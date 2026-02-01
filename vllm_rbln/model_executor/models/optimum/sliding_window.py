@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import torch
-import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
@@ -74,10 +73,7 @@ class RBLNOptimumSlidingWindowAttentionForCausalLM(
         finished_requests_ids = model_input.finished_requests_ids
         running_requests_ids = model_input.running_requests_ids
         request_nums = input_ids.shape[0]
-        if envs.VLLM_USE_V1:
-            is_prompt = model_input.is_prompt
-        else:
-            is_prompt = model_input.sampling_metadata.num_prompts > 0
+        is_prompt = model_input.is_prompt
 
         # In prefill phase, the length of list must be 1
         sliding_window_table_ids = self.attention_manager.get(

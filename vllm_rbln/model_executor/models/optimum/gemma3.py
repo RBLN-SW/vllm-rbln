@@ -14,7 +14,6 @@
 from typing import Any, Optional
 
 import torch
-import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.gemma3_mm import (Gemma3DummyInputsBuilder,
@@ -120,10 +119,7 @@ class RBLNOptimumGemma3ForConditionalGeneration(
         position_ids = model_input.input_positions
         block_tables = model_input.block_tables
 
-        if envs.VLLM_USE_V1:
-            is_prompt = model_input.is_prompt
-        else:
-            is_prompt = model_input.sampling_metadata.num_prompts > 0
+        is_prompt = model_input.is_prompt
 
         finished_requests_ids = model_input.finished_requests_ids
         running_requests_ids = model_input.running_requests_ids
@@ -266,11 +262,11 @@ class RBLNOptimumGemma3ForConditionalGeneration(
         if pixel_values is None:
             return None
 
-        if not isinstance(pixel_values, (torch.Tensor, list)):
+        if not isinstance(pixel_values, torch.Tensor | list):
             raise ValueError("Incorrect type of pixel values. "
                              f"Got type: {type(pixel_values)}")
 
-        if not isinstance(num_crops, (torch.Tensor, list)):
+        if not isinstance(num_crops, torch.Tensor | list):
             raise ValueError("Incorrect type of num_crops. "
                              f"Got type: {type(num_crops)}")
 

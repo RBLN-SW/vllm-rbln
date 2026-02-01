@@ -15,9 +15,9 @@ from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional
 
 import torch
-import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.model_executor.models.qwen2_5_vl import (
     Qwen2_5_VLImageEmbeddingInputs, Qwen2_5_VLImagePixelInputs,
     Qwen2_5_VLVideoEmbeddingInputs, Qwen2_5_VLVideoPixelInputs)
@@ -33,7 +33,8 @@ logger = init_logger(__name__)
 
 
 class RBLNOptimumQwenVLForConditionalGeneration(RBLNOptimumModelBase,
-                                                RBLNOptimumDecoderMixin, ABC):
+                                                RBLNOptimumDecoderMixin,
+                                                SupportsMultiModal, ABC):
     """
     Unified class for both Qwen2-VL and Qwen2.5-VL models.
     Automatically detects model type based on the model configuration.
@@ -142,10 +143,7 @@ class RBLNOptimumQwenVLForConditionalGeneration(RBLNOptimumModelBase,
         finished_requests_ids = model_input.finished_requests_ids
         running_requests_ids = model_input.running_requests_ids
 
-        if envs.VLLM_USE_V1:
-            is_prompt = model_input.is_prompt
-        else:
-            is_prompt = model_input.sampling_metadata.num_prompts > 0
+        is_prompt = model_input.is_prompt
 
         if is_prompt:
             image_input = None
@@ -235,7 +233,7 @@ class RBLNOptimumQwenVLForConditionalGeneration(RBLNOptimumModelBase,
 
     def _validate_and_reshape_mm_tensor(self, mm_input: object,
                                         name: str) -> torch.Tensor:
-        if not isinstance(mm_input, (torch.Tensor, list)):
+        if not isinstance(mm_input, torch.Tensor | list):
             raise ValueError(f"Incorrect type of {name}. "
                              f"Got type: {type(mm_input)}")
         if isinstance(mm_input, torch.Tensor):
@@ -346,12 +344,13 @@ class RBLNOptimumQwen2_5_VLForConditionalGeneration(
                 "second_per_grid_ts is required for Qwen2.5-VL video inputs.")
         # NOTE vLLM also squeezes the second_per_grid_ts tensor
         # https://github.com/vllm-project/vllm/blob/v0.10.2/vllm/model_executor/models/qwen2_5_vl.py#L1021
-        if envs.VLLM_USE_V1:
-            # [num_videos, 1] -> [num_videos]
-            second_per_grid_ts = second_per_grid_ts.squeeze(-1)
-        else:
-            # [1, num_videos] -> [num_videos]
-            second_per_grid_ts = second_per_grid_ts.squeeze(-2)
+        # if envs.VLLM_USE_V1:
+        #     # [num_videos, 1] -> [num_videos]
+        #     second_per_grid_ts = second_per_grid_ts.squeeze(-1)
+        # else:
+        #     # [1, num_videos] -> [num_videos]
+        #     second_per_grid_ts = second_per_grid_ts.squeeze(-2)
+        second_per_grid_ts = second_per_grid_ts.squeeze(-1)
         return Qwen2_5_VLVideoPixelInputs(
             type="pixel_values_videos",
             pixel_values_videos=pixel_values_videos,

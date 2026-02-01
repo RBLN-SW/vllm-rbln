@@ -24,8 +24,9 @@ else:
 
 import rebel
 from torch._dynamo import register_backend
-from vllm.platforms import Platform, PlatformEnum, _Backend
-from vllm.utils import FlexibleArgumentParser, _StreamPlaceholder
+from vllm.platforms import Platform, PlatformEnum
+from vllm.utils.argparse_utils import FlexibleArgumentParser
+from vllm.utils.torch_utils import _StreamPlaceholder
 
 import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
@@ -109,33 +110,6 @@ class RblnPlatform(Platform):
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         model_config = vllm_config.model_config
-        task = model_config.task
-        supported_tasks = set(model_config.supported_tasks)
-        pooling_tasks = {"embed", "classify", "reward", "score"}
-
-        if task == "auto":
-            is_pooling = bool(pooling_tasks & supported_tasks)
-            is_generate = "generate" in supported_tasks
-        else:
-            is_pooling = task in pooling_tasks
-            is_generate = task == "generate"
-
-        if is_pooling and not envs.VLLM_USE_V1:
-            raise ValueError("Pooling models are only supported on V1.")
-
-        if is_generate and cls.supports_v1(
-                model_config
-        ) and not envs.VLLM_USE_V1 and not model_config.is_encoder_decoder:
-            logger.warning("V0 support for decoder models is deprecated.")
-
-        if envs.VLLM_USE_V1:
-            architectures = getattr(vllm_config.model_config.hf_config,
-                                    "architectures", [])
-            if "T5ForConditionalGeneration" in architectures:
-                raise NotImplementedError(
-                    "T5 encoder-decoder model is not supported on V1. "
-                    "Set `VLLM_USE_V1=0` to run T5 models in V0")
-
         parallel_config = vllm_config.parallel_config
         scheduler_config = vllm_config.scheduler_config
 
@@ -203,23 +177,11 @@ class RblnPlatform(Platform):
             model_config.dtype = torch.float
             assert model_config.dtype == torch.float
 
-            if envs.VLLM_USE_V1:
-                if parallel_config.worker_cls == "auto":
-                    parallel_config.worker_cls = \
-                        "vllm_rbln.v1.worker.optimum_worker.RBLNOptimumWorker"
-                scheduler_config.scheduler_cls = \
-                        "vllm_rbln.v1.core.optimum_scheduler.RBLNOptimumScheduler"
-            else:
-                if parallel_config.worker_cls == "auto":
-                    parallel_config.worker_cls = \
-                        "vllm_rbln.worker.optimum_worker.RBLNOptimumWorker"
-                scheduler_config.scheduler_cls = \
-                    "vllm_rbln.core.optimum_scheduler.RBLNOptimumScheduler"
-
-                if envs.VLLM_RBLN_SAMPLER:
-                    logger.warning("RBLN Sampler is only supported on v1. "
-                                   "V0 will be deprecated soon.")
-                    envs.VLLM_RBLN_SAMPLER = False
+            if parallel_config.worker_cls == "auto":
+                parallel_config.worker_cls = \
+                    "vllm_rbln.v1.worker.optimum_worker.RBLNOptimumWorker"
+            scheduler_config.scheduler_cls = \
+                    "vllm_rbln.v1.core.optimum_scheduler.RBLNOptimumScheduler"
 
             assert vllm_config.parallel_config.tensor_parallel_size == 1, (
                 "Tensor parallelism is set when compiled in optimum-rbln.")
@@ -240,8 +202,10 @@ class RblnPlatform(Platform):
 
         assert (not vllm_config.speculative_config
                 ), "Speculative decoding not yet supported for RBLN backend."
+        assert not envs.VLLM_USE_V2_MODEL_RUNNER, \
+            "v2 model runner is not supported for RBLN backend."
 
-        if envs.VLLM_USE_V1 and envs.VLLM_RBLN_USE_VLLM_MODEL:
+        if envs.VLLM_RBLN_USE_VLLM_MODEL:
             from vllm.config import CompilationLevel
 
             if (vllm_config.compilation_config.level
@@ -262,7 +226,7 @@ class RblnPlatform(Platform):
     @classmethod
     def get_attn_backend_cls(
         cls,
-        selected_backend: _Backend,
+        selected_backend,
         head_size: int,
         dtype: torch.dtype,
         kv_cache_dtype: Optional[str],

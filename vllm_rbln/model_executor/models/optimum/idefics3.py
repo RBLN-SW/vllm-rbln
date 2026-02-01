@@ -14,12 +14,12 @@
 from typing import Any, Optional
 
 import torch
-import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.idefics3 import (Idefics3ImageEmbeddingInputs,
                                                  Idefics3ImagePixelInputs,
                                                  ImageInputs)
+from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.model_executor.models.utils import flatten_bn
 
 from .base import ModelInputForRBLN
@@ -29,7 +29,8 @@ logger = init_logger(__name__)
 
 
 class RBLNOptimumIdefics3ForConditionalGeneration(RBLNOptimumModelBase,
-                                                  RBLNOptimumDecoderMixin):
+                                                  RBLNOptimumDecoderMixin,
+                                                  SupportsMultiModal):
 
     def __init__(
         self,
@@ -54,10 +55,7 @@ class RBLNOptimumIdefics3ForConditionalGeneration(RBLNOptimumModelBase,
         block_tables = model_input.block_tables
 
         request_nums = input_ids.shape[0]
-        if envs.VLLM_USE_V1:
-            is_prompt = model_input.is_prompt
-        else:
-            is_prompt = model_input.sampling_metadata.num_prompts > 0
+        is_prompt = model_input.is_prompt
 
         kwargs = self.preprocess_for_decoder(is_prompt, block_tables,
                                              input_ids, cache_position)
@@ -129,7 +127,7 @@ class RBLNOptimumIdefics3ForConditionalGeneration(RBLNOptimumModelBase,
             return None
 
         if image_embeds is not None:
-            if not isinstance(image_embeds, (torch.Tensor, list)):
+            if not isinstance(image_embeds, torch.Tensor | list):
                 raise ValueError("Incorrect type of image embeddings. "
                                  f"Got type: {type(image_embeds)}")
 
@@ -139,17 +137,17 @@ class RBLNOptimumIdefics3ForConditionalGeneration(RBLNOptimumModelBase,
             )
 
         if pixel_values is not None:
-            if not isinstance(pixel_values, (torch.Tensor, list)):
+            if not isinstance(pixel_values, torch.Tensor | list):
                 raise ValueError("Incorrect type of pixel values. "
                                  f"Got type: {type(pixel_values)}")
 
             pixel_attention_mask = kwargs.pop("pixel_attention_mask")
-            if not isinstance(pixel_attention_mask, (torch.Tensor, list)):
+            if not isinstance(pixel_attention_mask, torch.Tensor | list):
                 raise ValueError("Incorrect type of pixel_attention_mask. "
                                  f"Got type: {type(pixel_attention_mask)}")
 
             num_patches = kwargs.pop("num_patches")
-            if not isinstance(num_patches, (torch.Tensor, list)):
+            if not isinstance(num_patches, torch.Tensor | list):
                 raise ValueError("Incorrect type of num_patches. "
                                  f"Got type: {type(num_patches)}")
 

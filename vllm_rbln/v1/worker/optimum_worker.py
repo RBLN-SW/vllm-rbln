@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import nullcontext
+from types import NoneType
 from typing import Any, Optional
 
 import torch
@@ -24,9 +26,9 @@ from vllm.lora.request import LoRARequest
 from vllm.model_executor import set_random_seed
 from vllm.tasks import SupportedTask
 from vllm.v1.core.kv_cache_utils import get_uniform_page_size
-from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheSpec
-from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 from vllm.v1.worker.worker_base import WorkerBase
 
 import vllm_rbln.rbln_envs as envs
@@ -102,12 +104,32 @@ class RBLNOptimumWorker(WorkerBase):
         """
         kv_cache_spec = self.model_runner.get_kv_cache_spec()
         num_layers = len(kv_cache_spec)
-        page_size = get_uniform_page_size(kv_cache_spec)
+        page_size = get_uniform_page_size(kv_cache_spec.values())
 
         adapter = self.model_runner.model.kv_block_adapter
         num_gpu_blocks = adapter.get_available_num_blocks()
 
         return num_gpu_blocks * page_size * num_layers
+
+    def annotate_profile(self, scheduler_output):
+        # add trace annotation so that we can easily distinguish
+        # new/cached request numbers in each iteration
+        if not self.profiler:
+            return nullcontext()
+
+        self.profiler.step()
+
+        num_new = len(scheduler_output.scheduled_new_reqs)
+        num_cached = len(scheduler_output.scheduled_cached_reqs.req_ids)
+
+        return self.profiler.annotate_context_manager(
+            f"execute_new_{num_new}_cached_{num_cached}")
+
+    @torch.inference_mode()
+    def sample_tokens(
+        self, grammar_output: "GrammarOutput | None"
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
+        return self.model_runner.sample_tokens(grammar_output)
 
     def execute_model(
         self,
@@ -116,10 +138,12 @@ class RBLNOptimumWorker(WorkerBase):
         intermediate_tensors = None
         # TODO setting intermediate_tensors for PP
 
-        output = self.model_runner.execute_model(scheduler_output,
-                                                 intermediate_tensors)
-        assert isinstance(output, ModelRunnerOutput)
-        return output if self.is_driver_worker else None
+        with self.annotate_profile(scheduler_output):
+            output = self.model_runner.execute_model(scheduler_output,
+                                                     intermediate_tensors)
+            if isinstance(output, (ModelRunnerOutput, NoneType)):
+                return output
+        return None
 
     def profile(self, is_start: bool = True):
         if self.profiler is None:

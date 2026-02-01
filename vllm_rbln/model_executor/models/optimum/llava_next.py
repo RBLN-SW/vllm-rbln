@@ -14,9 +14,9 @@
 from typing import Any, List, Optional, Union
 
 import torch
-import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.model_executor.models.llava_next import (LlavaNextImageInputs,
                                                    LlavaNextImagePixelInputs)
 from vllm.model_executor.models.utils import flatten_bn
@@ -28,7 +28,8 @@ logger = init_logger(__name__)
 
 
 class RBLNOptimumLlavaNextForConditionalGeneration(RBLNOptimumModelBase,
-                                                   RBLNOptimumDecoderMixin):
+                                                   RBLNOptimumDecoderMixin,
+                                                   SupportsMultiModal):
 
     def __init__(
         self,
@@ -110,10 +111,7 @@ class RBLNOptimumLlavaNextForConditionalGeneration(RBLNOptimumModelBase,
         cache_position = model_input.input_positions
         block_tables = model_input.block_tables
 
-        if envs.VLLM_USE_V1:
-            is_prompt = model_input.is_prompt
-        else:
-            is_prompt = model_input.sampling_metadata.num_prompts > 0
+        is_prompt = model_input.is_prompt
 
         request_nums = input_ids.shape[0]
 
@@ -163,11 +161,11 @@ class RBLNOptimumLlavaNextForConditionalGeneration(RBLNOptimumModelBase,
             return None
 
         if pixel_values is not None:
-            if not isinstance(pixel_values, (torch.Tensor, list)):
+            if not isinstance(pixel_values, torch.Tensor | list):
                 raise ValueError("Incorrect type of pixel values. "
                                  f"Got type: {type(pixel_values)}")
 
-            if not isinstance(image_sizes, (torch.Tensor, list)):
+            if not isinstance(image_sizes, torch.Tensor | list):
                 raise ValueError("Incorrect type of image sizes. "
                                  f"Got type: {type(image_sizes)}")
 

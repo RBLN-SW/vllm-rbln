@@ -39,9 +39,8 @@ dependencies = [
     "pyyaml",
     "datasets",
     "qwen_vl_utils",
-    "vllm==0.10.2",
-    "optimum-rbln>=0.10.0.post1",
-    "torch==2.8.0",
+    "vllm==0.13.0",
+    "torch>=2.9.0,<=2.9.1",
 ]
 
 [project.optional-dependencies]
@@ -117,6 +116,8 @@ ignore = [
     "F405", "F403",
     # lambda expression assignment
     "E731",
+    # zip without `strict=`
+    "B905",
     # Loop control variable not used within loop body
     "B007",
     # f-string format
@@ -134,7 +135,6 @@ follow_imports = "silent"
 # move the directory here and remove it from tools/mypy.sh
 files = [
     "vllm_rbln/*.py",
-    "vllm_rbln/core",
 ]
 
 [tool.codespell]

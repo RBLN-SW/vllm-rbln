@@ -14,9 +14,9 @@
 from typing import Any, Optional
 
 import torch
-import vllm.envs as envs
 from optimum.rbln.configuration_utils import RBLNModelConfig
 from vllm.config import VllmConfig
+from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.model_executor.models.paligemma import (
     PaliGemmaImageEmbeddingInputs, PaliGemmaImageInputs,
     PaliGemmaImagePixelInputs)
@@ -28,7 +28,8 @@ from .model_base import RBLNOptimumDecoderMixin, RBLNOptimumModelBase
 
 
 class RBLNOptimumPaliGemmaForConditionalGeneration(RBLNOptimumModelBase,
-                                                   RBLNOptimumDecoderMixin):
+                                                   RBLNOptimumDecoderMixin,
+                                                   SupportsMultiModal):
 
     def __init__(
         self,
@@ -53,10 +54,7 @@ class RBLNOptimumPaliGemmaForConditionalGeneration(RBLNOptimumModelBase,
         block_tables = model_input.block_tables
 
         request_nums = input_ids.shape[0]
-        if envs.VLLM_USE_V1:
-            is_prompt = model_input.is_prompt
-        else:
-            is_prompt = model_input.sampling_metadata.num_prompts > 0
+        is_prompt = model_input.is_prompt
 
         kwargs = self.preprocess_for_decoder(is_prompt, block_tables,
                                              input_ids, cache_position)

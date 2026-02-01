@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import torch
-import vllm.envs as envs
 from vllm.config import VllmConfig
 
 from vllm_rbln.logger import init_logger
@@ -23,6 +22,7 @@ from .model_base import RBLNOptimumDecoderMixin, RBLNOptimumModelBase
 logger = init_logger(__name__)
 
 
+# FIXME SupportsLoRA?
 class RBLNOptimumForCausalLM(RBLNOptimumModelBase, RBLNOptimumDecoderMixin):
 
     def __init__(
@@ -48,10 +48,7 @@ class RBLNOptimumForCausalLM(RBLNOptimumModelBase, RBLNOptimumDecoderMixin):
         dummy_block = model_input.dummy_block
 
         request_nums = input_ids.shape[0]
-        if envs.VLLM_USE_V1:
-            is_prompt = model_input.is_prompt
-        else:
-            is_prompt = model_input.sampling_metadata.num_prompts > 0
+        is_prompt = model_input.is_prompt
 
         kwargs = self.preprocess_for_decoder(is_prompt,
                                              block_tables,
