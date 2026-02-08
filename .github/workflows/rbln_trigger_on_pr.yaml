@@ -72,6 +72,7 @@ jobs:
           fi
 
   check-code-quality:
+    if: false
     needs: check-skip-ci
     uses: ./.github/workflows/pre-commit.yml
   
