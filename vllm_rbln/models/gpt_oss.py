@@ -47,10 +47,11 @@ if True:
 
         # In MoE, we need to flatten the tensor parallel size across the data
         # parallel size when EP is disabled.
+        # FIXME(RBLN) - disable flatten_tp_across_dp for data parallel w/o ep
         tp_size, tp_rank = FusedMoEParallelConfig.flatten_tp_across_dp_and_pcp(
             tp_size=get_tensor_model_parallel_world_size(),
-            dp_size=get_dp_group().world_size,
-            dp_rank=get_dp_group().rank_in_group,
+            dp_size=get_dp_group().world_size if use_ep else 1,
+            dp_rank=get_dp_group().rank_in_group if use_ep else 0,
             pcp_size=get_pcp_group().world_size,
             pcp_rank=get_pcp_group().rank_in_group,
         )

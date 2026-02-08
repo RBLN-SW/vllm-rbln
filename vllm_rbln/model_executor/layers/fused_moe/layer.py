@@ -421,7 +421,7 @@ def fused_moe_forward_rbln(self, hidden_states: torch.Tensor,
                            router_logits: torch.Tensor):
     assert self.quant_method is not None
 
-    if self.dp_size > 1:
+    if self.dp_size > 1 and self.use_ep:
         org_hidden_shape = hidden_states.shape
 
         # input broadcast - all DPs broadcast hidden_states & router_logits
@@ -458,7 +458,7 @@ def fused_moe_forward_rbln(self, hidden_states: torch.Tensor,
         apply_router_weight_on_input=self.apply_router_weight_on_input,
     )
 
-    if self.dp_size > 1:
+    if self.dp_size > 1 and self.use_ep:
         # output all_reduce == dp all_reduce + tp all_reduce
         all_hidden_states = get_dp_group().all_reduce(final_hidden_states)
         hidden_shape_dp = (-1, 1, org_hidden_shape[-1])

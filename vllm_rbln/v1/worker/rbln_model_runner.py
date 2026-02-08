@@ -482,6 +482,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.dummy_run_state: DummyRunState | None = None
 
         self.specialized_moe_decode = parallel_config.data_parallel_size > 1 \
+            and parallel_config.enable_expert_parallel \
             and envs.VLLM_RBLN_SPECIALIZE_MOE_DECODE
 
     def _enable_performance_tracker(self):
@@ -1444,10 +1445,11 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         num_padded_tokens: int | None = None,
         is_prefill: bool = False
     ) -> tuple[int, Optional[int], Optional[torch.Tensor]]:
+        enable_ep = self.vllm_config.parallel_config.enable_expert_parallel
         dp_size = self.vllm_config.parallel_config.data_parallel_size
         dp_rank = self.vllm_config.parallel_config.data_parallel_rank
 
-        if dp_size == 1:
+        if dp_size == 1 or not enable_ep:
             assert num_padded_tokens is None, \
                 "num_padded_tokens should not be applied for non-DP case"
             return batch_bucket_size, num_padded_tokens, None
@@ -3132,7 +3134,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
          - during profile_run
          - during DP rank dummy run
         """
-        dp_size = self.vllm_config.parallel_config.data_parallel_size
+        dp_size = self.vllm_config.parallel_config.data_parallel_size \
+                  and self.vllm_config.parallel_config.enable_expert_parallel
         randomize_inputs = envs.VLLM_RANDOMIZE_DP_DUMMY_INPUTS and dp_size > 1
         if not randomize_inputs:
             yield
