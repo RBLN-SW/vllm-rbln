@@ -23,7 +23,6 @@ from .model_base import RBLNOptimumDecoderMixin, RBLNOptimumModelBase
 logger = init_logger(__name__)
 
 
-# FIXME SupportsLoRA?
 class RBLNOptimumForCausalLM(RBLNOptimumModelBase, RBLNOptimumDecoderMixin,
                              SupportsLoRA):
 
