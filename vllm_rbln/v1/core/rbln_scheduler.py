@@ -47,9 +47,7 @@ def undo_uncomputed_block_caching(
         group.kv_cache_spec.block_size
         for group in kv_cache_manager.kv_cache_config.kv_cache_groups
     ]
-    for blocks, num_full_block in zip(grouped_blocks,
-                                      num_computed_blocks,
-                                      strict=False):
+    for blocks, num_full_block in zip(grouped_blocks, num_computed_blocks):
         for block in blocks[num_full_block:]:
             # NOTE(RBLN): this function call efficiently resets
             # the block hash and evicts the corresponding block from the cache.

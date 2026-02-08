@@ -35,10 +35,6 @@ _RBLN_GENERATION_MODELS: dict[str, tuple[str, str]] = {
 }
 
 _RBLN_ENCODER_DECODER_MODELS: dict[str, tuple[str, str]] = {
-    "BartForConditionalGeneration":
-    ("bart", "RBLNBartForConditionalGeneration"),
-    "T5ForConditionalGeneration": ("t5", "RBLNT5ForConditionalGeneration"),
-    "T5WithLMHeadModel": ("t5", "RBLNT5ForConditionalGeneration"),
     "WhisperForConditionalGeneration":
     ("whisper", "RBLNWhisperForConditionalGeneration"),
 }

@@ -15,9 +15,9 @@ from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional
 
 import torch
-import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.model_executor.models.qwen2_5_vl import (
     Qwen2_5_VLImageEmbeddingInputs, Qwen2_5_VLImagePixelInputs,
     Qwen2_5_VLVideoEmbeddingInputs, Qwen2_5_VLVideoPixelInputs)
@@ -33,7 +33,8 @@ logger = init_logger(__name__)
 
 
 class RBLNOptimumQwenVLForConditionalGeneration(RBLNOptimumModelBase,
-                                                RBLNOptimumDecoderMixin, ABC):
+                                                RBLNOptimumDecoderMixin,
+                                                SupportsMultiModal, ABC):
     """
     Unified class for both Qwen2-VL and Qwen2.5-VL models.
     Automatically detects model type based on the model configuration.
@@ -142,10 +143,7 @@ class RBLNOptimumQwenVLForConditionalGeneration(RBLNOptimumModelBase,
         finished_requests_ids = model_input.finished_requests_ids
         running_requests_ids = model_input.running_requests_ids
 
-        if envs.VLLM_USE_V1:
-            is_prompt = model_input.is_prompt
-        else:
-            is_prompt = model_input.sampling_metadata.num_prompts > 0
+        is_prompt = model_input.is_prompt
 
         if is_prompt:
             image_input = None
@@ -233,24 +231,6 @@ class RBLNOptimumQwenVLForConditionalGeneration(RBLNOptimumModelBase,
 
         return inputs_embeds, position_embeds
 
-    def _validate_and_reshape_mm_tensor(self, mm_input: object,
-                                        name: str) -> torch.Tensor:
-        if not isinstance(mm_input, (torch.Tensor, list)):
-            raise ValueError(f"Incorrect type of {name}. "
-                             f"Got type: {type(mm_input)}")
-        if isinstance(mm_input, torch.Tensor):
-            if mm_input.ndim == 2:
-                return mm_input
-            if mm_input.ndim != 3:
-                raise ValueError(f"{name} should be 2D or batched 3D tensor. "
-                                 f"Got ndim: {mm_input.ndim} "
-                                 f"(shape={mm_input.shape})")
-            return torch.concat(list(mm_input))
-        else:
-            return torch.concat(mm_input)
-
-        raise RuntimeError(f"Unhandled case for input '{name}'")
-
     def _parse_and_validate_image_input(self, **kwargs: Any) -> Optional[Any]:
         pixel_values = kwargs.pop("pixel_values", None)
         image_embeds = kwargs.pop("image_embeds", None)
@@ -260,20 +240,10 @@ class RBLNOptimumQwenVLForConditionalGeneration(RBLNOptimumModelBase,
             return None
 
         if pixel_values is not None:
-            pixel_values = self._validate_and_reshape_mm_tensor(
-                pixel_values, "image pixel values")
-            image_grid_thw = self._validate_and_reshape_mm_tensor(
-                image_grid_thw, "image grid_thw")
-
             return self._create_image_pixel_inputs(
                 pixel_values=pixel_values, image_grid_thw=image_grid_thw)
 
         if image_embeds is not None:
-            image_embeds = self._validate_and_reshape_mm_tensor(
-                image_embeds, "image embeds")
-            image_grid_thw = self._validate_and_reshape_mm_tensor(
-                image_grid_thw, "image grid_thw")
-
             return self._create_image_embedding_inputs(
                 image_embeds=image_embeds, image_grid_thw=image_grid_thw)
 
@@ -291,25 +261,11 @@ class RBLNOptimumQwenVLForConditionalGeneration(RBLNOptimumModelBase,
             return None
 
         if pixel_values_videos is not None:
-            pixel_values_videos = self._validate_and_reshape_mm_tensor(
-                pixel_values_videos, "video pixel values")
-            video_grid_thw = self._validate_and_reshape_mm_tensor(
-                video_grid_thw, "video grid_thw")
-
             return self._create_video_pixel_inputs(pixel_values_videos,
                                                    video_grid_thw,
                                                    second_per_grid_ts)
 
         if video_embeds is not None:
-            video_embeds = self._validate_and_reshape_mm_tensor(
-                video_embeds, "video embeds")
-            video_grid_thw = self._validate_and_reshape_mm_tensor(
-                video_grid_thw, "video grid_thw")
-
-            if not isinstance(video_embeds, torch.Tensor):
-                raise ValueError("Incorrect type of video embeddings. "
-                                 f"Got type: {type(video_embeds)}")
-
             return self._create_video_embedding_inputs(video_embeds,
                                                        video_grid_thw)
 
@@ -344,14 +300,6 @@ class RBLNOptimumQwen2_5_VLForConditionalGeneration(
         if second_per_grid_ts is None:
             raise ValueError(
                 "second_per_grid_ts is required for Qwen2.5-VL video inputs.")
-        # NOTE vLLM also squeezes the second_per_grid_ts tensor
-        # https://github.com/vllm-project/vllm/blob/v0.10.2/vllm/model_executor/models/qwen2_5_vl.py#L1021
-        if envs.VLLM_USE_V1:
-            # [num_videos, 1] -> [num_videos]
-            second_per_grid_ts = second_per_grid_ts.squeeze(-1)
-        else:
-            # [1, num_videos] -> [num_videos]
-            second_per_grid_ts = second_per_grid_ts.squeeze(-2)
         return Qwen2_5_VLVideoPixelInputs(
             type="pixel_values_videos",
             pixel_values_videos=pixel_values_videos,

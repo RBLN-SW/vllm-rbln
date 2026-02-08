@@ -14,13 +14,12 @@
 from typing import Any, Optional
 
 import torch
-import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.blip2 import (Blip2ImageEmbeddingInputs,
                                               Blip2ImageInputs,
                                               Blip2ImagePixelInputs)
-from vllm.model_executor.models.utils import flatten_bn
+from vllm.model_executor.models.interfaces import SupportsMultiModal
 
 from .base import ModelInputForRBLN
 from .model_base import RBLNOptimumDecoderMixin, RBLNOptimumModelBase
@@ -29,7 +28,8 @@ logger = init_logger(__name__)
 
 
 class RBLNOptimumBlip2ForConditionalGeneration(RBLNOptimumModelBase,
-                                               RBLNOptimumDecoderMixin):
+                                               RBLNOptimumDecoderMixin,
+                                               SupportsMultiModal):
 
     def __init__(
         self,
@@ -53,10 +53,7 @@ class RBLNOptimumBlip2ForConditionalGeneration(RBLNOptimumModelBase,
         cache_position = model_input.input_positions
         block_tables = model_input.block_tables
 
-        if envs.VLLM_USE_V1:
-            is_prompt = model_input.is_prompt
-        else:
-            is_prompt = model_input.sampling_metadata.num_prompts > 0
+        is_prompt = model_input.is_prompt
 
         image_input = None
         pixel_values = None
@@ -110,18 +107,19 @@ class RBLNOptimumBlip2ForConditionalGeneration(RBLNOptimumModelBase,
 
         if pixel_values is not None:
             expected_h = expected_w = config.vision_config.image_size
-            return Blip2ImagePixelInputs(type="pixel_values",
-                                         data=flatten_bn(pixel_values,
-                                                         concat=True),
-                                         resolve_bindings={
-                                             "h": expected_h,
-                                             "w": expected_w
-                                         })
+            return Blip2ImagePixelInputs(
+                type="pixel_values",
+                data=pixel_values,
+                resolve_bindings={
+                    "h": expected_h,
+                    "w": expected_w
+                },
+            )
 
         if image_embeds is not None:
             return Blip2ImageEmbeddingInputs(
                 type="image_embeds",
-                data=flatten_bn(image_embeds, concat=True),
+                data=image_embeds,
             )
 
         raise AssertionError("This line should be unreachable.")

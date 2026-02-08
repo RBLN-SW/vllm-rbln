@@ -11,12 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Any, Optional
 
 import torch
-import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.model_executor.models.interfaces import (SupportsMultiModal,
+                                                   SupportsTranscription)
+from vllm.model_executor.models.whisper import (ISO639_1_SUPPORTED_LANGS,
+                                                WhisperAudioInputs)
+from vllm.utils.jsontree import json_map_leaves
 
 from .base import ModelInputForRBLN
 from .model_base import RBLNOptimumDecoderMixin, RBLNOptimumModelBase
@@ -27,8 +30,29 @@ logger = init_logger(__name__)
 
 
 class RBLNOptimumWhisperForConditionalGeneration(RBLNOptimumModelBase,
-                                                 RBLNOptimumDecoderMixin):
+                                                 RBLNOptimumDecoderMixin,
+                                                 SupportsTranscription,
+                                                 SupportsMultiModal):
     INVALID_TOKEN = 100
+    # Whisper only supports audio-conditioned generation.
+    supports_transcription_only = True
+    supports_segment_timestamp = True
+    supported_languages = ISO639_1_SUPPORTED_LANGS
+
+    @classmethod
+    def validate_language(cls, language: str | None) -> str | None:
+        if language is None:
+            # TODO language should be optional and can be guessed.
+            # For now we default to en. See
+            # https://github.com/huggingface/transformers/blob/main/src/transformers/models/whisper/generation_whisper.py#L1520
+            logger.warning(
+                "Defaulting to language='en'. If you wish to transcribe "
+                "audio in a different language, pass the `language` field "
+                "in the TranscriptionRequest.")
+            language = "en"
+        return super().validate_language(language)
+
+    # FIXME more method needed
 
     def __init__(
         self,
@@ -45,9 +69,6 @@ class RBLNOptimumWhisperForConditionalGeneration(RBLNOptimumModelBase,
         )
         self.dec_max_seq_len = self.model_config.max_model_len
         self.dec_lengths = [0] * self.batch_size
-        # self.table_mapping: Dict[str, int] = {}
-        # Result1T = list[int]
-        # Result2T = tuple[torch.Tensor, torch.Tensor]
 
         self.strategy = InnerAttentionStrategy()
         self.attention_manager: AttentionManager[InnerAttentionStrategy,
@@ -64,10 +85,7 @@ class RBLNOptimumWhisperForConditionalGeneration(RBLNOptimumModelBase,
         running_requests_ids = model_input.running_requests_ids
         request_nums = input_ids.shape[0]
 
-        if envs.VLLM_USE_V1:
-            is_prompt = model_input.is_prompt
-        else:
-            is_prompt = model_input.sampling_metadata.num_prompts > 0
+        is_prompt = model_input.is_prompt
 
         table_ids = self.attention_manager.get(
             is_prompt,
@@ -84,6 +102,7 @@ class RBLNOptimumWhisperForConditionalGeneration(RBLNOptimumModelBase,
             if input_features is None:
                 raise ValueError(
                     "Whisper requires `input_features` as an input.")
+            # FIXME I think encoder should be called here
 
         cache_position = torch.zeros(request_nums, 1, dtype=torch.int32)
 
@@ -139,11 +158,11 @@ class RBLNOptimumWhisperForConditionalGeneration(RBLNOptimumModelBase,
         return lm_logits
 
     def _parse_and_validate_audio_input(
-            self, **kwargs: Any) -> Optional[torch.Tensor]:
+            self, **kwargs: object) -> WhisperAudioInputs:
         input_features = kwargs.pop("input_features", None)
-        if input_features is not None:
-            input_features = input_features.squeeze(0)
-        return input_features
 
-    def clear_dict_table(self):
-        self.table_mapping.clear()
+        if input_features is not None:
+            input_features = json_map_leaves(lambda x: x.to(self.dtype),
+                                             input_features)
+
+        return WhisperAudioInputs(input_features=input_features)

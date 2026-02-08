@@ -20,6 +20,10 @@ from .utils import create_requests, create_scheduler
 def test_structured_output():
     scheduler = create_scheduler()
     structured_output_manager = scheduler.structured_output_manager
+    # 1. schedule the requests
+    # 2. Execute the scheduleroutput => pass
+    # 3. get_grammar_bitmask
+
     sample_json_schema = {"a": "int", "b": {"c": "str", "d": "float"}}
     str_sample_json_schema = json.dumps(sample_json_schema)
     requests = create_requests(num_requests=2,
@@ -34,12 +38,16 @@ def test_structured_output():
 
     # Prefill 1st request
     scheduler_output = scheduler.schedule()
-    assert len(scheduler_output.structured_output_request_ids) == 1
-    assert len(scheduler_output.grammar_bitmask) == 1
+    grammar_bitmask = scheduler.get_grammar_bitmask(scheduler_output)
+    assert len(grammar_bitmask.structured_output_request_ids) == 1
+    assert grammar_bitmask.grammar_bitmask.shape[0] == 1
     # Prefill 2nd request
     scheduler_output = scheduler.schedule()
-    assert len(scheduler_output.structured_output_request_ids) == 1
-    assert len(scheduler_output.grammar_bitmask) == 1
+    grammar_bitmask = scheduler.get_grammar_bitmask(scheduler_output)
+    assert len(grammar_bitmask.structured_output_request_ids) == 1
+    assert grammar_bitmask.grammar_bitmask.shape[0] == 1
     # Decode step for both requests
     scheduler_output = scheduler.schedule()
-    assert len(scheduler_output.structured_output_request_ids) == 2
+    grammar_bitmask = scheduler.get_grammar_bitmask(scheduler_output)
+    assert len(grammar_bitmask.structured_output_request_ids) == 2
+    assert grammar_bitmask.grammar_bitmask.shape[0] == 2

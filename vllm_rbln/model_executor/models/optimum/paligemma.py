@@ -14,13 +14,12 @@
 from typing import Any, Optional
 
 import torch
-import vllm.envs as envs
 from optimum.rbln.configuration_utils import RBLNModelConfig
 from vllm.config import VllmConfig
+from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.model_executor.models.paligemma import (
     PaliGemmaImageEmbeddingInputs, PaliGemmaImageInputs,
     PaliGemmaImagePixelInputs)
-from vllm.model_executor.models.utils import flatten_bn
 
 from vllm_rbln.model_executor.models.optimum.base import ModelInputForRBLN
 
@@ -28,7 +27,8 @@ from .model_base import RBLNOptimumDecoderMixin, RBLNOptimumModelBase
 
 
 class RBLNOptimumPaliGemmaForConditionalGeneration(RBLNOptimumModelBase,
-                                                   RBLNOptimumDecoderMixin):
+                                                   RBLNOptimumDecoderMixin,
+                                                   SupportsMultiModal):
 
     def __init__(
         self,
@@ -53,10 +53,7 @@ class RBLNOptimumPaliGemmaForConditionalGeneration(RBLNOptimumModelBase,
         block_tables = model_input.block_tables
 
         request_nums = input_ids.shape[0]
-        if envs.VLLM_USE_V1:
-            is_prompt = model_input.is_prompt
-        else:
-            is_prompt = model_input.sampling_metadata.num_prompts > 0
+        is_prompt = model_input.is_prompt
 
         kwargs = self.preprocess_for_decoder(is_prompt, block_tables,
                                              input_ids, cache_position)
@@ -123,19 +120,17 @@ class RBLNOptimumPaliGemmaForConditionalGeneration(RBLNOptimumModelBase,
             return None
 
         if pixel_values is not None:
-            pixel_values = flatten_bn(pixel_values, concat=True)
-
             h = w = config.vision_config.image_size
-            return PaliGemmaImagePixelInputs(type="pixel_values",
-                                             data=pixel_values,
-                                             resolve_bindings={
-                                                 "h": h,
-                                                 "w": w
-                                             })
+            return PaliGemmaImagePixelInputs(
+                type="pixel_values",
+                data=pixel_values,
+                resolve_bindings={
+                    "h": h,
+                    "w": w
+                },
+            )
 
         if image_embeds is not None:
-            image_embeds = flatten_bn(image_embeds, concat=True)
-
             return PaliGemmaImageEmbeddingInputs(
                 type="image_embeds",
                 data=image_embeds,

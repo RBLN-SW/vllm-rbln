@@ -24,29 +24,11 @@ MODEL_NAME = MODEL_DIR + "/llama3_2-3b-128k_kv16k_batch4"
 MAX_TOKENS = 1
 
 
-@pytest.fixture(scope="module")
-def monkeypatch_module():
-    from _pytest.monkeypatch import MonkeyPatch
-    mpatch = MonkeyPatch()
-    yield mpatch
-    mpatch.undo()
-
-
 @pytest.fixture(scope="module", params=[False, True])
-def server(request, monkeypatch_module):
-
-    use_v1 = request.param
-    monkeypatch_module.setenv('VLLM_USE_V1', '1' if use_v1 else '0')
+def server():
     args = []
     with RemoteOpenAIServer(MODEL_NAME, args) as remote_server:
         yield remote_server
-
-
-@pytest.fixture
-def is_v1_server(server):
-    import os
-    assert os.environ['VLLM_USE_V1'] in ['0', '1']
-    return os.environ['VLLM_USE_V1'] == '1'
 
 
 @pytest_asyncio.fixture

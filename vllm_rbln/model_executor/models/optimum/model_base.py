@@ -19,14 +19,14 @@ from typing import Any, Optional
 import optimum.rbln
 import torch
 import torch.nn as nn
-import vllm.envs as envs
 from optimum.rbln.transformers.models.decoderonly import (
     decoderonly_runtime_utils as runtime_utils)
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.sampler import Sampler, SamplerOutput
-from vllm.model_executor.sampling_metadata import SamplingMetadata
+from vllm.model_executor.models.interfaces_base import (
+    VllmModelForTextGeneration)
+from vllm.v1.sample.metadata import SamplingMetadata
 
 from vllm_rbln.utils.optimum.common import select_bucket_size
 from vllm_rbln.utils.optimum.registry import get_rbln_model_info
@@ -54,7 +54,6 @@ class KVCacheBlockAdapter:
     ):
         self.vllm_config = vllm_config
         self.estimated_kvcache_num_blocks = estimated_kvcache_num_blocks
-        self.use_v1 = envs.VLLM_USE_V1
 
     @staticmethod
     def _env_int(name: str, default: int) -> int:
@@ -99,10 +98,10 @@ class KVCacheBlockAdapter:
 
         if self.is_full_block_available():
             new_estimated = self._estimated_num_blocks() * blk_ratio
-            return new_estimated + 1 if self.use_v1 else new_estimated
+            return new_estimated + 1
 
         new_estimated = (self._estimated_num_blocks() - 1) * blk_ratio + 1
-        return new_estimated if self.use_v1 else max(0, new_estimated - 1)
+        return new_estimated
 
 
 class RBLNOptimumModelBase(nn.Module):
@@ -142,8 +141,8 @@ class RBLNOptimumModelBase(nn.Module):
         config = self.model_config.hf_config
         model_name, model_cls_name = get_rbln_model_info(config)
 
-        if isinstance(self.model_config.model,
-                      (str, Path)) and os.path.exists(self.model_config.model):
+        if isinstance(self.model_config.model, str | Path) and os.path.exists(
+                self.model_config.model):
             model_path = Path(self.model_config.model)
             if model_path.is_dir() and any(
                     model_path.glob('rbln_config.json')):
@@ -179,7 +178,7 @@ class RBLNOptimumModelBase(nn.Module):
         return self.model.rbln_config.dtype
 
 
-class RBLNOptimumDecoderMixin:
+class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
 
     def setup_decoder_mixin(
         self,
@@ -199,7 +198,6 @@ class RBLNOptimumDecoderMixin:
 
         self.logits_processor = LogitsProcessor(vocab_size,
                                                 logits_as_input=True)
-        self.sampler = Sampler()
         self.available_blocks = torch.arange(
             0,
             num_blocks,
@@ -352,15 +350,6 @@ class RBLNOptimumDecoderMixin:
                     "at index %d: %s", src_block, dst_block, block_idx, e)
                 logger.error(error_msg)
                 raise RuntimeError(error_msg) from e
-
-    def sample(
-        self,
-        logits: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
-    ) -> Optional[SamplerOutput]:
-        # Only for V0
-        next_tokens = self.sampler(logits, sampling_metadata)
-        return next_tokens
 
     # It is required for decoder models in openai api server
     def compute_logits(self, hidden_states: torch.Tensor,

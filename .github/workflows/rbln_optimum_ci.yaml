@@ -111,12 +111,6 @@ jobs:
           python3 examples/optimum/run_basic.py
           --model_id ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/gemma-2-2b-8k_batch4
 
-      - name : Run encoder-decoder (V1)
-        run: >
-          python3 examples/optimum/run_encoder_decoder.py
-          --num_input_prompt ${{ env.NUM_INPUT_PROMPT }}
-          --model_id ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/rbln_bart-small_batch2
-
       - name : Run text embedding model (V1)
         run: >
           python3 examples/optimum/run_encoder_only.py
@@ -219,22 +213,10 @@ jobs:
            python3 examples/optimum/run_llava.py
            --num_input_prompt ${{ env.NUM_INPUT_PROMPT }}
            --model_id ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/llava-v1.6-mistral-7b-hf-32k-b4/
-      
-      - name : Run Llava-next (Eager mode) (V0)
-        run: >
-           VLLM_USE_V1=0 python3 examples/optimum/run_llava.py
-           --num_input_prompt ${{ env.NUM_INPUT_PROMPT }}
-           --model_id ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/llava-v1.6-mistral-7b-hf-32k-b4/
-
+    
       - name : Run Llava-next (Flash-attention mode) (V1)
         run: >
           python3 examples/optimum/run_llava.py
-          --num_input_prompt ${{ env.NUM_INPUT_PROMPT }}
-          --model_id ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/llava-v1.6-mistral-7b-hf-32k-b4-kv16k
-      
-      - name : Run Llava-next (Flash-attention mode) (V0)
-        run: >
-          VLLM_USE_V1=0 python3 examples/optimum/run_llava.py
           --num_input_prompt ${{ env.NUM_INPUT_PROMPT }}
           --model_id ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/llava-v1.6-mistral-7b-hf-32k-b4-kv16k
 

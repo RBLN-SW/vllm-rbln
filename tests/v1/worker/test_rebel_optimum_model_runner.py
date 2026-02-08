@@ -41,6 +41,7 @@ def get_vllm_config(async_scheduling=False):
         max_num_batched_tokens=128,
         max_model_len=128,
         async_scheduling=async_scheduling,
+        is_encoder_decoder=False,
     )
     model_config = ModelConfig(
         model="facebook/opt-125m",
@@ -104,7 +105,7 @@ def _is_req_state_block_table_match(model_runner, req_id: str) -> bool:
     num_block_of_req_state = len(req_state.block_ids[0])
     if num_block_of_runner != num_block_of_req_state:
         return False
-    return (block_table.block_table_np[req_index, :num_block_of_runner] ==
+    return (block_table.block_table.np[req_index, :num_block_of_runner] ==
             req_state.block_ids[0]).all()
 
 
@@ -146,8 +147,6 @@ def test_update_states_request_finished(model_runner):
         num_common_prefix_blocks=0,
         finished_req_ids={req_id},
         free_encoder_mm_hashes=[],
-        structured_output_request_ids={},
-        grammar_bitmask=None,
     )
 
     metadata_before = model_runner.input_batch.sampling_metadata
@@ -180,8 +179,6 @@ def test_update_states_request_resumed(model_runner):
         num_common_prefix_blocks=0,
         finished_req_ids=set(),
         free_encoder_mm_hashes=[],
-        structured_output_request_ids={},
-        grammar_bitmask=None,
     )
 
     model_runner._update_states(scheduler_output)
@@ -191,10 +188,12 @@ def test_update_states_request_resumed(model_runner):
     # resume request
     cached_req_data = CachedRequestData(
         req_ids=[req_id],
-        resumed_from_preemption=[False],
+        resumed_req_ids=set(),
         new_token_ids=[],
+        all_token_ids={},
         new_block_ids=[([0], )],
         num_computed_tokens=[0],
+        num_output_tokens=[0],
     )
 
     scheduler_output = RBLNSchedulerOutput(
@@ -207,8 +206,6 @@ def test_update_states_request_resumed(model_runner):
         num_common_prefix_blocks=0,
         finished_req_ids=set(),
         free_encoder_mm_hashes=[],
-        structured_output_request_ids={},
-        grammar_bitmask=None,
     )
 
     metadata_before = model_runner.input_batch.sampling_metadata

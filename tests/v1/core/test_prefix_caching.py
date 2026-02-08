@@ -16,7 +16,7 @@ import pytest
 import torch
 from vllm import SamplingParams
 from vllm.platforms import current_platform
-from vllm.utils import sha256
+from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_utils import (get_request_block_hasher,
                                          init_none_hash)
 from vllm.v1.request import Request, RequestStatus

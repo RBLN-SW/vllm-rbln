@@ -14,7 +14,6 @@
 from typing import Any, Optional
 
 import torch
-import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.gemma3_mm import (Gemma3DummyInputsBuilder,
@@ -41,7 +40,7 @@ PAD_TOKEN_ID = 0
 
 class RBLNGemma3MultiModalProcessor(Gemma3MultiModalProcessor):
 
-    def _pad_for_gemma3(self, prompt_ids: list[int], prompt: str):
+    def _pad_for_gemma3(self, prompt_ids: list[int]):
         token_type_ids = (torch.tensor(prompt_ids) ==
                           self.info.get_hf_processor().image_token_id)
 
@@ -58,22 +57,18 @@ class RBLNGemma3MultiModalProcessor(Gemma3MultiModalProcessor):
                 image_prefill_chunk_size -
                 (image_start + padded_seq_len) % image_prefill_chunk_size)
             padded_seq_len += pad_needed
-
-        pad_token = self.info.get_hf_processor().tokenizer.pad_token
         # To pad the image token
         # not using pad_token_id
         # NOTE: Left padding for Gemma3
         prompt_ids = [IMG_PAD_TOKEN_ID] * padded_seq_len + prompt_ids
-        prompt = pad_token * padded_seq_len + prompt
-        return prompt_ids, prompt
+        return prompt_ids
 
     def apply(self, *args, **kwargs):
+        # NOTE: Check if padding works correctly
         output = super().apply(*args, **kwargs)
-        prompt_ids, prompt = self._pad_for_gemma3(output["prompt_token_ids"],
-                                                  output["prompt"])
+        prompt_ids = self._pad_for_gemma3(output["prompt_token_ids"])
 
         output["prompt_token_ids"] = prompt_ids
-        output["prompt"] = prompt
 
         return output
 
@@ -120,10 +115,7 @@ class RBLNOptimumGemma3ForConditionalGeneration(
         position_ids = model_input.input_positions
         block_tables = model_input.block_tables
 
-        if envs.VLLM_USE_V1:
-            is_prompt = model_input.is_prompt
-        else:
-            is_prompt = model_input.sampling_metadata.num_prompts > 0
+        is_prompt = model_input.is_prompt
 
         finished_requests_ids = model_input.finished_requests_ids
         running_requests_ids = model_input.running_requests_ids
@@ -266,11 +258,11 @@ class RBLNOptimumGemma3ForConditionalGeneration(
         if pixel_values is None:
             return None
 
-        if not isinstance(pixel_values, (torch.Tensor, list)):
+        if not isinstance(pixel_values, torch.Tensor | list):
             raise ValueError("Incorrect type of pixel values. "
                              f"Got type: {type(pixel_values)}")
 
-        if not isinstance(num_crops, (torch.Tensor, list)):
+        if not isinstance(num_crops, torch.Tensor | list):
             raise ValueError("Incorrect type of num_crops. "
                              f"Got type: {type(num_crops)}")
 

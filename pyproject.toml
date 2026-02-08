@@ -39,6 +39,7 @@ dependencies = [
     "datasets",
     "qwen_vl_utils",
     "vllm==0.13.0",
+    "optimum-rbln>=0.10.1a1",
 ]
 
 [project.optional-dependencies]
@@ -133,7 +134,6 @@ follow_imports = "silent"
 # move the directory here and remove it from tools/mypy.sh
 files = [
     "vllm_rbln/*.py",
-    "vllm_rbln/core",
 ]
 
 [tool.codespell]

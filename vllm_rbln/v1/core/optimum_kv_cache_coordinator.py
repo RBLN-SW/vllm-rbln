@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from vllm.v1.core.kv_cache_coordinator import UnitaryKVCacheCoordinator
+from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.single_type_kv_cache_manager import (
     get_manager_for_kv_cache_spec)
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -33,13 +34,18 @@ class RBLNKVCacheCoordinator(UnitaryKVCacheCoordinator):
         enable_caching: bool,
         enable_kv_cache_events: bool,
         dcp_world_size: int,
+        pcp_world_size: int,
+        hash_block_size: int,
+        metrics_collector: KVCacheMetricsCollector | None = None,
     ):
         self.kv_cache_config = kv_cache_config
         self.max_model_len = max_model_len
         self.enable_caching = enable_caching
 
         self.block_pool = RBLNBlockPool(kv_cache_config.num_blocks,
-                                        enable_caching, enable_kv_cache_events)
+                                        enable_caching, hash_block_size,
+                                        enable_kv_cache_events,
+                                        metrics_collector)
 
         # Needs special handling for find_longest_cache_hit if eagle is enabled
         self.use_eagle = use_eagle
@@ -57,7 +63,14 @@ class RBLNKVCacheCoordinator(UnitaryKVCacheCoordinator):
             0].kv_cache_spec
         self.block_size = self.kv_cache_spec.block_size
         self.dcp_world_size = dcp_world_size
+        self.pcp_world_size = pcp_world_size
         if dcp_world_size > 1:
             self.block_size *= dcp_world_size
+        if pcp_world_size > 1:
+            self.block_size *= pcp_world_size
+        # For models using only Mamba, block_size is set to max_model_len when
+        # prefix caching is disabled, and hash_block_size validation is skipped.
+        assert not enable_caching or (hash_block_size == self.block_size), (
+            "UnitaryKVCacheCoordinator assumes hash_block_size == block_size")
         assert len(self.kv_cache_config.kv_cache_groups) == 1, (
             "UnitaryKVCacheCoordinator assumes only one kv cache group")

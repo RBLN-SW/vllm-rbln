@@ -25,7 +25,6 @@ from vllm_rbln.utils.optimum.registry import (_RBLN_MULTIMODAL_MODELS,
 from .blip2 import RBLNOptimumBlip2ForConditionalGeneration  # noqa: F401
 from .decoder_only import RBLNOptimumForCausalLM
 from .encoder import RBLNOptimumForEncoderModel
-from .encoder_decoder import RBLNOptimumEncoderDecoder
 from .gemma3 import RBLNOptimumGemma3ForConditionalGeneration  # noqa: F401
 from .idefics3 import RBLNOptimumIdefics3ForConditionalGeneration  # noqa: F401
 from .llava import RBLNOptimumLlavaForConditionalGeneration  # noqa: F401
@@ -76,8 +75,9 @@ def load_model(vllm_config: VllmConfig) -> nn.Module:
             rbln_model = RBLNOptimumWhisperForConditionalGeneration(
                 vllm_config)
         else:
-            # TODO: It will be deprecated in the future.
-            rbln_model = RBLNOptimumEncoderDecoder(vllm_config)
+            raise NotImplementedError(
+                "Encoder-decoder models are not supported"
+                "since vLLM RBLN v0.10.1")
     elif is_pooling_arch(model_config.hf_config):
         assert vllm_config.cache_config.enable_prefix_caching in (
             False, None
