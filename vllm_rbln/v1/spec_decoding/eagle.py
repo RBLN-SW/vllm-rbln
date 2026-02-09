@@ -202,6 +202,9 @@ def custom_propose(
     extra_attn_metadata_args[
         "num_tokens"] = self.runner.input_batch.num_tokens_no_spec
     extra_attn_metadata_args["positions"] = target_positions.cpu()
+    extra_attn_metadata_args[
+        "batch_pad"] = self.runner.bucketing_manager.find_decode_batch_bucket(
+            batch_size)
     attn_metadata = attn_metadata_builder.build(
         common_prefix_len=0,
         common_attn_metadata=common_attn_metadata,
@@ -380,16 +383,10 @@ def custom_propose(
         # of main model.
         # Increment the sequence lengths.
         common_attn_metadata.seq_lens += 1
-        # This is an out-of-place operation to avoid modifying
-        # the original tensor.
-        common_attn_metadata.seq_lens_cpu = \
-            common_attn_metadata.seq_lens_cpu + 1
-
         # For the requests that exceed the max model length, we set the
         # sequence length to 1 to minimize their overheads in attention.
-        # common_attn_metadata.seq_lens.masked_fill_(exceeds_max_model_len, 1)
-        common_attn_metadata.num_computed_tokens_cpu = (
-            common_attn_metadata.seq_lens_cpu - 1)
+        common_attn_metadata.seq_lens.masked_fill_(
+            exceeds_max_model_len.view(-1), 1)
 
         # Compute the slot mapping.
         if self.uses_mrope:
@@ -417,9 +414,10 @@ def custom_propose(
         # Rebuild attention metadata
         extra_attn_metadata_args = {}
         extra_attn_metadata_args[
-            "num_tokens"] = common_attn_metadata.num_computed_tokens_cpu.numpy(
-            )
+            "num_tokens"] = common_attn_metadata.seq_lens.cpu().numpy()
         extra_attn_metadata_args["positions"] = positions.cpu()
+        extra_attn_metadata_args["batch_pad"] = \
+            self.runner.bucketing_manager.find_decode_batch_bucket(batch_size)
         attn_metadata = attn_metadata_builder.build(
             common_prefix_len=0,
             common_attn_metadata=common_attn_metadata,
