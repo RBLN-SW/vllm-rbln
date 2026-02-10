@@ -855,6 +855,7 @@ class RBLNFlashAttentionMetadata:
     cache_offsets: Optional[torch.Tensor] = None
     local_block_tables: Optional[torch.Tensor] = None
 
+    is_prefill: bool = False
 
 class RBLNFlashAttentionMetadataBuilder(
         AttentionMetadataBuilder[RBLNFlashAttentionMetadata]):
@@ -1044,6 +1045,7 @@ class RBLNFlashAttentionMetadataBuilder(
             if cache_offsets is not None else None,
             local_block_tables=local_block_tables.to(self.device)
             if local_block_tables is not None else None,
+            is_prefill=bool(is_prefills[0])
         )
 
         return attn_metadata
@@ -1234,7 +1236,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                 sliding_window_attention_naive_decode = (
                     sliding_window_attention_naive_decode_impl)
 
-            if q_len == 1:
+            if not attn_metadata.is_prefill:
                 attn_output = sliding_window_attention_naive_decode(  # noqa: E501
                     query,
                     key,
@@ -1245,7 +1247,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                     self.scale,
                     attn_metadata.local_block_tables,
                     self.scale,  # dummy
-                    self.sinks,
+                    # self.sinks,
                 )
             else:
                 attn_output = sliding_window_attention_naive_prefill(  # noqa: E501
@@ -1258,7 +1260,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                     self.scale,
                     attn_metadata.local_block_tables,
                     self.scale,  # dummy
-                    self.sinks,
+                    # self.sinks,
                 )
         # actually non-flash paged attention DOES NOT use slot_mapping
         elif self.is_causal:
@@ -1290,7 +1292,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
             #   original sequence index
             # * otherwise         - seq_lens[B, P] == dyn_size_for_partitions,
             #   dynamic size for each partition
-            if q_len == 1:
+            if not attn_metadata.is_prefill:
                 attn_output = flash_causal_attention_naive_decode(  # noqa: E501
                     query,
                     key,
@@ -1300,7 +1302,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                     attn_metadata.seq_lens.to(torch.int16),
                     attn_metadata.block_tables.to(torch.int16),
                     self.scale,  # dummy
-                    self.sinks,
+                    # self.sinks,
                 )
             else:
                 attn_output = flash_causal_attention_naive_prefill(  # noqa: E501
@@ -1312,7 +1314,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                     attn_metadata.seq_lens.to(torch.int16),
                     attn_metadata.block_tables.to(torch.int16),
                     self.scale,  # dummy
-                    self.sinks,
+                    # self.sinks,
                 )
         else:
             if envs.VLLM_RBLN_COMPILE_MODEL:
@@ -1337,7 +1339,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                 flash_attention_naive_decode = (
                     flash_attention_naive_decode_impl)
 
-            if q_len == 1:
+            if not attn_metadata.is_prefill:
                 attn_output = flash_attention_naive_decode(  # noqa: E501
                     query,
                     key,
@@ -1348,7 +1350,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                     attn_metadata.seq_lens.to(torch.int16),
                     attn_metadata.block_tables.to(torch.int16),
                     self.scale,  # dummy
-                    self.sinks,
+                    # self.sinks,
                 )
             else:
                 attn_output = flash_attention_naive_prefill(  # noqa: E501
@@ -1361,7 +1363,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                     attn_metadata.seq_lens.to(torch.int16),
                     attn_metadata.block_tables.to(torch.int16),
                     self.scale,  # dummy
-                    self.sinks,
+                    # self.sinks,
                 )
 
         # 2. attention output reshape for attention backend return
