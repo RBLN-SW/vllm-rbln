@@ -117,6 +117,7 @@ class RblnPlatform(Platform):
         model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
         scheduler_config = vllm_config.scheduler_config
+        cache_config = vllm_config.cache_config
 
         if envs.VLLM_RBLN_USE_VLLM_MODEL:
             if envs.VLLM_RBLN_ENFORCE_MODEL_FP32:
@@ -171,6 +172,12 @@ class RblnPlatform(Platform):
 
                 if (lora_config := vllm_config.lora_config) is not None:
                     lora_config.lora_dtype = torch.float16
+
+            # FIXME(RBLN): rmove block size constraint from speculative decoding
+            if vllm_config.speculative_config is not None:
+                assert model_config.max_model_len == cache_config.block_size, (
+                    "block_size must be set to max_model_len with speculative decoding."
+                )
         else:
             # NOTE(eunji.lee):
             # It is for multimodal models
