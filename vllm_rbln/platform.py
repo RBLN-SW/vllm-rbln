@@ -119,6 +119,10 @@ class RblnPlatform(Platform):
         scheduler_config = vllm_config.scheduler_config
 
         if envs.VLLM_RBLN_USE_VLLM_MODEL:
+            assert scheduler_config.enable_chunked_prefill, (
+                "RBLN does not officially support disabling chunked prefill. "
+                "Please don't disable chunked prefill by yourself."
+            )
             if envs.VLLM_RBLN_ENFORCE_MODEL_FP32:
                 logger.info("original model_config.dtype = %s", model_config.dtype)
                 if model_config.dtype == torch.bfloat16:

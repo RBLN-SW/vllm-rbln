@@ -13,7 +13,6 @@
 # limitations under the License.
 """Attention layer with FlashAttention."""
 
-import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -1116,11 +1115,7 @@ class RBLNFlashAttentionMetadataBuilder(
             # NOTE(jiwoo.park) prefill's block_tables must be a 1D tensor.
             block_tables_tensor = block_tables_tensor[0]
             if not self.is_causal:
-                prefill_chunk_size = (
-                    self.chunked_prefill_size
-                    if self.chunked_prefill
-                    else 1 << (math.ceil(math.log2(query_max_seq_len)))
-                )
+                prefill_chunk_size = self.chunked_prefill_size
                 chunked_attention_mask = torch.zeros(
                     1,
                     1,

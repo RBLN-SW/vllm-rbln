@@ -14,7 +14,6 @@
 
 import contextlib
 import itertools
-import math
 import os
 import time
 from collections import defaultdict
@@ -2508,12 +2507,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             )
             if is_prefills[0]:
                 # prefill chunk padding
-                max_seq_len = int(self.seq_lens.np[:num_reqs].max())
-                prefill_size = (
-                    self.scheduler_config.max_num_batched_tokens
-                    if self.scheduler_config.enable_chunked_prefill
-                    else 1 << (math.ceil(math.log2(max_seq_len)))
-                )
+                prefill_size = self.scheduler_config.max_num_batched_tokens
                 input_ids = rbln_utils.pad(input_ids, -1, prefill_size)
                 positions = rbln_utils.pad(positions, -1, prefill_size)
             else:
