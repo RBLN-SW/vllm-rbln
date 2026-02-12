@@ -25,8 +25,8 @@ def attention_naive_prefill(
     query_base,
     key_base,
     value_base,
-    attn_mask_base,
     kv_cache_base,
+    attn_mask_base,
     output_base,
     seq_idx_base,
     qk_scale,
@@ -216,8 +216,8 @@ def attention_naive_decode(
     query_base,
     key_base,
     value_base,
-    attn_mask_base,
     kv_cache_base,
+    attn_mask_base,
     output_base,
     seq_idx_base,
     qk_scale,
@@ -403,7 +403,7 @@ def attention_naive_decode(
 
 
 def warmup(func, *args):
-    kernel = func.warmup(*args, grid=(1,), host_layout="1:2:4")
+    kernel = func.warmup(*args, grid=(1,), host_layout="1:2:3")
     rblib.write_rtosa(kernel, args)
 
     return kernel
@@ -414,8 +414,8 @@ def _(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    mask: torch.Tensor,
     kv_cache: torch.Tensor,
+    mask: torch.Tensor,
     seq_idx: torch.Tensor,
     qk_scale: torch.Tensor,
     block_table: torch.Tensor,
@@ -473,8 +473,8 @@ def _(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    mask: torch.Tensor,
     kv_cache: torch.Tensor,
+    mask: torch.Tensor,
     seq_idx: torch.Tensor,
     qk_scale: torch.Tensor,
     block_table: torch.Tensor,
@@ -533,8 +533,8 @@ def _(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    mask: torch.Tensor,
     kv_cache: torch.Tensor,
+    mask: torch.Tensor,
     seq_idx: torch.Tensor,
     qk_scale: torch.Tensor,
     block_table: torch.Tensor,
@@ -548,8 +548,8 @@ def _(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    mask: torch.Tensor,
     kv_cache: torch.Tensor,
+    mask: torch.Tensor,
     seq_idx: torch.Tensor,
     qk_scale: torch.Tensor,
     block_table: torch.Tensor,
