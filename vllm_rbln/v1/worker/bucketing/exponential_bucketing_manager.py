@@ -18,12 +18,31 @@ from .bucketing_manager import RBLNBucketingManager
 class ExponentialBucketingManager(RBLNBucketingManager):
     """Generates decode buckets by shrinking size with each division step."""
 
+    def __init__(
+        self,
+        max_batch_size: int,
+        min_batch_size: int,
+        limit: int,
+        step: int,
+    ):
+        RBLNBucketingManager.check_config(
+            max_batch_size=max_batch_size,
+            min_batch_size=min_batch_size,
+            limit=limit,
+            step=step,
+        )
+        self.min_batch_size = min_batch_size
+        self.limit = limit
+        self.step = step
+        super().__init__(max_batch_size=max_batch_size)
+
     def _build_decode_buckets(self) -> None:
         """Fill buckets that shrink exponentially."""
         if self.step <= 1:
             raise ValueError(
                 "For exponential bucketing, step must be greater than 1, "
-                "step: %d", self.step)
+                f"step: {self.step}",
+            )
 
         buckets = [self.max_batch_size]
         while len(buckets) < self.limit:

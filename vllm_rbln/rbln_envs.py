@@ -32,7 +32,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_USE_MOE_TOKENS_MASK: bool = True
     VLLM_RBLN_ENFORCE_MODEL_FP32: bool = False
     VLLM_RBLN_MOE_CUSTOM_KERNEL: bool = True
-    VLLM_RBLN_MOE_USE_OPT_KERNEL: bool = False
+    VLLM_RBLN_MOE_USE_OPT_KERNEL: bool = True
     VLLM_RBLN_DP_INPUT_ALL_GATHER: bool = True
     VLLM_RBLN_LOGITS_ALL_GATHER: bool = True
     VLLM_RBLN_NUM_RAY_NODES: int = 1
@@ -42,11 +42,12 @@ if TYPE_CHECKING:
     VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY: str = "exponential"
     VLLM_RBLN_DECODE_BATCH_BUCKET_MIN: int = 1
     VLLM_RBLN_DECODE_BATCH_BUCKET_STEP: int = 2
-    VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT: int = 4
+    VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT: int = 1
+    VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS: list[int] = []
     VLLM_RBLN_NUMA: bool = True
 
 
-def get_dp_impl():
+def get_dp_impl() -> str:
     dp_impl = os.environ.get("VLLM_RBLN_DP_IMPL")
     if dp_impl is None:
         return "padded_decode"
@@ -59,6 +60,51 @@ def get_dp_impl():
                          f"Valid choices: {choices}")
     return current_impl
 
+def get_decode_batch_bucket_strategy() -> str:
+    decode_batch_bucket_strategy = \
+        os.environ.get("VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY")
+    if decode_batch_bucket_strategy is None:
+        return "exponential"
+    choices = set(["exponential", "exp", "linear", "manual"])
+    current_strategy = decode_batch_bucket_strategy.lower()
+    if current_strategy not in choices:
+        raise ValueError(
+            f"Invalid VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY: {current_strategy}, "
+            f"Valid choices: {choices}", )
+    if current_strategy == "manual":
+        buckets = get_decode_batch_bucket_manual_buckets()
+        if len(buckets) < 1:
+            raise ValueError(
+                "There must be at least one decode "
+                "batch size in the manual buckets")
+    elif current_strategy == "exp":
+        return "exponential"
+    return current_strategy
+
+def get_decode_batch_bucket_manual_buckets() -> list[int]:
+    manual_buckets = \
+        os.environ.get("VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS")
+    if manual_buckets is None:
+        return []
+    try:
+        buckets = [int(bucket) for bucket in manual_buckets.split(",")]
+        if any(bucket <= 0 for bucket in buckets):
+            raise ValueError(
+                "All decode batch bucket manual buckets "
+                "must be greater than 0")
+        if len(buckets) < 1:
+            raise ValueError(
+                "There must be at least one decode batch size "
+                "in the manual buckets")
+        if len(buckets) != len(set(buckets)):
+            raise ValueError(
+                "All decode batch bucket manual buckets "
+                "must be unique")
+        return buckets
+    except ValueError as e:
+        raise ValueError(
+            f"Invalid VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS: "
+            f"{manual_buckets}, {e}")
 
 # extended environments
 environment_variables = {
@@ -145,10 +191,9 @@ environment_variables = {
     "VLLM_RBLN_SORT_BATCH":
     (lambda: os.environ.get("VLLM_RBLN_SORT_BATCH", "False").lower() in
      ("true", "1")),
-    # Decode batch bucket strategy [exponential, exp, linear]
+    # Decode batch bucket strategy [exponential, exp, linear, manual]
     "VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY":
-    lambda: os.environ.get("VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY",
-                           "exponential"),
+    get_decode_batch_bucket_strategy,
     # Decode batch bucket min
     "VLLM_RBLN_DECODE_BATCH_BUCKET_MIN":
     lambda: int(os.environ.get("VLLM_RBLN_DECODE_BATCH_BUCKET_MIN", 1)),
@@ -158,6 +203,9 @@ environment_variables = {
     # Decode batch bucket limit
     "VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT":
     lambda: int(os.environ.get("VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT", 1)),
+    # Decode batch bucket manual buckets
+    "VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS":
+    get_decode_batch_bucket_manual_buckets,
     # Enable NUMA-based CPU affinity binding for OpenMP threads
     "VLLM_RBLN_NUMA":
     (lambda: os.environ.get("VLLM_RBLN_NUMA", "True").lower() in

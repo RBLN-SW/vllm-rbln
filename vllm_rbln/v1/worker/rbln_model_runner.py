@@ -97,7 +97,7 @@ from vllm_rbln.v1.attention.backends.flash_attention import (
     RBLNFlashAttentionMetadataBuilder)
 from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 from vllm_rbln.v1.sample import RBLNSampler
-from vllm_rbln.v1.worker.bucketing import get_bucketing_manager_class
+from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
 from vllm_rbln.worker.metrics import PerformanceTracker
 
 if TYPE_CHECKING:
@@ -464,16 +464,16 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.max_num_batched_tokens = (
             self.scheduler_config.max_num_batched_tokens)
 
-        bucketing_manager_class = get_bucketing_manager_class(
-            envs.VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY)
-        self.bucketing_manager = bucketing_manager_class(
+        self.bucketing_manager = get_bucketing_manager(
+            envs.VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY,
             max_batch_size=self.max_batch_size,
             min_batch_size=envs.VLLM_RBLN_DECODE_BATCH_BUCKET_MIN,
             step=envs.VLLM_RBLN_DECODE_BATCH_BUCKET_STEP,
             limit=envs.VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT,
+            manual_buckets=envs.VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS,
         )
         logger.info("Using %s bucketing manager",
-                    bucketing_manager_class.__name__)
+                    type(self.bucketing_manager).__name__)
         logger.info("decode batch buckets: %s",
                     self.bucketing_manager.decode_batch_buckets)
 

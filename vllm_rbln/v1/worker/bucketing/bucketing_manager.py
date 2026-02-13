@@ -21,29 +21,8 @@ class RBLNBucketingManager(ABC):
     def __init__(
         self,
         max_batch_size: int,
-        min_batch_size: int = 1,
-        limit: int = 32,
-        step: int = 2,
     ):
         self.max_batch_size = max_batch_size
-        self.min_batch_size = min_batch_size
-        self.limit = limit
-        self.step = step
-
-        if self.max_batch_size < self.min_batch_size:
-            raise ValueError(
-                "max_batch_size must be >= min_batch_size, "
-                f"max_batch_size: {self.max_batch_size}, "
-                f"min_batch_size: {self.min_batch_size}", )
-        if self.limit <= 0:
-            raise ValueError(
-                f"limit must be greater than 0, limit: {self.limit}")
-        if self.step <= 0:
-            raise ValueError(f"step must be greater than 0, step: {self.step}")
-        if self.min_batch_size <= 0:
-            raise ValueError(
-                "min_batch_size must be greater than 0, "
-                f"min_batch_size: {self.min_batch_size}", )
 
         # build the decode buckets
         self.decode_batch_buckets: list[int]
@@ -70,3 +49,26 @@ class RBLNBucketingManager(ABC):
         raise ValueError(
             "No batch bucket found for batch size %d, "
             "batch buckets: %s", batch_size, self.batch_buckets)
+
+    @staticmethod
+    def check_config(
+        max_batch_size: int,
+        min_batch_size: int,
+        limit: int,
+        step: int,
+    ) -> None:
+        """Check if the config is valid."""
+        if max_batch_size < min_batch_size:
+            raise ValueError(
+                "max_batch_size must be >= min_batch_size, "
+                f"max_batch_size: {max_batch_size}, "
+                f"min_batch_size: {min_batch_size}", )
+        if limit <= 0:
+            raise ValueError(
+                f"limit must be greater than 0, limit: {limit}")
+        if step <= 0:
+            raise ValueError(f"step must be greater than 0, step: {step}")
+        if min_batch_size <= 0:
+            raise ValueError(
+                "min_batch_size must be greater than 0, "
+                f"min_batch_size: {min_batch_size}", )

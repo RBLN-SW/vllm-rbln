@@ -15,20 +15,52 @@
 from .bucketing_manager import RBLNBucketingManager
 from .exponential_bucketing_manager import ExponentialBucketingManager
 from .linear_bucketing_manager import LinearBucketingManager
+from .manual_bucketing_manager import ManualBucketingManager
 
 __all__ = [
     "RBLNBucketingManager",
     "ExponentialBucketingManager",
     "LinearBucketingManager",
+    "ManualBucketingManager",
+    "get_bucketing_manager",
 ]
 
 
-def get_bucketing_manager_class(strategy: str) -> type[RBLNBucketingManager]:
-    if strategy == "exponential" or strategy == "exp":
-        return ExponentialBucketingManager
+def get_bucketing_manager(
+    strategy: str,
+    *,
+    max_batch_size: int,
+    min_batch_size: int = 1,
+    limit: int = 1,
+    step: int = 2,
+    manual_buckets: list[int] = [],
+) -> type[RBLNBucketingManager]:
+    """Create a bucketing manager for the given strategy.
+
+    Caller can pass all possible args; only the ones required by the
+    selected strategy are forwarded to the manager class.
+    """
+    if strategy == "exponential":
+        return ExponentialBucketingManager(
+            max_batch_size=max_batch_size,
+            min_batch_size=min_batch_size,
+            limit=limit,
+            step=step,
+        )
     elif strategy == "linear":
-        return LinearBucketingManager
+        return LinearBucketingManager(
+            max_batch_size=max_batch_size,
+            min_batch_size=min_batch_size,
+            limit=limit,
+            step=step,
+        )
+    elif strategy == "manual":
+        return ManualBucketingManager(
+            max_batch_size=max_batch_size,
+            manual_buckets=manual_buckets,
+        )
     else:
         raise ValueError(
             f"Invalid bucketing strategy: {strategy}. "
-            "Valid strategies are [exponential, exp, linear].", )
+            "Valid strategies are [exponential, exp, linear, manual].",
+        )
