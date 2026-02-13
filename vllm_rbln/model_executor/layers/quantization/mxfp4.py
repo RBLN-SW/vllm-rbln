@@ -415,7 +415,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 expert_map_const = torch.tensor(expert_map_list,
                                                 dtype=torch.int32)
 
-            use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
+            use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK and self.moe.use_ep
             if use_moe_tokens_mask:
                 tokens_mask = get_tokens_mask(num_tokens)
                 router_logits = router_logits + tokens_mask

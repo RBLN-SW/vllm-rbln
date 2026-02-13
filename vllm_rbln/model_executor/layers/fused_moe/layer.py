@@ -254,7 +254,7 @@ def get_tokens_mask(num_tokens: int, left=0.0, right=float('-inf')):
 
 
 # based on custom fused moe expert kernel
-def get_masked_routing_weights(router_logits, top_k, renormalize, expert_map):
+def get_masked_routing_weights(router_logits, top_k, renormalize, expert_map, use_ep):
     # routing_weights: (batch * sequence_length, n_experts)
     # selected_experts: (batch * sequence_length, top_k)
     if renormalize:
@@ -270,7 +270,7 @@ def get_masked_routing_weights(router_logits, top_k, renormalize, expert_map):
                                                         k=top_k,
                                                         dim=-1)
 
-    use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
+    use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK and use_ep
     if use_moe_tokens_mask:
         tokens_mask = get_tokens_mask(router_logits.shape[0], 1.0, 0.0)
         selected_weights = selected_weights * tokens_mask
@@ -346,7 +346,7 @@ def unquantized_fused_moe_method_custom(
     router_logits = router_logits.reshape(num_tokens, -1)
 
     masked_routing_weights, expert_select_count = get_masked_routing_weights(
-        router_logits, top_k, renormalize, expert_map)
+        router_logits, top_k, renormalize, expert_map, self.use_ep)
     final_hidden_states = torch.ops.rbln_custom_ops.custom_moe_glu(
         hidden_states, gate_proj_weight, up_proj_weight, down_proj_weight,
         masked_routing_weights, expert_select_count)
@@ -397,7 +397,7 @@ def unquantized_fused_optimize_moe_method_custom(
         expert_map_list = expert_map.tolist()
         expert_map_const = torch.tensor(expert_map_list, dtype=torch.int32)
 
-    use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
+    use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK and self.use_ep
     if use_moe_tokens_mask:
         tokens_mask = get_tokens_mask(num_tokens)
         router_logits = router_logits + tokens_mask
@@ -421,7 +421,7 @@ def fused_moe_forward_rbln(self, hidden_states: torch.Tensor,
                            router: torch.nn.Module) -> torch.Tensor:
     assert self.quant_method is not None
 
-    if self.dp_size > 1:
+    if self.dp_size > 1 and self.use_ep:
         org_hidden_shape = hidden_states.shape
 
         # input broadcast - all DPs broadcast hidden_states & router_logits
@@ -459,7 +459,7 @@ def fused_moe_forward_rbln(self, hidden_states: torch.Tensor,
         apply_router_weight_on_input=self.apply_router_weight_on_input,
     )
 
-    if self.dp_size > 1:
+    if self.dp_size > 1 and self.use_ep:
         # output all_reduce == dp all_reduce + tp all_reduce
         all_hidden_states = get_dp_group().all_reduce(final_hidden_states)
         hidden_shape_dp = (-1, 1, org_hidden_shape[-1])

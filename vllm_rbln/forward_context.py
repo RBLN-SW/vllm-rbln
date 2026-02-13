@@ -87,9 +87,10 @@ class RBLNDPMetadata(DPMetadata):
         num_tokens_across_dp: torch.Tensor | None = None,
         num_padded_tokens: int | None = None,
     ) -> "RBLNDPMetadata":
-        dp_size = parallel_config.data_parallel_size
+        enable_dp = parallel_config.data_parallel_size > 1 \
+                and parallel_config.enable_expert_parallel
 
-        if dp_size > 1:
+        if enable_dp:
             assert num_tokens_across_dp is not None, \
                 "num_tokens_across_dp should be applied for DP case"
             assert num_padded_tokens is not None, \
@@ -136,9 +137,10 @@ def _set_forward_context(
         vfc.forward_start_time = time.perf_counter()
 
     dp_metadata: DPMetadata | None = None
-    enable_dp = vllm_config.parallel_config.data_parallel_size > 1
+    enable_dp = vllm_config.parallel_config.data_parallel_size > 1 \
+                and vllm_config.parallel_config.enable_expert_parallel
     use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
-    if (enable_dp or use_moe_tokens_mask) and (attn_metadata is not None
+    if (enable_dp and use_moe_tokens_mask) and (attn_metadata is not None
                                                or num_tokens is not None):
         dp_metadata = RBLNDPMetadata.make(vllm_config.parallel_config,
                                           num_tokens or 0,
