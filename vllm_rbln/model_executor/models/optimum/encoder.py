@@ -62,6 +62,13 @@ class RBLNOptimumForEncoderModel(RBLNOptimumModelBase, VllmModelForPooling):
     ) -> None:
         super().__init__(vllm_config=vllm_config)
         pooler_config = vllm_config.model_config.pooler_config
+        # NOTE:
+        # In vLLM, the default pooling type is set to LAST token pooling,
+        # which is suitable for decoder or encoder-decoder models.
+        # However, for encoder-only models (e.g., BERT),
+        # CLS token pooling is more appropriate.
+        # Therefore, we override the pooling type to CLS here.
+        pooler_config.pooling_type = "CLS"
         assert pooler_config is not None
         # https://github.com/vllm-project/vllm/blob/72506c98349d6bcd32b4e33eec7b5513453c1502/docs/models/pooling_models.md?plain=1#L312
         # encode task is split into `token_embed` and `token_classify` tasks
