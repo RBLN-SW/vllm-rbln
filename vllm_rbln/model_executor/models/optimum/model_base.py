@@ -187,12 +187,6 @@ class RBLNOptimumModelBase(nn.Module):
         else:
             model_cls = getattr(optimum.rbln, model_cls_name)
             assert model_cls is not None
-            logger.info(
-                "Loading the compiled model from %s for %s (%s)...",
-                compiled_path,
-                model_name,
-                model_cls_name,
-            )
             model = model_cls.from_pretrained(compiled_path, export=False)
             logger.info(
                 "model_name = %s, model_cls_name = %s, model_path = %s",
