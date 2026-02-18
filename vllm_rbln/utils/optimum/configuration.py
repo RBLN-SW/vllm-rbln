@@ -26,6 +26,7 @@ from vllm_rbln.logger import init_logger
 from vllm_rbln.utils.optimum.registry import (
     get_rbln_model_info,
     is_enc_dec_arch,
+    is_generation_arch,
     is_multi_modal,
     is_pooling_arch,
 )
@@ -288,9 +289,12 @@ def validate_vllm_config(vllm_config: VllmConfig) -> None:
     )
     # 3. tensor parallelism
     if vllm_config.parallel_config.tensor_parallel_size > 1:
-        vllm_config.additional_config["tensor_parallel_size"] = vllm_config.parallel_config.tensor_parallel_size
+        vllm_config.additional_config["tensor_parallel_size"] = (
+            vllm_config.parallel_config.tensor_parallel_size
+        )
         vllm_config.parallel_config.tensor_parallel_size = 1
         vllm_config.parallel_config.world_size = 1
+
 
 def sync_with_rbln_config(vllm_config: VllmConfig) -> None:
     try:

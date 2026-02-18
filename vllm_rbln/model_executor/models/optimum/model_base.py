@@ -180,7 +180,9 @@ class RBLNOptimumModelBase(nn.Module):
                 batch_size=self.scheduler_config.max_num_seqs,
                 block_size=get_attn_block_size(self.vllm_config),
                 max_model_len=self.model_config.max_model_len,
-                tp_size=self.vllm_config.additional_config.get("tensor_parallel_size", 1),
+                tp_size=self.vllm_config.additional_config.get(
+                    "tensor_parallel_size", 1
+                ),
                 model_path=model_path,
             )
             self.vllm_config.model_config.model = model_path
