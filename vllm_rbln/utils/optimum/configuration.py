@@ -268,11 +268,12 @@ def get_rbln_config(vllm_config: VllmConfig) -> dict | None:
 
 def validate_vllm_config(vllm_config: VllmConfig) -> None:
     # 1. block_size
+    hf_config = vllm_config.model_config.hf_config
     if vllm_config.cache_config.block_size is None:
-        if vllm_config.model_config.max_model_len < 32768:
-            vllm_config.cache_config.block_size = vllm_config.model_config.max_model_len
-        else:
+        if is_multi_modal(hf_config) or is_generation_arch(hf_config):
             vllm_config.cache_config.block_size = 4096
+        else:
+            vllm_config.cache_config.block_size = vllm_config.model_config.max_model_len
     kvcache_block_size = vllm_config.cache_config.block_size
 
     # 2. max_model_len
@@ -285,7 +286,11 @@ def validate_vllm_config(vllm_config: VllmConfig) -> None:
     update_vllm_block_size_for_prefix_caching(
         vllm_config, kvcache_block_size, prefill_chunk_size=128
     )
-
+    # 3. tensor parallelism
+    if vllm_config.parallel_config.tensor_parallel_size > 1:
+        vllm_config.additional_config["tensor_parallel_size"] = vllm_config.parallel_config.tensor_parallel_size
+        vllm_config.parallel_config.tensor_parallel_size = 1
+        vllm_config.parallel_config.world_size = 1
 
 def sync_with_rbln_config(vllm_config: VllmConfig) -> None:
     try:
