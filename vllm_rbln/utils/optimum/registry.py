@@ -20,6 +20,7 @@ from optimum.rbln import (
     RBLNAutoModelForCausalLM,
     RBLNAutoModelForSpeechSeq2Seq,
 )
+import optimum.rbln
 from transformers import PretrainedConfig
 
 from .multimodal import compile_multimodal
@@ -166,6 +167,16 @@ def compile_model(
             hf_model_name,
             **default_param,
         )
+    elif is_pooling_arch(config):
+        model_cls_name = _RBLN_SUPPORTED_MODELS[architectures[0]][1]
+        model_cls = getattr(optimum.rbln, model_cls_name)
+        assert model_cls is not None
+        default_param["rbln_max_seq_len"] = max_model_len
+        if architectures[0] == "Qwen3Model":
+            attn_impl = "flash_attn" if block_size != max_model_len else "eager"
+            default_param["rbln_kvcache_partition_len"] = block_size
+            default_param["rbln_attn_impl"] = attn_impl
+        model = model_cls.from_pretrained(hf_model_name, **default_param)
     elif is_multi_modal(config):
         model = compile_multimodal(
             model_name=hf_model_name,
@@ -185,7 +196,8 @@ def compile_model(
         )
     else:
         raise NotImplementedError(
-            "Compilation is only implemented for generation models for now."
+            "Compilation is not implemented for architecture *s",
+            architectures[0],
         )
     model.save_pretrained(model_path)
     return model
