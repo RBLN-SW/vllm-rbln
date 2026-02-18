@@ -13,6 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from pathlib import Path
+from typing import Any
+
+from optimum.rbln import RBLNAutoModelForCausalLM, RBLNAutoModelForImageTextToText
 from transformers import PretrainedConfig
 
 # modified/customized models for RBLN
@@ -91,6 +95,10 @@ _RBLN_SUPPORTED_MODELS = {
 }
 
 
+def is_generation_arch(config: PretrainedConfig) -> bool:
+    return is_arch_supported(config, _RBLN_GENERATION_MODELS)
+
+
 def is_multi_modal(config: PretrainedConfig) -> bool:
     return is_arch_supported(config, _RBLN_MULTIMODAL_MODELS)
 
@@ -124,3 +132,37 @@ def get_rbln_model_info(config: PretrainedConfig) -> tuple[str, str]:
         f"for now. Supported architectures: "
         f"{list(_RBLN_SUPPORTED_MODELS.keys())}"
     )
+
+
+def compile_model(
+    hf_model_name: str,
+    config: PretrainedConfig,
+    batch_size: int,
+    block_size: int,
+    max_model_len: int,
+    tp_size: int,
+    model_path: Path,
+) -> Any:
+    attn_impl = "flash_attn" if block_size != max_model_len else "eager"
+
+    if is_generation_arch(config):
+        model = RBLNAutoModelForCausalLM.from_pretrained(
+            hf_model_name,
+            export=True,
+            rbln_batch_size=batch_size,
+            rbln_max_seq_len=max_model_len,
+            rbln_tensor_parallel_size=tp_size,
+            rbln_kvcache_partition_len=block_size,
+            rbln_attn_impl=attn_impl,
+        )
+    elif is_multi_modal(config):
+        model = RBLNAutoModelForImageTextToText.from_pretrained(
+            hf_model_name,
+            export=True,
+        )
+    else:
+        raise NotImplementedError(
+            "Compilation is only implemented for generation models for now."
+        )
+    model.save_pretrained(model_path)
+    return model
