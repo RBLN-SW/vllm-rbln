@@ -22,6 +22,7 @@ from optimum.rbln import (
     RBLNAutoModelForSpeechSeq2Seq,
 )
 from transformers import PretrainedConfig
+from .multimodal import compile_multimodal
 
 # modified/customized models for RBLN
 _RBLN_GENERATION_MODELS: dict[str, tuple[str, str]] = {
@@ -166,9 +167,14 @@ def compile_model(
             **default_param,
         )
     elif is_multi_modal(config):
-        model = RBLNAutoModelForImageTextToText.from_pretrained(
-            hf_model_name,
-            **default_param,
+        model = compile_multimodal(
+            model_name=hf_model_name,
+            architecture=architectures[0],
+            model_alias=model_name,
+            batch_size=batch_size,
+            max_model_len=max_model_len,
+            block_size=block_size,
+            tp_size=tp_size,
         )
     elif is_enc_dec_arch(config):
         assert architectures[0] == "WhisperForConditionalGeneration"
