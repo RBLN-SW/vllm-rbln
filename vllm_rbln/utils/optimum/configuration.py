@@ -267,19 +267,6 @@ def get_rbln_config(vllm_config: VllmConfig) -> dict | None:
 
 
 def validate_vllm_config(vllm_config: VllmConfig) -> None:
-    print("@@ validate_vllm_config, block_size", vllm_config.cache_config.block_size)
-    assert vllm_config.scheduler_config.max_num_seqs > 0, (
-        "scheduler_config.max_num_seqs must be greater than 0"
-    )
-    assert vllm_config.model_config.max_model_len >= 4096, (
-        "model_config.max_model_len must be greater than 4096"
-    )
-    assert vllm_config.cache_config.block_size is not None, (
-        "cache_config.block_size must be specified in vllm_config"
-    )
-    assert vllm_config.cache_config.block_size >= 4096, (
-        "cache_config.block_size must be greater than 4096"
-    )
 
     vllm_config.scheduler_config.max_num_batched_tokens = (
         vllm_config.model_config.max_model_len
