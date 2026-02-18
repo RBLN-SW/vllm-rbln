@@ -16,11 +16,11 @@
 from pathlib import Path
 from typing import Any
 
+import optimum.rbln
 from optimum.rbln import (
     RBLNAutoModelForCausalLM,
     RBLNAutoModelForSpeechSeq2Seq,
 )
-import optimum.rbln
 from transformers import PretrainedConfig
 
 from .multimodal import compile_multimodal
