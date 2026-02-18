@@ -18,10 +18,10 @@ from typing import Any
 
 from optimum.rbln import (
     RBLNAutoModelForCausalLM,
-    RBLNAutoModelForImageTextToText,
     RBLNAutoModelForSpeechSeq2Seq,
 )
 from transformers import PretrainedConfig
+
 from .multimodal import compile_multimodal
 
 # modified/customized models for RBLN
