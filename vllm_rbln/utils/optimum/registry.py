@@ -16,7 +16,11 @@
 from pathlib import Path
 from typing import Any
 
-from optimum.rbln import RBLNAutoModelForCausalLM, RBLNAutoModelForImageTextToText
+from optimum.rbln import (
+    RBLNAutoModelForCausalLM,
+    RBLNAutoModelForImageTextToText,
+    RBLNAutoModelForSpeechSeq2Seq,
+)
 from transformers import PretrainedConfig
 
 # modified/customized models for RBLN
@@ -143,22 +147,35 @@ def compile_model(
     tp_size: int,
     model_path: Path,
 ) -> Any:
-    attn_impl = "flash_attn" if block_size != max_model_len else "eager"
-
+    architectures = getattr(config, "architectures", [])
+    model_name, model_cls_name = get_rbln_model_info(
+        config
+    )  # check if the model is supported and get model info
+    default_param: dict[str, Any] = {
+        "export": True,
+        "rbln_batch_size": batch_size,
+        "rbln_tensor_parallel_size": tp_size,
+    }
     if is_generation_arch(config):
+        attn_impl = "flash_attn" if block_size != max_model_len else "eager"
+        default_param["rbln_max_seq_len"] = max_model_len
+        default_param["rbln_kvcache_partition_len"] = block_size
+        default_param["rbln_attn_impl"] = attn_impl
         model = RBLNAutoModelForCausalLM.from_pretrained(
             hf_model_name,
-            export=True,
-            rbln_batch_size=batch_size,
-            rbln_max_seq_len=max_model_len,
-            rbln_tensor_parallel_size=tp_size,
-            rbln_kvcache_partition_len=block_size,
-            rbln_attn_impl=attn_impl,
+            **default_param,
         )
     elif is_multi_modal(config):
         model = RBLNAutoModelForImageTextToText.from_pretrained(
             hf_model_name,
-            export=True,
+            **default_param,
+        )
+    elif is_enc_dec_arch(config):
+        assert architectures[0] == "WhisperForConditionalGeneration"
+        model = RBLNAutoModelForSpeechSeq2Seq.from_pretrained(
+            hf_model_name,
+            rbln_token_timestamps=False,
+            **default_param,
         )
     else:
         raise NotImplementedError(
