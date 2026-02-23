@@ -62,7 +62,7 @@ class RblnPlatform(Platform):
     plugin_name: str = "rbln"
     device_name: str = "cpu"
     device_type: str = "cpu"
-    dispatch_key: str = "CPU"
+    dispatch_key: str = "CPU"  # not used
     ray_device_key: str = "RBLN"
     simple_compile_backend = "bypass"
     device_control_env_var: str = "RBLN_DEVICES"
@@ -182,11 +182,11 @@ class RblnPlatform(Platform):
             else:
                 dtype = model_config.dtype
                 logger.info("original model_config.dtype = %s", dtype)
-                if (
-                    dtype != torch.bfloat16
-                    and dtype != torch.float16
-                    and dtype != torch.float
-                ):
+                # override dtype for rbln compile
+                model_config.dtype = torch.float16
+                logger.info("modified model_config.dtype = %s", model_config.dtype)
+                if dtype != torch.bfloat16 and dtype != torch.float16 \
+                            and dtype != torch.float:
                     logger.warning(
                         "%s not supported on RBLN, only fp32,fp16,bf16 supported", dtype
                     )
