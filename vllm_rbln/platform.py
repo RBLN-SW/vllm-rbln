@@ -62,7 +62,7 @@ class RblnPlatform(Platform):
     plugin_name: str = "rbln"
     device_name: str = "cpu"
     device_type: str = "cpu"
-    dispatch_key: str = "CPU"
+    dispatch_key: str = "CPU"  # not used
     ray_device_key: str = "RBLN"
     simple_compile_backend = "bypass"
     device_control_env_var: str = "RBLN_DEVICES"
