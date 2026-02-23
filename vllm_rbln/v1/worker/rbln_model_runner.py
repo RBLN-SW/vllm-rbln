@@ -876,8 +876,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             )
             .int()
             .argmax(-1)
-            .cpu()
-            .numpy()
+            .tolist()
         )
         for i, num_tokens in enumerate(num_accepted_tokens):
             self.input_batch.num_accepted_tokens_cpu[i] = num_tokens
@@ -1595,7 +1594,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             )
             num_padded_tokens = batch_bucket_size
 
-        return batch_bucket_size, num_padded_tokens, num_tokens_across_dp_cpu
+        return batch_bucket_size, num_padded_tokens, num_tokens_across_dp_cpu.to(self.device)
 
     def _pool(
         self,
@@ -2775,7 +2774,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         logits = self.logits_processor._gather_logits(logits)
                     logits = logits.view(-1, logits.size(-1))
                 else:
-                    selected_token_indices = logits_indices
+                    selected_token_indices = logits_indices.to(self.device)
                     assert selected_token_indices.dim() == 1
                     if is_prefills[0]:  # prefill
                         assert selected_token_indices.size(0) == 1
