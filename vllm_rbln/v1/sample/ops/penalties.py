@@ -54,7 +54,7 @@ def _convert_to_tensors(
         # Use the value of vocab_size as a pad since we don't have a
         # token_id of this value.
         pad=vocab_size,
-        device="cpu",
+        device=device,
         dtype=torch.int64,
     )
     return output_tokens_tensor
