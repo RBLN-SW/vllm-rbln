@@ -58,6 +58,7 @@ def register_ops():
         import vllm_rbln.model_executor.model_loader.weight_loader  # noqa
         import vllm_rbln.models.deepseek_v2  # noqa
         import vllm_rbln.models.gpt_oss  # noqa
+        import vllm_rbln.models.qwen2  # noqa
         import vllm_rbln.models.qwen2_moe  # noqa
         import vllm_rbln.models.qwen3  # noqa
         import vllm_rbln.models.qwen3_moe  # noqa
