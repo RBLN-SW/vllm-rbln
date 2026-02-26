@@ -1118,7 +1118,7 @@ class RBLNFlashAttentionMetadataBuilder(
             "num_tokens is required for RBLN Attention Backend"
         )
         assert batch_pad is not None, "batch_pad is required for RBLN Attention Backend"
-        is_prefills = num_computed_tokens[:num_reqs].numpy() < num_tokens[:num_reqs] - 1
+        is_prefills = num_computed_tokens[:num_reqs].cpu().numpy() < num_tokens[:num_reqs] - 1
         # The prefill and decode cannot be mixed.
         assert len(is_prefills) > 0 and all(
             is_prefill == is_prefills[0] for is_prefill in is_prefills[:num_reqs]
