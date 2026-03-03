@@ -578,6 +578,8 @@ def load_llama4_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> se
 
 
 def load_minimax_m2_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+    import os
+
     stacked_params_mapping = [
         # (param_name, shard_name, shard_id)
         ("qkv_proj", "q_proj", "q"),
@@ -592,7 +594,7 @@ def load_minimax_m2_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -
     params_dict = dict(self.named_parameters())
     loaded_params: set[str] = set()
 
-    load_last_n_layers = getattr(self.config, "_rbln_load_last_n_layers", False)
+    load_last_n_layers = os.environ.get("VLLM_RBLN_LOAD_LAST_N_LAYERS", "false").lower() == "true"
 
     original_num_layers = 0
     if load_last_n_layers:
