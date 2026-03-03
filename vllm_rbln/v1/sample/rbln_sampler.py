@@ -147,7 +147,7 @@ class RBLNTopKTopPSampler(nn.Module):
         options = {
             "compile_context": compile_context
             if compile_context
-            else rebel.CompileContext()
+            else rebel.CompileContext(use_global_ctx=True)
         }
         if envs.VLLM_RBLN_COMPILE_STRICT_MODE:
             options["mode"] = "strict"
