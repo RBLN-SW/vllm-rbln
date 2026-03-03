@@ -1309,7 +1309,9 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
 
         self.is_causal = envs.VLLM_RBLN_FLASH_CAUSAL_ATTN
         self.is_batch_attention_opt = envs.VLLM_RBLN_BATCH_ATTN_OPT
-        self.is_normal = self.block_size == self.max_model_len
+        self.is_normal = (self.block_size == self.max_model_len) and (
+            self.sinks is None
+        )
 
     def forward(
         self,
