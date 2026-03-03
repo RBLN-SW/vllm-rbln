@@ -274,7 +274,9 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         from rebel.compile_context import CompileContext
 
-        self.compile_context = CompileContext(use_weight_sharing=True, use_global_ctx=True)
+        self.compile_context = CompileContext(
+            use_weight_sharing=True, use_global_ctx=True
+        )
 
         # Sampler
         self.use_rbln_sampler = envs.VLLM_RBLN_SAMPLER
