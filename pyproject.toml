@@ -39,7 +39,7 @@ dependencies = [
     "datasets",
     "qwen_vl_utils",
     "vllm==0.13.0",
-    "optimum-rbln>=0.10.1a2",
+    "optimum-rbln>=0.10.1",
 ]
 
 [project.optional-dependencies]
