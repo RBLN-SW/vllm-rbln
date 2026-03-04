@@ -254,7 +254,7 @@ def get_tokens_mask(num_tokens: int, left=0.0, right=float('-inf')):
 
 
 # based on custom fused moe expert kernel
-def get_masked_routing_weights(router_logits, top_k, renormalize, expert_map, use_ep):
+def get_masked_routing_weights(router_logits, top_k, renormalize, expert_map):
     # routing_weights: (batch * sequence_length, n_experts)
     # selected_experts: (batch * sequence_length, top_k)
     if renormalize:
@@ -270,7 +270,7 @@ def get_masked_routing_weights(router_logits, top_k, renormalize, expert_map, us
                                                         k=top_k,
                                                         dim=-1)
 
-    use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK and use_ep
+    use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
     if use_moe_tokens_mask:
         tokens_mask = get_tokens_mask(router_logits.shape[0], 1.0, 0.0)
         selected_weights = selected_weights * tokens_mask
@@ -346,7 +346,7 @@ def unquantized_fused_moe_method_custom(
     router_logits = router_logits.reshape(num_tokens, -1)
 
     masked_routing_weights, expert_select_count = get_masked_routing_weights(
-        router_logits, top_k, renormalize, expert_map, self.use_ep)
+        router_logits, top_k, renormalize, expert_map)
     final_hidden_states = torch.ops.rbln_custom_ops.custom_moe_glu(
         hidden_states, gate_proj_weight, up_proj_weight, down_proj_weight,
         masked_routing_weights, expert_select_count)
@@ -397,7 +397,7 @@ def unquantized_fused_optimize_moe_method_custom(
         expert_map_list = expert_map.tolist()
         expert_map_const = torch.tensor(expert_map_list, dtype=torch.int32)
 
-    use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK and self.use_ep
+    use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
     if use_moe_tokens_mask:
         tokens_mask = get_tokens_mask(num_tokens)
         router_logits = router_logits + tokens_mask

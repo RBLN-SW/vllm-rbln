@@ -140,7 +140,7 @@ def _set_forward_context(
     enable_dp = vllm_config.parallel_config.data_parallel_size > 1 \
                 and vllm_config.parallel_config.enable_expert_parallel
     use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
-    if (enable_dp and use_moe_tokens_mask) and (attn_metadata is not None
+    if (enable_dp or use_moe_tokens_mask) and (attn_metadata is not None
                                                or num_tokens is not None):
         dp_metadata = RBLNDPMetadata.make(vllm_config.parallel_config,
                                           num_tokens or 0,
