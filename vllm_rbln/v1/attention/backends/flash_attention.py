@@ -1010,6 +1010,9 @@ class RBLNFlashAttentionMetadata:
     scheduler_metadata: torch.Tensor | None = None
     prefix_scheduler_metadata: torch.Tensor | None = None
 
+    # To distinguish prefill and decode
+    is_prefill: bool = True
+
     # For RBLN Attention
     attn_masks: torch.Tensor | None = None
     kv_caches: list[torch.Tensor] | None = None
@@ -1211,6 +1214,7 @@ class RBLNFlashAttentionMetadataBuilder(
             prefix_kv_lens=prefix_kv_lens,
             suffix_kv_lens=suffix_kv_lens,
             prefix_scheduler_metadata=prefix_scheduler_metadata,
+            is_prefill=bool(is_prefills[0]),
             attn_masks=attn_masks,
             cache_seq_lens=cache_seq_lens.to(self.device)
             if cache_seq_lens is not None
@@ -1426,7 +1430,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                     sliding_window_attention_naive_decode_impl
                 )
 
-            if q_len == 1:
+            if not attn_metadata.is_prefill:
                 decode_args = [
                     query,
                     key,
@@ -1488,7 +1492,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                             torch.ops.rbln_custom_ops.causal_attention_naive_decode
                         )
 
-                if q_len == 1:
+                if not attn_metadata.is_prefill:
                     decode_args = [
                         query,
                         key,
@@ -1548,7 +1552,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                 #   original sequence index
                 # * otherwise         - seq_lens[B, P] == dyn_size_for_partitions,
                 #   dynamic size for each partition
-                if q_len == 1:
+                if not attn_metadata.is_prefill:
                     decode_args = [
                         query,
                         key,
@@ -1602,7 +1606,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                             torch.ops.rbln_custom_ops.attention_naive_decode
                         )
 
-                if q_len == 1:
+                if not attn_metadata.is_prefill:
                     decode_args = [
                         query,
                         key,
@@ -1656,7 +1660,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                     flash_attention_naive_prefill = flash_attention_naive_prefill_impl
                     flash_attention_naive_decode = flash_attention_naive_decode_impl
 
-                if q_len == 1:
+                if not attn_metadata.is_prefill:
                     decode_args = [
                         query,
                         key,

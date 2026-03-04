@@ -322,8 +322,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             )
             if self.speculative_config.method == "ngram":
                 self.drafter = NgramProposer(self.vllm_config)
-            # elif self.speculative_config.method == "suffix":
-            #     self.drafter = SuffixDecodingProposer(self.vllm_config)
+            elif self.speculative_config.method == "suffix":
+                self.drafter = SuffixDecodingProposer(self.vllm_config)
             elif self.speculative_config.use_eagle():
                 self.drafter = EagleProposer(self.vllm_config, self.device, self)  # type: ignore
                 if self.speculative_config.method == "eagle3":
@@ -1176,7 +1176,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             logits_indices = spec_decode_metadata.logits_indices
             num_sampled_tokens = num_draft_tokens + 1
 
-            self.num_decode_draft_tokens.np[:num_reqs] = num_draft_tokens
+            self.num_decode_draft_tokens.np[:num_reqs] = num_decode_draft_tokens
             self.num_decode_draft_tokens.np[num_reqs:].fill(-1)
             self.num_decode_draft_tokens.copy_to_gpu()
 
@@ -2539,28 +2539,46 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 model_kwargs,
             ) = self._preprocess(scheduler_output)
 
-        # Padding for speculative decoding
-        # in case of that all requests are not scheduled equally.
         assert input_ids is not None
-        num_scheduled_tokens_per_req = torch.tensor(
-            [
-                scheduler_output.num_scheduled_tokens[i]
-                for i in self.input_batch.req_ids
-            ],
-            device=input_ids.device,
-            dtype=torch.int32,
-        )
-        max_num_scheduled_tokens = torch.max(num_scheduled_tokens_per_req)
+        is_prefills = self.is_prefills()
 
-        if self.speculative_config is not None and not torch.all(
-            num_scheduled_tokens_per_req == max_num_scheduled_tokens
-        ):
+        # Padding length for speculative decoding by num_speculative_tokens
+        if self.speculative_config is not None and not is_prefills[0]:
+            max_spec_decode_len = self.speculative_config.num_speculative_tokens + 1
+            num_scheduled_tokens_per_req = torch.tensor(
+                [
+                    scheduler_output.num_scheduled_tokens[i]
+                    for i in self.input_batch.req_ids
+                ],
+                device=input_ids.device,
+                dtype=torch.int32,
+            )
             input_ids = rbln_utils.pad_speculative_draft_tokens(
-                input_ids, num_scheduled_tokens_per_req
+                input_ids,
+                num_scheduled_tokens_per_req,
+                max_spec_decode_len,
             )
             positions = rbln_utils.pad_speculative_draft_tokens(
-                positions, num_scheduled_tokens_per_req
+                positions,
+                num_scheduled_tokens_per_req,
+                max_spec_decode_len,
             )
+            # `logits_indices` are built for the original flattened
+            # [req0_tokens, req1_tokens, ...] layout. After per-request padding,
+            # flatten order changes to fixed-stride rows
+            # [req0(max_spec), req1(max_spec), ...], so remap indices.
+            num_scheduled_tokens_i64 = num_scheduled_tokens_per_req.to(torch.int64)
+            req_indices = torch.repeat_interleave(
+                torch.arange(num_reqs, device=logits_indices.device),
+                num_scheduled_tokens_i64,
+            )
+            token_offsets = (
+                torch.arange(num_input_tokens, device=logits_indices.device)
+                - num_scheduled_tokens_i64.cumsum(0)[req_indices]
+                + num_scheduled_tokens_i64[req_indices]
+            )
+            unpadded_to_padded = req_indices * max_spec_decode_len + token_offsets
+            logits_indices = unpadded_to_padded[logits_indices.to(torch.int64)]
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
@@ -2583,8 +2601,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # we must resolve the batch dimension.
             input_ids = input_ids.view(num_reqs, -1).to(torch.long)
             positions = positions.view(num_reqs, -1)
-
-            is_prefills = self.is_prefills()
 
             token_indices = None
             if is_prefills[0]:
@@ -2747,37 +2763,39 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         logits = self.logits_processor._gather_logits(logits)
                     logits = logits.view(-1, logits.size(-1))
                 else:
-                    assert logits_indices.dim() == 1
+                    selected_token_indices = logits_indices
+                    assert selected_token_indices.dim() == 1
                     if is_prefills[0]:  # prefill
-                        assert logits_indices.size(0) == 1
+                        assert selected_token_indices.size(0) == 1
                         num_computed = self.input_batch.num_computed_tokens_cpu
                         num_prompted = self.input_batch.num_prompt_tokens
                         is_last_prefill = (
                             num_computed + self.max_num_tokens
                         ) >= num_prompted
-                        # if last_prefill
-                        # chunked prefill(#0~#N-1, intermediate)
-                        # token_indices = torch.tensor([max_num_seqs-1])
-                        # selected = torch.tensor([])
-                        # else
-                        # chunked prefill(#N, final)
-                        # token_indices = torch.tensor([last_seq_idx-1])
-                        # selected_token_indices == token_indices
-                        logits = logits[:0] if not is_last_prefill[0] else logits
+                        if not is_last_prefill[0]:  # noqa: SIM108
+                            # chunked prefill(#0~#N-1, intermediate)
+                            # token_indices = torch.tensor([max_num_seqs-1])
+                            # selected = torch.tensor([])
+                            logits = logits[:0]
+                        else:
+                            # chunked prefill(#N, final)
+                            # token_indices = torch.tensor([last_seq_idx-1])
+                            # selected_token_indices == token_indices
+                            logits = logits
                     else:  # decode
-                        # logits_indices is for valid decode tokens,
-                        # which should be 0..num_input_tokens-1
-                        assert logits_indices[-1].item() == num_input_tokens - 1
+                        # selected_token_indices is for valid decode tokens
                         # token_indices == None, selected = torch.tensor([0])
-                        batch_indices = torch.arange(
-                            self.input_batch.num_reqs, device=self.device
-                        )
-                        if self.speculative_config is not None:
+                        if self.speculative_config is None:
+                            logits = logits[:num_input_tokens]
+                        else:
+                            batch_indices = torch.arange(
+                                self.input_batch.num_reqs, device=self.device
+                            )
                             sample_hidden_states = hidden_states[
                                 batch_indices,
                                 : self.speculative_config.num_speculative_tokens + 1,
                             ]
-                        logits = logits[:num_input_tokens]
+                            logits = logits[selected_token_indices]
 
             if broadcast_pp_output:
                 model_output_broadcast_data = (
