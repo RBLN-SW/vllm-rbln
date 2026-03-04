@@ -1450,7 +1450,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                     *decode_args,
                 )
             else:
-                attn_output = sliding_window_attention_naive_prefill(  # noqa: E501
+                prefill_args = [
                     query,
                     key,
                     value,
@@ -1460,6 +1460,11 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                     self.scale,
                     attn_metadata.local_block_tables,
                     self.scale,  # dummy
+                ]
+                if not envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
+                    prefill_args.append(self.sinks)
+                attn_output = sliding_window_attention_naive_prefill(  # noqa: E501
+                    *prefill_args
                 )
         # actually non-flash paged attention DOES NOT use slot_mapping
         elif self.is_causal:
