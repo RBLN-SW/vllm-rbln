@@ -445,7 +445,7 @@ def custom_moe_swiglu_group_dequantize(
         down_proj_weight, down_proj_scale, in_block_size, down_out_block
     )
 
-    routing_weights = torch.sigmoid(router_logits.float())
+    routing_weights = router_logits.float()
     scores_for_choice = routing_weights
     if e_score_correction_bias is not None:
         scores_for_choice = scores_for_choice + e_score_correction_bias
