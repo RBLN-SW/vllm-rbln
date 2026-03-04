@@ -54,6 +54,7 @@ def attention_naive_prefill_impl(
     scale: torch.Tensor,
     block_tables: torch.Tensor,
     dummy: torch.Tensor,
+    sinks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(q)
 
@@ -69,6 +70,7 @@ def _(
     scale: torch.Tensor,
     block_tables: torch.Tensor,
     dummy: torch.Tensor,
+    sinks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(q)
 
@@ -86,6 +88,7 @@ def attention_naive_decode_impl(
     scale: torch.Tensor,
     block_tables: torch.Tensor,
     dummy: torch.Tensor,
+    sinks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(q)
 
@@ -101,6 +104,7 @@ def _(
     scale: torch.Tensor,
     block_tables: torch.Tensor,
     dummy: torch.Tensor,
+    sinks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(q)
 
@@ -117,6 +121,7 @@ def causal_attention_naive_prefill_impl(
     scale: torch.Tensor,
     block_tables: torch.Tensor,
     dummy: torch.Tensor,
+    sinks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(q)
 
@@ -131,6 +136,7 @@ def _(
     scale: torch.Tensor,
     block_tables: torch.Tensor,
     dummy: torch.Tensor,
+    sinks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(q)
 
@@ -147,6 +153,7 @@ def causal_attention_naive_decode_impl(
     scale: torch.Tensor,
     block_tables: torch.Tensor,
     dummy: torch.Tensor,
+    sinks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(q)
 
@@ -161,6 +168,7 @@ def _(
     scale: torch.Tensor,
     block_tables: torch.Tensor,
     dummy: torch.Tensor,
+    sinks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(q)
 
@@ -1301,7 +1309,9 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
 
         self.is_causal = envs.VLLM_RBLN_FLASH_CAUSAL_ATTN
         self.is_batch_attention_opt = envs.VLLM_RBLN_BATCH_ATTN_OPT
-        self.is_normal = self.block_size == self.max_model_len
+        self.is_normal = (self.block_size == self.max_model_len) and (
+            self.sinks is None
+        )
 
     def forward(
         self,
