@@ -13,15 +13,20 @@
 # limitations under the License.
 
 import time
+from copy import deepcopy
 
+from vllm.config import VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
+from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import EngineCoreEventType
+from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.request import Request, RequestStatus
+from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 from vllm_rbln.logger import init_logger
@@ -58,6 +63,34 @@ def undo_uncomputed_block_caching(
 
 
 class RBLNScheduler(Scheduler):
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        kv_cache_config: KVCacheConfig,
+        structured_output_manager: StructuredOutputManager,
+        block_size: int,
+        mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
+        include_finished_set: bool = False,
+        log_stats: bool = False,
+    ) -> None:
+        # FIXME(RBLN): adjust max_model_len temporarily for speculative decoding
+        if vllm_config.speculative_config is not None and (
+            num_speculative_tokens
+            := vllm_config.speculative_config.num_speculative_tokens
+        ):
+            vllm_config = deepcopy(vllm_config)
+            vllm_config.model_config.max_model_len -= num_speculative_tokens - 1
+
+        super().__init__(
+            vllm_config,
+            kv_cache_config,
+            structured_output_manager,
+            block_size,
+            mm_registry,
+            include_finished_set,
+            log_stats,
+        )
+
     def schedule(self) -> SchedulerOutput:
         # Copied from vllm.v1.core.sched.Scheduler.schedule: https://github.com/vllm-project/vllm/blob/v0.13.0/vllm/v1/core/sched/scheduler.py#L216-L757
         # The only differences are:
