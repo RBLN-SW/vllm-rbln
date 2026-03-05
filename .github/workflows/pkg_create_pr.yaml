@@ -51,7 +51,7 @@ jobs:
           add-paths: |
             pyproject.toml
           commit-message: "Update optimum-rbln to ${{ inputs.optimum-version }}"
-          title: "Auto-update optimum-rbln to ${{ inputs.optimum-version }}"
+          title: "other: auto-update optimum-rbln to ${{ inputs.optimum-version }}"
           body: "Updated optimum-rbln to ${{ inputs.optimum-version }}."
           branch: auto-update-optimum-rbln-${{ inputs.optimum-version }}
           base: dev
