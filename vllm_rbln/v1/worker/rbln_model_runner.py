@@ -1800,7 +1800,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # compile decode graph considering decode batch buckets
         for batch_bucket_size in self.bucketing_manager.decode_batch_buckets:
-            decode_max_seq_len = self.max_model_len
+            decode_max_seq_len = self.max_model_len // 2
 
             dummy_decode_requests: list[NewRequestData] = []
             dummy_decode_num_scheduled_tokens: dict[str, int] = {}
@@ -1849,7 +1849,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # compile sampler for all possible decode batches
         max_decode_batch = self.bucketing_manager.decode_batch_buckets[-1]
         for decode_batch in range(1, max_decode_batch + 1):
-            decode_max_seq_len = self.max_model_len
+            decode_max_seq_len = self.max_model_len // 2
             dummy_decode_requests = []
             dummy_decode_num_scheduled_tokens = {}
             num_speculative_tokens = (
