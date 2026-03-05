@@ -230,8 +230,7 @@ def unquantized_fused_moe_method_rbln(
 
 
 def get_tokens_mask(num_tokens: int, left=1.0, right=0.0):
-    num_tokens_across_dp = \
-        get_forward_context().dp_metadata.num_tokens_across_dp_cpu
+    num_tokens_across_dp = get_forward_context().dp_metadata.num_tokens_across_dp_cpu
     num_tokens_across_dp = num_tokens_across_dp.unsqueeze(1)
     if num_tokens_across_dp.size(0) == 1:
         max_pad = num_tokens

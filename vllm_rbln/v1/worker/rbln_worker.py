@@ -260,7 +260,9 @@ class RBLNWorker(WorkerBase):
         num_runtimes = 1 + (1 + specialized_moe_decode) * decode_batch_buckets_count
 
         if self.model_config.quantization is not None:
-            logger.info("model quantization scheme = %s", self.model_config.quantization)
+            logger.info(
+                "model quantization scheme = %s", self.model_config.quantization
+            )
             # FIXME(RBLN) - for now, mxfp4/fp8 quantization is only supported
             quantization = self.model_config.quantization
             assert quantization == "mxfp4" or quantization == "fp8"
@@ -286,7 +288,7 @@ class RBLNWorker(WorkerBase):
                     )
             else:
                 raise ValueError(
-                        "invalid quantization scheme, candidates = [fp8, mxfp4]"
+                    "invalid quantization scheme, candidates = [fp8, mxfp4]"
                 )
 
             # pack 2 mxfp4 elems into single uint8 elem

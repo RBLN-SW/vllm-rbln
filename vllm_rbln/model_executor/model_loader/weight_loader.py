@@ -18,10 +18,19 @@ import torch
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.model_loader.weight_utils import (
-    default_weight_loader, maybe_remap_kv_scale_name)
-from vllm.model_executor.models import (deepseek_v2, llama, llama4, qwen2,
-                                        qwen2_moe, qwen3_moe, minimax_m2,
-                                        utils)
+    default_weight_loader,
+    maybe_remap_kv_scale_name,
+)
+from vllm.model_executor.models import (
+    deepseek_v2,
+    llama,
+    llama4,
+    minimax_m2,
+    qwen2,
+    qwen2_moe,
+    qwen3_moe,
+    utils,
+)
 
 logger = init_logger(__name__)
 
@@ -577,7 +586,9 @@ def load_llama4_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> se
     return loaded_params
 
 
-def load_minimax_m2_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+def load_minimax_m2_weights(
+    self, weights: Iterable[tuple[str, torch.Tensor]]
+) -> set[str]:
     stacked_params_mapping = [
         # (param_name, shard_name, shard_id)
         ("qkv_proj", "q_proj", "q"),
@@ -601,8 +612,7 @@ def load_minimax_m2_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -
         if "rotary_emb.inv_freq" in name:
             continue
 
-        spec_layer = minimax_m2.get_spec_layer_idx_from_weight_name(
-            self.config, name)
+        spec_layer = minimax_m2.get_spec_layer_idx_from_weight_name(self.config, name)
         if spec_layer is not None:
             continue  # skip spec decode layers for main model
 
@@ -664,9 +674,7 @@ def load_minimax_m2_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -
                     continue
 
                 param = params_dict[name]
-                weight_loader = getattr(
-                    param, "weight_loader", default_weight_loader
-                )
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
         loaded_params.add(name)
     return loaded_params
