@@ -592,44 +592,11 @@ def load_minimax_m2_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -
     params_dict = dict(self.named_parameters())
     loaded_params: set[str] = set()
 
-    load_last_n_layers = getattr(self.config, "_rbln_load_last_n_layers", False)
-
-    original_num_layers = 0
-    if load_last_n_layers:
-        weights_list = list(weights)
-
-        for name, _ in weights_list:
-            if name.startswith("layers."):
-                layer_idx = int(name.split(".")[1])
-                original_num_layers = max(original_num_layers, layer_idx + 1)
-
-        layer_offset = original_num_layers - self.config.num_hidden_layers
-        logger.info(
-            f"[RBLN] o_proj only: Loading o_proj from last {self.config.num_hidden_layers} layers "
-            f"(layers {layer_offset} to {original_num_layers - 1}, reversed: {original_num_layers - 1} -> 0, ..., {layer_offset} -> {self.config.num_hidden_layers - 1}), "
-            f"other weights from first {self.config.num_hidden_layers} layers"
-        )
-        weights = weights_list
-
     for name, loaded_weight in weights:
-
-        if name.startswith("layers."):
+        if name.startswith("layers"):
             layer_idx = int(name.split(".")[1])
-            if load_last_n_layers:
-                is_o_proj = "o_proj" in name
-                if is_o_proj:
-                    if layer_idx < layer_offset:
-                        continue
-                    if layer_idx >= original_num_layers:
-                        continue
-                    new_layer_idx = (original_num_layers - 1) - layer_idx
-                    name = name.replace(f"layers.{layer_idx}.", f"layers.{new_layer_idx}.")
-                else:
-                    if layer_idx >= self.config.num_hidden_layers:
-                        continue
-            else:
-                if layer_idx >= self.config.num_hidden_layers:
-                    continue
+            if layer_idx >= self.config.num_hidden_layers:
+                continue
 
         if "rotary_emb.inv_freq" in name:
             continue

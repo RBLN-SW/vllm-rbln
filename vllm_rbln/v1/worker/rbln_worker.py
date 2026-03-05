@@ -244,90 +244,6 @@ class RBLNWorker(WorkerBase):
     def load_model(self):
         self.model_runner.load_model()
 
-    def _calculate_kernel_bytes(self, key: str, is_REBEL, value: torch.Tensor) -> int:
-        quantization = self.model_config.quantization
-        num_elems = value.numel()
-        if value.dtype == torch.float32:
-            num_bits = 32
-        elif value.dtype == torch.bfloat16:
-            num_bits = 16
-        elif value.dtype == torch.float8_e5m2:
-            num_bits = 8
-        elif value.dtype == torch.float8_e4m3fn:
-            num_bits = 8
-        elif value.dtype == torch.uint8:
-            if not is_REBEL:
-                # ATOM
-                num_bits = 16
-                # DO NOT count quantized weight_scale
-                # due to ATOM dequantization merged scaled
-                if "weight_scale" in key:
-                    num_bits = 0
-            else:
-                # REBEL
-                num_bits = 4
-        else:
-            assert False, "invalid tensor dtype"
-
-        if quantization == "mxfp4" and value.dtype == torch.uint8:
-            # quantization packing mxfp4 into uint8
-            num_elems *= 2
-        kernel_bytes = num_elems * num_bits // 8
-        return kernel_bytes
-
-
-    def _estimate_kernel_bytes(self):
-        # estimate model kernel size
-        params_dict = dict(self.model_runner.model.named_parameters())
-        attn_kernel_bytes = 0
-        mlp_kernel_bytes = 0
-        norm_kernel_bytes = 0
-        embed_kernel_bytes = 0
-        lm_head_kernel_bytes = 0
-        target_arch = current_platform.get_device_name().lower()
-        assert "rbln" in target_arch
-        is_REBEL = True
-        if "ca" in target_arch:
-            is_REBEL = False
-        elif "cr" in target_arch:
-            is_REBEL = True
-        else:
-            assert False, "invalid RBLN target arch"
-        for key, value in params_dict.items():
-            logger.info("%s", key)
-            if "attn" in key:
-                # attention, fp32, bf16, fp8
-                attn_kernel_bytes += self._calculate_kernel_bytes(key, is_REBEL, value)
-            elif "mlp" in key or "expert" in key:
-                # mlp or expert, fp32, bf16, fp8, mxfp4
-                mlp_kernel_bytes += self._calculate_kernel_bytes(key, is_REBEL, value)
-            elif "norm" in key:
-                # normalization, fp32, bf16, fp8
-                norm_kernel_bytes += self._calculate_kernel_bytes(key, is_REBEL, value)
-            elif "embed" in key:
-                # embedding, fp32, bf16
-                embed_kernel_bytes += self._calculate_kernel_bytes(key, is_REBEL,  value)
-            elif "lm_head" in key:
-                lm_head_kernel_bytes += self._calculate_kernel_bytes(key, is_REBEL, value)
-            else:
-                pass
-        # RBLN binary DOES NOT include word embedding into device
-        if lm_head_kernel_bytes == 0:
-            # consider lm_head & embedding sharing
-            lm_head_kernel_bytes = embed_kernel_bytes
-
-        total_kernel_bytes = attn_kernel_bytes
-        total_kernel_bytes += mlp_kernel_bytes
-        total_kernel_bytes += norm_kernel_bytes
-        total_kernel_bytes += lm_head_kernel_bytes
-        logger.info("embed_tok    bytes = %s(GB), but not included", embed_kernel_bytes / 2**30)
-        logger.info("attention    bytes = %s(GB)", attn_kernel_bytes / 2**30)
-        logger.info("mlp or moe   bytes = %s(GB)", mlp_kernel_bytes / 2**30)
-        logger.info("normalize    bytes = %s(GB)", norm_kernel_bytes / 2**30)
-        logger.info("lm_head      bytes = %s(GB)", lm_head_kernel_bytes / 2**30)
-        logger.info("esti.kernel  bytes = %s(GB)", total_kernel_bytes / 2**30)
-        return total_kernel_bytes
-
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
         params_dict = dict(self.model_runner.model.named_parameters())
@@ -345,14 +261,10 @@ class RBLNWorker(WorkerBase):
 
         if self.model_config.quantization is not None:
             logger.info("model quantization scheme = %s", self.model_config.quantization)
-            # gpt-oss mxfp4 quantization - only applied to expert
-            # minimax fp8 quantization - applied into linear & expert
+            # FIXME(RBLN) - for now, mxfp4/fp8 quantization is only supported
             quantization = self.model_config.quantization
-            device_name = current_platform.get_device_name().lower()
-            assert "rbln" in device_name
+            assert quantization == "mxfp4" or quantization == "fp8"
 
-            # FIXME It is temporary code.
-            # It requires validation.
             if quantization == "fp8":
                 nbits_per_param = 8
                 ratio = 1

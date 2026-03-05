@@ -49,16 +49,25 @@ Multi-node:
 
 import os
 from time import sleep
-import json
-from transformers import AutoTokenizer
+
 from vllm import LLM, SamplingParams
 from vllm.utils import get_open_port
 
 
-
-def main(model, dp_size, local_dp_rank, global_dp_rank, dp_master_ip,
-         dp_master_port, tp_size, enable_ep, max_model_len, block_size,
-         decode_batch, num_hidden_layers):
+def main(
+    model,
+    dp_size,
+    local_dp_rank,
+    global_dp_rank,
+    dp_master_ip,
+    dp_master_port,
+    tp_size,
+    enable_ep,
+    max_model_len,
+    block_size,
+    decode_batch,
+    num_hidden_layers,
+):
     os.environ["VLLM_DP_RANK"] = str(global_dp_rank)
     os.environ["VLLM_DP_RANK_LOCAL"] = str(local_dp_rank)
     # paralle_config.data_parallel_size = envs.sVLLM_DP_SIZE
@@ -66,31 +75,25 @@ def main(model, dp_size, local_dp_rank, global_dp_rank, dp_master_ip,
     os.environ["VLLM_DP_MASTER_IP"] = dp_master_ip
     os.environ["VLLM_DP_MASTER_PORT"] = str(dp_master_port)
 
-
-    sample_prompts = json.load(open("/mnt/shared_data/.cache/dataset/simple_prompts/simple_prompts.json", "r"))
-    raw_prompts = sample_prompts[:4] * dp_size
     # Sample prompts.
-    # raw_prompts = [
-    #     "Hello, my name is",
-    #     "The vLLM is",
-    #     "The president of the United States is",
-    #     "The future of AI is",
-    # ] * dp_size
+    prompts = [
+        "Hello, my name is",
+        "The vLLM is",
+        "The president of the United States is",
+        "The future of AI is",
+    ] * dp_size
 
     # with DP, each rank should process different prompts.
     # usually all the DP ranks process a full dataset,
     # and each rank processes a different part of the dataset.
-    prompts_per_rank = (len(raw_prompts) // dp_size)
+    prompts_per_rank = len(prompts) // dp_size
     start = global_dp_rank * prompts_per_rank
     end = start + prompts_per_rank
-    raw_prompts = raw_prompts[start:end]
-    if len(raw_prompts) == 0:
+    prompts = prompts[start:end]
+    if len(prompts) == 0:
         # if any rank has no prompts to process,
         # we need to set a placeholder prompt
-        raw_prompts = ["Placeholder"]
-
-    # Apply chat template if enabled
-    prompts = raw_prompts
+        prompts = ["Placeholder"]
     print(f"DP rank {global_dp_rank} needs to process {len(prompts)} prompts")
 
     # Create a sampling params object.
@@ -105,7 +108,6 @@ def main(model, dp_size, local_dp_rank, global_dp_rank, dp_master_ip,
     else:
         hf_overrides_kw = {
             "num_hidden_layers": num_hidden_layers,
-            "_rbln_load_last_n_layers": False,
         }
 
     # Create an LLM.
@@ -120,7 +122,6 @@ def main(model, dp_size, local_dp_rank, global_dp_rank, dp_master_ip,
         trust_remote_code=True,
         tensor_parallel_size=tp_size,
         enable_expert_parallel=enable_ep,
-        num_gpu_blocks_override=4,
         profiler_config={
             "profiler": "torch",
             "torch_profiler_dir": "./profile",

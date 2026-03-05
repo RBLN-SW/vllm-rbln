@@ -1,6 +1,0 @@
-setuptools>=61
-setuptools-scm>=8
-pyyaml
-datasets
-qwen_vl_utils
-vllm==0.12.0
