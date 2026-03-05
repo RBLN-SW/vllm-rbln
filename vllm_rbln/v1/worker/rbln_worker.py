@@ -18,6 +18,7 @@ import os
 from types import NoneType
 from typing import TYPE_CHECKING
 
+import numba
 import torch
 
 try:
@@ -205,6 +206,20 @@ class RBLNWorker(WorkerBase):
                 self.local_rank,
                 num_threads,
             )
+
+        # NOTE(RBLN): numba is used throughout vllm code base (especially in spec-dec)
+        # however accessing numba thread settings somewhat affects torch
+        # thread settings and cause global state change leading to recompilation.
+        # Thus the only solution for now is to set both thread settings to identical
+        # value in correct order like below
+
+        # Code below sets numba num thread to torch num thread and
+        # potentially change torch num thread to other value
+        numba.set_num_threads(torch.get_num_threads())
+
+        # Code below restores torch num thread to its original value
+        # before numba.set_num_threads
+        torch.set_num_threads(numba.get_num_threads())
 
         # Initialize the distributed environment.
         init_worker_distributed_environment(

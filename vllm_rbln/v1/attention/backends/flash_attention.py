@@ -54,6 +54,7 @@ def attention_naive_prefill_impl(
     scale: torch.Tensor,
     block_tables: torch.Tensor,
     dummy: torch.Tensor,
+    sinks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(q)
 
@@ -69,6 +70,7 @@ def _(
     scale: torch.Tensor,
     block_tables: torch.Tensor,
     dummy: torch.Tensor,
+    sinks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(q)
 
@@ -86,6 +88,7 @@ def attention_naive_decode_impl(
     scale: torch.Tensor,
     block_tables: torch.Tensor,
     dummy: torch.Tensor,
+    sinks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(q)
 
@@ -101,6 +104,7 @@ def _(
     scale: torch.Tensor,
     block_tables: torch.Tensor,
     dummy: torch.Tensor,
+    sinks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(q)
 
@@ -117,6 +121,7 @@ def causal_attention_naive_prefill_impl(
     scale: torch.Tensor,
     block_tables: torch.Tensor,
     dummy: torch.Tensor,
+    sinks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(q)
 
@@ -131,6 +136,7 @@ def _(
     scale: torch.Tensor,
     block_tables: torch.Tensor,
     dummy: torch.Tensor,
+    sinks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(q)
 
@@ -147,6 +153,7 @@ def causal_attention_naive_decode_impl(
     scale: torch.Tensor,
     block_tables: torch.Tensor,
     dummy: torch.Tensor,
+    sinks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(q)
 
@@ -161,6 +168,7 @@ def _(
     scale: torch.Tensor,
     block_tables: torch.Tensor,
     dummy: torch.Tensor,
+    sinks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(q)
 
@@ -1002,6 +1010,9 @@ class RBLNFlashAttentionMetadata:
     scheduler_metadata: torch.Tensor | None = None
     prefix_scheduler_metadata: torch.Tensor | None = None
 
+    # To distinguish prefill and decode
+    is_prefill: bool = True
+
     # For RBLN Attention
     attn_masks: torch.Tensor | None = None
     kv_caches: list[torch.Tensor] | None = None
@@ -1203,6 +1214,7 @@ class RBLNFlashAttentionMetadataBuilder(
             prefix_kv_lens=prefix_kv_lens,
             suffix_kv_lens=suffix_kv_lens,
             prefix_scheduler_metadata=prefix_scheduler_metadata,
+            is_prefill=bool(is_prefills[0]),
             attn_masks=attn_masks,
             cache_seq_lens=cache_seq_lens.to(self.device)
             if cache_seq_lens is not None
@@ -1301,7 +1313,9 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
 
         self.is_causal = envs.VLLM_RBLN_FLASH_CAUSAL_ATTN
         self.is_batch_attention_opt = envs.VLLM_RBLN_BATCH_ATTN_OPT
-        self.is_normal = self.block_size == self.max_model_len
+        self.is_normal = (self.block_size == self.max_model_len) and (
+            self.sinks is None
+        )
 
     def forward(
         self,
@@ -1416,7 +1430,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                     sliding_window_attention_naive_decode_impl
                 )
 
-            if q_len == 1:
+            if not attn_metadata.is_prefill:
                 decode_args = [
                     query,
                     key,
@@ -1440,7 +1454,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                     *decode_args,
                 )
             else:
-                attn_output = sliding_window_attention_naive_prefill(  # noqa: E501
+                prefill_args = [
                     query,
                     key,
                     value,
@@ -1450,6 +1464,11 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                     self.scale,
                     attn_metadata.local_block_tables,
                     self.scale,  # dummy
+                ]
+                if not envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
+                    prefill_args.append(self.sinks)
+                attn_output = sliding_window_attention_naive_prefill(  # noqa: E501
+                    *prefill_args
                 )
         # actually non-flash paged attention DOES NOT use slot_mapping
         elif self.is_causal:
@@ -1473,7 +1492,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                             torch.ops.rbln_custom_ops.causal_attention_naive_decode
                         )
 
-                if q_len == 1:
+                if not attn_metadata.is_prefill:
                     decode_args = [
                         query,
                         key,
@@ -1533,7 +1552,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                 #   original sequence index
                 # * otherwise         - seq_lens[B, P] == dyn_size_for_partitions,
                 #   dynamic size for each partition
-                if q_len == 1:
+                if not attn_metadata.is_prefill:
                     decode_args = [
                         query,
                         key,
@@ -1587,7 +1606,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                             torch.ops.rbln_custom_ops.attention_naive_decode
                         )
 
-                if q_len == 1:
+                if not attn_metadata.is_prefill:
                     decode_args = [
                         query,
                         key,
@@ -1641,7 +1660,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                     flash_attention_naive_prefill = flash_attention_naive_prefill_impl
                     flash_attention_naive_decode = flash_attention_naive_decode_impl
 
-                if q_len == 1:
+                if not attn_metadata.is_prefill:
                     decode_args = [
                         query,
                         key,
