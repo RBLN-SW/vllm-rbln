@@ -19,7 +19,7 @@ from vllm.envs import environment_variables as vllm_envs
 
 if TYPE_CHECKING:
     VLLM_RBLN_COMPILE_MODEL: bool = True
-    VLLM_RBLN_COMPILE_STRICT_MODE: bool = True
+    VLLM_RBLN_COMPILE_STRICT_MODE: bool = False
     VLLM_RBLN_TP_SIZE: int = 1
     VLLM_RBLN_SAMPLER: bool = True
     VLLM_RBLN_ENABLE_WARM_UP: bool = True
@@ -124,7 +124,7 @@ environment_variables = {
     # If true, will compile models using strict mode.
     "VLLM_RBLN_COMPILE_STRICT_MODE": (
         lambda: (
-            os.environ.get("VLLM_RBLN_COMPILE_STRICT_MODE", "True").lower()
+            os.environ.get("VLLM_RBLN_COMPILE_STRICT_MODE", "False").lower()
             in ("true", "1")
         )
     ),

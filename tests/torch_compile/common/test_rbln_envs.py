@@ -22,8 +22,8 @@ def test_rbln_envs():
         got {rbln_envs.VLLM_RBLN_COMPILE_MODEL}"
     )
 
-    assert rbln_envs.VLLM_RBLN_COMPILE_STRICT_MODE, (
-        f"Expected VLLM_RBLN_COMPILE_STRICT_MODE to be True, \
+    assert not rbln_envs.VLLM_RBLN_COMPILE_STRICT_MODE, (
+        f"Expected VLLM_RBLN_COMPILE_STRICT_MODE to be False, \
         got {rbln_envs.VLLM_RBLN_COMPILE_STRICT_MODE}"
     )
 
