@@ -259,6 +259,7 @@ class RBLNWorker(WorkerBase):
 
         num_runtimes = 1 + (1 + specialized_moe_decode) * decode_batch_buckets_count
 
+        ratio: float = 1.0
         if self.model_config.quantization is not None:
             logger.info(
                 "model quantization scheme = %s", self.model_config.quantization
@@ -269,7 +270,7 @@ class RBLNWorker(WorkerBase):
 
             if quantization == "fp8":
                 nbits_per_param = 8
-                ratio = 1
+                ratio = 1.0
             elif quantization == "mxfp4":
                 if "ca" in device_name:
                     # ATOM DOES NOT support mxfp4 quantization, handled by bf16
@@ -281,7 +282,7 @@ class RBLNWorker(WorkerBase):
                 elif "cr" in device_name:
                     # REBEL can support mxfp4 quantization
                     nbits_per_param = 4
-                    ratio = 1
+                    ratio = 1.0
                 else:
                     raise ValueError(
                         "invalid RBLN architecture, candidates = [ATOM(ca), REBEL(cr)]"
@@ -296,7 +297,7 @@ class RBLNWorker(WorkerBase):
         else:
             nbits_per_param = 16
             packed_num_elems = 1
-            ratio = 1
+            ratio = 1.0
         for key, value in params_dict.items():
             if value.dtype == torch.bfloat16:
                 n_model_attentions += value.numel()
