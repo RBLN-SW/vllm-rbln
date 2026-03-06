@@ -274,9 +274,14 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         from rebel.compile_context import CompileContext
 
-        self.compile_context = CompileContext(
-            use_weight_sharing=True, use_global_ctx=True
-        )
+        # Only provide use_global_ctx if CompileContext supports it
+        import inspect
+        compile_ctx_args = {}
+        if "use_weight_sharing" in inspect.signature(CompileContext).parameters:
+            compile_ctx_args["use_weight_sharing"] = True
+        if "use_global_ctx" in inspect.signature(CompileContext).parameters:
+            compile_ctx_args["use_global_ctx"] = True
+        self.compile_context = CompileContext(**compile_ctx_args)
 
         # Sampler
         self.use_rbln_sampler = envs.VLLM_RBLN_SAMPLER
