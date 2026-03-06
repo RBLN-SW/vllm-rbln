@@ -137,6 +137,7 @@ class RblnPlatform(Platform):
                 )
             os.environ["RBLN_CTX_STANDALONE"] = "1"
             os.environ["RBLN_FORCE_CCL_ASYNC"] = "1"
+            os.environ["VLLM_RBLN_SAMPLER"] = "0"
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:

@@ -272,10 +272,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         else:
             self.max_encoder_len = 0
 
-        from rebel.compile_context import CompileContext
-
-        self.compile_context = CompileContext(use_weight_sharing=True)
-
         # Sampler
         self.use_rbln_sampler = envs.VLLM_RBLN_SAMPLER
         if self.use_rbln_sampler:
@@ -283,7 +279,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             sampler = RBLNSampler(
                 logprobs_mode=self.model_config.logprobs_mode,
                 seed=self.vllm_config.model_config.seed,
-                compile_context=self.compile_context,
             )
         else:
             logger.info("Using default vLLM sampler.")
@@ -3234,7 +3229,9 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # RBLN compile context to mark static address for kv cache tensor
             # if tensor is set to have static address,
             # similar to RBLN kv cache binding
+            from rebel.compile_context import CompileContext
 
+            self.compile_context = CompileContext(use_weight_sharing=True)
             compiled_graph = self._compile_model(model_wrapper)
             self.model_executable = compiled_graph
 
