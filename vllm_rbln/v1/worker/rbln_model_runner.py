@@ -1835,13 +1835,13 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             )
             assert current_intermediate_tensors is not None
 
-            if self.specialized_moe_decode:
-                self._execute_dummy_requests(
-                    so,
-                    cso,
-                    current_intermediate_tensors,
-                    num_padded_tokens=self.max_num_batched_tokens,
-                )
+            # if self.specialized_moe_decode:
+            #     self._execute_dummy_requests(
+            #         so,
+            #         cso,
+            #         current_intermediate_tensors,
+            #         num_padded_tokens=self.max_num_batched_tokens,
+            #     )
 
             self._execute_dummy_requests(so, cso, current_intermediate_tensors)
 
