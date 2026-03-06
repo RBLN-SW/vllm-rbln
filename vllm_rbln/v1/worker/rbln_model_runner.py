@@ -2535,8 +2535,14 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         is_prefills = self.is_prefills()
 
         # Padding length for speculative decoding by num_speculative_tokens
-        if self.speculative_config is not None and not is_prefills[0]:
-            max_spec_decode_len = self.speculative_config.num_speculative_tokens + 1
+        if scheduler_output.scheduled_spec_decode_tokens:
+            max_spec_decode_len = (
+                max(
+                    len(s)
+                    for s in scheduler_output.scheduled_spec_decode_tokens.values()
+                )
+                + 1
+            )
             num_scheduled_tokens_per_req = torch.tensor(
                 [
                     scheduler_output.num_scheduled_tokens[i]
