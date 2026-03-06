@@ -412,6 +412,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 expert_map_const = expert_map_const.detach().clone()
 
             use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
+            tokens_mask = None
             if use_moe_tokens_mask:
                 tokens_mask = get_tokens_mask(num_tokens)
 
