@@ -272,10 +272,11 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         else:
             self.max_encoder_len = 0
 
-        from rebel.compile_context import CompileContext
-
         # Only provide use_global_ctx if CompileContext supports it
         import inspect
+
+        from rebel.compile_context import CompileContext
+
         compile_ctx_args = {}
         if "use_weight_sharing" in inspect.signature(CompileContext).parameters:
             compile_ctx_args["use_weight_sharing"] = True
