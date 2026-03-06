@@ -1798,23 +1798,23 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         )
         self._execute_dummy_requests(so, cso, self.prefill_intermediate_tensors)
 
+        # FIXME(RBLN): At the moment, a single request can’t access multiple
+        # blocks per layer under the current implementation, so we’re forced
+        # to reduce the warmup length to a reasonable value for now.
+        # This is mainly because we still have to run the computation over
+        # the padded tokens in speculative decoing scenario as well.
+        decode_max_seq_len = self.max_model_len // 2
+
         # compile decode graph considering decode batch buckets
         for batch_bucket_size in self.bucketing_manager.decode_batch_buckets:
-            decode_max_seq_len = self.max_model_len // 2
-
             dummy_decode_requests: list[NewRequestData] = []
             dummy_decode_num_scheduled_tokens: dict[str, int] = {}
-            num_speculative_tokens = (
-                self.speculative_config.num_speculative_tokens
-                if self.speculative_config is not None
-                else 0
-            )
             for _ in range(batch_bucket_size):
                 self._add_dummy_requests(
                     requests=dummy_decode_requests,
                     num_scheduled_tokens=dummy_decode_num_scheduled_tokens,
-                    total_tokens=decode_max_seq_len - 1 - num_speculative_tokens,
-                    num_computed_tokens=decode_max_seq_len - 1 - num_speculative_tokens,
+                    total_tokens=decode_max_seq_len,
+                    num_computed_tokens=decode_max_seq_len,
                     num_kv_cache_groups=num_kv_cache_groups,
                     sampling_params=None
                     if self.is_pooling_model
@@ -1824,7 +1824,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     )
                     if self.is_pooling_model
                     else None,
-                    num_speculative_tokens=num_speculative_tokens,
                 )
             so, cso = self._make_dummy_scheduler_outputs(
                 dummy_decode_requests,
@@ -1849,20 +1848,14 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # compile sampler for all possible decode batches
         max_decode_batch = self.bucketing_manager.decode_batch_buckets[-1]
         for decode_batch in range(1, max_decode_batch + 1):
-            decode_max_seq_len = self.max_model_len // 2
             dummy_decode_requests = []
             dummy_decode_num_scheduled_tokens = {}
-            num_speculative_tokens = (
-                self.speculative_config.num_speculative_tokens
-                if self.speculative_config is not None
-                else 0
-            )
             for _ in range(decode_batch):
                 self._add_dummy_requests(
                     requests=dummy_decode_requests,
                     num_scheduled_tokens=dummy_decode_num_scheduled_tokens,
-                    total_tokens=decode_max_seq_len - 1 - num_speculative_tokens,
-                    num_computed_tokens=decode_max_seq_len - 1 - num_speculative_tokens,
+                    total_tokens=decode_max_seq_len,
+                    num_computed_tokens=decode_max_seq_len,
                     num_kv_cache_groups=num_kv_cache_groups,
                     sampling_params=None
                     if self.is_pooling_model
@@ -1872,7 +1865,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     )
                     if self.is_pooling_model
                     else None,
-                    num_speculative_tokens=num_speculative_tokens,
                 )
             so, cso = self._make_dummy_scheduler_outputs(
                 dummy_decode_requests,
@@ -1894,7 +1886,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         num_kv_cache_groups: int,
         sampling_params: SamplingParams | None = None,
         pooling_params: PoolingParams | None = None,
-        num_speculative_tokens: int = 0,
     ) -> None:
         num_blocks = (
             round_up(total_tokens, self.cache_config.block_size)
@@ -1916,7 +1907,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         )
         requests.append(req)
         num_scheduled_tokens[req.req_id] = (
-            (1 + num_speculative_tokens)
+            (1 + self.num_spec_tokens)
             if total_tokens - num_computed_tokens == 0
             else total_tokens - num_computed_tokens
         )
