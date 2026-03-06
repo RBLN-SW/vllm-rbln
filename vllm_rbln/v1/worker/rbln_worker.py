@@ -28,6 +28,7 @@ except ImportError:
     has_torch_rbln = False
 
 import torch.nn as nn
+from torch._dynamo.exc import BackendCompilerFailed
 from vllm.config import VllmConfig
 from vllm.distributed import (
     ensure_model_parallel_initialized,
@@ -327,7 +328,31 @@ class RBLNWorker(WorkerBase):
             logger.warning("skipping compile_or_warm_up_model")
             return
 
-        self.model_runner.warm_up_model()
+        try:
+            self.model_runner.warm_up_model()
+
+        except BackendCompilerFailed as e:
+
+            def is_oom(exc):
+                if isinstance(exc, RuntimeError):
+                    for arg in exc.args:
+                        if isinstance(arg, str) and (
+                            "SYS_ENOMEM: Out of memory" in arg
+                            or "SYS_EBUSY: Lack of device memory" in arg
+                        ):
+                            return True
+                return False
+
+            if is_oom(e.inner_exception):
+                raise RuntimeError(
+                    "Not enough memory for "
+                    f"{self.model_runner.kv_cache_config.num_blocks} "
+                    "blocks of KV cache. Try reducing the number of blocks "
+                    "by setting --num-gpu-blocks-override."
+                ) from e
+
+            raise
+
         # after completing model warm up, enable RBLN performance tracker
         self.model_runner._enable_performance_tracker()
 
