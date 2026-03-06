@@ -414,15 +414,16 @@ def fused_moe_forward_rbln(
 
     if self.dp_size > 1:
         # output all_reduce == dp all_reduce + tp all_reduce
-        all_hidden_states = get_dp_group().all_reduce(final_hidden_states)
         hidden_shape_dp = (-1, 1, org_hidden_shape[-1])
-        final_hidden_states = all_hidden_states.reshape(hidden_shape_dp)
+        all_hidden_states = final_hidden_states.reshape(hidden_shape_dp)
+        assert all_hidden_states.shape[0] % self.dp_size == 0
 
+        hidden_states = get_dp_group().reduce_scatter(all_hidden_states, dim=0)
         max_pad = get_forward_context().dp_metadata.max_pads_across_dp.shape[0]
+        assert hidden_states.shape[0] == max_pad
+
         num_tokens = org_hidden_shape[:-1].numel()  # noqa: F841
-        start = self.dp_rank * max_pad
-        end = start + num_tokens
-        final_hidden_states = final_hidden_states[start:end]
+        final_hidden_states = hidden_states[:num_tokens]
 
         final_hidden_states = final_hidden_states.reshape(org_hidden_shape)
 
