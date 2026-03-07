@@ -35,10 +35,18 @@ pip install vllm-rbln
 
 #### Or from source
 
+##### Using uv
 ```bash
 git clone https://github.com/rbln-sw/vllm-rbln.git
 cd vllm-rbln
-pip install -e .
+pip install -r requirements.txt
+```
+
+##### Using pip
+```bash
+git clone https://github.com/rbln-sw/vllm-rbln.git
+cd vllm-rbln
+uv pip install -e .
 ```
 
 ### 📚 Documentation
