@@ -132,16 +132,8 @@ name = "vllm-cpu"
 url = "https://wheels.vllm.ai/0.13.0/cpu"
 explicit = true
 
-[[tool.uv.index]]
-name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
-explicit = true
-
 [tool.uv.sources]
 vllm = { index = "vllm-cpu" }
-torch = { index = "pytorch-cpu" }
-torchvision = { index = "pytorch-cpu" }
-torchaudio = { index = "pytorch-cpu" }
 
 [tool.typos.default]
 binary = false
