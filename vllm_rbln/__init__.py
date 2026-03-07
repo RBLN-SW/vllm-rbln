@@ -52,6 +52,7 @@ def register_ops():
         import vllm_rbln.model_executor.layers.logits_processor  # noqa
         import vllm_rbln.model_executor.layers.quantization.kernels.mixed_precision  # noqa
         import vllm_rbln.model_executor.layers.quantization.mxfp4  # noqa
+        import vllm_rbln.model_executor.layers.quantization.fp8  # noqa
         import vllm_rbln.model_executor.layers.rotary_embedding.base  # noqa
         import vllm_rbln.model_executor.layers.rotary_embedding.deepseek_scaling_rope  # noqa
         import vllm_rbln.model_executor.layers.vocab_parallel_embedding  # noqa
@@ -61,6 +62,7 @@ def register_ops():
         import vllm_rbln.models.qwen2_moe  # noqa
         import vllm_rbln.models.qwen3  # noqa
         import vllm_rbln.models.qwen3_moe  # noqa
+        import vllm_rbln.models.minimax_m2  # noqa
         import vllm_rbln.models.utils  # noqa
         import vllm_rbln.v1.spec_decoding.eagle  # noqa
         from vllm_rbln.triton_kernels import attention  # noqa
