@@ -44,6 +44,7 @@ if envs.VLLM_RBLN_MOE_USE_OPT_KERNEL:
         topk: int,
         post_norm: bool,
         expert_map: torch.Tensor | None = None,
+        dp_mask: torch.Tensor | None = None,
         gate_proj_bias: torch.Tensor | None = None,
         up_proj_bias: torch.Tensor | None = None,
         down_proj_bias: torch.Tensor | None = None,
@@ -81,6 +82,7 @@ if envs.VLLM_RBLN_MOE_USE_OPT_KERNEL:
         topk: int,
         post_norm: bool,
         expert_map: torch.Tensor | None = None,
+        dp_mask: torch.Tensor | None = None,
         gate_proj_bias: torch.Tensor | None = None,
         up_proj_bias: torch.Tensor | None = None,
         down_proj_bias: torch.Tensor | None = None,
@@ -100,6 +102,7 @@ else:
         down_proj_weight: torch.Tensor,
         masked_routing_weight: torch.Tensor,
         expert_select_count: torch.Tensor,
+        dp_mask: torch.Tensor | None = None,
         gate_proj_bias: torch.Tensor | None = None,
         up_proj_bias: torch.Tensor | None = None,
         down_proj_bias: torch.Tensor | None = None,
@@ -136,6 +139,7 @@ else:
         down_proj_weight: torch.Tensor,
         masked_routing_weight: torch.Tensor,
         expert_select_count: torch.Tensor,
+        dp_mask: torch.Tensor | None = None,
         gate_proj_bias: torch.Tensor | None = None,
         up_proj_bias: torch.Tensor | None = None,
         down_proj_bias: torch.Tensor | None = None,
@@ -225,7 +229,7 @@ def unquantized_fused_moe_method_rbln(
     return final_hidden_states.reshape(orig_shape)
 
 
-def get_tokens_mask(num_tokens: int, left=0.0, right=float("-inf")):
+def get_tokens_mask(num_tokens: int, left=1.0, right=0.0):
     num_tokens_across_dp = get_forward_context().dp_metadata.num_tokens_across_dp_cpu
     num_tokens_across_dp = num_tokens_across_dp.unsqueeze(1)
     if num_tokens_across_dp.size(0) == 1:
@@ -364,7 +368,6 @@ def unquantized_fused_optimize_moe_method_custom(
     use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
     if use_moe_tokens_mask:
         tokens_mask = get_tokens_mask(num_tokens)
-        router_logits = router_logits + tokens_mask
 
     # optimum-rbln/src/optimum/rbln/transformers/models/qwen3_moe/
     # qwen3_moe_architecture.py
@@ -377,6 +380,7 @@ def unquantized_fused_optimize_moe_method_custom(
         layer.top_k,
         layer.renormalize,
         expert_map_const,
+        tokens_mask,
     )
     return final_hidden_states.reshape(orig_shape)
 
@@ -402,7 +406,6 @@ def fused_moe_forward_rbln(
         # 5. select each DP rank output
         # 6. to_group all reduce - {0+2+1+3}, {0+2+1+3}, {0+2+1+3}, {0+2+1+3}
         hidden_states = self.naive_multicast(hidden_states)
-
     router_logits = router(hidden_states)
 
     # Matrix multiply.
