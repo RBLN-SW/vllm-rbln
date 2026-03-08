@@ -36,7 +36,7 @@ def main():
     llm = LLM(
         model=MODEL_ID,
         max_model_len=2048,
-        block_size=2048,
+        block_size=1024,
         enable_chunked_prefill=True,
         max_num_batched_tokens=256,
         max_num_seqs=4,
