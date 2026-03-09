@@ -218,13 +218,6 @@ class RblnPlatform(Platform):
                 )
                 envs.VLLM_RBLN_SAMPLER = False
 
-                # FIXME(RBLN): temporarily block warm up with spec-dec
-                if envs.VLLM_RBLN_ENABLE_WARM_UP:
-                    logger.warning(
-                        "Using warm up with speculative decoding is not supported yet."
-                    )
-                    envs.VLLM_RBLN_ENABLE_WARM_UP = False
-
         else:
             # NOTE(eunji.lee):
             # It is for multimodal models

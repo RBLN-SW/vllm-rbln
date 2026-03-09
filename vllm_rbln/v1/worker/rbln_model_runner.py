@@ -1807,43 +1807,56 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # compile decode graph considering decode batch buckets
         for batch_bucket_size in self.bucketing_manager.decode_batch_buckets:
-            dummy_decode_requests: list[NewRequestData] = []
-            dummy_decode_num_scheduled_tokens: dict[str, int] = {}
-            for _ in range(batch_bucket_size):
-                self._add_dummy_requests(
-                    requests=dummy_decode_requests,
-                    num_scheduled_tokens=dummy_decode_num_scheduled_tokens,
-                    total_tokens=decode_max_seq_len,
-                    num_computed_tokens=decode_max_seq_len,
-                    num_kv_cache_groups=num_kv_cache_groups,
-                    sampling_params=None
-                    if self.is_pooling_model
-                    else SamplingParams(temperature=0.0),
-                    pooling_params=PoolingParams(
-                        task=self.get_supported_pooling_tasks()[0]
+            query_len_range = (
+                range(1, self.num_spec_tokens + 2) if self.num_spec_tokens > 0 else [1]
+            )
+            for query_len in query_len_range:
+                dummy_decode_requests: list[NewRequestData] = []
+                dummy_decode_num_scheduled_tokens: dict[str, int] = {}
+                for _ in range(batch_bucket_size):
+                    self._add_dummy_requests(
+                        requests=dummy_decode_requests,
+                        num_scheduled_tokens=dummy_decode_num_scheduled_tokens,
+                        total_tokens=decode_max_seq_len,
+                        num_computed_tokens=decode_max_seq_len,
+                        num_kv_cache_groups=num_kv_cache_groups,
+                        sampling_params=None
+                        if self.is_pooling_model
+                        else SamplingParams(temperature=0.0),
+                        pooling_params=PoolingParams(
+                            task=self.get_supported_pooling_tasks()[0]
+                        )
+                        if self.is_pooling_model
+                        else None,
                     )
-                    if self.is_pooling_model
-                    else None,
-                )
-            so, cso = self._make_dummy_scheduler_outputs(
-                dummy_decode_requests,
-                dummy_decode_num_scheduled_tokens,
-                num_kv_cache_groups,
-            )
-            current_intermediate_tensors = self.decode_intermediate_tensors.get(
-                batch_bucket_size
-            )
-            assert current_intermediate_tensors is not None
+                for req_id in dummy_decode_num_scheduled_tokens:
+                    dummy_decode_num_scheduled_tokens[req_id] = query_len
 
-            if self.specialized_moe_decode:
-                self._execute_dummy_requests(
-                    so,
-                    cso,
-                    current_intermediate_tensors,
-                    num_padded_tokens=self.max_num_batched_tokens,
+                spec_tokens = (
+                    {req.req_id: [0] * (query_len - 1) for req in dummy_decode_requests}
+                    if query_len > 1
+                    else {}
                 )
+                so, cso = self._make_dummy_scheduler_outputs(
+                    dummy_decode_requests,
+                    dummy_decode_num_scheduled_tokens,
+                    num_kv_cache_groups,
+                    scheduled_spec_decode_tokens=spec_tokens,
+                )
+                current_intermediate_tensors = self.decode_intermediate_tensors.get(
+                    batch_bucket_size
+                )
+                assert current_intermediate_tensors is not None
 
-            self._execute_dummy_requests(so, cso, current_intermediate_tensors)
+                if self.specialized_moe_decode:
+                    self._execute_dummy_requests(
+                        so,
+                        cso,
+                        current_intermediate_tensors,
+                        num_padded_tokens=self.max_num_batched_tokens,
+                    )
+
+                self._execute_dummy_requests(so, cso, current_intermediate_tensors)
 
         # compile sampler for all possible decode batches
         max_decode_batch = self.bucketing_manager.decode_batch_buckets[-1]
@@ -1907,7 +1920,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         )
         requests.append(req)
         num_scheduled_tokens[req.req_id] = (
-            (1 + self.num_spec_tokens)
+            1
             if total_tokens - num_computed_tokens == 0
             else total_tokens - num_computed_tokens
         )
@@ -1917,13 +1930,14 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         requests: list[NewRequestData],
         num_scheduled_tokens: dict[str, int],
         num_kv_cache_groups: int,
+        scheduled_spec_decode_tokens: dict[str, list[int]] | None = None,
     ) -> tuple[SchedulerOutput, SchedulerOutput]:
         sched_output = SchedulerOutput(
             scheduled_new_reqs=requests,
             scheduled_cached_reqs=CachedRequestData.make_empty(),
             num_scheduled_tokens=num_scheduled_tokens,
             total_num_scheduled_tokens=sum(num_scheduled_tokens.values()),
-            scheduled_spec_decode_tokens={},
+            scheduled_spec_decode_tokens=scheduled_spec_decode_tokens or {},
             scheduled_encoder_inputs={},
             num_common_prefix_blocks=[0] * num_kv_cache_groups,
             finished_req_ids=set(),
