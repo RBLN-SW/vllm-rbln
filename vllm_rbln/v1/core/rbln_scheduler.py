@@ -336,25 +336,15 @@ class RBLNScheduler(Scheduler):
                     continue
                 new_n = spec_decode_cap
 
-                # Check whether the reduced count requires freeing blocks.
-                # Extra blocks exist only when ceil reduces (edge case).
-                old_num_blocks = (
-                    req.num_computed_tokens + old_n + self.block_size - 1
-                ) // self.block_size
-                new_num_blocks = (
-                    req.num_computed_tokens + new_n + self.block_size - 1
-                ) // self.block_size
-
-                if old_num_blocks > new_num_blocks:
-                    # Extra blocks were allocated for the original token count but
-                    # are no longer needed. Invalidate their prefix cache hash so
-                    # they are not reused incorrectly; the blocks remain allocated
-                    # and will be reused when this request needs them in a future step.
-                    undo_uncomputed_block_caching(
-                        req,
-                        self.kv_cache_manager,
-                        req.num_computed_tokens + new_n,
-                    )
+                # Extra blocks were allocated for the original token count but
+                # are no longer needed. Invalidate their prefix cache hash so
+                # they are not reused incorrectly; the blocks remain allocated
+                # and will be reused when this request needs them in a future step.
+                undo_uncomputed_block_caching(
+                    req,
+                    self.kv_cache_manager,
+                    req.num_computed_tokens + new_n,
+                )
 
                 token_budget += old_n - new_n
                 num_scheduled_tokens[req_id] = new_n
