@@ -5,6 +5,7 @@ on:
     branches:
       - dev
       - dev-0.13
+      - tmp/check-pr
 
 jobs:
   check-skip-ci:
