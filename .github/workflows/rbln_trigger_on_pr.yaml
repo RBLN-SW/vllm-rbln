@@ -80,3 +80,5 @@ jobs:
     if: ${{ needs.check-skip-ci.outputs.should_skip != 'true' && (needs.check-team-member.outputs.is_team_member == 'true' || needs.check-team-member.outputs.is_collaborator == 'true') }}
     uses: ./.github/workflows/rbln_trigger_internal_test.yaml
     secrets: inherit
+    with:
+      ref: ${{ github.event.pull_request.head.sha }}
