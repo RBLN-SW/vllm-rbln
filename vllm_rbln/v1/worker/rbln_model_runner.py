@@ -1350,6 +1350,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             "tensor_parallel_size": envs.VLLM_RBLN_TP_SIZE,
             "process_group_dict": process_group_dict,
             "guard_filter_fn": torch.compiler.keep_tensor_guards_unsafe,
+            "mode": "strict",
         }
         if not envs.VLLM_DISABLE_COMPILE_CACHE:
             logger.info(
@@ -1357,8 +1358,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 "the cached compiled binary will be reused."
             )
             options["cache_dir"] = os.path.join(envs.VLLM_CACHE_ROOT, "rbln")
-        if envs.VLLM_RBLN_COMPILE_STRICT_MODE:
-            options["mode"] = "strict"
 
         # compile compute_logits
         # FIXME(jiwoo.park): method assignment for torch.compile

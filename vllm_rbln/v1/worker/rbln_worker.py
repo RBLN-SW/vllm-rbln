@@ -29,6 +29,7 @@ except ImportError:
     has_torch_rbln = False
 
 import torch.nn as nn
+from torch._dynamo.exc import BackendCompilerFailed
 from vllm.config import VllmConfig
 from vllm.distributed import (
     ensure_model_parallel_initialized,
@@ -259,23 +260,35 @@ class RBLNWorker(WorkerBase):
 
         num_runtimes = 1 + (1 + specialized_moe_decode) * decode_batch_buckets_count
 
+        ratio: float = 1.0
         if self.model_config.quantization is not None:
-            # FIXME(RBLN) - for now, mxfp4 quantization is only supported
-            assert self.model_config.quantization == "mxfp4"
-            if "ca" in device_name:
-                # ATOM DOES NOT support mxfp4 quantization, handled by bf16
-                nbits_per_param = 16
-                # mlp weight scale is merged into params
-                # FIXME(RBLN) - expert scale merged into expert weight param
-                # ratio scale vs weight = 1 : 16
-                ratio = 16 / 17
-            elif "cr" in device_name:
-                # REBEL can support mxfp4 quantization
-                nbits_per_param = 4
-                ratio = 1
+            logger.info(
+                "model quantization scheme = %s", self.model_config.quantization
+            )
+            # FIXME(RBLN) - for now, mxfp4/fp8 quantization is only supported
+            quantization = self.model_config.quantization
+            assert quantization == "mxfp4" or quantization == "fp8"
+
+            if quantization == "fp8":
+                nbits_per_param = 8
+            elif quantization == "mxfp4":
+                if "ca" in device_name:
+                    # ATOM DOES NOT support mxfp4 quantization, handled by bf16
+                    nbits_per_param = 16
+                    # mlp weight scale is merged into params
+                    # FIXME(RBLN) - expert scale merged into expert weight param
+                    # ratio scale vs weight = 1 : 16
+                    ratio = 16 / 17
+                elif "cr" in device_name:
+                    # REBEL can support mxfp4 quantization
+                    nbits_per_param = 4
+                else:
+                    raise ValueError(
+                        "invalid RBLN architecture, candidates = [ATOM(ca), REBEL(cr)]"
+                    )
             else:
                 raise ValueError(
-                    "invalid RBLN architecture, candidates = [ATOM(ca), REBEL(cr)]"
+                    "invalid quantization scheme, candidates = [fp8, mxfp4]"
                 )
 
             # pack 2 mxfp4 elems into single uint8 elem
@@ -283,7 +296,7 @@ class RBLNWorker(WorkerBase):
         else:
             nbits_per_param = 16
             packed_num_elems = 1
-            ratio = 1
+
         for key, value in params_dict.items():
             if value.dtype == torch.bfloat16:
                 n_model_attentions += value.numel()
@@ -342,7 +355,31 @@ class RBLNWorker(WorkerBase):
             logger.warning("skipping compile_or_warm_up_model")
             return
 
-        self.model_runner.warm_up_model()
+        try:
+            self.model_runner.warm_up_model()
+
+        except BackendCompilerFailed as e:
+
+            def is_oom(exc):
+                if isinstance(exc, RuntimeError):
+                    for arg in exc.args:
+                        if isinstance(arg, str) and (
+                            "SYS_ENOMEM: Out of memory" in arg
+                            or "SYS_EBUSY: Lack of device memory" in arg
+                        ):
+                            return True
+                return False
+
+            if is_oom(e.inner_exception):
+                raise RuntimeError(
+                    "Not enough memory for "
+                    f"{self.model_runner.kv_cache_config.num_blocks} "
+                    "blocks of KV cache. Try reducing the number of blocks "
+                    "by setting --num-gpu-blocks-override."
+                ) from e
+
+            raise
+
         # after completing model warm up, enable RBLN performance tracker
         self.model_runner._enable_performance_tracker()
 
