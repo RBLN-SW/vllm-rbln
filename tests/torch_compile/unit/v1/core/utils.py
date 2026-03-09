@@ -71,6 +71,7 @@ def create_scheduler(
     pipeline_parallel_size: int = 1,
     use_ec_connector: bool = False,
     ec_role: str | None = None,
+    sub_block_size: int | None = None,
 ) -> RBLNScheduler:
     """Create scheduler under test.
 
@@ -184,6 +185,7 @@ def create_scheduler(
         block_size=block_size,
         log_stats=True,
         structured_output_manager=StructuredOutputManager(vllm_config),
+        sub_block_size=sub_block_size,
     )
 
 

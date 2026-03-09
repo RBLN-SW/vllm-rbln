@@ -13,10 +13,13 @@
 # limitations under the License.
 
 import time
+from dataclasses import dataclass, field
 
 from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
+from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
+from vllm.v1.core.kv_cache_utils import init_none_hash
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
@@ -25,9 +28,19 @@ from vllm.v1.engine import EngineCoreEventType
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.utils import record_function_or_nullcontext
 
+import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
+from vllm_rbln.v1.core.rbln_kv_cache_manager import KVCacheCopyOp, RBLNKVCacheManager
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class RBLNSchedulerOutput(SchedulerOutput):
+    """SchedulerOutput extended with KV cache copy operations for sub-block
+    prefix caching."""
+
+    kv_cache_copy_ops: list[KVCacheCopyOp] = field(default_factory=list)
 
 
 def is_prefill(request: Request) -> bool:
@@ -59,7 +72,51 @@ def undo_uncomputed_block_caching(
 
 
 class RBLNScheduler(Scheduler):
-    def schedule(self) -> SchedulerOutput:
+    def __init__(
+        self,
+        *args,
+        sub_block_size: int | None = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+
+        # Replace the upstream KVCacheManager with RBLNKVCacheManager
+        # when sub-block prefix caching is enabled.
+        # Sub-block size equals the prefill chunk size (max_num_batched_tokens)
+        # so that each prefill does not span multiple blocks.
+        if sub_block_size is None and envs.VLLM_RBLN_SUB_BLOCK_CACHE:
+            sub_block_size = self.scheduler_config.max_num_batched_tokens
+        if (
+            self.cache_config.enable_prefix_caching
+            and sub_block_size
+            and RBLNKVCacheManager.can_use_sub_block_caching(
+                self.kv_cache_config, sub_block_size
+            )
+        ):
+            hash_fn = get_hash_fn_by_name(self.cache_config.prefix_caching_hash_algo)
+            init_none_hash(hash_fn)
+
+            self.kv_cache_manager = RBLNKVCacheManager(
+                kv_cache_config=self.kv_cache_config,
+                max_model_len=self.max_model_len,
+                hash_block_size=self.block_size,
+                sub_block_size=sub_block_size,
+                hash_fn=hash_fn,
+                use_eagle=self.use_eagle,
+                log_stats=self.log_stats,
+                enable_kv_cache_events=self.enable_kv_cache_events,
+                dcp_world_size=self.dcp_world_size,
+                pcp_world_size=self.pcp_world_size,
+                metrics_collector=self.kv_metrics_collector,
+            )
+
+            logger.info(
+                "Sub-block prefix caching enabled: block_size=%d, sub_block_size=%d",
+                self.block_size,
+                sub_block_size,
+            )
+
+    def schedule(self) -> RBLNSchedulerOutput:
         # Copied from vllm.v1.core.sched.Scheduler.schedule: https://github.com/vllm-project/vllm/blob/v0.18.0/vllm/v1/core/sched/scheduler.py#L338-L927
         # The only differences are:
         # - Disable mixed batching
@@ -753,7 +810,7 @@ class RBLNScheduler(Scheduler):
             else None
         )
 
-        scheduler_output = SchedulerOutput(
+        scheduler_output = RBLNSchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
             num_scheduled_tokens=num_scheduled_tokens,
@@ -770,6 +827,12 @@ class RBLNScheduler(Scheduler):
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
         )
+
+        # Drain pending copy ops from the KV cache manager.
+        if isinstance(self.kv_cache_manager, RBLNKVCacheManager):
+            scheduler_output.kv_cache_copy_ops = (
+                self.kv_cache_manager.drain_pending_copy_ops()
+            )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
