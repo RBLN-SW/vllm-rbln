@@ -1337,11 +1337,28 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         process_group_dict[DP.device_group.group_name] = DP.ranks
         process_group_dict[DP.cpu_group.group_name] = DP.ranks
 
+        def guard_filter(guards):
+            # leave only the guards for the input tensors
+            return [
+                g.name
+                in (
+                    # model_executable
+                    "input_ids",
+                    "positions",
+                    "intermediate_tensors",
+                    "selected_token_indices",
+                    "inputs_embeds",
+                    # compute_logits
+                    "hidden_states",
+                )
+                for g in guards
+            ]
+
         options = {
             "compile_context": self.compile_context,
             "tensor_parallel_size": envs.VLLM_RBLN_TP_SIZE,
             "process_group_dict": process_group_dict,
-            "guard_filter_fn": torch.compiler.keep_tensor_guards_unsafe,
+            "guard_filter_fn": guard_filter,
         }
         if not envs.VLLM_DISABLE_COMPILE_CACHE:
             logger.info(
