@@ -1802,7 +1802,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # blocks per layer under the current implementation, so we’re forced
         # to reduce the warmup length to a reasonable value for now.
         # This is mainly because we still have to run the computation over
-        # the padded tokens in speculative decoing scenario as well.
+        # the padded tokens in speculative decoding scenario as well.
         decode_max_seq_len = self.max_model_len // 2
 
         # compile decode graph considering decode batch buckets
