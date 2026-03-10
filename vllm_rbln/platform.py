@@ -145,10 +145,11 @@ class RblnPlatform(Platform):
                 os.environ["RBLN_FORCE_CCL_ASYNC"] = "1"
             elif ccl_async_mode == "0":
                 logger.warning(
-                    "RBLN_FORCE_CCL_ASYNC is set to 0, which may cause performance degradation "
+                    "RBLN_FORCE_CCL_ASYNC is set to 0, "
+                    "which may cause performance degradation "
                     "when using vLLM model parallel (TP, DP, EP, or PP)."
                 )
-                
+
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         model_config = vllm_config.model_config
