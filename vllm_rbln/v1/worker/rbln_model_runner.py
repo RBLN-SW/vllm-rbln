@@ -1351,7 +1351,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             )
             options["cache_dir"] = os.path.join(envs.VLLM_CACHE_ROOT, "rbln")
 
-        if envs.VLLM_RBLN_AUTO_PORT and has_torch_rbln:
+        if has_torch_rbln:
             options["use_global_ctx"] = True
             # TODO(yunseong.kim): use device_id from current platform
             # when vllm-rbln supports it
