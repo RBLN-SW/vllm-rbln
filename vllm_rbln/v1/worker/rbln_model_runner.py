@@ -121,7 +121,7 @@ from vllm_rbln.v1.attention.backends.flash_attention import (
 )
 from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 from vllm_rbln.v1.sample import RBLNSampler
-from vllm_rbln.worker.metrics import PerformanceTracker
+from vllm_rbln.v1.worker.metrics import PerformanceTracker
 
 if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
