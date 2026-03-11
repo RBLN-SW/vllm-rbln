@@ -75,6 +75,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheSpec,
     MambaSpec,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 
@@ -119,7 +120,6 @@ from vllm_rbln.lora.mask import LoRAMask
 from vllm_rbln.v1.attention.backends.flash_attention import (
     RBLNFlashAttentionMetadataBuilder,
 )
-from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 from vllm_rbln.v1.sample import RBLNSampler
 from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
 from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
@@ -1298,6 +1298,11 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     common_attn_metadata=common_attn_metadata,
                     **extra_attn_metadata_args,
                 )
+
+                if isinstance(kv_cache_group_spec.kv_cache_spec, SlidingWindowSpec):
+                    print(f"seq_lens: {attn_metadata_i.seq_lens}")
+                    print(f"vllm block_table: {attn_metadata_i.block_tables}")
+                    print(f"rbln block_table: {attn_metadata_i.swa_block_tables}")
 
                 for layer_name in attn_group.layer_names:
                     attn_metadata[layer_name] = attn_metadata_i
@@ -3729,7 +3734,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 kv_cache_spec = next(iter(kv_cache_spec.kv_cache_specs.values()))
             if isinstance(kv_cache_spec, EncoderOnlyAttentionSpec):
                 continue
-            elif isinstance(kv_cache_spec, RBLNSlidingWindowSpec):
+            elif isinstance(kv_cache_spec, SlidingWindowSpec):
+                # NOTE(RBLN): RBLN SWA requires kernel block size = window size.
                 kernel_block_sizes.append(kv_cache_spec.sliding_window)
             elif isinstance(kv_cache_spec, AttentionSpec):
                 # This is an attention backend that supports virtual

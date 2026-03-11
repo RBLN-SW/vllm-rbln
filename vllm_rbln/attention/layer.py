@@ -31,8 +31,6 @@ from vllm.platforms import current_platform
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 
-from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
-
 # @FIXME(RBLN): We hope to remove the Custom Attention forward.
 # The original vLLM forward function will be used in the future.
 
@@ -285,31 +283,5 @@ def custom_attention_forward(
             return torch.ops.vllm.unified_attention(query, key, value, self.layer_name)
 
 
-def custom_get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
-    # Block size may get updated after model loading, refresh it
-    block_size = vllm_config.cache_config.block_size
-    # Should not be called for enc-dec or encoder-only attention.
-    assert self.attn_type == AttentionType.DECODER
-    if self.sliding_window is not None:
-        assert not vllm_config.model_config.use_mla, (
-            "MLA is not supported for slidingwindow"
-        )
-        return RBLNSlidingWindowSpec(
-            block_size=block_size,
-            num_kv_heads=self.num_kv_heads,
-            head_size=self.head_size,
-            dtype=self.kv_cache_torch_dtype,
-            sliding_window=self.sliding_window,
-        )
-    else:
-        return FullAttentionSpec(
-            block_size=block_size,
-            num_kv_heads=self.num_kv_heads,
-            head_size=self.head_size,
-            dtype=self.kv_cache_torch_dtype,
-        )
-
-
 Attention.__init__ = __custom_init__
 Attention.forward = custom_attention_forward
-Attention.get_kv_cache_spec = custom_get_kv_cache_spec

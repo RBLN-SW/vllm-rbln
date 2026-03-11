@@ -681,8 +681,7 @@ def sliding_window_attention_naive_prefill_impl(
     k: torch.Tensor,
     v: torch.Tensor,
     kv_cache: torch.Tensor,
-    cache_seq_len: torch.Tensor,
-    cache_offset: torch.Tensor,
+    seq_lens: torch.Tensor,
     scale: torch.Tensor,
     block_tables: torch.Tensor,
     dummy: torch.Tensor,
@@ -690,87 +689,85 @@ def sliding_window_attention_naive_prefill_impl(
 ) -> torch.Tensor:
     """
     Expected tensor shapes:
-    - q: [batch, n_kv_heads, n_groups, seq_len, head_dim]
+    - q: [batch, n_kv_heads, n_groups, q_len, head_dim]
       Query states for multiple tokens
-    - k: [batch, n_kv_heads, 1, seq_len, head_dim]
+    - k: [batch, n_kv_heads, 1, q_len, head_dim]
       Key states for current input
-    - v: [batch, n_kv_heads, 1, seq_len, head_dim]
+    - v: [batch, n_kv_heads, 1, q_len, head_dim]
       Value states for current input
     - kv_cache: [2, num_blocks, n_kv_heads, 1, window_size, head_dim]
-      Key and value cache
-    - cache_seq_len: [batch, 1]
-      number of tokens already cached
-    - cache_offset: [batch, 1]
-      ending position after insertion (cache_seq_len + query_len)
+      Key and value cache. block_size = window_size.
+    - seq_lens: [batch, 1]
+      Sequence length before adding new k/v.
     - scale: []. Attention scale factor
-    - block_tables: [batch] for prefill, [batch, 1] for decode
+    - block_tables: [batch, 2].
+      Physical block indices [left_block, right_block] covering the window.
+      block_tables[:, 1] maps to logical block seq_lens // block_size.
+      block_tables[:, 0] maps to logical block max(0, seq_lens - W) // block_size.
+      When seq_lens < window_size, both entries are the same block.
+      Assumes q_len <= window_size and seq_lens is always aligned to q_len.
     - sinks: [n_heads, sink_len] (optional)
 
     Returns:
-        Tensor: attn_output: [batch, n_kv_heads, n_groups, seq_len, head_dim]
+        Tensor: attn_output: [batch, n_kv_heads, n_groups, q_len, head_dim]
 
     batch size is assumed to be 1 for prefill.
     """
     if envs.VLLM_RBLN_COMPILE_MODEL:
         return torch.empty_like(q)
 
-    window_size = kv_cache.size(-2)
-    seq_len = q.size(-2)
-    cache_start = int(cache_seq_len[0][0].item())
-    cache_end = int(cache_offset[0][0].item())
-    block = int(block_tables[0].item())
+    W = kv_cache.size(-2)
+    _, n_kv_heads, n_groups, q_len, _ = q.shape
+    S = int(seq_lens[0][0].item())
 
-    k_cache = kv_cache[0][block].unsqueeze(0)
-    k_cache_curr = torch.cat([k_cache[:, :, :, :cache_start, :], k], dim=3)
-    k_cache_curr = rbln_utils.pad(
-        k_cache_curr,
-        3,
-        window_size + seq_len,
-    )
-    k_cache_slice = k_cache_curr[
-        :, :, :, max(0, cache_end - window_size) : cache_end, :
+    left_block = int(block_tables[0, 0].item())
+    right_block = int(block_tables[0, 1].item())
+    R = S // W  # block containing position S
+    L = max(0, S - W) // W  # left block of the window
+
+    # S is always aligned to q_len, and q_len divides W,
+    # so all new tokens fit in the right block (no block boundary crossing).
+    offset_start = S % W
+    assert offset_start + q_len <= W
+    kv_cache[0, right_block, :, :, offset_start : offset_start + q_len, :] = k[0]
+    kv_cache[1, right_block, :, :, offset_start : offset_start + q_len, :] = v[0]
+
+    # Gather KV from the 2 blocks in position order
+    if left_block == right_block:
+        right_tokens = offset_start + q_len
+        k_gathered = kv_cache[0, right_block, :, :, :right_tokens, :].unsqueeze(0)
+        v_gathered = kv_cache[1, right_block, :, :, :right_tokens, :].unsqueeze(0)
+        kv_start_pos = R * W
+    else:
+        # Left block is fully filled; right block has partial tokens
+        k_left = kv_cache[0, left_block, :, :, :W, :]
+        v_left = kv_cache[1, left_block, :, :, :W, :]
+        right_tokens = offset_start + q_len
+        k_right = kv_cache[0, right_block, :, :, :right_tokens, :]
+        v_right = kv_cache[1, right_block, :, :, :right_tokens, :]
+        k_gathered = torch.cat([k_left, k_right], dim=2).unsqueeze(0)
+        v_gathered = torch.cat([v_left, v_right], dim=2).unsqueeze(0)
+        kv_start_pos = L * W
+
+    # k_gathered, v_gathered: [1, n_kv_heads, 1, total_kv, head_dim]
+    total_kv = k_gathered.size(3)
+
+    # Step 3: Sliding window + causal mask
+    query_positions = torch.arange(S, S + q_len, device=q.device)
+    kv_positions = torch.arange(kv_start_pos, kv_start_pos + total_kv, device=q.device)
+    causal = query_positions.unsqueeze(1) >= kv_positions.unsqueeze(0)
+    in_window = (query_positions.unsqueeze(1) - kv_positions.unsqueeze(0)) < W
+    mask = torch.where(causal & in_window, 0.0, float("-inf")).to(q.dtype)[
+        None, None, None, :, :
     ]
-    k_cache_slice = rbln_utils.pad(
-        k_cache_slice,
-        3,
-        window_size,
-    )
-    kv_cache[0][block] = k_cache_slice.squeeze(0)
 
-    v_cache = kv_cache[1][block].unsqueeze(0)
-    v_cache_curr = torch.cat([v_cache[:, :, :, :cache_start, :], v], dim=3)
-    v_cache_curr = rbln_utils.pad(
-        v_cache_curr,
-        3,
-        window_size + seq_len,
-    )
-    v_cache_slice = v_cache_curr[
-        :, :, :, max(0, cache_end - window_size) : cache_end, :
-    ]
-    v_cache_slice = rbln_utils.pad(
-        v_cache_slice,
-        3,
-        window_size,
-    )
-    kv_cache[1][block] = v_cache_slice.squeeze(0)
-
-    attn_weights = torch.matmul(q, k_cache_curr.transpose(3, 4)) * scale
-
-    ones = torch.ones(window_size + seq_len, window_size + seq_len)
-    mask_full = torch.tril(ones) - torch.tril(ones, diagonal=-window_size)
-    mask = mask_full[None, None, None, cache_start : cache_start + seq_len, :]
-    mask = torch.where(mask > 0, 0.0, float("-inf")).to(attn_weights.dtype)
-
-    attn_weights = attn_weights + mask
+    # Step 4: Compute attention
+    attn_weights = torch.matmul(q, k_gathered.transpose(3, 4)) * scale + mask
 
     if sinks is not None:
         sink_len = sinks.size(-1)
-        n_kv_heads = q.size(1)
-        n_groups = q.size(2)
         sinks_expanded = sinks.view(n_kv_heads, n_groups, 1, sink_len)
-        sinks_expanded = sinks_expanded.expand(
-            1, n_kv_heads, n_groups, seq_len, sink_len
-        )
+        sinks_expanded = sinks_expanded.expand(1, n_kv_heads, n_groups, q_len, sink_len)
         combined_logits = torch.cat([attn_weights, sinks_expanded], dim=-1)
         combined_logits = (
             combined_logits - combined_logits.max(dim=-1, keepdim=True).values
@@ -780,7 +777,7 @@ def sliding_window_attention_naive_prefill_impl(
     else:
         attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
 
-    attn_output = torch.matmul(attn_weights, v_cache_curr)
+    attn_output = torch.matmul(attn_weights, v_gathered)
 
     return attn_output
 
@@ -791,8 +788,7 @@ def _(
     k: torch.Tensor,
     v: torch.Tensor,
     kv_cache: torch.Tensor,
-    cache_seq_len: torch.Tensor,
-    cache_offset: torch.Tensor,
+    seq_lens: torch.Tensor,
     scale: torch.Tensor,
     block_tables: torch.Tensor,
     dummy: torch.Tensor,
@@ -809,8 +805,7 @@ def sliding_window_attention_naive_decode_impl(
     k: torch.Tensor,
     v: torch.Tensor,
     kv_cache: torch.Tensor,
-    cache_seq_len: torch.Tensor,
-    cache_offset: torch.Tensor,
+    seq_lens: torch.Tensor,
     scale: torch.Tensor,
     block_tables: torch.Tensor,
     dummy: torch.Tensor,
@@ -820,69 +815,52 @@ def sliding_window_attention_naive_decode_impl(
     if envs.VLLM_RBLN_COMPILE_MODEL:
         return torch.empty_like(q)
 
-    window_size = kv_cache.size(-2)
-    batch_size = q.size(0)
+    W = kv_cache.size(-2)
+    batch_size, n_kv_heads, n_groups, _, _ = q.shape
 
     outputs = []
-    for r in range(batch_size):
-        cache_start = int(cache_seq_len[r][0].item())
-        cache_end = int(cache_offset[r][0].item())
-        if cache_end - cache_start <= 0:
-            outputs.append(torch.zeros_like(q[r : r + 1]))
+    for b in range(batch_size):
+        S = int(seq_lens[b][0].item())
+
+        if S <= 0:
+            outputs.append(torch.zeros_like(q[b : b + 1]))
             continue
-        block = int(block_tables[r][0].item())
 
-        q_r = q[r : r + 1]
-        k_r = k[r : r + 1]
-        v_r = v[r : r + 1]
+        right_block = int(block_tables[b, 1].item())
+        left_block = int(block_tables[b, 0].item())
 
-        k_cache = kv_cache[0][block].unsqueeze(0)
-        k_cache_curr = torch.cat([k_cache[:, :, :, :cache_start, :], k_r], dim=3)
-        k_cache_curr = rbln_utils.pad(
-            k_cache_curr,
-            3,
-            window_size + 1,
-        )
-        k_cache_slice = k_cache_curr[
-            :, :, :, max(0, cache_end - window_size) : cache_end, :
-        ]
-        k_cache_slice = rbln_utils.pad(
-            k_cache_slice,
-            3,
-            window_size,
-        )
-        kv_cache[0][block] = k_cache_slice.squeeze(0)
+        # Write new k/v at position S
+        offset = S % W
+        kv_cache[0, right_block, :, :, offset, :] = k[b, :, :, 0, :]
+        kv_cache[1, right_block, :, :, offset, :] = v[b, :, :, 0, :]
 
-        v_cache = kv_cache[1][block].unsqueeze(0)
-        v_cache_curr = torch.cat([v_cache[:, :, :, :cache_start, :], v_r], dim=3)
-        v_cache_curr = rbln_utils.pad(
-            v_cache_curr,
-            3,
-            window_size + 1,
-        )
-        v_cache_slice = v_cache_curr[
-            :, :, :, max(0, cache_end - window_size) : cache_end, :
-        ]
-        v_cache_slice = rbln_utils.pad(
-            v_cache_slice,
-            3,
-            window_size,
-        )
-        kv_cache[1][block] = v_cache_slice.squeeze(0)
+        # Window covers [max(0, S-W+1), S], length = min(W, S+1)
+        window_len = min(W, S + 1)
+        r = offset  # offset of the newest token in right block
 
-        attn_weights = torch.matmul(q_r, k_cache_curr.transpose(3, 4)) * scale
+        if left_block == right_block or window_len <= r + 1:
+            # Window fits in right block only
+            start = r + 1 - window_len
+            k_window = kv_cache[0, right_block, :, :, start : r + 1, :].unsqueeze(0)
+            v_window = kv_cache[1, right_block, :, :, start : r + 1, :].unsqueeze(0)
+        else:
+            # Window spans two blocks
+            left_count = window_len - (r + 1)
+            left_start = W - left_count
+            k_left = kv_cache[0, left_block, :, :, left_start:, :]
+            v_left = kv_cache[1, left_block, :, :, left_start:, :]
+            k_right = kv_cache[0, right_block, :, :, : r + 1, :]
+            v_right = kv_cache[1, right_block, :, :, : r + 1, :]
+            k_window = torch.cat([k_left, k_right], dim=2).unsqueeze(0)
+            v_window = torch.cat([v_left, v_right], dim=2).unsqueeze(0)
 
-        ones = torch.ones(window_size + 1, window_size + 1)
-        mask_full = torch.tril(ones) - torch.tril(ones, diagonal=-window_size)
-        mask = mask_full[None, None, None, cache_start : cache_start + 1, :]
-        mask = torch.where(mask > 0, 0.0, float("-inf")).to(attn_weights.dtype)
-
-        attn_weights = attn_weights + mask
+        # k_window, v_window: [1, n_kv_heads, 1, window_len, head_dim]
+        q_b = q[b : b + 1]  # [1, n_kv_heads, n_groups, 1, head_dim]
+        attn_weights = torch.matmul(q_b, k_window.transpose(3, 4)) * scale
+        # No causal mask needed: decode query is at the end of the window
 
         if sinks is not None:
             sink_len = sinks.size(-1)
-            n_kv_heads = q.size(1)
-            n_groups = q.size(2)
             sinks_expanded = sinks.view(n_kv_heads, n_groups, 1, sink_len)
             sinks_expanded = sinks_expanded.expand(1, n_kv_heads, n_groups, 1, sink_len)
             combined_logits = torch.cat([attn_weights, sinks_expanded], dim=-1)
@@ -894,7 +872,7 @@ def sliding_window_attention_naive_decode_impl(
         else:
             attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
 
-        attn_output = torch.matmul(attn_weights, v_cache_curr)
+        attn_output = torch.matmul(attn_weights, v_window)
         outputs.append(attn_output)
 
     return torch.cat(outputs, dim=0)
@@ -906,8 +884,7 @@ def _(
     k: torch.Tensor,
     v: torch.Tensor,
     kv_cache: torch.Tensor,
-    cache_seq_len: torch.Tensor,
-    cache_offset: torch.Tensor,
+    seq_lens: torch.Tensor,
     scale: torch.Tensor,
     block_tables: torch.Tensor,
     dummy: torch.Tensor,
@@ -1017,9 +994,7 @@ class RBLNFlashAttentionMetadata:
     attn_masks: torch.Tensor | None = None
     kv_caches: list[torch.Tensor] | None = None
     # for sliding window attention
-    cache_seq_lens: torch.Tensor | None = None
-    cache_offsets: torch.Tensor | None = None
-    local_block_tables: torch.Tensor | None = None
+    swa_block_tables: torch.Tensor | None = None
     swa_attn_masks: torch.Tensor | None = None
 
 
@@ -1126,8 +1101,6 @@ class RBLNFlashAttentionMetadataBuilder(
 
         attn_masks = None
         if is_prefills[0]:
-            # NOTE(jiwoo.park) prefill's block_tables must be a 1D tensor.
-            block_tables_tensor = block_tables_tensor[0]
             if not self.is_causal:
                 prefill_chunk_size = self.chunked_prefill_size
                 chunked_attention_mask = torch.zeros(
@@ -1169,21 +1142,16 @@ class RBLNFlashAttentionMetadataBuilder(
                 attn_masks = decode_attention_mask
                 attn_masks = attn_masks.to(self.device)
 
-        cache_seq_lens = None
-        cache_offsets = None
-        local_block_tables = None
+        swa_block_tables = None
         swa_attn_masks = None
         if sliding_window := getattr(self.kv_cache_spec, "sliding_window", None):
             num_computed_tokens = (
                 num_computed_tokens[:num_reqs].view(-1, 1).to(torch.int16)
             )
             seq_lens = seq_lens[:num_reqs].view(-1, 1).to(torch.int16)
-            query_lens = seq_lens - num_computed_tokens
             cache_seq_lens = torch.clamp(num_computed_tokens, max=sliding_window)
-            cache_offsets = cache_seq_lens + query_lens
             if not is_prefills[0]:
                 cache_seq_lens = rbln_utils.pad(cache_seq_lens, 0, batch_pad)
-                cache_offsets = rbln_utils.pad(cache_offsets, 0, batch_pad)
                 # Generate sliding window attention mask for decode
                 # mask[b, s] = 1.0 if s <= cache_seq_lens[b] else 0.0
                 positions = torch.arange(sliding_window)[None, :]
@@ -1191,9 +1159,15 @@ class RBLNFlashAttentionMetadataBuilder(
                     :, None, None, :
                 ]
 
-            local_block_tables = block_tables_tensor[..., :1]
+            block_idx_left = torch.clamp(seq_idx - sliding_window, 0) // sliding_window
+            block_idx_right = seq_idx // sliding_window
+            block_idxs = torch.concat([block_idx_left, block_idx_right], dim=1)
+            swa_block_tables = block_tables_tensor.gather(1, block_idxs)
 
-        # * seq_idx(batch attention opt decode) - [B, 1],
+        if is_prefills[0]:
+            block_tables_tensor = block_tables_tensor[0]
+
+        # * seq_idx(batch attention opt decode or swa) - [B, 1],
         #   for each batch, have sequence offset
         # * seq_lens_tensor(otherwise)      - [B, P],
         #   have dynamic size for each partition
@@ -1202,9 +1176,10 @@ class RBLNFlashAttentionMetadataBuilder(
             max_query_len=max_query_len,
             query_start_loc=query_start_loc,
             max_seq_len=query_max_seq_len,
-            seq_lens=seq_lens_tensor.to(self.device)
-            if not self.is_batch_attention_opt or is_prefills[0] or batch_pad <= 1
-            else seq_idx.to(self.device),
+            seq_lens=seq_idx.to(self.device)
+            if sliding_window
+            or (self.is_batch_attention_opt and not is_prefills[0] and batch_pad > 1)
+            else seq_lens_tensor.to(self.device),
             block_tables=block_tables_tensor.to(self.device),
             slot_mapping=slot_mapping,
             use_cascade=False,
@@ -1216,14 +1191,8 @@ class RBLNFlashAttentionMetadataBuilder(
             prefix_scheduler_metadata=prefix_scheduler_metadata,
             is_prefill=bool(is_prefills[0]),
             attn_masks=attn_masks,
-            cache_seq_lens=cache_seq_lens.to(self.device)
-            if cache_seq_lens is not None
-            else None,
-            cache_offsets=cache_offsets.to(self.device)
-            if cache_offsets is not None
-            else None,
-            local_block_tables=local_block_tables.to(self.device)
-            if local_block_tables is not None
+            swa_block_tables=swa_block_tables.to(self.device)
+            if swa_block_tables is not None
             else None,
             swa_attn_masks=swa_attn_masks.to(self.device)
             if swa_attn_masks is not None
@@ -1405,8 +1374,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
             assert self.sliding_window == kv_cache.size(-2), (
                 "SWA kernel_block_size must match window_size"
             )
-            assert attn_metadata.cache_seq_lens is not None
-            assert attn_metadata.cache_offsets is not None
+            assert attn_metadata.swa_block_tables is not None
             if envs.VLLM_RBLN_COMPILE_MODEL:
                 if envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
                     sliding_window_attention_naive_prefill = (
@@ -1436,12 +1404,11 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                     key,
                     value,
                     kv_cache,
-                    attn_metadata.cache_seq_lens.to(torch.int32)
+                    attn_metadata.seq_lens.to(torch.int32)
                     if self.is_batch_attention_opt and b_size > 1
-                    else attn_metadata.cache_seq_lens,
-                    attn_metadata.cache_offsets,
+                    else attn_metadata.seq_lens,
                     self.scale,
-                    attn_metadata.local_block_tables,
+                    attn_metadata.swa_block_tables,
                     self.scale,  # dummy
                 ]
                 if not envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
@@ -1459,10 +1426,9 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                     key,
                     value,
                     kv_cache,
-                    attn_metadata.cache_seq_lens,
-                    attn_metadata.cache_offsets,
+                    attn_metadata.seq_lens,
                     self.scale,
-                    attn_metadata.local_block_tables,
+                    attn_metadata.swa_block_tables,
                     self.scale,  # dummy
                 ]
                 if not envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
