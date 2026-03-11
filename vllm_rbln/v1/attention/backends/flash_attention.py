@@ -1175,7 +1175,7 @@ class RBLNFlashAttentionMetadataBuilder(
                 cache_offsets = rbln_utils.pad(cache_offsets, 0, batch_pad)
                 # Generate sliding window attention mask for decode
                 # mask[b, s] = 1.0 if s <= cache_seq_lens[b] else 0.0
-                positions = torch.arange(sliding_window)[None, :]
+                positions = torch.arange(sliding_window)[None, :].to(cache_seq_lens.device)
                 swa_attn_masks = torch.where(positions - cache_seq_lens > 0, 0.0, 1.0)[
                     :, None, None, :
                 ]

@@ -410,7 +410,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
             use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
             if use_moe_tokens_mask:
-                tokens_mask = get_tokens_mask(num_tokens)
+                tokens_mask = get_tokens_mask(num_tokens, device=router_logits.device)
                 router_logits = router_logits + tokens_mask
 
             final_hidden_states = torch.ops.rbln_custom_ops.custom_moe_glu_mxfp4(
