@@ -81,7 +81,7 @@ jobs:
       - name: Checkout current repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.sha }}
+          ref: ${{ inputs.ref != '' && inputs.ref || github.sha }}
           submodules: recursive
           fetch-depth: 0
 
@@ -163,7 +163,7 @@ jobs:
       - name: Checkout current repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.sha }}
+          ref: ${{ inputs.ref != '' && inputs.ref || github.sha }}
           submodules: recursive
           fetch-depth: 0
 
@@ -283,7 +283,7 @@ jobs:
       - name: Checkout current repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.sha }}
+          ref: ${{ inputs.ref != '' && inputs.ref || github.sha }}
           submodules: recursive
           fetch-depth: 0
 

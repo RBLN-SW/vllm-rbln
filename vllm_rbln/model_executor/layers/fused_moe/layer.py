@@ -44,10 +44,10 @@ if envs.VLLM_RBLN_MOE_USE_OPT_KERNEL:
         topk: int,
         post_norm: bool,
         expert_map: torch.Tensor | None = None,
-        dp_mask: torch.Tensor | None = None,
         gate_proj_bias: torch.Tensor | None = None,
         up_proj_bias: torch.Tensor | None = None,
         down_proj_bias: torch.Tensor | None = None,
+        dp_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Customized MoE GLU operation (optimized kernel version).
@@ -82,10 +82,10 @@ if envs.VLLM_RBLN_MOE_USE_OPT_KERNEL:
         topk: int,
         post_norm: bool,
         expert_map: torch.Tensor | None = None,
-        dp_mask: torch.Tensor | None = None,
         gate_proj_bias: torch.Tensor | None = None,
         up_proj_bias: torch.Tensor | None = None,
         down_proj_bias: torch.Tensor | None = None,
+        dp_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return torch.empty_like(hidden_states)
 
@@ -102,10 +102,10 @@ else:
         down_proj_weight: torch.Tensor,
         masked_routing_weight: torch.Tensor,
         expert_select_count: torch.Tensor,
-        dp_mask: torch.Tensor | None = None,
         gate_proj_bias: torch.Tensor | None = None,
         up_proj_bias: torch.Tensor | None = None,
         down_proj_bias: torch.Tensor | None = None,
+        dp_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Customized MoE GLU operation (custom kernel version).
@@ -139,10 +139,10 @@ else:
         down_proj_weight: torch.Tensor,
         masked_routing_weight: torch.Tensor,
         expert_select_count: torch.Tensor,
-        dp_mask: torch.Tensor | None = None,
         gate_proj_bias: torch.Tensor | None = None,
         up_proj_bias: torch.Tensor | None = None,
         down_proj_bias: torch.Tensor | None = None,
+        dp_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return torch.empty_like(hidden_states)
 
@@ -323,6 +323,12 @@ def unquantized_fused_moe_method_custom(
     masked_routing_weights, expert_select_count = get_masked_routing_weights(
         router_logits, layer.top_k, layer.renormalize, layer.expert_map
     )
+
+    tokens_mask = None
+    use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
+    if use_moe_tokens_mask:
+        tokens_mask = get_tokens_mask(num_tokens)
+
     final_hidden_states = torch.ops.rbln_custom_ops.custom_moe_glu(
         hidden_states,
         gate_proj_weight,
@@ -330,6 +336,10 @@ def unquantized_fused_moe_method_custom(
         down_proj_weight,
         masked_routing_weights,
         expert_select_count,
+        None,
+        None,
+        None,
+        tokens_mask,
     )
     return final_hidden_states.reshape(orig_shape)
 
@@ -365,6 +375,7 @@ def unquantized_fused_optimize_moe_method_custom(
         expert_map_list = layer.expert_map.tolist()
         expert_map_const = torch.tensor(expert_map_list, dtype=torch.int32)
 
+    tokens_mask = None
     use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
     if use_moe_tokens_mask:
         tokens_mask = get_tokens_mask(num_tokens)
@@ -380,6 +391,9 @@ def unquantized_fused_optimize_moe_method_custom(
         layer.top_k,
         layer.renormalize,
         expert_map_const,
+        None,
+        None,
+        None,
         tokens_mask,
     )
     return final_hidden_states.reshape(orig_shape)
