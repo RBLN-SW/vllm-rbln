@@ -14,6 +14,14 @@
 # isort: off
 import torch
 import torch.nn as nn
+
+try:
+    import torch.rbln
+
+    has_torch_rbln = True
+except ImportError:
+    has_torch_rbln = False
+
 from vllm_rbln.logger import init_logger
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler as VLLMSampler
@@ -151,6 +159,11 @@ class RBLNTopKTopPSampler(nn.Module):
         }
         if envs.VLLM_RBLN_COMPILE_STRICT_MODE:
             options["mode"] = "strict"
+
+        if has_torch_rbln:
+            options["use_global_ctx"] = True
+            options["global_device_id"] = 0
+
         self._compiled_rbln_topk_topp_sampler = torch.compile(
             rbln_top_k_top_p_sample,
             dynamic=False,
