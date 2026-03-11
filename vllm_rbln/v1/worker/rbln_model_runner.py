@@ -121,6 +121,7 @@ from vllm_rbln.v1.attention.backends.flash_attention import (
 )
 from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 from vllm_rbln.v1.sample import RBLNSampler
+from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
 from vllm_rbln.v1.worker.metrics import PerformanceTracker
 
 if TYPE_CHECKING:
@@ -4062,6 +4063,49 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self.input_batch.num_computed_tokens_cpu
             < self.input_batch.num_tokens_no_spec - 1
         )
+
+    def use_wrapped_compute_logits(self) -> bool:
+        return not (
+            self.lora_config is not None
+            or (
+                self.speculative_config is not None
+                and self.speculative_config.method in ("eagle", "eagle3")
+            )
+        )
+
+    def collect_metrics(
+        self,
+        performance_tracker: PerformanceTracker,
+        is_prefill: bool,
+        start_time: float,
+        end_time: float,
+        reports: list[dict],
+        token_count: int,
+    ) -> None:
+        execution_time = end_time - start_time
+        host_time = None
+        device_time = None
+        ccl_time = None
+        if reports is not None and len(reports) > 0:
+            host_time = reports[0].get("total_host", None)
+            device_time = reports[0].get("total_device", None)
+            ccl_time = reports[0].get("total_ccl", None)
+        if is_prefill:
+            performance_tracker.record_prefill(
+                execution_time,
+                token_count,
+                host_time=host_time,
+                device_time=device_time,
+                ccl_time=ccl_time,
+            )
+        else:
+            performance_tracker.record_decode(
+                execution_time,
+                token_count,
+                host_time=host_time,
+                device_time=device_time,
+                ccl_time=ccl_time,
+            )
 
 def create_lora_mask(input_ids: torch.Tensor, lora_ids: list[int],
                      lora_index_to_id: list[int], max_loras: int,
