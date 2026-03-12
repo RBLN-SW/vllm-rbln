@@ -64,6 +64,10 @@ from vllm.v1.attention.backends.utils import (
     create_fast_prefill_custom_backend,
 )
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
+from vllm_rbln.v1.core.rbln_scheduler import RBLNSchedulerOutput
+
+if TYPE_CHECKING:
+    from vllm_rbln.v1.core.rbln_kv_cache_manager import KVCacheCopyOp
 
 # yapf conflicts with isort for this block
 # yapf: disable
@@ -275,6 +279,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         from rebel.compile_context import CompileContext
 
         self.compile_context = CompileContext(use_weight_sharing=True)
+        self.runtime_holder = []
 
         # Sampler
         self.use_rbln_sampler = envs.VLLM_RBLN_SAMPLER
@@ -1343,6 +1348,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             "process_group_dict": process_group_dict,
             "guard_filter_fn": torch.compiler.keep_tensor_guards_unsafe,
             "mode": "strict",
+            "_runtime_holder": self.runtime_holder,
         }
         if not envs.VLLM_DISABLE_COMPILE_CACHE:
             logger.info(
@@ -2481,6 +2487,18 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             invalid_req_indices,
         )
 
+    def _process_kv_cache_copy_ops(
+        self,
+        copy_ops: "list[KVCacheCopyOp]",
+    ) -> None:
+        runtime = self.runtime_holder[0]
+        for op in copy_ops:
+            # for kv_cache in self.kv_caches:
+            #     kv_cache[:, op.dst_block_id, :, :, : op.num_tokens, :] = kv_cache[
+            #         :, op.src_block_id, :, :, : op.num_tokens, :
+            #     ]
+            runtime._copy_kv_cache(op.src_block_id, op.dst_block_id, op.num_tokens)
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -2496,6 +2514,15 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with record_function_or_nullcontext("Preprocess"):
             self._update_states(scheduler_output)
+
+            # Process sub-block KV cache copy operations before the forward
+            # pass so that partially cached blocks are populated.
+            if (
+                isinstance(scheduler_output, RBLNSchedulerOutput)
+                and scheduler_output.kv_cache_copy_ops
+            ):
+                self._process_kv_cache_copy_ops(scheduler_output.kv_cache_copy_ops)
+
             if not num_scheduled_tokens:
                 if not has_kv_transfer_group():
                     # Return empty ModelRunnerOutput if there's no work to do.
@@ -3909,8 +3936,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             num_attn_module,
         )
         if not self.model_config.enforce_eager and envs.VLLM_RBLN_COMPILE_MODEL:
-            for kv_cache in self.kv_caches:
-                self.compile_context.mark_static_address(kv_cache)
+            for i, kv_cache in enumerate(self.kv_caches):
+                self.compile_context.mark_static_address(kv_cache, f"kv_cache_{i}")
 
         return kv_caches
 

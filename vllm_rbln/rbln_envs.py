@@ -46,6 +46,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS: list[int] = []
     VLLM_RBLN_USE_CUSTOM_KERNEL: bool = False
     VLLM_RBLN_AUTO_PORT: bool = True
+    VLLM_RBLN_SUB_BLOCK_SIZE: int = 128
 
 
 def get_dp_impl() -> str:
@@ -256,6 +257,11 @@ environment_variables = {
     ),
     "VLLM_RBLN_PROFILER": (
         lambda: os.environ.get("RBLN_PROFILER", "False").lower() in ("true", "1")
+    ),
+    # Sub-block size (tokens) for sub-block prefix caching.
+    # Set to 0 to disable sub-block prefix caching.
+    "VLLM_RBLN_SUB_BLOCK_SIZE": lambda: int(
+        os.environ.get("VLLM_RBLN_SUB_BLOCK_SIZE", 128)
     ),
 }
 
