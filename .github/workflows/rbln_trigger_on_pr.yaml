@@ -4,8 +4,6 @@ on:
   pull_request:
     branches:
       - dev
-      - fix/torch-cpu-yaml3
-      - fix/torch-cpu
 
 jobs:
   check-skip-ci:
