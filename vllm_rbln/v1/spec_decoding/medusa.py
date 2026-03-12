@@ -19,6 +19,7 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.distributed import get_dp_group, get_pp_group, get_tp_group
 from vllm.forward_context import set_forward_context
+from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.medusa import MedusaProposer
 
 import vllm_rbln.rbln_envs as envs
@@ -34,8 +35,7 @@ class RblnMedusaProposer(MedusaProposer):
 
     def load_model(self, target_model: nn.Module) -> None:
         super().load_model(target_model)
-        self.model = self._compile_model(self.model)  # type: ignore
-        # self.model.compute_logits = self._compile_model(self.model.compute_logits)
+        self._propose = self._compile_model(self._propose)  # type: ignore
 
     def _compile_model(self, model: nn.Module):
         TP = get_tp_group()
@@ -66,6 +66,23 @@ class RblnMedusaProposer(MedusaProposer):
             options=copy(options),
             dynamic=False,
         )
+
+    def _propose(self, target_hidden_states: torch.Tensor) -> list[torch.Tensor]:
+        return self.model.compute_logits(self.model(target_hidden_states))
+
+    def propose(
+        self,
+        target_hidden_states: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+    ) -> torch.Tensor:
+        # Generate blocks and compute logits
+        logits = self._propose(target_hidden_states)
+
+        # Compute argmax for each Medusa head and stack into a single tensor
+        # Shape: [batch_size, num_heads]
+        draft_tokens = torch.stack([logit.argmax(dim=-1) for logit in logits], dim=1)
+
+        return draft_tokens
 
     @torch.inference_mode()
     def dummy_run(self, batch_size: int) -> None:
