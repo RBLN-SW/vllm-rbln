@@ -123,6 +123,7 @@ check_untyped_defs = true
 follow_imports = "silent"
 
 [tool.uv]
+index-strategy = "unsafe-best-match"
 required-environments = [
     "sys_platform == 'linux' and platform_machine == 'x86_64'"
 ]
@@ -130,12 +131,10 @@ required-environments = [
 [[tool.uv.index]]
 name = "vllm-cpu"
 url = "https://wheels.vllm.ai/0.13.0/cpu"
-explicit = true
 
 [[tool.uv.index]]
 name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
-explicit = true
 
 [tool.uv.sources]
 vllm = { index = "vllm-cpu" }
