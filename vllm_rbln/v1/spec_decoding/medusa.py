@@ -25,7 +25,7 @@ from vllm.v1.spec_decode.medusa import MedusaProposer
 import vllm_rbln.rbln_envs as envs
 
 
-class RblnMedusaProposer(MedusaProposer):
+class RBLNMedusaProposer(MedusaProposer):
     def __init__(self, vllm_config: VllmConfig, runner) -> None:
         super().__init__(vllm_config, runner.device)
 

@@ -121,7 +121,7 @@ from vllm_rbln.v1.attention.backends.flash_attention import (
 from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 from vllm_rbln.v1.sample import RBLNSampler
 from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
-from vllm_rbln.v1.spec_decoding.medusa import RblnMedusaProposer
+from vllm_rbln.v1.spec_decoding.medusa import RBLNMedusaProposer
 from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
 from vllm_rbln.v1.worker.metrics import PerformanceTracker
 
@@ -329,7 +329,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 NgramProposer
                 | SuffixDecodingProposer
                 | EagleProposer
-                | RblnMedusaProposer
+                | RBLNMedusaProposer
             )
             if self.speculative_config.method == "ngram":
                 self.drafter = NgramProposer(self.vllm_config)
@@ -342,7 +342,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         self.drafter.eagle3_use_aux_hidden_state
                     )
             elif self.speculative_config.method == "medusa":
-                self.drafter = RblnMedusaProposer(self.vllm_config, self)
+                self.drafter = RBLNMedusaProposer(self.vllm_config, self)
             else:
                 raise ValueError(
                     "Unknown speculative decoding method: "
@@ -3026,7 +3026,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             draft_token_ids = self.drafter.propose(self.input_batch, sampled_token_ids)
         elif spec_config.method == "medusa":
             assert isinstance(sampled_token_ids, list)
-            assert isinstance(self.drafter, RblnMedusaProposer)
+            assert isinstance(self.drafter, RBLNMedusaProposer)
 
             if spec_decode_metadata is None:
                 # prefill: hidden states are already per-request
