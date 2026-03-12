@@ -39,7 +39,7 @@ dependencies = [
     "datasets",
     "qwen_vl_utils",
     "vllm==0.13.0+cpu",
-    "optimum-rbln @ git+https://github.com/RBLN-SW/optimum-rbln.git@update_torch_dep",
+    "optimum-rbln==0.10.2a0",
 ]
 
 [project.optional-dependencies]
