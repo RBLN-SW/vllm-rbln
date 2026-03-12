@@ -26,8 +26,8 @@ import vllm_rbln.rbln_envs as envs
 
 
 class RBLNMedusaProposer(MedusaProposer):
-    def __init__(self, vllm_config: VllmConfig, runner) -> None:
-        super().__init__(vllm_config, runner.device)
+    def __init__(self, vllm_config: VllmConfig, device: torch.device) -> None:
+        super().__init__(vllm_config, device)
 
         from rebel.compile_context import CompileContext
 

@@ -342,7 +342,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         self.drafter.eagle3_use_aux_hidden_state
                     )
             elif self.speculative_config.method == "medusa":
-                self.drafter = RBLNMedusaProposer(self.vllm_config, self)
+                self.drafter = RBLNMedusaProposer(self.vllm_config, self.device)
             else:
                 raise ValueError(
                     "Unknown speculative decoding method: "
