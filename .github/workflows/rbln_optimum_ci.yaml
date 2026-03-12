@@ -110,10 +110,10 @@ jobs:
             uv pip install --system packaging setuptools wheel simphile pynvml huggingface_hub setuptools_scm fire pytest pytest-asyncio
             VERSION=${{ inputs.optimum_rbln_version }}
             if [ -n "${{ inputs.optimum_rbln_version }}" ]; then
-              uv pip install --system --force-reinstall --no-cache-dir dist/vllm_rbln*.whl --constraint <(echo "optimum-rbln==${{ inputs.optimum_rbln_version }}") --index-url http://pypi-cache.devpi.svc.cluster.local/root/pypi/+simple/ --extra-index-url https://pypi.org/simple
+              uv pip install --system --force-reinstall --no-cache-dir dist/vllm_rbln*.whl --constraint <(echo "optimum-rbln==${{ inputs.optimum_rbln_version }}") --index-url http://pypi-cache.devpi.svc.cluster.local/root/pypi/+simple/ --extra-index-url https://wheels.vllm.ai/0.13.0/cpu --extra-index-url https://download.pytorch.org/whl/cpu --index-strategy unsafe-best-match
               echo "optimum-rbln ${{ inputs.optimum_rbln_version }}"
             else
-              uv pip install --system --force-reinstall --no-cache-dir dist/vllm_rbln*.whl --index-url http://pypi-cache.devpi.svc.cluster.local/root/pypi/+simple/ --extra-index-url https://pypi.org/simple
+              uv pip install --system --force-reinstall --no-cache-dir dist/vllm_rbln*.whl --index-url http://pypi-cache.devpi.svc.cluster.local/root/pypi/+simple/ --extra-index-url https://wheels.vllm.ai/0.13.0/cpu --extra-index-url https://download.pytorch.org/whl/cpu --index-strategy unsafe-best-match
             fi
 
       - name: Run gemma2 model (hybrid attention) (V1)
@@ -192,10 +192,10 @@ jobs:
             uv pip install --system packaging setuptools wheel simphile pynvml huggingface_hub setuptools_scm fire pytest pytest-asyncio
             VERSION=${{ inputs.optimum_rbln_version }}
             if [ -n "${{ inputs.optimum_rbln_version }}" ]; then
-              uv pip install --system --force-reinstall --no-cache-dir dist/vllm_rbln*.whl --constraint <(echo "optimum-rbln==${{ inputs.optimum_rbln_version }}") --index-url http://pypi-cache.devpi.svc.cluster.local/root/pypi/+simple/ --extra-index-url https://pypi.org/simple
+              uv pip install --system --force-reinstall --no-cache-dir dist/vllm_rbln*.whl --constraint <(echo "optimum-rbln==${{ inputs.optimum_rbln_version }}") --index-url http://pypi-cache.devpi.svc.cluster.local/root/pypi/+simple/ --extra-index-url https://wheels.vllm.ai/0.13.0/cpu --extra-index-url https://download.pytorch.org/whl/cpu --index-strategy unsafe-best-match
               echo "optimum-rbln ${{ inputs.optimum_rbln_version }}"
             else
-              uv pip install --system --force-reinstall --no-cache-dir dist/vllm_rbln*.whl --index-url http://pypi-cache.devpi.svc.cluster.local/root/pypi/+simple/ --extra-index-url https://pypi.org/simple
+              uv pip install --system --force-reinstall --no-cache-dir dist/vllm_rbln*.whl --index-url http://pypi-cache.devpi.svc.cluster.local/root/pypi/+simple/ --extra-index-url https://wheels.vllm.ai/0.13.0/cpu --extra-index-url https://download.pytorch.org/whl/cpu --index-strategy unsafe-best-match
             fi
 
       - name: Run decoder-only test (eager attn) (V1)
@@ -312,10 +312,10 @@ jobs:
             uv pip install --system packaging setuptools wheel simphile pynvml huggingface_hub setuptools_scm fire pytest pytest-asyncio
             VERSION=${{ inputs.optimum_rbln_version }}
             if [ -n "${{ inputs.optimum_rbln_version }}" ]; then
-              uv pip install --system --force-reinstall --no-cache-dir dist/vllm_rbln*.whl --constraint <(echo "optimum-rbln==${{ inputs.optimum_rbln_version }}") --index-url http://pypi-cache.devpi.svc.cluster.local/root/pypi/+simple/ --extra-index-url https://pypi.org/simple
+              uv pip install --system --force-reinstall --no-cache-dir dist/vllm_rbln*.whl --constraint <(echo "optimum-rbln==${{ inputs.optimum_rbln_version }}") --index-url http://pypi-cache.devpi.svc.cluster.local/root/pypi/+simple/ --extra-index-url https://wheels.vllm.ai/0.13.0/cpu --extra-index-url https://download.pytorch.org/whl/cpu --index-strategy unsafe-best-match
               echo "optimum-rbln ${{ inputs.optimum_rbln_version }}"
             else
-              uv pip install --system --force-reinstall --no-cache-dir dist/vllm_rbln*.whl --index-url http://pypi-cache.devpi.svc.cluster.local/root/pypi/+simple/ --extra-index-url https://pypi.org/simple
+              uv pip install --system --force-reinstall --no-cache-dir dist/vllm_rbln*.whl --index-url http://pypi-cache.devpi.svc.cluster.local/root/pypi/+simple/ --extra-index-url https://wheels.vllm.ai/0.13.0/cpu --extra-index-url https://download.pytorch.org/whl/cpu --index-strategy unsafe-best-match
             fi
 
       - name : Run Qwen2.5_VL (V1)

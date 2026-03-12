@@ -38,8 +38,8 @@ dependencies = [
     "pyyaml",
     "datasets",
     "qwen_vl_utils",
-    "vllm==0.13.0",
-    "optimum-rbln>=0.10.2a0",
+    "vllm==0.13.0+cpu",
+    "optimum-rbln>=0.10.2a1",
 ]
 
 [project.optional-dependencies]
@@ -123,18 +123,24 @@ check_untyped_defs = true
 follow_imports = "silent"
 
 [tool.uv]
+index-strategy = "unsafe-best-match"
 required-environments = [
     "sys_platform == 'linux' and platform_machine == 'x86_64'"
 ]
 
-[tool.uv.sources]
-torch = { index = "pytorch-cpu" }
-torchvision = { index = "pytorch-cpu" }
+[[tool.uv.index]]
+name = "vllm-cpu"
+url = "https://wheels.vllm.ai/0.13.0/cpu"
 
 [[tool.uv.index]]
 name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
-explicit = true
+
+[tool.uv.sources]
+vllm = { index = "vllm-cpu" }
+torch = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }
+torchaudio = { index = "pytorch-cpu" }
 
 [tool.typos.default]
 binary = false

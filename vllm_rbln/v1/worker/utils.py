@@ -374,18 +374,18 @@ def set_omp_num_threads(
     Args:
         rank: Global rank of the worker.
         local_rank: Local rank of the worker.
-        default_num_threads: Number of threads to use if OMP_NUM_THREADS
+        default_num_threads: Number of threads to use if RBLN_NUM_THREADS
             is not set. Defaults to 2.
     """
     import torch
 
     # Determine the number of threads to use
-    if "OMP_NUM_THREADS" in os.environ:
-        num_threads = int(os.environ["OMP_NUM_THREADS"])
+    if "RBLN_NUM_THREADS" in os.environ:
+        num_threads = int(os.environ["RBLN_NUM_THREADS"])
     else:
         num_threads = default_num_threads
         # Set env var for any future subprocesses
-        os.environ["OMP_NUM_THREADS"] = str(num_threads)
+        os.environ["RBLN_NUM_THREADS"] = str(num_threads)
 
     # Directly set PyTorch's thread count for this process
     torch.set_num_threads(num_threads)
