@@ -17,7 +17,7 @@ os.environ["RBLN_USE_CUSTOM_KERNEL"] = "1"
 os.environ["VLLM_RBLN_USE_VLLM_MODEL"] = "1"
 os.environ["VLLM_RBLN_COMPILE_STRICT_MODE"] = "1"
 os.environ["VLLM_DISABLE_COMPILE_CACHE"] = "1"
-os.environ["VLLM_RBLN_ENABLE_WARM_UP"] = "0"
+os.environ["VLLM_RBLN_ENABLE_WARM_UP"] = "1"
 os.environ["VLLM_RBLN_SAMPLER"] = "0"
 # vLLM(v0.10.2) bug: speculative decoding works only in multi-processing.
 # os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
@@ -36,7 +36,7 @@ def main():
     llm = LLM(
         model=MODEL_ID,
         max_model_len=2048,
-        block_size=2048,
+        block_size=1024,
         enable_chunked_prefill=True,
         max_num_batched_tokens=256,
         max_num_seqs=4,

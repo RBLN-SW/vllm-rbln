@@ -1095,7 +1095,7 @@ class RBLNFlashAttentionMetadataBuilder(
         suffix_kv_lens = None
         prefix_scheduler_metadata = None
 
-        seq_idx = positions[:num_reqs].view(-1, 1)
+        seq_idx = positions[query_start_loc[:num_reqs]].view(-1, 1)
 
         # The length of the partition equals the block size.
         partition_len = self.block_size

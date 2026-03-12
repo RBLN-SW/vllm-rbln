@@ -104,6 +104,14 @@ class RBLNScheduler(Scheduler):
             if self.running and is_prefill(self.running[-1])
             else 0
         )
+        # NOTE(RBLN): spec_decode_cap prevents block boundary crossing caused by
+        # runner-side padding. The runner pads all requests in the batch to the
+        # maximum scheduled token length (max_spec_decode_len). If any request
+        # is trimmed due to a block boundary, other requests with more tokens
+        # would cause that trimmed request to be padded beyond its boundary.
+        # spec_decode_cap propagates the tightest remaining_in_block constraint
+        # to all subsequent requests so no request exceeds it.
+        spec_decode_cap = self.block_size
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
 
@@ -235,6 +243,21 @@ class RBLNScheduler(Scheduler):
             token_budget -= num_new_tokens
             req_index += 1
 
+            # NOTE(RBLN): Update spec_decode_cap with the tightest constraint
+            # for this request: remaining space in the current block and remaining
+            # tokens until max_model_len. Done here (after confirmed scheduling)
+            # so that only actually scheduled requests affect the cap, and
+            # num_new_tokens reflects all prior adjustments. Even single-token
+            # decode requests must constrain the cap because the runner pads all
+            # requests to max_spec_decode_len.
+            if not is_prefill(request):
+                tokens_used_in_block = request.num_computed_tokens % self.block_size
+                remaining_in_block = self.block_size - tokens_used_in_block
+                remaining_in_maxlen = self.max_model_len - request.num_computed_tokens
+                spec_decode_cap = min(
+                    remaining_in_block, remaining_in_maxlen, spec_decode_cap
+                )
+
             # Speculative decode related.
             if request.spec_token_ids:
                 num_scheduled_spec_tokens = (
@@ -267,6 +290,50 @@ class RBLNScheduler(Scheduler):
                     self.encoder_cache_manager.allocate(request, i)
                     if self.ec_connector is not None:
                         self.ec_connector.update_state_after_alloc(request, i)
+
+        # NOTE(RBLN): Retroactively apply spec_decode_cap to requests scheduled
+        # before the cap was tightened. Only needed when spec decode is active
+        # this step (scheduled_spec_decode_tokens non-empty), since that is when
+        # the runner pads all requests to max_spec_decode_len. A request processed
+        # earlier in the loop may have been allocated more tokens than
+        # spec_decode_cap allows; if left uncorrected, the runner would pad a
+        # constrained request up to that larger length, causing it to cross its
+        # block boundary.
+        if spec_decode_cap < self.block_size and scheduled_spec_decode_tokens:
+            for req in scheduled_running_reqs:
+                req_id = req.request_id
+                old_n = num_scheduled_tokens[req_id]
+                if old_n <= spec_decode_cap:
+                    continue
+                new_n = spec_decode_cap
+
+                # Extra blocks were allocated for the original token count but
+                # are no longer needed. Invalidate their prefix cache hash so
+                # they are not reused incorrectly; the blocks remain allocated
+                # and will be reused when this request needs them in a future step.
+                undo_uncomputed_block_caching(
+                    req,
+                    self.kv_cache_manager,
+                    req.num_computed_tokens + new_n,
+                )
+
+                token_budget += old_n - new_n
+                num_scheduled_tokens[req_id] = new_n
+
+                # Re-trim spec tokens to match the reduced token count.
+                num_spec = (
+                    new_n
+                    + req.num_computed_tokens
+                    - req.num_tokens
+                    - req.num_output_placeholders
+                )
+                if num_spec > 0:
+                    if req_id in scheduled_spec_decode_tokens:
+                        scheduled_spec_decode_tokens[req_id] = (
+                            scheduled_spec_decode_tokens[req_id][:num_spec]
+                        )
+                else:
+                    scheduled_spec_decode_tokens.pop(req_id, None)
 
         # Record the LoRAs in scheduled_running_reqs
         scheduled_loras: set[int] = set()
