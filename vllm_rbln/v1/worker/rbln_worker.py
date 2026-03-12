@@ -14,6 +14,7 @@
 """A RBLN worker class."""
 
 import copy
+import math
 import os
 from types import NoneType
 from typing import TYPE_CHECKING
@@ -307,6 +308,7 @@ class RBLNWorker(WorkerBase):
         # NOTE - model parallel(tp, dp, ep, pp)
         #        already applied into model params
         n_model_params = n_model_attentions + n_model_experts
+        head_size = self.model_config.get_head_size()
 
         available_memory_estimate = estimate_available_memory(
             model_config=self.model_config,
@@ -321,7 +323,13 @@ class RBLNWorker(WorkerBase):
         logger.info(
             "available_memory_estimate = %.2f GB", available_memory_estimate / 10**9
         )
-
+        head_align_ratio = math.ceil(head_size / 64) * 64 / head_size
+        logger.info("head size align ratio = %s", head_align_ratio)
+        available_memory_estimate /= head_align_ratio
+        logger.info(
+            "available_memory_estimate considering 64B align = %.2f GB",
+            available_memory_estimate / 10**9
+        )
         return available_memory_estimate
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
