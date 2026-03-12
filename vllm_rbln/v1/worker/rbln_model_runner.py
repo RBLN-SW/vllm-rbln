@@ -272,18 +272,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         else:
             self.max_encoder_len = 0
 
-        # Only provide use_global_ctx if CompileContext supports it
-        import inspect
-
-        from rebel.compile_context import CompileContext
-
-        compile_ctx_args = {}
-        if "use_weight_sharing" in inspect.signature(CompileContext).parameters:
-            compile_ctx_args["use_weight_sharing"] = True
-        if "use_global_ctx" in inspect.signature(CompileContext).parameters:
-            compile_ctx_args["use_global_ctx"] = True
-        self.compile_context = CompileContext(**compile_ctx_args)
-
         # Sampler
         self.use_rbln_sampler = envs.VLLM_RBLN_SAMPLER
         if self.use_rbln_sampler:
@@ -291,7 +279,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             sampler = RBLNSampler(
                 logprobs_mode=self.model_config.logprobs_mode,
                 seed=self.vllm_config.model_config.seed,
-                compile_context=self.compile_context,
             )
         else:
             logger.info("Using default vLLM sampler.")
@@ -1345,7 +1332,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         process_group_dict[DP.cpu_group.group_name] = DP.ranks
 
         options = {
-            "compile_context": self.compile_context,
             "tensor_parallel_size": envs.VLLM_RBLN_TP_SIZE,
             "process_group_dict": process_group_dict,
             "guard_filter_fn": torch.compiler.keep_tensor_guards_unsafe,
@@ -3693,7 +3679,9 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         """
         kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-            device = "cpu" if envs.VLLM_RBLN_USE_CUSTOM_KERNEL else "meta"
+            # TODO: temporary fixed
+            # device = "cpu" if envs.VLLM_RBLN_USE_CUSTOM_KERNEL else "meta"
+            device = self.device
             tensor = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=device)
             for layer_name in kv_cache_tensor.shared_by:
                 kv_cache_raw_tensors[layer_name] = tensor
@@ -3920,9 +3908,9 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self.kv_caches,
             num_attn_module,
         )
-        if not self.model_config.enforce_eager and envs.VLLM_RBLN_COMPILE_MODEL:
-            for kv_cache in self.kv_caches:
-                self.compile_context.mark_static_address(kv_cache)
+        # if not self.model_config.enforce_eager and envs.VLLM_RBLN_COMPILE_MODEL:
+        #     for kv_cache in self.kv_caches:
+        #         self.compile_context.mark_static_address(kv_cache)
 
         return kv_caches
 

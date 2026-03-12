@@ -60,8 +60,8 @@ class RblnPlatform(Platform):
     # But we don't support the 'rbln'' device yet.
     # To support this, we must use PyTorch-RBLN
     plugin_name: str = "rbln"
-    device_name: str = "cpu"
-    device_type: str = "cpu"
+    device_name: str = "rbln"
+    device_type: str = "rbln"
     dispatch_key: str = "CPU"  # not used
     ray_device_key: str = "RBLN"
     simple_compile_backend = "bypass"

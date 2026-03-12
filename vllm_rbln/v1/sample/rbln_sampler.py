@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # isort: off
-import inspect
 import torch
 import torch.nn as nn
 
@@ -141,7 +140,6 @@ class RBLNTopKTopPSampler(nn.Module):
         self,
         logprobs_mode: LogprobsMode = "raw_logprobs",
         seed: int = 42,
-        compile_context: rebel.CompileContext = None,
     ):
         # TODO(rbln): Merge more ops to rbln context.
         #       Currently, we only have softmax in rbln context.
@@ -153,16 +151,7 @@ class RBLNTopKTopPSampler(nn.Module):
         )
 
         rebel.manual_seed(seed)
-        options = {
-            "compile_context": compile_context
-            if compile_context
-            else (
-                rebel.CompileContext(use_global_ctx=True)
-                if "use_global_ctx"
-                in inspect.signature(rebel.CompileContext).parameters
-                else rebel.CompileContext()
-            )
-        }
+        options = {}
         if envs.VLLM_RBLN_COMPILE_STRICT_MODE:
             options["mode"] = "strict"
 
@@ -207,12 +196,11 @@ class RBLNSampler(VLLMSampler):
         self,
         logprobs_mode: LogprobsMode = "raw_logprobs",
         seed: int = 42,
-        compile_context: rebel.CompileContext = None,
     ):
         super().__init__()
         if logprobs_mode in ("raw_logprobs", "raw_logits"):
             self.topk_topp_sampler = RBLNTopKTopPSampler(
-                logprobs_mode=logprobs_mode, seed=seed, compile_context=compile_context
+                logprobs_mode=logprobs_mode, seed=seed,
             )
         else:
             logger.warning_once(
