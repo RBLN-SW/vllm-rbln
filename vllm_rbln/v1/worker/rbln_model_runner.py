@@ -3771,6 +3771,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         """
         kv_caches: dict[str, torch.Tensor] = {}
         has_attn, has_mamba = False, False
+        _cloned: dict[int, torch.Tensor] = {}
         for group in self._kv_cache_spec_attn_group_iterator():
             kv_cache_spec = group.kv_cache_spec
             attn_backend = group.backend
@@ -3817,12 +3818,22 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         kv_cache_stride_order.index(i)
                         for i in range(len(kv_cache_stride_order))
                     ]
-                    kv_caches[layer_name] = (
-                        kv_cache_raw_tensors[layer_name]
-                        .view(dtype)
-                        .view(kv_cache_shape)
-                        .permute(*inv_order)
-                    )
+                    # kv_caches[layer_name] = (
+                    #     kv_cache_raw_tensors[layer_name]
+                    #     .view(dtype)
+                    #     .view(kv_cache_shape)
+                    #     .permute(*inv_order)
+                    # )
+                    raw_id = id(kv_cache_raw_tensors[layer_name])
+                    if raw_id not in _cloned:
+                        _cloned[raw_id] = (
+                            kv_cache_raw_tensors[layer_name]
+                            .view(dtype)
+                            .view(kv_cache_shape)
+                            .permute(*inv_order)
+                            .clone()
+                        )
+                    kv_caches[layer_name] = _cloned[raw_id]
                 elif isinstance(kv_cache_spec, MambaSpec):
                     has_mamba = True
                     raw_tensor = kv_cache_raw_tensors[layer_name]
