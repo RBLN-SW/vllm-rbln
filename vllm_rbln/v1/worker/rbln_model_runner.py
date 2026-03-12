@@ -272,9 +272,17 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         else:
             self.max_encoder_len = 0
 
+        # Only provide use_global_ctx if CompileContext supports it
+        import inspect
+
         from rebel.compile_context import CompileContext
 
-        self.compile_context = CompileContext(use_weight_sharing=True)
+        compile_ctx_args = {}
+        if "use_weight_sharing" in inspect.signature(CompileContext).parameters:
+            compile_ctx_args["use_weight_sharing"] = True
+        if "use_global_ctx" in inspect.signature(CompileContext).parameters:
+            compile_ctx_args["use_global_ctx"] = True
+        self.compile_context = CompileContext(**compile_ctx_args)
 
         # Sampler
         self.use_rbln_sampler = envs.VLLM_RBLN_SAMPLER
@@ -1350,12 +1358,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 "the cached compiled binary will be reused."
             )
             options["cache_dir"] = os.path.join(envs.VLLM_CACHE_ROOT, "rbln")
-
-        if has_torch_rbln:
-            options["use_global_ctx"] = True
-            # TODO(yunseong.kim): use device_id from current platform
-            # when vllm-rbln supports it
-            options["global_device_id"] = 0
 
         # compile compute_logits
         # FIXME(jiwoo.park): method assignment for torch.compile

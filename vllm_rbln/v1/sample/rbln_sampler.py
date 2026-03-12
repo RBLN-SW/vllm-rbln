@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # isort: off
+import inspect
 import torch
 import torch.nn as nn
 
@@ -155,7 +156,12 @@ class RBLNTopKTopPSampler(nn.Module):
         options = {
             "compile_context": compile_context
             if compile_context
-            else rebel.CompileContext()
+            else (
+                rebel.CompileContext(use_global_ctx=True)
+                if "use_global_ctx"
+                in inspect.signature(rebel.CompileContext).parameters
+                else rebel.CompileContext()
+            )
         }
         if envs.VLLM_RBLN_COMPILE_STRICT_MODE:
             options["mode"] = "strict"
