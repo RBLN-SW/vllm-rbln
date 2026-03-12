@@ -3037,13 +3037,10 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 batch_indices = torch.arange(
                     sample_hidden_states.shape[0], device=sample_hidden_states.device
                 )
-                indices = (
-                    torch.tensor(
-                        [len(t) for t in sampled_token_ids],
-                        device=sample_hidden_states.device,
-                        dtype=torch.long,
-                    )
-                    - 1
+                indices = torch.tensor(
+                    [len(t) - 1 for t in sampled_token_ids],
+                    device=sample_hidden_states.device,
+                    dtype=torch.long,
                 )
                 hidden_states = sample_hidden_states[batch_indices, indices]
 
