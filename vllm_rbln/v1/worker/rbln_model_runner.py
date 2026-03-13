@@ -124,6 +124,7 @@ from vllm_rbln.v1.attention.kv_cache_bindings import (
     attach_kv_cache_bindings,
     build_kv_cache_base_bindings,
     build_kv_cache_forward_context_kwargs,
+    validate_shared_attention_kv_cache_contiguity,
 )
 from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 from vllm_rbln.v1.sample import RBLNSampler
@@ -3690,7 +3691,9 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # TODO: temporary fixed
             # device = "cpu" if envs.VLLM_RBLN_USE_CUSTOM_KERNEL else "meta"
             device = self.device
-            tensor = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=device)
+            # tensor = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=device)
+            print(f"kv_cache_tensor.size: {kv_cache_tensor.size}, dtype: {torch.int8}, device: {device}")
+            tensor = torch.empty(kv_cache_tensor.size, dtype=torch.int8, device=device)
             for layer_name in kv_cache_tensor.shared_by:
                 kv_cache_raw_tensors[layer_name] = tensor
 
@@ -3764,7 +3767,11 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         kv_cache_config: KVCacheConfig,
         kv_cache_raw_tensors: dict[str, torch.Tensor],
         kernel_block_sizes: list[int],
-    ) -> tuple[dict[str, torch.Tensor], dict[str, KVCacheViewInfo]]:
+    ) -> tuple[
+        dict[str, torch.Tensor],
+        dict[str, torch.Tensor],
+        dict[str, KVCacheViewInfo],
+    ]:
         """
         Reshape the KV cache tensors to the desired shape and dtype.
 
@@ -3778,6 +3785,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             corresponding memory buffer for KV cache.
         """
         kv_caches: dict[str, torch.Tensor] = {}
+        kv_cache_base_tensors: dict[str, torch.Tensor] = {}
         kv_cache_view_infos: dict[str, KVCacheViewInfo] = {}
         has_attn, has_mamba = False, False
         for group in self._kv_cache_spec_attn_group_iterator():
@@ -3826,14 +3834,14 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         kv_cache_stride_order.index(i)
                         for i in range(len(kv_cache_stride_order))
                     ]
-                    kv_caches[layer_name] = (
-                        kv_cache_raw_tensors[layer_name]
-                        .view(dtype)
-                        .view(kv_cache_shape)
-                        .permute(*inv_order)
+                    # Keep the deduped base in a backend-native multidimensional
+                    # shape so export/Relay never sees a giant flat dimension.
+                    typed_base = kv_cache_raw_tensors[layer_name].view(dtype).view(
+                        kv_cache_shape
                     )
+                    kv_caches[layer_name] = typed_base.permute(*inv_order)
+                    kv_cache_base_tensors[layer_name] = typed_base
                     kv_cache_view_infos[layer_name] = KVCacheViewInfo(
-                        view_dtype=dtype,
                         view_shape=kv_cache_shape,
                         permute_order=tuple(inv_order),
                     )
@@ -3867,7 +3875,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         if has_attn and has_mamba:
             self._update_hybrid_attention_mamba_layout(kv_caches)
 
-        return kv_caches, kv_cache_view_infos
+        return kv_caches, kv_cache_base_tensors, kv_cache_view_infos
 
     def _build_uniform_kv_cache_view_infos(
         self,
@@ -3908,11 +3916,17 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self.kv_cache_bases = []
             self.kv_cache_view_infos = []
             return
-        self.kv_cache_bases, self.kv_cache_view_infos = build_kv_cache_base_bindings(
+        kv_cache_bases, kv_cache_view_infos = build_kv_cache_base_bindings(
             kv_cache_bases_by_layer,
             kv_cache_view_infos_by_layer,
             num_attn_module=num_attn_module,
         )
+        if len(kv_cache_bases) == len(kv_cache_view_infos):
+            self.kv_cache_bases = []
+            self.kv_cache_view_infos = []
+            return
+        self.kv_cache_bases = kv_cache_bases
+        self.kv_cache_view_infos = kv_cache_view_infos
 
     def _attach_kv_cache_bindings(
         self, attn_metadata: dict[str, Any] | None
@@ -3947,7 +3961,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # Try creating KV caches optimized for kv-connector transfers
         cache_dtype = self.cache_config.cache_dtype
-        kv_cache_raw_tensors: dict[str, torch.Tensor]
+        kv_cache_bases_by_layer: dict[str, torch.Tensor]
         kv_cache_view_infos: dict[str, KVCacheViewInfo]
         if self.use_uniform_kv_cache(self.attn_groups, cache_dtype):
             kv_caches, cross_layers_kv_cache, attn_backend = (
@@ -3961,7 +3975,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             )
             self.cross_layers_kv_cache = cross_layers_kv_cache
             self.cross_layers_attn_backend = attn_backend
-            kv_cache_raw_tensors = {
+            kv_cache_bases_by_layer = {
                 layer_name: cross_layers_kv_cache for layer_name in kv_caches
             }
             kv_cache_view_infos = self._build_uniform_kv_cache_view_infos(
@@ -3975,17 +3989,27 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             kv_cache_raw_tensors = self._allocate_kv_cache_tensors(kv_cache_config)
 
             # Change the memory buffer to the desired shape
-            kv_caches, kv_cache_view_infos = self._reshape_kv_cache_tensors(
-                kv_cache_config, kv_cache_raw_tensors, kernel_block_sizes
+            kv_caches, kv_cache_bases_by_layer, kv_cache_view_infos = (
+                self._reshape_kv_cache_tensors(
+                    kv_cache_config,
+                    kv_cache_raw_tensors,
+                    kernel_block_sizes,
+                )
             )
 
         # Set up cross-layer KV cache sharing
         for layer_name, target_layer_name in self.shared_kv_cache_layers.items():
             logger.debug("%s reuses KV cache of %s", layer_name, target_layer_name)
             kv_caches[layer_name] = kv_caches[target_layer_name]
-            kv_cache_raw_tensors[layer_name] = kv_cache_raw_tensors[target_layer_name]
+            kv_cache_bases_by_layer[layer_name] = kv_cache_bases_by_layer[target_layer_name]
             if target_layer_name in kv_cache_view_infos:
                 kv_cache_view_infos[layer_name] = kv_cache_view_infos[target_layer_name]
+
+        validate_shared_attention_kv_cache_contiguity(
+            kv_caches,
+            kv_cache_bases_by_layer,
+            kv_cache_view_infos,
+        )
 
         num_attn_module = (
             2 if self.model_config.hf_config.model_type == "longcat_flash" else 1
@@ -3993,7 +4017,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.kv_cache_bases = []
         self.kv_cache_view_infos = []
         self._update_kv_cache_base_bindings(
-            kv_cache_raw_tensors,
+            kv_cache_bases_by_layer,
             kv_cache_view_infos,
             num_attn_module,
         )

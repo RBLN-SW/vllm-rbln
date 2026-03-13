@@ -290,7 +290,8 @@ def _resolve_kv_cache(
     forward_context: ForwardContext, attn_metadata, layer_index: int
 ) -> torch.Tensor:
     kv_cache_view_infos = getattr(attn_metadata, "kv_cache_view_infos", None)
-    kv_cache_bases = forward_context.additional_kwargs.get("kv_cache_bases")
+    additional_kwargs = getattr(forward_context, "additional_kwargs", {}) or {}
+    kv_cache_bases = additional_kwargs.get("kv_cache_bases")
     if kv_cache_bases and kv_cache_view_infos:
         assert layer_index < len(kv_cache_view_infos)
         return materialize_kv_cache_view(

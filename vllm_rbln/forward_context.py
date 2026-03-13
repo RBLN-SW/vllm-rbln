@@ -169,8 +169,15 @@ def _set_forward_context(
         cudagraph_runtime_mode,
         batch_descriptor,
         ubatch_slices,
-        additional_kwargs=additional_kwargs,
     )
+    if additional_kwargs:
+        existing_additional_kwargs = getattr(
+            forward_context, "additional_kwargs", None
+        )
+        if existing_additional_kwargs is None:
+            setattr(forward_context, "additional_kwargs", dict(additional_kwargs))
+        else:
+            existing_additional_kwargs.update(additional_kwargs)
 
     try:
         with override_forward_context(forward_context):
