@@ -1562,7 +1562,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             num_tokens_across_dp_cpu = RBLNDPMetadata.num_tokens_across_dp(
                 num_tokens, dp_size, dp_rank
             )
-            return (batch_bucket_size, num_padded_tokens, num_tokens_across_dp_cpu)
+            return (batch_bucket_size, num_padded_tokens, num_tokens_across_dp_cpu.to(self.device))
 
         num_tokens_across_dp_cpu, max_decode_tokens = (
             RBLNDPMetadata.num_tokens_across_dp_with_max_decode_tokens(
