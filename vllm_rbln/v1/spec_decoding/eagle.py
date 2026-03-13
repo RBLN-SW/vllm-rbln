@@ -27,6 +27,10 @@ from vllm.v1.utils import CpuGpuBuffer
 
 import vllm_rbln.utils as rbln_utils
 from vllm_rbln.logger import init_logger
+from vllm_rbln.v1.attention.kv_cache_bindings import (
+    attach_kv_cache_bindings,
+    build_kv_cache_forward_context_kwargs,
+)
 from vllm_rbln.v1.attention.backends.flash_attention import (
     RBLNFlashAttentionMetadata,
 )
@@ -276,10 +280,18 @@ def custom_propose(
         self.vllm_config,
         num_tokens=num_input_tokens,
         num_tokens_across_dp=num_tokens_across_dp,
+        additional_kwargs=build_kv_cache_forward_context_kwargs(
+            getattr(self.runner, "kv_cache_bases", None)
+        ),
     ):
         if per_layer_attn_metadata is not None:
             for attn_metadata in per_layer_attn_metadata.values():
-                attn_metadata.kv_caches = kv_caches
+                attach_kv_cache_bindings(
+                    attn_metadata,
+                    kv_caches,
+                    getattr(self.runner, "kv_cache_bases", None),
+                    getattr(self.runner, "kv_cache_view_infos", None),
+                )
 
         ret_hidden_states = self.model(
             input_ids=input_ids,
@@ -454,10 +466,18 @@ def custom_propose(
             self.vllm_config,
             num_tokens=input_batch_size,
             num_tokens_across_dp=batch_size_across_dp,
+            additional_kwargs=build_kv_cache_forward_context_kwargs(
+                getattr(self.runner, "kv_cache_bases", None)
+            ),
         ):
             if per_layer_attn_metadata is not None:
                 for attn_metadata in per_layer_attn_metadata.values():
-                    attn_metadata.kv_caches = kv_caches
+                    attach_kv_cache_bindings(
+                        attn_metadata,
+                        kv_caches,
+                        getattr(self.runner, "kv_cache_bases", None),
+                        getattr(self.runner, "kv_cache_view_infos", None),
+                    )
 
             ret_hidden_states = self.model(
                 input_ids=input_ids,
