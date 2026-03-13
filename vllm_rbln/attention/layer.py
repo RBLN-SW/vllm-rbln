@@ -31,6 +31,7 @@ from vllm.platforms import current_platform
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 
+from vllm_rbln.v1.attention.kv_cache_bindings import materialize_kv_cache_view
 from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 
 # @FIXME(RBLN): We hope to remove the Custom Attention forward.
@@ -244,9 +245,9 @@ def custom_attention_forward(
             attention metadata's kv cache must equal
             the attention layer's embedded kv cache.
             """
-            assert attn_metadata.kv_caches is not None
-            assert self.layer_index < len(attn_metadata.kv_caches)
-            self_kv_cache = attn_metadata.kv_caches[self.layer_index]
+            self_kv_cache = _resolve_kv_cache(
+                forward_context, attn_metadata, self.layer_index
+            )
             self.impl.forward(
                 self,
                 query,
@@ -275,14 +276,30 @@ def custom_attention_forward(
             attention metadata's kv cache must equal
             the attention layer's embedded kv cache.
             """
-            assert attn_metadata.kv_caches is not None
-            assert self.layer_index < len(attn_metadata.kv_caches)
-            self_kv_cache = attn_metadata.kv_caches[self.layer_index]
+            self_kv_cache = _resolve_kv_cache(
+                forward_context, attn_metadata, self.layer_index
+            )
             return self.impl.forward(
                 self, query, key, value, self_kv_cache, attn_metadata
             )
         else:
             return torch.ops.vllm.unified_attention(query, key, value, self.layer_name)
+
+
+def _resolve_kv_cache(
+    forward_context: ForwardContext, attn_metadata, layer_index: int
+) -> torch.Tensor:
+    kv_cache_view_infos = getattr(attn_metadata, "kv_cache_view_infos", None)
+    kv_cache_bases = forward_context.additional_kwargs.get("kv_cache_bases")
+    if kv_cache_bases and kv_cache_view_infos:
+        assert layer_index < len(kv_cache_view_infos)
+        return materialize_kv_cache_view(
+            kv_cache_bases, kv_cache_view_infos[layer_index]
+        )
+
+    assert attn_metadata.kv_caches is not None
+    assert layer_index < len(attn_metadata.kv_caches)
+    return attn_metadata.kv_caches[layer_index]
 
 
 def custom_get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
