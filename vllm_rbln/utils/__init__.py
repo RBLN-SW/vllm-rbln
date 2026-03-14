@@ -25,7 +25,14 @@ def pad(
     if current >= target_len:
         # NOTE: dynamo distinguishes views and non-views for inputs,
         # so ensure that the output is always a non-view.
-        return x if x._base is None else x.clone()
+        # However, RBLN device tensors do not support clone()/copy_()
+        # on views, so skip the non-view conversion for RBLN
+        # devices (the dynamo concern does not apply there).
+        if x._base is None:
+            return x
+        if x.device.type in ("cpu"):
+            return x.clone()
+        return x
 
     pad_shape = list(x.shape)
     pad_shape[dim] = target_len - current
