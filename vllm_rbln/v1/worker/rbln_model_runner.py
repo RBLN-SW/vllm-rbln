@@ -2769,6 +2769,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         logits = self.logits_processor._gather_logits(logits)
                     logits = logits.view(-1, logits.size(-1))
                 else:
+                    assert logits is not None, "Logits must be returned by the model when using wrapped compute logits."
                     selected_token_indices = logits_indices.to(self.device)
                     assert selected_token_indices.dim() == 1
                     if is_prefills[0]:  # prefill
@@ -3182,6 +3183,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             else:
                 hidden_states = model_output
 
+            # Clone tensor here to resolve the conflict of keys
+            # between hidden_states and logits
+            original_hidden_states_device = hidden_states.device
+            cloned_hidden_states = hidden_states.detach().clone().to(original_hidden_states_device)
+            assert cloned_hidden_states.data_ptr() != hidden_states.data_ptr(), \
+                "Hidden states tensor was not cloned properly."
             if (
                 get_pp_group().is_last_rank
                 and self.lora_config is None
@@ -3198,14 +3205,14 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     #     contrib_dynamic_take (tensor -> scalar)
                     # aten::index_select --> take -->
                     #     contrib_dynamic_take (tensor -> scalar)
-                    hidden_states = hidden_states[:, selected_token_indices]
-                logits = self.compute_logits_model.compute_logits(hidden_states)
+                    cloned_hidden_states = cloned_hidden_states[:, selected_token_indices]
+                logits = self.compute_logits_model.compute_logits(cloned_hidden_states)
                 logits = logits.view(-1, logits.size(-1))
 
             # non last rank create intermediate tensors, bypass it
             if self.use_aux_hidden_state_outputs:
-                return hidden_states, aux_hidden_states, logits
-            return hidden_states, logits
+                return cloned_hidden_states, aux_hidden_states, logits
+            return cloned_hidden_states, logits
 
         if self.lora_config:
             self.model = self.load_lora_model(
