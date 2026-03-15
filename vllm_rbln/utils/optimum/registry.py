@@ -155,13 +155,13 @@ def compile_model(
     )  # check if the model is supported and get model info
     default_param: dict[str, Any] = {
         "export": True,
-        "rbln_batch_size": batch_size,
         "rbln_tensor_parallel_size": tp_size,
     }
     if is_generation_arch(config):
-        attn_impl = "flash_attn" if block_size != max_model_len else "eager"
+        default_param["rbln_batch_size"] = batch_size
         default_param["rbln_max_seq_len"] = max_model_len
         if block_size != max_model_len:
+            attn_impl = "flash_attn" if block_size != max_model_len else "eager"
             default_param["rbln_kvcache_partition_len"] = block_size
             default_param["rbln_attn_impl"] = attn_impl
 
@@ -173,11 +173,12 @@ def compile_model(
         model_cls_name = _RBLN_SUPPORTED_MODELS[architectures[0]][1]
         model_cls = getattr(optimum.rbln, model_cls_name)
         assert model_cls is not None
+        default_param["rbln_batch_size"] = batch_size
         default_param["rbln_max_seq_len"] = max_model_len
-        if architectures[0] == "Qwen3Model":
-            attn_impl = "flash_attn" if block_size != max_model_len else "eager"
-            default_param["rbln_kvcache_partition_len"] = block_size
-            default_param["rbln_attn_impl"] = attn_impl
+        if architectures[0] == "Qwen3Model" and block_size != max_model_len:
+                attn_impl = "flash_attn" if block_size != max_model_len else "eager"
+                default_param["rbln_kvcache_partition_len"] = block_size
+                default_param["rbln_attn_impl"] = attn_impl
         model = model_cls.from_pretrained(hf_model_name, **default_param)
     elif is_multi_modal(config):
         model = compile_multimodal(
@@ -191,6 +192,13 @@ def compile_model(
         )
     elif is_enc_dec_arch(config):
         assert architectures[0] == "WhisperForConditionalGeneration"
+        # Whisper model does not require max_model_len and block_size
+        assert block_size == max_model_len, "block_size must be equal to max_model_len for Whisper models."  # noqa: E501
+        assert max_model_len == config.max_length, (
+            f"max_model_len ({max_model_len}) must match the Whisper model's "
+            f"max_length ({config.max_length}) from the HuggingFace config."
+        )
+        default_param["rbln_batch_size"] = batch_size
         model = RBLNAutoModelForSpeechSeq2Seq.from_pretrained(
             hf_model_name,
             rbln_token_timestamps=False,

@@ -321,9 +321,8 @@ def validate_vllm_config(vllm_config: VllmConfig) -> None:
     user_set = vllm_config.additional_config.get("user_set_max_num_seqs", False)
     if not user_set:
         logger.info(
-            "max_num_seqs not explicitly set by user (current=%d), "
+            "max_num_seqs not explicitly set by user, "
             "defaulting to 1 for compilation.",
-            vllm_config.scheduler_config.max_num_seqs,
         )
         vllm_config.scheduler_config.max_num_seqs = 1
     else:
