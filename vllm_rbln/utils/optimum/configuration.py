@@ -273,6 +273,8 @@ def validate_vllm_config(vllm_config: VllmConfig) -> None:
     if vllm_config.cache_config.block_size is None:
         if is_multi_modal(hf_config) or is_generation_arch(hf_config):
             vllm_config.cache_config.block_size = 4096
+            vllm_config.model_config.max_model_len = 8192
+            print("@@@@@ block_size is set to 4096 and max_model_len is set to 8192 based on model architecture")
         else:
             vllm_config.cache_config.block_size = vllm_config.model_config.max_model_len
     kvcache_block_size = vllm_config.cache_config.block_size
