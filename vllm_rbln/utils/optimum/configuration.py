@@ -229,7 +229,7 @@ def update_vllm_config_with_rbln_params(
     else:
         adjusted_num_blocks = (num_blocks - 1) * blk_ratio + 1
 
-    vllm_config.cache_config.num_blocks = adjusted_num_blocks
+    vllm_config.cache_config.num_gpu_blocks = adjusted_num_blocks
 
     if vllm_config.cache_config.num_gpu_blocks_override is not None:
         vllm_config.cache_config.num_gpu_blocks_override = adjusted_num_blocks

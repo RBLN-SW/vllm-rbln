@@ -112,7 +112,7 @@ class RBLNOptimumWorker(WorkerBase):
 
         adapter = self.model_runner.model.kv_block_adapter
         num_gpu_blocks = adapter.get_available_num_blocks()
-        validation_blocks = self.model_runner.vllm_config.cache_config.num_blocks
+        validation_blocks = self.model_runner.vllm_config.cache_config.num_gpu_blocks
         # This will be removed after validation check
         assert num_gpu_blocks == validation_blocks, (
             f"The number of blocks from the model runner ({num_gpu_blocks}) "
