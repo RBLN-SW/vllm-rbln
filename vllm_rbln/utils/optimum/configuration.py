@@ -30,9 +30,26 @@ from vllm_rbln.utils.optimum.registry import (
     is_multi_modal,
     is_pooling_arch,
 )
-
+from optimum.rbln.configuration_utils import RBLNModelConfig
 logger = init_logger(__name__)
 
+
+def _cfg_get(cfg, key: str, default=None):
+    """Access a config value from either a dict or an RBLNModelConfig instance."""
+    if isinstance(cfg, dict):
+        return cfg.get(key, default)
+    return getattr(cfg, key, default)
+
+
+def _cfg_get_submodule(cfg, submodule: str):
+    """Get a submodule config from either a dict or an RBLNModelConfig instance.
+    Returns None if the submodule doesn't exist."""
+    if isinstance(cfg, dict):
+        return cfg.get(submodule)
+    sub = getattr(cfg, submodule, None)
+    # RBLNModelConfig stores submodules as attributes;
+    # filter out None / non-existent submodules.
+    return sub
 
 def is_full_block_available(num_blocks: int, vllm_config: VllmConfig) -> bool:
     if vllm_config.cache_config.enable_prefix_caching:
@@ -60,7 +77,7 @@ def get_block_ratio(vllm_config: VllmConfig) -> int:
 
 
 def get_rbln_params(
-    vllm_config: VllmConfig, rbln_config: dict
+    vllm_config: VllmConfig, rbln_config: dict | RBLNModelConfig,
 ) -> tuple[int, int, int, int, int]:
     kvcache_block_size = None
     prefill_chunk_size = 128
@@ -68,46 +85,45 @@ def get_rbln_params(
     max_seq_len = None
 
     if is_enc_dec_arch(vllm_config.model_config.hf_config):
-        max_seq_len = rbln_config.get("dec_max_seq_len")
+        max_seq_len = _cfg_get(rbln_config, "dec_max_seq_len")
         kvcache_block_size = max_seq_len
-        batch_size = rbln_config.get("batch_size")
-        num_blocks = rbln_config.get("kvcache_num_blocks")
+        batch_size = _cfg_get(rbln_config, "batch_size")
+        num_blocks = _cfg_get(rbln_config, "kvcache_num_blocks")
     elif is_multi_modal(vllm_config.model_config.hf_config):
         # Get configurations from main module (e.g. Qwen2.5-VL, Whisper)
-        kvcache_block_size = rbln_config.get("kvcache_block_size")
-        batch_size = rbln_config.get("batch_size")
-        max_seq_len = rbln_config.get("max_seq_len")
-        num_blocks = rbln_config.get("kvcache_num_blocks")
+        kvcache_block_size = _cfg_get(rbln_config, "kvcache_block_size")
+        batch_size = _cfg_get(rbln_config, "batch_size")
+        max_seq_len = _cfg_get(rbln_config, "max_seq_len")
+        num_blocks = _cfg_get(rbln_config, "kvcache_num_blocks")
         if max_seq_len is None:  # Whisper FIXME to be moved to enc-dec
-            max_seq_len = rbln_config.get("dec_max_seq_len")
+            max_seq_len = _cfg_get(rbln_config, "dec_max_seq_len")
         # Get configurations from submodule
         if kvcache_block_size is None:
             submodules = ["language_model", "text_model"]
             for submodule in submodules:
-                if submodule in rbln_config:
-                    kvcache_block_size = rbln_config[submodule].get(
-                        "kvcache_block_size", None
-                    )
-                    batch_size = rbln_config[submodule].get("batch_size", None)
-                    max_seq_len = rbln_config[submodule].get("max_seq_len", None)
-                    num_blocks = rbln_config[submodule].get("kvcache_num_blocks", None)
+                sub_cfg = _cfg_get_submodule(rbln_config, submodule)
+                if sub_cfg is not None:
+                    kvcache_block_size = _cfg_get(sub_cfg, "kvcache_block_size")
+                    batch_size = _cfg_get(sub_cfg, "batch_size")
+                    max_seq_len = _cfg_get(sub_cfg, "max_seq_len")
+                    num_blocks = _cfg_get(sub_cfg, "kvcache_num_blocks")
                     if kvcache_block_size is not None:
                         break
 
     elif is_pooling_arch(vllm_config.model_config.hf_config):
-        max_seq_len = rbln_config.get("max_seq_len")
+        max_seq_len = _cfg_get(rbln_config, "max_seq_len")
         kvcache_block_size = max_seq_len
-        batch_size = rbln_config.get("batch_size")
-        num_blocks = rbln_config.get("kvcache_num_blocks")
+        batch_size = _cfg_get(rbln_config, "batch_size")
+        num_blocks = _cfg_get(rbln_config, "kvcache_num_blocks")
         if num_blocks is None:
             num_blocks = batch_size  # for pooling models, each sequence is one block
     else:
         # decoder
-        kvcache_block_size = rbln_config.get("kvcache_block_size")
-        prefill_chunk_size = rbln_config.get("prefill_chunk_size", 128)
-        batch_size = rbln_config.get("batch_size")
-        max_seq_len = rbln_config.get("max_seq_len")
-        num_blocks = rbln_config.get("kvcache_num_blocks")
+        kvcache_block_size = _cfg_get(rbln_config, "kvcache_block_size")
+        prefill_chunk_size = _cfg_get(rbln_config, "prefill_chunk_size", 128)
+        batch_size = _cfg_get(rbln_config, "batch_size")
+        max_seq_len = _cfg_get(rbln_config, "max_seq_len")
+        num_blocks = _cfg_get(rbln_config, "kvcache_num_blocks")
 
     assert num_blocks is not None, "num_blocks must be specified in rbln_config.json"
 
@@ -183,6 +199,25 @@ def update_vllm_block_size_for_prefix_caching(
             )
             vllm_config.cache_config.block_size = kvcache_block_size
 
+def update_vllm_num_blocks(
+    vllm_config: VllmConfig, num_blocks: int
+) -> None:
+    # num_blocks is determined by rbln_config or overridden by user.
+    if vllm_config.cache_config.num_gpu_blocks_override is not None:
+        num_blocks = vllm_config.cache_config.num_gpu_blocks_override
+        vllm_config.additional_config["num_blocks_override"] = num_blocks
+
+    blk_ratio = get_block_ratio(vllm_config)
+
+    if is_full_block_available(num_blocks, vllm_config):
+        adjusted_num_blocks = num_blocks * blk_ratio + 1
+    else:
+        adjusted_num_blocks = (num_blocks - 1) * blk_ratio + 1
+
+    vllm_config.cache_config.num_gpu_blocks = adjusted_num_blocks
+
+    if vllm_config.cache_config.num_gpu_blocks_override is not None:
+        vllm_config.cache_config.num_gpu_blocks_override = adjusted_num_blocks
 
 def update_vllm_config_with_rbln_params(
     vllm_config: VllmConfig,
@@ -223,22 +258,7 @@ def update_vllm_config_with_rbln_params(
         vllm_config, kvcache_block_size, prefill_chunk_size
     )
 
-    # num_blocks is determined by rbln_config or overridden by user.
-    if vllm_config.cache_config.num_gpu_blocks_override is not None:
-        num_blocks = vllm_config.cache_config.num_gpu_blocks_override
-        vllm_config.additional_config["num_blocks_override"] = num_blocks
-
-    blk_ratio = get_block_ratio(vllm_config)
-
-    if is_full_block_available(num_blocks, vllm_config):
-        adjusted_num_blocks = num_blocks * blk_ratio + 1
-    else:
-        adjusted_num_blocks = (num_blocks - 1) * blk_ratio + 1
-
-    vllm_config.cache_config.num_blocks = adjusted_num_blocks
-
-    if vllm_config.cache_config.num_gpu_blocks_override is not None:
-        vllm_config.cache_config.num_gpu_blocks_override = adjusted_num_blocks
+    update_vllm_num_blocks(vllm_config, num_blocks)
 
 
 def is_qwen3_pooling(
