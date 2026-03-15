@@ -113,6 +113,28 @@ class RblnPlatform(Platform):
             if action.dest == "block_size":
                 action.choices = None  # Override choices
 
+        if not envs.VLLM_RBLN_USE_VLLM_MODEL:
+            # Patch EngineArgs to record whether max_num_seqs was explicitly
+            # set by the user, before vLLM overwrites it with a default (256).
+            # The flag is stored in additional_config so it's available later
+            # in check_and_update_config / validate_vllm_config.
+            from vllm.engine.arg_utils import EngineArgs
+
+            _orig = EngineArgs._set_default_max_num_seqs_and_batched_tokens_args
+
+            def _patched(self, usage_context, model_config):
+                if (
+                    not hasattr(self, "additional_config")
+                    or self.additional_config is None
+                ):
+                    self.additional_config = {}
+                self.additional_config["user_set_max_num_seqs"] = (
+                    self.max_num_seqs is not None
+                )
+                return _orig(self, usage_context, model_config)
+
+            EngineArgs._set_default_max_num_seqs_and_batched_tokens_args = _patched
+
     @classmethod
     def validate_and_setup_prerequisite(cls, vllm_config: VllmConfig) -> None:
         scheduler_config = vllm_config.scheduler_config
@@ -232,10 +254,6 @@ class RblnPlatform(Platform):
                 )
             scheduler_config.scheduler_cls = (
                 "vllm_rbln.v1.core.optimum_scheduler.RBLNOptimumScheduler"
-            )
-
-            assert vllm_config.parallel_config.tensor_parallel_size == 1, (
-                "Tensor parallelism is set when compiled in optimum-rbln."
             )
             assert vllm_config.parallel_config.pipeline_parallel_size == 1, (
                 "Pipeline parallelism is not supported in optimum-rbln."
