@@ -28,9 +28,12 @@ def get_param_qwen2_vl(
         },
         "tensor_parallel_size": tp_size,
         "max_seq_len": max_model_len,
-        "kvcache_block_size": block_size,
         "batch_size": batch_size,
     }
+    if block_size != max_model_len:
+        attn_impl = "flash_attn" if block_size != max_model_len else "eager"
+        param["kvcache_partition_len"] = block_size
+        param["attn_impl"] = attn_impl
     return param
 
 
