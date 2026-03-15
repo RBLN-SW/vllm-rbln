@@ -196,8 +196,7 @@ def compile_model(
         )
     else:
         raise NotImplementedError(
-            "Compilation is not implemented for architecture *s",
-            architectures[0],
+            f"Compilation is not implemented for architecture {architectures[0]}"
         )
     model.save_pretrained(model_path)
     return model
