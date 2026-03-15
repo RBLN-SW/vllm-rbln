@@ -160,9 +160,13 @@ def compile_model(
     }
     if is_generation_arch(config):
         attn_impl = "flash_attn" if block_size != max_model_len else "eager"
+        print("@@ block_size:", block_size)
+        print("@@ max_model_len:", max_model_len)
         default_param["rbln_max_seq_len"] = max_model_len
-        default_param["rbln_kvcache_partition_len"] = block_size
-        default_param["rbln_attn_impl"] = attn_impl
+        if block_size != max_model_len:
+            default_param["rbln_kvcache_partition_len"] = block_size
+            default_param["rbln_attn_impl"] = attn_impl
+
         model = RBLNAutoModelForCausalLM.from_pretrained(
             hf_model_name,
             **default_param,
