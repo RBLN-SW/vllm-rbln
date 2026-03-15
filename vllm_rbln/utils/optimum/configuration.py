@@ -294,7 +294,6 @@ def validate_vllm_config(vllm_config: VllmConfig) -> None:
         if is_multi_modal(hf_config) or is_generation_arch(hf_config):
             vllm_config.cache_config.block_size = 4096
             vllm_config.model_config.max_model_len = 8192
-            print("@@@@@ block_size is set to 4096 and max_model_len is set to 8192 based on model architecture")
         else:
             vllm_config.cache_config.block_size = vllm_config.model_config.max_model_len
     kvcache_block_size = vllm_config.cache_config.block_size
@@ -316,6 +315,22 @@ def validate_vllm_config(vllm_config: VllmConfig) -> None:
         )
         vllm_config.parallel_config.tensor_parallel_size = 1
         vllm_config.parallel_config.world_size = 1
+    # 4. max_num_seqs
+    # If user didn't explicitly set max_num_seqs, default to 1
+    # to avoid extremely slow compilation with large batch sizes.
+    user_set = vllm_config.additional_config.get("user_set_max_num_seqs", False)
+    if not user_set:
+        logger.info(
+            "max_num_seqs not explicitly set by user (current=%d), "
+            "defaulting to 1 for compilation.",
+            vllm_config.scheduler_config.max_num_seqs,
+        )
+        vllm_config.scheduler_config.max_num_seqs = 1
+    else:
+        logger.info(
+            "max_num_seqs explicitly set by user to %d. ",
+            vllm_config.scheduler_config.max_num_seqs,
+        )
 
 
 def sync_with_rbln_config(vllm_config: VllmConfig) -> None:
