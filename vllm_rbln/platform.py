@@ -123,8 +123,10 @@ class RblnPlatform(Platform):
             _orig = EngineArgs._set_default_max_num_seqs_and_batched_tokens_args
 
             def _patched(self, usage_context, model_config):
-                if not hasattr(self, "additional_config") or \
-                        self.additional_config is None:
+                if (
+                    not hasattr(self, "additional_config")
+                    or self.additional_config is None
+                ):
                     self.additional_config = {}
                 self.additional_config["user_set_max_num_seqs"] = (
                     self.max_num_seqs is not None

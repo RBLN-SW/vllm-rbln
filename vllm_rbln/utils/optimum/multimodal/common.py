@@ -17,7 +17,7 @@
 def get_language_model_config(
     batch_size: int, max_model_len: int, block_size: int, tp_size: int
 ) -> dict:
-    param = {
+    param: dict = {
         "use_inputs_embeds": True,
         "batch_size": batch_size,
         "max_seq_len": max_model_len,
