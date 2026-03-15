@@ -160,8 +160,6 @@ def compile_model(
     }
     if is_generation_arch(config):
         attn_impl = "flash_attn" if block_size != max_model_len else "eager"
-        print("@@ block_size:", block_size)
-        print("@@ max_model_len:", max_model_len)
         default_param["rbln_max_seq_len"] = max_model_len
         if block_size != max_model_len:
             default_param["rbln_kvcache_partition_len"] = block_size
