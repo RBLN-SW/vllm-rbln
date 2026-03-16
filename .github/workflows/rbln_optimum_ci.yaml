@@ -197,6 +197,21 @@ jobs:
             else
               uv pip install --system --force-reinstall --no-cache-dir dist/vllm_rbln*.whl --index-url http://pypi-cache.devpi.svc.cluster.local/root/pypi/+simple/ --extra-index-url https://wheels.vllm.ai/0.13.0/cpu --extra-index-url https://download.pytorch.org/whl/cpu --index-strategy unsafe-best-match
             fi
+      
+      - name : Run Qwen3-embedding (V1)
+        run: >
+          num_input_prompt=$((2 * ${{ env.NUM_INPUT_PROMPT }}))
+          python3 examples/optimum/run_qwen3_embedding.py
+          --num_input_prompt $num_input_prompt
+          --model_id ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/qwen3-0.6b-b1-embedding
+
+      - name : Run Qwen3-reranker (V1)
+        run: >
+          num_input_prompt=$((2 * ${{ env.NUM_INPUT_PROMPT }}))
+          python3 examples/optimum/run_qwen3_reranker.py
+          --max_seq_len 32768
+          --num_input_prompt $num_input_prompt
+          --model_id ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/qwen3-0.6b-b1
 
       - name: Run decoder-only test (eager attn) (V1)
         run: >
@@ -250,20 +265,20 @@ jobs:
           --num_input_prompt ${{ env.NUM_INPUT_PROMPT }}
           --model_id ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/paligemma-3b-8k-b4
       
-      - name : Run Qwen3-embedding (V1)
-        run: >
-          num_input_prompt=$((2 * ${{ env.NUM_INPUT_PROMPT }}))
-          python3 examples/optimum/run_qwen3_embedding.py
-          --num_input_prompt $num_input_prompt
-          --model_id ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/qwen3-0.6b-b1-embedding
+      # - name : Run Qwen3-embedding (V1)
+      #   run: >
+      #     num_input_prompt=$((2 * ${{ env.NUM_INPUT_PROMPT }}))
+      #     python3 examples/optimum/run_qwen3_embedding.py
+      #     --num_input_prompt $num_input_prompt
+      #     --model_id ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/qwen3-0.6b-b1-embedding
 
-      - name : Run Qwen3-reranker (V1)
-        run: >
-          num_input_prompt=$((2 * ${{ env.NUM_INPUT_PROMPT }}))
-          python3 examples/optimum/run_qwen3_reranker.py
-          --max_seq_len 32768
-          --num_input_prompt $num_input_prompt
-          --model_id ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/qwen3-0.6b-b1
+      # - name : Run Qwen3-reranker (V1)
+      #   run: >
+      #     num_input_prompt=$((2 * ${{ env.NUM_INPUT_PROMPT }}))
+      #     python3 examples/optimum/run_qwen3_reranker.py
+      #     --max_seq_len 32768
+      #     --num_input_prompt $num_input_prompt
+      #     --model_id ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/qwen3-0.6b-b1
 
   test_vllm_rbln_rsd8:
     needs: [get-compiler-version]
