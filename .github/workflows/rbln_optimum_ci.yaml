@@ -121,7 +121,7 @@ jobs:
           num_input_prompt=$((2 * ${{ env.NUM_INPUT_PROMPT }}))
           python3 examples/optimum/run_qwen3_embedding.py
           --num_input_prompt $num_input_prompt
-          --model_id ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/qwen3-0.6b-b1-embedding
+          --model_id ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/qwen3-embedding-0_6b-32k_kv4k_batch1
 
       - name : Run Qwen3-reranker (V1)
         run: >
@@ -129,7 +129,7 @@ jobs:
           python3 examples/optimum/run_qwen3_reranker.py
           --max_seq_len 32768
           --num_input_prompt $num_input_prompt
-          --model_id ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/qwen3-0.6b-b1
+          --model_id ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/qwen3-reranker-0_6b-40k_kv4k_batch2
 
       - name: Run gemma2 model (hybrid attention) (V1)
         run: >
