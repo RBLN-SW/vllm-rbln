@@ -177,8 +177,9 @@ class RBLNOptimumModelBase(nn.Module):
         model_name, model_cls_name = get_rbln_model_info(config)
         model = None
 
-        # If the model is not compiled,
-        # compile the model and save it to the cache for future use.
+        # If a HuggingFace model (not optimum-compiled) is given,
+        # look up the cached compiled model.
+        # If it does not exist, compile and save it to the cache for future use.
         if not is_compiled_model:
             model_path_name = generate_model_path_name(
                 self.model_config.model,
@@ -194,8 +195,6 @@ class RBLNOptimumModelBase(nn.Module):
                 "compiled_models/" + model_path_name,
             )
             self.vllm_config.model_config.model = cached_model_path
-            # If the compiled model does not exist, compile
-            # and save it to the cached_model_path for future use.
             if not os.path.exists(cached_model_path):
                 logger.info(
                     "Compiling the model %s. This may take a while...",
@@ -218,6 +217,8 @@ class RBLNOptimumModelBase(nn.Module):
                     cached_model_path,
                 )
 
+        # Load the model directly if it is either an optimum-compiled model
+        # or a HuggingFace model that has already been compiled and cached.
         if model is None:
             model_cls = getattr(optimum.rbln, model_cls_name)
             assert model_cls is not None
