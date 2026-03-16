@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from pathlib import Path
 from typing import Any
 
 import optimum.rbln
@@ -147,7 +146,7 @@ def compile_model(
     block_size: int,
     max_model_len: int,
     tp_size: int,
-    model_path: Path,
+    model_path: str,
 ) -> Any:
     architectures = getattr(config, "architectures", [])
     model_name, model_cls_name = get_rbln_model_info(

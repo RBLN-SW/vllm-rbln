@@ -43,6 +43,17 @@ def get_attn_block_size(vllm_config: VllmConfig) -> int:
     return block_size
 
 
+def generate_model_path_name(
+    model_name: str,
+    batch_size: int,
+    block_size: int,
+    max_model_len: int,
+    tp_size: int,
+) -> str:
+    model_name = model_name.replace("/", "_").replace(":", "_")
+    return f"{model_name}_bs{batch_size}_blk{block_size}_msl{max_model_len}_tp{tp_size}"
+
+
 class KVCacheBlockAdapter:
     """
      KV cache block allocation behavior (v1 vs v0).
@@ -157,44 +168,67 @@ class RBLNOptimumModelBase(nn.Module):
         ):
             model_path = Path(self.model_config.model)
             if model_path.is_dir() and any(model_path.glob("rbln_config.json")):
-                compiled_path = self.model_config.model
+                is_compiled_model = True
             else:
-                compiled_path = None
+                is_compiled_model = False
         else:
-            compiled_path = None
+            is_compiled_model = False
+
         model_name, model_cls_name = get_rbln_model_info(config)
-        if compiled_path is None or not os.path.exists(compiled_path):
-            logger.info(
-                "Compiling the model %s. This may take a while...",
+        model = None
+
+        # If the model is not compiled,
+        # compile the model and save it to the cache for future use.
+        if not is_compiled_model:
+            model_path_name = generate_model_path_name(
                 self.model_config.model,
-            )
-            # FIXME
-            # dir name with param?
-            model_path = os.path.join(
-                envs.VLLM_CACHE_ROOT,
-                "compiled_models/" + os.path.basename(self.model_config.model),
-            )
-            model = compile_model(
-                self.model_config.model,
-                config,
                 batch_size=self.scheduler_config.max_num_seqs,
                 block_size=get_attn_block_size(self.vllm_config),
                 max_model_len=self.model_config.max_model_len,
                 tp_size=self.vllm_config.additional_config.get(
                     "tensor_parallel_size", 1
                 ),
-                model_path=model_path,
             )
-            self.vllm_config.model_config.model = model_path
-        else:
+            cached_model_path = os.path.join(
+                envs.VLLM_CACHE_ROOT,
+                "compiled_models/" + model_path_name,
+            )
+            self.vllm_config.model_config.model = cached_model_path
+            # If the compiled model does not exist, compile
+            # and save it to the cached_model_path for future use.
+            if not os.path.exists(cached_model_path):
+                logger.info(
+                    "Compiling the model %s. This may take a while...",
+                    self.model_config.model,
+                )
+                model = compile_model(
+                    self.model_config.model,
+                    config,
+                    batch_size=self.scheduler_config.max_num_seqs,
+                    block_size=get_attn_block_size(self.vllm_config),
+                    max_model_len=self.model_config.max_model_len,
+                    tp_size=self.vllm_config.additional_config.get(
+                        "tensor_parallel_size", 1
+                    ),
+                    model_path=str(cached_model_path),
+                )
+            else:
+                logger.info(
+                    "Found compiled model at %s. Loading the model from the path.",
+                    cached_model_path,
+                )
+
+        if model is None:
             model_cls = getattr(optimum.rbln, model_cls_name)
             assert model_cls is not None
-            model = model_cls.from_pretrained(compiled_path, export=False)
+            model = model_cls.from_pretrained(
+                self.vllm_config.model_config.model, export=False
+            )
             logger.info(
                 "model_name = %s, model_cls_name = %s, model_path = %s",
                 model_name,
                 model_cls_name,
-                compiled_path,
+                self.vllm_config.model_config.model,
             )
 
         self.supports_transcription_only = (

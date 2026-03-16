@@ -128,9 +128,7 @@ class RblnPlatform(Platform):
                     or self.additional_config is None
                 ):
                     self.additional_config = {}
-                self.additional_config["max_num_seqs"] = (
-                    self.max_num_seqs is not None
-                )
+                self.additional_config["max_num_seqs"] = self.max_num_seqs is not None
                 return _orig(self, usage_context, model_config)
 
             EngineArgs._set_default_max_num_seqs_and_batched_tokens_args = _patched
