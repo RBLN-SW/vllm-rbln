@@ -128,7 +128,7 @@ def prepare_vllm_for_compile(vllm_config: VllmConfig) -> None:
     # 4. max_num_seqs
     # If user didn't explicitly set max_num_seqs, default to 1
     # to avoid extremely slow compilation with large batch sizes.
-    user_set = vllm_config.additional_config.get("user_set_max_num_seqs", False)
+    user_set = vllm_config.additional_config.get("max_num_seqs", False)
     if not user_set:
         logger.info(
             "max_num_seqs not explicitly set by user, defaulting to 1 for compilation.",
