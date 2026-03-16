@@ -35,7 +35,19 @@ class RBLNMedusaProposer(MedusaProposer):
 
     def load_model(self, target_model: nn.Module) -> None:
         super().load_model(target_model)
-        self._propose = self._compile_model(self._propose)  # type: ignore
+
+        def model_wrapper(target_hidden_states: torch.Tensor) -> torch.Tensor:
+            hidden_states = self.model(target_hidden_states)
+            logits = self.model.compute_logits(hidden_states)
+            return logits
+
+        if (
+            self.vllm_config.speculative_config.enforce_eager
+            or not envs.VLLM_RBLN_COMPILE_MODEL
+        ):
+            self.model_executable = model_wrapper
+        else:
+            self.model_executable = self._compile_model(model_wrapper)
 
     def _compile_model(self, model: nn.Module):
         TP = get_tp_group()
@@ -67,16 +79,13 @@ class RBLNMedusaProposer(MedusaProposer):
             dynamic=False,
         )
 
-    def _propose(self, target_hidden_states: torch.Tensor) -> list[torch.Tensor]:
-        return self.model.compute_logits(self.model(target_hidden_states))
-
     def propose(
         self,
         target_hidden_states: torch.Tensor,
         sampling_metadata: SamplingMetadata,
     ) -> torch.Tensor:
         # Generate blocks and compute logits
-        logits = self._propose(target_hidden_states)
+        logits = self.model_executable(target_hidden_states)
 
         # Compute argmax for each Medusa head and stack into a single tensor
         # Shape: [batch_size, num_heads]
