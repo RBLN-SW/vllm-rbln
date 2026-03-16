@@ -38,6 +38,7 @@ pip install vllm-rbln
 ```bash
 git clone https://github.com/rbln-sw/vllm-rbln.git
 cd vllm-rbln
+pip install -r requirements.txt
 pip install -e .
 ```
 
