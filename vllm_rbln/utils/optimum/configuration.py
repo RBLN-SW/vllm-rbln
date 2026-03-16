@@ -92,6 +92,9 @@ def sync_vllm_from_rbln_config(
 
 
 def prepare_vllm_for_compile(vllm_config: VllmConfig) -> None:
+    # NOTE:
+    # num_blocks is set after compilation,
+    # so we only set other parameters here to compile model internally.
     # 1. block_size
     # Get proper block_size if not set by user
     hf_config = vllm_config.model_config.hf_config
