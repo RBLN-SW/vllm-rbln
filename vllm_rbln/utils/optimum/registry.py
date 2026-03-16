@@ -153,7 +153,6 @@ def compile_model(
         config
     )  # check if the model is supported and get model info
     default_param: dict[str, Any] = {
-        "export": True,
         "rbln_tensor_parallel_size": tp_size,
     }
     if is_generation_arch(config):

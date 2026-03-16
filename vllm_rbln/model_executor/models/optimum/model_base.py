@@ -223,7 +223,7 @@ class RBLNOptimumModelBase(nn.Module):
             model_cls = getattr(optimum.rbln, model_cls_name)
             assert model_cls is not None
             model = model_cls.from_pretrained(
-                self.vllm_config.model_config.model, export=False
+                self.vllm_config.model_config.model
             )
             logger.info(
                 "model_name = %s, model_cls_name = %s, model_path = %s",
