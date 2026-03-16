@@ -3694,7 +3694,11 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         """
         kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-            device = "cpu" if envs.VLLM_RBLN_USE_CUSTOM_KERNEL else "meta"
+            device = (
+                "cpu"
+                if envs.VLLM_RBLN_USE_CUSTOM_KERNEL or not envs.VLLM_RBLN_COMPILE_MODEL
+                else "meta"
+            )
             tensor = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=device)
             for layer_name in kv_cache_tensor.shared_by:
                 kv_cache_raw_tensors[layer_name] = tensor
