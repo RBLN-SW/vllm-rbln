@@ -3190,11 +3190,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
             if (
                 get_pp_group().is_last_rank
-                and self.lora_config is None
-                and (
-                    self.speculative_config is None
-                    or self.speculative_config.method not in ("eagle", "eagle3")
-                )
+                and self.use_wrapped_compute_logits()
                 and not self.is_pooling_model
                 and self.logits_processor is not None
             ):
@@ -4096,13 +4092,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         )
 
     def use_wrapped_compute_logits(self) -> bool:
-        return not (
-            self.lora_config is not None
-            or (
-                self.speculative_config is not None
-                and self.speculative_config.method in ("eagle", "eagle3")
-            )
-        )
+        return False
 
     def collect_metrics(
         self,

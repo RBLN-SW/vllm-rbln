@@ -13,6 +13,11 @@
 # limitations under the License.
 
 import argparse
+import os
+os.environ["VLLM_RBLN_USE_VLLM_MODEL"] = "1"
+os.environ["VLLM_RBLN_COMPILE_STRICT_MODE"] = "1"
+os.environ["VLLM_DISABLE_COMPILE_CACHE"] = "1"
+os.environ["VLLM_RBLN_SAMPLER"] = "0"
 
 from vllm import LLM, SamplingParams
 
@@ -21,7 +26,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="meta-llama/Llama-3.2-1B-instruct")
     parser.add_argument("--max-num-seqs", type=int, default=8)
-    parser.add_argument("--max-model-len", type=int, default=40 * 1024)
+    parser.add_argument("--max-model-len", type=int, default=2 * 1024)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--block-size", type=int, default=1024)
     parser.add_argument("--enable-expert-parallel", action="store_true")
