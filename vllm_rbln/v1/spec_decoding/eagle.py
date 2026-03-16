@@ -528,7 +528,13 @@ class RBLNEagleProposer(EagleProposer):
 
             return hidden_states, logits
 
-        self.model_executable = self._compile_model(model_wrapper)
+        if (
+            self.vllm_config.speculative_config.enforce_eager
+            or not envs.VLLM_RBLN_COMPILE_MODEL
+        ):
+            self.model_executable = model_wrapper
+        else:
+            self.model_executable = self._compile_model(model_wrapper)
 
     def _compile_model(self, model):
         TP = get_tp_group()
