@@ -230,7 +230,7 @@ def main():
         },
         disable_log_stats=False,
         tensor_parallel_size=args.tensor_parallel_size,
-        gpu_memory_utilization=0.7,
+        gpu_memory_utilization=0.5,
     )
 
     sampling_params = SamplingParams(temperature=0.1, top_p=0.9, max_tokens=128)

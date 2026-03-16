@@ -118,6 +118,16 @@ class RBLNEagleProposer(EagleProposer):
         if self.supports_mm_inputs:
             raise NotImplementedError("Eagle is not supported with multi-modal.")
 
+        # TODO(RBLN): Using a separate CompileContext for the draft model is a
+        # temporary workaround. Since the base model's KV caches are managed
+        # together within its CompileContext, using a separate one here causes
+        # the draft model to redundantly allocate memory for the base model's
+        # KV caches, resulting in unnecessary memory waste. This should be
+        # revisited to properly share the base model's CompileContext.
+        from rebel import CompileContext
+
+        self.compile_context = CompileContext(use_weight_sharing=True)
+
     def propose(
         self,
         target_token_ids: torch.Tensor,
@@ -550,7 +560,7 @@ class RBLNEagleProposer(EagleProposer):
         process_group_dict[DP.cpu_group.group_name] = DP.ranks
 
         options = {
-            "compile_context": self.runner.compile_context,
+            "compile_context": self.compile_context,
             "tensor_parallel_size": envs.VLLM_RBLN_TP_SIZE,
             "process_group_dict": process_group_dict,
             "guard_filter_fn": torch.compiler.keep_tensor_guards_unsafe,
