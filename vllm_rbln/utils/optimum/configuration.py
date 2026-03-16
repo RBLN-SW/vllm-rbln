@@ -128,20 +128,10 @@ def prepare_vllm_for_compile(vllm_config: VllmConfig) -> None:
         vllm_config.parallel_config.tensor_parallel_size = 1
         vllm_config.parallel_config.world_size = 1
 
-    # 4. max_num_seqs
-    # If user didn't explicitly set max_num_seqs, default to 1
-    # to avoid extremely slow compilation with large batch sizes.
-    user_set = vllm_config.additional_config.get("max_num_seqs", False)
-    if not user_set:
-        logger.info(
-            "max_num_seqs not explicitly set by user, defaulting to 1 for compilation.",
-        )
-        vllm_config.scheduler_config.max_num_seqs = 1
-    else:
-        logger.info(
-            "max_num_seqs explicitly set by user to %d. ",
-            vllm_config.scheduler_config.max_num_seqs,
-        )
+    logger.info(
+        "Prepared vLLM config for compilation: %s",
+        vllm_config,
+    )
 
 
 def sync_with_rbln_config(vllm_config: VllmConfig) -> None:
