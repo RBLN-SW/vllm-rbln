@@ -49,7 +49,7 @@ def is_qwen3_pooling(
     )
 
 
-def _apply_rbln_params(
+def sync_vllm_from_rbln_config(
     vllm_config: VllmConfig,
     num_blocks: int,
     batch_size: int,
@@ -91,24 +91,26 @@ def _apply_rbln_params(
     sync_num_blocks(vllm_config, num_blocks)
 
 
-def validate_vllm_config(vllm_config: VllmConfig) -> None:
+def prepare_vllm_for_compile(vllm_config: VllmConfig) -> None:
     # 1. block_size
     # Get proper block_size if not set by user
     hf_config = vllm_config.model_config.hf_config
     if vllm_config.cache_config.block_size is None:
+        # Set block_size to 4096 for fast compilation
         if is_multi_modal(hf_config) or is_generation_arch(hf_config):
             vllm_config.cache_config.block_size = 4096
-            vllm_config.model_config.max_model_len = 8192
         else:
             vllm_config.cache_config.block_size = vllm_config.model_config.max_model_len
-    kvcache_block_size = vllm_config.cache_config.block_size
 
     # Set block_size in cache_config to compile model internally.
-    sync_cache_block_size(vllm_config, kvcache_block_size, prefill_chunk_size=128)
+    sync_cache_block_size(
+        vllm_config, vllm_config.cache_config.block_size, prefill_chunk_size=128
+    )
 
     # 2. max_model_len
-    # Currently, max_model_len is set to max_model_len of model
-    # But it takes so long to compile this model.
+    # NOTE: Uses the user-defined max_model_len if provided;
+    # otherwise, it defaults to the model's native maximum length.
+    # Note that using the default value may significantly increase compilation time.
     vllm_config.scheduler_config.max_num_batched_tokens = (
         vllm_config.model_config.max_model_len
     )
@@ -159,7 +161,7 @@ def sync_with_rbln_config(vllm_config: VllmConfig) -> None:
             kvcache_block_size,
             prefill_chunk_size,
         ) = get_rbln_params(vllm_config, rbln_config)
-        _apply_rbln_params(
+        sync_vllm_from_rbln_config(
             vllm_config,
             num_blocks,
             batch_size,
@@ -168,4 +170,4 @@ def sync_with_rbln_config(vllm_config: VllmConfig) -> None:
             prefill_chunk_size,
         )
     else:
-        validate_vllm_config(vllm_config)
+        prepare_vllm_for_compile(vllm_config)

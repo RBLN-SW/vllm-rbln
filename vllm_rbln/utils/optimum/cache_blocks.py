@@ -52,12 +52,7 @@ def get_block_ratio(vllm_config: VllmConfig) -> int:
     return blk_ratio
 
 
-# ---------------------------------------------------------------------------
-# Block-size / num-blocks synchronisation
-# ---------------------------------------------------------------------------
-
-
-def _apply_prefix_caching_block_size(
+def apply_prefix_caching_block_size(
     vllm_config: VllmConfig, kvcache_block_size: int, prefill_chunk_size: int
 ) -> None:
     assert prefill_chunk_size is not None, (
@@ -105,7 +100,7 @@ def sync_cache_block_size(
     vllm_config: VllmConfig, kvcache_block_size: int, prefill_chunk_size: int
 ) -> None:
     if vllm_config.cache_config.enable_prefix_caching:
-        _apply_prefix_caching_block_size(
+        apply_prefix_caching_block_size(
             vllm_config, kvcache_block_size, prefill_chunk_size
         )
     else:
