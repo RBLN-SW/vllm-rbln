@@ -65,7 +65,6 @@ def register_ops():
         import vllm_rbln.models.qwen3_moe  # noqa
         import vllm_rbln.models.minimax_m2  # noqa
         import vllm_rbln.models.utils  # noqa
-        import vllm_rbln.v1.spec_decoding.eagle  # noqa
         from vllm_rbln.triton_kernels import attention  # noqa
         from vllm_rbln.triton_kernels import causal_attention  # noqa
         from vllm_rbln.triton_kernels import flash_attention  # noqa
