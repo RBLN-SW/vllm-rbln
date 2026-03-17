@@ -194,7 +194,6 @@ class RBLNOptimumModelBase(nn.Module):
                 envs.VLLM_CACHE_ROOT,
                 "compiled_models/" + model_path_name,
             )
-            self.vllm_config.model_config.model = cached_model_path
             if not os.path.exists(cached_model_path):
                 logger.info(
                     "Compiling the model %s. This may take a while...",
@@ -216,6 +215,7 @@ class RBLNOptimumModelBase(nn.Module):
                     "Found compiled model at %s. Loading the model from the path.",
                     cached_model_path,
                 )
+            self.vllm_config.model_config.model = cached_model_path
 
         # Load the model directly if it is either an optimum-compiled model
         # or a HuggingFace model that has already been compiled and cached.

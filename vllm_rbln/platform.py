@@ -246,6 +246,13 @@ class RblnPlatform(Platform):
             cls.disable_unsupported_prefix_caching(vllm_config)
             sync_with_rbln_config(vllm_config)
 
+            # NOTE: While tensor parallel size is used for vllm-rbln compilation,
+            # it is redirected to optimum-rbln.
+            # Consequently, the actual tensor parallel size is enforced as 1.
+            assert vllm_config.parallel_config.tensor_parallel_size == 1, (
+                "Tensor parallelism is set when compiled in optimum-rbln."
+            )
+
         if (
             parallel_config.distributed_executor_backend is not None
             and parallel_config.distributed_executor_backend != "mp"
