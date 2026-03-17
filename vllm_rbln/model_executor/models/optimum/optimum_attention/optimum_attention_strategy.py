@@ -76,7 +76,7 @@ class AttentionStrategy(ABC, Generic[EntryT, Result1T, Result2T]):
         self,
         decoder_batch_size: int,
         is_prompt: bool,
-        finished_requests_ids: list[str], # FIXME to be removed
+        finished_requests_ids: list[str],  # FIXME to be removed
         running_requests_ids: list[str],
         get_entry_fn: Callable[[Any], Any] | None = None,
         get_extra_values_fn: Callable[[Any], Union[Any, tuple[Any, ...]]] | None = None,
