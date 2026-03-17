@@ -13,18 +13,26 @@
 # limitations under the License.
 
 import torch
-from vllm.distributed import tensor_model_parallel_all_reduce
+from vllm.distributed import tensor_model_parallel_all_gather
 from vllm.model_executor.models.deepseek_v2 import DeepseekV2Attention, DeepseekV2MoE
 
 
 def __deepseek_v2_moe_forward_rsd(self, hidden_states: torch.Tensor) -> torch.Tensor:
-    final_hidden_states = self.experts(
+    shared_output, final_hidden_states = self.experts(
         hidden_states=hidden_states, router=lambda x: self.gate(x)[0]
-    )
+    )    
+    # Fix FP16 overflow
+    # See DeepseekV2DecoderLayer for more details.
+    if hidden_states.dtype != torch.float16:
+        final_hidden_states *= self.routed_scaling_factor
+    elif self.shared_experts is not None:
+        shared_output *= 1.0 / self.routed_scaling_factor
+    
     if self.shared_experts is not None:
-        final_hidden_states = final_hidden_states[0] + final_hidden_states[1]
+        final_hidden_states += shared_output
+
     if self.tp_size > 1:
-        final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(  # noqa E501
+        final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(
             final_hidden_states
         )
     # FIXME(RBLN) - DO NOT reshape
