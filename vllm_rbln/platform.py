@@ -239,7 +239,9 @@ class RblnPlatform(Platform):
             )
 
             assert vllm_config.parallel_config.tensor_parallel_size == 1, (
-                "Tensor parallelism is set when compiled in optimum-rbln."
+                "Cannot set tensor_parallel_size for pre-compiled optimum-rbln models. "
+                "If you want to compile with tensor parallelism in vllm-rbln, "
+                "please use the `VLLM_RBLN_TP_SIZE` environment variable instead."
             )
             assert vllm_config.parallel_config.pipeline_parallel_size == 1, (
                 "Pipeline parallelism is not supported in optimum-rbln."
