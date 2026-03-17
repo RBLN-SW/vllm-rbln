@@ -63,7 +63,7 @@ else:
     xgr = LazyLoader("xgr", globals(), "xgrammar")
 
 MAX_NUM_SEQ = 2
-MAX_MODEL_LEN = 64
+MAX_MODEL_LEN = 1024
 OB_SIZE = 16
 IB_SIZE = 4
 NUM_BLOCKS = MAX_MODEL_LEN // OB_SIZE * MAX_NUM_SEQ + 1
@@ -80,15 +80,17 @@ class MockModelWrapper(nn.Module):
                 get_available_num_blocks=lambda: NUM_BLOCKS
             )
 
-    def __init__(self):
-        super().__init__()
-        self.model = self.MockModel()
-        self.dtype = self.model.rbln_config.dtype
-
     def compute_logits(
         self, hidden_states: torch.Tensor, sampling_metadata: SamplingMetadata
     ) -> torch.Tensor:
         return hidden_states
+
+    def init_model(self) -> None:
+        self.model = self.MockModel()
+        self.rbln_model_config = None
+        self.attn_impl = None
+        self.supports_transcription_only = False
+        self.dtype = self.model.rbln_config.dtype
 
 
 def fake_load_model(runner: RBLNOptimumModelRunner):
@@ -103,6 +105,7 @@ def fake_load_model(runner: RBLNOptimumModelRunner):
         )
 
     runner.model = MockModelWrapper()
+    runner.model.init_model()
     runner.use_optimum_lora = False
     # Assign the fake forward function to the model
     runner.model.forward = fake_forward

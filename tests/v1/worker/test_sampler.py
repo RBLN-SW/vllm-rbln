@@ -155,6 +155,9 @@ DEVICE = current_platform.device_type
 )
 def test_get_bucket_sizes(monkeypatch, num_seqs: int, expected_bucket_sizes: list[int]):
     monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1")
+    monkeypatch.setattr(
+        "vllm_rbln.utils.optimum.configuration.DEFAULT_PREFILL_CHUNK_SIZE", 4
+    )
     runner = create_model_runner(max_num_seqs=num_seqs)
     fake_load_model(runner)
     bucket_sizes = runner.get_bucket_sizes(num_seqs)
@@ -170,6 +173,9 @@ def test_forward_sampler_mode_and_structured_output(
     """Test sampler logic for both use_rbln_sampler=True and False."""
     monkeypatch.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
     monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1" if use_rbln_sampler else "0")
+    monkeypatch.setattr(
+        "vllm_rbln.utils.optimum.configuration.DEFAULT_PREFILL_CHUNK_SIZE", 4
+    )
     reqs = []
     for i in range(3):
         reqs.append(
@@ -204,6 +210,9 @@ def test_forward_sampling_parameters(
 ):
     monkeypatch.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
     monkeypatch.setenv("VLLM_RBLN_ENABLE_WARM_UP", "True" if warm_up else "False")
+    monkeypatch.setattr(
+        "vllm_rbln.utils.optimum.configuration.DEFAULT_PREFILL_CHUNK_SIZE", 4
+    )
     reqs = []
     for i in range(3):
         reqs.append(
@@ -238,6 +247,9 @@ def test_sampler_logits_reshape_prevents_torch_compile_recompile(monkeypatch):
     monkeypatch.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
     monkeypatch.setenv("VLLM_RBLN_ENABLE_WARM_UP", "False")
     monkeypatch.setenv("TORCH_LOGS", "recompiles")
+    monkeypatch.setattr(
+        "vllm_rbln.utils.optimum.configuration.DEFAULT_PREFILL_CHUNK_SIZE", 4
+    )
 
     compile_counter = CompileCounter()
     real_torch_compile = torch.compile

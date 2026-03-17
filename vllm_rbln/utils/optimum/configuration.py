@@ -38,6 +38,8 @@ from vllm_rbln.utils.optimum.registry import (
 
 logger = init_logger(__name__)
 
+DEFAULT_PREFILL_CHUNK_SIZE = 128
+
 
 def is_qwen3_pooling(
     vllm_config: VllmConfig,
@@ -107,7 +109,9 @@ def prepare_vllm_for_compile(vllm_config: VllmConfig) -> None:
 
     # Set block_size in cache_config to compile model internally.
     sync_cache_block_size(
-        vllm_config, vllm_config.cache_config.block_size, prefill_chunk_size=128
+        vllm_config,
+        vllm_config.cache_config.block_size,
+        prefill_chunk_size=DEFAULT_PREFILL_CHUNK_SIZE,
     )
 
     # 2. max_model_len
