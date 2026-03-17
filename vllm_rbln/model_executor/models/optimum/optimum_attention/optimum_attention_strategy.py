@@ -66,6 +66,9 @@ class AttentionStrategy(ABC, Generic[EntryT, Result1T, Result2T]):
         **kwargs,
     ) -> Result2T: ...
 
+    def pop(self, request_id: str) -> None:
+        self.table.pop(request_id, None)
+
     def clear(self):
         self.table.clear()
 

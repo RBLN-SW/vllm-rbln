@@ -74,7 +74,7 @@ class AttentionManager(Generic[StrategyT, EntryT, Result1T, Result2T]):
         self._s.clear()
 
     def pop(self, request_id: str):
-        self._s.table.pop(request_id, None)
+        self._s.pop(request_id)
 
 
 class HybridAttentionImageManager(
