@@ -237,10 +237,10 @@ class RblnPlatform(Platform):
             scheduler_config.scheduler_cls = (
                 "vllm_rbln.v1.core.optimum_scheduler.RBLNOptimumScheduler"
             )
+
             assert vllm_config.parallel_config.tensor_parallel_size == 1, (
                 "Tensor parallelism is set when compiled in optimum-rbln."
             )
-
             assert vllm_config.parallel_config.pipeline_parallel_size == 1, (
                 "Pipeline parallelism is not supported in optimum-rbln."
             )
@@ -249,7 +249,6 @@ class RblnPlatform(Platform):
             )
             cls.disable_unsupported_prefix_caching(vllm_config)
             sync_with_rbln_config(vllm_config)
-
 
         if (
             parallel_config.distributed_executor_backend is not None
