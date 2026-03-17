@@ -13,7 +13,6 @@
 # limitations under the License.
 # isort: off
 import inspect
-import os
 import torch
 import torch.nn as nn
 
@@ -166,14 +165,6 @@ class RBLNTopKTopPSampler(nn.Module):
         }
         if envs.VLLM_RBLN_COMPILE_STRICT_MODE:
             options["mode"] = "strict"
-
-        # FIXME: this should be removed after next compiler release
-        if not envs.VLLM_DISABLE_COMPILE_CACHE:
-            logger.info(
-                "Once the model is compiled for the first time, "
-                "the cached compiled binary will be reused."
-            )
-            options["cache_dir"] = os.path.join(envs.VLLM_CACHE_ROOT, "rbln")
 
         if has_torch_rbln:
             options["use_global_ctx"] = True
