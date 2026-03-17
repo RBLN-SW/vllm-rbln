@@ -39,9 +39,9 @@ dependencies = [
     "datasets",
     "qwen_vl_utils",
     "vllm==0.13.0+cpu",
-    "torch==2.9.1",
-    "torchvision==0.24.1",
-    "torchaudio==2.9.1",
+    "torch",
+    "torchvision",
+    "torchaudio",
     "optimum-rbln>=0.10.2a1",
 ]
 
