@@ -230,6 +230,9 @@ class RBLNEagleProposer(EagleProposer):
                 input_ids = rbln_utils.pad(input_ids, 0, batch_bucket_size)
                 positions = target_positions.view(batch_size, -1)
                 positions = rbln_utils.pad(positions, -2, batch_bucket_size)
+            last_token_indices_padded = rbln_utils.pad(
+                last_token_indices, 0, batch_bucket_size
+            )
             hidden_states = target_hidden_states.view(*input_ids.shape, -1)
 
             inputs_embeds = None
@@ -250,12 +253,12 @@ class RBLNEagleProposer(EagleProposer):
                 positions=positions,
                 hidden_states=hidden_states,
                 inputs_embeds=inputs_embeds,
-                last_token_indices=last_token_indices,
+                last_token_indices=last_token_indices_padded,
             )
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1:
-            draft_tokens_ids = logits.argmax(dim=-1)
+            draft_tokens_ids = logits[:batch_size].argmax(dim=-1)
             return draft_tokens_ids.view(-1, 1)
 
         positions = (
@@ -287,7 +290,7 @@ class RBLNEagleProposer(EagleProposer):
             # return torch.cat(draft_token_ids_list, dim=1)
             raise NotImplementedError("Tree attention is not supported")
 
-        draft_token_ids = logits.argmax(dim=-1)
+        draft_token_ids = logits[:batch_size].argmax(dim=-1)
 
         # Generate the remaining draft tokens.
         draft_token_ids_list = [draft_token_ids]
