@@ -329,6 +329,7 @@ def unquantized_fused_moe_method_custom(
     if use_moe_tokens_mask:
         tokens_mask = get_tokens_mask(num_tokens)
 
+
     final_hidden_states = torch.ops.rbln_custom_ops.custom_moe_glu(
         hidden_states,
         gate_proj_weight,
