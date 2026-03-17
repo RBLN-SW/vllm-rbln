@@ -118,16 +118,6 @@ def prepare_vllm_for_compile(vllm_config: VllmConfig) -> None:
         vllm_config.model_config.max_model_len
     )
 
-    # 3. tensor parallelism
-    # Move tensor_parallel_size from parallel_config to additional_config
-    # to avoid vLLM's TP logic as optimum models use TP internally.
-    if vllm_config.parallel_config.tensor_parallel_size > 1:
-        vllm_config.additional_config["tensor_parallel_size"] = (
-            vllm_config.parallel_config.tensor_parallel_size
-        )
-        vllm_config.parallel_config.tensor_parallel_size = 1
-        vllm_config.parallel_config.world_size = 1
-
     logger.info(
         "Prepared vLLM config for compilation: %s",
         vllm_config,
