@@ -50,6 +50,8 @@ def generate_model_path_name(
     max_model_len: int,
     tp_size: int,
 ) -> str:
+    # FIXME: To avoid cache collisions, the cache key should also include
+    # the versions of the compiler and optimum-rbln.
     model_name = model_name.replace("/", "_").replace(":", "_")
     return f"{model_name}_bs{batch_size}_blk{block_size}_msl{max_model_len}_tp{tp_size}"
 

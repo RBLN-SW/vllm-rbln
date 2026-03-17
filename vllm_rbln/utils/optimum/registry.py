@@ -173,6 +173,8 @@ def compile_model(
         assert model_cls is not None
         default_param["rbln_batch_size"] = batch_size
         default_param["rbln_max_seq_len"] = max_model_len
+        # FIXME: We need a more generalized logic to specify block sizes
+        # as the number of supported models continues to grow.
         if architectures[0] == "Qwen3Model" and block_size != max_model_len:
             attn_impl = "flash_attn" if block_size != max_model_len else "eager"
             default_param["rbln_kvcache_partition_len"] = block_size
