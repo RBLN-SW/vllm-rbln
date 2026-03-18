@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import torch
-from vllm.distributed import tensor_model_parallel_all_gather
+from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.model_executor.models.AXK1 import AXK1Attention, AXK1MoE
 import logging
 log = logging.getLogger("torch._dynamo")
@@ -33,7 +33,7 @@ def __AXK1_moe_forward_rsd(self, hidden_states: torch.Tensor) -> torch.Tensor:
         final_hidden_states += shared_output
 
     if self.tp_size > 1:
-        final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(
+        final_hidden_states = tensor_model_parallel_all_reduce(
             final_hidden_states
         )
     # FIXME(RBLN) - DO NOT reshape
@@ -70,10 +70,9 @@ def __AXK1_attention_forward(
     k_nope, v = kv.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
     k_pe = latent_cache[:, :, self.kv_lora_rank :]
     q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
-    
-    q[..., self.qk_nope_head_dim :] = q_pe
-    k = torch.empty_like(q)
-    k[..., : self.qk_nope_head_dim] = k_nope
+        
+    q = torch.cat([q_nope, q_pe], dim=-1)
+    k = torch.cat([k_nope, k_pe.repeat(1, self.num_local_heads, 1)], dim=-1)
     
     # Apply llama 4 scaling if provided
     if llama_4_scaling is not None:
