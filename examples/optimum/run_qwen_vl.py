@@ -59,7 +59,9 @@ def generate_prompts_video(batch_size: int, model_id: str):
     arr_video_kwargs = []
     for i in range(batch_size):
         image_inputs, video_inputs, video_kwargs = process_vision_info(
-            messages[i], return_video_kwargs=True
+            messages[i],
+            return_video_kwargs=True,
+            return_video_metadata=True,
         )
         arr_image_inputs.append(image_inputs)
         arr_video_inputs.append(video_inputs)
@@ -123,7 +125,7 @@ def generate_prompts_image(batch_size: int, model_id: str):
 
     for i in range(batch_size):
         image_inputs, video_inputs, video_kwargs = process_vision_info(
-            messages[i], return_video_kwargs=True
+            messages[i], return_video_kwargs=True, return_video_metadata=True
         )
         arr_image_inputs.append(image_inputs)
         arr_video_inputs.append(video_inputs)
@@ -224,8 +226,8 @@ async def main(
 
     engine = AsyncLLMEngine.from_engine_args(engine_args)
     tokenizer = AutoTokenizer.from_pretrained(model_id)
-    inputs = generate_prompts_image(num_input_prompt, model_id)
-    # inputs = generate_prompts_video(num_input_prompt, model_id)
+    # inputs = generate_prompts_image(num_input_prompt, model_id)
+    inputs = generate_prompts_video(num_input_prompt, model_id)
     # inputs = generate_prompts_wo_processing(num_input_prompt, model_id)
 
     futures = []
@@ -244,8 +246,8 @@ async def main(
 
 
 def entry_point(
-    num_input_prompt: int = 1,
-    model_id: str = "/qwen2_5-vl-7b-32k-b4-kv16k",
+    num_input_prompt: int = 3,
+    model_id: str = "/home/eunji.lee/nas_data/0318_models/Qwen3-VL-2B-Instruct",
 ):
     asyncio.run(
         main(
