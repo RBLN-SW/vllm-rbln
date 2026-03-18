@@ -16,6 +16,7 @@ import torch
 import vllm.model_executor.layers.quantization.fp8 as upstream
 from torch.nn.parameter import Parameter
 from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.model_executor.kernels.linear import init_fp8_linear_kernel
 from vllm.model_executor.layers.fused_moe import (
     FusedMoE,
     FusedMoEMethodBase,
@@ -34,11 +35,15 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     process_fp8_weight_tensor_strategy,
     validate_fp8_block_shape,
 )
-from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    GroupShape,
+    kFp8DynamicTensorSym,
+    kFp8DynamicTokenSym,
+    kFp8StaticTensorSym,
+)
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
-    Fp8LinearOp,
     all_close_1d,
-    maybe_create_device_identity,
+    cutlass_fp8_supported,
     per_tensor_dequantize,
 )
 from vllm.model_executor.parameter import (
@@ -165,9 +170,19 @@ class Fp8LinearMethod(LinearMethodBase):
                 act_quant_group_shape=self.act_q_group_shape,
             )
         else:
-            self.fp8_linear = Fp8LinearOp(
-                act_quant_static=self.act_q_static,
-                act_quant_group_shape=self.act_q_group_shape,
+            # Use per-token quantization for better perf if dynamic and cutlass
+            if self.act_q_static:
+                activation_quant_key = kFp8StaticTensorSym
+            elif cutlass_fp8_supported():
+                activation_quant_key = kFp8DynamicTokenSym
+            else:
+                activation_quant_key = kFp8DynamicTensorSym
+
+            self.fp8_linear = init_fp8_linear_kernel(
+                activation_quant_key=activation_quant_key,
+                weight_quant_key=kFp8StaticTensorSym,
+                out_dtype=torch.get_default_dtype(),
+                module_name=self.__class__.__name__,
             )
 
     def create_weights(
@@ -180,8 +195,6 @@ class Fp8LinearMethod(LinearMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        maybe_create_device_identity()
-
         output_size_per_partition = sum(output_partition_sizes)
         weight_loader = extra_weight_attrs.get("weight_loader")
         layer.logical_widths = output_partition_sizes
@@ -797,9 +810,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
     def select_gemm_impl(
         self,
-        prepare_finalize: mk.FusedMoEPrepareAndFinalize,
+        prepare_finalize: mk.FusedMoEPrepareAndFinalizeModular,
         layer: torch.nn.Module,
-    ) -> mk.FusedMoEPermuteExpertsUnpermute:
+    ) -> mk.FusedMoEExpertsModular:
         # NOTE(RBLN): this is used only for "modular kernel"
         raise NotImplementedError()
 

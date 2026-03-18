@@ -568,8 +568,6 @@ class RBLNScheduler(Scheduler):
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
                     continue
 
-                self._update_connector_prefix_cache_stats(request)
-
                 self.running.append(request)
                 if self.log_stats:
                     request.record_event(

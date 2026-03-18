@@ -16,19 +16,22 @@
 import torch
 import torch.nn as nn
 import vllm.envs as envs
-from vllm.attention.backends.abstract import AttentionBackend, AttentionType
-from vllm.attention.backends.registry import AttentionBackendEnum
-from vllm.attention.layer import Attention, _init_kv_cache_quant
-from vllm.attention.selector import get_attn_backend
-from vllm.attention.utils.kv_sharing_utils import validate_kv_sharing_target
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.forward_context import ForwardContext, get_forward_context
+from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.attention.attention import (
+    _init_kv_cache_quant,
+    validate_kv_sharing_target,
+)
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
 from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+from vllm.v1.attention.backend import AttentionBackend, AttentionType
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.attention.selector import get_attn_backend
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 
 from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
@@ -81,6 +84,8 @@ def __custom_init__(
     self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
         kv_cache_dtype, vllm_config.model_config
     )
+    self.kv_cache_dtype = kv_cache_dtype
+    self.calculate_kv_scales = calculate_kv_scales
     if num_kv_heads is None:
         num_kv_heads = num_heads
     assert num_heads % num_kv_heads == 0, (
@@ -88,9 +93,9 @@ def __custom_init__(
     )
 
     # Initialize KV cache quantization attributes
-    _init_kv_cache_quant(
-        self, quant_config, prefix, kv_cache_dtype, calculate_kv_scales
-    )
+    _init_kv_cache_quant(self, quant_config, prefix)
+
+    self.quant_config = quant_config
 
     self.num_heads = num_heads
     self.head_size = head_size
@@ -169,7 +174,7 @@ def __custom_init__(
 
     # for attn backends supporting query quantization
     self.query_quant = None
-    if self.kv_cache_dtype.startswith("fp8") and self.impl.supports_quant_query_input():
+    if self.impl.supports_quant_query_input and self.kv_cache_dtype.startswith("fp8"):
         self.query_quant = QuantFP8(static=True, group_shape=GroupShape.PER_TENSOR)
 
     # NOTE(jiwoo.park) layer index is required to use external binding KV cache.
