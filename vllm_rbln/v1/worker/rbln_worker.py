@@ -270,6 +270,7 @@ class RBLNWorker(WorkerBase):
 
             if quantization == "fp8":
                 nbits_per_param = 8
+                packed_num_elems = 1
             elif quantization == "mxfp4":
                 if "ca" in device_name:
                     # ATOM DOES NOT support mxfp4 quantization, handled by bf16
@@ -285,13 +286,13 @@ class RBLNWorker(WorkerBase):
                     raise ValueError(
                         "invalid RBLN architecture, candidates = [ATOM(ca), REBEL(cr)]"
                     )
+                # pack 2 mxfp4 elems into single uint8 elem
+                packed_num_elems = 8 // 4
             else:
                 raise ValueError(
                     "invalid quantization scheme, candidates = [fp8, mxfp4]"
                 )
 
-            # pack 2 mxfp4 elems into single uint8 elem
-            packed_num_elems = 8 // 4
         else:
             nbits_per_param = 16
             packed_num_elems = 1
