@@ -17,15 +17,15 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
-from vllm.attention.backends.abstract import (
+from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionImpl,
+    AttentionMetadataBuilder,
     AttentionType,
 )
-from vllm.attention.backends.registry import AttentionBackendEnum, register_backend
-from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
 from vllm.v1.attention.backends.utils import (
-    AttentionMetadataBuilder,
     CommonAttentionMetadata,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec

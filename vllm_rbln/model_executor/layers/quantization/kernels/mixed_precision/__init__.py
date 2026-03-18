@@ -16,8 +16,8 @@
 # because the function we're patching is imported at that moment.
 
 import vllm.envs as envs
-import vllm.model_executor.layers.quantization.kernels.mixed_precision as mp
-from vllm.model_executor.layers.quantization.kernels.mixed_precision.MPLinearKernel import (  # noqa: E501
+import vllm.model_executor.kernels.linear as linear
+from vllm.model_executor.kernels.linear.mixed_precision import (  # noqa: E501
     MPLinearKernel,
     MPLinearLayerConfig,
 )
@@ -26,7 +26,7 @@ from vllm_rbln.model_executor.layers.quantization.kernels.mixed_precision.unpack
     RBLNInt8UnpackedLinearKernel,
 )
 
-choose_mp_linear_kernel_original = mp.choose_mp_linear_kernel
+choose_mp_linear_kernel_original = linear.choose_mp_linear_kernel
 
 _POSSIBLE_KERNELS: list[type[MPLinearKernel]] = [
     RBLNInt8UnpackedLinearKernel,
@@ -64,4 +64,4 @@ def choose_mp_linear_kernel_rbln(
     )
 
 
-mp.choose_mp_linear_kernel = choose_mp_linear_kernel_rbln
+linear.choose_mp_linear_kernel = choose_mp_linear_kernel_rbln
