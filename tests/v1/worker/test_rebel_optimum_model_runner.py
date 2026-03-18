@@ -69,10 +69,7 @@ def get_vllm_config(async_scheduling=False):
 
 
 @pytest.fixture
-def model_runner(monkeypatch):
-    monkeypatch.setattr(
-        "vllm_rbln.utils.optimum.configuration.DEFAULT_PREFILL_CHUNK_SIZE", 4
-    )
+def model_runner():
     vllm_config = get_vllm_config()
     with set_current_vllm_config(vllm_config, check_compile=False):
         temp_file = tempfile.mkstemp()[1]
