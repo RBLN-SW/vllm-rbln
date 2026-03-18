@@ -6,6 +6,7 @@ llm = LLM(
     max_model_len=2048,
     max_num_seqs=1,
     block_size=1024,
+    num_gpu_blocks_override=5,
     enable_chunked_prefill=True,
     max_num_batched_tokens=128,
 )
