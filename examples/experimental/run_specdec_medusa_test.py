@@ -24,8 +24,6 @@ os.environ["VLLM_RBLN_COMPILE_STRICT_MODE"] = "1"
 os.environ["VLLM_DISABLE_COMPILE_CACHE"] = "1"
 os.environ["VLLM_RBLN_ENABLE_WARM_UP"] = "1"
 os.environ["VLLM_RBLN_SAMPLER"] = "0"
-# vLLM(v0.10.2) bug: speculative decoding works only in multi-processing.
-# os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 
 import torch
 from huggingface_hub import hf_hub_download
