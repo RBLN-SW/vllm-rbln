@@ -94,7 +94,6 @@ from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.eagle import EagleProposer
-from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
@@ -122,6 +121,7 @@ from vllm_rbln.v1.attention.backends.flash_attention import (
 from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 from vllm_rbln.v1.sample import RBLNSampler
 from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
+from vllm_rbln.v1.spec_decoding.medusa import RBLNMedusaProposer
 from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
 from vllm_rbln.v1.worker.metrics import PerformanceTracker
 
@@ -326,7 +326,10 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # layers in the draft model.
         if self.speculative_config and get_pp_group().is_last_rank:
             self.drafter: (
-                NgramProposer | SuffixDecodingProposer | EagleProposer | MedusaProposer
+                NgramProposer
+                | SuffixDecodingProposer
+                | EagleProposer
+                | RBLNMedusaProposer
             )
             if self.speculative_config.method == "ngram":
                 self.drafter = NgramProposer(self.vllm_config)
@@ -339,9 +342,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         self.drafter.eagle3_use_aux_hidden_state
                     )
             elif self.speculative_config.method == "medusa":
-                self.drafter = MedusaProposer(
-                    vllm_config=self.vllm_config, device=self.device
-                )  # type: ignore
+                self.drafter = RBLNMedusaProposer(self.vllm_config, self.device)
             else:
                 raise ValueError(
                     "Unknown speculative decoding method: "
@@ -3025,26 +3026,23 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             draft_token_ids = self.drafter.propose(self.input_batch, sampled_token_ids)
         elif spec_config.method == "medusa":
             assert isinstance(sampled_token_ids, list)
-            assert isinstance(self.drafter, MedusaProposer)
+            assert isinstance(self.drafter, RBLNMedusaProposer)
 
-            if sample_hidden_states.shape[0] == len(sampled_token_ids):
-                # The input to the target model does not include draft tokens.
+            if spec_decode_metadata is None:
+                # prefill: hidden states are already per-request
                 hidden_states = sample_hidden_states
             else:
-                indices = []
-                offset = 0
-                assert spec_decode_metadata is not None, (
-                    "No spec decode metadata for medusa"
+                # decode with draft tokens:
+                # pick last accepted token's hidden state per request
+                batch_indices = torch.arange(
+                    sample_hidden_states.shape[0], device=sample_hidden_states.device
                 )
-                for num_draft, tokens in zip(
-                    spec_decode_metadata.num_draft_tokens,
-                    sampled_token_ids,
-                    strict=False,
-                ):
-                    indices.append(offset + len(tokens) - 1)
-                    offset += num_draft + 1
-                indices = torch.tensor(indices, device=self.device)
-                hidden_states = sample_hidden_states[indices]
+                indices = torch.tensor(
+                    [len(t) - 1 for t in sampled_token_ids],
+                    device=sample_hidden_states.device,
+                    dtype=torch.long,
+                )
+                hidden_states = sample_hidden_states[batch_indices, indices]
 
             hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
             draft_token_ids = self.drafter.propose(

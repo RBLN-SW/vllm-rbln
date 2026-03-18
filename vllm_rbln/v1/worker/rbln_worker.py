@@ -155,14 +155,15 @@ class RBLNWorker(WorkerBase):
         world_size = self.local_world_size
         env_var = current_platform.device_control_env_var
 
-        total_device_count = world_size * envs.VLLM_RBLN_TP_SIZE
+        rbln_tp_size = envs.VLLM_RBLN_TP_SIZE
+        total_device_count = world_size * rbln_tp_size
 
         if env_var not in os.environ:
             dev_begin = total_device_count * self.parallel_config.data_parallel_rank
             dev_end = dev_begin + total_device_count
             device_ids = [str(i) for i in range(dev_begin, dev_end)]
-            start_idx = self.local_rank * envs.VLLM_RBLN_TP_SIZE
-            end_idx = start_idx + envs.VLLM_RBLN_TP_SIZE
+            start_idx = self.local_rank * rbln_tp_size
+            end_idx = start_idx + rbln_tp_size
             selected_devices = ",".join(device_ids[start_idx:end_idx])
         else:
             device_ids = os.environ[env_var].split(",")
@@ -171,8 +172,8 @@ class RBLNWorker(WorkerBase):
             )
             try:
                 device_id = int(device_ids[self.local_rank])
-                start_idx = device_id * envs.VLLM_RBLN_TP_SIZE
-                end_idx = start_idx + envs.VLLM_RBLN_TP_SIZE
+                start_idx = device_id * rbln_tp_size
+                end_idx = start_idx + rbln_tp_size
                 device_ids = [str(i) for i in range(start_idx, end_idx)]
                 selected_devices = ",".join(device_ids)
             except ValueError as e:
@@ -186,6 +187,9 @@ class RBLNWorker(WorkerBase):
             self.local_rank,
             selected_devices,
         )
+
+        if has_torch_rbln and rbln_tp_size > 1:
+            os.environ["RBLN_NPUS_PER_DEVICE"] = str(rbln_tp_size)
 
     def init_device(self) -> None:
         set_cpu_affinity(
