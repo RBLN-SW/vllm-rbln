@@ -247,7 +247,8 @@ async def main(
 
 def entry_point(
     num_input_prompt: int = 3,
-    model_id: str = "/home/eunji.lee/nas_data/0318_models/Qwen3-VL-2B-Instruct",
+    # NOTE: This example supports Qwen2-VL, Qwen2.5-VL, and Qwen3-VL.
+    model_id: str = "/qwen2_5-vl-7b-32k-b4-kv16k",
 ):
     asyncio.run(
         main(
