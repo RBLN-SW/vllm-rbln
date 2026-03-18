@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections.abc import Iterable
+import typing
+from collections.abc import Callable, Iterable
 
 import torch
 from vllm.logger import init_logger
@@ -22,6 +23,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from vllm.model_executor.models import (
+    AXK1,
     deepseek_v2,
     llama,
     llama4,
@@ -31,6 +33,10 @@ from vllm.model_executor.models import (
     qwen3_moe,
     utils,
 )
+from vllm.model_executor.models.deepseek_v2 import get_spec_layer_idx_from_weight_name
+from vllm.model_executor.models.utils import is_pp_missing_parameter
+
+from vllm_rbln.model_executor.layers.fused_moe.shared_fused_moe import SharedFusedMoE
 
 logger = init_logger(__name__)
 
@@ -411,11 +417,6 @@ def load_qwen2moe_weights(
 def load_deepseek_v2_weights(
     self, weights: Iterable[tuple[str, torch.Tensor]]
 ) -> set[str]:
-    from vllm_rbln.model_executor.layers.fused_moe.shared_fused_moe import SharedFusedMoE
-    from vllm.model_executor.models.utils import is_pp_missing_parameter
-    from vllm.model_executor.models.deepseek_v2 import get_spec_layer_idx_from_weight_name
-    import typing
-    from typing import Callable
 
     stacked_params_mapping = [
         # (param_name, shard_name, shard_id)
@@ -456,7 +457,6 @@ def load_deepseek_v2_weights(
         if spec_layer is not None:
             continue  # skip spec decode layers for main model
 
-
         for param_name, weight_name, shard_id in stacked_params_mapping:
             # Skip non-stacked layers and experts (experts handled below).
             if weight_name not in name:
@@ -475,9 +475,7 @@ def load_deepseek_v2_weights(
             # QKV fusion is optional, fall back to normal
             # weight loading if it's not enabled
             # if go with fusion option, then update name
-            if (
-                param_name == "fused_qkv_a_proj"
-            ) and name_mapped not in params_dict:
+            if (param_name == "fused_qkv_a_proj") and name_mapped not in params_dict:
                 continue
             else:
                 name = name_mapped
@@ -749,6 +747,166 @@ def load_minimax_m2_weights(
     return loaded_params
 
 
+def load_AXK1_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+    stacked_params_mapping = [
+        # (param_name, shard_name, shard_id)
+        ("gate_up_proj", "gate_proj", 0),
+        ("gate_up_proj", "up_proj", 1),
+    ]
+    mla_params_mapping = [
+        ("fused_qkv_a_proj", "q_a_proj", 0),
+        ("fused_qkv_a_proj", "kv_a_proj_with_mqa", 1),
+    ]
+    mha_params_mapping = [
+        ("qkv_proj", "q_proj", "q"),
+        ("qkv_proj", "k_proj", "k"),
+        ("qkv_proj", "v_proj", "v"),
+    ]
+
+    if self.use_mha:
+        stacked_params_mapping.extend(mha_params_mapping)
+    else:
+        stacked_params_mapping.extend(mla_params_mapping)
+
+    # Params for weights, fp8 weight scales, fp8 activation scales
+    # (param_name, weight_name, expert_id, shard_id)
+    expert_params_mapping = SharedFusedMoE.make_expert_params_mapping(
+        ckpt_gate_proj_name="gate_proj",
+        ckpt_down_proj_name="down_proj",
+        ckpt_up_proj_name="up_proj",
+        num_experts=self.config.n_routed_experts,
+        num_redundant_experts=self.num_redundant_experts,
+    )
+
+    params_dict = dict(self.named_parameters())
+    loaded_params: set[str] = set()
+    for name, loaded_weight in weights:
+        if name.startswith("layers"):
+            layer_idx = int(name.split(".")[1])
+            if layer_idx >= 2:
+                continue
+
+        if "rotary_emb.inv_freq" in name:
+            continue
+
+        spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
+        if spec_layer is not None:
+            continue  # skip spec decode layers for main model
+
+        for param_name, weight_name, shard_id in stacked_params_mapping:
+            # Skip non-stacked layers and experts (experts handled below).
+            if weight_name not in name:
+                continue
+            # We have mlp.experts[0].gate_proj in the checkpoint.
+            # Since we handle the experts below in expert_params_mapping,
+            # we need to skip here BEFORE we update the name, otherwise
+            # name will be updated to mlp.experts[0].gate_up_proj, which
+            # will then be updated below in expert_params_mapping
+            # for mlp.experts[0].gate_gate_up_proj, which breaks load.
+            if ("mlp.experts." in name) and name not in params_dict:
+                continue
+            name_mapped = name.replace(weight_name, param_name)
+
+            # QKV fusion is optional, fall back to normal
+            # weight loading if it's not enabled
+            # if go with fusion option, then update name
+            if (param_name == "fused_qkv_a_proj") and name_mapped not in params_dict:
+                continue
+            else:
+                name = name_mapped
+            # Skip loading extra bias for GPTQ models.
+            if name.endswith(".bias") and name not in params_dict:
+                continue
+
+            if is_pp_missing_parameter(name, self):
+                continue
+
+            param = params_dict[name]
+            weight_loader = param.weight_loader
+            weight_loader(param, loaded_weight, shard_id)
+            break
+        else:
+            is_expert_weight = False
+
+            # Special handling: when AITER fusion_shared_experts is enabled,
+            # checkpoints may provide a single widened shared_experts tensor
+            # without explicit expert indices
+            # (e.g. ...mlp.shared_experts.gate_proj.weight).
+            # For models with multiple shared experts, split that tensor
+            # evenly into per-shared-expert slices and load them into
+            # appended expert slots mlp.experts.{n_routed_experts + j}.*
+            # accordingly.
+            num_chunks = 1
+            for j in range(num_chunks):
+                chunk_name = name
+                weight_to_load = loaded_weight
+
+                # Use expert_params_mapping to locate the destination
+                # param and delegate to its expert-aware weight_loader
+                # with expert_id.
+                for mapping in expert_params_mapping:
+                    param_name, weight_name, expert_id, shard_id = mapping
+                    if weight_name not in chunk_name:
+                        continue
+
+                    # Anyway, this is an expert weight and should not be
+                    # attempted to load as other weights later
+                    is_expert_weight = True
+
+                    # Do not modify `name` since the loop may continue here
+                    # Instead, create a new variable
+                    name_mapped = chunk_name.replace(weight_name, param_name)
+
+                    if is_pp_missing_parameter(name_mapped, self):
+                        continue
+
+                    param = params_dict[name_mapped]
+                    # We should ask the weight loader to return success or
+                    # not here since otherwise we may skip experts with
+                    # other available replicas.
+                    weight_loader = typing.cast(
+                        Callable[..., bool], param.weight_loader
+                    )
+                    success = weight_loader(
+                        param,
+                        weight_to_load,
+                        name_mapped,
+                        shard_id=shard_id,
+                        expert_id=expert_id,
+                        return_success=True,
+                    )
+                    if success:
+                        name = name_mapped
+                        break
+                else:
+                    if is_expert_weight:
+                        # We've checked that this is an expert weight
+                        # However it's not mapped locally to this rank
+                        # So we simply skip it
+                        continue
+
+                    # Skip loading extra bias for GPTQ models.
+                    if name.endswith(".bias") and name not in params_dict:
+                        continue
+
+                    # Remapping the name of FP8 kv-scale.
+                    name = maybe_remap_kv_scale_name(name, params_dict)
+                    if name is None:
+                        continue
+
+                    if is_pp_missing_parameter(name, self):
+                        continue
+
+                    param = params_dict[name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
+        loaded_params.add(name)
+
+    return loaded_params
+
+
 llama.LlamaModel.load_weights = load_llama_weights
 llama4.Llama4Model.load_weights = load_llama4_weights
 
@@ -756,4 +914,5 @@ qwen2.Qwen2Model.load_weights = load_qwen2_weights
 qwen2_moe.Qwen2MoeModel.load_weights = load_qwen2moe_weights
 qwen3_moe.Qwen3MoeModel.load_weights = load_qwen3moe_weights
 deepseek_v2.DeepseekV2ForCausalLM.load_weights = load_deepseek_v2_weights
+AXK1.AXK1ForCausalLM.load_weights = load_AXK1_weights
 minimax_m2.MiniMaxM2Model.load_weights = load_minimax_m2_weights

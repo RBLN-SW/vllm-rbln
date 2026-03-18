@@ -19,6 +19,10 @@ from vllm.model_executor.layers.rotary_embedding.deepseek_scaling_rope import (
     DeepseekScalingRotaryEmbedding,
 )
 
+import logging
+
+log = logging.getLogger("torch._dynamo")
+
 
 def deepseek_scaling_rope_forward(
     self,
@@ -63,4 +67,4 @@ def deepseek_scaling_rope_forward(
     return query, key
 
 
-DeepseekScalingRotaryEmbedding.forward = deepseek_scaling_rope_forward
+DeepseekScalingRotaryEmbedding.forward_oot = deepseek_scaling_rope_forward
