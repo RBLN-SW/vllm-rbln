@@ -14,6 +14,7 @@
 
 import os
 import shutil
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -28,3 +29,9 @@ def fresh_inductor_cache_per_test(monkeypatch):
     torch._dynamo.reset()
 
     yield
+
+
+@pytest.fixture(autouse=True)
+def skip_prepare_compile():
+    with patch("vllm_rbln.utils.optimum.configuration.prepare_vllm_for_compile"):
+        yield

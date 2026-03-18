@@ -104,6 +104,11 @@ def prepare_vllm_for_compile(vllm_config: VllmConfig) -> None:
             vllm_config.cache_config.block_size = 4096
         else:
             vllm_config.cache_config.block_size = vllm_config.model_config.max_model_len
+    else:
+        if is_multi_modal(hf_config) or is_generation_arch(hf_config):
+            assert vllm_config.cache_config.block_size >= 4096, (
+                "block_size must be at least 4096 for compilation"
+            )
 
     # Set block_size in cache_config to compile model internally.
     sync_cache_block_size(
