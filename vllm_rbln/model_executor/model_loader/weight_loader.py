@@ -783,7 +783,7 @@ def load_AXK1_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[
     for name, loaded_weight in weights:
         if name.startswith("layers"):
             layer_idx = int(name.split(".")[1])
-            if layer_idx >= 2:
+            if layer_idx >= self.config.num_hidden_layers:
                 continue
 
         if "rotary_emb.inv_freq" in name:

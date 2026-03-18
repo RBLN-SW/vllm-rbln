@@ -56,23 +56,23 @@ def __AXK1_attention_forward(
         q = self.q_proj(hidden_states)[0].view(
             -1, self.num_local_heads, self.qk_head_dim
         )
-    q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1) # torch.size([128, 16, 128]), torch.size([128, 16, 192])
+    q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1) # torch.size([128, 16, 128]), torch.size([128, 16, 64])
     latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0] # torch.size([1, 128, 576])
     
     #rbln_fix: remove the first dimension of latent_cache
     latent_cache = latent_cache.squeeze(0)
     
     kv_a, _ = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1) # torch.Size([1, 128, 512])
-    latent_cache = latent_cache.unsqueeze(1) # torch.size([1, 1, 128, 576])
+    latent_cache = latent_cache.unsqueeze(1) # torch.size([128, 1, 576])
     kv_a = self.kv_a_layernorm(kv_a)
     kv = self.kv_b_proj(kv_a)[0] # torch.size([1,128, 4096])
     kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
     k_nope, v = kv.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-    k_pe = latent_cache[:, :, self.kv_lora_rank :]
+    k_pe = latent_cache[:, :, self.kv_lora_rank :] # torch.size([128, 1, 64])
     q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
         
-    q = torch.cat([q_nope, q_pe], dim=-1)
-    k = torch.cat([k_nope, k_pe.repeat(1, self.num_local_heads, 1)], dim=-1)
+    q = torch.cat([q_nope, q_pe], dim=-1) # torch.size([128, 16, 192])
+    k = torch.cat([k_nope, k_pe.repeat(1, self.num_local_heads, 1)], dim=-1) # torch.size([128, 16, 192])
     
     # Apply llama 4 scaling if provided
     if llama_4_scaling is not None:
