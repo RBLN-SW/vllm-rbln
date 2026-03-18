@@ -17,6 +17,7 @@ import time
 from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
+from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler
@@ -59,11 +60,12 @@ def undo_uncomputed_block_caching(
 
 class RBLNScheduler(Scheduler):
     def schedule(self) -> SchedulerOutput:
-        # Copied from vllm.v1.core.sched.Scheduler.schedule: https://github.com/vllm-project/vllm/blob/v0.13.0/vllm/v1/core/sched/scheduler.py#L216-L757
+        # Copied from vllm.v1.core.sched.Scheduler.schedule: https://github.com/vllm-project/vllm/blob/v0.17.1/vllm/v1/core/sched/scheduler.py#L317-L912
         # The only differences are:
         # - Disable mixed batching
         # - Limit prefill batch size to 1
         # - Limit decode batch size to (max_num_seqs // pipeline_parallel_size)
+        # - Do not schedule spec tokens when they are across block boundaries
         # Search for NOTE(RBLN) for details
 
         # NOTE(woosuk) on the scheduling algorithm:
@@ -85,6 +87,10 @@ class RBLNScheduler(Scheduler):
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
         token_budget = self.max_num_scheduled_tokens
+        if self._pause_state == PauseState.PAUSED_ALL:
+            # Do not schedule any requests when paused.
+            token_budget = 0
+
         # Encoder-related.
         scheduled_encoder_inputs: dict[str, list[int]] = {}
         encoder_compute_budget = self.max_num_encoder_input_tokens
@@ -94,16 +100,8 @@ class RBLNScheduler(Scheduler):
         # For logging.
         scheduled_timestamp = time.monotonic()
 
-        # First, schedule the RUNNING requests.
-        # NOTE(RBLN): Prioritize prefill requests.
-        # Given our constraint that the prefill batch size fixed to 1
-        # if any prefill request is running,
-        # there must be exactly one at the end of the list.
-        req_index = (
-            len(self.running) - 1
-            if self.running and is_prefill(self.running[-1])
-            else 0
-        )
+        self.kv_cache_manager.new_step_starts()
+
         # NOTE(RBLN): spec_decode_cap prevents block boundary crossing caused by
         # runner-side padding. The runner pads all requests in the batch to the
         # maximum scheduled token length (max_spec_decode_len). If any request
@@ -112,6 +110,16 @@ class RBLNScheduler(Scheduler):
         # spec_decode_cap propagates the tightest remaining_in_block constraint
         # to all subsequent requests so no request exceeds it.
         spec_decode_cap = self.block_size
+
+        # First, schedule the RUNNING requests.
+        # NOTE(RBLN): Prioritize prefill requests. Given our constraint that the prefill
+        # batch size fixed to 1 if any prefill request is running there must be exactly
+        # one at the end of the list.
+        req_index = (
+            len(self.running) - 1
+            if self.running and is_prefill(self.running[-1])
+            else 0
+        )
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
 
@@ -164,6 +172,11 @@ class RBLNScheduler(Scheduler):
                     shift_computed_tokens=1 if self.use_eagle else 0,
                 )
 
+            if self.need_mamba_block_aligned_split:
+                num_new_tokens = self._mamba_block_aligned_split(
+                    request, num_new_tokens
+                )
+
             if num_new_tokens == 0:
                 # The request cannot be scheduled because one of the following
                 # reasons:
@@ -174,6 +187,8 @@ class RBLNScheduler(Scheduler):
                 #    its max_total_tokens or max_model_len.
                 # 2. The encoder budget is exhausted.
                 # 3. The encoder cache is exhausted.
+                # 4. Insufficient budget for a block-aligned chunk in hybrid
+                #    models with mamba cache mode \"align\".
                 # NOTE(woosuk): Here, by doing `continue` instead of `break`,
                 # we do not strictly follow the FCFS scheduling policy and
                 # allow the lower-priority requests to be scheduled.
@@ -202,17 +217,13 @@ class RBLNScheduler(Scheduler):
                         )
                         self.running.remove(preempted_req)
                         if preempted_req in scheduled_running_reqs:
+                            preempted_req_id = preempted_req.request_id
                             scheduled_running_reqs.remove(preempted_req)
-                            token_budget += num_scheduled_tokens[
-                                preempted_req.request_id
-                            ]
-                            req_to_new_blocks.pop(preempted_req.request_id)
-                            num_scheduled_tokens.pop(preempted_req.request_id)
-                            scheduled_spec_decode_tokens.pop(
-                                preempted_req.request_id, None
-                            )
+                            token_budget += num_scheduled_tokens.pop(preempted_req_id)
+                            req_to_new_blocks.pop(preempted_req_id)
+                            scheduled_spec_decode_tokens.pop(preempted_req_id, None)
                             preempted_encoder_inputs = scheduled_encoder_inputs.pop(
-                                preempted_req.request_id, None
+                                preempted_req_id, None
                             )
                             if preempted_encoder_inputs:
                                 # Restore encoder compute budget if the preempted
@@ -238,10 +249,29 @@ class RBLNScheduler(Scheduler):
 
             # Schedule the request.
             scheduled_running_reqs.append(request)
-            req_to_new_blocks[request.request_id] = new_blocks
-            num_scheduled_tokens[request.request_id] = num_new_tokens
+            request_id = request.request_id
+            req_to_new_blocks[request_id] = new_blocks
+            num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
             req_index += 1
+
+            # Speculative decode related.
+            if request.spec_token_ids:
+                num_scheduled_spec_tokens = (
+                    num_new_tokens
+                    + request.num_computed_tokens
+                    - request.num_tokens
+                    - request.num_output_placeholders
+                )
+                if num_scheduled_spec_tokens > 0:
+                    spec_token_ids = request.spec_token_ids
+                    if len(spec_token_ids) > num_scheduled_spec_tokens:
+                        spec_token_ids = spec_token_ids[:num_scheduled_spec_tokens]
+                    scheduled_spec_decode_tokens[request.request_id] = spec_token_ids
+
+                # New spec tokens will be set in `update_draft_token_ids` before the
+                # next step when applicable.
+                request.spec_token_ids = []
 
             # NOTE(RBLN): Update spec_decode_cap with the tightest constraint
             # for this request: remaining space in the current block and remaining
@@ -258,29 +288,9 @@ class RBLNScheduler(Scheduler):
                     remaining_in_block, remaining_in_maxlen, spec_decode_cap
                 )
 
-            # Speculative decode related.
-            if request.spec_token_ids:
-                num_scheduled_spec_tokens = (
-                    num_new_tokens
-                    + request.num_computed_tokens
-                    - request.num_tokens
-                    - request.num_output_placeholders
-                )
-                if num_scheduled_spec_tokens > 0:
-                    # Trim spec_token_ids list to num_scheduled_spec_tokens.
-                    del request.spec_token_ids[num_scheduled_spec_tokens:]
-                    scheduled_spec_decode_tokens[request.request_id] = (
-                        request.spec_token_ids
-                    )
-                # New spec tokens will be set in `update_draft_token_ids` before the
-                # next step when applicable.
-                request.spec_token_ids = []
-
             # Encoder-related.
             if encoder_inputs_to_schedule:
-                scheduled_encoder_inputs[request.request_id] = (
-                    encoder_inputs_to_schedule
-                )
+                scheduled_encoder_inputs[request_id] = encoder_inputs_to_schedule
                 # Allocate the encoder cache.
                 for i in encoder_inputs_to_schedule:
                     self.encoder_cache_manager.allocate(request, i)
@@ -312,9 +322,7 @@ class RBLNScheduler(Scheduler):
                 # they are not reused incorrectly; the blocks remain allocated
                 # and will be reused when this request needs them in a future step.
                 undo_uncomputed_block_caching(
-                    req,
-                    self.kv_cache_manager,
-                    req.num_computed_tokens + new_n,
+                    req, self.kv_cache_manager, req.num_computed_tokens + new_n
                 )
 
                 token_budget += old_n - new_n
@@ -345,34 +353,43 @@ class RBLNScheduler(Scheduler):
             )
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
-        # Use a temporary RequestQueue to collect requests that need to be
-        # skipped and put back at the head of the waiting queue later
-        skipped_waiting_requests = create_request_queue(self.policy)
-
         # Next, schedule the WAITING requests.
-        # NOTE(RBLN): We do not attempt to schedule a new prefill request
-        # when a running prefill request is already scheduled.
-        if not preempted_reqs and not (
-            scheduled_running_reqs and is_prefill(scheduled_running_reqs[0])
+        # NOTE(RBLN): We do not attempt to schedule a new prefill request when a running
+        # prefill request is already scheduled.
+        if (
+            not preempted_reqs
+            and self._pause_state == PauseState.UNPAUSED
+            and not (scheduled_running_reqs and is_prefill(scheduled_running_reqs[0]))
         ):
-            # NOTE(RBLN): refresh the token budget to determine whether we
-            # can schedule new prefill requests into the running batch.
+            # NOTE(RBLN): refresh the token budget to determine whether we can schedule
+            # new prefill requests into the running batch.
             prefill_token_budget = self.max_num_scheduled_tokens
+
+            # Use a temporary RequestQueue to collect requests that need to be
+            # skipped and put back at the head of the waiting queue later
+            skipped_waiting_requests = create_request_queue(self.policy)
+
             while self.waiting and prefill_token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
                     break
 
                 request = self.waiting.peek_request()
+                request_id = request.request_id
 
                 # KVTransfer: skip request if still waiting for remote kvs.
                 if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                     is_ready = self._update_waiting_for_remote_kv(request)
                     if is_ready:
-                        request.status = RequestStatus.WAITING
+                        if request.num_preemptions:
+                            # We must be loading for a resumed preemption
+                            # rather than a new request.
+                            request.status = RequestStatus.PREEMPTED
+                        else:
+                            request.status = RequestStatus.WAITING
                     else:
                         logger.debug(
                             "%s is still in WAITING_FOR_REMOTE_KVS state.",
-                            request.request_id,
+                            request_id,
                         )
                         self.waiting.pop_request()
                         skipped_waiting_requests.prepend_request(request)
@@ -388,6 +405,13 @@ class RBLNScheduler(Scheduler):
                         self.waiting.pop_request()
                         skipped_waiting_requests.prepend_request(request)
                         continue
+
+                # Streaming: skip request if still waiting for next streaming req.
+                if request.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
+                    assert not request.streaming_queue
+                    self.waiting.pop_request()
+                    skipped_waiting_requests.prepend_request(request)
+                    continue
 
                 # Check that adding the request still respects the max_loras
                 # constraint.
@@ -406,6 +430,7 @@ class RBLNScheduler(Scheduler):
 
                 num_external_computed_tokens = 0
                 load_kv_async = False
+                connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
 
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
@@ -432,6 +457,11 @@ class RBLNScheduler(Scheduler):
 
                         request.num_external_computed_tokens = ext_tokens
                         num_external_computed_tokens = ext_tokens
+
+                        connector_prefix_cache_queries = (
+                            request.num_tokens - num_new_local_computed_tokens
+                        )
+                        connector_prefix_cache_hits = num_external_computed_tokens
 
                     # Total computed tokens (local + external).
                     num_computed_tokens = (
@@ -466,13 +496,13 @@ class RBLNScheduler(Scheduler):
                     # pooling requests to be chunked
                     if (
                         not self.scheduler_config.enable_chunked_prefill
-                        and num_new_tokens > prefill_token_budget
+                        and num_new_tokens > token_budget
                     ):
                         # If chunked_prefill is disabled,
                         # we can stop the scheduling here.
                         break
 
-                    num_new_tokens = min(num_new_tokens, prefill_token_budget)
+                    num_new_tokens = min(num_new_tokens, token_budget)
                     assert num_new_tokens > 0
 
                     # Schedule encoder inputs.
@@ -493,6 +523,16 @@ class RBLNScheduler(Scheduler):
                             # The request cannot be scheduled.
                             break
 
+                if self.need_mamba_block_aligned_split:
+                    num_new_tokens = self._mamba_block_aligned_split(
+                        request,
+                        num_new_tokens,
+                        num_new_local_computed_tokens,
+                        num_external_computed_tokens,
+                    )
+                    if num_new_tokens == 0:
+                        break
+
                 # Handles an edge case when P/D Disaggregation
                 # is used with Spec Decoding where an
                 # extra block gets allocated which
@@ -503,46 +543,49 @@ class RBLNScheduler(Scheduler):
                 )
 
                 # Determine if we need to allocate cross-attention blocks.
-                if self.is_encoder_decoder and request.has_encoder_inputs:
-                    # TODO(russellb): For Whisper, we know that the input is
-                    # always padded to the maximum length. If we support other
-                    # encoder-decoder models, this will need to be updated if we
-                    # want to only allocate what is needed.
-                    num_encoder_tokens = (
-                        self.scheduler_config.max_num_encoder_input_tokens
+                num_encoder_tokens = 0
+                if (
+                    self.is_encoder_decoder
+                    and request.has_encoder_inputs
+                    and encoder_inputs_to_schedule
+                ):
+                    num_encoder_tokens = sum(
+                        request.get_num_encoder_embeds(i)
+                        for i in encoder_inputs_to_schedule
                     )
-                else:
-                    num_encoder_tokens = 0
 
-                # NOTE(RBLN): Even when chunked prefill is enabled,
-                # we should schedule a new prefill request only if there is
-                # enough KV cache space to accommodate the full token count.
-                # Therefore, we allocate based on
-                # request.num_tokens - num_computed_tokens,
-                # not num_new_tokens + num_external_computed_tokens.
+                # NOTE(RBLN): Even when chunked prefill is enabled, we should schedule
+                # a new prefill request only if there is enough KV cache space to
+                # accommodate the full token count. Therefore, we allocate based on
+                # request.num_tokens - num_computed_tokens, not num_new_tokens.
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
                     request.num_tokens - num_computed_tokens,
-                    num_new_local_computed_tokens,
-                    new_computed_blocks,
+                    num_new_computed_tokens=num_new_local_computed_tokens,
+                    new_computed_blocks=new_computed_blocks,
                     num_lookahead_tokens=effective_lookahead_tokens,
+                    num_external_computed_tokens=num_external_computed_tokens,
                     delay_cache_blocks=load_kv_async,
                     num_encoder_tokens=num_encoder_tokens,
                 )
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
+
+                    # NOTE: we need to untouch the request from the encode cache
+                    # manager
+                    if request.has_encoder_inputs:
+                        self.encoder_cache_manager.free(request)
                     break
 
-                # NOTE(RBLN): By calling allocate_slots with request.num_tokens
-                # instead of (num_new_tokens + num_external_computed_tokens),
-                # we pre-allocate slots for all tokens that this request will
-                # prefill. If allocated slots end up filling a block, the
-                # block hash would also would be written down.
-                # However, since this iteration may not actually compute all
-                # tokens, the block may not be fully computed.
-                # Therefore, if the block is not finalized in this iteration,
-                # we must clear the block hash and undo block caching.
+                # NOTE(RBLN): By calling allocate_slots with
+                # request.num_tokens - num_computed_tokens instead of num_new_tokens,
+                # we pre-allocate slots for all tokens that this request will prefill.
+                # If allocated slots end up filling a block, the block hash would also
+                # would be written down. However, since this iteration may not actually
+                # compute all tokens, the block may not be fully computed. Therefore,
+                # if the block is not finalized in this iteration, we must clear the
+                # block hash and undo block caching.
                 undo_uncomputed_block_caching(
                     request, self.kv_cache_manager, num_computed_tokens + num_new_tokens
                 )
@@ -554,9 +597,18 @@ class RBLNScheduler(Scheduler):
                 if self.connector is not None:
                     self.connector.update_state_after_alloc(
                         request,
-                        new_computed_blocks + new_blocks,
+                        self.kv_cache_manager.get_blocks(request_id),
                         num_external_computed_tokens,
                     )
+                    if (
+                        self.connector_prefix_cache_stats is not None
+                        and connector_prefix_cache_queries != 0
+                    ):
+                        self.connector_prefix_cache_stats.record(
+                            num_tokens=connector_prefix_cache_queries,
+                            num_hits=connector_prefix_cache_hits,
+                            preempted=request.num_preemptions > 0,
+                        )
 
                 # Request was already popped from self.waiting
                 # unless it was re-added above due to new_blocks being None.
@@ -582,10 +634,10 @@ class RBLNScheduler(Scheduler):
 
                 if self.lora_config and request.lora_request:
                     scheduled_loras.add(request.lora_request.lora_int_id)
-                req_to_new_blocks[request.request_id] = (
-                    self.kv_cache_manager.get_blocks(request.request_id)
+                req_to_new_blocks[request_id] = self.kv_cache_manager.get_blocks(
+                    request_id
                 )
-                num_scheduled_tokens[request.request_id] = num_new_tokens
+                num_scheduled_tokens[request_id] = num_new_tokens
                 prefill_token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
@@ -594,9 +646,7 @@ class RBLNScheduler(Scheduler):
                     request.num_cached_tokens = num_computed_tokens
                 # Encoder-related.
                 if encoder_inputs_to_schedule:
-                    scheduled_encoder_inputs[request.request_id] = (
-                        encoder_inputs_to_schedule
-                    )
+                    scheduled_encoder_inputs[request_id] = encoder_inputs_to_schedule
                     # Allocate the encoder cache.
                     for i in encoder_inputs_to_schedule:
                         self.encoder_cache_manager.allocate(request, i)
@@ -608,23 +658,19 @@ class RBLNScheduler(Scheduler):
                         if self.ec_connector is not None:
                             self.ec_connector.update_state_after_alloc(request, i)
 
-                # NOTE(RBLN): Reaching this point means that this request
-                # can now be added to the running batch.
-                # However, since we do not support mixed batching for now,
-                # we remove all currently scheduled running requests
-                # from the scheduler output and run only this prefill request
-                # for the current step.
-                # In the next step (or after this request’s prefill completes
-                # if it cannot finish within a single step),
-                # this request will be scheduled together with the other
-                # running requests in the decoding phase.
-                # We also clear the block hash written in previous
-                # allocate_slots and undo block caching because this request
-                # and its tokens will be scheduled again, and allocate_slots
-                # will be invoked once more and the logic that writes the
-                # block hash will run again.
-                # Without clearing it here, an assertion error would occur
-                # because a block hash would already exist.
+                # NOTE(RBLN): Reaching this point means that this request can now be
+                # added to the running batch. However, since we do not support mixed
+                # batching for now, we remove all currently scheduled running requests
+                # from the scheduler output and run only this prefill request for the
+                # current step. In the next step (or after this request’s prefill
+                # completes if it cannot finish within a single step) this request will
+                # be scheduled together with the other running requests in the decoding
+                # phase. We also clear the block hash written in previous allocate_slots
+                # and undo block caching because this request and its tokens will be
+                # scheduled again, and allocate_slots will be invoked once more and the
+                # logic that writes the block hash will run again. Without clearing it
+                # here, an assertion error would occur because a block hash would
+                # already exist.
                 for req in scheduled_running_reqs:
                     req_to_new_blocks.pop(req.request_id)
                     num_scheduled_tokens.pop(req.request_id)
@@ -640,9 +686,9 @@ class RBLNScheduler(Scheduler):
                 # NOTE(RBLN): we restrict the prefill batch size to 1 for now.
                 break
 
-        # Put back any skipped requests at the head of the waiting queue
-        if skipped_waiting_requests:
-            self.waiting.prepend_requests(skipped_waiting_requests)
+            # Put back any skipped requests at the head of the waiting queue
+            if skipped_waiting_requests:
+                self.waiting.prepend_requests(skipped_waiting_requests)
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
@@ -662,11 +708,9 @@ class RBLNScheduler(Scheduler):
         num_common_prefix_blocks = [0] * len(self.kv_cache_config.kv_cache_groups)
         with record_function_or_nullcontext("schedule: get_num_common_prefix_blocks"):
             if self.running:
-                any_request = self.running[0]
+                any_request_id = self.running[0].request_id
                 num_common_prefix_blocks = (
-                    self.kv_cache_manager.get_num_common_prefix_blocks(
-                        any_request.request_id
-                    )
+                    self.kv_cache_manager.get_num_common_prefix_blocks(any_request_id)
                 )
 
         # Construct the scheduler output.
@@ -702,6 +746,12 @@ class RBLNScheduler(Scheduler):
         self.prev_step_scheduled_req_ids.clear()
         self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
 
+        new_block_ids_to_zero = (
+            (self.kv_cache_manager.take_new_block_ids() or None)
+            if self.needs_kv_cache_zeroing
+            else None
+        )
+
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
@@ -717,6 +767,7 @@ class RBLNScheduler(Scheduler):
             # the previous and the current steps.
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
+            new_block_ids_to_zero=new_block_ids_to_zero,
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
