@@ -16,12 +16,12 @@ import os
 from typing import TYPE_CHECKING
 
 import torch
-from vllm.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 if TYPE_CHECKING:
-    from vllm.attention.selector import AttentionSelectorConfig
     from vllm.config import VllmConfig
     from vllm.utils.argparse_utils import FlexibleArgumentParser
+    from vllm.v1.attention.selector import AttentionSelectorConfig
 else:
     VllmConfig = None
 
@@ -155,6 +155,10 @@ class RblnPlatform(Platform):
         model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
         scheduler_config = vllm_config.scheduler_config
+
+        if scheduler_config.async_scheduling:
+            scheduler_config.async_scheduling = False
+            logger.warning("Async scheduler not supported on RBLN.")
 
         if envs.VLLM_RBLN_USE_VLLM_MODEL:
             cls.validate_and_setup_prerequisite(vllm_config)
@@ -291,6 +295,7 @@ class RblnPlatform(Platform):
         cls,
         selected_backend: "AttentionBackendEnum",
         attn_selector_config: "AttentionSelectorConfig",
+        num_heads: int | None = None,
     ) -> str:
         if selected_backend and selected_backend != AttentionBackendEnum.FLASH_ATTN:
             logger.info("Cannot use %s backend on RBLN.", selected_backend)
