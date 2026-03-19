@@ -419,3 +419,14 @@ class RBLNOptimumQwen3VLForConditionalGeneration(
             video_grid_thw=video_grid_thw,
             second_per_grid_ts=second_per_grid_ts,
         )
+
+
+class RBLNOptimumQwen3VLMoeForConditionalGeneration(
+    RBLNOptimumQwen3VLForConditionalGeneration
+):
+    """
+    Qwen3-VL MoE variant shares the same input structure as Qwen3-VL,
+    so it inherits from RBLNOptimumQwen3VLForConditionalGeneration without changes.
+    """
+
+    pass
