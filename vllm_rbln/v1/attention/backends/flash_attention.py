@@ -1203,7 +1203,7 @@ class RBLNFlashAttentionMetadataBuilder(
             query_start_loc=query_start_loc,
             max_seq_len=query_max_seq_len,
             seq_lens=seq_lens_tensor.to(self.device)
-            if not self.is_batch_attention_opt or is_prefills[0]
+            if not self.is_batch_attention_opt or is_prefills[0] or batch_pad <= 1
             else seq_idx.to(self.device),
             block_tables=block_tables_tensor.to(self.device),
             slot_mapping=slot_mapping,
@@ -1437,7 +1437,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                     value,
                     kv_cache,
                     attn_metadata.cache_seq_lens.to(torch.int32)
-                    if self.is_batch_attention_opt
+                    if self.is_batch_attention_opt and b_size > 1
                     else attn_metadata.cache_seq_lens,
                     attn_metadata.cache_offsets,
                     self.scale,
@@ -1445,7 +1445,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                     self.scale,  # dummy
                 ]
                 if not envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
-                    if self.is_batch_attention_opt:
+                    if self.is_batch_attention_opt and b_size > 1:
                         decode_args.append(attn_metadata.swa_attn_masks)
                     else:
                         decode_args.append(None)
