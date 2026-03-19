@@ -416,13 +416,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 tokens_mask = get_tokens_mask(num_tokens, 0.0, float("-inf"))
                 router_logits = router_logits + tokens_mask
 
-            if layer.use_grouped_topk:
-                n_group = layer.num_expert_group
-                topk_group = layer.topk_group
-            else:
-                n_group = None
-                topk_group = None
-
             final_hidden_states = torch.ops.rbln_custom_ops.custom_moe_glu_mxfp4(
                 hidden_states,
                 layer.gate_proj_blocks,
@@ -440,8 +433,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.top_k,
                 layer.renormalize,
                 expert_map_const,
-                n_group,
-                topk_group,
             )
         else:
             raise NotImplementedError(layer.activation)
