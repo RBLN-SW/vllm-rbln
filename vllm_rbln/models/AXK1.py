@@ -20,7 +20,7 @@ log = logging.getLogger("torch._dynamo")
 
 def __AXK1_moe_forward_rsd(self, hidden_states: torch.Tensor) -> torch.Tensor:
     shared_output, final_hidden_states = self.experts(
-        hidden_states=hidden_states, router=lambda x: self.gate(x)[0]
+        hidden_states=hidden_states, router=lambda x: self.gate(x)[0].sigmoid()
     )    
     # Fix FP16 overflow
     # See DeepseekV2DecoderLayer for more details.
