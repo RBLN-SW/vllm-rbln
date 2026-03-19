@@ -120,33 +120,27 @@ def generate_prompts_image(batch_size: int, model_id: str):
     )
 
     arr_image_inputs = []
-    arr_video_inputs = []
-    arr_video_kwargs = []
 
     for i in range(batch_size):
-        image_inputs, video_inputs, video_kwargs = process_vision_info(
-            messages[i], return_video_kwargs=True, return_video_metadata=True
+        image_inputs, _ = process_vision_info(
+            messages[i],
         )
         arr_image_inputs.append(image_inputs)
-        arr_video_inputs.append(video_inputs)
-        arr_video_kwargs.append(video_kwargs)
 
     return [
         {
             "prompt": text,
             "multi_modal_data": {
-                # "video": video_inputs,
                 "image": image_inputs
             },
             "mm_processor_kwargs": {
                 "min_pixels": 1024 * 14 * 14,
                 "max_pixels": 5120 * 14 * 14,
                 "padding": True,
-                **video_kwargs,
             },
         }
-        for text, image_inputs, video_inputs, video_kwargs in zip(
-            texts, arr_image_inputs, arr_video_inputs, arr_video_kwargs
+        for text, image_inputs in zip(
+            texts, arr_image_inputs
         )
     ]
 
@@ -226,8 +220,8 @@ async def main(
 
     engine = AsyncLLMEngine.from_engine_args(engine_args)
     tokenizer = AutoTokenizer.from_pretrained(model_id)
-    # inputs = generate_prompts_image(num_input_prompt, model_id)
-    inputs = generate_prompts_video(num_input_prompt, model_id)
+    inputs = generate_prompts_image(num_input_prompt, model_id)
+    # inputs = generate_prompts_video(num_input_prompt, model_id)
     # inputs = generate_prompts_wo_processing(num_input_prompt, model_id)
 
     futures = []
@@ -248,7 +242,7 @@ async def main(
 def entry_point(
     num_input_prompt: int = 3,
     # NOTE: This example supports Qwen2-VL, Qwen2.5-VL, and Qwen3-VL.
-    model_id: str = "/qwen2_5-vl-7b-32k-b4-kv16k",
+    model_id: str = "/home/eunji.lee/qwen3/scripts/Qwen3-VL-30B-A3B-Instruct_rbln_qwen_vl_moe_b1_long",
 ):
     asyncio.run(
         main(
