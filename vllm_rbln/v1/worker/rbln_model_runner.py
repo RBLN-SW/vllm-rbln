@@ -530,6 +530,9 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         self.performance_tracker: PerformanceTracker | None = None
         self.sampler_performance_tracker: PerformanceTracker | None = None
+        self.e2e_performance_tracker: PerformanceTracker | None = None
+        self.e2e_start_time = None
+        self.e2e_end_time = None
 
         self.dummy_run_state: DummyRunState | None = None
 
@@ -2962,18 +2965,18 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             num_nans_in_logits=num_nans_in_logits,
         )
 
+        if self.e2e_performance_tracker is not None:
+            self.collect_metrics(
+                self.e2e_performance_tracker,
+                self.is_prefills()[0],
+                self.e2e_start_time,
+                self.e2e_end_time,
+                [],
+                scheduler_output.total_num_scheduled_tokens,
+            )
+
         if not self.use_async_scheduling:
             return output
-
-        is_prefills = self.is_prefills()
-        self.collect_metrics(
-            self.e2e_performance_tracker,
-            is_prefills[0],
-            self.e2e_start_time,
-            self.e2e_end_time,
-            [],
-            scheduler_output.total_num_scheduled_tokens,
-        )
 
         return AsyncRBLNModelRunnerOutput(
             model_runner_output=output,
