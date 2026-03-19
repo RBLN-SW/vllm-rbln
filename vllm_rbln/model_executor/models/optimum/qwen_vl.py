@@ -425,7 +425,7 @@ class RBLNOptimumQwen3VLMoeForConditionalGeneration(
     RBLNOptimumQwen3VLForConditionalGeneration
 ):
     """
-    Qwen3-VL MoE variant shares the same input structure as Qwen3-VL,
+    Qwen3-VL MoE model shares the same input structure as Qwen3-VL,
     so it inherits from RBLNOptimumQwen3VLForConditionalGeneration without changes.
     """
 
