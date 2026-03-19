@@ -25,13 +25,35 @@ from vllm.model_executor.models.interfaces_base import VllmModelForTextGeneratio
 from vllm.v1.sample.metadata import SamplingMetadata
 
 import optimum.rbln
+import vllm_rbln.rbln_envs as envs
 from optimum.rbln.transformers.models.decoderonly import (
     decoderonly_runtime_utils as runtime_utils,
 )
 from vllm_rbln.utils.optimum.common import select_bucket_size
-from vllm_rbln.utils.optimum.registry import get_rbln_model_info
+from vllm_rbln.utils.optimum.registry import compile_model, get_rbln_model_info
 
 logger = init_logger(__name__)
+
+
+def get_attn_block_size(vllm_config: VllmConfig) -> int:
+    if vllm_config.cache_config.enable_prefix_caching:
+        block_size = vllm_config.additional_config["attn_block_size"]
+    else:
+        block_size = vllm_config.cache_config.block_size
+    return block_size
+
+
+def generate_model_path_name(
+    model_name: str,
+    batch_size: int,
+    block_size: int,
+    max_model_len: int,
+    tp_size: int,
+) -> str:
+    # FIXME: To avoid cache collisions, the cache key should also include
+    # the versions of the compiler and optimum-rbln.
+    model_name = model_name.replace("/", "_").replace(":", "_")
+    return f"{model_name}_bs{batch_size}_blk{block_size}_msl{max_model_len}_tp{tp_size}"
 
 
 class KVCacheBlockAdapter:
@@ -81,12 +103,7 @@ class KVCacheBlockAdapter:
     def is_full_block_available(self) -> bool:
         """True if we can allocate a full batch worth of blocks."""
         estimated = self._estimated_num_blocks()
-
-        if self.vllm_config.cache_config.enable_prefix_caching:
-            block_size = self.vllm_config.additional_config["attn_block_size"]
-
-        else:
-            block_size = self.vllm_config.cache_config.block_size
+        block_size = get_attn_block_size(self.vllm_config)
 
         max_model_len = self.vllm_config.model_config.max_model_len
         max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
@@ -145,39 +162,76 @@ class RBLNOptimumModelBase(nn.Module):
             return int(self.scheduler_config.max_num_seqs)
 
     def init_model(self) -> None:
+        # Check if the model is already compiled and load it;
+        # else compile the model and load it.
         config = self.model_config.hf_config
-        model_name, model_cls_name = get_rbln_model_info(config)
-
         if isinstance(self.model_config.model, str | Path) and os.path.exists(
             self.model_config.model
         ):
             model_path = Path(self.model_config.model)
             if model_path.is_dir() and any(model_path.glob("rbln_config.json")):
-                compiled_path = self.model_config.model
+                is_compiled_model = True
             else:
-                compiled_path = None
+                is_compiled_model = False
         else:
-            compiled_path = None
+            is_compiled_model = False
 
-        if compiled_path is None or not os.path.exists(compiled_path):
-            raise RuntimeError(f"Compiled model path does not exist: {compiled_path}")
+        model_name, model_cls_name = get_rbln_model_info(config)
+        model = None
 
-        # huggingface model class name
-        logger.info(
-            "model_name = %s, model_cls_name = %s, model_path = %s",
-            model_name,
-            model_cls_name,
-            compiled_path,
-        )
+        # If a HuggingFace model (not optimum-compiled) is given,
+        # look up the cached compiled model.
+        # If it does not exist, compile and save it to the cache for future use.
+        if not is_compiled_model:
+            model_path_name = generate_model_path_name(
+                self.model_config.model,
+                batch_size=self.scheduler_config.max_num_seqs,
+                block_size=get_attn_block_size(self.vllm_config),
+                max_model_len=self.model_config.max_model_len,
+                tp_size=envs.VLLM_RBLN_TP_SIZE,
+            )
+            cached_model_path = os.path.join(
+                envs.VLLM_CACHE_ROOT,
+                "compiled_models/" + model_path_name,
+            )
+            if not os.path.exists(cached_model_path):
+                logger.info(
+                    "Compiling the model %s. This may take a while...",
+                    self.model_config.model,
+                )
+                model = compile_model(
+                    self.model_config.model,
+                    config,
+                    batch_size=self.scheduler_config.max_num_seqs,
+                    block_size=get_attn_block_size(self.vllm_config),
+                    max_model_len=self.model_config.max_model_len,
+                    tp_size=envs.VLLM_RBLN_TP_SIZE,
+                    model_path=str(cached_model_path),
+                )
+            else:
+                logger.info(
+                    "Found compiled model at %s. Loading the model from the path.",
+                    cached_model_path,
+                )
+            self.vllm_config.model_config.model = cached_model_path
+
+        # Load the model directly if it is either an optimum-compiled model
+        # or a HuggingFace model that has already been compiled and cached.
+        if model is None:
+            model_cls = getattr(optimum.rbln, model_cls_name)
+            assert model_cls is not None
+            model = model_cls.from_pretrained(self.vllm_config.model_config.model)
+            logger.info(
+                "model_name = %s, model_cls_name = %s, model_path = %s",
+                model_name,
+                model_cls_name,
+                self.vllm_config.model_config.model,
+            )
 
         self.supports_transcription_only = (
             model_cls_name == "RBLNOptimumWhisperForConditionalGeneration"
         )
 
-        # huggingface model class
-        model_cls = getattr(optimum.rbln, model_cls_name)
-        assert model_cls is not None
-        model = model_cls.from_pretrained(compiled_path, export=False)
         self.model = model
         self.rbln_model_config = model.rbln_config
         self.attn_impl = (

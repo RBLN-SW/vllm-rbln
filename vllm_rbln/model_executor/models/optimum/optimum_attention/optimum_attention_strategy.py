@@ -66,6 +66,9 @@ class AttentionStrategy(ABC, Generic[EntryT, Result1T, Result2T]):
         **kwargs,
     ) -> Result2T: ...
 
+    def pop(self, request_id: str) -> None:
+        self.table.pop(request_id, None)
+
     def clear(self):
         self.table.clear()
 
@@ -73,26 +76,18 @@ class AttentionStrategy(ABC, Generic[EntryT, Result1T, Result2T]):
         self,
         decoder_batch_size: int,
         is_prompt: bool,
-        finished_requests_ids: list[str],
+        finished_requests_ids: list[str],  # FIXME to be removed
         running_requests_ids: list[str],
         get_entry_fn: Callable[[Any], Any] | None = None,
         get_extra_values_fn: Callable[[Any], Union[Any, tuple[Any, ...]]] | None = None,
     ) -> Union[list[int], tuple[list[int], ...]]:
         if is_prompt:
-            if finished_requests_ids:
-                first_id = finished_requests_ids[0]
-                first_entry = self.table[first_id]
-                table_id = get_entry_fn(first_entry) if get_entry_fn else first_entry
-
-                for request_id in finished_requests_ids:
-                    self.table.pop(request_id)
-            else:
-                used_ids = {
-                    get_entry_fn(v) if get_entry_fn else v for v in self.table.values()
-                }
-                available_ids = set(range(decoder_batch_size)) - used_ids
-                assert available_ids, "No available table IDs"
-                table_id = min(available_ids)
+            used_ids = {
+                get_entry_fn(v) if get_entry_fn else v for v in self.table.values()
+            }
+            available_ids = set(range(decoder_batch_size)) - used_ids
+            assert available_ids, "No available table IDs"
+            table_id = min(available_ids)
             return [table_id]
 
         table_ids = []
