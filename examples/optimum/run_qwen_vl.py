@@ -130,18 +130,14 @@ def generate_prompts_image(batch_size: int, model_id: str):
     return [
         {
             "prompt": text,
-            "multi_modal_data": {
-                "image": image_inputs
-            },
+            "multi_modal_data": {"image": image_inputs},
             "mm_processor_kwargs": {
                 "min_pixels": 1024 * 14 * 14,
                 "max_pixels": 5120 * 14 * 14,
                 "padding": True,
             },
         }
-        for text, image_inputs in zip(
-            texts, arr_image_inputs
-        )
+        for text, image_inputs in zip(texts, arr_image_inputs)
     ]
 
 
