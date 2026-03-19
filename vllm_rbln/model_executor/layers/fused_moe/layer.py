@@ -21,7 +21,6 @@ from vllm.model_executor.layers.fused_moe.layer import (
     UnquantizedFusedMoEMethod,
 )
 
-from vllm.vllm.model_executor.models.utils import LayerFn
 import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
 
@@ -330,12 +329,6 @@ def unquantized_fused_moe_method_custom(
     if use_moe_tokens_mask:
         tokens_mask = get_tokens_mask(num_tokens)
 
-    if layer.use_grouped_topk:
-        n_group = layer.num_expert_group
-        topk_group = layer.topk_group
-    else:
-        n_group = None
-        topk_group = None
 
     final_hidden_states = torch.ops.rbln_custom_ops.custom_moe_glu(
         hidden_states,
@@ -348,8 +341,6 @@ def unquantized_fused_moe_method_custom(
         None,
         None,
         tokens_mask,
-        n_group,
-        topk_group,
     )
     return final_hidden_states.reshape(orig_shape)
 
@@ -390,13 +381,6 @@ def unquantized_fused_optimize_moe_method_custom(
     if use_moe_tokens_mask:
         tokens_mask = get_tokens_mask(num_tokens)
 
-    if layer.use_grouped_topk:
-        n_group = layer.num_expert_group
-        topk_group = layer.topk_group
-    else:
-        n_group = None
-        topk_group = None
-
     # optimum-rbln/src/optimum/rbln/transformers/models/qwen3_moe/
     # qwen3_moe_architecture.py
     final_hidden_states = torch.ops.rbln_custom_ops.custom_moe_glu(
@@ -412,8 +396,6 @@ def unquantized_fused_optimize_moe_method_custom(
         None,
         None,
         tokens_mask,
-        n_group,
-        topk_group,
     )
     return final_hidden_states.reshape(orig_shape)
 
