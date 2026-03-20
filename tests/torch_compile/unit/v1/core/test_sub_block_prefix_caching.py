@@ -39,7 +39,7 @@ from vllm_rbln.v1.core.rbln_kv_cache_manager import (
 )
 from vllm_rbln.v1.core.rbln_scheduler import RBLNSchedulerOutput
 
-from .utils import create_runner_output, create_scheduler
+from .utils import MockKVConfig, create_runner_output, create_scheduler
 
 
 @pytest.fixture(autouse=True)
@@ -223,12 +223,16 @@ def _make_request(
     prompt_token_ids: list[int],
     block_size: int,
     max_tokens: int = 17,
+    prompt_logprobs: int | None = None,
 ) -> Request:
     return Request(
         request_id=request_id,
         prompt_token_ids=prompt_token_ids,
         mm_features=None,
-        sampling_params=SamplingParams(max_tokens=max_tokens),
+        sampling_params=SamplingParams(
+            max_tokens=max_tokens,
+            prompt_logprobs=prompt_logprobs,
+        ),
         pooling_params=None,
         block_hasher=get_request_block_hasher(block_size, sha256),
     )
@@ -259,16 +263,24 @@ def _prefill_request(manager: RBLNKVCacheManager, request: Request):
     """Run the full get_computed_blocks → allocate_slots flow for a
     request (simulating what the scheduler does)."""
     computed_blocks, num_computed_tokens = manager.get_computed_blocks(request)
-    num_new_computed = num_computed_tokens
-    num_new_tokens = request.num_tokens - num_computed_tokens
+    sub_block_match = manager.get_computed_blocks_sub_block(
+        request, num_computed_tokens
+    )
+    sub_block_extra = sub_block_match.num_tokens if sub_block_match else 0
+    total_computed = num_computed_tokens + sub_block_extra
+    num_new_tokens = request.num_tokens - total_computed
     blocks = manager.allocate_slots(
         request,
         num_new_tokens,
-        num_new_computed,
+        total_computed,
         computed_blocks,
     )
+    if blocks is not None and sub_block_match is not None:
+        manager.apply_sub_block_match(sub_block_match, request)
+    elif sub_block_match is not None:
+        manager.release_sub_block_match(sub_block_match)
     request.num_computed_tokens = request.num_tokens
-    return computed_blocks, num_computed_tokens, blocks
+    return computed_blocks, total_computed, blocks
 
 
 class TestRBLNKVCacheManager:
@@ -333,11 +345,15 @@ class TestRBLNKVCacheManager:
 
         # Upstream should find 0 full block hits (different full-block hash).
         assert len(computed_blocks.blocks[0]) == 0
-        # But sub-block matching should give us extra tokens.
-        assert num_computed_tokens == self.SUB_BLOCK_SIZE  # 4 tokens from partial match
-        # Pending partial should be set.
-        assert manager._pending_partial is not None
-        assert manager._pending_partial.num_matched_sub_blocks == 1
+        # get_computed_blocks returns only full-block count (0 here).
+        assert num_computed_tokens == 0
+        # Sub-block match is available separately.
+        sub_block_match = manager.get_computed_blocks_sub_block(
+            req1, num_computed_tokens
+        )
+        assert sub_block_match is not None
+        assert sub_block_match.num_tokens == self.SUB_BLOCK_SIZE
+        assert sub_block_match.num_matched_sub_blocks == 1
 
     def test_copy_op_generated_on_partial_match(self):
         """After partial match detection + allocate_slots, a copy op should
@@ -384,7 +400,10 @@ class TestRBLNKVCacheManager:
         # All tokens in the 2 full blocks should be computed via upstream.
         assert num_computed_tokens == 2 * self.BLOCK_SIZE
         # No partial match (all full blocks matched by upstream).
-        assert manager._pending_partial is None
+        sub_block_match = manager.get_computed_blocks_sub_block(
+            req1, num_computed_tokens
+        )
+        assert sub_block_match is None
 
     def test_partial_match_after_full_block_match(self):
         """Partial match should work on the block boundary after full-block
@@ -419,9 +438,14 @@ class TestRBLNKVCacheManager:
         req2 = _make_request("2", req2_tokens, self.BLOCK_SIZE)
 
         _, num_computed_tokens = manager.get_computed_blocks(req2)
-        # 2 full blocks = 16 tokens from upstream + 4 tokens from partial match.
-        assert num_computed_tokens == 2 * self.BLOCK_SIZE + self.SUB_BLOCK_SIZE
-        assert manager._pending_partial is not None
+        # 2 full blocks = 16 tokens from upstream.
+        assert num_computed_tokens == 2 * self.BLOCK_SIZE
+        # Sub-block match adds 4 tokens separately.
+        sub_block_match = manager.get_computed_blocks_sub_block(
+            req2, num_computed_tokens
+        )
+        assert sub_block_match is not None
+        assert sub_block_match.num_tokens == self.SUB_BLOCK_SIZE
 
     def test_free_cleans_up_sub_hash_cache(self):
         """free() should remove the request's sub-hash cache entry."""
@@ -492,36 +516,34 @@ class TestRBLNKVCacheManager:
         assert len(ops) == 1
         assert manager.pending_copy_ops == []
 
-    def test_pending_partial_released_on_failed_alloc(self):
-        """If allocate_slots fails (returns None), pending partial should be
-        released."""
-        # Only 1 block — not enough for a request that needs more.
+    def test_sub_block_match_released_on_failed_alloc(self):
+        """If allocate_slots fails, the caller must release the match."""
         manager = _make_manager(self.BLOCK_SIZE, self.SUB_BLOCK_SIZE, num_blocks=2)
 
-        # Fill the one block first.
         req0 = _make_request("0", list(range(self.BLOCK_SIZE)), self.BLOCK_SIZE)
         _prefill_request(manager, req0)
         manager.free(req0)
 
-        # Request needing 2+ blocks but we only have 2 total, and 1 is in use
-        # by the cache. Create a request that triggers a partial match, then
-        # force allocation failure by requesting too many blocks.
         shared = list(range(self.SUB_BLOCK_SIZE))
-        # Need lots of tokens to require many blocks.
         big = shared + [200 + i for i in range(3 * self.BLOCK_SIZE)]
         req1 = _make_request("1", big, self.BLOCK_SIZE)
         computed_blocks, num_computed_tokens = manager.get_computed_blocks(req1)
+        match = manager.get_computed_blocks_sub_block(req1, num_computed_tokens)
 
-        if manager._pending_partial is not None:
-            # allocate_slots will likely fail due to insufficient blocks.
-            manager.allocate_slots(
+        if match is not None:
+            sub_extra = match.num_tokens
+            total_computed = num_computed_tokens + sub_extra
+            result = manager.allocate_slots(
                 req1,
-                len(big) - num_computed_tokens,
-                num_computed_tokens,
+                len(big) - total_computed,
+                total_computed,
                 computed_blocks,
             )
-            # Whether it succeeds or fails, pending_partial should be cleared.
-            assert manager._pending_partial is None
+            # Whether it succeeds or fails, caller releases the match.
+            if result is not None:
+                manager.apply_sub_block_match(match, req1)
+            else:
+                manager.release_sub_block_match(match)
 
     def test_partial_block_cached_on_free(self):
         """free() should index the last partial block's sub-blocks in the index
@@ -573,9 +595,13 @@ class TestRBLNKVCacheManager:
 
         # Upstream matches the first full block (8 tokens).  The sub-block
         # index then matches 1 sub-block (4 tokens) from the partial block.
-        assert num_computed_tokens == self.BLOCK_SIZE + self.SUB_BLOCK_SIZE
-        assert manager._pending_partial is not None
-        assert manager._pending_partial.num_matched_sub_blocks == 1
+        assert num_computed_tokens == self.BLOCK_SIZE
+        sub_block_match = manager.get_computed_blocks_sub_block(
+            req1, num_computed_tokens
+        )
+        assert sub_block_match is not None
+        assert sub_block_match.num_tokens == self.SUB_BLOCK_SIZE
+        assert sub_block_match.num_matched_sub_blocks == 1
 
     def test_no_partial_block_cache_when_block_is_full(self):
         """free() should NOT double-cache a block that is already fully cached."""
@@ -709,41 +735,61 @@ class TestRBLNKVCacheManager:
         unique_tail = [999] * BS
         req1 = _make_request("1", tokens + unique_tail, BS)
         _, num_computed = manager.get_computed_blocks(req1)
-        # Full block (16) + 3 sub-blocks (12) = 28.
-        assert num_computed == BS + 3 * SBS
+        # Full block (16) from upstream.
+        assert num_computed == BS
+        # 3 sub-blocks (12) from sub-block match.
+        sub_block_match = manager.get_computed_blocks_sub_block(req1, num_computed)
+        assert sub_block_match is not None
+        assert sub_block_match.num_tokens == 3 * SBS
 
-    def test_stale_pending_partial_discarded(self):
-        """If get_computed_blocks sets _pending_partial for req A but
-        allocate_slots is called for req B, the stale state is discarded."""
+    def test_ref_cnt_released_by_release_sub_block_match(self):
+        """release_sub_block_match should release source block ref_cnt."""
         manager = _make_manager(self.BLOCK_SIZE, self.SUB_BLOCK_SIZE, num_blocks=10)
-
         tokens = list(range(self.BLOCK_SIZE))
         req0 = _make_request("0", tokens, self.BLOCK_SIZE)
         _prefill_request(manager, req0)
         manager.free(req0)
 
-        # Trigger partial match for req1.
         shared = list(range(self.SUB_BLOCK_SIZE))
         req1 = _make_request("1", shared + [100] * self.BLOCK_SIZE, self.BLOCK_SIZE)
+        _, num_computed = manager.get_computed_blocks(req1)
+        match = manager.get_computed_blocks_sub_block(req1, num_computed)
+        assert match is not None
+        src_block = match.group_matches[0].src_block
+        ref_cnt_after_match = src_block.ref_cnt
+
+        # Release the match — should decrement ref_cnt.
+        manager.release_sub_block_match(match)
+        assert src_block.ref_cnt == ref_cnt_after_match - 1
+
+    def test_ref_cnt_managed_by_caller(self):
+        """Caller manages match lifecycle — ref_cnt is properly maintained."""
+        manager = _make_manager(self.BLOCK_SIZE, self.SUB_BLOCK_SIZE, num_blocks=10)
+        tokens = list(range(self.BLOCK_SIZE))
+        req0 = _make_request("0", tokens, self.BLOCK_SIZE)
+        _prefill_request(manager, req0)
+        manager.free(req0)
+
+        shared = list(range(self.SUB_BLOCK_SIZE))
+        req1 = _make_request("1", shared + [100] * self.BLOCK_SIZE, self.BLOCK_SIZE)
+        _, num_computed = manager.get_computed_blocks(req1)
+        match = manager.get_computed_blocks_sub_block(req1, num_computed)
+        assert match is not None
+        src_block = match.group_matches[0].src_block
+        ref_before = src_block.ref_cnt
+
+        # Calling get_computed_blocks again does NOT release the match
+        # (caller owns it). Ref_cnt unchanged.
         manager.get_computed_blocks(req1)
-        assert manager._pending_partial is not None
-        assert manager._pending_partial.request_id == "1"
+        assert src_block.ref_cnt == ref_before
 
-        # Now allocate_slots for a DIFFERENT request (req2).
-        req2 = _make_request("2", [200] * self.BLOCK_SIZE, self.BLOCK_SIZE)
-        manager.get_computed_blocks(req2)
-        manager.allocate_slots(req2, req2.num_tokens, 0)
-
-        # Stale pending from req1 should have been discarded.
-        assert manager._pending_partial is None
-        # No copy ops should be generated for the stale partial.
-        assert manager.drain_pending_copy_ops() == []
-
-    def test_partial_block_evicted_under_pressure(self):
-        """A cached partial block should be evictable under memory pressure."""
-        # 5 blocks total: 1 null + 4 usable. req0 uses 2 blocks (1 full +
-        # 1 partial). After free, 2 cached + 2 free. req1 needs all 4
-        # usable blocks, forcing eviction of both cached blocks.
+        # Explicit release decrements.
+        manager.release_sub_block_match(match)
+        assert src_block.ref_cnt == ref_before - 1
+        # A cached partial block should be evictable under memory pressure.
+        # 5 blocks total: 1 null + 4 usable. req0 uses 2 blocks (1 full + 1 partial).
+        # After free, 2 cached + 2 free. req1 needs all 4 usable blocks,
+        # forcing eviction of both cached blocks.
         manager = _make_manager(self.BLOCK_SIZE, self.SUB_BLOCK_SIZE, num_blocks=5)
 
         # Fill a full block + partial block.
@@ -769,70 +815,6 @@ class TestRBLNKVCacheManager:
         if partial_blk_id in _sub_block_index(manager)._block_hashes:
             new_hashes = _sub_block_index(manager)._block_hashes[partial_blk_id]
             assert new_hashes != old_hashes
-
-    def test_ref_cnt_released_when_allocate_skipped(self):
-        """If get_computed_blocks sets _pending_partial but allocate_slots is
-        never called (simulating a scheduler continue/break), the next
-        get_computed_blocks call must release the source block ref_cnt."""
-        manager = _make_manager(self.BLOCK_SIZE, self.SUB_BLOCK_SIZE, num_blocks=10)
-
-        # Cache a full block.
-        tokens = list(range(self.BLOCK_SIZE))
-        req0 = _make_request("0", tokens, self.BLOCK_SIZE)
-        _prefill_request(manager, req0)
-        manager.free(req0)
-
-        # Trigger partial match for req1.
-        shared = list(range(self.SUB_BLOCK_SIZE))
-        req1 = _make_request("1", shared + [100] * self.BLOCK_SIZE, self.BLOCK_SIZE)
-        manager.get_computed_blocks(req1)
-        assert manager._pending_partial is not None
-        gm = manager._pending_partial.group_matches[0]
-        src_block = gm.src_block
-        ref_cnt_after_match = src_block.ref_cnt
-
-        # Simulate scheduler skipping allocate_slots (e.g. budget exhausted).
-        # Call get_computed_blocks for another request — this should release
-        # the old pending partial's ref_cnt.
-        req2 = _make_request("2", [200] * self.BLOCK_SIZE, self.BLOCK_SIZE)
-        manager.get_computed_blocks(req2)
-
-        assert manager._pending_partial is None
-        assert src_block.ref_cnt == ref_cnt_after_match - 1
-
-    def test_ref_cnt_released_when_get_computed_blocks_finds_no_match(self):
-        """If get_computed_blocks is called twice in a row (first finds a
-        match, second doesn't), the first partial's ref_cnt is released."""
-        manager = _make_manager(self.BLOCK_SIZE, self.SUB_BLOCK_SIZE, num_blocks=10)
-
-        # Cache a full block.
-        tokens = list(range(self.BLOCK_SIZE))
-        req0 = _make_request("0", tokens, self.BLOCK_SIZE)
-        _prefill_request(manager, req0)
-        manager.free(req0)
-
-        # Trigger partial match.
-        shared = list(range(self.SUB_BLOCK_SIZE))
-        req1 = _make_request("1", shared + [100] * self.BLOCK_SIZE, self.BLOCK_SIZE)
-        manager.get_computed_blocks(req1)
-        assert manager._pending_partial is not None
-        gm = manager._pending_partial.group_matches[0]
-        src_block = gm.src_block
-        ref_before = src_block.ref_cnt
-
-        # Call get_computed_blocks again for same request without allocate_slots.
-        # This simulates the scheduler re-evaluating the request.
-        manager.get_computed_blocks(req1)
-
-        # ref_cnt should have been decremented from the first pending partial
-        # and then re-incremented for the new one (net zero change if match
-        # found again, or -1 if no match found).
-        # Since the first get_computed_blocks released the old pending, and
-        # the second may or may not find a match, just verify no leak.
-        if manager._pending_partial is not None:
-            assert src_block.ref_cnt == ref_before
-        else:
-            assert src_block.ref_cnt == ref_before - 1
 
     def test_index_newly_cached_blocks_during_decode(self):
         """_index_newly_cached_blocks should correctly index new blocks
@@ -933,10 +915,34 @@ class TestRBLNKVCacheManager:
 
         # Upstream matches 0 full blocks (num_tokens-1=7 < block_size=8).
         # Sub-block matching recovers 1 sub-block (4 tokens), capped so
-        # that num_computed <= num_tokens - 1 = 7.
-        assert num_computed <= req1.num_tokens - 1
-        assert num_computed == self.SUB_BLOCK_SIZE  # 4 tokens from sub-block match
-        assert manager._pending_partial is not None
+        # that total_computed <= num_tokens - 1 = 7.
+        assert num_computed == 0  # Full-block count only.
+        sub_block_match = manager.get_computed_blocks_sub_block(req1, num_computed)
+        assert sub_block_match is not None
+        assert num_computed + sub_block_match.num_tokens <= req1.num_tokens - 1
+        assert (
+            sub_block_match.num_tokens == self.SUB_BLOCK_SIZE
+        )  # 4 tokens from sub-block match
+
+    def test_prompt_logprobs_skips_sub_block_cache(self):
+        """Requests with prompt_logprobs must not get sub-block hits,
+        matching upstream's behaviour for full-block prefix caching."""
+        manager = _make_manager(self.BLOCK_SIZE, self.SUB_BLOCK_SIZE, num_blocks=10)
+
+        # Populate the cache with a full block.
+        tokens = list(range(self.BLOCK_SIZE))
+        req0 = _make_request("0", tokens, self.BLOCK_SIZE)
+        _prefill_request(manager, req0)
+        manager.free(req0)
+
+        # with prompt_logprobs: must NOT get any cache hit.
+        shared = list(range(self.SUB_BLOCK_SIZE))
+        unique = [100 + i for i in range(self.BLOCK_SIZE)]
+        req = _make_request("2", shared + unique, self.BLOCK_SIZE, prompt_logprobs=5)
+        _, num_computed = manager.get_computed_blocks(req)
+        assert num_computed == 0  # Full-block path also skipped.
+        sub_match = manager.get_computed_blocks_sub_block(req, num_computed)
+        assert sub_match is None
 
 
 # ---------------------------------------------------------------------------
@@ -1139,11 +1145,12 @@ class TestMultiGroupRBLNKVCacheManager:
         unique = [100 + i for i in range(full_bs)]
         req1 = _make_request("1", shared + unique, hash_bs)
         _, num_computed = manager.get_computed_blocks(req1)
-
-        # Should get 1 sub-block match (min across groups).
-        assert num_computed == sbs
-        assert manager._pending_partial is not None
-        assert manager._pending_partial.num_matched_sub_blocks == 1
+        # Should get 0 from full-block matching, 1 sub-block match separately.
+        assert num_computed == 0
+        sub_block_match = manager.get_computed_blocks_sub_block(req1, num_computed)
+        assert sub_block_match is not None
+        assert sub_block_match.num_tokens == sbs
+        assert sub_block_match.num_matched_sub_blocks == 1
 
     def test_hybrid_partial_block_indexed_on_free(self):
         """In multi-group setup, free() should index partial blocks in both
@@ -1196,8 +1203,11 @@ class TestMultiGroupRBLNKVCacheManager:
         # Sub-block match: 1 sub-block (4 tokens), capped at 4 <= 7. OK.
         req1 = _make_request("1", tokens, self.BLOCK_SIZE)
         _, num_computed = manager.get_computed_blocks(req1)
-        assert num_computed <= req1.num_tokens - 1
-        assert num_computed == self.SUB_BLOCK_SIZE
+        sub_block_match = manager.get_computed_blocks_sub_block(req1, num_computed)
+        assert sub_block_match is not None
+        assert num_computed + sub_block_match.num_tokens <= req1.num_tokens - 1
+        assert num_computed == 0  # Full-block count only.
+        assert sub_block_match.num_tokens == self.SUB_BLOCK_SIZE
 
     def test_eligibility(self):
         """Test the eligibility check with various configs."""
@@ -1499,3 +1509,187 @@ class TestRBLNScheduler:
         uncomputed = [blk for blk in req_blocks if blk.block_hash is None]
         for blk in uncomputed:
             assert not index.contains(blk.block_id)
+
+
+# ---------------------------------------------------------------------------
+# KV Connector + Sub-block prefix caching interaction tests
+# ---------------------------------------------------------------------------
+
+
+class TestSubBlockWithKVConnector:
+    """Tests for the interaction between sub-block prefix caching and KV
+    connectors.  The scheduler picks whichever source (sub-block or connector)
+    provides more tokens; sub-block wins on ties since local copy is cheaper."""
+
+    BLOCK_SIZE = 16
+    SUB_BLOCK_SIZE = 4
+
+    def _create_scheduler(
+        self,
+        matched_tokens=0,
+        is_async=False,
+        num_blocks=100,
+        max_model_len=None,
+    ):
+        if max_model_len is None:
+            max_model_len = self.BLOCK_SIZE * num_blocks
+        return create_scheduler(
+            block_size=self.BLOCK_SIZE,
+            num_blocks=num_blocks,
+            max_num_batched_tokens=max_model_len,
+            max_model_len=max_model_len,
+            enable_prefix_caching=True,
+            sub_block_size=self.SUB_BLOCK_SIZE,
+            use_kv_connector=MockKVConfig(
+                matched_tokens=matched_tokens,
+                is_async=is_async,
+            ),
+        )
+
+    def test_connector_zero_tokens_sub_block_used(self):
+        """When the connector returns 0 external tokens, sub-block match
+        should be used as fallback."""
+        scheduler = self._create_scheduler(matched_tokens=0)
+        assert isinstance(scheduler.kv_cache_manager, RBLNKVCacheManager)
+        assert scheduler.connector is not None
+
+        # Cache a full block via request 0.
+        req0 = _make_request("0", [0] * self.BLOCK_SIZE, self.BLOCK_SIZE, max_tokens=1)
+        scheduler.add_request(req0)
+        output0 = scheduler.schedule()
+        runner_output0 = create_runner_output(output0, 0)
+        scheduler.update_from_output(output0, runner_output0)
+
+        # Request 1: shares first sub-block, then diverges.
+        shared = [0] * self.SUB_BLOCK_SIZE
+        unique = [900 + i for i in range(self.BLOCK_SIZE)]
+        req1 = _make_request("1", shared + unique, self.BLOCK_SIZE, max_tokens=1)
+        scheduler.add_request(req1)
+        output1 = scheduler.schedule()
+        assert isinstance(output1, RBLNSchedulerOutput)
+
+        # Sub-block match should be active → copy op generated.
+        assert len(output1.kv_cache_copy_ops) == 1
+        assert output1.kv_cache_copy_ops[0].num_tokens == self.SUB_BLOCK_SIZE
+
+        # The connector provided nothing, so prefill should compute all
+        # tokens beyond the sub-block match.
+        expected_scheduled = len(shared + unique) - self.SUB_BLOCK_SIZE
+        assert output1.num_scheduled_tokens["1"] == expected_scheduled
+
+    def test_sub_block_beats_connector(self):
+        """When sub-block match provides more tokens than the connector,
+        sub-block should win and the connector's offer should be ignored."""
+        # Sub-block can provide up to 3 sub-blocks = 12 tokens (block=16, sub=4).
+        # Connector offers only 1 sub-block's worth = 4 tokens.
+        # Sub-block should win.
+        scheduler = self._create_scheduler(matched_tokens=self.SUB_BLOCK_SIZE)
+        assert isinstance(scheduler.kv_cache_manager, RBLNKVCacheManager)
+
+        # Cache a full block with 3 sub-blocks worth of known tokens.
+        num_shared = 3 * self.SUB_BLOCK_SIZE  # 12 tokens
+        req0_tokens = list(range(num_shared)) + [
+            800 + i for i in range(self.BLOCK_SIZE - num_shared)
+        ]
+        req0 = _make_request("0", req0_tokens, self.BLOCK_SIZE, max_tokens=1)
+        scheduler.add_request(req0)
+        output0 = scheduler.schedule()
+        runner_output0 = create_runner_output(output0, 0)
+        scheduler.update_from_output(output0, runner_output0)
+
+        # Request 1: shares first 3 sub-blocks, then diverges.
+        # This triggers a 3-sub-block match = 12 tokens.
+        # The connector only offers SUB_BLOCK_SIZE = 4 tokens.
+        shared = list(range(num_shared))
+        unique = [900 + i for i in range(self.BLOCK_SIZE)]
+        req1 = _make_request("1", shared + unique, self.BLOCK_SIZE, max_tokens=1)
+        req1.kv_transfer_params = {"do_remote_prefill": True}
+        scheduler.add_request(req1)
+        output1 = scheduler.schedule()
+        assert isinstance(output1, RBLNSchedulerOutput)
+
+        # Sub-block wins → copy op generated, connector overridden.
+        assert len(output1.kv_cache_copy_ops) == 1
+        assert output1.kv_cache_copy_ops[0].num_tokens == num_shared
+
+        # Scheduled tokens = total - sub_block_match (connector ignored).
+        total = len(shared + unique)
+        expected_scheduled = total - num_shared
+        assert output1.num_scheduled_tokens["1"] == expected_scheduled
+
+    def test_connector_nonzero_tokens_sub_block_discarded(self):
+        """When the connector returns more external tokens than the sub-block
+        match, the sub-block should be discarded."""
+        # Connector claims to have 1 block's worth of external tokens.
+        scheduler = self._create_scheduler(matched_tokens=self.BLOCK_SIZE)
+        assert isinstance(scheduler.kv_cache_manager, RBLNKVCacheManager)
+        assert scheduler.connector is not None
+
+        # Cache a full block via request 0 (no remote prefill).
+        req0 = _make_request("0", [0] * self.BLOCK_SIZE, self.BLOCK_SIZE, max_tokens=1)
+        scheduler.add_request(req0)
+        output0 = scheduler.schedule()
+        runner_output0 = create_runner_output(output0, 0)
+        scheduler.update_from_output(output0, runner_output0)
+
+        # Request 1: same sub-block prefix as req0 → would trigger sub-block
+        # match normally, but connector provides external tokens.
+        # Set kv_transfer_params to trigger the mock connector.
+        shared = [0] * self.SUB_BLOCK_SIZE
+        unique = [900 + i for i in range(2 * self.BLOCK_SIZE)]
+        req1 = _make_request("1", shared + unique, self.BLOCK_SIZE, max_tokens=1)
+        req1.kv_transfer_params = {"do_remote_prefill": True}
+        scheduler.add_request(req1)
+        output1 = scheduler.schedule()
+        assert isinstance(output1, RBLNSchedulerOutput)
+
+        # Sub-block match should be discarded → no copy ops.
+        assert output1.kv_cache_copy_ops == []
+
+        # Connector provides BLOCK_SIZE tokens, so scheduled tokens =
+        # total - (local_full_block + connector_tokens).
+        # local full-block matches: 0 (req1's first block hash differs).
+        # external: BLOCK_SIZE (from connector).
+        total = len(shared + unique)
+        expected_scheduled = total - self.BLOCK_SIZE
+        assert output1.num_scheduled_tokens["1"] == expected_scheduled
+
+    def test_connector_sees_block_aligned_count(self):
+        """The connector should receive a block-aligned num_computed_tokens
+        (not inflated by sub-block tokens)."""
+        # We'll use a custom connector that records the num_computed_tokens
+        # it receives.
+        recorded_computed: list[int] = []
+
+        scheduler = self._create_scheduler(matched_tokens=0)
+        assert scheduler.connector is not None
+
+        original_fn = scheduler.connector.get_num_new_matched_tokens
+
+        def recording_get_num_new_matched_tokens(request, num_computed_tokens):
+            recorded_computed.append(num_computed_tokens)
+            return original_fn(request, num_computed_tokens)
+
+        scheduler.connector.get_num_new_matched_tokens = (
+            recording_get_num_new_matched_tokens
+        )
+
+        # Cache a full block.
+        req0 = _make_request("0", [0] * self.BLOCK_SIZE, self.BLOCK_SIZE, max_tokens=1)
+        scheduler.add_request(req0)
+        output0 = scheduler.schedule()
+        runner_output0 = create_runner_output(output0, 0)
+        scheduler.update_from_output(output0, runner_output0)
+
+        # Request 1 shares first sub-block → triggers sub-block match.
+        # Set kv_transfer_params so the mock connector responds.
+        shared = [0] * self.SUB_BLOCK_SIZE
+        unique = [900 + i for i in range(self.BLOCK_SIZE)]
+        req1 = _make_request("1", shared + unique, self.BLOCK_SIZE, max_tokens=1)
+        req1.kv_transfer_params = {"do_remote_prefill": True}
+        scheduler.add_request(req1)
+        scheduler.schedule()
+
+        # The connector should have seen block-aligned count (0, not 4).
+        # recorded_computed may have entries from req0 too; check the last.
+        assert recorded_computed[-1] == 0  # Block-aligned, no sub-block inflation.

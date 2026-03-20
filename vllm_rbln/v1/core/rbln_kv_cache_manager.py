@@ -180,11 +180,16 @@ class SubBlockIndex:
 
 
 @dataclass(slots=True)
-class _PendingPartialMatch:
-    """Temporary state between get_computed_blocks and allocate_slots.
-    Owns references to source blocks to prevent eviction during scheduling."""
+class SubBlockMatch:
+    """Result of a sub-block partial match lookup.
 
-    request_id: str
+    Returned by ``RBLNKVCacheManager.get_computed_blocks_sub_block``.
+    The caller must either pass it to ``apply_sub_block_match`` (to create
+    copy ops) or ``release_sub_block_match`` (to discard it and free the
+    source-block references).
+    """
+
+    num_tokens: int
     num_matched_sub_blocks: int
     group_matches: tuple[_GroupPartialMatch, ...]
 
@@ -279,10 +284,6 @@ class RBLNKVCacheManager(KVCacheManager):
         # Per-request sub-block hash cache (group-independent).
         self._req_sub_hashes: dict[str, list[BlockHash]] = {}
 
-        # Pending partial match state (set by get_computed_blocks, consumed
-        # by allocate_slots).
-        self._pending_partial: _PendingPartialMatch | None = None
-
         # Copy operations accumulated during a scheduling step; the scheduler
         # drains this list when building SchedulerOutput. While pending, each
         # copy op holds a ref count of its source block to prevent eviction.
@@ -290,24 +291,24 @@ class RBLNKVCacheManager(KVCacheManager):
 
         self._install_eviction_hook()
 
-    # -- overrides ----------------------------------------------------------
+    def get_computed_blocks_sub_block(
+        self,
+        request: Request,
+        num_computed_tokens: int,
+    ) -> SubBlockMatch | None:
+        """Discover a sub-block partial match after full-block matching.
 
-    def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int]:
-        # Release any stale pending partial from a prior get_computed_blocks
-        # that was never followed by allocate_slots (e.g. scheduler skipped
-        # the request via continue/break).
-        if self._pending_partial is not None:
-            self._release_pending_partial(self._pending_partial)
-            self._pending_partial = None
+        Looks for sub-block prefix matches in the block immediately after the
+        full-block boundary.  Returns a ``SubBlockMatch`` handle if found, or
+        ``None``.
 
+        The caller must pass the result to ``apply_sub_block_match`` (to
+        create copy ops) or ``release_sub_block_match`` (to free the
+        source-block references it holds).
+        """
         if request.skip_reading_prefix_cache:
-            return self.empty_kv_cache_blocks, 0
+            return None
 
-        # Step 1: upstream full-block matching.
-        computed_blocks, num_computed_tokens = super().get_computed_blocks(request)
-
-        # Step 2: check for partial sub-block match in the next block
-        # across all groups. Extension = min across groups.
         sub_hashes = self._get_or_compute_sub_hashes(request)
 
         min_matched: int | None = None
@@ -342,7 +343,7 @@ class RBLNKVCacheManager(KVCacheManager):
             )
 
         if not min_matched:
-            return computed_blocks, num_computed_tokens
+            return None
 
         # We have a partial match!
         num_matched = min_matched
@@ -355,15 +356,14 @@ class RBLNKVCacheManager(KVCacheManager):
         max_allowed_sub_blocks = max_allowed_extra_tokens // self.sub_block_size
         num_matched = min(num_matched, max_allowed_sub_blocks)
         if num_matched == 0:
-            return computed_blocks, num_computed_tokens
+            return None
         extra_tokens = num_matched * self.sub_block_size
 
         # Touch source blocks to prevent eviction during allocate_slots.
-        # _PendingPartialMatch owns these references.
-        # This also lowers their eviction priority.
+        # The SubBlockMatch owns these references until apply or release.
         self.block_pool.touch([gm.src_block for gm in group_matches])
-        self._pending_partial = _PendingPartialMatch(
-            request_id=request.request_id,
+        match = SubBlockMatch(
+            num_tokens=extra_tokens,
             num_matched_sub_blocks=num_matched,
             group_matches=tuple(group_matches),
         )
@@ -380,7 +380,49 @@ class RBLNKVCacheManager(KVCacheManager):
                 ),
             )
 
-        return computed_blocks, num_computed_tokens + extra_tokens
+        return match
+
+    def apply_sub_block_match(
+        self,
+        match: SubBlockMatch,
+        request: Request,
+    ) -> None:
+        """Create copy ops from a sub-block match.
+
+        Call this after ``allocate_slots`` succeeds. The source-block refs
+        owned by *match* are transferred to the pending copy ops (released
+        by ``drain_pending_copy_ops``).
+        """
+        blocks = self.coordinator.get_blocks(request.request_id)
+
+        for i, gm in enumerate(match.group_matches):
+            block_list = blocks[i]
+            # By this point, the destination block must have been allocated.
+            dst_block = block_list[gm.dst_block_index]
+            self.pending_copy_ops.append(
+                KVCacheCopyOp(
+                    group_id=i,
+                    src_block_id=gm.src_block_id,
+                    dst_block_id=dst_block.block_id,
+                    num_tokens=match.num_tokens,
+                )
+            )
+
+        if self.log_stats:
+            assert self.prefix_cache_stats is not None
+            self.prefix_cache_stats.record(
+                num_tokens=0,  # already counted in get_computed_blocks
+                num_hits=match.num_tokens,
+                preempted=request.num_preemptions > 0,
+            )
+
+    def release_sub_block_match(self, match: SubBlockMatch) -> None:
+        """Release source-block references held by a sub-block match.
+
+        Call this when discarding a match (e.g. connector provides better
+        coverage, or allocation failed).
+        """
+        self.block_pool.free_blocks([gm.src_block for gm in match.group_matches])
 
     def allocate_slots(
         self,
@@ -393,10 +435,6 @@ class RBLNKVCacheManager(KVCacheManager):
         delay_cache_blocks: bool = False,
         num_encoder_tokens: int = 0,
     ) -> KVCacheBlocks | None:
-        # Consume the pending partial match, releasing it if it doesn't
-        # belong to this request (stale from a skipped request).
-        partial = self._take_pending_partial(request.request_id)
-
         num_full_blocks_before = tuple(
             request.num_computed_tokens // gi.block_size for gi in self._group_infos
         )
@@ -412,17 +450,20 @@ class RBLNKVCacheManager(KVCacheManager):
             num_encoder_tokens,
         )
 
-        if result is None:
-            if partial is not None:
-                self._release_pending_partial(partial)
-            return None
-
-        self._index_newly_cached_blocks(request, num_full_blocks_before)
-
-        if partial is not None:
-            self._apply_partial(partial, request)
+        if result is not None:
+            self._index_newly_cached_blocks(request, num_full_blocks_before)
 
         return result
+
+    def drain_pending_copy_ops(self) -> list[KVCacheCopyOp]:
+        """Return and clear all pending copy operations, releasing source block refs."""
+        ops = self.pending_copy_ops
+        self.pending_copy_ops = []
+        if ops:
+            self.block_pool.free_blocks(
+                [self.block_pool.blocks[op.src_block_id] for op in ops]
+            )
+        return ops
 
     def free(self, request: Request) -> None:
         """Free blocks and clean up sub-block state for a request."""
@@ -567,56 +608,3 @@ class RBLNKVCacheManager(KVCacheManager):
             return result
 
         self.block_pool._maybe_evict_cached_block = evict_with_index_cleanup
-
-    # -- pending partial match & copy ops lifecycle --------------------------
-
-    def _take_pending_partial(self, request_id: str) -> _PendingPartialMatch | None:
-        """Consume the pending partial match. If it belongs to a different
-        request (stale), release its source block and return None."""
-        partial = self._pending_partial
-        self._pending_partial = None
-        if partial is not None and partial.request_id != request_id:
-            self._release_pending_partial(partial)
-            return None
-        return partial
-
-    def _apply_partial(self, partial: _PendingPartialMatch, request: Request) -> None:
-        """Create copy ops from the partial match, one per group."""
-        blocks = self.coordinator.get_blocks(request.request_id)
-        num_matched_tokens = partial.num_matched_sub_blocks * self.sub_block_size
-
-        for i, gm in enumerate(partial.group_matches):
-            block_list = blocks[i]
-            # By this point, the destination block must have been allocated
-            dst_block = block_list[gm.dst_block_index]
-            self.pending_copy_ops.append(
-                # Ownership of src_block ref is transferred to KVCacheCopyOp
-                KVCacheCopyOp(
-                    group_id=i,
-                    src_block_id=gm.src_block_id,
-                    dst_block_id=dst_block.block_id,
-                    num_tokens=num_matched_tokens,
-                )
-            )
-
-        if self.log_stats:
-            assert self.prefix_cache_stats is not None
-            self.prefix_cache_stats.record(
-                num_tokens=0,  # already counted in get_computed_blocks
-                num_hits=num_matched_tokens,
-                preempted=request.num_preemptions > 0,
-            )
-
-    def _release_pending_partial(self, partial: _PendingPartialMatch) -> None:
-        """Release source block references held by a partial match."""
-        self.block_pool.free_blocks([gm.src_block for gm in partial.group_matches])
-
-    def drain_pending_copy_ops(self) -> list[KVCacheCopyOp]:
-        """Return and clear all pending copy operations, releasing source block refs."""
-        ops = self.pending_copy_ops
-        self.pending_copy_ops = []
-        if ops:
-            self.block_pool.free_blocks(
-                [self.block_pool.blocks[op.src_block_id] for op in ops]
-            )
-        return ops

@@ -30,7 +30,11 @@ from vllm.v1.utils import record_function_or_nullcontext
 
 import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
-from vllm_rbln.v1.core.rbln_kv_cache_manager import KVCacheCopyOp, RBLNKVCacheManager
+from vllm_rbln.v1.core.rbln_kv_cache_manager import (
+    KVCacheCopyOp,
+    RBLNKVCacheManager,
+    SubBlockMatch,
+)
 
 logger = init_logger(__name__)
 
@@ -425,6 +429,7 @@ class RBLNScheduler(Scheduler):
             prefill_token_budget = self.max_num_scheduled_tokens
 
             step_skipped_waiting = create_request_queue(self.policy)
+            sub_block_match = None
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
@@ -467,10 +472,12 @@ class RBLNScheduler(Scheduler):
                 num_external_computed_tokens = 0
                 load_kv_async = False
                 connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
+                sub_block_match = None
+                num_sub_block_tokens = 0
 
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
-                    # Get locally-cached tokens.
+                    # Get locally-cached tokens (full-block matches only).
                     new_computed_blocks, num_new_local_computed_tokens = (
                         self.kv_cache_manager.get_computed_blocks(request)
                     )
@@ -499,9 +506,24 @@ class RBLNScheduler(Scheduler):
                         )
                         connector_prefix_cache_hits = num_external_computed_tokens
 
+                    # NOTE(RBLN): Arbitrate between sub-block match and KV connector.
+                    sub_block_match, num_sub_block_tokens = self._try_sub_block_match(
+                        request,
+                        num_new_local_computed_tokens,
+                        num_external_computed_tokens,
+                    )
+                    if num_sub_block_tokens > 0 and num_external_computed_tokens > 0:
+                        # Cancel the KV connector match in favor of the sub-block match
+                        request.num_external_computed_tokens = 0
+                        num_external_computed_tokens = 0
+                        load_kv_async = False
+                        connector_prefix_cache_hits = 0
+
                     # Total computed tokens (local + external).
                     num_computed_tokens = (
-                        num_new_local_computed_tokens + num_external_computed_tokens
+                        num_new_local_computed_tokens
+                        + num_sub_block_tokens
+                        + num_external_computed_tokens
                     )
                     assert num_computed_tokens <= request.num_tokens
                 else:
@@ -605,7 +627,9 @@ class RBLNScheduler(Scheduler):
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
                     request.num_tokens - num_computed_tokens,
-                    num_new_computed_tokens=num_new_local_computed_tokens,
+                    num_new_computed_tokens=(
+                        num_new_local_computed_tokens + num_sub_block_tokens
+                    ),
                     new_computed_blocks=new_computed_blocks,
                     num_lookahead_tokens=effective_lookahead_tokens,
                     num_external_computed_tokens=num_external_computed_tokens,
@@ -621,6 +645,14 @@ class RBLNScheduler(Scheduler):
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
                     break
+
+                # NOTE(RBLN): Apply sub-block match now that blocks are
+                # allocated (the destination block exists).
+                if sub_block_match is not None:
+                    self.kv_cache_manager.apply_sub_block_match(
+                        sub_block_match, request
+                    )
+                    sub_block_match = None
 
                 # NOTE(RBLN): By calling allocate_slots with
                 # request.num_tokens - num_computed_tokens instead of num_new_tokens,
@@ -744,6 +776,12 @@ class RBLNScheduler(Scheduler):
                 # NOTE(RBLN): we restrict the prefill batch size to 1 for now.
                 break
 
+            # NOTE(RBLN): Release any un-applied sub-block match from a
+            # break path (budget exhausted, allocation failure, etc.).
+            if sub_block_match is not None:
+                assert isinstance(self.kv_cache_manager, RBLNKVCacheManager)
+                self.kv_cache_manager.release_sub_block_match(sub_block_match)
+
             # re-queue requests skipped in this pass ahead of older skipped items.
             if step_skipped_waiting:
                 self.skipped_waiting.prepend_requests(step_skipped_waiting)
@@ -854,3 +892,31 @@ class RBLNScheduler(Scheduler):
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
         return scheduler_output
+
+    def _try_sub_block_match(
+        self,
+        request: Request,
+        num_local_computed_tokens: int,
+        num_external_computed_tokens: int,
+    ) -> tuple[SubBlockMatch | None, int]:
+        """Discover a sub-block match and arbitrate against a KV connector.
+
+        Returns ``(match, extra_tokens)``.
+        When *match* is not ``None`` the caller must later pass it to
+        ``kv_cache_manager.apply_sub_block_match`` or
+        ``kv_cache_manager.release_sub_block_match``.
+        """
+        if not isinstance(self.kv_cache_manager, RBLNKVCacheManager):
+            return None, 0
+
+        match = self.kv_cache_manager.get_computed_blocks_sub_block(
+            request, num_local_computed_tokens
+        )
+        if match is not None and match.num_tokens >= num_external_computed_tokens:
+            # sub-block wins on ties (local copy is cheaper than remote load)
+            return match, match.num_tokens
+
+        # Connector provides better coverage, or no sub-block match at all.
+        if match is not None:
+            self.kv_cache_manager.release_sub_block_match(match)
+        return None, 0

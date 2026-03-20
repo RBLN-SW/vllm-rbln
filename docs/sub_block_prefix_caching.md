@@ -49,6 +49,10 @@ so that each prefill does not span multiple blocks.
 │  │  │  per sub-blk) │  │         block_ids        │  │  │
 │  │  └───────────────┘  └──────────────────────────┘  │  │
 │  └───────────────────────────────────────────────────┘  │
+│          ↕ arbitration (connector vs sub-block)         │
+│  ┌───────────────────────────────────────────────────┐  │
+│  │  KV Connector (optional)                          │  │
+│  └───────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────┘
               │  RBLNSchedulerOutput (kv_cache_copy_ops)
               ▼
@@ -66,14 +70,17 @@ so that each prefill does not span multiple blocks.
    * `SubBlockIndex`:
      Maps sub-block hashes to sets of physical block IDs containing the sub-block.
      Supports `insert`, `pop`, and `longest_match`.
-   * `RBLNKVCacheManager`: Extends upstream `KVCacheManager`. Overrides
-     `get_computed_blocks` (adds sub-block matching after full-block matching),
-     `allocate_slots` (schedules copy ops), and
-     `free` (caches partial blocks).
-     The sub-block machinery is hidden in the manager for compatibility with the original interface,
-     except that the scheduler should `drain_pending_copy_ops()` to retrieve
-     the KV cache copy ops accumulated in the current scheduling step.
-     Additionally, the manager provides `can_use_sub_block_caching()` for checking eligibility.
+   * `RBLNKVCacheManager`: Extends upstream `KVCacheManager`.
+        * Overrides
+            * `allocate_slots` indexes newly cached blocks' sub-block hashes.
+            * `free` caches partial blocks.
+            * `reset_prefix_cache` clears sub-block indices.
+        * New methods
+            * `get_computed_blocks_sub_block(request, num_computed_tokens)`
+              discovers sub-block matches and returns a `SubBlockMatch` handle.
+            * `apply_sub_block_match` / `release_sub_block_match` consume or discard the handle.
+            * `drain_pending_copy_ops()` retrieves the KV cache copy ops accumulated in the current scheduling step.
+            * `can_use_sub_block_caching()` checks eligibility.
    * `KVCacheCopyOp`: Dataclass describing a sub-block KV data copy:
      `(group_id, src_block_id, dst_block_id, num_tokens)`.
 * `vllm_rbln.v1.core.rbln_scheduler`
@@ -119,22 +126,21 @@ The last partial block of a request (the one that doesn't fill a full block)
 is indexed during `free()` per group and given a synthetic `block_hash` so
 upstream's LRU preserves it for potential reuse.
 
-### Step 3: Partial-match lookup (get_computed_blocks)
+### Step 3: Partial-match lookup
 
-`get_computed_blocks(request)`
-1.  Call upstream → full-block matches, `num_computed_tokens`
-2.  Compute sub-block hashes for the request
-3.  For each group:
+`get_computed_blocks_sub_block(request, num_computed_tokens)`
+1.  Compute sub-block hashes for the request
+2.  For each group:
     1. Starting after the last full-block boundary,
        query the group's index with up to `sub_blocks_per_block − 1` hashes
     2. Record the match length
-4.  Extension = min match length across all groups
-5.  If match found → record `_PendingPartialMatch`
+3.  Extension = min match length across all groups
+4.  If match found → return a `SubBlockMatch` handle
     (with per-group `_GroupPartialMatch`),
     bump `src_block`s' ref counts to prevent eviction
-6.  Return `num_computed_tokens` + matched sub-block tokens
-    (capped at `request.num_tokens − 1` to preserve the upstream
-    "must recompute last token" invariant)
+5.  Return the sub-block extension in tokens (0 if no match),
+    capped at `request.num_tokens − 1` to preserve the upstream
+    "must recompute last token" invariant.
 
 The query is limited to `sub_blocks_per_block - 1` because a match of all
 sub-blocks would be a full-block match, which upstream handles already. The
@@ -142,16 +148,14 @@ cap at `num_tokens - 1` ensures the scheduler always schedules at least one
 token for computation (upstream requires the last token to be recomputed to
 produce logits).
 
-### Step 4: Copy op scheduling (allocate_slots)
+### Step 4: Copy op scheduling
 
-allocate_slots(request, ...)
-1.  Snapshot per-group cached block counts
-2.  Call upstream → allocates blocks
-3.  Index any newly cached full blocks for each group
-4.  If `_PendingPartialMatch` exists for this request,
-    for each group:
-    1. Look up the destination block (newly allocated at the match boundary)
-    2. Append `KVCacheCopyOp(group_id, src_block_id, dst_block_id, num_tokens)`
+After `allocate_slots` succeeds, the scheduler calls
+`apply_sub_block_match(match, request)` which, for each group:
+1.  Looks up the destination block (newly allocated at the match boundary)
+2.  Appends `KVCacheCopyOp(group_id, src_block_id, dst_block_id, num_tokens)`
+
+(`allocate_slots` itself only indexes any newly cached full blocks.)
 
 ### Step 5: Copy execution (model runner)
 
@@ -176,6 +180,28 @@ kv_cache[:, dst_block_id, :, :, :num_tokens, :] = \
   `SubBlockIndex.pop()` whenever the upstream evicts a cached block.
 - **Reset**: `reset_prefix_cache()` clears all sub-block indices.
 
+## Interaction with KV Connectors
+
+Sub-block prefix caching and KV connectors are conflicting in that
+both attempt to extend the full-block prefix cache hit with additional tokens.
+Ideally, they should cooperate:
+sub-block match first extends the cache hit,
+then the connector extends the match further from there.
+However, sub-block caching is RBLN custom extension,
+so we cannot assume that all KV connectors will work properly
+when the starting position of their match is not full-block-aligned.
+
+**Compromise: mutual-exclusion arbitration.**
+The scheduler picks whichever offers more tokens.
+On ties, sub-block wins because a local memcpy is cheaper than a remote transfer.
+The worst case performance loss due to this compromise is the diff between
+a remote transfer of `block_size - sub_block_size + 1` tokens (current) vs.
+a local memcpy of `block_size - sub_block_size` tokens + a remote transfer of 1 token (ideal).
+
+In the future, we can allow-list KV connectors
+that are verified to be compatible with sub-block caching,
+or patch existing connectors as needed.
+
 ## Limitations
 
 - To simplify `SubBlockIndex` maintenance,
@@ -188,10 +214,3 @@ kv_cache[:, dst_block_id, :, :, :num_tokens, :] = \
       Currently it copies for all layers, so it is not applicable to multi-group setups.
     - **Synchronous.**
       Currently it is blocking.
-- **Incompatible with KV connector.**
-  Currently, the sub-blocks are not exposed outside of the manager,
-  but KV connector works at the block level.
-  To fix this, the sub-blocks should be exposed as the "canonical" blocks to
-  the rest of the system, and `RBLNKVCacheManager` should ensure that
-  consecutive sub-blocks are contiguous in memory.
-  This requires a complete redesign.
