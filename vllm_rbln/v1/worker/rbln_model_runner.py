@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import bdb
 import contextlib
 import itertools
 import os
+import resource
 import time
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
@@ -1352,6 +1354,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             "process_group_dict": process_group_dict,
             "guard_filter_fn": torch.compiler.keep_tensor_guards_unsafe,
             "mode": "strict",
+            "exp_weight_free": envs.VLLM_RBLN_WEIGHT_FREE,
         }
         if not envs.VLLM_DISABLE_COMPILE_CACHE:
             logger.info(
@@ -1769,6 +1772,9 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
     @torch.inference_mode()
     def warm_up_model(self) -> None:
+        self._log_memory("before warm_up_model (pre-compilation)")
+        if envs.VLLM_RBLN_WEIGHT_FREE:
+            self._weight_free_compiling = True
         num_kv_cache_groups = len(self.kv_cache_config.kv_cache_groups)
 
         logger.info("Warm up prefill graph")
@@ -1890,6 +1896,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             )
             assert current_intermediate_tensors is not None
             self._execute_dummy_requests(so, cso, current_intermediate_tensors)
+
+        self._weight_free_compiling = False
 
     def _add_dummy_requests(
         self,
@@ -2668,6 +2676,10 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 LoRAMask.set_lora_mask(lora_mask)
                 LoRAInputs.set_sampler_indices_padded(sampler_indices_padded)
 
+            if getattr(self, "_weight_free_compiling", False):
+                input_ids = input_ids.to(device="meta")
+                positions = positions.to(device="meta")
+
             start_time = time.perf_counter()
             with capture_ctx as reports:
                 if not self.use_wrapped_compute_logits():
@@ -3122,8 +3134,22 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         return draft_token_ids
 
+    @staticmethod
+    def _log_memory(label: str) -> None:
+        rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        rss_mb = rss_kb / 1024
+        logger.info("[MEM] %s: RSS = %.1f MB", label, rss_mb)
+
     def load_model(self) -> None:
         logger.info("Starting to load model %s...", self.model_config.model)
+        self._log_memory("before load_model")
+
+        if envs.VLLM_RBLN_WEIGHT_FREE:
+            logger.info(
+                "Weight-free mode enabled: model will be initialized on meta device"
+            )
+            self.load_config.device = "meta"
+
         model_loader = get_model_loader(self.load_config)
         if not hasattr(self, "model"):
             logger.info("Loading model from scratch...")
@@ -3133,6 +3159,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         else:
             logger.info("Model was already initialized. Loading weights inplace...")
             model_loader.load_weights(self.model, model_config=self.model_config)
+        self._log_memory("after load_model (weights loaded)")
 
         self.model = self.get_model().eval()
         self.compute_logits_model = self.model
