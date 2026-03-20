@@ -212,9 +212,11 @@ async def main(
     num_input_prompt: int,
     model_id: str,
 ):
-    # NOTE: We can set the device to run submodules by passing `additional_config` to `AsyncEngineArgs`.
+    # NOTE: We can set the device to run submodules
+    # by passing `rbln_config` to `additional_config`
     # Unless specified, OOM may occur when running the vision-related submodules
-    # For example, the tensor parallel size of the language is 16, and the vision submodule is 1,
+    # For example, the tensor parallel size of the language is 16,
+    # and the vision submodule is 1,
     # we can set the device allocation as follows to optimally utilize RBLN memory:
     # engine_args = AsyncEngineArgs(model=model_id, additional_config={
     #     "rbln_config": {
@@ -222,7 +224,7 @@ async def main(
     #         "visual": {
     #             "device": [16],
     #         }
-    #     }    
+    #     }
     # })
     engine_args = AsyncEngineArgs(model=model_id)
 
