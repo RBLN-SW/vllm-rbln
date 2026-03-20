@@ -199,6 +199,8 @@ class RBLNOptimumModelBase(nn.Module):
                     "Compiling the model %s. This may take a while...",
                     self.model_config.model,
                 )
+                # FIXME check whether the rbln_config is not aligned with
+                # the vllm native parameters.
                 model = compile_model(
                     self.model_config.model,
                     config,
