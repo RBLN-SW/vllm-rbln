@@ -214,6 +214,8 @@ async def main(
 ):
     # NOTE: We can set the device to run submodules by passing `additional_config` to `AsyncEngineArgs`.
     # Unless specified, OOM may occur when running the vision-related submodules
+    # For example, the tensor parallel size of the language is 16, and the vision submodule is 1,
+    # we can set the device allocation as follows to optimally utilize RBLN memory:
     # engine_args = AsyncEngineArgs(model=model_id, additional_config={
     #     "rbln_config": {
     #         "device": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
@@ -247,7 +249,7 @@ async def main(
 
 def entry_point(
     num_input_prompt: int = 1,
-    model_id: str = "/home/eunji.lee/qwen3/scripts/Qwen3-VL-30B-A3B-Instruct_rbln_qwen_vl_moe_b1_long",
+    model_id: str = "/qwen2_5-vl-7b-32k-b4-kv16k",
 ):
     asyncio.run(
         main(
