@@ -212,6 +212,16 @@ async def main(
     num_input_prompt: int,
     model_id: str,
 ):
+    # NOTE: We can set the device to run submodules by passing `additional_config` to `AsyncEngineArgs`.
+    # Unless specified, OOM may occur when running the vision-related submodules
+    # engine_args = AsyncEngineArgs(model=model_id, additional_config={
+    #     "rbln_config": {
+    #         "device": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+    #         "visual": {
+    #             "device": [16],
+    #         }
+    #     }    
+    # })
     engine_args = AsyncEngineArgs(model=model_id)
 
     engine = AsyncLLMEngine.from_engine_args(engine_args)
@@ -237,8 +247,7 @@ async def main(
 
 def entry_point(
     num_input_prompt: int = 1,
-    # NOTE: This example supports Qwen2-VL, Qwen2.5-VL, and Qwen3-VL.
-    model_id: str = "/qwen2_5-vl-7b-32k-b4-kv16k",
+    model_id: str = "/home/eunji.lee/qwen3/scripts/Qwen3-VL-30B-A3B-Instruct_rbln_qwen_vl_moe_b1_long",
 ):
     asyncio.run(
         main(

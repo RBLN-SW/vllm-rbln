@@ -207,6 +207,7 @@ class RBLNOptimumModelBase(nn.Module):
                     max_model_len=self.model_config.max_model_len,
                     tp_size=envs.VLLM_RBLN_TP_SIZE,
                     model_path=str(cached_model_path),
+                    additional_config=self.vllm_config.additional_config.get("rbln_config", {}),
                 )
             else:
                 logger.info(
@@ -220,7 +221,15 @@ class RBLNOptimumModelBase(nn.Module):
         if model is None:
             model_cls = getattr(optimum.rbln, model_cls_name)
             assert model_cls is not None
-            model = model_cls.from_pretrained(self.vllm_config.model_config.model)
+            additional_rbln_config = self.vllm_config.additional_config.get("rbln_config", {})
+            # NOTE: We can set the device to run submodules
+            # https://github.com/rebellions-sw/rbln_model_zoo/blob/6b015d28cda7bff2935108ece7d32ae8590cc35c/huggingface/diffusers/text-to-video/cosmos-predict1-7b/inference.py#L78
+            model = model_cls.from_pretrained(
+                self.vllm_config.model_config.model,
+                rbln_config={
+                    **additional_rbln_config
+                }
+            )
             logger.info(
                 "model_name = %s, model_cls_name = %s, model_path = %s",
                 model_name,
