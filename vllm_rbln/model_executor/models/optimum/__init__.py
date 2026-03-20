@@ -36,6 +36,8 @@ from .paligemma import RBLNOptimumPaliGemmaForConditionalGeneration  # noqa: F40
 from .qwen_vl import (  # noqa: F401
     RBLNOptimumQwen2_5_VLForConditionalGeneration,
     RBLNOptimumQwen2VLForConditionalGeneration,
+    RBLNOptimumQwen3VLForConditionalGeneration,
+    RBLNOptimumQwen3VLMoeForConditionalGeneration,
 )
 from .sliding_window import RBLNOptimumSlidingWindowAttentionForCausalLM  # noqa: F401
 from .whisper import RBLNOptimumWhisperForConditionalGeneration  # noqa: F401

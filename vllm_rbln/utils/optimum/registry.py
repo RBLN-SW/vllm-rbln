@@ -63,6 +63,14 @@ _RBLN_MULTIMODAL_MODELS = {
         "qwen2_5_vl",
         "RBLNQwen2_5_VLForConditionalGeneration",
     ),
+    "Qwen3VLForConditionalGeneration": (
+        "qwen3_vl",
+        "RBLNQwen3VLForConditionalGeneration",
+    ),
+    "Qwen3VLMoeForConditionalGeneration": (
+        "qwen3_vl_moe",
+        "RBLNQwen3VLMoeForConditionalGeneration",
+    ),
     "Idefics3ForConditionalGeneration": (
         "idefics3",
         "RBLNIdefics3ForConditionalGeneration",
