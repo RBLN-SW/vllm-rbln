@@ -531,8 +531,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.performance_tracker: PerformanceTracker | None = None
         self.sampler_performance_tracker: PerformanceTracker | None = None
         self.e2e_performance_tracker: PerformanceTracker | None = None
-        self.e2e_start_time = None
-        self.e2e_end_time = None
+        self.e2e_start_time: float = 0.0
+        self.e2e_end_time: float = 0.0
 
         self.dummy_run_state: DummyRunState | None = None
 
@@ -549,8 +549,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self.sampler_performance_tracker.register_cleanup()
             self.e2e_performance_tracker = PerformanceTracker("E2E")
             self.e2e_performance_tracker.register_cleanup()
-            self.e2e_start_time = None
-            self.e2e_end_time = None
 
     def _get_positions(self, num_tokens: Any):
         if isinstance(num_tokens, int):
@@ -2969,16 +2967,16 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             kv_connector_output=kv_connector_output,
             num_nans_in_logits=num_nans_in_logits,
         )
-        self.e2e_end_time = time.perf_counter()
 
         if self.e2e_performance_tracker is not None:
+            self.e2e_end_time = time.perf_counter()
             self.collect_metrics(
                 self.e2e_performance_tracker,
                 is_prefills[0],
-                self.e2e_start_time,
-                self.e2e_end_time,
-                [],
-                scheduler_output.total_num_scheduled_tokens,
+                start_time=self.e2e_start_time,
+                end_time=self.e2e_end_time,
+                reports=[],
+                token_count=scheduler_output.total_num_scheduled_tokens,
             )
 
         if not self.use_async_scheduling:
