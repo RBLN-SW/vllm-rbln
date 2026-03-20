@@ -2723,7 +2723,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         and num_padded_tokens != batch_bucket_size
                     )
                     self.performance_tracker.record_decode(
-                        execution_time,
+                        model_execution_time,
                         num_scheduled_tokens,
                         host_time=host_time,
                         device_time=device_time,
@@ -2925,6 +2925,11 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 propose_draft_token_ids(sampled_token_ids)
 
         with record_function_or_nullcontext("Bookkeep"):
+            # NOTE:
+            # is_prefill is changed after bookkeeping
+            # so we need to get it before bookkeeping,
+            # and pass it to performance tracker.
+            is_prefills = self.is_prefills()
             (
                 num_nans_in_logits,
                 logprobs_lists,
@@ -2964,11 +2969,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             kv_connector_output=kv_connector_output,
             num_nans_in_logits=num_nans_in_logits,
         )
+        self.e2e_end_time = time.perf_counter()
 
         if self.e2e_performance_tracker is not None:
             self.collect_metrics(
                 self.e2e_performance_tracker,
-                self.is_prefills()[0],
+                is_prefills[0],
                 self.e2e_start_time,
                 self.e2e_end_time,
                 [],

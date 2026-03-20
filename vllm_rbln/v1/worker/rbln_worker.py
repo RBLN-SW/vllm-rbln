@@ -479,6 +479,8 @@ class RBLNWorker(WorkerBase):
                 self.model_runner.performance_tracker.print_final_stats()
             if self.model_runner.sampler_performance_tracker:
                 self.model_runner.sampler_performance_tracker.print_final_stats()
+            if self.model_runner.e2e_performance_tracker:
+                self.model_runner.e2e_performance_tracker.print_final_stats()
 
 
 def init_worker_distributed_environment(
