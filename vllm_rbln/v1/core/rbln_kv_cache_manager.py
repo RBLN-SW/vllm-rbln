@@ -391,7 +391,7 @@ class RBLNKVCacheManager(KVCacheManager):
 
         Call this after ``allocate_slots`` succeeds. The source-block refs
         owned by *match* are transferred to the pending copy ops (released
-        by ``drain_pending_copy_ops``).
+        by ``release_copy_ops``).
         """
         blocks = self.coordinator.get_blocks(request.request_id)
 
@@ -456,14 +456,22 @@ class RBLNKVCacheManager(KVCacheManager):
         return result
 
     def drain_pending_copy_ops(self) -> list[KVCacheCopyOp]:
-        """Return and clear all pending copy operations, releasing source block refs."""
+        """Return and clear all pending copy operations.
+
+        Source-block refs are **retained** so the data remains valid until
+        the model runner finishes the copies.  The caller must call
+        :meth:`release_copy_ops` afterwards to free the refs.
+        """
         ops = self.pending_copy_ops
         self.pending_copy_ops = []
+        return ops
+
+    def release_copy_ops(self, ops: list[KVCacheCopyOp]) -> None:
+        """Release source-block refs held by previously drained copy ops."""
         if ops:
             self.block_pool.free_blocks(
                 [self.block_pool.blocks[op.src_block_id] for op in ops]
             )
-        return ops
 
     def free(self, request: Request) -> None:
         """Free blocks and clean up sub-block state for a request."""

@@ -24,7 +24,8 @@ from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler
-from vllm.v1.engine import EngineCoreEventType
+from vllm.v1.engine import EngineCoreEventType, EngineCoreOutputs
+from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.utils import record_function_or_nullcontext
 
@@ -867,6 +868,9 @@ class RBLNScheduler(Scheduler):
         )
 
         # Drain pending copy ops from the KV cache manager.
+        # Source-block refs are kept alive until update_from_output(),
+        # which runs after the model runner finishes (safe for async
+        # scheduling / pipeline parallelism).
         if isinstance(self.kv_cache_manager, RBLNKVCacheManager):
             scheduler_output.kv_cache_copy_ops = (
                 self.kv_cache_manager.drain_pending_copy_ops()
@@ -892,6 +896,24 @@ class RBLNScheduler(Scheduler):
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
         return scheduler_output
+
+    def update_from_output(
+        self,
+        scheduler_output: SchedulerOutput,
+        model_runner_output: ModelRunnerOutput,
+    ) -> dict[int, EngineCoreOutputs]:
+        # Release source-block refs from this step's copy ops now that the
+        # model runner has finished copying.  This is safe for async
+        # scheduling because update_from_output is called only after the
+        # execution future completes.
+        if (
+            isinstance(scheduler_output, RBLNSchedulerOutput)
+            and scheduler_output.kv_cache_copy_ops
+        ):
+            assert isinstance(self.kv_cache_manager, RBLNKVCacheManager)
+            self.kv_cache_manager.release_copy_ops(scheduler_output.kv_cache_copy_ops)
+
+        return super().update_from_output(scheduler_output, model_runner_output)
 
     def _try_sub_block_match(
         self,

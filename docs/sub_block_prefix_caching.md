@@ -80,6 +80,7 @@ so that each prefill does not span multiple blocks.
               discovers sub-block matches and returns a `SubBlockMatch` handle.
             * `apply_sub_block_match` / `release_sub_block_match` consume or discard the handle.
             * `drain_pending_copy_ops()` retrieves the KV cache copy ops accumulated in the current scheduling step.
+            * `release_copy_ops()` releases the source-block references after the model runner finishes copying.
             * `can_use_sub_block_caching()` checks eligibility.
    * `KVCacheCopyOp`: Dataclass describing a sub-block KV data copy:
      `(group_id, src_block_id, dst_block_id, num_tokens)`.
@@ -88,6 +89,8 @@ so that each prefill does not span multiple blocks.
    * `RBLNScheduler.__init__`: Creates `RBLNKVCacheManager` when prefix caching is
      enabled and `can_use_sub_block_caching()` passes.
    * `RBLNScheduler.schedule`: Returns `RBLNSchedulerOutput`, draining copy ops from the manager.
+   * `RBLNScheduler.update_from_output`: Releases source-block refs from copy ops
+     after the model runner finishes (safe for async scheduling / pipeline parallelism).
 * `vllm_rbln.v1.worker.rbln_model_runner`
    * `_process_kv_cache_copy_ops`: Copies KV data between blocks before the forward pass.
 

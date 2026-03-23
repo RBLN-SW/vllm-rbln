@@ -871,9 +871,9 @@ class TestRBLNKVCacheManager:
         _, _, new_blocks = _prefill_request(manager, req1)
         assert new_blocks is not None
 
-    def test_src_block_protected_until_drain(self):
+    def test_src_block_protected_until_release(self):
         """Source block for a copy op must stay referenced until
-        drain_pending_copy_ops releases it."""
+        release_copy_ops is called (after the model runner copies data)."""
         manager = _make_manager(self.BLOCK_SIZE, self.SUB_BLOCK_SIZE, num_blocks=10)
 
         req0 = _make_request("0", list(range(self.BLOCK_SIZE)), self.BLOCK_SIZE)
@@ -889,15 +889,19 @@ class TestRBLNKVCacheManager:
         src_block_id = manager.pending_copy_ops[0].src_block_id
         src_block = manager.block_pool.blocks[src_block_id]
         assert src_block.ref_cnt > 0
+        ref_before_drain = src_block.ref_cnt
 
         # Reset should fail due to pending copy op refs.
         assert not manager.reset_prefix_cache()
         assert len(_sub_block_index(manager)._block_hashes) > 0
 
-        # After drain, source block ref is released.
-        manager.drain_pending_copy_ops()
-        # ref_cnt should have decremented (may still be >0 if other refs exist).
-        assert src_block.ref_cnt >= 0
+        # drain returns ops but does NOT release refs.
+        ops = manager.drain_pending_copy_ops()
+        assert src_block.ref_cnt == ref_before_drain
+
+        # release_copy_ops releases the refs.
+        manager.release_copy_ops(ops)
+        assert src_block.ref_cnt == ref_before_drain - 1
 
     def test_exact_block_size_request_sub_block_recovery(self):
         """When num_tokens == block_size, upstream caps at num_tokens-1 and
@@ -943,6 +947,70 @@ class TestRBLNKVCacheManager:
         assert num_computed == 0  # Full-block path also skipped.
         sub_match = manager.get_computed_blocks_sub_block(req, num_computed)
         assert sub_match is None
+
+    def test_early_release_allows_src_eviction(self):
+        """Demonstrates the async-scheduling race: if copy-op source-block
+        refs are released before the model runner copies data, a subsequent
+        allocation can evict the source block.
+
+        The sequence simulates what happens when schedule(N+1) releases
+        step N's copy-op refs while execute_model(N) hasn't run yet:
+
+        1. Nearly fill memory, create a copy op (src block ref-held)
+        2. drain_pending_copy_ops  (scheduler builds output for step N)
+        3. release_copy_ops        (schedule N+1 starts, releases refs)
+        4. New allocation forces eviction → src block is reclaimed
+        5. The copy op now points to a recycled block — data is lost
+        """
+        # 4 blocks total: req0 uses 1, req1 uses 2 (with sub-block match),
+        # leaving 1 free.  After freeing req1 and releasing the copy-op ref,
+        # req2 needs 3 blocks → must evict the src block.
+        manager = _make_manager(self.BLOCK_SIZE, self.SUB_BLOCK_SIZE, num_blocks=4)
+
+        # req0: fill 1 full block → cached & indexed.
+        req0 = _make_request("0", list(range(self.BLOCK_SIZE)), self.BLOCK_SIZE)
+        _prefill_request(manager, req0)
+        manager.free(req0)  # block cached in LRU + sub-block index
+
+        # req1: partial match on first sub-block → uses 2 blocks, copy op pending.
+        shared = list(range(self.SUB_BLOCK_SIZE))
+        req1 = _make_request(
+            "1", shared + [100 + i for i in range(self.BLOCK_SIZE)], self.BLOCK_SIZE
+        )
+        _prefill_request(manager, req1)
+        assert len(manager.pending_copy_ops) == 1
+
+        src_block_id = manager.pending_copy_ops[0].src_block_id
+        src_block = manager.block_pool.blocks[src_block_id]
+
+        # --- simulate scheduler building output (end of schedule N) ---
+        ops = manager.drain_pending_copy_ops()
+        # Source block still protected (drain doesn't release).
+        assert src_block.ref_cnt > 0
+
+        # --- simulate schedule(N+1) starting: premature release ---
+        manager.release_copy_ops(ops)
+        # Source block ref dropped — now an eviction candidate.
+
+        # Free req1 to make its 2 blocks available, but the cached src
+        # block (from req0) is also free now since we released its ref.
+        manager.free(req1)
+
+        # req2 needs 3 blocks → must evict the former src block.
+        req2 = _make_request(
+            "2", [200 + i for i in range(3 * self.BLOCK_SIZE)], self.BLOCK_SIZE
+        )
+        _prefill_request(manager, req2)
+
+        # The source block has been recycled for req2.
+        # Its block_hash was cleared by eviction, confirming reuse.
+        # In a real system, the model runner would now copy stale data
+        # from ops[0].src_block_id — a correctness bug.
+        assert src_block.ref_cnt > 0  # now held by req2
+        assert src_block.block_hash is not None  # re-cached for req2
+
+        # Verify the copy op still references the recycled block id.
+        assert ops[0].src_block_id == src_block.block_id
 
 
 # ---------------------------------------------------------------------------
@@ -1509,6 +1577,46 @@ class TestRBLNScheduler:
         uncomputed = [blk for blk in req_blocks if blk.block_hash is None]
         for blk in uncomputed:
             assert not index.contains(blk.block_id)
+
+    def test_copy_op_refs_released_in_update_from_output(self):
+        """Source-block refs from copy ops must be released in
+        update_from_output (after execution), not in schedule().
+
+        This is critical for async scheduling where schedule(N+1) runs
+        before execute_model(N) completes."""
+        scheduler = self._create_scheduler(num_blocks=10)
+        mgr = scheduler.kv_cache_manager
+        assert isinstance(mgr, RBLNKVCacheManager)
+
+        # Build a cached block.
+        req0 = _make_request("0", [0] * self.BLOCK_SIZE, self.BLOCK_SIZE, max_tokens=1)
+        scheduler.add_request(req0)
+        out0 = scheduler.schedule()
+        scheduler.update_from_output(out0, create_runner_output(out0, 0))
+
+        # New request with sub-block match → copy op.
+        shared = [0] * self.SUB_BLOCK_SIZE
+        unique = [900 + i for i in range(self.BLOCK_SIZE)]
+        req1 = _make_request("1", shared + unique, self.BLOCK_SIZE, max_tokens=1)
+        scheduler.add_request(req1)
+        out1 = scheduler.schedule()
+        assert len(out1.kv_cache_copy_ops) == 1
+
+        src_block_id = out1.kv_cache_copy_ops[0].src_block_id
+        src_block = mgr.block_pool.blocks[src_block_id]
+
+        # Before update_from_output: src block ref still held.
+        assert src_block.ref_cnt > 0
+        ref_before = src_block.ref_cnt
+
+        # Simulate schedule(N+1) starting BEFORE update_from_output(N).
+        # With the fix, schedule() does NOT release the refs.
+        # (Nothing to verify here — the key is that schedule() no longer
+        # touches _unreleased_copy_ops.)
+
+        # Now update_from_output releases the refs.
+        scheduler.update_from_output(out1, create_runner_output(out1, 1))
+        assert src_block.ref_cnt == ref_before - 1
 
 
 # ---------------------------------------------------------------------------
