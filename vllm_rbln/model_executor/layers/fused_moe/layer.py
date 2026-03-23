@@ -110,8 +110,6 @@ else:
         up_proj_bias: torch.Tensor | None = None,
         down_proj_bias: torch.Tensor | None = None,
         dp_mask: torch.Tensor | None = None,
-        n_group: int | None = None,
-        topk_group: int | None = None,
     ) -> torch.Tensor:
         """
         Customized MoE GLU operation (custom kernel version).
@@ -149,8 +147,6 @@ else:
         up_proj_bias: torch.Tensor | None = None,
         down_proj_bias: torch.Tensor | None = None,
         dp_mask: torch.Tensor | None = None,
-        n_group: int | None = None,
-        topk_group: int | None = None,
     ) -> torch.Tensor:
         return torch.empty_like(hidden_states)
 
@@ -328,6 +324,9 @@ def unquantized_fused_moe_method_custom(
     hidden_states = x.reshape(num_tokens, -1)
     router_logits = router_logits.reshape(num_tokens, -1)
 
+    if layer.use_grouped_topk:
+        raise NotImplementedError("Grouped topk case is not supported")
+
     masked_routing_weights, expert_select_count = get_masked_routing_weights(
         router_logits, layer.top_k, layer.renormalize, layer.expert_map
     )
@@ -336,13 +335,6 @@ def unquantized_fused_moe_method_custom(
     use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
     if use_moe_tokens_mask:
         tokens_mask = get_tokens_mask(num_tokens)
-
-    if layer.use_grouped_topk:
-        n_group = layer.num_expert_group
-        topk_group = layer.topk_group
-    else:
-        n_group = None
-        topk_group = None
 
     final_hidden_states = torch.ops.rbln_custom_ops.custom_moe_glu(
         hidden_states,
@@ -355,8 +347,6 @@ def unquantized_fused_moe_method_custom(
         None,
         None,
         tokens_mask,
-        n_group,
-        topk_group,
     )
     return final_hidden_states.reshape(orig_shape)
 
