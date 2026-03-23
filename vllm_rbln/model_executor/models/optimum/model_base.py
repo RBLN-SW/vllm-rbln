@@ -202,8 +202,9 @@ class RBLNOptimumModelBase(nn.Module):
                 # FIXME check whether the rbln_config is not aligned with
                 # the vllm native parameters.
                 rbln_config = self.vllm_config.additional_config.get("rbln_config", {})
-                assert rbln_config == {}, (
-                    "Currently, we don't support passing rbln_config for compilation yet."
+                assert len(rbln_config) == 0, (
+                    "Currently, we don't support passing rbln_config "
+                    "for compilation yet."
                 )
                 model = compile_model(
                     self.model_config.model,
@@ -229,7 +230,6 @@ class RBLNOptimumModelBase(nn.Module):
             assert model_cls is not None
             rbln_config = self.vllm_config.additional_config.get("rbln_config", {})
             # NOTE: We can set the device to run submodules
-            # https://github.com/rebellions-sw/rbln_model_zoo/blob/6b015d28cda7bff2935108ece7d32ae8590cc35c/huggingface/diffusers/text-to-video/cosmos-predict1-7b/inference.py#L78
             model = model_cls.from_pretrained(
                 self.vllm_config.model_config.model,
                 rbln_config={**rbln_config},
