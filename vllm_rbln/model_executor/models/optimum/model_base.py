@@ -201,6 +201,8 @@ class RBLNOptimumModelBase(nn.Module):
                 )
                 # FIXME check whether the rbln_config is not aligned with
                 # the vllm native parameters.
+                rbln_config = self.vllm_config.additional_config.get("rbln_config", {})
+                assert rbln_config is {}, "Currently, we don't support passing rbln_config for compilation yet."
                 model = compile_model(
                     self.model_config.model,
                     config,
@@ -209,9 +211,7 @@ class RBLNOptimumModelBase(nn.Module):
                     max_model_len=self.model_config.max_model_len,
                     tp_size=envs.VLLM_RBLN_TP_SIZE,
                     model_path=str(cached_model_path),
-                    additional_config=self.vllm_config.additional_config.get(
-                        "rbln_config", {}
-                    ),
+                    additional_config=rbln_config,
                 )
             else:
                 logger.info(

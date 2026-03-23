@@ -251,6 +251,7 @@ async def main(
 
 def entry_point(
     num_input_prompt: int = 1,
+    # NOTE: This example supports Qwen2-VL, Qwen2.5-VL, and Qwen3-VL.
     model_id: str = "/qwen2_5-vl-7b-32k-b4-kv16k",
 ):
     asyncio.run(
