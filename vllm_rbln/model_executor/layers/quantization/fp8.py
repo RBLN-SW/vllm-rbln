@@ -395,6 +395,8 @@ def custom_moe_swiglu_group_dequantize(
     down_proj_bias: torch.Tensor | None = None,
     expert_map: torch.Tensor | None = None,
     dp_mask: torch.Tensor | None = None,
+    n_group: int | None = None,
+    topk_group: int | None = None,
 ) -> torch.Tensor:
     """
     Customized MoE SwiGLU operation.
@@ -535,6 +537,8 @@ def custom_moe_swiglu_group_dequantize_fake(
     down_proj_bias: torch.Tensor | None = None,
     expert_map: torch.Tensor | None = None,
     dp_mask: torch.Tensor | None = None,
+    n_group: int | None = None,
+    topk_group: int | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
 

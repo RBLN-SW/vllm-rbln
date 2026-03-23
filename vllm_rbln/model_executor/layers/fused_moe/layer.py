@@ -21,7 +21,6 @@ from vllm.model_executor.layers.fused_moe.layer import (
     UnquantizedFusedMoEMethod,
 )
 
-from vllm.vllm.model_executor.models.utils import LayerFn
 import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
 
@@ -49,6 +48,8 @@ if envs.VLLM_RBLN_MOE_USE_OPT_KERNEL:
         up_proj_bias: torch.Tensor | None = None,
         down_proj_bias: torch.Tensor | None = None,
         dp_mask: torch.Tensor | None = None,
+        n_group: int | None = None,
+        topk_group: int | None = None,
     ) -> torch.Tensor:
         """
         Customized MoE GLU operation (optimized kernel version).
@@ -87,6 +88,8 @@ if envs.VLLM_RBLN_MOE_USE_OPT_KERNEL:
         up_proj_bias: torch.Tensor | None = None,
         down_proj_bias: torch.Tensor | None = None,
         dp_mask: torch.Tensor | None = None,
+        n_group: int | None = None,
+        topk_group: int | None = None,
     ) -> torch.Tensor:
         return torch.empty_like(hidden_states)
 
@@ -107,6 +110,8 @@ else:
         up_proj_bias: torch.Tensor | None = None,
         down_proj_bias: torch.Tensor | None = None,
         dp_mask: torch.Tensor | None = None,
+        n_group: int | None = None,
+        topk_group: int | None = None,
     ) -> torch.Tensor:
         """
         Customized MoE GLU operation (custom kernel version).
@@ -144,6 +149,8 @@ else:
         up_proj_bias: torch.Tensor | None = None,
         down_proj_bias: torch.Tensor | None = None,
         dp_mask: torch.Tensor | None = None,
+        n_group: int | None = None,
+        topk_group: int | None = None,
     ) -> torch.Tensor:
         return torch.empty_like(hidden_states)
 
