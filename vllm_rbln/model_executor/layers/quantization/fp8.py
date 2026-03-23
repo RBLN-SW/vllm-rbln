@@ -395,6 +395,8 @@ def custom_moe_swiglu_group_dequantize(
     down_proj_bias: torch.Tensor | None = None,
     expert_map: torch.Tensor | None = None,
     dp_mask: torch.Tensor | None = None,
+    n_group: int | None = None,
+    topk_group: int | None = None,
 ) -> torch.Tensor:
     """
     Customized MoE SwiGLU operation.
@@ -535,6 +537,8 @@ def custom_moe_swiglu_group_dequantize_fake(
     down_proj_bias: torch.Tensor | None = None,
     expert_map: torch.Tensor | None = None,
     dp_mask: torch.Tensor | None = None,
+    n_group: int | None = None,
+    topk_group: int | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
 
@@ -856,6 +860,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
         if use_moe_tokens_mask:
             tokens_mask = get_tokens_mask(num_tokens)
+            
+        if layer.use_grouped_topk:
+            n_group = layer.num_expert_group
+            topk_group = layer.topk_group
+        else:
+            n_group = None
+            topk_group = None
 
         final_hidden_states = (
             torch.ops.rbln_custom_ops.custom_moe_swiglu_group_dequantize(
@@ -875,6 +886,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 None,  # down_proj_bias
                 expert_map_const,
                 tokens_mask,
+                n_group,
+                topk_group,
             )
         )
 
