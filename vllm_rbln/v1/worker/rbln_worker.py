@@ -198,9 +198,8 @@ class RBLNWorker(WorkerBase):
             self.parallel_config,
         )
 
-        # Use half of allocated CPUs to avoid oversubscription
         allocated_cpus = len(os.sched_getaffinity(0))
-        num_threads = max(2, allocated_cpus // 2)
+        num_threads = max(2, allocated_cpus)
         set_omp_num_threads(
             self.rank,
             self.local_rank,
