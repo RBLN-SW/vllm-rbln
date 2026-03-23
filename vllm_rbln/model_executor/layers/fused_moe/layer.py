@@ -41,8 +41,6 @@ if envs.VLLM_RBLN_MOE_USE_OPT_KERNEL:
         up_proj_weight: torch.Tensor,
         down_proj_weight: torch.Tensor,
         masked_routing_weight: torch.Tensor,
-        topk: int,
-        post_norm: bool,
         expert_map: torch.Tensor | None = None,
         gate_proj_bias: torch.Tensor | None = None,
         up_proj_bias: torch.Tensor | None = None,
@@ -69,7 +67,7 @@ if envs.VLLM_RBLN_MOE_USE_OPT_KERNEL:
             up = torch.nn.functional.linear(hidden_states, up_proj_weight[i])
             mul = torch.nn.functional.silu(gate) * up
             down = torch.nn.functional.linear(mul, down_proj_weight[i])
-            out += down * masked_routing_weight[:, i : i + 1]
+            out += down * masked_routing_weight.transpose(0, 1)[:, i : i + 1]
         return out
 
     @custom_moe_glu.register_fake
@@ -79,8 +77,6 @@ if envs.VLLM_RBLN_MOE_USE_OPT_KERNEL:
         up_proj_weight: torch.Tensor,
         down_proj_weight: torch.Tensor,
         masked_routing_weight: torch.Tensor,
-        topk: int,
-        post_norm: bool,
         expert_map: torch.Tensor | None = None,
         gate_proj_bias: torch.Tensor | None = None,
         up_proj_bias: torch.Tensor | None = None,
@@ -128,7 +124,7 @@ else:
             up = torch.nn.functional.linear(hidden_states, up_proj_weight[i])
             mul = torch.nn.functional.silu(gate) * up
             down = torch.nn.functional.linear(mul, down_proj_weight[i])
-            out += down * masked_routing_weight[:, i : i + 1]
+            out += down * masked_routing_weight.transpose(0, 1)[:, i : i + 1]
         return out
 
     @custom_moe_glu.register_fake
@@ -369,6 +365,21 @@ def unquantized_fused_optimize_moe_method_custom(
     hidden_states = x.reshape(num_tokens, -1)
     router_logits = router_logits.reshape(num_tokens, -1)
 
+    router_logits = router_logits.transpose(0, 1)  # [num_experts, num_tokens]
+
+    # Compute routing weights: softmax + topk + scatter only
+    # (dp_mask and expert_map are handled separately by the compiler)
+    if layer.renormalize:
+        # post_norm: topk first, then softmax on selected values
+        topk_weights, selected_experts = torch.topk(router_logits, k=layer.top_k, dim=0)
+        topk_weights = F.softmax(topk_weights, dim=0)
+    else:
+        # pre_norm: softmax first, then topk
+        routing_weights = F.softmax(router_logits, dim=0)
+        topk_weights, selected_experts = torch.topk(routing_weights, k=layer.top_k, dim=0)
+    masked_routing_weights = torch.zeros_like(router_logits)
+    masked_routing_weights.scatter_(0, selected_experts, topk_weights)
+
     expert_map_const = None
     if layer.expert_map is not None:
         # Extract numpy array and create a fresh constant tensor
@@ -380,16 +391,12 @@ def unquantized_fused_optimize_moe_method_custom(
     if use_moe_tokens_mask:
         tokens_mask = get_tokens_mask(num_tokens)
 
-    # optimum-rbln/src/optimum/rbln/transformers/models/qwen3_moe/
-    # qwen3_moe_architecture.py
     final_hidden_states = torch.ops.rbln_custom_ops.custom_moe_glu(
         hidden_states,
         gate_proj_weight,
         up_proj_weight,
         down_proj_weight,
-        router_logits,
-        layer.top_k,
-        layer.renormalize,
+        masked_routing_weights,
         expert_map_const,
         None,
         None,
