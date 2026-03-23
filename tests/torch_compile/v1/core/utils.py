@@ -14,15 +14,17 @@
 
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# Copied from https://github.com/vllm-project/vllm/blob/v0.12.0/tests/v1/core/utils.py
+# Copied from https://github.com/vllm-project/vllm/blob/v0.17.1/tests/v1/core/utils.py
 # Search for NOTE(RBLN) or TODO(RBLN) for changes
 
 
 import torch
 from vllm.config import (
     CacheConfig,
-    ECTransferConfig,  # KVTransferConfig,
+    # ECTransferConfig,
+    # KVTransferConfig,
     ModelConfig,
+    ParallelConfig,
     SchedulerConfig,
     SpeculativeConfig,
     VllmConfig,
@@ -66,6 +68,7 @@ def create_scheduler(
     num_speculative_tokens: int | None = None,
     skip_tokenizer_init: bool = False,
     async_scheduling: bool = False,
+    pipeline_parallel_size: int = 1,
     use_ec_connector: bool = False,
     ec_role: str | None = None,
 ) -> RBLNScheduler:
@@ -87,8 +90,6 @@ def create_scheduler(
     assert not async_scheduling
     # TODO(RBLN): support kv transfer via kv connector
     assert not use_kv_connector
-    # TODO(RBLN): support specluative decoding
-    assert not num_speculative_tokens
 
     model_config = ModelConfig(
         model=model,
@@ -129,11 +130,9 @@ def create_scheduler(
     #     )
     # elif use_kv_connector:
     #     kv_transfer_config = KVTransferConfig(
-    #         kv_connector="SharedStorageConnector",
+    #         kv_connector="ExampleConnector",
     #         kv_role="kv_both",
-    #         kv_connector_extra_config={
-    #             "shared_storage_path": "local_storage"
-    #         },
+    #         kv_connector_extra_config={"shared_storage_path": "local_storage"},
     #     )
 
     speculative_config: SpeculativeConfig | None = None
@@ -142,20 +141,22 @@ def create_scheduler(
             model="ngram", num_speculative_tokens=num_speculative_tokens
         )
 
-    ec_transfer_config = (
-        ECTransferConfig(
-            ec_connector="ECSharedStorageConnector",
-            ec_role=ec_role,
-            ec_connector_extra_config={"shared_storage_path": "/tmp/ec_test"},
-        )
-        if use_ec_connector
-        else None
-    )
+    ec_transfer_config = None
+    # ec_transfer_config = (
+    #     ECTransferConfig(
+    #         ec_connector="ECExampleConnector",
+    #         ec_role=ec_role,
+    #         ec_connector_extra_config={"shared_storage_path": "/tmp/ec_test"},
+    #     )
+    #     if use_ec_connector
+    #     else None
+    # )
 
     vllm_config = VllmConfig(
         scheduler_config=scheduler_config,
         model_config=model_config,
         cache_config=cache_config,
+        parallel_config=ParallelConfig(pipeline_parallel_size=pipeline_parallel_size),
         kv_transfer_config=kv_transfer_config,
         speculative_config=speculative_config,
         ec_transfer_config=ec_transfer_config,
@@ -165,13 +166,18 @@ def create_scheduler(
         kv_cache_tensors=[],
         kv_cache_groups=[
             KVCacheGroupSpec(
-                ["layer"], FullAttentionSpec(block_size, 1, 1, torch.float32, False)
+                ["layer"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
             )
         ],
     )
     cache_config.num_gpu_blocks = num_blocks
-    # TODO(RBLN): support async scheduling
-    # scheduler_cls = AsyncScheduler if async_scheduling else RBLNScheduler
+    # scheduler_cls = RBLNAsyncScheduler if async_scheduling else RBLNScheduler
     scheduler_cls = RBLNScheduler
     return scheduler_cls(
         vllm_config=vllm_config,
@@ -190,6 +196,7 @@ def create_requests(
     num_tokens: int = 10,
     mm_hashes_list: list[list[str]] | None = None,
     mm_positions: list[list[PlaceholderRange]] | None = None,
+    ignore_eos: bool = False,
     max_tokens: int = 16,
     stop_token_ids: list[int] | None = None,
     prompt_logprobs: int | None = None,
@@ -208,17 +215,17 @@ def create_requests(
 
     block_hasher = get_request_block_hasher(block_size, sha256)
     sampling_params = SamplingParams(
-        ignore_eos=False,
+        ignore_eos=ignore_eos,
         max_tokens=max_tokens,
         stop_token_ids=stop_token_ids,
         prompt_logprobs=prompt_logprobs,
     )
+    sampling_params.update_from_generation_config({}, EOS_TOKEN_ID)
     requests = []
 
     if mm_hashes_list is not None:
         # NOTE: allow manual input; some mm items can have the same identifier
-        # no. of mm_hashes and mm_positions for each request should be
-        # identical
+        # no. of mm_hashes and mm_positions for each request should be identical
         assert mm_positions is not None, (
             "mm_positions must be provided when mm_hashes_list is provided"
         )
@@ -226,8 +233,7 @@ def create_requests(
         assert [len(h) for h in mm_hashes_list] == [len(p) for p in mm_positions]
 
         # Since same identifier would imply they are identical encoder output
-        # Verify mm items with identical identifier are having
-        # mm_position.length
+        # Verify mm items with identical identifier are having mm_position.length
         seen_hashes: dict[str, int] = {}
 
     if req_ids:
@@ -248,9 +254,9 @@ def create_requests(
                 position_length = position.length
                 if identifier in seen_hashes:
                     assert seen_hashes[identifier] == position_length, (
-                        f"mm_hash '{identifier}' has inconsistent position "
-                        f"lengths: previously {seen_hashes[identifier]}, now "
-                        f"{position_length} at request {i}, position {j}"
+                        f"mm_hash '{identifier}' has inconsistent position lengths: "
+                        f"previously {seen_hashes[identifier]}, now {position_length} "
+                        f"at request {i}, position {j}"
                     )
                 else:
                     seen_hashes[identifier] = position_length
@@ -258,7 +264,7 @@ def create_requests(
                 # Unique dummy hash for each mm item
                 identifier = f"hash{i}_{j}"
             mm_feature = MultiModalFeatureSpec(
-                data=MultiModalKwargsItem.dummy("dummy_m"),
+                data=MultiModalKwargsItem.dummy(),
                 mm_position=position,
                 identifier=identifier,
                 modality="image",
@@ -272,7 +278,6 @@ def create_requests(
             sampling_params=sampling_params,
             pooling_params=None,
             mm_features=mm_features if mm_features else None,
-            eos_token_id=EOS_TOKEN_ID,
             block_hasher=block_hasher,
         )
         requests.append(request)
