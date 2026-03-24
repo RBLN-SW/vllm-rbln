@@ -327,6 +327,65 @@ def test_build_given_sliding_window_decode_clamps_cache_lengths_and_generates_ma
     assert metadata.swa_attn_masks.shape == (2, 1, 1, 4)
 
 
+@pytest.mark.parametrize(
+    ("positions", "num_tokens", "expected_prefix"),
+    [
+        (torch.tensor([1, 2], dtype=torch.int32), [3], [0.0, 1.0, 0.0]),
+        (torch.tensor([3, 4], dtype=torch.int32), [5], [1.0, 1.0, 1.0]),
+    ],
+)
+def test_build_given_noncausal_prefill_constructs_chunked_attention_mask(
+    metadata_builder_factory,
+    positions: torch.Tensor,
+    num_tokens: list[int],
+    expected_prefix: list[float],
+):
+    builder = metadata_builder_factory(is_causal=False)
+    common_attn_metadata = _make_common_attn_metadata(
+        num_reqs=1,
+        query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
+        seq_lens=torch.tensor([positions[-1].item() + 1], dtype=torch.int32),
+        block_table_tensor=torch.tensor([[0, 1]], dtype=torch.int16),
+    )
+
+    metadata = builder.build(
+        common_prefix_len=0,
+        common_attn_metadata=common_attn_metadata,
+        num_tokens=torch.tensor(num_tokens, dtype=torch.int32).numpy(),
+        positions=positions,
+        batch_pad=1,
+    )
+
+    assert metadata.is_prefill is True
+    assert metadata.attn_masks is not None
+    assert metadata.attn_masks.shape[-2:] == (2, 8)
+    assert metadata.attn_masks[0, 0, 0, 0, :3].tolist() == expected_prefix
+
+
+def test_build_given_batch_attention_opt_decode_uses_seq_idx_as_seq_lens(
+    metadata_builder_factory,
+):
+    builder = metadata_builder_factory(is_batch_attention_opt=True)
+    common_attn_metadata = _make_common_attn_metadata(
+        num_reqs=2,
+        query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
+        seq_lens=torch.tensor([2, 3], dtype=torch.int32),
+        block_table_tensor=torch.tensor([[0, 1], [1, 0]], dtype=torch.int16),
+    )
+
+    metadata = builder.build(
+        common_prefix_len=0,
+        common_attn_metadata=common_attn_metadata,
+        num_tokens=torch.tensor([1, 1], dtype=torch.int32).numpy(),
+        positions=torch.tensor([1, 2], dtype=torch.int32),
+        batch_pad=2,
+    )
+
+    assert metadata.is_prefill is False
+    assert metadata.seq_lens.shape == (2, 1)
+    assert metadata.seq_lens.tolist() == [[1], [2]]
+
+
 def test_forward_given_custom_sliding_window_batch_decode_forwards_int32_masks_and_normalized_sinks(
     monkeypatch, backend_module, attention_impl_factory
 ):
@@ -372,6 +431,120 @@ def test_forward_given_custom_sliding_window_batch_decode_forwards_int32_masks_a
     )
     assert selected.call_args.args[9] is metadata.swa_attn_masks
     assert torch.equal(selected.call_args.args[10], attention_impl.sinks)
+
+
+def test_forward_given_compiled_custom_sliding_window_prefill_routes_with_sinks(
+    monkeypatch, backend_module, attention_impl_factory
+):
+    selected = Mock(return_value=torch.zeros((1, 1, 4, 2, 32), dtype=torch.float32))
+    not_selected = Mock()
+
+    _configure_runtime(
+        monkeypatch, backend_module, compile_model=True, use_custom_kernel=False
+    )
+    _patch_namespace_op(
+        monkeypatch,
+        backend_module.torch.ops.rbln_custom_ops,
+        "sliding_window_attention_naive_prefill",
+        selected,
+    )
+    _patch_namespace_op(
+        monkeypatch,
+        backend_module.torch.ops.rbln_triton_ops,
+        "sliding_window_attention_naive_prefill",
+        not_selected,
+    )
+
+    attention_impl = attention_impl_factory(
+        sliding_window=4,
+        sinks=torch.ones(4, dtype=torch.float32),
+    )
+    metadata = _make_forward_metadata(
+        is_prefill=True,
+        cache_seq_lens=torch.ones((1, 1), dtype=torch.int16),
+        cache_offsets=torch.full((1, 1), 3, dtype=torch.int16),
+        local_block_tables=torch.zeros((1, 1), dtype=torch.int16),
+    )
+    query, key, value, kv_cache = _make_forward_inputs(q_len=2, block_size=4)
+
+    attention_impl.forward(None, query, key, value, kv_cache, metadata)
+
+    selected.assert_called_once()
+    not_selected.assert_not_called()
+    assert torch.equal(selected.call_args.args[4], metadata.cache_seq_lens)
+    assert selected.call_args.args[-1] is attention_impl.sinks
+
+
+def test_forward_given_compiled_triton_flash_causal_decode_routes_to_triton_namespace(
+    monkeypatch, backend_module, attention_impl_factory
+):
+    selected = Mock(return_value=torch.zeros((1, 1, 4, 1, 32), dtype=torch.float32))
+    not_selected = Mock()
+
+    _configure_runtime(
+        monkeypatch, backend_module, compile_model=True, use_custom_kernel=True
+    )
+    _patch_namespace_op(
+        monkeypatch,
+        backend_module.torch.ops.rbln_triton_ops,
+        "flash_causal_attention_naive_decode",
+        selected,
+    )
+    _patch_namespace_op(
+        monkeypatch,
+        backend_module.torch.ops.rbln_custom_ops,
+        "flash_causal_attention_naive_decode",
+        not_selected,
+    )
+
+    attention_impl = attention_impl_factory()
+    attention_impl.is_causal = True
+    attention_impl.is_normal = False
+    metadata = _make_forward_metadata(is_prefill=False)
+    query, key, value, kv_cache = _make_forward_inputs(block_size=4)
+
+    attention_impl.forward(None, query, key, value, kv_cache, metadata)
+
+    selected.assert_called_once()
+    not_selected.assert_not_called()
+
+
+def test_forward_given_compiled_triton_normal_prefill_routes_to_triton_namespace(
+    monkeypatch, backend_module, attention_impl_factory
+):
+    selected = Mock(return_value=torch.zeros((1, 1, 4, 2, 32), dtype=torch.float32))
+    not_selected = Mock()
+
+    _configure_runtime(
+        monkeypatch, backend_module, compile_model=True, use_custom_kernel=True
+    )
+    _patch_namespace_op(
+        monkeypatch,
+        backend_module.torch.ops.rbln_triton_ops,
+        "attention_naive_prefill",
+        selected,
+    )
+    _patch_namespace_op(
+        monkeypatch,
+        backend_module.torch.ops.rbln_custom_ops,
+        "attention_naive_prefill",
+        not_selected,
+    )
+
+    attention_impl = attention_impl_factory()
+    attention_impl.is_causal = False
+    attention_impl.is_normal = True
+    metadata = _make_forward_metadata(
+        is_prefill=True,
+        attn_masks=torch.ones((1, 1, 1, 2, 4), dtype=torch.float32),
+        seq_lens=torch.full((1, 1), 2, dtype=torch.int16),
+    )
+    query, key, value, kv_cache = _make_forward_inputs(q_len=2, block_size=4)
+
+    attention_impl.forward(None, query, key, value, kv_cache, metadata)
+
+    selected.assert_called_once()
+    not_selected.assert_not_called()
 
 
 def test_forward_given_missing_kv_cache_raises_assertion_error(
@@ -462,6 +635,177 @@ def test_flash_attention_decode_impl_given_batch_size_greater_than_one_raises_as
             torch.tensor([[0], [0]], dtype=torch.int16),
             None,
         )
+
+
+def test_flash_attention_prefill_impl_given_single_partition_updates_cache_and_returns_output(
+    monkeypatch, backend_module
+):
+    monkeypatch.setattr(
+        backend_module.envs,
+        "VLLM_RBLN_COMPILE_MODEL",
+        False,
+        raising=False,
+    )
+    query = torch.ones((1, 1, 1, 2, 2), dtype=torch.float32)
+    key = torch.tensor([[[[[1.0, 0.0], [2.0, 0.0]]]]])
+    value = torch.tensor([[[[[3.0, 0.0], [4.0, 0.0]]]]])
+    kv_cache = torch.zeros((2, 1, 1, 1, 4, 2), dtype=torch.float32)
+    mask = torch.ones((1, 1, 1, 2, 4), dtype=torch.float32)
+
+    output = backend_module.flash_attention_naive_prefill_impl(
+        query,
+        key,
+        value,
+        kv_cache,
+        mask,
+        torch.tensor(1.0),
+        torch.tensor([[0]], dtype=torch.int16),
+        torch.tensor([0], dtype=torch.int16),
+        None,
+    )
+
+    assert torch.equal(kv_cache[0, 0, 0, 0, :2], key[0, 0, 0])
+    assert torch.equal(kv_cache[1, 0, 0, 0, :2], value[0, 0, 0])
+    assert output.shape == query.shape
+    assert torch.isfinite(output).all()
+
+
+def test_flash_attention_decode_impl_given_single_partition_updates_cache_and_returns_output(
+    monkeypatch, backend_module
+):
+    monkeypatch.setattr(
+        backend_module.envs,
+        "VLLM_RBLN_COMPILE_MODEL",
+        False,
+        raising=False,
+    )
+    query = torch.ones((1, 1, 1, 1, 2), dtype=torch.float32)
+    key = torch.tensor([[[[[5.0, 0.0]]]]])
+    value = torch.tensor([[[[[6.0, 1.0]]]]])
+    kv_cache = torch.zeros((2, 1, 1, 1, 4, 2), dtype=torch.float32)
+    mask = torch.ones((1, 1, 1, 1, 4), dtype=torch.float32)
+
+    output = backend_module.flash_attention_naive_decode_impl(
+        query,
+        key,
+        value,
+        kv_cache,
+        mask,
+        torch.tensor(1.0),
+        torch.tensor([[1]], dtype=torch.int16),
+        torch.tensor([[0]], dtype=torch.int16),
+        None,
+    )
+
+    assert torch.equal(kv_cache[0, 0, 0, 0, 1:2], key[0, 0, 0])
+    assert torch.equal(kv_cache[1, 0, 0, 0, 1:2], value[0, 0, 0])
+    assert output.shape == query.shape
+    assert torch.isfinite(output).all()
+
+
+def test_flash_causal_prefill_impl_given_cross_partition_write_updates_multiple_blocks(
+    monkeypatch, backend_module
+):
+    monkeypatch.setattr(
+        backend_module.envs,
+        "VLLM_RBLN_COMPILE_MODEL",
+        False,
+        raising=False,
+    )
+    query = torch.ones((1, 1, 1, 3, 2), dtype=torch.float32)
+    key = torch.tensor([[[[[1.0, 0.0], [2.0, 0.0], [3.0, 0.0]]]]])
+    value = torch.tensor([[[[[4.0, 0.0], [5.0, 0.0], [6.0, 0.0]]]]])
+    kv_cache = torch.zeros((2, 2, 1, 1, 2, 2), dtype=torch.float32)
+
+    output = backend_module.flash_causal_attention_naive_prefill_impl(
+        query,
+        key,
+        value,
+        kv_cache,
+        torch.tensor(1.0),
+        torch.tensor([[1, 0]], dtype=torch.int16),
+        torch.tensor([0, 1], dtype=torch.int16),
+        None,
+    )
+
+    assert torch.equal(kv_cache[0, 0, 0, 0, 1], key[0, 0, 0, 0])
+    assert torch.equal(kv_cache[0, 1, 0, 0, :2], key[0, 0, 0, 1:3])
+    assert torch.equal(kv_cache[1, 1, 0, 0, :2], value[0, 0, 0, 1:3])
+    assert output.shape == query.shape
+    assert torch.isfinite(output).all()
+
+
+def test_sliding_window_prefill_impl_given_window_trim_updates_cache_slice(
+    monkeypatch, backend_module
+):
+    monkeypatch.setattr(
+        backend_module.envs,
+        "VLLM_RBLN_COMPILE_MODEL",
+        False,
+        raising=False,
+    )
+    query = torch.ones((1, 1, 1, 2, 2), dtype=torch.float32)
+    key = torch.tensor([[[[[7.0, 0.0], [8.0, 0.0]]]]])
+    value = torch.tensor([[[[[9.0, 0.0], [10.0, 0.0]]]]])
+    kv_cache = torch.zeros((2, 1, 1, 1, 4, 2), dtype=torch.float32)
+    kv_cache[0, 0, 0, 0, 0] = torch.tensor([1.0, 0.0])
+    kv_cache[0, 0, 0, 0, 1] = torch.tensor([2.0, 0.0])
+    kv_cache[1, 0, 0, 0, 0] = torch.tensor([3.0, 0.0])
+    kv_cache[1, 0, 0, 0, 1] = torch.tensor([4.0, 0.0])
+
+    output = backend_module.sliding_window_attention_naive_prefill_impl(
+        query,
+        key,
+        value,
+        kv_cache,
+        torch.tensor([[2]], dtype=torch.int16),
+        torch.tensor([[4]], dtype=torch.int16),
+        torch.tensor(1.0),
+        torch.tensor([0], dtype=torch.int16),
+        torch.tensor(0.0),
+        None,
+    )
+
+    assert torch.equal(
+        kv_cache[0, 0, 0, 0],
+        torch.tensor([[1.0, 0.0], [2.0, 0.0], [7.0, 0.0], [8.0, 0.0]]),
+    )
+    assert output.shape == query.shape
+    assert torch.isfinite(output).all()
+
+
+def test_sliding_window_decode_impl_given_multiple_active_rows_updates_each_block(
+    monkeypatch, backend_module
+):
+    monkeypatch.setattr(
+        backend_module.envs,
+        "VLLM_RBLN_COMPILE_MODEL",
+        False,
+        raising=False,
+    )
+    query = torch.ones((2, 1, 1, 1, 2), dtype=torch.float32)
+    key = torch.tensor([[[[[1.0, 0.0]]]], [[[[2.0, 0.0]]]]])
+    value = torch.tensor([[[[[3.0, 0.0]]]], [[[[4.0, 0.0]]]]])
+    kv_cache = torch.zeros((2, 2, 1, 1, 4, 2), dtype=torch.float32)
+
+    output = backend_module.sliding_window_attention_naive_decode_impl(
+        query,
+        key,
+        value,
+        kv_cache,
+        torch.tensor([[1], [1]], dtype=torch.int16),
+        torch.tensor([[2], [2]], dtype=torch.int16),
+        torch.tensor(1.0),
+        torch.tensor([[0], [1]], dtype=torch.int16),
+        torch.tensor(0.0),
+        None,
+        None,
+    )
+
+    assert torch.equal(kv_cache[0, 0, 0, 0, 1], key[0, 0, 0, 0])
+    assert torch.equal(kv_cache[0, 1, 0, 0, 1], key[1, 0, 0, 0])
+    assert output.shape == query.shape
+    assert torch.isfinite(output).all()
 
 
 def test_flash_causal_decode_impl_given_zero_total_sequence_length_returns_zeros(
