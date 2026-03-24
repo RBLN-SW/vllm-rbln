@@ -155,6 +155,7 @@ def compile_model(
     max_model_len: int,
     tp_size: int,
     model_path: str,
+    additional_config: dict[str, Any] | None = None,
 ) -> Any:
     architectures = getattr(config, "architectures", [])
     model_name, model_cls_name = get_rbln_model_info(
@@ -163,6 +164,8 @@ def compile_model(
     default_param: dict[str, Any] = {
         "rbln_tensor_parallel_size": tp_size,
     }
+    if additional_config:
+        default_param.update(additional_config)
     if is_generation_arch(config):
         default_param["rbln_batch_size"] = batch_size
         default_param["rbln_max_seq_len"] = max_model_len
