@@ -154,6 +154,7 @@ def sync_with_rbln_config(vllm_config: VllmConfig) -> None:
         rbln_config = get_rbln_config(vllm_config)
     except Exception as e:
         raise RuntimeError("Failed to get RBLN config: %s", e) from e
+
     additional_rbln_config = vllm_config.additional_config.get("rbln_config", {})
     if rbln_config is not None:
         invalid_keys = get_invalid_leaf_keys(additional_rbln_config)
