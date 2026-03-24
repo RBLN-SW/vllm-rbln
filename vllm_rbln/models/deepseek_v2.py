@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import torch
-from vllm.distributed import tensor_model_parallel_all_gather
 from vllm.model_executor.models.deepseek_v2 import DeepseekV2Attention, DeepseekV2MoE
 
 
