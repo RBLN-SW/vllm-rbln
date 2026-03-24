@@ -289,7 +289,13 @@ class RblnPlatform(Platform):
         if selected_backend and selected_backend != AttentionBackendEnum.FLASH_ATTN:
             logger.info("Cannot use %s backend on RBLN.", selected_backend)
         if attn_selector_config.use_mla:
-            attn_backend_cls = AttentionBackendEnum.FLASH_ATTN_MLA.get_path()
+            # FLASH_ATTN_MLA.get_path() defaults to upstream FlashAttn (CUDA).
+            # RBLN registers an override in flash_attention_mla only if that module
+            # is imported first; workers often resolve the backend before then.
+            attn_backend_cls = (
+                "vllm_rbln.v1.attention.backends.mla.flash_attn_mla."
+                "RBLNFlashAttnMLABackend"
+            )
             logger.info("Using RBLN MLA Attention Backend: %s", attn_backend_cls)
             return attn_backend_cls
         if attn_selector_config.use_sparse:

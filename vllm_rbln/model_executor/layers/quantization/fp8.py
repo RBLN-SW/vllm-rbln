@@ -860,7 +860,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
         if use_moe_tokens_mask:
             tokens_mask = get_tokens_mask(num_tokens)
-            
+
         if layer.use_grouped_topk:
             n_group = layer.num_expert_group
             topk_group = layer.topk_group

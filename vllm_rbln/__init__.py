@@ -50,6 +50,7 @@ def register_ops():
         import vllm_rbln.model_executor.layers.fused_moe.layer  # noqa
         import vllm_rbln.model_executor.layers.fused_moe.shared_fused_moe  # noqa
         import vllm_rbln.model_executor.layers.logits_processor  # noqa
+        import vllm_rbln.model_executor.layers.mla  # noqa
         import vllm_rbln.model_executor.layers.quantization.kernels.mixed_precision  # noqa
         import vllm_rbln.model_executor.layers.quantization.mxfp4  # noqa
         import vllm_rbln.model_executor.layers.quantization.fp8  # noqa
@@ -71,3 +72,6 @@ def register_ops():
         from vllm_rbln.triton_kernels import flash_attention  # noqa
         from vllm_rbln.triton_kernels import flash_causal_attention  # noqa
         from vllm_rbln.triton_kernels import sliding_window_attention  # noqa
+        from vllm_rbln.v1.attention.backends.mla.flash_attn_mla import (
+            RBLNFlashAttnMLABackend,
+        )  # noqa
