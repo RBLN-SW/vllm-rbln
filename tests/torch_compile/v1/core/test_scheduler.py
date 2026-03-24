@@ -133,3 +133,279 @@ def test_preempt_during_execution():
     # sampled token id.
     assert len(requests[1].output_token_ids) == 1
     assert requests[1].output_token_ids[0] == 42
+
+
+# ---------------------------------------------------------------------------
+# Helpers for spec_decode_cap tests
+# ---------------------------------------------------------------------------
+
+_SD_BLOCK_SIZE = 1024
+_SD_NUM_BLOCKS = 100
+_SD_MAX_NUM_SEQS = 10
+
+
+def _sd_scheduler(**kwargs):
+    return create_scheduler(
+        block_size=_SD_BLOCK_SIZE,
+        num_blocks=_SD_NUM_BLOCKS,
+        max_num_seqs=_SD_MAX_NUM_SEQS,
+        **kwargs,
+    )
+
+
+def _sd_request(num_tokens, req_id):
+    return create_requests(
+        num_requests=1,
+        num_tokens=num_tokens,
+        block_size=_SD_BLOCK_SIZE,
+        max_tokens=2048,
+        req_ids=[req_id],
+    )[0]
+
+
+def _advance_to_decode(scheduler, request):
+    """Run one prefill step + update so the request enters decode state."""
+    scheduler.add_request(request)
+    sched_out = scheduler.schedule()
+    scheduler.update_from_output(sched_out, create_runner_output(sched_out, 1))
+
+
+def _check_invariant(sched_out, req_id):
+    """num_scheduled_tokens == 1 (decode token) + len(spec_tokens)."""
+    n = sched_out.num_scheduled_tokens[req_id]
+    spec = sched_out.scheduled_spec_decode_tokens.get(req_id, [])
+    assert n == 1 + len(spec), (
+        f"req {req_id}: num_scheduled_tokens={n} but 1+spec={1 + len(spec)}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# spec_decode_cap [1/10]:
+# block boundary → cap == block_size → no retroactive trim
+# ---------------------------------------------------------------------------
+
+
+def test_spec_decode_cap_at_block_boundary():
+    """prompt=1024 → remaining_in_block=1024 == block_size; cap unchanged."""
+    scheduler = _sd_scheduler()
+    req = _sd_request(1024, "A")
+    _advance_to_decode(scheduler, req)
+
+    req.spec_token_ids = [1] * 4
+    sched_out = scheduler.schedule()
+
+    rid = req.request_id
+    assert sched_out.num_scheduled_tokens[rid] == 5
+    assert len(sched_out.scheduled_spec_decode_tokens[rid]) == 4
+    _check_invariant(sched_out, rid)
+
+
+# ---------------------------------------------------------------------------
+# spec_decode_cap [2/10]:
+# near block boundary → all spec tokens trimmed
+# ---------------------------------------------------------------------------
+
+
+def test_spec_decode_cap_near_block_boundary_all_trimmed():
+    """prompt=1023 → remaining_in_block=1 → cap=1 → all spec removed."""
+    scheduler = _sd_scheduler()
+    req = _sd_request(1023, "A")
+    _advance_to_decode(scheduler, req)
+
+    req.spec_token_ids = [1] * 4
+    sched_out = scheduler.schedule()
+
+    rid = req.request_id
+    assert sched_out.num_scheduled_tokens[rid] == 1
+    assert rid not in sched_out.scheduled_spec_decode_tokens
+
+
+# ---------------------------------------------------------------------------
+# spec_decode_cap [3/10]:
+# partial spec tokens fit (remaining=4, spec=6 → 3 spec survive)
+# ---------------------------------------------------------------------------
+
+
+def test_spec_decode_cap_partial_spec_tokens_fit():
+    """prompt=1020 → remaining_in_block=4 → cap=4 → 3 spec tokens survive."""
+    scheduler = _sd_scheduler()
+    req = _sd_request(1020, "A")
+    _advance_to_decode(scheduler, req)
+
+    req.spec_token_ids = [1] * 6
+    sched_out = scheduler.schedule()
+
+    rid = req.request_id
+    assert sched_out.num_scheduled_tokens[rid] == 4
+    assert len(sched_out.scheduled_spec_decode_tokens[rid]) == 3
+    _check_invariant(sched_out, rid)
+
+
+# ---------------------------------------------------------------------------
+# spec_decode_cap [4/10]:
+# no spec tokens → retroactive trim skipped even when cap < block_size
+# ---------------------------------------------------------------------------
+
+
+def test_spec_decode_cap_no_spec_tokens_no_retroactive_trim():
+    """cap=1 but scheduled_spec_decode_tokens is empty → trim skipped."""
+    scheduler = _sd_scheduler()
+    req_a = _sd_request(1024, "A")
+    req_b = _sd_request(1023, "B")
+    _advance_to_decode(scheduler, req_a)
+    _advance_to_decode(scheduler, req_b)
+
+    sched_out = scheduler.schedule()
+
+    assert sched_out.num_scheduled_tokens[req_a.request_id] == 1
+    assert sched_out.num_scheduled_tokens[req_b.request_id] == 1
+    assert sched_out.scheduled_spec_decode_tokens == {}
+
+
+# ---------------------------------------------------------------------------
+# spec_decode_cap [5/10]:
+# B tightens cap=1 → both A and B lose all spec tokens
+# ---------------------------------------------------------------------------
+
+
+def test_spec_decode_cap_retroactive_trim_all_spec_removed():
+    """A(1024)+B(1023) with spec=4 each; B sets cap=1 → both trimmed to 1."""
+    scheduler = _sd_scheduler()
+    req_a = _sd_request(1024, "A")
+    req_b = _sd_request(1023, "B")
+    _advance_to_decode(scheduler, req_a)
+    _advance_to_decode(scheduler, req_b)
+
+    req_a.spec_token_ids = [1] * 4
+    req_b.spec_token_ids = [1] * 4
+    sched_out = scheduler.schedule()
+
+    assert sched_out.num_scheduled_tokens[req_a.request_id] == 1
+    assert sched_out.num_scheduled_tokens[req_b.request_id] == 1
+    assert req_a.request_id not in sched_out.scheduled_spec_decode_tokens
+    assert req_b.request_id not in sched_out.scheduled_spec_decode_tokens
+
+
+# ---------------------------------------------------------------------------
+# spec_decode_cap [6/10]:
+# B tightens cap=4 → both A and B trimmed to 4 (1+3 spec)
+# ---------------------------------------------------------------------------
+
+
+def test_spec_decode_cap_retroactive_trim_partial_spec_preserved():
+    """A(1024)+B(1020) with spec=6 each; B sets cap=4 → 3 spec each."""
+    scheduler = _sd_scheduler()
+    req_a = _sd_request(1024, "A")
+    req_b = _sd_request(1020, "B")
+    _advance_to_decode(scheduler, req_a)
+    _advance_to_decode(scheduler, req_b)
+
+    req_a.spec_token_ids = [1] * 6
+    req_b.spec_token_ids = [1] * 6
+    sched_out = scheduler.schedule()
+
+    assert sched_out.num_scheduled_tokens[req_a.request_id] == 4
+    assert sched_out.num_scheduled_tokens[req_b.request_id] == 4
+    assert len(sched_out.scheduled_spec_decode_tokens[req_a.request_id]) == 3
+    assert len(sched_out.scheduled_spec_decode_tokens[req_b.request_id]) == 3
+    _check_invariant(sched_out, req_a.request_id)
+    _check_invariant(sched_out, req_b.request_id)
+
+
+# ---------------------------------------------------------------------------
+# spec_decode_cap [7/10]:
+# three requests; C sets cap=2 → all trimmed to 2 (1+1 spec)
+# ---------------------------------------------------------------------------
+
+
+def test_spec_decode_cap_retroactive_trim_three_requests():
+    """A(1024)+B(512)+C(1022) with spec=6 each; C sets cap=2 → 1 spec each."""
+    scheduler = _sd_scheduler()
+    req_a = _sd_request(1024, "A")
+    req_b = _sd_request(512, "B")
+    req_c = _sd_request(1022, "C")
+    _advance_to_decode(scheduler, req_a)
+    _advance_to_decode(scheduler, req_b)
+    _advance_to_decode(scheduler, req_c)
+
+    req_a.spec_token_ids = [1] * 6
+    req_b.spec_token_ids = [1] * 6
+    req_c.spec_token_ids = [1] * 6
+    sched_out = scheduler.schedule()
+
+    for req in (req_a, req_b, req_c):
+        rid = req.request_id
+        assert sched_out.num_scheduled_tokens[rid] == 2
+        assert len(sched_out.scheduled_spec_decode_tokens[rid]) == 1
+        _check_invariant(sched_out, rid)
+
+
+# ---------------------------------------------------------------------------
+# spec_decode_cap [8/10]:
+# decode-only B tightens cap → A retroactively trimmed
+# ---------------------------------------------------------------------------
+
+
+def test_spec_decode_cap_decode_only_tightens_cap():
+    """A(1024,spec=4)+B(1020,no spec); B sets cap=4 → A trimmed to 4 (1+3)."""
+    scheduler = _sd_scheduler()
+    req_a = _sd_request(1024, "A")
+    req_b = _sd_request(1020, "B")
+    _advance_to_decode(scheduler, req_a)
+    _advance_to_decode(scheduler, req_b)
+
+    req_a.spec_token_ids = [1] * 4
+    # req_b has no spec tokens
+    sched_out = scheduler.schedule()
+
+    assert sched_out.num_scheduled_tokens[req_a.request_id] == 4
+    assert sched_out.num_scheduled_tokens[req_b.request_id] == 1
+    assert len(sched_out.scheduled_spec_decode_tokens[req_a.request_id]) == 3
+    assert req_b.request_id not in sched_out.scheduled_spec_decode_tokens
+    _check_invariant(sched_out, req_a.request_id)
+
+
+# ---------------------------------------------------------------------------
+# spec_decode_cap [9/10]:
+# max_model_len constraint tightens cap via remaining_in_maxlen
+# ---------------------------------------------------------------------------
+
+
+def test_spec_decode_cap_maxlen_constraint():
+    """A(1024,spec=6)+B(2046,no spec); B's remaining_in_maxlen=2 → cap=2."""
+    scheduler = _sd_scheduler(max_model_len=2048, max_num_batched_tokens=2048)
+    req_a = _sd_request(1024, "A")
+    req_b = _sd_request(2046, "B")
+    _advance_to_decode(scheduler, req_a)
+    _advance_to_decode(scheduler, req_b)
+
+    req_a.spec_token_ids = [1] * 6
+    sched_out = scheduler.schedule()
+
+    assert sched_out.num_scheduled_tokens[req_a.request_id] == 2
+    assert sched_out.num_scheduled_tokens[req_b.request_id] == 1
+    assert len(sched_out.scheduled_spec_decode_tokens[req_a.request_id]) == 1
+    assert req_b.request_id not in sched_out.scheduled_spec_decode_tokens
+    _check_invariant(sched_out, req_a.request_id)
+
+
+# ---------------------------------------------------------------------------
+# spec_decode_cap [10/10]:
+# new prefill in waiting triggers no-mixed-batching → decode excluded
+# ---------------------------------------------------------------------------
+
+
+def test_spec_decode_cap_prefill_triggers_no_mixed_batching():
+    """A(1024,decode,spec=4) running + B(512) waiting → only B scheduled."""
+    scheduler = _sd_scheduler()
+    req_a = _sd_request(1024, "A")
+    req_b = _sd_request(512, "B")
+    _advance_to_decode(scheduler, req_a)
+
+    req_a.spec_token_ids = [1] * 4
+    scheduler.add_request(req_b)
+    sched_out = scheduler.schedule()
+
+    assert len(sched_out.scheduled_new_reqs) == 1
+    assert req_a.request_id not in sched_out.num_scheduled_tokens
+    assert req_b.request_id in sched_out.num_scheduled_tokens

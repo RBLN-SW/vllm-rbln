@@ -155,14 +155,15 @@ class RBLNWorker(WorkerBase):
         world_size = self.local_world_size
         env_var = current_platform.device_control_env_var
 
-        total_device_count = world_size * envs.VLLM_RBLN_TP_SIZE
+        rbln_tp_size = envs.VLLM_RBLN_TP_SIZE
+        total_device_count = world_size * rbln_tp_size
 
         if env_var not in os.environ:
             dev_begin = total_device_count * self.parallel_config.data_parallel_rank
             dev_end = dev_begin + total_device_count
             device_ids = [str(i) for i in range(dev_begin, dev_end)]
-            start_idx = self.local_rank * envs.VLLM_RBLN_TP_SIZE
-            end_idx = start_idx + envs.VLLM_RBLN_TP_SIZE
+            start_idx = self.local_rank * rbln_tp_size
+            end_idx = start_idx + rbln_tp_size
             selected_devices = ",".join(device_ids[start_idx:end_idx])
         else:
             device_ids = os.environ[env_var].split(",")
@@ -171,8 +172,8 @@ class RBLNWorker(WorkerBase):
             )
             try:
                 device_id = int(device_ids[self.local_rank])
-                start_idx = device_id * envs.VLLM_RBLN_TP_SIZE
-                end_idx = start_idx + envs.VLLM_RBLN_TP_SIZE
+                start_idx = device_id * rbln_tp_size
+                end_idx = start_idx + rbln_tp_size
                 device_ids = [str(i) for i in range(start_idx, end_idx)]
                 selected_devices = ",".join(device_ids)
             except ValueError as e:
@@ -187,6 +188,9 @@ class RBLNWorker(WorkerBase):
             selected_devices,
         )
 
+        if has_torch_rbln and rbln_tp_size > 1:
+            os.environ["RBLN_NPUS_PER_DEVICE"] = str(rbln_tp_size)
+
     def init_device(self) -> None:
         set_cpu_affinity(
             self.rank,
@@ -194,19 +198,14 @@ class RBLNWorker(WorkerBase):
             self.parallel_config,
         )
 
-        # Only set OMP_NUM_THREADS when TP > 1 or DP > 1
-        if (
-            self.parallel_config.tensor_parallel_size > 1
-            or self.parallel_config.data_parallel_size > 1
-        ):
-            # Use half of allocated CPUs to avoid oversubscription
-            allocated_cpus = len(os.sched_getaffinity(0))
-            num_threads = max(2, allocated_cpus // 2)
-            set_omp_num_threads(
-                self.rank,
-                self.local_rank,
-                num_threads,
-            )
+        # Use half of allocated CPUs to avoid oversubscription
+        allocated_cpus = len(os.sched_getaffinity(0))
+        num_threads = max(2, allocated_cpus // 2)
+        set_omp_num_threads(
+            self.rank,
+            self.local_rank,
+            num_threads,
+        )
 
         # NOTE(RBLN): numba is used throughout vllm code base (especially in spec-dec)
         # however accessing numba thread settings somewhat affects torch
@@ -271,6 +270,7 @@ class RBLNWorker(WorkerBase):
 
             if quantization == "fp8":
                 nbits_per_param = 8
+                packed_num_elems = 1
             elif quantization == "mxfp4":
                 if "ca" in device_name:
                     # ATOM DOES NOT support mxfp4 quantization, handled by bf16
@@ -286,13 +286,13 @@ class RBLNWorker(WorkerBase):
                     raise ValueError(
                         "invalid RBLN architecture, candidates = [ATOM(ca), REBEL(cr)]"
                     )
+                # pack 2 mxfp4 elems into single uint8 elem
+                packed_num_elems = 8 // 4
             else:
                 raise ValueError(
                     "invalid quantization scheme, candidates = [fp8, mxfp4]"
                 )
 
-            # pack 2 mxfp4 elems into single uint8 elem
-            packed_num_elems = 8 // 4
         else:
             nbits_per_param = 16
             packed_num_elems = 1
@@ -479,6 +479,8 @@ class RBLNWorker(WorkerBase):
                 self.model_runner.performance_tracker.print_final_stats()
             if self.model_runner.sampler_performance_tracker:
                 self.model_runner.sampler_performance_tracker.print_final_stats()
+            if self.model_runner.e2e_performance_tracker:
+                self.model_runner.e2e_performance_tracker.print_final_stats()
 
 
 def init_worker_distributed_environment(

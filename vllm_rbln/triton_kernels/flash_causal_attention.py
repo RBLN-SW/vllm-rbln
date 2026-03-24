@@ -283,7 +283,6 @@ def flash_causal_attention_naive_decode(
     NUM_BLOCK: tl.constexpr,
     DIM_BLOCK_TABLE: tl.constexpr,
 ):
-    tl.static_assert(QUERY_LEN == 1)
     tl.static_assert(MAX_SEQ_LEN % PARTITION_SIZE == 0)
     NUM_PARTITION: tl.constexpr = MAX_SEQ_LEN // PARTITION_SIZE
     DYNAMIC_AXIS: tl.constexpr = 4

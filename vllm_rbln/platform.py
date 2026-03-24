@@ -155,7 +155,6 @@ class RblnPlatform(Platform):
         model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
         scheduler_config = vllm_config.scheduler_config
-        cache_config = vllm_config.cache_config
 
         if envs.VLLM_RBLN_USE_VLLM_MODEL:
             cls.validate_and_setup_prerequisite(vllm_config)
@@ -172,6 +171,10 @@ class RblnPlatform(Platform):
                 if (lora_config := vllm_config.lora_config) is not None:
                     lora_config.lora_dtype = torch.float
                     logger.info("RBLN enforce lora_config.lora_dtype as torch.float")
+
+                if (speculative_config := vllm_config.speculative_config) is not None:
+                    speculative_config.draft_model_config.dtype = torch.float
+                    logger.info("RBLN enforce draft_model_config.dtype as torch.float")
             else:
                 dtype = model_config.dtype
                 logger.info("original model_config.dtype = %s", dtype)
@@ -212,26 +215,12 @@ class RblnPlatform(Platform):
                 if (lora_config := vllm_config.lora_config) is not None:
                     lora_config.lora_dtype = torch.float16
 
-            if vllm_config.speculative_config is not None:
-                # FIXME(RBLN): remove block size constraint from spec-dec
-                assert model_config.max_model_len == cache_config.block_size, (
-                    "block_size must be set to max_model_len with speculative decoding."
-                )
-
+            if vllm_config.speculative_config is not None and envs.VLLM_RBLN_SAMPLER:
                 # FIXME(RBLN): make RBLNSampler compatible with speculative decoding
-                if envs.VLLM_RBLN_SAMPLER:
-                    logger.warning(
-                        "Using RBLNSampler with speculative decoding "
-                        "is not supported yet."
-                    )
-                    envs.VLLM_RBLN_SAMPLER = False
-
-                # FIXME(RBLN): temporarily block warm up with spec-dec
-                if envs.VLLM_RBLN_ENABLE_WARM_UP:
-                    logger.warning(
-                        "Using warm up with speculative decoding is not supported yet."
-                    )
-                    envs.VLLM_RBLN_ENABLE_WARM_UP = False
+                logger.warning(
+                    "Using RBLNSampler with speculative decoding is not supported yet."
+                )
+                envs.VLLM_RBLN_SAMPLER = False
 
         else:
             # NOTE(eunji.lee):
@@ -250,7 +239,9 @@ class RblnPlatform(Platform):
             )
 
             assert vllm_config.parallel_config.tensor_parallel_size == 1, (
-                "Tensor parallelism is set when compiled in optimum-rbln."
+                "Cannot set tensor_parallel_size for pre-compiled optimum-rbln models. "
+                "If you want to compile with tensor parallelism in vllm-rbln, "
+                "please use the `VLLM_RBLN_TP_SIZE` environment variable instead."
             )
             assert vllm_config.parallel_config.pipeline_parallel_size == 1, (
                 "Pipeline parallelism is not supported in optimum-rbln."

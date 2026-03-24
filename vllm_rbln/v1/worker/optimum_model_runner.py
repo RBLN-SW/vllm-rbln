@@ -668,6 +668,10 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
 
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
+            # In case of sliding window / hybrid attention models,
+            # free the local block table id managed in the model's attention manager.
+            if getattr(self.model, "attention_manager", None):
+                self.model.attention_manager.pop(req_id)
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
         # scheduled_req_ids overlap. This happens when a request is aborted and
