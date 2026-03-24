@@ -38,7 +38,7 @@ dependencies = [
     "pyyaml",
     "datasets",
     "qwen_vl_utils",
-    "vllm==0.17.1+cpu",
+    "vllm==0.18.0+cpu",
     "torch",
     "torchvision",
     "torchaudio",
@@ -132,7 +132,7 @@ environments = [
 
 [[tool.uv.index]]
 name = "vllm-cpu"
-url = "https://wheels.vllm.ai/0.17.1/cpu"
+url = "https://wheels.vllm.ai/0.18.0/cpu"
 explicit = true
 
 [[tool.uv.index]]

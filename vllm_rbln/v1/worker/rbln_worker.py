@@ -31,7 +31,7 @@ except ImportError:
 
 import torch.nn as nn
 from torch._dynamo.exc import BackendCompilerFailed
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed import (
     ensure_model_parallel_initialized,
     init_distributed_environment,
@@ -218,7 +218,8 @@ class RBLNWorker(WorkerBase):
             report_usage_stats(self.vllm_config)
 
     def load_model(self):
-        self.model_runner.load_model()
+        with set_current_vllm_config(self.vllm_config):
+            self.model_runner.load_model()
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
