@@ -364,6 +364,7 @@ class RBLNScheduler(Scheduler):
 
                 request = self.waiting.peek_request()
 
+                is_ready = False
                 # KVTransfer: skip request if still waiting for remote kvs.
                 if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                     is_ready = self._update_waiting_for_remote_kv(request)
@@ -520,9 +521,14 @@ class RBLNScheduler(Scheduler):
                 # Therefore, we allocate based on
                 # request.num_tokens - num_computed_tokens,
                 # not num_new_tokens + num_external_computed_tokens.
+                num_tokens_to_allocate = (
+                    num_new_tokens + num_external_computed_tokens
+                    if load_kv_async
+                    else request.num_tokens - num_computed_tokens
+                )
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
-                    request.num_tokens - num_computed_tokens,
+                    num_tokens_to_allocate,
                     num_new_local_computed_tokens,
                     new_computed_blocks,
                     num_lookahead_tokens=effective_lookahead_tokens,
@@ -543,9 +549,12 @@ class RBLNScheduler(Scheduler):
                 # tokens, the block may not be fully computed.
                 # Therefore, if the block is not finalized in this iteration,
                 # we must clear the block hash and undo block caching.
-                undo_uncomputed_block_caching(
-                    request, self.kv_cache_manager, num_computed_tokens + num_new_tokens
-                )
+                if not load_kv_async:
+                    undo_uncomputed_block_caching(
+                        request,
+                        self.kv_cache_manager,
+                        num_computed_tokens + num_new_tokens,
+                    )
 
                 # KVTransfer: the connector uses this info to determine
                 # if a load is needed. Note that
@@ -609,6 +618,13 @@ class RBLNScheduler(Scheduler):
                         self.encoder_cache_manager.allocate(request, i)
                         if self.ec_connector is not None:
                             self.ec_connector.update_state_after_alloc(request, i)
+
+                # If the request' previous state is WAITING_FOR_REMOTE_KVS,
+                # we can continue the scheduling process.
+                if is_ready:
+                    # token_budget is only used for assertion checks.
+                    token_budget -= num_new_tokens
+                    continue
 
                 # NOTE(RBLN): Reaching this point means that this request
                 # can now be added to the running batch.
