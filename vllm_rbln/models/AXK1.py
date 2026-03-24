@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+
 import torch
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.model_executor.models.AXK1 import AXK1Attention, AXK1MoE
-import logging
 
 log = logging.getLogger("torch._dynamo")
 

@@ -66,6 +66,7 @@ def __MLAAttentionWrapper_forward(
         q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
             positions, q[..., self.qk_nope_head_dim :], k_pe
         )
+    k_pe.squeeze_(2)
 
     if self.indexer and self.is_sparse:
         _topk_indices = self.indexer(

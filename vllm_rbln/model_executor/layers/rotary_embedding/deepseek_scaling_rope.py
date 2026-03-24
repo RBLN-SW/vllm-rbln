@@ -13,13 +13,13 @@
 # limitations under the License.
 
 
+import logging
+
 import torch
 from vllm.model_executor.layers.rotary_embedding.common import rotate_gptj, rotate_neox
 from vllm.model_executor.layers.rotary_embedding.deepseek_scaling_rope import (
     DeepseekScalingRotaryEmbedding,
 )
-
-import logging
 
 log = logging.getLogger("torch._dynamo")
 
