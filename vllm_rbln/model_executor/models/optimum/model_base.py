@@ -199,6 +199,7 @@ class RBLNOptimumModelBase(nn.Module):
                     "Compiling the model %s. This may take a while...",
                     self.model_config.model,
                 )
+                rbln_config = self.vllm_config.additional_config.get("rbln_config", {})
                 model = compile_model(
                     self.model_config.model,
                     config,
@@ -207,6 +208,7 @@ class RBLNOptimumModelBase(nn.Module):
                     max_model_len=self.model_config.max_model_len,
                     tp_size=envs.VLLM_RBLN_TP_SIZE,
                     model_path=str(cached_model_path),
+                    additional_config=rbln_config,
                 )
             else:
                 logger.info(
@@ -220,7 +222,12 @@ class RBLNOptimumModelBase(nn.Module):
         if model is None:
             model_cls = getattr(optimum.rbln, model_cls_name)
             assert model_cls is not None
-            model = model_cls.from_pretrained(self.vllm_config.model_config.model)
+            rbln_config = self.vllm_config.additional_config.get("rbln_config", {})
+            # NOTE: We can set the device to run submodules
+            model = model_cls.from_pretrained(
+                self.vllm_config.model_config.model,
+                rbln_config=rbln_config,
+            )
             logger.info(
                 "model_name = %s, model_cls_name = %s, model_path = %s",
                 model_name,
