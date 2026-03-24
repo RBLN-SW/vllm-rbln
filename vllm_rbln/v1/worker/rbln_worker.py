@@ -18,7 +18,6 @@ import os
 from types import NoneType
 from typing import TYPE_CHECKING
 
-import numba
 import torch
 
 try:
@@ -56,11 +55,7 @@ from vllm.v1.worker.worker_base import WorkerBase
 import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.worker.rbln_model_runner import RBLNModelRunner
-from vllm_rbln.v1.worker.utils import (
-    estimate_available_memory,
-    set_cpu_affinity,
-    set_omp_num_threads,
-)
+from vllm_rbln.v1.worker.utils import estimate_available_memory
 
 logger = init_logger(__name__)
 
@@ -192,35 +187,6 @@ class RBLNWorker(WorkerBase):
             os.environ["RBLN_NPUS_PER_DEVICE"] = str(rbln_tp_size)
 
     def init_device(self) -> None:
-        set_cpu_affinity(
-            self.rank,
-            self.local_rank,
-            self.parallel_config,
-        )
-
-        # Use half of allocated CPUs to avoid oversubscription
-        allocated_cpus = len(os.sched_getaffinity(0))
-        num_threads = max(2, allocated_cpus // 2)
-        set_omp_num_threads(
-            self.rank,
-            self.local_rank,
-            num_threads,
-        )
-
-        # NOTE(RBLN): numba is used throughout vllm code base (especially in spec-dec)
-        # however accessing numba thread settings somewhat affects torch
-        # thread settings and cause global state change leading to recompilation.
-        # Thus the only solution for now is to set both thread settings to identical
-        # value in correct order like below
-
-        # Code below sets numba num thread to torch num thread and
-        # potentially change torch num thread to other value
-        numba.set_num_threads(torch.get_num_threads())
-
-        # Code below restores torch num thread to its original value
-        # before numba.set_num_threads
-        torch.set_num_threads(numba.get_num_threads())
-
         # Initialize the distributed environment.
         init_worker_distributed_environment(
             self.vllm_config,
@@ -234,7 +200,10 @@ class RBLNWorker(WorkerBase):
 
         # Construct the model runner
         self.model_runner: RBLNModelRunner = RBLNModelRunner(
-            self.vllm_config, self.device
+            self.vllm_config,
+            self.device,
+            rank=self.rank,
+            local_rank=self.local_rank,
         )
 
         if self.rank == 0:
@@ -380,7 +349,8 @@ class RBLNWorker(WorkerBase):
 
             raise
 
-        # after completing model warm up, enable RBLN performance tracker
+        # after completing model warm up: CPU/thread layout then metrics
+        self.model_runner._ensure_rbln_cpu_threading()
         self.model_runner._enable_performance_tracker()
 
     def get_model(self) -> nn.Module:
