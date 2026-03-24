@@ -199,13 +199,7 @@ class RBLNOptimumModelBase(nn.Module):
                     "Compiling the model %s. This may take a while...",
                     self.model_config.model,
                 )
-                # FIXME check whether the rbln_config is not aligned with
-                # the vllm native parameters.
                 rbln_config = self.vllm_config.additional_config.get("rbln_config", {})
-                assert len(rbln_config) == 0, (
-                    "Currently, we don't support passing rbln_config "
-                    "for compilation yet."
-                )
                 model = compile_model(
                     self.model_config.model,
                     config,
@@ -232,7 +226,7 @@ class RBLNOptimumModelBase(nn.Module):
             # NOTE: We can set the device to run submodules
             model = model_cls.from_pretrained(
                 self.vllm_config.model_config.model,
-                rbln_config={**rbln_config},
+                rbln_config=rbln_config,
             )
             logger.info(
                 "model_name = %s, model_cls_name = %s, model_path = %s",
