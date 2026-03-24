@@ -18,6 +18,7 @@ import os
 from types import NoneType
 from typing import TYPE_CHECKING
 
+import numba
 import torch
 
 try:
@@ -55,7 +56,11 @@ from vllm.v1.worker.worker_base import WorkerBase
 import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.worker.rbln_model_runner import RBLNModelRunner
-from vllm_rbln.v1.worker.utils import estimate_available_memory
+from vllm_rbln.v1.worker.utils import (
+    estimate_available_memory,
+    set_cpu_affinity,
+    set_omp_num_threads,
+)
 
 logger = init_logger(__name__)
 
@@ -97,6 +102,7 @@ class RBLNWorker(WorkerBase):
 
         # Buffers saved before sleep
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
+        self._rbln_cpu_threading_configured = False
 
         profiler_config = vllm_config.profiler_config
         # Set up profiler if profiling is enabled
@@ -202,8 +208,6 @@ class RBLNWorker(WorkerBase):
         self.model_runner: RBLNModelRunner = RBLNModelRunner(
             self.vllm_config,
             self.device,
-            rank=self.rank,
-            local_rank=self.local_rank,
         )
 
         if self.rank == 0:
@@ -300,6 +304,46 @@ class RBLNWorker(WorkerBase):
         """Allocate RBLN KV cache with the specified kv_cache_config."""
         self.model_runner.initialize_kv_cache(kv_cache_config)
 
+    def _ensure_rbln_cpu_threading(self) -> None:
+        """Apply CPU affinity and align OpenMP / numba / torch thread counts.
+
+        Invoked once `warm_up_model()` has finished successfully, so compile/warm-up
+        keeps default threading until then.
+        """
+        if self._rbln_cpu_threading_configured:
+            return
+
+        set_cpu_affinity(
+            self.rank,
+            self.local_rank,
+            self.parallel_config,
+        )
+
+        # Use half of allocated CPUs to avoid oversubscription
+        allocated_cpus = len(os.sched_getaffinity(0))
+        num_threads = max(2, allocated_cpus // 2)
+        set_omp_num_threads(
+            self.rank,
+            self.local_rank,
+            num_threads,
+        )
+
+        # NOTE(RBLN): numba is used throughout vllm code base (especially in spec-dec)
+        # however accessing numba thread settings somewhat affects torch
+        # thread settings and cause global state change leading to recompilation.
+        # Thus the only solution for now is to set both thread settings to identical
+        # value in correct order like below
+
+        # Code below sets numba num thread to torch num thread and
+        # potentially change torch num thread to other value
+        numba.set_num_threads(torch.get_num_threads())
+
+        # Code below restores torch num thread to its original value
+        # before numba.set_num_threads
+        torch.set_num_threads(numba.get_num_threads())
+
+        self._rbln_cpu_threading_configured = True
+
     def compile_or_warm_up_model(self) -> None:
         if self.parallel_config.data_parallel_size > 1:
             if envs.VLLM_RBLN_DP_IMPL == "padded_decode":
@@ -350,7 +394,7 @@ class RBLNWorker(WorkerBase):
             raise
 
         # after completing model warm up: CPU/thread layout then metrics
-        self.model_runner._ensure_rbln_cpu_threading()
+        self._ensure_rbln_cpu_threading()
         self.model_runner._enable_performance_tracker()
 
     def get_model(self) -> nn.Module:
