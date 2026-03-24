@@ -457,10 +457,6 @@ class RBLNScheduler(Scheduler):
                 request = request_queue.peek_request()
                 request_id = request.request_id
 
-                is_ready = False
-                was_waiting_for_remote_kvs = (
-                    request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
-                )
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(
                     request.status
@@ -473,7 +469,6 @@ class RBLNScheduler(Scheduler):
                     request_queue.pop_request()
                     step_skipped_waiting.prepend_request(request)
                     continue
-                is_ready = was_waiting_for_remote_kvs
 
                 # Check that adding the request still respects the max_loras
                 # constraint.
@@ -773,13 +768,6 @@ class RBLNScheduler(Scheduler):
                         self.encoder_cache_manager.allocate(request, i)
                         if self.ec_connector is not None:
                             self.ec_connector.update_state_after_alloc(request, i)
-
-                # If the request’ previous state is WAITING_FOR_REMOTE_KVS,
-                # we can continue the scheduling process.
-                if is_ready:
-                    # token_budget is only used for assertion checks.
-                    token_budget -= num_new_tokens
-                    continue
 
                 # NOTE(RBLN): Reaching this point means that this request
                 # can now be added to the running batch.
