@@ -125,6 +125,20 @@ ignore_missing_imports = true
 check_untyped_defs = true
 follow_imports = "silent"
 
+[tool.coverage.run]
+omit = [
+    "vllm_rbln/utils/optimum/*",
+    "vllm_rbln/utils/optimum/**/*",
+    "*/optimum_*.py",
+]
+
+[tool.coverage.report]
+omit = [
+    "vllm_rbln/utils/optimum/*",
+    "vllm_rbln/utils/optimum/**/*",
+    "*/optimum_*.py",
+]
+
 [tool.uv]
 environments = [
     "sys_platform == 'linux' and platform_machine == 'x86_64'"
