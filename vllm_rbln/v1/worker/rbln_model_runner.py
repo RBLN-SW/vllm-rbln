@@ -2416,8 +2416,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             scheduler_output.num_scheduled_tokens,
         )
 
-        num_sampled_tokens = sampler_output.sampled_token_ids.shape[0]
-        sampled_token_ids = sampler_output.sampled_token_ids
+        num_sampled_tokens = self.input_batch.num_reqs
+        sampled_token_ids = sampler_output.sampled_token_ids[:num_sampled_tokens]
         invalid_req_indices = []
         if not self.use_async_scheduling:
             # Get the valid generated tokens.
@@ -2784,29 +2784,10 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 else:
                     selected_token_indices = logits_indices
                     assert selected_token_indices.dim() == 1
-                    if is_prefills[0]:  # prefill
-                        assert selected_token_indices.size(0) == 1
-                        num_computed = self.input_batch.num_computed_tokens_cpu
-                        num_prompted = self.input_batch.num_prompt_tokens
-                        is_last_prefill = (
-                            num_computed + self.max_num_tokens
-                        ) >= num_prompted
-                        if not is_last_prefill[0]:  # noqa: SIM108
-                            # chunked prefill(#0~#N-1, intermediate)
-                            # token_indices = torch.tensor([max_num_seqs-1])
-                            # selected = torch.tensor([])
-                            logits = logits[:0]
-                        else:
-                            # chunked prefill(#N, final)
-                            # token_indices = torch.tensor([last_seq_idx-1])
-                            # selected_token_indices == token_indices
-                            logits = logits
-                    else:  # decode
+                    if not is_prefills[0]:
                         # selected_token_indices is for valid decode tokens
                         # token_indices == None, selected = torch.tensor([0])
-                        if self.speculative_config is None:
-                            logits = logits[:num_input_tokens]
-                        else:
+                        if self.speculative_config is not None:
                             batch_indices = torch.arange(
                                 self.input_batch.num_reqs, device=self.device
                             )
