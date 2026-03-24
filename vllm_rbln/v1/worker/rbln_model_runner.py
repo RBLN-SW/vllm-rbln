@@ -2784,18 +2784,17 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 else:
                     selected_token_indices = logits_indices
                     assert selected_token_indices.dim() == 1
-                    if not is_prefills[0]:
+                    if not is_prefills[0] and self.speculative_config is not None:
                         # selected_token_indices is for valid decode tokens
                         # token_indices == None, selected = torch.tensor([0])
-                        if self.speculative_config is not None:
-                            batch_indices = torch.arange(
-                                self.input_batch.num_reqs, device=self.device
-                            )
-                            sample_hidden_states = hidden_states[
-                                batch_indices,
-                                : self.speculative_config.num_speculative_tokens + 1,
-                            ]
-                            logits = logits[selected_token_indices]
+                        batch_indices = torch.arange(
+                            self.input_batch.num_reqs, device=self.device
+                        )
+                        sample_hidden_states = hidden_states[
+                            batch_indices,
+                            : self.speculative_config.num_speculative_tokens + 1,
+                        ]
+                        logits = logits[selected_token_indices]
 
             if broadcast_pp_output:
                 model_output_broadcast_data = (
