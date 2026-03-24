@@ -359,3 +359,13 @@ class RblnPlatform(Platform):
     @classmethod
     def can_update_inplace(cls) -> bool:
         return False
+
+    @classmethod
+    def get_nixl_supported_devices(cls) -> dict[str, tuple[str, ...]]:
+        return {
+            "rbln": ("cpu",),
+        }
+
+    @classmethod
+    def get_nixl_memory_type(cls) -> str | None:
+        return "DRAM"
