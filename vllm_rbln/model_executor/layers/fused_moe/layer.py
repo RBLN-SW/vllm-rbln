@@ -242,7 +242,7 @@ def _ccl_receive_kernel_fake(
 # ---------------------------------------------------------------------------
 # CCL All2All group ID
 # ---------------------------------------------------------------------------
-CCL_ALL2ALL_GROUP_ID = 42
+CCL_ALL2ALL_GROUP_ID = 42 ## may make problem in multiple layers ?
 
 
 # Define custom_moe_glu op based on environment variable
@@ -531,7 +531,7 @@ def unquantized_fused_moe_method_custom(
     self: UnquantizedFusedMoEMethod,
     layer: FusedMoE,
     x: torch.Tensor,
-    router_logits: torch.Tensor,
+    masked_routing_weights: torch.Tensor,
 ):
     # router_logits is now pre-computed masked_routing_weights
     # (topk + softmax already done in fused_moe_forward_rbln)
@@ -546,7 +546,7 @@ def unquantized_fused_moe_method_custom(
 
     # expected tensor shape - [num_tokens, -1]
     hidden_states = x.reshape(num_tokens, -1)
-    masked_routing_weights = router_logits.reshape(num_tokens, -1)
+    masked_routing_weights = masked_routing_weights.reshape(num_tokens, -1)
 
     # transpose to [num_experts, num_tokens] for custom_moe_glu
     masked_routing_weights_t = masked_routing_weights.transpose(0, 1)
@@ -567,7 +567,6 @@ def unquantized_fused_moe_method_custom(
         None,
     )
 
-    print ("final_hidden_states dtype:", final_hidden_states.dtype)
     return final_hidden_states.reshape(orig_shape)
 
 
@@ -656,10 +655,7 @@ def fused_moe_forward_rbln(
         masked_routing_weights = torch.zeros_like(all_router_logits_t)  # [E, R*t]
         masked_routing_weights.scatter_(0, selected_experts, topk_weights)
 
-        # Restore dtype to match hidden_states (scatter_ may promote to float32)
-        masked_routing_weights = masked_routing_weights.to(hidden_states.dtype)
-
-        # all_routing_3d: [E, R, t] for CCL send kernel (just reshape, no permute needed)
+        # all_routing_3d: [E, R, t] for CCL send kernel 
         all_routing_3d = masked_routing_weights.reshape(E, R, t)
 
         # --- Step 4: CCL all2all dispatch ---
@@ -700,7 +696,7 @@ def fused_moe_forward_rbln(
         H_dim = hidden_flat.shape[1]
         gathered_hidden = unpacked.reshape(R * t, H_dim)
 
-        # masked_routing_weights: [E, R*t] → [R*t, E] (just transpose, no reshape needed)
+        # masked_routing_weights: [E, R*t] → [R*t, E]
         all_routing_flat = masked_routing_weights.transpose(0, 1)  # [R*t, E]
 
         final_hidden_states = self.quant_method.apply(
@@ -709,8 +705,11 @@ def fused_moe_forward_rbln(
             router_logits=all_routing_flat,
         )
 
-        # --- Step 6: Extract this rank's output ---
-        # final_hidden_states: [R*t, H] → [R, t, H]
+        # --- Step 6: Combine partial results and extract this rank's output ---
+        # all_reduce across DP group to sum partial expert contributions
+        # (each rank computed only its local experts; all_reduce aggregates)
+        final_hidden_states = get_dp_group().all_reduce(final_hidden_states)
+         # final_hidden_states: [R*t, H] → [R, t, H]
         final_hidden_states = final_hidden_states.reshape(R, t, H_dim)
         # Take only this rank's slice
         final_hidden_states = final_hidden_states[self.dp_rank]
