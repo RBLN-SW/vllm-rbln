@@ -15,15 +15,14 @@ from typing import ClassVar
 import torch
 
 from vllm.attention.backends.abstract import AttentionLayer, AttentionType
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
 from vllm.v1.attention.backends.mla.common import (
     MLACommonBackend,
+    MLACommonBaseImpl,
     MLACommonDecodeMetadata,
-    MLACommonImpl,
     MLACommonMetadata,
     MLACommonMetadataBuilder,
-    MLACommonPrefillMetadata,
     QueryLenSupport,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
@@ -31,6 +30,10 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)
+
+import logging
+
+log = logging.getLogger("torch._dynamo")
 
 
 def _concat_and_cache_mla_python(
@@ -41,6 +44,12 @@ def _concat_and_cache_mla_python(
 ) -> None:
     """Python fallback for writing MLA latent + rope into paged cache."""
     # kv_c: (num_tokens, kv_lora_rank), k_pe: (num_tokens, qk_rope_head_dim)
+
+    log.info(
+        f"kv_c: {kv_c.shape}, k_pe: {k_pe.shape}, kv_cache: {kv_cache.shape}, slot_mapping: {slot_mapping.shape}"
+    )
+
+    k_pe.squeeze_(2)
     kv_merged = torch.cat([kv_c, k_pe], dim=-1)
     flat = kv_cache.reshape(-1, kv_cache.size(-1))
     flat[slot_mapping] = kv_merged.to(flat.dtype)
@@ -83,7 +92,9 @@ class RBLNFlashAttnMLABackend(MLACommonBackend):
         return RBLNFlashAttnMLAImpl
 
 
-class RBLNFlashAttnMLAMetadataBuilder(MLACommonMetadataBuilder[RBLNFlashAttnMLAMetadata]):
+class RBLNFlashAttnMLAMetadataBuilder(
+    MLACommonMetadataBuilder[RBLNFlashAttnMLAMetadata]
+):
     """Builds RBLN MLA metadata (no FA AOT / cuda graph)."""
 
     query_len_support: ClassVar[QueryLenSupport] = QueryLenSupport.VARLEN
@@ -140,17 +151,30 @@ class RBLNFlashAttnMLAMetadataBuilder(MLACommonMetadataBuilder[RBLNFlashAttnMLAM
         )
 
 
-class RBLNFlashAttnMLAImpl(MLACommonImpl[RBLNFlashAttnMLAMetadata]):
-    """RBLN MLA impl: Python cache write + torch SDPA for decode (prefill TODO)."""
+class RBLNFlashAttnMLAImpl(MLACommonBaseImpl[RBLNFlashAttnMLAMetadata]):
+    """RBLN MLA impl: Python cache write + torch SDPA for decode (prefill TODO).
+
+    Subclasses MLACommonBaseImpl only: MLACommonImpl.__init__ always enters a
+    FlashAttention/FlashInfer prefill branch that requires flash_attn_varlen_func,
+    which is absent on RBLN. Prefill is not supported here anyway; decode uses
+    _forward_decode and forward below.
+    """
 
     can_return_lse_for_decode: bool = True
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        if self.kv_cache_dtype.startswith("fp8"):
-            raise NotImplementedError(
-                "RBLN MLA does not support FP8 KV cache yet."
+        self.dcp_world_size: int | None = None
+        self.chunked_prefill_workspace_size = (
+            MLACommonMetadataBuilder.determine_chunked_prefill_workspace_size(
+                get_current_vllm_config()
             )
+        )
+        self.cp_kv_cache_interleave_size: int = (
+            get_current_vllm_config().parallel_config.cp_kv_cache_interleave_size
+        )
+        if self.kv_cache_dtype.startswith("fp8"):
+            raise NotImplementedError("RBLN MLA does not support FP8 KV cache yet.")
 
     def _forward_decode(
         self,
@@ -191,24 +215,33 @@ class RBLNFlashAttnMLAImpl(MLACommonImpl[RBLNFlashAttnMLAMetadata]):
             seq_len_k = int(dec.seq_lens[b].item())
             if seq_len_k == 0:
                 out_b = torch.zeros(
-                    1, self.num_heads, head_dim_v,
-                    device=q_pe.device, dtype=q_pe.dtype
+                    1, self.num_heads, head_dim_v, device=q_pe.device, dtype=q_pe.dtype
                 )
                 outputs.append(out_b)
                 if self.need_to_return_lse_for_decode:
-                    lse_list.append(torch.zeros(1, self.num_heads, device=q_pe.device, dtype=torch.float32))
+                    lse_list.append(
+                        torch.zeros(
+                            1, self.num_heads, device=q_pe.device, dtype=torch.float32
+                        )
+                    )
                 continue
 
             # Gather K,V for this request from paged blocks
             block_table_b = dec.block_table[b]
             n_blocks_b = block_table_b.numel()
             k_pe_b = torch.zeros(
-                1, seq_len_k, head_dim_qk,
-                device=kv_c_and_k_pe_cache.device, dtype=kv_c_and_k_pe_cache.dtype
+                1,
+                seq_len_k,
+                head_dim_qk,
+                device=kv_c_and_k_pe_cache.device,
+                dtype=kv_c_and_k_pe_cache.dtype,
             )
             kv_c_b = torch.zeros(
-                1, seq_len_k, head_dim_v,
-                device=kv_c_and_k_pe_cache.device, dtype=kv_c_and_k_pe_cache.dtype
+                1,
+                seq_len_k,
+                head_dim_v,
+                device=kv_c_and_k_pe_cache.device,
+                dtype=kv_c_and_k_pe_cache.dtype,
             )
             written = 0
             for blk_idx in range(n_blocks_b):
