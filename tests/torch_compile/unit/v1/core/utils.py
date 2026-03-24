@@ -14,7 +14,7 @@
 
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# Copied from https://github.com/vllm-project/vllm/blob/v0.17.1/tests/v1/core/utils.py
+# Copied from https://github.com/vllm-project/vllm/blob/v0.18.0/tests/v1/core/utils.py
 # Search for NOTE(RBLN) or TODO(RBLN) for changes
 
 
