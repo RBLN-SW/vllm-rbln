@@ -60,7 +60,7 @@ def undo_uncomputed_block_caching(
 
 class RBLNScheduler(Scheduler):
     def schedule(self) -> SchedulerOutput:
-        # Copied from vllm.v1.core.sched.Scheduler.schedule: https://github.com/vllm-project/vllm/blob/v0.17.1/vllm/v1/core/sched/scheduler.py#L317-L912
+        # Copied from vllm.v1.core.sched.Scheduler.schedule: https://github.com/vllm-project/vllm/blob/v0.18.0/vllm/v1/core/sched/scheduler.py#L338-L927
         # The only differences are:
         # - Disable mixed batching
         # - Limit prefill batch size to 1
@@ -294,6 +294,8 @@ class RBLNScheduler(Scheduler):
                 # Allocate the encoder cache.
                 for i in encoder_inputs_to_schedule:
                     self.encoder_cache_manager.allocate(request, i)
+                    if self.ec_connector is not None:
+                        self.ec_connector.update_state_after_alloc(request, i)
                 encoder_compute_budget = new_encoder_compute_budget
             if external_load_encoder_input:
                 for i in external_load_encoder_input:
@@ -365,52 +367,29 @@ class RBLNScheduler(Scheduler):
             # new prefill requests into the running batch.
             prefill_token_budget = self.max_num_scheduled_tokens
 
-            # Use a temporary RequestQueue to collect requests that need to be
-            # skipped and put back at the head of the waiting queue later
-            skipped_waiting_requests = create_request_queue(self.policy)
+            step_skipped_waiting = create_request_queue(self.policy)
 
-            while self.waiting and prefill_token_budget > 0:
+            while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
                     break
 
-                request = self.waiting.peek_request()
+                request_queue = self._select_waiting_queue_for_scheduling()
+                assert request_queue is not None
+
+                request = request_queue.peek_request()
                 request_id = request.request_id
 
-                # KVTransfer: skip request if still waiting for remote kvs.
-                if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
-                    is_ready = self._update_waiting_for_remote_kv(request)
-                    if is_ready:
-                        if request.num_preemptions:
-                            # We must be loading for a resumed preemption
-                            # rather than a new request.
-                            request.status = RequestStatus.PREEMPTED
-                        else:
-                            request.status = RequestStatus.WAITING
-                    else:
+                # try to promote blocked statuses while traversing skipped queue.
+                if self._is_blocked_waiting_status(
+                    request.status
+                ) and not self._try_promote_blocked_waiting_request(request):
+                    if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                         logger.debug(
                             "%s is still in WAITING_FOR_REMOTE_KVS state.",
                             request_id,
                         )
-                        self.waiting.pop_request()
-                        skipped_waiting_requests.prepend_request(request)
-                        continue
-
-                # Skip request if the structured output request is still waiting
-                # for FSM compilation.
-                if request.status == RequestStatus.WAITING_FOR_FSM:
-                    structured_output_req = request.structured_output_request
-                    if structured_output_req and structured_output_req.grammar:
-                        request.status = RequestStatus.WAITING
-                    else:
-                        self.waiting.pop_request()
-                        skipped_waiting_requests.prepend_request(request)
-                        continue
-
-                # Streaming: skip request if still waiting for next streaming req.
-                if request.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
-                    assert not request.streaming_queue
-                    self.waiting.pop_request()
-                    skipped_waiting_requests.prepend_request(request)
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
                     continue
 
                 # Check that adding the request still respects the max_loras
@@ -424,8 +403,8 @@ class RBLNScheduler(Scheduler):
                     )
                 ):
                     # Scheduling would exceed max_loras, skip.
-                    self.waiting.pop_request()
-                    skipped_waiting_requests.prepend_request(request)
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
                     continue
 
                 num_external_computed_tokens = 0
@@ -451,8 +430,8 @@ class RBLNScheduler(Scheduler):
                             # The request cannot be scheduled because
                             # the KVConnector couldn't determine
                             # the number of matched tokens.
-                            self.waiting.pop_request()
-                            skipped_waiting_requests.prepend_request(request)
+                            request_queue.pop_request()
+                            step_skipped_waiting.prepend_request(request)
                             continue
 
                         request.num_external_computed_tokens = ext_tokens
@@ -467,6 +446,7 @@ class RBLNScheduler(Scheduler):
                     num_computed_tokens = (
                         num_new_local_computed_tokens + num_external_computed_tokens
                     )
+                    assert num_computed_tokens <= request.num_tokens
                 else:
                     # KVTransfer: WAITING reqs have num_computed_tokens > 0
                     # after async KV recvs are completed.
@@ -610,14 +590,26 @@ class RBLNScheduler(Scheduler):
                             preempted=request.num_preemptions > 0,
                         )
 
-                # Request was already popped from self.waiting
-                # unless it was re-added above due to new_blocks being None.
-                request = self.waiting.pop_request()
+                request = request_queue.pop_request()
                 if load_kv_async:
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
-                    skipped_waiting_requests.prepend_request(request)
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+                    step_skipped_waiting.prepend_request(request)
+                    # Set num_computed_tokens even though KVs are not yet loaded.
+                    # request.num_computed_tokens will not be used anywhere until
+                    # the request finished the KV transfer.
+                    #
+                    # If a transfer error is reported by the connector,
+                    # request.num_computed_tokens will be re-set accordingly in
+                    # _update_requests_with_invalid_blocks.
+                    #
+                    # When the transfer is finished, either successfully or not,
+                    # request.num_computed_tokens will correctly reflect the number
+                    # of computed tokens.
+                    # _update_waiting_for_remote_kv will then cache
+                    # only the successfully loaded tokens.
+                    request.num_computed_tokens = num_computed_tokens
                     continue
 
                 self.running.append(request)
@@ -638,7 +630,7 @@ class RBLNScheduler(Scheduler):
                     request_id
                 )
                 num_scheduled_tokens[request_id] = num_new_tokens
-                prefill_token_budget -= num_new_tokens
+                token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 # Count the number of prefix cached tokens.
@@ -650,6 +642,8 @@ class RBLNScheduler(Scheduler):
                     # Allocate the encoder cache.
                     for i in encoder_inputs_to_schedule:
                         self.encoder_cache_manager.allocate(request, i)
+                        if self.ec_connector is not None:
+                            self.ec_connector.update_state_after_alloc(request, i)
                     encoder_compute_budget = new_encoder_compute_budget
                 # Allocate for external load encoder cache
                 if external_load_encoder_input:
@@ -686,9 +680,9 @@ class RBLNScheduler(Scheduler):
                 # NOTE(RBLN): we restrict the prefill batch size to 1 for now.
                 break
 
-            # Put back any skipped requests at the head of the waiting queue
-            if skipped_waiting_requests:
-                self.waiting.prepend_requests(skipped_waiting_requests)
+            # re-queue requests skipped in this pass ahead of older skipped items.
+            if step_skipped_waiting:
+                self.skipped_waiting.prepend_requests(step_skipped_waiting)
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
