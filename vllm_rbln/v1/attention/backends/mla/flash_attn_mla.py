@@ -38,15 +38,12 @@ log = logging.getLogger("torch._dynamo")
 
 
 def _empty_mla_attention_output(
-    q: torch.Tensor, weight_uv: torch.Tensor | None
+    q: torch.Tensor, kv_c_normed: torch.Tensor | None
 ) -> torch.Tensor:
     """Shape for MLA kernel output consumed by o_proj: [B, seq, H * v_head_dim]."""
     b, seq_len, num_heads, _ = q.shape
-    if weight_uv is not None:
-        v_head_dim = weight_uv.shape[-1]
-    else:
-        v_head_dim = q.shape[-1]
-    return q.new_empty((b, seq_len, num_heads * v_head_dim))
+    kv_lora_rank = kv_c_normed.shape[-1]
+    return torch.empty((b, seq_len, num_heads, kv_lora_rank))
 
 
 # RBLN custom op (flash causal attention naive prefill/decode w/o attn mask)
@@ -59,50 +56,28 @@ def flash_causal_mla_attention_naive_prefill_impl(
     kv_c_normed: torch.Tensor,
     k_pe: torch.Tensor,
     kv_cache: torch.Tensor,
-    scale: torch.Tensor,
     seq_idx: torch.Tensor,
     block_tables: torch.Tensor,
-    slot_mapping: torch.Tensor,
     sinks: torch.Tensor | None = None,
-    weight_uk_t: torch.Tensor | None = None,
-    weight_uv: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Expected tensor shapes:
-    - q: [batch, num_tokens, num_heads, qk_head_dim]
+    - q: [batch, num_tokens, num_heads, _ ]
     - kv_c_normed: [batch, num_tokens, kv_lora_rank]
-    - k_pe: [batch, num_tokens, 1, qk_rope_head_dim]
+    - k_pe: [batch, num_tokens, qk_rope_head_dim]
     - kv_cache: [num_blocks, block_size, num_kv_heads(= kv_lora_rank + qk_rope_head_dim)]
       Key and value cache
     - seq_idx: [batch, num_partitions]
       number of already cached tokens in each partition
     - block_tables: [num_partitions,] for prefill,
                     [batch, num_partitions] for decode
-    - sinks: [n_heads, sink_len] (optional)
-    - weight_uk_t: [qk_nope_head_dim, kv_lora_rank, num_heads]
-    - weight_uv: [num_heads, kv_lora_rank, v_head_dim]
 
     Returns:
         Tensor: attn_output [batch, seq_len, num_heads * v_head_dim] (V space for o_proj).
 
     batch size is assumed to be 1 for prefill.
     """
-    return _empty_mla_attention_output(q, weight_uv)
-
-    # kv_b_proj_weight = kv_b_proj_weight.view(
-    #     self.kv_lora_rank,
-    #     self.num_heads,
-    #     self.qk_nope_head_dim + self.v_head_dim,
-    # )
-
-    # W_UK, W_UV = kv_b_proj_weight.split(
-    #     [self.qk_nope_head_dim, self.v_head_dim], dim=-1
-    # )
-
-    # # # Convert from (L, N, V) to (N, L, V)
-    # # self.W_UV = W_UV.transpose(0, 1)
-    # # # Convert from (L, N, P) to (N, P, L)
-    # # self.W_UK_T = W_UK.permute(1, 2, 0)
+    return _empty_mla_attention_output(q, kv_c_normed)
 
 
 @torch.library.register_fake(
@@ -113,15 +88,10 @@ def _(
     kv_c_normed: torch.Tensor,
     k_pe: torch.Tensor,
     kv_cache: torch.Tensor,
-    scale: torch.Tensor,
     seq_idx: torch.Tensor,
     block_tables: torch.Tensor,
-    slot_mapping: torch.Tensor,
-    sinks: torch.Tensor | None = None,
-    weight_uk_t: torch.Tensor | None = None,
-    weight_uv: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    return _empty_mla_attention_output(q, weight_uv)
+    return _empty_mla_attention_output(q, kv_c_normed)
 
 
 @torch.library.custom_op(
@@ -133,15 +103,10 @@ def flash_causal_mla_attention_naive_decode_impl(
     kv_c_normed: torch.Tensor,
     k_pe: torch.Tensor,
     kv_cache: torch.Tensor,
-    scale: torch.Tensor,
     seq_idx: torch.Tensor,
     block_tables: torch.Tensor,
-    slot_mapping: torch.Tensor,
-    sinks: torch.Tensor | None = None,
-    weight_uk_t: torch.Tensor | None = None,
-    weight_uv: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    return _empty_mla_attention_output(q, weight_uv)
+    return _empty_mla_attention_output(q, kv_c_normed)
 
 
 @torch.library.register_fake("rbln_custom_ops::flash_causal_mla_attention_naive_decode")
@@ -150,15 +115,10 @@ def _(
     kv_c_normed: torch.Tensor,
     k_pe: torch.Tensor,
     kv_cache: torch.Tensor,
-    scale: torch.Tensor,
     seq_idx: torch.Tensor,
     block_tables: torch.Tensor,
-    slot_mapping: torch.Tensor,
-    sinks: torch.Tensor | None = None,
-    weight_uk_t: torch.Tensor | None = None,
-    weight_uv: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    return _empty_mla_attention_output(q, weight_uv)
+    return _empty_mla_attention_output(q, kv_c_normed)
 
 
 @register_backend(AttentionBackendEnum.FLASH_ATTN_MLA)
@@ -340,7 +300,24 @@ class RBLNFlashAttnMLAImpl(MLACommonBaseImpl[RBLNFlashAttentionMetadata]):
         Returns:
             attn_out  = (batch_size, seq_len, num_heads * v_head_dim)
         """
-        b_size, q_len, _, _ = q.size()
+        b_size, q_len, num_heads, qk_head_dim = q.size()
+
+        decode_q_nope, decode_q_pe = q.split(
+            [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+        )
+
+        # Convert from (num_tokens, num_heads, qk_nope_head_dim) to (num_heads, num_tokens, qk_nope_head_dim)
+        decode_q_nope = decode_q_nope.view(b_size * q_len, num_heads, -1).transpose(
+            0, 1
+        )
+
+        # Multiply (N, B, P) x (N, P, L) -> (N, B, L)
+        decode_ql_nope = torch.bmm(decode_q_nope, self.W_UK_T).view(
+            b_size, q_len, num_heads, -1
+        )
+
+        q = torch.cat([decode_ql_nope, decode_q_pe], dim=-1)
+        k_pe = k_pe.squeeze(2)
 
         assert kv_cache is not None
 
@@ -382,13 +359,8 @@ class RBLNFlashAttnMLAImpl(MLACommonBaseImpl[RBLNFlashAttentionMetadata]):
                         kv_c_normed,
                         k_pe,
                         kv_cache,
-                        self.scale,
                         attn_metadata.seq_lens.to(torch.int16),
                         attn_metadata.block_tables.to(torch.int16),
-                        self.scale,  # dummy
-                        None,
-                        self.W_UK_T,
-                        self.W_UV,
                     ]
                     attn_output = flash_causal_mla_attention_naive_decode(  # noqa: E501
                         *decode_args,
@@ -399,13 +371,8 @@ class RBLNFlashAttnMLAImpl(MLACommonBaseImpl[RBLNFlashAttentionMetadata]):
                         kv_c_normed,
                         k_pe,
                         kv_cache,
-                        self.scale,
                         attn_metadata.seq_lens.to(torch.int16),
                         attn_metadata.block_tables.to(torch.int16),
-                        self.scale,  # dummy
-                        None,
-                        self.W_UK_T,
-                        self.W_UV,
                     ]
                     attn_output = flash_causal_mla_attention_naive_prefill(  # noqa: E501
                         *prefill_args,
