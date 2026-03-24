@@ -14,7 +14,7 @@
 
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# Copied from https://github.com/vllm-project/vllm/blob/v0.17.1/tests/v1/core/utils.py
+# Copied from https://github.com/vllm-project/vllm/blob/v0.18.0/tests/v1/core/utils.py
 # Search for NOTE(RBLN) or TODO(RBLN) for changes
 
 
@@ -114,7 +114,6 @@ def create_scheduler(
     cache_config = CacheConfig(
         block_size=block_size,
         gpu_memory_utilization=0.9,
-        swap_space=0,
         cache_dtype="auto",
         enable_prefix_caching=enable_prefix_caching,
     )
