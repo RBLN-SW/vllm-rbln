@@ -19,7 +19,9 @@ from rebel.triton import language as tl
 from rebel.triton.language.extra.rbln import libdevice as rblib
 from torch.library import register_fake, triton_op
 
+__triton_op_files__ = rblib.collect_triton_op_files()
 
+################################################################################
 @triton.jit
 def flash_causal_attention_naive_prefill(
     query_base,
@@ -524,55 +526,21 @@ def _(
     block_table: torch.Tensor,
     dummy0: torch.Tensor,
 ) -> torch.Tensor:
-    original_dtype = query.dtype
+    return torch.empty_like(query)
 
-    query = query.to(torch.float32)
-    key = key.to(torch.float32)
-    value = value.to(torch.float32)
-    kv_cache = kv_cache.to(torch.float32)
-    qk_scale = qk_scale.to(torch.float32)
-
-    output = torch.empty_like(query)
-
-    query = rblib.align_tensor_last_dim_to_64(query)
-    key = rblib.align_tensor_last_dim_to_64(key)
-    value = rblib.align_tensor_last_dim_to_64(value)
-
-    NUM_HEAD = query.shape[1]
-    NUM_GROUP = query.shape[2]
-    HEAD_DIM = query.shape[-1]
-    QUERY_LEN = query.shape[-2]
-    PARTITION_SIZE = kv_cache.shape[-2]
-    MAX_SEQ_LEN = PARTITION_SIZE * seq_idx.shape[1]
-    NUM_BLOCK = kv_cache.shape[1]
-    NUM_BATCH = query.shape[0]
-    DIM_BLOCK_TABLE = block_table.dim()
-
-    params = [
-        query,
-        key,
-        value,
-        kv_cache,
-        output,
-        qk_scale,
-        seq_idx,
-        block_table,
-        qk_scale,
-        NUM_HEAD,
-        NUM_GROUP,
-        HEAD_DIM,
-        QUERY_LEN,
-        NUM_BATCH,
-        PARTITION_SIZE,
-        MAX_SEQ_LEN,
-        NUM_BLOCK,
-        DIM_BLOCK_TABLE,
-    ]
-
-    warmup(flash_causal_attention_naive_prefill, *params)
-
-    return output.to(original_dtype)
-
+@triton_op("rbln_triton_ops::flash_causal_attention_naive_decode",
+           mutates_args=())
+def _(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    kv_cache: torch.Tensor,
+    qk_scale: torch.Tensor,
+    seq_idx: torch.Tensor,
+    block_table: torch.Tensor,
+    dummy0: torch.Tensor,
+) -> torch.Tensor:
+    return torch.empty_like(query)
 
 @register_fake("rbln_triton_ops::flash_causal_attention_naive_prefill")
 def _(
@@ -587,8 +555,7 @@ def _(
 ) -> torch.Tensor:
     return torch.empty_like(query)
 
-
-@triton_op("rbln_triton_ops::flash_causal_attention_naive_decode", mutates_args=())
+@register_fake("rbln_triton_ops::flash_causal_attention_naive_decode")
 def _(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -599,23 +566,23 @@ def _(
     block_table: torch.Tensor,
     dummy0: torch.Tensor,
 ) -> torch.Tensor:
-    original_dtype = query.dtype
+    return torch.empty_like(query)
 
-    query = query.to(torch.float32)
-    key = key.to(torch.float32)
-    value = value.to(torch.float32)
-    kv_cache = kv_cache.to(torch.float32)
-    qk_scale = qk_scale.to(torch.float32)
-
+def flash_causal_attention_naive_prefill_wrapper(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    kv_cache: torch.Tensor,
+    qk_scale: torch.Tensor,
+    seq_idx: torch.Tensor,
+    block_table: torch.Tensor,
+    dummy0: torch.Tensor,
+) -> torch.Tensor:
     output = torch.empty_like(query)
-
-    query = rblib.align_tensor_last_dim_to_64(query)
-    key = rblib.align_tensor_last_dim_to_64(key)
-    value = rblib.align_tensor_last_dim_to_64(value)
 
     NUM_HEAD = query.shape[1]
     NUM_GROUP = query.shape[2]
-    HEAD_DIM = query.shape[-1]
+    HEAD_DIM = query.shape[-1] * query.shape[-3]
     QUERY_LEN = query.shape[-2]
     PARTITION_SIZE = kv_cache.shape[-2]
     MAX_SEQ_LEN = PARTITION_SIZE * seq_idx.shape[1]
@@ -644,13 +611,11 @@ def _(
         DIM_BLOCK_TABLE,
     ]
 
-    warmup(flash_causal_attention_naive_decode, *params)
+    rblib.warmup(flash_causal_attention_naive_prefill, kernel_conf, *params)
 
-    return output.to(original_dtype)
+    return output
 
-
-@register_fake("rbln_triton_ops::flash_causal_attention_naive_decode")
-def _(
+def flash_causal_attention_naive_decode_wrapper(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -660,4 +625,46 @@ def _(
     block_table: torch.Tensor,
     dummy0: torch.Tensor,
 ) -> torch.Tensor:
-    return torch.empty_like(query)
+    output = torch.empty_like(query)
+
+    NUM_HEAD = query.shape[1]
+    NUM_GROUP = query.shape[2]
+    HEAD_DIM = query.shape[-1] * query.shape[-3]
+    QUERY_LEN = query.shape[-2]
+    PARTITION_SIZE = kv_cache.shape[-2]
+    MAX_SEQ_LEN = PARTITION_SIZE * seq_idx.shape[1]
+    NUM_BLOCK = kv_cache.shape[1]
+    NUM_BATCH = query.shape[0]
+    DIM_BLOCK_TABLE = block_table.dim()
+
+    params = [
+        query,
+        key,
+        value,
+        kv_cache,
+        output,
+        qk_scale,
+        seq_idx,
+        block_table,
+        qk_scale,
+        NUM_HEAD,
+        NUM_GROUP,
+        HEAD_DIM,
+        QUERY_LEN,
+        NUM_BATCH,
+        PARTITION_SIZE,
+        MAX_SEQ_LEN,
+        NUM_BLOCK,
+        DIM_BLOCK_TABLE,
+    ]
+
+    rblib.warmup(flash_causal_attention_naive_decode, kernel_conf, *params)
+
+    return output
+
+
+kernel_conf = {
+    "vector_inputs":4,
+    "host_layout":[1, 2, 3],
+    "indices":[5, 6]
+}

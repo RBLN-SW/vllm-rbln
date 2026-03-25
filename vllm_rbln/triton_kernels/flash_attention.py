@@ -19,7 +19,9 @@ from rebel.triton import language as tl
 from rebel.triton.language.extra.rbln import libdevice as rblib
 from torch.library import register_fake, triton_op
 
+__triton_op_files__ = rblib.collect_triton_op_files()
 
+################################################################################
 @triton.jit
 def flash_attention_naive_prefill(
     query,
@@ -344,14 +346,6 @@ def flash_attention_naive_decode(
         attn_out = attn_out_i / row_sum_i
         tl.store(O_block_ptr, attn_out)
 
-
-def warmup(func, *args):
-    kernel = func.warmup(*args, grid=(1,), host_layout="1:2:3")
-    rblib.write_rtosa(kernel, args)
-
-    return kernel
-
-
 @triton_op("rbln_triton_ops::flash_attention_naive_prefill", mutates_args=())
 def _(
     query: torch.Tensor,
@@ -364,55 +358,7 @@ def _(
     block_table: torch.Tensor,
     dummy0: torch.Tensor,
 ) -> torch.Tensor:
-    original_dtype = query.dtype
-
-    query = query.to(torch.float32)
-    key = key.to(torch.float32)
-    value = value.to(torch.float32)
-    kv_cache = kv_cache.to(torch.float32)
-    mask = mask.to(torch.float32)
-    qk_scale = qk_scale.to(torch.float32)
-
-    output = torch.empty_like(query)
-
-    query = rblib.align_tensor_last_dim_to_64(query)
-    key = rblib.align_tensor_last_dim_to_64(key)
-    value = rblib.align_tensor_last_dim_to_64(value)
-
-    NUM_HEAD = query.shape[1]
-    NUM_GROUP = query.shape[2]
-    HEAD_DIM = query.shape[-1]
-    QUERY_LEN = query.shape[-2]
-    PARTITION_SIZE = kv_cache.shape[-2]
-    MAX_SEQ_LEN = mask.shape[-1]
-    NUM_BLOCK = kv_cache.shape[1]
-    NUM_BATCH = query.shape[0]
-    DIM_BLOCK_TABLE = block_table.dim()
-
-    params = [
-        query,
-        key,
-        value,
-        kv_cache,
-        mask,
-        output,
-        qk_scale,
-        seq_idx,
-        block_table,
-        qk_scale,
-        NUM_HEAD,
-        NUM_GROUP,
-        HEAD_DIM,
-        QUERY_LEN,
-        NUM_BATCH,
-        PARTITION_SIZE,
-        MAX_SEQ_LEN,
-        NUM_BLOCK,
-        DIM_BLOCK_TABLE,
-    ]
-    warmup(flash_attention_naive_prefill, *params)
-    return output.to(original_dtype)
-
+    return torch.empty_like(query)
 
 @triton_op("rbln_triton_ops::flash_attention_naive_decode", mutates_args=())
 def _(
@@ -426,56 +372,7 @@ def _(
     block_table: torch.Tensor,
     dummy0: torch.Tensor,
 ) -> torch.Tensor:
-    original_dtype = query.dtype
-
-    query = query.to(torch.float32)
-    key = key.to(torch.float32)
-    value = value.to(torch.float32)
-    kv_cache = kv_cache.to(torch.float32)
-    mask = mask.to(torch.float32)
-    qk_scale = qk_scale.to(torch.float32)
-
-    output = torch.empty_like(query)
-
-    query = rblib.align_tensor_last_dim_to_64(query)
-    key = rblib.align_tensor_last_dim_to_64(key)
-    value = rblib.align_tensor_last_dim_to_64(value)
-
-    NUM_HEAD = query.shape[1]
-    NUM_GROUP = query.shape[2]
-    HEAD_DIM = query.shape[-1]
-    QUERY_LEN = query.shape[-2]
-    PARTITION_SIZE = kv_cache.shape[-2]
-    MAX_SEQ_LEN = mask.shape[-1]
-    NUM_BLOCK = kv_cache.shape[1]
-    NUM_BATCH = query.shape[0]
-    DIM_BLOCK_TABLE = block_table.dim()
-
-    params = [
-        query,
-        key,
-        value,
-        kv_cache,
-        mask,
-        output,
-        qk_scale,
-        seq_idx,
-        block_table,
-        qk_scale,
-        NUM_HEAD,
-        NUM_GROUP,
-        HEAD_DIM,
-        QUERY_LEN,
-        NUM_BATCH,
-        PARTITION_SIZE,
-        MAX_SEQ_LEN,
-        NUM_BLOCK,
-        DIM_BLOCK_TABLE,
-    ]
-
-    warmup(flash_attention_naive_decode, *params)
-
-    return output.to(original_dtype)
+    return torch.empty_like(query)
 
 
 @register_fake("rbln_triton_ops::flash_attention_naive_prefill")
@@ -506,3 +403,107 @@ def _(
     dummy0: torch.Tensor,
 ) -> torch.Tensor:
     return torch.empty_like(query)
+
+def flash_attention_naive_prefill_wrapper(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    kv_cache: torch.Tensor,
+    mask: torch.Tensor,
+    qk_scale: torch.Tensor,
+    seq_idx: torch.Tensor,
+    block_table: torch.Tensor,
+    dummy0: torch.Tensor,
+) -> torch.Tensor:
+    output = torch.empty_like(query)
+
+    NUM_HEAD = query.shape[1]
+    NUM_GROUP = query.shape[2]
+    HEAD_DIM = query.shape[-1] * query.shape[-3]
+    QUERY_LEN = query.shape[-2]
+    PARTITION_SIZE = kv_cache.shape[-2]
+    MAX_SEQ_LEN = mask.shape[-1] * mask.shape[-3]
+    NUM_BLOCK = kv_cache.shape[1]
+    NUM_BATCH = query.shape[0]
+    DIM_BLOCK_TABLE = block_table.dim()
+
+    params = [
+        query,
+        key,
+        value,
+        kv_cache,
+        mask,
+        output,
+        qk_scale,
+        seq_idx,
+        block_table,
+        qk_scale,
+        NUM_HEAD,
+        NUM_GROUP,
+        HEAD_DIM,
+        QUERY_LEN,
+        NUM_BATCH,
+        PARTITION_SIZE,
+        MAX_SEQ_LEN,
+        NUM_BLOCK,
+        DIM_BLOCK_TABLE,
+    ]
+    rblib.warmup(flash_attention_naive_prefill, kernel_conf, *params)
+
+    return output
+
+
+def flash_attention_naive_decode_wrapper(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    kv_cache: torch.Tensor,
+    mask: torch.Tensor,
+    qk_scale: torch.Tensor,
+    seq_idx: torch.Tensor,
+    block_table: torch.Tensor,
+    dummy0: torch.Tensor,
+) -> torch.Tensor:
+    output = torch.empty_like(query)
+
+    NUM_HEAD = query.shape[1]
+    NUM_GROUP = query.shape[2]
+    HEAD_DIM = query.shape[-1] * query.shape[-3]
+    QUERY_LEN = query.shape[-2]
+    PARTITION_SIZE = kv_cache.shape[-2]
+    MAX_SEQ_LEN = mask.shape[-1] * mask.shape[-3]
+    NUM_BLOCK = kv_cache.shape[1]
+    NUM_BATCH = query.shape[0]
+    DIM_BLOCK_TABLE = block_table.dim()
+
+    params = [
+        query,
+        key,
+        value,
+        kv_cache,
+        mask,
+        output,
+        qk_scale,
+        seq_idx,
+        block_table,
+        qk_scale,
+        NUM_HEAD,
+        NUM_GROUP,
+        HEAD_DIM,
+        QUERY_LEN,
+        NUM_BATCH,
+        PARTITION_SIZE,
+        MAX_SEQ_LEN,
+        NUM_BLOCK,
+        DIM_BLOCK_TABLE,
+    ]
+
+    rblib.warmup(flash_attention_naive_decode, kernel_conf, *params)
+
+    return output
+
+kernel_conf = {
+    "vector_inputs":5,
+    "host_layout":[1, 2, 3],
+    "indices":[6, 7]
+}
