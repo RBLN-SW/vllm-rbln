@@ -234,7 +234,7 @@ async def main(
 
 def entry_point(
     num_input_prompt: int = 4,
-    model_id: str = "/home/eunji.lee/exaone/optimum-rbln/model_32B-dummy_128k_2026-02-26",
+    model_id: str = "/home/kblee/.cache/rbln-exec/compile_results/optimum-exaone4-5/model_id__exaone4.5-32b#batch_size__4#max_seq_len__128000#n_layers__64#tensor_parallel_size__16#vit_seq_lens__16384#kvcache_partition_len__5120#use_attn_mask__False/model",
 ):
     asyncio.run(
         main(
