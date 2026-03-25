@@ -27,6 +27,13 @@ from vllm.model_executor.models.qwen2_vl import Qwen2VLVideoPixelInputs
 
 from .base import ModelInputForRBLN
 from .model_base import RBLNOptimumDecoderMixin, RBLNOptimumModelBase
+from .optimum_attention import (
+    AttentionManager,
+    InnerAttentionEntry,
+    InnerAttentionStrategy,
+    InnerR1,
+    InnerR2,
+)
 
 logger = init_logger(__name__)
 
@@ -49,24 +56,11 @@ class RBLNOptimumExaone4_5_ForConditionalGeneration(
             decoder_batch_sizes=self.model.rbln_config.decoder_batch_sizes,
             num_blocks=self.kv_block_adapter._estimated_num_blocks(),
         )
+        self.strategy = InnerAttentionStrategy()
+        self.attention_manager: AttentionManager[
+            InnerAttentionStrategy, InnerAttentionEntry, InnerR1, InnerR2
+        ] = AttentionManager(self.strategy)
         self.is_hybrid = getattr(self.model.rbln_config, "cache_impl", None) == "hybrid"
-        self._local_table_by_request_id: dict[str, int] = {}
-
-    def _release_finished_slots(self, finished_request_ids: list[str]) -> None:
-        for request_id in finished_request_ids:
-            self._local_table_by_request_id.pop(request_id, None)
-
-    def _allocate_slot_for_request(self, request_id: str) -> int:
-        slot = self._local_table_by_request_id.get(request_id)
-        if slot is not None:
-            return slot
-
-        used = set(self._local_table_by_request_id.values())
-        for candidate in range(self.decoder_batch_size):
-            if candidate not in used:
-                self._local_table_by_request_id[request_id] = candidate
-                return candidate
-        raise RuntimeError("No available local attention table slots.")
 
     def preprocess_prefill(self, input_ids, attention_mask, image_input, video_input):
         """
@@ -155,7 +149,28 @@ class RBLNOptimumExaone4_5_ForConditionalGeneration(
         finished_requests_ids = model_input.finished_requests_ids
         running_requests_ids = model_input.running_requests_ids
         is_prompt = model_input.is_prompt
-        self._release_finished_slots(finished_requests_ids)
+
+        # In prefill phase, the length of list must be 1
+        sliding_window_table_ids = self.attention_manager.get(
+            is_prompt,
+            self.decoder_batch_size,
+            running_requests_ids,
+            finished_requests_ids,
+        )
+
+        kwargs = self.preprocess_for_decoder(
+            is_prompt, block_tables, input_ids, cache_position
+        )
+
+        padded_batch_size = kwargs.pop("padded_batch_size", self.decoder_batch_size)
+
+        # [prefill] the length of the padded cache is calculated
+        # during the forward pass and stored in self.sliding_window_table.
+        # [decode] `cache_position` and `position_ids` are distinguished
+        # due to the padding space reserved for the sliding window.
+        cache_position = kwargs.pop("cache_position")
+        input_ids = kwargs.pop("input_ids")
+        block_tables = kwargs.pop("block_tables")
 
         if is_prompt:
             image_input = None
@@ -173,62 +188,38 @@ class RBLNOptimumExaone4_5_ForConditionalGeneration(
             inputs_embeds = self.preprocess_prefill(
                 input_ids, attention_mask, image_input, video_input
             )
-
-        kwargs = self.preprocess_for_decoder(
-            is_prompt, block_tables, input_ids, cache_position
-        )
-        cache_position = kwargs.pop("cache_position")
-        block_tables = kwargs.pop("block_tables")
-
-        if is_prompt:
-            prefill_kwargs = {
-                "inputs_embeds": inputs_embeds,
-                "cache_position": cache_position,
-                "block_tables": block_tables,
-            }
-            if self.is_hybrid:
-                assert len(running_requests_ids) == 1
-                prefill_batch_idx = self._allocate_slot_for_request(
-                    running_requests_ids[0]
-                )
-                prefill_kwargs["local_block_tables"] = torch.tensor(
-                    [prefill_batch_idx], dtype=torch.int16, device=block_tables.device
-                )
-
-            logits = self.model.prefill_decoder(**prefill_kwargs).logits
+            prefill_batch_idx = sliding_window_table_ids[0]
+            local_block_table_id = torch.tensor([prefill_batch_idx], dtype=torch.int16)
+            logits = self.model.prefill_decoder(
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                cache_position=cache_position,
+                local_block_tables=local_block_table_id,
+                block_tables=block_tables if self.is_hybrid else None,
+            ).logits
+            assert len(running_requests_ids) == 1
+            self.attention_manager.add(
+                running_requests_id=running_requests_ids[0],
+                local_table_id=prefill_batch_idx,
+            )
         else:
-            padded_batch_size = kwargs.pop("padded_batch_size", self.decoder_batch_size)
             self.model.decoder = self.model.decoders[padded_batch_size]
-            input_ids = kwargs.pop("input_ids")
             inputs_embeds = self.model.embed_tokens(input_ids).to(
                 self.model.rbln_config.dtype
             )
-            decoder_kwargs = {
-                "inputs_embeds": inputs_embeds,
-                "cache_position": cache_position,
-                "block_tables": block_tables,
-            }
-            if self.is_hybrid:
-                local_ids = [
-                    self._allocate_slot_for_request(request_id)
-                    for request_id in running_requests_ids
-                ]
-                used_ids = set(local_ids)
-                pad_value = next(
-                    (i for i in range(padded_batch_size) if i not in used_ids), 0
-                )
-                local_block_tables = torch.full(
-                    (padded_batch_size, 1),
-                    pad_value,
-                    dtype=torch.int16,
-                    device=block_tables.device,
-                )
-                local_block_tables[: len(local_ids), 0] = torch.tensor(
-                    local_ids, dtype=torch.int16, device=block_tables.device
-                )
-                decoder_kwargs["local_block_tables"] = local_block_tables
-
-            logits = self.model.decoder(**decoder_kwargs).logits
+            local_block_table_id, cache_position = self.attention_manager.preprocess(
+                sliding_window_table_ids,
+                cache_position,
+                request_nums,
+                padded_batch_size,
+            )
+            logits = self.model.decoder(
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                cache_position=cache_position,
+                local_block_tables=local_block_table_id,
+                block_tables=block_tables if self.is_hybrid else None,
+            ).logits
         if not is_prompt:
             logits = logits[:request_nums]
         return logits

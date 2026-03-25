@@ -28,7 +28,7 @@ from vllm_rbln.utils.optimum.registry import (
 from .blip2 import RBLNOptimumBlip2ForConditionalGeneration  # noqa: F401
 from .decoder_only import RBLNOptimumForCausalLM
 from .encoder import RBLNOptimumForEncoderModel
-from .exaone4_5 import RBLNOptimumExaone4_5_ForConditionalGeneration
+from .exaone4_5 import RBLNOptimumExaone4_5_ForConditionalGeneration  # noqa: F401
 from .gemma3 import RBLNOptimumGemma3ForConditionalGeneration  # noqa: F401
 from .idefics3 import RBLNOptimumIdefics3ForConditionalGeneration  # noqa: F401
 from .llava import RBLNOptimumLlavaForConditionalGeneration  # noqa: F401
