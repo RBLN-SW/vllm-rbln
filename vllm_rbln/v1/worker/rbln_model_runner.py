@@ -2421,8 +2421,13 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         invalid_req_indices = []
         if not self.use_async_scheduling:
             # Get the valid generated tokens.
-            max_gen_len = sampled_token_ids.shape[-1]
-            if max_gen_len == 1:
+            if sampled_token_ids.shape[0] == 0:
+                # No tokens were actually sampled (e.g., non-last
+                # chunk in chunked prefill produces empty logits).
+                valid_sampled_token_ids: list[list[int]] = [
+                    [] for _ in range(num_sampled_tokens)
+                ]
+            elif sampled_token_ids.shape[-1] == 1:
                 # No spec decode tokens.
                 valid_sampled_token_ids = self._to_list(sampled_token_ids)
             else:
@@ -2784,17 +2789,37 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 else:
                     selected_token_indices = logits_indices
                     assert selected_token_indices.dim() == 1
-                    if not is_prefills[0] and self.speculative_config is not None:
+                    if is_prefills[0]:  # prefill
+                        assert selected_token_indices.size(0) == 1
+                        num_computed = self.input_batch.num_computed_tokens_cpu
+                        num_prompted = self.input_batch.num_prompt_tokens
+                        is_last_prefill = (
+                            num_computed + self.max_num_tokens
+                        ) >= num_prompted
+                        if not is_last_prefill[0]:  # noqa: SIM108
+                            # chunked prefill(#0~#N-1, intermediate)
+                            # token_indices = torch.tensor([max_num_seqs-1])
+                            # selected = torch.tensor([])
+                            logits = logits[:0]
+                        else:
+                            # chunked prefill(#N, final)
+                            # token_indices = torch.tensor([last_seq_idx-1])
+                            # selected_token_indices == token_indices
+                            logits = logits
+                    else:  # decode
                         # selected_token_indices is for valid decode tokens
                         # token_indices == None, selected = torch.tensor([0])
-                        batch_indices = torch.arange(
-                            self.input_batch.num_reqs, device=self.device
-                        )
-                        sample_hidden_states = hidden_states[
-                            batch_indices,
-                            : self.speculative_config.num_speculative_tokens + 1,
-                        ]
-                        logits = logits[selected_token_indices]
+                        if self.speculative_config is None:
+                            logits = logits
+                        else:
+                            batch_indices = torch.arange(
+                                self.input_batch.num_reqs, device=self.device
+                            )
+                            sample_hidden_states = hidden_states[
+                                batch_indices,
+                                : self.speculative_config.num_speculative_tokens + 1,
+                            ]
+                            logits = logits[selected_token_indices]
 
             if broadcast_pp_output:
                 model_output_broadcast_data = (
