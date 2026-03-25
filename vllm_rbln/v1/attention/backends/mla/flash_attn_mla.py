@@ -40,7 +40,7 @@ def _empty_mla_attention_output(
     """Shape for MLA kernel output consumed by o_proj: [B, seq, H * v_head_dim]."""
     b, seq_len, num_heads, _ = q.shape
     kv_lora_rank = kv_c_normed.shape[-1]
-    return torch.empty((b, seq_len, num_heads, kv_lora_rank))
+    return q.new_empty((b, seq_len, num_heads, kv_lora_rank))
 
 
 # RBLN custom op (flash causal attention naive prefill/decode w/o attn mask)
@@ -387,8 +387,8 @@ class RBLNFlashAttnMLAImpl(MLACommonBaseImpl[RBLNFlashAttentionMetadata]):
                         *prefill_args,
                     )
 
-        # Custom ops return [batch, seq, num_heads * v_head_dim] (MLA / o_proj layout).
-        expected = (b_size, q_len, self.num_heads, self.v_head_dim)
+        # Custom ops return [batch, seq, num_heads, kv_lora_rank] (MLA / o_proj layout).
+        expected = (b_size, q_len, self.num_heads, self.kv_lora_rank)
         if attn_output.shape != expected:
             raise ValueError(
                 f"MLA attention output shape {tuple(attn_output.shape)} != expected "
