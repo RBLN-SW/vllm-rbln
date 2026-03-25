@@ -32,6 +32,9 @@ from ..flash_attention import (
 
 logger = init_logger(__name__)
 
+import logging
+
+log = logging.getLogger("torch._dynamo")
 
 
 def _empty_mla_attention_output(
@@ -40,15 +43,20 @@ def _empty_mla_attention_output(
     """Shape for MLA kernel output consumed by o_proj: [B, seq, H * v_head_dim]."""
     b, seq_len, num_heads, _ = q.shape
     kv_lora_rank = kv_c_normed.shape[-1]
-    return q.new_empty((b, seq_len, num_heads, kv_lora_rank))
+
+    device = q.device
+    dtype = q.dtype
+    return torch.empty(
+        (b, seq_len, num_heads, kv_lora_rank), device=device, dtype=dtype
+    )
 
 
 # RBLN custom op (flash causal attention naive prefill/decode w/o attn mask)
 @torch.library.custom_op(
-    "rbln_custom_ops::flash_causal_mla_attention_naive_prefill",
+    "rbln_custom_ops::paged_flash_causal_mla_naive_prefill",
     mutates_args=["kv_cache"],
 )
-def flash_causal_mla_attention_naive_prefill_impl(
+def paged_flash_causal_mla_naive_prefill_impl(
     q: torch.Tensor,
     kv_c_normed: torch.Tensor,
     k_pe: torch.Tensor,
@@ -77,9 +85,7 @@ def flash_causal_mla_attention_naive_prefill_impl(
     return _empty_mla_attention_output(q, kv_c_normed)
 
 
-@torch.library.register_fake(
-    "rbln_custom_ops::flash_causal_mla_attention_naive_prefill"
-)
+@torch.library.register_fake("rbln_custom_ops::paged_flash_causal_mla_naive_prefill")
 def _(
     q: torch.Tensor,
     kv_c_normed: torch.Tensor,
@@ -93,10 +99,10 @@ def _(
 
 
 @torch.library.custom_op(
-    "rbln_custom_ops::flash_causal_mla_attention_naive_decode",
+    "rbln_custom_ops::flash_causal_mla_naive_decode",
     mutates_args=["kv_cache"],
 )
-def flash_causal_mla_attention_naive_decode_impl(
+def flash_causal_mla_naive_decode_impl(
     q: torch.Tensor,
     kv_c_normed: torch.Tensor,
     k_pe: torch.Tensor,
@@ -108,7 +114,7 @@ def flash_causal_mla_attention_naive_decode_impl(
     return _empty_mla_attention_output(q, kv_c_normed)
 
 
-@torch.library.register_fake("rbln_custom_ops::flash_causal_mla_attention_naive_decode")
+@torch.library.register_fake("rbln_custom_ops::flash_causal_mla_naive_decode")
 def _(
     q: torch.Tensor,
     kv_c_normed: torch.Tensor,
@@ -266,7 +272,7 @@ class RBLNFlashAttnMLAImpl(MLACommonBaseImpl[RBLNFlashAttentionMetadata]):
         self.is_causal = envs.VLLM_RBLN_FLASH_CAUSAL_ATTN
         self.is_batch_attention_opt = envs.VLLM_RBLN_BATCH_ATTN_OPT
         self.is_normal = False
-        self.scale = torch.tensor(scale, device=self.device)
+        self.scale = torch.tensor([scale], device=self.device)
 
         if not self.is_batch_attention_opt:
             raise NotImplementedError(
@@ -350,11 +356,11 @@ class RBLNFlashAttnMLAImpl(MLACommonBaseImpl[RBLNFlashAttentionMetadata]):
                             "Triton Custom kernel is not supported for MLA"
                         )
                     else:
-                        flash_causal_mla_attention_naive_prefill = (  # noqa: E501
-                            torch.ops.rbln_custom_ops.flash_causal_mla_attention_naive_prefill
+                        paged_flash_causal_mla_naive_prefill = (  # noqa: E501
+                            torch.ops.rbln_custom_ops.paged_flash_causal_mla_naive_prefill
                         )
-                        flash_causal_mla_attention_naive_decode = (  # noqa: E501
-                            torch.ops.rbln_custom_ops.flash_causal_mla_attention_naive_decode
+                        flash_causal_mla_naive_decode = (  # noqa: E501
+                            torch.ops.rbln_custom_ops.flash_causal_mla_naive_decode
                         )
                 else:
                     raise NotImplementedError(
@@ -373,9 +379,9 @@ class RBLNFlashAttnMLAImpl(MLACommonBaseImpl[RBLNFlashAttentionMetadata]):
                         kv_cache,
                         attn_metadata.seq_lens.to(torch.int16),
                         attn_metadata.block_tables.to(torch.int16),
-                        self.scale
+                        self.scale,
                     ]
-                    attn_output = flash_causal_mla_attention_naive_decode(  # noqa: E501
+                    attn_output = flash_causal_mla_naive_decode(  # noqa: E501
                         *decode_args,
                     )
                 else:
@@ -386,11 +392,19 @@ class RBLNFlashAttnMLAImpl(MLACommonBaseImpl[RBLNFlashAttentionMetadata]):
                         kv_cache,
                         attn_metadata.seq_lens.to(torch.int16),
                         attn_metadata.block_tables.to(torch.int16),
-                        self.scale
+                        self.scale,
                     ]
-                    attn_output = flash_causal_mla_attention_naive_prefill(  # noqa: E501
+                    attn_output = paged_flash_causal_mla_naive_prefill(  # noqa: E501
                         *prefill_args,
                     )
+                    # log.info(f"[thkim_debug] q : {q.shape}, kv_c_normed : {kv_c_normed.shape}, k_pe : {k_pe.shape}, kv_cache : {kv_cache.shape}, seq_idx : {attn_metadata.seq_lens.shape}, block_tables : {attn_metadata.block_tables.shape}, scale : {self.scale.shape}")
+                    # q : torch.Size([1, 128, 16, 576]),
+                    # kv_c_normed : torch.Size([1, 128, 512]),
+                    # k_pe : torch.Size([1, 128, 64]),
+                    # kv_cache : torch.Size([1461, 8192, 576]),
+                    # seq_idx : torch.Size([1, 1]),
+                    # block_tables : torch.Size([1]),
+                    # scale : torch.Size([])
 
         # Custom ops return [batch, seq, num_heads, kv_lora_rank] (MLA / o_proj layout).
         expected = (b_size, q_len, self.num_heads, self.kv_lora_rank)
