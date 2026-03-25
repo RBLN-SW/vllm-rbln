@@ -18,12 +18,12 @@ import torch
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsMultiModal
-from vllm.model_executor.models.qwen2_5_vl import (
-    Qwen2_5_VLImageEmbeddingInputs,
-    Qwen2_5_VLImagePixelInputs,
-    Qwen2_5_VLVideoEmbeddingInputs,
+from vllm.model_executor.models.qwen2_vl import (
+    Qwen2VLImageEmbeddingInputs,
+    Qwen2VLImagePixelInputs,
+    Qwen2VLVideoEmbeddingInputs,
+    Qwen2VLVideoPixelInputs,
 )
-from vllm.model_executor.models.qwen2_vl import Qwen2VLVideoPixelInputs
 
 from .base import ModelInputForRBLN
 from .model_base import RBLNOptimumDecoderMixin, RBLNOptimumModelBase
@@ -36,6 +36,23 @@ from .optimum_attention import (
 )
 
 logger = init_logger(__name__)
+
+
+# NOTE: # EXAONE4_5 path does not require second_per_grid_ts.
+class EXAONE4_5ImageEmbeddingInputs(Qwen2VLImageEmbeddingInputs):
+    pass
+
+
+class EXAONE4_5ImagePixelInputs(Qwen2VLImagePixelInputs):
+    pass
+
+
+class EXAONE4_5VideoPixelInputs(Qwen2VLVideoPixelInputs):
+    pass
+
+
+class EXAONE4_5VideoEmbeddingInputs(Qwen2VLVideoEmbeddingInputs):
+    pass
 
 
 class RBLNOptimumExaone4_5_ForConditionalGeneration(
@@ -107,14 +124,14 @@ class RBLNOptimumExaone4_5_ForConditionalGeneration(
             preprocess_args["second_per_grid_ts"] = video_input["second_per_grid_ts"]
 
     def _create_image_pixel_inputs(self, pixel_values, image_grid_thw):
-        return Qwen2_5_VLImagePixelInputs(
+        return EXAONE4_5ImagePixelInputs(
             type="pixel_values",
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
         )
 
     def _create_image_embedding_inputs(self, image_embeds, image_grid_thw):
-        return Qwen2_5_VLImageEmbeddingInputs(
+        return EXAONE4_5ImageEmbeddingInputs(
             type="image_embeds",
             image_embeds=image_embeds,
             image_grid_thw=image_grid_thw,
@@ -126,15 +143,14 @@ class RBLNOptimumExaone4_5_ForConditionalGeneration(
         video_grid_thw: torch.Tensor,
         second_per_grid_ts=torch.Tensor | None,
     ):
-        # Exaone4_5 path does not require second_per_grid_ts.
-        return Qwen2VLVideoPixelInputs(
+        return EXAONE4_5VideoPixelInputs(
             type="pixel_values_videos",
             pixel_values_videos=pixel_values_videos,
             video_grid_thw=video_grid_thw,
         )
 
     def _create_video_embedding_inputs(self, video_embeds, video_grid_thw):
-        return Qwen2_5_VLVideoEmbeddingInputs(
+        return EXAONE4_5VideoEmbeddingInputs(
             type="video_embeds",
             video_embeds=video_embeds,
             video_grid_thw=video_grid_thw,
@@ -182,9 +198,10 @@ class RBLNOptimumExaone4_5_ForConditionalGeneration(
                 video_input = self._parse_and_validate_video_input(
                     **model_input.multi_modal_kwargs
                 )
+            if image_input is None and video_input is None:
+                inputs_embeds = None
 
             attention_mask = torch.ones_like(input_ids)
-
             inputs_embeds = self.preprocess_prefill(
                 input_ids, attention_mask, image_input, video_input
             )
