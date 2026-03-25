@@ -273,6 +273,22 @@ class RBLNFlashAttnMLAImpl(MLACommonBaseImpl[RBLNFlashAttentionMetadata]):
                 "Batch attention non-optimization is not supported for MLA"
             )
 
+    def _v_up_proj(self, x: torch.Tensor):
+        """V-up projection.
+
+        Args:
+            x: torch.size([batch, num_tokens, num_heads, kv_lora_rank])
+
+        Returns:
+            torch.size([batch, num_tokens, num_heads, v_head_dim])
+        """
+        b_size, q_len, num_heads, _ = x.size()
+        x = x.view(b_size * q_len, num_heads, -1).transpose(0, 1)
+        x = torch.bmm(x, self.W_UV)
+        x = x.transpose(0, 1).view(b_size, q_len, num_heads, self.v_head_dim)
+
+        return x
+
     def forward(
         self,
         layer: torch.nn.Module,
@@ -298,9 +314,9 @@ class RBLNFlashAttnMLAImpl(MLACommonBaseImpl[RBLNFlashAttentionMetadata]):
             output_block_scale: torch.size([batch, num_tokens, num_heads * v_head_dim])
 
         Returns:
-            attn_out  = (batch_size, seq_len, num_heads * v_head_dim)
+            attn_out  = (batch_size, seq_len, num_heads, v_head_dim)
         """
-        b_size, q_len, num_heads, qk_head_dim = q.size()
+        b_size, q_len, num_heads, _ = q.size()
 
         decode_q_nope, decode_q_pe = q.split(
             [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
@@ -318,8 +334,6 @@ class RBLNFlashAttnMLAImpl(MLACommonBaseImpl[RBLNFlashAttentionMetadata]):
 
         q = torch.cat([decode_ql_nope, decode_q_pe], dim=-1)
         k_pe = k_pe.squeeze(2)
-
-        assert kv_cache is not None
 
         if self.sliding_window is not None:
             raise NotImplementedError(
@@ -379,10 +393,11 @@ class RBLNFlashAttnMLAImpl(MLACommonBaseImpl[RBLNFlashAttentionMetadata]):
                     )
 
         # Custom ops return [batch, seq, num_heads * v_head_dim] (MLA / o_proj layout).
-        expected = (b_size, q_len, self.num_heads * self.v_head_dim)
+        expected = (b_size, q_len, self.num_heads, self.v_head_dim)
         if attn_output.shape != expected:
             raise ValueError(
                 f"MLA attention output shape {tuple(attn_output.shape)} != expected "
                 f"{expected}; kernel must return V-space layout for o_proj."
             )
-        return attn_output
+
+        return self._v_up_proj(attn_output)
