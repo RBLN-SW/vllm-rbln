@@ -24,10 +24,8 @@ def __AXK1_moe_forward_rsd(self, hidden_states: torch.Tensor) -> torch.Tensor:
     )    
     # Fix FP16 overflow
     # See DeepseekV2DecoderLayer for more details.
-    if hidden_states.dtype != torch.float16:
-        final_hidden_states *= self.routed_scaling_factor
-    elif self.shared_experts is not None:
-        shared_output *= 1.0 / self.routed_scaling_factor
+    final_hidden_states *= (self.routed_scaling_factor ** 0.5 / 2)
+    shared_output *= 1.0 / (self.routed_scaling_factor ** 0.5 * 2)
     
     if self.shared_experts is not None:
         final_hidden_states += shared_output
