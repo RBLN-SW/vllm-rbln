@@ -28,7 +28,7 @@ from pathlib import Path
 import pytest
 
 # Smallest public Qwen2 causal LM in the Qwen2 family (~0.5B params).
-QWEN2_SMALL_MODEL = "Qwen/Qwen2-0.5B-Instruct"
+QWEN2_SMALL_MODEL = "Qwen/Qwen3-0.6B"
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 OFFLINE_INFERENCE_BASIC = REPO_ROOT / "examples" / "experimental" / "offline_inference_basic.py"
@@ -44,6 +44,9 @@ pytestmark = pytest.mark.skipif(
 def test_dump_metrics(tmp_path: Path) -> None:
     """Run dump metrics; expect *_metrics.txt in cwd."""
     env = os.environ.copy()
+    env["RBLN_USE_CUSTOM_KERNEL"] = "0"
+    env["VLLM_RBLN_COMPILE_STRICT_MODE"] = "1"
+    env["VLLM_DISABLE_COMPILE_CACHE"] = "1"
     env["VLLM_USE_V1"] = "1"
     env["VLLM_RBLN_METRICS"] = "1"
     env["VLLM_RBLN_DUMP_METRICS"] = "1"
@@ -53,12 +56,10 @@ def test_dump_metrics(tmp_path: Path) -> None:
         str(OFFLINE_INFERENCE_BASIC),
         "--model",
         QWEN2_SMALL_MODEL,
-        "--max-model-len",
-        "512",
         "--max-num-seqs",
-        "4",
+        "1",
         "--block-size",
-        "128",
+        "4096",
         "--tensor-parallel-size",
         "1",
     ]
