@@ -274,21 +274,24 @@ if envs.VLLM_RBLN_MOE_USE_OPT_KERNEL:
         - gate_proj_weight: [num_experts, intermediate_size, hidden_size]
         - up_proj_weight: [num_experts, intermediate_size, hidden_size]
         - down_proj_weight: [num_experts, hidden_size, intermediate_size]
-        - masked_routing_weight: [num_experts, batch * seq_len]
+        - masked_routing_weight: [num_experts, batch * seq_len] (token dim may be padded to 64-align)
 
         Returns:
             torch.Tensor: [batch * seq_len, hidden_size]
         """
         assert hidden_states.dtype == masked_routing_weight.dtype, "hidden_states and masked_routing_weight must have the same dtype"
 
+        num_tokens = hidden_states.shape[0]
         out = torch.zeros_like(hidden_states)
         expert_cnt = gate_proj_weight.shape[0]
+        # routing weight token dim may be padded to 64-align; slice to actual num_tokens
+        routing_t = masked_routing_weight.transpose(0, 1)[:num_tokens, :]  # [num_tokens, E]
         for i in range(expert_cnt):
             gate = torch.nn.functional.linear(hidden_states, gate_proj_weight[i])
             up = torch.nn.functional.linear(hidden_states, up_proj_weight[i])
             mul = torch.nn.functional.silu(gate) * up
             down = torch.nn.functional.linear(mul, down_proj_weight[i])
-            out += down * masked_routing_weight.transpose(0, 1)[:, i : i + 1]
+            out += down * routing_t[:, i : i + 1]
         return out
 
     @custom_moe_glu.register_fake
@@ -332,7 +335,7 @@ else:
         - gate_proj_weight: [num_experts, intermediate_size, hidden_size]
         - up_proj_weight: [num_experts, intermediate_size, hidden_size]
         - down_proj_weight: [num_experts, hidden_size, intermediate_size]
-        - masked_routing_weight: [num_experts, batch * seq_len]
+        - masked_routing_weight: [num_experts, batch * seq_len] (token dim may be padded to 64-align)
         - expert_select_count: [num_experts]
 
         Returns:
@@ -340,14 +343,17 @@ else:
         """
         assert hidden_states.dtype == masked_routing_weight.dtype, "hidden_states and masked_routing_weight must have the same dtype"
 
+        num_tokens = hidden_states.shape[0]
         out = torch.zeros_like(hidden_states)
         expert_cnt = gate_proj_weight.shape[0]
+        # routing weight token dim may be padded to 64-align; slice to actual num_tokens
+        routing_t = masked_routing_weight.transpose(0, 1)[:num_tokens, :]  # [num_tokens, E]
         for i in range(expert_cnt):
             gate = torch.nn.functional.linear(hidden_states, gate_proj_weight[i])
             up = torch.nn.functional.linear(hidden_states, up_proj_weight[i])
             mul = torch.nn.functional.silu(gate) * up
             down = torch.nn.functional.linear(mul, down_proj_weight[i])
-            out += down * masked_routing_weight.transpose(0, 1)[:, i : i + 1]
+            out += down * routing_t[:, i : i + 1]
         return out
 
     @custom_moe_glu.register_fake
@@ -551,6 +557,12 @@ def unquantized_fused_moe_method_custom(
     # transpose to [num_experts, num_tokens] for custom_moe_glu
     masked_routing_weights_t = masked_routing_weights.transpose(0, 1)
 
+    # pad token dim to 64-alignment for hardware (matching compiler moe_glu padding)
+    T = masked_routing_weights_t.shape[1]
+    if T <= 8:
+        pad_size = 64 - (T % 64)
+        masked_routing_weights_t = F.pad(masked_routing_weights_t, (0, pad_size), value=0.0)
+
     # compute expert_select_count from masked_routing_weights
     expert_select_count = (masked_routing_weights_t > 0).sum(dim=1).to(torch.int32)
 
@@ -594,6 +606,12 @@ def unquantized_fused_optimize_moe_method_custom(
     # transpose to [num_experts, num_tokens] for custom_moe_glu
     masked_routing_weights_t = masked_routing_weights.transpose(0, 1)
 
+    # pad token dim to 64-alignment for hardware (matching compiler moe_glu padding)
+    T = masked_routing_weights_t.shape[1]
+    if T <= 8:
+        pad_size = 64 - (T % 64)
+        masked_routing_weights_t = F.pad(masked_routing_weights_t, (0, pad_size), value=0.0)
+
     expert_map_const = None
     if layer.expert_map is not None:
         expert_map_list = layer.expert_map.tolist()
@@ -624,21 +642,29 @@ def fused_moe_forward_rbln(
         R = self.dp_size
         num_tokens = org_hidden_shape[:-1].numel()
         t = num_tokens
+        max_pad = get_forward_context().dp_metadata.max_pads_across_dp.shape[0]
+        H_dim = hidden_states.shape[-1]
 
         # --- Step 1: Local routing on this rank's own tokens ---
         router_logits = router(hidden_states)
         router_logits_2d = router_logits.reshape(t, -1)  # [t, E]
         E = router_logits_2d.shape[-1]
 
+        # Pad to max_pad so all DP ranks have the same tensor size for all_gather
+        hidden_flat = hidden_states.reshape(t, -1)  # [t, H]
+        if t < max_pad:
+            router_logits_2d = F.pad(router_logits_2d, (0, 0, 0, max_pad - t), value=0.0)  # [max_pad, E]
+            hidden_flat = F.pad(hidden_flat, (0, 0, 0, max_pad - t), value=0.0)  # [max_pad, H]
+
         # --- Step 2: all_gather router_logits across DP ranks ---
-        # [t, E] → [1, t*E] → all_gather → [R, t*E] → [R*t, E]
-        rl_flat = router_logits_2d.reshape(1, -1)  # [1, t*E]
-        all_rl_flat = get_dp_group().all_gather(rl_flat, dim=0)  # [R, t*E]
-        all_router_logits = all_rl_flat.reshape(R * t, E)  # [R*t, E]
+        # [max_pad, E] → [1, max_pad*E] → all_gather → [R, max_pad*E] → [R*max_pad, E]
+        rl_flat = router_logits_2d.reshape(1, -1)  # [1, max_pad*E]
+        all_rl_flat = get_dp_group().all_gather(rl_flat, dim=0)  # [R, max_pad*E]
+        all_router_logits = all_rl_flat.reshape(R * max_pad, E)  # [R*max_pad, E]
 
         # --- Step 3: topk + softmax on all gathered tokens ---
-        # [E, R*t] for dim=0 topk (select top_k experts per token)
-        all_router_logits_t = all_router_logits.transpose(0, 1)  # [E, R*t]
+        # [E, R*max_pad] for dim=0 topk (select top_k experts per token)
+        all_router_logits_t = all_router_logits.transpose(0, 1)  # [E, R*max_pad]
 
         if self.renormalize:
             # post_norm: topk first, then softmax on selected values
@@ -652,15 +678,24 @@ def fused_moe_forward_rbln(
             topk_weights, selected_experts = torch.topk(
                 routing_weights, k=self.top_k, dim=0
             )
-        masked_routing_weights = torch.zeros_like(all_router_logits_t)  # [E, R*t]
+        masked_routing_weights = torch.zeros_like(all_router_logits_t)  # [E, R*max_pad]
         masked_routing_weights.scatter_(0, selected_experts, topk_weights)
 
-        # all_routing_3d: [E, R, t] for CCL send kernel 
-        all_routing_3d = masked_routing_weights.reshape(E, R, t)
+        masked_routing_weights = masked_routing_weights.to(hidden_states.dtype)
+
+        # Apply token mask to zero out padded positions per DP rank
+        use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
+        if use_moe_tokens_mask:
+            # get_tokens_mask returns [R*max_pad, 1] — dimensions now match
+            tokens_mask = get_tokens_mask(max_pad).to(hidden_states.dtype)  # [R*max_pad, 1]
+            # [E, R*max_pad] * [1, R*max_pad] (broadcast)
+            masked_routing_weights = masked_routing_weights * tokens_mask.transpose(0, 1)
+
+        # all_routing_3d: [E, R, max_pad] for CCL send kernel
+        all_routing_3d = masked_routing_weights.reshape(E, R, max_pad)
 
         # --- Step 4: CCL all2all dispatch ---
-        # hidden_states for send: [t, H]
-        hidden_flat = hidden_states.reshape(t, -1)
+        # hidden_flat: [max_pad, H] (already padded above)
 
         # ccl_send
         send_buffer, recv_indices, send_sizes, recv_sizes = (
@@ -692,12 +727,11 @@ def fused_moe_forward_rbln(
         )
 
         # --- Step 5: MoE FFN on gathered tokens ---
-        # unpacked: [R, t, H] → flatten to [R*t, H] for MoE
-        H_dim = hidden_flat.shape[1]
-        gathered_hidden = unpacked.reshape(R * t, H_dim)
+        # unpacked: [R, max_pad, H] → flatten to [R*max_pad, H] for MoE
+        gathered_hidden = unpacked.reshape(R * max_pad, H_dim)
 
-        # masked_routing_weights: [E, R*t] → [R*t, E]
-        all_routing_flat = masked_routing_weights.transpose(0, 1)  # [R*t, E]
+        # masked_routing_weights: [E, R*max_pad] → [R*max_pad, E]
+        all_routing_flat = masked_routing_weights.transpose(0, 1)  # [R*max_pad, E]
 
         final_hidden_states = self.quant_method.apply(
             layer=self,
@@ -709,10 +743,10 @@ def fused_moe_forward_rbln(
         # all_reduce across DP group to sum partial expert contributions
         # (each rank computed only its local experts; all_reduce aggregates)
         final_hidden_states = get_dp_group().all_reduce(final_hidden_states)
-         # final_hidden_states: [R*t, H] → [R, t, H]
-        final_hidden_states = final_hidden_states.reshape(R, t, H_dim)
-        # Take only this rank's slice
-        final_hidden_states = final_hidden_states[self.dp_rank]
+        # final_hidden_states: [R*max_pad, H] → [R, max_pad, H]
+        final_hidden_states = final_hidden_states.reshape(R, max_pad, H_dim)
+        # Take only this rank's slice and trim to actual token count
+        final_hidden_states = final_hidden_states[self.dp_rank][:t]  # [t, H]
         final_hidden_states = final_hidden_states.reshape(org_hidden_shape)
 
         return final_hidden_states
@@ -741,15 +775,21 @@ def fused_moe_forward_rbln(
     masked_routing_weights = torch.zeros_like(router_logits_t)  # [E, t]
     masked_routing_weights.scatter_(0, selected_experts, topk_weights)
 
-    # # Apply token mask to zero out padded positions
-    # use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
-    # if use_moe_tokens_mask:
-    #     tokens_mask = get_tokens_mask(num_tokens)
-    #     # tokens_mask: [t, 1] -> transpose -> [1, t], broadcast with [E, t]
-    #     masked_routing_weights = masked_routing_weights * tokens_mask.transpose(0, 1)
-
-    # Restore dtype to match hidden_states (scatter_ may promote to float32)
+    # Restore dtype to match hidden_states BEFORE tokens_mask multiply
+    # (scatter_ promotes to float32, but LowerTopKRouting fuses
+    #  scatter+cast(bf16) into contrib_topk_routing with bf16 output;
+    #  multiply must happen after the cast so types match)
     masked_routing_weights = masked_routing_weights.to(hidden_states.dtype)
+
+    # Apply token mask to zero out padded positions
+    use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
+    if use_moe_tokens_mask:
+        tokens_mask = get_tokens_mask(num_tokens).to(hidden_states.dtype)  # [t, 1]
+
+        ## missing pad in token dim
+
+        # [E, t] * [1, t] (broadcast)
+        masked_routing_weights = masked_routing_weights * tokens_mask.transpose(0, 1)
 
     # pass as [t, E] to quant_method.apply (it will be reshaped inside)
     final_hidden_states = self.quant_method.apply(
