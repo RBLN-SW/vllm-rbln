@@ -16,7 +16,11 @@
 import asyncio
 
 def _ensure_transformers_layer_type_alias() -> None:
-    """Backfill renamed transformers symbol for vLLM compatibility."""
+    """
+    This ensures compatibility with different versions of transformers.
+    vLLM 0.13.0 still uses transformers < 5.0.0, while EXAONE uses transformers 5.0.0,
+    which renamed `ALLOWED_ATTENTION_LAYER_TYPES` to `ALLOWED_LAYER_TYPES`.
+    """
     import transformers.configuration_utils as configuration_utils
 
     if not hasattr(configuration_utils, "ALLOWED_LAYER_TYPES") and hasattr(
@@ -230,7 +234,7 @@ async def main(
 
 def entry_point(
     num_input_prompt: int = 4,
-    model_id: str = "/home/kblee/.cache/rbln-exec/compile_results/optimum-exaone4-5/model_id__exaone4.5-32b#batch_size__4#max_seq_len__128000#n_layers__64#tensor_parallel_size__16#vit_seq_lens__16384#kvcache_partition_len__5120#use_attn_mask__False/model",
+    model_id: str = "/home/eunji.lee/exaone/optimum-rbln/model_32B-dummy_128k_2026-02-26",
 ):
     asyncio.run(
         main(
