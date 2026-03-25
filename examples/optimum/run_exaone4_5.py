@@ -14,30 +14,24 @@
 # limitations under the License.
 
 import asyncio
-import os
-from pathlib import Path
+
+def _ensure_transformers_layer_type_alias() -> None:
+    """Backfill renamed transformers symbol for vLLM compatibility."""
+    import transformers.configuration_utils as configuration_utils
+
+    if not hasattr(configuration_utils, "ALLOWED_LAYER_TYPES") and hasattr(
+        configuration_utils, "ALLOWED_ATTENTION_LAYER_TYPES"
+    ):
+        configuration_utils.ALLOWED_LAYER_TYPES = (
+            configuration_utils.ALLOWED_ATTENTION_LAYER_TYPES
+        )
+
+_ensure_transformers_layer_type_alias()
 
 import fire
 from datasets import load_dataset
 from qwen_vl_utils import process_vision_info
 from transformers import AutoProcessor, AutoTokenizer
-
-
-def _ensure_sitecustomize_for_subprocess() -> None:
-    """Expose local sitecustomize.py to vLLM registry subprocesses."""
-    this_dir = str(Path(__file__).resolve().parent)
-    current = os.environ.get("PYTHONPATH")
-
-    if not current:
-        os.environ["PYTHONPATH"] = this_dir
-        return
-
-    paths = current.split(os.pathsep)
-    if this_dir not in paths:
-        os.environ["PYTHONPATH"] = os.pathsep.join([this_dir, *paths])
-
-
-_ensure_sitecustomize_for_subprocess()
 from vllm import AsyncEngineArgs, AsyncLLMEngine, SamplingParams
 
 # If the video is too long
