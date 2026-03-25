@@ -1713,6 +1713,61 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             model_kwargs,
         )
 
+    def _pad_sampling_metadata(
+        self,
+        metadata: SamplingMetadata,
+        padded_size: int,
+    ) -> SamplingMetadata:
+        """Pad SamplingMetadata tensors to match padded logits batch size.
+        When logits are kept at batch_bucket_size (not trimmed to num_reqs),
+        the sampler's tensor operations require metadata tensors to have
+        the same batch dimension.  Padding uses neutral values so that
+        padded positions do not alter the sampling outcome.
+        """
+        num_reqs = self.input_batch.num_reqs
+        if padded_size <= num_reqs:
+            return metadata
+
+        def _pad_1d(t: torch.Tensor | None, fill: float) -> torch.Tensor | None:
+            if t is None:
+                return None
+            pad_len = padded_size - t.shape[0]
+            if pad_len <= 0:
+                return t
+            return torch.cat([t, t.new_full((pad_len,), fill)])
+
+        def _pad_2d(t: torch.Tensor | None, fill: float) -> torch.Tensor | None:
+            if t is None:
+                return None
+            pad_len = padded_size - t.shape[0]
+            if pad_len <= 0:
+                return t
+            return torch.cat([t, t.new_full((pad_len, t.shape[1]), fill)])
+
+        output_token_ids = metadata.output_token_ids
+        if output_token_ids is not None and len(output_token_ids) < padded_size:
+            output_token_ids = list(output_token_ids) + [
+                [] for _ in range(padded_size - len(output_token_ids))
+            ]
+        return SamplingMetadata(
+            temperature=_pad_1d(metadata.temperature, 1.0),
+            all_greedy=metadata.all_greedy,
+            all_random=metadata.all_random,
+            top_p=_pad_1d(metadata.top_p, 1.0),
+            top_k=_pad_1d(metadata.top_k, self.input_batch.vocab_size),
+            generators=metadata.generators,
+            max_num_logprobs=metadata.max_num_logprobs,
+            prompt_token_ids=metadata.prompt_token_ids,
+            frequency_penalties=_pad_1d(metadata.frequency_penalties, 0.0),
+            presence_penalties=_pad_1d(metadata.presence_penalties, 0.0),
+            repetition_penalties=_pad_1d(metadata.repetition_penalties, 1.0),
+            output_token_ids=output_token_ids,
+            no_penalties=metadata.no_penalties,
+            allowed_token_ids_mask=_pad_2d(metadata.allowed_token_ids_mask, 0),
+            bad_words_token_ids=metadata.bad_words_token_ids,
+            logitsprocs=metadata.logitsprocs,
+        )
+
     def _sample(
         self,
         logits: torch.Tensor | None,
@@ -1731,6 +1786,10 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             )
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
+        if logits is not None and logits.shape[0] > self.input_batch.num_reqs:
+            sampling_metadata = self._pad_sampling_metadata(
+                sampling_metadata, logits.shape[0]
+            )
         if hasattr(rebel, "capture_reports"):
             capture_ctx = rebel.capture_reports()
         else:
