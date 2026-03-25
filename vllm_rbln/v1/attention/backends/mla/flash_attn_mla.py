@@ -55,7 +55,7 @@ def flash_causal_mla_attention_naive_prefill_impl(
     kv_cache: torch.Tensor,
     seq_idx: torch.Tensor,
     block_tables: torch.Tensor,
-    sinks: torch.Tensor | None = None,
+    scale: torch.Tensor,
 ) -> torch.Tensor:
     """
     Expected tensor shapes:
@@ -68,7 +68,7 @@ def flash_causal_mla_attention_naive_prefill_impl(
       number of already cached tokens in each partition
     - block_tables: [num_partitions,] for prefill,
                     [batch, num_partitions] for decode
-
+    - scale: []
     Returns:
         Tensor: attn_output [batch, seq_len, num_heads, kv_lora_rank]
 
@@ -87,6 +87,7 @@ def _(
     kv_cache: torch.Tensor,
     seq_idx: torch.Tensor,
     block_tables: torch.Tensor,
+    scale: torch.Tensor,
 ) -> torch.Tensor:
     return _empty_mla_attention_output(q, kv_c_normed)
 
@@ -102,6 +103,7 @@ def flash_causal_mla_attention_naive_decode_impl(
     kv_cache: torch.Tensor,
     seq_idx: torch.Tensor,
     block_tables: torch.Tensor,
+    scale: torch.Tensor,
 ) -> torch.Tensor:
     return _empty_mla_attention_output(q, kv_c_normed)
 
@@ -114,6 +116,7 @@ def _(
     kv_cache: torch.Tensor,
     seq_idx: torch.Tensor,
     block_tables: torch.Tensor,
+    scale: torch.Tensor,
 ) -> torch.Tensor:
     return _empty_mla_attention_output(q, kv_c_normed)
 
@@ -370,6 +373,7 @@ class RBLNFlashAttnMLAImpl(MLACommonBaseImpl[RBLNFlashAttentionMetadata]):
                         kv_cache,
                         attn_metadata.seq_lens.to(torch.int16),
                         attn_metadata.block_tables.to(torch.int16),
+                        self.scale
                     ]
                     attn_output = flash_causal_mla_attention_naive_decode(  # noqa: E501
                         *decode_args,
@@ -382,6 +386,7 @@ class RBLNFlashAttnMLAImpl(MLACommonBaseImpl[RBLNFlashAttentionMetadata]):
                         kv_cache,
                         attn_metadata.seq_lens.to(torch.int16),
                         attn_metadata.block_tables.to(torch.int16),
+                        self.scale
                     ]
                     attn_output = flash_causal_mla_attention_naive_prefill(  # noqa: E501
                         *prefill_args,
