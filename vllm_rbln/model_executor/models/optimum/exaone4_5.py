@@ -63,6 +63,10 @@ class EXAONE4_5VideoEmbeddingInputs(Qwen2VLVideoEmbeddingInputs):
     pass
 
 
+class EXAONE4_5_DummyInputsBuilder(Qwen2_5_VLDummyInputsBuilder):
+    pass
+
+
 class EXAONE4_5ProcessingInfo(Qwen2_5_VLProcessingInfo):
     def get_hf_config(self):
         return self.ctx.get_hf_config(Exaone4_5_Config)
@@ -75,14 +79,24 @@ class EXAONE4_5ProcessingInfo(Qwen2_5_VLProcessingInfo):
         )
 
 
-# class RBLNEXAONE4_5MultiModalProcessor(Qwen2_5_VLMultiModalProcessor):
-#     pass
+class EXAONE4_5MultiModalProcessor(Qwen2_5_VLMultiModalProcessor):
+    def apply(self, *args, **kwargs):
+        hf_processor_mm_kwargs = kwargs.pop("hf_processor_mm_kwargs", {})
+        if "fps" in hf_processor_mm_kwargs and isinstance(
+            hf_processor_mm_kwargs["fps"], list
+        ):
+            if len(hf_processor_mm_kwargs["fps"]) == 1:
+                hf_processor_mm_kwargs["fps"] = hf_processor_mm_kwargs["fps"][0]
+            else:
+                hf_processor_mm_kwargs.pop("fps", None)
+        kwargs["hf_processor_mm_kwargs"] = hf_processor_mm_kwargs
+        return super().apply(*args, **kwargs)
 
 
 @MULTIMODAL_REGISTRY.register_processor(
-    Qwen2_5_VLMultiModalProcessor,
+    EXAONE4_5MultiModalProcessor,
     info=EXAONE4_5ProcessingInfo,
-    dummy_inputs=Qwen2_5_VLDummyInputsBuilder,
+    dummy_inputs=EXAONE4_5_DummyInputsBuilder,
 )
 class RBLNOptimumExaone4_5_ForConditionalGeneration(
     RBLNOptimumModelBase, RBLNOptimumDecoderMixin, SupportsMultiModal, ABC
