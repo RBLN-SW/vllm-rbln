@@ -54,7 +54,7 @@ class EXAONE4_5ImagePixelInputs(Qwen2_5_VLImagePixelInputs):
     pass
 
 
-# NOTE: # EXAONE4_5 path does not require second_per_grid_ts.
+# NOTE: EXAONE4_5 does not require second_per_grid_ts.
 class EXAONE4_5VideoPixelInputs(Qwen2VLVideoPixelInputs):
     pass
 
