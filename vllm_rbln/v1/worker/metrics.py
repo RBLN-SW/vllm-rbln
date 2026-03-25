@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import atexit
+import os
 from collections import defaultdict
 from dataclasses import dataclass, field
 
@@ -130,27 +131,38 @@ class StepMetrics:
         """Get total number of requests processed."""
         return len(self.latencies)
 
-    def show_stats(self, stat_type: str):
+    def gen_stats(self, stat_type: str):
+        """ Generate stats string for the given stat type. """
+        stats = f""
         if self.get_call_counts() > 0:
-            logger.info("%s METRICS:", stat_type)
-            logger.info("  Total call counts: %d", self.get_call_counts())
-            logger.info("  Average latency: %.2f ms", self.get_avg_latency())
+            stats += f"{stat_type} METRICS:\n"
+            stats += f"  Total call counts: {self.get_call_counts()}\n"
+            stats += f"  Average latency: {self.get_avg_latency()} ms\n"
             if sum(self.token_counts) > 0:
-                logger.info("  Total tokens processed: %d", sum(self.token_counts))
-                logger.info(
-                    "  Average throughput: %.2f tokens/sec", self.get_avg_throughput()
-                )
+                stats += f"  Total tokens processed: {sum(self.token_counts)}\n"
+                stats += f"  Average throughput: {self.get_avg_throughput()} tokens/sec\n"
             if self.host_times:
-                logger.info("  Average host time: %.2f us", self.get_avg_host_time())
+                stats += f"  Average host time: {self.get_avg_host_time()} us\n"
             if self.device_times:
-                logger.info(
-                    "  Average device time: %.2f us", self.get_avg_device_time()
-                )
+                stats += f"  Average device time: {self.get_avg_device_time()} us\n"
             if self.ccl_times:
-                logger.info("  Average ccl time: %.2f us", self.get_avg_ccl_time())
+                stats += f"  Average ccl time: {self.get_avg_ccl_time()} us\n"
         else:
-            logger.info("%s METRICS: No data recorded", stat_type)
+            stats += f"{stat_type} METRICS: No data recorded\n"
+        return stats
 
+    def dump_stats(self, stat_type: str):
+        """ Dump stats to a file. """
+        filename = f"{stat_type}_metrics.txt"
+        if os.path.exists(filename):
+            os.remove(filename)
+        with open(filename, "w") as f:
+            f.write(self.gen_stats(stat_type))
+            
+    def show_stats(self, stat_type: str):
+        """ Show stats in the console. """
+        logger.info(self.gen_stats(stat_type))
+        self.dump_stats(stat_type)
 
 class PrefillMetricsByRequestID:
     """Metrics for prefill step by request id."""
