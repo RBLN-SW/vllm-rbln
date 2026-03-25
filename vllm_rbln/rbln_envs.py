@@ -46,6 +46,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS: list[int] = []
     VLLM_RBLN_USE_CUSTOM_KERNEL: bool = False
     VLLM_RBLN_AUTO_PORT: bool = True
+    VLLM_RBLN_DUMP_METRICS: bool = False
 
 
 def get_dp_impl() -> str:
@@ -256,6 +257,10 @@ environment_variables = {
     ),
     "VLLM_RBLN_PROFILER": (
         lambda: os.environ.get("RBLN_PROFILER", "False").lower() in ("true", "1")
+    ),
+    # Dump metrics to a file
+    "VLLM_RBLN_DUMP_METRICS": (
+        lambda: os.environ.get("VLLM_RBLN_DUMP_METRICS", "False").lower() in ("true", "1")
     ),
 }
 
