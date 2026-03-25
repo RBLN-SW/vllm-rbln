@@ -17,6 +17,7 @@ import os
 from collections import defaultdict
 from dataclasses import dataclass, field
 
+import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)
@@ -153,6 +154,8 @@ class StepMetrics:
 
     def dump_stats(self, stat_type: str):
         """ Dump stats to a file. """
+        if not envs.VLLM_RBLN_DUMP_METRICS:
+            return
         filename = f"{stat_type}_metrics.txt"
         if os.path.exists(filename):
             os.remove(filename)
