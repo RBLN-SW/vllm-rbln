@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import torch
+import torch.nn.functional as F
 import vllm.model_executor.layers.quantization.mxfp4 as upstream
 from vllm.model_executor.layers.fused_moe import (
     FusedMoE,
@@ -25,7 +26,6 @@ from vllm.model_executor.utils import set_weight_attrs
 
 import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
-from vllm_rbln.model_executor.layers.fused_moe.layer import get_tokens_mask
 
 logger = init_logger(__name__)
 
@@ -104,11 +104,9 @@ def custom_moe_glu_mxfp4(
     down_proj_blocks: torch.Tensor,
     down_proj_scales: torch.Tensor,
     down_proj_bias: torch.Tensor,
-    router_logits: torch.Tensor,
+    masked_routing_weights: torch.Tensor,
     alpha: torch.Tensor,
     limit: torch.Tensor,
-    k: int,
-    post_norm: bool = True,
     expert_map: torch.Tensor | None = None,
     dp_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -126,7 +124,7 @@ def custom_moe_glu_mxfp4(
     - down_proj_blocks: uint8 [num_experts, hidden_size, intermediate_size // 2]
     - down_proj_scales: [num_experts, hidden_size, intermediate_size // 32]
     - down_proj_bias: [num_experts, hidden_size]
-    - router_logits: [num_tokens, num_experts]
+    - masked_routing_weights: [num_experts, num_tokens] (token dim may be padded to 64-align)
     - alpha: [], constant
     - limit: [], constant
     - expert_map: [num_experts],
@@ -136,37 +134,23 @@ def custom_moe_glu_mxfp4(
     Returns:
         torch.Tensor: [num_tokens, hidden_size]
     """
+    assert hidden_states.dtype == masked_routing_weights.dtype, "hidden_states and masked_routing_weights must have the same dtype"
 
     if envs.VLLM_RBLN_COMPILE_MODEL:
         return torch.empty_like(hidden_states)
 
-    # Reference torch native implementation
-
     num_tokens, hidden_size = hidden_states.shape
     num_local_experts = gate_proj_blocks.shape[0]
-    # num_global_experts = router_logits.shape[1]
     dtype = hidden_states.dtype
 
     alpha_val = alpha.item()
     limit_val = limit.item()
 
-    # Compute top-k routing
-    # router_logits: [num_tokens, num_global_experts]
-    top_k_values, top_k_indices = torch.topk(router_logits, k, dim=-1)
-
-    # Apply softmax to get routing weights (only over selected experts)
-    if post_norm:
-        routing_weights = torch.softmax(top_k_values, dim=-1)
-    else:
-        # Pre-norm: softmax over all experts, then select top-k
-        all_weights = torch.softmax(router_logits, dim=-1)
-        routing_weights = torch.gather(all_weights, dim=-1, index=top_k_indices)
-
-    # Initialize output
-    output = torch.zeros(num_tokens, hidden_size, dtype=dtype)
+    # routing weight token dim may be padded to 64-align; slice to actual num_tokens
+    # masked_routing_weights: [E, num_tokens(+pad)] → [num_tokens, E]
+    routing_t = masked_routing_weights.transpose(0, 1)[:num_tokens, :]  # [num_tokens, E]
 
     # Dequantize all expert weights once
-    # gate_proj: [num_local_experts, intermediate_size, hidden_size]
     gate_proj_weights = _dequantize_mxfp4(
         gate_proj_blocks, gate_proj_scales, dtype=dtype
     )
@@ -175,11 +159,12 @@ def custom_moe_glu_mxfp4(
         down_proj_blocks, down_proj_scales, dtype=dtype
     )
 
+    output = torch.zeros(num_tokens, hidden_size, dtype=dtype)
+
     # Process each local expert
     for local_expert_idx in range(num_local_experts):
         # Determine which global expert this local expert corresponds to
         if expert_map is not None:
-            # Find global expert index that maps to this local expert
             global_expert_idx = (expert_map == local_expert_idx).nonzero(as_tuple=True)[
                 0
             ]
@@ -189,18 +174,14 @@ def custom_moe_glu_mxfp4(
         else:
             global_expert_idx = local_expert_idx
 
-        # Find tokens routed to this expert
-        # top_k_indices: [num_tokens, k]
-        expert_mask = top_k_indices == global_expert_idx  # [num_tokens, k]
-        token_indices, k_indices = expert_mask.nonzero(as_tuple=True)
+        # Find tokens routed to this expert (non-zero routing weight)
+        weights = routing_t[:, global_expert_idx]  # [num_tokens]
+        token_indices = weights.nonzero(as_tuple=True)[0]
 
         if len(token_indices) == 0:
             continue
 
-        # Get routing weights for these tokens
-        weights = routing_weights[token_indices, k_indices]  # [num_selected_tokens]
-
-        # Get hidden states for selected tokens
+        selected_weights = weights[token_indices]  # [num_selected]
         selected_hidden = hidden_states[token_indices]  # [num_selected, hidden_size]
 
         # Get expert weights
@@ -218,7 +199,7 @@ def custom_moe_glu_mxfp4(
         expert_out = activated @ down_w.T + down_b  # [num_selected, hidden_size]
 
         # Apply routing weights and accumulate
-        weighted_out = expert_out * weights.unsqueeze(-1)
+        weighted_out = expert_out * selected_weights.unsqueeze(-1)
         output.index_add_(0, token_indices, weighted_out.to(dtype))
 
     return output
@@ -231,16 +212,16 @@ def custom_moe_glu_mxfp4_fake(
     gate_proj_scales: torch.Tensor,
     gate_proj_bias: torch.Tensor,
     up_proj_blocks: torch.Tensor,
+
     up_proj_scales: torch.Tensor,
     up_proj_bias: torch.Tensor,
     down_proj_blocks: torch.Tensor,
     down_proj_scales: torch.Tensor,
     down_proj_bias: torch.Tensor,
-    router_logits: torch.Tensor,
+    
+    masked_routing_weights: torch.Tensor,
     alpha: torch.Tensor,
     limit: torch.Tensor,
-    k: int,
-    post_norm: bool = True,
     expert_map: torch.Tensor | None = None,
     dp_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -394,14 +375,21 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         x: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        # refer to custom_moe_glu
+        # router_logits is now pre-computed masked_routing_weights
+        # (topk + softmax already done in fused_moe_forward_rbln)
         orig_shape = x.shape  # noqa: F841
         num_tokens = orig_shape[:-1].numel()  # noqa: F841
         hidden_states = x.reshape(num_tokens, -1)
-        router_logits = router_logits.reshape(num_tokens, -1)
-        # x = x.view(-1, self.hidden_size)
-        # router_logits = router_logits.view(-1, self.num_experts)
-        # router_logits = router_logits.view(-1, self.moe.num_experts)
+        masked_routing_weights = router_logits.reshape(num_tokens, -1)
+
+        # transpose to [num_experts, num_tokens] for custom_moe_glu_mxfp4
+        masked_routing_weights_t = masked_routing_weights.transpose(0, 1)
+
+        # pad token dim to 64-alignment for hardware (matching compiler moe_glu padding)
+        T = masked_routing_weights_t.shape[1]
+        if T <= 8:
+            pad_size = 64 - (T % 64)
+            masked_routing_weights_t = F.pad(masked_routing_weights_t, (0, pad_size), value=0.0)
 
         if layer.activation == "swigluoai":
             expert_map_const = None
@@ -409,12 +397,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 # Extract numpy array and create a fresh constant tensor
                 expert_map_list = layer.expert_map.tolist()
                 expert_map_const = torch.tensor(expert_map_list, dtype=torch.int32)
-
-            use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
-            tokens_mask = None
-            if use_moe_tokens_mask:
-                tokens_mask = get_tokens_mask(num_tokens, 0.0, float("-inf"))
-                router_logits = router_logits + tokens_mask
 
             final_hidden_states = torch.ops.rbln_custom_ops.custom_moe_glu_mxfp4(
                 hidden_states,
@@ -427,11 +409,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.down_proj_blocks,
                 layer.down_proj_scales,
                 layer.down_proj_bias,
-                router_logits,
+                masked_routing_weights_t,
                 self.swiglu_alpha,
                 self.swiglu_limit,
-                layer.top_k,
-                layer.renormalize,
                 expert_map_const,
             )
         else:
