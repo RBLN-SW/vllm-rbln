@@ -16,6 +16,12 @@
 
 import pytest
 import torch
+from vllm.lora.request import LoRARequest
+from vllm.multimodal.inputs import (
+    MultiModalFeatureSpec,
+    MultiModalKwargsItem,
+    PlaceholderRange,
+)
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_utils import (
@@ -57,61 +63,131 @@ class TestSubBlockHasher:
         self.hasher = SubBlockHasher(sha256, sub_block_size=4)
 
     def test_hash_empty_tokens(self):
-        hashes = self.hasher.hash_tokens([])
+        hashes, _ = self.hasher.hash_tokens([])
         assert hashes == []
 
     def test_hash_fewer_than_sub_block(self):
-        hashes = self.hasher.hash_tokens([1, 2, 3])
+        hashes, _ = self.hasher.hash_tokens([1, 2, 3])
         assert hashes == []
 
     def test_hash_exact_sub_block(self):
-        hashes = self.hasher.hash_tokens([1, 2, 3, 4])
+        hashes, _ = self.hasher.hash_tokens([1, 2, 3, 4])
         assert len(hashes) == 1
         assert isinstance(hashes[0], bytes)
 
     def test_hash_multiple_sub_blocks(self):
-        hashes = self.hasher.hash_tokens([1, 2, 3, 4, 5, 6, 7, 8])
+        hashes, _ = self.hasher.hash_tokens([1, 2, 3, 4, 5, 6, 7, 8])
         assert len(hashes) == 2
 
     def test_hash_partial_last_sub_block(self):
-        hashes = self.hasher.hash_tokens([1, 2, 3, 4, 5, 6])
+        hashes, _ = self.hasher.hash_tokens([1, 2, 3, 4, 5, 6])
         assert len(hashes) == 1  # Only the first full sub-block.
 
     def test_hashes_are_chained(self):
         # Hashing [1,2,3,4,5,6,7,8] should produce different h1 than
         # hashing [5,6,7,8] alone (because the parent hash differs).
-        hashes_full = self.hasher.hash_tokens([1, 2, 3, 4, 5, 6, 7, 8])
-        hashes_second_only = self.hasher.hash_tokens([5, 6, 7, 8])
+        hashes_full, _ = self.hasher.hash_tokens([1, 2, 3, 4, 5, 6, 7, 8])
+        hashes_second_only, _ = self.hasher.hash_tokens([5, 6, 7, 8])
         assert hashes_full[1] != hashes_second_only[0]
 
     def test_incremental_hashing(self):
         # Hash in one go.
-        hashes_all = self.hasher.hash_tokens([1, 2, 3, 4, 5, 6, 7, 8])
+        hashes_all, _ = self.hasher.hash_tokens([1, 2, 3, 4, 5, 6, 7, 8])
 
         # Hash in two steps.
         # Step 1: first sub-block only (only 4 tokens available).
-        h1 = self.hasher.hash_tokens(
+        h1, _ = self.hasher.hash_tokens(
             [1, 2, 3, 4],
             parent_hash=None,
             num_hashed_tokens=0,
         )
         # Step 2: all 8 tokens available, start from offset 4.
-        h2 = self.hasher.hash_tokens(
+        h2, _ = self.hasher.hash_tokens(
             [1, 2, 3, 4, 5, 6, 7, 8],
             parent_hash=h1[0],
             num_hashed_tokens=4,
         )
         assert h1 + h2 == hashes_all
 
+    def test_incremental_hashing_with_extra_keys(self):
+        """Incremental hashing with extra_keys (via request=) must
+        produce the same result as one-shot hashing.
+
+        Uses images with gaps and one image spanning two sub-blocks
+        so that the incremental resume point lands *between* images.
+
+        Layout (sub_block_size=4):
+          tokens:     0..3   4..7   8..11  12..15  16..19
+          sub-blocks: sb0    sb1    sb2    sb3     sb4
+          image A:    [0, 4)
+          image B:                  [8,      14)
+          image C:                                 [16, 20)
+        """
+        tokens = list(range(20))
+
+        mm_features = [
+            MultiModalFeatureSpec(
+                data=MultiModalKwargsItem.dummy(),
+                modality="image",
+                identifier="hash_img_a",
+                mm_position=PlaceholderRange(offset=0, length=4),
+            ),
+            MultiModalFeatureSpec(
+                data=MultiModalKwargsItem.dummy(),
+                modality="image",
+                identifier="hash_img_b",
+                mm_position=PlaceholderRange(offset=8, length=6),
+            ),
+            MultiModalFeatureSpec(
+                data=MultiModalKwargsItem.dummy(),
+                modality="image",
+                identifier="hash_img_c",
+                mm_position=PlaceholderRange(offset=16, length=4),
+            ),
+        ]
+
+        req = Request(
+            request_id="mm",
+            prompt_token_ids=tokens,
+            mm_features=mm_features,
+            sampling_params=SamplingParams(max_tokens=17),
+            pooling_params=None,
+            block_hasher=get_request_block_hasher(8, sha256),
+        )
+
+        # One-shot: hash all 5 sub-blocks at once.
+        hashes_all, _ = self.hasher.hash_tokens(tokens, request=req)
+        assert len(hashes_all) == 5
+
+        # Incremental: one sub-block at a time.
+        # After sb0 mm_idx=1 (past A). Using mm_idx=-1 from here
+        # would jump to C (idx=2) and miss B entirely at sb2.
+        incremental: list[BlockHash] = []
+        parent = None
+        mm_idx = 0
+        for i in range(5):
+            off = i * 4
+            h, mm_idx = self.hasher.hash_tokens(
+                tokens[: off + 4],
+                parent_hash=parent,
+                num_hashed_tokens=off,
+                request=req,
+                start_mm_idx=mm_idx,
+            )
+            assert len(h) == 1
+            incremental.extend(h)
+            parent = h[-1]
+        assert incremental == hashes_all
+
     def test_deterministic(self):
         tokens = list(range(100, 112))
-        h1 = self.hasher.hash_tokens(tokens)
-        h2 = self.hasher.hash_tokens(tokens)
+        h1, _ = self.hasher.hash_tokens(tokens)
+        h2, _ = self.hasher.hash_tokens(tokens)
         assert h1 == h2
 
     def test_different_tokens_different_hashes(self):
-        h1 = self.hasher.hash_tokens([1, 2, 3, 4])
-        h2 = self.hasher.hash_tokens([5, 6, 7, 8])
+        h1, _ = self.hasher.hash_tokens([1, 2, 3, 4])
+        h2, _ = self.hasher.hash_tokens([5, 6, 7, 8])
         assert h1 != h2
 
 
@@ -126,7 +202,8 @@ class TestSubBlockIndex:
         sub-block token lists."""
         hasher = SubBlockHasher(sha256, sub_block_size=len(tokens_per_sub_block[0]))
         flat = [t for sub in tokens_per_sub_block for t in sub]
-        return hasher.hash_tokens(flat)
+        hashes, _ = hasher.hash_tokens(flat)
+        return hashes
 
     def test_empty_no_match(self):
         index = SubBlockIndex()
@@ -223,6 +300,8 @@ def _make_request(
     prompt_token_ids: list[int],
     block_size: int,
     max_tokens: int = 17,
+    cache_salt: str | None = None,
+    lora_request: LoRARequest | None = None,
     prompt_logprobs: int | None = None,
 ) -> Request:
     return Request(
@@ -234,6 +313,8 @@ def _make_request(
             prompt_logprobs=prompt_logprobs,
         ),
         pooling_params=None,
+        cache_salt=cache_salt,
+        lora_request=lora_request,
         block_hasher=get_request_block_hasher(block_size, sha256),
     )
 
@@ -1011,6 +1092,53 @@ class TestRBLNKVCacheManager:
 
         # Verify the copy op still references the recycled block id.
         assert ops[0].src_block_id == src_block.block_id
+
+    def test_cache_salt_isolation(self):
+        """Sub-block match must not cross cache_salt boundaries.
+        Also, a request without cache_salt must not match sub-blocks
+        cached by a request with cache_salt, and vice versa."""
+        manager = _make_manager(self.BLOCK_SIZE, self.SUB_BLOCK_SIZE, num_blocks=10)
+
+        # req0 with salt "A": fills a full block → sub-blocks indexed.
+        tokens = list(range(self.BLOCK_SIZE))
+        req0 = _make_request("0", tokens, self.BLOCK_SIZE, cache_salt="A")
+        _prefill_request(manager, req0)
+        manager.free(req0)
+
+        # req1 with salt "B": same token prefix, different salt → no mat
+        shared = list(range(self.SUB_BLOCK_SIZE))
+        unique = [100 + i for i in range(self.BLOCK_SIZE)]
+        req1 = _make_request("1", shared + unique, self.BLOCK_SIZE, cache_salt="B")
+        _, num_computed = manager.get_computed_blocks(req1)
+        assert num_computed == 0
+        sub_match = manager.get_computed_blocks_sub_block(req1, num_computed)
+        assert sub_match is None
+
+        # Same tokens, no salt → no match
+        req2 = _make_request("2", shared + unique, self.BLOCK_SIZE)
+        _, num_computed2 = manager.get_computed_blocks(req2)
+        sub_match2 = manager.get_computed_blocks_sub_block(req2, num_computed2)
+        assert sub_match2 is None
+
+    def test_lora_isolation(self):
+        """Sub-block match must not cross LoRA boundaries."""
+        manager = _make_manager(self.BLOCK_SIZE, self.SUB_BLOCK_SIZE, num_blocks=10)
+
+        lora_a = LoRARequest(lora_name="lora_a", lora_int_id=1, lora_path="/a")
+        lora_b = LoRARequest(lora_name="lora_b", lora_int_id=2, lora_path="/b")
+
+        tokens = list(range(self.BLOCK_SIZE))
+        req0 = _make_request("0", tokens, self.BLOCK_SIZE, lora_request=lora_a)
+        _prefill_request(manager, req0)
+        manager.free(req0)
+
+        shared = list(range(self.SUB_BLOCK_SIZE))
+        unique = [100 + i for i in range(self.BLOCK_SIZE)]
+        req1 = _make_request("1", shared + unique, self.BLOCK_SIZE, lora_request=lora_b)
+        _, num_computed = manager.get_computed_blocks(req1)
+        assert num_computed == 0
+        sub_match = manager.get_computed_blocks_sub_block(req1, num_computed)
+        assert sub_match is None
 
 
 # ---------------------------------------------------------------------------

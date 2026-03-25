@@ -27,8 +27,10 @@ from typing import TYPE_CHECKING
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
+    generate_block_hash_extra_keys,
     hash_block_tokens,
     make_block_hash_with_group_id,
+    need_extra_keys,
 )
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
@@ -73,7 +75,9 @@ class SubBlockHasher:
     """Computes chained sub-block hashes from token IDs.
 
     Uses the same ``hash_block_tokens`` as upstream, but at sub-block
-    granularity.
+    granularity.  When a *request* is provided, per-sub-block
+    ``extra_keys`` (cache_salt, LoRA, multimodal, prompt_embeds) are
+    mixed in, mirroring upstream full-block hashing.
     """
 
     def __init__(
@@ -90,7 +94,9 @@ class SubBlockHasher:
         *,
         parent_hash: BlockHash | None = None,
         num_hashed_tokens: int = 0,
-    ) -> list[BlockHash]:
+        request: Request | None = None,
+        start_mm_idx: int = 0,
+    ) -> tuple[list[BlockHash], int]:
         """Return sub-block hashes for *full* sub-blocks in ``token_ids``.
 
         Args:
@@ -99,22 +105,40 @@ class SubBlockHasher:
                 are hashing (``None`` for the very first sub-block).
             num_hashed_tokens: Number of tokens already hashed (i.e. the
                 start offset into ``token_ids``).
+            request: When provided and the request carries extra hash
+                keys (LoRA, cache_salt, multimodal, prompt_embeds),
+                those keys are mixed into each sub-block hash.
+            start_mm_idx: Starting multimodal feature index for
+                incremental hashing with multimodal requests.
 
         Returns:
-            List of ``BlockHash`` values, one per full sub-block starting
-            from ``num_hashed_tokens``.
+            ``(hashes, mm_idx)`` — list of ``BlockHash`` values (one
+            per full sub-block) and the updated multimodal index.
         """
+        # Based on upstream request_block_hasher() in get_request_block_hasher().
+
         sbs = self.sub_block_size
         hashes: list[BlockHash] = []
+        use_extra = request is not None and need_extra_keys(request)
+        # NOTE: We can't simply use `mm_idx=-1`,
+        # because it means the last mm input in the entire prompt,
+        # which is meant to be used during decode phase.
+        mm_idx = start_mm_idx
         start = num_hashed_tokens
         for i in range(start, len(token_ids) - sbs + 1, sbs):
+            extra_keys = None
+            if use_extra:
+                extra_keys, mm_idx = generate_block_hash_extra_keys(
+                    request, i, i + sbs, mm_idx
+                )
             parent_hash = hash_block_tokens(
                 self.hash_fn,
                 parent_hash,
                 token_ids[i : i + sbs],
+                extra_keys,
             )
             hashes.append(parent_hash)
-        return hashes
+        return hashes, mm_idx
 
 
 class SubBlockIndex:
@@ -177,6 +201,14 @@ class SubBlockIndex:
 # ---------------------------------------------------------------------------
 # RBLNKVCacheManager
 # ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class _SubHashState:
+    """Per-request cached sub-block hashes and multimodal index."""
+
+    hashes: list[BlockHash]
+    mm_idx: int = 0
 
 
 @dataclass(slots=True)
@@ -282,7 +314,7 @@ class RBLNKVCacheManager(KVCacheManager):
         self.sub_block_hasher = SubBlockHasher(hash_fn, sub_block_size)
 
         # Per-request sub-block hash cache (group-independent).
-        self._req_sub_hashes: dict[str, list[BlockHash]] = {}
+        self._req_sub_hashes: dict[str, _SubHashState] = {}
 
         # Copy operations accumulated during a scheduling step; the scheduler
         # drains this list when building SchedulerOutput. While pending, each
@@ -496,18 +528,25 @@ class RBLNKVCacheManager(KVCacheManager):
     def _get_or_compute_sub_hashes(self, request: Request) -> list[BlockHash]:
         """Return the sub-block hashes for the request, computing new ones if
         the request has grown since the last call.  Group-independent."""
-        cached_hashes = self._req_sub_hashes.setdefault(request.request_id, [])
-        num_hashed_tokens = len(cached_hashes) * self.sub_block_size
-        parent_hash = cached_hashes[-1] if cached_hashes else None
+        state = self._req_sub_hashes.get(request.request_id)
+        if state is None:
+            state = _SubHashState(hashes=[])
+            self._req_sub_hashes[request.request_id] = state
 
-        new_hashes = self.sub_block_hasher.hash_tokens(
+        num_hashed_tokens = len(state.hashes) * self.sub_block_size
+        parent_hash = state.hashes[-1] if state.hashes else None
+
+        new_hashes, new_mm_idx = self.sub_block_hasher.hash_tokens(
             request.all_token_ids,
             parent_hash=parent_hash,
             num_hashed_tokens=num_hashed_tokens,
+            request=request,
+            start_mm_idx=state.mm_idx,
         )
         if new_hashes:
-            cached_hashes.extend(new_hashes)
-        return cached_hashes
+            state.hashes.extend(new_hashes)
+            state.mm_idx = new_mm_idx
+        return state.hashes
 
     # -- sub-block index maintenance ----------------------------------------
 
