@@ -40,6 +40,10 @@ def register_model():
             "Gemma3ForConditionalGeneration",
             "vllm_rbln.model_executor.models.optimum.gemma3:RBLNOptimumGemma3ForConditionalGeneration",
         )
+        ModelRegistry.register_model(
+            "Exaone4_5_ForConditionalGeneration",
+            "vllm_rbln.model_executor.models.optimum.exaone4_5:RBLNOptimumExaone4_5_ForConditionalGeneration",
+        )
 
 
 def register_ops():
