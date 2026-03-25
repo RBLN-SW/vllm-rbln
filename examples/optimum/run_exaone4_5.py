@@ -15,6 +15,7 @@
 
 import asyncio
 
+
 def _ensure_transformers_layer_type_alias() -> None:
     """
     This ensures compatibility with different versions of transformers.
@@ -30,13 +31,14 @@ def _ensure_transformers_layer_type_alias() -> None:
             configuration_utils.ALLOWED_ATTENTION_LAYER_TYPES
         )
 
+
 _ensure_transformers_layer_type_alias()
 
-import fire
-from datasets import load_dataset
-from qwen_vl_utils import process_vision_info
-from transformers import AutoProcessor, AutoTokenizer
-from vllm import AsyncEngineArgs, AsyncLLMEngine, SamplingParams
+import fire  # noqa: E402
+from datasets import load_dataset  # noqa: E402
+from qwen_vl_utils import process_vision_info  # noqa: E402
+from transformers import AutoProcessor, AutoTokenizer  # noqa: E402
+from vllm import AsyncEngineArgs, AsyncLLMEngine, SamplingParams  # noqa: E402
 
 # If the video is too long
 # set `VLLM_ENGINE_ITERATION_TIMEOUT_S` to a higher timeout value.
@@ -108,8 +110,7 @@ def generate_prompts_image(batch_size: int, model_id: str):
                     {
                         "type": "text",
                         "text": "What’s shown in this image?",
-                    }
-                    ,
+                    },
                     {"type": "image"},
                 ],
             },
@@ -125,9 +126,7 @@ def generate_prompts_image(batch_size: int, model_id: str):
     return [
         {
             "prompt": text,
-            "multi_modal_data": {
-                "image": [image_inputs]
-            },
+            "multi_modal_data": {"image": [image_inputs]},
             "mm_processor_kwargs": {
                 "min_pixels": 256 * 28 * 28,
                 "max_pixels": 1280 * 28 * 28,
@@ -234,7 +233,7 @@ async def main(
 
 def entry_point(
     num_input_prompt: int = 4,
-    model_id: str = "/home/kblee/.cache/rbln-exec/compile_results/optimum-exaone4-5/model_id__exaone4.5-32b#batch_size__4#max_seq_len__128000#n_layers__64#tensor_parallel_size__16#vit_seq_lens__16384#kvcache_partition_len__5120#use_attn_mask__False/model",
+    model_id: str = "/home/kblee/.cache/rbln-exec/compile_results/optimum-exaone4-5/model_id__exaone4.5-32b#batch_size__4#max_seq_len__128000#n_layers__64#tensor_parallel_size__16#vit_seq_lens__16384#kvcache_partition_len__5120#use_attn_mask__False/model",  # noqa: E501
 ):
     asyncio.run(
         main(
