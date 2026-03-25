@@ -75,12 +75,6 @@ def generate_prompts_video(batch_size: int, model_id: str):
         conversations, return_video_kwargs=True
     )
 
-    if "fps" in video_kwargs and isinstance(video_kwargs["fps"], list):
-        if len(video_kwargs["fps"]) == 1:
-            video_kwargs["fps"] = video_kwargs["fps"][0]
-        else:
-            video_kwargs.pop("fps", None)
-
     return [
         {
             "prompt": text,
