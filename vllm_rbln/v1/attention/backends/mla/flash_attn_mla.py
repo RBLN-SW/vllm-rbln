@@ -32,9 +32,6 @@ from ..flash_attention import (
 
 logger = init_logger(__name__)
 
-import logging
-
-log = logging.getLogger("torch._dynamo")
 
 
 def _empty_mla_attention_output(
@@ -65,7 +62,7 @@ def flash_causal_mla_attention_naive_prefill_impl(
     - q: [batch, num_tokens, num_heads, _ ]
     - kv_c_normed: [batch, num_tokens, kv_lora_rank]
     - k_pe: [batch, num_tokens, qk_rope_head_dim]
-    - kv_cache: [num_blocks, block_size, num_kv_heads(= kv_lora_rank + qk_rope_head_dim)]
+    - kv_cache: [num_blocks, block_size, num_kv_heads(=kv_lora_rank+qk_rope_head_dim)]
       Key and value cache
     - seq_idx: [batch, num_partitions]
       number of already cached tokens in each partition
@@ -73,7 +70,7 @@ def flash_causal_mla_attention_naive_prefill_impl(
                     [batch, num_partitions] for decode
 
     Returns:
-        Tensor: attn_output [batch, seq_len, num_heads * v_head_dim] (V space for o_proj).
+        Tensor: attn_output [batch, seq_len, num_heads, kv_lora_rank]
 
     batch size is assumed to be 1 for prefill.
     """
@@ -307,7 +304,7 @@ class RBLNFlashAttnMLAImpl(MLACommonBaseImpl[RBLNFlashAttentionMetadata]):
             q : torch.size([batch, num_tokens, num_heads, qk_head_dim])
             kv_c_normed: torch.size([batch, num_tokens, kv_lora_rank])
             k_pe: torch.size([batch, num_tokens, 1, qk_rope_head_dim])
-            kv_cache: torch.size([num_blocks, block_size, num_kv_heads(= kv_lora_rank + qk_rope_head_dim)])
+            kv_cache: torch.size([num_blocks, block_size, num_kv_heads_dim])
             attn_metadata: RBLNFlashAttentionMetadata
             output: torch.size([batch, num_tokens, num_heads * v_head_dim])
             output_scale: torch.size([batch, num_tokens, num_heads * v_head_dim])
@@ -321,8 +318,6 @@ class RBLNFlashAttnMLAImpl(MLACommonBaseImpl[RBLNFlashAttentionMetadata]):
         decode_q_nope, decode_q_pe = q.split(
             [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
         )
-
-        # Convert from (num_tokens, num_heads, qk_nope_head_dim) to (num_heads, num_tokens, qk_nope_head_dim)
         decode_q_nope = decode_q_nope.view(b_size * q_len, num_heads, -1).transpose(
             0, 1
         )
