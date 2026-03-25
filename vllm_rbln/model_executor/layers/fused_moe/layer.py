@@ -740,13 +740,16 @@ def fused_moe_forward_rbln(
         )
 
         # --- Step 6: Combine partial results and extract this rank's output ---
-        # all_reduce across DP group to sum partial expert contributions
-        # (each rank computed only its local experts; all_reduce aggregates)
-        final_hidden_states = get_dp_group().all_reduce(final_hidden_states)
-        # final_hidden_states: [R*max_pad, H] → [R, max_pad, H]
-        final_hidden_states = final_hidden_states.reshape(R, max_pad, H_dim)
-        # Take only this rank's slice and trim to actual token count
-        final_hidden_states = final_hidden_states[self.dp_rank][:t]  # [t, H]
+        # reduce_scatter: each rank receives only its own summed portion
+        # (more efficient than all_reduce + slice since each rank only needs 1/R of data)
+        hidden_shape_dp = (-1, 1, H_dim)
+        all_hidden_states = final_hidden_states.reshape(hidden_shape_dp)
+        assert all_hidden_states.shape[0] % self.dp_size == 0
+
+        final_hidden_states = get_dp_group().reduce_scatter(all_hidden_states, dim=0)
+        assert final_hidden_states.shape[0] == max_pad
+
+        final_hidden_states = final_hidden_states[:t]
         final_hidden_states = final_hidden_states.reshape(org_hidden_shape)
 
         return final_hidden_states
