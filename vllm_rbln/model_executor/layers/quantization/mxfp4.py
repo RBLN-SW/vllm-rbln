@@ -139,8 +139,11 @@ def custom_moe_glu_mxfp4(
     if envs.VLLM_RBLN_COMPILE_MODEL:
         return torch.empty_like(hidden_states)
 
+    # Reference torch native implementation
+
     num_tokens, hidden_size = hidden_states.shape
     num_local_experts = gate_proj_blocks.shape[0]
+    # num_global_experts = router_logits.shape[1]
     dtype = hidden_states.dtype
 
     alpha_val = alpha.item()
@@ -149,8 +152,10 @@ def custom_moe_glu_mxfp4(
     # routing weight token dim may be padded to 64-align; slice to actual num_tokens
     # masked_routing_weights: [E, num_tokens(+pad)] → [num_tokens, E]
     routing_t = masked_routing_weights.transpose(0, 1)[:num_tokens, :]  # [num_tokens, E]
+    output = torch.zeros(num_tokens, hidden_size, dtype=dtype)
 
     # Dequantize all expert weights once
+    # gate_proj: [num_local_experts, intermediate_size, hidden_size]
     gate_proj_weights = _dequantize_mxfp4(
         gate_proj_blocks, gate_proj_scales, dtype=dtype
     )
@@ -159,12 +164,11 @@ def custom_moe_glu_mxfp4(
         down_proj_blocks, down_proj_scales, dtype=dtype
     )
 
-    output = torch.zeros(num_tokens, hidden_size, dtype=dtype)
-
     # Process each local expert
     for local_expert_idx in range(num_local_experts):
         # Determine which global expert this local expert corresponds to
         if expert_map is not None:
+            # Find global expert index that maps to this local expert
             global_expert_idx = (expert_map == local_expert_idx).nonzero(as_tuple=True)[
                 0
             ]
@@ -174,14 +178,18 @@ def custom_moe_glu_mxfp4(
         else:
             global_expert_idx = local_expert_idx
 
-        # Find tokens routed to this expert (non-zero routing weight)
-        weights = routing_t[:, global_expert_idx]  # [num_tokens]
-        token_indices = weights.nonzero(as_tuple=True)[0]
+        # Find tokens routed to this expert
+        # top_k_indices: [num_tokens, k]
+        expert_mask = top_k_indices == global_expert_idx  # [num_tokens, k]
+        token_indices, k_indices = expert_mask.nonzero(as_tuple=True)
 
         if len(token_indices) == 0:
             continue
 
-        selected_weights = weights[token_indices]  # [num_selected]
+        # Get routing weights for these tokens
+        weights = routing_weights[token_indices, k_indices]  # [num_selected_tokens]
+
+        # Get hidden states for selected tokens
         selected_hidden = hidden_states[token_indices]  # [num_selected, hidden_size]
 
         # Get expert weights
@@ -199,7 +207,7 @@ def custom_moe_glu_mxfp4(
         expert_out = activated @ down_w.T + down_b  # [num_selected, hidden_size]
 
         # Apply routing weights and accumulate
-        weighted_out = expert_out * selected_weights.unsqueeze(-1)
+        weighted_out = expert_out * weights.unsqueeze(-1)
         output.index_add_(0, token_indices, weighted_out.to(dtype))
 
     return output
@@ -212,13 +220,11 @@ def custom_moe_glu_mxfp4_fake(
     gate_proj_scales: torch.Tensor,
     gate_proj_bias: torch.Tensor,
     up_proj_blocks: torch.Tensor,
-
     up_proj_scales: torch.Tensor,
     up_proj_bias: torch.Tensor,
     down_proj_blocks: torch.Tensor,
     down_proj_scales: torch.Tensor,
     down_proj_bias: torch.Tensor,
-    
     masked_routing_weights: torch.Tensor,
     alpha: torch.Tensor,
     limit: torch.Tensor,
