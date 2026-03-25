@@ -237,10 +237,11 @@ class RBLNEagleProposer(EagleProposer):
 
             inputs_embeds = None
 
-        if envs.VLLM_RBLN_COMPILE_MODEL:
+        if (
+            not self.vllm_config.speculative_config.enforce_eager
+            and envs.VLLM_RBLN_COMPILE_MODEL
+        ):
             self.compile_context.mark_static_address(self.runner.kv_caches[-1])
-            assert len(self.compile_context.static_address) == 1, "EAGLE kv cache SHOULD be registered"
-            logger.info("EAGLE model compile context static_address size = %s", len(self.compile_context.static_address))
 
         with set_forward_context(
             per_layer_attn_metadata,
