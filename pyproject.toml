@@ -42,7 +42,7 @@ dependencies = [
     "torch",
     "torchvision",
     "torchaudio",
-    # "optimum-rbln>=0.10.2a3",
+    "optimum-rbln @ git+https://github.com/RBLN-SW/optimum-rbln.git@upgrade-torch",
 ]
 
 [project.optional-dependencies]
