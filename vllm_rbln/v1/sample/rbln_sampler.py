@@ -152,12 +152,10 @@ class RBLNTopKTopPSampler(nn.Module):
 
         rebel.manual_seed(seed)
         options = {}
+        options["tensor_parallel_size"] = 1
         if envs.VLLM_RBLN_COMPILE_STRICT_MODE:
             options["mode"] = "strict"
 
-        if has_torch_rbln:
-            options["use_global_ctx"] = True
-            options["global_device_id"] = 0
 
         self._compiled_rbln_topk_topp_sampler = torch.compile(
             rbln_top_k_top_p_sample,
