@@ -373,9 +373,8 @@ def unquantized_fused_optimize_moe_method_custom(
 
     expert_map_const = None
     if layer.expert_map is not None:
-        # Extract numpy array and create a fresh constant tensor
-        expert_map_list = layer.expert_map.tolist()
-        expert_map_const = torch.tensor(expert_map_list, dtype=torch.int32)
+        # workaround for torch.export.export
+        expert_map_const = layer.expert_map.clone().detach().to(dtype=torch.int32)
 
     tokens_mask = None
     use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK

@@ -67,6 +67,7 @@ class RblnPlatform(Platform):
     simple_compile_backend = "bypass"
     device_control_env_var: str = "RBLN_DEVICES"
     current_stream = _StreamPlaceholder
+    dist_backend: str = "rbln-ccl"
 
     @classmethod
     def import_kernels(cls) -> None:
