@@ -101,6 +101,13 @@ def apply_prefix_caching_block_size(
 def sync_cache_block_size(
     vllm_config: VllmConfig, kvcache_block_size: int, prefill_chunk_size: int
 ) -> None:
+    # vLLM's CacheConfig has a pydantic validator (_apply_block_size_default)
+    # that replaces block_size with DEFAULT_BLOCK_SIZE (16) when
+    # user_specified_block_size is False.  This validator re-runs whenever
+    # VllmConfig is deserialised in a subprocess (e.g. EngineCore), which
+    # would silently overwrite the RBLN-derived block_size we set below.
+    # Mark it as user-specified so the validator preserves our value.
+    vllm_config.cache_config.user_specified_block_size = True
     if vllm_config.cache_config.enable_prefix_caching:
         apply_prefix_caching_block_size(
             vllm_config, kvcache_block_size, prefill_chunk_size
@@ -123,12 +130,13 @@ def sync_num_blocks(vllm_config: VllmConfig, num_blocks: int) -> None:
         vllm_config.additional_config["num_blocks_override"] = num_blocks
 
     blk_ratio = get_block_ratio(vllm_config)
+    print("@@@ blk_ratio: ", blk_ratio)
 
     if is_full_block_available(num_blocks, vllm_config):
         adjusted_num_blocks = num_blocks * blk_ratio + 1
     else:
         adjusted_num_blocks = (num_blocks - 1) * blk_ratio + 1
-
+    print("@@@@ adjusted_num_blocks: ", adjusted_num_blocks)
     vllm_config.cache_config.num_gpu_blocks = adjusted_num_blocks
 
     if vllm_config.cache_config.num_gpu_blocks_override is not None:
