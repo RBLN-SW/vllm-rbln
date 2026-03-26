@@ -33,7 +33,6 @@ from vllm.model_executor.models.interfaces_base import (
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
     BatchedTensorInputs,
-    MultiModalKwargs,
     MultiModalKwargsItem,
 )
 from vllm.multimodal.utils import group_mm_kwargs_by_modality
@@ -127,10 +126,6 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
         # self.speculative_config = vllm_config.speculative_config
         # self.prompt_adapter_config = vllm_config.prompt_adapter_config
         # self.observability_config = vllm_config.observability_config
-
-        from vllm.model_executor.models.utils import set_cpu_offload_max_bytes
-
-        set_cpu_offload_max_bytes(0)
 
         model_config = self.model_config
         cache_config = self.cache_config
@@ -515,7 +510,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
         torch.Tensor,
         list[int],
         list[int],
-        MultiModalKwargs | None,
+        BatchedTensorInputs | None,
         list[str],
     ]:
         running_request_ids = []
