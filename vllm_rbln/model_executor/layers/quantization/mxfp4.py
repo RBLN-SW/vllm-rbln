@@ -391,12 +391,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # transpose to [num_experts, num_tokens] for custom_moe_glu_mxfp4
         masked_routing_weights_t = masked_routing_weights.transpose(0, 1)
 
-        # pad token dim to 64-alignment for hardware (matching compiler moe_glu padding)
-        T = masked_routing_weights_t.shape[1]
-        if T <= 8:
-            pad_size = 64 - (T % 64)
-            masked_routing_weights_t = F.pad(masked_routing_weights_t, (0, pad_size), value=0.0)
-
         if layer.activation == "swigluoai":
             expert_map_const = None
             if layer.expert_map is not None:

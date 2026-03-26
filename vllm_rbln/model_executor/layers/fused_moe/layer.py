@@ -105,8 +105,9 @@ def ccl_send_kernel(
     rank_id: int,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     dtype = hidden_states.dtype
-    send_mask = send_mask.to(dtype)
-    recv_mask = recv_mask.to(dtype)
+    ltype = router_logits.dtype
+    send_mask = send_mask.to(ltype)
+    recv_mask = recv_mask.to(ltype)
 
     t_dim = hidden_states.shape[0]
     t_padded = (t_dim + 63) // 64 * 64
@@ -557,12 +558,6 @@ def unquantized_fused_moe_method_custom(
     # transpose to [num_experts, num_tokens] for custom_moe_glu
     masked_routing_weights_t = masked_routing_weights.transpose(0, 1)
 
-    # pad token dim to 64-alignment for hardware (matching compiler moe_glu padding)
-    T = masked_routing_weights_t.shape[1]
-    if T <= 8:
-        pad_size = 64 - (T % 64)
-        masked_routing_weights_t = F.pad(masked_routing_weights_t, (0, pad_size), value=0.0)
-
     # compute expert_select_count from masked_routing_weights
     expert_select_count = (masked_routing_weights_t > 0).sum(dim=1).to(torch.int32)
 
@@ -605,12 +600,6 @@ def unquantized_fused_optimize_moe_method_custom(
 
     # transpose to [num_experts, num_tokens] for custom_moe_glu
     masked_routing_weights_t = masked_routing_weights.transpose(0, 1)
-
-    # pad token dim to 64-alignment for hardware (matching compiler moe_glu padding)
-    T = masked_routing_weights_t.shape[1]
-    if T <= 8:
-        pad_size = 64 - (T % 64)
-        masked_routing_weights_t = F.pad(masked_routing_weights_t, (0, pad_size), value=0.0)
 
     expert_map_const = None
     if layer.expert_map is not None:
@@ -666,7 +655,23 @@ def fused_moe_forward_rbln(
         # [E, R*max_pad] for dim=0 topk (select top_k experts per token)
         all_router_logits_t = all_router_logits.transpose(0, 1)  # [E, R*max_pad]
 
-        if self.renormalize:
+        scoring_func = getattr(self, 'scoring_func', 'softmax')
+        e_score_correction_bias = getattr(self, 'e_score_correction_bias', None)
+
+        # deepseekv3 style: minimax m2.5
+        if scoring_func == 'sigmoid':
+            # scores_t = torch.sigmoid(all_router_logits_t)  # [E, R*max_pad]
+
+            # sigmoid scoring with optional e_score_correction_bias
+            scores = torch.sigmoid(all_router_logits)  # [R*max_pad, E]
+            scores_t = scores.transpose(0, 1)  # [E, R*max_pad]
+            scores_for_topk = scores_t
+            if e_score_correction_bias is not None:
+                scores_for_topk = scores_t + e_score_correction_bias.unsqueeze(1)  # [E, 1]
+            _, selected_experts = torch.topk(scores_for_topk, k=self.top_k, dim=0)
+            topk_weights = scores_t.gather(0, selected_experts)  # weights from original scores
+            topk_weights = topk_weights / topk_weights.sum(dim=0, keepdim=True).clamp_min(1e-20)
+        elif self.renormalize:
             # post_norm: topk first, then softmax on selected values
             topk_weights, selected_experts = torch.topk(
                 all_router_logits_t, k=self.top_k, dim=0
@@ -681,15 +686,20 @@ def fused_moe_forward_rbln(
         masked_routing_weights = torch.zeros_like(all_router_logits_t)  # [E, R*max_pad]
         masked_routing_weights.scatter_(0, selected_experts, topk_weights)
 
-        masked_routing_weights = masked_routing_weights.to(hidden_states.dtype)
-
         # Apply token mask to zero out padded positions per DP rank
         use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
         if use_moe_tokens_mask:
-            # get_tokens_mask returns [R*max_pad, 1] — dimensions now match
-            tokens_mask = get_tokens_mask(max_pad).to(hidden_states.dtype)  # [R*max_pad, 1]
+            tokens_mask = get_tokens_mask(max_pad).reshape(1, -1)  # [1, R*max_pad]
+
+            ## token dim padding
+            T = masked_routing_weights.shape[1]
+            if T <= 8:
+                pad_size = 64 - (T % 64)
+                tokens_mask = F.pad(tokens_mask, (0, pad_size), value=0.0)
+                masked_routing_weights = F.pad(masked_routing_weights, (0, pad_size), value=0.0)
+
             # [E, R*max_pad] * [1, R*max_pad] (broadcast)
-            masked_routing_weights = masked_routing_weights * tokens_mask.transpose(0, 1)
+            masked_routing_weights = masked_routing_weights * tokens_mask
 
         # all_routing_3d: [E, R, max_pad] for CCL send kernel
         all_routing_3d = masked_routing_weights.reshape(E, R, max_pad)
@@ -765,7 +775,19 @@ def fused_moe_forward_rbln(
     # transpose to [E, t] for dim=0 topk (matching detach_topk branch)
     router_logits_t = router_logits_2d.transpose(0, 1)  # [E, t]
 
-    if self.renormalize:
+    scoring_func = getattr(self, 'scoring_func', 'softmax')
+    e_score_correction_bias = getattr(self, 'e_score_correction_bias', None)
+
+    if scoring_func == 'sigmoid':
+        # DeepSeek-V3 style: sigmoid scoring with optional e_score_correction_bias
+        scores_t = torch.sigmoid(router_logits_t)  # [E, t]
+        scores_for_topk = scores_t
+        if e_score_correction_bias is not None:
+            scores_for_topk = scores_t + e_score_correction_bias.unsqueeze(1)  # [E, 1]
+        _, selected_experts = torch.topk(scores_for_topk, k=self.top_k, dim=0)
+        topk_weights = scores_t.gather(0, selected_experts)  # weights from original scores
+        topk_weights = topk_weights / topk_weights.sum(dim=0, keepdim=True).clamp_min(1e-20)
+    elif self.renormalize:
         topk_weights, selected_experts = torch.topk(
             router_logits_t, k=self.top_k, dim=0
         )
@@ -782,17 +804,22 @@ def fused_moe_forward_rbln(
     # (scatter_ promotes to float32, but LowerTopKRouting fuses
     #  scatter+cast(bf16) into contrib_topk_routing with bf16 output;
     #  multiply must happen after the cast so types match)
-    masked_routing_weights = masked_routing_weights.to(hidden_states.dtype)
+    masked_routing_weights = masked_routing_weights
 
     # Apply token mask to zero out padded positions
     use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
     if use_moe_tokens_mask:
-        tokens_mask = get_tokens_mask(num_tokens).to(hidden_states.dtype)  # [t, 1]
+        tokens_mask = get_tokens_mask(num_tokens).reshape(1, -1)  # [1, t]
 
-        ## missing pad in token dim
+        ## token dim padding
+        T = masked_routing_weights.shape[1]
+        if T <= 8:
+            pad_size = 64 - (T % 64)
+            tokens_mask = F.pad(tokens_mask, (0, pad_size), value=0.0)
+            masked_routing_weights = F.pad(masked_routing_weights, (0, pad_size), value=0.0)
 
         # [E, t] * [1, t] (broadcast)
-        masked_routing_weights = masked_routing_weights * tokens_mask.transpose(0, 1)
+        masked_routing_weights = masked_routing_weights * tokens_mask
 
     # pass as [t, E] to quant_method.apply (it will be reshaped inside)
     final_hidden_states = self.quant_method.apply(
