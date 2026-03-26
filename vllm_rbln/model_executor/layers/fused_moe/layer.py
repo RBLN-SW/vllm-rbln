@@ -686,20 +686,24 @@ def fused_moe_forward_rbln(
         masked_routing_weights = torch.zeros_like(all_router_logits_t)  # [E, R*max_pad]
         masked_routing_weights.scatter_(0, selected_experts, topk_weights)
 
+        masked_routing_weights = masked_routing_weights.transpose(0, 1)  # [R*max_pad, E]
         # Apply token mask to zero out padded positions per DP rank
         use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
         if use_moe_tokens_mask:
-            tokens_mask = get_tokens_mask(max_pad).reshape(1, -1)  # [1, R*max_pad]
+            tokens_mask = get_tokens_mask(max_pad)  # [R*max_pad, 1]
 
             ## token dim padding
-            T = masked_routing_weights.shape[1]
+            T = masked_routing_weights.shape[0]
+            pad_size = 0
             if T <= 8:
                 pad_size = 64 - (T % 64)
-                tokens_mask = F.pad(tokens_mask, (0, pad_size), value=0.0)
-                masked_routing_weights = F.pad(masked_routing_weights, (0, pad_size), value=0.0)
+                tokens_mask = F.pad(tokens_mask, (pad_size, 0), value=0.0)
+                masked_routing_weights = F.pad(masked_routing_weights, (pad_size, 0), value=0.0)
 
             # [E, R*max_pad] * [1, R*max_pad] (broadcast)
             masked_routing_weights = masked_routing_weights * tokens_mask
+            # masked_routing_weights_depadded = masked_routing_weights[:T, 0]
+            masked_routing_weights = F.pad(masked_routing_weights, (-pad_size, 0), value=0.0)
 
         # all_routing_3d: [E, R, max_pad] for CCL send kernel
         all_routing_3d = masked_routing_weights.reshape(E, R, max_pad)
@@ -804,22 +808,24 @@ def fused_moe_forward_rbln(
     # (scatter_ promotes to float32, but LowerTopKRouting fuses
     #  scatter+cast(bf16) into contrib_topk_routing with bf16 output;
     #  multiply must happen after the cast so types match)
-    masked_routing_weights = masked_routing_weights
 
+    masked_routing_weights = masked_routing_weights.transpose(0, 1)  # [R*max_pad, E]
     # Apply token mask to zero out padded positions
     use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
     if use_moe_tokens_mask:
-        tokens_mask = get_tokens_mask(num_tokens).reshape(1, -1)  # [1, t]
+        tokens_mask = get_tokens_mask(num_tokens)  # [t, 1]
 
         ## token dim padding
-        T = masked_routing_weights.shape[1]
+        T = masked_routing_weights.shape[0]
+        pad_size = 0
         if T <= 8:
             pad_size = 64 - (T % 64)
-            tokens_mask = F.pad(tokens_mask, (0, pad_size), value=0.0)
-            masked_routing_weights = F.pad(masked_routing_weights, (0, pad_size), value=0.0)
+            tokens_mask = F.pad(tokens_mask, (pad_size, 0), value=0.0)
+            masked_routing_weights = F.pad(masked_routing_weights, (pad_size, 0), value=0.0)
 
         # [E, t] * [1, t] (broadcast)
         masked_routing_weights = masked_routing_weights * tokens_mask
+        masked_routing_weights = F.pad(masked_routing_weights, (-pad_size, 0), value=0.0)
 
     # pass as [t, E] to quant_method.apply (it will be reshaped inside)
     final_hidden_states = self.quant_method.apply(
