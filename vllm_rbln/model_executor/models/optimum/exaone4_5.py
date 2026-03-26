@@ -82,13 +82,13 @@ class EXAONE4_5ProcessingInfo(Qwen2_5_VLProcessingInfo):
 class EXAONE4_5MultiModalProcessor(Qwen2_5_VLMultiModalProcessor):
     def apply(self, *args, **kwargs):
         hf_processor_mm_kwargs = kwargs.pop("hf_processor_mm_kwargs", {})
-        if "fps" in hf_processor_mm_kwargs and isinstance(
-            hf_processor_mm_kwargs["fps"], list
-        ):
-            if len(hf_processor_mm_kwargs["fps"]) == 1:
-                hf_processor_mm_kwargs["fps"] = hf_processor_mm_kwargs["fps"][0]
-            else:
-                hf_processor_mm_kwargs.pop("fps", None)
+        do_sample_frames = hf_processor_mm_kwargs.get("do_sample_frames", False)
+        if do_sample_frames:
+            raise NotImplementedError(
+                "`do_sample_frames=True` is not supported yet. "
+                "Please set `do_sample_frames` to False."
+            )
+        hf_processor_mm_kwargs.pop("fps", None)
         kwargs["hf_processor_mm_kwargs"] = hf_processor_mm_kwargs
         return super().apply(*args, **kwargs)
 
