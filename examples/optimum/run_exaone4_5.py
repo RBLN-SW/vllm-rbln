@@ -14,15 +14,21 @@
 # limitations under the License.
 
 import asyncio
+import atexit
+import os
+import site
 
 
-def _ensure_transformers_layer_type_alias() -> None:
+def _ensure_transformers_layer_type_alias() -> str | None:
     """
     This ensures compatibility with different versions of transformers.
-    vLLM 0.13.0 still uses transformers < 5.0.0, while EXAONE uses transformers 5.0.0,
-    which renamed `ALLOWED_ATTENTION_LAYER_TYPES` to `ALLOWED_LAYER_TYPES`.
+    vLLM inspects models in a subprocess, so a regular monkey-patch in the
+    main process is not enough.  We install a .pth file into site-packages
+    so that every Python process (including vllm subprocesses) applies the
+    alias at startup, before any `from ... import` can fail.
     """
-    import transformers.configuration_utils as configuration_utils
+    # 1. Patch the current process immediately
+    import transformers.configuration_utils as configuration_utils  # pylint: disable=import-outside-toplevel,consider-using-from-import
 
     if not hasattr(configuration_utils, "ALLOWED_LAYER_TYPES") and hasattr(
         configuration_utils, "ALLOWED_ATTENTION_LAYER_TYPES"
@@ -31,8 +37,34 @@ def _ensure_transformers_layer_type_alias() -> None:
             configuration_utils.ALLOWED_ATTENTION_LAYER_TYPES
         )
 
+    # 2. Install a .pth file so subprocesses also get the patch
+    site_dir = site.getsitepackages()[0]
+    pth_file = os.path.join(site_dir, "exaone_compat.pth")
+    pth_content = (
+        "import importlib; "
+        "mod = importlib.import_module('transformers.configuration_utils'); "
+        "setattr(mod, 'ALLOWED_LAYER_TYPES', getattr(mod, 'ALLOWED_ATTENTION_LAYER_TYPES', None)) "  # noqa: E501
+        "if not hasattr(mod, 'ALLOWED_LAYER_TYPES') and hasattr(mod, 'ALLOWED_ATTENTION_LAYER_TYPES') "  # noqa: E501
+        "else None\n"
+    )
+    try:
+        with open(pth_file, "w") as f:
+            f.write(pth_content)
+    except PermissionError:
+        # Fallback: add to user site-packages
+        user_site = site.getusersitepackages()
+        os.makedirs(user_site, exist_ok=True)
+        pth_file = os.path.join(user_site, "exaone_compat.pth")
+        with open(pth_file, "w") as f:
+            f.write(pth_content)
 
-_ensure_transformers_layer_type_alias()
+    return pth_file
+
+
+_pth_file = _ensure_transformers_layer_type_alias()
+if _pth_file:
+    atexit.register(lambda: os.remove(_pth_file) if os.path.exists(_pth_file) else None)
+
 
 import fire  # noqa: E402
 from datasets import load_dataset  # noqa: E402
