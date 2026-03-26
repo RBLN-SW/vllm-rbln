@@ -41,9 +41,12 @@ def _empty_mla_attention_output(
     q: torch.Tensor, kv_c_normed: torch.Tensor | None
 ) -> torch.Tensor:
     """Shape for MLA kernel output consumed by o_proj: [B, seq, H * v_head_dim]."""
+    if not envs.VLLM_RBLN_COMPILE_MODEL:
+        raise NotImplementedError(
+            "MLA attention is not supported for non-compile model"
+        )
     b, seq_len, num_heads, _ = q.shape
     kv_lora_rank = kv_c_normed.shape[-1]
-
     device = q.device
     dtype = q.dtype
     return torch.empty(
@@ -133,6 +136,7 @@ class RBLNFlashAttnMLABackend(MLACommonBackend):
 
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = ["auto"]
+    accept_output_buffer: bool = False
 
     @staticmethod
     def get_name() -> str:
@@ -286,13 +290,12 @@ class RBLNFlashAttnMLAImpl(MLACommonBaseImpl[RBLNFlashAttentionMetadata]):
             x: torch.size([batch, num_tokens, num_heads, kv_lora_rank])
 
         Returns:
-            torch.size([batch, num_tokens, num_heads, v_head_dim])
+            torch.size([batch, num_tokens, num_heads * v_head_dim]) (contiguous)
         """
-        b_size, q_len, num_heads, _ = x.size()
-        x = x.view(b_size * q_len, num_heads, -1).transpose(0, 1)
+        b_size, q_len, num_heads, kv_lora_rank = x.size()
+        x = x.reshape(b_size * q_len, num_heads, kv_lora_rank).transpose(0, 1)
         x = torch.bmm(x, self.W_UV)
-        x = x.transpose(0, 1).view(b_size, q_len, num_heads, self.v_head_dim)
-
+        x = x.transpose(0, 1).reshape(b_size, q_len, num_heads * self.v_head_dim)
         return x
 
     def forward(
@@ -320,7 +323,7 @@ class RBLNFlashAttnMLAImpl(MLACommonBaseImpl[RBLNFlashAttentionMetadata]):
             output_block_scale: torch.size([batch, num_tokens, num_heads * v_head_dim])
 
         Returns:
-            attn_out  = (batch_size, seq_len, num_heads, v_head_dim)
+            attn_out: (batch_size, seq_len, num_heads * v_head_dim), contiguous layout.
         """
         b_size, q_len, num_heads, _ = q.size()
 
