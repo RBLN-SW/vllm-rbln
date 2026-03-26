@@ -1952,6 +1952,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
                 self._execute_dummy_requests(so, cso, current_intermediate_tensors)
 
+        # FIXME: remove this code after #474(sampler with decode batch) is merged
         # compile sampler for all possible decode batches
         max_decode_batch = self.bucketing_manager.decode_batch_buckets[-1]
         dummy_decode_requests = []
@@ -1966,9 +1967,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 sampling_params=None
                 if self.is_pooling_model
                 else SamplingParams(temperature=0.0),
-                pooling_params=PoolingParams(
-                    task=self.get_supported_pooling_tasks()[0]
-                )
+                pooling_params=PoolingParams(task=self.get_supported_pooling_tasks()[0])
                 if self.is_pooling_model
                 else None,
             )
@@ -3470,14 +3469,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         )
         if distributed_executor_backend == "ray":
             self._prepare_prefill_intermediate_tensors()
-            for batch_bucket_size \
-                in self.bucketing_manager.decode_batch_buckets:
+            for batch_bucket_size in self.bucketing_manager.decode_batch_buckets:
                 self._prepare_decode_intermediate_tensors(batch_bucket_size)
         else:
             with torch.inference_mode():
                 self._prepare_prefill_intermediate_tensors()
-                for batch_bucket_size \
-                    in self.bucketing_manager.decode_batch_buckets:
+                for batch_bucket_size in self.bucketing_manager.decode_batch_buckets:
                     self._prepare_decode_intermediate_tensors(batch_bucket_size)
 
     def _prepare_prefill_intermediate_tensors(self) -> None:
