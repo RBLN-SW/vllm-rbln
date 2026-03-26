@@ -18,10 +18,12 @@ jobs:
       env:
         GH_TOKEN: ${{ secrets.GIT_PAT }}
       run: |
-        RUN_ID=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+        RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
           -H "Accept: application/vnd.github+json" \
-          "https://api.github.com/repos/rbln-sw/vllm-rbln/actions/workflows/rbln_utils_set_compiler_version_ci.yaml/runs?status=success&per_page=1" \
-          | jq -r '.workflow_runs[0].id')
+          "https://api.github.com/repos/rbln-sw/vllm-rbln/actions/workflows/rbln_utils_set_compiler_version_ci.yaml/runs?status=success&per_page=1")
+        echo "API Response: $RESPONSE"
+        
+        RUN_ID=$(echo "$RESPONSE" | jq -r '.workflow_runs[0].id')
         echo "Selected RUN_ID=${RUN_ID}"
         
         if [ "$RUN_ID" = "null" ] || [ -z "$RUN_ID" ]; then
