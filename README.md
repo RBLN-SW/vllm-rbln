@@ -30,7 +30,7 @@ You can install this project using `pip` or from source.
 #### Install via PyPI
 
 ```bash
-pip install vllm-rbln --extra-index-url https://wheels.vllm.ai/0.13.0/cpu --extra-index-url https://download.pytorch.org/whl/cpu
+pip install vllm-rbln --extra-index-url https://wheels.vllm.ai/0.18.0/cpu --extra-index-url https://download.pytorch.org/whl/cpu
 ```
 
 #### Or from source
@@ -46,7 +46,7 @@ uv pip install -e .
 ```bash
 git clone https://github.com/rbln-sw/vllm-rbln.git
 cd vllm-rbln
-pip install -e . --extra-index-url https://wheels.vllm.ai/0.13.0/cpu --extra-index-url https://download.pytorch.org/whl/cpu
+pip install -e . --extra-index-url https://wheels.vllm.ai/0.18.0/cpu --extra-index-url https://download.pytorch.org/whl/cpu
 ```
 
 ### 📚 Documentation
