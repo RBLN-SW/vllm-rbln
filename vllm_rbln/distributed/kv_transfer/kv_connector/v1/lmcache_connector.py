@@ -155,21 +155,6 @@ class RBLNLMCacheConnector(KVConnectorBase_V1):
         )
 
     def wait_for_save(self):
-        metadata = self._lmcache_engine._parent._get_connector_metadata()
-        for req in metadata.requests:
-            logger.info(
-                "[wait_for_save] req=%s, num_tokens=%d, "
-                "is_last_prefill=%s, save_spec=%s",
-                req.req_id,
-                len(req.token_ids),
-                req.is_last_prefill,
-                (
-                    f"SaveSpec(skip={req.save_spec.skip_leading_tokens}, "
-                    f"can_save={req.save_spec.can_save})"
-                    if req.save_spec
-                    else "None"
-                ),
-            )
         self._lmcache_engine.wait_for_save()
 
     def get_finished(
@@ -224,43 +209,7 @@ class RBLNLMCacheConnector(KVConnectorBase_V1):
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
-        num_new = len(scheduler_output.scheduled_new_reqs)
-        cached_reqs = scheduler_output.scheduled_cached_reqs
-        if isinstance(cached_reqs, list):
-            num_cached = len(cached_reqs)
-        else:
-            num_cached = len(cached_reqs.req_ids) if cached_reqs else 0
-        logger.info(
-            "[build_connector_meta] new_reqs=%d, cached_reqs=%d, "
-            "num_scheduled_tokens=%s",
-            num_new,
-            num_cached,
-            dict(scheduler_output.num_scheduled_tokens),
-        )
-        meta = self._lmcache_engine.build_connector_meta(scheduler_output)
-        for req in meta.requests:
-            logger.info(
-                "[build_connector_meta] result: req=%s, "
-                "num_tokens=%d, is_last_prefill=%s, "
-                "load_spec=%s, save_spec=%s",
-                req.req_id,
-                len(req.token_ids),
-                req.is_last_prefill,
-                (
-                    f"LoadSpec(vllm={req.load_spec.vllm_cached_tokens}, "
-                    f"lmcache={req.load_spec.lmcache_cached_tokens}, "
-                    f"can_load={req.load_spec.can_load})"
-                    if req.load_spec
-                    else "None"
-                ),
-                (
-                    f"SaveSpec(skip={req.save_spec.skip_leading_tokens}, "
-                    f"can_save={req.save_spec.can_save})"
-                    if req.save_spec
-                    else "None"
-                ),
-            )
-        return meta
+        return self._lmcache_engine.build_connector_meta(scheduler_output)
 
     def request_finished(
         self,
