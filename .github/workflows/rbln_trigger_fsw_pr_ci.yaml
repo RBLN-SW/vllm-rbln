@@ -33,7 +33,7 @@ jobs:
           with: |
             token: ${{ secrets.GIT_PAT }}
             repository: rebellions-sw/fsw-integration
-            event-type: ${{ github.event.pull_request.base.ref == 'dev-0.12' && 'vllm-rbln-pr-event-for-0.12' || 'vllm-rbln-pr-event' }}
+            event-type: ${{ github.event.pull_request.base.ref == 'dev-0.18' && 'vllm-rbln-pr-event-for-0.18' || 'vllm-rbln-pr-event' }}
             client-payload: |
               {
                 "ref": "${{ github.event.pull_request.head.ref }}",
