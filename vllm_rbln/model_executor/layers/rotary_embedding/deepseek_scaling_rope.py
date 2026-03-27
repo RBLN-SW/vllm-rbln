@@ -99,5 +99,5 @@ def deepseek_scaling_rope_forward(
 
     return query, key
 
-DeepseekScalingRotaryEmbedding.__init__ = rope__custom_init__
-DeepseekScalingRotaryEmbedding.forward_oot = deepseek_scaling_rope_forward
+# DeepseekScalingRotaryEmbedding.__init__ = rope__custom_init__
+# DeepseekScalingRotaryEmbedding.forward_oot = deepseek_scaling_rope_forward
