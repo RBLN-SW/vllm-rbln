@@ -320,6 +320,21 @@ class RBLNWorker(WorkerBase):
             gpu_memory_utilization=self.cache_config.gpu_memory_utilization,
         )
 
+        if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
+            if kv_cache_memory_bytes > available_memory_estimate:
+                logger.warning(
+                    "kv_cache_memory_bytes (%.2f GiB) exceeds the estimated "
+                    "available memory (%.2f GiB). Clamping to available memory.",
+                    kv_cache_memory_bytes / (1 << 30),
+                    available_memory_estimate / (1 << 30),
+                )
+                return available_memory_estimate
+            logger.info(
+                "Using kv_cache_memory_bytes = %.2f GiB for KV cache.",
+                kv_cache_memory_bytes / (1 << 30),
+            )
+            return kv_cache_memory_bytes
+
         logger.info(
             "available_memory_estimate = %.2f GB", available_memory_estimate / 10**9
         )
