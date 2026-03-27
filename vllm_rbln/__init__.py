@@ -20,6 +20,17 @@ def register():
     return "vllm_rbln.platform.RblnPlatform"
 
 
+def register_connector():
+    if envs.VLLM_RBLN_USE_VLLM_MODEL:
+        from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
+
+        KVConnectorFactory.register_connector(
+            "RBLNLMCacheConnectorV1",
+            "vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_lmcache_connector",
+            "RBLNLMCacheConnectorV1",
+        )
+
+
 def register_model():
     if not envs.VLLM_RBLN_USE_VLLM_MODEL:
         from vllm import ModelRegistry

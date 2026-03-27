@@ -73,6 +73,7 @@ Repository="https://github.com/rbln-sw/vllm-rbln"
 rbln = "vllm_rbln:register"
 
 [project.entry-points."vllm.general_plugins"]
+rbln_new_connectors = "vllm_rbln:register_connector"
 rbln_new_models = "vllm_rbln:register_model"
 rbln_custom_ops = "vllm_rbln:register_ops"
 
