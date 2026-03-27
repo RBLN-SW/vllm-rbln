@@ -42,7 +42,7 @@ dependencies = [
     "torch",
     "torchvision",
     "torchaudio",
-    "optimum-rbln>=0.10.2a4",
+    "optimum-rbln>=0.10.2",
 ]
 
 [project.optional-dependencies]
