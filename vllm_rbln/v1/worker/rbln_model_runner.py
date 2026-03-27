@@ -1876,10 +1876,11 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         num_kv_cache_groups = len(self.kv_cache_config.kv_cache_groups)
 
         logger.info("Warm up prefill graph")
-        prefill_seq_len = (
+        prefill_seq_len = min(
             self.scheduler_config.max_num_batched_tokens
             if self.scheduler_config.enable_chunked_prefill
-            else self.model_config.max_model_len
+            else self.model_config.max_model_len,
+            self.model_config.max_model_len,
         )
         dummy_prefill_requests: list[NewRequestData] = []
         dummy_prefill_num_scheduled_tokens: dict[str, int] = {}
@@ -4275,7 +4276,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         if has_kv_transfer_group():
             kv_transfer_group = get_kv_transfer_group()
-            if self.cross_layers_kv_cache is not None:
+            if getattr(self, "cross_layers_kv_cache", None) is not None:
                 assert self.cross_layers_attn_backend is not None
                 kv_transfer_group.register_cross_layers_kv_cache(
                     self.cross_layers_kv_cache, self.cross_layers_attn_backend
@@ -4314,6 +4315,29 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         copy_fn(kv_cache.data_ptr(), idx, 0, block_size, kv_name)
 
             kv_transfer_group.set_host_xfer_buffer_ops(rbln_copy_kv_blocks)
+
+            # Pass runtime_holder reference to LMCache's RBLNConnector
+            # so it can lazily access the runtime after compilation.
+            # This follows the same pattern as rbln_copy_kv_blocks above:
+            # runtime_holder is populated by the RBLN compile backend,
+            # and the connector reads runtime_holder[0] at transfer time.
+            if hasattr(kv_transfer_group, "set_runtime_holder"):
+                kv_transfer_group.set_runtime_holder(self.runtime_holder)
+                logger.info(
+                    "Passed runtime_holder to LMCache RBLNConnector (lazy)"
+                )
+            elif len(self.runtime_holder) > 0 and hasattr(
+                kv_transfer_group, "set_runtime"
+            ):
+                kv_transfer_group.set_runtime(self.runtime_holder[0])
+                logger.info(
+                    "Injected rebel runtime into LMCache RBLNConnector"
+                )
+
+            logger.info(
+                "Registered %d KV cache layers with KV connector",
+                len(kv_caches),
+            )
 
         if self.dcp_world_size > 1:
             layer_type = cast(type[Any], AttentionLayerBase)

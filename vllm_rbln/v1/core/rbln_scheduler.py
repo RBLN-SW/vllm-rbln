@@ -56,11 +56,17 @@ def undo_uncomputed_block_caching(
     request: Request,
     kv_cache_manager: KVCacheManager,
     num_computed_tokens: int | None = None,
+    num_external_tokens: int = 0,
 ) -> None:
+    # NOTE(RBLN): When LMCache provides externally cached tokens,
+    # those tokens will be loaded into the KV cache before the forward
+    # pass. The blocks covering external tokens should be treated as
+    # "computed" so their hashes are preserved for future cache hits.
+    effective_computed = (num_computed_tokens
+                         or request.num_computed_tokens) + num_external_tokens
     grouped_blocks = kv_cache_manager.get_blocks(request.request_id).blocks
     num_computed_blocks = [
-        (num_computed_tokens or request.num_computed_tokens)
-        // group.kv_cache_spec.block_size
+        effective_computed // group.kv_cache_spec.block_size
         for group in kv_cache_manager.kv_cache_config.kv_cache_groups
     ]
     for blocks, num_full_block in zip(grouped_blocks, num_computed_blocks):

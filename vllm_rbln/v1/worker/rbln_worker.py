@@ -331,6 +331,21 @@ class RBLNWorker(WorkerBase):
             "available_memory_estimate = %.2f GB", available_memory_estimate / 10**9
         )
 
+        if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
+            if kv_cache_memory_bytes > available_memory_estimate:
+                logger.warning(
+                    "kv_cache_memory_bytes (%.2f GiB) exceeds the estimated "
+                    "available memory (%.2f GiB). Clamping to available memory.",
+                    kv_cache_memory_bytes / (1 << 30),
+                    available_memory_estimate / (1 << 30),
+                )
+                return available_memory_estimate
+            logger.info(
+                "Using kv_cache_memory_bytes = %.2f GiB for KV cache.",
+                kv_cache_memory_bytes / (1 << 30),
+            )
+            return kv_cache_memory_bytes
+
         return available_memory_estimate
 
     def get_kv_connector_handshake_metadata(self) -> dict | None:
@@ -500,6 +515,13 @@ class RBLNWorker(WorkerBase):
 
     def shutdown(self) -> None:
         logger.info("v1 rbln_worker shutdown called")
+        # Shutdown KV connector (e.g. LMCache) if present
+        if has_kv_transfer_group():
+            try:
+                get_kv_transfer_group().shutdown()
+                logger.info("KV connector shutdown complete")
+            except Exception as e:
+                logger.warning("KV connector shutdown failed: %s", e)
         if envs.VLLM_RBLN_METRICS:
             if self.model_runner.performance_tracker:
                 self.model_runner.performance_tracker.print_final_stats()
