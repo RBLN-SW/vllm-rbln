@@ -2588,12 +2588,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     @staticmethod
     def maybe_get_kv_connector_output(
         scheduler_output: "SchedulerOutput",
-        wait_for_save: bool,
+        defer_finalize: bool = False,
     ) -> AbstractContextManager[KVConnectorOutput | None]:
         warm_up_phase = scheduler_output.kv_connector_metadata is None
         return (
             KVConnectorModelRunnerMixin._get_kv_connector_output(
-                scheduler_output, wait_for_save
+                scheduler_output, defer_finalize=defer_finalize
             )
             if has_kv_transfer_group() and not warm_up_phase
             else nullcontext()
@@ -2823,7 +2823,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             ),
             record_function_or_nullcontext("Forward"),
             self.maybe_get_kv_connector_output(
-                scheduler_output, is_last_prefill_chunk
+                scheduler_output,
             ) as kv_connector_output,
         ):
             if attn_metadata is not None:
