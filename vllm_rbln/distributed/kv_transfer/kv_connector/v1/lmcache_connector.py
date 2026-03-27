@@ -116,28 +116,6 @@ class RBLNLMCacheConnector(KVConnectorBase_V1):
     def start_load_kv(
         self, forward_context: "ForwardContext", **kwargs
     ) -> None:
-        metadata = self._lmcache_engine._parent._get_connector_metadata()
-        for req in metadata.requests:
-            load_spec = req.load_spec
-            logger.info(
-                "[start_load_kv] req=%s, num_tokens=%d, "
-                "load_spec=%s, save_spec=%s",
-                req.req_id,
-                len(req.token_ids),
-                (
-                    f"LoadSpec(vllm={load_spec.vllm_cached_tokens}, "
-                    f"lmcache={load_spec.lmcache_cached_tokens}, "
-                    f"can_load={load_spec.can_load})"
-                    if load_spec
-                    else "None"
-                ),
-                (
-                    f"SaveSpec(skip={req.save_spec.skip_leading_tokens}, "
-                    f"can_save={req.save_spec.can_save})"
-                    if req.save_spec
-                    else "None"
-                ),
-            )
         self._lmcache_engine.start_load_kv(forward_context, **kwargs)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
@@ -196,12 +174,6 @@ class RBLNLMCacheConnector(KVConnectorBase_V1):
         blocks: "KVCacheBlocks",
         num_external_tokens: int,
     ):
-        logger.info(
-            "[update_state_after_alloc] req=%s, "
-            "num_external_tokens=%d",
-            request.request_id,
-            num_external_tokens,
-        )
         self._lmcache_engine.update_state_after_alloc(
             request, num_external_tokens
         )
