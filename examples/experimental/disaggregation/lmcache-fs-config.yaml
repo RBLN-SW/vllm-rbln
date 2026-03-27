@@ -1,0 +1,12 @@
+save_unfull_chunk: true
+chunk_size: 8
+
+local_cpu: true
+max_local_cpu_size: 2.0
+
+remote_url: "fs://localhost:1/workspace/vllm-rbln/examples/experimental/disaggregation/shared"
+remote_serde: "naive"
+
+store_location: "RemoteBackend"
+retrieve_locations:
+  - "RemoteBackend"

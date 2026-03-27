@@ -1,0 +1,8 @@
+save_unfull_chunk: true
+chunk_size: 8
+
+local_cpu: false
+max_local_cpu_size: 2.0
+
+local_disk: disk
+max_local_disk_size: 2.0
