@@ -85,6 +85,27 @@ class RBLNLMCacheConnector(KVConnectorBase_V1):
         """
         self._lmcache_engine.set_runtime(runtime)
 
+    def initialize_host_xfer_buffer(
+        self, kv_caches: dict[str, torch.Tensor]
+    ) -> None:
+        """Initialize per-layer aligned transfer buffers for D2H/H2D.
+
+        Called by model runner after KV caches are allocated. Creates
+        aligned buffers matching each layer's kv_cache shape, following
+        the same pattern as RblnNixlConnectorWorker.
+        """
+        self._lmcache_engine.register_kv_caches(kv_caches)
+
+    def set_host_xfer_buffer_ops(self, copy_operation) -> None:
+        """Assign copy (d2h, h2d) operations when host buffer is used.
+
+        For LMCache, the copy operations are handled internally by
+        RBLNConnector via fetch_kv_cache/update_kv_cache, so this is
+        a no-op. Provided for interface compatibility with
+        RblnNixlConnectorWorker.
+        """
+        pass
+
     # ==============================
     # Worker-side methods
     # ==============================
