@@ -376,7 +376,7 @@ class RBLNOptimumScheduler(Scheduler):
                 # It is used for logging and metrics.
                 if request.num_cached_tokens < 0:
                     request.num_cached_tokens = request.num_computed_tokens
-            
+
             # re-queue requests skipped in this pass ahead of older skipped items.
             if step_skipped_waiting:
                 self.skipped_waiting.prepend_requests(step_skipped_waiting)
