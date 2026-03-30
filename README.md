@@ -35,7 +35,6 @@ uv pip install vllm-rbln --extra-index-url https://wheels.vllm.ai/0.13.0/cpu --t
 ```
 
 ##### Using pip
-
 ```bash
 pip install vllm-rbln --extra-index-url https://wheels.vllm.ai/0.13.0/cpu --extra-index-url https://download.pytorch.org/whl/cpu
 ```
