@@ -16,10 +16,11 @@
 implementations, FP8, custom ops, and quantization method weights."""
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, PropertyMock, patch
 
 import pytest
 import torch
+from torch.nn.parameter import Parameter
 
 import vllm_rbln.rbln_envs as envs
 
@@ -1028,3 +1029,346 @@ class TestMxfp4MoEMethodWeights:
         assert layer.gate_proj_blocks.shape == (E, I, H // 2)
         assert layer.up_proj_blocks.shape == (E, I, H // 2)
         assert layer.down_proj_blocks.shape == (E, H, I // 2)
+
+
+# ===========================================================================
+# FP8 Linear Method -- unit tests for init, create_weights, apply
+# ===========================================================================
+
+
+def _make_fp8_config(weight_block_size=None, activation_scheme="dynamic",
+                     is_checkpoint_fp8_serialized=True):
+    return SimpleNamespace(
+        weight_block_size=weight_block_size,
+        activation_scheme=activation_scheme,
+        is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
+    )
+
+
+class TestFp8LinearMethodInit:
+    """Test Fp8LinearMethod.__init__ for block-quant and per-tensor paths."""
+
+    def test_block_quant_init(self):
+        from vllm_rbln.model_executor.layers.quantization.fp8 import Fp8LinearMethod
+
+        config = _make_fp8_config(weight_block_size=[128, 128])
+        method = Fp8LinearMethod(config)
+
+        assert method.block_quant is True
+        assert method.weight_block_size == [128, 128]
+        assert hasattr(method, "w8a8_block_fp8_linear")
+
+    def test_per_tensor_init(self):
+        from vllm_rbln.model_executor.layers.quantization.fp8 import Fp8LinearMethod
+
+        config = _make_fp8_config(weight_block_size=None, activation_scheme="dynamic")
+        method = Fp8LinearMethod(config)
+
+        assert method.block_quant is False
+        assert hasattr(method, "fp8_linear")
+
+
+class TestFp8LinearMethodApply:
+    """Test Fp8LinearMethod.apply covering all code paths."""
+
+    def test_apply_block_quant(self):
+        from vllm_rbln.model_executor.layers.quantization.fp8 import Fp8LinearMethod
+
+        out_features, in_features = 128, 256
+        block_size = [128, 128]
+
+        config = _make_fp8_config(weight_block_size=block_size)
+        method = Fp8LinearMethod(config)
+
+        layer = SimpleNamespace(
+            weight=torch.randn(out_features, in_features).to(torch.float8_e4m3fn),
+            weight_scale=torch.rand(
+                out_features // block_size[0], in_features // block_size[1],
+                dtype=torch.bfloat16,
+            ),
+            input_scale=None,
+        )
+
+        x = torch.randn(4, in_features, dtype=torch.bfloat16)
+        result = method.apply(layer, x)
+
+        assert result.shape == (4, out_features)
+        assert result.dtype == torch.bfloat16
+
+    def test_apply_per_tensor_scalar_scale(self):
+        """Per-tensor path with single scale (weight_scale.numel() == 1)."""
+        from vllm_rbln.model_executor.layers.quantization.fp8 import Fp8LinearMethod
+
+        out_features, in_features = 32, 64
+        config = _make_fp8_config(weight_block_size=None)
+        method = Fp8LinearMethod(config)
+
+        # weight shape [in, out] after .t() in process_weights_after_loading
+        layer = SimpleNamespace(
+            weight=torch.randn(in_features, out_features).to(torch.float8_e4m3fn),
+            weight_scale=torch.tensor([0.5], dtype=torch.bfloat16),
+            input_scale=None,
+        )
+
+        x = torch.randn(4, in_features, dtype=torch.bfloat16)
+        result = method.apply(layer, x)
+
+        assert result.shape == (4, out_features)
+
+    def test_apply_per_row_scale(self):
+        """Per-tensor path with per-row scale (weight_scale.shape[0] == weight.shape[0])."""
+        from vllm_rbln.model_executor.layers.quantization.fp8 import Fp8LinearMethod
+
+        out_features, in_features = 32, 64
+        config = _make_fp8_config(weight_block_size=None)
+        method = Fp8LinearMethod(config)
+
+        layer = SimpleNamespace(
+            weight=torch.randn(in_features, out_features).to(torch.float8_e4m3fn),
+            weight_scale=torch.rand(in_features, dtype=torch.bfloat16),
+            input_scale=None,
+        )
+
+        x = torch.randn(4, in_features, dtype=torch.bfloat16)
+        result = method.apply(layer, x)
+
+        assert result.shape == (4, out_features)
+
+    def test_apply_with_bias(self):
+        from vllm_rbln.model_executor.layers.quantization.fp8 import Fp8LinearMethod
+
+        out_features, in_features = 32, 64
+        config = _make_fp8_config(weight_block_size=None)
+        method = Fp8LinearMethod(config)
+
+        layer = SimpleNamespace(
+            weight=torch.randn(in_features, out_features).to(torch.float8_e4m3fn),
+            weight_scale=torch.tensor([1.0], dtype=torch.bfloat16),
+            input_scale=None,
+        )
+
+        x = torch.randn(4, in_features, dtype=torch.bfloat16)
+        bias = torch.randn(out_features, dtype=torch.bfloat16)
+        result = method.apply(layer, x, bias=bias)
+
+        assert result.shape == (4, out_features)
+
+    def test_apply_fallback_scale_broadcast(self):
+        """Fallback path where scale is not per-row and not scalar."""
+        from vllm_rbln.model_executor.layers.quantization.fp8 import Fp8LinearMethod
+
+        out_features, in_features = 32, 64
+        config = _make_fp8_config(weight_block_size=None)
+        method = Fp8LinearMethod(config)
+
+        # scale shape doesn't match weight.shape[0] => fallback broadcast
+        layer = SimpleNamespace(
+            weight=torch.randn(in_features, out_features).to(torch.float8_e4m3fn),
+            weight_scale=torch.rand(out_features, dtype=torch.bfloat16),
+            input_scale=None,
+        )
+
+        x = torch.randn(4, in_features, dtype=torch.bfloat16)
+        result = method.apply(layer, x)
+
+        assert result.shape == (4, out_features)
+
+
+class TestFp8LinearMethodCreateWeights:
+    """Test create_weights for both block-quant and per-tensor paths."""
+
+    def test_create_weights_block_quant_serialized(self):
+        from vllm_rbln.model_executor.layers.quantization.fp8 import Fp8LinearMethod
+
+        config = _make_fp8_config(
+            weight_block_size=[128, 128],
+            is_checkpoint_fp8_serialized=True,
+        )
+        method = Fp8LinearMethod(config)
+
+        layer = torch.nn.Module()
+        method.create_weights(
+            layer,
+            input_size_per_partition=256,
+            output_partition_sizes=[128],
+            input_size=256,
+            output_size=128,
+            params_dtype=torch.bfloat16,
+        )
+
+        assert hasattr(layer, "weight")
+        assert layer.weight.dtype == torch.float8_e4m3fn
+        assert hasattr(layer, "weight_scale_inv")
+
+    def test_create_weights_per_tensor_serialized(self):
+        from vllm_rbln.model_executor.layers.quantization.fp8 import Fp8LinearMethod
+
+        config = _make_fp8_config(
+            weight_block_size=None,
+            is_checkpoint_fp8_serialized=True,
+        )
+        method = Fp8LinearMethod(config)
+
+        layer = torch.nn.Module()
+        method.create_weights(
+            layer,
+            input_size_per_partition=64,
+            output_partition_sizes=[32],
+            input_size=64,
+            output_size=32,
+            params_dtype=torch.bfloat16,
+        )
+
+        assert hasattr(layer, "weight")
+        assert layer.weight.dtype == torch.float8_e4m3fn
+        assert hasattr(layer, "weight_scale")
+        assert hasattr(layer, "input_scale")
+
+    def test_create_weights_non_serialized(self):
+        from vllm_rbln.model_executor.layers.quantization.fp8 import Fp8LinearMethod
+
+        config = _make_fp8_config(
+            weight_block_size=None,
+            is_checkpoint_fp8_serialized=False,
+        )
+        method = Fp8LinearMethod(config)
+
+        layer = torch.nn.Module()
+        method.create_weights(
+            layer,
+            input_size_per_partition=64,
+            output_partition_sizes=[32],
+            input_size=64,
+            output_size=32,
+            params_dtype=torch.bfloat16,
+        )
+
+        assert hasattr(layer, "weight")
+        assert layer.weight.dtype == torch.bfloat16
+
+
+class TestFp8MoEMethodInit:
+    def test_block_quant(self):
+        from vllm_rbln.model_executor.layers.quantization.fp8 import Fp8MoEMethod
+
+        config = _make_fp8_config(weight_block_size=[128, 128])
+        mock_layer = SimpleNamespace(moe_config=SimpleNamespace())
+
+        with patch.object(Fp8MoEMethod.__bases__[0], "__init__", lambda self, *a: None):
+            method = Fp8MoEMethod(config, mock_layer)
+
+        assert method.block_quant is True
+        assert method.weight_block_size == [128, 128]
+
+    def test_per_tensor(self):
+        from vllm_rbln.model_executor.layers.quantization.fp8 import Fp8MoEMethod
+
+        config = _make_fp8_config(weight_block_size=None)
+        mock_layer = SimpleNamespace(moe_config=SimpleNamespace())
+
+        with patch.object(Fp8MoEMethod.__bases__[0], "__init__", lambda self, *a: None):
+            method = Fp8MoEMethod(config, mock_layer)
+
+        assert method.block_quant is False
+
+
+class TestFp8MoEMethodCreateWeights:
+    def test_create_weights_per_tensor(self):
+        from vllm_rbln.model_executor.layers.quantization.fp8 import Fp8MoEMethod
+
+        config = _make_fp8_config(
+            weight_block_size=None,
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme="dynamic",
+        )
+        mock_init_layer = SimpleNamespace(moe_config=SimpleNamespace())
+
+        with patch.object(Fp8MoEMethod.__bases__[0], "__init__", lambda self, *a: None):
+            method = Fp8MoEMethod(config, mock_init_layer)
+
+        layer = torch.nn.Module()
+        method.create_weights(
+            layer,
+            num_experts=4,
+            hidden_size=32,
+            intermediate_size_per_partition=64,
+            params_dtype=torch.bfloat16,
+        )
+
+        assert layer.w13_weight.shape == (4, 128, 32)
+        assert layer.w13_weight.dtype == torch.float8_e4m3fn
+        assert layer.w2_weight.shape == (4, 32, 64)
+        assert hasattr(layer, "w13_weight_scale")
+        assert hasattr(layer, "w2_weight_scale")
+
+    def test_create_weights_block_quant(self):
+        from vllm_rbln.model_executor.layers.quantization.fp8 import Fp8MoEMethod
+
+        config = _make_fp8_config(
+            weight_block_size=[64, 64],
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme="dynamic",
+        )
+        mock_init_layer = SimpleNamespace(moe_config=SimpleNamespace())
+
+        with patch.object(Fp8MoEMethod.__bases__[0], "__init__", lambda self, *a: None), \
+             patch("vllm_rbln.model_executor.layers.quantization.fp8.get_tensor_model_parallel_world_size", return_value=1):
+            method = Fp8MoEMethod(config, mock_init_layer)
+
+        layer = torch.nn.Module()
+        method.create_weights(
+            layer,
+            num_experts=4,
+            hidden_size=64,
+            intermediate_size_per_partition=128,
+            params_dtype=torch.bfloat16,
+        )
+
+        assert layer.w13_weight.shape == (4, 256, 64)
+        assert hasattr(layer, "w13_weight_scale_inv")
+        assert hasattr(layer, "w2_weight_scale_inv")
+
+
+class TestFp8MoEMethodApply:
+    def test_apply(self):
+        from vllm_rbln.model_executor.layers.quantization.fp8 import Fp8MoEMethod
+
+        num_experts, hidden_size, intermediate_size = 4, 64, 128
+        num_tokens, top_k = 8, 2
+        block_size = [64, 64]
+
+        config = _make_fp8_config(weight_block_size=block_size)
+        mock_init_layer = SimpleNamespace(moe_config=SimpleNamespace())
+
+        with patch.object(Fp8MoEMethod.__bases__[0], "__init__", lambda self, *a: None):
+            method = Fp8MoEMethod(config, mock_init_layer)
+
+        # Build mock layer with required attributes
+        scale_intermediate = intermediate_size // block_size[0]
+        scale_hidden = hidden_size // block_size[1]
+
+        layer = SimpleNamespace(
+            w13_weight=torch.randn(num_experts, 2 * intermediate_size, hidden_size).to(
+                torch.float8_e4m3fn
+            ),
+            w2_weight=torch.randn(num_experts, hidden_size, intermediate_size).to(
+                torch.float8_e4m3fn
+            ),
+            w13_weight_scale_inv=torch.rand(
+                num_experts, 2 * scale_intermediate, scale_hidden
+            ),
+            w2_weight_scale_inv=torch.rand(num_experts, scale_hidden, scale_intermediate),
+            top_k=top_k,
+            expert_map=None,
+        )
+
+        x = torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16)
+        router_logits = torch.randn(num_tokens, num_experts)
+
+        with patch(
+            "vllm_rbln.model_executor.layers.quantization.fp8.envs"
+            ".VLLM_RBLN_USE_MOE_TOKENS_MASK", False,
+        ):
+            result = method.apply(layer, x, router_logits)
+
+        assert result.shape == (num_tokens, hidden_size)
