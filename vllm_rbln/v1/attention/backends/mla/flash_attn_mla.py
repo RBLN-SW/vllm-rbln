@@ -294,6 +294,7 @@ class RBLNFlashAttnMLAImpl(MLACommonBaseImpl[RBLNFlashAttentionMetadata]):
         """
         b_size, q_len, num_heads, kv_lora_rank = x.size()
         x = x.reshape(b_size * q_len, num_heads, kv_lora_rank).transpose(0, 1)
+        # (num_heads, b_size * q_len, kv_lora_rank) x (num_heads,kv_lora_rank, v_head_dim) -> (num_heads, b_size * q_len, v_head_dim)
         x = torch.bmm(x, self.W_UV)
         x = x.transpose(0, 1).reshape(b_size, q_len, num_heads * self.v_head_dim)
         return x
@@ -334,9 +335,14 @@ class RBLNFlashAttnMLAImpl(MLACommonBaseImpl[RBLNFlashAttentionMetadata]):
             0, 1
         )
 
+        # decode_q_nope: self.num_heads, b_size * q_len, self.qk_nope_head_dim
+        # self.W_UK_T: self.qk_nope_head_dim, self.num_heads, self.kv_lora_rank,
+
         # Multiply (N, B, P) x (N, P, L) -> (N, B, L)
-        decode_ql_nope = torch.bmm(decode_q_nope, self.W_UK_T).view(
-            b_size, q_len, num_heads, -1
+        decode_ql_nope = (
+            torch.bmm(decode_q_nope, self.W_UK_T)
+            .transpose(0, 1)
+            .view(b_size, q_len, num_heads, -1)
         )
 
         q = torch.cat([decode_ql_nope, decode_q_pe], dim=-1)
