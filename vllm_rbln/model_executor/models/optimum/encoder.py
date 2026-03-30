@@ -18,6 +18,8 @@ import torch
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.pooler import DispatchPooler, Pooler
+from vllm.model_executor.layers.pooler.seqwise import pooler_for_embed
+from vllm.model_executor.layers.pooler.tokwise import pooler_for_token_embed
 from vllm.model_executor.models import VllmModelForPooling
 from vllm.tasks import PoolingTask
 from vllm.v1.outputs import PoolerOutput
@@ -74,11 +76,8 @@ class RBLNOptimumForEncoderModel(RBLNOptimumModelBase, VllmModelForPooling):
         # encode task is split into `token_embed` and `token_classify` tasks
         self.pooler = DispatchPooler(
             {
-                "token_embed": Pooler.for_token_embed(pooler_config),
-                "token_classify": Pooler.for_token_classify(pooler_config),
-                "embed": Pooler.for_embed(pooler_config),
-                "classify": RBLNClassifierPooler(),
-                "score": RBLNClassifierPooler(),
+                "token_embed": pooler_for_token_embed(pooler_config),
+                "embed": pooler_for_embed(pooler_config),
             },
         )
 

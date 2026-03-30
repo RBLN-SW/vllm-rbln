@@ -264,10 +264,6 @@ class RBLNOptimumScheduler(Scheduler):
             )
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
-        # Use a temporary RequestQueue to collect requests that need to be
-        # skipped and put back at the head of the waiting queue later
-        skipped_waiting_requests = create_request_queue(self.policy)
-
         self.kv_cache_manager.new_step_starts()
 
         # First, schedule the WAITING requests.
@@ -376,14 +372,14 @@ class RBLNOptimumScheduler(Scheduler):
                 # by prefix caching may cause incorrect computation
                 # of new_blocks during the decode phase.
                 request.num_computed_tokens = 0
-                # NOTE num_cached_tokens is
-                # used for disaggregated prefill,decode.
-                # We don't set it here because it is not used in RBLN.
-                # request.num_cached_tokens = -1
-
-        # Put back any skipped requests at the head of the waiting queue
-        if skipped_waiting_requests:
-            self.waiting.prepend_requests(skipped_waiting_requests)
+                # NOTE(fix): num_cached_tokens defaults to -1.
+                # It is used for logging and metrics.
+                if request.num_cached_tokens < 0:
+                    request.num_cached_tokens = request.num_computed_tokens
+            
+            # re-queue requests skipped in this pass ahead of older skipped items.
+            if step_skipped_waiting:
+                self.skipped_waiting.prepend_requests(step_skipped_waiting)
 
         # Next, schedule the RUNNING requests.
         if req_index == 0:

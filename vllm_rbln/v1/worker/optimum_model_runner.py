@@ -395,7 +395,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
         # Get the number of scheduled tokens for each request.
         req_ids = self.input_batch.req_ids
         tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
-        num_scheduled_tokens = np.array(tokens, dtype=np.int32)
+        num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
         num_prefill_reqs = len(scheduler_output.scheduled_new_reqs)
         num_decode_reqs = scheduler_output.scheduled_cached_reqs.num_reqs
         finished_requests_ids = scheduler_output.finished_req_ids
@@ -435,7 +435,8 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
 
         # Set seq_lens
         self.seq_lens[:num_reqs] = (
-            self.input_batch.num_computed_tokens_cpu[:num_reqs] + num_scheduled_tokens
+            self.input_batch.num_computed_tokens_cpu[:num_reqs]
+            + num_scheduled_tokens_np[:num_reqs]
         )
 
         # TODO interemediate_tensor should be set
@@ -451,7 +452,9 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
             is_prompt=is_prefill,
             dummy_block=scheduler_output.dummy_block,
         )
-        return model_input, num_scheduled_tokens
+        # print("@@ num_scheduled_tokens_np", num_scheduled_tokens_np)
+        # print("type", type(num_scheduled_tokens_np))
+        return model_input, num_scheduled_tokens_np
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """
@@ -1001,7 +1004,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
 
         pooling_metadata = self.input_batch.get_pooling_metadata()
         pooling_metadata.build_pooling_cursor(
-            num_scheduled_tokens_np.tolist(), seq_lens_cpu, device=hidden_states.device
+            num_scheduled_tokens_np, seq_lens_cpu, device=hidden_states.device
         )
 
         model = cast(VllmModelForPooling, self.model)
