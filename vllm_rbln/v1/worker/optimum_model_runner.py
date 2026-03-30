@@ -408,7 +408,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
 
         if num_prefill_reqs > 0 or (
             num_decode_reqs == 1
-            and scheduler_output.scheduled_cached_reqs.resumed_from_preemption[0]
+            and len(scheduler_output.scheduled_cached_reqs.resumed_req_ids) == 1
         ):
             is_prefill = True
 
@@ -682,6 +682,11 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
         for req_id in scheduler_output.finished_req_ids:
             self.input_batch.remove_request(req_id)
 
+        # Zero GPU memory for freshly allocated cache blocks to prevent
+        # stale NaN/data from corrupting attention or SSM computation.
+        if scheduler_output.new_block_ids_to_zero:
+            self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
+
         # Remove the unscheduled requests from the persistent batch.
         # NOTE(woosuk): The unscheduled requests are either preempted requests
         # or running requests that are not scheduled in this step. We remove
@@ -708,6 +713,12 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
         # Add new requests to the cached states.
         for new_req_data in scheduler_output.scheduled_new_reqs:
             req_id = new_req_data.req_id
+            if req_id in self.requests:
+                # For streaming case only.
+                req_state = self._update_streaming_request(req_id, new_req_data)
+                reqs_to_add.append(req_state)
+                continue
+
             sampling_params = new_req_data.sampling_params
             pooling_params = new_req_data.pooling_params
 
@@ -809,9 +820,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
             if not resumed_from_preemption:
                 if new_block_ids is not None:
                     # Append the new blocks to the existing block IDs.
-                    for block_ids, new_ids in zip(
-                        req_state.block_ids, new_block_ids, strict=False
-                    ):
+                    for block_ids, new_ids in zip(req_state.block_ids, new_block_ids):
                         block_ids.extend(new_ids)
             else:
                 assert req_index is None
