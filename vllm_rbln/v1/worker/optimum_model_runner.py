@@ -39,6 +39,7 @@ from vllm.multimodal.utils import group_mm_kwargs_by_modality
 from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
+from vllm.tracing import instrument
 from vllm.utils.import_utils import LazyLoader
 from vllm.utils.jsontree import json_map_leaves
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
@@ -200,7 +201,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
             vocab_size=self.model_config.get_vocab_size(),
             block_sizes=[cache_config.block_size],
             kernel_block_sizes=[cache_config.block_size],  # FIXME: why do we need this?
-            is_spec_decode=False,  # No spec decode in optimum model runner
+            max_num_blocks_per_req=None,
             logitsprocs=build_logitsprocs(
                 self.vllm_config,
                 self.device,
@@ -208,6 +209,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
                 self.is_pooling_model,
                 self.vllm_config.model_config.logits_processors,
             ),
+            is_spec_decode=False,  # No spec decode in optimum model runner
             is_pooling_model=self.is_pooling_model,
             use_rbln_sampler=self.use_rbln_sampler,
         )
@@ -244,6 +246,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
 
         # FIXME async_scheduling?
 
+    @instrument(span_name="Loading (RBLN)")
     def load_model(self) -> None:
         with set_current_vllm_config(self.vllm_config, check_compile=False):
             self.model = get_optimum_model(vllm_config=self.vllm_config)
@@ -1111,37 +1114,19 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
             logprobs_tensors = sampler_output.logprobs_tensors
 
         invalid_req_indices: list[int] = []
-        cu_num_tokens: list[int] | None = None
-        if not self.use_async_scheduling:
-            # Get the valid generated tokens.
-            max_gen_len = sampled_token_ids.shape[-1]
-            assert max_gen_len == 1, (
-                "No spec decode tokens. Max generation length must be 1."
-            )
-            # No spec decode tokens.
-            valid_sampled_token_ids = self._to_list(sampled_token_ids)
-            # Mask out the sampled tokens that should not be sampled.
-            # for i in discard_sampled_tokens_req_indices:
-            #     valid_sampled_token_ids[int(i)].clear()
-        else:
-            valid_sampled_token_ids = []
-            # invalid_req_indices = discard_sampled_tokens_req_indices.tolist()
-            invalid_req_indices = []
-            invalid_req_indices_set = set(invalid_req_indices)
-
-            # Cache the sampled tokens on the GPU and avoid CPU sync.
-            # These will be copied into input_ids in the next step
-            # when preparing inputs.
-            # With spec decoding, this is done in propose_draft_token_ids().
-            if self.input_batch.prev_sampled_token_ids is None:
-                assert sampled_token_ids.shape[-1] == 1
-                self.input_batch.prev_sampled_token_ids = sampled_token_ids
-            self.input_batch.prev_req_id_to_index = {
-                req_id: i
-                for i, req_id in enumerate(self.input_batch.req_ids)
-                if i not in invalid_req_indices_set
-            }
-
+        logprobs_lists = None
+        # Get the valid generated tokens.
+        max_gen_len = sampled_token_ids.shape[-1]
+        assert max_gen_len == 1, (
+            "No spec decode tokens. Max generation length must be 1."
+        )
+        # No spec decode tokens.
+        valid_sampled_token_ids = self._to_list(sampled_token_ids)
+        # Mask out the sampled tokens that should not be sampled.
+        # for i in discard_sampled_tokens_req_indices:
+        #     valid_sampled_token_ids[int(i)].clear()
+        if logprobs_tensors is not None:
+            logprobs_lists = logprobs_tensors.tolists()
         # Cache the sampled tokens in the model runner, so that the scheduler
         # doesn't need to send them back.
         # NOTE(woosuk): As an exception, when using PP, the scheduler sends
@@ -1149,10 +1134,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
         # between the first-stage worker and the last-stage worker.
         req_ids = self.input_batch.req_ids
         for req_idx in range(num_sampled_tokens):
-            if self.use_async_scheduling:
-                sampled_ids = [-1] if req_idx not in invalid_req_indices_set else None
-            else:
-                sampled_ids = valid_sampled_token_ids[req_idx]
+            sampled_ids = valid_sampled_token_ids[req_idx]
 
             num_sampled_ids: int = len(sampled_ids) if sampled_ids else 0
 
@@ -1170,17 +1152,10 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
             self.input_batch.token_ids_cpu[req_idx, start_idx:end_idx] = sampled_ids
             self.input_batch.is_token_ids[req_idx, start_idx:end_idx] = True
             self.input_batch.num_tokens_no_spec[req_idx] = end_idx
-            self.input_batch.num_tokens[req_idx] = end_idx
 
             req_id = req_ids[req_idx]
             req_state = self.requests[req_id]
             req_state.output_token_ids.extend(sampled_ids)
-        # FIXME padding handling
-        logprobs_lists = (
-            logprobs_tensors.tolists(cu_num_tokens)
-            if not self.use_async_scheduling and logprobs_tensors is not None
-            else None
-        )
 
         # Compute prompt logprobs if needed.
         prompt_logprobs_dict = self._get_prompt_logprobs_dict(
