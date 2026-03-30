@@ -628,7 +628,7 @@ class TestFp8Compile:
 
         def fn(inp, w, ws):
             w_bf16 = w.to(torch.bfloat16) * ws
-            return torch.nn.functional.linear(inp, w_bf16.t())
+            return torch.nn.functional.linear(inp, w_bf16)
 
         ref = fn(x.clone(), weight_fp8, weight_scale)
         compiled = _compile(fn)(x.clone(), weight_fp8, weight_scale)
@@ -645,7 +645,7 @@ class TestFp8Compile:
 
         def fn(inp, w, ws):
             w_bf16 = w.to(torch.bfloat16) * ws.unsqueeze(1)
-            return torch.nn.functional.linear(inp, w_bf16.t())
+            return torch.nn.functional.linear(inp, w_bf16)
 
         ref = fn(x.clone(), weight_fp8, weight_scale)
         compiled = _compile(fn)(x.clone(), weight_fp8, weight_scale)
