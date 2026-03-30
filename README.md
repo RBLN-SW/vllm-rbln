@@ -27,7 +27,7 @@ Built on top of [vLLM’s Plugin System](https://docs.vllm.ai/en/latest/design/p
 
 You can install this project using `pip` or from source.
 
-#### Install pypi package
+#### Install via PyPI
 
 ##### Using uv
 ```bash
