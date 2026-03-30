@@ -576,7 +576,7 @@ class TestFp8Compile:
         )
 
         x = torch.randn(batch, in_features, dtype=torch.bfloat16)
-        weight = torch.randn(out_features, in_features, dtype=torch.float8_e4m3fn)
+        weight = torch.randn(out_features, in_features).to(torch.float8_e4m3fn)
         weight_scale = torch.rand(
             out_features // block_size[0], in_features // block_size[1],
             dtype=torch.bfloat16,
@@ -603,7 +603,7 @@ class TestFp8Compile:
         )
 
         x = torch.randn(2, in_features, dtype=torch.bfloat16)
-        weight = torch.randn(out_features, in_features, dtype=torch.float8_e4m3fn)
+        weight = torch.randn(out_features, in_features).to(torch.float8_e4m3fn)
         weight_scale = torch.rand(
             out_features // block_size[0], in_features // block_size[1],
             dtype=torch.bfloat16,
@@ -623,7 +623,7 @@ class TestFp8Compile:
         batch = 4
 
         x = torch.randn(batch, in_features, dtype=torch.bfloat16)
-        weight_fp8 = torch.randn(out_features, in_features, dtype=torch.float8_e4m3fn)
+        weight_fp8 = torch.randn(out_features, in_features).to(torch.float8_e4m3fn)
         weight_scale = torch.tensor([0.5], dtype=torch.bfloat16)
 
         def fn(inp, w, ws):
@@ -640,7 +640,7 @@ class TestFp8Compile:
         batch = 4
 
         x = torch.randn(batch, in_features, dtype=torch.bfloat16)
-        weight_fp8 = torch.randn(out_features, in_features, dtype=torch.float8_e4m3fn)
+        weight_fp8 = torch.randn(out_features, in_features).to(torch.float8_e4m3fn)
         weight_scale = torch.rand(out_features, dtype=torch.bfloat16)
 
         def fn(inp, w, ws):
@@ -659,8 +659,9 @@ class TestFp8Compile:
         out_blocks = out_features // out_block_size
         in_blocks = in_features // in_block_size
 
-        weight = torch.randn(num_experts, out_features, in_features,
-                             dtype=torch.float8_e4m3fn)
+        weight = torch.randn(num_experts, out_features, in_features).to(
+            torch.float8_e4m3fn
+        )
         scale = torch.rand(num_experts, out_blocks, in_blocks, dtype=torch.bfloat16)
 
         def fn(w, s):
