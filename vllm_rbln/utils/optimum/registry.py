@@ -127,14 +127,14 @@ def is_enc_dec_arch(config: PretrainedConfig) -> bool:
 def is_arch_supported(
     config: PretrainedConfig, model_set: dict[str, tuple[str, str]]
 ) -> bool:
-    architectures = getattr(config, "architectures", [])
+    architectures = getattr(config, "architectures", None) or []
     return any(
         arch in _RBLN_SUPPORTED_MODELS and arch in model_set for arch in architectures
     )
 
 
 def get_rbln_model_info(config: PretrainedConfig) -> tuple[str, str]:
-    architectures = getattr(config, "architectures", [])
+    architectures = getattr(config, "architectures", None) or []
     for arch in architectures:
         if arch in _RBLN_SUPPORTED_MODELS:
             model_name, model_cls_name = _RBLN_SUPPORTED_MODELS[arch]
@@ -156,7 +156,7 @@ def compile_model(
     tp_size: int,
     model_path: str,
 ) -> Any:
-    architectures = getattr(config, "architectures", [])
+    architectures = getattr(config, "architectures", None) or []
     model_name, model_cls_name = get_rbln_model_info(
         config
     )  # check if the model is supported and get model info

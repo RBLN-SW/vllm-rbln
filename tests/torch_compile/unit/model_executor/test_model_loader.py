@@ -102,6 +102,13 @@ class TestArchitectureDetection:
         config = PretrainedConfig(architectures=[])
         assert is_arch_supported(config, {}) is False
 
+    def test_is_arch_supported_none_architectures(self):
+        """Regression: architectures=None should not crash."""
+        from vllm_rbln.utils.optimum.registry import is_arch_supported
+
+        config = PretrainedConfig()  # architectures defaults to None
+        assert is_arch_supported(config, {}) is False
+
 
 class TestGetRblnModelInfo:
     """Test get_rbln_model_info: model metadata lookup."""
