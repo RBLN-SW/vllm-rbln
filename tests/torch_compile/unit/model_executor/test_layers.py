@@ -25,6 +25,8 @@ import rebel  # noqa: F401 -- registers "rbln" backend
 import pytest
 import torch
 
+import vllm_rbln.rbln_envs as envs
+
 COMPILE_ATOL = 5e-3
 COMPILE_RTOL = 5e-3
 
@@ -411,6 +413,145 @@ class TestFusedMoEHelpers:
 
         torch.testing.assert_close(compiled_w, ref_w, atol=COMPILE_ATOL, rtol=COMPILE_RTOL)
         torch.testing.assert_close(compiled_c, ref_c)
+
+
+# ===========================================================================
+# Tests: fused MoE forward -- compile path
+# ===========================================================================
+
+
+class TestFusedMoEForwardCompile:
+    """Test full MoE forward through compile path."""
+
+    def _make_moe_weights(self, num_experts=4, hidden_size=32,
+                          intermediate_size=64):
+        """Create fake MoE layer weights."""
+        # w13 = [gate_proj; up_proj] fused: [num_experts, 2*intermediate, hidden]
+        w13 = torch.randn(num_experts, 2 * intermediate_size, hidden_size)
+        # w2 = down_proj: [num_experts, hidden, intermediate]
+        w2 = torch.randn(num_experts, hidden_size, intermediate_size)
+        return w13, w2
+
+    def test_unquantized_moe_rbln(self):
+        """Full unquantized MoE forward (rbln path) through compile."""
+        from vllm_rbln.model_executor.layers.fused_moe.layer import (
+            unquantized_fused_moe_method_rbln,
+        )
+
+        num_experts, hidden_size, intermediate_size = 4, 32, 64
+        num_tokens, top_k = 8, 2
+        w13, w2 = self._make_moe_weights(num_experts, hidden_size, intermediate_size)
+
+        layer = SimpleNamespace(
+            w13_weight=w13,
+            w2_weight=w2,
+            top_k=top_k,
+            renormalize=True,
+            expert_map=None,
+        )
+        self_stub = SimpleNamespace()
+
+        x = torch.randn(num_tokens, hidden_size)
+        router_logits = torch.randn(num_tokens, num_experts)
+
+        def fn(inp, logits):
+            return unquantized_fused_moe_method_rbln(self_stub, layer, inp, logits)
+
+        ref = fn(x.clone(), router_logits.clone())
+        compiled = _compile(fn)(x.clone(), router_logits.clone())
+
+        torch.testing.assert_close(compiled, ref, atol=COMPILE_ATOL, rtol=COMPILE_RTOL)
+
+    def test_unquantized_moe_rbln_no_renormalize(self):
+        from vllm_rbln.model_executor.layers.fused_moe.layer import (
+            unquantized_fused_moe_method_rbln,
+        )
+
+        num_experts, hidden_size, intermediate_size = 4, 32, 64
+        num_tokens, top_k = 4, 1
+        w13, w2 = self._make_moe_weights(num_experts, hidden_size, intermediate_size)
+
+        layer = SimpleNamespace(
+            w13_weight=w13,
+            w2_weight=w2,
+            top_k=top_k,
+            renormalize=False,
+            expert_map=None,
+        )
+        self_stub = SimpleNamespace()
+
+        x = torch.randn(num_tokens, hidden_size)
+        router_logits = torch.randn(num_tokens, num_experts)
+
+        def fn(inp, logits):
+            return unquantized_fused_moe_method_rbln(self_stub, layer, inp, logits)
+
+        ref = fn(x.clone(), router_logits.clone())
+        compiled = _compile(fn)(x.clone(), router_logits.clone())
+
+        torch.testing.assert_close(compiled, ref, atol=COMPILE_ATOL, rtol=COMPILE_RTOL)
+
+    def test_unquantized_moe_rbln_with_expert_map(self):
+        from vllm_rbln.model_executor.layers.fused_moe.layer import (
+            unquantized_fused_moe_method_rbln,
+        )
+
+        num_experts, hidden_size, intermediate_size = 4, 32, 64
+        num_tokens, top_k = 6, 2
+        w13, w2 = self._make_moe_weights(num_experts, hidden_size, intermediate_size)
+
+        layer = SimpleNamespace(
+            w13_weight=w13,
+            w2_weight=w2,
+            top_k=top_k,
+            renormalize=True,
+            expert_map=torch.tensor([1, 0, 3, 2], dtype=torch.int64),
+        )
+        self_stub = SimpleNamespace()
+
+        x = torch.randn(num_tokens, hidden_size)
+        router_logits = torch.randn(num_tokens, num_experts)
+
+        def fn(inp, logits):
+            return unquantized_fused_moe_method_rbln(self_stub, layer, inp, logits)
+
+        ref = fn(x.clone(), router_logits.clone())
+        compiled = _compile(fn)(x.clone(), router_logits.clone())
+
+        torch.testing.assert_close(compiled, ref, atol=COMPILE_ATOL, rtol=COMPILE_RTOL)
+
+    def test_custom_moe_glu_reference(self):
+        """Test custom_moe_glu reference impl through compile path."""
+        from vllm_rbln.model_executor.layers.fused_moe.layer import custom_moe_glu
+
+        num_experts, hidden_size, intermediate_size = 4, 32, 64
+        num_tokens = 8
+
+        hidden_states = torch.randn(num_tokens, hidden_size)
+        gate_proj = torch.randn(num_experts, intermediate_size, hidden_size)
+        up_proj = torch.randn(num_experts, intermediate_size, hidden_size)
+        down_proj = torch.randn(num_experts, hidden_size, intermediate_size)
+        masked_routing = torch.randn(num_tokens, num_experts).softmax(dim=-1)
+
+        if envs.VLLM_RBLN_MOE_USE_OPT_KERNEL:
+            def fn(h, g, u, d, r):
+                return custom_moe_glu(h, g, u, d, r, topk=2, post_norm=True)
+        else:
+            expert_count = torch.ones(num_experts, dtype=torch.int32)
+
+            def fn(h, g, u, d, r):
+                return custom_moe_glu(h, g, u, d, r, expert_count)
+
+        ref = fn(
+            hidden_states.clone(), gate_proj, up_proj, down_proj,
+            masked_routing.clone(),
+        )
+        compiled = _compile(fn)(
+            hidden_states.clone(), gate_proj, up_proj, down_proj,
+            masked_routing.clone(),
+        )
+
+        torch.testing.assert_close(compiled, ref, atol=COMPILE_ATOL, rtol=COMPILE_RTOL)
 
 
 # ===========================================================================
