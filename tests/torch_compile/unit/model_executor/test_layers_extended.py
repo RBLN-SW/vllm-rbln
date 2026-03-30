@@ -1179,10 +1179,12 @@ class TestFp8LinearMethodApply:
         assert result.shape == (4, out_features)
 
 
+@patch("vllm.distributed.get_tensor_model_parallel_world_size", return_value=1)
+@patch("vllm.distributed.get_tensor_model_parallel_rank", return_value=0)
 class TestFp8LinearMethodCreateWeights:
     """Test create_weights for both block-quant and per-tensor paths."""
 
-    def test_create_weights_block_quant_serialized(self):
+    def test_create_weights_block_quant_serialized(self, _mock_rank, _mock_ws):
         method = _make_fp8_linear_method(
             weight_block_size=[128, 128],
             is_checkpoint_fp8_serialized=True,
@@ -1202,7 +1204,7 @@ class TestFp8LinearMethodCreateWeights:
         assert layer.weight.dtype == torch.float8_e4m3fn
         assert hasattr(layer, "weight_scale_inv")
 
-    def test_create_weights_per_tensor_serialized(self):
+    def test_create_weights_per_tensor_serialized(self, _mock_rank, _mock_ws):
         method = _make_fp8_linear_method(
             weight_block_size=None,
             is_checkpoint_fp8_serialized=True,
@@ -1223,7 +1225,7 @@ class TestFp8LinearMethodCreateWeights:
         assert hasattr(layer, "weight_scale")
         assert hasattr(layer, "input_scale")
 
-    def test_create_weights_non_serialized(self):
+    def test_create_weights_non_serialized(self, _mock_rank, _mock_ws):
         method = _make_fp8_linear_method(
             weight_block_size=None,
             is_checkpoint_fp8_serialized=False,
@@ -1488,6 +1490,8 @@ class TestFp8MoEProcessWeights:
         return method
 
     def test_block_quant_converts_parameters(self):
+        from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+
         method = self._make_moe_method(weight_block_size=[64, 64])
 
         num_experts = 4
@@ -1517,6 +1521,7 @@ class TestFp8MoEProcessWeights:
         assert isinstance(layer.w2_weight, Parameter)
 
     def test_serialized_per_tensor_requantizes(self):
+        from vllm.model_executor.layers.fused_moe.layer import FusedMoE
         import vllm.model_executor.layers.quantization.fp8 as upstream_mod
 
         method = self._make_moe_method(
