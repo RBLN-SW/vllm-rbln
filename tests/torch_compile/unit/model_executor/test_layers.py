@@ -32,7 +32,10 @@ COMPILE_RTOL = 5e-3
 
 
 def _compile(fn):
-    return torch.compile(fn, backend="rbln", dynamic=False)
+    """Compile with RBLN backend in strict mode.
+    Equivalent to VLLM_RBLN_COMPILE_STRICT_MODE=1."""
+    return torch.compile(fn, backend="rbln", dynamic=False,
+                         options={"mode": "strict"})
 
 
 # ===========================================================================
