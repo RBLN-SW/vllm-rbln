@@ -40,15 +40,5 @@ class TestSamplerCompile:
         compiled = _compile(fn)(logits.clone())
         torch.testing.assert_close(compiled, ref)
 
-    def test_apply_top_k_top_p_with_k(self):
-        from vllm_rbln.v1.sample.rbln_sampler import apply_top_k_top_p
-
-        torch.manual_seed(42)
-        logits = torch.randn(4, 32)
-        k = torch.tensor([3, 3, 3, 3])
-
-        def fn(l, k_val):
-            return apply_top_k_top_p(l, k=k_val, p=None)
-
-        compiled = _compile(fn)(logits.clone(), k)
-        assert compiled.shape == (4,)
+    # NOTE: top-k with random sampling uses exponential_() which is not
+    # supported by RBLN backend. Only greedy path is compilable.

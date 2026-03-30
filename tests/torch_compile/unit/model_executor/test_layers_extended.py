@@ -15,11 +15,13 @@
 """Extended tests for RBLN model executor layers: bug-catching, MoE reference
 implementations, FP8, custom ops, and quantization method weights."""
 
+import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+import torch.distributed as dist
 from torch.nn.parameter import Parameter
 
 import vllm_rbln.rbln_envs as envs
@@ -1179,12 +1181,39 @@ class TestFp8LinearMethodApply:
         assert result.shape == (4, out_features)
 
 
-@patch("vllm.distributed.get_tensor_model_parallel_world_size", return_value=1)
-@patch("vllm.distributed.get_tensor_model_parallel_rank", return_value=0)
+@pytest.fixture(scope="module", autouse=False)
+def init_distributed():
+    """Initialize a minimal gloo process group for tests needing distributed."""
+    if not dist.is_initialized():
+        os.environ.setdefault("MASTER_ADDR", "localhost")
+        os.environ.setdefault("MASTER_PORT", "29500")
+        os.environ.setdefault("RANK", "0")
+        os.environ.setdefault("WORLD_SIZE", "1")
+        dist.init_process_group(backend="gloo", rank=0, world_size=1)
+    yield
+    # Don't destroy - other tests may need it
+
+
 class TestFp8LinearMethodCreateWeights:
     """Test create_weights for both block-quant and per-tensor paths."""
 
-    def test_create_weights_block_quant_serialized(self, _mock_rank, _mock_ws):
+    @pytest.fixture(autouse=True)
+    def _setup_distributed(self, init_distributed):
+        from vllm.distributed.parallel_state import (
+            init_model_parallel_group,
+        )
+        # Initialize vllm's TP group if not already done
+        try:
+            from vllm.distributed import get_tensor_model_parallel_world_size
+            get_tensor_model_parallel_world_size()
+        except AssertionError:
+            init_model_parallel_group(
+                group_ranks=[[0]],
+                local_rank=0,
+                backend="gloo",
+            )
+
+    def test_create_weights_block_quant_serialized(self):
         method = _make_fp8_linear_method(
             weight_block_size=[128, 128],
             is_checkpoint_fp8_serialized=True,
@@ -1204,7 +1233,7 @@ class TestFp8LinearMethodCreateWeights:
         assert layer.weight.dtype == torch.float8_e4m3fn
         assert hasattr(layer, "weight_scale_inv")
 
-    def test_create_weights_per_tensor_serialized(self, _mock_rank, _mock_ws):
+    def test_create_weights_per_tensor_serialized(self):
         method = _make_fp8_linear_method(
             weight_block_size=None,
             is_checkpoint_fp8_serialized=True,
@@ -1225,7 +1254,7 @@ class TestFp8LinearMethodCreateWeights:
         assert hasattr(layer, "weight_scale")
         assert hasattr(layer, "input_scale")
 
-    def test_create_weights_non_serialized(self, _mock_rank, _mock_ws):
+    def test_create_weights_non_serialized(self):
         method = _make_fp8_linear_method(
             weight_block_size=None,
             is_checkpoint_fp8_serialized=False,
