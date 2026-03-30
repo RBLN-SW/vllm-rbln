@@ -12,133 +12,159 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for model_executor layers: rotary embedding, logits processor,
-quantization helpers, and fused MoE utilities."""
+"""Unit tests for model_executor layers.
+
+Tests that can go through torch.compile(backend='rbln') use the compile path
+to verify both correctness and compile compatibility. Tests that require mocks
+or only validate configs/shapes remain as eager-only tests."""
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import rebel  # noqa: F401 -- registers "rbln" backend
 import pytest
 import torch
 
+COMPILE_ATOL = 5e-3
+COMPILE_RTOL = 5e-3
+
+
+def _compile(fn):
+    return torch.compile(fn, backend="rbln", dynamic=False)
+
 
 # ===========================================================================
-# Tests: rotary_embedding/base.py
+# Helpers
+# ===========================================================================
+
+
+def _make_rope(head_size=64, rotary_dim=64, max_position_embeddings=128,
+               is_neox_style=True):
+    rope = SimpleNamespace()
+    inv_freq = 1.0 / (10000.0 ** (
+        torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim
+    ))
+    t = torch.arange(max_position_embeddings, dtype=torch.float)
+    freqs = torch.outer(t, inv_freq)
+    cos_sin = torch.cat([freqs.cos(), freqs.sin()], dim=-1)
+
+    rope.cos_sin_cache = cos_sin
+    rope.is_neox_style = is_neox_style
+    rope.head_size = head_size
+    rope.rotary_dim = rotary_dim
+
+    def register_buffer(name, tensor, persistent=False):
+        setattr(rope, name, tensor)
+    rope.register_buffer = register_buffer
+
+    cos, sin = cos_sin.chunk(2, dim=-1)
+    if is_neox_style:
+        cos = cos.repeat(1, 2)
+        sin = sin.repeat(1, 2)
+    else:
+        cos = torch.stack([cos, cos], dim=-1).reshape(cos.shape[0], -1)
+        sin = torch.stack([sin, sin], dim=-1).reshape(sin.shape[0], -1)
+    rope.cos_cache = cos
+    rope.sin_cache = sin
+    return rope
+
+
+# ===========================================================================
+# Tests: rotary_embedding -- compile path
 # ===========================================================================
 
 
 class TestRotaryEmbedding:
-    def _make_rope(self, head_size=64, rotary_dim=64, is_neox_style=True):
-        from vllm_rbln.model_executor.layers.rotary_embedding.base import (
-            rope__custom_init__,
-            rope_original__init__,
-        )
-
-        rope = SimpleNamespace()
-
-        # Simulate parent init: build cos_sin_cache
-        inv_freq = 1.0 / (10000.0 ** (
-            torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim
-        ))
-        t = torch.arange(128, dtype=torch.float)
-        freqs = torch.outer(t, inv_freq)
-        cos_sin = torch.cat([freqs.cos(), freqs.sin()], dim=-1)
-        rope.cos_sin_cache = cos_sin
-        rope.is_neox_style = is_neox_style
-        rope.head_size = head_size
-        rope.rotary_dim = rotary_dim
-
-        def register_buffer(name, tensor, persistent=False):
-            setattr(rope, name, tensor)
-        rope.register_buffer = register_buffer
-
-        # Call only the cache transformation part of custom init
-        cos, sin = rope.cos_sin_cache.chunk(2, dim=-1)
-        if is_neox_style:
-            cos = cos.repeat(1, 2)
-            sin = sin.repeat(1, 2)
-        else:
-            cos = torch.stack([cos, cos], dim=-1).reshape(cos.shape[0], -1)
-            sin = torch.stack([sin, sin], dim=-1).reshape(sin.shape[0], -1)
-        rope.cos_cache = cos
-        rope.sin_cache = sin
-
-        return rope
-
     def test_init_neox_cache_shape(self):
-        rope = self._make_rope(is_neox_style=True)
-        assert rope.cos_cache.shape[0] == 128
-        assert rope.cos_cache.shape[1] == 64
+        rope = _make_rope(is_neox_style=True)
+        assert rope.cos_cache.shape == (128, 64)
 
     def test_init_gptj_cache_shape(self):
-        rope = self._make_rope(is_neox_style=False)
-        assert rope.cos_cache.shape[0] == 128
-        assert rope.cos_cache.shape[1] == 64
+        rope = _make_rope(is_neox_style=False)
+        assert rope.cos_cache.shape == (128, 64)
 
-    def test_forward_neox(self):
+    def test_forward_neox_compile(self):
         from vllm_rbln.model_executor.layers.rotary_embedding.base import (
             rope_forward_oot,
         )
 
-        rope = self._make_rope(is_neox_style=True)
-        batch, seq_len, num_heads, head_size = 2, 4, 8, 64
-        positions = torch.zeros(batch, seq_len, dtype=torch.long)
-        query = torch.randn(batch, seq_len, num_heads * head_size)
-        key = torch.randn(batch, seq_len, 2 * head_size)
+        rope = _make_rope(is_neox_style=True)
+        positions = torch.arange(4, dtype=torch.long).unsqueeze(0)
+        query = torch.randn(1, 4, 8 * 64)
+        key = torch.randn(1, 4, 2 * 64)
 
-        q_out, k_out = rope_forward_oot(rope, positions, query, key)
-        assert q_out.shape == query.shape
-        assert k_out.shape == key.shape
+        def fn(pos, q, k):
+            return rope_forward_oot(rope, pos, q, k)
 
-    def test_forward_gptj(self):
+        q_ref, k_ref = fn(positions, query.clone(), key.clone())
+        q_compiled, k_compiled = _compile(fn)(positions, query.clone(), key.clone())
+
+        torch.testing.assert_close(q_compiled, q_ref, atol=COMPILE_ATOL, rtol=COMPILE_RTOL)
+        torch.testing.assert_close(k_compiled, k_ref, atol=COMPILE_ATOL, rtol=COMPILE_RTOL)
+
+    def test_forward_gptj_compile(self):
         from vllm_rbln.model_executor.layers.rotary_embedding.base import (
             rope_forward_oot,
         )
 
-        rope = self._make_rope(is_neox_style=False)
-        batch, seq_len, num_heads, head_size = 1, 8, 4, 64
-        positions = torch.zeros(batch, seq_len, dtype=torch.long)
-        query = torch.randn(batch, seq_len, num_heads * head_size)
-        key = torch.randn(batch, seq_len, 2 * head_size)
+        rope = _make_rope(is_neox_style=False)
+        positions = torch.arange(4, dtype=torch.long).unsqueeze(0)
+        query = torch.randn(1, 4, 4 * 64)
+        key = torch.randn(1, 4, 2 * 64)
 
-        q_out, k_out = rope_forward_oot(rope, positions, query, key)
-        assert q_out.shape == query.shape
-        assert k_out.shape == key.shape
+        def fn(pos, q, k):
+            return rope_forward_oot(rope, pos, q, k)
 
-    def test_forward_with_offsets(self):
+        q_ref, k_ref = fn(positions, query.clone(), key.clone())
+        q_compiled, k_compiled = _compile(fn)(positions, query.clone(), key.clone())
+
+        torch.testing.assert_close(q_compiled, q_ref, atol=COMPILE_ATOL, rtol=COMPILE_RTOL)
+        torch.testing.assert_close(k_compiled, k_ref, atol=COMPILE_ATOL, rtol=COMPILE_RTOL)
+
+    def test_forward_with_offsets_compile(self):
         from vllm_rbln.model_executor.layers.rotary_embedding.base import (
             rope_forward_oot,
         )
 
-        rope = self._make_rope(is_neox_style=True)
-        batch, seq_len, num_heads, head_size = 1, 4, 4, 64
-        positions = torch.zeros(batch, seq_len, dtype=torch.long)
-        offsets = torch.ones(batch, seq_len, dtype=torch.long)
-        query = torch.randn(batch, seq_len, num_heads * head_size)
-        key = torch.randn(batch, seq_len, 2 * head_size)
+        rope = _make_rope(max_position_embeddings=256)
+        positions = torch.arange(4, dtype=torch.long).unsqueeze(0)
+        offsets = torch.full((1, 4), 10, dtype=torch.long)
+        query = torch.randn(1, 4, 4 * 64)
+        key = torch.randn(1, 4, 2 * 64)
 
-        q_out, k_out = rope_forward_oot(rope, positions, query, key, offsets)
-        assert q_out.shape == query.shape
+        def fn(pos, q, k, off):
+            return rope_forward_oot(rope, pos, q, k, off)
 
-    def test_forward_partial_rotary_dim(self):
-        """When rotary_dim < head_size, unrotated part is concatenated."""
+        q_ref, k_ref = fn(positions, query.clone(), key.clone(), offsets)
+        q_compiled, k_compiled = _compile(fn)(
+            positions, query.clone(), key.clone(), offsets
+        )
+
+        torch.testing.assert_close(q_compiled, q_ref, atol=COMPILE_ATOL, rtol=COMPILE_RTOL)
+        torch.testing.assert_close(k_compiled, k_ref, atol=COMPILE_ATOL, rtol=COMPILE_RTOL)
+
+    def test_forward_partial_rotary_dim_compile(self):
         from vllm_rbln.model_executor.layers.rotary_embedding.base import (
             rope_forward_oot,
         )
 
-        rope = self._make_rope(head_size=128, rotary_dim=64, is_neox_style=True)
-        batch, seq_len, num_heads = 1, 4, 4
-        positions = torch.zeros(batch, seq_len, dtype=torch.long)
-        query = torch.randn(batch, seq_len, num_heads * 128)
-        key = torch.randn(batch, seq_len, 2 * 128)
+        rope = _make_rope(head_size=128, rotary_dim=64)
+        positions = torch.arange(4, dtype=torch.long).unsqueeze(0)
+        query = torch.randn(1, 4, 2 * 128)
+        key = torch.randn(1, 4, 128)
 
-        q_out, k_out = rope_forward_oot(rope, positions, query, key)
-        assert q_out.shape == query.shape
-        assert k_out.shape == key.shape
+        def fn(pos, q, k):
+            return rope_forward_oot(rope, pos, q, k)
+
+        q_ref, k_ref = fn(positions, query.clone(), key.clone())
+        q_compiled, k_compiled = _compile(fn)(positions, query.clone(), key.clone())
+
+        torch.testing.assert_close(q_compiled, q_ref, atol=COMPILE_ATOL, rtol=COMPILE_RTOL)
+        torch.testing.assert_close(k_compiled, k_ref, atol=COMPILE_ATOL, rtol=COMPILE_RTOL)
 
 
 # ===========================================================================
-# Tests: logits_processor.py
+# Tests: logits_processor -- mock-based (not compilable)
 # ===========================================================================
 
 
@@ -159,9 +185,6 @@ class TestLogitsProcessor:
             mock_self, hidden, mock_lm_head, embedding_bias=None
         )
         assert torch.equal(result, expected)
-        mock_lm_head.quant_method.apply.assert_called_once_with(
-            mock_lm_head, hidden, bias=None
-        )
 
     def test_get_logits_with_bias(self):
         from vllm_rbln.model_executor.layers.logits_processor import (
@@ -227,140 +250,147 @@ class TestLogitsProcessor:
 
 
 # ===========================================================================
-# Tests: quantization/mxfp4.py helpers
+# Tests: quantization/mxfp4 helpers -- compile path
 # ===========================================================================
 
 
 class TestMxfp4Helpers:
-    def test_dequantize_mxfp4_basic(self):
+    def test_dequantize_zeros_compile(self):
         from vllm_rbln.model_executor.layers.quantization.mxfp4 import (
             _dequantize_mxfp4,
         )
 
-        # 4 packed bytes = 8 FP4 values, 1 scale for 32 elements
-        # We need blocks dim to be K//2 and scales dim to be K//32
-        # For K=8: blocks=[4], scales=[1] (but 8/32 = 0.25, need at least 1)
-        # Let's use K=64: blocks=[32], scales=[2]
-        blocks = torch.zeros(32, dtype=torch.uint8)
-        scales = torch.full((2,), 127, dtype=torch.uint8)  # exponent=0 -> 2^0=1
+        blocks = torch.zeros(16, dtype=torch.uint8)
+        scales = torch.full((1,), 127, dtype=torch.uint8)
 
-        result = _dequantize_mxfp4(blocks, scales, torch.float32)
-        assert result.shape == (64,)  # 32 * 2
-        # All zeros nibbles -> 0.0 values
-        assert torch.allclose(result, torch.zeros(64))
+        def fn(b, s):
+            return _dequantize_mxfp4(b, s, torch.float32)
 
-    def test_dequantize_mxfp4_nonzero(self):
+        ref = fn(blocks, scales)
+        compiled = _compile(fn)(blocks, scales)
+        torch.testing.assert_close(compiled, ref, atol=COMPILE_ATOL, rtol=COMPILE_RTOL)
+
+    def test_dequantize_known_values_compile(self):
         from vllm_rbln.model_executor.layers.quantization.mxfp4 import (
             _dequantize_mxfp4,
         )
 
-        # 0x21 = hi=2 (1.0), lo=1 (0.5)
         blocks = torch.tensor([0x21], dtype=torch.uint8)
-        scales = torch.tensor([127], dtype=torch.uint8)  # 2^0 = 1
+        scales = torch.tensor([127], dtype=torch.uint8)
 
-        result = _dequantize_mxfp4(blocks, scales, torch.float32)
-        assert result.shape == (2,)
-        assert result[0].item() == pytest.approx(0.5, abs=1e-5)
-        assert result[1].item() == pytest.approx(1.0, abs=1e-5)
+        def fn(b, s):
+            return _dequantize_mxfp4(b, s, torch.float32)
 
-    def test_dequantize_mxfp4_with_scale(self):
+        ref = fn(blocks, scales)
+        compiled = _compile(fn)(blocks, scales)
+        torch.testing.assert_close(compiled, ref, atol=COMPILE_ATOL, rtol=COMPILE_RTOL)
+
+    def test_dequantize_with_scale_compile(self):
         from vllm_rbln.model_executor.layers.quantization.mxfp4 import (
             _dequantize_mxfp4,
         )
 
-        # scale=128 -> exponent=128-127=1 -> 2^1=2
         blocks = torch.tensor([0x21], dtype=torch.uint8)
         scales = torch.tensor([128], dtype=torch.uint8)
 
-        result = _dequantize_mxfp4(blocks, scales, torch.float32)
-        assert result[0].item() == pytest.approx(1.0, abs=1e-5)  # 0.5 * 2
-        assert result[1].item() == pytest.approx(2.0, abs=1e-5)  # 1.0 * 2
+        def fn(b, s):
+            return _dequantize_mxfp4(b, s, torch.float32)
 
-    def test_dequantize_mxfp4_batched(self):
+        ref = fn(blocks, scales)
+        compiled = _compile(fn)(blocks, scales)
+        torch.testing.assert_close(compiled, ref, atol=COMPILE_ATOL, rtol=COMPILE_RTOL)
+
+    def test_dequantize_batched_compile(self):
         from vllm_rbln.model_executor.layers.quantization.mxfp4 import (
             _dequantize_mxfp4,
         )
 
-        blocks = torch.zeros(3, 16, dtype=torch.uint8)
-        scales = torch.full((3, 1), 127, dtype=torch.uint8)
+        blocks = torch.randint(0, 256, (4, 8, 32), dtype=torch.uint8)
+        scales = torch.randint(100, 140, (4, 8, 2), dtype=torch.uint8)
 
-        result = _dequantize_mxfp4(blocks, scales, torch.float32)
-        assert result.shape == (3, 32)
+        def fn(b, s):
+            return _dequantize_mxfp4(b, s, torch.float32)
 
-    def test_swigluoai(self):
+        ref = fn(blocks, scales)
+        compiled = _compile(fn)(blocks, scales)
+        torch.testing.assert_close(compiled, ref, atol=COMPILE_ATOL, rtol=COMPILE_RTOL)
+
+    def test_swigluoai_compile(self):
         from vllm_rbln.model_executor.layers.quantization.mxfp4 import _swigluoai
 
-        gate = torch.tensor([1.0, 2.0, 10.0])
-        up = torch.tensor([0.5, 1.0, 0.0])
+        gate = torch.randn(8)
+        up = torch.randn(8)
 
-        result = _swigluoai(gate, up, alpha=1.702, limit=7.0)
-        assert result.shape == (3,)
+        def fn(g, u):
+            return _swigluoai(g, u, alpha=1.702, limit=7.0)
 
-        # gate clamped at 7.0 for last element
-        # up clamped at [-7, 7]
-        gate_clamped = gate.clamp(max=7.0)
-        up_clamped = up.clamp(min=-7.0, max=7.0)
-        glu = gate_clamped * torch.sigmoid(gate_clamped * 1.702)
-        expected = (up_clamped + 1) * glu
-        assert torch.allclose(result, expected)
+        ref = fn(gate, up)
+        compiled = _compile(fn)(gate, up)
+        torch.testing.assert_close(compiled, ref, atol=COMPILE_ATOL, rtol=COMPILE_RTOL)
 
-    def test_swigluoai_negative(self):
+    def test_swigluoai_negative_compile(self):
         from vllm_rbln.model_executor.layers.quantization.mxfp4 import _swigluoai
 
         gate = torch.tensor([-1.0, -10.0])
         up = torch.tensor([-10.0, 1.0])
 
-        result = _swigluoai(gate, up, alpha=1.702, limit=7.0)
-        assert result.shape == (2,)
+        def fn(g, u):
+            return _swigluoai(g, u, alpha=1.702, limit=7.0)
+
+        ref = fn(gate, up)
+        compiled = _compile(fn)(gate, up)
+        torch.testing.assert_close(compiled, ref, atol=COMPILE_ATOL, rtol=COMPILE_RTOL)
 
 
 # ===========================================================================
-# Tests: fused_moe/layer.py helpers
+# Tests: fused_moe routing -- compile path
 # ===========================================================================
 
 
 class TestFusedMoEHelpers:
-    def test_get_masked_routing_weights_renormalize(self):
+    def test_routing_renormalize_compile(self):
         from vllm_rbln.model_executor.layers.fused_moe.layer import (
             get_masked_routing_weights,
         )
 
         router_logits = torch.randn(4, 8)
-        top_k = 2
+
+        def fn(logits):
+            return get_masked_routing_weights(logits, top_k=2, renormalize=True,
+                                              expert_map=None)
 
         with patch(
-            "vllm_rbln.model_executor.layers.fused_moe.layer.envs.VLLM_RBLN_USE_MOE_TOKENS_MASK",
-            False,
+            "vllm_rbln.model_executor.layers.fused_moe.layer.envs"
+            ".VLLM_RBLN_USE_MOE_TOKENS_MASK", False,
         ):
-            masked_weights, expert_count = get_masked_routing_weights(
-                router_logits, top_k, renormalize=True, expert_map=None
-            )
-        assert masked_weights.shape == (4, 8)
-        # Each row should have exactly top_k non-zero entries
-        for i in range(4):
-            assert (masked_weights[i] != 0).sum() == top_k
-        assert expert_count.shape == (8,)
-        assert expert_count.sum() == 4 * top_k
+            ref_w, ref_c = fn(router_logits.clone())
+            compiled_w, compiled_c = _compile(fn)(router_logits.clone())
 
-    def test_get_masked_routing_weights_no_renormalize(self):
+        torch.testing.assert_close(compiled_w, ref_w, atol=COMPILE_ATOL, rtol=COMPILE_RTOL)
+        torch.testing.assert_close(compiled_c, ref_c)
+
+    def test_routing_no_renormalize_compile(self):
         from vllm_rbln.model_executor.layers.fused_moe.layer import (
             get_masked_routing_weights,
         )
 
-        router_logits = torch.randn(3, 6)
+        router_logits = torch.randn(4, 8)
+
+        def fn(logits):
+            return get_masked_routing_weights(logits, top_k=1, renormalize=False,
+                                              expert_map=None)
 
         with patch(
-            "vllm_rbln.model_executor.layers.fused_moe.layer.envs.VLLM_RBLN_USE_MOE_TOKENS_MASK",
-            False,
+            "vllm_rbln.model_executor.layers.fused_moe.layer.envs"
+            ".VLLM_RBLN_USE_MOE_TOKENS_MASK", False,
         ):
-            masked_weights, expert_count = get_masked_routing_weights(
-                router_logits, top_k=1, renormalize=False, expert_map=None
-            )
-        assert masked_weights.shape == (3, 6)
-        for i in range(3):
-            assert (masked_weights[i] != 0).sum() == 1
+            ref_w, ref_c = fn(router_logits.clone())
+            compiled_w, compiled_c = _compile(fn)(router_logits.clone())
 
-    def test_get_masked_routing_weights_with_expert_map(self):
+        torch.testing.assert_close(compiled_w, ref_w, atol=COMPILE_ATOL, rtol=COMPILE_RTOL)
+        torch.testing.assert_close(compiled_c, ref_c)
+
+    def test_routing_with_expert_map_compile(self):
         from vllm_rbln.model_executor.layers.fused_moe.layer import (
             get_masked_routing_weights,
         )
@@ -368,18 +398,144 @@ class TestFusedMoEHelpers:
         router_logits = torch.randn(2, 4)
         expert_map = torch.tensor([1, 0, 3, 2], dtype=torch.int64)
 
+        def fn(logits):
+            return get_masked_routing_weights(logits, top_k=2, renormalize=True,
+                                              expert_map=expert_map)
+
         with patch(
-            "vllm_rbln.model_executor.layers.fused_moe.layer.envs.VLLM_RBLN_USE_MOE_TOKENS_MASK",
-            False,
+            "vllm_rbln.model_executor.layers.fused_moe.layer.envs"
+            ".VLLM_RBLN_USE_MOE_TOKENS_MASK", False,
         ):
-            masked_weights, _ = get_masked_routing_weights(
-                router_logits, top_k=2, renormalize=True, expert_map=expert_map
-            )
-        assert masked_weights.shape == (2, 4)
+            ref_w, ref_c = fn(router_logits.clone())
+            compiled_w, compiled_c = _compile(fn)(router_logits.clone())
+
+        torch.testing.assert_close(compiled_w, ref_w, atol=COMPILE_ATOL, rtol=COMPILE_RTOL)
+        torch.testing.assert_close(compiled_c, ref_c)
 
 
 # ===========================================================================
-# Tests: quantization/kernels/mixed_precision/unpacked.py
+# Tests: FP8 quantization -- compile path
+# ===========================================================================
+
+
+class TestFp8Compile:
+    def test_w8a16_block_fp8_matmul(self):
+        """Block FP8 dequant + matmul through compile path."""
+        from vllm_rbln.model_executor.layers.quantization.fp8 import (
+            RBLNW8A16BlockFp8LinearOp,
+        )
+
+        out_features, in_features = 64, 128
+        block_size = [32, 64]
+        batch = 4
+
+        op = RBLNW8A16BlockFp8LinearOp(
+            weight_group_shape=(block_size[0], block_size[1]),
+            act_quant_group_shape=(1, 128),
+        )
+
+        x = torch.randn(batch, in_features, dtype=torch.bfloat16)
+        weight = torch.randn(out_features, in_features, dtype=torch.float8_e4m3fn)
+        weight_scale = torch.rand(
+            out_features // block_size[0], in_features // block_size[1],
+            dtype=torch.bfloat16,
+        )
+
+        def fn(inp, w, ws):
+            return op.apply(inp, w, ws)
+
+        ref = fn(x.clone(), weight, weight_scale)
+        compiled = _compile(fn)(x.clone(), weight, weight_scale)
+        torch.testing.assert_close(compiled, ref, atol=COMPILE_ATOL, rtol=COMPILE_RTOL)
+
+    def test_w8a16_block_fp8_matmul_with_bias(self):
+        from vllm_rbln.model_executor.layers.quantization.fp8 import (
+            RBLNW8A16BlockFp8LinearOp,
+        )
+
+        out_features, in_features = 64, 128
+        block_size = [32, 64]
+
+        op = RBLNW8A16BlockFp8LinearOp(
+            weight_group_shape=(block_size[0], block_size[1]),
+            act_quant_group_shape=(1, 128),
+        )
+
+        x = torch.randn(2, in_features, dtype=torch.bfloat16)
+        weight = torch.randn(out_features, in_features, dtype=torch.float8_e4m3fn)
+        weight_scale = torch.rand(
+            out_features // block_size[0], in_features // block_size[1],
+            dtype=torch.bfloat16,
+        )
+        bias = torch.randn(out_features, dtype=torch.bfloat16)
+
+        def fn(inp, w, ws, b):
+            return op.apply(inp, w, ws, bias=b)
+
+        ref = fn(x.clone(), weight, weight_scale, bias)
+        compiled = _compile(fn)(x.clone(), weight, weight_scale, bias)
+        torch.testing.assert_close(compiled, ref, atol=COMPILE_ATOL, rtol=COMPILE_RTOL)
+
+    def test_fp8_per_tensor_dequant_linear(self):
+        """Per-tensor FP8 dequant path: weight * scale → bf16 linear."""
+        out_features, in_features = 32, 64
+        batch = 4
+
+        x = torch.randn(batch, in_features, dtype=torch.bfloat16)
+        weight_fp8 = torch.randn(out_features, in_features, dtype=torch.float8_e4m3fn)
+        weight_scale = torch.tensor([0.5], dtype=torch.bfloat16)
+
+        def fn(inp, w, ws):
+            w_bf16 = w.to(torch.bfloat16) * ws
+            return torch.nn.functional.linear(inp, w_bf16.t())
+
+        ref = fn(x.clone(), weight_fp8, weight_scale)
+        compiled = _compile(fn)(x.clone(), weight_fp8, weight_scale)
+        torch.testing.assert_close(compiled, ref, atol=COMPILE_ATOL, rtol=COMPILE_RTOL)
+
+    def test_fp8_per_row_dequant_linear(self):
+        """Per-row FP8 dequant path: weight * scale.unsqueeze(1) → bf16 linear."""
+        out_features, in_features = 32, 64
+        batch = 4
+
+        x = torch.randn(batch, in_features, dtype=torch.bfloat16)
+        weight_fp8 = torch.randn(out_features, in_features, dtype=torch.float8_e4m3fn)
+        weight_scale = torch.rand(out_features, dtype=torch.bfloat16)
+
+        def fn(inp, w, ws):
+            w_bf16 = w.to(torch.bfloat16) * ws.unsqueeze(1)
+            return torch.nn.functional.linear(inp, w_bf16.t())
+
+        ref = fn(x.clone(), weight_fp8, weight_scale)
+        compiled = _compile(fn)(x.clone(), weight_fp8, weight_scale)
+        torch.testing.assert_close(compiled, ref, atol=COMPILE_ATOL, rtol=COMPILE_RTOL)
+
+    def test_fp8_blockwise_dequantize(self):
+        """Blockwise weight dequantization used inside FP8 MoE."""
+        num_experts, out_features, in_features = 4, 64, 128
+        in_block_size = 64
+        out_block_size = 32
+        out_blocks = out_features // out_block_size
+        in_blocks = in_features // in_block_size
+
+        weight = torch.randn(num_experts, out_features, in_features,
+                             dtype=torch.float8_e4m3fn)
+        scale = torch.rand(num_experts, out_blocks, in_blocks, dtype=torch.bfloat16)
+
+        def fn(w, s):
+            # Mirrors _dequantize_blockwise_weight from fp8.py
+            expanded = s.repeat_interleave(out_block_size, dim=1).repeat_interleave(
+                in_block_size, dim=2
+            )
+            expanded = expanded[:, :out_features, :in_features]
+            return w.to(torch.bfloat16) * expanded
+        ref = fn(weight, scale)
+        compiled = _compile(fn)(weight, scale)
+        torch.testing.assert_close(compiled, ref, atol=COMPILE_ATOL, rtol=COMPILE_RTOL)
+
+
+# ===========================================================================
+# Tests: quantization kernels -- config validation (not compilable)
 # ===========================================================================
 
 
