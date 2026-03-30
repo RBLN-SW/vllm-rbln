@@ -45,7 +45,8 @@ class TestSamplerCompile:
 
         ref = fn(logits.clone())
         compiled = _compile(fn)(logits.clone())
-        torch.testing.assert_close(compiled, ref)
+        # RBLN compile may return int32 vs eager int64; compare values only
+        torch.testing.assert_close(compiled.to(ref.dtype), ref)
 
 
 class TestSamplerEager:
