@@ -2239,8 +2239,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             positions = rbln_utils.pad(positions, -2, batch_bucket_size)
 
             attn_metadata_bucket[batch_bucket_size] = attn_metadata
-            input_ids_bucket[batch_bucket_size] = input_ids
-            positions_bucket[batch_bucket_size] = positions
+            input_ids_bucket[batch_bucket_size] = input_ids.to(self.device)
+            positions_bucket[batch_bucket_size] = positions.to(self.device)
 
         return DummyRunState(
             attn_metadata=attn_metadata_bucket,
