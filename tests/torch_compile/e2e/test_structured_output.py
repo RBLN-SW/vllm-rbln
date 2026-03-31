@@ -104,7 +104,6 @@ class TestJsonStructuredOutput:
                 "of the most iconic car from the 90's"
             ),
             sampling_params=SamplingParams(
-                max_tokens=200,
                 structured_outputs=StructuredOutputsParams(
                     json=CarDescription.model_json_schema()
                 )
