@@ -902,16 +902,19 @@ class RBLNScheduler(Scheduler):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
-        # Release source-block refs from this step's copy ops now that the
-        # model runner has finished copying.  This is safe for async
-        # scheduling because update_from_output is called only after the
-        # execution future completes.
-        if (
-            isinstance(scheduler_output, RBLNSchedulerOutput)
-            and scheduler_output.kv_cache_copy_ops
-        ):
-            assert isinstance(self.kv_cache_manager, RBLNKVCacheManager)
-            self.kv_cache_manager.release_copy_ops(scheduler_output.kv_cache_copy_ops)
+        assert isinstance(scheduler_output, RBLNSchedulerOutput)
+        if isinstance(self.kv_cache_manager, RBLNKVCacheManager):
+            # Index sub-blocks now that execute_model has written KV data,
+            # which is safe for copy for later steps.
+            self.kv_cache_manager.do_pending_indexing()
+            # Release source-block refs from this step's copy ops now that the
+            # model runner has finished copying.  This is safe for async
+            # scheduling because update_from_output is called only after the
+            # execution future completes.
+            if scheduler_output.kv_cache_copy_ops:
+                self.kv_cache_manager.release_copy_ops(
+                    scheduler_output.kv_cache_copy_ops
+                )
 
         return super().update_from_output(scheduler_output, model_runner_output)
 

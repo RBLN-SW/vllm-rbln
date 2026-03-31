@@ -321,6 +321,11 @@ class RBLNKVCacheManager(KVCacheManager):
         # copy op holds a ref count of its source block to prevent eviction.
         self.pending_copy_ops: list[KVCacheCopyOp] = []
 
+        # Requests for which sub-block indexing is pending.
+        # Each entry stores the per-group full-block count snapshot
+        # taken before allocate_slots, used to narrow the scan range.
+        self._pending_indexing: dict[str, tuple[Request, tuple[int, ...]]] = {}
+
         self._install_eviction_hook()
 
     def get_computed_blocks_sub_block(
@@ -483,7 +488,13 @@ class RBLNKVCacheManager(KVCacheManager):
         )
 
         if result is not None:
-            self._index_newly_cached_blocks(request, num_full_blocks_before)
+            # Defer sub-block indexing until after execute_model writes KV cache,
+            # so that concurrent prefills in the same step cannot match sub-blocks
+            # whose KV data does not yet exist.
+            self._pending_indexing[request.request_id] = (
+                request,
+                num_full_blocks_before,
+            )
 
         return result
 
@@ -505,14 +516,26 @@ class RBLNKVCacheManager(KVCacheManager):
                 [self.block_pool.blocks[op.src_block_id] for op in ops]
             )
 
+    def do_pending_indexing(self) -> None:
+        """Index sub-blocks for requests whose indexing was deferred.
+
+        Must be called **after** execute_model so that the new KV data is
+        written before the index entries become visible to subsequent
+        scheduling steps.
+        """
+        for request, num_full_blocks_before in self._pending_indexing.values():
+            self._index_newly_cached_blocks(request, num_full_blocks_before)
+        self._pending_indexing.clear()
+
     def free(self, request: Request) -> None:
         """Free blocks and clean up sub-block state for a request."""
         # Before freeing, cache the last partial block's sub-blocks in the
         # index so future requests can reuse them via sub-block matching.
         self._index_partial_block(request)
 
-        # Clean up request sub-hash cache.
+        # Clean up request states
         del self._req_sub_hashes[request.request_id]
+        self._pending_indexing.pop(request.request_id, None)
         super().free(request)
 
     def reset_prefix_cache(self) -> bool:
@@ -521,6 +544,7 @@ class RBLNKVCacheManager(KVCacheManager):
         if result:
             for gi in self._group_infos:
                 gi.sub_block_index = SubBlockIndex()
+            self._pending_indexing.clear()
         return result
 
     # -- sub-block hash helpers ---------------------------------------------

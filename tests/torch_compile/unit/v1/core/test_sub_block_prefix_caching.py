@@ -360,7 +360,9 @@ def _prefill_request(manager: RBLNKVCacheManager, request: Request):
         manager.apply_sub_block_match(sub_block_match, request)
     elif sub_block_match is not None:
         manager.release_sub_block_match(sub_block_match)
+    # Simulate execute_model completion.
     request.num_computed_tokens = request.num_tokens
+    manager.do_pending_indexing()
     return computed_blocks, total_computed, blocks
 
 
@@ -898,7 +900,7 @@ class TestRBLNKVCacheManager:
             assert new_hashes != old_hashes
 
     def test_index_newly_cached_blocks_during_decode(self):
-        """_index_newly_cached_blocks should correctly index new blocks
+        """Deferred sub-block indexing should correctly index new blocks
         when a decode step causes a block to become full."""
         BS, SBS = 8, 4
         manager = _make_manager(BS, SBS, num_blocks=10)
@@ -924,6 +926,9 @@ class TestRBLNKVCacheManager:
             result = manager.allocate_slots(req, 1, 0)
             assert result is not None
             req.num_computed_tokens = num_computed_before + 1
+
+        # Finish the current step
+        manager.do_pending_indexing()
 
         # After filling BS-1 decode tokens, the second block should now be full
         # and indexed in the index.
@@ -1139,6 +1144,57 @@ class TestRBLNKVCacheManager:
         assert num_computed == 0
         sub_match = manager.get_computed_blocks_sub_block(req1, num_computed)
         assert sub_match is None
+
+    def test_multi_prefill_no_stale_sub_block_match(self):
+        """When two prefills with overlapping tokens are scheduled in the
+        same step (before execute_model), the second request must NOT get
+        a sub-block match from the first request's blocks because the KV
+        data hasn't been computed yet.
+        In the next step, a third request should get the match.
+        """
+        manager = _make_manager(self.BLOCK_SIZE, self.SUB_BLOCK_SIZE, num_blocks=100)
+
+        # Both requests share the same first sub-block prefix.
+        shared = list(range(self.SUB_BLOCK_SIZE))
+        req0 = _make_request(
+            "0", shared + [100] * self.BLOCK_SIZE, self.BLOCK_SIZE, max_tokens=1
+        )
+        req1 = _make_request(
+            "1", shared + [200] * self.BLOCK_SIZE, self.BLOCK_SIZE, max_tokens=1
+        )
+
+        # --- Simulate scheduling both in the same step (multi-prefill) ---
+
+        # req0: get_computed_blocks → allocate_slots
+        cb0, nc0 = manager.get_computed_blocks(req0)
+        sm0 = manager.get_computed_blocks_sub_block(req0, nc0)
+        assert sm0 is None  # Cold cache.
+        manager.allocate_slots(req0, req0.num_tokens, 0, cb0)
+
+        # req1: scheduled in the same step.
+        # With deferred indexing, req0's sub-blocks are NOT indexed yet.
+        cb1, nc1 = manager.get_computed_blocks(req1)
+        sm1 = manager.get_computed_blocks_sub_block(req1, nc1)
+        assert sm1 is None  # Must NOT match — req0's KV data doesn't exist.
+        manager.allocate_slots(req1, req1.num_tokens, 0, cb1)
+
+        # --- Finish the step ---
+        req0.num_computed_tokens = req0.num_tokens
+        req1.num_computed_tokens = req1.num_tokens
+        manager.do_pending_indexing()
+
+        # After that, the index should be populated.
+        assert len(_sub_block_index(manager)._hash_to_blocks) > 0
+
+        # A third request should now get a sub-block match.
+        req2 = _make_request(
+            "2", shared + [300] * self.BLOCK_SIZE, self.BLOCK_SIZE, max_tokens=1
+        )
+        _, nc2 = manager.get_computed_blocks(req2)
+        sm2 = manager.get_computed_blocks_sub_block(req2, nc2)
+        assert sm2 is not None
+        assert sm2.num_tokens == self.SUB_BLOCK_SIZE
+        manager.release_sub_block_match(sm2)
 
 
 # ---------------------------------------------------------------------------
@@ -1696,7 +1752,11 @@ class TestRBLNScheduler:
         req = _make_request("req", tokens, BS, max_tokens=1)
         scheduler.add_request(req)
 
-        scheduler.schedule()
+        output = scheduler.schedule()
+
+        # After update_from_output (forward pass done), only block 0 is indexed.
+        runner_out = create_runner_output(output, 0)
+        scheduler.update_from_output(output, runner_out)
 
         req_blocks = mgr.coordinator.get_blocks("req")[0]
 
