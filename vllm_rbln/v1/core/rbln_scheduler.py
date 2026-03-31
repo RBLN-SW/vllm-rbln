@@ -482,7 +482,14 @@ class RBLNScheduler(Scheduler):
                         # we can stop the scheduling here.
                         break
 
-                    num_new_tokens = min(num_new_tokens, token_budget)
+                    # NOTE(RBLN): Use prefill_token_budget instead of
+                    # token_budget. Running decode requests may have already
+                    # consumed part of token_budget, but they will be kicked
+                    # out when this new prefill is scheduled (see the
+                    # "disable mixed batching" block below), restoring the
+                    # full budget. Using token_budget here would clip the
+                    # first prefill chunk short (e.g. 127 instead of 128).
+                    num_new_tokens = min(num_new_tokens, prefill_token_budget)
                     assert num_new_tokens > 0
 
                     # Schedule encoder inputs.
