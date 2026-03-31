@@ -215,7 +215,7 @@ class TestSubBlockIndex:
     def test_insert_and_match(self):
         index = SubBlockIndex()
         hashes = self._make_hashes([[1, 2], [3, 4], [5, 6]])
-        index.insert(10, hashes)
+        index.update(10, hashes)
 
         # Full match.
         block_id, depth = index.longest_match(hashes)
@@ -225,7 +225,7 @@ class TestSubBlockIndex:
     def test_partial_match(self):
         index = SubBlockIndex()
         hashes_src = self._make_hashes([[1, 2], [3, 4], [5, 6]])
-        index.insert(10, hashes_src)
+        index.update(10, hashes_src)
 
         # Query with only the first 2 matching sub-blocks.
         block_id, depth = index.longest_match(hashes_src[:2])
@@ -235,8 +235,8 @@ class TestSubBlockIndex:
     def test_multiple_blocks_same_prefix(self):
         index = SubBlockIndex()
         hashes = self._make_hashes([[1, 2], [3, 4], [5, 6]])
-        index.insert(10, hashes)
-        index.insert(20, hashes)
+        index.update(10, hashes)
+        index.update(20, hashes)
 
         block_id, depth = index.longest_match(hashes)
         assert block_id in (10, 20)
@@ -245,7 +245,7 @@ class TestSubBlockIndex:
     def test_remove_block(self):
         index = SubBlockIndex()
         hashes = self._make_hashes([[1, 2], [3, 4]])
-        index.insert(10, hashes)
+        index.update(10, hashes)
         index.pop(10)
 
         block_id, depth = index.longest_match(hashes)
@@ -255,8 +255,8 @@ class TestSubBlockIndex:
     def test_remove_one_of_two_blocks(self):
         index = SubBlockIndex()
         hashes = self._make_hashes([[1, 2], [3, 4]])
-        index.insert(10, hashes)
-        index.insert(20, hashes)
+        index.update(10, hashes)
+        index.update(20, hashes)
         index.pop(10)
 
         block_id, depth = index.longest_match(hashes)
@@ -270,7 +270,7 @@ class TestSubBlockIndex:
     def test_longest_match_empty_query(self):
         index = SubBlockIndex()
         hashes = self._make_hashes([[1, 2], [3, 4]])
-        index.insert(10, hashes)
+        index.update(10, hashes)
 
         block_id, depth = index.longest_match([])
         assert block_id is None
@@ -629,8 +629,9 @@ class TestRBLNKVCacheManager:
                 manager.release_sub_block_match(match)
 
     def test_partial_block_cached_on_free(self):
-        """free() should index the last partial block's sub-blocks in the index
-        and mark it as cached so its KV data is preserved."""
+        """free() should mark the last partial block as cached with synthetic
+        block_hash so its KV data is preserved in the LRU.
+        Eager indexing already adds sub-block entries before free()."""
         manager = _make_manager(self.BLOCK_SIZE, self.SUB_BLOCK_SIZE, num_blocks=10)
 
         # 1 full block (8 tokens) + 1 sub-block (4 tokens) = 12 tokens total.
@@ -638,21 +639,22 @@ class TestRBLNKVCacheManager:
         req0 = _make_request("0", tokens, self.BLOCK_SIZE)
         _prefill_request(manager, req0)
 
-        # Before free: only the full block (block index 0) is in the index.
+        # After prefill: full block is indexed AND partial block is eagerly
+        # indexed (sub-block entries exist), but not yet marked cached.
         blocks = manager.coordinator.get_blocks(req0.request_id)
         block_list = blocks[0]
         full_blk = block_list[0]
         partial_blk = block_list[1]
         assert full_blk.block_id in _sub_block_index(manager)._block_hashes
-        assert partial_blk.block_id not in _sub_block_index(manager)._block_hashes
-        assert partial_blk.block_hash is None  # Not cached yet.
+        assert partial_blk.block_id in _sub_block_index(manager)._block_hashes
+        assert partial_blk.block_hash is None  # Not cached yet (no synthetic hash).
 
         partial_blk_id = partial_blk.block_id
         manager.free(req0)
 
-        # After free: the partial block should now be in the index.
+        # After free: the partial block should still be in the index
+        # and now have a block_hash (cached in LRU).
         assert partial_blk_id in _sub_block_index(manager)._block_hashes
-        # And it should have a block_hash (cached in LRU).
         assert partial_blk.block_hash is not None
 
     def test_partial_block_reused_by_next_request(self):
@@ -937,6 +939,108 @@ class TestRBLNKVCacheManager:
             blk1 = blocks[0][1]
             if blk1.block_hash is not None:
                 assert _sub_block_index(manager).contains(blk1.block_id)
+
+    def test_eager_partial_block_visible_before_free(self):
+        """A running request's partial block sub-blocks should be visible
+        to new requests for matching before free() is called."""
+        BS, SBS = 8, 4
+        manager = _make_manager(BS, SBS, num_blocks=10)
+
+        # Request 0: 1 full block + 1 sub-block = 12 tokens.
+        tokens0 = list(range(BS + SBS))
+        req0 = _make_request("0", tokens0, BS, max_tokens=BS)
+        _prefill_request(manager, req0)
+
+        # req0 is still running (not freed).  Its partial block's sub-block
+        # should already be indexed eagerly.
+        blocks = manager.coordinator.get_blocks(req0.request_id)
+        partial_blk = blocks[0][1]
+        assert partial_blk.block_id in _sub_block_index(manager)._block_hashes
+        # But not cached (no synthetic hash).
+        assert partial_blk.block_hash is None
+
+        # Request 1: shares the full prefix including the partial sub-block.
+        tokens1 = list(range(BS + SBS)) + [100 + i for i in range(BS)]
+        req1 = _make_request("1", tokens1, BS)
+        _, num_computed = manager.get_computed_blocks(req1)
+        assert num_computed == BS  # Full block match only.
+        sub_match = manager.get_computed_blocks_sub_block(req1, num_computed)
+        # Should match the partial sub-block from the running request.
+        assert sub_match is not None
+        assert sub_match.num_tokens == SBS
+        manager.release_sub_block_match(sub_match)
+
+    def test_eager_partial_block_grows_during_decode(self):
+        """As a running request decodes and crosses sub-block boundaries,
+        the eagerly indexed partial block should grow incrementally."""
+        BS, SBS = 8, 4
+        manager = _make_manager(BS, SBS, num_blocks=10)
+
+        # Prompt: 1 full block + 1 token in partial block.
+        prompt = list(range(BS + 1))
+        req = _make_request("0", prompt, BS, max_tokens=2 * BS)
+        _prefill_request(manager, req)
+
+        # After prefill: partial block has 1 token < SBS, so 0 complete
+        # sub-blocks → not in index.
+        blocks = manager.coordinator.get_blocks(req.request_id)
+        partial_blk = blocks[0][1]
+        assert partial_blk.block_id not in _sub_block_index(manager)._block_hashes
+
+        # Decode SBS-1 = 3 more tokens to complete the first sub-block.
+        for i in range(SBS - 1):
+            req.append_output_token_ids(200 + i)
+            num_before = req.num_computed_tokens
+            manager.allocate_slots(req, 1, 0)
+            req.num_computed_tokens = num_before + 1
+        manager.do_pending_indexing()
+
+        # Now partial block has SBS tokens → 1 complete sub-block in index.
+        idx = _sub_block_index(manager)
+        assert idx.contains(partial_blk.block_id)
+        assert len(idx._block_hashes[partial_blk.block_id]) == 1
+
+        # Decode SBS more tokens to complete a second sub-block.
+        for i in range(SBS):
+            req.append_output_token_ids(300 + i)
+            num_before = req.num_computed_tokens
+            manager.allocate_slots(req, 1, 0)
+            req.num_computed_tokens = num_before + 1
+        manager.do_pending_indexing()
+
+        # Now 2 complete sub-blocks.
+        assert len(idx._block_hashes[partial_blk.block_id]) == 2
+
+    def test_partial_to_full_transition_completes_indexing(self):
+        """When a partially indexed block becomes full, _on_block_cached
+        should complete the indexing with update()."""
+        BS, SBS = 8, 4  # 2 sub-blocks per block
+        manager = _make_manager(BS, SBS, num_blocks=10)
+
+        # Prompt: 1 full block + SBS tokens in partial block.
+        prompt = list(range(BS + SBS))
+        req = _make_request("0", prompt, BS, max_tokens=BS)
+        _prefill_request(manager, req)
+
+        blocks = manager.coordinator.get_blocks(req.request_id)
+        partial_blk = blocks[0][1]
+
+        # After prefill: 1 sub-block indexed in the partial block.
+        idx = _sub_block_index(manager)
+        assert idx.contains(partial_blk.block_id)
+        assert len(idx._block_hashes[partial_blk.block_id]) == 1
+
+        # Decode SBS more tokens to fill the block completely.
+        for i in range(SBS):
+            req.append_output_token_ids(400 + i)
+            num_before = req.num_computed_tokens
+            manager.allocate_slots(req, 1, 0)
+            req.num_computed_tokens = num_before + 1
+        manager.do_pending_indexing()
+
+        # The block is now full and should have both sub-blocks indexed.
+        assert partial_blk.block_hash is not None  # Upstream marked it cached.
+        assert len(idx._block_hashes[partial_blk.block_id]) == 2
 
     def test_partial_match_tight_memory_no_assertion(self):
         """With tight block pool, partial match source block must survive
@@ -1406,7 +1510,7 @@ class TestMultiGroupRBLNKVCacheManager:
 
     def test_hybrid_partial_block_indexed_on_free(self):
         """In multi-group setup, free() should index partial blocks in both
-        groups' sub-block indices."""
+        groups' sub-block indices and mark them as cached."""
         manager = _make_hybrid_manager(
             self.BLOCK_SIZE,
             self.SUB_BLOCK_SIZE,
@@ -1419,18 +1523,20 @@ class TestMultiGroupRBLNKVCacheManager:
         req0 = _make_request("0", tokens, self.BLOCK_SIZE)
         _prefill_request(manager, req0)
 
-        # Before free: partial block not in index.
+        # After prefill: partial block is eagerly indexed but not yet cached.
         blocks = manager.coordinator.get_blocks(req0.request_id)
         partial_blk_ids = [
             blocks[gid][1].block_id for gid in range(len(manager._group_infos))
         ]
 
         for i, gi in enumerate(manager._group_infos):
-            assert partial_blk_ids[i] not in gi.sub_block_index._block_hashes
+            assert partial_blk_ids[i] in gi.sub_block_index._block_hashes
+            assert blocks[i][1].block_hash is None  # Not cached yet.
 
         manager.free(req0)
 
-        # After free: partial block should be in both group indices.
+        # After free: partial block should still be in both group indices
+        # and now have a block_hash (cached in LRU).
         for i, gi in enumerate(manager._group_infos):
             assert partial_blk_ids[i] in gi.sub_block_index._block_hashes
 

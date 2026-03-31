@@ -69,12 +69,13 @@ so that each prefill does not span multiple blocks.
      Uses the same `hash_block_tokens` as upstream.
    * `SubBlockIndex`:
      Maps sub-block hashes to sets of physical block IDs containing the sub-block.
-     Supports `insert`, `pop`, and `longest_match`.
+     Supports `update`, `pop`, and `longest_match`.
    * `RBLNKVCacheManager`: Extends upstream `KVCacheManager`.
         * Overrides
             * `allocate_slots` queues the request for sub-block indexing work
               to be processed by `do_pending_indexing`.
-            * `free` caches partial blocks.
+            * `free` indexes all blocks (full + partial) for the finishing request
+              and assigns a synthetic `block_hash` to the partial block.
             * `reset_prefix_cache` clears sub-block indices and pending indexing.
         * New methods
             * `get_computed_blocks_sub_block(request, num_computed_tokens)`
@@ -84,7 +85,7 @@ so that each prefill does not span multiple blocks.
             * `release_copy_ops()` releases the source-block references after the model runner finishes copying.
             * `do_pending_indexing()` indexes sub-blocks for requests for which
               `allocate_slots` was called in the current scheduling step.
-              Must be called after `execute_model`.
+              Must be called after `super().update_from_output()`.
             * `can_use_sub_block_caching()` checks eligibility.
    * `KVCacheCopyOp`: Dataclass describing a sub-block KV data copy:
      `(group_id, src_block_id, dst_block_id, num_tokens)`.
@@ -93,8 +94,9 @@ so that each prefill does not span multiple blocks.
    * `RBLNScheduler.__init__`: Creates `RBLNKVCacheManager` when prefix caching is
      enabled and `can_use_sub_block_caching()` passes.
    * `RBLNScheduler.schedule`: Returns `RBLNSchedulerOutput`, draining copy ops from the manager.
-   * `RBLNScheduler.update_from_output`:
-     Triggers `do_pending_indexing` and releases source-block refs from copy ops.
+   * `RBLNScheduler.update_from_output`: Calls `super().update_from_output()`
+     (updates `num_computed_tokens`, `free()`s finished requests),
+     then `do_pending_indexing` and releases source-block refs from copy ops.
 * `vllm_rbln.v1.worker.rbln_model_runner`
    * `_process_kv_cache_copy_ops`: Copies KV data between blocks before the forward pass.
 
@@ -129,14 +131,19 @@ This ensures that concurrent prefills in the same scheduling step cannot match
 sub-blocks whose KV data has not yet been computed and thus should not be copied.
 
 During `allocate_slots`, requests are queued for deferred indexing.
-`RBLNScheduler.update_from_output` calls `do_pending_indexing`
-(before `super().update_from_output()`, which may `free()` the requests),
-inserting each newly cached full block's sub-block hashes into the per-group `SubBlockIndex`.
-Each hash at depth *k* maps to the set of physical blocks whose first *k* sub-blocks match.
+`RBLNScheduler.update_from_output` first calls `super().update_from_output()`
+(which updates `num_computed_tokens` and `free()`s finished requests),
+then calls `do_pending_indexing` for the remaining running requests.
 
-The last partial block of a request (the one that doesn't fill a full block)
-is indexed during `free()` per group and given a synthetic `block_hash` so
-upstream's LRU preserves it for potential reuse.
+`free()` consumes its own pending-indexing entry, indexes all blocks
+(full + partial), and assigns a synthetic `block_hash` to the partial block
+so upstream's LRU preserves it for potential reuse.
+
+`do_pending_indexing` processes each remaining running request:
+1. Indexes newly cached full blocks' sub-block hashes into the per-group `SubBlockIndex`.
+   Each hash at depth *k* maps to the set of physical blocks whose first *k* sub-blocks match.
+2. Indexes complete sub-blocks within the request's current partial block,
+   making them visible for matching by new requests.
 
 ### Step 3: Partial-match lookup
 
@@ -183,12 +190,13 @@ kv_cache[:, dst_block_id, :, :, :num_tokens, :] = \
 
 ### Block lifecycle
 
-- **Caching full blocks**: Sub-block indexing is deferred from `allocate_slots`
-  to `do_pending_indexing` (called in `update_from_output`, after `execute_model`
-  but before `free()`).
-- **Caching partial blocks**: Indexed during `free()`. A synthetic
-  `block_hash` is assigned so the block stays in the upstream LRU rather than
-  being immediately reused.
+- **Indexing running requests**:
+  Scheduled by `allocate_slots`, then executed by `do_pending_indexing`
+  (called after `super().update_from_output()`).
+  Indexes both full blocks and complete sub-blocks within partial blocks.
+- **Indexing finished requests**: `free()` consumes the pending-indexing
+  entry, indexes all blocks, and assigns a synthetic `block_hash` to the
+  partial block so the upstream LRU preserves it.
 - **Eviction**: A monkey-patched eviction hook calls
   `SubBlockIndex.pop()` whenever the upstream evicts a cached block.
 - **Reset**: `reset_prefix_cache()` clears all sub-block indices and pending
@@ -218,11 +226,6 @@ or patch existing connectors as needed.
 
 ## Limitations
 
-- To simplify `SubBlockIndex` maintenance,
-  **the last partial block of a running request is not indexed until `free()`.**
-  Eagerly indexing partial blocks of running requests would require
-  updating/replacing index entries on each sub-block boundary.
-  The reduction in cache hit rate caused by this is negligible.
 - KV cache copy implementation (`_copy_kv_cache`) limitations
     - **Per-tensor copy not yet implemented.**
       Currently it copies for all layers, so it is not applicable to multi-group setups.

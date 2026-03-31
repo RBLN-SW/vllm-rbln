@@ -143,10 +143,7 @@ class SubBlockHasher:
 
 class SubBlockIndex:
     """Index mapping sub-block hashes to physical block IDs that contain that
-    sub-block as a prefix.
-
-    Invariant: cached ↔ indexed.
-    """
+    sub-block as a prefix."""
 
     def __init__(self) -> None:
         # sub_block_hash → set of block IDs with that prefix cached.
@@ -154,11 +151,16 @@ class SubBlockIndex:
         # Reverse index: block_id → list of sub-block hashes (for removal).
         self._block_hashes: dict[int, list[BlockHash]] = {}
 
-    def insert(self, block_id: int, sub_block_hashes: list[BlockHash]) -> None:
-        """Index a block's sub-block hashes."""
-        assert block_id not in self._block_hashes
-        self._block_hashes[block_id] = sub_block_hashes
-        for h in sub_block_hashes:
+    def update(self, block_id: int, sub_block_hashes: list[BlockHash]) -> None:
+        """Index or extend a block's sub-block hashes (idempotent).
+
+        If the block is not yet indexed, inserts all hashes.
+        If already indexed, appends any new hashes beyond what is recorded.
+        """
+        existing = self._block_hashes.setdefault(block_id, [])
+        for i in range(len(existing), len(sub_block_hashes)):
+            h = sub_block_hashes[i]
+            existing.append(h)
             self._hash_to_blocks.setdefault(h, set()).add(block_id)
 
     def pop(self, block_id: int) -> None:
@@ -519,23 +521,28 @@ class RBLNKVCacheManager(KVCacheManager):
     def do_pending_indexing(self) -> None:
         """Index sub-blocks for requests whose indexing was deferred.
 
-        Must be called **after** execute_model so that the new KV data is
-        written before the index entries become visible to subsequent
-        scheduling steps.
+        Must be called **after** ``super().update_from_output()`` so that
+        ``num_computed_tokens`` is up-to-date and ``free()`` has already
+        consumed its own pending entries.
         """
         for request, num_full_blocks_before in self._pending_indexing.values():
             self._index_newly_cached_blocks(request, num_full_blocks_before)
+            self._index_partial_block(request, False)
         self._pending_indexing.clear()
 
     def free(self, request: Request) -> None:
-        """Free blocks and clean up sub-block state for a request."""
-        # Before freeing, cache the last partial block's sub-blocks in the
-        # index so future requests can reuse them via sub-block matching.
-        self._index_partial_block(request)
+        """Index any not-yet-indexed sub-blocks, free blocks, and clean up
+        sub-block state for the request."""
+        # Consume this request's pending indexing entry and index all blocks
+        # (full + partial) before releasing them.
+        pending = self._pending_indexing.pop(request.request_id, None)
+        if pending is not None:
+            _, num_full_blocks_before = pending
+            self._index_newly_cached_blocks(request, num_full_blocks_before)
+        self._index_partial_block(request, True)
 
         # Clean up request states
         del self._req_sub_hashes[request.request_id]
-        self._pending_indexing.pop(request.request_id, None)
         super().free(request)
 
     def reset_prefix_cache(self) -> bool:
@@ -588,10 +595,9 @@ class RBLNKVCacheManager(KVCacheManager):
                 # NOTE: For a new request, num_full_blocks_before is zero
                 # because num_computed_tokens is set after scheduling.
                 # So this doesn't tell us which blocks are newly cached.
-                # So we also check that the block is not already indexed.
-                if blk.block_hash is not None and not gi.sub_block_index.contains(
-                    blk.block_id
-                ):
+                # _on_block_cached uses update() which is idempotent,
+                # so re-processing already-indexed blocks is fine.
+                if blk.block_hash is not None:
                     self._on_block_cached(request, blk_idx, blk, gi)
 
     def _on_block_cached(
@@ -609,11 +615,15 @@ class RBLNKVCacheManager(KVCacheManager):
         if sub_end <= sub_start:
             return
         blk_sub_hashes = sub_hashes[sub_start:sub_end]
-        gi.sub_block_index.insert(blk.block_id, blk_sub_hashes)
+        gi.sub_block_index.update(blk.block_id, blk_sub_hashes)
 
-    def _index_partial_block(self, request: Request) -> None:
-        """Index sub-blocks of the last partial block per group
-        and mark it as cached so the upstream LRU preserves it."""
+    def _index_partial_block(self, request: Request, mark_cached: bool) -> None:
+        """Index sub-blocks of the last partial block per group.
+
+        Args:
+            mark_cached: Whether to assign a synthetic ``block_hash`` so the
+                upstream LRU preserves the block.
+        """
         num_computed_tokens = request.num_computed_tokens
         sub_hashes = self._get_or_compute_sub_hashes(request)
         blocks = self.coordinator.get_blocks(request.request_id)
@@ -641,24 +651,25 @@ class RBLNKVCacheManager(KVCacheManager):
             partial_sub_hashes = sub_hashes[sub_start:sub_end]
 
             # Index in the group's sub-block index.
-            gi.sub_block_index.insert(blk.block_id, partial_sub_hashes)
+            gi.sub_block_index.update(blk.block_id, partial_sub_hashes)
 
-            # Give the block a synthetic block_hash so the upstream block pool
-            # keeps it in the LRU cache instead of immediately reusing it.
-            # The actual value doesn't matter as long as it's unique so that it
-            # doesn't collide with any real full-block hash.
-            synthetic_hash = make_block_hash_with_group_id(
-                BlockHash(
-                    b"partial_block_"
-                    + str(blk.block_id).encode("ascii")
-                    + b"_"
-                    + partial_sub_hashes[-1]
-                ),
-                gid,
-            )
-            assert blk.block_hash is None
-            blk.block_hash = synthetic_hash
-            self.block_pool.cached_block_hash_to_block.insert(synthetic_hash, blk)
+            if mark_cached:
+                # Give the block a synthetic block_hash so the upstream block pool
+                # keeps it in the LRU cache instead of immediately reusing it.
+                # The actual value doesn't matter as long as it' unique so that it
+                # doesn't collide with any real full-block hash.
+                synthetic_hash = make_block_hash_with_group_id(
+                    BlockHash(
+                        b"partial_block_"
+                        + str(blk.block_id).encode("ascii")
+                        + b"_"
+                        + partial_sub_hashes[-1]
+                    ),
+                    gid,
+                )
+                assert blk.block_hash is None
+                blk.block_hash = synthetic_hash
+                self.block_pool.cached_block_hash_to_block.insert(synthetic_hash, blk)
 
     def _on_block_evicted(self, block_id: int) -> None:
         """Called when a block is evicted — remove from index."""
