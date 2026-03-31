@@ -281,6 +281,19 @@ class RBLNOptimumScheduler(Scheduler):
                 if req_index > 0:
                     break
 
+                # try to promote blocked statuses while traversing skipped queue.
+                if self._is_blocked_waiting_status(
+                    request.status
+                ) and not self._try_promote_blocked_waiting_request(request):
+                    if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+                        logger.debug(
+                            "%s is still in WAITING_FOR_REMOTE_KVS state.",
+                            request_id,
+                        )
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
+
                 # Check that adding the request still respects the max_loras
                 # constraint.
                 if (
@@ -567,6 +580,9 @@ class RBLNOptimumScheduler(Scheduler):
         request: Request,
         timestamp: float,
     ) -> None:
+        assert request.status == RequestStatus.RUNNING, (
+            "Only running requests can be preempted"
+        )
         preempted_blocks = self.kv_cache_manager.get_block_ids(request.request_id)[0]
         self.kv_cache_manager.free(request, preemption=True)
         if not self.cache_config.enable_prefix_caching:
