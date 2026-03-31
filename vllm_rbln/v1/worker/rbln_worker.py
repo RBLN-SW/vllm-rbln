@@ -382,6 +382,8 @@ class RBLNWorker(WorkerBase):
             or not envs.VLLM_RBLN_ENABLE_WARM_UP
         ):
             logger.warning("skipping compile_or_warm_up_model")
+
+            self._ensure_rbln_cpu_affinity_after_warmup()
             return
 
         try:
