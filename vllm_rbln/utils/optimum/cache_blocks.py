@@ -135,6 +135,7 @@ def sync_num_blocks(vllm_config: VllmConfig, num_blocks: int) -> None:
         adjusted_num_blocks = num_blocks * blk_ratio + 1
     else:
         adjusted_num_blocks = (num_blocks - 1) * blk_ratio + 1
+
     vllm_config.cache_config.num_gpu_blocks = adjusted_num_blocks
 
     if vllm_config.cache_config.num_gpu_blocks_override is not None:
