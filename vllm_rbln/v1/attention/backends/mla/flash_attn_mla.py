@@ -276,7 +276,7 @@ class RBLNFlashAttnMLAImpl(MLACommonBaseImpl[RBLNFlashAttentionMetadata]):
         self.is_causal = envs.VLLM_RBLN_FLASH_CAUSAL_ATTN
         self.is_batch_attention_opt = envs.VLLM_RBLN_BATCH_ATTN_OPT
         self.is_normal = False
-        self.scale = torch.tensor([scale], device=self.device)
+        self.scale = torch.tensor(scale, device=self.device)
 
         if not self.is_batch_attention_opt:
             raise NotImplementedError(
