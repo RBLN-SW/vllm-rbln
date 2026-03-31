@@ -110,10 +110,10 @@ def create_scheduler(
             KVCacheGroupSpec(
                 ["layer"],
                 FullAttentionSpec(
-                    block_size=block_size, 
+                    block_size=block_size,
                     num_kv_heads=1,
                     head_size=1,
-                    dtype=torch.float32
+                    dtype=torch.float32,
                 ),
             )
         ],
