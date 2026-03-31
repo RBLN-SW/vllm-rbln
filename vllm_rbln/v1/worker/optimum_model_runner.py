@@ -451,8 +451,6 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
             is_prompt=is_prefill,
             dummy_block=scheduler_output.dummy_block,
         )
-        # print("@@ num_scheduled_tokens_np", num_scheduled_tokens_np)
-        # print("type", type(num_scheduled_tokens_np))
         return model_input, num_scheduled_tokens_np
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
