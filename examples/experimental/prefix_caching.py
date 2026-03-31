@@ -233,7 +233,12 @@ def main():
 
     # Destroy the LLM object and free up the GPU memory.
     del regular_llm
-    cleanup_dist_env_and_memory()
+    try:
+        cleanup_dist_env_and_memory()
+    except RuntimeError as e:
+        # ignore error when not using torch-rbln
+        if "Cannot access accelerator device when none is available" not in str(e):
+            raise
 
     # Create an LLM with prefix caching enabled.
     args.enable_prefix_caching = True
