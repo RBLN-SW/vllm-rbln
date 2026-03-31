@@ -71,8 +71,8 @@ def paged_flash_causal_mla_naive_prefill_impl(
     """
     Expected tensor shapes:
     - q: [batch, num_heads, num_tokens, _ ]
-    - kv_c_normed: [batch, 1, num_tokens, kv_lora_rank]
-    - k_pe: [batch, 1, num_tokens, qk_rope_head_dim]
+    - kv_c_normed: [batch, num_tokens, kv_lora_rank]
+    - k_pe: [batch, num_tokens, qk_rope_head_dim]
     - kv_cache: [num_blocks, block_size, num_kv_heads(=kv_lora_rank+qk_rope_head_dim)]
       Key and value cache
     - seq_idx: [batch, num_partitions]
@@ -333,7 +333,7 @@ class RBLNFlashAttnMLAImpl(MLACommonBaseImpl[RBLNFlashAttentionMetadata]):
         Returns:
             attn_out: (batch_size, seq_len, num_heads * v_head_dim), contiguous layout.
         """
-        b_size, q_len, num_heads, _ = q.size()
+        b_size, q_len, _, _ = q.size()
 
         decode_q_nope, decode_q_pe = q.split(
             [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
@@ -346,10 +346,7 @@ class RBLNFlashAttnMLAImpl(MLACommonBaseImpl[RBLNFlashAttentionMetadata]):
         decode_ql_nope = torch.matmul(decode_q_nope, self.W_UK_T)
         decode_q_pe = decode_q_pe.transpose(1, 2)
         q = torch.cat([decode_ql_nope, decode_q_pe], dim=-1)
-
-        # Make a num_head dim for broadcasting matmul in custom kernel
-        k_pe = k_pe.view(b_size, 1, q_len, self.qk_rope_head_dim)
-        kv_c_normed = kv_c_normed.view(b_size, 1, q_len, self.kv_lora_rank)
+        k_pe = k_pe.squeeze(2)
 
         if self.sliding_window is not None:
             raise NotImplementedError(
