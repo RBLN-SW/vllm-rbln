@@ -88,7 +88,6 @@ def create_scheduler(
 
     cache_config = CacheConfig(
         block_size=block_size,
-        swap_space=0,
         cache_dtype="auto",
         enable_prefix_caching=enable_prefix_caching,
     )
