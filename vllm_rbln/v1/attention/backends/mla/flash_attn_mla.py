@@ -45,12 +45,12 @@ def _empty_mla_attention_output(
         raise NotImplementedError(
             "MLA attention is not supported for non-compile model"
         )
-    b, seq_len, num_heads, _ = q.shape
+    b, num_heads, seq_len, _ = q.shape
     kv_lora_rank = kv_c_normed.shape[-1]
     device = q.device
     dtype = q.dtype
     return torch.empty(
-        (b, seq_len, num_heads, kv_lora_rank), device=device, dtype=dtype
+        (b, num_heads, seq_len, kv_lora_rank), device=device, dtype=dtype
     )
 
 
@@ -81,7 +81,7 @@ def paged_flash_causal_mla_naive_prefill_impl(
                     [batch, num_partitions] for decode
     - scale: []
     Returns:
-        Tensor: attn_output [batch, seq_len, num_heads, kv_lora_rank]
+        Tensor: attn_output [batch, num_heads, seq_len, kv_lora_rank]
 
     batch size is assumed to be 1 for prefill.
     """
@@ -288,21 +288,22 @@ class RBLNFlashAttnMLAImpl(MLACommonBaseImpl[RBLNFlashAttentionMetadata]):
         if hasattr(self, "W_UK_T"):
             #  (N, P, L) -> (1, N, P, L) for batched matmul
             self.W_UK_T = self.W_UK_T.unsqueeze(0)
+        if hasattr(self, "W_UV"):
+            # (N, P, L) -> (1, N, P, L) for batched matmul
+            self.W_UV = self.W_UV.unsqueeze(0)
 
     def _v_up_proj(self, x: torch.Tensor):
         """V-up projection.
 
         Args:
-            x: torch.size([batch, num_tokens, num_heads, kv_lora_rank])
+            x: torch.size([batch, num_heads, seq_len, kv_lora_rank])
 
         Returns:
             torch.size([batch, num_tokens, num_heads * v_head_dim]) (contiguous)
         """
-        b_size, q_len, num_heads, kv_lora_rank = x.size()
-        x = x.reshape(b_size * q_len, num_heads, kv_lora_rank).transpose(0, 1)
-        # (num_heads, b_size * q_len, kv_lora_rank) x (num_heads,kv_lora_rank, v_head_dim) -> (num_heads, b_size * q_len, v_head_dim)
-        x = torch.bmm(x, self.W_UV)
-        x = x.transpose(0, 1).reshape(b_size, q_len, num_heads * self.v_head_dim)
+        b_size, num_heads, seq_len, _ = x.size()
+        x = torch.matmul(x, self.W_UV)
+        x = x.transpose(1, 2).reshape(b_size, seq_len, num_heads * self.v_head_dim)
         return x
 
     def forward(
@@ -418,7 +419,7 @@ class RBLNFlashAttnMLAImpl(MLACommonBaseImpl[RBLNFlashAttentionMetadata]):
                     # scale : torch.Size([])
 
         # Custom ops return [batch, seq, num_heads, kv_lora_rank] (MLA / o_proj layout).
-        expected = (b_size, q_len, self.num_heads, self.kv_lora_rank)
+        expected = (b_size, self.num_heads, q_len, self.kv_lora_rank)
         if attn_output.shape != expected:
             raise ValueError(
                 f"MLA attention output shape {tuple(attn_output.shape)} != expected "
