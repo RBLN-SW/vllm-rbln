@@ -342,8 +342,7 @@ class RBLNFlashAttnMLAImpl(MLACommonBaseImpl[RBLNFlashAttentionMetadata]):
         # Change bmm -> matmul for custom kernel compatibility
         decode_q_nope = decode_q_nope.transpose(1, 2)
         # (B, N, T, P) @ (1, N, P, L): leading 1 broadcasts over batch B
-        W_batched = self.W_UK_T.unsqueeze(0)
-        decode_ql_nope = torch.matmul(decode_q_nope, W_batched)
+        decode_ql_nope = torch.matmul(decode_q_nope, self.W_UK_T)
         decode_q_pe = decode_q_pe.transpose(1, 2)
         q = torch.cat([decode_ql_nope, decode_q_pe], dim=-1)
 
