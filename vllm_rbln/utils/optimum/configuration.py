@@ -39,6 +39,20 @@ from vllm_rbln.utils.optimum.registry import (
 logger = init_logger(__name__)
 
 
+def get_invalid_leaf_keys(dict_rbln_config, prefix=""):
+    """Return a list of leaf keys that are not 'device'."""
+    target_key = "device"
+    invalid_keys = []
+    for key, value in dict_rbln_config.items():
+        full_key = f"{prefix}.{key}" if prefix else key
+        if isinstance(value, dict):
+            invalid_keys.extend(get_invalid_leaf_keys(value, prefix=full_key))
+        else:
+            if key != target_key:
+                invalid_keys.append(full_key)
+    return invalid_keys
+
+
 def is_qwen3_pooling(
     vllm_config: VllmConfig,
 ) -> bool:
@@ -141,7 +155,18 @@ def sync_with_rbln_config(vllm_config: VllmConfig) -> None:
     except Exception as e:
         raise RuntimeError("Failed to get RBLN config: %s", e) from e
 
+    additional_rbln_config = vllm_config.additional_config.get("rbln_config", {})
+    # If the pre-compiled model exists, rbln_config is not None
     if rbln_config is not None:
+        invalid_keys = get_invalid_leaf_keys(additional_rbln_config)
+        if invalid_keys:
+            raise RuntimeError(
+                "For now, we only support 'device' as a configurable key "
+                "in rbln_config passed through additional_config "
+                "for pre-compiled optimum models. "
+                f"Got unsupported keys: {invalid_keys}"
+            )
+
         (
             num_blocks,
             batch_size,
@@ -158,4 +183,8 @@ def sync_with_rbln_config(vllm_config: VllmConfig) -> None:
             prefill_chunk_size,
         )
     else:
+        assert len(additional_rbln_config) == 0, (
+            "For now, we don't support passing rbln_config "
+            "through additional_config for compilation yet."
+        )
         prepare_vllm_for_compile(vllm_config)
