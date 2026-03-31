@@ -70,9 +70,9 @@ def paged_flash_causal_mla_naive_prefill_impl(
 ) -> torch.Tensor:
     """
     Expected tensor shapes:
-    - q: [batch, num_tokens, num_heads, _ ]
-    - kv_c_normed: [batch, num_tokens, kv_lora_rank]
-    - k_pe: [batch, num_tokens, qk_rope_head_dim]
+    - q: [batch, num_heads, num_tokens, _ ]
+    - kv_c_normed: [batch, 1, num_tokens, kv_lora_rank]
+    - k_pe: [batch, 1, num_tokens, qk_rope_head_dim]
     - kv_cache: [num_blocks, block_size, num_kv_heads(=kv_lora_rank+qk_rope_head_dim)]
       Key and value cache
     - seq_idx: [batch, num_partitions]
@@ -283,6 +283,12 @@ class RBLNFlashAttnMLAImpl(MLACommonBaseImpl[RBLNFlashAttentionMetadata]):
                 "Batch attention non-optimization is not supported for MLA"
             )
 
+    def process_weights_after_loading(self, act_dtype: torch.dtype):
+        super().process_weights_after_loading(act_dtype)
+        if hasattr(self, "W_UK_T"):
+            #  (N, P, L) -> (1, N, P, L) for batched matmul
+            self.W_UK_T = self.W_UK_T.unsqueeze(0)
+
     def _v_up_proj(self, x: torch.Tensor):
         """V-up projection.
 
@@ -331,22 +337,19 @@ class RBLNFlashAttnMLAImpl(MLACommonBaseImpl[RBLNFlashAttentionMetadata]):
         decode_q_nope, decode_q_pe = q.split(
             [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
         )
-        decode_q_nope = decode_q_nope.view(b_size * q_len, num_heads, -1).transpose(
-            0, 1
-        )
 
-        # decode_q_nope: self.num_heads, b_size * q_len, self.qk_nope_head_dim
-        # self.W_UK_T: self.qk_nope_head_dim, self.num_heads, self.kv_lora_rank,
-
-        # Multiply (N, B, P) x (N, P, L) -> (N, B, L)
-        decode_ql_nope = (
-            torch.bmm(decode_q_nope, self.W_UK_T)
-            .transpose(0, 1)
-            .view(b_size, q_len, num_heads, -1)
-        )
-
+        # RBLN Fix:
+        # Change bmm -> matmul for custom kernel compatibility
+        decode_q_nope = decode_q_nope.transpose(1, 2)
+        # (B, N, T, P) @ (1, N, P, L): leading 1 broadcasts over batch B
+        W_batched = self.W_UK_T.unsqueeze(0)
+        decode_ql_nope = torch.matmul(decode_q_nope, W_batched)
+        decode_q_pe = decode_q_pe.transpose(1, 2)
         q = torch.cat([decode_ql_nope, decode_q_pe], dim=-1)
-        k_pe = k_pe.squeeze(2)
+
+        # Make a num_head dim for broadcasting matmul in custom kernel
+        k_pe = k_pe.view(b_size, 1, q_len, self.qk_rope_head_dim)
+        kv_c_normed = kv_c_normed.view(b_size, 1, q_len, self.kv_lora_rank)
 
         if self.sliding_window is not None:
             raise NotImplementedError(
