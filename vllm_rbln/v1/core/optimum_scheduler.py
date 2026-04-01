@@ -470,27 +470,7 @@ class RBLNOptimumScheduler(Scheduler):
                 token_budget -= num_new_tokens
                 req_index += 1
 
-                # Speculative decode related.
-                if request.spec_token_ids:
-                    num_scheduled_spec_tokens = (
-                        num_new_tokens
-                        + request.num_computed_tokens
-                        - request.num_tokens
-                        - request.num_output_placeholders
-                    )
-                    if num_scheduled_spec_tokens > 0:
-                        spec_token_ids = request.spec_token_ids
-                        if len(spec_token_ids) > num_scheduled_spec_tokens:
-                            spec_token_ids = spec_token_ids[:num_scheduled_spec_tokens]
-                        scheduled_spec_decode_tokens[request.request_id] = (
-                            spec_token_ids
-                        )
-
-                    # New spec tokens will be set in `update_draft_token_ids` before the
-                    # next step when applicable.
-                    request.spec_token_ids = []
-
-        #  [skip] encoder-related tasks
+        # [skip] speculative decoding, encoder-related tasks
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
