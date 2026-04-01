@@ -50,11 +50,18 @@ class RBLNSlidingWindowManager(SingleTypeKVCacheManager):
         request_id: str,
         num_tokens: int,
         new_computed_blocks: Sequence[KVCacheBlock],
+        total_computed_tokens: int,
+        num_tokens_main_model: int,
     ) -> int:
+        # Single physical block per request; num_tokens* args match upstream
+        # SingleTypeKVCacheManager (spec-decode / prefix-cache accounting).
         return 0 if self.req_to_blocks[request_id] else 1
 
     def allocate_new_blocks(
-        self, request_id: str, num_tokens: int
+        self,
+        request_id: str,
+        num_tokens: int,
+        num_tokens_main_model: int,
     ) -> list[KVCacheBlock]:
         if self.req_to_blocks[request_id]:
             return []
