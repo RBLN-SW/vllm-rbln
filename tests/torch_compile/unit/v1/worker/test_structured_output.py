@@ -84,9 +84,19 @@ class TestGrammarBitmaskApplication:
                 "vllm_rbln.v1.worker.rbln_model_runner.apply_grammar_bitmask"
             ) as mock_apply,
             patch.object(runner, "_sample", return_value=MagicMock()) as mock_sample,
-            patch.object(runner, "_bookkeeping_sync", return_value=(
-                0, None, [[1]], {}, ["req-0"], {"req-0": 0}, [],
-            )),
+            patch.object(
+                runner,
+                "_bookkeeping_sync",
+                return_value=(
+                    0,
+                    None,
+                    [[1]],
+                    {},
+                    ["req-0"],
+                    {"req-0": 0},
+                    [],
+                ),
+            ),
             patch.object(runner, "is_prefills", return_value=[False]),
         ):
             runner.sample_tokens(grammar_output)
@@ -121,9 +131,19 @@ class TestGrammarBitmaskApplication:
                 "vllm_rbln.v1.worker.rbln_model_runner.apply_grammar_bitmask"
             ) as mock_apply,
             patch.object(runner, "_sample", return_value=MagicMock()),
-            patch.object(runner, "_bookkeeping_sync", return_value=(
-                0, None, [[1]], {}, ["req-0"], {"req-0": 0}, [],
-            )),
+            patch.object(
+                runner,
+                "_bookkeeping_sync",
+                return_value=(
+                    0,
+                    None,
+                    [[1]],
+                    {},
+                    ["req-0"],
+                    {"req-0": 0},
+                    [],
+                ),
+            ),
             patch.object(runner, "is_prefills", return_value=[False]),
         ):
             runner.sample_tokens(None)
@@ -159,9 +179,19 @@ class TestGrammarBitmaskApplication:
                 "vllm_rbln.v1.worker.rbln_model_runner.apply_grammar_bitmask"
             ) as mock_apply,
             patch.object(runner, "_sample", return_value=MagicMock()),
-            patch.object(runner, "_bookkeeping_sync", return_value=(
-                0, None, [], {}, [], {}, [],
-            )),
+            patch.object(
+                runner,
+                "_bookkeeping_sync",
+                return_value=(
+                    0,
+                    None,
+                    [],
+                    {},
+                    [],
+                    {},
+                    [],
+                ),
+            ),
             patch.object(runner, "is_prefills", return_value=[False]),
         ):
             runner.sample_tokens(grammar_output)
@@ -205,15 +235,16 @@ class TestApplyGrammarBitmask:
         # Patch both xgr and pin_memory (not available on CPU-only systems)
         with (
             patch("vllm.v1.structured_output.utils.xgr") as mock_xgr,
-            patch("torch.tensor", wraps=lambda *a, **kw: torch.as_tensor(
-                *a, **{k: v for k, v in kw.items() if k != "pin_memory"}
-            )),
+            patch(
+                "torch.tensor",
+                wraps=lambda *a, **kw: torch.as_tensor(
+                    *a, **{k: v for k, v in kw.items() if k != "pin_memory"}
+                ),
+            ),
         ):
             from vllm.v1.structured_output.utils import apply_grammar_bitmask
 
-            apply_grammar_bitmask(
-                scheduler_output, grammar_output, input_batch, logits
-            )
+            apply_grammar_bitmask(scheduler_output, grammar_output, input_batch, logits)
 
         mock_xgr.apply_token_bitmask_inplace.assert_called_once()
         call_args = mock_xgr.apply_token_bitmask_inplace.call_args
@@ -253,15 +284,16 @@ class TestApplyGrammarBitmask:
 
         with (
             patch("vllm.v1.structured_output.utils.xgr") as mock_xgr,
-            patch("torch.tensor", wraps=lambda *a, **kw: torch.as_tensor(
-                *a, **{k: v for k, v in kw.items() if k != "pin_memory"}
-            )),
+            patch(
+                "torch.tensor",
+                wraps=lambda *a, **kw: torch.as_tensor(
+                    *a, **{k: v for k, v in kw.items() if k != "pin_memory"}
+                ),
+            ),
         ):
             from vllm.v1.structured_output.utils import apply_grammar_bitmask
 
-            apply_grammar_bitmask(
-                scheduler_output, grammar_output, input_batch, logits
-            )
+            apply_grammar_bitmask(scheduler_output, grammar_output, input_batch, logits)
 
         mock_xgr.apply_token_bitmask_inplace.assert_called_once()
         call_args = mock_xgr.apply_token_bitmask_inplace.call_args
@@ -319,9 +351,7 @@ class TestSampleTokensEarlyReturn:
         runner.kv_connector_output = None
         runner.use_async_scheduling = True
 
-        with patch(
-            "vllm_rbln.v1.worker.rbln_model_runner.get_pp_group"
-        ) as mock_pp:
+        with patch("vllm_rbln.v1.worker.rbln_model_runner.get_pp_group") as mock_pp:
             mock_pp.return_value.world_size = 1
             result = runner.sample_tokens(None)
 
@@ -371,9 +401,19 @@ class TestLogitsDtypeConversion:
                 side_effect=capture_dtype,
             ),
             patch.object(runner, "_sample", return_value=MagicMock()) as mock_sample,
-            patch.object(runner, "_bookkeeping_sync", return_value=(
-                0, None, [[1]], {}, ["req-0"], {"req-0": 0}, [],
-            )),
+            patch.object(
+                runner,
+                "_bookkeeping_sync",
+                return_value=(
+                    0,
+                    None,
+                    [[1]],
+                    {},
+                    ["req-0"],
+                    {"req-0": 0},
+                    [],
+                ),
+            ),
             patch.object(runner, "is_prefills", return_value=[False]),
         ):
             runner.sample_tokens(grammar_output)

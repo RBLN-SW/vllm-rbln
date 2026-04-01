@@ -72,9 +72,7 @@ class TestRegexStructuredOutput:
                 "Example result: alan.turing@enigma.com\n"
             ),
             sampling_params=SamplingParams(
-                structured_outputs=StructuredOutputsParams(
-                    regex=r"\w+@\w+\.com\n"
-                )
+                structured_outputs=StructuredOutputsParams(regex=r"\w+@\w+\.com\n")
             ),
         )
         text = outputs[0].outputs[0].text
@@ -212,9 +210,7 @@ What is the weather in New York City?
         )
 
         # Extract and validate JSON between tags
-        match = re.search(
-            r"<function=get_weather>(.*?)</function>", text, re.DOTALL
-        )
+        match = re.search(r"<function=get_weather>(.*?)</function>", text, re.DOTALL)
         assert match is not None, f"Could not extract function call from: {text!r}"
         params = json.loads(match.group(1))
         assert "city" in params
