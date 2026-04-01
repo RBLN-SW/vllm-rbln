@@ -83,7 +83,7 @@ class TestGrammarBitmaskApplication:
             patch(
                 "vllm_rbln.v1.worker.rbln_model_runner.apply_grammar_bitmask"
             ) as mock_apply,
-            patch.object(runner, "_sample", return_value=MagicMock()) as mock_sample,
+            patch.object(runner, "_sample", return_value=MagicMock()),
             patch.object(
                 runner,
                 "_bookkeeping_sync",
