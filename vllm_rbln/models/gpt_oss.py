@@ -42,7 +42,11 @@ if True:
         loaded_params: set[str] = set()
 
         mxfp4_block = 32
-        use_ep = self.parallel_config.enable_expert_parallel
+        use_ep = (
+            get_dp_group().world_size * get_tensor_model_parallel_world_size() > 1
+            and self.parallel_config.enable_expert_parallel
+        )
+
         num_experts = self.config.num_local_experts
 
         # In MoE, we need to flatten the tensor parallel size across the data
