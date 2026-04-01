@@ -18,7 +18,7 @@ import torch.nn as nn
 import vllm.envs as envs
 from vllm.attention.backends.abstract import AttentionBackend, AttentionType
 from vllm.attention.backends.registry import AttentionBackendEnum
-from vllm.attention.layer import Attention, _init_kv_cache_quant
+from vllm.attention.layer import Attention, _init_kv_cache_quant, MLAAttention
 from vllm.attention.selector import get_attn_backend
 from vllm.attention.utils.kv_sharing_utils import validate_kv_sharing_target
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
@@ -35,6 +35,73 @@ from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 
 # @FIXME(RBLN): We hope to remove the Custom Attention forward.
 # The original vLLM forward function will be used in the future.
+
+_original_mla_attention_init = MLAAttention.__init__
+
+
+def __custom_mla_attention_init__(self, *args, **kwargs) -> None:
+    _original_mla_attention_init(self, *args, **kwargs)
+
+    # Align with Attention: index into attn_metadata.kv_caches for RBLN export/bind.
+    self.layer_index = extract_layer_index(self.layer_name)
+    vllm_config = get_current_vllm_config()
+    parallel_config = vllm_config.parallel_config
+    model_config = vllm_config.model_config
+    start, _end = model_config.get_layers_start_end_indices(parallel_config)
+    self.layer_index -= start
+
+
+def custom_mla_attention_forward(
+    self,
+    q: torch.Tensor,
+    kv_c_normed: torch.Tensor,
+    k_pe: torch.Tensor,
+    output_shape: torch.Size | None = None,
+) -> torch.Tensor:
+    if self.calculate_kv_scales:
+        torch.ops.vllm.maybe_calc_kv_scales(q, kv_c_normed, k_pe, self.layer_name)
+
+    if self.use_direct_call:
+        forward_context: ForwardContext = get_forward_context()
+        attn_metadata = forward_context.attn_metadata
+        if isinstance(attn_metadata, dict):
+            attn_metadata = attn_metadata[self.layer_name]
+        assert attn_metadata.kv_caches is not None
+        assert self.layer_index < len(attn_metadata.kv_caches)
+        self_kv_cache = attn_metadata.kv_caches[self.layer_index]
+
+        if self.attn_backend.accept_output_buffer:
+            output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
+            self.impl.forward(
+                self,
+                q,
+                kv_c_normed,
+                k_pe,
+                self_kv_cache,
+                attn_metadata,
+                output=output,
+            )
+            return output
+        return self.impl.forward(
+            self, q, kv_c_normed, k_pe, self_kv_cache, attn_metadata
+        )
+
+    if self.attn_backend.accept_output_buffer:
+        output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
+        torch.ops.vllm.unified_mla_attention_with_output(
+            q,
+            kv_c_normed,
+            k_pe,
+            output,
+            self.layer_name,
+        )
+        return output
+    return torch.ops.vllm.unified_mla_attention(
+        q,
+        kv_c_normed,
+        k_pe,
+        self.layer_name,
+    )
 
 
 def __custom_init__(
@@ -313,3 +380,6 @@ def custom_get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
 Attention.__init__ = __custom_init__
 Attention.forward = custom_attention_forward
 Attention.get_kv_cache_spec = custom_get_kv_cache_spec
+
+MLAAttention.__init__ = __custom_mla_attention_init__
+MLAAttention.forward = custom_mla_attention_forward
