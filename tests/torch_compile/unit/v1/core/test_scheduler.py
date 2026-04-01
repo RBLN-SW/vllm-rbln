@@ -14,7 +14,7 @@
 
 from vllm.v1.request import RequestStatus
 
-from tests.torch_compile.v1.core.utils import (
+from .utils import (
     create_requests,
     create_runner_output,
     create_scheduler,
@@ -86,6 +86,44 @@ def test_schedule_chunked_prefill():
     assert len(output.finished_req_ids) == 0
 
     assert output.num_scheduled_tokens[request.request_id] == 1
+
+
+def test_new_prefill_uses_full_budget_when_decode_running():
+    """When a decode request is running and a new prefill enters, the RBLN
+    scheduler kicks out the decode and gives the full token budget to the
+    prefill.  Before the fix, num_new_tokens was clipped to the
+    already-reduced token_budget (e.g. 127) instead of the restored
+    prefill_token_budget (128), causing an off-by-one in chunk positions.
+    """
+    max_num_batched_tokens = 128
+    scheduler = create_scheduler(
+        max_num_batched_tokens=max_num_batched_tokens,
+        max_num_seqs=4,
+        block_size=16,
+        num_blocks=10000,
+    )
+
+    # First request: short prompt so it finishes prefill in one chunk.
+    req_a = create_requests(num_requests=1, num_tokens=64, req_ids=["A"])[0]
+    scheduler.add_request(req_a)
+
+    # Prefill req_a (64 < 128, fits in one chunk).
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens[req_a.request_id] == 64
+    scheduler.update_from_output(output, create_runner_output(output, 1))
+
+    # req_a is now in decode.  Add req_b (long prompt, needs multiple chunks).
+    req_b = create_requests(num_requests=1, num_tokens=500, req_ids=["B"])[0]
+    scheduler.add_request(req_b)
+
+    # Schedule: running loop picks req_a (decode, 1 token), then new-request
+    # loop picks req_b (prefill) and kicks out req_a.
+    output = scheduler.schedule()
+
+    # req_a should have been kicked out (no mixed batching).
+    assert req_a.request_id not in output.num_scheduled_tokens
+    # req_b should get the FULL budget, not budget-minus-1.
+    assert output.num_scheduled_tokens[req_b.request_id] == max_num_batched_tokens
 
 
 def test_preempt_during_execution():

@@ -25,11 +25,12 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler, SamplerOutput
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
-from tests.torch_compile.v1.sample.utils import create_allowed_token_ids
 from vllm_rbln.v1.sample.rbln_rejection_sampler import (
     PLACEHOLDER_TOKEN_ID,
     RBLNRejectionSampler,
 )
+
+from .utils import create_allowed_token_ids
 
 DEVICE = "cpu"
 
