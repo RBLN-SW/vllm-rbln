@@ -2300,11 +2300,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         custom_logitsprocs: Sequence[Union[str, type[LogitsProcessor]]] = (
             tuple(logits_processors) if logits_processors is not None else ()
         )
+        max_model_len=max(self.max_model_len, self.max_encoder_len),
         dummy_input_batch = InputBatch(
             max_num_reqs=self.max_num_reqs,
             # We need to use the encoder length for encoder-decoer
             # because of KV cache for cross-attention.
-            max_model_len=max(self.max_model_len, self.max_encoder_len),
+            max_model_len=max_model_len,
             max_num_batched_tokens=self.max_num_tokens,
             device=self.device,
             pin_memory=self.pin_memory,
@@ -2327,7 +2328,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         )
 
         block_sizes, max_num_blocks = self._kv_block_sizes_and_max_num_blocks(
-            self.kv_cache_config
+            self.kv_cache_config, max_model_len
         )
         kernel_block_sizes = self.kernel_block_sizes
 
@@ -3845,12 +3846,11 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         raise ValueError(f"No common block size for {kv_manager_block_size}. ")
 
     def _kv_block_sizes_and_max_num_blocks(
-        self, kv_cache_config: KVCacheConfig
+        self, kv_cache_config: KVCacheConfig, max_model_len: int
     ) -> tuple[list[int], list[int]]:
         """Block sizes per KV group and per-request max block counts for InputBatch."""
         block_sizes: list[int] = []
         max_num_blocks: list[int] = []
-        max_model_len = max(self.max_model_len, self.max_encoder_len)
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             if isinstance(kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec):
                 continue
@@ -3880,10 +3880,10 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             kv_cache_config: The KV cache configuration.
             kernel_block_sizes: The kernel block sizes for each KV cache group.
         """
-        block_sizes, max_num_blocks = self._kv_block_sizes_and_max_num_blocks(
-            kv_cache_config
-        )
         max_model_len = max(self.max_model_len, self.max_encoder_len)
+        block_sizes, max_num_blocks = self._kv_block_sizes_and_max_num_blocks(
+            kv_cache_config, max_model_len
+        )
 
         if block_sizes != [self.cache_config.block_size] or kernel_block_sizes != [
             self.cache_config.block_size
