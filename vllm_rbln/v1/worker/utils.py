@@ -291,10 +291,12 @@ def compute_rbln_local_omp_cpuid(
     local_rank: int,
     parallel_config: ParallelConfig,
 ) -> str:
-    """CPU set string that ``set_cpu_affinity`` will use (comma list, ``all``, or ``nobind``)."""
+    """CPU set string that ``set_cpu_affinity`` will use (comma list, ``all``, or
+    ``nobind``)."""
     if envs.VLLM_RBLN_NUMA and platform.system() == "Linux":
         cpu_arch = current_platform.get_cpu_architecture()
         if cpu_arch in (CpuArchEnum.POWERPC, CpuArchEnum.S390X):
+            # For S390X/POWERPC SMT-8/4/2
             return get_autobind_cpu_ids(
                 rank,
                 local_rank,
@@ -302,6 +304,7 @@ def compute_rbln_local_omp_cpuid(
                 lambda cpus: [cpu for cpu in cpus if cpu.id % 8 < 4],
             )
         if cpu_arch == CpuArchEnum.X86:
+            # For x86 SMT-2, use 1 CPU per core
             return get_autobind_cpu_ids(
                 rank, local_rank, parallel_config, lambda cpus: cpus[:1]
             )
@@ -314,11 +317,12 @@ def get_rbln_planned_affinity_cpu_count(
     local_rank: int,
     parallel_config: ParallelConfig,
 ) -> int:
-    """Logical CPU count this rank will pin to after NUMA split (before ``sched_setaffinity``).
+    """Logical CPU count this rank will pin to after NUMA split (before
+    ``sched_setaffinity``).
 
-    Use this to size ``torch``/OpenMP threads before affinity is applied so thread counts
-    match the post-bind CPU mask. If binding is ``nobind``/``all``, uses the current
-    ``sched_getaffinity`` mask.
+    Use this to size ``torch``/OpenMP threads before affinity is applied so thread
+    counts match the post-bind CPU mask. If binding is ``nobind``/``all``, uses the
+    current ``sched_getaffinity`` mask.
     """
     local_omp_cpuid = compute_rbln_local_omp_cpuid(rank, local_rank, parallel_config)
     if local_omp_cpuid not in ("all", "nobind"):

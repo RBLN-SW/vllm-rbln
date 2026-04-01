@@ -307,12 +307,14 @@ class RBLNWorker(WorkerBase):
         self.model_runner.initialize_kv_cache(kv_cache_config)
 
     def _ensure_rbln_host_threads_before_compile(self) -> None:
-        """Set OpenMP / torch / numba threads before ``warm_up_model()`` without CPU affinity.
+        """Set OpenMP / torch / numba threads before ``warm_up_model()`` without
+        CPU affinity.
 
-        Affinity is applied later (after warm-up) so ``torch.compile`` / dummy compile sees
-        an unpinned CPU mask while thread counts and ``RBLN_NUM_THREADS`` match Dynamo.
-        Default thread count uses the same logical CPU count ``set_cpu_affinity`` will pin
-        to (NUMA / DP split), not the pre-split ``sched_getaffinity`` mask.
+        Affinity is applied later (after warm-up) so ``torch.compile`` / dummy
+        compile sees an unpinned CPU mask while thread counts and
+        ``RBLN_NUM_THREADS`` match Dynamo. Default thread count uses the same
+        logical CPU count ``set_cpu_affinity`` will pin to (NUMA / DP split),
+        not the pre-split ``sched_getaffinity`` mask.
         """
         if self._rbln_host_threads_before_compile_ready:
             return
@@ -346,7 +348,8 @@ class RBLNWorker(WorkerBase):
         self._rbln_host_threads_before_compile_ready = True
 
     def _ensure_rbln_cpu_affinity_after_warmup(self) -> None:
-        """Pin CPU affinity after ``warm_up_model()``; does not change torch thread counts."""
+        """Pin CPU affinity after ``warm_up_model()``; does not change torch
+        thread counts."""
         if self._rbln_cpu_affinity_applied:
             return
 
@@ -373,7 +376,7 @@ class RBLNWorker(WorkerBase):
                 )
             self.model_runner.prepare_dummy_run()
 
-        # Thread policy + RBLN_NUM_THREADS before any compile/warm-up; affinity comes after.
+        # Thread policy + RBLN_NUM_THREADS before compile/warm-up; affinity after.
         self._ensure_rbln_host_threads_before_compile()
 
         if (
