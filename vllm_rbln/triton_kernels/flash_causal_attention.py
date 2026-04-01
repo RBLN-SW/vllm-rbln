@@ -19,8 +19,6 @@ from rebel.triton import language as tl
 from rebel.triton.language.extra.rbln import libdevice as rblib
 from torch.library import register_fake, triton_op
 
-__triton_op_files__ = rblib.collect_triton_op_files()
-
 ################################################################################
 @triton.jit
 def flash_causal_attention_naive_prefill(

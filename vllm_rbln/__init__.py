@@ -71,3 +71,8 @@ def register_ops():
         from vllm_rbln.triton_kernels import flash_attention  # noqa
         from vllm_rbln.triton_kernels import flash_causal_attention  # noqa
         from vllm_rbln.triton_kernels import sliding_window_attention  # noqa
+        from rebel.triton.language.extra.rbln import libdevice as _rblib_triton_op_files
+
+        _rblib_triton_op_files.attach_triton_op_files_to_loaded_modules(
+            "vllm_rbln.triton_kernels"
+        )
