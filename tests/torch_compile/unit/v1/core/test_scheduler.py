@@ -14,7 +14,7 @@
 
 from vllm.v1.request import RequestStatus
 
-from tests.torch_compile.v1.core.utils import (
+from .utils import (
     create_requests,
     create_runner_output,
     create_scheduler,
