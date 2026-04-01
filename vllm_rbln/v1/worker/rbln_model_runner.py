@@ -43,7 +43,10 @@ from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import TensorizerLoader, get_model_loader
-from vllm.model_executor.models.interfaces import supports_transcription
+from vllm.model_executor.models.interfaces import (
+    supports_eagle3,
+    supports_transcription,
+)
 from vllm.model_executor.models.interfaces_base import (
     VllmModelForPooling,
     is_pooling_model,
@@ -3463,9 +3466,22 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             logger.info("Loading drafter model...")
             self.drafter.load_model(self.model)
         if self.use_aux_hidden_state_outputs:
-            self.model.set_aux_hidden_state_layers(
-                self.model.get_eagle3_aux_hidden_state_layers()
-            )
+            if not supports_eagle3(self.get_model()):
+                raise RuntimeError(
+                    "Model does not support EAGLE3 interface but "
+                    "aux_hidden_state_outputs was requested"
+                )
+
+            aux_layers = self._get_eagle3_aux_layers_from_config()
+            if aux_layers:
+                logger.info(
+                    "Using auxiliary layers from speculative config: %s",
+                    aux_layers,
+                )
+            else:
+                aux_layers = self.model.get_eagle3_default_aux_hidden_state_layers()
+
+            self.model.set_aux_hidden_state_layers(aux_layers)
 
         # FIXME - device specific communication buffer (CUDA)?
         # disable communication buffer for RBLN (NYI)
@@ -3502,6 +3518,30 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 self._prepare_prefill_intermediate_tensors()
                 for batch_bucket_size in self.bucketing_manager.decode_batch_buckets:
                     self._prepare_decode_intermediate_tensors(batch_bucket_size)
+
+    def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:
+        """Extract Eagle3 auxiliary layer indices from speculative config.
+
+        These indices specify which hidden states from the base model should
+        be used as auxiliary inputs for the Eagle3 drafter model during
+        speculative decoding.
+
+        Returns:
+            Tuple of layer indices if found in draft model config,
+            None otherwise.
+        """
+        if not (self.speculative_config and self.speculative_config.draft_model_config):
+            return None
+
+        hf_config = self.speculative_config.draft_model_config.hf_config
+        if not hasattr(hf_config, "eagle_aux_hidden_state_layer_ids"):
+            return None
+
+        layer_ids = hf_config.eagle_aux_hidden_state_layer_ids
+        if layer_ids and isinstance(layer_ids, (list, tuple)):
+            return tuple(layer_ids)
+
+        return None
 
     def _prepare_prefill_intermediate_tensors(self) -> None:
         def _reshape(
