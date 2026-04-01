@@ -3314,6 +3314,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             )
 
             target_hidden_states = hidden_states
+            num_rejected_tokens_gpu = None
             if spec_decode_metadata is None:
                 token_indices_to_sample = None
                 # input_ids can be None for multimodal models.
@@ -3325,12 +3326,14 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         [h.view(-1, h.shape[-1]) for h in aux_hidden_states], dim=-1
                     )
             else:
-                common_attn_metadata, token_indices_to_sample = (
-                    self.drafter.prepare_inputs_padded(
-                        common_attn_metadata,
-                        spec_decode_metadata,
-                        valid_sampled_tokens_count,
-                    )
+                (
+                    common_attn_metadata,
+                    token_indices_to_sample,
+                    num_rejected_tokens_gpu,
+                ) = self.drafter.prepare_inputs_padded(
+                    common_attn_metadata,
+                    spec_decode_metadata,
+                    valid_sampled_tokens_count,
                 )
                 total_num_tokens = common_attn_metadata.num_actual_tokens
                 # When padding the batch, token_indices is just a range
@@ -3355,10 +3358,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 target_positions=target_positions,
                 target_hidden_states=target_hidden_states,
                 next_token_ids=next_token_ids,
-                last_token_indices=token_indices_to_sample,
+                token_indices_to_sample=token_indices_to_sample,
                 sampling_metadata=sampling_metadata,
                 common_attn_metadata=common_attn_metadata,
                 mm_embed_inputs=mm_embed_inputs,
+                num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                slot_mappings=slot_mappings,
             )
 
         return draft_token_ids
@@ -3780,6 +3785,14 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # Note (tdoublep): do this *after* constructing builders,
         # because some of them change the threshold at init time.
         self.calculate_reorder_batch_threshold()
+
+        # Initialize drafter attention backend
+        if self.speculative_config and (
+            self.speculative_config.use_eagle()
+            or self.speculative_config.uses_draft_model()
+        ):
+            assert isinstance(self.drafter, RBLNEagleProposer)  # | DraftModelProposer)
+            self.drafter.initialize_attn_backend(kv_cache_config, kernel_block_sizes)
 
     def calculate_reorder_batch_threshold(self) -> None:
         """

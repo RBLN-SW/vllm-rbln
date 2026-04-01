@@ -30,100 +30,18 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 import vllm_rbln.rbln_envs as envs
 import vllm_rbln.utils as rbln_utils
 from vllm_rbln.logger import init_logger
-from vllm_rbln.v1.attention.backends.flash_attention import (
-    RBLNFlashAttentionMetadata,
+from vllm_rbln.v1.spec_decoding.utils import (
+    eagle_prepare_inputs_padded,
+    eagle_prepare_next_token_padded,
 )
 
 logger = init_logger(__name__)
-
-
-def eagle_prepare_next_token_padded(
-    # [bs, num_sampled_tokens_per_req]
-    sampled_token_ids: torch.Tensor,
-    # [bs], bool
-    discard_request_mask: torch.Tensor,
-    # [bs]
-    backup_next_token_ids: torch.Tensor,
-    vocab_size: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    This function computes the number of valid (1 + accepted) tokens for each request,
-    and the corresponding "next" token id to sample from during speculative decoding.
-    This is the "last accepted token" from the sampled tokens, or the backup token if no
-    tokens were accepted or if the request is marked as discarded.
-    """
-    _, num_tokens = sampled_token_ids.shape
-
-    is_valid = (sampled_token_ids != -1) & (sampled_token_ids < vocab_size)
-    valid_count = is_valid.sum(dim=1).to(torch.int32)
-
-    token_offsets = torch.arange(num_tokens, device=sampled_token_ids.device)
-    last_valid_index = torch.where(
-        is_valid, token_offsets, torch.tensor(-1, device=sampled_token_ids.device)
-    ).amax(dim=1)
-
-    last_valid_token = (
-        torch.where(
-            token_offsets == last_valid_index.unsqueeze(1),
-            sampled_token_ids,
-            torch.zeros_like(sampled_token_ids),
-        )
-        .sum(dim=1)
-        .to(torch.int32)
-    )
-
-    has_valid = valid_count > 0
-    next_token_ids = torch.where(has_valid, last_valid_token, backup_next_token_ids)
-    valid_count = torch.where(
-        discard_request_mask, torch.zeros_like(valid_count), valid_count
-    )
-
-    return next_token_ids, valid_count
-
-
-def eagle_prepare_inputs_padded(
-    # [num_reqs]
-    cu_num_draft_tokens: torch.Tensor,
-    # [num_reqs]
-    valid_sampled_tokens_count: torch.Tensor,
-    # [num_reqs + 1]
-    query_start_loc: torch.Tensor,
-) -> torch.Tensor:
-    """
-    This function computes the token index to sample for each request, taking into
-    account the number of draft tokens and the number of valid sampled tokens
-    (which is one more than the number of accepted tokens)
-    """
-    num_draft_tokens = cu_num_draft_tokens - torch.nn.functional.pad(
-        cu_num_draft_tokens[:-1], (1, 0)
-    )
-
-    has_draft = num_draft_tokens > 0
-    num_rejected = has_draft * (num_draft_tokens + 1 - valid_sampled_tokens_count)
-
-    return (query_start_loc[1:] - 1 - num_rejected).to(torch.int32)
 
 
 class RBLNEagleProposer(EagleProposer):
     def __init__(self, vllm_config: VllmConfig, device: torch.device, runner=None):
         super().__init__(vllm_config, device, runner)
 
-        # NOTE(RBLN): vllm-rbln does not use cudagraphs.
-        self.use_cuda_graph = False
-
-        # NOTE(RBLN): vllm-rbln uses only RBLNFlashAttentionMetadata
-        self.allowed_attn_types = (RBLNFlashAttentionMetadata,)
-
-        # TODO(RBLN): supports eagle/eagle3 with multi-modal.
-        if self.supports_mm_inputs:
-            raise NotImplementedError("Eagle is not supported with multi-modal.")
-
-        # TODO(RBLN): Using a separate CompileContext for the draft model is a
-        # temporary workaround. Since the base model's KV caches are managed
-        # together within its CompileContext, using a separate one here causes
-        # the draft model to redundantly allocate memory for the base model's
-        # KV caches, resulting in unnecessary memory waste. This should be
-        # revisited to properly share the base model's CompileContext.
         from rebel import CompileContext
 
         self.compile_context = CompileContext(use_weight_sharing=True)
@@ -134,37 +52,39 @@ class RBLNEagleProposer(EagleProposer):
         target_positions: torch.Tensor,
         target_hidden_states: torch.Tensor,
         next_token_ids: torch.Tensor,
-        last_token_indices: torch.Tensor | None,
+        token_indices_to_sample: torch.Tensor | None,
         common_attn_metadata: CommonAttentionMetadata,
         sampling_metadata: SamplingMetadata,
         mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
+        num_rejected_tokens_gpu: torch.Tensor | None = None,
+        slot_mappings: dict[str, torch.Tensor]
+        | list[dict[str, torch.Tensor]]
+        | None = None,
     ) -> torch.Tensor:
-        num_tokens = target_token_ids.shape[0]
         batch_size = next_token_ids.shape[0]
 
-        if last_token_indices is None:
-            last_token_indices = common_attn_metadata.query_start_loc[1:] - 1
-
         if self.method == "eagle3":
-            # assert isinstance(self.model, Eagle3LlamaForCausalLM)
+            # assert isinstance(
+            #     self.model, (Eagle3LlamaForCausalLM, Eagle3DeepseekV2ForCausalLM)
+            # )
             target_hidden_states = self.model.combine_hidden_states(
                 target_hidden_states
             )
             assert target_hidden_states.shape[-1] == self.hidden_size
 
-        # Shift the input ids by one token.
-        # E.g., [a1, b1, b2, c1, c2, c3] -> [b1, b2, c1, c2, c3, c3]
-        self.input_ids[: num_tokens - 1] = target_token_ids[1:]
-        # Replace the last token with the next token.
-        # E.g., [b1, b2, c1, c2, c3, c3] -> [a2, b2, b3, c2, c3, c4]
-        self.input_ids[last_token_indices] = next_token_ids
+        num_tokens, token_indices_to_sample, common_attn_metadata = (
+            self.set_inputs_first_pass(
+                target_token_ids=target_token_ids,
+                next_token_ids=next_token_ids,
+                target_positions=target_positions,
+                target_hidden_states=target_hidden_states,
+                token_indices_to_sample=token_indices_to_sample,
+                cad=common_attn_metadata,
+                num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+            )
+        )
 
         assert self.runner is not None
-
-        if self.attn_metadata_builder is None:
-            attn_metadata_builder = self._get_attention_metadata_builder()
-        else:
-            attn_metadata_builder = self.attn_metadata_builder
 
         # NOTE(RBLN): build attention metadata
         batch_bucket_size = self.runner.bucketing_manager.find_decode_batch_bucket(
@@ -178,33 +98,18 @@ class RBLNEagleProposer(EagleProposer):
         )
         extra_attn_metadata_args["positions"] = target_positions.cpu()
         extra_attn_metadata_args["batch_pad"] = batch_bucket_size
-        attn_metadata = attn_metadata_builder.build(
-            common_prefix_len=0,
-            common_attn_metadata=common_attn_metadata,
-            fast_build=True,
-            **extra_attn_metadata_args,
-        )
-        # FIXME: support hybrid kv for draft model (remove separate indexer)
-        if self.draft_indexer_metadata_builder:
-            draft_indexer_metadata = (
-                self.draft_indexer_metadata_builder.build_for_drafting(
-                    common_attn_metadata=common_attn_metadata,
-                    draft_index=0,
-                )
+        per_layer_attn_metadata: dict[str, object] = {}
+        for attn_group in self.draft_attn_groups:
+            attn_metadata = attn_group.get_metadata_builder().build(
+                common_prefix_len=0,
+                common_attn_metadata=common_attn_metadata,
+                fast_build=True,
+                **extra_attn_metadata_args,
             )
-        else:
-            draft_indexer_metadata = None
-        # At this moment, we assume all eagle layers belong to the same KV
-        # cache group, thus using the same attention metadata.
-        per_layer_attn_metadata = {}
-        for layer_name in self.attn_layer_names:
-            per_layer_attn_metadata[layer_name] = attn_metadata
+            attn_metadata.kv_caches = self.runner.kv_caches
+            for layer_name in attn_group.layer_names:
+                per_layer_attn_metadata[layer_name] = attn_metadata
 
-        for layer_name in self.indexer_layer_names:
-            assert draft_indexer_metadata is not None
-            per_layer_attn_metadata[layer_name] = draft_indexer_metadata
-
-        # NOTE(RBLN): just set num_tokens to num_input_tokens
         num_input_tokens = num_tokens
         if self.supports_mm_inputs:
             mm_embeds, is_mm_embed = mm_embed_inputs or (None, None)
@@ -223,18 +128,17 @@ class RBLNEagleProposer(EagleProposer):
             if is_prefill:
                 input_ids = self.input_ids.view(batch_size, -1)
                 positions = rbln_utils.pad(
-                    target_positions.view(batch_size, -1), -1, input_ids.shape[-1]
+                    target_positions.view(batch_size, -1), -1, input_ids.shape[-1], -1
                 )
             else:
                 input_ids = self.input_ids[:num_input_tokens].view(batch_size, -1)
                 input_ids = rbln_utils.pad(input_ids, 0, batch_bucket_size)
                 positions = target_positions.view(batch_size, -1)
-                positions = rbln_utils.pad(positions, -2, batch_bucket_size)
-            last_token_indices_padded = rbln_utils.pad(
-                last_token_indices, 0, batch_bucket_size
+                positions = rbln_utils.pad(positions, -2, batch_bucket_size, -2)
+            token_indices_to_sample_padded = rbln_utils.pad(
+                token_indices_to_sample, 0, batch_bucket_size
             )
             hidden_states = target_hidden_states.view(*input_ids.shape, -1)
-
             inputs_embeds = None
 
         if (
@@ -249,17 +153,16 @@ class RBLNEagleProposer(EagleProposer):
             num_tokens=num_input_tokens,
             num_tokens_across_dp=num_tokens_across_dp,
             num_padded_tokens=num_padded_tokens,
+            # slot_mapping=self._get_slot_mapping(
+            #     num_input_tokens, common_attn_metadata.slot_mapping
+            # ),
         ):
-            if per_layer_attn_metadata is not None:
-                for attn_metadata in per_layer_attn_metadata.values():
-                    attn_metadata.kv_caches = self.runner.kv_caches
-
             hidden_states, logits = self.model_executable(
                 input_ids=input_ids,
                 positions=positions,
                 hidden_states=hidden_states,
                 inputs_embeds=inputs_embeds,
-                last_token_indices=last_token_indices_padded,
+                last_token_indices=token_indices_to_sample_padded,
             )
 
         # Early exit if there is only one draft token to be generated.
@@ -268,35 +171,27 @@ class RBLNEagleProposer(EagleProposer):
             return draft_tokens_ids.view(-1, 1)
 
         positions = (
-            target_positions[:, last_token_indices]
+            target_positions[:, token_indices_to_sample]
             if self.uses_mrope
-            else target_positions[last_token_indices]
+            else target_positions[token_indices_to_sample]
         )
-        if self.method in (
-            "deepseek_mtp",
-            "ernie_mtp",
-            "longcat_flash_mtp",
-            "pangu_ultra_moe_mtp",
-        ):
-            hidden_states = self.hidden_states[last_token_indices]
-        else:
-            hidden_states = hidden_states[last_token_indices]
+        hidden_states = hidden_states[token_indices_to_sample]
 
         if isinstance(attn_metadata, TreeAttentionMetadata):
             # NOTE(RBLN): tree attention is not supported
-            # # Draft using tree attention.
-            # draft_token_ids_list = self.propose_tree(
-            #     batch_size=batch_size,
-            #     logits=logits,
-            #     positions=positions,
-            #     hidden_states=hidden_states,
-            #     common_attn_metadata=common_attn_metadata,
-            # )
-            # # [batch_size, num_tree_tokens]
-            # return torch.cat(draft_token_ids_list, dim=1)
             raise NotImplementedError("Tree attention is not supported")
 
         draft_token_ids = logits[:batch_size].argmax(dim=-1)
+
+        if self.allowed_attn_types is not None and not isinstance(
+            attn_metadata, self.allowed_attn_types
+        ):
+            raise ValueError(
+                f"Unsupported attention metadata type for speculative "
+                "decoding with num_speculative_tokens > 1: "
+                f"{type(attn_metadata)}. Supported types are: "
+                f"{self.allowed_attn_types}"
+            )
 
         # Generate the remaining draft tokens.
         draft_token_ids_list = [draft_token_ids]
@@ -307,7 +202,20 @@ class RBLNEagleProposer(EagleProposer):
         common_attn_metadata.query_start_loc_cpu = torch.from_numpy(
             self.token_arange_np[: batch_size + 1]
         ).clone()
-        for _ in range(self.num_speculative_tokens - 1):
+
+        # In padded drafter batch, we need to adjust the sequence lengths
+        # to remove the "padding" (i.e. rejected tokens).
+        # Only apply this adjustment when we have rejected tokens
+        # (i.e., not the first proposal).
+        if self.num_speculative_tokens > 1 and num_rejected_tokens_gpu is not None:
+            common_attn_metadata.seq_lens -= num_rejected_tokens_gpu
+            # Invalidate the CPU-side shadows to avoid H<>D sync.
+            common_attn_metadata._seq_lens_cpu = None
+            common_attn_metadata._num_computed_tokens_cpu = None
+
+        block_size = self.block_size
+        assert block_size > 0, "block_size has not been initialized."
+        for token_index in range(self.num_speculative_tokens - 1):
             # Update the inputs
             # cast to int32 is crucial when eagle model is compiled.
             # tensor.argmax returns int64 by default.
@@ -315,17 +223,7 @@ class RBLNEagleProposer(EagleProposer):
             positions = positions[:batch_size].view(-1)
             if self.uses_mrope:
                 positions += 1
-                # NOTE(woosuk): We should handle the case where the draft model
-                # generates tokens beyond the max model length.
-                # Since it is complex to remove such requests from the batch,
-                # we keep them in the batch but adjust the position ids
-                # and slot mappings to avoid the
-                # out-of-range access during the model execution.
-                # The draft tokens generated with this adjustment
-                # should be ignored.
                 exceeds_max_model_len = positions[0] >= self.max_model_len
-                # Mask out the position ids that exceed the max model length.
-                # Otherwise, we may get out-of-range error in RoPE.
                 clamped_positions = torch.where(
                     exceeds_max_model_len.unsqueeze(0),
                     torch.zeros_like(positions),
@@ -335,25 +233,15 @@ class RBLNEagleProposer(EagleProposer):
                 positions += 1
                 exceeds_max_model_len = positions >= self.max_model_len
                 clamped_positions = torch.where(exceeds_max_model_len, 0, positions)
-            # For data integrity when async scheduling, we shouldn't use in place
-            # operations in case they are modified in next step's `prepare_input`
-            # of main model.
-            # Increment the sequence lengths.
             common_attn_metadata.seq_lens += 1
-            # For the requests that exceed the max model length, we set the
-            # sequence length to 1 to minimize their overheads in attention.
             common_attn_metadata.seq_lens.masked_fill_(exceeds_max_model_len, 1)
 
-            # Also update the CPU-side shadow; NOTE: this is hacky and should be
-            # removed in when common_attn_metadata.seq_lens_cpu is deprecated.
             if common_attn_metadata._seq_lens_cpu is not None:
                 common_attn_metadata._seq_lens_cpu += 1
             if common_attn_metadata._num_computed_tokens_cpu is not None:
                 common_attn_metadata._num_computed_tokens_cpu += 1
 
-            # Compute the slot mapping.
             if self.uses_mrope:
-                # all dimensions of positions are the same
                 block_numbers = clamped_positions[0] // self.block_size
             else:
                 block_numbers = clamped_positions // self.block_size
@@ -369,9 +257,6 @@ class RBLNEagleProposer(EagleProposer):
                 common_attn_metadata.slot_mapping = (
                     block_ids * self.block_size + clamped_positions % self.block_size
                 )
-            # Mask out the slot mappings that exceed the max model length.
-            # Otherwise, the KV cache will be inadvertently updated with the
-            # padding tokens.
             common_attn_metadata.slot_mapping.masked_fill_(
                 exceeds_max_model_len, PADDING_SLOT_ID
             )
@@ -383,14 +268,16 @@ class RBLNEagleProposer(EagleProposer):
             )
             extra_attn_metadata_args["positions"] = positions.cpu()
             extra_attn_metadata_args["batch_pad"] = batch_bucket_size
-            attn_metadata = attn_metadata_builder.build(
-                common_prefix_len=0,
-                common_attn_metadata=common_attn_metadata,
-                fast_build=True,
-                **extra_attn_metadata_args,
-            )
-            for layer_name in self.attn_layer_names:
-                per_layer_attn_metadata[layer_name] = attn_metadata
+            for attn_group in self.draft_attn_groups:
+                attn_metadata = attn_group.get_metadata_builder().build(
+                    common_prefix_len=0,
+                    common_attn_metadata=common_attn_metadata,
+                    fast_build=True,
+                    **extra_attn_metadata_args,
+                )
+                attn_metadata.kv_caches = self.runner.kv_caches
+                for layer_name in attn_group.layer_names:
+                    per_layer_attn_metadata[layer_name] = attn_metadata
 
             # copy inputs to buffer
             self.input_ids[:batch_size] = input_ids
@@ -421,11 +308,8 @@ class RBLNEagleProposer(EagleProposer):
                 num_tokens=batch_size,
                 num_tokens_across_dp=None,
                 num_padded_tokens=None,
+                # slot_mapping=self._get_slot_mapping(batch_size),
             ):
-                if per_layer_attn_metadata is not None:
-                    for attn_metadata in per_layer_attn_metadata.values():
-                        attn_metadata.kv_caches = self.runner.kv_caches
-
                 hidden_states, logits = self.model_executable(
                     input_ids=input_ids,
                     positions=positions,
@@ -439,6 +323,32 @@ class RBLNEagleProposer(EagleProposer):
         # [batch_size, num_speculative_tokens]
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
         return draft_token_ids
+
+    def set_inputs_first_pass(
+        self,
+        target_token_ids: torch.Tensor,
+        next_token_ids: torch.Tensor,
+        target_positions: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        token_indices_to_sample: torch.Tensor | None,
+        cad: CommonAttentionMetadata,
+        num_rejected_tokens_gpu: torch.Tensor | None,
+    ) -> tuple[int, torch.Tensor, CommonAttentionMetadata]:
+        if self.needs_extra_input_slots:
+            raise NotImplementedError(
+                "vllm-rbln does not support EAGLE extra input slots required for "
+                "parallel drafting or draft-model speculative decoding yet."
+            )
+
+        if token_indices_to_sample is None:
+            token_indices_to_sample = cad.query_start_loc[1:] - 1
+
+        num_tokens = target_token_ids.shape[0]
+        self.input_ids[: num_tokens - 1] = target_token_ids[1:]
+        self.input_ids[token_indices_to_sample] = next_token_ids
+        self._set_positions(num_tokens, target_positions)
+
+        return num_tokens, token_indices_to_sample, cad
 
     def prepare_next_token_ids_padded(
         self,
@@ -477,7 +387,7 @@ class RBLNEagleProposer(EagleProposer):
         common_attn_metadata: CommonAttentionMetadata,
         spec_decode_metadata: SpecDecodeMetadata,
         valid_sampled_tokens_count: torch.Tensor,
-    ) -> tuple[CommonAttentionMetadata, torch.Tensor]:
+    ) -> tuple[CommonAttentionMetadata, torch.Tensor, torch.Tensor]:
         """
         This function is used to prepare the inputs for speculative decoding
         It updates the common_attn_metadata for speculative decoding,
@@ -485,13 +395,18 @@ class RBLNEagleProposer(EagleProposer):
         are included as inputs to the speculator, with the rejected tokens
         used as padding and filtered out later by `token_indices_to_sample`.
         """
-        token_indices_to_sample = eagle_prepare_inputs_padded(
+        token_indices_to_sample, num_rejected_tokens_gpu = eagle_prepare_inputs_padded(
             spec_decode_metadata.cu_num_draft_tokens,
             valid_sampled_tokens_count,
             common_attn_metadata.query_start_loc,
         )
 
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
+        seq_lens_cpu = (
+            common_attn_metadata._seq_lens_cpu
+            if common_attn_metadata._seq_lens_cpu is not None
+            else common_attn_metadata.seq_lens.cpu()
+        )
         new_query_len_per_req = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
 
         total_num_tokens = query_start_loc_cpu[-1].item()
@@ -505,14 +420,18 @@ class RBLNEagleProposer(EagleProposer):
             num_reqs=common_attn_metadata.num_reqs,
             num_actual_tokens=total_num_tokens,
             max_query_len=new_query_len_per_req.max().item(),
-            max_seq_len=common_attn_metadata.seq_lens.max().item(),
+            max_seq_len=seq_lens_cpu.max().item(),
             block_table_tensor=common_attn_metadata.block_table_tensor,
             slot_mapping=common_attn_metadata.slot_mapping[:total_num_tokens],
             causal=True,
             dcp_local_seq_lens=common_attn_metadata.dcp_local_seq_lens,
         )
 
-        return spec_common_attn_metadata, token_indices_to_sample
+        return (
+            spec_common_attn_metadata,
+            token_indices_to_sample,
+            num_rejected_tokens_gpu,
+        )
 
     def load_model(self, target_model: nn.Module) -> None:
         super().load_model(target_model)
