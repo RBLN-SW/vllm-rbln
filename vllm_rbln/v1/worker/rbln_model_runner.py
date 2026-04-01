@@ -2300,7 +2300,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         custom_logitsprocs: Sequence[Union[str, type[LogitsProcessor]]] = (
             tuple(logits_processors) if logits_processors is not None else ()
         )
-        max_model_len=max(self.max_model_len, self.max_encoder_len),
+        max_model_len = max(self.max_model_len, self.max_encoder_len)
         dummy_input_batch = InputBatch(
             max_num_reqs=self.max_num_reqs,
             # We need to use the encoder length for encoder-decoer
