@@ -39,7 +39,6 @@ def vllm_config():
     cache_config = CacheConfig(
         block_size=1024,
         gpu_memory_utilization=0.9,
-        swap_space=0,
         cache_dtype="auto",
     )
     parallel_config = ParallelConfig(data_parallel_size=2)
