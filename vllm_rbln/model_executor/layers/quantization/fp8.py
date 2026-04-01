@@ -460,13 +460,13 @@ def custom_moe_swiglu_group_dequantize(
     num_experts = gate_proj_weight_dq.shape[0]
     dtype = hidden_states.dtype
 
-    # masked_routing_weights: [E, T(+pad)] → slice to actual T → transpose to [T, E]
-    routing_t = masked_routing_weights[:, :num_tokens].transpose(0, 1).to(dtype)  # [T, E]
+    # masked_routing_weights: [E, T_padded]
+    routing_t = masked_routing_weights[:, :num_tokens]
 
     final_hidden_states = torch.zeros(num_tokens, hidden_size, dtype=dtype)
 
     for expert_idx in range(num_experts):
-        expert_weights = routing_t[:, expert_idx]  # [T]
+        expert_weights = routing_t[expert_idx]  # [T]
         token_indices = expert_weights.nonzero(as_tuple=True)[0]
         if token_indices.numel() == 0:
             continue
@@ -802,8 +802,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         orig_shape = x.shape  # noqa: F841
         num_tokens = orig_shape[:-1].numel()  # noqa: F841
         hidden_states = x.reshape(num_tokens, -1)
-        masked_routing_weights = router_logits.reshape(num_tokens, -1)
-
+        masked_routing_weights = router_logits
         intermediate_size = layer.w2_weight.shape[-1]
 
         # w13_weight: merged gate(up) weights, w2_weight: down weights
@@ -822,9 +821,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             :, scale_intermediate_size:, :
         ]
 
-        # transpose to [num_experts, num_tokens] for custom op
-        masked_routing_weights_t = masked_routing_weights.transpose(0, 1)
-
         expert_map_const = None
         if layer.expert_map is not None:
             # Extract numpy array and create a fresh constant tensor
@@ -840,7 +836,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 up_proj_weight_scale,
                 down_proj_weight,
                 down_proj_weight_scale,
-                masked_routing_weights_t,
+                masked_routing_weights,
                 torch.tensor(self.weight_block_size[1], dtype=torch.int32),
                 None,  # e_score_correction_bias (routing done externally)
                 None,  # gate_proj_bias

@@ -134,8 +134,6 @@ def custom_moe_glu_mxfp4(
     Returns:
         torch.Tensor: [num_tokens, hidden_size]
     """
-    assert hidden_states.dtype == masked_routing_weights.dtype, "hidden_states and masked_routing_weights must have the same dtype"
-
     if envs.VLLM_RBLN_COMPILE_MODEL:
         return torch.empty_like(hidden_states)
 
