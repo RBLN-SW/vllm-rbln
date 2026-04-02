@@ -537,7 +537,7 @@ class RBLNOptimumScheduler(Scheduler):
             # the previous and the current steps.
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=[],
-            new_block_ids_to_zero=None,
+            new_block_ids_to_zero=None, # It is used for Mamba models
             block_table_dict=block_table_dict,
             cached_block_table=cached_block_table,
             cached_length=cached_length,
