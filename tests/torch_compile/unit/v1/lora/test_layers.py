@@ -79,6 +79,28 @@ NUM_RANDOM_SEEDS = 2
 VOCAB_PARALLEL_EMBEDDING_TEST_NUM_RANDOM_SEEDS = 2
 
 
+@pytest.fixture(scope="module", autouse=True)
+def relax_dynamo_recompile_limits():
+    config = torch._dynamo.config
+    original_recompile_limit = config.recompile_limit
+    original_cache_size_limit = config.cache_size_limit
+    original_accumulated_recompile_limit = config.accumulated_recompile_limit
+    original_accumulated_cache_size_limit = config.accumulated_cache_size_limit
+
+    config.recompile_limit = 64
+    config.cache_size_limit = 64
+    config.accumulated_recompile_limit = 2048
+    config.accumulated_cache_size_limit = 2048
+
+    try:
+        yield
+    finally:
+        config.recompile_limit = original_recompile_limit
+        config.cache_size_limit = original_cache_size_limit
+        config.accumulated_recompile_limit = original_accumulated_recompile_limit
+        config.accumulated_cache_size_limit = original_accumulated_cache_size_limit
+
+
 def get_random_id_to_index(
     num_loras: int, num_slots: int, log: bool = True
 ) -> list[int | None]:
@@ -254,7 +276,6 @@ def set_sampler_indices_padded(
 
 
 def rbln_compile(model):
-    torch._dynamo.reset()
     return torch.compile(
         model,
         backend="rbln",
