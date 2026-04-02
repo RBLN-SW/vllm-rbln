@@ -56,7 +56,7 @@ from vllm.sampling_params import SamplingParams, SamplingType
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.utils import length_from_prompt_token_ids_or_embeds
-from vllm.utils.math_utils import round_up
+from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.utils.torch_utils import get_dtype_size, kv_cache_dtype_str_to_dtype
 from vllm.v1.attention.backend import AttentionBackend, AttentionType, MultipleOf
@@ -101,6 +101,7 @@ from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
+from vllm.v1.worker.cp_utils import get_total_cp_world_size
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
@@ -213,6 +214,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
+        self.offload_config = vllm_config.offload_config
         self.compilation_config = vllm_config.compilation_config
         self.lora_config = vllm_config.lora_config
         self.load_config = vllm_config.load_config
@@ -2295,11 +2297,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         custom_logitsprocs: Sequence[Union[str, type[LogitsProcessor]]] = (
             tuple(logits_processors) if logits_processors is not None else ()
         )
+        max_model_len = max(self.max_model_len, self.max_encoder_len)
         dummy_input_batch = InputBatch(
             max_num_reqs=self.max_num_reqs,
             # We need to use the encoder length for encoder-decoer
             # because of KV cache for cross-attention.
-            max_model_len=max(self.max_model_len, self.max_encoder_len),
+            max_model_len=max_model_len,
             max_num_batched_tokens=self.max_num_tokens,
             device=self.device,
             pin_memory=self.pin_memory,
@@ -2321,17 +2324,15 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
         )
 
-        block_sizes = [
-            kv_cache_group.kv_cache_spec.block_size
-            for kv_cache_group in self.kv_cache_config.kv_cache_groups
-            if not isinstance(kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec)
-        ]
+        block_sizes, max_num_blocks = self._kv_block_sizes_and_max_num_blocks(
+            self.kv_cache_config, max_model_len
+        )
         kernel_block_sizes = self.kernel_block_sizes
 
         if block_sizes != [self.cache_config.block_size] or kernel_block_sizes != [
             self.cache_config.block_size
         ]:
-            assert self.cache_config.cpu_offload_gb == 0, (
+            assert self.offload_config.uva.cpu_offload_gb == 0, (
                 "Cannot re-initialize the input batch when CPU weight "
                 "offloading is enabled. See https://github.com/vllm-project/vllm/pull/18298 "  # noqa: E501
                 "for more details."
@@ -2345,14 +2346,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 vocab_size=self.model_config.get_vocab_size(),
                 block_sizes=block_sizes,
                 kernel_block_sizes=kernel_block_sizes,
+                max_num_blocks_per_req=max_num_blocks,
                 is_spec_decode=bool(self.vllm_config.speculative_config),
                 logitsprocs=dummy_input_batch.logitsprocs,
+                logitsprocs_need_output_token_ids=dummy_input_batch.logitsprocs_need_output_token_ids,
                 is_pooling_model=self.is_pooling_model,
-                num_speculative_tokens=(
-                    self.vllm_config.speculative_config.num_speculative_tokens
-                    if self.vllm_config.speculative_config
-                    else 0
-                ),
+                cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
             )
 
         return dummy_input_batch
@@ -3843,6 +3842,29 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 return supported_size
         raise ValueError(f"No common block size for {kv_manager_block_size}. ")
 
+    def _kv_block_sizes_and_max_num_blocks(
+        self, kv_cache_config: KVCacheConfig, max_model_len: int
+    ) -> tuple[list[int], list[int]]:
+        """Block sizes per KV group and per-request max block counts for InputBatch."""
+        block_sizes: list[int] = []
+        max_num_blocks: list[int] = []
+        for kv_cache_group in kv_cache_config.kv_cache_groups:
+            if isinstance(kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec):
+                continue
+            block_size = kv_cache_group.kv_cache_spec.block_size
+            block_sizes.append(block_size)
+            max_num_blocks_per_req = cdiv(
+                max_model_len, block_size * get_total_cp_world_size()
+            )
+            if isinstance(kv_cache_group.kv_cache_spec, MambaSpec):
+                max_num_blocks_per_req = (
+                    max_num_blocks_per_req
+                    if self.cache_config.enable_prefix_caching
+                    else 1
+                ) + kv_cache_group.kv_cache_spec.num_speculative_blocks
+            max_num_blocks.append(max_num_blocks_per_req)
+        return block_sizes, max_num_blocks
+
     def may_reinitialize_input_batch(
         self, kv_cache_config: KVCacheConfig, kernel_block_sizes: list[int]
     ) -> None:
@@ -3855,37 +3877,34 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             kv_cache_config: The KV cache configuration.
             kernel_block_sizes: The kernel block sizes for each KV cache group.
         """
-        block_sizes = [
-            kv_cache_group.kv_cache_spec.block_size
-            for kv_cache_group in kv_cache_config.kv_cache_groups
-            if not isinstance(kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec)
-        ]
+        max_model_len = max(self.max_model_len, self.max_encoder_len)
+        block_sizes, max_num_blocks = self._kv_block_sizes_and_max_num_blocks(
+            kv_cache_config, max_model_len
+        )
 
         if block_sizes != [self.cache_config.block_size] or kernel_block_sizes != [
             self.cache_config.block_size
         ]:
-            assert self.cache_config.cpu_offload_gb == 0, (
+            assert self.offload_config.uva.cpu_offload_gb == 0, (
                 "Cannot re-initialize the input batch when CPU weight "
                 "offloading is enabled. See https://github.com/vllm-project/vllm/pull/18298 "  # noqa: E501
                 "for more details."
             )
             self.input_batch = InputBatch(
                 max_num_reqs=self.max_num_reqs,
-                max_model_len=max(self.max_model_len, self.max_encoder_len),
+                max_model_len=max_model_len,
                 max_num_batched_tokens=self.max_num_tokens,
                 device=self.device,
                 pin_memory=self.pin_memory,
                 vocab_size=self.model_config.get_vocab_size(),
                 block_sizes=block_sizes,
                 kernel_block_sizes=kernel_block_sizes,
+                max_num_blocks_per_req=max_num_blocks,
                 is_spec_decode=bool(self.vllm_config.speculative_config),
                 logitsprocs=self.input_batch.logitsprocs,
+                logitsprocs_need_output_token_ids=self.input_batch.logitsprocs_need_output_token_ids,
                 is_pooling_model=self.is_pooling_model,
-                num_speculative_tokens=(
-                    self.vllm_config.speculative_config.num_speculative_tokens
-                    if self.vllm_config.speculative_config
-                    else 0
-                ),
+                cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
             )
 
     def _allocate_kv_cache_tensors(
