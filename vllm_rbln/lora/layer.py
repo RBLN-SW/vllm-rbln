@@ -45,23 +45,16 @@ def vocab_parallel_embedding_patched_forward(
     # NOTE: It assumes that the batch size of prefill phase is always 1.
     is_prefill = x.shape[0] == 1
     added_tokens_mask = torch.where(x > self.base_layer.org_vocab_size - 1, 1, 0)
-    narrow_length = x.size(1) if is_prefill else x.size(0)
-    embeddings_indices = torch.narrow(
-        self.punica_wrapper._embeddings_indices, 1, 0, narrow_length
-    )
+    num_tokens = x.size(1) if is_prefill else x.size(0)
+    indices_1 = self.punica_wrapper._embeddings_indices[1][:num_tokens]
 
-    indices = embeddings_indices[1]
     if not is_prefill:
-        indices = indices.unsqueeze(1)
+        indices_1 = indices_1.unsqueeze(1)
     full_lora_a_embeddings = F.embedding(
-        x + indices,
+        x + indices_1,
         self.lora_a_stacked_2d,
     )
-
-    indices = embeddings_indices[0]
-    if not is_prefill:
-        indices = indices.unsqueeze(1)
-    full_output = self.base_layer.forward(x + (indices * added_tokens_mask))
+    full_output = self.base_layer.forward(x + (indices_1 * added_tokens_mask))
 
     full_output_org = full_output
     if full_output.ndim == 3:
@@ -73,7 +66,7 @@ def vocab_parallel_embedding_patched_forward(
         )
 
     lora_output: torch.Tensor = self.punica_wrapper.add_lora_embedding(
-        full_output, full_lora_a_embeddings, self.lora_b_stacked, add_input=True
+        full_output, full_lora_a_embeddings, self.lora_b_stacked, add_inputs=True
     )
 
     return lora_output.view_as(full_output_org)
