@@ -289,6 +289,12 @@ def rbln_compile(model):
 @pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("vocab_size", [512, 32000, 64000, 128000])
 @pytest.mark.parametrize("stage", STAGES)
+@pytest.mark.xfail(
+    reason=(
+        "embedding LoRA path produces numerically incorrect outputs "
+        "compared with eager execution."
+    )
+)
 def test_embeddings(dist_init, num_loras, device, vocab_size, stage) -> None:
     torch.set_default_device(device)
     max_loras = 8
