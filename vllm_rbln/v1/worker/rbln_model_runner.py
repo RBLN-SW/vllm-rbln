@@ -1235,7 +1235,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 blk_table_tensor = torch.zeros(
                     (num_reqs, 1),
                     dtype=torch.int32,
-                    device=self.device,
+                    # device=self.device,
                 )
                 slot_mapping = torch.zeros(
                     (total_num_scheduled_tokens,),
@@ -1245,7 +1245,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 num_common_prefix_blocks = 0
             else:
                 blk_table = self.input_batch.block_table[kv_cache_group_id]
-                blk_table_tensor = blk_table.get_device_tensor(num_reqs)
+                # blk_table_tensor = blk_table.get_device_tensor(num_reqs)
+                blk_table_tensor = blk_table.get_cpu_tensor()[:num_reqs]
                 slot_mapping = blk_table.slot_mapping.gpu[:total_num_scheduled_tokens]
 
                 # Fill unused with -1. Needed for reshape_and_cache in full cuda
