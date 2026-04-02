@@ -22,8 +22,8 @@ import torch
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.spec_decode.eagle import PADDING_SLOT_ID
 
-import vllm_rbln.v1.spec_decoding.eagle as eagle_module
-from vllm_rbln.v1.spec_decoding.eagle import RBLNEagleProposer
+import vllm_rbln.v1.spec_decode.eagle as eagle_module
+from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 
 
 class FakeBackupNextTokenIds:

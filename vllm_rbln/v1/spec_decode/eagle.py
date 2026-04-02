@@ -30,7 +30,7 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 import vllm_rbln.rbln_envs as envs
 import vllm_rbln.utils as rbln_utils
 from vllm_rbln.logger import init_logger
-from vllm_rbln.v1.spec_decoding.utils import (
+from vllm_rbln.v1.spec_decode.utils import (
     eagle_prepare_inputs_padded,
     eagle_prepare_next_token_padded,
 )

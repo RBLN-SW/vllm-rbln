@@ -16,8 +16,8 @@ import torch
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
-from vllm_rbln.v1.spec_decoding.eagle import RBLNEagleProposer
-from vllm_rbln.v1.spec_decoding.utils import (
+from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
+from vllm_rbln.v1.spec_decode.utils import (
     eagle_prepare_inputs_padded,
     eagle_prepare_next_token_padded,
 )
