@@ -679,8 +679,9 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
 
         # Zero GPU memory for freshly allocated cache blocks to prevent
         # stale NaN/data from corrupting attention or SSM computation.
-        if scheduler_output.new_block_ids_to_zero:
-            self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
+        # NOTE(eunji.lee): It is required for Mamba models
+        # if scheduler_output.new_block_ids_to_zero:
+        #     self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
 
         # Remove the unscheduled requests from the persistent batch.
         # NOTE(woosuk): The unscheduled requests are either preempted requests
