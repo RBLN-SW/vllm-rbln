@@ -15,7 +15,9 @@
 import os
 from typing import TYPE_CHECKING
 
-from vllm.envs import environment_variables as vllm_envs
+import vllm.envs as _vllm_envs_module
+
+vllm_envs = _vllm_envs_module.environment_variables
 
 if TYPE_CHECKING:
     VLLM_RBLN_COMPILE_MODEL: bool = True
@@ -265,3 +267,26 @@ def __getattr__(name: str):
     if name in environment_variables:
         return environment_variables[name]()
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+vllm_envs.update(environment_variables)
+
+
+def _validate_environ_with_rbln_namespace(hard_fail: bool) -> None:
+    """vLLM treats unset VLLM_* keys as typos; VLLM_RBLN* is the vllm-rbln namespace."""
+    for env in os.environ:
+        if (
+            env.startswith("VLLM_")
+            and env not in _vllm_envs_module.environment_variables
+        ):
+            if env.startswith("VLLM_RBLN"):
+                continue
+            if hard_fail:
+                raise ValueError(f"Unknown vLLM environment variable detected: {env}")
+            else:
+                _vllm_envs_module.logger.warning(
+                    "Unknown vLLM environment variable detected: %s", env
+                )
+
+
+_vllm_envs_module.validate_environ = _validate_environ_with_rbln_namespace
