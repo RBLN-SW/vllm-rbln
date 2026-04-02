@@ -102,10 +102,10 @@ def _(
 
 
 @torch.library.custom_op(
-    "rbln_custom_ops::flash_causal_mla_naive_decode",
+    "rbln_custom_ops::paged_flash_causal_mla_naive_decode",
     mutates_args=["kv_cache"],
 )
-def flash_causal_mla_naive_decode_impl(
+def paged_flash_causal_mla_naive_decode_impl(
     q: torch.Tensor,
     kv_c_normed: torch.Tensor,
     k_pe: torch.Tensor,
@@ -117,7 +117,7 @@ def flash_causal_mla_naive_decode_impl(
     return _empty_mla_attention_output(q, kv_c_normed)
 
 
-@torch.library.register_fake("rbln_custom_ops::flash_causal_mla_naive_decode")
+@torch.library.register_fake("rbln_custom_ops::paged_flash_causal_mla_naive_decode")
 def _(
     q: torch.Tensor,
     kv_c_normed: torch.Tensor,
@@ -368,8 +368,8 @@ class RBLNFlashAttnMLAImpl(MLACommonBaseImpl[RBLNFlashAttentionMetadata]):
                         paged_flash_causal_mla_naive_prefill = (  # noqa: E501
                             torch.ops.rbln_custom_ops.paged_flash_causal_mla_naive_prefill
                         )
-                        flash_causal_mla_naive_decode = (  # noqa: E501
-                            torch.ops.rbln_custom_ops.flash_causal_mla_naive_decode
+                        paged_flash_causal_mla_naive_decode = (  # noqa: E501
+                            torch.ops.rbln_custom_ops.paged_flash_causal_mla_naive_decode
                         )
                 else:
                     raise NotImplementedError(
@@ -390,7 +390,7 @@ class RBLNFlashAttnMLAImpl(MLACommonBaseImpl[RBLNFlashAttentionMetadata]):
                         attn_metadata.block_tables.to(torch.int16),
                         self.scale,
                     ]
-                    attn_output = flash_causal_mla_naive_decode(  # noqa: E501
+                    attn_output = paged_flash_causal_mla_naive_decode(  # noqa: E501
                         *decode_args,
                     )
                 else:
