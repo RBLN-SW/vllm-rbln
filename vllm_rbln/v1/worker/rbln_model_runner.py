@@ -1116,6 +1116,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.query_start_loc.np[num_reqs + 1 :].fill(cu_num_tokens[-1])
         self.query_start_loc.copy_to_gpu()
         query_start_loc = self.query_start_loc.gpu[: num_reqs + 1]
+        query_start_loc_cpu = self.query_start_loc.cpu[: num_reqs + 1]
 
         self.seq_lens.np[:num_reqs] = (
             self.input_batch.num_computed_tokens_cpu[:num_reqs] + num_scheduled_tokens
@@ -1148,7 +1149,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # from these partial requests, we do so for simplicity.
             # We will ignore the sampled tokens from the partial requests.
             # TODO: Support prompt logprobs.
-            logits_indices = query_start_loc[1:] - 1
+            logits_indices = query_start_loc_cpu[1:] - 1
             num_draft_tokens = None
             spec_decode_metadata = None
             num_sampled_tokens = np.ones(num_reqs, dtype=np.int32)
@@ -1189,10 +1190,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 logits_indices
             )
 
+        if logits_indices.device != self.device:
+            logits_indices = logits_indices.to(self.device)
+
         attn_metadata: dict[str, Any] = {}
 
         # Used in the below loop.
-        query_start_loc_cpu = self.query_start_loc.cpu[: num_reqs + 1]
         seq_lens = self.seq_lens.gpu[:num_reqs]
         max_seq_len = self.seq_lens.np[:num_reqs].max().item()
         spec_decode_common_attn_metadata = None
@@ -1675,16 +1678,16 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             }
         else:
             # For text-only models, we use token ids as input.
-            # While it is possible to use embeddings as input just like the
-            # multimodal models, it is not desirable for performance since
-            # then the embedding layer is not included in the CUDA graph.
-            input_ids = self.input_ids.gpu[:num_input_tokens]
+            # Use the CPU buffer (already filled before copy_to_gpu) so that
+            # subsequent view / pad / clone operations stay on CPU.
+            # The tensor is moved to self.device just before model_executable.
+            input_ids = self.input_ids.cpu[:num_input_tokens]
             inputs_embeds = None
             model_kwargs = self._init_model_kwargs(num_input_tokens)
         if self.uses_mrope:
-            positions = self.mrope_positions.gpu[:, :num_input_tokens]
+            positions = self.mrope_positions.cpu[:, :num_input_tokens]
         else:
-            positions = self.positions.gpu[:num_input_tokens]
+            positions = self.positions.cpu[:num_input_tokens]
 
         if (
             self.model_config.is_encoder_decoder
@@ -2696,6 +2699,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             else:
                 # use a dummy context manager that does nothing
                 capture_ctx = contextlib.nullcontext()
+
+            # Move input_ids / positions to device now that all CPU-side prep is done.
+            if input_ids is not None and input_ids.device.type == "cpu":
+                input_ids = input_ids.to(self.device, non_blocking=True)
+            if positions.device.type == "cpu":
+                positions = positions.to(self.device, non_blocking=True)
 
             if self.lora_config is not None:
                 lora_ids = [
