@@ -60,7 +60,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
     get_masked_input_and_mask,
 )
-from vllm.model_executor.utils import set_random_seed
+from vllm.utils.torch_utils import set_random_seed
 
 from vllm_rbln.lora.inputs import LoRAInputs
 from vllm_rbln.lora.mask import LoRAMask
@@ -254,7 +254,13 @@ def set_sampler_indices_padded(
 
 
 def rbln_compile(model):
-    return torch.compile(model, backend="rbln", dynamic=False)
+    torch._dynamo.reset()
+    return torch.compile(
+        model,
+        backend="rbln",
+        options={"mode": "strict"},
+        dynamic=False,
+    )
 
 
 @torch.inference_mode()

@@ -17,6 +17,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import importlib.util
 import tempfile
 from collections import OrderedDict
 from unittest.mock import MagicMock
@@ -46,6 +47,16 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.models.interfaces import SupportsLoRA
 
+HAS_RAY = importlib.util.find_spec("ray") is not None
+
+
+def cleanup_dist_env() -> None:
+    try:
+        cleanup_dist_env_and_memory(shutdown_ray=HAS_RAY)
+    except RuntimeError as exc:
+        if "Cannot access accelerator device when none is available." not in str(exc):
+            raise
+
 
 def get_vllm_config() -> VllmConfig:
     max_model_len = 4096
@@ -61,7 +72,6 @@ def get_vllm_config() -> VllmConfig:
     )
     cache_config = CacheConfig(
         block_size=1024,
-        swap_space=0,
         cache_dtype="auto",
         enable_prefix_caching=True,
     )
@@ -87,7 +97,7 @@ def should_do_global_cleanup_after_test(request) -> bool:
 def cleanup_fixture(should_do_global_cleanup_after_test: bool):
     yield
     if should_do_global_cleanup_after_test:
-        cleanup_dist_env_and_memory(shutdown_ray=True)
+        cleanup_dist_env()
 
 
 @pytest.fixture
@@ -106,7 +116,18 @@ def dist_init():
         )
         initialize_model_parallel(1, 1)
         yield
-        cleanup_dist_env_and_memory(shutdown_ray=True)
+        cleanup_dist_env()
+
+
+@pytest.fixture
+def default_vllm_config(vllm_config):
+    """Set a default VllmConfig for tests that directly test CustomOps or pathways
+    that use get_current_vllm_config() outside of a full engine context.
+    """
+    from vllm.config import set_current_vllm_config
+
+    with set_current_vllm_config(vllm_config):
+        yield
 
 
 @pytest.fixture

@@ -80,7 +80,6 @@ def test_worker_apply_lora(qwen3_lora_files):
         device_config=DeviceConfig("cpu"),
         cache_config=CacheConfig(
             block_size=16,
-            swap_space=0,
             cache_dtype="auto",
         ),
         lora_config=LoRAConfig(
