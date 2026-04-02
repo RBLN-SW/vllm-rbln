@@ -242,7 +242,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
         )
 
         if envs.VLLM_RBLN_METRICS:
-            self.performance_tracker = PerformanceTracker("MODEL")
+            self.model_performance_tracker = PerformanceTracker("MODEL")
             self.sampler_performance_tracker = PerformanceTracker("SAMPLER")
 
         # Ephemeral state transferred
@@ -323,7 +323,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
             if envs.VLLM_RBLN_METRICS and self.model_performance_tracker is not None:
                 self.collect_metrics(
                     self.model_performance_tracker,
-                    self.is_prefills()[0],
+                    model_input.is_prompt,
                     start_time=model_start_time,
                     end_time=time.perf_counter(),
                     reports=model_reports,
@@ -456,7 +456,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
             finished_requests_ids=list(finished_requests_ids),
             cached_block_tables=cached_block_tables,
             cached_lengths=cached_lengths,
-            is_prompt=is_prefill,
+            is_prompt=is_prefill, # FIXME unify the variable name is_prefill and is_prompt
             dummy_block=scheduler_output.dummy_block,
         )
         return model_input, num_scheduled_tokens
@@ -1323,6 +1323,10 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
             with capture_ctx as sampler_reports:
                 sampler_output = self._sample(padded_logits, spec_decode_metadata=None)
             if envs.VLLM_RBLN_METRICS and self.sampler_performance_tracker is not None:
+                if is_prompt:
+                    print("@@@ [prefill] sampler reports: ", sampler_reports)
+                else:
+                    print("@@@ [decode] sampler reports: ", sampler_reports)
                 self.collect_metrics(
                     self.sampler_performance_tracker,
                     is_prompt,
