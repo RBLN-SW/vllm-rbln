@@ -1323,10 +1323,6 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
             with capture_ctx as sampler_reports:
                 sampler_output = self._sample(padded_logits, spec_decode_metadata=None)
             if envs.VLLM_RBLN_METRICS and self.sampler_performance_tracker is not None:
-                if is_prompt:
-                    print("@@@ [prefill] sampler reports: ", sampler_reports)
-                else:
-                    print("@@@ [decode] sampler reports: ", sampler_reports)
                 self.collect_metrics(
                     self.sampler_performance_tracker,
                     is_prompt,
