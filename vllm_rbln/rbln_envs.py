@@ -265,3 +265,6 @@ def __getattr__(name: str):
     if name in environment_variables:
         return environment_variables[name]()
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+vllm_envs.update(environment_variables)
