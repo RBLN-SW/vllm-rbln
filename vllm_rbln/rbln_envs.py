@@ -15,9 +15,7 @@
 import os
 from typing import TYPE_CHECKING
 
-import vllm.envs as _vllm_envs_module
-
-vllm_envs = _vllm_envs_module.environment_variables
+from vllm.envs import environment_variables as vllm_envs
 
 if TYPE_CHECKING:
     VLLM_RBLN_COMPILE_MODEL: bool = True
