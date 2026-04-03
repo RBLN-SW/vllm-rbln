@@ -204,11 +204,12 @@ def main():
         model="Qwen/Qwen3-0.6B",
         max_num_seqs=2,
         max_model_len=2048,
-        block_size=256,
         enable_chunked_prefill=True,
         max_num_batched_tokens=128,
         num_gpu_blocks_override=32,
     )
+    # Can't directly pass this value due to validation
+    args.block_size = 1024  # type: ignore
 
     # Create an LLM without prefix caching as a baseline.
     args.enable_prefix_caching = False

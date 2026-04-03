@@ -67,6 +67,11 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 
+from vllm_rbln.v1.core.rbln_scheduler import RBLNSchedulerOutput
+
+if TYPE_CHECKING:
+    from vllm_rbln.v1.core.rbln_kv_cache_manager import KVCacheCopyOp
+
 # yapf conflicts with isort for this block
 # yapf: disable
 from vllm.v1.kv_cache_interface import (
@@ -283,6 +288,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         if "use_global_ctx" in inspect.signature(CompileContext).parameters:
             compile_ctx_args["use_global_ctx"] = True
         self.compile_context = CompileContext(**compile_ctx_args)
+        self.runtime_holder: list = []
 
         # Sampler
         self.use_rbln_sampler = envs.VLLM_RBLN_SAMPLER
@@ -1444,6 +1450,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             "process_group_dict": process_group_dict,
             "guard_filter_fn": torch.compiler.keep_tensor_guards_unsafe,
             "mode": "strict",
+            "_runtime_holder": self.runtime_holder,
         }
         if not envs.VLLM_DISABLE_COMPILE_CACHE:
             logger.info(
@@ -2647,6 +2654,21 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         return slot_mappings_by_gid, slot_mappings_by_layer
 
+    def _process_kv_cache_copy_ops(
+        self,
+        copy_ops: "list[KVCacheCopyOp]",
+    ) -> None:
+        if self.model_config.enforce_eager or not envs.VLLM_RBLN_COMPILE_MODEL:
+            for op in copy_ops:
+                for kv_cache in self.kv_caches:
+                    kv_cache[:, op.dst_block_id, :, :, : op.num_tokens, :] = kv_cache[
+                        :, op.src_block_id, :, :, : op.num_tokens, :
+                    ]
+        else:
+            runtime = self.runtime_holder[0]
+            for op in copy_ops:
+                runtime._copy_kv_cache(op.src_block_id, op.dst_block_id, op.num_tokens)
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -2663,6 +2685,15 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with record_function_or_nullcontext("Preprocess"):
             self._update_states(scheduler_output)
+
+            # Process sub-block KV cache copy operations before the forward
+            # pass so that partially cached blocks are populated.
+            if (
+                isinstance(scheduler_output, RBLNSchedulerOutput)
+                and scheduler_output.kv_cache_copy_ops
+            ):
+                self._process_kv_cache_copy_ops(scheduler_output.kv_cache_copy_ops)
+
             if not num_scheduled_tokens:
                 if not has_kv_transfer_group():
                     # Return empty ModelRunnerOutput if there's no work to do.
@@ -4154,8 +4185,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             num_attn_module,
         )
         if not self.model_config.enforce_eager and envs.VLLM_RBLN_COMPILE_MODEL:
-            for kv_cache in self.kv_caches:
-                self.compile_context.mark_static_address(kv_cache)
+            for i, kv_cache in enumerate(self.kv_caches):
+                self.compile_context.mark_static_address(kv_cache, f"kv_cache_{i}")
 
         return kv_caches
 
@@ -4194,6 +4225,15 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             kv_cache_config: Configuration for the KV cache, including the KV
             cache size of each layer
         """
+        if envs.VLLM_RBLN_SUB_BLOCK_CACHE and (
+            len(kv_cache_config.kv_cache_groups) > 1
+        ):
+            raise NotImplementedError(
+                "Sub-block prefix caching does not support "
+                "multi-group KV caches yet.  "
+                "Set VLLM_RBLN_SUB_BLOCK_CACHE=false to disable."
+            )
+
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
         self.may_add_encoder_only_layers_to_kv_cache_config()
