@@ -23,9 +23,14 @@ from typing import Any
 
 import torch
 from huggingface_hub import hf_hub_download
-from safetensors.torch import save_file
+from safetensors import safe_open
+from safetensors.torch import load_file, save_file
 from transformers import AutoConfig
 
+DEFAULT_EAGLE_TEST_MODEL_IDS: dict[str, tuple[str, str]] = {
+    "eagle": ("meta-llama/Llama-3.2-1B", "JKroller/llama3.2-1b-eagle"),
+    "eagle3": ("Qwen/Qwen3-1.7B", "AngelSlim/Qwen3-1.7B_eagle3"),
+}
 DEFAULT_MODEL_ID = "meta-llama/Llama-3.2-1B"
 DEFAULT_MEDUSA_MODEL_ID = "MegaLearner/medusa_llama_3_2_1b_3_heads"
 
@@ -35,10 +40,16 @@ _EXT_BIAS_RE = re.compile(r"^(\d+)\.0\.linear\.bias$")
 _EXT_LM_HEAD_RE = re.compile(r"^(\d+)\.1\.weight$")
 
 
+def get_default_eagle_test_model_ids(method: str) -> tuple[str, str]:
+    try:
+        return DEFAULT_EAGLE_TEST_MODEL_IDS[method]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported speculative method: {method}") from exc
+
+
 def _load_json(path: str | Path) -> dict[str, Any]:
     with Path(path).open("r", encoding="utf-8") as f:
         return json.load(f)
-
 
 def _is_vllm_medusa_config(config_dict: dict[str, Any]) -> bool:
     return config_dict.get("model_type") == "medusa" and isinstance(
@@ -161,8 +172,113 @@ def ensure_converted_medusa_adapter(
     return str(out_dir), num_heads
 
 
+def _remote_has_config(model_id: str) -> bool:
+    try:
+        hf_hub_download(model_id, "config.json")
+        return True
+    except Exception:
+        return False
+
+
+def _infer_num_draft_layers(weight_keys: list[str]) -> int:
+    layer_indices: set[int] = set()
+    layer_pattern = re.compile(r"^(?:model\.)?layers\.(\d+)\.")
+    for key in weight_keys:
+        if (match := layer_pattern.match(key)) is not None:
+            layer_indices.add(int(match.group(1)))
+    if not layer_indices:
+        raise ValueError("Could not infer Eagle draft layer count from weights.")
+    return max(layer_indices) + 1
+
+
+def _map_external_eagle_state_dict(
+    source_state_dict: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    converted: dict[str, torch.Tensor] = {}
+    for key, value in source_state_dict.items():
+        new_key = key
+        if new_key.startswith("model."):
+            new_key = new_key[len("model.") :]
+        if new_key == "fusion.fc.bias":
+            # vLLM Eagle Llama uses fc without bias.
+            continue
+        if new_key.startswith("fusion.fc."):
+            new_key = f"fc.{new_key[len('fusion.fc.') :]}"
+        converted[new_key] = value
+    return converted
+
+
+def _validate_converted_state_dict(
+    state_dict: dict[str, torch.Tensor],
+    num_draft_layers: int,
+) -> None:
+    required_keys = {"fc.weight"}
+    required_layer_suffixes = (
+        "self_attn.q_proj.weight",
+        "self_attn.k_proj.weight",
+        "self_attn.v_proj.weight",
+        "self_attn.o_proj.weight",
+        "mlp.gate_proj.weight",
+        "mlp.up_proj.weight",
+        "mlp.down_proj.weight",
+        "post_attention_layernorm.weight",
+    )
+    for layer_idx in range(num_draft_layers):
+        for suffix in required_layer_suffixes:
+            required_keys.add(f"layers.{layer_idx}.{suffix}")
+
+    missing = [key for key in sorted(required_keys) if key not in state_dict]
+    if missing:
+        raise ValueError(f"Missing required Eagle tensors after conversion: {missing}")
+
+
+def ensure_vllm_compatible_eagle_draft_model(
+    *,
+    eagle_model_id: str,
+    base_model_id: str,
+) -> str:
+    model_path = Path(eagle_model_id)
+    if model_path.exists() and (model_path / "config.json").is_file():
+        return str(model_path)
+    if _remote_has_config(eagle_model_id):
+        return eagle_model_id
+
+    source_weights_path = hf_hub_download(eagle_model_id, "model.safetensors")
+    snapshot_dir = Path(source_weights_path).parent
+    out_dir = snapshot_dir / "vllm_converted_eagle"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_config_path = out_dir / "config.json"
+    out_weights_path = out_dir / "model.safetensors"
+
+    with safe_open(source_weights_path, framework="pt", device="cpu") as f:
+        source_keys = list(f.keys())
+    num_draft_layers = _infer_num_draft_layers(source_keys)
+
+    base_config = AutoConfig.from_pretrained(base_model_id)
+    out_config = base_config.to_dict()
+    out_config["num_hidden_layers"] = num_draft_layers
+    out_config["draft_vocab_size"] = int(base_config.vocab_size)
+    out_config["dtype"] = "bfloat16"
+    out_config["torch_dtype"] = "bfloat16"
+
+    if out_config_path.exists() and out_weights_path.exists():
+        existing = _load_json(out_config_path)
+        if existing == out_config:
+            return str(out_dir)
+
+    source_state_dict = load_file(source_weights_path)
+    converted_state_dict = _map_external_eagle_state_dict(source_state_dict)
+    _validate_converted_state_dict(converted_state_dict, num_draft_layers)
+    save_file(converted_state_dict, str(out_weights_path))
+    out_config_path.write_text(json.dumps(out_config, indent=2), encoding="utf-8")
+    return str(out_dir)
+
+
 __all__ = [
+    "DEFAULT_EAGLE_TEST_MODEL_IDS",
     "DEFAULT_MEDUSA_MODEL_ID",
     "DEFAULT_MODEL_ID",
     "ensure_converted_medusa_adapter",
+    "ensure_vllm_compatible_eagle_draft_model",
+    "get_default_eagle_test_model_ids",
 ]
