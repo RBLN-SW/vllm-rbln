@@ -365,6 +365,15 @@ class RBLNScheduler(Scheduler):
                     if self.ec_connector is not None:
                         self.ec_connector.update_state_after_alloc(request, i)
 
+            # NOTE(RBLN): We restrict the decode batch size to
+            # (max_num_seqs // pipeline_parallel_size) to prevent pipeline
+            # bubbles.
+            if len(scheduled_running_reqs) >= (
+                self.max_num_running_reqs
+                // self.vllm_config.parallel_config.pipeline_parallel_size
+            ):
+                break
+
         # NOTE(RBLN): Retroactively apply spec_decode_cap to requests scheduled
         # before the cap was tightened. Only needed when spec decode is active
         # this step (scheduled_spec_decode_tokens non-empty), since that is when
