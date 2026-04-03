@@ -650,9 +650,7 @@ class RBLNScheduler(Scheduler):
                 # NOTE(RBLN): Apply sub-block match now that blocks are
                 # allocated (the destination block exists).
                 if sub_block_match is not None:
-                    self.kv_cache_manager.apply_sub_block_match(
-                        sub_block_match, request
-                    )
+                    self.kv_cache_manager.apply_sub_block_match(sub_block_match)
                     sub_block_match = None
 
                 # NOTE(RBLN): By calling allocate_slots with

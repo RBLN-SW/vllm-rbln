@@ -223,8 +223,8 @@ class SubBlockMatch:
     source-block references).
     """
 
+    request: Request
     num_tokens: int
-    num_matched_sub_blocks: int
     group_matches: tuple[_GroupPartialMatch, ...]
 
 
@@ -232,11 +232,10 @@ class SubBlockMatch:
 class _GroupPartialMatch:
     """Per-group partial match info."""
 
-    src_block_id: int
     src_block: KVCacheBlock
     # Index of the block (in the request's block list) that will receive
     # the copied sub-blocks.
-    dst_block_index: int
+    dst_req_block_index: int
 
 
 @dataclass(slots=True)
@@ -375,9 +374,8 @@ class RBLNKVCacheManager(KVCacheManager):
 
             group_matches.append(
                 _GroupPartialMatch(
-                    src_block_id=src_block_id,
                     src_block=self.block_pool.blocks[src_block_id],
-                    dst_block_index=num_full_blocks,
+                    dst_req_block_index=num_full_blocks,
                 )
             )
 
@@ -402,8 +400,8 @@ class RBLNKVCacheManager(KVCacheManager):
         # The SubBlockMatch owns these references until apply or release.
         self.block_pool.touch([gm.src_block for gm in group_matches])
         match = SubBlockMatch(
+            request=request,
             num_tokens=extra_tokens,
-            num_matched_sub_blocks=num_matched,
             group_matches=tuple(group_matches),
         )
 
@@ -414,34 +412,31 @@ class RBLNKVCacheManager(KVCacheManager):
                 num_matched,
                 extra_tokens,
                 ", ".join(
-                    f"group {i} from block {gm.src_block_id}"
+                    f"group {i} from block {gm.src_block.block_id}"
                     for i, gm in enumerate(group_matches)
                 ),
             )
 
         return match
 
-    def apply_sub_block_match(
-        self,
-        match: SubBlockMatch,
-        request: Request,
-    ) -> None:
+    def apply_sub_block_match(self, match: SubBlockMatch) -> None:
         """Create copy ops from a sub-block match.
 
         Call this after ``allocate_slots`` succeeds. The source-block refs
         owned by *match* are transferred to the pending copy ops (released
         by ``release_copy_ops``).
         """
+        request = match.request
         blocks = self.coordinator.get_blocks(request.request_id)
 
         for i, gm in enumerate(match.group_matches):
             block_list = blocks[i]
             # By this point, the destination block must have been allocated.
-            dst_block = block_list[gm.dst_block_index]
+            dst_block = block_list[gm.dst_req_block_index]
             self.pending_copy_ops.append(
                 KVCacheCopyOp(
                     group_id=i,
-                    src_block_id=gm.src_block_id,
+                    src_block_id=gm.src_block.block_id,
                     dst_block_id=dst_block.block_id,
                     num_tokens=match.num_tokens,
                 )

@@ -357,7 +357,7 @@ def _prefill_request(manager: RBLNKVCacheManager, request: Request):
         computed_blocks,
     )
     if blocks is not None and sub_block_match is not None:
-        manager.apply_sub_block_match(sub_block_match, request)
+        manager.apply_sub_block_match(sub_block_match)
     elif sub_block_match is not None:
         manager.release_sub_block_match(sub_block_match)
     # Simulate execute_model completion.
@@ -436,7 +436,6 @@ class TestRBLNKVCacheManager:
         )
         assert sub_block_match is not None
         assert sub_block_match.num_tokens == self.SUB_BLOCK_SIZE
-        assert sub_block_match.num_matched_sub_blocks == 1
 
     def test_copy_op_generated_on_partial_match(self):
         """After partial match detection + allocate_slots, a copy op should
@@ -624,7 +623,7 @@ class TestRBLNKVCacheManager:
             )
             # Whether it succeeds or fails, caller releases the match.
             if result is not None:
-                manager.apply_sub_block_match(match, req1)
+                manager.apply_sub_block_match(match)
             else:
                 manager.release_sub_block_match(match)
 
@@ -686,7 +685,6 @@ class TestRBLNKVCacheManager:
         )
         assert sub_block_match is not None
         assert sub_block_match.num_tokens == self.SUB_BLOCK_SIZE
-        assert sub_block_match.num_matched_sub_blocks == 1
 
     def test_no_partial_block_cache_when_block_is_full(self):
         """free() should NOT double-cache a block that is already fully cached."""
@@ -762,7 +760,6 @@ class TestRBLNKVCacheManager:
         assert num_computed == 0
         sub_match = manager.get_computed_blocks_sub_block(req1, num_computed)
         assert sub_match is not None
-        assert sub_match.num_matched_sub_blocks == 2
         assert sub_match.num_tokens == 2 * SBS
         assert num_computed + sub_match.num_tokens <= req1.num_tokens - 1
         manager.release_sub_block_match(sub_match)
@@ -1506,7 +1503,6 @@ class TestMultiGroupRBLNKVCacheManager:
         sub_block_match = manager.get_computed_blocks_sub_block(req1, num_computed)
         assert sub_block_match is not None
         assert sub_block_match.num_tokens == sbs
-        assert sub_block_match.num_matched_sub_blocks == 1
 
     def test_hybrid_partial_block_indexed_on_free(self):
         """In multi-group setup, free() should index partial blocks in both
