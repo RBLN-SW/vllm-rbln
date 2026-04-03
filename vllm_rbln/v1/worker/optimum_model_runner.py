@@ -1455,6 +1455,8 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
         if sampler_output.logprobs_tensors is not None:
             for field_name in sampler_output.logprobs_tensors._fields:
                 tensor = getattr(sampler_output.logprobs_tensors, field_name)
+                # There is a field whose default value is None,
+                # so we need to check if it is not None before slicing.
                 if tensor is not None:
                     dict[field_name] = tensor[: num_reqs * num_spec_decode_token]
             logprobs_tensors = LogprobsTensors(**dict)
