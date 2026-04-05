@@ -33,7 +33,7 @@ def get_multimodal_cls(architecture: str) -> type[Any]:
         return RBLNAutoModelForVision2Seq
 
 
-_COMPILE_FNS: dict[str, Callable[[int, int, int, int], dict]] = {
+_COMPILE_MULTIMODAL_FNS: dict[str, Callable[[int, int, int, int], dict]] = {
     "blip2": get_param_blip2,
     "idefics3": get_param_idefics3,
     "llava": get_param_llava,
@@ -43,24 +43,3 @@ _COMPILE_FNS: dict[str, Callable[[int, int, int, int], dict]] = {
     "qwen2_vl": get_param_qwen2_vl,
     "qwen2_5_vl": get_param_qwen2_5_vl,
 }
-
-
-def compile_multimodal(
-    model_name: str,
-    architecture: str,
-    model_alias: str,
-    batch_size: int,
-    max_model_len: int,
-    block_size: int,
-    tp_size: int,
-) -> dict:
-    model_cls = get_multimodal_cls(architecture)
-    compile_fn = _COMPILE_FNS.get(model_alias)
-    if compile_fn is None:
-        raise ValueError(
-            f"Unknown multimodal model alias: {model_alias}. "
-            f"Supported aliases: {sorted(_COMPILE_FNS.keys())}"
-        )
-    param = compile_fn(batch_size, max_model_len, block_size, tp_size)
-    model = model_cls.from_pretrained(model_name, export=True, rbln_config=param)
-    return model

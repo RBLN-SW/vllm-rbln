@@ -22,7 +22,7 @@ from optimum.rbln import (
 )
 from transformers import PretrainedConfig
 
-from .multimodal import compile_multimodal
+from .multimodal import _COMPILE_MULTIMODAL_FNS, get_multimodal_cls
 
 # modified/customized models for RBLN
 _RBLN_GENERATION_MODELS: dict[str, tuple[str, str]] = {
@@ -162,45 +162,38 @@ def compile_model(
         config
     )  # check if the model is supported and get model info
     default_param: dict[str, Any] = {
-        "rbln_tensor_parallel_size": tp_size,
+        "tensor_parallel_size": tp_size,
     }
-    if additional_config:
-        default_param.update(additional_config)
+
     if is_generation_arch(config):
-        default_param["rbln_batch_size"] = batch_size
-        default_param["rbln_max_seq_len"] = max_model_len
+        default_param["batch_size"] = batch_size
+        default_param["max_seq_len"] = max_model_len
         if block_size != max_model_len:
             attn_impl = "flash_attn" if block_size != max_model_len else "eager"
-            default_param["rbln_kvcache_partition_len"] = block_size
-            default_param["rbln_attn_impl"] = attn_impl
-
-        model = RBLNAutoModelForCausalLM.from_pretrained(
-            hf_model_name,
-            **default_param,
-        )
+            default_param["kvcache_partition_len"] = block_size
+            default_param["attn_impl"] = attn_impl
+        model_cls = RBLNAutoModelForCausalLM
     elif is_pooling_arch(config):
         model_cls_name = _RBLN_SUPPORTED_MODELS[architectures[0]][1]
         model_cls = getattr(optimum.rbln, model_cls_name)
         assert model_cls is not None
-        default_param["rbln_batch_size"] = batch_size
-        default_param["rbln_max_seq_len"] = max_model_len
+        default_param["batch_size"] = batch_size
+        default_param["max_seq_len"] = max_model_len
         # FIXME: We need a more generalized logic to specify block sizes
         # as the number of supported models continues to grow.
         if architectures[0] == "Qwen3Model" and block_size != max_model_len:
             attn_impl = "flash_attn" if block_size != max_model_len else "eager"
-            default_param["rbln_kvcache_partition_len"] = block_size
-            default_param["rbln_attn_impl"] = attn_impl
-        model = model_cls.from_pretrained(hf_model_name, **default_param)
+            default_param["kvcache_partition_len"] = block_size
+            default_param["attn_impl"] = attn_impl
     elif is_multi_modal(config):
-        model = compile_multimodal(
-            model_name=hf_model_name,
-            architecture=architectures[0],
-            model_alias=model_name,
-            batch_size=batch_size,
-            max_model_len=max_model_len,
-            block_size=block_size,
-            tp_size=tp_size,
-        )
+        model_cls = get_multimodal_cls(architectures[0])
+        compile_fn = _COMPILE_MULTIMODAL_FNS.get(model_name)
+        if compile_fn is None:
+            raise ValueError(
+                f"Unknown multimodal model alias: {model_name}. "
+                f"Supported aliases: {sorted(_COMPILE_MULTIMODAL_FNS.keys())}"
+            )
+        default_param = compile_fn(batch_size, max_model_len, block_size, tp_size)
     elif is_enc_dec_arch(config):
         assert architectures[0] == "WhisperForConditionalGeneration"
         # Whisper model does not require max_model_len and block_size
@@ -211,15 +204,24 @@ def compile_model(
             f"max_model_len ({max_model_len}) must match the Whisper model's "
             f"max_length ({config.max_length}) from the HuggingFace config."
         )
-        default_param["rbln_batch_size"] = batch_size
-        model = RBLNAutoModelForSpeechSeq2Seq.from_pretrained(
-            hf_model_name,
-            rbln_token_timestamps=False,
-            **default_param,
-        )
+        default_param["batch_size"] = batch_size
+        default_param["token_timestamps"] = False
+        model_cls = RBLNAutoModelForSpeechSeq2Seq
     else:
         raise NotImplementedError(
             f"Compilation is not implemented for architecture {architectures[0]}"
         )
+    print("@@ additional_config for compilation: ", additional_config)
+    if additional_config:
+        default_param.update(additional_config)
+    # FIXME:
+    # Check conflict between default_param and additional_config,
+    # and raise error if conflict exists, to avoid silent bug.
+    print("@@ default_param for compilation: ", default_param)
+    model = model_cls.from_pretrained(
+        hf_model_name,
+        rbln_config=default_param,
+    )
+
     model.save_pretrained(model_path)
     return model

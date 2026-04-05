@@ -14,6 +14,7 @@
 
 """Top-level vLLM ↔ RBLN config synchronisation entry points."""
 
+import os
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -21,6 +22,7 @@ if TYPE_CHECKING:
 else:
     VllmConfig = None
 
+import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
 from vllm_rbln.utils.optimum.cache_blocks import (
     sync_cache_block_size,
@@ -38,6 +40,13 @@ from vllm_rbln.utils.optimum.registry import (
 )
 
 logger = init_logger(__name__)
+
+
+def _is_internally_compiled(vllm_config: VllmConfig) -> bool:
+    """Check if the model was internally compiled and cached by vllm-rbln."""
+    model_path = str(vllm_config.model_config.model)
+    cache_root = os.path.join(envs.VLLM_CACHE_ROOT, "compiled_models")
+    return model_path.startswith(cache_root)
 
 
 def get_invalid_leaf_keys(dict_rbln_config, prefix=""):
@@ -136,8 +145,6 @@ def prepare_vllm_for_compile(vllm_config: VllmConfig) -> None:
     if not vllm_config.cache_config.user_specified_block_size:
         # Set block_size to 4096 for fast compilation
         if is_multi_modal(hf_config) or is_generation_arch(hf_config):
-            vllm_config.cache_config.block_size = 4096
-        else:
             vllm_config.cache_config.block_size = vllm_config.model_config.max_model_len
     else:
         if is_multi_modal(hf_config) or is_generation_arch(hf_config):
@@ -180,14 +187,17 @@ def sync_with_rbln_config(vllm_config: VllmConfig) -> None:
     additional_rbln_config = vllm_config.additional_config.get("rbln_config", {})
     # If the pre-compiled model exists, rbln_config is not None
     if rbln_config is not None:
-        invalid_keys = get_invalid_leaf_keys(additional_rbln_config)
-        if invalid_keys:
-            raise RuntimeError(
-                "For now, we only support 'device' as a configurable key "
-                "in rbln_config passed through additional_config "
-                "for pre-compiled optimum models. "
-                f"Got unsupported keys: {invalid_keys}"
-            )
+        # Only validate additional_config keys for user-provided pre-compiled models,
+        # not for internally compiled and cached models.
+        if not _is_internally_compiled(vllm_config):
+            invalid_keys = get_invalid_leaf_keys(additional_rbln_config)
+            if invalid_keys:
+                raise RuntimeError(
+                    "For now, we only support 'device' as a configurable key "
+                    "in rbln_config passed through additional_config "
+                    "for pre-compiled optimum models. "
+                    f"Got unsupported keys: {invalid_keys}"
+                )
 
         (
             num_blocks,
@@ -205,8 +215,4 @@ def sync_with_rbln_config(vllm_config: VllmConfig) -> None:
             prefill_chunk_size,
         )
     else:
-        assert len(additional_rbln_config) == 0, (
-            "For now, we don't support passing rbln_config "
-            "through additional_config for compilation yet."
-        )
         prepare_vllm_for_compile(vllm_config)
