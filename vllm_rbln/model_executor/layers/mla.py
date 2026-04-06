@@ -80,7 +80,7 @@ def __MLAAttentionWrapper_forward(
         q,
         kv_c_normed,
         k_pe,
-        output_shape=(hidden_states.shape[0], self.num_heads * self.v_head_dim),
+        output_shape=(batch_size, seq_len, self.num_heads * self.v_head_dim),
     )
 
     return self.o_proj(attn_out)[0]
