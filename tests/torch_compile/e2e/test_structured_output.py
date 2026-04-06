@@ -105,7 +105,7 @@ class TestJsonStructuredOutput:
                 max_tokens=32,
                 structured_outputs=StructuredOutputsParams(
                     json=CarDescription.model_json_schema()
-                )
+                ),
             ),
         )
         text = outputs[0].outputs[0].text
