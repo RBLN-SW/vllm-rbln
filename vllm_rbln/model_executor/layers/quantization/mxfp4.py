@@ -384,10 +384,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         orig_shape = x.shape  # noqa: F841
         num_tokens = orig_shape[:-1].numel()  # noqa: F841
         hidden_states = x.reshape(num_tokens, -1)
-        masked_routing_weights = router_logits.reshape(num_tokens, -1)
-
-        # transpose to [num_experts, num_tokens] for custom_moe_glu_mxfp4
-        masked_routing_weights_t = masked_routing_weights.transpose(0, 1)
+        masked_routing_weights = router_logits
 
         if layer.activation == "swigluoai":
             expert_map_const = None
@@ -407,7 +404,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.down_proj_blocks,
                 layer.down_proj_scales,
                 layer.down_proj_bias,
-                masked_routing_weights_t,
+                masked_routing_weights,
                 self.swiglu_alpha,
                 self.swiglu_limit,
                 expert_map_const,
