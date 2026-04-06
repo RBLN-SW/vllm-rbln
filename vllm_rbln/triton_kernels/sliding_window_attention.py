@@ -429,7 +429,7 @@ def warmup(func, *args):
 
 
 @triton_op("rbln_triton_ops::sliding_window_attention_naive_prefill", mutates_args=())
-def _(
+def sliding_window_attention_naive_prefill_wrapper(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -504,7 +504,7 @@ def _(
 
 
 @triton_op("rbln_triton_ops::sliding_window_attention_naive_decode", mutates_args=())
-def _(
+def sliding_window_attention_naive_decode_wrapper(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
