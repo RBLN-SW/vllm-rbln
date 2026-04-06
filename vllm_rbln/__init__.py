@@ -44,7 +44,7 @@ def register_model():
 
 def register_ops():
     if envs.VLLM_RBLN_USE_VLLM_MODEL:
-        import vllm_rbln.attention.layer  # noqa
+        import vllm_rbln.model_executor.layers.attention.attention  # noqa
         import vllm_rbln.forward_context  # noqa
         import vllm_rbln.lora.layer  # noqa
         import vllm_rbln.model_executor.layers.fused_moe.layer  # noqa

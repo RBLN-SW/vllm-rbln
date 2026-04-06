@@ -15,15 +15,15 @@
 from pathlib import Path
 
 import torch
-from vllm.attention.backends.abstract import AttentionType
-from vllm.attention.backends.registry import AttentionBackendEnum
-from vllm.attention.selector import AttentionSelectorConfig
+from vllm.v1.attention.backend import AttentionType
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.attention.selector import AttentionSelectorConfig
 
 
 def test_platform_plugins():
     import runpy
 
-    repo_root = Path(__file__).resolve().parents[4]
+    repo_root = Path(__file__).resolve().parents[3]
     example_file = (
         repo_root / "examples" / "experimental" / "offline_inference_basic.py"
     )
@@ -43,10 +43,12 @@ def test_register_ops(vllm_config):
     from vllm.config import set_current_vllm_config
 
     with set_current_vllm_config(vllm_config):
-        # Attention
-        from vllm.attention.layer import Attention
+        # Attention (patched by vllm_rbln.model_executor.layers.attention)
+        from vllm.model_executor.layers.attention.attention import Attention
 
-        attention = Attention(16, 32, 16, 16, prefix="layer.0")
+        import vllm_rbln.model_executor.layers.attention  # noqa: F401
+
+        attention = Attention(16, 32, 0.125, 16, prefix="layer.0")
         assert hasattr(attention, "layer_index"), (
             f"Expected 'layer_index' in attention.__dict__, got {attention.__dict__}"
         )
