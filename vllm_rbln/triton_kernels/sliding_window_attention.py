@@ -54,7 +54,6 @@ def sliding_window_attention_naive_prefill(
             block_shape=(1, 1),
             order=(1, 0),
         )
-        cache_start = rblib.to_dynamic_index(cache_seq_len_ptr)
 
         cache_offset_ptr = tl.make_block_ptr(
             base=cache_offset_base,
@@ -64,7 +63,6 @@ def sliding_window_attention_naive_prefill(
             block_shape=(1, 1),
             order=(1, 0),
         )
-        cache_end = rblib.to_dynamic_index(cache_offset_ptr)
 
         # -- get physical block index from block table --
         block_table_ptr = tl.make_block_ptr(
@@ -77,7 +75,10 @@ def sliding_window_attention_naive_prefill(
         )
         tl.static_assert(len(block_table_ptr.type.element_ty.shape) == DIM_BLOCK_TABLE)
 
+        cache_start = rblib.to_dynamic_index(cache_seq_len_ptr)
+        cache_end = rblib.to_dynamic_index(cache_offset_ptr)
         block_number = rblib.to_dynamic_index(block_table_ptr)
+        block_number = block_number.cast(tl.int32)
 
         k_block_ptr = tl.make_block_ptr(
             base=key_base,
@@ -274,6 +275,7 @@ def sliding_window_attention_naive_decode(
         cache_start = rblib.to_dynamic_index(cache_seq_len_ptr)
         cache_end = rblib.to_dynamic_index(cache_offset_ptr)
         block_number = rblib.to_dynamic_index(block_table_ptr)
+        block_number = block_number.cast(tl.int32)
 
         k_block_ptr = tl.make_block_ptr(
             base=key_base,
