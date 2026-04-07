@@ -88,7 +88,6 @@ def create_scheduler(
 
     cache_config = CacheConfig(
         block_size=block_size,
-        swap_space=0,
         cache_dtype="auto",
         enable_prefix_caching=enable_prefix_caching,
     )
@@ -110,7 +109,12 @@ def create_scheduler(
         kv_cache_groups=[
             KVCacheGroupSpec(
                 ["layer"],
-                FullAttentionSpec(block_size, 1, 1, torch.float32, False),
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
             )
         ],
     )
@@ -211,7 +215,6 @@ def create_requests(
             sampling_params=sampling_params,
             pooling_params=None,
             mm_features=mm_features if mm_features else None,
-            eos_token_id=EOS_TOKEN_ID,
             block_hasher=block_hasher,
         )
         requests.append(request)

@@ -133,8 +133,9 @@ def prepare_vllm_for_compile(vllm_config: VllmConfig) -> None:
     # NOTE: Uses the user-defined max_model_len if provided;
     # otherwise, it defaults to the model's native maximum length.
     # Note that using the default value may significantly increase compilation time.
-    vllm_config.scheduler_config.max_num_batched_tokens = (
-        vllm_config.model_config.max_model_len
+    vllm_config.scheduler_config.max_num_batched_tokens = max(
+        vllm_config.model_config.max_model_len,
+        vllm_config.scheduler_config.max_num_seqs,
     )
 
     logger.info(

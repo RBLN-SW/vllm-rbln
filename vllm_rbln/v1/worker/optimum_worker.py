@@ -25,8 +25,8 @@ from vllm.distributed import (
     init_distributed_environment,
 )
 from vllm.lora.request import LoRARequest
-from vllm.model_executor import set_random_seed
 from vllm.tasks import SupportedTask
+from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.core.kv_cache_utils import get_uniform_page_size
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheSpec
