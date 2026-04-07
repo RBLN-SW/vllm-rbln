@@ -112,7 +112,9 @@ class RBLNOptimumWorker(WorkerBase):
                 "Skipping set_cpu_affinity, setting threads to %d.",
                 allocated_cpus, reported_cpus, allocated_cpus,
             )
-            set_omp_num_threads(self.rank, self.local_rank, allocated_cpus)
+            allocated_cpus = len(os.sched_getaffinity(0))
+            num_threads = allocated_cpus // 2  # physical cores only, skip HT
+            set_omp_num_threads(self.rank, self.local_rank, max(2, num_threads))
         else:
             # Bare metal: use NUMA-aware binding
             set_cpu_affinity(self.rank, self.local_rank, self.parallel_config)
