@@ -105,19 +105,15 @@ class RBLNOptimumWorker(WorkerBase):
             self.parallel_config,
         )
 
+        # set_cpu_affinity already selects physical cores only (no HT)
+        # so use the full affinity count
         allocated_cpus = len(os.sched_getaffinity(0))
-        num_threads = max(2, allocated_cpus // 2)
         set_omp_num_threads(
             self.rank,
             self.local_rank,
-            num_threads,
+            max(2, allocated_cpus),
         )
 
-        # NOTE(RBLN): numba is used throughout vllm code base (especially in spec-dec)
-        # however accessing numba thread settings somewhat affects torch
-        # thread settings and cause global state change leading to recompilation.
-        # Thus the only solution for now is to set both thread settings to identical
-        # value in correct order like below
         numba.set_num_threads(torch.get_num_threads())
         torch.set_num_threads(numba.get_num_threads())
 
