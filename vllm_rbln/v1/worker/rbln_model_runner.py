@@ -290,6 +290,11 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.compile_context = CompileContext(**compile_ctx_args)
         self.runtime_holder: list = []
 
+        # Mutable list populated by the RBLN compile backend with the
+        # rebel runtime.  Passed as a reference to the KV connector so
+        # it can lazily access the runtime after compilation completes.
+        self.runtime_holder: list = []
+
         # Sampler
         self.use_rbln_sampler = envs.VLLM_RBLN_SAMPLER
         if self.use_rbln_sampler:
@@ -4197,8 +4202,10 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             num_attn_module,
         )
         if not self.model_config.enforce_eager and envs.VLLM_RBLN_COMPILE_MODEL:
-            for i, kv_cache in enumerate(self.kv_caches):
-                self.compile_context.mark_static_address(kv_cache, f"kv_cache_{i}")
+            runner_kv_cache_names: list[str] = []
+            bind_kv_cache_name(kv_caches, runner_kv_cache_names, num_attn_module)
+            for kv_cache, name in zip(self.kv_caches, runner_kv_cache_names):
+                self.compile_context.mark_static_address(kv_cache, name)
 
         return kv_caches
 
@@ -4323,16 +4330,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # and the connector reads runtime_holder[0] at transfer time.
             if hasattr(kv_transfer_group, "set_runtime_holder"):
                 kv_transfer_group.set_runtime_holder(self.runtime_holder)
-                logger.info(
-                    "Passed runtime_holder to LMCache RBLNConnector (lazy)"
-                )
+                logger.info("Passed runtime_holder to LMCache RBLNConnector (lazy)")
             elif len(self.runtime_holder) > 0 and hasattr(
                 kv_transfer_group, "set_runtime"
             ):
                 kv_transfer_group.set_runtime(self.runtime_holder[0])
-                logger.info(
-                    "Injected rebel runtime into LMCache RBLNConnector"
-                )
+                logger.info("Injected rebel runtime into LMCache RBLNConnector")
 
             logger.info(
                 "Registered %d KV cache layers with KV connector",
