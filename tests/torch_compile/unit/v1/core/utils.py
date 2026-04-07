@@ -18,16 +18,25 @@
 # Search for NOTE(RBLN) or TODO(RBLN) for changes
 
 
+from dataclasses import dataclass
+from itertools import chain
+
 import torch
 from vllm.config import (
     CacheConfig,
     # ECTransferConfig,
-    # KVTransferConfig,
+    KVTransferConfig,
     ModelConfig,
     ParallelConfig,
     SchedulerConfig,
     SpeculativeConfig,
     VllmConfig,
+)
+from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorBase_V1,
+    KVConnectorMetadata,
+    KVConnectorRole,
 )
 from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
@@ -36,6 +45,7 @@ from vllm.multimodal.inputs import (
 )
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
+from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
@@ -53,6 +63,93 @@ from vllm_rbln.v1.core.rbln_scheduler import RBLNScheduler
 EOS_TOKEN_ID = 50256
 
 
+# ---------------------------------------------------------------------------
+# Mock KV Connector for testing sub-block ↔ connector interaction
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class MockKVConfig:
+    """Config for MockKVConnector: how many tokens to report as externally
+    cached, and whether loading is async."""
+
+    matched_tokens: int = 0
+    is_async: bool = False
+
+
+class _MockKVConnectorMetadata(KVConnectorMetadata):
+    def __init__(self):
+        self.requests: list = []
+
+
+class MockKVConnector(KVConnectorBase_V1):
+    """Minimal mock KV connector for scheduler tests.
+
+    Returns ``config.matched_tokens`` as external tokens only for requests
+    whose ``kv_transfer_params`` contain ``do_remote_prefill=True``.
+    Other requests get 0 external tokens.
+    """
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        role: KVConnectorRole,
+        kv_cache_config: KVCacheConfig | None = None,
+    ):
+        super().__init__(vllm_config, role, kv_cache_config)
+        extra = self._kv_transfer_config.kv_connector_extra_config
+        self.config = MockKVConfig(
+            matched_tokens=extra["matched_tokens"],
+            is_async=extra["is_async"],
+        )
+
+    def get_num_new_matched_tokens(
+        self, request: Request, num_computed_tokens: int
+    ) -> tuple[int | None, bool]:
+        params = getattr(request, "kv_transfer_params", None)
+        if params and params.get("do_remote_prefill"):
+            return (self.config.matched_tokens, self.config.is_async)
+        return (0, False)
+
+    def update_state_after_alloc(
+        self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
+    ):
+        pass
+
+    def build_connector_meta(
+        self, scheduler_output: SchedulerOutput
+    ) -> KVConnectorMetadata:
+        metadata = _MockKVConnectorMetadata()
+        cached_reqs = scheduler_output.scheduled_cached_reqs
+        for req_id in chain(
+            (req.req_id for req in scheduler_output.scheduled_new_reqs),
+            (
+                req_id
+                for req_id in cached_reqs.req_ids
+                if req_id in cached_reqs.resumed_req_ids
+            ),
+        ):
+            metadata.requests.append({"req_id": req_id})
+        return metadata
+
+    def start_load_kv(self, forward_context, **kwargs):
+        pass
+
+    def wait_for_layer_load(self, layer_name):
+        pass
+
+    def save_kv_layer(self, layer_name, kv_layer, attn_metadata, **kwargs):
+        pass
+
+    def wait_for_save(self):
+        pass
+
+
+KVConnectorFactory.register_connector(
+    "MockKVConnector", __name__, MockKVConnector.__name__
+)
+
+
 def create_scheduler(
     model: str = "facebook/opt-125m",
     max_num_seqs: int = 16,
@@ -61,7 +158,7 @@ def create_scheduler(
     enable_prefix_caching: bool = False,
     long_prefill_token_threshold: int = 0,
     disable_chunked_mm_input: bool = False,
-    use_kv_connector: None | bool = None,
+    use_kv_connector: None | MockKVConfig = None,
     num_blocks: int = 10000,
     block_size: int = 16,
     max_model_len: int | None = None,
@@ -71,6 +168,7 @@ def create_scheduler(
     pipeline_parallel_size: int = 1,
     use_ec_connector: bool = False,
     ec_role: str | None = None,
+    sub_block_size: int | None = None,
 ) -> RBLNScheduler:
     """Create scheduler under test.
 
@@ -88,8 +186,8 @@ def create_scheduler(
 
     # TODO(RBLN): support async scheduling
     assert not async_scheduling
-    # TODO(RBLN): support kv transfer via kv connector
-    assert not use_kv_connector
+    # TODO(RBLN): support specluative decoding
+    assert not num_speculative_tokens
 
     model_config = ModelConfig(
         model=model,
@@ -118,21 +216,15 @@ def create_scheduler(
         enable_prefix_caching=enable_prefix_caching,
     )
     kv_transfer_config = None
-    # if isinstance(use_kv_connector, MockKVConfig):
-    #     kv_transfer_config = KVTransferConfig(
-    #         kv_connector="MockKVConnector",
-    #         kv_role="kv_both",
-    #         kv_connector_extra_config={
-    #             "matched_tokens": use_kv_connector.matched_tokens,
-    #             "is_async": use_kv_connector.is_async,
-    #         },
-    #     )
-    # elif use_kv_connector:
-    #     kv_transfer_config = KVTransferConfig(
-    #         kv_connector="ExampleConnector",
-    #         kv_role="kv_both",
-    #         kv_connector_extra_config={"shared_storage_path": "local_storage"},
-    #     )
+    if isinstance(use_kv_connector, MockKVConfig):
+        kv_transfer_config = KVTransferConfig(
+            kv_connector="MockKVConnector",
+            kv_role="kv_both",
+            kv_connector_extra_config={
+                "matched_tokens": use_kv_connector.matched_tokens,
+                "is_async": use_kv_connector.is_async,
+            },
+        )
 
     speculative_config: SpeculativeConfig | None = None
     if num_speculative_tokens is not None:
@@ -184,6 +276,7 @@ def create_scheduler(
         block_size=block_size,
         log_stats=True,
         structured_output_manager=StructuredOutputManager(vllm_config),
+        sub_block_size=sub_block_size,
     )
 
 
