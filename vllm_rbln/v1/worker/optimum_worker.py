@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from contextlib import nullcontext
 from types import NoneType
 from typing import Any
 
+import numba
 import torch
 import torch.distributed
 import torch.nn as nn
@@ -38,6 +40,7 @@ from vllm_rbln.logger import init_logger
 from vllm_rbln.utils.optimum.cache_blocks import sync_num_blocks
 from vllm_rbln.utils.optimum.rbln_params import get_rbln_params
 from vllm_rbln.v1.worker.optimum_model_runner import RBLNOptimumModelRunner
+from vllm_rbln.v1.worker.utils import set_cpu_affinity, set_omp_num_threads
 
 logger = init_logger(__name__)
 
@@ -96,6 +99,28 @@ class RBLNOptimumWorker(WorkerBase):
             self.profiler = None
 
     def init_device(self) -> None:
+        set_cpu_affinity(
+            self.rank,
+            self.local_rank,
+            self.parallel_config,
+        )
+
+        allocated_cpus = len(os.sched_getaffinity(0))
+        num_threads = max(2, allocated_cpus // 2)
+        set_omp_num_threads(
+            self.rank,
+            self.local_rank,
+            num_threads,
+        )
+
+        # NOTE(RBLN): numba is used throughout vllm code base (especially in spec-dec)
+        # however accessing numba thread settings somewhat affects torch
+        # thread settings and cause global state change leading to recompilation.
+        # Thus the only solution for now is to set both thread settings to identical
+        # value in correct order like below
+        numba.set_num_threads(torch.get_num_threads())
+        torch.set_num_threads(numba.get_num_threads())
+
         # Initialize the distributed environment.
         init_worker_distributed_environment(
             self.vllm_config, self.rank, self.distributed_init_method, self.local_rank
