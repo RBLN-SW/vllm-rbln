@@ -103,7 +103,6 @@ class RBLNOptimumWorker(WorkerBase):
         reported_cpus = os.cpu_count() or allocated_cpus
 
         if allocated_cpus < reported_cpus:
-            # Container: K8s cpuset already configured, don't override affinity.
             # Use physical cores only (exclude HT siblings).
             num_threads = max(2, allocated_cpus // 2)
             logger.info(
