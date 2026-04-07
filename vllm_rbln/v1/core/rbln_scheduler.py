@@ -451,6 +451,10 @@ class RBLNScheduler(Scheduler):
                 request = request_queue.peek_request()
                 request_id = request.request_id
 
+                is_ready = False
+                was_waiting_for_remote_kvs = (
+                    request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+                )
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(
                     request.status
@@ -463,6 +467,7 @@ class RBLNScheduler(Scheduler):
                     request_queue.pop_request()
                     step_skipped_waiting.prepend_request(request)
                     continue
+                is_ready = was_waiting_for_remote_kvs
 
                 # Check that adding the request still respects the max_loras
                 # constraint.
@@ -630,10 +635,17 @@ class RBLNScheduler(Scheduler):
                         for i in encoder_inputs_to_schedule
                     )
 
-                # NOTE(RBLN): Even when chunked prefill is enabled, we should schedule
-                # a new prefill request only if there is enough KV cache space to
-                # accommodate the full token count. Therefore, we allocate based on
-                # request.num_tokens - num_computed_tokens, not num_new_tokens.
+                # NOTE(RBLN): Even when chunked prefill is enabled,
+                # we should schedule a new prefill request only if there is
+                # enough KV cache space to accommodate the full token count.
+                # Therefore, we allocate based on
+                # request.num_tokens - num_computed_tokens,
+                # not num_new_tokens + num_external_computed_tokens.
+                num_tokens_to_allocate = (
+                    num_new_tokens + num_external_computed_tokens
+                    if load_kv_async
+                    else request.num_tokens - num_computed_tokens
+                )
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
                     request.num_tokens - num_computed_tokens,
@@ -756,19 +768,30 @@ class RBLNScheduler(Scheduler):
                         if self.ec_connector is not None:
                             self.ec_connector.update_state_after_alloc(request, i)
 
-                # NOTE(RBLN): Reaching this point means that this request can now be
-                # added to the running batch. However, since we do not support mixed
-                # batching for now, we remove all currently scheduled running requests
-                # from the scheduler output and run only this prefill request for the
-                # current step. In the next step (or after this request’s prefill
-                # completes if it cannot finish within a single step) this request will
-                # be scheduled together with the other running requests in the decoding
-                # phase. We also clear the block hash written in previous allocate_slots
-                # and undo block caching because this request and its tokens will be
-                # scheduled again, and allocate_slots will be invoked once more and the
-                # logic that writes the block hash will run again. Without clearing it
-                # here, an assertion error would occur because a block hash would
-                # already exist.
+                # If the request’ previous state is WAITING_FOR_REMOTE_KVS,
+                # we can continue the scheduling process.
+                if is_ready:
+                    # token_budget is only used for assertion checks.
+                    token_budget -= num_new_tokens
+                    continue
+
+                # NOTE(RBLN): Reaching this point means that this request
+                # can now be added to the running batch.
+                # However, since we do not support mixed batching for now,
+                # we remove all currently scheduled running requests
+                # from the scheduler output and run only this prefill request
+                # for the current step.
+                # In the next step (or after this request’s prefill completes
+                # if it cannot finish within a single step),
+                # this request will be scheduled together with the other
+                # running requests in the decoding phase.
+                # We also clear the block hash written in previous
+                # allocate_slots and undo block caching because this request
+                # and its tokens will be scheduled again, and allocate_slots
+                # will be invoked once more and the logic that writes the
+                # block hash will run again.
+                # Without clearing it here, an assertion error would occur
+                # because a block hash would already exist.
                 for req in scheduled_running_reqs:
                     req_to_new_blocks.pop(req.request_id)
                     num_scheduled_tokens.pop(req.request_id)
