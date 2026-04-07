@@ -308,9 +308,9 @@ def main():
         ):
             user_config = config
         else:
-            raise ValueError(f"Unexpected config description: {config.description}")
+            raise ValueError(f"Unexpected sampling type: {args.sampling_type}")
 
-    reesults = run_benchmark(
+    result = run_benchmark(
         user_config,
         warmup_configs=warmup_configs,
         warmup_iters=args.warmup_iters,
