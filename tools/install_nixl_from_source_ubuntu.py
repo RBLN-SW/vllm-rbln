@@ -101,16 +101,19 @@ def install_nixl_shim_for_meta_compat(site_packages_dir):
     nixl_dir = os.path.join(site_packages_dir, "nixl")
     os.makedirs(nixl_dir, exist_ok=True)
     init_py = os.path.join(nixl_dir, "__init__.py")
-    shim_content = '''# Shim so that source-installed nixl-cu12 is usable as "nixl" (meta-package style).
+    shim_content = """# Shim so that source-installed nixl-cu12 is usable as "nixl" (meta-package style).
 # See install_nixl_from_source_ubuntu.py
 import sys
 import nixl_cu12
 sys.modules["nixl._api"] = nixl_cu12._api
 sys.modules["nixl._bindings"] = nixl_cu12._bindings
-'''
+"""
     with open(init_py, "w") as f:
         f.write(shim_content)
-    print("--> Installed 'nixl' shim for meta-package-style import (import nixl, from nixl._api import ...)", flush=True)
+    print(
+        "--> Installed 'nixl' shim for meta-package-style import (import nixl, from nixl._api import ...)",
+        flush=True,
+    )
 
 
 def install_system_dependencies():
