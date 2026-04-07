@@ -99,20 +99,22 @@ class RBLNOptimumWorker(WorkerBase):
             self.profiler = None
 
     def init_device(self) -> None:
-        set_cpu_affinity(
-            self.rank,
-            self.local_rank,
-            self.parallel_config,
-        )
-
-        # set_cpu_affinity already selects physical cores only (no HT)
-        # so use the full affinity count
         allocated_cpus = len(os.sched_getaffinity(0))
-        set_omp_num_threads(
-            self.rank,
-            self.local_rank,
-            max(2, allocated_cpus),
-        )
+        reported_cpus = os.cpu_count() or allocated_cpus
+
+        if allocated_cpus < reported_cpus:
+            # Container: K8s cpuset already configured, don't override
+            logger.info(
+                "Container cpuset detected (%d/%d CPUs). "
+                "Skipping set_cpu_affinity, setting threads to %d.",
+                allocated_cpus, reported_cpus, allocated_cpus,
+            )
+            set_omp_num_threads(self.rank, self.local_rank, allocated_cpus)
+        else:
+            # Bare metal: use NUMA-aware binding
+            set_cpu_affinity(self.rank, self.local_rank, self.parallel_config)
+            allocated_cpus = len(os.sched_getaffinity(0))
+            set_omp_num_threads(self.rank, self.local_rank, max(2, allocated_cpus))
 
         numba.set_num_threads(torch.get_num_threads())
         torch.set_num_threads(numba.get_num_threads())
