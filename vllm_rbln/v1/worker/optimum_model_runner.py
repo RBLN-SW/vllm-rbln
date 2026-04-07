@@ -312,7 +312,10 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
             start_time = time.perf_counter()
             # FIXME model_input must be modified to be padded
             hidden_states = self.model(model_input)
-            sample_hidden_states = hidden_states.clone()
+            if model_input.is_prompt:
+                sample_hidden_states = hidden_states.clone()
+            else:
+                sample_hidden_states = hidden_states
             end_time = time.perf_counter()
             if envs.VLLM_RBLN_METRICS:
                 # Record performance metrics
@@ -1257,12 +1260,18 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
             batch_size = self.vllm_config.scheduler_config.max_num_seqs
             self.bucket_sizes = tuple(self.get_bucket_sizes(batch_size))
         logger.debug("Bucket sizes for RBLN sampler: %s", self.bucket_sizes)
+        decode_out_buffers = getattr(self.model, "decode_out_buffers", {})
         with torch.inference_mode():
             for bucket_size in self.bucket_sizes:
-                self.pooled_tensors[bucket_size] = torch.empty(
-                    (bucket_size, self.model_config.get_vocab_size()),
-                    dtype=self.model.dtype,
-                )
+                if bucket_size in decode_out_buffers:
+                    self.pooled_tensors[bucket_size] = (
+                        decode_out_buffers[bucket_size][0].squeeze(1)
+                    )
+                else:
+                    self.pooled_tensors[bucket_size] = torch.empty(
+                        (bucket_size, self.model_config.get_vocab_size()),
+                        dtype=self.model.dtype,
+                    )
         torch._dynamo.config.recompile_limit = len(self.bucket_sizes) * len(
             WARM_UP_CONFIGS
         )
@@ -1298,7 +1307,8 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
             if use_padding:
                 num_reqs = self.input_batch.num_reqs
                 padded_logits = self.pooled_tensors[self.bucket_size]
-                padded_logits[:num_reqs].copy_(logits)
+                if padded_logits.data_ptr() != logits.data_ptr():
+                    padded_logits[:num_reqs].copy_(logits)
             elif is_prompt:
                 # Among self.input_batch.num_reqs > 1 cases,
                 # only the prefill stage of multimodal models produces logits

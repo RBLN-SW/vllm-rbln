@@ -275,6 +275,22 @@ class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
             dtype=torch.int16,
         )
 
+    def setup_zero_copy_decode(self):
+        """Initialize pre-allocated output buffers on all decoders for zero-copy.
+
+        After calling this, each decoder's out_buffers are pre-allocated and
+        reused across decode calls. Access the logits buffer via
+        self.decode_out_buffers[batch_size] to pass directly to the sampler.
+        """
+        self.decode_out_buffers: dict[int, list[torch.Tensor]] = {}
+        for batch_size, decoder in self.model.decoders.items():
+            buffers = [
+                torch.empty(size=profile.shape, dtype=profile.dtype, device="cpu")
+                for profile in decoder.runtime._output_profile
+            ]
+            decoder.out_buffers = buffers
+            self.decode_out_buffers[batch_size] = buffers
+
     def pad_decoder_items(
         self,
         input_ids: torch.Tensor,

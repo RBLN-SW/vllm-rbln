@@ -41,6 +41,7 @@ class RBLNOptimumForCausalLM(
             decoder_batch_sizes=self.model.rbln_config.decoder_batch_sizes,
             num_blocks=self.kv_block_adapter._estimated_num_blocks(),
         )
+        self.setup_zero_copy_decode()
 
     def forward(self, model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
         input_ids = model_input.input_tokens
@@ -70,7 +71,8 @@ class RBLNOptimumForCausalLM(
         else:
             self.model.decoder = self.model.decoders[padded_batch_size]
 
-            logits = self.model.decoder(**kwargs).logits
+            self.model.decoder(**kwargs)
+            logits = self.decode_out_buffers[padded_batch_size][0]
             if self.attn_impl != "flash_attn":
                 return logits[:request_nums]
 
