@@ -101,29 +101,40 @@ class RBLNOptimumWorker(WorkerBase):
     def init_device(self) -> None:
         allocated_cpus = len(os.sched_getaffinity(0))
         reported_cpus = os.cpu_count() or allocated_cpus
-        logger.info(
-            "DEBUG: allocated_cpus=%d, reported_cpus=%d",
-            allocated_cpus, reported_cpus,
-        )
+
         if allocated_cpus < reported_cpus:
-            # Container: K8s cpuset already configured, don't override
+            # Container: K8s cpuset already configured, don't override affinity.
+            # Use physical cores only (exclude HT siblings).
+            num_threads = max(2, allocated_cpus // 2)
             logger.info(
                 "Container cpuset detected (%d/%d CPUs). "
-                "Skipping set_cpu_affinity, setting threads to %d.",
-                allocated_cpus, reported_cpus, allocated_cpus,
+                "Skipping set_cpu_affinity, setting threads to %d "
+                "(physical cores only, excluding HT).",
+                allocated_cpus, reported_cpus, num_threads,
             )
-            allocated_cpus = len(os.sched_getaffinity(0))
-            num_threads = allocated_cpus // 2  # physical cores only, skip HT
-            set_omp_num_threads(self.rank, self.local_rank, max(2, num_threads))
+
+            # Set all thread pool environment variables
+            os.environ["OMP_NUM_THREADS"] = str(num_threads)
+            os.environ["MKL_NUM_THREADS"] = str(num_threads)
+            os.environ["OPENBLAS_NUM_THREADS"] = str(num_threads)
+            os.environ["NUMEXPR_MAX_THREADS"] = str(num_threads)
+            os.environ["RBLN_NUM_THREADS"] = str(num_threads)
+
+            # Directly set PyTorch thread counts
+            torch.set_num_threads(num_threads)
+            torch.set_num_interop_threads(max(1, num_threads // 4))
+
+            set_omp_num_threads(self.rank, self.local_rank, num_threads)
         else:
             # Bare metal: use NUMA-aware binding
             set_cpu_affinity(self.rank, self.local_rank, self.parallel_config)
             allocated_cpus = len(os.sched_getaffinity(0))
             set_omp_num_threads(self.rank, self.local_rank, max(2, allocated_cpus))
 
+        # Sync numba and torch thread settings to avoid recompilation
+        # caused by global state mismatch between the two runtimes
         numba.set_num_threads(torch.get_num_threads())
         torch.set_num_threads(numba.get_num_threads())
-
         # Initialize the distributed environment.
         init_worker_distributed_environment(
             self.vllm_config, self.rank, self.distributed_init_method, self.local_rank
