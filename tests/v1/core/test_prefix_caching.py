@@ -98,7 +98,6 @@ def create_request(
         ),
         block_hasher=block_hasher,
         pooling_params=None,
-        eos_token_id=100,
     )
     return request
 
