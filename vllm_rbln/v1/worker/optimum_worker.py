@@ -101,7 +101,10 @@ class RBLNOptimumWorker(WorkerBase):
     def init_device(self) -> None:
         allocated_cpus = len(os.sched_getaffinity(0))
         reported_cpus = os.cpu_count() or allocated_cpus
-
+        logger.info(
+            "DEBUG: allocated_cpus=%d, reported_cpus=%d",
+            allocated_cpus, reported_cpus,
+        )
         if allocated_cpus < reported_cpus:
             # Container: K8s cpuset already configured, don't override
             logger.info(
