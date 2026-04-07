@@ -50,7 +50,7 @@ jobs:
           token: ${{ secrets.GIT_PAT }}
           add-paths: |
             pyproject.toml
-          commit-message: "Update optimum-rbln to ${{ inputs.optimum-version }}"
+          commit-message: "other: update optimum-rbln to ${{ inputs.optimum-version }}"
           title: "other: auto-update optimum-rbln to ${{ inputs.optimum-version }}"
           body: "Updated optimum-rbln to ${{ inputs.optimum-version }}."
           branch: auto-update-optimum-rbln-${{ inputs.optimum-version }}
