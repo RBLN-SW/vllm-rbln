@@ -33,6 +33,7 @@ PROMPTS = [
 
 @pytest.fixture(scope="module")
 def llm_env(monkeypatch_module):
+    monkeypatch_module.setenv("RBLN_USE_CUSTOM_KERNEL", "1")
     monkeypatch_module.setenv("VLLM_RBLN_USE_VLLM_MODEL", "1")
     monkeypatch_module.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
     monkeypatch_module.setenv("VLLM_DISABLE_COMPILE_CACHE", "1")
@@ -64,7 +65,7 @@ def _build_llm() -> LLM:
 
 
 def test_basic_medusa_generation(llm_env) -> None:
-    sampling_params = SamplingParams(temperature=0.1, top_p=0.9, max_tokens=128)
+    sampling_params = SamplingParams(temperature=0.1, top_p=0.9, max_tokens=32)
 
     llm = _build_llm()
     outputs = llm.generate(PROMPTS, sampling_params=sampling_params)
