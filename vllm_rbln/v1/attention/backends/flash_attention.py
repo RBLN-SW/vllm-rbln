@@ -942,7 +942,9 @@ class RBLNAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_name() -> str:
-        return "RBLN_ATTN"
+        # Must match AttentionBackendEnum (see Attention.__init__ in v0.18+). This
+        # backend is registered via @register_backend(AttentionBackendEnum.FLASH_ATTN).
+        return "FLASH_ATTN"
 
     @staticmethod
     def get_impl_cls() -> type["RBLNFlashAttentionImpl"]:
