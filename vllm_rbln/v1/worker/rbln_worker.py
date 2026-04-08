@@ -390,7 +390,7 @@ class RBLNWorker(WorkerBase):
             logger.warning("skipping compile_or_warm_up_model")
 
             self._ensure_rbln_cpu_affinity_after_warmup()
-            return
+            return time.perf_counter() - st
         else:
             try:
                 self.model_runner.warm_up_model()
