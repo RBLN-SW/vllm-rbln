@@ -219,7 +219,9 @@ class PerformanceTracker:
                 f"got {len(request_ids)}: {request_ids}"
             )
             request_id = request_ids[0]
-        self.prefill_metrics.add_measurement(latency, token_count, host_time, device_time, ccl_time)
+        self.prefill_metrics.add_measurement(
+            latency, token_count, host_time, device_time, ccl_time
+        )
         if request_id:
             self.prefill_metrics_by_request_id.add_measurement(
                 request_id, latency, token_count, host_time, device_time, ccl_time
