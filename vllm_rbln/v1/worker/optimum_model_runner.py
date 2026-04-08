@@ -456,7 +456,8 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
             finished_requests_ids=list(finished_requests_ids),
             cached_block_tables=cached_block_tables,
             cached_lengths=cached_lengths,
-            is_prompt=is_prefill, # FIXME unify the variable name is_prefill and is_prompt
+            # FIXME unify the variable name is_prefill and is_prompt
+            is_prompt=is_prefill,
             dummy_block=scheduler_output.dummy_block,
         )
         return model_input, num_scheduled_tokens
