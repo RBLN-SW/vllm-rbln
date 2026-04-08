@@ -130,11 +130,15 @@ class StepMetrics:
         """Get total number of requests processed."""
         return len(self.latencies)
 
-    def show_stats(self, stat_type: str):
+    def show_stats(
+        self,
+        stat_type: str,
+        latency_label: str = "Average latency",
+    ):
         if self.get_call_counts() > 0:
             logger.info("%s METRICS:", stat_type)
             logger.info("  Total call counts: %d", self.get_call_counts())
-            logger.info("  Average latency: %.2f ms", self.get_avg_latency())
+            logger.info("  %s: %.2f ms", latency_label, self.get_avg_latency())
             if sum(self.token_counts) > 0:
                 logger.info("  Total tokens processed: %d", sum(self.token_counts))
                 logger.info(
@@ -185,8 +189,6 @@ class PrefillMetricsByRequestID:
 
 
 class PerformanceTracker:
-    """Tracks performance metrics for prefill and decode steps."""
-
     def __init__(self, name: str | None = None):
         self.name = name
         self.prefill_metrics = StepMetrics()
@@ -194,6 +196,7 @@ class PerformanceTracker:
         self.prefill_metrics_by_request_id = PrefillMetricsByRequestID()
         self.padded_decode_metrics = StepMetrics()
         self._registered_cleanup = False
+        self._kv_connector = None
 
     def register_cleanup(self):
         """Register cleanup function to print stats on exit."""
@@ -207,6 +210,9 @@ class PerformanceTracker:
             if request_id.startswith("dummy_request_"):
                 return True
         return False
+
+    def set_kv_connector(self, kv_connector) -> None:
+        self._kv_connector = kv_connector
 
     def record_prefill(
         self,
@@ -249,6 +255,63 @@ class PerformanceTracker:
         metrics = self.padded_decode_metrics if padded_decode else self.decode_metrics
         metrics.add_measurement(latency, token_count, host_time, device_time, ccl_time)
 
+    def print_current_stats(self):
+        logger.info("=" * 80)
+        if self.name:
+            logger.info("PERFORMANCE STATISTICS [%s]", self.name)
+        else:
+            logger.info("PERFORMANCE STATISTICS")
+        logger.info("=" * 80)
+
+        self.prefill_metrics.show_stats(
+            "PREFILL", latency_label="Average model execution time"
+        )
+        logger.info("-" * 40)
+
+        self.decode_metrics.show_stats(
+            "DECODE", latency_label="Average model execution time"
+        )
+        logger.info("-" * 40)
+
+        self.padded_decode_metrics.show_stats(
+            "PADDED DECODE",
+            latency_label="Average model execution time",
+        )
+        logger.info("-" * 40)
+
+        if self._kv_connector and hasattr(self._kv_connector, "get_transfer_stats"):
+            stats = self._kv_connector.get_transfer_stats()
+            d2h = stats["d2h"]
+            h2d = stats["h2d"]
+
+            if d2h["calls"] > 0:
+                logger.info("KV CACHE D2H TRANSFER METRICS:")
+                logger.info("  Total calls: %d", d2h["calls"])
+                logger.info("  Average total time: %.2f ms", d2h["avg_total_ms"])
+                logger.info("  Average DMA time: %.2f ms", d2h["avg_dma_ms"])
+                logger.info(
+                    "  Average scatter/gather time: %.2f ms",
+                    d2h["avg_scatter_gather_ms"],
+                )
+                logger.info("  Throughput: %.2f GB/s", d2h["throughput_gbps"])
+                logger.info("  Total transferred: %.2f MB", d2h["total_mb"])
+                logger.info("-" * 40)
+
+            if h2d["calls"] > 0:
+                logger.info("KV CACHE H2D TRANSFER METRICS:")
+                logger.info("  Total calls: %d", h2d["calls"])
+                logger.info("  Average total time: %.2f ms", h2d["avg_total_ms"])
+                logger.info("  Average DMA time: %.2f ms", h2d["avg_dma_ms"])
+                logger.info(
+                    "  Average scatter/gather time: %.2f ms",
+                    h2d["avg_scatter_gather_ms"],
+                )
+                logger.info("  Throughput: %.2f GB/s", h2d["throughput_gbps"])
+                logger.info("  Total transferred: %.2f MB", h2d["total_mb"])
+                logger.info("-" * 40)
+
+        logger.info("=" * 80)
+
     def print_final_stats(self):
         logger.info("=" * 80)
         if self.name:
@@ -257,14 +320,51 @@ class PerformanceTracker:
             logger.info("FINAL PERFORMANCE STATISTICS")
         logger.info("=" * 80)
 
-        # Prefill stats
-        self.prefill_metrics.show_stats("PREFILL")
+        self.prefill_metrics.show_stats(
+            "PREFILL", latency_label="Average model execution time"
+        )
         logger.info("-" * 40)
 
-        # Decode stats
-        self.decode_metrics.show_stats("DECODE")
+        self.decode_metrics.show_stats(
+            "DECODE", latency_label="Average model execution time"
+        )
         logger.info("-" * 40)
 
-        # Padded decode stats
-        self.padded_decode_metrics.show_stats("PADDED DECODE")
+        self.padded_decode_metrics.show_stats(
+            "PADDED DECODE",
+            latency_label="Average model execution time",
+        )
+        logger.info("-" * 40)
+
+        if self._kv_connector and hasattr(self._kv_connector, "get_transfer_stats"):
+            stats = self._kv_connector.get_transfer_stats()
+            d2h = stats["d2h"]
+            h2d = stats["h2d"]
+
+            if d2h["calls"] > 0:
+                logger.info("KV CACHE D2H TRANSFER METRICS:")
+                logger.info("  Total calls: %d", d2h["calls"])
+                logger.info("  Average total time: %.2f ms", d2h["avg_total_ms"])
+                logger.info("  Average DMA time: %.2f ms", d2h["avg_dma_ms"])
+                logger.info(
+                    "  Average scatter/gather time: %.2f ms",
+                    d2h["avg_scatter_gather_ms"],
+                )
+                logger.info("  Throughput: %.2f GB/s", d2h["throughput_gbps"])
+                logger.info("  Total transferred: %.2f MB", d2h["total_mb"])
+                logger.info("-" * 40)
+
+            if h2d["calls"] > 0:
+                logger.info("KV CACHE H2D TRANSFER METRICS:")
+                logger.info("  Total calls: %d", h2d["calls"])
+                logger.info("  Average total time: %.2f ms", h2d["avg_total_ms"])
+                logger.info("  Average DMA time: %.2f ms", h2d["avg_dma_ms"])
+                logger.info(
+                    "  Average scatter/gather time: %.2f ms",
+                    h2d["avg_scatter_gather_ms"],
+                )
+                logger.info("  Throughput: %.2f GB/s", h2d["throughput_gbps"])
+                logger.info("  Total transferred: %.2f MB", h2d["total_mb"])
+                logger.info("-" * 40)
+
         logger.info("=" * 80)

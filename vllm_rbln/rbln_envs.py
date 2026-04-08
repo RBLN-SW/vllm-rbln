@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_LOGITS_ALL_GATHER: bool = True
     VLLM_RBLN_NUM_RAY_NODES: int = 1
     VLLM_RBLN_METRICS: bool = False
+    VLLM_RBLN_METRICS_INTERVAL_SEC: int = 0
     VLLM_RBLN_NUMA: bool = True
     VLLM_RBLN_SORT_BATCH: bool = False
     VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY: str = "exponential"
@@ -222,6 +223,10 @@ environment_variables = {
     ),
     "VLLM_RBLN_METRICS": (
         lambda: os.environ.get("VLLM_RBLN_METRICS", "False").lower() in ("true", "1")
+    ),
+    # Interval in seconds for periodic metrics logging (0 = disabled)
+    "VLLM_RBLN_METRICS_INTERVAL_SEC": lambda: int(
+        os.environ.get("VLLM_RBLN_METRICS_INTERVAL_SEC", 0)
     ),
     # Enable NUMA-based CPU affinity binding for OpenMP threads
     "VLLM_RBLN_NUMA": (

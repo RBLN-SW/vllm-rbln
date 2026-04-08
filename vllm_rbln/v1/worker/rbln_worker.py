@@ -15,6 +15,7 @@
 
 import copy
 import os
+import threading
 import time
 from types import NoneType
 from typing import TYPE_CHECKING
@@ -110,6 +111,9 @@ class RBLNWorker(WorkerBase):
 
         # Buffers saved before sleep
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
+
+        self._metrics_timer: threading.Timer | None = None
+        self._metrics_shutdown = False
 
         profiler_config = vllm_config.profiler_config
         # Set up profiler if profiling is enabled
@@ -422,6 +426,9 @@ class RBLNWorker(WorkerBase):
         # after completing model warm up, enable RBLN performance tracker
         self.model_runner._enable_performance_tracker()
 
+        if envs.VLLM_RBLN_METRICS_INTERVAL_SEC > 0 and self.rank == 0:
+            self._start_periodic_metrics()
+
         return time.perf_counter() - st
 
     def get_model(self) -> nn.Module:
@@ -515,7 +522,10 @@ class RBLNWorker(WorkerBase):
 
     def shutdown(self) -> None:
         logger.info("v1 rbln_worker shutdown called")
-        # Shutdown KV connector (e.g. LMCache) if present
+        self._metrics_shutdown = True
+        if self._metrics_timer:
+            self._metrics_timer.cancel()
+
         if has_kv_transfer_group():
             try:
                 get_kv_transfer_group().shutdown()
@@ -529,6 +539,21 @@ class RBLNWorker(WorkerBase):
                 self.model_runner.sampler_performance_tracker.print_final_stats()
             if self.model_runner.e2e_performance_tracker:
                 self.model_runner.e2e_performance_tracker.print_final_stats()
+
+    def _start_periodic_metrics(self) -> None:
+        if self._metrics_shutdown:
+            return
+        if self.model_runner.performance_tracker:
+            self.model_runner.performance_tracker.print_current_stats()
+        if self.model_runner.sampler_performance_tracker:
+            self.model_runner.sampler_performance_tracker.print_current_stats()
+        if self.model_runner.e2e_performance_tracker:
+            self.model_runner.e2e_performance_tracker.print_current_stats()
+        self._metrics_timer = threading.Timer(
+            envs.VLLM_RBLN_METRICS_INTERVAL_SEC, self._start_periodic_metrics
+        )
+        self._metrics_timer.daemon = True
+        self._metrics_timer.start()
 
 
 def init_worker_distributed_environment(

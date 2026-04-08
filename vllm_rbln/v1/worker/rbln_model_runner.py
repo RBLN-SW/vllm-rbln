@@ -14,6 +14,7 @@
 
 import contextlib
 import itertools
+import logging
 import os
 import time
 from collections import defaultdict
@@ -547,6 +548,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.performance_tracker: PerformanceTracker | None = None
         self.sampler_performance_tracker: PerformanceTracker | None = None
         self.e2e_performance_tracker: PerformanceTracker | None = None
+        self._kv_connector_ref = None
         self.e2e_start_time: float = 0.0
         self.e2e_end_time: float = 0.0
 
@@ -565,6 +567,9 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self.sampler_performance_tracker.register_cleanup()
             self.e2e_performance_tracker = PerformanceTracker("E2E")
             self.e2e_performance_tracker.register_cleanup()
+            if self._kv_connector_ref is not None:
+                self.performance_tracker.set_kv_connector(self._kv_connector_ref)
+                logger.info("Connected KV connector to PerformanceTracker")
 
     def _get_positions(self, num_tokens: Any):
         if isinstance(num_tokens, int):
@@ -2723,6 +2728,28 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 if not has_kv_transfer_group() or warm_up_phase:
                     # Return empty ModelRunnerOutput if there's no work to do.
                     return EMPTY_MODEL_RUNNER_OUTPUT
+                meta = scheduler_output.kv_connector_metadata
+                if logger.isEnabledFor(logging.DEBUG) and hasattr(meta, "requests"):
+                    for req in meta.requests:
+                        ls = getattr(req, "load_spec", None)
+                        if ls is not None and ls.can_load:
+                            logger.debug(
+                                "[KV-HIT] req=%s lmcache_cached=%d vllm_cached=%d"
+                                " new_tokens=%d → prefill SKIPPED (no_forward)",
+                                req.req_id,
+                                ls.lmcache_cached_tokens,
+                                ls.vllm_cached_tokens,
+                                ls.lmcache_cached_tokens - ls.vllm_cached_tokens,
+                            )
+                        elif ls is not None:
+                            logger.debug(
+                                "[KV-MISS] req=%s lmcache_cached=%d vllm_cached=%d"
+                                " can_load=%s",
+                                req.req_id,
+                                ls.lmcache_cached_tokens,
+                                ls.vllm_cached_tokens,
+                                ls.can_load,
+                            )
                 return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
             if self.cache_config.kv_sharing_fast_prefill:
                 assert not self.num_prompt_logprobs, (
@@ -2942,6 +2969,19 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         padded_decode=padded_decode,
                         request_ids=self.input_batch.req_ids,
                     )
+
+                logger.debug(
+                    (
+                        "[MODEL] step=%s tokens=%d model_execution=%.2fms "
+                        "host=%s device=%s ccl=%s"
+                    ),
+                    "prefill" if is_first_request_prefill else "decode",
+                    num_scheduled_tokens,
+                    model_execution_time * 1000,
+                    f"{host_time}us" if host_time is not None else "-",
+                    f"{device_time}us" if device_time is not None else "-",
+                    f"{ccl_time}us" if ccl_time is not None else "-",
+                )
 
         with record_function_or_nullcontext("Postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -4323,11 +4363,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
             kv_transfer_group.set_host_xfer_buffer_ops(rbln_copy_kv_blocks)
 
-            # Pass runtime_holder reference to LMCache's RBLNConnector
-            # so it can lazily access the runtime after compilation.
-            # This follows the same pattern as rbln_copy_kv_blocks above:
-            # runtime_holder is populated by the RBLN compile backend,
-            # and the connector reads runtime_holder[0] at transfer time.
             if hasattr(kv_transfer_group, "set_runtime_holder"):
                 kv_transfer_group.set_runtime_holder(self.runtime_holder)
                 logger.info("Passed runtime_holder to LMCache RBLNConnector (lazy)")
@@ -4336,6 +4371,11 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             ):
                 kv_transfer_group.set_runtime(self.runtime_holder[0])
                 logger.info("Injected rebel runtime into LMCache RBLNConnector")
+
+            if hasattr(kv_transfer_group, "get_connector"):
+                self._kv_connector_ref = kv_transfer_group.get_connector()
+                if self._kv_connector_ref:
+                    logger.info("Saved KV connector reference for PerformanceTracker")
 
             logger.info(
                 "Registered %d KV cache layers with KV connector",
