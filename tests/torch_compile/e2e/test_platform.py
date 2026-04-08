@@ -43,10 +43,8 @@ def test_register_ops(vllm_config):
     from vllm.config import set_current_vllm_config
 
     with set_current_vllm_config(vllm_config):
-        # Attention (patched by vllm_rbln.model_executor.layers.attention)
+        # Attention
         from vllm.model_executor.layers.attention.attention import Attention
-
-        import vllm_rbln.model_executor.layers.attention  # noqa: F401
 
         attention = Attention(16, 32, 0.125, 16, prefix="layer.0")
         assert hasattr(attention, "layer_index"), (

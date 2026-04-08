@@ -59,14 +59,11 @@ def _rbln_unified_attention(
 ) -> torch.Tensor:
     attn_metadata, self, _kv_cache, _ = get_attention_context(layer_name)
 
-    """
-    NOTE(jiwoo.park) - To represent kv cache as model input,
-    modify attention
-    instead of attention layer's embedded kv cache(self.kv_cache),
-    use attention metadata's kv cache.
-    attention metadata's kv cache must equal
-    the attention layer's embedded kv cache.
-    """
+    # NOTE(RBLN) - To represent kv cache as model input,
+    # modify attention instead of using the attention layer's embedded
+    # kv cache (self.kv_cache); use attention metadata's kv cache.
+    # attention metadata's kv cache must equal the attention layer's
+    # embedded kv cache.
     assert attn_metadata.kv_caches is not None
     assert self.layer_index < len(attn_metadata.kv_caches)
     kv_cache = attn_metadata.kv_caches[self.layer_index]
@@ -91,14 +88,11 @@ def _rbln_unified_attention_with_output(
     del kv_cache_dummy_dep
     attn_metadata, self, _kv_cache, _ = get_attention_context(layer_name)
 
-    """
-    NOTE(jiwoo.park) - To represent kv cache as model input,
-    modify attention
-    instead of attention layer's embedded kv cache(self.kv_cache),
-    use attention metadata's kv cache.
-    attention metadata's kv cache must equal
-    the attention layer's embedded kv cache.
-    """
+    # NOTE(RBLN) - To represent kv cache as model input,
+    # modify attention instead of using the attention layer's embedded
+    # kv cache (self.kv_cache); use attention metadata's kv cache.
+    # attention metadata's kv cache must equal the attention layer's
+    # embedded kv cache.
     assert attn_metadata.kv_caches is not None
     assert self.layer_index < len(attn_metadata.kv_caches)
     kv_cache = attn_metadata.kv_caches[self.layer_index]
