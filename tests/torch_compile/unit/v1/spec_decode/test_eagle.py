@@ -149,8 +149,8 @@ def make_fake_proposer(
         fake.positions[:num_tokens] = positions
 
     fake._set_positions = _set_positions
-    fake.set_inputs_first_pass = (
-        lambda **kwargs: RBLNEagleProposer.set_inputs_first_pass(fake, **kwargs)
+    fake.set_inputs_first_pass = lambda **kwargs: (
+        RBLNEagleProposer.set_inputs_first_pass(fake, **kwargs)
     )
     return fake, builder
 
