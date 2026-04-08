@@ -43,7 +43,10 @@ from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import TensorizerLoader, get_model_loader
-from vllm.model_executor.models.interfaces import supports_transcription
+from vllm.model_executor.models.interfaces import (
+    supports_eagle3,
+    supports_transcription,
+)
 from vllm.model_executor.models.interfaces_base import (
     VllmModelForPooling,
     is_pooling_model,
@@ -100,7 +103,6 @@ from vllm.v1.sample.logits_processor import build_logitsprocs
 from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
-from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
@@ -129,7 +131,8 @@ from vllm_rbln.v1.attention.backends.flash_attention import (
 from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 from vllm_rbln.v1.sample import RBLNSampler
 from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
-from vllm_rbln.v1.spec_decoding.medusa import RBLNMedusaProposer
+from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
+from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
 from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
 from vllm_rbln.v1.worker.metrics import PerformanceTracker
 
@@ -334,7 +337,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self.drafter: (
                 NgramProposer
                 | SuffixDecodingProposer
-                | EagleProposer
+                | RBLNEagleProposer
                 | RBLNMedusaProposer
             )
             if self.speculative_config.method == "ngram":
@@ -342,7 +345,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             elif self.speculative_config.method == "suffix":
                 self.drafter = SuffixDecodingProposer(self.vllm_config)
             elif self.speculative_config.use_eagle():
-                self.drafter = EagleProposer(self.vllm_config, self.device, self)  # type: ignore
+                self.drafter = RBLNEagleProposer(self.vllm_config, self.device, self)  # type: ignore
                 if self.speculative_config.method == "eagle3":
                     self.use_aux_hidden_state_outputs = (
                         self.drafter.eagle3_use_aux_hidden_state
@@ -2815,7 +2818,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             positions = positions.view(num_reqs, -1)
 
             token_indices = None
-            if is_prefills[0]:
+            if is_prefills[0] and not self.use_eagle():
                 # DO NOT include compute logits if lora_config is enabled
                 token_indices = logits_indices
 
@@ -2869,23 +2872,14 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
             model_start_time = time.perf_counter()
             with capture_ctx as reports:
-                if not self.use_wrapped_compute_logits():
-                    model_output = self.model_executable(
-                        input_ids=input_ids,
-                        positions=positions,
-                        intermediate_tensors=intermediate_tensors,
-                        inputs_embeds=inputs_embeds,
-                        **model_kwargs,
-                    )
-                else:
-                    model_output = self.model_executable(
-                        input_ids=input_ids,
-                        positions=positions,
-                        intermediate_tensors=intermediate_tensors,
-                        selected_token_indices=token_indices,
-                        inputs_embeds=inputs_embeds,
-                        **model_kwargs,
-                    )
+                model_output = self.model_executable(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    selected_token_indices=token_indices,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
             if self.performance_tracker is not None:
                 # Record performance metrics
                 model_end_time = time.perf_counter()
@@ -2994,6 +2988,11 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                             # token_indices = torch.tensor([last_seq_idx-1])
                             # selected_token_indices == token_indices
                             logits = logits
+
+                        if self.use_eagle():
+                            hidden_states = hidden_states.flatten(0, -2)
+                            sample_hidden_states = hidden_states[logits_indices]
+                            logits = logits[logits_indices]
                     else:  # decode
                         # selected_token_indices is for valid decode tokens
                         # token_indices == None, selected = torch.tensor([0])
@@ -3104,9 +3103,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         spec_config = self.speculative_config
         use_padded_batch_for_eagle = (
-            spec_config is not None
-            and spec_config.use_eagle()
-            and not spec_config.disable_padded_drafter_batch
+            self.use_eagle() and not spec_config.disable_padded_drafter_batch
         )
         effective_drafter_max_model_len = self.max_model_len
         if effective_drafter_max_model_len is None:
@@ -3125,7 +3122,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         )
         if use_padded_batch_for_eagle:
             assert spec_config is not None
-            assert isinstance(self.drafter, EagleProposer)
+            assert isinstance(self.drafter, RBLNEagleProposer)
             sampled_token_ids = sampler_output.sampled_token_ids
             if input_fits_in_drafter:
                 # EAGLE speculative decoding can use the GPU sampled tokens as
@@ -3295,7 +3292,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 sampling_metadata=sampling_metadata,
             )
         elif spec_config.use_eagle():
-            assert isinstance(self.drafter, EagleProposer)
+            assert isinstance(self.drafter, RBLNEagleProposer)
             assert spec_config.disable_padded_drafter_batch is not True, (
                 "This option is not supported in vllm-rbln."
             )
@@ -3317,6 +3314,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             )
 
             target_hidden_states = hidden_states
+            num_rejected_tokens_gpu = None
             if spec_decode_metadata is None:
                 token_indices_to_sample = None
                 # input_ids can be None for multimodal models.
@@ -3328,12 +3326,14 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         [h.view(-1, h.shape[-1]) for h in aux_hidden_states], dim=-1
                     )
             else:
-                common_attn_metadata, token_indices_to_sample = (
-                    self.drafter.prepare_inputs_padded(
-                        common_attn_metadata,
-                        spec_decode_metadata,
-                        valid_sampled_tokens_count,
-                    )
+                (
+                    common_attn_metadata,
+                    token_indices_to_sample,
+                    num_rejected_tokens_gpu,
+                ) = self.drafter.prepare_inputs_padded(
+                    common_attn_metadata,
+                    spec_decode_metadata,
+                    valid_sampled_tokens_count,
                 )
                 total_num_tokens = common_attn_metadata.num_actual_tokens
                 # When padding the batch, token_indices is just a range
@@ -3358,11 +3358,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 target_positions=target_positions,
                 target_hidden_states=target_hidden_states,
                 next_token_ids=next_token_ids,
-                last_token_indices=token_indices_to_sample,
+                token_indices_to_sample=token_indices_to_sample,
                 sampling_metadata=sampling_metadata,
                 common_attn_metadata=common_attn_metadata,
                 mm_embed_inputs=mm_embed_inputs,
-                kv_caches=self.kv_caches,
+                num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                slot_mappings=slot_mappings,
             )
 
         return draft_token_ids
@@ -3433,11 +3434,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
             if (
                 get_pp_group().is_last_rank
-                and self.lora_config is None
-                and (
-                    self.speculative_config is None
-                    or self.speculative_config.method not in ("eagle", "eagle3")
-                )
+                and self.use_wrapped_compute_logits()
                 and not self.is_pooling_model
                 and self.logits_processor is not None
             ):
@@ -3466,9 +3463,22 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             logger.info("Loading drafter model...")
             self.drafter.load_model(self.model)
         if self.use_aux_hidden_state_outputs:
-            self.model.set_aux_hidden_state_layers(
-                self.model.get_eagle3_aux_hidden_state_layers()
-            )
+            if not supports_eagle3(self.get_model()):
+                raise RuntimeError(
+                    "Model does not support EAGLE3 interface but "
+                    "aux_hidden_state_outputs was requested"
+                )
+
+            aux_layers = self._get_eagle3_aux_layers_from_config()
+            if aux_layers:
+                logger.info(
+                    "Using auxiliary layers from speculative config: %s",
+                    aux_layers,
+                )
+            else:
+                aux_layers = self.model.get_eagle3_default_aux_hidden_state_layers()
+
+            self.model.set_aux_hidden_state_layers(aux_layers)
 
         # FIXME - device specific communication buffer (CUDA)?
         # disable communication buffer for RBLN (NYI)
@@ -3505,6 +3515,30 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 self._prepare_prefill_intermediate_tensors()
                 for batch_bucket_size in self.bucketing_manager.decode_batch_buckets:
                     self._prepare_decode_intermediate_tensors(batch_bucket_size)
+
+    def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:
+        """Extract Eagle3 auxiliary layer indices from speculative config.
+
+        These indices specify which hidden states from the base model should
+        be used as auxiliary inputs for the Eagle3 drafter model during
+        speculative decoding.
+
+        Returns:
+            Tuple of layer indices if found in draft model config,
+            None otherwise.
+        """
+        if not (self.speculative_config and self.speculative_config.draft_model_config):
+            return None
+
+        hf_config = self.speculative_config.draft_model_config.hf_config
+        if not hasattr(hf_config, "eagle_aux_hidden_state_layer_ids"):
+            return None
+
+        layer_ids = hf_config.eagle_aux_hidden_state_layer_ids
+        if layer_ids and isinstance(layer_ids, (list, tuple)):
+            return tuple(layer_ids)
+
+        return None
 
     def _prepare_prefill_intermediate_tensors(self) -> None:
         def _reshape(
@@ -3788,6 +3822,14 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # Note (tdoublep): do this *after* constructing builders,
         # because some of them change the threshold at init time.
         self.calculate_reorder_batch_threshold()
+
+        # Initialize drafter attention backend
+        if self.speculative_config and (
+            self.speculative_config.use_eagle()
+            or self.speculative_config.uses_draft_model()
+        ):
+            assert isinstance(self.drafter, RBLNEagleProposer)  # | DraftModelProposer)
+            self.drafter.initialize_attn_backend(kv_cache_config, kernel_block_sizes)
 
     def calculate_reorder_batch_threshold(self) -> None:
         """
@@ -4258,8 +4300,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             kv_cache_config, kernel_block_sizes
         )
 
-        if self.speculative_config and self.speculative_config.use_eagle():
-            assert isinstance(self.drafter, EagleProposer)
+        if self.use_eagle():
+            assert isinstance(self.drafter, RBLNEagleProposer)
             # validate all draft model layers belong to the same kv cache
             # group
             self.drafter.validate_same_kv_cache_group(kv_cache_config)
@@ -4370,12 +4412,11 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         )
 
     def use_wrapped_compute_logits(self) -> bool:
-        return not (
-            self.lora_config is not None
-            or (
-                self.speculative_config is not None
-                and self.speculative_config.method in ("eagle", "eagle3")
-            )
+        return not (self.lora_config is not None)
+
+    def use_eagle(self) -> bool:
+        return (
+            self.speculative_config is not None and self.speculative_config.use_eagle()
         )
 
     def collect_metrics(
