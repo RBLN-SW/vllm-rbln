@@ -51,6 +51,7 @@ def _load_json(path: str | Path) -> dict[str, Any]:
     with Path(path).open("r", encoding="utf-8") as f:
         return json.load(f)
 
+
 def _is_vllm_medusa_config(config_dict: dict[str, Any]) -> bool:
     return config_dict.get("model_type") == "medusa" and isinstance(
         config_dict.get("num_heads"), int
