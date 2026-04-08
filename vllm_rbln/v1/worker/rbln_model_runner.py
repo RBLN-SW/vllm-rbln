@@ -2263,7 +2263,9 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     extra_attn_metadata_args = {}
 
                     if isinstance(builder, RBLNFlashAttentionMetadataBuilder):
-                        extra_attn_metadata_args["num_tokens"] = input_batch.num_tokens
+                        extra_attn_metadata_args["num_tokens"] = (
+                            input_batch.num_tokens_no_spec
+                        )
                         extra_attn_metadata_args["positions"] = positions
                         extra_attn_metadata_args["batch_pad"] = batch_bucket_size
                     attn_metadata_i = builder.build(

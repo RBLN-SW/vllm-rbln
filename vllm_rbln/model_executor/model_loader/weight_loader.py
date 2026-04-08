@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections.abc import Iterable
+import typing
+from collections.abc import Callable, Iterable
 
 import torch
 from vllm.logger import init_logger
@@ -29,8 +30,8 @@ from vllm.model_executor.models import (
     qwen2,
     qwen2_moe,
     qwen3_moe,
-    utils,
 )
+from vllm.model_executor.models.utils import is_pp_missing_parameter
 
 logger = init_logger(__name__)
 
@@ -96,7 +97,7 @@ def load_llama_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set
             if name.endswith(".bias") and name not in params_dict:
                 continue
 
-            if utils.is_pp_missing_parameter(name, self):
+            if is_pp_missing_parameter(name, self):
                 continue
 
             param = params_dict[name]
@@ -108,7 +109,7 @@ def load_llama_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set
             if name.endswith(".bias") and name not in params_dict:
                 continue
 
-            if utils.is_pp_missing_parameter(name, self):
+            if is_pp_missing_parameter(name, self):
                 continue
 
             param = params_dict[name]
@@ -161,7 +162,7 @@ def load_qwen2_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set
             # Skip loading extra bias for GPTQ models.
             if name.endswith(".bias") and name not in params_dict:
                 continue
-            if utils.is_pp_missing_parameter(name, self):
+            if is_pp_missing_parameter(name, self):
                 continue
             param = params_dict[name]
             weight_loader = param.weight_loader
@@ -175,7 +176,7 @@ def load_qwen2_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set
             name = maybe_remap_kv_scale_name(name, params_dict)
             if name is None:
                 continue
-            if utils.is_pp_missing_parameter(name, self):
+            if is_pp_missing_parameter(name, self):
                 continue
             param = params_dict[name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
@@ -196,17 +197,19 @@ def load_qwen3moe_weights(
         ("gate_up_proj", "up_proj", 1),
     ]
 
-    # Params for weights, fp8 weight scales, fp8 activation scales
-    # (param_name, weight_name, expert_id, shard_id)
-    expert_params_mapping = FusedMoE.make_expert_params_mapping(
-        ckpt_gate_proj_name="gate_proj",
-        ckpt_down_proj_name="down_proj",
-        ckpt_up_proj_name="up_proj",
-        num_experts=self.config.num_experts,
+    # Skip loading extra parameters for GPTQ/modelopt models.
+    ignore_suffixes = (
+        ".bias",
+        "_bias",
+        ".weight_scale",
+        "_weight_scale",
+        ".input_scale",
+        "_input_scale",
     )
 
     params_dict = dict(self.named_parameters())
     loaded_params: set[str] = set()
+    expert_params_mapping = self.get_expert_mapping()
     for name, loaded_weight in weights:
         """
         [RBLN] Skips loading of layers greater than `num_hidden_layers`.
@@ -218,6 +221,23 @@ def load_qwen3moe_weights(
                 continue
         #######
 
+        if self.quant_config is not None and (
+            scale_name := self.quant_config.get_cache_scale(name)
+        ):
+            # Loading kv cache quantization scales
+            param = params_dict[scale_name]
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            assert loaded_weight.numel() == 1, (
+                f"KV scale numel {loaded_weight.numel()} != 1"
+            )
+            loaded_weight = loaded_weight.squeeze()
+            weight_loader(param, loaded_weight)
+            loaded_params.add(scale_name)
+            continue
+        if "scale" in name or "zero_point" in name:
+            name = maybe_remap_kv_scale_name(name, params_dict)
+            if name is None:
+                continue
         for param_name, weight_name, shard_id in stacked_params_mapping:
             # Skip non-stacked layers and experts (experts handled below).
             if weight_name not in name:
@@ -231,64 +251,85 @@ def load_qwen3moe_weights(
             if "mlp.experts" in name:
                 continue
             name = name.replace(weight_name, param_name)
-            # Skip loading extra bias for GPTQ models.
-            if (
-                name.endswith(".bias") or name.endswith("_bias")
-            ) and name not in params_dict:
+
+            # Skip loading extra parameters for GPTQ/modelopt models.
+            if name.endswith(ignore_suffixes) and name not in params_dict:
                 continue
+
             # Skip layers on other devices.
-            if utils.is_pp_missing_parameter(name, self):
+            if is_pp_missing_parameter(name, self):
                 continue
+            if name.endswith("scale"):
+                # Remapping the name of FP8 kv-scale.
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
             if name not in params_dict:
                 continue
 
             param = params_dict[name]
-            weight_loader = param.weight_loader
-            weight_loader(param, loaded_weight, shard_id)
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            if weight_loader == default_weight_loader:
+                weight_loader(param, loaded_weight)
+            else:
+                weight_loader(param, loaded_weight, shard_id)
             break
         else:
+            is_expert_weight = False
             for mapping in expert_params_mapping:
                 param_name, weight_name, expert_id, shard_id = mapping
                 if weight_name not in name:
                     continue
-                name = name.replace(weight_name, param_name)
-                # Skip layers on other devices.
-                if utils.is_pp_missing_parameter(name, self):
+
+                # Anyway, this is an expert weight and should not be
+                # attempted to load as other weights later
+                is_expert_weight = True
+
+                # Do not modify `name` since the loop may continue here
+                # Instead, create a new variable
+                name_mapped = name.replace(weight_name, param_name)
+
+                if is_pp_missing_parameter(name_mapped, self):
                     continue
-                # Skip loading extra bias for GPTQ models.
+
+                # Skip loading extra parameters for GPTQ/modelopt models.
                 if (
-                    name.endswith(".bias") or name.endswith("_bias")
-                ) and name not in params_dict:
+                    name_mapped.endswith(ignore_suffixes)
+                    and name_mapped not in params_dict
+                ):
                     continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(
-                    param, loaded_weight, name, shard_id=shard_id, expert_id=expert_id
+
+                param = params_dict[name_mapped]
+                # We should ask the weight loader to return success or not
+                # here since otherwise we may skip experts with other
+                # available replicas.
+                weight_loader = typing.cast(Callable[..., bool], param.weight_loader)
+                success = weight_loader(
+                    param,
+                    loaded_weight,
+                    name_mapped,
+                    shard_id=shard_id,
+                    expert_id=expert_id,
+                    return_success=True,
                 )
-                break
+                if success:
+                    name = name_mapped
+                    break
             else:
-                # Skip loading extra bias for GPTQ models.
-                if (
-                    name.endswith(".bias") or name.endswith("_bias")
-                ) and name not in params_dict:
+                if is_expert_weight:
+                    # We've checked that this is an expert weight
+                    # However it's not mapped locally to this rank
+                    # So we simply skip it
+                    continue
+
+                # Skip loading extra parameters for GPTQ/modelopt models.
+                if name.endswith(ignore_suffixes) and name not in params_dict:
                     continue
                 # Skip layers on other devices.
-                if utils.is_pp_missing_parameter(name, self):
+                if is_pp_missing_parameter(name, self):
                     continue
-                # Remapping the name of FP8 kv-scale.
-                if name.endswith("kv_scale"):
-                    remapped_kv_scale_name = name.replace(".kv_scale", ".attn.kv_scale")
-                    if remapped_kv_scale_name not in params_dict:
-                        logger.warning_once(
-                            "Found kv scale in the checkpoint "
-                            f"(e.g. {name}), but not found the expected "
-                            f"name in the model "
-                            f"(e.g. {remapped_kv_scale_name}). "
-                            "kv-scale is not loaded."
-                        )
-                        continue
-                    else:
-                        name = remapped_kv_scale_name
+                if name not in params_dict:
+                    continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
@@ -308,17 +349,9 @@ def load_qwen2moe_weights(
         ("gate_up_proj", "up_proj", 1),
     ]
 
-    # Params for weights, fp8 weight scales, fp8 activation scales
-    # (param_name, weight_name, expert_id, shard_id)
-    expert_params_mapping = FusedMoE.make_expert_params_mapping(
-        ckpt_gate_proj_name="gate_proj",
-        ckpt_down_proj_name="down_proj",
-        ckpt_up_proj_name="up_proj",
-        num_experts=self.config.num_experts,
-    )
-
     params_dict = dict(self.named_parameters())
     loaded_params: set[str] = set()
+    expert_params_mapping = self.get_expert_mapping()
     for name, loaded_weight in weights:
         """
         [RBLN] Skips loading of layers greater than `num_hidden_layers`.
@@ -349,7 +382,7 @@ def load_qwen2moe_weights(
             ) and name not in params_dict:
                 continue
             # Skip layers on other devices.
-            if utils.is_pp_missing_parameter(name, self):
+            if is_pp_missing_parameter(name, self):
                 continue
             if name not in params_dict:
                 continue
@@ -364,8 +397,9 @@ def load_qwen2moe_weights(
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
+
                 # Skip layers on other devices.
-                if utils.is_pp_missing_parameter(name, self):
+                if is_pp_missing_parameter(name, self):
                     continue
                 # Skip loading extra bias for GPTQ models.
                 if (
@@ -375,7 +409,11 @@ def load_qwen2moe_weights(
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(
-                    param, loaded_weight, name, shard_id=shard_id, expert_id=expert_id
+                    param,
+                    loaded_weight,
+                    name,
+                    shard_id=shard_id,
+                    expert_id=expert_id,
                 )
                 break
             else:
@@ -385,22 +423,23 @@ def load_qwen2moe_weights(
                 ) and name not in params_dict:
                     continue
                 # Skip layers on other devices.
-                if utils.is_pp_missing_parameter(name, self):
+                if is_pp_missing_parameter(name, self):
                     continue
                 # Remapping the name of FP8 kv-scale.
                 if name.endswith("kv_scale"):
                     remapped_kv_scale_name = name.replace(".kv_scale", ".attn.kv_scale")
                     if remapped_kv_scale_name not in params_dict:
                         logger.warning_once(
-                            "Found kv scale in the checkpoint "
-                            f"(e.g. {name}), but not found the expected "
-                            f"name in the model "
-                            f"(e.g. {remapped_kv_scale_name}). "
-                            "kv-scale is not loaded."
+                            "Found kv_scale in the checkpoint (e.g. %s), but not found the expected name in the model (e.g. %s). kv_scale is not loaded.",  #  noqa: E501
+                            name,
+                            remapped_kv_scale_name,
                         )
                         continue
                     else:
                         name = remapped_kv_scale_name
+                # GGUF: make sure that shared_expert_gate is a 2D tensor.
+                if "mlp.shared_expert_gate" in name and len(loaded_weight.shape) == 1:
+                    loaded_weight = loaded_weight[None, :]
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
@@ -462,7 +501,7 @@ def load_deepseek_v2_weights(
             if name.endswith(".bias") and name not in params_dict:
                 continue
 
-            if utils.is_pp_missing_parameter(name, self):
+            if is_pp_missing_parameter(name, self):
                 continue
 
             param = params_dict[name]
@@ -476,7 +515,7 @@ def load_deepseek_v2_weights(
                     continue
                 name = name.replace(weight_name, param_name)
 
-                if utils.is_pp_missing_parameter(name, self):
+                if is_pp_missing_parameter(name, self):
                     continue
 
                 param = params_dict[name]
@@ -495,7 +534,7 @@ def load_deepseek_v2_weights(
                 if name is None:
                     continue
 
-                if utils.is_pp_missing_parameter(name, self):
+                if is_pp_missing_parameter(name, self):
                     continue
 
                 param = params_dict[name]
@@ -559,7 +598,7 @@ def load_llama4_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> se
             if weight_name not in name or "experts" in name:
                 continue
             name = name.replace(weight_name, param_name)
-            if utils.is_pp_missing_parameter(name, self):
+            if is_pp_missing_parameter(name, self):
                 continue
             param = params_dict[name]
             weight_loader = param.weight_loader
@@ -577,7 +616,7 @@ def load_llama4_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> se
             )
 
             if not moe_loaded:
-                if utils.is_pp_missing_parameter(name, self):
+                if is_pp_missing_parameter(name, self):
                     continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
@@ -633,7 +672,7 @@ def load_minimax_m2_weights(
             if name.endswith(".bias") and name not in params_dict:
                 continue
 
-            if utils.is_pp_missing_parameter(name, self):
+            if is_pp_missing_parameter(name, self):
                 continue
 
             param = params_dict[name]
@@ -647,7 +686,7 @@ def load_minimax_m2_weights(
                     continue
                 name = name.replace(weight_name, param_name)
 
-                if utils.is_pp_missing_parameter(name, self):
+                if is_pp_missing_parameter(name, self):
                     continue
 
                 param = params_dict[name]
@@ -670,7 +709,7 @@ def load_minimax_m2_weights(
                 if name is None:
                     continue
 
-                if utils.is_pp_missing_parameter(name, self):
+                if is_pp_missing_parameter(name, self):
                     continue
 
                 param = params_dict[name]

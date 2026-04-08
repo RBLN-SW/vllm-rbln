@@ -406,9 +406,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if layer.activation == "swigluoai":
             expert_map_const = None
             if layer.expert_map is not None:
-                # Extract numpy array and create a fresh constant tensor
-                expert_map_list = layer.expert_map.tolist()
-                expert_map_const = torch.tensor(expert_map_list, dtype=torch.int32)
+                assert getattr(layer, "expert_map_const", None) is not None
+                expert_map_const = torch.tensor(
+                    layer.expert_map_const, dtype=torch.int32
+                )
 
             use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
             tokens_mask = None
