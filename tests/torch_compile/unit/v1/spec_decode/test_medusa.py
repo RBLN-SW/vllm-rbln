@@ -24,8 +24,8 @@ import pytest
 import torch
 from vllm.v1.spec_decode.medusa import MedusaProposer
 
-import vllm_rbln.v1.spec_decoding.medusa as medusa_module
-from vllm_rbln.v1.spec_decoding.medusa import RBLNMedusaProposer
+import vllm_rbln.v1.spec_decode.medusa as medusa_module
+from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
 
 
 class FakeMedusaModel:
