@@ -32,6 +32,20 @@ def initialize_environment():
     return
 
 
+@pytest.fixture(scope="class")
+def monkeypatch_class():
+    monkeypatch = pytest.MonkeyPatch()
+    yield monkeypatch
+    monkeypatch.undo()
+
+
+@pytest.fixture(scope="module")
+def monkeypatch_module():
+    monkeypatch = pytest.MonkeyPatch()
+    yield monkeypatch
+    monkeypatch.undo()
+
+
 @pytest.fixture
 def vllm_config():
     scheduler_config = SchedulerConfig.default_factory()
