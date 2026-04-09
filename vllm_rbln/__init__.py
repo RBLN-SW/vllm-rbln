@@ -54,7 +54,7 @@ def register_ops():
         import vllm_rbln.model_executor.layers.quantization.kernels.mixed_precision  # noqa
         import vllm_rbln.model_executor.layers.quantization.mxfp4  # noqa
         import vllm_rbln.model_executor.layers.quantization.fp8  # noqa
-        # import vllm_rbln.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe  # noqa
+        import vllm_rbln.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe  # noqa
         import vllm_rbln.model_executor.layers.rotary_embedding.base  # noqa
         import vllm_rbln.model_executor.layers.vocab_parallel_embedding  # noqa
         import vllm_rbln.model_executor.model_loader.weight_loader  # noqa
