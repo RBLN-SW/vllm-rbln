@@ -78,6 +78,7 @@ rbln = "vllm_rbln:register"
 [project.entry-points."vllm.general_plugins"]
 rbln_new_models = "vllm_rbln:register_model"
 rbln_custom_ops = "vllm_rbln:register_ops"
+rbln_kv_connectors = "vllm_rbln:register_kv_connectors"
 
 [tool.setuptools_scm]
 version_file = "vllm_rbln/_version.py"

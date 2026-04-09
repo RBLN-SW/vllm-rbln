@@ -18,7 +18,7 @@ import os
 import time
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from copy import copy, deepcopy
 from typing import TYPE_CHECKING, Any, NamedTuple, Union, cast
 
@@ -4317,6 +4317,13 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 kv_transfer_group.register_kv_caches(kv_caches)
             kv_transfer_group.set_host_xfer_buffer_ops(copy_kv_blocks)
 
+            if hasattr(kv_transfer_group, "set_runtime_holder"):
+                kv_transfer_group.set_runtime_holder(self.runtime_holder)
+            elif len(self.runtime_holder) > 0 and hasattr(
+                kv_transfer_group, "set_runtime"
+            ):
+                kv_transfer_group.set_runtime(self.runtime_holder[0])
+
         if self.dcp_world_size > 1:
             layer_type = cast(type[Any], AttentionLayerBase)
             layers = get_layers_from_vllm_config(self.vllm_config, layer_type)
@@ -4410,6 +4417,24 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self.input_batch.num_computed_tokens_cpu
             < self.input_batch.num_tokens_no_spec - 1
         )
+
+    @staticmethod
+    def maybe_get_kv_connector_output(
+        scheduler_output: SchedulerOutput,
+        defer_finalize: bool = False,
+    ) -> AbstractContextManager[KVConnectorOutput | None]:
+        """Override upstream to skip KV connector during warmup phase.
+
+        During warmup, scheduler_output.kv_connector_metadata is None, which
+        would trigger an assertion error in the upstream
+        ``_get_kv_connector_output``. We guard against that here.
+        """
+        warm_up_phase = scheduler_output.kv_connector_metadata is None
+        if has_kv_transfer_group() and not warm_up_phase:
+            return KVConnectorModelRunnerMixin._get_kv_connector_output(
+                scheduler_output, defer_finalize=defer_finalize
+            )
+        return nullcontext()
 
     def use_wrapped_compute_logits(self) -> bool:
         return not (self.lora_config is not None)

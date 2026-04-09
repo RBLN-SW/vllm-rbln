@@ -16,9 +16,12 @@
 import math
 import os
 import platform
+from collections import defaultdict
 from collections.abc import Callable
 
+import torch
 from vllm.config import ModelConfig, ParallelConfig
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.platforms.cpu import CpuPlatform, LogicalCPUInfo
 
@@ -422,3 +425,46 @@ def set_omp_num_threads(
         rank,
         local_rank,
     )
+
+
+def bind_kv_cache_name(
+    kv_caches: dict[str, torch.Tensor],
+    runner_kv_cache_names: list[str],
+    num_attn_module: int = 1,
+) -> None:
+    """Bind the allocated KV cache name to ModelRunner and forward context so
+    that the KV cache can be used in the forward pass.
+
+    This function:
+      1) Fills the ModelRunner's kv cache name list (`runner_kv_cache_names`)
+         with kv_caches.
+      2) Copied and Modified from vllm.v1.worker.utils.bind_kv_cache
+
+    Args:
+        kv_caches: The allocated kv_caches with layer names as keys.
+        runner_kv_cache_names: The kv_cache name list declared by ModelRunner.
+        num_attn_module: Number of attention modules per layer (default 1).
+    """
+    assert len(runner_kv_cache_names) == 0
+
+    # Convert kv_caches dict to a list of names in the order of layer_index.
+    index2name: dict[int, list[str]] = defaultdict(list)
+    for layer_name in kv_caches:
+        index2name[extract_layer_index(layer_name, num_attn_module)].append(layer_name)
+
+    for layer_index in sorted(index2name.keys()):
+        layer_names = index2name[layer_index]
+        if len(layer_names) > 1:
+            # One typical case is encoder-decoder model, e.g., bart.
+            # The cross attention and self attention in the same decoder layer
+            # has different layer_name but the same layer_index.
+            if (
+                current_platform.is_cuda_alike()
+                or current_platform.is_xpu()
+                or current_platform.is_cpu()
+            ):
+                pass
+            else:
+                raise NotImplementedError
+        layer_name = layer_names[0]
+        runner_kv_cache_names.append(layer_name)
