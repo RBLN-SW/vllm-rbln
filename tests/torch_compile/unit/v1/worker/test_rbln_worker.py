@@ -619,6 +619,31 @@ class TestDetermineAvailableMemory:
 
 
 class TestCompileOrWarmUpModel:
+    """Tests for ``compile_or_warm_up_model``.
+
+    Thread/affinity helpers are mocked via an autouse fixture so that
+    ``_ensure_rbln_host_threads_before_compile`` and
+    ``_ensure_rbln_cpu_affinity_after_warmup`` never touch the real
+    process-global state (os.sched_setaffinity, OMP_NUM_THREADS,
+    torch/numba thread counts).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _mock_thread_affinity(self):
+        with (
+            patch("vllm_rbln.v1.worker.rbln_worker.set_cpu_affinity"),
+            patch("vllm_rbln.v1.worker.rbln_worker.set_omp_num_threads"),
+            patch(
+                "vllm_rbln.v1.worker.rbln_worker.get_rbln_planned_affinity_cpu_count",
+                return_value=4,
+            ),
+            patch("numba.set_num_threads"),
+            patch("numba.get_num_threads", return_value=2),
+            patch("torch.get_num_threads", return_value=2),
+            patch("torch.set_num_threads"),
+        ):
+            yield
+
     def test_skip_enforce_eager(self):
         cfg = _make_vllm_config(enforce_eager=True)
         worker = _create_worker(vllm_config=cfg)
