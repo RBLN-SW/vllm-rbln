@@ -46,6 +46,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+lmcache = [
+    "lmcache==0.4.3",
+]
 test = [
     "pytest",
     "pytest-asyncio",
