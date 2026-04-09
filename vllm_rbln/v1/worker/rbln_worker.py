@@ -58,6 +58,7 @@ from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.worker.rbln_model_runner import RBLNModelRunner
 from vllm_rbln.v1.worker.utils import (
     estimate_available_memory,
+    get_rbln_planned_affinity_cpu_count,
     set_cpu_affinity,
     set_omp_num_threads,
 )
@@ -102,6 +103,8 @@ class RBLNWorker(WorkerBase):
 
         # Buffers saved before sleep
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
+        self._rbln_host_threads_before_compile_ready = False
+        self._rbln_cpu_affinity_applied = False
 
         profiler_config = vllm_config.profiler_config
         # Set up profiler if profiling is enabled
@@ -192,35 +195,6 @@ class RBLNWorker(WorkerBase):
             os.environ["RBLN_NPUS_PER_DEVICE"] = str(rbln_tp_size)
 
     def init_device(self) -> None:
-        set_cpu_affinity(
-            self.rank,
-            self.local_rank,
-            self.parallel_config,
-        )
-
-        # Use half of allocated CPUs to avoid oversubscription
-        allocated_cpus = len(os.sched_getaffinity(0))
-        num_threads = max(2, allocated_cpus // 2)
-        set_omp_num_threads(
-            self.rank,
-            self.local_rank,
-            num_threads,
-        )
-
-        # NOTE(RBLN): numba is used throughout vllm code base (especially in spec-dec)
-        # however accessing numba thread settings somewhat affects torch
-        # thread settings and cause global state change leading to recompilation.
-        # Thus the only solution for now is to set both thread settings to identical
-        # value in correct order like below
-
-        # Code below sets numba num thread to torch num thread and
-        # potentially change torch num thread to other value
-        numba.set_num_threads(torch.get_num_threads())
-
-        # Code below restores torch num thread to its original value
-        # before numba.set_num_threads
-        torch.set_num_threads(numba.get_num_threads())
-
         # Initialize the distributed environment.
         init_worker_distributed_environment(
             self.vllm_config,
@@ -234,7 +208,8 @@ class RBLNWorker(WorkerBase):
 
         # Construct the model runner
         self.model_runner: RBLNModelRunner = RBLNModelRunner(
-            self.vllm_config, self.device
+            self.vllm_config,
+            self.device,
         )
 
         if self.rank == 0:
@@ -331,6 +306,60 @@ class RBLNWorker(WorkerBase):
         """Allocate RBLN KV cache with the specified kv_cache_config."""
         self.model_runner.initialize_kv_cache(kv_cache_config)
 
+    def _ensure_rbln_host_threads_before_compile(self) -> None:
+        """Set OpenMP / torch / numba threads before ``warm_up_model()`` without
+        CPU affinity.
+
+        Affinity is applied later (after warm-up) so ``torch.compile`` / dummy
+        compile sees an unpinned CPU mask while thread counts and
+        ``RBLN_NUM_THREADS`` match Dynamo. Default thread count uses the same
+        logical CPU count ``set_cpu_affinity`` will pin to (NUMA / DP split),
+        not the pre-split ``sched_getaffinity`` mask.
+        """
+        if self._rbln_host_threads_before_compile_ready:
+            return
+
+        allocated_cpus = get_rbln_planned_affinity_cpu_count(
+            self.rank,
+            self.local_rank,
+            self.parallel_config,
+        )
+        num_threads = max(2, allocated_cpus // 2)
+        set_omp_num_threads(
+            self.rank,
+            self.local_rank,
+            num_threads,
+        )
+
+        # NOTE(RBLN): numba is used throughout vllm code base (especially in spec-dec)
+        # however accessing numba thread settings somewhat affects torch
+        # thread settings and cause global state change leading to recompilation.
+        # Thus the only solution for now is to set both thread settings to identical
+        # value in correct order like below
+
+        # Code below sets numba num thread to torch num thread and
+        # potentially change torch num thread to other value
+        numba.set_num_threads(torch.get_num_threads())
+
+        # Code below restores torch num thread to its original value
+        # before numba.set_num_threads
+        torch.set_num_threads(numba.get_num_threads())
+
+        self._rbln_host_threads_before_compile_ready = True
+
+    def _ensure_rbln_cpu_affinity_after_warmup(self) -> None:
+        """Pin CPU affinity after ``warm_up_model()``; does not change torch
+        thread counts."""
+        if self._rbln_cpu_affinity_applied:
+            return
+
+        set_cpu_affinity(
+            self.rank,
+            self.local_rank,
+            self.parallel_config,
+        )
+        self._rbln_cpu_affinity_applied = True
+
     def compile_or_warm_up_model(self) -> None:
         if self.parallel_config.data_parallel_size > 1:
             if envs.VLLM_RBLN_DP_IMPL == "padded_decode":
@@ -347,12 +376,17 @@ class RBLNWorker(WorkerBase):
                 )
             self.model_runner.prepare_dummy_run()
 
+        # Thread policy + RBLN_NUM_THREADS before compile/warm-up; affinity after.
+        self._ensure_rbln_host_threads_before_compile()
+
         if (
             self.model_config.enforce_eager
             or not envs.VLLM_RBLN_COMPILE_MODEL
             or not envs.VLLM_RBLN_ENABLE_WARM_UP
         ):
             logger.warning("skipping compile_or_warm_up_model")
+
+            self._ensure_rbln_cpu_affinity_after_warmup()
             return
 
         try:
@@ -380,7 +414,8 @@ class RBLNWorker(WorkerBase):
 
             raise
 
-        # after completing model warm up, enable RBLN performance tracker
+        # After warm-up: apply CPU affinity only (threads already set pre-compile).
+        self._ensure_rbln_cpu_affinity_after_warmup()
         self.model_runner._enable_performance_tracker()
 
     def get_model(self) -> nn.Module:
@@ -454,6 +489,7 @@ class RBLNWorker(WorkerBase):
                 )
 
     def execute_dummy_batch(self) -> None:
+        self._ensure_rbln_host_threads_before_compile()
         self.model_runner.dummy_run()
 
     def add_lora(self, lora_request: LoRARequest) -> bool:

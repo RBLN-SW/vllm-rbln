@@ -1099,11 +1099,9 @@ class RBLNFlashAttentionMetadataBuilder(
 
         # The length of the partition equals the block size.
         partition_len = self.block_size
-        # no. of block(HW constraint) determines max sequence length.
-        # max_model_len(Model constraint) determines max sequence length.
-        # One of them is selected for max_seq_len.
-        block_length = self.cache_config.num_gpu_blocks * partition_len
-        max_seq_len = min(self.model_config.max_model_len, block_length)
+        # num_partition is derived from max_model_len (not hardware block count)
+        # to ensure seq_idx/seq_lens dimensions stay within block_table bounds.
+        max_seq_len = self.model_config.max_model_len
 
         num_partition = max_seq_len // partition_len
         cs = seq_idx.repeat(1, num_partition)
