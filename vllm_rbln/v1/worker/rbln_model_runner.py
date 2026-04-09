@@ -639,7 +639,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         orig_indices = np.arange(len(self.input_batch.req_ids))
         sorted_order = np.argsort(
-            self.input_batch.num_tokens[orig_indices] * (-1), kind="stable"
+            self.input_batch.num_tokens_no_spec[orig_indices] * (-1), kind="stable"
         )
         src_indices = orig_indices[sorted_order]
         src_dest_map = {
