@@ -121,7 +121,6 @@ class RBLNOptimumWorker(WorkerBase):
 
             # Directly set PyTorch thread counts
             torch.set_num_threads(num_threads)
-            torch.set_num_interop_threads(max(1, num_threads // 4))
 
             set_omp_num_threads(self.rank, self.local_rank, num_threads)
         else:
