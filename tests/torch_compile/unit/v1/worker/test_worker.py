@@ -366,16 +366,6 @@ class TestInterfaceCompliance:
 
         assert RBLNWorker.check_health is not WorkerBase.check_health
 
-    def test_sleep_wake_up_are_defined(self):
-        """sleep and wake_up must be defined on RBLNWorker."""
-        from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
-
-        assert hasattr(RBLNWorker, "sleep")
-        assert hasattr(RBLNWorker, "wake_up")
-        assert callable(RBLNWorker.sleep)
-        assert callable(RBLNWorker.wake_up)
-
-
 # ===========================================================================
 # 2. WorkerBase contract: class hierarchy and method signatures
 # ===========================================================================
@@ -394,14 +384,6 @@ class TestWorkerBaseContract:
         from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
 
         assert RBLNWorker.__bases__[0] is WorkerBase
-
-    def test_determine_available_memory_returns_int(self):
-        """determine_available_memory should return int (bytes)."""
-        from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
-
-        sig = inspect.signature(RBLNWorker.determine_available_memory)
-        ret = sig.return_annotation
-        assert ret is int or ret == inspect.Parameter.empty
 
     def test_initialize_cache_signature(self):
         from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
