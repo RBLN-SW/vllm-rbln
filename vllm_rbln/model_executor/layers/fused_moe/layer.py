@@ -89,6 +89,33 @@ def prepare_recv_mask_matrix(R: int, my_rank: int, E: int) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# All2All mask generation helpers — naive P2P (AllToAllX)
+# ---------------------------------------------------------------------------
+
+
+def prepare_send_mask_matrix_p2p(R: int, my_rank: int, E: int) -> np.ndarray:
+    """(R, E) naive P2P send mask — one row per destination rank.
+
+    send_mask[dst, e] = 1 if expert e belongs to rank dst and dst != my_rank.
+    """
+    expert_binary = np.where(generate_expert_mask(R, E) >= 0, 1, 0)
+    send_mask = expert_binary.copy()
+    send_mask[my_rank, :] = 0  # no self-send via CCL
+    return send_mask
+
+
+def prepare_recv_mask_matrix_p2p(R: int, my_rank: int, E: int) -> np.ndarray:
+    """(R, E) naive P2P recv mask.
+
+    recv_mask[src, e] = 1 if expert e is assigned to my_rank (I own it),
+    so I expect to receive tokens for my local experts from every source.
+    """
+    expert_binary = np.where(generate_expert_mask(R, E) >= 0, 1, 0)
+    recv_mask = np.tile(expert_binary[my_rank : my_rank + 1, :], (R, 1))
+    return recv_mask
+
+
+# ---------------------------------------------------------------------------
 # Custom op: ccl_send_kernel
 # ---------------------------------------------------------------------------
 
@@ -191,6 +218,42 @@ def _ccl_all2all_kernel_fake(
     group_id: int,
 ) -> Tensor:
     R_dim = recv_sizes.shape[0]
+    t_dim = send_buffer.shape[1]
+    H_dim = send_buffer.shape[2]
+    return torch.empty(R_dim, t_dim, H_dim, dtype=send_buffer.dtype)
+
+
+# ---------------------------------------------------------------------------
+# Custom op: ccl_all2all_x_kernel  (naive P2P — no recv_sizes)
+# ---------------------------------------------------------------------------
+
+
+@torch.library.custom_op(
+    "rbln_custom_ops::ccl_all2all_x_kernel",
+    mutates_args=(),
+)
+def ccl_all2all_x_kernel(
+    send_buffer: Tensor,
+    send_sizes: Tensor,
+    ccl_world_size: int,
+    group_id: int,
+) -> Tensor:
+    # CPU stub — returns zeros of correct shape.
+    # Real communication happens on device via CCL runtime (rcclAllToAllX).
+    R = ccl_world_size
+    t = send_buffer.shape[1]
+    H = send_buffer.shape[2]
+    return torch.zeros(R, t, H, dtype=send_buffer.dtype)
+
+
+@ccl_all2all_x_kernel.register_fake
+def _ccl_all2all_x_kernel_fake(
+    send_buffer: Tensor,
+    send_sizes: Tensor,
+    ccl_world_size: int,
+    group_id: int,
+) -> Tensor:
+    R_dim = ccl_world_size
     t_dim = send_buffer.shape[1]
     H_dim = send_buffer.shape[2]
     return torch.empty(R_dim, t_dim, H_dim, dtype=send_buffer.dtype)
@@ -720,14 +783,22 @@ def fused_moe_forward_rbln(
             )
         )
 
-        # ccl_all2all
-        recv_buffer = torch.ops.rbln_custom_ops.ccl_all2all_kernel(
-            send_buffer,
-            send_sizes,
-            recv_sizes,
-            self.dp_size,
-            CCL_ALL2ALL_GROUP_ID,
-        )
+        # ccl_all2all — branch on P2P vs recursive doubling
+        if envs.VLLM_RBLN_CCL_ALL2ALL_P2P:
+            recv_buffer = torch.ops.rbln_custom_ops.ccl_all2all_x_kernel(
+                send_buffer,
+                send_sizes,
+                self.dp_size,
+                CCL_ALL2ALL_GROUP_ID,
+            )
+        else:
+            recv_buffer = torch.ops.rbln_custom_ops.ccl_all2all_kernel(
+                send_buffer,
+                send_sizes,
+                recv_sizes,
+                self.dp_size,
+                CCL_ALL2ALL_GROUP_ID,
+            )
 
         # ccl_receive → unpacked: [R, t, H]
         unpacked = torch.ops.rbln_custom_ops.ccl_receive_kernel(
@@ -877,20 +948,42 @@ def _fused_moe_init_with_all2all(self, *args, **kwargs):
         R = self.dp_size
         rank_id = self.dp_rank
         E = self.global_num_experts
-        self.register_buffer(
-            "send_mask",
-            torch.tensor(
-                prepare_send_mask_matrix(R, rank_id, E), dtype=torch.float32
-            ),
-        )
-        self.register_buffer(
-            "recv_mask",
-            torch.tensor(
-                prepare_recv_mask_matrix(R, rank_id, E), dtype=torch.float32
-            ),
-        )
+        if envs.VLLM_RBLN_CCL_ALL2ALL_P2P:
+            # Naive P2P (AllToAllX): send_mask (R, E), recv_mask (R, E)
+            self.register_buffer(
+                "send_mask",
+                torch.tensor(
+                    prepare_send_mask_matrix_p2p(R, rank_id, E),
+                    dtype=torch.float32,
+                ),
+            )
+            self.register_buffer(
+                "recv_mask",
+                torch.tensor(
+                    prepare_recv_mask_matrix_p2p(R, rank_id, E),
+                    dtype=torch.float32,
+                ),
+            )
+            mode_str = "P2P (AllToAllX)"
+        else:
+            # Recursive doubling (AllToAllV): send_mask (N, E), recv_mask (R, E)
+            self.register_buffer(
+                "send_mask",
+                torch.tensor(
+                    prepare_send_mask_matrix(R, rank_id, E),
+                    dtype=torch.float32,
+                ),
+            )
+            self.register_buffer(
+                "recv_mask",
+                torch.tensor(
+                    prepare_recv_mask_matrix(R, rank_id, E),
+                    dtype=torch.float32,
+                ),
+            )
+            mode_str = "recursive doubling (AllToAllV)"
         logger.info(
-            "[RBLN] FusedMoE all2all masks registered: "
+            f"[RBLN] FusedMoE all2all masks registered ({mode_str}): "
             f"R={R}, rank={rank_id}, E={E}, "
             f"send_mask={self.send_mask.shape}, recv_mask={self.recv_mask.shape}"
         )
