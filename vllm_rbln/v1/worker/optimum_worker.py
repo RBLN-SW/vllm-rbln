@@ -35,6 +35,8 @@ from vllm.v1.worker.worker_base import WorkerBase
 
 import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
+from vllm_rbln.utils.optimum.cache_blocks import sync_num_blocks
+from vllm_rbln.utils.optimum.rbln_params import get_rbln_params
 from vllm_rbln.v1.worker.optimum_model_runner import RBLNOptimumModelRunner
 
 logger = init_logger(__name__)
@@ -112,7 +114,16 @@ class RBLNOptimumWorker(WorkerBase):
 
         adapter = self.model_runner.model.kv_block_adapter
         num_gpu_blocks = adapter.get_available_num_blocks()
-        validation_blocks = self.model_runner.vllm_config.cache_config.num_blocks
+        # If the model is compiled in the runner,
+        # the number of blocks is not set in the vLLM config yet.
+        # Therefore, we need to update it here.
+        if not self.model_runner.vllm_config.cache_config.num_gpu_blocks:
+            num_blocks, _, _, _, _ = get_rbln_params(
+                self.model_runner.vllm_config, self.model_runner.model.rbln_model_config
+            )
+            sync_num_blocks(self.model_runner.vllm_config, num_blocks)
+
+        validation_blocks = self.model_runner.vllm_config.cache_config.num_gpu_blocks
         # This will be removed after validation check
         assert num_gpu_blocks == validation_blocks, (
             f"The number of blocks from the model runner ({num_gpu_blocks}) "
@@ -232,9 +243,11 @@ class RBLNOptimumWorker(WorkerBase):
 
     def shutdown(self) -> None:
         logger.info("v1 optimum_worker shutdown called")
-        if envs.VLLM_RBLN_METRICS and self.model_runner.performance_tracker:
-            # FIXME - performance tracker atexit is not called
-            self.model_runner.performance_tracker.print_final_stats()
+        if envs.VLLM_RBLN_METRICS:
+            if self.model_runner.model_performance_tracker:
+                self.model_runner.model_performance_tracker.print_final_stats()
+            if self.model_runner.sampler_performance_tracker:
+                self.model_runner.sampler_performance_tracker.print_final_stats()
 
 
 def init_worker_distributed_environment(

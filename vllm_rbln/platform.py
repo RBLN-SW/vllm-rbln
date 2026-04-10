@@ -171,6 +171,10 @@ class RblnPlatform(Platform):
                 if (lora_config := vllm_config.lora_config) is not None:
                     lora_config.lora_dtype = torch.float
                     logger.info("RBLN enforce lora_config.lora_dtype as torch.float")
+
+                if (speculative_config := vllm_config.speculative_config) is not None:
+                    speculative_config.draft_model_config.dtype = torch.float
+                    logger.info("RBLN enforce draft_model_config.dtype as torch.float")
             else:
                 dtype = model_config.dtype
                 logger.info("original model_config.dtype = %s", dtype)
@@ -235,7 +239,9 @@ class RblnPlatform(Platform):
             )
 
             assert vllm_config.parallel_config.tensor_parallel_size == 1, (
-                "Tensor parallelism is set when compiled in optimum-rbln."
+                "Cannot set tensor_parallel_size for pre-compiled optimum-rbln models. "
+                "If you want to compile with tensor parallelism in vllm-rbln, "
+                "please use the `VLLM_RBLN_TP_SIZE` environment variable instead."
             )
             assert vllm_config.parallel_config.pipeline_parallel_size == 1, (
                 "Pipeline parallelism is not supported in optimum-rbln."

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # Copyright 2025 Rebellions Inc. All rights reserved.
 
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,26 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-import shutil
-from unittest.mock import patch
-
-import pytest
-import torch
+from .common import get_language_model_config
 
 
-@pytest.fixture(autouse=True)
-def fresh_inductor_cache_per_test(monkeypatch):
-    worker_id = os.environ.get("PYTEST_XDIST_WORKER", "root")
-    cache_dir = f"/tmp/torchinductor_{worker_id}"
-    shutil.rmtree(cache_dir, ignore_errors=True)
-
-    torch._dynamo.reset()
-
-    yield
-
-
-@pytest.fixture(autouse=True)
-def skip_prepare_compile():
-    with patch("vllm_rbln.utils.optimum.configuration.prepare_vllm_for_compile"):
-        yield
+def get_param_blip2(
+    batch_size: int, max_model_len: int, block_size: int, tp_size: int
+) -> dict:
+    language_model_config = get_language_model_config(
+        batch_size, max_model_len, block_size, tp_size
+    )
+    param = {"text_model": language_model_config}
+    return param

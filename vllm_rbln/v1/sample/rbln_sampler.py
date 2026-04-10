@@ -169,6 +169,7 @@ class RBLNTopKTopPSampler(nn.Module):
         if has_torch_rbln:
             options["use_global_ctx"] = True
             options["global_device_id"] = 0
+            options["tensor_parallel_size"] = 1
 
         self._compiled_rbln_topk_topp_sampler = torch.compile(
             rbln_top_k_top_p_sample,

@@ -12,23 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-import shutil
 from unittest.mock import patch
 
 import pytest
-import torch
-
-
-@pytest.fixture(autouse=True)
-def fresh_inductor_cache_per_test(monkeypatch):
-    worker_id = os.environ.get("PYTEST_XDIST_WORKER", "root")
-    cache_dir = f"/tmp/torchinductor_{worker_id}"
-    shutil.rmtree(cache_dir, ignore_errors=True)
-
-    torch._dynamo.reset()
-
-    yield
 
 
 @pytest.fixture(autouse=True)
