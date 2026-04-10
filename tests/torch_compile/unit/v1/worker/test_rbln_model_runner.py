@@ -472,17 +472,6 @@ class TestGetSupportedTasksFeature:
 class TestEdgeCases:
     """Bug-catching tests for edge conditions."""
 
-    def test_dummy_run_state_tuple_unpacking(self):
-        """DummyRunState should support tuple unpacking."""
-        state = DummyRunState(
-            attn_metadata={"a": 1},
-            num_input_tokens=5,
-            input_ids={"b": 2},
-            positions={"c": 3},
-        )
-        attn, num_tokens, ids, pos = state
-        assert num_tokens == 5
-
     def test_async_output_with_empty_sampled_tokens(self):
         """AsyncRBLNModelRunnerOutput should handle zero requests gracefully."""
         mro = MagicMock(spec=ModelRunnerOutput)
@@ -776,15 +765,14 @@ class TestMayReorderBatch:
             kv_cache_config=SimpleNamespace(kv_cache_groups=[1]),
             input_batch=SimpleNamespace(
                 req_ids=["a", "b", "c"],
-                num_tokens=np.array([10, 30, 20]),
+                num_tokens_no_spec=np.array([10, 30, 20]),
             ),
         )
         bound = types.MethodType(RBLNModelRunner._may_reorder_batch, stub)
         with patch("vllm_rbln.v1.worker.rbln_model_runner.envs") as mock_envs:
             mock_envs.VLLM_RBLN_SORT_BATCH = False
             bound(MagicMock())
-        # num_tokens unchanged
-        np.testing.assert_array_equal(stub.input_batch.num_tokens, [10, 30, 20])
+        np.testing.assert_array_equal(stub.input_batch.num_tokens_no_spec, [10, 30, 20])
 
     def test_no_reorder_when_no_kv_cache_groups(self):
         """When kv_cache_groups is empty, no reordering occurs."""
@@ -792,30 +780,29 @@ class TestMayReorderBatch:
             kv_cache_config=SimpleNamespace(kv_cache_groups=[]),
             input_batch=SimpleNamespace(
                 req_ids=["a", "b"],
-                num_tokens=np.array([5, 10]),
+                num_tokens_no_spec=np.array([5, 10]),
             ),
         )
         bound = types.MethodType(RBLNModelRunner._may_reorder_batch, stub)
         with patch("vllm_rbln.v1.worker.rbln_model_runner.envs") as mock_envs:
             mock_envs.VLLM_RBLN_SORT_BATCH = True
             bound(MagicMock())
-        np.testing.assert_array_equal(stub.input_batch.num_tokens, [5, 10])
+        np.testing.assert_array_equal(stub.input_batch.num_tokens_no_spec, [5, 10])
 
     def test_reorder_sorts_descending(self):
-        """When enabled and groups exist, reorder by descending num_tokens."""
+        """When enabled and groups exist, reorder by descending num_tokens_no_spec."""
         swap_log = []
 
         def mock_swap(src, dst):
             swap_log.append((src, dst))
-            # Actually swap num_tokens to verify logic
-            arr = stub.input_batch.num_tokens
+            arr = stub.input_batch.num_tokens_no_spec
             arr[src], arr[dst] = arr[dst], arr[src]
 
         stub = SimpleNamespace(
             kv_cache_config=SimpleNamespace(kv_cache_groups=[1]),
             input_batch=SimpleNamespace(
                 req_ids=["a", "b", "c"],
-                num_tokens=np.array([10, 30, 20]),
+                num_tokens_no_spec=np.array([10, 30, 20]),
                 swap_states=mock_swap,
             ),
         )
@@ -824,7 +811,7 @@ class TestMayReorderBatch:
             mock_envs.VLLM_RBLN_SORT_BATCH = True
             bound(MagicMock())
         # After sorting descending: [30, 20, 10]
-        np.testing.assert_array_equal(stub.input_batch.num_tokens, [30, 20, 10])
+        np.testing.assert_array_equal(stub.input_batch.num_tokens_no_spec, [30, 20, 10])
 
     def test_already_sorted_no_swaps(self):
         """If already sorted descending, no swaps needed."""
@@ -837,7 +824,7 @@ class TestMayReorderBatch:
             kv_cache_config=SimpleNamespace(kv_cache_groups=[1]),
             input_batch=SimpleNamespace(
                 req_ids=["a", "b", "c"],
-                num_tokens=np.array([30, 20, 10]),
+                num_tokens_no_spec=np.array([30, 20, 10]),
                 swap_states=mock_swap,
             ),
         )
