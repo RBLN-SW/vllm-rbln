@@ -471,6 +471,7 @@ class TestGetSupportedTasksFeature:
 
 class TestEdgeCases:
     """Bug-catching tests for edge conditions."""
+
     def test_dummy_run_state_tuple_unpacking(self):
         """DummyRunState should support tuple unpacking."""
         state = DummyRunState(
@@ -759,6 +760,7 @@ class TestToList:
         t = torch.tensor([[0], [1], [9999]])
         result = self._call(t, pinned_size=8)
         assert result == [[0], [1], [9999]]
+
 
 # ===========================================================================
 # 15. _may_reorder_batch – REAL code path with env override

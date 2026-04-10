@@ -22,10 +22,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
-from vllm.v1.worker.worker_base import WorkerBase
 from torch._dynamo.exc import BackendCompilerFailed
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
+from vllm.v1.worker.worker_base import WorkerBase
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -370,6 +370,7 @@ class TestInterfaceCompliance:
         from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
 
         assert RBLNWorker.check_health is not WorkerBase.check_health
+
 
 # ===========================================================================
 # 2. WorkerBase contract: class hierarchy and method signatures
