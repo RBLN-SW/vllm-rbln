@@ -23,6 +23,7 @@ import numpy as np
 import pytest
 import torch
 from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.worker.gpu_input_batch import InputBatch
 
 from vllm_rbln.v1.worker.rbln_model_runner import (
     AsyncRBLNModelRunnerOutput,
@@ -603,12 +604,10 @@ class TestIsPrefills:
     """Test RBLNModelRunner.is_prefills with real numpy arrays."""
 
     def _call(self, num_computed, num_tokens_no_spec):
-        stub = SimpleNamespace(
-            input_batch=SimpleNamespace(
-                num_computed_tokens_cpu=np.array(num_computed, dtype=np.int64),
-                num_tokens_no_spec=np.array(num_tokens_no_spec, dtype=np.int64),
-            )
-        )
+        batch = MagicMock(spec=InputBatch)
+        batch.num_computed_tokens_cpu = np.array(num_computed, dtype=np.int64)
+        batch.num_tokens_no_spec = np.array(num_tokens_no_spec, dtype=np.int64)
+        stub = SimpleNamespace(input_batch=batch)
         bound = types.MethodType(RBLNModelRunner.is_prefills, stub)
         return bound()
 
@@ -699,12 +698,12 @@ class TestUpdateStatesAfterExecute:
 
     def test_hybrid_with_spec_counts_accepted(self):
         num_accepted = np.zeros(3, dtype=np.int64)
+        batch = MagicMock(spec=InputBatch)
+        batch.num_accepted_tokens_cpu = num_accepted
         runner = SimpleNamespace(
             model_config=SimpleNamespace(is_hybrid=True),
             speculative_config=SimpleNamespace(),
-            input_batch=SimpleNamespace(
-                num_accepted_tokens_cpu=num_accepted,
-            ),
+            input_batch=batch,
         )
 
         output = torch.tensor(
@@ -757,37 +756,48 @@ class TestToList:
 
 
 class TestMayReorderBatch:
-    """Test RBLNModelRunner._may_reorder_batch with REAL sorting logic."""
+    """Test RBLNModelRunner._may_reorder_batch with REAL sorting logic.
+
+    Uses MagicMock(spec=InputBatch) so that accessing a removed/renamed
+    attribute raises AttributeError immediately — no silent drift when
+    upstream changes the InputBatch interface.
+    """
+
+    @staticmethod
+    def _make_input_batch_mock(req_ids, num_tokens_no_spec, swap_fn=None):
+        """Build a spec-bound mock of InputBatch with real numpy data."""
+        batch = MagicMock(spec=InputBatch)
+        batch.req_ids = req_ids
+        batch.num_tokens_no_spec = np.array(num_tokens_no_spec)
+        if swap_fn is not None:
+            batch.swap_states = swap_fn
+        return batch
 
     def test_no_reorder_when_env_disabled(self):
         """When VLLM_RBLN_SORT_BATCH is False, no reordering occurs."""
+        batch = self._make_input_batch_mock(["a", "b", "c"], [10, 30, 20])
         stub = SimpleNamespace(
             kv_cache_config=SimpleNamespace(kv_cache_groups=[1]),
-            input_batch=SimpleNamespace(
-                req_ids=["a", "b", "c"],
-                num_tokens_no_spec=np.array([10, 30, 20]),
-            ),
+            input_batch=batch,
         )
         bound = types.MethodType(RBLNModelRunner._may_reorder_batch, stub)
         with patch("vllm_rbln.v1.worker.rbln_model_runner.envs") as mock_envs:
             mock_envs.VLLM_RBLN_SORT_BATCH = False
             bound(MagicMock())
-        np.testing.assert_array_equal(stub.input_batch.num_tokens_no_spec, [10, 30, 20])
+        np.testing.assert_array_equal(batch.num_tokens_no_spec, [10, 30, 20])
 
     def test_no_reorder_when_no_kv_cache_groups(self):
         """When kv_cache_groups is empty, no reordering occurs."""
+        batch = self._make_input_batch_mock(["a", "b"], [5, 10])
         stub = SimpleNamespace(
             kv_cache_config=SimpleNamespace(kv_cache_groups=[]),
-            input_batch=SimpleNamespace(
-                req_ids=["a", "b"],
-                num_tokens_no_spec=np.array([5, 10]),
-            ),
+            input_batch=batch,
         )
         bound = types.MethodType(RBLNModelRunner._may_reorder_batch, stub)
         with patch("vllm_rbln.v1.worker.rbln_model_runner.envs") as mock_envs:
             mock_envs.VLLM_RBLN_SORT_BATCH = True
             bound(MagicMock())
-        np.testing.assert_array_equal(stub.input_batch.num_tokens_no_spec, [5, 10])
+        np.testing.assert_array_equal(batch.num_tokens_no_spec, [5, 10])
 
     def test_reorder_sorts_descending(self):
         """When enabled and groups exist, reorder by descending num_tokens_no_spec."""
@@ -795,23 +805,23 @@ class TestMayReorderBatch:
 
         def mock_swap(src, dst):
             swap_log.append((src, dst))
-            arr = stub.input_batch.num_tokens_no_spec
+            arr = batch.num_tokens_no_spec
             arr[src], arr[dst] = arr[dst], arr[src]
 
+        batch = self._make_input_batch_mock(
+            ["a", "b", "c"],
+            [10, 30, 20],
+            swap_fn=mock_swap,
+        )
         stub = SimpleNamespace(
             kv_cache_config=SimpleNamespace(kv_cache_groups=[1]),
-            input_batch=SimpleNamespace(
-                req_ids=["a", "b", "c"],
-                num_tokens_no_spec=np.array([10, 30, 20]),
-                swap_states=mock_swap,
-            ),
+            input_batch=batch,
         )
         bound = types.MethodType(RBLNModelRunner._may_reorder_batch, stub)
         with patch("vllm_rbln.v1.worker.rbln_model_runner.envs") as mock_envs:
             mock_envs.VLLM_RBLN_SORT_BATCH = True
             bound(MagicMock())
-        # After sorting descending: [30, 20, 10]
-        np.testing.assert_array_equal(stub.input_batch.num_tokens_no_spec, [30, 20, 10])
+        np.testing.assert_array_equal(batch.num_tokens_no_spec, [30, 20, 10])
 
     def test_already_sorted_no_swaps(self):
         """If already sorted descending, no swaps needed."""
@@ -820,13 +830,14 @@ class TestMayReorderBatch:
         def mock_swap(src, dst):
             swap_log.append((src, dst))
 
+        batch = self._make_input_batch_mock(
+            ["a", "b", "c"],
+            [30, 20, 10],
+            swap_fn=mock_swap,
+        )
         stub = SimpleNamespace(
             kv_cache_config=SimpleNamespace(kv_cache_groups=[1]),
-            input_batch=SimpleNamespace(
-                req_ids=["a", "b", "c"],
-                num_tokens_no_spec=np.array([30, 20, 10]),
-                swap_states=mock_swap,
-            ),
+            input_batch=batch,
         )
         bound = types.MethodType(RBLNModelRunner._may_reorder_batch, stub)
         with patch("vllm_rbln.v1.worker.rbln_model_runner.envs") as mock_envs:
