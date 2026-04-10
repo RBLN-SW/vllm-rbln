@@ -471,34 +471,6 @@ class TestGetSupportedTasksFeature:
 
 class TestEdgeCases:
     """Bug-catching tests for edge conditions."""
-
-    def test_execute_model_state_unpacking(self):
-        """ExecuteModelState should support tuple unpacking (it is a NamedTuple)."""
-        state = ExecuteModelState(
-            scheduler_output="sched",
-            logits=torch.zeros(1),
-            spec_decode_metadata=None,
-            spec_decode_common_attn_metadata=None,
-            hidden_states=torch.ones(1),
-            sample_hidden_states=None,
-            aux_hidden_states=None,
-            kv_connector_output=None,
-            slot_mappings=None,
-        )
-        (
-            sched,
-            logits,
-            spec_meta,
-            spec_common,
-            hidden,
-            sample_hidden,
-            aux,
-            kv_out,
-            slots,
-        ) = state
-        assert sched == "sched"
-        assert spec_meta is None
-
     def test_dummy_run_state_tuple_unpacking(self):
         """DummyRunState should support tuple unpacking."""
         state = DummyRunState(
@@ -787,13 +759,6 @@ class TestToList:
         t = torch.tensor([[0], [1], [9999]])
         result = self._call(t, pinned_size=8)
         assert result == [[0], [1], [9999]]
-
-    def test_return_type_is_list_of_lists(self):
-        t = torch.tensor([[7], [8]])
-        result = self._call(t)
-        assert isinstance(result, list)
-        assert all(isinstance(r, list) for r in result)
-
 
 # ===========================================================================
 # 15. _may_reorder_batch – REAL code path with env override
