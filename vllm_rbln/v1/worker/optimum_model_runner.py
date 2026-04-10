@@ -14,7 +14,7 @@
 import contextlib
 import logging
 import time
-from typing import TYPE_CHECKING, NamedTuple, Union, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, Union, cast
 
 import numpy as np
 import rebel
@@ -22,6 +22,7 @@ import torch
 import torch.distributed
 import torch.nn as nn
 from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.model_executor.models.interfaces import (
     supports_transcription,
@@ -53,17 +54,20 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCache
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
+    ECConnectorOutput,
     LogprobsLists,
     LogprobsTensors,
     ModelRunnerOutput,
     PoolerOutput,
     SamplerOutput,
+    make_empty_encoder_model_runner_output,
 )
 from vllm.v1.sample.logits_processor import build_logitsprocs
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import record_function_or_nullcontext
+from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 
@@ -99,7 +103,7 @@ class ExecuteModelState(NamedTuple):
     is_prompt: bool
 
 
-class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
+class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
     input_batch: RBLNInputBatch
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
@@ -241,6 +245,10 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
             self.model_performance_tracker = PerformanceTracker("MODEL")
             self.sampler_performance_tracker = PerformanceTracker("SAMPLER")
 
+        # Encoder cache for EC disaggregation.
+        # Maps mm_hash → dict of prefill params (inputs_embeds, position_embed, etc.)
+        self.encoder_cache: dict[str, Any] = {}
+
         # Ephemeral state transferred
         # between execute_model() and sample_tokens().
         self.execute_model_state: ExecuteModelState | None = None
@@ -302,12 +310,34 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
                     self.model.attention_manager.clear()
                 # Return empty ModelRunnerOutput if there's no work to do.
                 return EMPTY_MODEL_RUNNER_OUTPUT
+
+            # EC Producer early-exit: run vision encoder only,
+            # save results to EC connector, then return empty output.
+            if has_ec_transfer() and get_ec_transfer().is_producer:
+                model_input, _ = self._prepare_inputs(scheduler_output)
+                if model_input.is_prompt and model_input.multi_modal_kwargs:
+                    with self.maybe_get_ec_connector_output(
+                        scheduler_output,
+                        encoder_cache=self.encoder_cache,
+                    ):
+                        self._run_encoder_and_save(model_input, scheduler_output)
+                return make_empty_encoder_model_runner_output(scheduler_output)
+
+            # EC Consumer: load encoder results before model forward.
+            if has_ec_transfer() and not get_ec_transfer().is_producer:
+                with self.maybe_get_ec_connector_output(
+                    scheduler_output,
+                    encoder_cache=self.encoder_cache,
+                ):
+                    pass
+
             # Prepare the decoder inputs.
             model_input, num_scheduled_tokens_np = self._prepare_inputs(
                 scheduler_output
             )
 
         with record_function_or_nullcontext("rbln_model_runner: forward"):
+<<<<<<< Updated upstream
             if hasattr(rebel, "capture_reports"):
                 capture_ctx = rebel.capture_reports()
             else:
@@ -327,6 +357,21 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
                     token_count=0,
                     # the performance of sampler doesn't depend on token count
                 )
+=======
+            start_time = time.perf_counter()
+            # FIXME model_input must be modified to be padded
+            if (
+                has_ec_transfer()
+                and not get_ec_transfer().is_producer
+                and model_input.is_prompt
+                and self.encoder_cache
+            ):
+                hidden_states = self._run_decoder_with_cached_encoder(
+                    model_input, scheduler_output
+                )
+            else:
+                hidden_states = self.model(model_input)
+>>>>>>> Stashed changes
             sample_hidden_states = hidden_states.clone()
 
         with record_function_or_nullcontext("rbln_model_runner: postprocess"):
@@ -345,6 +390,94 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
             is_prompt=model_input.is_prompt,
         )
         return None
+
+    # ------------------------------------------------------------------
+    # EC Disaggregation helpers
+    # ------------------------------------------------------------------
+
+    def _run_encoder_and_save(
+        self,
+        model_input: ModelInputForRBLN,
+        scheduler_output: "SchedulerOutput",
+    ) -> None:
+        """Run the vision encoder (preprocess_prefill) and save
+        results to the EC connector.  Producer-only path."""
+        image_input = None
+        video_input = None
+        if model_input.multi_modal_kwargs:
+            image_input = self.model._parse_and_validate_image_input(
+                **model_input.multi_modal_kwargs
+            )
+            video_input = self.model._parse_and_validate_video_input(
+                **model_input.multi_modal_kwargs
+            )
+
+        input_ids = model_input.input_tokens
+        attention_mask = torch.ones_like(input_ids)
+        prefill_params = self.model.preprocess_prefill(
+            input_ids, attention_mask, image_input, video_input
+        )
+
+        mm_hash = self._get_mm_hash_for_request(scheduler_output)
+        if mm_hash is not None:
+            self.encoder_cache[mm_hash] = prefill_params
+            self.maybe_save_ec_to_connector(self.encoder_cache, mm_hash)
+
+    def _run_decoder_with_cached_encoder(
+        self,
+        model_input: ModelInputForRBLN,
+        scheduler_output: "SchedulerOutput",
+    ) -> torch.Tensor:
+        """Consumer path: skip vision encoder and use cached
+        encoder outputs loaded by the EC connector."""
+        mm_hash = self._get_mm_hash_for_request(scheduler_output)
+        if mm_hash is not None and mm_hash in self.encoder_cache:
+            cached = self.encoder_cache[mm_hash]
+            prefill_params = dict(cached) if isinstance(cached, dict) else {"inputs_embeds": cached}
+
+            # rope_deltas is stored in the cache for bookkeeping but is not
+            # accepted by prefill_decoder. Extract and store it just like the
+            # normal forward() path does before calling prefill_decoder.
+            rope_deltas = prefill_params.pop("rope_deltas", None)
+            if rope_deltas is not None:
+                cur_request_id = model_input.running_requests_ids[0]
+                self.model.rope_deltas[cur_request_id] = rope_deltas.item()
+
+            # Cast cached tensors to model dtype. Safetensors preserves the
+            # original dtype but the RBLN runtime requires an exact dtype match.
+            model_dtype = self.model.dtype
+            prefill_params = {
+                k: v.to(model_dtype) if isinstance(v, torch.Tensor) else v
+                for k, v in prefill_params.items()
+            }
+
+            kwargs = self.model.preprocess_for_decoder(
+                True,
+                model_input.block_tables,
+                model_input.input_tokens,
+                model_input.input_positions,
+            )
+            block_tables = kwargs.pop("block_tables")
+            logits = self.model.model.prefill_decoder(
+                **prefill_params,
+                block_tables=block_tables,
+            ).logits
+            return logits
+
+        # Fallback: run the full model if cache miss.
+        return self.model(model_input)
+
+    @staticmethod
+    def _get_mm_hash_for_request(
+        scheduler_output: "SchedulerOutput",
+    ) -> str | None:
+        """Get the mm_hash from the first mm_feature of the first new request."""
+        if not scheduler_output.scheduled_new_reqs:
+            return None
+        req = scheduler_output.scheduled_new_reqs[0]
+        if not req.mm_features:
+            return None
+        return req.mm_features[0].identifier
 
     def mask_block_table(
         self,
@@ -1332,6 +1465,14 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
                 spec_decode_metadata=None,
             )
 
+        ec_connector_output = self.get_finished_ec_transfers(scheduler_output)
+        ec_out = None
+        if ec_connector_output != (None, None):
+            ec_out = ECConnectorOutput(
+                finished_sending=ec_connector_output[0],
+                finished_recving=ec_connector_output[1],
+            )
+
         with record_function_or_nullcontext("rbln_model_runner: ModelRunnerOutput"):
             output = ModelRunnerOutput(
                 req_ids=req_ids_output_copy,
@@ -1341,6 +1482,9 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
                 prompt_logprobs_dict=prompt_logprobs_dict,
                 pooler_output=[],
                 # kv_connector_output=kv_connector_output,
+                ec_connector_output=ec_out
+                if self.supports_mm_inputs
+                else None,
                 num_nans_in_logits=num_nans_in_logits,
             )
         # FIXME: enable async scheduling

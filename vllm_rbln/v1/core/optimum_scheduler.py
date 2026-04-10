@@ -20,6 +20,11 @@ import torch
 from vllm.config import VllmConfig
 from vllm.distributed.kv_events import EventPublisherFactory
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
+from vllm.distributed.ec_transfer.ec_connector.base import (
+    ECConnectorMetadata,
+    ECConnectorRole,
+)
+from vllm.distributed.ec_transfer.ec_connector.factory import ECConnectorFactory
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
@@ -126,6 +131,11 @@ class RBLNOptimumScheduler(Scheduler):
             self.parallel_config.data_parallel_rank,
         )
         self.ec_connector = None
+        if self.vllm_config.ec_transfer_config is not None:
+            self.ec_connector = ECConnectorFactory.create_connector(
+                config=self.vllm_config, role=ECConnectorRole.SCHEDULER
+            )
+
         num_gpu_blocks = self.cache_config.num_gpu_blocks
         assert num_gpu_blocks is not None and num_gpu_blocks > 0
 
@@ -385,10 +395,21 @@ class RBLNOptimumScheduler(Scheduler):
                 # by prefix caching may cause incorrect computation
                 # of new_blocks during the decode phase.
                 request.num_computed_tokens = 0
+<<<<<<< Updated upstream
                 # NOTE(fix): num_cached_tokens defaults to -1.
                 # It is used for logging and metrics.
                 if request.num_cached_tokens < 0:
                     request.num_cached_tokens = request.num_computed_tokens
+=======
+
+                # EC Connector: track multimodal features that need remote
+                # loading or local encoding for this request.
+                if self.ec_connector is not None and request.has_encoder_inputs:
+                    remote_hits = self.ec_connector.has_caches(request)
+                    for i, hit in enumerate(remote_hits):
+                        if hit:
+                            self.ec_connector.update_state_after_alloc(request, i)
+>>>>>>> Stashed changes
 
             # re-queue requests skipped in this pass ahead of older skipped items.
             if step_skipped_waiting:
@@ -543,6 +564,14 @@ class RBLNOptimumScheduler(Scheduler):
             cached_length=cached_length,
             dummy_block=dummy_block,
         )
+
+        # Build the connector meta for ECConnector
+        if self.ec_connector is not None:
+            ec_meta: ECConnectorMetadata = self.ec_connector.build_connector_meta(
+                scheduler_output
+            )
+            scheduler_output.ec_connector_metadata = ec_meta
+
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
         # self._update_after_schedule(scheduler_output)

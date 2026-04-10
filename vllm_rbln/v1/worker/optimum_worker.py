@@ -26,6 +26,7 @@ from vllm.distributed import (
     ensure_model_parallel_initialized,
     init_distributed_environment,
 )
+from vllm.distributed.ec_transfer import ensure_ec_transfer_initialized
 from vllm.lora.request import LoRARequest
 from vllm.tasks import SupportedTask
 from vllm.utils.torch_utils import set_random_seed
@@ -142,6 +143,11 @@ class RBLNOptimumWorker(WorkerBase):
         # Set random seed.
         set_random_seed(self.model_config.seed)
         self.device = self.vllm_config.device_config.device
+
+        # Init EC connector before model runner (must precede KV cache init
+        # so that encoder-only instances can skip KV cache allocation).
+        ensure_ec_transfer_initialized(self.vllm_config)
+
         self.model_runner = RBLNOptimumModelRunner(self.vllm_config, self.device)
 
     @torch.inference_mode()
