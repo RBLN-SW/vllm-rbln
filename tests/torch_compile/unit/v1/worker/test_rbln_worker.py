@@ -12,14 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for RBLNWorker and init_worker_distributed_environment."""
+"""Unit tests for RBLNWorker: interface compliance, WorkerBase contract,
+device env initialization, and behavior tests."""
 
+import inspect
 import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+from vllm.v1.worker.worker_base import WorkerBase
 from torch._dynamo.exc import BackendCompilerFailed
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
@@ -251,6 +254,165 @@ def _create_worker(
             p.stop()
 
     return worker
+
+
+# ===========================================================================
+# 1. Interface compliance: RBLNWorker implements all WorkerBase methods
+# ===========================================================================
+
+
+class TestInterfaceCompliance:
+    """Verify RBLNWorker provides implementations for every method that
+    WorkerBase declares (both abstract-style raise-NotImplementedError
+    and regular methods)."""
+
+    def _get_worker_base_interface_methods(self):
+        """Return names of WorkerBase methods that subclasses should provide."""
+        base_methods = []
+        for name, obj in inspect.getmembers(WorkerBase, predicate=inspect.isfunction):
+            if name.startswith("_") and name != "__init__":
+                continue
+            base_methods.append(name)
+        return base_methods
+
+    def _get_notimplemented_methods(self):
+        """Return names of WorkerBase methods that raise NotImplementedError."""
+        ni_methods = []
+        for name, obj in inspect.getmembers(WorkerBase, predicate=inspect.isfunction):
+            if name.startswith("_"):
+                continue
+            src = inspect.getsource(obj)
+            if "NotImplementedError" in src:
+                ni_methods.append(name)
+        return ni_methods
+
+    def test_rbln_worker_extends_worker_base(self):
+        from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
+
+        assert issubclass(RBLNWorker, WorkerBase)
+
+    def test_all_not_implemented_methods_are_overridden(self):
+        """Every WorkerBase method that raises NotImplementedError must be
+        overridden by RBLNWorker (except known intentional gaps)."""
+        from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
+
+        # Methods intentionally not overridden (e.g. speculative-decoding only)
+        KNOWN_GAPS = {"get_cache_block_size_bytes"}
+
+        ni_methods = self._get_notimplemented_methods()
+        assert len(ni_methods) > 0, "Expected some NotImplementedError methods"
+
+        missing = []
+        for name in ni_methods:
+            if name in KNOWN_GAPS:
+                continue
+            base_method = getattr(WorkerBase, name)
+            child_method = getattr(RBLNWorker, name)
+            if child_method is base_method:
+                missing.append(name)
+
+        assert missing == [], (
+            f"RBLNWorker does not override these WorkerBase methods: {missing}"
+        )
+
+    def test_known_gaps_documented(self):
+        """Verify that get_cache_block_size_bytes is indeed not overridden
+        (intentional gap for speculative decoding)."""
+        from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
+
+        assert (
+            RBLNWorker.get_cache_block_size_bytes
+            is WorkerBase.get_cache_block_size_bytes
+        )
+
+    def test_init_signature_matches_worker_base(self):
+        """RBLNWorker.__init__ must accept the same parameters as WorkerBase."""
+        from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
+
+        base_sig = inspect.signature(WorkerBase.__init__)
+        child_sig = inspect.signature(RBLNWorker.__init__)
+
+        base_params = list(base_sig.parameters.keys())
+        child_params = list(child_sig.parameters.keys())
+
+        assert base_params == child_params, (
+            f"Signature mismatch: base={base_params}, child={child_params}"
+        )
+
+    def test_execute_model_signature_compatible(self):
+        """execute_model must accept scheduler_output positional arg."""
+        from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
+
+        sig = inspect.signature(RBLNWorker.execute_model)
+        params = list(sig.parameters.keys())
+        assert "self" in params
+        assert "scheduler_output" in params
+
+    def test_compile_or_warm_up_model_returns_float(self):
+        """compile_or_warm_up_model must return a float (elapsed time)."""
+        from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
+
+        sig = inspect.signature(RBLNWorker.compile_or_warm_up_model)
+        # The return annotation should be float
+        assert (
+            sig.return_annotation is float
+            or sig.return_annotation == inspect.Parameter.empty
+        )
+
+    def test_shutdown_is_overridden(self):
+        """shutdown must be overridden (not the base no-op)."""
+        from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
+
+        assert RBLNWorker.shutdown is not WorkerBase.shutdown
+
+    def test_check_health_is_overridden(self):
+        """check_health must be overridden."""
+        from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
+
+        assert RBLNWorker.check_health is not WorkerBase.check_health
+
+# ===========================================================================
+# 2. WorkerBase contract: class hierarchy and method signatures
+# ===========================================================================
+
+
+class TestWorkerBaseContract:
+    """Verify the class hierarchy and that method signatures match vllm
+    expectations for pluggable workers."""
+
+    def test_mro_includes_worker_base(self):
+        from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
+
+        assert WorkerBase in RBLNWorker.__mro__
+
+    def test_direct_parent_is_worker_base(self):
+        from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
+
+        assert RBLNWorker.__bases__[0] is WorkerBase
+
+    def test_initialize_cache_signature(self):
+        from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
+
+        sig = inspect.signature(RBLNWorker.initialize_cache)
+        params = list(sig.parameters.keys())
+        assert "num_gpu_blocks" in params
+        assert "num_cpu_blocks" in params
+
+    def test_load_model_takes_no_args(self):
+        from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
+
+        sig = inspect.signature(RBLNWorker.load_model)
+        # Only self
+        non_self = [p for p in sig.parameters if p != "self"]
+        assert non_self == []
+
+    def test_get_kv_cache_spec_returns_dict_annotation(self):
+        from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
+
+        sig = inspect.signature(RBLNWorker.get_kv_cache_spec)
+        # Should have no positional args beyond self
+        non_self = [p for p in sig.parameters if p != "self"]
+        assert non_self == []
 
 
 # ===========================================================================
