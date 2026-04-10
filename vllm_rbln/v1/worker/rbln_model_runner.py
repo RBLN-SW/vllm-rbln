@@ -94,7 +94,6 @@ from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.eagle import EagleProposer
-from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
@@ -122,6 +121,7 @@ from vllm_rbln.v1.attention.backends.flash_attention import (
 from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 from vllm_rbln.v1.sample import RBLNSampler
 from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
+from vllm_rbln.v1.spec_decoding.medusa import RBLNMedusaProposer
 from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
 from vllm_rbln.v1.worker.metrics import PerformanceTracker
 
@@ -326,7 +326,10 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # layers in the draft model.
         if self.speculative_config and get_pp_group().is_last_rank:
             self.drafter: (
-                NgramProposer | SuffixDecodingProposer | EagleProposer | MedusaProposer
+                NgramProposer
+                | SuffixDecodingProposer
+                | EagleProposer
+                | RBLNMedusaProposer
             )
             if self.speculative_config.method == "ngram":
                 self.drafter = NgramProposer(self.vllm_config)
@@ -339,9 +342,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         self.drafter.eagle3_use_aux_hidden_state
                     )
             elif self.speculative_config.method == "medusa":
-                self.drafter = MedusaProposer(
-                    vllm_config=self.vllm_config, device=self.device
-                )  # type: ignore
+                self.drafter = RBLNMedusaProposer(self.vllm_config, self.device)
             else:
                 raise ValueError(
                     "Unknown speculative decoding method: "
@@ -529,6 +530,9 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         self.performance_tracker: PerformanceTracker | None = None
         self.sampler_performance_tracker: PerformanceTracker | None = None
+        self.e2e_performance_tracker: PerformanceTracker | None = None
+        self.e2e_start_time: float = 0.0
+        self.e2e_end_time: float = 0.0
 
         self.dummy_run_state: DummyRunState | None = None
 
@@ -540,9 +544,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     def _enable_performance_tracker(self):
         if envs.VLLM_RBLN_METRICS:
             self.performance_tracker = PerformanceTracker("MODEL")
-            self.performance_tracker.register_cleanup()
             self.sampler_performance_tracker = PerformanceTracker("SAMPLER")
-            self.sampler_performance_tracker.register_cleanup()
+            self.e2e_performance_tracker = PerformanceTracker("E2E")
 
     def _get_positions(self, num_tokens: Any):
         if isinstance(num_tokens, int):
@@ -1730,7 +1733,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         else:
             # use a dummy context manager that does nothing
             capture_ctx = contextlib.nullcontext()
-        start_time = time.perf_counter()
+        sampler_start_time = time.perf_counter()
         with capture_ctx as sampler_reports:
             if spec_decode_metadata is None:
                 sampler_output = self.sampler(
@@ -1751,7 +1754,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self.collect_metrics(
                 self.sampler_performance_tracker,
                 self.is_prefills()[0],
-                start_time=start_time,
+                start_time=sampler_start_time,
                 end_time=time.perf_counter(),
                 reports=sampler_reports,
                 token_count=0,
@@ -2495,6 +2498,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         intermediate_tensors: IntermediateTensors | None = None,
         num_padded_tokens: int | None = None,
     ) -> Union[ModelRunnerOutput, IntermediateTensors, None]:
+        self.e2e_start_time = time.perf_counter()
         if self.execute_model_state is not None:
             raise RuntimeError(
                 "State error: sample_tokens() must be called "
@@ -2667,7 +2671,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 LoRAMask.set_lora_mask(lora_mask)
                 LoRAInputs.set_sampler_indices_padded(sampler_indices_padded)
 
-            start_time = time.perf_counter()
+            model_start_time = time.perf_counter()
             with capture_ctx as reports:
                 if not self.use_wrapped_compute_logits():
                     model_output = self.model_executable(
@@ -2688,8 +2692,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     )
             if self.performance_tracker is not None:
                 # Record performance metrics
-                end_time = time.perf_counter()
-                execution_time = end_time - start_time
+                model_end_time = time.perf_counter()
+                model_execution_time = model_end_time - model_start_time
                 host_time = None
                 device_time = None
                 ccl_time = None
@@ -2701,7 +2705,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
                 if is_prefills[0]:
                     self.performance_tracker.record_prefill(
-                        execution_time,
+                        model_execution_time,
                         num_scheduled_tokens,
                         host_time=host_time,
                         device_time=device_time,
@@ -2714,7 +2718,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         and num_padded_tokens != batch_bucket_size
                     )
                     self.performance_tracker.record_decode(
-                        execution_time,
+                        model_execution_time,
                         num_scheduled_tokens,
                         host_time=host_time,
                         device_time=device_time,
@@ -2916,6 +2920,11 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 propose_draft_token_ids(sampled_token_ids)
 
         with record_function_or_nullcontext("Bookkeep"):
+            # NOTE:
+            # is_prefill is changed after bookkeeping
+            # so we need to get it before bookkeeping,
+            # and pass it to performance tracker.
+            is_prefills = self.is_prefills()
             (
                 num_nans_in_logits,
                 logprobs_lists,
@@ -2955,6 +2964,17 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             kv_connector_output=kv_connector_output,
             num_nans_in_logits=num_nans_in_logits,
         )
+
+        if self.e2e_performance_tracker is not None:
+            self.e2e_end_time = time.perf_counter()
+            self.collect_metrics(
+                self.e2e_performance_tracker,
+                is_prefills[0],
+                start_time=self.e2e_start_time,
+                end_time=self.e2e_end_time,
+                reports=[],
+                token_count=scheduler_output.total_num_scheduled_tokens,
+            )
 
         if not self.use_async_scheduling:
             return output
@@ -3025,26 +3045,23 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             draft_token_ids = self.drafter.propose(self.input_batch, sampled_token_ids)
         elif spec_config.method == "medusa":
             assert isinstance(sampled_token_ids, list)
-            assert isinstance(self.drafter, MedusaProposer)
+            assert isinstance(self.drafter, RBLNMedusaProposer)
 
-            if sample_hidden_states.shape[0] == len(sampled_token_ids):
-                # The input to the target model does not include draft tokens.
+            if spec_decode_metadata is None:
+                # prefill: hidden states are already per-request
                 hidden_states = sample_hidden_states
             else:
-                indices = []
-                offset = 0
-                assert spec_decode_metadata is not None, (
-                    "No spec decode metadata for medusa"
+                # decode with draft tokens:
+                # pick last accepted token's hidden state per request
+                batch_indices = torch.arange(
+                    sample_hidden_states.shape[0], device=sample_hidden_states.device
                 )
-                for num_draft, tokens in zip(
-                    spec_decode_metadata.num_draft_tokens,
-                    sampled_token_ids,
-                    strict=False,
-                ):
-                    indices.append(offset + len(tokens) - 1)
-                    offset += num_draft + 1
-                indices = torch.tensor(indices, device=self.device)
-                hidden_states = sample_hidden_states[indices]
+                indices = torch.tensor(
+                    [len(t) - 1 for t in sampled_token_ids],
+                    device=sample_hidden_states.device,
+                    dtype=torch.long,
+                )
+                hidden_states = sample_hidden_states[batch_indices, indices]
 
             hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
             draft_token_ids = self.drafter.propose(
@@ -3694,8 +3711,11 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         """
         kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-            # device = "cpu" if envs.VLLM_RBLN_USE_CUSTOM_KERNEL else "meta"
-            device = "cpu"
+            device = (
+                "cpu"
+                if envs.VLLM_RBLN_USE_CUSTOM_KERNEL or not envs.VLLM_RBLN_COMPILE_MODEL
+                else "meta"
+            )
             tensor = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=device)
             for layer_name in kv_cache_tensor.shared_by:
                 kv_cache_raw_tensors[layer_name] = tensor

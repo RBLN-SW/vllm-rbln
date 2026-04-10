@@ -286,6 +286,51 @@ def get_autobind_cpu_ids(
     return ",".join([str(x.id) for x in logical_cpu_list])
 
 
+def compute_rbln_local_omp_cpuid(
+    rank: int,
+    local_rank: int,
+    parallel_config: ParallelConfig,
+) -> str:
+    """CPU set string that ``set_cpu_affinity`` will use (comma list, ``all``, or
+    ``nobind``)."""
+    if envs.VLLM_RBLN_NUMA and platform.system() == "Linux":
+        cpu_arch = current_platform.get_cpu_architecture()
+        if cpu_arch in (CpuArchEnum.POWERPC, CpuArchEnum.S390X):
+            # For S390X/POWERPC SMT-8/4/2
+            return get_autobind_cpu_ids(
+                rank,
+                local_rank,
+                parallel_config,
+                lambda cpus: [cpu for cpu in cpus if cpu.id % 8 < 4],
+            )
+        if cpu_arch == CpuArchEnum.X86:
+            # For x86 SMT-2, use 1 CPU per core
+            return get_autobind_cpu_ids(
+                rank, local_rank, parallel_config, lambda cpus: cpus[:1]
+            )
+        return "nobind"
+    return "nobind"
+
+
+def get_rbln_planned_affinity_cpu_count(
+    rank: int,
+    local_rank: int,
+    parallel_config: ParallelConfig,
+) -> int:
+    """Logical CPU count this rank will pin to after NUMA split (before
+    ``sched_setaffinity``).
+
+    Use this to size ``torch``/OpenMP threads before affinity is applied so thread
+    counts match the post-bind CPU mask. If binding is ``nobind``/``all``, uses the
+    current ``sched_getaffinity`` mask.
+    """
+    local_omp_cpuid = compute_rbln_local_omp_cpuid(rank, local_rank, parallel_config)
+    if local_omp_cpuid not in ("all", "nobind"):
+        cpu_ids = [int(x.strip()) for x in local_omp_cpuid.split(",") if x.strip()]
+        return max(1, len(cpu_ids))
+    return max(1, len(os.sched_getaffinity(0)))
+
+
 def set_cpu_affinity(
     rank: int,
     local_rank: int,
@@ -298,26 +343,7 @@ def set_cpu_affinity(
         local_rank: Local rank of the worker.
         parallel_config: Parallel configuration.
     """
-    # Setup thread affinity based on NUMA nodes
-    if envs.VLLM_RBLN_NUMA and platform.system() == "Linux":
-        cpu_arch = current_platform.get_cpu_architecture()
-        if cpu_arch in (CpuArchEnum.POWERPC, CpuArchEnum.S390X):
-            # For S390X/POWERPC SMT-8/4/2
-            local_omp_cpuid = get_autobind_cpu_ids(
-                rank,
-                local_rank,
-                parallel_config,
-                lambda cpus: [cpu for cpu in cpus if cpu.id % 8 < 4],
-            )
-        elif cpu_arch == CpuArchEnum.X86:
-            # For x86 SMT-2, use 1 CPU per core
-            local_omp_cpuid = get_autobind_cpu_ids(
-                rank, local_rank, parallel_config, lambda cpus: cpus[:1]
-            )
-        else:
-            local_omp_cpuid = "nobind"
-    else:
-        local_omp_cpuid = "nobind"
+    local_omp_cpuid = compute_rbln_local_omp_cpuid(rank, local_rank, parallel_config)
 
     if local_omp_cpuid not in ("all", "nobind"):
         # Parse CPU IDs from string (e.g., "0,1,2,3" -> [0, 1, 2, 3])

@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import atexit
 from collections import defaultdict
 from dataclasses import dataclass, field
 
@@ -193,13 +192,6 @@ class PerformanceTracker:
         self.decode_metrics = StepMetrics()
         self.prefill_metrics_by_request_id = PrefillMetricsByRequestID()
         self.padded_decode_metrics = StepMetrics()
-        self._registered_cleanup = False
-
-    def register_cleanup(self):
-        """Register cleanup function to print stats on exit."""
-        if not self._registered_cleanup:
-            atexit.register(self.print_final_stats)
-            self._registered_cleanup = True
 
     def check_dummy_request(self, request_ids: list[str] | None) -> bool:
         if request_ids:
@@ -227,7 +219,9 @@ class PerformanceTracker:
                 f"got {len(request_ids)}: {request_ids}"
             )
             request_id = request_ids[0]
-        self.prefill_metrics.add_measurement(latency, token_count)
+        self.prefill_metrics.add_measurement(
+            latency, token_count, host_time, device_time, ccl_time
+        )
         if request_id:
             self.prefill_metrics_by_request_id.add_measurement(
                 request_id, latency, token_count, host_time, device_time, ccl_time

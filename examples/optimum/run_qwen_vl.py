@@ -59,7 +59,9 @@ def generate_prompts_video(batch_size: int, model_id: str):
     arr_video_kwargs = []
     for i in range(batch_size):
         image_inputs, video_inputs, video_kwargs = process_vision_info(
-            messages[i], return_video_kwargs=True
+            messages[i],
+            return_video_kwargs=True,
+            return_video_metadata=True,
         )
         arr_image_inputs.append(image_inputs)
         arr_video_inputs.append(video_inputs)
@@ -118,34 +120,24 @@ def generate_prompts_image(batch_size: int, model_id: str):
     )
 
     arr_image_inputs = []
-    arr_video_inputs = []
-    arr_video_kwargs = []
 
     for i in range(batch_size):
-        image_inputs, video_inputs, video_kwargs = process_vision_info(
-            messages[i], return_video_kwargs=True
+        image_inputs, _ = process_vision_info(
+            messages[i],
         )
         arr_image_inputs.append(image_inputs)
-        arr_video_inputs.append(video_inputs)
-        arr_video_kwargs.append(video_kwargs)
 
     return [
         {
             "prompt": text,
-            "multi_modal_data": {
-                # "video": video_inputs,
-                "image": image_inputs
-            },
+            "multi_modal_data": {"image": image_inputs},
             "mm_processor_kwargs": {
                 "min_pixels": 1024 * 14 * 14,
                 "max_pixels": 5120 * 14 * 14,
                 "padding": True,
-                **video_kwargs,
             },
         }
-        for text, image_inputs, video_inputs, video_kwargs in zip(
-            texts, arr_image_inputs, arr_video_inputs, arr_video_kwargs
-        )
+        for text, image_inputs in zip(texts, arr_image_inputs)
     ]
 
 
@@ -220,6 +212,21 @@ async def main(
     num_input_prompt: int,
     model_id: str,
 ):
+    # NOTE: We can set the device to run submodules
+    # by passing `rbln_config` to `additional_config`
+    # Unless specified, OOM may occur when running the vision-related submodules
+    # For example, the tensor parallel size of the language is 16,
+    # and the vision submodule is 1,
+    # we can set the device allocation as follows to optimally utilize RBLN memory:
+    # https://github.com/rebellions-sw/rbln_model_zoo/blob/6b015d28cda7bff2935108ece7d32ae8590cc35c/huggingface/transformers/image-text-to-text/qwen2.5-vl/qwen2.5-vl-7b/inference.py#L36
+    # engine_args = AsyncEngineArgs(model=model_id, additional_config={
+    #     "rbln_config": {
+    #         "device": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+    #         "visual": {
+    #             "device": [16],
+    #         }
+    #     }
+    # })
     engine_args = AsyncEngineArgs(model=model_id)
 
     engine = AsyncLLMEngine.from_engine_args(engine_args)
@@ -245,6 +252,7 @@ async def main(
 
 def entry_point(
     num_input_prompt: int = 1,
+    # NOTE: This example supports Qwen2-VL, Qwen2.5-VL, and Qwen3-VL.
     model_id: str = "/qwen2_5-vl-7b-32k-b4-kv16k",
 ):
     asyncio.run(

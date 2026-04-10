@@ -410,11 +410,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 expert_map_list = layer.expert_map.tolist()
                 expert_map_const = torch.tensor(expert_map_list, dtype=torch.int32)
 
-            use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
             tokens_mask = None
+            use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
             if use_moe_tokens_mask:
-                tokens_mask = get_tokens_mask(num_tokens, 0.0, float("-inf"))
-                router_logits = router_logits + tokens_mask
+                tokens_mask = get_tokens_mask(num_tokens)
 
             final_hidden_states = torch.ops.rbln_custom_ops.custom_moe_glu_mxfp4(
                 hidden_states,
@@ -433,6 +432,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.top_k,
                 layer.renormalize,
                 expert_map_const,
+                tokens_mask,
             )
         else:
             raise NotImplementedError(layer.activation)
