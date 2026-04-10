@@ -109,7 +109,9 @@ class RBLNOptimumWorker(WorkerBase):
                 "Container cpuset detected (%d/%d CPUs). "
                 "Skipping set_cpu_affinity, setting threads to %d "
                 "(physical cores only, excluding HT).",
-                allocated_cpus, reported_cpus, num_threads,
+                allocated_cpus,
+                reported_cpus,
+                num_threads,
             )
 
             # Set all thread pool environment variables
