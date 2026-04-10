@@ -21,7 +21,7 @@ from torch.library import register_fake, triton_op
 
 
 @triton.jit
-def flash_attention_naive_prefill(
+def flash_attention_naive_prefill(  # pragma: no cover
     query,
     key,
     value,
@@ -184,7 +184,7 @@ def flash_attention_naive_prefill(
 
 
 @triton.jit
-def flash_attention_naive_decode(
+def flash_attention_naive_decode(  # pragma: no cover
     query,
     key,
     value,
@@ -345,7 +345,7 @@ def flash_attention_naive_decode(
         tl.store(O_block_ptr, attn_out)
 
 
-def warmup(func, *args):
+def warmup(func, *args):  # pragma: no cover
     kernel = func.warmup(*args, grid=(1,), host_layout="1:2:3")
     rblib.write_rtosa(kernel, args)
 

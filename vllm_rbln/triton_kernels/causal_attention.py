@@ -21,7 +21,7 @@ from torch.library import register_fake, triton_op
 
 
 @triton.jit
-def causal_attention_naive_prefill(
+def causal_attention_naive_prefill(  # pragma: no cover
     query_base,
     key_base,
     value_base,
@@ -195,7 +195,7 @@ def causal_attention_naive_prefill(
 
 
 @triton.jit
-def causal_attention_naive_decode(
+def causal_attention_naive_decode(  # pragma: no cover
     query_base,
     key_base,
     value_base,
@@ -368,7 +368,7 @@ def causal_attention_naive_decode(
         tl.store(output_ptr, attn_out)  # (1,h,4,l,d)
 
 
-def warmup(func, *args):
+def warmup(func, *args):  # pragma: no cover
     kernel = func.warmup(*args, grid=(1,), host_layout="1:2:3")
     rblib.write_rtosa(kernel, args)
 
