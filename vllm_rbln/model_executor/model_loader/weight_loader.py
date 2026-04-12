@@ -781,8 +781,8 @@ def load_AXK1_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[
     params_dict = dict(self.named_parameters())
     loaded_params: set[str] = set()
     for name, loaded_weight in weights:
-        if name.startswith("layers"):
-            layer_idx = int(name.split(".")[1])
+        if name.startswith("model.layers"):
+            layer_idx = int(name.split(".")[2])
             if layer_idx >= self.config.num_hidden_layers:
                 continue
 
