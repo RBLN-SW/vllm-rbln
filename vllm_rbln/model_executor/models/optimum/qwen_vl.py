@@ -83,6 +83,9 @@ class RBLNOptimumQwenVLForConditionalGeneration(
                 grid_thw=video_input["video_grid_thw"],
             )
             result["video_grid_thw"] = video_input["video_grid_thw"]
+            second_per_grid_ts = video_input.get("second_per_grid_ts", None)
+            if second_per_grid_ts is not None:
+                result["second_per_grid_ts"] = second_per_grid_ts
         return result
 
     def preprocess_prefill(
@@ -333,7 +336,9 @@ class RBLNOptimumQwen2_5_VLForConditionalGeneration(
     def _add_model_specific_args(self, preprocess_args: dict, video_input: Any):
         """Add second_per_grid_ts for Qwen2.5-VL"""
         if video_input is not None:
-            preprocess_args["second_per_grid_ts"] = video_input["second_per_grid_ts"]
+            second_per_grid_ts = video_input.get("second_per_grid_ts", None)
+            if second_per_grid_ts is not None:
+                preprocess_args["second_per_grid_ts"] = second_per_grid_ts
 
     def _create_image_pixel_inputs(self, pixel_values, image_grid_thw):
         return Qwen2_5_VLImagePixelInputs(

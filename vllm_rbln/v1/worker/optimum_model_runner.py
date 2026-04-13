@@ -397,8 +397,10 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         model_input: ModelInputForRBLN,
         scheduler_output: "SchedulerOutput",
     ) -> None:
-        """Run the vision encoder (preprocess_prefill) and save
-        results to the EC connector.  Producer-only path."""
+        """Run the vision encoder only and save results to the EC
+        connector.  Producer-only path — sends encode() output
+        (image_embeds/video_embeds + grid_thw) instead of the full
+        preprocess_prefill result."""
         image_input = None
         video_input = None
         if model_input.multi_modal_kwargs:
@@ -409,15 +411,11 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                 **model_input.multi_modal_kwargs
             )
 
-        input_ids = model_input.input_tokens
-        attention_mask = torch.ones_like(input_ids)
-        prefill_params = self.model.preprocess_prefill(
-            input_ids, attention_mask, image_input, video_input
-        )
+        encode_output = self.model.encode(image_input, video_input)
 
         mm_hash = self._get_mm_hash_for_request(scheduler_output)
         if mm_hash is not None:
-            self.encoder_cache[mm_hash] = prefill_params
+            self.encoder_cache[mm_hash] = encode_output
             self.maybe_save_ec_to_connector(self.encoder_cache, mm_hash)
 
     def _run_decoder_with_cached_encoder(
@@ -425,28 +423,46 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         model_input: ModelInputForRBLN,
         scheduler_output: "SchedulerOutput",
     ) -> torch.Tensor:
-        """Consumer path: skip vision encoder and use cached
-        encoder outputs loaded by the EC connector."""
+        """Consumer path: reconstruct embedding inputs from cached
+        encode() output and run preprocess_prefill + prefill_decoder."""
         mm_hash = self._get_mm_hash_for_request(scheduler_output)
         if mm_hash is not None and mm_hash in self.encoder_cache:
             cached = self.encoder_cache[mm_hash]
-            prefill_params = dict(cached) if isinstance(cached, dict) else {"inputs_embeds": cached}
+            model_dtype = self.model.dtype
 
-            # rope_deltas is stored in the cache for bookkeeping but is not
-            # accepted by prefill_decoder. Extract and store it just like the
-            # normal forward() path does before calling prefill_decoder.
+            # Reconstruct image/video inputs with embedding type
+            # so preprocess_prefill skips the vision encoder.
+            image_input = None
+            video_input = None
+
+            if "image_embeds" in cached:
+                image_input = self.model._create_image_embedding_inputs(
+                    image_embeds=cached["image_embeds"].to(model_dtype),
+                    image_grid_thw=cached["image_grid_thw"].to(torch.int64),
+                )
+            if "video_embeds" in cached:
+                video_input = self.model._create_video_embedding_inputs(
+                    video_embeds=cached["video_embeds"].to(model_dtype),
+                    video_grid_thw=cached["video_grid_thw"].to(torch.int64),
+                )
+                # Pass through second_per_grid_ts for Qwen2.5-VL
+                if "second_per_grid_ts" in cached:
+                    video_input["second_per_grid_ts"] = cached[
+                        "second_per_grid_ts"
+                    ]
+
+            # Run preprocess_prefill with pre-computed embeddings
+            input_ids = model_input.input_tokens
+            attention_mask = torch.ones_like(input_ids)
+            prefill_params = self.model.preprocess_prefill(
+                input_ids, attention_mask, image_input, video_input
+            )
+
+            # Extract rope_deltas for bookkeeping (same as forward())
             rope_deltas = prefill_params.pop("rope_deltas", None)
             if rope_deltas is not None:
                 cur_request_id = model_input.running_requests_ids[0]
                 self.model.rope_deltas[cur_request_id] = rope_deltas.item()
-
-            # Cast cached tensors to model dtype. Safetensors preserves the
-            # original dtype but the RBLN runtime requires an exact dtype match.
-            model_dtype = self.model.dtype
-            prefill_params = {
-                k: v.to(model_dtype) if isinstance(v, torch.Tensor) else v
-                for k, v in prefill_params.items()
-            }
 
             kwargs = self.model.preprocess_for_decoder(
                 True,
@@ -461,8 +477,11 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             ).logits
             return logits
 
-        # Fallback: run the full model if cache miss.
-        return self.model(model_input)
+        raise RuntimeError(
+            f"EC consumer cache miss: mm_hash={mm_hash}, "
+            f"encoder_cache_keys={list(self.encoder_cache.keys())[:5]}, "
+            f"scheduled_new_reqs={len(scheduler_output.scheduled_new_reqs)}"
+        )
 
     @staticmethod
     def _get_mm_hash_for_request(

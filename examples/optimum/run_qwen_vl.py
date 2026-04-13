@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import asyncio
+import time
 
 import fire
 from datasets import load_dataset
@@ -190,6 +191,7 @@ def generate_prompts_wo_processing(batch_size: int, model_id: str):
 
 
 async def generate(engine: AsyncLLMEngine, tokenizer, request_id, request):
+    t0 = time.perf_counter()
     results_generator = engine.generate(
         request,
         SamplingParams(
@@ -205,6 +207,8 @@ async def generate(engine: AsyncLLMEngine, tokenizer, request_id, request):
     final_output = None
     async for request_output in results_generator:
         final_output = request_output
+    elapsed = time.perf_counter() - t0
+    final_output._elapsed = elapsed
     return final_output
 
 
@@ -245,15 +249,19 @@ async def main(
 
     for i, result in enumerate(results):
         output = result.outputs[0].text
+        elapsed = getattr(result, "_elapsed", None)
+        num_tokens = len(result.outputs[0].token_ids)
         print(f"===================== Output {i} ==============================")
         print(output)
+        if elapsed is not None:
+            print(f"--- {elapsed:.2f}s | {num_tokens} tokens | {num_tokens / elapsed:.1f} tok/s")
         print("===============================================================\n")
 
 
 def entry_point(
     num_input_prompt: int = 1,
     # NOTE: This example supports Qwen2-VL, Qwen2.5-VL, and Qwen3-VL.
-    model_id: str = "/qwen2_5-vl-7b-32k-b4-kv16k",
+    model_id: str = "Qwen2-VL-7B-Instruct",
 ):
     asyncio.run(
         main(
