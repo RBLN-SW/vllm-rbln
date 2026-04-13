@@ -1831,9 +1831,10 @@ class TestRBLNScheduler:
         expected_scheduled = req2.num_tokens - num_computed
         assert output2.num_scheduled_tokens["turn2"] == expected_scheduled
 
-    def test_speculative_alloc_undo_cleans_sub_block_index(self):
-        """Speculative allocate_slots + undo_uncomputed_block_caching must not
-        leave stale sub-block index entries for blocks that were never computed.
+    def test_speculative_alloc_does_not_index_uncomputed_blocks(self):
+        """Pre-allocated but uncomputed blocks must not appear in the
+        sub-block index. With delay_cache_blocks=True, only blocks that
+        are explicitly cached in the finalization step get indexed.
         """
         BS = self.BLOCK_SIZE  # 16
         SBS = self.SUB_BLOCK_SIZE  # 4
@@ -1846,9 +1847,9 @@ class TestRBLNScheduler:
         # 3 full blocks + 1 partial block.
         # The scheduler pre-allocates blocks for ALL tokens but only computes
         # one chunk (BS tokens) per iteration.
-        # After undo_uncomputed_block_caching:
+        # With delay_cache_blocks + finalization:
         #   block 0: computed and indexed
-        #   blocks 1-2: full but uncomputed and unindexed
+        #   blocks 1-2: full, never got cached/indexed
         #   block 3: partial, never got indexed
         tokens = list(range(3 * BS + SBS))
         req = _make_request("req", tokens, BS, max_tokens=1)

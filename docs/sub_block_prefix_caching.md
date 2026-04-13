@@ -73,7 +73,9 @@ so that each prefill does not span multiple blocks.
    * `RBLNKVCacheManager`: Extends upstream `KVCacheManager`.
         * Overrides
             * `allocate_slots` queues the request for sub-block indexing work
-              to be processed by `do_pending_indexing`.
+              when `delay_cache_blocks=False`.
+              When `delay_cache_blocks=True`, the caller must call
+              `schedule_sub_block_indexing()` after `cache_blocks()`.
             * `free` indexes all blocks (full + partial) for the finishing request
               and assigns a synthetic `block_hash` to the partial block.
             * `reset_prefix_cache` clears sub-block indices and pending indexing.
@@ -83,8 +85,9 @@ so that each prefill does not span multiple blocks.
             * `apply_sub_block_match` / `release_sub_block_match` consume or discard the handle.
             * `drain_pending_copy_ops()` retrieves the KV cache copy ops accumulated in the current scheduling step.
             * `release_copy_ops()` releases the source-block references after the model runner finishes copying.
-            * `do_pending_indexing()` indexes sub-blocks for requests for which
-              `allocate_slots` was called in the current scheduling step.
+            * `schedule_sub_block_indexing(request)` records that a request
+              needs sub-block indexing.
+            * `do_pending_indexing()` executes the scheduled indexing work.
               Must be called after `super().update_from_output()`.
             * `can_use_sub_block_caching()` checks eligibility.
    * `KVCacheCopyOp`: Dataclass describing a sub-block KV data copy:
@@ -130,7 +133,12 @@ Sub-block indexing is **deferred** until after the forward pass writes KV data.
 This ensures that concurrent prefills in the same scheduling step cannot match
 sub-blocks whose KV data has not yet been computed and thus should not be copied.
 
-During `allocate_slots`, requests are queued for deferred indexing.
+When a scheduler schedules a request, it should schedule sub-block indexing for that request.
+This is done automatically when `allocate_slots` is called with `delay_cache_blocks=False`.
+If `delay_cache_blocks=True`, the user must call `schedule_sub_block_indexing()` after upstream `cache_blocks()`.
+The current implementation of `RBLNScheduler` uses the latter approach,
+because its complex scheduling logic requires manual control over full block caching.
+
 `RBLNScheduler.update_from_output` first calls `super().update_from_output()`
 (which updates `num_computed_tokens` and `free()`s finished requests),
 then calls `do_pending_indexing` for the remaining running requests.
@@ -170,11 +178,9 @@ produce logits).
 ### Step 4: Copy op scheduling
 
 After `allocate_slots` succeeds, the scheduler calls
-`apply_sub_block_match(match, request)` which, for each group:
+`apply_sub_block_match(match)` which, for each group:
 1.  Looks up the destination block (newly allocated at the match boundary)
 2.  Appends `KVCacheCopyOp(group_id, src_block_id, dst_block_id, num_tokens)`
-
-(`allocate_slots` itself only queues deferred sub-block indexing.)
 
 ### Step 5: Copy execution (model runner)
 
@@ -191,7 +197,7 @@ kv_cache[:, dst_block_id, :, :, :num_tokens, :] = \
 ### Block lifecycle
 
 - **Indexing running requests**:
-  Scheduled by `allocate_slots`, then executed by `do_pending_indexing`
+  Scheduled by `allocate_slots` or by user, then executed by `do_pending_indexing`
   (called after `super().update_from_output()`).
   Indexes both full blocks and complete sub-blocks within partial blocks.
 - **Indexing finished requests**: `free()` consumes the pending-indexing
