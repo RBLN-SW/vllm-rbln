@@ -30,6 +30,8 @@ Usage:
 
 import asyncio
 import multiprocessing as mp
+import os
+import time
 
 import fire
 from datasets import load_dataset
@@ -90,6 +92,7 @@ def generate_prompts_image(batch_size: int, model_id: str):
 
 
 async def _generate(engine, tokenizer, request_id, request):
+    t0 = time.perf_counter()
     results_generator = engine.generate(
         request,
         SamplingParams(
@@ -104,6 +107,7 @@ async def _generate(engine, tokenizer, request_id, request):
     final_output = None
     async for request_output in results_generator:
         final_output = request_output
+    final_output._elapsed = time.perf_counter() - t0
     return final_output
 
 
@@ -131,7 +135,10 @@ def _engine_proc(
     nixl_port: int,
     req_queue: "mp.Queue",
     res_queue: "mp.Queue",
+    rbln_devices: str | None = None,
 ):
+    if rbln_devices is not None:
+        os.environ["RBLN_DEVICES"] = rbln_devices
     asyncio.run(
         _engine_proc_async(
             model_id, max_model_len, ec_role,
@@ -157,7 +164,9 @@ async def _engine_proc_async(
         if request is None:
             break
         output = await _generate(engine, tokenizer, request_id, request)
-        res_queue.put((request_id, output))
+        elapsed = getattr(output, "_elapsed", None)
+        num_tokens = len(output.outputs[0].token_ids)
+        res_queue.put((request_id, output.outputs[0].text, elapsed, num_tokens))
 
 
 # ---------------------------------------------------------------------------
@@ -166,10 +175,12 @@ async def _engine_proc_async(
 
 def main(
     num_input_prompt: int = 1,
-    model_id: str = "./qwen2_5-vl-7b-32k-b4-kv16k",
+    model_id: str = "Qwen2-VL-7B-Instruct",
     max_model_len: int | None = None,
     ec_nixl_host: str = "127.0.0.1",
     ec_nixl_port: int = 15100,
+    producer_devices: str = "0,1,2,3,4,5,6,7",
+    consumer_devices: str = "8,9,10,11,12,13,14,15",
 ):
     ctx = mp.get_context("spawn")
     producer_req, producer_res = ctx.Queue(), ctx.Queue()
@@ -180,11 +191,13 @@ def main(
 
     producer = ctx.Process(
         target=_engine_proc,
-        args=(*common, "ec_producer", *nixl, producer_req, producer_res),
+        args=(*common, "ec_producer", *nixl, producer_req, producer_res,
+              producer_devices),
     )
     consumer = ctx.Process(
         target=_engine_proc,
-        args=(*common, "ec_consumer", *nixl, consumer_req, consumer_res),
+        args=(*common, "ec_consumer", *nixl, consumer_req, consumer_res,
+              consumer_devices),
     )
     producer.start()
     consumer.start()
@@ -197,14 +210,16 @@ def main(
         consumer_req.put((i, req))
 
     # Collect results from consumer.
-    results = {}
+    consumer_results = {}
     for _ in inputs:
-        req_id, output = consumer_res.get()
-        results[req_id] = output
+        req_id, text, elapsed, num_tokens = consumer_res.get()
+        consumer_results[req_id] = (text, elapsed, num_tokens)
 
-    # Drain producer results (fire-and-forget, but must consume to unblock).
+    # Collect results from producer.
+    producer_results = {}
     for _ in inputs:
-        producer_res.get()
+        req_id, text, elapsed, num_tokens = producer_res.get()
+        producer_results[req_id] = (text, elapsed, num_tokens)
 
     # Shutdown.
     producer_req.put((None, None))
@@ -213,9 +228,13 @@ def main(
     consumer.join(timeout=30)
 
     for i in range(len(inputs)):
-        text = results[i].outputs[0].text
+        c_text, c_elapsed, c_tokens = consumer_results[i]
+        p_text, p_elapsed, p_tokens = producer_results[i]
         print(f"==================== Output {i} ==============================")
-        print(text)
+        print(c_text)
+        print(f"--- producer: {p_elapsed:.2f}s | {p_tokens} tokens")
+        print(f"--- consumer: {c_elapsed:.2f}s | {c_tokens} tokens | "
+              f"{c_tokens / c_elapsed:.1f} tok/s")
         print("===============================================================\n")
 
 

@@ -32,6 +32,7 @@ Flow per request:
 import asyncio
 import base64
 import random
+import time
 from io import BytesIO
 
 import fire
@@ -86,23 +87,35 @@ async def process_request(
     consumer_url: str,
     body: dict,
     request_id: int,
-) -> str:
+) -> dict:
     """Send the same request to producer (fire-and-forget) then consumer."""
     # Fire request to producer — triggers vision encoding + NIXL registration.
     # We don't need the generated text from producer, but must wait for it
     # to finish so the encoder cache is registered before consumer pulls.
+    t_producer_start = time.perf_counter()
     producer_task = asyncio.create_task(
         _send_request(client, producer_url, body)
     )
 
     # Wait for producer to finish encoding, then send to consumer.
     await producer_task
+    t_producer_end = time.perf_counter()
 
     # Consumer pulls encoder cache via NIXL and runs decoder.
+    t_consumer_start = time.perf_counter()
     resp = await _send_request(client, consumer_url, body)
     resp.raise_for_status()
+    t_consumer_end = time.perf_counter()
+
     result = resp.json()
-    return result["choices"][0]["message"]["content"]
+    usage = result.get("usage", {})
+    return {
+        "text": result["choices"][0]["message"]["content"],
+        "producer_time": t_producer_end - t_producer_start,
+        "consumer_time": t_consumer_end - t_consumer_start,
+        "total_time": t_consumer_end - t_producer_start,
+        "completion_tokens": usage.get("completion_tokens", 0),
+    }
 
 
 async def main(
@@ -143,9 +156,15 @@ async def main(
         ]
         results = await asyncio.gather(*tasks)
 
-    for i, text in enumerate(results):
+    for i, r in enumerate(results):
+        tokens = r["completion_tokens"]
+        tok_s = tokens / r["consumer_time"] if r["consumer_time"] > 0 else 0
         print(f"==================== Output {i} ==============================")
-        print(text)
+        print(r["text"])
+        print(f"--- producer: {r['producer_time']:.2f}s")
+        print(f"--- consumer: {r['consumer_time']:.2f}s | "
+              f"{tokens} tokens | {tok_s:.1f} tok/s")
+        print(f"--- total:    {r['total_time']:.2f}s")
         print("===============================================================\n")
 
 
