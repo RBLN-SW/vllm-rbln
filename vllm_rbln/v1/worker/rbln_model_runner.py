@@ -125,15 +125,15 @@ from vllm_rbln.forward_context import RBLNDPMetadata
 from vllm_rbln.logger import init_logger
 from vllm_rbln.lora.inputs import LoRAInputs
 from vllm_rbln.lora.mask import LoRAMask
+from vllm_rbln.v1.attention.backends.flash_attention import (
+    RBLNFlashAttentionMetadataBuilder,
+)
 from vllm_rbln.v1.attention.kv_cache_bindings import (
     KVCacheViewInfo,
     attach_kv_cache_bindings,
     build_kv_cache_base_bindings,
     build_kv_cache_forward_context_kwargs,
     validate_shared_attention_kv_cache_contiguity,
-)
-from vllm_rbln.v1.attention.backends.flash_attention import (
-    RBLNFlashAttentionMetadataBuilder,
 )
 from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 from vllm_rbln.v1.sample import RBLNSampler
@@ -4156,8 +4156,10 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     ]
                     # Keep the deduped base in a backend-native multidimensional
                     # shape so export/Relay never sees a giant flat dimension.
-                    typed_base = kv_cache_raw_tensors[layer_name].view(dtype).view(
-                        kv_cache_shape
+                    typed_base = (
+                        kv_cache_raw_tensors[layer_name]
+                        .view(dtype)
+                        .view(kv_cache_shape)
                     )
                     kv_caches[layer_name] = typed_base.permute(*inv_order)
                     kv_cache_base_tensors[layer_name] = typed_base
@@ -4250,9 +4252,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.kv_cache_bases = kv_cache_bases
         self.kv_cache_view_infos = kv_cache_view_infos
 
-    def _attach_kv_cache_bindings(
-        self, attn_metadata: dict[str, Any] | None
-    ) -> None:
+    def _attach_kv_cache_bindings(self, attn_metadata: dict[str, Any] | None) -> None:
         if attn_metadata is None:
             return
         for attn_metadatum in attn_metadata.values():
@@ -4329,9 +4329,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 target_layer_name
             ]
             if target_layer_name in kv_cache_view_infos:
-                kv_cache_view_infos[layer_name] = kv_cache_view_infos[
-                    target_layer_name
-                ]
+                kv_cache_view_infos[layer_name] = kv_cache_view_infos[target_layer_name]
 
         validate_shared_attention_kv_cache_contiguity(
             kv_caches,

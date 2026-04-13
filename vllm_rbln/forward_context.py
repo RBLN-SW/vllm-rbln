@@ -171,11 +171,9 @@ def _set_forward_context(
         ubatch_slices,
     )
     if additional_kwargs:
-        existing_additional_kwargs = getattr(
-            forward_context, "additional_kwargs", None
-        )
+        existing_additional_kwargs = getattr(forward_context, "additional_kwargs", None)
         if existing_additional_kwargs is None:
-            setattr(forward_context, "additional_kwargs", dict(additional_kwargs))
+            forward_context.additional_kwargs = dict(additional_kwargs)
         else:
             existing_additional_kwargs.update(additional_kwargs)
 
