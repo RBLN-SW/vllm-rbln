@@ -69,6 +69,22 @@ class RBLNOptimumQwenVLForConditionalGeneration(
             "rope_deltas": preprocess_outputs[2],
         }
 
+    def encode(self, image_input, video_input) -> dict:
+        # sync with optimum encode()
+        result = {}
+        if image_input is not None and image_input.get("type") == "pixel_values":
+            result["image_embeds"] = self.model.visual(
+                image_input["pixel_values"], grid_thw=image_input["image_grid_thw"]
+            )
+            result["image_grid_thw"] = image_input["image_grid_thw"]
+        if video_input is not None and video_input.get("type") == "pixel_values_videos":
+            result["video_embeds"] = self.model.visual(
+                video_input["pixel_values_videos"],
+                grid_thw=video_input["video_grid_thw"],
+            )
+            result["video_grid_thw"] = video_input["video_grid_thw"]
+        return result
+
     def preprocess_prefill(
         self, input_ids, attention_mask, image_input, video_input
     ) -> dict:
@@ -79,30 +95,47 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         Args:
             input_ids: Input token IDs
             attention_mask: Attention mask
-            image_input: Image input data
-            video_input: Video input data
+            image_input: Image input data (pixel_values or image_embeds type)
+            video_input: Video input data (pixel_values_videos or video_embeds type)
 
         Returns:
             Dict of preprocessed inputs for the model's prefill_decoder
         """
 
-        # Prepare base arguments common to all models
         preprocess_args = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
-            "pixel_values": image_input["pixel_values"]
-            if image_input is not None
-            else None,
-            "image_grid_thw": image_input["image_grid_thw"]
-            if image_input is not None
-            else None,
-            "pixel_values_videos": video_input["pixel_values_videos"]
-            if video_input is not None
-            else None,
-            "video_grid_thw": video_input["video_grid_thw"]
-            if video_input is not None
-            else None,
         }
+
+        # Dispatch image inputs: pre-computed embeddings skip the visual encoder
+        if image_input is not None:
+            preprocess_args["image_grid_thw"] = image_input["image_grid_thw"]
+            if image_input.get("type") == "image_embeds":
+                preprocess_args["image_embeds"] = image_input["image_embeds"]
+                preprocess_args["pixel_values"] = None
+            else:
+                preprocess_args["pixel_values"] = image_input["pixel_values"]
+                preprocess_args["image_embeds"] = None
+        else:
+            preprocess_args["pixel_values"] = None
+            preprocess_args["image_grid_thw"] = None
+            preprocess_args["image_embeds"] = None
+
+        # Dispatch video inputs: pre-computed embeddings skip the visual encoder
+        if video_input is not None:
+            preprocess_args["video_grid_thw"] = video_input["video_grid_thw"]
+            if video_input.get("type") == "video_embeds":
+                preprocess_args["video_embeds"] = video_input["video_embeds"]
+                preprocess_args["pixel_values_videos"] = None
+            else:
+                preprocess_args["pixel_values_videos"] = video_input[
+                    "pixel_values_videos"
+                ]
+                preprocess_args["video_embeds"] = None
+        else:
+            preprocess_args["pixel_values_videos"] = None
+            preprocess_args["video_grid_thw"] = None
+            preprocess_args["video_embeds"] = None
 
         # Add model-specific parameters
         self._add_model_specific_args(preprocess_args, video_input)
