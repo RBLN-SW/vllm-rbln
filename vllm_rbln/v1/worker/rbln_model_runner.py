@@ -2593,6 +2593,25 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             invalid_req_indices,
         )
 
+    @staticmethod
+    def maybe_get_kv_connector_output(
+        scheduler_output: "SchedulerOutput",
+        defer_finalize: bool = False,
+    ) -> AbstractContextManager[KVConnectorOutput | None]:
+        """Override upstream helper to bypass it during compilation warmup.
+
+        During warmup, ``scheduler_output.kv_connector_metadata`` is ``None``
+        and the upstream helper would raise its ``assert ... is not None``.
+        """
+        warm_up_phase = scheduler_output.kv_connector_metadata is None
+        return (
+            KVConnectorModelRunnerMixin._get_kv_connector_output(
+                scheduler_output, defer_finalize=defer_finalize
+            )
+            if has_kv_transfer_group() and not warm_up_phase
+            else nullcontext()
+        )
+
     def _get_slot_mappings(
         self,
         num_tokens_padded: int,
@@ -4509,6 +4528,9 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         copy_fn(kv_cache.data_ptr(), idx, 0, block_size, kv_name)
 
             kv_transfer_group.set_host_xfer_buffer_ops(rbln_copy_kv_blocks)
+
+            if hasattr(kv_transfer_group, "set_runtime_holder"):
+                kv_transfer_group.set_runtime_holder(self.runtime_holder)
 
         if self.dcp_world_size > 1:
             layer_type = cast(type[Any], AttentionLayerBase)
