@@ -15,12 +15,6 @@
 from vllm.distributed.ec_transfer.ec_connector.factory import ECConnectorFactory
 
 ECConnectorFactory.register_connector(
-    "RblnECExampleConnector",
-    "vllm_rbln.distributed.ec_transfer.ec_connector.rbln_ec_example_connector",
-    "RblnECExampleConnector",
-)
-
-ECConnectorFactory.register_connector(
     "RblnECNixlConnector",
     "vllm_rbln.distributed.ec_transfer.ec_connector.rbln_ec_nixl_connector",
     "RblnECNixlConnector",

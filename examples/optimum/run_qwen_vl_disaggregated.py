@@ -231,71 +231,6 @@ async def generate(engine: AsyncLLMEngine, tokenizer, request_id, request):
     return final_output
 
 
-async def main(
-    num_input_prompt: int,
-    model_id: str,
-    max_model_len: int | None = None,
-    ec_connector: str | None = None,
-    ec_role: str | None = None,
-    ec_shared_path: str = "/tmp/ec_cache",
-    ec_nixl_host: str = "127.0.0.1",
-    ec_nixl_port: int = 15100,
-):
-    # NOTE: We can set the device to run submodules
-    # by passing `rbln_config` to `additional_config`
-    # Unless specified, OOM may occur when running the vision-related submodules
-    # For example, the tensor parallel size of the language is 16,
-    # and the vision submodule is 1,
-    # we can set the device allocation as follows to optimally utilize RBLN memory:
-    # https://github.com/rebellions-sw/rbln_model_zoo/blob/6b015d28cda7bff2935108ece7d32ae8590cc35c/huggingface/transformers/image-text-to-text/qwen2.5-vl/qwen2.5-vl-7b/inference.py#L36
-    # engine_args = AsyncEngineArgs(model=model_id, additional_config={
-    #     "rbln_config": {
-    #         "device": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
-    #         "visual": {
-    #             "device": [16],
-    #         }
-    #     }
-    # })
-    ec_transfer_config = None
-    if ec_connector and ec_role:
-        ec_transfer_config = ECTransferConfig(
-            ec_connector=ec_connector,
-            ec_role=ec_role,
-            ec_buffer_device="cpu",
-            ec_connector_extra_config={
-                "shared_storage_path": ec_shared_path,
-                "side_channel_host": ec_nixl_host,
-                "side_channel_port": ec_nixl_port,
-            },
-        )
-
-    engine_args = AsyncEngineArgs(
-        model=model_id,
-        max_model_len=max_model_len,
-        ec_transfer_config=ec_transfer_config,
-    )
-
-    engine = AsyncLLMEngine.from_engine_args(engine_args)
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-    inputs = generate_prompts_image(num_input_prompt, model_id)
-    # inputs = generate_prompts_video(num_input_prompt, model_id)
-    # inputs = generate_prompts_wo_processing(num_input_prompt, model_id)
-
-    futures = []
-    for request_id, request in enumerate(inputs):
-        futures.append(
-            asyncio.create_task(generate(engine, tokenizer, request_id, request))
-        )
-
-    results = await asyncio.gather(*futures)
-
-    for i, result in enumerate(results):
-        output = result.outputs[0].text
-        print(f"===================== Output {i} ==============================")
-        print(output)
-        print("===============================================================\n")
-
-
 # ---------------------------------------------------------------------------
 # Auto-disaggregation: spawn producer + consumer in a single invocation
 # ---------------------------------------------------------------------------
@@ -305,7 +240,6 @@ def _engine_loop(
     max_model_len: int | None,
     ec_connector: str,
     ec_role: str,
-    ec_shared_path: str,
     request_queue: "mp.Queue",
     result_queue: "mp.Queue",
     ec_nixl_host: str = "127.0.0.1",
@@ -314,11 +248,11 @@ def _engine_loop(
     """Subprocess entry point: runs an AsyncLLMEngine serving requests from a queue."""
     logger = _setup_logging(ec_role)
     logger.info("Process started (pid=%d)", mp.current_process().pid)
-    logger.info("model_id=%s  max_model_len=%s  ec_connector=%s  ec_shared_path=%s",
-                model_id, max_model_len, ec_connector, ec_shared_path)
+    logger.info("model_id=%s  max_model_len=%s  ec_connector=%s",
+                model_id, max_model_len, ec_connector)
     asyncio.run(
         _engine_loop_async(
-            model_id, max_model_len, ec_connector, ec_role, ec_shared_path,
+            model_id, max_model_len, ec_connector, ec_role,
             request_queue, result_queue, logger,
             ec_nixl_host=ec_nixl_host, ec_nixl_port=ec_nixl_port,
         )
@@ -330,7 +264,6 @@ async def _engine_loop_async(
     max_model_len: int | None,
     ec_connector: str,
     ec_role: str,
-    ec_shared_path: str,
     request_queue: "mp.Queue",
     result_queue: "mp.Queue",
     logger: logging.Logger,
@@ -342,7 +275,6 @@ async def _engine_loop_async(
         ec_role=ec_role,
         ec_buffer_device="cpu",
         ec_connector_extra_config={
-            "shared_storage_path": ec_shared_path,
             "side_channel_host": ec_nixl_host,
             "side_channel_port": ec_nixl_port,
         },
@@ -374,21 +306,20 @@ def _run_disaggregated(
     model_id: str,
     max_model_len: int | None,
     ec_connector: str,
-    ec_shared_path: str,
     ec_nixl_host: str = "127.0.0.1",
     ec_nixl_port: int = 15100,
 ):
     """Spawn a producer and a consumer process, coordinate requests between them.
 
     Flow per request batch:
-      1. Send all requests to producer  → vision encoder runs, saves to ec_shared_path
-      2. Wait for all producer results  → cache is guaranteed to be on disk
-      3. Send all requests to consumer  → loads cache, runs prefill_decoder + decoder
+      1. Send all requests to producer  → vision encoder runs, registers with NIXL
+      2. Wait for all producer results  → cache is guaranteed to be registered
+      3. Send all requests to consumer  → pulls cache via NIXL, runs prefill_decoder + decoder
       4. Print consumer outputs
     """
     logger = _setup_logging("main")
     logger.info("Auto-disaggregation mode: spawning producer + consumer processes")
-    logger.info("ec_connector=%s  ec_shared_path=%s", ec_connector, ec_shared_path)
+    logger.info("ec_connector=%s", ec_connector)
 
     ctx = mp.get_context("spawn")
     producer_req_q = ctx.Queue()
@@ -399,14 +330,14 @@ def _run_disaggregated(
     producer_proc = ctx.Process(
         target=_engine_loop,
         args=(model_id, max_model_len, ec_connector, "ec_producer",
-              ec_shared_path, producer_req_q, producer_res_q),
+              producer_req_q, producer_res_q),
         kwargs={"ec_nixl_host": ec_nixl_host, "ec_nixl_port": ec_nixl_port},
         daemon=False,
     )
     consumer_proc = ctx.Process(
         target=_engine_loop,
         args=(model_id, max_model_len, ec_connector, "ec_consumer",
-              ec_shared_path, consumer_req_q, consumer_res_q),
+              consumer_req_q, consumer_res_q),
         kwargs={"ec_nixl_host": ec_nixl_host, "ec_nixl_port": ec_nixl_port},
         daemon=False,
     )
@@ -426,13 +357,13 @@ def _run_disaggregated(
     )
 
     # Process each request sequentially: producer encodes, then consumer decodes.
-    # This ensures the encoder cache is on disk before the consumer starts each request.
+    # This ensures the encoder cache is registered via NIXL before the consumer pulls it.
     results = {}
     for request_id, request in enumerate(inputs):
         logger.info("[request %d] Sending to producer (vision encoding) ...", request_id)
         producer_req_q.put((request_id, request))
         req_id, _ = producer_res_q.get()
-        logger.info("[request %d] Producer done → cache written to %s", req_id, ec_shared_path)
+        logger.info("[request %d] Producer done → cache registered via NIXL", req_id)
 
         logger.info("[request %d] Sending to consumer (prefill + decode) ...", request_id)
         consumer_req_q.put((request_id, request))
@@ -462,44 +393,19 @@ def entry_point(
     model_id: str = "/qwen2_5-vl-7b-32k-b4-kv16k",
     # max_model_len must be a multiple of kvcache_partition_len when using flash_attn.
     max_model_len: int | None = None,
-    # EC disaggregation (Encoder/Decoder split).
-    # ec_connector: "RblnECExampleConnector" (file-based, for testing)
-    #               "RblnECNixlConnector"    (NIXL RDMA, for production)
-    # ec_role:      omit to auto-spawn both producer and consumer (recommended)
-    #               "ec_producer" / "ec_consumer" to run a single role manually
-    ec_connector: str | None = None,
-    ec_role: str | None = None,
-    ec_shared_path: str = "/tmp/ec_cache",
-    # NIXL side-channel settings (only used with RblnECNixlConnector)
+    # NIXL side-channel settings
     ec_nixl_host: str = "127.0.0.1",
     ec_nixl_port: int = 15100,
 ):
-    if ec_connector and not ec_role:
-        # Auto disaggregation: spawn producer + consumer in this process
-        _run_disaggregated(
-            num_input_prompt=num_input_prompt,
-            model_id=model_id,
-            max_model_len=max_model_len,
-            ec_connector=ec_connector,
-            ec_shared_path=ec_shared_path,
-            ec_nixl_host=ec_nixl_host,
-            ec_nixl_port=ec_nixl_port,
-        )
-    else:
-        # Single-engine mode: no EC, or manually specified ec_role
-        asyncio.run(
-            main(
-                num_input_prompt=num_input_prompt,
-                model_id=model_id,
-                max_model_len=max_model_len,
-                ec_connector=ec_connector,
-                ec_role=ec_role,
-                ec_shared_path=ec_shared_path,
-                ec_nixl_host=ec_nixl_host,
-                ec_nixl_port=ec_nixl_port,
-            )
-        )
 
+    _run_disaggregated(
+        num_input_prompt=num_input_prompt,
+        model_id=model_id,
+        max_model_len=max_model_len,
+        ec_connector="RblnECNixlConnector",
+        ec_nixl_host=ec_nixl_host,
+        ec_nixl_port=ec_nixl_port,
+    )
 
 if __name__ == "__main__":
     fire.Fire(entry_point)
