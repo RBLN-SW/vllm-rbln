@@ -777,6 +777,10 @@ class RBLNScheduler(Scheduler):
                     )
                     scheduled_encoder_inputs.pop(req.request_id, None)
                     undo_uncomputed_block_caching(req, self.kv_cache_manager)
+                    if isinstance(self.kv_cache_manager, RBLNKVCacheManager):
+                        self.kv_cache_manager._pending_indexing.pop(
+                            req.request_id, None
+                        )
 
                 scheduled_running_reqs.clear()
                 token_budget = prefill_token_budget
