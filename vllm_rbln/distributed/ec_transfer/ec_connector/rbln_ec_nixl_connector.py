@@ -108,6 +108,8 @@ _DEFAULT_SIDE_CHANNEL_HOST = "127.0.0.1"
 _DEFAULT_SIDE_CHANNEL_PORT = 15100  # separate from VLLM_NIXL_SIDE_CHANNEL_PORT
 _HANDSHAKE_TIMEOUT_MS = 10_000  # ZMQ recv timeout (ms)
 _XFER_POLL_INTERVAL_S = 0.001   # poll interval for async transfer completion
+_CACHE_WAIT_TIMEOUT_S = 30.0    # max time to wait for producer cache availability
+_CACHE_WAIT_POLL_S = 0.5        # poll interval when waiting for producer cache
 
 # ---------------------------------------------------------------------------
 # Wire-protocol data classes (msgspec for zero-copy serialisation)
@@ -118,7 +120,7 @@ class ECNixlAgentMetadata(msgspec.Struct):
     """Metadata sent from producer to consumer during NIXL handshake."""
     engine_id: str
     agent_metadata: bytes
-    # list of (mm_hash, key, base_addr, nbytes, device_id) tuples
+    # list of (mm_hash, key, base_addr, nbytes, device_id, shape, dtype_str)
     registered_tensors: list
 
 
@@ -221,16 +223,17 @@ class RblnECNixlConnectorScheduler(ECConnectorBase):
     # ------------------------------------------------------------------
 
     def has_cache_item(self, identifier: str) -> bool:
-        """Always return False: consumer must always pull from producer.
+        """Consumer returns True so the scheduler tracks mm_hashes to load.
 
-        With NIXL, the producer registers tensors after encoding and the
-        consumer pulls on demand. We never have a local disk cache to check.
+        The consumer will pull encoder caches from the producer via NIXL.
+        Returning True tells the scheduler to call update_state_after_alloc,
+        which populates mm_datas_need_loads for the worker.
         """
-        return False
+        return self.is_consumer
 
     def update_state_after_alloc(self, request: "Request", index: int) -> None:
         mm_hash = request.mm_features[index].identifier
-        if not self.is_consumer or not self.has_cache_item(mm_hash):
+        if not self.is_consumer:
             return
         num_tokens = request.get_num_encoder_embeds(index)
         self._mm_datas_need_loads[mm_hash] = num_tokens
@@ -345,8 +348,8 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
 
         # Remote producer agent name (consumer only, set after handshake)
         self._remote_agent_name: str | None = None
-        # Remote tensor registry: mm_hash → {key: (base_addr, size, device_id)}
-        self._remote_tensor_registry: dict[str, dict[str, tuple[int, int, int]]] = {}
+        # Remote tensor registry: mm_hash → {key: (base_addr, size, device_id, shape, dtype_str)}
+        self._remote_tensor_registry: dict[str, dict[str, tuple[int, int, int, list, str]]] = {}
 
         # Side-channel listener (producer only, started by _publish_agent_metadata)
         self._stop_event = threading.Event()
@@ -423,6 +426,8 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
         """Consumer: initiate async NIXL pull for each pending mm_hash.
 
         Called by the model runner before prefill_decoder.
+        If a mm_hash is not yet in the remote registry, re-handshakes with
+        the producer (with retry) to discover newly registered tensors.
         Actual tensor data is available only after get_finished() returns.
         """
         if self.is_producer:
@@ -440,9 +445,15 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
             mm_hash = mm_data.mm_hash
             if mm_hash in encoder_cache or mm_hash in self._pending_loads:
                 continue
+
+            # If mm_hash unknown, re-handshake to discover newly registered
+            # tensors from the producer, retrying until available or timeout.
             if mm_hash not in self._remote_tensor_registry:
-                logger.warning(
-                    "EC NIXL: mm_hash=%s not in remote registry, cannot pull",
+                self._wait_for_cache(mm_hash)
+            if mm_hash not in self._remote_tensor_registry:
+                logger.error(
+                    "EC NIXL: mm_hash=%s not available from producer after "
+                    "timeout, skipping",
                     mm_hash,
                 )
                 continue
@@ -450,6 +461,50 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
             handle, local_bufs = self._initiate_pull(mm_hash)
             self._pending_loads[mm_hash] = (handle, local_bufs)
             logger.debug("EC NIXL: initiated pull for mm_hash=%s", mm_hash)
+
+        # Block until all initiated pulls complete (or timeout).
+        # Without this, the model forward may run before encoder_cache
+        # is populated, forcing the consumer to fall back to local
+        # vision encoding and defeating EC disaggregation.
+        if self._pending_loads:
+            self._wait_for_pulls(encoder_cache)
+
+    def _wait_for_pulls(self, encoder_cache: dict[str, Any]) -> None:
+        """Synchronously wait for all pending NIXL pulls to complete."""
+        deadline = time.monotonic() + _CACHE_WAIT_TIMEOUT_S
+        while self._pending_loads and time.monotonic() < deadline:
+            for mm_hash, (handle, local_bufs) in list(
+                self._pending_loads.items()
+            ):
+                status = self._nixl_agent.check_xfer_state(handle)
+                if status == "DONE":
+                    encoder_cache[mm_hash] = {
+                        k: v.clone() for k, v in local_bufs.items()
+                    }
+                    self._nixl_agent.release_xfer_handle(handle)
+                    del self._pending_loads[mm_hash]
+                    logger.debug(
+                        "EC NIXL: pull complete for mm_hash=%s", mm_hash
+                    )
+                elif status not in ("DONE", "PROC"):
+                    logger.error(
+                        "EC NIXL: transfer failed for mm_hash=%s", mm_hash
+                    )
+                    self._nixl_agent.release_xfer_handle(handle)
+                    del self._pending_loads[mm_hash]
+            if self._pending_loads:
+                time.sleep(_XFER_POLL_INTERVAL_S)
+
+        if self._pending_loads:
+            logger.warning(
+                "EC NIXL: %d pulls did not complete within timeout, "
+                "consumer will fall back to local encoding",
+                len(self._pending_loads),
+            )
+            # Clean up timed-out transfers
+            for mm_hash, (handle, _) in list(self._pending_loads.items()):
+                self._nixl_agent.release_xfer_handle(handle)
+                del self._pending_loads[mm_hash]
 
     def get_finished(
         self,
@@ -461,8 +516,8 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
 
         completed: set[str] = set()
         for mm_hash, (handle, local_bufs) in list(self._pending_loads.items()):
-            status = self._nixl_agent.get_xfer_status(handle)
-            if status == "nixl_success":
+            status = self._nixl_agent.check_xfer_state(handle)
+            if status == "DONE":
                 # Copy aligned CPU buffers into encoder_cache
                 self._encoder_cache[mm_hash] = {
                     k: v.clone() for k, v in local_bufs.items()
@@ -471,7 +526,7 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
                 del self._pending_loads[mm_hash]
                 completed.add(mm_hash)
                 logger.debug("EC NIXL: pull complete for mm_hash=%s", mm_hash)
-            elif status == "nixl_error":
+            elif status not in ("DONE", "PROC"):
                 logger.error("EC NIXL: transfer failed for mm_hash=%s", mm_hash)
                 self._nixl_agent.release_xfer_handle(handle)
                 del self._pending_loads[mm_hash]
@@ -493,13 +548,71 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
     # NIXL helpers
     # ------------------------------------------------------------------
 
+    def _refresh_metadata(self) -> None:
+        """Re-fetch producer's agent metadata and re-register the remote
+        agent with NIXL so that newly registered tensors are discoverable."""
+        path = make_zmq_path(
+            "tcp", self._side_channel_host, self._side_channel_port
+        )
+        try:
+            with _zmq_ctx(zmq.REQ, path) as sock:
+                sock.setsockopt(zmq.RCVTIMEO, 2000)
+                sock.send(_GET_META_MSG)
+                raw = sock.recv()
+            decoder = msgspec.msgpack.Decoder(ECNixlHandshakePayload)
+            payload = decoder.decode(raw)
+            meta_decoder = msgspec.msgpack.Decoder(ECNixlAgentMetadata)
+            agent_meta = meta_decoder.decode(payload.agent_metadata_bytes)
+
+            # Remove stale remote agent and re-add with fresh metadata
+            # so NIXL knows about newly registered memory regions.
+            if self._remote_agent_name is not None:
+                self._nixl_agent.remove_remote_agent(self._remote_agent_name)
+            self._remote_agent_name = self._nixl_agent.add_remote_agent(
+                agent_meta.agent_metadata
+            )
+
+            self._remote_tensor_registry.clear()
+            for entry in agent_meta.registered_tensors:
+                mm_hash, key, base_addr, nbytes, device_id = entry[:5]
+                shape = entry[5] if len(entry) > 5 else []
+                dtype_str = entry[6] if len(entry) > 6 else "torch.bfloat16"
+                if mm_hash not in self._remote_tensor_registry:
+                    self._remote_tensor_registry[mm_hash] = {}
+                self._remote_tensor_registry[mm_hash][key] = (
+                    base_addr, nbytes, device_id, shape, dtype_str
+                )
+            logger.debug(
+                "EC NIXL: metadata refreshed — %d mm_hashes available",
+                len(self._remote_tensor_registry),
+            )
+        except (zmq.Again, zmq.ZMQError, msgspec.DecodeError) as exc:
+            logger.debug("EC NIXL: metadata refresh failed (%s)", exc)
+
+    def _wait_for_cache(self, mm_hash: str) -> None:
+        """Poll the producer's side-channel until *mm_hash* appears in the
+        remote tensor registry or timeout is reached."""
+        deadline = time.monotonic() + _CACHE_WAIT_TIMEOUT_S
+        while time.monotonic() < deadline:
+            self._refresh_metadata()
+            if mm_hash in self._remote_tensor_registry:
+                logger.debug(
+                    "EC NIXL: mm_hash=%s discovered after refresh", mm_hash
+                )
+                return
+            time.sleep(_CACHE_WAIT_POLL_S)
+        logger.warning(
+            "EC NIXL: timed out waiting for mm_hash=%s (%.1fs)",
+            mm_hash, _CACHE_WAIT_TIMEOUT_S,
+        )
+
     def _publish_agent_metadata(self) -> None:
         """Encode current agent metadata and start side-channel listener."""
         if not self.is_producer:
             return
 
         # Build the registered tensor registry for the consumer
-        registered_tensors: list[tuple[str, str, int, int, int]] = []
+        registered_tensors: list[tuple[str, str, int, int, int, list, str]] = []
         for mm_hash, tensor_dict in self._registered_caches.items():
             for key, buf in tensor_dict.items():
                 registered_tensors.append((
@@ -508,6 +621,8 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
                     buf.data_ptr(),
                     buf.numel() * buf.element_size(),
                     0,  # CPU device_id
+                    list(buf.shape),
+                    str(buf.dtype),
                 ))
 
         agent_meta = ECNixlAgentMetadata(
@@ -585,10 +700,15 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
 
         # Build local registry of remote tensor addresses
         self._remote_tensor_registry.clear()
-        for mm_hash, key, base_addr, nbytes, device_id in agent_meta.registered_tensors:
+        for entry in agent_meta.registered_tensors:
+            mm_hash, key, base_addr, nbytes, device_id = entry[:5]
+            shape = entry[5] if len(entry) > 5 else []
+            dtype_str = entry[6] if len(entry) > 6 else "torch.bfloat16"
             if mm_hash not in self._remote_tensor_registry:
                 self._remote_tensor_registry[mm_hash] = {}
-            self._remote_tensor_registry[mm_hash][key] = (base_addr, nbytes, device_id)
+            self._remote_tensor_registry[mm_hash][key] = (
+                base_addr, nbytes, device_id, shape, dtype_str
+            )
 
         logger.info(
             "EC NIXL: handshake complete — %d mm_hashes available from producer",
@@ -602,37 +722,56 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
         remote_tensors = self._remote_tensor_registry[mm_hash]
 
         local_bufs: dict[str, torch.Tensor] = {}
-        local_descs_data: list[tuple[int, int, int, str]] = []
-        remote_descs_data: list[tuple[int, int, int, str]] = []
+        # 4-tuples for reg_descs: (addr, size, device_id, label)
+        local_reg_data: list[tuple[int, int, int, str]] = []
+        # 3-tuples for xfer_descs: (addr, size, device_id)
+        local_xfer_data: list[tuple[int, int, int]] = []
+        remote_xfer_data: list[tuple[int, int, int]] = []
 
-        for key, (base_addr, nbytes, device_id) in remote_tensors.items():
-            # Allocate aligned local buffer matching remote tensor size
-            numel = nbytes // 2  # bfloat16 = 2 bytes per element
+        for key, (base_addr, nbytes, device_id, shape, _dtype_str) in remote_tensors.items():
+            # Allocate aligned local buffer matching remote tensor size.
+            # Producer uses aligned_tensor(numel) which defaults to float16
+            # (2 bytes/element), so we do the same here.
+            numel = nbytes // 2  # float16 = 2 bytes per element
             buf = aligned_tensor(numel)
+            if shape:
+                buf = buf.reshape(shape)
             local_bufs[key] = buf
-            local_descs_data.append((buf.data_ptr(), nbytes, 0, ""))
-            remote_descs_data.append((base_addr, nbytes, device_id, ""))
+            local_reg_data.append((buf.data_ptr(), nbytes, 0, ""))
+            local_xfer_data.append((buf.data_ptr(), nbytes, 0))
+            remote_xfer_data.append((base_addr, nbytes, device_id))
 
-        # Build NIXL transfer descriptor lists
-        local_descs = self._nixl_agent.get_xfer_descs(local_descs_data, "DRAM")
-        remote_descs = self._nixl_agent.get_xfer_descs(remote_descs_data, "DRAM")
+        num_descs = len(local_xfer_data)
 
         # Register local destination buffers
-        local_reg_descs = self._nixl_agent.get_reg_descs(local_descs_data, "DRAM")
+        local_reg_descs = self._nixl_agent.get_reg_descs(local_reg_data, "DRAM")
         self._nixl_agent.register_memory(local_reg_descs, backends=self._backends)
         self._registered_descs[f"_consumer_{mm_hash}"] = local_reg_descs
 
+        # Prep transfer descriptor lists (prep_xfer_dlist calls get_xfer_descs
+        # internally, so pass raw 3-tuples directly)
+        local_prepped = self._nixl_agent.prep_xfer_dlist(
+            "NIXL_INIT_AGENT", local_xfer_data, "DRAM"
+        )
+        remote_prepped = self._nixl_agent.prep_xfer_dlist(
+            self._remote_agent_name, remote_xfer_data, "DRAM"
+        )
+
         # Initiate async NIXL READ (consumer pulls from producer)
+        indices = list(range(num_descs))
         handle = self._nixl_agent.make_prepped_xfer(
-            "NIXL_READ",
-            self._remote_agent_name,
-            local_descs,
-            remote_descs,
+            "READ",
+            local_prepped,
+            indices,
+            remote_prepped,
+            indices,
             notif_msg=b"",
         )
         status = self._nixl_agent.transfer(handle)
-        if status == "nixl_error":
-            raise RuntimeError(f"EC NIXL: transfer initiation failed for mm_hash={mm_hash}")
+        if status not in ("DONE", "PROC"):
+            raise RuntimeError(
+                f"EC NIXL: transfer initiation failed for mm_hash={mm_hash}"
+            )
 
         return handle, local_bufs
 

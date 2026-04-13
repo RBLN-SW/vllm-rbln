@@ -186,7 +186,7 @@ class RBLNOptimumQwenVLForConditionalGeneration(
 
             if finished_requests_ids:
                 for request_id in finished_requests_ids:
-                    self.rope_deltas.pop(request_id)
+                    self.rope_deltas.pop(request_id, None)
             self.rope_deltas[cur_request_id] = prefill_params["rope_deltas"].item()
             prefill_params.pop("rope_deltas")
 
