@@ -110,7 +110,12 @@ class RBLNEagleProposer(EagleProposer):
                 fast_build=True,
                 **extra_attn_metadata_args,
             )
-            attn_metadata.kv_caches = self.runner.kv_caches
+            attach_kv_cache_bindings(
+                attn_metadata,
+                self.runner.kv_caches,
+                getattr(self.runner, "kv_cache_bases", None),
+                getattr(self.runner, "kv_cache_view_infos", None),
+            )
             for layer_name in attn_group.layer_names:
                 per_layer_attn_metadata[layer_name] = attn_metadata
 
