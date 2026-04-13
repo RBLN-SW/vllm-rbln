@@ -238,6 +238,8 @@ async def main(
     ec_connector: str | None = None,
     ec_role: str | None = None,
     ec_shared_path: str = "/tmp/ec_cache",
+    ec_nixl_host: str = "127.0.0.1",
+    ec_nixl_port: int = 15100,
 ):
     # NOTE: We can set the device to run submodules
     # by passing `rbln_config` to `additional_config`
@@ -260,7 +262,11 @@ async def main(
             ec_connector=ec_connector,
             ec_role=ec_role,
             ec_buffer_device="cpu",
-            ec_connector_extra_config={"shared_storage_path": ec_shared_path},
+            ec_connector_extra_config={
+                "shared_storage_path": ec_shared_path,
+                "side_channel_host": ec_nixl_host,
+                "side_channel_port": ec_nixl_port,
+            },
         )
 
     engine_args = AsyncEngineArgs(
@@ -302,6 +308,8 @@ def _engine_loop(
     ec_shared_path: str,
     request_queue: "mp.Queue",
     result_queue: "mp.Queue",
+    ec_nixl_host: str = "127.0.0.1",
+    ec_nixl_port: int = 15100,
 ):
     """Subprocess entry point: runs an AsyncLLMEngine serving requests from a queue."""
     logger = _setup_logging(ec_role)
@@ -312,6 +320,7 @@ def _engine_loop(
         _engine_loop_async(
             model_id, max_model_len, ec_connector, ec_role, ec_shared_path,
             request_queue, result_queue, logger,
+            ec_nixl_host=ec_nixl_host, ec_nixl_port=ec_nixl_port,
         )
     )
 
@@ -325,12 +334,18 @@ async def _engine_loop_async(
     request_queue: "mp.Queue",
     result_queue: "mp.Queue",
     logger: logging.Logger,
+    ec_nixl_host: str = "127.0.0.1",
+    ec_nixl_port: int = 15100,
 ):
     ec_transfer_config = ECTransferConfig(
         ec_connector=ec_connector,
         ec_role=ec_role,
         ec_buffer_device="cpu",
-        ec_connector_extra_config={"shared_storage_path": ec_shared_path},
+        ec_connector_extra_config={
+            "shared_storage_path": ec_shared_path,
+            "side_channel_host": ec_nixl_host,
+            "side_channel_port": ec_nixl_port,
+        },
     )
     engine_args = AsyncEngineArgs(
         model=model_id,
@@ -360,6 +375,8 @@ def _run_disaggregated(
     max_model_len: int | None,
     ec_connector: str,
     ec_shared_path: str,
+    ec_nixl_host: str = "127.0.0.1",
+    ec_nixl_port: int = 15100,
 ):
     """Spawn a producer and a consumer process, coordinate requests between them.
 
@@ -383,12 +400,14 @@ def _run_disaggregated(
         target=_engine_loop,
         args=(model_id, max_model_len, ec_connector, "ec_producer",
               ec_shared_path, producer_req_q, producer_res_q),
+        kwargs={"ec_nixl_host": ec_nixl_host, "ec_nixl_port": ec_nixl_port},
         daemon=False,
     )
     consumer_proc = ctx.Process(
         target=_engine_loop,
         args=(model_id, max_model_len, ec_connector, "ec_consumer",
               ec_shared_path, consumer_req_q, consumer_res_q),
+        kwargs={"ec_nixl_host": ec_nixl_host, "ec_nixl_port": ec_nixl_port},
         daemon=False,
     )
 
@@ -451,6 +470,9 @@ def entry_point(
     ec_connector: str | None = None,
     ec_role: str | None = None,
     ec_shared_path: str = "/tmp/ec_cache",
+    # NIXL side-channel settings (only used with RblnECNixlConnector)
+    ec_nixl_host: str = "127.0.0.1",
+    ec_nixl_port: int = 15100,
 ):
     if ec_connector and not ec_role:
         # Auto disaggregation: spawn producer + consumer in this process
@@ -460,6 +482,8 @@ def entry_point(
             max_model_len=max_model_len,
             ec_connector=ec_connector,
             ec_shared_path=ec_shared_path,
+            ec_nixl_host=ec_nixl_host,
+            ec_nixl_port=ec_nixl_port,
         )
     else:
         # Single-engine mode: no EC, or manually specified ec_role
@@ -471,6 +495,8 @@ def entry_point(
                 ec_connector=ec_connector,
                 ec_role=ec_role,
                 ec_shared_path=ec_shared_path,
+                ec_nixl_host=ec_nixl_host,
+                ec_nixl_port=ec_nixl_port,
             )
         )
 

@@ -1,0 +1,747 @@
+# Copyright 2025 Rebellions Inc. All rights reserved.
+
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at:
+
+#     http://www.apache.org/licenses/LICENSE-2.0
+
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+RblnECNixlConnector: NIXL-based EC (Encoder Cache) disaggregation connector.
+
+Architecture
+------------
+EC disaggregation splits vision-language model execution across two processes:
+
+  Producer  → runs the vision encoder (_preprocess_prefill)
+            → saves encoder outputs (inputs_embeds, position_embed, rope_deltas)
+              to an EC cache keyed by mm_hash
+            → exposes the cache via NIXL over RDMA (UCX backend)
+
+  Consumer  → receives requests with the same mm_hash
+            → uses NIXL to pull encoder cache from producer
+            → runs prefill_decoder + decoder phases only
+
+Transfer flow per request
+-------------------------
+  1. Producer encodes image → encoder_cache[mm_hash] populated
+  2. Producer registers tensor memory with NIXL (dynamic, per mm_hash)
+  3. Producer's side-channel (ZMQ ROUTER) publishes agent metadata
+  4. Consumer (on first request) fetches producer's agent metadata via ZMQ REQ
+  5. Consumer calls start_load_caches → initiates async NIXL pull (xfer)
+  6. Consumer polls get_finished until transfer completes
+  7. Consumer proceeds with prefill_decoder using the pulled tensors
+
+Design decisions
+----------------
+- Dynamic NIXL registration: EC tensors are variable-size (~45 MB typical for
+  Qwen2-VL-7B with 6400 visual tokens), making pre-allocated fixed buffers
+  impractical. Tensors are registered on first save and deregistered when the
+  request finishes.
+- Consumer Pull: consumer initiates the NIXL transfer; producer is passive
+  after registering memory. This matches the sequential flow where the
+  orchestrator ensures the producer finishes before sending the consumer's
+  request.
+- Separate side-channel port: configurable via ec_connector_extra_config to
+  avoid collision with the KV transfer side-channel used in PD disaggregation.
+- UCX backend: same as feat_pd_disag's RblnNixlConnector.
+- aligned_tensor: all CPU tensors are allocated via rebel.kv_cache.aligned_tensor
+  for efficient NPU DMA.
+
+Configuration example
+---------------------
+  ECTransferConfig(
+      ec_connector="RblnECNixlConnector",
+      ec_role="ec_producer",  # or "ec_consumer"
+      ec_buffer_device="cpu",
+      ec_connector_extra_config={
+          "side_channel_host": "127.0.0.1",
+          "side_channel_port": 15100,   # must differ from VLLM_NIXL_SIDE_CHANNEL_PORT
+          "backends": ["UCX"],
+          "producer_engine_id": "<uuid>",  # set by orchestrator if needed
+      },
+  )
+"""
+
+from __future__ import annotations
+
+import threading
+import time
+import uuid
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Iterator
+
+import msgspec
+import torch
+import zmq
+from rebel.kv_cache import aligned_tensor
+from vllm.config import VllmConfig
+from vllm.distributed.ec_transfer.ec_connector.base import (
+    ECConnectorBase,
+    ECConnectorMetadata,
+    ECConnectorRole,
+)
+from vllm.distributed.ec_transfer.ec_connector.example_connector import MMMeta
+from vllm.utils.network_utils import make_zmq_path, make_zmq_socket
+from vllm.v1.core.sched.output import SchedulerOutput
+
+from vllm_rbln.logger import init_logger
+
+if TYPE_CHECKING:
+    from vllm.v1.request import Request
+
+logger = init_logger(__name__)
+
+# ---------------------------------------------------------------------------
+# Side-channel constants
+# ---------------------------------------------------------------------------
+
+_GET_META_MSG = b"get_ec_meta_msg"
+_DEFAULT_SIDE_CHANNEL_HOST = "127.0.0.1"
+_DEFAULT_SIDE_CHANNEL_PORT = 15100  # separate from VLLM_NIXL_SIDE_CHANNEL_PORT
+_HANDSHAKE_TIMEOUT_MS = 10_000  # ZMQ recv timeout (ms)
+_XFER_POLL_INTERVAL_S = 0.001   # poll interval for async transfer completion
+
+# ---------------------------------------------------------------------------
+# Wire-protocol data classes (msgspec for zero-copy serialisation)
+# ---------------------------------------------------------------------------
+
+
+class ECNixlAgentMetadata(msgspec.Struct):
+    """Metadata sent from producer to consumer during NIXL handshake."""
+    engine_id: str
+    agent_metadata: bytes
+    # list of (mm_hash, key, base_addr, nbytes, device_id) tuples
+    registered_tensors: list
+
+
+class ECNixlHandshakePayload(msgspec.Struct):
+    """Wire payload sent from producer's ZMQ ROUTER to consumer's ZMQ REQ."""
+    agent_metadata_bytes: bytes
+
+
+# ---------------------------------------------------------------------------
+# Connector metadata (scheduler → worker)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ECNixlConnectorMetadata(ECConnectorMetadata):
+    """Metadata passed from scheduler to worker each step."""
+    # mm_hashes the consumer worker needs to pull from producer
+    mm_datas_to_load: list[MMMeta] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Scheduler-side implementation
+# ---------------------------------------------------------------------------
+
+
+class RblnECNixlConnectorScheduler(ECConnectorBase):
+    """Scheduler-side EC connector using NIXL for inter-process transfer.
+
+    Tracks which mm_hashes need to be loaded by the consumer worker and
+    runs a ZMQ ROUTER side-channel thread (producer only) to serve handshake
+    requests from the consumer.
+    """
+
+    def __init__(self, vllm_config: VllmConfig, role: ECConnectorRole):
+        super().__init__(vllm_config=vllm_config, role=role)
+
+        ec_cfg = vllm_config.ec_transfer_config
+        assert ec_cfg is not None
+
+        self._side_channel_host: str = ec_cfg.get_from_extra_config(
+            "side_channel_host", _DEFAULT_SIDE_CHANNEL_HOST
+        )
+        self._side_channel_port: int = ec_cfg.get_from_extra_config(
+            "side_channel_port", _DEFAULT_SIDE_CHANNEL_PORT
+        )
+
+        # mm_hash → num_encoder_tokens (consumer only: tracks what to load)
+        self._mm_datas_need_loads: dict[str, int] = {}
+
+        # Side-channel listener thread (producer only)
+        self._stop_event = threading.Event()
+        self._listener_thread: threading.Thread | None = None
+        # Populated by worker via update_agent_metadata()
+        self._encoded_agent_metadata: bytes | None = None
+
+        logger.info(
+            "RblnECNixlConnectorScheduler initialised (role=%s, side_channel=%s:%d)",
+            "producer" if self.is_producer else "consumer",
+            self._side_channel_host,
+            self._side_channel_port,
+        )
+
+    # ------------------------------------------------------------------
+    # Called by worker once it has completed NIXL registration
+    # ------------------------------------------------------------------
+
+    def update_agent_metadata(self, encoded_metadata: bytes) -> None:
+        """Start the side-channel listener with fresh agent metadata.
+
+        Called by the worker after it has registered EC tensors with NIXL
+        and encoded the ECNixlHandshakePayload.
+        """
+        if not self.is_producer:
+            return
+        self._encoded_agent_metadata = encoded_metadata
+        if self._listener_thread is None:
+            ready = threading.Event()
+            self._listener_thread = threading.Thread(
+                target=self._side_channel_listener,
+                args=(encoded_metadata, ready, self._stop_event,
+                      self._side_channel_host, self._side_channel_port),
+                daemon=True,
+                name="ec_nixl_handshake_listener",
+            )
+            self._listener_thread.start()
+            ready.wait()
+            logger.info(
+                "EC NIXL side-channel listener started on %s:%d",
+                self._side_channel_host, self._side_channel_port,
+            )
+
+    def shutdown(self) -> None:
+        self._stop_event.set()
+        if self._listener_thread is not None:
+            self._listener_thread.join(timeout=5)
+            self._listener_thread = None
+
+    # ------------------------------------------------------------------
+    # ECConnectorBase interface - scheduler side
+    # ------------------------------------------------------------------
+
+    def has_cache_item(self, identifier: str) -> bool:
+        """Always return False: consumer must always pull from producer.
+
+        With NIXL, the producer registers tensors after encoding and the
+        consumer pulls on demand. We never have a local disk cache to check.
+        """
+        return False
+
+    def update_state_after_alloc(self, request: "Request", index: int) -> None:
+        mm_hash = request.mm_features[index].identifier
+        if not self.is_consumer or not self.has_cache_item(mm_hash):
+            return
+        num_tokens = request.get_num_encoder_embeds(index)
+        self._mm_datas_need_loads[mm_hash] = num_tokens
+
+    def build_connector_meta(
+        self, scheduler_output: SchedulerOutput
+    ) -> ECNixlConnectorMetadata:
+        meta = ECNixlConnectorMetadata()
+        for mm_hash, num_tokens in self._mm_datas_need_loads.items():
+            meta.mm_datas_to_load.append(
+                MMMeta.make_meta(mm_hash, num_tokens)
+            )
+        self._mm_datas_need_loads.clear()
+        return meta
+
+    # ------------------------------------------------------------------
+    # ECConnectorBase interface - worker side (not used on scheduler)
+    # ------------------------------------------------------------------
+
+    def start_load_caches(self, encoder_cache: dict[str, Any], **kwargs) -> None:
+        raise RuntimeError("start_load_caches must be called on the worker connector")
+
+    def save_caches(self, encoder_cache: dict[str, Any], mm_hash: str, **kwargs) -> None:
+        raise RuntimeError("save_caches must be called on the worker connector")
+
+    # ------------------------------------------------------------------
+    # Static side-channel listener (ZMQ ROUTER)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _side_channel_listener(
+        encoded_metadata: bytes,
+        ready_event: threading.Event,
+        stop_event: threading.Event,
+        host: str,
+        port: int,
+    ) -> None:
+        path = make_zmq_path("tcp", host, port)
+        logger.debug("EC NIXL side-channel listening on %s", path)
+        with _zmq_ctx(zmq.ROUTER, path) as sock:
+            sock.setsockopt(zmq.RCVTIMEO, 1000)
+            ready_event.set()
+            while not stop_event.is_set():
+                try:
+                    identity, _, msg = sock.recv_multipart()
+                except zmq.Again:
+                    continue
+                if msg == _GET_META_MSG:
+                    sock.send_multipart((identity, b"", encoded_metadata))
+                else:
+                    logger.warning("EC side-channel got unexpected message: %s", msg)
+
+
+# ---------------------------------------------------------------------------
+# Worker-side implementation
+# ---------------------------------------------------------------------------
+
+
+class RblnECNixlConnectorWorker(ECConnectorBase):
+    """Worker-side EC connector using NIXL for RDMA-based encoder cache transfer.
+
+    Producer side:
+      - After save_caches() is called, registers the EC tensors with NIXL
+        and notifies the scheduler to start the side-channel listener.
+
+    Consumer side:
+      - On first request, performs a ZMQ handshake with the producer to
+        obtain NIXL agent metadata.
+      - start_load_caches() initiates async NIXL pulls.
+      - get_finished() polls for completion and copies results into
+        encoder_cache.
+    """
+
+    def __init__(self, vllm_config: VllmConfig, role: ECConnectorRole):
+        super().__init__(vllm_config=vllm_config, role=role)
+
+        try:
+            from nixl._api import nixl_agent as NixlAgent  # type: ignore[import]
+        except ImportError as e:
+            raise RuntimeError(
+                "NIXL is not available. Install the nixl package to use "
+                "RblnECNixlConnector."
+            ) from e
+
+        ec_cfg = vllm_config.ec_transfer_config
+        assert ec_cfg is not None
+
+        self._side_channel_host: str = ec_cfg.get_from_extra_config(
+            "side_channel_host", _DEFAULT_SIDE_CHANNEL_HOST
+        )
+        self._side_channel_port: int = ec_cfg.get_from_extra_config(
+            "side_channel_port", _DEFAULT_SIDE_CHANNEL_PORT
+        )
+        self._backends: list[str] = ec_cfg.get_from_extra_config(
+            "backends", ["UCX"]
+        )
+
+        self._engine_id: str = str(uuid.uuid4())
+        self._nixl_agent = NixlAgent(self._engine_id, None)
+
+        # mm_hash → dict[tensor_key, aligned CPU tensor]
+        self._registered_caches: dict[str, dict[str, torch.Tensor]] = {}
+        # mm_hash → nixl descriptor list (for deregistration)
+        self._registered_descs: dict[str, Any] = {}
+
+        # Pending async NIXL transfer handles (consumer only)
+        # mm_hash → (handle, local_tensor_dict)
+        self._pending_loads: dict[str, tuple[Any, dict[str, torch.Tensor]]] = {}
+
+        # Pointer to the shared encoder_cache dict (set in start_load_caches)
+        self._encoder_cache: dict[str, Any] | None = None
+
+        # Remote producer agent name (consumer only, set after handshake)
+        self._remote_agent_name: str | None = None
+        # Remote tensor registry: mm_hash → {key: (base_addr, size, device_id)}
+        self._remote_tensor_registry: dict[str, dict[str, tuple[int, int, int]]] = {}
+
+        # Side-channel listener (producer only, started by _publish_agent_metadata)
+        self._stop_event = threading.Event()
+        self._listener_thread: threading.Thread | None = None
+
+        logger.info(
+            "RblnECNixlConnectorWorker initialised (engine_id=%s, role=%s, backends=%s)",
+            self._engine_id,
+            "producer" if self.is_producer else "consumer",
+            self._backends,
+        )
+
+    # ------------------------------------------------------------------
+    # ECConnectorBase interface - worker side
+    # ------------------------------------------------------------------
+
+    def save_caches(
+        self,
+        encoder_cache: dict[str, Any],
+        mm_hash: str,
+        **kwargs,
+    ) -> None:
+        """Producer: register EC tensors with NIXL and update side-channel.
+
+        Called by the model runner after preprocess_prefill completes.
+        Tensors are dynamically registered on the first save for each mm_hash.
+        """
+        if not self.is_producer:
+            return
+        if mm_hash in self._registered_caches:
+            logger.debug("EC NIXL: mm_hash=%s already registered, skipping", mm_hash)
+            return
+
+        raw: dict[str, torch.Tensor] = encoder_cache[mm_hash]
+        if not isinstance(raw, dict):
+            raw = {"inputs_embeds": raw}
+
+        # Allocate aligned CPU tensors and copy data
+        aligned: dict[str, torch.Tensor] = {}
+        caches_data: list[tuple[int, int, int, str]] = []
+
+        for key, tensor in raw.items():
+            t = tensor.detach().cpu()
+            buf = aligned_tensor(t.numel()).reshape(t.shape)
+            buf.copy_(t)
+            aligned[key] = buf
+            caches_data.append((
+                buf.data_ptr(),        # base address
+                buf.numel() * buf.element_size(),  # size in bytes
+                0,                     # device_id 0 = CPU for NIXL DRAM
+                "",                    # label (unused)
+            ))
+
+        # Register with NIXL
+        descs = self._nixl_agent.get_reg_descs(caches_data, "DRAM")
+        self._nixl_agent.register_memory(descs, backends=self._backends)
+
+        self._registered_caches[mm_hash] = aligned
+        self._registered_descs[mm_hash] = descs
+
+        logger.debug(
+            "EC NIXL: registered %d tensors for mm_hash=%s (keys=%s)",
+            len(aligned), mm_hash, list(aligned.keys()),
+        )
+
+        # Notify scheduler to publish updated agent metadata
+        self._publish_agent_metadata()
+
+    def start_load_caches(
+        self,
+        encoder_cache: dict[str, Any],
+        **kwargs,
+    ) -> None:
+        """Consumer: initiate async NIXL pull for each pending mm_hash.
+
+        Called by the model runner before prefill_decoder.
+        Actual tensor data is available only after get_finished() returns.
+        """
+        if self.is_producer:
+            return
+
+        self._encoder_cache = encoder_cache
+        metadata = self._get_connector_metadata()
+        assert isinstance(metadata, ECNixlConnectorMetadata)
+
+        # Ensure we have a connection to the producer
+        if self._remote_agent_name is None:
+            self._do_handshake()
+
+        for mm_data in metadata.mm_datas_to_load:
+            mm_hash = mm_data.mm_hash
+            if mm_hash in encoder_cache or mm_hash in self._pending_loads:
+                continue
+            if mm_hash not in self._remote_tensor_registry:
+                logger.warning(
+                    "EC NIXL: mm_hash=%s not in remote registry, cannot pull",
+                    mm_hash,
+                )
+                continue
+
+            handle, local_bufs = self._initiate_pull(mm_hash)
+            self._pending_loads[mm_hash] = (handle, local_bufs)
+            logger.debug("EC NIXL: initiated pull for mm_hash=%s", mm_hash)
+
+    def get_finished(
+        self,
+        finished_req_ids: set[str],
+    ) -> tuple[set[str] | None, set[str] | None]:
+        """Poll pending NIXL transfers and move completed ones to encoder_cache."""
+        if not self._pending_loads or self._encoder_cache is None:
+            return None, None
+
+        completed: set[str] = set()
+        for mm_hash, (handle, local_bufs) in list(self._pending_loads.items()):
+            status = self._nixl_agent.get_xfer_status(handle)
+            if status == "nixl_success":
+                # Copy aligned CPU buffers into encoder_cache
+                self._encoder_cache[mm_hash] = {
+                    k: v.clone() for k, v in local_bufs.items()
+                }
+                self._nixl_agent.release_xfer_handle(handle)
+                del self._pending_loads[mm_hash]
+                completed.add(mm_hash)
+                logger.debug("EC NIXL: pull complete for mm_hash=%s", mm_hash)
+            elif status == "nixl_error":
+                logger.error("EC NIXL: transfer failed for mm_hash=%s", mm_hash)
+                self._nixl_agent.release_xfer_handle(handle)
+                del self._pending_loads[mm_hash]
+
+        return None, completed if completed else None
+
+    def request_finished(
+        self, request: "Request"
+    ) -> tuple[bool, dict[str, Any] | None]:
+        """Deregister NIXL memory for completed requests (producer only)."""
+        if not self.is_producer:
+            return False, None
+        for feature in request.mm_features:
+            mm_hash = feature.identifier
+            self._deregister_mm_hash(mm_hash)
+        return False, None
+
+    # ------------------------------------------------------------------
+    # NIXL helpers
+    # ------------------------------------------------------------------
+
+    def _publish_agent_metadata(self) -> None:
+        """Encode current agent metadata and start side-channel listener."""
+        if not self.is_producer:
+            return
+
+        # Build the registered tensor registry for the consumer
+        registered_tensors: list[tuple[str, str, int, int, int]] = []
+        for mm_hash, tensor_dict in self._registered_caches.items():
+            for key, buf in tensor_dict.items():
+                registered_tensors.append((
+                    mm_hash,
+                    key,
+                    buf.data_ptr(),
+                    buf.numel() * buf.element_size(),
+                    0,  # CPU device_id
+                ))
+
+        agent_meta = ECNixlAgentMetadata(
+            engine_id=self._engine_id,
+            agent_metadata=self._nixl_agent.get_agent_metadata(),
+            registered_tensors=registered_tensors,
+        )
+        encoder = msgspec.msgpack.Encoder()
+        payload = ECNixlHandshakePayload(
+            agent_metadata_bytes=encoder.encode(agent_meta)
+        )
+        encoded = encoder.encode(payload)
+
+        # Start (or restart) the side-channel listener thread
+        if self._listener_thread is not None:
+            self._stop_event.set()
+            self._listener_thread.join(timeout=5)
+            self._stop_event.clear()
+
+        ready = threading.Event()
+        self._listener_thread = threading.Thread(
+            target=RblnECNixlConnectorScheduler._side_channel_listener,
+            args=(encoded, ready, self._stop_event,
+                  self._side_channel_host, self._side_channel_port),
+            daemon=True,
+            name="ec_nixl_handshake_listener",
+        )
+        self._listener_thread.start()
+        ready.wait()
+        logger.info(
+            "EC NIXL side-channel listener started on %s:%d",
+            self._side_channel_host, self._side_channel_port,
+        )
+
+    def _do_handshake(self) -> None:
+        """Consumer: fetch producer's NIXL agent metadata via ZMQ REQ."""
+        path = make_zmq_path("tcp", self._side_channel_host, self._side_channel_port)
+        logger.info("EC NIXL: performing handshake with producer at %s", path)
+
+        deadline = time.monotonic() + _HANDSHAKE_TIMEOUT_MS / 1000
+        payload: ECNixlHandshakePayload | None = None
+
+        while time.monotonic() < deadline:
+            try:
+                with _zmq_ctx(zmq.REQ, path) as sock:
+                    sock.setsockopt(zmq.RCVTIMEO, 2000)
+                    sock.send(_GET_META_MSG)
+                    raw = sock.recv()
+                decoder = msgspec.msgpack.Decoder(ECNixlHandshakePayload)
+                payload = decoder.decode(raw)
+                break
+            except (zmq.Again, zmq.ZMQError, msgspec.DecodeError) as exc:
+                logger.debug("EC NIXL: handshake attempt failed (%s), retrying ...", exc)
+                time.sleep(0.5)
+
+        if payload is None:
+            raise RuntimeError(
+                f"EC NIXL handshake with producer timed out after "
+                f"{_HANDSHAKE_TIMEOUT_MS}ms"
+            )
+
+        meta_decoder = msgspec.msgpack.Decoder(ECNixlAgentMetadata)
+        agent_meta: ECNixlAgentMetadata = meta_decoder.decode(
+            payload.agent_metadata_bytes
+        )
+
+        # Register the remote producer as a NIXL agent
+        self._remote_agent_name = self._nixl_agent.add_remote_agent(
+            agent_meta.agent_metadata
+        )
+        logger.info(
+            "EC NIXL: registered remote producer (engine_id=%s, agent=%s)",
+            agent_meta.engine_id, self._remote_agent_name,
+        )
+
+        # Build local registry of remote tensor addresses
+        self._remote_tensor_registry.clear()
+        for mm_hash, key, base_addr, nbytes, device_id in agent_meta.registered_tensors:
+            if mm_hash not in self._remote_tensor_registry:
+                self._remote_tensor_registry[mm_hash] = {}
+            self._remote_tensor_registry[mm_hash][key] = (base_addr, nbytes, device_id)
+
+        logger.info(
+            "EC NIXL: handshake complete — %d mm_hashes available from producer",
+            len(self._remote_tensor_registry),
+        )
+
+    def _initiate_pull(
+        self, mm_hash: str
+    ) -> tuple[Any, dict[str, torch.Tensor]]:
+        """Prepare local buffers and start an async NIXL pull from producer."""
+        remote_tensors = self._remote_tensor_registry[mm_hash]
+
+        local_bufs: dict[str, torch.Tensor] = {}
+        local_descs_data: list[tuple[int, int, int, str]] = []
+        remote_descs_data: list[tuple[int, int, int, str]] = []
+
+        for key, (base_addr, nbytes, device_id) in remote_tensors.items():
+            # Allocate aligned local buffer matching remote tensor size
+            numel = nbytes // 2  # bfloat16 = 2 bytes per element
+            buf = aligned_tensor(numel)
+            local_bufs[key] = buf
+            local_descs_data.append((buf.data_ptr(), nbytes, 0, ""))
+            remote_descs_data.append((base_addr, nbytes, device_id, ""))
+
+        # Build NIXL transfer descriptor lists
+        local_descs = self._nixl_agent.get_xfer_descs(local_descs_data, "DRAM")
+        remote_descs = self._nixl_agent.get_xfer_descs(remote_descs_data, "DRAM")
+
+        # Register local destination buffers
+        local_reg_descs = self._nixl_agent.get_reg_descs(local_descs_data, "DRAM")
+        self._nixl_agent.register_memory(local_reg_descs, backends=self._backends)
+        self._registered_descs[f"_consumer_{mm_hash}"] = local_reg_descs
+
+        # Initiate async NIXL READ (consumer pulls from producer)
+        handle = self._nixl_agent.make_prepped_xfer(
+            "NIXL_READ",
+            self._remote_agent_name,
+            local_descs,
+            remote_descs,
+            notif_msg=b"",
+        )
+        status = self._nixl_agent.transfer(handle)
+        if status == "nixl_error":
+            raise RuntimeError(f"EC NIXL: transfer initiation failed for mm_hash={mm_hash}")
+
+        return handle, local_bufs
+
+    def _deregister_mm_hash(self, mm_hash: str) -> None:
+        """Deregister NIXL memory for a completed mm_hash (producer only)."""
+        if mm_hash in self._registered_descs:
+            try:
+                self._nixl_agent.deregister_memory(self._registered_descs.pop(mm_hash))
+            except Exception as exc:
+                logger.warning(
+                    "EC NIXL: failed to deregister mm_hash=%s: %s", mm_hash, exc
+                )
+        self._registered_caches.pop(mm_hash, None)
+
+    # ------------------------------------------------------------------
+    # Unused scheduler-side stubs (required by abstract base)
+    # ------------------------------------------------------------------
+
+    def has_cache_item(self, identifier: str) -> bool:
+        raise RuntimeError("has_cache_item must be called on the scheduler connector")
+
+    def update_state_after_alloc(self, request: "Request", index: int) -> None:
+        raise RuntimeError("update_state_after_alloc must be called on the scheduler connector")
+
+    def build_connector_meta(self, scheduler_output: SchedulerOutput) -> ECConnectorMetadata:
+        raise RuntimeError("build_connector_meta must be called on the scheduler connector")
+
+
+# ---------------------------------------------------------------------------
+# Top-level connector: instantiates scheduler or worker based on role
+# ---------------------------------------------------------------------------
+
+
+class RblnECNixlConnector(ECConnectorBase):
+    """Entry point registered with ECConnectorFactory.
+
+    Delegates to RblnECNixlConnectorScheduler or RblnECNixlConnectorWorker
+    depending on the role assigned by vLLM's engine infrastructure.
+    """
+
+    def __init__(self, vllm_config: VllmConfig, role: ECConnectorRole):
+        super().__init__(vllm_config=vllm_config, role=role)
+
+        if role == ECConnectorRole.SCHEDULER:
+            self._impl: ECConnectorBase = RblnECNixlConnectorScheduler(
+                vllm_config, role
+            )
+        elif role == ECConnectorRole.WORKER:
+            self._impl = RblnECNixlConnectorWorker(vllm_config, role)
+        else:
+            raise ValueError(f"Unknown ECConnectorRole: {role}")
+
+        logger.info(
+            "RblnECNixlConnector created (role=%s)", role.name
+        )
+
+    # ------------------------------------------------------------------
+    # Delegate all interface methods to the appropriate impl
+    # ------------------------------------------------------------------
+
+    def has_cache_item(self, identifier: str) -> bool:
+        return self._impl.has_cache_item(identifier)
+
+    def update_state_after_alloc(self, request: "Request", index: int) -> None:
+        self._impl.update_state_after_alloc(request, index)
+
+    def build_connector_meta(self, scheduler_output: SchedulerOutput) -> ECConnectorMetadata:
+        return self._impl.build_connector_meta(scheduler_output)
+
+    def start_load_caches(self, encoder_cache: dict[str, Any], **kwargs) -> None:
+        self._impl.start_load_caches(encoder_cache, **kwargs)
+
+    def save_caches(self, encoder_cache: dict[str, Any], mm_hash: str, **kwargs) -> None:
+        self._impl.save_caches(encoder_cache, mm_hash, **kwargs)
+
+    def get_finished(
+        self, finished_req_ids: set[str]
+    ) -> tuple[set[str] | None, set[str] | None]:
+        return self._impl.get_finished(finished_req_ids)
+
+    def request_finished(
+        self, request: "Request"
+    ) -> tuple[bool, dict[str, Any] | None]:
+        return self._impl.request_finished(request)
+
+    def bind_connector_metadata(self, metadata: ECConnectorMetadata) -> None:
+        self._impl.bind_connector_metadata(metadata)
+
+    def clear_connector_metadata(self) -> None:
+        self._impl.clear_connector_metadata()
+
+
+# ---------------------------------------------------------------------------
+# ZMQ context manager (mirrors nixl_connector.py's zmq_ctx helper)
+# ---------------------------------------------------------------------------
+
+
+@contextmanager
+def _zmq_ctx(socket_type: int, addr: str) -> Iterator[zmq.Socket]:
+    """Context manager for a ZMQ socket (ROUTER binds, REQ connects)."""
+    ctx: zmq.Context | None = None
+    try:
+        ctx = zmq.Context()
+        yield make_zmq_socket(
+            ctx=ctx,
+            path=addr,
+            socket_type=socket_type,
+            bind=socket_type == zmq.ROUTER,
+        )
+    finally:
+        if ctx is not None:
+            ctx.destroy(linger=0)

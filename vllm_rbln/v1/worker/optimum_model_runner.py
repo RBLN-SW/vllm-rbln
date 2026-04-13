@@ -337,7 +337,6 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             )
 
         with record_function_or_nullcontext("rbln_model_runner: forward"):
-<<<<<<< Updated upstream
             if hasattr(rebel, "capture_reports"):
                 capture_ctx = rebel.capture_reports()
             else:
@@ -357,7 +356,6 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                     token_count=0,
                     # the performance of sampler doesn't depend on token count
                 )
-=======
             start_time = time.perf_counter()
             # FIXME model_input must be modified to be padded
             if (
@@ -371,7 +369,6 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                 )
             else:
                 hidden_states = self.model(model_input)
->>>>>>> Stashed changes
             sample_hidden_states = hidden_states.clone()
 
         with record_function_or_nullcontext("rbln_model_runner: postprocess"):
