@@ -304,7 +304,7 @@ class RBLNWorker(WorkerBase):
                     value.numel() * packed_num_elems * ratio * nbits_per_param // 8
                 )
 
-        logger.info("n_model_bytes = %.2f GB", n_model_bytes / 10**9)
+        logger.info("n_model_bytes = %.2f GB", n_model_bytes / 1024**3)
 
         available_memory_estimate = estimate_available_memory(
             model_config=self.model_config,
@@ -315,7 +315,7 @@ class RBLNWorker(WorkerBase):
         )
 
         logger.info(
-            "available_memory_estimate = %.2f GB", available_memory_estimate / 10**9
+            "available_memory_estimate = %.2f GB", available_memory_estimate / 1024**3
         )
 
         return available_memory_estimate

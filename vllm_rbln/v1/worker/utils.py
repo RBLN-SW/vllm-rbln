@@ -82,8 +82,6 @@ def estimate_available_memory(
     num_key_value_heads = model_config.get_num_kv_heads(parallel_config)
     tp_size = parallel_config.tensor_parallel_size
 
-    # TODO(jongho): Update if target npu is REBEL.
-
     device_name = current_platform.get_device_name().lower()
     assert "rbln" in device_name
     if "ca" in device_name:
@@ -172,7 +170,10 @@ def estimate_available_memory(
         buffer = buffer_per_runtime_per_core * num_runtimes
     available_dram_bytes -= buffer
 
-    rsd_replicas = (rsd_size // num_key_value_heads) or 1
+    if "ca" in device_name:
+        rsd_replicas = (rsd_size // num_key_value_heads) or 1
+    else:
+        rsd_replicas = 1
     available_dram_bytes = available_dram_bytes // rsd_replicas
 
     check_oom(available_dram_bytes)
