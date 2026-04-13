@@ -37,7 +37,11 @@ from vllm.distributed import (
     init_distributed_environment,
     set_custom_all_reduce,
 )
-from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized
+from vllm.distributed.kv_transfer import (
+    ensure_kv_transfer_initialized,
+    get_kv_transfer_group,
+    has_kv_transfer_group,
+)
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.lora.request import LoRARequest
 from vllm.platforms import current_platform
@@ -509,6 +513,11 @@ class RBLNWorker(WorkerBase):
 
     def shutdown(self) -> None:
         logger.info("v1 rbln_worker shutdown called")
+        if has_kv_transfer_group():
+            try:
+                get_kv_transfer_group().shutdown()
+            except Exception as e:
+                logger.warning("KV connector shutdown failed: %s", e)
         if envs.VLLM_RBLN_METRICS:
             if self.model_runner.performance_tracker:
                 self.model_runner.performance_tracker.print_final_stats()

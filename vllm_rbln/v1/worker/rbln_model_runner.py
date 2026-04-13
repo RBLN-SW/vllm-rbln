@@ -18,9 +18,9 @@ import os
 import time
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from copy import copy, deepcopy
-from typing import TYPE_CHECKING, Any, NamedTuple, Union, cast
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Union, cast
 
 import numpy as np
 import rebel
@@ -37,7 +37,6 @@ except ImportError:
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
-from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
 from vllm.distributed.parallel_state import get_dp_group, get_pp_group, get_tp_group
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.attention import Attention
@@ -330,6 +329,9 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.kv_caches: list[torch.Tensor] = []
         self.kv_cache_bases: list[torch.Tensor] = []
         self.kv_cache_view_infos: list[KVCacheViewInfo] = []
+        # Set by uniform kv cache allocation path; remain None in fallback.
+        self.cross_layers_kv_cache: torch.Tensor | None = None
+        self.cross_layers_attn_backend: type[AttentionBackend] | None = None
         # indexes: [kv_cache_group_id][attn_group]
         self.attn_groups: list[list[AttentionGroup]] = []
         # self.kv_cache_config: KVCacheConfig
@@ -2595,6 +2597,25 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             invalid_req_indices,
         )
 
+    @staticmethod
+    def maybe_get_kv_connector_output(
+        scheduler_output: "SchedulerOutput",
+        defer_finalize: bool = False,
+    ) -> AbstractContextManager[KVConnectorOutput | None]:
+        """Override upstream helper to bypass it during compilation warmup.
+
+        During warmup, ``scheduler_output.kv_connector_metadata`` is ``None``
+        and the upstream helper would raise its ``assert ... is not None``.
+        """
+        warm_up_phase = scheduler_output.kv_connector_metadata is None
+        return (
+            KVConnectorModelRunnerMixin._get_kv_connector_output(
+                scheduler_output, defer_finalize=defer_finalize
+            )
+            if has_kv_transfer_group() and not warm_up_phase
+            else nullcontext()
+        )
+
     def _get_slot_mappings(
         self,
         num_tokens_padded: int,
@@ -2710,7 +2731,11 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 self._process_kv_cache_copy_ops(scheduler_output.kv_cache_copy_ops)
 
             if not num_scheduled_tokens:
-                if not has_kv_transfer_group():
+                # During compilation warmup, kv_connector_metadata is None.
+                # Treat it like "no kv_transfer_group" to avoid firing the
+                # connector's assertions during warmup.
+                warm_up_phase = scheduler_output.kv_connector_metadata is None
+                if not has_kv_transfer_group() or warm_up_phase:
                     # Return empty ModelRunnerOutput if there's no work to do.
                     return EMPTY_MODEL_RUNNER_OUTPUT
                 return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
@@ -4440,7 +4465,43 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 )
             else:
                 kv_transfer_group.register_kv_caches(kv_caches)
-            kv_transfer_group.set_host_xfer_buffer_ops(copy_kv_blocks)
+
+            # Upstream's ``copy_kv_blocks`` is CUDA-only.  Define an RBLN-
+            # equivalent that uses the rebel runtime via ``runtime_holder``.
+            def rbln_copy_kv_blocks(
+                src_kv_caches: dict[str, torch.Tensor],
+                dst_kv_caches: dict[str, torch.Tensor],
+                src_block_ids: list[int],
+                dst_block_ids: list[int],
+                direction: Literal["h2d", "d2h"],
+            ) -> None:
+                if (
+                    not src_kv_caches
+                    or not dst_kv_caches
+                    or not src_block_ids
+                    or not dst_block_ids
+                    or len(src_block_ids) != len(dst_block_ids)
+                ):
+                    return
+                assert len(self.runtime_holder) > 0
+                runtime = self.runtime_holder[0]
+                if direction == "h2d":
+                    kv_caches_ = src_kv_caches
+                    copy_fn = runtime._update_kv_cache
+                else:
+                    kv_caches_ = dst_kv_caches
+                    copy_fn = runtime._fetch_kv_cache
+                for idx in src_block_ids:
+                    for kv_name, kv_cache in kv_caches_.items():
+                        block_size = kv_cache.shape[-2]
+                        copy_fn(kv_cache.data_ptr(), idx, 0, block_size, kv_name)
+
+            kv_transfer_group.set_host_xfer_buffer_ops(rbln_copy_kv_blocks)
+
+            # Pass runtime_holder reference to LMCache's RBLNConnector so it
+            # can lazily access the rebel runtime after compilation completes.
+            if hasattr(kv_transfer_group, "set_runtime_holder"):
+                kv_transfer_group.set_runtime_holder(self.runtime_holder)
 
         if self.dcp_world_size > 1:
             layer_type = cast(type[Any], AttentionLayerBase)
