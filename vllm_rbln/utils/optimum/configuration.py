@@ -98,14 +98,17 @@ def sync_vllm_from_rbln_config(
                 max_model_len,
             )
 
-    if vllm_config.scheduler_config.max_num_batched_tokens != target_max_num_batched_tokens:
+    cur = vllm_config.scheduler_config.max_num_batched_tokens
+    if cur != target_max_num_batched_tokens:
         logger.info(
-            "Updating scheduler_config.max_num_batched_tokens from %s to "
-            "%d based on rbln_config.json",
-            vllm_config.scheduler_config.max_num_batched_tokens,
+            "Updating scheduler_config.max_num_batched_tokens "
+            "from %s to %d based on rbln_config.json",
+            cur,
             target_max_num_batched_tokens,
         )
-        vllm_config.scheduler_config.max_num_batched_tokens = target_max_num_batched_tokens
+        vllm_config.scheduler_config.max_num_batched_tokens = (
+            target_max_num_batched_tokens
+        )
 
     if vllm_config.model_config.max_model_len != max_model_len:
         logger.info(
