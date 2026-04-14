@@ -40,7 +40,7 @@ from vllm_rbln.logger import init_logger
 from vllm_rbln.utils.optimum.cache_blocks import sync_num_blocks
 from vllm_rbln.utils.optimum.rbln_params import get_rbln_params
 from vllm_rbln.v1.worker.optimum_model_runner import RBLNOptimumModelRunner
-from vllm_rbln.v1.worker.utils import set_cpu_affinity, set_omp_num_threads
+from vllm_rbln.v1.worker.utils import set_omp_num_threads
 
 logger = init_logger(__name__)
 
@@ -126,10 +126,30 @@ class RBLNOptimumWorker(WorkerBase):
 
             set_omp_num_threads(self.rank, self.local_rank, num_threads)
         else:
-            # Bare metal: use NUMA-aware binding
-            set_cpu_affinity(self.rank, self.local_rank, self.parallel_config)
-            allocated_cpus = len(os.sched_getaffinity(0))
-            set_omp_num_threads(self.rank, self.local_rank, max(2, allocated_cpus))
+            # Bare metal: use physical cores only (exclude HT siblings).
+            # Skip set_cpu_affinity to avoid restricting the process to a
+            # single NUMA node, which causes severe latency regression on
+            # high-core-count servers (e.g. 128 core → 32x slower).
+            num_threads = max(2, allocated_cpus // 2)
+            logger.info(
+                "Bare metal detected (%d CPUs). "
+                "Skipping set_cpu_affinity, setting threads to %d "
+                "(physical cores only, excluding HT).",
+                allocated_cpus,
+                num_threads,
+            )
+
+            # Set all thread pool environment variables
+            os.environ["OMP_NUM_THREADS"] = str(num_threads)
+            os.environ["MKL_NUM_THREADS"] = str(num_threads)
+            os.environ["OPENBLAS_NUM_THREADS"] = str(num_threads)
+            os.environ["NUMEXPR_MAX_THREADS"] = str(num_threads)
+            os.environ["RBLN_NUM_THREADS"] = str(num_threads)
+
+            # Directly set PyTorch thread counts
+            torch.set_num_threads(num_threads)
+
+            set_omp_num_threads(self.rank, self.local_rank, num_threads)
 
         # Sync numba and torch thread settings to avoid recompilation
         # caused by global state mismatch between the two runtimes
