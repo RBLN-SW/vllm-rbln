@@ -25,10 +25,7 @@ import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
 from vllm_rbln.model_executor.layers.fused_moe.all2all import (  # noqa: F401 — registers custom ops on import
     CCL_ALL2ALL_GROUP_ID,
-    prepare_recv_mask_matrix,
-    prepare_recv_mask_matrix_p2p,
     prepare_send_mask_matrix,
-    prepare_send_mask_matrix_p2p,
 )
 
 logger = init_logger(__name__)
@@ -495,41 +492,38 @@ def fused_moe_forward_rbln(
         all_routing_3d = masked_routing_weights_depadded.reshape(E, R, max_pad)
 
         # --- Step 4: CCL all2all dispatch ---
+        # Prepare per-rank router_logits slices
+        e = E // R  # local experts per rank
+        # send_rl: [E, max_pad] — this rank's local routing
+        send_rl = all_routing_3d[:, self.dp_rank, :]  # (E, max_pad)
+        # recv_rl: [e, R*max_pad] — local experts' routing across all ranks
+        e_start = self.dp_rank * e
+        recv_rl = all_routing_3d[e_start : e_start + e].reshape(e, R * max_pad)  # (e, T)
+
         # hidden_flat: [max_pad, H] (already padded above)
 
-        # ccl_send
-        send_buffer, recv_indices, send_sizes, recv_sizes = (
-            torch.ops.rbln_custom_ops.ccl_send_kernel(
+        # ccl_dispatch_send
+        send_buffer, send_sizes = (
+            torch.ops.rbln_custom_ops.ccl_dispatch_send(
                 hidden_flat,
-                all_routing_3d,
+                send_rl,
                 self.send_mask,
-                self.recv_mask,
                 self.dp_rank,
             )
         )
 
-        # ccl_all2all — branch on P2P vs recursive doubling
-        if envs.VLLM_RBLN_CCL_ALL2ALL_P2P:
-            recv_buffer = torch.ops.rbln_custom_ops.ccl_all2all_x_kernel(
-                send_buffer,
-                send_sizes,
-                self.dp_size,
-                CCL_ALL2ALL_GROUP_ID,
-            )
-        else:
-            recv_buffer = torch.ops.rbln_custom_ops.ccl_all2all_kernel(
-                send_buffer,
-                send_sizes,
-                recv_sizes,
-                self.dp_size,
-                CCL_ALL2ALL_GROUP_ID,
-            )
+        # ccl_all2all_x (naive P2P)
+        recv_buffer = torch.ops.rbln_custom_ops.ccl_all2all_x_kernel(
+            send_buffer,
+            send_sizes,
+            self.dp_size,
+            CCL_ALL2ALL_GROUP_ID,
+        )
 
-        # ccl_receive → unpacked: [R, t, H]
-        unpacked = torch.ops.rbln_custom_ops.ccl_receive_kernel(
+        # ccl_dispatch_receive → unpacked: [R, max_pad, H]
+        unpacked = torch.ops.rbln_custom_ops.ccl_dispatch_receive(
             recv_buffer,
-            recv_indices,
-            recv_sizes,
+            recv_rl,
             hidden_flat,
             self.dp_rank,
         )
@@ -671,46 +665,18 @@ def _fused_moe_init_with_all2all(self, *args, **kwargs):
     _original_fused_moe_init(self, *args, **kwargs)
     if self.dp_size > 1:
         R = self.dp_size
-        rank_id = self.dp_rank
         E = self.global_num_experts
-        if envs.VLLM_RBLN_CCL_ALL2ALL_P2P:
-            # Naive P2P (AllToAllX): send_mask (R, E), recv_mask (R, E)
-            self.register_buffer(
-                "send_mask",
-                torch.tensor(
-                    prepare_send_mask_matrix_p2p(R, rank_id, E),
-                    dtype=torch.float32,
-                ),
-            )
-            self.register_buffer(
-                "recv_mask",
-                torch.tensor(
-                    prepare_recv_mask_matrix_p2p(R, rank_id, E),
-                    dtype=torch.float32,
-                ),
-            )
-            mode_str = "P2P (AllToAllX)"
-        else:
-            # Recursive doubling (AllToAllV): send_mask (N, E), recv_mask (R, E)
-            self.register_buffer(
-                "send_mask",
-                torch.tensor(
-                    prepare_send_mask_matrix(R, rank_id, E),
-                    dtype=torch.float32,
-                ),
-            )
-            self.register_buffer(
-                "recv_mask",
-                torch.tensor(
-                    prepare_recv_mask_matrix(R, rank_id, E),
-                    dtype=torch.float32,
-                ),
-            )
-            mode_str = "recursive doubling (AllToAllV)"
+        self.register_buffer(
+            "send_mask",
+            torch.tensor(
+                prepare_send_mask_matrix(R, E),
+                dtype=torch.float32,
+            ),
+        )
         logger.info(
-            f"[RBLN] FusedMoE all2all masks registered ({mode_str}): "
-            f"R={R}, rank={rank_id}, E={E}, "
-            f"send_mask={self.send_mask.shape}, recv_mask={self.recv_mask.shape}"
+            f"[RBLN] FusedMoE all2all masks registered (P2P / dispatch): "
+            f"R={R}, E={E}, "
+            f"send_mask={self.send_mask.shape}"
         )
 
 
