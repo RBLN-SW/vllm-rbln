@@ -403,7 +403,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # router_logits = router_logits.view(-1, self.num_experts)
         # router_logits = router_logits.view(-1, self.moe.num_experts)
 
-        if layer.activation == "swigluoai":
+        activation = getattr(layer.activation, "value", layer.activation)
+        if activation == "swigluoai":
             expert_map_const = None
             if layer.expert_map is not None:
                 assert getattr(layer, "expert_map_const", None) is not None
