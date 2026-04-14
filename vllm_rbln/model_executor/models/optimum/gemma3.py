@@ -33,12 +33,6 @@ from .optimum_attention import HybridAttentionImageManager, HybridAttentionImage
 
 logger = init_logger(__name__)
 
-# Sentinel token ID for image boundary padding. Must be a non-negative value
-# that fits within u32 range, since vllm's FastIncrementalDetokenizer passes
-# prompt_token_ids to tokenizers.DecodeStream which expects u32 values.
-# Using a value beyond the vocab size (262208) so it won't collide with real tokens.
-# This is replaced with PAD_TOKEN_ID before model execution.
-IMG_PAD_TOKEN_ID = 2**30
 PAD_TOKEN_ID = 0
 
 
@@ -62,10 +56,8 @@ class RBLNGemma3MultiModalProcessor(Gemma3MultiModalProcessor):
                 - (image_start + padded_seq_len) % image_prefill_chunk_size
             )
             padded_seq_len += pad_needed
-        # To pad the image token
-        # not using pad_token_id
-        # NOTE: Left padding for Gemma3
-        prompt_ids = [IMG_PAD_TOKEN_ID] * padded_seq_len + prompt_ids
+        # Left padding for Gemma3 image boundary alignment
+        prompt_ids = [PAD_TOKEN_ID] * padded_seq_len + prompt_ids
         return prompt_ids
 
     def apply(self, *args, **kwargs):
@@ -108,7 +100,7 @@ class RBLNOptimumGemma3ForConditionalGeneration(
             decoder_batch_sizes=self.model.rbln_config.language_model.decoder_batch_sizes,
             num_blocks=self.kv_block_adapter._estimated_num_blocks(),
         )
-        self.strategy = HybridAttentionImageStrategy(IMG_PAD_TOKEN_ID)
+        self.strategy = HybridAttentionImageStrategy(PAD_TOKEN_ID)
         self.attention_manager: HybridAttentionImageManager = (
             HybridAttentionImageManager(self.strategy)
         )
@@ -134,21 +126,6 @@ class RBLNOptimumGemma3ForConditionalGeneration(
                 input_ids=input_ids,
             )
         )
-        # When processing input_ids, we initially pad them with IMG_PAD_TOKEN_ID
-        # instead of PAD_TOKEN_ID.
-        #
-        # IMG_PAD_TOKEN_ID does not have an embedding. It is used only to mark
-        # image boundaries and to prevent multiple images from being placed
-        # within the same attention window. It is used in generating
-        # attention mask during the prefill phase.
-        #
-        # PAD_TOKEN_ID, on the other hand, has a valid embedding and is used for
-        # standard padding.
-        #
-        # After the attention mask is generated, IMG_PAD_TOKEN_ID is replaced
-        # with PAD_TOKEN_ID.
-        input_ids = self.postprocess_input_ids(input_ids)
-
         kwargs = self.preprocess_for_decoder(
             is_prompt, block_tables, input_ids, position_ids
         )
@@ -270,8 +247,3 @@ class RBLNOptimumGemma3ForConditionalGeneration(
             num_patches=num_patches,
             resolve_bindings={"h": image_size, "w": image_size},
         )
-
-    def postprocess_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        is_image_pad_token = input_ids == IMG_PAD_TOKEN_ID
-        input_ids[is_image_pad_token] = PAD_TOKEN_ID
-        return input_ids

@@ -112,7 +112,7 @@ def prepare_vllm_for_compile(vllm_config: VllmConfig) -> None:
     # 1. block_size
     # Get proper block_size if not set by user
     hf_config = vllm_config.model_config.hf_config
-    if vllm_config.cache_config.block_size is None:
+    if not vllm_config.cache_config.user_specified_block_size:
         # Set block_size to 4096 for fast compilation
         if is_multi_modal(hf_config) or is_generation_arch(hf_config):
             vllm_config.cache_config.block_size = 4096
