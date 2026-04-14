@@ -14,7 +14,7 @@
 
 import torch
 import vllm.model_executor.layers.attention.attention as vllm_attn
-from vllm.attention.layer import MLAAttention
+from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.model_executor.layers.attention.attention import (
@@ -215,5 +215,18 @@ def _rbln_mla_attention_forward(
     )
 
 
+_original_mla_process_weights = MLAAttention.process_weights_after_loading
+
+
+def _rbln_mla_process_weights(self, act_dtype: torch.dtype) -> None:
+    _original_mla_process_weights(self, act_dtype)
+    # RBLN uses 4D weights for batched matmul: [1, N, P, L] / [1, N, L, V]
+    if hasattr(self, "W_UK_T"):
+        self.W_UK_T = self.W_UK_T.unsqueeze(0)
+    if hasattr(self, "W_UV"):
+        self.W_UV = self.W_UV.unsqueeze(0)
+
+
 MLAAttention.__init__ = _rbln_mla_attention_init
 MLAAttention.forward = _rbln_mla_attention_forward
+MLAAttention.process_weights_after_loading = _rbln_mla_process_weights

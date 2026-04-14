@@ -477,6 +477,7 @@ def load_deepseek_v2_weights(
     # Params for weights, fp8 weight scales, fp8 activation scales
     # (param_name, weight_name, expert_id, shard_id)
     expert_params_mapping = SharedFusedMoE.make_expert_params_mapping(
+        model=self,
         ckpt_gate_proj_name="gate_proj",
         ckpt_down_proj_name="down_proj",
         ckpt_up_proj_name="up_proj",
@@ -586,12 +587,14 @@ def load_llama4_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> se
     ]
     fused_experts_params = False
     expert_params_mapping = FusedMoE.make_expert_params_mapping(
+        model=self,
         ckpt_gate_proj_name="gate_proj",
         ckpt_down_proj_name="down_proj",
         ckpt_up_proj_name="up_proj",
         num_experts=self.num_experts,
     )
     expert_params_mapping_fused = FusedMoE.make_expert_params_mapping(
+        model=self,
         ckpt_gate_proj_name="gate_up_proj",
         ckpt_down_proj_name="down_proj",
         ckpt_up_proj_name="gate_up_proj",
@@ -772,6 +775,7 @@ def load_AXK1_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[
         stacked_params_mapping.extend(mla_params_mapping)
 
     expert_params_mapping = SharedFusedMoE.make_expert_params_mapping(
+        model=self,
         ckpt_gate_proj_name="gate_proj",
         ckpt_down_proj_name="down_proj",
         ckpt_up_proj_name="up_proj",

@@ -267,3 +267,44 @@ class CompressedTensorsW8A16Fp8MoEMethod(upstream.CompressedTensorsMoEMethod):
 
 
 upstream.CompressedTensorsW8A16Fp8MoEMethod = CompressedTensorsW8A16Fp8MoEMethod
+
+# ---------------------------------------------------------------------------
+# Override non-MoE CompressedTensorsW8A16Fp8 scheme to skip Marlin (GPU-only)
+# ---------------------------------------------------------------------------
+from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a16_fp8 import (  # noqa: E402
+    CompressedTensorsW8A16Fp8,
+)
+from vllm.model_executor.layers.quantization.utils.fp8_utils import (  # noqa: E402
+    process_fp8_weight_block_strategy,
+)
+from vllm.model_executor.layers.quantization.utils.w8a8_utils import (  # noqa: E402
+    convert_to_channelwise,
+)
+from vllm.model_executor.utils import replace_parameter  # noqa: E402
+
+_original_ct_fp8_process_weights = CompressedTensorsW8A16Fp8.process_weights_after_loading
+
+
+def _rbln_ct_fp8_process_weights(self, layer: torch.nn.Module) -> None:
+    weight = layer.weight
+    weight_scale = layer.weight_scale
+    size_k_first = True
+
+    if self.strategy == QuantizationStrategy.BLOCK:
+        size_k_first = False
+        weight, weight_scale = process_fp8_weight_block_strategy(
+            weight, weight_scale
+        )
+    else:
+        weight = weight.t()
+        if self.strategy == QuantizationStrategy.TENSOR:
+            weight_scale = convert_to_channelwise(
+                weight_scale, layer.logical_widths
+            )
+
+    replace_parameter(layer, "weight", weight.data)
+    replace_parameter(layer, "weight_scale", weight_scale.data)
+    # Skip prepare_fp8_layer_for_marlin -- Marlin GPU kernels are not used on RBLN
+
+
+CompressedTensorsW8A16Fp8.process_weights_after_loading = _rbln_ct_fp8_process_weights

@@ -17,10 +17,10 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_b
 from vllm.config import get_current_vllm_config
 from vllm.config.cache import CacheDType
 from vllm.model_executor.layers.linear import ColumnParallelLinear
-from vllm.v1.attention.backends.mla.common import (
+from vllm.model_executor.layers.attention.mla_attention import (
     MLACommonBackend,
-    MLACommonBaseImpl,
 )
+from vllm.v1.attention.backend import MLAAttentionImpl
 
 import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
@@ -159,13 +159,11 @@ class RBLNFlashAttnMLABackend(MLACommonBackend):
         return (num_blocks, block_size, head_size)
 
 
-class RBLNFlashAttnMLAImpl(MLACommonBaseImpl[RBLNFlashAttentionMetadata]):
+class RBLNFlashAttnMLAImpl(MLAAttentionImpl[RBLNFlashAttentionMetadata]):
     """RBLN MLA impl: Python cache write + torch SDPA for decode (prefill TODO).
 
-    Subclasses MLACommonBaseImpl only: MLACommonImpl.__init__ always enters a
-    FlashAttention/FlashInfer prefill branch that requires flash_attn_varlen_func,
-    which is absent on RBLN. Prefill is not supported here anyway; decode uses
-    _forward_decode and forward below.
+    Inherits from MLAAttentionImpl directly because MLACommonImpl.__init__
+    requires FlashAttention/FlashInfer which are unavailable on RBLN.
     """
 
     can_return_lse_for_decode: bool = True
@@ -193,27 +191,20 @@ class RBLNFlashAttnMLAImpl(MLACommonBaseImpl[RBLNFlashAttentionMetadata]):
         indexer=None,
         q_pad_num_heads: int | None = None,
     ) -> None:
-        super().__init__(
-            num_heads,
-            head_size,
-            scale,
-            num_kv_heads,
-            alibi_slopes,
-            sliding_window,
-            kv_cache_dtype,
-            logits_soft_cap,
-            attn_type,
-            kv_sharing_target_layer_name,
-            q_lora_rank,
-            kv_lora_rank,
-            qk_nope_head_dim,
-            qk_rope_head_dim,
-            qk_head_dim,
-            v_head_dim,
-            kv_b_proj,
-            indexer,
-            q_pad_num_heads,
-        )
+        self.num_heads = num_heads
+        self.head_size = head_size
+        self.scale = float(scale)
+        self.num_kv_heads = num_kv_heads
+        self.kv_cache_dtype = kv_cache_dtype
+        self.q_lora_rank = q_lora_rank
+        self.kv_lora_rank = kv_lora_rank
+        self.qk_nope_head_dim = qk_nope_head_dim
+        self.qk_rope_head_dim = qk_rope_head_dim
+        self.qk_head_dim = qk_head_dim
+        self.v_head_dim = v_head_dim
+        self.kv_b_proj = kv_b_proj
+        self.indexer = indexer
+        self.q_pad_num_heads = q_pad_num_heads
 
         unsupported_features = [alibi_slopes, sliding_window, logits_soft_cap]
         if any(unsupported_features):
@@ -269,24 +260,30 @@ class RBLNFlashAttnMLAImpl(MLACommonBaseImpl[RBLNFlashAttentionMetadata]):
                 "Batch attention non-optimization is not supported for MLA"
             )
 
-    def process_weights_after_loading(self, act_dtype: torch.dtype):
-        super().process_weights_after_loading(act_dtype)
-        if hasattr(self, "W_UK_T"):
-            self.W_UK_T = self.W_UK_T.unsqueeze(0)
-        if hasattr(self, "W_UV"):
-            self.W_UV = self.W_UV.unsqueeze(0)
+    def forward_mha(self, q, kv_c_normed, k_pe, kv_c_and_k_pe_cache,
+                    attn_metadata, k_scale, output):
+        raise NotImplementedError(
+            "RBLN MLA backend uses forward() directly")
 
-    def _v_up_proj(self, x: torch.Tensor):
+    def forward_mqa(self, q, kv_c_and_k_pe_cache, attn_metadata, layer):
+        raise NotImplementedError(
+            "RBLN MLA backend uses forward() directly")
+
+    def process_weights_after_loading(self, act_dtype: torch.dtype):
+        pass
+
+    def _v_up_proj(self, x: torch.Tensor, W_UV: torch.Tensor):
         """V-up projection.
 
         Args:
             x: torch.size([batch, num_heads, seq_len, kv_lora_rank])
+            W_UV: torch.size([1, num_heads, kv_lora_rank, v_head_dim])
 
         Returns:
             torch.size([batch, num_tokens, num_heads * v_head_dim]) (contiguous)
         """
         b_size, num_heads, seq_len, _ = x.size()
-        x = torch.matmul(x, self.W_UV)
+        x = torch.matmul(x, W_UV)
         x = x.transpose(1, 2).reshape(b_size, seq_len, num_heads * self.v_head_dim)
         return x
 
@@ -318,7 +315,7 @@ class RBLNFlashAttnMLAImpl(MLACommonBaseImpl[RBLNFlashAttentionMetadata]):
         )
 
         decode_q_nope = decode_q_nope.transpose(1, 2)
-        decode_ql_nope = torch.matmul(decode_q_nope, self.W_UK_T)
+        decode_ql_nope = torch.matmul(decode_q_nope, layer.W_UK_T)
         decode_q_pe = decode_q_pe.transpose(1, 2)
         q = torch.cat([decode_ql_nope, decode_q_pe], dim=-1)
         k_pe = k_pe.squeeze(2)
@@ -384,4 +381,4 @@ class RBLNFlashAttnMLAImpl(MLACommonBaseImpl[RBLNFlashAttentionMetadata]):
                 f"{expected}; kernel must return V-space layout for o_proj."
             )
 
-        return self._v_up_proj(attn_output)
+        return self._v_up_proj(attn_output, layer.W_UV)
