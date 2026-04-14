@@ -11,11 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import contextlib
 import logging
 import time
 from typing import TYPE_CHECKING, NamedTuple, Union, cast
 
 import numpy as np
+import rebel
 import torch
 import torch.distributed
 import torch.nn as nn
@@ -240,8 +242,8 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
         )
 
         if envs.VLLM_RBLN_METRICS:
-            self.performance_tracker = PerformanceTracker()
-            self.performance_tracker.register_cleanup()
+            self.model_performance_tracker = PerformanceTracker("MODEL")
+            self.sampler_performance_tracker = PerformanceTracker("SAMPLER")
 
         # Ephemeral state transferred
         # between execute_model() and sample_tokens().
@@ -309,22 +311,26 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
             )
 
         with record_function_or_nullcontext("rbln_model_runner: forward"):
-            start_time = time.perf_counter()
-            # FIXME model_input must be modified to be padded
-            hidden_states = self.model(model_input)
+            if hasattr(rebel, "capture_reports"):
+                capture_ctx = rebel.capture_reports()
+            else:
+                # use a dummy context manager that does nothing
+                capture_ctx = contextlib.nullcontext()
+            model_start_time = time.perf_counter()
+            with capture_ctx as model_reports:
+                # FIXME model_input must be modified to be padded
+                hidden_states = self.model(model_input)
+            if envs.VLLM_RBLN_METRICS and self.model_performance_tracker is not None:
+                self.collect_metrics(
+                    self.model_performance_tracker,
+                    model_input.is_prompt,
+                    start_time=model_start_time,
+                    end_time=time.perf_counter(),
+                    reports=model_reports,
+                    token_count=0,
+                    # the performance of sampler doesn't depend on token count
+                )
             sample_hidden_states = hidden_states.clone()
-            end_time = time.perf_counter()
-            if envs.VLLM_RBLN_METRICS:
-                # Record performance metrics
-                execution_time = end_time - start_time
-                if model_input.is_prompt:
-                    self.performance_tracker.record_prefill(
-                        execution_time, num_scheduled_tokens
-                    )
-                else:
-                    self.performance_tracker.record_decode(
-                        execution_time, num_scheduled_tokens
-                    )
 
         with record_function_or_nullcontext("rbln_model_runner: postprocess"):
             if self.is_pooling_model:
@@ -450,6 +456,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
             finished_requests_ids=list(finished_requests_ids),
             cached_block_tables=cached_block_tables,
             cached_lengths=cached_lengths,
+            # FIXME unify the variable name is_prefill and is_prompt
             is_prompt=is_prefill,
             dummy_block=scheduler_output.dummy_block,
         )
@@ -668,6 +675,10 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
 
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
+            # In case of sliding window / hybrid attention models,
+            # free the local block table id managed in the model's attention manager.
+            if getattr(self.model, "attention_manager", None):
+                self.model.attention_manager.pop(req_id)
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
         # scheduled_req_ids overlap. This happens when a request is aborted and
@@ -1304,7 +1315,24 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
                 padded_logits = logits.reshape(1, -1)
             else:
                 padded_logits = logits
-            sampler_output = self._sample(padded_logits, spec_decode_metadata=None)
+            sampler_start_time = time.perf_counter()
+            if hasattr(rebel, "capture_reports"):
+                capture_ctx = rebel.capture_reports()
+            else:
+                # use a dummy context manager that does nothing
+                capture_ctx = contextlib.nullcontext()
+            with capture_ctx as sampler_reports:
+                sampler_output = self._sample(padded_logits, spec_decode_metadata=None)
+            if envs.VLLM_RBLN_METRICS and self.sampler_performance_tracker is not None:
+                self.collect_metrics(
+                    self.sampler_performance_tracker,
+                    is_prompt,
+                    start_time=sampler_start_time,
+                    end_time=time.perf_counter(),
+                    reports=sampler_reports,
+                    token_count=0,
+                    # the performance of sampler doesn't depend on token count
+                )
         self.input_batch.prev_sampled_token_ids = None
 
         with record_function_or_nullcontext("rbln_model_runner: bookkeep"):
@@ -1477,3 +1505,37 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
             logprobs_tensors = LogprobsTensors(**dict)
 
         return num_sampled_tokens, sampled_token_ids, logprobs_tensors
+
+    def collect_metrics(
+        self,
+        performance_tracker: PerformanceTracker,
+        is_prefill: bool,
+        start_time: float,
+        end_time: float,
+        reports: list[dict],
+        token_count: int,
+    ) -> None:
+        execution_time = end_time - start_time
+        host_time = None
+        device_time = None
+        ccl_time = None
+        if reports is not None and len(reports) > 0:
+            host_time = reports[0].get("total_host", None)
+            device_time = reports[0].get("total_device", None)
+            ccl_time = reports[0].get("total_ccl", None)
+        if is_prefill:
+            performance_tracker.record_prefill(
+                execution_time,
+                token_count,
+                host_time=host_time,
+                device_time=device_time,
+                ccl_time=ccl_time,
+            )
+        else:
+            performance_tracker.record_decode(
+                execution_time,
+                token_count,
+                host_time=host_time,
+                device_time=device_time,
+                ccl_time=ccl_time,
+            )

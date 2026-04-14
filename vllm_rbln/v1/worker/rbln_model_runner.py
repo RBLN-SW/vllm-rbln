@@ -530,6 +530,9 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         self.performance_tracker: PerformanceTracker | None = None
         self.sampler_performance_tracker: PerformanceTracker | None = None
+        self.e2e_performance_tracker: PerformanceTracker | None = None
+        self.e2e_start_time: float = 0.0
+        self.e2e_end_time: float = 0.0
 
         self.dummy_run_state: DummyRunState | None = None
 
@@ -541,9 +544,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     def _enable_performance_tracker(self):
         if envs.VLLM_RBLN_METRICS:
             self.performance_tracker = PerformanceTracker("MODEL")
-            self.performance_tracker.register_cleanup()
             self.sampler_performance_tracker = PerformanceTracker("SAMPLER")
-            self.sampler_performance_tracker.register_cleanup()
+            self.e2e_performance_tracker = PerformanceTracker("E2E")
 
     def _get_positions(self, num_tokens: Any):
         if isinstance(num_tokens, int):
@@ -1731,7 +1733,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         else:
             # use a dummy context manager that does nothing
             capture_ctx = contextlib.nullcontext()
-        start_time = time.perf_counter()
+        sampler_start_time = time.perf_counter()
         with capture_ctx as sampler_reports:
             if spec_decode_metadata is None:
                 sampler_output = self.sampler(
@@ -1752,7 +1754,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self.collect_metrics(
                 self.sampler_performance_tracker,
                 self.is_prefills()[0],
-                start_time=start_time,
+                start_time=sampler_start_time,
                 end_time=time.perf_counter(),
                 reports=sampler_reports,
                 token_count=0,
@@ -2496,6 +2498,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         intermediate_tensors: IntermediateTensors | None = None,
         num_padded_tokens: int | None = None,
     ) -> Union[ModelRunnerOutput, IntermediateTensors, None]:
+        self.e2e_start_time = time.perf_counter()
         if self.execute_model_state is not None:
             raise RuntimeError(
                 "State error: sample_tokens() must be called "
@@ -2668,7 +2671,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 LoRAMask.set_lora_mask(lora_mask)
                 LoRAInputs.set_sampler_indices_padded(sampler_indices_padded)
 
-            start_time = time.perf_counter()
+            model_start_time = time.perf_counter()
             with capture_ctx as reports:
                 if not self.use_wrapped_compute_logits():
                     model_output = self.model_executable(
@@ -2689,8 +2692,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     )
             if self.performance_tracker is not None:
                 # Record performance metrics
-                end_time = time.perf_counter()
-                execution_time = end_time - start_time
+                model_end_time = time.perf_counter()
+                model_execution_time = model_end_time - model_start_time
                 host_time = None
                 device_time = None
                 ccl_time = None
@@ -2702,7 +2705,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
                 if is_prefills[0]:
                     self.performance_tracker.record_prefill(
-                        execution_time,
+                        model_execution_time,
                         num_scheduled_tokens,
                         host_time=host_time,
                         device_time=device_time,
@@ -2715,7 +2718,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         and num_padded_tokens != batch_bucket_size
                     )
                     self.performance_tracker.record_decode(
-                        execution_time,
+                        model_execution_time,
                         num_scheduled_tokens,
                         host_time=host_time,
                         device_time=device_time,
@@ -2917,6 +2920,11 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 propose_draft_token_ids(sampled_token_ids)
 
         with record_function_or_nullcontext("Bookkeep"):
+            # NOTE:
+            # is_prefill is changed after bookkeeping
+            # so we need to get it before bookkeeping,
+            # and pass it to performance tracker.
+            is_prefills = self.is_prefills()
             (
                 num_nans_in_logits,
                 logprobs_lists,
@@ -2956,6 +2964,17 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             kv_connector_output=kv_connector_output,
             num_nans_in_logits=num_nans_in_logits,
         )
+
+        if self.e2e_performance_tracker is not None:
+            self.e2e_end_time = time.perf_counter()
+            self.collect_metrics(
+                self.e2e_performance_tracker,
+                is_prefills[0],
+                start_time=self.e2e_start_time,
+                end_time=self.e2e_end_time,
+                reports=[],
+                token_count=scheduler_output.total_num_scheduled_tokens,
+            )
 
         if not self.use_async_scheduling:
             return output
@@ -3692,11 +3711,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         """
         kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-            device = (
-                "cpu"
-                if envs.VLLM_RBLN_USE_CUSTOM_KERNEL or not envs.VLLM_RBLN_COMPILE_MODEL
-                else "meta"
-            )
+            # device = "cpu" if envs.VLLM_RBLN_USE_CUSTOM_KERNEL else "meta"
+            device = "cpu"
             tensor = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=device)
             for layer_name in kv_cache_tensor.shared_by:
                 kv_cache_raw_tensors[layer_name] = tensor

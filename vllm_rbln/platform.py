@@ -239,7 +239,9 @@ class RblnPlatform(Platform):
             )
 
             assert vllm_config.parallel_config.tensor_parallel_size == 1, (
-                "Tensor parallelism is set when compiled in optimum-rbln."
+                "Cannot set tensor_parallel_size for pre-compiled optimum-rbln models. "
+                "If you want to compile with tensor parallelism in vllm-rbln, "
+                "please use the `VLLM_RBLN_TP_SIZE` environment variable instead."
             )
             assert vllm_config.parallel_config.pipeline_parallel_size == 1, (
                 "Pipeline parallelism is not supported in optimum-rbln."
@@ -293,7 +295,15 @@ class RblnPlatform(Platform):
         if selected_backend and selected_backend != AttentionBackendEnum.FLASH_ATTN:
             logger.info("Cannot use %s backend on RBLN.", selected_backend)
         if attn_selector_config.use_mla:
-            raise NotImplementedError("MLA is not supported on RBLN.")
+            # FLASH_ATTN_MLA.get_path() defaults to upstream FlashAttn (CUDA).
+            # RBLN registers an override in flash_attention_mla only if that module
+            # is imported first; workers often resolve the backend before then.
+            attn_backend_cls = (
+                "vllm_rbln.v1.attention.backends.mla.flash_attn_mla."
+                "RBLNFlashAttnMLABackend"
+            )
+            logger.info("Using RBLN MLA Attention Backend: %s", attn_backend_cls)
+            return attn_backend_cls
         if attn_selector_config.use_sparse:
             raise NotImplementedError("Sparse Attention is not supported on RBLN.")
 

@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_USE_CUSTOM_KERNEL: bool = False
     VLLM_RBLN_AUTO_PORT: bool = True
     VLLM_RBLN_CCL_ALL2ALL_P2P: bool = False
+    VLLM_RBLN_MOE_REDUCE_SCATTER: bool = False
 
 
 def get_dp_impl() -> str:
@@ -253,6 +254,13 @@ environment_variables = {
     "VLLM_RBLN_USE_CUSTOM_KERNEL": (
         lambda: (
             os.environ.get("RBLN_USE_CUSTOM_KERNEL", "False").lower() in ("true", "1")
+        )
+    ),
+    # Use reduce_scatter instead of all_reduce in MoE combine phase
+    "VLLM_RBLN_MOE_REDUCE_SCATTER": (
+        lambda: (
+            os.environ.get("VLLM_RBLN_MOE_REDUCE_SCATTER", "False").lower()
+            in ("true", "1")
         )
     ),
     "VLLM_RBLN_PROFILER": (

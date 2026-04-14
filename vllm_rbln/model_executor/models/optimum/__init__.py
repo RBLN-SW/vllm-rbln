@@ -36,6 +36,8 @@ from .paligemma import RBLNOptimumPaliGemmaForConditionalGeneration  # noqa: F40
 from .qwen_vl import (  # noqa: F401
     RBLNOptimumQwen2_5_VLForConditionalGeneration,
     RBLNOptimumQwen2VLForConditionalGeneration,
+    RBLNOptimumQwen3VLForConditionalGeneration,
+    RBLNOptimumQwen3VLMoeForConditionalGeneration,
 )
 from .sliding_window import RBLNOptimumSlidingWindowAttentionForCausalLM  # noqa: F401
 from .whisper import RBLNOptimumWhisperForConditionalGeneration  # noqa: F401
@@ -50,7 +52,7 @@ _RBLN_OPTIMUM_MULTIMODAL_MODELS = {
 
 def load_model(vllm_config: VllmConfig) -> nn.Module:
     model_config = vllm_config.model_config
-
+    logger.info("Loading RBLN model from %s", model_config.model)
     if is_multi_modal(model_config.hf_config):
         assert vllm_config.cache_config.enable_prefix_caching in (False, None), (
             "Prefix caching is not supported with multimodal models. "

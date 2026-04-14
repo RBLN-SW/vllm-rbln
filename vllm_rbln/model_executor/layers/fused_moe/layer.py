@@ -51,6 +51,8 @@ if envs.VLLM_RBLN_MOE_USE_OPT_KERNEL:
         up_proj_bias: torch.Tensor | None = None,
         down_proj_bias: torch.Tensor | None = None,
         dp_mask: torch.Tensor | None = None,
+        n_group: int | None = None,
+        topk_group: int | None = None,
     ) -> torch.Tensor:
         """
         Customized MoE GLU operation (optimized kernel version).
@@ -92,6 +94,8 @@ if envs.VLLM_RBLN_MOE_USE_OPT_KERNEL:
         up_proj_bias: torch.Tensor | None = None,
         down_proj_bias: torch.Tensor | None = None,
         dp_mask: torch.Tensor | None = None,
+        n_group: int | None = None,
+        topk_group: int | None = None,
     ) -> torch.Tensor:
         return torch.empty_like(hidden_states)
 
@@ -342,6 +346,12 @@ def unquantized_fused_moe_method_custom(
 
     # transpose to [num_experts, num_tokens] for custom_moe_glu
     masked_routing_weights_t = masked_routing_weights.transpose(0, 1)
+    if layer.use_grouped_topk:
+        raise NotImplementedError("Grouped topk case is not supported")
+
+    masked_routing_weights, expert_select_count = get_masked_routing_weights(
+        router_logits, layer.top_k, layer.renormalize, layer.expert_map
+    )
 
     # compute expert_select_count from masked_routing_weights
     expert_select_count = (masked_routing_weights_t > 0).sum(dim=1).to(torch.int32)
@@ -355,7 +365,7 @@ def unquantized_fused_moe_method_custom(
         expert_select_count,
         None,
         None,
-        None,
+        None,ㅋ
         None,
     )
 
@@ -391,6 +401,20 @@ def unquantized_fused_optimize_moe_method_custom(
         expert_map_list = layer.expert_map.tolist()
         expert_map_const = torch.tensor(expert_map_list, dtype=torch.int32)
 
+    tokens_mask = None
+    use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
+    if use_moe_tokens_mask:
+        tokens_mask = get_tokens_mask(num_tokens)
+
+    if layer.use_grouped_topk:
+        n_group = layer.num_expert_group
+        topk_group = layer.topk_group
+    else:
+        n_group = None
+        topk_group = None
+
+    # optimum-rbln/src/optimum/rbln/transformers/models/qwen3_moe/
+    # qwen3_moe_architecture.py
     final_hidden_states = torch.ops.rbln_custom_ops.custom_moe_glu(
         hidden_states,
         gate_proj_weight,
@@ -401,7 +425,9 @@ def unquantized_fused_optimize_moe_method_custom(
         None,
         None,
         None,
-        None,
+        tokens_mask,
+        n_group,
+        topk_group,
     )
     return final_hidden_states.reshape(orig_shape)
 
