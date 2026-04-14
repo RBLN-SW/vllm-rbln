@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import os
 from typing import TYPE_CHECKING
 
@@ -253,6 +254,20 @@ class RblnPlatform(Platform):
             assert vllm_config.speculative_config is None, (
                 "Speculative decoding is not supported in optimum-rbln."
             )
+            # T5EncoderModel is encoder-only but inherits T5Config which has
+            # is_encoder_decoder=True. This causes vllm to route inputs
+            # through the enc-dec path, prepending decoder_start_token_id and
+            # breaking CLS pooling. Set it to False for pooling models.
+            # ModelConfig.is_encoder_decoder is a @cached_property that's
+            # already evaluated by this point, so invalidate the cache too.
+            hf_config = model_config.hf_config
+            if is_pooling_arch(hf_config) and getattr(
+                hf_config, "is_encoder_decoder", False
+            ):
+                hf_config.is_encoder_decoder = False
+                with contextlib.suppress(KeyError):
+                    del model_config.__dict__["is_encoder_decoder"]
+
             cls.disable_unsupported_prefix_caching(vllm_config)
             sync_with_rbln_config(vllm_config)
 
