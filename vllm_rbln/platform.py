@@ -369,3 +369,11 @@ class RblnPlatform(Platform):
     @classmethod
     def get_nixl_memory_type(cls) -> str | None:
         return "DRAM"
+
+    @classmethod
+    def discover_numa_topology(cls) -> list[list[int]]:
+        """
+        Discover NUMA topology and keep the last physical core of each numa
+        into one core group list for nixl start_kv_load()
+        """
+        return []

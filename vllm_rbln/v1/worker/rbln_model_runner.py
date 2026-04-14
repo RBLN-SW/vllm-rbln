@@ -207,7 +207,6 @@ class ExecuteModelState(NamedTuple):
     hidden_states: torch.Tensor
     sample_hidden_states: torch.Tensor | None
     aux_hidden_states: list[torch.Tensor] | None
-    kv_connector_output: KVConnectorOutput | None
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
 
 
@@ -1327,13 +1326,13 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             num_reqs
         )
 
-        is_first_request_prefill = self.is_first_request_prefill()
+        is_prefill_phase = self.is_prefill_phase()
         (batch_bucket_size, num_padded_tokens, num_tokens_across_dp) = (
             self.get_dp_padding(
                 total_num_scheduled_tokens,
                 initial_batch_bucket_size,
                 num_padded_tokens,
-                is_first_request_prefill,
+                is_prefill_phase,
             )
         )
         assert batch_bucket_size is not None
@@ -1413,7 +1412,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 if isinstance(builder, RBLNFlashAttentionMetadataBuilder):
                     extra_attn_metadata_args["positions"] = self.positions.cpu
                     extra_attn_metadata_args["batch_pad"] = batch_bucket_size
-                    extra_attn_metadata_args["is_prefill"] = is_first_request_prefill
+                    extra_attn_metadata_args["is_prefill"] = is_prefill_phase
                 attn_metadata_i = builder.build(
                     common_prefix_len=common_prefix_len,
                     common_attn_metadata=common_attn_metadata,
@@ -1864,7 +1863,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         if envs.VLLM_RBLN_METRICS and self.sampler_performance_tracker is not None:
             self.collect_metrics(
                 self.sampler_performance_tracker,
-                self.is_first_request_prefill(),
+                self.is_prefill_phase(),
                 start_time=sampler_start_time,
                 end_time=time.perf_counter(),
                 reports=sampler_reports,
@@ -2686,12 +2685,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     @staticmethod
     def maybe_get_kv_connector_output(
         scheduler_output: "SchedulerOutput",
-        wait_for_save: bool,
+        defer_finalize: bool = False,
     ) -> AbstractContextManager[KVConnectorOutput | None]:
         warm_up_phase = scheduler_output.kv_connector_metadata is None
         return (
             KVConnectorModelRunnerMixin._get_kv_connector_output(
-                scheduler_output, wait_for_save
+                scheduler_output, defer_finalize=defer_finalize
             )
             if has_kv_transfer_group() and not warm_up_phase
             else nullcontext()
@@ -2710,6 +2709,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 "State error: sample_tokens() must be called "
                 "after execute_model() returns None."
             )
+
+        if scheduler_output.preempted_req_ids and has_kv_transfer_group():
+            get_kv_transfer_group().handle_preemptions(
+                scheduler_output.preempted_req_ids
+            )
+
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with record_function_or_nullcontext("Preprocess"):
             self._update_states(scheduler_output)
@@ -2773,8 +2778,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             ) = self._preprocess(scheduler_output)
 
         assert input_ids is not None
-        is_first_request_prefill = self.is_first_request_prefill()
-        is_last_prefill_chunk = self.is_last_prefill_chunk()
+        is_prefill_phase = self.is_prefill_phase()
 
         # Padding length for speculative decoding by num_speculative_tokens
         if scheduler_output.scheduled_spec_decode_tokens:
@@ -2822,6 +2826,9 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
+        # When spec decode is enabled, defer connector finalization
+        # (wait_for_save + clear metadata) until after draft model runs.
+        defer_kv_connector_finalize = self.speculative_config is not None
         with (
             set_forward_context(
                 attn_metadata,
@@ -2833,7 +2840,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             ),
             record_function_or_nullcontext("Forward"),
             self.maybe_get_kv_connector_output(
-                scheduler_output, is_last_prefill_chunk
+                scheduler_output,
+                defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
             self._attach_kv_cache_bindings(attn_metadata)
@@ -2844,9 +2852,11 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             positions = positions.view(num_reqs, -1)
 
             token_indices = None
-            if is_first_request_prefill and not self.use_eagle():
+            if is_prefill_phase and not self.use_eagle():
                 # DO NOT include compute logits if lora_config is enabled
                 token_indices = logits_indices
+
+            if is_prefill_phase:
                 # prefill chunk padding
                 prefill_size = self.scheduler_config.max_num_batched_tokens
                 input_ids = rbln_utils.pad(input_ids, -1, prefill_size)
@@ -2883,7 +2893,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     lora_ids,
                     self.lora_manager._adapter_manager.lora_index_to_id,
                     batch_bucket_size,
-                    is_first_request_prefill,
+                    is_prefill_phase,
                     self.lora_config.max_loras,
                     self.device,
                 )
@@ -2913,7 +2923,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     device_time = reports[0].get("total_device", None)
                     ccl_time = reports[0].get("total_ccl", None)
 
-                if is_first_request_prefill:
+                if is_prefill_phase:
                     self.performance_tracker.record_prefill(
                         model_execution_time,
                         num_scheduled_tokens,
@@ -2958,6 +2968,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 assert isinstance(hidden_states, IntermediateTensors)
                 if not broadcast_pp_output:
                     hidden_states.kv_connector_output = kv_connector_output
+                    self.kv_connector_output = kv_connector_output
                     return hidden_states
                 # NOTE - DO NOT all_gather_group for RBLN pp
                 get_pp_group().send_tensor_dict(hidden_states.tensors)
@@ -2979,7 +2990,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     # SHOULD resolve the batch dimension.
                     hidden_states = hidden_states.flatten(0, -2)
 
-                    if is_first_request_prefill:  # prefill
+                    if is_prefill_phase:  # prefill
                         sample_hidden_states = hidden_states[logits_indices]
                         logits = self.compute_logits(sample_hidden_states)
                     else:  # decode
@@ -2991,9 +3002,14 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 else:
                     selected_token_indices = logits_indices
                     assert selected_token_indices.dim() == 1
-                    if is_first_request_prefill:  # prefill
+                    if is_prefill_phase:  # prefill
                         assert selected_token_indices.size(0) == 1
-                        if not is_last_prefill_chunk:  # noqa: SIM108
+                        num_computed = self.input_batch.num_computed_tokens_cpu
+                        num_prompted = self.input_batch.num_prompt_tokens
+                        is_last_prefill = (
+                            num_computed + self.max_num_tokens
+                        ) >= num_prompted
+                        if not is_last_prefill[0]:  # noqa: SIM108
                             # chunked prefill(#0~#N-1, intermediate)
                             # token_indices = torch.tensor([max_num_seqs-1])
                             # selected = torch.tensor([])
@@ -3045,9 +3061,9 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             hidden_states,
             sample_hidden_states,
             aux_hidden_states,
-            kv_connector_output,
             slot_mappings,
         )
+        self.kv_connector_output = kv_connector_output
         return None
 
     @torch.inference_mode()
@@ -3081,7 +3097,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             hidden_states,
             sample_hidden_states,
             aux_hidden_states,
-            kv_connector_output,
             slot_mappings,
         ) = self.execute_model_state
         # Clear ephemeral state.
@@ -3149,7 +3164,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # is_prefill is changed after bookkeeping
             # so we need to get it before bookkeeping,
             # and pass it to performance tracker.
-            is_prefills = self.is_prefills()
+            is_prefill_phase = self.is_prefill_phase()
             (
                 num_nans_in_logits,
                 logprobs_lists,
@@ -3176,9 +3191,19 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # tokens on the CPU, so they are run after bookkeeping.
             propose_draft_token_ids(valid_sampled_token_ids)
 
+        # Finalize KV connector (wait_for_save + clear metadata) after
+        # draft model runs. Deferred from target model forward to allow
+        # draft model to also save its KV cache.
+        if spec_config is not None:
+            self.finalize_kv_connector()
+
         # FIXME(jiwoo.park) EPLB is not supported in RBLN
         # with record_function_or_nullcontext("EPLB"):
         #     self.eplb_step()
+
+        # self.kv_connector_output may be modified during drafting
+        kv_connector_output = self.kv_connector_output
+        self.kv_connector_output = None
 
         output = ModelRunnerOutput(
             req_ids=req_ids_output_copy,
@@ -3195,7 +3220,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self.e2e_end_time = time.perf_counter()
             self.collect_metrics(
                 self.e2e_performance_tracker,
-                is_prefills[0],
+                is_prefill_phase,
                 start_time=self.e2e_start_time,
                 end_time=self.e2e_end_time,
                 reports=[],
@@ -4361,13 +4386,10 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         )
         if not self.model_config.enforce_eager and envs.VLLM_RBLN_COMPILE_MODEL:
             kv_cache_names: list[str] = []
-            bind_kv_cache_name(
-                kv_caches,
-                kv_cache_names,
-                num_attn_module,
-            )
-            for kv_cache, kv_cache_name in zip(self.kv_caches, kv_cache_names):
-                self.compile_context.mark_static_address(kv_cache, f"{kv_cache_name}")
+            bind_kv_cache_name(kv_caches, kv_cache_names, num_attn_module)
+            assert len(kv_cache_names) == len(self.kv_caches)
+            for kv_cache, name in zip(self.kv_caches, kv_cache_names):
+                self.compile_context.mark_static_address(kv_cache, name)
 
         return kv_caches
 
@@ -4579,14 +4601,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             < self.input_batch.num_tokens_no_spec - 1
         )
 
-    def is_first_request_prefill(self) -> bool:
+    def is_prefill_phase(self) -> bool:
         return bool(self.is_prefills()[0])
-
-    def is_last_prefill_chunk(self) -> bool:
-        num_computed = self.input_batch.num_computed_tokens_cpu
-        num_prompted = self.input_batch.num_prompt_tokens
-        is_last_prefill = (num_computed + self.max_num_tokens) >= num_prompted
-        return bool(is_last_prefill[0])
 
     def use_wrapped_compute_logits(self) -> bool:
         return not (self.lora_config is not None)

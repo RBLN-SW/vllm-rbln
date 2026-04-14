@@ -473,5 +473,5 @@ def bind_kv_cache_name(
                 pass
             else:
                 raise NotImplementedError
-        layer_name = layer_names[0]
-        runner_kv_cache_names.append(layer_name)
+        for layer_name in layer_names:
+            runner_kv_cache_names.append(layer_name)
