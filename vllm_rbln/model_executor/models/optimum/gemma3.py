@@ -33,7 +33,12 @@ from .optimum_attention import HybridAttentionImageManager, HybridAttentionImage
 
 logger = init_logger(__name__)
 
-IMG_PAD_TOKEN_ID = -1
+# Sentinel token ID for image boundary padding. Must be a non-negative value
+# that fits within u32 range, since vllm's FastIncrementalDetokenizer passes
+# prompt_token_ids to tokenizers.DecodeStream which expects u32 values.
+# Using a value beyond the vocab size (262208) so it won't collide with real tokens.
+# This is replaced with PAD_TOKEN_ID before model execution.
+IMG_PAD_TOKEN_ID = 2**30
 PAD_TOKEN_ID = 0
 
 
