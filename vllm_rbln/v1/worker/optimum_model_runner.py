@@ -263,12 +263,6 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
     def load_model(self) -> None:
         with set_current_vllm_config(self.vllm_config, check_compile=False):
             self.model = get_optimum_model(vllm_config=self.vllm_config)
-
-        if self._is_ec_producer_only():
-            # Producer only has the visual encoder; skip LoRA and sampler.
-            self.use_optimum_lora = None
-            return
-
         self.use_optimum_lora = getattr(self.model.model.rbln_config, "use_lora", None)
         if self.lora_config and not self.use_optimum_lora:
             raise RuntimeError(
@@ -333,13 +327,24 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                         self._run_encoder_and_save(model_input, scheduler_output)
                 return make_empty_encoder_model_runner_output(scheduler_output)
 
-            # EC Consumer: load encoder results before model forward.
-            if has_ec_transfer() and not get_ec_transfer().is_producer:
-                with self.maybe_get_ec_connector_output(
-                    scheduler_output,
-                    encoder_cache=self.encoder_cache,
-                ):
-                    pass
+            # EC Consumer: initiate encoder cache loading.
+            # - Prefill steps: block until the cache is ready (needed
+            #   for _run_decoder_with_cached_encoder).
+            # - Decode-only steps: non-blocking — pulls continue in
+            #   background while decode batch runs unblocked.
+            is_ec_consumer = (
+                has_ec_transfer() and not get_ec_transfer().is_producer
+            )
+            if is_ec_consumer:
+                ec = get_ec_transfer()
+                if scheduler_output.ec_connector_metadata is not None:
+                    ec.bind_connector_metadata(
+                        scheduler_output.ec_connector_metadata
+                    )
+                    has_new_prefill = len(scheduler_output.scheduled_new_reqs) > 0
+                    ec.start_load_caches(
+                        self.encoder_cache, blocking=has_new_prefill
+                    )
 
             # Prepare the decoder inputs.
             model_input, num_scheduled_tokens_np = self._prepare_inputs(
@@ -357,8 +362,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             # with pre-computed embeddings instead of the full model
             # forward (which would require the vision encoder runtime).
             if (
-                has_ec_transfer()
-                and not get_ec_transfer().is_producer
+                is_ec_consumer
                 and model_input.is_prompt
                 and self.encoder_cache
             ):
@@ -389,6 +393,11 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             # [batch_size, 1, vocab_size] -> [batch_size, vocab_size]
             hidden_states = hidden_states.squeeze(1)
             logits = self.model.compute_logits(hidden_states, None)
+        # EC Consumer cleanup: poll finished transfers and clear metadata.
+        if is_ec_consumer:
+            ec.get_finished(scheduler_output.finished_req_ids)
+            ec.clear_connector_metadata()
+
         self.execute_model_state = ExecuteModelState(
             scheduler_output=scheduler_output,
             logits=logits,
@@ -401,6 +410,29 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
     # ------------------------------------------------------------------
     # EC Disaggregation helpers
     # ------------------------------------------------------------------
+
+    def _make_producer_output(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> ModelRunnerOutput:
+        """Build a ModelRunnerOutput that tells the engine core every
+        request is finished (by returning the EOS token).
+
+        Without this, the engine keeps scheduling decode steps for a
+        request that will never produce real tokens.
+        """
+        if not scheduler_output.num_scheduled_tokens:
+            return EMPTY_MODEL_RUNNER_OUTPUT
+
+        eos = self.model_config.hf_config.eos_token_id
+        if isinstance(eos, list):
+            eos = eos[0]
+
+        req_ids = list(scheduler_output.num_scheduled_tokens.keys())
+        return ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index={rid: idx for idx, rid in enumerate(req_ids)},
+            sampled_token_ids=[[eos] for _ in req_ids],
+        )
 
     def _run_encoder_and_save(
         self,

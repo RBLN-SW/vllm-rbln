@@ -159,11 +159,6 @@ class RBLNOptimumModelBase(nn.Module):
         self.scheduler_config = vllm_config.scheduler_config
         self.cache_config = vllm_config.cache_config
         self.init_model()
-        if self._is_ec_producer_only():
-            # Producer doesn't need KV cache or batch scheduling.
-            self.batch_size = 1
-            self.kv_block_adapter = None
-            return
         self.batch_size = self.scheduler_config.max_num_seqs
         self.kv_block_adapter = KVCacheBlockAdapter(
             vllm_config, self._resolve_kvcache_num_blocks()
@@ -250,7 +245,17 @@ class RBLNOptimumModelBase(nn.Module):
             model_path = str(self.vllm_config.model_config.model)
 
             if self._is_ec_producer_only():
-                model = self._load_producer_model(model_cls, model_path)
+                # Full model load with LLM runtimes disabled.
+                # TODO: use _load_producer_model() for true partial
+                # loading once engine core compatibility is resolved.
+                rbln_config = self.vllm_config.additional_config.get(
+                    "rbln_config", {}
+                )
+                rbln_config = self._apply_ec_producer_config(
+                    rbln_config, model_cls
+                )
+                model = model_cls.from_pretrained(model_path, rbln_config=rbln_config)
+                self._free_producer_compiled_models(model, model_cls)
             else:
                 rbln_config = self.vllm_config.additional_config.get(
                     "rbln_config", {}
@@ -386,6 +391,41 @@ class RBLNOptimumModelBase(nn.Module):
                     "submodule '%s' CPU memory",
                     num_freed, name,
                 )
+
+    def _apply_ec_producer_config(
+        self, rbln_config: dict, model_cls: type
+    ) -> dict:
+        """Disable LLM runtimes, keep encoder submodule runtimes."""
+        submodule_names = [
+            s["name"] for s in getattr(model_cls, "_rbln_submodules", [])
+        ]
+        if not submodule_names:
+            return rbln_config
+
+        rbln_config = dict(rbln_config)
+        rbln_config["create_runtimes"] = False
+        for name in submodule_names:
+            sub = dict(rbln_config.get(name) or {})
+            sub["create_runtimes"] = True
+            rbln_config[name] = sub
+        logger.info(
+            "EC producer: LLM runtime disabled, "
+            "encoder submodules enabled (%s).",
+            ", ".join(submodule_names),
+        )
+        return rbln_config
+
+    def _free_producer_compiled_models(
+        self, model: Any, model_cls: type
+    ) -> None:
+        """Free LLM compiled models from CPU memory (producer only)."""
+        if hasattr(model, "compiled_models") and model.compiled_models:
+            num_freed = len(model.compiled_models)
+            model.compiled_models = []
+            logger.info(
+                "EC producer: freed %d LLM compiled model(s) from CPU memory",
+                num_freed,
+            )
 
     @property
     def dtype(self) -> torch.dtype:

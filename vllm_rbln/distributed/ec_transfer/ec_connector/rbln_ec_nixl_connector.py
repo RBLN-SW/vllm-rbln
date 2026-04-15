@@ -464,15 +464,17 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
     def start_load_caches(
         self,
         encoder_cache: dict[str, Any],
+        blocking: bool = True,
         **kwargs,
     ) -> None:
         """Consumer: initiate async NIXL pull for each pending mm_hash.
 
-        Called by the model runner before prefill_decoder.
-        If a mm_hash is not yet in any producer's registry, refreshes
-        metadata from all producers (with retry) to discover newly
-        registered tensors.
-        Actual tensor data is available only after get_finished() returns.
+        Args:
+            encoder_cache: Shared encoder cache dict to populate.
+            blocking: If True, wait for all pulls to complete before
+                returning. If False, only initiate pulls — caller must
+                poll via ``get_finished()`` or call
+                ``wait_for_pending_pulls()`` later.
         """
         if self.is_producer:
             return
@@ -506,12 +508,17 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
             self._pending_loads[mm_hash] = (handle, local_bufs)
             logger.debug("EC NIXL: initiated pull for mm_hash=%s", mm_hash)
 
-        # Block until all initiated pulls complete (or timeout).
-        # Without this, the model forward may run before encoder_cache
-        # is populated, forcing the consumer to fall back to local
-        # vision encoding and defeating EC disaggregation.
-        if self._pending_loads:
+        if self._pending_loads and blocking:
             self._wait_for_pulls(encoder_cache)
+
+    def wait_for_pending_pulls(self) -> None:
+        """Block until all pending NIXL pulls complete.
+
+        Convenience method for callers that used
+        ``start_load_caches(blocking=False)`` and now need the data.
+        """
+        if self._pending_loads and self._encoder_cache is not None:
+            self._wait_for_pulls(self._encoder_cache)
 
     def _wait_for_pulls(self, encoder_cache: dict[str, Any]) -> None:
         """Synchronously wait for all pending NIXL pulls to complete."""
