@@ -158,7 +158,8 @@ def estimate_available_memory(
         kernel_size = layer_nbytes + lm_heads_nbytes
     elif n_model_params is not None or n_model_bytes is not None:
         raise ValueError(
-            "`n_model_params`/`n_model_bytes` and `kernel_size` cannot both be specified."
+            "`n_model_params`/`n_model_bytes` and `kernel_size`"
+            " cannot both be specified."
         )
 
     available_dram_bytes -= kernel_size
@@ -170,10 +171,7 @@ def estimate_available_memory(
         buffer = buffer_per_runtime_per_core * num_runtimes
     available_dram_bytes -= buffer
 
-    if "ca" in device_name:
-        rsd_replicas = (rsd_size // num_key_value_heads) or 1
-    else:
-        rsd_replicas = 1
+    rsd_replicas = (rsd_size // num_key_value_heads) or 1 if "ca" in device_name else 1
     available_dram_bytes = available_dram_bytes // rsd_replicas
 
     check_oom(available_dram_bytes)
