@@ -280,12 +280,18 @@ class RblnECNixlConnectorScheduler(ECConnectorBase):
 
     @staticmethod
     def _side_channel_listener(
-        encoded_metadata: bytes,
+        metadata_holder: list[bytes],
         ready_event: threading.Event,
         stop_event: threading.Event,
         host: str,
         port: int,
     ) -> None:
+        """ZMQ ROUTER that serves the latest agent metadata to consumers.
+
+        ``metadata_holder`` is a 1-element list whose contents are
+        replaced in-place by ``_publish_agent_metadata`` whenever the
+        tensor registry changes — no thread restart needed.
+        """
         path = make_zmq_path("tcp", host, port)
         logger.debug("EC NIXL side-channel listening on %s", path)
         with _zmq_ctx(zmq.ROUTER, path) as sock:
@@ -297,7 +303,7 @@ class RblnECNixlConnectorScheduler(ECConnectorBase):
                 except zmq.Again:
                     continue
                 if msg == _GET_META_MSG:
-                    sock.send_multipart((identity, b"", encoded_metadata))
+                    sock.send_multipart((identity, b"", metadata_holder[0]))
                 else:
                     logger.warning("EC side-channel got unexpected message: %s", msg)
 
@@ -392,9 +398,16 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
         # Reverse index: mm_hash → producer_idx (for quick pull lookup)
         self._mm_hash_to_producer: dict[str, int] = {}
 
-        # Side-channel listener (producer only, started by _publish_agent_metadata)
+        # Side-channel listener (producer only)
         self._stop_event = threading.Event()
         self._listener_thread: threading.Thread | None = None
+
+        # Start the side-channel listener immediately so consumers can
+        # connect before any request arrives. Initial metadata has an
+        # empty tensor registry; _publish_agent_metadata() will restart
+        # it with actual tensors after the first save_caches() call.
+        if self.is_producer:
+            self._publish_agent_metadata()
 
         logger.info(
             "RblnECNixlConnectorWorker initialised "
@@ -489,11 +502,10 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
 
         for mm_data in metadata.mm_datas_to_load:
             mm_hash = mm_data.mm_hash
-            if mm_hash in encoder_cache or mm_hash in self._pending_loads:
+            if mm_hash in self._pending_loads:
                 continue
 
-            # If mm_hash unknown, refresh all producers' metadata to
-            # discover newly registered tensors.
+            # Refresh producers' metadata to discover the mm_hash.
             if mm_hash not in self._mm_hash_to_producer:
                 self._wait_for_cache(mm_hash)
             if mm_hash not in self._mm_hash_to_producer:
@@ -644,15 +656,21 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
                 self._mm_hash_to_producer[mm_hash] = producer_idx
 
             if new_mm_hashes:
-                logger.debug(
+                logger.info(
                     "EC NIXL: producer %d — %d new mm_hash(es) discovered "
                     "(%d total across all producers)",
                     producer_idx,
                     len(new_mm_hashes),
                     len(self._mm_hash_to_producer),
                 )
+            else:
+                logger.info(
+                    "EC NIXL: producer %d refresh — %d mm_hashes (no new)",
+                    producer_idx,
+                    len(new_registry),
+                )
         except (zmq.Again, zmq.ZMQError, msgspec.DecodeError) as exc:
-            logger.debug(
+            logger.info(
                 "EC NIXL: metadata refresh for producer %d failed (%s)",
                 producer_idx, exc,
             )
@@ -686,7 +704,11 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
         )
 
     def _publish_agent_metadata(self) -> None:
-        """Encode current agent metadata and start side-channel listener."""
+        """Encode current agent metadata and update the side-channel listener.
+
+        On first call, starts the listener thread. On subsequent calls,
+        updates the metadata in-place (no thread restart needed).
+        """
         if not self.is_producer:
             return
 
@@ -715,35 +737,46 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
         )
         encoded = encoder.encode(payload)
 
-        # Start (or restart) the side-channel listener thread
         if self._listener_thread is not None:
-            self._stop_event.set()
-            self._listener_thread.join(timeout=5)
-            self._stop_event.clear()
+            # Listener already running — update metadata in-place.
+            self._metadata_holder[0] = encoded
+            logger.info(
+                "EC NIXL: metadata updated in-place (%d mm_hashes, %d tensors)",
+                len(self._registered_caches),
+                len(registered_tensors),
+            )
+        else:
+            # First call — start the listener thread.
+            self._metadata_holder = [encoded]
+            ready = threading.Event()
+            self._listener_thread = threading.Thread(
+                target=RblnECNixlConnectorScheduler._side_channel_listener,
+                args=(self._metadata_holder, ready, self._stop_event,
+                      self._side_channel_host, self._side_channel_port),
+                daemon=True,
+                name="ec_nixl_handshake_listener",
+            )
+            self._listener_thread.start()
+            ready.wait()
+            logger.info(
+                "EC NIXL side-channel listener started on %s:%d",
+                self._side_channel_host, self._side_channel_port,
+            )
 
-        ready = threading.Event()
-        self._listener_thread = threading.Thread(
-            target=RblnECNixlConnectorScheduler._side_channel_listener,
-            args=(encoded, ready, self._stop_event,
-                  self._side_channel_host, self._side_channel_port),
-            daemon=True,
-            name="ec_nixl_handshake_listener",
-        )
-        self._listener_thread.start()
-        ready.wait()
-        logger.info(
-            "EC NIXL side-channel listener started on %s:%d",
-            self._side_channel_host, self._side_channel_port,
-        )
+    def _do_handshake_all(self, fast: bool = False) -> None:
+        """Consumer: connect to all configured producers sequentially.
 
-    def _do_handshake_all(self) -> None:
-        """Consumer: connect to all configured producers sequentially."""
+        Args:
+            fast: If True, use a short timeout per producer (1s) so startup
+                isn't blocked waiting for producers that aren't ready yet.
+        """
         for idx, endpoint in enumerate(self._producer_endpoints):
             if idx in self._remote_agent_names:
                 continue  # already connected
             try:
                 self._do_handshake_single(
-                    idx, endpoint["host"], endpoint["port"]
+                    idx, endpoint["host"], endpoint["port"],
+                    timeout_ms=1000 if fast else _HANDSHAKE_TIMEOUT_MS,
                 )
             except RuntimeError:
                 logger.warning(
@@ -758,7 +791,8 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
         )
 
     def _do_handshake_single(
-        self, producer_idx: int, host: str, port: int
+        self, producer_idx: int, host: str, port: int,
+        timeout_ms: int = _HANDSHAKE_TIMEOUT_MS,
     ) -> None:
         """Consumer: fetch a single producer's NIXL agent metadata via ZMQ."""
         path = make_zmq_path("tcp", host, port)
@@ -767,7 +801,7 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
             producer_idx, path,
         )
 
-        deadline = time.monotonic() + _HANDSHAKE_TIMEOUT_MS / 1000
+        deadline = time.monotonic() + timeout_ms / 1000
         payload: ECNixlHandshakePayload | None = None
 
         while time.monotonic() < deadline:

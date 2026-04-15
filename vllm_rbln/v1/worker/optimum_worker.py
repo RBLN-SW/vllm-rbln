@@ -245,6 +245,20 @@ class RBLNOptimumWorker(WorkerBase):
             logger.info("EC producer: skipping warmup (no decoder).")
             return
 
+        # EC consumer: pre-connect to all producers at startup so the
+        # first request doesn't pay the handshake cost (~seconds).
+        # Uses a short timeout — producers that aren't ready yet will
+        # be connected on demand when the first request arrives.
+        if ec is not None and ec.is_ec_consumer:
+            from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
+            if has_ec_transfer():
+                connector = get_ec_transfer()
+                if hasattr(connector, '_impl'):
+                    connector = connector._impl
+                if hasattr(connector, '_do_handshake_all'):
+                    logger.info("EC consumer: pre-connecting to producers...")
+                    connector._do_handshake_all(fast=True)
+
         if not envs.VLLM_RBLN_ENABLE_WARM_UP:
             logger.info(
                 "Warm up is disabled. Set VLLM_RBLN_ENABLE_WARM_UP=1 to enable warm up."

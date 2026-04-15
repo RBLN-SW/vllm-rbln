@@ -325,7 +325,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                         encoder_cache=self.encoder_cache,
                     ):
                         self._run_encoder_and_save(model_input, scheduler_output)
-                return make_empty_encoder_model_runner_output(scheduler_output)
+                return self._make_producer_output(scheduler_output)
 
             # EC Consumer: initiate encoder cache loading.
             # - Prefill steps: block until the cache is ready (needed
