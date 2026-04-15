@@ -20,6 +20,18 @@ import torch
 from vllm.model_executor.models.utils import extract_layer_index
 
 
+def _storage_key(tensor: torch.Tensor) -> tuple[int, int]:
+    """Return a hashable key that identifies the tensor's underlying storage.
+
+    Meta tensors have no real storage, so we use the storage object identity
+    which is shared across views of the same base tensor.
+    """
+    storage = tensor.untyped_storage()
+    if tensor.device.type == "meta":
+        return (id(storage), storage.nbytes())
+    return (storage.data_ptr(), storage.nbytes())
+
+
 @dataclass(frozen=True)
 class KVCacheViewInfo:
     base_index: int = -1
@@ -44,8 +56,7 @@ def build_kv_cache_base_bindings(
     )
     for layer_name in layer_names:
         base_tensor = kv_cache_bases_by_layer[layer_name]
-        storage = base_tensor.untyped_storage()
-        storage_key = (storage.data_ptr(), storage.nbytes())
+        storage_key = _storage_key(base_tensor)
         base_index = base_index_by_storage.get(storage_key)
         if base_index is None:
             base_index = len(base_tensors)
@@ -114,8 +125,7 @@ def validate_shared_attention_kv_cache_contiguity(
         kv_cache = kv_caches.get(layer_name)
         if base_tensor is None or kv_cache is None:
             continue
-        storage = base_tensor.untyped_storage()
-        storage_key = (storage.data_ptr(), storage.nbytes())
+        storage_key = _storage_key(base_tensor)
         layers_by_storage[storage_key].append(layer_name)
 
     for layer_names in layers_by_storage.values():
