@@ -423,85 +423,69 @@ def fused_moe_forward_rbln(
         router_logits = router(hidden_states)
         router_logits_2d = router_logits.reshape(t, -1)  # [t, E]
         E = router_logits_2d.shape[-1]
+        e = E // R  # local experts per rank
 
-        # Pad to max_pad so all DP ranks have the same tensor size for all_gather
+        # Pad to max_pad so all DP ranks have the same tensor size
         hidden_flat = hidden_states.reshape(t, -1)  # [t, H]
         if t < max_pad:
             router_logits_2d = F.pad(router_logits_2d, (0, 0, 0, max_pad - t), value=0.0)  # [max_pad, E]
             hidden_flat = F.pad(hidden_flat, (0, 0, 0, max_pad - t), value=0.0)  # [max_pad, H]
 
-        # --- Step 2: all_gather router_logits across DP ranks ---
-        # [max_pad, E] → [1, max_pad*E] → all_gather → [R, max_pad*E] → [R*max_pad, E]
-        rl_flat = router_logits_2d.reshape(1, -1)  # [1, max_pad*E]
-        all_rl_flat = get_dp_group().all_gather(rl_flat, dim=0)  # [R, max_pad*E]
-        all_router_logits = all_rl_flat.reshape(R * max_pad, E)  # [R*max_pad, E]
-
-        # --- Step 3: topk + softmax on all gathered tokens ---
-        # [E, R*max_pad] for dim=0 topk (select top_k experts per token)
-        all_router_logits_t = all_router_logits.transpose(0, 1)  # [E, R*max_pad]
+        # --- Step 2: Local topk + scoring (no all_gather needed) ---
+        # [E, max_pad] for dim=0 topk (select top_k tokens per expert)
+        router_logits_t = router_logits_2d.transpose(0, 1)  # [E, max_pad]
 
         scoring_func = getattr(self, 'scoring_func', 'softmax')
         e_score_correction_bias = getattr(self, 'e_score_correction_bias', None)
 
-        # deepseekv3 style: minimax m2.5
         if scoring_func == 'sigmoid':
-            # scores_t = torch.sigmoid(all_router_logits_t)  # [E, R*max_pad]
-
-            # sigmoid scoring with optional e_score_correction_bias
-            scores = torch.sigmoid(all_router_logits)  # [R*max_pad, E]
-            scores_t = scores.transpose(0, 1)  # [E, R*max_pad]
+            scores = torch.sigmoid(router_logits_2d)  # [max_pad, E]
+            scores_t = scores.transpose(0, 1)  # [E, max_pad]
             scores_for_topk = scores_t
             if e_score_correction_bias is not None:
                 scores_for_topk = scores_t + e_score_correction_bias.unsqueeze(1)  # [E, 1]
             _, selected_experts = torch.topk(scores_for_topk, k=self.top_k, dim=0)
-            topk_weights = scores_t.gather(0, selected_experts)  # weights from original scores
+            topk_weights = scores_t.gather(0, selected_experts)
             topk_weights = topk_weights / topk_weights.sum(dim=0, keepdim=True).clamp_min(1e-20)
         elif self.renormalize:
-            # post_norm: topk first, then softmax on selected values
             topk_weights, selected_experts = torch.topk(
-                all_router_logits_t, k=self.top_k, dim=0
+                router_logits_t, k=self.top_k, dim=0
             )
             topk_weights = F.softmax(topk_weights, dim=0)
         else:
-            # pre_norm: softmax first, then topk
-            routing_weights = F.softmax(all_router_logits_t, dim=0)
+            routing_weights = F.softmax(router_logits_t, dim=0)
             topk_weights, selected_experts = torch.topk(
                 routing_weights, k=self.top_k, dim=0
             )
-        masked_routing_weights = torch.zeros_like(all_router_logits_t)  # [E, R*max_pad]
-        masked_routing_weights.scatter_(0, selected_experts, topk_weights)
+        local_masked = torch.zeros_like(router_logits_t)  # [E, max_pad]
+        local_masked.scatter_(0, selected_experts, topk_weights)
 
-        # Apply token mask to zero out padded positions per DP rank
+        # Apply token mask to zero out padded positions
         use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
         if use_moe_tokens_mask:
-            tokens_mask = get_tokens_mask(max_pad).transpose(1, 0)  # [1, R*max_pad]
+            # For local topk, we only have local tokens → use single-rank mask
+            tokens_mask_local = get_tokens_mask_DP(max_pad, self.dp_rank).transpose(1, 0)  # [1, max_pad]
 
-            ## token dim padding (dim 0 right pad)
-            T = masked_routing_weights.shape[1]
+            T_local = local_masked.shape[1]
             pad_size = 0
-            if T <= 8:
-                pad_size = 64 - (T % 64)
-                tokens_mask = F.pad(tokens_mask, (0, pad_size), value=0.0)
-                masked_routing_weights = F.pad(masked_routing_weights, (0, pad_size), value=0.0)
+            if T_local <= 8:
+                pad_size = 64 - (T_local % 64)
+                tokens_mask_local = F.pad(tokens_mask_local, (0, pad_size), value=0.0)
+                local_masked = F.pad(local_masked, (0, pad_size), value=0.0)
 
-            # [R*max_pad(+pad), E] * [R*max_pad(+pad), 1] (broadcast)
-            masked_routing_weights = masked_routing_weights * tokens_mask
-            masked_routing_weights_depadded = F.pad(masked_routing_weights, (0, -pad_size), value=0.0)
+            local_masked = local_masked * tokens_mask_local
+            local_masked = F.pad(local_masked, (0, -pad_size), value=0.0)
 
-        # all_routing_3d: [E, R, max_pad] for CCL send kernel
-        all_routing_3d = masked_routing_weights_depadded.reshape(E, R, max_pad)
+        # --- Step 3: Prepare fixed_send_buff for all2all_xf ---
+        # fixed_send_buff[dst] = local_masked[dst*e:(dst+1)*e, :] → (R, e, max_pad)
+        # Each destination rank receives the routing weights for THEIR local experts
+        # from THIS rank's local tokens.
+        fixed_send_buff = local_masked.reshape(R, e, max_pad)  # (R, e, max_pad)
 
-        # --- Step 4: CCL all2all dispatch ---
-        # Prepare per-rank router_logits slices
-        e = E // R  # local experts per rank
-        # send_rl: [E, max_pad] — this rank's local routing
-        send_rl = all_routing_3d[:, self.dp_rank, :]  # (E, max_pad)
-        # recv_rl: [e, R*max_pad] — local experts' routing across all ranks
-        e_start = self.dp_rank * e
-        recv_rl = all_routing_3d[e_start : e_start + e].reshape(e, R * max_pad)  # (e, T)
+        # send_rl for ccl_dispatch_send: full local routing (E, max_pad)
+        send_rl = local_masked  # (E, max_pad)
 
-        # hidden_flat: [max_pad, H] (already padded above)
-
+        # --- Step 4: CCL all2all_xf dispatch ---
         # ccl_dispatch_send
         send_buffer, send_sizes = (
             torch.ops.rbln_custom_ops.ccl_dispatch_send(
@@ -512,13 +496,18 @@ def fused_moe_forward_rbln(
             )
         )
 
-        # ccl_all2all_x (naive P2P)
-        recv_buffer = torch.ops.rbln_custom_ops.ccl_all2all_x_kernel(
+        # ccl_all2all_xf: variable-size tokens + fixed-size routing logits
+        recv_buffer, fixed_recv_buff = torch.ops.rbln_custom_ops.ccl_all2all_xf_kernel(
             send_buffer,
             send_sizes,
+            fixed_send_buff,
             self.dp_size,
             CCL_ALL2ALL_GROUP_ID,
         )
+
+        # Reconstruct recv_rl from fixed_recv_buff
+        # fixed_recv_buff: (R, e, max_pad) — routing weights for our local experts from each rank
+        recv_rl = fixed_recv_buff.permute(1, 0, 2).reshape(e, R * max_pad)  # (e, R*max_pad)
 
         # ccl_dispatch_receive → unpacked: [R, max_pad, H]
         unpacked = torch.ops.rbln_custom_ops.ccl_dispatch_receive(
@@ -529,18 +518,21 @@ def fused_moe_forward_rbln(
         )
 
         # --- Step 5: MoE FFN on gathered tokens ---
-        # unpacked: [R, max_pad, H] → flatten to [R*max_pad, H] for MoE
+        # Reconstruct full masked_routing_weights [E, R*max_pad] for MoE FFN
+        # Only local experts have non-zero weights; non-local expert rows = 0
+        e_start = self.dp_rank * e
+        masked_routing_weights = torch.zeros(E, R * max_pad, dtype=torch.float32)
+        masked_routing_weights[e_start:e_start + e] = recv_rl
+
         gathered_hidden = unpacked.reshape(R * max_pad, H_dim)
 
         final_hidden_states = self.quant_method.apply(
             layer=self,
             x=gathered_hidden,
-            router_logits=masked_routing_weights, # [E*max_pad, T_padded]
+            router_logits=masked_routing_weights,  # [E, R*max_pad]
         )
 
         # --- Step 6: Combine partial results and extract this rank's output ---
-        # reduce_scatter: each rank receives only its own summed portion
-        # (more efficient than all_reduce + slice since each rank only needs 1/R of data)
         hidden_shape_dp = (-1, 1, H_dim)
         all_hidden_states = final_hidden_states.reshape(hidden_shape_dp)
         assert all_hidden_states.shape[0] % self.dp_size == 0

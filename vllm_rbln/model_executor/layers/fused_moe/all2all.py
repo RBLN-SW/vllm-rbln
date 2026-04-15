@@ -136,8 +136,65 @@ def _ccl_all2all_x_kernel_fake(
     return torch.empty(R_dim, t_dim, H_dim, dtype=send_buffer.dtype)
 
 
-# ---------------------------------------------------------------------------
-# Custom op: ccl_dispatch_receive
+# ---------------------------------------------------------------------------# Custom op: ccl_all2all_xf_kernel  (naive P2P with Fixed data exchange)
+# -------------------------------------------------------------------------
+
+
+@torch.library.custom_op(
+    "rbln_custom_ops::ccl_all2all_xf_kernel",
+    mutates_args=(),
+)
+def ccl_all2all_xf_kernel(
+    send_buffer: Tensor,
+    send_sizes: Tensor,
+    fixed_send_buff: Tensor,
+    ccl_world_size: int,
+    group_id: int,
+) -> Tuple[Tensor, Tensor]:
+    """AllToAllXF: variable-size token dispatch + fixed-size data exchange.
+
+    Extends all2all_x by piggybacking fixed-size per-rank data (e.g. routing
+    logits) onto the dynamic all-to-all communication, eliminating a separate
+    all_gather step.
+
+    Args:
+        send_buffer: (R, t, H) — variable-size token data per destination rank.
+        send_sizes: (R, 64) — uint16, number of valid tokens per rank.
+        fixed_send_buff: (R, ...) — fixed-size data to exchange per rank.
+        ccl_world_size: number of ranks in the CCL group.
+        group_id: CCL group identifier.
+
+    Returns:
+        recv_buffer: (R, t, H) — received variable-size token data.
+        fixed_recv_buff: (R, ...) — received fixed-size data from all ranks.
+    """
+    # CPU stub — returns zeros of correct shapes.
+    # Real communication happens on device via CCL runtime (rcclAllToAllXF).
+    R = ccl_world_size
+    t = send_buffer.shape[1]
+    H = send_buffer.shape[2]
+    recv_buffer = torch.zeros(R, t, H, dtype=send_buffer.dtype)
+    fixed_recv_buff = torch.zeros_like(fixed_send_buff)
+    return recv_buffer, fixed_recv_buff
+
+
+@ccl_all2all_xf_kernel.register_fake
+def _ccl_all2all_xf_kernel_fake(
+    send_buffer: Tensor,
+    send_sizes: Tensor,
+    fixed_send_buff: Tensor,
+    ccl_world_size: int,
+    group_id: int,
+) -> Tuple[Tensor, Tensor]:
+    R_dim = ccl_world_size
+    t_dim = send_buffer.shape[1]
+    H_dim = send_buffer.shape[2]
+    recv_buffer = torch.empty(R_dim, t_dim, H_dim, dtype=send_buffer.dtype)
+    fixed_recv_buff = torch.empty_like(fixed_send_buff)
+    return recv_buffer, fixed_recv_buff
+
+
+# -------------------------------------------------------------------------# Custom op: ccl_dispatch_receive
 # ---------------------------------------------------------------------------
 
 
