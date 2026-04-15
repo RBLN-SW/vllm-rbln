@@ -543,7 +543,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
             req_id = scheduler_output.scheduled_cached_reqs.req_ids[0]
             req_index = self.input_batch.req_id_to_index[req_id]
             logger.warning("Request %s is resumed.", req_id)
-            num_token = int(self.input_batch.num_tokens[req_index])
+            num_token = int(self.input_batch.num_tokens_no_spec[req_index])
             prompt_tokens = self.input_batch.token_ids_cpu[req_index][:num_token]
             block_ids = scheduler_output.scheduled_cached_reqs.new_block_ids[0]
         else:
@@ -855,7 +855,6 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
                     req_index, start_token_index:end_token_index
                 ] = new_token_ids
                 self.input_batch.num_tokens_no_spec[req_index] = end_token_index
-                self.input_batch.num_tokens[req_index] = end_token_index
 
         # Add the new or resumed requests to the persistent batch.
         # The smaller empty indices are filled first.
