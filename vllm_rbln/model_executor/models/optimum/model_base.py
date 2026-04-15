@@ -29,6 +29,8 @@ import vllm_rbln.rbln_envs as envs
 from optimum.rbln.transformers.models.decoderonly import (
     decoderonly_runtime_utils as runtime_utils,
 )
+from optimum.rbln.utils.model_utils import get_rbln_model_cls
+from transformers import PretrainedConfig
 from vllm_rbln.utils.optimum.common import select_bucket_size
 from vllm_rbln.utils.optimum.registry import compile_model, get_rbln_model_info
 
@@ -128,6 +130,24 @@ class KVCacheBlockAdapter:
         return new_estimated
 
 
+class _ProducerOptimumModelProxy:
+    """Lightweight proxy replacing the full optimum model for EC producers.
+
+    Only the visual encoder submodule is loaded; LLM compiled models
+    (.rbln files for prefill/decode) are never touched.
+    """
+
+    def __init__(self, visual: Any, rbln_config: Any) -> None:
+        self.visual = visual
+        self.rbln_config = rbln_config
+
+    def get_kvcache_num_blocks(self) -> int:
+        return getattr(self.rbln_config, "kvcache_num_blocks", 1)
+
+    def get_attn_impl(self) -> None:
+        return None
+
+
 class RBLNOptimumModelBase(nn.Module):
     def __init__(
         self,
@@ -139,6 +159,11 @@ class RBLNOptimumModelBase(nn.Module):
         self.scheduler_config = vllm_config.scheduler_config
         self.cache_config = vllm_config.cache_config
         self.init_model()
+        if self._is_ec_producer_only():
+            # Producer doesn't need KV cache or batch scheduling.
+            self.batch_size = 1
+            self.kv_block_adapter = None
+            return
         self.batch_size = self.scheduler_config.max_num_seqs
         self.kv_block_adapter = KVCacheBlockAdapter(
             vllm_config, self._resolve_kvcache_num_blocks()
@@ -222,24 +247,29 @@ class RBLNOptimumModelBase(nn.Module):
         if model is None:
             model_cls = getattr(optimum.rbln, model_cls_name)
             assert model_cls is not None
-            rbln_config = self.vllm_config.additional_config.get("rbln_config", {})
+            model_path = str(self.vllm_config.model_config.model)
 
-            # EC disaggregation: selectively create runtimes so that
-            # the producer only loads encoder (vision) submodules and
-            # the consumer only loads the LLM decoder submodules.
-            rbln_config = self._apply_ec_runtime_config(
-                rbln_config, model_cls
-            )
+            if self._is_ec_producer_only():
+                model = self._load_producer_model(model_cls, model_path)
+            else:
+                rbln_config = self.vllm_config.additional_config.get(
+                    "rbln_config", {}
+                )
+                if self._is_ec_consumer_only():
+                    rbln_config = self._apply_ec_consumer_config(
+                        rbln_config, model_cls
+                    )
+                model = model_cls.from_pretrained(model_path, rbln_config=rbln_config)
+                if self._is_ec_consumer_only():
+                    self._free_consumer_submodule_compiled_models(
+                        model, model_cls
+                    )
 
-            model = model_cls.from_pretrained(
-                self.vllm_config.model_config.model,
-                rbln_config=rbln_config,
-            )
             logger.info(
                 "model_name = %s, model_cls_name = %s, model_path = %s",
                 model_name,
                 model_cls_name,
-                self.vllm_config.model_config.model,
+                model_path,
             )
 
         self.supports_transcription_only = (
@@ -252,62 +282,110 @@ class RBLNOptimumModelBase(nn.Module):
             model.get_attn_impl() if hasattr(model, "get_attn_impl") else None
         )
 
-    def _apply_ec_runtime_config(
+    # ------------------------------------------------------------------
+    # EC disaggregation helpers
+    # ------------------------------------------------------------------
+
+    def _is_ec_producer_only(self) -> bool:
+        ec = getattr(self.vllm_config, "ec_transfer_config", None)
+        return ec is not None and ec.is_ec_producer and not ec.is_ec_consumer
+
+    def _is_ec_consumer_only(self) -> bool:
+        ec = getattr(self.vllm_config, "ec_transfer_config", None)
+        return ec is not None and ec.is_ec_consumer and not ec.is_ec_producer
+
+    def _load_producer_model(
+        self, model_cls: type, model_path: str
+    ) -> _ProducerOptimumModelProxy:
+        """Load only the visual encoder submodule for EC producer.
+
+        LLM compiled models (.rbln for prefill/decode) are never loaded,
+        saving several GB of CPU memory.
+        """
+        # Load the top-level rbln_config to get submodule info
+        config_cls = model_cls.get_rbln_config_class()
+        rbln_config_obj, _ = config_cls.from_pretrained(
+            model_path, return_unused_kwargs=True
+        )
+
+        submodule_names = [
+            s["name"] for s in getattr(model_cls, "_rbln_submodules", [])
+        ]
+        if not submodule_names:
+            raise RuntimeError(
+                "EC producer requires a model with submodules (e.g. visual), "
+                f"but {model_cls.__name__} has none."
+            )
+
+        # Load each encoder submodule (typically just "visual")
+        submodules: dict[str, Any] = {}
+        for name in submodule_names:
+            sub_config = getattr(rbln_config_obj, name)
+            sub_cls = get_rbln_model_cls(sub_config.rbln_model_cls_name)
+            hf_config = PretrainedConfig.from_json_file(
+                os.path.join(model_path, name, "config.json")
+            )
+            submodules[name] = sub_cls._from_pretrained(
+                model_id=model_path,
+                config=hf_config,
+                subfolder=name,
+                rbln_config=sub_config,
+            )
+
+        proxy = _ProducerOptimumModelProxy(
+            submodules[submodule_names[0]], rbln_config_obj
+        )
+        # Attach additional submodules if more than one
+        for name in submodule_names[1:]:
+            setattr(proxy, name, submodules[name])
+
+        logger.info(
+            "EC producer: loaded submodule(s) only (%s), "
+            "LLM .rbln files not loaded.",
+            ", ".join(submodule_names),
+        )
+        return proxy
+
+    def _apply_ec_consumer_config(
         self, rbln_config: dict, model_cls: type
     ) -> dict:
-        """Apply selective ``create_runtimes`` flags for EC disaggregation.
-
-        * **Producer-only** (``ec_role="ec_producer"``): disables runtimes
-          for the main model (LLM prefill/decode) and keeps them for encoder
-          submodules (e.g. ``visual``).
-        * **Consumer-only** (``ec_role="ec_consumer"``): keeps LLM runtimes
-          and disables encoder submodule runtimes.
-
-        Returns a (possibly copied) *rbln_config* dict; the original is
-        never mutated.
-        """
-        ec_config = getattr(self.vllm_config, "ec_transfer_config", None)
-        if ec_config is None or not ec_config.is_ec_transfer_instance:
-            return rbln_config
-
-        is_producer_only = ec_config.is_ec_producer and not ec_config.is_ec_consumer
-        is_consumer_only = ec_config.is_ec_consumer and not ec_config.is_ec_producer
-
-        if not is_producer_only and not is_consumer_only:
-            return rbln_config
-
+        """Set ``create_runtimes=False`` for encoder submodules so the
+        consumer skips NPU allocation for the visual encoder."""
         submodule_names = [
             s["name"] for s in getattr(model_cls, "_rbln_submodules", [])
         ]
         if not submodule_names:
             return rbln_config
 
-        rbln_config = dict(rbln_config)  # shallow copy to avoid mutating original
-
-        if is_producer_only:
-            # Producer only needs encoder submodules; skip LLM runtimes.
-            rbln_config["create_runtimes"] = False
-            for name in submodule_names:
-                sub = dict(rbln_config.get(name) or {})
-                sub["create_runtimes"] = True
-                rbln_config[name] = sub
-            logger.info(
-                "EC producer: skipping LLM runtime creation, "
-                "loading encoder submodules only (%s).",
-                ", ".join(submodule_names),
-            )
-        elif is_consumer_only:
-            # Consumer only needs LLM runtimes; skip encoder submodules.
-            for name in submodule_names:
-                sub = dict(rbln_config.get(name) or {})
-                sub["create_runtimes"] = False
-                rbln_config[name] = sub
-            logger.info(
-                "EC consumer: skipping encoder submodule runtime creation (%s).",
-                ", ".join(submodule_names),
-            )
-
+        rbln_config = dict(rbln_config)
+        for name in submodule_names:
+            sub = dict(rbln_config.get(name) or {})
+            sub["create_runtimes"] = False
+            rbln_config[name] = sub
+        logger.info(
+            "EC consumer: encoder submodule runtime disabled (%s).",
+            ", ".join(submodule_names),
+        )
         return rbln_config
+
+    def _free_consumer_submodule_compiled_models(
+        self, model: Any, model_cls: type
+    ) -> None:
+        """Free encoder submodule compiled models from CPU memory after
+        the consumer has loaded the full model."""
+        submodule_names = [
+            s["name"] for s in getattr(model_cls, "_rbln_submodules", [])
+        ]
+        for name in submodule_names:
+            sub = getattr(model, name, None)
+            if sub is not None and hasattr(sub, "compiled_models") and sub.compiled_models:
+                num_freed = len(sub.compiled_models)
+                sub.compiled_models = []
+                logger.info(
+                    "EC consumer: freed %d compiled model(s) from "
+                    "submodule '%s' CPU memory",
+                    num_freed, name,
+                )
 
     @property
     def dtype(self) -> torch.dtype:

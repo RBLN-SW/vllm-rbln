@@ -124,7 +124,7 @@ _DEFAULT_SIDE_CHANNEL_PORT = 15100  # separate from VLLM_NIXL_SIDE_CHANNEL_PORT
 _HANDSHAKE_TIMEOUT_MS = 10_000  # ZMQ recv timeout (ms)
 _XFER_POLL_INTERVAL_S = 0.001   # poll interval for async transfer completion
 _CACHE_WAIT_TIMEOUT_S = 30.0    # max time to wait for producer cache availability
-_CACHE_WAIT_POLL_S = 0.5        # poll interval when waiting for producer cache
+_CACHE_WAIT_POLL_S = 0.05       # poll interval when waiting for producer cache
 
 # ---------------------------------------------------------------------------
 # Wire-protocol data classes (msgspec for zero-copy serialisation)
@@ -522,9 +522,9 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
             ):
                 status = self._nixl_agent.check_xfer_state(handle)
                 if status == "DONE":
-                    encoder_cache[mm_hash] = {
-                        k: v.clone() for k, v in local_bufs.items()
-                    }
+                    # Use local_bufs directly — no clone needed since
+                    # they are allocated per-pull and not reused.
+                    encoder_cache[mm_hash] = local_bufs
                     self._nixl_agent.release_xfer_handle(handle)
                     del self._pending_loads[mm_hash]
                     logger.debug(
@@ -562,10 +562,7 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
         for mm_hash, (handle, local_bufs) in list(self._pending_loads.items()):
             status = self._nixl_agent.check_xfer_state(handle)
             if status == "DONE":
-                # Copy aligned CPU buffers into encoder_cache
-                self._encoder_cache[mm_hash] = {
-                    k: v.clone() for k, v in local_bufs.items()
-                }
+                self._encoder_cache[mm_hash] = local_bufs
                 self._nixl_agent.release_xfer_handle(handle)
                 del self._pending_loads[mm_hash]
                 completed.add(mm_hash)
@@ -593,14 +590,15 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
     # ------------------------------------------------------------------
 
     def _refresh_metadata(self, producer_idx: int) -> None:
-        """Re-fetch a specific producer's agent metadata and re-register
-        the remote agent with NIXL so that newly registered tensors are
-        discoverable."""
+        """Re-fetch a specific producer's agent metadata and update the
+        tensor registry.  Only re-registers the NIXL remote agent when
+        new mm_hashes are discovered (avoids expensive remove/re-add on
+        every poll)."""
         endpoint = self._producer_endpoints[producer_idx]
         path = make_zmq_path("tcp", endpoint["host"], endpoint["port"])
         try:
             with _zmq_ctx(zmq.REQ, path) as sock:
-                sock.setsockopt(zmq.RCVTIMEO, 2000)
+                sock.setsockopt(zmq.RCVTIMEO, 500)
                 sock.send(_GET_META_MSG)
                 raw = sock.recv()
             decoder = msgspec.msgpack.Decoder(ECNixlHandshakePayload)
@@ -608,38 +606,44 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
             meta_decoder = msgspec.msgpack.Decoder(ECNixlAgentMetadata)
             agent_meta = meta_decoder.decode(payload.agent_metadata_bytes)
 
-            # Remove stale remote agent and re-add with fresh metadata
-            # so NIXL knows about newly registered memory regions.
-            if producer_idx in self._remote_agent_names:
-                self._nixl_agent.remove_remote_agent(
-                    self._remote_agent_names[producer_idx]
-                )
-            self._remote_agent_names[producer_idx] = (
-                self._nixl_agent.add_remote_agent(agent_meta.agent_metadata)
-            )
-
-            # Rebuild this producer's tensor registry and reverse index
-            self._remote_tensor_registries[producer_idx] = {}
+            # Build the new tensor registry to compare with the old one.
+            new_registry: dict[str, dict[str, tuple[int, int, int, list, str]]] = {}
             for entry in agent_meta.registered_tensors:
                 mm_hash, key, base_addr, nbytes, device_id = entry[:5]
                 shape = entry[5] if len(entry) > 5 else []
                 dtype_str = entry[6] if len(entry) > 6 else "torch.bfloat16"
-                registry = self._remote_tensor_registries[producer_idx]
-                if mm_hash not in registry:
-                    registry[mm_hash] = {}
-                registry[mm_hash][key] = (
+                if mm_hash not in new_registry:
+                    new_registry[mm_hash] = {}
+                new_registry[mm_hash][key] = (
                     base_addr, nbytes, device_id, shape, dtype_str
                 )
+
+            old_registry = self._remote_tensor_registries.get(producer_idx, {})
+            new_mm_hashes = set(new_registry) - set(old_registry)
+
+            # Only re-register NIXL agent when new tensors appear
+            # (remote memory regions have changed).
+            if new_mm_hashes:
+                if producer_idx in self._remote_agent_names:
+                    self._nixl_agent.remove_remote_agent(
+                        self._remote_agent_names[producer_idx]
+                    )
+                self._remote_agent_names[producer_idx] = (
+                    self._nixl_agent.add_remote_agent(agent_meta.agent_metadata)
+                )
+
+            self._remote_tensor_registries[producer_idx] = new_registry
+            for mm_hash in new_registry:
                 self._mm_hash_to_producer[mm_hash] = producer_idx
 
-            total_mm_hashes = len(self._mm_hash_to_producer)
-            logger.debug(
-                "EC NIXL: producer %d metadata refreshed — "
-                "%d mm_hashes available (total across all producers: %d)",
-                producer_idx,
-                len(self._remote_tensor_registries.get(producer_idx, {})),
-                total_mm_hashes,
-            )
+            if new_mm_hashes:
+                logger.debug(
+                    "EC NIXL: producer %d — %d new mm_hash(es) discovered "
+                    "(%d total across all producers)",
+                    producer_idx,
+                    len(new_mm_hashes),
+                    len(self._mm_hash_to_producer),
+                )
         except (zmq.Again, zmq.ZMQError, msgspec.DecodeError) as exc:
             logger.debug(
                 "EC NIXL: metadata refresh for producer %d failed (%s)",

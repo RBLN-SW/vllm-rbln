@@ -262,7 +262,7 @@ async def main(
     host: str = "127.0.0.1",
     max_tokens: int = 200,
     request_rate: float = 0.0,
-    max_concurrency: int = 16,
+    max_concurrency: int = 0,
     timeout: float = 6000.0,
     baseline: bool = False,
     baseline_port: int = 8000,

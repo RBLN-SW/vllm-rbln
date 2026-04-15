@@ -158,6 +158,11 @@ class RBLNOptimumWorker(WorkerBase):
         page_size = get_uniform_page_size(kv_cache_spec.values())
 
         adapter = self.model_runner.model.kv_block_adapter
+        if adapter is None:
+            # EC producer has no KV cache; return minimum to satisfy
+            # vLLM's engine core initialization.
+            return page_size * num_layers
+
         num_gpu_blocks = adapter.get_available_num_blocks()
         # If the model is compiled in the runner,
         # the number of blocks is not set in the vLLM config yet.
@@ -233,6 +238,12 @@ class RBLNOptimumWorker(WorkerBase):
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
+
+        # EC producer has no decoder — skip warmup entirely.
+        ec = getattr(self.vllm_config, "ec_transfer_config", None)
+        if ec is not None and ec.is_ec_producer and not ec.is_ec_consumer:
+            logger.info("EC producer: skipping warmup (no decoder).")
+            return
 
         if not envs.VLLM_RBLN_ENABLE_WARM_UP:
             logger.info(

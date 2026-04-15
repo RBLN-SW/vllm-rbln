@@ -50,6 +50,9 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         vllm_config: VllmConfig,
     ) -> None:
         super().__init__(vllm_config=vllm_config)
+        self.rope_deltas: dict = dict()
+        if self._is_ec_producer_only():
+            return
         self.setup_decoder_mixin(
             attn_impl=self.attn_impl,
             vocab_size=self.model_config.get_vocab_size,
@@ -60,7 +63,6 @@ class RBLNOptimumQwenVLForConditionalGeneration(
             decoder_batch_sizes=self.model.rbln_config.decoder_batch_sizes,
             num_blocks=self.kv_block_adapter._estimated_num_blocks(),
         )
-        self.rope_deltas: dict = dict()
 
     def _build_prefill_params(self, preprocess_outputs: tuple) -> dict:
         return {

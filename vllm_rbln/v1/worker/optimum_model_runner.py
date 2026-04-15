@@ -255,10 +255,20 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
 
         # FIXME async_scheduling?
 
+    def _is_ec_producer_only(self) -> bool:
+        ec = getattr(self.vllm_config, "ec_transfer_config", None)
+        return ec is not None and ec.is_ec_producer and not ec.is_ec_consumer
+
     @instrument(span_name="Loading (RBLN)")
     def load_model(self) -> None:
         with set_current_vllm_config(self.vllm_config, check_compile=False):
             self.model = get_optimum_model(vllm_config=self.vllm_config)
+
+        if self._is_ec_producer_only():
+            # Producer only has the visual encoder; skip LoRA and sampler.
+            self.use_optimum_lora = None
+            return
+
         self.use_optimum_lora = getattr(self.model.model.rbln_config, "use_lora", None)
         if self.lora_config and not self.use_optimum_lora:
             raise RuntimeError(
