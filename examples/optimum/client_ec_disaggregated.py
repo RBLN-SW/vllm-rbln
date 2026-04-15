@@ -112,28 +112,38 @@ async def process_request(
     request_id: int,
     timeout: float = 6000.0,
 ) -> dict:
-    """Send the same request to producer then consumer."""
+    """Send request to producer and consumer simultaneously.
+
+    Consumer's NIXL pull will poll until the producer finishes encoding
+    and registers the cache, so there's no need to wait for the producer
+    before sending to the consumer.
+    """
     t_start = time.perf_counter()
 
-    # Send to producer — triggers vision encoding + NIXL registration.
-    t_producer_start = time.perf_counter()
-    producer_resp = await _send_request(client, producer_url, body, timeout)
-    t_producer_end = time.perf_counter()
+    # Fire both at the same time — consumer will poll via NIXL until
+    # producer's encoder cache is available.
+    producer_task = asyncio.create_task(
+        _send_request(client, producer_url, body, timeout)
+    )
+    consumer_task = asyncio.create_task(
+        _send_request(client, consumer_url, body, timeout)
+    )
 
-    # Consumer pulls encoder cache via NIXL and runs decoder.
-    t_consumer_start = time.perf_counter()
-    resp = await _send_request(client, consumer_url, body, timeout)
-    resp.raise_for_status()
-    t_consumer_end = time.perf_counter()
+    # Wait for both to complete
+    producer_resp, consumer_resp = await asyncio.gather(
+        producer_task, consumer_task
+    )
+    t_end = time.perf_counter()
 
-    result = resp.json()
+    consumer_resp.raise_for_status()
+    result = consumer_resp.json()
     usage = result.get("usage", {})
     return {
         "request_id": request_id,
         "text": result["choices"][0]["message"]["content"],
-        "producer_time": t_producer_end - t_producer_start,
-        "consumer_time": t_consumer_end - t_consumer_start,
-        "total_time": t_consumer_end - t_start,
+        "producer_time": 0.0,  # not measurable separately in parallel mode
+        "consumer_time": t_end - t_start,
+        "total_time": t_end - t_start,
         "completion_tokens": usage.get("completion_tokens", 0),
     }
 
