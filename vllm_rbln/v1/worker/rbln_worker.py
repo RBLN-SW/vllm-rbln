@@ -96,12 +96,6 @@ class RBLNWorker(WorkerBase):
 
         self._init_device_env()
 
-        if self.model_config.trust_remote_code:
-            # note: lazy import to avoid importing torch before initializing
-            from vllm.utils.import_utils import init_cached_hf_modules
-
-            init_cached_hf_modules()
-
         # Buffers saved before sleep
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
         self._rbln_host_threads_before_compile_ready = False

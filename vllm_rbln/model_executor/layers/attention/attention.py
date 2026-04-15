@@ -15,6 +15,7 @@
 import torch
 import vllm.model_executor.layers.attention.attention as vllm_attn
 from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention.attention import (
     Attention,
     get_attention_context,
@@ -26,6 +27,7 @@ from vllm.model_executor.models.utils import extract_layer_index
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 
+from vllm_rbln.v1.attention.kv_cache_bindings import materialize_kv_cache_view
 from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 
 # ---------------------------------------------------------------------------
@@ -51,6 +53,24 @@ def _rbln_attention_init(self, *args, **kwargs) -> None:
         self.layer_index -= start
 
 
+def _resolve_kv_cache(attn_metadata, layer_index: int) -> torch.Tensor:
+    """Resolve the KV cache for a given layer, either from deduplicated
+    base tensors (for torch.export compatibility) or from the direct list."""
+    kv_cache_view_infos = getattr(attn_metadata, "kv_cache_view_infos", None)
+    forward_context = get_forward_context()
+    additional_kwargs = getattr(forward_context, "additional_kwargs", {}) or {}
+    kv_cache_bases = additional_kwargs.get("kv_cache_bases")
+    if kv_cache_bases and kv_cache_view_infos:
+        assert layer_index < len(kv_cache_view_infos)
+        return materialize_kv_cache_view(
+            kv_cache_bases, kv_cache_view_infos[layer_index]
+        )
+
+    assert attn_metadata.kv_caches is not None
+    assert layer_index < len(attn_metadata.kv_caches)
+    return attn_metadata.kv_caches[layer_index]
+
+
 def _rbln_unified_attention(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -64,9 +84,7 @@ def _rbln_unified_attention(
     # kv cache (self.kv_cache); use attention metadata's kv cache.
     # attention metadata's kv cache must equal the attention layer's
     # embedded kv cache.
-    assert attn_metadata.kv_caches is not None
-    assert self.layer_index < len(attn_metadata.kv_caches)
-    kv_cache = attn_metadata.kv_caches[self.layer_index]
+    kv_cache = _resolve_kv_cache(attn_metadata, self.layer_index)
 
     output = self.impl.forward(self, query, key, value, kv_cache, attn_metadata)
     return output
@@ -93,9 +111,7 @@ def _rbln_unified_attention_with_output(
     # kv cache (self.kv_cache); use attention metadata's kv cache.
     # attention metadata's kv cache must equal the attention layer's
     # embedded kv cache.
-    assert attn_metadata.kv_caches is not None
-    assert self.layer_index < len(attn_metadata.kv_caches)
-    kv_cache = attn_metadata.kv_caches[self.layer_index]
+    kv_cache = _resolve_kv_cache(attn_metadata, self.layer_index)
     self.impl.forward(
         self,
         query,

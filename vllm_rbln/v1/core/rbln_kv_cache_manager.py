@@ -469,10 +469,6 @@ class RBLNKVCacheManager(KVCacheManager):
         delay_cache_blocks: bool = False,
         num_encoder_tokens: int = 0,
     ) -> KVCacheBlocks | None:
-        num_full_blocks_before = tuple(
-            request.num_computed_tokens // gi.block_size for gi in self._group_infos
-        )
-
         result = super().allocate_slots(
             request,
             num_new_tokens,
@@ -484,16 +480,27 @@ class RBLNKVCacheManager(KVCacheManager):
             num_encoder_tokens,
         )
 
-        if result is not None:
-            # Defer sub-block indexing until after execute_model writes KV cache,
-            # so that concurrent prefills in the same step cannot match sub-blocks
-            # whose KV data does not yet exist.
-            self._pending_indexing[request.request_id] = (
-                request,
-                num_full_blocks_before,
-            )
+        if result is not None and not delay_cache_blocks:
+            # When delay_cache_blocks=True, the caller is responsible for
+            # calling schedule_sub_block_indexing() after cache_blocks().
+            self.schedule_sub_block_indexing(request)
 
         return result
+
+    def schedule_sub_block_indexing(self, request: Request) -> None:
+        """Record that *request* needs sub-block indexing in the next
+        ``do_pending_indexing`` call.
+
+        When ``allocate_slots`` is called with ``delay_cache_blocks=False``,
+        this is called automatically.  Otherwise the caller must call it
+        """
+        num_full_blocks_before = tuple(
+            request.num_computed_tokens // gi.block_size for gi in self._group_infos
+        )
+        self._pending_indexing[request.request_id] = (
+            request,
+            num_full_blocks_before,
+        )
 
     def drain_pending_copy_ops(self) -> list[KVCacheCopyOp]:
         """Return and clear all pending copy operations.
@@ -579,7 +586,7 @@ class RBLNKVCacheManager(KVCacheManager):
     def _index_newly_cached_blocks(
         self, request: Request, num_full_blocks_before: tuple[int, ...]
     ) -> None:
-        """After allocate_slots caches new full blocks, index their sub-blocks."""
+        """Index sub-blocks for newly cached full blocks since the last call."""
         blocks = self.coordinator.get_blocks(request.request_id)
         for gi, block_list, before in zip(
             self._group_infos, blocks, num_full_blocks_before

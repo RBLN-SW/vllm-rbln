@@ -72,14 +72,17 @@ class RBLNOptimumForEncoderModel(RBLNOptimumModelBase, VllmModelForPooling):
         # Therefore, we override the pooling type to CLS here.
         pooler_config.pooling_type = "CLS"
         assert pooler_config is not None
-        # https://github.com/vllm-project/vllm/blob/72506c98349d6bcd32b4e33eec7b5513453c1502/docs/models/pooling_models.md?plain=1#L312
-        # encode task is split into `token_embed` and `token_classify` tasks
-        self.pooler = DispatchPooler(
-            {
-                "token_embed": pooler_for_token_embed(pooler_config),
-                "embed": pooler_for_embed(pooler_config),
-            },
-        )
+        if self.is_classification_arch():
+            self.pooler = RBLNClassifierPooler()
+        else:
+            # https://github.com/vllm-project/vllm/blob/72506c98349d6bcd32b4e33eec7b5513453c1502/docs/models/pooling_models.md?plain=1#L312
+            # encode task is split into `token_embed` and `token_classify` tasks
+            self.pooler = DispatchPooler(
+                {
+                    "token_embed": pooler_for_token_embed(pooler_config),
+                    "embed": pooler_for_embed(pooler_config),
+                },
+            )
 
     def is_classification_arch(self):
         architectures = getattr(

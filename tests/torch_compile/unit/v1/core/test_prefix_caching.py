@@ -138,6 +138,46 @@ def test_preallocation_in_prefill():
     )
 
 
+def test_chunked_prefill_caches_blocks_progressively():
+    # With delay_cache_blocks + finalization, verify that each prefill
+    # chunk caches exactly the computed blocks.
+    block_size = 16
+    num_blocks_per_request = 4
+
+    scheduler = create_scheduler(
+        block_size=block_size,
+        max_num_batched_tokens=block_size,  # 1 block per step
+        enable_prefix_caching=True,
+        max_model_len=num_blocks_per_request * block_size * 2,
+    )
+    mgr = scheduler.kv_cache_manager
+
+    req = create_requests(
+        1,
+        num_tokens=num_blocks_per_request * block_size,
+        max_tokens=1,
+        same_prompt=True,
+    )[0]
+    scheduler.add_request(req)
+
+    for step in range(num_blocks_per_request):
+        output = scheduler.schedule()
+
+        # All blocks are pre-allocated from step 0.
+        blocks = mgr.get_blocks(req.request_id).blocks[0]
+        assert len(blocks) == num_blocks_per_request
+
+        # After finalization: exactly (step+1) blocks should be cached.
+        cached = [b for b in blocks if b.block_hash is not None]
+        uncached = [b for b in blocks if b.block_hash is None]
+        assert len(cached) == step + 1
+        assert len(uncached) == num_blocks_per_request - step - 1
+
+        is_last = step == num_blocks_per_request - 1
+        runner_out = create_runner_output(output, 0 if is_last else None)
+        scheduler.update_from_output(output, runner_out)
+
+
 def test_preallocation_in_decode():
     # test that block preallocation during the decode phase
     # does not break prefix caching functionality

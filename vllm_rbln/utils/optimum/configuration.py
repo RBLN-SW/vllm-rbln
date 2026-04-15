@@ -32,6 +32,7 @@ from vllm_rbln.utils.optimum.rbln_params import (
 )
 from vllm_rbln.utils.optimum.registry import (
     get_rbln_model_info,
+    is_enc_dec_arch,
     is_generation_arch,
     is_multi_modal,
 )
@@ -80,14 +81,34 @@ def sync_vllm_from_rbln_config(
         )
         vllm_config.scheduler_config.max_num_seqs = batch_size
 
-    if vllm_config.scheduler_config.max_num_batched_tokens != (max_model_len):
+    # For encoder-decoder multimodal models (e.g. Whisper), max_num_batched_tokens
+    # must be at least max_source_positions so that vllm's MultiModalBudget
+    # validation passes (it requires max_tokens_per_mm_item <= max_num_batched_tokens
+    # when chunked MM input is disabled).
+    target_max_num_batched_tokens = max_model_len
+    hf_config = vllm_config.model_config.hf_config
+    if is_enc_dec_arch(hf_config):
+        max_source_positions = getattr(hf_config, "max_source_positions", 0)
+        if max_source_positions > target_max_num_batched_tokens:
+            target_max_num_batched_tokens = max_source_positions
+            logger.info(
+                "Encoder-decoder model detected: setting max_num_batched_tokens "
+                "to %d (max_source_positions) instead of %d (max_model_len)",
+                max_source_positions,
+                max_model_len,
+            )
+
+    cur = vllm_config.scheduler_config.max_num_batched_tokens
+    if cur != target_max_num_batched_tokens:
         logger.info(
-            "Updating scheduler_config.max_num_batched_tokens from %s to "
-            "%d based on rbln_config.json",
-            vllm_config.scheduler_config.max_num_batched_tokens,
-            max_model_len,
+            "Updating scheduler_config.max_num_batched_tokens "
+            "from %s to %d based on rbln_config.json",
+            cur,
+            target_max_num_batched_tokens,
         )
-        vllm_config.scheduler_config.max_num_batched_tokens = max_model_len
+        vllm_config.scheduler_config.max_num_batched_tokens = (
+            target_max_num_batched_tokens
+        )
 
     if vllm_config.model_config.max_model_len != max_model_len:
         logger.info(
