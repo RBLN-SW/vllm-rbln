@@ -513,6 +513,17 @@ class RBLNOptimumScheduler(Scheduler):
                     )
                 )
 
+        # Log batching info
+        num_prefill = len(scheduled_new_reqs) + len(scheduled_resumed_reqs)
+        num_decode = len(scheduled_running_reqs)
+        if num_prefill > 0 or num_decode > 0:
+            logger.info(
+                "Scheduler step: prefill=%d, decode=%d (batch), "
+                "waiting=%d, running=%d",
+                num_prefill, num_decode,
+                len(self.waiting), len(self.running),
+            )
+
         # Construct the scheduler output.
         new_reqs_data = [
             NewRequestData.from_request(

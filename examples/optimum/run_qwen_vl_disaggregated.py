@@ -16,16 +16,21 @@
 """
 EC disaggregated inference example (programmatic, single-script).
 
-Spawns a producer (vision encoder) and consumer (decoder) as two separate
-AsyncLLMEngine instances in child processes. The consumer automatically
-pulls encoder cache from the producer via NIXL.
+Spawns N producers (vision encoder, 1 device each) and 1 consumer
+(decoder, multi-device) as separate AsyncLLMEngine instances in child
+processes. The consumer automatically pulls encoder caches from any
+producer via NIXL.
 
 For a serving-based setup, see:
   - serve_ec_producer.sh / serve_ec_consumer.sh  (vllm serve)
   - client_ec_disaggregated.py                   (OpenAI-compatible client)
 
 Usage:
-  python run_qwen_vl_disaggregated.py --num_input_prompt 3
+  # 8 producers (device 0-7) + 1 consumer (device 8-15):
+  python run_qwen_vl_disaggregated.py --num_producers 8 --num_input_prompt 8
+
+  # Legacy single-producer mode:
+  python run_qwen_vl_disaggregated.py --num_producers 1
 """
 
 import asyncio
@@ -111,14 +116,33 @@ async def _generate(engine, tokenizer, request_id, request):
     return final_output
 
 
-def _make_ec_config(ec_role: str, nixl_host: str, nixl_port: int):
+def _make_producer_ec_config(nixl_host: str, nixl_port: int):
+    """EC config for a single producer (listens on its own side-channel port)."""
     return ECTransferConfig(
         ec_connector="RblnECNixlConnector",
-        ec_role=ec_role,
+        ec_role="ec_producer",
         ec_buffer_device="cpu",
         ec_connector_extra_config={
             "side_channel_host": nixl_host,
             "side_channel_port": nixl_port,
+        },
+    )
+
+
+def _make_consumer_ec_config(
+    nixl_host: str, nixl_base_port: int, num_producers: int
+):
+    """EC config for the consumer (connects to all producer side-channels)."""
+    producer_endpoints = [
+        {"host": nixl_host, "port": nixl_base_port + i}
+        for i in range(num_producers)
+    ]
+    return ECTransferConfig(
+        ec_connector="RblnECNixlConnector",
+        ec_role="ec_consumer",
+        ec_buffer_device="cpu",
+        ec_connector_extra_config={
+            "producer_endpoints": producer_endpoints,
         },
     )
 
@@ -130,9 +154,7 @@ def _make_ec_config(ec_role: str, nixl_host: str, nixl_port: int):
 def _engine_proc(
     model_id: str,
     max_model_len: int | None,
-    ec_role: str,
-    nixl_host: str,
-    nixl_port: int,
+    ec_transfer_config: ECTransferConfig,
     req_queue: "mp.Queue",
     res_queue: "mp.Queue",
     rbln_devices: str | None = None,
@@ -141,20 +163,20 @@ def _engine_proc(
         os.environ["RBLN_DEVICES"] = rbln_devices
     asyncio.run(
         _engine_proc_async(
-            model_id, max_model_len, ec_role,
-            nixl_host, nixl_port, req_queue, res_queue,
+            model_id, max_model_len, ec_transfer_config,
+            req_queue, res_queue,
         )
     )
 
 
 async def _engine_proc_async(
-    model_id, max_model_len, ec_role,
-    nixl_host, nixl_port, req_queue, res_queue,
+    model_id, max_model_len, ec_transfer_config,
+    req_queue, res_queue,
 ):
     engine = AsyncLLMEngine.from_engine_args(AsyncEngineArgs(
         model=model_id,
         max_model_len=max_model_len,
-        ec_transfer_config=_make_ec_config(ec_role, nixl_host, nixl_port),
+        ec_transfer_config=ec_transfer_config,
     ))
     tokenizer = AutoTokenizer.from_pretrained(model_id)
 
@@ -178,35 +200,56 @@ def main(
     model_id: str = "Qwen2-VL-7B-Instruct",
     max_model_len: int | None = None,
     ec_nixl_host: str = "127.0.0.1",
-    ec_nixl_port: int = 15100,
+    ec_nixl_base_port: int = 15100,
+    num_producers: int = 8,
     producer_devices: str = "0,1,2,3,4,5,6,7",
     consumer_devices: str = "8,9,10,11,12,13,14,15",
 ):
     ctx = mp.get_context("spawn")
-    producer_req, producer_res = ctx.Queue(), ctx.Queue()
+
+    # Each producer gets 1 device and its own side-channel port.
+    producer_device_list = producer_devices.split(",")
+    if len(producer_device_list) < num_producers:
+        raise ValueError(
+            f"Need at least {num_producers} producer devices, "
+            f"got {len(producer_device_list)}"
+        )
+
+    producers = []
+    producer_queues = []  # (req_queue, res_queue) per producer
+    for p_idx in range(num_producers):
+        req_q, res_q = ctx.Queue(), ctx.Queue()
+        producer_queues.append((req_q, res_q))
+        ec_cfg = _make_producer_ec_config(
+            ec_nixl_host, ec_nixl_base_port + p_idx
+        )
+        proc = ctx.Process(
+            target=_engine_proc,
+            args=(model_id, max_model_len, ec_cfg, req_q, res_q,
+                  producer_device_list[p_idx]),
+        )
+        producers.append(proc)
+
     consumer_req, consumer_res = ctx.Queue(), ctx.Queue()
-
-    common = (model_id, max_model_len)
-    nixl = (ec_nixl_host, ec_nixl_port)
-
-    producer = ctx.Process(
-        target=_engine_proc,
-        args=(*common, "ec_producer", *nixl, producer_req, producer_res,
-              producer_devices),
+    consumer_ec_cfg = _make_consumer_ec_config(
+        ec_nixl_host, ec_nixl_base_port, num_producers
     )
     consumer = ctx.Process(
         target=_engine_proc,
-        args=(*common, "ec_consumer", *nixl, consumer_req, consumer_res,
-              consumer_devices),
+        args=(model_id, max_model_len, consumer_ec_cfg,
+              consumer_req, consumer_res, consumer_devices),
     )
-    producer.start()
+
+    for p in producers:
+        p.start()
     consumer.start()
 
     inputs = generate_prompts_image(num_input_prompt, model_id)
 
-    # Submit to both — consumer waits for producer's cache via NIXL.
+    # Round-robin requests across producers; send all to consumer.
     for i, req in enumerate(inputs):
-        producer_req.put((i, req))
+        p_idx = i % num_producers
+        producer_queues[p_idx][0].put((i, req))
         consumer_req.put((i, req))
 
     # Collect results from consumer.
@@ -215,16 +258,19 @@ def main(
         req_id, text, elapsed, num_tokens = consumer_res.get()
         consumer_results[req_id] = (text, elapsed, num_tokens)
 
-    # Collect results from producer.
+    # Collect results from producers.
     producer_results = {}
-    for _ in inputs:
-        req_id, text, elapsed, num_tokens = producer_res.get()
+    for i in range(len(inputs)):
+        p_idx = i % num_producers
+        req_id, text, elapsed, num_tokens = producer_queues[p_idx][1].get()
         producer_results[req_id] = (text, elapsed, num_tokens)
 
     # Shutdown.
-    producer_req.put((None, None))
+    for p_idx in range(num_producers):
+        producer_queues[p_idx][0].put((None, None))
     consumer_req.put((None, None))
-    producer.join(timeout=30)
+    for p in producers:
+        p.join(timeout=30)
     consumer.join(timeout=30)
 
     for i in range(len(inputs)):

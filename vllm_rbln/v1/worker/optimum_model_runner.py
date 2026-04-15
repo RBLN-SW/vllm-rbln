@@ -343,9 +343,22 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                 # use a dummy context manager that does nothing
                 capture_ctx = contextlib.nullcontext()
             model_start_time = time.perf_counter()
-            with capture_ctx as model_reports:
-                # FIXME model_input must be modified to be padded
-                hidden_states = self.model(model_input)
+            # EC consumer with cached encoder output: run the decoder
+            # with pre-computed embeddings instead of the full model
+            # forward (which would require the vision encoder runtime).
+            if (
+                has_ec_transfer()
+                and not get_ec_transfer().is_producer
+                and model_input.is_prompt
+                and self.encoder_cache
+            ):
+                with capture_ctx as model_reports:
+                    hidden_states = self._run_decoder_with_cached_encoder(
+                        model_input, scheduler_output
+                    )
+            else:
+                with capture_ctx as model_reports:
+                    hidden_states = self.model(model_input)
             if envs.VLLM_RBLN_METRICS and self.model_performance_tracker is not None:
                 self.collect_metrics(
                     self.model_performance_tracker,
@@ -356,19 +369,6 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                     token_count=0,
                     # the performance of sampler doesn't depend on token count
                 )
-            start_time = time.perf_counter()
-            # FIXME model_input must be modified to be padded
-            if (
-                has_ec_transfer()
-                and not get_ec_transfer().is_producer
-                and model_input.is_prompt
-                and self.encoder_cache
-            ):
-                hidden_states = self._run_decoder_with_cached_encoder(
-                    model_input, scheduler_output
-                )
-            else:
-                hidden_states = self.model(model_input)
             sample_hidden_states = hidden_states.clone()
 
         with record_function_or_nullcontext("rbln_model_runner: postprocess"):

@@ -223,7 +223,14 @@ class RBLNOptimumModelBase(nn.Module):
             model_cls = getattr(optimum.rbln, model_cls_name)
             assert model_cls is not None
             rbln_config = self.vllm_config.additional_config.get("rbln_config", {})
-            # NOTE: We can set the device to run submodules
+
+            # EC disaggregation: selectively create runtimes so that
+            # the producer only loads encoder (vision) submodules and
+            # the consumer only loads the LLM decoder submodules.
+            rbln_config = self._apply_ec_runtime_config(
+                rbln_config, model_cls
+            )
+
             model = model_cls.from_pretrained(
                 self.vllm_config.model_config.model,
                 rbln_config=rbln_config,
@@ -244,6 +251,63 @@ class RBLNOptimumModelBase(nn.Module):
         self.attn_impl = (
             model.get_attn_impl() if hasattr(model, "get_attn_impl") else None
         )
+
+    def _apply_ec_runtime_config(
+        self, rbln_config: dict, model_cls: type
+    ) -> dict:
+        """Apply selective ``create_runtimes`` flags for EC disaggregation.
+
+        * **Producer-only** (``ec_role="ec_producer"``): disables runtimes
+          for the main model (LLM prefill/decode) and keeps them for encoder
+          submodules (e.g. ``visual``).
+        * **Consumer-only** (``ec_role="ec_consumer"``): keeps LLM runtimes
+          and disables encoder submodule runtimes.
+
+        Returns a (possibly copied) *rbln_config* dict; the original is
+        never mutated.
+        """
+        ec_config = getattr(self.vllm_config, "ec_transfer_config", None)
+        if ec_config is None or not ec_config.is_ec_transfer_instance:
+            return rbln_config
+
+        is_producer_only = ec_config.is_ec_producer and not ec_config.is_ec_consumer
+        is_consumer_only = ec_config.is_ec_consumer and not ec_config.is_ec_producer
+
+        if not is_producer_only and not is_consumer_only:
+            return rbln_config
+
+        submodule_names = [
+            s["name"] for s in getattr(model_cls, "_rbln_submodules", [])
+        ]
+        if not submodule_names:
+            return rbln_config
+
+        rbln_config = dict(rbln_config)  # shallow copy to avoid mutating original
+
+        if is_producer_only:
+            # Producer only needs encoder submodules; skip LLM runtimes.
+            rbln_config["create_runtimes"] = False
+            for name in submodule_names:
+                sub = dict(rbln_config.get(name) or {})
+                sub["create_runtimes"] = True
+                rbln_config[name] = sub
+            logger.info(
+                "EC producer: skipping LLM runtime creation, "
+                "loading encoder submodules only (%s).",
+                ", ".join(submodule_names),
+            )
+        elif is_consumer_only:
+            # Consumer only needs LLM runtimes; skip encoder submodules.
+            for name in submodule_names:
+                sub = dict(rbln_config.get(name) or {})
+                sub["create_runtimes"] = False
+                rbln_config[name] = sub
+            logger.info(
+                "EC consumer: skipping encoder submodule runtime creation (%s).",
+                ", ".join(submodule_names),
+            )
+
+        return rbln_config
 
     @property
     def dtype(self) -> torch.dtype:

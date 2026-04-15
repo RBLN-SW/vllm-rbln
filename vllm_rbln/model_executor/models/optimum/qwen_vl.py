@@ -114,9 +114,11 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         if image_input is not None:
             preprocess_args["image_grid_thw"] = image_input["image_grid_thw"]
             if image_input.get("type") == "image_embeds":
+                logger.info("Prefill: using cached image embeddings (encoder skipped)")
                 preprocess_args["image_embeds"] = image_input["image_embeds"]
                 preprocess_args["pixel_values"] = None
             else:
+                logger.info("Prefill: running visual encoder (pixel_values)")
                 preprocess_args["pixel_values"] = image_input["pixel_values"]
                 preprocess_args["image_embeds"] = None
         else:
@@ -128,9 +130,11 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         if video_input is not None:
             preprocess_args["video_grid_thw"] = video_input["video_grid_thw"]
             if video_input.get("type") == "video_embeds":
+                logger.info("Prefill: using cached video embeddings (encoder skipped)")
                 preprocess_args["video_embeds"] = video_input["video_embeds"]
                 preprocess_args["pixel_values_videos"] = None
             else:
+                logger.info("Prefill: running visual encoder (pixel_values_videos)")
                 preprocess_args["pixel_values_videos"] = video_input[
                     "pixel_values_videos"
                 ]
@@ -233,12 +237,17 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         block_tables = kwargs.pop("block_tables")
 
         if is_prompt:
+            logger.info("Model forward: prefill (1 request)")
             logits = self.model.prefill_decoder(
                 **prefill_params,
                 block_tables=block_tables,
             ).logits
         else:
             padded_batch_size = kwargs.pop("padded_batch_size", self.decoder_batch_size)
+            logger.info(
+                "Model forward: decode batch=%d (actual=%d, padded=%d)",
+                request_nums, request_nums, padded_batch_size,
+            )
             self.model.decoder = self.model.decoders[padded_batch_size]
             input_ids = kwargs.pop("input_ids")
 
