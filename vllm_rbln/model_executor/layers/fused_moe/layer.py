@@ -244,6 +244,108 @@ def unquantized_fused_moe_method_rbln(
     return final_hidden_states.reshape(orig_shape)
 
 
+def _apply_grouped_topk_torch(
+    router_logits_2d,  # [T, E] - raw logits (not transposed)
+    top_k,
+    num_expert_group,
+    topk_group,
+    scoring_func='softmax',
+    renormalize=True,
+    e_score_correction_bias=None,
+):
+    """Apply grouped topk routing in PyTorch.
+
+    Groups experts, selects top groups per token, then applies topk routing
+    within selected groups, and scatters results back to full expert space.
+
+    Args:
+        router_logits_2d: [T, E] raw router logits.
+        top_k: Number of experts to select per token.
+        num_expert_group: Number of expert groups (G).
+        topk_group: Number of top groups to select per token.
+        scoring_func: "softmax", "sigmoid", or None.
+        renormalize: Whether to renormalize routing weights after topk.
+        e_score_correction_bias: Optional [E] bias tensor (used with sigmoid).
+
+    Returns:
+        masked_routing_weights: [E, T] tensor with topk routing weights.
+    """
+    T, E = router_logits_2d.shape
+    G = num_expert_group
+    epg = E // G  # experts per group
+
+    # For sigmoid, apply activation before grouping so group scoring uses sigmoid values
+    if scoring_func == 'sigmoid':
+        router_logits_2d = torch.sigmoid(router_logits_2d)  # [T, E]
+
+    # Step 1: Reshape to groups [T, G, E/G]
+    grouped = router_logits_2d.reshape(T, G, epg)
+
+    # Step 2: Score each group by sum of top-2 expert values
+    group_top2_values, _ = torch.topk(grouped, 2, dim=2)  # [T, G, 2]
+    group_scores = group_top2_values.sum(dim=2)  # [T, G]
+
+    # Step 3: Select top topk_group groups per token
+    _, selected_group_idx = torch.topk(group_scores, topk_group, dim=1)  # [T, topk_group]
+
+    # Step 4: Gather selected groups [T, topk_group, epg]
+    idx_expanded = selected_group_idx.unsqueeze(-1).expand(-1, -1, epg)
+    gathered = torch.gather(grouped, 1, idx_expanded)  # [T, topk_group, epg]
+
+    # Transpose to [topk_group, epg, T] then flatten to [topk_group*epg, T]
+    gathered_t = gathered.permute(1, 2, 0).reshape(-1, T)  # [topk_group*epg, T]
+
+    # Step 5: Apply topk routing on gathered experts
+    if scoring_func == 'sigmoid':
+        # gathered is already sigmoid-activated (applied to router_logits_2d above)
+        scores_for_topk = gathered_t
+        if e_score_correction_bias is not None:
+            # Gather bias for selected groups per token
+            bias_grouped = e_score_correction_bias.reshape(G, epg)  # [G, epg]
+            bias_idx = selected_group_idx.unsqueeze(-1).expand(-1, -1, epg)  # [T, topk_group, epg]
+            gathered_bias = torch.gather(
+                bias_grouped.unsqueeze(0).expand(T, -1, -1), 1, bias_idx
+            )  # [T, topk_group, epg]
+            gathered_bias_t = gathered_bias.permute(1, 2, 0).reshape(-1, T)  # [topk_group*epg, T]
+            scores_for_topk = gathered_t + gathered_bias_t
+            _, selected_experts = torch.topk(scores_for_topk, k=top_k, dim=0)
+            topk_weights = gathered_t.gather(0, selected_experts)
+        else:
+            topk_weights, selected_experts = torch.topk(scores_for_topk, k=top_k, dim=0)
+        if renormalize:
+            topk_weights = topk_weights / topk_weights.sum(dim=0, keepdim=True).clamp_min(1e-20)
+    elif scoring_func == 'softmax':
+        if renormalize:
+            # post_norm: topk first, no softmax (renormalize handles normalization)
+            topk_weights, selected_experts = torch.topk(gathered_t, k=top_k, dim=0)
+        else:
+            # pre_norm: softmax first, then topk
+            sw = F.softmax(gathered_t, dim=0)
+            topk_weights, selected_experts = torch.topk(sw, k=top_k, dim=0)
+    else:
+        if renormalize:
+            topk_weights, selected_experts = torch.topk(gathered_t, k=top_k, dim=0)
+            topk_weights = F.softmax(topk_weights, dim=0)
+        else:
+            topk_weights, selected_experts = torch.topk(gathered_t, k=top_k, dim=0)
+
+    # Create masked routing in gathered space [topk_group*epg, T]
+    routed_flat = torch.zeros_like(gathered_t)
+    routed_flat.scatter_(0, selected_experts, topk_weights)
+
+    # Reshape back: [topk_group, epg, T] -> [T, topk_group, epg]
+    routed_3d = routed_flat.reshape(topk_group, epg, T)
+    routed_t = routed_3d.permute(2, 0, 1)  # [T, topk_group, epg]
+
+    # Scatter back to full [T, G, epg]
+    result = torch.zeros(T, G, epg, dtype=routed_t.dtype, device=routed_t.device)
+    idx_expanded = selected_group_idx.unsqueeze(-1).expand(-1, -1, epg)
+    result.scatter_(1, idx_expanded, routed_t)
+
+    # Reshape to [T, E] then transpose to [E, T]
+    return result.reshape(T, E).transpose(0, 1)  # [E, T]
+
+
 def get_tokens_mask(num_tokens: int, left=1.0, right=0.0):
     num_tokens_across_dp = get_forward_context().dp_metadata.num_tokens_across_dp_cpu
     num_tokens_across_dp = num_tokens_across_dp.unsqueeze(1)
@@ -365,7 +467,7 @@ def unquantized_fused_moe_method_custom(
         expert_select_count,
         None,
         None,
-        None,ㅋ
+        None,
         None,
     )
 
@@ -463,39 +565,62 @@ def fused_moe_forward_rbln(
         all_router_logits = all_rl_flat.reshape(R * max_pad, E)  # [R*max_pad, E]
 
         # --- Step 3: topk + softmax on all gathered tokens ---
-        # [E, R*max_pad] for dim=0 topk (select top_k experts per token)
-        all_router_logits_t = all_router_logits.transpose(0, 1)  # [E, R*max_pad]
-
         scoring_func = getattr(self, 'scoring_func', 'softmax')
         e_score_correction_bias = getattr(self, 'e_score_correction_bias', None)
+        use_grouped_topk = getattr(self, 'use_grouped_topk', False)
 
-        # deepseekv3 style: minimax m2.5
         if scoring_func == 'sigmoid':
-            # scores_t = torch.sigmoid(all_router_logits_t)  # [E, R*max_pad]
-
-            # sigmoid scoring with optional e_score_correction_bias
-            scores = torch.sigmoid(all_router_logits)  # [R*max_pad, E]
-            scores_t = scores.transpose(0, 1)  # [E, R*max_pad]
-            scores_for_topk = scores_t
-            if e_score_correction_bias is not None:
-                scores_for_topk = scores_t + e_score_correction_bias.unsqueeze(1)  # [E, 1]
-            _, selected_experts = torch.topk(scores_for_topk, k=self.top_k, dim=0)
-            topk_weights = scores_t.gather(0, selected_experts)  # weights from original scores
-            topk_weights = topk_weights / topk_weights.sum(dim=0, keepdim=True).clamp_min(1e-20)
+            if use_grouped_topk:
+                masked_routing_weights = _apply_grouped_topk_torch(
+                    all_router_logits, self.top_k, self.num_expert_group, self.topk_group,
+                    scoring_func=scoring_func, renormalize=self.renormalize,
+                    e_score_correction_bias=e_score_correction_bias,
+                )  # [E, R*max_pad]
+            else:
+                all_router_logits_t = all_router_logits.transpose(0, 1)  # [E, R*max_pad]
+                # sigmoid scoring with optional e_score_correction_bias
+                scores = torch.sigmoid(all_router_logits)  # [R*max_pad, E]
+                scores_t = scores.transpose(0, 1)  # [E, R*max_pad]
+                scores_for_topk = scores_t
+                if e_score_correction_bias is not None:
+                    scores_for_topk = scores_t + e_score_correction_bias.unsqueeze(1)  # [E, 1]
+                _, selected_experts = torch.topk(scores_for_topk, k=self.top_k, dim=0)
+                topk_weights = scores_t.gather(0, selected_experts)  # weights from original scores
+                topk_weights = topk_weights / topk_weights.sum(dim=0, keepdim=True).clamp_min(1e-20)
+                masked_routing_weights = torch.zeros_like(all_router_logits_t)  # [E, R*max_pad]
+                masked_routing_weights.scatter_(0, selected_experts, topk_weights)
         elif self.renormalize:
-            # post_norm: topk first, then softmax on selected values
-            topk_weights, selected_experts = torch.topk(
-                all_router_logits_t, k=self.top_k, dim=0
-            )
-            topk_weights = F.softmax(topk_weights, dim=0)
+            if use_grouped_topk:
+                masked_routing_weights = _apply_grouped_topk_torch(
+                    all_router_logits, self.top_k, self.num_expert_group, self.topk_group,
+                    scoring_func=scoring_func, renormalize=self.renormalize,
+                    e_score_correction_bias=e_score_correction_bias,
+                )  # [E, R*max_pad]
+            else:
+                all_router_logits_t = all_router_logits.transpose(0, 1)  # [E, R*max_pad]
+                # post_norm: topk first, then softmax on selected values
+                topk_weights, selected_experts = torch.topk(
+                    all_router_logits_t, k=self.top_k, dim=0
+                )
+                topk_weights = F.softmax(topk_weights, dim=0)
+                masked_routing_weights = torch.zeros_like(all_router_logits_t)  # [E, R*max_pad]
+                masked_routing_weights.scatter_(0, selected_experts, topk_weights)
         else:
-            # pre_norm: softmax first, then topk
-            routing_weights = F.softmax(all_router_logits_t, dim=0)
-            topk_weights, selected_experts = torch.topk(
-                routing_weights, k=self.top_k, dim=0
-            )
-        masked_routing_weights = torch.zeros_like(all_router_logits_t)  # [E, R*max_pad]
-        masked_routing_weights.scatter_(0, selected_experts, topk_weights)
+            if use_grouped_topk:
+                masked_routing_weights = _apply_grouped_topk_torch(
+                    all_router_logits, self.top_k, self.num_expert_group, self.topk_group,
+                    scoring_func=scoring_func, renormalize=self.renormalize,
+                    e_score_correction_bias=e_score_correction_bias,
+                )  # [E, R*max_pad]
+            else:
+                all_router_logits_t = all_router_logits.transpose(0, 1)  # [E, R*max_pad]
+                # pre_norm: softmax first, then topk
+                routing_weights = F.softmax(all_router_logits_t, dim=0)
+                topk_weights, selected_experts = torch.topk(
+                    routing_weights, k=self.top_k, dim=0
+                )
+                masked_routing_weights = torch.zeros_like(all_router_logits_t)  # [E, R*max_pad]
+                masked_routing_weights.scatter_(0, selected_experts, topk_weights)
 
         # Apply token mask to zero out padded positions per DP rank
         use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
@@ -588,32 +713,59 @@ def fused_moe_forward_rbln(
     router_logits_2d = router_logits.reshape(num_tokens, -1)
 
     # transpose to [E, t] for dim=0 topk (matching detach_topk branch)
-    router_logits_t = router_logits_2d.transpose(0, 1)  # [E, t]
-
     scoring_func = getattr(self, 'scoring_func', 'softmax')
     e_score_correction_bias = getattr(self, 'e_score_correction_bias', None)
+    use_grouped_topk = getattr(self, 'use_grouped_topk', False)
 
     if scoring_func == 'sigmoid':
-        # DeepSeek-V3 style: sigmoid scoring with optional e_score_correction_bias
-        scores_t = torch.sigmoid(router_logits_t)  # [E, t]
-        scores_for_topk = scores_t
-        if e_score_correction_bias is not None:
-            scores_for_topk = scores_t + e_score_correction_bias.unsqueeze(1)  # [E, 1]
-        _, selected_experts = torch.topk(scores_for_topk, k=self.top_k, dim=0)
-        topk_weights = scores_t.gather(0, selected_experts)  # weights from original scores
-        topk_weights = topk_weights / topk_weights.sum(dim=0, keepdim=True).clamp_min(1e-20)
+        if use_grouped_topk:
+            masked_routing_weights = _apply_grouped_topk_torch(
+                router_logits_2d, self.top_k, self.num_expert_group, self.topk_group,
+                scoring_func=scoring_func, renormalize=self.renormalize,
+                e_score_correction_bias=e_score_correction_bias,
+            )  # [E, t]
+        else:
+            router_logits_t = router_logits_2d.transpose(0, 1)  # [E, t]
+            # DeepSeek-V3 style: sigmoid scoring with optional e_score_correction_bias
+            scores_t = torch.sigmoid(router_logits_t)  # [E, t]
+            scores_for_topk = scores_t
+            if e_score_correction_bias is not None:
+                scores_for_topk = scores_t + e_score_correction_bias.unsqueeze(1)  # [E, 1]
+            _, selected_experts = torch.topk(scores_for_topk, k=self.top_k, dim=0)
+            topk_weights = scores_t.gather(0, selected_experts)  # weights from original scores
+            topk_weights = topk_weights / topk_weights.sum(dim=0, keepdim=True).clamp_min(1e-20)
+            masked_routing_weights = torch.zeros_like(router_logits_t)  # [E, t]
+            masked_routing_weights.scatter_(0, selected_experts, topk_weights)
     elif self.renormalize:
-        topk_weights, selected_experts = torch.topk(
-            router_logits_t, k=self.top_k, dim=0
-        )
-        topk_weights = F.softmax(topk_weights, dim=0)
+        if use_grouped_topk:
+            masked_routing_weights = _apply_grouped_topk_torch(
+                router_logits_2d, self.top_k, self.num_expert_group, self.topk_group,
+                scoring_func=scoring_func, renormalize=self.renormalize,
+                e_score_correction_bias=e_score_correction_bias,
+            )  # [E, t]
+        else:
+            router_logits_t = router_logits_2d.transpose(0, 1)  # [E, t]
+            topk_weights, selected_experts = torch.topk(
+                router_logits_t, k=self.top_k, dim=0
+            )
+            topk_weights = F.softmax(topk_weights, dim=0)
+            masked_routing_weights = torch.zeros_like(router_logits_t)  # [E, t]
+            masked_routing_weights.scatter_(0, selected_experts, topk_weights)
     else:
-        routing_weights = F.softmax(router_logits_t, dim=0)
-        topk_weights, selected_experts = torch.topk(
-            routing_weights, k=self.top_k, dim=0
-        )
-    masked_routing_weights = torch.zeros_like(router_logits_t)  # [E, t]
-    masked_routing_weights.scatter_(0, selected_experts, topk_weights)
+        if use_grouped_topk:
+            masked_routing_weights = _apply_grouped_topk_torch(
+                router_logits_2d, self.top_k, self.num_expert_group, self.topk_group,
+                scoring_func=scoring_func, renormalize=self.renormalize,
+                e_score_correction_bias=e_score_correction_bias,
+            )  # [E, t]
+        else:
+            router_logits_t = router_logits_2d.transpose(0, 1)  # [E, t]
+            routing_weights = F.softmax(router_logits_t, dim=0)
+            topk_weights, selected_experts = torch.topk(
+                routing_weights, k=self.top_k, dim=0
+            )
+            masked_routing_weights = torch.zeros_like(router_logits_t)  # [E, t]
+            masked_routing_weights.scatter_(0, selected_experts, topk_weights)
 
     # Restore dtype to match hidden_states BEFORE tokens_mask multiply
     # (scatter_ promotes to float32, but LowerTopKRouting fuses
