@@ -241,7 +241,7 @@ def unquantized_fused_moe_method_rbln(
     return final_hidden_states.reshape(orig_shape)
 
 
-def get_tokens_mask(num_tokens: int, left=1.0, right=0.0):
+def get_tokens_mask(num_tokens: int, left=1.0, right=0.0, device=None):
     num_tokens_across_dp = get_forward_context().dp_metadata.num_tokens_across_dp_cpu
     num_tokens_across_dp = num_tokens_across_dp.unsqueeze(1)
     if num_tokens_across_dp.size(0) == 1:
@@ -253,6 +253,8 @@ def get_tokens_mask(num_tokens: int, left=1.0, right=0.0):
         pos < num_tokens_across_dp, left, right
     )  # [dp_size, max_pad]
     tokens_mask = tokens_mask.reshape(-1, 1)  # [dp_size * max_pad, 1]
+    if device is not None:
+        tokens_mask = tokens_mask.to(device)
     return tokens_mask
 
 
@@ -273,7 +275,9 @@ def get_masked_routing_weights(router_logits, top_k, renormalize, expert_map):
 
     use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
     if use_moe_tokens_mask:
-        tokens_mask = get_tokens_mask(router_logits.shape[0], 1.0, 0.0)
+        tokens_mask = get_tokens_mask(
+            router_logits.shape[0], 1.0, 0.0, device=selected_weights.device
+        )
         selected_weights = selected_weights * tokens_mask
 
     n_expert = router_logits.shape[1]
@@ -383,15 +387,13 @@ def unquantized_fused_optimize_moe_method_custom(
 
     expert_map_const = None
     if layer.expert_map is not None:
-        assert getattr(layer, "expert_map_const", None) is not None
-        # Keep tensor ops only: .tolist() + torch.tensor(list) graph-breaks under
-        # PyTorch 2.10+ Dynamo when capture_scalar_outputs is false (pytorch#163807).
-        expert_map_const = torch.tensor(layer.expert_map_const, dtype=torch.int32)
+        # workaround for torch.export.export
+        expert_map_const = layer.expert_map.clone().detach().to(dtype=torch.int32)
 
     tokens_mask = None
     use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
     if use_moe_tokens_mask:
-        tokens_mask = get_tokens_mask(num_tokens)
+        tokens_mask = get_tokens_mask(num_tokens, device=router_logits.device)
 
     # optimum-rbln/src/optimum/rbln/transformers/models/qwen3_moe/
     # qwen3_moe_architecture.py

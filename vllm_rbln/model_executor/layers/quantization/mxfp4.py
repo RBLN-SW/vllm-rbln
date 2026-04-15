@@ -406,15 +406,15 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if layer.activation == "swigluoai":
             expert_map_const = None
             if layer.expert_map is not None:
-                assert getattr(layer, "expert_map_const", None) is not None
-                expert_map_const = torch.tensor(
-                    layer.expert_map_const, dtype=torch.int32
+                # workaround for torch.export.export
+                expert_map_const = (
+                    layer.expert_map.clone().detach().to(dtype=torch.int32)
                 )
 
             tokens_mask = None
             use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
             if use_moe_tokens_mask:
-                tokens_mask = get_tokens_mask(num_tokens)
+                tokens_mask = get_tokens_mask(num_tokens, device=router_logits.device)
 
             final_hidden_states = torch.ops.rbln_custom_ops.custom_moe_glu_mxfp4(
                 hidden_states,
