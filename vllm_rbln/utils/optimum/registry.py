@@ -211,13 +211,11 @@ def compile_model(
         raise NotImplementedError(
             f"Compilation is not implemented for architecture {architectures[0]}"
         )
-    print("@@ additional_config for compilation: ", additional_config)
     if additional_config:
         default_param.update(additional_config)
     # FIXME:
     # Check conflict between default_param and additional_config,
     # and raise error if conflict exists, to avoid silent bug.
-    print("@@ default_param for compilation: ", default_param)
     model = model_cls.from_pretrained(
         hf_model_name,
         rbln_config=default_param,
