@@ -25,6 +25,8 @@ import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
 from vllm_rbln.model_executor.layers.fused_moe.all2all import (  # noqa: F401 — registers custom ops on import
     CCL_ALL2ALL_GROUP_ID,
+    ccl_combine_receive,  # noqa: F811
+    ccl_combine_send,  # noqa: F811
     prepare_send_mask_matrix,
 )
 
@@ -488,50 +490,61 @@ def fused_moe_forward_rbln(
             masked_routing_weights = masked_routing_weights * tokens_mask
             masked_routing_weights_depadded = F.pad(masked_routing_weights, (0, -pad_size), value=0.0)
 
-        # all_routing_3d: [E, R, max_pad] for CCL send kernel
-        all_routing_3d = masked_routing_weights_depadded.reshape(E, R, max_pad)
+        # --- Pre-compute routing logit slices (used by dispatch and/or combine all2all) ---
+        if envs.VLLM_RBLN_DISPATCH_ALL2ALL or envs.VLLM_RBLN_COMBINE_ALL2ALL:
+            # all_routing_3d: [E, R, max_pad] for CCL send/receive kernels
+            all_routing_3d = masked_routing_weights_depadded.reshape(E, R, max_pad)
 
-        # --- Step 4: CCL all2all dispatch ---
-        # Prepare per-rank router_logits slices
-        e = E // R  # local experts per rank
-        # send_rl: [E, max_pad] — this rank's local routing
-        send_rl = all_routing_3d[:, self.dp_rank, :]  # (E, max_pad)
-        # recv_rl: [e, R*max_pad] — local experts' routing across all ranks
-        e_start = self.dp_rank * e
-        recv_rl = all_routing_3d[e_start : e_start + e].reshape(e, R * max_pad)  # (e, T)
+            # Prepare per-rank router_logits slices
+            e = E // R  # local experts per rank
+            # send_rl: [E, max_pad] — this rank's routing for all experts
+            send_rl = all_routing_3d[:, self.dp_rank, :]  # (E, max_pad)
+            # recv_rl: [e, R*max_pad] — local experts' routing across all ranks
+            e_start = self.dp_rank * e
+            recv_rl = all_routing_3d[e_start : e_start + e].reshape(e, R * max_pad)  # (e, T)
 
-        # hidden_flat: [max_pad, H] (already padded above)
+        # --- Step 4: Dispatch tokens across DP ranks ---
+        if envs.VLLM_RBLN_DISPATCH_ALL2ALL:
+            # --- all2all dispatch path ---
+            # hidden_flat: [max_pad, H] (already padded above)
 
-        # ccl_dispatch_send
-        send_buffer, send_sizes = (
-            torch.ops.rbln_custom_ops.ccl_dispatch_send(
+            # ccl_dispatch_send
+            send_buffer, send_sizes = (
+                torch.ops.rbln_custom_ops.ccl_dispatch_send(
+                    hidden_flat,
+                    send_rl,
+                    self.send_mask,
+                    self.dp_rank,
+                )
+            )
+
+            # ccl_all2all_x (naive P2P)
+            recv_buffer = torch.ops.rbln_custom_ops.ccl_all2all_x_kernel(
+                send_buffer,
+                send_sizes,
+                self.dp_size,
+                CCL_ALL2ALL_GROUP_ID,
+            )
+
+            # ccl_dispatch_receive → unpacked: [R, max_pad, H]
+            unpacked = torch.ops.rbln_custom_ops.ccl_dispatch_receive(
+                recv_buffer,
+                recv_rl,
                 hidden_flat,
-                send_rl,
-                self.send_mask,
                 self.dp_rank,
             )
-        )
 
-        # ccl_all2all_x (naive P2P)
-        recv_buffer = torch.ops.rbln_custom_ops.ccl_all2all_x_kernel(
-            send_buffer,
-            send_sizes,
-            self.dp_size,
-            CCL_ALL2ALL_GROUP_ID,
-        )
+            # unpacked: [R, max_pad, H] → flatten to [R*max_pad, H] for MoE
+            gathered_hidden = unpacked.reshape(R * max_pad, H_dim)
+        else:
+            # --- all-gather dispatch path ---
+            # Broadcast hidden_states to all DP ranks via all_gather
+            # hidden_flat: [max_pad, H] → [1, max_pad, H] → all_gather → [R, max_pad, H]
+            hidden_for_gather = hidden_flat.unsqueeze(0)  # [1, max_pad, H]
+            all_hidden = get_dp_group().all_gather(hidden_for_gather, dim=0)  # [R, max_pad, H]
+            gathered_hidden = all_hidden.reshape(R * max_pad, H_dim)
 
-        # ccl_dispatch_receive → unpacked: [R, max_pad, H]
-        unpacked = torch.ops.rbln_custom_ops.ccl_dispatch_receive(
-            recv_buffer,
-            recv_rl,
-            hidden_flat,
-            self.dp_rank,
-        )
-
-        # --- Step 5: MoE FFN on gathered tokens ---
-        # unpacked: [R, max_pad, H] → flatten to [R*max_pad, H] for MoE
-        gathered_hidden = unpacked.reshape(R * max_pad, H_dim)
-
+        # --- Step 5: MoE FFN computation ---
         final_hidden_states = self.quant_method.apply(
             layer=self,
             x=gathered_hidden,
@@ -539,14 +552,50 @@ def fused_moe_forward_rbln(
         )
 
         # --- Step 6: Combine partial results and extract this rank's output ---
-        # reduce_scatter: each rank receives only its own summed portion
-        # (more efficient than all_reduce + slice since each rank only needs 1/R of data)
-        hidden_shape_dp = (-1, 1, H_dim)
-        all_hidden_states = final_hidden_states.reshape(hidden_shape_dp)
-        assert all_hidden_states.shape[0] % self.dp_size == 0
+        if envs.VLLM_RBLN_COMBINE_ALL2ALL:
+            # --- all2all combine path ---
+            # MoE output: [R*max_pad, H] → [R, max_pad, H]
+            combine_3d = final_hidden_states.reshape(R, max_pad, H_dim)
 
-        final_hidden_states = get_dp_group().reduce_scatter(all_hidden_states, dim=0)
-        assert final_hidden_states.shape[0] == max_pad
+            # ccl_combine_send: pack expert outputs per destination rank
+            # recv_rl (e, T): local experts' routing → sum-reduction for dest indices
+            combine_send_buf, combine_send_sizes = (
+                torch.ops.rbln_custom_ops.ccl_combine_send(
+                    combine_3d,
+                    recv_rl,
+                    self.dp_rank,
+                )
+            )
+
+            # ccl_all2all_x: exchange combine buffers (reuse same group ID)
+            combine_recv_buf = torch.ops.rbln_custom_ops.ccl_all2all_x_kernel(
+                combine_send_buf,
+                combine_send_sizes,
+                self.dp_size,
+                CCL_ALL2ALL_GROUP_ID,
+            )
+
+            # ccl_combine_receive: unpack + sum-reduce → (max_pad, H)
+            # send_rl (E, max_pad): this rank's full expert routing
+            # self.send_mask: reused as expert_map (same matrix)
+            final_hidden_states = torch.ops.rbln_custom_ops.ccl_combine_receive(
+                combine_recv_buf,
+                send_rl,
+                self.send_mask,
+                combine_3d[self.dp_rank],  # local rank's own contribution
+                self.dp_rank,
+            )
+            # final_hidden_states: (max_pad, H)
+        else:
+            # --- reduce_scatter combine path ---
+            # reduce_scatter: each rank receives only its own summed portion
+            # (more efficient than all_reduce + slice since each rank only needs 1/R of data)
+            hidden_shape_dp = (-1, 1, H_dim)
+            all_hidden_states = final_hidden_states.reshape(hidden_shape_dp)
+            assert all_hidden_states.shape[0] % self.dp_size == 0
+
+            final_hidden_states = get_dp_group().reduce_scatter(all_hidden_states, dim=0)
+            assert final_hidden_states.shape[0] == max_pad
 
         final_hidden_states = final_hidden_states[:t]
         final_hidden_states = final_hidden_states.reshape(org_hidden_shape)
@@ -663,9 +712,13 @@ _original_fused_moe_init = FusedMoE.__init__
 
 def _fused_moe_init_with_all2all(self, *args, **kwargs):
     _original_fused_moe_init(self, *args, **kwargs)
-    if self.dp_size > 1:
+    use_dispatch_all2all = envs.VLLM_RBLN_DISPATCH_ALL2ALL
+    use_combine_all2all = envs.VLLM_RBLN_COMBINE_ALL2ALL
+
+    if self.dp_size > 1 and (use_dispatch_all2all or use_combine_all2all):
         R = self.dp_size
         E = self.global_num_experts
+        # send_mask doubles as expert_map for combine_receive (same matrix)
         self.register_buffer(
             "send_mask",
             torch.tensor(
@@ -674,9 +727,15 @@ def _fused_moe_init_with_all2all(self, *args, **kwargs):
             ),
         )
         logger.info(
-            f"[RBLN] FusedMoE all2all masks registered (P2P / dispatch): "
+            f"[RBLN] FusedMoE all2all masks registered "
+            f"(dispatch={use_dispatch_all2all}, combine={use_combine_all2all}): "
             f"R={R}, E={E}, "
             f"send_mask={self.send_mask.shape}"
+        )
+    elif self.dp_size > 1:
+        logger.info(
+            f"[RBLN] FusedMoE using all-gather dispatch: "
+            f"R={self.dp_size}, E={self.global_num_experts}"
         )
 
 

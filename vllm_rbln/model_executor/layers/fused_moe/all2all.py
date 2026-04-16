@@ -194,6 +194,138 @@ def _ccl_dispatch_receive_fake(
 
 
 # ---------------------------------------------------------------------------
+# Custom op: ccl_combine_send
+# ---------------------------------------------------------------------------
+
+
+@torch.library.custom_op(
+    "rbln_custom_ops::ccl_combine_send",
+    mutates_args=(),
+)
+def ccl_combine_send(
+    hidden_states: Tensor,
+    router_logits: Tensor,
+    rank_id: int,
+) -> Tuple[Tensor, Tensor]:
+    """Combine send: pack per-rank expert outputs for all2all exchange.
+
+    Reverse of dispatch_receive — uses sum-reduction over local experts.
+
+    Args:
+        hidden_states: (R, t, H) — per-rank token embeddings after expert processing
+        router_logits: (e, T) — local expert routing logits, e=E/R, T=R*t
+        rank_id: this rank's ID
+
+    Returns:
+        send_buffer: (R, t, H) — packed hidden states per dest rank
+        send_sizes: (R, 64) — uint16 valid count per dest rank
+    """
+    R_dim = hidden_states.shape[0]
+    t_dim = hidden_states.shape[1]
+    H_dim = hidden_states.shape[2]
+
+    # e-reduction via sum: (e, T) -> (T,) -> (R, t)
+    send_logit = router_logits.sum(dim=0).reshape(R_dim, t_dim)
+
+    send_buffer = torch.zeros(R_dim, t_dim, H_dim, dtype=hidden_states.dtype)
+    send_sizes = torch.zeros(R_dim, 64, dtype=torch.uint16)
+    for r in range(R_dim):
+        valid_idx = send_logit[r].nonzero(as_tuple=True)[0]
+        send_buffer[r, : valid_idx.shape[0]] = hidden_states[r, valid_idx]
+        send_sizes[r, 0] = valid_idx.shape[0]
+
+    return send_buffer, send_sizes
+
+
+@ccl_combine_send.register_fake
+def _ccl_combine_send_fake(
+    hidden_states: Tensor,
+    router_logits: Tensor,
+    rank_id: int,
+) -> Tuple[Tensor, Tensor]:
+    R_dim = hidden_states.shape[0]
+    t_dim = hidden_states.shape[1]
+    H_dim = hidden_states.shape[2]
+    return (
+        torch.empty(R_dim, t_dim, H_dim, dtype=hidden_states.dtype),
+        torch.empty(R_dim, 64, dtype=torch.uint16),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Custom op: ccl_combine_receive
+# ---------------------------------------------------------------------------
+
+
+@torch.library.custom_op(
+    "rbln_custom_ops::ccl_combine_receive",
+    mutates_args=(),
+)
+def ccl_combine_receive(
+    recv_buffer: Tensor,
+    router_logits: Tensor,
+    expert_map: Tensor,
+    hidden_states: Tensor,
+    rank_id: int,
+) -> Tensor:
+    """Combine receive: unpack recv_buffer and sum-reduce over R ranks.
+
+    Reverse of dispatch_send — uses expert_map @ router_logits matmul.
+
+    Args:
+        recv_buffer: (R, t, H) — packed received data per source rank
+        router_logits: (E, t) — this rank's routing logits (full experts)
+        expert_map: (R, E) — per-rank expert map (identity-based)
+        hidden_states: (t, H) — local rank's hidden states
+        rank_id: this rank's ID
+
+    Returns:
+        output: (t, H) — sum-reduced over R ranks
+    """
+    R_dim = recv_buffer.shape[0]
+    t_dim = recv_buffer.shape[1]
+    H_dim = recv_buffer.shape[2]
+
+    # recv_logit = expert_map @ router_logits -> (R, t)
+    recv_logit = torch.matmul(expert_map, router_logits)  # (R, t)
+
+    # nonzero -> recv_indices
+    t_padded = (t_dim + 63) // 64 * 64
+    recv_indices = torch.full((R_dim, t_padded), 65535, dtype=torch.uint16)
+    recv_sizes = torch.zeros(R_dim, 64, dtype=torch.uint16)
+    for r in range(R_dim):
+        valid_idx = recv_logit[r].nonzero(as_tuple=True)[0].to(torch.uint16)
+        recv_indices[r, : valid_idx.shape[0]] = valid_idx
+        recv_sizes[r, 0] = valid_idx.shape[0]
+
+    # scatter + replace rank_id slot
+    unpacked = torch.zeros(R_dim, t_dim, H_dim, dtype=recv_buffer.dtype)
+    for r in range(R_dim):
+        if r == rank_id:
+            unpacked[r] = hidden_states
+        else:
+            num_valid = int(recv_sizes[r, 0])
+            valid_idx = recv_indices[r, :num_valid].long()
+            unpacked[r, valid_idx] = recv_buffer[r, :num_valid]
+
+    # sum-reduce over R ranks
+    return unpacked.sum(dim=0)
+
+
+@ccl_combine_receive.register_fake
+def _ccl_combine_receive_fake(
+    recv_buffer: Tensor,
+    router_logits: Tensor,
+    expert_map: Tensor,
+    hidden_states: Tensor,
+    rank_id: int,
+) -> Tensor:
+    t_dim = recv_buffer.shape[1]
+    H_dim = recv_buffer.shape[2]
+    return torch.empty(t_dim, H_dim, dtype=recv_buffer.dtype)
+
+
+# ---------------------------------------------------------------------------
 # CCL All2All group ID
 # ---------------------------------------------------------------------------
 CCL_ALL2ALL_GROUP_ID = 42  ## may make problem in multiple layers ?
