@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import hashlib
+import json
 import math
 import os
 from pathlib import Path
@@ -49,11 +51,25 @@ def generate_model_path_name(
     block_size: int,
     max_model_len: int,
     tp_size: int,
+    additional_config: dict[str, Any] | None = None,
 ) -> str:
     # FIXME: To avoid cache collisions, the cache key should also include
     # the versions of the compiler and optimum-rbln.
-    model_name = model_name.replace("/", "_").replace(":", "_")
-    return f"{model_name}_bs{batch_size}_blk{block_size}_msl{max_model_len}_tp{tp_size}"
+    config_dict = {
+        "model_name": model_name,
+        "batch_size": batch_size,
+        "block_size": block_size,
+        "max_model_len": max_model_len,
+        "tp_size": tp_size,
+    }
+    if additional_config:
+        config_dict["rbln_config"] = additional_config
+
+    config_json = json.dumps(config_dict, sort_keys=True, default=str)
+    config_hash = hashlib.sha256(config_json.encode()).hexdigest()[:16]
+
+    sanitized_name = model_name.replace("/", "_").replace(":", "_")
+    return f"{sanitized_name}_{config_hash}"
 
 
 class KVCacheBlockAdapter:
@@ -211,12 +227,14 @@ class RBLNOptimumModelBase(nn.Module):
         # look up the cached compiled model.
         # If it does not exist, compile and save it to the cache for future use.
         if not is_compiled_model:
+            rbln_config = self.vllm_config.additional_config.get("rbln_config", {})
             model_path_name = generate_model_path_name(
                 self.model_config.model,
                 batch_size=self.scheduler_config.max_num_seqs,
                 block_size=get_attn_block_size(self.vllm_config),
                 max_model_len=self.model_config.max_model_len,
                 tp_size=envs.VLLM_RBLN_TP_SIZE,
+                additional_config=rbln_config if rbln_config else None,
             )
             cached_model_path = os.path.join(
                 envs.VLLM_CACHE_ROOT,
@@ -227,7 +245,6 @@ class RBLNOptimumModelBase(nn.Module):
                     "Compiling the model %s. This may take a while...",
                     self.model_config.model,
                 )
-                rbln_config = self.vllm_config.additional_config.get("rbln_config", {})
                 model = compile_model(
                     self.model_config.model,
                     config,
