@@ -16,47 +16,97 @@
 """
 Usage:
 Single node:
-    python examples/offline_inference/data_parallel.py \
-            --model="ibm-research/PowerMoE-3b" \
-            --dp-size=2 \
-            --tp-size=2
+    python examples/experimental/qwen3_data_parallel.py \
+            --model="Qwen/Qwen3-1.7B" \
+            -dp=2 \
+            -tp=1
 
 Multi-node:
     Node 0 (assume the node has ip of 10.99.48.128):
-            python examples/offline_inference/data_parallel.py \
-                    --model="ibm-research/PowerMoE-3b" \
-                    --dp-size=2 \
-                    --tp-size=2 \
-                    --node-size=2 \
-                    --node-rank=0 \
-                    --master-addr=10.99.48.128 \
-                    --master-port=13345
+            python examples/experimental/qwen3_data_parallel.py \
+                    --model="Qwen/Qwen3-1.7B" \
+                    -dp=2 \
+                    -tp=1 \
+                    --dp-num-nodes=2 \
+                    --dp-node-rank=0 \
+                    --dp-master-addr=10.99.48.128 \
+                    --dp-master-port=13345
     Node 1:
-            python examples/offline_inference/data_parallel.py \
-                    --model="ibm-research/PowerMoE-3b" \
-                    --dp-size=2 \
-                    --tp-size=2 \
-                    --node-size=2 \
-                    --node-rank=1 \
-                    --master-addr=10.99.48.128 \
-                    --master-port=13345
+            python examples/experimental/qwen3_data_parallel.py \
+                    --model="Qwen/Qwen3-1.7B" \
+                    -dp=2 \
+                    -tp=1 \
+                    --dp-num-nodes=2 \
+                    --dp-node-rank=1 \
+                    --dp-master-addr=10.99.48.128 \
+                    --dp-master-port=13345
 """
 
 import os
 from time import sleep
 
-from vllm import LLM, SamplingParams
-from vllm.utils import get_open_port
+from vllm import LLM, EngineArgs, SamplingParams
+from vllm.utils.argparse_utils import FlexibleArgumentParser
+from vllm.utils.network_utils import get_open_port
+
+
+def create_parser():
+    parser = FlexibleArgumentParser(description="Data Parallel Inference")
+
+    # Add all engine args
+    EngineArgs.add_cli_args(parser)
+    parser.set_defaults(
+        model="Qwen/Qwen3-1.7B",
+        enable_expert_parallel=False,
+        max_model_len=8 * 1024,
+        block_size=1024,
+        enable_chunked_prefill=True,
+        max_num_batched_tokens=128,
+        max_num_seqs=8,
+    )
+
+    # Add DP-specific args (separate from engine args to avoid conflicts)
+    parser.add_argument(
+        "--dp-num-nodes",
+        type=int,
+        default=1,
+        help="Total number of nodes for data parallel.",
+    )
+    parser.add_argument(
+        "--dp-node-rank",
+        type=int,
+        default=0,
+        help="Rank of the current node for data parallel.",
+    )
+    parser.add_argument(
+        "--dp-master-addr",
+        type=str,
+        default="",
+        help="Master node IP address for DP coordination.",
+    )
+    parser.add_argument(
+        "--dp-master-port",
+        type=int,
+        default=0,
+        help="Master node port for DP coordination.",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=300,
+        help="Number of seconds before unresponsive process is killed.",
+    )
+
+    return parser
 
 
 def main(
-    model,
     dp_size,
     local_dp_rank,
     global_dp_rank,
     dp_master_ip,
     dp_master_port,
-    GPUs_per_dp_rank,
+    engine_args,
 ):
     os.environ["VLLM_DP_RANK"] = str(global_dp_rank)
     os.environ["VLLM_DP_RANK_LOCAL"] = str(local_dp_rank)
@@ -79,38 +129,24 @@ def main(
     # with DP, each rank should process different prompts.
     # usually all the DP ranks process a full dataset,
     # and each rank processes a different part of the dataset.
-    promts_per_rank = len(prompts) // dp_size
-    start = global_dp_rank * promts_per_rank
-    end = start + promts_per_rank
-    prompts = prompts[start:end]
+    floor = len(prompts) // dp_size
+    remainder = len(prompts) % dp_size
+
+    def start(rank):
+        return rank * floor + min(rank, remainder)
+
+    prompts = prompts[start(global_dp_rank) : start(global_dp_rank + 1)]
     if len(prompts) == 0:
         # if any rank has no prompts to process,
         # we need to set a placeholder prompt
         prompts = ["Placeholder"]
     print(f"DP rank {global_dp_rank} needs to process {len(prompts)} prompts")
 
-    # hf_overrides = {
-    #     "num_hidden_layers": 1,
-    # }
     # Create a sampling params object.
-    # since we are doing data parallel, every rank can have different
-    # sampling params. here we set different max_tokens for different
-    # ranks for demonstration.
     sampling_params = SamplingParams(temperature=0.0, max_tokens=32)
 
     # Create an LLM.
-    llm = LLM(
-        model=model,
-        # hf_overrides=hf_overrides,
-        tensor_parallel_size=GPUs_per_dp_rank,
-        #   enforce_eager=True,
-        max_model_len=8 * 1024,
-        block_size=1024,
-        enable_chunked_prefill=True,
-        max_num_batched_tokens=128,
-        max_num_seqs=8,
-        enable_expert_parallel=False,
-    )
+    llm = LLM(**engine_args)
     outputs = llm.generate(prompts, sampling_params)
     # Print the outputs.
     for i, output in enumerate(outputs):
@@ -129,66 +165,54 @@ def main(
 
 
 if __name__ == "__main__":
-    import argparse
+    parser = create_parser()
+    args = vars(parser.parse_args())
 
-    parser = argparse.ArgumentParser(description="Data Parallel Inference")
-    parser.add_argument(
-        "--model", type=str, default="Qwen/Qwen3-1.7B", help="Model name or path"
-    )
-    parser.add_argument("--dp-size", type=int, default=2, help="Data parallel size")
-    parser.add_argument("--tp-size", type=int, default=1, help="Tensor parallel size")
-    parser.add_argument(
-        "--node-size", type=int, default=1, help="Total number of nodes"
-    )
-    parser.add_argument(
-        "--node-rank", type=int, default=0, help="Rank of the current node"
-    )
-    parser.add_argument(
-        "--master-addr", type=str, default="", help="Master node IP address"
-    )
-    parser.add_argument("--master-port", type=int, default=0, help="Master node port")
-    args = parser.parse_args()
+    # Extract DP-specific args (pop to remove from engine_args)
+    dp_size = args.pop("data_parallel_size")
+    dp_num_nodes = args.pop("dp_num_nodes")
+    dp_node_rank = args.pop("dp_node_rank")
+    dp_master_addr = args.pop("dp_master_addr")
+    dp_master_port = args.pop("dp_master_port")
+    timeout = args.pop("timeout")
 
-    dp_size = args.dp_size
-    tp_size = args.tp_size
-    node_size = args.node_size
-    node_rank = args.node_rank
+    # Remaining args are engine args
+    engine_args = args
 
-    if node_size == 1:
+    if dp_num_nodes == 1:
         dp_master_ip = "127.0.0.1"
-        dp_master_port = get_open_port()
+        dp_master_port_val = get_open_port()
     else:
-        dp_master_ip = args.master_addr
-        dp_master_port = args.master_port
+        dp_master_ip = dp_master_addr
+        dp_master_port_val = dp_master_port
 
-    assert dp_size % node_size == 0, "dp_size should be divisible by node_size"
-    dp_per_node = dp_size // node_size
+    assert dp_size % dp_num_nodes == 0, "dp_size should be divisible by dp_num_nodes"
+    dp_per_node = dp_size // dp_num_nodes
 
     from multiprocessing import Process
 
     procs = []
     for local_dp_rank, global_dp_rank in enumerate(
-        range(node_rank * dp_per_node, (node_rank + 1) * dp_per_node)
+        range(dp_node_rank * dp_per_node, (dp_node_rank + 1) * dp_per_node)
     ):
         proc = Process(
             target=main,
             args=(
-                args.model,
                 dp_size,
                 local_dp_rank,
                 global_dp_rank,
                 dp_master_ip,
-                dp_master_port,
-                tp_size,
+                dp_master_port_val,
+                engine_args,
             ),
         )
         proc.start()
         procs.append(proc)
     exit_code = 0
     for proc in procs:
-        proc.join(timeout=300)
+        proc.join(timeout=timeout)
         if proc.exitcode is None:
-            print(f"Killing process {proc.pid} that didn't stop within 5 minutes.")
+            print(f"Killing process {proc.pid} that didn't stop within {timeout} seconds.")
             proc.kill()
             exit_code = 1
         elif proc.exitcode:
