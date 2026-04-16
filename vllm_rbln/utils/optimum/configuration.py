@@ -37,6 +37,7 @@ from vllm_rbln.utils.optimum.registry import (
     is_enc_dec_arch,
     is_generation_arch,
     is_multi_modal,
+    is_pooling_arch,
 )
 
 logger = init_logger(__name__)
@@ -143,13 +144,16 @@ def prepare_vllm_for_compile(vllm_config: VllmConfig) -> None:
     # Get proper block_size if not set by user
     hf_config = vllm_config.model_config.hf_config
     if not vllm_config.cache_config.user_specified_block_size:
-        # Set block_size to 4096 for fast compilation
-        if is_multi_modal(hf_config) or is_generation_arch(hf_config):
-            vllm_config.cache_config.block_size = vllm_config.model_config.max_model_len
+        # Set block_size to max_model_len for decoder-only, multimodal, and pooling models
+        vllm_config.cache_config.block_size = vllm_config.model_config.max_model_len
     else:
         if is_multi_modal(hf_config) or is_generation_arch(hf_config):
             assert vllm_config.cache_config.block_size >= 4096, (
-                "block_size must be at least 4096 for compilation"
+                "block_size must be at least 4096 for compilation."
+            )
+        if is_pooling_arch(hf_config):
+            assert vllm_config.cache_config.block_size == vllm_config.model_config.max_model_len, (
+                "For pooling models, block_size must be equal to max_model_len."
             )
 
     # Set block_size in cache_config to compile model internally.
@@ -206,6 +210,7 @@ def sync_with_rbln_config(vllm_config: VllmConfig) -> None:
             kvcache_block_size,
             prefill_chunk_size,
         ) = get_rbln_params(vllm_config, rbln_config)
+        print("@@@ kvcache_block_size from rbln_config", kvcache_block_size)
         sync_vllm_from_rbln_config(
             vllm_config,
             num_blocks,
