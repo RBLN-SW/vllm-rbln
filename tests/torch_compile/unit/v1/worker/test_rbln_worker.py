@@ -117,6 +117,7 @@ def _make_vllm_config(
         ),
         cache_config=_make_cache_config(),
         scheduler_config=_make_scheduler_config(),
+        kv_transfer_config=None,
         instance_id="test-instance",
     )
 
@@ -391,13 +392,12 @@ class TestWorkerBaseContract:
 
         assert RBLNWorker.__bases__[0] is WorkerBase
 
-    def test_initialize_cache_signature(self):
+    def test_initialize_from_config_signature(self):
         from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
 
-        sig = inspect.signature(RBLNWorker.initialize_cache)
+        sig = inspect.signature(RBLNWorker.initialize_from_config)
         params = list(sig.parameters.keys())
-        assert "num_gpu_blocks" in params
-        assert "num_cpu_blocks" in params
+        assert "kv_cache_config" in params
 
     def test_load_model_takes_no_args(self):
         from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
@@ -436,16 +436,6 @@ class TestRBLNWorkerInit:
         ):
             worker = _create_worker(vllm_config=cfg)
         assert worker.profiler is not None
-
-    def test_init_trust_remote_code(self):
-        cfg = _make_vllm_config(trust_remote_code=True)
-        mock_init_hf = MagicMock()
-        with patch.dict(
-            "sys.modules",
-            {"vllm.utils.import_utils": MagicMock(init_cached_hf_modules=mock_init_hf)},
-        ):
-            _create_worker(vllm_config=cfg)
-        mock_init_hf.assert_called_once()
 
     def test_local_world_size(self):
         cfg = _make_vllm_config(world_size=4)
@@ -579,20 +569,27 @@ class TestSleepWakeUp:
 
 
 # ===========================================================================
-# Tests: initialize_cache
+# Tests: initialize_from_config
 # ===========================================================================
 
 
-class TestInitializeCache:
+class TestInitializeFromConfig:
     def test_sets_blocks(self):
         worker = _create_worker()
-        worker.initialize_cache(128, 64)
+        worker.model_runner = MagicMock()
+        kv_cfg = MagicMock()
+        kv_cfg.num_blocks = 128
+        worker.initialize_from_config(kv_cfg)
         assert worker.cache_config.num_gpu_blocks == 128
-        assert worker.cache_config.num_cpu_blocks == 64
+        assert worker.cache_config.num_cpu_blocks == 128
+        worker.model_runner.initialize_kv_cache.assert_called_once_with(kv_cfg)
 
     def test_zero_blocks(self):
         worker = _create_worker()
-        worker.initialize_cache(0, 0)
+        worker.model_runner = MagicMock()
+        kv_cfg = MagicMock()
+        kv_cfg.num_blocks = 0
+        worker.initialize_from_config(kv_cfg)
         assert worker.cache_config.num_gpu_blocks == 0
 
 
@@ -1146,13 +1143,6 @@ class TestMisc:
         spec = {"layer": MagicMock()}
         worker.model_runner.get_kv_cache_spec.return_value = spec
         assert worker.get_kv_cache_spec() is spec
-
-    def test_initialize_from_config(self):
-        worker = _create_worker()
-        worker.model_runner = MagicMock()
-        kv_cfg = MagicMock()
-        worker.initialize_from_config(kv_cfg)
-        worker.model_runner.initialize_kv_cache.assert_called_once_with(kv_cfg)
 
 
 # ===========================================================================
