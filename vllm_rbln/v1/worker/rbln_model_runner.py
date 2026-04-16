@@ -2593,25 +2593,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             invalid_req_indices,
         )
 
-    @staticmethod
-    def maybe_get_kv_connector_output(
-        scheduler_output: "SchedulerOutput",
-        defer_finalize: bool = False,
-    ) -> AbstractContextManager[KVConnectorOutput | None]:
-        """Override upstream helper to bypass it during compilation warmup.
-
-        During warmup, ``scheduler_output.kv_connector_metadata`` is ``None``
-        and the upstream helper would raise its ``assert ... is not None``.
-        """
-        warm_up_phase = scheduler_output.kv_connector_metadata is None
-        return (
-            KVConnectorModelRunnerMixin._get_kv_connector_output(
-                scheduler_output, defer_finalize=defer_finalize
-            )
-            if has_kv_transfer_group() and not warm_up_phase
-            else nullcontext()
-        )
-
     def _get_slot_mappings(
         self,
         num_tokens_padded: int,
@@ -2700,6 +2681,20 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             runtime = self.runtime_holder[0]
             for op in copy_ops:
                 runtime._copy_kv_cache(op.src_block_id, op.dst_block_id, op.num_tokens)
+
+    @staticmethod
+    def maybe_get_kv_connector_output(
+        scheduler_output: "SchedulerOutput",
+        defer_finalize: bool = False,
+    ) -> AbstractContextManager[KVConnectorOutput | None]:
+        warm_up_phase = scheduler_output.kv_connector_metadata is None
+        return (
+            KVConnectorModelRunnerMixin._get_kv_connector_output(
+                scheduler_output, defer_finalize=defer_finalize
+            )
+            if has_kv_transfer_group() and not warm_up_phase
+            else nullcontext()
+        )
 
     @torch.inference_mode()
     def execute_model(
