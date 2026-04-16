@@ -1,7 +1,6 @@
 import argparse
 import contextlib
 import time
-from dataclasses import dataclass
 
 import numpy as np
 import rebel
@@ -37,14 +36,12 @@ def _create_prompt_tokens_tensor(
     )
 
 
-def _create_default_sampling_metadata(
-    num_output_tokens: int,
+def _create_sampling_metadata_from_config(
+    config: dict,
     batch_size: int,
     vocab_size: int,
     device: torch.device,
-    temperature: torch.Tensor | None = None,
-    top_p: torch.Tensor | None = None,
-    top_k: torch.Tensor | None = None,
+    num_output_tokens: int = 1,
 ) -> SamplingMetadata:
     output_token_ids: list[list[int]] = []
     prompt_token_ids: list[list[int]] = []
@@ -57,27 +54,43 @@ def _create_default_sampling_metadata(
                 0, vocab_size, size=np.random.randint(1, MAX_NUM_PROMPT_TOKENS)
             ).tolist()
         )
-    if top_p is None and top_k is None:
-        is_greedy = True
-    else:
-        is_greedy = False
+
+    temperature = torch.full((batch_size,), config["temperature"], device=device)
+
+    top_p = None
+    if config.get("top_p") is not None:
+        top_p = torch.full((batch_size,), config["top_p"], dtype=torch.float32, device=device)
+
+    top_k = None
+    if config.get("top_k") is not None:
+        top_k = torch.full((batch_size,), config["top_k"], dtype=torch.int32, device=device)
+
+    no_penalties = config["no_penalties"]
+    freq_val = config.get("frequency_penalties", 0.0)
+    pres_val = config.get("presence_penalties", 0.0)
+    rep_val = config.get("repetition_penalties", 1.0)
+
+    prompt_tokens_tensor = None
+    if not no_penalties:
+        prompt_tokens_tensor = _create_prompt_tokens_tensor(
+            prompt_token_ids, vocab_size, device
+        )
+
     fake_sampling_metadata = SamplingMetadata(
         temperature=temperature,
-        all_greedy=is_greedy,
-        all_random=not is_greedy,
+        all_greedy=config["all_greedy"],
+        all_random=config["all_random"],
         top_p=top_p,
         top_k=top_k,
         generators={},
         max_num_logprobs=0,
-        prompt_token_ids=_create_prompt_tokens_tensor(
-            prompt_token_ids, vocab_size, device
-        ),
+        prompt_token_ids=prompt_tokens_tensor,
         output_token_ids=output_token_ids,
         spec_token_ids=[[] for _ in range(batch_size)],
-        frequency_penalties=_create_penalty_tensor(batch_size, 0.0, device),
-        presence_penalties=_create_penalty_tensor(batch_size, 0.0, device),
-        repetition_penalties=_create_penalty_tensor(batch_size, 1.0, device),
-        no_penalties=True,
+        frequency_penalties=_create_penalty_tensor(batch_size, freq_val, device),
+        presence_penalties=_create_penalty_tensor(batch_size, pres_val, device),
+        repetition_penalties=_create_penalty_tensor(batch_size, rep_val, device),
+        no_penalties=no_penalties,
         allowed_token_ids_mask=None,
         bad_words_token_ids={},
         logitsprocs=LogitsProcessors(),
@@ -85,122 +98,55 @@ def _create_default_sampling_metadata(
     return fake_sampling_metadata
 
 
-@dataclass
-class BenchmarkConfig:
-    """Configuration for a benchmark run."""
-
-    name: str
-    batch_size: int
-    vocab_size: int
-    # k and p can be tensors or None
-    temperature: torch.Tensor | None  # [batch_size] or None
-    k_values: torch.Tensor | None  # [batch_size] or None
-    p_values: torch.Tensor | None  # [batch_size] or None
-    description: str = ""
-
-
-def create_benchmark_configs(
-    batch_sizes: list[int],
-    vocab_sizes: list[int],
-    device: str = "cpu",
-    sampling_type: str = "greedy",
-) -> list[BenchmarkConfig]:
-    configs: list[BenchmarkConfig] = []
-    for vocab_size in vocab_sizes:
-        for batch_size in batch_sizes:
-            # Greedy
-            if sampling_type == "greedy":
-                temperature = torch.full((batch_size,), 0.0, device=device)
-                config = BenchmarkConfig(
-                    name=f"bs{batch_size}_vocab{vocab_size}",
-                    batch_size=batch_size,
-                    vocab_size=vocab_size,
-                    k_values=None,
-                    p_values=None,
-                    temperature=temperature,
-                    description="Greedy",
-                )
-                configs.append(config)
-            elif sampling_type == "topkp":
-                # Top-k / Top-p
-                k_values = torch.full(
-                    (batch_size,), 30, dtype=torch.int32, device=device
-                )
-                p_values = torch.full(
-                    (batch_size,), 0.99, dtype=torch.float32, device=device
-                )
-                temperature = torch.full((batch_size,), 0.8, device=device)
-                config = BenchmarkConfig(
-                    name=f"bs{batch_size}_vocab{vocab_size}_topk30toppt99",
-                    batch_size=batch_size,
-                    vocab_size=vocab_size,
-                    k_values=k_values,
-                    p_values=p_values,
-                    temperature=temperature,
-                    description="Top-k with k=30 and Top-p with p=0.99",
-                )
-                configs.append(config)
-    return configs
-
-
 def create_logits(batch_size: int, vocab_size: int) -> torch.Tensor:
-    # Create random logits for testing
     return torch.randn(batch_size, vocab_size, device="cpu")
 
 
 def run_benchmark(
-    user_config: BenchmarkConfig,
-    warmup_configs: list[BenchmarkConfig],
+    benchmark_config: dict,
+    batch_size: int,
+    vocab_size: int,
     warmup_iters: int,
     benchmark_iters: int,
 ):
-    torch._dynamo.config.recompile_limit = len(warmup_configs) * len(WARM_UP_CONFIGS)
+    torch._dynamo.config.recompile_limit = len(WARM_UP_CONFIGS)
     sampler = RBLNSampler(seed=42)
     sampler = torch.compile(sampler, dynamic=False, fullgraph=False)
     sampler_performance_tracker = PerformanceTracker("SAMPLER")
 
-    logits = create_logits(user_config.batch_size, user_config.vocab_size)
+    logits = create_logits(batch_size, vocab_size)
 
-    # warmup iterations
+    # warmup: iterate over all WARM_UP_CONFIGS, matching actual vllm-rbln behavior
     for _ in range(warmup_iters):
-        for config in warmup_configs:
-            sampling_metadata = _create_default_sampling_metadata(
-                num_output_tokens=1,
-                batch_size=config.batch_size,
-                vocab_size=config.vocab_size,
+        for config in WARM_UP_CONFIGS:
+            sampling_metadata = _create_sampling_metadata_from_config(
+                config=config,
+                batch_size=batch_size,
+                vocab_size=vocab_size,
                 device=logits.device,
-                temperature=config.temperature,
-                top_p=config.p_values,
-                top_k=config.k_values,
             )
             sampler(logits, sampling_metadata)
 
-    print(f"Running benchmark: {user_config.name}")
-    print(f"Description: {user_config.description}")
-    print(f"Batch size: {user_config.batch_size}, Vocab size: {user_config.vocab_size}")
+    print(f"Running benchmark: {benchmark_config['name']}")
+    print(f"Batch size: {batch_size}, Vocab size: {vocab_size}")
     print()
 
-    sampling_metadata = _create_default_sampling_metadata(
-        num_output_tokens=1,
-        batch_size=user_config.batch_size,
-        vocab_size=user_config.vocab_size,
+    # benchmark run with the user-specified config
+    sampling_metadata = _create_sampling_metadata_from_config(
+        config=benchmark_config,
+        batch_size=batch_size,
+        vocab_size=vocab_size,
         device=logits.device,
-        temperature=user_config.temperature,
-        top_p=user_config.p_values,
-        top_k=user_config.k_values,
     )
 
     for _ in range(benchmark_iters):
-        # Benchmark iterations
         if hasattr(rebel, "capture_reports"):
             capture_ctx = rebel.capture_reports()
         else:
-            # use a dummy context manager that does nothing
             capture_ctx = contextlib.nullcontext()
         start_time = time.perf_counter()
         with capture_ctx as model_reports:
             sampler(logits, sampling_metadata)
-        # Collect metrics from the sampler
         collect_metrics(
             sampler_performance_tracker,
             is_prefill=False,
@@ -217,18 +163,16 @@ def main():
         description="Benchmark Triton vs PyTorch sort-based top-k/top-p implementations"
     )
     parser.add_argument(
-        "--batch-sizes",
+        "--batch-size",
         type=int,
-        nargs="+",
-        default=[1],
-        help="Batch sizes to test (default: 1)",
+        default=1,
+        help="Batch size to test (default: 1)",
     )
     parser.add_argument(
-        "--vocab-sizes",
+        "--vocab-size",
         type=int,
-        nargs="+",
-        default=[151936],
-        help="Vocabulary sizes to test (default: 151936)",
+        default=151936,
+        help="Vocabulary size to test (default: 151936)",
     )
     parser.add_argument(
         "--warmup-iters",
@@ -243,41 +187,36 @@ def main():
         help="Number of benchmark iterations (default: 8)",
     )
     parser.add_argument(
-        "--sampling-type", type=str, choices=["greedy", "topkp"], default="greedy"
+        "--benchmark-config",
+        type=str,
+        choices=[c["name"] for c in WARM_UP_CONFIGS],
+        default="no_penalty_greedy",
+        help=f"Benchmark config name (default: no_penalty_greedy). Choices: {[c['name'] for c in WARM_UP_CONFIGS]}",
     )
 
     args = parser.parse_args()
 
+    # Find the benchmark config by name
+    benchmark_config = None
+    for config in WARM_UP_CONFIGS:
+        if config["name"] == args.benchmark_config:
+            benchmark_config = config
+            break
+    if benchmark_config is None:
+        raise ValueError(f"Unknown benchmark config: {args.benchmark_config}")
+
     # Print configuration
-    print(f"Batch sizes: {args.batch_sizes}")
-    print(f"Vocab sizes: {args.vocab_sizes}")
+    print(f"Batch size: {args.batch_size}")
+    print(f"Vocab size: {args.vocab_size}")
+    print(f"Benchmark config: {args.benchmark_config}")
     print(f"Warmup iterations: {args.warmup_iters}")
     print(f"Benchmark iterations: {args.benchmark_iters}")
     print()
 
-    # Create configs
-    warmup_configs = create_benchmark_configs(
-        args.batch_sizes,
-        args.vocab_sizes,
-        device="cpu",
-        sampling_type=args.sampling_type,
-    )
-    user_config = None
-    # extract the user specified config
-    for config in warmup_configs:
-        if (
-            args.sampling_type == "greedy"
-            and config.description == "Greedy"
-            or args.sampling_type == "topkp"
-            and config.description.startswith("Top")
-        ):
-            user_config = config
-        else:
-            raise ValueError(f"Unexpected sampling type: {args.sampling_type}")
-
-    result = run_benchmark(
-        user_config,
-        warmup_configs=warmup_configs,
+    run_benchmark(
+        benchmark_config=benchmark_config,
+        batch_size=args.batch_size,
+        vocab_size=args.vocab_size,
         warmup_iters=args.warmup_iters,
         benchmark_iters=args.benchmark_iters,
     )
