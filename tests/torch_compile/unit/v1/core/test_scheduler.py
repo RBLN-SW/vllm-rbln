@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import RequestStatus
 
 from .utils import (
+    MockKVConfig,
     create_requests,
     create_runner_output,
     create_scheduler,
@@ -124,6 +126,55 @@ def test_new_prefill_uses_full_budget_when_decode_running():
     assert req_a.request_id not in output.num_scheduled_tokens
     # req_b should get the FULL budget, not budget-minus-1.
     assert output.num_scheduled_tokens[req_b.request_id] == max_num_batched_tokens
+
+
+def test_remote_kv_promotion_keeps_decode_batch_and_defers_local_prefill():
+    """A ready remote-KV request should join the decode batch, while a later
+    local prefill stays deferred to the next step.
+    """
+    num_tokens = 10
+    scheduler = create_scheduler(
+        max_num_seqs=4,
+        max_num_batched_tokens=16,
+        use_kv_connector=MockKVConfig(matched_tokens=num_tokens, is_async=True),
+    )
+
+    req_running = create_requests(
+        num_requests=1, num_tokens=num_tokens, req_ids=["run"]
+    )[0]
+    _advance_to_decode(scheduler, req_running)
+
+    req_remote = create_requests(
+        num_requests=1, num_tokens=num_tokens, req_ids=["remote"]
+    )[0]
+    req_remote.kv_transfer_params = {"do_remote_prefill": True}
+    scheduler.add_request(req_remote)
+
+    wait_remote_output = scheduler.schedule()
+    assert req_remote.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+
+    model_runner_output = create_runner_output(wait_remote_output, 1)
+    model_runner_output.kv_connector_output = KVConnectorOutput(
+        finished_recving={req_remote.request_id}
+    )
+    scheduler.update_from_output(wait_remote_output, model_runner_output)
+
+    req_local = create_requests(
+        num_requests=1, num_tokens=num_tokens, req_ids=["local"]
+    )[0]
+    scheduler.add_request(req_local)
+
+    output = scheduler.schedule()
+
+    assert output.scheduled_cached_reqs.req_ids == [req_running.request_id]
+    assert [req.req_id for req in output.scheduled_new_reqs] == [req_remote.request_id]
+    assert output.num_scheduled_tokens[req_remote.request_id] == 1
+    assert req_local.request_id not in output.num_scheduled_tokens
+    assert [req.request_id for req in scheduler.running] == [
+        req_running.request_id,
+        req_remote.request_id,
+    ]
+    assert [req.request_id for req in scheduler.waiting] == [req_local.request_id]
 
 
 def test_preempt_during_execution():
