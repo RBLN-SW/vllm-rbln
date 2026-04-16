@@ -427,31 +427,28 @@ def set_omp_num_threads(
     )
 
 
-def bind_kv_cache_name(
+def get_kv_cache_names(
     kv_caches: dict[str, torch.Tensor],
-    runner_kv_cache_names: list[str],
     num_attn_module: int = 1,
-) -> None:
+) -> list[str]:
     """
-    Bind the allocated KV cache name to ModelRunner and forward context so
-    that the KV cache can be used in the forward pass.
+    Get KV cache layer names sorted by layer index.
 
-    This function:
-      1) Fills the ModelRunner's kv cache name list (`runner_kv_cache_names`) with
-         kv_caches.
-      2) Copied and Modified from vllm.v1.worker.utils.bind_kv_cache
+    Copied and Modified from vllm.v1.worker.utils.bind_kv_cache
+
     Args:
         kv_caches: The allocated kv_caches with layer names as keys.
-        runner_kv_cache_names: The kv_cache name list declared by ModelRunner.
-    """
-    # Bind kv_cache names to ModelRunner
-    assert len(runner_kv_cache_names) == 0
+        num_attn_module: Number of attention modules per layer.
 
-    # Convert kv_caches dict to a list of tensors in the order of layer_index.
+    Returns:
+        List of KV cache layer names in layer index order.
+    """
+    # Convert kv_caches dict to a list of names in the order of layer_index.
     index2name = defaultdict(list)
     for layer_name in kv_caches:
         index2name[extract_layer_index(layer_name, num_attn_module)].append(layer_name)
 
+    kv_cache_names: list[str] = []
     for layer_index in sorted(index2name.keys()):
         layer_names = index2name[layer_index]
         if len(layer_names) > 1:
@@ -474,4 +471,5 @@ def bind_kv_cache_name(
             else:
                 raise NotImplementedError
         for layer_name in layer_names:
-            runner_kv_cache_names.append(layer_name)
+            kv_cache_names.append(layer_name)
+    return kv_cache_names

@@ -141,7 +141,7 @@ from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
 from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
 from vllm_rbln.v1.worker.metrics import PerformanceTracker
-from vllm_rbln.v1.worker.utils import bind_kv_cache_name
+from vllm_rbln.v1.worker.utils import get_kv_cache_names
 
 if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
@@ -4385,8 +4385,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             num_attn_module,
         )
         if not self.model_config.enforce_eager and envs.VLLM_RBLN_COMPILE_MODEL:
-            kv_cache_names: list[str] = []
-            bind_kv_cache_name(kv_caches, kv_cache_names, num_attn_module)
+            kv_cache_names = get_kv_cache_names(kv_caches, num_attn_module)
             assert len(kv_cache_names) == len(self.kv_caches)
             for kv_cache, name in zip(self.kv_caches, kv_cache_names):
                 self.compile_context.mark_static_address(kv_cache, name)
