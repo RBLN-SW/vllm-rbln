@@ -23,7 +23,7 @@ from .gemma3 import get_param_gemma3
 from .idefics3 import get_param_idefics3
 from .llava import get_param_llava, get_param_llava_next
 from .paligemma import get_param_paligemma
-from .qwen import get_param_qwen2_5_vl, get_param_qwen2_vl
+from .qwen import get_param_qwen2_5_vl, get_param_qwen2_vl, get_param_qwen3_vl
 
 
 def get_multimodal_cls(architecture: str) -> type[Any]:
@@ -42,4 +42,5 @@ _COMPILE_MULTIMODAL_FNS: dict[str, Callable[[int, int, int, int], dict]] = {
     "gemma3": get_param_gemma3,
     "qwen2_vl": get_param_qwen2_vl,
     "qwen2_5_vl": get_param_qwen2_5_vl,
+    "qwen3_vl": get_param_qwen3_vl,
 }

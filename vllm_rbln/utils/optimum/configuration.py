@@ -74,27 +74,16 @@ def is_qwen3_pooling(
     )
 
 
-def sync_vllm_from_rbln_config(
-    vllm_config: VllmConfig,
-    num_blocks: int,
-    batch_size: int,
-    max_model_len: int,
-    kvcache_block_size: int,
-    prefill_chunk_size: int,
-) -> None:
-    if vllm_config.scheduler_config.max_num_seqs != batch_size:
-        logger.info(
-            "Updating scheduler_config.max_num_seqs from %s to %s "
-            "based on rbln_config.json",
-            vllm_config.scheduler_config.max_num_seqs,
-            batch_size,
-        )
-        vllm_config.scheduler_config.max_num_seqs = batch_size
+def update_max_num_batched_tokens(vllm_config: VllmConfig, max_model_len: int) -> None:
+    """
+    Update the max_num_batched_tokens in the vLLM configuration based on the model's
+    maximum length and architecture.
 
-    # For encoder-decoder multimodal models (e.g. Whisper), max_num_batched_tokens
-    # must be at least max_source_positions so that vllm's MultiModalBudget
-    # validation passes (it requires max_tokens_per_mm_item <= max_num_batched_tokens
-    # when chunked MM input is disabled).
+    For encoder-decoder multimodal models (e.g. Whisper), max_num_batched_tokens
+    must be at least max_source_positions so that vllm's MultiModalBudget
+    validation passes (it requires max_tokens_per_mm_item <= max_num_batched_tokens
+    when chunked MM input is disabled).
+    """
     target_max_num_batched_tokens = max_model_len
     hf_config = vllm_config.model_config.hf_config
     if is_enc_dec_arch(hf_config):
@@ -120,6 +109,27 @@ def sync_vllm_from_rbln_config(
             target_max_num_batched_tokens
         )
 
+
+def sync_vllm_from_rbln_config(
+    vllm_config: VllmConfig,
+    num_blocks: int,
+    batch_size: int,
+    max_model_len: int,
+    kvcache_block_size: int,
+    prefill_chunk_size: int,
+) -> None:
+    if vllm_config.scheduler_config.max_num_seqs != batch_size:
+        logger.info(
+            "Updating scheduler_config.max_num_seqs from %s to %s "
+            "based on rbln_config.json",
+            vllm_config.scheduler_config.max_num_seqs,
+            batch_size,
+        )
+        vllm_config.scheduler_config.max_num_seqs = batch_size
+
+    # FIXME handle if num_seqs > max_model_len
+    update_max_num_batched_tokens(vllm_config, max_model_len)
+
     if vllm_config.model_config.max_model_len != max_model_len:
         logger.info(
             "Updating model_config.max_model_len "
@@ -144,7 +154,8 @@ def prepare_vllm_for_compile(vllm_config: VllmConfig) -> None:
     # Get proper block_size if not set by user
     hf_config = vllm_config.model_config.hf_config
     if not vllm_config.cache_config.user_specified_block_size:
-        # Set block_size to max_model_len for decoder-only, multimodal, and pooling models
+        # Set block_size to max_model_len
+        # for decoder-only, multimodal, and pooling models
         vllm_config.cache_config.block_size = vllm_config.model_config.max_model_len
     else:
         if is_multi_modal(hf_config) or is_generation_arch(hf_config):
@@ -152,9 +163,10 @@ def prepare_vllm_for_compile(vllm_config: VllmConfig) -> None:
                 "block_size must be at least 4096 for compilation."
             )
         if is_pooling_arch(hf_config):
-            assert vllm_config.cache_config.block_size == vllm_config.model_config.max_model_len, (
-                "For pooling models, block_size must be equal to max_model_len."
-            )
+            assert (
+                vllm_config.cache_config.block_size
+                == vllm_config.model_config.max_model_len
+            ), "For pooling models, block_size must be equal to max_model_len."
 
     # Set block_size in cache_config to compile model internally.
     sync_cache_block_size(
@@ -168,6 +180,10 @@ def prepare_vllm_for_compile(vllm_config: VllmConfig) -> None:
     vllm_config.scheduler_config.max_num_batched_tokens = max(
         vllm_config.model_config.max_model_len,
         vllm_config.scheduler_config.max_num_seqs,
+    )
+
+    update_max_num_batched_tokens(
+        vllm_config, vllm_config.scheduler_config.max_num_batched_tokens
     )
 
     logger.info(
