@@ -85,4 +85,4 @@ def __MLAAttentionWrapper_forward(
     return self.o_proj(attn_out)[0]
 
 
-MultiHeadLatentAttentionWrapper.forward_oot = __MLAAttentionWrapper_forward
+MultiHeadLatentAttentionWrapper.forward = __MLAAttentionWrapper_forward
