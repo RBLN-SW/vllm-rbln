@@ -201,7 +201,7 @@ run_tests_for_model() {
     --enable-chunked-prefill \
     --max-num-batched-tokens $MAX_NUM_BATCHED_TOKENS \
     --max-num-seqs $MAX_NUM_SEQS \
-    --tensor-parallel-size $PREFILLER_TP_SIZE \
+    --tensor-parallel-size $DECODER_TP_SIZE \
     --kv-transfer-config '$KV_CONFIG'"
   
     if [ -n "$model_args" ]; then
