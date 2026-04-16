@@ -4488,10 +4488,14 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     or not dst_kv_caches
                     or not src_block_ids
                     or not dst_block_ids
-                    or len(src_block_ids) != len(dst_block_ids)
                 ):
                     return
-                assert len(self.runtime_holder) > 0
+                assert src_block_ids == dst_block_ids, (
+                    "src_block_ids and dst_block_ids must be the same"
+                    f"src_block_ids: {src_block_ids}"
+                    f"dst_block_ids: {dst_block_ids}"
+                )
+                assert len(self.runtime_holder) > 0, "Runtime holder is not initialized"
                 runtime = self.runtime_holder[0]
                 if direction == "h2d":
                     kv_caches = src_kv_caches

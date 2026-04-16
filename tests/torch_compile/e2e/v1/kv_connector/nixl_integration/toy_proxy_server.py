@@ -270,12 +270,12 @@ async def _handle_completions(api: str, request: Request):
 
 @app.post("/v1/completions")
 async def handle_completions(request: Request):
-    return await _handle_completions("/completions", request)
+    return await _handle_completions("completions", request)
 
 
 @app.post("/v1/chat/completions")
 async def handle_chat_completions(request: Request):
-    return await _handle_completions("/chat/completions", request)
+    return await _handle_completions("chat/completions", request)
 
 
 @app.get("/healthcheck")
