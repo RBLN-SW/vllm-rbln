@@ -2,17 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2025 Rebellions Inc. All rights reserved.
 #
-# EC Disaggregated Encoder Benchmark
+# EC Disaggregated Benchmark with RblnECNixlPushConnector
 #
-# Launches producers, consumer, proxy, waits for readiness, runs benchmark,
-# then cleans up everything.
+# Launches producers, consumer, proxy, waits for readiness, runs benchmark.
 #
 # Usage:
-#   bash examples/optimum/run_ec_disagg_benchmark.sh
+#   bash examples/optimum/run_ec_push_benchmark.sh
 #
 # Override any variable via env:
-#   NUM_PRODUCERS=4 CONSUMER_DEVICES="4,5,6,7" NUM_PROMPTS=50 \
-#       bash examples/optimum/run_ec_disagg_benchmark.sh
+#   NUM_PRODUCERS=4 NUM_PROMPTS=10 bash examples/optimum/run_ec_push_benchmark.sh
 #
 set -euo pipefail
 
@@ -27,25 +25,27 @@ fi
 ###############################################################################
 # Configuration
 ###############################################################################
-MODEL="${MODEL:-Qwen2-VL-7B-Instruct}"
-NUM_PRODUCERS="${NUM_PRODUCERS:-8}"
-NUM_PROMPTS="${NUM_PROMPTS:-300}"
-REQUEST_RATE="${REQUEST_RATE:-2.0}"
+MODEL="${MODEL:-Qwen3-VL-8B-Instruct}"
+NUM_PRODUCERS="${NUM_PRODUCERS:-2}"
+NUM_PROMPTS="${NUM_PROMPTS:-4}"
+REQUEST_RATE="${REQUEST_RATE:-0.5}"
 
 # Ports
-PRODUCER_BASE_PORT="${PRODUCER_BASE_PORT:-8000}"
-CONSUMER_PORT="${CONSUMER_PORT:-9000}"
-PROXY_PORT="${PROXY_PORT:-1800}"
-NIXL_BASE_PORT="${NIXL_BASE_PORT:-25300}"
-NIXL_HOST="${NIXL_HOST:-127.0.0.1}"
+PRODUCER_BASE_PORT="${PRODUCER_BASE_PORT:-8100}"
+CONSUMER_PORT="${CONSUMER_PORT:-9100}"
+PROXY_PORT="${PROXY_PORT:-1900}"
 
-# Devices
-PRODUCER_BASE_DEVICE="${PRODUCER_BASE_DEVICE:-0}"       # producers use devices 0..N-1
-CONSUMER_DEVICES="${CONSUMER_DEVICES:-10,11,12,13,14,15,16,17}"
+# ZMQ PULL port (consumer binds, producers connect)
+CONSUMER_PULL_PORT="${CONSUMER_PULL_PORT:-16100}"
+CONSUMER_HOST="${CONSUMER_HOST:-127.0.0.1}"
+
+# Devices (using free devices 20-29)
+PRODUCER_BASE_DEVICE="${PRODUCER_BASE_DEVICE:-20}"
+CONSUMER_DEVICES="${CONSUMER_DEVICES:-22,23,24,25,26,27,28,29}"
 
 # Logging
-LOG_PATH="${LOG_PATH:-./logs/ec_disagg}"
-TIMEOUT_SECONDS="${TIMEOUT_SECONDS:-600}"               # wait_for_server timeout
+LOG_PATH="${LOG_PATH:-./logs/ec_push}"
+TIMEOUT_SECONDS="${TIMEOUT_SECONDS:-600}"
 
 # Benchmark
 BENCH_DATASET="${BENCH_DATASET:-lmarena-ai/VisionArena-Chat}"
@@ -103,51 +103,55 @@ trap cleanup INT TERM
 ###############################################################################
 cat <<EOF
 ============================================================
-  EC Disaggregated Encoder Benchmark
+  EC Disaggregated Benchmark (RblnECNixlPushConnector)
 ============================================================
   Model:            $MODEL
+  Connector:        RblnECNixlPushConnector (ZMQ PUSH/PULL + NIXL)
   Producers:        $NUM_PRODUCERS (devices $PRODUCER_BASE_DEVICE..$((PRODUCER_BASE_DEVICE + NUM_PRODUCERS - 1)))
   Consumer:         port $CONSUMER_PORT (devices $CONSUMER_DEVICES)
+  PULL port:        $CONSUMER_HOST:$CONSUMER_PULL_PORT
   Proxy:            port $PROXY_PORT
-  NIXL:             $NIXL_HOST:$NIXL_BASE_PORT-$((NIXL_BASE_PORT + NUM_PRODUCERS - 1))
   Prompts:          $NUM_PROMPTS @ ${REQUEST_RATE} req/s
   Logs:             $LOG_PATH/
 ============================================================
 EOF
 
 ###############################################################################
-# 1. Start producers
+# 1. Start consumer FIRST (binds PULL socket)
 ###############################################################################
 echo ""
-echo "[1/4] Starting $NUM_PRODUCERS producer(s)..."
+echo "[1/4] Starting consumer (must be up before producers)..."
+
+CONSUMER_LOG="$LOG_PATH/consumer_${START_TIME}.log"
+CONSUMER_DEVICES=$CONSUMER_DEVICES \
+PULL_HOST="0.0.0.0" \
+PULL_PORT=$CONSUMER_PULL_PORT \
+    bash "$SCRIPT_DIR/serve_ec_push_consumer.sh" \
+        "$MODEL" "$CONSUMER_PORT" \
+    > "$CONSUMER_LOG" 2>&1 &
+PIDS+=($!)
+
+wait_for_server "$CONSUMER_PORT" "consumer"
+
+###############################################################################
+# 2. Start producers (connect to consumer's PULL port)
+###############################################################################
+echo ""
+echo "[2/4] Starting $NUM_PRODUCERS producer(s)..."
 
 PRODUCER_LOG="$LOG_PATH/producer_${START_TIME}.log"
 NUM_PRODUCERS=$NUM_PRODUCERS \
 BASE_DEVICE=$PRODUCER_BASE_DEVICE \
-    bash "$SCRIPT_DIR/serve_ec_producer.sh" \
-        "$MODEL" "$PRODUCER_BASE_PORT" "$NIXL_HOST" "$NIXL_BASE_PORT" \
+CONSUMER_HOST=$CONSUMER_HOST \
+CONSUMER_PULL_PORT=$CONSUMER_PULL_PORT \
+    bash "$SCRIPT_DIR/serve_ec_push_producer.sh" \
+        "$MODEL" "$PRODUCER_BASE_PORT" \
     > "$PRODUCER_LOG" 2>&1 &
 PIDS+=($!)
 
 for i in $(seq 0 $((NUM_PRODUCERS - 1))); do
     wait_for_server $((PRODUCER_BASE_PORT + i)) "producer $i"
 done
-
-###############################################################################
-# 2. Start consumer
-###############################################################################
-echo ""
-echo "[2/4] Starting consumer..."
-
-CONSUMER_LOG="$LOG_PATH/consumer_${START_TIME}.log"
-RBLN_DEVICES=$CONSUMER_DEVICES \
-NUM_PRODUCERS=$NUM_PRODUCERS \
-    bash "$SCRIPT_DIR/serve_ec_consumer.sh" \
-        "$MODEL" "$CONSUMER_PORT" "$NIXL_HOST" "$NIXL_BASE_PORT" \
-    > "$CONSUMER_LOG" 2>&1 &
-PIDS+=($!)
-
-wait_for_server "$CONSUMER_PORT" "consumer"
 
 ###############################################################################
 # 3. Start proxy

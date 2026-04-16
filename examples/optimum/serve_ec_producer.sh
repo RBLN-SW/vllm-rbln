@@ -19,6 +19,11 @@
 # Each producer gets 1 device and its own vllm port + NIXL side-channel port.
 # Start the consumer with: NUM_PRODUCERS=6 bash serve_ec_consumer.sh
 
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+if [ -f "$REPO_ROOT/.venv/bin/activate" ]; then
+    source "$REPO_ROOT/.venv/bin/activate"
+fi
+
 MODEL_ID="${1:-Qwen2-VL-7B-Instruct}"
 BASE_PORT="${2:-8000}"
 NIXL_HOST="${3:-127.0.0.1}"
@@ -41,7 +46,7 @@ launch_producer() {
     local idx=$1
     local device=${DEVICES[$idx]}
     local port=$((BASE_PORT + idx))
-    local nixl_port=$((NIXL_BASE_PORT + idx))
+    local nixl_port=$((NIXL_BASE_PORT + idx * 2))
 
     echo "Starting producer $idx (device=$device, port=$port, nixl_port=$nixl_port)"
     RBLN_DEVICES=$device vllm serve "$MODEL_ID" \

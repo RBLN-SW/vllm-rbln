@@ -13,6 +13,11 @@
 # The consumer pulls encoder cache from producer(s) via NIXL and runs
 # prefill_decoder + decode. Start producers first with serve_ec_producer.sh.
 
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+if [ -f "$REPO_ROOT/.venv/bin/activate" ]; then
+    source "$REPO_ROOT/.venv/bin/activate"
+fi
+
 MODEL_ID="${1:-Qwen2-VL-7B-Instruct}"
 PORT="${2:-8001}"
 NIXL_HOST="${3:-127.0.0.1}"
@@ -24,7 +29,7 @@ if [ "$NUM_PRODUCERS" -gt 1 ]; then
     ENDPOINTS="["
     for i in $(seq 0 $((NUM_PRODUCERS - 1))); do
         [ "$i" -gt 0 ] && ENDPOINTS+=","
-        ENDPOINTS+="{\"host\":\"$NIXL_HOST\",\"port\":$((NIXL_BASE_PORT + i))}"
+        ENDPOINTS+="{\"host\":\"$NIXL_HOST\",\"port\":$((NIXL_BASE_PORT + i * 2))}"
     done
     ENDPOINTS+="]"
 
