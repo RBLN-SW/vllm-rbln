@@ -281,7 +281,9 @@ class RBLNSampler(VLLMSampler):
         if not envs.VLLM_RBLN_USE_VLLM_MODEL:
             argmax_sampled = logits.argmax(dim=-1).view(-1)
             if not torch.equal(sampled.view(-1), argmax_sampled):
-                mismatches = (sampled.view(-1) != argmax_sampled).nonzero(as_tuple=True)[0]
+                mismatches = (sampled.view(-1) != argmax_sampled).nonzero(
+                    as_tuple=True
+                )[0]
                 for idx in mismatches:
                     i = idx.item()
                     rbln_tok = sampled.view(-1)[i].item()
@@ -293,10 +295,14 @@ class RBLNSampler(VLLMSampler):
                         "GREEDY MISMATCH at batch[%d]: "
                         "rbln_op=%d (logit=%.8f) vs argmax=%d (logit=%.8f), "
                         "diff=%.2e",
-                        i, rbln_tok, rbln_logit, argmax_tok, argmax_logit,
+                        i,
+                        rbln_tok,
+                        rbln_logit,
+                        argmax_tok,
+                        argmax_logit,
                         argmax_logit - rbln_logit,
                     )
-        
+
         if processed_logprobs is not None:
             raw_logprobs = processed_logprobs
         # Convert sampled token ids to int64 (long) type to ensure compatibility
