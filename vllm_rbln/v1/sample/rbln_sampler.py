@@ -254,8 +254,9 @@ class RBLNSampler(VLLMSampler):
                     i = idx.item()
                     rbln_tok = sampled.view(-1)[i].item()
                     argmax_tok = argmax_sampled[i].item()
-                    rbln_logit = logits[i, rbln_tok].item()
-                    argmax_logit = logits[i, argmax_tok].item()
+                    logits_f32 = logits.float()
+                    rbln_logit = logits_f32[i, rbln_tok].item()
+                    argmax_logit = logits_f32[i, argmax_tok].item()
                     logger.info(
                         "GREEDY MISMATCH at batch[%d]: "
                         "rbln_op=%d (logit=%.8f) vs argmax=%d (logit=%.8f), "
