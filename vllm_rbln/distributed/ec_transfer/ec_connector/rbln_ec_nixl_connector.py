@@ -19,55 +19,54 @@ Architecture
 ------------
 EC disaggregation splits vision-language model execution across two processes:
 
-  Producer  → runs the vision encoder (_preprocess_prefill)
-            → saves encoder outputs (inputs_embeds, position_embed, rope_deltas)
-              to an EC cache keyed by mm_hash
-            → exposes the cache via NIXL over RDMA (UCX backend)
+  Producer  -> runs the vision encoder (_preprocess_prefill)
+            -> saves encoder outputs to an EC cache keyed by mm_hash
+            -> exposes the cache via NIXL over RDMA (UCX backend)
+            -> broadcasts cache-ready notifications via ZMQ PUB
 
-  Consumer  → receives requests with the same mm_hash
-            → uses NIXL to pull encoder cache from producer
-            → runs prefill_decoder + decoder phases only
+  Consumer  -> subscribes to all producers' PUB notifications (background thread)
+            -> on notification: updates NIXL remote agent + tensor registry
+            -> on request: looks up local registry (O(1)), initiates NIXL pull
+            -> runs prefill_decoder + decoder phases only
 
 Transfer flow per request
 -------------------------
-  1. Producer encodes image → encoder_cache[mm_hash] populated
+  1. Producer encodes image -> encoder_cache[mm_hash] populated
   2. Producer registers tensor memory with NIXL (dynamic, per mm_hash)
-  3. Producer's side-channel (ZMQ ROUTER) publishes agent metadata
-  4. Consumer (on first request) fetches producer's agent metadata via ZMQ REQ
-  5. Consumer calls start_load_caches → initiates async NIXL pull (xfer)
-  6. Consumer polls get_finished until transfer completes
-  7. Consumer proceeds with prefill_decoder using the pulled tensors
+  3. Producer broadcasts ECNixlCacheNotification via ZMQ PUB
+  4. Consumer's background SUB listener receives notification, queues it
+  5. Consumer main thread drains queue -> updates NIXL agent + tensor registry
+  6. Consumer calls start_load_caches -> initiates async NIXL pull (xfer)
+  7. Consumer polls get_finished until transfer completes
 
 Design decisions
 ----------------
+- Push-based discovery: producer broadcasts cache availability via ZMQ PUB,
+  eliminating round-robin polling across N producers.  Consumer maintains
+  a local registry updated by a background SUB listener thread.
+- Event-based waiting: consumer waits on threading.Event instead of
+  sleep-based polling, reducing discovery latency to near-zero.
+- Persistent ZMQ connections: SUB sockets are long-lived, avoiding per-poll
+  ZMQ context creation/teardown overhead.
+- ROUTER fallback: if PUB/SUB notification is missed (ZMQ PUB drops messages
+  when no subscriber is connected), consumer falls back to targeted ROUTER
+  refresh of specific producers.
 - Dynamic NIXL registration: EC tensors are variable-size (~45 MB typical for
   Qwen2-VL-7B with 6400 visual tokens), making pre-allocated fixed buffers
-  impractical. Tensors are registered on first save and deregistered when the
-  request finishes.
-- Consumer Pull: consumer initiates the NIXL transfer; producer is passive
-  after registering memory. This matches the sequential flow where the
-  orchestrator ensures the producer finishes before sending the consumer's
-  request.
-- Separate side-channel port: configurable via ec_connector_extra_config to
-  avoid collision with the KV transfer side-channel used in PD disaggregation.
-- UCX backend: same as feat_pd_disag's RblnNixlConnector.
+  impractical.  Tensors are registered on first save and deregistered when
+  the request finishes.
+- UCX backend: same as KV transfer NixlConnector.
 - aligned_tensor: all CPU tensors are allocated via rebel.kv_cache.aligned_tensor
   for efficient NPU DMA.
 
+Port layout
+-----------
+  Each producer uses two ports:
+    - side_channel_port:     ZMQ ROUTER (handshake / metadata refresh fallback)
+    - side_channel_port + 1: ZMQ PUB    (cache-ready notifications)
+
 Configuration example
 ---------------------
-  # Single producer (backward-compatible):
-  ECTransferConfig(
-      ec_connector="RblnECNixlConnector",
-      ec_role="ec_producer",  # or "ec_consumer"
-      ec_buffer_device="cpu",
-      ec_connector_extra_config={
-          "side_channel_host": "127.0.0.1",
-          "side_channel_port": 15100,
-          "backends": ["UCX"],
-      },
-  )
-
   # Multi-producer (consumer connects to 8 producers):
   ECTransferConfig(
       ec_connector="RblnECNixlConnector",
@@ -86,6 +85,7 @@ Configuration example
 
 from __future__ import annotations
 
+import queue
 import threading
 import time
 import uuid
@@ -115,7 +115,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 # ---------------------------------------------------------------------------
-# Side-channel constants
+# Constants
 # ---------------------------------------------------------------------------
 
 _GET_META_MSG = b"get_ec_meta_msg"
@@ -124,7 +124,7 @@ _DEFAULT_SIDE_CHANNEL_PORT = 15100  # separate from VLLM_NIXL_SIDE_CHANNEL_PORT
 _HANDSHAKE_TIMEOUT_MS = 10_000  # ZMQ recv timeout (ms)
 _XFER_POLL_INTERVAL_S = 0.001   # poll interval for async transfer completion
 _CACHE_WAIT_TIMEOUT_S = 30.0    # max time to wait for producer cache availability
-_CACHE_WAIT_POLL_S = 0.05       # poll interval when waiting for producer cache
+_PUB_PORT_OFFSET = 1            # PUB port = side_channel_port + offset
 
 # ---------------------------------------------------------------------------
 # Wire-protocol data classes (msgspec for zero-copy serialisation)
@@ -140,12 +140,18 @@ class ECNixlAgentMetadata(msgspec.Struct):
 
 
 class ECNixlHandshakePayload(msgspec.Struct):
-    """Wire payload sent from producer's ZMQ ROUTER to consumer's ZMQ REQ."""
+    """Wire payload for ROUTER handshake and PUB notification carrier."""
     agent_metadata_bytes: bytes
 
 
+class ECNixlCacheNotification(msgspec.Struct):
+    """PUB notification broadcast when caches change on a producer."""
+    new_mm_hashes: list[str]   # newly available mm_hashes (empty on deregister)
+    payload_bytes: bytes       # encoded ECNixlHandshakePayload
+
+
 # ---------------------------------------------------------------------------
-# Connector metadata (scheduler → worker)
+# Connector metadata (scheduler -> worker)
 # ---------------------------------------------------------------------------
 
 
@@ -162,11 +168,11 @@ class ECNixlConnectorMetadata(ECConnectorMetadata):
 
 
 class RblnECNixlConnectorScheduler(ECConnectorBase):
-    """Scheduler-side EC connector using NIXL for inter-process transfer.
+    """Scheduler-side EC connector.
 
-    Tracks which mm_hashes need to be loaded by the consumer worker and
-    runs a ZMQ ROUTER side-channel thread (producer only) to serve handshake
-    requests from the consumer.
+    Tracks which mm_hashes need to be loaded by the consumer worker.
+    The side-channel listener (ROUTER + PUB) is started by the *Worker*
+    via the static ``_side_channel_listener`` method.
     """
 
     def __init__(self, vllm_config: VllmConfig, role: ECConnectorRole):
@@ -182,13 +188,12 @@ class RblnECNixlConnectorScheduler(ECConnectorBase):
             "side_channel_port", _DEFAULT_SIDE_CHANNEL_PORT
         )
 
-        # mm_hash → num_encoder_tokens (consumer only: tracks what to load)
+        # mm_hash -> num_encoder_tokens (consumer only: tracks what to load)
         self._mm_datas_need_loads: dict[str, int] = {}
 
         # Side-channel listener thread (producer only)
         self._stop_event = threading.Event()
         self._listener_thread: threading.Thread | None = None
-        # Populated by worker via update_agent_metadata()
         self._encoded_agent_metadata: bytes | None = None
 
         logger.info(
@@ -203,29 +208,11 @@ class RblnECNixlConnectorScheduler(ECConnectorBase):
     # ------------------------------------------------------------------
 
     def update_agent_metadata(self, encoded_metadata: bytes) -> None:
-        """Start the side-channel listener with fresh agent metadata.
-
-        Called by the worker after it has registered EC tensors with NIXL
-        and encoded the ECNixlHandshakePayload.
-        """
+        """Legacy hook for scheduler-started listener. Not used when the
+        Worker manages its own listener thread (current default)."""
         if not self.is_producer:
             return
         self._encoded_agent_metadata = encoded_metadata
-        if self._listener_thread is None:
-            ready = threading.Event()
-            self._listener_thread = threading.Thread(
-                target=self._side_channel_listener,
-                args=(encoded_metadata, ready, self._stop_event,
-                      self._side_channel_host, self._side_channel_port),
-                daemon=True,
-                name="ec_nixl_handshake_listener",
-            )
-            self._listener_thread.start()
-            ready.wait()
-            logger.info(
-                "EC NIXL side-channel listener started on %s:%d",
-                self._side_channel_host, self._side_channel_port,
-            )
 
     def shutdown(self) -> None:
         self._stop_event.set()
@@ -238,12 +225,7 @@ class RblnECNixlConnectorScheduler(ECConnectorBase):
     # ------------------------------------------------------------------
 
     def has_cache_item(self, identifier: str) -> bool:
-        """Consumer returns True so the scheduler tracks mm_hashes to load.
-
-        The consumer will pull encoder caches from the producer via NIXL.
-        Returning True tells the scheduler to call update_state_after_alloc,
-        which populates mm_datas_need_loads for the worker.
-        """
+        """Consumer returns True so the scheduler tracks mm_hashes to load."""
         return self.is_consumer
 
     def update_state_after_alloc(self, request: "Request", index: int) -> None:
@@ -275,7 +257,7 @@ class RblnECNixlConnectorScheduler(ECConnectorBase):
         raise RuntimeError("save_caches must be called on the worker connector")
 
     # ------------------------------------------------------------------
-    # Static side-channel listener (ZMQ ROUTER)
+    # Static side-channel listener (ROUTER + PUB)
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -285,27 +267,72 @@ class RblnECNixlConnectorScheduler(ECConnectorBase):
         stop_event: threading.Event,
         host: str,
         port: int,
+        notification_queue: queue.Queue[bytes] | None = None,
     ) -> None:
-        """ZMQ ROUTER that serves the latest agent metadata to consumers.
+        """ROUTER + PUB listener thread.
 
-        ``metadata_holder`` is a 1-element list whose contents are
-        replaced in-place by ``_publish_agent_metadata`` whenever the
-        tensor registry changes — no thread restart needed.
+        ROUTER serves handshake / metadata-refresh requests from consumers.
+        PUB broadcasts cache-ready notifications (only when *notification_queue*
+        is provided by the Worker).
+
+        ``metadata_holder`` is a 1-element list whose contents are replaced
+        in-place by ``_publish_agent_metadata`` whenever the tensor registry
+        changes.
         """
-        path = make_zmq_path("tcp", host, port)
-        logger.debug("EC NIXL side-channel listening on %s", path)
-        with _zmq_ctx(zmq.ROUTER, path) as sock:
-            sock.setsockopt(zmq.RCVTIMEO, 1000)
+        router_path = make_zmq_path("tcp", host, port)
+        pub_path = make_zmq_path("tcp", host, port + _PUB_PORT_OFFSET)
+
+        ctx = zmq.Context()
+        try:
+            router = make_zmq_socket(
+                ctx=ctx, path=router_path,
+                socket_type=zmq.ROUTER, bind=True,
+            )
+
+            pub: zmq.Socket | None = None
+            if notification_queue is not None:
+                pub = make_zmq_socket(
+                    ctx=ctx, path=pub_path,
+                    socket_type=zmq.PUB, bind=True,
+                )
+
+            poller = zmq.Poller()
+            poller.register(router, zmq.POLLIN)
+
             ready_event.set()
+            logger.debug(
+                "EC NIXL side-channel: ROUTER=%s, PUB=%s",
+                router_path, pub_path if pub else "disabled",
+            )
+
             while not stop_event.is_set():
-                try:
-                    identity, _, msg = sock.recv_multipart()
-                except zmq.Again:
-                    continue
-                if msg == _GET_META_MSG:
-                    sock.send_multipart((identity, b"", metadata_holder[0]))
-                else:
-                    logger.warning("EC side-channel got unexpected message: %s", msg)
+                events = dict(poller.poll(100))
+
+                # Serve handshake / refresh requests
+                if router in events:
+                    try:
+                        identity, _, msg = router.recv_multipart()
+                        if msg == _GET_META_MSG:
+                            router.send_multipart(
+                                (identity, b"", metadata_holder[0])
+                            )
+                        else:
+                            logger.warning(
+                                "EC side-channel got unexpected message: %s", msg
+                            )
+                    except zmq.ZMQError as exc:
+                        logger.debug("EC NIXL ROUTER error: %s", exc)
+
+                # Broadcast pending notifications via PUB
+                if pub is not None and notification_queue is not None:
+                    while True:
+                        try:
+                            notif_bytes = notification_queue.get_nowait()
+                            pub.send(notif_bytes)
+                        except queue.Empty:
+                            break
+        finally:
+            ctx.destroy(linger=0)
 
 
 # ---------------------------------------------------------------------------
@@ -314,18 +341,19 @@ class RblnECNixlConnectorScheduler(ECConnectorBase):
 
 
 class RblnECNixlConnectorWorker(ECConnectorBase):
-    """Worker-side EC connector using NIXL for RDMA-based encoder cache transfer.
+    """Worker-side EC connector with push-based cache notifications.
 
     Producer side:
-      - After save_caches() is called, registers the EC tensors with NIXL
-        and notifies the scheduler to start the side-channel listener.
+      - Registers EC tensors with NIXL after save_caches().
+      - Broadcasts cache-ready notifications via ZMQ PUB.
+      - Serves handshake requests via ZMQ ROUTER.
 
     Consumer side:
-      - On first request, performs a ZMQ handshake with the producer to
-        obtain NIXL agent metadata.
-      - start_load_caches() initiates async NIXL pulls.
-      - get_finished() polls for completion and copies results into
-        encoder_cache.
+      - Background SUB listener receives producer notifications.
+      - Notifications are queued and processed on the main thread
+        (NIXL agent ops are not thread-safe).
+      - Event-based waiting replaces round-robin polling.
+      - ROUTER refresh is kept as a fallback for missed PUB messages.
     """
 
     def __init__(self, vllm_config: VllmConfig, role: ECConnectorRole):
@@ -376,38 +404,51 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
         self._engine_id: str = str(uuid.uuid4())
         self._nixl_agent = NixlAgent(self._engine_id, None)
 
-        # mm_hash → dict[tensor_key, aligned CPU tensor]
+        # mm_hash -> dict[tensor_key, aligned CPU tensor]
         self._registered_caches: dict[str, dict[str, torch.Tensor]] = {}
-        # mm_hash → nixl descriptor list (for deregistration)
+        # mm_hash -> nixl descriptor list (for deregistration)
         self._registered_descs: dict[str, Any] = {}
 
         # Pending async NIXL transfer handles (consumer only)
-        # mm_hash → (handle, local_tensor_dict)
+        # mm_hash -> (handle, local_tensor_dict)
         self._pending_loads: dict[str, tuple[Any, dict[str, torch.Tensor]]] = {}
 
         # Pointer to the shared encoder_cache dict (set in start_load_caches)
         self._encoder_cache: dict[str, Any] | None = None
 
         # Multi-producer state (consumer only, populated after handshake)
-        # producer_idx → remote NIXL agent name
+        # producer_idx -> remote NIXL agent name
         self._remote_agent_names: dict[int, str] = {}
-        # producer_idx → {mm_hash → {key: (base_addr, size, device_id, shape, dtype_str)}}
+        # producer_idx -> {mm_hash -> {key: (base_addr, size, device_id, shape, dtype_str)}}
         self._remote_tensor_registries: dict[
             int, dict[str, dict[str, tuple[int, int, int, list, str]]]
         ] = {}
-        # Reverse index: mm_hash → producer_idx (for quick pull lookup)
+        # Reverse index: mm_hash -> producer_idx (for quick pull lookup)
         self._mm_hash_to_producer: dict[str, int] = {}
 
-        # Side-channel listener (producer only)
+        # Thread control
         self._stop_event = threading.Event()
         self._listener_thread: threading.Thread | None = None
+        self._metadata_holder: list[bytes] = []
 
-        # Start the side-channel listener immediately so consumers can
-        # connect before any request arrives. Initial metadata has an
-        # empty tensor registry; _publish_agent_metadata() will restart
-        # it with actual tensors after the first save_caches() call.
+        # --- Producer: PUB notification outbound queue ---
+        self._notification_out_queue: queue.Queue[bytes] = queue.Queue()
+
+        # --- Consumer: SUB notification inbound infrastructure ---
+        self._incoming_notifications: queue.Queue[
+            tuple[int, bytes]
+        ] = queue.Queue()
+        self._new_notification = threading.Event()
+        self._sub_listener_thread: threading.Thread | None = None
+
+        # Start producer side-channel immediately so consumers can connect
+        # before any request arrives.
         if self.is_producer:
             self._publish_agent_metadata()
+
+        # Start consumer notification listener (subscribes to all producers)
+        if self.is_consumer and self._producer_endpoints:
+            self._start_notification_listener()
 
         logger.info(
             "RblnECNixlConnectorWorker initialised "
@@ -419,6 +460,155 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
         )
 
     # ------------------------------------------------------------------
+    # Consumer: background notification listener (SUB)
+    # ------------------------------------------------------------------
+
+    def _start_notification_listener(self) -> None:
+        """Start background thread subscribing to all producers' PUB sockets."""
+        ready = threading.Event()
+        self._sub_listener_thread = threading.Thread(
+            target=self._notification_listener,
+            args=(ready,),
+            daemon=True,
+            name="ec_nixl_notification_listener",
+        )
+        self._sub_listener_thread.start()
+        ready.wait()
+        logger.info(
+            "EC NIXL: notification listener started "
+            "(subscribing to %d producers)",
+            len(self._producer_endpoints),
+        )
+
+    def _notification_listener(self, ready: threading.Event) -> None:
+        """Background thread: receive PUB notifications from all producers.
+
+        Each notification is placed into ``_incoming_notifications`` as a
+        ``(producer_idx, raw_bytes)`` tuple.  The main thread drains this
+        queue in ``_process_pending_notifications`` where NIXL agent updates
+        (which are not thread-safe) are performed.
+        """
+        ctx = zmq.Context()
+        try:
+            poller = zmq.Poller()
+            sub_sockets: dict[zmq.Socket, int] = {}
+
+            for idx, endpoint in enumerate(self._producer_endpoints):
+                pub_path = make_zmq_path(
+                    "tcp", endpoint["host"],
+                    endpoint["port"] + _PUB_PORT_OFFSET,
+                )
+                sub = ctx.socket(zmq.SUB)
+                sub.setsockopt(zmq.RCVTIMEO, 500)
+                sub.connect(pub_path)
+                sub.subscribe(b"")
+                poller.register(sub, zmq.POLLIN)
+                sub_sockets[sub] = idx
+                logger.debug(
+                    "EC NIXL: SUB connected to producer %d at %s",
+                    idx, pub_path,
+                )
+
+            ready.set()
+
+            while not self._stop_event.is_set():
+                events = dict(poller.poll(200))
+                for sock in events:
+                    producer_idx = sub_sockets[sock]
+                    try:
+                        raw = sock.recv(zmq.NOBLOCK)
+                        self._incoming_notifications.put(
+                            (producer_idx, raw)
+                        )
+                        self._new_notification.set()
+                    except zmq.Again:
+                        pass
+        finally:
+            ctx.destroy(linger=0)
+
+    def _process_pending_notifications(self) -> set[str]:
+        """Drain notification queue, update NIXL agents and registries.
+
+        Returns the set of newly discovered mm_hashes.
+
+        Must be called from the main thread (NIXL agent operations are
+        not thread-safe).
+        """
+        all_new: set[str] = set()
+
+        while True:
+            try:
+                producer_idx, raw = self._incoming_notifications.get_nowait()
+            except queue.Empty:
+                break
+
+            try:
+                notif = msgspec.msgpack.Decoder(
+                    ECNixlCacheNotification
+                ).decode(raw)
+                payload = msgspec.msgpack.Decoder(
+                    ECNixlHandshakePayload
+                ).decode(notif.payload_bytes)
+                agent_meta = msgspec.msgpack.Decoder(
+                    ECNixlAgentMetadata
+                ).decode(payload.agent_metadata_bytes)
+
+                # Build the new tensor registry from the notification
+                new_registry: dict[
+                    str, dict[str, tuple[int, int, int, list, str]]
+                ] = {}
+                for entry in agent_meta.registered_tensors:
+                    mm_hash, key, base_addr, nbytes, device_id = entry[:5]
+                    shape = entry[5] if len(entry) > 5 else []
+                    dtype_str = entry[6] if len(entry) > 6 else "torch.bfloat16"
+                    if mm_hash not in new_registry:
+                        new_registry[mm_hash] = {}
+                    new_registry[mm_hash][key] = (
+                        base_addr, nbytes, device_id, shape, dtype_str
+                    )
+
+                old_registry = self._remote_tensor_registries.get(
+                    producer_idx, {}
+                )
+                new_mm_hashes = set(new_registry) - set(old_registry)
+
+                # Re-register NIXL remote agent only when new memory
+                # regions appear (addresses changed).
+                if new_mm_hashes:
+                    if producer_idx in self._remote_agent_names:
+                        self._nixl_agent.remove_remote_agent(
+                            self._remote_agent_names[producer_idx]
+                        )
+                    self._remote_agent_names[producer_idx] = (
+                        self._nixl_agent.add_remote_agent(
+                            agent_meta.agent_metadata
+                        )
+                    )
+
+                self._remote_tensor_registries[producer_idx] = new_registry
+                for mm_hash in new_registry:
+                    self._mm_hash_to_producer[mm_hash] = producer_idx
+
+                all_new.update(new_mm_hashes)
+
+                if new_mm_hashes:
+                    logger.info(
+                        "EC NIXL: producer %d notification — "
+                        "%d new mm_hash(es) (%d total)",
+                        producer_idx,
+                        len(new_mm_hashes),
+                        len(self._mm_hash_to_producer),
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "EC NIXL: failed to process notification "
+                    "from producer %d: %s",
+                    producer_idx, exc,
+                )
+
+        return all_new
+
+    # ------------------------------------------------------------------
     # ECConnectorBase interface - worker side
     # ------------------------------------------------------------------
 
@@ -428,7 +618,7 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
         mm_hash: str,
         **kwargs,
     ) -> None:
-        """Producer: register EC tensors with NIXL and update side-channel.
+        """Producer: register EC tensors with NIXL and broadcast notification.
 
         Called by the model runner after preprocess_prefill completes.
         Tensors are dynamically registered on the first save for each mm_hash.
@@ -471,8 +661,8 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
             len(aligned), mm_hash, list(aligned.keys()),
         )
 
-        # Notify scheduler to publish updated agent metadata
-        self._publish_agent_metadata()
+        # Update ROUTER metadata and broadcast PUB notification
+        self._publish_agent_metadata(new_mm_hashes=[mm_hash])
 
     def start_load_caches(
         self,
@@ -485,9 +675,8 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
         Args:
             encoder_cache: Shared encoder cache dict to populate.
             blocking: If True, wait for all pulls to complete before
-                returning. If False, only initiate pulls — caller must
-                poll via ``get_finished()`` or call
-                ``wait_for_pending_pulls()`` later.
+                returning.  If False, only initiate pulls -- caller must
+                poll via ``get_finished()`` later.
         """
         if self.is_producer:
             return
@@ -496,16 +685,20 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, ECNixlConnectorMetadata)
 
-        # Ensure we have connections to all producers
+        # Ensure we have initial connections to all producers
         if not self._remote_agent_names:
             self._do_handshake_all()
+
+        # Process any pending PUB notifications (updates registries on
+        # main thread before we check for mm_hashes).
+        self._process_pending_notifications()
 
         for mm_data in metadata.mm_datas_to_load:
             mm_hash = mm_data.mm_hash
             if mm_hash in self._pending_loads:
                 continue
 
-            # Refresh producers' metadata to discover the mm_hash.
+            # Check registry (populated by PUB notifications or handshake)
             if mm_hash not in self._mm_hash_to_producer:
                 self._wait_for_cache(mm_hash)
             if mm_hash not in self._mm_hash_to_producer:
@@ -541,7 +734,7 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
             ):
                 status = self._nixl_agent.check_xfer_state(handle)
                 if status == "DONE":
-                    # Use local_bufs directly — no clone needed since
+                    # Use local_bufs directly -- no clone needed since
                     # they are allocated per-pull and not reused.
                     encoder_cache[mm_hash] = local_bufs
                     self._nixl_agent.release_xfer_handle(handle)
@@ -573,9 +766,16 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
         self,
         finished_req_ids: set[str],
     ) -> tuple[set[str] | None, set[str] | None]:
-        """Poll pending NIXL transfers and move completed ones to encoder_cache."""
+        """Poll pending NIXL transfers and move completed ones to encoder_cache.
+
+        Also drains PUB notifications so that next-step caches can be
+        discovered early (pre-fetch).
+        """
         if not self._pending_loads or self._encoder_cache is None:
             return None, None
+
+        # Drain notifications for pre-fetch benefit
+        self._process_pending_notifications()
 
         completed: set[str] = set()
         for mm_hash, (handle, local_bufs) in list(self._pending_loads.items()):
@@ -602,17 +802,92 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
         for feature in request.mm_features:
             mm_hash = feature.identifier
             self._deregister_mm_hash(mm_hash)
+        # Broadcast updated metadata so consumers see the deregistration
+        self._publish_agent_metadata()
         return False, None
 
     # ------------------------------------------------------------------
     # NIXL helpers
     # ------------------------------------------------------------------
 
+    def _wait_for_cache(self, mm_hash: str) -> None:
+        """Wait for *mm_hash* to appear via PUB notification, with ROUTER
+        fallback if notifications are missed.
+
+        Phase 1 (fast path): drain the notification queue and wait on the
+        ``_new_notification`` Event.  This is near-zero latency when the
+        producer PUB message arrives before the consumer needs it.
+
+        Phase 2 (fallback): if Phase 1 times out (e.g. PUB was missed
+        because SUB wasn't connected yet), fall back to targeted ROUTER
+        refresh of each producer.
+        """
+        deadline = time.monotonic() + _CACHE_WAIT_TIMEOUT_S
+
+        # Phase 1: event-based waiting on PUB notifications
+        fallback_deadline = min(
+            deadline,
+            time.monotonic() + _CACHE_WAIT_TIMEOUT_S * 0.8,
+        )
+        while time.monotonic() < fallback_deadline:
+            self._process_pending_notifications()
+            if mm_hash in self._mm_hash_to_producer:
+                logger.debug(
+                    "EC NIXL: mm_hash=%s discovered via PUB notification",
+                    mm_hash,
+                )
+                return
+
+            remaining = fallback_deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            self._new_notification.clear()
+            self._new_notification.wait(timeout=min(remaining, 1.0))
+
+        if mm_hash in self._mm_hash_to_producer:
+            return
+
+        # Phase 2: ROUTER fallback -- targeted refresh of each producer
+        logger.info(
+            "EC NIXL: mm_hash=%s not found via PUB, "
+            "falling back to ROUTER refresh",
+            mm_hash,
+        )
+        while time.monotonic() < deadline:
+            for idx in range(len(self._producer_endpoints)):
+                if idx not in self._remote_agent_names:
+                    endpoint = self._producer_endpoints[idx]
+                    try:
+                        self._do_handshake_single(
+                            idx, endpoint["host"], endpoint["port"]
+                        )
+                    except RuntimeError:
+                        continue
+                self._refresh_metadata(idx)
+                if mm_hash in self._mm_hash_to_producer:
+                    logger.debug(
+                        "EC NIXL: mm_hash=%s found via ROUTER fallback "
+                        "on producer %d",
+                        mm_hash, idx,
+                    )
+                    return
+            # Also check PUB queue between ROUTER rounds
+            self._process_pending_notifications()
+            if mm_hash in self._mm_hash_to_producer:
+                return
+            time.sleep(0.05)
+
+        logger.warning(
+            "EC NIXL: timed out waiting for mm_hash=%s (%.1fs)",
+            mm_hash, _CACHE_WAIT_TIMEOUT_S,
+        )
+
     def _refresh_metadata(self, producer_idx: int) -> None:
-        """Re-fetch a specific producer's agent metadata and update the
+        """ROUTER-based metadata refresh (fallback when PUB is missed).
+
+        Re-fetches a specific producer's agent metadata and updates the
         tensor registry.  Only re-registers the NIXL remote agent when
-        new mm_hashes are discovered (avoids expensive remove/re-add on
-        every poll)."""
+        new mm_hashes are discovered."""
         endpoint = self._producer_endpoints[producer_idx]
         path = make_zmq_path("tcp", endpoint["host"], endpoint["port"])
         try:
@@ -625,7 +900,7 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
             meta_decoder = msgspec.msgpack.Decoder(ECNixlAgentMetadata)
             agent_meta = meta_decoder.decode(payload.agent_metadata_bytes)
 
-            # Build the new tensor registry to compare with the old one.
+            # Build new tensor registry
             new_registry: dict[str, dict[str, tuple[int, int, int, list, str]]] = {}
             for entry in agent_meta.registered_tensors:
                 mm_hash, key, base_addr, nbytes, device_id = entry[:5]
@@ -640,8 +915,6 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
             old_registry = self._remote_tensor_registries.get(producer_idx, {})
             new_mm_hashes = set(new_registry) - set(old_registry)
 
-            # Only re-register NIXL agent when new tensors appear
-            # (remote memory regions have changed).
             if new_mm_hashes:
                 if producer_idx in self._remote_agent_names:
                     self._nixl_agent.remove_remote_agent(
@@ -657,62 +930,31 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
 
             if new_mm_hashes:
                 logger.info(
-                    "EC NIXL: producer %d — %d new mm_hash(es) discovered "
-                    "(%d total across all producers)",
+                    "EC NIXL: producer %d ROUTER refresh — "
+                    "%d new mm_hash(es) (%d total)",
                     producer_idx,
                     len(new_mm_hashes),
                     len(self._mm_hash_to_producer),
                 )
-            else:
-                logger.info(
-                    "EC NIXL: producer %d refresh — %d mm_hashes (no new)",
-                    producer_idx,
-                    len(new_registry),
-                )
         except (zmq.Again, zmq.ZMQError, msgspec.DecodeError) as exc:
-            logger.info(
-                "EC NIXL: metadata refresh for producer %d failed (%s)",
+            logger.debug(
+                "EC NIXL: ROUTER refresh for producer %d failed (%s)",
                 producer_idx, exc,
             )
 
-    def _wait_for_cache(self, mm_hash: str) -> None:
-        """Poll all producers' side-channels until *mm_hash* appears in
-        any producer's registry or timeout is reached."""
-        deadline = time.monotonic() + _CACHE_WAIT_TIMEOUT_S
-        while time.monotonic() < deadline:
-            for idx in range(len(self._producer_endpoints)):
-                if idx not in self._remote_agent_names:
-                    # Try connecting to producers that failed initial handshake
-                    endpoint = self._producer_endpoints[idx]
-                    try:
-                        self._do_handshake_single(
-                            idx, endpoint["host"], endpoint["port"]
-                        )
-                    except RuntimeError:
-                        continue
-                self._refresh_metadata(idx)
-                if mm_hash in self._mm_hash_to_producer:
-                    logger.debug(
-                        "EC NIXL: mm_hash=%s discovered on producer %d",
-                        mm_hash, idx,
-                    )
-                    return
-            time.sleep(_CACHE_WAIT_POLL_S)
-        logger.warning(
-            "EC NIXL: timed out waiting for mm_hash=%s (%.1fs)",
-            mm_hash, _CACHE_WAIT_TIMEOUT_S,
-        )
+    def _publish_agent_metadata(
+        self, new_mm_hashes: list[str] | None = None,
+    ) -> None:
+        """Producer: update ROUTER metadata and queue PUB notification.
 
-    def _publish_agent_metadata(self) -> None:
-        """Encode current agent metadata and update the side-channel listener.
-
-        On first call, starts the listener thread. On subsequent calls,
-        updates the metadata in-place (no thread restart needed).
+        On first call, starts the ROUTER + PUB listener thread.
+        On subsequent calls, updates ROUTER metadata in-place and
+        enqueues a notification for the PUB socket.
         """
         if not self.is_producer:
             return
 
-        # Build the registered tensor registry for the consumer
+        # Build the registered tensor list for consumers
         registered_tensors: list[tuple[str, str, int, int, int, list, str]] = []
         for mm_hash, tensor_dict in self._registered_caches.items():
             for key, buf in tensor_dict.items():
@@ -737,30 +979,47 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
         )
         encoded = encoder.encode(payload)
 
+        # Queue PUB notification
+        notif = ECNixlCacheNotification(
+            new_mm_hashes=new_mm_hashes or [],
+            payload_bytes=encoded,
+        )
+        self._notification_out_queue.put(encoder.encode(notif))
+
         if self._listener_thread is not None:
-            # Listener already running — update metadata in-place.
+            # Listener already running -- update ROUTER metadata in-place.
             self._metadata_holder[0] = encoded
             logger.info(
-                "EC NIXL: metadata updated in-place (%d mm_hashes, %d tensors)",
+                "EC NIXL: metadata updated (%d mm_hashes, %d tensors, "
+                "new=%s)",
                 len(self._registered_caches),
                 len(registered_tensors),
+                new_mm_hashes,
             )
         else:
-            # First call — start the listener thread.
+            # First call -- start the ROUTER + PUB listener thread.
             self._metadata_holder = [encoded]
             ready = threading.Event()
             self._listener_thread = threading.Thread(
                 target=RblnECNixlConnectorScheduler._side_channel_listener,
-                args=(self._metadata_holder, ready, self._stop_event,
-                      self._side_channel_host, self._side_channel_port),
+                args=(
+                    self._metadata_holder,
+                    ready,
+                    self._stop_event,
+                    self._side_channel_host,
+                    self._side_channel_port,
+                    self._notification_out_queue,
+                ),
                 daemon=True,
                 name="ec_nixl_handshake_listener",
             )
             self._listener_thread.start()
             ready.wait()
             logger.info(
-                "EC NIXL side-channel listener started on %s:%d",
+                "EC NIXL side-channel started on %s:%d (ROUTER) / %s:%d (PUB)",
                 self._side_channel_host, self._side_channel_port,
+                self._side_channel_host,
+                self._side_channel_port + _PUB_PORT_OFFSET,
             )
 
     def _do_handshake_all(self, fast: bool = False) -> None:
@@ -824,7 +1083,7 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
         if payload is None:
             raise RuntimeError(
                 f"EC NIXL handshake with producer {producer_idx} at "
-                f"{host}:{port} timed out after {_HANDSHAKE_TIMEOUT_MS}ms"
+                f"{host}:{port} timed out after {timeout_ms}ms"
             )
 
         meta_decoder = msgspec.msgpack.Decoder(ECNixlAgentMetadata)
@@ -1018,13 +1277,14 @@ class RblnECNixlConnector(ECConnectorBase):
 
 
 # ---------------------------------------------------------------------------
-# ZMQ context manager (mirrors nixl_connector.py's zmq_ctx helper)
+# ZMQ context manager (used for one-shot REQ connections in handshake
+# and ROUTER-based fallback refresh)
 # ---------------------------------------------------------------------------
 
 
 @contextmanager
 def _zmq_ctx(socket_type: int, addr: str) -> Iterator[zmq.Socket]:
-    """Context manager for a ZMQ socket (ROUTER binds, REQ connects)."""
+    """Context manager for a ZMQ socket (ROUTER/PUB bind, REQ/SUB connect)."""
     ctx: zmq.Context | None = None
     try:
         ctx = zmq.Context()
@@ -1032,7 +1292,7 @@ def _zmq_ctx(socket_type: int, addr: str) -> Iterator[zmq.Socket]:
             ctx=ctx,
             path=addr,
             socket_type=socket_type,
-            bind=socket_type == zmq.ROUTER,
+            bind=socket_type in (zmq.ROUTER, zmq.PUB),
         )
     finally:
         if ctx is not None:

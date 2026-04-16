@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2025 Rebellions Inc. All rights reserved.
 
@@ -14,361 +15,496 @@
 # limitations under the License.
 
 """
-Client for EC disaggregated serving (multi-producer + consumer).
+EC Disaggregated Encoder Proxy
 
-Prerequisites:
-  1. Start producers:  NUM_PRODUCERS=6 bash serve_ec_producer.sh
-  2. Start consumer:   NUM_PRODUCERS=6 bash serve_ec_consumer.sh
+Proxy that routes OpenAI-compatible "/v1/chat/completions" requests to two
+clusters for EC (Encoder Cache) disaggregation:
+
+  * encode  (producer — runs the visual encoder, caches via NIXL)
+  * decode  (consumer — pulls encoder cache via NIXL, runs LLM)
+
+For multimodal input we:
+    1. Extract *every* image/audio item from the request.
+    2. Fire N concurrent requests to the encoder cluster
+       (one request per MM item, with **all text removed**).
+    3. Wait for all of them to succeed (encoder caches are now available
+       via NIXL on the producer side).
+    4. Forward the *original* request to a decode server (consumer pulls
+       the encoder cache via NIXL and runs prefill + decode).
+
+This is the E+PD mode of disagg_epd_proxy.py, simplified for EC
+disaggregation where no separate prefill stage is needed.
 
 Usage:
-  # Quick test (3 requests, all at once):
-  python client_ec_disaggregated.py --num-requests 3
-
-  # Dynamic load test (50 requests, 5 req/s, 6 producers):
   python client_ec_disaggregated.py \
-      --num-requests 50 \
-      --request-rate 5.0 \
-      --num-producers 6 \
-      --producer-base-port 8000 \
-      --consumer-port 9000
+      --encode-servers-urls "http://127.0.0.1:8000,http://127.0.0.1:8001" \
+      --decode-servers-urls "http://127.0.0.1:9000"
 
-  # Burst test (all requests at once, max 16 concurrent):
-  python client_ec_disaggregated.py \
-      --num-requests 100 \
-      --max-concurrency 16 \
-      --num-producers 6
-
-  # Baseline (no disaggregation, single server on port 8000):
-  python client_ec_disaggregated.py \
-      --baseline \
-      --baseline-port 8000 \
-      --num-requests 50
-
-Flow per request:
-  1. Pick a producer (round-robin)
-  2. Send request to producer (triggers vision encoding)
-  3. Wait for producer to finish
-  4. Send same request to consumer (pulls cache via NIXL, decodes)
-  5. Collect result from consumer
+  # Then send requests to the proxy:
+  curl http://127.0.0.1:1800/v1/chat/completions -d '{...}'
 """
 
+from __future__ import annotations
+
+import argparse
 import asyncio
-import base64
-import time
-from io import BytesIO
+import logging
+import os
+import random
+import uuid
+from collections.abc import AsyncIterator
 
-import fire
-import httpx
-import numpy as np
-from datasets import load_dataset
+import aiohttp
+import uvicorn
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 
+###############################################################################
+# FastAPI app & global state
+###############################################################################
 
-def _make_chat_request(image_b64: str, question: str, max_tokens: int = 200):
-    """Build an OpenAI-compatible chat completion request body."""
-    return {
-        "model": "Qwen2-VL-7B-Instruct",
-        "messages": [
-            {
-                "role": "system",
-                "content": "You are a helpful assistant. "
-                "Answer each question based on the image.",
-            },
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/png;base64,{image_b64}",
-                        },
-                    },
-                    {"type": "text", "text": question},
-                ],
-            },
-        ],
-        "max_tokens": max_tokens,
-        "temperature": 0,
-    }
+logging.basicConfig(
+    level=logging.DEBUG, format="%(asctime)s %(levelname)s: %(message)s"
+)
+logger = logging.getLogger("ec_proxy")
+
+app = FastAPI()
+encode_session: aiohttp.ClientSession | None = None
+decode_session: aiohttp.ClientSession | None = None
+
+###############################################################################
+# Utils
+###############################################################################
+
+MM_TYPES = {"image_url", "audio_url", "input_audio"}
 
 
-async def _send_request(
-    client: httpx.AsyncClient,
+def extract_mm_items(request_data: dict) -> list[dict]:
+    """
+    Return *all* image/audio items that appear anywhere in `messages`.
+
+    Each returned dict looks like:
+        { "type": "image_url", "image_url": {...} }
+    """
+    items: list[dict] = []
+    for msg in request_data.get("messages", []):
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+
+        for item in content:
+            if item.get("type") in MM_TYPES:
+                items.append(item)
+    return items
+
+
+async def fanout_encoder_primer(
+    orig_request: dict,
+    e_urls: list[str],
+    req_id: str,
+) -> None:
+    """
+    1. Build one request *per MM item* with all text removed.
+    2. Send them concurrently to the encode cluster (round-robin).
+    3. Raise if any of them fails.
+    """
+    logger.info("[%s] Processing multimodal items...", req_id)
+
+    mm_items = extract_mm_items(orig_request)
+    if not mm_items:
+        logger.info("[%s] No multimodal items, skipping encoder", req_id)
+        return
+
+    logger.info("[%s] Got %d multimodal items", req_id, len(mm_items))
+
+    tasks = []
+
+    # Round-robin over encode servers to distribute load
+    url_cycle = (e_urls[i % len(e_urls)] for i in range(len(mm_items)))
+
+    for idx, (item, target_url) in enumerate(zip(mm_items, url_cycle)):
+        child_req_id = f"{req_id}:{idx}:{uuid.uuid4().hex[:6]}"
+        headers = {"x-request-id": child_req_id}
+
+        encoder_req = {
+            "model": orig_request.get("model"),
+            "messages": [
+                {"role": "user", "content": [item]},
+            ],
+            # Only need 1 token so the server actually runs the encoder path
+            "max_tokens": 1,
+            "stream": False,
+        }
+        tasks.append(
+            encode_session.post(
+                f"{target_url}/v1/chat/completions",
+                json=encoder_req,
+                headers=headers,
+            )
+        )
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Fail fast if any sub-request failed
+    for idx, r in enumerate(results):
+        if isinstance(r, Exception):
+            logger.error(
+                "[%s] Encoder request #%d raised exception: %s",
+                req_id,
+                idx,
+                r,
+                exc_info=r,
+            )
+            raise HTTPException(
+                status_code=502, detail=f"Encoder request failed: {str(r)}"
+            )
+        if r.status != 200:
+            try:
+                detail = await r.text()
+            except Exception:
+                detail = "<unable to read body>"
+            logger.error(
+                "[%s] Encoder request #%d returned status %s: %s",
+                req_id,
+                idx,
+                r.status,
+                detail,
+            )
+            raise HTTPException(
+                status_code=r.status,
+                detail=f"Encoder request failed: {detail}",
+            )
+
+    logger.info(
+        "[%s] All %d encoder requests completed successfully",
+        req_id,
+        len(mm_items),
+    )
+
+
+###############################################################################
+# Middleware for request/response logging
+###############################################################################
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    req_id = request.headers.get("x-request-id", str(uuid.uuid4()))
+
+    logger.info(
+        ">>> [%s] %s %s from %s",
+        req_id,
+        request.method,
+        request.url.path,
+        request.client.host if request.client else "unknown",
+    )
+
+    try:
+        response = await call_next(request)
+        logger.info(
+            "<<< [%s] %s %s completed with status %d",
+            req_id,
+            request.method,
+            request.url.path,
+            response.status_code,
+        )
+        return response
+    except Exception as e:
+        logger.exception(
+            "!!! [%s] %s %s failed with error: %s",
+            req_id,
+            request.method,
+            request.url.path,
+            str(e),
+        )
+        raise
+
+
+###############################################################################
+# FastAPI lifecycle
+###############################################################################
+
+
+@app.on_event("startup")
+async def on_startup() -> None:
+    global encode_session, decode_session
+    timeout = aiohttp.ClientTimeout(total=100_000)
+    connector = aiohttp.TCPConnector(limit=0, force_close=False)
+    encode_session = aiohttp.ClientSession(
+        timeout=timeout, connector=connector
+    )
+    decode_session = aiohttp.ClientSession(
+        timeout=timeout, connector=connector
+    )
+
+
+@app.on_event("shutdown")
+async def on_shutdown() -> None:
+    global encode_session, decode_session
+    if encode_session:
+        await encode_session.close()
+    if decode_session:
+        await decode_session.close()
+
+
+###############################################################################
+# Core forwarding
+###############################################################################
+
+
+async def forward_non_stream(
+    req_data: dict,
+    req_id: str,
+    e_urls: list[str],
+    d_url: str,
+) -> dict:
+    try:
+        # Step 1: Fan-out to encoder cluster (produces NIXL caches)
+        await fanout_encoder_primer(req_data, e_urls, req_id)
+
+        # Step 2: Forward original request to decode cluster
+        # (consumer pulls encoder cache via NIXL)
+        logger.info("[%s] Forwarding to decode: %s", req_id, d_url)
+        headers = {"x-request-id": req_id}
+
+        async with decode_session.post(
+            f"{d_url}/v1/chat/completions", json=req_data, headers=headers
+        ) as resp:
+            resp.raise_for_status()
+            return await resp.json()
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(
+            "[%s] Error in forward_non_stream: %s", req_id, str(e)
+        )
+        raise HTTPException(
+            status_code=500, detail=f"Proxy error: {str(e)}"
+        ) from e
+
+
+async def forward_stream(
+    req_data: dict,
+    req_id: str,
+    e_urls: list[str],
+    d_url: str,
+) -> AsyncIterator[str]:
+    try:
+        # Step 1: Fan-out to encoder cluster (produces NIXL caches)
+        await fanout_encoder_primer(req_data, e_urls, req_id)
+
+        # Step 2: Stream from decode cluster
+        logger.info("[%s] Starting streaming from decode: %s", req_id, d_url)
+        headers = {"x-request-id": req_id}
+
+        async with decode_session.post(
+            f"{d_url}/v1/chat/completions",
+            json=req_data,
+            headers=headers,
+        ) as resp:
+            resp.raise_for_status()
+            async for chunk in resp.content.iter_chunked(1024):
+                if chunk:
+                    yield chunk.decode("utf-8", errors="ignore")
+
+        logger.info("[%s] Streaming completed", req_id)
+
+    except HTTPException:
+        logger.exception("[%s] HTTPException in forward_stream", req_id)
+        raise
+    except Exception as e:
+        logger.exception(
+            "[%s] Error in forward_stream: %s", req_id, str(e)
+        )
+        raise HTTPException(
+            status_code=500, detail=f"Proxy streaming error: {str(e)}"
+        ) from e
+
+
+###############################################################################
+# Public routes
+###############################################################################
+
+
+@app.post("/v1/chat/completions")
+async def chat_completions(request: Request):
+    try:
+        req_data = await request.json()
+        req_id = request.headers.get("x-request-id", str(uuid.uuid4()))
+
+        e_urls = app.state.e_urls
+        d_url = random.choice(app.state.d_urls)
+
+        is_streaming = req_data.get("stream", False)
+
+        if is_streaming:
+            return StreamingResponse(
+                forward_stream(req_data, req_id, e_urls, d_url),
+                media_type="text/event-stream",
+            )
+        result = await forward_non_stream(req_data, req_id, e_urls, d_url)
+        return JSONResponse(content=result)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error in chat_completions endpoint: %s", str(e))
+        raise HTTPException(
+            status_code=500, detail=f"Request processing error: {str(e)}"
+        ) from e
+
+
+@app.get("/v1/models")
+async def list_models():
+    async with decode_session.get(
+        f"{app.state.d_urls[0]}/v1/models"
+    ) as resp:
+        resp.raise_for_status()
+        return await resp.json()
+
+
+@app.get("/health")
+async def health_check():
+    async def healthy(urls):
+        if not urls:
+            return "empty"
+        for u in urls:
+            try:
+                async with encode_session.get(f"{u}/health") as resp:
+                    resp.raise_for_status()
+            except Exception:
+                return "unhealthy"
+        return "healthy"
+
+    e_status, d_status = await asyncio.gather(
+        healthy(app.state.e_urls),
+        healthy(app.state.d_urls),
+    )
+
+    overall_healthy = all(
+        status != "unhealthy" for status in (e_status, d_status)
+    )
+
+    return JSONResponse(
+        {
+            "proxy": "healthy",
+            "encode_cluster": e_status,
+            "decode_cluster": d_status,
+        },
+        status_code=200 if overall_healthy else 503,
+    )
+
+
+###############################################################################
+# Profiler fan-out
+###############################################################################
+
+
+async def _post_if_available(
+    session: aiohttp.ClientSession,
     url: str,
-    body: dict,
-    timeout: float = 6000.0,
-) -> httpx.Response:
-    return await client.post(
-        url,
-        json=body,
-        timeout=timeout,
-    )
+    payload: dict,
+    headers: dict,
+) -> dict | None:
+    try:
+        resp = await session.post(url, json=payload, headers=headers)
+        if resp.status == 404:
+            logger.warning("Profiling endpoint missing on %s", url)
+            return None
+        resp.raise_for_status()
+        return await resp.json(content_type=None)
+    except aiohttp.ClientResponseError as exc:
+        if exc.status == 404:
+            logger.warning("Profiling endpoint missing on %s", url)
+            return None
+        raise
 
 
-async def process_request(
-    client: httpx.AsyncClient,
-    producer_url: str,
-    consumer_url: str,
-    body: dict,
-    request_id: int,
-    timeout: float = 6000.0,
-) -> dict:
-    """Send request to producer and consumer simultaneously.
-
-    Consumer's NIXL pull will poll until the producer finishes encoding
-    and registers the cache, so there's no need to wait for the producer
-    before sending to the consumer.
-    """
-    t_start = time.perf_counter()
-
-    # Fire both at the same time — consumer will poll via NIXL until
-    # producer's encoder cache is available.
-    producer_task = asyncio.create_task(
-        _send_request(client, producer_url, body, timeout)
-    )
-    consumer_task = asyncio.create_task(
-        _send_request(client, consumer_url, body, timeout)
-    )
-
-    # Wait for both to complete
-    producer_resp, consumer_resp = await asyncio.gather(
-        producer_task, consumer_task
-    )
-    t_end = time.perf_counter()
-
-    consumer_resp.raise_for_status()
-    result = consumer_resp.json()
-    usage = result.get("usage", {})
-    return {
-        "request_id": request_id,
-        "text": result["choices"][0]["message"]["content"],
-        "producer_time": 0.0,  # not measurable separately in parallel mode
-        "consumer_time": t_end - t_start,
-        "total_time": t_end - t_start,
-        "completion_tokens": usage.get("completion_tokens", 0),
-    }
-
-
-async def process_request_baseline(
-    client: httpx.AsyncClient,
-    server_url: str,
-    body: dict,
-    request_id: int,
-    timeout: float = 6000.0,
-) -> dict:
-    """Baseline: send request to a single server (no disaggregation)."""
-    t_start = time.perf_counter()
-    resp = await _send_request(client, server_url, body, timeout)
-    resp.raise_for_status()
-    t_end = time.perf_counter()
-
-    result = resp.json()
-    usage = result.get("usage", {})
-    return {
-        "request_id": request_id,
-        "text": result["choices"][0]["message"]["content"],
-        "producer_time": 0.0,
-        "consumer_time": t_end - t_start,
-        "total_time": t_end - t_start,
-        "completion_tokens": usage.get("completion_tokens", 0),
-    }
-
-
-async def _rate_limited_worker(
-    semaphore: asyncio.Semaphore,
-    client: httpx.AsyncClient,
-    producer_url: str,
-    consumer_url: str,
-    body: dict,
-    request_id: int,
-    timeout: float = 6000.0,
-) -> dict:
-    """Wrap process_request with a concurrency-limiting semaphore."""
-    async with semaphore:
-        return await process_request(
-            client, producer_url, consumer_url, body, request_id, timeout
-        )
-
-
-async def _rate_limited_worker_baseline(
-    semaphore: asyncio.Semaphore,
-    client: httpx.AsyncClient,
-    server_url: str,
-    body: dict,
-    request_id: int,
-    timeout: float = 6000.0,
-) -> dict:
-    """Wrap process_request_baseline with a concurrency-limiting semaphore."""
-    async with semaphore:
-        return await process_request_baseline(
-            client, server_url, body, request_id, timeout
-        )
-
-
-def _print_summary(results: list[dict], is_baseline: bool = False) -> None:
-    """Print per-request results and aggregate metrics."""
-    producer_times = []
-    consumer_times = []
-    total_times = []
-    total_tokens = 0
-
-    mode = "BASELINE" if is_baseline else "DISAGGREGATED"
-    print(f"\n{'='*60}")
-    print(f"  Mode: {mode}")
-    print(f"{'='*60}")
-
-    # Per-request metrics
-    for r in results:
-        tokens = r["completion_tokens"]
-        total_tokens += tokens
-        producer_times.append(r["producer_time"])
-        consumer_times.append(r["consumer_time"])
-        total_times.append(r["total_time"])
-        tok_s = tokens / r["consumer_time"] if r["consumer_time"] > 0 else 0
-        if is_baseline:
-            print(f"[req {r['request_id']:3d}] "
-                  f"time={r['total_time']:.2f}s  "
-                  f"{tokens} tokens  {tok_s:.1f} tok/s")
-        else:
-            print(f"[req {r['request_id']:3d}] "
-                  f"producer={r['producer_time']:.2f}s  "
-                  f"consumer={r['consumer_time']:.2f}s  "
-                  f"total={r['total_time']:.2f}s  "
-                  f"{tokens} tokens  {tok_s:.1f} tok/s")
-
-    # Per-request response text
-    print(f"\n{'='*60}")
-    print("Response texts")
-    print(f"{'='*60}")
-    for r in sorted(results, key=lambda x: x["request_id"]):
-        print(f"\n--- [req {r['request_id']}] ---")
-        print(r["text"])
-
-    # Aggregate metrics
-    wall_time = max(total_times) if total_times else 0
-    n = len(results)
-    print(f"\n{'='*60}")
-    print(f"  {mode} Summary")
-    print(f"{'='*60}")
-    print(f"Completed: {n} requests")
-    print(f"Total tokens: {total_tokens}")
-    print(f"Wall time: {wall_time:.2f}s")
-    if wall_time > 0:
-        print(f"Throughput: {n / wall_time:.2f} req/s, "
-              f"{total_tokens / wall_time:.1f} tok/s")
-    if not is_baseline:
-        print(f"Avg producer: {np.mean(producer_times):.2f}s")
-        print(f"Avg consumer: {np.mean(consumer_times):.2f}s")
-    print(f"Avg total:    {np.mean(total_times):.2f}s")
-    print(f"P50 total:    {np.percentile(total_times, 50):.2f}s")
-    print(f"P99 total:    {np.percentile(total_times, 99):.2f}s")
-    print(f"{'='*60}")
-
-
-async def main(
-    num_requests: int = 3,
-    num_producers: int = 1,
-    producer_base_port: int = 8000,
-    consumer_port: int = 8001,
-    host: str = "127.0.0.1",
-    max_tokens: int = 200,
-    request_rate: float = 0.0,
-    max_concurrency: int = 0,
-    timeout: float = 6000.0,
-    baseline: bool = False,
-    baseline_port: int = 8000,
+async def _profile_cmd(
+    cmd: str, payload: dict, e_url: str, d_url: str
 ):
-    """Run disaggregated EC benchmark (or baseline comparison).
+    headers = {
+        "Authorization": f"Bearer {os.getenv('OPENAI_API_KEY', '')}"
+    }
 
-    Args:
-        num_requests: Total number of requests to send.
-        num_producers: Number of producer instances (ports base..base+N-1).
-        producer_base_port: First producer's HTTP port.
-        consumer_port: Consumer's HTTP port.
-        host: Server host address.
-        max_tokens: Max tokens per response.
-        request_rate: Requests per second (0 = send all at once).
-        max_concurrency: Max concurrent requests (0 = unlimited).
-        timeout: HTTP request timeout in seconds.
-        baseline: If True, send to a single server (no disaggregation).
-        baseline_port: Server port for baseline mode.
-    """
-    # Load sample images
-    seed = 2442233655
-    # seed = random.randint(0, 2**32 - 1)
-    print(f"Using random seed: {seed}")
-    dataset = load_dataset(
-        "lmms-lab/llava-bench-in-the-wild", split="train"
-    ).shuffle(seed=seed)
-
-    # Encode images to base64
-    requests_data = []
-    for i in range(num_requests):
-        idx = i % len(dataset)
-        buf = BytesIO()
-        dataset[idx]["image"].save(buf, format="PNG")
-        image_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-        body = _make_chat_request(
-            image_b64, dataset[idx]["question"], max_tokens
-        )
-        requests_data.append(body)
-
-    sem = asyncio.Semaphore(
-        max_concurrency if max_concurrency > 0 else num_requests
+    encode_task = _post_if_available(
+        encode_session, f"{e_url}/{cmd}_profile", payload, headers
+    )
+    decode_task = _post_if_available(
+        decode_session, f"{d_url}/{cmd}_profile", payload, headers
     )
 
-    if baseline:
-        server_url = f"http://{host}:{baseline_port}/v1/chat/completions"
-        print("Mode: BASELINE (no disaggregation)")
-        print(f"Config: {num_requests} requests, "
-              f"rate={'unlimited' if request_rate <= 0 else f'{request_rate} req/s'}, "
-              f"max_concurrency={max_concurrency}")
-        print(f"Server: {server_url}\n")
+    encode_res, decode_res = await asyncio.gather(encode_task, decode_task)
 
-        async with httpx.AsyncClient() as client:
-            tasks = []
-            for i, body in enumerate(requests_data):
-                tasks.append(
-                    _rate_limited_worker_baseline(
-                        sem, client, server_url, body, i, timeout
-                    )
-                )
-                if request_rate > 0 and i < len(requests_data) - 1:
-                    await asyncio.sleep(1.0 / request_rate)
+    if encode_res is decode_res is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Profiling endpoints are disabled on all clusters",
+        )
 
-            results = await asyncio.gather(*tasks)
+    return {
+        "encode": encode_res,
+        "decode": decode_res,
+    }
 
-        _print_summary(results, is_baseline=True)
 
-    else:
-        producer_urls = [
-            f"http://{host}:{producer_base_port + i}/v1/chat/completions"
-            for i in range(num_producers)
-        ]
-        consumer_url = f"http://{host}:{consumer_port}/v1/chat/completions"
+@app.post("/start_profile")
+async def start_profile(request: Request):
+    body = await request.json()
+    e_url = random.choice(app.state.e_urls)
+    d_url = random.choice(app.state.d_urls)
+    return await _profile_cmd("start", body, e_url, d_url)
 
-        print(f"Mode: DISAGGREGATED ({num_producers} producers)")
-        print(f"Config: {num_requests} requests, "
-              f"rate={'unlimited' if request_rate <= 0 else f'{request_rate} req/s'}, "
-              f"max_concurrency={max_concurrency}")
-        print(f"Producers: {producer_urls}")
-        print(f"Consumer:  {consumer_url}\n")
 
-        async with httpx.AsyncClient() as client:
-            tasks = []
-            for i, body in enumerate(requests_data):
-                p_url = producer_urls[i % num_producers]
-                tasks.append(
-                    _rate_limited_worker(
-                        sem, client, p_url, consumer_url, body, i, timeout
-                    )
-                )
-                if request_rate > 0 and i < len(requests_data) - 1:
-                    await asyncio.sleep(1.0 / request_rate)
+@app.post("/stop_profile")
+async def stop_profile(request: Request):
+    body = await request.json()
+    e_url = random.choice(app.state.e_urls)
+    d_url = random.choice(app.state.d_urls)
+    return await _profile_cmd("stop", body, e_url, d_url)
 
-            results = await asyncio.gather(*tasks)
 
-        _print_summary(results, is_baseline=False)
-
+###############################################################################
+# CLI
+###############################################################################
 
 if __name__ == "__main__":
-    fire.Fire(main)
+    parser = argparse.ArgumentParser(
+        description="EC Disaggregated Encoder Proxy (E+PD mode)"
+    )
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=1800)
+    parser.add_argument(
+        "--encode-servers-urls",
+        required=True,
+        help='Comma-separated encode (producer) URLs '
+             '("http://127.0.0.1:8000,http://127.0.0.1:8001")',
+    )
+    parser.add_argument(
+        "--decode-servers-urls",
+        required=True,
+        help='Comma-separated decode (consumer) URLs '
+             '("http://127.0.0.1:9000")',
+    )
+
+    args = parser.parse_args()
+    app.state.e_urls = [
+        u.strip() for u in args.encode_servers_urls.split(",") if u.strip()
+    ]
+    app.state.d_urls = [
+        u.strip() for u in args.decode_servers_urls.split(",") if u.strip()
+    ]
+
+    logger.info("EC Proxy listening on %s:%s", args.host, args.port)
+    logger.info("Encode servers (producers): %s", app.state.e_urls)
+    logger.info("Decode servers (consumers): %s", app.state.d_urls)
+
+    uvicorn.run(
+        app,
+        host=args.host,
+        port=args.port,
+        log_level="info",
+        loop="uvloop",
+        access_log=True,
+    )
