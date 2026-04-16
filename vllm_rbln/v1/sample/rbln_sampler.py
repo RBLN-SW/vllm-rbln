@@ -244,6 +244,27 @@ class RBLNSampler(VLLMSampler):
         # If there are any parameters for top-k or top-p,
         # this function works as a greedy sampler.
         sampled, _ = self.topk_topp_sampler(logits, dict(), None, None)
+        
+        if not envs.VLLM_RBLN_USE_VLLM_MODEL:
+            # DEBUG: compare RBLN op vs direct argmax
+            argmax_sampled = logits.argmax(dim=-1).view(-1)
+            if not torch.equal(sampled.view(-1), argmax_sampled):
+                mismatches = (sampled.view(-1) != argmax_sampled).nonzero(as_tuple=True)[0]
+                print("@@@ mismatches: ", mismatches)
+                for idx in mismatches:
+                    i = idx.item()
+                    rbln_tok = sampled.view(-1)[i].item()
+                    argmax_tok = argmax_sampled[i].item()
+                    rbln_logit = logits[i, rbln_tok].item()
+                    argmax_logit = logits[i, argmax_tok].item()
+                    logger.warning(
+                        "GREEDY MISMATCH at batch[%d]: "
+                        "rbln_op=%d (logit=%.8f) vs argmax=%d (logit=%.8f), "
+                        "diff=%.2e",
+                        i, rbln_tok, rbln_logit, argmax_tok, argmax_logit,
+                        argmax_logit - rbln_logit,
+                    )
+
         return sampled
 
     def forward(
