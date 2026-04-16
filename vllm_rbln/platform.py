@@ -68,7 +68,6 @@ class RblnPlatform(Platform):
     simple_compile_backend = "bypass"
     device_control_env_var: str = "RBLN_DEVICES"
     current_stream = _StreamPlaceholder
-    dist_backend: str = "rbln-ccl"
 
     @classmethod
     def import_kernels(cls) -> None:
@@ -168,6 +167,7 @@ class RblnPlatform(Platform):
             # native vLLM model path.
             RblnPlatform.device_name = "rbln"
             RblnPlatform.device_type = "rbln"
+            RblnPlatform.dist_backend = "rbln-ccl"
             vllm_config.device_config.device_type = RblnPlatform.device_type
             vllm_config.device_config.device = torch.device(
                 RblnPlatform.device_type)
@@ -219,6 +219,7 @@ class RblnPlatform(Platform):
                 )
 
                 RblnPlatform.device_type = "rbln"
+                RblnPlatform.dist_backend = "rbln-ccl"
                 vllm_config.device_config.device_type = RblnPlatform.device_type
                 vllm_config.device_config.device = torch.device(
                     RblnPlatform.device_type
