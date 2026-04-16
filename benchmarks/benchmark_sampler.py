@@ -117,7 +117,7 @@ def _create_sampling_metadata_from_config(
     return fake_sampling_metadata
 
 
-def create_logits(batch_size: int, vocab_size: int) -> torch.Tensor:
+def _create_logits(batch_size: int, vocab_size: int) -> torch.Tensor:
     return torch.randn(batch_size, vocab_size, device="cpu")
 
 
@@ -133,7 +133,7 @@ def run_benchmark(
     sampler = torch.compile(sampler, dynamic=False, fullgraph=False)
     sampler_performance_tracker = PerformanceTracker("SAMPLER")
 
-    logits = create_logits(batch_size, vocab_size)
+    logits = _create_logits(batch_size, vocab_size)
 
     # warmup: iterate over all WARM_UP_CONFIGS, matching actual vllm-rbln behavior
     for _ in range(warmup_iters):
