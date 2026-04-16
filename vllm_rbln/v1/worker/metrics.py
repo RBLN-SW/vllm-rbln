@@ -263,6 +263,7 @@ class PerformanceTracker:
         self.padded_decode_metrics.show_stats("PADDED DECODE")
         logger.info("=" * 80)
 
+
 def collect_metrics(
     performance_tracker: PerformanceTracker,
     is_prefill: bool,

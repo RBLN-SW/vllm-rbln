@@ -1,3 +1,17 @@
+# Copyright 2025 Rebellions Inc. All rights reserved.
+
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at:
+
+#     http://www.apache.org/licenses/LICENSE-2.0
+
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import argparse
 import contextlib
 import time
@@ -13,6 +27,7 @@ from vllm_rbln.v1.sample import WARM_UP_CONFIGS, RBLNSampler
 from vllm_rbln.v1.worker.metrics import PerformanceTracker, collect_metrics
 
 MAX_NUM_PROMPT_TOKENS = 64
+
 
 def _create_penalty_tensor(
     batch_size: int, penalty_value: float, device: torch.device
@@ -59,11 +74,15 @@ def _create_sampling_metadata_from_config(
 
     top_p = None
     if config.get("top_p") is not None:
-        top_p = torch.full((batch_size,), config["top_p"], dtype=torch.float32, device=device)
+        top_p = torch.full(
+            (batch_size,), config["top_p"], dtype=torch.float32, device=device
+        )
 
     top_k = None
     if config.get("top_k") is not None:
-        top_k = torch.full((batch_size,), config["top_k"], dtype=torch.int32, device=device)
+        top_k = torch.full(
+            (batch_size,), config["top_k"], dtype=torch.int32, device=device
+        )
 
     no_penalties = config["no_penalties"]
     freq_val = config.get("frequency_penalties", 0.0)
@@ -191,7 +210,8 @@ def main():
         type=str,
         choices=[c["name"] for c in WARM_UP_CONFIGS],
         default="no_penalty_greedy",
-        help=f"Benchmark config name (default: no_penalty_greedy). Choices: {[c['name'] for c in WARM_UP_CONFIGS]}",
+        help=f"Benchmark config name (default: no_penalty_greedy). "
+        f"Choices: {[c['name'] for c in WARM_UP_CONFIGS]}",
     )
 
     args = parser.parse_args()

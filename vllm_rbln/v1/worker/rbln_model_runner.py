@@ -4544,6 +4544,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self.speculative_config is not None and self.speculative_config.use_eagle()
         )
 
+
 def create_lora_mask(
     input_ids: torch.Tensor,
     lora_ids: list[int],
