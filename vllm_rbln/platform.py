@@ -60,13 +60,14 @@ class RblnPlatform(Platform):
     # But we don't support the 'rbln'' device yet.
     # To support this, we must use PyTorch-RBLN
     plugin_name: str = "rbln"
-    device_name: str = "cpu"
-    device_type: str = "cpu"
-    dispatch_key: str = "CPU"
+    device_name: str = "rbln"
+    device_type: str = "rbln"
+    dispatch_key: str = "CPU"  # not used
     ray_device_key: str = "RBLN"
     simple_compile_backend = "bypass"
     device_control_env_var: str = "RBLN_DEVICES"
     current_stream = _StreamPlaceholder
+    dist_backend: str = "rbln-ccl"
 
     @classmethod
     def import_kernels(cls) -> None:
@@ -158,6 +159,14 @@ class RblnPlatform(Platform):
 
         if envs.VLLM_RBLN_USE_VLLM_MODEL:
             cls.validate_and_setup_prerequisite(vllm_config)
+            # Use RBLN device tensors for torch.compile/runtime on the
+            # native vLLM model path.
+            RblnPlatform.device_name = "rbln"
+            RblnPlatform.device_type = "rbln"
+            vllm_config.device_config.device_type = RblnPlatform.device_type
+            vllm_config.device_config.device = torch.device(
+                RblnPlatform.device_type)
+
             if envs.VLLM_RBLN_ENFORCE_MODEL_FP32:
                 logger.info("original model_config.dtype = %s", model_config.dtype)
                 if model_config.dtype == torch.bfloat16:
@@ -178,11 +187,11 @@ class RblnPlatform(Platform):
             else:
                 dtype = model_config.dtype
                 logger.info("original model_config.dtype = %s", dtype)
-                if (
-                    dtype != torch.bfloat16
-                    and dtype != torch.float16
-                    and dtype != torch.float
-                ):
+                # override dtype for rbln compile
+                model_config.dtype = torch.float16
+                logger.info("modified model_config.dtype = %s", model_config.dtype)
+                if dtype != torch.bfloat16 and dtype != torch.float16 \
+                            and dtype != torch.float:
                     logger.warning(
                         "%s not supported on RBLN, only fp32,fp16,bf16 supported", dtype
                     )
