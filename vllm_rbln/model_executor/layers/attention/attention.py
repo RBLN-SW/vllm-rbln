@@ -15,7 +15,7 @@
 import torch
 import vllm.model_executor.layers.attention.attention as vllm_attn
 from vllm.config import VllmConfig, get_current_vllm_config
-from vllm.forward_context import get_forward_context
+from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.model_executor.layers.attention.attention import (
     Attention,
     get_attention_context,
@@ -23,6 +23,7 @@ from vllm.model_executor.layers.attention.attention import (
 from vllm.model_executor.layers.attention.kv_transfer_utils import (
     maybe_transfer_kv_layer,
 )
+from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
@@ -158,3 +159,89 @@ vllm_attn.unified_attention_with_output = maybe_transfer_kv_layer(
 
 Attention.__init__ = _rbln_attention_init
 Attention.get_kv_cache_spec = _rbln_get_kv_cache_spec
+
+# ---------------------------------------------------------------------------
+# MLAAttention overrides for RBLN
+# ---------------------------------------------------------------------------
+_original_mla_attention_init = MLAAttention.__init__
+
+
+def _rbln_mla_attention_init(self, *args, **kwargs) -> None:
+    _original_mla_attention_init(self, *args, **kwargs)
+
+    self.layer_index = extract_layer_index(self.layer_name)
+    vllm_config = get_current_vllm_config()
+    parallel_config = vllm_config.parallel_config
+    model_config = vllm_config.model_config
+    start, _end = model_config.get_layers_start_end_indices(parallel_config)
+    self.layer_index -= start
+
+
+def _rbln_mla_attention_forward(
+    self,
+    q: torch.Tensor,
+    kv_c_normed: torch.Tensor,
+    k_pe: torch.Tensor,
+    output_shape: torch.Size | None = None,
+) -> torch.Tensor:
+    if self.calculate_kv_scales:
+        torch.ops.vllm.maybe_calc_kv_scales(q, kv_c_normed, k_pe, self.layer_name)
+
+    if self.use_direct_call:
+        forward_context: ForwardContext = get_forward_context()
+        attn_metadata = forward_context.attn_metadata
+        if isinstance(attn_metadata, dict):
+            attn_metadata = attn_metadata[self.layer_name]
+        assert attn_metadata.kv_caches is not None
+        assert self.layer_index < len(attn_metadata.kv_caches)
+        self_kv_cache = attn_metadata.kv_caches[self.layer_index]
+
+        if self.attn_backend.accept_output_buffer:
+            output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
+            self.impl.forward(
+                self,
+                q,
+                kv_c_normed,
+                k_pe,
+                self_kv_cache,
+                attn_metadata,
+                output=output,
+            )
+            return output
+        return self.impl.forward(
+            self, q, kv_c_normed, k_pe, self_kv_cache, attn_metadata
+        )
+
+    if self.attn_backend.accept_output_buffer:
+        output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
+        torch.ops.vllm.unified_mla_attention_with_output(
+            q,
+            kv_c_normed,
+            k_pe,
+            output,
+            self.layer_name,
+        )
+        return output
+    return torch.ops.vllm.unified_mla_attention(
+        q,
+        kv_c_normed,
+        k_pe,
+        self.layer_name,
+    )
+
+
+_original_mla_process_weights = MLAAttention.process_weights_after_loading
+
+
+def _rbln_mla_process_weights(self, act_dtype: torch.dtype) -> None:
+    _original_mla_process_weights(self, act_dtype)
+    # RBLN uses 4D weights for batched matmul: [1, N, P, L] / [1, N, L, V]
+    if hasattr(self, "W_UK_T"):
+        self.W_UK_T = self.W_UK_T.unsqueeze(0)
+    if hasattr(self, "W_UV"):
+        self.W_UV = self.W_UV.unsqueeze(0)
+
+
+MLAAttention.__init__ = _rbln_mla_attention_init
+MLAAttention.forward = _rbln_mla_attention_forward
+MLAAttention.process_weights_after_loading = _rbln_mla_process_weights
