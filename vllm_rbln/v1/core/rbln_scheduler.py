@@ -12,13 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import itertools
 import time
 from dataclasses import dataclass, field
 
 from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.utils.hashing import get_hash_fn_by_name
-from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
+from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_utils import init_none_hash
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
@@ -50,30 +51,6 @@ class RBLNSchedulerOutput(SchedulerOutput):
 
 def is_prefill(request: Request) -> bool:
     return request.num_computed_tokens < request.num_tokens - 1
-
-
-def undo_uncomputed_block_caching(
-    request: Request,
-    kv_cache_manager: KVCacheManager,
-    num_computed_tokens: int | None = None,
-) -> None:
-    grouped_blocks = kv_cache_manager.get_blocks(request.request_id).blocks
-    num_computed_blocks = [
-        (num_computed_tokens or request.num_computed_tokens)
-        // group.kv_cache_spec.block_size
-        for group in kv_cache_manager.kv_cache_config.kv_cache_groups
-    ]
-    for blocks, num_full_block in zip(grouped_blocks, num_computed_blocks):
-        for block in blocks[num_full_block:]:
-            # NOTE(RBLN): this function call efficiently resets
-            # the block hash and evicts the corresponding block from the cache.
-            kv_cache_manager.block_pool._maybe_evict_cached_block(block)
-
-        for manager in kv_cache_manager.coordinator.single_type_managers:
-            # NOTE(RBLN): SingleTypeKVCacheManager instances track the number of
-            # cached blocks of running requests in num_cached_block dictionary.
-            if request.request_id in manager.num_cached_block:
-                manager.num_cached_block[request.request_id] = num_full_block
 
 
 class RBLNScheduler(Scheduler):
@@ -264,6 +241,8 @@ class RBLNScheduler(Scheduler):
                         request,
                         num_new_tokens,
                         num_lookahead_tokens=self.num_lookahead_tokens,
+                        # NOTE(RBLN): Cache blocks only after scheduling is finalized.
+                        delay_cache_blocks=True,
                     )
 
                     if new_blocks is not None:
@@ -389,14 +368,6 @@ class RBLNScheduler(Scheduler):
                 if old_n <= spec_decode_cap:
                     continue
                 new_n = spec_decode_cap
-
-                # Extra blocks were allocated for the original token count but
-                # are no longer needed. Invalidate their prefix cache hash so
-                # they are not reused incorrectly; the blocks remain allocated
-                # and will be reused when this request needs them in a future step.
-                undo_uncomputed_block_caching(
-                    req, self.kv_cache_manager, req.num_computed_tokens + new_n
-                )
 
                 token_budget += old_n - new_n
                 num_scheduled_tokens[req_id] = new_n
@@ -643,7 +614,8 @@ class RBLNScheduler(Scheduler):
                     new_computed_blocks=new_computed_blocks,
                     num_lookahead_tokens=effective_lookahead_tokens,
                     num_external_computed_tokens=num_external_computed_tokens,
-                    delay_cache_blocks=load_kv_async,
+                    # NOTE(RBLN): Cache blocks only after scheduling is finalized.
+                    delay_cache_blocks=True,
                     num_encoder_tokens=num_encoder_tokens,
                 )
 
@@ -661,18 +633,6 @@ class RBLNScheduler(Scheduler):
                 if sub_block_match is not None:
                     self.kv_cache_manager.apply_sub_block_match(sub_block_match)
                     sub_block_match = None
-
-                # NOTE(RBLN): By calling allocate_slots with
-                # request.num_tokens - num_computed_tokens instead of num_new_tokens,
-                # we pre-allocate slots for all tokens that this request will prefill.
-                # If allocated slots end up filling a block, the block hash would also
-                # would be written down. However, since this iteration may not actually
-                # compute all tokens, the block may not be fully computed. Therefore,
-                # if the block is not finalized in this iteration, we must clear the
-                # block hash and undo block caching.
-                undo_uncomputed_block_caching(
-                    request, self.kv_cache_manager, num_computed_tokens + num_new_tokens
-                )
 
                 # KVTransfer: the connector uses this info to determine
                 # if a load is needed. Note that
@@ -763,12 +723,7 @@ class RBLNScheduler(Scheduler):
                 # current step. In the next step (or after this request’s prefill
                 # completes if it cannot finish within a single step) this request will
                 # be scheduled together with the other running requests in the decoding
-                # phase. We also clear the block hash written in previous allocate_slots
-                # and undo block caching because this request and its tokens will be
-                # scheduled again, and allocate_slots will be invoked once more and the
-                # logic that writes the block hash will run again. Without clearing it
-                # here, an assertion error would occur because a block hash would
-                # already exist.
+                # phase.
                 for req in scheduled_running_reqs:
                     req_to_new_blocks.pop(req.request_id)
                     num_scheduled_tokens.pop(req.request_id)
@@ -776,7 +731,6 @@ class RBLNScheduler(Scheduler):
                         req.request_id, []
                     )
                     scheduled_encoder_inputs.pop(req.request_id, None)
-                    undo_uncomputed_block_caching(req, self.kv_cache_manager)
 
                 scheduled_running_reqs.clear()
                 token_budget = prefill_token_budget
@@ -806,6 +760,26 @@ class RBLNScheduler(Scheduler):
         assert len(scheduled_new_reqs) + len(scheduled_resumed_reqs) + len(
             scheduled_running_reqs
         ) <= len(self.running)
+
+        # NOTE(RBLN): All allocate_slots calls above used delay_cache_blocks=True
+        # so that scheduling decisions (spec_decode_cap trimming, prefill kicking
+        # out running decodes) can adjust token counts without needing to undo
+        # premature caching. Now that scheduling is finalized, cache blocks and
+        # schedule sub-block indexing for all scheduled requests.
+        for req in itertools.chain(
+            scheduled_running_reqs, scheduled_new_reqs, scheduled_resumed_reqs
+        ):
+            self.kv_cache_manager.cache_blocks(
+                req,
+                # Cap at req.num_tokens to exclude unverified spec decode
+                # draft tokens, matching the upstream allocate_slots behavior.
+                min(
+                    req.num_computed_tokens + num_scheduled_tokens[req.request_id],
+                    req.num_tokens,
+                ),
+            )
+            if isinstance(self.kv_cache_manager, RBLNKVCacheManager):
+                self.kv_cache_manager.schedule_sub_block_indexing(req)
 
         # Get the longest common prefix among all requests in the running queue.
         # This can be potentially used for cascade attention.

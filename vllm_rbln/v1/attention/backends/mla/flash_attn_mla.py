@@ -12,15 +12,18 @@
 from typing import ClassVar
 
 import torch
-from vllm.v1.attention.backend import AttentionType, is_quantized_kv_cache
-from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
 from vllm.config import get_current_vllm_config
 from vllm.config.cache import CacheDType
-from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.layers.attention.mla_attention import (
     MLACommonBackend,
 )
-from vllm.v1.attention.backend import MLAAttentionImpl
+from vllm.model_executor.layers.linear import ColumnParallelLinear
+from vllm.v1.attention.backend import (
+    AttentionType,
+    MLAAttentionImpl,
+    is_quantized_kv_cache,
+)
+from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
 
 import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger

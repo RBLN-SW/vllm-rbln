@@ -20,6 +20,7 @@ from vllm.model_executor.layers.fused_moe import (
     FusedMoEMethodBase,
 )
 from vllm.model_executor.layers.fused_moe import modular_kernel as mk
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.utils import set_weight_attrs
 
@@ -407,7 +408,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # router_logits = router_logits.view(-1, self.num_experts)
         # router_logits = router_logits.view(-1, self.moe.num_experts)
 
-        if layer.activation == "swigluoai":
+        if layer.activation == MoEActivation.SWIGLUOAI:
             expert_map_const = None
             if layer.expert_map is not None:
                 assert getattr(layer, "expert_map_const", None) is not None
@@ -415,11 +416,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     layer.expert_map_const, dtype=torch.int32
                 )
 
-            use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
             tokens_mask = None
+            use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
             if use_moe_tokens_mask:
-                tokens_mask = get_tokens_mask(num_tokens, 0.0, float("-inf"))
-                router_logits = router_logits + tokens_mask
+                tokens_mask = get_tokens_mask(num_tokens)
 
             if layer.use_grouped_topk:
                 n_group = layer.num_expert_group
@@ -447,6 +447,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 expert_map_const,
                 n_group,
                 topk_group,
+                tokens_mask,
             )
         else:
             raise NotImplementedError(layer.activation)

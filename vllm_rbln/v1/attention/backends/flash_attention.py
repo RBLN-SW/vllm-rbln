@@ -37,6 +37,7 @@ if TYPE_CHECKING:
 import vllm_rbln.rbln_envs as envs
 import vllm_rbln.utils as rbln_utils
 from vllm_rbln.logger import init_logger
+from vllm_rbln.v1.attention.kv_cache_bindings import KVCacheViewInfo
 
 logger = init_logger(__name__)
 
@@ -1018,6 +1019,7 @@ class RBLNFlashAttentionMetadata:
     # For RBLN Attention
     attn_masks: torch.Tensor | None = None
     kv_caches: list[torch.Tensor] | None = None
+    kv_cache_view_infos: list[KVCacheViewInfo] | None = None
     # for sliding window attention
     cache_seq_lens: torch.Tensor | None = None
     cache_offsets: torch.Tensor | None = None

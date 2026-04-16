@@ -246,7 +246,8 @@ class Fp8LinearMethod(LinearMethodBase):
                     None,
                     weight_loader,
                 )
-                set_weight_attrs(scale, {"scale_type": "weight_scale"})
+                if not hasattr(scale, "scale_type"):
+                    set_weight_attrs(scale, {"scale_type": "weight_scale"})
                 layer.register_parameter("weight_scale", scale)
             else:
                 assert not self.act_q_static
@@ -258,14 +259,16 @@ class Fp8LinearMethod(LinearMethodBase):
                     self.weight_block_size,
                     weight_loader,
                 )
-                set_weight_attrs(scale, {"scale_type": "weight_scale"})
+                if not hasattr(scale, "scale_type"):
+                    set_weight_attrs(scale, {"scale_type": "weight_scale"})
                 # The weight_scale_inv name is intentional for deepseekv3
                 layer.register_parameter("weight_scale_inv", scale)
 
             # INPUT ACTIVATION SCALE
             if self.act_q_static:
                 scale = create_fp8_input_scale(output_partition_sizes, weight_loader)
-                set_weight_attrs(scale, {"scale_type": "input_scale"})
+                if not hasattr(scale, "scale_type"):
+                    set_weight_attrs(scale, {"scale_type": "input_scale"})
                 layer.register_parameter("input_scale", scale)
             else:
                 layer.register_parameter("input_scale", None)
