@@ -6,8 +6,8 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 #
-# RBLN MLA backend: minimal port of vLLM FlashAttn MLA using torch SDPA and
-# Python cache write. Reuses vLLM MLA common types and metadata builder.
+# RBLN MLA backend: minimal port of vLLM FlashAttn MLA using custom ops for
+# compilation.  Reuses vLLM MLA common types and metadata builder.
 
 from typing import ClassVar
 
@@ -35,24 +35,19 @@ from ..flash_attention import (
 
 logger = init_logger(__name__)
 
-import logging
 
-log = logging.getLogger("torch._dynamo")
+# ---------------------------------------------------------------------------
+# Custom ops (stubs for torch.compile — actual kernel provided by RBLN runtime)
+# ---------------------------------------------------------------------------
 
-
-def _empty_mla_attention_output(
-    q: torch.Tensor, kv_c_normed: torch.Tensor | None
+def _fake_mla_output(
+    q: torch.Tensor, kv_c_normed: torch.Tensor
 ) -> torch.Tensor:
-    if not envs.VLLM_RBLN_COMPILE_MODEL:
-        raise NotImplementedError(
-            "MLA attention is not supported for non-compile model"
-        )
+    """Return shape: [batch, num_heads, seq_len, kv_lora_rank]."""
     b, num_heads, seq_len, _ = q.shape
     kv_lora_rank = kv_c_normed.shape[-1]
-    device = q.device
-    dtype = q.dtype
     return torch.empty(
-        (b, num_heads, seq_len, kv_lora_rank), device=device, dtype=dtype
+        (b, num_heads, seq_len, kv_lora_rank), device=q.device, dtype=q.dtype
     )
 
 
@@ -69,33 +64,12 @@ def paged_flash_causal_mla_naive_prefill_impl(
     block_tables: torch.Tensor,
     scale: torch.Tensor,
 ) -> torch.Tensor:
-    """
-    Expected tensor shapes:
-    - q: [batch, num_heads, num_tokens, _ ]
-    - kv_c_normed: [batch, num_tokens, kv_lora_rank]
-    - k_pe: [batch, num_tokens, qk_rope_head_dim]
-    - kv_cache: [num_blocks, block_size, num_kv_heads(=kv_lora_rank+qk_rope_head_dim)]
-    - seq_idx: [batch, num_partitions]
-    - block_tables: [num_partitions,] for prefill,
-                    [batch, num_partitions] for decode
-    - scale: []
-
-    batch size is assumed to be 1 for prefill.
-    """
-    return _empty_mla_attention_output(q, kv_c_normed)
+    return _fake_mla_output(q, kv_c_normed)
 
 
 @torch.library.register_fake("rbln_custom_ops::paged_flash_causal_mla_naive_prefill")
-def _(
-    q: torch.Tensor,
-    kv_c_normed: torch.Tensor,
-    k_pe: torch.Tensor,
-    kv_cache: torch.Tensor,
-    seq_idx: torch.Tensor,
-    block_tables: torch.Tensor,
-    scale: torch.Tensor,
-) -> torch.Tensor:
-    return _empty_mla_attention_output(q, kv_c_normed)
+def _(q, kv_c_normed, k_pe, kv_cache, seq_idx, block_tables, scale):
+    return _fake_mla_output(q, kv_c_normed)
 
 
 @torch.library.custom_op(
@@ -111,25 +85,21 @@ def paged_flash_causal_mla_naive_decode_impl(
     block_tables: torch.Tensor,
     scale: torch.Tensor,
 ) -> torch.Tensor:
-    return _empty_mla_attention_output(q, kv_c_normed)
+    return _fake_mla_output(q, kv_c_normed)
 
 
 @torch.library.register_fake("rbln_custom_ops::paged_flash_causal_mla_naive_decode")
-def _(
-    q: torch.Tensor,
-    kv_c_normed: torch.Tensor,
-    k_pe: torch.Tensor,
-    kv_cache: torch.Tensor,
-    seq_idx: torch.Tensor,
-    block_tables: torch.Tensor,
-    scale: torch.Tensor,
-) -> torch.Tensor:
-    return _empty_mla_attention_output(q, kv_c_normed)
+def _(q, kv_c_normed, k_pe, kv_cache, seq_idx, block_tables, scale):
+    return _fake_mla_output(q, kv_c_normed)
 
+
+# ---------------------------------------------------------------------------
+# Backend / Impl
+# ---------------------------------------------------------------------------
 
 @register_backend(AttentionBackendEnum.FLASH_ATTN_MLA)
 class RBLNFlashAttnMLABackend(MLACommonBackend):
-    """MLA backend for RBLN: uses torch SDPA and Python cache write."""
+    """MLA backend for RBLN."""
 
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = ["auto"]
@@ -163,7 +133,7 @@ class RBLNFlashAttnMLABackend(MLACommonBackend):
 
 
 class RBLNFlashAttnMLAImpl(MLAAttentionImpl[RBLNFlashAttentionMetadata]):
-    """RBLN MLA impl: Python cache write + torch SDPA for decode (prefill TODO).
+    """RBLN MLA implementation.
 
     Inherits from MLAAttentionImpl directly because MLACommonImpl.__init__
     requires FlashAttention/FlashInfer which are unavailable on RBLN.
@@ -183,7 +153,7 @@ class RBLNFlashAttnMLAImpl(MLAAttentionImpl[RBLNFlashAttentionMetadata]):
         logits_soft_cap: float | None,
         attn_type: str,
         kv_sharing_target_layer_name: str | None,
-        # MLA Specific Arguments
+        # MLA specific
         q_lora_rank: int | None,
         kv_lora_rank: int,
         qk_nope_head_dim: int,
@@ -209,87 +179,68 @@ class RBLNFlashAttnMLAImpl(MLAAttentionImpl[RBLNFlashAttentionMetadata]):
         self.indexer = indexer
         self.q_pad_num_heads = q_pad_num_heads
 
-        unsupported_features = [alibi_slopes, sliding_window, logits_soft_cap]
-        if any(unsupported_features):
+        unsupported = [alibi_slopes, sliding_window, logits_soft_cap]
+        if any(unsupported):
             raise NotImplementedError(
-                "FlashAttnMLAImpl does not support one of the following: "
-                "alibi_slopes, sliding_window, logits_soft_cap"
+                "FlashAttnMLAImpl does not support alibi_slopes, "
+                "sliding_window, or logits_soft_cap"
             )
         if attn_type != AttentionType.DECODER:
             raise NotImplementedError(
-                "Encoder self-attention and "
-                "encoder/decoder cross-attention "
-                "are not implemented for "
-                "FlashAttnMLAImpl"
+                "Only decoder self-attention is implemented for FlashAttnMLAImpl"
             )
-
         if is_quantized_kv_cache(self.kv_cache_dtype):
             raise NotImplementedError(
-                "FlashAttnMLA V1 with FP8 KV cache not yet supported"
+                "FlashAttnMLA with FP8 KV cache not yet supported"
             )
+        if kv_sharing_target_layer_name is not None:
+            raise NotImplementedError("KV sharing is not supported in RBLN.")
 
         vllm_config = get_current_vllm_config()
-        self.enforce_eager = vllm_config.model_config.enforce_eager
         self.device = vllm_config.device_config.device
         self.block_size = vllm_config.cache_config.block_size
         self.max_model_len = vllm_config.model_config.max_model_len
-
-        if kv_sharing_target_layer_name is not None:
-            raise NotImplementedError("KV sharing is not supported in RBLN.")
-        if logits_soft_cap is not None:
-            logger.warning_once(
-                "RBLN Attention Backend does not support logits soft cap. "
-                "Outputs may be slightly off."
-            )
-            logits_soft_cap = None
+        self.attn_type = attn_type
 
         supported_head_sizes = RBLNFlashAttnMLABackend.get_supported_head_sizes()
         if head_size not in supported_head_sizes:
             raise ValueError(
-                f"Head size {head_size} is not supported by PagedAttention. "
-                f"Supported head sizes are: {supported_head_sizes}."
+                f"Head size {head_size} is not supported by MLA backend. "
+                f"Supported: {supported_head_sizes}."
             )
-        self.attn_type = attn_type
 
-        self.sinks = None
         self.sliding_window = sliding_window
         self.is_causal = envs.VLLM_RBLN_FLASH_CAUSAL_ATTN
-        self.is_batch_attention_opt = envs.VLLM_RBLN_BATCH_ATTN_OPT
-        self.is_normal = False
-        self.scale = torch.tensor(scale, device=self.device)
+        self.scale_tensor = torch.tensor(scale, device=self.device)
 
-        if not self.is_batch_attention_opt:
-            raise NotImplementedError(
-                "Batch attention non-optimization is not supported for MLA"
-            )
-
+    # -- stubs required by MLAAttentionImpl interface -----------------------
     def forward_mha(self, q, kv_c_normed, k_pe, kv_c_and_k_pe_cache,
                     attn_metadata, k_scale, output):
-        raise NotImplementedError(
-            "RBLN MLA backend uses forward() directly")
+        raise NotImplementedError("RBLN MLA backend uses forward() directly")
 
     def forward_mqa(self, q, kv_c_and_k_pe_cache, attn_metadata, layer):
-        raise NotImplementedError(
-            "RBLN MLA backend uses forward() directly")
+        raise NotImplementedError("RBLN MLA backend uses forward() directly")
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         pass
 
-    def _v_up_proj(self, x: torch.Tensor, W_UV: torch.Tensor):
+    # -- helpers ------------------------------------------------------------
+    def _v_up_proj(self, x: torch.Tensor, W_UV: torch.Tensor) -> torch.Tensor:
         """V-up projection.
 
         Args:
-            x: torch.size([batch, num_heads, seq_len, kv_lora_rank])
-            W_UV: torch.size([1, num_heads, kv_lora_rank, v_head_dim])
+            x: [batch, num_heads, seq_len, kv_lora_rank]
+            W_UV: [1, num_heads, kv_lora_rank, v_head_dim]
 
         Returns:
-            torch.size([batch, num_tokens, num_heads * v_head_dim]) (contiguous)
+            [batch, seq_len, num_heads * v_head_dim]
         """
         b_size, num_heads, seq_len, _ = x.size()
         x = torch.matmul(x, W_UV)
         x = x.transpose(1, 2).reshape(b_size, seq_len, num_heads * self.v_head_dim)
         return x
 
+    # -- main forward -------------------------------------------------------
     def forward(
         self,
         layer: torch.nn.Module,
@@ -302,86 +253,41 @@ class RBLNFlashAttnMLAImpl(MLAAttentionImpl[RBLNFlashAttentionMetadata]):
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Forward pass with xFormers and PagedAttention.
+        """Forward pass.
 
-        Args:
-            q : torch.size([batch, num_tokens, num_heads, qk_head_dim])
-            kv_c_normed: torch.size([batch, num_tokens, kv_lora_rank])
-            k_pe: torch.size([batch, num_tokens, 1, qk_rope_head_dim])
-            kv_cache: torch.size([num_blocks, block_size, num_kv_heads_dim])
-            attn_metadata: RBLNFlashAttentionMetadata
+        Tensor shapes (RBLN convention — batch dim preserved):
+            q:           [batch, seq_len, num_heads, qk_head_dim]
+            kv_c_normed: [batch, seq_len, kv_lora_rank]
+            k_pe:        [batch, seq_len, qk_rope_head_dim]
+            kv_cache:    [num_blocks, block_size, head_size]
         """
         b_size, q_len, _, _ = q.size()
 
+        # Q → latent space via W_UK_T: project q_nope down to kv_lora_rank
+        # q: [B, S, H, D] → transpose to [B, H, S, D] for matmul
         decode_q_nope, decode_q_pe = q.split(
             [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
         )
+        decode_q_nope = decode_q_nope.transpose(1, 2)  # [B, H, S, nope]
+        decode_ql_nope = torch.matmul(decode_q_nope, layer.W_UK_T)  # [B, H, S, lora_rank]
+        decode_q_pe = decode_q_pe.transpose(1, 2)  # [B, H, S, rope]
+        q = torch.cat([decode_ql_nope, decode_q_pe], dim=-1)  # [B, H, S, lora_rank+rope]
 
-        decode_q_nope = decode_q_nope.transpose(1, 2)
-        decode_ql_nope = torch.matmul(decode_q_nope, layer.W_UK_T)
-        decode_q_pe = decode_q_pe.transpose(1, 2)
-        q = torch.cat([decode_ql_nope, decode_q_pe], dim=-1)
-        k_pe = k_pe.squeeze(2)
-
-        if self.sliding_window is not None:
-            raise NotImplementedError(
-                "Sliding window attention is not supported for MLA"
-            )
-        elif not self.is_causal:
-            raise NotImplementedError("Non-causal attention is not supported for MLA")
+        # Dispatch to custom kernel
+        if attn_metadata.is_prefill:
+            kernel = torch.ops.rbln_custom_ops.paged_flash_causal_mla_naive_prefill
         else:
-            if self.is_normal:
-                raise NotImplementedError("Normal attention is not supported for MLA")
-            else:
-                if envs.VLLM_RBLN_COMPILE_MODEL:
-                    if envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
-                        raise NotImplementedError(
-                            "Triton Custom kernel is not supported for MLA"
-                        )
-                    else:
-                        paged_flash_causal_mla_naive_prefill = (
-                            torch.ops.rbln_custom_ops.paged_flash_causal_mla_naive_prefill
-                        )
-                        paged_flash_causal_mla_naive_decode = (
-                            torch.ops.rbln_custom_ops.paged_flash_causal_mla_naive_decode
-                        )
-                else:
-                    raise NotImplementedError(
-                        "Eager execution is not supported for MLA custom kernel"
-                    )
+            kernel = torch.ops.rbln_custom_ops.paged_flash_causal_mla_naive_decode
 
-                if not attn_metadata.is_prefill:
-                    decode_args = [
-                        q,
-                        kv_c_normed,
-                        k_pe,
-                        kv_cache,
-                        attn_metadata.seq_lens.to(torch.int16),
-                        attn_metadata.block_tables.to(torch.int16),
-                        self.scale,
-                    ]
-                    attn_output = paged_flash_causal_mla_naive_decode(
-                        *decode_args,
-                    )
-                else:
-                    prefill_args = [
-                        q,
-                        kv_c_normed,
-                        k_pe,
-                        kv_cache,
-                        attn_metadata.seq_lens.to(torch.int16),
-                        attn_metadata.block_tables.to(torch.int16),
-                        self.scale,
-                    ]
-                    attn_output = paged_flash_causal_mla_naive_prefill(
-                        *prefill_args,
-                    )
+        attn_output = kernel(
+            q,
+            kv_c_normed,
+            k_pe,
+            kv_cache,
+            attn_metadata.seq_lens.to(torch.int16),
+            attn_metadata.block_tables.to(torch.int16),
+            self.scale_tensor,
+        )
 
-        expected = (b_size, self.num_heads, q_len, self.kv_lora_rank)
-        if attn_output.shape != expected:
-            raise ValueError(
-                f"MLA attention output shape {tuple(attn_output.shape)} != expected "
-                f"{expected}; kernel must return V-space layout for o_proj."
-            )
-
+        # attn_output: [B, H, S, kv_lora_rank] → V-up projection → [B, S, H*v_head_dim]
         return self._v_up_proj(attn_output, layer.W_UV)

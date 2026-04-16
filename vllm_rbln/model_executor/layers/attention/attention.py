@@ -192,9 +192,10 @@ def _rbln_mla_attention_forward(
         attn_metadata = forward_context.attn_metadata
         if isinstance(attn_metadata, dict):
             attn_metadata = attn_metadata[self.layer_name]
-        assert attn_metadata.kv_caches is not None
-        assert self.layer_index < len(attn_metadata.kv_caches)
-        self_kv_cache = attn_metadata.kv_caches[self.layer_index]
+
+        # NOTE(RBLN): Use attn_metadata's KV cache instead of self.kv_cache
+        # so that KV caches appear as explicit model inputs for compilation.
+        self_kv_cache = _resolve_kv_cache(attn_metadata, self.layer_index)
 
         if self.attn_backend.accept_output_buffer:
             output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
