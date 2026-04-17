@@ -174,6 +174,9 @@ class CompressedTensorsW8A16Fp8MoEMethod(upstream.CompressedTensorsMoEMethod):
             layer.w2_weight_scale.data, requires_grad=False
         )
 
+        if getattr(layer, "_expert_map", None) is not None:
+            layer._expert_map_list = layer._expert_map.data.to(dtype=torch.int32).tolist()
+
     @property
     def is_monolithic(self) -> bool:
         return False
@@ -215,8 +218,7 @@ class CompressedTensorsW8A16Fp8MoEMethod(upstream.CompressedTensorsMoEMethod):
 
         expert_map_const = None
         if layer.expert_map is not None:
-            expert_map_list = layer.expert_map.tolist()
-            expert_map_const = torch.tensor(expert_map_list, dtype=torch.int32)
+            expert_map_const = torch.tensor(layer._expert_map_list, dtype=torch.int32)
 
         tokens_mask = None
         if envs.VLLM_RBLN_USE_MOE_TOKENS_MASK:
@@ -294,7 +296,11 @@ def _rbln_ct_fp8_process_weights(self, layer: torch.nn.Module) -> None:
             weight, weight_scale
         )
     else:
-        weight = weight.t()
+        # NOTE(RBLN): Do NOT transpose weight here.
+        # Upstream transposes for Marlin GPU kernels, but RBLN uses
+        # F.linear which expects [out_features, in_features].
+        # Keeping the standard PyTorch layout avoids a redundant double
+        # transpose in the compiled graph.
         if self.strategy == QuantizationStrategy.TENSOR:
             weight_scale = convert_to_channelwise(
                 weight_scale, layer.logical_widths
@@ -305,4 +311,36 @@ def _rbln_ct_fp8_process_weights(self, layer: torch.nn.Module) -> None:
     # Skip prepare_fp8_layer_for_marlin -- Marlin GPU kernels are not used on RBLN
 
 
+def _rbln_ct_fp8_apply_weights(
+    self,
+    layer: torch.nn.Module,
+    x: torch.Tensor,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """RBLN override: BF16 dequant + matmul instead of Marlin GPU kernels."""
+    weight = layer.weight
+    weight_scale = layer.weight_scale
+
+    if self.strategy == QuantizationStrategy.BLOCK:
+        # weight: [N, K], scale: block-wise [N_blocks, K_blocks]
+        block_size = layer.weight_block_size
+        out_features, in_features = weight.shape
+        bs0, bs1 = block_size[0], block_size[1]
+        out_blocks = out_features // bs0
+        in_blocks = in_features // bs1
+
+        w = weight.view(out_blocks, bs0, in_blocks, bs1).to(x.dtype)
+        s = weight_scale.view(out_blocks, in_blocks).to(x.dtype)
+        scaled_weight = (w * s[:, None, :, None]).reshape(out_features, in_features)
+        return torch.nn.functional.linear(x, scaled_weight, bias)
+    else:
+        # weight: [N, K] = [out_features, in_features] (standard PyTorch layout)
+        # scale: per-channel [N, 1] or per-tensor scalar
+        w_bf16 = weight.to(x.dtype)
+        s = weight_scale.to(x.dtype)
+        # [N, K] * [N, 1] broadcasts naturally, no squeeze/unsqueeze needed
+        return torch.nn.functional.linear(x, w_bf16 * s, bias)
+
+
 CompressedTensorsW8A16Fp8.process_weights_after_loading = _rbln_ct_fp8_process_weights
+CompressedTensorsW8A16Fp8.apply_weights = _rbln_ct_fp8_apply_weights
