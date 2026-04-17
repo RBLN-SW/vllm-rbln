@@ -72,6 +72,12 @@ app = FastAPI()
 encode_session: aiohttp.ClientSession | None = None
 decode_session: aiohttp.ClientSession | None = None
 
+# Monotonic counter used to round-robin encoder targets across chat
+# requests. Without this, every request starts its MM-item index at 0
+# and always hits e_urls[0], serialising all encodes on a single
+# producer.
+_encode_rr_counter: int = 0
+
 ###############################################################################
 # Utils
 ###############################################################################
@@ -119,8 +125,13 @@ async def fanout_encoder_primer(
 
     tasks = []
 
-    # Round-robin over encode servers to distribute load
-    url_cycle = (e_urls[i % len(e_urls)] for i in range(len(mm_items)))
+    # Round-robin over encode servers, advancing a *global* counter so
+    # that concurrent chat requests with a single MM item still spread
+    # across producers.
+    global _encode_rr_counter
+    start = _encode_rr_counter
+    _encode_rr_counter = (start + len(mm_items)) % max(len(e_urls), 1)
+    url_cycle = (e_urls[(start + i) % len(e_urls)] for i in range(len(mm_items)))
 
     for idx, (item, target_url) in enumerate(zip(mm_items, url_cycle)):
         child_req_id = f"{req_id}:{idx}:{uuid.uuid4().hex[:6]}"

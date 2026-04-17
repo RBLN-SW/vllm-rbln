@@ -185,30 +185,42 @@ echo "============================================================"
 ###############################################################################
 # 4. Run benchmark
 ###############################################################################
-echo ""
-echo "[4/4] Running benchmark ($NUM_PROMPTS prompts, rate=$REQUEST_RATE)..."
+if [ "${BENCH_SKIP:-0}" != "1" ]; then
+    echo ""
+    echo "[4/4] Running benchmark ($NUM_PROMPTS prompts, rate=$REQUEST_RATE)..."
 
-BENCH_LOG="$LOG_PATH/bench_${START_TIME}.log"
+    BENCH_LOG="$LOG_PATH/bench_${START_TIME}.log"
 
-vllm bench serve \
-    --model "$MODEL" \
-    --backend "$BENCH_BACKEND" \
-    --endpoint /v1/chat/completions \
-    --dataset-name hf \
-    --dataset-path "$BENCH_DATASET" \
-    --seed 0 \
-    --num-prompts "$NUM_PROMPTS" \
-    --request-rate "$REQUEST_RATE" \
-    --port "$PROXY_PORT" \
-    2>&1 | tee "$BENCH_LOG"
+    vllm bench serve \
+        --model "$MODEL" \
+        --backend "$BENCH_BACKEND" \
+        --endpoint /v1/chat/completions \
+        --dataset-name hf \
+        --dataset-path "$BENCH_DATASET" \
+        --seed 0 \
+        --num-prompts "$NUM_PROMPTS" \
+        --request-rate "$REQUEST_RATE" \
+        --port "$PROXY_PORT" \
+        2>&1 | tee "$BENCH_LOG"
 
-echo ""
-echo "============================================================"
-echo "  Benchmark complete."
-echo "  Logs: $LOG_PATH/*_${START_TIME}.log"
-echo "============================================================"
+    echo ""
+    echo "============================================================"
+    echo "  Benchmark complete."
+    echo "  Logs: $LOG_PATH/*_${START_TIME}.log"
+    echo "============================================================"
 
-###############################################################################
-# Cleanup
-###############################################################################
-cleanup
+    ###############################################################################
+    # Cleanup
+    ###############################################################################
+    cleanup
+else
+    echo ""
+    echo "============================================================"
+    echo "  BENCH_SKIP=1 — services running; drive externally."
+    echo "  Proxy:     http://127.0.0.1:$PROXY_PORT"
+    echo "  Logs:      $LOG_PATH/{consumer,producer,proxy}_${START_TIME}.log"
+    echo "  Ctrl+C or \`kill $$\` to stop."
+    echo "============================================================"
+    # Block until signal; trap invokes cleanup().
+    while true; do sleep 3600; done
+fi

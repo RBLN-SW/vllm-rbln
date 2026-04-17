@@ -423,9 +423,26 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         if not scheduler_output.num_scheduled_tokens:
             return EMPTY_MODEL_RUNNER_OUTPUT
 
-        eos = self.model_config.hf_config.eos_token_id
-        if isinstance(eos, list):
-            eos = eos[0]
+        # Multimodal configs (e.g. Qwen3-VL) leave the top-level
+        # hf_config.eos_token_id as None and carry the real value inside
+        # text_config / generation_config. Walk the fallbacks so the
+        # scheduler never sees a None token id.
+        eos = None
+        for cfg in (
+            getattr(self.model_config, "hf_text_config", None),
+            self.model_config.hf_config,
+            getattr(self.model_config, "hf_generation_config", None),
+        ):
+            if cfg is None:
+                continue
+            cand = getattr(cfg, "eos_token_id", None)
+            if isinstance(cand, list):
+                cand = next((x for x in cand if x is not None), None)
+            if cand is not None:
+                eos = cand
+                break
+        if eos is None:
+            eos = 0
 
         req_ids = list(scheduler_output.num_scheduled_tokens.keys())
         return ModelRunnerOutput(
@@ -493,11 +510,30 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                         "second_per_grid_ts"
                     ]
 
-            # Run preprocess_prefill with pre-computed embeddings
+            # Run preprocess_prefill with pre-computed embeddings.
+            # Forward deepstack features when present (Qwen3-VL): the
+            # visual encoder is skipped on the consumer side so deepstack
+            # outputs that normally come out of visual() must be replayed
+            # from the cache.
             input_ids = model_input.input_tokens
             attention_mask = torch.ones_like(input_ids)
+            deepstack_image_embeds = cached.get("deepstack_image_embeds")
+            deepstack_video_embeds = cached.get("deepstack_video_embeds")
+            if deepstack_image_embeds is not None:
+                deepstack_image_embeds = [
+                    t.to(model_dtype) for t in deepstack_image_embeds
+                ]
+            if deepstack_video_embeds is not None:
+                deepstack_video_embeds = [
+                    t.to(model_dtype) for t in deepstack_video_embeds
+                ]
             prefill_params = self.model.preprocess_prefill(
-                input_ids, attention_mask, image_input, video_input
+                input_ids,
+                attention_mask,
+                image_input,
+                video_input,
+                deepstack_image_embeds=deepstack_image_embeds,
+                deepstack_video_embeds=deepstack_video_embeds,
             )
 
             # Extract rope_deltas for bookkeeping (same as forward())

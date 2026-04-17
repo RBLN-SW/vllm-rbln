@@ -73,15 +73,29 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         # sync with optimum encode()
         result = {}
         if image_input is not None and image_input.get("type") == "pixel_values":
-            result["image_embeds"] = self.model.visual(
+            visual_out = self.model.visual(
                 image_input["pixel_values"], grid_thw=image_input["image_grid_thw"]
             )
+            # Qwen3-VL.visual returns (image_embeds, deepstack_features),
+            # Qwen2/2.5-VL.visual returns a single tensor.
+            if isinstance(visual_out, tuple):
+                result["image_embeds"] = visual_out[0]
+                if len(visual_out) > 1:
+                    result["deepstack_image_embeds"] = visual_out[1]
+            else:
+                result["image_embeds"] = visual_out
             result["image_grid_thw"] = image_input["image_grid_thw"]
         if video_input is not None and video_input.get("type") == "pixel_values_videos":
-            result["video_embeds"] = self.model.visual(
+            visual_out = self.model.visual(
                 video_input["pixel_values_videos"],
                 grid_thw=video_input["video_grid_thw"],
             )
+            if isinstance(visual_out, tuple):
+                result["video_embeds"] = visual_out[0]
+                if len(visual_out) > 1:
+                    result["deepstack_video_embeds"] = visual_out[1]
+            else:
+                result["video_embeds"] = visual_out
             result["video_grid_thw"] = video_input["video_grid_thw"]
             second_per_grid_ts = video_input.get("second_per_grid_ts", None)
             if second_per_grid_ts is not None:
@@ -89,7 +103,13 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         return result
 
     def preprocess_prefill(
-        self, input_ids, attention_mask, image_input, video_input
+        self,
+        input_ids,
+        attention_mask,
+        image_input,
+        video_input,
+        deepstack_image_embeds=None,
+        deepstack_video_embeds=None,
     ) -> dict:
         """
         Common preprocessing logic for prefill inputs.
@@ -146,6 +166,15 @@ class RBLNOptimumQwenVLForConditionalGeneration(
 
         # Add model-specific parameters
         self._add_model_specific_args(preprocess_args, video_input)
+
+        # Forward pre-computed deepstack features (Qwen3-VL disaggregated
+        # encoder path): when image/video embeds come from the EC cache,
+        # the visual encoder is skipped and deepstack features must be
+        # supplied explicitly.
+        if deepstack_image_embeds is not None:
+            preprocess_args["deepstack_image_embeds"] = deepstack_image_embeds
+        if deepstack_video_embeds is not None:
+            preprocess_args["deepstack_video_embeds"] = deepstack_video_embeds
 
         # Call the actual preprocessing
         preprocess_outputs = self.model._preprocess_prefill(**preprocess_args)
@@ -440,14 +469,22 @@ class RBLNOptimumQwen3VLForConditionalGeneration(
     """
 
     def _build_prefill_params(self, preprocess_outputs: tuple) -> dict:
-        # deepstack_embeds
-        # [1, 3, num_patches, embedding_dim] -> [3, num_patches, embedding_dim]
+        # deepstack_embeds: [1, L, N, H] -> [L, N, H] when present.
+        # Prefill steps with no image/video tokens (or cached-encoder
+        # requests whose deepstack features weren't available) produce
+        # None here; the runtime wrapper already fills zeros of the
+        # correct per-chunk shape when these slots are None, so forward
+        # None through rather than fabricating a misshaped placeholder.
+        deepstack_raw = preprocess_outputs[4]
+        deepstack_embeds = (
+            None if deepstack_raw is None else deepstack_raw.squeeze(0)
+        )
         return {
             "inputs_embeds": preprocess_outputs[0],
             "position_embed": preprocess_outputs[1],
             "rope_deltas": preprocess_outputs[2],
             "visual_pos_mask": preprocess_outputs[3],
-            "deepstack_embeds": preprocess_outputs[4].squeeze(0),
+            "deepstack_embeds": deepstack_embeds,
         }
 
     def _add_model_specific_args(self, preprocess_args: dict, video_input: Any):
