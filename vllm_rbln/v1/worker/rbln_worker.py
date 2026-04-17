@@ -64,6 +64,7 @@ from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.worker.rbln_model_runner import RBLNModelRunner
 from vllm_rbln.v1.worker.utils import (
     estimate_available_memory,
+    estimate_model_kernel_size,
     get_rbln_planned_affinity_cpu_count,
     set_cpu_affinity,
     set_omp_num_threads,
@@ -280,15 +281,91 @@ class RBLNWorker(WorkerBase):
         #        already applied into model params
         n_model_params = n_model_attentions + n_model_experts
 
-        available_memory_estimate = estimate_available_memory(
+        estimate_kwargs = dict(
             model_config=self.model_config,
             parallel_config=self.parallel_config,
             # quantization : 4 (This is an ad-hoc value. Need to fix it)
             nbits_per_param=nbits_per_param,
-            n_model_params=n_model_params,
             num_runtimes=num_runtimes,
             gpu_memory_utilization=self.cache_config.gpu_memory_utilization,
         )
+
+        speculative_config = getattr(self, "speculative_config", None)
+        drafter = getattr(self.model_runner, "drafter", None)
+        draft_model = getattr(drafter, "model", None)
+        draft_model_config = getattr(speculative_config, "draft_model_config", None)
+        draft_parallel_config = getattr(
+            speculative_config,
+            "draft_parallel_config",
+            None,
+        )
+
+        if draft_model is not None and draft_model_config is not None:
+            if draft_parallel_config is None:
+                draft_parallel_config = self.parallel_config
+
+            model_kernel_size = estimate_model_kernel_size(
+                model_config=self.model_config,
+                parallel_config=self.parallel_config,
+                nbits_per_param=nbits_per_param,
+                n_model_params=n_model_params,
+            )
+
+            draft_params_dict = dict(draft_model.named_parameters())
+            draft_n_model_attentions = 0
+            draft_n_model_experts = 0
+            draft_ratio: float = 1.0
+            if getattr(draft_model_config, "quantization", None) is not None:
+                logger.info(
+                    "model quantization scheme = %s", draft_model_config.quantization
+                )
+                quantization = draft_model_config.quantization
+                assert quantization == "mxfp4" or quantization == "fp8"
+
+                if quantization == "fp8":
+                    draft_nbits_per_param = 8
+                    draft_packed_num_elems = 1
+                elif quantization == "mxfp4":
+                    if "ca" in device_name:
+                        draft_nbits_per_param = 16
+                        draft_ratio = 16 / 17
+                    elif "cr" in device_name:
+                        draft_nbits_per_param = 4
+                    else:
+                        raise ValueError(
+                            "invalid RBLN architecture, \
+                                candidates = [ATOM(ca), REBEL(cr)]"
+                        )
+                    draft_packed_num_elems = 8 // 4
+                else:
+                    raise ValueError(
+                        "invalid quantization scheme, candidates = [fp8, mxfp4]"
+                    )
+            else:
+                draft_nbits_per_param = 16
+                draft_packed_num_elems = 1
+
+            for key, value in draft_params_dict.items():
+                if value.dtype == torch.bfloat16:
+                    draft_n_model_attentions += value.numel()
+                else:
+                    draft_n_model_experts += (
+                        value.numel() * draft_packed_num_elems * draft_ratio
+                    )
+
+            draft_n_model_params = draft_n_model_attentions + draft_n_model_experts
+            draft_kernel_size = estimate_model_kernel_size(
+                model_config=draft_model_config,
+                parallel_config=draft_parallel_config,
+                nbits_per_param=draft_nbits_per_param,
+                n_model_params=draft_n_model_params,
+            )
+            estimate_kwargs["kernel_size"] = model_kernel_size + draft_kernel_size
+            logger.info("draft_model_kernel_size = %.2f GB", draft_kernel_size / 10**9)
+        else:
+            estimate_kwargs["n_model_params"] = n_model_params
+
+        available_memory_estimate = estimate_available_memory(**estimate_kwargs)
 
         logger.info(
             "available_memory_estimate = %.2f GB", available_memory_estimate / 10**9

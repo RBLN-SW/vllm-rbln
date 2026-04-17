@@ -31,6 +31,45 @@ from vllm_rbln.logger import init_logger
 logger = init_logger(__name__)
 
 
+def estimate_model_kernel_size(
+    model_config: ModelConfig,
+    parallel_config: ParallelConfig,
+    *,
+    nbits_per_param: int,
+    n_model_params: int | float,
+    default_bits_per_param: int | None = None,
+) -> int:
+    def align(x: int | float, nbytes: int) -> int:
+        return int(math.ceil(x / nbytes) * nbytes)
+
+    def align_2MB(x: int | float) -> int:
+        return align(x, 2**21)
+
+    num_layers = model_config.get_num_layers(parallel_config)
+    vocab_size = model_config.get_vocab_size()
+    hidden_size = model_config.get_hidden_size()
+    tp_size = parallel_config.tensor_parallel_size
+
+    if default_bits_per_param is None:
+        device_name = current_platform.get_device_name().lower()
+        assert "rbln" in device_name
+        if "ca" in device_name or "cr" in device_name:
+            default_bits_per_param = 16
+        else:
+            raise ValueError(
+                "invalid RBLN architecture, candidates = [ATOM(ca), REBEL(cr)]"
+            )
+
+    lm_heads_params = align(vocab_size, 64) * hidden_size
+    lm_heads_nbytes = (
+        align_2MB(lm_heads_params * default_bits_per_param // 8 / tp_size) * tp_size
+    )
+    word_embedding_params = lm_heads_params
+    params = n_model_params - lm_heads_params - word_embedding_params
+    layer_nbytes = align_2MB(params * nbits_per_param // 8 / num_layers) * num_layers
+    return int(layer_nbytes + lm_heads_nbytes)
+
+
 # NOTE: This function comes from optimum-rbln. Keep in sync.
 def estimate_available_memory(
     model_config: ModelConfig,
@@ -72,17 +111,7 @@ def estimate_available_memory(
     # After that, we can derive the following equation:
     # x = floor(2**21 / b * floor((k - 1) / 2**21))
 
-    def align(x: int, nbytes: int) -> int:
-        return int(math.ceil(x / nbytes) * nbytes)
-
-    def align_2MB(x: int) -> int:
-        return align(x, 2**21)
-
-    num_layers = model_config.get_num_layers(parallel_config)
-    vocab_size = model_config.get_vocab_size()
-    hidden_size = model_config.get_hidden_size()
     num_key_value_heads = model_config.get_num_kv_heads(parallel_config)
-    tp_size = parallel_config.tensor_parallel_size
 
     # TODO(jongho): Update if target npu is REBEL.
 
@@ -127,29 +156,18 @@ def estimate_available_memory(
             )
 
     if kernel_size is None:
-        if n_model_params is None:
+        if n_model_params is None or nbits_per_param is None:
             raise ValueError(
-                "`n_model_params` should be specified \
+                "`n_model_params` and `nbits_per_param` should be specified \
                 to estimate the kernel memory."
             )
-        # Get estimated kernel size (approximated)
-        # kernel_size
-        # - QKV params    - model parallel (tp) sharded
-        # - MLP or expert - model parallel (ep) sharded
-        # - word embedding- non sharded,  not included into device,
-        #                   hidden_size * vocab_size
-        # - lm head       - model parallel (tp) sharded,
-        #                   hidden_size * vocab_size
-        lm_heads_params = align(vocab_size, 64) * hidden_size
-        lm_heads_nbytes = (
-            align_2MB(lm_heads_params * default_bits_per_param // 8 / tp_size) * tp_size
+        kernel_size = estimate_model_kernel_size(
+            model_config=model_config,
+            parallel_config=parallel_config,
+            nbits_per_param=nbits_per_param,
+            n_model_params=n_model_params,
+            default_bits_per_param=default_bits_per_param,
         )
-        word_embedding_params = lm_heads_params
-        params = n_model_params - lm_heads_params - word_embedding_params
-        layer_nbytes = (
-            align_2MB(params * nbits_per_param // 8 / num_layers) * num_layers
-        )
-        kernel_size = layer_nbytes + lm_heads_nbytes
     elif n_model_params is not None:
         raise ValueError("Both `n_model_params` and `kernel_size` cannot be specified.")
 
