@@ -316,6 +316,9 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
             model_start_time = time.perf_counter()
             with capture_ctx as model_reports:
                 # FIXME model_input must be modified to be padded
+                print("@@ model_input.input_tokens", model_input.input_tokens)
+                print("@@ model_input.input_positions", model_input.input_positions)
+                print("@@ model_input.multi_modal_kwargs", model_input.multi_modal_kwargs)
                 hidden_states = self.model(model_input)
             if envs.VLLM_RBLN_METRICS and self.model_performance_tracker is not None:
                 self.collect_metrics(
