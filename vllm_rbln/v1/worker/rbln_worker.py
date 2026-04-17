@@ -65,6 +65,7 @@ from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.worker.rbln_model_runner import RBLNModelRunner
 from vllm_rbln.v1.worker.utils import (
     estimate_available_memory,
+    estimate_model_kernel_size,
     get_rbln_planned_affinity_cpu_count,
     set_cpu_affinity,
     set_omp_num_threads,
@@ -283,7 +284,7 @@ class RBLNWorker(WorkerBase):
             packed_num_elems = 1
 
         n_model_bytes = 0
-        for key, value in params_dict.items():
+        for value in params_dict.values():
             if value.is_floating_point():
                 n_model_bytes += value.numel() * value.element_size()
             else:
@@ -293,13 +294,122 @@ class RBLNWorker(WorkerBase):
 
         logger.info("n_model_bytes = %.2f GB", n_model_bytes / 1024**3)
 
-        available_memory_estimate = estimate_available_memory(
+        estimate_kwargs = dict(
             model_config=self.model_config,
             parallel_config=self.parallel_config,
-            n_model_bytes=n_model_bytes,
             num_runtimes=num_runtimes,
             gpu_memory_utilization=self.cache_config.gpu_memory_utilization,
         )
+
+        speculative_config = getattr(self, "speculative_config", None)
+        drafter = getattr(self.model_runner, "drafter", None)
+        draft_model = getattr(drafter, "model", None)
+        draft_model_config = getattr(speculative_config, "draft_model_config", None)
+        draft_parallel_config = getattr(
+            speculative_config,
+            "draft_parallel_config",
+            None,
+        )
+
+        if draft_model is not None and draft_model_config is not None:
+            if draft_parallel_config is None:
+                draft_parallel_config = self.parallel_config
+
+            model_kernel_size = estimate_model_kernel_size(
+                model_config=self.model_config,
+                parallel_config=self.parallel_config,
+                n_model_bytes=n_model_bytes,
+            )
+
+            num_draft_runtimes = 1 + decode_batch_buckets_count
+            draft_n_model_bytes = 0
+            draft_ratio: float = 1.0
+            if getattr(draft_model_config, "quantization", None) is not None:
+                logger.info(
+                    "draft model quantization scheme = %s",
+                    draft_model_config.quantization,
+                )
+                quantization = draft_model_config.quantization
+                assert quantization in ("mxfp4", "fp8", "compressed-tensors")
+
+                if quantization == "compressed-tensors":
+                    qcfg = (
+                        getattr(
+                            getattr(draft_model_config, "hf_config", None),
+                            "quantization_config",
+                            {},
+                        )
+                        or {}
+                    )
+                    groups = qcfg.get("config_groups", {})
+                    num_bits_set: set[int] = set()
+                    for group_cfg in groups.values():
+                        nb = group_cfg.get("weights", {}).get("num_bits")
+                        if nb is not None:
+                            num_bits_set.add(nb)
+                    if not num_bits_set:
+                        logger.warning(
+                            "compressed-tensors quantization_config has no num_bits; "
+                            "assuming fp8."
+                        )
+                    elif num_bits_set != {8}:
+                        raise ValueError(
+                            f"compressed-tensors config has unsupported bit-widths "
+                            f"{num_bits_set}; only 8-bit (fp8) is supported."
+                        )
+                    quantization = "fp8"
+
+                if quantization == "fp8":
+                    draft_nbits_per_param = 8
+                    draft_packed_num_elems = 1
+                elif quantization == "mxfp4":
+                    if "ca" in device_name:
+                        draft_nbits_per_param = 16
+                        draft_ratio = 16 / 17
+                    elif "cr" in device_name:
+                        draft_nbits_per_param = 4
+                    else:
+                        raise ValueError(
+                            "invalid RBLN architecture, "
+                            "candidates = [ATOM(ca), REBEL(cr)]"
+                        )
+                    draft_packed_num_elems = 8 // 4
+                else:
+                    raise ValueError(
+                        "invalid quantization scheme, candidates = [fp8, mxfp4]"
+                    )
+            else:
+                draft_nbits_per_param = 16
+                draft_packed_num_elems = 1
+
+            for value in draft_model.parameters():
+                if value.is_floating_point():
+                    draft_n_model_bytes += value.numel() * value.element_size()
+                else:
+                    draft_n_model_bytes += int(
+                        value.numel()
+                        * draft_packed_num_elems
+                        * draft_ratio
+                        * draft_nbits_per_param
+                        // 8
+                    )
+
+            draft_kernel_size = estimate_model_kernel_size(
+                model_config=draft_model_config,
+                parallel_config=draft_parallel_config,
+                n_model_bytes=draft_n_model_bytes,
+            )
+            estimate_kwargs["num_runtimes"] = num_runtimes + num_draft_runtimes
+            estimate_kwargs["kernel_size"] = model_kernel_size + draft_kernel_size
+            logger.info("draft_n_model_bytes = %.2f GB", draft_n_model_bytes / 1024**3)
+            logger.info(
+                "draft_model_kernel_size = %.2f GB",
+                draft_kernel_size / 1024**3,
+            )
+        else:
+            estimate_kwargs["n_model_bytes"] = n_model_bytes
+
+        available_memory_estimate = estimate_available_memory(**estimate_kwargs)
 
         logger.info(
             "available_memory_estimate = %.2f GiB", available_memory_estimate / 1024**3
