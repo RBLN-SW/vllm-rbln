@@ -772,6 +772,68 @@ class TestDetermineAvailableMemory:
         # n_model_params = 100 (bf16) + 50*1*1 (uint8 fp8 packed=1)
         assert est.call_args.kwargs["n_model_params"] == 150
 
+    def test_draft_model_kernel_size_is_added(self):
+        worker = self._setup()
+        draft_model = MagicMock()
+        draft_model.named_parameters.return_value = [
+            ("draft.weight", torch.zeros(40, dtype=torch.bfloat16)),
+        ]
+        worker.model_runner.drafter = SimpleNamespace(model=draft_model)
+        worker.speculative_config = SimpleNamespace(
+            draft_model_config=SimpleNamespace(quantization=None),
+            draft_parallel_config=SimpleNamespace(tensor_parallel_size=1),
+        )
+
+        with (
+            patch("vllm_rbln.v1.worker.rbln_worker.current_platform") as plat,
+            patch(
+                "vllm_rbln.v1.worker.rbln_worker.estimate_model_kernel_size",
+                side_effect=[400, 120],
+            ) as kernel_est,
+            patch(
+                "vllm_rbln.v1.worker.rbln_worker.estimate_available_memory",
+                return_value=10**9,
+            ) as est,
+        ):
+            plat.get_device_name.return_value = "RBLN-CA25"
+            worker.determine_available_memory()
+
+        assert kernel_est.call_count == 2
+        assert est.call_args.kwargs["kernel_size"] == 520
+        assert "n_model_params" not in est.call_args.kwargs
+
+    def test_draft_model_fp8_params_are_reflected_in_kernel_estimation(self):
+        worker = self._setup()
+        draft_model = MagicMock()
+        draft_model.named_parameters.return_value = [
+            ("draft.attn.weight", torch.zeros(100, dtype=torch.bfloat16)),
+            ("draft.mlp.weight", torch.zeros(50, dtype=torch.uint8)),
+        ]
+        worker.model_runner.drafter = SimpleNamespace(model=draft_model)
+        worker.speculative_config = SimpleNamespace(
+            draft_model_config=SimpleNamespace(quantization="fp8"),
+            draft_parallel_config=None,
+        )
+
+        with (
+            patch("vllm_rbln.v1.worker.rbln_worker.current_platform") as plat,
+            patch(
+                "vllm_rbln.v1.worker.rbln_worker.estimate_model_kernel_size",
+                side_effect=[400, 120],
+            ) as kernel_est,
+            patch(
+                "vllm_rbln.v1.worker.rbln_worker.estimate_available_memory",
+                return_value=10**9,
+            ),
+        ):
+            plat.get_device_name.return_value = "RBLN-CA25"
+            worker.determine_available_memory()
+
+        draft_call = kernel_est.call_args_list[1].kwargs
+        assert draft_call["parallel_config"] is worker.parallel_config
+        assert draft_call["nbits_per_param"] == 8
+        assert draft_call["n_model_params"] == 150
+
 
 # ===========================================================================
 # Tests: compile_or_warm_up_model
