@@ -275,6 +275,7 @@ class RBLNSampler(VLLMSampler):
         logits = self.apply_logits_processors(
             logits, sampling_metadata, predict_bonus_token
         )
+        print("@@ logits,", logits)
         # Sample the next token.
         sampled, processed_logprobs = self.sample(logits, sampling_metadata)
         # DEBUG: compare RBLN op vs direct argmax
