@@ -20,6 +20,7 @@ from vllm.model_executor.layers.fused_moe import (
     FusedMoEMethodBase,
 )
 from vllm.model_executor.layers.fused_moe import modular_kernel as mk
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.utils import set_weight_attrs
 
@@ -403,7 +404,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # router_logits = router_logits.view(-1, self.num_experts)
         # router_logits = router_logits.view(-1, self.moe.num_experts)
 
-        if layer.activation == "swigluoai":
+        if layer.activation == MoEActivation.SWIGLUOAI:
             expert_map_const = None
             if layer.expert_map is not None:
                 assert getattr(layer, "expert_map_const", None) is not None

@@ -30,6 +30,10 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 import vllm_rbln.rbln_envs as envs
 import vllm_rbln.utils as rbln_utils
 from vllm_rbln.logger import init_logger
+from vllm_rbln.v1.attention.kv_cache_bindings import (
+    attach_kv_cache_bindings,
+    build_kv_cache_forward_context_kwargs,
+)
 from vllm_rbln.v1.spec_decode.utils import (
     eagle_prepare_inputs_padded,
     eagle_prepare_next_token_padded,
@@ -106,7 +110,12 @@ class RBLNEagleProposer(EagleProposer):
                 fast_build=True,
                 **extra_attn_metadata_args,
             )
-            attn_metadata.kv_caches = self.runner.kv_caches
+            attach_kv_cache_bindings(
+                attn_metadata,
+                self.runner.kv_caches,
+                getattr(self.runner, "kv_cache_bases", None),
+                getattr(self.runner, "kv_cache_view_infos", None),
+            )
             for layer_name in attn_group.layer_names:
                 per_layer_attn_metadata[layer_name] = attn_metadata
 
@@ -153,9 +162,9 @@ class RBLNEagleProposer(EagleProposer):
             num_tokens=num_input_tokens,
             num_tokens_across_dp=num_tokens_across_dp,
             num_padded_tokens=num_padded_tokens,
-            # slot_mapping=self._get_slot_mapping(
-            #     num_input_tokens, common_attn_metadata.slot_mapping
-            # ),
+            additional_kwargs=build_kv_cache_forward_context_kwargs(
+                getattr(self.runner, "kv_cache_bases", None)
+            ),
         ):
             hidden_states, logits = self.model_executable(
                 input_ids=input_ids,
@@ -275,7 +284,12 @@ class RBLNEagleProposer(EagleProposer):
                     fast_build=True,
                     **extra_attn_metadata_args,
                 )
-                attn_metadata.kv_caches = self.runner.kv_caches
+                attach_kv_cache_bindings(
+                    attn_metadata,
+                    self.runner.kv_caches,
+                    getattr(self.runner, "kv_cache_bases", None),
+                    getattr(self.runner, "kv_cache_view_infos", None),
+                )
                 for layer_name in attn_group.layer_names:
                     per_layer_attn_metadata[layer_name] = attn_metadata
 
@@ -308,7 +322,9 @@ class RBLNEagleProposer(EagleProposer):
                 num_tokens=batch_size,
                 num_tokens_across_dp=None,
                 num_padded_tokens=None,
-                # slot_mapping=self._get_slot_mapping(batch_size),
+                additional_kwargs=build_kv_cache_forward_context_kwargs(
+                    getattr(self.runner, "kv_cache_bases", None)
+                ),
             ):
                 hidden_states, logits = self.model_executable(
                     input_ids=input_ids,
