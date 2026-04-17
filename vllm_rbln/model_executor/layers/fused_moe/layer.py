@@ -421,24 +421,38 @@ def fused_moe_forward_rbln(
         max_pad = get_forward_context().dp_metadata.max_pads_across_dp.shape[0]
         H_dim = hidden_states.shape[-1]
 
-        # --- Step 1: Local routing on this rank's own tokens ---
-        router_logits = router(hidden_states)
-        router_logits_2d = router_logits.reshape(t, -1)  # [t, E]
-        E = router_logits_2d.shape[-1]
-
-        # Pad to max_pad so all DP ranks have the same tensor size for all_gather
+        # Pad hidden_states to max_pad so all DP ranks have the same tensor size
         hidden_flat = hidden_states.reshape(t, -1)  # [t, H]
         if t < max_pad:
-            router_logits_2d = F.pad(router_logits_2d, (0, 0, 0, max_pad - t), value=0.0)  # [max_pad, E]
             hidden_flat = F.pad(hidden_flat, (0, 0, 0, max_pad - t), value=0.0)  # [max_pad, H]
 
-        # --- Step 2: all_gather router_logits across DP ranks ---
-        # [max_pad, E] → [1, max_pad*E] → all_gather → [R, max_pad*E] → [R*max_pad, E]
-        rl_flat = router_logits_2d.reshape(1, -1)  # [1, max_pad*E]
-        all_rl_flat = get_dp_group().all_gather(rl_flat, dim=0)  # [R, max_pad*E]
-        all_router_logits = all_rl_flat.reshape(R * max_pad, E)  # [R*max_pad, E]
+        if envs.VLLM_RBLN_DISPATCH_ALL2ALL:
+            # --- Router DP path: local routing → all_gather logits → all2all dispatch later ---
+            router_logits = router(hidden_states)
+            router_logits_2d = router_logits.reshape(t, -1)  # [t, E]
+            E = router_logits_2d.shape[-1]
 
-        # --- Step 3: topk + softmax on all gathered tokens ---
+            if t < max_pad:
+                router_logits_2d = F.pad(router_logits_2d, (0, 0, 0, max_pad - t), value=0.0)  # [max_pad, E]
+
+            # all_gather router_logits across DP ranks
+            # [max_pad, E] → [1, max_pad*E] → all_gather → [R, max_pad*E] → [R*max_pad, E]
+            rl_flat = router_logits_2d.reshape(1, -1)  # [1, max_pad*E]
+            all_rl_flat = get_dp_group().all_gather(rl_flat, dim=0)  # [R, max_pad*E]
+            all_router_logits = all_rl_flat.reshape(R * max_pad, E)  # [R*max_pad, E]
+        else:
+            # --- origin/dev path: all-gather hidden first → router on full tokens ---
+            # all-gather hidden_states across DP ranks (also serves as dispatch)
+            hidden_for_gather = hidden_flat.unsqueeze(0)  # [1, max_pad, H]
+            all_hidden = get_dp_group().all_gather(hidden_for_gather, dim=0)  # [R, max_pad, H]
+            gathered_hidden = all_hidden.reshape(R * max_pad, H_dim)
+
+            # Router on all gathered tokens (no Router DP)
+            all_router_logits = router(gathered_hidden)  # [R*max_pad, E]
+            all_router_logits = all_router_logits.reshape(R * max_pad, -1)
+            E = all_router_logits.shape[-1]
+
+        # --- topk + softmax on all gathered tokens ---
         # [E, R*max_pad] for dim=0 topk (select top_k experts per token)
         all_router_logits_t = all_router_logits.transpose(0, 1)  # [E, R*max_pad]
 
@@ -536,13 +550,7 @@ def fused_moe_forward_rbln(
 
             # unpacked: [R, max_pad, H] → flatten to [R*max_pad, H] for MoE
             gathered_hidden = unpacked.reshape(R * max_pad, H_dim)
-        else:
-            # --- all-gather dispatch path ---
-            # Broadcast hidden_states to all DP ranks via all_gather
-            # hidden_flat: [max_pad, H] → [1, max_pad, H] → all_gather → [R, max_pad, H]
-            hidden_for_gather = hidden_flat.unsqueeze(0)  # [1, max_pad, H]
-            all_hidden = get_dp_group().all_gather(hidden_for_gather, dim=0)  # [R, max_pad, H]
-            gathered_hidden = all_hidden.reshape(R * max_pad, H_dim)
+        # else: gathered_hidden was already computed via all-gather before router
 
         # --- Step 5: MoE FFN computation ---
         final_hidden_states = self.quant_method.apply(
