@@ -15,7 +15,7 @@
 """Top-level vLLM ↔ RBLN config synchronisation entry points."""
 
 import os
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -72,6 +72,50 @@ def is_qwen3_pooling(
         model_cls_name in ["RBLNQwen3ForCausalLM"]
         and vllm_config.model_config.runner_type == "pooling"
     )
+
+
+# Keys that affect only runtime loading, not the compiled binary, and
+# therefore must be stripped before hashing so the same compiled artifact
+# is shared between compile-only and inference invocations.
+_RUNTIME_ONLY_KEYS: frozenset[str] = frozenset({"create_runtimes", "devices"})
+
+
+def strip_runtime_only_keys(obj: Any) -> Any:
+    """Recursively drop :data:`_RUNTIME_ONLY_KEYS` from nested dict/list."""
+    if isinstance(obj, dict):
+        return {
+            k: strip_runtime_only_keys(v)
+            for k, v in obj.items()
+            if k not in _RUNTIME_ONLY_KEYS
+        }
+    if isinstance(obj, list):
+        return [strip_runtime_only_keys(item) for item in obj]
+    return obj
+
+
+def keep_only_device_keys(obj: Any) -> Any:
+    """Recursively keep only ``devices`` entries from nested dict/list.
+
+    Submodule configs are preserved as containers so nested ``devices``
+    assignments survive; branches without any ``devices`` are dropped.
+    """
+    if isinstance(obj, dict):
+        result: dict[str, Any] = {}
+        for k, v in obj.items():
+            if k == "devices":
+                result[k] = v
+            elif isinstance(v, (dict, list)):
+                filtered = keep_only_device_keys(v)
+                if filtered:
+                    result[k] = filtered
+        return result
+    if isinstance(obj, list):
+        return [
+            item
+            for item in (keep_only_device_keys(i) for i in obj)
+            if item not in ({}, [])
+        ]
+    return obj
 
 
 def update_max_num_batched_tokens(vllm_config: VllmConfig, max_model_len: int) -> None:
@@ -226,7 +270,6 @@ def sync_with_rbln_config(vllm_config: VllmConfig) -> None:
             kvcache_block_size,
             prefill_chunk_size,
         ) = get_rbln_params(vllm_config, rbln_config)
-        print("@@@ kvcache_block_size from rbln_config", kvcache_block_size)
         sync_vllm_from_rbln_config(
             vllm_config,
             num_blocks,
