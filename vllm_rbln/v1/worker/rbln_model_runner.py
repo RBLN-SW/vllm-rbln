@@ -38,7 +38,7 @@ from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.parallel_state import get_dp_group, get_pp_group, get_tp_group
-from vllm.forward_context import set_forward_context
+from vllm_rbln.forward_context import set_forward_context
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import TensorizerLoader, get_model_loader
@@ -137,6 +137,7 @@ from vllm_rbln.v1.attention.kv_cache_bindings import (
 from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 from vllm_rbln.v1.sample import RBLNSampler
 from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
+from vllm_rbln.v1.worker.utils import compute_slot_mapping_cpu
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
 from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
@@ -1223,8 +1224,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             out=self.input_ids.cpu[:total_num_scheduled_tokens],
         )
 
-        self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
-        self.input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
+        compute_slot_mapping_cpu(
+            self.input_batch.block_table,
+            req_indices,
+            positions_np,
+            total_num_scheduled_tokens,
+        )
 
         # Prepare the attention metadata.
         self.query_start_loc.np[0] = 0
@@ -2182,8 +2187,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             out=input_ids[:total_num_scheduled_tokens],
         )
 
-        input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
-        input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
+        compute_slot_mapping_cpu(
+            input_batch.block_table,
+            req_indices,
+            positions_np,
+            total_num_scheduled_tokens,
+        )
 
         query_start_loc_np = self.query_start_loc.np.copy()
         query_start_loc_np[0] = 0
