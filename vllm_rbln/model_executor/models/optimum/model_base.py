@@ -45,6 +45,25 @@ def get_attn_block_size(vllm_config: VllmConfig) -> int:
     return block_size
 
 
+# Keys that affect only runtime loading, not the compiled binary, and
+# therefore must be stripped before hashing so the same compiled artifact
+# is shared between compile-only and inference invocations.
+_RUNTIME_ONLY_KEYS: frozenset[str] = frozenset({"create_runtimes"})
+
+
+def _strip_runtime_only_keys(obj: Any) -> Any:
+    """Recursively drop :data:`_RUNTIME_ONLY_KEYS` from nested dict/list."""
+    if isinstance(obj, dict):
+        return {
+            k: _strip_runtime_only_keys(v)
+            for k, v in obj.items()
+            if k not in _RUNTIME_ONLY_KEYS
+        }
+    if isinstance(obj, list):
+        return [_strip_runtime_only_keys(item) for item in obj]
+    return obj
+
+
 def generate_model_path_name(
     model_name: str,
     batch_size: int,
@@ -63,7 +82,7 @@ def generate_model_path_name(
         "tp_size": tp_size,
     }
     if additional_config:
-        config_dict["rbln_config"] = additional_config
+        config_dict["rbln_config"] = _strip_runtime_only_keys(additional_config)
 
     config_json = json.dumps(config_dict, sort_keys=True, default=str)
     config_hash = hashlib.sha256(config_json.encode()).hexdigest()[:16]
