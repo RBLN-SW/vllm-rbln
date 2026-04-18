@@ -14,6 +14,8 @@
 
 """Top-level vLLM ↔ RBLN config synchronisation entry points."""
 
+import hashlib
+import json
 import os
 from typing import TYPE_CHECKING, Any
 
@@ -41,6 +43,33 @@ from vllm_rbln.utils.optimum.registry import (
 )
 
 logger = init_logger(__name__)
+
+
+def generate_model_path_name(
+    model_name: str,
+    batch_size: int,
+    block_size: int,
+    max_model_len: int,
+    tp_size: int,
+    additional_config: dict[str, Any] | None = None,
+) -> str:
+    # FIXME: To avoid cache collisions, the cache key should also include
+    # the versions of the compiler and optimum-rbln.
+    config_dict = {
+        "model_name": model_name,
+        "batch_size": batch_size,
+        "block_size": block_size,
+        "max_model_len": max_model_len,
+        "tp_size": tp_size,
+    }
+    if additional_config:
+        config_dict["rbln_config"] = strip_runtime_only_keys(additional_config)
+
+    config_json = json.dumps(config_dict, sort_keys=True, default=str)
+    config_hash = hashlib.sha256(config_json.encode()).hexdigest()[:16]
+
+    sanitized_name = model_name.replace("/", "_").replace(":", "_")
+    return f"{sanitized_name}_{config_hash}"
 
 
 def _is_internally_compiled(vllm_config: VllmConfig) -> bool:
@@ -156,13 +185,18 @@ def update_max_num_batched_tokens(vllm_config: VllmConfig, max_model_len: int) -
 
 def sync_vllm_from_rbln_config(
     vllm_config: VllmConfig,
-    num_blocks: int,
-    batch_size: int,
-    max_model_len: int,
-    kvcache_block_size: int,
     prefill_chunk_size: int,
+    tensor_parallel_size: int,
+    num_blocks: int | None = None,
+    batch_size: int | None = None,
+    max_model_len: int | None = None,
+    kvcache_block_size: int | None = None,
 ) -> None:
-    if vllm_config.scheduler_config.max_num_seqs != batch_size:
+    envs.VLLM_RBLN_TP_SIZE = tensor_parallel_size
+    if (
+        batch_size is not None
+        and vllm_config.scheduler_config.max_num_seqs != batch_size
+    ):
         logger.info(
             "Updating scheduler_config.max_num_seqs from %s to %s "
             "based on rbln_config.json",
@@ -171,10 +205,12 @@ def sync_vllm_from_rbln_config(
         )
         vllm_config.scheduler_config.max_num_seqs = batch_size
 
-    # FIXME handle if num_seqs > max_model_len
-    update_max_num_batched_tokens(vllm_config, max_model_len)
-
-    if vllm_config.model_config.max_model_len != max_model_len:
+    if (
+        max_model_len is not None
+        and vllm_config.model_config.max_model_len != max_model_len
+    ):
+        # FIXME handle if num_seqs > max_model_len
+        update_max_num_batched_tokens(vllm_config, max_model_len)
         logger.info(
             "Updating model_config.max_model_len "
             "from %s to %s "
@@ -184,10 +220,15 @@ def sync_vllm_from_rbln_config(
         )
         vllm_config.model_config.max_model_len = max_model_len
 
-    # Set block_size in cache_config based on rbln_config.json
-    sync_cache_block_size(vllm_config, kvcache_block_size, prefill_chunk_size)
-    # Set num_blocks in cache_config based on rbln_config.json
-    sync_num_blocks(vllm_config, num_blocks)
+    if kvcache_block_size is not None:
+        assert prefill_chunk_size is not None, (
+            "prefill_chunk_size must be specified and default to 128."
+        )
+        # Set block_size in cache_config based on rbln_config.json
+        sync_cache_block_size(vllm_config, kvcache_block_size, prefill_chunk_size)
+    if num_blocks is not None:
+        # Set num_blocks in cache_config based on rbln_config.json
+        sync_num_blocks(vllm_config, num_blocks)
 
 
 def prepare_vllm_for_compile(vllm_config: VllmConfig) -> None:
@@ -269,14 +310,35 @@ def sync_with_rbln_config(vllm_config: VllmConfig) -> None:
             max_model_len,
             kvcache_block_size,
             prefill_chunk_size,
+            tensor_parallel_size,
         ) = get_rbln_params(vllm_config, rbln_config)
         sync_vllm_from_rbln_config(
             vllm_config,
+            prefill_chunk_size,
+            tensor_parallel_size,
             num_blocks,
             batch_size,
             max_model_len,
             kvcache_block_size,
-            prefill_chunk_size,
         )
     else:
+        if additional_rbln_config:
+            # extract essential parameters to run vllm
+            (
+                num_blocks,
+                batch_size,
+                max_model_len,
+                kvcache_block_size,
+                prefill_chunk_size,
+                tensor_parallel_size,
+            ) = get_rbln_params(vllm_config, additional_rbln_config, use_assert=False)
+            sync_vllm_from_rbln_config(
+                vllm_config,
+                prefill_chunk_size,
+                tensor_parallel_size,
+                num_blocks,
+                batch_size,
+                max_model_len,
+                kvcache_block_size,
+            )
         prepare_vllm_for_compile(vllm_config)

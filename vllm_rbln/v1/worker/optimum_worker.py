@@ -196,6 +196,9 @@ class RBLNOptimumWorker(WorkerBase):
             num_blocks, _, _, _, _ = get_rbln_params(
                 self.model_runner.vllm_config, self.model_runner.model.rbln_model_config
             )
+            assert num_blocks is not None, (
+                "num_blocks must be specified in rbln_config.json"
+            )
             sync_num_blocks(self.model_runner.vllm_config, num_blocks)
 
         validation_blocks = self.model_runner.vllm_config.cache_config.num_gpu_blocks

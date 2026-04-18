@@ -73,11 +73,14 @@ def get_rbln_config(vllm_config: VllmConfig) -> dict | None:
 def get_rbln_params(
     vllm_config: VllmConfig,
     rbln_config: dict | RBLNModelConfig,
-) -> tuple[int, int, int, int, int]:
+    use_assert: bool = True,
+) -> tuple[int | None, int | None, int | None, int | None, int, int]:
     kvcache_block_size = None
     prefill_chunk_size = 128
     batch_size = None
     max_seq_len = None
+
+    tensor_parallel_size = _cfg_get(rbln_config, "tensor_parallel_size", 1)
 
     if is_enc_dec_arch(vllm_config.model_config.hf_config):
         max_seq_len = _cfg_get(rbln_config, "dec_max_seq_len")
@@ -120,14 +123,28 @@ def get_rbln_params(
         max_seq_len = _cfg_get(rbln_config, "max_seq_len")
         num_blocks = _cfg_get(rbln_config, "kvcache_num_blocks")
 
-    assert num_blocks is not None, "num_blocks must be specified in rbln_config.json"
+    if use_assert:
+        assert num_blocks is not None, (
+            "num_blocks must be specified in rbln_config.json"
+        )
 
-    assert kvcache_block_size is not None, (
-        "kvcache_block_size must be specified in rbln_config.json"
-    )
-    assert batch_size is not None, "batch_size must be specified in rbln_config.json"
-    assert max_seq_len is not None, "max_seq_len must be specified in rbln_config.json"
+        assert kvcache_block_size is not None, (
+            "kvcache_block_size must be specified in rbln_config.json"
+        )
+        assert batch_size is not None, (
+            "batch_size must be specified in rbln_config.json"
+        )
+        assert max_seq_len is not None, (
+            "max_seq_len must be specified in rbln_config.json"
+        )
     # NOTE:
     # prefill_chunk_size is only used for decoder-only models
     # with prefix caching
-    return num_blocks, batch_size, max_seq_len, kvcache_block_size, prefill_chunk_size
+    return (
+        num_blocks,
+        batch_size,
+        max_seq_len,
+        kvcache_block_size,
+        prefill_chunk_size,
+        tensor_parallel_size,
+    )

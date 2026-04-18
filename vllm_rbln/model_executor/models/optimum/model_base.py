@@ -11,8 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import hashlib
-import json
 import math
 import os
 from pathlib import Path
@@ -33,8 +31,8 @@ from optimum.rbln.transformers.models.decoderonly import (
 )
 from vllm_rbln.utils.optimum.common import select_bucket_size
 from vllm_rbln.utils.optimum.configuration import (
+    generate_model_path_name,
     keep_only_device_keys,
-    strip_runtime_only_keys,
 )
 from vllm_rbln.utils.optimum.registry import compile_model, get_rbln_model_info
 
@@ -47,33 +45,6 @@ def get_attn_block_size(vllm_config: VllmConfig) -> int:
     else:
         block_size = vllm_config.cache_config.block_size
     return block_size
-
-
-def generate_model_path_name(
-    model_name: str,
-    batch_size: int,
-    block_size: int,
-    max_model_len: int,
-    tp_size: int,
-    additional_config: dict[str, Any] | None = None,
-) -> str:
-    # FIXME: To avoid cache collisions, the cache key should also include
-    # the versions of the compiler and optimum-rbln.
-    config_dict = {
-        "model_name": model_name,
-        "batch_size": batch_size,
-        "block_size": block_size,
-        "max_model_len": max_model_len,
-        "tp_size": tp_size,
-    }
-    if additional_config:
-        config_dict["rbln_config"] = strip_runtime_only_keys(additional_config)
-
-    config_json = json.dumps(config_dict, sort_keys=True, default=str)
-    config_hash = hashlib.sha256(config_json.encode()).hexdigest()[:16]
-
-    sanitized_name = model_name.replace("/", "_").replace(":", "_")
-    return f"{sanitized_name}_{config_hash}"
 
 
 class KVCacheBlockAdapter:
