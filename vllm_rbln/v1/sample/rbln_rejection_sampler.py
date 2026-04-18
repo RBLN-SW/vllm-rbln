@@ -30,16 +30,61 @@ logger = init_logger(__name__)
 
 PLACEHOLDER_TOKEN_ID = -1
 GREEDY_TEMPERATURE = 0
-# Maximum number of speculative draft tokens allowed per request in a single
-# step. This value is chosen to be large enough to handle typical use cases.
-MAX_SPEC_LEN = 128
+# Maximum number of speculative draft tokens allowed per request in a single                                                                                                                                                                                 
+# step. Bounded to [1, 32] by the rbln::rejection_sample NPU primitive.
+MAX_SPEC_LEN = 32
 
+@torch.library.custom_op("rbln::rejection_sample", mutates_args=())
+def rejection_sample(
+    draft_token_ids: torch.Tensor,
+    target_probs: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    num_requests = draft_token_ids.shape[0]
+    max_spec_len = draft_token_ids.shape[1]
+
+    output_tokens = torch.ones((num_requests, max_spec_len), dtype=torch.int32)
+    acceptance_rate = torch.ones((num_requests, max_spec_len), dtype=torch.float16)
+    return output_tokens, acceptance_rate
+
+@rejection_sample.register_fake
+def rejection_sample_fake(
+    draft_token_ids: torch.Tensor,
+    target_probs: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    num_requests = draft_token_ids.shape[0]
+    max_spec_len = draft_token_ids.shape[1]
+
+    output_tokens = torch.ones((num_requests, max_spec_len), dtype=torch.int32)
+    acceptance_rate = torch.ones((num_requests, max_spec_len), dtype=torch.float16)
+    return output_tokens, acceptance_rate
+
+def rbln_random_sample(
+    draft_token_ids: torch.Tensor,
+    target_probs: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    output_tokens, acceptance_rate = torch.ops.rbln.rejection_sample(
+        draft_token_ids,
+        target_probs,
+    )
+    return output_tokens, acceptance_rate
 
 # TODO(RBLN): Enable RBLNSampler for
 # - apply_bad_words_with_drafts
 # - apply_all_penalties
 # - apply_top_k_top_p
 class RBLNRejectionSampler(RejectionSampler):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        options = {
+            "mode": "strict"
+        }
+        self.compiled_rejection_sample = torch.compile(
+            rbln_random_sample,
+            dynamic=False,
+            fullgraph=True,
+            backend="rbln",
+            options=options,
+        )
     # NOTE(RBLN): This class simply overrides forward by copying the upstream
     # implementation verbatim, so that it uses the functions defined in this
     # file. There are no behavioral changes.
@@ -120,7 +165,7 @@ class RBLNRejectionSampler(RejectionSampler):
         # Compute probability distribution from target logits.
         target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
 
-        output_token_ids = rejection_sample(
+        output_token_ids = self.rejection_sample(
             metadata.draft_token_ids,
             metadata.num_draft_tokens,
             metadata.max_spec_len,
@@ -148,107 +193,80 @@ class RBLNRejectionSampler(RejectionSampler):
         )
 
 
-def rejection_sample(
-    # [num_tokens]
-    draft_token_ids: torch.Tensor,
-    # [batch_size]
-    num_draft_tokens: list[int],
-    max_spec_len: int,
-    # [batch_size]
-    cu_num_draft_tokens: torch.Tensor,
-    # [num_tokens, vocab_size]
-    draft_probs: torch.Tensor | None,
-    # [num_tokens, vocab_size]
-    target_probs: torch.Tensor,
-    # [batch_size, 1]
-    bonus_token_ids: torch.Tensor,
-    sampling_metadata: SamplingMetadata,
-) -> torch.Tensor:
-    assert draft_token_ids.ndim == 1
-    assert draft_probs is None or draft_probs.ndim == 2
-    assert cu_num_draft_tokens.ndim == 1
-    assert target_probs.ndim == 2
+    def rejection_sample(
+        self,
+        # [num_tokens]
+        draft_token_ids: torch.Tensor,
+        # [batch_size]
+        num_draft_tokens: list[int],
+        max_spec_len: int,
+        # [batch_size]
+        cu_num_draft_tokens: torch.Tensor,
+        # [num_tokens, vocab_size]
+        draft_probs: torch.Tensor | None,
+        # [num_tokens, vocab_size]
+        target_probs: torch.Tensor,
+        # [batch_size, 1]
+        bonus_token_ids: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+    ) -> torch.Tensor:
+        # FOR debugging
+        print("draft_token_ids:", draft_token_ids)
+        print("num_draft_tokens:", num_draft_tokens)
+        print("max_spec_len:", max_spec_len)
+        print("cu_num_draft_tokens:", cu_num_draft_tokens)
+        print("draft_probs:", draft_probs)
+        print("target_probs.max:", target_probs.max(dim=-1))
+        print("bonus_token_ids:", bonus_token_ids)
+        print("sampling_metadata:", sampling_metadata)
 
-    batch_size = len(num_draft_tokens)
-    num_tokens = draft_token_ids.shape[0]
-    vocab_size = target_probs.shape[-1]
-    device = target_probs.device
-    assert draft_token_ids.is_contiguous()
-    assert draft_probs is None or draft_probs.is_contiguous()
-    assert target_probs.is_contiguous()
-    assert bonus_token_ids.is_contiguous()
-    assert target_probs.shape == (num_tokens, vocab_size)
+        assert draft_token_ids.ndim == 1
+        assert draft_probs is None or draft_probs.ndim == 2
+        assert cu_num_draft_tokens.ndim == 1
+        assert target_probs.ndim == 2
 
-    # Create output buffer.
-    output_token_ids = torch.full(
-        (batch_size, max_spec_len + 1),
-        PLACEHOLDER_TOKEN_ID,
-        dtype=torch.int32,  # Consistent with SamplerOutput.sampled_token_ids.
-        device=device,
-    )
+        batch_size = len(num_draft_tokens)
+        num_tokens = draft_token_ids.shape[0]
+        vocab_size = target_probs.shape[-1]
+        assert draft_token_ids.is_contiguous()
+        assert draft_probs is None or draft_probs.is_contiguous()
+        assert target_probs.is_contiguous()
+        assert bonus_token_ids.is_contiguous()
+        assert target_probs.shape == (num_tokens, vocab_size)
 
-    if sampling_metadata.all_greedy:
-        is_greedy = None
-    else:
-        is_greedy = sampling_metadata.temperature == GREEDY_TEMPERATURE
-    if not sampling_metadata.all_random:
-        # Rejection sampling for greedy sampling requests.
-        target_argmax = target_probs.argmax(dim=-1)
-
-        # NOTE(RBLN): Call torch_rejection_greedy_sample_kernel instead of
-        # rejection_greedy_sample_kernel
-        torch_rejection_greedy_sample_kernel(
-            output_token_ids,
-            cu_num_draft_tokens,
-            draft_token_ids,
-            target_argmax,
-            bonus_token_ids,
-            is_greedy,
-            batch_size,
-            device,
+        # Create output buffer.
+        output_token_ids = torch.full(
+            (batch_size, max_spec_len + 1),
+            PLACEHOLDER_TOKEN_ID,
+            dtype=torch.int32,  # Consistent with SamplerOutput.sampled_token_ids.
         )
-        if sampling_metadata.all_greedy:
-            return output_token_ids
+        # NOTE(RBLN): rbln::rejection_sample expects
+        #   draft_tokens: [N, K] int32
+        #   target_probs: [N, K, V] fp16 (NPU kernel is half-precision;
+        #                                  acceptance output is fp16)
+        reshaped_draft_token_ids = draft_token_ids.reshape(-1, max_spec_len).to(
+            torch.int32
+        )
+        reshaped_target_probs = target_probs.reshape(-1, max_spec_len, vocab_size).to(
+            torch.float16
+        )
 
-    # Generate uniform probabilities for rejection sampling.
-    # [num_tokens]
-    uniform_probs = generate_uniform_probs(
-        num_tokens,
-        num_draft_tokens,
-        sampling_metadata.generators,
-        device,
-    )
+        selected_token_ids, acceptance_rate = self.compiled_rejection_sample(
+            reshaped_draft_token_ids,
+            reshaped_target_probs,
+        )
 
-    # Sample recovered tokens for each position.
-    # [num_tokens]
-    recovered_token_ids = sample_recovered_tokens(
-        max_spec_len,
-        num_draft_tokens,
-        cu_num_draft_tokens,
-        draft_token_ids,
-        draft_probs,
-        target_probs,
-        sampling_metadata,
-        device,
-    )
+        # num_draft_tokens: list[int], length = batch_size
+        active_mask = torch.tensor(
+            [n > 0 for n in num_draft_tokens],
+            device=output_token_ids.device,
+            dtype=torch.bool,
+        )  # [batch_size]
 
-    # NOTE(RBLN): Call torch_rejection_random_sample_kernel instead of
-    # rejection_random_sample_kernel
-    torch_rejection_random_sample_kernel(
-        output_token_ids,
-        cu_num_draft_tokens,
-        draft_token_ids,
-        draft_probs,
-        target_probs,
-        bonus_token_ids,
-        recovered_token_ids,
-        uniform_probs,
-        is_greedy,
-        batch_size,
-        device,
-    )
+        output_token_ids[active_mask, :max_spec_len] = reshaped_draft_token_ids
+        output_token_ids[~active_mask, 0] = bonus_token_ids.squeeze(-1)[~active_mask].to(torch.int32)
 
-    return output_token_ids
+        return output_token_ids
 
 
 # NOTE(RBLN): This function was copied without modification to replace
