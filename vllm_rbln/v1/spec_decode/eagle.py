@@ -19,7 +19,7 @@ import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.distributed.parallel_state import get_dp_group, get_pp_group, get_tp_group
-from vllm.forward_context import set_forward_context
+from vllm_rbln.forward_context import set_forward_context
 from vllm.v1.attention.backends.tree_attn import TreeAttentionMetadata
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.sample.metadata import SamplingMetadata
