@@ -72,25 +72,24 @@ def generate_model_path_name(
     return f"{sanitized_name}_{config_hash}"
 
 
-def _is_internally_compiled(vllm_config: VllmConfig) -> bool:
-    """Check if the model was internally compiled and cached by vllm-rbln."""
-    model_path = str(vllm_config.model_config.model)
-    cache_root = os.path.join(envs.VLLM_CACHE_ROOT, "compiled_models")
-    return model_path.startswith(cache_root)
+def generate_model_path_name_v2(
+    vllm_config: VllmConfig,
+) -> str:
+    model_name = str(vllm_config.model_config.model)
+    batch_size = vllm_config.scheduler_config.max_num_seqs
+    block_size = vllm_config.cache_config.block_size
+    max_model_len = vllm_config.model_config.max_model_len
+    tp_size = envs.VLLM_RBLN_TP_SIZE
+    additional_config = vllm_config.additional_config.get("rbln_config", None)
 
-
-def get_invalid_leaf_keys(dict_rbln_config, prefix=""):
-    """Return a list of leaf keys that are not 'device'."""
-    target_key = "device"
-    invalid_keys = []
-    for key, value in dict_rbln_config.items():
-        full_key = f"{prefix}.{key}" if prefix else key
-        if isinstance(value, dict):
-            invalid_keys.extend(get_invalid_leaf_keys(value, prefix=full_key))
-        else:
-            if key != target_key:
-                invalid_keys.append(full_key)
-    return invalid_keys
+    return generate_model_path_name(
+        model_name=model_name,
+        batch_size=batch_size,
+        block_size=block_size,
+        max_model_len=max_model_len,
+        tp_size=tp_size,
+        additional_config=additional_config,
+    )
 
 
 def is_qwen3_pooling(
@@ -185,18 +184,14 @@ def update_max_num_batched_tokens(vllm_config: VllmConfig, max_model_len: int) -
 
 def sync_vllm_from_rbln_config(
     vllm_config: VllmConfig,
+    num_blocks: int,
+    batch_size: int,
+    max_model_len: int,
+    kvcache_block_size: int,
     prefill_chunk_size: int,
     tensor_parallel_size: int,
-    num_blocks: int | None = None,
-    batch_size: int | None = None,
-    max_model_len: int | None = None,
-    kvcache_block_size: int | None = None,
 ) -> None:
-    envs.VLLM_RBLN_TP_SIZE = tensor_parallel_size
-    if (
-        batch_size is not None
-        and vllm_config.scheduler_config.max_num_seqs != batch_size
-    ):
+    if vllm_config.scheduler_config.max_num_seqs != batch_size:
         logger.info(
             "Updating scheduler_config.max_num_seqs from %s to %s "
             "based on rbln_config.json",
@@ -205,12 +200,36 @@ def sync_vllm_from_rbln_config(
         )
         vllm_config.scheduler_config.max_num_seqs = batch_size
 
-    if (
-        max_model_len is not None
-        and vllm_config.model_config.max_model_len != max_model_len
-    ):
-        # FIXME handle if num_seqs > max_model_len
-        update_max_num_batched_tokens(vllm_config, max_model_len)
+    # For encoder-decoder multimodal models (e.g. Whisper), max_num_batched_tokens
+    # must be at least max_source_positions so that vllm's MultiModalBudget
+    # validation passes (it requires max_tokens_per_mm_item <= max_num_batched_tokens
+    # when chunked MM input is disabled).
+    target_max_num_batched_tokens = max_model_len
+    hf_config = vllm_config.model_config.hf_config
+    if is_enc_dec_arch(hf_config):
+        max_source_positions = getattr(hf_config, "max_source_positions", 0)
+        if max_source_positions > target_max_num_batched_tokens:
+            target_max_num_batched_tokens = max_source_positions
+            logger.info(
+                "Encoder-decoder model detected: setting max_num_batched_tokens "
+                "to %d (max_source_positions) instead of %d (max_model_len)",
+                max_source_positions,
+                max_model_len,
+            )
+
+    cur = vllm_config.scheduler_config.max_num_batched_tokens
+    if cur != target_max_num_batched_tokens:
+        logger.info(
+            "Updating scheduler_config.max_num_batched_tokens "
+            "from %s to %d based on rbln_config.json",
+            cur,
+            target_max_num_batched_tokens,
+        )
+        vllm_config.scheduler_config.max_num_batched_tokens = (
+            target_max_num_batched_tokens
+        )
+
+    if vllm_config.model_config.max_model_len != max_model_len:
         logger.info(
             "Updating model_config.max_model_len "
             "from %s to %s "
@@ -220,15 +239,11 @@ def sync_vllm_from_rbln_config(
         )
         vllm_config.model_config.max_model_len = max_model_len
 
-    if kvcache_block_size is not None:
-        assert prefill_chunk_size is not None, (
-            "prefill_chunk_size must be specified and default to 128."
-        )
-        # Set block_size in cache_config based on rbln_config.json
-        sync_cache_block_size(vllm_config, kvcache_block_size, prefill_chunk_size)
-    if num_blocks is not None:
-        # Set num_blocks in cache_config based on rbln_config.json
-        sync_num_blocks(vllm_config, num_blocks)
+    # Set block_size in cache_config based on rbln_config.json
+    sync_cache_block_size(vllm_config, kvcache_block_size, prefill_chunk_size)
+    # Set num_blocks in cache_config based on rbln_config.json
+    sync_num_blocks(vllm_config, num_blocks)
+    envs.VLLM_RBLN_TP_SIZE = tensor_parallel_size
 
 
 def prepare_vllm_for_compile(vllm_config: VllmConfig) -> None:
@@ -290,20 +305,27 @@ def sync_with_rbln_config(vllm_config: VllmConfig) -> None:
         raise RuntimeError("Failed to get RBLN config: %s", e) from e
 
     additional_rbln_config = vllm_config.additional_config.get("rbln_config", {})
+
+    if rbln_config is None:
+        cached_model_path = os.path.join(
+            envs.VLLM_CACHE_ROOT,
+            "compiled_models",
+            generate_model_path_name_v2(vllm_config=vllm_config),
+        )
+        if os.path.exists(os.path.join(cached_model_path, "rbln_config.json")):
+            logger.info("Found cached compiled model at %s", cached_model_path)
+            vllm_config.model_config.model = cached_model_path
+            rbln_config = get_rbln_config(vllm_config)
+        else:
+            vllm_config.additional_config["cached_model_path"] = cached_model_path
+
     # If the pre-compiled model exists, rbln_config is not None
     if rbln_config is not None:
-        # Only validate additional_config keys for user-provided pre-compiled models,
-        # not for internally compiled and cached models.
-        if not _is_internally_compiled(vllm_config):
-            invalid_keys = get_invalid_leaf_keys(additional_rbln_config)
-            if invalid_keys:
-                raise RuntimeError(
-                    "For now, we only support 'device' as a configurable key "
-                    "in rbln_config passed through additional_config "
-                    "for pre-compiled optimum models. "
-                    f"Got unsupported keys: {invalid_keys}"
-                )
-
+        # NOTE: We can set the device to run submodules
+        # Set only device setting using rbln_config
+        vllm_config.additional_config["rbln_config"] = keep_only_device_keys(
+            additional_rbln_config
+        )
         (
             num_blocks,
             batch_size,
@@ -314,31 +336,12 @@ def sync_with_rbln_config(vllm_config: VllmConfig) -> None:
         ) = get_rbln_params(vllm_config, rbln_config)
         sync_vllm_from_rbln_config(
             vllm_config,
-            prefill_chunk_size,
-            tensor_parallel_size,
             num_blocks,
             batch_size,
             max_model_len,
             kvcache_block_size,
+            prefill_chunk_size,
+            tensor_parallel_size,
         )
     else:
-        if additional_rbln_config:
-            # extract essential parameters to run vllm
-            (
-                num_blocks,
-                batch_size,
-                max_model_len,
-                kvcache_block_size,
-                prefill_chunk_size,
-                tensor_parallel_size,
-            ) = get_rbln_params(vllm_config, additional_rbln_config, use_assert=False)
-            sync_vllm_from_rbln_config(
-                vllm_config,
-                prefill_chunk_size,
-                tensor_parallel_size,
-                num_blocks,
-                batch_size,
-                max_model_len,
-                kvcache_block_size,
-            )
         prepare_vllm_for_compile(vllm_config)

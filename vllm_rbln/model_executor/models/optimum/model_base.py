@@ -30,10 +30,6 @@ from optimum.rbln.transformers.models.decoderonly import (
     decoderonly_runtime_utils as runtime_utils,
 )
 from vllm_rbln.utils.optimum.common import select_bucket_size
-from vllm_rbln.utils.optimum.configuration import (
-    generate_model_path_name,
-    keep_only_device_keys,
-)
 from vllm_rbln.utils.optimum.registry import compile_model, get_rbln_model_info
 
 logger = init_logger(__name__)
@@ -197,44 +193,32 @@ class RBLNOptimumModelBase(nn.Module):
 
         model_name, model_cls_name = get_rbln_model_info(config)
         model = None
+        rbln_config = self.vllm_config.additional_config.get("rbln_config", {})
 
         # If a HuggingFace model (not optimum-compiled) is given,
         # look up the cached compiled model.
         # If it does not exist, compile and save it to the cache for future use.
         if not is_compiled_model:
-            rbln_config = self.vllm_config.additional_config.get("rbln_config", {})
-            model_path_name = generate_model_path_name(
+            logger.info(
+                "Compiling the model %s. This may take a while...",
                 self.model_config.model,
+            )
+            cached_model_path = self.vllm_config.additional_config.get(
+                "cached_model_path", None
+            )
+            assert not os.path.exists(cached_model_path), (
+                "Compiled model must be loaded from the cache."
+            )
+            model = compile_model(
+                self.model_config.model,
+                config,
                 batch_size=self.scheduler_config.max_num_seqs,
                 block_size=get_attn_block_size(self.vllm_config),
                 max_model_len=self.model_config.max_model_len,
                 tp_size=envs.VLLM_RBLN_TP_SIZE,
-                additional_config=rbln_config if rbln_config else None,
+                model_path=str(cached_model_path),
+                additional_config=rbln_config,
             )
-            cached_model_path = os.path.join(
-                envs.VLLM_CACHE_ROOT,
-                "compiled_models/" + model_path_name,
-            )
-            if not os.path.exists(cached_model_path):
-                logger.info(
-                    "Compiling the model %s. This may take a while...",
-                    self.model_config.model,
-                )
-                model = compile_model(
-                    self.model_config.model,
-                    config,
-                    batch_size=self.scheduler_config.max_num_seqs,
-                    block_size=get_attn_block_size(self.vllm_config),
-                    max_model_len=self.model_config.max_model_len,
-                    tp_size=envs.VLLM_RBLN_TP_SIZE,
-                    model_path=str(cached_model_path),
-                    additional_config=rbln_config,
-                )
-            else:
-                logger.info(
-                    "Found compiled model at %s. Loading the model from the path.",
-                    cached_model_path,
-                )
             self.vllm_config.model_config.model = cached_model_path
 
         # Load the model directly if it is either an optimum-compiled model

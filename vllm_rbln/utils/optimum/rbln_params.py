@@ -73,8 +73,7 @@ def get_rbln_config(vllm_config: VllmConfig) -> dict | None:
 def get_rbln_params(
     vllm_config: VllmConfig,
     rbln_config: dict | RBLNModelConfig,
-    use_assert: bool = True,
-) -> tuple[int | None, int | None, int | None, int | None, int, int]:
+) -> tuple[int, int, int, int, int, int]:
     kvcache_block_size = None
     prefill_chunk_size = 128
     batch_size = None
@@ -123,20 +122,13 @@ def get_rbln_params(
         max_seq_len = _cfg_get(rbln_config, "max_seq_len")
         num_blocks = _cfg_get(rbln_config, "kvcache_num_blocks")
 
-    if use_assert:
-        assert num_blocks is not None, (
-            "num_blocks must be specified in rbln_config.json"
-        )
+    assert num_blocks is not None, "num_blocks must be specified in rbln_config.json"
 
-        assert kvcache_block_size is not None, (
-            "kvcache_block_size must be specified in rbln_config.json"
-        )
-        assert batch_size is not None, (
-            "batch_size must be specified in rbln_config.json"
-        )
-        assert max_seq_len is not None, (
-            "max_seq_len must be specified in rbln_config.json"
-        )
+    assert kvcache_block_size is not None, (
+        "kvcache_block_size must be specified in rbln_config.json"
+    )
+    assert batch_size is not None, "batch_size must be specified in rbln_config.json"
+    assert max_seq_len is not None, "max_seq_len must be specified in rbln_config.json"
     # NOTE:
     # prefill_chunk_size is only used for decoder-only models
     # with prefix caching
