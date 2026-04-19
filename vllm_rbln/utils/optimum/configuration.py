@@ -17,7 +17,7 @@
 import hashlib
 import json
 import os
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -29,6 +29,10 @@ from vllm_rbln.logger import init_logger
 from vllm_rbln.utils.optimum.cache_blocks import (
     sync_cache_block_size,
     sync_num_blocks,
+)
+from vllm_rbln.utils.optimum.configuration_helper import (
+    keep_only_device_keys,
+    strip_runtime_only_keys,
 )
 from vllm_rbln.utils.optimum.rbln_params import (
     get_rbln_config,
@@ -46,13 +50,15 @@ logger = init_logger(__name__)
 
 
 def generate_model_path_name(
-    model_name: str,
-    batch_size: int,
-    block_size: int,
-    max_model_len: int,
-    tp_size: int,
-    additional_config: dict[str, Any] | None = None,
+    vllm_config: VllmConfig,
 ) -> str:
+    model_name = str(vllm_config.model_config.model)
+    batch_size = vllm_config.scheduler_config.max_num_seqs
+    block_size = vllm_config.cache_config.block_size
+    max_model_len = vllm_config.model_config.max_model_len
+    tp_size = envs.VLLM_RBLN_TP_SIZE
+    additional_config = vllm_config.additional_config.get("rbln_config", None)
+
     # FIXME: To avoid cache collisions, the cache key should also include
     # the versions of the compiler and optimum-rbln.
     config_dict = {
@@ -63,33 +69,13 @@ def generate_model_path_name(
         "tp_size": tp_size,
     }
     if additional_config:
-        config_dict["rbln_config"] = _strip_runtime_only_keys(additional_config)
+        config_dict["rbln_config"] = strip_runtime_only_keys(additional_config)
 
     config_json = json.dumps(config_dict, sort_keys=True, default=str)
     config_hash = hashlib.sha256(config_json.encode()).hexdigest()[:16]
 
     sanitized_name = model_name.replace("/", "_").replace(":", "_")
     return f"{sanitized_name}_{config_hash}"
-
-
-def generate_model_path_name_v2(
-    vllm_config: VllmConfig,
-) -> str:
-    model_name = str(vllm_config.model_config.model)
-    batch_size = vllm_config.scheduler_config.max_num_seqs
-    block_size = vllm_config.cache_config.block_size
-    max_model_len = vllm_config.model_config.max_model_len
-    tp_size = envs.VLLM_RBLN_TP_SIZE
-    additional_config = vllm_config.additional_config.get("rbln_config", None)
-
-    return generate_model_path_name(
-        model_name=model_name,
-        batch_size=batch_size,
-        block_size=block_size,
-        max_model_len=max_model_len,
-        tp_size=tp_size,
-        additional_config=additional_config,
-    )
 
 
 def is_qwen3_pooling(
@@ -100,40 +86,6 @@ def is_qwen3_pooling(
         model_cls_name in ["RBLNQwen3ForCausalLM"]
         and vllm_config.model_config.runner_type == "pooling"
     )
-
-
-# Keys that affect only runtime loading, not the compiled binary, and
-# therefore must be stripped before hashing so the same compiled artifact
-# is shared between compile-only and inference invocations.
-_RUNTIME_ONLY_KEYS: frozenset[str] = frozenset({"create_runtimes", "devices"})
-
-
-def _strip_runtime_only_keys(obj: Any) -> Any:
-    """Recursively drop :data:`_RUNTIME_ONLY_KEYS` from nested dict/list."""
-    if isinstance(obj, dict):
-        return {
-            k: _strip_runtime_only_keys(v)
-            for k, v in obj.items()
-            if k not in _RUNTIME_ONLY_KEYS
-        }
-    if isinstance(obj, list):
-        return [_strip_runtime_only_keys(item) for item in obj]
-    return obj
-
-
-def _keep_only_device_keys(obj: dict) -> Any:
-    """
-    Recursively keep only ``devices`` entries from nested dict/list.
-    """
-    result: dict[str, Any] = {}
-    for k, v in obj.items():
-        if k == "devices":
-            result[k] = v
-        elif isinstance(v, dict):
-            filtered = _keep_only_device_keys(v)
-            if filtered:
-                result[k] = filtered
-    return result
 
 
 def update_max_num_batched_tokens(vllm_config: VllmConfig, max_model_len: int) -> None:
@@ -300,7 +252,7 @@ def sync_with_rbln_config(vllm_config: VllmConfig) -> None:
         cached_model_path = os.path.join(
             envs.VLLM_CACHE_ROOT,
             "compiled_models",
-            generate_model_path_name_v2(vllm_config=vllm_config),
+            generate_model_path_name(vllm_config=vllm_config),
         )
         if os.path.exists(os.path.join(cached_model_path, "rbln_config.json")):
             logger.info("Found cached compiled model at %s", cached_model_path)
@@ -313,7 +265,7 @@ def sync_with_rbln_config(vllm_config: VllmConfig) -> None:
     if rbln_config is not None:
         # NOTE: We can set the device to run submodules
         # Set only device setting using rbln_config
-        vllm_config.additional_config["rbln_config"] = _keep_only_device_keys(
+        vllm_config.additional_config["rbln_config"] = keep_only_device_keys(
             additional_rbln_config
         )
         (
