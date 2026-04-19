@@ -63,7 +63,7 @@ def generate_model_path_name(
         "tp_size": tp_size,
     }
     if additional_config:
-        config_dict["rbln_config"] = strip_runtime_only_keys(additional_config)
+        config_dict["rbln_config"] = _strip_runtime_only_keys(additional_config)
 
     config_json = json.dumps(config_dict, sort_keys=True, default=str)
     config_hash = hashlib.sha256(config_json.encode()).hexdigest()[:16]
@@ -108,42 +108,32 @@ def is_qwen3_pooling(
 _RUNTIME_ONLY_KEYS: frozenset[str] = frozenset({"create_runtimes", "devices"})
 
 
-def strip_runtime_only_keys(obj: Any) -> Any:
+def _strip_runtime_only_keys(obj: Any) -> Any:
     """Recursively drop :data:`_RUNTIME_ONLY_KEYS` from nested dict/list."""
     if isinstance(obj, dict):
         return {
-            k: strip_runtime_only_keys(v)
+            k: _strip_runtime_only_keys(v)
             for k, v in obj.items()
             if k not in _RUNTIME_ONLY_KEYS
         }
     if isinstance(obj, list):
-        return [strip_runtime_only_keys(item) for item in obj]
+        return [_strip_runtime_only_keys(item) for item in obj]
     return obj
 
 
-def keep_only_device_keys(obj: Any) -> Any:
-    """Recursively keep only ``devices`` entries from nested dict/list.
-
-    Submodule configs are preserved as containers so nested ``devices``
-    assignments survive; branches without any ``devices`` are dropped.
+def _keep_only_device_keys(obj: dict) -> Any:
     """
-    if isinstance(obj, dict):
-        result: dict[str, Any] = {}
-        for k, v in obj.items():
-            if k == "devices":
-                result[k] = v
-            elif isinstance(v, (dict, list)):
-                filtered = keep_only_device_keys(v)
-                if filtered:
-                    result[k] = filtered
-        return result
-    if isinstance(obj, list):
-        return [
-            item
-            for item in (keep_only_device_keys(i) for i in obj)
-            if item not in ({}, [])
-        ]
-    return obj
+    Recursively keep only ``devices`` entries from nested dict/list.
+    """
+    result: dict[str, Any] = {}
+    for k, v in obj.items():
+        if k == "devices":
+            result[k] = v
+        elif isinstance(v, dict):
+            filtered = _keep_only_device_keys(v)
+            if filtered:
+                result[k] = filtered
+    return result
 
 
 def update_max_num_batched_tokens(vllm_config: VllmConfig, max_model_len: int) -> None:
@@ -323,7 +313,7 @@ def sync_with_rbln_config(vllm_config: VllmConfig) -> None:
     if rbln_config is not None:
         # NOTE: We can set the device to run submodules
         # Set only device setting using rbln_config
-        vllm_config.additional_config["rbln_config"] = keep_only_device_keys(
+        vllm_config.additional_config["rbln_config"] = _keep_only_device_keys(
             additional_rbln_config
         )
         (
