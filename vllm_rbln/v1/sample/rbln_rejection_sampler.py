@@ -237,92 +237,89 @@ class RBLNRejectionSampler(RejectionSampler):
         assert bonus_token_ids.is_contiguous()
         assert target_probs.shape == (num_tokens, vocab_size)
 
-        # Create output buffer.
+        # Output buffer (batch space). Unwritten slots stay as PLACEHOLDER.
         output_token_ids = torch.full(
             (batch_size, max_spec_len + 1),
             PLACEHOLDER_TOKEN_ID,
             dtype=torch.int32,  # Consistent with SamplerOutput.sampled_token_ids.
         )
-        # NOTE(RBLN): rbln::rejection_sample expects
-        #   draft_tokens: [N, K] int32
-        #   target_probs: [N, K, V] fp16 (NPU kernel is half-precision;
-        #                                  acceptance output is fp16)
+
+        # ------------------------------------------------------------------
+        # 1) Call the NPU primitive.
+        # Expects draft[N, K] int32 and target[N, K, V] fp16, where N is the
+        # active row count (draft rows flattened across requests with
+        # num_draft_tokens > 0) -- NOT batch_size.
+        # ------------------------------------------------------------------
         reshaped_draft_token_ids = draft_token_ids.reshape(-1, max_spec_len).to(
             torch.int32
         )
-        reshaped_target_probs = target_probs.reshape(-1, max_spec_len, vocab_size).to(
-            torch.float16
-        )
-
+        reshaped_target_probs = target_probs.reshape(
+            -1, max_spec_len, vocab_size
+        ).to(torch.float16)
         selected_token_ids, acceptance_rate = self.compiled_rejection_sample(
             reshaped_draft_token_ids,
             reshaped_target_probs,
         )
 
-        print("@@ selected_token_ids:", selected_token_ids)
-        print("@@ acceptance_rate (raw):", acceptance_rate)
+        # ------------------------------------------------------------------
+        # 2) Per-position masks in active-row space [N_active, K].
+        # ------------------------------------------------------------------
+        # Chain-AND: once any position rejects, every later position in the
+        # same row is treated as rejected too.
+        #   e.g. [[1, 1, 0, 1, 1], [1, 1, 1, 0, 1]] 
+        #   -> [[1, 1, 0, 0, 0], [1, 1, 1, 0, 0]]
+        chain_accepted = torch.cumprod(acceptance_rate, dim=-1)    # fp16
+        accepted_bool = chain_accepted == 1.0                      # bool
 
-        # Turn the per-position accept/reject flags into a chain: once any position
-        # rejects, every later position in that row is treated as rejected too.
-        # `torch.cumprod` does exactly this for 0/1 values: leading 1s stay 1, and
-        # from the first 0 onward the running product stays 0.
-        #   e.g. [1, 1, 0, 1, 1] -> [1, 1, 0, 0, 0]
-        accepted_mask = torch.cumprod(acceptance_rate, dim=-1)
-        print("@@ accepted_mask (chain):", accepted_mask)
+        # `first_reject`: the single column where the chain first breaks.
+        # Shift accepted_bool right by one (prepend True). If previous
+        # position was accepted but this one isn't, this is the boundary.
+        prev_accepted = torch.cat(
+            [torch.ones_like(accepted_bool[:, :1]), accepted_bool[:, :-1]],
+            dim=-1,
+        )
+        first_reject = prev_accepted & ~accepted_bool   # <= 1 True per row
 
-        # num_draft_tokens: list[int], length = batch_size
+        # Whole chain accepted (per active row).
+        all_accepted_active = accepted_bool.all(dim=-1)
+
+        # ------------------------------------------------------------------
+        # 3) Compose per-position output for active rows:
+        #      accepted position         -> draft token
+        #      first reject position     -> NPU-recovered token from target
+        #      positions after reject    -> PLACEHOLDER (unused)
+        # ------------------------------------------------------------------
+        draft_i32 = reshaped_draft_token_ids
+        recovered_i32 = selected_token_ids
+        placeholder_i32 = torch.full_like(draft_i32, PLACEHOLDER_TOKEN_ID)
+        active_out = torch.where(
+            first_reject,
+            recovered_i32,
+            torch.where(accepted_bool, draft_i32, placeholder_i32),
+        )
+
+        # ------------------------------------------------------------------
+        # 4) Scatter back into batch-space `output_token_ids`.
+        # ------------------------------------------------------------------
+        # `active_mask` is in batch space: True for rows with any draft.
         active_mask = torch.tensor(
             [n > 0 for n in num_draft_tokens],
             device=output_token_ids.device,
             dtype=torch.bool,
         )  # [batch_size]
+        bonus = bonus_token_ids.squeeze(-1).to(torch.int32)
 
-        print("@@@ active_mask:", active_mask)
+        # 4a) Active rows: composed draft/recovered/placeholder in first K cols.
+        output_token_ids[active_mask, :max_spec_len] = active_out
 
-        accepted_bool = accepted_mask == 1.0  # [N_active, max_spec_len]
-        # prev_accepted[:, i] = accepted_bool[:, i-1]; treat pre-col-0 as True.
-        prev_accepted = torch.cat(
-            [
-                torch.ones_like(accepted_bool[:, :1]),
-                accepted_bool[:, :-1],
-            ],
-            dim=-1,
-        )
-        first_reject = (
-            prev_accepted & ~accepted_bool
-        )  # exactly one True per row, or none
-        print("@@@ accepted_bool:", accepted_bool)
-        print("@@@ first_reject:", first_reject)
-
-        out_slice = torch.full_like(
-            reshaped_draft_token_ids, PLACEHOLDER_TOKEN_ID, dtype=torch.int32
-        )
-        out_slice = torch.where(
-            accepted_bool, reshaped_draft_token_ids.to(torch.int32), out_slice
-        )
-        out_slice = torch.where(
-            first_reject, selected_token_ids.to(torch.int32), out_slice
-        )
-
-        # [N_active] -> [batch_size] by scattering through active_mask.
-        all_accepted_active = (accepted_mask == 1.0).all(dim=-1)
+        # 4b) Fully-accepted active rows: emit the bonus token at the last col.
         all_accepted = torch.zeros_like(active_mask)
         all_accepted[active_mask] = all_accepted_active
+        output_token_ids[all_accepted, -1] = bonus[all_accepted]
 
-        print("@@ all_accepted_active:", all_accepted_active)
-        print("@@ all_accepted:", all_accepted)
-        # All K drafts accepted -> accept bonus token at position K (after the drafts)
-        output_token_ids[all_accepted, -1] = bonus_token_ids.squeeze(-1)[
-            all_accepted
-        ].to(torch.int32)
-        output_token_ids[active_mask, :max_spec_len] = out_slice
+        # 4c) Inactive rows (no drafts): only the bonus token at col 0.
+        output_token_ids[~active_mask, 0] = bonus[~active_mask]
 
-        print("@@@ output_token_ids before bonus:", output_token_ids)
-        # Fill out the request where the draft token ids are not existing
-        output_token_ids[~active_mask, 0] = bonus_token_ids.squeeze(-1)[
-            ~active_mask
-        ].to(torch.int32)
-        print("output_token_ids after bonus:", output_token_ids)
         return output_token_ids
 
 
