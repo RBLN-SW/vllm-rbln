@@ -243,9 +243,9 @@ class RBLNRejectionSampler(RejectionSampler):
         reshaped_draft_token_ids = draft_token_ids.reshape(-1, max_spec_len).to(
             torch.int32
         )
-        reshaped_target_probs = target_probs.reshape(
-            -1, max_spec_len, vocab_size
-        ).to(torch.float16)
+        reshaped_target_probs = target_probs.reshape(-1, max_spec_len, vocab_size).to(
+            torch.float16
+        )
         selected_token_ids, acceptance_rate = self.compiled_rejection_sample(
             reshaped_draft_token_ids,
             reshaped_target_probs,
@@ -256,10 +256,10 @@ class RBLNRejectionSampler(RejectionSampler):
         # ------------------------------------------------------------------
         # Chain-AND: once any position rejects, every later position in the
         # same row is treated as rejected too.
-        #   e.g. [[1, 1, 0, 1, 1], [1, 1, 1, 0, 1]] 
+        #   e.g. [[1, 1, 0, 1, 1], [1, 1, 1, 0, 1]]
         #   -> [[1, 1, 0, 0, 0], [1, 1, 1, 0, 0]]
-        chain_accepted = torch.cumprod(acceptance_rate, dim=-1)    # fp16
-        accepted_bool = chain_accepted == 1.0                      # bool
+        chain_accepted = torch.cumprod(acceptance_rate, dim=-1)  # fp16
+        accepted_bool = chain_accepted == 1.0  # bool
 
         # `first_reject`: the single column where the chain first breaks.
         # Shift accepted_bool right by one (prepend True). If previous
@@ -268,7 +268,7 @@ class RBLNRejectionSampler(RejectionSampler):
             [torch.ones_like(accepted_bool[:, :1]), accepted_bool[:, :-1]],
             dim=-1,
         )
-        first_reject = prev_accepted & ~accepted_bool   # <= 1 True per row
+        first_reject = prev_accepted & ~accepted_bool  # <= 1 True per row
 
         # Whole chain accepted (per active row).
         all_accepted_active = accepted_bool.all(dim=-1)
