@@ -23,7 +23,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.sample.rejection_sampler import RejectionSampler, generate_uniform_probs
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
-
+from vllm.sampling_params import _SAMPLING_EPS
 from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)
@@ -256,6 +256,9 @@ class RBLNRejectionSampler(RejectionSampler):
             reshaped_target_probs,
         )
 
+        print("@@ selected_token_ids:", selected_token_ids)
+        print("@@ acceptance_rate:", acceptance_rate)
+
         # num_draft_tokens: list[int], length = batch_size
         active_mask = torch.tensor(
             [n > 0 for n in num_draft_tokens],
@@ -299,12 +302,17 @@ def apply_sampling_constraints(
         return logits
 
     num_tokens = logits.shape[0]
+    # NOTE(eunji.lee):
+    # Upstream vLLM treats any temperature below _SAMPLING_EPS as greedy, sets it to 0,
+    # and then overrides it to 1 right before the sampling op.
+    # In rbln_rejection_sampler, random sampling is faster than the greedy path, so we
+    # only treat temperature == GREEDY_TEMPERATURE (0) as greedy decoding.
     temperature = expand_batch_to_tokens(
         sampling_metadata.temperature,
         cu_num_draft_tokens,
         num_tokens,
         replace_from=GREEDY_TEMPERATURE,
-        replace_to=1,
+        replace_to=_SAMPLING_EPS,
     )
     # NOTE(woosuk): Update `logits` in place to avoid allocating a new tensor.
     logits.div_(temperature.unsqueeze(-1))
