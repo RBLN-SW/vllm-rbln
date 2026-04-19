@@ -18,21 +18,23 @@
 from dataclasses import replace
 
 import torch
+from vllm.sampling_params import _SAMPLING_EPS
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
-from vllm.v1.sample.rejection_sampler import RejectionSampler, generate_uniform_probs
+from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
-from vllm.sampling_params import _SAMPLING_EPS
+
 from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)
 
 PLACEHOLDER_TOKEN_ID = -1
 GREEDY_TEMPERATURE = 0
-# Maximum number of speculative draft tokens allowed per request in a single                                                                                                                                                                                 
+# Maximum number of speculative draft tokens allowed per request in a single
 # step. Bounded to [1, 32] by the rbln::rejection_sample NPU primitive.
 MAX_SPEC_LEN = 32
+
 
 @torch.library.custom_op("rbln::rejection_sample", mutates_args=())
 def rejection_sample(
@@ -46,6 +48,7 @@ def rejection_sample(
     acceptance_rate = torch.ones((num_requests, max_spec_len), dtype=torch.float16)
     return output_tokens, acceptance_rate
 
+
 @rejection_sample.register_fake
 def rejection_sample_fake(
     draft_token_ids: torch.Tensor,
@@ -58,6 +61,7 @@ def rejection_sample_fake(
     acceptance_rate = torch.ones((num_requests, max_spec_len), dtype=torch.float16)
     return output_tokens, acceptance_rate
 
+
 def rbln_random_sample(
     draft_token_ids: torch.Tensor,
     target_probs: torch.Tensor,
@@ -68,6 +72,7 @@ def rbln_random_sample(
     )
     return output_tokens, acceptance_rate
 
+
 # TODO(RBLN): Enable RBLNSampler for
 # - apply_bad_words_with_drafts
 # - apply_all_penalties
@@ -75,9 +80,7 @@ def rbln_random_sample(
 class RBLNRejectionSampler(RejectionSampler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        options = {
-            "mode": "strict"
-        }
+        options = {"mode": "strict"}
         self.compiled_rejection_sample = torch.compile(
             rbln_random_sample,
             dynamic=False,
@@ -85,6 +88,7 @@ class RBLNRejectionSampler(RejectionSampler):
             backend="rbln",
             options=options,
         )
+
     # NOTE(RBLN): This class simply overrides forward by copying the upstream
     # implementation verbatim, so that it uses the functions defined in this
     # file. There are no behavioral changes.
@@ -192,7 +196,6 @@ class RBLNRejectionSampler(RejectionSampler):
             logprobs_tensors=logprobs_tensors,
         )
 
-
     def rejection_sample(
         self,
         # [num_tokens]
@@ -267,7 +270,9 @@ class RBLNRejectionSampler(RejectionSampler):
         )  # [batch_size]
 
         output_token_ids[active_mask, :max_spec_len] = reshaped_draft_token_ids
-        output_token_ids[~active_mask, 0] = bonus_token_ids.squeeze(-1)[~active_mask].to(torch.int32)
+        output_token_ids[~active_mask, 0] = bonus_token_ids.squeeze(-1)[
+            ~active_mask
+        ].to(torch.int32)
 
         return output_token_ids
 
