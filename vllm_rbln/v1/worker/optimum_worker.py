@@ -193,7 +193,7 @@ class RBLNOptimumWorker(WorkerBase):
         # the number of blocks is not set in the vLLM config yet.
         # Therefore, we need to update it here.
         if not self.model_runner.vllm_config.cache_config.num_gpu_blocks:
-            num_blocks, _, _, _, _ = get_rbln_params(
+            num_blocks, _, _, _, _, _ = get_rbln_params(
                 self.model_runner.vllm_config, self.model_runner.model.rbln_model_config
             )
             assert num_blocks is not None, (
