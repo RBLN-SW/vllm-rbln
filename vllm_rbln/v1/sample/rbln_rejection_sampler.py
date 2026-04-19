@@ -213,16 +213,6 @@ class RBLNRejectionSampler(RejectionSampler):
         bonus_token_ids: torch.Tensor,
         sampling_metadata: SamplingMetadata,
     ) -> torch.Tensor:
-        # FOR debugging
-        print("draft_token_ids:", draft_token_ids)
-        print("num_draft_tokens:", num_draft_tokens)
-        print("max_spec_len:", max_spec_len)
-        print("cu_num_draft_tokens:", cu_num_draft_tokens)
-        print("draft_probs:", draft_probs)
-        print("target_probs.max:", target_probs.max(dim=-1))
-        print("bonus_token_ids:", bonus_token_ids)
-        print("sampling_metadata:", sampling_metadata)
-
         assert draft_token_ids.ndim == 1
         assert draft_probs is None or draft_probs.ndim == 2
         assert cu_num_draft_tokens.ndim == 1
