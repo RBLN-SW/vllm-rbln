@@ -312,6 +312,7 @@ class RBLNWorker(WorkerBase):
             )
 
             draft_params_dict = dict(draft_model.named_parameters())
+            num_draft_runtimes = 1 + decode_batch_buckets_count
             draft_n_model_attentions = 0
             draft_n_model_experts = 0
             draft_ratio: float = 1.0
@@ -360,6 +361,7 @@ class RBLNWorker(WorkerBase):
                 nbits_per_param=draft_nbits_per_param,
                 n_model_params=draft_n_model_params,
             )
+            estimate_kwargs["num_runtimes"] = num_draft_runtimes
             estimate_kwargs["kernel_size"] = model_kernel_size + draft_kernel_size
             logger.info("draft_model_kernel_size = %.2f GB", draft_kernel_size / 10**9)
         else:
