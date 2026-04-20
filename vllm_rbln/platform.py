@@ -191,10 +191,6 @@ class RblnPlatform(Platform):
                     logger.info("RBLN enforce draft_model_config.dtype as torch.float")
             else:
                 dtype = model_config.dtype
-                logger.info("original model_config.dtype = %s", dtype)
-                # override dtype for rbln compile
-                model_config.dtype = torch.float16
-                logger.info("modified model_config.dtype = %s", model_config.dtype)
                 if dtype != torch.bfloat16 and dtype != torch.float16 \
                             and dtype != torch.float:
                     logger.warning(
