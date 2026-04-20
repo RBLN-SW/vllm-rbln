@@ -2,13 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2025 Rebellions Inc. All rights reserved.
 """
-Parse `vllm bench serve --save-result` JSONs from the A/B EC connector runs
-and print a side-by-side comparison.
+Side-by-side parser for `vllm bench serve --save-result` JSONs produced by
+`compare_disagg_vs_nondisagg.sh` (and any other A/B script that drops
+result files named ``<tag>_rate<RATE>.json`` into a single directory).
 
-Filenames produced by `compare_ec_connectors.sh`:
-    <connector>_rate<RATE>.json       e.g. push_rate1.0.json, nixl_rate1.0.json
+Rows are grouped by rate, columns by tag (e.g. `disagg`, `nondisagg`).
+Prints the standard throughput / TTFT / ITL / E2E metrics plus a per-rate
+"wins N metrics" verdict when exactly two tags are present.
 
-The rate is pulled from the filename so we can align rows across connectors.
+Usage:
+    python compare_ec_results.py --result-dir path/to/results
 """
 
 from __future__ import annotations
@@ -32,11 +35,11 @@ METRICS = [
     ("p99_e2el_ms",         "E2E p99",       True),
 ]
 
-FNAME_RE = re.compile(r"^(?P<connector>[^_]+)_rate(?P<rate>[0-9.]+)\.json$")
+FNAME_RE = re.compile(r"^(?P<tag>[^_]+)_rate(?P<rate>[0-9.]+)\.json$")
 
 
 def load_results(result_dir: Path) -> dict[str, dict[str, dict]]:
-    """Return {rate: {connector: result_json}}."""
+    """Return {rate: {tag: result_json}}."""
     out: dict[str, dict[str, dict]] = defaultdict(dict)
     for path in sorted(result_dir.glob("*.json")):
         m = FNAME_RE.match(path.name)
@@ -44,7 +47,7 @@ def load_results(result_dir: Path) -> dict[str, dict[str, dict]]:
             continue
         with path.open() as f:
             data = json.load(f)
-        out[m.group("rate")][m.group("connector")] = data
+        out[m.group("rate")][m.group("tag")] = data
     return out
 
 
@@ -61,64 +64,70 @@ def render_table(results: dict[str, dict[str, dict]]) -> None:
         print("  (no result JSONs found)")
         return
 
-    connectors: list[str] = []
+    # Stable column order: first-seen across rate buckets.
+    tags: list[str] = []
     seen: set[str] = set()
-    for _, by_conn in results.items():
-        for c in by_conn:
-            if c not in seen:
-                connectors.append(c)
-                seen.add(c)
+    for _, by_tag in results.items():
+        for t in by_tag:
+            if t not in seen:
+                tags.append(t)
+                seen.add(t)
 
     for rate in sorted(results.keys(), key=float):
-        by_conn = results[rate]
+        by_tag = results[rate]
         print()
         print(f"── rate = {rate} req/s " + "─" * 50)
         header = f"  {'metric':<14}"
-        for c in connectors:
-            header += f" | {c:>10}"
-        if len(connectors) == 2:
+        for t in tags:
+            header += f" | {t:>10}"
+        if len(tags) == 2:
             header += f" | {'Δ (2-1)':>10} | {'Δ %':>8}"
         print(header)
         print("  " + "-" * (len(header) - 2))
 
-        for key, label, lower_better in METRICS:
+        for key, label, _lower_better in METRICS:
             row = f"  {label:<14}"
             values: list[float | None] = []
-            for c in connectors:
-                v = by_conn.get(c, {}).get(key)
+            for t in tags:
+                v = by_tag.get(t, {}).get(key)
                 values.append(v if isinstance(v, (int, float)) else None)
                 row += f" | {fmt(v, label):>10}"
-            if len(connectors) == 2 and all(v is not None for v in values):
+            if len(tags) == 2 and all(v is not None for v in values):
                 diff = values[1] - values[0]
                 pct = diff / values[0] * 100 if values[0] else float("inf")
-                # Mark winner with * (push is col 1 here by default ordering).
                 row += f" | {diff:>10.2f} | {pct:>7.1f}%"
             print(row)
 
-        # Print a one-line verdict if exactly two connectors.
-        if len(connectors) == 2 and all(c in by_conn for c in connectors):
-            c1, c2 = connectors
-            wins = {c1: 0, c2: 0}
+        if len(tags) == 2 and all(t in by_tag for t in tags):
+            t1, t2 = tags
+            wins = {t1: 0, t2: 0}
             for key, _, lower_better in METRICS:
-                v1 = by_conn[c1].get(key)
-                v2 = by_conn[c2].get(key)
+                v1 = by_tag[t1].get(key)
+                v2 = by_tag[t2].get(key)
                 if not (isinstance(v1, (int, float)) and isinstance(v2, (int, float))):
                     continue
                 if v1 == v2:
                     continue
-                better = v1 if lower_better else -v1
-                other = v2 if lower_better else -v2
-                if better < other:
-                    wins[c1] += 1
+                # Normalise so smaller-is-better regardless of metric polarity.
+                a = v1 if lower_better else -v1
+                b = v2 if lower_better else -v2
+                if a < b:
+                    wins[t1] += 1
                 else:
-                    wins[c2] += 1
+                    wins[t2] += 1
             print()
-            print(f"  → {c1} wins {wins[c1]} metrics, {c2} wins {wins[c2]} metrics")
+            print(f"  → {t1} wins {wins[t1]} metrics, {t2} wins {wins[t2]} metrics")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--result-dir", required=True, type=Path)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--result-dir",
+        required=True,
+        type=Path,
+        help="Directory of <tag>_rate<RATE>.json files "
+             "(produced by vllm bench serve --save-result).",
+    )
     args = parser.parse_args()
 
     results = load_results(args.result_dir)

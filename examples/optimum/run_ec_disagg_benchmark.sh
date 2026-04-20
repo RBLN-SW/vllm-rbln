@@ -44,7 +44,7 @@ ENCODER_BASE_DEVICE="${ENCODER_BASE_DEVICE:-20}"
 LLM_DEVICES="${LLM_DEVICES:-22,23,24,25,26,27,28,29}"
 
 # Logging
-LOG_PATH="${LOG_PATH:-./logs/ec_push}"
+LOG_PATH="${LOG_PATH:-./logs/ec_disagg}"
 TIMEOUT_SECONDS="${TIMEOUT_SECONDS:-600}"
 
 # Benchmark
@@ -105,14 +105,14 @@ cat <<EOF
 ============================================================
   EC Disaggregated Benchmark (RblnECNixlConnector)
 ============================================================
-  Model:            $MODEL
-  Connector:        RblnECNixlConnector (ZMQ PUSH/PULL + NIXL)
-  Encoders:        $NUM_ENCODERS (devices $ENCODER_BASE_DEVICE..$((ENCODER_BASE_DEVICE + NUM_ENCODERS - 1)))
-  LLM:         port $LLM_PORT (devices $LLM_DEVICES)
-  PULL port:        $LLM_HOST:$LLM_PULL_PORT
-  Proxy:            port $PROXY_PORT
-  Prompts:          $NUM_PROMPTS @ ${REQUEST_RATE} req/s
-  Logs:             $LOG_PATH/
+  Model:        $MODEL
+  Connector:    RblnECNixlConnector (ZMQ PUSH/PULL + NIXL)
+  Encoders:     $NUM_ENCODERS on devices $ENCODER_BASE_DEVICE..$((ENCODER_BASE_DEVICE + NUM_ENCODERS - 1))
+  LLM:          port $LLM_PORT, devices $LLM_DEVICES
+  PULL port:    $LLM_HOST:$LLM_PULL_PORT
+  Proxy:        port $PROXY_PORT
+  Prompts:      $NUM_PROMPTS @ ${REQUEST_RATE} req/s
+  Logs:         $LOG_PATH/
 ============================================================
 EOF
 

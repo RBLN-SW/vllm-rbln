@@ -32,9 +32,6 @@ For multimodal input we:
     4. Forward the *original* request to a decode server (llm pulls
        the encoder cache via NIXL and runs prefill + decode).
 
-This is the E+PD mode of disagg_epd_proxy.py, simplified for EC
-disaggregation where no separate prefill stage is needed.
-
 Usage:
   python client_ec_disaggregated.py \
       --encode-servers-urls "http://127.0.0.1:8000,http://127.0.0.1:8001" \
