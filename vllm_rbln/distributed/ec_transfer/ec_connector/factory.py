@@ -19,9 +19,3 @@ ECConnectorFactory.register_connector(
     "vllm_rbln.distributed.ec_transfer.ec_connector.rbln_ec_nixl_connector",
     "RblnECNixlConnector",
 )
-
-ECConnectorFactory.register_connector(
-    "RblnECNixlProxyConnector",
-    "vllm_rbln.distributed.ec_transfer.ec_connector.rbln_ec_nixl_proxy_connector",
-    "RblnECNixlProxyConnector",
-)
