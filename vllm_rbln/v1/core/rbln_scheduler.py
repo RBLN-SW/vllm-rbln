@@ -422,6 +422,10 @@ class RBLNScheduler(Scheduler):
                 request = request_queue.peek_request()
                 request_id = request.request_id
 
+                promoted_from_waiting_for_remote_kvs = (
+                    request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+                )
+
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(
                     request.status
@@ -551,6 +555,20 @@ class RBLNScheduler(Scheduler):
                     # first prefill chunk short (e.g. 127 instead of 128).
                     num_new_tokens = min(num_new_tokens, prefill_token_budget)
                     assert num_new_tokens > 0
+
+                    if (
+                        not promoted_from_waiting_for_remote_kvs
+                        and len(scheduled_new_reqs) > 0
+                    ):
+                        # NOTE(RBLN): promoted_from_waiting_for_remote_kvs is False, so
+                        # this waiting request needs local prefill (not remote prefill).
+                        # scheduled_new_reqs is non-empty because a prior iteration of
+                        # this waiting loop already added a request to the decode batch
+                        # from remote prefill.
+                        # In this case, we defer scheduling this local prefill request
+                        # (waiting request) to the next step.
+                        assert len(scheduled_resumed_reqs) == 0
+                        break
 
                     # Schedule encoder inputs.
                     if request.has_encoder_inputs:
@@ -715,6 +733,11 @@ class RBLNScheduler(Scheduler):
                         self.encoder_cache_manager.allocate(request, i)
                         if self.ec_connector is not None:
                             self.ec_connector.update_state_after_alloc(request, i)
+
+                if promoted_from_waiting_for_remote_kvs:
+                    # NOTE(RBLN): We can continue to schedule the next request
+                    # because scheduled new request is added as decoding phase.
+                    continue
 
                 # NOTE(RBLN): Reaching this point means that this request can now be
                 # added to the running batch. However, since we do not support mixed

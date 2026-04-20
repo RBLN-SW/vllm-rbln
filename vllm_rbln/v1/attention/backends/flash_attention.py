@@ -1079,9 +1079,9 @@ class RBLNFlashAttentionMetadataBuilder(
         common_prefix_len: int,
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
-        num_tokens=None,
         positions=None,
         batch_pad=None,
+        is_prefill=False,
     ) -> RBLNFlashAttentionMetadata:
         num_reqs = common_attn_metadata.num_reqs
         num_actual_tokens = common_attn_metadata.num_actual_tokens
@@ -1116,18 +1116,10 @@ class RBLNFlashAttentionMetadataBuilder(
         ).to(torch.int16)
         seq_lens_tensor = dyn_size_for_partitions
 
-        assert num_tokens is not None, (
-            "num_tokens is required for RBLN Attention Backend"
-        )
         assert batch_pad is not None, "batch_pad is required for RBLN Attention Backend"
-        is_prefills = num_computed_tokens[:num_reqs].numpy() < num_tokens[:num_reqs] - 1
-        # The prefill and decode cannot be mixed.
-        assert len(is_prefills) > 0 and all(
-            is_prefill == is_prefills[0] for is_prefill in is_prefills[:num_reqs]
-        )
 
         attn_masks = None
-        if is_prefills[0]:
+        if is_prefill:
             # NOTE(jiwoo.park) prefill's block_tables must be a 1D tensor.
             block_tables_tensor = block_tables_tensor[0]
             if not self.is_causal:
@@ -1183,7 +1175,7 @@ class RBLNFlashAttentionMetadataBuilder(
             query_lens = seq_lens - num_computed_tokens
             cache_seq_lens = torch.clamp(num_computed_tokens, max=sliding_window)
             cache_offsets = cache_seq_lens + query_lens
-            if not is_prefills[0]:
+            if not is_prefill:
                 cache_seq_lens = rbln_utils.pad(cache_seq_lens, 0, batch_pad)
                 cache_offsets = rbln_utils.pad(cache_offsets, 0, batch_pad)
                 # Generate sliding window attention mask for decode
@@ -1205,7 +1197,7 @@ class RBLNFlashAttentionMetadataBuilder(
             query_start_loc=query_start_loc,
             max_seq_len=query_max_seq_len,
             seq_lens=seq_lens_tensor.to(self.device)
-            if not self.is_batch_attention_opt or is_prefills[0] or batch_pad <= 1
+            if not self.is_batch_attention_opt or is_prefill or batch_pad <= 1
             else seq_idx.to(self.device),
             block_tables=block_tables_tensor.to(self.device),
             slot_mapping=slot_mapping,
@@ -1216,7 +1208,7 @@ class RBLNFlashAttentionMetadataBuilder(
             prefix_kv_lens=prefix_kv_lens,
             suffix_kv_lens=suffix_kv_lens,
             prefix_scheduler_metadata=prefix_scheduler_metadata,
-            is_prefill=bool(is_prefills[0]),
+            is_prefill=is_prefill,
             attn_masks=attn_masks,
             cache_seq_lens=cache_seq_lens.to(self.device)
             if cache_seq_lens is not None

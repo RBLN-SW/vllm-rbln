@@ -389,3 +389,10 @@ def create_runner_output(
         prompt_logprobs_dict={},
         pooler_output=[],
     )
+
+
+def advance_to_decode(scheduler, request):
+    """Run one prefill step + update so the request enters decode state."""
+    scheduler.add_request(request)
+    sched_out = scheduler.schedule()
+    scheduler.update_from_output(sched_out, create_runner_output(sched_out, 1))

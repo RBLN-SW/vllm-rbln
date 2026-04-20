@@ -15,6 +15,7 @@
 from vllm.v1.request import RequestStatus
 
 from .utils import (
+    advance_to_decode,
     create_requests,
     create_runner_output,
     create_scheduler,
@@ -201,13 +202,6 @@ def _sd_request(num_tokens, req_id):
     )[0]
 
 
-def _advance_to_decode(scheduler, request):
-    """Run one prefill step + update so the request enters decode state."""
-    scheduler.add_request(request)
-    sched_out = scheduler.schedule()
-    scheduler.update_from_output(sched_out, create_runner_output(sched_out, 1))
-
-
 def _check_invariant(sched_out, req_id):
     """num_scheduled_tokens == 1 (decode token) + len(spec_tokens)."""
     n = sched_out.num_scheduled_tokens[req_id]
@@ -227,7 +221,7 @@ def test_spec_decode_cap_at_block_boundary():
     """prompt=1024 → remaining_in_block=1024 == block_size; cap unchanged."""
     scheduler = _sd_scheduler()
     req = _sd_request(1024, "A")
-    _advance_to_decode(scheduler, req)
+    advance_to_decode(scheduler, req)
 
     req.spec_token_ids = [1] * 4
     sched_out = scheduler.schedule()
@@ -248,7 +242,7 @@ def test_spec_decode_cap_near_block_boundary_all_trimmed():
     """prompt=1023 → remaining_in_block=1 → cap=1 → all spec removed."""
     scheduler = _sd_scheduler()
     req = _sd_request(1023, "A")
-    _advance_to_decode(scheduler, req)
+    advance_to_decode(scheduler, req)
 
     req.spec_token_ids = [1] * 4
     sched_out = scheduler.schedule()
@@ -268,7 +262,7 @@ def test_spec_decode_cap_partial_spec_tokens_fit():
     """prompt=1020 → remaining_in_block=4 → cap=4 → 3 spec tokens survive."""
     scheduler = _sd_scheduler()
     req = _sd_request(1020, "A")
-    _advance_to_decode(scheduler, req)
+    advance_to_decode(scheduler, req)
 
     req.spec_token_ids = [1] * 6
     sched_out = scheduler.schedule()
@@ -290,8 +284,8 @@ def test_spec_decode_cap_no_spec_tokens_no_retroactive_trim():
     scheduler = _sd_scheduler()
     req_a = _sd_request(1024, "A")
     req_b = _sd_request(1023, "B")
-    _advance_to_decode(scheduler, req_a)
-    _advance_to_decode(scheduler, req_b)
+    advance_to_decode(scheduler, req_a)
+    advance_to_decode(scheduler, req_b)
 
     sched_out = scheduler.schedule()
 
@@ -311,8 +305,8 @@ def test_spec_decode_cap_retroactive_trim_all_spec_removed():
     scheduler = _sd_scheduler()
     req_a = _sd_request(1024, "A")
     req_b = _sd_request(1023, "B")
-    _advance_to_decode(scheduler, req_a)
-    _advance_to_decode(scheduler, req_b)
+    advance_to_decode(scheduler, req_a)
+    advance_to_decode(scheduler, req_b)
 
     req_a.spec_token_ids = [1] * 4
     req_b.spec_token_ids = [1] * 4
@@ -335,8 +329,8 @@ def test_spec_decode_cap_retroactive_trim_partial_spec_preserved():
     scheduler = _sd_scheduler()
     req_a = _sd_request(1024, "A")
     req_b = _sd_request(1020, "B")
-    _advance_to_decode(scheduler, req_a)
-    _advance_to_decode(scheduler, req_b)
+    advance_to_decode(scheduler, req_a)
+    advance_to_decode(scheduler, req_b)
 
     req_a.spec_token_ids = [1] * 6
     req_b.spec_token_ids = [1] * 6
@@ -362,9 +356,9 @@ def test_spec_decode_cap_retroactive_trim_three_requests():
     req_a = _sd_request(1024, "A")
     req_b = _sd_request(512, "B")
     req_c = _sd_request(1022, "C")
-    _advance_to_decode(scheduler, req_a)
-    _advance_to_decode(scheduler, req_b)
-    _advance_to_decode(scheduler, req_c)
+    advance_to_decode(scheduler, req_a)
+    advance_to_decode(scheduler, req_b)
+    advance_to_decode(scheduler, req_c)
 
     req_a.spec_token_ids = [1] * 6
     req_b.spec_token_ids = [1] * 6
@@ -389,8 +383,8 @@ def test_spec_decode_cap_decode_only_tightens_cap():
     scheduler = _sd_scheduler()
     req_a = _sd_request(1024, "A")
     req_b = _sd_request(1020, "B")
-    _advance_to_decode(scheduler, req_a)
-    _advance_to_decode(scheduler, req_b)
+    advance_to_decode(scheduler, req_a)
+    advance_to_decode(scheduler, req_b)
 
     req_a.spec_token_ids = [1] * 4
     # req_b has no spec tokens
@@ -414,8 +408,8 @@ def test_spec_decode_cap_maxlen_constraint():
     scheduler = _sd_scheduler(max_model_len=2048, max_num_batched_tokens=2048)
     req_a = _sd_request(1024, "A")
     req_b = _sd_request(2046, "B")
-    _advance_to_decode(scheduler, req_a)
-    _advance_to_decode(scheduler, req_b)
+    advance_to_decode(scheduler, req_a)
+    advance_to_decode(scheduler, req_b)
 
     req_a.spec_token_ids = [1] * 6
     sched_out = scheduler.schedule()
@@ -438,7 +432,7 @@ def test_spec_decode_cap_prefill_triggers_no_mixed_batching():
     scheduler = _sd_scheduler()
     req_a = _sd_request(1024, "A")
     req_b = _sd_request(512, "B")
-    _advance_to_decode(scheduler, req_a)
+    advance_to_decode(scheduler, req_a)
 
     req_a.spec_token_ids = [1] * 4
     scheduler.add_request(req_b)
