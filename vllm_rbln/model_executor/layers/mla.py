@@ -56,14 +56,17 @@ def __MLAAttentionWrapper_forward(
 
     # NOTE(RBLN): reshape to 4-D [batch, seq, heads, head_dim]
     # upstream uses 3-D [num_tokens, heads, head_dim]
-    q = q.view(batch_size, seq_len, self.num_heads, self.qk_head_dim)
+    q = q.reshape(batch_size, seq_len, self.num_heads, self.qk_head_dim)
     # Add head dim — upstream unsqueeze(1), RBLN unsqueeze(2) due to batch dim
     k_pe = k_pe.unsqueeze(2)
 
     if self.rotary_emb is not None:
-        q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
-            positions, q[..., self.qk_nope_head_dim :], k_pe
-        )
+        # Avoid in-place slice assignment (q[..., N:] = ...) which creates a
+        # view->slice->copy_ chain that process_inplace_copy_ops cannot handle
+        # when the view changes the number of dimensions.
+        q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+        q = torch.cat([q_nope, q_pe], dim=-1)
     # Remove the head dim added above so downstream gets [batch, seq, rope_dim]
     k_pe = k_pe.squeeze(2)
 

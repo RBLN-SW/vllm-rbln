@@ -53,11 +53,11 @@ def __AXK1_attention_forward(
     if self.q_lora_rank is not None:
         q = self.q_a_proj(hidden_states)[0]
         q = self.q_a_layernorm(q)
-        q = self.q_b_proj(q)[0].view(
+        q = self.q_b_proj(q)[0].reshape(
             batch, num_tokens, self.num_local_heads, self.qk_head_dim
         )
     else:
-        q = self.q_proj(hidden_states)[0].view(
+        q = self.q_proj(hidden_states)[0].reshape(
             batch, num_tokens, self.num_local_heads, self.qk_head_dim
         )
     q_nope, q_pe = q.split(
@@ -71,7 +71,7 @@ def __AXK1_attention_forward(
     latent_cache = latent_cache.unsqueeze(2)
     kv_a = self.kv_a_layernorm(kv_a)
     kv = self.kv_b_proj(kv_a)[0]
-    kv = kv.view(
+    kv = kv.reshape(
         batch, -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
     )
     k_nope, v = kv.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
@@ -86,13 +86,13 @@ def __AXK1_attention_forward(
     if llama_4_scaling is not None:
         q *= llama_4_scaling
 
-    q = q.view(batch, -1, self.num_local_heads * self.qk_head_dim)
-    k = k.view(-1, self.num_local_heads * self.qk_head_dim)
+    q = q.reshape(batch, -1, self.num_local_heads * self.qk_head_dim)
+    k = k.reshape(-1, self.num_local_heads * self.qk_head_dim)
     v = torch.nn.functional.pad(
         v, [0, self.qk_head_dim - self.v_head_dim], value=0
-    ).view(-1, self.num_local_heads * self.qk_head_dim)
+    ).reshape(-1, self.num_local_heads * self.qk_head_dim)
     attn_output = self.attn(q, k, v)
-    attn_output = attn_output.view(batch, -1, self.num_local_heads, self.qk_head_dim)[
+    attn_output = attn_output.reshape(batch, -1, self.num_local_heads, self.qk_head_dim)[
         ..., : self.v_head_dim
     ].reshape(batch, -1, self.num_local_heads * self.v_head_dim)
     output, _ = self.o_proj(attn_output)
