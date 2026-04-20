@@ -275,7 +275,9 @@ def get_masked_routing_weights(router_logits, top_k, renormalize, expert_map):
 
     use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
     if use_moe_tokens_mask:
-        tokens_mask = get_tokens_mask(router_logits.shape[0], 1.0, 0.0, device=selected_weights.device)
+        tokens_mask = get_tokens_mask(
+            router_logits.shape[0], 1.0, 0.0, device=selected_weights.device
+        )
         selected_weights = selected_weights * tokens_mask
 
     n_expert = router_logits.shape[1]
