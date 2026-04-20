@@ -17,11 +17,10 @@ RblnECNixlPushConnector: NIXL data transfer + ZMQ PUSH/PULL notification.
 
 Architecture
 ------------
-Uses NIXL for CPU-to-CPU tensor data transfer (same as RblnECNixlConnector),
-but replaces the PUB/SUB + ROUTER notification mechanism with direct ZMQ
-PUSH/PULL.  This eliminates the polling-based notification overhead
-(~150-300ms in the PUB/SUB design) while keeping NIXL's efficient memory
-transfer for large tensors (~45 MB).
+Uses NIXL for CPU-to-CPU tensor data transfer, with direct ZMQ PUSH/PULL
+for metadata notification — producer pushes NIXL agent metadata and tensor
+registry entries straight to the consumer's PULL socket, so the consumer
+can initiate the NIXL pull as soon as the encoder finishes.
 
   Producer  -> runs the vision encoder
             -> registers encoder output tensors with NIXL

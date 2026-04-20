@@ -49,7 +49,6 @@ Transfer flow per request
 
 Comparison with other connectors
 ---------------------------------
-  RblnECNixlConnector:      PUB/SUB notification, NIXL data   (N:1, ~150-300ms)
   RblnECNixlPushConnector:  ZMQ PUSH/PULL direct, NIXL data   (N:1, ~0ms)
   RblnECNixlProxyConnector: Proxy-routed metadata, NIXL data  (N:M, ~3-15ms)
 
