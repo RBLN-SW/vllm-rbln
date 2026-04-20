@@ -187,7 +187,6 @@ class CompressedTensorsW8A16Fp8MoEMethod(upstream.CompressedTensorsMoEMethod):
         orig_shape = x.shape
         num_tokens = orig_shape[:-1].numel()
         hidden_states = x.reshape(num_tokens, -1)
-        router_logits = router_logits.reshape(num_tokens, -1)
 
         intermediate_size = layer.w2_weight.shape[-1]
 
