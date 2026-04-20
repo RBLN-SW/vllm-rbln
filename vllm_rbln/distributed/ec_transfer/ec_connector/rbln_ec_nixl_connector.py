@@ -68,7 +68,6 @@ Configuration example
   ECTransferConfig(
       ec_connector="RblnECNixlConnector",
       ec_role="ec_producer",
-      ec_buffer_device="cpu",
       ec_connector_extra_config={
           "llm_host": "127.0.0.1",
           "llm_pull_port": 16100,
@@ -80,7 +79,6 @@ Configuration example
   ECTransferConfig(
       ec_connector="RblnECNixlConnector",
       ec_role="ec_consumer",
-      ec_buffer_device="cpu",
       ec_connector_extra_config={
           "pull_host": "0.0.0.0",
           "pull_port": 16100,

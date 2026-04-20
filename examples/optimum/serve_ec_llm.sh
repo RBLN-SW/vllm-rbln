@@ -32,7 +32,6 @@ exec vllm serve "$MODEL_ID" \
     --ec-transfer-config "{
         \"ec_connector\": \"RblnECNixlConnector\",
         \"ec_role\": \"ec_consumer\",
-        \"ec_buffer_device\": \"cpu\",
         \"ec_connector_extra_config\": {
             \"pull_host\": \"$PULL_HOST\",
             \"pull_port\": $PULL_PORT

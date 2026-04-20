@@ -47,7 +47,6 @@ launch_encoder() {
         --ec-transfer-config "{
             \"ec_connector\": \"RblnECNixlConnector\",
             \"ec_role\": \"ec_producer\",
-            \"ec_buffer_device\": \"cpu\",
             \"ec_connector_extra_config\": {
                 \"llm_host\": \"$LLM_HOST\",
                 \"llm_pull_port\": $LLM_PULL_PORT
