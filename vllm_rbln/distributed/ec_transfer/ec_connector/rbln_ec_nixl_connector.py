@@ -90,6 +90,7 @@ Configuration example
 from __future__ import annotations
 
 import queue
+import socket
 import threading
 import time
 import uuid
@@ -125,6 +126,23 @@ _DEFAULT_PULL_PORT = 16100
 _DEFAULT_LLM_HOST = "127.0.0.1"
 _CACHE_WAIT_TIMEOUT_S = 30.0
 _XFER_POLL_INTERVAL_S = 0.001
+_LLM_PROBE_TIMEOUT_S = 1.0
+
+
+def _probe_tcp(host: str, port: int, timeout: float = _LLM_PROBE_TIMEOUT_S) -> bool:
+    """Return True if *host:port* is accepting TCP connections.
+
+    Used at encoder startup to check whether the LLM's ZMQ PULL socket
+    is already listening. ZMQ's connect() itself is non-blocking and
+    succeeds even when the peer isn't up yet, so we do this one-shot
+    probe to give the operator a clear "start the LLM first" signal.
+    """
+    probe_host = "127.0.0.1" if host in ("0.0.0.0", "") else host
+    try:
+        with socket.create_connection((probe_host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
 
 # ---------------------------------------------------------------------------
 # Wire protocol (msgspec)
@@ -278,6 +296,16 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
                 "llm_pull_port", _DEFAULT_PULL_PORT
             )
             self._push_addr = f"tcp://{llm_host}:{llm_pull_port}"
+            if not _probe_tcp(llm_host, llm_pull_port):
+                logger.warning(
+                    "RblnECNixlConnector (encoder): LLM PULL port %s:%d is not "
+                    "accepting connections yet. Start the LLM first with "
+                    "`bash examples/optimum/serve_ec_llm.sh` — ZMQ will still "
+                    "buffer messages and reconnect once the LLM is up, but "
+                    "tail latency for the earliest requests may be poor.",
+                    llm_host,
+                    llm_pull_port,
+                )
             self._zmq_ctx = zmq.Context()
             self._push_sock = self._zmq_ctx.socket(zmq.PUSH)
             self._push_sock.setsockopt(zmq.SNDHWM, 64)
