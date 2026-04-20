@@ -238,10 +238,19 @@ class RBLNWorker(WorkerBase):
             )
             # FIXME(RBLN) - for now, mxfp4/fp8 quantization is only supported
             quantization = self.model_config.quantization
-            assert quantization == "mxfp4" or quantization == "fp8" or quantization == "compressed-tensors"
+            assert (
+                quantization == "mxfp4"
+                or quantization == "fp8"
+                or quantization == "compressed-tensors"
+            )
             # FIXME(RBLN) - compressed_tensors is only supported for fp8 quantization
             if quantization == "compressed-tensors":
-                assert self.model_config.hf_config.quantization_config["config_groups"]['group_0']['weights']['num_bits'] == 8
+                assert (
+                    self.model_config.hf_config.quantization_config["config_groups"][
+                        "group_0"
+                    ]["weights"]["num_bits"]
+                    == 8
+                )
                 quantization = "fp8"
 
             if quantization == "fp8":

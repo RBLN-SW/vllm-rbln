@@ -60,14 +60,10 @@ def __AXK1_attention_forward(
         q = self.q_proj(hidden_states)[0].reshape(
             batch, num_tokens, self.num_local_heads, self.qk_head_dim
         )
-    q_nope, q_pe = q.split(
-        [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
-    )
+    q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
     latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
 
-    kv_a, _ = latent_cache.split(
-        [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
-    )
+    kv_a, _ = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
     latent_cache = latent_cache.unsqueeze(2)
     kv_a = self.kv_a_layernorm(kv_a)
     kv = self.kv_b_proj(kv_a)[0]
@@ -79,9 +75,7 @@ def __AXK1_attention_forward(
     q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
     q = torch.cat([q_nope, q_pe], dim=-1)
-    k = torch.cat(
-        [k_nope, k_pe.repeat(1, 1, self.num_local_heads, 1)], dim=-1
-    )
+    k = torch.cat([k_nope, k_pe.repeat(1, 1, self.num_local_heads, 1)], dim=-1)
 
     if llama_4_scaling is not None:
         q *= llama_4_scaling
@@ -92,9 +86,9 @@ def __AXK1_attention_forward(
         v, [0, self.qk_head_dim - self.v_head_dim], value=0
     ).reshape(-1, self.num_local_heads * self.qk_head_dim)
     attn_output = self.attn(q, k, v)
-    attn_output = attn_output.reshape(batch, -1, self.num_local_heads, self.qk_head_dim)[
-        ..., : self.v_head_dim
-    ].reshape(batch, -1, self.num_local_heads * self.v_head_dim)
+    attn_output = attn_output.reshape(
+        batch, -1, self.num_local_heads, self.qk_head_dim
+    )[..., : self.v_head_dim].reshape(batch, -1, self.num_local_heads * self.v_head_dim)
     output, _ = self.o_proj(attn_output)
     return output
 
@@ -143,6 +137,8 @@ class AXK1MLP(nn.Module):
         x = F.silu(gate) * up
         x, _ = self.down_proj(x)
         return x
+
+
 AXK1MoE.forward = __AXK1_moe_forward_rsd
 AXK1Attention.forward = __AXK1_attention_forward
 _axk1_mod.AXK1MLP = AXK1MLP

@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import torch
-import vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe as upstream
+import vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe as upstream  # noqa: E501
 from compressed_tensors.quantization import QuantizationArgs, QuantizationStrategy
 from torch.nn.parameter import Parameter
 from vllm.distributed import get_tensor_model_parallel_world_size
@@ -35,7 +35,6 @@ logger = init_logger(__name__)
 
 
 class CompressedTensorsW8A16Fp8MoEMethod(upstream.CompressedTensorsMoEMethod):
-
     def __init__(
         self,
         weight_quant: QuantizationArgs,
@@ -119,6 +118,8 @@ class CompressedTensorsW8A16Fp8MoEMethod(upstream.CompressedTensorsMoEMethod):
         layer.register_parameter("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
+        w13_scale_shape: tuple[int, ...]
+        w2_scale_shape: tuple[int, ...]
         if self.strategy == QuantizationStrategy.BLOCK:
             block_n, block_k = self.weight_block_size[0], self.weight_block_size[1]
             w13_scale_shape = (
@@ -175,7 +176,9 @@ class CompressedTensorsW8A16Fp8MoEMethod(upstream.CompressedTensorsMoEMethod):
         )
 
         if getattr(layer, "_expert_map", None) is not None:
-            layer._expert_map_list = layer._expert_map.data.to(dtype=torch.int32).tolist()
+            layer._expert_map_list = layer._expert_map.data.to(
+                dtype=torch.int32
+            ).tolist()
 
     @property
     def is_monolithic(self) -> bool:
@@ -271,7 +274,7 @@ upstream.CompressedTensorsW8A16Fp8MoEMethod = CompressedTensorsW8A16Fp8MoEMethod
 # ---------------------------------------------------------------------------
 # Override non-MoE CompressedTensorsW8A16Fp8 scheme to skip Marlin (GPU-only)
 # ---------------------------------------------------------------------------
-from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a16_fp8 import (  # noqa: E402
+from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a16_fp8 import (  # noqa: E402, E501
     CompressedTensorsW8A16Fp8,
 )
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (  # noqa: E402
@@ -282,19 +285,17 @@ from vllm.model_executor.layers.quantization.utils.w8a8_utils import (  # noqa: 
 )
 from vllm.model_executor.utils import replace_parameter  # noqa: E402
 
-_original_ct_fp8_process_weights = CompressedTensorsW8A16Fp8.process_weights_after_loading
+_original_ct_fp8_process_weights = (
+    CompressedTensorsW8A16Fp8.process_weights_after_loading
+)
 
 
 def _rbln_ct_fp8_process_weights(self, layer: torch.nn.Module) -> None:
     weight = layer.weight
     weight_scale = layer.weight_scale
-    size_k_first = True
 
     if self.strategy == QuantizationStrategy.BLOCK:
-        size_k_first = False
-        weight, weight_scale = process_fp8_weight_block_strategy(
-            weight, weight_scale
-        )
+        weight, weight_scale = process_fp8_weight_block_strategy(weight, weight_scale)
     else:
         # NOTE(RBLN): Do NOT transpose weight here.
         # Upstream transposes for Marlin GPU kernels, but RBLN uses
@@ -302,9 +303,7 @@ def _rbln_ct_fp8_process_weights(self, layer: torch.nn.Module) -> None:
         # Keeping the standard PyTorch layout avoids a redundant double
         # transpose in the compiled graph.
         if self.strategy == QuantizationStrategy.TENSOR:
-            weight_scale = convert_to_channelwise(
-                weight_scale, layer.logical_widths
-            )
+            weight_scale = convert_to_channelwise(weight_scale, layer.logical_widths)
 
     replace_parameter(layer, "weight", weight.data)
     replace_parameter(layer, "weight_scale", weight_scale.data)

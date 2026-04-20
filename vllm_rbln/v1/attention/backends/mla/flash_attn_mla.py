@@ -40,9 +40,8 @@ logger = init_logger(__name__)
 # Custom ops (stubs for torch.compile — actual kernel provided by RBLN runtime)
 # ---------------------------------------------------------------------------
 
-def _fake_mla_output(
-    q: torch.Tensor, kv_c_normed: torch.Tensor
-) -> torch.Tensor:
+
+def _fake_mla_output(q: torch.Tensor, kv_c_normed: torch.Tensor) -> torch.Tensor:
     """Return shape: [batch, num_heads, seq_len, kv_lora_rank]."""
     b, num_heads, seq_len, _ = q.shape
     kv_lora_rank = kv_c_normed.shape[-1]
@@ -96,6 +95,7 @@ def _(q, kv_c_normed, k_pe, kv_cache, seq_idx, block_tables, scale):
 # ---------------------------------------------------------------------------
 # Backend / Impl
 # ---------------------------------------------------------------------------
+
 
 @register_backend(AttentionBackendEnum.FLASH_ATTN_MLA)
 class RBLNFlashAttnMLABackend(MLACommonBackend):
@@ -214,8 +214,9 @@ class RBLNFlashAttnMLAImpl(MLAAttentionImpl[RBLNFlashAttentionMetadata]):
         self.scale_tensor = torch.tensor(scale, device=self.device)
 
     # -- stubs required by MLAAttentionImpl interface -----------------------
-    def forward_mha(self, q, kv_c_normed, k_pe, kv_c_and_k_pe_cache,
-                    attn_metadata, k_scale, output):
+    def forward_mha(
+        self, q, kv_c_normed, k_pe, kv_c_and_k_pe_cache, attn_metadata, k_scale, output
+    ):
         raise NotImplementedError("RBLN MLA backend uses forward() directly")
 
     def forward_mqa(self, q, kv_c_and_k_pe_cache, attn_metadata, layer):
@@ -269,9 +270,13 @@ class RBLNFlashAttnMLAImpl(MLAAttentionImpl[RBLNFlashAttentionMetadata]):
             [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
         )
         decode_q_nope = decode_q_nope.transpose(1, 2)  # [B, H, S, nope]
-        decode_ql_nope = torch.matmul(decode_q_nope, layer.W_UK_T)  # [B, H, S, lora_rank]
+        decode_ql_nope = torch.matmul(
+            decode_q_nope, layer.W_UK_T
+        )  # [B, H, S, lora_rank]
         decode_q_pe = decode_q_pe.transpose(1, 2)  # [B, H, S, rope]
-        q = torch.cat([decode_ql_nope, decode_q_pe], dim=-1)  # [B, H, S, lora_rank+rope]
+        q = torch.cat(
+            [decode_ql_nope, decode_q_pe], dim=-1
+        )  # [B, H, S, lora_rank+rope]
 
         # Dispatch to custom kernel
         if attn_metadata.is_prefill:

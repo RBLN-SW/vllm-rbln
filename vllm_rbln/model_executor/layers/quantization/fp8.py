@@ -461,18 +461,15 @@ def custom_moe_swiglu_group_dequantize(
     in_block_size = int(group_size.item())
 
     if in_block_size == 0:
-        gate_proj_weight_dq = (
-            gate_proj_weight.to(hidden_states.dtype)
-            * gate_proj_scale.to(hidden_states.dtype)
+        gate_proj_weight_dq = gate_proj_weight.to(
+            hidden_states.dtype
+        ) * gate_proj_scale.to(hidden_states.dtype)
+        up_proj_weight_dq = up_proj_weight.to(hidden_states.dtype) * up_proj_scale.to(
+            hidden_states.dtype
         )
-        up_proj_weight_dq = (
-            up_proj_weight.to(hidden_states.dtype)
-            * up_proj_scale.to(hidden_states.dtype)
-        )
-        down_proj_weight_dq = (
-            down_proj_weight.to(hidden_states.dtype)
-            * down_proj_scale.to(hidden_states.dtype)
-        )
+        down_proj_weight_dq = down_proj_weight.to(
+            hidden_states.dtype
+        ) * down_proj_scale.to(hidden_states.dtype)
     else:
         gate_out_block = (
             gate_proj_weight.shape[1] + gate_proj_scale.shape[1] - 1
@@ -831,7 +828,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
 
         if getattr(layer, "_expert_map", None) is not None:
-            layer._expert_map_list = layer._expert_map.data.to(dtype=torch.int32).tolist()
+            layer._expert_map_list = layer._expert_map.data.to(
+                dtype=torch.int32
+            ).tolist()
 
     def select_gemm_impl(
         self,
