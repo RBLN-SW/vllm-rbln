@@ -192,6 +192,10 @@ class PerformanceTracker:
         self.decode_metrics = StepMetrics()
         self.prefill_metrics_by_request_id = PrefillMetricsByRequestID()
         self.padded_decode_metrics = StepMetrics()
+        # Named sub-step metrics (e.g. finer breakdown of the main step, such
+        # as `apply_sampling_constraints` / `rejection_sample` inside the
+        # rejection sampler). Keyed by a caller-supplied name.
+        self.sub_metrics: dict[str, StepMetrics] = {}
 
     def check_dummy_request(self, request_ids: list[str] | None) -> bool:
         if request_ids:
@@ -243,6 +247,26 @@ class PerformanceTracker:
         metrics = self.padded_decode_metrics if padded_decode else self.decode_metrics
         metrics.add_measurement(latency, token_count, host_time, device_time, ccl_time)
 
+    def record_sub_step(
+        self,
+        name: str,
+        latency: float,
+        token_count: int = 0,
+        host_time: int | None = None,
+        device_time: int | None = None,
+        ccl_time: int | None = None,
+        request_ids: list[str] | None = None,
+    ):
+        """Record a named sub-step measurement (e.g. a sub-call inside the
+        tracked step). Creates the entry lazily on first use."""
+        if self.check_dummy_request(request_ids):
+            return
+        if name not in self.sub_metrics:
+            self.sub_metrics[name] = StepMetrics()
+        self.sub_metrics[name].add_measurement(
+            latency, token_count, host_time, device_time, ccl_time
+        )
+
     def print_final_stats(self):
         logger.info("=" * 80)
         if self.name:
@@ -261,4 +285,11 @@ class PerformanceTracker:
 
         # Padded decode stats
         self.padded_decode_metrics.show_stats("PADDED DECODE")
+        logger.info("-" * 40)
+
+        # Named sub-step stats
+        for sub_name, sub_metric in self.sub_metrics.items():
+            sub_metric.show_stats(f"SUB-STEP: {sub_name}")
+            logger.info("-" * 40)
+
         logger.info("=" * 80)

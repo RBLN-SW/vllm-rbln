@@ -568,6 +568,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self.performance_tracker = PerformanceTracker("MODEL")
             self.sampler_performance_tracker = PerformanceTracker("SAMPLER")
             self.e2e_performance_tracker = PerformanceTracker("E2E")
+            # Route rejection-sampler sub-step timings (apply_sampling_constraints,
+            # rejection_sample) into the sampler tracker.
+            if getattr(self, "rejection_sampler", None) is not None:
+                self.rejection_sampler.performance_tracker = (
+                    self.sampler_performance_tracker
+                )
 
     def _get_positions(self, num_tokens: Any):
         if isinstance(num_tokens, int):

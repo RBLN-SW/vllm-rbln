@@ -15,7 +15,9 @@
 # Copied from vllm.v1.sample.rejection_sampler: https://github.com/vllm-project/vllm/blob/v0.13.0/vllm/v1/sample/rejection_sampler.py
 # Search for NOTE(RBLN) or TODO(RBLN) for details
 
+import time
 from dataclasses import replace
+from typing import TYPE_CHECKING
 
 import torch
 from vllm.sampling_params import _SAMPLING_EPS
@@ -26,6 +28,9 @@ from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
 from vllm_rbln.logger import init_logger
+
+if TYPE_CHECKING:
+    from vllm_rbln.v1.worker.metrics import PerformanceTracker
 
 logger = init_logger(__name__)
 
@@ -92,6 +97,12 @@ class RBLNRejectionSampler(RejectionSampler):
     # NOTE(RBLN): This class simply overrides forward by copying the upstream
     # implementation verbatim, so that it uses the functions defined in this
     # file. There are no behavioral changes.
+
+    # Optional performance tracker. When set, `forward` records per-sub-step
+    # timings (apply_sampling_constraints, rejection_sample) via
+    # `record_sub_step`. Assigned externally from the model runner.
+    performance_tracker: "PerformanceTracker | None" = None
+
     def forward(
         self,
         metadata: SpecDecodeMetadata,
@@ -161,14 +172,21 @@ class RBLNRejectionSampler(RejectionSampler):
         # [num_tokens, vocab_size]
         # NOTE(woosuk): `target_logits` can be updated in place inside the
         # `apply_sampling_constraints` function.
+        _asc_start = time.perf_counter()
         target_logits = apply_sampling_constraints(
             target_logits,
             metadata.cu_num_draft_tokens,
             sampling_metadata,
         )
+        if self.performance_tracker is not None:
+            self.performance_tracker.record_sub_step(
+                "apply_sampling_constraints",
+                time.perf_counter() - _asc_start,
+            )
         # Compute probability distribution from target logits.
         target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
 
+        _rs_start = time.perf_counter()
         output_token_ids = self.rejection_sample(
             metadata.draft_token_ids,
             metadata.num_draft_tokens,
@@ -179,6 +197,11 @@ class RBLNRejectionSampler(RejectionSampler):
             bonus_token_ids,
             sampling_metadata,
         )
+        if self.performance_tracker is not None:
+            self.performance_tracker.record_sub_step(
+                "rejection_sample",
+                time.perf_counter() - _rs_start,
+            )
 
         logprobs_tensors = None
         if sampling_metadata.max_num_logprobs is not None:
