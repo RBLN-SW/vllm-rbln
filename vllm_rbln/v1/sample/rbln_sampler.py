@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # isort: off
+import inspect
 import torch
 import torch.nn as nn
 
@@ -140,6 +141,7 @@ class RBLNTopKTopPSampler(nn.Module):
         self,
         logprobs_mode: LogprobsMode = "raw_logprobs",
         seed: int = 42,
+        compile_context: rebel.CompileContext = None,
     ):
         # TODO(rbln): Merge more ops to rbln context.
         #       Currently, we only have softmax in rbln context.
@@ -151,10 +153,27 @@ class RBLNTopKTopPSampler(nn.Module):
         )
 
         rebel.manual_seed(seed)
-        options = {}
-        options["tensor_parallel_size"] = 1
+        use_dt = envs.VLLM_RBLN_USE_DEVICE_TENSOR
+        options: dict = {}
+        if not use_dt:
+            options["compile_context"] = (
+                compile_context
+                if compile_context
+                else (
+                    rebel.CompileContext(use_global_ctx=True)
+                    if "use_global_ctx"
+                    in inspect.signature(rebel.CompileContext).parameters
+                    else rebel.CompileContext()
+                )
+            )
         if envs.VLLM_RBLN_COMPILE_STRICT_MODE:
             options["mode"] = "strict"
+
+        if has_torch_rbln or use_dt:
+            options["tensor_parallel_size"] = 1
+            if not use_dt:
+                options["use_global_ctx"] = True
+                options["global_device_id"] = 0
 
         self._compiled_rbln_topk_topp_sampler = torch.compile(
             rbln_top_k_top_p_sample,
@@ -193,11 +212,14 @@ class RBLNSampler(VLLMSampler):
         self,
         logprobs_mode: LogprobsMode = "raw_logprobs",
         seed: int = 42,
+        compile_context: rebel.CompileContext = None,
     ):
         super().__init__()
         if logprobs_mode in ("raw_logprobs", "raw_logits"):
             self.topk_topp_sampler = RBLNTopKTopPSampler(
-                logprobs_mode=logprobs_mode, seed=seed,
+                logprobs_mode=logprobs_mode,
+                seed=seed,
+                compile_context=compile_context,
             )
         else:
             logger.warning_once(

@@ -1083,32 +1083,37 @@ class RBLNFlashAttentionMetadataBuilder(
         batch_pad=None,
         is_prefill=False,
     ) -> RBLNFlashAttentionMetadata:
+        use_dt = envs.VLLM_RBLN_USE_DEVICE_TENSOR
         num_reqs = common_attn_metadata.num_reqs
         num_actual_tokens = common_attn_metadata.num_actual_tokens
         max_query_len = common_attn_metadata.max_query_len
         query_max_seq_len = common_attn_metadata.max_seq_len
         query_start_loc = common_attn_metadata.query_start_loc
-        query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
         seq_lens = common_attn_metadata.seq_lens
-        # Prefer the pre-existing CPU copy to avoid an extra D2H sync.
-        _seq_lens_cpu = common_attn_metadata._seq_lens_cpu
-        seq_lens_cpu = (
-            _seq_lens_cpu[:num_reqs]
-            if _seq_lens_cpu is not None
-            else seq_lens[:num_reqs].cpu()
-        )
         block_tables_tensor = common_attn_metadata.block_table_tensor
         slot_mapping = common_attn_metadata.slot_mapping
-        # Both operands are CPU tensors → arithmetic stays on CPU.
-        query_seq_lens = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
-        num_computed_tokens_cpu = seq_lens_cpu - query_seq_lens
+        if use_dt:
+            # Prefer the pre-existing CPU copy to avoid an extra D2H sync;
+            # arithmetic stays on CPU until .to(self.device) in the constructor.
+            query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
+            _seq_lens_cpu = common_attn_metadata._seq_lens_cpu
+            seq_lens_cpu = (
+                _seq_lens_cpu[:num_reqs]
+                if _seq_lens_cpu is not None
+                else seq_lens[:num_reqs].cpu()
+            )
+            query_seq_lens = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+            num_computed_tokens_cpu = seq_lens_cpu - query_seq_lens
+            seq_idx = positions[query_start_loc[:num_reqs].to("cpu")].view(-1, 1)
+        else:
+            query_seq_lens = query_start_loc[1:] - query_start_loc[:-1]
+            num_computed_tokens = seq_lens - query_seq_lens
+            seq_idx = positions[query_start_loc[:num_reqs]].view(-1, 1)
 
         cu_prefix_query_lens = None
         prefix_kv_lens = None
         suffix_kv_lens = None
         prefix_scheduler_metadata = None
-
-        seq_idx = positions[query_start_loc[:num_reqs].to("cpu")].view(-1, 1)
 
         # The length of the partition equals the block size.
         partition_len = self.block_size
@@ -1167,7 +1172,9 @@ class RBLNFlashAttentionMetadataBuilder(
                     max_seq_len,
                     dtype=torch.float16 if self.enforce_eager else torch.float32,
                 )
-                for batch_index, batch_step in enumerate(seq_lens_cpu):
+                for batch_index, batch_step in enumerate(
+                    seq_lens_cpu if use_dt else seq_lens
+                ):
                     decode_attention_mask[batch_index, :, :, :, : batch_step + 1] = 1
                 attn_masks = decode_attention_mask
                 attn_masks = attn_masks.to(self.device)
@@ -1177,10 +1184,13 @@ class RBLNFlashAttentionMetadataBuilder(
         local_block_tables = None
         swa_attn_masks = None
         if sliding_window := getattr(self.kv_cache_spec, "sliding_window", None):
-            # All arithmetic stays on CPU until .to(self.device) in the constructor.
-            num_computed_tokens = num_computed_tokens_cpu.view(-1, 1).to(torch.int16)
-            seq_lens_swa = seq_lens_cpu.view(-1, 1).to(torch.int16)
-            query_lens = seq_lens_swa - num_computed_tokens
+            nct_src = (
+                num_computed_tokens_cpu if use_dt else num_computed_tokens[:num_reqs]
+            )
+            sl_src = seq_lens_cpu if use_dt else seq_lens[:num_reqs]
+            num_computed_tokens = nct_src.view(-1, 1).to(torch.int16)
+            seq_lens = sl_src.view(-1, 1).to(torch.int16)
+            query_lens = seq_lens - num_computed_tokens
             cache_seq_lens = torch.clamp(num_computed_tokens, max=sliding_window)
             cache_offsets = cache_seq_lens + query_lens
             if not is_prefill:
@@ -1188,7 +1198,6 @@ class RBLNFlashAttentionMetadataBuilder(
                 cache_offsets = rbln_utils.pad(cache_offsets, 0, batch_pad)
                 # Generate sliding window attention mask for decode
                 # mask[b, s] = 1.0 if s <= cache_seq_lens[b] else 0.0
-                # positions stays on CPU; cache_seq_lens is still CPU here.
                 positions = torch.arange(sliding_window)[None, :]
                 swa_attn_masks = torch.where(positions - cache_seq_lens > 0, 0.0, 1.0)[
                     :, None, None, :
