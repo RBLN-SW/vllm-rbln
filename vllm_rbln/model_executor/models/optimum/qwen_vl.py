@@ -266,17 +266,12 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         block_tables = kwargs.pop("block_tables")
 
         if is_prompt:
-            logger.info("Model forward: prefill (1 request)")
             logits = self.model.prefill_decoder(
                 **prefill_params,
                 block_tables=block_tables,
             ).logits
         else:
             padded_batch_size = kwargs.pop("padded_batch_size", self.decoder_batch_size)
-            logger.info(
-                "Model forward: decode batch=%d (actual=%d, padded=%d)",
-                request_nums, request_nums, padded_batch_size,
-            )
             self.model.decoder = self.model.decoders[padded_batch_size]
             input_ids = kwargs.pop("input_ids")
 
