@@ -37,8 +37,13 @@ from vllm.distributed import (
     init_distributed_environment,
     set_custom_all_reduce,
 )
-from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized
-from vllm.distributed.parallel_state import get_pp_group
+from vllm.distributed.kv_transfer import (
+    ensure_kv_transfer_initialized,
+    ensure_kv_transfer_shutdown,
+    get_kv_transfer_group,
+    has_kv_transfer_group,
+)
+from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.lora.request import LoRARequest
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -144,10 +149,6 @@ class RBLNWorker(WorkerBase):
     def wake_up(self, tags: list[str] | None = None) -> None:
         logger.warning("sleep mode is not supported on RBLN, ignore it.")
         pass
-
-    def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:
-        self.cache_config.num_gpu_blocks = num_gpu_blocks
-        self.cache_config.num_cpu_blocks = num_cpu_blocks
 
     def _init_device_env(self) -> None:
         world_size = self.local_world_size
@@ -295,11 +296,39 @@ class RBLNWorker(WorkerBase):
 
         return available_memory_estimate
 
+    def get_kv_connector_handshake_metadata(self) -> dict | None:
+        """Get KV connector metadata from this worker if available."""
+
+        if not has_kv_transfer_group():
+            return None
+
+        connector = get_kv_transfer_group()
+        # Return None for connectors that don't need to exchange handshake
+        # metadata across workers.
+        if (metadata := connector.get_handshake_metadata()) is None:
+            return None
+
+        tp_rank = get_tp_group().rank_in_group
+        return {tp_rank: metadata}
+
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return self.model_runner.get_kv_cache_spec()
 
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate RBLN KV cache with the specified kv_cache_config."""
+
+        # Update local config with adjusted num blocks after profiling,
+        # so that it's available to the warmup stage.
+        self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
+        self.cache_config.num_cpu_blocks = kv_cache_config.num_blocks
+
+        # Init kv cache connector here, because it requires
+        # `kv_cache_config`.
+        # NOTE(Kuntai): This need to be done before `initialize_kv_cache`,
+        # because `initialize_kv_cache` will inject kv cache groups not
+        # related to kv cache connector (e.g. kv cache sharing layers).
+        ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
+
         self.model_runner.initialize_kv_cache(kv_cache_config)
 
     def _ensure_rbln_host_threads_before_compile(self) -> None:
@@ -509,6 +538,12 @@ class RBLNWorker(WorkerBase):
 
     def shutdown(self) -> None:
         logger.info("v1 rbln_worker shutdown called")
+        # has_kv_transfer_group can be None during interpreter shutdown.
+        if ensure_kv_transfer_shutdown is not None:
+            ensure_kv_transfer_shutdown()
+        if self.profiler is not None:
+            self.profiler.shutdown()
+
         if envs.VLLM_RBLN_METRICS:
             if self.model_runner.performance_tracker:
                 self.model_runner.performance_tracker.print_final_stats()
@@ -572,5 +607,3 @@ def init_worker_distributed_environment(
         parallel_config.tensor_parallel_size,
         parallel_config.pipeline_parallel_size,
     )
-
-    ensure_kv_transfer_initialized(vllm_config)
