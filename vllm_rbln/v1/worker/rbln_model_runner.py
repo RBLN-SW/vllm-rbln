@@ -4560,6 +4560,9 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
             kv_transfer_group.set_host_xfer_buffer_ops(rbln_copy_kv_blocks)
 
+            if hasattr(kv_transfer_group, "set_runtime_holder"):
+                kv_transfer_group.set_runtime_holder(self.runtime_holder)
+
         if self.dcp_world_size > 1:
             layer_type = cast(type[Any], AttentionLayerBase)
             layers = get_layers_from_vllm_config(self.vllm_config, layer_type)

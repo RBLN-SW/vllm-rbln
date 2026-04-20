@@ -12,15 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
+"""RBLN LMCache KV connector for vLLM — thin re-export shim.
 
-KVConnectorFactory.register_connector(
-    "RblnNixlConnector",
-    "vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl_connector",
-    "RblnNixlConnector",
-)
-KVConnectorFactory.register_connector(
-    "RBLNLMCacheConnectorV1",
-    "vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_lmcache_connector",
-    "RBLNLMCacheConnectorV1",
-)
+All RBLN-specific logic lives in the ``lmcache_rbln`` package.
+This module re-exports ``RBLNLMCacheConnectorV1`` so that vllm-rbln's
+factory registration can reference it via a stable path inside the
+``vllm_rbln`` namespace.
+
+Usage in vLLM config::
+
+    kv_connector = (
+        "vllm_rbln.distributed.kv_transfer"
+        ".kv_connector.v1.rbln_lmcache_connector"
+        ".RBLNLMCacheConnectorV1"
+    )
+"""
+
+from lmcache_rbln.integration.vllm.connector import RBLNLMCacheConnectorV1
+
+__all__ = ["RBLNLMCacheConnectorV1"]
