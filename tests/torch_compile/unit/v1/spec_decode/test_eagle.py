@@ -80,8 +80,8 @@ class FakeRunner:
         self.kv_caches = [torch.tensor([11], dtype=torch.int32)]
         self._is_prefill = is_prefill
 
-    def is_prefills(self):
-        return [self._is_prefill]
+    def is_prefill_phase(self):
+        return self._is_prefill
 
 
 def make_common_attn_metadata(

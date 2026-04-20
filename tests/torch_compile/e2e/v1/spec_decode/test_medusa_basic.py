@@ -16,29 +16,19 @@
 
 from __future__ import annotations
 
-import pytest
 from vllm import LLM, SamplingParams
 
 from .utils import (
     DEFAULT_MEDUSA_MODEL_ID,
     DEFAULT_MODEL_ID,
     ensure_converted_medusa_adapter,
+    run_in_spawned_process,
 )
 
 PROMPTS = [
     "A robot may not injure a human being",
     "The capital of France is",
 ]
-
-
-@pytest.fixture(scope="module")
-def llm_env(monkeypatch_module):
-    monkeypatch_module.setenv("RBLN_USE_CUSTOM_KERNEL", "1")
-    monkeypatch_module.setenv("VLLM_RBLN_USE_VLLM_MODEL", "1")
-    monkeypatch_module.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
-    monkeypatch_module.setenv("VLLM_DISABLE_COMPILE_CACHE", "1")
-    monkeypatch_module.setenv("VLLM_RBLN_ENABLE_WARM_UP", "1")
-    monkeypatch_module.setenv("VLLM_RBLN_SAMPLER", "0")
 
 
 def _build_llm() -> LLM:
@@ -60,11 +50,10 @@ def _build_llm() -> LLM:
         },
         disable_log_stats=False,
         tensor_parallel_size=1,
-        gpu_memory_utilization=0.8,
     )
 
 
-def test_basic_medusa_generation(llm_env) -> None:
+def _run_basic_medusa_generation() -> None:
     sampling_params = SamplingParams(temperature=0.1, top_p=0.9, max_tokens=32)
 
     llm = _build_llm()
@@ -81,3 +70,13 @@ def test_basic_medusa_generation(llm_env) -> None:
     assert "vllm:spec_decode_num_drafts" in metric_names
     assert "vllm:spec_decode_num_draft_tokens" in metric_names
     assert "vllm:spec_decode_num_accepted_tokens" in metric_names
+
+
+def test_basic_medusa_generation():
+    run_in_spawned_process(
+        module_name=__name__,
+        func_name="_run_basic_medusa_generation",
+        env={
+            "RBLN_USE_CUSTOM_KERNEL": "1",
+        },
+    )
