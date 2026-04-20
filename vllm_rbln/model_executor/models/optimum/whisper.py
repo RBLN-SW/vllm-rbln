@@ -79,8 +79,6 @@ class RBLNOptimumWhisperForConditionalGeneration(
         input_ids = model_input.input_tokens
         block_tables = model_input.block_tables
 
-        finished_requests_ids = model_input.finished_requests_ids
-        running_requests_ids = model_input.running_requests_ids
         request_nums = input_ids.shape[0]
 
         is_prompt = model_input.is_prompt
