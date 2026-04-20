@@ -1,0 +1,34 @@
+name: Trigger FSW Nightly E2E for vLLM-RBLN
+
+on:
+  schedule:
+    # Daily 02:00 KST (17:00 UTC)
+    - cron: '0 17 * * *'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "vllm-rbln ref to test (branch, tag, or SHA). Defaults to dev."
+        required: false
+        type: string
+        default: dev
+
+jobs:
+  trigger-vllm-rbln-fsw-nightly-e2e:
+    if: github.repository_owner == 'RBLN-SW'
+    runs-on: fsw-r18s-atom-ext-rbln-sw-general-c1m12
+    steps:
+      - name: Dispatch to fsw-integration
+        uses: Wandalen/wretry.action@v3
+        with:
+          action: peter-evans/repository-dispatch@v4
+          attempt_limit: 5
+          attempt_delay: 2000
+          with: |
+            token: ${{ secrets.GIT_PAT }}
+            repository: rebellions-sw/fsw-integration
+            event-type: vllm-rbln-nightly-e2e
+            client-payload: |
+              {
+                "ref": "${{ inputs.ref || 'dev' }}",
+                "actor": "${{ github.actor }}"
+              }
