@@ -15,9 +15,9 @@
 from vllm.distributed.ec_transfer.ec_connector.factory import ECConnectorFactory
 
 ECConnectorFactory.register_connector(
-    "RblnECNixlPushConnector",
-    "vllm_rbln.distributed.ec_transfer.ec_connector.rbln_ec_nixl_push_connector",
-    "RblnECNixlPushConnector",
+    "RblnECNixlConnector",
+    "vllm_rbln.distributed.ec_transfer.ec_connector.rbln_ec_nixl_connector",
+    "RblnECNixlConnector",
 )
 
 ECConnectorFactory.register_connector(

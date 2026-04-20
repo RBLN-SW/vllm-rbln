@@ -2,14 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2025 Rebellions Inc. All rights reserved.
 #
-# Disaggregated encoder (push connector) vs monolithic (non-disaggregated)
-# A/B benchmark on an identical workload.
+# Disaggregated encoder vs monolithic (non-disaggregated) A/B benchmark
+# on an identical workload.
 #
 #   non-disagg:  single vllm serve; decoder TP8 + visual co-located via
 #                `--additional-config '{"rbln_config":{"device":[...],
 #                "visual":{"device":...}}}'`
-#   disagg:      N independent producers + TP8 consumer + proxy, using
-#                RblnECNixlPushConnector (the only connector that works
+#   disagg:      N independent encoders + TP8 llm + proxy, using
+#                RblnECNixlConnector (the only connector that works
 #                with Qwen3-VL today).
 #
 # Same MODEL / NUM_PROMPTS / RATES / dataset for both, with warm-up run
@@ -19,7 +19,7 @@
 #   bash examples/optimum/compare_disagg_vs_nondisagg.sh
 #
 # Override:
-#   MODES="nondisagg disagg" NUM_PRODUCERS=8 RATES="0.3 0.5" \
+#   MODES="nondisagg disagg" NUM_ENCODERS=8 RATES="0.3 0.5" \
 #   NUM_PROMPTS=40 bash examples/optimum/compare_disagg_vs_nondisagg.sh
 #
 set -euo pipefail
@@ -39,7 +39,7 @@ fi
 MODEL="${MODEL:-Qwen3-VL-8B-Instruct}"
 MODES="${MODES:-nondisagg disagg}"
 
-NUM_PRODUCERS="${NUM_PRODUCERS:-8}"
+NUM_ENCODERS="${NUM_ENCODERS:-8}"
 NUM_PROMPTS="${NUM_PROMPTS:-40}"
 NUM_WARMUP="${NUM_WARMUP:-8}"
 RATES="${RATES:-0.5}"
@@ -51,14 +51,14 @@ RATES="${RATES:-0.5}"
 NONDISAGG_DECODER_DEVICES="${NONDISAGG_DECODER_DEVICES:-16,17,18,19,20,21,22,23}"
 NONDISAGG_VISUAL_DEVICE="${NONDISAGG_VISUAL_DEVICE:-24}"
 
-# disagg: producer_base..+NUM_PRODUCERS-1, consumer TP8 on 8 devices
-DISAGG_PRODUCER_BASE_DEVICE="${DISAGG_PRODUCER_BASE_DEVICE:-16}"
-DISAGG_CONSUMER_DEVICES="${DISAGG_CONSUMER_DEVICES:-24,25,26,27,28,29,30,31}"
+# disagg: encoder_base..+NUM_ENCODERS-1, llm TP8 on 8 devices
+DISAGG_ENCODER_BASE_DEVICE="${DISAGG_ENCODER_BASE_DEVICE:-16}"
+DISAGG_LLM_DEVICES="${DISAGG_LLM_DEVICES:-24,25,26,27,28,29,30,31}"
 
 # Ports
 NONDISAGG_PORT="${NONDISAGG_PORT:-9300}"
-DISAGG_PRODUCER_BASE_PORT="${DISAGG_PRODUCER_BASE_PORT:-8000}"
-DISAGG_CONSUMER_PORT="${DISAGG_CONSUMER_PORT:-9000}"
+DISAGG_ENCODER_BASE_PORT="${DISAGG_ENCODER_BASE_PORT:-8000}"
+DISAGG_LLM_PORT="${DISAGG_LLM_PORT:-9000}"
 DISAGG_PROXY_PORT="${DISAGG_PROXY_PORT:-1800}"
 DISAGG_PULL_PORT="${DISAGG_PULL_PORT:-16100}"
 
@@ -140,45 +140,45 @@ EOF
 
 launch_disagg() {
     local tag=$1
-    local producer_log="$LOG_PATH/${tag}_producer.log"
-    local consumer_log="$LOG_PATH/${tag}_consumer.log"
+    local encoder_log="$LOG_PATH/${tag}_encoder.log"
+    local llm_log="$LOG_PATH/${tag}_llm.log"
     local proxy_log="$LOG_PATH/${tag}_proxy.log"
 
-    echo "[launch:$tag] consumer (push connector, TP8 on $DISAGG_CONSUMER_DEVICES) ..."
-    CONSUMER_DEVICES="$DISAGG_CONSUMER_DEVICES" \
+    echo "[launch:$tag] llm (TP8 on $DISAGG_LLM_DEVICES) ..."
+    LLM_DEVICES="$DISAGG_LLM_DEVICES" \
     PULL_HOST="0.0.0.0" \
     PULL_PORT="$DISAGG_PULL_PORT" \
-        bash "$SCRIPT_DIR/serve_ec_push_consumer.sh" \
-            "$MODEL" "$DISAGG_CONSUMER_PORT" \
-        > "$consumer_log" 2>&1 &
+        bash "$SCRIPT_DIR/serve_ec_llm.sh" \
+            "$MODEL" "$DISAGG_LLM_PORT" \
+        > "$llm_log" 2>&1 &
     PIDS+=($!)
-    wait_for_server "$DISAGG_CONSUMER_PORT" "$tag consumer"
+    wait_for_server "$DISAGG_LLM_PORT" "$tag llm"
 
-    echo "[launch:$tag] $NUM_PRODUCERS producer(s) on devices $DISAGG_PRODUCER_BASE_DEVICE..$((DISAGG_PRODUCER_BASE_DEVICE + NUM_PRODUCERS - 1)) ..."
-    NUM_PRODUCERS="$NUM_PRODUCERS" \
-    BASE_DEVICE="$DISAGG_PRODUCER_BASE_DEVICE" \
-    CONSUMER_HOST="127.0.0.1" \
-    CONSUMER_PULL_PORT="$DISAGG_PULL_PORT" \
-        bash "$SCRIPT_DIR/serve_ec_push_producer.sh" \
-            "$MODEL" "$DISAGG_PRODUCER_BASE_PORT" \
-        > "$producer_log" 2>&1 &
+    echo "[launch:$tag] $NUM_ENCODERS encoder(s) on devices $DISAGG_ENCODER_BASE_DEVICE..$((DISAGG_ENCODER_BASE_DEVICE + NUM_ENCODERS - 1)) ..."
+    NUM_ENCODERS="$NUM_ENCODERS" \
+    BASE_DEVICE="$DISAGG_ENCODER_BASE_DEVICE" \
+    LLM_HOST="127.0.0.1" \
+    LLM_PULL_PORT="$DISAGG_PULL_PORT" \
+        bash "$SCRIPT_DIR/serve_ec_encoder.sh" \
+            "$MODEL" "$DISAGG_ENCODER_BASE_PORT" \
+        > "$encoder_log" 2>&1 &
     PIDS+=($!)
-    for i in $(seq 0 $((NUM_PRODUCERS - 1))); do
-        wait_for_server $((DISAGG_PRODUCER_BASE_PORT + i)) "$tag producer $i"
+    for i in $(seq 0 $((NUM_ENCODERS - 1))); do
+        wait_for_server $((DISAGG_ENCODER_BASE_PORT + i)) "$tag encoder $i"
     done
 
-    # Proxy fanning out encodes and forwarding decode to the TP8 consumer.
+    # Proxy fanning out encodes and forwarding decode to the TP8 llm.
     echo "[launch:$tag] proxy ..."
     local encode_urls=""
-    for i in $(seq 0 $((NUM_PRODUCERS - 1))); do
+    for i in $(seq 0 $((NUM_ENCODERS - 1))); do
         [ -n "$encode_urls" ] && encode_urls+=","
-        encode_urls+="http://127.0.0.1:$((DISAGG_PRODUCER_BASE_PORT + i))"
+        encode_urls+="http://127.0.0.1:$((DISAGG_ENCODER_BASE_PORT + i))"
     done
     python "$SCRIPT_DIR/client_ec_disaggregated.py" \
         --host 0.0.0.0 \
         --port "$DISAGG_PROXY_PORT" \
         --encode-servers-urls "$encode_urls" \
-        --decode-servers-urls "http://127.0.0.1:$DISAGG_CONSUMER_PORT" \
+        --decode-servers-urls "http://127.0.0.1:$DISAGG_LLM_PORT" \
         > "$proxy_log" 2>&1 &
     PIDS+=($!)
     wait_for_server "$DISAGG_PROXY_PORT" "$tag proxy"
@@ -228,8 +228,8 @@ cat <<EOF
 
   [non-disagg] decoder TP8 = $NONDISAGG_DECODER_DEVICES  |  visual = $NONDISAGG_VISUAL_DEVICE
                port = $NONDISAGG_PORT
-  [disagg]     producers = $NUM_PRODUCERS on $DISAGG_PRODUCER_BASE_DEVICE..$((DISAGG_PRODUCER_BASE_DEVICE + NUM_PRODUCERS - 1))
-               consumer TP8 = $DISAGG_CONSUMER_DEVICES
+  [disagg]     encoders = $NUM_ENCODERS on $DISAGG_ENCODER_BASE_DEVICE..$((DISAGG_ENCODER_BASE_DEVICE + NUM_ENCODERS - 1))
+               llm TP8 = $DISAGG_LLM_DEVICES
                proxy = $DISAGG_PROXY_PORT
 
   Logs + results:   $LOG_PATH

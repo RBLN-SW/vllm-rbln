@@ -2,13 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2025 Rebellions Inc. All rights reserved.
 #
-# Start EC disaggregation consumer using RblnECNixlPushConnector.
+# Start EC disaggregation llm using RblnECNixlConnector.
 #
 # Usage:
-#   bash serve_ec_push_consumer.sh
+#   bash serve_ec_llm.sh
 #
-# The consumer binds a ZMQ PULL socket and receives NIXL metadata
-# directly from producers. Start this BEFORE the producers.
+# The llm binds a ZMQ PULL socket and receives NIXL metadata
+# directly from encoders. Start this BEFORE the encoders.
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 if [ -f "$REPO_ROOT/.venv/bin/activate" ]; then
@@ -18,19 +18,19 @@ fi
 MODEL_ID="${1:-Qwen3-VL-8B-Instruct}"
 PORT="${2:-9100}"
 
-# ZMQ PULL bind address (producers connect here)
+# ZMQ PULL bind address (encoders connect here)
 PULL_HOST="${PULL_HOST:-0.0.0.0}"
 PULL_PORT="${PULL_PORT:-16100}"
 
-# Consumer devices
-CONSUMER_DEVICES="${CONSUMER_DEVICES:-22,23,24,25,26,27,28,29}"
+# LLM devices
+LLM_DEVICES="${LLM_DEVICES:-22,23,24,25,26,27,28,29}"
 
-export RBLN_DEVICES=$CONSUMER_DEVICES
+export RBLN_DEVICES=$LLM_DEVICES
 exec vllm serve "$MODEL_ID" \
     --port "$PORT" \
     --mm-processor-kwargs '{"max_pixels": 802816}' \
     --ec-transfer-config "{
-        \"ec_connector\": \"RblnECNixlPushConnector\",
+        \"ec_connector\": \"RblnECNixlConnector\",
         \"ec_role\": \"ec_consumer\",
         \"ec_buffer_device\": \"cpu\",
         \"ec_connector_extra_config\": {

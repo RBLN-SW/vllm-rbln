@@ -20,16 +20,16 @@ EC Disaggregated Encoder Proxy
 Proxy that routes OpenAI-compatible "/v1/chat/completions" requests to two
 clusters for EC (Encoder Cache) disaggregation:
 
-  * encode  (producer — runs the visual encoder, caches via NIXL)
-  * decode  (consumer — pulls encoder cache via NIXL, runs LLM)
+  * encode  (encoder — runs the visual encoder, caches via NIXL)
+  * decode  (llm — pulls encoder cache via NIXL, runs LLM)
 
 For multimodal input we:
     1. Extract *every* image/audio item from the request.
     2. Fire N concurrent requests to the encoder cluster
        (one request per MM item, with **all text removed**).
     3. Wait for all of them to succeed (encoder caches are now available
-       via NIXL on the producer side).
-    4. Forward the *original* request to a decode server (consumer pulls
+       via NIXL on the encoder side).
+    4. Forward the *original* request to a decode server (llm pulls
        the encoder cache via NIXL and runs prefill + decode).
 
 This is the E+PD mode of disagg_epd_proxy.py, simplified for EC
@@ -75,7 +75,7 @@ decode_session: aiohttp.ClientSession | None = None
 # Monotonic counter used to round-robin encoder targets across chat
 # requests. Without this, every request starts its MM-item index at 0
 # and always hits e_urls[0], serialising all encodes on a single
-# producer.
+# encoder.
 _encode_rr_counter: int = 0
 
 ###############################################################################
@@ -127,7 +127,7 @@ async def fanout_encoder_primer(
 
     # Round-robin over encode servers, advancing a *global* counter so
     # that concurrent chat requests with a single MM item still spread
-    # across producers.
+    # across encoders.
     global _encode_rr_counter
     start = _encode_rr_counter
     _encode_rr_counter = (start + len(mm_items)) % max(len(e_urls), 1)
@@ -274,7 +274,7 @@ async def forward_non_stream(
         await fanout_encoder_primer(req_data, e_urls, req_id)
 
         # Step 2: Forward original request to decode cluster
-        # (consumer pulls encoder cache via NIXL)
+        # (llm pulls encoder cache via NIXL)
         logger.info("[%s] Forwarding to decode: %s", req_id, d_url)
         headers = {"x-request-id": req_id}
 
@@ -489,13 +489,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--encode-servers-urls",
         required=True,
-        help='Comma-separated encode (producer) URLs '
+        help='Comma-separated encode (encoder) URLs '
              '("http://127.0.0.1:8000,http://127.0.0.1:8001")',
     )
     parser.add_argument(
         "--decode-servers-urls",
         required=True,
-        help='Comma-separated decode (consumer) URLs '
+        help='Comma-separated decode (llm) URLs '
              '("http://127.0.0.1:9000")',
     )
 
@@ -508,8 +508,8 @@ if __name__ == "__main__":
     ]
 
     logger.info("EC Proxy listening on %s:%s", args.host, args.port)
-    logger.info("Encode servers (producers): %s", app.state.e_urls)
-    logger.info("Decode servers (consumers): %s", app.state.d_urls)
+    logger.info("Encode servers (encoders): %s", app.state.e_urls)
+    logger.info("Decode servers (llms): %s", app.state.d_urls)
 
     uvicorn.run(
         app,

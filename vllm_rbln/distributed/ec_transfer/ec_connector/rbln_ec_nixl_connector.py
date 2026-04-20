@@ -13,72 +13,72 @@
 # limitations under the License.
 
 """
-RblnECNixlPushConnector: NIXL data transfer + ZMQ PUSH/PULL notification.
+RblnECNixlConnector: NIXL data transfer + ZMQ PUSH/PULL notification.
 
 Architecture
 ------------
 Uses NIXL for CPU-to-CPU tensor data transfer, with direct ZMQ PUSH/PULL
-for metadata notification — producer pushes NIXL agent metadata and tensor
-registry entries straight to the consumer's PULL socket, so the consumer
+for metadata notification — encoder pushes NIXL agent metadata and tensor
+registry entries straight to the llm's PULL socket, so the llm
 can initiate the NIXL pull as soon as the encoder finishes.
 
-  Producer  -> runs the vision encoder
+  Encoder  -> runs the vision encoder
             -> registers encoder output tensors with NIXL
             -> pushes NIXL metadata (agent_metadata + tensor addresses)
-               directly to consumer via ZMQ PUSH
+               directly to llm via ZMQ PUSH
 
-  Consumer  -> binds a ZMQ PULL socket at init (fan-in from N producers)
+  LLM  -> binds a ZMQ PULL socket at init (fan-in from N encoders)
             -> background thread receives metadata, queues it
             -> main thread drains queue, registers NIXL remote agent,
                initiates NIXL pull to fetch actual tensor data
 
 Transfer flow per request
 -------------------------
-  1. Client sends the same request to both producer and consumer
-  2. Producer encodes image -> encoder outputs ready
-  3. Producer registers tensors with NIXL, gets agent_metadata
-  4. Producer pushes metadata via ZMQ PUSH to consumer
-  5. Consumer background PULL thread receives, queues metadata, sets event
-  6. Consumer main thread: drains queue, add_remote_agent, initiates NIXL pull
+  1. Client sends the same request to both encoder and llm
+  2. Encoder encodes image -> encoder outputs ready
+  3. Encoder registers tensors with NIXL, gets agent_metadata
+  4. Encoder pushes metadata via ZMQ PUSH to llm
+  5. LLM background PULL thread receives, queues metadata, sets event
+  6. LLM main thread: drains queue, add_remote_agent, initiates NIXL pull
   7. NIXL transfers tensor data (CPU -> CPU)
-  8. Consumer populates encoder_cache, runs prefill + decode
+  8. LLM populates encoder_cache, runs prefill + decode
 
 Design decisions
 ----------------
-- ZMQ PUSH/PULL for metadata notification: direct push from producer to
-  consumer with zero polling.  N:1 fan-in is natively supported.
+- ZMQ PUSH/PULL for metadata notification: direct push from encoder to
+  llm with zero polling.  N:1 fan-in is natively supported.
 - NIXL for data transfer: efficient CPU memory transfer for large tensors
   via UCX backend.  Only metadata (~hundreds of bytes) flows over ZMQ;
   tensor data (~45 MB) flows over NIXL.
-- Event-based waiting: consumer waits on threading.Event per mm_hash,
+- Event-based waiting: llm waits on threading.Event per mm_hash,
   near-zero latency once metadata arrives.
 - No ROUTER fallback needed: PUSH/PULL is reliable (ZMQ buffers messages
-  until the consumer connects, unlike PUB which drops).
+  until the llm connects, unlike PUB which drops).
 
 Port layout
 -----------
-  Consumer binds on a single port:
-    - pull_port: ZMQ PULL (receives NIXL metadata from all producers)
+  LLM binds on a single port:
+    - pull_port: ZMQ PULL (receives NIXL metadata from all encoders)
 
-  Each producer connects to the consumer's PULL port via ZMQ PUSH.
+  Each encoder connects to the llm's PULL port via ZMQ PUSH.
 
 Configuration example
 ---------------------
-  # Producer:
+  # Encoder:
   ECTransferConfig(
-      ec_connector="RblnECNixlPushConnector",
+      ec_connector="RblnECNixlConnector",
       ec_role="ec_producer",
       ec_buffer_device="cpu",
       ec_connector_extra_config={
-          "consumer_host": "127.0.0.1",
-          "consumer_pull_port": 16100,
+          "llm_host": "127.0.0.1",
+          "llm_pull_port": 16100,
           "backends": ["UCX"],
       },
   )
 
-  # Consumer:
+  # LLM:
   ECTransferConfig(
-      ec_connector="RblnECNixlPushConnector",
+      ec_connector="RblnECNixlConnector",
       ec_role="ec_consumer",
       ec_buffer_device="cpu",
       ec_connector_extra_config={
@@ -124,7 +124,7 @@ logger = init_logger(__name__)
 
 _DEFAULT_PULL_HOST = "0.0.0.0"
 _DEFAULT_PULL_PORT = 16100
-_DEFAULT_CONSUMER_HOST = "127.0.0.1"
+_DEFAULT_LLM_HOST = "127.0.0.1"
 _CACHE_WAIT_TIMEOUT_S = 30.0
 _XFER_POLL_INTERVAL_S = 0.001
 
@@ -133,8 +133,8 @@ _XFER_POLL_INTERVAL_S = 0.001
 # ---------------------------------------------------------------------------
 
 
-class ECNixlPushTensorInfo(msgspec.Struct):
-    """Per-tensor metadata sent from producer to consumer."""
+class ECNixlTensorInfo(msgspec.Struct):
+    """Per-tensor metadata sent from encoder to llm."""
     key: str
     base_addr: int
     nbytes: int
@@ -143,18 +143,18 @@ class ECNixlPushTensorInfo(msgspec.Struct):
     dtype_str: str
 
 
-class ECNixlPushMetadata(msgspec.Struct):
-    """Metadata pushed from producer to consumer via ZMQ.
+class ECNixlMetadata(msgspec.Struct):
+    """Metadata pushed from encoder to llm via ZMQ.
 
-    Contains everything the consumer needs to register the remote NIXL
+    Contains everything the llm needs to register the remote NIXL
     agent and initiate a pull for this mm_hash.
     """
     engine_id: str
     mm_hash: str
     agent_metadata: bytes
-    tensors: list[ECNixlPushTensorInfo]
+    tensors: list[ECNixlTensorInfo]
     # Non-tensor values (e.g. second_per_grid_ts) serialised as
-    # {key: value} — consumer restores these alongside pulled tensors.
+    # {key: value} — llm restores these alongside pulled tensors.
     non_tensor_data: dict = {}
 
 
@@ -164,7 +164,7 @@ class ECNixlPushMetadata(msgspec.Struct):
 
 
 @dataclass
-class ECNixlPushConnectorMetadata(ECConnectorMetadata):
+class ECNixlConnectorMetadata(ECConnectorMetadata):
     """Metadata passed from scheduler to worker each step."""
     mm_datas_to_load: list[MMMeta] = field(default_factory=list)
 
@@ -174,8 +174,8 @@ class ECNixlPushConnectorMetadata(ECConnectorMetadata):
 # ---------------------------------------------------------------------------
 
 
-class RblnECNixlPushConnectorScheduler(ECConnectorBase):
-    """Scheduler-side: tracks which mm_hashes the consumer needs to load."""
+class RblnECNixlConnectorScheduler(ECConnectorBase):
+    """Scheduler-side: tracks which mm_hashes the llm needs to load."""
 
     def __init__(self, vllm_config: VllmConfig, role: ECConnectorRole):
         super().__init__(vllm_config=vllm_config, role=role)
@@ -193,8 +193,8 @@ class RblnECNixlPushConnectorScheduler(ECConnectorBase):
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
-    ) -> ECNixlPushConnectorMetadata:
-        meta = ECNixlPushConnectorMetadata()
+    ) -> ECNixlConnectorMetadata:
+        meta = ECNixlConnectorMetadata()
         for mm_hash, num_tokens in self._mm_datas_need_loads.items():
             meta.mm_datas_to_load.append(
                 MMMeta.make_meta(mm_hash, num_tokens)
@@ -216,17 +216,17 @@ class RblnECNixlPushConnectorScheduler(ECConnectorBase):
 # ---------------------------------------------------------------------------
 
 
-class RblnECNixlPushConnectorWorker(ECConnectorBase):
+class RblnECNixlConnectorWorker(ECConnectorBase):
     """Worker-side EC connector: NIXL data transfer + ZMQ PUSH/PULL metadata.
 
-    Producer:
+    Encoder:
       - Creates NIXL agent and ZMQ PUSH socket at init.
       - On save_caches(): registers tensors with NIXL, pushes metadata
-        via ZMQ directly to consumer.
+        via ZMQ directly to llm.
 
-    Consumer:
+    LLM:
       - Creates NIXL agent and binds ZMQ PULL socket at init.
-      - Background thread receives metadata from all producers into a queue.
+      - Background thread receives metadata from all encoders into a queue.
       - Main thread drains queue, registers NIXL remote agents, and
         initiates NIXL pulls.
     """
@@ -239,7 +239,7 @@ class RblnECNixlPushConnectorWorker(ECConnectorBase):
         except ImportError as e:
             raise RuntimeError(
                 "NIXL is not available. Install the nixl package to use "
-                "RblnECNixlPushConnector."
+                "RblnECNixlConnector."
             ) from e
 
         ec_cfg = vllm_config.ec_transfer_config
@@ -252,22 +252,22 @@ class RblnECNixlPushConnectorWorker(ECConnectorBase):
         self._nixl_agent = NixlAgent(self._engine_id, None)
         self._stop_event = threading.Event()
 
-        # -- Producer state --
+        # -- Encoder state --
         # mm_hash -> dict[key, aligned CPU tensor]
         self._registered_caches: dict[str, dict[str, torch.Tensor]] = {}
         # mm_hash -> NIXL descriptor (for deregistration)
         self._registered_descs: dict[str, Any] = {}
 
-        # -- Consumer state --
+        # -- LLM state --
         # Incoming metadata queue (filled by background PULL thread)
-        self._incoming_metadata: queue.Queue[ECNixlPushMetadata] = queue.Queue()
+        self._incoming_metadata: queue.Queue[ECNixlMetadata] = queue.Queue()
         # Per-mm_hash event for waiters
         self._cache_events: dict[str, threading.Event] = {}
         self._cache_events_lock = threading.Lock()
         # engine_id -> remote NIXL agent name
         self._remote_agents: dict[str, str] = {}
-        # mm_hash -> (engine_id, list[ECNixlPushTensorInfo])
-        self._tensor_registry: dict[str, tuple[str, list[ECNixlPushTensorInfo]]] = {}
+        # mm_hash -> (engine_id, list[ECNixlTensorInfo])
+        self._tensor_registry: dict[str, tuple[str, list[ECNixlTensorInfo]]] = {}
         # mm_hash -> non-tensor data dict
         self._non_tensor_registry: dict[str, dict] = {}
         # Pending async NIXL transfers: mm_hash -> (handle, local_bufs, local_descs)
@@ -275,20 +275,20 @@ class RblnECNixlPushConnectorWorker(ECConnectorBase):
         self._encoder_cache: dict[str, Any] | None = None
 
         if self.is_producer:
-            consumer_host: str = ec_cfg.get_from_extra_config(
-                "consumer_host", _DEFAULT_CONSUMER_HOST
+            llm_host: str = ec_cfg.get_from_extra_config(
+                "llm_host", _DEFAULT_LLM_HOST
             )
-            consumer_pull_port: int = ec_cfg.get_from_extra_config(
-                "consumer_pull_port", _DEFAULT_PULL_PORT
+            llm_pull_port: int = ec_cfg.get_from_extra_config(
+                "llm_pull_port", _DEFAULT_PULL_PORT
             )
-            self._push_addr = f"tcp://{consumer_host}:{consumer_pull_port}"
+            self._push_addr = f"tcp://{llm_host}:{llm_pull_port}"
             self._zmq_ctx = zmq.Context()
             self._push_sock = self._zmq_ctx.socket(zmq.PUSH)
             self._push_sock.setsockopt(zmq.SNDHWM, 64)
             self._push_sock.setsockopt(zmq.LINGER, 5000)
             self._push_sock.connect(self._push_addr)
             logger.info(
-                "RblnECNixlPushConnector (producer): PUSH connected to %s",
+                "RblnECNixlConnector (encoder): PUSH connected to %s",
                 self._push_addr,
             )
 
@@ -312,19 +312,19 @@ class RblnECNixlPushConnectorWorker(ECConnectorBase):
             )
             self._receiver_thread.start()
             logger.info(
-                "RblnECNixlPushConnector (consumer): PULL bound on %s",
+                "RblnECNixlConnector (llm): PULL bound on %s",
                 self._pull_addr,
             )
 
     # ------------------------------------------------------------------
-    # Consumer: background PULL receiver
+    # LLM: background PULL receiver
     # ------------------------------------------------------------------
 
     def _receiver_loop(self) -> None:
-        """Background thread: receive NIXL metadata from all producers."""
+        """Background thread: receive NIXL metadata from all encoders."""
         poller = zmq.Poller()
         poller.register(self._pull_sock, zmq.POLLIN)
-        decoder = msgspec.msgpack.Decoder(ECNixlPushMetadata)
+        decoder = msgspec.msgpack.Decoder(ECNixlMetadata)
 
         while not self._stop_event.is_set():
             events = dict(poller.poll(200))
@@ -346,13 +346,13 @@ class RblnECNixlPushConnectorWorker(ECConnectorBase):
                         evt.set()
 
                 logger.debug(
-                    "EC NixlPush: received metadata for mm_hash=%s "
+                    "EC Nixl: received metadata for mm_hash=%s "
                     "from engine=%s (%d tensors)",
                     meta.mm_hash, meta.engine_id, len(meta.tensors),
                 )
             except Exception as exc:
                 logger.warning(
-                    "EC NixlPush: failed to decode received metadata: %s", exc
+                    "EC Nixl: failed to decode received metadata: %s", exc
                 )
 
     def _process_pending_metadata(self) -> set[str]:
@@ -372,7 +372,7 @@ class RblnECNixlPushConnectorWorker(ECConnectorBase):
             engine_id = meta.engine_id
             mm_hash = meta.mm_hash
 
-            # Register or update remote NIXL agent for this producer
+            # Register or update remote NIXL agent for this encoder
             if engine_id in self._remote_agents:
                 self._nixl_agent.remove_remote_agent(
                     self._remote_agents[engine_id]
@@ -388,7 +388,7 @@ class RblnECNixlPushConnectorWorker(ECConnectorBase):
             new_mm_hashes.add(mm_hash)
 
             logger.debug(
-                "EC NixlPush: registered remote agent for engine=%s, "
+                "EC Nixl: registered remote agent for engine=%s, "
                 "mm_hash=%s",
                 engine_id, mm_hash,
             )
@@ -425,13 +425,13 @@ class RblnECNixlPushConnectorWorker(ECConnectorBase):
             self._process_pending_metadata()
             if mm_hash in self._tensor_registry:
                 logger.debug(
-                    "EC NixlPush: mm_hash=%s discovered via PUSH notification",
+                    "EC Nixl: mm_hash=%s discovered via PUSH notification",
                     mm_hash,
                 )
                 return True
 
         logger.warning(
-            "EC NixlPush: timed out waiting for mm_hash=%s (%.1fs)",
+            "EC Nixl: timed out waiting for mm_hash=%s (%.1fs)",
             mm_hash, _CACHE_WAIT_TIMEOUT_S,
         )
         return False
@@ -478,7 +478,7 @@ class RblnECNixlPushConnectorWorker(ECConnectorBase):
             remote_agent_name, remote_xfer_data, "DRAM"
         )
 
-        # Initiate async READ (consumer pulls from producer)
+        # Initiate async READ (llm pulls from encoder)
         indices = list(range(num_descs))
         handle = self._nixl_agent.make_prepped_xfer(
             "READ", local_prepped, indices, remote_prepped, indices,
@@ -487,7 +487,7 @@ class RblnECNixlPushConnectorWorker(ECConnectorBase):
         status = self._nixl_agent.transfer(handle)
         if status not in ("DONE", "PROC"):
             raise RuntimeError(
-                f"EC NixlPush: transfer initiation failed for "
+                f"EC Nixl: transfer initiation failed for "
                 f"mm_hash={mm_hash}"
             )
 
@@ -503,7 +503,7 @@ class RblnECNixlPushConnectorWorker(ECConnectorBase):
         mm_hash: str,
         **kwargs,
     ) -> None:
-        """Producer: register tensors with NIXL, push metadata to consumer."""
+        """Encoder: register tensors with NIXL, push metadata to llm."""
         if not self.is_producer:
             return
         if mm_hash in self._registered_caches:
@@ -516,7 +516,7 @@ class RblnECNixlPushConnectorWorker(ECConnectorBase):
         # Allocate aligned CPU tensors and register with NIXL
         aligned: dict[str, Any] = {}
         caches_data: list[tuple[int, int, int, str]] = []
-        tensor_infos: list[ECNixlPushTensorInfo] = []
+        tensor_infos: list[ECNixlTensorInfo] = []
         non_tensor_data: dict = {}
 
         def _register_tensor(key: str, tensor: torch.Tensor) -> None:
@@ -526,7 +526,7 @@ class RblnECNixlPushConnectorWorker(ECConnectorBase):
             aligned[key] = buf
             nbytes = buf.numel() * buf.element_size()
             caches_data.append((buf.data_ptr(), nbytes, 0, ""))
-            tensor_infos.append(ECNixlPushTensorInfo(
+            tensor_infos.append(ECNixlTensorInfo(
                 key=key,
                 base_addr=buf.data_ptr(),
                 nbytes=nbytes,
@@ -555,7 +555,7 @@ class RblnECNixlPushConnectorWorker(ECConnectorBase):
 
         if not caches_data:
             logger.warning(
-                "EC NixlPush: no tensors to register for mm_hash=%s "
+                "EC Nixl: no tensors to register for mm_hash=%s "
                 "(all values are non-tensor)", mm_hash,
             )
             return
@@ -566,8 +566,8 @@ class RblnECNixlPushConnectorWorker(ECConnectorBase):
         self._registered_caches[mm_hash] = aligned
         self._registered_descs[mm_hash] = descs
 
-        # Push metadata to consumer via ZMQ
-        push_meta = ECNixlPushMetadata(
+        # Push metadata to llm via ZMQ
+        push_meta = ECNixlMetadata(
             engine_id=self._engine_id,
             mm_hash=mm_hash,
             agent_metadata=self._nixl_agent.get_agent_metadata(),
@@ -578,7 +578,7 @@ class RblnECNixlPushConnectorWorker(ECConnectorBase):
         self._push_sock.send(encoded)
 
         logger.debug(
-            "EC NixlPush: registered + pushed mm_hash=%s (%d tensors)",
+            "EC Nixl: registered + pushed mm_hash=%s (%d tensors)",
             mm_hash, len(tensor_infos),
         )
 
@@ -588,15 +588,15 @@ class RblnECNixlPushConnectorWorker(ECConnectorBase):
         blocking: bool = True,
         **kwargs,
     ) -> None:
-        """Consumer: drain metadata queue and initiate NIXL pulls."""
+        """LLM: drain metadata queue and initiate NIXL pulls."""
         if self.is_producer:
             return
 
         self._encoder_cache = encoder_cache
         metadata = self._get_connector_metadata()
-        assert isinstance(metadata, ECNixlPushConnectorMetadata)
+        assert isinstance(metadata, ECNixlConnectorMetadata)
 
-        # Process any pending metadata from producers
+        # Process any pending metadata from encoders
         self._process_pending_metadata()
 
         for mm_data in metadata.mm_datas_to_load:
@@ -611,14 +611,14 @@ class RblnECNixlPushConnectorWorker(ECConnectorBase):
             if mm_hash not in self._tensor_registry:
                 if not self._wait_for_cache(mm_hash):
                     logger.error(
-                        "EC NixlPush: mm_hash=%s not available after timeout",
+                        "EC Nixl: mm_hash=%s not available after timeout",
                         mm_hash,
                     )
                     continue
 
             handle, local_bufs, local_descs = self._initiate_pull(mm_hash)
             self._pending_loads[mm_hash] = (handle, local_bufs, local_descs)
-            logger.debug("EC NixlPush: initiated pull for mm_hash=%s", mm_hash)
+            logger.debug("EC Nixl: initiated pull for mm_hash=%s", mm_hash)
 
         if self._pending_loads and blocking:
             self._wait_for_pulls(encoder_cache)
@@ -639,11 +639,11 @@ class RblnECNixlPushConnectorWorker(ECConnectorBase):
                     self._nixl_agent.release_xfer_handle(handle)
                     del self._pending_loads[mm_hash]
                     logger.debug(
-                        "EC NixlPush: pull complete for mm_hash=%s", mm_hash
+                        "EC Nixl: pull complete for mm_hash=%s", mm_hash
                     )
                 elif status not in ("DONE", "PROC"):
                     logger.error(
-                        "EC NixlPush: transfer failed for mm_hash=%s", mm_hash
+                        "EC Nixl: transfer failed for mm_hash=%s", mm_hash
                     )
                     self._nixl_agent.release_xfer_handle(handle)
                     del self._pending_loads[mm_hash]
@@ -652,7 +652,7 @@ class RblnECNixlPushConnectorWorker(ECConnectorBase):
 
         if self._pending_loads:
             logger.warning(
-                "EC NixlPush: %d pulls did not complete within timeout",
+                "EC Nixl: %d pulls did not complete within timeout",
                 len(self._pending_loads),
             )
             for mm_hash, (handle, _, _) in list(self._pending_loads.items()):
@@ -685,11 +685,11 @@ class RblnECNixlPushConnectorWorker(ECConnectorBase):
                 del self._pending_loads[mm_hash]
                 completed.add(mm_hash)
                 logger.debug(
-                    "EC NixlPush: pull complete for mm_hash=%s", mm_hash
+                    "EC Nixl: pull complete for mm_hash=%s", mm_hash
                 )
             elif status not in ("DONE", "PROC"):
                 logger.error(
-                    "EC NixlPush: transfer failed for mm_hash=%s", mm_hash
+                    "EC Nixl: transfer failed for mm_hash=%s", mm_hash
                 )
                 self._nixl_agent.release_xfer_handle(handle)
                 del self._pending_loads[mm_hash]
@@ -699,7 +699,7 @@ class RblnECNixlPushConnectorWorker(ECConnectorBase):
     def request_finished(
         self, request: "Request"
     ) -> tuple[bool, dict[str, Any] | None]:
-        """Deregister NIXL memory for completed requests (producer only)."""
+        """Deregister NIXL memory for completed requests (encoder only)."""
         if self.is_producer:
             for feature in request.mm_features:
                 mm_hash = feature.identifier
@@ -710,7 +710,7 @@ class RblnECNixlPushConnectorWorker(ECConnectorBase):
                         )
                     except Exception as exc:
                         logger.warning(
-                            "EC NixlPush: failed to deregister mm_hash=%s: %s",
+                            "EC Nixl: failed to deregister mm_hash=%s: %s",
                             mm_hash, exc,
                         )
                     self._registered_caches.pop(mm_hash, None)
@@ -721,8 +721,8 @@ class RblnECNixlPushConnectorWorker(ECConnectorBase):
                 with self._cache_events_lock:
                     self._cache_events.pop(mm_hash, None)
                 self._tensor_registry.pop(mm_hash, None)
-                # Deregister local consumer buffers
-                desc_key = f"_consumer_{mm_hash}"
+                # Deregister local llm buffers
+                desc_key = f"_llm_{mm_hash}"
                 if desc_key in self._registered_descs:
                     try:
                         self._nixl_agent.deregister_memory(
@@ -757,22 +757,22 @@ class RblnECNixlPushConnectorWorker(ECConnectorBase):
 # ---------------------------------------------------------------------------
 
 
-class RblnECNixlPushConnector(ECConnectorBase):
+class RblnECNixlConnector(ECConnectorBase):
     """Entry point registered with ECConnectorFactory."""
 
     def __init__(self, vllm_config: VllmConfig, role: ECConnectorRole):
         super().__init__(vllm_config=vllm_config, role=role)
 
         if role == ECConnectorRole.SCHEDULER:
-            self._impl: ECConnectorBase = RblnECNixlPushConnectorScheduler(
+            self._impl: ECConnectorBase = RblnECNixlConnectorScheduler(
                 vllm_config, role
             )
         elif role == ECConnectorRole.WORKER:
-            self._impl = RblnECNixlPushConnectorWorker(vllm_config, role)
+            self._impl = RblnECNixlConnectorWorker(vllm_config, role)
         else:
             raise ValueError(f"Unknown ECConnectorRole: {role}")
 
-        logger.info("RblnECNixlPushConnector created (role=%s)", role.name)
+        logger.info("RblnECNixlConnector created (role=%s)", role.name)
 
     def has_cache_item(self, identifier: str) -> bool:
         return self._impl.has_cache_item(identifier)

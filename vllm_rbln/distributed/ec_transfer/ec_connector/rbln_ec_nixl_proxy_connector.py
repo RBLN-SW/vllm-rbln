@@ -17,51 +17,51 @@ RblnECNixlProxyConnector: Proxy-mediated NIXL EC connector for N:M topology.
 
 Architecture
 ------------
-Supports N producers and M consumers via a proxy that routes NIXL metadata.
+Supports N encoders and M llms via a proxy that routes NIXL metadata.
 Actual tensor data is transferred via NIXL (CPU-to-CPU); only lightweight
 metadata (~hundreds of bytes) flows through the proxy.
 
-  Producer  -> runs the vision encoder
+  Encoder  -> runs the vision encoder
             -> registers encoder output tensors with NIXL
             -> returns NIXL metadata via request_finished() → HTTP response
 
-  Proxy     -> receives NIXL metadata from producer HTTP response
-            -> selects a consumer (random / round-robin / etc.)
-            -> deposits metadata to the chosen consumer's ZMQ PULL socket
+  Proxy     -> receives NIXL metadata from encoder HTTP response
+            -> selects a llm (random / round-robin / etc.)
+            -> deposits metadata to the chosen llm's ZMQ PULL socket
 
-  Consumer  -> binds a ZMQ PULL socket (receives metadata deposits from proxy)
+  LLM  -> binds a ZMQ PULL socket (receives metadata deposits from proxy)
             -> background thread queues incoming metadata
             -> main thread: add_remote_agent, initiates NIXL pull
 
 Transfer flow per request
 -------------------------
-  1. Proxy sends encode request to Producer P_i
-  2. Producer encodes image, registers tensors with NIXL
-  3. Producer returns HTTP response containing ec_transfer_params
+  1. Proxy sends encode request to Encoder P_i
+  2. Encoder encodes image, registers tensors with NIXL
+  3. Encoder returns HTTP response containing ec_transfer_params
      (serialised NIXL metadata: agent_metadata + tensor addresses)
-  4. Proxy extracts ec_transfer_params, selects Consumer C_j
-  5. Proxy sends original request to Consumer C_j (HTTP)
-  6. Proxy pushes NIXL metadata to Consumer C_j's PULL socket (ZMQ)
-  7. Consumer background PULL thread receives metadata, queues it
-  8. Consumer main thread: drains queue, add_remote_agent, NIXL pull
+  4. Proxy extracts ec_transfer_params, selects LLM C_j
+  5. Proxy sends original request to LLM C_j (HTTP)
+  6. Proxy pushes NIXL metadata to LLM C_j's PULL socket (ZMQ)
+  7. LLM background PULL thread receives metadata, queues it
+  8. LLM main thread: drains queue, add_remote_agent, NIXL pull
   9. NIXL transfers tensor data (CPU -> CPU)
-  10. Consumer runs prefill + decode
+  10. LLM runs prefill + decode
 
 Comparison with other connectors
 ---------------------------------
-  RblnECNixlPushConnector:  ZMQ PUSH/PULL direct, NIXL data   (N:1, ~0ms)
+  RblnECNixlConnector:  ZMQ PUSH/PULL direct, NIXL data   (N:1, ~0ms)
   RblnECNixlProxyConnector: Proxy-routed metadata, NIXL data  (N:M, ~3-15ms)
 
 Port layout
 -----------
-  Each consumer binds:
+  Each llm binds:
     - pull_port: ZMQ PULL (receives NIXL metadata deposits from proxy)
 
-  Producer has no ZMQ sockets (metadata returned via HTTP).
+  Encoder has no ZMQ sockets (metadata returned via HTTP).
 
 Configuration example
 ---------------------
-  # Producer (no ZMQ config needed):
+  # Encoder (no ZMQ config needed):
   ECTransferConfig(
       ec_connector="RblnECNixlProxyConnector",
       ec_role="ec_producer",
@@ -71,7 +71,7 @@ Configuration example
       },
   )
 
-  # Consumer (binds PULL port for metadata deposits):
+  # LLM (binds PULL port for metadata deposits):
   ECTransferConfig(
       ec_connector="RblnECNixlProxyConnector",
       ec_role="ec_consumer",
@@ -86,26 +86,26 @@ Configuration example
 Proxy integration
 -----------------
   The proxy must:
-    1. Extract ``ec_transfer_params`` from the producer's HTTP response.
-    2. Create a ZMQ PUSH socket connected to the chosen consumer's PULL port.
+    1. Extract ``ec_transfer_params`` from the encoder's HTTP response.
+    2. Create a ZMQ PUSH socket connected to the chosen llm's PULL port.
     3. Forward the raw bytes from ``ec_transfer_params`` via zmq.send().
 
   The ``ec_transfer_params`` value is a msgpack-encoded ``ECNixlProxyMetadata``
-  struct that the consumer connector knows how to decode.  The proxy does NOT
+  struct that the llm connector knows how to decode.  The proxy does NOT
   need to parse it — just forward the opaque bytes.
 
   Example proxy pseudocode::
 
-      # After receiving producer response:
-      ec_params = producer_response["ec_transfer_params"]
+      # After receiving encoder response:
+      ec_params = encoder_response["ec_transfer_params"]
 
-      # Select consumer and forward:
-      consumer = random.choice(consumers)
-      push_sock = get_push_socket(consumer)  # cached per consumer
+      # Select llm and forward:
+      llm = random.choice(llms)
+      push_sock = get_push_socket(llm)  # cached per llm
       push_sock.send(ec_params)              # forward opaque bytes
 
-      # Send request to consumer via HTTP as usual:
-      consumer.submit(request)
+      # Send request to llm via HTTP as usual:
+      llm.submit(request)
 """
 
 from __future__ import annotations
@@ -165,9 +165,9 @@ class ECNixlProxyMetadata(msgspec.Struct):
     """NIXL metadata produced by the encoder, forwarded by the proxy.
 
     This struct is:
-      - Serialised by the producer and returned as ``ec_transfer_params``
+      - Serialised by the encoder and returned as ``ec_transfer_params``
       - Forwarded as opaque bytes by the proxy
-      - Deserialised by the consumer to initiate NIXL pull
+      - Deserialised by the llm to initiate NIXL pull
     """
     engine_id: str
     mm_hash: str
@@ -192,7 +192,7 @@ class ECNixlProxyConnectorMetadata(ECConnectorMetadata):
 
 
 class RblnECNixlProxyConnectorScheduler(ECConnectorBase):
-    """Scheduler-side: tracks which mm_hashes the consumer needs to load."""
+    """Scheduler-side: tracks which mm_hashes the llm needs to load."""
 
     def __init__(self, vllm_config: VllmConfig, role: ECConnectorRole):
         super().__init__(vllm_config=vllm_config, role=role)
@@ -236,13 +236,13 @@ class RblnECNixlProxyConnectorScheduler(ECConnectorBase):
 class RblnECNixlProxyConnectorWorker(ECConnectorBase):
     """Worker-side EC connector for proxy-mediated N:M topology.
 
-    Producer:
+    Encoder:
       - Registers tensors with NIXL on save_caches().
       - Stores serialised metadata per mm_hash.
       - Returns metadata via request_finished() for the proxy to forward.
       - No ZMQ sockets.
 
-    Consumer:
+    LLM:
       - Binds a ZMQ PULL socket for metadata deposits from the proxy.
       - Background thread receives deposits, queues them.
       - Main thread drains queue, registers NIXL agents, initiates pulls.
@@ -270,13 +270,13 @@ class RblnECNixlProxyConnectorWorker(ECConnectorBase):
         self._stop_event = threading.Event()
         self._encoder = msgspec.msgpack.Encoder()
 
-        # -- Producer state --
+        # -- Encoder state --
         self._registered_caches: dict[str, dict[str, torch.Tensor]] = {}
         self._registered_descs: dict[str, Any] = {}
         # mm_hash -> serialised ECNixlProxyMetadata bytes (for HTTP response)
         self._pending_ec_params: dict[str, bytes] = {}
 
-        # -- Consumer state --
+        # -- LLM state --
         self._incoming_metadata: queue.Queue[ECNixlProxyMetadata] = queue.Queue()
         self._cache_events: dict[str, threading.Event] = {}
         self._cache_events_lock = threading.Lock()
@@ -309,18 +309,18 @@ class RblnECNixlProxyConnectorWorker(ECConnectorBase):
             )
             self._receiver_thread.start()
             logger.info(
-                "RblnECNixlProxyConnector (consumer): PULL bound on %s",
+                "RblnECNixlProxyConnector (llm): PULL bound on %s",
                 self._pull_addr,
             )
 
         if self.is_producer:
             logger.info(
-                "RblnECNixlProxyConnector (producer): no ZMQ sockets "
+                "RblnECNixlProxyConnector (encoder): no ZMQ sockets "
                 "(metadata returned via ec_transfer_params)"
             )
 
     # ------------------------------------------------------------------
-    # Consumer: background PULL receiver (receives deposits from proxy)
+    # LLM: background PULL receiver (receives deposits from proxy)
     # ------------------------------------------------------------------
 
     def _receiver_loop(self) -> None:
@@ -427,7 +427,7 @@ class RblnECNixlProxyConnectorWorker(ECConnectorBase):
         return False
 
     # ------------------------------------------------------------------
-    # NIXL pull (consumer)
+    # NIXL pull (llm)
     # ------------------------------------------------------------------
 
     def _initiate_pull(
@@ -490,7 +490,7 @@ class RblnECNixlProxyConnectorWorker(ECConnectorBase):
         mm_hash: str,
         **kwargs,
     ) -> None:
-        """Producer: register tensors with NIXL and store metadata.
+        """Encoder: register tensors with NIXL and store metadata.
 
         No ZMQ send — metadata is returned via request_finished() for
         the proxy to pick up and forward.
@@ -556,7 +556,7 @@ class RblnECNixlProxyConnectorWorker(ECConnectorBase):
         blocking: bool = True,
         **kwargs,
     ) -> None:
-        """Consumer: drain metadata queue and initiate NIXL pulls."""
+        """LLM: drain metadata queue and initiate NIXL pulls."""
         if self.is_producer:
             return
 
@@ -657,8 +657,8 @@ class RblnECNixlProxyConnectorWorker(ECConnectorBase):
     def request_finished(
         self, request: "Request",
     ) -> tuple[bool, dict[str, Any] | None]:
-        """Producer: return NIXL metadata for proxy to forward.
-        Consumer: clean up state.
+        """Encoder: return NIXL metadata for proxy to forward.
+        LLM: clean up state.
         """
         if self.is_producer:
             ec_params: dict[str, bytes] = {}
@@ -690,7 +690,7 @@ class RblnECNixlProxyConnectorWorker(ECConnectorBase):
                 with self._cache_events_lock:
                     self._cache_events.pop(mm_hash, None)
                 self._tensor_registry.pop(mm_hash, None)
-                desc_key = f"_consumer_{mm_hash}"
+                desc_key = f"_llm_{mm_hash}"
                 if desc_key in self._registered_descs:
                     try:
                         self._nixl_agent.deregister_memory(
