@@ -471,9 +471,7 @@ class RBLNOptimumQwen3VLForConditionalGeneration(
         # correct per-chunk shape when these slots are None, so forward
         # None through rather than fabricating a misshaped placeholder.
         deepstack_raw = preprocess_outputs[4]
-        deepstack_embeds = (
-            None if deepstack_raw is None else deepstack_raw.squeeze(0)
-        )
+        deepstack_embeds = None if deepstack_raw is None else deepstack_raw.squeeze(0)
         return {
             "inputs_embeds": preprocess_outputs[0],
             "position_embed": preprocess_outputs[1],

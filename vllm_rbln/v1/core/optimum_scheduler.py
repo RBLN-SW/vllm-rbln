@@ -572,9 +572,7 @@ class RBLNOptimumScheduler(Scheduler):
                 ):
                     for i, feature in enumerate(request.mm_features):
                         if self.ec_connector.has_cache_item(feature.identifier):
-                            self.ec_connector.update_state_after_alloc(
-                                request, i
-                            )
+                            self.ec_connector.update_state_after_alloc(request, i)
 
             ec_meta: ECConnectorMetadata = self.ec_connector.build_connector_meta(
                 scheduler_output

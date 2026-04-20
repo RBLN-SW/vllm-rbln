@@ -89,6 +89,7 @@ Configuration example
 
 from __future__ import annotations
 
+import contextlib
 import queue
 import socket
 import threading
@@ -143,6 +144,7 @@ def _probe_tcp(host: str, port: int, timeout: float = _LLM_PROBE_TIMEOUT_S) -> b
             return True
     except OSError:
         return False
+
 
 # ---------------------------------------------------------------------------
 # Wire protocol (msgspec)
@@ -257,7 +259,8 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
             from nixl._api import nixl_agent as NixlAgent
         except ImportError as e:
             raise RuntimeError(
-                "NIXL is not available. Install the nixl package to use RblnECNixlConnector."
+                "NIXL is not available. Install the nixl package to use "
+                "RblnECNixlConnector."
             ) from e
 
         ec_cfg = vllm_config.ec_transfer_config
@@ -370,7 +373,8 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
                         evt.set()
 
                 logger.debug(
-                    "EC Nixl: received metadata for mm_hash=%s from engine=%s (%d tensors)",
+                    "EC Nixl: received metadata for mm_hash=%s from engine=%s "
+                    "(%d tensors)",
                     meta.mm_hash,
                     meta.engine_id,
                     len(meta.tensors),
@@ -581,7 +585,8 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
 
         if not caches_data:
             logger.warning(
-                "EC Nixl: no tensors to register for mm_hash=%s (all values are non-tensor)",
+                "EC Nixl: no tensors to register for mm_hash=%s "
+                "(all values are non-tensor)",
                 mm_hash,
             )
             return
@@ -635,13 +640,14 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
                 continue
 
             # Wait for metadata if not yet received
-            if mm_hash not in self._tensor_registry:
-                if not self._wait_for_cache(mm_hash):
-                    logger.error(
-                        "EC Nixl: mm_hash=%s not available after timeout",
-                        mm_hash,
-                    )
-                    continue
+            if mm_hash not in self._tensor_registry and not self._wait_for_cache(
+                mm_hash
+            ):
+                logger.error(
+                    "EC Nixl: mm_hash=%s not available after timeout",
+                    mm_hash,
+                )
+                continue
 
             handle, local_bufs, local_descs = self._initiate_pull(mm_hash)
             self._pending_loads[mm_hash] = (handle, local_bufs, local_descs)
@@ -740,12 +746,10 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
                 # Deregister local llm buffers
                 desc_key = f"_llm_{mm_hash}"
                 if desc_key in self._registered_descs:
-                    try:
+                    with contextlib.suppress(Exception):
                         self._nixl_agent.deregister_memory(
                             self._registered_descs.pop(desc_key)
                         )
-                    except Exception:
-                        pass
 
         return False, None
 

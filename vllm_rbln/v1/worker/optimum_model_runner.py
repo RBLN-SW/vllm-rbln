@@ -60,7 +60,6 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
     PoolerOutput,
     SamplerOutput,
-    make_empty_encoder_model_runner_output,
 )
 from vllm.v1.sample.logits_processor import build_logitsprocs
 from vllm.v1.sample.sampler import Sampler
@@ -332,19 +331,13 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             #   for _run_decoder_with_cached_encoder).
             # - Decode-only steps: non-blocking — pulls continue in
             #   background while decode batch runs unblocked.
-            is_ec_consumer = (
-                has_ec_transfer() and not get_ec_transfer().is_producer
-            )
+            is_ec_consumer = has_ec_transfer() and not get_ec_transfer().is_producer
             if is_ec_consumer:
                 ec = get_ec_transfer()
                 if scheduler_output.ec_connector_metadata is not None:
-                    ec.bind_connector_metadata(
-                        scheduler_output.ec_connector_metadata
-                    )
+                    ec.bind_connector_metadata(scheduler_output.ec_connector_metadata)
                     has_new_prefill = len(scheduler_output.scheduled_new_reqs) > 0
-                    ec.start_load_caches(
-                        self.encoder_cache, blocking=has_new_prefill
-                    )
+                    ec.start_load_caches(self.encoder_cache, blocking=has_new_prefill)
 
             # Prepare the decoder inputs.
             model_input, num_scheduled_tokens_np = self._prepare_inputs(
@@ -361,11 +354,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             # EC consumer with cached encoder output: run the decoder
             # with pre-computed embeddings instead of the full model
             # forward (which would require the vision encoder runtime).
-            if (
-                is_ec_consumer
-                and model_input.is_prompt
-                and self.encoder_cache
-            ):
+            if is_ec_consumer and model_input.is_prompt and self.encoder_cache:
                 with capture_ctx as model_reports:
                     hidden_states = self._run_decoder_with_cached_encoder(
                         model_input, scheduler_output
@@ -506,9 +495,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                 )
                 # Pass through second_per_grid_ts for Qwen2.5-VL
                 if "second_per_grid_ts" in cached:
-                    video_input["second_per_grid_ts"] = cached[
-                        "second_per_grid_ts"
-                    ]
+                    video_input["second_per_grid_ts"] = cached["second_per_grid_ts"]
 
             # Run preprocess_prefill with pre-computed embeddings.
             # Forward deepstack features when present (Qwen3-VL): the
@@ -1575,9 +1562,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                 prompt_logprobs_dict=prompt_logprobs_dict,
                 pooler_output=[],
                 # kv_connector_output=kv_connector_output,
-                ec_connector_output=ec_out
-                if self.supports_mm_inputs
-                else None,
+                ec_connector_output=ec_out if self.supports_mm_inputs else None,
                 num_nans_in_logits=num_nans_in_logits,
             )
         # FIXME: enable async scheduling

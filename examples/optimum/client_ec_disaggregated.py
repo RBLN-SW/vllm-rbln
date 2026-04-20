@@ -238,12 +238,8 @@ async def on_startup() -> None:
     global encode_session, decode_session
     timeout = aiohttp.ClientTimeout(total=100_000)
     connector = aiohttp.TCPConnector(limit=0, force_close=False)
-    encode_session = aiohttp.ClientSession(
-        timeout=timeout, connector=connector
-    )
-    decode_session = aiohttp.ClientSession(
-        timeout=timeout, connector=connector
-    )
+    encode_session = aiohttp.ClientSession(timeout=timeout, connector=connector)
+    decode_session = aiohttp.ClientSession(timeout=timeout, connector=connector)
 
 
 @app.on_event("shutdown")
@@ -284,12 +280,8 @@ async def forward_non_stream(
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception(
-            "[%s] Error in forward_non_stream: %s", req_id, str(e)
-        )
-        raise HTTPException(
-            status_code=500, detail=f"Proxy error: {str(e)}"
-        ) from e
+        logger.exception("[%s] Error in forward_non_stream: %s", req_id, str(e))
+        raise HTTPException(status_code=500, detail=f"Proxy error: {str(e)}") from e
 
 
 async def forward_stream(
@@ -322,9 +314,7 @@ async def forward_stream(
         logger.exception("[%s] HTTPException in forward_stream", req_id)
         raise
     except Exception as e:
-        logger.exception(
-            "[%s] Error in forward_stream: %s", req_id, str(e)
-        )
+        logger.exception("[%s] Error in forward_stream: %s", req_id, str(e))
         raise HTTPException(
             status_code=500, detail=f"Proxy streaming error: {str(e)}"
         ) from e
@@ -365,9 +355,7 @@ async def chat_completions(request: Request):
 
 @app.get("/v1/models")
 async def list_models():
-    async with decode_session.get(
-        f"{app.state.d_urls[0]}/v1/models"
-    ) as resp:
+    async with decode_session.get(f"{app.state.d_urls[0]}/v1/models") as resp:
         resp.raise_for_status()
         return await resp.json()
 
@@ -390,9 +378,7 @@ async def health_check():
         healthy(app.state.d_urls),
     )
 
-    overall_healthy = all(
-        status != "unhealthy" for status in (e_status, d_status)
-    )
+    overall_healthy = all(status != "unhealthy" for status in (e_status, d_status))
 
     return JSONResponse(
         {
@@ -429,12 +415,8 @@ async def _post_if_available(
         raise
 
 
-async def _profile_cmd(
-    cmd: str, payload: dict, e_url: str, d_url: str
-):
-    headers = {
-        "Authorization": f"Bearer {os.getenv('OPENAI_API_KEY', '')}"
-    }
+async def _profile_cmd(cmd: str, payload: dict, e_url: str, d_url: str):
+    headers = {"Authorization": f"Bearer {os.getenv('OPENAI_API_KEY', '')}"}
 
     encode_task = _post_if_available(
         encode_session, f"{e_url}/{cmd}_profile", payload, headers
@@ -486,14 +468,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--encode-servers-urls",
         required=True,
-        help='Comma-separated encode (encoder) URLs '
-             '("http://127.0.0.1:8000,http://127.0.0.1:8001")',
+        help="Comma-separated encode (encoder) URLs "
+        '("http://127.0.0.1:8000,http://127.0.0.1:8001")',
     )
     parser.add_argument(
         "--decode-servers-urls",
         required=True,
-        help='Comma-separated decode (llm) URLs '
-             '("http://127.0.0.1:9000")',
+        help='Comma-separated decode (llm) URLs ("http://127.0.0.1:9000")',
     )
 
     args = parser.parse_args()

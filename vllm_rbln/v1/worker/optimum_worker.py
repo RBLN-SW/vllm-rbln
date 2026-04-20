@@ -271,11 +271,12 @@ class RBLNOptimumWorker(WorkerBase):
         # be connected on demand when the first request arrives.
         if ec is not None and ec.is_ec_consumer:
             from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
+
             if has_ec_transfer():
                 connector = get_ec_transfer()
-                if hasattr(connector, '_impl'):
+                if hasattr(connector, "_impl"):
                     connector = connector._impl
-                if hasattr(connector, '_do_handshake_all'):
+                if hasattr(connector, "_do_handshake_all"):
                     logger.info("EC consumer: pre-connecting to producers...")
                     connector._do_handshake_all(fast=True)
 

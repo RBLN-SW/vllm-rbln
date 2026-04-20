@@ -248,27 +248,17 @@ class RBLNOptimumModelBase(nn.Module):
                 # Full model load with LLM runtimes disabled.
                 # TODO: use _load_producer_model() for true partial
                 # loading once engine core compatibility is resolved.
-                rbln_config = self.vllm_config.additional_config.get(
-                    "rbln_config", {}
-                )
-                rbln_config = self._apply_ec_producer_config(
-                    rbln_config, model_cls
-                )
+                rbln_config = self.vllm_config.additional_config.get("rbln_config", {})
+                rbln_config = self._apply_ec_producer_config(rbln_config, model_cls)
                 model = model_cls.from_pretrained(model_path, rbln_config=rbln_config)
                 self._free_producer_compiled_models(model, model_cls)
             else:
-                rbln_config = self.vllm_config.additional_config.get(
-                    "rbln_config", {}
-                )
+                rbln_config = self.vllm_config.additional_config.get("rbln_config", {})
                 if self._is_ec_consumer_only():
-                    rbln_config = self._apply_ec_consumer_config(
-                        rbln_config, model_cls
-                    )
+                    rbln_config = self._apply_ec_consumer_config(rbln_config, model_cls)
                 model = model_cls.from_pretrained(model_path, rbln_config=rbln_config)
                 if self._is_ec_consumer_only():
-                    self._free_consumer_submodule_compiled_models(
-                        model, model_cls
-                    )
+                    self._free_consumer_submodule_compiled_models(model, model_cls)
 
             logger.info(
                 "model_name = %s, model_cls_name = %s, model_path = %s",
@@ -345,15 +335,12 @@ class RBLNOptimumModelBase(nn.Module):
             setattr(proxy, name, submodules[name])
 
         logger.info(
-            "EC producer: loaded submodule(s) only (%s), "
-            "LLM .rbln files not loaded.",
+            "EC producer: loaded submodule(s) only (%s), LLM .rbln files not loaded.",
             ", ".join(submodule_names),
         )
         return proxy
 
-    def _apply_ec_consumer_config(
-        self, rbln_config: dict, model_cls: type
-    ) -> dict:
+    def _apply_ec_consumer_config(self, rbln_config: dict, model_cls: type) -> dict:
         """Set ``create_runtimes=False`` for encoder submodules so the
         consumer skips NPU allocation for the visual encoder."""
         submodule_names = [
@@ -383,18 +370,21 @@ class RBLNOptimumModelBase(nn.Module):
         ]
         for name in submodule_names:
             sub = getattr(model, name, None)
-            if sub is not None and hasattr(sub, "compiled_models") and sub.compiled_models:
+            if (
+                sub is not None
+                and hasattr(sub, "compiled_models")
+                and sub.compiled_models
+            ):
                 num_freed = len(sub.compiled_models)
                 sub.compiled_models = []
                 logger.info(
                     "EC consumer: freed %d compiled model(s) from "
                     "submodule '%s' CPU memory",
-                    num_freed, name,
+                    num_freed,
+                    name,
                 )
 
-    def _apply_ec_producer_config(
-        self, rbln_config: dict, model_cls: type
-    ) -> dict:
+    def _apply_ec_producer_config(self, rbln_config: dict, model_cls: type) -> dict:
         """Disable LLM runtimes, keep encoder submodule runtimes."""
         submodule_names = [
             s["name"] for s in getattr(model_cls, "_rbln_submodules", [])
@@ -409,15 +399,12 @@ class RBLNOptimumModelBase(nn.Module):
             sub["create_runtimes"] = True
             rbln_config[name] = sub
         logger.info(
-            "EC producer: LLM runtime disabled, "
-            "encoder submodules enabled (%s).",
+            "EC producer: LLM runtime disabled, encoder submodules enabled (%s).",
             ", ".join(submodule_names),
         )
         return rbln_config
 
-    def _free_producer_compiled_models(
-        self, model: Any, model_cls: type
-    ) -> None:
+    def _free_producer_compiled_models(self, model: Any, model_cls: type) -> None:
         """Free LLM compiled models from CPU memory (producer only)."""
         if hasattr(model, "compiled_models") and model.compiled_models:
             num_freed = len(model.compiled_models)
