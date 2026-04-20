@@ -18,6 +18,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+from transformers import PretrainedConfig
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -30,7 +31,6 @@ from optimum.rbln.transformers.models.decoderonly import (
     decoderonly_runtime_utils as runtime_utils,
 )
 from optimum.rbln.utils.model_utils import get_rbln_model_cls
-from transformers import PretrainedConfig
 from vllm_rbln.utils.optimum.common import select_bucket_size
 from vllm_rbln.utils.optimum.registry import compile_model, get_rbln_model_info
 
@@ -242,7 +242,7 @@ class RBLNOptimumModelBase(nn.Module):
         if model is None:
             model_cls = getattr(optimum.rbln, model_cls_name)
             assert model_cls is not None
-            model_path = str(self.vllm_config.model_config.model)
+            model_path = Path(self.vllm_config.model_config.model)
 
             if self._is_ec_producer_only():
                 # Full model load with LLM runtimes disabled.
@@ -308,7 +308,7 @@ class RBLNOptimumModelBase(nn.Module):
         saving several GB of CPU memory.
         """
         # Load the top-level rbln_config to get submodule info
-        config_cls = model_cls.get_rbln_config_class()
+        config_cls = model_cls.get_rbln_config_class()  # type: ignore[attr-defined]
         rbln_config_obj, _ = config_cls.from_pretrained(
             model_path, return_unused_kwargs=True
         )
