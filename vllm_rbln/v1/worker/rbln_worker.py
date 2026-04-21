@@ -311,7 +311,6 @@ class RBLNWorker(WorkerBase):
                 n_model_params=n_model_params,
             )
 
-            draft_params_dict = dict(draft_model.named_parameters())
             num_draft_runtimes = 1 + decode_batch_buckets_count
             draft_n_model_attentions = 0
             draft_n_model_experts = 0
@@ -334,8 +333,8 @@ class RBLNWorker(WorkerBase):
                         draft_nbits_per_param = 4
                     else:
                         raise ValueError(
-                            "invalid RBLN architecture, \
-                                candidates = [ATOM(ca), REBEL(cr)]"
+                            "invalid RBLN architecture, "
+                            "candidates = [ATOM(ca), REBEL(cr)]"
                         )
                     draft_packed_num_elems = 8 // 4
                 else:
@@ -346,7 +345,7 @@ class RBLNWorker(WorkerBase):
                 draft_nbits_per_param = 16
                 draft_packed_num_elems = 1
 
-            for key, value in draft_params_dict.items():
+            for value in draft_model.parameters():
                 if value.dtype == torch.bfloat16:
                     draft_n_model_attentions += value.numel()
                 else:
@@ -361,7 +360,7 @@ class RBLNWorker(WorkerBase):
                 nbits_per_param=draft_nbits_per_param,
                 n_model_params=draft_n_model_params,
             )
-            estimate_kwargs["num_runtimes"] = num_draft_runtimes
+            estimate_kwargs["num_runtimes"] = num_runtimes + num_draft_runtimes
             estimate_kwargs["kernel_size"] = model_kernel_size + draft_kernel_size
             logger.info("draft_model_kernel_size = %.2f GB", draft_kernel_size / 10**9)
         else:
