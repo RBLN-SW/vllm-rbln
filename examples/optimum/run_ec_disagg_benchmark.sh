@@ -29,6 +29,7 @@ MODEL="${MODEL:-Qwen3-VL-8B-Instruct}"
 NUM_ENCODERS="${NUM_ENCODERS:-2}"
 NUM_PROMPTS="${NUM_PROMPTS:-4}"
 REQUEST_RATE="${REQUEST_RATE:-0.5}"
+BENCH_NUM_WARMUPS="${BENCH_NUM_WARMUPS:-0}"
 
 # Ports
 ENCODER_BASE_PORT="${ENCODER_BASE_PORT:-8100}"
@@ -200,6 +201,7 @@ if [ "${BENCH_SKIP:-0}" != "1" ]; then
         --seed 0 \
         --num-prompts "$NUM_PROMPTS" \
         --request-rate "$REQUEST_RATE" \
+        --num-warmups "$BENCH_NUM_WARMUPS" \
         --port "$PROXY_PORT" \
         2>&1 | tee "$BENCH_LOG"
 

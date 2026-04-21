@@ -160,9 +160,14 @@ class RBLNOptimumModelBase(nn.Module):
         self.cache_config = vllm_config.cache_config
         self.init_model()
         self.batch_size = self.scheduler_config.max_num_seqs
-        self.kv_block_adapter = KVCacheBlockAdapter(
-            vllm_config, self._resolve_kvcache_num_blocks()
-        )
+        if self._is_ec_producer_only():
+            # Producer has no LLM; KV cache is not meaningful. Worker's
+            # determine_available_memory() short-circuits when adapter is None.
+            self.kv_block_adapter = None
+        else:
+            self.kv_block_adapter = KVCacheBlockAdapter(
+                vllm_config, self._resolve_kvcache_num_blocks()
+            )
 
     def _resolve_kvcache_num_blocks(self) -> int:
         """Prefer model-provided KV-cache block count;
@@ -248,22 +253,17 @@ class RBLNOptimumModelBase(nn.Module):
             if self._is_ec_producer_only():
                 if not ec_enabled_model:
                     raise ValueError("Disaggregation is not supported for this model.")
-                # Full model load with LLM runtimes disabled.
-                # TODO: use _load_producer_model() for true partial
-                # loading once engine core compatibility is resolved.
-                rbln_config = self.vllm_config.additional_config.get("rbln_config", {})
-                rbln_config = self._apply_ec_producer_config(rbln_config, model_cls)
-                model = model_cls.from_pretrained(model_path, rbln_config=rbln_config, subfolder="visual")
-                self._free_producer_compiled_models(model, model_cls)
+                visual = model_cls.load_visual_encoder(str(model_path))
+                model = _ProducerOptimumModelProxy(visual, visual.rbln_config)
             else:
                 rbln_config = self.vllm_config.additional_config.get("rbln_config", {})
                 if self._is_ec_consumer_only():
                     if not ec_enabled_model:
-                        raise ValueError("Disaggregation is not supported for this model.")
-                    rbln_config = self._apply_ec_consumer_config(rbln_config, model_cls)
+                        raise ValueError(
+                            "Disaggregation is not supported for this model."
+                        )
+                    rbln_config["_load_visual_runtime"] = False
                 model = model_cls.from_pretrained(model_path, rbln_config=rbln_config)
-                if self._is_ec_consumer_only():
-                    self._free_consumer_submodule_compiled_models(model, model_cls)
 
             logger.info(
                 "model_name = %s, model_cls_name = %s, model_path = %s",
@@ -344,81 +344,6 @@ class RBLNOptimumModelBase(nn.Module):
             ", ".join(submodule_names),
         )
         return proxy
-
-    def _apply_ec_consumer_config(self, rbln_config: dict, model_cls: type) -> dict:
-        """Set ``create_runtimes=False`` for encoder submodules so the
-        consumer skips NPU allocation for the visual encoder."""
-        submodule_names = [
-            s["name"] for s in getattr(model_cls, "_rbln_submodules", [])
-        ]
-        if not submodule_names:
-            return rbln_config
-
-        rbln_config = dict(rbln_config)
-        for name in submodule_names:
-            sub = dict(rbln_config.get(name) or {})
-            sub["create_runtimes"] = False
-            rbln_config[name] = sub
-        rbln_config["load_visual"] = False
-        logger.info(
-            "EC consumer: encoder submodule runtime disabled (%s).",
-            ", ".join(submodule_names),
-        )
-        return rbln_config
-
-    def _free_consumer_submodule_compiled_models(
-        self, model: Any, model_cls: type
-    ) -> None:
-        """Free encoder submodule compiled models from CPU memory after
-        the consumer has loaded the full model."""
-        submodule_names = [
-            s["name"] for s in getattr(model_cls, "_rbln_submodules", [])
-        ]
-        for name in submodule_names:
-            sub = getattr(model, name, None)
-            if (
-                sub is not None
-                and hasattr(sub, "compiled_models")
-                and sub.compiled_models
-            ):
-                num_freed = len(sub.compiled_models)
-                sub.compiled_models = []
-                logger.info(
-                    "EC consumer: freed %d compiled model(s) from "
-                    "submodule '%s' CPU memory",
-                    num_freed,
-                    name,
-                )
-
-    def _apply_ec_producer_config(self, rbln_config: dict, model_cls: type) -> dict:
-        """Disable LLM runtimes, keep encoder submodule runtimes."""
-        submodule_names = [
-            s["name"] for s in getattr(model_cls, "_rbln_submodules", [])
-        ]
-        if not submodule_names:
-            return rbln_config
-
-        rbln_config = dict(rbln_config)
-        rbln_config["create_runtimes"] = False
-        for name in submodule_names:
-            sub = dict(rbln_config.get(name) or {})
-            sub["create_runtimes"] = True
-            rbln_config[name] = sub
-        logger.info(
-            "EC producer: LLM runtime disabled, encoder submodules enabled (%s).",
-            ", ".join(submodule_names),
-        )
-        return rbln_config
-
-    def _free_producer_compiled_models(self, model: Any, model_cls: type) -> None:
-        """Free LLM compiled models from CPU memory (producer only)."""
-        if hasattr(model, "compiled_models") and model.compiled_models:
-            num_freed = len(model.compiled_models)
-            model.compiled_models = []
-            logger.info(
-                "EC producer: freed %d LLM compiled model(s) from CPU memory",
-                num_freed,
-            )
 
     @property
     def dtype(self) -> torch.dtype:

@@ -179,9 +179,14 @@ class RBLNOptimumWorker(WorkerBase):
 
         adapter = self.model_runner.model.kv_block_adapter
         if adapter is None:
-            # EC producer has no KV cache; return minimum to satisfy
-            # vLLM's engine core initialization.
-            return page_size * num_layers
+            # EC producer has no real LLM; the scheduler still spins up
+            # a KV-cache manager, so report enough memory to satisfy
+            # vLLM's max_model_len sizing check. Nothing is actually
+            # allocated because initialize_cache() is a no-op.
+            max_model_len = self.model_runner.vllm_config.model_config.max_model_len
+            block_size = self.model_runner.vllm_config.cache_config.block_size
+            num_blocks = max_model_len // block_size + 1
+            return num_blocks * page_size * num_layers
 
         num_gpu_blocks = adapter.get_available_num_blocks()
         # If the model is compiled in the runner,
