@@ -166,8 +166,14 @@ class RBLNRejectionSampler(RejectionSampler):
             metadata.cu_num_draft_tokens,
             sampling_metadata,
         )
+
         # Compute probability distribution from target logits.
-        target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
+        # target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
+        # Make One-hot target distribution for the rejection sampler.
+        _, max_idx = target_probs.max(dim=-1, keepdim=True)
+        target_probs = torch.zeros_like(target_probs).scatter_(
+            -1, max_idx, 1.0)
+
 
         output_token_ids = self.rejection_sample(
             metadata.draft_token_ids,
@@ -309,7 +315,7 @@ class RBLNRejectionSampler(RejectionSampler):
 
         # 4c) Inactive rows (no drafts): only the bonus token at col 0.
         output_token_ids[~active_mask, 0] = bonus[~active_mask]
-
+        print("@@@ output_token_ids:", output_token_ids)
         return output_token_ids
 
 
