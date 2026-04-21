@@ -275,8 +275,8 @@ def _apply_grouped_topk_torch(
     epg = E // G  # experts per group
 
     # For sigmoid, apply activation before grouping so group scoring uses sigmoid values
-    if scoring_func == 'sigmoid':
-        router_logits_2d = torch.sigmoid(router_logits_2d)  # [T, E]
+    # if scoring_func == 'sigmoid':
+    #     router_logits_2d = torch.sigmoid(router_logits_2d)  # [T, E]
 
     # Step 1: Reshape to groups [T, G, E/G]
     grouped = router_logits_2d.reshape(T, G, epg)
