@@ -243,18 +243,23 @@ class RBLNOptimumModelBase(nn.Module):
             model_cls = getattr(optimum.rbln, model_cls_name)
             assert model_cls is not None
             model_path = Path(self.vllm_config.model_config.model)
+            ec_enabled_model = model_cls_name == "RBLNQwen3VLForConditionalGeneration"
 
             if self._is_ec_producer_only():
+                if not ec_enabled_model:
+                    raise ValueError("Disaggregation is not supported for this model.")
                 # Full model load with LLM runtimes disabled.
                 # TODO: use _load_producer_model() for true partial
                 # loading once engine core compatibility is resolved.
                 rbln_config = self.vllm_config.additional_config.get("rbln_config", {})
                 rbln_config = self._apply_ec_producer_config(rbln_config, model_cls)
-                model = model_cls.from_pretrained(model_path, rbln_config=rbln_config)
+                model = model_cls.from_pretrained(model_path, rbln_config=rbln_config, subfolder="visual")
                 self._free_producer_compiled_models(model, model_cls)
             else:
                 rbln_config = self.vllm_config.additional_config.get("rbln_config", {})
                 if self._is_ec_consumer_only():
+                    if not ec_enabled_model:
+                        raise ValueError("Disaggregation is not supported for this model.")
                     rbln_config = self._apply_ec_consumer_config(rbln_config, model_cls)
                 model = model_cls.from_pretrained(model_path, rbln_config=rbln_config)
                 if self._is_ec_consumer_only():
@@ -354,6 +359,7 @@ class RBLNOptimumModelBase(nn.Module):
             sub = dict(rbln_config.get(name) or {})
             sub["create_runtimes"] = False
             rbln_config[name] = sub
+        rbln_config["load_visual"] = False
         logger.info(
             "EC consumer: encoder submodule runtime disabled (%s).",
             ", ".join(submodule_names),
