@@ -3011,6 +3011,11 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         is_last_prefill = (
                             num_computed + self.max_num_tokens
                         ) >= num_prompted
+
+                        if self.use_eagle():
+                            hidden_states = hidden_states.flatten(0, -2)
+                            sample_hidden_states = hidden_states[logits_indices]
+
                         if not is_last_prefill[0]:  # noqa: SIM108
                             # chunked prefill(#0~#N-1, intermediate)
                             # token_indices = torch.tensor([max_num_seqs-1])
@@ -3020,12 +3025,9 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                             # chunked prefill(#N, final)
                             # token_indices = torch.tensor([last_seq_idx-1])
                             # selected_token_indices == token_indices
-                            logits = logits
+                            if self.use_eagle():
+                                logits = logits[logits_indices]
 
-                        if self.use_eagle():
-                            hidden_states = hidden_states.flatten(0, -2)
-                            sample_hidden_states = hidden_states[logits_indices]
-                            logits = logits[logits_indices]
                     else:  # decode
                         # selected_token_indices is for valid decode tokens
                         # token_indices == None, selected = torch.tensor([0])
@@ -3118,6 +3120,10 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         with record_function_or_nullcontext("Sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
+        is_intermediate_prefill = (
+            self.is_prefill_phase() and logits is not None and logits.shape[0] == 0
+        )
+
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
             with record_function_or_nullcontext("Draft"):
@@ -3131,6 +3137,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     spec_decode_metadata,
                     spec_decode_common_attn_metadata,
                     slot_mappings,
+                    is_intermediate_prefill=is_intermediate_prefill,
                 )
 
         spec_config = self.speculative_config
@@ -3291,7 +3298,9 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         spec_decode_metadata: SpecDecodeMetadata | None,
         common_attn_metadata: CommonAttentionMetadata,
         slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None,
-    ) -> list[list[int]] | torch.Tensor:
+        *,
+        is_intermediate_prefill: bool = False,
+    ) -> list[list[int]] | torch.Tensor | None:
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         spec_config = self.speculative_config
         assert spec_config is not None
@@ -3311,6 +3320,9 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         elif spec_config.method == "medusa":
             assert isinstance(sampled_token_ids, list)
             assert isinstance(self.drafter, RBLNMedusaProposer)
+
+            if is_intermediate_prefill:
+                return [[] for _ in self.input_batch.req_ids]
 
             if spec_decode_metadata is None:
                 # prefill: hidden states are already per-request
@@ -3342,18 +3354,41 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 "sampled_token_ids should be a torch.Tensor."
             )
 
-            next_token_ids, valid_sampled_tokens_count = (
-                self.drafter.prepare_next_token_ids_padded(
-                    common_attn_metadata,
-                    sampled_token_ids,
-                    self.requests,
-                    self.input_batch,
-                    self.discard_request_mask.gpu,
+            if is_intermediate_prefill:
+                num_reqs = self.input_batch.num_reqs
+                dummy_sampled_token_ids = torch.full(
+                    (num_reqs, 1),
+                    -1,
+                    dtype=torch.int32,
+                    device=self.device,
                 )
-            )
-            self._copy_valid_sampled_token_count(
-                next_token_ids, valid_sampled_tokens_count
-            )
+                discard_request_mask = torch.ones(
+                    num_reqs,
+                    dtype=torch.bool,
+                    device=self.device,
+                )
+                next_token_ids, valid_sampled_tokens_count = (
+                    self.drafter.prepare_next_token_ids_padded(
+                        common_attn_metadata,
+                        dummy_sampled_token_ids,
+                        self.requests,
+                        self.input_batch,
+                        discard_request_mask,
+                    )
+                )
+            else:
+                next_token_ids, valid_sampled_tokens_count = (
+                    self.drafter.prepare_next_token_ids_padded(
+                        common_attn_metadata,
+                        sampled_token_ids,
+                        self.requests,
+                        self.input_batch,
+                        self.discard_request_mask.gpu,
+                    )
+                )
+                self._copy_valid_sampled_token_count(
+                    next_token_ids, valid_sampled_tokens_count
+                )
 
             target_hidden_states = hidden_states
             num_rejected_tokens_gpu = None
@@ -3395,18 +3430,29 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             else:
                 mm_embed_inputs = None
 
-            draft_token_ids = self.drafter.propose(
-                target_token_ids=target_token_ids,
-                target_positions=target_positions,
-                target_hidden_states=target_hidden_states,
-                next_token_ids=next_token_ids,
-                token_indices_to_sample=token_indices_to_sample,
-                sampling_metadata=sampling_metadata,
-                common_attn_metadata=common_attn_metadata,
-                mm_embed_inputs=mm_embed_inputs,
-                num_rejected_tokens_gpu=num_rejected_tokens_gpu,
-                slot_mappings=slot_mappings,
-            )
+            if is_intermediate_prefill:
+                draft_token_ids = None
+                self.drafter.prefill_only(
+                    target_token_ids=target_token_ids,
+                    target_positions=target_positions,
+                    target_hidden_states=target_hidden_states,
+                    next_token_ids=next_token_ids,
+                    common_attn_metadata=common_attn_metadata,
+                    mm_embed_inputs=mm_embed_inputs,
+                )
+            else:
+                draft_token_ids = self.drafter.propose(
+                    target_token_ids=target_token_ids,
+                    target_positions=target_positions,
+                    target_hidden_states=target_hidden_states,
+                    next_token_ids=next_token_ids,
+                    token_indices_to_sample=token_indices_to_sample,
+                    sampling_metadata=sampling_metadata,
+                    common_attn_metadata=common_attn_metadata,
+                    mm_embed_inputs=mm_embed_inputs,
+                    num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                    slot_mappings=slot_mappings,
+                )
 
         return draft_token_ids
 
