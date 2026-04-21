@@ -4506,7 +4506,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 for idx in src_block_ids:
                     for kv_name, kv_cache in kv_caches.items():
                         block_size = kv_cache.shape[-2]
-                        copy_fn(kv_cache.data_ptr(), idx, 0, block_size, kv_name)
+                        copy_fn(kv_cache, idx, 0, block_size, kv_name)
 
             kv_transfer_group.set_host_xfer_buffer_ops(rbln_copy_kv_blocks)
 
