@@ -83,7 +83,7 @@ class RBLNOptimumWhisperForConditionalGeneration(
 
         is_prompt = model_input.is_prompt
 
-        valid_block_ids = block_tables.flatten().to(torch.int16)
+        valid_block_ids = block_tables.flatten().to(torch.int64)
 
         if is_prompt:
             if model_input.multi_modal_kwargs:
