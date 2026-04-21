@@ -344,8 +344,7 @@ def apply_sampling_constraints(
     if sampling_metadata.all_greedy:
         # Make One-hot target distribution for the rejection sampler.
         _, max_idx = logits.max(dim=-1, keepdim=True)
-        logits = torch.zeros_like(logits).scatter_(
-            -1, max_idx, 1.0)
+        logits = torch.zeros_like(logits).scatter_(-1, max_idx, 1.0)
         return logits
 
     num_tokens = logits.shape[0]
