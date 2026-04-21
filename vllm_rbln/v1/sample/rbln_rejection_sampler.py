@@ -169,11 +169,7 @@ class RBLNRejectionSampler(RejectionSampler):
 
         # Compute probability distribution from target logits.
         # target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
-        # Make One-hot target distribution for the rejection sampler.
-        _, max_idx = target_probs.max(dim=-1, keepdim=True)
-        target_probs = torch.zeros_like(target_probs).scatter_(
-            -1, max_idx, 1.0)
-
+        target_probs = target_logits.to(torch.float32)
 
         output_token_ids = self.rejection_sample(
             metadata.draft_token_ids,
@@ -346,6 +342,10 @@ def apply_sampling_constraints(
     assert logits.ndim == 2
     assert cu_num_draft_tokens.ndim == 1
     if sampling_metadata.all_greedy:
+        # Make One-hot target distribution for the rejection sampler.
+        _, max_idx = logits.max(dim=-1, keepdim=True)
+        logits = torch.zeros_like(logits).scatter_(
+            -1, max_idx, 1.0)
         return logits
 
     num_tokens = logits.shape[0]
