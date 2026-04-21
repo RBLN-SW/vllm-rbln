@@ -449,9 +449,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.top_k,
                 layer.renormalize,
                 expert_map_const,
+                tokens_mask,
                 n_group,
                 topk_group,
-                tokens_mask,
             )
         else:
             raise NotImplementedError(layer.activation)
