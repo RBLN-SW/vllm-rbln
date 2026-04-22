@@ -553,13 +553,24 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
             engine_id = meta.engine_id
             mm_hash = meta.mm_hash
 
-            # Register the remote NIXL agent once per encoder. agent_metadata
-            # is stable across the encoder's lifetime, so re-registering on
-            # every incoming mm_hash just churns NIXL bookkeeping.
-            if engine_id not in self._remote_agents:
-                self._remote_agents[engine_id] = self._nixl_agent.add_remote_agent(
-                    meta.agent_metadata
+            # Re-register the remote NIXL agent on every incoming metadata.
+            # agent_metadata is NOT stable across mm_hashes: the encoder
+            # allocates fresh aligned buffers per save_caches (new base
+            # addresses), so NIXL needs to drop the stale view of this
+            # agent and re-add with the latest memory map before any
+            # prep_xfer_dlist can resolve the new addresses. Skipping this
+            # (the earlier "once per engine_id" shortcut) crashes the
+            # consumer with NIXL_ERR_NOT_FOUND on the encoder's 2nd+
+            # request. remove+add must be paired — add-only without
+            # remove triggers NIXL_ERR_REMOTE_DISCONNECT when UCX state
+            # gets confused.
+            if engine_id in self._remote_agents:
+                self._nixl_agent.remove_remote_agent(
+                    self._remote_agents[engine_id]
                 )
+            self._remote_agents[engine_id] = self._nixl_agent.add_remote_agent(
+                meta.agent_metadata
+            )
 
             # Store tensor registry and non-tensor data for this mm_hash
             self._tensor_registry[mm_hash] = (engine_id, meta.tensors)
