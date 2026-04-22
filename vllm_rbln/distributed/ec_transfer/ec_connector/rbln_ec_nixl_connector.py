@@ -129,6 +129,15 @@ _CACHE_WAIT_TIMEOUT_S = 30.0
 _XFER_POLL_INTERVAL_S = 0.001
 _LLM_PROBE_TIMEOUT_S = 1.0
 
+# Stage 2 defaults (tunable via ec_connector_extra_config)
+_DEFAULT_METADATA_QUEUE_MAX = 256
+_DEFAULT_MAX_CONCURRENT_PULLS = 32
+_DEFAULT_PRODUCER_CACHE_CAPACITY = 128
+_DEFAULT_PRODUCER_CACHE_TTL_S = 60.0
+# How long the receiver thread blocks on queue.put before re-checking
+# the stop_event — keeps shutdown responsive when the queue is saturated.
+_QUEUE_PUT_TIMEOUT_S = 0.2
+
 
 def _probe_tcp(host: str, port: int, timeout: float = _LLM_PROBE_TIMEOUT_S) -> bool:
     """Return True if *host:port* is accepting TCP connections.
@@ -271,15 +280,41 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
         self._nixl_agent = NixlAgent(self._engine_id, None)
         self._stop_event = threading.Event()
 
+        # -- Tunable knobs --
+        self._metadata_queue_max: int = ec_cfg.get_from_extra_config(
+            "metadata_queue_max", _DEFAULT_METADATA_QUEUE_MAX
+        )
+        self._max_concurrent_pulls: int = ec_cfg.get_from_extra_config(
+            "max_concurrent_pulls", _DEFAULT_MAX_CONCURRENT_PULLS
+        )
+        self._producer_cache_capacity: int = ec_cfg.get_from_extra_config(
+            "producer_cache_capacity", _DEFAULT_PRODUCER_CACHE_CAPACITY
+        )
+        self._producer_cache_ttl_s: float = ec_cfg.get_from_extra_config(
+            "producer_cache_ttl_s", _DEFAULT_PRODUCER_CACHE_TTL_S
+        )
+
         # -- Encoder state --
+        # Insertion order is the LRU order; we never move entries, so a plain
+        # dict (Python 3.7+) is sufficient.
         # mm_hash -> dict[key, aligned CPU tensor]
         self._registered_caches: dict[str, dict[str, torch.Tensor]] = {}
         # mm_hash -> NIXL descriptor (for deregistration)
         self._registered_descs: dict[str, Any] = {}
+        # mm_hash -> monotonic timestamp of registration (for TTL)
+        self._registered_timestamps: dict[str, float] = {}
 
         # -- LLM state --
-        # Incoming metadata queue (filled by background PULL thread)
-        self._incoming_metadata: queue.Queue[ECNixlMetadata] = queue.Queue()
+        # Incoming metadata queue (filled by background PULL thread). Bounded
+        # so receiver.put() blocks when the main thread is slow, which in
+        # turn fills the ZMQ PULL HWM and back-pressures encoders via PUSH.
+        self._incoming_metadata: queue.Queue[ECNixlMetadata] = queue.Queue(
+            maxsize=self._metadata_queue_max
+        )
+        # mm_hashes the scheduler asked us to load but for which we deferred
+        # initiating the pull because _pending_loads hit the concurrency cap.
+        # Retried on the next start_load_caches() call.
+        self._deferred_loads: set[str] = set()
         # Per-mm_hash event for waiters
         self._cache_events: dict[str, threading.Event] = {}
         self._cache_events_lock = threading.Lock()
@@ -364,23 +399,34 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
 
             try:
                 meta = decoder.decode(raw)
-                self._incoming_metadata.put(meta)
-
-                # Signal waiter for this mm_hash
-                with self._cache_events_lock:
-                    evt = self._cache_events.get(meta.mm_hash)
-                    if evt is not None:
-                        evt.set()
-
-                logger.debug(
-                    "EC Nixl: received metadata for mm_hash=%s from engine=%s "
-                    "(%d tensors)",
-                    meta.mm_hash,
-                    meta.engine_id,
-                    len(meta.tensors),
-                )
             except Exception as exc:
                 logger.warning("EC Nixl: failed to decode received metadata: %s", exc)
+                continue
+
+            # Block on put() when the queue is full so back-pressure propagates
+            # through ZMQ's PULL HWM (and then PUSH HWM) to encoders. Poll
+            # stop_event so shutdown is never stuck behind a saturated queue.
+            while not self._stop_event.is_set():
+                try:
+                    self._incoming_metadata.put(meta, timeout=_QUEUE_PUT_TIMEOUT_S)
+                    break
+                except queue.Full:
+                    continue
+            else:
+                return
+
+            # Signal waiter for this mm_hash
+            with self._cache_events_lock:
+                evt = self._cache_events.get(meta.mm_hash)
+                if evt is not None:
+                    evt.set()
+
+            logger.debug(
+                "EC Nixl: received metadata for mm_hash=%s from engine=%s (%d tensors)",
+                meta.mm_hash,
+                meta.engine_id,
+                len(meta.tensors),
+            )
 
     def _process_pending_metadata(self) -> set[str]:
         """Drain metadata queue, register NIXL remote agents.
@@ -470,6 +516,54 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
             _CACHE_WAIT_TIMEOUT_S,
         )
         return False
+
+    # ------------------------------------------------------------------
+    # Producer-side cache admission (LRU + TTL)
+    # ------------------------------------------------------------------
+
+    def _evict_producer_entry(self, mm_hash: str) -> None:
+        """Deregister NIXL memory and drop the producer-side cache entry."""
+        descs = self._registered_descs.pop(mm_hash, None)
+        if descs is not None:
+            with contextlib.suppress(Exception):
+                self._nixl_agent.deregister_memory(descs)
+        self._registered_caches.pop(mm_hash, None)
+        self._registered_timestamps.pop(mm_hash, None)
+
+    def _sweep_expired_producer_entries(self) -> None:
+        """Drop any registered producer entries older than the TTL."""
+        now = time.monotonic()
+        expired = [
+            h
+            for h, ts in self._registered_timestamps.items()
+            if now - ts > self._producer_cache_ttl_s
+        ]
+        for h in expired:
+            logger.warning(
+                "EC Nixl: TTL-evicting producer cache for mm_hash=%s "
+                "(ttl=%.1fs, consumer never pulled or request_finished "
+                "never fired)",
+                h,
+                self._producer_cache_ttl_s,
+            )
+            self._evict_producer_entry(h)
+
+    def _admit_producer_entry(self) -> None:
+        """Make room before inserting a new producer cache entry.
+
+        Runs a lazy TTL sweep first, then evicts LRU entries (insertion
+        order) until the capacity budget allows one more insertion.
+        """
+        self._sweep_expired_producer_entries()
+        while len(self._registered_caches) >= self._producer_cache_capacity:
+            oldest = next(iter(self._registered_caches))
+            logger.warning(
+                "EC Nixl: LRU-evicting producer cache for mm_hash=%s "
+                "(capacity=%d reached)",
+                oldest,
+                self._producer_cache_capacity,
+            )
+            self._evict_producer_entry(oldest)
 
     # ------------------------------------------------------------------
     # NIXL pull
@@ -611,11 +705,15 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
             )
             return
 
+        # Enforce LRU capacity + TTL before registering a new entry.
+        self._admit_producer_entry()
+
         descs = self._nixl_agent.get_reg_descs(caches_data, "DRAM")
         self._nixl_agent.register_memory(descs, backends=self._backends)
 
         self._registered_caches[mm_hash] = aligned
         self._registered_descs[mm_hash] = descs
+        self._registered_timestamps[mm_hash] = time.monotonic()
 
         # Push metadata to llm via ZMQ
         push_meta = ECNixlMetadata(
@@ -651,12 +749,27 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
         # Process any pending metadata from encoders
         self._process_pending_metadata()
 
+        # Merge fresh scheduler asks with hashes deferred from previous steps
+        # due to the concurrent-pull cap. Dedup via set so the scheduler's
+        # new list takes priority on ordering but deferred entries aren't lost.
+        todo: list[str] = list(self._deferred_loads)
+        self._deferred_loads.clear()
+        seen = set(todo)
         for mm_data in metadata.mm_datas_to_load:
-            mm_hash = mm_data.mm_hash
+            if mm_data.mm_hash not in seen:
+                todo.append(mm_data.mm_hash)
+                seen.add(mm_data.mm_hash)
 
+        for mm_hash in todo:
             if mm_hash in encoder_cache:
                 continue
             if mm_hash in self._pending_loads:
+                continue
+
+            # Enforce concurrent-pull cap: defer the rest to a later step
+            # so we don't flood NIXL/local memory with in-flight transfers.
+            if len(self._pending_loads) >= self._max_concurrent_pulls:
+                self._deferred_loads.add(mm_hash)
                 continue
 
             # Wait for metadata if not yet received
@@ -747,18 +860,7 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
         if self.is_producer:
             for feature in request.mm_features:
                 mm_hash = feature.identifier
-                if mm_hash in self._registered_descs:
-                    try:
-                        self._nixl_agent.deregister_memory(
-                            self._registered_descs.pop(mm_hash)
-                        )
-                    except Exception as exc:
-                        logger.warning(
-                            "EC Nixl: failed to deregister mm_hash=%s: %s",
-                            mm_hash,
-                            exc,
-                        )
-                    self._registered_caches.pop(mm_hash, None)
+                self._evict_producer_entry(mm_hash)
 
         if self.is_consumer:
             for feature in request.mm_features:
@@ -767,6 +869,7 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
                     self._cache_events.pop(mm_hash, None)
                 self._tensor_registry.pop(mm_hash, None)
                 self._non_tensor_registry.pop(mm_hash, None)
+                self._deferred_loads.discard(mm_hash)
                 pending = self._pending_loads.pop(mm_hash, None)
                 if pending is not None:
                     handle, _, local_descs = pending
@@ -789,11 +892,10 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
         self._pending_loads.clear()
 
         # Producer: deregister any remaining NIXL memory.
-        for mm_hash, descs in list(self._registered_descs.items()):
-            with contextlib.suppress(Exception):
-                self._nixl_agent.deregister_memory(descs)
-        self._registered_descs.clear()
-        self._registered_caches.clear()
+        for mm_hash in list(self._registered_descs.keys()):
+            self._evict_producer_entry(mm_hash)
+
+        self._deferred_loads.clear()
 
         if hasattr(self, "_zmq_ctx"):
             self._zmq_ctx.destroy(linger=1000)
