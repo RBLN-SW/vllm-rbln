@@ -143,6 +143,10 @@ _DEFAULT_ACK_HOST = "127.0.0.1"
 _DEFAULT_ACK_PORT = 0  # 0 = bind ephemeral, advertise actual port
 _DEFAULT_ACK_QUEUE_MAX = 256
 
+# Stage 3b defaults (heartbeat / liveness)
+_DEFAULT_PING_INTERVAL_S = 60.0
+_DEFAULT_DEAD_THRESHOLD_S = 180.0  # ~3 × ping interval, tolerates missed pings
+
 
 def _probe_tcp(host: str, port: int, timeout: float = _LLM_PROBE_TIMEOUT_S) -> bool:
     """Return True if *host:port* is accepting TCP connections.
@@ -197,17 +201,24 @@ class ECNixlMetadata(msgspec.Struct):
 
 
 class ECNixlAck(msgspec.Struct):
-    """Completion notification pushed from llm back to encoder.
+    """Completion / liveness notification pushed from llm back to encoder.
 
-    status is "ok" when the NIXL pull finished cleanly, "fail" when the
-    transfer failed, timed out, or the request was torn down before the
-    pull completed. Either way the producer can safely deregister its
-    NIXL memory on receipt.
+    status is one of:
+      - "ok":   NIXL pull finished cleanly; producer may deregister.
+      - "fail": transfer failed, timed out, or request was torn down;
+                producer may deregister.
+      - "ping": idle liveness beacon; carries no mm_hash, the producer
+                uses it only to refresh the consumer's last_seen.
+
+    consumer_engine_id identifies which consumer sent the message; the
+    producer tracks liveness per consumer on that key. Empty means the
+    sender did not enable liveness (backward compat).
     """
 
     mm_hash: str
     engine_id: str
     status: str = "ok"
+    consumer_engine_id: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -325,6 +336,12 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
         self._ack_queue_max: int = ec_cfg.get_from_extra_config(
             "ack_queue_max", _DEFAULT_ACK_QUEUE_MAX
         )
+        self._ping_interval_s: float = ec_cfg.get_from_extra_config(
+            "ping_interval_s", _DEFAULT_PING_INTERVAL_S
+        )
+        self._dead_threshold_s: float = ec_cfg.get_from_extra_config(
+            "dead_threshold_s", _DEFAULT_DEAD_THRESHOLD_S
+        )
 
         # -- Encoder state --
         # Insertion order is the LRU order; we never move entries, so a plain
@@ -335,6 +352,10 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
         self._registered_descs: dict[str, Any] = {}
         # mm_hash -> monotonic timestamp of registration (for TTL)
         self._registered_timestamps: dict[str, float] = {}
+        # Liveness tracking keyed by consumer_engine_id. Updated by the ACK
+        # receiver thread on every incoming message (including pings).
+        self._last_seen: dict[str, float] = {}
+        self._engine_alive: dict[str, bool] = {}
 
         # -- LLM state --
         # Incoming metadata queue (filled by background PULL thread). Bounded
@@ -349,11 +370,20 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
         self._deferred_loads: set[str] = set()
         # Per-encoder PUSH socket for ACKs, keyed by (host, port). Created
         # lazily the first time we see metadata advertising that address.
+        # Owned by the main thread (used from _send_ack_if_unsent).
         self._ack_push_sockets: dict[tuple[str, int], Any] = {}
         # mm_hash -> (ack_host, ack_port) — where to send ACK for this hash.
         self._mm_hash_ack_addr: dict[str, tuple[str, int]] = {}
         # Used to guarantee at most one ACK per mm_hash per request lifetime.
         self._ack_sent: set[str] = set()
+        # Known encoder endpoints for liveness pings (engine_id -> address).
+        # Written by main thread, read by ping thread — shared under a lock
+        # so the ping thread sees a consistent snapshot.
+        self._known_ack_addrs: dict[str, tuple[str, int]] = {}
+        self._known_ack_addrs_lock = threading.Lock()
+        # Dedicated PUSH sockets owned by the ping thread. ZMQ sockets are
+        # not thread-safe, so the ping thread must not reuse _ack_push_sockets.
+        self._ping_push_sockets: dict[tuple[str, int], Any] = {}
         # Per-mm_hash event for waiters
         self._cache_events: dict[str, threading.Event] = {}
         self._cache_events_lock = threading.Lock()
@@ -441,6 +471,16 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
                 name="ec_nixl_push_receiver",
             )
             self._receiver_thread.start()
+
+            # Idle-ping thread: keeps producer's liveness view of this
+            # consumer warm even when no real ACKs are flowing.
+            self._ping_thread = threading.Thread(
+                target=self._ping_loop,
+                daemon=True,
+                name="ec_nixl_ping",
+            )
+            self._ping_thread.start()
+
             logger.info(
                 "RblnECNixlConnector (llm): PULL bound on %s",
                 self._pull_addr,
@@ -525,7 +565,21 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
             if meta.non_tensor_data:
                 self._non_tensor_registry[mm_hash] = meta.non_tensor_data
             if meta.ack_host and meta.ack_port:
-                self._mm_hash_ack_addr[mm_hash] = (meta.ack_host, meta.ack_port)
+                addr = (meta.ack_host, meta.ack_port)
+                self._mm_hash_ack_addr[mm_hash] = addr
+                # Track this encoder for liveness pings. Log when we see an
+                # engine_id for the first time so operators can observe the
+                # fan-in topology as it converges.
+                with self._known_ack_addrs_lock:
+                    is_new = engine_id not in self._known_ack_addrs
+                    self._known_ack_addrs[engine_id] = addr
+                if is_new:
+                    logger.info(
+                        "EC Nixl: discovered encoder engine=%s at %s:%d",
+                        engine_id,
+                        addr[0],
+                        addr[1],
+                    )
             new_mm_hashes.add(mm_hash)
 
             logger.debug(
@@ -615,7 +669,12 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
             sock.connect(f"tcp://{addr[0]}:{addr[1]}")
             self._ack_push_sockets[addr] = sock
 
-        ack = ECNixlAck(mm_hash=mm_hash, engine_id=engine_id, status=status)
+        ack = ECNixlAck(
+            mm_hash=mm_hash,
+            engine_id=engine_id,
+            status=status,
+            consumer_engine_id=self._engine_id,
+        )
         try:
             sock.send(msgspec.msgpack.Encoder().encode(ack), zmq.NOBLOCK)
             self._ack_sent.add(mm_hash)
@@ -626,8 +685,80 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
             )
 
     # ------------------------------------------------------------------
-    # Encoder: ACK receiver
+    # LLM: idle-ping loop
     # ------------------------------------------------------------------
+
+    def _ping_loop(self) -> None:
+        """Consumer: periodically PUSH a liveness ping to each known encoder.
+
+        Runs on its own thread with its own PUSH sockets (ZMQ sockets are
+        not thread-safe, so we cannot reuse _ack_push_sockets). Ping is
+        encoded as an ECNixlAck with empty mm_hash and status="ping" — the
+        producer refreshes last_seen and ignores it for eviction.
+        """
+        encoder = msgspec.msgpack.Encoder()
+        while not self._stop_event.wait(self._ping_interval_s):
+            with self._known_ack_addrs_lock:
+                snapshot = list(self._known_ack_addrs.items())
+            for engine_id, addr in snapshot:
+                sock = self._ping_push_sockets.get(addr)
+                if sock is None:
+                    sock = self._zmq_ctx.socket(zmq.PUSH)
+                    sock.setsockopt(zmq.SNDHWM, self._ack_queue_max)
+                    sock.setsockopt(zmq.LINGER, 1000)
+                    sock.connect(f"tcp://{addr[0]}:{addr[1]}")
+                    self._ping_push_sockets[addr] = sock
+                ping = ECNixlAck(
+                    mm_hash="",
+                    engine_id=engine_id,
+                    status="ping",
+                    consumer_engine_id=self._engine_id,
+                )
+                # Encoder ACK queue full: skip this round, next ping cycle
+                # will retry. Not worth logging.
+                with contextlib.suppress(zmq.Again):
+                    sock.send(encoder.encode(ping), zmq.NOBLOCK)
+
+    # ------------------------------------------------------------------
+    # Encoder: ACK receiver + liveness tracking
+    # ------------------------------------------------------------------
+
+    def _record_liveness(self, consumer_engine_id: str) -> None:
+        """Refresh last_seen and log a transition if the consumer recovered."""
+        if not consumer_engine_id:
+            return  # older consumer without liveness support
+        self._last_seen[consumer_engine_id] = time.monotonic()
+        prev = self._engine_alive.get(consumer_engine_id)
+        self._engine_alive[consumer_engine_id] = True
+        if prev is None:
+            logger.info(
+                "EC Nixl: first contact from consumer engine=%s",
+                consumer_engine_id,
+            )
+        elif prev is False:
+            logger.warning(
+                "EC Nixl: consumer engine=%s RECOVERED (ACK/ping received "
+                "after dead threshold)",
+                consumer_engine_id,
+            )
+
+    def _check_engine_liveness(self) -> None:
+        """Transition alive->dead consumers past the threshold; log once."""
+        now = time.monotonic()
+        for consumer_engine_id, ts in list(self._last_seen.items()):
+            if (
+                self._engine_alive.get(consumer_engine_id, False)
+                and (now - ts) > self._dead_threshold_s
+            ):
+                self._engine_alive[consumer_engine_id] = False
+                logger.warning(
+                    "EC Nixl: consumer engine=%s DEAD (no ACK/ping for %.1fs, "
+                    "threshold=%.1fs) — logging only, registered caches "
+                    "left to TTL backstop",
+                    consumer_engine_id,
+                    now - ts,
+                    self._dead_threshold_s,
+                )
 
     def _ack_receiver_loop(self) -> None:
         """Background thread on producer: receive ACKs from llm."""
@@ -637,6 +768,9 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
 
         while not self._stop_event.is_set():
             events = dict(poller.poll(200))
+            # Scan for alive->dead transitions every poll tick so the
+            # threshold triggers promptly even when no ACKs are arriving.
+            self._check_engine_liveness()
             if self._ack_pull_sock not in events:
                 continue
             try:
@@ -648,6 +782,13 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
                 ack = decoder.decode(raw)
             except Exception as exc:
                 logger.warning("EC Nixl: failed to decode ACK: %s", exc)
+                continue
+
+            # Any message — ok / fail / ping — counts as liveness evidence.
+            self._record_liveness(ack.consumer_engine_id)
+
+            if ack.status == "ping":
+                # Liveness-only; nothing to evict.
                 continue
 
             while not self._stop_event.is_set():
@@ -1062,7 +1203,7 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
 
         # Join receiver threads so they stop touching ZMQ/NIXL before we tear
         # down the underlying resources.
-        for attr in ("_receiver_thread", "_ack_receiver_thread"):
+        for attr in ("_receiver_thread", "_ack_receiver_thread", "_ping_thread"):
             thread = getattr(self, attr, None)
             if thread is not None and thread.is_alive():
                 thread.join(timeout=2.0)
@@ -1072,6 +1213,7 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
             self._release_pull(handle, local_descs)
         self._pending_loads.clear()
         self._ack_push_sockets.clear()  # closed by zmq_ctx.destroy below
+        self._ping_push_sockets.clear()
 
         # Producer: deregister any remaining NIXL memory.
         for mm_hash in list(self._registered_descs.keys()):
