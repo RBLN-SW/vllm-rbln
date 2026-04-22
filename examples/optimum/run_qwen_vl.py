@@ -205,7 +205,6 @@ async def generate(engine: AsyncLLMEngine, tokenizer, request_id, request):
     final_output = None
     async for request_output in results_generator:
         final_output = request_output
-
     return final_output
 
 
@@ -254,7 +253,7 @@ async def main(
 def entry_point(
     num_input_prompt: int = 1,
     # NOTE: This example supports Qwen2-VL, Qwen2.5-VL, and Qwen3-VL.
-    model_id: str = "Qwen2-VL-7B-Instruct",
+    model_id: str = "/qwen2_5-vl-7b-32k-b4-kv16k",
 ):
     asyncio.run(
         main(
