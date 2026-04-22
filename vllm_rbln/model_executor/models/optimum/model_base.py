@@ -147,6 +147,11 @@ class _ProducerOptimumModelProxy:
 
 
 class RBLNOptimumModelBase(nn.Module):
+    model: Any
+    rbln_model_config: Any
+    attn_impl: str | None
+    kv_block_adapter: "KVCacheBlockAdapter | None"
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -299,9 +304,11 @@ class RBLNOptimumModelBase(nn.Module):
 
 
 class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
+    attn_impl: str | None
+
     def setup_decoder_mixin(
         self,
-        attn_impl: str,
+        attn_impl: str | None,
         vocab_size: int,
         use_multiple_decoder: bool,
         default_batch_size: int,
