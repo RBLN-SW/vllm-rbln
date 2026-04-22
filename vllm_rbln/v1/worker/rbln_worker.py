@@ -541,8 +541,6 @@ class RBLNWorker(WorkerBase):
         # has_kv_transfer_group can be None during interpreter shutdown.
         if ensure_kv_transfer_shutdown is not None:
             ensure_kv_transfer_shutdown()
-        if self.profiler is not None:
-            self.profiler.shutdown()
 
         if envs.VLLM_RBLN_METRICS:
             if self.model_runner.performance_tracker:
