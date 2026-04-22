@@ -199,8 +199,10 @@ class RBLNOptimumWorker(WorkerBase):
             assert num_blocks is not None, (
                 "num_blocks must be specified in rbln_config.json"
             )
+            print("@@@ call in determine_available_memory, num_blocks:", num_blocks)
             sync_num_blocks(self.model_runner.vllm_config, num_blocks)
-
+        # num_gpu_blocks must be set after sync_num_blocks is called.
+        num_gpu_blocks = adapter.get_available_num_blocks()
         validation_blocks = self.model_runner.vllm_config.cache_config.num_gpu_blocks
         # This will be removed after validation check
         assert num_gpu_blocks == validation_blocks, (

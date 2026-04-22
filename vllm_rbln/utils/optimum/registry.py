@@ -157,6 +157,7 @@ def compile_model(
     model_path: str,
     additional_config: dict[str, Any] | None = None,
 ) -> Any:
+    print("@@@@ block_size in compile_model: ", block_size)
     architectures = getattr(config, "architectures", [])
     model_name, model_cls_name = get_rbln_model_info(
         config

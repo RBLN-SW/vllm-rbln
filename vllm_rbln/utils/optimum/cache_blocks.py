@@ -124,11 +124,24 @@ def sync_cache_block_size(
 
 
 def sync_num_blocks(vllm_config: VllmConfig, num_blocks: int) -> None:
+    # This function is called twice during startup: once in the main process
+    # when we first read rbln_config.json, and once in each subprocess when
+    # the VllmConfig is deserialized. We only want to perform the num_blocks
+    # calculation and update once, in the main process, to avoid redundant
+    # calculations and potential inconsistencies. We use an additional_config
+    # flag to track whether we have already synced num_blocks.
+    if vllm_config.additional_config.get("num_blocks_synced", False):
+        logger.debug(
+            "num_blocks already synced to %s, skipping...",
+            vllm_config.cache_config.num_gpu_blocks,
+        )
+        return
     # num_blocks is determined by rbln_config or overridden by user.
     if vllm_config.cache_config.num_gpu_blocks_override is not None:
         num_blocks = vllm_config.cache_config.num_gpu_blocks_override
+        # This is kept for optimum based num blocks
+        # not considering ob-ib logic for prefix caching
         vllm_config.additional_config["num_blocks_override"] = num_blocks
-
     blk_ratio = get_block_ratio(vllm_config)
 
     if is_full_block_available(num_blocks, vllm_config):
@@ -140,3 +153,4 @@ def sync_num_blocks(vllm_config: VllmConfig, num_blocks: int) -> None:
 
     if vllm_config.cache_config.num_gpu_blocks_override is not None:
         vllm_config.cache_config.num_gpu_blocks_override = adjusted_num_blocks
+    vllm_config.additional_config["num_blocks_synced"] = True

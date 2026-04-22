@@ -30,17 +30,10 @@ from optimum.rbln.transformers.models.decoderonly import (
     decoderonly_runtime_utils as runtime_utils,
 )
 from vllm_rbln.utils.optimum.common import select_bucket_size
+from vllm_rbln.utils.optimum.configuration import get_attn_block_size
 from vllm_rbln.utils.optimum.registry import compile_model, get_rbln_model_info
 
 logger = init_logger(__name__)
-
-
-def get_attn_block_size(vllm_config: VllmConfig) -> int:
-    if vllm_config.cache_config.enable_prefix_caching:
-        block_size = vllm_config.additional_config["attn_block_size"]
-    else:
-        block_size = vllm_config.cache_config.block_size
-    return block_size
 
 
 class KVCacheBlockAdapter:
@@ -83,6 +76,7 @@ class KVCacheBlockAdapter:
             num_gpu_blocks_override = self.vllm_config.additional_config[
                 "num_blocks_override"
             ]
+            print("@@@@ num_blocks_override: ", num_gpu_blocks_override)
             return num_gpu_blocks_override
         else:
             return int(self.estimated_kvcache_num_blocks)
@@ -106,7 +100,7 @@ class KVCacheBlockAdapter:
             blk_ratio = ob_size // ib_size
         else:
             blk_ratio = 1
-
+        print("@@@ _estimated_num_blocks: ", self._estimated_num_blocks())
         if self.is_full_block_available():
             new_estimated = self._estimated_num_blocks() * blk_ratio
             return new_estimated + 1

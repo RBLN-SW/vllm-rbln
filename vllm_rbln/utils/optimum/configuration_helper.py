@@ -13,10 +13,13 @@
 # limitations under the License.
 
 from typing import Any
+
 # Keys that affect only runtime loading, not the compiled binary, and
 # therefore must be stripped before hashing so the same compiled artifact
 # is shared between compile-only and inference invocations.
-_RUNTIME_ONLY_KEYS: frozenset[str] = frozenset({"create_runtimes", "devices"})
+_RUNTIME_ONLY_KEYS: frozenset[str] = frozenset(
+    {"create_runtimes", "devices", "kvcache_num_blocks"}
+)
 
 
 def strip_runtime_only_keys(obj: dict) -> dict:

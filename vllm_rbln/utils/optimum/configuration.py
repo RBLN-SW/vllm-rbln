@@ -49,9 +49,18 @@ from vllm_rbln.utils.optimum.registry import (
 logger = init_logger(__name__)
 
 
+def get_attn_block_size(vllm_config: VllmConfig) -> int:
+    if vllm_config.cache_config.enable_prefix_caching:
+        block_size = vllm_config.additional_config["attn_block_size"]
+    else:
+        block_size = vllm_config.cache_config.block_size
+    return block_size
+
+
 def generate_model_path_name(
     vllm_config: VllmConfig,
 ) -> str:
+    # Just depends on user-provided parameters
     model_name = str(vllm_config.model_config.model)
     batch_size = vllm_config.scheduler_config.max_num_seqs
     block_size = vllm_config.cache_config.block_size
@@ -189,12 +198,32 @@ def sync_vllm_from_rbln_config(
 
 
 def prepare_vllm_for_compile(vllm_config: VllmConfig) -> None:
-    # NOTE:
-    # num_blocks is set after compilation,
-    # so we only set other parameters here to compile model internally.
-    # 1. block_size
-    # Get proper block_size if not set by user
     hf_config = vllm_config.model_config.hf_config
+    rbln_config = vllm_config.additional_config.get("rbln_config", {})
+    # Extract block size from rbln_config
+    _, max_num_seqs, max_model_len, kvcache_block_size, _, _ = get_rbln_params(
+        vllm_config, rbln_config, use_assert=False
+    )
+    if max_num_seqs is not None:
+        logger.info(
+            "Setting max_num_seqs to %d based on rbln_config in additional_config",
+            max_num_seqs,
+        )
+        vllm_config.scheduler_config.max_num_seqs = max_num_seqs
+    if max_model_len is not None:
+        logger.info(
+            "Setting max_model_len to %d based on rbln_config in additional_config",
+            max_model_len,
+        )
+        vllm_config.model_config.max_model_len = max_model_len
+    if kvcache_block_size is not None:
+        logger.info(
+            "Setting block_size to %d based on rbln_config in additional_config",
+            kvcache_block_size,
+        )
+        vllm_config.cache_config.block_size = kvcache_block_size
+        vllm_config.cache_config.user_specified_block_size = kvcache_block_size
+
     if not vllm_config.cache_config.user_specified_block_size:
         # Set block_size to max_model_len
         # for decoder-only, multimodal, and pooling models
@@ -210,6 +239,11 @@ def prepare_vllm_for_compile(vllm_config: VllmConfig) -> None:
                 == vllm_config.model_config.max_model_len
             ), "For pooling models, block_size must be equal to max_model_len."
 
+    # NOTE:
+    # num_blocks is set after compilation,
+    # so we only set other parameters here to compile model internally.
+    # 1. block_size
+    # Get proper block_size if not set by user
     # Set block_size in cache_config to compile model internally.
     sync_cache_block_size(
         vllm_config, vllm_config.cache_config.block_size, prefill_chunk_size=128
