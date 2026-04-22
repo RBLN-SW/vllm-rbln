@@ -436,6 +436,15 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
             return True
 
         evt = self._get_or_create_event(mm_hash)
+
+        # Close race: the receiver thread may have enqueued metadata between
+        # our drain above and the event creation here. In that window, the
+        # receiver's `_cache_events.get(mm_hash)` returns None and no signal
+        # fires, so drain once more before sleeping on the event.
+        self._process_pending_metadata()
+        if mm_hash in self._tensor_registry:
+            return True
+
         deadline = time.monotonic() + _CACHE_WAIT_TIMEOUT_S
 
         while time.monotonic() < deadline:
@@ -465,6 +474,17 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
     # ------------------------------------------------------------------
     # NIXL pull
     # ------------------------------------------------------------------
+
+    def _release_pull(self, handle: Any, local_descs: Any) -> None:
+        """Release NIXL handle and deregister local destination memory.
+
+        Safe to call on both success and failure paths. Suppresses errors
+        so cleanup never leaves dangling state.
+        """
+        with contextlib.suppress(Exception):
+            self._nixl_agent.release_xfer_handle(handle)
+        with contextlib.suppress(Exception):
+            self._nixl_agent.deregister_memory(local_descs)
 
     def _initiate_pull(
         self,
@@ -667,12 +687,13 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
                 if status == "DONE":
                     non_tensor = self._non_tensor_registry.pop(mm_hash, None)
                     encoder_cache[mm_hash] = _merge_pull_result(local_bufs, non_tensor)
-                    self._nixl_agent.release_xfer_handle(handle)
+                    self._release_pull(handle, local_descs)
                     del self._pending_loads[mm_hash]
                     logger.debug("EC Nixl: pull complete for mm_hash=%s", mm_hash)
                 elif status not in ("DONE", "PROC"):
                     logger.error("EC Nixl: transfer failed for mm_hash=%s", mm_hash)
-                    self._nixl_agent.release_xfer_handle(handle)
+                    self._release_pull(handle, local_descs)
+                    self._non_tensor_registry.pop(mm_hash, None)
                     del self._pending_loads[mm_hash]
             if self._pending_loads:
                 time.sleep(_XFER_POLL_INTERVAL_S)
@@ -682,8 +703,9 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
                 "EC Nixl: %d pulls did not complete within timeout",
                 len(self._pending_loads),
             )
-            for mm_hash, (handle, _, _) in list(self._pending_loads.items()):
-                self._nixl_agent.release_xfer_handle(handle)
+            for mm_hash, (handle, _, local_descs) in list(self._pending_loads.items()):
+                self._release_pull(handle, local_descs)
+                self._non_tensor_registry.pop(mm_hash, None)
                 del self._pending_loads[mm_hash]
 
     def get_finished(
@@ -708,13 +730,14 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
                 if non_tensor:
                     result.update(non_tensor)
                 self._encoder_cache[mm_hash] = result
-                self._nixl_agent.release_xfer_handle(handle)
+                self._release_pull(handle, local_descs)
                 del self._pending_loads[mm_hash]
                 completed.add(mm_hash)
                 logger.debug("EC Nixl: pull complete for mm_hash=%s", mm_hash)
             elif status not in ("DONE", "PROC"):
                 logger.error("EC Nixl: transfer failed for mm_hash=%s", mm_hash)
-                self._nixl_agent.release_xfer_handle(handle)
+                self._release_pull(handle, local_descs)
+                self._non_tensor_registry.pop(mm_hash, None)
                 del self._pending_loads[mm_hash]
 
         return None, completed if completed else None
@@ -743,18 +766,35 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
                 with self._cache_events_lock:
                     self._cache_events.pop(mm_hash, None)
                 self._tensor_registry.pop(mm_hash, None)
-                # Deregister local llm buffers
-                desc_key = f"_llm_{mm_hash}"
-                if desc_key in self._registered_descs:
-                    with contextlib.suppress(Exception):
-                        self._nixl_agent.deregister_memory(
-                            self._registered_descs.pop(desc_key)
-                        )
+                self._non_tensor_registry.pop(mm_hash, None)
+                pending = self._pending_loads.pop(mm_hash, None)
+                if pending is not None:
+                    handle, _, local_descs = pending
+                    self._release_pull(handle, local_descs)
 
         return False, None
 
     def shutdown(self) -> None:
         self._stop_event.set()
+
+        # Join receiver thread so it stops touching ZMQ/NIXL before we tear
+        # down the underlying resources.
+        thread = getattr(self, "_receiver_thread", None)
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
+
+        # Consumer: release any in-flight pulls.
+        for mm_hash, (handle, _, local_descs) in list(self._pending_loads.items()):
+            self._release_pull(handle, local_descs)
+        self._pending_loads.clear()
+
+        # Producer: deregister any remaining NIXL memory.
+        for mm_hash, descs in list(self._registered_descs.items()):
+            with contextlib.suppress(Exception):
+                self._nixl_agent.deregister_memory(descs)
+        self._registered_descs.clear()
+        self._registered_caches.clear()
+
         if hasattr(self, "_zmq_ctx"):
             self._zmq_ctx.destroy(linger=1000)
 
