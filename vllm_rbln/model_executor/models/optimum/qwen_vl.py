@@ -133,7 +133,9 @@ class RBLNOptimumQwenVLForConditionalGeneration(
             "attention_mask": attention_mask,
         }
 
-        # Dispatch image inputs: pre-computed embeddings skip the visual encoder
+        # Dispatch image inputs: pre-computed embeddings skip the visual encoder.
+        # image_embeds kwarg is only passed when actually present — models
+        # without EC disagg support (e.g. Qwen2.5-VL) don't accept it.
         if image_input is not None:
             preprocess_args["image_grid_thw"] = image_input["image_grid_thw"]
             if image_input.get("type") == "image_embeds":
@@ -143,13 +145,11 @@ class RBLNOptimumQwenVLForConditionalGeneration(
             else:
                 logger.info("Prefill: running visual encoder (pixel_values)")
                 preprocess_args["pixel_values"] = image_input["pixel_values"]
-                preprocess_args["image_embeds"] = None
         else:
             preprocess_args["pixel_values"] = None
             preprocess_args["image_grid_thw"] = None
-            preprocess_args["image_embeds"] = None
 
-        # Dispatch video inputs: pre-computed embeddings skip the visual encoder
+        # Dispatch video inputs: pre-computed embeddings skip the visual encoder.
         if video_input is not None:
             preprocess_args["video_grid_thw"] = video_input["video_grid_thw"]
             if video_input.get("type") == "video_embeds":
@@ -161,11 +161,9 @@ class RBLNOptimumQwenVLForConditionalGeneration(
                 preprocess_args["pixel_values_videos"] = video_input[
                     "pixel_values_videos"
                 ]
-                preprocess_args["video_embeds"] = None
         else:
             preprocess_args["pixel_values_videos"] = None
             preprocess_args["video_grid_thw"] = None
-            preprocess_args["video_embeds"] = None
 
         # Add model-specific parameters
         self._add_model_specific_args(preprocess_args, video_input)
