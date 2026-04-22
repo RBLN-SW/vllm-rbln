@@ -566,10 +566,7 @@ class RBLNOptimumScheduler(Scheduler):
         # can pull encoder caches in the background before they are needed.
         if self.ec_connector is not None:
             for request in self.waiting:
-                if (
-                    hasattr(request, "has_encoder_inputs")
-                    and request.has_encoder_inputs
-                ):
+                if request.has_encoder_inputs:
                     for i, feature in enumerate(request.mm_features):
                         if self.ec_connector.has_cache_item(feature.identifier):
                             self.ec_connector.update_state_after_alloc(request, i)

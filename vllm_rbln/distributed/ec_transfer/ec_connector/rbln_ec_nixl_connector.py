@@ -553,12 +553,13 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
             engine_id = meta.engine_id
             mm_hash = meta.mm_hash
 
-            # Register or update remote NIXL agent for this encoder
-            if engine_id in self._remote_agents:
-                self._nixl_agent.remove_remote_agent(self._remote_agents[engine_id])
-            self._remote_agents[engine_id] = self._nixl_agent.add_remote_agent(
-                meta.agent_metadata
-            )
+            # Register the remote NIXL agent once per encoder. agent_metadata
+            # is stable across the encoder's lifetime, so re-registering on
+            # every incoming mm_hash just churns NIXL bookkeeping.
+            if engine_id not in self._remote_agents:
+                self._remote_agents[engine_id] = self._nixl_agent.add_remote_agent(
+                    meta.agent_metadata
+                )
 
             # Store tensor registry and non-tensor data for this mm_hash
             self._tensor_registry[mm_hash] = (engine_id, meta.tensors)
@@ -823,8 +824,17 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
         """Deregister NIXL memory and drop the producer-side cache entry."""
         descs = self._registered_descs.pop(mm_hash, None)
         if descs is not None:
-            with contextlib.suppress(Exception):
+            try:
                 self._nixl_agent.deregister_memory(descs)
+            except Exception as exc:
+                # Never let cleanup failures abort eviction — the local
+                # dict pops below must still run. Log so descriptor-pool
+                # leaks don't go silent.
+                logger.warning(
+                    "EC Nixl: deregister_memory failed for mm_hash=%s: %s",
+                    mm_hash,
+                    exc,
+                )
         self._registered_caches.pop(mm_hash, None)
         self._registered_timestamps.pop(mm_hash, None)
 
@@ -870,13 +880,18 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
     def _release_pull(self, handle: Any, local_descs: Any) -> None:
         """Release NIXL handle and deregister local destination memory.
 
-        Safe to call on both success and failure paths. Suppresses errors
-        so cleanup never leaves dangling state.
+        Safe to call on both success and failure paths. Failures are
+        logged but never raised so the caller's cleanup sequence runs
+        to completion.
         """
-        with contextlib.suppress(Exception):
+        try:
             self._nixl_agent.release_xfer_handle(handle)
-        with contextlib.suppress(Exception):
+        except Exception as exc:
+            logger.warning("EC Nixl: release_xfer_handle failed: %s", exc)
+        try:
             self._nixl_agent.deregister_memory(local_descs)
+        except Exception as exc:
+            logger.warning("EC Nixl: deregister_memory failed: %s", exc)
 
     def _initiate_pull(
         self,
