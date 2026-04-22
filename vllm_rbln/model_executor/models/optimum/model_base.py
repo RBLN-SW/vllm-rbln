@@ -18,7 +18,6 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from transformers import PretrainedConfig
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -30,7 +29,6 @@ import vllm_rbln.rbln_envs as envs
 from optimum.rbln.transformers.models.decoderonly import (
     decoderonly_runtime_utils as runtime_utils,
 )
-from optimum.rbln.utils.model_utils import get_rbln_model_cls
 from vllm_rbln.utils.optimum.common import select_bucket_size
 from vllm_rbln.utils.optimum.registry import compile_model, get_rbln_model_info
 
@@ -293,57 +291,6 @@ class RBLNOptimumModelBase(nn.Module):
     def _is_ec_consumer_only(self) -> bool:
         ec = getattr(self.vllm_config, "ec_transfer_config", None)
         return ec is not None and ec.is_ec_consumer and not ec.is_ec_producer
-
-    def _load_producer_model(
-        self, model_cls: type, model_path: str
-    ) -> _ProducerOptimumModelProxy:
-        """Load only the visual encoder submodule for EC producer.
-
-        LLM compiled models (.rbln for prefill/decode) are never loaded,
-        saving several GB of CPU memory.
-        """
-        # Load the top-level rbln_config to get submodule info
-        config_cls = model_cls.get_rbln_config_class()  # type: ignore[attr-defined]
-        rbln_config_obj, _ = config_cls.from_pretrained(
-            model_path, return_unused_kwargs=True
-        )
-
-        submodule_names = [
-            s["name"] for s in getattr(model_cls, "_rbln_submodules", [])
-        ]
-        if not submodule_names:
-            raise RuntimeError(
-                "EC producer requires a model with submodules (e.g. visual), "
-                f"but {model_cls.__name__} has none."
-            )
-
-        # Load each encoder submodule (typically just "visual")
-        submodules: dict[str, Any] = {}
-        for name in submodule_names:
-            sub_config = getattr(rbln_config_obj, name)
-            sub_cls = get_rbln_model_cls(sub_config.rbln_model_cls_name)
-            hf_config = PretrainedConfig.from_json_file(
-                os.path.join(model_path, name, "config.json")
-            )
-            submodules[name] = sub_cls._from_pretrained(
-                model_id=model_path,
-                config=hf_config,
-                subfolder=name,
-                rbln_config=sub_config,
-            )
-
-        proxy = _ProducerOptimumModelProxy(
-            submodules[submodule_names[0]], rbln_config_obj
-        )
-        # Attach additional submodules if more than one
-        for name in submodule_names[1:]:
-            setattr(proxy, name, submodules[name])
-
-        logger.info(
-            "EC producer: loaded submodule(s) only (%s), LLM .rbln files not loaded.",
-            ", ".join(submodule_names),
-        )
-        return proxy
 
     @property
     def dtype(self) -> torch.dtype:
