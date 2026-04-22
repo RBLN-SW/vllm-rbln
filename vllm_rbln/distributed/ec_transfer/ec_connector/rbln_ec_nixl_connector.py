@@ -138,6 +138,11 @@ _DEFAULT_PRODUCER_CACHE_TTL_S = 60.0
 # the stop_event — keeps shutdown responsive when the queue is saturated.
 _QUEUE_PUT_TIMEOUT_S = 0.2
 
+# Stage 3a defaults (ACK channel)
+_DEFAULT_ACK_HOST = "127.0.0.1"
+_DEFAULT_ACK_PORT = 0  # 0 = bind ephemeral, advertise actual port
+_DEFAULT_ACK_QUEUE_MAX = 256
+
 
 def _probe_tcp(host: str, port: int, timeout: float = _LLM_PROBE_TIMEOUT_S) -> bool:
     """Return True if *host:port* is accepting TCP connections.
@@ -185,6 +190,24 @@ class ECNixlMetadata(msgspec.Struct):
     # Non-tensor values (e.g. second_per_grid_ts) serialised as
     # {key: value} — llm restores these alongside pulled tensors.
     non_tensor_data: dict = {}
+    # ACK channel the llm should PUSH completion/fail notifications to.
+    # Empty host means the producer did not enable ACKs (backward compat).
+    ack_host: str = ""
+    ack_port: int = 0
+
+
+class ECNixlAck(msgspec.Struct):
+    """Completion notification pushed from llm back to encoder.
+
+    status is "ok" when the NIXL pull finished cleanly, "fail" when the
+    transfer failed, timed out, or the request was torn down before the
+    pull completed. Either way the producer can safely deregister its
+    NIXL memory on receipt.
+    """
+
+    mm_hash: str
+    engine_id: str
+    status: str = "ok"
 
 
 # ---------------------------------------------------------------------------
@@ -293,6 +316,15 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
         self._producer_cache_ttl_s: float = ec_cfg.get_from_extra_config(
             "producer_cache_ttl_s", _DEFAULT_PRODUCER_CACHE_TTL_S
         )
+        self._ack_host: str = ec_cfg.get_from_extra_config(
+            "ack_host", _DEFAULT_ACK_HOST
+        )
+        self._ack_port_configured: int = ec_cfg.get_from_extra_config(
+            "ack_port", _DEFAULT_ACK_PORT
+        )
+        self._ack_queue_max: int = ec_cfg.get_from_extra_config(
+            "ack_queue_max", _DEFAULT_ACK_QUEUE_MAX
+        )
 
         # -- Encoder state --
         # Insertion order is the LRU order; we never move entries, so a plain
@@ -315,6 +347,13 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
         # initiating the pull because _pending_loads hit the concurrency cap.
         # Retried on the next start_load_caches() call.
         self._deferred_loads: set[str] = set()
+        # Per-encoder PUSH socket for ACKs, keyed by (host, port). Created
+        # lazily the first time we see metadata advertising that address.
+        self._ack_push_sockets: dict[tuple[str, int], Any] = {}
+        # mm_hash -> (ack_host, ack_port) — where to send ACK for this hash.
+        self._mm_hash_ack_addr: dict[str, tuple[str, int]] = {}
+        # Used to guarantee at most one ACK per mm_hash per request lifetime.
+        self._ack_sent: set[str] = set()
         # Per-mm_hash event for waiters
         self._cache_events: dict[str, threading.Event] = {}
         self._cache_events_lock = threading.Lock()
@@ -352,6 +391,35 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
             logger.info(
                 "RblnECNixlConnector (encoder): PUSH connected to %s",
                 self._push_addr,
+            )
+
+            # ACK PULL socket — receives completion notifications from LLM so
+            # we can deregister NIXL memory immediately instead of relying on
+            # TTL / request_finished as the only drain path.
+            self._ack_pull_sock = self._zmq_ctx.socket(zmq.PULL)
+            self._ack_pull_sock.setsockopt(zmq.RCVHWM, self._ack_queue_max)
+            if self._ack_port_configured == 0:
+                self._ack_pull_sock.bind(f"tcp://{self._ack_host}:*")
+                endpoint = self._ack_pull_sock.getsockopt(zmq.LAST_ENDPOINT).decode()
+                self._ack_port = int(endpoint.rsplit(":", 1)[1])
+            else:
+                self._ack_pull_sock.bind(
+                    f"tcp://{self._ack_host}:{self._ack_port_configured}"
+                )
+                self._ack_port = self._ack_port_configured
+            self._incoming_acks: queue.Queue[ECNixlAck] = queue.Queue(
+                maxsize=self._ack_queue_max
+            )
+            self._ack_receiver_thread = threading.Thread(
+                target=self._ack_receiver_loop,
+                daemon=True,
+                name="ec_nixl_ack_receiver",
+            )
+            self._ack_receiver_thread.start()
+            logger.info(
+                "RblnECNixlConnector (encoder): ACK PULL bound on %s:%d",
+                self._ack_host,
+                self._ack_port,
             )
 
         if self.is_consumer:
@@ -456,6 +524,8 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
             self._tensor_registry[mm_hash] = (engine_id, meta.tensors)
             if meta.non_tensor_data:
                 self._non_tensor_registry[mm_hash] = meta.non_tensor_data
+            if meta.ack_host and meta.ack_port:
+                self._mm_hash_ack_addr[mm_hash] = (meta.ack_host, meta.ack_port)
             new_mm_hashes.add(mm_hash)
 
             logger.debug(
@@ -516,6 +586,93 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
             _CACHE_WAIT_TIMEOUT_S,
         )
         return False
+
+    # ------------------------------------------------------------------
+    # LLM: ACK sender
+    # ------------------------------------------------------------------
+
+    def _send_ack_if_unsent(self, mm_hash: str, status: str) -> None:
+        """Best-effort ACK the producer for this mm_hash.
+
+        Idempotent per mm_hash via self._ack_sent. Silently skips if the
+        producer did not advertise an ACK address (older encoder) or if a
+        prior ACK was already sent for this mm_hash.
+        """
+        if mm_hash in self._ack_sent:
+            return
+        addr = self._mm_hash_ack_addr.get(mm_hash)
+        if addr is None:
+            return
+        engine_id = self._tensor_registry.get(mm_hash, (None,))[0]
+        if engine_id is None:
+            return
+
+        sock = self._ack_push_sockets.get(addr)
+        if sock is None:
+            sock = self._zmq_ctx.socket(zmq.PUSH)
+            sock.setsockopt(zmq.SNDHWM, self._ack_queue_max)
+            sock.setsockopt(zmq.LINGER, 1000)
+            sock.connect(f"tcp://{addr[0]}:{addr[1]}")
+            self._ack_push_sockets[addr] = sock
+
+        ack = ECNixlAck(mm_hash=mm_hash, engine_id=engine_id, status=status)
+        try:
+            sock.send(msgspec.msgpack.Encoder().encode(ack), zmq.NOBLOCK)
+            self._ack_sent.add(mm_hash)
+        except zmq.Again:
+            logger.warning(
+                "EC Nixl: ACK send would block for mm_hash=%s (encoder ACK queue full)",
+                mm_hash,
+            )
+
+    # ------------------------------------------------------------------
+    # Encoder: ACK receiver
+    # ------------------------------------------------------------------
+
+    def _ack_receiver_loop(self) -> None:
+        """Background thread on producer: receive ACKs from llm."""
+        poller = zmq.Poller()
+        poller.register(self._ack_pull_sock, zmq.POLLIN)
+        decoder = msgspec.msgpack.Decoder(ECNixlAck)
+
+        while not self._stop_event.is_set():
+            events = dict(poller.poll(200))
+            if self._ack_pull_sock not in events:
+                continue
+            try:
+                raw = self._ack_pull_sock.recv(zmq.NOBLOCK)
+            except zmq.Again:
+                continue
+
+            try:
+                ack = decoder.decode(raw)
+            except Exception as exc:
+                logger.warning("EC Nixl: failed to decode ACK: %s", exc)
+                continue
+
+            while not self._stop_event.is_set():
+                try:
+                    self._incoming_acks.put(ack, timeout=_QUEUE_PUT_TIMEOUT_S)
+                    break
+                except queue.Full:
+                    continue
+            else:
+                return
+
+    def _drain_acks(self) -> None:
+        """Evict any ACKed producer entries. Main-thread only (NIXL)."""
+        while True:
+            try:
+                ack = self._incoming_acks.get_nowait()
+            except queue.Empty:
+                break
+            if ack.mm_hash in self._registered_caches:
+                logger.debug(
+                    "EC Nixl: ACK status=%s for mm_hash=%s, evicting",
+                    ack.status,
+                    ack.mm_hash,
+                )
+                self._evict_producer_entry(ack.mm_hash)
 
     # ------------------------------------------------------------------
     # Producer-side cache admission (LRU + TTL)
@@ -648,6 +805,11 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
         """Encoder: register tensors with NIXL, push metadata to llm."""
         if not self.is_producer:
             return
+
+        # Drain any ACKs from completed llm-side pulls first so evictions
+        # make room before we potentially admit a new entry.
+        self._drain_acks()
+
         if mm_hash in self._registered_caches:
             return
 
@@ -722,6 +884,8 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
             agent_metadata=self._nixl_agent.get_agent_metadata(),
             tensors=tensor_infos,
             non_tensor_data=non_tensor_data,
+            ack_host=self._ack_host,
+            ack_port=self._ack_port,
         )
         encoded = msgspec.msgpack.Encoder().encode(push_meta)
         self._push_sock.send(encoded)
@@ -802,12 +966,14 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
                     encoder_cache[mm_hash] = _merge_pull_result(local_bufs, non_tensor)
                     self._release_pull(handle, local_descs)
                     del self._pending_loads[mm_hash]
+                    self._send_ack_if_unsent(mm_hash, "ok")
                     logger.debug("EC Nixl: pull complete for mm_hash=%s", mm_hash)
                 elif status not in ("DONE", "PROC"):
                     logger.error("EC Nixl: transfer failed for mm_hash=%s", mm_hash)
                     self._release_pull(handle, local_descs)
                     self._non_tensor_registry.pop(mm_hash, None)
                     del self._pending_loads[mm_hash]
+                    self._send_ack_if_unsent(mm_hash, "fail")
             if self._pending_loads:
                 time.sleep(_XFER_POLL_INTERVAL_S)
 
@@ -820,6 +986,7 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
                 self._release_pull(handle, local_descs)
                 self._non_tensor_registry.pop(mm_hash, None)
                 del self._pending_loads[mm_hash]
+                self._send_ack_if_unsent(mm_hash, "fail")
 
     def get_finished(
         self,
@@ -846,18 +1013,22 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
                 self._release_pull(handle, local_descs)
                 del self._pending_loads[mm_hash]
                 completed.add(mm_hash)
+                self._send_ack_if_unsent(mm_hash, "ok")
                 logger.debug("EC Nixl: pull complete for mm_hash=%s", mm_hash)
             elif status not in ("DONE", "PROC"):
                 logger.error("EC Nixl: transfer failed for mm_hash=%s", mm_hash)
                 self._release_pull(handle, local_descs)
                 self._non_tensor_registry.pop(mm_hash, None)
                 del self._pending_loads[mm_hash]
+                self._send_ack_if_unsent(mm_hash, "fail")
 
         return None, completed if completed else None
 
     def request_finished(self, request: Request) -> tuple[bool, dict[str, Any] | None]:
         """Deregister NIXL memory for completed requests (encoder only)."""
         if self.is_producer:
+            # Drain any late ACKs so eviction state stays current.
+            self._drain_acks()
             for feature in request.mm_features:
                 mm_hash = feature.identifier
                 self._evict_producer_entry(mm_hash)
@@ -865,10 +1036,19 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
         if self.is_consumer:
             for feature in request.mm_features:
                 mm_hash = feature.identifier
+
+                # Send fail ACK first (before popping tensor_registry, which
+                # holds engine_id), so producer can evict even when the pull
+                # never finished. _send_ack_if_unsent is idempotent, so the
+                # ok case from _wait_for_pulls / get_finished is preserved.
+                self._send_ack_if_unsent(mm_hash, "fail")
+
                 with self._cache_events_lock:
                     self._cache_events.pop(mm_hash, None)
                 self._tensor_registry.pop(mm_hash, None)
                 self._non_tensor_registry.pop(mm_hash, None)
+                self._mm_hash_ack_addr.pop(mm_hash, None)
+                self._ack_sent.discard(mm_hash)
                 self._deferred_loads.discard(mm_hash)
                 pending = self._pending_loads.pop(mm_hash, None)
                 if pending is not None:
@@ -880,16 +1060,18 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
     def shutdown(self) -> None:
         self._stop_event.set()
 
-        # Join receiver thread so it stops touching ZMQ/NIXL before we tear
+        # Join receiver threads so they stop touching ZMQ/NIXL before we tear
         # down the underlying resources.
-        thread = getattr(self, "_receiver_thread", None)
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=2.0)
+        for attr in ("_receiver_thread", "_ack_receiver_thread"):
+            thread = getattr(self, attr, None)
+            if thread is not None and thread.is_alive():
+                thread.join(timeout=2.0)
 
         # Consumer: release any in-flight pulls.
         for mm_hash, (handle, _, local_descs) in list(self._pending_loads.items()):
             self._release_pull(handle, local_descs)
         self._pending_loads.clear()
+        self._ack_push_sockets.clear()  # closed by zmq_ctx.destroy below
 
         # Producer: deregister any remaining NIXL memory.
         for mm_hash in list(self._registered_descs.keys()):
