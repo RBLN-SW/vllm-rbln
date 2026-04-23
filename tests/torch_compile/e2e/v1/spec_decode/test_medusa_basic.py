@@ -22,7 +22,6 @@ from .utils import (
     DEFAULT_MEDUSA_MODEL_ID,
     DEFAULT_MODEL_ID,
     ensure_converted_medusa_adapter,
-    run_in_spawned_process,
 )
 
 PROMPTS = [
@@ -53,7 +52,7 @@ def _build_llm() -> LLM:
     )
 
 
-def _run_basic_medusa_generation() -> None:
+def test_basic_medusa_generation() -> None:
     sampling_params = SamplingParams(temperature=0.1, top_p=0.9, max_tokens=32)
 
     llm = _build_llm()
@@ -72,11 +71,3 @@ def _run_basic_medusa_generation() -> None:
     assert "vllm:spec_decode_num_accepted_tokens" in metric_names
 
 
-def test_basic_medusa_generation():
-    run_in_spawned_process(
-        module_name=__name__,
-        func_name="_run_basic_medusa_generation",
-        env={
-            "RBLN_USE_CUSTOM_KERNEL": "1",
-        },
-    )

@@ -16,12 +16,8 @@
 
 from __future__ import annotations
 
-import importlib
 import json
-import multiprocessing
-import os
 import re
-import traceback
 from pathlib import Path
 from typing import Any
 
@@ -279,57 +275,6 @@ def ensure_vllm_compatible_eagle_draft_model(
     return str(out_dir)
 
 
-def _spawn_entry(
-    module_name: str,
-    func_name: str,
-    env: dict[str, str],
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
-    error_queue,
-) -> None:
-    for key, value in env.items():
-        os.environ[key] = value
-
-    try:
-        module = importlib.import_module(module_name)
-        func = getattr(module, func_name)
-        func(*args, **kwargs)
-    except BaseException:
-        error_queue.put(traceback.format_exc())
-        raise
-
-
-def run_in_spawned_process(
-    *,
-    module_name: str,
-    func_name: str,
-    env: dict[str, str] | None = None,
-    args: tuple[Any, ...] = (),
-    kwargs: dict[str, Any] | None = None,
-) -> None:
-    ctx = multiprocessing.get_context("spawn")
-    error_queue = ctx.Queue()
-    proc = ctx.Process(
-        target=_spawn_entry,
-        args=(
-            module_name,
-            func_name,
-            env or {},
-            args,
-            kwargs or {},
-            error_queue,
-        ),
-    )
-    proc.start()
-    proc.join()
-
-    if proc.exitcode != 0:
-        tb = ""
-        if not error_queue.empty():
-            tb = error_queue.get()
-        raise AssertionError(f"Spawned process exited with code {proc.exitcode}\n{tb}")
-
-
 __all__ = [
     "DEFAULT_EAGLE_TEST_MODEL_IDS",
     "DEFAULT_MEDUSA_MODEL_ID",
@@ -337,5 +282,4 @@ __all__ = [
     "ensure_converted_medusa_adapter",
     "ensure_vllm_compatible_eagle_draft_model",
     "get_default_eagle_test_model_ids",
-    "run_in_spawned_process",
 ]

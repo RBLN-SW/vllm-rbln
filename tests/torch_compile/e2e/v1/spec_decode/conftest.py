@@ -17,6 +17,8 @@ import pytest
 
 @pytest.fixture(scope="module", autouse=True)
 def common_specdec_env(monkeypatch_module):
+    monkeypatch_module.setenv("VLLM_RBLN_USE_CUSTOM_KERNEL", "1")
     monkeypatch_module.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
     monkeypatch_module.setenv("VLLM_DISABLE_COMPILE_CACHE", "1")
     monkeypatch_module.setenv("VLLM_RBLN_ENABLE_WARM_UP", "1")
+    monkeypatch_module.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
