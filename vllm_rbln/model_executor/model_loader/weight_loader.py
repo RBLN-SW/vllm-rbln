@@ -487,6 +487,18 @@ def load_deepseek_v2_weights(
     params_dict = dict(self.named_parameters())
     loaded_params: set[str] = set()
     for name, loaded_weight in weights:
+        """
+        [RBLN] Skips loading of layers greater than `num_hidden_layers`.
+        `load_deepseek_v2_weights` is bound to `DeepseekV2ForCausalLM`,
+        so weight names are prefixed with `model.layers.X.*`.
+        This must be modified to more graceful code in the future.
+        """
+        if name.startswith("model.layers"):
+            layer_idx = int(name.split(".")[2])
+            if layer_idx >= self.config.num_hidden_layers:
+                continue
+        #######
+
         if "rotary_emb.inv_freq" in name:
             continue
 
@@ -512,6 +524,9 @@ def load_deepseek_v2_weights(
             if is_pp_missing_parameter(name, self):
                 continue
 
+            if name not in params_dict:
+                continue
+
             param = params_dict[name]
             weight_loader = param.weight_loader
             weight_loader(param, loaded_weight, shard_id)
@@ -534,6 +549,9 @@ def load_deepseek_v2_weights(
                     name_mapped = chunk_name.replace(weight_name, param_name)
 
                     if is_pp_missing_parameter(name_mapped, self):
+                        continue
+
+                    if name_mapped not in params_dict:
                         continue
 
                     param = params_dict[name_mapped]
@@ -563,6 +581,9 @@ def load_deepseek_v2_weights(
                         continue
 
                     if is_pp_missing_parameter(name, self):
+                        continue
+
+                    if name not in params_dict:
                         continue
 
                     param = params_dict[name]
