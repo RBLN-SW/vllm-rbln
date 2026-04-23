@@ -47,7 +47,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_USE_CUSTOM_KERNEL: bool = False
     VLLM_RBLN_AUTO_PORT: bool = True
     VLLM_RBLN_CCL_ALL2ALL_P2P: bool = False
-    VLLM_RBLN_MOE_REDUCE_SCATTER: bool = False
+    VLLM_RBLN_DISPATCH_ALL2ALL: bool = False
 
 
 def get_dp_impl() -> str:
@@ -270,6 +270,20 @@ environment_variables = {
     "VLLM_RBLN_CCL_ALL2ALL_P2P": (
         lambda: (
             os.environ.get("VLLM_RBLN_CCL_ALL2ALL_P2P", "False").lower()
+            in ("true", "1")
+        )
+    ),
+    # Use all2all dispatch instead of all-gather for MoE DP dispatch
+    "VLLM_RBLN_DISPATCH_ALL2ALL": (
+        lambda: (
+            os.environ.get("VLLM_RBLN_DISPATCH_ALL2ALL", "False").lower()
+            in ("true", "1")
+        )
+    ),
+    # Use all2all combine instead of reduce-scatter for MoE DP combine
+    "VLLM_RBLN_COMBINE_ALL2ALL": (
+        lambda: (
+            os.environ.get("VLLM_RBLN_COMBINE_ALL2ALL", "False").lower()
             in ("true", "1")
         )
     ),
