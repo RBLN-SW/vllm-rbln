@@ -69,3 +69,8 @@ def test_basic_medusa_generation() -> None:
     assert "vllm:spec_decode_num_drafts" in metric_names
     assert "vllm:spec_decode_num_draft_tokens" in metric_names
     assert "vllm:spec_decode_num_accepted_tokens" in metric_names
+
+    accepted_tokens = next(
+        m for m in metrics if m.name == "vllm:spec_decode_num_accepted_tokens"
+    )
+    assert accepted_tokens.value > 0

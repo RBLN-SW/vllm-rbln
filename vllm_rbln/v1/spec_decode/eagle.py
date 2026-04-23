@@ -174,7 +174,7 @@ class RBLNEagleProposer(EagleProposer):
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1:
-            draft_tokens_ids = logits[:batch_size].argmax(dim=-1)
+            draft_tokens_ids = self._argmax_draft_logits(logits[:batch_size])
             return draft_tokens_ids.view(-1, 1)
 
         positions = (
@@ -188,7 +188,7 @@ class RBLNEagleProposer(EagleProposer):
             # NOTE(RBLN): tree attention is not supported
             raise NotImplementedError("Tree attention is not supported")
 
-        draft_token_ids = logits[:batch_size].argmax(dim=-1)
+        draft_token_ids = self._argmax_draft_logits(logits[:batch_size])
 
         if self.allowed_attn_types is not None and not isinstance(
             attn_metadata, self.allowed_attn_types
@@ -329,7 +329,7 @@ class RBLNEagleProposer(EagleProposer):
                     inputs_embeds=inputs_embeds,
                     last_token_indices=None,
                 )
-            draft_token_ids = logits[:batch_size].argmax(dim=-1)
+            draft_token_ids = self._argmax_draft_logits(logits[:batch_size])
             draft_token_ids_list.append(draft_token_ids)
 
         # [batch_size, num_speculative_tokens]
@@ -445,8 +445,37 @@ class RBLNEagleProposer(EagleProposer):
             num_rejected_tokens_gpu,
         )
 
+    def _argmax_draft_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        """Take argmax and, for eagle3, map from draft-vocab to target-vocab IDs.
+
+        The eagle3 draft head emits logits sized to ``draft_vocab_size`` and
+        Eagle3LlamaForCausalLM.compute_logits scatters them into a full
+        target-vocab tensor using ``new_full(-inf) + advanced indexing``.
+        Compiling that scatter on the RBLN backend produces NaN for every
+        unwritten slot (rather than -inf), so argmax picks the first NaN
+        position instead of the highest-scoring token. We bypass it here: the
+        compiled graph now returns draft-vocab logits directly, and we convert
+        to target-vocab IDs in eager with the ``draft_id_to_target_id`` map.
+        """
+        draft_ids = logits.argmax(dim=-1)
+        if self.method != "eagle3":
+            return draft_ids
+        d2t = self.model.draft_id_to_target_id
+        return (draft_ids + d2t[draft_ids]).to(torch.int64)
+
     def load_model(self, target_model: nn.Module) -> None:
         super().load_model(target_model)
+
+        def compute_draft_logits(sample_hidden_states: torch.Tensor) -> torch.Tensor:
+            if self.method == "eagle3":
+                # Skip Eagle3LlamaForCausalLM.compute_logits because its
+                # `new_full(-inf)` + scatter path breaks under RBLN compile.
+                # Draft-vocab logits are enough; we map draft->target IDs in
+                # eager via draft_id_to_target_id after argmax.
+                return self.model.logits_processor(
+                    self.model.lm_head, sample_hidden_states
+                )
+            return self.model.compute_logits(sample_hidden_states)
 
         def model_wrapper(
             input_ids: torch.Tensor,
@@ -474,7 +503,7 @@ class RBLNEagleProposer(EagleProposer):
                 if last_token_indices is not None
                 else last_hidden_states
             )
-            logits = self.model.compute_logits(sample_hidden_states)
+            logits = compute_draft_logits(sample_hidden_states)
 
             return hidden_states, logits
 
