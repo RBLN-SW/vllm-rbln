@@ -73,6 +73,6 @@ def register_ops():
         from vllm_rbln.triton_kernels import flash_attention  # noqa
         from vllm_rbln.triton_kernels import flash_causal_attention  # noqa
         from vllm_rbln.triton_kernels import sliding_window_attention  # noqa
-        from vllm_rbln.v1.attention.backends.mla.flash_attn_mla import (  # noqa: F401
+        from vllm_rbln.v1.attention.backends.mla.flashattn_mla import (  # noqa: F401
             RBLNFlashAttnMLABackend,
         )
