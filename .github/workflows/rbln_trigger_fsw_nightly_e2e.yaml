@@ -13,11 +13,33 @@ on:
         default: dev
 
 jobs:
-  trigger-vllm-rbln-fsw-nightly-e2e:
+  resolve-vllm-versions:
     if: github.repository_owner == 'RBLN-SW'
     runs-on: fsw-r18s-atom-ext-rbln-sw-general-c1m12
+    outputs:
+      versions: ${{ steps.pick.outputs.versions }}
     steps:
-      - name: Dispatch to fsw-integration
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || 'dev' }}
+      - id: pick
+        shell: bash
+        run: |
+          set -euo pipefail
+          versions=$(python3 -c 'import json; print(json.dumps(json.load(open(".github/vllm-test-versions.json"))["versions"]))')
+          echo "::notice::vLLM versions to dispatch: $versions"
+          echo "versions=$versions" >> "$GITHUB_OUTPUT"
+
+  trigger-vllm-rbln-fsw-nightly-e2e:
+    needs: resolve-vllm-versions
+    if: github.repository_owner == 'RBLN-SW'
+    runs-on: fsw-r18s-atom-ext-rbln-sw-general-c1m12
+    strategy:
+      fail-fast: false
+      matrix:
+        vllm_version: ${{ fromJSON(needs.resolve-vllm-versions.outputs.versions) }}
+    steps:
+      - name: Dispatch to fsw-integration (vllm ${{ matrix.vllm_version }})
         uses: Wandalen/wretry.action@v3
         with:
           action: peter-evans/repository-dispatch@v4
@@ -30,5 +52,6 @@ jobs:
             client-payload: |
               {
                 "ref": "${{ inputs.ref || 'dev' }}",
-                "actor": "${{ github.actor }}"
+                "actor": "${{ github.actor }}",
+                "vllm_version": "${{ matrix.vllm_version }}"
               }

@@ -1,0 +1,6 @@
+{
+  "_comment": "Before adding a new version here, ask the Cloud Infra team to publish a vllm wheel built for that version on the private PyPI mirror (same index that serves rebel-compiler). Upstream wheels.vllm.ai targets a newer glibc than our CI runners (manylinux_2_34), so vllm installs resolve against the privately re-built wheel, not wheels.vllm.ai.",
+  "versions": [
+    "0.18.0+cpu"
+  ]
+}
