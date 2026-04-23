@@ -471,82 +471,133 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         model_input: ModelInputForRBLN,
         scheduler_output: "SchedulerOutput",
     ) -> torch.Tensor:
-        """Consumer path: reconstruct embedding inputs from cached
-        encode() output and run preprocess_prefill + prefill_decoder."""
-        mm_hash = self._get_mm_hash_for_request(scheduler_output)
-        if mm_hash is not None and mm_hash in self.encoder_cache:
+        """Consumer path: reconstruct embedding inputs from all cached
+        per-mm_feature encode() outputs and run preprocess_prefill +
+        prefill_decoder.
+
+        Each image/video in the request is a separate mm_feature with its
+        own identifier; the producer caches one encode() result per
+        mm_feature. This walks every mm_feature of the new request in
+        order, fetches its cached embeddings, and concatenates them so
+        the LLM sees the full embedding sequence for the whole request.
+        """
+        if not scheduler_output.scheduled_new_reqs:
+            raise RuntimeError(
+                "EC consumer: no scheduled_new_reqs on prefill step."
+            )
+        req = scheduler_output.scheduled_new_reqs[0]
+        if not req.mm_features:
+            raise RuntimeError("EC consumer: request has no mm_features.")
+
+        model_dtype = self.model.dtype
+
+        image_caches: list[dict] = []
+        video_caches: list[dict] = []
+        for feat in req.mm_features:
+            mm_hash = feat.identifier
+            if mm_hash not in self.encoder_cache:
+                raise RuntimeError(
+                    f"EC consumer cache miss: mm_hash={mm_hash}, "
+                    f"encoder_cache_keys={list(self.encoder_cache.keys())[:5]}, "
+                    f"mm_features={[f.identifier for f in req.mm_features]}"
+                )
             cached = self.encoder_cache[mm_hash]
-            model_dtype = self.model.dtype
+            modality = getattr(feat, "modality", None)
+            if modality == "image" or (modality is None and "image_embeds" in cached):
+                image_caches.append(cached)
+            elif modality == "video" or (modality is None and "video_embeds" in cached):
+                video_caches.append(cached)
+            else:
+                # Fallback: include into whichever modality is populated.
+                if "image_embeds" in cached:
+                    image_caches.append(cached)
+                if "video_embeds" in cached:
+                    video_caches.append(cached)
 
-            # Reconstruct image/video inputs with embedding type
-            # so preprocess_prefill skips the vision encoder.
-            image_input = None
-            video_input = None
-
-            if "image_embeds" in cached:
-                image_input = self.model._create_image_embedding_inputs(
-                    image_embeds=cached["image_embeds"].to(model_dtype),
-                    image_grid_thw=cached["image_grid_thw"].to(torch.int64),
+        def _concat_deepstack(caches: list[dict], key: str) -> list[torch.Tensor] | None:
+            """Concat per-layer deepstack tensors across features along dim=0."""
+            present = [c for c in caches if c.get(key) is not None]
+            if not present:
+                return None
+            num_layers = len(present[0][key])
+            out: list[torch.Tensor] = []
+            for layer in range(num_layers):
+                out.append(
+                    torch.cat(
+                        [c[key][layer].to(model_dtype) for c in present], dim=0
+                    )
                 )
-            if "video_embeds" in cached:
-                video_input = self.model._create_video_embedding_inputs(
-                    video_embeds=cached["video_embeds"].to(model_dtype),
-                    video_grid_thw=cached["video_grid_thw"].to(torch.int64),
-                )
-                # Pass through second_per_grid_ts for Qwen2.5-VL
-                if "second_per_grid_ts" in cached:
-                    video_input["second_per_grid_ts"] = cached["second_per_grid_ts"]
+            return out
 
-            # Run preprocess_prefill with pre-computed embeddings.
-            # Forward deepstack features when present (Qwen3-VL): the
-            # visual encoder is skipped on the consumer side so deepstack
-            # outputs that normally come out of visual() must be replayed
-            # from the cache.
-            input_ids = model_input.input_tokens
-            attention_mask = torch.ones_like(input_ids)
-            deepstack_image_embeds = cached.get("deepstack_image_embeds")
-            deepstack_video_embeds = cached.get("deepstack_video_embeds")
-            if deepstack_image_embeds is not None:
-                deepstack_image_embeds = [
-                    t.to(model_dtype) for t in deepstack_image_embeds
-                ]
-            if deepstack_video_embeds is not None:
-                deepstack_video_embeds = [
-                    t.to(model_dtype) for t in deepstack_video_embeds
-                ]
-            prefill_params = self.model.preprocess_prefill(
-                input_ids,
-                attention_mask,
-                image_input,
-                video_input,
-                deepstack_image_embeds=deepstack_image_embeds,
-                deepstack_video_embeds=deepstack_video_embeds,
+        image_input = None
+        video_input = None
+        deepstack_image_embeds = None
+        deepstack_video_embeds = None
+
+        if image_caches:
+            image_embeds = torch.cat(
+                [c["image_embeds"].to(model_dtype) for c in image_caches], dim=0
+            )
+            image_grid_thw = torch.cat(
+                [c["image_grid_thw"].to(torch.int64) for c in image_caches], dim=0
+            )
+            image_input = self.model._create_image_embedding_inputs(
+                image_embeds=image_embeds,
+                image_grid_thw=image_grid_thw,
+            )
+            deepstack_image_embeds = _concat_deepstack(
+                image_caches, "deepstack_image_embeds"
             )
 
-            # Extract rope_deltas for bookkeeping (same as forward())
-            rope_deltas = prefill_params.pop("rope_deltas", None)
-            if rope_deltas is not None:
-                cur_request_id = model_input.running_requests_ids[0]
-                self.model.rope_deltas[cur_request_id] = rope_deltas.item()
-
-            kwargs = self.model.preprocess_for_decoder(
-                True,
-                model_input.block_tables,
-                model_input.input_tokens,
-                model_input.input_positions,
+        if video_caches:
+            video_embeds = torch.cat(
+                [c["video_embeds"].to(model_dtype) for c in video_caches], dim=0
             )
-            block_tables = kwargs.pop("block_tables")
-            logits = self.model.model.prefill_decoder(
-                **prefill_params,
-                block_tables=block_tables,
-            ).logits
-            return logits
+            video_grid_thw = torch.cat(
+                [c["video_grid_thw"].to(torch.int64) for c in video_caches], dim=0
+            )
+            video_input = self.model._create_video_embedding_inputs(
+                video_embeds=video_embeds,
+                video_grid_thw=video_grid_thw,
+            )
+            # Qwen2.5-VL: second_per_grid_ts is per-video metadata; carry
+            # the first feature's value as a best-effort for mixed batches.
+            if "second_per_grid_ts" in video_caches[0]:
+                video_input["second_per_grid_ts"] = video_caches[0][
+                    "second_per_grid_ts"
+                ]
+            deepstack_video_embeds = _concat_deepstack(
+                video_caches, "deepstack_video_embeds"
+            )
 
-        raise RuntimeError(
-            f"EC consumer cache miss: mm_hash={mm_hash}, "
-            f"encoder_cache_keys={list(self.encoder_cache.keys())[:5]}, "
-            f"scheduled_new_reqs={len(scheduler_output.scheduled_new_reqs)}"
+        input_ids = model_input.input_tokens
+        attention_mask = torch.ones_like(input_ids)
+        prefill_params = self.model.preprocess_prefill(
+            input_ids,
+            attention_mask,
+            image_input,
+            video_input,
+            deepstack_image_embeds=deepstack_image_embeds,
+            deepstack_video_embeds=deepstack_video_embeds,
         )
+
+        rope_deltas = prefill_params.pop("rope_deltas", None)
+        if rope_deltas is not None:
+            cur_request_id = model_input.running_requests_ids[0]
+            self.model.rope_deltas[cur_request_id] = rope_deltas.item()
+
+        kwargs = self.model.preprocess_for_decoder(
+            True,
+            model_input.block_tables,
+            model_input.input_tokens,
+            model_input.input_positions,
+        )
+        block_tables = kwargs.pop("block_tables")
+        logits = self.model.model.prefill_decoder(
+            **prefill_params,
+            block_tables=block_tables,
+        ).logits
+        return logits
 
     @staticmethod
     def _get_mm_hash_for_request(
