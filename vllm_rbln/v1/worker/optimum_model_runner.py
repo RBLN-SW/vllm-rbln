@@ -482,9 +482,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         the LLM sees the full embedding sequence for the whole request.
         """
         if not scheduler_output.scheduled_new_reqs:
-            raise RuntimeError(
-                "EC consumer: no scheduled_new_reqs on prefill step."
-            )
+            raise RuntimeError("EC consumer: no scheduled_new_reqs on prefill step.")
         req = scheduler_output.scheduled_new_reqs[0]
         if not req.mm_features:
             raise RuntimeError("EC consumer: request has no mm_features.")
@@ -514,7 +512,9 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                 if "video_embeds" in cached:
                     video_caches.append(cached)
 
-        def _concat_deepstack(caches: list[dict], key: str) -> list[torch.Tensor] | None:
+        def _concat_deepstack(
+            caches: list[dict], key: str
+        ) -> list[torch.Tensor] | None:
             """Concat per-layer deepstack tensors across features along dim=0."""
             present = [c for c in caches if c.get(key) is not None]
             if not present:
@@ -523,9 +523,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             out: list[torch.Tensor] = []
             for layer in range(num_layers):
                 out.append(
-                    torch.cat(
-                        [c[key][layer].to(model_dtype) for c in present], dim=0
-                    )
+                    torch.cat([c[key][layer].to(model_dtype) for c in present], dim=0)
                 )
             return out
 
