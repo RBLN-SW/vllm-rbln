@@ -794,8 +794,8 @@ class TestDetermineAvailableMemory:
     def test_draft_model_kernel_size_is_added(self):
         worker = self._setup()
         draft_model = MagicMock()
-        draft_model.named_parameters.return_value = [
-            ("draft.weight", torch.zeros(40, dtype=torch.bfloat16)),
+        draft_model.parameters.return_value = [
+            torch.zeros(40, dtype=torch.bfloat16),
         ]
         worker.model_runner.drafter = SimpleNamespace(model=draft_model)
         worker.speculative_config = SimpleNamespace(
@@ -818,15 +818,18 @@ class TestDetermineAvailableMemory:
             worker.determine_available_memory()
 
         assert kernel_est.call_count == 2
+        assert kernel_est.call_args_list[0].kwargs["n_model_bytes"] == 300
+        assert kernel_est.call_args_list[1].kwargs["n_model_bytes"] == 80
         assert est.call_args.kwargs["kernel_size"] == 520
-        assert "n_model_params" not in est.call_args.kwargs
+        assert est.call_args.kwargs["num_runtimes"] == 4
+        assert "n_model_bytes" not in est.call_args.kwargs
 
     def test_draft_model_fp8_params_are_reflected_in_kernel_estimation(self):
         worker = self._setup()
         draft_model = MagicMock()
-        draft_model.named_parameters.return_value = [
-            ("draft.attn.weight", torch.zeros(100, dtype=torch.bfloat16)),
-            ("draft.mlp.weight", torch.zeros(50, dtype=torch.uint8)),
+        draft_model.parameters.return_value = [
+            torch.zeros(100, dtype=torch.bfloat16),
+            torch.zeros(50, dtype=torch.uint8),
         ]
         worker.model_runner.drafter = SimpleNamespace(model=draft_model)
         worker.speculative_config = SimpleNamespace(
@@ -850,8 +853,7 @@ class TestDetermineAvailableMemory:
 
         draft_call = kernel_est.call_args_list[1].kwargs
         assert draft_call["parallel_config"] is worker.parallel_config
-        assert draft_call["nbits_per_param"] == 8
-        assert draft_call["n_model_params"] == 150
+        assert draft_call["n_model_bytes"] == 250
 
 
 # ===========================================================================
