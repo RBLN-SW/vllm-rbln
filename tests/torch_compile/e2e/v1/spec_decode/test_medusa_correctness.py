@@ -89,5 +89,3 @@ def test_medusa_matches_base_generation() -> None:
         )
         assert base_output.outputs[0].text == medusa_output.outputs[0].text
         assert base_output.outputs[0].token_ids == medusa_output.outputs[0].token_ids
-
-
