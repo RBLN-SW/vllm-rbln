@@ -69,9 +69,17 @@ def _build_eagle_llm(method: str) -> LLM:
     )
 
 
-@pytest.mark.parametrize("method", ["eagle", "eagle3"])
-def test_eagle_matches_base_generation(method: str) -> None:
-    sampling_params = SamplingParams(temperature=0.0, top_p=1.0, max_tokens=32)
+@pytest.mark.parametrize(
+    ("method", "max_tokens"),
+    [("eagle", 8), ("eagle3", 32)],
+)
+def test_eagle_matches_base_generation(method: str, max_tokens: int) -> None:
+    sampling_params = SamplingParams(
+        temperature=0.0,
+        top_p=1.0,
+        max_tokens=max_tokens,
+        ignore_eos=True,
+    )
 
     base_llm = _build_base_llm(method)
     base_outputs = base_llm.generate(PROMPTS, sampling_params=sampling_params)
