@@ -345,7 +345,8 @@ class RBLNWorker(WorkerBase):
                 draft_nbits_per_param = 16
                 draft_packed_num_elems = 1
 
-            for value in draft_model.parameters():
+            draft_params_dict = dict(draft_model.named_parameters())
+            for key, value in draft_params_dict.items():
                 if value.dtype == torch.bfloat16:
                     draft_n_model_attentions += value.numel()
                 else:
