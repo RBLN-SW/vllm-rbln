@@ -401,7 +401,9 @@ class RBLNOptimumQwen3VLForConditionalGeneration(
             "position_embed": preprocess_outputs[1],
             "rope_deltas": preprocess_outputs[2],
             "visual_pos_mask": preprocess_outputs[3],
-            "deepstack_embeds": deepstack_embeds.squeeze(0) if deepstack_embeds is not None else None,
+            "deepstack_embeds": deepstack_embeds.squeeze(0)
+            if deepstack_embeds is not None
+            else None,
         }
 
     def _add_model_specific_args(self, preprocess_args: dict, video_input: Any):
