@@ -12,17 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# TODO: drop entries as the underlying issues are resolved.
-# - models/test_basic_models_correctness.py: slow and redundant with
-#   the coverage suite; drop once the nightly budget accommodates it.
-# - models/test_model_coverage_single.py: EXAONE-3.5-2.4B fails with
-#   ImportError: RopeParameters (transformers version mismatch) and
-#   Mistral-7B OOMs the runner container (exit 137) mid-run.
-# - v1/lora/: LoRA e2e suite isn't yet stable under the nightly FSW
-#   matrix.
-# Pooling model tests under models/ continue to run.
-collect_ignore = [
-    "models/test_basic_models_correctness.py",
-    "models/test_model_coverage_single.py",
-    "v1/lora",
-]
+# TODO: drop this once the LoRA e2e suite is stable under the nightly
+# FSW matrix.
+collect_ignore = ["v1/lora"]
