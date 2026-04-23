@@ -75,7 +75,6 @@ def estimate_model_kernel_size(
     lm_heads_nbytes = (
         align_2MB(lm_heads_params * default_bits_per_param // 8 / tp_size) * tp_size
     )
-
     if n_model_bytes is not None:
         lm_heads_bytes = lm_heads_params * default_bits_per_param // 8
         word_embedding_bytes = lm_heads_bytes
@@ -89,9 +88,11 @@ def estimate_model_kernel_size(
             )
         word_embedding_params = lm_heads_params
         params = n_model_params - lm_heads_params - word_embedding_params
-        layer_nbytes = align_2MB(params * nbits_per_param // 8 / num_layers) * num_layers
+        layer_nbytes = (
+            align_2MB(params * nbits_per_param // 8 / num_layers) * num_layers
+        )
 
-    return int(layer_nbytes + lm_heads_nbytes)
+    return layer_nbytes + lm_heads_nbytes
 
 
 # NOTE: This function comes from optimum-rbln. Keep in sync.
