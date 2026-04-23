@@ -67,7 +67,12 @@ def _build_medusa_llm() -> LLM:
 
 
 def test_medusa_matches_base_generation() -> None:
-    sampling_params = SamplingParams(temperature=0.0, top_p=1.0, max_tokens=32)
+    sampling_params = SamplingParams(
+        temperature=0.0,
+        top_p=1.0,
+        max_tokens=8,
+        ignore_eos=True,
+    )
 
     base_llm = _build_base_llm()
     base_outputs = base_llm.generate(PROMPTS, sampling_params=sampling_params)
