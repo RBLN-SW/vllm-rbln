@@ -159,10 +159,10 @@ jobs:
           VLLM_CPU_URL="${{ steps.parse_index_url.outputs.VLLM_CPU_URL }}"
           pip install packaging setuptools wheel simphile pynvml huggingface_hub setuptools_scm fire pytest pytest-asyncio
           if [ -n "${{ inputs.optimum_rbln_version }}" ]; then
-            pip install --force-reinstall --no-cache-dir dist/vllm_rbln*.whl --constraint <(echo "optimum-rbln==${{ inputs.optimum_rbln_version }}") --index-url http://pypi-cache.devpi.svc.cluster.local/root/pypi/+simple/ --extra-index-url "${VLLM_CPU_URL}" --extra-index-url https://download.pytorch.org/whl/cpu --trusted-host pypi-cache.devpi.svc.cluster.local
+            pip install --force-reinstall --no-cache-dir dist/vllm_rbln*.whl --constraint <(echo "optimum-rbln==${{ inputs.optimum_rbln_version }}") --index-url http://pypi-cache.devpi.svc.cluster.local/root/pypi/+simple/ --extra-index-url "${VLLM_CPU_URL}" --extra-index-url https://download.pytorch.org/whl/cpu --trusted-host pypi-cache.devpi.svc.cluster.local --extra-index-url https://pypi.org/simple
             echo "optimum-rbln ${{ inputs.optimum_rbln_version }}"
           else
-            pip install --force-reinstall --no-cache-dir dist/vllm_rbln*.whl --index-url http://pypi-cache.devpi.svc.cluster.local/root/pypi/+simple/ --extra-index-url "${VLLM_CPU_URL}" --extra-index-url https://download.pytorch.org/whl/cpu --trusted-host pypi-cache.devpi.svc.cluster.local
+            pip install --force-reinstall --no-cache-dir dist/vllm_rbln*.whl --index-url http://pypi-cache.devpi.svc.cluster.local/root/pypi/+simple/ --extra-index-url "${VLLM_CPU_URL}" --extra-index-url https://download.pytorch.org/whl/cpu --trusted-host pypi-cache.devpi.svc.cluster.local --extra-index-url https://pypi.org/simple
           fi
 
       - name: Run pytest
