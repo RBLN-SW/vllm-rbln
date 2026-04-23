@@ -565,9 +565,7 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
             # remove triggers NIXL_ERR_REMOTE_DISCONNECT when UCX state
             # gets confused.
             if engine_id in self._remote_agents:
-                self._nixl_agent.remove_remote_agent(
-                    self._remote_agents[engine_id]
-                )
+                self._nixl_agent.remove_remote_agent(self._remote_agents[engine_id])
             self._remote_agents[engine_id] = self._nixl_agent.add_remote_agent(
                 meta.agent_metadata
             )
