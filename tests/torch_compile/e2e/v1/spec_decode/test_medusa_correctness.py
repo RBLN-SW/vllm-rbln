@@ -24,7 +24,6 @@ from .utils import (
     DEFAULT_MEDUSA_MODEL_ID,
     DEFAULT_MODEL_ID,
     ensure_converted_medusa_adapter,
-    run_in_spawned_process,
 )
 
 PROMPTS = [
@@ -67,7 +66,7 @@ def _build_medusa_llm() -> LLM:
     )
 
 
-def _run_medusa_matches_base_generation() -> None:
+def test_medusa_matches_base_generation() -> None:
     sampling_params = SamplingParams(temperature=0.0, top_p=1.0, max_tokens=32)
 
     base_llm = _build_base_llm()
@@ -92,11 +91,3 @@ def _run_medusa_matches_base_generation() -> None:
         assert base_output.outputs[0].token_ids == medusa_output.outputs[0].token_ids
 
 
-def test_medusa_matches_base_generation():
-    run_in_spawned_process(
-        module_name=__name__,
-        func_name="_run_medusa_matches_base_generation",
-        env={
-            "RBLN_USE_CUSTOM_KERNEL": "1",
-        },
-    )
