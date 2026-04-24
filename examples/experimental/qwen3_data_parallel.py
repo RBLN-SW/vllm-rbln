@@ -46,7 +46,7 @@ import os
 from time import sleep
 
 from vllm import LLM, SamplingParams
-from vllm.utils import get_open_port
+from vllm.utils.network_utils import get_open_port
 
 
 def main(

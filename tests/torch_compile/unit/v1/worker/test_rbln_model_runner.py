@@ -267,13 +267,12 @@ class TestExecuteModelStateFeature:
             "hidden_states",
             "sample_hidden_states",
             "aux_hidden_states",
-            "kv_connector_output",
             "slot_mappings",
         )
         assert ExecuteModelState._fields == expected_fields
 
     def test_field_count(self):
-        assert len(ExecuteModelState._fields) == 9
+        assert len(ExecuteModelState._fields) == 8
 
     def test_is_named_tuple(self):
         assert issubclass(ExecuteModelState, tuple)
@@ -287,7 +286,6 @@ class TestExecuteModelStateFeature:
             hidden_states=torch.ones(2, 10),
             sample_hidden_states=None,
             aux_hidden_states=None,
-            kv_connector_output=None,
             slot_mappings=None,
         )
         assert state.spec_decode_metadata is None
@@ -305,7 +303,6 @@ class TestExecuteModelStateFeature:
             hidden_states=torch.zeros(1),
             sample_hidden_states=None,
             aux_hidden_states=None,
-            kv_connector_output=None,
             slot_mappings=mappings,
         )
         assert "layer_0" in state.slot_mappings
@@ -324,7 +321,6 @@ class TestExecuteModelStateFeature:
             hidden_states=torch.zeros(1),
             sample_hidden_states=None,
             aux_hidden_states=None,
-            kv_connector_output=None,
             slot_mappings=mappings,
         )
         assert len(state.slot_mappings) == 2

@@ -76,7 +76,7 @@ from vllm_rbln.utils.optimum.configuration import is_qwen3_pooling
 from vllm_rbln.utils.optimum.registry import get_rbln_model_info
 from vllm_rbln.v1.core.optimum_scheduler import RBLNSchedulerOutput
 from vllm_rbln.v1.sample import WARM_UP_CONFIGS, RBLNSampler
-from vllm_rbln.v1.worker.metrics import PerformanceTracker
+from vllm_rbln.v1.worker.metrics import PerformanceTracker, collect_metrics
 from vllm_rbln.v1.worker.optimum_input_batch import RBLNInputBatch
 
 if TYPE_CHECKING:
@@ -318,7 +318,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
                 # FIXME model_input must be modified to be padded
                 hidden_states = self.model(model_input)
             if envs.VLLM_RBLN_METRICS and self.model_performance_tracker is not None:
-                self.collect_metrics(
+                collect_metrics(
                     self.model_performance_tracker,
                     model_input.is_prompt,
                     start_time=model_start_time,
@@ -1301,7 +1301,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
             with capture_ctx as sampler_reports:
                 sampler_output = self._sample(padded_logits, spec_decode_metadata=None)
             if envs.VLLM_RBLN_METRICS and self.sampler_performance_tracker is not None:
-                self.collect_metrics(
+                collect_metrics(
                     self.sampler_performance_tracker,
                     is_prompt,
                     start_time=sampler_start_time,
@@ -1485,37 +1485,3 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
             logprobs_tensors = LogprobsTensors(**dict)
 
         return num_sampled_tokens, sampled_token_ids, logprobs_tensors
-
-    def collect_metrics(
-        self,
-        performance_tracker: PerformanceTracker,
-        is_prefill: bool,
-        start_time: float,
-        end_time: float,
-        reports: list[dict],
-        token_count: int,
-    ) -> None:
-        execution_time = end_time - start_time
-        host_time = None
-        device_time = None
-        ccl_time = None
-        if reports is not None and len(reports) > 0:
-            host_time = reports[0].get("total_host", None)
-            device_time = reports[0].get("total_device", None)
-            ccl_time = reports[0].get("total_ccl", None)
-        if is_prefill:
-            performance_tracker.record_prefill(
-                execution_time,
-                token_count,
-                host_time=host_time,
-                device_time=device_time,
-                ccl_time=ccl_time,
-            )
-        else:
-            performance_tracker.record_decode(
-                execution_time,
-                token_count,
-                host_time=host_time,
-                device_time=device_time,
-                ccl_time=ccl_time,
-            )
