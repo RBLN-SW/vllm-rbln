@@ -465,20 +465,17 @@ class RBLNOptimumQwen3VLForConditionalGeneration(
     """
 
     def _build_prefill_params(self, preprocess_outputs: tuple) -> dict:
-        # deepstack_embeds: [1, L, N, H] -> [L, N, H] when present.
-        # Prefill steps with no image/video tokens (or cached-encoder
-        # requests whose deepstack features weren't available) produce
-        # None here; the runtime wrapper already fills zeros of the
-        # correct per-chunk shape when these slots are None, so forward
-        # None through rather than fabricating a misshaped placeholder.
-        deepstack_raw = preprocess_outputs[4]
-        deepstack_embeds = None if deepstack_raw is None else deepstack_raw.squeeze(0)
+        # deepstack_embeds
+        # [1, 3, num_patches, embedding_dim] -> [3, num_patches, embedding_dim]
+        deepstack_embeds = preprocess_outputs[4]
         return {
             "inputs_embeds": preprocess_outputs[0],
             "position_embed": preprocess_outputs[1],
             "rope_deltas": preprocess_outputs[2],
             "visual_pos_mask": preprocess_outputs[3],
-            "deepstack_embeds": deepstack_embeds,
+            "deepstack_embeds": deepstack_embeds.squeeze(0)
+            if deepstack_embeds is not None
+            else None,
         }
 
     def _add_model_specific_args(self, preprocess_args: dict, video_input: Any):

@@ -219,8 +219,6 @@ class RBLNWorker(WorkerBase):
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
         params_dict = dict(self.model_runner.model.named_parameters())
-        n_model_attentions = 0
-        n_model_experts = 0
         device_name = current_platform.get_device_name().lower()
         assert "rbln" in device_name
 
@@ -238,7 +236,30 @@ class RBLNWorker(WorkerBase):
             )
             # FIXME(RBLN) - for now, mxfp4/fp8 quantization is only supported
             quantization = self.model_config.quantization
-            assert quantization == "mxfp4" or quantization == "fp8"
+            assert quantization in ("mxfp4", "fp8", "compressed-tensors")
+
+            if quantization == "compressed-tensors":
+                qcfg = (
+                    getattr(self.model_config.hf_config, "quantization_config", {})
+                    or {}
+                )
+                groups = qcfg.get("config_groups", {})
+                num_bits_set: set[int] = set()
+                for group_cfg in groups.values():
+                    nb = group_cfg.get("weights", {}).get("num_bits")
+                    if nb is not None:
+                        num_bits_set.add(nb)
+                if not num_bits_set:
+                    logger.warning(
+                        "compressed-tensors quantization_config has no num_bits; "
+                        "assuming fp8."
+                    )
+                elif num_bits_set != {8}:
+                    raise ValueError(
+                        f"compressed-tensors config has unsupported bit-widths "
+                        f"{num_bits_set}; only 8-bit (fp8) is supported."
+                    )
+                quantization = "fp8"
 
             if quantization == "fp8":
                 nbits_per_param = 8
@@ -269,29 +290,27 @@ class RBLNWorker(WorkerBase):
             nbits_per_param = 16
             packed_num_elems = 1
 
+        n_model_bytes = 0
         for key, value in params_dict.items():
-            if value.dtype == torch.bfloat16:
-                n_model_attentions += value.numel()
+            if value.is_floating_point():
+                n_model_bytes += value.numel() * value.element_size()
             else:
-                # quantized params is handled
-                n_model_experts += value.numel() * packed_num_elems * ratio
+                n_model_bytes += int(
+                    value.numel() * packed_num_elems * ratio * nbits_per_param // 8
+                )
 
-        # NOTE - model parallel(tp, dp, ep, pp)
-        #        already applied into model params
-        n_model_params = n_model_attentions + n_model_experts
+        logger.info("n_model_bytes = %.2f GB", n_model_bytes / 1024**3)
 
         available_memory_estimate = estimate_available_memory(
             model_config=self.model_config,
             parallel_config=self.parallel_config,
-            # quantization : 4 (This is an ad-hoc value. Need to fix it)
-            nbits_per_param=nbits_per_param,
-            n_model_params=n_model_params,
+            n_model_bytes=n_model_bytes,
             num_runtimes=num_runtimes,
             gpu_memory_utilization=self.cache_config.gpu_memory_utilization,
         )
 
         logger.info(
-            "available_memory_estimate = %.2f GB", available_memory_estimate / 10**9
+            "available_memory_estimate = %.2f GiB", available_memory_estimate / 1024**3
         )
 
         return available_memory_estimate
