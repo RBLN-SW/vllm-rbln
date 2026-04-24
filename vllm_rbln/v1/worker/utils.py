@@ -37,6 +37,7 @@ def estimate_available_memory(
     parallel_config: ParallelConfig,
     nbits_per_param: int | None = None,
     n_model_params: int | None = None,
+    n_model_bytes: int | None = None,
     kernel_size: int | None = None,
     buffer: int | None = None,
     num_runtimes: int = 2,
@@ -84,8 +85,6 @@ def estimate_available_memory(
     num_key_value_heads = model_config.get_num_kv_heads(parallel_config)
     tp_size = parallel_config.tensor_parallel_size
 
-    # TODO(jongho): Update if target npu is REBEL.
-
     device_name = current_platform.get_device_name().lower()
     assert "rbln" in device_name
     if "ca" in device_name:
@@ -127,10 +126,14 @@ def estimate_available_memory(
             )
 
     if kernel_size is None:
-        if n_model_params is None:
+        if n_model_params is None and n_model_bytes is None:
             raise ValueError(
-                "`n_model_params` should be specified \
-                to estimate the kernel memory."
+                "Either `n_model_params` or `n_model_bytes` should be specified "
+                "to estimate the kernel memory."
+            )
+        if n_model_params is not None and n_model_bytes is not None:
+            raise ValueError(
+                "Only one of `n_model_params` or `n_model_bytes` may be specified."
             )
         # Get estimated kernel size (approximated)
         # kernel_size
@@ -144,14 +147,23 @@ def estimate_available_memory(
         lm_heads_nbytes = (
             align_2MB(lm_heads_params * default_bits_per_param // 8 / tp_size) * tp_size
         )
-        word_embedding_params = lm_heads_params
-        params = n_model_params - lm_heads_params - word_embedding_params
-        layer_nbytes = (
-            align_2MB(params * nbits_per_param // 8 / num_layers) * num_layers
-        )
+        if n_model_bytes is not None:
+            lm_heads_bytes = lm_heads_params * default_bits_per_param // 8
+            word_embedding_bytes = lm_heads_params * default_bits_per_param // 8
+            layer_bytes = n_model_bytes - lm_heads_bytes - word_embedding_bytes
+            layer_nbytes = align_2MB(layer_bytes / num_layers) * num_layers
+        else:
+            word_embedding_params = lm_heads_params
+            params = n_model_params - lm_heads_params - word_embedding_params
+            layer_nbytes = (
+                align_2MB(params * nbits_per_param // 8 / num_layers) * num_layers
+            )
         kernel_size = layer_nbytes + lm_heads_nbytes
-    elif n_model_params is not None:
-        raise ValueError("Both `n_model_params` and `kernel_size` cannot be specified.")
+    elif n_model_params is not None or n_model_bytes is not None:
+        raise ValueError(
+            "`n_model_params`/`n_model_bytes` and `kernel_size`"
+            " cannot both be specified."
+        )
 
     available_dram_bytes -= kernel_size
 
@@ -162,7 +174,7 @@ def estimate_available_memory(
         buffer = buffer_per_runtime_per_core * num_runtimes
     available_dram_bytes -= buffer
 
-    rsd_replicas = (rsd_size // num_key_value_heads) or 1
+    rsd_replicas = (rsd_size // num_key_value_heads) or 1 if "ca" in device_name else 1
     available_dram_bytes = available_dram_bytes // rsd_replicas
 
     check_oom(available_dram_bytes)
