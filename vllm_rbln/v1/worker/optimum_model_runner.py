@@ -258,9 +258,7 @@ class RBLNOptimumModelRunner(
         # EC role flags — ec_transfer_config is static, so cache once.
         ec_cfg = getattr(self.vllm_config, "ec_transfer_config", None)
         self.is_ec_producer: bool = ec_cfg is not None and ec_cfg.is_ec_producer
-        self.is_ec_consumer: bool = (
-            ec_cfg is not None and not ec_cfg.is_ec_producer
-        )
+        self.is_ec_consumer: bool = ec_cfg is not None and not ec_cfg.is_ec_producer
 
         # FIXME async_scheduling?
 
