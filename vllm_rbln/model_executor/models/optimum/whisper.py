@@ -27,13 +27,6 @@ from vllm.utils.jsontree import json_map_leaves
 
 from .base import ModelInputForRBLN
 from .model_base import RBLNOptimumDecoderMixin, RBLNOptimumModelBase
-from .optimum_attention import (
-    AttentionManager,
-    InnerAttentionEntry,
-    InnerAttentionStrategy,
-    InnerR1,
-    InnerR2,
-)
 
 logger = init_logger(__name__)
 
@@ -82,28 +75,15 @@ class RBLNOptimumWhisperForConditionalGeneration(
         self.dec_max_seq_len = self.model_config.max_model_len
         self.dec_lengths = [0] * self.batch_size
 
-        self.strategy = InnerAttentionStrategy()
-        self.attention_manager: AttentionManager[
-            InnerAttentionStrategy, InnerAttentionEntry, InnerR1, InnerR2
-        ] = AttentionManager(self.strategy)
-
     def forward(self, model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
         input_ids = model_input.input_tokens
         block_tables = model_input.block_tables
 
-        finished_requests_ids = model_input.finished_requests_ids
-        running_requests_ids = model_input.running_requests_ids
         request_nums = input_ids.shape[0]
 
         is_prompt = model_input.is_prompt
 
-        table_ids = self.attention_manager.get(
-            is_prompt,
-            self.decoder_batch_size,
-            running_requests_ids,
-            finished_requests_ids,
-        )
-        valid_block_ids = torch.tensor(table_ids)
+        valid_block_ids = block_tables.flatten().to(torch.int32)
 
         if is_prompt:
             if model_input.multi_modal_kwargs:
@@ -138,11 +118,7 @@ class RBLNOptimumWhisperForConditionalGeneration(
             # Set the probability of INVALID_TOKEN (the last token in
             # the logits tensor) to 1.0.
             lm_logits[0][0][-1] = 1
-            self.attention_manager.add(
-                running_requests_ids[0],
-                table_ids[0],
-            )
-            self.dec_lengths[table_ids[0]] = 0
+            self.dec_lengths[valid_block_ids[0].item()] = 0
 
         else:
             input_ids[

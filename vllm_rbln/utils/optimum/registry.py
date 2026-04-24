@@ -13,7 +13,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Any
+
+import optimum.rbln
+from optimum.rbln import (
+    RBLNAutoModelForCausalLM,
+    RBLNAutoModelForSpeechSeq2Seq,
+)
 from transformers import PretrainedConfig
+
+from .multimodal import compile_multimodal
 
 # modified/customized models for RBLN
 _RBLN_GENERATION_MODELS: dict[str, tuple[str, str]] = {
@@ -54,6 +63,14 @@ _RBLN_MULTIMODAL_MODELS = {
         "qwen2_5_vl",
         "RBLNQwen2_5_VLForConditionalGeneration",
     ),
+    "Qwen3VLForConditionalGeneration": (
+        "qwen3_vl",
+        "RBLNQwen3VLForConditionalGeneration",
+    ),
+    "Qwen3VLMoeForConditionalGeneration": (
+        "qwen3_vl_moe",
+        "RBLNQwen3VLMoeForConditionalGeneration",
+    ),
     "Idefics3ForConditionalGeneration": (
         "idefics3",
         "RBLNIdefics3ForConditionalGeneration",
@@ -91,6 +108,10 @@ _RBLN_SUPPORTED_MODELS = {
 }
 
 
+def is_generation_arch(config: PretrainedConfig) -> bool:
+    return is_arch_supported(config, _RBLN_GENERATION_MODELS)
+
+
 def is_multi_modal(config: PretrainedConfig) -> bool:
     return is_arch_supported(config, _RBLN_MULTIMODAL_MODELS)
 
@@ -124,3 +145,81 @@ def get_rbln_model_info(config: PretrainedConfig) -> tuple[str, str]:
         f"for now. Supported architectures: "
         f"{list(_RBLN_SUPPORTED_MODELS.keys())}"
     )
+
+
+def compile_model(
+    hf_model_name: str,
+    config: PretrainedConfig,
+    batch_size: int,
+    block_size: int,
+    max_model_len: int,
+    tp_size: int,
+    model_path: str,
+    additional_config: dict[str, Any] | None = None,
+) -> Any:
+    architectures = getattr(config, "architectures", [])
+    model_name, model_cls_name = get_rbln_model_info(
+        config
+    )  # check if the model is supported and get model info
+    default_param: dict[str, Any] = {
+        "rbln_tensor_parallel_size": tp_size,
+    }
+    if additional_config:
+        default_param.update(additional_config)
+    if is_generation_arch(config):
+        default_param["rbln_batch_size"] = batch_size
+        default_param["rbln_max_seq_len"] = max_model_len
+        if block_size != max_model_len:
+            attn_impl = "flash_attn" if block_size != max_model_len else "eager"
+            default_param["rbln_kvcache_partition_len"] = block_size
+            default_param["rbln_attn_impl"] = attn_impl
+
+        model = RBLNAutoModelForCausalLM.from_pretrained(
+            hf_model_name,
+            **default_param,
+        )
+    elif is_pooling_arch(config):
+        model_cls_name = _RBLN_SUPPORTED_MODELS[architectures[0]][1]
+        model_cls = getattr(optimum.rbln, model_cls_name)
+        assert model_cls is not None
+        default_param["rbln_batch_size"] = batch_size
+        default_param["rbln_max_seq_len"] = max_model_len
+        # FIXME: We need a more generalized logic to specify block sizes
+        # as the number of supported models continues to grow.
+        if architectures[0] == "Qwen3Model" and block_size != max_model_len:
+            attn_impl = "flash_attn" if block_size != max_model_len else "eager"
+            default_param["rbln_kvcache_partition_len"] = block_size
+            default_param["rbln_attn_impl"] = attn_impl
+        model = model_cls.from_pretrained(hf_model_name, **default_param)
+    elif is_multi_modal(config):
+        model = compile_multimodal(
+            model_name=hf_model_name,
+            architecture=architectures[0],
+            model_alias=model_name,
+            batch_size=batch_size,
+            max_model_len=max_model_len,
+            block_size=block_size,
+            tp_size=tp_size,
+        )
+    elif is_enc_dec_arch(config):
+        assert architectures[0] == "WhisperForConditionalGeneration"
+        # Whisper model does not require max_model_len and block_size
+        assert block_size == max_model_len, (
+            "block_size must be equal to max_model_len for Whisper models."
+        )  # noqa: E501
+        assert max_model_len == config.max_length, (
+            f"max_model_len ({max_model_len}) must match the Whisper model's "
+            f"max_length ({config.max_length}) from the HuggingFace config."
+        )
+        default_param["rbln_batch_size"] = batch_size
+        model = RBLNAutoModelForSpeechSeq2Seq.from_pretrained(
+            hf_model_name,
+            rbln_token_timestamps=False,
+            **default_param,
+        )
+    else:
+        raise NotImplementedError(
+            f"Compilation is not implemented for architecture {architectures[0]}"
+        )
+    model.save_pretrained(model_path)
+    return model

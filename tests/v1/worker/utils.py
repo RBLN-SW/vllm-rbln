@@ -184,7 +184,6 @@ def make_request(
         mm_features=mm_features if mm_features else None,
         sampling_params=sampling_params,
         pooling_params=None,
-        eos_token_id=100,
         lora_request=None,
         cache_salt=cache_salt,
         block_hasher=get_request_block_hasher(block_size, hash_fn),
@@ -198,9 +197,10 @@ def finish_request(manager: KVCacheManager, request: Request):
 
 def get_vllm_config(async_scheduling=False, max_num_seqs=None):
     max_model_len = MAX_MODEL_LEN
+    max_num_batched_tokens = max(max_num_seqs, MAX_MODEL_LEN)
     scheduler_config = SchedulerConfig(
         max_num_seqs=max_num_seqs if max_num_seqs is not None else MAX_NUM_SEQ,
-        max_num_batched_tokens=max_model_len,
+        max_num_batched_tokens=max_num_batched_tokens,
         max_model_len=max_model_len,
         async_scheduling=async_scheduling,
         is_encoder_decoder=False,
@@ -213,7 +213,6 @@ def get_vllm_config(async_scheduling=False, max_num_seqs=None):
     )
     cache_config = CacheConfig(
         block_size=IB_SIZE,
-        swap_space=0,
         cache_dtype="auto",
         enable_prefix_caching=True,
     )

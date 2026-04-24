@@ -11,18 +11,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import contextlib
 import logging
 import time
 from typing import TYPE_CHECKING, NamedTuple, Union, cast
 
 import numpy as np
+import rebel
 import torch
 import torch.distributed
 import torch.nn as nn
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.model_executor.models.interfaces import (
-    SupportsMultiModal,
     supports_transcription,
 )
 from vllm.model_executor.models.interfaces_base import (
@@ -33,13 +34,13 @@ from vllm.model_executor.models.interfaces_base import (
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
     BatchedTensorInputs,
-    MultiModalKwargs,
     MultiModalKwargsItem,
 )
-from vllm.multimodal.utils import group_mm_kwargs_by_modality
+from vllm.multimodal.utils import group_and_batch_mm_kwargs
 from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
+from vllm.tracing import instrument
 from vllm.utils.import_utils import LazyLoader
 from vllm.utils.jsontree import json_map_leaves
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
@@ -75,7 +76,7 @@ from vllm_rbln.utils.optimum.configuration import is_qwen3_pooling
 from vllm_rbln.utils.optimum.registry import get_rbln_model_info
 from vllm_rbln.v1.core.optimum_scheduler import RBLNSchedulerOutput
 from vllm_rbln.v1.sample import WARM_UP_CONFIGS, RBLNSampler
-from vllm_rbln.v1.worker.metrics import PerformanceTracker
+from vllm_rbln.v1.worker.metrics import PerformanceTracker, collect_metrics
 from vllm_rbln.v1.worker.optimum_input_batch import RBLNInputBatch
 
 if TYPE_CHECKING:
@@ -127,10 +128,6 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
         # self.speculative_config = vllm_config.speculative_config
         # self.prompt_adapter_config = vllm_config.prompt_adapter_config
         # self.observability_config = vllm_config.observability_config
-
-        from vllm.model_executor.models.utils import set_cpu_offload_max_bytes
-
-        set_cpu_offload_max_bytes(0)
 
         model_config = self.model_config
         cache_config = self.cache_config
@@ -205,7 +202,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
             vocab_size=self.model_config.get_vocab_size(),
             block_sizes=[cache_config.block_size],
             kernel_block_sizes=[cache_config.block_size],  # FIXME: why do we need this?
-            is_spec_decode=False,  # No spec decode in optimum model runner
+            max_num_blocks_per_req=None,
             logitsprocs=build_logitsprocs(
                 self.vllm_config,
                 self.device,
@@ -213,6 +210,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
                 self.is_pooling_model,
                 self.vllm_config.model_config.logits_processors,
             ),
+            is_spec_decode=False,  # No spec decode in optimum model runner
             is_pooling_model=self.is_pooling_model,
             use_rbln_sampler=self.use_rbln_sampler,
         )
@@ -240,8 +238,8 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
         )
 
         if envs.VLLM_RBLN_METRICS:
-            self.performance_tracker = PerformanceTracker()
-            self.performance_tracker.register_cleanup()
+            self.model_performance_tracker = PerformanceTracker("MODEL")
+            self.sampler_performance_tracker = PerformanceTracker("SAMPLER")
 
         # Ephemeral state transferred
         # between execute_model() and sample_tokens().
@@ -249,6 +247,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
 
         # FIXME async_scheduling?
 
+    @instrument(span_name="Loading (RBLN)")
     def load_model(self) -> None:
         with set_current_vllm_config(self.vllm_config, check_compile=False):
             self.model = get_optimum_model(vllm_config=self.vllm_config)
@@ -309,22 +308,26 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
             )
 
         with record_function_or_nullcontext("rbln_model_runner: forward"):
-            start_time = time.perf_counter()
-            # FIXME model_input must be modified to be padded
-            hidden_states = self.model(model_input)
+            if hasattr(rebel, "capture_reports"):
+                capture_ctx = rebel.capture_reports()
+            else:
+                # use a dummy context manager that does nothing
+                capture_ctx = contextlib.nullcontext()
+            model_start_time = time.perf_counter()
+            with capture_ctx as model_reports:
+                # FIXME model_input must be modified to be padded
+                hidden_states = self.model(model_input)
+            if envs.VLLM_RBLN_METRICS and self.model_performance_tracker is not None:
+                collect_metrics(
+                    self.model_performance_tracker,
+                    model_input.is_prompt,
+                    start_time=model_start_time,
+                    end_time=time.perf_counter(),
+                    reports=model_reports,
+                    token_count=0,
+                    # the performance of sampler doesn't depend on token count
+                )
             sample_hidden_states = hidden_states.clone()
-            end_time = time.perf_counter()
-            if envs.VLLM_RBLN_METRICS:
-                # Record performance metrics
-                execution_time = end_time - start_time
-                if model_input.is_prompt:
-                    self.performance_tracker.record_prefill(
-                        execution_time, num_scheduled_tokens
-                    )
-                else:
-                    self.performance_tracker.record_decode(
-                        execution_time, num_scheduled_tokens
-                    )
 
         with record_function_or_nullcontext("rbln_model_runner: postprocess"):
             if self.is_pooling_model:
@@ -397,7 +400,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
         # Get the number of scheduled tokens for each request.
         req_ids = self.input_batch.req_ids
         tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
-        num_scheduled_tokens = np.array(tokens, dtype=np.int32)
+        num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
         num_prefill_reqs = len(scheduler_output.scheduled_new_reqs)
         num_decode_reqs = scheduler_output.scheduled_cached_reqs.num_reqs
         finished_requests_ids = scheduler_output.finished_req_ids
@@ -410,7 +413,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
 
         if num_prefill_reqs > 0 or (
             num_decode_reqs == 1
-            and scheduler_output.scheduled_cached_reqs.resumed_from_preemption[0]
+            and len(scheduler_output.scheduled_cached_reqs.resumed_req_ids) == 1
         ):
             is_prefill = True
 
@@ -437,7 +440,8 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
 
         # Set seq_lens
         self.seq_lens[:num_reqs] = (
-            self.input_batch.num_computed_tokens_cpu[:num_reqs] + num_scheduled_tokens
+            self.input_batch.num_computed_tokens_cpu[:num_reqs]
+            + num_scheduled_tokens_np[:num_reqs]
         )
 
         # TODO interemediate_tensor should be set
@@ -450,10 +454,11 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
             finished_requests_ids=list(finished_requests_ids),
             cached_block_tables=cached_block_tables,
             cached_lengths=cached_lengths,
+            # FIXME unify the variable name is_prefill and is_prompt
             is_prompt=is_prefill,
             dummy_block=scheduler_output.dummy_block,
         )
-        return model_input, num_scheduled_tokens
+        return model_input, num_scheduled_tokens_np
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """
@@ -487,22 +492,20 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
         if not scheduler_output or not self.is_multimodal_raw_input_only_model:
             return {}
 
-        mm_kwargs = list[MultiModalKwargsItem]()
+        mm_kwargs = list[tuple[str, MultiModalKwargsItem]]()
         for req in scheduler_output.scheduled_new_reqs:
             for feature in req.mm_features:
                 if feature.data is not None:
-                    mm_kwargs.append(feature.data)
+                    mm_kwargs.append((feature.modality, feature.data))
 
         # Input all modalities at once
-        model = cast(SupportsMultiModal, self.model)
         mm_kwargs_combined: BatchedTensorInputs = {}
-        for _, _, mm_kwargs_group in group_mm_kwargs_by_modality(
+        for _, _, mm_kwargs_batch in group_and_batch_mm_kwargs(
             mm_kwargs,
             device=self.device,
             pin_memory=self.pin_memory,
-            merge_by_field_config=model.merge_by_field_config,
         ):
-            mm_kwargs_combined.update(mm_kwargs_group)
+            mm_kwargs_combined.update(mm_kwargs_batch)
 
         return mm_kwargs_combined
 
@@ -515,7 +518,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
         torch.Tensor,
         list[int],
         list[int],
-        MultiModalKwargs | None,
+        BatchedTensorInputs | None,
         list[str],
     ]:
         running_request_ids = []
@@ -540,7 +543,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
             req_id = scheduler_output.scheduled_cached_reqs.req_ids[0]
             req_index = self.input_batch.req_id_to_index[req_id]
             logger.warning("Request %s is resumed.", req_id)
-            num_token = int(self.input_batch.num_tokens[req_index])
+            num_token = int(self.input_batch.num_tokens_no_spec[req_index])
             prompt_tokens = self.input_batch.token_ids_cpu[req_index][:num_token]
             block_ids = scheduler_output.scheduled_cached_reqs.new_block_ids[0]
         else:
@@ -668,6 +671,10 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
 
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
+            # In case of sliding window / hybrid attention models,
+            # free the local block table id managed in the model's attention manager.
+            if getattr(self.model, "attention_manager", None):
+                self.model.attention_manager.pop(req_id)
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
         # scheduled_req_ids overlap. This happens when a request is aborted and
@@ -676,6 +683,12 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
         # and handling the second as a new request.
         for req_id in scheduler_output.finished_req_ids:
             self.input_batch.remove_request(req_id)
+
+        # Zero GPU memory for freshly allocated cache blocks to prevent
+        # stale NaN/data from corrupting attention or SSM computation.
+        # NOTE(eunji.lee): It is required for Mamba models
+        # if scheduler_output.new_block_ids_to_zero:
+        #     self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
 
         # Remove the unscheduled requests from the persistent batch.
         # NOTE(woosuk): The unscheduled requests are either preempted requests
@@ -703,6 +716,12 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
         # Add new requests to the cached states.
         for new_req_data in scheduler_output.scheduled_new_reqs:
             req_id = new_req_data.req_id
+            if req_id in self.requests:
+                # For streaming case only.
+                req_state = self._update_streaming_request(req_id, new_req_data)
+                reqs_to_add.append(req_state)
+                continue
+
             sampling_params = new_req_data.sampling_params
             pooling_params = new_req_data.pooling_params
 
@@ -804,9 +823,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
             if not resumed_from_preemption:
                 if new_block_ids is not None:
                     # Append the new blocks to the existing block IDs.
-                    for block_ids, new_ids in zip(
-                        req_state.block_ids, new_block_ids, strict=False
-                    ):
+                    for block_ids, new_ids in zip(req_state.block_ids, new_block_ids):
                         block_ids.extend(new_ids)
             else:
                 assert req_index is None
@@ -838,7 +855,6 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
                     req_index, start_token_index:end_token_index
                 ] = new_token_ids
                 self.input_batch.num_tokens_no_spec[req_index] = end_token_index
-                self.input_batch.num_tokens[req_index] = end_token_index
 
         # Add the new or resumed requests to the persistent batch.
         # The smaller empty indices are filled first.
@@ -999,7 +1015,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
 
         pooling_metadata = self.input_batch.get_pooling_metadata()
         pooling_metadata.build_pooling_cursor(
-            num_scheduled_tokens_np.tolist(), seq_lens_cpu, device=hidden_states.device
+            num_scheduled_tokens_np, seq_lens_cpu, device=hidden_states.device
         )
 
         model = cast(VllmModelForPooling, self.model)
@@ -1112,37 +1128,19 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
             logprobs_tensors = sampler_output.logprobs_tensors
 
         invalid_req_indices: list[int] = []
-        cu_num_tokens: list[int] | None = None
-        if not self.use_async_scheduling:
-            # Get the valid generated tokens.
-            max_gen_len = sampled_token_ids.shape[-1]
-            assert max_gen_len == 1, (
-                "No spec decode tokens. Max generation length must be 1."
-            )
-            # No spec decode tokens.
-            valid_sampled_token_ids = self._to_list(sampled_token_ids)
-            # Mask out the sampled tokens that should not be sampled.
-            # for i in discard_sampled_tokens_req_indices:
-            #     valid_sampled_token_ids[int(i)].clear()
-        else:
-            valid_sampled_token_ids = []
-            # invalid_req_indices = discard_sampled_tokens_req_indices.tolist()
-            invalid_req_indices = []
-            invalid_req_indices_set = set(invalid_req_indices)
-
-            # Cache the sampled tokens on the GPU and avoid CPU sync.
-            # These will be copied into input_ids in the next step
-            # when preparing inputs.
-            # With spec decoding, this is done in propose_draft_token_ids().
-            if self.input_batch.prev_sampled_token_ids is None:
-                assert sampled_token_ids.shape[-1] == 1
-                self.input_batch.prev_sampled_token_ids = sampled_token_ids
-            self.input_batch.prev_req_id_to_index = {
-                req_id: i
-                for i, req_id in enumerate(self.input_batch.req_ids)
-                if i not in invalid_req_indices_set
-            }
-
+        logprobs_lists = None
+        # Get the valid generated tokens.
+        max_gen_len = sampled_token_ids.shape[-1]
+        assert max_gen_len == 1, (
+            "No spec decode tokens. Max generation length must be 1."
+        )
+        # No spec decode tokens.
+        valid_sampled_token_ids = self._to_list(sampled_token_ids)
+        # Mask out the sampled tokens that should not be sampled.
+        # for i in discard_sampled_tokens_req_indices:
+        #     valid_sampled_token_ids[int(i)].clear()
+        if logprobs_tensors is not None:
+            logprobs_lists = logprobs_tensors.tolists()
         # Cache the sampled tokens in the model runner, so that the scheduler
         # doesn't need to send them back.
         # NOTE(woosuk): As an exception, when using PP, the scheduler sends
@@ -1150,10 +1148,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
         # between the first-stage worker and the last-stage worker.
         req_ids = self.input_batch.req_ids
         for req_idx in range(num_sampled_tokens):
-            if self.use_async_scheduling:
-                sampled_ids = [-1] if req_idx not in invalid_req_indices_set else None
-            else:
-                sampled_ids = valid_sampled_token_ids[req_idx]
+            sampled_ids = valid_sampled_token_ids[req_idx]
 
             num_sampled_ids: int = len(sampled_ids) if sampled_ids else 0
 
@@ -1171,17 +1166,10 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
             self.input_batch.token_ids_cpu[req_idx, start_idx:end_idx] = sampled_ids
             self.input_batch.is_token_ids[req_idx, start_idx:end_idx] = True
             self.input_batch.num_tokens_no_spec[req_idx] = end_idx
-            self.input_batch.num_tokens[req_idx] = end_idx
 
             req_id = req_ids[req_idx]
             req_state = self.requests[req_id]
             req_state.output_token_ids.extend(sampled_ids)
-        # FIXME padding handling
-        logprobs_lists = (
-            logprobs_tensors.tolists(cu_num_tokens)
-            if not self.use_async_scheduling and logprobs_tensors is not None
-            else None
-        )
 
         # Compute prompt logprobs if needed.
         prompt_logprobs_dict = self._get_prompt_logprobs_dict(
@@ -1304,7 +1292,24 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
                 padded_logits = logits.reshape(1, -1)
             else:
                 padded_logits = logits
-            sampler_output = self._sample(padded_logits, spec_decode_metadata=None)
+            sampler_start_time = time.perf_counter()
+            if hasattr(rebel, "capture_reports"):
+                capture_ctx = rebel.capture_reports()
+            else:
+                # use a dummy context manager that does nothing
+                capture_ctx = contextlib.nullcontext()
+            with capture_ctx as sampler_reports:
+                sampler_output = self._sample(padded_logits, spec_decode_metadata=None)
+            if envs.VLLM_RBLN_METRICS and self.sampler_performance_tracker is not None:
+                collect_metrics(
+                    self.sampler_performance_tracker,
+                    is_prompt,
+                    start_time=sampler_start_time,
+                    end_time=time.perf_counter(),
+                    reports=sampler_reports,
+                    token_count=0,
+                    # the performance of sampler doesn't depend on token count
+                )
         self.input_batch.prev_sampled_token_ids = None
 
         with record_function_or_nullcontext("rbln_model_runner: bookkeep"):
@@ -1473,7 +1478,10 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
         if sampler_output.logprobs_tensors is not None:
             for field_name in sampler_output.logprobs_tensors._fields:
                 tensor = getattr(sampler_output.logprobs_tensors, field_name)
-                dict[field_name] = tensor[: num_reqs * num_spec_decode_token]
+                # There is a field whose default value is None,
+                # so we need to check if it is not None before slicing.
+                if tensor is not None:
+                    dict[field_name] = tensor[: num_reqs * num_spec_decode_token]
             logprobs_tensors = LogprobsTensors(**dict)
 
         return num_sampled_tokens, sampled_token_ids, logprobs_tensors

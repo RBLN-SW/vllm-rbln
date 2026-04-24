@@ -21,6 +21,7 @@ from vllm.model_executor.layers.fused_moe import (
     FusedMoEMethodBase,
 )
 from vllm.model_executor.layers.fused_moe import modular_kernel as mk
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.utils import set_weight_attrs
 
@@ -361,9 +362,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
     def select_gemm_impl(
         self,
-        prepare_finalize: mk.FusedMoEPrepareAndFinalize,
+        prepare_finalize: mk.FusedMoEPrepareAndFinalizeModular,
         layer: torch.nn.Module,
-    ) -> mk.FusedMoEPermuteExpertsUnpermute:
+    ) -> mk.FusedMoEExpertsModular:
         # NOTE(RBLN): this is used only for "modular kernel"
         raise NotImplementedError()
 
@@ -386,12 +387,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         hidden_states = x.reshape(num_tokens, -1)
         masked_routing_weights = router_logits
 
-        if layer.activation == "swigluoai":
+        if layer.activation == MoEActivation.SWIGLUOAI:
             expert_map_const = None
             if layer.expert_map is not None:
-                # Extract numpy array and create a fresh constant tensor
-                expert_map_list = layer.expert_map.tolist()
-                expert_map_const = torch.tensor(expert_map_list, dtype=torch.int32)
+                assert getattr(layer, "expert_map_const", None) is not None
+                expert_map_const = torch.tensor(
+                    layer.expert_map_const, dtype=torch.int32
+                )
+
+            tokens_mask = None
+            use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
+            if use_moe_tokens_mask:
+                tokens_mask = get_tokens_mask(num_tokens)
 
             final_hidden_states = torch.ops.rbln_custom_ops.custom_moe_glu_mxfp4(
                 hidden_states,
@@ -408,6 +415,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 self.swiglu_alpha,
                 self.swiglu_limit,
                 expert_map_const,
+                tokens_mask,
             )
         else:
             raise NotImplementedError(layer.activation)

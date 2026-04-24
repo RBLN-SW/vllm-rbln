@@ -15,6 +15,7 @@
 
 import copy
 import os
+import time
 from types import NoneType
 from typing import TYPE_CHECKING
 
@@ -30,19 +31,24 @@ except ImportError:
 
 import torch.nn as nn
 from torch._dynamo.exc import BackendCompilerFailed
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed import (
     ensure_model_parallel_initialized,
     init_distributed_environment,
     set_custom_all_reduce,
 )
-from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized
-from vllm.distributed.parallel_state import get_pp_group
+from vllm.distributed.kv_transfer import (
+    ensure_kv_transfer_initialized,
+    ensure_kv_transfer_shutdown,
+    get_kv_transfer_group,
+    has_kv_transfer_group,
+)
+from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.lora.request import LoRARequest
-from vllm.model_executor import set_random_seed
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
+from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
@@ -58,6 +64,7 @@ from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.worker.rbln_model_runner import RBLNModelRunner
 from vllm_rbln.v1.worker.utils import (
     estimate_available_memory,
+    get_rbln_planned_affinity_cpu_count,
     set_cpu_affinity,
     set_omp_num_threads,
 )
@@ -94,14 +101,10 @@ class RBLNWorker(WorkerBase):
 
         self._init_device_env()
 
-        if self.model_config.trust_remote_code:
-            # note: lazy import to avoid importing torch before initializing
-            from vllm.utils.import_utils import init_cached_hf_modules
-
-            init_cached_hf_modules()
-
         # Buffers saved before sleep
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
+        self._rbln_host_threads_before_compile_ready = False
+        self._rbln_cpu_affinity_applied = False
 
         profiler_config = vllm_config.profiler_config
         # Set up profiler if profiling is enabled
@@ -147,10 +150,6 @@ class RBLNWorker(WorkerBase):
         logger.warning("sleep mode is not supported on RBLN, ignore it.")
         pass
 
-    def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:
-        self.cache_config.num_gpu_blocks = num_gpu_blocks
-        self.cache_config.num_cpu_blocks = num_cpu_blocks
-
     def _init_device_env(self) -> None:
         world_size = self.local_world_size
         env_var = current_platform.device_control_env_var
@@ -192,35 +191,6 @@ class RBLNWorker(WorkerBase):
             os.environ["RBLN_NPUS_PER_DEVICE"] = str(rbln_tp_size)
 
     def init_device(self) -> None:
-        set_cpu_affinity(
-            self.rank,
-            self.local_rank,
-            self.parallel_config,
-        )
-
-        # Use half of allocated CPUs to avoid oversubscription
-        allocated_cpus = len(os.sched_getaffinity(0))
-        num_threads = max(2, allocated_cpus // 2)
-        set_omp_num_threads(
-            self.rank,
-            self.local_rank,
-            num_threads,
-        )
-
-        # NOTE(RBLN): numba is used throughout vllm code base (especially in spec-dec)
-        # however accessing numba thread settings somewhat affects torch
-        # thread settings and cause global state change leading to recompilation.
-        # Thus the only solution for now is to set both thread settings to identical
-        # value in correct order like below
-
-        # Code below sets numba num thread to torch num thread and
-        # potentially change torch num thread to other value
-        numba.set_num_threads(torch.get_num_threads())
-
-        # Code below restores torch num thread to its original value
-        # before numba.set_num_threads
-        torch.set_num_threads(numba.get_num_threads())
-
         # Initialize the distributed environment.
         init_worker_distributed_environment(
             self.vllm_config,
@@ -234,7 +204,8 @@ class RBLNWorker(WorkerBase):
 
         # Construct the model runner
         self.model_runner: RBLNModelRunner = RBLNModelRunner(
-            self.vllm_config, self.device
+            self.vllm_config,
+            self.device,
         )
 
         if self.rank == 0:
@@ -242,7 +213,8 @@ class RBLNWorker(WorkerBase):
             report_usage_stats(self.vllm_config)
 
     def load_model(self):
-        self.model_runner.load_model()
+        with set_current_vllm_config(self.vllm_config):
+            self.model_runner.load_model()
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
@@ -270,6 +242,7 @@ class RBLNWorker(WorkerBase):
 
             if quantization == "fp8":
                 nbits_per_param = 8
+                packed_num_elems = 1
             elif quantization == "mxfp4":
                 if "ca" in device_name:
                     # ATOM DOES NOT support mxfp4 quantization, handled by bf16
@@ -285,13 +258,13 @@ class RBLNWorker(WorkerBase):
                     raise ValueError(
                         "invalid RBLN architecture, candidates = [ATOM(ca), REBEL(cr)]"
                     )
+                # pack 2 mxfp4 elems into single uint8 elem
+                packed_num_elems = 8 // 4
             else:
                 raise ValueError(
                     "invalid quantization scheme, candidates = [fp8, mxfp4]"
                 )
 
-            # pack 2 mxfp4 elems into single uint8 elem
-            packed_num_elems = 8 // 4
         else:
             nbits_per_param = 16
             packed_num_elems = 1
@@ -323,14 +296,97 @@ class RBLNWorker(WorkerBase):
 
         return available_memory_estimate
 
+    def get_kv_connector_handshake_metadata(self) -> dict | None:
+        """Get KV connector metadata from this worker if available."""
+
+        if not has_kv_transfer_group():
+            return None
+
+        connector = get_kv_transfer_group()
+        # Return None for connectors that don't need to exchange handshake
+        # metadata across workers.
+        if (metadata := connector.get_handshake_metadata()) is None:
+            return None
+
+        tp_rank = get_tp_group().rank_in_group
+        return {tp_rank: metadata}
+
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return self.model_runner.get_kv_cache_spec()
 
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate RBLN KV cache with the specified kv_cache_config."""
+
+        # Update local config with adjusted num blocks after profiling,
+        # so that it's available to the warmup stage.
+        self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
+        self.cache_config.num_cpu_blocks = kv_cache_config.num_blocks
+
+        # Init kv cache connector here, because it requires
+        # `kv_cache_config`.
+        # NOTE(Kuntai): This need to be done before `initialize_kv_cache`,
+        # because `initialize_kv_cache` will inject kv cache groups not
+        # related to kv cache connector (e.g. kv cache sharing layers).
+        ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
+
         self.model_runner.initialize_kv_cache(kv_cache_config)
 
-    def compile_or_warm_up_model(self) -> None:
+    def _ensure_rbln_host_threads_before_compile(self) -> None:
+        """Set OpenMP / torch / numba threads before ``warm_up_model()`` without
+        CPU affinity.
+
+        Affinity is applied later (after warm-up) so ``torch.compile`` / dummy
+        compile sees an unpinned CPU mask while thread counts and
+        ``RBLN_NUM_THREADS`` match Dynamo. Default thread count uses the same
+        logical CPU count ``set_cpu_affinity`` will pin to (NUMA / DP split),
+        not the pre-split ``sched_getaffinity`` mask.
+        """
+        if self._rbln_host_threads_before_compile_ready:
+            return
+
+        allocated_cpus = get_rbln_planned_affinity_cpu_count(
+            self.rank,
+            self.local_rank,
+            self.parallel_config,
+        )
+        num_threads = max(2, allocated_cpus // 2)
+        set_omp_num_threads(
+            self.rank,
+            self.local_rank,
+            num_threads,
+        )
+
+        # NOTE(RBLN): numba is used throughout vllm code base (especially in spec-dec)
+        # however accessing numba thread settings somewhat affects torch
+        # thread settings and cause global state change leading to recompilation.
+        # Thus the only solution for now is to set both thread settings to identical
+        # value in correct order like below
+
+        # Code below sets numba num thread to torch num thread and
+        # potentially change torch num thread to other value
+        numba.set_num_threads(torch.get_num_threads())
+
+        # Code below restores torch num thread to its original value
+        # before numba.set_num_threads
+        torch.set_num_threads(numba.get_num_threads())
+
+        self._rbln_host_threads_before_compile_ready = True
+
+    def _ensure_rbln_cpu_affinity_after_warmup(self) -> None:
+        """Pin CPU affinity after ``warm_up_model()``; does not change torch
+        thread counts."""
+        if self._rbln_cpu_affinity_applied:
+            return
+
+        set_cpu_affinity(
+            self.rank,
+            self.local_rank,
+            self.parallel_config,
+        )
+        self._rbln_cpu_affinity_applied = True
+
+    def compile_or_warm_up_model(self) -> float:
+        st = time.perf_counter()
         if self.parallel_config.data_parallel_size > 1:
             if envs.VLLM_RBLN_DP_IMPL == "padded_decode":
                 max_num_batched_tokens = self.scheduler_config.max_num_batched_tokens
@@ -346,41 +402,49 @@ class RBLNWorker(WorkerBase):
                 )
             self.model_runner.prepare_dummy_run()
 
+        # Thread policy + RBLN_NUM_THREADS before compile/warm-up; affinity after.
+        self._ensure_rbln_host_threads_before_compile()
+
         if (
             self.model_config.enforce_eager
             or not envs.VLLM_RBLN_COMPILE_MODEL
             or not envs.VLLM_RBLN_ENABLE_WARM_UP
         ):
             logger.warning("skipping compile_or_warm_up_model")
-            return
 
-        try:
-            self.model_runner.warm_up_model()
+            self._ensure_rbln_cpu_affinity_after_warmup()
+            return time.perf_counter() - st
+        else:
+            try:
+                self.model_runner.warm_up_model()
 
-        except BackendCompilerFailed as e:
+            except BackendCompilerFailed as e:
 
-            def is_oom(exc):
-                if isinstance(exc, RuntimeError):
-                    for arg in exc.args:
-                        if isinstance(arg, str) and (
-                            "SYS_ENOMEM: Out of memory" in arg
-                            or "SYS_EBUSY: Lack of device memory" in arg
-                        ):
-                            return True
-                return False
+                def is_oom(exc):
+                    if isinstance(exc, RuntimeError):
+                        for arg in exc.args:
+                            if isinstance(arg, str) and (
+                                "SYS_ENOMEM: Out of memory" in arg
+                                or "SYS_EBUSY: Lack of device memory" in arg
+                            ):
+                                return True
+                    return False
 
-            if is_oom(e.inner_exception):
-                raise RuntimeError(
-                    "Not enough memory for "
-                    f"{self.model_runner.kv_cache_config.num_blocks} "
-                    "blocks of KV cache. Try reducing the number of blocks "
-                    "by setting --num-gpu-blocks-override."
-                ) from e
+                if is_oom(e.inner_exception):
+                    raise RuntimeError(
+                        "Not enough memory for "
+                        f"{self.model_runner.kv_cache_config.num_blocks} "
+                        "blocks of KV cache. Try reducing the number of blocks "
+                        "by setting --num-gpu-blocks-override."
+                    ) from e
 
-            raise
+                raise
 
-        # after completing model warm up, enable RBLN performance tracker
+        # After warm-up: apply CPU affinity only (threads already set pre-compile).
+        self._ensure_rbln_cpu_affinity_after_warmup()
         self.model_runner._enable_performance_tracker()
+
+        return time.perf_counter() - st
 
     def get_model(self) -> nn.Module:
         return self.model_runner.get_model()
@@ -439,7 +503,7 @@ class RBLNWorker(WorkerBase):
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         return self.model_runner.take_draft_token_ids()
 
-    def profile(self, is_start: bool = True):
+    def profile(self, is_start: bool = True, profile_prefix: str | None = None):
         if self.profiler is None:
             raise RuntimeError("Profiler is not enabled.")
         if is_start:
@@ -453,6 +517,7 @@ class RBLNWorker(WorkerBase):
                 )
 
     def execute_dummy_batch(self) -> None:
+        self._ensure_rbln_host_threads_before_compile()
         self.model_runner.dummy_run()
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
@@ -473,11 +538,19 @@ class RBLNWorker(WorkerBase):
 
     def shutdown(self) -> None:
         logger.info("v1 rbln_worker shutdown called")
+        # has_kv_transfer_group can be None during interpreter shutdown.
+        if ensure_kv_transfer_shutdown is not None:
+            ensure_kv_transfer_shutdown()
+        if self.profiler is not None:
+            self.profiler.shutdown()
+
         if envs.VLLM_RBLN_METRICS:
             if self.model_runner.performance_tracker:
                 self.model_runner.performance_tracker.print_final_stats()
             if self.model_runner.sampler_performance_tracker:
                 self.model_runner.sampler_performance_tracker.print_final_stats()
+            if self.model_runner.e2e_performance_tracker:
+                self.model_runner.e2e_performance_tracker.print_final_stats()
 
 
 def init_worker_distributed_environment(
@@ -534,5 +607,3 @@ def init_worker_distributed_environment(
         parallel_config.tensor_parallel_size,
         parallel_config.pipeline_parallel_size,
     )
-
-    ensure_kv_transfer_initialized(vllm_config)

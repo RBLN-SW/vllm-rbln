@@ -57,7 +57,6 @@ def get_vllm_config(async_scheduling=False):
     )
     cache_config = CacheConfig(
         block_size=BLOCK_SIZE,
-        swap_space=0,
         cache_dtype="auto",
     )
     vllm_config = VllmConfig(

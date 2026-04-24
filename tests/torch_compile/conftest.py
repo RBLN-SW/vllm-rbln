@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+
 import pytest
 from vllm.config import (
     CacheConfig,
@@ -23,13 +25,26 @@ from vllm.config import (
 from vllm.plugins import load_general_plugins
 
 
-@pytest.fixture(scope="session", autouse=True)
-def initialize_environment():
-    monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setenv("VLLM_RBLN_USE_VLLM_MODEL", "1")
-    monkeypatch.setenv("VLLM_USE_V1", "1")
+def pytest_configure(config):
+    # Must run before test collection so that monkey patches applied by
+    # `register_ops()` are in place before any test module does
+    # `from vllm.xxx import yyy` at import time and captures the original symbol.
+    os.environ["VLLM_RBLN_USE_VLLM_MODEL"] = "1"
     load_general_plugins()
-    return
+
+
+@pytest.fixture(scope="class")
+def monkeypatch_class():
+    monkeypatch = pytest.MonkeyPatch()
+    yield monkeypatch
+    monkeypatch.undo()
+
+
+@pytest.fixture(scope="module")
+def monkeypatch_module():
+    monkeypatch = pytest.MonkeyPatch()
+    yield monkeypatch
+    monkeypatch.undo()
 
 
 @pytest.fixture
@@ -39,7 +54,6 @@ def vllm_config():
     cache_config = CacheConfig(
         block_size=1024,
         gpu_memory_utilization=0.9,
-        swap_space=0,
         cache_dtype="auto",
     )
     parallel_config = ParallelConfig(data_parallel_size=2)

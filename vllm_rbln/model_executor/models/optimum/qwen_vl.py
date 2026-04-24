@@ -62,7 +62,16 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         )
         self.rope_deltas: dict = dict()
 
-    def preprocess_prefill(self, input_ids, attention_mask, image_input, video_input):
+    def _build_prefill_params(self, preprocess_outputs: tuple) -> dict:
+        return {
+            "inputs_embeds": preprocess_outputs[0],
+            "position_embed": preprocess_outputs[1],
+            "rope_deltas": preprocess_outputs[2],
+        }
+
+    def preprocess_prefill(
+        self, input_ids, attention_mask, image_input, video_input
+    ) -> dict:
         """
         Common preprocessing logic for prefill inputs.
         Calls model-specific parameter preparation method.
@@ -74,7 +83,7 @@ class RBLNOptimumQwenVLForConditionalGeneration(
             video_input: Video input data
 
         Returns:
-            Tuple of (inputs_embeds, position_embed, rope_deltas)
+            Dict of preprocessed inputs for the model's prefill_decoder
         """
 
         # Prepare base arguments common to all models
@@ -99,7 +108,9 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         self._add_model_specific_args(preprocess_args, video_input)
 
         # Call the actual preprocessing
-        return self.model._preprocess_prefill(**preprocess_args)
+        preprocess_outputs = self.model._preprocess_prefill(**preprocess_args)
+        prefill_params = self._build_prefill_params(preprocess_outputs)
+        return prefill_params
 
     @abstractmethod
     def _add_model_specific_args(self, preprocess_args: dict, video_input: Any):
@@ -169,14 +180,15 @@ class RBLNOptimumQwenVLForConditionalGeneration(
             cur_request_id = running_requests_ids[0]
             attention_mask = torch.ones_like(input_ids)
 
-            (inputs_embeds, position_embed, rope_deltas) = self.preprocess_prefill(
+            prefill_params = self.preprocess_prefill(
                 input_ids, attention_mask, image_input, video_input
             )
 
             if finished_requests_ids:
                 for request_id in finished_requests_ids:
                     self.rope_deltas.pop(request_id)
-            self.rope_deltas[cur_request_id] = rope_deltas.item()
+            self.rope_deltas[cur_request_id] = prefill_params["rope_deltas"].item()
+            prefill_params.pop("rope_deltas")
 
         kwargs = self.preprocess_for_decoder(
             is_prompt, block_tables, input_ids, cache_position
@@ -186,9 +198,7 @@ class RBLNOptimumQwenVLForConditionalGeneration(
 
         if is_prompt:
             logits = self.model.prefill_decoder(
-                inputs_embeds=inputs_embeds,
-                cache_position=cache_position,
-                position_embed=position_embed,
+                **prefill_params,
                 block_tables=block_tables,
             ).logits
         else:
@@ -371,3 +381,52 @@ class RBLNOptimumQwen2VLForConditionalGeneration(
             video_embeds=video_embeds,
             video_grid_thw=video_grid_thw,
         )
+
+
+class RBLNOptimumQwen3VLForConditionalGeneration(
+    RBLNOptimumQwen2_5_VLForConditionalGeneration
+):
+    """
+    Qwen3-VL reuses Qwen2.5-VL classes with the same implementation.
+    However, since Qwen3-VL does not require second_per_grid_ts,
+    certain methods are overridden to exclude it from the model inputs.
+    """
+
+    def _build_prefill_params(self, preprocess_outputs: tuple) -> dict:
+        # deepstack_embeds
+        # [1, 3, num_patches, embedding_dim] -> [3, num_patches, embedding_dim]
+        return {
+            "inputs_embeds": preprocess_outputs[0],
+            "position_embed": preprocess_outputs[1],
+            "rope_deltas": preprocess_outputs[2],
+            "visual_pos_mask": preprocess_outputs[3],
+            "deepstack_embeds": preprocess_outputs[4].squeeze(0),
+        }
+
+    def _add_model_specific_args(self, preprocess_args: dict, video_input: Any):
+        """Qwen3-VL doesn't need additional arguments"""
+        pass
+
+    def _create_video_pixel_inputs(
+        self,
+        pixel_values_videos: torch.Tensor,
+        video_grid_thw: torch.Tensor,
+        second_per_grid_ts=torch.Tensor | None,
+    ):
+        return Qwen2_5_VLVideoPixelInputs(
+            type="pixel_values_videos",
+            pixel_values_videos=pixel_values_videos,
+            video_grid_thw=video_grid_thw,
+            second_per_grid_ts=second_per_grid_ts,
+        )
+
+
+class RBLNOptimumQwen3VLMoeForConditionalGeneration(
+    RBLNOptimumQwen3VLForConditionalGeneration
+):
+    """
+    Qwen3-VL MoE model shares the same input structure as Qwen3-VL,
+    so it inherits from RBLNOptimumQwen3VLForConditionalGeneration without changes.
+    """
+
+    pass

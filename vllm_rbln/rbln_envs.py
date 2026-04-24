@@ -48,6 +48,9 @@ if TYPE_CHECKING:
     VLLM_RBLN_AUTO_PORT: bool = True
     VLLM_RBLN_CCL_ALL2ALL_P2P: bool = False
     VLLM_RBLN_DISPATCH_ALL2ALL: bool = False
+    VLLM_RBLN_COMBINE_ALL2ALL: bool = False
+    VLLM_RBLN_MOE_REDUCE_SCATTER: bool = False
+    VLLM_RBLN_SUB_BLOCK_CACHE: bool = True
 
 
 def get_dp_impl() -> str:
@@ -256,6 +259,13 @@ environment_variables = {
             os.environ.get("RBLN_USE_CUSTOM_KERNEL", "False").lower() in ("true", "1")
         )
     ),
+    # Use reduce_scatter instead of all_reduce in MoE combine phase
+    "VLLM_RBLN_MOE_REDUCE_SCATTER": (
+        lambda: (
+            os.environ.get("VLLM_RBLN_MOE_REDUCE_SCATTER", "False").lower()
+            in ("true", "1")
+        )
+    ),
     "VLLM_RBLN_PROFILER": (
         lambda: os.environ.get("RBLN_PROFILER", "False").lower() in ("true", "1")
     ),
@@ -280,6 +290,11 @@ environment_variables = {
             in ("true", "1")
         )
     ),
+    # Enable sub-block prefix caching.
+    # Sub-block size equals max_num_batched_tokens (prefill chunk size).
+    "VLLM_RBLN_SUB_BLOCK_CACHE": lambda: (
+        os.environ.get("VLLM_RBLN_SUB_BLOCK_CACHE", "True").lower() in ("true", "1")
+    ),
 }
 
 
@@ -288,3 +303,6 @@ def __getattr__(name: str):
     if name in environment_variables:
         return environment_variables[name]()
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+vllm_envs.update(environment_variables)

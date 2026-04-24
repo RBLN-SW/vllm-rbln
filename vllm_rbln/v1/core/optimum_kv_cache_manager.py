@@ -109,6 +109,7 @@ class RBLNKVCacheManager(KVCacheManager):
         num_new_computed_tokens: int = 0,
         new_computed_blocks: KVCacheBlocks | None = None,
         num_lookahead_tokens: int = 0,
+        num_external_computed_tokens: int = 0,
         delay_cache_blocks: bool = False,
         num_encoder_tokens: int = 0,
     ) -> KVCacheBlocks | None:
@@ -134,6 +135,8 @@ class RBLNKVCacheManager(KVCacheManager):
             num_tokens=num_tokens_need_slot,
             new_computed_blocks=self.empty_kv_cache_blocks.blocks,
             num_encoder_tokens=0,
+            total_computed_tokens=0,
+            num_tokens_main_model=num_tokens_need_slot,
         )
 
         if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
@@ -151,9 +154,13 @@ class RBLNKVCacheManager(KVCacheManager):
         # in the coordinator
         # `empty_computed_block_list` is used here to avoid
         # saving the computed blocks to the request state
-        self.coordinator.save_new_computed_blocks(
-            request.request_id,
-            self.empty_kv_cache_blocks.blocks,
+        # Append the new computed blocks to the request blocks until now to
+        # avoid the case where the new blocks cannot be allocated.
+        self.coordinator.allocate_new_computed_blocks(
+            request_id=request.request_id,
+            new_computed_blocks=self.empty_kv_cache_blocks.blocks,
+            num_local_computed_tokens=0,
+            num_external_computed_tokens=0,
         )
 
         new_blocks = self.coordinator.allocate_new_blocks(
@@ -162,7 +169,7 @@ class RBLNKVCacheManager(KVCacheManager):
 
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.
-        if not self.enable_caching or delay_cache_blocks:
+        if not self.enable_caching:
             return self.create_kv_cache_blocks(new_blocks)
 
         # Allocate outer blocks for prefix caching
