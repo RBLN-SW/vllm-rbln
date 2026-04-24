@@ -35,8 +35,8 @@ from vllm_rbln.utils.optimum.configuration_helper import (
     strip_runtime_only_keys,
 )
 from vllm_rbln.utils.optimum.rbln_params import (
+    RBLNParams,
     get_rbln_config,
-    get_rbln_params,
 )
 from vllm_rbln.utils.optimum.registry import (
     get_rbln_model_info,
@@ -201,9 +201,10 @@ def prepare_vllm_for_compile(vllm_config: VllmConfig) -> None:
     hf_config = vllm_config.model_config.hf_config
     rbln_config = vllm_config.additional_config.get("rbln_config", {})
     # Extract block size from rbln_config
-    _, max_num_seqs, max_model_len, kvcache_block_size, _, _ = get_rbln_params(
-        vllm_config, rbln_config, use_assert=False
-    )
+    params = RBLNParams.from_rbln_config(vllm_config, rbln_config)
+    max_num_seqs = params.batch_size
+    max_model_len = params.max_seq_len
+    kvcache_block_size = params.kvcache_block_size
     if max_num_seqs is not None:
         logger.info(
             "Setting max_num_seqs to %d based on rbln_config in additional_config",
@@ -302,22 +303,15 @@ def sync_with_rbln_config(vllm_config: VllmConfig) -> None:
         vllm_config.additional_config["rbln_config"] = keep_only_device_keys(
             additional_rbln_config
         )
-        (
-            num_blocks,
-            batch_size,
-            max_model_len,
-            kvcache_block_size,
-            prefill_chunk_size,
-            tensor_parallel_size,
-        ) = get_rbln_params(vllm_config, rbln_config)
+        params = RBLNParams.from_rbln_config(vllm_config, rbln_config).assert_complete()
         sync_vllm_from_rbln_config(
             vllm_config,
-            num_blocks,
-            batch_size,
-            max_model_len,
-            kvcache_block_size,
-            prefill_chunk_size,
-            tensor_parallel_size,
+            params.num_blocks,
+            params.batch_size,
+            params.max_seq_len,
+            params.kvcache_block_size,
+            params.prefill_chunk_size,
+            params.tensor_parallel_size,
         )
     else:
         prepare_vllm_for_compile(vllm_config)
