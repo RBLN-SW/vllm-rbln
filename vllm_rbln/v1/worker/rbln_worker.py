@@ -309,7 +309,7 @@ class RBLNWorker(WorkerBase):
         )
 
         logger.info(
-            "available_memory_estimate = %.2f GB", available_memory_estimate / 1024**3
+            "available_memory_estimate = %.2f GiB", available_memory_estimate / 1024**3
         )
 
         return available_memory_estimate
