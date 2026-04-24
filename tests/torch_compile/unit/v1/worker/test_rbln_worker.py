@@ -40,6 +40,12 @@ def _make_profiler_config(trace_dir=None):
         torch_profiler_with_stack=False,
         torch_profiler_with_flops=False,
         torch_profiler_use_gzip=False,
+        torch_profiler_dump_cuda_time_total=False,
+        delay_iterations=0,
+        max_iterations=0,
+        wait_iterations=0,
+        warmup_iterations=0,
+        active_iterations=0,
     )
 
 
@@ -1061,14 +1067,14 @@ class TestProfile:
         worker.profiler = MagicMock()
         worker.profile(is_start=False)
         worker.profiler.stop.assert_called_once()
-        worker.profiler.key_averages.assert_called_once()
+        worker.profiler.profiler.key_averages.assert_called_once()
 
     def test_stop_non_rank0(self):
         worker = _create_worker(local_rank=1)
         worker.profiler = MagicMock()
         worker.profile(is_start=False)
         worker.profiler.stop.assert_called_once()
-        worker.profiler.key_averages.assert_not_called()
+        worker.profiler.profiler.key_averages.assert_not_called()
 
 
 # ===========================================================================

@@ -109,7 +109,7 @@ class RBLNWorker(WorkerBase):
 
         profiler_config = vllm_config.profiler_config
         # Set up profiler if profiling is enabled
-        if profiler_config.profiler == "torch":
+        if profiler_config.torch_profiler_dir:
             logger.info(
                 "Profiling enabled. Traces will be saved to: %s",
                 profiler_config.torch_profiler_dir,
