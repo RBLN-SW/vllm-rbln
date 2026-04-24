@@ -409,9 +409,10 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
                 logger.warning(
                     "RblnECNixlConnector (encoder): LLM PULL port %s:%d is not "
                     "accepting connections yet. Start the LLM first with "
-                    "`bash examples/optimum/ec_disagg/serve_ec_llm.sh` — ZMQ will still "
-                    "buffer messages and reconnect once the LLM is up, but "
-                    "tail latency for the earliest requests may be poor.",
+                    "`bash examples/optimum/ec_disagg/serve_ec_llm.sh` - "
+                    "ZMQ will still buffer messages and reconnect"
+                    "once the LLM is up, but tail latency for the earliest"
+                    "requests may be poor.",
                     llm_host,
                     llm_pull_port,
                 )
