@@ -301,9 +301,9 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
         try:
             from nixl._api import nixl_agent as NixlAgent
         except ImportError as e:
-            raise RuntimeError(
-                "NIXL is not available. Install the nixl package to use "
-                "RblnECNixlConnector."
+            raise ImportError(
+                "The 'nixl' package is required to use 'RblnECNixlConnector'. "
+                "Please install it by running: pip install nixl"
             ) from e
 
         ec_cfg = vllm_config.ec_transfer_config
