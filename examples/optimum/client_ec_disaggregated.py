@@ -237,9 +237,14 @@ async def log_requests(request: Request, call_next):
 async def on_startup() -> None:
     global encode_session, decode_session
     timeout = aiohttp.ClientTimeout(total=100_000)
-    connector = aiohttp.TCPConnector(limit=0, force_close=False)
-    encode_session = aiohttp.ClientSession(timeout=timeout, connector=connector)
-    decode_session = aiohttp.ClientSession(timeout=timeout, connector=connector)
+    # force_close=True: new TCP per request. Avoids occasional 502s when
+    # the encoder server drops an idle keep-alive connection that the
+    # proxy then reuses (ServerDisconnectedError at resp.start).
+    # Overhead on localhost is negligible vs. encoder compute.
+    enc_connector = aiohttp.TCPConnector(limit=0, force_close=True)
+    dec_connector = aiohttp.TCPConnector(limit=0, force_close=True)
+    encode_session = aiohttp.ClientSession(timeout=timeout, connector=enc_connector)
+    decode_session = aiohttp.ClientSession(timeout=timeout, connector=dec_connector)
 
 
 @app.on_event("shutdown")
