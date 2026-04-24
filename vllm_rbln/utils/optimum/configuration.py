@@ -135,27 +135,35 @@ def update_max_num_batched_tokens(vllm_config: VllmConfig, max_model_len: int) -
 
 def sync_vllm_from_rbln_config(
     vllm_config: VllmConfig,
-    num_blocks: int,
-    batch_size: int,
-    max_model_len: int,
-    kvcache_block_size: int,
-    prefill_chunk_size: int,
-    tensor_parallel_size: int,
+    params: RBLNParams,
 ) -> None:
-    if vllm_config.scheduler_config.max_num_seqs != batch_size:
+    assert params.num_blocks is not None, (
+        "num_blocks must be specified in rbln_config.json"
+    )
+    assert params.batch_size is not None, (
+        "batch_size must be specified in rbln_config.json"
+    )
+    assert params.max_seq_len is not None, (
+        "max_seq_len must be specified in rbln_config.json"
+    )
+    assert params.kvcache_block_size is not None, (
+        "kvcache_block_size must be specified in rbln_config.json"
+    )
+
+    if vllm_config.scheduler_config.max_num_seqs != params.batch_size:
         logger.info(
             "Updating scheduler_config.max_num_seqs from %s to %s "
             "based on rbln_config.json",
             vllm_config.scheduler_config.max_num_seqs,
-            batch_size,
+            params.batch_size,
         )
-        vllm_config.scheduler_config.max_num_seqs = batch_size
+        vllm_config.scheduler_config.max_num_seqs = params.batch_size
 
     # For encoder-decoder multimodal models (e.g. Whisper), max_num_batched_tokens
     # must be at least max_source_positions so that vllm's MultiModalBudget
     # validation passes (it requires max_tokens_per_mm_item <= max_num_batched_tokens
     # when chunked MM input is disabled).
-    target_max_num_batched_tokens = max_model_len
+    target_max_num_batched_tokens = params.max_seq_len
     hf_config = vllm_config.model_config.hf_config
     if is_enc_dec_arch(hf_config):
         max_source_positions = getattr(hf_config, "max_source_positions", 0)
@@ -165,7 +173,7 @@ def sync_vllm_from_rbln_config(
                 "Encoder-decoder model detected: setting max_num_batched_tokens "
                 "to %d (max_source_positions) instead of %d (max_model_len)",
                 max_source_positions,
-                max_model_len,
+                params.max_seq_len,
             )
 
     cur = vllm_config.scheduler_config.max_num_batched_tokens
@@ -180,21 +188,23 @@ def sync_vllm_from_rbln_config(
             target_max_num_batched_tokens
         )
 
-    if vllm_config.model_config.max_model_len != max_model_len:
+    if vllm_config.model_config.max_model_len != params.max_seq_len:
         logger.info(
             "Updating model_config.max_model_len "
             "from %s to %s "
             "based on rbln_config.json",
             vllm_config.model_config.max_model_len,
-            max_model_len,
+            params.max_seq_len,
         )
-        vllm_config.model_config.max_model_len = max_model_len
+        vllm_config.model_config.max_model_len = params.max_seq_len
 
     # Set block_size in cache_config based on rbln_config.json
-    sync_cache_block_size(vllm_config, kvcache_block_size, prefill_chunk_size)
+    sync_cache_block_size(
+        vllm_config, params.kvcache_block_size, params.prefill_chunk_size
+    )
     # Set num_blocks in cache_config based on rbln_config.json
-    sync_num_blocks(vllm_config, num_blocks)
-    envs.VLLM_RBLN_TP_SIZE = tensor_parallel_size
+    sync_num_blocks(vllm_config, params.num_blocks)
+    envs.VLLM_RBLN_TP_SIZE = params.tensor_parallel_size
 
 
 def prepare_vllm_for_compile(vllm_config: VllmConfig) -> None:
@@ -303,15 +313,7 @@ def sync_with_rbln_config(vllm_config: VllmConfig) -> None:
         vllm_config.additional_config["rbln_config"] = keep_only_device_keys(
             additional_rbln_config
         )
-        params = RBLNParams.from_rbln_config(vllm_config, rbln_config).assert_complete()
-        sync_vllm_from_rbln_config(
-            vllm_config,
-            params.num_blocks,
-            params.batch_size,
-            params.max_seq_len,
-            params.kvcache_block_size,
-            params.prefill_chunk_size,
-            params.tensor_parallel_size,
-        )
+        params = RBLNParams.from_rbln_config(vllm_config, rbln_config)
+        sync_vllm_from_rbln_config(vllm_config, params)
     else:
         prepare_vllm_for_compile(vllm_config)

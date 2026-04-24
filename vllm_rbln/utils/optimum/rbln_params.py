@@ -71,29 +71,9 @@ def get_rbln_config(vllm_config: VllmConfig) -> dict | None:
 
 
 @dataclass
-class CompleteRBLNParams:
-    """:class:`RBLNParams` with every field guaranteed present.
-
-    Returned by :meth:`RBLNParams.assert_complete` so callers that rely on
-    the values being populated get non-Optional types.
-    """
-
-    num_blocks: int
-    batch_size: int
-    max_seq_len: int
-    kvcache_block_size: int
-    prefill_chunk_size: int = 128
-    tensor_parallel_size: int = 1
-
-
-@dataclass
 class RBLNParams:
-    """Parameters derived from an optimum-rbln ``rbln_config.json``.
-
-    Any field may be ``None`` when parsed from a user-supplied partial config
-    (e.g. the ``additional_config`` passed before compilation). Call
-    :meth:`assert_complete` once a fully materialised rbln_config is expected;
-    it returns a :class:`CompleteRBLNParams` whose fields are non-Optional.
+    """
+    Parameters derived from an optimum-rbln `rbln_config.json`.
     """
 
     num_blocks: int | None = None
@@ -122,29 +102,6 @@ class RBLNParams:
 
         params.tensor_parallel_size = tensor_parallel_size
         return params
-
-    def assert_complete(self) -> CompleteRBLNParams:
-        """Validate every required field is set, returning a narrowed view."""
-        assert self.num_blocks is not None, (
-            "num_blocks must be specified in rbln_config.json"
-        )
-        assert self.kvcache_block_size is not None, (
-            "kvcache_block_size must be specified in rbln_config.json"
-        )
-        assert self.batch_size is not None, (
-            "batch_size must be specified in rbln_config.json"
-        )
-        assert self.max_seq_len is not None, (
-            "max_seq_len must be specified in rbln_config.json"
-        )
-        return CompleteRBLNParams(
-            num_blocks=self.num_blocks,
-            batch_size=self.batch_size,
-            max_seq_len=self.max_seq_len,
-            kvcache_block_size=self.kvcache_block_size,
-            prefill_chunk_size=self.prefill_chunk_size,
-            tensor_parallel_size=self.tensor_parallel_size,
-        )
 
     @classmethod
     def _parse_enc_dec(cls, cfg: RblnConfigLike) -> "RBLNParams":
