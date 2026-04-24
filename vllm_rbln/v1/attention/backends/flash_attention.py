@@ -1069,6 +1069,22 @@ class RBLNFlashAttentionMetadataBuilder(
         self.is_causal = envs.VLLM_RBLN_FLASH_CAUSAL_ATTN
         self.is_batch_attention_opt = envs.VLLM_RBLN_BATCH_ATTN_OPT
 
+        self._swa_cache_seq_lens_buf: torch.Tensor | None = None
+        self._swa_cache_offsets_buf: torch.Tensor | None = None
+
+    def _to_device_inplace(
+        self, cpu_tensor: torch.Tensor, attr_name: str
+    ) -> torch.Tensor:
+        """Copy cpu_tensor into a reusable device buffer, allocating only on shape/dtype change."""
+        buf: torch.Tensor | None = getattr(self, attr_name)
+        if buf is None or buf.shape != cpu_tensor.shape or buf.dtype != cpu_tensor.dtype:
+            buf = torch.empty(
+                cpu_tensor.shape, dtype=cpu_tensor.dtype, device=self.device
+            )
+            setattr(self, attr_name, buf)
+        buf.copy_(cpu_tensor)
+        return buf
+
     def reorder_batch(
         self, input_batch: "InputBatch", scheduler_output: "SchedulerOutput"
     ) -> bool:
@@ -1228,10 +1244,14 @@ class RBLNFlashAttentionMetadataBuilder(
             prefix_scheduler_metadata=prefix_scheduler_metadata,
             is_prefill=is_prefill,
             attn_masks=attn_masks,
-            cache_seq_lens=cache_seq_lens.to(self.device)
+            cache_seq_lens=self._to_device_inplace(
+                cache_seq_lens, "_swa_cache_seq_lens_buf"
+            )
             if cache_seq_lens is not None
             else None,
-            cache_offsets=cache_offsets.to(self.device)
+            cache_offsets=self._to_device_inplace(
+                cache_offsets, "_swa_cache_offsets_buf"
+            )
             if cache_offsets is not None
             else None,
             local_block_tables=local_block_tables.to(self.device)
