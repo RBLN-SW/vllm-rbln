@@ -44,131 +44,67 @@ def fused_moe_custom__init__(self, *args, **kwargs):
     )
 
 
-# Define custom_moe_glu op based on environment variable
-# VLLM_RBLN_MOE_USE_OPT_KERNEL: uses topk, post_norm, expert_map parameters
-# VLLM_RBLN_MOE_CUSTOM_KERNEL: uses expert_select_count parameter
-if envs.VLLM_RBLN_MOE_USE_OPT_KERNEL:
+# Define custom_moe_glu op for VLLM_RBLN_MOE_CUSTOM_KERNEL
+# When disabled, falls back to PyTorch native loop implementation.
+@torch.library.custom_op(
+    "rbln_custom_ops::custom_moe_glu",
+    mutates_args=(),
+)
+def custom_moe_glu(
+    hidden_states: torch.Tensor,
+    gate_proj_weight: torch.Tensor,
+    up_proj_weight: torch.Tensor,
+    down_proj_weight: torch.Tensor,
+    masked_routing_weight: torch.Tensor,
+    expert_map: torch.Tensor | None = None,
+    gate_proj_bias: torch.Tensor | None = None,
+    up_proj_bias: torch.Tensor | None = None,
+    down_proj_bias: torch.Tensor | None = None,
+    dp_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """
+    Customized MoE GLU operation (custom kernel version).
 
-    @torch.library.custom_op(
-        "rbln_custom_ops::custom_moe_glu",
-        mutates_args=(),
-    )
-    def custom_moe_glu(
-        hidden_states: torch.Tensor,
-        gate_proj_weight: torch.Tensor,
-        up_proj_weight: torch.Tensor,
-        down_proj_weight: torch.Tensor,
-        masked_routing_weight: torch.Tensor,
-        expert_map: torch.Tensor | None = None,
-        gate_proj_bias: torch.Tensor | None = None,
-        up_proj_bias: torch.Tensor | None = None,
-        down_proj_bias: torch.Tensor | None = None,
-        dp_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """
-        Customized MoE GLU operation (optimized kernel version).
+    Expected tensor shapes:
+    - hidden_states: [batch * seq_len, hidden_size]
+    - gate_proj_weight: [num_experts, intermediate_size, hidden_size]
+    - up_proj_weight: [num_experts, intermediate_size, hidden_size]
+    - down_proj_weight: [num_experts, hidden_size, intermediate_size]
+    - masked_routing_weight: [num_experts, batch * seq_len] (token dim may be padded to 64-align)
 
-        Expected tensor shapes:
-        - hidden_states: [batch * seq_len, hidden_size]
-        - gate_proj_weight: [num_experts, intermediate_size, hidden_size]
-        - up_proj_weight: [num_experts, intermediate_size, hidden_size]
-        - down_proj_weight: [num_experts, hidden_size, intermediate_size]
-        - masked_routing_weight: [num_experts, batch * seq_len] (token dim may be padded to 64-align)
+    Returns:
+        torch.Tensor: [batch * seq_len, hidden_size]
+    """
+    assert hidden_states.dtype == masked_routing_weight.dtype, "hidden_states and masked_routing_weight must have the same dtype"
 
-        Returns:
-            torch.Tensor: [batch * seq_len, hidden_size]
-        """
-        assert hidden_states.dtype == masked_routing_weight.dtype, "hidden_states and masked_routing_weight must have the same dtype"
+    num_tokens = hidden_states.shape[0]
+    out = torch.zeros_like(hidden_states)
+    expert_cnt = gate_proj_weight.shape[0]
+    # routing weight token dim may be padded to 64-align; slice to actual num_tokens
+    routing_t = masked_routing_weight.transpose(0, 1)[:num_tokens, :]  # [num_tokens, E]
+    for i in range(expert_cnt):
+        gate = torch.nn.functional.linear(hidden_states, gate_proj_weight[i])
+        up = torch.nn.functional.linear(hidden_states, up_proj_weight[i])
+        mul = torch.nn.functional.silu(gate) * up
+        down = torch.nn.functional.linear(mul, down_proj_weight[i])
+        out += down * routing_t[:, i : i + 1]
+    return out
 
-        num_tokens = hidden_states.shape[0]
-        out = torch.zeros_like(hidden_states)
-        expert_cnt = gate_proj_weight.shape[0]
-        # routing weight token dim may be padded to 64-align; slice to actual num_tokens
-        routing_t = masked_routing_weight.transpose(0, 1)[:num_tokens, :]  # [num_tokens, E]
-        for i in range(expert_cnt):
-            gate = torch.nn.functional.linear(hidden_states, gate_proj_weight[i])
-            up = torch.nn.functional.linear(hidden_states, up_proj_weight[i])
-            mul = torch.nn.functional.silu(gate) * up
-            down = torch.nn.functional.linear(mul, down_proj_weight[i])
-            out += down * routing_t[:, i : i + 1]
-        return out
 
-    @custom_moe_glu.register_fake
-    def custom_moe_glu_fake(
-        hidden_states: torch.Tensor,
-        gate_proj_weight: torch.Tensor,
-        up_proj_weight: torch.Tensor,
-        down_proj_weight: torch.Tensor,
-        masked_routing_weight: torch.Tensor,
-        expert_map: torch.Tensor | None = None,
-        gate_proj_bias: torch.Tensor | None = None,
-        up_proj_bias: torch.Tensor | None = None,
-        down_proj_bias: torch.Tensor | None = None,
-        dp_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        return torch.empty_like(hidden_states)
-
-else:
-
-    @torch.library.custom_op(
-        "rbln_custom_ops::custom_moe_glu",
-        mutates_args=(),
-    )
-    def custom_moe_glu(
-        hidden_states: torch.Tensor,
-        gate_proj_weight: torch.Tensor,
-        up_proj_weight: torch.Tensor,
-        down_proj_weight: torch.Tensor,
-        masked_routing_weight: torch.Tensor,
-        expert_select_count: torch.Tensor,
-        gate_proj_bias: torch.Tensor | None = None,
-        up_proj_bias: torch.Tensor | None = None,
-        down_proj_bias: torch.Tensor | None = None,
-        dp_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """
-        Customized MoE GLU operation (custom kernel version).
-
-        Expected tensor shapes:
-        - hidden_states: [batch * seq_len, hidden_size]
-        - gate_proj_weight: [num_experts, intermediate_size, hidden_size]
-        - up_proj_weight: [num_experts, intermediate_size, hidden_size]
-        - down_proj_weight: [num_experts, hidden_size, intermediate_size]
-        - masked_routing_weight: [num_experts, batch * seq_len] (token dim may be padded to 64-align)
-        - expert_select_count: [num_experts]
-
-        Returns:
-            torch.Tensor: [batch * seq_len, hidden_size]
-        """
-        assert hidden_states.dtype == masked_routing_weight.dtype, "hidden_states and masked_routing_weight must have the same dtype"
-
-        num_tokens = hidden_states.shape[0]
-        out = torch.zeros_like(hidden_states)
-        expert_cnt = gate_proj_weight.shape[0]
-        # routing weight token dim may be padded to 64-align; slice to actual num_tokens
-        routing_t = masked_routing_weight.transpose(0, 1)[:num_tokens, :]  # [num_tokens, E]
-        for i in range(expert_cnt):
-            gate = torch.nn.functional.linear(hidden_states, gate_proj_weight[i])
-            up = torch.nn.functional.linear(hidden_states, up_proj_weight[i])
-            mul = torch.nn.functional.silu(gate) * up
-            down = torch.nn.functional.linear(mul, down_proj_weight[i])
-            out += down * routing_t[:, i : i + 1]
-        return out
-
-    @custom_moe_glu.register_fake
-    def custom_moe_glu_fake(
-        hidden_states: torch.Tensor,
-        gate_proj_weight: torch.Tensor,
-        up_proj_weight: torch.Tensor,
-        down_proj_weight: torch.Tensor,
-        masked_routing_weight: torch.Tensor,
-        expert_select_count: torch.Tensor,
-        gate_proj_bias: torch.Tensor | None = None,
-        up_proj_bias: torch.Tensor | None = None,
-        down_proj_bias: torch.Tensor | None = None,
-        dp_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        return torch.empty_like(hidden_states)
+@custom_moe_glu.register_fake
+def custom_moe_glu_fake(
+    hidden_states: torch.Tensor,
+    gate_proj_weight: torch.Tensor,
+    up_proj_weight: torch.Tensor,
+    down_proj_weight: torch.Tensor,
+    masked_routing_weight: torch.Tensor,
+    expert_map: torch.Tensor | None = None,
+    gate_proj_bias: torch.Tensor | None = None,
+    up_proj_bias: torch.Tensor | None = None,
+    down_proj_bias: torch.Tensor | None = None,
+    dp_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
 
 
 def unquantized_fused_moe_method_rbln(
@@ -333,49 +269,6 @@ def get_masked_routing_weights(router_logits, top_k, renormalize, expert_map):
 
 
 def unquantized_fused_moe_method_custom(
-    self: UnquantizedFusedMoEMethod,
-    layer: FusedMoE,
-    x: torch.Tensor,
-    masked_routing_weights: torch.Tensor,
-):
-    # router_logits is now pre-computed masked_routing_weights
-    # (topk + softmax already done in fused_moe_forward_rbln)
-    # w1 : gate_proj, w2 : down_proj, w3 : up_proj
-    orig_shape = x.shape  # noqa: F841
-    num_tokens = orig_shape[:-1].numel()  # noqa: F841
-    intermediate_size = layer.w2_weight.shape[-1]
-
-    gate_proj_weight = layer.w13_weight[:, :intermediate_size, :]
-    up_proj_weight = layer.w13_weight[:, intermediate_size:, :]
-    down_proj_weight = layer.w2_weight
-
-    # expected tensor shape - [num_tokens, -1]
-    hidden_states = x.reshape(num_tokens, -1)
-    masked_routing_weights = masked_routing_weights.reshape(num_tokens, -1)
-
-    # transpose to [num_experts, num_tokens] for custom_moe_glu
-    masked_routing_weights_t = masked_routing_weights.transpose(0, 1)
-
-    # compute expert_select_count from masked_routing_weights
-    expert_select_count = (masked_routing_weights_t > 0).sum(dim=1).to(torch.int32)
-
-    final_hidden_states = torch.ops.rbln_custom_ops.custom_moe_glu(
-        hidden_states,
-        gate_proj_weight,
-        up_proj_weight,
-        down_proj_weight,
-        masked_routing_weights_t,
-        expert_select_count,
-        None,
-        None,
-        None,
-        None,
-    )
-
-    return final_hidden_states.reshape(orig_shape)
-
-
-def unquantized_fused_optimize_moe_method_custom(
     self: UnquantizedFusedMoEMethod,
     layer: FusedMoE,
     x: torch.Tensor,
@@ -788,10 +681,7 @@ def _fused_moe_init_with_all2all(self, *args, **kwargs):
 FusedMoE.__init__ = _fused_moe_init_with_all2all
 FusedMoE.forward_oot = fused_moe_forward_rbln
 
-if envs.VLLM_RBLN_MOE_USE_OPT_KERNEL:
-    logger.info("[RBLN] fused moe, RBLN optimize moe custom kernel")
-    UnquantizedFusedMoEMethod.apply = unquantized_fused_optimize_moe_method_custom
-elif envs.VLLM_RBLN_MOE_CUSTOM_KERNEL:
+if envs.VLLM_RBLN_MOE_CUSTOM_KERNEL:
     logger.info("[RBLN] fused moe, RBLN moe custom kernel")
     UnquantizedFusedMoEMethod.apply = unquantized_fused_moe_method_custom
 else:
