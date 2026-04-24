@@ -89,6 +89,13 @@ jobs:
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
+      - name: Parse vllm-cpu index URL from pyproject.toml
+        id: parse_index_url
+        run: |
+          VLLM_CPU_URL=$(python3 -c "import tomllib; f=open('pyproject.toml','rb'); config=tomllib.load(f); print(next(i['url'] for i in config.get('tool',{}).get('uv',{}).get('index',[]) if i.get('name')=='vllm-cpu'))")
+          echo "Parsed vllm-cpu URL: ${VLLM_CPU_URL}"
+          echo "VLLM_CPU_URL=${VLLM_CPU_URL}" >> $GITHUB_OUTPUT
+
       - name: Uninstall existing vllm-rbln
         run: |
           uv pip uninstall --system vllm-rbln
@@ -107,13 +114,14 @@ jobs:
           retry_on: any
           shell: bash
           command: |
+            VLLM_CPU_URL="${{ steps.parse_index_url.outputs.VLLM_CPU_URL }}"
             uv pip install --system packaging setuptools wheel simphile pynvml huggingface_hub setuptools_scm fire pytest pytest-asyncio
             VERSION=${{ inputs.optimum_rbln_version }}
             if [ -n "${{ inputs.optimum_rbln_version }}" ]; then
-              uv pip install --system --force-reinstall --no-cache-dir dist/vllm_rbln*.whl --constraint <(echo "optimum-rbln==${{ inputs.optimum_rbln_version }}") --index-url http://pypi-cache.devpi.svc.cluster.local/root/pypi/+simple/ --extra-index-url https://wheels.vllm.ai/0.13.0/cpu --extra-index-url https://download.pytorch.org/whl/cpu --index-strategy unsafe-best-match
+              uv pip install --system --force-reinstall --no-cache-dir dist/vllm_rbln*.whl --constraint <(echo "optimum-rbln==${{ inputs.optimum_rbln_version }}") --index-url http://pypi-cache.devpi.svc.cluster.local/root/pypi/+simple/ --extra-index-url "${VLLM_CPU_URL}" --extra-index-url https://download.pytorch.org/whl/cpu --index-strategy unsafe-best-match
               echo "optimum-rbln ${{ inputs.optimum_rbln_version }}"
             else
-              uv pip install --system --force-reinstall --no-cache-dir dist/vllm_rbln*.whl --index-url http://pypi-cache.devpi.svc.cluster.local/root/pypi/+simple/ --extra-index-url https://wheels.vllm.ai/0.13.0/cpu --extra-index-url https://download.pytorch.org/whl/cpu --index-strategy unsafe-best-match
+              uv pip install --system --force-reinstall --no-cache-dir dist/vllm_rbln*.whl --index-url http://pypi-cache.devpi.svc.cluster.local/root/pypi/+simple/ --extra-index-url "${VLLM_CPU_URL}" --extra-index-url https://download.pytorch.org/whl/cpu --index-strategy unsafe-best-match
             fi
       
       - name : Run Qwen3-embedding (V1)
@@ -184,6 +192,13 @@ jobs:
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
+      - name: Parse vllm-cpu index URL from pyproject.toml
+        id: parse_index_url
+        run: |
+          VLLM_CPU_URL=$(python3 -c "import tomllib; f=open('pyproject.toml','rb'); config=tomllib.load(f); print(next(i['url'] for i in config.get('tool',{}).get('uv',{}).get('index',[]) if i.get('name')=='vllm-cpu'))")
+          echo "Parsed vllm-cpu URL: ${VLLM_CPU_URL}"
+          echo "VLLM_CPU_URL=${VLLM_CPU_URL}" >> $GITHUB_OUTPUT
+
       - name: Uninstall existing vllm-rbln
         run: |
           uv pip uninstall --system vllm-rbln
@@ -202,13 +217,14 @@ jobs:
           retry_on: any
           shell: bash
           command: |
+            VLLM_CPU_URL="${{ steps.parse_index_url.outputs.VLLM_CPU_URL }}"
             uv pip install --system packaging setuptools wheel simphile pynvml huggingface_hub setuptools_scm fire pytest pytest-asyncio
             VERSION=${{ inputs.optimum_rbln_version }}
             if [ -n "${{ inputs.optimum_rbln_version }}" ]; then
-              uv pip install --system --force-reinstall --no-cache-dir dist/vllm_rbln*.whl --constraint <(echo "optimum-rbln==${{ inputs.optimum_rbln_version }}") --index-url http://pypi-cache.devpi.svc.cluster.local/root/pypi/+simple/ --extra-index-url https://wheels.vllm.ai/0.13.0/cpu --extra-index-url https://download.pytorch.org/whl/cpu --index-strategy unsafe-best-match
+              uv pip install --system --force-reinstall --no-cache-dir dist/vllm_rbln*.whl --constraint <(echo "optimum-rbln==${{ inputs.optimum_rbln_version }}") --index-url http://pypi-cache.devpi.svc.cluster.local/root/pypi/+simple/ --extra-index-url "${VLLM_CPU_URL}" --extra-index-url https://download.pytorch.org/whl/cpu --index-strategy unsafe-best-match
               echo "optimum-rbln ${{ inputs.optimum_rbln_version }}"
             else
-              uv pip install --system --force-reinstall --no-cache-dir dist/vllm_rbln*.whl --index-url http://pypi-cache.devpi.svc.cluster.local/root/pypi/+simple/ --extra-index-url https://wheels.vllm.ai/0.13.0/cpu --extra-index-url https://download.pytorch.org/whl/cpu --index-strategy unsafe-best-match
+              uv pip install --system --force-reinstall --no-cache-dir dist/vllm_rbln*.whl --index-url http://pypi-cache.devpi.svc.cluster.local/root/pypi/+simple/ --extra-index-url "${VLLM_CPU_URL}" --extra-index-url https://download.pytorch.org/whl/cpu --index-strategy unsafe-best-match
             fi
 
       - name: Run decoder-only test (eager attn) (V1)
@@ -304,6 +320,13 @@ jobs:
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
+      - name: Parse vllm-cpu index URL from pyproject.toml
+        id: parse_index_url
+        run: |
+          VLLM_CPU_URL=$(python3 -c "import tomllib; f=open('pyproject.toml','rb'); config=tomllib.load(f); print(next(i['url'] for i in config.get('tool',{}).get('uv',{}).get('index',[]) if i.get('name')=='vllm-cpu'))")
+          echo "Parsed vllm-cpu URL: ${VLLM_CPU_URL}"
+          echo "VLLM_CPU_URL=${VLLM_CPU_URL}" >> $GITHUB_OUTPUT
+
       - name: Uninstall existing vllm-rbln
         run: |
           uv pip uninstall --system vllm-rbln
@@ -322,13 +345,14 @@ jobs:
           retry_on: any
           shell: bash
           command: |
+            VLLM_CPU_URL="${{ steps.parse_index_url.outputs.VLLM_CPU_URL }}"
             uv pip install --system packaging setuptools wheel simphile pynvml huggingface_hub setuptools_scm fire pytest pytest-asyncio
             VERSION=${{ inputs.optimum_rbln_version }}
             if [ -n "${{ inputs.optimum_rbln_version }}" ]; then
-              uv pip install --system --force-reinstall --no-cache-dir dist/vllm_rbln*.whl --constraint <(echo "optimum-rbln==${{ inputs.optimum_rbln_version }}") --index-url http://pypi-cache.devpi.svc.cluster.local/root/pypi/+simple/ --extra-index-url https://wheels.vllm.ai/0.13.0/cpu --extra-index-url https://download.pytorch.org/whl/cpu --index-strategy unsafe-best-match
+              uv pip install --system --force-reinstall --no-cache-dir dist/vllm_rbln*.whl --constraint <(echo "optimum-rbln==${{ inputs.optimum_rbln_version }}") --index-url http://pypi-cache.devpi.svc.cluster.local/root/pypi/+simple/ --extra-index-url "${VLLM_CPU_URL}" --extra-index-url https://download.pytorch.org/whl/cpu --index-strategy unsafe-best-match
               echo "optimum-rbln ${{ inputs.optimum_rbln_version }}"
             else
-              uv pip install --system --force-reinstall --no-cache-dir dist/vllm_rbln*.whl --index-url http://pypi-cache.devpi.svc.cluster.local/root/pypi/+simple/ --extra-index-url https://wheels.vllm.ai/0.13.0/cpu --extra-index-url https://download.pytorch.org/whl/cpu --index-strategy unsafe-best-match
+              uv pip install --system --force-reinstall --no-cache-dir dist/vllm_rbln*.whl --index-url http://pypi-cache.devpi.svc.cluster.local/root/pypi/+simple/ --extra-index-url "${VLLM_CPU_URL}" --extra-index-url https://download.pytorch.org/whl/cpu --index-strategy unsafe-best-match
             fi
 
       - name : Run Qwen2.5_VL (V1)

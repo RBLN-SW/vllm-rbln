@@ -138,6 +138,7 @@ def _set_forward_context(
     batch_descriptor: BatchDescriptor | None = None,
     ubatch_slices: UBatchSlices | None = None,
     num_padded_tokens: int | None = None,
+    additional_kwargs: dict[str, Any] | None = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -169,6 +170,12 @@ def _set_forward_context(
         batch_descriptor,
         ubatch_slices,
     )
+    if additional_kwargs:
+        existing_additional_kwargs = getattr(forward_context, "additional_kwargs", None)
+        if existing_additional_kwargs is None:
+            forward_context.additional_kwargs = dict(additional_kwargs)
+        else:
+            existing_additional_kwargs.update(additional_kwargs)
 
     try:
         with override_forward_context(forward_context):

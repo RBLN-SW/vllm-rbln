@@ -16,9 +16,12 @@
 import math
 import os
 import platform
+from collections import defaultdict
 from collections.abc import Callable
 
+import torch
 from vllm.config import ModelConfig, ParallelConfig
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.platforms.cpu import CpuPlatform, LogicalCPUInfo
 
@@ -34,6 +37,7 @@ def estimate_available_memory(
     parallel_config: ParallelConfig,
     nbits_per_param: int | None = None,
     n_model_params: int | None = None,
+    n_model_bytes: int | None = None,
     kernel_size: int | None = None,
     buffer: int | None = None,
     num_runtimes: int = 2,
@@ -81,8 +85,6 @@ def estimate_available_memory(
     num_key_value_heads = model_config.get_num_kv_heads(parallel_config)
     tp_size = parallel_config.tensor_parallel_size
 
-    # TODO(jongho): Update if target npu is REBEL.
-
     device_name = current_platform.get_device_name().lower()
     assert "rbln" in device_name
     if "ca" in device_name:
@@ -124,10 +126,14 @@ def estimate_available_memory(
             )
 
     if kernel_size is None:
-        if n_model_params is None:
+        if n_model_params is None and n_model_bytes is None:
             raise ValueError(
-                "`n_model_params` should be specified \
-                to estimate the kernel memory."
+                "Either `n_model_params` or `n_model_bytes` should be specified "
+                "to estimate the kernel memory."
+            )
+        if n_model_params is not None and n_model_bytes is not None:
+            raise ValueError(
+                "Only one of `n_model_params` or `n_model_bytes` may be specified."
             )
         # Get estimated kernel size (approximated)
         # kernel_size
@@ -141,14 +147,23 @@ def estimate_available_memory(
         lm_heads_nbytes = (
             align_2MB(lm_heads_params * default_bits_per_param // 8 / tp_size) * tp_size
         )
-        word_embedding_params = lm_heads_params
-        params = n_model_params - lm_heads_params - word_embedding_params
-        layer_nbytes = (
-            align_2MB(params * nbits_per_param // 8 / num_layers) * num_layers
-        )
+        if n_model_bytes is not None:
+            lm_heads_bytes = lm_heads_params * default_bits_per_param // 8
+            word_embedding_bytes = lm_heads_params * default_bits_per_param // 8
+            layer_bytes = n_model_bytes - lm_heads_bytes - word_embedding_bytes
+            layer_nbytes = align_2MB(layer_bytes / num_layers) * num_layers
+        else:
+            word_embedding_params = lm_heads_params
+            params = n_model_params - lm_heads_params - word_embedding_params
+            layer_nbytes = (
+                align_2MB(params * nbits_per_param // 8 / num_layers) * num_layers
+            )
         kernel_size = layer_nbytes + lm_heads_nbytes
-    elif n_model_params is not None:
-        raise ValueError("Both `n_model_params` and `kernel_size` cannot be specified.")
+    elif n_model_params is not None or n_model_bytes is not None:
+        raise ValueError(
+            "`n_model_params`/`n_model_bytes` and `kernel_size`"
+            " cannot both be specified."
+        )
 
     available_dram_bytes -= kernel_size
 
@@ -159,7 +174,7 @@ def estimate_available_memory(
         buffer = buffer_per_runtime_per_core * num_runtimes
     available_dram_bytes -= buffer
 
-    rsd_replicas = (rsd_size // num_key_value_heads) or 1
+    rsd_replicas = (rsd_size // num_key_value_heads) or 1 if "ca" in device_name else 1
     available_dram_bytes = available_dram_bytes // rsd_replicas
 
     check_oom(available_dram_bytes)
@@ -286,6 +301,51 @@ def get_autobind_cpu_ids(
     return ",".join([str(x.id) for x in logical_cpu_list])
 
 
+def compute_rbln_local_omp_cpuid(
+    rank: int,
+    local_rank: int,
+    parallel_config: ParallelConfig,
+) -> str:
+    """CPU set string that ``set_cpu_affinity`` will use (comma list, ``all``, or
+    ``nobind``)."""
+    if envs.VLLM_RBLN_NUMA and platform.system() == "Linux":
+        cpu_arch = current_platform.get_cpu_architecture()
+        if cpu_arch in (CpuArchEnum.POWERPC, CpuArchEnum.S390X):
+            # For S390X/POWERPC SMT-8/4/2
+            return get_autobind_cpu_ids(
+                rank,
+                local_rank,
+                parallel_config,
+                lambda cpus: [cpu for cpu in cpus if cpu.id % 8 < 4],
+            )
+        if cpu_arch == CpuArchEnum.X86:
+            # For x86 SMT-2, use 1 CPU per core
+            return get_autobind_cpu_ids(
+                rank, local_rank, parallel_config, lambda cpus: cpus[:1]
+            )
+        return "nobind"
+    return "nobind"
+
+
+def get_rbln_planned_affinity_cpu_count(
+    rank: int,
+    local_rank: int,
+    parallel_config: ParallelConfig,
+) -> int:
+    """Logical CPU count this rank will pin to after NUMA split (before
+    ``sched_setaffinity``).
+
+    Use this to size ``torch``/OpenMP threads before affinity is applied so thread
+    counts match the post-bind CPU mask. If binding is ``nobind``/``all``, uses the
+    current ``sched_getaffinity`` mask.
+    """
+    local_omp_cpuid = compute_rbln_local_omp_cpuid(rank, local_rank, parallel_config)
+    if local_omp_cpuid not in ("all", "nobind"):
+        cpu_ids = [int(x.strip()) for x in local_omp_cpuid.split(",") if x.strip()]
+        return max(1, len(cpu_ids))
+    return max(1, len(os.sched_getaffinity(0)))
+
+
 def set_cpu_affinity(
     rank: int,
     local_rank: int,
@@ -298,26 +358,7 @@ def set_cpu_affinity(
         local_rank: Local rank of the worker.
         parallel_config: Parallel configuration.
     """
-    # Setup thread affinity based on NUMA nodes
-    if envs.VLLM_RBLN_NUMA and platform.system() == "Linux":
-        cpu_arch = current_platform.get_cpu_architecture()
-        if cpu_arch in (CpuArchEnum.POWERPC, CpuArchEnum.S390X):
-            # For S390X/POWERPC SMT-8/4/2
-            local_omp_cpuid = get_autobind_cpu_ids(
-                rank,
-                local_rank,
-                parallel_config,
-                lambda cpus: [cpu for cpu in cpus if cpu.id % 8 < 4],
-            )
-        elif cpu_arch == CpuArchEnum.X86:
-            # For x86 SMT-2, use 1 CPU per core
-            local_omp_cpuid = get_autobind_cpu_ids(
-                rank, local_rank, parallel_config, lambda cpus: cpus[:1]
-            )
-        else:
-            local_omp_cpuid = "nobind"
-    else:
-        local_omp_cpuid = "nobind"
+    local_omp_cpuid = compute_rbln_local_omp_cpuid(rank, local_rank, parallel_config)
 
     if local_omp_cpuid not in ("all", "nobind"):
         # Parse CPU IDs from string (e.g., "0,1,2,3" -> [0, 1, 2, 3])
@@ -396,3 +437,51 @@ def set_omp_num_threads(
         rank,
         local_rank,
     )
+
+
+def get_kv_cache_names(
+    kv_caches: dict[str, torch.Tensor],
+    num_attn_module: int = 1,
+) -> list[str]:
+    """
+    Get KV cache layer names sorted by layer index.
+
+    Copied and Modified from vllm.v1.worker.utils.bind_kv_cache
+
+    Args:
+        kv_caches: The allocated kv_caches with layer names as keys.
+        num_attn_module: Number of attention modules per layer.
+
+    Returns:
+        List of KV cache layer names in layer index order.
+    """
+    # Convert kv_caches dict to a list of names in the order of layer_index.
+    index2name = defaultdict(list)
+    for layer_name in kv_caches:
+        index2name[extract_layer_index(layer_name, num_attn_module)].append(layer_name)
+
+    kv_cache_names: list[str] = []
+    for layer_index in sorted(index2name.keys()):
+        layer_names = index2name[layer_index]
+        if len(layer_names) > 1:
+            # One typical case is encoder-decoder model, e.g., bart.
+            # The cross attention and self attention in the same decoder layer
+            # has different layer_name but the same layer_index.
+
+            # TODO - analyze where runner_kv_caches is used and the right
+            # way to ensure it properly reflects multiple attention layers
+            # in the same decoder block.
+            if (
+                current_platform.is_cuda_alike()
+                or current_platform.is_xpu()
+                or current_platform.is_cpu()
+            ):
+                # We know that the GPU / CPU runner is not impacted by this
+                # case. Some test code depends on runner_kv_caches, but
+                # not in a way that's impacted by ignoring this.
+                pass
+            else:
+                raise NotImplementedError
+        for layer_name in layer_names:
+            kv_cache_names.append(layer_name)
+    return kv_cache_names

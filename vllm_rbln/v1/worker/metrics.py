@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import atexit
 from collections import defaultdict
 from dataclasses import dataclass, field
 
@@ -193,13 +192,6 @@ class PerformanceTracker:
         self.decode_metrics = StepMetrics()
         self.prefill_metrics_by_request_id = PrefillMetricsByRequestID()
         self.padded_decode_metrics = StepMetrics()
-        self._registered_cleanup = False
-
-    def register_cleanup(self):
-        """Register cleanup function to print stats on exit."""
-        if not self._registered_cleanup:
-            atexit.register(self.print_final_stats)
-            self._registered_cleanup = True
 
     def check_dummy_request(self, request_ids: list[str] | None) -> bool:
         if request_ids:
@@ -227,7 +219,9 @@ class PerformanceTracker:
                 f"got {len(request_ids)}: {request_ids}"
             )
             request_id = request_ids[0]
-        self.prefill_metrics.add_measurement(latency, token_count)
+        self.prefill_metrics.add_measurement(
+            latency, token_count, host_time, device_time, ccl_time
+        )
         if request_id:
             self.prefill_metrics_by_request_id.add_measurement(
                 request_id, latency, token_count, host_time, device_time, ccl_time
@@ -268,3 +262,37 @@ class PerformanceTracker:
         # Padded decode stats
         self.padded_decode_metrics.show_stats("PADDED DECODE")
         logger.info("=" * 80)
+
+
+def collect_metrics(
+    performance_tracker: PerformanceTracker,
+    is_prefill: bool,
+    start_time: float,
+    end_time: float,
+    reports: list[dict],
+    token_count: int,
+) -> None:
+    execution_time = end_time - start_time
+    host_time = None
+    device_time = None
+    ccl_time = None
+    if reports is not None and len(reports) > 0:
+        host_time = reports[0].get("total_host", None)
+        device_time = reports[0].get("total_device", None)
+        ccl_time = reports[0].get("total_ccl", None)
+    if is_prefill:
+        performance_tracker.record_prefill(
+            execution_time,
+            token_count,
+            host_time=host_time,
+            device_time=device_time,
+            ccl_time=ccl_time,
+        )
+    else:
+        performance_tracker.record_decode(
+            execution_time,
+            token_count,
+            host_time=host_time,
+            device_time=device_time,
+            ccl_time=ccl_time,
+        )

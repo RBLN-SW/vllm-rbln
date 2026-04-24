@@ -26,6 +26,18 @@ from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)
 
+
+fused_moe_upstream__init__ = FusedMoE.__init__
+
+
+def fused_moe_custom__init__(self, *args, **kwargs):
+    fused_moe_upstream__init__(self, *args, **kwargs)
+
+    self.expert_map_const = (
+        self.expert_map.tolist() if self.expert_map is not None else None
+    )
+
+
 # Define custom_moe_glu op based on environment variable
 # VLLM_RBLN_MOE_USE_OPT_KERNEL: uses topk, post_norm, expert_map parameters
 # VLLM_RBLN_MOE_CUSTOM_KERNEL: uses expert_select_count parameter
@@ -371,9 +383,10 @@ def unquantized_fused_optimize_moe_method_custom(
 
     expert_map_const = None
     if layer.expert_map is not None:
-        # Extract numpy array and create a fresh constant tensor
-        expert_map_list = layer.expert_map.tolist()
-        expert_map_const = torch.tensor(expert_map_list, dtype=torch.int32)
+        assert getattr(layer, "expert_map_const", None) is not None
+        # Keep tensor ops only: .tolist() + torch.tensor(list) graph-breaks under
+        # PyTorch 2.10+ Dynamo when capture_scalar_outputs is false (pytorch#163807).
+        expert_map_const = torch.tensor(layer.expert_map_const, dtype=torch.int32)
 
     tokens_mask = None
     use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
@@ -404,7 +417,7 @@ def fused_moe_forward_rbln(
 ) -> torch.Tensor:
     assert self.quant_method is not None
 
-    if self.dp_size > 1:
+    if self.moe_parallel_config.dp_size > 1:
         org_hidden_shape = hidden_states.shape
 
         # input broadcast - all DPs broadcast hidden_states & router_logits
@@ -429,17 +442,29 @@ def fused_moe_forward_rbln(
         router_logits=router_logits,
     )
 
-    if self.dp_size > 1:
+    if self.moe_parallel_config.dp_size > 1:
         # output all_reduce == dp all_reduce + tp all_reduce
-        all_hidden_states = get_dp_group().all_reduce(final_hidden_states)
-        hidden_shape_dp = (-1, 1, org_hidden_shape[-1])
-        final_hidden_states = all_hidden_states.reshape(hidden_shape_dp)
+        if envs.VLLM_RBLN_MOE_REDUCE_SCATTER:
+            hidden_shape_dp = (-1, 1, org_hidden_shape[-1])
+            all_hidden_states = final_hidden_states.reshape(hidden_shape_dp)
+            assert all_hidden_states.shape[0] % self.moe_parallel_config.dp_size == 0
 
-        max_pad = get_forward_context().dp_metadata.max_pads_across_dp.shape[0]
-        num_tokens = org_hidden_shape[:-1].numel()  # noqa: F841
-        start = self.dp_rank * max_pad
-        end = start + num_tokens
-        final_hidden_states = final_hidden_states[start:end]
+            hidden_states = get_dp_group().reduce_scatter(all_hidden_states, dim=0)
+            max_pad = get_forward_context().dp_metadata.max_pads_across_dp.shape[0]
+            assert hidden_states.shape[0] == max_pad
+
+            num_tokens = org_hidden_shape[:-1].numel()  # noqa: F841
+            final_hidden_states = hidden_states[:num_tokens]
+        else:
+            all_hidden_states = get_dp_group().all_reduce(final_hidden_states)
+            hidden_shape_dp = (-1, 1, org_hidden_shape[-1])
+            final_hidden_states = all_hidden_states.reshape(hidden_shape_dp)
+
+            max_pad = get_forward_context().dp_metadata.max_pads_across_dp.shape[0]
+            num_tokens = org_hidden_shape[:-1].numel()  # noqa: F841
+            start = self.moe_parallel_config.dp_rank * max_pad
+            end = start + num_tokens
+            final_hidden_states = final_hidden_states[start:end]
 
         final_hidden_states = final_hidden_states.reshape(org_hidden_shape)
 
@@ -467,7 +492,7 @@ def fused_moe_naive_multicast_rbln(self: FusedMoE, x: torch.Tensor):
         all_buffer = None
         zeros = x - x
         for rank in range(get_dp_group().world_size):
-            rank_tensor = x if rank == self.dp_rank else zeros
+            rank_tensor = x if rank == self.moe_parallel_config.dp_rank else zeros
             all_buffer = (
                 torch.cat((all_buffer, rank_tensor), dim=0)
                 if all_buffer is not None
@@ -481,15 +506,16 @@ def fused_moe_naive_multicast_rbln(self: FusedMoE, x: torch.Tensor):
         return all_gather_buffer
 
 
+FusedMoE.__init__ = fused_moe_custom__init__
 FusedMoE.forward_oot = fused_moe_forward_rbln
 
 if envs.VLLM_RBLN_MOE_USE_OPT_KERNEL:
     logger.info("[RBLN] fused moe, RBLN optimize moe custom kernel")
-    UnquantizedFusedMoEMethod.forward_oot = unquantized_fused_optimize_moe_method_custom
+    UnquantizedFusedMoEMethod.apply = unquantized_fused_optimize_moe_method_custom
 elif envs.VLLM_RBLN_MOE_CUSTOM_KERNEL:
     logger.info("[RBLN] fused moe, RBLN moe custom kernel")
-    UnquantizedFusedMoEMethod.forward_oot = unquantized_fused_moe_method_custom
+    UnquantizedFusedMoEMethod.apply = unquantized_fused_moe_method_custom
 else:
     logger.info("[RBLN] fused moe, pytorch native kernel")
-    UnquantizedFusedMoEMethod.forward_oot = unquantized_fused_moe_method_rbln
+    UnquantizedFusedMoEMethod.apply = unquantized_fused_moe_method_rbln
 FusedMoE.naive_multicast = fused_moe_naive_multicast_rbln

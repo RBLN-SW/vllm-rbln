@@ -17,15 +17,15 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
-from vllm.attention.backends.abstract import (
+from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionImpl,
+    AttentionMetadataBuilder,
     AttentionType,
 )
-from vllm.attention.backends.registry import AttentionBackendEnum, register_backend
-from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
 from vllm.v1.attention.backends.utils import (
-    AttentionMetadataBuilder,
     CommonAttentionMetadata,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
@@ -37,6 +37,7 @@ if TYPE_CHECKING:
 import vllm_rbln.rbln_envs as envs
 import vllm_rbln.utils as rbln_utils
 from vllm_rbln.logger import init_logger
+from vllm_rbln.v1.attention.kv_cache_bindings import KVCacheViewInfo
 
 logger = init_logger(__name__)
 
@@ -942,7 +943,9 @@ class RBLNAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_name() -> str:
-        return "RBLN_ATTN"
+        # Must match AttentionBackendEnum (see Attention.__init__ in v0.18+). This
+        # backend is registered via @register_backend(AttentionBackendEnum.FLASH_ATTN).
+        return "FLASH_ATTN"
 
     @staticmethod
     def get_impl_cls() -> type["RBLNFlashAttentionImpl"]:
@@ -1016,6 +1019,7 @@ class RBLNFlashAttentionMetadata:
     # For RBLN Attention
     attn_masks: torch.Tensor | None = None
     kv_caches: list[torch.Tensor] | None = None
+    kv_cache_view_infos: list[KVCacheViewInfo] | None = None
     # for sliding window attention
     cache_seq_lens: torch.Tensor | None = None
     cache_offsets: torch.Tensor | None = None
@@ -1075,9 +1079,9 @@ class RBLNFlashAttentionMetadataBuilder(
         common_prefix_len: int,
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
-        num_tokens=None,
         positions=None,
         batch_pad=None,
+        is_prefill=False,
     ) -> RBLNFlashAttentionMetadata:
         num_reqs = common_attn_metadata.num_reqs
         num_actual_tokens = common_attn_metadata.num_actual_tokens
@@ -1099,11 +1103,9 @@ class RBLNFlashAttentionMetadataBuilder(
 
         # The length of the partition equals the block size.
         partition_len = self.block_size
-        # no. of block(HW constraint) determines max sequence length.
-        # max_model_len(Model constraint) determines max sequence length.
-        # One of them is selected for max_seq_len.
-        block_length = self.cache_config.num_gpu_blocks * partition_len
-        max_seq_len = min(self.model_config.max_model_len, block_length)
+        # num_partition is derived from max_model_len (not hardware block count)
+        # to ensure seq_idx/seq_lens dimensions stay within block_table bounds.
+        max_seq_len = self.model_config.max_model_len
 
         num_partition = max_seq_len // partition_len
         cs = seq_idx.repeat(1, num_partition)
@@ -1114,18 +1116,10 @@ class RBLNFlashAttentionMetadataBuilder(
         ).to(torch.int16)
         seq_lens_tensor = dyn_size_for_partitions
 
-        assert num_tokens is not None, (
-            "num_tokens is required for RBLN Attention Backend"
-        )
         assert batch_pad is not None, "batch_pad is required for RBLN Attention Backend"
-        is_prefills = num_computed_tokens[:num_reqs].numpy() < num_tokens[:num_reqs] - 1
-        # The prefill and decode cannot be mixed.
-        assert len(is_prefills) > 0 and all(
-            is_prefill == is_prefills[0] for is_prefill in is_prefills[:num_reqs]
-        )
 
         attn_masks = None
-        if is_prefills[0]:
+        if is_prefill:
             # NOTE(jiwoo.park) prefill's block_tables must be a 1D tensor.
             block_tables_tensor = block_tables_tensor[0]
             if not self.is_causal:
@@ -1181,7 +1175,7 @@ class RBLNFlashAttentionMetadataBuilder(
             query_lens = seq_lens - num_computed_tokens
             cache_seq_lens = torch.clamp(num_computed_tokens, max=sliding_window)
             cache_offsets = cache_seq_lens + query_lens
-            if not is_prefills[0]:
+            if not is_prefill:
                 cache_seq_lens = rbln_utils.pad(cache_seq_lens, 0, batch_pad)
                 cache_offsets = rbln_utils.pad(cache_offsets, 0, batch_pad)
                 # Generate sliding window attention mask for decode
@@ -1203,7 +1197,7 @@ class RBLNFlashAttentionMetadataBuilder(
             query_start_loc=query_start_loc,
             max_seq_len=query_max_seq_len,
             seq_lens=seq_lens_tensor.to(self.device)
-            if not self.is_batch_attention_opt or is_prefills[0] or batch_pad <= 1
+            if not self.is_batch_attention_opt or is_prefill or batch_pad <= 1
             else seq_idx.to(self.device),
             block_tables=block_tables_tensor.to(self.device),
             slot_mapping=slot_mapping,
@@ -1214,7 +1208,7 @@ class RBLNFlashAttentionMetadataBuilder(
             prefix_kv_lens=prefix_kv_lens,
             suffix_kv_lens=suffix_kv_lens,
             prefix_scheduler_metadata=prefix_scheduler_metadata,
-            is_prefill=bool(is_prefills[0]),
+            is_prefill=is_prefill,
             attn_masks=attn_masks,
             cache_seq_lens=cache_seq_lens.to(self.device)
             if cache_seq_lens is not None

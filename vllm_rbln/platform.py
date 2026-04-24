@@ -12,16 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import os
 from typing import TYPE_CHECKING
 
 import torch
-from vllm.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 if TYPE_CHECKING:
-    from vllm.attention.selector import AttentionSelectorConfig
     from vllm.config import VllmConfig
     from vllm.utils.argparse_utils import FlexibleArgumentParser
+    from vllm.v1.attention.selector import AttentionSelectorConfig
 else:
     VllmConfig = None
 
@@ -156,6 +157,10 @@ class RblnPlatform(Platform):
         parallel_config = vllm_config.parallel_config
         scheduler_config = vllm_config.scheduler_config
 
+        if scheduler_config.async_scheduling:
+            scheduler_config.async_scheduling = False
+            logger.warning("Async scheduler not supported on RBLN.")
+
         if envs.VLLM_RBLN_USE_VLLM_MODEL:
             cls.validate_and_setup_prerequisite(vllm_config)
             if envs.VLLM_RBLN_ENFORCE_MODEL_FP32:
@@ -249,6 +254,20 @@ class RblnPlatform(Platform):
             assert vllm_config.speculative_config is None, (
                 "Speculative decoding is not supported in optimum-rbln."
             )
+            # T5EncoderModel is encoder-only but inherits T5Config which has
+            # is_encoder_decoder=True. This causes vllm to route inputs
+            # through the enc-dec path, prepending decoder_start_token_id and
+            # breaking CLS pooling. Set it to False for pooling models.
+            # ModelConfig.is_encoder_decoder is a @cached_property that's
+            # already evaluated by this point, so invalidate the cache too.
+            hf_config = model_config.hf_config
+            if is_pooling_arch(hf_config) and getattr(
+                hf_config, "is_encoder_decoder", False
+            ):
+                hf_config.is_encoder_decoder = False
+                with contextlib.suppress(KeyError):
+                    del model_config.__dict__["is_encoder_decoder"]
+
             cls.disable_unsupported_prefix_caching(vllm_config)
             sync_with_rbln_config(vllm_config)
 
@@ -291,6 +310,7 @@ class RblnPlatform(Platform):
         cls,
         selected_backend: "AttentionBackendEnum",
         attn_selector_config: "AttentionSelectorConfig",
+        num_heads: int | None = None,
     ) -> str:
         if selected_backend and selected_backend != AttentionBackendEnum.FLASH_ATTN:
             logger.info("Cannot use %s backend on RBLN.", selected_backend)
@@ -354,3 +374,21 @@ class RblnPlatform(Platform):
     @classmethod
     def can_update_inplace(cls) -> bool:
         return False
+
+    @classmethod
+    def get_nixl_supported_devices(cls) -> dict[str, tuple[str, ...]]:
+        return {
+            "rbln": ("cpu",),
+        }
+
+    @classmethod
+    def get_nixl_memory_type(cls) -> str | None:
+        return "DRAM"
+
+    @classmethod
+    def discover_numa_topology(cls) -> list[list[int]]:
+        """
+        Discover NUMA topology and keep the last physical core of each numa
+        into one core group list for nixl start_kv_load()
+        """
+        return []
