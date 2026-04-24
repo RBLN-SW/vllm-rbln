@@ -252,6 +252,34 @@ def prepare_vllm_for_compile(vllm_config: VllmConfig) -> None:
     )
 
 
+def _resolve_rbln_config(vllm_config: VllmConfig) -> dict | None:
+    """Locate a compiled ``rbln_config.json`` for this vLLM config.
+
+    1. pre-compiled path (user passed an already-compiled directory)
+    2. cache hit (hashed path already contains a compiled artifact)
+    3. cache miss (compilation still needed; stages `cached_model_path`)
+    """
+    try:
+        rbln_config = get_rbln_config(vllm_config)
+    except Exception as e:
+        raise RuntimeError("Failed to get RBLN config: %s", e) from e
+    if rbln_config is not None:
+        return rbln_config
+
+    cached_model_path = os.path.join(
+        envs.VLLM_CACHE_ROOT,
+        "compiled_models",
+        generate_model_path_name(vllm_config=vllm_config),
+    )
+    if os.path.exists(os.path.join(cached_model_path, "rbln_config.json")):
+        logger.info("Found cached compiled model at %s", cached_model_path)
+        vllm_config.model_config.model = cached_model_path
+        return get_rbln_config(vllm_config)
+
+    vllm_config.additional_config["cached_model_path"] = cached_model_path
+    return None
+
+
 def sync_with_rbln_config(vllm_config: VllmConfig) -> None:
     """
     If compiled model with RBLN config is given,
@@ -259,34 +287,16 @@ def sync_with_rbln_config(vllm_config: VllmConfig) -> None:
     If no RBLN config is given, validate vLLM config and set necessary parameters
     to default values to compile model internally.
     """
-    try:
-        rbln_config = get_rbln_config(vllm_config)
-    except Exception as e:
-        raise RuntimeError("Failed to get RBLN config: %s", e) from e
-
-    additional_rbln_config = vllm_config.additional_config.get("rbln_config", {})
-
+    rbln_config = _resolve_rbln_config(vllm_config)
     if rbln_config is None:
-        cached_model_path = os.path.join(
-            envs.VLLM_CACHE_ROOT,
-            "compiled_models",
-            generate_model_path_name(vllm_config=vllm_config),
-        )
-        if os.path.exists(os.path.join(cached_model_path, "rbln_config.json")):
-            logger.info("Found cached compiled model at %s", cached_model_path)
-            vllm_config.model_config.model = cached_model_path
-            rbln_config = get_rbln_config(vllm_config)
-        else:
-            vllm_config.additional_config["cached_model_path"] = cached_model_path
-
-    # If the pre-compiled model exists, rbln_config is not None
-    if rbln_config is not None:
-        # NOTE: We can set the device to run submodules
-        # Set only device setting using rbln_config
-        vllm_config.additional_config["rbln_config"] = keep_only_device_keys(
-            additional_rbln_config
-        )
-        params = RBLNParams.from_rbln_config(vllm_config, rbln_config)
-        sync_vllm_from_rbln_config(vllm_config, params)
-    else:
         prepare_vllm_for_compile(vllm_config)
+        return
+
+    # Pre-compiled (or cache-hit): the compiled artefact is the source of
+    # truth. Strip the user's additional_config down to device-only keys so
+    # submodule placement can still be overridden.
+    vllm_config.additional_config["rbln_config"] = keep_only_device_keys(
+        vllm_config.additional_config.get("rbln_config", {})
+    )
+    params = RBLNParams.from_rbln_config(vllm_config, rbln_config)
+    sync_vllm_from_rbln_config(vllm_config, params)
