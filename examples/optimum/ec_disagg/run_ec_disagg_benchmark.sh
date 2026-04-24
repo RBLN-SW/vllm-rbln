@@ -7,17 +7,17 @@
 # Launches encoders, llm, proxy, waits for readiness, runs benchmark.
 #
 # Usage:
-#   bash examples/optimum/run_ec_disagg_benchmark.sh
+#   bash examples/optimum/ec_disagg/run_ec_disagg_benchmark.sh
 #
 # Override any variable via env:
-#   NUM_ENCODERS=4 NUM_PROMPTS=10 bash examples/optimum/run_ec_disagg_benchmark.sh
+#   NUM_ENCODERS=4 NUM_PROMPTS=10 bash examples/optimum/ec_disagg/run_ec_disagg_benchmark.sh
 #
 set -euo pipefail
 
 ###############################################################################
 # Activate venv
 ###############################################################################
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 if [ -f "$REPO_ROOT/.venv/bin/activate" ]; then
     source "$REPO_ROOT/.venv/bin/activate"
 fi

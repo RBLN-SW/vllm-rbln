@@ -308,8 +308,7 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
 
         ec_cfg = vllm_config.ec_transfer_config
         assert ec_cfg is not None, (
-            "RblnECNixlConnector requires `ec_transfer_config` to be set "
-            "on VllmConfig, but it was None. Please refer to the [documentation](~~~)"
+            "RblnECNixlConnector requires `ec_transfer_config` to be set."
         )
 
         self._backends: list[str] = ec_cfg.get_from_extra_config("backends", ["UCX"])
@@ -410,7 +409,7 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
                 logger.warning(
                     "RblnECNixlConnector (encoder): LLM PULL port %s:%d is not "
                     "accepting connections yet. Start the LLM first with "
-                    "`bash examples/optimum/serve_ec_llm.sh` — ZMQ will still "
+                    "`bash examples/optimum/ec_disagg/serve_ec_llm.sh` — ZMQ will still "
                     "buffer messages and reconnect once the LLM is up, but "
                     "tail latency for the earliest requests may be poor.",
                     llm_host,

@@ -10,7 +10,7 @@
 # Each encoder gets 1 device and connects to the llm's PULL port.
 # Start the llm FIRST with: bash serve_ec_llm.sh
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 if [ -f "$REPO_ROOT/.venv/bin/activate" ]; then
     source "$REPO_ROOT/.venv/bin/activate"
 fi

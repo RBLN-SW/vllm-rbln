@@ -22,7 +22,7 @@ import torch
 import torch.distributed
 import torch.nn as nn
 from vllm.config import VllmConfig, set_current_vllm_config
-from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
+from vllm.distributed.ec_transfer import get_ec_transfer
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.model_executor.models.interfaces import (
     supports_transcription,
@@ -252,9 +252,17 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         # between execute_model() and sample_tokens().
         self.execute_model_state: ExecuteModelState | None = None
 
+        # EC role flags — ec_transfer_config is static, so cache once.
+        ec_cfg = getattr(self.vllm_config, "ec_transfer_config", None)
+        self.is_ec_producer: bool = ec_cfg is not None and ec_cfg.is_ec_producer
+        self.is_ec_consumer: bool = (
+            ec_cfg is not None and not ec_cfg.is_ec_producer
+        )
+
         # FIXME async_scheduling?
 
-    def _is_ec_producer_only(self) -> bool:
+    @property
+    def is_ec_producer_only(self) -> bool:
         ec = getattr(self.vllm_config, "ec_transfer_config", None)
         return ec is not None and ec.is_ec_producer and not ec.is_ec_consumer
 
@@ -316,7 +324,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
 
             # EC Producer early-exit: run vision encoder only,
             # save results to EC connector, then return empty output.
-            if has_ec_transfer() and get_ec_transfer().is_producer:
+            if self.is_ec_producer:
                 model_input, _ = self._prepare_inputs(scheduler_output)
                 if model_input.is_prompt and model_input.multi_modal_kwargs:
                     with self.maybe_get_ec_connector_output(
@@ -331,8 +339,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             #   for _run_decoder_with_cached_encoder).
             # - Decode-only steps: non-blocking — pulls continue in
             #   background while decode batch runs unblocked.
-            is_ec_consumer = has_ec_transfer() and not get_ec_transfer().is_producer
-            if is_ec_consumer:
+            if self.is_ec_consumer:
                 ec = get_ec_transfer()
                 if scheduler_output.ec_connector_metadata is not None:
                     ec.bind_connector_metadata(scheduler_output.ec_connector_metadata)
@@ -354,7 +361,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             # EC consumer with cached encoder output: run the decoder
             # with pre-computed embeddings instead of the full model
             # forward (which would require the vision encoder runtime).
-            if is_ec_consumer and model_input.is_prompt and self.encoder_cache:
+            if self.is_ec_consumer and model_input.is_prompt and self.encoder_cache:
                 with capture_ctx as model_reports:
                     hidden_states = self._run_decoder_with_cached_encoder(
                         model_input, scheduler_output
@@ -383,7 +390,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             hidden_states = hidden_states.squeeze(1)
             logits = self.model.compute_logits(hidden_states, None)
         # EC Consumer cleanup: poll finished transfers and clear metadata.
-        if is_ec_consumer:
+        if self.is_ec_consumer:
             ec.get_finished(scheduler_output.finished_req_ids)
             ec.clear_connector_metadata()
 
