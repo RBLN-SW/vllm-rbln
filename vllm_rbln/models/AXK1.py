@@ -31,12 +31,12 @@ def __AXK1_moe_forward_rsd(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states=hidden_states, router=lambda x: self.gate(x)[0].sigmoid()
     )
     if hidden_states.dtype != torch.float16:
-        final_hidden_states *= self.routed_scaling_factor
+        final_hidden_states = final_hidden_states * self.routed_scaling_factor
     elif self.shared_experts is not None:
-        shared_output *= 1.0 / self.routed_scaling_factor
+        shared_output = shared_output * (1.0 / self.routed_scaling_factor)
 
     if self.shared_experts is not None:
-        final_hidden_states += shared_output
+        final_hidden_states = final_hidden_states + shared_output
 
     if self.tp_size > 1:
         final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
