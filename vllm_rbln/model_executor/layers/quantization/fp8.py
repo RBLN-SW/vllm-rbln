@@ -408,7 +408,6 @@ def custom_moe_swiglu_group_dequantize(
     up_proj_bias: torch.Tensor | None = None,
     down_proj_bias: torch.Tensor | None = None,
     expert_map: torch.Tensor | None = None,
-    dp_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Customized MoE SwiGLU operation with pre-computed routing weights.
@@ -530,7 +529,6 @@ def custom_moe_swiglu_group_dequantize_fake(
     up_proj_bias: torch.Tensor | None = None,
     down_proj_bias: torch.Tensor | None = None,
     expert_map: torch.Tensor | None = None,
-    dp_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
 
@@ -842,11 +840,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             assert getattr(layer, "expert_map_const", None) is not None
             expert_map_const = torch.tensor(layer.expert_map_const, dtype=torch.int32)
 
-        tokens_mask = None
-        use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
-        if use_moe_tokens_mask:
-            tokens_mask = get_tokens_mask(num_tokens)
-
         final_hidden_states = (
             torch.ops.rbln_custom_ops.custom_moe_swiglu_group_dequantize(
                 hidden_states,
@@ -863,7 +856,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 None,  # up_proj_bias
                 None,  # down_proj_bias
                 expert_map_const,
-                None,  # dp_mask (handled externally)
             )
         )
 

@@ -109,7 +109,6 @@ def custom_moe_glu_mxfp4(
     alpha: torch.Tensor,
     limit: torch.Tensor,
     expert_map: torch.Tensor | None = None,
-    dp_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     MoE GLU operation for GPT-OSS with mxfp4 quantization and swigluoai activation.
@@ -228,7 +227,6 @@ def custom_moe_glu_mxfp4_fake(
     alpha: torch.Tensor,
     limit: torch.Tensor,
     expert_map: torch.Tensor | None = None,
-    dp_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
 
@@ -395,11 +393,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     layer.expert_map_const, dtype=torch.int32
                 )
 
-            tokens_mask = None
-            use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
-            if use_moe_tokens_mask:
-                tokens_mask = get_tokens_mask(num_tokens)
-
             final_hidden_states = torch.ops.rbln_custom_ops.custom_moe_glu_mxfp4(
                 hidden_states,
                 layer.gate_proj_blocks,
@@ -415,7 +408,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 self.swiglu_alpha,
                 self.swiglu_limit,
                 expert_map_const,
-                tokens_mask,
             )
         else:
             raise NotImplementedError(layer.activation)
