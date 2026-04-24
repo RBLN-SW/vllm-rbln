@@ -939,7 +939,7 @@ def _(
 class RBLNAttentionBackend(AttentionBackend):
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
-        return [32, 64, 80, 96, 128, 160, 192, 224, 256]
+        return [32, 64, 80, 96, 128, 160, 192, 224, 256, 512]
 
     @staticmethod
     def get_name() -> str:
