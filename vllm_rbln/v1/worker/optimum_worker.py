@@ -38,8 +38,8 @@ from vllm.v1.worker.worker_base import WorkerBase
 
 import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
-from vllm_rbln.utils.optimum.cache_blocks import sync_num_blocks
-from vllm_rbln.utils.optimum.rbln_params import RBLNParams
+from vllm_rbln.utils.optimum.converter import sync_num_blocks
+from vllm_rbln.utils.optimum.params import RBLNParams
 from vllm_rbln.v1.worker.optimum_model_runner import RBLNOptimumModelRunner
 from vllm_rbln.v1.worker.utils import set_omp_num_threads
 
