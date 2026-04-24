@@ -240,7 +240,6 @@ class CompressedTensorsW8A16Fp8MoEMethod(upstream.CompressedTensorsMoEMethod):
                 down_proj_weight_scale,
                 router_logits,
                 torch.tensor(group_size, dtype=torch.int32),
-                layer.top_k,
                 e_score_correction_bias,
                 None,  # gate_proj_bias
                 None,  # up_proj_bias
