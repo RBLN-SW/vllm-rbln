@@ -17,7 +17,8 @@ Kept as a mixin so `RBLNOptimumModelRunner` keeps a stable public
 surface (all call sites are `self._make_producer_output(...)` etc.) while
 the EC-specific logic lives in its own module.
 """
-from typing import TYPE_CHECKING
+
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
@@ -25,6 +26,7 @@ from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
 from vllm_rbln.model_executor.models.optimum import ModelInputForRBLN
 
 if TYPE_CHECKING:
+    from vllm.config import ModelConfig
     from vllm.v1.core.sched.output import SchedulerOutput
 
 
@@ -35,6 +37,17 @@ class ECDisaggHelpersMixin:
       - self.model, self.model_config, self.encoder_cache
       - self.maybe_save_ec_to_connector (from ECConnectorModelRunnerMixin)
     """
+
+    # Attributes and methods supplied by the host class / sibling mixins.
+    # Declared here so mypy sees them when type-checking this file in isolation.
+    if TYPE_CHECKING:
+        model: Any
+        model_config: "ModelConfig"
+        encoder_cache: dict[str, Any]
+
+        def maybe_save_ec_to_connector(
+            self, encoder_cache: dict[str, Any], mm_hash: str
+        ) -> None: ...
 
     def _make_producer_output(
         self, scheduler_output: "SchedulerOutput"
