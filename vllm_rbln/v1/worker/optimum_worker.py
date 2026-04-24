@@ -177,8 +177,7 @@ class RBLNOptimumWorker(WorkerBase):
         num_layers = len(kv_cache_spec)
         page_size = get_uniform_page_size(kv_cache_spec.values())
 
-        adapter = self.model_runner.model.kv_block_adapter
-        if adapter is None:
+        if self.model_runner.is_ec_producer_only:
             # EC producer has no real LLM; the scheduler still spins up
             # a KV-cache manager, so report enough memory to satisfy
             # vLLM's max_model_len sizing check. Nothing is actually
@@ -188,6 +187,7 @@ class RBLNOptimumWorker(WorkerBase):
             num_blocks = max_model_len // block_size + 1
             return num_blocks * page_size * num_layers
 
+        adapter = self.model_runner.model.kv_block_adapter
         num_gpu_blocks = adapter.get_available_num_blocks()
         # If the model is compiled in the runner,
         # the number of blocks is not set in the vLLM config yet.
@@ -265,8 +265,7 @@ class RBLNOptimumWorker(WorkerBase):
         set_random_seed(self.model_config.seed)
 
         # EC producer has no decoder — skip warmup entirely.
-        ec = getattr(self.vllm_config, "ec_transfer_config", None)
-        if ec is not None and ec.is_ec_producer and not ec.is_ec_consumer:
+        if self.model_runner.is_ec_producer_only:
             logger.info("EC producer: skipping warmup (no decoder).")
             return
 
