@@ -38,7 +38,7 @@ from vllm.v1.worker.worker_base import WorkerBase
 
 import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
-from vllm_rbln.utils.optimum.converter import sync_num_blocks
+from vllm_rbln.utils.optimum.converter import update_num_blocks
 from vllm_rbln.utils.optimum.params import RBLNParams
 from vllm_rbln.v1.worker.optimum_model_runner import RBLNOptimumModelRunner
 from vllm_rbln.v1.worker.utils import set_omp_num_threads
@@ -200,8 +200,8 @@ class RBLNOptimumWorker(WorkerBase):
             assert params.num_blocks is not None, (
                 "num_blocks must be specified in rbln_config.json"
             )
-            sync_num_blocks(self.model_runner.vllm_config, params.num_blocks)
-        # num_gpu_blocks must be set after sync_num_blocks is called.
+            update_num_blocks(self.model_runner.vllm_config, params.num_blocks)
+        # num_gpu_blocks must be set after update_num_blocks is called.
         num_gpu_blocks = adapter.get_available_num_blocks()
         validation_blocks = self.model_runner.vllm_config.cache_config.num_gpu_blocks
         # This will be removed after validation check

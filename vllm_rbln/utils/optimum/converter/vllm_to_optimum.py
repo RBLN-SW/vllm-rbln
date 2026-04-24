@@ -1,6 +1,24 @@
-from vllm_rbln.logger import init_logger
+# Copyright 2025 Rebellions Inc. All rights reserved.
+
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at:
+
+#     http://www.apache.org/licenses/LICENSE-2.0
+
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from typing import TYPE_CHECKING
 
+from vllm_rbln.logger import init_logger
+from vllm_rbln.utils.optimum.converter.common import (
+    update_block_size,
+    update_max_num_batched_tokens,
+)
 from vllm_rbln.utils.optimum.params import (
     RBLNParams,
 )
@@ -9,10 +27,7 @@ from vllm_rbln.utils.optimum.registry import (
     is_multi_modal,
     is_pooling_arch,
 )
-from vllm_rbln.utils.optimum.converter.utils import (
-    update_max_num_batched_tokens,
-    update_block_size,
-)
+
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 else:
@@ -26,6 +41,7 @@ def _set_default_block_size(vllm_config: VllmConfig) -> None:
     cache_config = vllm_config.cache_config
     if not cache_config.user_specified_block_size:
         cache_config.block_size = vllm_config.model_config.max_model_len
+
 
 def _validate_block_size(vllm_config: VllmConfig) -> None:
     cache_config = vllm_config.cache_config
@@ -41,11 +57,13 @@ def _validate_block_size(vllm_config: VllmConfig) -> None:
             "For pooling models, block_size must be equal to max_model_len."
         )
 
+
 def sync_from_vllm(vllm_config: VllmConfig) -> None:
     """
     Sync vLLM configuration from RBLN parameters.
     1. Parse RBLNParams from vllm_config.additional_config["rbln_config"].
-    2. Update vllm_config based on the parsed RBLNParams to ensure consistency between vLLM and RBLN configurations.
+    2. Update vllm_config based on the parsed RBLNParams
+    to ensure consistency between vLLM and RBLN configurations.
     3. Validate the updated block size
     """
     rbln_config = vllm_config.additional_config.get("rbln_config", {})
@@ -89,4 +107,3 @@ def sync_from_vllm(vllm_config: VllmConfig) -> None:
     )
 
     logger.info("Prepared vLLM config for compilation: %s", vllm_config)
-

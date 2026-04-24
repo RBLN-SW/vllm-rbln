@@ -13,23 +13,26 @@
 # limitations under the License.
 
 from typing import TYPE_CHECKING
-from vllm_rbln.utils.optimum.params import RBLNParams
-from vllm_rbln.logger import init_logger
+
 import vllm_rbln.rbln_envs as envs
+from vllm_rbln.logger import init_logger
 from vllm_rbln.utils.optimum.cache_blocks import (
-    is_full_block_available,
     get_block_ratio,
+    is_full_block_available,
 )
-from vllm_rbln.utils.optimum.converter.utils import (
-    update_max_num_batched_tokens,
+from vllm_rbln.utils.optimum.converter.common import (
     update_block_size,
+    update_max_num_batched_tokens,
 )
+from vllm_rbln.utils.optimum.params import RBLNParams
+
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 else:
     VllmConfig = None
 
 logger = init_logger(__name__)
+
 
 def sync_to_vllm(
     vllm_config: VllmConfig,
@@ -74,16 +77,15 @@ def sync_to_vllm(
         vllm_config.model_config.max_model_len = params.max_seq_len
 
     # Set block_size in cache_config based on rbln_config.json
-    update_block_size(
-        vllm_config, params.kvcache_block_size, params.prefill_chunk_size
-    )
+    update_block_size(vllm_config, params.kvcache_block_size, params.prefill_chunk_size)
     # Set num_blocks in cache_config based on rbln_config.json
-    _update_num_blocks(vllm_config, params.num_blocks)
+    update_num_blocks(vllm_config, params.num_blocks)
 
     # Set tensor_parallel_size in envs based on rbln_config.json
     envs.VLLM_RBLN_TP_SIZE = params.tensor_parallel_size
 
-def _update_num_blocks(vllm_config: VllmConfig, num_blocks: int) -> None:
+
+def update_num_blocks(vllm_config: VllmConfig, num_blocks: int) -> None:
     # This function is called twice during startup: once in the main process
     # when we first read rbln_config.json, and once in each subprocess when
     # the VllmConfig is deserialized. We only want to perform the num_blocks
