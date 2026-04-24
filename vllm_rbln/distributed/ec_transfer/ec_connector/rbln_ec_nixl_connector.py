@@ -307,7 +307,10 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
             ) from e
 
         ec_cfg = vllm_config.ec_transfer_config
-        assert ec_cfg is not None
+        assert ec_cfg is not None, (
+            "RblnECNixlConnector requires `ec_transfer_config` to be set "
+            "on VllmConfig, but it was None. Please refer to the [documentation](~~~)"
+        )
 
         self._backends: list[str] = ec_cfg.get_from_extra_config("backends", ["UCX"])
         self._engine_id: str = str(uuid.uuid4())
