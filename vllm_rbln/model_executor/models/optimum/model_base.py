@@ -30,7 +30,7 @@ from optimum.rbln.transformers.models.decoderonly import (
     decoderonly_runtime_utils as runtime_utils,
 )
 from vllm_rbln.utils.optimum.common import select_bucket_size
-from vllm_rbln.utils.optimum.compilation import compile_model
+from vllm_rbln.utils.optimum.compilation import RBLNCompileSpec
 from vllm_rbln.utils.optimum.configuration import get_attn_block_size
 from vllm_rbln.utils.optimum.registry import get_rbln_model_info
 
@@ -204,16 +204,18 @@ class RBLNOptimumModelBase(nn.Module):
             assert not os.path.exists(cached_model_path), (
                 "Compiled model must be loaded from the cache."
             )
-            model = compile_model(
-                self.model_config.model,
+            spec = RBLNCompileSpec.for_architecture(
                 config,
                 batch_size=self.scheduler_config.max_num_seqs,
                 block_size=get_attn_block_size(self.vllm_config),
                 max_model_len=self.model_config.max_model_len,
                 tp_size=envs.VLLM_RBLN_TP_SIZE,
-                model_path=str(cached_model_path),
                 additional_config=rbln_config,
             )
+            model = spec.model_cls.from_pretrained(
+                self.model_config.model, rbln_config=spec.rbln_config
+            )
+            model.save_pretrained(str(cached_model_path))
             self.vllm_config.model_config.model = cached_model_path
 
         # Load the model directly if it is either an optimum-compiled model
