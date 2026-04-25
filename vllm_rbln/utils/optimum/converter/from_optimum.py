@@ -20,11 +20,9 @@ from vllm_rbln.utils.optimum.cache_blocks import (
     get_block_ratio,
     is_full_block_available,
 )
-from vllm_rbln.utils.optimum.converter.common import (
-    update_block_size,
-    update_max_num_batched_tokens,
-)
-from vllm_rbln.utils.optimum.params import RBLNParams
+
+from .common import update_block_size, update_max_num_batched_tokens
+from .params import RBLNParams
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -34,10 +32,13 @@ else:
 logger = init_logger(__name__)
 
 
-def sync_to_vllm(
+def sync_from_optimum(
     vllm_config: VllmConfig,
     params: RBLNParams,
 ) -> None:
+    """
+    optimum -> vLLM config synchronization
+    """
     assert params.num_blocks is not None, (
         "num_blocks must be specified in rbln_config.json"
     )

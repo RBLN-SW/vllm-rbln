@@ -15,18 +15,14 @@
 from typing import TYPE_CHECKING
 
 from vllm_rbln.logger import init_logger
-from vllm_rbln.utils.optimum.converter.common import (
-    update_block_size,
-    update_max_num_batched_tokens,
-)
-from vllm_rbln.utils.optimum.params import (
-    RBLNParams,
-)
 from vllm_rbln.utils.optimum.registry import (
     is_generation_arch,
     is_multi_modal,
     is_pooling_arch,
 )
+
+from .common import update_block_size, update_max_num_batched_tokens
+from .params import RBLNParams
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -60,7 +56,7 @@ def _validate_block_size(vllm_config: VllmConfig) -> None:
 
 def sync_from_vllm(vllm_config: VllmConfig) -> None:
     """
-    Sync vLLM configuration from RBLN parameters.
+    vllm_config.additional_config["rbln_config"] -> optimum
     1. Parse RBLNParams from vllm_config.additional_config["rbln_config"].
     2. Update vllm_config based on the parsed RBLNParams
     to ensure consistency between vLLM and RBLN configurations.

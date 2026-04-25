@@ -13,9 +13,12 @@
 # limitations under the License.
 
 from .dispatch import sync_vllm_and_optimum
-from .optimum_to_vllm import update_num_blocks
+from .from_optimum import update_num_blocks
+from .params import RBLNParams, get_rbln_config
 
 __all__ = [
+    "RBLNParams",
+    "get_rbln_config",
     "sync_vllm_and_optimum",
     "update_num_blocks",
 ]

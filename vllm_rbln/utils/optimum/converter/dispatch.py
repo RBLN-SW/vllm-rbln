@@ -15,14 +15,14 @@
 import hashlib
 import json
 import os
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
-from vllm_rbln.utils.optimum.params import RBLNParams, get_rbln_config
 
-from .optimum_to_vllm import sync_to_vllm
-from .vllm_to_optimum import sync_from_vllm
+from .from_optimum import sync_from_optimum
+from .from_vllm import sync_from_vllm
+from .params import RBLNParams, get_rbln_config
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -143,4 +143,4 @@ def sync_vllm_and_optimum(vllm_config: VllmConfig) -> None:
         vllm_config.additional_config.get("rbln_config", {})
     )
     params = RBLNParams.from_rbln_config(vllm_config, rbln_config)
-    sync_to_vllm(vllm_config, params)
+    sync_from_optimum(vllm_config, params)
