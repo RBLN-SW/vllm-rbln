@@ -68,13 +68,29 @@ class RBLNScheduler(Scheduler):
         # so that each prefill does not span multiple blocks.
         if sub_block_size is None and envs.VLLM_RBLN_SUB_BLOCK_CACHE:
             sub_block_size = self.scheduler_config.max_num_batched_tokens
-        if (
+        will_use_sub_block_caching = (
             self.cache_config.enable_prefix_caching
-            and sub_block_size
+            and sub_block_size is not None
+            and sub_block_size > 0
             and RBLNKVCacheManager.can_use_sub_block_caching(
                 self.kv_cache_config, sub_block_size
             )
+        )
+        if (
+            self.enable_kv_cache_events
+            and envs.VLLM_RBLN_SUB_BLOCK_EVENT
+            and not will_use_sub_block_caching
         ):
+            raise ValueError(
+                "VLLM_RBLN_SUB_BLOCK_EVENT=True requires sub-block prefix "
+                "caching to be active. Either ensure prefix caching is "
+                "enabled and the KV cache config supports sub-block caching "
+                "(eligible spec types with block_size > sub_block_size and "
+                "block_size % sub_block_size == 0), or set "
+                "VLLM_RBLN_SUB_BLOCK_EVENT=False to emit big-block events."
+            )
+        if will_use_sub_block_caching:
+            assert sub_block_size is not None
             hash_fn = get_hash_fn_by_name(self.cache_config.prefix_caching_hash_algo)
             init_none_hash(hash_fn)
 
@@ -98,12 +114,19 @@ class RBLNScheduler(Scheduler):
                 sub_block_size,
             )
             if self.enable_kv_cache_events:
-                logger.info(
-                    "NOTE that KV cache events emit at sub_block_size granularity. "
-                    "Cache-aware routers must set token processing block size to "
-                    "sub_block_size=%d.",
-                    sub_block_size,
-                )
+                if envs.VLLM_RBLN_SUB_BLOCK_EVENT:
+                    logger.info(
+                        "NOTE that KV cache events emit at sub_block_size "
+                        "granularity. Cache-aware routers must set token "
+                        "processing block size to sub_block_size=%d.",
+                        sub_block_size,
+                    )
+                else:
+                    logger.info(
+                        "VLLM_RBLN_SUB_BLOCK_EVENT=False: KV cache events "
+                        "emit at big block_size=%d granularity.",
+                        self.block_size,
+                    )
 
     def schedule(self) -> RBLNSchedulerOutput:
         # Copied from vllm.v1.core.sched.Scheduler.schedule: https://github.com/vllm-project/vllm/blob/v0.18.0/vllm/v1/core/sched/scheduler.py#L338-L927

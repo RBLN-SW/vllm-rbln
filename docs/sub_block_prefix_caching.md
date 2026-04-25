@@ -32,6 +32,7 @@ if the KV cache tensor has a token dimension that can be sliced for partial copy
 | Environment variable | Default | Description |
 |---|---|---|
 | `VLLM_RBLN_SUB_BLOCK_CACHE` | `true` | Enable sub-block prefix caching. |
+| `VLLM_RBLN_SUB_BLOCK_EVENT` | `true` | Emit KV cache events at sub-block granularity. Requires sub-block caching. Set to `false` to fall back to upstream big-block events. |
 
 The `sub_block_size` is automatically set to prefill chunk size (`max_num_batched_tokens`)
 so that each prefill does not span multiple blocks.
@@ -215,16 +216,19 @@ kv_cache[:, dst_block_id, :, :, :num_tokens, :] = \
 
 ## KV cache events
 
-Sub-block caching so far is an intra-engine optimisation:
+Sub-block caching so far is an intra-engine optimization:
 one instance serving multiple requests that share a prefix reuses KV locally.
-Prefix-cache-aware routers (e.g. llm-d) extend that reuse *across* engines by
+Prefix-cache-aware routers (e.g. llm-d) extend that reuse across engines by
 subscribing to KV events and routing each request to an engine that already
 caches its prefix.
 
 Upstream vLLM emits those events at block granularity.
 For RBLN's 1k–4k token big blocks, that means a partial big block never gets advertised.
 So routers cannot utilize the sub-block prefix information.
-Therefore, we adapt the KV cache manager to emit events at sub-block granularity.
+Therefore, we adapt the KV cache manager to emit events at sub-block granularity
+by default (`VLLM_RBLN_SUB_BLOCK_EVENT=true`).
+Setting `VLLM_RBLN_SUB_BLOCK_EVENT=false` reverts to upstream big-block emission
+without disabling intra-engine sub-block caching.
 
 ### Contract
 

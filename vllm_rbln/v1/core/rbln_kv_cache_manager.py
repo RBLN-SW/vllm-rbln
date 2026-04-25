@@ -35,6 +35,7 @@ from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     generate_block_hash_extra_keys,
+    get_block_hash,
     hash_block_tokens,
     make_block_hash_with_group_id,
     maybe_convert_block_hash,
@@ -47,6 +48,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
 )
 
+import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
 
 if TYPE_CHECKING:
@@ -65,6 +67,12 @@ _SUB_BLOCK_ELIGIBLE_SPECS: tuple[type[KVCacheSpec], ...] = (
 )
 
 logger = init_logger(__name__)
+
+# Bare-hash prefix for synthetic block hashes installed by
+# ``_index_partial_block`` to keep partial blocks pinned in the upstream LRU.
+# These hashes never appear in a ``BlockStored`` event, so any matching
+# ``BlockRemoved`` from the pool is spurious noise to consumers.
+_SYNTHETIC_HASH_PREFIX = b"partial_block_"
 
 
 @dataclass
@@ -365,21 +373,25 @@ class RBLNKVCacheManager(KVCacheManager):
         # taken before allocate_slots, used to narrow the scan range.
         self._pending_indexing: dict[str, tuple[Request, tuple[int, ...]]] = {}
 
-        # Sub-block-granular KV event queue. We intercept the upstream pool's
-        # big-block event emission and publish sub-block events instead.
-        self.enable_kv_cache_events = self.block_pool.enable_kv_cache_events
-        self.block_pool.enable_kv_cache_events = False
+        # When VLLM_RBLN_SUB_BLOCK_EVENT is on, intercept the upstream pool's
+        # big-block emission and publish sub-block-granular events instead.
+        # Otherwise, leave the pool to emit at its native big-block granularity.
+        self.enable_sub_block_events = (
+            self.block_pool.enable_kv_cache_events and envs.VLLM_RBLN_SUB_BLOCK_EVENT
+        )
         self._sub_block_event_queue: list[KVCacheEvent] = []
+        if self.enable_sub_block_events:
+            self.block_pool.enable_kv_cache_events = False
 
-        # Upstream gates hybrid (multi-group) KV cache manager off when
-        # KV events are enabled (see vllm/config/vllm.py
-        # ``need_disable_hybrid_kv_cache_manager``).
-        if self.enable_kv_cache_events and len(self._group_infos) > 1:
-            raise ValueError(
-                "KV cache events are not supported with multi-group (hybrid) "
-                "sub-block caching. Upstream disables the hybrid KV cache "
-                "manager when KV events are enabled."
-            )
+            # Upstream gates hybrid (multi-group) KV cache manager off when
+            # KV events are enabled (see vllm/config/vllm.py
+            # ``need_disable_hybrid_kv_cache_manager``).
+            if len(self._group_infos) > 1:
+                raise ValueError(
+                    "KV cache events are not supported with multi-group "
+                    "(hybrid) sub-block caching. Upstream disables the "
+                    "hybrid KV cache manager when KV events are enabled."
+                )
 
         self._install_eviction_hook()
 
@@ -605,7 +617,7 @@ class RBLNKVCacheManager(KVCacheManager):
         """Reset prefix cache including all per-group sub-block indices."""
         result = super().reset_prefix_cache()
         if result:
-            if self.enable_kv_cache_events:
+            if self.enable_sub_block_events:
                 self._sub_block_event_queue.append(AllBlocksCleared())
             for gi in self._group_infos:
                 gi.sub_block_index = SubBlockIndex()
@@ -613,13 +625,15 @@ class RBLNKVCacheManager(KVCacheManager):
         return result
 
     def take_events(self) -> list[KVCacheEvent]:
-        """Return and clear the sub-block KV event queue.
+        """Return and clear pending KV cache events.
 
-        Overrides upstream to return sub-block-granular events (big-block
-        emission from the underlying pool is suppressed in ``__init__``).
+        When sub-block events are enabled, returns sub-block-granular events
+        from our queue (the underlying pool's big-block emission is
+        suppressed in ``__init__``).  Otherwise, falls through to upstream
+        which returns big-block events from the pool.
         """
-        if not self.enable_kv_cache_events:
-            return []
+        if not self.enable_sub_block_events:
+            return super().take_events()
         events = self._sub_block_event_queue
         self._sub_block_event_queue = []
         return events
@@ -735,7 +749,7 @@ class RBLNKVCacheManager(KVCacheManager):
                 # doesn't collide with any real full-block hash.
                 synthetic_hash = make_block_hash_with_group_id(
                     BlockHash(
-                        b"partial_block_"
+                        _SYNTHETIC_HASH_PREFIX
                         + str(blk.block_id).encode("ascii")
                         + b"_"
                         + partial_sub_hashes[-1]
@@ -758,12 +772,28 @@ class RBLNKVCacheManager(KVCacheManager):
         # sub-block index. We can't simply override evict_blocks because we
         # need to know if eviction actually happened.
         original_evict = self.block_pool._maybe_evict_cached_block
+        pool = self.block_pool
 
         def evict_with_index_cleanup(block: KVCacheBlock) -> bool:
             block_id = block.block_id
+            # Detect a synthetic-hash partial block before the pool resets
+            # block_hash. When the pool is emitting big-block events (i.e.
+            # sub-block events are off), it would otherwise append a
+            # BlockRemoved for a hash no consumer ever saw a BlockStored
+            # for; we drop that entry below.
+            had_synthetic = (
+                not self.enable_sub_block_events
+                and pool.enable_kv_cache_events
+                and block.block_hash is not None
+                and get_block_hash(block.block_hash).startswith(_SYNTHETIC_HASH_PREFIX)
+            )
             result = original_evict(block)
             if result:
                 self._on_block_evicted(block_id)
+                if had_synthetic and pool.kv_event_queue:
+                    last = pool.kv_event_queue[-1]
+                    assert isinstance(last, BlockRemoved)
+                    pool.kv_event_queue.pop()
             return result
 
         self.block_pool._maybe_evict_cached_block = evict_with_index_cleanup
@@ -785,7 +815,7 @@ class RBLNKVCacheManager(KVCacheManager):
         The fresh suffix we emit is
         ``state.hashes[sub_start + first_fresh_idx : sub_end]``.
         """
-        if not self.enable_kv_cache_events:
+        if not self.enable_sub_block_events:
             return
         slice_len = sub_end - sub_start
         if first_fresh_idx >= slice_len:
@@ -818,7 +848,7 @@ class RBLNKVCacheManager(KVCacheManager):
 
     def _emit_block_removed(self, fully_removed: list[BlockHash]) -> None:
         """Emit a single ``BlockRemoved`` for hashes whose last holder is gone."""
-        if not self.enable_kv_cache_events or not fully_removed:
+        if not self.enable_sub_block_events or not fully_removed:
             return
         self._sub_block_event_queue.append(
             BlockRemoved(

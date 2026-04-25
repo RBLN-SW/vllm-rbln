@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_AUTO_PORT: bool = True
     VLLM_RBLN_MOE_REDUCE_SCATTER: bool = False
     VLLM_RBLN_SUB_BLOCK_CACHE: bool = True
+    VLLM_RBLN_SUB_BLOCK_EVENT: bool = True
 
 
 def get_dp_impl() -> str:
@@ -270,6 +271,11 @@ environment_variables = {
     # Sub-block size equals max_num_batched_tokens (prefill chunk size).
     "VLLM_RBLN_SUB_BLOCK_CACHE": lambda: (
         os.environ.get("VLLM_RBLN_SUB_BLOCK_CACHE", "True").lower() in ("true", "1")
+    ),
+    # Emit KV cache events at sub-block granularity instead of the upstream
+    # big-block granularity. Requires sub-block prefix caching to be active.
+    "VLLM_RBLN_SUB_BLOCK_EVENT": lambda: (
+        os.environ.get("VLLM_RBLN_SUB_BLOCK_EVENT", "True").lower() in ("true", "1")
     ),
 }
 

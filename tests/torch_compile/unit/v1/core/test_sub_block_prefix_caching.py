@@ -2570,3 +2570,73 @@ class TestKVCacheEvents:
             f"expected at least one of req0's hashes in remove events; "
             f"got {seen}, expected {expected}"
         )
+
+    def test_big_block_mode_drops_synthetic_remove(self, monkeypatch):
+        """``VLLM_RBLN_SUB_BLOCK_EVENT=False`` keeps the pool's big-block
+        emission, but the synthetic hash we install on partial blocks (to
+        pin them in the upstream LRU) was never advertised via BlockStored.
+        Eviction of a synthetic-hash block must therefore not surface a
+        spurious BlockRemoved."""
+        monkeypatch.setenv("VLLM_RBLN_SUB_BLOCK_EVENT", "False")
+        # Use raw-bytes block hashes so we can substring-check below.
+        monkeypatch.setenv("VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES", "0")
+        manager = _make_manager(
+            self.BLOCK_SIZE,
+            self.SUB_BLOCK_SIZE,
+            num_blocks=4,
+            enable_kv_cache_events=True,
+        )
+
+        # Request 0: caches a partial block so free() installs the synthetic
+        # hash via _index_partial_block(mark_cached=True).
+        partial_tokens = list(range(self.SUB_BLOCK_SIZE))
+        req0 = _make_request(
+            "0", partial_tokens, self.BLOCK_SIZE, max_tokens=self.SUB_BLOCK_SIZE
+        )
+        _prefill_request(manager, req0)
+        manager.free(req0)
+        manager.take_events()  # drain setup events
+
+        # Saturate the pool to force eviction of req0's synthetic-hash block.
+        for i in range(1, 6):
+            req = _make_request(
+                str(i),
+                list(range(i * 1000, i * 1000 + self.BLOCK_SIZE)),
+                self.BLOCK_SIZE,
+            )
+            _prefill_request(manager, req)
+            manager.free(req)
+
+        # No BlockRemoved should carry the synthetic-hash bytes.
+        for ev in manager.take_events():
+            if isinstance(ev, BlockRemoved):
+                for h in ev.block_hashes:
+                    assert isinstance(h, bytes)
+                    assert b"partial_block_" not in h, (
+                        f"synthetic hash leaked into BlockRemoved: {h!r}"
+                    )
+
+    def test_sub_block_event_env_off_falls_back_to_big_block(self, monkeypatch):
+        """``VLLM_RBLN_SUB_BLOCK_EVENT=False`` keeps the pool's big-block
+        emission and stops sub-block emission, so ``take_events`` surfaces
+        upstream big-block events at ``block_size`` granularity."""
+        monkeypatch.setenv("VLLM_RBLN_SUB_BLOCK_EVENT", "False")
+        manager = _make_manager(
+            self.BLOCK_SIZE,
+            self.SUB_BLOCK_SIZE,
+            num_blocks=10,
+            enable_kv_cache_events=True,
+        )
+        assert manager.enable_sub_block_events is False
+        # Pool emission must still be on so events flow at all.
+        assert manager.block_pool.enable_kv_cache_events is True
+
+        tokens = list(range(self.BLOCK_SIZE))
+        req = _make_request("0", tokens, self.BLOCK_SIZE)
+        _prefill_request(manager, req)
+
+        events = manager.take_events()
+        stored = [e for e in events if isinstance(e, BlockStored)]
+        assert stored, "expected upstream big-block BlockStored"
+        # Granularity is the big block, not the sub-block.
+        assert all(e.block_size == self.BLOCK_SIZE for e in stored)
