@@ -34,11 +34,11 @@ from vllm.utils.torch_utils import _StreamPlaceholder
 import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
 from vllm_rbln.utils.optimum.converter import sync_vllm_and_optimum
+from vllm_rbln.utils.optimum.predicates import is_qwen3_pooling
 from vllm_rbln.utils.optimum.registry import (
     is_enc_dec_arch,
     is_multi_modal,
     is_pooling_arch,
-    is_qwen3_pooling,
 )
 
 logger = init_logger(__name__)

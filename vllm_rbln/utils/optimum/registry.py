@@ -15,7 +15,6 @@
 
 
 from transformers import PretrainedConfig
-from vllm.config import ModelConfig
 
 # modified/customized models for RBLN
 _RBLN_GENERATION_MODELS: dict[str, tuple[str, str]] = {
@@ -137,12 +136,4 @@ def get_rbln_model_info(config: PretrainedConfig) -> tuple[str, str]:
         f"Model architectures {architectures} are not supported on RBLN "
         f"for now. Supported architectures: "
         f"{list(_RBLN_SUPPORTED_MODELS.keys())}"
-    )
-
-
-def is_qwen3_pooling(model_config: ModelConfig) -> bool:
-    _, model_cls_name = get_rbln_model_info(model_config)
-    return (
-        model_cls_name == "RBLNQwen3ForCausalLM"
-        and model_config.runner_type == "pooling"
     )
