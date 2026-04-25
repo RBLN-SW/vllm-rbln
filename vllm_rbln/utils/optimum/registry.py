@@ -14,8 +14,14 @@
 # limitations under the License.
 
 
+from typing import TYPE_CHECKING
+
 from transformers import PretrainedConfig
 
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
+else:
+    VllmConfig = None
 # modified/customized models for RBLN
 _RBLN_GENERATION_MODELS: dict[str, tuple[str, str]] = {
     "LlamaForCausalLM": (
@@ -136,4 +142,14 @@ def get_rbln_model_info(config: PretrainedConfig) -> tuple[str, str]:
         f"Model architectures {architectures} are not supported on RBLN "
         f"for now. Supported architectures: "
         f"{list(_RBLN_SUPPORTED_MODELS.keys())}"
+    )
+
+
+def is_qwen3_pooling(
+    vllm_config: VllmConfig,
+) -> bool:
+    _, model_cls_name = get_rbln_model_info(vllm_config.model_config)
+    return (
+        model_cls_name in ["RBLNQwen3ForCausalLM"]
+        and vllm_config.model_config.runner_type == "pooling"
     )
