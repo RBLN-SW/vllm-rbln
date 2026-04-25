@@ -29,8 +29,8 @@ import vllm_rbln.rbln_envs as envs
 from optimum.rbln.transformers.models.decoderonly import (
     decoderonly_runtime_utils as runtime_utils,
 )
+from vllm_rbln.utils.optimum.bucket import select_bucket_size
 from vllm_rbln.utils.optimum.cache_blocks import get_attn_block_size
-from vllm_rbln.utils.bucket import select_bucket_size
 from vllm_rbln.utils.optimum.compilation import RBLNCompileSpec
 from vllm_rbln.utils.optimum.registry import get_rbln_model_info
 
