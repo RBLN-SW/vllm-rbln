@@ -1,13 +1,24 @@
-from vllm_rbln.utils.optimum.registry import get_rbln_model_info, is_generation_arch, is_pooling_arch, is_multi_modal, is_enc_dec_arch, _RBLN_SUPPORTED_MODELS
-from transformers import PretrainedConfig
 from typing import Any
+
+import optimum.rbln
 from optimum.rbln import (
     RBLNAutoModelForCausalLM,
     RBLNAutoModelForSpeechSeq2Seq,
 )
-from vllm_rbln.utils.optimum.multimodal import get_multimodal_cls, _COMPILE_MULTIMODAL_FNS
+from transformers import PretrainedConfig
 
-import optimum.rbln
+from vllm_rbln.utils.optimum.multimodal import (
+    _COMPILE_MULTIMODAL_FNS,
+    get_multimodal_cls,
+)
+from vllm_rbln.utils.optimum.registry import (
+    get_rbln_model_info,
+    is_enc_dec_arch,
+    is_generation_arch,
+    is_multi_modal,
+    is_pooling_arch,
+)
+
 
 def compile_model(
     hf_model_name: str,
@@ -31,12 +42,10 @@ def compile_model(
         default_param["batch_size"] = batch_size
         default_param["max_seq_len"] = max_model_len
         if block_size != max_model_len:
-            attn_impl = "flash_attn" if block_size != max_model_len else "eager"
             default_param["kvcache_partition_len"] = block_size
-            default_param["attn_impl"] = attn_impl
+            default_param["attn_impl"] = "flash_attn"
         model_cls = RBLNAutoModelForCausalLM
     elif is_pooling_arch(config):
-        model_cls_name = _RBLN_SUPPORTED_MODELS[architectures[0]][1]
         model_cls = getattr(optimum.rbln, model_cls_name)
         assert model_cls is not None
         default_param["batch_size"] = batch_size
@@ -44,9 +53,8 @@ def compile_model(
         # FIXME: We need a more generalized logic to specify block sizes
         # as the number of supported models continues to grow.
         if architectures[0] == "Qwen3Model" and block_size != max_model_len:
-            attn_impl = "flash_attn" if block_size != max_model_len else "eager"
             default_param["kvcache_partition_len"] = block_size
-            default_param["attn_impl"] = attn_impl
+            default_param["attn_impl"] = "flash_attn"
     elif is_multi_modal(config):
         model_cls = get_multimodal_cls(architectures[0])
         compile_fn = _COMPILE_MULTIMODAL_FNS.get(model_name)
