@@ -33,5 +33,5 @@ def fresh_inductor_cache_per_test(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def skip_prepare_compile():
-    with patch("vllm_rbln.utils.optimum.configuration.prepare_vllm_for_compile"):
+    with patch("vllm_rbln.utils.optimum.converter.dispatch.sync_from_vllm"):
         yield
