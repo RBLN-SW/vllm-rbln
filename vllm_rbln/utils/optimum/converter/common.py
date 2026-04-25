@@ -12,17 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import TYPE_CHECKING
+
+from vllm_rbln.logger import init_logger
 from vllm_rbln.utils.optimum.registry import (
     is_enc_dec_arch,
 )
-from vllm_rbln.logger import init_logger
-from typing import TYPE_CHECKING
+
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 else:
     VllmConfig = None
 
 logger = init_logger(__name__)
+
 
 def update_max_num_batched_tokens(vllm_config: VllmConfig, max_model_len: int) -> None:
     """
@@ -114,9 +117,9 @@ def update_block_size(
 ) -> None:
     """
     Update the block size in the vllm_config based on the provided kvcache_block_size
-    and prefill_chunk_size.
-    For models with prefix caching enabled, the block size is set to the prefix block size,
-    which is determined based on the prefill_chunk_size and user-provided prefix_block_size.
+    and prefill_chunk_size. For models with prefix caching enabled, the block size
+    is set to the prefix block size, which is determined based on the prefill_chunk_size
+    and user-provided prefix_block_size.
     """
     vllm_config.cache_config.user_specified_block_size = True
     if vllm_config.cache_config.enable_prefix_caching:

@@ -30,8 +30,9 @@ from optimum.rbln.transformers.models.decoderonly import (
     decoderonly_runtime_utils as runtime_utils,
 )
 from vllm_rbln.utils.optimum.common import select_bucket_size
+from vllm_rbln.utils.optimum.compilation import compile_model
 from vllm_rbln.utils.optimum.configuration import get_attn_block_size
-from vllm_rbln.utils.optimum.registry import compile_model, get_rbln_model_info
+from vllm_rbln.utils.optimum.registry import get_rbln_model_info
 
 logger = init_logger(__name__)
 
