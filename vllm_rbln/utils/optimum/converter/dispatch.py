@@ -15,16 +15,12 @@
 import hashlib
 import json
 import os
-from typing import TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
 from vllm_rbln.utils.optimum.params import RBLNParams, get_rbln_config
 
-from .dispatch_helper import (
-    keep_only_device_keys,
-    strip_runtime_only_keys,
-)
 from .optimum_to_vllm import sync_to_vllm
 from .vllm_to_optimum import sync_from_vllm
 
@@ -34,6 +30,40 @@ else:
     VllmConfig = None
 
 logger = init_logger(__name__)
+
+
+# Keys that affect only runtime loading, not the compiled binary, and
+# therefore must be stripped before hashing so the same compiled artifact
+# is shared between compile-only and inference invocations.
+_RUNTIME_ONLY_KEYS: frozenset[str] = frozenset(
+    {"create_runtimes", "devices", "kvcache_num_blocks"}
+)
+
+
+def _strip_runtime_only_keys(obj: dict) -> dict:
+    """Recursively drop :data:`_RUNTIME_ONLY_KEYS` from nested dict/list."""
+    if isinstance(obj, dict):
+        return {
+            k: _strip_runtime_only_keys(v)
+            for k, v in obj.items()
+            if k not in _RUNTIME_ONLY_KEYS
+        }
+    if isinstance(obj, list):
+        return [_strip_runtime_only_keys(item) for item in obj]
+    return obj
+
+
+def _keep_only_device_keys(obj: dict) -> dict:
+    """Recursively keep only ``devices`` entries from nested dict/list."""
+    result: dict[str, Any] = {}
+    for k, v in obj.items():
+        if k == "devices":
+            result[k] = v
+        elif isinstance(v, dict):
+            filtered = _keep_only_device_keys(v)
+            if filtered:
+                result[k] = filtered
+    return result
 
 
 def generate_model_path_name(
@@ -57,7 +87,7 @@ def generate_model_path_name(
         "tp_size": tp_size,
     }
     if additional_config:
-        config_dict["rbln_config"] = strip_runtime_only_keys(additional_config)
+        config_dict["rbln_config"] = _strip_runtime_only_keys(additional_config)
 
     config_json = json.dumps(config_dict, sort_keys=True, default=str)
     config_hash = hashlib.sha256(config_json.encode()).hexdigest()[:16]
@@ -109,7 +139,7 @@ def sync_vllm_and_optimum(vllm_config: VllmConfig) -> None:
     # Pre-compiled (or cache-hit): the compiled artefact is the source of
     # truth. Strip the user's additional_config down to device-only keys so
     # submodule placement can still be overridden.
-    vllm_config.additional_config["rbln_config"] = keep_only_device_keys(
+    vllm_config.additional_config["rbln_config"] = _keep_only_device_keys(
         vllm_config.additional_config.get("rbln_config", {})
     )
     params = RBLNParams.from_rbln_config(vllm_config, rbln_config)
