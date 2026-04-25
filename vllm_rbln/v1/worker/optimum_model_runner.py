@@ -114,7 +114,7 @@ class RBLNOptimumModelRunner(
         # it’s important to set the is_encoder_decoder flag to False.
         # This prevents the scheduler from applying text generation settings.
         _, model_cls_name = get_rbln_model_info(vllm_config.model_config)
-        if is_qwen3_pooling(vllm_config):
+        if is_qwen3_pooling(vllm_config.model_config):
             # NOTE The architecture of Qwen3-Embedding model in huggingface
             # is `Qwen3ForCausalLM`. But it have to be mapped to `Qwen3Model`
             # for optimum-rbln.
