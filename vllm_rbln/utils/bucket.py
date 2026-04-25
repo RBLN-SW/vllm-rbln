@@ -17,6 +17,7 @@ from functools import cache
 
 
 @cache
-def select_bucket_size(original_batch_size: int, bucket_sizes: tuple):
+def select_bucket_size(original_batch_size: int, bucket_sizes: tuple) -> int:
+    """Return the smallest entry in ``bucket_sizes`` that is >= ``original_batch_size``."""
     index = bisect.bisect_left(bucket_sizes, original_batch_size)
     return bucket_sizes[index]
