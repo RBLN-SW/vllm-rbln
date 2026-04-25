@@ -233,9 +233,10 @@ class RBLNOptimumModelBase(nn.Module):
                 model = _ProducerOptimumModelProxy(visual, visual.rbln_config)
             else:
                 rbln_config = self.vllm_config.additional_config.get("rbln_config", {})
-                # NOTE: We can set the device to run submodules
-                # Set only device setting using rbln_config
-                rbln_config = keep_only_device_keys(rbln_config)
+                # NOTE:
+                # Only device mapping info is kept in rbln_config for loading the model
+                # Other parameters in rbln_config are already removed
+                # in `sync_vllm_and_optimum` function.
                 model = model_cls.from_pretrained(
                     self.vllm_config.model_config.model,
                     rbln_config=rbln_config,
