@@ -42,19 +42,6 @@ from vllm_rbln.utils.optimum.registry import (
 logger = init_logger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Exported utilities / shared helpers
-# ---------------------------------------------------------------------------
-
-
-def get_attn_block_size(vllm_config: VllmConfig) -> int:
-    if vllm_config.cache_config.enable_prefix_caching:
-        block_size = vllm_config.additional_config["attn_block_size"]
-    else:
-        block_size = vllm_config.cache_config.block_size
-    return block_size
-
-
 def is_qwen3_pooling(
     vllm_config: VllmConfig,
 ) -> bool:

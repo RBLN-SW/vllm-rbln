@@ -22,16 +22,17 @@ from optimum.rbln import (
 )
 from transformers import PretrainedConfig
 
-from vllm_rbln.utils.optimum.multimodal import (
-    _COMPILE_MULTIMODAL_FNS,
-    get_multimodal_cls,
-)
 from vllm_rbln.utils.optimum.registry import (
     get_rbln_model_info,
     is_enc_dec_arch,
     is_generation_arch,
     is_multi_modal,
     is_pooling_arch,
+)
+
+from .multimodal import (
+    _COMPILE_MULTIMODAL_FNS,
+    get_multimodal_cls,
 )
 
 

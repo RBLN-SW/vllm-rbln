@@ -50,3 +50,11 @@ def get_block_ratio(vllm_config: VllmConfig) -> int:
     else:
         blk_ratio = 1
     return blk_ratio
+
+
+def get_attn_block_size(vllm_config: VllmConfig) -> int:
+    if vllm_config.cache_config.enable_prefix_caching:
+        block_size = vllm_config.additional_config["attn_block_size"]
+    else:
+        block_size = vllm_config.cache_config.block_size
+    return block_size
