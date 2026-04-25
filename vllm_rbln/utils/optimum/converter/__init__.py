@@ -12,11 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .optimum_to_vllm import sync_to_vllm, update_num_blocks
-from .vllm_to_optimum import sync_from_vllm
+from .dispatch import sync_vllm_and_optimum
+from .optimum_to_vllm import update_num_blocks
 
 __all__ = [
-    "sync_to_vllm",
-    "sync_from_vllm",
+    "sync_vllm_and_optimum",
     "update_num_blocks",
 ]

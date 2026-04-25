@@ -23,7 +23,9 @@ _RUNTIME_ONLY_KEYS: frozenset[str] = frozenset(
 
 
 def strip_runtime_only_keys(obj: dict) -> dict:
-    """Recursively drop :data:`_RUNTIME_ONLY_KEYS` from nested dict/list."""
+    """
+    Recursively drop :data:`_RUNTIME_ONLY_KEYS` from nested dict/list.
+    """
     if isinstance(obj, dict):
         return {
             k: strip_runtime_only_keys(v)
