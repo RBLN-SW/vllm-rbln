@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 
 import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
-from vllm_rbln.utils.optimum.cache_blocks import (
+from vllm_rbln.utils.optimum.block_size import (
     get_block_ratio,
     is_full_block_available,
 )

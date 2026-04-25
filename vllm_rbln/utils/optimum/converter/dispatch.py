@@ -66,7 +66,7 @@ def _keep_only_device_keys(obj: dict) -> dict:
     return result
 
 
-def generate_model_path_name(
+def _generate_model_path_name(
     vllm_config: VllmConfig,
 ) -> str:
     # Just depends on user-provided parameters
@@ -113,7 +113,7 @@ def _resolve_rbln_config(vllm_config: VllmConfig) -> dict | None:
     cached_model_path = os.path.join(
         envs.VLLM_CACHE_ROOT,
         "compiled_models",
-        generate_model_path_name(vllm_config=vllm_config),
+        _generate_model_path_name(vllm_config=vllm_config),
     )
     if os.path.exists(os.path.join(cached_model_path, "rbln_config.json")):
         logger.info("Found cached compiled model at %s", cached_model_path)
