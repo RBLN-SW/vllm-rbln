@@ -38,22 +38,6 @@ def _set_default_block_size(vllm_config: VllmConfig) -> None:
     if not cache_config.user_specified_block_size:
         cache_config.block_size = vllm_config.model_config.max_model_len
 
-
-def _validate_block_size(vllm_config: VllmConfig) -> None:
-    cache_config = vllm_config.cache_config
-    hf_config = vllm_config.model_config.hf_config
-    max_model_len = vllm_config.model_config.max_model_len
-
-    if is_multi_modal(hf_config) or is_generation_arch(hf_config):
-        assert cache_config.block_size >= 4096, (
-            "block_size must be at least 4096 for compilation."
-        )
-    if is_pooling_arch(hf_config):
-        assert cache_config.block_size == max_model_len, (
-            "For pooling models, block_size must be equal to max_model_len."
-        )
-
-
 def sync_from_vllm(vllm_config: VllmConfig) -> None:
     """
     vllm_config.additional_config["rbln_config"] -> optimum
@@ -86,7 +70,6 @@ def sync_from_vllm(vllm_config: VllmConfig) -> None:
         vllm_config.cache_config.user_specified_block_size = params.kvcache_block_size
 
     _set_default_block_size(vllm_config)
-    _validate_block_size(vllm_config)
     update_block_size(
         vllm_config, vllm_config.cache_config.block_size, prefill_chunk_size=128
     )
