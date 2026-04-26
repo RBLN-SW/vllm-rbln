@@ -202,7 +202,7 @@ class RBLNOptimumModelBase(nn.Module):
                 "cached_model_path", None
             )
             assert not os.path.exists(cached_model_path), (
-                "Compiled model must be loaded from the cache."
+                f"Compiled model {cached_model_path} cannot be loaded."
             )
             spec = RBLNCompileSpec.for_architecture(
                 config,

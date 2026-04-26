@@ -15,11 +15,6 @@
 from typing import TYPE_CHECKING
 
 from vllm_rbln.logger import init_logger
-from vllm_rbln.utils.optimum.registry import (
-    is_generation_arch,
-    is_multi_modal,
-    is_pooling_arch,
-)
 
 from .common import update_block_size, update_max_num_batched_tokens
 from .params import RBLNParams
@@ -37,6 +32,7 @@ def _set_default_block_size(vllm_config: VllmConfig) -> None:
     cache_config = vllm_config.cache_config
     if not cache_config.user_specified_block_size:
         cache_config.block_size = vllm_config.model_config.max_model_len
+
 
 def sync_from_vllm(vllm_config: VllmConfig) -> None:
     """
