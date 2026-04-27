@@ -207,14 +207,16 @@ class RBLNTopKTopPSampler(nn.Module):
             batch_size = logits.shape[0]
             vocab_size = logits.shape[-1]
             if self.default_p_buf is None or self.default_p_buf.shape[0] < batch_size:
-                self.default_p_buf = torch.ones(batch_size, dtype=torch.float32)
+                self.default_p_buf = torch.ones(
+                    batch_size, dtype=torch.float32, device=logits.device
+                )
             if (
                 self.default_k_buf is None
                 or self.default_k_buf.shape[0] < batch_size
                 or self.default_vocab_size != vocab_size
             ):
                 self.default_k_buf = torch.full(
-                    (batch_size,), vocab_size, dtype=torch.int32
+                    (batch_size,), vocab_size, dtype=torch.int32, device=logits.device
                 )
                 self.default_vocab_size = vocab_size
             p = self.default_p_buf[:batch_size]
