@@ -77,12 +77,6 @@ def apply_top_k_top_p(
     a dual-pivot algorithm is implemented in rebel and
     it will be used to avoid the sorting step and improve efficiency.
     """
-    # NOTE This function is used when falling back to eager execution
-    # due to RBLN compilation failure.
-    # If both k and p are None, return the argmax (greedy sampling).
-    if k is None and p is None:
-        return logits.argmax(dim=-1).view(-1)
-
     logits_sort, logits_idx = logits.sort(dim=-1, descending=False, stable=True)
     if k is not None:
         # Apply top-k.
@@ -133,6 +127,16 @@ def rbln_top_k_top_p_sample(
     # It requires softmax prior to calling the op.
     probs = torch.nn.functional.softmax(logits, dim=-1)
     sampled = torch.ops.rbln.top_k_top_p(probs, k, p)
+    return sampled
+
+
+def rbln_greedy_sample(logits: torch.Tensor) -> torch.Tensor:
+    """
+    Implementation of RBLN greedy sampling.
+    To avoid self parameter issues when torch.compile is used,
+    we define this as a static method.
+    """
+    sampled = torch.ops.rbln.argmax(logits)
     return sampled
 
 
@@ -220,6 +224,30 @@ class RBLNSampler(VLLMSampler):
                 f"RBLN Sampling does not support logprobs_mode: {logprobs_mode}. "
                 "Using native sampler instead."
             )
+        options = {
+            "compile_context": compile_context
+            if compile_context
+            else (
+                rebel.CompileContext(use_global_ctx=True)
+                if "use_global_ctx"
+                in inspect.signature(rebel.CompileContext).parameters
+                else rebel.CompileContext()
+            )
+        }
+        if envs.VLLM_RBLN_COMPILE_STRICT_MODE:
+            options["mode"] = "strict"
+
+        if has_torch_rbln:
+            options["use_global_ctx"] = True
+            options["global_device_id"] = 0
+            options["tensor_parallel_size"] = 1
+        self.greedy_sample = torch.compile(
+            rbln_greedy_sample,
+            dynamic=False,
+            fullgraph=True,
+            backend="rbln",
+            options=options,
+        )
 
     def apply_penalties(
         self,
@@ -239,12 +267,66 @@ class RBLNSampler(VLLMSampler):
             )
         return logits
 
-    def greedy_sample(self, logits: torch.Tensor) -> torch.Tensor:
-        # NOTE:
-        # If there are any parameters for top-k or top-p,
-        # this function works as a greedy sampler.
-        sampled, _ = self.topk_topp_sampler(logits, dict(), None, None)
-        return sampled
+    def sample(
+        self,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+        logprobs_mode_override: LogprobsMode | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Sample logits based on sampling metadata.
+
+        The various logits processing functions called in this method
+        may update the logits tensor in-place.
+        """
+
+        logprobs_mode = logprobs_mode_override or self.logprobs_mode
+        assert not (sampling_metadata.all_greedy and sampling_metadata.all_random)
+        if sampling_metadata.all_random:
+            greedy_sampled = None
+        else:
+            greedy_sampled = self.greedy_sample(logits)
+            if sampling_metadata.all_greedy:
+                processed_logprobs = None
+                if sampling_metadata.max_num_logprobs is not None:
+                    if logprobs_mode == "processed_logits":
+                        processed_logprobs = logits
+                    elif logprobs_mode == "processed_logprobs":
+                        processed_logprobs = self.compute_logprobs(logits)
+                return greedy_sampled, processed_logprobs
+
+        assert sampling_metadata.temperature is not None
+
+        # Apply temperature.
+        logits = self.apply_temperature(
+            logits, sampling_metadata.temperature, sampling_metadata.all_random
+        )
+
+        # Apply logits processors that only apply to random sampling
+        # (argmax invariant)
+        for processor in sampling_metadata.logitsprocs.argmax_invariant:
+            logits = processor.apply(logits)
+
+        # Apply top_k and/or top_p.
+        print("@@@ sampling_metadata:", sampling_metadata)
+        print("@@@@ top_k:", sampling_metadata.top_k)
+        print("@@@@ top_p:", sampling_metadata.top_p)
+        random_sampled, processed_logprobs = self.topk_topp_sampler(
+            logits,
+            sampling_metadata.generators,
+            sampling_metadata.top_k,
+            sampling_metadata.top_p,
+        )
+
+        if greedy_sampled is None:
+            return random_sampled, processed_logprobs
+
+        sampled = torch.where(
+            sampling_metadata.temperature < _SAMPLING_EPS,
+            greedy_sampled,
+            random_sampled,
+            out=greedy_sampled,  # Reuse tensor
+        )
+        return sampled, processed_logprobs
 
     def forward(
         self,
