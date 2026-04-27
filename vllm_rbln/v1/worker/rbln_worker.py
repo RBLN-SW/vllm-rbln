@@ -342,7 +342,7 @@ class RBLNWorker(WorkerBase):
                         or {}
                     )
                     groups = qcfg.get("config_groups", {})
-                    num_bits_set: set[int] = set()
+                    num_bits_set = set()
                     for group_cfg in groups.values():
                         nb = group_cfg.get("weights", {}).get("num_bits")
                         if nb is not None:
