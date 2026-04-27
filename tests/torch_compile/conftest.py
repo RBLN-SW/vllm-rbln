@@ -49,6 +49,20 @@ def pytest_configure(config):
     load_general_plugins()
 
 
+@pytest.fixture(autouse=True)
+def _isolate_rbln_ctx_standalone():
+    # `RblnPlatform.validate_and_setup_prerequisite` sets
+    # `RBLN_CTX_STANDALONE=1` in the process env whenever it sees a config
+    # with TP/DP/PP/EP > 1, and never clears it. The flag is read by the
+    # rebel runtime on every context creation, so once any test's
+    # `VllmConfig` triggers it, every subsequent test in the session
+    # (and every forked child) creates exclusive contexts and any second
+    # compile on the same device fails. Clear it before each test so
+    # tests don't depend on collection order.
+    os.environ.pop("RBLN_CTX_STANDALONE", None)
+    yield
+
+
 @pytest.fixture(scope="class")
 def monkeypatch_class():
     monkeypatch = pytest.MonkeyPatch()
