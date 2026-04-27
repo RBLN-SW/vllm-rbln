@@ -1314,9 +1314,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 logits_indices
             )
 
-        if logits_indices.device != self.device:
-            logits_indices = logits_indices.to(self.device)
-
         attn_metadata: dict[str, Any] = {}
 
         # Used in the below loop.
@@ -1371,11 +1368,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 num_common_prefix_blocks = 0
             else:
                 blk_table = self.input_batch.block_table[kv_cache_group_id]
-                blk_table_tensor = (
-                    blk_table.get_cpu_tensor()[:num_reqs]
-                    if envs.VLLM_RBLN_USE_DEVICE_TENSOR
-                    else blk_table.get_device_tensor(num_reqs)
-                )
+                blk_table_tensor = blk_table.get_device_tensor(num_reqs)
                 slot_mapping = blk_table.slot_mapping.gpu[:total_num_scheduled_tokens]
 
                 # Fill unused with -1. Needed for reshape_and_cache in full cuda
@@ -1424,7 +1417,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     )
 
                 if isinstance(builder, RBLNFlashAttentionMetadataBuilder):
-                    extra_attn_metadata_args["positions"] = self.positions.cpu
+                    extra_attn_metadata_args["positions"] = self.positions.gpu
                     extra_attn_metadata_args["batch_pad"] = batch_bucket_size
                     extra_attn_metadata_args["is_prefill"] = is_prefill_phase
                 attn_metadata_i = builder.build(
@@ -1723,7 +1716,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             )
             num_padded_tokens = batch_bucket_size
 
-        return batch_bucket_size, num_padded_tokens, num_tokens_across_dp_cpu
+        return batch_bucket_size, num_padded_tokens, num_tokens_across_dp_cpu.to(self.device)
 
     def _pool(
         self,
@@ -1781,7 +1774,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # _prepare_inputs may reorder the batch, so we must gather multi
         # modal outputs after that to ensure the correct order
-        use_dt = envs.VLLM_RBLN_USE_DEVICE_TENSOR
         if (
             self.supports_mm_inputs
             and get_pp_group().is_first_rank
@@ -1812,16 +1804,13 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # For text-only models, we use token ids as input. Under device-tensor
             # mode, use the CPU buffer so view/pad/clone stay on CPU; it is moved
             # to self.device just before model_executable.
-            ids_buf = self.input_ids.cpu if use_dt else self.input_ids.gpu
-            input_ids = ids_buf[:num_input_tokens]
+            input_ids = self.input_ids.gpu[:num_input_tokens]
             inputs_embeds = None
             model_kwargs = self._init_model_kwargs(num_input_tokens)
         if self.uses_mrope:
-            pos_buf = self.mrope_positions.cpu if use_dt else self.mrope_positions.gpu
-            positions = pos_buf[:, :num_input_tokens]
+            positions = self.mrope_positions.gpu[:, :num_input_tokens]
         else:
-            pos_buf = self.positions.cpu if use_dt else self.positions.gpu
-            positions = pos_buf[:num_input_tokens]
+            positions = self.positions.gpu[:num_input_tokens]
 
         if (
             self.model_config.is_encoder_decoder
@@ -1919,7 +1908,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             sampling_metadata = self._pad_sampling_metadata(
                 sampling_metadata, logits.shape[0]
             )
-        if hasattr(rebel, "capture_reports"):
+        if envs.VLLM_RBLN_METRICS and hasattr(rebel, "capture_reports"):
             capture_ctx = rebel.capture_reports()
         else:
             # use a dummy context manager that does nothing
@@ -2956,7 +2945,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 input_ids = rbln_utils.pad(input_ids, 0, batch_bucket_size)
                 positions = rbln_utils.pad(positions, -2, batch_bucket_size)
 
-            if hasattr(rebel, "capture_reports"):
+            if envs.VLLM_RBLN_METRICS and hasattr(rebel, "capture_reports"):
                 capture_ctx = rebel.capture_reports()
             else:
                 # use a dummy context manager that does nothing

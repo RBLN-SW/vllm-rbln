@@ -1123,7 +1123,7 @@ class RBLNFlashAttentionMetadataBuilder(
 
         num_partition = max_seq_len // partition_len
         cs = seq_idx.repeat(1, num_partition)
-        pidx = torch.arange(num_partition, dtype=torch.int32)
+        pidx = torch.arange(num_partition, dtype=torch.int32, device=cs.device)
         # RBLN - seq_lens tensor dtype SHOULD be int16
         dyn_size_for_partitions = torch.clamp(
             cs - pidx * partition_len, 0, partition_len
