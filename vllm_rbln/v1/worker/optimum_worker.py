@@ -120,7 +120,7 @@ class RBLNOptimumWorker(WorkerBase):
             os.environ["OPENBLAS_NUM_THREADS"] = str(num_threads)
             os.environ["NUMEXPR_MAX_THREADS"] = str(num_threads)
             os.environ["RBLN_NUM_THREADS"] = str(num_threads)
-            os.environ.setdefault("MKL_NUM_THREADS", str(num_threads))
+            # os.environ.setdefault("MKL_NUM_THREADS", str(num_threads))
 
             # Directly set PyTorch thread counts
             torch.set_num_threads(num_threads)
