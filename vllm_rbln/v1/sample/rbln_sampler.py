@@ -15,6 +15,7 @@
 import inspect
 import torch
 import torch.nn as nn
+from vllm.sampling_params import _SAMPLING_EPS
 
 try:
     import torch.rbln
@@ -35,8 +36,6 @@ from vllm_rbln.v1.sample.ops.penalties import (
 import vllm_rbln.rbln_envs as envs
 
 logger = init_logger(__name__)
-
-_SAMPLING_EPS = 1e-5
 
 
 def random_sample(
@@ -267,67 +266,6 @@ class RBLNSampler(VLLMSampler):
             )
         return logits
 
-    def sample(
-        self,
-        logits: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
-        logprobs_mode_override: LogprobsMode | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Sample logits based on sampling metadata.
-
-        The various logits processing functions called in this method
-        may update the logits tensor in-place.
-        """
-
-        logprobs_mode = logprobs_mode_override or self.logprobs_mode
-        assert not (sampling_metadata.all_greedy and sampling_metadata.all_random)
-        if sampling_metadata.all_random:
-            greedy_sampled = None
-        else:
-            greedy_sampled = self.greedy_sample(logits)
-            if sampling_metadata.all_greedy:
-                processed_logprobs = None
-                if sampling_metadata.max_num_logprobs is not None:
-                    if logprobs_mode == "processed_logits":
-                        processed_logprobs = logits
-                    elif logprobs_mode == "processed_logprobs":
-                        processed_logprobs = self.compute_logprobs(logits)
-                return greedy_sampled, processed_logprobs
-
-        assert sampling_metadata.temperature is not None
-
-        # Apply temperature.
-        logits = self.apply_temperature(
-            logits, sampling_metadata.temperature, sampling_metadata.all_random
-        )
-
-        # Apply logits processors that only apply to random sampling
-        # (argmax invariant)
-        for processor in sampling_metadata.logitsprocs.argmax_invariant:
-            logits = processor.apply(logits)
-
-        # Apply top_k and/or top_p.
-        print("@@@ sampling_metadata:", sampling_metadata)
-        print("@@@@ top_k:", sampling_metadata.top_k)
-        print("@@@@ top_p:", sampling_metadata.top_p)
-        random_sampled, processed_logprobs = self.topk_topp_sampler(
-            logits,
-            sampling_metadata.generators,
-            sampling_metadata.top_k,
-            sampling_metadata.top_p,
-        )
-
-        if greedy_sampled is None:
-            return random_sampled, processed_logprobs
-
-        sampled = torch.where(
-            sampling_metadata.temperature < _SAMPLING_EPS,
-            greedy_sampled,
-            random_sampled,
-            out=greedy_sampled,  # Reuse tensor
-        )
-        return sampled, processed_logprobs
-
     def forward(
         self,
         logits: torch.Tensor,
@@ -403,7 +341,7 @@ class RBLNSampler(VLLMSampler):
         # in-place division triggers buffer key error
         # in torchinductor
         if not all_random:
-            temp = torch.where(temp < _SAMPLING_EPS, 1.0, temp)
+            temp = torch.where(temp < _SAMPLING_EPS, _SAMPLING_EPS, temp)
         return logits.div(temp.unsqueeze(dim=1))
 
 
