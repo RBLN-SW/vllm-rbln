@@ -103,60 +103,60 @@ class RBLNOptimumWorker(WorkerBase):
         allocated_cpus = len(os.sched_getaffinity(0))
         reported_cpus = os.cpu_count() or allocated_cpus
 
-        if allocated_cpus < reported_cpus:
-            # Use physical cores only (exclude HT siblings).
-            num_threads = max(2, allocated_cpus // 2)
-            logger.info(
-                "Container cpuset detected (%d/%d CPUs). "
-                "Skipping set_cpu_affinity, setting threads to %d "
-                "(physical cores only, excluding HT).",
-                allocated_cpus,
-                reported_cpus,
-                num_threads,
-            )
+        # if allocated_cpus < reported_cpus:
+        #     # Use physical cores only (exclude HT siblings).
+        #     num_threads = max(2, allocated_cpus // 2)
+        #     logger.info(
+        #         "Container cpuset detected (%d/%d CPUs). "
+        #         "Skipping set_cpu_affinity, setting threads to %d "
+        #         "(physical cores only, excluding HT).",
+        #         allocated_cpus,
+        #         reported_cpus,
+        #         num_threads,
+        #     )
 
-            # Set all thread pool environment variables
-            os.environ["OMP_NUM_THREADS"] = str(num_threads)
-            os.environ["OPENBLAS_NUM_THREADS"] = str(num_threads)
-            os.environ["NUMEXPR_MAX_THREADS"] = str(num_threads)
-            os.environ["RBLN_NUM_THREADS"] = str(num_threads)
-            # os.environ.setdefault("MKL_NUM_THREADS", str(num_threads))
+        #     # Set all thread pool environment variables
+        #     os.environ["OMP_NUM_THREADS"] = str(num_threads)
+        #     os.environ["OPENBLAS_NUM_THREADS"] = str(num_threads)
+        #     os.environ["NUMEXPR_MAX_THREADS"] = str(num_threads)
+        #     os.environ["RBLN_NUM_THREADS"] = str(num_threads)
+        #     # os.environ.setdefault("MKL_NUM_THREADS", str(num_threads))
 
-            # Directly set PyTorch thread counts
-            torch.set_num_threads(num_threads)
+        #     # Directly set PyTorch thread counts
+        #     torch.set_num_threads(num_threads)
 
-            set_omp_num_threads(self.rank, self.local_rank, num_threads)
-            print("@@@ MKL_NUM_THREADS:", os.environ["MKL_NUM_THREADS"])
-        else:
-            # Bare metal: use physical cores only (exclude HT siblings).
-            # Skip set_cpu_affinity to avoid restricting the process to a
-            # single NUMA node, which causes severe latency regression on
-            # high-core-count servers (e.g. 128 core → 32x slower).
-            num_threads = max(2, allocated_cpus // 2)
-            logger.info(
-                "Bare metal detected (%d CPUs). "
-                "Skipping set_cpu_affinity, setting threads to %d "
-                "(physical cores only, excluding HT).",
-                allocated_cpus,
-                num_threads,
-            )
+        #     set_omp_num_threads(self.rank, self.local_rank, num_threads)
+        #     print("@@@ MKL_NUM_THREADS:", os.environ["MKL_NUM_THREADS"])
+        # else:
+        #     # Bare metal: use physical cores only (exclude HT siblings).
+        #     # Skip set_cpu_affinity to avoid restricting the process to a
+        #     # single NUMA node, which causes severe latency regression on
+        #     # high-core-count servers (e.g. 128 core → 32x slower).
+        #     num_threads = max(2, allocated_cpus // 2)
+        #     logger.info(
+        #         "Bare metal detected (%d CPUs). "
+        #         "Skipping set_cpu_affinity, setting threads to %d "
+        #         "(physical cores only, excluding HT).",
+        #         allocated_cpus,
+        #         num_threads,
+        #     )
 
-            # Set all thread pool environment variables
-            os.environ["OMP_NUM_THREADS"] = str(num_threads)
-            os.environ["OPENBLAS_NUM_THREADS"] = str(num_threads)
-            os.environ["NUMEXPR_MAX_THREADS"] = str(num_threads)
-            os.environ["RBLN_NUM_THREADS"] = str(num_threads)
-            os.environ.setdefault("MKL_NUM_THREADS", str(num_threads))
+        #     # Set all thread pool environment variables
+        #     os.environ["OMP_NUM_THREADS"] = str(num_threads)
+        #     os.environ["OPENBLAS_NUM_THREADS"] = str(num_threads)
+        #     os.environ["NUMEXPR_MAX_THREADS"] = str(num_threads)
+        #     os.environ["RBLN_NUM_THREADS"] = str(num_threads)
+        #     os.environ.setdefault("MKL_NUM_THREADS", str(num_threads))
 
-            # Directly set PyTorch thread counts
-            torch.set_num_threads(num_threads)
+        #     # Directly set PyTorch thread counts
+        #     torch.set_num_threads(num_threads)
 
-            set_omp_num_threads(self.rank, self.local_rank, num_threads)
-            print("@@@ MKL_NUM_THREADS:", os.environ["MKL_NUM_THREADS"])
-        # Sync numba and torch thread settings to avoid recompilation
-        # caused by global state mismatch between the two runtimes
-        numba.set_num_threads(torch.get_num_threads())
-        torch.set_num_threads(numba.get_num_threads())
+        #     set_omp_num_threads(self.rank, self.local_rank, num_threads)
+        #     print("@@@ MKL_NUM_THREADS:", os.environ["MKL_NUM_THREADS"])
+        # # Sync numba and torch thread settings to avoid recompilation
+        # # caused by global state mismatch between the two runtimes
+        # numba.set_num_threads(torch.get_num_threads())
+        # torch.set_num_threads(numba.get_num_threads())
         # Initialize the distributed environment.
         init_worker_distributed_environment(
             self.vllm_config, self.rank, self.distributed_init_method, self.local_rank
