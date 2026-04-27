@@ -46,6 +46,7 @@ from vllm.distributed.kv_transfer import (
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.lora.request import LoRARequest
 from vllm.platforms import current_platform
+from vllm.profiler.wrapper import TorchProfilerWrapper
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.utils.torch_utils import set_random_seed
@@ -109,10 +110,9 @@ class RBLNWorker(WorkerBase):
         profiler_config = vllm_config.profiler_config
         # Set up profiler if profiling is enabled
         if profiler_config.torch_profiler_dir:
-            torch_profiler_trace_dir = profiler_config.torch_profiler_dir
             logger.info(
                 "Profiling enabled. Traces will be saved to: %s",
-                torch_profiler_trace_dir,
+                profiler_config.torch_profiler_dir,
             )
             logger.debug(
                 "Profiler config: record_shapes=%s,"
@@ -123,19 +123,11 @@ class RBLNWorker(WorkerBase):
                 profiler_config.torch_profiler_with_flops,
                 profiler_config.torch_profiler_use_gzip,
             )
-            self.profiler = torch.profiler.profile(
-                activities=[
-                    torch.profiler.ProfilerActivity.CPU,
-                ],
-                record_shapes=profiler_config.torch_profiler_record_shapes,
-                profile_memory=profiler_config.torch_profiler_with_memory,
-                with_stack=profiler_config.torch_profiler_with_stack,
-                with_flops=profiler_config.torch_profiler_with_flops,
-                on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                    torch_profiler_trace_dir,
-                    worker_name=f"{vllm_config.instance_id}-rank-{self.rank}",
-                    use_gzip=profiler_config.torch_profiler_use_gzip,
-                ),
+            self.profiler = TorchProfilerWrapper(
+                profiler_config,
+                worker_name=f"{vllm_config.instance_id}-rank-{self.rank}",
+                local_rank=self.local_rank,
+                activities=["CPU"],
             )
         else:
             self.profiler = None
@@ -532,7 +524,9 @@ class RBLNWorker(WorkerBase):
             # only print profiler results on rank 0
             if self.local_rank == 0:
                 print(
-                    self.profiler.key_averages().table(sort_by="self_cuda_time_total")
+                    self.profiler.profiler.key_averages().table(
+                        sort_by="self_cpu_time_total"
+                    )
                 )
 
     def execute_dummy_batch(self) -> None:
