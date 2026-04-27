@@ -2,7 +2,7 @@ name: Trigger FSW Merge CI for vLLM-RBLN
 
 on:
   push:
-    branches: [dev]
+    branches: [dev, main]
     paths:
       - 'vllm_rbln/**'
       - 'tests/torch_compile/**'
