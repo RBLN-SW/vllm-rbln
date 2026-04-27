@@ -173,6 +173,11 @@ class RBLNTopKTopPSampler(nn.Module):
             backend="rbln",
             options=options,
         )
+        # Cached default-k / default-p buffers for the (k=None, p=None) patch
+        # below. Grown lazily so we avoid reallocating each forward call.
+        self.default_k_buf: torch.Tensor | None = None
+        self.default_p_buf: torch.Tensor | None = None
+        self.default_vocab_size: int | None = None
         self.forward = self.forward_rbln
 
     @torch.compiler.disable
@@ -199,10 +204,24 @@ class RBLNTopKTopPSampler(nn.Module):
         # sampling here by setting k to vocab_size and p to 1.0.
         # This will be fixed in the future.
         if k is None and p is None:
-            vocab_size = logits.shape[-1]
             batch_size = logits.shape[0]
-            p = torch.tensor([1.0] * batch_size, dtype=torch.float32)
-            k = torch.tensor([vocab_size] * batch_size, dtype=torch.int32)
+            vocab_size = logits.shape[-1]
+            if (
+                self.default_p_buf is None
+                or self.default_p_buf.shape[0] < batch_size
+            ):
+                self.default_p_buf = torch.ones(batch_size, dtype=torch.float32)
+            if (
+                self.default_k_buf is None
+                or self.default_k_buf.shape[0] < batch_size
+                or self.default_vocab_size != vocab_size
+            ):
+                self.default_k_buf = torch.full(
+                    (batch_size,), vocab_size, dtype=torch.int32
+                )
+                self.default_vocab_size = vocab_size
+            p = self.default_p_buf[:batch_size]
+            k = self.default_k_buf[:batch_size]
         return self.top_k_top_p_sample(logits, k, p), None
 
 
