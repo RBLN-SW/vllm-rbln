@@ -77,7 +77,6 @@ class KVCacheBlockAdapter:
             num_gpu_blocks_override = self.vllm_config.additional_config[
                 "num_blocks_override"
             ]
-            print("@@@@ num_blocks_override: ", num_gpu_blocks_override)
             return num_gpu_blocks_override
         else:
             return int(self.estimated_kvcache_num_blocks)
