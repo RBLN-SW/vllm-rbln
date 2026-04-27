@@ -77,11 +77,6 @@ def apply_top_k_top_p(
     a dual-pivot algorithm is implemented in rebel and
     it will be used to avoid the sorting step and improve efficiency.
     """
-    # NOTE This function is used when falling back to eager execution
-    # due to RBLN compilation failure.
-    # If both k and p are None, return the argmax (greedy sampling).
-    if k is None and p is None:
-        return logits.argmax(dim=-1).view(-1)
 
     logits_sort, logits_idx = logits.sort(dim=-1, descending=False, stable=True)
     if k is not None:
@@ -199,7 +194,15 @@ class RBLNTopKTopPSampler(nn.Module):
                 "RBLN Sampling does not support "
                 "per-request generators. Ignoring generators."
             )
-
+        # NOTE: When both k and p are None, `top_k_top_p_sample` originally
+        # performs greedy sampling. As a temporary patch, we force random
+        # sampling here by setting k to vocab_size and p to 1.0.
+        # This will be fixed in the future.
+        if k is None and p is None:
+            vocab_size = logits.shape[-1]
+            batch_size = logits.shape[0]
+            p = torch.tensor([1.0] * batch_size, dtype=torch.float32)
+            k = torch.tensor([vocab_size] * batch_size, dtype=torch.int32)
         return self.top_k_top_p_sample(logits, k, p), None
 
 
