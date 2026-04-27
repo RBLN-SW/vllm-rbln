@@ -126,6 +126,7 @@ class RBLNOptimumWorker(WorkerBase):
             torch.set_num_threads(num_threads)
 
             set_omp_num_threads(self.rank, self.local_rank, num_threads)
+            print("@@@ MKL_NUM_THREADS:", os.environ["MKL_NUM_THREADS"])
         else:
             # Bare metal: use physical cores only (exclude HT siblings).
             # Skip set_cpu_affinity to avoid restricting the process to a
@@ -151,7 +152,7 @@ class RBLNOptimumWorker(WorkerBase):
             torch.set_num_threads(num_threads)
 
             set_omp_num_threads(self.rank, self.local_rank, num_threads)
-
+            print("@@@ MKL_NUM_THREADS:", os.environ["MKL_NUM_THREADS"])
         # Sync numba and torch thread settings to avoid recompilation
         # caused by global state mismatch between the two runtimes
         numba.set_num_threads(torch.get_num_threads())
