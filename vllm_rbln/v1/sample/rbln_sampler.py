@@ -141,6 +141,8 @@ class RBLNTopKTopPSampler(nn.Module):
         # TODO(rbln): Merge more ops to rbln context.
         #       Currently, we only have softmax in rbln context.
         super().__init__()
+        self.greedy_topk = torch.tensor(-1, dtype=torch.int32)
+        self.greedy_topp = torch.tensor(-1, dtype=torch.float32)
         self.logprobs_mode = logprobs_mode
 
         assert self.logprobs_mode not in ("processed_logits", "processed_logprobs"), (
@@ -219,8 +221,16 @@ class RBLNTopKTopPSampler(nn.Module):
                     (batch_size,), vocab_size, dtype=torch.int32, device=logits.device
                 )
                 self.default_vocab_size = vocab_size
-            p = self.default_p_buf[:batch_size]
             k = self.default_k_buf[:batch_size]
+            p = self.default_p_buf[:batch_size]
+        elif (
+            k is not None
+            and torch.allclose(k, self.greedy_topk)
+            and p is not None
+            and torch.allclose(p, self.greedy_topp)
+        ):
+            k = None
+            p = None
         return self.top_k_top_p_sample(logits, k, p), None
 
 
@@ -232,6 +242,8 @@ class RBLNSampler(VLLMSampler):
         compile_context: rebel.CompileContext = None,
     ):
         super().__init__()
+        self.greedy_topk = torch.tensor(-1, dtype=torch.int32)
+        self.greedy_topp = torch.tensor(-1, dtype=torch.float32)
         if logprobs_mode in ("raw_logprobs", "raw_logits"):
             self.topk_topp_sampler = RBLNTopKTopPSampler(
                 logprobs_mode=logprobs_mode, seed=seed, compile_context=compile_context
@@ -264,7 +276,9 @@ class RBLNSampler(VLLMSampler):
         # NOTE:
         # If there are any parameters for top-k or top-p,
         # this function works as a greedy sampler.
-        sampled, _ = self.topk_topp_sampler(logits, dict(), None, None)
+        sampled, _ = self.topk_topp_sampler(
+            logits, dict(), self.greedy_topk, self.greedy_topp
+        )
         return sampled
 
     def forward(
