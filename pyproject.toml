@@ -51,7 +51,6 @@ test = [
     "pytest-asyncio",
     "pytest-xdist",
     "pytest-cov",
-    "pytest-forked",
 ]
 build = [
     "build",

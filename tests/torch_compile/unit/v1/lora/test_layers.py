@@ -68,14 +68,6 @@ from vllm_rbln.v1.worker.rbln_model_runner import create_sampler_indices_padded
 
 from .utils import DummyLoRAManager
 
-# Each test compiles several models via `torch.compile(backend="rbln")`, and
-# each compilation creates a runtime that holds an NPU context for the lifetime
-# of the pytest process. Within a single process these contexts accumulate
-# across tests until the NPU runs out of per-device context slots, after which
-# every subsequent compile fails. Run each test in its own subprocess so the
-# contexts are released at test exit.
-pytestmark = pytest.mark.forked
-
 TOLERANCES = {
     torch.float16: (5e-3, 5e-3),
     torch.float32: (5e-3, 5e-3),
