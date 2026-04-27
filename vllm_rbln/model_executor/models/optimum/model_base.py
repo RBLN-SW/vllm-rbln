@@ -100,7 +100,6 @@ class KVCacheBlockAdapter:
             blk_ratio = ob_size // ib_size
         else:
             blk_ratio = 1
-        print("@@@ _estimated_num_blocks: ", self._estimated_num_blocks())
         if self.is_full_block_available():
             new_estimated = self._estimated_num_blocks() * blk_ratio
             return new_estimated + 1
