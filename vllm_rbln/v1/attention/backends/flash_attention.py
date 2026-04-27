@@ -1087,19 +1087,33 @@ class RBLNFlashAttentionMetadataBuilder(
         num_actual_tokens = common_attn_metadata.num_actual_tokens
         max_query_len = common_attn_metadata.max_query_len
         query_max_seq_len = common_attn_metadata.max_seq_len
+        # Keep the device-resident query_start_loc for the returned
+        # ``RBLNFlashAttentionMetadata`` (downstream RBLN attention kernels
+        # expect it on the runtime device), but drive all internal CPU-side
+        # metadata math (numpy conversion at ``is_prefills``, attention-mask
+        # construction with python-int indexing, ``enumerate(seq_lens)``,
+        # ``positions[...]`` indexing where ``positions`` is the CPU buffer)
+        # off CPU mirrors. In graph mode device==cpu so both mirrors point at
+        # the same tensor and behavior is unchanged; in eager mode device==rbln
+        # and this avoids mixed-device errors like
+        # ``RuntimeError: indices should be either on cpu or on the same
+        # device as the indexed tensor (cpu)`` and
+        # ``TypeError: can't convert rbln:0 device type tensor to numpy``.
         query_start_loc = common_attn_metadata.query_start_loc
+        query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
         seq_lens = common_attn_metadata.seq_lens
+        seq_lens_cpu = seq_lens if seq_lens.device.type == "cpu" else seq_lens.cpu()
         block_tables_tensor = common_attn_metadata.block_table_tensor
         slot_mapping = common_attn_metadata.slot_mapping
-        query_seq_lens = query_start_loc[1:] - query_start_loc[:-1]
-        num_computed_tokens = seq_lens - query_seq_lens
+        query_seq_lens = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+        num_computed_tokens = seq_lens_cpu - query_seq_lens
 
         cu_prefix_query_lens = None
         prefix_kv_lens = None
         suffix_kv_lens = None
         prefix_scheduler_metadata = None
 
-        seq_idx = positions[query_start_loc[:num_reqs]].view(-1, 1)
+        seq_idx = positions[query_start_loc_cpu[:num_reqs]].view(-1, 1)
 
         # The length of the partition equals the block size.
         partition_len = self.block_size
@@ -1158,7 +1172,7 @@ class RBLNFlashAttentionMetadataBuilder(
                     max_seq_len,
                     dtype=torch.float16 if self.enforce_eager else torch.float32,
                 )
-                for batch_index, batch_step in enumerate(seq_lens):
+                for batch_index, batch_step in enumerate(seq_lens_cpu):
                     decode_attention_mask[batch_index, :, :, :, : batch_step + 1] = 1
                 attn_masks = decode_attention_mask
                 attn_masks = attn_masks.to(self.device)
@@ -1171,7 +1185,7 @@ class RBLNFlashAttentionMetadataBuilder(
             num_computed_tokens = (
                 num_computed_tokens[:num_reqs].view(-1, 1).to(torch.int16)
             )
-            seq_lens = seq_lens[:num_reqs].view(-1, 1).to(torch.int16)
+            seq_lens = seq_lens_cpu[:num_reqs].view(-1, 1).to(torch.int16)
             query_lens = seq_lens - num_computed_tokens
             cache_seq_lens = torch.clamp(num_computed_tokens, max=sliding_window)
             cache_offsets = cache_seq_lens + query_lens
