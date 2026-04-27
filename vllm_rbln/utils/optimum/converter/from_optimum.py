@@ -64,6 +64,10 @@ def sync_from_optimum(
 
     # In case of encoder-decoder models,
     # update max_num_seqs in encoder_scheduler_config as well
+    vllm_config.scheduler_config.max_num_batched_tokens = max(
+        vllm_config.model_config.max_model_len,
+        vllm_config.scheduler_config.max_num_seqs,
+    )
     update_max_num_batched_tokens(vllm_config, params.max_seq_len)
 
     # Set max_model_len in model_config based on rbln_config.json
