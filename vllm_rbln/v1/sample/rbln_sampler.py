@@ -129,6 +129,16 @@ def rbln_top_k_top_p_sample(
     return sampled
 
 
+@torch.library.custom_op("rbln::argmax", mutates_args=())
+def argmax(logits: torch.Tensor) -> torch.Tensor:
+    return torch.empty(logits.shape[:-1], dtype=torch.int64, device=logits.device)
+
+
+@torch.library.register_fake("rbln::argmax")
+def argmax_fake(logits: torch.Tensor) -> torch.Tensor:
+    return torch.empty(logits.shape[:-1], dtype=torch.int64, device=logits.device)
+
+
 def rbln_greedy_sample(logits: torch.Tensor) -> torch.Tensor:
     """
     Implementation of RBLN greedy sampling.
