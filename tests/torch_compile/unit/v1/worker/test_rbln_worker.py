@@ -824,7 +824,8 @@ class TestDetermineAvailableMemory:
         assert est.call_args.kwargs["num_runtimes"] == 4
         assert "n_model_bytes" not in est.call_args.kwargs
 
-    def test_draft_model_fp8_params_are_reflected_in_kernel_estimation(self):
+    @pytest.mark.parametrize("quantization", ["fp8", "mxfp4", "compressed-tensors"])
+    def test_draft_model_quantization_is_rejected(self, quantization):
         worker = self._setup()
         draft_model = MagicMock()
         draft_model.parameters.return_value = [
@@ -833,78 +834,7 @@ class TestDetermineAvailableMemory:
         ]
         worker.model_runner.drafter = SimpleNamespace(model=draft_model)
         worker.speculative_config = SimpleNamespace(
-            draft_model_config=SimpleNamespace(quantization="fp8"),
-            draft_parallel_config=None,
-        )
-
-        with (
-            patch("vllm_rbln.v1.worker.rbln_worker.current_platform") as plat,
-            patch(
-                "vllm_rbln.v1.worker.rbln_worker.estimate_model_kernel_size",
-                side_effect=[400, 120],
-            ) as kernel_est,
-            patch(
-                "vllm_rbln.v1.worker.rbln_worker.estimate_available_memory",
-                return_value=10**9,
-            ),
-        ):
-            plat.get_device_name.return_value = "RBLN-CA25"
-            worker.determine_available_memory()
-
-        draft_call = kernel_est.call_args_list[1].kwargs
-        assert draft_call["parallel_config"] is worker.parallel_config
-        assert draft_call["n_model_bytes"] == 250
-
-    def test_draft_model_compressed_tensors_without_num_bits_assumes_fp8(self):
-        worker = self._setup()
-        draft_model = MagicMock()
-        draft_model.parameters.return_value = [
-            torch.zeros(100, dtype=torch.bfloat16),
-            torch.zeros(50, dtype=torch.uint8),
-        ]
-        worker.model_runner.drafter = SimpleNamespace(model=draft_model)
-        worker.speculative_config = SimpleNamespace(
-            draft_model_config=SimpleNamespace(
-                quantization="compressed-tensors",
-                hf_config=SimpleNamespace(
-                    quantization_config={"config_groups": {"g0": {"weights": {}}}}
-                ),
-            ),
-            draft_parallel_config=None,
-        )
-
-        with (
-            patch("vllm_rbln.v1.worker.rbln_worker.current_platform") as plat,
-            patch(
-                "vllm_rbln.v1.worker.rbln_worker.estimate_model_kernel_size",
-                side_effect=[400, 120],
-            ) as kernel_est,
-            patch(
-                "vllm_rbln.v1.worker.rbln_worker.estimate_available_memory",
-                return_value=10**9,
-            ),
-            patch("vllm_rbln.v1.worker.rbln_worker.logger.warning") as warn,
-        ):
-            plat.get_device_name.return_value = "RBLN-CA25"
-            worker.determine_available_memory()
-
-        assert "assuming fp8" in warn.call_args.args[0]
-        assert kernel_est.call_args_list[1].kwargs["n_model_bytes"] == 250
-
-    def test_draft_model_compressed_tensors_rejects_unsupported_bit_width(self):
-        worker = self._setup()
-        draft_model = MagicMock()
-        draft_model.parameters.return_value = [torch.zeros(40, dtype=torch.uint8)]
-        worker.model_runner.drafter = SimpleNamespace(model=draft_model)
-        worker.speculative_config = SimpleNamespace(
-            draft_model_config=SimpleNamespace(
-                quantization="compressed-tensors",
-                hf_config=SimpleNamespace(
-                    quantization_config={
-                        "config_groups": {"g0": {"weights": {"num_bits": 4}}}
-                    }
-                ),
-            ),
+            draft_model_config=SimpleNamespace(quantization=quantization),
             draft_parallel_config=None,
         )
 
@@ -916,48 +846,11 @@ class TestDetermineAvailableMemory:
             ),
         ):
             plat.get_device_name.return_value = "RBLN-CA25"
-            with pytest.raises(ValueError, match="unsupported bit-widths"):
+            with pytest.raises(
+                ValueError,
+                match="draft model quantization is not supported",
+            ):
                 worker.determine_available_memory()
-
-    @pytest.mark.parametrize(
-        ("device_name", "expected_bytes"),
-        [
-            ("RBLN-CA25", 440),
-            ("RBLN-CR100", 264),
-        ],
-    )
-    def test_draft_model_mxfp4_params_are_reflected_in_kernel_estimation(
-        self,
-        device_name,
-        expected_bytes,
-    ):
-        worker = self._setup()
-        draft_model = MagicMock()
-        draft_model.parameters.return_value = [
-            torch.zeros(100, dtype=torch.bfloat16),
-            torch.zeros(64, dtype=torch.uint8),
-        ]
-        worker.model_runner.drafter = SimpleNamespace(model=draft_model)
-        worker.speculative_config = SimpleNamespace(
-            draft_model_config=SimpleNamespace(quantization="mxfp4"),
-            draft_parallel_config=None,
-        )
-
-        with (
-            patch("vllm_rbln.v1.worker.rbln_worker.current_platform") as plat,
-            patch(
-                "vllm_rbln.v1.worker.rbln_worker.estimate_model_kernel_size",
-                side_effect=[400, 120],
-            ) as kernel_est,
-            patch(
-                "vllm_rbln.v1.worker.rbln_worker.estimate_available_memory",
-                return_value=10**9,
-            ),
-        ):
-            plat.get_device_name.return_value = device_name
-            worker.determine_available_memory()
-
-        assert kernel_est.call_args_list[1].kwargs["n_model_bytes"] == expected_bytes
 
 
 # ===========================================================================
