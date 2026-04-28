@@ -2683,16 +2683,24 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 runtime._copy_kv_cache(op.src_block_id, op.dst_block_id, op.num_tokens)
 
     @staticmethod
+    def _is_kv_connector_warm_up_phase(scheduler_output: "SchedulerOutput") -> bool:
+        # Warmup runs `_execute_dummy_requests` with synthetic SchedulerOutput
+        # whose `kv_connector_metadata` is None. The connector lifecycle
+        # (bind/wait/clear) must skip this phase, otherwise stateful
+        # connectors (e.g. LMCache) assert on missing bound metadata.
+        return scheduler_output.kv_connector_metadata is None
+
+    @staticmethod
     def maybe_get_kv_connector_output(
         scheduler_output: "SchedulerOutput",
         defer_finalize: bool = False,
     ) -> AbstractContextManager[KVConnectorOutput | None]:
-        warm_up_phase = scheduler_output.kv_connector_metadata is None
+        skip = RBLNModelRunner._is_kv_connector_warm_up_phase(scheduler_output)
         return (
             KVConnectorModelRunnerMixin._get_kv_connector_output(
                 scheduler_output, defer_finalize=defer_finalize
             )
-            if has_kv_transfer_group() and not warm_up_phase
+            if has_kv_transfer_group() and not skip
             else nullcontext()
         )
 
@@ -3193,8 +3201,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # Finalize KV connector (wait_for_save + clear metadata) after
         # draft model runs. Deferred from target model forward to allow
-        # draft model to also save its KV cache.
-        if spec_config is not None:
+        # draft model to also save its KV cache. Skip during warmup —
+        # the connector context was bypassed in maybe_get_kv_connector_output,
+        # so no metadata was bound.
+        if spec_config is not None and not self._is_kv_connector_warm_up_phase(
+            scheduler_output
+        ):
             self.finalize_kv_connector()
 
         # FIXME(jiwoo.park) EPLB is not supported in RBLN
