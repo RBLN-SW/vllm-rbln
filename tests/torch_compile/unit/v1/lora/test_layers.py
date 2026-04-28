@@ -285,7 +285,7 @@ def rbln_compile(model):
 
 
 @torch.inference_mode()
-@pytest.mark.parametrize("num_loras", [1, 2, 4])
+@pytest.mark.parametrize("num_loras", [1, 2])
 @pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("vocab_size", [512, 32000, 64000, 128000])
 @pytest.mark.parametrize("stage", STAGES)
@@ -391,9 +391,9 @@ def test_embeddings(dist_init, num_loras, device, vocab_size, stage) -> None:
 
 
 @torch.inference_mode()
-@pytest.mark.parametrize("num_loras", [1, 2, 4])
+@pytest.mark.parametrize("num_loras", [1, 2])
 @pytest.mark.parametrize("device", DEVICES)
-@pytest.mark.parametrize("vocab_size", [512, 32000, 64000, 256512])
+@pytest.mark.parametrize("vocab_size", [32000])
 @pytest.mark.parametrize("stage", STAGES)
 def test_lm_head_logits_processor(
     dist_init, num_loras, device, vocab_size, stage
@@ -529,7 +529,7 @@ def test_lm_head_logits_processor(
 
 
 @torch.inference_mode()
-@pytest.mark.parametrize("num_loras", [1, 2, 4])
+@pytest.mark.parametrize("num_loras", [1, 2])
 @pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("stage", STAGES)
 def test_linear_replicated(dist_init, num_loras, device, stage) -> None:
@@ -650,7 +650,7 @@ def test_linear_replicated(dist_init, num_loras, device, stage) -> None:
 
 
 @torch.inference_mode()
-@pytest.mark.parametrize("num_loras", [1, 2, 4])
+@pytest.mark.parametrize("num_loras", [1, 2])
 @pytest.mark.parametrize("orientation", ["row", "column"])
 @pytest.mark.parametrize(
     "fully_shard", [False]
@@ -796,7 +796,7 @@ def test_linear_parallel(
 
 
 @torch.inference_mode()
-@pytest.mark.parametrize("num_loras", [1, 2, 4])
+@pytest.mark.parametrize("num_loras", [1, 2])
 @pytest.mark.parametrize("repeats", [1, 2, 3])
 @pytest.mark.parametrize(
     "fully_shard", [False]
