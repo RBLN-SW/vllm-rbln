@@ -157,10 +157,6 @@ class RblnPlatform(Platform):
         parallel_config = vllm_config.parallel_config
         scheduler_config = vllm_config.scheduler_config
 
-        if scheduler_config.async_scheduling:
-            scheduler_config.async_scheduling = False
-            logger.warning("Async scheduler not supported on RBLN.")
-
         if envs.VLLM_RBLN_USE_VLLM_MODEL:
             cls.validate_and_setup_prerequisite(vllm_config)
             if envs.VLLM_RBLN_USE_DEVICE_TENSOR:

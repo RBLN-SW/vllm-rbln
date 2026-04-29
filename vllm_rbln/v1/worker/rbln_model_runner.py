@@ -157,32 +157,36 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
         model_runner_output: ModelRunnerOutput,
         sampled_token_ids: torch.Tensor,
         invalid_req_indices: list[int],
-        async_output_copy_stream: torch.cuda.Stream,
+        device_index: int,
     ):
         self._model_runner_output = model_runner_output
         self._invalid_req_indices = invalid_req_indices
-
-        # Event on the copy stream so we can synchronize the non-blocking copy.
-        # self._async_copy_ready_event = torch.cuda.Event()
+        self._device_index = device_index
 
         # Keep a reference to the device tensor to avoid it being
         # deallocated until we finish copying it to the host.
         self._sampled_token_ids = sampled_token_ids
 
-        # Initiate the copy on a separate stream, but do not synchronize it.
-        # default_stream = torch.cuda.current_stream()
-        # with torch.cuda.stream(async_output_copy_stream):
-        #     async_output_copy_stream.wait_stream(default_stream)
-        #     self._sampled_token_ids_cpu = self._sampled_token_ids.to(
-        #         'cpu', non_blocking=True)
-        #     self._async_copy_ready_event.record()
+        # Kick off non-blocking V2H. torch-rbln dispatches contiguous
+        # same-dtype copies to rbln_memcpy_v2h_async; non-direct copies
+        # transparently fall back to sync. Pre-allocate the CPU dst with
+        # torch.empty (avoids PyTorch's pinned-memory allocator path that
+        # would route through PrivateUse1Hooks::getPinnedMemoryAllocator).
+        self._sampled_token_ids_cpu = torch.empty(
+            self._sampled_token_ids.shape,
+            dtype=self._sampled_token_ids.dtype,
+            device="cpu",
+        )
+        self._sampled_token_ids_cpu.copy_(
+            self._sampled_token_ids, non_blocking=True
+        )
 
     def get_output(self) -> ModelRunnerOutput:
         """Copy the device tensors to the host and return a ModelRunnerOutput.
 
         This function blocks until the copy is finished.
         """
-        self._async_copy_ready_event.synchronize()
+        torch.rbln.synchronize(self._device_index)
 
         # Release the device tensor once the copy has completed
         del self._sampled_token_ids
@@ -3331,7 +3335,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             model_runner_output=output,
             sampled_token_ids=sampler_output.sampled_token_ids,
             invalid_req_indices=invalid_req_indices,
-            async_output_copy_stream=self.async_output_copy_stream,
+            device_index=self.device.index if self.device.index is not None else 0,
         )
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
