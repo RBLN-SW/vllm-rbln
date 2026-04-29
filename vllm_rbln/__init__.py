@@ -43,6 +43,8 @@ def register_model():
 
 
 def register_ops():
+    import vllm_rbln.distributed.ec_transfer.ec_connector.factory  # noqa
+
     if envs.VLLM_RBLN_USE_VLLM_MODEL:
         import vllm_rbln.model_executor.layers.attention.attention  # noqa
         import vllm_rbln.distributed.kv_transfer.kv_connector.factory  # noqa

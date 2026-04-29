@@ -40,6 +40,12 @@ def _make_profiler_config(trace_dir=None):
         torch_profiler_with_stack=False,
         torch_profiler_with_flops=False,
         torch_profiler_use_gzip=False,
+        torch_profiler_dump_cuda_time_total=False,
+        delay_iterations=0,
+        max_iterations=0,
+        wait_iterations=0,
+        warmup_iterations=0,
+        active_iterations=0,
     )
 
 
@@ -650,17 +656,26 @@ class TestLoadModel:
 
 
 class TestDetermineAvailableMemory:
-    def _setup(self, quantization=None, specialized_moe=False, bucket_count=1):
+    def _setup(
+        self,
+        quantization=None,
+        specialized_moe=False,
+        bucket_count=1,
+        quant_numel=0,
+    ):
         cfg = _make_vllm_config(quantization=quantization)
         worker = _create_worker(vllm_config=cfg)
 
         mock_model = MagicMock()
-        p1 = torch.zeros(100, dtype=torch.bfloat16)
-        p2 = torch.zeros(50, dtype=torch.bfloat16)
-        mock_model.named_parameters.return_value = [
-            ("layer.weight", p1),
-            ("layer.bias", p2),
+        params = [
+            ("layer.weight", torch.zeros(100, dtype=torch.bfloat16)),
+            ("layer.bias", torch.zeros(50, dtype=torch.bfloat16)),
         ]
+        if quant_numel > 0:
+            params.append(
+                ("layer.qweight", torch.zeros(quant_numel, dtype=torch.uint8))
+            )
+        mock_model.named_parameters.return_value = params
 
         runner = MagicMock()
         runner.model = mock_model
@@ -681,10 +696,11 @@ class TestDetermineAvailableMemory:
             plat.get_device_name.return_value = "RBLN-CA25"
             result = worker.determine_available_memory()
         assert result == 10**9
-        assert est.call_args.kwargs["nbits_per_param"] == 16
+        # bf16: 100*2 + 50*2 = 300
+        assert est.call_args.kwargs["n_model_bytes"] == 300
 
     def test_fp8(self):
-        worker = self._setup(quantization="fp8")
+        worker = self._setup(quantization="fp8", quant_numel=64)
         with (
             patch("vllm_rbln.v1.worker.rbln_worker.current_platform") as plat,
             patch(
@@ -694,10 +710,11 @@ class TestDetermineAvailableMemory:
         ):
             plat.get_device_name.return_value = "RBLN-CA25"
             worker.determine_available_memory()
-        assert est.call_args.kwargs["nbits_per_param"] == 8
+        # bf16: 300; uint8 fp8: 64 * 1 * 1.0 * 8 // 8 = 64
+        assert est.call_args.kwargs["n_model_bytes"] == 364
 
     def test_mxfp4_atom(self):
-        worker = self._setup(quantization="mxfp4")
+        worker = self._setup(quantization="mxfp4", quant_numel=64)
         with (
             patch("vllm_rbln.v1.worker.rbln_worker.current_platform") as plat,
             patch(
@@ -707,10 +724,11 @@ class TestDetermineAvailableMemory:
         ):
             plat.get_device_name.return_value = "RBLN-CA25"
             worker.determine_available_memory()
-        assert est.call_args.kwargs["nbits_per_param"] == 16
+        # bf16: 300; uint8 mxfp4-atom: int(64 * 2 * (16/17) * 16 // 8) = 240
+        assert est.call_args.kwargs["n_model_bytes"] == 540
 
     def test_mxfp4_rebel(self):
-        worker = self._setup(quantization="mxfp4")
+        worker = self._setup(quantization="mxfp4", quant_numel=64)
         with (
             patch("vllm_rbln.v1.worker.rbln_worker.current_platform") as plat,
             patch(
@@ -720,7 +738,8 @@ class TestDetermineAvailableMemory:
         ):
             plat.get_device_name.return_value = "RBLN-CR100"
             worker.determine_available_memory()
-        assert est.call_args.kwargs["nbits_per_param"] == 4
+        # bf16: 300; uint8 mxfp4-rebel: 64 * 2 * 1.0 * 4 // 8 = 64
+        assert est.call_args.kwargs["n_model_bytes"] == 364
 
     def test_mxfp4_unknown_device(self):
         worker = self._setup(quantization="mxfp4")
@@ -769,8 +788,8 @@ class TestDetermineAvailableMemory:
         ):
             plat.get_device_name.return_value = "RBLN-CA25"
             worker.determine_available_memory()
-        # n_model_params = 100 (bf16) + 50*1*1 (uint8 fp8 packed=1)
-        assert est.call_args.kwargs["n_model_params"] == 150
+        # bf16: 100*2 = 200; uint8 fp8: 50 * 1 * 1.0 * 8 // 8 = 50
+        assert est.call_args.kwargs["n_model_bytes"] == 250
 
 
 # ===========================================================================
@@ -1061,14 +1080,14 @@ class TestProfile:
         worker.profiler = MagicMock()
         worker.profile(is_start=False)
         worker.profiler.stop.assert_called_once()
-        worker.profiler.key_averages.assert_called_once()
+        worker.profiler.profiler.key_averages.assert_called_once()
 
     def test_stop_non_rank0(self):
         worker = _create_worker(local_rank=1)
         worker.profiler = MagicMock()
         worker.profile(is_start=False)
         worker.profiler.stop.assert_called_once()
-        worker.profiler.key_averages.assert_not_called()
+        worker.profiler.profiler.key_averages.assert_not_called()
 
 
 # ===========================================================================
