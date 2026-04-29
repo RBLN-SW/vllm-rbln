@@ -409,7 +409,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             if layer.expert_map is not None:
                 assert getattr(layer, "expert_map_const", None) is not None
                 expert_map_const = torch.tensor(
-                    layer.expert_map_const, dtype=torch.int32, device=router_logits.device
+                    layer.expert_map_const,
+                    dtype=torch.int32,
+                    device=router_logits.device,
                 )
 
             tokens_mask = None
