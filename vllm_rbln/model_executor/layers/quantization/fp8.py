@@ -811,11 +811,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 max_w13_scales, requires_grad=False
             )
 
-        if getattr(layer, "_expert_map", None) is not None:
-            layer._expert_map_list = layer._expert_map.data.to(
-                dtype=torch.int32
-            ).tolist()
-
     def select_gemm_impl(
         self,
         prepare_finalize: mk.FusedMoEPrepareAndFinalizeModular,

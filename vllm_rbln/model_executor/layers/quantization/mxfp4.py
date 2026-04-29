@@ -375,11 +375,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         layer.register_buffer("down_proj_scales", layer.w2_weight_scale.data)
         layer.register_buffer("down_proj_bias", layer.w2_bias.data)
 
-        if getattr(layer, "_expert_map", None) is not None:
-            layer._expert_map_list = layer._expert_map.data.to(
-                dtype=torch.int32
-            ).tolist()
-
     def select_gemm_impl(
         self,
         prepare_finalize: mk.FusedMoEPrepareAndFinalizeModular,
@@ -412,8 +407,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if layer.activation == MoEActivation.SWIGLUOAI:
             expert_map_const = None
             if layer.expert_map is not None:
+                assert getattr(layer, "expert_map_const", None) is not None
                 expert_map_const = torch.tensor(
-                    layer._expert_map_list, dtype=torch.int32
+                    layer.expert_map_const, dtype=torch.int32, device=router_logits.device
                 )
 
             tokens_mask = None
