@@ -128,7 +128,30 @@ class KVCacheBlockAdapter:
         return new_estimated
 
 
+class _ProducerOptimumModelProxy:
+    """Lightweight proxy replacing the full optimum model for EC producers.
+
+    Only the visual encoder submodule is loaded; LLM compiled models
+    (.rbln files for prefill/decode) are never touched.
+    """
+
+    def __init__(self, visual: Any, rbln_config: Any) -> None:
+        self.visual = visual
+        self.rbln_config = rbln_config
+
+    def get_kvcache_num_blocks(self) -> int:
+        return getattr(self.rbln_config, "kvcache_num_blocks", 1)
+
+    def get_attn_impl(self) -> None:
+        return None
+
+
 class RBLNOptimumModelBase(nn.Module):
+    model: Any
+    rbln_model_config: Any
+    attn_impl: str | None
+    kv_block_adapter: "KVCacheBlockAdapter | None"
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -140,9 +163,14 @@ class RBLNOptimumModelBase(nn.Module):
         self.cache_config = vllm_config.cache_config
         self.init_model()
         self.batch_size = self.scheduler_config.max_num_seqs
-        self.kv_block_adapter = KVCacheBlockAdapter(
-            vllm_config, self._resolve_kvcache_num_blocks()
-        )
+        if self._is_ec_producer_only():
+            # Producer has no LLM; KV cache is not meaningful. Worker's
+            # determine_available_memory() short-circuits when adapter is None.
+            self.kv_block_adapter = None
+        else:
+            self.kv_block_adapter = KVCacheBlockAdapter(
+                vllm_config, self._resolve_kvcache_num_blocks()
+            )
 
     def _resolve_kvcache_num_blocks(self) -> int:
         """Prefer model-provided KV-cache block count;
@@ -222,17 +250,29 @@ class RBLNOptimumModelBase(nn.Module):
         if model is None:
             model_cls = getattr(optimum.rbln, model_cls_name)
             assert model_cls is not None
-            rbln_config = self.vllm_config.additional_config.get("rbln_config", {})
-            # NOTE: We can set the device to run submodules
-            model = model_cls.from_pretrained(
-                self.vllm_config.model_config.model,
-                rbln_config=rbln_config,
-            )
+            model_path = Path(self.vllm_config.model_config.model)
+            ec_enabled_model = model_cls_name == "RBLNQwen3VLForConditionalGeneration"
+
+            if self._is_ec_producer_only():
+                if not ec_enabled_model:
+                    raise ValueError("Disaggregation is not supported for this model.")
+                visual = model_cls.load_visual_encoder(str(model_path))
+                model = _ProducerOptimumModelProxy(visual, visual.rbln_config)
+            else:
+                rbln_config = self.vllm_config.additional_config.get("rbln_config", {})
+                if self._is_ec_consumer_only():
+                    if not ec_enabled_model:
+                        raise ValueError(
+                            "Disaggregation is not supported for this model."
+                        )
+                    rbln_config["_load_visual_runtime"] = False
+                model = model_cls.from_pretrained(model_path, rbln_config=rbln_config)
+
             logger.info(
                 "model_name = %s, model_cls_name = %s, model_path = %s",
                 model_name,
                 model_cls_name,
-                self.vllm_config.model_config.model,
+                model_path,
             )
 
         self.supports_transcription_only = (
@@ -245,6 +285,18 @@ class RBLNOptimumModelBase(nn.Module):
             model.get_attn_impl() if hasattr(model, "get_attn_impl") else None
         )
 
+    # ------------------------------------------------------------------
+    # EC disaggregation helpers
+    # ------------------------------------------------------------------
+
+    def _is_ec_producer_only(self) -> bool:
+        ec = getattr(self.vllm_config, "ec_transfer_config", None)
+        return ec is not None and ec.is_ec_producer and not ec.is_ec_consumer
+
+    def _is_ec_consumer_only(self) -> bool:
+        ec = getattr(self.vllm_config, "ec_transfer_config", None)
+        return ec is not None and ec.is_ec_consumer and not ec.is_ec_producer
+
     @property
     def dtype(self) -> torch.dtype:
         assert self.model.rbln_config.dtype is not None
@@ -252,9 +304,11 @@ class RBLNOptimumModelBase(nn.Module):
 
 
 class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
+    attn_impl: str | None
+
     def setup_decoder_mixin(
         self,
-        attn_impl: str,
+        attn_impl: str | None,
         vocab_size: int,
         use_multiple_decoder: bool,
         default_batch_size: int,

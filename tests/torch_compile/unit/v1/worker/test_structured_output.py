@@ -70,7 +70,6 @@ class TestGrammarBitmaskApplication:
             hidden_states=torch.randn(3, 128),
             sample_hidden_states=None,
             aux_hidden_states=None,
-            kv_connector_output=None,
             slot_mappings=None,
         )
 
@@ -122,7 +121,6 @@ class TestGrammarBitmaskApplication:
             hidden_states=torch.randn(3, 128),
             sample_hidden_states=None,
             aux_hidden_states=None,
-            kv_connector_output=None,
             slot_mappings=None,
         )
 
@@ -165,7 +163,6 @@ class TestGrammarBitmaskApplication:
             hidden_states=torch.randn(0, 128),
             sample_hidden_states=None,
             aux_hidden_states=None,
-            kv_connector_output=None,
             slot_mappings=None,
         )
 
@@ -381,7 +378,6 @@ class TestLogitsDtypeConversion:
             hidden_states=torch.randn(2, 64),
             sample_hidden_states=None,
             aux_hidden_states=None,
-            kv_connector_output=None,
             slot_mappings=None,
         )
 

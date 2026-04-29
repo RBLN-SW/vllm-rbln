@@ -26,6 +26,7 @@ from vllm.distributed import (
     ensure_model_parallel_initialized,
     init_distributed_environment,
 )
+from vllm.distributed.ec_transfer import ensure_ec_transfer_initialized
 from vllm.lora.request import LoRARequest
 from vllm.tasks import SupportedTask
 from vllm.utils.torch_utils import set_random_seed
@@ -162,6 +163,11 @@ class RBLNOptimumWorker(WorkerBase):
         # Set random seed.
         set_random_seed(self.model_config.seed)
         self.device = self.vllm_config.device_config.device
+
+        # Init EC connector before model runner (must precede KV cache init
+        # so that encoder-only instances can skip KV cache allocation).
+        ensure_ec_transfer_initialized(self.vllm_config)
+
         self.model_runner = RBLNOptimumModelRunner(self.vllm_config, self.device)
 
     @torch.inference_mode()
@@ -170,6 +176,16 @@ class RBLNOptimumWorker(WorkerBase):
         kv_cache_spec = self.model_runner.get_kv_cache_spec()
         num_layers = len(kv_cache_spec)
         page_size = get_uniform_page_size(kv_cache_spec.values())
+
+        if self.model_runner.is_ec_producer_only:
+            # EC producer has no real LLM; the scheduler still spins up
+            # a KV-cache manager, so report enough memory to satisfy
+            # vLLM's max_model_len sizing check. Nothing is actually
+            # allocated because initialize_cache() is a no-op.
+            max_model_len = self.model_runner.vllm_config.model_config.max_model_len
+            block_size = self.model_runner.vllm_config.cache_config.block_size
+            num_blocks = max_model_len // block_size + 1
+            return num_blocks * page_size * num_layers
 
         adapter = self.model_runner.model.kv_block_adapter
         num_gpu_blocks = adapter.get_available_num_blocks()
@@ -247,6 +263,11 @@ class RBLNOptimumWorker(WorkerBase):
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
+
+        # EC producer has no decoder — skip warmup entirely.
+        if self.model_runner.is_ec_producer_only:
+            logger.info("EC producer: skipping warmup (no decoder).")
+            return
 
         if not envs.VLLM_RBLN_ENABLE_WARM_UP:
             logger.info(

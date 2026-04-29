@@ -131,7 +131,7 @@ class TestEstimateAvailableMemory:
         model_cfg = _make_model_config()
         parallel_cfg = _make_parallel_config()
 
-        with pytest.raises(ValueError, match="Both.*cannot be specified"):
+        with pytest.raises(ValueError, match="cannot both be specified"):
             estimate_available_memory(
                 model_cfg,
                 parallel_cfg,
