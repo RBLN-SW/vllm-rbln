@@ -157,12 +157,19 @@ class RblnPlatform(Platform):
         parallel_config = vllm_config.parallel_config
         scheduler_config = vllm_config.scheduler_config
 
-        if scheduler_config.async_scheduling:
-            scheduler_config.async_scheduling = False
-            logger.warning("Async scheduler not supported on RBLN.")
-
         if envs.VLLM_RBLN_USE_VLLM_MODEL:
             cls.validate_and_setup_prerequisite(vllm_config)
+            if envs.VLLM_RBLN_USE_DEVICE_TENSOR:
+                # Use RBLN device tensors for torch.compile/runtime on the
+                # native vLLM model path.
+                RblnPlatform.device_name = "rbln"
+                RblnPlatform.device_type = "rbln"
+                RblnPlatform.dist_backend = "rbln-ccl"
+                vllm_config.device_config.device_type = RblnPlatform.device_type
+                vllm_config.device_config.device = torch.device(
+                    RblnPlatform.device_type
+                )
+
             if envs.VLLM_RBLN_ENFORCE_MODEL_FP32:
                 logger.info("original model_config.dtype = %s", model_config.dtype)
                 if model_config.dtype == torch.bfloat16:
@@ -182,7 +189,6 @@ class RblnPlatform(Platform):
                     logger.info("RBLN enforce draft_model_config.dtype as torch.float")
             else:
                 dtype = model_config.dtype
-                logger.info("original model_config.dtype = %s", dtype)
                 if (
                     dtype != torch.bfloat16
                     and dtype != torch.float16
@@ -210,6 +216,8 @@ class RblnPlatform(Platform):
                 )
 
                 RblnPlatform.device_type = "rbln"
+                if envs.VLLM_RBLN_USE_DEVICE_TENSOR:
+                    RblnPlatform.dist_backend = "rbln-ccl"
                 vllm_config.device_config.device_type = RblnPlatform.device_type
                 vllm_config.device_config.device = torch.device(
                     RblnPlatform.device_type

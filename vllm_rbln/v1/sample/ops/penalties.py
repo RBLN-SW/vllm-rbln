@@ -8,6 +8,8 @@ import torch
 from vllm.model_executor.layers.utils import apply_penalties
 from vllm.utils.torch_utils import make_tensor_with_pad
 
+import vllm_rbln.rbln_envs as envs
+
 
 @torch.compiler.disable
 def apply_all_penalties(
@@ -54,7 +56,7 @@ def _convert_to_tensors(
         # Use the value of vocab_size as a pad since we don't have a
         # token_id of this value.
         pad=vocab_size,
-        device="cpu",
+        device=device if envs.VLLM_RBLN_USE_DEVICE_TENSOR else "cpu",
         dtype=torch.int64,
     )
     return output_tokens_tensor
