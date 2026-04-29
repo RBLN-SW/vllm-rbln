@@ -1075,7 +1075,6 @@ class RBLNFlashAttentionMetadataBuilder(
     def _to_device_inplace(
         self, cpu_tensor: torch.Tensor, attr_name: str
     ) -> torch.Tensor:
-        """Copy cpu_tensor into a reusable device buffer, allocating only on shape/dtype change."""
         buf: torch.Tensor | None = getattr(self, attr_name)
         if (
             buf is None
