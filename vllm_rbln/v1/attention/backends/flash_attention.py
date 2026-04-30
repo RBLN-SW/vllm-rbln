@@ -1492,7 +1492,9 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         key,
                         value,
                         kv_cache,
-                        attn_metadata.seq_lens.to(torch.int16),
+                        attn_metadata.seq_lens.to(torch.int32)
+                        if self.is_batch_attention_opt and b_size > 1
+                        else attn_metadata.seq_lens.to(torch.int16),
                         self.scale,
                         attn_metadata.block_tables.to(torch.int16),
                         self.scale,  # dummy (required by rbln_triton_ops signature)
@@ -1553,7 +1555,9 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         value,
                         kv_cache,
                         self.scale,
-                        attn_metadata.seq_lens.to(torch.int16),
+                        attn_metadata.seq_lens.to(torch.int32)
+                        if self.is_batch_attention_opt and b_size > 1
+                        else attn_metadata.seq_lens.to(torch.int16),
                         attn_metadata.block_tables.to(torch.int16),
                         self.scale,  # dummy
                     ]
@@ -1607,7 +1611,9 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         value,
                         kv_cache,
                         attn_metadata.attn_masks,
-                        attn_metadata.seq_lens.to(torch.int16),
+                        attn_metadata.seq_lens.to(torch.int32)
+                        if self.is_batch_attention_opt and b_size > 1
+                        else attn_metadata.seq_lens.to(torch.int16),
                         self.scale,
                         attn_metadata.block_tables.to(torch.int16),
                         self.scale,  # dummy (required by rbln_triton_ops signature)
@@ -1662,7 +1668,9 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         kv_cache,
                         attn_metadata.attn_masks,
                         self.scale,
-                        attn_metadata.seq_lens.to(torch.int16),
+                        attn_metadata.seq_lens.to(torch.int32)
+                        if self.is_batch_attention_opt and b_size > 1
+                        else attn_metadata.seq_lens.to(torch.int16),
                         attn_metadata.block_tables.to(torch.int16),
                         self.scale,  # dummy
                     ]
