@@ -405,6 +405,7 @@ def custom_moe_swiglu_group_dequantize(
     router_logits: torch.Tensor,
     group_size: torch.Tensor,
     topk: int,
+    renormalize: bool,
     e_score_correction_bias: torch.Tensor | None = None,
     gate_proj_bias: torch.Tensor | None = None,
     up_proj_bias: torch.Tensor | None = None,
@@ -428,6 +429,7 @@ def custom_moe_swiglu_group_dequantize(
     - router_logits: [batch*seq_len, num_experts]
     - group_size: group size for weight scale
     - topk: top k experts to select
+    - renormalize: whether to renormalize the router logits
     - e_score_correction_bias:
     - gate_proj_bias: [num_experts, intermediate_size]
     - up_proj_bias: [num_experts, intermediate_size]
@@ -495,9 +497,10 @@ def custom_moe_swiglu_group_dequantize(
 
     _, topk_ids = torch.topk(scores_for_choice, topk, dim=-1, sorted=False)
     topk_weights = routing_weights.gather(1, topk_ids)
-    topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True).clamp_min(
-        1e-20
-    )
+    if renormalize:
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True).clamp_min(
+            1e-20
+        )
     topk_weights = topk_weights.to(hidden_states.dtype)
 
     if dp_mask is not None:
@@ -559,6 +562,7 @@ def custom_moe_swiglu_group_dequantize_fake(
     router_logits: torch.Tensor,
     group_size: torch.Tensor,
     topk: int,
+    renormalize: bool,
     e_score_correction_bias: torch.Tensor | None = None,
     gate_proj_bias: torch.Tensor | None = None,
     up_proj_bias: torch.Tensor | None = None,
@@ -911,6 +915,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 router_logits,
                 torch.tensor(self.weight_block_size[1], dtype=torch.int32),
                 layer.top_k,
+                layer.renormalize,
                 e_score_correction_bias,
                 None,  # gate_proj_bias
                 None,  # up_proj_bias
