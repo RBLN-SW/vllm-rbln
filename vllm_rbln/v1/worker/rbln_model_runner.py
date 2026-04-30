@@ -4428,6 +4428,20 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 else:
                     break
 
+    @staticmethod
+    def _propagate_runtime_holder(group: object, runtime_holder: list) -> None:
+        """Pass runtime_holder to every connector exposing set_runtime_holder.
+
+        Walks into ``MultiConnector._connectors`` recursively because
+        MultiConnector does not implement this RBLN-specific method, so a
+        plain hasattr check on the top-level group would silently skip the
+        nested LMCache/RBLN connector that actually needs the holder.
+        """
+        if hasattr(group, "set_runtime_holder"):
+            group.set_runtime_holder(runtime_holder)
+        for child in getattr(group, "_connectors", ()) or ():
+            RBLNModelRunner._propagate_runtime_holder(child, runtime_holder)
+
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """
         Initialize KV cache based on `kv_cache_config`.
@@ -4518,17 +4532,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
             kv_transfer_group.set_host_xfer_buffer_ops(rbln_copy_kv_blocks)
 
-            # Propagate runtime_holder to every connector that exposes
-            # set_runtime_holder, walking into MultiConnector children since
-            # MultiConnector itself does not implement this RBLN-specific
-            # method (it would otherwise be silently skipped by hasattr).
-            def _propagate_runtime_holder(group: object) -> None:
-                if hasattr(group, "set_runtime_holder"):
-                    group.set_runtime_holder(self.runtime_holder)
-                for child in getattr(group, "_connectors", ()) or ():
-                    _propagate_runtime_holder(child)
-
-            _propagate_runtime_holder(kv_transfer_group)
+            self._propagate_runtime_holder(kv_transfer_group, self.runtime_holder)
 
         if self.dcp_world_size > 1:
             layer_type = cast(type[Any], AttentionLayerBase)

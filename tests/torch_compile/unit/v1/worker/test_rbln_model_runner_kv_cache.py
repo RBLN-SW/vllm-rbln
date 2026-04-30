@@ -16,7 +16,7 @@
 
 Tests _add_dummy_requests, _make_dummy_scheduler_outputs,
 select_common_block_size, _prepare_kernel_block_sizes,
-and _allocate_kv_cache_tensors.
+_allocate_kv_cache_tensors, and _propagate_runtime_holder.
 """
 
 from unittest.mock import MagicMock, patch
@@ -425,3 +425,96 @@ class TestAllocateKvCacheTensors:
         assert result["layer_0"].shape == (1024,)
         assert result["layer_1"].shape == (2048,)
         assert result["layer_0"] is not result["layer_1"]
+
+
+# ============================================================
+# _propagate_runtime_holder Tests
+# ============================================================
+
+
+class _ConnectorWithHolder:
+    """Stub for an RBLN-aware connector exposing set_runtime_holder."""
+
+    def __init__(self) -> None:
+        self.holder: list | None = None
+
+    def set_runtime_holder(self, runtime_holder: list) -> None:
+        self.holder = runtime_holder
+
+
+class _PlainConnector:
+    """Stub for a connector without set_runtime_holder (e.g. NIXL)."""
+
+
+class _MultiConnectorStub:
+    """Stub mimicking vLLM MultiConnector: has _connectors, no set_runtime_holder."""
+
+    def __init__(self, children: list[object]) -> None:
+        self._connectors = children
+
+
+class TestPropagateRuntimeHolder:
+    """Test _propagate_runtime_holder: walks MultiConnector children."""
+
+    def test_direct_connector_with_set_runtime_holder(self):
+        """Top-level connector that exposes the method receives the holder."""
+        connector = _ConnectorWithHolder()
+        holder = [object()]
+
+        RBLNModelRunner._propagate_runtime_holder(connector, holder)
+
+        assert connector.holder is holder
+
+    def test_direct_connector_without_set_runtime_holder(self):
+        """Top-level connector without the method is silently skipped."""
+        connector = _PlainConnector()
+        holder = [object()]
+
+        # Must not raise
+        RBLNModelRunner._propagate_runtime_holder(connector, holder)
+
+    def test_multi_connector_walks_children(self):
+        """MultiConnector itself lacks the method; children that have it get it."""
+        rbln_child = _ConnectorWithHolder()
+        nixl_child = _PlainConnector()
+        multi = _MultiConnectorStub([nixl_child, rbln_child])
+        holder = [object()]
+
+        RBLNModelRunner._propagate_runtime_holder(multi, holder)
+
+        assert rbln_child.holder is holder
+
+    def test_multi_connector_propagates_to_all_rbln_children(self):
+        """Every child with set_runtime_holder receives the same holder."""
+        child_a = _ConnectorWithHolder()
+        child_b = _ConnectorWithHolder()
+        multi = _MultiConnectorStub([child_a, child_b])
+        holder = [object()]
+
+        RBLNModelRunner._propagate_runtime_holder(multi, holder)
+
+        assert child_a.holder is holder
+        assert child_b.holder is holder
+
+    def test_nested_multi_connector(self):
+        """Nested MultiConnectors are walked recursively."""
+        inner_child = _ConnectorWithHolder()
+        inner = _MultiConnectorStub([inner_child])
+        outer = _MultiConnectorStub([inner])
+        holder = [object()]
+
+        RBLNModelRunner._propagate_runtime_holder(outer, holder)
+
+        assert inner_child.holder is holder
+
+    def test_holder_reference_is_shared_not_copied(self):
+        """The list itself is passed (lazy runtime population relies on this)."""
+        connector = _ConnectorWithHolder()
+        holder: list = []
+
+        RBLNModelRunner._propagate_runtime_holder(connector, holder)
+
+        # Mutating the original list must be visible via the connector.
+        holder.append("rt")
+        assert connector.holder is holder
+        assert connector.holder[0] == "rt"
