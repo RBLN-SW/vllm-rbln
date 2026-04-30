@@ -4518,8 +4518,17 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
             kv_transfer_group.set_host_xfer_buffer_ops(rbln_copy_kv_blocks)
 
-            if hasattr(kv_transfer_group, "set_runtime_holder"):
-                kv_transfer_group.set_runtime_holder(self.runtime_holder)
+            # Propagate runtime_holder to every connector that exposes
+            # set_runtime_holder, walking into MultiConnector children since
+            # MultiConnector itself does not implement this RBLN-specific
+            # method (it would otherwise be silently skipped by hasattr).
+            def _propagate_runtime_holder(group: object) -> None:
+                if hasattr(group, "set_runtime_holder"):
+                    group.set_runtime_holder(self.runtime_holder)
+                for child in getattr(group, "_connectors", ()) or ():
+                    _propagate_runtime_holder(child)
+
+            _propagate_runtime_holder(kv_transfer_group)
 
         if self.dcp_world_size > 1:
             layer_type = cast(type[Any], AttentionLayerBase)
