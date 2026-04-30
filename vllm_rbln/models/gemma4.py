@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import re
 from collections.abc import Iterable
 from contextlib import suppress
@@ -274,6 +275,7 @@ class Gemma4Attention(nn.Module):
         num_kv_heads: int,
         head_dim: int,
         max_position_embeddings: int,
+        proj_head_dim: int | None = None,
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
@@ -293,13 +295,23 @@ class Gemma4Attention(nn.Module):
             assert tp_size % self.total_num_kv_heads == 0
         self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
         self.head_dim = head_dim
+        # NOTE(RBLN): This is a workaround to avoid compilation failure
+        # when the value of num_kv_heads differs between full-attention and
+        # sliding-attention layers.
+        # proj_head_dim is the head_size of qkv_proj output. When >= head_dim,
+        # the trailing per-head dim is sliced off after the QKV split so that
+        # downstream ops (norms, rotary, self.attn, o_proj) see the layer's
+        # actual head_dim. Defaults to head_dim for the no-padding path.
+        self.proj_head_dim = proj_head_dim if proj_head_dim is not None else head_dim
+        self.proj_q_size = self.num_heads * self.proj_head_dim
+        self.proj_kv_size = self.num_kv_heads * self.proj_head_dim
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = 1.0
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
-            self.head_dim,
+            self.proj_head_dim,
             self.total_num_heads,
             self.total_num_kv_heads,
             bias=config.attention_bias,
@@ -372,19 +384,27 @@ class Gemma4Attention(nn.Module):
         **kwargs,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q, k, v = qkv.split(
+            [self.proj_q_size, self.proj_kv_size, self.proj_kv_size], dim=-1
+        )
 
-        q = q.unflatten(-1, (self.num_heads, self.head_dim))
+        q = q.unflatten(-1, (self.num_heads, self.proj_head_dim))
+        if self.proj_head_dim != self.head_dim:
+            q = q[..., : self.head_dim]
         q = self.q_norm(q)
         q = q.flatten(-2, -1)
 
         if not self.is_kv_shared_layer:
-            k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
+            k = k.unflatten(-1, (self.num_kv_heads, self.proj_head_dim))
+            if self.proj_head_dim != self.head_dim:
+                k = k[..., : self.head_dim]
             k = self.k_norm(k)
             k = k.flatten(-2, -1)
             q, k = self.rotary_emb(positions, q, k)
 
-            v = v.unflatten(-1, (self.num_kv_heads, self.head_dim))
+            v = v.unflatten(-1, (self.num_kv_heads, self.proj_head_dim))
+            if self.proj_head_dim != self.head_dim:
+                v = v[..., : self.head_dim]
             v = self.v_norm(v)
             v = v.flatten(-2, -1)
         else:
@@ -423,12 +443,31 @@ class Gemma4DecoderLayer(nn.Module):
         else:
             num_kv_heads = config.num_key_value_heads
 
+        if os.environ.get("PAD_GEMMA4_QKV_PROJ", "False").lower() in ("true", "1"):
+            # NOTE(RBLN): This is a workaround to avoid compilation failure
+            # when the value of num_kv_heads differs between full-attention and
+            # sliding-attention layers.
+            # qkv_proj output is uniform (max) across layers and num_kv_heads
+            # is uniform via weight replication. Q/K/V are sliced from
+            # proj_head_dim → head_dim after the split, and downstream ops
+            # run at the layer's actual head_dim.
+            proj_head_dim = max(
+                getattr(config, "global_head_dim", 0) or 0, config.head_dim
+            )
+            num_kv_heads = max(
+                getattr(config, "num_global_key_value_heads", 0) or 0,
+                config.num_key_value_heads,
+            )
+        else:
+            proj_head_dim = head_dim
+
         self.self_attn = Gemma4Attention(
             config=config,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
+            proj_head_dim=proj_head_dim,
             max_position_embeddings=config.max_position_embeddings,
             cache_config=cache_config,
             quant_config=quant_config,
@@ -676,12 +715,90 @@ class Gemma4ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         return self.logits_processor(self.lm_head, hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        use_k_eq_v = getattr(self.config, "attention_k_eq_v", False)
+        config = self.config
+        use_k_eq_v = getattr(config, "attention_k_eq_v", False)
         k_eq_v_layer_indices: set[int] = set()
         if use_k_eq_v:
-            for idx, layer_type in enumerate(self.config.layer_types):
+            for idx, layer_type in enumerate(config.layer_types):
                 if layer_type == "full_attention":
                     k_eq_v_layer_indices.add(idx)
+
+        pad_qkv = os.environ.get("PAD_GEMMA4_QKV_PROJ", "False").lower() in ("true", "1")
+        padded_head_dim = max(
+            getattr(config, "global_head_dim", 0) or 0, config.head_dim
+        )
+        padded_num_kv_heads = max(
+            getattr(config, "num_global_key_value_heads", 0) or 0,
+            config.num_key_value_heads,
+        )
+        num_attention_heads = config.num_attention_heads
+
+        def actual_dims_for_layer(layer_idx: int) -> tuple[int, int]:
+            layer_type = config.layer_types[layer_idx]
+            is_full = layer_type == "full_attention"
+            head_dim = (
+                (getattr(config, "global_head_dim", None) or config.head_dim)
+                if is_full
+                else config.head_dim
+            )
+            if is_full and use_k_eq_v:
+                num_kv = getattr(
+                    config,
+                    "num_global_key_value_heads",
+                    config.num_key_value_heads,
+                )
+            else:
+                num_kv = config.num_key_value_heads
+            return head_dim, num_kv
+
+        def pad_for_layer(name: str, weight: torch.Tensor) -> torch.Tensor:
+            if not pad_qkv:
+                return weight
+            m = re.search(r"layers\.(\d+)\.", name)
+            if not m:
+                return weight
+            layer_idx = int(m.group(1))
+            actual_head_dim, actual_num_kv = actual_dims_for_layer(layer_idx)
+            head_dim_diff = padded_head_dim - actual_head_dim
+            if head_dim_diff == 0 and actual_num_kv == padded_num_kv_heads:
+                return weight
+
+            if "self_attn.q_proj.weight" in name:
+                # [num_heads * actual_head_dim, hidden_size] →
+                # [num_heads * padded_head_dim, hidden_size] (zero-pad
+                # head_dim). Q's head count doesn't change.
+                w = weight.view(num_attention_heads, actual_head_dim, -1)
+                if head_dim_diff > 0:
+                    w = torch.nn.functional.pad(w, (0, 0, 0, head_dim_diff))
+                return w.reshape(num_attention_heads * padded_head_dim, -1)
+            if (
+                "self_attn.k_proj.weight" in name
+                or "self_attn.v_proj.weight" in name
+            ):
+                # K/V: zero-pad head_dim → padded_head_dim, then *replicate*
+                # each kv head padded_num_kv_heads/actual_num_kv times so
+                # GQA grouping at padded_num_kv_heads reproduces the
+                # original grouping.
+                if padded_num_kv_heads % actual_num_kv != 0:
+                    raise ValueError(
+                        "padded_num_kv_heads must be a multiple of "
+                        "actual_num_kv for replication"
+                    )
+                rep = padded_num_kv_heads // actual_num_kv
+                w = weight.view(actual_num_kv, actual_head_dim, -1)
+                if head_dim_diff > 0:
+                    w = torch.nn.functional.pad(w, (0, 0, 0, head_dim_diff))
+                # [actual_num_kv, padded_head_dim, hidden_size] →
+                # [actual_num_kv, rep, padded_head_dim, hidden_size] →
+                # [padded_num_kv_heads, padded_head_dim, hidden_size]
+                if rep > 1:
+                    w = (
+                        w.unsqueeze(1)
+                        .expand(actual_num_kv, rep, padded_head_dim, w.shape[-1])
+                        .reshape(padded_num_kv_heads, padded_head_dim, w.shape[-1])
+                    )
+                return w.reshape(padded_num_kv_heads * padded_head_dim, -1)
+            return weight
 
         def iter_weights() -> Iterable[tuple[str, torch.Tensor]]:
             for name, weight in weights:
@@ -690,11 +807,12 @@ class Gemma4ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
                 if "self_attn.k_proj" in name and k_eq_v_layer_indices:
                     match = re.search(r"layers\.(\d+)\.", name)
                     if match and int(match.group(1)) in k_eq_v_layer_indices:
-                        yield name, weight
-                        yield name.replace("k_proj", "v_proj"), weight.clone()
+                        yield name, pad_for_layer(name, weight)
+                        v_name = name.replace("k_proj", "v_proj")
+                        yield v_name, pad_for_layer(v_name, weight.clone())
                         continue
 
-                yield name, weight
+                yield name, pad_for_layer(name, weight)
 
         skip = [
             "audio_tower.",
