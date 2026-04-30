@@ -41,6 +41,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
+import vllm_rbln.model_executor.layers.rotary_embedding.gemma4_rope  # noqa: F401
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -66,6 +67,19 @@ from vllm.transformers_utils.model_arch_config_convertor import (
     MODEL_ARCH_CONFIG_CONVERTORS,
     ModelArchConfigConvertorBase,
 )
+
+
+def _gemma4_materialized_v_proj_weight(weight: torch.Tensor) -> torch.Tensor:
+    copied = weight.clone()
+    flat = copied.flatten()
+    original = flat[0].clone()
+    delta = torch.tensor(
+        torch.finfo(copied.dtype).eps,
+        dtype=torch.float32,
+        device=copied.device,
+    )
+    flat[0] = (original.float() + delta).to(dtype=copied.dtype)
+    return copied
 
 
 class Gemma4TextConfig(PretrainedConfig):
@@ -443,7 +457,7 @@ class Gemma4DecoderLayer(nn.Module):
         else:
             num_kv_heads = config.num_key_value_heads
 
-        if os.environ.get("PAD_GEMMA4_QKV_PROJ", "False").lower() in ("true", "1"):
+        if os.environ.get("GEMMA4_PAD_QKV_PROJ", "False").lower() in ("true", "1"):
             # NOTE(RBLN): This is a workaround to avoid compilation failure
             # when the value of num_kv_heads differs between full-attention and
             # sliding-attention layers.
@@ -723,7 +737,10 @@ class Gemma4ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
                 if layer_type == "full_attention":
                     k_eq_v_layer_indices.add(idx)
 
-        pad_qkv = os.environ.get("PAD_GEMMA4_QKV_PROJ", "False").lower() in ("true", "1")
+        pad_qkv = os.environ.get("GEMMA4_PAD_QKV_PROJ", "False").lower() in (
+            "true",
+            "1",
+        )
         padded_head_dim = max(
             getattr(config, "global_head_dim", 0) or 0, config.head_dim
         )
@@ -731,6 +748,11 @@ class Gemma4ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
             getattr(config, "num_global_key_value_heads", 0) or 0,
             config.num_key_value_heads,
         )
+
+        # NOTE(RBLN): This is a workaround to materialize Gemma4 full-attention v_proj weights from k_proj as near-copies,
+        # to avoid compilation failure when the value of k and v are identical, and v_norm is present.
+        materialize_v_proj = os.getenv("GEMMA4_MATERIALIZE_V_PROJ", "False").lower() in ("true", "1")
+
         num_attention_heads = config.num_attention_heads
 
         def actual_dims_for_layer(layer_idx: int) -> tuple[int, int]:
@@ -771,10 +793,7 @@ class Gemma4ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
                 if head_dim_diff > 0:
                     w = torch.nn.functional.pad(w, (0, 0, 0, head_dim_diff))
                 return w.reshape(num_attention_heads * padded_head_dim, -1)
-            if (
-                "self_attn.k_proj.weight" in name
-                or "self_attn.v_proj.weight" in name
-            ):
+            if "self_attn.k_proj.weight" in name or "self_attn.v_proj.weight" in name:
                 # K/V: zero-pad head_dim → padded_head_dim, then *replicate*
                 # each kv head padded_num_kv_heads/actual_num_kv times so
                 # GQA grouping at padded_num_kv_heads reproduces the
@@ -809,7 +828,12 @@ class Gemma4ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
                     if match and int(match.group(1)) in k_eq_v_layer_indices:
                         yield name, pad_for_layer(name, weight)
                         v_name = name.replace("k_proj", "v_proj")
-                        yield v_name, pad_for_layer(v_name, weight.clone())
+                        v_weight = (
+                            _gemma4_materialized_v_proj_weight(weight)
+                            if materialize_v_proj
+                            else weight.clone()
+                        )
+                        yield v_name, pad_for_layer(v_name, v_weight)
                         continue
 
                 yield name, pad_for_layer(name, weight)
