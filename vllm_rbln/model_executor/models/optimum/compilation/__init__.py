@@ -15,13 +15,13 @@
 from dataclasses import dataclass
 from typing import Any
 
+from transformers import PretrainedConfig
+
 import optimum.rbln
 from optimum.rbln import (
     RBLNAutoModelForCausalLM,
     RBLNAutoModelForSpeechSeq2Seq,
 )
-from transformers import PretrainedConfig
-
 from vllm_rbln.utils.optimum.registry import (
     get_rbln_model_info,
     is_enc_dec_arch,

@@ -22,7 +22,7 @@ from vllm_rbln.logger import init_logger
 
 from .from_optimum import sync_from_optimum
 from .from_vllm import sync_from_vllm
-from .params import RBLNParams, get_rbln_config
+from .params import RBLNParams, load_compiled_rbln_config
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -91,11 +91,11 @@ def _resolve_rbln_config(vllm_config: VllmConfig) -> dict | None:
     3. cache miss (compilation still needed; stages `cached_model_path`)
     """
     try:
-        rbln_config = get_rbln_config(vllm_config)
+        compiled_rbln_config = load_compiled_rbln_config(vllm_config)
     except Exception as e:
         raise RuntimeError("Failed to get RBLN config: %s", e) from e
-    if rbln_config is not None:
-        return rbln_config
+    if compiled_rbln_config is not None:
+        return compiled_rbln_config
 
     cached_model_path = os.path.join(
         envs.VLLM_CACHE_ROOT,
@@ -106,7 +106,7 @@ def _resolve_rbln_config(vllm_config: VllmConfig) -> dict | None:
     if os.path.exists(os.path.join(cached_model_path, "rbln_config.json")):
         logger.info("Found cached compiled model at %s", cached_model_path)
         vllm_config.model_config.model = cached_model_path
-        return get_rbln_config(vllm_config)
+        return load_compiled_rbln_config(vllm_config)
     return None
 
 
@@ -117,10 +117,10 @@ def sync_vllm_and_optimum(vllm_config: VllmConfig) -> None:
     If no RBLN config is given, validate vLLM config and set necessary parameters
     to default values to compile model internally.
     """
-    rbln_config = _resolve_rbln_config(vllm_config)
-    if rbln_config is None:
+    compiled_rbln_config = _resolve_rbln_config(vllm_config)
+    if compiled_rbln_config is None:
         sync_from_vllm(vllm_config)
         return
 
-    params = RBLNParams.from_rbln_config(vllm_config, rbln_config)
+    params = RBLNParams.from_rbln_config(vllm_config, compiled_rbln_config)
     sync_from_optimum(vllm_config, params)

@@ -30,8 +30,9 @@ from optimum.rbln.transformers.models.decoderonly import (
 )
 from vllm_rbln.utils.optimum.block_size import get_attn_block_size
 from vllm_rbln.utils.optimum.bucket import select_bucket_size
-from .compilation import RBLNCompileSpec
 from vllm_rbln.utils.optimum.registry import get_rbln_model_info
+
+from .compilation import RBLNCompileSpec
 
 logger = init_logger(__name__)
 
@@ -171,7 +172,7 @@ class RBLNOptimumModelBase(nn.Module):
     def init_model(self) -> None:
         hf_config = self.model_config.hf_config
         cached_model_path = self.vllm_config.additional_config.get("cached_model_path")
-        rbln_config = self.vllm_config.additional_config.get("rbln_config", {})
+        rbln_overrides = self.vllm_config.additional_config.get("rbln_config", {})
         _, model_cls_name = get_rbln_model_info(hf_config)
         model_path = self.vllm_config.model_config.model
         if os.path.exists(model_path):
@@ -193,12 +194,11 @@ class RBLNOptimumModelBase(nn.Module):
                 model = _ProducerOptimumModelProxy(visual, visual.rbln_config)
             else:
                 # NOTE:
-                # Only device mapping info is kept in rbln_config for loading the model
-                # Other parameters in rbln_config are already removed
-                # in `sync_vllm_and_optimum` function.
+                # ``sync_vllm_and_optimum`` already narrowed user overrides
+                # down to device-only keys; we forward only those here.
                 model = model_cls.from_pretrained(
                     valid_path,
-                    rbln_config=rbln_config,
+                    rbln_config=rbln_overrides,
                 )
                 self.vllm_config.model_config.model = valid_path
         else:
@@ -216,7 +216,7 @@ class RBLNOptimumModelBase(nn.Module):
                 block_size=get_attn_block_size(self.vllm_config),
                 max_model_len=self.model_config.max_model_len,
                 tp_size=envs.VLLM_RBLN_TP_SIZE,
-                additional_config=rbln_config,
+                additional_config=rbln_overrides,
             )
             model = spec.model_cls.from_pretrained(
                 self.model_config.model, rbln_config=spec.rbln_config

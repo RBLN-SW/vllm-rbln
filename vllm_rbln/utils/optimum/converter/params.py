@@ -54,7 +54,12 @@ def _cfg_get_submodule(cfg: RblnConfigLike, submodule: str) -> RblnConfigLike | 
     return getattr(cfg, submodule, None)
 
 
-def get_rbln_config(vllm_config: VllmConfig) -> dict | None:
+def load_compiled_rbln_config(vllm_config: VllmConfig) -> dict | None:
+    """Load the ``rbln_config.json`` artefact written by optimum-rbln.
+
+    Returns ``None`` if the model directory has no compiled artefact yet
+    (e.g. pre-compile stage or HuggingFace-only model path).
+    """
     rbln_config_path = Path(
         os.path.join(vllm_config.model_config.model, "rbln_config.json")
     )

@@ -14,11 +14,11 @@
 
 from .dispatch import sync_vllm_and_optimum
 from .from_optimum import update_num_blocks
-from .params import RBLNParams, get_rbln_config
+from .params import RBLNParams, load_compiled_rbln_config
 
 __all__ = [
     "RBLNParams",
-    "get_rbln_config",
+    "load_compiled_rbln_config",
     "sync_vllm_and_optimum",
     "update_num_blocks",
 ]

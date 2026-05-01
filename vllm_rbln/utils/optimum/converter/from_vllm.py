@@ -42,8 +42,8 @@ def sync_from_vllm(vllm_config: VllmConfig) -> None:
     to ensure consistency between vLLM and RBLN configurations.
     3. Validate the updated block size
     """
-    rbln_config = vllm_config.additional_config.get("rbln_config", {})
-    params = RBLNParams.from_rbln_config(vllm_config, rbln_config)
+    rbln_overrides = vllm_config.additional_config.get("rbln_config", {})
+    params = RBLNParams.from_rbln_config(vllm_config, rbln_overrides)
 
     if params.batch_size is not None:
         logger.info(
