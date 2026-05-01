@@ -15,7 +15,7 @@
 import hashlib
 import json
 import os
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
@@ -51,19 +51,6 @@ def _strip_runtime_only_keys(obj: dict) -> dict:
     if isinstance(obj, list):
         return [_strip_runtime_only_keys(item) for item in obj]
     return obj
-
-
-def _keep_only_device_keys(obj: dict) -> dict:
-    """Recursively keep only ``devices`` entries from nested dict/list."""
-    result: dict[str, Any] = {}
-    for k, v in obj.items():
-        if k == "devices":
-            result[k] = v
-        elif isinstance(v, dict):
-            filtered = _keep_only_device_keys(v)
-            if filtered:
-                result[k] = filtered
-    return result
 
 
 def _generate_model_path_name(
@@ -135,11 +122,5 @@ def sync_vllm_and_optimum(vllm_config: VllmConfig) -> None:
         sync_from_vllm(vllm_config)
         return
 
-    # Pre-compiled (or cache-hit): the compiled artefact is the source of
-    # truth. Strip the user's additional_config down to device-only keys so
-    # submodule placement can still be overridden.
-    vllm_config.additional_config["rbln_config"] = _keep_only_device_keys(
-        vllm_config.additional_config.get("rbln_config", {})
-    )
     params = RBLNParams.from_rbln_config(vllm_config, rbln_config)
     sync_from_optimum(vllm_config, params)

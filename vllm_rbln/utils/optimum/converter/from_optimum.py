@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
@@ -32,6 +32,19 @@ else:
 logger = init_logger(__name__)
 
 
+def _keep_only_device_keys(obj: dict) -> dict:
+    """Recursively keep only ``devices`` entries from nested dict/list."""
+    result: dict[str, Any] = {}
+    for k, v in obj.items():
+        if k == "devices":
+            result[k] = v
+        elif isinstance(v, dict):
+            filtered = _keep_only_device_keys(v)
+            if filtered:
+                result[k] = filtered
+    return result
+
+
 def sync_from_optimum(
     vllm_config: VllmConfig,
     params: RBLNParams,
@@ -39,6 +52,13 @@ def sync_from_optimum(
     """
     optimum -> vLLM config synchronization
     """
+    # The compiled artefact is the source of truth. Strip the user's
+    # additional_config down to device-only keys so submodule placement
+    # can still be overridden, but no other parameter sneaks in.
+    vllm_config.additional_config["rbln_config"] = _keep_only_device_keys(
+        vllm_config.additional_config.get("rbln_config", {})
+    )
+
     assert params.num_blocks is not None, (
         "num_blocks must be specified in rbln_config.json"
     )
