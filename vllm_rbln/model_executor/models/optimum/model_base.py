@@ -30,7 +30,7 @@ from optimum.rbln.transformers.models.decoderonly import (
 )
 from vllm_rbln.utils.optimum.block_size import get_attn_block_size
 from vllm_rbln.utils.optimum.bucket import select_bucket_size
-from vllm_rbln.utils.optimum.compilation import RBLNCompileSpec
+from .compilation import RBLNCompileSpec
 from vllm_rbln.utils.optimum.registry import get_rbln_model_info
 
 logger = init_logger(__name__)
@@ -185,10 +185,9 @@ class RBLNOptimumModelBase(nn.Module):
             # pre-compiled OR cache-hit
             model_cls = getattr(optimum.rbln, model_cls_name)
             assert model_cls is not None
-            ec_enabled_model = model_cls_name == "RBLNQwen3VLForConditionalGeneration"
             # FIXME decouple producer logic from model_base.py
             if self._is_ec_producer_only():
-                if not ec_enabled_model:
+                if model_cls_name != "RBLNQwen3VLForConditionalGeneration":
                     raise ValueError("Disaggregation is not supported for this model.")
                 visual = model_cls.load_visual_encoder(valid_path)
                 model = _ProducerOptimumModelProxy(visual, visual.rbln_config)
