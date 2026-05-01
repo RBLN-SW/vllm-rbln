@@ -115,12 +115,11 @@ def _resolve_rbln_config(vllm_config: VllmConfig) -> dict | None:
         "compiled_models",
         _generate_model_path_name(vllm_config=vllm_config),
     )
+    vllm_config.additional_config["cached_model_path"] = cached_model_path
     if os.path.exists(os.path.join(cached_model_path, "rbln_config.json")):
         logger.info("Found cached compiled model at %s", cached_model_path)
         vllm_config.model_config.model = cached_model_path
         return get_rbln_config(vllm_config)
-
-    vllm_config.additional_config["cached_model_path"] = cached_model_path
     return None
 
 

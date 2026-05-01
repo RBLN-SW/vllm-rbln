@@ -13,7 +13,6 @@
 # limitations under the License.
 import math
 import os
-from pathlib import Path
 from typing import Any
 
 import torch
@@ -170,40 +169,49 @@ class RBLNOptimumModelBase(nn.Module):
             return int(self.scheduler_config.max_num_seqs)
 
     def init_model(self) -> None:
-        # Check if the model is already compiled and load it;
-        # else compile the model and load it.
-        config = self.model_config.hf_config
-        if isinstance(self.model_config.model, str | Path) and os.path.exists(
-            self.model_config.model
-        ):
-            model_path = Path(self.model_config.model)
-            if model_path.is_dir() and any(model_path.glob("rbln_config.json")):
-                is_compiled_model = True
-            else:
-                is_compiled_model = False
-        else:
-            is_compiled_model = False
-
-        model_name, model_cls_name = get_rbln_model_info(config)
-        model = None
+        hf_config = self.model_config.hf_config
+        cached_model_path = self.vllm_config.additional_config.get("cached_model_path")
         rbln_config = self.vllm_config.additional_config.get("rbln_config", {})
 
-        # If a HuggingFace model (not optimum-compiled) is given,
-        # look up the cached compiled model.
-        # If it does not exist, compile and save it to the cache for future use.
-        if not is_compiled_model:
-            logger.info(
-                "Compiling the model %s. This may take a while...",
-                self.model_config.model,
+        if os.path.exists(self.vllm_config.model_config.model) or os.path.exists(
+            cached_model_path
+        ):
+            if os.path.exists(self.vllm_config.model_config.model):
+                valid_path = self.vllm_config.model_config.model
+            else:
+                valid_path = cached_model_path
+            # pre-compiled OR cache-hit
+            _, model_cls_name = get_rbln_model_info(hf_config)
+            model_cls = getattr(optimum.rbln, model_cls_name)
+            assert model_cls is not None
+            ec_enabled_model = model_cls_name == "RBLNQwen3VLForConditionalGeneration"
+            # FIXME decouple producer logic from model_base.py
+            if self._is_ec_producer_only():
+                if not ec_enabled_model:
+                    raise ValueError("Disaggregation is not supported for this model.")
+                visual = model_cls.load_visual_encoder(valid_path)
+                model = _ProducerOptimumModelProxy(visual, visual.rbln_config)
+            else:
+                # NOTE:
+                # Only device mapping info is kept in rbln_config for loading the model
+                # Other parameters in rbln_config are already removed
+                # in `sync_vllm_and_optimum` function.
+                model = model_cls.from_pretrained(
+                    valid_path,
+                    rbln_config=rbln_config,
+                )
+                self.vllm_config.model_config.model = valid_path
+        else:
+            assert not self._is_ec_producer_only(), (
+                "Disaggregated Encoder is only supported for pre-compiled model"
             )
-            cached_model_path = self.vllm_config.additional_config.get(
-                "cached_model_path", None
-            )
-            assert not os.path.exists(cached_model_path), (
-                f"Compiled model {cached_model_path} cannot be loaded."
-            )
+            # cache miss
+            logger.info("Compiling the model %s ...", self.model_config.model)
+            # If a HuggingFace model (not optimum-compiled) is given,
+            # look up the cached compiled model.
+            # If it does not exist, compile and save it to the cache for future use.
             spec = RBLNCompileSpec.for_architecture(
-                config,
+                hf_config,
                 batch_size=self.scheduler_config.max_num_seqs,
                 block_size=get_attn_block_size(self.vllm_config),
                 max_model_len=self.model_config.max_model_len,
@@ -213,39 +221,8 @@ class RBLNOptimumModelBase(nn.Module):
             model = spec.model_cls.from_pretrained(
                 self.model_config.model, rbln_config=spec.rbln_config
             )
-            model.save_pretrained(str(cached_model_path))
+            model.save_pretrained(cached_model_path)  # type: ignore[attr-defined]
             self.vllm_config.model_config.model = cached_model_path
-
-        # Load the model directly if it is either an optimum-compiled model
-        # or a HuggingFace model that has already been compiled and cached.
-        if model is None:
-            model_cls = getattr(optimum.rbln, model_cls_name)
-            assert model_cls is not None
-            model_path = Path(self.vllm_config.model_config.model)
-            ec_enabled_model = model_cls_name == "RBLNQwen3VLForConditionalGeneration"
-
-            if self._is_ec_producer_only():
-                if not ec_enabled_model:
-                    raise ValueError("Disaggregation is not supported for this model.")
-                visual = model_cls.load_visual_encoder(str(model_path))
-                model = _ProducerOptimumModelProxy(visual, visual.rbln_config)
-            else:
-                rbln_config = self.vllm_config.additional_config.get("rbln_config", {})
-                # NOTE:
-                # Only device mapping info is kept in rbln_config for loading the model
-                # Other parameters in rbln_config are already removed
-                # in `sync_vllm_and_optimum` function.
-                model = model_cls.from_pretrained(
-                    self.vllm_config.model_config.model,
-                    rbln_config=rbln_config,
-                )
-
-            logger.info(
-                "model_name = %s, model_cls_name = %s, model_path = %s",
-                model_name,
-                model_cls_name,
-                model_path,
-            )
 
         self.supports_transcription_only = (
             model_cls_name == "RBLNOptimumWhisperForConditionalGeneration"
@@ -254,7 +231,9 @@ class RBLNOptimumModelBase(nn.Module):
         self.model = model
         self.rbln_model_config = model.rbln_config
         self.attn_impl = (
-            model.get_attn_impl() if hasattr(model, "get_attn_impl") else None
+            model.get_attn_impl()  # type: ignore[func-returns-value]
+            if hasattr(model, "get_attn_impl")
+            else None
         )
 
     # ------------------------------------------------------------------
