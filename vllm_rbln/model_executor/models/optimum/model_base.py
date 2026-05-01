@@ -213,7 +213,7 @@ class RBLNOptimumModelBase(nn.Module):
                 block_size=get_attn_block_size(self.vllm_config),
                 max_model_len=self.model_config.max_model_len,
                 tp_size=envs.VLLM_RBLN_TP_SIZE,
-                additional_config=rbln_overrides,
+                rbln_overrides=rbln_overrides,
             )
             logger.info(
                 "Compiling %s via optimum-rbln (%s) with rbln_config:\n%s",

@@ -36,6 +36,21 @@ from .multimodal import (
 )
 
 
+def _deep_merge(base: dict, overrides: dict) -> None:
+    """Recursively merge ``overrides`` into ``base`` in place.
+
+    Nested dicts are merged key-by-key; non-dict values overwrite. This
+    preserves untouched sub-keys when the user only overrides part of a
+    nested config (e.g. ``language_model.max_seq_len`` for multimodal).
+    """
+    for key, value in overrides.items():
+        existing = base.get(key)
+        if isinstance(value, dict) and isinstance(existing, dict):
+            _deep_merge(existing, value)
+        else:
+            base[key] = value
+
+
 @dataclass
 class RBLNCompileSpec:
     """Resolved (model_cls, rbln_config) ready to feed optimum-rbln."""
@@ -52,7 +67,7 @@ class RBLNCompileSpec:
         block_size: int,
         max_model_len: int,
         tp_size: int,
-        additional_config: dict[str, Any] | None = None,
+        rbln_overrides: dict[str, Any] | None = None,
     ) -> "RBLNCompileSpec":
         """Build a compile spec from vllm-rbln inputs, dispatched by architecture."""
         if is_generation_arch(config):
@@ -75,10 +90,10 @@ class RBLNCompileSpec:
                 f"Compilation is not implemented for architecture {architectures[0]}"
             )
 
-        # FIXME: detect conflicts between spec.rbln_config and additional_config
+        # FIXME: detect conflicts between spec.rbln_config and rbln_overrides
         # so we don't silently overwrite compile-critical fields.
-        if additional_config:
-            spec.rbln_config.update(additional_config)
+        if rbln_overrides:
+            _deep_merge(spec.rbln_config, rbln_overrides)
         return spec
 
     @classmethod
