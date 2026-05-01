@@ -172,16 +172,17 @@ class RBLNOptimumModelBase(nn.Module):
         hf_config = self.model_config.hf_config
         cached_model_path = self.vllm_config.additional_config.get("cached_model_path")
         rbln_config = self.vllm_config.additional_config.get("rbln_config", {})
+        _, model_cls_name = get_rbln_model_info(hf_config)
+        model_path = self.vllm_config.model_config.model
+        if os.path.exists(model_path):
+            valid_path = model_path
+        elif cached_model_path and os.path.exists(cached_model_path):
+            valid_path = cached_model_path
+        else:
+            valid_path = None
 
-        if os.path.exists(self.vllm_config.model_config.model) or os.path.exists(
-            cached_model_path
-        ):
-            if os.path.exists(self.vllm_config.model_config.model):
-                valid_path = self.vllm_config.model_config.model
-            else:
-                valid_path = cached_model_path
+        if valid_path is not None:
             # pre-compiled OR cache-hit
-            _, model_cls_name = get_rbln_model_info(hf_config)
             model_cls = getattr(optimum.rbln, model_cls_name)
             assert model_cls is not None
             ec_enabled_model = model_cls_name == "RBLNQwen3VLForConditionalGeneration"
@@ -203,7 +204,7 @@ class RBLNOptimumModelBase(nn.Module):
                 self.vllm_config.model_config.model = valid_path
         else:
             assert not self._is_ec_producer_only(), (
-                "Disaggregated Encoder is only supported for pre-compiled model"
+                "Disaggregated Encoder is only supported for pre-compiled model."
             )
             # cache miss
             logger.info("Compiling the model %s ...", self.model_config.model)
