@@ -81,4 +81,3 @@ def sync_from_vllm(vllm_config: VllmConfig) -> None:
         vllm_config, vllm_config.scheduler_config.max_num_batched_tokens
     )
 
-    logger.info("Prepared vLLM config for compilation: %s", vllm_config)

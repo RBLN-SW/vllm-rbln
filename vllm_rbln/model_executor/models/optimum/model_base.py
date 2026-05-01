@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
 import math
 import os
 from typing import Any
@@ -205,11 +206,7 @@ class RBLNOptimumModelBase(nn.Module):
             assert not self._is_ec_producer_only(), (
                 "Disaggregated Encoder is only supported for pre-compiled model."
             )
-            # cache miss
-            logger.info("Compiling the model %s ...", self.model_config.model)
-            # If a HuggingFace model (not optimum-compiled) is given,
-            # look up the cached compiled model.
-            # If it does not exist, compile and save it to the cache for future use.
+            # cache miss: compile the model and save it to the cache for reuse.
             spec = RBLNCompileSpec.for_architecture(
                 hf_config,
                 batch_size=self.scheduler_config.max_num_seqs,
@@ -217,6 +214,12 @@ class RBLNOptimumModelBase(nn.Module):
                 max_model_len=self.model_config.max_model_len,
                 tp_size=envs.VLLM_RBLN_TP_SIZE,
                 additional_config=rbln_overrides,
+            )
+            logger.info(
+                "Compiling %s via optimum-rbln (%s) with rbln_config:\n%s",
+                self.model_config.model,
+                spec.model_cls.__name__,
+                json.dumps(spec.rbln_config, indent=2, default=str),
             )
             model = spec.model_cls.from_pretrained(
                 self.model_config.model, rbln_config=spec.rbln_config
