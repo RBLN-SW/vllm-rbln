@@ -31,7 +31,11 @@ def _set_default_block_size(vllm_config: VllmConfig) -> None:
     """Set a default block_size in cache_config if not already set by the user."""
     cache_config = vllm_config.cache_config
     if not cache_config.user_specified_block_size:
-        cache_config.block_size = vllm_config.model_config.max_model_len
+        # optimum-rbln constraint: flash_attn is required when max_model_len > 32768.
+        if vllm_config.model_config.max_model_len > 32768:
+            cache_config.block_size = 4096
+        else:
+            cache_config.block_size = vllm_config.model_config.max_model_len
 
 
 def sync_from_vllm(vllm_config: VllmConfig) -> None:
@@ -80,4 +84,3 @@ def sync_from_vllm(vllm_config: VllmConfig) -> None:
     update_max_num_batched_tokens(
         vllm_config, vllm_config.scheduler_config.max_num_batched_tokens
     )
-
