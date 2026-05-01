@@ -1,0 +1,8 @@
+[run]
+source = vllm_rbln
+branch = True
+omit =
+    vllm_rbln/model_executor/models/*
+    vllm_rbln/model_executor/model_loader/rbln_model_loader.py
+    vllm_rbln/utils/*
+    */optimum*

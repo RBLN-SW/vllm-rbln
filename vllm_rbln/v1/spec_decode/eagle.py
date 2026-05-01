@@ -66,6 +66,7 @@ class RBLNEagleProposer(EagleProposer):
         | None = None,
     ) -> torch.Tensor:
         batch_size = next_token_ids.shape[0]
+        is_prefill = self.runner.is_prefill_phase()
 
         if self.method == "eagle3":
             # assert isinstance(
@@ -97,11 +98,9 @@ class RBLNEagleProposer(EagleProposer):
         num_padded_tokens = None
         num_tokens_across_dp = None
         extra_attn_metadata_args = {}
-        extra_attn_metadata_args["num_tokens"] = (
-            self.runner.input_batch.num_tokens_no_spec
-        )
         extra_attn_metadata_args["positions"] = target_positions.cpu()
         extra_attn_metadata_args["batch_pad"] = batch_bucket_size
+        extra_attn_metadata_args["is_prefill"] = is_prefill
         per_layer_attn_metadata: dict[str, object] = {}
         for attn_group in self.draft_attn_groups:
             attn_metadata = attn_group.get_metadata_builder().build(
@@ -133,7 +132,6 @@ class RBLNEagleProposer(EagleProposer):
             inputs_embeds = self.inputs_embeds[:num_input_tokens]
         else:
             # NOTE(RBLN): reshape tensors in the same way as the RBLN model runner.
-            is_prefill = self.runner.is_prefills()[0]
             if is_prefill:
                 input_ids = self.input_ids.view(batch_size, -1)
                 positions = rbln_utils.pad(
@@ -272,11 +270,9 @@ class RBLNEagleProposer(EagleProposer):
 
             # Rebuild attention metadata
             extra_attn_metadata_args = {}
-            extra_attn_metadata_args["num_tokens"] = (
-                common_attn_metadata.seq_lens.cpu().numpy()
-            )
             extra_attn_metadata_args["positions"] = positions.cpu()
             extra_attn_metadata_args["batch_pad"] = batch_bucket_size
+            extra_attn_metadata_args["is_prefill"] = False
             for attn_group in self.draft_attn_groups:
                 attn_metadata = attn_group.get_metadata_builder().build(
                     common_prefix_len=0,

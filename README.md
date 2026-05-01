@@ -31,7 +31,7 @@ You can install this project using `pip` or from source.
 
 ##### Using uv
 ```bash
-uv pip install vllm-rbln --extra-index-url https://wheels.vllm.ai/0.13.0/cpu --torch-backend cpu
+uv pip install vllm-rbln --extra-index-url https://wheels.vllm.ai/0.18.0/cpu --torch-backend cpu
 ```
 
 ##### Using pip

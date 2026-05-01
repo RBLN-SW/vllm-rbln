@@ -32,15 +32,6 @@ PROMPTS = [
 NUM_SPECULATIVE_TOKENS = 3
 
 
-@pytest.fixture(scope="module")
-def llm_env(monkeypatch_module):
-    monkeypatch_module.setenv("VLLM_RBLN_USE_VLLM_MODEL", "1")
-    monkeypatch_module.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
-    monkeypatch_module.setenv("VLLM_DISABLE_COMPILE_CACHE", "1")
-    monkeypatch_module.setenv("VLLM_RBLN_ENABLE_WARM_UP", "1")
-    monkeypatch_module.setenv("VLLM_RBLN_SAMPLER", "0")
-
-
 def _build_base_llm(method: str) -> LLM:
     base_model_id, _ = get_default_eagle_test_model_ids(method)
     return LLM(
@@ -52,7 +43,6 @@ def _build_base_llm(method: str) -> LLM:
         max_num_seqs=1,
         disable_log_stats=False,
         tensor_parallel_size=1,
-        gpu_memory_utilization=0.5,
     )
 
 
@@ -76,13 +66,20 @@ def _build_eagle_llm(method: str) -> LLM:
         },
         disable_log_stats=False,
         tensor_parallel_size=1,
-        gpu_memory_utilization=0.5,
     )
 
 
-@pytest.mark.parametrize("method", ["eagle", "eagle3"])
-def test_eagle_matches_base_generation(llm_env, method: str) -> None:
-    sampling_params = SamplingParams(temperature=0.0, top_p=1.0, max_tokens=32)
+@pytest.mark.parametrize(
+    ("method", "max_tokens"),
+    [("eagle", 8), ("eagle3", 32)],
+)
+def test_eagle_matches_base_generation(method: str, max_tokens: int) -> None:
+    sampling_params = SamplingParams(
+        temperature=0.0,
+        top_p=1.0,
+        max_tokens=max_tokens,
+        ignore_eos=True,
+    )
 
     base_llm = _build_base_llm(method)
     base_outputs = base_llm.generate(PROMPTS, sampling_params=sampling_params)
