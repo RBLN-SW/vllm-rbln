@@ -281,15 +281,17 @@ class RBLNFlashAttnMLAImpl(MLAAttentionImpl[RBLNFlashAttentionMetadata]):
         # Dispatch to custom kernel
         if attn_metadata.is_prefill:
             kernel = torch.ops.rbln_custom_ops.paged_flash_causal_mla_naive_prefill
+            seq_lens = attn_metadata.seq_lens.to(torch.int16)
         else:
             kernel = torch.ops.rbln_custom_ops.paged_flash_causal_mla_naive_decode
+            seq_lens =  attn_metadata.seq_lens.to(torch.int32) if envs.VLLM_RBLN_BATCH_ATTN_OPT and b_size > 1 else attn_metadata.seq_lens.to(torch.int16)
 
         attn_output = kernel(
             q,
             kv_c_normed,
             k_pe,
             kv_cache,
-            attn_metadata.seq_lens.to(torch.int16),
+            seq_lens,
             attn_metadata.block_tables.to(torch.int16),
             self.scale_tensor,
         )
