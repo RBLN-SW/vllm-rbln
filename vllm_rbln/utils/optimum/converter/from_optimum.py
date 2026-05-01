@@ -47,11 +47,14 @@ def _keep_only_device_keys(obj: dict) -> dict:
 
 def sync_from_optimum(
     vllm_config: VllmConfig,
-    params: RBLNParams,
+    compiled_rbln_config: dict,
 ) -> None:
     """
     optimum -> vLLM config synchronization
     """
+
+    params = RBLNParams.from_rbln_config(vllm_config, compiled_rbln_config)
+
     # The compiled artefact is the source of truth. Strip the user's
     # additional_config down to device-only keys so submodule placement
     # can still be overridden, but no other parameter sneaks in.

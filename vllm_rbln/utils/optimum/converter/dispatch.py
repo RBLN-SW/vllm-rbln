@@ -22,7 +22,7 @@ from vllm_rbln.logger import init_logger
 
 from .from_optimum import sync_from_optimum
 from .from_vllm import sync_from_vllm
-from .params import RBLNParams, load_compiled_rbln_config
+from .params import load_compiled_rbln_config
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -112,15 +112,13 @@ def _resolve_rbln_config(vllm_config: VllmConfig) -> dict | None:
 
 def sync_vllm_and_optimum(vllm_config: VllmConfig) -> None:
     """
-    If compiled model with RBLN config is given,
-    synchronise vLLM config with RBLN config.
-    If no RBLN config is given, validate vLLM config and set necessary parameters
-    to default values to compile model internally.
+    Reconcile vllm_config with the optimum-rbln side.
+
+    If a compiled model exists, it is the source of truth (optimum→vllm).
+    Otherwise stage user overrides for the upcoming compile (vllm→optimum).
     """
     compiled_rbln_config = _resolve_rbln_config(vllm_config)
     if compiled_rbln_config is None:
         sync_from_vllm(vllm_config)
-        return
-
-    params = RBLNParams.from_rbln_config(vllm_config, compiled_rbln_config)
-    sync_from_optimum(vllm_config, params)
+    else:
+        sync_from_optimum(vllm_config, compiled_rbln_config)
