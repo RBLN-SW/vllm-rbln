@@ -161,7 +161,9 @@ class RBLNParams:
                 sub_cfg = _cfg_get_submodule(cfg, submodule_name)
                 if sub_cfg is None:
                     continue
-                kvcache_block_size = _cfg_get(sub_cfg, "kvcache_block_size")
+                kvcache_block_size = _resolve_kvcache_block_size(
+                    sub_cfg, arch=submodule_name
+                )
                 if kvcache_block_size is not None:
                     batch_size = _cfg_get(sub_cfg, "batch_size")
                     max_seq_len = _cfg_get(sub_cfg, "max_seq_len")

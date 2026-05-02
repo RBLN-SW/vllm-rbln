@@ -19,7 +19,6 @@ from typing import Any
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
-from vllm.logger import init_logger
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.models.interfaces_base import VllmModelForTextGeneration
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -29,6 +28,7 @@ import vllm_rbln.rbln_envs as envs
 from optimum.rbln.transformers.models.decoderonly import (
     decoderonly_runtime_utils as runtime_utils,
 )
+from vllm_rbln.logger import init_logger
 from vllm_rbln.utils.optimum.block_size import get_attn_block_size
 from vllm_rbln.utils.optimum.bucket import select_bucket_size
 from vllm_rbln.utils.optimum.registry import get_rbln_model_info
