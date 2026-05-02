@@ -59,15 +59,16 @@ def paged_flash_causal_mla_naive_prefill_impl(
     kv_c_normed: torch.Tensor,
     k_pe: torch.Tensor,
     kv_cache: torch.Tensor,
-    seq_idx: torch.Tensor,
-    block_tables: torch.Tensor,
     scale: torch.Tensor,
+    seq_idx: torch.Tensor,
+    block_table: torch.Tensor,
+    block_size: torch.Tensor,
 ) -> torch.Tensor:
     return _fake_mla_output(q, kv_c_normed)
 
 
 @torch.library.register_fake("rbln_custom_ops::paged_flash_causal_mla_naive_prefill")
-def _(q, kv_c_normed, k_pe, kv_cache, seq_idx, block_tables, scale):
+def _(q, kv_c_normed, k_pe, kv_cache, scale, seq_idx, block_table, block_size):
     return _fake_mla_output(q, kv_c_normed)
 
 
@@ -81,14 +82,30 @@ def paged_flash_causal_mla_naive_decode_impl(
     k_pe: torch.Tensor,
     kv_cache: torch.Tensor,
     seq_idx: torch.Tensor,
-    block_tables: torch.Tensor,
     scale: torch.Tensor,
+    block_table: torch.Tensor,
+    block_size: torch.Tensor,
+    mask: torch.Tensor,
+    valid_batch: torch.Tensor,
+    seq_idx2: torch.Tensor,
 ) -> torch.Tensor:
     return _fake_mla_output(q, kv_c_normed)
 
 
 @torch.library.register_fake("rbln_custom_ops::paged_flash_causal_mla_naive_decode")
-def _(q, kv_c_normed, k_pe, kv_cache, seq_idx, block_tables, scale):
+def _(
+    q,
+    kv_c_normed,
+    k_pe,
+    kv_cache,
+    seq_idx,
+    scale,
+    block_table,
+    block_size,
+    mask,
+    valid_batch,
+    seq_idx2,
+):
     return _fake_mla_output(q, kv_c_normed)
 
 
@@ -278,23 +295,64 @@ class RBLNFlashAttnMLAImpl(MLAAttentionImpl[RBLNFlashAttentionMetadata]):
             [decode_ql_nope, decode_q_pe], dim=-1
         )  # [B, H, S, lora_rank+rope]
 
-        # Dispatch to custom kernel
+        block_size_t = torch.tensor(
+            self.block_size, dtype=q.dtype, device=q.device
+        )
+
         if attn_metadata.is_prefill:
             kernel = torch.ops.rbln_custom_ops.paged_flash_causal_mla_naive_prefill
-            seq_lens = attn_metadata.seq_lens.to(torch.int16)
+            seq_idx = attn_metadata.seq_lens.to(torch.int16)
+            block_table = attn_metadata.block_tables.to(torch.int16)
+            if block_table.dim() > 1:
+                block_table = block_table.flatten()
+
+            attn_output = kernel(
+                q,
+                kv_c_normed,
+                k_pe,
+                kv_cache,
+                self.scale_tensor,
+                seq_idx,
+                block_table,
+                block_size_t,
+            )
         else:
             kernel = torch.ops.rbln_custom_ops.paged_flash_causal_mla_naive_decode
-            seq_lens =  attn_metadata.seq_lens.to(torch.int32) if envs.VLLM_RBLN_BATCH_ATTN_OPT and b_size > 1 else attn_metadata.seq_lens.to(torch.int16)
+            block_table = attn_metadata.block_tables.to(torch.int16)
+            if block_table.dim() == 1:
+                block_table = block_table.unsqueeze(0)
 
-        attn_output = kernel(
-            q,
-            kv_c_normed,
-            k_pe,
-            kv_cache,
-            seq_lens,
-            attn_metadata.block_tables.to(torch.int16),
-            self.scale_tensor,
-        )
+            seq_idx = (
+                attn_metadata.seq_lens.to(torch.int32)
+                if envs.VLLM_RBLN_BATCH_ATTN_OPT and b_size > 1
+                else attn_metadata.seq_lens.to(torch.int16)
+            )
+            if seq_idx.dim() == 1:
+                seq_idx = seq_idx.unsqueeze(0)
+
+            seq_idx2 = seq_idx.clone()
+            mask = attn_metadata.attn_masks
+            num_partitions = block_table.shape[1]
+            valid_batch = torch.full(
+                (num_partitions,),
+                b_size,
+                dtype=torch.int16,
+                device=q.device,
+            )
+
+            attn_output = kernel(
+                q,
+                kv_c_normed,
+                k_pe,
+                kv_cache,
+                seq_idx,
+                self.scale_tensor,
+                block_table,
+                block_size_t,
+                mask,
+                valid_batch,
+                seq_idx2,
+            )
 
         # attn_output: [B, H, S, kv_lora_rank] → V-up projection → [B, S, H*v_head_dim]
         return self._v_up_proj(attn_output, layer.W_UV)
