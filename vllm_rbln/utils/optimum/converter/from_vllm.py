@@ -71,7 +71,9 @@ def sync_from_vllm(vllm_config: VllmConfig) -> None:
 
     _set_default_block_size(vllm_config)
     update_block_size(
-        vllm_config, vllm_config.cache_config.block_size, prefill_chunk_size=params.prefill_chunk_size
+        vllm_config,
+        vllm_config.cache_config.block_size,
+        prefill_chunk_size=params.prefill_chunk_size,
     )
 
     # max_num_batched_tokens must fit both a full-length prefill and a full
