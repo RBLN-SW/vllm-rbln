@@ -1,0 +1,39 @@
+name: CD / Upload Package to Internal PyPI / workflow_call (internal)
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        required: true
+        type: string
+
+jobs:
+  deploy-internal:
+    runs-on: rbln-sw-k8s-general
+    continue-on-error: true
+    steps:
+      - name: Checkout the repository
+        uses: actions/checkout@v4
+        with:
+          repository: rbln-sw/vllm-rbln
+          fetch-depth: 0
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install build dependencies
+        run: |
+          pip3 install packaging setuptools wheel setuptools_scm build
+      - name: Build package
+        run: |
+          python3 -m build --wheel
+      - name: Publish package to internal PyPI
+        run: |
+          pip3 install twine
+          TWINE_REPOSITORY_URL=${{ vars.VLLM_RBLN_INTERNAL_PYPI_URL }} \
+          TWINE_USERNAME=${{ secrets.VLLM_RBLN_INTERNAL_PYPI_USERNAME }} \
+          TWINE_PASSWORD=${{ secrets.VLLM_RBLN_INTERNAL_PYPI_PASSWORD }} \
+          TWINE_NON_INTERACTIVE=1 \
+          twine upload --skip-existing dist/vllm_rbln*.whl
