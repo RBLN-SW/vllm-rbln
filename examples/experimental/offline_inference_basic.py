@@ -23,7 +23,7 @@ def parse_args():
     parser.add_argument("--max-num-seqs", type=int, default=8)
     parser.add_argument("--max-model-len", type=int, default=40 * 1024)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
-    parser.add_argument("--block-size", type=int, default=1024)
+    # parser.add_argument("--block-size", type=int, default=1024)
     parser.add_argument("--enable-expert-parallel", action="store_true")
     return parser.parse_args()
 
@@ -45,7 +45,7 @@ def main():
         max_model_len=args.max_model_len,
         max_num_seqs=args.max_num_seqs,
         tensor_parallel_size=args.tensor_parallel_size,
-        block_size=args.block_size,
+        # block_size=args.block_size,
         enable_chunked_prefill=True,
         max_num_batched_tokens=128,
         gpu_memory_utilization=0.9,

@@ -27,18 +27,6 @@ else:
 logger = init_logger(__name__)
 
 
-def _set_default_block_size(vllm_config: VllmConfig) -> None:
-    """Set a default block_size in cache_config if not already set by the user."""
-    cache_config = vllm_config.cache_config
-    if not cache_config.user_specified_block_size:
-        # optimum-rbln constraint: flash_attn is required when max_model_len > 32768.
-        if vllm_config.model_config.max_model_len > 32768:
-            from optimum.rbln.transformers.modeling_attention_utils import MIN_FLASH_ATTN_PARTITION_LENGTH
-            cache_config.block_size = MIN_FLASH_ATTN_PARTITION_LENGTH
-        else:
-            cache_config.block_size = vllm_config.model_config.max_model_len
-
-
 def sync_from_vllm(vllm_config: VllmConfig) -> None:
     """
     vllm_config.additional_config["rbln_config"] -> optimum
@@ -70,7 +58,16 @@ def sync_from_vllm(vllm_config: VllmConfig) -> None:
         vllm_config.cache_config.block_size = params.kvcache_block_size
         vllm_config.cache_config.user_specified_block_size = params.kvcache_block_size
 
-    _set_default_block_size(vllm_config)
+    if not vllm_config.cache_config.user_specified_block_size:
+        raise ValueError(
+            "`block_size` is required to run optimum-rbln models in vLLM RBLN.\n"
+            "Set it via one of:\n"
+            "  1) vLLM's `block_size` argument "
+            "(e.g. `LLM(block_size=...)` or `--block-size`), or\n"
+            "  2) `kvcache_block_size` under "
+            "`additional_config={'rbln_config': {...}}`.\n"
+        )
+
     update_block_size(
         vllm_config,
         vllm_config.cache_config.block_size,
