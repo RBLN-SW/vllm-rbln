@@ -33,7 +33,8 @@ def _set_default_block_size(vllm_config: VllmConfig) -> None:
     if not cache_config.user_specified_block_size:
         # optimum-rbln constraint: flash_attn is required when max_model_len > 32768.
         if vllm_config.model_config.max_model_len > 32768:
-            cache_config.block_size = 4096
+            from optimum.rbln.transformers.modeling_attention_utils import MIN_FLASH_ATTN_PARTITION_LENGTH
+            cache_config.block_size = MIN_FLASH_ATTN_PARTITION_LENGTH
         else:
             cache_config.block_size = vllm_config.model_config.max_model_len
 
