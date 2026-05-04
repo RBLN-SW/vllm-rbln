@@ -56,7 +56,7 @@ def sync_from_vllm(vllm_config: VllmConfig) -> None:
             params.kvcache_block_size,
         )
         vllm_config.cache_config.block_size = params.kvcache_block_size
-        vllm_config.cache_config.user_specified_block_size = params.kvcache_block_size
+        vllm_config.cache_config.user_specified_block_size = True
 
     if not vllm_config.cache_config.user_specified_block_size:
         raise ValueError(
