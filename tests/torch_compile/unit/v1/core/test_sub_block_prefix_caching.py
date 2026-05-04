@@ -16,6 +16,11 @@
 
 import pytest
 import torch
+from vllm.distributed.kv_events import (
+    AllBlocksCleared,
+    BlockRemoved,
+    BlockStored,
+)
 from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
@@ -26,8 +31,11 @@ from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
+    generate_block_hash_extra_keys,
     get_request_block_hasher,
+    hash_block_tokens,
     init_none_hash,
+    maybe_convert_block_hash,
 )
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -63,46 +71,46 @@ class TestSubBlockHasher:
         self.hasher = SubBlockHasher(sha256, sub_block_size=4)
 
     def test_hash_empty_tokens(self):
-        hashes, _ = self.hasher.hash_tokens([])
+        hashes, _, _ = self.hasher.hash_tokens([])
         assert hashes == []
 
     def test_hash_fewer_than_sub_block(self):
-        hashes, _ = self.hasher.hash_tokens([1, 2, 3])
+        hashes, _, _ = self.hasher.hash_tokens([1, 2, 3])
         assert hashes == []
 
     def test_hash_exact_sub_block(self):
-        hashes, _ = self.hasher.hash_tokens([1, 2, 3, 4])
+        hashes, _, _ = self.hasher.hash_tokens([1, 2, 3, 4])
         assert len(hashes) == 1
         assert isinstance(hashes[0], bytes)
 
     def test_hash_multiple_sub_blocks(self):
-        hashes, _ = self.hasher.hash_tokens([1, 2, 3, 4, 5, 6, 7, 8])
+        hashes, _, _ = self.hasher.hash_tokens([1, 2, 3, 4, 5, 6, 7, 8])
         assert len(hashes) == 2
 
     def test_hash_partial_last_sub_block(self):
-        hashes, _ = self.hasher.hash_tokens([1, 2, 3, 4, 5, 6])
+        hashes, _, _ = self.hasher.hash_tokens([1, 2, 3, 4, 5, 6])
         assert len(hashes) == 1  # Only the first full sub-block.
 
     def test_hashes_are_chained(self):
         # Hashing [1,2,3,4,5,6,7,8] should produce different h1 than
         # hashing [5,6,7,8] alone (because the parent hash differs).
-        hashes_full, _ = self.hasher.hash_tokens([1, 2, 3, 4, 5, 6, 7, 8])
-        hashes_second_only, _ = self.hasher.hash_tokens([5, 6, 7, 8])
+        hashes_full, _, _ = self.hasher.hash_tokens([1, 2, 3, 4, 5, 6, 7, 8])
+        hashes_second_only, _, _ = self.hasher.hash_tokens([5, 6, 7, 8])
         assert hashes_full[1] != hashes_second_only[0]
 
     def test_incremental_hashing(self):
         # Hash in one go.
-        hashes_all, _ = self.hasher.hash_tokens([1, 2, 3, 4, 5, 6, 7, 8])
+        hashes_all, _, _ = self.hasher.hash_tokens([1, 2, 3, 4, 5, 6, 7, 8])
 
         # Hash in two steps.
         # Step 1: first sub-block only (only 4 tokens available).
-        h1, _ = self.hasher.hash_tokens(
+        h1, _, _ = self.hasher.hash_tokens(
             [1, 2, 3, 4],
             parent_hash=None,
             num_hashed_tokens=0,
         )
         # Step 2: all 8 tokens available, start from offset 4.
-        h2, _ = self.hasher.hash_tokens(
+        h2, _, _ = self.hasher.hash_tokens(
             [1, 2, 3, 4, 5, 6, 7, 8],
             parent_hash=h1[0],
             num_hashed_tokens=4,
@@ -156,7 +164,7 @@ class TestSubBlockHasher:
         )
 
         # One-shot: hash all 5 sub-blocks at once.
-        hashes_all, _ = self.hasher.hash_tokens(tokens, request=req)
+        hashes_all, _, _ = self.hasher.hash_tokens(tokens, request=req)
         assert len(hashes_all) == 5
 
         # Incremental: one sub-block at a time.
@@ -167,7 +175,7 @@ class TestSubBlockHasher:
         mm_idx = 0
         for i in range(5):
             off = i * 4
-            h, mm_idx = self.hasher.hash_tokens(
+            h, _, mm_idx = self.hasher.hash_tokens(
                 tokens[: off + 4],
                 parent_hash=parent,
                 num_hashed_tokens=off,
@@ -181,13 +189,13 @@ class TestSubBlockHasher:
 
     def test_deterministic(self):
         tokens = list(range(100, 112))
-        h1, _ = self.hasher.hash_tokens(tokens)
-        h2, _ = self.hasher.hash_tokens(tokens)
+        h1, _, _ = self.hasher.hash_tokens(tokens)
+        h2, _, _ = self.hasher.hash_tokens(tokens)
         assert h1 == h2
 
     def test_different_tokens_different_hashes(self):
-        h1, _ = self.hasher.hash_tokens([1, 2, 3, 4])
-        h2, _ = self.hasher.hash_tokens([5, 6, 7, 8])
+        h1, _, _ = self.hasher.hash_tokens([1, 2, 3, 4])
+        h2, _, _ = self.hasher.hash_tokens([5, 6, 7, 8])
         assert h1 != h2
 
 
@@ -202,7 +210,7 @@ class TestSubBlockIndex:
         sub-block token lists."""
         hasher = SubBlockHasher(sha256, sub_block_size=len(tokens_per_sub_block[0]))
         flat = [t for sub in tokens_per_sub_block for t in sub]
-        hashes, _ = hasher.hash_tokens(flat)
+        hashes, _, _ = hasher.hash_tokens(flat)
         return hashes
 
     def test_empty_no_match(self):
@@ -324,6 +332,7 @@ def _make_manager(
     sub_block_size: int,
     num_blocks: int,
     max_model_len: int = 8192,
+    enable_kv_cache_events: bool = False,
 ) -> RBLNKVCacheManager:
     manager = RBLNKVCacheManager(
         kv_cache_config=_make_kv_cache_config(block_size, num_blocks),
@@ -331,6 +340,7 @@ def _make_manager(
         hash_block_size=block_size,
         sub_block_size=sub_block_size,
         hash_fn=sha256,
+        enable_kv_cache_events=enable_kv_cache_events,
     )
     return manager
 
@@ -2092,3 +2102,471 @@ class TestSubBlockWithKVConnector:
         # The connector should have seen block-aligned count (0, not 4).
         # recorded_computed may have entries from req0 too; check the last.
         assert recorded_computed[-1] == 0  # Block-aligned, no sub-block inflation.
+
+
+# ---------------------------------------------------------------------------
+# KV cache events
+# ---------------------------------------------------------------------------
+
+
+class TestKVCacheEvents:
+    """Sub-block-granular KV cache event emission."""
+
+    BLOCK_SIZE = 8
+    SUB_BLOCK_SIZE = 4
+
+    def test_disabled_yields_no_events(self):
+        manager = _make_manager(self.BLOCK_SIZE, self.SUB_BLOCK_SIZE, num_blocks=10)
+        req = _make_request("0", list(range(self.BLOCK_SIZE)), self.BLOCK_SIZE)
+        _prefill_request(manager, req)
+        assert manager.take_events() == []
+
+    def test_store_at_sub_block_granularity(self):
+        """A cached full big block emits one BlockStored per indexed run
+        at ``block_size = sub_block_size``, covering all R sub-blocks."""
+        manager = _make_manager(
+            self.BLOCK_SIZE,
+            self.SUB_BLOCK_SIZE,
+            num_blocks=10,
+            enable_kv_cache_events=True,
+        )
+        tokens = list(range(self.BLOCK_SIZE))
+        req = _make_request("0", tokens, self.BLOCK_SIZE)
+        _prefill_request(manager, req)
+
+        events = manager.take_events()
+        stored = [e for e in events if isinstance(e, BlockStored)]
+        assert stored, "expected at least one BlockStored"
+        # All stored events are at sub-block granularity.
+        assert all(e.block_size == self.SUB_BLOCK_SIZE for e in stored)
+        # Total sub-block hashes reported covers exactly the R sub-blocks
+        # of the full block.
+        R = self.BLOCK_SIZE // self.SUB_BLOCK_SIZE
+        total_hashes = sum(len(e.block_hashes) for e in stored)
+        assert total_hashes == R
+
+    def test_store_hash_chain_reconstructible(self):
+        """The parent-chained hashes in emitted events match what a
+        consumer would reconstruct by re-hashing the prompt."""
+        manager = _make_manager(
+            self.BLOCK_SIZE,
+            self.SUB_BLOCK_SIZE,
+            num_blocks=10,
+            enable_kv_cache_events=True,
+        )
+        tokens = list(range(2 * self.BLOCK_SIZE))
+        req = _make_request("0", tokens, self.BLOCK_SIZE)
+        _prefill_request(manager, req)
+
+        events = manager.take_events()
+        stored = [e for e in events if isinstance(e, BlockStored)]
+
+        # Reconstruct the expected chain by re-hashing the prompt.
+        hasher = SubBlockHasher(sha256, self.SUB_BLOCK_SIZE)
+        expected_hashes, _, _ = hasher.hash_tokens(tokens)
+        expected = [maybe_convert_block_hash(h) for h in expected_hashes]
+
+        # Flatten emitted events in emission order with their chain parents.
+        flat_chain: list = []
+        for e in stored:
+            if not flat_chain:
+                assert e.parent_block_hash is None
+            else:
+                assert e.parent_block_hash == flat_chain[-1]
+            flat_chain.extend(e.block_hashes)
+
+        # The emitted chain should be a prefix of the expected chain.
+        assert flat_chain == expected[: len(flat_chain)]
+
+    def test_store_token_ids_and_size_match_sub_block(self):
+        """Emitted ``token_ids`` are exactly the prompt tokens the
+        sub-block hashes were computed from, sliced at sub-block size."""
+        manager = _make_manager(
+            self.BLOCK_SIZE,
+            self.SUB_BLOCK_SIZE,
+            num_blocks=10,
+            enable_kv_cache_events=True,
+        )
+        tokens = list(range(self.BLOCK_SIZE))
+        req = _make_request("0", tokens, self.BLOCK_SIZE)
+        _prefill_request(manager, req)
+
+        events = manager.take_events()
+        stored = [e for e in events if isinstance(e, BlockStored)]
+        flat_tokens: list[int] = []
+        for e in stored:
+            # len(token_ids) / block_size == len(block_hashes).
+            assert len(e.token_ids) == len(e.block_hashes) * e.block_size
+            flat_tokens.extend(e.token_ids)
+        assert flat_tokens == tokens
+
+    def test_dedup_on_multi_turn_same_prefix(self):
+        """Two requests caching identical prefix bytes: the second's
+        BlockStored skips the already-indexed hashes (dedup at hash
+        refcount level)."""
+        manager = _make_manager(
+            self.BLOCK_SIZE,
+            self.SUB_BLOCK_SIZE,
+            num_blocks=10,
+            enable_kv_cache_events=True,
+        )
+        tokens = list(range(self.BLOCK_SIZE))
+
+        req0 = _make_request("0", tokens, self.BLOCK_SIZE)
+        _prefill_request(manager, req0)
+        events0 = manager.take_events()
+        stored0 = [e for e in events0 if isinstance(e, BlockStored)]
+        total0 = sum(len(e.block_hashes) for e in stored0)
+        assert total0 > 0
+
+        # Free req0 but keep it cached (mark_cached=True makes it LRU-kept).
+        manager.free(req0)
+
+        # Same prompt, different request id.  The upstream full-block
+        # match hits; no fresh sub-block allocation → no sub-block Store.
+        req1 = _make_request("1", tokens, self.BLOCK_SIZE)
+        _prefill_request(manager, req1)
+        events1 = manager.take_events()
+        stored1 = [e for e in events1 if isinstance(e, BlockStored)]
+        # All hashes in the second turn were already indexed by req0 →
+        # nothing fresh to emit.
+        assert stored1 == []
+
+    def test_remove_only_fires_on_last_holder(self):
+        """Two blocks hold the same prefix hashes (multi-block collision);
+        evicting the first holder fires no BlockRemoved; evicting the
+        second finally fires it."""
+        manager = _make_manager(
+            self.BLOCK_SIZE,
+            self.SUB_BLOCK_SIZE,
+            num_blocks=10,
+            enable_kv_cache_events=True,
+        )
+        R = self.BLOCK_SIZE // self.SUB_BLOCK_SIZE
+        index = _sub_block_index(manager)
+
+        # Build the sub-block hash chain for a prompt of R sub-blocks.
+        tokens = list(range(self.BLOCK_SIZE))
+        hasher = SubBlockHasher(sha256, self.SUB_BLOCK_SIZE)
+        hashes, _, _ = hasher.hash_tokens(tokens)
+        assert len(hashes) == R
+
+        # Two distinct block IDs hold the identical prefix.
+        index.update(5, hashes)
+        index.update(6, hashes)
+        manager.take_events()  # drain any unrelated state
+
+        # Evict the first holder → no BlockRemoved (refcount still 1).
+        manager._on_block_evicted(5)
+        events_first = manager.take_events()
+        assert not any(isinstance(e, BlockRemoved) for e in events_first)
+
+        # Evict the second holder → BlockRemoved carrying all R hashes
+        # (refcount went 1→0 for every sub-block).
+        manager._on_block_evicted(6)
+        events_second = manager.take_events()
+        removed = [e for e in events_second if isinstance(e, BlockRemoved)]
+        assert len(removed) == 1
+        expected = [maybe_convert_block_hash(h) for h in hashes]
+        assert set(removed[0].block_hashes) == set(expected)
+
+    def test_partial_then_full_emits_suffix_only(self):
+        """A partial block indexed with N<R sub-blocks, later promoted to
+        full, emits a fresh Store for the trailing R-N hashes (chained to
+        the already-stored prefix)."""
+        manager = _make_manager(
+            self.BLOCK_SIZE,
+            self.SUB_BLOCK_SIZE,
+            num_blocks=10,
+            enable_kv_cache_events=True,
+        )
+        # First request: 1 sub-block only (partial).  Upstream full-block
+        # match misses; sub-block indexing caches the partial sub-block
+        # via `_index_partial_block` during do_pending_indexing.
+        partial_tokens = list(range(self.SUB_BLOCK_SIZE))
+        req0 = _make_request(
+            "0", partial_tokens, self.BLOCK_SIZE, max_tokens=self.SUB_BLOCK_SIZE
+        )
+        _prefill_request(manager, req0)
+        # mark_cached=True in free() installs synthetic hash, keeping the
+        # indexed hashes around.
+        manager.free(req0)
+
+        events0 = manager.take_events()
+        stored0 = [e for e in events0 if isinstance(e, BlockStored)]
+        total0 = sum(len(e.block_hashes) for e in stored0)
+        # One sub-block was fresh.
+        assert total0 == 1
+
+        # Second request: full block (R sub-blocks) whose first sub-block
+        # shares the partial.  The first sub-block is dedup'd (already
+        # indexed in req0's partial block), only the trailing R-1 are fresh.
+        R = self.BLOCK_SIZE // self.SUB_BLOCK_SIZE
+        full_tokens = list(range(self.BLOCK_SIZE))
+        req1 = _make_request("1", full_tokens, self.BLOCK_SIZE)
+        _prefill_request(manager, req1)
+        events1 = manager.take_events()
+        stored1 = [e for e in events1 if isinstance(e, BlockStored)]
+        total1 = sum(len(e.block_hashes) for e in stored1)
+        assert total1 == R - 1
+        # The fresh suffix's parent must be the already-stored first hash.
+        hasher = SubBlockHasher(sha256, self.SUB_BLOCK_SIZE)
+        expected_hashes, _, _ = hasher.hash_tokens(full_tokens)
+        expected_parent = maybe_convert_block_hash(expected_hashes[0])
+        # First event of the second turn should chain from that.
+        assert stored1[0].parent_block_hash == expected_parent
+
+    def test_reset_emits_cleared(self):
+        """``reset_prefix_cache`` emits ``AllBlocksCleared``."""
+        manager = _make_manager(
+            self.BLOCK_SIZE,
+            self.SUB_BLOCK_SIZE,
+            num_blocks=10,
+            enable_kv_cache_events=True,
+        )
+        tokens = list(range(self.BLOCK_SIZE))
+        req = _make_request("0", tokens, self.BLOCK_SIZE)
+        _prefill_request(manager, req)
+        manager.free(req)
+        manager.take_events()  # drain Store events
+        assert _sub_block_index(manager).all_hashes()
+
+        assert manager.reset_prefix_cache() is True
+        events = manager.take_events()
+        assert [type(e) for e in events] == [AllBlocksCleared]
+
+    def test_take_events_drains(self):
+        """``take_events`` returns the buffered events and clears them."""
+        manager = _make_manager(
+            self.BLOCK_SIZE,
+            self.SUB_BLOCK_SIZE,
+            num_blocks=10,
+            enable_kv_cache_events=True,
+        )
+        tokens = list(range(self.BLOCK_SIZE))
+        req = _make_request("0", tokens, self.BLOCK_SIZE)
+        _prefill_request(manager, req)
+        first = manager.take_events()
+        assert first
+        assert manager.take_events() == []
+
+    def test_extra_keys_round_trip_multimodal(self):
+        """End-to-end: emitted ``token_ids`` + ``extra_keys`` +
+        ``parent_block_hash`` re-hashed via upstream's ``hash_block_tokens``
+        reproduce the emitted ``block_hashes``.  Uses multimodal so
+        ``mm_idx`` advances mid-chain — the path that would silently break
+        if the extra_keys plumbing regressed."""
+        # Layout (sub_block_size=4, block_size=8):
+        #   tokens:     0..3   4..7   8..11  12..15  16..19
+        #   sub-blocks: sb0    sb1    sb2    sb3     sb4
+        #   image A:    [0, 4)
+        #   image B:                  [8,      14)
+        #   image C:                                 [16, 20)
+        mm_features = [
+            MultiModalFeatureSpec(
+                data=MultiModalKwargsItem.dummy(),
+                modality="image",
+                identifier="hash_img_a",
+                mm_position=PlaceholderRange(offset=0, length=4),
+            ),
+            MultiModalFeatureSpec(
+                data=MultiModalKwargsItem.dummy(),
+                modality="image",
+                identifier="hash_img_b",
+                mm_position=PlaceholderRange(offset=8, length=6),
+            ),
+            MultiModalFeatureSpec(
+                data=MultiModalKwargsItem.dummy(),
+                modality="image",
+                identifier="hash_img_c",
+                mm_position=PlaceholderRange(offset=16, length=4),
+            ),
+        ]
+        tokens = list(range(20))
+
+        manager = _make_manager(
+            self.BLOCK_SIZE,
+            self.SUB_BLOCK_SIZE,
+            num_blocks=10,
+            enable_kv_cache_events=True,
+        )
+        req = Request(
+            request_id="mm",
+            prompt_token_ids=tokens,
+            mm_features=mm_features,
+            sampling_params=SamplingParams(max_tokens=5),
+            pooling_params=None,
+            cache_salt="sprinkle",
+            block_hasher=get_request_block_hasher(self.BLOCK_SIZE, sha256),
+        )
+        _prefill_request(manager, req)
+
+        events = manager.take_events()
+        stored = [e for e in events if isinstance(e, BlockStored)]
+        assert stored, "expected BlockStored events"
+
+        # Reconstruct: walk the emitted events in order, rehash each
+        # (token, extra_keys) triple, and check each emitted hash matches.
+        prev_bare_hash: BlockHash | None = None
+        for e in stored:
+            # parent_block_hash wiring must reflect the chain.
+            expected_parent_external = (
+                maybe_convert_block_hash(prev_bare_hash)
+                if prev_bare_hash is not None
+                else None
+            )
+            assert e.parent_block_hash == expected_parent_external
+            # Extra keys must be present (this prompt has MM + cache_salt).
+            assert e.extra_keys is not None
+            assert len(e.extra_keys) == len(e.block_hashes)
+            # Token_ids must align to sub_block_size per hash.
+            assert len(e.token_ids) == len(e.block_hashes) * e.block_size
+
+            # Re-hash each sub-block.
+            parent = prev_bare_hash
+            for i, emitted_hash in enumerate(e.block_hashes):
+                sub_tokens = e.token_ids[i * e.block_size : (i + 1) * e.block_size]
+                extras = e.extra_keys[i]
+                bare = hash_block_tokens(sha256, parent, sub_tokens, extras)
+                assert maybe_convert_block_hash(bare) == emitted_hash
+                parent = bare
+            prev_bare_hash = parent
+
+        # The reconstructed chain must match what
+        # ``generate_block_hash_extra_keys`` produces for the same prompt,
+        # proving the mm_idx threading is faithful through event boundaries.
+        mm_idx = 0
+        parent = None
+        sbs = self.SUB_BLOCK_SIZE
+        expected_chain: list = []
+        for i in range(len(tokens) // sbs):
+            extras, mm_idx = generate_block_hash_extra_keys(
+                req, i * sbs, (i + 1) * sbs, mm_idx
+            )
+            parent = hash_block_tokens(
+                sha256, parent, tokens[i * sbs : (i + 1) * sbs], extras
+            )
+            expected_chain.append(maybe_convert_block_hash(parent))
+
+        flat_emitted: list = []
+        for e in stored:
+            flat_emitted.extend(e.block_hashes)
+        assert flat_emitted == expected_chain[: len(flat_emitted)]
+
+    def test_extra_keys_round_trip_lora(self):
+        """LoRA + cache_salt round-trip: the emitted extras reproduce the
+        emitted hash via upstream's ``hash_block_tokens``, and the
+        ``lora_name``/``lora_id`` fields surface on the event itself."""
+        lora = LoRARequest(
+            lora_name="sales_bot", lora_int_id=42, lora_path="/tmp/ignored"
+        )
+        manager = _make_manager(
+            self.BLOCK_SIZE,
+            self.SUB_BLOCK_SIZE,
+            num_blocks=10,
+            enable_kv_cache_events=True,
+        )
+        tokens = list(range(self.BLOCK_SIZE))
+        req = _make_request(
+            "0",
+            tokens,
+            self.BLOCK_SIZE,
+            cache_salt="pepper",
+            lora_request=lora,
+        )
+        _prefill_request(manager, req)
+
+        stored = [e for e in manager.take_events() if isinstance(e, BlockStored)]
+        assert stored
+
+        for e in stored:
+            assert e.lora_id == 42
+            assert e.lora_name == "sales_bot"
+            assert e.extra_keys is not None
+
+        # Round-trip.
+        parent: BlockHash | None = None
+        for e in stored:
+            for i, emitted_hash in enumerate(e.block_hashes):
+                sub_tokens = e.token_ids[i * e.block_size : (i + 1) * e.block_size]
+                extras = e.extra_keys[i]
+                bare = hash_block_tokens(sha256, parent, sub_tokens, extras)
+                assert maybe_convert_block_hash(bare) == emitted_hash
+                parent = bare
+
+    def test_multi_group_with_events_raises(self):
+        """Fail loudly when events are enabled on a multi-group config.
+
+        Upstream already disables the hybrid KV cache manager when KV
+        events are enabled; this guard catches the case where that gate
+        ever loosens (per-group dedup would otherwise let the same hash
+        emit twice, breaking the set-membership contract).
+        """
+        with pytest.raises(ValueError, match="multi-group"):
+            RBLNKVCacheManager(
+                kv_cache_config=_make_hybrid_kv_cache_config(
+                    self.BLOCK_SIZE, num_blocks=10, sliding_window=16
+                ),
+                max_model_len=8192,
+                hash_block_size=self.BLOCK_SIZE,
+                sub_block_size=self.SUB_BLOCK_SIZE,
+                hash_fn=sha256,
+                enable_kv_cache_events=True,
+            )
+
+    def test_eviction_via_real_pool_path_emits_remove(self):
+        """Forces a real ``BlockPool._maybe_evict_cached_block`` by
+        saturating the pool — covers the monkey-patch wiring and its
+        contract with upstream (the symbol, the return-True-on-eviction
+        signal, and the reset of ``block_hash`` that would otherwise
+        leave the sub-block index stale).
+        """
+        # Small pool so eviction kicks in after a few requests.
+        # One slot is reserved for null_block; leaves 3 allocatable.
+        manager = _make_manager(
+            self.BLOCK_SIZE,
+            self.SUB_BLOCK_SIZE,
+            num_blocks=4,
+            enable_kv_cache_events=True,
+        )
+
+        # Request 0: allocate + cache + free (goes to upstream LRU).
+        req0 = _make_request("0", list(range(self.BLOCK_SIZE)), self.BLOCK_SIZE)
+        _prefill_request(manager, req0)
+        manager.free(req0)
+
+        # Sanity: req0's hashes are indexed and have been Store-announced.
+        assert _sub_block_index(manager).all_hashes()
+        manager.take_events()  # drain setup events
+
+        # Requests 1..N exhaust remaining slots until the pool must evict
+        # req0's (sole) cached block to satisfy a new allocation.
+        removed_events: list[BlockRemoved] = []
+        for i in range(1, 6):
+            req = _make_request(
+                str(i),
+                list(range(i * 1000, i * 1000 + self.BLOCK_SIZE)),
+                self.BLOCK_SIZE,
+            )
+            _prefill_request(manager, req)
+            manager.free(req)
+            for e in manager.take_events():
+                if isinstance(e, BlockRemoved):
+                    removed_events.append(e)
+
+        assert removed_events, (
+            "expected BlockRemoved via the upstream eviction path; the "
+            "monkey-patched _maybe_evict_cached_block hook is the only "
+            "wire-up for that"
+        )
+        # The evicted hashes must be req0's sub-block hashes.
+        hasher = SubBlockHasher(sha256, self.SUB_BLOCK_SIZE)
+        expected_hashes, _, _ = hasher.hash_tokens(list(range(self.BLOCK_SIZE)))
+        expected = {maybe_convert_block_hash(h) for h in expected_hashes}
+        seen: set = set()
+        for ev in removed_events:
+            seen.update(ev.block_hashes)
+        assert expected & seen, (
+            f"expected at least one of req0's hashes in remove events; "
+            f"got {seen}, expected {expected}"
+        )

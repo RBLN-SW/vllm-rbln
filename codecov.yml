@@ -1,0 +1,47 @@
+codecov:
+  require_ci_to_pass: false
+  notify:
+    wait_for_ci: false
+
+coverage:
+  status:
+    project:
+      default:
+        target: auto
+        threshold: 1%
+        if_no_uploads: success
+    patch:
+      default:
+        target: 80%
+        threshold: 1%
+        informational: true
+        if_no_uploads: success
+
+comment:
+  layout: "reach, diff, flags, components, files"
+  behavior: default
+  require_base: false
+  require_head: true
+  require_changes: false
+
+flag_management:
+  default_rules:
+    carryforward: true
+  individual_flags:
+    - name: torch_compile-unit
+      paths:
+        - vllm_rbln/
+    - name: torch_compile-e2e
+      paths:
+        - vllm_rbln/
+
+component_management:
+  individual_components:
+    - component_id: torch_compile
+      name: torch_compile
+      flag_regexes:
+        - torch_compile-.*
+
+ignore:
+  - "tests/"
+  - "**/_version.py"

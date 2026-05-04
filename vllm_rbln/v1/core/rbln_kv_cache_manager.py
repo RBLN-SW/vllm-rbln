@@ -21,15 +21,23 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
 
+from vllm.distributed.kv_events import (
+    MEDIUM_GPU,
+    AllBlocksCleared,
+    BlockRemoved,
+    BlockStored,
+    KVCacheEvent,
+)
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     generate_block_hash_extra_keys,
     hash_block_tokens,
     make_block_hash_with_group_id,
+    maybe_convert_block_hash,
     need_extra_keys,
 )
 from vllm.v1.kv_cache_interface import (
@@ -96,7 +104,7 @@ class SubBlockHasher:
         num_hashed_tokens: int = 0,
         request: Request | None = None,
         start_mm_idx: int = 0,
-    ) -> tuple[list[BlockHash], int]:
+    ) -> tuple[list[BlockHash], list[tuple[Any, ...] | None], int]:
         """Return sub-block hashes for *full* sub-blocks in ``token_ids``.
 
         Args:
@@ -112,13 +120,17 @@ class SubBlockHasher:
                 incremental hashing with multimodal requests.
 
         Returns:
-            ``(hashes, mm_idx)`` — list of ``BlockHash`` values (one
-            per full sub-block) and the updated multimodal index.
+            ``(hashes, extra_keys, mm_idx)``.  ``extra_keys`` is a list
+            (aligned with ``hashes``) of the per-sub-block extra-keys
+            tuples actually mixed into the hash, or ``None`` for
+            sub-blocks that had no extra keys — returned so callers can
+            reproduce the hash when emitting KV events.
         """
         # Based on upstream request_block_hasher() in get_request_block_hasher().
 
         sbs = self.sub_block_size
         hashes: list[BlockHash] = []
+        extra_keys_list: list[tuple[Any, ...] | None] = []
         use_extra = request is not None and need_extra_keys(request)
         # NOTE: We can't simply use `mm_idx=-1`,
         # because it means the last mm input in the entire prompt,
@@ -126,7 +138,7 @@ class SubBlockHasher:
         mm_idx = start_mm_idx
         start = num_hashed_tokens
         for i in range(start, len(token_ids) - sbs + 1, sbs):
-            extra_keys = None
+            extra_keys: tuple[Any, ...] | None = None
             if use_extra:
                 extra_keys, mm_idx = generate_block_hash_extra_keys(
                     request, i, i + sbs, mm_idx
@@ -138,7 +150,8 @@ class SubBlockHasher:
                 extra_keys,
             )
             hashes.append(parent_hash)
-        return hashes, mm_idx
+            extra_keys_list.append(extra_keys)
+        return hashes, extra_keys_list, mm_idx
 
 
 class SubBlockIndex:
@@ -151,29 +164,48 @@ class SubBlockIndex:
         # Reverse index: block_id → list of sub-block hashes (for removal).
         self._block_hashes: dict[int, list[BlockHash]] = {}
 
-    def update(self, block_id: int, sub_block_hashes: list[BlockHash]) -> None:
+    def update(self, block_id: int, sub_block_hashes: list[BlockHash]) -> int:
         """Index or extend a block's sub-block hashes (idempotent).
 
-        If the block is not yet indexed, inserts all hashes.
-        If already indexed, appends any new hashes beyond what is recorded.
+        Returns ``first_fresh_idx``: the index in ``sub_block_hashes`` at
+        which the first globally-fresh (previously absent from the whole
+        index) hash was added by this call.
+        ``first_fresh_idx == len(sub_block_hashes)`` means nothing was fresh.
         """
         existing = self._block_hashes.setdefault(block_id, [])
+        first_fresh_idx = len(sub_block_hashes)
         for i in range(len(existing), len(sub_block_hashes)):
             h = sub_block_hashes[i]
+            bucket = self._hash_to_blocks.setdefault(h, set())
+            if not bucket and i < first_fresh_idx:
+                first_fresh_idx = i
             existing.append(h)
-            self._hash_to_blocks.setdefault(h, set()).add(block_id)
+            bucket.add(block_id)
+        return first_fresh_idx
 
-    def pop(self, block_id: int) -> None:
-        """Remove a block from the index (called on eviction)."""
+    def pop(self, block_id: int) -> list[BlockHash]:
+        """Remove a block from the index (called on eviction).
+
+        Returns the list of hashes whose bucket became empty as a result.
+        An empty list means nothing was removed or every removed hash is still
+        held by another block.
+        """
         hashes = self._block_hashes.pop(block_id, None)
         if hashes is None:
-            return
+            return []
+        fully_removed: list[BlockHash] = []
         for h in hashes:
             s = self._hash_to_blocks.get(h)
             if s is not None:
                 s.discard(block_id)
                 if not s:
                     del self._hash_to_blocks[h]
+                    fully_removed.append(h)
+        return fully_removed
+
+    def all_hashes(self) -> list[BlockHash]:
+        """All currently-indexed hashes (order unspecified)."""
+        return list(self._hash_to_blocks.keys())
 
     def contains(self, block_id: int) -> bool:
         """Return True if the block is indexed."""
@@ -207,9 +239,15 @@ class SubBlockIndex:
 
 @dataclass(slots=True)
 class _SubHashState:
-    """Per-request cached sub-block hashes and multimodal index."""
+    """Per-request cached sub-block hashes and multimodal index.
+
+    ``extra_keys`` is aligned 1:1 with ``hashes`` and records the
+    extra-keys tuple mixed into each sub-block's hash (or ``None`` when
+    the sub-block had no extras).
+    """
 
     hashes: list[BlockHash]
+    extra_keys: list[tuple[Any, ...] | None] = field(default_factory=list)
     mm_idx: int = 0
 
 
@@ -327,6 +365,22 @@ class RBLNKVCacheManager(KVCacheManager):
         # taken before allocate_slots, used to narrow the scan range.
         self._pending_indexing: dict[str, tuple[Request, tuple[int, ...]]] = {}
 
+        # Sub-block-granular KV event queue. We intercept the upstream pool's
+        # big-block event emission and publish sub-block events instead.
+        self.enable_kv_cache_events = self.block_pool.enable_kv_cache_events
+        self.block_pool.enable_kv_cache_events = False
+        self._sub_block_event_queue: list[KVCacheEvent] = []
+
+        # Upstream gates hybrid (multi-group) KV cache manager off when
+        # KV events are enabled (see vllm/config/vllm.py
+        # ``need_disable_hybrid_kv_cache_manager``).
+        if self.enable_kv_cache_events and len(self._group_infos) > 1:
+            raise ValueError(
+                "KV cache events are not supported with multi-group (hybrid) "
+                "sub-block caching. Upstream disables the hybrid KV cache "
+                "manager when KV events are enabled."
+            )
+
         self._install_eviction_hook()
 
     def get_computed_blocks_sub_block(
@@ -347,7 +401,7 @@ class RBLNKVCacheManager(KVCacheManager):
         if request.skip_reading_prefix_cache:
             return None
 
-        sub_hashes = self._get_or_compute_sub_hashes(request)
+        sub_hashes = self._get_or_compute_sub_hashes(request).hashes
 
         min_matched: int | None = None
         group_matches: list[_GroupPartialMatch] = []
@@ -551,16 +605,30 @@ class RBLNKVCacheManager(KVCacheManager):
         """Reset prefix cache including all per-group sub-block indices."""
         result = super().reset_prefix_cache()
         if result:
+            if self.enable_kv_cache_events:
+                self._sub_block_event_queue.append(AllBlocksCleared())
             for gi in self._group_infos:
                 gi.sub_block_index = SubBlockIndex()
             self._pending_indexing.clear()
         return result
 
+    def take_events(self) -> list[KVCacheEvent]:
+        """Return and clear the sub-block KV event queue.
+
+        Overrides upstream to return sub-block-granular events (big-block
+        emission from the underlying pool is suppressed in ``__init__``).
+        """
+        if not self.enable_kv_cache_events:
+            return []
+        events = self._sub_block_event_queue
+        self._sub_block_event_queue = []
+        return events
+
     # -- sub-block hash helpers ---------------------------------------------
 
-    def _get_or_compute_sub_hashes(self, request: Request) -> list[BlockHash]:
-        """Return the sub-block hashes for the request, computing new ones if
-        the request has grown since the last call.  Group-independent."""
+    def _get_or_compute_sub_hashes(self, request: Request) -> _SubHashState:
+        """Return the sub-block hash state for the request, computing new ones if
+        the request has grown since the last call. Group-independent."""
         state = self._req_sub_hashes.get(request.request_id)
         if state is None:
             state = _SubHashState(hashes=[])
@@ -569,7 +637,7 @@ class RBLNKVCacheManager(KVCacheManager):
         num_hashed_tokens = len(state.hashes) * self.sub_block_size
         parent_hash = state.hashes[-1] if state.hashes else None
 
-        new_hashes, new_mm_idx = self.sub_block_hasher.hash_tokens(
+        new_hashes, new_extra_keys, new_mm_idx = self.sub_block_hasher.hash_tokens(
             request.all_token_ids,
             parent_hash=parent_hash,
             num_hashed_tokens=num_hashed_tokens,
@@ -578,8 +646,9 @@ class RBLNKVCacheManager(KVCacheManager):
         )
         if new_hashes:
             state.hashes.extend(new_hashes)
+            state.extra_keys.extend(new_extra_keys)
             state.mm_idx = new_mm_idx
-        return state.hashes
+        return state
 
     # -- sub-block index maintenance ----------------------------------------
 
@@ -610,14 +679,15 @@ class RBLNKVCacheManager(KVCacheManager):
         gi: _GroupInfo,
     ) -> None:
         """Index a newly cached full block's sub-blocks."""
-        sub_hashes = self._get_or_compute_sub_hashes(request)
+        state = self._get_or_compute_sub_hashes(request)
         sbpb = gi.sub_blocks_per_block
         sub_start = blk_idx * sbpb
-        sub_end = min(sub_start + sbpb, len(sub_hashes))
+        sub_end = min(sub_start + sbpb, len(state.hashes))
         if sub_end <= sub_start:
             return
-        blk_sub_hashes = sub_hashes[sub_start:sub_end]
-        gi.sub_block_index.update(blk.block_id, blk_sub_hashes)
+        blk_sub_hashes = state.hashes[sub_start:sub_end]
+        first_fresh_idx = gi.sub_block_index.update(blk.block_id, blk_sub_hashes)
+        self._emit_block_stored(request, state, sub_start, sub_end, first_fresh_idx)
 
     def _index_partial_block(self, request: Request, mark_cached: bool) -> None:
         """Index sub-blocks of the last partial block per group.
@@ -627,7 +697,7 @@ class RBLNKVCacheManager(KVCacheManager):
                 upstream LRU preserves the block.
         """
         num_computed_tokens = request.num_computed_tokens
-        sub_hashes = self._get_or_compute_sub_hashes(request)
+        state = self._get_or_compute_sub_hashes(request)
         blocks = self.coordinator.get_blocks(request.request_id)
 
         for gid, gi in enumerate(self._group_infos):
@@ -647,13 +717,16 @@ class RBLNKVCacheManager(KVCacheManager):
 
             sbpb = gi.sub_blocks_per_block
             sub_start = last_blk_idx * sbpb
-            sub_end = min(sub_start + num_sub_blocks, len(sub_hashes))
+            sub_end = min(sub_start + num_sub_blocks, len(state.hashes))
             if sub_end <= sub_start:
                 continue
-            partial_sub_hashes = sub_hashes[sub_start:sub_end]
+            partial_sub_hashes = state.hashes[sub_start:sub_end]
 
             # Index in the group's sub-block index.
-            gi.sub_block_index.update(blk.block_id, partial_sub_hashes)
+            first_fresh_idx = gi.sub_block_index.update(
+                blk.block_id, partial_sub_hashes
+            )
+            self._emit_block_stored(request, state, sub_start, sub_end, first_fresh_idx)
 
             if mark_cached:
                 # Give the block a synthetic block_hash so the upstream block pool
@@ -674,9 +747,11 @@ class RBLNKVCacheManager(KVCacheManager):
                 self.block_pool.cached_block_hash_to_block.insert(synthetic_hash, blk)
 
     def _on_block_evicted(self, block_id: int) -> None:
-        """Called when a block is evicted — remove from index."""
+        """Called when a block is evicted — remove from index and emit
+        ``BlockRemoved`` for hashes whose last holder was this block."""
         for gi in self._group_infos:
-            gi.sub_block_index.pop(block_id)
+            fully_removed = gi.sub_block_index.pop(block_id)
+            self._emit_block_removed(fully_removed)
 
     def _install_eviction_hook(self) -> None:
         # Monkey-patch the block pool's eviction method to also clean up the
@@ -692,3 +767,62 @@ class RBLNKVCacheManager(KVCacheManager):
             return result
 
         self.block_pool._maybe_evict_cached_block = evict_with_index_cleanup
+
+    # -- event emission ------------------------------------------------------
+
+    def _emit_block_stored(
+        self,
+        request: Request,
+        state: _SubHashState,
+        sub_start: int,
+        sub_end: int,
+        first_fresh_idx: int,
+    ) -> None:
+        """Emit a single ``BlockStored`` for the fresh suffix of one update.
+
+        The caller has just indexed ``state.hashes[sub_start:sub_end]`` via
+        ``SubBlockIndex.update``, which returned ``first_fresh_idx``.
+        The fresh suffix we emit is
+        ``state.hashes[sub_start + first_fresh_idx : sub_end]``.
+        """
+        if not self.enable_kv_cache_events:
+            return
+        slice_len = sub_end - sub_start
+        if first_fresh_idx >= slice_len:
+            return
+        fresh_start = sub_start + first_fresh_idx
+        fresh_hashes = state.hashes[fresh_start:sub_end]
+        parent_hash = state.hashes[fresh_start - 1] if fresh_start > 0 else None
+        tok_start = fresh_start * self.sub_block_size
+        tok_end = sub_end * self.sub_block_size
+        token_ids = request.all_token_ids[tok_start:tok_end]
+        extras = state.extra_keys[fresh_start:sub_end]
+        self._sub_block_event_queue.append(
+            BlockStored(
+                block_hashes=[maybe_convert_block_hash(h) for h in fresh_hashes],
+                parent_block_hash=(
+                    maybe_convert_block_hash(parent_hash)
+                    if parent_hash is not None
+                    else None
+                ),
+                token_ids=list(token_ids),
+                block_size=self.sub_block_size,
+                lora_id=(
+                    request.lora_request.adapter_id if request.lora_request else None
+                ),
+                medium=MEDIUM_GPU,
+                lora_name=(request.lora_request.name if request.lora_request else None),
+                extra_keys=extras if any(e is not None for e in extras) else None,
+            )
+        )
+
+    def _emit_block_removed(self, fully_removed: list[BlockHash]) -> None:
+        """Emit a single ``BlockRemoved`` for hashes whose last holder is gone."""
+        if not self.enable_kv_cache_events or not fully_removed:
+            return
+        self._sub_block_event_queue.append(
+            BlockRemoved(
+                block_hashes=[maybe_convert_block_hash(h) for h in fully_removed],
+                medium=MEDIUM_GPU,
+            )
+        )

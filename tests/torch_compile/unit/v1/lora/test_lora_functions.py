@@ -35,10 +35,8 @@ def make_lora_request(lora_id: int):
 
 def test_lora_functions_sync(monkeypatch):
     monkeypatch.setenv("RBLN_PROFILER", "0")
-    monkeypatch.setenv("RBLN_KERNEL_MODEL", "triton")
-    monkeypatch.setenv("VLLM_USE_V1", "1")
     monkeypatch.setenv("VLLM_RBLN_USE_VLLM_MODEL", "1")
-    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    monkeypatch.setenv("VLLM_RBLN_ENABLE_WARM_UP", "0")
 
     max_loras = 4
     engine_args = EngineArgs(

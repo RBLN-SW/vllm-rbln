@@ -97,6 +97,13 @@ class RBLNScheduler(Scheduler):
                 self.block_size,
                 sub_block_size,
             )
+            if self.enable_kv_cache_events:
+                logger.info(
+                    "NOTE that KV cache events emit at sub_block_size granularity. "
+                    "Cache-aware routers must set token processing block size to "
+                    "sub_block_size=%d.",
+                    sub_block_size,
+                )
 
     def schedule(self) -> RBLNSchedulerOutput:
         # Copied from vllm.v1.core.sched.Scheduler.schedule: https://github.com/vllm-project/vllm/blob/v0.18.0/vllm/v1/core/sched/scheduler.py#L338-L927
