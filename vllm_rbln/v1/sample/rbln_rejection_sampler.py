@@ -658,3 +658,8 @@ def torch_sample_recovered_tokens_kernel(
         recovered_token_ids[s:e] = scores.argmax(dim=-1).to(recovered_token_ids.dtype)
 
     return recovered_token_ids
+
+
+def select_valid_request_sampling_metadata(base_tensor, num_draft_tokens):
+    mask = torch.tensor([ids > 0 for ids in num_draft_tokens])
+    return base_tensor[mask]
