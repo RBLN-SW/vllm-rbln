@@ -21,7 +21,6 @@ import torch
 from vllm.sampling_params import _SAMPLING_EPS
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
@@ -40,6 +39,8 @@ MAX_SPEC_LEN = 32
 def rejection_sample(
     draft_token_ids: torch.Tensor,
     target_probs: torch.Tensor,
+    top_k: torch.Tensor | None,
+    top_p: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     num_requests = draft_token_ids.shape[0]
     max_spec_len = draft_token_ids.shape[1]
@@ -53,6 +54,8 @@ def rejection_sample(
 def rejection_sample_fake(
     draft_token_ids: torch.Tensor,
     target_probs: torch.Tensor,
+    top_k: torch.Tensor | None,
+    top_p: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     num_requests = draft_token_ids.shape[0]
     max_spec_len = draft_token_ids.shape[1]
@@ -65,10 +68,14 @@ def rejection_sample_fake(
 def rbln_random_sample(
     draft_token_ids: torch.Tensor,
     target_probs: torch.Tensor,
+    top_k: torch.Tensor | None,
+    top_p: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     output_tokens, acceptance_rate = torch.ops.rbln.rejection_sample(
         draft_token_ids,
         target_probs,
+        top_k,
+        top_p,
     )
     return output_tokens, acceptance_rate
 
@@ -233,7 +240,7 @@ class RBLNRejectionSampler(RejectionSampler):
         output_token_ids = torch.full(
             (batch_size, max_spec_len + 1),
             PLACEHOLDER_TOKEN_ID,
-            dtype=torch.int32,  # Consistent with SamplerOutput.sampled_token_ids.
+            dtype=torch.int64,  # Consistent with SamplerOutput.sampled_token_ids.
         )
 
         # ------------------------------------------------------------------
@@ -248,9 +255,23 @@ class RBLNRejectionSampler(RejectionSampler):
         reshaped_target_probs = target_probs.reshape(-1, max_spec_len, vocab_size).to(
             torch.float16
         )
+
+        # Get expanded top_k and top_p tensors.
+        top_k = None
+        top_p = None
+        if sampling_metadata.top_k is not None:
+            top_k = select_valid_request_sampling_metadata(
+                sampling_metadata.top_k, num_draft_tokens
+            )
+        if sampling_metadata.top_p is not None:
+            top_p = select_valid_request_sampling_metadata(
+                sampling_metadata.top_p, num_draft_tokens
+            )
         selected_token_ids, acceptance_rate = self.compiled_rejection_sample(
             reshaped_draft_token_ids,
             reshaped_target_probs,
+            top_k,
+            top_p,
         )
 
         # ------------------------------------------------------------------
@@ -299,7 +320,7 @@ class RBLNRejectionSampler(RejectionSampler):
             device=output_token_ids.device,
             dtype=torch.bool,
         )  # [batch_size]
-        bonus = bonus_token_ids.squeeze(-1).to(torch.int32)
+        bonus = bonus_token_ids.squeeze(-1).to(torch.int64)
 
         # 4a) Active rows: composed draft/recovered/placeholder in first K cols.
         output_token_ids[active_mask, :max_spec_len] = active_out
@@ -363,25 +384,8 @@ def apply_sampling_constraints(
     # NOTE(woosuk): Update `logits` in place to avoid allocating a new tensor.
     logits.div_(temperature.unsqueeze(-1))
 
-    # Get expanded top_k and top_p tensors.
-    top_k = None
-    if sampling_metadata.top_k is not None:
-        top_k = expand_batch_to_tokens(
-            sampling_metadata.top_k,
-            cu_num_draft_tokens,
-            num_tokens,
-        )
-    top_p = None
-    if sampling_metadata.top_p is not None:
-        top_p = expand_batch_to_tokens(
-            sampling_metadata.top_p,
-            cu_num_draft_tokens,
-            num_tokens,
-        )
-
-    # NOTE(woosuk): `apply_top_k_top_p` uses sorting to calculate the mask,
-    # which is slow for large vocab sizes. This may cause performance issues.
-    return apply_top_k_top_p(logits, top_k, top_p)
+    # NOTE(eunji.lee): top_k and top_p are applied together during rejection sampling.
+    return logits
 
 
 def expand_batch_to_tokens(
