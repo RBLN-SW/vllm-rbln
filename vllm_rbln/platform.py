@@ -319,7 +319,9 @@ class RblnPlatform(Platform):
         if attn_selector_config.use_sparse:
             raise NotImplementedError("Sparse Attention is not supported on RBLN.")
 
-        attn_backend_cls = AttentionBackendEnum.FLASH_ATTN.get_path()
+        attn_backend_cls = (
+            "vllm_rbln.v1.attention.backends.flash_attention.RBLNAttentionBackend"
+        )
         logger.info("Using RBLN Attention Backend: %s", attn_backend_cls)
 
         return attn_backend_cls
