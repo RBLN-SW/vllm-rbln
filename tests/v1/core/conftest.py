@@ -18,6 +18,6 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def skip_prepare_compile():
-    with patch("vllm_rbln.utils.optimum.converter.dispatch.sync_vllm_and_optimum"):
+def skip_sync_vllm_and_optimum():
+    with patch("vllm_rbln.platform.sync_vllm_and_optimum"):
         yield
