@@ -22,19 +22,37 @@ jobs:
         vllm_version:
           - "0.18.0+cpu"
     steps:
-      - name: Dispatch to fsw-integration (vllm ${{ matrix.vllm_version }})
-        uses: Wandalen/wretry.action@v3
+      - name: Compute distinct id
+        id: distinct
+        shell: bash
+        run: |
+          echo "id=nightly-e2e-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.vllm_version }}" >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch fsw-integration nightly e2e and capture run id
+        id: dispatch
+        uses: Codex-/return-dispatch@v2
         with:
-          action: peter-evans/repository-dispatch@v4
-          attempt_limit: 5
-          attempt_delay: 2000
-          with: |
-            token: ${{ secrets.GIT_PAT }}
-            repository: rebellions-sw/fsw-integration
-            event-type: vllm-rbln-nightly-e2e
-            client-payload: |
-              {
-                "ref": "${{ inputs.ref || 'dev' }}",
-                "actor": "${{ github.actor }}",
-                "vllm_version": "${{ matrix.vllm_version }}"
-              }
+          token: ${{ secrets.GIT_PAT }}
+          ref: dev
+          repo: fsw-integration
+          owner: rebellions-sw
+          workflow: vllm_rbln_nightly_e2e.yaml
+          workflow_inputs: |
+            {
+              "environment": "vllm_rbln-nightly",
+              "vllm_rbln_ref": "${{ inputs.ref || 'dev' }}",
+              "vllm_version": "${{ matrix.vllm_version }}",
+              "distinct_id": "${{ steps.distinct.outputs.id }}"
+            }
+          workflow_timeout_seconds: 300
+          distinct_id: ${{ steps.distinct.outputs.id }}
+
+      - name: Await fsw-integration nightly e2e completion
+        uses: Codex-/await-remote-run@v1
+        with:
+          token: ${{ secrets.GIT_PAT }}
+          repo: fsw-integration
+          owner: rebellions-sw
+          run_id: ${{ steps.dispatch.outputs.run_id }}
+          run_timeout_seconds: 7200
+          poll_interval_ms: 60000
