@@ -19,5 +19,5 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def skip_prepare_compile():
-    with patch("vllm_rbln.utils.optimum.converter.dispatch.sync_from_vllm"):
+    with patch("vllm_rbln.utils.optimum.converter.dispatch.sync_vllm_and_optimum"):
         yield
