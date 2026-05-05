@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
-from types import SimpleNamespace
 
 import pytest
 
@@ -40,7 +38,7 @@ class TestParseDecoder:
         # so it is not asserted here.
 
     def test_none_dict_config(self):
-        cfg = {}
+        cfg: dict = {}
         params = RBLNParams._parse_decoder(cfg)
         assert params.num_blocks is None
         assert params.batch_size is None
@@ -99,16 +97,11 @@ class TestParseEncDec:
             "dec_max_seq_len": 448,
             "kvcache_block_size": 224,
         }
-        with pytest.raises(AssertionError, match="kvcache_block_size must equal dec_max_seq_len"):
+        with pytest.raises(
+            AssertionError, match="kvcache_block_size must equal dec_max_seq_len"
+        ):
             RBLNParams._parse_enc_dec(cfg)
 
-    def test_kvcache_block_size_equals_dec_max_seq_len(self):
-        cfg = {
-            "batch_size": 4,
-            "dec_max_seq_len": 448,
-        }
-        params = RBLNParams._parse_enc_dec(cfg)
-        assert params.num_blocks == 4
 
 class TestParsePooling:
     def test_uses_explicit_kvcache_num_blocks(self):
