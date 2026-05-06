@@ -1,4 +1,4 @@
-name: Trigger FSW PR CI for vLLM-RBLN
+name: CI / FSW PR / Trigger on PR
 
 on:
   pull_request:

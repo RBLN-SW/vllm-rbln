@@ -1,4 +1,4 @@
-name: pre-commit
+name: CI / Pre-commit / workflow_call
 
 on:
   workflow_call:
