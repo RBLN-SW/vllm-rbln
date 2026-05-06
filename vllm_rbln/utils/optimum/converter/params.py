@@ -112,9 +112,6 @@ class RBLNParams:
     def _parse_enc_dec(cls, cfg: RblnConfigLike) -> "RBLNParams":
         max_seq_len = _cfg_get(cfg, "dec_max_seq_len")
         batch_size = _cfg_get(cfg, "batch_size")
-        _assert_block_size_equals_seq_len(
-            cfg, max_seq_len, arch="enc_dec", seq_len_field="dec_max_seq_len"
-        )
         num_blocks = _cfg_get(cfg, "kvcache_num_blocks")
         if num_blocks is None and batch_size is not None:
             num_blocks = batch_size
@@ -129,9 +126,6 @@ class RBLNParams:
     def _parse_pooling(cls, cfg: RblnConfigLike) -> "RBLNParams":
         max_seq_len = _cfg_get(cfg, "max_seq_len")
         batch_size = _cfg_get(cfg, "batch_size")
-        _assert_block_size_equals_seq_len(
-            cfg, max_seq_len, arch="pooling", seq_len_field="max_seq_len"
-        )
         # For pooling models each sequence occupies exactly one block.
         num_blocks = _cfg_get(cfg, "kvcache_num_blocks")
         if num_blocks is None and batch_size is not None:
@@ -181,21 +175,6 @@ class RBLNParams:
             batch_size=batch_size,
             max_seq_len=max_seq_len,
             kvcache_block_size=kvcache_block_size,
-        )
-
-
-def _assert_block_size_equals_seq_len(
-    cfg: RblnConfigLike,
-    max_seq_len: int | None,
-    *,
-    arch: str,
-    seq_len_field: str,
-) -> None:
-    """Enforce ``kvcache_block_size == max_seq_len`` for single-block architectures."""
-    kvcache_block_size = _resolve_kvcache_block_size(cfg, arch=arch)
-    if kvcache_block_size is not None and max_seq_len is not None:
-        assert kvcache_block_size == max_seq_len, (
-            f"For {arch} models, kvcache_block_size must equal {seq_len_field}."
         )
 
 
