@@ -53,16 +53,7 @@ def sql_lora_path() -> str:
     return snapshot_download(repo_id=SQL_LORA_MODEL_ID)
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason=(
-        "Passes locally on RBLN-CA25 with 1B base + 1B SQL LoRA, but the FSW "
-        "nightly e2e-lora shard runs on a different NPU/runner setup where "
-        "two-module (prefill/decode) runtime instantiation has historically "
-        "hit `[const_buf] Failed to alloc const buf` (EPERM). Marked xfail "
-        "until that environment is verified."
-    ),
-)
+@pytest.mark.xfail(strict=False)
 def test_basic_lora_sql_prompt(llm: LLM, sql_lora_path: str) -> None:
     sampling_params = SamplingParams(temperature=0.0, max_tokens=128)
 
