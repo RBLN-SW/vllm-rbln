@@ -15,6 +15,7 @@
 import inspect
 import torch
 import torch.nn as nn
+from vllm.sampling_params import _SAMPLING_EPS
 
 try:
     import torch.rbln
@@ -35,8 +36,6 @@ from vllm_rbln.v1.sample.ops.penalties import (
 import vllm_rbln.rbln_envs as envs
 
 logger = init_logger(__name__)
-
-_SAMPLING_EPS = 1e-5
 
 
 def random_sample(
@@ -77,12 +76,6 @@ def apply_top_k_top_p(
     a dual-pivot algorithm is implemented in rebel and
     it will be used to avoid the sorting step and improve efficiency.
     """
-    # NOTE This function is used when falling back to eager execution
-    # due to RBLN compilation failure.
-    # If both k and p are None, return the argmax (greedy sampling).
-    if k is None and p is None:
-        return logits.argmax(dim=-1).view(-1)
-
     logits_sort, logits_idx = logits.sort(dim=-1, descending=False, stable=True)
     if k is not None:
         # Apply top-k.
@@ -133,6 +126,26 @@ def rbln_top_k_top_p_sample(
     # It requires softmax prior to calling the op.
     probs = torch.nn.functional.softmax(logits, dim=-1)
     sampled = torch.ops.rbln.top_k_top_p(probs, k, p)
+    return sampled
+
+
+@torch.library.custom_op("rbln::argmax", mutates_args=())
+def argmax(logits: torch.Tensor) -> torch.Tensor:
+    return torch.empty(logits.shape[:-1], dtype=torch.int64, device=logits.device)
+
+
+@torch.library.register_fake("rbln::argmax")
+def argmax_fake(logits: torch.Tensor) -> torch.Tensor:
+    return torch.empty(logits.shape[:-1], dtype=torch.int64, device=logits.device)
+
+
+def rbln_greedy_sample(logits: torch.Tensor) -> torch.Tensor:
+    """
+    Implementation of RBLN greedy sampling.
+    To avoid self parameter issues when torch.compile is used,
+    we define this as a static method.
+    """
+    sampled = torch.ops.rbln.argmax(logits)
     return sampled
 
 
@@ -220,6 +233,30 @@ class RBLNSampler(VLLMSampler):
                 f"RBLN Sampling does not support logprobs_mode: {logprobs_mode}. "
                 "Using native sampler instead."
             )
+        options = {
+            "compile_context": compile_context
+            if compile_context
+            else (
+                rebel.CompileContext(use_global_ctx=True)
+                if "use_global_ctx"
+                in inspect.signature(rebel.CompileContext).parameters
+                else rebel.CompileContext()
+            )
+        }
+        if envs.VLLM_RBLN_COMPILE_STRICT_MODE:
+            options["mode"] = "strict"
+
+        if has_torch_rbln:
+            options["use_global_ctx"] = True
+            options["global_device_id"] = 0
+            options["tensor_parallel_size"] = 1
+        self.greedy_sample = torch.compile(
+            rbln_greedy_sample,
+            dynamic=False,
+            fullgraph=True,
+            backend="rbln",
+            options=options,
+        )
 
     def apply_penalties(
         self,
@@ -238,13 +275,6 @@ class RBLNSampler(VLLMSampler):
                 output_token_ids,
             )
         return logits
-
-    def greedy_sample(self, logits: torch.Tensor) -> torch.Tensor:
-        # NOTE:
-        # If there are any parameters for top-k or top-p,
-        # this function works as a greedy sampler.
-        sampled, _ = self.topk_topp_sampler(logits, dict(), None, None)
-        return sampled
 
     def forward(
         self,
@@ -321,7 +351,7 @@ class RBLNSampler(VLLMSampler):
         # in-place division triggers buffer key error
         # in torchinductor
         if not all_random:
-            temp = torch.where(temp < _SAMPLING_EPS, 1.0, temp)
+            temp = torch.where(temp < _SAMPLING_EPS, _SAMPLING_EPS, temp)
         return logits.div(temp.unsqueeze(dim=1))
 
 
