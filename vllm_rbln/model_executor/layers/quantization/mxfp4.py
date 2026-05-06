@@ -112,6 +112,8 @@ def custom_moe_glu_mxfp4(
     post_norm: bool = True,
     expert_map: torch.Tensor | None = None,
     dp_mask: torch.Tensor | None = None,
+    n_group: int | None = None,
+    topk_group: int | None = None,
 ) -> torch.Tensor:
     """
     MoE GLU operation for GPT-OSS with mxfp4 quantization and swigluoai activation.
@@ -244,6 +246,8 @@ def custom_moe_glu_mxfp4_fake(
     post_norm: bool = True,
     expert_map: torch.Tensor | None = None,
     dp_mask: torch.Tensor | None = None,
+    n_group: int | None = None,
+    topk_group: int | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
 
@@ -375,6 +379,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         layer.register_buffer("down_proj_scales", layer.w2_weight_scale.data)
         layer.register_buffer("down_proj_bias", layer.w2_bias.data)
 
+        if getattr(layer, "_expert_map", None) is not None:
+            layer._expert_map_list = layer._expert_map.data.to(
+                dtype=torch.int32
+            ).tolist()
+
     def select_gemm_impl(
         self,
         prepare_finalize: mk.FusedMoEPrepareAndFinalizeModular,
@@ -407,15 +416,21 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if layer.activation == MoEActivation.SWIGLUOAI:
             expert_map_const = None
             if layer.expert_map is not None:
-                assert getattr(layer, "expert_map_const", None) is not None
                 expert_map_const = torch.tensor(
-                    layer.expert_map_const, dtype=torch.int32
+                    layer._expert_map_list, dtype=torch.int32
                 )
 
             tokens_mask = None
             use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
             if use_moe_tokens_mask:
                 tokens_mask = get_tokens_mask(num_tokens)
+
+            if layer.use_grouped_topk:
+                n_group = layer.num_expert_group
+                topk_group = layer.topk_group
+            else:
+                n_group = None
+                topk_group = None
 
             final_hidden_states = torch.ops.rbln_custom_ops.custom_moe_glu_mxfp4(
                 hidden_states,
@@ -435,6 +450,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.renormalize,
                 expert_map_const,
                 tokens_mask,
+                n_group,
+                topk_group,
             )
         else:
             raise NotImplementedError(layer.activation)
