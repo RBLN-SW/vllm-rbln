@@ -2926,9 +2926,9 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     device_time = reports[0].get("total_device", None)
                     ccl_time = reports[0].get("total_ccl", None)
                 if reports is not None and len(reports) > 1:
-                    vmem_time = reports[1].get(
-                        "prepare_inputs_us", 0
-                    ) + reports[1].get("prepare_outputs_us", 0)
+                    vmem_time = reports[1].get("prepare_inputs_us", 0) + reports[1].get(
+                        "prepare_outputs_us", 0
+                    )
 
                 if is_prefill_phase:
                     self.performance_tracker.record_prefill(
