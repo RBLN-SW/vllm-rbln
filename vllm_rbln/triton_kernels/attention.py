@@ -410,7 +410,7 @@ def warmup(func, *args):
 
 
 @triton_op("rbln_triton_ops::attention_naive_prefill", mutates_args=())
-def attention_naive_prefill_wrapper(
+def _(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -448,8 +448,8 @@ def attention_naive_prefill_wrapper(
         query,
         key,
         value,
-        kv_cache,
         mask,
+        kv_cache,
         output,
         seq_idx,
         qk_scale,
@@ -469,7 +469,7 @@ def attention_naive_prefill_wrapper(
 
 
 @triton_op("rbln_triton_ops::attention_naive_decode", mutates_args=())
-def attention_naive_decode_wrapper(
+def _(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -507,8 +507,8 @@ def attention_naive_decode_wrapper(
         query,
         key,
         value,
-        kv_cache,
         mask,
+        kv_cache,
         output,
         seq_idx,
         qk_scale,
