@@ -27,7 +27,6 @@ from vllm.v1.worker.gpu_input_batch import InputBatch
 
 from vllm_rbln.v1.worker.rbln_model_runner import (
     AsyncRBLNModelRunnerOutput,
-    DummyRunState,
     ExecuteModelState,
     RBLNModelRunner,
 )
@@ -252,7 +251,7 @@ class TestAsyncRBLNModelRunnerOutputFeature:
 
 
 # ===========================================================================
-# 3. ExecuteModelState / DummyRunState named tuples
+# 3. ExecuteModelState named tuple
 # ===========================================================================
 
 
@@ -323,45 +322,6 @@ class TestExecuteModelStateFeature:
             slot_mappings=mappings,
         )
         assert len(state.slot_mappings) == 2
-
-
-class TestDummyRunStateFeature:
-    def test_field_names(self):
-        expected_fields = (
-            "attn_metadata",
-            "num_input_tokens",
-            "input_ids",
-            "positions",
-        )
-        assert DummyRunState._fields == expected_fields
-
-    def test_field_count(self):
-        assert len(DummyRunState._fields) == 4
-
-    def test_is_named_tuple(self):
-        assert issubclass(DummyRunState, tuple)
-
-    def test_typical_construction(self):
-        state = DummyRunState(
-            attn_metadata={0: {"key": "value"}},
-            num_input_tokens=32,
-            input_ids={0: torch.zeros(32, dtype=torch.long)},
-            positions={0: torch.arange(32)},
-        )
-        assert state.num_input_tokens == 32
-        assert isinstance(state.attn_metadata, dict)
-        assert isinstance(state.input_ids, dict)
-        assert isinstance(state.positions, dict)
-
-    def test_empty_dicts(self):
-        state = DummyRunState(
-            attn_metadata={},
-            num_input_tokens=0,
-            input_ids={},
-            positions={},
-        )
-        assert state.num_input_tokens == 0
-        assert len(state.attn_metadata) == 0
 
 
 # ===========================================================================

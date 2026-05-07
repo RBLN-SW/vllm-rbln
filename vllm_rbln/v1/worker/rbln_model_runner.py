@@ -200,15 +200,6 @@ class ExecuteModelState(NamedTuple):
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
 
 
-class DummyRunState(NamedTuple):
-    """Input state for dummy run."""
-
-    attn_metadata: dict[int, dict[str, Any]]
-    num_input_tokens: int
-    input_ids: dict[int, torch.Tensor]
-    positions: dict[int, torch.Tensor]
-
-
 class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     def __init__(
         self,
@@ -522,8 +513,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.e2e_performance_tracker: PerformanceTracker | None = None
         self.e2e_start_time: float = 0.0
         self.e2e_end_time: float = 0.0
-
-        self.dummy_run_state: DummyRunState | None = None
 
         self.specialized_moe_decode = (
             parallel_config.data_parallel_size > 1
@@ -2087,373 +2076,47 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         if output is None:
             self.sample_tokens(None)
 
-    def _update_dummy_states(
-        self, scheduler_output: SchedulerOutput, input_batch: InputBatch
-    ) -> None:
-        reqs_to_add: list[CachedRequestState] = []
-        # Add new requests to the cached states.
-        for new_req_data in scheduler_output.scheduled_new_reqs:
-            req_id = new_req_data.req_id
-            sampling_params = new_req_data.sampling_params
-            pooling_params = new_req_data.pooling_params
-
-            generator = None
-
-            req_state = CachedRequestState(
-                req_id=req_id,
-                prompt_token_ids=new_req_data.prompt_token_ids,
-                mm_features=new_req_data.mm_features,
-                sampling_params=sampling_params,
-                pooling_params=pooling_params,
-                generator=generator,
-                block_ids=new_req_data.block_ids,
-                num_computed_tokens=new_req_data.num_computed_tokens,
-                output_token_ids=[],
-                lora_request=new_req_data.lora_request,
-            )
-
-            reqs_to_add.append(req_state)
-
-        # Add the new or resumed requests to the persistent batch.
-        # The smaller empty indices are filled first.
-        for request in reqs_to_add:
-            input_batch.add_request(request)
-
-        # Refresh batch metadata with any pending updates.
-        input_batch.refresh_metadata()
-
-    def _prepare_dummy_inputs(
-        self,
-        scheduler_output: SchedulerOutput,
-        input_batch: InputBatch,
-    ) -> DummyRunState:
-        total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
-        num_reqs = input_batch.num_reqs
-
-        # OPTIMIZATION: Start copying the block table first.
-        # This way, we can overlap the copy with the following CPU operations.
-        input_batch.block_table.commit_block_table(num_reqs)
-
-        # Get the number of scheduled tokens for each request.
-        req_ids = input_batch.req_ids
-        tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
-        num_scheduled_tokens = np.array(tokens, dtype=np.int32)
-        max_num_scheduled_tokens = max(tokens)
-
-        # Get request indices.
-        # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
-        req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens)
-
-        # cu_num_tokens: [2, 5, 3] -> [2, 7, 10]
-        # arange: [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
-        cu_num_tokens, arange = self._get_cumsum_and_arange(num_scheduled_tokens)
-
-        # Get positions.
-        positions_np = self.positions.np[:total_num_scheduled_tokens]
-        np.add(
-            input_batch.num_computed_tokens_cpu[req_indices], arange, out=positions_np
-        )
-        positions_np = positions_np.copy()
-        positions = self.positions.cpu.clone()
-
-        # Get token indices.
-        # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
-        # -> [0, 1, M, M + 1, M + 2, M + 3, M + 4, 2 * M, 2 * M + 1, 2 * M + 2]
-        # where M is the max_model_len.
-        token_indices = positions_np + req_indices * input_batch.token_ids_cpu.shape[1]
-
-        input_ids = self.input_ids.cpu.clone()
-        # NOTE(woosuk): We use torch.index_select instead of np.take here
-        # because torch.index_select is much faster than np.take for large
-        # tensors.
-        torch.index_select(
-            input_batch.token_ids_cpu_tensor.flatten(),
-            0,
-            torch.from_numpy(token_indices),
-            out=input_ids[:total_num_scheduled_tokens],
-        )
-
-        input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
-        input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
-
-        query_start_loc_np = self.query_start_loc.np.copy()
-        query_start_loc_np[0] = 0
-        query_start_loc_np[1 : num_reqs + 1] = cu_num_tokens
-        # Note: pad query_start_loc to be non-decreasing, as kernels
-        # like FlashAttention requires that
-        query_start_loc_np[num_reqs + 1 :].fill(cu_num_tokens[-1])
-        query_start_loc = torch.tensor(query_start_loc_np, dtype=torch.int32)[
-            : num_reqs + 1
-        ]
-
-        seq_lens_np = self.seq_lens.np.copy()
-        seq_lens_np[:num_reqs] = (
-            input_batch.num_computed_tokens_cpu[:num_reqs] + num_scheduled_tokens
-        )
-        # Fill unused with 0 for full cuda graph mode.
-        seq_lens_np[num_reqs:].fill(0)
-        seq_lens = torch.tensor(seq_lens_np, dtype=torch.int32)[:num_reqs]
-        max_seq_len = seq_lens_np[:num_reqs].max().item()
-
-        # TODO: support spec_decode
-        use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
-        if use_spec_decode:
-            raise NotImplementedError("Spec decode is not supported for DP dummy run")
-
-        logits_indices = query_start_loc[1:] - 1
-
-        logits_indices_padded = None
-
-        # Used in the below loop.
-        query_start_loc_cpu = query_start_loc
-
-        attn_metadata_bucket: dict[int, dict[str, Any]] = {}
-        input_ids_bucket: dict[int, torch.Tensor] = {}
-        positions_bucket: dict[int, torch.Tensor] = {}
-
-        # Cycle 5d (M3): bucket sweep collapsed to a single representative
-        # batch size — DP dummy_run is M16 (deferred), so this keeps the
-        # path runnable but stops fanning out per bucket.
-        for batch_bucket_size in (self.max_batch_size,):
-            attn_metadata: dict[str, Any] = {}
-            # Prepare the attention metadata for each KV cache group and
-            # make layers in the same group share the same metadata.
-            for kv_cache_group_id, kv_cache_group_spec in enumerate(
-                self.kv_cache_config.kv_cache_groups
-            ):
-                encoder_seq_lens = None
-
-                if isinstance(
-                    kv_cache_group_spec.kv_cache_spec, EncoderOnlyAttentionSpec
-                ):
-                    raise NotImplementedError(
-                        "Encoder-only attention is not supported for DP dummy run"
-                    )
-                else:
-                    blk_table = input_batch.block_table[kv_cache_group_id]
-                    blk_table_tensor = blk_table.get_device_tensor(num_reqs)
-                    slot_mapping = blk_table.slot_mapping.gpu[
-                        :total_num_scheduled_tokens
-                    ]
-
-                    # Fill unused with -1.
-                    # Needed for reshape_and_cache in full cuda graph mode.
-                    # `blk_table_tensor` -1 to match mamba PAD_SLOT_ID
-                    slot_mapping[
-                        total_num_scheduled_tokens:total_num_scheduled_tokens
-                    ].fill_(-1)
-                    blk_table_tensor[num_reqs:total_num_scheduled_tokens].fill_(-1)
-
-                common_attn_metadata = CommonAttentionMetadata(
-                    query_start_loc=query_start_loc,
-                    query_start_loc_cpu=query_start_loc_cpu,
-                    seq_lens=seq_lens,
-                    num_reqs=num_reqs,
-                    num_actual_tokens=total_num_scheduled_tokens,
-                    max_query_len=max_num_scheduled_tokens,
-                    max_seq_len=max_seq_len,
-                    block_table_tensor=blk_table_tensor,
-                    slot_mapping=slot_mapping,
-                    logits_indices_padded=logits_indices_padded,
-                    num_logits_indices=logits_indices.size(0),
-                    causal=True,
-                    encoder_seq_lens=encoder_seq_lens,
-                )
-
-                for attn_group in self.attn_groups[kv_cache_group_id]:
-                    # Prepare for cascade attention if enabled & beneficial.
-                    common_prefix_len = 0
-                    builder = attn_group.get_metadata_builder()
-                    if self.cascade_attn_enabled:
-                        raise NotImplementedError(
-                            "Cascade attention is not supported for DP dummy run"
-                        )
-
-                    extra_attn_metadata_args = {}
-
-                    if isinstance(builder, RBLNFlashAttentionMetadataBuilder):
-                        extra_attn_metadata_args["positions"] = positions
-                        extra_attn_metadata_args["batch_pad"] = batch_bucket_size
-                    attn_metadata_i = builder.build(
-                        common_prefix_len=common_prefix_len,
-                        common_attn_metadata=common_attn_metadata,
-                        **extra_attn_metadata_args,
-                    )
-
-                    for layer_name in attn_group.layer_names:
-                        attn_metadata[layer_name] = attn_metadata_i
-
-            self._attach_kv_cache_bindings(attn_metadata)
-            num_input_tokens = total_num_scheduled_tokens
-            input_ids = input_ids[:num_input_tokens]
-            positions = positions[:num_input_tokens]
-
-            input_ids = input_ids.view(num_reqs, -1).to(torch.long)
-            positions = positions.view(num_reqs, -1)
-
-            # decode batch padding
-            input_ids = rbln_utils.pad(input_ids, 0, batch_bucket_size)
-            positions = rbln_utils.pad(positions, -2, batch_bucket_size)
-
-            attn_metadata_bucket[batch_bucket_size] = attn_metadata
-            input_ids_bucket[batch_bucket_size] = input_ids.to(self.device)
-            positions_bucket[batch_bucket_size] = positions.to(self.device)
-
-        return DummyRunState(
-            attn_metadata=attn_metadata_bucket,
-            num_input_tokens=num_input_tokens,
-            input_ids=input_ids_bucket,
-            positions=positions_bucket,
-        )
-
-    def _prepare_dummy_input_batch(self) -> InputBatch:
-        logits_processors = self.model_config.logits_processors
-        custom_logitsprocs: Sequence[Union[str, type[LogitsProcessor]]] = (
-            tuple(logits_processors) if logits_processors is not None else ()
-        )
-        max_model_len = max(self.max_model_len, self.max_encoder_len)
-        dummy_input_batch = InputBatch(
-            max_num_reqs=self.max_num_reqs,
-            # We need to use the encoder length for encoder-decoer
-            # because of KV cache for cross-attention.
-            max_model_len=max_model_len,
-            max_num_batched_tokens=self.max_num_tokens,
-            device=self.device,
-            pin_memory=self.pin_memory,
-            vocab_size=self.model_config.get_vocab_size(),
-            block_sizes=[self.cache_config.block_size],
-            kernel_block_sizes=[self.cache_config.block_size],
-            is_spec_decode=bool(self.vllm_config.speculative_config),
-            logitsprocs=build_logitsprocs(
-                self.vllm_config,
-                self.device,
-                self.pin_memory,
-                self.is_pooling_model,
-                custom_logitsprocs,
-            ),
-            # We currently don't know whether a particular custom logits
-            # processor uses output token ids so we set this conservatively.
-            logitsprocs_need_output_token_ids=bool(custom_logitsprocs),
-            is_pooling_model=self.is_pooling_model,
-            cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
-        )
-
-        block_sizes, max_num_blocks = self._kv_block_sizes_and_max_num_blocks(
-            self.kv_cache_config, max_model_len
-        )
-        kernel_block_sizes = self.kernel_block_sizes
-
-        if block_sizes != [self.cache_config.block_size] or kernel_block_sizes != [
-            self.cache_config.block_size
-        ]:
-            assert self.offload_config.uva.cpu_offload_gb == 0, (
-                "Cannot re-initialize the input batch when CPU weight "
-                "offloading is enabled. See https://github.com/vllm-project/vllm/pull/18298 "  # noqa: E501
-                "for more details."
-            )
-            dummy_input_batch = InputBatch(
-                max_num_reqs=self.max_num_reqs,
-                max_model_len=max(self.max_model_len, self.max_encoder_len),
-                max_num_batched_tokens=self.max_num_tokens,
-                device=self.device,
-                pin_memory=self.pin_memory,
-                vocab_size=self.model_config.get_vocab_size(),
-                block_sizes=block_sizes,
-                kernel_block_sizes=kernel_block_sizes,
-                max_num_blocks_per_req=max_num_blocks,
-                is_spec_decode=bool(self.vllm_config.speculative_config),
-                logitsprocs=dummy_input_batch.logitsprocs,
-                logitsprocs_need_output_token_ids=dummy_input_batch.logitsprocs_need_output_token_ids,
-                is_pooling_model=self.is_pooling_model,
-                cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
-            )
-
-        return dummy_input_batch
-
     @torch.inference_mode()
-    def prepare_dummy_run(self) -> None:
-        # TODO: support spec_decode, pooling, mrope, lora,
-        #       and encoder-only attention
-        if self.is_pooling_model:
-            raise NotImplementedError("Pooling model is not supported for DP dummy run")
-        if self.uses_mrope:
-            raise NotImplementedError("M-RoPE is not supported for DP dummy run")
-        if self.lora_config:
-            raise NotImplementedError("LoRA is not supported for DP dummy run")
+    def dummy_run(self, num_tokens: int = 1) -> None:
+        """Minimal forward pass used by DP synchronisation.
 
+        Cycle 5d (M16): the legacy `prepare_dummy_run` / `dummy_run_state`
+        machinery (per-bucket pre-built attn_metadata + input_ids + positions)
+        is gone. With dynamic shapes, DP ranks can run heterogeneous batch
+        sizes without pre-padding, so the only requirement here is that this
+        rank issues *some* forward pass to keep the keep-alive contract with
+        the rest of the DP group. We reuse the existing decode dummy
+        request/scheduler-output helpers to issue a 1-token decode forward.
+        """
         num_kv_cache_groups = len(self.kv_cache_config.kv_cache_groups)
-        dummy_run_requests: list[NewRequestData] = []
-        dummy_run_num_scheduled_tokens: dict[str, int] = {}
+        sampling_params = (
+            None if self.is_pooling_model else SamplingParams(temperature=0.0)
+        )
+        pooling_params = (
+            PoolingParams(task=self.get_supported_pooling_tasks()[0])
+            if self.is_pooling_model
+            else None
+        )
+
+        dummy_requests: list[NewRequestData] = []
+        dummy_num_scheduled_tokens: dict[str, int] = {}
+        # 1-token decode: total_tokens == num_computed_tokens forces the
+        # `_add_dummy_requests` helper to schedule exactly one token.
         self._add_dummy_requests(
-            requests=dummy_run_requests,
-            num_scheduled_tokens=dummy_run_num_scheduled_tokens,
-            total_tokens=1,
-            num_computed_tokens=1,
+            requests=dummy_requests,
+            num_scheduled_tokens=dummy_num_scheduled_tokens,
+            total_tokens=max(num_tokens, 1),
+            num_computed_tokens=max(num_tokens, 1),
             num_kv_cache_groups=num_kv_cache_groups,
-            sampling_params=None
-            if self.is_pooling_model
-            else SamplingParams(temperature=0.0),
-            pooling_params=PoolingParams(task=self.get_supported_pooling_tasks()[0])
-            if self.is_pooling_model
-            else None,
+            sampling_params=sampling_params,
+            pooling_params=pooling_params,
         )
-        dummy_run_scheduler_output, _ = self._make_dummy_scheduler_outputs(
-            dummy_run_requests, dummy_run_num_scheduled_tokens, num_kv_cache_groups
+        sched_output, cleanup_sched_output = self._make_dummy_scheduler_outputs(
+            dummy_requests, dummy_num_scheduled_tokens, num_kv_cache_groups
         )
-
-        dummy_input_batch = self._prepare_dummy_input_batch()
-        self._update_dummy_states(dummy_run_scheduler_output, dummy_input_batch)
-        self.dummy_run_state = self._prepare_dummy_inputs(
-            dummy_run_scheduler_output, dummy_input_batch
+        self._execute_dummy_requests(
+            sched_output, cleanup_sched_output, self.intermediate_tensors
         )
-
-    @torch.inference_mode()
-    def dummy_run(self) -> None:
-        assert self.dummy_run_state is not None
-        (attn_metadata, num_input_tokens, input_ids, positions) = self.dummy_run_state
-
-        (batch_bucket_size, num_padded_tokens, num_tokens_across_dp) = (
-            self.get_dp_padding(num_input_tokens, self.max_batch_size)
-        )
-
-        assert (
-            batch_bucket_size in attn_metadata
-            and batch_bucket_size in input_ids
-            and batch_bucket_size in positions
-        ), (
-            "attn_metadata, input_ids, and positions should be defined"
-            f" for batch_bucket_size: {batch_bucket_size}"
-        )
-        bucket_attn_metadata = attn_metadata[batch_bucket_size]
-        bucket_input_ids = input_ids[batch_bucket_size]
-        bucket_positions = positions[batch_bucket_size]
-
-        if get_pp_group().is_first_rank:
-            intermediate_tensors = None
-        else:
-            # Cycle 5d (M2): single lazy buffer; DP dummy_run reuses it.
-            intermediate_tensors = self.intermediate_tensors
-
-        with set_forward_context(
-            bucket_attn_metadata,
-            self.vllm_config,
-            num_tokens=num_input_tokens,
-            num_tokens_across_dp=num_tokens_across_dp,
-            num_padded_tokens=num_padded_tokens,
-        ):
-            self._attach_kv_cache_bindings(bucket_attn_metadata)
-            token_indices = None
-            inputs_embeds = None
-            model_kwargs = dict[str, Any]({})
-
-            _ = self.model_executable(
-                input_ids=bucket_input_ids,
-                positions=bucket_positions,
-                intermediate_tensors=intermediate_tensors,
-                selected_token_indices=token_indices,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
-            )
 
     def _bookkeeping_sync(
         self,

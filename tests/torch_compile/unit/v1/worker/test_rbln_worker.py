@@ -833,7 +833,9 @@ class TestCompileOrWarmUpModel:
         worker = _create_worker(vllm_config=cfg)
         worker.model_runner = MagicMock()
         worker.compile_or_warm_up_model()
-        worker.model_runner.prepare_dummy_run.assert_called_once()
+        # Cycle 5d (M16): prepare_dummy_run removed; DP padded_decode
+        # warm-up no longer pre-populates dummy state.
+        worker.model_runner.prepare_dummy_run.assert_not_called()
 
     def test_dp_padded_decode_not_divisible(self):
         cfg = _make_vllm_config(data_parallel_size=2)
