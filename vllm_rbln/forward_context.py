@@ -160,22 +160,6 @@ def _set_forward_context(
             num_tokens_across_dp,
             num_padded_tokens,
         )
-        device = vllm_config.device
-        dp_metadata.num_tokens_across_dp_cpu = (
-            dp_metadata.num_tokens_across_dp_cpu.to(device)
-            if dp_metadata.num_tokens_across_dp_cpu is not None
-            else None
-        )
-        dp_metadata.max_tokens_across_dp_cpu = (
-            dp_metadata.max_tokens_across_dp_cpu.to(device)
-            if dp_metadata.max_tokens_across_dp_cpu is not None
-            else None
-        )
-        dp_metadata.max_pads_across_dp = (
-            dp_metadata.max_pads_across_dp.to(device)
-            if dp_metadata.max_pads_across_dp is not None
-            else None
-        )
 
     forward_context = create_forward_context(
         attn_metadata,
