@@ -227,21 +227,7 @@ async def main(
     #         }
     #     }
     # })
-
-    rbln_config = {
-        "rbln_config": {
-            "device": [8, 9, 10, 11, 12, 13, 14, 15],
-            "tensor_parallel_size": 8,
-            "batch_size": 1,
-            "max_seq_len": 114_688,
-            "kvcache_partition_len": 16_384,
-            "visual": {
-                "device": 0,
-                # "max_seq_lens": 6400,
-                }
-            }
-        }
-    engine_args = AsyncEngineArgs(model=model_id, additional_config=rbln_config)
+    engine_args = AsyncEngineArgs(model=model_id)
 
     engine = AsyncLLMEngine.from_engine_args(engine_args)
     tokenizer = AutoTokenizer.from_pretrained(model_id)

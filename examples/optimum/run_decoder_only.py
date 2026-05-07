@@ -59,9 +59,9 @@ async def generate(
 
 
 def get_input_prompts(prompt_txt: str) -> list[str]:
-    # with open(prompt_txt) as file:
-    #     prompt = file.readlines()
-    prompt = ["Tell me a joke.", "Tell me a joke.", "Tell me a joke.", "Tell me a joke."]
+    with open(prompt_txt) as file:
+        prompt = file.readlines()
+
     return prompt
 
 
@@ -94,14 +94,7 @@ async def main(
     prompt_txt: str,
     golden_json: str,
 ):
-    rbln_config = {
-        "device": [0, 1, 2, 3, 4, 5, 6, 7], 
-        "tensor_parallel_size": 8, 
-        "batch_size": 1, 
-        "max_seq_len": 16384,
-        # "kvcache_block_size": 4096
-        }
-    engine_args = AsyncEngineArgs(model=model_id, additional_config={"rbln_config": rbln_config})
+    engine_args = AsyncEngineArgs(model=model_id)
 
     engine = AsyncLLMEngine.from_engine_args(engine_args)
     prompt = get_input_prompts(prompt_txt)
@@ -124,10 +117,10 @@ async def main(
 
     result = await asyncio.gather(*futures)
 
-    # score = compare_copy_prompt_task_result(result, golden_json)
-    # if score < 0.97:
-    #     print(f"score is lower than threshold({score})")
-    #     exit(1)
+    score = compare_copy_prompt_task_result(result, golden_json)
+    if score < 0.97:
+        print(f"score is lower than threshold({score})")
+        exit(1)
 
 
 def entry_point(
