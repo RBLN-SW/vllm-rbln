@@ -1629,12 +1629,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             hidden_states=hidden_states, pooling_metadata=pooling_metadata
         )
 
-        pooler_output: list[torch.Tensor | None] = []
-        for raw_output, seq_len, prompt_len in zip(
-            raw_pooler_output, seq_lens_cpu, pooling_metadata.prompt_lens
-        ):
-            output = raw_output.data if seq_len == prompt_len else None
-            pooler_output.append(output)
+        pooler_output: list[torch.Tensor | None] = [
+            raw.data if seq_len == prompt_len else None
+            for raw, seq_len, prompt_len in zip(
+                raw_pooler_output, seq_lens_cpu, pooling_metadata.prompt_lens
+            )
+        ]
 
         return ModelRunnerOutput(
             req_ids=self.input_batch.req_ids,
@@ -1781,19 +1781,15 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             )
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
-        if (
-            True
-            and logits is not None
-            and logits.shape[0] > self.input_batch.num_reqs
-        ):
+        if logits is not None and logits.shape[0] > self.input_batch.num_reqs:
             sampling_metadata = self._pad_sampling_metadata(
                 sampling_metadata, logits.shape[0]
             )
-        if hasattr(rebel, "capture_reports"):
-            capture_ctx = rebel.capture_reports()
-        else:
-            # use a dummy context manager that does nothing
-            capture_ctx = contextlib.nullcontext()
+        capture_ctx = (
+            rebel.capture_reports()
+            if hasattr(rebel, "capture_reports")
+            else contextlib.nullcontext()
+        )
         sampler_start_time = time.perf_counter()
         with capture_ctx as sampler_reports:
             if spec_decode_metadata is None:
@@ -1934,10 +1930,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             lora_request=None,
         )
         requests.append(req)
-        num_scheduled_tokens[req.req_id] = (
-            1
-            if total_tokens - num_computed_tokens == 0
-            else total_tokens - num_computed_tokens
+        num_scheduled_tokens[req.req_id] = max(
+            1, total_tokens - num_computed_tokens
         )
 
     def _make_dummy_scheduler_outputs(
@@ -3253,34 +3247,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         return prompt_logprobs_dict
 
     @contextmanager
-    def maybe_randomize_inputs(self, input_ids: torch.Tensor):
-        """
-        Randomize input_ids if VLLM_RANDOMIZE_DP_DUMMY_INPUTS is set.
-        This is to help balance expert-selection
-         - during profile_run
-         - during DP rank dummy run
-        """
-        dp_size = self.vllm_config.parallel_config.data_parallel_size
-        randomize_inputs = envs.VLLM_RANDOMIZE_DP_DUMMY_INPUTS and dp_size > 1
-        if not randomize_inputs:
-            yield
-        else:
-            import functools
-
-            @functools.cache
-            def rand_input_ids() -> torch.Tensor:
-                return torch.randint_like(
-                    self.input_ids.gpu,
-                    low=0,
-                    high=self.model_config.get_vocab_size(),
-                    dtype=input_ids.dtype,
-                )
-
-            logger.debug_once("Randomizing dummy data for DP Rank")
-            input_ids.copy_(rand_input_ids()[: input_ids.size(0)], non_blocking=True)
-            yield
-            input_ids.fill_(0)
-
     def initialize_attn_backend(self, kv_cache_config: KVCacheConfig) -> None:
         """
         Initialize the attention backends and attention metadata builders.
@@ -3708,18 +3674,16 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     ) -> None:
         """Expose the runner-bound KV cache list on each attn_metadata.
 
-        Cycle 5c — M12-M14 collapse: the previous deduplicated-base +
-        view-info sidecar is gone; per-forward we just hand the backend
-        the same list of layer tensors that bind_kv_cache stored on the
-        Attention layers. Consumers (RBLNFlashAttentionMetadata,
-        attention.py:_resolve_kv_cache, eagle's draft metadata) read
-        ``attn_metadata.kv_caches[layer_index]`` directly.
+        Consumers (`attention.py:_resolve_kv_cache`, eagle draft metadata)
+        read ``attn_metadatum.kv_caches[layer_index]`` directly. The
+        legacy deduplicated-base + view-info sidecar was retired; clear
+        any stale `kv_cache_view_infos` from a prior step so consumers
+        don't pick it up.
         """
         if attn_metadata is None:
             return
         for attn_metadatum in attn_metadata.values():
             attn_metadatum.kv_caches = self.kv_caches
-            # No deduplicated base / view info anymore.
             if hasattr(attn_metadatum, "kv_cache_view_infos"):
                 attn_metadatum.kv_cache_view_infos = None
 
