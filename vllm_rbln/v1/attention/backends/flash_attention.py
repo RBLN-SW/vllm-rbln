@@ -1067,7 +1067,6 @@ class RBLNFlashAttentionMetadataBuilder(
         self.enforce_eager = get_current_vllm_config().model_config.enforce_eager
 
         self.is_causal = envs.VLLM_RBLN_FLASH_CAUSAL_ATTN
-        self.is_batch_attention_opt = envs.VLLM_RBLN_BATCH_ATTN_OPT
 
         self._swa_cache_seq_lens_buf: torch.Tensor | None = None
         self._swa_cache_offsets_buf: torch.Tensor | None = None
@@ -1212,18 +1211,13 @@ class RBLNFlashAttentionMetadataBuilder(
 
             local_block_tables = block_tables_tensor[..., :1]
 
-        # * seq_idx(batch attention opt decode) - [B, 1],
-        #   for each batch, have sequence offset
-        # * seq_lens_tensor(otherwise)      - [B, P],
-        #   have dynamic size for each partition
+        # seq_lens_tensor: [B, P], dynamic size per partition.
         attn_metadata = RBLNFlashAttentionMetadata(
             num_actual_tokens=num_actual_tokens,
             max_query_len=max_query_len,
             query_start_loc=query_start_loc,
             max_seq_len=query_max_seq_len,
-            seq_lens=seq_lens_tensor.to(self.device)
-            if not self.is_batch_attention_opt or is_prefill or batch_pad <= 1
-            else seq_idx.to(self.device),
+            seq_lens=seq_lens_tensor.to(self.device),
             block_tables=block_tables_tensor.to(self.device),
             slot_mapping=slot_mapping,
             use_cascade=False,
@@ -1335,7 +1329,6 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                 self.sinks = self.sinks[:, None]
 
         self.is_causal = envs.VLLM_RBLN_FLASH_CAUSAL_ATTN
-        self.is_batch_attention_opt = envs.VLLM_RBLN_BATCH_ATTN_OPT
         self.is_normal = (self.block_size == self.max_model_len) and (
             self.sinks is None
         )
@@ -1459,19 +1452,14 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                     key,
                     value,
                     kv_cache,
-                    attn_metadata.cache_seq_lens.to(torch.int32)
-                    if self.is_batch_attention_opt and b_size > 1
-                    else attn_metadata.cache_seq_lens,
+                    attn_metadata.cache_seq_lens,
                     attn_metadata.cache_offsets,
                     self.scale,
                     attn_metadata.local_block_tables,
                     self.scale,  # dummy
                 ]
                 if not envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
-                    if self.is_batch_attention_opt and b_size > 1:
-                        decode_args.append(attn_metadata.swa_attn_masks)
-                    else:
-                        decode_args.append(None)
+                    decode_args.append(None)
                     decode_args.append(self.sinks)
                 attn_output = sliding_window_attention_naive_decode(  # noqa: E501
                     *decode_args,
