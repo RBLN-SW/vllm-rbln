@@ -19,7 +19,6 @@ import time
 from types import NoneType
 from typing import TYPE_CHECKING
 
-import numba
 import torch
 
 try:
@@ -30,7 +29,6 @@ except ImportError:
     has_torch_rbln = False
 
 import torch.nn as nn
-from torch._dynamo.exc import BackendCompilerFailed
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed import (
     ensure_model_parallel_initialized,
@@ -105,8 +103,7 @@ class RBLNWorker(WorkerBase):
 
         # Buffers saved before sleep
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
-        self._rbln_host_threads_before_compile_ready = False
-        self._rbln_cpu_affinity_applied = False
+        self._rbln_host_threads_setup = False
 
         profiler_config = vllm_config.profiler_config
         # Set up profiler if profiling is enabled
@@ -391,17 +388,16 @@ class RBLNWorker(WorkerBase):
 
         self.model_runner.initialize_kv_cache(kv_cache_config)
 
-    def _ensure_rbln_host_threads_before_compile(self) -> None:
-        """Set OpenMP / torch / numba threads before ``warm_up_model()`` without
-        CPU affinity.
+    def _setup_rbln_host_threads(self) -> None:
+        """Pin CPU affinity + OMP threads for the worker.
 
-        Affinity is applied later (after warm-up) so ``torch.compile`` / dummy
-        compile sees an unpinned CPU mask while thread counts and
-        ``RBLN_NUM_THREADS`` match Dynamo. Default thread count uses the same
-        logical CPU count ``set_cpu_affinity`` will pin to (NUMA / DP split),
-        not the pre-split ``sched_getaffinity`` mask.
+        Replaces the previous pre/post-warmup split that existed only to
+        keep ``torch.compile(backend="rbln")`` + Dynamo + numba global
+        state from triggering recompilation. With our own dispatcher we
+        no longer go through Dynamo for compilation, so a single setup
+        call at initialisation is enough.
         """
-        if self._rbln_host_threads_before_compile_ready:
+        if self._rbln_host_threads_setup:
             return
 
         allocated_cpus = get_rbln_planned_affinity_cpu_count(
@@ -410,40 +406,10 @@ class RBLNWorker(WorkerBase):
             self.parallel_config,
         )
         num_threads = max(2, allocated_cpus // 2)
-        set_omp_num_threads(
-            self.rank,
-            self.local_rank,
-            num_threads,
-        )
+        set_omp_num_threads(self.rank, self.local_rank, num_threads)
+        set_cpu_affinity(self.rank, self.local_rank, self.parallel_config)
 
-        # NOTE(RBLN): numba is used throughout vllm code base (especially in spec-dec)
-        # however accessing numba thread settings somewhat affects torch
-        # thread settings and cause global state change leading to recompilation.
-        # Thus the only solution for now is to set both thread settings to identical
-        # value in correct order like below
-
-        # Code below sets numba num thread to torch num thread and
-        # potentially change torch num thread to other value
-        numba.set_num_threads(torch.get_num_threads())
-
-        # Code below restores torch num thread to its original value
-        # before numba.set_num_threads
-        torch.set_num_threads(numba.get_num_threads())
-
-        self._rbln_host_threads_before_compile_ready = True
-
-    def _ensure_rbln_cpu_affinity_after_warmup(self) -> None:
-        """Pin CPU affinity after ``warm_up_model()``; does not change torch
-        thread counts."""
-        if self._rbln_cpu_affinity_applied:
-            return
-
-        set_cpu_affinity(
-            self.rank,
-            self.local_rank,
-            self.parallel_config,
-        )
-        self._rbln_cpu_affinity_applied = True
+        self._rbln_host_threads_setup = True
 
     def compile_or_warm_up_model(self) -> float:
         st = time.perf_counter()
@@ -462,8 +428,7 @@ class RBLNWorker(WorkerBase):
                 )
             self.model_runner.prepare_dummy_run()
 
-        # Thread policy + RBLN_NUM_THREADS before compile/warm-up; affinity after.
-        self._ensure_rbln_host_threads_before_compile()
+        self._setup_rbln_host_threads()
 
         if (
             self.model_config.enforce_eager
@@ -471,39 +436,13 @@ class RBLNWorker(WorkerBase):
             or not envs.VLLM_RBLN_ENABLE_WARM_UP
         ):
             logger.warning("skipping compile_or_warm_up_model")
-
-            self._ensure_rbln_cpu_affinity_after_warmup()
             return time.perf_counter() - st
-        else:
-            try:
-                self.model_runner.warm_up_model()
 
-            except BackendCompilerFailed as e:
+        # Let any compile error propagate; OOM detection lives in the
+        # compiler itself once it raises typed RblnOutOfMemoryError.
+        self.model_runner.warm_up_model()
 
-                def is_oom(exc):
-                    if isinstance(exc, RuntimeError):
-                        for arg in exc.args:
-                            if isinstance(arg, str) and (
-                                "SYS_ENOMEM: Out of memory" in arg
-                                or "SYS_EBUSY: Lack of device memory" in arg
-                            ):
-                                return True
-                    return False
-
-                if is_oom(e.inner_exception):
-                    raise RuntimeError(
-                        "Not enough memory for "
-                        f"{self.model_runner.kv_cache_config.num_blocks} "
-                        "blocks of KV cache. Try reducing the number of blocks "
-                        "by setting --num-gpu-blocks-override."
-                    ) from e
-
-                raise
-
-        # After warm-up: apply CPU affinity only (threads already set pre-compile).
-        self._ensure_rbln_cpu_affinity_after_warmup()
         self.model_runner._enable_performance_tracker()
-
         return time.perf_counter() - st
 
     def get_model(self) -> nn.Module:
