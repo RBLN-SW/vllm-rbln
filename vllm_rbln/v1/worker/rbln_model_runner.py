@@ -29,6 +29,7 @@ import torch.nn as nn
 
 try:
     import torch.rbln
+    import torch_rbln
 
     has_torch_rbln = True
 except ImportError:
@@ -1326,25 +1327,19 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         )
 
     def _compile_model(self, model):
-        process_group_dict = {
-            g.group_name: pg.ranks
-            for pg in (get_tp_group(), get_pp_group(), get_dp_group())
-            for g in (pg.device_group, pg.cpu_group)
-        }
-
-        options = {
-            "tensor_parallel_size": envs.VLLM_RBLN_TP_SIZE,
-            "process_group_dict": process_group_dict,
-            "guard_filter_fn": torch.compiler.keep_tensor_guards_unsafe,
-            "mode": "strict",
-            "_runtime_holder": self.runtime_holder,
-        }
+        cache_dir: str | None = None
         if not envs.VLLM_DISABLE_COMPILE_CACHE:
             logger.info(
                 "Once the model is compiled for the first time, "
                 "the cached compiled binary will be reused."
             )
-            options["cache_dir"] = os.path.join(envs.VLLM_CACHE_ROOT, "rbln")
+            cache_dir = os.path.join(envs.VLLM_CACHE_ROOT, "rbln")
+        options = torch_rbln.compile_options(
+            runtime_holder=self.runtime_holder,
+            tensor_parallel_size=envs.VLLM_RBLN_TP_SIZE,
+            process_groups=(get_tp_group(), get_pp_group(), get_dp_group()),
+            cache_dir=cache_dir,
+        )
 
         # compile compute_logits
         # FIXME(jiwoo.park): method assignment for torch.compile

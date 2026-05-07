@@ -327,15 +327,8 @@ class RBLNWorker(WorkerBase):
             elif envs.VLLM_RBLN_DP_IMPL == "dummy_prefill":
                 raise ValueError(
                     "dummy_prefill is not supported in v1 worker"
-                    "and will be deprecated in the future"
+                    " and will be deprecated in the future"
                 )
-            # Cycle 5d (M16): the legacy `prepare_dummy_run` pre-built
-            # per-bucket attn_metadata + input_ids + positions for every DP
-            # rank to keep them in lockstep on a fixed compiled bucket.
-            # Dynamic shapes mean ranks no longer need that synchronisation
-            # padding. `model_runner.dummy_run()` is now a minimal
-            # forward-pass keep-alive triggered on demand from
-            # `execute_dummy_batch`, so no pre-population is required here.
 
         self._setup_rbln_host_threads()
 
