@@ -37,7 +37,6 @@ class RBLNOptimumWhisperForConditionalGeneration(
     SupportsTranscription,
     SupportsMultiModal,
 ):
-    INVALID_TOKEN = 100
     # Whisper only supports audio-conditioned generation.
     supports_transcription_only = True
     supports_segment_timestamp = True
@@ -113,19 +112,28 @@ class RBLNOptimumWhisperForConditionalGeneration(
             _ = self.model.encoder(
                 input_features=input_features, block_tables=block_tables
             )
-            lm_logits = torch.zeros(
-                1, 1, self.model.config.vocab_size + self.INVALID_TOKEN
+
+            decoder_input_ids = torch.full(
+                (request_nums, 1),
+                self.model.config.decoder_start_token_id,
+                dtype=torch.long,
             )
-            # Set the probability of INVALID_TOKEN (the last token in
-            # the logits tensor) to 1.0.
-            lm_logits[0][0][-1] = 1
-            self.dec_lengths[valid_block_ids[0].item()] = 0
+            decoder_attention_mask = torch.zeros(
+                self.batch_size, self.dec_max_seq_len, dtype=self.dtype
+            )
+            for batch_idx in valid_block_ids:
+                cache_position[batch_idx] = 0
+                decoder_attention_mask[batch_idx, 0] = 1
+                self.dec_lengths[batch_idx] = 1
+
+            decoder_output = self.model.decoder(
+                decoder_input_ids=decoder_input_ids.contiguous(),
+                decoder_attention_mask=decoder_attention_mask,
+                cache_position=cache_position,
+                block_tables=block_tables.unsqueeze(-1),
+            )
 
         else:
-            input_ids[
-                input_ids == (self.model.config.vocab_size + self.INVALID_TOKEN - 1)
-            ] = self.model.config.decoder_start_token_id
-
             # FIXME Is it ok generate torch.zero tensor for each forward?
             # OR just generate pooled tensor in the model instance?
             decoder_attention_mask = torch.zeros(
@@ -144,8 +152,8 @@ class RBLNOptimumWhisperForConditionalGeneration(
                 block_tables=block_tables,
             )
 
-            lm_logits = decoder_output.logits
-            lm_logits = lm_logits[valid_block_ids]
+        lm_logits = decoder_output.logits
+        lm_logits = lm_logits[valid_block_ids]
         return lm_logits
 
     def _parse_and_validate_audio_input(self, **kwargs: object) -> WhisperAudioInputs:
