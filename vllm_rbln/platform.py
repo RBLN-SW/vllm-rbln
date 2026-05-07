@@ -153,6 +153,23 @@ class RblnPlatform(Platform):
                 "path."
             )
 
+        # async_scheduling + spec decode together would hit an IndexError
+        # at rbln_model_runner.py:736 because valid_sampled_token_count_event
+        # is never wired up on RBLN (upstream uses torch.cuda.Stream/Event,
+        # which don't apply to PrivateUse1). Fail fast with a clear message
+        # rather than crash deep inside _update_states.
+        if (
+            scheduler_config.async_scheduling
+            and vllm_config.speculative_config is not None
+        ):
+            raise NotImplementedError(
+                "async_scheduling + speculative decoding is not yet "
+                "supported on RBLN. The valid_sampled_token_count copy "
+                "path needs a CPU-side replacement for torch.cuda.Stream/"
+                "Event before this combination can be enabled. Either "
+                "disable --async-scheduling or drop --speculative-config."
+            )
+
         cls.validate_and_setup_prerequisite(vllm_config)
         # Use RBLN device tensors for torch.compile/runtime on the
         # native vLLM model path.
