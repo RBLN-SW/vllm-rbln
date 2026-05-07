@@ -335,12 +335,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
         )
 
-        # Async scheduling is forced off in platform.py (RBLN does not support
-        # it; check_and_update_config flips scheduler_config.async_scheduling
-        # to False). Keep the attribute pinned to False so the few dead
-        # `if self.use_async_scheduling:` branches scattered through this
-        # file stay parseable until they're swept in a follow-up cycle.
-        self.use_async_scheduling = False
+        self.use_async_scheduling = self.scheduler_config.async_scheduling
 
         # Cache the device properties.
         self._init_device_properties()
