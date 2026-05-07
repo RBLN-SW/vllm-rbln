@@ -3728,14 +3728,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             if hasattr(attn_metadatum, "kv_cache_view_infos"):
                 attn_metadatum.kv_cache_view_infos = None
 
-    def _get_kv_cache_forward_context_kwargs(
-        self,
-    ) -> dict[str, tuple[torch.Tensor, ...]]:
-        # Cycle 5c: no kv_cache_bases sidecar, so nothing to add to
-        # forward context. Kept as a method to preserve the call-site
-        # contract used by execute_model / dummy_run.
-        return {}
-
     def initialize_kv_cache_tensors(
         self, kv_cache_config: KVCacheConfig, kernel_block_sizes: list[int]
     ) -> dict[str, torch.Tensor]:
