@@ -444,6 +444,15 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 pin_memory=self.pin_memory,
             )
 
+        # STREAM-5: dedicated stream for the model forward dispatch. Wrapping
+        # the call below in `with torch.rbln.stream(self.forward_stream):` is
+        # the first real consumer of the streaming chain (Stream/Event +
+        # HybridRuntime.run_async + dynamo-backend stream-aware dispatch).
+        # Today RBLN compute is synchronous under PrivateUse1 so the stream
+        # is a logical handle; once the in-process dispatcher with async
+        # queue (Phase E STREAM-7) lands, this stream gates real overlap.
+        self.forward_stream: "torch.rbln.Stream" = torch.rbln.Stream()
+
         # Ephemeral state transferred between
         # execute_model() and sample_tokens().
         self.execute_model_state: ExecuteModelState | None = None
@@ -2485,7 +2494,14 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 LoRAInputs.set_sampler_indices_padded(sampler_indices_padded)
 
             model_start_time = time.perf_counter()
-            with capture_ctx as reports:
+            # STREAM-5: wrap the compiled forward in our dedicated stream so
+            # the Dynamo backend's stream-aware dispatch (rbln_dynamo_backend)
+            # picks up `self.forward_stream` instead of the implicit current
+            # stream. The wrap lives OUTSIDE the torch.compile-wrapped function
+            # because `torch.rbln.stream` is a contextvar-based Python context
+            # manager and is not Dynamo-allowlisted — placing it inside the
+            # compiled wrapper would either graph-break or skip capture.
+            with torch.rbln.stream(self.forward_stream), capture_ctx as reports:
                 model_output = self.model_executable(
                     input_ids=input_ids,
                     positions=positions,
