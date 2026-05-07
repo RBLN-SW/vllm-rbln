@@ -466,10 +466,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.max_prefill_batch_size = 1
         self.max_num_batched_tokens = self.scheduler_config.max_num_batched_tokens
 
-        # Cycle 5d (M3): bucketing_manager removed — dynamic shapes mean we
-        # pass real `num_reqs` directly. The historical
-        # `VLLM_RBLN_DECODE_BATCH_BUCKET_*` env vars are now no-ops.
-
         self.performance_tracker: PerformanceTracker | None = None
         self.sampler_performance_tracker: PerformanceTracker | None = None
         self.e2e_performance_tracker: PerformanceTracker | None = None

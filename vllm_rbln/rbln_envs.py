@@ -43,11 +43,6 @@ if TYPE_CHECKING:
     VLLM_RBLN_METRICS: bool = False
     VLLM_RBLN_NUMA: bool = True
     VLLM_RBLN_SORT_BATCH: bool = False
-    VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY: str = "exponential"
-    VLLM_RBLN_DECODE_BATCH_BUCKET_MIN: int = 1
-    VLLM_RBLN_DECODE_BATCH_BUCKET_STEP: int = 2
-    VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT: int = 1
-    VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS: list[int] = []
     VLLM_RBLN_USE_CUSTOM_KERNEL: bool = False
     VLLM_RBLN_AUTO_PORT: bool = True
     VLLM_RBLN_MOE_REDUCE_SCATTER: bool = False
@@ -67,54 +62,6 @@ def get_dp_impl() -> str:
             f"Invalid VLLM_RBLN_DP_IMPL: {current_impl}, Valid choices: {choices}"
         )
     return current_impl
-
-
-def get_decode_batch_bucket_strategy() -> str:
-    decode_batch_bucket_strategy = os.environ.get(
-        "VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY"
-    )
-    if decode_batch_bucket_strategy is None:
-        return "exponential"
-    choices = set(["exponential", "exp", "linear", "manual"])
-    current_strategy = decode_batch_bucket_strategy.lower()
-    if current_strategy not in choices:
-        raise ValueError(
-            f"Invalid VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY: {current_strategy}, "
-            f"Valid choices: {choices}",
-        )
-    if current_strategy == "manual":
-        buckets = get_decode_batch_bucket_manual_buckets()
-        if len(buckets) < 1:
-            raise ValueError(
-                "There must be at least one decode batch size in the manual buckets"
-            )
-    elif current_strategy == "exp":
-        return "exponential"
-    return current_strategy
-
-
-def get_decode_batch_bucket_manual_buckets() -> list[int]:
-    manual_buckets = os.environ.get("VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS")
-    if manual_buckets is None:
-        return []
-    try:
-        buckets = [int(bucket) for bucket in manual_buckets.split(",")]
-        if any(bucket <= 0 for bucket in buckets):
-            raise ValueError(
-                "All decode batch bucket manual buckets must be greater than 0"
-            )
-        if len(buckets) < 1:
-            raise ValueError(
-                "There must be at least one decode batch size in the manual buckets"
-            )
-        if len(buckets) != len(set(buckets)):
-            raise ValueError("All decode batch bucket manual buckets must be unique")
-        return buckets
-    except ValueError as e:
-        raise ValueError(
-            f"Invalid VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS: "
-            f"{manual_buckets}, {e}"
-        ) from e
 
 
 # extended environments
@@ -218,26 +165,10 @@ environment_variables = {
     "VLLM_RBLN_SORT_BATCH": (
         lambda: os.environ.get("VLLM_RBLN_SORT_BATCH", "False").lower() in ("true", "1")
     ),
-    # Decode batch bucket strategy [exponential, exp, linear, manual]
-    "VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY": get_decode_batch_bucket_strategy,
-    # Decode batch bucket min
-    "VLLM_RBLN_DECODE_BATCH_BUCKET_MIN": lambda: int(
-        os.environ.get("VLLM_RBLN_DECODE_BATCH_BUCKET_MIN", 1)
-    ),
-    # Decode batch bucket step
-    "VLLM_RBLN_DECODE_BATCH_BUCKET_STEP": lambda: int(
-        os.environ.get("VLLM_RBLN_DECODE_BATCH_BUCKET_STEP", 2)
-    ),
-    # Decode batch bucket limit
-    "VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT": lambda: int(
-        os.environ.get("VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT", 1)
-    ),
     # Auto port
     "VLLM_RBLN_AUTO_PORT": (
         lambda: os.environ.get("VLLM_RBLN_AUTO_PORT", "False").lower() in ("true", "1")
     ),
-    # Decode batch bucket manual buckets
-    "VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS": get_decode_batch_bucket_manual_buckets,  # noqa E501
     "VLLM_RBLN_USE_CUSTOM_KERNEL": _torch_rbln_use_custom_kernel,
     # Use reduce_scatter instead of all_reduce in MoE combine phase
     "VLLM_RBLN_MOE_REDUCE_SCATTER": (
