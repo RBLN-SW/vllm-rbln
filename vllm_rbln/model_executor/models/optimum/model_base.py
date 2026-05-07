@@ -11,15 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
 import math
 import os
-from pathlib import Path
 from typing import Any
 
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
-from vllm.logger import init_logger
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.models.interfaces_base import VllmModelForTextGeneration
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -29,31 +28,14 @@ import vllm_rbln.rbln_envs as envs
 from optimum.rbln.transformers.models.decoderonly import (
     decoderonly_runtime_utils as runtime_utils,
 )
-from vllm_rbln.utils.optimum.common import select_bucket_size
-from vllm_rbln.utils.optimum.registry import compile_model, get_rbln_model_info
+from vllm_rbln.logger import init_logger
+from vllm_rbln.utils.optimum.block_size import get_attn_block_size
+from vllm_rbln.utils.optimum.bucket import select_bucket_size
+from vllm_rbln.utils.optimum.registry import get_rbln_model_info
+
+from .compilation import RBLNCompileSpec
 
 logger = init_logger(__name__)
-
-
-def get_attn_block_size(vllm_config: VllmConfig) -> int:
-    if vllm_config.cache_config.enable_prefix_caching:
-        block_size = vllm_config.additional_config["attn_block_size"]
-    else:
-        block_size = vllm_config.cache_config.block_size
-    return block_size
-
-
-def generate_model_path_name(
-    model_name: str,
-    batch_size: int,
-    block_size: int,
-    max_model_len: int,
-    tp_size: int,
-) -> str:
-    # FIXME: To avoid cache collisions, the cache key should also include
-    # the versions of the compiler and optimum-rbln.
-    model_name = model_name.replace("/", "_").replace(":", "_")
-    return f"{model_name}_bs{batch_size}_blk{block_size}_msl{max_model_len}_tp{tp_size}"
 
 
 class KVCacheBlockAdapter:
@@ -119,7 +101,6 @@ class KVCacheBlockAdapter:
             blk_ratio = ob_size // ib_size
         else:
             blk_ratio = 1
-
         if self.is_full_block_available():
             new_estimated = self._estimated_num_blocks() * blk_ratio
             return new_estimated + 1
@@ -190,90 +171,61 @@ class RBLNOptimumModelBase(nn.Module):
             return int(self.scheduler_config.max_num_seqs)
 
     def init_model(self) -> None:
-        # Check if the model is already compiled and load it;
-        # else compile the model and load it.
-        config = self.model_config.hf_config
-        if isinstance(self.model_config.model, str | Path) and os.path.exists(
-            self.model_config.model
-        ):
-            model_path = Path(self.model_config.model)
-            if model_path.is_dir() and any(model_path.glob("rbln_config.json")):
-                is_compiled_model = True
-            else:
-                is_compiled_model = False
+        hf_config = self.model_config.hf_config
+        cached_model_path = self.vllm_config.additional_config.get("cached_model_path")
+        rbln_overrides = self.vllm_config.additional_config.get("rbln_config", {})
+        _, model_cls_name = get_rbln_model_info(hf_config)
+        model_path = self.vllm_config.model_config.model
+        if os.path.exists(model_path):
+            valid_path = model_path
+        elif cached_model_path and os.path.exists(cached_model_path):
+            valid_path = cached_model_path
         else:
-            is_compiled_model = False
+            valid_path = None
 
-        model_name, model_cls_name = get_rbln_model_info(config)
-        model = None
-
-        # If a HuggingFace model (not optimum-compiled) is given,
-        # look up the cached compiled model.
-        # If it does not exist, compile and save it to the cache for future use.
-        if not is_compiled_model:
-            model_path_name = generate_model_path_name(
-                self.model_config.model,
+        if valid_path is not None:
+            # pre-compiled OR cache-hit
+            model_cls = getattr(optimum.rbln, model_cls_name)
+            assert model_cls is not None
+            # FIXME decouple producer logic from model_base.py
+            if self._is_ec_producer_only():
+                if model_cls_name != "RBLNQwen3VLForConditionalGeneration":
+                    raise ValueError("Disaggregation is not supported for this model.")
+                visual = model_cls.load_visual_encoder(valid_path)
+                model = _ProducerOptimumModelProxy(visual, visual.rbln_config)
+            else:
+                # NOTE:
+                # ``sync_vllm_and_optimum`` already narrowed user overrides
+                # down to device-only keys; we forward only those here.
+                model = model_cls.from_pretrained(
+                    valid_path,
+                    rbln_config=rbln_overrides,
+                )
+                self.vllm_config.model_config.model = valid_path
+        else:
+            assert not self._is_ec_producer_only(), (
+                "Disaggregated Encoder is only supported for pre-compiled model."
+            )
+            # cache miss: compile the model and save it to the cache for reuse.
+            spec = RBLNCompileSpec.for_architecture(
+                hf_config,
                 batch_size=self.scheduler_config.max_num_seqs,
                 block_size=get_attn_block_size(self.vllm_config),
                 max_model_len=self.model_config.max_model_len,
                 tp_size=envs.VLLM_RBLN_TP_SIZE,
+                rbln_overrides=rbln_overrides,
             )
-            cached_model_path = os.path.join(
-                envs.VLLM_CACHE_ROOT,
-                "compiled_models/" + model_path_name,
-            )
-            if not os.path.exists(cached_model_path):
-                logger.info(
-                    "Compiling the model %s. This may take a while...",
-                    self.model_config.model,
-                )
-                rbln_config = self.vllm_config.additional_config.get("rbln_config", {})
-                model = compile_model(
-                    self.model_config.model,
-                    config,
-                    batch_size=self.scheduler_config.max_num_seqs,
-                    block_size=get_attn_block_size(self.vllm_config),
-                    max_model_len=self.model_config.max_model_len,
-                    tp_size=envs.VLLM_RBLN_TP_SIZE,
-                    model_path=str(cached_model_path),
-                    additional_config=rbln_config,
-                )
-            else:
-                logger.info(
-                    "Found compiled model at %s. Loading the model from the path.",
-                    cached_model_path,
-                )
-            self.vllm_config.model_config.model = cached_model_path
-
-        # Load the model directly if it is either an optimum-compiled model
-        # or a HuggingFace model that has already been compiled and cached.
-        if model is None:
-            model_cls = getattr(optimum.rbln, model_cls_name)
-            assert model_cls is not None
-            model_path = Path(self.vllm_config.model_config.model)
-            ec_enabled_model = model_cls_name == "RBLNQwen3VLForConditionalGeneration"
-
-            if self._is_ec_producer_only():
-                if not ec_enabled_model:
-                    raise ValueError("Disaggregation is not supported for this model.")
-                visual = model_cls.load_visual_encoder(str(model_path))
-                model = _ProducerOptimumModelProxy(visual, visual.rbln_config)
-            else:
-                rbln_config = self.vllm_config.additional_config.get("rbln_config", {})
-                if self._is_ec_consumer_only():
-                    if not ec_enabled_model:
-                        raise ValueError(
-                            "Disaggregation is not supported for this model."
-                        )
-                    rbln_config["_load_visual_runtime"] = False
-                model = model_cls.from_pretrained(model_path, rbln_config=rbln_config)
-
             logger.info(
-                "model_name = %s, model_cls_name = %s, model_path = %s",
-                model_name,
-                model_cls_name,
-                model_path,
+                "Compiling %s via optimum-rbln (%s) with rbln_config:\n%s",
+                self.model_config.model,
+                spec.model_cls.__name__,
+                json.dumps(spec.rbln_config, indent=2, default=str),
             )
+            model = spec.model_cls.from_pretrained(
+                self.model_config.model, rbln_config=spec.rbln_config
+            )
+            model.save_pretrained(cached_model_path)  # type: ignore[attr-defined]
+            self.vllm_config.model_config.model = cached_model_path
 
         self.supports_transcription_only = (
             model_cls_name == "RBLNOptimumWhisperForConditionalGeneration"
@@ -282,7 +234,9 @@ class RBLNOptimumModelBase(nn.Module):
         self.model = model
         self.rbln_model_config = model.rbln_config
         self.attn_impl = (
-            model.get_attn_impl() if hasattr(model, "get_attn_impl") else None
+            model.get_attn_impl()  # type: ignore[func-returns-value]
+            if hasattr(model, "get_attn_impl")
+            else None
         )
 
     # ------------------------------------------------------------------

@@ -33,10 +33,8 @@ from vllm.utils.torch_utils import _StreamPlaceholder
 
 import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
-from vllm_rbln.utils.optimum.configuration import (
-    is_qwen3_pooling,
-    sync_with_rbln_config,
-)
+from vllm_rbln.utils.optimum.converter import sync_vllm_and_optimum
+from vllm_rbln.utils.optimum.predicates import is_qwen3_pooling
 from vllm_rbln.utils.optimum.registry import (
     is_enc_dec_arch,
     is_multi_modal,
@@ -269,7 +267,7 @@ class RblnPlatform(Platform):
                     del model_config.__dict__["is_encoder_decoder"]
 
             cls.disable_unsupported_prefix_caching(vllm_config)
-            sync_with_rbln_config(vllm_config)
+            sync_vllm_and_optimum(vllm_config)
 
         if (
             parallel_config.distributed_executor_backend is not None
@@ -351,7 +349,7 @@ class RblnPlatform(Platform):
 
         else:
             # Prefix caching is supported only for decoder-only models for now.
-            if is_qwen3_pooling(vllm_config):
+            if is_qwen3_pooling(vllm_config.model_config):
                 # Qwen3 pooling model does not support prefix caching for now.
                 cls._disable_prefix_caching(vllm_config, "Qwen3 pooling models")
             elif is_enc_dec_arch(hf_config):

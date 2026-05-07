@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # Copyright 2025 Rebellions Inc. All rights reserved.
 
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,11 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import bisect
-from functools import cache
+from .common import get_language_model_config
 
 
-@cache
-def select_bucket_size(original_batch_size: int, bucket_sizes: tuple):
-    index = bisect.bisect_left(bucket_sizes, original_batch_size)
-    return bucket_sizes[index]
+def get_param_idefics3(
+    batch_size: int, max_model_len: int, block_size: int, tp_size: int
+) -> dict:
+    language_model_config = get_language_model_config(
+        batch_size, max_model_len, block_size, tp_size
+    )
+    return {"text_model": language_model_config}

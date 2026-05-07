@@ -72,6 +72,10 @@ jobs:
               name : "worker",
               runner : "rbln-sw-k8s-general"
             },
+            {
+              name : "optimum_compile",
+              runner : "rbln-sw-k8s-general"
+            },
           ]
     steps:
       - name: Checkout the vllm-rbln repository
@@ -116,6 +120,11 @@ jobs:
               ;;
             "worker")
               if [[ "$COMMIT_MESSAGE" == *"[skip worker]"* ]]; then
+                SKIP=true
+              fi
+              ;;
+            "optimum_compile")
+              if [[ "$COMMIT_MESSAGE" == *"[skip optimum_compile]"* ]]; then
                 SKIP=true
               fi
               ;;
@@ -177,6 +186,9 @@ jobs:
               ;;
             "worker")
               pytest tests/v1/worker/test_rebel_optimum_model_runner.py -vv --durations 0
+              ;;
+            "optimum_compile")
+              pytest tests/optimum_compile -vv --durations 0
               ;;
           esac
 

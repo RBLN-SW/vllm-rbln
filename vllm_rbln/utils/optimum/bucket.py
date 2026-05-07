@@ -12,12 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest.mock import patch
+import bisect
+from functools import cache
 
-import pytest
 
-
-@pytest.fixture(autouse=True)
-def skip_sync_vllm_and_optimum():
-    with patch("vllm_rbln.platform.sync_vllm_and_optimum"):
-        yield
+@cache
+def select_bucket_size(original_batch_size: int, bucket_sizes: tuple) -> int:
+    index = bisect.bisect_left(bucket_sizes, original_batch_size)
+    return bucket_sizes[index]

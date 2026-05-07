@@ -38,3 +38,5 @@ def get_param_qwen2_vl(
 
 
 get_param_qwen2_5_vl = get_param_qwen2_vl
+get_param_qwen3_vl = get_param_qwen2_vl
+get_param_qwen3_vl_moe = get_param_qwen2_vl
