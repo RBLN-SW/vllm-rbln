@@ -66,8 +66,6 @@ class RBLNEagleProposer(EagleProposer):
         | None = None,
     ) -> torch.Tensor:
         batch_size = next_token_ids.shape[0]
-        # Cycle 5d (M4): runner-side `is_prefill_phase()` is gone; the
-        # eagle proposer derives the same classification locally.
         input_batch = self.runner.input_batch
         is_prefill = bool(
             input_batch.num_computed_tokens_cpu[0]
@@ -98,13 +96,11 @@ class RBLNEagleProposer(EagleProposer):
         assert self.runner is not None
 
         # NOTE(RBLN): build attention metadata.
-        # Cycle 5d (M3): bucketing removed — pass real batch size through.
-        batch_bucket_size = batch_size
         num_padded_tokens = None
         num_tokens_across_dp = None
         extra_attn_metadata_args = {}
         extra_attn_metadata_args["positions"] = target_positions.cpu()
-        extra_attn_metadata_args["batch_pad"] = batch_bucket_size
+        extra_attn_metadata_args["batch_pad"] = batch_size
         extra_attn_metadata_args["is_prefill"] = is_prefill
         per_layer_attn_metadata: dict[str, object] = {}
         for attn_group in self.draft_attn_groups:
@@ -144,12 +140,8 @@ class RBLNEagleProposer(EagleProposer):
                 )
             else:
                 input_ids = self.input_ids[:num_input_tokens].view(batch_size, -1)
-                input_ids = rbln_utils.pad(input_ids, 0, batch_bucket_size)
                 positions = target_positions.view(batch_size, -1)
-                positions = rbln_utils.pad(positions, -2, batch_bucket_size, -2)
-            token_indices_to_sample_padded = rbln_utils.pad(
-                token_indices_to_sample, 0, batch_bucket_size
-            )
+            token_indices_to_sample_padded = token_indices_to_sample
             hidden_states = target_hidden_states.view(*input_ids.shape, -1)
             inputs_embeds = None
 
@@ -276,7 +268,7 @@ class RBLNEagleProposer(EagleProposer):
             # Rebuild attention metadata
             extra_attn_metadata_args = {}
             extra_attn_metadata_args["positions"] = positions.cpu()
-            extra_attn_metadata_args["batch_pad"] = batch_bucket_size
+            extra_attn_metadata_args["batch_pad"] = batch_size
             extra_attn_metadata_args["is_prefill"] = False
             for attn_group in self.draft_attn_groups:
                 attn_metadata = attn_group.get_metadata_builder().build(
@@ -305,14 +297,14 @@ class RBLNEagleProposer(EagleProposer):
                 inputs_embeds = self.inputs_embeds[:batch_size]
             else:
                 # NOTE(RBLN): reshape tensors in the same way as the RBLN model runner.
-                input_ids = self.input_ids[:batch_bucket_size].view(
-                    batch_bucket_size, 1
+                input_ids = self.input_ids[:batch_size].view(
+                    batch_size, 1
                 )
-                positions = self.positions[:batch_bucket_size].view(
-                    batch_bucket_size, 1
+                positions = self.positions[:batch_size].view(
+                    batch_size, 1
                 )
-                hidden_states = self.hidden_states[:batch_bucket_size].view(
-                    batch_bucket_size, 1, -1
+                hidden_states = self.hidden_states[:batch_size].view(
+                    batch_size, 1, -1
                 )
                 inputs_embeds = None
 

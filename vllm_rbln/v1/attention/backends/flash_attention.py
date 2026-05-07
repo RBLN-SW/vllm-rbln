@@ -1048,8 +1048,6 @@ class RBLNFlashAttentionMetadataBuilder(
         self.compilation_config = vllm_config.compilation_config
         self.scheduler_config = vllm_config.scheduler_config
 
-        # self.runner = runner
-        # self.input_batch = runner.input_batch
         self.num_heads_q = self.model_config.get_num_attention_heads(
             self.parallel_config
         )
@@ -1300,10 +1298,6 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
 
         assert self.num_heads % self.num_kv_heads == 0
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
-        # unused?
-        self.need_mask = (
-            self.alibi_slopes is not None or self.sliding_window is not None
-        )
 
         supported_head_sizes = RBLNAttentionBackend.get_supported_head_sizes()
         if head_size not in supported_head_sizes:
@@ -1361,18 +1355,12 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
             attn_out  = [num_tokens, num_heads * head_size]
 
             hidden_size = num_heads * head_size
-        """
-        # B - num_blocks == num_partitions
-        # S - block_size == partition_size
-        # H - num_kv_heads
-        # G - num_heads / num_kv_heads = 4
-        # D - head_size
-        # L - query length
-        # C - max_seq_len
-        # NB- num batch
 
-        # 1. query reshape for custom operation
-        # query = [b_size(batch), q_len(query len), num_heads * head_size]
+        Shape legend (used in the comments below):
+            B = num_blocks  S = block_size  H = num_kv_heads
+            G = num_heads / num_kv_heads    D = head_size
+            L = query length  C = max_seq_len  NB = num_batch
+        """
         b_size, q_len, _ = query.size()
         query = query.view(b_size, q_len, self.num_heads, self.head_size).transpose(
             1, 2
@@ -1387,34 +1375,6 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         )
         value = value.view(b_size, self.num_kv_heads, 1, q_len, self.head_size)
 
-        # NOTE - for cache update,
-        # slot mapping will be necessary from sequence index
-        # slot_mapping = [block_number, block_offset]
-
-        # flash_attention_naive extended to have cache update
-        # cache update is included into flash attention
-        # but not within partition loop
-        # input = {q, k, v, kv_cache, mask, scalar_scale,
-        # seq_lens, block_table, slot_mapping}
-        # output = {attn_output}
-        # q, k, v = [batch,H,G,L,D]
-        # key/value cache = [B,H,1,S,D]
-        # mask  = [1,1,1,L,C]
-        # o = [batch,H,G,L,D]
-
-        # build attention mask within [0, 1]
-        # - attention mask SHOULD be causal mask based on query length
-        # - attention mask is used for masked softmax not actual value
-        # if there is not positional embedding,
-        # it can be merged into attention mask
-        # attn_masks = _make_alibi_bias(alibi_slopes, dtype, seq_lens)
-        # seq_lens_tensor (1, num_partition = 128k / k = 128)
-        # ex) tensor[partition0 = 1024, partition1 = 10,
-        # partition2 = 0, partition3 = 0] for len=1034
-        # block_tables tensor (1, num_blocks = 256)
-        # ex) tensor[block0 : 0, block1 : 100,
-        #  block2: 10, block3: 5, ...]
-        # attn_output = [batch,H,4,L,D]
         assert kv_cache is not None
 
         if self.sliding_window is not None:
