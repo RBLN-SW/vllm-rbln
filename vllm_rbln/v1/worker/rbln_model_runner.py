@@ -1753,7 +1753,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # _prepare_inputs may reorder the batch, so we must gather multi
         # modal outputs after that to ensure the correct order
-        use_dt = True
         if (
             self.supports_mm_inputs
             and get_pp_group().is_first_rank
@@ -1781,19 +1780,15 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 **self._extract_mm_kwargs(scheduler_output),
             }
         else:
-            # For text-only models, we use token ids as input. Under device-tensor
-            # mode, use the CPU buffer so view/pad/clone stay on CPU; it is moved
-            # to self.device just before model_executable.
-            ids_buf = self.input_ids.cpu if use_dt else self.input_ids.gpu
-            input_ids = ids_buf[:num_input_tokens]
+            # Text-only: use the CPU buffer so view/pad/clone stay on CPU;
+            # the tensor is moved to self.device just before model_executable.
+            input_ids = self.input_ids.cpu[:num_input_tokens]
             inputs_embeds = None
             model_kwargs = self._init_model_kwargs(num_input_tokens)
         if self.uses_mrope:
-            pos_buf = self.mrope_positions.cpu if use_dt else self.mrope_positions.gpu
-            positions = pos_buf[:, :num_input_tokens]
+            positions = self.mrope_positions.cpu[:, :num_input_tokens]
         else:
-            pos_buf = self.positions.cpu if use_dt else self.positions.gpu
-            positions = pos_buf[:num_input_tokens]
+            positions = self.positions.cpu[:num_input_tokens]
 
         if (
             self.model_config.is_encoder_decoder
