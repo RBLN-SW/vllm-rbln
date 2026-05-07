@@ -1043,19 +1043,21 @@ class TestPlatformPinMemoryAndAsync:
 
         assert vllm_config.scheduler_config.async_scheduling is False
 
-    def test_check_and_update_config_rejects_async_plus_spec(self):
-        """async_scheduling + speculative_config is not yet supported on
-        RBLN — _get_valid_sampled_token_count would IndexError. Fail fast
-        with a clear message at config check."""
+    def test_check_and_update_config_accepts_async_plus_spec(self):
+        """async_scheduling + speculative_config now passes config check.
+        torch.rbln.Stream/Event provide the no-op replacement for
+        torch.cuda.Stream/Event in _copy_valid_sampled_token_count."""
         from contextlib import ExitStack
 
         from vllm_rbln.platform import RblnPlatform
 
         vllm_config = self._build_vllm_config(async_scheduling=True)
-        # Any non-None object is enough to trip the guard.
+        # Any non-None object is enough — platform doesn't introspect it.
         vllm_config.speculative_config = SimpleNamespace()
 
         with ExitStack() as stack:
             self._patched_envs(stack)
-            with pytest.raises(NotImplementedError, match="async_scheduling"):
-                RblnPlatform.check_and_update_config(vllm_config)
+            RblnPlatform.check_and_update_config(vllm_config)
+
+        assert vllm_config.scheduler_config.async_scheduling is True
+        assert vllm_config.speculative_config is not None

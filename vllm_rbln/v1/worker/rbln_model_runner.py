@@ -442,7 +442,24 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             pin_memory=self.pin_memory,
         )
 
+        # Spec-decode + async-scheduling pipelines a per-step CPU copy of
+        # valid_sampled_tokens_count overlapping the draft-model prepare.
+        # On RBLN, torch.rbln.Stream / torch.rbln.Event are no-ops (compute
+        # is synchronous under PrivateUse1), so the "event" just acts as a
+        # gate around the copy buffer's lifetime — the actual sync happens
+        # eagerly inside Tensor.copy_.
         self.valid_sampled_token_count_event: torch.Event | None = None
+        self.valid_sampled_token_count_copy_stream: "torch.rbln.Stream | None" = None
+        self.valid_sampled_token_count_cpu: torch.Tensor | None = None
+        if self.num_spec_tokens and self.use_async_scheduling:
+            self.valid_sampled_token_count_event = torch.rbln.Event()
+            self.valid_sampled_token_count_copy_stream = torch.rbln.Stream()
+            self.valid_sampled_token_count_cpu = torch.empty(
+                self.max_num_seqs,
+                dtype=torch.int64,
+                device="cpu",
+                pin_memory=self.pin_memory,
+            )
 
         # Ephemeral state transferred between
         # execute_model() and sample_tokens().
@@ -2854,10 +2871,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         if self.valid_sampled_token_count_event is None:
             return
 
-        default_stream = torch.cuda.current_stream()
-        # Initialize a new stream to overlap the copy operation with
-        # prepare_input of draft model.
-        with torch.cuda.stream(self.valid_sampled_token_count_copy_stream):
+        default_stream = torch.rbln.current_stream()
+        # On CUDA this overlaps the count copy with the draft-model
+        # prepare_input via a side stream + event. On RBLN the stream/
+        # event API is no-op (PrivateUse1 dispatch is synchronous), so
+        # the body executes inline — the same shape works either way.
+        with torch.rbln.stream(self.valid_sampled_token_count_copy_stream):
             self.valid_sampled_token_count_copy_stream.wait_stream(default_stream)  # type: ignore
             counts = valid_sampled_tokens_count
             counts_cpu = self.valid_sampled_token_count_cpu
