@@ -15,14 +15,15 @@
 import os
 from typing import TYPE_CHECKING
 
-from vllm.envs import environment_variables as vllm_envs
-
 # Canonical readers live in torch_rbln so the OS-env names
 # (`RBLN_PROFILER`, `RBLN_USE_CUSTOM_KERNEL`) have one source of truth.
 from torch_rbln import (  # noqa: E402
     is_profiler_enabled as _torch_rbln_is_profiler_enabled,
+)
+from torch_rbln import (
     use_custom_kernel as _torch_rbln_use_custom_kernel,
 )
+from vllm.envs import environment_variables as vllm_envs
 
 if TYPE_CHECKING:
     VLLM_RBLN_COMPILE_MODEL: bool = True
@@ -47,6 +48,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_AUTO_PORT: bool = True
     VLLM_RBLN_MOE_REDUCE_SCATTER: bool = False
     VLLM_RBLN_SUB_BLOCK_CACHE: bool = True
+    VLLM_RBLN_USE_FLASHINFER: bool = False
 
 
 def get_dp_impl() -> str:
@@ -182,6 +184,12 @@ environment_variables = {
     # Sub-block size equals max_num_batched_tokens (prefill chunk size).
     "VLLM_RBLN_SUB_BLOCK_CACHE": lambda: (
         os.environ.get("VLLM_RBLN_SUB_BLOCK_CACHE", "True").lower() in ("true", "1")
+    ),
+    # Use flashinfer_rbln paged attention kernels instead of the built-in
+    # rbln_custom_ops / rbln_triton_ops attention dispatch.
+    # Set VLLM_RBLN_USE_FLASHINFER=1 to enable.
+    "VLLM_RBLN_USE_FLASHINFER": lambda: (
+        os.environ.get("VLLM_RBLN_USE_FLASHINFER", "False").lower() in ("true", "1")
     ),
 }
 

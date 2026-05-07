@@ -1026,6 +1026,10 @@ class RBLNFlashAttentionMetadata:
     local_block_tables: torch.Tensor | None = None
     swa_attn_masks: torch.Tensor | None = None
 
+    # For flashinfer_rbln dispatch (populated by RBLNFlashAttentionMetadataBuilder
+    # when VLLM_RBLN_USE_FLASHINFER=1; None otherwise).
+    _flashinfer_metadata: object | None = None  # flashinfer_rbln.RBLNAttentionMetadata
+
 
 class RBLNFlashAttentionMetadataBuilder(
     AttentionMetadataBuilder[RBLNFlashAttentionMetadata]
@@ -1245,7 +1249,118 @@ class RBLNFlashAttentionMetadataBuilder(
             else None,
         )
 
+        if envs.VLLM_RBLN_USE_FLASHINFER:
+            attn_metadata._flashinfer_metadata = self._build_flashinfer_metadata(
+                attn_metadata=attn_metadata,
+                num_reqs=num_reqs,
+                num_actual_tokens=num_actual_tokens,
+                seq_lens_cpu=seq_lens_cpu,
+                raw_block_tables=common_attn_metadata.block_table_tensor,
+                batch_pad=batch_pad,
+                is_prefill=is_prefill,
+            )
+
         return attn_metadata
+
+    def _build_flashinfer_metadata(
+        self,
+        attn_metadata: "RBLNFlashAttentionMetadata",
+        num_reqs: int,
+        num_actual_tokens: int,
+        seq_lens_cpu: torch.Tensor,
+        raw_block_tables: torch.Tensor,
+        batch_pad: int,
+        is_prefill: bool,
+    ) -> object:
+        """Construct a flashinfer_rbln.RBLNAttentionMetadata from the vllm-rbln
+        attention metadata built for the current forward step.
+
+        This is called once per step (not per layer).  The workspace is compiled
+        (or cache-hit) by flashinfer_rbln.plan() and stored on the returned
+        RBLNAttentionMetadata._workspace so that run() in forward() is cheap.
+
+        Mapping:
+          vllm-rbln                          flashinfer_rbln
+          ─────────────────────────────────  ─────────────────────────────
+          common_attn_metadata.block_table_tensor[:num_reqs]
+                                          -> PagedKVMetadata.block_tables
+          seq_lens_cpu                    -> PagedKVMetadata.seq_lens
+          attn_metadata.slot_mapping      -> RBLNAttentionMetadata.slot_mapping
+          kv_cache.shape[1]               -> PagedKVMetadata.num_pages
+          block_size                      -> PagedKVMetadata.block_size
+        """
+        try:
+            from flashinfer_rbln import PagedKVMetadata, plan
+            from flashinfer_rbln import RBLNAttentionMetadata as FIMetadata
+        except ImportError:
+            logger.warning_once(
+                "VLLM_RBLN_USE_FLASHINFER=1 but flashinfer_rbln is not installed. "
+                "Falling back to built-in RBLN attention ops. "
+                "Install it with: pip install "
+                "flashinfer-rbln @ file:///path/to/rbln-toolchain/flashinfer_rbln"
+            )
+            return None
+
+        block_size = self.block_size
+        max_seq_len = self.model_config.max_model_len
+        max_blocks_per_seq = max_seq_len // block_size
+
+        # raw_block_tables is [batch_pad, num_partitions] (CPU, padded) for
+        # decode; for prefill it was sliced to 1-D before we get here so we
+        # reconstruct the 2-D shape from the original tensor.
+        if is_prefill:
+            # Prefill: single request, seq_lens_cpu contains length of that req.
+            num_prefill_tokens = int(num_actual_tokens)
+            num_decode_tokens = 0
+            seq_lens_list = seq_lens_cpu[:num_reqs].tolist()
+            # block_tables for prefill: [num_reqs, max_blocks_per_seq].
+            # raw_block_tables was already sliced to the first row (1D) by
+            # build(); reconstruct from seq_lens_cpu to a 2D CPU tensor.
+            bt_2d = raw_block_tables[:num_reqs].to(torch.int32)  # [1, P]
+            fi_paged_kv = PagedKVMetadata(
+                block_tables=bt_2d,
+                seq_lens=seq_lens_cpu[:num_reqs].to(torch.int32),
+                block_size=block_size,
+                num_pages=max_seq_len // block_size,  # conservative upper bound
+                max_blocks_per_seq=max_blocks_per_seq,
+            )
+            fi_metadata = FIMetadata(
+                num_prefill_tokens=num_prefill_tokens,
+                num_decode_tokens=num_decode_tokens,
+                slot_mapping=attn_metadata.slot_mapping,
+                seq_lens=seq_lens_list,
+                paged_kv=fi_paged_kv,
+            )
+        else:
+            # Decode: each of the num_reqs requests contributes exactly 1 token.
+            num_prefill_tokens = 0
+            num_decode_tokens = num_reqs
+            # raw_block_tables: [batch_pad, num_partitions] CPU int32.
+            bt_2d = raw_block_tables[:num_reqs].to(torch.int32)
+            fi_paged_kv = PagedKVMetadata(
+                block_tables=bt_2d,
+                seq_lens=seq_lens_cpu[:num_reqs].to(torch.int32),
+                block_size=block_size,
+                num_pages=max_seq_len // block_size,
+                max_blocks_per_seq=max_blocks_per_seq,
+            )
+            fi_metadata = FIMetadata(
+                num_prefill_tokens=num_prefill_tokens,
+                num_decode_tokens=num_decode_tokens,
+                slot_mapping=attn_metadata.slot_mapping,
+                seq_lens=None,
+                paged_kv=fi_paged_kv,
+            )
+
+        # plan() compiles kernels (cached by GLOBAL_CACHE on shape) and sets
+        # fi_metadata._workspace.  This is the per-step cost; run() is cheap.
+        plan(
+            fi_metadata,
+            num_q_heads=self.num_heads_q,
+            num_kv_heads=self.num_heads_kv,
+            head_dim=self.headdim,
+        )
+        return fi_metadata
 
     def use_cascade_attention(self, *args, **kwargs) -> bool:
         return False
@@ -1376,6 +1491,22 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         value = value.view(b_size, self.num_kv_heads, 1, q_len, self.head_size)
 
         assert kv_cache is not None
+
+        # ── flashinfer_rbln dispatch path ────────────────────────────────────
+        # Enabled by VLLM_RBLN_USE_FLASHINFER=1.  plan() is called once per
+        # step by RBLNFlashAttentionMetadataBuilder.build() and the workspace
+        # is stored on attn_metadata._flashinfer_metadata._workspace.
+        # run() is called here, once per layer.
+        # Note: sliding-window attention is NOT supported by flashinfer_rbln;
+        # we fall through to the built-in path in that case.
+        if (
+            envs.VLLM_RBLN_USE_FLASHINFER
+            and self.sliding_window is None
+            and getattr(attn_metadata, "_flashinfer_metadata", None) is not None
+        ):
+            return self._forward_flashinfer(
+                query, key, value, kv_cache, attn_metadata, b_size, q_len
+            )
 
         if self.sliding_window is not None:
             assert self.sliding_window == kv_cache.size(-2), (
@@ -1683,4 +1814,67 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                 b_size, q_len, self.num_heads * self.head_size
             )
         # attn_output = [batch,L,H*4*D]
+        return attn_output
+
+    def _forward_flashinfer(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: "RBLNFlashAttentionMetadata",
+        b_size: int,
+        q_len: int,
+    ) -> torch.Tensor:
+        """Attention forward using flashinfer_rbln kernels.
+
+        Called from forward() when VLLM_RBLN_USE_FLASHINFER=1 and the
+        metadata has a valid _flashinfer_metadata (set by
+        RBLNFlashAttentionMetadataBuilder.build()).
+
+        Tensor shapes at entry to this method (reshaped by forward()):
+          query: [b_size, num_kv_heads, num_queries_per_kv, q_len, head_size]
+          key:   [b_size, num_kv_heads, 1, q_len, head_size]
+          value: [b_size, num_kv_heads, 1, q_len, head_size]
+          kv_cache: [2, num_blocks, num_kv_heads, 1, block_size, head_size]
+
+        flashinfer_rbln kernel tensor contracts:
+          Decode  q: [batch, num_q_heads, head_dim]
+          Prefill q: [batch, seq_len, num_q_heads, head_dim]
+          k/v cache: [num_blocks, num_kv_heads, 1, block_size, head_dim]
+                     (matches our kv_cache[0/1] slices directly)
+
+        Returns:
+          [b_size, q_len, num_heads * head_size]
+        """
+        from flashinfer_rbln import run as flashinfer_run
+
+        fi_metadata = attn_metadata._flashinfer_metadata
+
+        # kv_cache[0] = k_cache, kv_cache[1] = v_cache.
+        # Shape: [num_blocks, num_kv_heads, 1, block_size, head_size]
+        k_cache = kv_cache[0]
+        v_cache = kv_cache[1]
+
+        if attn_metadata.is_prefill:
+            # Prefill: q shape expected by kernel = [batch, seq_len, num_q_heads, D].
+            # query entering here: [b, H_kv, G, L, D]
+            # Rearrange to [b, L, H_kv*G, D] = [b, seq_len, num_heads, D].
+            q_kernel = query.permute(0, 3, 1, 2, 4).reshape(  # [b, L, H_kv, G, D]
+                b_size, q_len, self.num_heads, self.head_size
+            )
+            out = torch.empty_like(q_kernel)
+            flashinfer_run(fi_metadata, q_kernel, k_cache, v_cache, out)
+            # out: [b, seq_len, num_heads, D] -> [b, seq_len, num_heads * D]
+            attn_output = out.reshape(b_size, q_len, self.num_heads * self.head_size)
+        else:
+            # Decode: q shape expected by kernel = [batch, num_q_heads, D].
+            # query entering here: [b, H_kv, G, q_len, D] with q_len=1 for decode.
+            # Collapse to [b, num_heads, D].
+            q_kernel = query.reshape(b_size, self.num_heads, self.head_size)
+            out = torch.empty_like(q_kernel)
+            flashinfer_run(fi_metadata, q_kernel, k_cache, v_cache, out)
+            # out: [b, num_heads, D] -> [b, 1, num_heads * D]  (q_len=1 for decode)
+            attn_output = out.reshape(b_size, q_len, self.num_heads * self.head_size)
+
         return attn_output

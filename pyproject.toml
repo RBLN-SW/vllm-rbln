@@ -63,6 +63,13 @@ dev = [
     "huggingface_hub",
     "fire",
 ]
+# Optional flashinfer_rbln paged attention kernels.
+# Enable at runtime with VLLM_RBLN_USE_FLASHINFER=1.
+# Install with:
+#   pip install "flashinfer-rbln @ file:///home/jinhwan.suk/workspace/rbln-toolchain/flashinfer_rbln"
+flashinfer = [
+    "flashinfer-rbln @ file:///home/jinhwan.suk/workspace/rbln-toolchain/flashinfer_rbln",
+]
 
 [project.urls]
 Homepage="https://rebellions.ai"
