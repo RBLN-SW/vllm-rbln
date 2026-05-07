@@ -48,11 +48,9 @@ def run_llm(llm, sampling_params, q):
 def _worker(device, q, llm_args):
     if device == "cpu":
         os.environ["VLLM_PLUGINS"] = "cpu"
-        os.environ["VLLM_USE_V1"] = "0"
     elif device == "rbln":
         os.environ.pop("VLLM_PLUGINS", None)
         os.environ["RBLN_KERNEL_MODE"] = "triton"
-        os.environ["VLLM_USE_V1"] = "0"
         os.environ["USE_VLLM_MODEL"] = "1"
         os.environ["VLLM_DISABLE_COMPILE_CACHE"] = "1"
         # 1 means disable using compile cache

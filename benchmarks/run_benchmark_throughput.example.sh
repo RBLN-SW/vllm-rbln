@@ -2,7 +2,7 @@
 # This script shows how to run the throughput benchmark with vLLM.
 
 # torch.compile path
-VLLM_LOGGING_LEVEL=warning RBLN_PROFILER=0 RBLN_KERNEL_MODE=triton USE_VLLM_MODEL=1 VLLM_DISABLE_COMPILE_CACHE=1 VLLM_USE_V1=0 \
+VLLM_LOGGING_LEVEL=warning RBLN_PROFILER=0 RBLN_KERNEL_MODE=triton USE_VLLM_MODEL=1 VLLM_DISABLE_COMPILE_CACHE=1 \
 python3 benchmark_throughput.py \
     --model meta-llama/Llama-3.2-1B-instruct \
     --backend vllm \

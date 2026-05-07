@@ -261,17 +261,14 @@ def set_env_for_device(device: str):
         "VLLM_PLUGINS",
         "RBLN_KERNEL_MODE",
         "USE_VLLM_MODEL",
-        "VLLM_USE_V1",
         "VLLM_DISABLE_COMPILE_CACHE",
     ]:
         os.environ.pop(k, None)
 
     if device == "cpu":
         os.environ["VLLM_PLUGINS"] = "cpu"
-        os.environ["VLLM_USE_V1"] = "0"
     elif device == "rbln":
         os.environ["RBLN_KERNEL_MODE"] = "triton"
-        os.environ["VLLM_USE_V1"] = "0"
         os.environ["USE_VLLM_MODEL"] = "1"
         os.environ["VLLM_DISABLE_COMPILE_CACHE"] = "1"
     else:
