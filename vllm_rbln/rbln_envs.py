@@ -17,6 +17,13 @@ from typing import TYPE_CHECKING
 
 from vllm.envs import environment_variables as vllm_envs
 
+# Canonical readers live in torch_rbln so the OS-env names
+# (`RBLN_PROFILER`, `RBLN_USE_CUSTOM_KERNEL`) have one source of truth.
+from torch_rbln import (  # noqa: E402
+    is_profiler_enabled as _torch_rbln_is_profiler_enabled,
+    use_custom_kernel as _torch_rbln_use_custom_kernel,
+)
+
 if TYPE_CHECKING:
     VLLM_RBLN_COMPILE_MODEL: bool = True
     VLLM_RBLN_COMPILE_STRICT_MODE: bool = False
@@ -231,11 +238,7 @@ environment_variables = {
     ),
     # Decode batch bucket manual buckets
     "VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS": get_decode_batch_bucket_manual_buckets,  # noqa E501
-    "VLLM_RBLN_USE_CUSTOM_KERNEL": (
-        lambda: (
-            os.environ.get("RBLN_USE_CUSTOM_KERNEL", "False").lower() in ("true", "1")
-        )
-    ),
+    "VLLM_RBLN_USE_CUSTOM_KERNEL": _torch_rbln_use_custom_kernel,
     # Use reduce_scatter instead of all_reduce in MoE combine phase
     "VLLM_RBLN_MOE_REDUCE_SCATTER": (
         lambda: (
@@ -243,9 +246,7 @@ environment_variables = {
             in ("true", "1")
         )
     ),
-    "VLLM_RBLN_PROFILER": (
-        lambda: os.environ.get("RBLN_PROFILER", "False").lower() in ("true", "1")
-    ),
+    "VLLM_RBLN_PROFILER": _torch_rbln_is_profiler_enabled,
     # Enable sub-block prefix caching.
     # Sub-block size equals max_num_batched_tokens (prefill chunk size).
     "VLLM_RBLN_SUB_BLOCK_CACHE": lambda: (
