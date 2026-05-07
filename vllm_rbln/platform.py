@@ -315,13 +315,16 @@ class RblnPlatform(Platform):
         if selected_backend and selected_backend != AttentionBackendEnum.FLASH_ATTN:
             logger.info("Cannot use %s backend on RBLN.", selected_backend)
         if attn_selector_config.use_mla:
-            raise NotImplementedError("MLA is not supported on RBLN.")
+            attn_backend_cls = (
+                "vllm_rbln.v1.attention.backends.mla.flashattn_mla."
+                "RBLNFlashAttnMLABackend"
+            )
+            logger.info("Using RBLN MLA Attention Backend: %s", attn_backend_cls)
+            return attn_backend_cls
         if attn_selector_config.use_sparse:
             raise NotImplementedError("Sparse Attention is not supported on RBLN.")
 
-        attn_backend_cls = (
-            "vllm_rbln.v1.attention.backends.flash_attention.RBLNAttentionBackend"
-        )
+        attn_backend_cls = AttentionBackendEnum.FLASH_ATTN.get_path()
         logger.info("Using RBLN Attention Backend: %s", attn_backend_cls)
 
         return attn_backend_cls
