@@ -28,6 +28,7 @@ jobs:
       matrix:
         vllm_version:
           - "0.18.0+cpu"
+          - "0.19.1+cpu"
     steps:
       - name: Dispatch to fsw-integration (vllm ${{ matrix.vllm_version }})
         uses: Wandalen/wretry.action@v3
