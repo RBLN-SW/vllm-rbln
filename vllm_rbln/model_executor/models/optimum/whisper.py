@@ -104,7 +104,6 @@ class RBLNOptimumWhisperForConditionalGeneration(
             cache_position=cache_position,
             input_block_ids=valid_block_ids,
         )
-        decoder_input_ids = kwargs.pop("input_ids")
         decoder_cache_position = kwargs.pop("cache_position")
         decoder_block_tables = kwargs.pop("block_tables")
         # FIXME Is it ok generate torch.zero tensor for each forward?
@@ -123,7 +122,11 @@ class RBLNOptimumWhisperForConditionalGeneration(
                 decoder_cache_position[batch_idx] = 0
                 decoder_attention_mask[batch_idx, 0] = 1
                 self.dec_lengths[batch_idx] = 1
-
+            decoder_input_ids = torch.full(
+                (self.batch_size, 1),
+                self.model.config.decoder_start_token_id,
+                dtype=torch.long,
+            )
             decoder_output = self.model.decoder(
                 decoder_input_ids=decoder_input_ids.contiguous(),
                 decoder_attention_mask=decoder_attention_mask,
@@ -132,6 +135,7 @@ class RBLNOptimumWhisperForConditionalGeneration(
             )
 
         else:
+            decoder_input_ids = kwargs.pop("input_ids")
             # Generate cache_position using dec_lengths
             for batch_idx in valid_block_ids:
                 decoder_cache_position[batch_idx] = self.dec_lengths[batch_idx]
