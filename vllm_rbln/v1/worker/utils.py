@@ -19,16 +19,47 @@ import platform
 from collections import defaultdict
 from collections.abc import Callable
 
+import numpy as np
 import torch
 from vllm.config import ModelConfig, ParallelConfig
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.platforms.cpu import CpuPlatform, LogicalCPUInfo
+from vllm.v1.worker.block_table import MultiGroupBlockTable
 
 import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+def compute_slot_mapping_cpu(
+    block_table: MultiGroupBlockTable,
+    req_indices: np.ndarray,
+    positions_np: np.ndarray,
+    total_num_scheduled_tokens: int,
+) -> None:
+    """Compute slot_mapping on CPU and sync to device.
+
+    vLLM 0.19 replaced the numpy slot_mapping path with a Triton kernel that
+    RBLN (CPU) cannot dispatch, so we always compute via numpy and push to
+    device ourselves. The same code works on 0.18 since all referenced
+    buffer attributes (``block_table.np``, ``slot_mapping.np``,
+    ``copy_to_gpu``) exist on both versions.
+    """
+    num_tokens = req_indices.shape[0]
+    for bt in block_table.block_tables:
+        block_table_indices = (
+            req_indices * bt.max_num_blocks_per_req + positions_np // bt.block_size
+        )
+        block_numbers = bt.block_table.np.ravel()[block_table_indices]
+        block_offsets = positions_np % bt.block_size
+        np.add(
+            block_numbers * bt.block_size,
+            block_offsets,
+            out=bt.slot_mapping.np[:num_tokens],
+        )
+        bt.slot_mapping.copy_to_gpu(total_num_scheduled_tokens)
 
 
 def estimate_model_kernel_size(

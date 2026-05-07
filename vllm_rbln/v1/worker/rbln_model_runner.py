@@ -38,7 +38,6 @@ from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.parallel_state import get_dp_group, get_pp_group, get_tp_group
-from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import TensorizerLoader, get_model_loader
@@ -69,6 +68,7 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 
+from vllm_rbln.forward_context import set_forward_context
 from vllm_rbln.v1.core.rbln_scheduler import RBLNSchedulerOutput
 
 if TYPE_CHECKING:
@@ -141,7 +141,7 @@ from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
 from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
 from vllm_rbln.v1.worker.metrics import PerformanceTracker, collect_metrics
-from vllm_rbln.v1.worker.utils import get_kv_cache_names
+from vllm_rbln.v1.worker.utils import compute_slot_mapping_cpu, get_kv_cache_names
 
 if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
@@ -1223,8 +1223,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             out=self.input_ids.cpu[:total_num_scheduled_tokens],
         )
 
-        self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
-        self.input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
+        compute_slot_mapping_cpu(
+            self.input_batch.block_table,
+            req_indices,
+            positions_np,
+            total_num_scheduled_tokens,
+        )
 
         # Prepare the attention metadata.
         self.query_start_loc.np[0] = 0
@@ -2182,8 +2186,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             out=input_ids[:total_num_scheduled_tokens],
         )
 
-        input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
-        input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
+        compute_slot_mapping_cpu(
+            input_batch.block_table,
+            req_indices,
+            positions_np,
+            total_num_scheduled_tokens,
+        )
 
         query_start_loc_np = self.query_start_loc.np.copy()
         query_start_loc_np[0] = 0

@@ -18,11 +18,11 @@ import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.distributed import get_dp_group, get_pp_group, get_tp_group
-from vllm.forward_context import set_forward_context
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.medusa import MedusaProposer
 
 import vllm_rbln.rbln_envs as envs
+from vllm_rbln.forward_context import set_forward_context
 
 
 class RBLNMedusaProposer(MedusaProposer):
