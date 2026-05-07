@@ -50,6 +50,9 @@ class RBLNEagleProposer(EagleProposer):
 
         self.compile_context = CompileContext(use_weight_sharing=True)
 
+        if self.supports_mm_inputs:
+            raise NotImplementedError("Multimodal inputs are not supported yet.")
+
     def propose(
         self,
         target_token_ids: torch.Tensor,
