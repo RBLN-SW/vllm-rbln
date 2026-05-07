@@ -50,6 +50,9 @@ class RBLNEagleProposer(EagleProposer):
 
         self.compile_context = CompileContext(use_weight_sharing=True)
 
+        if self.supports_mm_inputs:
+            raise NotImplementedError("Multimodal inputs are not supported yet.")
+
     def propose(
         self,
         target_token_ids: torch.Tensor,
@@ -335,6 +338,122 @@ class RBLNEagleProposer(EagleProposer):
         # [batch_size, num_speculative_tokens]
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
         return draft_token_ids
+
+    def prefill_only(
+        self,
+        target_token_ids: torch.Tensor,
+        target_positions: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        next_token_ids: torch.Tensor,
+        common_attn_metadata: CommonAttentionMetadata,
+        mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
+    ) -> None:
+        batch_size = next_token_ids.shape[0]
+        is_prefill = self.runner.is_prefill_phase()
+
+        if self.method == "eagle3":
+            # assert isinstance(
+            #     self.model, (Eagle3LlamaForCausalLM, Eagle3DeepseekV2ForCausalLM)
+            # )
+            target_hidden_states = self.model.combine_hidden_states(
+                target_hidden_states
+            )
+            assert target_hidden_states.shape[-1] == self.hidden_size
+
+        num_tokens, token_indices_to_sample, common_attn_metadata = (
+            self.set_inputs_first_pass(
+                target_token_ids=target_token_ids,
+                next_token_ids=next_token_ids,
+                target_positions=target_positions,
+                target_hidden_states=target_hidden_states,
+                token_indices_to_sample=None,
+                cad=common_attn_metadata,
+                num_rejected_tokens_gpu=None,
+            )
+        )
+
+        assert self.runner is not None
+
+        # NOTE(RBLN): build attention metadata
+        batch_bucket_size = self.runner.bucketing_manager.find_decode_batch_bucket(
+            batch_size
+        )
+        num_padded_tokens = None
+        num_tokens_across_dp = None
+        extra_attn_metadata_args = {}
+        extra_attn_metadata_args["positions"] = target_positions.cpu()
+        extra_attn_metadata_args["batch_pad"] = batch_bucket_size
+        extra_attn_metadata_args["is_prefill"] = is_prefill
+        per_layer_attn_metadata: dict[str, object] = {}
+        for attn_group in self.draft_attn_groups:
+            attn_metadata = attn_group.get_metadata_builder().build(
+                common_prefix_len=0,
+                common_attn_metadata=common_attn_metadata,
+                fast_build=True,
+                **extra_attn_metadata_args,
+            )
+            attach_kv_cache_bindings(
+                attn_metadata,
+                self.runner.kv_caches,
+                getattr(self.runner, "kv_cache_bases", None),
+                getattr(self.runner, "kv_cache_view_infos", None),
+            )
+            for layer_name in attn_group.layer_names:
+                per_layer_attn_metadata[layer_name] = attn_metadata
+
+        num_input_tokens = num_tokens
+        if self.supports_mm_inputs:
+            mm_embeds, is_mm_embed = mm_embed_inputs or (None, None)
+
+            self.inputs_embeds[:num_tokens] = self.model.embed_input_ids(
+                self.input_ids[:num_tokens],
+                multimodal_embeddings=mm_embeds,
+                is_multimodal=is_mm_embed,
+            )
+
+            input_ids = None
+            inputs_embeds = self.inputs_embeds[:num_input_tokens]
+        else:
+            # NOTE(RBLN): reshape tensors in the same way as the RBLN model runner.
+            if is_prefill:
+                input_ids = self.input_ids.view(batch_size, -1)
+                positions = rbln_utils.pad(
+                    target_positions.view(batch_size, -1), -1, input_ids.shape[-1], -1
+                )
+            else:
+                input_ids = self.input_ids[:num_input_tokens].view(batch_size, -1)
+                input_ids = rbln_utils.pad(input_ids, 0, batch_bucket_size)
+                positions = target_positions.view(batch_size, -1)
+                positions = rbln_utils.pad(positions, -2, batch_bucket_size, -2)
+            token_indices_to_sample_padded = rbln_utils.pad(
+                token_indices_to_sample, 0, batch_bucket_size
+            )
+            hidden_states = target_hidden_states.view(*input_ids.shape, -1)
+            inputs_embeds = None
+
+        if (
+            not self.vllm_config.speculative_config.enforce_eager
+            and envs.VLLM_RBLN_COMPILE_MODEL
+        ):
+            self.compile_context.mark_static_address(self.runner.kv_caches[-1])
+
+        with set_forward_context(
+            per_layer_attn_metadata,
+            self.vllm_config,
+            num_tokens=num_input_tokens,
+            num_tokens_across_dp=num_tokens_across_dp,
+            num_padded_tokens=num_padded_tokens,
+            additional_kwargs=build_kv_cache_forward_context_kwargs(
+                getattr(self.runner, "kv_cache_bases", None)
+            ),
+        ):
+            _, _ = self.model_executable(
+                input_ids=input_ids,
+                positions=positions,
+                hidden_states=hidden_states,
+                inputs_embeds=inputs_embeds,
+                last_token_indices=token_indices_to_sample_padded,
+            )
 
     def set_inputs_first_pass(
         self,

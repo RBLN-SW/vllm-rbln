@@ -25,6 +25,7 @@ import torch
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.worker.gpu_input_batch import InputBatch
 
+import vllm_rbln.v1.worker.rbln_model_runner as model_runner_module
 from vllm_rbln.v1.worker.rbln_model_runner import (
     AsyncRBLNModelRunnerOutput,
     DummyRunState,
@@ -712,6 +713,146 @@ class TestUpdateStatesAfterExecute:
         RBLNModelRunner._update_states_after_model_execute(runner, output)
 
         np.testing.assert_array_equal(num_accepted, [2, 1, 3])
+
+
+class TestProposeDraftTokenIdsIntermediatePrefill:
+    def test_medusa_returns_empty_drafts_without_calling_drafter(self, monkeypatch):
+        class DummyMedusaProposer:
+            def propose(self, **kwargs):
+                raise AssertionError("intermediate prefill must not propose drafts")
+
+        monkeypatch.setattr(
+            model_runner_module, "RBLNMedusaProposer", DummyMedusaProposer
+        )
+
+        runner = SimpleNamespace(
+            speculative_config=SimpleNamespace(method="medusa"),
+            drafter=DummyMedusaProposer(),
+            input_batch=SimpleNamespace(req_ids=["req-0", "req-1"]),
+        )
+
+        draft_token_ids = RBLNModelRunner.propose_draft_token_ids(
+            runner,
+            scheduler_output=SimpleNamespace(total_num_scheduled_tokens=4),
+            sampled_token_ids=[],
+            sampling_metadata=MagicMock(),
+            hidden_states=torch.empty(4, 8),
+            sample_hidden_states=None,
+            aux_hidden_states=None,
+            spec_decode_metadata=None,
+            common_attn_metadata=MagicMock(),
+            slot_mappings=None,
+            is_intermediate_prefill=True,
+        )
+
+        assert draft_token_ids == [[], []]
+
+    def test_eagle_runs_prefill_only_without_copying_sampled_count(self, monkeypatch):
+        class DummyEagleProposer:
+            def __init__(self):
+                self.prepare_next_token_ids_padded = MagicMock(
+                    side_effect=self._prepare_next_token_ids_padded
+                )
+                self.prefill_only = MagicMock()
+                self.propose = MagicMock(
+                    side_effect=AssertionError(
+                        "intermediate prefill must not propose drafts"
+                    )
+                )
+
+            def _prepare_next_token_ids_padded(
+                self,
+                common_attn_metadata,
+                sampled_token_ids,
+                requests,
+                input_batch,
+                discard_request_mask,
+            ):
+                torch.testing.assert_close(
+                    sampled_token_ids,
+                    torch.full((2, 1), -1, dtype=torch.int32),
+                )
+                torch.testing.assert_close(
+                    discard_request_mask,
+                    torch.ones(2, dtype=torch.bool),
+                )
+                assert input_batch.num_reqs == 2
+                return (
+                    torch.tensor([11, 22], dtype=torch.int32),
+                    torch.zeros(2, dtype=torch.int32),
+                )
+
+        monkeypatch.setattr(
+            model_runner_module, "RBLNEagleProposer", DummyEagleProposer
+        )
+
+        drafter = DummyEagleProposer()
+        copy_valid_sampled_token_count = MagicMock()
+        common_attn_metadata = MagicMock()
+        hidden_states = torch.randn(4, 8)
+        runner = SimpleNamespace(
+            speculative_config=SimpleNamespace(
+                method="eagle",
+                disable_padded_drafter_batch=False,
+                use_eagle=lambda: True,
+            ),
+            drafter=drafter,
+            input_batch=SimpleNamespace(
+                num_reqs=2,
+                req_ids=["req-0", "req-1"],
+                sampling_metadata=MagicMock(),
+            ),
+            requests={"req-0": MagicMock(), "req-1": MagicMock()},
+            discard_request_mask=SimpleNamespace(gpu=torch.zeros(2, dtype=torch.bool)),
+            input_ids=SimpleNamespace(gpu=torch.arange(8, dtype=torch.int32)),
+            device=torch.device("cpu"),
+            use_aux_hidden_state_outputs=False,
+            supports_mm_inputs=False,
+            _get_positions=lambda num_tokens: torch.arange(
+                num_tokens, dtype=torch.int64
+            ),
+            _copy_valid_sampled_token_count=copy_valid_sampled_token_count,
+        )
+
+        draft_token_ids = RBLNModelRunner.propose_draft_token_ids(
+            runner,
+            scheduler_output=SimpleNamespace(total_num_scheduled_tokens=4),
+            sampled_token_ids=torch.empty(0, 1, dtype=torch.int32),
+            sampling_metadata=MagicMock(),
+            hidden_states=hidden_states,
+            sample_hidden_states=None,
+            aux_hidden_states=None,
+            spec_decode_metadata=None,
+            common_attn_metadata=common_attn_metadata,
+            slot_mappings=None,
+            is_intermediate_prefill=True,
+        )
+
+        assert draft_token_ids is None
+        copy_valid_sampled_token_count.assert_not_called()
+        drafter.prepare_next_token_ids_padded.assert_called_once()
+        drafter.propose.assert_not_called()
+
+        drafter.prefill_only.assert_called_once()
+        prefill_kwargs = drafter.prefill_only.call_args.kwargs
+        torch.testing.assert_close(
+            prefill_kwargs["target_token_ids"],
+            torch.arange(4, dtype=torch.int32),
+        )
+        torch.testing.assert_close(
+            prefill_kwargs["target_positions"],
+            torch.arange(4, dtype=torch.int64),
+        )
+        torch.testing.assert_close(
+            prefill_kwargs["target_hidden_states"],
+            hidden_states,
+        )
+        torch.testing.assert_close(
+            prefill_kwargs["next_token_ids"],
+            torch.tensor([11, 22], dtype=torch.int32),
+        )
+        assert prefill_kwargs["common_attn_metadata"] is common_attn_metadata
+        assert prefill_kwargs["mm_embed_inputs"] is None
 
 
 # ===========================================================================
