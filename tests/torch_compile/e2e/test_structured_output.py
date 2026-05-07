@@ -35,7 +35,6 @@ MODEL_ID = "meta-llama/Llama-3.2-1B-Instruct"
 @pytest.fixture(scope="module")
 def llm(monkeypatch_module):
     """Module-scoped LLM instance shared across all structured output tests."""
-    monkeypatch_module.setenv("VLLM_RBLN_USE_VLLM_MODEL", "1")
     monkeypatch_module.setenv("VLLM_DISABLE_COMPILE_CACHE", "1")
     return LLM(
         model=MODEL_ID,

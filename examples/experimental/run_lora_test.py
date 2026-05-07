@@ -17,7 +17,6 @@ import os
 os.environ["VLLM_RBLN_COMPILE_STRICT_MODE"] = "1"
 os.environ["VLLM_DISABLE_COMPILE_CACHE"] = "1"
 os.environ["VLLM_RBLN_ENABLE_WARM_UP"] = "0"
-os.environ["VLLM_RBLN_SAMPLER"] = "0"
 os.environ["VLLM_RBLN_ENFORCE_MODEL_FP32"] = "1"
 
 from huggingface_hub import snapshot_download

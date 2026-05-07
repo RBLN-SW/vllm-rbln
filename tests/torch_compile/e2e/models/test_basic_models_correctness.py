@@ -40,7 +40,6 @@ def test_dense_models(
     max_tokens: int,
 ) -> None:
     with monkeypatch.context() as m:
-        m.setenv("VLLM_RBLN_USE_VLLM_MODEL", "1")
         m.setenv("VLLM_DISABLE_COMPILE_CACHE", "1")
 
         prompts = PROMPTS

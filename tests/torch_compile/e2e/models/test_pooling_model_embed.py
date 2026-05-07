@@ -78,7 +78,6 @@ def test_pooling_model_embed(
     llm_params: dict,
 ) -> None:
     env = {
-        "VLLM_RBLN_USE_VLLM_MODEL": "1",
         "VLLM_DISABLE_COMPILE_CACHE": "1",
         "VLLM_RBLN_COMPILE_STRICT_MODE": "1",
     }

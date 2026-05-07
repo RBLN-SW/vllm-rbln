@@ -19,7 +19,6 @@ from pathlib import Path
 from typing import Any
 
 os.environ["RBLN_USE_CUSTOM_KERNEL"] = "1"
-os.environ["VLLM_RBLN_USE_VLLM_MODEL"] = "1"
 os.environ["VLLM_RBLN_COMPILE_STRICT_MODE"] = "1"
 os.environ["VLLM_DISABLE_COMPILE_CACHE"] = "1"
 os.environ["VLLM_RBLN_ENABLE_WARM_UP"] = "1"
