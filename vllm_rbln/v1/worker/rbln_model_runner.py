@@ -206,8 +206,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # Multi-modal data support
         self.mm_registry = MULTIMODAL_REGISTRY
-        self.uses_mrope = model_config.uses_mrope
-        assert not self.uses_mrope, "RBLN does not support M-RoPE."
+        assert not model_config.uses_mrope, "RBLN does not support M-RoPE."
 
         self.supports_mm_inputs = self.mm_registry.supports_multimodal_inputs(
             model_config
@@ -364,22 +363,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self.max_num_reqs, dtype=torch.int64
         )
 
-        # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
-        if self.uses_mrope:
-            # NOTE: `mrope_positions` is implemented with one additional dummy
-            # position on purpose to make it non-contiguous so that it can work
-            # with torch compile.
-            # See detailed explanation in https://github.com/vllm-project/vllm/pull/12128#discussion_r1926431923
-
-            # NOTE: When M-RoPE is enabled, position ids are 3D regardless of
-            # the modality of inputs. For text-only inputs, each dimension has
-            # identical position IDs, making M-RoPE functionally equivalent to
-            # 1D-RoPE.
-            # See page 5 of https://arxiv.org/abs/2409.12191
-            self.mrope_positions = self._make_buffer(
-                (3, self.max_num_tokens + 1), dtype=torch.int64
-            )
-
         # PP intermediate tensors are now allocated lazily on the receive
         # path (Cycle 5d M2). With dynamic shapes the runner no longer needs
         # to pre-build a per-bucket pool — the GPU runner does the same.
@@ -497,16 +480,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
     def _get_positions(self, num_tokens: Any):
         if isinstance(num_tokens, int):
-            if self.uses_mrope:
-                return self.mrope_positions.gpu[:, :num_tokens]
-            # if self.uses_xdrope_dim > 0:
-            #     return self.xdrope_positions.gpu[:, :num_tokens]
             return self.positions.gpu[:num_tokens]
         else:
-            if self.uses_mrope:
-                return self.mrope_positions.gpu[:, num_tokens]
-            # if self.uses_xdrope_dim > 0:
-            #     return self.xdrope_positions.gpu[:, num_tokens]
             return self.positions.gpu[num_tokens]
 
     def _make_buffer(
@@ -702,15 +677,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     if sampling_params.prompt_logprobs == -1
                     else sampling_params.prompt_logprobs
                 )
-
-            # TODO(jiwoo.park) We don't support M-RoPE yet.
-            # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
-            if self.uses_mrope:
-                self._init_mrope_positions(req_state)
-
-            # Only relevant for models using XD-RoPE (e.g, HunYuan-VL)
-            # if self.uses_xdrope_dim > 0:
-            #     self._init_xdrope_positions(req_state)
 
             reqs_to_add.append(req_state)
 
@@ -914,9 +880,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # Clear `output_token_ids` as previous output tokens are now part of
         # `prompt_token_ids`.
         req_state.output_token_ids.clear()
-
-        if self.uses_mrope:
-            self._init_mrope_positions(req_state)
 
         return req_state
 
@@ -1125,11 +1088,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             out=positions_np,
         )
 
-        # Calculate M-RoPE positions.
-        # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
-        if self.uses_mrope:
-            self._calc_mrope_positions(scheduler_output)
-
         # Get token indices.
         # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
         # -> [0, 1, M, M + 1, M + 2, M + 3, M + 4, 2 * M, 2 * M + 1, 2 * M + 2]
@@ -1175,15 +1133,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             scheduler_output, total_num_scheduled_tokens, cu_num_tokens
         )
 
-        if self.uses_mrope:
-            # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
-            self.mrope_positions.gpu[:, :total_num_scheduled_tokens].copy_(
-                self.mrope_positions.cpu[:, :total_num_scheduled_tokens],
-                non_blocking=True,
-            )
-        else:
-            # Common case (1D positions)
-            self.positions.copy_to_gpu(total_num_scheduled_tokens)
+        # Common case (1D positions)
+        self.positions.copy_to_gpu(total_num_scheduled_tokens)
 
         use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
         if not use_spec_decode:
@@ -1192,11 +1143,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # from these partial requests, we do so for simplicity.
             # We will ignore the sampled tokens from the partial requests.
             # TODO: Support prompt logprobs.
-            logits_indices = (
-                query_start_loc_cpu
-                if True
-                else query_start_loc
-            )[1:] - 1
+            logits_indices = query_start_loc_cpu[1:] - 1
             num_draft_tokens = None
             spec_decode_metadata = None
             num_sampled_tokens = np.ones(num_reqs, dtype=np.int32)
@@ -1288,11 +1235,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 num_common_prefix_blocks = 0
             else:
                 blk_table = self.input_batch.block_table[kv_cache_group_id]
-                blk_table_tensor = (
-                    blk_table.get_cpu_tensor()[:num_reqs]
-                    if True
-                    else blk_table.get_device_tensor(num_reqs)
-                )
+                blk_table_tensor = blk_table.get_cpu_tensor()[:num_reqs]
                 slot_mapping = blk_table.slot_mapping.gpu[:total_num_scheduled_tokens]
 
                 # Fill unused with -1. Needed for reshape_and_cache in full cuda
@@ -1705,9 +1648,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # enabled collective fusion for SP
         num_input_tokens = num_scheduled_tokens
 
-        # Padding for DP
-        # NOTE(RBLN): RBLN handles DP padding in _prepare_inputs
-
         # _prepare_inputs may reorder the batch, so we must gather multi
         # modal outputs after that to ensure the correct order
         if (
@@ -1742,10 +1682,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             input_ids = self.input_ids.cpu[:num_input_tokens]
             inputs_embeds = None
             model_kwargs = self._init_model_kwargs(num_input_tokens)
-        if self.uses_mrope:
-            positions = self.mrope_positions.cpu[:, :num_input_tokens]
-        else:
-            positions = self.positions.cpu[:num_input_tokens]
+        positions = self.positions.cpu[:num_input_tokens]
 
         if (
             self.model_config.is_encoder_decoder
@@ -2125,18 +2062,14 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         req_ids_output_copy = self.input_batch.req_ids.copy()
         req_id_to_index_output_copy = self.input_batch.req_id_to_index.copy()
 
-        num_sampled_tokens = (
-            self.input_batch.num_reqs
-            if True
-            else sampler_output.sampled_token_ids.shape[0]
-        )
+        num_sampled_tokens = self.input_batch.num_reqs
         sampled_token_ids = sampler_output.sampled_token_ids[:num_sampled_tokens]
         logprobs_tensors = sampler_output.logprobs_tensors
         invalid_req_indices = []
         logprobs_lists = None
         if not self.use_async_scheduling:
             # Get the valid generated tokens.
-            if True and sampled_token_ids.shape[0] == 0:
+            if sampled_token_ids.shape[0] == 0:
                 # No tokens were actually sampled (e.g., non-last
                 # chunk in chunked prefill produces empty logits).
                 valid_sampled_token_ids: list[list[int]] = [
@@ -3607,21 +3540,9 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         """
         kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-            if True:
-                device = self.device
-                tensor = torch.empty(
-                    kv_cache_tensor.size, dtype=torch.int8, device=device
-                )
-            else:
-                device = (
-                    "cpu"
-                    if envs.VLLM_RBLN_USE_CUSTOM_KERNEL
-                    or not envs.VLLM_RBLN_COMPILE_MODEL
-                    else "meta"
-                )
-                tensor = torch.zeros(
-                    kv_cache_tensor.size, dtype=torch.int8, device=device
-                )
+            tensor = torch.empty(
+                kv_cache_tensor.size, dtype=torch.int8, device=self.device
+            )
             for layer_name in kv_cache_tensor.shared_by:
                 kv_cache_raw_tensors[layer_name] = tensor
 
