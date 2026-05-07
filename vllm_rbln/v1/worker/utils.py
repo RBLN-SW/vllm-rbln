@@ -95,7 +95,6 @@ def estimate_model_kernel_size(
     return layer_nbytes + lm_heads_nbytes
 
 
-# NOTE: This function comes from optimum-rbln. Keep in sync.
 def estimate_available_memory(
     model_config: ModelConfig,
     parallel_config: ParallelConfig,

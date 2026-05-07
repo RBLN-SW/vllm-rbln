@@ -15,10 +15,6 @@ on:
         description: "Version of rebel-compiler to use (optional)"
         required: false
         type: string
-      optimum_rbln_version:
-        description: "Version of optimum-rbln to use (optional)"
-        required: false
-        type: string
 
 jobs:
   get-compiler-version:
@@ -54,7 +50,7 @@ jobs:
           WHEEL_FILENAME=$(ls dist/vllm_rbln-*.whl | xargs basename)
           echo "Found wheel file: ${WHEEL_FILENAME}"
           echo "WHEEL_FILENAME=${WHEEL_FILENAME}" >> $GITHUB_OUTPUT
-      
+
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
         with:
@@ -70,14 +66,3 @@ jobs:
     with:
       ref: ${{ inputs.ref }}
       rebel_compiler_version: ${{ inputs.rebel_compiler_version || needs.get-compiler-version.outputs.compiler_version }}
-      optimum_rbln_version: ${{ inputs.optimum_rbln_version }}
-
-  vllm-rbln-optimum-ci:
-    needs: [get-compiler-version, build-vllm-rbln]
-    if: ${{ always() && !cancelled() && needs.build-vllm-rbln.result == 'success' }}
-    uses: ./.github/workflows/rbln_optimum_ci.yaml
-    secrets: inherit
-    with:
-      ref: ${{ inputs.ref }}
-      rebel_compiler_version: ${{ inputs.rebel_compiler_version || needs.get-compiler-version.outputs.compiler_version }}
-      optimum_rbln_version: ${{ inputs.optimum_rbln_version }}

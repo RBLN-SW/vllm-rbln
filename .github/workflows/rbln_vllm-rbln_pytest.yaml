@@ -15,10 +15,6 @@ on:
         description: "Version of rebel-compiler to use (optional)"
         required: false
         type: string
-      optimum_rbln_version:
-        description: "Version of optimum-rbln to use (optional)"
-        required: false
-        type: string
       fail_fast:
         description: "Whether to fail fast when one matrix job fails"
         required: false
@@ -43,10 +39,6 @@ on:
         description: "Version of rebel-compiler to use (optional)"
         required: false
         type: string
-      optimum_rbln_version:
-        description: "Version of optimum-rbln to use (optional)"
-        required: false
-        type: string
       test_level:
         description: "Test level for VLLM_RBLN_TEST_LEVEL environment variable"
         required: false
@@ -56,135 +48,6 @@ env:
   RBLN_VERBOSE: 6
 
 jobs:
-  pytest:
-    name: Pytest (${{ matrix.test_type.name }})
-    runs-on: ${{ matrix.test_type.runner }}
-    strategy:
-      fail-fast: ${{ inputs.fail_fast }}
-      matrix:
-        test_type: 
-          [
-            {
-              name : "core",
-              runner : "rbln-sw-k8s-general"
-            },
-            {
-              name : "worker",
-              runner : "rbln-sw-k8s-general"
-            },
-          ]
-    steps:
-      - name: Checkout the vllm-rbln repository
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_number && format('refs/pull/{0}/merge', inputs.pr_number) || (inputs.ref != '' && inputs.ref) || github.sha }}
-          submodules: recursive
-          fetch-depth: 0
-
-      - name: Parse vllm-cpu index URL from pyproject.toml
-        id: parse_index_url
-        run: |
-          VLLM_CPU_URL=$(python3 -c "import tomllib; f=open('pyproject.toml','rb'); config=tomllib.load(f); print(next(i['url'] for i in config.get('tool',{}).get('uv',{}).get('index',[]) if i.get('name')=='vllm-cpu'))")
-          echo "Parsed vllm-cpu URL: ${VLLM_CPU_URL}"
-          echo "VLLM_CPU_URL=${VLLM_CPU_URL}" >> $GITHUB_OUTPUT
-
-      - name: Get commit message
-        id: get_commit_message
-        run: |
-          if git rev-parse HEAD^2 >/dev/null 2>&1; then
-            COMMIT_MESSAGE=$(git log -1 --pretty=%B HEAD^2)
-          else
-            COMMIT_MESSAGE=$(git log -1 --pretty=%B)
-          fi
-          echo "Commit message: $COMMIT_MESSAGE"
-          echo "message<<EOF" >> $GITHUB_OUTPUT
-          echo "$COMMIT_MESSAGE" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-
-      - name: Check if test should be skipped
-        id: should_skip
-        env:
-          COMMIT_MESSAGE: ${{ steps.get_commit_message.outputs.message }}
-        run: |
-          SKIP=false
-          
-          case "${{ matrix.test_type.name }}" in
-            "core")
-              if [[ "$COMMIT_MESSAGE" == *"[skip core]"* ]]; then
-                SKIP=true
-              fi
-              ;;
-            "worker")
-              if [[ "$COMMIT_MESSAGE" == *"[skip worker]"* ]]; then
-                SKIP=true
-              fi
-              ;;
-          esac
-          
-          echo "skip=$SKIP" >> $GITHUB_OUTPUT
-          echo "Skip decision: $SKIP"
-
-      - name: Set up Python 3.12
-        if: steps.should_skip.outputs.skip != 'true'
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install rebel-compiler
-        if: steps.should_skip.outputs.skip != 'true'
-        run: |
-          for i in {1..3}; do
-            sudo apt-get update && break || sleep 10
-          done
-          sudo apt-get install -y build-essential
-          python3 -m pip uninstall rebel-compiler -y
-          VERSION="${{ inputs.rebel_compiler_version }}"
-          if [ -z "$VERSION" ]; then
-            echo "Error: rebel_compiler_version is not set"
-            exit 1
-          fi
-          echo "rebel-compiler ${VERSION}"
-          python3 -m pip install --extra-index-url ${{ secrets.DEV_PKG_URL }} rebel-compiler=="${VERSION}"
-
-      - name: Download wheel artifact
-        if: steps.should_skip.outputs.skip != 'true'
-        uses: actions/download-artifact@v4
-        with:
-          name: vllm-wheel
-          path: dist
-
-      - name: Install local vllm-rbln package and dependencies
-        if: steps.should_skip.outputs.skip != 'true'
-        run: |
-          VLLM_CPU_URL="${{ steps.parse_index_url.outputs.VLLM_CPU_URL }}"
-          pip install packaging setuptools wheel simphile pynvml huggingface_hub setuptools_scm fire pytest pytest-asyncio
-          if [ -n "${{ inputs.optimum_rbln_version }}" ]; then
-            pip install --force-reinstall --no-cache-dir dist/vllm_rbln*.whl --constraint <(echo "optimum-rbln==${{ inputs.optimum_rbln_version }}") --index-url http://pypi-cache.devpi.svc.cluster.local/root/pypi/+simple/ --extra-index-url "${VLLM_CPU_URL}" --extra-index-url https://download.pytorch.org/whl/cpu --trusted-host pypi-cache.devpi.svc.cluster.local --extra-index-url https://pypi.org/simple
-            echo "optimum-rbln ${{ inputs.optimum_rbln_version }}"
-          else
-            pip install --force-reinstall --no-cache-dir dist/vllm_rbln*.whl --index-url http://pypi-cache.devpi.svc.cluster.local/root/pypi/+simple/ --extra-index-url "${VLLM_CPU_URL}" --extra-index-url https://download.pytorch.org/whl/cpu --trusted-host pypi-cache.devpi.svc.cluster.local --extra-index-url https://pypi.org/simple
-          fi
-
-      - name: Run pytest
-        if: steps.should_skip.outputs.skip != 'true'
-        env:
-          REBEL_VLLM_PRE_COMPILED_DIR: ${{ secrets.VLLM_PRE_COMPILED_DIR }}
-
-        run: |
-          case "${{ matrix.test_type.name }}" in
-            "core")
-              pytest tests/v1/core -vv --durations 0
-              ;;
-            "worker")
-              pytest tests/v1/worker/test_rebel_optimum_model_runner.py -vv --durations 0
-              ;;
-          esac
-
-      - name: Skip message
-        if: steps.should_skip.outputs.skip == 'true'
-        run: |
-          echo "Found [skip-${{ matrix.test_type.name }}] in commit message, skipping CI"
-
   pytest-arc:
     name: Pytest (${{ matrix.test_type.name }})
     runs-on: ${{ matrix.test_type.runner }}
@@ -196,15 +59,11 @@ jobs:
     strategy:
       fail-fast: ${{ inputs.fail_fast }}
       matrix:
-        test_type: 
+        test_type:
           [
             {
               name : "openai",
               runner : "rbln-sw-k8s-ca22-4"
-            },
-            {
-              name : "sampler",
-              runner : "rbln-sw-k8s-ca22-1"
             },
           ]
     steps:
@@ -245,20 +104,15 @@ jobs:
           COMMIT_MESSAGE: ${{ steps.get_commit_message.outputs.message }}
         run: |
           SKIP=false
-          
+
           case "${{ matrix.test_type.name }}" in
             "openai")
               if [[ "$COMMIT_MESSAGE" == *"[skip openai]"* ]]; then
                 SKIP=true
               fi
               ;;
-            "sampler")
-              if [[ "$COMMIT_MESSAGE" == *"[skip worker]"* ]]; then
-                SKIP=true
-              fi
-              ;;
           esac
-          
+
           echo "skip=$SKIP" >> $GITHUB_OUTPUT
 
       - name: Install uv CLI
@@ -301,12 +155,7 @@ jobs:
           command: |
             VLLM_CPU_URL="${{ steps.parse_index_url.outputs.VLLM_CPU_URL }}"
             uv pip install --system packaging setuptools wheel simphile pynvml huggingface_hub setuptools_scm fire pytest pytest-asyncio pytest-xdist
-            if [ -n "${{ inputs.optimum_rbln_version }}" ]; then
-              uv pip install --system --force-reinstall --no-cache-dir dist/vllm_rbln*.whl --constraint <(echo "optimum-rbln==${{ inputs.optimum_rbln_version }}") --index-url http://pypi-cache.devpi.svc.cluster.local/root/pypi/+simple/ --extra-index-url "${VLLM_CPU_URL}" --extra-index-url https://download.pytorch.org/whl/cpu  --extra-index-url https://pypi.org/simple --index-strategy unsafe-best-match
-              echo "optimum-rbln ${{ inputs.optimum_rbln_version }}"
-            else
-              uv pip install --system --force-reinstall --no-cache-dir dist/vllm_rbln*.whl --index-url http://pypi-cache.devpi.svc.cluster.local/root/pypi/+simple/ --extra-index-url "${VLLM_CPU_URL}" --extra-index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple --index-strategy unsafe-best-match
-            fi
+            uv pip install --system --force-reinstall --no-cache-dir dist/vllm_rbln*.whl --index-url http://pypi-cache.devpi.svc.cluster.local/root/pypi/+simple/ --extra-index-url "${VLLM_CPU_URL}" --extra-index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple --index-strategy unsafe-best-match
 
       - name: Run pytest
         if: steps.should_skip.outputs.skip != 'true'
@@ -317,10 +166,6 @@ jobs:
           case "${{ matrix.test_type.name }}" in
             "openai")
               pytest tests/entrypoints/openai -vv --durations 0
-              ;;
-            "sampler")
-              pytest -n auto -k "warm_upTrue" tests/v1/worker/test_sampler.py -vv --durations 0
-              pytest -n auto -k "warm_upFalse" tests/v1/worker/test_sampler.py -vv --durations 0
               ;;
           esac
 

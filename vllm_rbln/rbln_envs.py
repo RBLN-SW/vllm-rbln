@@ -144,7 +144,6 @@ environment_variables = {
         )
     ),
     # If true, it uses the natively compiled vLLM model
-    # rather than the optimum-rbln compiled model.
     "VLLM_RBLN_USE_VLLM_MODEL": (
         lambda: (
             os.environ.get("VLLM_RBLN_USE_VLLM_MODEL", "False").lower() in ("true", "1")

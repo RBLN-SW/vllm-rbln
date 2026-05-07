@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import contextlib
 import os
 from typing import TYPE_CHECKING
 
@@ -33,15 +32,6 @@ from vllm.utils.torch_utils import _StreamPlaceholder
 
 import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
-from vllm_rbln.utils.optimum.configuration import (
-    is_qwen3_pooling,
-    sync_with_rbln_config,
-)
-from vllm_rbln.utils.optimum.registry import (
-    is_enc_dec_arch,
-    is_multi_modal,
-    is_pooling_arch,
-)
 
 logger = init_logger(__name__)
 
@@ -161,127 +151,89 @@ class RblnPlatform(Platform):
             scheduler_config.async_scheduling = False
             logger.warning("Async scheduler not supported on RBLN.")
 
-        if envs.VLLM_RBLN_USE_VLLM_MODEL:
-            cls.validate_and_setup_prerequisite(vllm_config)
-            if envs.VLLM_RBLN_USE_DEVICE_TENSOR:
-                # Use RBLN device tensors for torch.compile/runtime on the
-                # native vLLM model path.
-                RblnPlatform.device_name = "rbln"
-                RblnPlatform.device_type = "rbln"
-                RblnPlatform.dist_backend = "rbln-ccl"
-                vllm_config.device_config.device_type = RblnPlatform.device_type
-                vllm_config.device_config.device = torch.device(
-                    RblnPlatform.device_type
-                )
-
-            if envs.VLLM_RBLN_ENFORCE_MODEL_FP32:
-                logger.info("original model_config.dtype = %s", model_config.dtype)
-                if model_config.dtype == torch.bfloat16:
-                    logger.warning("bfloat16 is not supported on RBLN.")
-
-                # FIXME - force model dtype into fp32 for graph compilation
-                model_config.dtype = torch.float
-                assert model_config.dtype == torch.float
-                logger.info("RBLN enforce model_config.dtype as torch.float")
-
-                if (lora_config := vllm_config.lora_config) is not None:
-                    lora_config.lora_dtype = torch.float
-                    logger.info("RBLN enforce lora_config.lora_dtype as torch.float")
-
-                if (speculative_config := vllm_config.speculative_config) is not None:
-                    speculative_config.draft_model_config.dtype = torch.float
-                    logger.info("RBLN enforce draft_model_config.dtype as torch.float")
-            else:
-                dtype = model_config.dtype
-                if (
-                    dtype != torch.bfloat16
-                    and dtype != torch.float16
-                    and dtype != torch.float
-                ):
-                    logger.warning(
-                        "%s not supported on RBLN, only fp32,fp16,bf16 supported", dtype
-                    )
-                    model_config.dtype = torch.float
-                logger.info("RBLN use model_config.dtype = %s", model_config.dtype)
-
-            if parallel_config.worker_cls == "auto":
-                parallel_config.worker_cls = (
-                    "vllm_rbln.v1.worker.rbln_worker.RBLNWorker"
-                )
-            scheduler_config.scheduler_cls = (
-                "vllm_rbln.v1.core.rbln_scheduler.RBLNScheduler"
+        if not envs.VLLM_RBLN_USE_VLLM_MODEL:
+            raise RuntimeError(
+                "The optimum-rbln codepath has been removed from vllm-rbln. "
+                "Set VLLM_RBLN_USE_VLLM_MODEL=1 to use the native vLLM model "
+                "path."
             )
 
-            # FIXME(jiwoo.park) This is a temporary workaround.
-            if model_config.enforce_eager:
-                hf_config = vllm_config.model_config.hf_config
-                assert not hasattr(hf_config, "sliding_window") or not getattr(
-                    hf_config, "use_sliding_window", True
-                )
+        cls.validate_and_setup_prerequisite(vllm_config)
+        if envs.VLLM_RBLN_USE_DEVICE_TENSOR:
+            # Use RBLN device tensors for torch.compile/runtime on the
+            # native vLLM model path.
+            RblnPlatform.device_name = "rbln"
+            RblnPlatform.device_type = "rbln"
+            RblnPlatform.dist_backend = "rbln-ccl"
+            vllm_config.device_config.device_type = RblnPlatform.device_type
+            vllm_config.device_config.device = torch.device(
+                RblnPlatform.device_type
+            )
 
-                RblnPlatform.device_type = "rbln"
-                if envs.VLLM_RBLN_USE_DEVICE_TENSOR:
-                    RblnPlatform.dist_backend = "rbln-ccl"
-                vllm_config.device_config.device_type = RblnPlatform.device_type
-                vllm_config.device_config.device = torch.device(
-                    RblnPlatform.device_type
-                )
-                # NOTE - force dtype into fp16 for eager mode
-                model_config.dtype = torch.float16
+        if envs.VLLM_RBLN_ENFORCE_MODEL_FP32:
+            logger.info("original model_config.dtype = %s", model_config.dtype)
+            if model_config.dtype == torch.bfloat16:
+                logger.warning("bfloat16 is not supported on RBLN.")
 
-                if (lora_config := vllm_config.lora_config) is not None:
-                    lora_config.lora_dtype = torch.float16
-
-            if vllm_config.speculative_config is not None and envs.VLLM_RBLN_SAMPLER:
-                # FIXME(RBLN): make RBLNSampler compatible with speculative decoding
-                logger.warning(
-                    "Using RBLNSampler with speculative decoding is not supported yet."
-                )
-                envs.VLLM_RBLN_SAMPLER = False
-
-        else:
-            # NOTE(eunji.lee):
-            # It is for multimodal models
-            # to generate inputs as fp32, not bfloat16
-            # even though the model is compiled with bfloat16
+            # FIXME - force model dtype into fp32 for graph compilation
             model_config.dtype = torch.float
             assert model_config.dtype == torch.float
+            logger.info("RBLN enforce model_config.dtype as torch.float")
 
-            if parallel_config.worker_cls == "auto":
-                parallel_config.worker_cls = (
-                    "vllm_rbln.v1.worker.optimum_worker.RBLNOptimumWorker"
-                )
-            scheduler_config.scheduler_cls = (
-                "vllm_rbln.v1.core.optimum_scheduler.RBLNOptimumScheduler"
-            )
+            if (lora_config := vllm_config.lora_config) is not None:
+                lora_config.lora_dtype = torch.float
+                logger.info("RBLN enforce lora_config.lora_dtype as torch.float")
 
-            assert vllm_config.parallel_config.tensor_parallel_size == 1, (
-                "Cannot set tensor_parallel_size for pre-compiled optimum-rbln models. "
-                "If you want to compile with tensor parallelism in vllm-rbln, "
-                "please use the `VLLM_RBLN_TP_SIZE` environment variable instead."
-            )
-            assert vllm_config.parallel_config.pipeline_parallel_size == 1, (
-                "Pipeline parallelism is not supported in optimum-rbln."
-            )
-            assert vllm_config.speculative_config is None, (
-                "Speculative decoding is not supported in optimum-rbln."
-            )
-            # T5EncoderModel is encoder-only but inherits T5Config which has
-            # is_encoder_decoder=True. This causes vllm to route inputs
-            # through the enc-dec path, prepending decoder_start_token_id and
-            # breaking CLS pooling. Set it to False for pooling models.
-            # ModelConfig.is_encoder_decoder is a @cached_property that's
-            # already evaluated by this point, so invalidate the cache too.
-            hf_config = model_config.hf_config
-            if is_pooling_arch(hf_config) and getattr(
-                hf_config, "is_encoder_decoder", False
+            if (speculative_config := vllm_config.speculative_config) is not None:
+                speculative_config.draft_model_config.dtype = torch.float
+                logger.info("RBLN enforce draft_model_config.dtype as torch.float")
+        else:
+            dtype = model_config.dtype
+            if (
+                dtype != torch.bfloat16
+                and dtype != torch.float16
+                and dtype != torch.float
             ):
-                hf_config.is_encoder_decoder = False
-                with contextlib.suppress(KeyError):
-                    del model_config.__dict__["is_encoder_decoder"]
+                logger.warning(
+                    "%s not supported on RBLN, only fp32,fp16,bf16 supported", dtype
+                )
+                model_config.dtype = torch.float
+            logger.info("RBLN use model_config.dtype = %s", model_config.dtype)
 
-            cls.disable_unsupported_prefix_caching(vllm_config)
-            sync_with_rbln_config(vllm_config)
+        if parallel_config.worker_cls == "auto":
+            parallel_config.worker_cls = (
+                "vllm_rbln.v1.worker.rbln_worker.RBLNWorker"
+            )
+        scheduler_config.scheduler_cls = (
+            "vllm_rbln.v1.core.rbln_scheduler.RBLNScheduler"
+        )
+
+        # FIXME(jiwoo.park) This is a temporary workaround.
+        if model_config.enforce_eager:
+            hf_config = vllm_config.model_config.hf_config
+            assert not hasattr(hf_config, "sliding_window") or not getattr(
+                hf_config, "use_sliding_window", True
+            )
+
+            RblnPlatform.device_type = "rbln"
+            if envs.VLLM_RBLN_USE_DEVICE_TENSOR:
+                RblnPlatform.dist_backend = "rbln-ccl"
+            vllm_config.device_config.device_type = RblnPlatform.device_type
+            vllm_config.device_config.device = torch.device(
+                RblnPlatform.device_type
+            )
+            # NOTE - force dtype into fp16 for eager mode
+            model_config.dtype = torch.float16
+
+            if (lora_config := vllm_config.lora_config) is not None:
+                lora_config.lora_dtype = torch.float16
+
+        if vllm_config.speculative_config is not None and envs.VLLM_RBLN_SAMPLER:
+            # FIXME(RBLN): make RBLNSampler compatible with speculative decoding
+            logger.warning(
+                "Using RBLNSampler with speculative decoding is not supported yet."
+            )
+            envs.VLLM_RBLN_SAMPLER = False
 
         if (
             parallel_config.distributed_executor_backend is not None
@@ -299,23 +251,22 @@ class RblnPlatform(Platform):
             "v2 model runner is not supported for RBLN backend."
         )
 
-        if envs.VLLM_RBLN_USE_VLLM_MODEL:
-            from vllm.config import CompilationMode
+        from vllm.config import CompilationMode
 
-            if vllm_config.compilation_config.mode != CompilationMode.NONE:
-                logger.info("RBLN doesn't @support_torch_compile decorator")
-                vllm_config.compilation_config.mode = CompilationMode.NONE
-                if (
-                    len(vllm_config.compilation_config.custom_ops) == 1
-                    and vllm_config.compilation_config.custom_ops[0] == "none"
-                ):
-                    vllm_config.compilation_config.custom_ops = []
+        if vllm_config.compilation_config.mode != CompilationMode.NONE:
+            logger.info("RBLN doesn't @support_torch_compile decorator")
+            vllm_config.compilation_config.mode = CompilationMode.NONE
+            if (
+                len(vllm_config.compilation_config.custom_ops) == 1
+                and vllm_config.compilation_config.custom_ops[0] == "none"
+            ):
+                vllm_config.compilation_config.custom_ops = []
 
-            if not model_config.disable_cascade_attn:
-                logger.info(
-                    "The cascade attention is disabled because RBLN does not support it"
-                )
-                model_config.disable_cascade_attn = True
+        if not model_config.disable_cascade_attn:
+            logger.info(
+                "The cascade attention is disabled because RBLN does not support it"
+            )
+            model_config.disable_cascade_attn = True
 
     @classmethod
     def get_attn_backend_cls(
@@ -353,27 +304,10 @@ class RblnPlatform(Platform):
 
         hf_config = vllm_config.model_config.hf_config
 
-        if envs.VLLM_RBLN_USE_VLLM_MODEL:
-            if getattr(hf_config, "sliding_window", None) is not None and getattr(
-                hf_config, "use_sliding_window", True
-            ):
-                cls._disable_prefix_caching(vllm_config, "sliding window models")
-
-        else:
-            # Prefix caching is supported only for decoder-only models for now.
-            if is_qwen3_pooling(vllm_config):
-                # Qwen3 pooling model does not support prefix caching for now.
-                cls._disable_prefix_caching(vllm_config, "Qwen3 pooling models")
-            elif is_enc_dec_arch(hf_config):
-                cls._disable_prefix_caching(vllm_config, "encoder-decoder models")
-            elif is_multi_modal(hf_config):
-                cls._disable_prefix_caching(vllm_config, "multimodal models")
-            elif is_pooling_arch(hf_config):
-                cls._disable_prefix_caching(vllm_config, "pooling models")
-            elif getattr(hf_config, "sliding_window", None) is not None and getattr(
-                hf_config, "use_sliding_window", True
-            ):
-                cls._disable_prefix_caching(vllm_config, "sliding window models")
+        if getattr(hf_config, "sliding_window", None) is not None and getattr(
+            hf_config, "use_sliding_window", True
+        ):
+            cls._disable_prefix_caching(vllm_config, "sliding window models")
 
     @classmethod
     def support_hybrid_kv_cache(cls) -> bool:

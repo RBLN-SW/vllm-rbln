@@ -90,7 +90,7 @@ class RBLNW8A16BlockFp8LinearOp:
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # FIXME(RBLN) - REBEL evt0 DOES NOT support w8a8
-        # current implementation is based on w8a16 (imported from optimum minimax2)
+        # current implementation is based on w8a16
         # TODO(RBLN) - REBEL evt1 SHOULD support w8a8 fp8 linear operation
         # further implementation will be basedon on w8a8
         return self._w8a16_block_fp8_matmul(
