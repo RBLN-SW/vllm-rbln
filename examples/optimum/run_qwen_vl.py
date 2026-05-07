@@ -227,7 +227,21 @@ async def main(
     #         }
     #     }
     # })
-    engine_args = AsyncEngineArgs(model=model_id)
+
+    rbln_config = {
+        "rbln_config": {
+            "device": [8, 9, 10, 11, 12, 13, 14, 15],
+            "tensor_parallel_size": 8,
+            "batch_size": 1,
+            "max_seq_len": 114_688,
+            "kvcache_partition_len": 16_384,
+            "visual": {
+                "device": 0,
+                # "max_seq_lens": 6400,
+                }
+            }
+        }
+    engine_args = AsyncEngineArgs(model=model_id, additional_config=rbln_config)
 
     engine = AsyncLLMEngine.from_engine_args(engine_args)
     tokenizer = AutoTokenizer.from_pretrained(model_id)
@@ -253,7 +267,7 @@ async def main(
 def entry_point(
     num_input_prompt: int = 1,
     # NOTE: This example supports Qwen2-VL, Qwen2.5-VL, and Qwen3-VL.
-    model_id: str = "/qwen2_5-vl-7b-32k-b4-kv16k",
+    model_id: str = "Qwen/Qwen2.5-VL-7B-Instruct",
 ):
     asyncio.run(
         main(

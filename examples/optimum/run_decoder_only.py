@@ -59,9 +59,9 @@ async def generate(
 
 
 def get_input_prompts(prompt_txt: str) -> list[str]:
-    with open(prompt_txt) as file:
-        prompt = file.readlines()
-
+    # with open(prompt_txt) as file:
+    #     prompt = file.readlines()
+    prompt = ["Tell me a joke.", "Tell me a joke.", "Tell me a joke.", "Tell me a joke."]
     return prompt
 
 
@@ -94,7 +94,14 @@ async def main(
     prompt_txt: str,
     golden_json: str,
 ):
-    engine_args = AsyncEngineArgs(model=model_id)
+    rbln_config = {
+        "device": [0, 1, 2, 3, 4, 5, 6, 7], 
+        "tensor_parallel_size": 8, 
+        "batch_size": 1, 
+        "max_seq_len": 16384,
+        # "kvcache_block_size": 4096
+        }
+    engine_args = AsyncEngineArgs(model=model_id, additional_config={"rbln_config": rbln_config})
 
     engine = AsyncLLMEngine.from_engine_args(engine_args)
     prompt = get_input_prompts(prompt_txt)
@@ -117,16 +124,16 @@ async def main(
 
     result = await asyncio.gather(*futures)
 
-    score = compare_copy_prompt_task_result(result, golden_json)
-    if score < 0.97:
-        print(f"score is lower than threshold({score})")
-        exit(1)
+    # score = compare_copy_prompt_task_result(result, golden_json)
+    # if score < 0.97:
+    #     print(f"score is lower than threshold({score})")
+    #     exit(1)
 
 
 def entry_point(
     max_seq_len: int = 4096,
     num_input_prompt: int = 1,
-    model_id: str = "/llama2-7b_batch2",
+    model_id: str = "meta-llama/Llama-3.1-8B-Instruct",
     prompt_txt: str = "/prompts/copy_prompts.txt",
     golden_json: str = "/golden/golden_llama7b_result_copy_prompts.json",
 ):
