@@ -248,9 +248,7 @@ def get_tokens_mask(num_tokens: int, left=1.0, right=0.0, device=None):
         max_pad = num_tokens
     else:
         max_pad = get_forward_context().dp_metadata.max_pads_across_dp.shape[0]
-    pos = torch.arange(
-        max_pad, dtype=torch.int32, device=num_tokens_across_dp.device
-    ).unsqueeze(0)  # [1, max_pad]
+    pos = torch.arange(max_pad, dtype=torch.int32).unsqueeze(0)  # [1, max_pad]
     tokens_mask = torch.where(
         pos < num_tokens_across_dp, left, right
     )  # [dp_size, max_pad]
