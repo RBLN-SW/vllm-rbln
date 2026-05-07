@@ -32,6 +32,7 @@ from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)
 
+
 def compute_slot_mapping_cpu(
     block_table: MultiGroupBlockTable,
     req_indices: np.ndarray,
@@ -49,8 +50,7 @@ def compute_slot_mapping_cpu(
     num_tokens = req_indices.shape[0]
     for bt in block_table.block_tables:
         block_table_indices = (
-            req_indices * bt.max_num_blocks_per_req
-            + positions_np // bt.block_size
+            req_indices * bt.max_num_blocks_per_req + positions_np // bt.block_size
         )
         block_numbers = bt.block_table.np.ravel()[block_table_indices]
         block_offsets = positions_np % bt.block_size
