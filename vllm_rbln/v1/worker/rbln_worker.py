@@ -421,7 +421,7 @@ class RBLNWorker(WorkerBase):
                 )
 
     def execute_dummy_batch(self) -> None:
-        self._ensure_rbln_host_threads_before_compile()
+        self._setup_rbln_host_threads()
         self.model_runner.dummy_run()
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
