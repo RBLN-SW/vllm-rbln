@@ -90,6 +90,7 @@ class TestParseEncDec:
         assert params.max_seq_len == 448
         assert params.kvcache_block_size == 448
 
+
 class TestParsePooling:
     def test_uses_explicit_kvcache_num_blocks(self):
         cfg = {

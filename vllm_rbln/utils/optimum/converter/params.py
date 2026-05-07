@@ -128,13 +128,16 @@ class RBLNParams:
         batch_size = _cfg_get(cfg, "batch_size")
         # For pooling models each sequence occupies exactly one block.
         num_blocks = _cfg_get(cfg, "kvcache_num_blocks")
+        kvcache_block_size = _cfg_get(cfg, "kvcache_block_size")
+        if kvcache_block_size is None and max_seq_len is not None:
+            kvcache_block_size = max_seq_len
         if num_blocks is None and batch_size is not None:
             num_blocks = batch_size
         return cls(
             num_blocks=num_blocks,
             batch_size=batch_size,
             max_seq_len=max_seq_len,
-            kvcache_block_size=max_seq_len,
+            kvcache_block_size=kvcache_block_size,
         )
 
     @classmethod
