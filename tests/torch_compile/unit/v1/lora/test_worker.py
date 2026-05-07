@@ -20,6 +20,7 @@ import random
 import tempfile
 from unittest.mock import patch
 
+import pytest
 from vllm.config import (
     CacheConfig,
     DeviceConfig,
@@ -42,6 +43,16 @@ MODEL_PATH = "Qwen/Qwen3-0.6B"
 NUM_LORAS = 16
 
 
+@pytest.mark.xfail(
+    reason=(
+        "Loads a real model on the rbln device, which hits the dummy-weight "
+        "init path and calls `torch.Generator(device='rbln')` for the "
+        "uniform_-style randomization. torch_rbln does not yet expose "
+        "`_is_in_bad_fork` / `manual_seed_all` for the rbln device — fix "
+        "lives in `torch_rbln/aten/src/ATen/native/rbln/RBLNGenerator*`."
+    ),
+    strict=False,
+)
 @patch.dict(os.environ, {"RANK": "0"})
 def test_worker_apply_lora(qwen3_lora_files):
     def set_active_loras(worker: Worker, lora_requests: list[LoRARequest]):

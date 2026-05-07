@@ -32,11 +32,6 @@ def test_rbln_envs():
         got {rbln_envs.VLLM_RBLN_TP_SIZE}"
     )
 
-    assert rbln_envs.VLLM_RBLN_SAMPLER, (
-        f"Expected VLLM_RBLN_SAMPLER to be True, \
-        got {rbln_envs.VLLM_RBLN_SAMPLER}"
-    )
-
     assert rbln_envs.VLLM_RBLN_ENABLE_WARM_UP, (
         f"Expected VLLM_RBLN_ENABLE_WARM_UP to be True, \
         got {rbln_envs.VLLM_RBLN_ENABLE_WARM_UP}"

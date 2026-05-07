@@ -15,6 +15,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
+
 import pytest
 from vllm.lora.request import LoRARequest
 from vllm.lora.resolver import LoRAResolver, LoRAResolverRegistry
@@ -69,19 +71,20 @@ def test_resolver_registry_unknown_resolver():
         registry.get_resolver("unknown_resolver")
 
 
-@pytest.mark.asyncio
-async def test_dummy_resolver_resolve():
+def test_dummy_resolver_resolve():
     """Test the dummy resolver's resolve functionality."""
     dummy_resolver = DummyLoRAResolver()
     base_model_name = "base_model_test"
     lora_name = "test_lora"
 
-    # Test successful resolution
-    result = await dummy_resolver.resolve_lora(base_model_name, lora_name)
+    # Test successful resolution.
+    result = asyncio.run(dummy_resolver.resolve_lora(base_model_name, lora_name))
     assert isinstance(result, LoRARequest)
     assert result.lora_name == lora_name
     assert result.lora_path == f"/dummy/path/{base_model_name}/{lora_name}"
 
-    # Test failed resolution
-    result = await dummy_resolver.resolve_lora(base_model_name, "nonexistent_lora")
+    # Test failed resolution.
+    result = asyncio.run(
+        dummy_resolver.resolve_lora(base_model_name, "nonexistent_lora")
+    )
     assert result is None

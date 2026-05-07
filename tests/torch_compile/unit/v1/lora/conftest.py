@@ -67,7 +67,7 @@ def get_vllm_config() -> VllmConfig:
         max_model_len=max_model_len,
     )
     model_config = ModelConfig(
-        model="meta-llama/Llama-3.2-1B",
+        model="facebook/opt-125m",
         dtype=torch.float,
     )
     cache_config = CacheConfig(
