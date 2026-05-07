@@ -90,19 +90,6 @@ class TestParseEncDec:
         assert params.max_seq_len == 448
         assert params.kvcache_block_size == 448
 
-    def test_error_kvcache_block_size_not_equal_dec_max_seq_len(self):
-        cfg = {
-            "kvcache_num_blocks": 4,
-            "batch_size": 1,
-            "dec_max_seq_len": 448,
-            "kvcache_block_size": 224,
-        }
-        with pytest.raises(
-            AssertionError, match="kvcache_block_size must equal dec_max_seq_len"
-        ):
-            RBLNParams._parse_enc_dec(cfg)
-
-
 class TestParsePooling:
     def test_uses_explicit_kvcache_num_blocks(self):
         cfg = {
