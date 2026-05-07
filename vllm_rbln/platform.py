@@ -82,8 +82,7 @@ class RblnPlatform(Platform):
 
     @classmethod
     def is_pin_memory_available(cls):
-        logger.warning("Pin memory is not supported on RBLN.")
-        return False
+        return True
 
     @classmethod
     def get_device_communicator_cls(cls) -> str:
