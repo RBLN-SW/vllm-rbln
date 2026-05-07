@@ -375,29 +375,14 @@ class TestAllocateKvCacheTensors:
         assert result["layer_0"].dtype == torch.int8
         assert result["layer_0"].device.type == "cpu"
 
-    def test_meta_device_when_compile(self):
-        """When VLLM_RBLN_USE_CUSTOM_KERNEL=False and COMPILE_MODEL=True,
-        tensors are on meta device."""
-        runner = _make_runner_stub()
-        runner.runner_only_attn_layers = set()
-        self._bind(runner)
-
-        kv_tensor = MagicMock()
-        kv_tensor.size = 512
-        kv_tensor.shared_by = ["layer_0"]
-
-        kv_cache_config = MagicMock()
-        kv_cache_config.kv_cache_tensors = [kv_tensor]
-        kv_cache_config.kv_cache_groups = [MagicMock(layer_names=["layer_0"])]
-
-        with patch("vllm_rbln.v1.worker.rbln_model_runner.envs") as mock_envs:
-            mock_envs.VLLM_RBLN_USE_DEVICE_TENSOR = False
-            mock_envs.VLLM_RBLN_USE_CUSTOM_KERNEL = False
-            mock_envs.VLLM_RBLN_COMPILE_MODEL = True
-
-            result = runner._allocate_kv_cache_tensors(kv_cache_config)
-
-        assert result["layer_0"].device.type == "meta"
+    # Cycle 5a (commit 547111ff) deleted VLLM_RBLN_USE_DEVICE_TENSOR and
+    # collapsed _allocate_kv_cache_tensors to always allocate on
+    # ``self.device``. The previous "meta-device when compile +
+    # !custom_kernel" branch no longer exists in the source, so the test
+    # that asserted on it has been removed (test obsolete, not assertion
+    # drift). The on-device path is covered by the surviving
+    # test_basic_allocation / test_multiple_kv_cache_tensors /
+    # test_device_tensor_allocates_on_self_device cases.
 
     def test_multiple_kv_cache_tensors(self):
         """Multiple KV cache tensor configs for different layer groups."""
