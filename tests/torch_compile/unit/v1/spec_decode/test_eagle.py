@@ -64,24 +64,34 @@ class FakeAttentionGroup:
         return self._builder
 
 
-class FakeBucketingManager:
-    def __init__(self, batch_bucket_size: int):
-        self.batch_bucket_size = batch_bucket_size
-
-    def find_decode_batch_bucket(self, batch_size: int) -> int:
-        assert batch_size <= self.batch_bucket_size
-        return self.batch_bucket_size
-
-
 class FakeRunner:
-    def __init__(self, batch_bucket_size: int, num_tokens_no_spec, is_prefill: bool):
-        self.bucketing_manager = FakeBucketingManager(batch_bucket_size)
-        self.input_batch = SimpleNamespace(num_tokens_no_spec=num_tokens_no_spec)
-        self.kv_caches = [torch.tensor([11], dtype=torch.int32)]
-        self._is_prefill = is_prefill
+    """Stub matching the post-Cycle-5d eagle proposer contract.
 
-    def is_prefill_phase(self):
-        return self._is_prefill
+    The proposer derives prefill/decode locally from
+    ``runner.input_batch.num_computed_tokens_cpu`` vs
+    ``runner.input_batch.num_tokens_no_spec`` (M4 collapse) — the
+    runner-side ``is_prefill_phase()`` and ``bucketing_manager`` are gone.
+    """
+
+    def __init__(self, num_tokens_no_spec, is_prefill: bool):
+        num_reqs = int(num_tokens_no_spec.shape[0])
+        # Pick computed-tokens such that the eagle-side
+        # `num_computed_tokens_cpu[0] < num_tokens_no_spec[0] - 1`
+        # check yields the requested prefill/decode classification.
+        if is_prefill:
+            num_computed = np.zeros(num_reqs, dtype=np.int32)
+        else:
+            no_spec_np = (
+                num_tokens_no_spec.numpy()
+                if isinstance(num_tokens_no_spec, torch.Tensor)
+                else np.asarray(num_tokens_no_spec)
+            )
+            num_computed = np.maximum(no_spec_np - 1, 0).astype(np.int32)
+        self.input_batch = SimpleNamespace(
+            num_tokens_no_spec=num_tokens_no_spec,
+            num_computed_tokens_cpu=num_computed,
+        )
+        self.kv_caches = [torch.tensor([11], dtype=torch.int32)]
 
 
 def make_common_attn_metadata(
@@ -111,7 +121,6 @@ def make_common_attn_metadata(
 
 def make_fake_proposer(
     *,
-    batch_bucket_size: int,
     is_prefill: bool,
     num_speculative_tokens: int,
     hidden_size: int = 4,
@@ -124,7 +133,6 @@ def make_fake_proposer(
     fake.hidden_size = hidden_size
     fake.supports_mm_inputs = False
     fake.runner = FakeRunner(
-        batch_bucket_size=batch_bucket_size,
         num_tokens_no_spec=torch.tensor([2, 2], dtype=torch.int32),
         is_prefill=is_prefill,
     )
@@ -167,7 +175,7 @@ def patch_forward_context(monkeypatch):
 # Verifies that the first-pass helper shifts tokens and infers default sample indices.
 def test_set_inputs_first_pass_sets_shifted_tokens_and_default_indices():
     fake, _ = make_fake_proposer(
-        batch_bucket_size=4, is_prefill=False, num_speculative_tokens=1
+        is_prefill=False, num_speculative_tokens=1
     )
     fake.needs_extra_input_slots = False
     cad = make_common_attn_metadata(
@@ -207,7 +215,7 @@ def test_set_inputs_first_pass_sets_shifted_tokens_and_default_indices():
 # Verifies that extra input slot mode is explicitly unsupported in RBLN EAGLE.
 def test_set_inputs_first_pass_rejects_extra_input_slots():
     fake, _ = make_fake_proposer(
-        batch_bucket_size=4, is_prefill=False, num_speculative_tokens=1
+        is_prefill=False, num_speculative_tokens=1
     )
     fake.needs_extra_input_slots = True
     cad = make_common_attn_metadata(
@@ -234,7 +242,7 @@ def test_set_inputs_first_pass_rejects_extra_input_slots():
 # when sampling output is discarded or empty.
 def test_prepare_next_token_ids_padded_uses_request_backup_tokens():
     fake, _ = make_fake_proposer(
-        batch_bucket_size=4, is_prefill=False, num_speculative_tokens=1
+        is_prefill=False, num_speculative_tokens=1
     )
     common_attn_metadata = make_common_attn_metadata(
         query_start_loc=torch.tensor([0, 1, 2, 3, 4], dtype=torch.int32),
@@ -278,11 +286,12 @@ def test_prepare_next_token_ids_padded_uses_request_backup_tokens():
     )
 
 
-# Verifies the decode-path proposer reshapes and pads inputs
-# before calling the draft model.
+# Verifies the decode-path proposer reshapes inputs to the real batch shape.
+# Cycle 5d collapsed bucket-pad to a no-op (batch_bucket_size = batch_size),
+# so shapes are (batch_size, tokens_per_req, ...) without trailing zero rows.
 def test_propose_decode_path_pads_inputs_and_hidden_states():
     fake, builder = make_fake_proposer(
-        batch_bucket_size=4, is_prefill=False, num_speculative_tokens=1
+        is_prefill=False, num_speculative_tokens=1
     )
     fake.needs_extra_input_slots = False
     cad = make_common_attn_metadata(
@@ -290,7 +299,7 @@ def test_propose_decode_path_pads_inputs_and_hidden_states():
         seq_lens=torch.tensor([10, 11], dtype=torch.int32),
     )
     target_positions = torch.tensor([4, 5, 6, 7], dtype=torch.int64)
-    target_hidden_states = torch.arange(32, dtype=torch.float32).view(8, 4)
+    target_hidden_states = torch.arange(16, dtype=torch.float32).view(4, 4)
 
     def model_executable(
         input_ids: torch.Tensor,
@@ -300,12 +309,12 @@ def test_propose_decode_path_pads_inputs_and_hidden_states():
         last_token_indices: torch.Tensor | None,
     ):
         assert inputs_embeds is None
-        assert input_ids.shape == (4, 2)
-        assert positions.shape == (4, 2)
-        assert hidden_states.shape == (4, 2, 4)
+        assert input_ids.shape == (2, 2)
+        assert positions.shape == (2, 2)
+        assert hidden_states.shape == (2, 2, 4)
         torch.testing.assert_close(
             last_token_indices,
-            torch.tensor([1, 3, 0, 0], dtype=torch.int32),
+            torch.tensor([1, 3], dtype=torch.int32),
         )
         logits = torch.tensor(
             [[0.0, 5.0, 1.0], [0.0, 1.0, 7.0]],
@@ -334,12 +343,15 @@ def test_propose_decode_path_pads_inputs_and_hidden_states():
 # Verifies that eagle3 combines hidden states before the first draft-model forward pass.
 def test_propose_eagle3_combines_hidden_states_before_forward():
     fake, builder = make_fake_proposer(
-        batch_bucket_size=4, is_prefill=False, num_speculative_tokens=1
+        is_prefill=False, num_speculative_tokens=1
     )
     fake.needs_extra_input_slots = False
     fake.method = "eagle3"
-    raw_hidden_states = torch.arange(64, dtype=torch.float32).view(8, 8)
-    combined_hidden_states = torch.arange(32, dtype=torch.float32).view(8, 4) + 200
+    # Raw hidden-state stacking dim is unconstrained (proposer just feeds it
+    # to combine_hidden_states), but the *combined* output must match the
+    # post-5d batch shape (batch_size=2, tokens=2, hidden=4) → 16 elements.
+    raw_hidden_states = torch.arange(32, dtype=torch.float32).view(4, 8)
+    combined_hidden_states = torch.arange(16, dtype=torch.float32).view(4, 4) + 200
     fake.model = SimpleNamespace(
         combine_hidden_states=Mock(return_value=combined_hidden_states)
     )
@@ -357,16 +369,16 @@ def test_propose_eagle3_combines_hidden_states_before_forward():
         last_token_indices: torch.Tensor | None,
     ):
         assert inputs_embeds is None
-        assert input_ids.shape == (4, 2)
-        assert positions.shape == (4, 2)
-        assert hidden_states.shape == (4, 2, 4)
+        assert input_ids.shape == (2, 2)
+        assert positions.shape == (2, 2)
+        assert hidden_states.shape == (2, 2, 4)
         torch.testing.assert_close(
             hidden_states,
-            combined_hidden_states.view(4, 2, 4),
+            combined_hidden_states.view(2, 2, 4),
         )
         torch.testing.assert_close(
             last_token_indices,
-            torch.tensor([1, 3, 0, 0], dtype=torch.int32),
+            torch.tensor([1, 3], dtype=torch.int32),
         )
         logits = torch.tensor(
             [[0.0, 6.0, 1.0], [0.0, 1.0, 8.0]],
@@ -396,7 +408,7 @@ def test_propose_eagle3_combines_hidden_states_before_forward():
 # with an unexpected final dimension.
 def test_propose_eagle3_asserts_combined_hidden_size():
     fake, _ = make_fake_proposer(
-        batch_bucket_size=4, is_prefill=False, num_speculative_tokens=1
+        is_prefill=False, num_speculative_tokens=1
     )
     fake.needs_extra_input_slots = False
     fake.method = "eagle3"
@@ -427,7 +439,7 @@ def test_propose_eagle3_asserts_combined_hidden_size():
 # wide batch shape expected by the runner.
 def test_propose_prefill_path_keeps_unpadded_batch_shape():
     fake, _ = make_fake_proposer(
-        batch_bucket_size=4, is_prefill=True, num_speculative_tokens=1
+        is_prefill=True, num_speculative_tokens=1
     )
     fake.needs_extra_input_slots = False
     cad = make_common_attn_metadata(
@@ -446,9 +458,10 @@ def test_propose_prefill_path_keeps_unpadded_batch_shape():
         assert input_ids.shape == (2, 16)
         assert positions.shape == (2, 16)
         assert hidden_states.shape == (2, 16, 4)
+        # Cycle 5d: bucket-pad collapsed to batch_size, so no trailing zeros.
         torch.testing.assert_close(
             last_token_indices,
-            torch.tensor([1, 3, 0, 0], dtype=torch.int32),
+            torch.tensor([1, 3], dtype=torch.int32),
         )
         logits = torch.tensor(
             [[0.0, 2.0, 1.0], [0.0, 1.0, 4.0]],
@@ -476,7 +489,6 @@ def test_propose_prefill_path_keeps_unpadded_batch_shape():
 # slot mapping, and attention metadata between passes.
 def test_propose_multistep_updates_metadata_and_rebuilds_attention():
     fake, builder = make_fake_proposer(
-        batch_bucket_size=4,
         is_prefill=False,
         num_speculative_tokens=2,
         max_model_len=9,
@@ -494,8 +506,10 @@ def test_propose_multistep_updates_metadata_and_rebuilds_attention():
         ),
     )
     target_positions = torch.tensor([5, 6, 7, 8], dtype=torch.int64)
-    target_hidden_states = torch.arange(32, dtype=torch.float32).view(8, 4)
-    first_hidden_states = torch.arange(32, dtype=torch.float32).view(8, 4) + 100
+    # Cycle 5d: hidden tensors live at the real (batch_size, tokens, hidden)
+    # = (2, 2, 4) shape — no bucket padding to (4, 2, 4).
+    target_hidden_states = torch.arange(16, dtype=torch.float32).view(4, 4)
+    first_hidden_states = torch.arange(16, dtype=torch.float32).view(4, 4) + 100
     calls: list[dict[str, torch.Tensor | None]] = []
 
     def model_executable(
@@ -516,12 +530,12 @@ def test_propose_multistep_updates_metadata_and_rebuilds_attention():
             }
         )
         if len(calls) == 1:
-            assert input_ids.shape == (4, 2)
-            assert positions.shape == (4, 2)
-            assert hidden_states.shape == (4, 2, 4)
+            assert input_ids.shape == (2, 2)
+            assert positions.shape == (2, 2)
+            assert hidden_states.shape == (2, 2, 4)
             torch.testing.assert_close(
                 last_token_indices,
-                torch.tensor([1, 3, 0, 0], dtype=torch.int32),
+                torch.tensor([1, 3], dtype=torch.int32),
             )
             logits = torch.tensor(
                 [[0.0, 5.0, 1.0], [0.0, 1.0, 7.0]],
@@ -530,12 +544,12 @@ def test_propose_multistep_updates_metadata_and_rebuilds_attention():
             return first_hidden_states, logits
 
         assert len(calls) == 2
-        assert input_ids.shape == (4, 1)
-        assert positions.shape == (4, 1)
-        assert hidden_states.shape == (4, 1, 4)
+        assert input_ids.shape == (2, 1)
+        assert positions.shape == (2, 1)
+        assert hidden_states.shape == (2, 1, 4)
         assert last_token_indices is None
 
-        expected_hidden = torch.zeros((4, 1, 4), dtype=torch.float32)
+        expected_hidden = torch.zeros((2, 1, 4), dtype=torch.float32)
         expected_hidden[0, 0] = first_hidden_states[1]
         expected_hidden[1, 0] = first_hidden_states[3]
         torch.testing.assert_close(hidden_states, expected_hidden)

@@ -64,7 +64,6 @@ def _make_runner_stub(**overrides):
         input_batch=MagicMock(),
         arange_np=np.arange(10000, dtype=np.int64),
         intermediate_tensors=None,
-        bucketing_manager=MagicMock(),
         max_num_batched_tokens=256,
         specialized_moe_decode=False,
         sampler=MagicMock(),
@@ -592,44 +591,7 @@ class TestGetCumsumAndArange:
 
 
 # ===========================================================================
-# 7. is_prefills – REAL code path
-# ===========================================================================
-
-
-class TestIsPrefills:
-    """Test RBLNModelRunner.is_prefills with real numpy arrays."""
-
-    def _call(self, num_computed, num_tokens_no_spec):
-        batch = MagicMock(spec=InputBatch)
-        batch.num_computed_tokens_cpu = np.array(num_computed, dtype=np.int64)
-        batch.num_tokens_no_spec = np.array(num_tokens_no_spec, dtype=np.int64)
-        stub = SimpleNamespace(input_batch=batch)
-        bound = types.MethodType(RBLNModelRunner.is_prefills, stub)
-        return bound()
-
-    def test_all_prefill(self):
-        # computed < total - 1 means prefill
-        result = self._call([0, 0, 0], [10, 20, 30])
-        np.testing.assert_array_equal(result, [True, True, True])
-
-    def test_all_decode(self):
-        # computed >= total - 1 means decode
-        result = self._call([9, 19, 29], [10, 20, 30])
-        np.testing.assert_array_equal(result, [False, False, False])
-
-    def test_mixed(self):
-        result = self._call([0, 19], [10, 20])
-        np.testing.assert_array_equal(result, [True, False])
-
-    def test_boundary(self):
-        # num_computed == num_tokens - 2 => True (prefill)
-        # num_computed == num_tokens - 1 => False (decode)
-        result = self._call([8, 9], [10, 10])
-        np.testing.assert_array_equal(result, [True, False])
-
-
-# ===========================================================================
-# 8. use_wrapped_compute_logits – REAL code path
+# 7. use_wrapped_compute_logits – REAL code path
 # ===========================================================================
 
 
