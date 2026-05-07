@@ -1978,19 +1978,14 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         sched_output: SchedulerOutput,
         cleanup_sched_output: SchedulerOutput,
         intermediate_tensors: IntermediateTensors,
-        num_padded_tokens: int | None = None,
     ) -> None:
         if get_pp_group().is_first_rank:
             intermediate_tensors = None
 
-        output = self.execute_model(
-            sched_output, intermediate_tensors, num_padded_tokens
-        )
+        output = self.execute_model(sched_output, intermediate_tensors)
         if output is None:
             self.sample_tokens(None)
-        output = self.execute_model(
-            cleanup_sched_output, intermediate_tensors, num_padded_tokens
-        )
+        output = self.execute_model(cleanup_sched_output, intermediate_tensors)
         if output is None:
             self.sample_tokens(None)
 
