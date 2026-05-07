@@ -21,7 +21,6 @@ if TYPE_CHECKING:
     VLLM_RBLN_COMPILE_MODEL: bool = True
     VLLM_RBLN_COMPILE_STRICT_MODE: bool = False
     VLLM_RBLN_TP_SIZE: int = 1
-    VLLM_RBLN_SAMPLER: bool = True
     VLLM_RBLN_ENABLE_WARM_UP: bool = True
     VLLM_RBLN_USE_VLLM_MODEL: bool = False
     VLLM_RBLN_SPECIALIZE_MOE_DECODE: bool = True
@@ -132,10 +131,6 @@ environment_variables = {
     ),
     # TP Size for RSD.
     "VLLM_RBLN_TP_SIZE": lambda: int(os.environ.get("VLLM_RBLN_TP_SIZE", 1)),
-    # Use customized sampler
-    "VLLM_RBLN_SAMPLER": (
-        lambda: os.environ.get("VLLM_RBLN_SAMPLER", "True").lower() in ("true", "1")
-    ),
     # Enable warm_up
     "VLLM_RBLN_ENABLE_WARM_UP": (
         lambda: (

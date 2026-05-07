@@ -101,7 +101,6 @@ from vllm.v1.outputs import (
 from vllm.v1.sample.logits_processor import build_logitsprocs
 from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
@@ -282,17 +281,11 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.runtime_holder: list = []
 
         # Sampler
-        self.use_rbln_sampler = envs.VLLM_RBLN_SAMPLER
-        if self.use_rbln_sampler:
-            logger.info("Using RBLN sampler: %s", self.use_rbln_sampler)
-            sampler = RBLNSampler(
-                logprobs_mode=self.model_config.logprobs_mode,
-                seed=self.vllm_config.model_config.seed,
-                compile_context=self.compile_context,
-            )
-        else:
-            logger.info("Using default vLLM sampler.")
-            sampler = Sampler(logprobs_mode=self.model_config.logprobs_mode)
+        sampler = RBLNSampler(
+            logprobs_mode=self.model_config.logprobs_mode,
+            seed=self.vllm_config.model_config.seed,
+            compile_context=self.compile_context,
+        )
         self.sampler = sampler
 
         # Lazy initialization
