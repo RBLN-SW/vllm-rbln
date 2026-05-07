@@ -778,31 +778,17 @@ class TestCompileOrWarmUpModel:
         worker.compile_or_warm_up_model()
         worker.model_runner.warm_up_model.assert_called_once()
 
-    def test_oom_enomem(self):
-        worker = _create_worker()
-        worker.model_runner = MagicMock()
-        worker.model_runner.kv_cache_config.num_blocks = 64
-
-        inner = RuntimeError("SYS_ENOMEM: Out of memory")
-        exc = BackendCompilerFailed(MagicMock(), inner, None)
-        exc.inner_exception = inner
-        worker.model_runner.warm_up_model.side_effect = exc
-
-        with pytest.raises(RuntimeError, match="Not enough memory"):
-            worker.compile_or_warm_up_model()
-
-    def test_oom_ebusy(self):
-        worker = _create_worker()
-        worker.model_runner = MagicMock()
-        worker.model_runner.kv_cache_config.num_blocks = 32
-
-        inner = RuntimeError("SYS_EBUSY: Lack of device memory")
-        exc = BackendCompilerFailed(MagicMock(), inner, None)
-        exc.inner_exception = inner
-        worker.model_runner.warm_up_model.side_effect = exc
-
-        with pytest.raises(RuntimeError, match="Not enough memory"):
-            worker.compile_or_warm_up_model()
+    # Cycle 2 (commit d249007b) removed the OOM string-match path from
+    # `compile_or_warm_up_model`. The SYS_ENOMEM / SYS_EBUSY translation
+    # to a "Not enough memory" RuntimeError no longer exists; the
+    # comment in the source explicitly says "OOM detection lives in the
+    # compiler itself once it raises typed RblnOutOfMemoryError." The
+    # test_oom_enomem / test_oom_ebusy cases that asserted on the old
+    # string-match wrapper have been removed (test obsolete, not
+    # assertion drift). The fallthrough behaviour for unrecognised
+    # BackendCompilerFailed payloads is still covered by the
+    # test_non_oom_backend_error / test_non_runtime_inner_exception
+    # cases below.
 
     def test_non_oom_backend_error(self):
         worker = _create_worker()
@@ -1071,7 +1057,14 @@ class TestMisc:
     def test_execute_dummy_batch(self):
         worker = _create_worker()
         worker.model_runner = MagicMock()
-        worker.execute_dummy_batch()
+        # `execute_dummy_batch` first calls `_setup_rbln_host_threads`,
+        # which shells out to `lscpu` via vllm's
+        # `get_allowed_cpu_core_node_list`. Hosts without `util-linux`
+        # installed (e.g. minimal CI images) lack `lscpu` and the call
+        # fails with returncode 127. Stub the setup helper to keep the
+        # test focused on the dummy_run delegation contract.
+        with patch.object(worker, "_setup_rbln_host_threads"):
+            worker.execute_dummy_batch()
         worker.model_runner.dummy_run.assert_called_once()
 
     def test_take_draft_token_ids(self):
