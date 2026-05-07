@@ -132,7 +132,6 @@ from vllm_rbln.v1.sample import RBLNSampler
 from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
-from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
 from vllm_rbln.v1.worker.metrics import PerformanceTracker, collect_metrics
 
 if TYPE_CHECKING:
@@ -444,9 +443,15 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 (3, self.max_num_tokens + 1), dtype=torch.int64
             )
 
-        # None in the first PP rank. The rest are set after load_model.
-        self.prefill_intermediate_tensors: IntermediateTensors | None = None
-        self.decode_intermediate_tensors: dict[int, IntermediateTensors] = {}
+        # PP intermediate tensors are now allocated lazily on the receive
+        # path (Cycle 5d M2). With dynamic shapes the runner no longer needs
+        # to pre-build a per-bucket pool — the GPU runner does the same.
+        self.intermediate_tensors: IntermediateTensors | None = None
+
+        # Cycle 5d (M4): cache the last-seen prefill/decode classification so
+        # bookkeeping consumers (perf tracker, metrics) keep their phase
+        # bucketing without resurrecting `is_prefill_phase()`.
+        self._last_execute_was_prefill: bool = False
 
         # OPTIMIZATION: Cache the tensors rather than creating them every step.
         # Keep in int64 to avoid overflow with long context
@@ -515,18 +520,9 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.max_prefill_batch_size = 1
         self.max_num_batched_tokens = self.scheduler_config.max_num_batched_tokens
 
-        self.bucketing_manager = get_bucketing_manager(
-            envs.VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY,
-            max_batch_size=self.max_batch_size,
-            min_batch_size=envs.VLLM_RBLN_DECODE_BATCH_BUCKET_MIN,
-            step=envs.VLLM_RBLN_DECODE_BATCH_BUCKET_STEP,
-            limit=envs.VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT,
-            manual_buckets=envs.VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS,
-        )
-        logger.info("Using %s bucketing manager", type(self.bucketing_manager).__name__)
-        logger.info(
-            "decode batch buckets: %s", self.bucketing_manager.decode_batch_buckets
-        )
+        # Cycle 5d (M3): bucketing_manager removed — dynamic shapes mean we
+        # pass real `num_reqs` directly. The historical
+        # `VLLM_RBLN_DECODE_BATCH_BUCKET_*` env vars are now no-ops.
 
         self.performance_tracker: PerformanceTracker | None = None
         self.sampler_performance_tracker: PerformanceTracker | None = None
@@ -1306,17 +1302,14 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self.num_accepted_tokens.copy_to_gpu()
 
         max_num_scheduled_tokens = int(num_scheduled_tokens.max())
-        initial_batch_bucket_size = self.bucketing_manager.find_decode_batch_bucket(
-            num_reqs
-        )
+        # Cycle 5d (M3+M4): no bucketing; pass real num_reqs straight through.
+        initial_batch_bucket_size = num_reqs
 
-        is_prefill_phase = self.is_prefill_phase()
         (batch_bucket_size, num_padded_tokens, num_tokens_across_dp) = (
             self.get_dp_padding(
                 total_num_scheduled_tokens,
                 initial_batch_bucket_size,
                 num_padded_tokens,
-                is_prefill_phase,
             )
         )
         assert batch_bucket_size is not None
@@ -1398,7 +1391,17 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 if isinstance(builder, RBLNFlashAttentionMetadataBuilder):
                     extra_attn_metadata_args["positions"] = self.positions.cpu
                     extra_attn_metadata_args["batch_pad"] = batch_bucket_size
-                    extra_attn_metadata_args["is_prefill"] = is_prefill_phase
+                    # The attention backend still distinguishes prefill vs
+                    # decode mask shapes (Cycle V `flash_attn_varlen` will
+                    # eventually unify these); derive the flag locally instead
+                    # of going through the deleted runner-wide
+                    # `is_prefill_phase()` helper (Cycle 5d M4).
+                    extra_attn_metadata_args["is_prefill"] = bool(
+                        (
+                            self.input_batch.num_computed_tokens_cpu[:num_reqs]
+                            < self.input_batch.num_tokens_no_spec[:num_reqs] - 1
+                        )[0]
+                    ) if num_reqs > 0 else False
                 attn_metadata_i = builder.build(
                     common_prefix_len=common_prefix_len,
                     common_attn_metadata=common_attn_metadata,
@@ -1688,9 +1691,9 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             num_padded_tokens = self.max_num_batched_tokens
         else:
             assert max_decode_tokens is not None
-            batch_bucket_size = self.bucketing_manager.find_decode_batch_bucket(
-                max_decode_tokens
-            )
+            # Cycle 5d (M3): no bucket rounding; the batch bucket is just the
+            # actual decode-token count seen across DP ranks.
+            batch_bucket_size = max_decode_tokens
             num_padded_tokens = batch_bucket_size
 
         return batch_bucket_size, num_padded_tokens, num_tokens_across_dp_cpu
@@ -1911,7 +1914,10 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         if envs.VLLM_RBLN_METRICS and self.sampler_performance_tracker is not None:
             collect_metrics(
                 self.sampler_performance_tracker,
-                self.is_prefill_phase(),
+                # Cycle 5d (M4): perf-tracker bucketing inherits the cached
+                # phase from the most recent execute_model() call rather than
+                # re-deriving it via the deleted `is_prefill_phase()` helper.
+                bool(self._last_execute_was_prefill),
                 start_time=sampler_start_time,
                 end_time=time.perf_counter(),
                 reports=sampler_reports,
@@ -1973,7 +1979,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             dummy_prefill_num_scheduled_tokens,
             num_kv_cache_groups,
         )
-        self._execute_dummy_requests(so, cso, self.prefill_intermediate_tensors)
+        self._execute_dummy_requests(so, cso, self.intermediate_tensors)
 
         # Single decode dummy at one representative shape; further shapes
         # are JIT'd on first real request.
@@ -1995,10 +2001,9 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             dummy_decode_num_scheduled_tokens,
             num_kv_cache_groups,
         )
-        # Use the first available decode intermediate tensor; with dynamic
-        # shapes we'll drop this pre-allocation entirely (Cycle 3b — M2).
-        decode_it = next(iter(self.decode_intermediate_tensors.values()))
-        self._execute_dummy_requests(so, cso, decode_it)
+        # Cycle 5d (M2): single lazy intermediate-tensor buffer; dynamic
+        # shapes mean we no longer keep one per decode-batch bucket.
+        self._execute_dummy_requests(so, cso, self.intermediate_tensors)
 
     def _add_dummy_requests(
         self,
@@ -2213,7 +2218,10 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         input_ids_bucket: dict[int, torch.Tensor] = {}
         positions_bucket: dict[int, torch.Tensor] = {}
 
-        for batch_bucket_size in self.bucketing_manager.decode_batch_buckets:
+        # Cycle 5d (M3): bucket sweep collapsed to a single representative
+        # batch size — DP dummy_run is M16 (deferred), so this keeps the
+        # path runnable but stops fanning out per bucket.
+        for batch_bucket_size in (self.max_batch_size,):
             attn_metadata: dict[str, Any] = {}
             # Prepare the attention metadata for each KV cache group and
             # make layers in the same group share the same metadata.
@@ -2412,9 +2420,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         (attn_metadata, num_input_tokens, input_ids, positions) = self.dummy_run_state
 
         (batch_bucket_size, num_padded_tokens, num_tokens_across_dp) = (
-            self.get_dp_padding(
-                num_input_tokens, self.bucketing_manager.decode_batch_buckets[0]
-            )
+            self.get_dp_padding(num_input_tokens, self.max_batch_size)
         )
 
         assert (
@@ -2432,10 +2438,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         if get_pp_group().is_first_rank:
             intermediate_tensors = None
         else:
-            intermediate_tensors = self.decode_intermediate_tensors.get(
-                batch_bucket_size
-            )
-            assert intermediate_tensors is not None
+            # Cycle 5d (M2): single lazy buffer; DP dummy_run reuses it.
+            intermediate_tensors = self.intermediate_tensors
 
         with set_forward_context(
             bucket_attn_metadata,
@@ -2781,7 +2785,18 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             ) = self._preprocess(scheduler_output)
 
         assert input_ids is not None
-        is_prefill_phase = self.is_prefill_phase()
+        # Cycle 5d (M4): collapsed prefill/decode bifurcation. The remaining
+        # users that genuinely need the phase classification (perf tracker,
+        # attention-mask shape) compute it locally; the global runner-side
+        # branch is gone.
+        num_computed_tokens_cpu = self.input_batch.num_computed_tokens_cpu
+        num_prompt_tokens_cpu = self.input_batch.num_prompt_tokens
+        is_prefill_phase = bool(
+            (num_computed_tokens_cpu[0] < num_prompt_tokens_cpu[0] - 1)
+            if num_reqs > 0
+            else False
+        )
+        self._last_execute_was_prefill = is_prefill_phase
 
         # Padding length for speculative decoding by num_speculative_tokens
         if scheduler_output.scheduled_spec_decode_tokens:
@@ -2992,58 +3007,38 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     )
                 sample_hidden_states = hidden_states
                 if not self.use_wrapped_compute_logits():
-                    # DO NOT include compute logits
-
-                    # FIXME(jiwoo.park) This is a temporary workaround;
-                    # SHOULD resolve the batch dimension.
+                    # DO NOT include compute logits.
+                    # Cycle 5d (M4): single path mirroring GPU runner —
+                    # gather hidden states at `logits_indices` then compute
+                    # logits once. The prefill-vs-decode dichotomy is gone.
                     hidden_states = hidden_states.flatten(0, -2)
-
-                    if is_prefill_phase:  # prefill
-                        sample_hidden_states = hidden_states[logits_indices]
-                        logits = self.compute_logits(sample_hidden_states)
-                    else:  # decode
-                        logits = self.compute_logits(hidden_states)
-                        logits = logits[logits_indices]
+                    sample_hidden_states = hidden_states[logits_indices]
+                    logits = self.compute_logits(sample_hidden_states)
                     if not envs.VLLM_RBLN_LOGITS_ALL_GATHER:
                         logits = self.logits_processor._gather_logits(logits)
                     logits = logits.view(-1, logits.size(-1))
                 else:
+                    # `compute_logits` is fused into `model_executable` (M10
+                    # still pending) so `logits` is already produced — only
+                    # spec-decode needs to re-shape `sample_hidden_states`
+                    # for the draft model. Cycle 5d (M4): drop the
+                    # prefill/decode chunk-boundary branch; logits are taken
+                    # at `logits_indices` like the GPU runner.
                     selected_token_indices = logits_indices.to(self.device)
                     assert selected_token_indices.dim() == 1
-                    if is_prefill_phase:  # prefill
-                        assert selected_token_indices.size(0) == 1
-                        num_computed = self.input_batch.num_computed_tokens_cpu
-                        num_prompted = self.input_batch.num_prompt_tokens
-                        is_last_prefill = (
-                            num_computed + self.max_num_tokens
-                        ) >= num_prompted
-                        if not is_last_prefill[0]:  # noqa: SIM108
-                            # chunked prefill(#0~#N-1, intermediate)
-                            # token_indices = torch.tensor([max_num_seqs-1])
-                            # selected = torch.tensor([])
-                            logits = logits[:0]
-                        else:
-                            # chunked prefill(#N, final)
-                            # token_indices = torch.tensor([last_seq_idx-1])
-                            # selected_token_indices == token_indices
-                            logits = logits
-
-                        if self.use_eagle():
-                            hidden_states = hidden_states.flatten(0, -2)
-                            sample_hidden_states = hidden_states[logits_indices]
-                            logits = logits[logits_indices]
-                    else:  # decode
-                        # selected_token_indices is for valid decode tokens
-                        # token_indices == None, selected = torch.tensor([0])
-                        if self.speculative_config is not None:
-                            batch_indices = torch.arange(
-                                self.input_batch.num_reqs, device=self.device
-                            )
-                            sample_hidden_states = hidden_states[
-                                batch_indices,
-                                : self.speculative_config.num_speculative_tokens + 1,
-                            ]
-                            logits = logits[selected_token_indices]
+                    if self.speculative_config is not None:
+                        batch_indices = torch.arange(
+                            self.input_batch.num_reqs, device=self.device
+                        )
+                        sample_hidden_states = hidden_states[
+                            batch_indices,
+                            : self.speculative_config.num_speculative_tokens + 1,
+                        ]
+                        logits = logits[selected_token_indices]
+                    elif self.use_eagle():
+                        hidden_states = hidden_states.flatten(0, -2)
+                        sample_hidden_states = hidden_states[logits_indices]
+                        logits = logits[logits_indices]
 
             if broadcast_pp_output:
                 model_output_broadcast_data = (
@@ -3166,11 +3161,9 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 propose_draft_token_ids(sampled_token_ids)
 
         with record_function_or_nullcontext("Bookkeep"):
-            # NOTE:
-            # is_prefill is changed after bookkeeping
-            # so we need to get it before bookkeeping,
-            # and pass it to performance tracker.
-            is_prefill_phase = self.is_prefill_phase()
+            # Cycle 5d (M4): use the cached classification from execute_model
+            # rather than re-deriving it via the deleted helper.
+            is_prefill_phase = self._last_execute_was_prefill
             (
                 num_nans_in_logits,
                 logprobs_lists,
@@ -3549,18 +3542,9 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             compiled_graph = self._compile_model(model_wrapper)
             self.model_executable = compiled_graph
 
-        distributed_executor_backend = (
-            self.vllm_config.parallel_config.distributed_executor_backend
-        )
-        if distributed_executor_backend == "ray":
-            self._prepare_prefill_intermediate_tensors()
-            for batch_bucket_size in self.bucketing_manager.decode_batch_buckets:
-                self._prepare_decode_intermediate_tensors(batch_bucket_size)
-        else:
-            with torch.inference_mode():
-                self._prepare_prefill_intermediate_tensors()
-                for batch_bucket_size in self.bucketing_manager.decode_batch_buckets:
-                    self._prepare_decode_intermediate_tensors(batch_bucket_size)
+        # Cycle 5d (M2): pre-allocation per (prefill | decode bucket) is gone.
+        # PP intermediate tensors are now built on demand the first time the
+        # receive path needs them (mirrors the GPU runner's lazy alloc).
 
     def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:
         """Extract Eagle3 auxiliary layer indices from speculative config.
@@ -3585,52 +3569,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             return tuple(layer_ids)
 
         return None
-
-    def _prepare_prefill_intermediate_tensors(self) -> None:
-        def _reshape(
-            batch_size: int, seq_len: int, intermediate_tensors: IntermediateTensors
-        ) -> IntermediateTensors:
-            return IntermediateTensors(
-                {
-                    k: v.view(batch_size, seq_len, -1)
-                    for k, v in intermediate_tensors.items()
-                }
-            )
-
-        batch_size = self.max_prefill_batch_size
-        seq_len = self.max_num_batched_tokens
-        self.prefill_intermediate_tensors = _reshape(
-            batch_size,
-            seq_len,
-            self.model.make_empty_intermediate_tensors(
-                batch_size=batch_size * seq_len,
-                dtype=self.model_config.dtype,
-                device=self.device,
-            ),
-        )
-
-    def _prepare_decode_intermediate_tensors(self, batch_bucket_size) -> None:
-        def _reshape(
-            batch_size: int, seq_len: int, intermediate_tensors: IntermediateTensors
-        ) -> IntermediateTensors:
-            return IntermediateTensors(
-                {
-                    k: v.view(batch_size, seq_len, -1)
-                    for k, v in intermediate_tensors.items()
-                }
-            )
-
-        batch_size = batch_bucket_size
-        seq_len = 1
-        self.decode_intermediate_tensors[batch_bucket_size] = _reshape(
-            batch_size,
-            seq_len,
-            self.model.make_empty_intermediate_tensors(
-                batch_size=batch_size * seq_len,
-                dtype=self.model_config.dtype,
-                device=self.device,
-            ),
-        )
 
     def save_tensorized_model(
         self,
@@ -4486,15 +4424,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # self.transfer_event.record()
         # self.transfer_event.synchronize()
         return pinned.tolist()
-
-    def is_prefills(self) -> np.ndarray:
-        return (
-            self.input_batch.num_computed_tokens_cpu
-            < self.input_batch.num_tokens_no_spec - 1
-        )
-
-    def is_prefill_phase(self) -> bool:
-        return bool(self.is_prefills()[0])
 
     def use_wrapped_compute_logits(self) -> bool:
         return not (self.lora_config is not None)

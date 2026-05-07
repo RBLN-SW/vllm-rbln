@@ -66,7 +66,13 @@ class RBLNEagleProposer(EagleProposer):
         | None = None,
     ) -> torch.Tensor:
         batch_size = next_token_ids.shape[0]
-        is_prefill = self.runner.is_prefill_phase()
+        # Cycle 5d (M4): runner-side `is_prefill_phase()` is gone; the
+        # eagle proposer derives the same classification locally.
+        input_batch = self.runner.input_batch
+        is_prefill = bool(
+            input_batch.num_computed_tokens_cpu[0]
+            < input_batch.num_tokens_no_spec[0] - 1
+        )
 
         if self.method == "eagle3":
             # assert isinstance(
@@ -91,10 +97,9 @@ class RBLNEagleProposer(EagleProposer):
 
         assert self.runner is not None
 
-        # NOTE(RBLN): build attention metadata
-        batch_bucket_size = self.runner.bucketing_manager.find_decode_batch_bucket(
-            batch_size
-        )
+        # NOTE(RBLN): build attention metadata.
+        # Cycle 5d (M3): bucketing removed — pass real batch size through.
+        batch_bucket_size = batch_size
         num_padded_tokens = None
         num_tokens_across_dp = None
         extra_attn_metadata_args = {}
