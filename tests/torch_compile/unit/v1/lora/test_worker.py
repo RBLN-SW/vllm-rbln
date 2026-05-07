@@ -43,17 +43,6 @@ MODEL_PATH = "Qwen/Qwen3-0.6B"
 NUM_LORAS = 16
 
 
-@pytest.mark.xfail(
-    reason=(
-        "vLLM core's `initialize_dummy_weights` builds the Generator on the "
-        "model_config device ('rbln') and then calls `param.uniform_(low, "
-        "high, generator=generator)` where `param` is a CPU staging tensor "
-        "during dummy-init — torch raises 'Expected a cpu device type for "
-        "generator but found rbln'. Fix is on the vLLM-side or requires a "
-        "vllm-rbln override of the dummy-weight loader."
-    ),
-    strict=False,
-)
 @patch.dict(os.environ, {"RANK": "0"})
 def test_worker_apply_lora(qwen3_lora_files):
     def set_active_loras(worker: Worker, lora_requests: list[LoRARequest]):
