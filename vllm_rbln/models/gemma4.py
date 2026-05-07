@@ -35,8 +35,10 @@ from vllm.model_executor.layers.activation import GeluAndMul
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -439,6 +441,9 @@ class Gemma4DecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.hidden_size_per_layer_input = getattr(
+            config, "hidden_size_per_layer_input", 0
+        )
 
         layer_idx = extract_layer_index(prefix)
         layer_type = config.layer_types[layer_idx]
@@ -496,6 +501,35 @@ class Gemma4DecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.mlp",
         )
+        self.has_per_layer_input = (
+            self.hidden_size_per_layer_input is not None
+            and self.hidden_size_per_layer_input > 0
+        )
+        if self.has_per_layer_input:
+            self.per_layer_input_gate = ReplicatedLinear(
+                self.hidden_size,
+                self.hidden_size_per_layer_input,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.per_layer_input_gate",
+                return_bias=False,
+            )
+            self.per_layer_projection = ReplicatedLinear(
+                self.hidden_size_per_layer_input,
+                self.hidden_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.per_layer_projection",
+                return_bias=False,
+            )
+            self.post_per_layer_input_norm = RMSNorm(
+                config.hidden_size,
+                eps=config.rms_norm_eps,
+            )
+        else:
+            self.per_layer_input_gate = None
+            self.per_layer_projection = None
+            self.post_per_layer_input_norm = None
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -514,6 +548,7 @@ class Gemma4DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
+        per_layer_input: torch.Tensor | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         residual = hidden_states
@@ -530,7 +565,21 @@ class Gemma4DecoderLayer(nn.Module):
         hidden_states = self.pre_feedforward_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = self.post_feedforward_layernorm(hidden_states)
-        hidden_states = (hidden_states + residual) * self.layer_scalar
+        hidden_states = hidden_states + residual
+
+        if per_layer_input is not None and self.per_layer_input_gate is not None:
+            gate = self.per_layer_input_gate(hidden_states)
+            gate = torch.nn.functional.gelu(gate, approximate="tanh")
+            per_layer_hidden_states = gate * per_layer_input
+            per_layer_hidden_states = self.per_layer_projection(
+                per_layer_hidden_states
+            )
+            per_layer_hidden_states = self.post_per_layer_input_norm(
+                per_layer_hidden_states
+            )
+            hidden_states = hidden_states + per_layer_hidden_states
+
+        hidden_states = hidden_states * self.layer_scalar
         return hidden_states, None
 
 
@@ -543,6 +592,12 @@ class Gemma4Model(nn.Module):
         quant_config = vllm_config.quant_config
         self.config = config
         self.quant_config = quant_config
+        self.hidden_size_per_layer_input = getattr(
+            config, "hidden_size_per_layer_input", 0
+        )
+        self.vocab_size_per_layer_input = getattr(
+            config, "vocab_size_per_layer_input", config.vocab_size
+        )
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
@@ -550,6 +605,54 @@ class Gemma4Model(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.embed_tokens",
         )
+        self.has_per_layer_embeddings = (
+            self.hidden_size_per_layer_input is not None
+            and self.hidden_size_per_layer_input > 0
+        )
+        if self.has_per_layer_embeddings:
+            total_ple_dim = self.hidden_size_per_layer_input * config.num_hidden_layers
+            self.embed_tokens_per_layer = VocabParallelEmbedding(
+                self.vocab_size_per_layer_input,
+                total_ple_dim,
+                quant_config=quant_config,
+                prefix=f"{prefix}.embed_tokens_per_layer",
+            )
+            self.register_buffer(
+                "embed_scale_per_layer",
+                torch.tensor(self.hidden_size_per_layer_input**0.5),
+                persistent=False,
+            )
+            self.per_layer_model_projection = ColumnParallelLinear(
+                config.hidden_size,
+                total_ple_dim,
+                bias=False,
+                gather_output=True,
+                return_bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.per_layer_model_projection",
+            )
+            self.per_layer_projection_norm = RMSNorm(
+                self.hidden_size_per_layer_input,
+                eps=config.rms_norm_eps,
+            )
+            self.register_buffer(
+                "per_layer_input_scale",
+                torch.rsqrt(torch.tensor(2.0)),
+                persistent=False,
+            )
+            self.register_buffer(
+                "per_layer_projection_scale",
+                torch.tensor(config.hidden_size**-0.5),
+                persistent=False,
+            )
+        else:
+            self.embed_tokens_per_layer = None
+            self.embed_scale_per_layer = None
+            self.per_layer_model_projection = None
+            self.per_layer_projection_norm = None
+            self.per_layer_input_scale = None
+            self.per_layer_projection_scale = None
+
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: Gemma4DecoderLayer(
@@ -566,12 +669,86 @@ class Gemma4Model(nn.Module):
             torch.tensor(config.hidden_size**0.5),
             persistent=False,
         )
-        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
-            ["hidden_states", "residual"], config.hidden_size
-        )
+        if self.has_per_layer_embeddings:
+
+            def make_empty_intermediate_tensors(
+                batch_size: int,
+                dtype: torch.dtype,
+                device: torch.device,
+            ) -> IntermediateTensors:
+                return IntermediateTensors(
+                    {
+                        "hidden_states": torch.zeros(
+                            (batch_size, config.hidden_size),
+                            dtype=dtype,
+                            device=device,
+                        ),
+                        "residual": torch.zeros(
+                            (batch_size, config.hidden_size),
+                            dtype=dtype,
+                            device=device,
+                        ),
+                        "per_layer_inputs": torch.zeros(
+                            (
+                                batch_size,
+                                config.num_hidden_layers,
+                                self.hidden_size_per_layer_input,
+                            ),
+                            dtype=dtype,
+                            device=device,
+                        ),
+                    }
+                )
+
+            self.make_empty_intermediate_tensors = make_empty_intermediate_tensors
+        else:
+            self.make_empty_intermediate_tensors = (
+                make_empty_intermediate_tensors_factory(
+                    ["hidden_states", "residual"], config.hidden_size
+                )
+            )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids) * self.normalizer
+
+    def get_per_layer_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+        if self.embed_tokens_per_layer is None:
+            raise ValueError("Gemma4 config does not define per-layer embeddings.")
+        per_layer_inputs_mask = torch.logical_and(
+            input_ids >= 0,
+            input_ids < self.vocab_size_per_layer_input,
+        )
+        per_layer_inputs_tokens = torch.where(
+            per_layer_inputs_mask, input_ids, torch.zeros_like(input_ids)
+        )
+        per_layer_inputs = (
+            self.embed_tokens_per_layer(per_layer_inputs_tokens)
+            * self.embed_scale_per_layer
+        )
+        return per_layer_inputs.reshape(
+            *input_ids.shape,
+            self.config.num_hidden_layers,
+            self.hidden_size_per_layer_input,
+        )
+
+    def get_per_layer_inputs(
+        self,
+        hidden_states: torch.Tensor,
+        per_layer_inputs: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        if self.per_layer_model_projection is None:
+            return None
+        per_layer_projection = self.per_layer_model_projection(hidden_states)
+        per_layer_projection = per_layer_projection * self.per_layer_projection_scale
+        per_layer_projection = per_layer_projection.reshape(
+            *hidden_states.shape[:-1],
+            self.config.num_hidden_layers,
+            self.hidden_size_per_layer_input,
+        )
+        per_layer_projection = self.per_layer_projection_norm(per_layer_projection)
+        if per_layer_inputs is None:
+            return per_layer_projection
+        return (per_layer_projection + per_layer_inputs) * self.per_layer_input_scale
 
     def forward(
         self,
@@ -579,31 +756,57 @@ class Gemma4Model(nn.Module):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
+        per_layer_inputs: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor | IntermediateTensors:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
+                assert input_ids is not None
                 hidden_states = self.embed_input_ids(input_ids)
+                if self.has_per_layer_embeddings:
+                    per_layer_inputs = self.get_per_layer_input_embeddings(input_ids)
+            per_layer_inputs = self.get_per_layer_inputs(
+                hidden_states,
+                per_layer_inputs,
+            )
             residual = None
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
+            per_layer_inputs = intermediate_tensors.tensors.get("per_layer_inputs")
+            if per_layer_inputs is not None and per_layer_inputs.ndim == (
+                hidden_states.ndim
+            ):
+                per_layer_inputs = per_layer_inputs.reshape(
+                    *hidden_states.shape[:-1],
+                    self.config.num_hidden_layers,
+                    self.hidden_size_per_layer_input,
+                )
 
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
+        for layer_idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer)
+        ):
+            layer_per_input = None
+            if per_layer_inputs is not None:
+                layer_per_input = per_layer_inputs[
+                    ..., self.start_layer + layer_idx, :
+                ]
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
                 residual,
+                per_layer_input=layer_per_input,
                 **kwargs,
             )
 
         if not get_pp_group().is_last_rank:
-            return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
+            tensors = {"hidden_states": hidden_states, "residual": residual}
+            if per_layer_inputs is not None:
+                tensors["per_layer_inputs"] = per_layer_inputs
+            return IntermediateTensors(tensors)
 
         if residual is None:
             return self.norm(hidden_states)
@@ -709,19 +912,24 @@ class Gemma4ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
+    def get_per_layer_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.get_per_layer_input_embeddings(input_ids)
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        per_layer_inputs: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor | IntermediateTensors:
         return self.model(
-            input_ids,
-            positions,
-            intermediate_tensors,
-            inputs_embeds,
+            input_ids=input_ids,
+            positions=positions,
+            intermediate_tensors=intermediate_tensors,
+            inputs_embeds=inputs_embeds,
+            per_layer_inputs=per_layer_inputs,
             **kwargs,
         )
 
