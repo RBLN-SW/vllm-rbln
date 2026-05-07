@@ -1061,3 +1061,99 @@ class TestPlatformPinMemoryAndAsync:
 
         assert vllm_config.scheduler_config.async_scheduling is True
         assert vllm_config.speculative_config is not None
+
+
+def _load_rbln_streams():
+    """Load torch_rbln/device/streams.py directly so async tests work
+    without the full torch_rbln native stack (which isn't installed in
+    this test env). The streams module is pure Python with no native
+    deps so importlib loading is safe."""
+    import importlib.util
+    import pathlib
+
+    streams_path = pathlib.Path(
+        "/home/jinhwan.suk/workspace/torch-rbln/torch_rbln/device/streams.py"
+    )
+    if not streams_path.exists():
+        pytest.skip(f"streams.py not found at {streams_path}")
+    spec = importlib.util.spec_from_file_location(
+        "_test_rbln_streams", streams_path
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class TestCopyValidSampledTokenCount:
+    """End-to-end exercise of _copy_valid_sampled_token_count and
+    _get_valid_sampled_token_count with real torch.rbln.Stream/Event.
+    Loads the streams module by file path so the test is independent
+    of whether torch_rbln is pip-installed in the test env.
+    """
+
+    @staticmethod
+    def _build_runner(num_reqs, rbln_streams):
+        cpu_buffer = torch.zeros(8, dtype=torch.int64)
+        input_batch = MagicMock()
+        input_batch.prev_sampled_token_ids = None
+        runner = SimpleNamespace(
+            valid_sampled_token_count_event=rbln_streams.Event(),
+            valid_sampled_token_count_copy_stream=rbln_streams.Stream(),
+            valid_sampled_token_count_cpu=cpu_buffer,
+            input_batch=input_batch,
+        )
+        return runner
+
+    def test_round_trip_copy_record_synchronize(self):
+        """The copy submitted onto the side stream is observable after
+        Event.synchronize, which is what _get_valid_sampled_token_count
+        relies on."""
+        rbln_streams = _load_rbln_streams()
+        runner = self._build_runner(num_reqs=3, rbln_streams=rbln_streams)
+        next_token_ids = torch.tensor([5, 7, 9])
+        counts = torch.tensor([2, 1, 3], dtype=torch.int64)
+
+        with patch.object(torch, "rbln", rbln_streams, create=True):
+            bound = types.MethodType(
+                RBLNModelRunner._copy_valid_sampled_token_count, runner
+            )
+            bound(next_token_ids, counts)
+
+        # prev_sampled_token_ids was set inline (synchronous part).
+        assert runner.input_batch.prev_sampled_token_ids is not None
+        # After Event.synchronize the buffer reflects the submitted copy.
+        runner.valid_sampled_token_count_event.synchronize()
+        assert runner.valid_sampled_token_count_cpu[:3].tolist() == [2, 1, 3]
+
+    def test_get_valid_sampled_token_count_blocks_on_event(self):
+        """_get_valid_sampled_token_count synchronizes the event and
+        then reads the slice keyed by prev_sampled_token_ids.shape[0]."""
+        rbln_streams = _load_rbln_streams()
+        runner = self._build_runner(num_reqs=3, rbln_streams=rbln_streams)
+        next_token_ids = torch.tensor([1, 2, 3])
+        counts = torch.tensor([4, 5, 6], dtype=torch.int64)
+
+        with patch.object(torch, "rbln", rbln_streams, create=True):
+            copy_bound = types.MethodType(
+                RBLNModelRunner._copy_valid_sampled_token_count, runner
+            )
+            copy_bound(next_token_ids, counts)
+
+            get_bound = types.MethodType(
+                RBLNModelRunner._get_valid_sampled_token_count, runner
+            )
+            result = get_bound()
+
+        assert result == [4, 5, 6]
+
+    def test_get_valid_sampled_token_count_returns_empty_when_uninitialized(self):
+        """Without spec+async (event is None), the getter returns []."""
+        runner = SimpleNamespace(
+            valid_sampled_token_count_event=None,
+            valid_sampled_token_count_cpu=None,
+            input_batch=SimpleNamespace(prev_sampled_token_ids=None),
+        )
+        bound = types.MethodType(
+            RBLNModelRunner._get_valid_sampled_token_count, runner
+        )
+        assert bound() == []

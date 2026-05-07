@@ -2871,17 +2871,21 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         if self.valid_sampled_token_count_event is None:
             return
 
-        default_stream = torch.rbln.current_stream()
-        # On CUDA this overlaps the count copy with the draft-model
-        # prepare_input via a side stream + event. On RBLN the stream/
-        # event API is no-op (PrivateUse1 dispatch is synchronous), so
-        # the body executes inline — the same shape works either way.
-        with torch.rbln.stream(self.valid_sampled_token_count_copy_stream):
-            self.valid_sampled_token_count_copy_stream.wait_stream(default_stream)  # type: ignore
-            counts = valid_sampled_tokens_count
-            counts_cpu = self.valid_sampled_token_count_cpu
-            counts_cpu[: counts.shape[0]].copy_(counts, non_blocking=True)
-            self.valid_sampled_token_count_event.record()
+        # Overlap the count copy with subsequent CPU work (draft-model
+        # prepare_input under spec+async). The copy runs on the side
+        # stream's worker thread; the event captures the snapshot so
+        # _get_valid_sampled_token_count blocks just on this copy and
+        # not on anything submitted later.
+        copy_stream = self.valid_sampled_token_count_copy_stream
+        copy_stream.wait_stream(torch.rbln.current_stream())  # type: ignore
+        counts = valid_sampled_tokens_count
+        counts_cpu = self.valid_sampled_token_count_cpu
+
+        def _copy() -> None:
+            counts_cpu[: counts.shape[0]].copy_(counts)
+
+        copy_stream.submit(_copy)  # type: ignore
+        self.valid_sampled_token_count_event.record(copy_stream)
 
         self.input_batch.prev_sampled_token_ids = next_token_ids.unsqueeze(1)
 
