@@ -63,7 +63,6 @@ from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.worker.rbln_model_runner import RBLNModelRunner
 from vllm_rbln.v1.worker.utils import (
     estimate_available_memory,
-    estimate_model_kernel_size,
     get_rbln_planned_affinity_cpu_count,
     set_cpu_affinity,
     set_omp_num_threads,
@@ -208,147 +207,51 @@ class RBLNWorker(WorkerBase):
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
-        params_dict = dict(self.model_runner.model.named_parameters())
-        device_name = current_platform.get_device_name().lower()
-        assert "rbln" in device_name
+        """Profile-run-style KV-cache budget, mirroring the GPU worker.
 
-        specialized_moe_decode = int(self.model_runner.specialized_moe_decode)
-        decode_batch_buckets_count = (
-            self.model_runner.bucketing_manager.decode_batch_buckets_count
+        GPU equivalent (`gpu_worker.py:determine_available_memory`) runs
+        `model_runner.profile_run()` to allocate peak activations, snapshots
+        torch's free memory, and subtracts weights + activations from the
+        device total. RBLN has no runtime equivalent of
+        `torch.cuda.mem_get_info()`, so the only genuine HW primitive we
+        can keep is the static device-arch DRAM table inside
+        `estimate_available_memory` (ATOM 16 GiB, REBEL 144 GiB minus
+        system reserve). The activation reserve is folded into a fixed
+        per-runtime buffer (256 MiB × num_runtimes) inside that helper.
+        Profile-run itself runs later as part of `compile_or_warm_up_model`
+        — duplicating it here would double the warm-up cost.
+        What we drop relative to the previous implementation:
+          - bucket-aware `num_runtimes = 1 + (1+moe) * decode_buckets`
+            (collapses to a single prefill + single decode runtime);
+          - quantization-aware `n_model_bytes` walk (mxfp4 ATOM/REBEL
+            branches, packed-element ratios) — packing accounting moves
+            into the model loader, so `parameters()` already reports the
+            on-device byte count.
+        """
+        assert "rbln" in current_platform.get_device_name().lower()
+
+        # Weights snapshot: simple parameter byte count, no quantization
+        # branches (the loader is responsible for packing-aware sizing).
+        n_model_bytes = sum(
+            p.numel() * p.element_size()
+            for p in self.model_runner.model.parameters()
         )
-
-        num_runtimes = 1 + (1 + specialized_moe_decode) * decode_batch_buckets_count
-
-        ratio: float = 1.0
-        if self.model_config.quantization is not None:
-            logger.info(
-                "model quantization scheme = %s", self.model_config.quantization
-            )
-            # FIXME(RBLN) - for now, mxfp4/fp8 quantization is only supported
-            quantization = self.model_config.quantization
-            assert quantization in ("mxfp4", "fp8", "compressed-tensors")
-
-            if quantization == "compressed-tensors":
-                qcfg = (
-                    getattr(self.model_config.hf_config, "quantization_config", {})
-                    or {}
-                )
-                groups = qcfg.get("config_groups", {})
-                num_bits_set: set[int] = set()
-                for group_cfg in groups.values():
-                    nb = group_cfg.get("weights", {}).get("num_bits")
-                    if nb is not None:
-                        num_bits_set.add(nb)
-                if not num_bits_set:
-                    logger.warning(
-                        "compressed-tensors quantization_config has no num_bits; "
-                        "assuming fp8."
-                    )
-                elif num_bits_set != {8}:
-                    raise ValueError(
-                        f"compressed-tensors config has unsupported bit-widths "
-                        f"{num_bits_set}; only 8-bit (fp8) is supported."
-                    )
-                quantization = "fp8"
-
-            if quantization == "fp8":
-                nbits_per_param = 8
-                packed_num_elems = 1
-            elif quantization == "mxfp4":
-                if "ca" in device_name:
-                    # ATOM DOES NOT support mxfp4 quantization, handled by bf16
-                    nbits_per_param = 16
-                    # mlp weight scale is merged into params
-                    # FIXME(RBLN) - expert scale merged into expert weight param
-                    # ratio scale vs weight = 1 : 16
-                    ratio = 16 / 17
-                elif "cr" in device_name:
-                    # REBEL can support mxfp4 quantization
-                    nbits_per_param = 4
-                else:
-                    raise ValueError(
-                        "invalid RBLN architecture, candidates = [ATOM(ca), REBEL(cr)]"
-                    )
-                # pack 2 mxfp4 elems into single uint8 elem
-                packed_num_elems = 8 // 4
-            else:
-                raise ValueError(
-                    "invalid quantization scheme, candidates = [fp8, mxfp4]"
-                )
-
-        else:
-            nbits_per_param = 16
-            packed_num_elems = 1
-
-        n_model_bytes = 0
-        for value in params_dict.values():
-            if value.is_floating_point():
-                n_model_bytes += value.numel() * value.element_size()
-            else:
-                n_model_bytes += int(
-                    value.numel() * packed_num_elems * ratio * nbits_per_param // 8
-                )
-
         logger.info("n_model_bytes = %.2f GB", n_model_bytes / 1024**3)
 
-        estimate_kwargs = dict(
+        # GPU-style: one prefill + one decode runtime, regardless of buckets.
+        num_runtimes = 2
+
+        available_memory_estimate = estimate_available_memory(
             model_config=self.model_config,
             parallel_config=self.parallel_config,
+            n_model_bytes=n_model_bytes,
             num_runtimes=num_runtimes,
             gpu_memory_utilization=self.cache_config.gpu_memory_utilization,
         )
 
-        speculative_config = getattr(self, "speculative_config", None)
-        drafter = getattr(self.model_runner, "drafter", None)
-        draft_model = getattr(drafter, "model", None)
-        draft_model_config = getattr(speculative_config, "draft_model_config", None)
-        draft_parallel_config = getattr(
-            speculative_config,
-            "draft_parallel_config",
-            None,
-        )
-
-        if draft_model is not None and draft_model_config is not None:
-            if draft_parallel_config is None:
-                draft_parallel_config = self.parallel_config
-
-            draft_quantization = getattr(draft_model_config, "quantization", None)
-            if draft_quantization is not None:
-                raise ValueError(
-                    f"draft model quantization is not supported: {draft_quantization}"
-                )
-
-            model_kernel_size = estimate_model_kernel_size(
-                model_config=self.model_config,
-                parallel_config=self.parallel_config,
-                n_model_bytes=n_model_bytes,
-            )
-
-            num_draft_runtimes = 1 + decode_batch_buckets_count
-            draft_n_model_bytes = 0
-
-            for value in draft_model.parameters():
-                draft_n_model_bytes += value.numel() * value.element_size()
-
-            draft_kernel_size = estimate_model_kernel_size(
-                model_config=draft_model_config,
-                parallel_config=draft_parallel_config,
-                n_model_bytes=draft_n_model_bytes,
-            )
-            estimate_kwargs["num_runtimes"] = num_runtimes + num_draft_runtimes
-            estimate_kwargs["kernel_size"] = model_kernel_size + draft_kernel_size
-            logger.info("draft_n_model_bytes = %.2f GB", draft_n_model_bytes / 1024**3)
-            logger.info(
-                "draft_model_kernel_size = %.2f GB",
-                draft_kernel_size / 1024**3,
-            )
-        else:
-            estimate_kwargs["n_model_bytes"] = n_model_bytes
-
-        available_memory_estimate = estimate_available_memory(**estimate_kwargs)
-
         logger.info(
-            "available_memory_estimate = %.2f GiB", available_memory_estimate / 1024**3
+            "available_memory_estimate = %.2f GiB",
+            available_memory_estimate / 1024**3,
         )
 
         return available_memory_estimate
