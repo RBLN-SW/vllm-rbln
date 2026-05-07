@@ -45,11 +45,12 @@ NUM_LORAS = 16
 
 @pytest.mark.xfail(
     reason=(
-        "Loads a real model on the rbln device, which hits the dummy-weight "
-        "init path and calls `torch.Generator(device='rbln')` for the "
-        "uniform_-style randomization. torch_rbln does not yet expose "
-        "`_is_in_bad_fork` / `manual_seed_all` for the rbln device — fix "
-        "lives in `torch_rbln/aten/src/ATen/native/rbln/RBLNGenerator*`."
+        "vLLM core's `initialize_dummy_weights` builds the Generator on the "
+        "model_config device ('rbln') and then calls `param.uniform_(low, "
+        "high, generator=generator)` where `param` is a CPU staging tensor "
+        "during dummy-init — torch raises 'Expected a cpu device type for "
+        "generator but found rbln'. Fix is on the vLLM-side or requires a "
+        "vllm-rbln override of the dummy-weight loader."
     ),
     strict=False,
 )

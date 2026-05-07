@@ -83,7 +83,14 @@ class RBLNMedusaProposer(MedusaProposer):
         self,
         target_hidden_states: torch.Tensor,
         sampling_metadata: SamplingMetadata,
+        slot_mappings: dict[str, torch.Tensor]
+        | list[dict[str, torch.Tensor]]
+        | None = None,
     ) -> torch.Tensor:
+        # `slot_mappings` matches upstream `MedusaProposer.propose` signature
+        # added in vLLM commits since our pin; unused here but accepted to
+        # keep the polymorphic call path intact when callers pass it.
+        del slot_mappings
         # Generate blocks and compute logits
         logits = self.model_executable(target_hidden_states)
 
