@@ -98,17 +98,18 @@ class RBLNOptimumWhisperForConditionalGeneration(
         cache_position = torch.zeros(request_nums, 1, dtype=torch.int32)
 
         kwargs = self.preprocess_for_decoder(
-            is_prompt=is_prompt,
+            is_prompt=False,
             block_tables=block_tables,
             input_ids=input_ids,
             cache_position=cache_position,
             input_block_ids=valid_block_ids,
         )
-        input_ids = kwargs.pop("input_ids")
-        cache_position = kwargs.pop("cache_position")
+        decoder_input_ids = kwargs.pop("input_ids")
+        decoder_cache_position = kwargs.pop("cache_position")
         decoder_block_tables = kwargs.pop("block_tables")
         # FIXME Is it ok generate torch.zero tensor for each forward?
         # OR just generate pooled tensor in the model instance?
+        # FIXME bucketing?
         decoder_attention_mask = torch.zeros(
             self.batch_size, self.dec_max_seq_len, dtype=self.dtype
         )
@@ -119,28 +120,30 @@ class RBLNOptimumWhisperForConditionalGeneration(
                 block_tables=block_tables.squeeze(0).to(torch.int16),
             )
             for batch_idx in valid_block_ids:
-                cache_position[batch_idx] = 0
+                decoder_cache_position[batch_idx] = 0
                 decoder_attention_mask[batch_idx, 0] = 1
                 self.dec_lengths[batch_idx] = 1
 
             decoder_output = self.model.decoder(
-                decoder_input_ids=input_ids.contiguous(),
+                decoder_input_ids=decoder_input_ids.contiguous(),
                 decoder_attention_mask=decoder_attention_mask,
-                cache_position=cache_position,
+                cache_position=decoder_cache_position,
                 block_tables=decoder_block_tables,
             )
 
         else:
             # Generate cache_position using dec_lengths
             for batch_idx in valid_block_ids:
-                cache_position[batch_idx] = self.dec_lengths[batch_idx]
-                decoder_attention_mask[batch_idx, : cache_position[batch_idx] + 1] = 1
+                decoder_cache_position[batch_idx] = self.dec_lengths[batch_idx]
+                decoder_attention_mask[
+                    batch_idx, : decoder_cache_position[batch_idx] + 1
+                ] = 1
                 self.dec_lengths[batch_idx] += 1
 
             decoder_output = self.model.decoder(
-                decoder_input_ids=input_ids.contiguous(),
+                decoder_input_ids=decoder_input_ids.contiguous(),
                 decoder_attention_mask=decoder_attention_mask,
-                cache_position=cache_position,
+                cache_position=decoder_cache_position,
                 block_tables=decoder_block_tables,
             )
 
