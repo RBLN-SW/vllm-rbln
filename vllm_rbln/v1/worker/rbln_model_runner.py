@@ -1337,7 +1337,9 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 if use_spec_decode and isinstance(builder, GDNAttentionMetadataBuilder):
                     extra_attn_metadata_args = dict(
                         num_accepted_tokens=self.num_accepted_tokens.gpu[:num_reqs],
-                        num_draft_tokens=self.num_draft_tokens.gpu[:num_reqs],
+                        num_decode_draft_tokens_cpu=self.num_decode_draft_tokens.cpu[
+                            :num_reqs
+                        ],
                     )
 
                 if isinstance(builder, RBLNFlashAttentionMetadataBuilder):
