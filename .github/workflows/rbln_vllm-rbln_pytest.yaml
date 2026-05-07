@@ -188,7 +188,7 @@ jobs:
               pytest tests/v1/worker/test_rebel_optimum_model_runner.py -vv --durations 0
               ;;
             "optimum_compile")
-              pytest tests/v1/optimum_compile -vv --durations 0
+              pytest tests/optimum_compile -vv --durations 0
               ;;
           esac
 
