@@ -112,7 +112,18 @@ class RBLNScheduler(Scheduler):
         # - Limit prefill batch size to 1
         # - Limit decode batch size to (max_num_seqs // pipeline_parallel_size)
         # - Do not schedule spec tokens when they are across block boundaries
-        # Search for NOTE(RBLN) for details
+        # Search for NOTE(RBLN) for details.
+        #
+        # NOTE(pin-bump): re-apply the four RBLN tweaks above when bumping
+        # the vllm pin. Upstream has accumulated 14 commits on this method
+        # since v0.18.0; do a 3-way diff (upstream-prev, upstream-new, this
+        # copy) and re-apply ours on top of the new base. Material upstream
+        # changes since v0.18.0 (selected):
+        #   - `dd5506a15` scheduler-reserve-full-isl simplification
+        #   - `7b1bc0a3e` SWA / chunked-local admission cap
+        #   - `4d51588e2` DeepSeek V4 path
+        #   - `de35c06c6` KV connector metadata override
+        #   - `1bf2ddd0e` `WAITING_FOR_FSM` → `WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR`
 
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.

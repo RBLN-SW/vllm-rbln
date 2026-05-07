@@ -98,6 +98,23 @@ class RBLNWorker(WorkerBase):
             self.parallel_config.world_size // envs.VLLM_RBLN_NUM_RAY_NODES
         )
 
+        # Pipeline-parallel + async-scheduling needs `AsyncIntermediateTensors`
+        # semantics (wait_for_comm / __getattribute__ wrapping) that this
+        # worker doesn't yet implement; the model_runner constructs raw
+        # `IntermediateTensors` and the receive path would deadlock waiting
+        # for a comm barrier that never fires. Reject early instead of
+        # hanging the engine at runtime.
+        if (
+            self.parallel_config.pipeline_parallel_size > 1
+            and self.scheduler_config.async_scheduling
+        ):
+            raise NotImplementedError(
+                "RBLN does not support pipeline_parallel_size > 1 with "
+                "async_scheduling enabled (no AsyncIntermediateTensors "
+                "support). Set --async-scheduling=False or "
+                "--pipeline-parallel-size=1."
+            )
+
         self._init_device_env()
 
         # Buffers saved before sleep
@@ -454,6 +471,84 @@ class RBLNWorker(WorkerBase):
                 self.model_runner.sampler_performance_tracker.print_final_stats()
             if self.model_runner.e2e_performance_tracker:
                 self.model_runner.e2e_performance_tracker.print_final_stats()
+
+    # --- vLLM Worker RPC surface stubs --------------------------------------
+    # These methods are part of upstream `gpu_worker.Worker`'s public API
+    # and may be called via the engine's RPC fan-out (frontend → executor →
+    # workers). RBLN doesn't implement most of them today; we surface them
+    # as explicit `NotImplementedError` (rather than `AttributeError` from
+    # absence) so a consumer hitting an unsupported feature gets a clear
+    # message instead of a confusing missing-attribute crash.
+
+    def update_max_model_len(self, max_model_len: int) -> None:
+        # `max_model_len=-1` (auto-fit to device memory) is a vLLM CLI feature
+        # that asks the worker to pick a value at startup; RBLN's compiled
+        # artifacts pin max_model_len at build time, so dynamic update is a
+        # no-op (and would invalidate the compiled binary if it weren't).
+        raise NotImplementedError(
+            "RBLN compiled artifacts pin `max_model_len` at build time; "
+            "dynamic update via `update_max_model_len` is not supported. "
+            "Set `max_model_len` explicitly when launching."
+        )
+
+    def reload_weights(self, *args, **kwargs) -> None:
+        raise NotImplementedError(
+            "RBLN does not support hot weight reload; the compiled artifact "
+            "binds weights at compile time."
+        )
+
+    def update_config(self, overrides: dict) -> None:
+        raise NotImplementedError(
+            "RBLN does not support runtime config override "
+            "(`update_config` RPC); restart with the desired config."
+        )
+
+    def save_sharded_state(
+        self,
+        path: str,
+        pattern: str | None = None,
+        max_size: int | None = None,
+    ) -> None:
+        # ShardedStateLoader walks the host-side parameter tree and writes
+        # them to disk; works regardless of compute device.
+        from vllm.model_executor.model_loader import ShardedStateLoader
+
+        ShardedStateLoader.save_model(
+            self.model_runner.model,
+            path,
+            pattern=pattern,
+            max_size=max_size,
+        )
+
+    def save_tensorized_model(self, tensorizer_config: "TensorizerConfig") -> None:  # noqa: F821
+        # Forward to model_runner.save_tensorized_model (already implemented).
+        self.model_runner.save_tensorized_model(tensorizer_config=tensorizer_config)
+
+    def init_weight_transfer_engine(self, init_info: dict) -> None:
+        raise NotImplementedError(
+            "RBLN has no weight-transfer engine wired up; this RPC is for "
+            "trainer-side weight broadcasting (NCCL/Gloo PG with the trainer)."
+        )
+
+    def update_weights(self, update_info: dict) -> None:
+        raise NotImplementedError(
+            "RBLN has no weight-transfer engine wired up; "
+            "see `init_weight_transfer_engine`."
+        )
+
+    def elastic_ep_execute(self, execute_method: str, *args, **kwargs):
+        raise NotImplementedError(
+            "RBLN does not implement elastic expert-parallel reconfiguration."
+        )
+
+    def reset_mm_cache(self) -> None:
+        # The model_runner caches encoder outputs by mm_hash; clearing the
+        # dict is the entire reset operation.
+        self.model_runner.encoder_cache.clear()
+
+    def reset_encoder_cache(self) -> None:
+        # Alias for the multi-modal encoder cache; same backing store.
+        self.model_runner.encoder_cache.clear()
 
 
 def init_worker_distributed_environment(

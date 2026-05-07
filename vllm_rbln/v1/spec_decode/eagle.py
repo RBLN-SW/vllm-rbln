@@ -23,6 +23,12 @@ from vllm.forward_context import set_forward_context
 from vllm.v1.attention.backends.tree_attn import TreeAttentionMetadata
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.sample.metadata import SamplingMetadata
+# NOTE(pin-bump): upstream commit `cde8d2471` (post v0.18.0) factored
+# `SpecDecodeBaseProposer` out of `eagle.py`. When this fork bumps the
+# vllm pin past that commit, this import line will need adjustment
+# (likely to `from vllm.v1.spec_decode.base import ...` for the base
+# and `from vllm.v1.spec_decode.eagle import EagleProposer` only for
+# the eagle subclass).
 from vllm.v1.spec_decode.eagle import PADDING_SLOT_ID, EagleProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
