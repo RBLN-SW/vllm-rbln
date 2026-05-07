@@ -1292,6 +1292,7 @@ class RBLNFlashAttentionMetadataBuilder(
         try:
             from flashinfer_rbln import PagedKVMetadata, plan
             from flashinfer_rbln import RBLNAttentionMetadata as FIMetadata
+            from flashinfer_rbln._hardware import RBLN_DEFAULT_SPEC
         except ImportError:
             logger.warning_once(
                 "VLLM_RBLN_USE_FLASHINFER=1 but flashinfer_rbln is not installed. "
@@ -1302,6 +1303,19 @@ class RBLNFlashAttentionMetadataBuilder(
             return None
 
         block_size = self.block_size
+        # The flashinfer_rbln planner needs a block_n that both meets the
+        # RBLN array_n minimum and divides cache block_size; vLLM's default
+        # block_size=16 fails that constraint and yields a hard ValueError
+        # in plan().  Fail fast here with a vllm-aware actionable message.
+        if block_size % RBLN_DEFAULT_SPEC.array_n != 0:
+            raise ValueError(
+                f"VLLM_RBLN_USE_FLASHINFER=1 requires "
+                f"--block-size to be a multiple of array_n "
+                f"({RBLN_DEFAULT_SPEC.array_n}); got {block_size}. "
+                f"Pass `--block-size 32` (or 64, 128, ...) on the vllm "
+                f"command line, or unset VLLM_RBLN_USE_FLASHINFER."
+            )
+
         max_seq_len = self.model_config.max_model_len
         max_blocks_per_seq = max_seq_len // block_size
 
@@ -1838,11 +1852,16 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
           value: [b_size, num_kv_heads, 1, q_len, head_size]
           kv_cache: [2, num_blocks, num_kv_heads, 1, block_size, head_size]
 
-        flashinfer_rbln kernel tensor contracts:
-          Decode  q: [batch, num_q_heads, head_dim]
-          Prefill q: [batch, seq_len, num_q_heads, head_dim]
-          k/v cache: [num_blocks, num_kv_heads, 1, block_size, head_dim]
-                     (matches our kv_cache[0/1] slices directly)
+        flashinfer_rbln TileLang kernel tensor contracts (authoritative —
+        see tilelang_rbln/examples/flash_decode_paged{,_packed}.py and
+        flash_attn_varlen.py):
+          Decode  q/o:  [BATCH, Q_HEADS, 1, HEAD_DIM]
+          Prefill q/o:  [BATCH * MAX_Q_PER_REQ, Q_HEADS, HEAD_DIM]
+          k/v cache:    [NUM_PAGES, PAGE_SIZE, KV_HEADS, HEAD_DIM]
+
+        vllm-rbln stores kv_cache as
+        [2, num_blocks, num_kv_heads, 1, block_size, head_dim], so each
+        slice needs squeeze(2) + permute(0, 2, 1, 3) before dispatch.
 
         Returns:
           [b_size, q_len, num_heads * head_size]
@@ -1851,30 +1870,35 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
 
         fi_metadata = attn_metadata._flashinfer_metadata
 
-        # kv_cache[0] = k_cache, kv_cache[1] = v_cache.
-        # Shape: [num_blocks, num_kv_heads, 1, block_size, head_size]
-        k_cache = kv_cache[0]
-        v_cache = kv_cache[1]
+        # kv_cache[i]: [num_blocks, num_kv_heads, 1, block_size, head_dim]
+        # → kernel:    [num_blocks, block_size, num_kv_heads, head_dim]
+        k_cache = kv_cache[0].squeeze(2).permute(0, 2, 1, 3).contiguous()
+        v_cache = kv_cache[1].squeeze(2).permute(0, 2, 1, 3).contiguous()
 
         if attn_metadata.is_prefill:
-            # Prefill: q shape expected by kernel = [batch, seq_len, num_q_heads, D].
-            # query entering here: [b, H_kv, G, L, D]
-            # Rearrange to [b, L, H_kv*G, D] = [b, seq_len, num_heads, D].
-            q_kernel = query.permute(0, 3, 1, 2, 4).reshape(  # [b, L, H_kv, G, D]
-                b_size, q_len, self.num_heads, self.head_size
+            # query entering here: [b, H_kv, G, L, D].  Rearrange to
+            # [b, L, H_kv*G, D] = [b, seq_len, num_heads, D], then pack
+            # batch+seq into a single leading dim for the varlen kernel.
+            q_packed = query.permute(0, 3, 1, 2, 4).reshape(
+                b_size * q_len, self.num_heads, self.head_size
+            )
+            out_packed = torch.empty_like(q_packed)
+            flashinfer_run(fi_metadata, q_packed, k_cache, v_cache, out_packed)
+            # out_packed: [b*L, H, D] → [b, L, H*D]
+            attn_output = out_packed.reshape(
+                b_size, q_len, self.num_heads * self.head_size
+            )
+        else:
+            # query entering here: [b, H_kv, G, q_len, D] with q_len=1 for
+            # decode.  Reshape to [b, H, 1, D] for the kernel ABI.
+            q_kernel = query.reshape(
+                b_size, self.num_heads, 1, self.head_size
             )
             out = torch.empty_like(q_kernel)
             flashinfer_run(fi_metadata, q_kernel, k_cache, v_cache, out)
-            # out: [b, seq_len, num_heads, D] -> [b, seq_len, num_heads * D]
-            attn_output = out.reshape(b_size, q_len, self.num_heads * self.head_size)
-        else:
-            # Decode: q shape expected by kernel = [batch, num_q_heads, D].
-            # query entering here: [b, H_kv, G, q_len, D] with q_len=1 for decode.
-            # Collapse to [b, num_heads, D].
-            q_kernel = query.reshape(b_size, self.num_heads, self.head_size)
-            out = torch.empty_like(q_kernel)
-            flashinfer_run(fi_metadata, q_kernel, k_cache, v_cache, out)
-            # out: [b, num_heads, D] -> [b, 1, num_heads * D]  (q_len=1 for decode)
-            attn_output = out.reshape(b_size, q_len, self.num_heads * self.head_size)
+            # out: [b, H, 1, D] → [b, 1, H*D] (q_len=1 for decode).
+            attn_output = out.reshape(
+                b_size, q_len, self.num_heads * self.head_size
+            )
 
         return attn_output
