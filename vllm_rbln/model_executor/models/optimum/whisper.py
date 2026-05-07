@@ -98,28 +98,25 @@ class RBLNOptimumWhisperForConditionalGeneration(
         cache_position = torch.zeros(request_nums, 1, dtype=torch.int32)
 
         kwargs = self.preprocess_for_decoder(
-            is_prompt,
-            block_tables,
-            input_ids,
-            cache_position,
+            is_prompt=is_prompt,
+            block_tables=block_tables,
+            input_ids=input_ids,
+            cache_position=cache_position,
             input_block_ids=valid_block_ids,
         )
         input_ids = kwargs.pop("input_ids")
         cache_position = kwargs.pop("cache_position")
-        block_tables = kwargs.pop("block_tables")
-
+        decoder_block_tables = kwargs.pop("block_tables")
+        # FIXME Is it ok generate torch.zero tensor for each forward?
+        # OR just generate pooled tensor in the model instance?
+        decoder_attention_mask = torch.zeros(
+            self.batch_size, self.dec_max_seq_len, dtype=self.dtype
+        )
         if is_prompt:
+            print("block_tables", block_tables)
             _ = self.model.encoder(
-                input_features=input_features, block_tables=block_tables
-            )
-
-            decoder_input_ids = torch.full(
-                (request_nums, 1),
-                self.model.config.decoder_start_token_id,
-                dtype=torch.long,
-            )
-            decoder_attention_mask = torch.zeros(
-                self.batch_size, self.dec_max_seq_len, dtype=self.dtype
+                input_features=input_features,
+                block_tables=block_tables.squeeze(0).to(torch.int16),
             )
             for batch_idx in valid_block_ids:
                 cache_position[batch_idx] = 0
@@ -127,18 +124,13 @@ class RBLNOptimumWhisperForConditionalGeneration(
                 self.dec_lengths[batch_idx] = 1
 
             decoder_output = self.model.decoder(
-                decoder_input_ids=decoder_input_ids.contiguous(),
+                decoder_input_ids=input_ids.contiguous(),
                 decoder_attention_mask=decoder_attention_mask,
                 cache_position=cache_position,
-                block_tables=block_tables.unsqueeze(-1),
+                block_tables=decoder_block_tables,
             )
 
         else:
-            # FIXME Is it ok generate torch.zero tensor for each forward?
-            # OR just generate pooled tensor in the model instance?
-            decoder_attention_mask = torch.zeros(
-                self.batch_size, self.dec_max_seq_len, dtype=self.dtype
-            )
             # Generate cache_position using dec_lengths
             for batch_idx in valid_block_ids:
                 cache_position[batch_idx] = self.dec_lengths[batch_idx]
@@ -149,7 +141,7 @@ class RBLNOptimumWhisperForConditionalGeneration(
                 decoder_input_ids=input_ids.contiguous(),
                 decoder_attention_mask=decoder_attention_mask,
                 cache_position=cache_position,
-                block_tables=block_tables,
+                block_tables=decoder_block_tables,
             )
 
         lm_logits = decoder_output.logits
