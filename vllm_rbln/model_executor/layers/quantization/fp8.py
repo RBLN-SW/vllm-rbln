@@ -114,14 +114,12 @@ class RBLNW8A16BlockFp8LinearOp:
         _input_dtype = input.dtype
         out_features, in_features = weight.shape
         bs0, bs1 = int(block_size[0]), int(block_size[1])
-        out_blocks = out_features // bs0
-        in_blocks = in_features // bs1
 
-        weight = weight.view(out_blocks, bs0, in_blocks, bs1).to(_input_dtype)
-        weight_scale = weight_scale.view(out_blocks, in_blocks).to(_input_dtype)
-        scaled_weight = (weight * weight_scale[:, None, :, None]).reshape(
-            out_features, in_features
+        expanded = weight_scale.repeat_interleave(bs0, dim=0).repeat_interleave(
+            bs1, dim=1
         )
+        expanded = expanded[:out_features, :in_features].to(_input_dtype)
+        scaled_weight = weight.to(_input_dtype) * expanded
         output = torch.nn.functional.linear(input, scaled_weight, bias)
         return output
 
