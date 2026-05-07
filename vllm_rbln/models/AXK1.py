@@ -15,12 +15,7 @@
 import logging
 
 import torch
-import torch.nn.functional as F
-from torch import nn
 from vllm.distributed import tensor_model_parallel_all_reduce
-from vllm.model_executor.layers.linear import ColumnParallelLinear, RowParallelLinear
-from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.models import AXK1 as _axk1_mod
 from vllm.model_executor.models.AXK1 import AXK1Attention, AXK1MoE
 
 log = logging.getLogger("torch._dynamo")
@@ -93,52 +88,5 @@ def __AXK1_attention_forward(
     return output
 
 
-class AXK1MLP(nn.Module):
-    def __init__(
-        self,
-        hidden_size: int,
-        intermediate_size: int,
-        hidden_act: str,
-        quant_config: QuantizationConfig | None = None,
-        reduce_results: bool = True,
-        is_sequence_parallel: bool = False,
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-        self.gate_proj = ColumnParallelLinear(
-            hidden_size,
-            intermediate_size,
-            bias=False,
-            quant_config=quant_config,
-            disable_tp=is_sequence_parallel,
-            prefix=f"{prefix}.gate_proj",
-        )
-        self.up_proj = ColumnParallelLinear(
-            hidden_size,
-            intermediate_size,
-            bias=False,
-            quant_config=quant_config,
-            disable_tp=is_sequence_parallel,
-            prefix=f"{prefix}.up_proj",
-        )
-        self.down_proj = RowParallelLinear(
-            intermediate_size,
-            hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            reduce_results=reduce_results,
-            disable_tp=is_sequence_parallel,
-            prefix=f"{prefix}.down_proj",
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate, _ = self.gate_proj(x)
-        up, _ = self.up_proj(x)
-        x = F.silu(gate) * up
-        x, _ = self.down_proj(x)
-        return x
-
-
 AXK1MoE.forward = __AXK1_moe_forward_rsd
 AXK1Attention.forward = __AXK1_attention_forward
-_axk1_mod.AXK1MLP = AXK1MLP

@@ -776,6 +776,8 @@ def load_minimax_m2_weights(
 def load_AXK1_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
     stacked_params_mapping: list[tuple[str, str, str | int]] = [
         # (param_name, shard_name, shard_id)
+        ("gate_up_proj", "gate_proj", 0),
+        ("gate_up_proj", "up_proj", 1),
     ]
     mla_params_mapping: list[tuple[str, str, str | int]] = [
         ("fused_qkv_a_proj", "q_a_proj", 0),
@@ -814,34 +816,6 @@ def load_AXK1_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[
 
         spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
         if spec_layer is not None:
-            continue
-
-        if "shared_experts.gate_up_proj" in name:
-            gate_name = name.replace(
-                "shared_experts.gate_up_proj", "shared_experts.gate_proj"
-            )
-            up_name = name.replace(
-                "shared_experts.gate_up_proj", "shared_experts.up_proj"
-            )
-            if loaded_weight.ndim > 0 and loaded_weight.shape[0] > 1:
-                half = loaded_weight.shape[0] // 2
-                gate_weight, up_weight = loaded_weight[:half], loaded_weight[half:]
-            else:
-                gate_weight = up_weight = loaded_weight
-            for split_name, split_weight in (
-                (gate_name, gate_weight),
-                (up_name, up_weight),
-            ):
-                if is_pp_missing_parameter(split_name, self):
-                    continue
-                if split_name not in params_dict:
-                    continue
-                param = params_dict[split_name]
-                weight_loader_fn = getattr(
-                    param, "weight_loader", default_weight_loader
-                )
-                weight_loader_fn(param, split_weight)
-                loaded_params.add(split_name)
             continue
 
         for param_name, weight_name, shard_id in stacked_params_mapping:
