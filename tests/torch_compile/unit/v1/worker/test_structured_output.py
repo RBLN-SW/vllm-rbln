@@ -42,6 +42,10 @@ def _make_runner_stub():
     runner.num_spec_tokens = 0
     runner.e2e_performance_tracker = None
     runner._draft_token_ids = None
+    # Cycle 5d (M4) replaced the `is_prefills()` helper with a cached flag
+    # set by execute_model. Stubs need to provide it directly since
+    # sample_tokens reads it during the bookkeeping phase.
+    runner._last_execute_was_prefill = False
     return runner
 
 
@@ -96,7 +100,6 @@ class TestGrammarBitmaskApplication:
                     [],
                 ),
             ),
-            patch.object(runner, "is_prefills", return_value=[False]),
         ):
             runner.sample_tokens(grammar_output)
 
@@ -142,7 +145,6 @@ class TestGrammarBitmaskApplication:
                     [],
                 ),
             ),
-            patch.object(runner, "is_prefills", return_value=[False]),
         ):
             runner.sample_tokens(None)
 
@@ -189,7 +191,6 @@ class TestGrammarBitmaskApplication:
                     [],
                 ),
             ),
-            patch.object(runner, "is_prefills", return_value=[False]),
         ):
             runner.sample_tokens(grammar_output)
 
@@ -410,7 +411,6 @@ class TestLogitsDtypeConversion:
                     [],
                 ),
             ),
-            patch.object(runner, "is_prefills", return_value=[False]),
         ):
             runner.sample_tokens(grammar_output)
 
