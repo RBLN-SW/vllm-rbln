@@ -14,6 +14,7 @@
 """Benchmark offline inference throughput."""
 
 import argparse
+import dataclasses
 import json
 import os
 import random
@@ -36,12 +37,11 @@ from benchmark_dataset import (
 )
 from benchmark_utils import (
     convert_to_pytorch_benchmark_format,
-    get_llm_instance,
     write_to_json,
 )
 from transformers import AutoTokenizer
 from typing_extensions import deprecated
-from vllm import SamplingParams
+from vllm import LLM, SamplingParams
 from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
 from vllm.entrypoints.openai.api_server import (
     build_async_engine_client_from_engine_args,
@@ -60,7 +60,7 @@ def run_vllm(
     warmup_requests: int,
     disable_detokenize: bool = False,
 ) -> tuple[float, list[RequestOutput] | None]:
-    llm = get_llm_instance(engine_args)
+    llm = LLM(**dataclasses.asdict(engine_args))
     assert all(
         llm.llm_engine.model_config.max_model_len
         >= (request.prompt_len + request.expected_output_len)
@@ -176,7 +176,7 @@ def run_vllm_chat(
     multimodal models as it properly handles multimodal inputs and chat
     formatting. For non-multimodal models, use run_vllm() instead.
     """
-    llm = get_llm_instance(engine_args)
+    llm = LLM(**dataclasses.asdict(engine_args))
 
     assert all(
         llm.llm_engine.model_config.max_model_len

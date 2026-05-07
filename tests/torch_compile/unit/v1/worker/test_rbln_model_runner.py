@@ -1004,7 +1004,6 @@ class TestPlatformPinMemoryAndAsync:
         rbln backend isn't registered without torch_rbln autoload, so
         torch.device("rbln") needs a stub too."""
         envs_patch = stack.enter_context(patch("vllm_rbln.platform.envs"))
-        envs_patch.VLLM_RBLN_USE_VLLM_MODEL = True
         envs_patch.VLLM_RBLN_ENFORCE_MODEL_FP32 = False
         envs_patch.VLLM_USE_V2_MODEL_RUNNER = False
         envs_patch.VLLM_RBLN_PROFILER = False

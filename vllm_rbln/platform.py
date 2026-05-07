@@ -146,16 +146,7 @@ class RblnPlatform(Platform):
         parallel_config = vllm_config.parallel_config
         scheduler_config = vllm_config.scheduler_config
 
-        if not envs.VLLM_RBLN_USE_VLLM_MODEL:
-            raise RuntimeError(
-                "The optimum-rbln codepath has been removed from vllm-rbln. "
-                "Set VLLM_RBLN_USE_VLLM_MODEL=1 to use the native vLLM model "
-                "path."
-            )
-
         cls.validate_and_setup_prerequisite(vllm_config)
-        # Use RBLN device tensors for torch.compile/runtime on the
-        # native vLLM model path.
         RblnPlatform.device_name = "rbln"
         RblnPlatform.device_type = "rbln"
         RblnPlatform.dist_backend = "rbln-ccl"

@@ -22,7 +22,6 @@ if TYPE_CHECKING:
     VLLM_RBLN_COMPILE_STRICT_MODE: bool = False
     VLLM_RBLN_TP_SIZE: int = 1
     VLLM_RBLN_ENABLE_WARM_UP: bool = True
-    VLLM_RBLN_USE_VLLM_MODEL: bool = False
     VLLM_RBLN_SPECIALIZE_MOE_DECODE: bool = True
     VLLM_RBLN_FLASH_CAUSAL_ATTN: bool = True
     VLLM_RBLN_BATCH_ATTN_OPT: bool = False
@@ -135,12 +134,6 @@ environment_variables = {
     "VLLM_RBLN_ENABLE_WARM_UP": (
         lambda: (
             os.environ.get("VLLM_RBLN_ENABLE_WARM_UP", "True").lower() in ("true", "1")
-        )
-    ),
-    # If true, it uses the natively compiled vLLM model
-    "VLLM_RBLN_USE_VLLM_MODEL": (
-        lambda: (
-            os.environ.get("VLLM_RBLN_USE_VLLM_MODEL", "False").lower() in ("true", "1")
         )
     ),
     # Use flash attention for causal attention

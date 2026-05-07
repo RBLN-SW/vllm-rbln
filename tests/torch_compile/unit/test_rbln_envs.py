@@ -42,11 +42,6 @@ def test_rbln_envs():
         got {rbln_envs.VLLM_RBLN_ENABLE_WARM_UP}"
     )
 
-    assert rbln_envs.VLLM_RBLN_USE_VLLM_MODEL, (
-        f"Expected VLLM_RBLN_USE_VLLM_MODEL to be True, \
-        got {rbln_envs.VLLM_RBLN_USE_VLLM_MODEL}"
-    )
-
     assert rbln_envs.VLLM_RBLN_FLASH_CAUSAL_ATTN, (
         f"Expected VLLM_RBLN_FLASH_CAUSAL_ATTN to be True, \
         got {rbln_envs.VLLM_RBLN_FLASH_CAUSAL_ATTN}"

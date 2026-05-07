@@ -26,10 +26,6 @@ from vllm.plugins import load_general_plugins
 
 
 def pytest_configure(config):
-    # Must run before test collection so that monkey patches applied by
-    # `register_ops()` are in place before any test module does
-    # `from vllm.xxx import yyy` at import time and captures the original symbol.
-    os.environ["VLLM_RBLN_USE_VLLM_MODEL"] = "1"
     # Running torch.compile-based tests in this tree leaves hundreds of
     # background threads alive in the pytest process (we saw ~2400 before
     # the EngineCore spawn). POSIX fork() clones only the calling thread

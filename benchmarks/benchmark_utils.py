@@ -13,28 +13,12 @@
 # limitations under the License.
 
 import argparse
-import dataclasses
 import json
 import math
 import os
 import time
 from types import TracebackType
 from typing import Any, Union
-
-from vllm import LLM, EngineArgs
-
-from vllm_rbln.rbln_envs import VLLM_RBLN_USE_VLLM_MODEL
-
-
-def get_llm_instance(engine_args: EngineArgs) -> LLM:
-    if not VLLM_RBLN_USE_VLLM_MODEL:
-        compiled_model_path = engine_args.model
-        if not os.path.exists(compiled_model_path):
-            raise ValueError(
-                f"Compiled model path does not exist: {compiled_model_path}"
-            )
-
-    return LLM(**dataclasses.asdict(engine_args))
 
 
 def convert_to_pytorch_benchmark_format(
