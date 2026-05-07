@@ -286,7 +286,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         else:
             self.max_encoder_len = 0
 
-        if not envs.VLLM_RBLN_USE_DEVICE_TENSOR:
+        if not True:
             # Only provide use_global_ctx if CompileContext supports it
             import inspect
 
@@ -1271,7 +1271,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # TODO: Support prompt logprobs.
             logits_indices = (
                 query_start_loc_cpu
-                if envs.VLLM_RBLN_USE_DEVICE_TENSOR
+                if True
                 else query_start_loc
             )[1:] - 1
             num_draft_tokens = None
@@ -1358,7 +1358,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 # Encoder-only layers do not have KV cache, so we need to
                 # create a dummy block table and slot mapping for them.
                 device_kwarg = (
-                    {} if envs.VLLM_RBLN_USE_DEVICE_TENSOR else {"device": self.device}
+                    {} if True else {"device": self.device}
                 )
                 blk_table_tensor = torch.zeros(
                     (num_reqs, 1), dtype=torch.int32, **device_kwarg
@@ -1373,7 +1373,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 blk_table = self.input_batch.block_table[kv_cache_group_id]
                 blk_table_tensor = (
                     blk_table.get_cpu_tensor()[:num_reqs]
-                    if envs.VLLM_RBLN_USE_DEVICE_TENSOR
+                    if True
                     else blk_table.get_device_tensor(num_reqs)
                 )
                 slot_mapping = blk_table.slot_mapping.gpu[:total_num_scheduled_tokens]
@@ -1478,7 +1478,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             "mode": "strict",
             "_runtime_holder": self.runtime_holder,
         }
-        if not envs.VLLM_RBLN_USE_DEVICE_TENSOR:
+        if not True:
             options["compile_context"] = self.compile_context
         if not envs.VLLM_DISABLE_COMPILE_CACHE:
             logger.info(
@@ -1783,7 +1783,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # _prepare_inputs may reorder the batch, so we must gather multi
         # modal outputs after that to ensure the correct order
-        use_dt = envs.VLLM_RBLN_USE_DEVICE_TENSOR
+        use_dt = True
         if (
             self.supports_mm_inputs
             and get_pp_group().is_first_rank
@@ -1914,7 +1914,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
         if (
-            envs.VLLM_RBLN_USE_DEVICE_TENSOR
+            True
             and logits is not None
             and logits.shape[0] > self.input_batch.num_reqs
         ):
@@ -1964,14 +1964,34 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
     @torch.inference_mode()
     def warm_up_model(self) -> None:
+        """Profile-style warm-up: one prefill + one decode dummy pass.
+
+        Replaces the per-bucket triple-loop that compiled a separate AOT
+        binary for every (prefill | decode_bucket × spec_query_len ×
+        sampler_decode_batch) combination. With our own toolchain
+        accepting dynamic shapes (or recompiling cheaply on demand) the
+        bucket sweep is unnecessary — a single dummy forward exercises
+        the codepath and the JIT picks up real shapes at request time.
+        Mirrors the GPU runner's profile_run pattern.
+        """
         num_kv_cache_groups = len(self.kv_cache_config.kv_cache_groups)
 
-        logger.info("Warm up prefill graph")
         prefill_seq_len = (
             self.scheduler_config.max_num_batched_tokens
             if self.scheduler_config.enable_chunked_prefill
             else self.model_config.max_model_len
         )
+        sampling_params = (
+            None if self.is_pooling_model else SamplingParams(temperature=0.0)
+        )
+        pooling_params = (
+            PoolingParams(task=self.get_supported_pooling_tasks()[0])
+            if self.is_pooling_model
+            else None
+        )
+
+        # Single prefill dummy.
+        logger.info("Warm up prefill graph")
         dummy_prefill_requests: list[NewRequestData] = []
         dummy_prefill_num_scheduled_tokens: dict[str, int] = {}
         self._add_dummy_requests(
@@ -1980,12 +2000,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             total_tokens=prefill_seq_len,
             num_computed_tokens=0,
             num_kv_cache_groups=num_kv_cache_groups,
-            sampling_params=None
-            if self.is_pooling_model
-            else SamplingParams(temperature=0.0),
-            pooling_params=PoolingParams(task=self.get_supported_pooling_tasks()[0])
-            if self.is_pooling_model
-            else None,
+            sampling_params=sampling_params,
+            pooling_params=pooling_params,
         )
         so, cso = self._make_dummy_scheduler_outputs(
             dummy_prefill_requests,
@@ -1994,99 +2010,30 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         )
         self._execute_dummy_requests(so, cso, self.prefill_intermediate_tensors)
 
-        # FIXME(RBLN): At the moment, a single request can’t access multiple
-        # blocks per layer under the current implementation, so we’re forced
-        # to reduce the warmup length to a reasonable value for now.
-        # This is mainly because we still have to run the computation over
-        # the padded tokens in speculative decoding scenario as well.
+        # Single decode dummy at one representative shape; further shapes
+        # are JIT'd on first real request.
+        logger.info("Warm up decode graph")
         decode_max_seq_len = self.max_model_len // 2
-
-        # compile decode graph considering decode batch buckets
-        for batch_bucket_size in self.bucketing_manager.decode_batch_buckets:
-            query_len_range = (
-                range(1, self.num_spec_tokens + 2) if self.num_spec_tokens > 0 else [1]
-            )
-            for query_len in query_len_range:
-                dummy_decode_requests: list[NewRequestData] = []
-                dummy_decode_num_scheduled_tokens: dict[str, int] = {}
-                for _ in range(batch_bucket_size):
-                    self._add_dummy_requests(
-                        requests=dummy_decode_requests,
-                        num_scheduled_tokens=dummy_decode_num_scheduled_tokens,
-                        total_tokens=decode_max_seq_len,
-                        num_computed_tokens=decode_max_seq_len,
-                        num_kv_cache_groups=num_kv_cache_groups,
-                        sampling_params=None
-                        if self.is_pooling_model
-                        else SamplingParams(temperature=0.0),
-                        pooling_params=PoolingParams(
-                            task=self.get_supported_pooling_tasks()[0]
-                        )
-                        if self.is_pooling_model
-                        else None,
-                    )
-                for req_id in dummy_decode_num_scheduled_tokens:
-                    dummy_decode_num_scheduled_tokens[req_id] = query_len
-
-                spec_tokens = (
-                    {req.req_id: [0] * (query_len - 1) for req in dummy_decode_requests}
-                    if query_len > 1
-                    else {}
-                )
-                so, cso = self._make_dummy_scheduler_outputs(
-                    dummy_decode_requests,
-                    dummy_decode_num_scheduled_tokens,
-                    num_kv_cache_groups,
-                    scheduled_spec_decode_tokens=spec_tokens,
-                )
-                current_intermediate_tensors = self.decode_intermediate_tensors.get(
-                    batch_bucket_size
-                )
-                assert current_intermediate_tensors is not None
-
-                if self.specialized_moe_decode:
-                    self._execute_dummy_requests(
-                        so,
-                        cso,
-                        current_intermediate_tensors,
-                        num_padded_tokens=self.max_num_batched_tokens,
-                    )
-
-                self._execute_dummy_requests(so, cso, current_intermediate_tensors)
-
-        # FIXME: remove this code after #474(sampler with decode batch) is merged
-        # compile sampler for all possible decode batches
-        max_decode_batch = self.bucketing_manager.decode_batch_buckets[-1]
-        dummy_decode_requests = []
-        dummy_decode_num_scheduled_tokens = {}
-        for decode_batch in range(1, max_decode_batch + 1):
-            self._add_dummy_requests(
-                requests=dummy_decode_requests,
-                num_scheduled_tokens=dummy_decode_num_scheduled_tokens,
-                total_tokens=1,
-                num_computed_tokens=1,
-                num_kv_cache_groups=num_kv_cache_groups,
-                sampling_params=None
-                if self.is_pooling_model
-                else SamplingParams(temperature=0.0),
-                pooling_params=PoolingParams(task=self.get_supported_pooling_tasks()[0])
-                if self.is_pooling_model
-                else None,
-            )
-            assert decode_batch == len(dummy_decode_requests)
-            so, cso = self._make_dummy_scheduler_outputs(
-                dummy_decode_requests,
-                dummy_decode_num_scheduled_tokens,
-                num_kv_cache_groups,
-            )
-            batch_bucket_size = self.bucketing_manager.find_decode_batch_bucket(
-                decode_batch
-            )
-            current_intermediate_tensors = self.decode_intermediate_tensors.get(
-                batch_bucket_size
-            )
-            assert current_intermediate_tensors is not None
-            self._execute_dummy_requests(so, cso, current_intermediate_tensors)
+        dummy_decode_requests: list[NewRequestData] = []
+        dummy_decode_num_scheduled_tokens: dict[str, int] = {}
+        self._add_dummy_requests(
+            requests=dummy_decode_requests,
+            num_scheduled_tokens=dummy_decode_num_scheduled_tokens,
+            total_tokens=decode_max_seq_len,
+            num_computed_tokens=decode_max_seq_len,
+            num_kv_cache_groups=num_kv_cache_groups,
+            sampling_params=sampling_params,
+            pooling_params=pooling_params,
+        )
+        so, cso = self._make_dummy_scheduler_outputs(
+            dummy_decode_requests,
+            dummy_decode_num_scheduled_tokens,
+            num_kv_cache_groups,
+        )
+        # Use the first available decode intermediate tensor; with dynamic
+        # shapes we'll drop this pre-allocation entirely (Cycle 3b — M2).
+        decode_it = next(iter(self.decode_intermediate_tensors.values()))
+        self._execute_dummy_requests(so, cso, decode_it)
 
     def _add_dummy_requests(
         self,
@@ -2584,7 +2531,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         num_sampled_tokens = (
             self.input_batch.num_reqs
-            if envs.VLLM_RBLN_USE_DEVICE_TENSOR
+            if True
             else sampler_output.sampled_token_ids.shape[0]
         )
         sampled_token_ids = sampler_output.sampled_token_ids[:num_sampled_tokens]
@@ -2593,7 +2540,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         logprobs_lists = None
         if not self.use_async_scheduling:
             # Get the valid generated tokens.
-            if envs.VLLM_RBLN_USE_DEVICE_TENSOR and sampled_token_ids.shape[0] == 0:
+            if True and sampled_token_ids.shape[0] == 0:
                 # No tokens were actually sampled (e.g., non-last
                 # chunk in chunked prefill produces empty logits).
                 valid_sampled_token_ids: list[list[int]] = [
@@ -3126,7 +3073,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         # selected_token_indices is for valid decode tokens
                         # token_indices == None, selected = torch.tensor([0])
                         if self.speculative_config is None:
-                            if not envs.VLLM_RBLN_USE_DEVICE_TENSOR:
+                            if not True:
                                 logits = logits[:num_input_tokens]
                         else:
                             batch_indices = torch.arange(
@@ -4136,7 +4083,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         """
         kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-            if envs.VLLM_RBLN_USE_DEVICE_TENSOR:
+            if True:
                 device = self.device
                 tensor = torch.empty(
                     kv_cache_tensor.size, dtype=torch.int8, device=device
@@ -4493,7 +4440,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             num_attn_module,
         )
         if (
-            not envs.VLLM_RBLN_USE_DEVICE_TENSOR
+            not True
             and not self.model_config.enforce_eager
             and envs.VLLM_RBLN_COMPILE_MODEL
         ):
