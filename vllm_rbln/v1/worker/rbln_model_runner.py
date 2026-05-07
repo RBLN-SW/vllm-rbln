@@ -286,20 +286,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         else:
             self.max_encoder_len = 0
 
-        if not True:
-            # Only provide use_global_ctx if CompileContext supports it
-            import inspect
-
-            from rebel.compile_context import CompileContext
-
-            compile_ctx_args = {}
-            if "use_weight_sharing" in inspect.signature(CompileContext).parameters:
-                compile_ctx_args["use_weight_sharing"] = True
-            if "use_global_ctx" in inspect.signature(CompileContext).parameters:
-                compile_ctx_args["use_global_ctx"] = True
-            self.compile_context = CompileContext(**compile_ctx_args)
-        else:
-            self.compile_context = None
+        # device-tensor mode is the only mode now (Cycle 3 M7 collapse).
+        self.compile_context = None
         self.runtime_holder: list = []
 
         # Sampler
@@ -1357,11 +1345,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             if isinstance(kv_cache_group_spec.kv_cache_spec, EncoderOnlyAttentionSpec):
                 # Encoder-only layers do not have KV cache, so we need to
                 # create a dummy block table and slot mapping for them.
-                device_kwarg = (
-                    {} if True else {"device": self.device}
-                )
                 blk_table_tensor = torch.zeros(
-                    (num_reqs, 1), dtype=torch.int32, **device_kwarg
+                    (num_reqs, 1), dtype=torch.int32
                 )
                 slot_mapping = torch.zeros(
                     (total_num_scheduled_tokens,),
@@ -1478,8 +1463,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             "mode": "strict",
             "_runtime_holder": self.runtime_holder,
         }
-        if not True:
-            options["compile_context"] = self.compile_context
         if not envs.VLLM_DISABLE_COMPILE_CACHE:
             logger.info(
                 "Once the model is compiled for the first time, "
@@ -3072,10 +3055,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     else:  # decode
                         # selected_token_indices is for valid decode tokens
                         # token_indices == None, selected = torch.tensor([0])
-                        if self.speculative_config is None:
-                            if not True:
-                                logits = logits[:num_input_tokens]
-                        else:
+                        if self.speculative_config is not None:
                             batch_indices = torch.arange(
                                 self.input_batch.num_reqs, device=self.device
                             )

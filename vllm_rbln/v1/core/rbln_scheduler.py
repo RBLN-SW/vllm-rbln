@@ -551,7 +551,8 @@ class RBLNScheduler(Scheduler):
                     new_computed_blocks=new_computed_blocks,
                     num_lookahead_tokens=effective_lookahead_tokens,
                     num_external_computed_tokens=num_external_computed_tokens,
-                    # NOTE(RBLN): Cache blocks only after scheduling is finalized.
+                    # NOTE(RBLN): Cache blocks finalisation is handled inline now
+                    # (Cycle 1 simplification removed the deferred-caching path).
                     delay_cache_blocks=True,
                     num_encoder_tokens=num_encoder_tokens,
                 )
@@ -681,11 +682,9 @@ class RBLNScheduler(Scheduler):
             scheduled_running_reqs
         ) <= len(self.running)
 
-        # NOTE(RBLN): All allocate_slots calls above used delay_cache_blocks=True
-        # so that scheduling decisions (spec_decode_cap trimming, prefill kicking
-        # out running decodes) can adjust token counts without needing to undo
-        # premature caching. Now that scheduling is finalized, cache blocks and
-        # schedule sub-block indexing for all scheduled requests.
+        # NOTE(RBLN): cache blocks + schedule sub-block indexing for all
+        # scheduled requests. (Cycle 1 removed the spec_decode_cap trim and
+        # mixed-batch flush passes that previously required deferred caching.)
         for req in itertools.chain(
             scheduled_running_reqs, scheduled_new_reqs, scheduled_resumed_reqs
         ):
