@@ -2683,16 +2683,24 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 runtime._copy_kv_cache(op.src_block_id, op.dst_block_id, op.num_tokens)
 
     @staticmethod
+    def _is_kv_connector_warm_up_phase(scheduler_output: "SchedulerOutput") -> bool:
+        # Warmup runs `_execute_dummy_requests` with synthetic SchedulerOutput
+        # whose `kv_connector_metadata` is None. The connector lifecycle
+        # (bind/wait/clear) must skip this phase, otherwise stateful
+        # connectors (e.g. LMCache) assert on missing bound metadata.
+        return scheduler_output.kv_connector_metadata is None
+
+    @staticmethod
     def maybe_get_kv_connector_output(
         scheduler_output: "SchedulerOutput",
         defer_finalize: bool = False,
     ) -> AbstractContextManager[KVConnectorOutput | None]:
-        warm_up_phase = scheduler_output.kv_connector_metadata is None
+        skip = RBLNModelRunner._is_kv_connector_warm_up_phase(scheduler_output)
         return (
             KVConnectorModelRunnerMixin._get_kv_connector_output(
                 scheduler_output, defer_finalize=defer_finalize
             )
-            if has_kv_transfer_group() and not warm_up_phase
+            if has_kv_transfer_group() and not skip
             else nullcontext()
         )
 
@@ -3193,8 +3201,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # Finalize KV connector (wait_for_save + clear metadata) after
         # draft model runs. Deferred from target model forward to allow
-        # draft model to also save its KV cache.
-        if spec_config is not None:
+        # draft model to also save its KV cache. Skip during warmup —
+        # the connector context was bypassed in maybe_get_kv_connector_output,
+        # so no metadata was bound.
+        if spec_config is not None and not self._is_kv_connector_warm_up_phase(
+            scheduler_output
+        ):
             self.finalize_kv_connector()
 
         # FIXME(jiwoo.park) EPLB is not supported in RBLN
@@ -4420,6 +4432,20 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 else:
                     break
 
+    @staticmethod
+    def _propagate_runtime_holder(group: object, runtime_holder: list) -> None:
+        """Pass runtime_holder to every connector exposing set_runtime_holder.
+
+        Walks into ``MultiConnector._connectors`` recursively because
+        MultiConnector does not implement this RBLN-specific method, so a
+        plain hasattr check on the top-level group would silently skip the
+        nested LMCache/RBLN connector that actually needs the holder.
+        """
+        if hasattr(group, "set_runtime_holder"):
+            group.set_runtime_holder(runtime_holder)
+        for child in getattr(group, "_connectors", ()) or ():
+            RBLNModelRunner._propagate_runtime_holder(child, runtime_holder)
+
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """
         Initialize KV cache based on `kv_cache_config`.
@@ -4510,8 +4536,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
             kv_transfer_group.set_host_xfer_buffer_ops(rbln_copy_kv_blocks)
 
-            if hasattr(kv_transfer_group, "set_runtime_holder"):
-                kv_transfer_group.set_runtime_holder(self.runtime_holder)
+            self._propagate_runtime_holder(kv_transfer_group, self.runtime_holder)
 
         if self.dcp_world_size > 1:
             layer_type = cast(type[Any], AttentionLayerBase)
