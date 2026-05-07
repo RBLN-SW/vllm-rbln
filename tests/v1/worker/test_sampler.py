@@ -16,6 +16,13 @@ import pytest
 import torch
 from torch._dynamo.testing import CompileCounter
 from vllm.platforms import current_platform
+from vllm.sampling_params import SamplingParams
+from vllm.v1.sample.logits_processor import LogitsProcessors
+from vllm.v1.sample.logits_processor.builtin import MinTokensLogitsProcessor
+from vllm.v1.sample.logits_processor.interface import BatchUpdate
+from vllm.v1.sample.metadata import SamplingMetadata
+
+from vllm_rbln.v1.sample.rbln_sampler import RBLNSampler
 
 from .utils import (
     _schedule_new_request_from_request,
@@ -223,6 +230,72 @@ def test_forward_sampling_parameters(
 
 
 # TODO mix the requests with different sampling parameters
+
+
+def test_rbln_sampler_casts_bfloat16_logits_before_min_tokens_processor(monkeypatch):
+    device = torch.device("cpu")
+    stop_token_id = 1
+    sampled_token_id = 2
+    output_token_ids: list[list[int]] = [[]]
+
+    min_tokens_processor = MinTokensLogitsProcessor(
+        vllm_config=None,
+        device=device,
+        is_pin_memory=False,
+    )
+    sampling_params = SamplingParams(
+        min_tokens=2,
+        stop_token_ids=[stop_token_id],
+    )
+    min_tokens_processor.update_state(
+        BatchUpdate(
+            batch_size=1,
+            removed=[],
+            added=[(0, sampling_params, None, output_token_ids[0])],
+            moved=[],
+        )
+    )
+
+    sampling_metadata = SamplingMetadata(
+        temperature=None,
+        all_greedy=True,
+        all_random=False,
+        top_p=None,
+        top_k=None,
+        generators={},
+        max_num_logprobs=-1,
+        no_penalties=True,
+        prompt_token_ids=None,
+        frequency_penalties=torch.tensor([], device=device),
+        presence_penalties=torch.tensor([], device=device),
+        repetition_penalties=torch.tensor([], device=device),
+        output_token_ids=output_token_ids,
+        allowed_token_ids_mask=None,
+        bad_words_token_ids={},
+        logitsprocs=LogitsProcessors([min_tokens_processor]),
+    )
+    logits = torch.tensor([[0.0, 10.0, 1.0]], dtype=torch.bfloat16, device=device)
+    observed: dict[str, torch.Tensor] = {}
+
+    def fake_sample(self, processed_logits, sampling_metadata):
+        observed["processed_logits"] = processed_logits.detach().clone()
+        return processed_logits.argmax(dim=-1), None
+
+    monkeypatch.setattr(RBLNSampler, "sample", fake_sample)
+
+    sampler = RBLNSampler.__new__(RBLNSampler)
+    torch.nn.Module.__init__(sampler)
+    sampler.logprobs_mode = "raw_logits"
+
+    sampler_output = sampler.forward(logits, sampling_metadata)
+
+    processed_logits = observed["processed_logits"]
+    assert processed_logits.dtype == torch.float32
+    assert processed_logits[0, stop_token_id].item() == float("-inf")
+    assert sampler_output.sampled_token_ids.item() == sampled_token_id
+    assert sampler_output.sampled_token_ids.item() != stop_token_id
+    assert sampler_output.logprobs_tensors is not None
+    assert sampler_output.logprobs_tensors.logprobs[0, stop_token_id].item() == 10.0
 
 
 def test_sampler_logits_reshape_prevents_torch_compile_recompile(monkeypatch):

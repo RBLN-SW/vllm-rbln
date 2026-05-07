@@ -268,9 +268,10 @@ class RBLNSampler(VLLMSampler):
                 else:
                     raw_logprobs = logits.to(torch.float32)
 
-        # NOTE(eunji.lee) To reduce the copy overhead, we turned off type casting.
-        # Use float32 for the logits.
-        # logits = logits.to(torch.float32)
+        # Logits processors can mutate logits in-place with float32 tensors
+        # such as MinTokensLogitsProcessor.neg_inf_tensor.
+        if logits.dtype != torch.float32:
+            logits = logits.to(torch.float32)
 
         logits = self.apply_logits_processors(
             logits, sampling_metadata, predict_bonus_token
