@@ -221,7 +221,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         else:
             self.max_encoder_len = 0
 
-        # device-tensor mode is the only mode now (Cycle 3 M7 collapse).
         self.compile_context = None
         self.runtime_holder: list = []
 
@@ -363,14 +362,10 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self.max_num_reqs, dtype=torch.int64
         )
 
-        # PP intermediate tensors are now allocated lazily on the receive
-        # path (Cycle 5d M2). With dynamic shapes the runner no longer needs
-        # to pre-build a per-bucket pool — the GPU runner does the same.
+        # PP intermediate tensors are allocated lazily on the receive path.
         self.intermediate_tensors: IntermediateTensors | None = None
 
-        # Cycle 5d (M4): cache the last-seen prefill/decode classification so
-        # bookkeeping consumers (perf tracker, metrics) keep their phase
-        # bucketing without resurrecting `is_prefill_phase()`.
+        # Cached prefill/decode flag for perf-tracker phase bucketing.
         self._last_execute_was_prefill: bool = False
 
         # OPTIMIZATION: Cache the tensors rather than creating them every step.
@@ -1206,13 +1201,11 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self.num_accepted_tokens.copy_to_gpu()
 
         max_num_scheduled_tokens = int(num_scheduled_tokens.max())
-        # Cycle 5d (M3+M4): no bucketing; pass real num_reqs straight through.
-        initial_batch_bucket_size = num_reqs
 
         (batch_bucket_size, num_padded_tokens, num_tokens_across_dp) = (
             self.get_dp_padding(
                 total_num_scheduled_tokens,
-                initial_batch_bucket_size,
+                num_reqs,
                 num_padded_tokens,
             )
         )
@@ -1293,11 +1286,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 if isinstance(builder, RBLNFlashAttentionMetadataBuilder):
                     extra_attn_metadata_args["positions"] = self.positions.cpu
                     extra_attn_metadata_args["batch_pad"] = batch_bucket_size
-                    # The attention backend still distinguishes prefill vs
-                    # decode mask shapes (Cycle V `flash_attn_varlen` will
-                    # eventually unify these); derive the flag locally instead
-                    # of going through the deleted runner-wide
-                    # `is_prefill_phase()` helper (Cycle 5d M4).
+                    # Attention backend distinguishes prefill vs decode
+                    # mask shapes; derive the flag locally.
                     extra_attn_metadata_args["is_prefill"] = bool(
                         (
                             self.input_batch.num_computed_tokens_cpu[:num_reqs]
@@ -1336,17 +1326,11 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         )
 
     def _compile_model(self, model):
-        TP = get_tp_group()
-        PP = get_pp_group()
-        DP = get_dp_group()
-
-        process_group_dict = {}
-        process_group_dict[TP.device_group.group_name] = TP.ranks
-        process_group_dict[TP.cpu_group.group_name] = TP.ranks
-        process_group_dict[PP.device_group.group_name] = PP.ranks
-        process_group_dict[PP.cpu_group.group_name] = PP.ranks
-        process_group_dict[DP.device_group.group_name] = DP.ranks
-        process_group_dict[DP.cpu_group.group_name] = DP.ranks
+        process_group_dict = {
+            g.group_name: pg.ranks
+            for pg in (get_tp_group(), get_pp_group(), get_dp_group())
+            for g in (pg.device_group, pg.cpu_group)
+        }
 
         options = {
             "tensor_parallel_size": envs.VLLM_RBLN_TP_SIZE,
@@ -1371,14 +1355,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             dynamic=False,
         )
 
-        compiled_model = torch.compile(
+        return torch.compile(
             model,
             backend="rbln",
             options=copy(options),
             dynamic=False,
         )
-
-        return compiled_model
 
     def _calc_spec_decode_metadata(
         self,
@@ -1593,8 +1575,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             num_padded_tokens = self.max_num_batched_tokens
         else:
             assert max_decode_tokens is not None
-            # Cycle 5d (M3): no bucket rounding; the batch bucket is just the
-            # actual decode-token count seen across DP ranks.
+            # Cross-DP equalisation: the batch bucket equals the
+            # max decode-token count seen across DP ranks.
             batch_bucket_size = max_decode_tokens
             num_padded_tokens = batch_bucket_size
 
@@ -1806,9 +1788,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         if envs.VLLM_RBLN_METRICS and self.sampler_performance_tracker is not None:
             collect_metrics(
                 self.sampler_performance_tracker,
-                # Cycle 5d (M4): perf-tracker bucketing inherits the cached
-                # phase from the most recent execute_model() call rather than
-                # re-deriving it via the deleted `is_prefill_phase()` helper.
                 bool(self._last_execute_was_prefill),
                 start_time=sampler_start_time,
                 end_time=time.perf_counter(),
@@ -1893,8 +1872,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             dummy_decode_num_scheduled_tokens,
             num_kv_cache_groups,
         )
-        # Cycle 5d (M2): single lazy intermediate-tensor buffer; dynamic
-        # shapes mean we no longer keep one per decode-batch bucket.
         self._execute_dummy_requests(so, cso, self.intermediate_tensors)
 
     def _add_dummy_requests(
@@ -1981,15 +1958,11 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
     @torch.inference_mode()
     def dummy_run(self, num_tokens: int = 1) -> None:
-        """Minimal forward pass used by DP synchronisation.
+        """Issue a 1-token decode forward to keep the DP keep-alive contract.
 
-        Cycle 5d (M16): the legacy `prepare_dummy_run` / `dummy_run_state`
-        machinery (per-bucket pre-built attn_metadata + input_ids + positions)
-        is gone. With dynamic shapes, DP ranks can run heterogeneous batch
-        sizes without pre-padding, so the only requirement here is that this
-        rank issues *some* forward pass to keep the keep-alive contract with
-        the rest of the DP group. We reuse the existing decode dummy
-        request/scheduler-output helpers to issue a 1-token decode forward.
+        Reuses the decode dummy request/scheduler-output helpers; with dynamic
+        shapes, DP ranks can run heterogeneous batch sizes without per-bucket
+        pre-padding.
         """
         num_kv_cache_groups = len(self.kv_cache_config.kv_cache_groups)
         sampling_params = (
@@ -2340,10 +2313,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             ) = self._preprocess(scheduler_output)
 
         assert input_ids is not None
-        # Cycle 5d (M4): collapsed prefill/decode bifurcation. The remaining
-        # users that genuinely need the phase classification (perf tracker,
-        # attention-mask shape) compute it locally; the global runner-side
-        # branch is gone.
         num_computed_tokens_cpu = self.input_batch.num_computed_tokens_cpu
         num_prompt_tokens_cpu = self.input_batch.num_prompt_tokens
         is_prefill_phase = bool(
@@ -2438,11 +2407,11 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 input_ids = rbln_utils.pad(input_ids, 0, batch_bucket_size)
                 positions = rbln_utils.pad(positions, -2, batch_bucket_size)
 
-            if hasattr(rebel, "capture_reports"):
-                capture_ctx = rebel.capture_reports()
-            else:
-                # use a dummy context manager that does nothing
-                capture_ctx = contextlib.nullcontext()
+            capture_ctx = (
+                rebel.capture_reports()
+                if hasattr(rebel, "capture_reports")
+                else contextlib.nullcontext()
+            )
 
             # Move input_ids / positions to device now that all CPU-side prep is done.
             if input_ids is not None and input_ids.device.type == "cpu":
@@ -2569,10 +2538,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     )
                 sample_hidden_states = hidden_states
                 if not self.use_wrapped_compute_logits():
-                    # DO NOT include compute logits.
-                    # Cycle 5d (M4): single path mirroring GPU runner —
-                    # gather hidden states at `logits_indices` then compute
-                    # logits once. The prefill-vs-decode dichotomy is gone.
+                    # Gather hidden states at `logits_indices` then compute
+                    # logits once (mirrors the GPU runner).
                     hidden_states = hidden_states.flatten(0, -2)
                     sample_hidden_states = hidden_states[logits_indices]
                     logits = self.compute_logits(sample_hidden_states)
@@ -2580,12 +2547,9 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         logits = self.logits_processor._gather_logits(logits)
                     logits = logits.view(-1, logits.size(-1))
                 else:
-                    # `compute_logits` is fused into `model_executable` (M10
-                    # still pending) so `logits` is already produced — only
+                    # `compute_logits` is fused into `model_executable`; only
                     # spec-decode needs to re-shape `sample_hidden_states`
-                    # for the draft model. Cycle 5d (M4): drop the
-                    # prefill/decode chunk-boundary branch; logits are taken
-                    # at `logits_indices` like the GPU runner.
+                    # for the draft model.
                     selected_token_indices = logits_indices.to(self.device)
                     assert selected_token_indices.dim() == 1
                     if self.speculative_config is not None:
@@ -2699,8 +2663,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self.use_eagle() and not spec_config.disable_padded_drafter_batch
         )
         effective_drafter_max_model_len = self.max_model_len
-        if effective_drafter_max_model_len is None:
-            effective_drafter_max_model_len = self.model_config.max_model_len
         if (
             spec_config is not None
             and spec_config.draft_model_config is not None
@@ -2723,8 +2685,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 propose_draft_token_ids(sampled_token_ids)
 
         with record_function_or_nullcontext("Bookkeep"):
-            # Cycle 5d (M4): use the cached classification from execute_model
-            # rather than re-deriving it via the deleted helper.
             is_prefill_phase = self._last_execute_was_prefill
             (
                 num_nans_in_logits,
@@ -3101,10 +3061,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
             compiled_graph = self._compile_model(model_wrapper)
             self.model_executable = compiled_graph
-
-        # Cycle 5d (M2): pre-allocation per (prefill | decode bucket) is gone.
-        # PP intermediate tensors are now built on demand the first time the
-        # receive path needs them (mirrors the GPU runner's lazy alloc).
 
     def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:
         """Extract Eagle3 auxiliary layer indices from speculative config.
@@ -3590,11 +3546,11 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         kv_cache_raw_tensors: dict[str, torch.Tensor],
         kernel_block_sizes: list[int],
     ) -> dict[str, torch.Tensor]:
-        """
-        Allocate per-layer KV cache tensors using a GPU-style layout
-        (Cycle 5c — M12-M14): one contiguous tensor per layer at the shape
-        the attention backend reports. No deduplicated base / view-info
-        sidecar — backends read strides directly from the tensor.
+        """Allocate per-layer KV cache tensors with the GPU-style layout.
+
+        One contiguous tensor per layer at the shape the attention backend
+        reports; backends read strides directly from the tensor (no
+        deduplicated base / view-info sidecar).
         """
         kv_caches: dict[str, torch.Tensor] = {}
         has_attn, has_mamba = False, False
@@ -3686,18 +3642,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     def initialize_kv_cache_tensors(
         self, kv_cache_config: KVCacheConfig, kernel_block_sizes: list[int]
     ) -> dict[str, torch.Tensor]:
-        """
-        Initialize the memory buffer for KV cache (Cycle 5c — M12-M14).
-
-        Returns:
-            Dict[str, torch.Tensor]: A map between layer names to their
-            corresponding memory buffer for KV cache.
-        """
+        """Initialize the memory buffer for KV cache."""
         cache_dtype = self.cache_config.cache_dtype
         if self.use_uniform_kv_cache(self.attn_groups, cache_dtype):
-            # The kv-connector "uniform" layout previously relied on the
-            # KVCacheViewInfo / kv_cache_bases sidecar, which has been
-            # removed in Cycle 5c. Re-enabling it is a separate cycle.
+            # The kv-connector "uniform" layout requires a stride-aware
+            # allocation contract that no longer exists; re-enabling it
+            # is a separate task.
             raise NotImplementedError(
                 "Uniform KV cache layout (kv-connector optimised path) needs"
                 " a follow-up cycle: it requires a stride-aware allocation"
@@ -3811,13 +3761,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 dst_block_ids: list[int],
                 direction: Literal["h2d", "d2h"],
             ) -> None:
-                """Copy kv blocks via tensor-direct slicing (Cycle 5c — M14).
+                """Copy kv blocks via tensor-direct slicing.
 
-                With KV laid out as plain torch tensors (no rebel-runtime
-                sidecar), we can copy block-by-block using normal indexing.
-                The block axis is dim 1 (e.g. [2, num_blocks, ...] for the
-                current backend or [num_blocks, ...] for GPU-style); we
-                detect it by matching layer-name keys.
+                With KV laid out as plain torch tensors, we copy
+                block-by-block using normal indexing. The block axis is
+                dim 1 (e.g. [2, num_blocks, ...]) or 0 ([num_blocks, ...])
+                — detected by matching layer-name keys.
                 """
                 if (
                     not src_kv_caches
