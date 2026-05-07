@@ -124,6 +124,10 @@ from vllm_rbln.forward_context import RBLNDPMetadata
 from vllm_rbln.logger import init_logger
 from vllm_rbln.lora.inputs import LoRAInputs
 from vllm_rbln.lora.mask import LoRAMask
+from vllm_rbln.torch_compile_backend import (
+    logged_rbln_backend,
+    set_warmup_active,
+)
 from vllm_rbln.v1.attention.backends.flash_attention import (
     RBLNFlashAttentionMetadataBuilder,
 )
@@ -1476,14 +1480,14 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # FIXME(jiwoo.park): method assignment for torch.compile
         self.compute_logits = torch.compile(  # type: ignore[method-assign]
             self.compute_logits,
-            backend="rbln",
+            backend=logged_rbln_backend,
             options=copy(options),
             dynamic=False,
         )
 
         compiled_model = torch.compile(
             model,
-            backend="rbln",
+            backend=logged_rbln_backend,
             options=copy(options),
             dynamic=False,
         )
@@ -1883,9 +1887,15 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
     @torch.inference_mode()
     def warm_up_model(self) -> None:
+        set_warmup_active(True)
+        try:
+            self._warm_up_model_inner()
+        finally:
+            set_warmup_active(False)
+
+    def _warm_up_model_inner(self) -> None:
         num_kv_cache_groups = len(self.kv_cache_config.kv_cache_groups)
 
-        logger.info("Warm up prefill graph")
         prefill_seq_len = (
             self.scheduler_config.max_num_batched_tokens
             if self.scheduler_config.enable_chunked_prefill
@@ -1911,6 +1921,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             dummy_prefill_num_scheduled_tokens,
             num_kv_cache_groups,
         )
+        logger.info("Warm-up: prefill (seq_len=%d)", prefill_seq_len)
         self._execute_dummy_requests(so, cso, self.prefill_intermediate_tensors)
 
         # FIXME(RBLN): At the moment, a single request can’t access multiple
@@ -1963,6 +1974,11 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 )
                 assert current_intermediate_tensors is not None
 
+                logger.info(
+                    "Warm-up: decode (batch_bucket=%d, query_len=%d)",
+                    batch_bucket_size,
+                    query_len,
+                )
                 if self.specialized_moe_decode:
                     self._execute_dummy_requests(
                         so,
@@ -2005,6 +2021,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 batch_bucket_size
             )
             assert current_intermediate_tensors is not None
+            logger.info("Warm-up: sampler (decode_batch=%d)", decode_batch)
             self._execute_dummy_requests(so, cso, current_intermediate_tensors)
 
     def _add_dummy_requests(
@@ -4446,7 +4463,38 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             for kv_cache, name in zip(self.kv_caches, kv_cache_names):
                 self.compile_context.mark_static_address(kv_cache, name)
 
+        self._log_kv_cache_info(kv_cache_config, kv_caches)
         return kv_caches
+
+    def _log_kv_cache_info(
+        self,
+        kv_cache_config: KVCacheConfig,
+        kv_caches: dict[str, torch.Tensor],
+    ) -> None:
+        total_bytes = sum(t.size for t in kv_cache_config.kv_cache_tensors)
+        logger.info(
+            "KV cache: num_blocks=%d, num_groups=%d, num_tensors=%d, total=%.3f GiB",
+            kv_cache_config.num_blocks,
+            len(kv_cache_config.kv_cache_groups),
+            len(kv_cache_config.kv_cache_tensors),
+            total_bytes / 1024**3,
+        )
+        # Group layers by (shape, dtype)
+        groups: dict[Any, list[str]] = defaultdict(list)
+        for layer_name, tensor in kv_caches.items():
+            key: Any
+            if isinstance(tensor, list):
+                key = tuple((tuple(s.shape), str(s.dtype)) for s in tensor)
+            else:
+                key = (tuple(tensor.shape), str(tensor.dtype))
+            groups[key].append(layer_name)
+        for key, layer_names in groups.items():
+            logger.info(
+                "KV cache: %d layer(s) shape/dtype=%s, e.g. %s",
+                len(layer_names),
+                key,
+                layer_names[0],
+            )
 
     def maybe_add_kv_sharing_layers_to_kv_cache_groups(
         self, kv_cache_config: KVCacheConfig
