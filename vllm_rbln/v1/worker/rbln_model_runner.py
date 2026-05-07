@@ -141,51 +141,6 @@ logger = init_logger(__name__)
 
 
 # Wrapper for ModelRunnerOutput to support overlapped execution.
-class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
-    def __init__(
-        self,
-        model_runner_output: ModelRunnerOutput,
-        sampled_token_ids: torch.Tensor,
-        invalid_req_indices: list[int],
-        async_output_copy_stream: torch.cuda.Stream,
-    ):
-        self._model_runner_output = model_runner_output
-        self._invalid_req_indices = invalid_req_indices
-
-        # Event on the copy stream so we can synchronize the non-blocking copy.
-        # self._async_copy_ready_event = torch.cuda.Event()
-
-        # Keep a reference to the device tensor to avoid it being
-        # deallocated until we finish copying it to the host.
-        self._sampled_token_ids = sampled_token_ids
-
-        # Initiate the copy on a separate stream, but do not synchronize it.
-        # default_stream = torch.cuda.current_stream()
-        # with torch.cuda.stream(async_output_copy_stream):
-        #     async_output_copy_stream.wait_stream(default_stream)
-        #     self._sampled_token_ids_cpu = self._sampled_token_ids.to(
-        #         'cpu', non_blocking=True)
-        #     self._async_copy_ready_event.record()
-
-    def get_output(self) -> ModelRunnerOutput:
-        """Copy the device tensors to the host and return a ModelRunnerOutput.
-
-        This function blocks until the copy is finished.
-        """
-        self._async_copy_ready_event.synchronize()
-
-        # Release the device tensor once the copy has completed
-        del self._sampled_token_ids
-
-        valid_sampled_token_ids = self._sampled_token_ids_cpu.tolist()
-        for i in self._invalid_req_indices:
-            valid_sampled_token_ids[i].clear()
-
-        output = self._model_runner_output
-        output.sampled_token_ids = valid_sampled_token_ids
-        return output
-
-
 class ExecuteModelState(NamedTuple):
     """Ephemeral cached state transferred between execute_model() and
     sample_tokens(), after execute_model() returns None."""
@@ -380,9 +335,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
         )
 
-        self.use_async_scheduling = self.scheduler_config.async_scheduling
-        # self.async_output_copy_stream = torch.cuda.Stream() if \
-        #     self.use_async_scheduling else None
+        # Async scheduling is forced off in platform.py (RBLN does not support
+        # it; check_and_update_config flips scheduler_config.async_scheduling
+        # to False). Keep the attribute pinned to False so the few dead
+        # `if self.use_async_scheduling:` branches scattered through this
+        # file stay parseable until they're swept in a follow-up cycle.
+        self.use_async_scheduling = False
 
         # Cache the device properties.
         self._init_device_properties()
@@ -2882,15 +2840,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 token_count=scheduler_output.total_num_scheduled_tokens,
             )
 
-        if not self.use_async_scheduling:
-            return output
-
-        return AsyncRBLNModelRunnerOutput(
-            model_runner_output=output,
-            sampled_token_ids=sampler_output.sampled_token_ids,
-            invalid_req_indices=invalid_req_indices,
-            async_output_copy_stream=self.async_output_copy_stream,
-        )
+        return output
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         if self._draft_token_ids is None:

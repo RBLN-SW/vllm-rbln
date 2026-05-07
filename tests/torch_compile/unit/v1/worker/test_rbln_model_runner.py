@@ -26,7 +26,6 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.worker.gpu_input_batch import InputBatch
 
 from vllm_rbln.v1.worker.rbln_model_runner import (
-    AsyncRBLNModelRunnerOutput,
     ExecuteModelState,
     RBLNModelRunner,
 )
@@ -164,90 +163,6 @@ class TestMixinInterfaceCompliance:
             f"RBLNModelRunner missing public method: {method_name}"
         )
 
-
-# ===========================================================================
-# 2. AsyncRBLNModelRunnerOutput
-# ===========================================================================
-
-
-class TestAsyncRBLNModelRunnerOutputFeature:
-    def _make_output(self, num_reqs=3, invalid_indices=None):
-        """Helper to create an AsyncRBLNModelRunnerOutput with controllable state."""
-        mro = MagicMock(spec=ModelRunnerOutput)
-        sampled = torch.tensor([[10], [20], [30]][:num_reqs])
-        stream = MagicMock()
-        output = AsyncRBLNModelRunnerOutput(
-            model_runner_output=mro,
-            sampled_token_ids=sampled,
-            invalid_req_indices=invalid_indices or [],
-            async_output_copy_stream=stream,
-        )
-        return output, mro
-
-    def test_invalid_req_indices_clears_sampled_tokens(self):
-        """Verify that invalid_req_indices correctly clears the corresponding
-        sampled token entries when get_output() is called."""
-        output, mro = self._make_output(num_reqs=3, invalid_indices=[0, 2])
-
-        # Simulate what would happen after the async copy completes:
-        # Manually set the internal state that get_output() reads.
-        output._sampled_token_ids_cpu = torch.tensor([[10], [20], [30]])
-        output._async_copy_ready_event = MagicMock()
-
-        result = output.get_output()
-
-        # Index 0 and 2 should be cleared (empty lists)
-        assert result.sampled_token_ids[0] == []
-        assert result.sampled_token_ids[1] == [20]  # index 1 is not invalid, preserved
-        assert result.sampled_token_ids[2] == []
-
-    def test_get_output_returns_model_runner_output(self):
-        """Verify get_output() returns the underlying ModelRunnerOutput."""
-        output, mro = self._make_output(num_reqs=2, invalid_indices=[])
-
-        output._sampled_token_ids_cpu = torch.tensor([[10], [20]])
-        output._async_copy_ready_event = MagicMock()
-
-        result = output.get_output()
-        assert result is mro
-        assert result.sampled_token_ids == [[10], [20]]
-
-    def test_get_output_synchronizes_event(self):
-        """Verify get_output() calls synchronize on the copy event."""
-        output, mro = self._make_output(num_reqs=1, invalid_indices=[])
-        mock_event = MagicMock()
-        output._async_copy_ready_event = mock_event
-        output._sampled_token_ids_cpu = torch.tensor([[42]])
-
-        output.get_output()
-        mock_event.synchronize.assert_called_once()
-
-    def test_get_output_deletes_device_tensor(self):
-        """After get_output(), the device tensor reference should be released."""
-        output, _ = self._make_output(num_reqs=1, invalid_indices=[])
-        output._async_copy_ready_event = MagicMock()
-        output._sampled_token_ids_cpu = torch.tensor([[1]])
-
-        output.get_output()
-        assert not hasattr(output, "_sampled_token_ids")
-
-    def test_all_invalid_indices(self):
-        """When all indices are invalid, all sampled tokens should be cleared."""
-        output, mro = self._make_output(num_reqs=3, invalid_indices=[0, 1, 2])
-        output._sampled_token_ids_cpu = torch.tensor([[1], [2], [3]])
-        output._async_copy_ready_event = MagicMock()
-
-        result = output.get_output()
-        assert result.sampled_token_ids == [[], [], []]
-
-    def test_no_invalid_indices(self):
-        """When no indices are invalid, all tokens should be preserved."""
-        output, mro = self._make_output(num_reqs=2, invalid_indices=[])
-        output._sampled_token_ids_cpu = torch.tensor([[5], [6]])
-        output._async_copy_ready_event = MagicMock()
-
-        result = output.get_output()
-        assert result.sampled_token_ids == [[5], [6]]
 
 
 # ===========================================================================
@@ -427,22 +342,6 @@ class TestGetSupportedTasksFeature:
 
 class TestEdgeCases:
     """Bug-catching tests for edge conditions."""
-
-    def test_async_output_with_empty_sampled_tokens(self):
-        """AsyncRBLNModelRunnerOutput should handle zero requests gracefully."""
-        mro = MagicMock(spec=ModelRunnerOutput)
-        sampled = torch.zeros(0, 1, dtype=torch.long)
-        output = AsyncRBLNModelRunnerOutput(
-            model_runner_output=mro,
-            sampled_token_ids=sampled,
-            invalid_req_indices=[],
-            async_output_copy_stream=MagicMock(),
-        )
-        output._sampled_token_ids_cpu = sampled
-        output._async_copy_ready_event = MagicMock()
-
-        result = output.get_output()
-        assert result.sampled_token_ids == []
 
     def test_get_model_returns_model_attribute(self):
         """get_model should return the model attribute directly."""
