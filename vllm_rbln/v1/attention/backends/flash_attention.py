@@ -1184,12 +1184,19 @@ class RBLNFlashAttentionMetadataBuilder(
             if not is_prefills[0]:
                 cache_seq_lens = rbln_utils.pad(cache_seq_lens, 0, batch_pad)
                 cache_offsets = rbln_utils.pad(cache_offsets, 0, batch_pad)
-                # Generate sliding window attention mask for decode
-                # mask[b, s] = 1.0 if s <= cache_seq_lens[b] else 0.0
-                positions = torch.arange(sliding_window)[None, :]
-                swa_attn_masks = torch.where(positions - cache_seq_lens > 0, 0.0, 1.0)[
-                    :, None, None, :
-                ]
+                # Generate sliding window attention mask for decode.
+                # Converter expects 4D mask [B, 1, L, S] where L=query_len,
+                # S=key_len (must be multiple of 64).
+                # For spec decode (multi-token), each query token at offset q
+                # attends to cache positions [0, cache_seq_lens[b] + q].
+                # mask[b, q, s] = 1.0 if s <= cache_seq_lens[b] + q else 0.0
+                positions = torch.arange(sliding_window)[None, None, :]
+                query_offsets = torch.arange(max_query_len)[None, :, None]
+                swa_attn_masks = torch.where(
+                    positions - cache_seq_lens.unsqueeze(-1) - query_offsets > 0,
+                    0.0,
+                    1.0,
+                )[:, None, :, :]
 
             local_block_tables = block_tables_tensor[..., :1]
 
