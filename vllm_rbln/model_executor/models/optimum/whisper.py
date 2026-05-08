@@ -78,11 +78,8 @@ class RBLNOptimumWhisperForConditionalGeneration(
     def forward(self, model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
         input_ids = model_input.input_tokens
         block_tables = model_input.block_tables
-
         request_nums = input_ids.shape[0]
-
         is_prompt = model_input.is_prompt
-
         valid_block_ids = block_tables.flatten().to(torch.int32)
 
         if is_prompt:
@@ -93,10 +90,16 @@ class RBLNOptimumWhisperForConditionalGeneration(
                 input_features = audio_input["input_features"]
             if input_features is None:
                 raise ValueError("Whisper requires `input_features` as an input.")
-            # FIXME I think encoder should be called here
+            _ = self.model.encoder(
+                input_features=input_features,
+                block_tables=block_tables.squeeze(0).to(torch.int16),
+            )
 
         cache_position = torch.zeros(request_nums, 1, dtype=torch.int32)
 
+        # In whisper model,
+        # decoder input is always required in prefill step,
+        # so is_prompt=False is set for both prefill and decode step.
         kwargs = self.preprocess_for_decoder(
             is_prompt=False,
             block_tables=block_tables,
@@ -106,27 +109,21 @@ class RBLNOptimumWhisperForConditionalGeneration(
         )
         decoder_cache_position = kwargs.pop("cache_position")
         decoder_block_tables = kwargs.pop("block_tables")
-        # FIXME Is it ok generate torch.zero tensor for each forward?
-        # OR just generate pooled tensor in the model instance?
-        # FIXME bucketing?
+
+        # Whisper model does not support bucketing.
         decoder_attention_mask = torch.zeros(
             self.batch_size, self.dec_max_seq_len, dtype=self.dtype
         )
         if is_prompt:
-            print("block_tables", block_tables)
-            _ = self.model.encoder(
-                input_features=input_features,
-                block_tables=block_tables.squeeze(0).to(torch.int16),
-            )
-            for batch_idx in valid_block_ids:
-                decoder_cache_position[batch_idx] = 0
-                decoder_attention_mask[batch_idx, 0] = 1
-                self.dec_lengths[batch_idx] = 1
             decoder_input_ids = torch.full(
                 (self.batch_size, 1),
                 self.model.config.decoder_start_token_id,
                 dtype=torch.long,
             )
+            for batch_idx in valid_block_ids:
+                decoder_cache_position[batch_idx] = 0
+                decoder_attention_mask[batch_idx, 0] = 1
+                self.dec_lengths[batch_idx] = 1
             decoder_output = self.model.decoder(
                 decoder_input_ids=decoder_input_ids.contiguous(),
                 decoder_attention_mask=decoder_attention_mask,
