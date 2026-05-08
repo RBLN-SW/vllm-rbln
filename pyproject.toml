@@ -38,7 +38,7 @@ dependencies = [
     "pyyaml",
     "datasets",
     "qwen_vl_utils",
-    "vllm==0.18.0+cpu",
+    "vllm>=0.18.0,<0.20",
     "torch",
     "torchvision",
     "torchaudio",
