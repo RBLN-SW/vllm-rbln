@@ -472,6 +472,84 @@ def test_propose_prefill_path_keeps_unpadded_batch_shape():
     torch.testing.assert_close(output, torch.tensor([[1], [2]], dtype=torch.int64))
 
 
+# Verifies intermediate chunked prefill updates the draft KV cache
+# without producing draft tokens.
+def test_prefill_only_keeps_unpadded_batch_shape_and_returns_none():
+    fake, builder = make_fake_proposer(
+        batch_bucket_size=4, is_prefill=True, num_speculative_tokens=1
+    )
+    fake.needs_extra_input_slots = False
+    cad = make_common_attn_metadata(
+        query_start_loc=torch.tensor([0, 2, 4], dtype=torch.int32),
+        seq_lens=torch.tensor([10, 11], dtype=torch.int32),
+    )
+    target_positions = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
+    target_hidden_states = torch.arange(128, dtype=torch.float32).view(32, 4)
+    calls: list[torch.Tensor] = []
+
+    def model_executable(
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        inputs_embeds,
+        last_token_indices: torch.Tensor | None,
+    ):
+        calls.append(input_ids)
+        assert inputs_embeds is None
+        assert input_ids.shape == (2, 16)
+        assert positions.shape == (2, 16)
+        assert hidden_states.shape == (2, 16, 4)
+        torch.testing.assert_close(
+            input_ids[0, :4],
+            torch.tensor([11, 30, 21, 31], dtype=torch.int32),
+        )
+        torch.testing.assert_close(
+            input_ids[0, 4:],
+            torch.full((12,), -1, dtype=torch.int32),
+        )
+        torch.testing.assert_close(
+            input_ids[1],
+            torch.full((16,), -1, dtype=torch.int32),
+        )
+        torch.testing.assert_close(
+            positions,
+            torch.tensor(
+                [
+                    [0, 1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1],
+                    [2, 3, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1],
+                ],
+                dtype=torch.int64,
+            ),
+        )
+        torch.testing.assert_close(
+            last_token_indices,
+            torch.tensor([1, 3, 0, 0], dtype=torch.int32),
+        )
+        torch.testing.assert_close(
+            hidden_states,
+            target_hidden_states.view(2, 16, 4),
+        )
+        return hidden_states.view(-1, fake.hidden_size), torch.empty(0, 3)
+
+    fake.model_executable = model_executable
+
+    output = RBLNEagleProposer.prefill_only(
+        fake,
+        target_token_ids=torch.tensor([10, 11, 20, 21], dtype=torch.int32),
+        target_positions=target_positions,
+        target_hidden_states=target_hidden_states,
+        next_token_ids=torch.tensor([30, 31], dtype=torch.int32),
+        common_attn_metadata=cad,
+    )
+
+    assert output is None
+    assert len(calls) == 1
+    assert len(builder.calls) == 1
+    assert builder.calls[0]["is_prefill"] is True
+    assert builder.calls[0]["batch_pad"] == 4
+    assert builder.metas[0].kv_caches is fake.runner.kv_caches
+
+
 # Verifies multi-step drafting updates metadata,
 # slot mapping, and attention metadata between passes.
 def test_propose_multistep_updates_metadata_and_rebuilds_attention():

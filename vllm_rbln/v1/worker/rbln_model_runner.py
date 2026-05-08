@@ -124,6 +124,10 @@ from vllm_rbln.forward_context import RBLNDPMetadata
 from vllm_rbln.logger import init_logger
 from vllm_rbln.lora.inputs import LoRAInputs
 from vllm_rbln.lora.mask import LoRAMask
+from vllm_rbln.torch_compile_backend import (
+    logged_rbln_backend,
+    set_warmup_active,
+)
 from vllm_rbln.v1.attention.backends.flash_attention import (
     RBLNFlashAttentionMetadataBuilder,
 )
@@ -1476,14 +1480,14 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # FIXME(jiwoo.park): method assignment for torch.compile
         self.compute_logits = torch.compile(  # type: ignore[method-assign]
             self.compute_logits,
-            backend="rbln",
+            backend=logged_rbln_backend,
             options=copy(options),
             dynamic=False,
         )
 
         compiled_model = torch.compile(
             model,
-            backend="rbln",
+            backend=logged_rbln_backend,
             options=copy(options),
             dynamic=False,
         )
@@ -1722,11 +1726,13 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         )
 
         hidden_states = hidden_states[:num_scheduled_tokens]
+        seq_lens_cpu = self.seq_lens.cpu[: self.input_batch.num_reqs]
         pooling_metadata = self.input_batch.get_pooling_metadata()
         pooling_metadata.build_pooling_cursor(
-            num_scheduled_tokens_np.tolist(), device=hidden_states.device
+            num_scheduled_tokens_np,
+            seq_lens_cpu,
+            device=hidden_states.device,
         )
-        seq_lens_cpu = self.seq_lens.cpu[: self.input_batch.num_reqs]
 
         # Pooling models D2H & synchronize occurs in pooler.py:build_output
         raw_pooler_output = self.model.pooler(
@@ -1881,9 +1887,15 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
     @torch.inference_mode()
     def warm_up_model(self) -> None:
+        set_warmup_active(True)
+        try:
+            self._warm_up_model_inner()
+        finally:
+            set_warmup_active(False)
+
+    def _warm_up_model_inner(self) -> None:
         num_kv_cache_groups = len(self.kv_cache_config.kv_cache_groups)
 
-        logger.info("Warm up prefill graph")
         prefill_seq_len = (
             self.scheduler_config.max_num_batched_tokens
             if self.scheduler_config.enable_chunked_prefill
@@ -1909,6 +1921,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             dummy_prefill_num_scheduled_tokens,
             num_kv_cache_groups,
         )
+        logger.info("Warm-up: prefill (seq_len=%d)", prefill_seq_len)
         self._execute_dummy_requests(so, cso, self.prefill_intermediate_tensors)
 
         # FIXME(RBLN): At the moment, a single request can’t access multiple
@@ -1961,6 +1974,11 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 )
                 assert current_intermediate_tensors is not None
 
+                logger.info(
+                    "Warm-up: decode (batch_bucket=%d, query_len=%d)",
+                    batch_bucket_size,
+                    query_len,
+                )
                 if self.specialized_moe_decode:
                     self._execute_dummy_requests(
                         so,
@@ -2003,6 +2021,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 batch_bucket_size
             )
             assert current_intermediate_tensors is not None
+            logger.info("Warm-up: sampler (decode_batch=%d)", decode_batch)
             self._execute_dummy_requests(so, cso, current_intermediate_tensors)
 
     def _add_dummy_requests(
@@ -2683,16 +2702,24 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 runtime._copy_kv_cache(op.src_block_id, op.dst_block_id, op.num_tokens)
 
     @staticmethod
+    def _is_kv_connector_warm_up_phase(scheduler_output: "SchedulerOutput") -> bool:
+        # Warmup runs `_execute_dummy_requests` with synthetic SchedulerOutput
+        # whose `kv_connector_metadata` is None. The connector lifecycle
+        # (bind/wait/clear) must skip this phase, otherwise stateful
+        # connectors (e.g. LMCache) assert on missing bound metadata.
+        return scheduler_output.kv_connector_metadata is None
+
+    @staticmethod
     def maybe_get_kv_connector_output(
         scheduler_output: "SchedulerOutput",
         defer_finalize: bool = False,
     ) -> AbstractContextManager[KVConnectorOutput | None]:
-        warm_up_phase = scheduler_output.kv_connector_metadata is None
+        skip = RBLNModelRunner._is_kv_connector_warm_up_phase(scheduler_output)
         return (
             KVConnectorModelRunnerMixin._get_kv_connector_output(
                 scheduler_output, defer_finalize=defer_finalize
             )
-            if has_kv_transfer_group() and not warm_up_phase
+            if has_kv_transfer_group() and not skip
             else nullcontext()
         )
 
@@ -3009,6 +3036,11 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         is_last_prefill = (
                             num_computed + self.max_num_tokens
                         ) >= num_prompted
+
+                        if self.use_eagle():
+                            hidden_states = hidden_states.flatten(0, -2)
+                            sample_hidden_states = hidden_states[logits_indices]
+
                         if not is_last_prefill[0]:  # noqa: SIM108
                             # chunked prefill(#0~#N-1, intermediate)
                             # token_indices = torch.tensor([max_num_seqs-1])
@@ -3018,12 +3050,9 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                             # chunked prefill(#N, final)
                             # token_indices = torch.tensor([last_seq_idx-1])
                             # selected_token_indices == token_indices
-                            logits = logits
+                            if self.use_eagle():
+                                logits = logits[logits_indices]
 
-                        if self.use_eagle():
-                            hidden_states = hidden_states.flatten(0, -2)
-                            sample_hidden_states = hidden_states[logits_indices]
-                            logits = logits[logits_indices]
                     else:  # decode
                         # selected_token_indices is for valid decode tokens
                         # token_indices == None, selected = torch.tensor([0])
@@ -3116,6 +3145,10 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         with record_function_or_nullcontext("Sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
+        is_intermediate_prefill = (
+            self.is_prefill_phase() and logits is not None and logits.shape[0] == 0
+        )
+
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
             with record_function_or_nullcontext("Draft"):
@@ -3129,6 +3162,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     spec_decode_metadata,
                     spec_decode_common_attn_metadata,
                     slot_mappings,
+                    is_intermediate_prefill=is_intermediate_prefill,
                 )
 
         spec_config = self.speculative_config
@@ -3193,8 +3227,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # Finalize KV connector (wait_for_save + clear metadata) after
         # draft model runs. Deferred from target model forward to allow
-        # draft model to also save its KV cache.
-        if spec_config is not None:
+        # draft model to also save its KV cache. Skip during warmup —
+        # the connector context was bypassed in maybe_get_kv_connector_output,
+        # so no metadata was bound.
+        if spec_config is not None and not self._is_kv_connector_warm_up_phase(
+            scheduler_output
+        ):
             self.finalize_kv_connector()
 
         # FIXME(jiwoo.park) EPLB is not supported in RBLN
@@ -3289,7 +3327,9 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         spec_decode_metadata: SpecDecodeMetadata | None,
         common_attn_metadata: CommonAttentionMetadata,
         slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None,
-    ) -> list[list[int]] | torch.Tensor:
+        *,
+        is_intermediate_prefill: bool = False,
+    ) -> list[list[int]] | torch.Tensor | None:
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         spec_config = self.speculative_config
         assert spec_config is not None
@@ -3309,6 +3349,9 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         elif spec_config.method == "medusa":
             assert isinstance(sampled_token_ids, list)
             assert isinstance(self.drafter, RBLNMedusaProposer)
+
+            if is_intermediate_prefill:
+                return [[] for _ in self.input_batch.req_ids]
 
             if spec_decode_metadata is None:
                 # prefill: hidden states are already per-request
@@ -3340,18 +3383,41 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 "sampled_token_ids should be a torch.Tensor."
             )
 
-            next_token_ids, valid_sampled_tokens_count = (
-                self.drafter.prepare_next_token_ids_padded(
-                    common_attn_metadata,
-                    sampled_token_ids,
-                    self.requests,
-                    self.input_batch,
-                    self.discard_request_mask.gpu,
+            if is_intermediate_prefill:
+                num_reqs = self.input_batch.num_reqs
+                dummy_sampled_token_ids = torch.full(
+                    (num_reqs, 1),
+                    -1,
+                    dtype=torch.int32,
+                    device=self.device,
                 )
-            )
-            self._copy_valid_sampled_token_count(
-                next_token_ids, valid_sampled_tokens_count
-            )
+                discard_request_mask = torch.ones(
+                    num_reqs,
+                    dtype=torch.bool,
+                    device=self.device,
+                )
+                next_token_ids, valid_sampled_tokens_count = (
+                    self.drafter.prepare_next_token_ids_padded(
+                        common_attn_metadata,
+                        dummy_sampled_token_ids,
+                        self.requests,
+                        self.input_batch,
+                        discard_request_mask,
+                    )
+                )
+            else:
+                next_token_ids, valid_sampled_tokens_count = (
+                    self.drafter.prepare_next_token_ids_padded(
+                        common_attn_metadata,
+                        sampled_token_ids,
+                        self.requests,
+                        self.input_batch,
+                        self.discard_request_mask.gpu,
+                    )
+                )
+                self._copy_valid_sampled_token_count(
+                    next_token_ids, valid_sampled_tokens_count
+                )
 
             target_hidden_states = hidden_states
             num_rejected_tokens_gpu = None
@@ -3393,18 +3459,29 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             else:
                 mm_embed_inputs = None
 
-            draft_token_ids = self.drafter.propose(
-                target_token_ids=target_token_ids,
-                target_positions=target_positions,
-                target_hidden_states=target_hidden_states,
-                next_token_ids=next_token_ids,
-                token_indices_to_sample=token_indices_to_sample,
-                sampling_metadata=sampling_metadata,
-                common_attn_metadata=common_attn_metadata,
-                mm_embed_inputs=mm_embed_inputs,
-                num_rejected_tokens_gpu=num_rejected_tokens_gpu,
-                slot_mappings=slot_mappings,
-            )
+            if is_intermediate_prefill:
+                draft_token_ids = None
+                self.drafter.prefill_only(
+                    target_token_ids=target_token_ids,
+                    target_positions=target_positions,
+                    target_hidden_states=target_hidden_states,
+                    next_token_ids=next_token_ids,
+                    common_attn_metadata=common_attn_metadata,
+                    mm_embed_inputs=mm_embed_inputs,
+                )
+            else:
+                draft_token_ids = self.drafter.propose(
+                    target_token_ids=target_token_ids,
+                    target_positions=target_positions,
+                    target_hidden_states=target_hidden_states,
+                    next_token_ids=next_token_ids,
+                    token_indices_to_sample=token_indices_to_sample,
+                    sampling_metadata=sampling_metadata,
+                    common_attn_metadata=common_attn_metadata,
+                    mm_embed_inputs=mm_embed_inputs,
+                    num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                    slot_mappings=slot_mappings,
+                )
 
         return draft_token_ids
 
@@ -4386,7 +4463,38 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             for kv_cache, name in zip(self.kv_caches, kv_cache_names):
                 self.compile_context.mark_static_address(kv_cache, name)
 
+        self._log_kv_cache_info(kv_cache_config, kv_caches)
         return kv_caches
+
+    def _log_kv_cache_info(
+        self,
+        kv_cache_config: KVCacheConfig,
+        kv_caches: dict[str, torch.Tensor],
+    ) -> None:
+        total_bytes = sum(t.size for t in kv_cache_config.kv_cache_tensors)
+        logger.info(
+            "KV cache: num_blocks=%d, num_groups=%d, num_tensors=%d, total=%.3f GiB",
+            kv_cache_config.num_blocks,
+            len(kv_cache_config.kv_cache_groups),
+            len(kv_cache_config.kv_cache_tensors),
+            total_bytes / 1024**3,
+        )
+        # Group layers by (shape, dtype)
+        groups: dict[Any, list[str]] = defaultdict(list)
+        for layer_name, tensor in kv_caches.items():
+            key: Any
+            if isinstance(tensor, list):
+                key = tuple((tuple(s.shape), str(s.dtype)) for s in tensor)
+            else:
+                key = (tuple(tensor.shape), str(tensor.dtype))
+            groups[key].append(layer_name)
+        for key, layer_names in groups.items():
+            logger.info(
+                "KV cache: %d layer(s) shape/dtype=%s, e.g. %s",
+                len(layer_names),
+                key,
+                layer_names[0],
+            )
 
     def maybe_add_kv_sharing_layers_to_kv_cache_groups(
         self, kv_cache_config: KVCacheConfig
@@ -4415,6 +4523,20 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     self.kv_sharing_fast_prefill_eligible_layers.add(layer_name)
                 else:
                     break
+
+    @staticmethod
+    def _propagate_runtime_holder(group: object, runtime_holder: list) -> None:
+        """Pass runtime_holder to every connector exposing set_runtime_holder.
+
+        Walks into ``MultiConnector._connectors`` recursively because
+        MultiConnector does not implement this RBLN-specific method, so a
+        plain hasattr check on the top-level group would silently skip the
+        nested LMCache/RBLN connector that actually needs the holder.
+        """
+        if hasattr(group, "set_runtime_holder"):
+            group.set_runtime_holder(runtime_holder)
+        for child in getattr(group, "_connectors", ()) or ():
+            RBLNModelRunner._propagate_runtime_holder(child, runtime_holder)
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """
@@ -4506,8 +4628,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
             kv_transfer_group.set_host_xfer_buffer_ops(rbln_copy_kv_blocks)
 
-            if hasattr(kv_transfer_group, "set_runtime_holder"):
-                kv_transfer_group.set_runtime_holder(self.runtime_holder)
+            self._propagate_runtime_holder(kv_transfer_group, self.runtime_holder)
 
         if self.dcp_world_size > 1:
             layer_type = cast(type[Any], AttentionLayerBase)

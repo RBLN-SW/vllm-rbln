@@ -1,27 +1,20 @@
-name: Trigger FSW PR CI for vLLM-RBLN
+name: Trigger FSW Nightly E2E for vLLM-RBLN
 
 on:
-  pull_request:
-    types: [opened, synchronize, reopened]
+  schedule:
+    # Daily 02:00 KST (17:00 UTC)
+    - cron: '0 17 * * *'
   workflow_dispatch:
     inputs:
       ref:
-        description: "ref to checkout"
+        description: "vllm-rbln ref to test (branch, tag, or SHA). Defaults to dev."
         required: false
         type: string
-      python_version:
-        description: "Python version to use"
-        required: false
-        type: string
-        default: "3.12.9"
-      vllm_upstream_tag:
-        description: "vLLM upstream tag/version to use for tests (e.g., v0.9.1)"
-        required: false
-        type: string
+        default: dev
 
 jobs:
-  trigger-vllm-rbln-fsw-pr-ci:
-    if: github.repository_owner == 'RBLN-SW' && github.event_name == 'pull_request'
+  trigger-vllm-rbln-fsw-nightly-e2e:
+    if: github.repository_owner == 'RBLN-SW'
     runs-on: fsw-r18s-atom-ext-rbln-sw-general-c1m12
     strategy:
       fail-fast: false
@@ -38,12 +31,10 @@ jobs:
           with: |
             token: ${{ secrets.GIT_PAT }}
             repository: rebellions-sw/fsw-integration
-            event-type: vllm-rbln-pr-event
+            event-type: vllm-rbln-nightly-e2e
             client-payload: |
               {
-                "ref": "${{ github.event.pull_request.head.ref }}",
-                "sha": "${{ github.event.pull_request.head.sha }}",
-                "pr_number": "${{ github.event.number }}",
+                "ref": "${{ inputs.ref || 'dev' }}",
                 "actor": "${{ github.actor }}",
                 "vllm_version": "${{ matrix.vllm_version }}"
               }
