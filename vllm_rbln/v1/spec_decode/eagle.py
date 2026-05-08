@@ -594,7 +594,28 @@ class RBLNEagleProposer(EagleProposer):
                 if last_token_indices is not None
                 else last_hidden_states
             )
-            logits = self.model.compute_logits(sample_hidden_states)
+            # logits = self.model.compute_logits(sample_hidden_states)
+            # NOTE: Use scatter for RBLN compile instead of compute_logits' in-place remap.
+            logits = self.model.logits_processor(
+                self.model.lm_head, sample_hidden_states
+            )
+            if self.model.draft_id_to_target_id is not None:
+                
+                logits = logits[..., : self.model.config.draft_vocab_size]
+                base = torch.arange(
+                    self.model.config.draft_vocab_size,
+                    device=logits.device,
+                )
+                targets = base + self.model.draft_id_to_target_id
+                target_indices = targets.unsqueeze(0).expand(logits.shape[0], -1)
+                remapped_logits = logits.new_full(
+                    (
+                        logits.shape[0],
+                        self.model.config.vocab_size,
+                    ),
+                    float("-inf"),
+                )
+                logits = remapped_logits.scatter(1, target_indices, logits)
 
             return hidden_states, logits
 
