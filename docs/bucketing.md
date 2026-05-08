@@ -19,7 +19,7 @@ Key components:
 ## Enabling and Configuring
 
 Bucketing is controlled entirely through environment variables that the runner
-reads from `vllm_rbln.rbln_envs` at import time. Set them before launching the
+reads from `vllm_rbln.envs` at import time. Set them before launching the
 worker (e.g. in your launcher script or shell).
 
 | Variable | Default | Description |
