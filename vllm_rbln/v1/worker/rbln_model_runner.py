@@ -4200,12 +4200,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     kv_cache_tensor.size, dtype=torch.int8, device=device
                 )
             else:
-                device = (
-                    "cpu"
-                    if envs.VLLM_RBLN_USE_CUSTOM_KERNEL
-                    or not envs.VLLM_RBLN_COMPILE_MODEL
-                    else "meta"
-                )
+                device = "cpu" if not envs.VLLM_RBLN_COMPILE_MODEL else "meta"
                 tensor = torch.zeros(
                     kv_cache_tensor.size, dtype=torch.int8, device=device
                 )
