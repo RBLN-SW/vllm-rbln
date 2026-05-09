@@ -28,7 +28,10 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_b
 from vllm.v1.attention.backends.utils import (
     CommonAttentionMetadata,
 )
-from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    MLAAttentionSpec,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -1230,14 +1233,23 @@ class RBLNFlashAttentionMetadataBuilder(
         #   for each batch, have sequence offset
         # * seq_lens_tensor(otherwise)      - [B, P],
         #   have dynamic size for each partition
+        if is_prefill:
+            seq_lens = seq_lens_tensor.to(self.device)
+        elif isinstance(self.kv_cache_spec, MLAAttentionSpec):
+            assert self.is_batch_attention_opt, "batch_attn_opt required for MLAAttention decoder"
+            seq_lens = seq_idx.to(self.device)
+        else:
+            if not self.is_batch_attention_opt or batch_pad <= 1:
+                seq_lens = seq_lens_tensor.to(self.device)
+            else:
+                seq_lens = seq_idx.to(self.device)
+
         attn_metadata = RBLNFlashAttentionMetadata(
             num_actual_tokens=num_actual_tokens,
             max_query_len=max_query_len,
             query_start_loc=query_start_loc,
             max_seq_len=query_max_seq_len,
-            seq_lens=seq_lens_tensor.to(self.device)
-            if not self.is_batch_attention_opt or is_prefill or batch_pad <= 1
-            else seq_idx.to(self.device),
+            seq_lens=seq_lens,
             block_tables=block_tables_tensor.to(self.device),
             slot_mapping=slot_mapping,
             use_cascade=False,
