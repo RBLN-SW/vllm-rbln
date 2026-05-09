@@ -405,12 +405,15 @@ def custom_moe_swiglu_group_dequantize(
     router_logits: torch.Tensor,
     group_size: torch.Tensor,
     topk: int,
+    renormalize: bool,
     e_score_correction_bias: torch.Tensor | None = None,
     gate_proj_bias: torch.Tensor | None = None,
     up_proj_bias: torch.Tensor | None = None,
     down_proj_bias: torch.Tensor | None = None,
     expert_map: torch.Tensor | None = None,
     dp_mask: torch.Tensor | None = None,
+    n_group: int | None = None,
+    topk_group: int | None = None,
 ) -> torch.Tensor:
     """
     Customized MoE SwiGLU operation.
@@ -426,6 +429,7 @@ def custom_moe_swiglu_group_dequantize(
     - router_logits: [batch*seq_len, num_experts]
     - group_size: group size for weight scale
     - topk: top k experts to select
+    - renormalize: whether to renormalize the router logits
     - e_score_correction_bias:
     - gate_proj_bias: [num_experts, intermediate_size]
     - up_proj_bias: [num_experts, intermediate_size]
@@ -457,22 +461,34 @@ def custom_moe_swiglu_group_dequantize(
         return weight.to(hidden_states.dtype) * expanded.to(hidden_states.dtype)
 
     in_block_size = int(group_size.item())
-    gate_out_block = (
-        gate_proj_weight.shape[1] + gate_proj_scale.shape[1] - 1
-    ) // gate_proj_scale.shape[1]
-    down_out_block = (
-        down_proj_weight.shape[1] + down_proj_scale.shape[1] - 1
-    ) // down_proj_scale.shape[1]
 
-    gate_proj_weight_dq = _dequantize_blockwise_weight(
-        gate_proj_weight, gate_proj_scale, in_block_size, gate_out_block
-    )
-    up_proj_weight_dq = _dequantize_blockwise_weight(
-        up_proj_weight, up_proj_scale, in_block_size, gate_out_block
-    )
-    down_proj_weight_dq = _dequantize_blockwise_weight(
-        down_proj_weight, down_proj_scale, in_block_size, down_out_block
-    )
+    if in_block_size == 0:
+        gate_proj_weight_dq = gate_proj_weight.to(
+            hidden_states.dtype
+        ) * gate_proj_scale.to(hidden_states.dtype)
+        up_proj_weight_dq = up_proj_weight.to(hidden_states.dtype) * up_proj_scale.to(
+            hidden_states.dtype
+        )
+        down_proj_weight_dq = down_proj_weight.to(
+            hidden_states.dtype
+        ) * down_proj_scale.to(hidden_states.dtype)
+    else:
+        gate_out_block = (
+            gate_proj_weight.shape[1] + gate_proj_scale.shape[1] - 1
+        ) // gate_proj_scale.shape[1]
+        down_out_block = (
+            down_proj_weight.shape[1] + down_proj_scale.shape[1] - 1
+        ) // down_proj_scale.shape[1]
+
+        gate_proj_weight_dq = _dequantize_blockwise_weight(
+            gate_proj_weight, gate_proj_scale, in_block_size, gate_out_block
+        )
+        up_proj_weight_dq = _dequantize_blockwise_weight(
+            up_proj_weight, up_proj_scale, in_block_size, gate_out_block
+        )
+        down_proj_weight_dq = _dequantize_blockwise_weight(
+            down_proj_weight, down_proj_scale, in_block_size, down_out_block
+        )
 
     routing_weights = router_logits.float()
     scores_for_choice = routing_weights
@@ -481,9 +497,10 @@ def custom_moe_swiglu_group_dequantize(
 
     _, topk_ids = torch.topk(scores_for_choice, topk, dim=-1, sorted=False)
     topk_weights = routing_weights.gather(1, topk_ids)
-    topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True).clamp_min(
-        1e-20
-    )
+    if renormalize:
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True).clamp_min(
+            1e-20
+        )
     topk_weights = topk_weights.to(hidden_states.dtype)
 
     if dp_mask is not None:
@@ -545,12 +562,15 @@ def custom_moe_swiglu_group_dequantize_fake(
     router_logits: torch.Tensor,
     group_size: torch.Tensor,
     topk: int,
+    renormalize: bool,
     e_score_correction_bias: torch.Tensor | None = None,
     gate_proj_bias: torch.Tensor | None = None,
     up_proj_bias: torch.Tensor | None = None,
     down_proj_bias: torch.Tensor | None = None,
     expert_map: torch.Tensor | None = None,
     dp_mask: torch.Tensor | None = None,
+    n_group: int | None = None,
+    topk_group: int | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
 
@@ -811,6 +831,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 max_w13_scales, requires_grad=False
             )
 
+        if getattr(layer, "_expert_map", None) is not None:
+            layer._expert_map_list = layer._expert_map.data.to(
+                dtype=torch.int32
+            ).tolist()
+
     def select_gemm_impl(
         self,
         prepare_finalize: mk.FusedMoEPrepareAndFinalizeModular,
@@ -871,6 +896,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if use_moe_tokens_mask:
             tokens_mask = get_tokens_mask(num_tokens)
 
+        if layer.use_grouped_topk:
+            n_group = layer.num_expert_group
+            topk_group = layer.topk_group
+        else:
+            n_group = None
+            topk_group = None
+
         final_hidden_states = (
             torch.ops.rbln_custom_ops.custom_moe_swiglu_group_dequantize(
                 hidden_states,
@@ -883,12 +915,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 router_logits,
                 torch.tensor(self.weight_block_size[1], dtype=torch.int32),
                 layer.top_k,
+                layer.renormalize,
                 e_score_correction_bias,
                 None,  # gate_proj_bias
                 None,  # up_proj_bias
                 None,  # down_proj_bias
                 expert_map_const,
                 tokens_mask,
+                n_group,
+                topk_group,
             )
         )
 
