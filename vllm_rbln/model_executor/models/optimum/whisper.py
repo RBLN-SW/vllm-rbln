@@ -96,14 +96,14 @@ class RBLNOptimumWhisperForConditionalGeneration(
             )
 
         cache_position = torch.zeros(request_nums, 1, dtype=torch.int32)
-
+        dummy_input_ids = torch.zeros(request_nums, 1, dtype=torch.long)
         # In whisper model,
         # decoder input is always required in prefill step,
         # so is_prompt=False is set for both prefill and decode step.
         kwargs = self.preprocess_for_decoder(
             is_prompt=False,
             block_tables=block_tables,
-            input_ids=input_ids,
+            input_ids=dummy_input_ids if is_prompt else input_ids,
             cache_position=cache_position,
             input_block_ids=valid_block_ids,
         )
@@ -115,21 +115,28 @@ class RBLNOptimumWhisperForConditionalGeneration(
             self.batch_size, self.dec_max_seq_len, dtype=self.dtype
         )
         if is_prompt:
-            decoder_input_ids = torch.full(
-                (self.batch_size, 1),
-                self.model.config.decoder_start_token_id,
-                dtype=torch.long,
-            )
-            for batch_idx in valid_block_ids:
-                decoder_cache_position[batch_idx] = 0
-                decoder_attention_mask[batch_idx, 0] = 1
-                self.dec_lengths[batch_idx] = 1
-            decoder_output = self.model.decoder(
-                decoder_input_ids=decoder_input_ids.contiguous(),
-                decoder_attention_mask=decoder_attention_mask,
-                cache_position=decoder_cache_position,
-                block_tables=decoder_block_tables,
-            )
+            # valid_block_ids has length 1 in prefill.
+            batch_idx = valid_block_ids[0]
+            token_sequence = input_ids[0].tolist()
+            for step, token_id in enumerate(token_sequence):
+                step_decoder_input_ids = torch.full(
+                    (self.batch_size, 1),
+                    token_id,
+                    dtype=torch.long,
+                )
+                step_cache_position = decoder_cache_position.clone()
+                step_attention_mask = torch.zeros(
+                    self.batch_size, self.dec_max_seq_len, dtype=self.dtype
+                )
+                step_cache_position[batch_idx] = step
+                step_attention_mask[batch_idx, : step + 1] = 1
+                decoder_output = self.model.decoder(
+                    decoder_input_ids=step_decoder_input_ids.contiguous(),
+                    decoder_attention_mask=step_attention_mask,
+                    cache_position=step_cache_position,
+                    block_tables=decoder_block_tables,
+                )
+            self.dec_lengths[batch_idx] = len(token_sequence)
 
         else:
             decoder_input_ids = kwargs.pop("input_ids")
