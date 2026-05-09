@@ -95,50 +95,51 @@ class RBLNOptimumWhisperForConditionalGeneration(
                 block_tables=block_tables.squeeze(0).to(torch.int16),
             )
 
-        cache_position = torch.zeros(request_nums, 1, dtype=torch.int32)
-        dummy_input_ids = torch.zeros(request_nums, 1, dtype=torch.long)
-        # In whisper model,
-        # decoder input is always required in prefill step,
-        # so is_prompt=False is set for both prefill and decode step.
-        kwargs = self.preprocess_for_decoder(
-            is_prompt=False,
-            block_tables=block_tables,
-            input_ids=dummy_input_ids if is_prompt else input_ids,
-            cache_position=cache_position,
-            input_block_ids=valid_block_ids,
-        )
-        decoder_cache_position = kwargs.pop("cache_position")
-        decoder_block_tables = kwargs.pop("block_tables")
-
         # Whisper model does not support bucketing.
         decoder_attention_mask = torch.zeros(
             self.batch_size, self.dec_max_seq_len, dtype=self.dtype
         )
         if is_prompt:
             # valid_block_ids has length 1 in prefill.
+            assert valid_block_ids.shape[0] == 1, (
+                "Whisper only supports batch_size=1 in prefill step."
+            )
             batch_idx = valid_block_ids[0]
             token_sequence = input_ids[0].tolist()
+            step_decoder_input_ids = torch.zeros(self.batch_size, 1, dtype=torch.long)
+            decoder_block_tables = torch.full(
+                (self.batch_size, 1), batch_idx, dtype=torch.int16
+            )
+            decoder_cache_position = torch.zeros(self.batch_size, 1, dtype=torch.int32)
             for step, token_id in enumerate(token_sequence):
-                step_decoder_input_ids = torch.full(
-                    (self.batch_size, 1),
-                    token_id,
-                    dtype=torch.long,
-                )
-                step_cache_position = decoder_cache_position.clone()
-                step_attention_mask = torch.zeros(
-                    self.batch_size, self.dec_max_seq_len, dtype=self.dtype
-                )
-                step_cache_position[batch_idx] = step
-                step_attention_mask[batch_idx, : step + 1] = 1
+                step_decoder_input_ids[:, 0] = token_id
+
+                # cache_position: where in the KV cache this token's K/V is stored.
+                # attention_mask: which positions this token may attend to.
+                # Causal, so only past and current positions are visible; the
+                # mask grows by one bit per step rather than being rebuilt.
+                # e.g. step=2 -> cache_position=2, mask=[1,1,1,0,...,0]
+                decoder_cache_position[:] = step
+                decoder_attention_mask[:, step] = 1
                 decoder_output = self.model.decoder(
                     decoder_input_ids=step_decoder_input_ids.contiguous(),
-                    decoder_attention_mask=step_attention_mask,
-                    cache_position=step_cache_position,
+                    decoder_attention_mask=decoder_attention_mask,
+                    cache_position=decoder_cache_position,
                     block_tables=decoder_block_tables,
                 )
             self.dec_lengths[batch_idx] = len(token_sequence)
 
         else:
+            cache_position = torch.zeros(request_nums, 1, dtype=torch.int32)
+            kwargs = self.preprocess_for_decoder(
+                is_prompt=False,
+                block_tables=block_tables,
+                input_ids=input_ids,
+                cache_position=cache_position,
+                input_block_ids=valid_block_ids,
+            )
+            decoder_cache_position = kwargs.pop("cache_position")
+            decoder_block_tables = kwargs.pop("block_tables")
             decoder_input_ids = kwargs.pop("input_ids")
             # Generate cache_position using dec_lengths
             for batch_idx in valid_block_ids:
