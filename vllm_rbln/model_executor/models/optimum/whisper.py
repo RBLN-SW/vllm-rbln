@@ -117,22 +117,18 @@ class RBLNOptimumWhisperForConditionalGeneration(
             decoder_block_tables = torch.full(
                 (self.batch_size, 1), model_input.dummy_block - 1, dtype=torch.int16
             )
-            decoder_block_tables[0, 0] = batch_idx
+            decoder_block_tables[batch_idx, 0] = batch_idx
             decoder_cache_position = torch.zeros(self.batch_size, 1, dtype=torch.int32)
             for step, token_id in enumerate(token_sequence):
-                step_decoder_input_ids[0, 0] = token_id
+                step_decoder_input_ids[batch_idx, 0] = token_id
 
                 # cache_position: where in the KV cache this token's K/V is stored.
                 # attention_mask: which positions this token may attend to.
                 # Causal, so only past and current positions are visible; the
                 # mask grows by one bit per step rather than being rebuilt.
                 # e.g. step=2 -> cache_position=2, mask=[1,1,1,0,...,0]
-                decoder_cache_position[:] = step
-                decoder_attention_mask[:, step] = 1
-                print("[prefill]@@@ step_decoder_input_ids", step_decoder_input_ids)
-                print("[prefill]@@@ decoder_attention_mask", decoder_attention_mask)
-                print("[prefill]@@@ decoder_cache_position", decoder_cache_position)
-                print("[prefill]@@@ decoder_block_tables", decoder_block_tables)
+                decoder_cache_position[batch_idx, 0] = step
+                decoder_attention_mask[batch_idx, step] = 1
                 decoder_output = self.model.decoder(
                     decoder_input_ids=step_decoder_input_ids.contiguous(),
                     decoder_attention_mask=decoder_attention_mask,
@@ -163,10 +159,6 @@ class RBLNOptimumWhisperForConditionalGeneration(
                     batch_idx, : decoder_cache_position[batch_idx] + 1
                 ] = 1
                 self.dec_lengths[batch_idx] += 1
-            print("[decoder]@@@ decoder_input_ids", decoder_input_ids)
-            print("[decoder]@@@ decoder_attention_mask", decoder_attention_mask)
-            print("[decoder]@@@ decoder_cache_position", decoder_cache_position)
-            print("[decoder]@@@ decoder_block_tables", decoder_block_tables)
             decoder_output = self.model.decoder(
                 decoder_input_ids=decoder_input_ids.contiguous(),
                 decoder_attention_mask=decoder_attention_mask,
