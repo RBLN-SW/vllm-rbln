@@ -36,7 +36,8 @@ dependencies = [
     "setuptools>=64",
     "setuptools-scm>=8",
     "pyyaml",
-    "datasets",
+    # datasets <3 references pa.PyExtensionType, removed in pyarrow >=21
+    "datasets>=3.3.0,<=3.6.0",
     "qwen_vl_utils",
     "vllm>=0.18.0,<0.20",
     "torch",
