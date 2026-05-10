@@ -112,7 +112,11 @@ class RBLNInputBatch(InputBatch):
             # step pooling during the sampling/pooling process.
             # Hence copy these tensors only when there are requests which
             # need penalties/step_pooler to be applied.
-            prompt_token_ids = self._make_prompt_token_ids_tensor()
+            # vLLM 0.19 renamed _make_prompt_token_ids_tensor to _cpu_tensor.
+            if hasattr(self, "_make_prompt_token_ids_cpu_tensor"):
+                prompt_token_ids = self._make_prompt_token_ids_cpu_tensor()
+            else:
+                prompt_token_ids = self._make_prompt_token_ids_tensor()
         else:
             prompt_token_ids = None
 
