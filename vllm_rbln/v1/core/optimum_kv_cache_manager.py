@@ -16,6 +16,7 @@
 import torch
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
+from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request
@@ -42,6 +43,7 @@ class RBLNKVCacheManager(KVCacheManager):
         metrics_collector: KVCacheMetricsCollector | None = None,
         attn_block_size: int | None = None,
         max_num_seqs: int = 1,
+        is_encoder_decoder: bool = False,
     ) -> None:
         """
         RBLNKVCacheManager = KVCacheManager + PrefixKVCacheManager.
@@ -93,6 +95,27 @@ class RBLNKVCacheManager(KVCacheManager):
         self.empty_kv_cache_blocks = KVCacheBlocks(
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
+
+        # Encoder-decoder models (e.g. Whisper) drive their decoder runtime at
+        # a fixed compiled batch size even during prefill, where only one
+        # request is scheduled. Reserve a dedicated scratch block now so the
+        # padding slots can write throwaway K/V without touching real request
+        # blocks or the vLLM null_block. Prefix caching has its own dummy-block
+        # mechanism via prefix_cache_manager, so we only reserve here when
+        # caching is disabled.
+        self._reserved_dummy_block: KVCacheBlock | None = None
+        if is_encoder_decoder:
+            free_queue = self.block_pool.free_block_queue
+            if free_queue.num_free_blocks == 0:
+                raise RuntimeError(
+                    "No free block available to reserve as a scratch dummy "
+                    "block for encoder-decoder padding."
+                )
+            self._reserved_dummy_block = free_queue.popleft()
+            logger.info(
+                "Reserved block %d as a scratch dummy for encoder-decoder padding.",
+                self._reserved_dummy_block.block_id,
+            )
 
     def free(self, request: Request, preemption: bool = False) -> None:
         """Free the blocks allocated for the request."""
@@ -210,4 +233,11 @@ class RBLNKVCacheManager(KVCacheManager):
         return self.prefix_cache_manager.get_blocks(request_id)
 
     def get_dummy_block(self) -> int:
-        return self.prefix_cache_manager.get_dummy_block()
+        if self.enable_caching:
+            return self.prefix_cache_manager.get_dummy_block()
+        if self._reserved_dummy_block is None:
+            raise RuntimeError(
+                "Dummy block was not reserved. Construct RBLNKVCacheManager "
+                "with is_encoder_decoder=True when padding is required."
+            )
+        return self._reserved_dummy_block.block_id

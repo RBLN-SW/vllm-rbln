@@ -107,12 +107,20 @@ class RBLNOptimumWhisperForConditionalGeneration(
             batch_idx = valid_block_ids[0]
             token_sequence = input_ids[0].tolist()
             step_decoder_input_ids = torch.zeros(self.batch_size, 1, dtype=torch.long)
-            decoder_block_tables = torch.full(
-                (self.batch_size, 1), batch_idx, dtype=torch.int16
+            # The decoder runtime is compiled at self.batch_size, so prefill
+            # must still feed every slot. Point unused slots at a scratch
+            # block so their K/V writes don't touch the active prefill block
+            # or any other request's KV cache.
+            assert model_input.dummy_block is not None, (
+                "Whisper prefill requires dummy_block from the scheduler."
             )
+            decoder_block_tables = torch.full(
+                (self.batch_size, 1), model_input.dummy_block - 1, dtype=torch.int16
+            )
+            decoder_block_tables[0, 0] = batch_idx
             decoder_cache_position = torch.zeros(self.batch_size, 1, dtype=torch.int32)
             for step, token_id in enumerate(token_sequence):
-                step_decoder_input_ids[:, 0] = token_id
+                step_decoder_input_ids[0, 0] = token_id
 
                 # cache_position: where in the KV cache this token's K/V is stored.
                 # attention_mask: which positions this token may attend to.
@@ -121,6 +129,10 @@ class RBLNOptimumWhisperForConditionalGeneration(
                 # e.g. step=2 -> cache_position=2, mask=[1,1,1,0,...,0]
                 decoder_cache_position[:] = step
                 decoder_attention_mask[:, step] = 1
+                print("[prefill]@@@ step_decoder_input_ids", step_decoder_input_ids)
+                print("[prefill]@@@ decoder_attention_mask", decoder_attention_mask)
+                print("[prefill]@@@ decoder_cache_position", decoder_cache_position)
+                print("[prefill]@@@ decoder_block_tables", decoder_block_tables)
                 decoder_output = self.model.decoder(
                     decoder_input_ids=step_decoder_input_ids.contiguous(),
                     decoder_attention_mask=decoder_attention_mask,
@@ -131,12 +143,15 @@ class RBLNOptimumWhisperForConditionalGeneration(
 
         else:
             cache_position = torch.zeros(request_nums, 1, dtype=torch.int32)
+            if model_input.dummy_block is not None:
+                dummy_block = model_input.dummy_block - 1
             kwargs = self.preprocess_for_decoder(
                 is_prompt=False,
                 block_tables=block_tables,
                 input_ids=input_ids,
                 cache_position=cache_position,
                 input_block_ids=valid_block_ids,
+                dummy_block=dummy_block,
             )
             decoder_cache_position = kwargs.pop("cache_position")
             decoder_block_tables = kwargs.pop("block_tables")
@@ -148,7 +163,10 @@ class RBLNOptimumWhisperForConditionalGeneration(
                     batch_idx, : decoder_cache_position[batch_idx] + 1
                 ] = 1
                 self.dec_lengths[batch_idx] += 1
-
+            print("[decoder]@@@ decoder_input_ids", decoder_input_ids)
+            print("[decoder]@@@ decoder_attention_mask", decoder_attention_mask)
+            print("[decoder]@@@ decoder_cache_position", decoder_cache_position)
+            print("[decoder]@@@ decoder_block_tables", decoder_block_tables)
             decoder_output = self.model.decoder(
                 decoder_input_ids=decoder_input_ids.contiguous(),
                 decoder_attention_mask=decoder_attention_mask,
