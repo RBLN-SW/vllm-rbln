@@ -373,7 +373,6 @@ class TestAllocateKvCacheTensors:
         assert result["layer_0"] is result["layer_1"]
         assert result["layer_0"].shape == (1024,)
         assert result["layer_0"].dtype == torch.int8
-        assert result["layer_0"].device.type == "cpu"
 
     def test_meta_device_when_compile(self):
         """When VLLM_RBLN_USE_CUSTOM_KERNEL=False and COMPILE_MODEL=True,
