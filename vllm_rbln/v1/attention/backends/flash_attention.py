@@ -1123,7 +1123,7 @@ class RBLNFlashAttentionMetadataBuilder(
             )
             query_seq_lens = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
             num_computed_tokens_cpu = seq_lens_cpu - query_seq_lens
-            seq_idx = positions[query_start_loc[:num_reqs].to("cpu")].view(-1, 1)
+            seq_idx = positions[query_start_loc_cpu[:num_reqs]].view(-1, 1)
         else:
             query_seq_lens = query_start_loc[1:] - query_start_loc[:-1]
             num_computed_tokens = seq_lens - query_seq_lens
