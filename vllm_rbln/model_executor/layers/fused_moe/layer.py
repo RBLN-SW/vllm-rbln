@@ -42,8 +42,6 @@ def fused_moe_custom__init__(self, *args, **kwargs):
     self.expert_map_const = (
         self.expert_map.tolist() if self.expert_map is not None else None
     )
-    self.dp_size = self.moe_parallel_config.dp_size
-    self.dp_rank = self.moe_parallel_config.dp_rank
 
 
 # Define custom_moe_glu op for VLLM_RBLN_MOE_CUSTOM_KERNEL
@@ -320,7 +318,7 @@ def fused_moe_forward_rbln(
 
     if self.moe_parallel_config.dp_size > 1:
         org_hidden_shape = hidden_states.shape
-        R = self.dp_size
+        R = self.moe_parallel_config.dp_size
         num_tokens = org_hidden_shape[:-1].numel()
         t = num_tokens
         max_pad = get_forward_context().dp_metadata.max_pads_across_dp.shape[0]
@@ -417,9 +415,9 @@ def fused_moe_forward_rbln(
             # Prepare per-rank router_logits slices
             e = E // R  # local experts per rank
             # send_rl: [E, max_pad] — this rank's routing for all experts
-            send_rl = all_routing_3d[:, self.dp_rank, :]  # (E, max_pad)
+            send_rl = all_routing_3d[:, self.moe_parallel_config.dp_rank, :]  # (E, max_pad)
             # recv_rl: [e, R*max_pad] — local experts' routing across all ranks
-            e_start = self.dp_rank * e
+            e_start = self.moe_parallel_config.dp_rank * e
             recv_rl = all_routing_3d[e_start : e_start + e].reshape(e, R * max_pad)  # (e, T)
 
         # --- Step 4: Dispatch tokens across DP ranks ---
@@ -433,7 +431,7 @@ def fused_moe_forward_rbln(
                     hidden_flat,
                     send_rl,
                     self.send_mask,
-                    self.dp_rank,
+                    self.moe_parallel_config.dp_rank,
                 )
             )
 
@@ -441,7 +439,7 @@ def fused_moe_forward_rbln(
             recv_buffer = torch.ops.rbln_custom_ops.ccl_all2all_x_kernel(
                 send_buffer,
                 send_sizes,
-                self.dp_size,
+                self.moe_parallel_config.dp_size,
                 CCL_ALL2ALL_GROUP_ID,
             )
 
@@ -450,7 +448,7 @@ def fused_moe_forward_rbln(
                 recv_buffer,
                 recv_rl,
                 hidden_flat,
-                self.dp_rank,
+                self.moe_parallel_config.dp_rank,
             )
 
             # unpacked: [R, max_pad, H] → flatten to [R*max_pad, H] for MoE
@@ -476,7 +474,7 @@ def fused_moe_forward_rbln(
                 torch.ops.rbln_custom_ops.ccl_combine_send(
                     combine_3d,
                     recv_rl,
-                    self.dp_rank,
+                    self.moe_parallel_config.dp_rank,
                 )
             )
 
@@ -484,7 +482,7 @@ def fused_moe_forward_rbln(
             combine_recv_buf = torch.ops.rbln_custom_ops.ccl_all2all_x_kernel(
                 combine_send_buf,
                 combine_send_sizes,
-                self.dp_size,
+                self.moe_parallel_config.dp_size,
                 CCL_ALL2ALL_GROUP_ID,
             )
 
@@ -495,8 +493,8 @@ def fused_moe_forward_rbln(
                 combine_recv_buf,
                 send_rl,
                 self.send_mask,
-                combine_3d[self.dp_rank],  # local rank's own contribution
-                self.dp_rank,
+                combine_3d[self.moe_parallel_config.dp_rank],  # local rank's own contribution
+                self.moe_parallel_config.dp_rank,
             )
             # final_hidden_states: (max_pad, H)
         else:
@@ -505,7 +503,7 @@ def fused_moe_forward_rbln(
                 # reduce_scatter: each rank receives only its own summed portion
                 hidden_shape_dp = (-1, 1, H_dim)
                 all_hidden_states = final_hidden_states.reshape(hidden_shape_dp)
-                assert all_hidden_states.shape[0] % self.dp_size == 0
+                assert all_hidden_states.shape[0] % self.moe_parallel_config.dp_size == 0
 
                 final_hidden_states = get_dp_group().reduce_scatter(all_hidden_states, dim=0)
                 assert final_hidden_states.shape[0] == max_pad
@@ -514,7 +512,7 @@ def fused_moe_forward_rbln(
                 hidden_shape_dp = (-1, 1, H_dim)
                 final_hidden_states = all_hidden_states.reshape(hidden_shape_dp)
 
-                start = self.dp_rank * max_pad
+                start = self.moe_parallel_config.dp_rank * max_pad
                 end = start + t
                 final_hidden_states = final_hidden_states[start:end]
 
@@ -661,8 +659,8 @@ def _fused_moe_init_with_all2all(self, *args, **kwargs):
     use_dispatch_all2all = envs.VLLM_RBLN_DISPATCH_ALL2ALL
     use_combine_all2all = envs.VLLM_RBLN_COMBINE_ALL2ALL
 
-    if self.dp_size > 1 and (use_dispatch_all2all or use_combine_all2all):
-        R = self.dp_size
+    if self.moe_parallel_config.dp_size > 1 and (use_dispatch_all2all or use_combine_all2all):
+        R = self.moe_parallel_config.dp_size
         E = self.global_num_experts
         # send_mask doubles as expert_map for combine_receive (same matrix)
         self.register_buffer(
@@ -678,10 +676,10 @@ def _fused_moe_init_with_all2all(self, *args, **kwargs):
             f"R={R}, E={E}, "
             f"send_mask={self.send_mask.shape}"
         )
-    elif self.dp_size > 1:
+    elif self.moe_parallel_config.dp_size > 1:
         logger.info(
             f"[RBLN] FusedMoE using all-gather dispatch: "
-            f"R={self.dp_size}, E={self.global_num_experts}"
+            f"R={self.moe_parallel_config.dp_size}, E={self.global_num_experts}"
         )
 
 
