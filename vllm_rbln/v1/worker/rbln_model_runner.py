@@ -1334,6 +1334,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         (batch_bucket_size, num_padded_tokens, num_tokens_across_dp) = (
             self.get_dp_padding(
                 total_num_scheduled_tokens,
+                num_reqs,
                 initial_batch_bucket_size,
                 num_padded_tokens,
                 is_prefill_phase,
@@ -1667,6 +1668,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     def get_dp_padding(
         self,
         num_tokens: int,
+        num_reqs: int,
         batch_bucket_size: int | None,
         num_padded_tokens: int | None = None,
         is_prefill: bool = False,
@@ -1696,21 +1698,31 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             )
             return (batch_bucket_size, num_padded_tokens, num_tokens_across_dp_cpu)
 
-        num_tokens_across_dp_cpu, max_decode_tokens = (
-            RBLNDPMetadata.num_tokens_across_dp_with_max_decode_tokens(
-                num_tokens, dp_size, dp_rank, is_prefill
+        num_tokens_across_dp_cpu, num_reqs_across_dp_cpu = (
+            RBLNDPMetadata.num_tokens_and_reqs_across_dp(
+                num_tokens, num_reqs, dp_size, dp_rank, is_prefill
             )
         )
 
-        any_prefill = max_decode_tokens is None
+        any_prefill = num_reqs_across_dp_cpu is None
         if any_prefill or not self.specialized_moe_decode:
             num_padded_tokens = self.max_num_batched_tokens
         else:
-            assert max_decode_tokens is not None
+            assert num_reqs_across_dp_cpu is not None
+            max_batch_size = int(torch.max(num_reqs_across_dp_cpu).item())
             batch_bucket_size = self.bucketing_manager.find_decode_batch_bucket(
-                max_decode_tokens
+                max_batch_size
             )
-            num_padded_tokens = batch_bucket_size
+            # For multi-token decode (e.g., speculative decoding), the
+            # padded-token buffer must fit batch_bucket_size * max_tokens_per_req
+            # so that the MoE tokens_mask covers every actual token position
+            # across DP. For single-token decode this reduces to batch_bucket_size.
+            clamped_reqs = num_reqs_across_dp_cpu.clamp(min=1)
+            tokens_per_req_per_rank = (
+                num_tokens_across_dp_cpu + clamped_reqs - 1
+            ) // clamped_reqs
+            max_tokens_per_req = int(tokens_per_req_per_rank.max().item())
+            num_padded_tokens = batch_bucket_size * max_tokens_per_req
 
         return batch_bucket_size, num_padded_tokens, num_tokens_across_dp_cpu
 
@@ -2437,7 +2449,9 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         (batch_bucket_size, num_padded_tokens, num_tokens_across_dp) = (
             self.get_dp_padding(
-                num_input_tokens, self.bucketing_manager.decode_batch_buckets[0]
+                num_input_tokens,
+                1,
+                self.bucketing_manager.decode_batch_buckets[0],
             )
         )
 
