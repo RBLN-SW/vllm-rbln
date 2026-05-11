@@ -1198,7 +1198,6 @@ class RBLNFlashAttentionMetadataBuilder(
             max_query_len=max_query_len,
             query_start_loc=query_start_loc,
             max_seq_len=query_max_seq_len,
-            seq_lens=seq_lens,
             seq_lens=seq_lens_tensor.to(self.device)
             if not self.is_batch_attention_opt or is_prefill or batch_pad <= 1
             else seq_idx.to(self.device),
