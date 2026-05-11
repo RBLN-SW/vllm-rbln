@@ -18,7 +18,7 @@ import math
 import fire
 from transformers import AutoTokenizer
 from vllm import AsyncEngineArgs, AsyncLLMEngine, SamplingParams
-from vllm.inputs.data import TokensPrompt
+from vllm.inputs import TokensPrompt
 
 SUFFIX = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
 
