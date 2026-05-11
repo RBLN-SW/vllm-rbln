@@ -217,7 +217,7 @@ def estimate_available_memory(
         buffer = buffer_per_runtime_per_core * num_runtimes
     available_dram_bytes -= buffer
 
-    rsd_replicas = (rsd_size // num_key_value_heads) or 1 if "ca" in device_name else 1
+    rsd_replicas = max(1, rsd_size // num_key_value_heads)
     available_dram_bytes = available_dram_bytes // rsd_replicas
 
     check_oom(available_dram_bytes)
