@@ -60,6 +60,9 @@ jobs:
     name: Pytest (${{ matrix.test_type.name }}, vllm ${{ matrix.vllm_version }})
     needs: [versions]
     runs-on: ${{ matrix.test_type.runner }}
+    # Dev vllm versions are partial-support; let them fail without failing the
+    # overall workflow. Stable versions stay required.
+    continue-on-error: ${{ contains(fromJSON(needs.versions.outputs.vllm_versions_dev), matrix.vllm_version) }}
     strategy:
       fail-fast: ${{ inputs.fail_fast }}
       matrix:
@@ -78,7 +81,7 @@ jobs:
               runner : "rbln-sw-k8s-general"
             },
           ]
-        vllm_version: ${{ fromJSON(needs.versions.outputs.vllm_versions) }}
+        vllm_version: ${{ fromJSON(needs.versions.outputs.vllm_versions_all) }}
     steps:
       - name: Checkout the vllm-rbln repository
         uses: actions/checkout@v4
@@ -206,6 +209,8 @@ jobs:
     name: Pytest (${{ matrix.test_type.name }}, vllm ${{ matrix.vllm_version }})
     needs: [versions]
     runs-on: ${{ matrix.test_type.runner }}
+    # Dev vllm versions are partial-support; see pytest job for rationale.
+    continue-on-error: ${{ contains(fromJSON(needs.versions.outputs.vllm_versions_dev), matrix.vllm_version) }}
     container:
       image: mcr.microsoft.com/devcontainers/python:3.12
     defaults:
@@ -229,7 +234,7 @@ jobs:
               runner : "rbln-sw-k8s-ca22-1"
             },
           ]
-        vllm_version: ${{ fromJSON(needs.versions.outputs.vllm_versions) }}
+        vllm_version: ${{ fromJSON(needs.versions.outputs.vllm_versions_all) }}
     steps:
       - name: Checkout the vllm-rbln repository
         uses: actions/checkout@v4
