@@ -53,13 +53,17 @@ on:
         type: string
 
 jobs:
+  versions:
+    uses: ./.github/workflows/rbln_utils_get_ci_versions.yaml
+
   pytest:
-    name: Pytest (${{ matrix.test_type.name }})
+    name: Pytest (${{ matrix.test_type.name }}, vllm ${{ matrix.vllm_version }})
+    needs: [versions]
     runs-on: ${{ matrix.test_type.runner }}
     strategy:
       fail-fast: ${{ inputs.fail_fast }}
       matrix:
-        test_type: 
+        test_type:
           [
             {
               name : "core",
@@ -74,6 +78,7 @@ jobs:
               runner : "rbln-sw-k8s-general"
             },
           ]
+        vllm_version: ${{ fromJSON(needs.versions.outputs.vllm_versions) }}
     steps:
       - name: Checkout the vllm-rbln repository
         uses: actions/checkout@v4
@@ -82,11 +87,13 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      - name: Parse vllm-cpu index URL from pyproject.toml
+      - name: Derive vllm-cpu index URL from matrix vllm_version
         id: parse_index_url
         run: |
-          VLLM_CPU_URL=$(python3 -c "import tomllib; f=open('pyproject.toml','rb'); config=tomllib.load(f); print(next(i['url'] for i in config.get('tool',{}).get('uv',{}).get('index',[]) if i.get('name')=='vllm-cpu'))")
-          echo "Parsed vllm-cpu URL: ${VLLM_CPU_URL}"
+          VERSION="${{ matrix.vllm_version }}"
+          PUBLIC="${VERSION%%+*}"
+          VLLM_CPU_URL="https://wheels.vllm.ai/${PUBLIC}/cpu"
+          echo "Derived vllm-cpu URL: ${VLLM_CPU_URL}"
           echo "VLLM_CPU_URL=${VLLM_CPU_URL}" >> $GITHUB_OUTPUT
 
       - name: Get commit message
@@ -108,7 +115,7 @@ jobs:
           COMMIT_MESSAGE: ${{ steps.get_commit_message.outputs.message }}
         run: |
           SKIP=false
-          
+
           case "${{ matrix.test_type.name }}" in
             "core")
               if [[ "$COMMIT_MESSAGE" == *"[skip core]"* ]]; then
@@ -126,7 +133,7 @@ jobs:
               fi
               ;;
           esac
-          
+
           echo "skip=$SKIP" >> $GITHUB_OUTPUT
           echo "Skip decision: $SKIP"
 
@@ -163,12 +170,13 @@ jobs:
         if: steps.should_skip.outputs.skip != 'true'
         run: |
           VLLM_CPU_URL="${{ steps.parse_index_url.outputs.VLLM_CPU_URL }}"
+          VLLM_PIN="vllm==${{ matrix.vllm_version }}"
           pip install packaging setuptools wheel simphile pynvml huggingface_hub setuptools_scm fire pytest pytest-asyncio
           if [ -n "${{ inputs.optimum_rbln_version }}" ]; then
-            pip install --force-reinstall --no-cache-dir dist/vllm_rbln*.whl --constraint <(echo "optimum-rbln==${{ inputs.optimum_rbln_version }}") --index-url http://pypi-cache.devpi.svc.cluster.local/root/pypi/+simple/ --extra-index-url "${VLLM_CPU_URL}" --extra-index-url https://download.pytorch.org/whl/cpu --trusted-host pypi-cache.devpi.svc.cluster.local --extra-index-url https://pypi.org/simple
+            pip install --force-reinstall --no-cache-dir dist/vllm_rbln*.whl "${VLLM_PIN}" --constraint <(echo "optimum-rbln==${{ inputs.optimum_rbln_version }}") --index-url http://pypi-cache.devpi.svc.cluster.local/root/pypi/+simple/ --extra-index-url "${VLLM_CPU_URL}" --extra-index-url https://download.pytorch.org/whl/cpu --trusted-host pypi-cache.devpi.svc.cluster.local --extra-index-url https://pypi.org/simple
             echo "optimum-rbln ${{ inputs.optimum_rbln_version }}"
           else
-            pip install --force-reinstall --no-cache-dir dist/vllm_rbln*.whl --index-url http://pypi-cache.devpi.svc.cluster.local/root/pypi/+simple/ --extra-index-url "${VLLM_CPU_URL}" --extra-index-url https://download.pytorch.org/whl/cpu --trusted-host pypi-cache.devpi.svc.cluster.local --extra-index-url https://pypi.org/simple
+            pip install --force-reinstall --no-cache-dir dist/vllm_rbln*.whl "${VLLM_PIN}" --index-url http://pypi-cache.devpi.svc.cluster.local/root/pypi/+simple/ --extra-index-url "${VLLM_CPU_URL}" --extra-index-url https://download.pytorch.org/whl/cpu --trusted-host pypi-cache.devpi.svc.cluster.local --extra-index-url https://pypi.org/simple
           fi
 
       - name: Run pytest
@@ -195,7 +203,8 @@ jobs:
           echo "Found [skip-${{ matrix.test_type.name }}] in commit message, skipping CI"
 
   pytest-arc:
-    name: Pytest (${{ matrix.test_type.name }})
+    name: Pytest (${{ matrix.test_type.name }}, vllm ${{ matrix.vllm_version }})
+    needs: [versions]
     runs-on: ${{ matrix.test_type.runner }}
     container:
       image: mcr.microsoft.com/devcontainers/python:3.12
@@ -205,7 +214,7 @@ jobs:
     strategy:
       fail-fast: ${{ inputs.fail_fast }}
       matrix:
-        test_type: 
+        test_type:
           [
             {
               name : "openai",
@@ -216,6 +225,7 @@ jobs:
               runner : "rbln-sw-k8s-ca22-1"
             },
           ]
+        vllm_version: ${{ fromJSON(needs.versions.outputs.vllm_versions) }}
     steps:
       - name: Checkout the vllm-rbln repository
         uses: actions/checkout@v4
@@ -228,11 +238,13 @@ jobs:
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      - name: Parse vllm-cpu index URL from pyproject.toml
+      - name: Derive vllm-cpu index URL from matrix vllm_version
         id: parse_index_url
         run: |
-          VLLM_CPU_URL=$(python3 -c "import tomllib; f=open('pyproject.toml','rb'); config=tomllib.load(f); print(next(i['url'] for i in config.get('tool',{}).get('uv',{}).get('index',[]) if i.get('name')=='vllm-cpu'))")
-          echo "Parsed vllm-cpu URL: ${VLLM_CPU_URL}"
+          VERSION="${{ matrix.vllm_version }}"
+          PUBLIC="${VERSION%%+*}"
+          VLLM_CPU_URL="https://wheels.vllm.ai/${PUBLIC}/cpu"
+          echo "Derived vllm-cpu URL: ${VLLM_CPU_URL}"
           echo "VLLM_CPU_URL=${VLLM_CPU_URL}" >> $GITHUB_OUTPUT
 
       - name: Get commit message
@@ -254,7 +266,7 @@ jobs:
           COMMIT_MESSAGE: ${{ steps.get_commit_message.outputs.message }}
         run: |
           SKIP=false
-          
+
           case "${{ matrix.test_type.name }}" in
             "openai")
               if [[ "$COMMIT_MESSAGE" == *"[skip openai]"* ]]; then
@@ -267,7 +279,7 @@ jobs:
               fi
               ;;
           esac
-          
+
           echo "skip=$SKIP" >> $GITHUB_OUTPUT
 
       - name: Install uv CLI
@@ -309,12 +321,13 @@ jobs:
           shell: bash
           command: |
             VLLM_CPU_URL="${{ steps.parse_index_url.outputs.VLLM_CPU_URL }}"
+            VLLM_PIN="vllm==${{ matrix.vllm_version }}"
             uv pip install --system packaging setuptools wheel simphile pynvml huggingface_hub setuptools_scm fire pytest pytest-asyncio pytest-xdist
             if [ -n "${{ inputs.optimum_rbln_version }}" ]; then
-              uv pip install --system --force-reinstall --no-cache-dir dist/vllm_rbln*.whl --constraint <(echo "optimum-rbln==${{ inputs.optimum_rbln_version }}") --index-url http://pypi-cache.devpi.svc.cluster.local/root/pypi/+simple/ --extra-index-url "${VLLM_CPU_URL}" --extra-index-url https://download.pytorch.org/whl/cpu  --extra-index-url https://pypi.org/simple --index-strategy unsafe-best-match
+              uv pip install --system --force-reinstall --no-cache-dir dist/vllm_rbln*.whl "${VLLM_PIN}" --constraint <(echo "optimum-rbln==${{ inputs.optimum_rbln_version }}") --index-url http://pypi-cache.devpi.svc.cluster.local/root/pypi/+simple/ --extra-index-url "${VLLM_CPU_URL}" --extra-index-url https://download.pytorch.org/whl/cpu  --extra-index-url https://pypi.org/simple --index-strategy unsafe-best-match
               echo "optimum-rbln ${{ inputs.optimum_rbln_version }}"
             else
-              uv pip install --system --force-reinstall --no-cache-dir dist/vllm_rbln*.whl --index-url http://pypi-cache.devpi.svc.cluster.local/root/pypi/+simple/ --extra-index-url "${VLLM_CPU_URL}" --extra-index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple --index-strategy unsafe-best-match
+              uv pip install --system --force-reinstall --no-cache-dir dist/vllm_rbln*.whl "${VLLM_PIN}" --index-url http://pypi-cache.devpi.svc.cluster.local/root/pypi/+simple/ --extra-index-url "${VLLM_CPU_URL}" --extra-index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple --index-strategy unsafe-best-match
             fi
 
       - name: Run pytest

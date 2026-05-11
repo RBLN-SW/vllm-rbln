@@ -1,0 +1,30 @@
+name: Utils / Get CI versions
+
+# Reusable workflow that exposes the version lists defined in
+# .github/ci-versions.json as workflow outputs, so multiple workflows can share
+# the same matrix dimensions without duplicating literal lists.
+
+on:
+  workflow_call:
+    outputs:
+      vllm_versions:
+        description: "JSON array of vllm versions to test against"
+        value: ${{ jobs.get-versions.outputs.vllm_versions }}
+
+jobs:
+  get-versions:
+    runs-on: ubuntu-latest
+    outputs:
+      vllm_versions: ${{ steps.read.outputs.vllm_versions }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            .github/ci-versions.json
+          sparse-checkout-cone-mode: false
+
+      - id: read
+        run: |
+          VERSIONS=$(jq -c '.vllm_versions' .github/ci-versions.json)
+          echo "vllm_versions=${VERSIONS}" >> "$GITHUB_OUTPUT"
+          echo "vllm_versions: ${VERSIONS}"
