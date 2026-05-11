@@ -218,8 +218,6 @@ class RblnPlatform(Platform):
                 )
 
                 RblnPlatform.device_type = "rbln"
-                if envs.VLLM_RBLN_USE_DEVICE_TENSOR:
-                    RblnPlatform.dist_backend = "rbln-ccl"
                 vllm_config.device_config.device_type = RblnPlatform.device_type
                 vllm_config.device_config.device = torch.device(
                     RblnPlatform.device_type
