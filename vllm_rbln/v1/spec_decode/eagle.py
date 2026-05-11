@@ -30,6 +30,7 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 import vllm_rbln.rbln_envs as envs
 import vllm_rbln.utils as rbln_utils
 from vllm_rbln.logger import init_logger
+from vllm_rbln.torch_compile_backend import logged_rbln_backend
 from vllm_rbln.v1.attention.kv_cache_bindings import (
     attach_kv_cache_bindings,
     build_kv_cache_forward_context_kwargs,
@@ -634,7 +635,7 @@ class RBLNEagleProposer(EagleProposer):
 
         return torch.compile(
             model,
-            backend="rbln",
+            backend=logged_rbln_backend,
             options=copy(options),
             dynamic=False,
         )

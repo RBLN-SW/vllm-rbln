@@ -12,47 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""KV-cache block calculation and synchronisation helpers."""
-
-import math
 from typing import TYPE_CHECKING
+
+from vllm_rbln.logger import init_logger
+from vllm_rbln.utils.optimum.registry import (
+    is_enc_dec_arch,
+)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 else:
     VllmConfig = None
 
-from vllm_rbln.logger import init_logger
-
 logger = init_logger(__name__)
 
 
-def is_full_block_available(num_blocks: int, vllm_config: VllmConfig) -> bool:
-    if vllm_config.cache_config.enable_prefix_caching:
-        block_size = vllm_config.additional_config["attn_block_size"]
-
-    else:
-        block_size = vllm_config.cache_config.block_size
-
-    max_model_len = vllm_config.model_config.max_model_len
-    max_num_seqs = vllm_config.scheduler_config.max_num_seqs
-
-    blocks_per_seq = math.ceil(max_model_len / block_size)
-    ideal_total = max_num_seqs * blocks_per_seq
-    return num_blocks >= ideal_total
-
-
-def get_block_ratio(vllm_config: VllmConfig) -> int:
-    if vllm_config.cache_config.enable_prefix_caching:
-        ob_size = vllm_config.additional_config["attn_block_size"]
-        ib_size = vllm_config.cache_config.block_size
-        blk_ratio = ob_size // ib_size
-    else:
-        blk_ratio = 1
-    return blk_ratio
-
-
-def apply_prefix_caching_block_size(
+def _apply_prefix_caching_block_size(
     vllm_config: VllmConfig, kvcache_block_size: int, prefill_chunk_size: int
 ) -> None:
     assert prefill_chunk_size is not None, (
@@ -98,18 +73,18 @@ def apply_prefix_caching_block_size(
     vllm_config.additional_config["attn_block_size"] = kvcache_block_size
 
 
-def sync_cache_block_size(
+def update_block_size(
     vllm_config: VllmConfig, kvcache_block_size: int, prefill_chunk_size: int
 ) -> None:
-    # vLLM's CacheConfig has a pydantic validator (_apply_block_size_default)
-    # that replaces block_size with DEFAULT_BLOCK_SIZE (16) when
-    # user_specified_block_size is False.  This validator re-runs whenever
-    # VllmConfig is deserialised in a subprocess (e.g. EngineCore), which
-    # would silently overwrite the RBLN-derived block_size we set below.
-    # Mark it as user-specified so the validator preserves our value.
+    """
+    Update the block size in the vllm_config based on the provided kvcache_block_size
+    and prefill_chunk_size. For models with prefix caching enabled, the block size
+    is set to the prefix block size, which is determined based on the prefill_chunk_size
+    and user-provided prefix_block_size.
+    """
     vllm_config.cache_config.user_specified_block_size = True
     if vllm_config.cache_config.enable_prefix_caching:
-        apply_prefix_caching_block_size(
+        _apply_prefix_caching_block_size(
             vllm_config, kvcache_block_size, prefill_chunk_size
         )
     else:
@@ -123,20 +98,40 @@ def sync_cache_block_size(
             vllm_config.cache_config.block_size = kvcache_block_size
 
 
-def sync_num_blocks(vllm_config: VllmConfig, num_blocks: int) -> None:
-    # num_blocks is determined by rbln_config or overridden by user.
-    if vllm_config.cache_config.num_gpu_blocks_override is not None:
-        num_blocks = vllm_config.cache_config.num_gpu_blocks_override
-        vllm_config.additional_config["num_blocks_override"] = num_blocks
+def update_max_num_batched_tokens(vllm_config: VllmConfig, max_model_len: int) -> None:
+    """
+    Update the max_num_batched_tokens in the vLLM configuration based on the model's
+    maximum length and architecture.
 
-    blk_ratio = get_block_ratio(vllm_config)
+    For encoder-decoder multimodal models (e.g. Whisper), max_num_batched_tokens
+    must be at least max_source_positions so that vllm's MultiModalBudget
+    validation passes (it requires max_tokens_per_mm_item <= max_num_batched_tokens
+    when chunked MM input is disabled).
+    """
+    target_max_num_batched_tokens = max_model_len
+    hf_config = vllm_config.model_config.hf_config
 
-    if is_full_block_available(num_blocks, vllm_config):
-        adjusted_num_blocks = num_blocks * blk_ratio + 1
-    else:
-        adjusted_num_blocks = (num_blocks - 1) * blk_ratio + 1
+    if not is_enc_dec_arch(hf_config):
+        return
 
-    vllm_config.cache_config.num_gpu_blocks = adjusted_num_blocks
+    max_source_positions = getattr(hf_config, "max_source_positions", 0)
+    if max_source_positions > target_max_num_batched_tokens:
+        target_max_num_batched_tokens = max_source_positions
+        logger.info(
+            "Encoder-decoder model detected: setting max_num_batched_tokens "
+            "to %d (max_source_positions) instead of %d (max_model_len)",
+            max_source_positions,
+            max_model_len,
+        )
 
-    if vllm_config.cache_config.num_gpu_blocks_override is not None:
-        vllm_config.cache_config.num_gpu_blocks_override = adjusted_num_blocks
+    cur = vllm_config.scheduler_config.max_num_batched_tokens
+    if cur != target_max_num_batched_tokens:
+        logger.info(
+            "Updating scheduler_config.max_num_batched_tokens "
+            "from %s to %d based on rbln_config.json",
+            cur,
+            target_max_num_batched_tokens,
+        )
+        vllm_config.scheduler_config.max_num_batched_tokens = (
+            target_max_num_batched_tokens
+        )
