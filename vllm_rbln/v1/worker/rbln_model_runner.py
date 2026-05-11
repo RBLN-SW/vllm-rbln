@@ -1318,8 +1318,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 logits_indices
             )
 
-        if logits_indices.device != self.device:
-            logits_indices = logits_indices.to(self.device)
+        logits_indices = logits_indices.to(self.device)
 
         attn_metadata: dict[str, Any] = {}
 
