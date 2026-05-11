@@ -1,6 +1,10 @@
 {
-  "vllm_versions": [
-    "0.18.0+cpu",
-    "0.19.1+cpu"
-  ]
+  "vllm_versions": {
+    "stable": [
+      "0.18.0+cpu"
+    ],
+    "dev": [
+      "0.19.1+cpu"
+    ]
+  }
 }

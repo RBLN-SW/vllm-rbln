@@ -31,7 +31,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        vllm_version: ${{ fromJSON(needs.versions.outputs.vllm_versions) }}
+        vllm_version: ${{ fromJSON(needs.versions.outputs.vllm_versions_all) }}
     steps:
       - name: Dispatch to fsw-integration (vllm ${{ matrix.vllm_version }})
         uses: Wandalen/wretry.action@v3
