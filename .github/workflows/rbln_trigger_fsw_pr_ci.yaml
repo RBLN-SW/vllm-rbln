@@ -20,15 +20,18 @@ on:
         type: string
 
 jobs:
+  versions:
+    if: github.repository_owner == 'RBLN-SW' && github.event_name == 'pull_request'
+    uses: ./.github/workflows/rbln_utils_get_ci_versions.yaml
+
   trigger-vllm-rbln-fsw-pr-ci:
     if: github.repository_owner == 'RBLN-SW' && github.event_name == 'pull_request'
+    needs: [versions]
     runs-on: fsw-r18s-atom-ext-rbln-sw-general-c1m12
     strategy:
       fail-fast: false
       matrix:
-        vllm_version:
-          - "0.18.0+cpu"
-          - "0.19.1+cpu"
+        vllm_version: ${{ fromJSON(needs.versions.outputs.vllm_versions) }}
     steps:
       - name: Dispatch to fsw-integration (vllm ${{ matrix.vllm_version }})
         uses: Wandalen/wretry.action@v3
