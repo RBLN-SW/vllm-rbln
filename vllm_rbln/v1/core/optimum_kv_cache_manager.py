@@ -16,7 +16,6 @@
 import torch
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request
@@ -211,5 +210,5 @@ class RBLNKVCacheManager(KVCacheManager):
         return self.prefix_cache_manager.get_blocks(request_id)
 
     def get_dummy_block(self) -> int:
-        if self.enable_caching:
-            return self.prefix_cache_manager.get_dummy_block()
+        # It's only for prefix caching.
+        return self.prefix_cache_manager.get_dummy_block()

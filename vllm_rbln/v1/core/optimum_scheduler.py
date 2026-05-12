@@ -535,14 +535,12 @@ class RBLNOptimumScheduler(Scheduler):
 
         # Calculate the dummy block index.
         if self.is_encoder_decoder:
+            # Whisper requires a dummy block as scratch space to pad the
+            # decoder's block table during the prefill step.
+            # The dummy block is always pinned to the last block,
+            # which is reserved and never allocated to valid requests.
             dummy_block = self.scheduler_config.max_num_seqs
-        #     # Encoder-decoder models (e.g. Whisper) drive the decoder runtime
-        #     # at the full compiled batch size even during prefill, where only
-        #     # one request is scheduled. The remaining slots need a scratch
-        #     # block so their throwaway K/V writes don't touch the active
-        #     # prefill block or any other request's KV cache.
-        #     dummy_block = self.kv_cache_manager.get_dummy_block()
-        if self.cache_config.enable_prefix_caching:
+        elif self.cache_config.enable_prefix_caching:
             num_decode_reqs = len(scheduled_running_reqs)
             if num_decode_reqs > 0 and num_decode_reqs < self.max_num_running_reqs:
                 dummy_block = self.kv_cache_manager.get_dummy_block()
