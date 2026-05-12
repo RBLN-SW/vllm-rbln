@@ -132,12 +132,12 @@ def rbln_top_k_top_p_sample(
 
 @torch.library.custom_op("rbln::argmax", mutates_args=())
 def argmax(logits: torch.Tensor) -> torch.Tensor:
-    return torch.empty(logits.shape[:-1], dtype=torch.int64, device=logits.device)
+    return torch.argmax(logits, dim=-1)
 
 
 @torch.library.register_fake("rbln::argmax")
 def argmax_fake(logits: torch.Tensor) -> torch.Tensor:
-    return torch.empty(logits.shape[:-1], dtype=torch.int64, device=logits.device)
+    return torch.argmax(logits, dim=-1)
 
 
 def rbln_greedy_sample(logits: torch.Tensor) -> torch.Tensor:
@@ -240,30 +240,40 @@ class RBLNSampler(VLLMSampler):
                 f"RBLN Sampling does not support logprobs_mode: {logprobs_mode}. "
                 "Using native sampler instead."
             )
-        options = {
-            "compile_context": compile_context
-            if compile_context
-            else (
-                rebel.CompileContext(use_global_ctx=True)
-                if "use_global_ctx"
-                in inspect.signature(rebel.CompileContext).parameters
-                else rebel.CompileContext()
+        use_dt = envs.VLLM_RBLN_USE_DEVICE_TENSOR
+        options: dict = {}
+        if not use_dt:
+            options["compile_context"] = (
+                compile_context
+                if compile_context
+                else (
+                    rebel.CompileContext(use_global_ctx=True)
+                    if "use_global_ctx"
+                    in inspect.signature(rebel.CompileContext).parameters
+                    else rebel.CompileContext()
+                )
             )
-        }
         if envs.VLLM_RBLN_COMPILE_STRICT_MODE:
             options["mode"] = "strict"
 
-        if has_torch_rbln:
-            options["use_global_ctx"] = True
-            options["global_device_id"] = 0
+        if has_torch_rbln or use_dt:
             options["tensor_parallel_size"] = 1
-        self.greedy_sample = torch.compile(
+            if not use_dt:
+                options["use_global_ctx"] = True
+                options["global_device_id"] = 0
+        # FIXME compiling both greedy and top-k top-p sampling
+        # causes some issues in torchinductor.
+        self._compiled_greedy_sample = torch.compile(
             rbln_greedy_sample,
             dynamic=False,
             fullgraph=True,
-            backend="rbln",
+            backend=logged_rbln_backend,
             options=options,
         )
+
+    @torch.compiler.disable
+    def greedy_sample(self, logits: torch.Tensor) -> torch.Tensor:
+        return self._compiled_greedy_sample(logits)
 
     def apply_penalties(
         self,
