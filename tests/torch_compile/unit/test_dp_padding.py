@@ -119,7 +119,11 @@ class TestNumTokensAndReqsAcrossDP:
         ]
         with _patch_all_reduce(per_rank):
             tokens_t, reqs_t = RBLNDPMetadata.num_tokens_and_reqs_across_dp(
-                num_tokens=512, num_reqs=1, dp_size=4, dp_rank=0, is_prefill=True,
+                num_tokens=512,
+                num_reqs=1,
+                dp_size=4,
+                dp_rank=0,
+                is_prefill=True,
             )
         assert reqs_t is None
         assert torch.equal(tokens_t, torch.tensor([512, 8, 8, 8], dtype=torch.int32))
@@ -127,14 +131,20 @@ class TestNumTokensAndReqsAcrossDP:
     def test_assert_num_tokens_overflow(self):
         with pytest.raises(AssertionError, match="num_tokens=65536"):
             RBLNDPMetadata.num_tokens_and_reqs_across_dp(
-                num_tokens=1 << 16, num_reqs=1, dp_size=4, dp_rank=0,
+                num_tokens=1 << 16,
+                num_reqs=1,
+                dp_size=4,
+                dp_rank=0,
                 is_prefill=False,
             )
 
     def test_assert_num_reqs_overflow(self):
         with pytest.raises(AssertionError, match="num_reqs=16384"):
             RBLNDPMetadata.num_tokens_and_reqs_across_dp(
-                num_tokens=1, num_reqs=1 << 14, dp_size=4, dp_rank=0,
+                num_tokens=1,
+                num_reqs=1 << 14,
+                dp_size=4,
+                dp_rank=0,
                 is_prefill=False,
             )
 
@@ -143,7 +153,10 @@ class TestNumTokensAndReqsAcrossDP:
         per_rank = [_encode(0xFFFF, 0x3FFF, False)] * 4
         with _patch_all_reduce(per_rank):
             tokens_t, reqs_t = RBLNDPMetadata.num_tokens_and_reqs_across_dp(
-                num_tokens=0xFFFF, num_reqs=0x3FFF, dp_size=4, dp_rank=0,
+                num_tokens=0xFFFF,
+                num_reqs=0x3FFF,
+                dp_size=4,
+                dp_rank=0,
                 is_prefill=False,
             )
         assert reqs_t is not None
@@ -181,8 +194,14 @@ class _FakeVllmConfig:
 class _FakeRunner:
     """Minimal stand-in for RBLNModelRunner exposing only what get_dp_padding uses."""
 
-    def __init__(self, dp_size, dp_rank, decode_buckets, max_num_batched_tokens,
-                 specialized_moe_decode):
+    def __init__(
+        self,
+        dp_size,
+        dp_rank,
+        decode_buckets,
+        max_num_batched_tokens,
+        specialized_moe_decode,
+    ):
         self.vllm_config = _FakeVllmConfig(dp_size, dp_rank)
         self.bucketing_manager = _FakeBucketingManager(decode_buckets)
         self.max_num_batched_tokens = max_num_batched_tokens
@@ -192,6 +211,7 @@ class _FakeRunner:
     # this fake as `self`.
     def get_dp_padding(self, *args, **kwargs):
         from vllm_rbln.v1.worker.rbln_model_runner import RBLNModelRunner
+
         return RBLNModelRunner.get_dp_padding(self, *args, **kwargs)
 
 
@@ -200,13 +220,16 @@ class TestGetDpPadding:
         """dp_size=1 short-circuit kept for completeness; the non-DP code
         path bypasses the all-reduce entirely."""
         runner = _FakeRunner(
-            dp_size=1, dp_rank=0,
+            dp_size=1,
+            dp_rank=0,
             decode_buckets=[1, 4, 8],
             max_num_batched_tokens=512,
             specialized_moe_decode=True,
         )
         bucket, padded, across_dp, _max_per_req = runner.get_dp_padding(
-            num_tokens=8, num_reqs=8, batch_bucket_size=8,
+            num_tokens=8,
+            num_reqs=8,
+            batch_bucket_size=8,
         )
         assert bucket == 8
         assert padded is None
@@ -215,7 +238,8 @@ class TestGetDpPadding:
     def test_single_token_decode_keeps_bucket(self):
         """Sanity: single-token DP decode still produces the right bucket."""
         runner = _FakeRunner(
-            dp_size=4, dp_rank=0,
+            dp_size=4,
+            dp_rank=0,
             decode_buckets=[1, 4, 8],
             max_num_batched_tokens=512,
             specialized_moe_decode=True,
@@ -223,7 +247,9 @@ class TestGetDpPadding:
         per_rank = [_encode(8, 8, False)] * 4
         with _patch_all_reduce(per_rank):
             bucket, padded, across_dp, _max_per_req = runner.get_dp_padding(
-                num_tokens=8, num_reqs=8, batch_bucket_size=8,
+                num_tokens=8,
+                num_reqs=8,
+                batch_bucket_size=8,
             )
         assert bucket == 8
         # single-token → max_tokens_per_req=1 → padded == bucket
@@ -238,7 +264,8 @@ class TestGetDpPadding:
         bucket * tokens_per_req = 16.
         """
         runner = _FakeRunner(
-            dp_size=4, dp_rank=0,
+            dp_size=4,
+            dp_rank=0,
             decode_buckets=[1, 4, 8],
             max_num_batched_tokens=512,
             specialized_moe_decode=True,
@@ -246,7 +273,9 @@ class TestGetDpPadding:
         per_rank = [_encode(16, 8, False)] * 4
         with _patch_all_reduce(per_rank):
             bucket, padded, across_dp, _max_per_req = runner.get_dp_padding(
-                num_tokens=16, num_reqs=8, batch_bucket_size=8,
+                num_tokens=16,
+                num_reqs=8,
+                batch_bucket_size=8,
             )
         assert bucket == 8, "Bucket must be looked up by num_reqs, not num_tokens"
         assert padded == 16, "Padded buffer must fit batch_bucket_size * tokens_per_req"
@@ -254,7 +283,8 @@ class TestGetDpPadding:
 
     def test_any_prefill_falls_back_to_max_num_batched_tokens(self):
         runner = _FakeRunner(
-            dp_size=4, dp_rank=0,
+            dp_size=4,
+            dp_rank=0,
             decode_buckets=[1, 4, 8],
             max_num_batched_tokens=512,
             specialized_moe_decode=True,
@@ -267,7 +297,9 @@ class TestGetDpPadding:
         ]
         with _patch_all_reduce(per_rank):
             bucket, padded, across_dp, _max_per_req = runner.get_dp_padding(
-                num_tokens=8, num_reqs=8, batch_bucket_size=8,
+                num_tokens=8,
+                num_reqs=8,
+                batch_bucket_size=8,
                 is_prefill=False,
             )
         # any_prefill path: bucket left as the initial (caller-provided) value,
@@ -277,7 +309,8 @@ class TestGetDpPadding:
 
     def test_non_specialized_moe_uses_max_num_batched_tokens(self):
         runner = _FakeRunner(
-            dp_size=4, dp_rank=0,
+            dp_size=4,
+            dp_rank=0,
             decode_buckets=[1, 4, 8],
             max_num_batched_tokens=512,
             specialized_moe_decode=False,
@@ -285,14 +318,17 @@ class TestGetDpPadding:
         per_rank = [_encode(8, 8, False)] * 4
         with _patch_all_reduce(per_rank):
             bucket, padded, across_dp, _max_per_req = runner.get_dp_padding(
-                num_tokens=8, num_reqs=8, batch_bucket_size=8,
+                num_tokens=8,
+                num_reqs=8,
+                batch_bucket_size=8,
             )
         assert padded == 512
 
     def test_num_padded_tokens_path_a(self):
         """Path A: explicit num_padded_tokens passed in → short-circuit."""
         runner = _FakeRunner(
-            dp_size=4, dp_rank=0,
+            dp_size=4,
+            dp_rank=0,
             decode_buckets=[1, 4, 8],
             max_num_batched_tokens=512,
             specialized_moe_decode=True,
@@ -302,8 +338,11 @@ class TestGetDpPadding:
         per_rank = [8, 8, 8, 8]
         with _patch_all_reduce(per_rank):
             bucket, padded, across_dp, _max_per_req = runner.get_dp_padding(
-                num_tokens=8, num_reqs=8, batch_bucket_size=8,
-                num_padded_tokens=512, is_prefill=False,
+                num_tokens=8,
+                num_reqs=8,
+                batch_bucket_size=8,
+                num_padded_tokens=512,
+                is_prefill=False,
             )
         assert bucket == 8
         assert padded == 512

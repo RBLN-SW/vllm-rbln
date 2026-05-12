@@ -1765,6 +1765,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             batch_bucket_size = self.bucketing_manager.find_decode_batch_bucket(
                 max_batch_size
             )
+            assert batch_bucket_size is not None
             # Determine max_tokens_per_req as cross-DP max of per-rank
             # max(per-req scheduled length). When spec decode is active the
             # caller pre-computes a pow2-rounded local value so the resulting
@@ -3023,19 +3024,14 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # `scheduled_spec_decode_tokens` is empty on every rank, so
             # downstream tensors built by `_prepare_inputs` are uniformly
             # sized for query_len=1 across DP.
-            if (
-                step_no_spec_required
-                and scheduler_output.scheduled_spec_decode_tokens
-            ):
+            if step_no_spec_required and scheduler_output.scheduled_spec_decode_tokens:
                 scheduler_output.scheduled_spec_decode_tokens.clear()
                 for req_id in list(scheduler_output.num_scheduled_tokens):
                     scheduler_output.num_scheduled_tokens[req_id] = 1
                 scheduler_output.total_num_scheduled_tokens = sum(
                     scheduler_output.num_scheduled_tokens.values()
                 )
-                tokens = [
-                    scheduler_output.num_scheduled_tokens[i] for i in req_ids
-                ]
+                tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
                 num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
                 num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
 
@@ -3096,7 +3092,10 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # scheduled_spec_decode_tokens leaves the (input_ids[1],
         # max_pads_across_dp) tuple inconsistent across DP and triggers a
         # hot-path model_wrapper recompile.
-        if max_tokens_per_req_across_dp is not None and max_tokens_per_req_across_dp > 1:
+        if (
+            max_tokens_per_req_across_dp is not None
+            and max_tokens_per_req_across_dp > 1
+        ):
             max_spec_decode_len = max_tokens_per_req_across_dp
         elif (
             max_tokens_per_req_across_dp is None
