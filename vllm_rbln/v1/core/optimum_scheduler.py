@@ -190,7 +190,6 @@ class RBLNOptimumScheduler(Scheduler):
             metrics_collector=self.kv_metrics_collector,
             attn_block_size=attn_block_size,
             max_num_seqs=self.max_num_running_reqs,
-            is_encoder_decoder=self.is_encoder_decoder,
         )
         self.perf_metrics: ModelMetrics | None = None
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
@@ -535,17 +534,18 @@ class RBLNOptimumScheduler(Scheduler):
         self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
 
         # Calculate the dummy block index.
+        if self.is_encoder_decoder:
+            dummy_block = self.scheduler_config.max_num_seqs
+        #     # Encoder-decoder models (e.g. Whisper) drive the decoder runtime
+        #     # at the full compiled batch size even during prefill, where only
+        #     # one request is scheduled. The remaining slots need a scratch
+        #     # block so their throwaway K/V writes don't touch the active
+        #     # prefill block or any other request's KV cache.
+        #     dummy_block = self.kv_cache_manager.get_dummy_block()
         if self.cache_config.enable_prefix_caching:
             num_decode_reqs = len(scheduled_running_reqs)
             if num_decode_reqs > 0 and num_decode_reqs < self.max_num_running_reqs:
                 dummy_block = self.kv_cache_manager.get_dummy_block()
-        elif self.is_encoder_decoder:
-            # Encoder-decoder models (e.g. Whisper) drive the decoder runtime
-            # at the full compiled batch size even during prefill, where only
-            # one request is scheduled. The remaining slots need a scratch
-            # block so their throwaway K/V writes don't touch the active
-            # prefill block or any other request's KV cache.
-            dummy_block = self.kv_cache_manager.get_dummy_block()
 
         scheduler_output = RBLNSchedulerOutput(
             scheduled_new_reqs=new_reqs_data,

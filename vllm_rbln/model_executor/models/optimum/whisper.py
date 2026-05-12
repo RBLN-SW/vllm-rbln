@@ -115,7 +115,7 @@ class RBLNOptimumWhisperForConditionalGeneration(
                 "Whisper prefill requires dummy_block from the scheduler."
             )
             decoder_block_tables = torch.full(
-                (self.batch_size, 1), model_input.dummy_block - 1, dtype=torch.int16
+                (self.batch_size, 1), model_input.dummy_block, dtype=torch.int16
             )
             decoder_block_tables[batch_idx, 0] = batch_idx
             decoder_cache_position = torch.zeros(self.batch_size, 1, dtype=torch.int32)
@@ -139,15 +139,13 @@ class RBLNOptimumWhisperForConditionalGeneration(
 
         else:
             cache_position = torch.zeros(request_nums, 1, dtype=torch.int32)
-            if model_input.dummy_block is not None:
-                dummy_block = model_input.dummy_block - 1
             kwargs = self.preprocess_for_decoder(
                 is_prompt=False,
                 block_tables=block_tables,
                 input_ids=input_ids,
                 cache_position=cache_position,
                 input_block_ids=valid_block_ids,
-                dummy_block=dummy_block,
+                dummy_block=model_input.dummy_block,
             )
             decoder_cache_position = kwargs.pop("cache_position")
             decoder_block_tables = kwargs.pop("block_tables")
