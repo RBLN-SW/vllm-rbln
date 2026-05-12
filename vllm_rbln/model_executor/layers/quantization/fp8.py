@@ -403,8 +403,10 @@ def custom_moe_swiglu_group_dequantize(
     down_proj_weight: torch.Tensor,
     down_proj_scale: torch.Tensor,
     router_logits: torch.Tensor,
+    scoring_func: str,
     group_size: torch.Tensor,
     topk: int,
+    post_norm: bool = True,
     e_score_correction_bias: torch.Tensor | None = None,
     gate_proj_bias: torch.Tensor | None = None,
     up_proj_bias: torch.Tensor | None = None,
@@ -474,16 +476,32 @@ def custom_moe_swiglu_group_dequantize(
         down_proj_weight, down_proj_scale, in_block_size, down_out_block
     )
 
-    routing_weights = router_logits.float()
-    scores_for_choice = routing_weights
-    if e_score_correction_bias is not None:
-        scores_for_choice = scores_for_choice + e_score_correction_bias
+    routing_scores = router_logits.float()
+    # Match rebel router behavior:
+    # - softmax: select topk on logits (post_norm) or on softmax weights (pre_norm)
+    # - sigmoid: select topk on sigmoid(+optional bias), optional post topk renorm
+    if scoring_func == "softmax":
+        if post_norm:
+            _, topk_ids = torch.topk(routing_scores, topk, dim=-1, sorted=False)
+            topk_values = routing_scores.gather(1, topk_ids)
+            topk_weights = torch.softmax(topk_values, dim=-1)
+        else:
+            all_weights = torch.softmax(routing_scores, dim=-1)
+            _, topk_ids = torch.topk(all_weights, topk, dim=-1, sorted=False)
+            topk_weights = all_weights.gather(1, topk_ids)
+    else:
+        # Sigmoid mode expects pre-scored inputs from caller.
+        routing_weights = routing_scores
+        scores_for_choice = routing_weights
+        if e_score_correction_bias is not None:
+            scores_for_choice = scores_for_choice + e_score_correction_bias
+        _, topk_ids = torch.topk(scores_for_choice, topk, dim=-1, sorted=False)
+        topk_weights = routing_weights.gather(1, topk_ids)
+        if post_norm:
+            topk_weights = topk_weights / topk_weights.sum(
+                dim=-1, keepdim=True
+            ).clamp_min(1e-20)
 
-    _, topk_ids = torch.topk(scores_for_choice, topk, dim=-1, sorted=False)
-    topk_weights = routing_weights.gather(1, topk_ids)
-    topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True).clamp_min(
-        1e-20
-    )
     topk_weights = topk_weights.to(hidden_states.dtype)
 
     if dp_mask is not None:
@@ -543,8 +561,10 @@ def custom_moe_swiglu_group_dequantize_fake(
     down_proj_weight: torch.Tensor,
     down_proj_scale: torch.Tensor,
     router_logits: torch.Tensor,
+    scoring_func: str,
     group_size: torch.Tensor,
     topk: int,
+    post_norm: bool = True,
     e_score_correction_bias: torch.Tensor | None = None,
     gate_proj_bias: torch.Tensor | None = None,
     up_proj_bias: torch.Tensor | None = None,
@@ -837,7 +857,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         num_tokens = orig_shape[:-1].numel()  # noqa: F841
         hidden_states = x.reshape(num_tokens, -1)
         router_logits = router_logits.reshape(num_tokens, -1)
-        router_logits = torch.sigmoid(router_logits)
+
+        # Pre-score routing inputs at caller side; compiler custom op routing
+        # expects already-scored values (no sigmoid applied inside the kernel).
+        scoring_func = getattr(layer, "scoring_func", None)
+        assert scoring_func is not None, "FusedMoE.scoring_func must be set"
+        assert scoring_func in {"softmax", "sigmoid"}
+        if scoring_func == "sigmoid":
+            router_logits = torch.sigmoid(router_logits.to(torch.float32)).to(
+                router_logits.dtype
+            )
 
         intermediate_size = layer.w2_weight.shape[-1]
 
@@ -881,8 +910,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 down_proj_weight,
                 down_proj_weight_scale,
                 router_logits,
+                # Keep arg order aligned with rebel custom_op schema:
+                # (..., router_logits, scoring_func, group_size, topk, post_norm, ...)
+                scoring_func,
                 torch.tensor(self.weight_block_size[1], dtype=torch.int32),
                 layer.top_k,
+                layer.renormalize,
                 e_score_correction_bias,
                 None,  # gate_proj_bias
                 None,  # up_proj_bias
