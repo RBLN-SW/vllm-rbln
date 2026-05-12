@@ -361,6 +361,7 @@ class TestAllocateKvCacheTensors:
         ]
 
         with patch("vllm_rbln.v1.worker.rbln_model_runner.envs") as mock_envs:
+            mock_envs.VLLM_RBLN_USE_DEVICE_TENSOR = False
             mock_envs.VLLM_RBLN_USE_CUSTOM_KERNEL = True
             mock_envs.VLLM_RBLN_COMPILE_MODEL = True
 
@@ -389,6 +390,7 @@ class TestAllocateKvCacheTensors:
         kv_cache_config.kv_cache_groups = [MagicMock(layer_names=["layer_0"])]
 
         with patch("vllm_rbln.v1.worker.rbln_model_runner.envs") as mock_envs:
+            mock_envs.VLLM_RBLN_USE_DEVICE_TENSOR = False
             mock_envs.VLLM_RBLN_USE_CUSTOM_KERNEL = False
             mock_envs.VLLM_RBLN_COMPILE_MODEL = True
 
@@ -417,6 +419,7 @@ class TestAllocateKvCacheTensors:
         ]
 
         with patch("vllm_rbln.v1.worker.rbln_model_runner.envs") as mock_envs:
+            mock_envs.VLLM_RBLN_USE_DEVICE_TENSOR = False
             mock_envs.VLLM_RBLN_USE_CUSTOM_KERNEL = True
             mock_envs.VLLM_RBLN_COMPILE_MODEL = True
 
@@ -425,6 +428,32 @@ class TestAllocateKvCacheTensors:
         assert result["layer_0"].shape == (1024,)
         assert result["layer_1"].shape == (2048,)
         assert result["layer_0"] is not result["layer_1"]
+
+    def test_device_tensor_allocates_on_self_device(self):
+        """When VLLM_RBLN_USE_DEVICE_TENSOR=True, tensors are allocated on
+        self.device regardless of CUSTOM_KERNEL / COMPILE_MODEL."""
+        runner = _make_runner_stub()
+        runner.runner_only_attn_layers = set()
+        self._bind(runner)
+
+        kv_tensor = MagicMock()
+        kv_tensor.size = 768
+        kv_tensor.shared_by = ["layer_0"]
+
+        kv_cache_config = MagicMock()
+        kv_cache_config.kv_cache_tensors = [kv_tensor]
+        kv_cache_config.kv_cache_groups = [MagicMock(layer_names=["layer_0"])]
+
+        with patch("vllm_rbln.v1.worker.rbln_model_runner.envs") as mock_envs:
+            mock_envs.VLLM_RBLN_USE_DEVICE_TENSOR = True
+            mock_envs.VLLM_RBLN_USE_CUSTOM_KERNEL = False
+            mock_envs.VLLM_RBLN_COMPILE_MODEL = True
+
+            result = runner._allocate_kv_cache_tensors(kv_cache_config)
+
+        assert result["layer_0"].device == runner.device
+        assert result["layer_0"].shape == (768,)
+        assert result["layer_0"].dtype == torch.int8
 
 
 # ============================================================
