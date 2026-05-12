@@ -96,7 +96,6 @@ class RblnNixlConnectorScheduler(NixlConnectorScheduler):
     ) -> KVConnectorMetadata:
         meta = NixlConnectorMetadata()
 
-        # Loop through scheduled reqs and convert to ReqMeta.
         for req_id, (req, block_ids) in self._reqs_need_recv.items():
             assert req.kv_transfer_params is not None
             meta.add_new_req_to_recv(
@@ -131,6 +130,7 @@ class RblnNixlConnectorScheduler(NixlConnectorScheduler):
                 is_partial = (
                     req.num_computed_tokens + num_scheduled_tokens
                 ) < req.num_prompt_tokens
+
                 if not is_partial:
                     new_block_id_groups = self._block_ids_need_save.pop(req_id)
                     clipped_block_id_groups = self.get_sw_clipped_blocks(
@@ -238,7 +238,18 @@ class RblnNixlConnectorScheduler(NixlConnectorScheduler):
 
 
 class RblnNixlConnectorWorker(NixlConnectorWorker):
-    """Implementation of Worker side methods"""
+    """RBLN's KV connector worker.
+
+    The runner filters `kv_caches` to one Full-attention canonical layer
+    per HMA pool before `register_kv_caches`, so upstream's
+    `cache.shape[0] == num_blocks` invariant holds without a bigger
+    override (see `RBLNModelRunner._select_canonical_kv_layers_per_pool`).
+
+    Not supported: pure-SWA single-group with `sliding_window < block_size`
+    under a KV connector — the canonical-layer fallback picks the SWA
+    layer (kernel granularity), whose `cache.shape[0]` mismatches
+    `num_blocks`. Non-disagg serving is unaffected.
+    """
 
     def __init__(
         self, vllm_config: VllmConfig, engine_id: str, kv_cache_config: "KVCacheConfig"
@@ -250,13 +261,21 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
         # inheriting an assert that would reject its own ("rbln") buffer.
         super().__init__(vllm_config, engine_id, kv_cache_config)
 
+        # `RblnPlatform.device_type = "cpu"` makes upstream skip the host
+        # buffer; restore it — NIXL cannot register RBLN device memory.
         self.use_host_buffer = self.kv_buffer_device == "cpu"
 
+        # Pin to logical values. Upstream would otherwise multiply by the
+        # attention backend's kernel ratio, which doesn't reflect per-spec
+        # ratios in hybrid models.
+        self.num_blocks = self.kv_cache_config.num_blocks
+        self.block_size = self.vllm_config.cache_config.block_size
+        self._physical_blocks_per_logical_kv_block = 1
+        self._logical_num_blocks = self.num_blocks
+        self._block_size[self.engine_id] = self.block_size
+
     def initialize_host_xfer_buffer(self, kv_caches: dict[str, torch.Tensor]) -> None:
-        """
-        Initialize transfer buffer in CPU mem for accelerators
-        NOT directly supported by NIXL (e.g., RBLN)
-        """
+        """Allocate one rebel-aligned host buffer per layer."""
         assert self.kv_cache_layout == "HND", (
             "RBLN NIXL Connector only supports HND layout"
         )
@@ -270,11 +289,19 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
             logger.error("RblnNixlConnectorWorker gets %s", e)
             raise
 
+        keys_preview = list(xfer_buffers.keys())
+        if len(keys_preview) > 8:
+            keys_preview = keys_preview[:4] + ["..."] + keys_preview[-4:]
+        logger.info(
+            "Host xfer buffers allocated: %d pool(s) (keys e.g. %s)",
+            len(xfer_buffers),
+            keys_preview,
+        )
+
         self.host_xfer_buffers = xfer_buffers
 
     def set_host_xfer_buffer_ops(self, copy_operation: CopyBlocksOp):
         """Assign copy (d2h, h2d) operations when host buffer is used."""
-        # Set a no-op if the host buffer is not cpu.
         if self.kv_buffer_device != "cpu":
             return
         assert self.use_host_buffer
