@@ -356,9 +356,7 @@ class RBLNScheduler(Scheduler):
             if not is_prefill(request):
                 if self.num_spec_tokens > 0:
                     max_spec_decode_len = self.num_spec_tokens + 1
-                    tokens_used_in_block = (
-                        request.num_computed_tokens % self.block_size
-                    )
+                    tokens_used_in_block = request.num_computed_tokens % self.block_size
                     remaining_in_block = self.block_size - tokens_used_in_block
                     remaining_in_maxlen = (
                         self.max_model_len - request.num_computed_tokens
