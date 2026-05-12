@@ -2781,7 +2781,11 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self,
         copy_ops: "list[KVCacheCopyOp]",
     ) -> None:
-        if self.model_config.enforce_eager or not envs.VLLM_RBLN_COMPILE_MODEL:
+        if (
+            envs.VLLM_RBLN_USE_DEVICE_TENSOR
+            or self.model_config.enforce_eager
+            or not envs.VLLM_RBLN_COMPILE_MODEL
+        ):
             for op in copy_ops:
                 for kv_cache in self.kv_caches:
                     kv_cache[:, op.dst_block_id, :, :, : op.num_tokens, :] = kv_cache[
