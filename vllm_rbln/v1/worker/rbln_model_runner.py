@@ -80,6 +80,7 @@ from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     CrossAttentionSpec,
     EncoderOnlyAttentionSpec,
+    FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheSpec,
@@ -336,6 +337,10 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # self.model: nn.Module  # Set after load_model
         # Initialize in initialize_kv_cache
         self.kv_caches: list[torch.Tensor] = []
+        # Layer names in layer-index order, parallel to `self.kv_caches`.
+        # Drives the deterministic iteration order required by
+        # `mark_static_address` and the KV-connector filter.
+        self.kv_cache_names: list[str] = []
         self.kv_cache_bases: list[torch.Tensor] = []
         self.kv_cache_view_infos: list[KVCacheViewInfo] = []
         # Initialize in initialize_kv_cache_tensors
@@ -4625,6 +4630,42 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     def _attn_group_iterator(self) -> Iterator[AttentionGroup]:
         return itertools.chain.from_iterable(self.attn_groups)
 
+    def _select_canonical_kv_layers_per_pool(
+        self, kv_cache_config: KVCacheConfig
+    ) -> set[str]:
+        """Pick one layer per HMA pool as the canonical handle.
+
+        Both `mark_static_address` (last-write-wins on storage->name) and
+        the KV connector's `register_kv_caches` (uses the chosen layer's
+        view as NIXL's descriptor stride) need a single layer per pool.
+
+        Prefer a Full-attention layer — its view's `cache.shape[-2]`
+        equals `cache_config.block_size` (logical), matching the
+        scheduler / connector / runtime copy block_id space. A SWA
+        layer's view (`shape[-2] == sliding_window`, kernel granularity)
+        would mis-address logical block_ids. Falls back to the first
+        layer in `shared_by` when no Full layer is present.
+        """
+        layer_to_spec: dict[str, KVCacheSpec] = {
+            layer_name: attn_group.kv_cache_spec
+            for attn_group in self._attn_group_iterator()
+            for layer_name in attn_group.layer_names
+        }
+        chosen: set[str] = set()
+        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+            pool_layers = kv_cache_tensor.shared_by
+            if not pool_layers:
+                continue
+            full_layer = next(
+                (
+                    ln for ln in pool_layers
+                    if isinstance(layer_to_spec.get(ln), FullAttentionSpec)
+                ),
+                None,
+            )
+            chosen.add(full_layer or pool_layers[0])
+        return chosen
+
     def _kv_cache_spec_attn_group_iterator(self) -> Iterator[AttentionGroup]:
         if not self.kv_cache_config.kv_cache_groups:
             return
@@ -4949,14 +4990,28 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self.kv_caches,
             num_attn_module,
         )
+        self.kv_cache_names = get_kv_cache_names(kv_caches, num_attn_module)
+        assert len(self.kv_cache_names) == len(self.kv_caches)
+
         if (
             not envs.VLLM_RBLN_USE_DEVICE_TENSOR
             and not self.model_config.enforce_eager
             and envs.VLLM_RBLN_COMPILE_MODEL
         ):
-            kv_cache_names = get_kv_cache_names(kv_caches, num_attn_module)
-            assert len(kv_cache_names) == len(self.kv_caches)
-            for kv_cache, name in zip(self.kv_caches, kv_cache_names):
+            # `mark_static_address` is last-write-wins on storage->name.
+            # Pin to one canonical layer per pool so the runtime, the
+            # connector's host buffers, and the runtime copy path all
+            # address the same name (and the same logical block_id space).
+            layers_to_register = self._select_canonical_kv_layers_per_pool(
+                kv_cache_config
+            )
+
+            for kv_cache, name in zip(self.kv_caches, self.kv_cache_names):
+                if name not in layers_to_register:
+                    continue
+                logger.debug(
+                    "mark_static_address: name=%s shape=%s", name, kv_cache.shape
+                )
                 self.compile_context.mark_static_address(kv_cache, name)
 
         self._log_kv_cache_info(kv_cache_config, kv_caches)
@@ -5086,7 +5141,27 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     self.cross_layers_kv_cache, self.cross_layers_attn_backend
                 )
             else:
-                kv_transfer_group.register_kv_caches(kv_caches)
+                # Filter to one Full-preferred canonical layer per pool
+                # so upstream NIXL sees `cache.shape[0] == num_blocks`
+                # (logical). SWA-layer views alias the same storage, so
+                # no separate registration is needed.
+                canonical_layers = self._select_canonical_kv_layers_per_pool(
+                    kv_cache_config
+                )
+                missing = canonical_layers - kv_caches.keys()
+                assert not missing, (
+                    f"Canonical layers missing from kv_caches: {missing}"
+                )
+                # Iterate by layer index — NIXL assigns region indices in
+                # iteration order, and set iteration would vary with
+                # PYTHONHASHSEED, breaking the P/D region <-> layer
+                # agreement.
+                filtered_kv_caches = {
+                    name: kv_caches[name]
+                    for name in self.kv_cache_names
+                    if name in canonical_layers
+                }
+                kv_transfer_group.register_kv_caches(filtered_kv_caches)
 
             def rbln_copy_kv_blocks(
                 src_kv_caches: dict[str, torch.Tensor],

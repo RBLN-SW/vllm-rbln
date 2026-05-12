@@ -388,3 +388,226 @@ class TestPDDisaggregationNixlConnector:
         assert params["do_remote_prefill"] is True
         assert params["remote_engine_id"] == "test-engine"
         assert "done" in sched._reqs_need_send
+
+
+# ===========================================================================
+# RBLNSlidingWindowManager.allocate_new_computed_blocks
+# ===========================================================================
+#
+# The D-side P/D receive path routes through `allocate_new_computed_blocks`
+# rather than `allocate_new_blocks`. The RBLN SWA kernel uses a single
+# in-place ring-buffered block, so this override forces "one block per
+# request" regardless of how many computed tokens the scheduler hands us.
+
+
+def _make_swa_manager():
+    """Build an RBLNSlidingWindowManager with the minimum state its
+    `allocate_new_computed_blocks` reaches into."""
+    from collections import defaultdict
+
+    from vllm_rbln.v1.kv_cache import RBLNSlidingWindowManager
+
+    mgr = object.__new__(RBLNSlidingWindowManager)
+    mgr.num_cached_block = {}
+    mgr.req_to_blocks = defaultdict(list)
+    mgr.block_pool = MagicMock()
+    # `get_new_blocks(n)` returns a list of n fresh KVCacheBlock objects.
+    mgr.block_pool.get_new_blocks.side_effect = lambda n: [
+        MagicMock(name=f"block_{i}") for i in range(n)
+    ]
+    return mgr
+
+
+class TestRBLNSlidingWindowManager:
+    """`allocate_new_computed_blocks` enforces the SWA kernel's
+    one-block-per-request invariant on the receive path."""
+
+    def test_allocates_single_block_for_remote_prefill(self):
+        """One block regardless of `num_external_computed_tokens` size."""
+        mgr = _make_swa_manager()
+
+        mgr.allocate_new_computed_blocks(
+            request_id="req-0",
+            new_computed_blocks=[],
+            num_local_computed_tokens=0,
+            num_external_computed_tokens=2674,
+        )
+
+        assert len(mgr.req_to_blocks["req-0"]) == 1
+        # Sentinel set so a follow-up call hits the fast path.
+        assert mgr.num_cached_block["req-0"] == 0
+        mgr.block_pool.get_new_blocks.assert_called_once_with(1)
+
+    def test_no_allocation_when_no_external_tokens(self):
+        """Setting num_external_computed_tokens=0 still records the
+        sentinel but does not allocate."""
+        mgr = _make_swa_manager()
+
+        mgr.allocate_new_computed_blocks(
+            request_id="req-0",
+            new_computed_blocks=[],
+            num_local_computed_tokens=0,
+            num_external_computed_tokens=0,
+        )
+
+        assert mgr.req_to_blocks["req-0"] == []
+        assert mgr.num_cached_block["req-0"] == 0
+        mgr.block_pool.get_new_blocks.assert_not_called()
+
+    def test_running_request_fast_path_is_noop(self):
+        """Second call for the same request (already in num_cached_block)
+        is a no-op."""
+        mgr = _make_swa_manager()
+        mgr.num_cached_block["req-0"] = 0
+        mgr.req_to_blocks["req-0"] = [MagicMock(name="existing")]
+
+        mgr.allocate_new_computed_blocks(
+            request_id="req-0",
+            new_computed_blocks=[],
+            num_local_computed_tokens=128,
+            num_external_computed_tokens=512,
+        )
+
+        assert len(mgr.req_to_blocks["req-0"]) == 1
+        mgr.block_pool.get_new_blocks.assert_not_called()
+
+    def test_rejects_prefix_cache_hits(self):
+        """`find_longest_cache_hit` is overridden to return empty, so a
+        non-empty new_computed_blocks is a contract violation."""
+        import pytest
+
+        mgr = _make_swa_manager()
+
+        with pytest.raises(AssertionError):
+            mgr.allocate_new_computed_blocks(
+                request_id="req-0",
+                new_computed_blocks=[MagicMock(name="leaked_hit")],
+                num_local_computed_tokens=0,
+                num_external_computed_tokens=128,
+            )
+
+
+# ===========================================================================
+# RblnNixlConnectorWorker
+# ===========================================================================
+#
+# We exercise the worker __init__ and host-buffer helpers without touching
+# the upstream NIXL agent — `super().__init__` is patched out, and we
+# inject only the attributes our overrides read.
+
+
+def _build_connector_worker(kv_buffer_device="cpu", num_blocks=128, block_size=64):
+    """Create a RblnNixlConnectorWorker through its __init__ with the
+    upstream NixlConnectorWorker side effects stubbed out.
+
+    Returns the constructed worker so tests can inspect post-__init__ state.
+    """
+    from unittest.mock import patch
+
+    from vllm.config import CacheConfig
+
+    from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl_connector import (
+        RblnNixlConnectorWorker,
+    )
+
+    vllm_config = MagicMock()
+    vllm_config.cache_config = CacheConfig(block_size=block_size)
+    kv_cache_config = MagicMock()
+    kv_cache_config.num_blocks = num_blocks
+
+    def fake_super_init(self, vllm_config_, engine_id_, kv_cache_config_):
+        # Set just the attributes our overrides touch / depend on. The real
+        # NixlConnectorWorker.__init__ does a lot more, including NIXL agent
+        # creation — we don't want any of that in a unit test.
+        self.vllm_config = vllm_config_
+        self.engine_id = engine_id_
+        self.kv_cache_config = kv_cache_config_
+        self.kv_buffer_device = kv_buffer_device
+        self._block_size = {}
+
+    with patch.object(
+        RblnNixlConnectorWorker.__mro__[1], "__init__", fake_super_init
+    ):
+        return RblnNixlConnectorWorker(
+            vllm_config=vllm_config,
+            engine_id="test-engine",
+            kv_cache_config=kv_cache_config,
+        )
+
+
+class TestRblnNixlConnectorWorkerInit:
+    """`__init__` recovers the host-buffer flag (upstream sets it False
+    because `RblnPlatform.device_type == 'cpu'`) and pins block sizes to
+    logical values."""
+
+    def test_recovers_host_buffer_for_cpu_kv_device(self):
+        worker = _build_connector_worker(kv_buffer_device="cpu")
+        assert worker.use_host_buffer is True
+
+    def test_no_host_buffer_when_kv_device_is_non_cpu(self):
+        worker = _build_connector_worker(kv_buffer_device="cuda")
+        assert worker.use_host_buffer is False
+
+    def test_pins_logical_block_sizes(self):
+        worker = _build_connector_worker(num_blocks=128, block_size=64)
+        assert worker.num_blocks == 128
+        assert worker.block_size == 64
+        assert worker._physical_blocks_per_logical_kv_block == 1
+        assert worker._logical_num_blocks == 128
+        assert worker._block_size["test-engine"] == 64
+
+
+class TestRblnNixlConnectorWorkerHostBuffer:
+    """`initialize_host_xfer_buffer` / `set_host_xfer_buffer_ops` honor
+    HND layout, allocate one rebel-aligned buffer per filtered layer, and
+    preserve insertion order (matters for NIXL region indexing in P/D)."""
+
+    def _patch_worker(self, kv_cache_layout="HND"):
+        worker = _build_connector_worker()
+        worker.kv_cache_layout = kv_cache_layout
+        return worker
+
+    def test_one_buffer_per_layer_preserves_order(self):
+        """Iterates `kv_caches.items()` in input order; result dict keeps
+        that order — load-bearing for P/D region <-> layer mapping."""
+        import torch
+
+        worker = self._patch_worker()
+        kv_caches = {
+            f"model.layers.{i}.attn": torch.zeros(4, 2, dtype=torch.float32)
+            for i in (3, 1, 7, 0)
+        }
+
+        worker.initialize_host_xfer_buffer(kv_caches)
+
+        assert list(worker.host_xfer_buffers.keys()) == list(kv_caches.keys())
+        for name, original in kv_caches.items():
+            assert worker.host_xfer_buffers[name].shape == original.shape
+
+    def test_asserts_hnd_layout(self):
+        import pytest
+        import torch
+
+        worker = self._patch_worker(kv_cache_layout="NHD")
+        with pytest.raises(AssertionError, match="HND"):
+            worker.initialize_host_xfer_buffer(
+                {"layer0": torch.zeros(4, 2, dtype=torch.float32)}
+            )
+
+    def test_set_ops_noop_when_kv_buffer_not_cpu(self):
+        """When kv_buffer_device is not 'cpu' the operation is a no-op —
+        host-buffer copies aren't needed."""
+        worker = _build_connector_worker(kv_buffer_device="cuda")
+
+        sentinel = MagicMock(name="copy_op")
+        worker.set_host_xfer_buffer_ops(sentinel)
+
+        assert not hasattr(worker, "copy_blocks") or worker.copy_blocks is not sentinel
+
+    def test_set_ops_assigns_copy_when_kv_buffer_is_cpu(self):
+        worker = _build_connector_worker(kv_buffer_device="cpu")
+
+        sentinel = MagicMock(name="copy_op")
+        worker.set_host_xfer_buffer_ops(sentinel)
+
+        assert worker.copy_blocks is sentinel
