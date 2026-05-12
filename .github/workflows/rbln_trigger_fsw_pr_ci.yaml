@@ -23,8 +23,13 @@ jobs:
   trigger-vllm-rbln-fsw-pr-ci:
     if: github.repository_owner == 'RBLN-SW' && github.event_name == 'pull_request'
     runs-on: fsw-r18s-atom-ext-rbln-sw-general-c1m12
+    strategy:
+      fail-fast: false
+      matrix:
+        vllm_version:
+          - "0.18.0+cpu"
     steps:
-      - name: Dispatch to fsw-integration
+      - name: Dispatch to fsw-integration (vllm ${{ matrix.vllm_version }})
         uses: Wandalen/wretry.action@v3
         with:
           action: peter-evans/repository-dispatch@v4
@@ -33,11 +38,12 @@ jobs:
           with: |
             token: ${{ secrets.GIT_PAT }}
             repository: rebellions-sw/fsw-integration
-            event-type: ${{ github.event.pull_request.base.ref == 'dev-0.18' && 'vllm-rbln-pr-event-for-0.18' || 'vllm-rbln-pr-event' }}
+            event-type: vllm-rbln-pr-event
             client-payload: |
               {
                 "ref": "${{ github.event.pull_request.head.ref }}",
                 "sha": "${{ github.event.pull_request.head.sha }}",
                 "pr_number": "${{ github.event.number }}",
-                "actor": "${{ github.actor }}"
+                "actor": "${{ github.actor }}",
+                "vllm_version": "${{ matrix.vllm_version }}"
               }

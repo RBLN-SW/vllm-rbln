@@ -241,7 +241,7 @@ def unquantized_fused_moe_method_rbln(
     return final_hidden_states.reshape(orig_shape)
 
 
-def get_tokens_mask(num_tokens: int, left=1.0, right=0.0):
+def get_tokens_mask(num_tokens: int, left=1.0, right=0.0, device=None):
     num_tokens_across_dp = get_forward_context().dp_metadata.num_tokens_across_dp_cpu
     num_tokens_across_dp = num_tokens_across_dp.unsqueeze(1)
     if num_tokens_across_dp.size(0) == 1:
@@ -253,6 +253,8 @@ def get_tokens_mask(num_tokens: int, left=1.0, right=0.0):
         pos < num_tokens_across_dp, left, right
     )  # [dp_size, max_pad]
     tokens_mask = tokens_mask.reshape(-1, 1)  # [dp_size * max_pad, 1]
+    if device is not None:
+        tokens_mask = tokens_mask.to(device)
     return tokens_mask
 
 
@@ -273,7 +275,9 @@ def get_masked_routing_weights(router_logits, top_k, renormalize, expert_map):
 
     use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
     if use_moe_tokens_mask:
-        tokens_mask = get_tokens_mask(router_logits.shape[0], 1.0, 0.0)
+        tokens_mask = get_tokens_mask(
+            router_logits.shape[0], 1.0, 0.0, device=selected_weights.device
+        )
         selected_weights = selected_weights * tokens_mask
 
     n_expert = router_logits.shape[1]
@@ -339,7 +343,7 @@ def unquantized_fused_moe_method_custom(
     tokens_mask = None
     use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
     if use_moe_tokens_mask:
-        tokens_mask = get_tokens_mask(num_tokens)
+        tokens_mask = get_tokens_mask(num_tokens, device=router_logits.device)
 
     final_hidden_states = torch.ops.rbln_custom_ops.custom_moe_glu(
         hidden_states,
@@ -391,7 +395,7 @@ def unquantized_fused_optimize_moe_method_custom(
     tokens_mask = None
     use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
     if use_moe_tokens_mask:
-        tokens_mask = get_tokens_mask(num_tokens)
+        tokens_mask = get_tokens_mask(num_tokens, device=router_logits.device)
 
     # optimum-rbln/src/optimum/rbln/transformers/models/qwen3_moe/
     # qwen3_moe_architecture.py

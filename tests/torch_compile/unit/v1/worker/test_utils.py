@@ -22,6 +22,7 @@ from vllm.platforms.cpu import LogicalCPUInfo
 
 from vllm_rbln.v1.worker.utils import (
     estimate_available_memory,
+    estimate_model_kernel_size,
     get_autobind_cpu_ids,
     set_cpu_affinity,
     set_omp_num_threads,
@@ -69,6 +70,47 @@ def _make_cpu(cpu_id, physical_core, numa_node):
 # ---------------------------------------------------------------------------
 # estimate_available_memory
 # ---------------------------------------------------------------------------
+class TestEstimateModelKernelSize:
+    @patch("vllm_rbln.v1.worker.utils.current_platform")
+    def test_bytes_path_estimates_kernel_size(self, mock_platform):
+        mock_platform.get_device_name.return_value = "RBLN-CA12"
+
+        model_cfg = _make_model_config(num_layers=2, vocab_size=64, hidden_size=32)
+        parallel_cfg = _make_parallel_config(tp_size=1)
+
+        result = estimate_model_kernel_size(
+            model_cfg,
+            parallel_cfg,
+            n_model_bytes=12_288,
+        )
+
+        assert result == 6_291_456
+
+    @patch("vllm_rbln.v1.worker.utils.current_platform")
+    @pytest.mark.parametrize(
+        ("kwargs", "match"),
+        [
+            ({}, "Either `n_model_params` or `n_model_bytes`"),
+            (
+                {"n_model_params": 1_000_000, "n_model_bytes": 2_000_000},
+                "Only one of `n_model_params` or `n_model_bytes`",
+            ),
+            (
+                {"n_model_params": 1_000_000},
+                "`nbits_per_param` should be specified",
+            ),
+        ],
+    )
+    def test_validates_input_combinations(self, mock_platform, kwargs, match):
+        mock_platform.get_device_name.return_value = "RBLN-CA12"
+
+        model_cfg = _make_model_config()
+        parallel_cfg = _make_parallel_config()
+
+        with pytest.raises(ValueError, match=match):
+            estimate_model_kernel_size(model_cfg, parallel_cfg, **kwargs)
+
+
 class TestEstimateAvailableMemory:
     """Test DRAM estimation for ATOM and REBEL devices."""
 
@@ -159,6 +201,22 @@ class TestEstimateAvailableMemory:
 
     @patch("vllm_rbln.v1.worker.utils.current_platform")
     @patch("vllm_rbln.v1.worker.utils.envs")
+    def test_estimated_kernel_size_from_bytes(self, mock_envs, mock_platform):
+        mock_platform.get_device_name.return_value = "RBLN-CA12"
+        mock_envs.VLLM_RBLN_TP_SIZE = 1
+
+        model_cfg = _make_model_config(num_layers=2, vocab_size=64, hidden_size=32)
+        parallel_cfg = _make_parallel_config(tp_size=1)
+
+        result = estimate_available_memory(
+            model_cfg,
+            parallel_cfg,
+            n_model_bytes=12_288,
+        )
+        assert result > 0
+
+    @patch("vllm_rbln.v1.worker.utils.current_platform")
+    @patch("vllm_rbln.v1.worker.utils.envs")
     def test_no_params_no_kernel_raises(self, mock_envs, mock_platform):
         """If neither kernel_size nor n_model_params given, should raise."""
         mock_platform.get_device_name.return_value = "RBLN-CA12"
@@ -169,6 +227,22 @@ class TestEstimateAvailableMemory:
 
         with pytest.raises(ValueError, match="n_model_params.*should be specified"):
             estimate_available_memory(model_cfg, parallel_cfg)
+
+    @patch("vllm_rbln.v1.worker.utils.current_platform")
+    @patch("vllm_rbln.v1.worker.utils.envs")
+    def test_n_model_params_requires_nbits(self, mock_envs, mock_platform):
+        mock_platform.get_device_name.return_value = "RBLN-CA12"
+        mock_envs.VLLM_RBLN_TP_SIZE = 1
+
+        model_cfg = _make_model_config()
+        parallel_cfg = _make_parallel_config()
+
+        with pytest.raises(ValueError, match="`nbits_per_param` should be specified"):
+            estimate_available_memory(
+                model_cfg,
+                parallel_cfg,
+                n_model_params=1_000_000,
+            )
 
     @patch("vllm_rbln.v1.worker.utils.current_platform")
     @patch("vllm_rbln.v1.worker.utils.envs")
