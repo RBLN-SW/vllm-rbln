@@ -15,12 +15,13 @@ import asyncio
 import os
 
 import fire
-from datasets import load_dataset
-from transformers import AutoTokenizer
+from transformers import WhisperProcessor
 from vllm import AsyncEngineArgs, AsyncLLMEngine, SamplingParams
 
 
 def generate_prompts(batch_size: int, model_id: str):
+    from datasets import load_dataset
+
     dataset = load_dataset(
         "distil-whisper/librispeech_asr-noise",
         "test-pub-noise",
@@ -29,10 +30,15 @@ def generate_prompts(batch_size: int, model_id: str):
     )
     dataset = dataset.take(batch_size)
     messages = []
+    processor = WhisperProcessor.from_pretrained(model_id)
+    forced_decoder_ids = processor.get_decoder_prompt_ids(
+        language="en", task="transcribe"
+    )
+    forced_decoder_ids = [idx for _, idx in forced_decoder_ids]
     for item in dataset:
         messages.append(
             {
-                "prompt": "<|startoftranscript|>",
+                "prompt_token_ids": forced_decoder_ids,
                 "multi_modal_data": {
                     "audio": (item["audio"]["array"], item["audio"]["sampling_rate"])
                 },
@@ -42,14 +48,13 @@ def generate_prompts(batch_size: int, model_id: str):
     return messages
 
 
-async def generate(engine: AsyncLLMEngine, tokenizer, request_id, request):
+async def generate(engine: AsyncLLMEngine, request_id, request):
     results_generator = engine.generate(
         request,
         SamplingParams(
             temperature=0,
             ignore_eos=False,
             skip_special_tokens=True,
-            stop_token_ids=[tokenizer.eos_token_id],
             max_tokens=448,
         ),
         str(request_id),
@@ -62,20 +67,16 @@ async def generate(engine: AsyncLLMEngine, tokenizer, request_id, request):
 
 
 async def main(
-    num_input_prompt: int,
+    inputs: list,
     model_id: str,
 ):
     engine_args = AsyncEngineArgs(model=model_id, limit_mm_per_prompt={"audio": 1})
 
     engine = AsyncLLMEngine.from_engine_args(engine_args)
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-    inputs = generate_prompts(num_input_prompt, model_id)
 
     futures = []
     for request_id, request in enumerate(inputs):
-        futures.append(
-            asyncio.create_task(generate(engine, tokenizer, request_id, request))
-        )
+        futures.append(asyncio.create_task(generate(engine, request_id, request)))
 
     results = await asyncio.gather(*futures)
 
@@ -90,9 +91,10 @@ def entry_point(
     num_input_prompt: int = 1,
     model_id: str = "/whisper-base-b4-wo-token-timestamps",
 ):
+    inputs = generate_prompts(num_input_prompt, model_id)
     asyncio.run(
         main(
-            num_input_prompt=num_input_prompt,
+            inputs=inputs,
             model_id=model_id,
         )
     )
