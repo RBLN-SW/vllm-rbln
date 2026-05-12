@@ -601,3 +601,128 @@ class TestPropagateRuntimeHolder:
         holder.append("rt")
         assert connector.holder is holder
         assert connector.holder[0] == "rt"
+
+
+# ============================================================
+# _select_canonical_kv_layers_per_pool Tests
+# ============================================================
+#
+# Pick one Full-preferred layer per HMA pool. `mark_static_address` is
+# last-write-wins on storage->name, and the NIXL connector uses the
+# chosen layer's view as its descriptor stride, so both need a single
+# canonical layer per pool with `cache.shape[0] == num_blocks` (logical).
+
+
+def _make_kv_cache_config(pools, layer_specs):
+    """Build a minimal KVCacheConfig-like object.
+
+    `pools`: list of `shared_by` lists, one per HMA pool.
+    `layer_specs`: dict layer_name -> KVCacheSpec.
+    """
+    kv_cache_config = MagicMock()
+    kv_cache_config.kv_cache_tensors = [
+        MagicMock(shared_by=pool) for pool in pools
+    ]
+    # Drive `_attn_group_iterator` via attn_groups[i][j].
+    # Each AttentionGroup needs `layer_names` and `kv_cache_spec`.
+    grouped: dict[type, dict] = {}
+    for layer_name, spec in layer_specs.items():
+        grouped.setdefault(id(spec), {"spec": spec, "layers": []})["layers"].append(
+            layer_name
+        )
+    attn_groups = [
+        [MagicMock(layer_names=g["layers"], kv_cache_spec=g["spec"])]
+        for g in grouped.values()
+    ]
+    return kv_cache_config, attn_groups
+
+
+class TestSelectCanonicalKvLayersPerPool:
+    """`_select_canonical_kv_layers_per_pool` picks one layer per HMA
+    pool, preferring Full-attention (whose view is at logical block
+    granularity)."""
+
+    def _bind(self, attn_groups):
+        runner = object.__new__(RBLNModelRunner)
+        runner.attn_groups = attn_groups
+        # `_attn_group_iterator` is itertools.chain.from_iterable(attn_groups);
+        # bind it via the same class so the implementation under test is reached.
+        runner._attn_group_iterator = (
+            RBLNModelRunner._attn_group_iterator.__get__(runner)
+        )
+        runner._select_canonical_kv_layers_per_pool = (
+            RBLNModelRunner._select_canonical_kv_layers_per_pool.__get__(runner)
+        )
+        return runner
+
+    def test_prefers_full_attention_layer(self):
+        """A pool with both Full and SWA layers picks the Full one — its
+        view has `cache.shape[-2] == block_size` (logical)."""
+        from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
+
+        full_spec = MagicMock(spec=FullAttentionSpec)
+        swa_spec = MagicMock(spec=SlidingWindowSpec)
+        kv_cache_config, attn_groups = _make_kv_cache_config(
+            pools=[["layer.swa", "layer.full"]],
+            layer_specs={"layer.full": full_spec, "layer.swa": swa_spec},
+        )
+        runner = self._bind(attn_groups)
+
+        chosen = runner._select_canonical_kv_layers_per_pool(kv_cache_config)
+
+        assert chosen == {"layer.full"}
+
+    def test_falls_back_to_first_layer_when_no_full(self):
+        """Pure-SWA pool (no Full layer) falls back to the first layer in
+        `shared_by`."""
+        from vllm.v1.kv_cache_interface import SlidingWindowSpec
+
+        swa_spec = MagicMock(spec=SlidingWindowSpec)
+        kv_cache_config, attn_groups = _make_kv_cache_config(
+            pools=[["layer.swa.0", "layer.swa.1"]],
+            layer_specs={"layer.swa.0": swa_spec, "layer.swa.1": swa_spec},
+        )
+        runner = self._bind(attn_groups)
+
+        chosen = runner._select_canonical_kv_layers_per_pool(kv_cache_config)
+
+        assert chosen == {"layer.swa.0"}
+
+    def test_skips_pool_with_empty_shared_by(self):
+        """A pool whose `shared_by` is empty doesn't contribute a layer."""
+        from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+        full_spec = MagicMock(spec=FullAttentionSpec)
+        kv_cache_config, attn_groups = _make_kv_cache_config(
+            pools=[[], ["layer.full"]],
+            layer_specs={"layer.full": full_spec},
+        )
+        runner = self._bind(attn_groups)
+
+        chosen = runner._select_canonical_kv_layers_per_pool(kv_cache_config)
+
+        assert chosen == {"layer.full"}
+
+    def test_one_canonical_layer_per_pool(self):
+        """Multiple HMA pools, each Full+SWA — one Full per pool, no overlap."""
+        from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
+
+        full_spec = MagicMock(spec=FullAttentionSpec)
+        swa_spec = MagicMock(spec=SlidingWindowSpec)
+        kv_cache_config, attn_groups = _make_kv_cache_config(
+            pools=[
+                ["pool0.swa", "pool0.full"],
+                ["pool1.swa", "pool1.full"],
+            ],
+            layer_specs={
+                "pool0.full": full_spec,
+                "pool0.swa": swa_spec,
+                "pool1.full": full_spec,
+                "pool1.swa": swa_spec,
+            },
+        )
+        runner = self._bind(attn_groups)
+
+        chosen = runner._select_canonical_kv_layers_per_pool(kv_cache_config)
+
+        assert chosen == {"pool0.full", "pool1.full"}
