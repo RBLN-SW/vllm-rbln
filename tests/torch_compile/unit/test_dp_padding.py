@@ -205,7 +205,7 @@ class TestGetDpPadding:
             max_num_batched_tokens=512,
             specialized_moe_decode=True,
         )
-        bucket, padded, across_dp = runner.get_dp_padding(
+        bucket, padded, across_dp, _max_per_req = runner.get_dp_padding(
             num_tokens=8, num_reqs=8, batch_bucket_size=8,
         )
         assert bucket == 8
@@ -222,7 +222,7 @@ class TestGetDpPadding:
         )
         per_rank = [_encode(8, 8, False)] * 4
         with _patch_all_reduce(per_rank):
-            bucket, padded, across_dp = runner.get_dp_padding(
+            bucket, padded, across_dp, _max_per_req = runner.get_dp_padding(
                 num_tokens=8, num_reqs=8, batch_bucket_size=8,
             )
         assert bucket == 8
@@ -245,7 +245,7 @@ class TestGetDpPadding:
         )
         per_rank = [_encode(16, 8, False)] * 4
         with _patch_all_reduce(per_rank):
-            bucket, padded, across_dp = runner.get_dp_padding(
+            bucket, padded, across_dp, _max_per_req = runner.get_dp_padding(
                 num_tokens=16, num_reqs=8, batch_bucket_size=8,
             )
         assert bucket == 8, "Bucket must be looked up by num_reqs, not num_tokens"
@@ -266,7 +266,7 @@ class TestGetDpPadding:
             _encode(8, 8, False),
         ]
         with _patch_all_reduce(per_rank):
-            bucket, padded, across_dp = runner.get_dp_padding(
+            bucket, padded, across_dp, _max_per_req = runner.get_dp_padding(
                 num_tokens=8, num_reqs=8, batch_bucket_size=8,
                 is_prefill=False,
             )
@@ -284,7 +284,7 @@ class TestGetDpPadding:
         )
         per_rank = [_encode(8, 8, False)] * 4
         with _patch_all_reduce(per_rank):
-            bucket, padded, across_dp = runner.get_dp_padding(
+            bucket, padded, across_dp, _max_per_req = runner.get_dp_padding(
                 num_tokens=8, num_reqs=8, batch_bucket_size=8,
             )
         assert padded == 512
@@ -301,7 +301,7 @@ class TestGetDpPadding:
         # that directly.
         per_rank = [8, 8, 8, 8]
         with _patch_all_reduce(per_rank):
-            bucket, padded, across_dp = runner.get_dp_padding(
+            bucket, padded, across_dp, _max_per_req = runner.get_dp_padding(
                 num_tokens=8, num_reqs=8, batch_bucket_size=8,
                 num_padded_tokens=512, is_prefill=False,
             )
