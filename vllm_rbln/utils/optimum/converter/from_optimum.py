@@ -33,10 +33,10 @@ logger = init_logger(__name__)
 
 
 def _keep_only_device_keys(obj: dict) -> dict:
-    """Recursively keep only ``devices`` entries from nested dict/list."""
+    """Recursively keep only ``device`` entries from nested dict/list."""
     result: dict[str, Any] = {}
     for k, v in obj.items():
-        if k == "devices":
+        if k == "device":
             result[k] = v
         elif isinstance(v, dict):
             filtered = _keep_only_device_keys(v)
