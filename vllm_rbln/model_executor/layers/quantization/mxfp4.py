@@ -160,7 +160,9 @@ def custom_moe_glu_mxfp4(
         # Sigmoid mode expects pre-scored inputs from caller.
         routing_weights_full = routing_scores
         _, top_k_indices = torch.topk(routing_weights_full, k, dim=-1)
-        routing_weights = torch.gather(routing_weights_full, dim=-1, index=top_k_indices)
+        routing_weights = torch.gather(
+            routing_weights_full, dim=-1, index=top_k_indices
+        )
         if post_norm:
             routing_weights = routing_weights / routing_weights.sum(
                 dim=-1, keepdim=True
@@ -421,9 +423,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         assert scoring_func is not None, "FusedMoE.scoring_func must be set"
         assert scoring_func in {"softmax", "sigmoid"}
         if scoring_func == "sigmoid":
-            router_logits = torch.sigmoid(
-                router_logits.to(torch.float32)
-            ).to(router_logits.dtype)
+            router_logits = torch.sigmoid(router_logits.to(torch.float32)).to(
+                router_logits.dtype
+            )
 
         if layer.activation == MoEActivation.SWIGLUOAI:
             expert_map_const = None

@@ -864,9 +864,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         assert scoring_func is not None, "FusedMoE.scoring_func must be set"
         assert scoring_func in {"softmax", "sigmoid"}
         if scoring_func == "sigmoid":
-            router_logits = torch.sigmoid(
-                router_logits.to(torch.float32)
-            ).to(router_logits.dtype)
+            router_logits = torch.sigmoid(router_logits.to(torch.float32)).to(
+                router_logits.dtype
+            )
 
         intermediate_size = layer.w2_weight.shape[-1]
 
