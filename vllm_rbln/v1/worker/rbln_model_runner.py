@@ -1204,18 +1204,42 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # This way, we can overlap the copy with the following CPU operations.
         self.input_batch.block_table.commit_block_table(num_reqs)
 
+        # NOTE(RBLN): Sliding-window per-req slide distances from the
+        # scheduler. For a boundary-affected req the runner prepends
+        # `slide` past positions to the query window so the full
+        # num_spec_tokens+1 shape stays within already-allocated KV slots.
+        # Reqs without slide stay at their scheduled length. The total
+        # tensor count below (`total_query_tokens`) therefore equals
+        # total_num_scheduled_tokens (logical advance) + sum(slide).
+        slide_distance_map = getattr(scheduler_output, "spec_decode_slide_distance", {})
+        if slide_distance_map:
+            req_ids = self.input_batch.req_ids
+            slide_arr = np.array(
+                [slide_distance_map.get(rid, 0) for rid in req_ids],
+                dtype=np.int32,
+            )
+        else:
+            slide_arr = np.zeros(num_reqs, dtype=np.int32)
+        query_lengths = num_scheduled_tokens + slide_arr
+        total_query_tokens = int(query_lengths.sum())
+
         # Get request indices.
         # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
-        req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens)
+        # Under sliding the lengths used here are query_lengths (= scheduled
+        # + slide), so past positions get their own req_indices entries.
+        req_indices = np.repeat(self.arange_np[:num_reqs], query_lengths)
 
-        # cu_num_tokens: [2, 5, 3] -> [2, 7, 10]
-        # arange: [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
-        cu_num_tokens, arange = self._get_cumsum_and_arange(num_scheduled_tokens)
+        # cu_num_tokens: cumulative query lengths
+        # arange: per-req local arange over query_lengths [0..query_lengths[i]-1]
+        cu_num_tokens, arange = self._get_cumsum_and_arange(query_lengths)
 
-        # Get positions.
-        positions_np = self.positions.np[:total_num_scheduled_tokens]
+        # Get positions. For boundary reqs the window starts at
+        # (num_computed - slide), so past positions land within the
+        # already-allocated current block.
+        positions_np = self.positions.np[:total_query_tokens]
         np.add(
-            self.input_batch.num_computed_tokens_cpu[req_indices],
+            self.input_batch.num_computed_tokens_cpu[req_indices]
+            - slide_arr[req_indices],
             arange,
             out=positions_np,
         )
@@ -1240,11 +1264,11 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self.input_batch.token_ids_cpu_tensor.flatten(),
             0,
             torch.from_numpy(token_indices),
-            out=self.input_ids.cpu[:total_num_scheduled_tokens],
+            out=self.input_ids.cpu[:total_query_tokens],
         )
 
         self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
-        self.input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
+        self.input_batch.block_table.commit_slot_mapping(total_query_tokens)
 
         # Prepare the attention metadata.
         self.query_start_loc.np[0] = 0
@@ -1266,19 +1290,20 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # Copy the tensors to the GPU.
         # TODO(jiwoo.park) Currently, this code is meaningless.(overhead)
         # The input_ids may be padded by chunk size and max batch size.
-        self._prepare_input_ids(
-            scheduler_output, total_num_scheduled_tokens, cu_num_tokens
-        )
+        # NOTE(RBLN): under sliding window, total_query_tokens includes
+        # prepended past positions, so the input_ids / positions GPU copies
+        # cover them too.
+        self._prepare_input_ids(scheduler_output, total_query_tokens, cu_num_tokens)
 
         if self.uses_mrope:
             # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
-            self.mrope_positions.gpu[:, :total_num_scheduled_tokens].copy_(
-                self.mrope_positions.cpu[:, :total_num_scheduled_tokens],
+            self.mrope_positions.gpu[:, :total_query_tokens].copy_(
+                self.mrope_positions.cpu[:, :total_query_tokens],
                 non_blocking=True,
             )
         else:
             # Common case (1D positions)
-            self.positions.copy_to_gpu(total_num_scheduled_tokens)
+            self.positions.copy_to_gpu(total_query_tokens)
 
         use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
         if not use_spec_decode:
@@ -1347,7 +1372,10 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self.num_accepted_tokens.np[num_reqs:].fill(1)
             self.num_accepted_tokens.copy_to_gpu()
 
-        max_num_scheduled_tokens = int(num_scheduled_tokens.max())
+        # Under sliding window the actual per-req query length equals
+        # num_scheduled + slide. max_query_len and the cross-DP token count
+        # must therefore reflect query_lengths, not the logical advance.
+        max_num_scheduled_tokens = int(query_lengths.max())
         initial_batch_bucket_size = self.bucketing_manager.find_decode_batch_bucket(
             num_reqs
         )
@@ -1359,7 +1387,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             num_tokens_across_dp,
             max_tokens_per_req_across_dp,
         ) = self.get_dp_padding(
-            total_num_scheduled_tokens,
+            total_query_tokens,
             num_reqs,
             initial_batch_bucket_size,
             num_padded_tokens,
@@ -1386,7 +1414,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     (num_reqs, 1), dtype=torch.int32, **device_kwarg
                 )
                 slot_mapping = torch.zeros(
-                    (total_num_scheduled_tokens,),
+                    (total_query_tokens,),
                     dtype=torch.int64,
                     device=self.device,
                 )
@@ -1398,21 +1426,19 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     if envs.VLLM_RBLN_USE_DEVICE_TENSOR
                     else blk_table.get_device_tensor(num_reqs)
                 )
-                slot_mapping = blk_table.slot_mapping.gpu[:total_num_scheduled_tokens]
+                slot_mapping = blk_table.slot_mapping.gpu[:total_query_tokens]
 
                 # Fill unused with -1. Needed for reshape_and_cache in full cuda
                 # graph mode. `blk_table_tensor` -1 to match mamba PAD_SLOT_ID
-                slot_mapping[
-                    total_num_scheduled_tokens:total_num_scheduled_tokens
-                ].fill_(-1)
-                blk_table_tensor[num_reqs:total_num_scheduled_tokens].fill_(-1)
+                slot_mapping[total_query_tokens:total_query_tokens].fill_(-1)
+                blk_table_tensor[num_reqs:total_query_tokens].fill_(-1)
 
             common_attn_metadata = CommonAttentionMetadata(
                 query_start_loc=query_start_loc,
                 query_start_loc_cpu=query_start_loc_cpu,
                 seq_lens=seq_lens,
                 num_reqs=num_reqs,
-                num_actual_tokens=total_num_scheduled_tokens,
+                num_actual_tokens=total_query_tokens,
                 max_query_len=max_num_scheduled_tokens,
                 max_seq_len=max_seq_len,
                 block_table_tensor=blk_table_tensor,
