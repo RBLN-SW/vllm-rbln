@@ -29,7 +29,7 @@ class StepMetrics:
     host_times: list[int] = field(default_factory=list)
     device_times: list[int] = field(default_factory=list)
     ccl_times: list[int] = field(default_factory=list)
-    vmem_times: list[int] = field(default_factory=list)
+    prepare_times: list[int] = field(default_factory=list)
 
     def add_measurement(
         self,
@@ -38,7 +38,7 @@ class StepMetrics:
         host_time: int | None = None,
         device_time: int | None = None,
         ccl_time: int | None = None,
-        vmem_time: int | None = None,
+        prepare_time: int | None = None,
     ):
         """Add a latency, token count, and timing measurements."""
         self.latencies.append(latency)
@@ -49,8 +49,8 @@ class StepMetrics:
             self.device_times.append(device_time)
         if ccl_time is not None:
             self.ccl_times.append(ccl_time)
-        if vmem_time is not None:
-            self.vmem_times.append(vmem_time)
+        if prepare_time is not None:
+            self.prepare_times.append(prepare_time)
 
     def _without_outlier_f(self, values: list[float]) -> list[float]:
         """Return values excluding one outlier (max absolute deviation)."""
@@ -129,13 +129,13 @@ class StepMetrics:
         )
         return sum(values) / len(values) if values else 0.0
 
-    def get_avg_vmem_time(self, ignore_outlier: bool = True) -> float:
-        """Get average vmem time in microseconds,
-        optionally ignoring one outlier."""
+    def get_avg_prepare_time(self, ignore_outlier: bool = True) -> float:
+        """Get average prepare time (PrepareInputs + PrepareOutputs around Run)
+        in microseconds, optionally ignoring one outlier."""
         values = (
-            self._without_outlier_i(self.vmem_times)
+            self._without_outlier_i(self.prepare_times)
             if ignore_outlier
-            else self.vmem_times
+            else self.prepare_times
         )
         return sum(values) / len(values) if values else 0.0
 
@@ -161,8 +161,10 @@ class StepMetrics:
                 )
             if self.ccl_times:
                 logger.info("  Average ccl time: %.2f us", self.get_avg_ccl_time())
-            if self.vmem_times:
-                logger.info("  Average vmem time: %.2f us", self.get_avg_vmem_time())
+            if self.prepare_times:
+                logger.info(
+                    "  Average prepare time: %.2f us", self.get_avg_prepare_time()
+                )
         else:
             logger.info("%s METRICS: No data recorded", stat_type)
 
@@ -181,7 +183,7 @@ class PrefillMetricsByRequestID:
         host_time: int | None = None,
         device_time: int | None = None,
         ccl_time: int | None = None,
-        vmem_time: int | None = None,
+        prepare_time: int | None = None,
     ):
         """Add a latency and token count measurement."""
         self.metrics[request_id].add_measurement(
@@ -190,7 +192,7 @@ class PrefillMetricsByRequestID:
             host_time,
             device_time,
             ccl_time,
-            vmem_time,
+            prepare_time,
         )
 
     def get_avg_latency_per_request(self) -> dict[str, float]:
@@ -229,7 +231,7 @@ class PerformanceTracker:
         host_time: int | None = None,
         device_time: int | None = None,
         ccl_time: int | None = None,
-        vmem_time: int | None = None,
+        prepare_time: int | None = None,
         request_ids: list[str] | None = None,
     ):
         """Record prefill step metrics."""
@@ -248,7 +250,7 @@ class PerformanceTracker:
             host_time,
             device_time,
             ccl_time,
-            vmem_time,
+            prepare_time,
         )
         if request_id:
             self.prefill_metrics_by_request_id.add_measurement(
@@ -258,7 +260,7 @@ class PerformanceTracker:
                 host_time,
                 device_time,
                 ccl_time,
-                vmem_time,
+                prepare_time,
             )
 
     def record_decode(
@@ -268,7 +270,7 @@ class PerformanceTracker:
         host_time: int | None = None,
         device_time: int | None = None,
         ccl_time: int | None = None,
-        vmem_time: int | None = None,
+        prepare_time: int | None = None,
         padded_decode: bool = False,
         request_ids: list[str] | None = None,
     ):
@@ -282,7 +284,7 @@ class PerformanceTracker:
             host_time,
             device_time,
             ccl_time,
-            vmem_time,
+            prepare_time,
         )
 
     def print_final_stats(self):
@@ -318,14 +320,14 @@ def collect_metrics(
     host_time = None
     device_time = None
     ccl_time = None
-    vmem_time = None
+    prepare_time = None
     if reports is not None and len(reports) > 0:
         host_time = reports[0].get("total_host", None)
         device_time = reports[0].get("total_device", None)
         ccl_time = reports[0].get("total_ccl", None)
     if reports is not None and len(reports) > 1:
-        vmem_time = reports[1].get("prepare_inputs_us", 0) + reports[1].get(
-            "prepare_outputs_us", 0
+        prepare_time = reports[1].get("prepare_input_us", 0) + reports[1].get(
+            "prepare_output_us", 0
         )
     if is_prefill:
         performance_tracker.record_prefill(
@@ -334,7 +336,7 @@ def collect_metrics(
             host_time=host_time,
             device_time=device_time,
             ccl_time=ccl_time,
-            vmem_time=vmem_time,
+            prepare_time=prepare_time,
         )
     else:
         performance_tracker.record_decode(
@@ -343,5 +345,5 @@ def collect_metrics(
             host_time=host_time,
             device_time=device_time,
             ccl_time=ccl_time,
-            vmem_time=vmem_time,
+            prepare_time=prepare_time,
         )

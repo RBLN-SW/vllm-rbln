@@ -3041,16 +3041,16 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 host_time = None
                 device_time = None
                 ccl_time = None
-                vmem_time = None
+                prepare_time = None
 
                 if reports is not None and len(reports) > 0:
                     host_time = reports[0].get("total_host", None)
                     device_time = reports[0].get("total_device", None)
                     ccl_time = reports[0].get("total_ccl", None)
                 if reports is not None and len(reports) > 1:
-                    vmem_time = reports[1].get("prepare_inputs_us", 0) + reports[1].get(
-                        "prepare_outputs_us", 0
-                    )
+                    prepare_time = reports[1].get("prepare_input_us", 0) + reports[
+                        1
+                    ].get("prepare_output_us", 0)
 
                 if is_prefill_phase:
                     self.performance_tracker.record_prefill(
@@ -3059,7 +3059,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         host_time=host_time,
                         device_time=device_time,
                         ccl_time=ccl_time,
-                        vmem_time=vmem_time,
+                        prepare_time=prepare_time,
                         request_ids=self.input_batch.req_ids,
                     )
                 else:
@@ -3073,7 +3073,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         host_time=host_time,
                         device_time=device_time,
                         ccl_time=ccl_time,
-                        vmem_time=vmem_time,
+                        prepare_time=prepare_time,
                         padded_decode=padded_decode,
                         request_ids=self.input_batch.req_ids,
                     )
