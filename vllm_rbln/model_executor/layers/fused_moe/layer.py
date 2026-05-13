@@ -366,7 +366,7 @@ def fused_moe_forward_rbln(
         scoring_func = getattr(self, 'scoring_func', 'softmax')
         e_score_correction_bias = getattr(self, 'e_score_correction_bias', None)
 
-        ## FIXME: proper handling for score_func and self.renomalize conditions
+        ## FIXME(kblee): proper handling for score_func and self.renomalize conditions
         # deepseekv3 style: minimax m2.5
         if scoring_func == 'sigmoid':
             # scores_t = torch.sigmoid(all_router_logits_t)  # [E, R*max_pad]
