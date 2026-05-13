@@ -169,6 +169,8 @@ class RBLNTopKTopPSampler(nn.Module):
             )
         if envs.VLLM_RBLN_COMPILE_STRICT_MODE:
             options["mode"] = "strict"
+        if use_dt:
+            options["model_trace_method"] = "export"
 
         if has_torch_rbln or use_dt:
             options["tensor_parallel_size"] = 1
