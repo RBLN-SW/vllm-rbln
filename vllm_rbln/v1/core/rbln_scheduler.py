@@ -394,6 +394,25 @@ class RBLNScheduler(Scheduler):
                         )
                         new_n = effective_remaining
                         spec_decode_slide_distance[req_id] = desired_slide
+                        # Diagnostic log so end-to-end runs make the
+                        # sliding decision observable. Fires only when
+                        # a req actually hits a block boundary, so the
+                        # rate is bounded by ~num_spec_tokens /
+                        # block_size per req per step (≈0.3% for the
+                        # typical 1024-block / 3-draft config).
+                        logger.info(
+                            "spec-decode sliding: req=%s "
+                            "num_computed=%d remaining_in_block=%d "
+                            "remaining_in_maxlen=%d slide=%d "
+                            "advance=%d kept_drafts=%d",
+                            req_id,
+                            request.num_computed_tokens,
+                            remaining_in_block,
+                            remaining_in_maxlen,
+                            desired_slide,
+                            new_n,
+                            max(new_n - 1, 0),
+                        )
 
                         if old_n > new_n:
                             token_budget += old_n - new_n
