@@ -260,7 +260,7 @@ class RBLNOptimumWorker(WorkerBase):
                     self.profiler.key_averages().table(sort_by="self_cuda_time_total")
                 )
 
-    def load_model(self):
+    def load_model(self, *, load_dummy_weights: bool = False):
         self.model_runner.load_model()
 
     def compile_or_warm_up_model(self) -> None:

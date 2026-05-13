@@ -131,9 +131,26 @@ class RBLNInputBatch(InputBatch):
             # step pooling during the sampling/pooling process.
             # Hence copy these tensors only when there are requests which
             # need penalties/step_pooler to be applied.
-            prompt_token_ids = self._make_prompt_token_ids_tensor()
+            # vLLM 0.19 renamed _make_prompt_token_ids_tensor to _cpu_tensor.
+            if hasattr(self, "_make_prompt_token_ids_cpu_tensor"):
+                prompt_token_ids = self._make_prompt_token_ids_cpu_tensor()
+            else:
+                prompt_token_ids = self._make_prompt_token_ids_tensor()
         else:
             prompt_token_ids = None
+
+        # Only set output_token_ids if required by the current requests'
+        # sampling parameters.
+        needs_output_token_ids = (
+            not self.no_penalties
+            or bool(self.bad_words_token_ids)
+            or self.logitsprocs_need_output_token_ids
+        )
+        output_token_ids = (
+            cast(list[list[int]], self.req_output_token_ids)
+            if needs_output_token_ids
+            else []
+        )
 
         allowed_token_ids_mask: torch.Tensor | None = None
         if not self.no_allowed_token_ids:
@@ -157,7 +174,7 @@ class RBLNInputBatch(InputBatch):
             frequency_penalties=self.frequency_penalties[:num_reqs],
             presence_penalties=self.presence_penalties[:num_reqs],
             repetition_penalties=self.repetition_penalties[:num_reqs],
-            output_token_ids=cast(list[list[int]], self.req_output_token_ids),
+            output_token_ids=output_token_ids,
             no_penalties=self.no_penalties,
             allowed_token_ids_mask=allowed_token_ids_mask,
             bad_words_token_ids=self.bad_words_token_ids,
