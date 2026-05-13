@@ -167,8 +167,13 @@ class RBLNTopKTopPSampler(nn.Module):
                     else rebel.CompileContext()
                 )
             )
+        modes = []
         if envs.VLLM_RBLN_COMPILE_STRICT_MODE:
-            options["mode"] = "strict"
+            modes.append("strict")
+        if use_dt:
+            modes.append("no_export_fallback")
+        if modes:
+            options["mode"] = modes
 
         if has_torch_rbln or use_dt:
             options["tensor_parallel_size"] = 1
