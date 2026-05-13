@@ -1351,6 +1351,68 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self.num_decode_draft_tokens.np[num_reqs:].fill(-1)
             self.num_decode_draft_tokens.copy_to_gpu()
 
+            # Diagnostic trace: dump key sliding-window invariants for
+            # every sliding event of the first N reqs that hit sliding
+            # (per worker). Captures the FULL per-req sequence — 1021,
+            # 1022, 1023 boundary events for the same req end up in
+            # contiguous log lines so the timeline can be reconstructed.
+            # Verifies past prepend, slot_mapping range, logits-indices
+            # exclusion, and effective num_draft_tokens. CPU host code
+            # only — outside any compiled model graph. Gated by env var
+            # `VLLM_RBLN_SLIDING_TRACE_REQS` (default 0 = disabled).
+            if not hasattr(self, "_sliding_trace_budget"):
+                self._sliding_trace_budget = int(
+                    os.environ.get("VLLM_RBLN_SLIDING_TRACE_REQS", "0")
+                )
+                self._sliding_trace_reqs: set[str] = set()
+            if slide_distance_map and self._sliding_trace_budget > 0:
+                # MultiGroupBlockTable: access first KV-cache group's
+                # slot_mapping (single group for this model).
+                slot_mapping_np = self.input_batch.block_table[0].slot_mapping.np[
+                    :total_query_tokens
+                ]
+                logits_indices_list = logits_indices.tolist()
+                block_size = self.cache_config.block_size
+                for req_idx_dbg, rid_dbg in enumerate(req_ids):
+                    sd = int(slide_arr[req_idx_dbg])
+                    if sd <= 0:
+                        continue
+                    if rid_dbg in self._sliding_trace_reqs:
+                        pass  # already tracking — dump every event
+                    elif len(self._sliding_trace_reqs) < self._sliding_trace_budget:
+                        self._sliding_trace_reqs.add(rid_dbg)
+                    else:
+                        continue  # budget reached, skip new reqs
+                    s_dbg = (
+                        0 if req_idx_dbg == 0 else int(cu_num_tokens[req_idx_dbg - 1])
+                    )
+                    e_dbg = int(cu_num_tokens[req_idx_dbg])
+                    pos_dbg = positions_np[s_dbg:e_dbg].tolist()
+                    ids_dbg = self.input_ids.cpu[s_dbg:e_dbg].tolist()
+                    sm_dbg = slot_mapping_np[s_dbg:e_dbg].tolist()
+                    sm_blocks = sorted({s // block_size for s in sm_dbg if s >= 0})
+                    li_in_req = [
+                        int(x) for x in logits_indices_list if s_dbg <= int(x) < e_dbg
+                    ]
+                    li_relative = [int(x) - s_dbg for x in li_in_req]
+                    ndt_req = int(num_draft_tokens[req_idx_dbg])
+                    logger.info(
+                        "sliding-trace req=%s slide=%d flat_range=[%d,%d) "
+                        "positions=%s input_ids=%s slot_blocks=%s "
+                        "logits_indices_in_req=%s (relative_to_req=%s) "
+                        "num_draft_tokens=%d",
+                        rid_dbg,
+                        sd,
+                        s_dbg,
+                        e_dbg,
+                        pos_dbg,
+                        ids_dbg,
+                        sm_blocks,
+                        li_in_req,
+                        li_relative,
+                        ndt_req,
+                    )
+
         logits_indices_padded = None
         if self.cache_config.kv_sharing_fast_prefill:
             logits_indices_padded = self._prepare_kv_sharing_fast_prefill(
