@@ -1868,6 +1868,14 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         scheduler_output: "SchedulerOutput",
     ) -> tuple[Any, Any | None, Any, Any, dict[Any, Any]]:
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        # Sliding window: `_prepare_inputs` prepends past tokens to decode
+        # queries, inflating the flat layout beyond the scheduler's logical
+        # advance. Extend `num_input_tokens` so the slice picks up the
+        # past-token prefix that the runner wrote at the tail of the buffer.
+        slide_distance_map = (
+            getattr(scheduler_output, "spec_decode_slide_distance", {}) or {}
+        )
+        num_scheduled_tokens += sum(slide_distance_map.values())
 
         # TODO(RBLN): Support SP
         # Pad tokens to multiple of tensor_parallel_size when
@@ -3014,7 +3022,16 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
             num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
             # max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
-            num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
+            # Sliding window: account for past-token prefixes that
+            # `_prepare_inputs` adds to decode queries. Downstream slicing
+            # (`_preprocess`, `_get_slot_mappings`, `unpadded_to_padded`)
+            # must see the post-sliding flat-token count.
+            _slide_total = sum(
+                getattr(scheduler_output, "spec_decode_slide_distance", {}).values()
+            )
+            num_tokens_unpadded = (
+                scheduler_output.total_num_scheduled_tokens + _slide_total
+            )
 
             # Cross-DP collective decision for boundary-induced no-spec.
             # Scheduler marks `step_no_spec_required` when at least one local
@@ -3135,9 +3152,17 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             max_spec_decode_len = None
 
         if max_spec_decode_len is not None:
+            # Sliding window: per-req unpadded flat length is
+            # scheduled + slide. `pad_speculative_draft_tokens` and the
+            # remap below both rely on this length matching the size of
+            # `input_ids`/`positions` written by `_prepare_inputs`.
+            _slide_distance_map = (
+                getattr(scheduler_output, "spec_decode_slide_distance", {}) or {}
+            )
             num_scheduled_tokens_per_req = torch.tensor(
                 [
                     scheduler_output.num_scheduled_tokens[i]
+                    + _slide_distance_map.get(i, 0)
                     for i in self.input_batch.req_ids
                 ],
                 device=input_ids.device,
