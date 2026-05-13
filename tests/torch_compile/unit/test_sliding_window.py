@@ -331,3 +331,103 @@ class TestRunnerSlidingMath:
             2022,
             2023,
         ]
+
+
+# ---------------------------------------------------------------------------
+# Sampler logits indices: past positions excluded automatically
+# ---------------------------------------------------------------------------
+
+
+class TestSlidingLogitsIndices:
+    """Verify that the existing _calc_spec_decode_metadata math, when fed
+    query-aware cu_num_tokens (= cumsum of query_lengths, sliding-aware),
+    yields logits_indices that point only at the NEW positions of each
+    req's window — past positions are excluded automatically. No code
+    change was required for this; the test pins down the invariant so
+    future refactors don't accidentally break it.
+
+    The formula being exercised (mirroring _calc_spec_decode_metadata):
+        cu_prev_end      = cu_num_scheduled_tokens - num_sampled_tokens
+        logits_indices   = repeat(cu_prev_end, num_sampled_tokens) + arange
+    where
+        num_sampled_tokens      = num_draft_tokens + 1 = effective_remaining
+        cu_num_scheduled_tokens = cumsum of query_lengths (incl. slide)
+    """
+
+    def _calc_logits_indices(self, query_lengths, num_draft_tokens):
+        """Reimplement the per-step block of _calc_spec_decode_metadata as
+        pure numpy. Returns (logits_indices, target_logits_indices,
+        bonus_logits_indices)."""
+        import numpy as np
+
+        query_lengths_np = np.asarray(query_lengths, dtype=np.int32)
+        num_draft = np.asarray(num_draft_tokens, dtype=np.int32)
+        cu_num_scheduled_tokens = np.cumsum(query_lengths_np)
+        num_sampled_tokens = num_draft + 1
+
+        cu_prev_end = cu_num_scheduled_tokens - num_sampled_tokens
+        arange = np.concatenate(
+            [np.arange(s, dtype=np.int32) for s in num_sampled_tokens]
+        )
+        logits_indices = np.repeat(cu_prev_end, num_sampled_tokens) + arange
+
+        cu_num_sampled_tokens = np.cumsum(num_sampled_tokens)
+        if int(num_draft.sum()) > 0:
+            target_arange = np.concatenate(
+                [np.arange(d, dtype=np.int32) for d in num_draft]
+            )
+            target_logits_indices = (
+                np.repeat(cu_num_sampled_tokens - num_sampled_tokens, num_draft)
+                + target_arange
+            )
+        else:
+            target_logits_indices = np.zeros(0, dtype=np.int32)
+        bonus_logits_indices = cu_num_sampled_tokens - 1
+
+        return logits_indices, target_logits_indices, bonus_logits_indices
+
+    def test_no_slide_full_spec_indices(self):
+        """Baseline: no boundary, drafts=3. logits_indices covers all 4
+        sampled positions (base + 3 drafts)."""
+        logits_indices, target, bonus = self._calc_logits_indices(
+            query_lengths=[4], num_draft_tokens=[3]
+        )
+        assert logits_indices.tolist() == [0, 1, 2, 3]
+        assert target.tolist() == [0, 1, 2]
+        assert bonus.tolist() == [3]
+
+    def test_slide_2_drafts_1_skips_past_positions(self):
+        """Boundary slide=2, drafts=1. Flat layout per req =
+        [past, past, base, draft]. logits_indices must skip pasts
+        (flat 0, 1) and only point at base (2) and draft (3)."""
+        logits_indices, target, bonus = self._calc_logits_indices(
+            query_lengths=[4], num_draft_tokens=[1]
+        )
+        assert logits_indices.tolist() == [2, 3]
+        assert target.tolist() == [0]
+        assert bonus.tolist() == [1]
+
+    def test_slide_3_no_drafts_only_base_logit(self):
+        """Extreme boundary (remaining=1): slide=3, drafts=0.
+        Flat layout = [past, past, past, base]. Only the base logit is
+        sampled; no drafts to validate."""
+        logits_indices, target, bonus = self._calc_logits_indices(
+            query_lengths=[4], num_draft_tokens=[0]
+        )
+        assert logits_indices.tolist() == [3]
+        assert target.tolist() == []
+        assert bonus.tolist() == [0]
+
+    def test_mixed_batch_logits_indices_skip_per_req(self):
+        """Two reqs:
+          A: query_length=4, drafts=3 (no slide) -> all 4 positions sampled.
+          B: query_length=4, drafts=1 (slide=2)  -> only base+draft sampled.
+        Flat layout: [A0, A1, A2, A3,  B_past, B_past, B_base, B_draft]
+        Expected logits_indices = [0, 1, 2, 3,  6, 7] (B's pasts 4, 5
+        excluded)."""
+        logits_indices, target, bonus = self._calc_logits_indices(
+            query_lengths=[4, 4], num_draft_tokens=[3, 1]
+        )
+        assert logits_indices.tolist() == [0, 1, 2, 3, 6, 7]
+        assert target.tolist() == [0, 1, 2, 4]
+        assert bonus.tolist() == [3, 5]
