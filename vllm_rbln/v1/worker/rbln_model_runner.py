@@ -1478,12 +1478,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             "tensor_parallel_size": envs.VLLM_RBLN_TP_SIZE,
             "process_group_dict": process_group_dict,
             "guard_filter_fn": torch.compiler.keep_tensor_guards_unsafe,
-            "mode": ["strict", "no_export_fallback"]
-            if envs.VLLM_RBLN_USE_DEVICE_TENSOR
-            else "strict",
+            "mode": "strict",
             "_runtime_holder": self.runtime_holder,
         }
-        if not envs.VLLM_RBLN_USE_DEVICE_TENSOR:
+        if envs.VLLM_RBLN_USE_DEVICE_TENSOR:
+            options["model_trace_method"] = "export"
+        else:
             options["compile_context"] = self.compile_context
         if not envs.VLLM_DISABLE_COMPILE_CACHE:
             logger.info(
