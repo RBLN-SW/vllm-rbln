@@ -131,7 +131,9 @@ class RBLNInputBatch(InputBatch):
             # step pooling during the sampling/pooling process.
             # Hence copy these tensors only when there are requests which
             # need penalties/step_pooler to be applied.
-            # vLLM 0.19 renamed _make_prompt_token_ids_tensor to _cpu_tensor.
+            # NOTE(0.18): _make_prompt_token_ids_tensor was renamed to
+            # _make_prompt_token_ids_cpu_tensor in 0.19. When 0.18 support is
+            # dropped, replace this block with a direct call to _cpu_tensor.
             if hasattr(self, "_make_prompt_token_ids_cpu_tensor"):
                 prompt_token_ids = self._make_prompt_token_ids_cpu_tensor()
             else:

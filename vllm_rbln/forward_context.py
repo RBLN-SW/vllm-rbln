@@ -160,9 +160,10 @@ def _set_forward_context(
             num_padded_tokens,
         )
 
-    # NOTE: We intentionally omit `virtual_engine`. It defaults to 0 on
-    # vLLM 0.18 and is removed in 0.19+, so passing it would either be
-    # a no-op or a TypeError depending on the installed version.
+    # NOTE(0.18): We intentionally omit `virtual_engine`. It defaults to 0
+    # on vLLM 0.18 and is removed in 0.19+, so passing it would either be a
+    # no-op or a TypeError depending on the installed version. When 0.18
+    # support is dropped, this comment can be removed.
     forward_context = create_forward_context(
         attn_metadata,
         vllm_config,
