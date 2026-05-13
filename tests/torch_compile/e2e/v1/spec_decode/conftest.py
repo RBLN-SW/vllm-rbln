@@ -1,4 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
 # Copyright 2025 Rebellions Inc. All rights reserved.
 
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,14 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .common import get_language_model_config
+import pytest
 
 
-def get_param_blip2(
-    batch_size: int, max_model_len: int, block_size: int, tp_size: int
-) -> dict:
-    language_model_config = get_language_model_config(
-        batch_size, max_model_len, block_size, tp_size
-    )
-    param = {"text_model": language_model_config}
-    return param
+@pytest.fixture(scope="module", autouse=True)
+def common_specdec_env(monkeypatch_module):
+    monkeypatch_module.setenv("RBLN_USE_CUSTOM_KERNEL", "1")
+    monkeypatch_module.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
+    monkeypatch_module.setenv("VLLM_DISABLE_COMPILE_CACHE", "1")
+    monkeypatch_module.setenv("VLLM_RBLN_ENABLE_WARM_UP", "1")
+    monkeypatch_module.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")

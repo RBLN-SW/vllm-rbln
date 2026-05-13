@@ -33,10 +33,8 @@ from vllm.utils.torch_utils import _StreamPlaceholder
 
 import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
-from vllm_rbln.utils.optimum.configuration import (
-    is_qwen3_pooling,
-    sync_with_rbln_config,
-)
+from vllm_rbln.utils.optimum.converter import sync_vllm_and_optimum
+from vllm_rbln.utils.optimum.predicates import is_qwen3_pooling
 from vllm_rbln.utils.optimum.registry import (
     is_enc_dec_arch,
     is_multi_modal,
@@ -163,6 +161,17 @@ class RblnPlatform(Platform):
 
         if envs.VLLM_RBLN_USE_VLLM_MODEL:
             cls.validate_and_setup_prerequisite(vllm_config)
+            if envs.VLLM_RBLN_USE_DEVICE_TENSOR:
+                # Use RBLN device tensors for torch.compile/runtime on the
+                # native vLLM model path.
+                RblnPlatform.device_name = "rbln"
+                RblnPlatform.device_type = "rbln"
+                RblnPlatform.dist_backend = "rbln-ccl"
+                vllm_config.device_config.device_type = RblnPlatform.device_type
+                vllm_config.device_config.device = torch.device(
+                    RblnPlatform.device_type
+                )
+
             if envs.VLLM_RBLN_ENFORCE_MODEL_FP32:
                 logger.info("original model_config.dtype = %s", model_config.dtype)
                 if model_config.dtype == torch.bfloat16:
@@ -182,7 +191,6 @@ class RblnPlatform(Platform):
                     logger.info("RBLN enforce draft_model_config.dtype as torch.float")
             else:
                 dtype = model_config.dtype
-                logger.info("original model_config.dtype = %s", dtype)
                 if (
                     dtype != torch.bfloat16
                     and dtype != torch.float16
@@ -269,7 +277,7 @@ class RblnPlatform(Platform):
                     del model_config.__dict__["is_encoder_decoder"]
 
             cls.disable_unsupported_prefix_caching(vllm_config)
-            sync_with_rbln_config(vllm_config)
+            sync_vllm_and_optimum(vllm_config)
 
         if (
             parallel_config.distributed_executor_backend is not None
@@ -319,7 +327,9 @@ class RblnPlatform(Platform):
         if attn_selector_config.use_sparse:
             raise NotImplementedError("Sparse Attention is not supported on RBLN.")
 
-        attn_backend_cls = AttentionBackendEnum.FLASH_ATTN.get_path()
+        attn_backend_cls = (
+            "vllm_rbln.v1.attention.backends.flash_attention.RBLNAttentionBackend"
+        )
         logger.info("Using RBLN Attention Backend: %s", attn_backend_cls)
 
         return attn_backend_cls
@@ -349,7 +359,7 @@ class RblnPlatform(Platform):
 
         else:
             # Prefix caching is supported only for decoder-only models for now.
-            if is_qwen3_pooling(vllm_config):
+            if is_qwen3_pooling(vllm_config.model_config):
                 # Qwen3 pooling model does not support prefix caching for now.
                 cls._disable_prefix_caching(vllm_config, "Qwen3 pooling models")
             elif is_enc_dec_arch(hf_config):

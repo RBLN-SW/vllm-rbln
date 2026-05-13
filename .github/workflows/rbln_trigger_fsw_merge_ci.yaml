@@ -1,0 +1,38 @@
+name: Trigger FSW Merge CI for vLLM-RBLN
+
+on:
+  push:
+    branches: [dev, main]
+    paths:
+      - 'vllm_rbln/**'
+      - 'tests/torch_compile/**'
+      - 'pyproject.toml'
+      - '.github/workflows/rbln_trigger_fsw_merge_ci.yaml'
+
+jobs:
+  trigger-vllm-rbln-fsw-merge-ci:
+    if: github.repository_owner == 'RBLN-SW'
+    runs-on: fsw-r18s-atom-ext-rbln-sw-general-c1m12
+    strategy:
+      fail-fast: false
+      matrix:
+        vllm_version:
+          - "0.18.0+cpu"
+    steps:
+      - name: Dispatch to fsw-integration (vllm ${{ matrix.vllm_version }})
+        uses: Wandalen/wretry.action@v3
+        with:
+          action: peter-evans/repository-dispatch@v4
+          attempt_limit: 5
+          attempt_delay: 2000
+          with: |
+            token: ${{ secrets.GIT_PAT }}
+            repository: rebellions-sw/fsw-integration
+            event-type: vllm-rbln-merge-event
+            client-payload: |
+              {
+                "ref": "${{ github.ref_name }}",
+                "sha": "${{ github.sha }}",
+                "actor": "${{ github.actor }}",
+                "vllm_version": "${{ matrix.vllm_version }}"
+              }

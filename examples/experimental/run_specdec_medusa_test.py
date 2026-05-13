@@ -23,7 +23,6 @@ os.environ["VLLM_RBLN_USE_VLLM_MODEL"] = "1"
 os.environ["VLLM_RBLN_COMPILE_STRICT_MODE"] = "1"
 os.environ["VLLM_DISABLE_COMPILE_CACHE"] = "1"
 os.environ["VLLM_RBLN_ENABLE_WARM_UP"] = "1"
-os.environ["VLLM_RBLN_SAMPLER"] = "0"
 
 import torch
 from huggingface_hub import hf_hub_download
@@ -234,7 +233,6 @@ def main() -> None:
         },
         disable_log_stats=False,
         tensor_parallel_size=args.tensor_parallel_size,
-        gpu_memory_utilization=0.8,
     )
 
     sampling_params = SamplingParams(temperature=0.1, top_p=0.9, max_tokens=128)
