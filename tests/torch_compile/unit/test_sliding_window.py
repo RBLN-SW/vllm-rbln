@@ -550,3 +550,75 @@ class TestSlidingDraftTokenExtraction:
         )
         # A's 3 drafts (D1, D2, D3) + B's 1 surviving draft (D1).
         assert draft_tokens.tolist() == [11, 22, 33, 99]
+
+
+# ---------------------------------------------------------------------------
+# Edge cases: spec disabled, prefill-only, boundary not triggered
+# ---------------------------------------------------------------------------
+
+
+class TestSlidingEdgeCases:
+    """Verify the sliding-window logic stays a no-op when spec decode is
+    disabled (num_spec_tokens=0), when the running req is in prefill
+    phase, or when the boundary simply isn't reached. These are the
+    guards the per-req sliding block depends on; a regression that
+    removes one of them would silently change behavior for non-spec or
+    prefill workloads.
+    """
+
+    def test_no_spec_configured_no_slide_entry(self):
+        """num_spec_tokens=0 disables spec entirely; scheduler must not
+        record any slide_distance for any req."""
+        scheduler = create_scheduler(
+            block_size=_BLOCK_SIZE,
+            num_blocks=100,
+            max_num_seqs=10,
+            num_speculative_tokens=None,  # spec decode OFF
+        )
+        req = _request(1022, "A")  # would be a boundary case if spec were on
+        advance_to_decode(scheduler, req)
+
+        sched_out = scheduler.schedule()
+
+        # No slide map entries when spec decode is disabled.
+        assert sched_out.spec_decode_slide_distance == {}
+        # Standard single-token decode advance.
+        assert sched_out.num_scheduled_tokens[req.request_id] == 1
+        assert req.request_id not in sched_out.scheduled_spec_decode_tokens
+
+    def test_prefill_req_no_slide_entry(self):
+        """The sliding decision is gated on `not is_prefill(request)`,
+        so a req still in prefill must never appear in
+        spec_decode_slide_distance even if num_computed % block_size is
+        near the boundary."""
+        scheduler = _scheduler()
+        # Long prompt so we'd hit boundary IF this were a decode req.
+        req = _request(1022, "A")
+        # Do NOT advance_to_decode — leave the req in prefill phase.
+        scheduler.add_request(req)
+
+        sched_out = scheduler.schedule()
+
+        # Prefill reqs are excluded from the sliding block (is_prefill
+        # guard), so the dict stays empty regardless of position-in-block.
+        assert sched_out.spec_decode_slide_distance == {}
+
+    def test_no_boundary_no_slide_entry_far_from_block_end(self):
+        """A decode req whose full num_spec_tokens+1 window fits inside
+        the current block must not get a slide entry (sanity for the
+        condition `effective_remaining < max_spec_decode_len`)."""
+        scheduler = _scheduler()
+        # remaining_in_block from this position = block_size - 100 = 924,
+        # comfortably larger than max_spec_decode_len (4).
+        req = _request(100, "A")
+        advance_to_decode(scheduler, req)
+        req.spec_token_ids = [11, 22, 33]
+
+        sched_out = scheduler.schedule()
+
+        assert req.request_id not in sched_out.spec_decode_slide_distance
+        assert sched_out.num_scheduled_tokens[req.request_id] == _MAX_SPEC_DECODE_LEN
+        assert (
+            len(sched_out.scheduled_spec_decode_tokens[req.request_id])
+            == _NUM_SPEC_TOKENS
+        )
