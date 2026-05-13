@@ -69,11 +69,13 @@ def _resolve_kv_cache(attn_metadata, layer_index: int) -> torch.Tensor:
 
 
 def _rbln_get_attention_context(layer_name: str):
-    # NOTE(RBLN) - Upstream get_attention_context() reads
-    # `attn_layer.kv_cache`. Under torch.compile, that attribute access is
-    # lifted into the graph as a buffer (a meta tensor on RBLN), which later
-    # fails in rebel-compiler's `.cpu()` conversion. Reimplement locally and
-    # skip the `.kv_cache` attribute read entirely.
+    # NOTE(0.19): Upstream get_attention_context() in 0.19+ reads
+    # `attn_layer.kv_cache` as part of its return tuple. Under torch.compile
+    # that attribute access is lifted into the FX graph as a buffer (a meta
+    # tensor on RBLN), which later fails in rebel-compiler's `.cpu()`
+    # conversion. Reimplement locally and skip the `.kv_cache` attribute
+    # read entirely. If upstream stops lifting the buffer, this override can
+    # be replaced with a direct call to `get_attention_context`.
     forward_context = get_forward_context()
     attn_metadata = forward_context.attn_metadata
     if isinstance(attn_metadata, dict):
