@@ -342,93 +342,98 @@ class RBLNScheduler(Scheduler):
                 # next step when applicable.
                 request.spec_token_ids = []
 
-            # NOTE(RBLN): Full-spec-or-no-spec block-boundary decision.
-            # Under fixed-length spec decode the runtime query length must be
-            # exactly 1 (no-spec) or num_spec_tokens + 1 (full spec) — these
-            # are the only two warmup-compiled shapes. Pick a binary
-            # per-request cap (max_spec_decode_len when this req's
-            # remaining block / maxlen can hold a full-spec window, else 1)
-            # and propagate the tightest local choice to spec_decode_cap.
-            # The retroactive trim below uses the final cap to align every
-            # scheduled req's num_scheduled_tokens onto the same pow2 shape,
-            # so the runner-side pad to max_spec_decode_len never writes
-            # past anyone's block boundary.
-            if not is_prefill(request):
-                if self.num_spec_tokens > 0:
-                    max_spec_decode_len = self.num_spec_tokens + 1
-                    tokens_used_in_block = request.num_computed_tokens % self.block_size
-                    remaining_in_block = self.block_size - tokens_used_in_block
-                    remaining_in_maxlen = (
-                        self.max_model_len - request.num_computed_tokens
+            # NOTE(RBLN): Sliding-window per-request boundary decision.
+            # When a decode req's remaining block / maxlen can no longer
+            # hold a full num_spec_tokens+1 window, slide the query window
+            # backward by `desired_slide` past positions whose KV is
+            # already in the current block. The runner re-feeds those past
+            # tokens (idempotent KV re-write) and drops their logits from
+            # sampling, so the effective advance per step is capped at
+            # `effective_remaining` while no KV write crosses the block
+            # boundary. Drafts that would land past the boundary get
+            # trimmed in `scheduled_spec_decode_tokens`. Peers in the
+            # same batch that aren't near a boundary keep running full
+            # spec — the decision is purely per-request.
+            if not is_prefill(request) and self.num_spec_tokens > 0:
+                max_spec_decode_len = self.num_spec_tokens + 1
+                tokens_used_in_block = request.num_computed_tokens % self.block_size
+                remaining_in_block = self.block_size - tokens_used_in_block
+                remaining_in_maxlen = self.max_model_len - request.num_computed_tokens
+                effective_remaining = min(remaining_in_block, remaining_in_maxlen)
+
+                if effective_remaining < max_spec_decode_len:
+                    # Boundary case: slide the query window backward by
+                    # `desired_slide` past positions so the full window
+                    # stays within already-allocated KV slots. By
+                    # construction past tokens are always sufficient
+                    # when boundary is reached — for remaining_in_block
+                    # to drop below num_spec_tokens+1 the req must have
+                    # num_computed_tokens >= block_size - num_spec_tokens,
+                    # which dominates desired_slide (<= num_spec_tokens)
+                    # for any sane block_size >= num_spec_tokens+1. So
+                    # we assert the invariant rather than maintain a
+                    # no-spec fallback.
+                    req_id = request.request_id
+                    old_n = num_scheduled_tokens[req_id]
+                    desired_slide = max_spec_decode_len - effective_remaining
+                    available_past = request.num_computed_tokens
+                    assert effective_remaining >= 1, (
+                        f"effective_remaining must be >= 1; req {req_id} has "
+                        f"remaining_in_block={remaining_in_block}, "
+                        f"remaining_in_maxlen={remaining_in_maxlen}"
                     )
-                    effective_remaining = min(remaining_in_block, remaining_in_maxlen)
+                    assert desired_slide <= available_past, (
+                        f"sliding window requires available_past "
+                        f"({available_past}) >= desired_slide "
+                        f"({desired_slide}); req {req_id}. This indicates "
+                        f"block_size ({self.block_size}) < "
+                        f"num_spec_tokens + 1 ({max_spec_decode_len}), "
+                        f"which is unsupported."
+                    )
+                    new_n = effective_remaining
+                    spec_decode_slide_distance[req_id] = desired_slide
+                    # Diagnostic log so end-to-end runs make the
+                    # sliding decision observable. Fires only when
+                    # a req actually hits a block boundary, so the
+                    # rate is bounded by ~num_spec_tokens /
+                    # block_size per req per step (≈0.3% for the
+                    # typical 1024-block / 3-draft config).
+                    # `proposed_drafts` is what the ngram proposer
+                    # returned BEFORE the sliding-induced trim
+                    # (= old_n - 1). Compare against `kept_drafts`
+                    # (= max(new_n - 1, 0)) to see when sliding
+                    # drops drafts: proposed_drafts > kept_drafts
+                    # means the boundary forced some drafts out.
+                    logger.info(
+                        "spec-decode sliding: req=%s "
+                        "num_computed=%d remaining_in_block=%d "
+                        "remaining_in_maxlen=%d slide=%d "
+                        "advance=%d proposed_drafts=%d kept_drafts=%d",
+                        req_id,
+                        request.num_computed_tokens,
+                        remaining_in_block,
+                        remaining_in_maxlen,
+                        desired_slide,
+                        new_n,
+                        max(old_n - 1, 0),
+                        max(new_n - 1, 0),
+                    )
 
-                    if effective_remaining < max_spec_decode_len:
-                        # Boundary case: slide the query window backward by
-                        # `desired_slide` past positions so the full window
-                        # stays within already-allocated KV slots. By
-                        # construction past tokens are always sufficient
-                        # when boundary is reached — for remaining_in_block
-                        # to drop below num_spec_tokens+1 the req must have
-                        # num_computed_tokens >= block_size - num_spec_tokens,
-                        # which dominates desired_slide (<= num_spec_tokens)
-                        # for any sane block_size >= num_spec_tokens+1. So
-                        # we assert the invariant rather than maintain a
-                        # no-spec fallback.
-                        req_id = request.request_id
-                        old_n = num_scheduled_tokens[req_id]
-                        desired_slide = max_spec_decode_len - effective_remaining
-                        available_past = request.num_computed_tokens
-                        assert effective_remaining >= 1, (
-                            f"effective_remaining must be >= 1; req {req_id} has "
-                            f"remaining_in_block={remaining_in_block}, "
-                            f"remaining_in_maxlen={remaining_in_maxlen}"
+                    if old_n > new_n:
+                        token_budget += old_n - new_n
+                        num_scheduled_tokens[req_id] = new_n
+                        num_spec = (
+                            new_n
+                            + request.num_computed_tokens
+                            - request.num_tokens
+                            - request.num_output_placeholders
                         )
-                        assert desired_slide <= available_past, (
-                            f"sliding window requires available_past "
-                            f"({available_past}) >= desired_slide "
-                            f"({desired_slide}); req {req_id}. This indicates "
-                            f"block_size ({self.block_size}) < "
-                            f"num_spec_tokens + 1 ({max_spec_decode_len}), "
-                            f"which is unsupported."
-                        )
-                        new_n = effective_remaining
-                        spec_decode_slide_distance[req_id] = desired_slide
-                        # Diagnostic log so end-to-end runs make the
-                        # sliding decision observable. Fires only when
-                        # a req actually hits a block boundary, so the
-                        # rate is bounded by ~num_spec_tokens /
-                        # block_size per req per step (≈0.3% for the
-                        # typical 1024-block / 3-draft config).
-                        logger.info(
-                            "spec-decode sliding: req=%s "
-                            "num_computed=%d remaining_in_block=%d "
-                            "remaining_in_maxlen=%d slide=%d "
-                            "advance=%d kept_drafts=%d",
-                            req_id,
-                            request.num_computed_tokens,
-                            remaining_in_block,
-                            remaining_in_maxlen,
-                            desired_slide,
-                            new_n,
-                            max(new_n - 1, 0),
-                        )
-
-                        if old_n > new_n:
-                            token_budget += old_n - new_n
-                            num_scheduled_tokens[req_id] = new_n
-                            num_spec = (
-                                new_n
-                                + request.num_computed_tokens
-                                - request.num_tokens
-                                - request.num_output_placeholders
+                        if num_spec > 0 and req_id in scheduled_spec_decode_tokens:
+                            scheduled_spec_decode_tokens[req_id] = (
+                                scheduled_spec_decode_tokens[req_id][:num_spec]
                             )
-                            if num_spec > 0 and req_id in scheduled_spec_decode_tokens:
-                                scheduled_spec_decode_tokens[req_id] = (
-                                    scheduled_spec_decode_tokens[req_id][:num_spec]
-                                )
-                            elif num_spec <= 0:
-                                scheduled_spec_decode_tokens.pop(req_id, None)
+                        elif num_spec <= 0:
+                            scheduled_spec_decode_tokens.pop(req_id, None)
 
             # Encoder-related.
             if encoder_inputs_to_schedule:
