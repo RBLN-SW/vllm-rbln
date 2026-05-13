@@ -431,3 +431,122 @@ class TestSlidingLogitsIndices:
         assert logits_indices.tolist() == [0, 1, 2, 3, 6, 7]
         assert target.tolist() == [0, 1, 2, 4]
         assert bonus.tolist() == [3, 5]
+
+
+# ---------------------------------------------------------------------------
+# Rejection sampler input integrity: draft_token_ids extraction
+# ---------------------------------------------------------------------------
+
+
+class TestSlidingDraftTokenExtraction:
+    """Verify that the draft token ids the rejection sampler validates
+    against are the post-trim drafts (not the pre-slide originals).
+
+    In _calc_spec_decode_metadata the draft token tensor is extracted as:
+        draft_token_ids = input_ids[logits_indices][target_logits_indices + 1]
+    Under sliding, input_ids has past tokens prepended at flat positions
+    [0..slide-1], the base at [slide], and the (effective_remaining-1)
+    surviving drafts at [slide+1..query_length-1]. The extraction must
+    pull exactly those surviving drafts — no past, no original-but-dropped
+    drafts.
+    """
+
+    def _extract_draft_tokens(self, input_ids_flat, query_lengths, num_draft_tokens):
+        """Mirror _calc_spec_decode_metadata's draft_token_ids extraction."""
+        import numpy as np
+
+        query_lengths_np = np.asarray(query_lengths, dtype=np.int32)
+        num_draft = np.asarray(num_draft_tokens, dtype=np.int32)
+        cu_num_scheduled_tokens = np.cumsum(query_lengths_np)
+        num_sampled_tokens = num_draft + 1
+        cu_num_sampled_tokens = np.cumsum(num_sampled_tokens)
+
+        cu_prev_end = cu_num_scheduled_tokens - num_sampled_tokens
+        sampled_arange = np.concatenate(
+            [np.arange(s, dtype=np.int32) for s in num_sampled_tokens]
+        )
+        logits_indices = np.repeat(cu_prev_end, num_sampled_tokens) + sampled_arange
+
+        if int(num_draft.sum()) > 0:
+            draft_arange = np.concatenate(
+                [np.arange(d, dtype=np.int32) for d in num_draft]
+            )
+            target_logits_indices = (
+                np.repeat(cu_num_sampled_tokens - num_sampled_tokens, num_draft)
+                + draft_arange
+            )
+        else:
+            target_logits_indices = np.zeros(0, dtype=np.int32)
+
+        # Equivalent of: input_ids[logits_indices][target_logits_indices + 1]
+        sampled_input_ids = input_ids_flat[logits_indices]
+        if target_logits_indices.size > 0:
+            draft_token_ids = sampled_input_ids[target_logits_indices + 1]
+        else:
+            draft_token_ids = sampled_input_ids[np.zeros(0, dtype=np.int32)]
+        return draft_token_ids
+
+    def test_no_slide_extracts_all_drafts(self):
+        """Baseline: full spec, no slide. Drafts extracted are exactly the
+        proposed drafts D1, D2, D3."""
+        import numpy as np
+
+        # Flat input_ids for 1 req with no slide: [base, D1, D2, D3]
+        input_ids = np.array([500, 11, 22, 33], dtype=np.int32)
+        draft_tokens = self._extract_draft_tokens(
+            input_ids, query_lengths=[4], num_draft_tokens=[3]
+        )
+        assert draft_tokens.tolist() == [11, 22, 33]
+
+    def test_slide_2_extracts_only_surviving_draft(self):
+        """Sliding scenario: slide=2 prepends 2 past tokens; only 1 draft
+        survives the scheduler's trim. The extraction must skip the past
+        slots AND skip the original-but-dropped drafts (D2, D3) — only
+        the kept draft D1 should be returned."""
+        import numpy as np
+
+        # Flat input_ids for boundary req: [past0, past1, base, D1]
+        # Note D2, D3 do NOT appear in input_ids at all — scheduler
+        # already trimmed scheduled_spec_decode_tokens to [D1] before
+        # runner builds input_ids.
+        input_ids = np.array([700, 701, 500, 11], dtype=np.int32)
+        draft_tokens = self._extract_draft_tokens(
+            input_ids, query_lengths=[4], num_draft_tokens=[1]
+        )
+        assert draft_tokens.tolist() == [11]
+
+    def test_slide_3_no_drafts_empty_extraction(self):
+        """Extreme boundary: slide=3, drafts=0. No drafts to extract."""
+        import numpy as np
+
+        input_ids = np.array([700, 701, 702, 500], dtype=np.int32)
+        draft_tokens = self._extract_draft_tokens(
+            input_ids, query_lengths=[4], num_draft_tokens=[0]
+        )
+        assert draft_tokens.tolist() == []
+
+    def test_mixed_batch_extracts_per_req_drafts(self):
+        """Mixed batch: A has 3 drafts (no slide), B has 1 draft
+        (slide=2). Extraction returns A's 3 drafts followed by B's 1
+        surviving draft — nothing from B's past or B's dropped drafts."""
+        import numpy as np
+
+        # A: [a_base, A_D1, A_D2, A_D3], B: [b_past0, b_past1, b_base, B_D1]
+        input_ids = np.array(
+            [
+                100,
+                11,
+                22,
+                33,  # req A
+                700,
+                701,
+                200,
+                99,  # req B
+            ],
+            dtype=np.int32,
+        )
+        draft_tokens = self._extract_draft_tokens(
+            input_ids, query_lengths=[4, 4], num_draft_tokens=[3, 1]
+        )
+        # A's 3 drafts (D1, D2, D3) + B's 1 surviving draft (D1).
+        assert draft_tokens.tolist() == [11, 22, 33, 99]
