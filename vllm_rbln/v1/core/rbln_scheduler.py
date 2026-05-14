@@ -355,27 +355,41 @@ class RBLNScheduler(Scheduler):
             # same batch that aren't near a boundary keep running full
             # spec — the decision is purely per-request.
             if not is_prefill(request) and self.num_spec_tokens > 0:
+                # Unified sliding-window decision: pad every decode
+                # req's query window to a fixed `num_spec_tokens + 1`,
+                # regardless of how many drafts the proposer returned
+                # or whether the req is near a block boundary.
+                #
+                # - Variable-length proposers (ngram, suffix decoding)
+                #   that return fewer than num_spec_tokens drafts → the
+                #   shortage is filled with past positions (sliding
+                #   pads the length deficit, logits at past positions
+                #   are discarded).
+                # - Fixed-length proposers (MTP, EAGLE) → no padding
+                #   needed off the boundary; sliding only fires when
+                #   the boundary squeezes effective_remaining below
+                #   num_spec_tokens + 1.
+                # - Boundary + variable-length combine naturally:
+                #   `new_n = min(old_n, effective_remaining)` caps
+                #   actual advance, and `desired_slide` pads the rest.
+                #
+                # The runner sees a single decode shape
+                # (batch, num_spec_tokens + 1) — no_spec compile
+                # variants and runtime branching are eliminated.
                 max_spec_decode_len = self.num_spec_tokens + 1
                 tokens_used_in_block = request.num_computed_tokens % self.block_size
                 remaining_in_block = self.block_size - tokens_used_in_block
                 remaining_in_maxlen = self.max_model_len - request.num_computed_tokens
                 effective_remaining = min(remaining_in_block, remaining_in_maxlen)
 
-                if effective_remaining < max_spec_decode_len:
-                    # Boundary case: slide the query window backward by
-                    # `desired_slide` past positions so the full window
-                    # stays within already-allocated KV slots. By
-                    # construction past tokens are always sufficient
-                    # when boundary is reached — for remaining_in_block
-                    # to drop below num_spec_tokens+1 the req must have
-                    # num_computed_tokens >= block_size - num_spec_tokens,
-                    # which dominates desired_slide (<= num_spec_tokens)
-                    # for any sane block_size >= num_spec_tokens+1. So
-                    # we assert the invariant rather than maintain a
-                    # no-spec fallback.
-                    req_id = request.request_id
-                    old_n = num_scheduled_tokens[req_id]
-                    desired_slide = max_spec_decode_len - effective_remaining
+                req_id = request.request_id
+                old_n = num_scheduled_tokens[req_id]
+                # Cap actual advance by boundary, then pad query
+                # window length via slide.
+                new_n = min(old_n, effective_remaining)
+                desired_slide = max_spec_decode_len - new_n
+
+                if desired_slide > 0:
                     available_past = request.num_computed_tokens
                     assert effective_remaining >= 1, (
                         f"effective_remaining must be >= 1; req {req_id} has "
@@ -385,25 +399,27 @@ class RBLNScheduler(Scheduler):
                     assert desired_slide <= available_past, (
                         f"sliding window requires available_past "
                         f"({available_past}) >= desired_slide "
-                        f"({desired_slide}); req {req_id}. This indicates "
-                        f"block_size ({self.block_size}) < "
-                        f"num_spec_tokens + 1 ({max_spec_decode_len}), "
-                        f"which is unsupported."
+                        f"({desired_slide}); req {req_id}. This means "
+                        f"the prompt is shorter than num_spec_tokens "
+                        f"({self.num_spec_tokens}); RBLN spec decode "
+                        f"requires prompts of at least num_spec_tokens "
+                        f"committed positions before the first decode."
                     )
-                    new_n = effective_remaining
                     spec_decode_slide_distance[req_id] = desired_slide
                     # Diagnostic log so end-to-end runs make the
-                    # sliding decision observable. Fires only when
-                    # a req actually hits a block boundary, so the
-                    # rate is bounded by ~num_spec_tokens /
-                    # block_size per req per step (≈0.3% for the
-                    # typical 1024-block / 3-draft config).
-                    # `proposed_drafts` is what the ngram proposer
-                    # returned BEFORE the sliding-induced trim
-                    # (= old_n - 1). Compare against `kept_drafts`
-                    # (= max(new_n - 1, 0)) to see when sliding
-                    # drops drafts: proposed_drafts > kept_drafts
-                    # means the boundary forced some drafts out.
+                    # sliding decision observable. Fires for every
+                    # decode step where the query window needs padding
+                    # — either because the proposer returned fewer
+                    # than num_spec_tokens drafts, or because the
+                    # boundary squeezed the advance below
+                    # num_spec_tokens + 1, or both.
+                    # `proposed_drafts` is what the proposer returned
+                    # BEFORE any sliding-induced trim (= old_n - 1).
+                    # Compare against `kept_drafts` (= max(new_n - 1, 0))
+                    # to see when sliding drops drafts:
+                    # proposed_drafts > kept_drafts ⇒ boundary forced
+                    # some drafts out; proposed_drafts == kept_drafts ⇒
+                    # only length padding, no draft drop.
                     logger.info(
                         "spec-decode sliding: req=%s "
                         "num_computed=%d remaining_in_block=%d "
