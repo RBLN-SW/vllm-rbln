@@ -36,7 +36,7 @@ logger = init_logger(__name__)
 # therefore must be stripped before hashing so the same compiled artifact
 # is shared between compile-only and inference invocations.
 _RUNTIME_ONLY_KEYS: frozenset[str] = frozenset(
-    {"create_runtimes", "devices", "kvcache_num_blocks"}
+    {"create_runtimes", "device", "kvcache_num_blocks"}
 )
 
 

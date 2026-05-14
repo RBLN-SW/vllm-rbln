@@ -70,6 +70,8 @@ class RBLNMedusaProposer(MedusaProposer):
             "guard_filter_fn": torch.compiler.keep_tensor_guards_unsafe,
             "mode": "strict",
         }
+        if envs.VLLM_RBLN_USE_DEVICE_TENSOR:
+            options["model_trace_method"] = "export"
         if not envs.VLLM_DISABLE_COMPILE_CACHE:
             options["cache_dir"] = os.path.join(envs.VLLM_CACHE_ROOT, "rbln")
 

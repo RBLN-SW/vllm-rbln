@@ -1481,7 +1481,9 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             "mode": "strict",
             "_runtime_holder": self.runtime_holder,
         }
-        if not envs.VLLM_RBLN_USE_DEVICE_TENSOR:
+        if envs.VLLM_RBLN_USE_DEVICE_TENSOR:
+            options["model_trace_method"] = "export"
+        else:
             options["compile_context"] = self.compile_context
         if not envs.VLLM_DISABLE_COMPILE_CACHE:
             logger.info(
