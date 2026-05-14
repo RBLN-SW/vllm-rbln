@@ -43,6 +43,8 @@ dependencies = [
     "torchvision",
     "torchaudio",
     "optimum-rbln>=0.10.4a0",
+    "rebel-compiler==0.10.4.dev141+g2933521d",
+    "torch-rbln==0.2.1.dev6+g93da0fb",
 ]
 
 [project.optional-dependencies]
@@ -140,11 +142,18 @@ name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
+[[tool.uv.index]]
+name = "rebellions"
+url = "https://pypi.rebellions.in/simple/"
+explicit = true
+
 [tool.uv.sources]
 vllm = { index = "vllm-cpu" }
 torch = { index = "pytorch-cpu" }
 torchvision = { index = "pytorch-cpu" }
 torchaudio = { index = "pytorch-cpu" }
+rebel-compiler = { index = "rebellions" }
+torch-rbln = { index = "rebellions" }
 
 [tool.typos.default]
 binary = false
