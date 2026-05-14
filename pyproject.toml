@@ -144,7 +144,7 @@ explicit = true
 
 [[tool.uv.index]]
 name = "rebellions"
-url = "https://pypi.rebellions.in/simple/"
+url = "https://pypi.rebellions.in/simple"
 explicit = true
 
 [tool.uv.sources]
