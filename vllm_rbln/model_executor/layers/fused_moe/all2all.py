@@ -22,12 +22,9 @@ used to dispatch tokens across data-parallel ranks in MoE layers. It contains:
 - The CCL group ID constant
 """
 
-from typing import Tuple
-
 import numpy as np
 import torch
 from torch import Tensor
-
 
 # ---------------------------------------------------------------------------
 # Mask generation helpers
@@ -67,7 +64,7 @@ def ccl_dispatch_send(
     router_logits: Tensor,
     send_mask: Tensor,
     rank_id: int,
-) -> Tuple[Tensor, Tensor]:
+) -> tuple[Tensor, Tensor]:
     t_dim = hidden_states.shape[0]
     H_dim = hidden_states.shape[1]
     R_dim = send_mask.shape[0]
@@ -90,7 +87,7 @@ def _ccl_dispatch_send_fake(
     router_logits: Tensor,
     send_mask: Tensor,
     rank_id: int,
-) -> Tuple[Tensor, Tensor]:
+) -> tuple[Tensor, Tensor]:
     t_dim = hidden_states.shape[0]
     H_dim = hidden_states.shape[1]
     R_dim = send_mask.shape[0]
@@ -206,7 +203,7 @@ def ccl_combine_send(
     hidden_states: Tensor,
     router_logits: Tensor,
     rank_id: int,
-) -> Tuple[Tensor, Tensor]:
+) -> tuple[Tensor, Tensor]:
     """Combine send: pack per-rank expert outputs for all2all exchange.
 
     Reverse of dispatch_receive — uses sum-reduction over local experts.
@@ -242,7 +239,7 @@ def _ccl_combine_send_fake(
     hidden_states: Tensor,
     router_logits: Tensor,
     rank_id: int,
-) -> Tuple[Tensor, Tensor]:
+) -> tuple[Tensor, Tensor]:
     R_dim = hidden_states.shape[0]
     t_dim = hidden_states.shape[1]
     H_dim = hidden_states.shape[2]

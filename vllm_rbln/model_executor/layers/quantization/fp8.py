@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import torch
-import torch.nn.functional as F
 import vllm.model_executor.layers.quantization.fp8 as upstream
 from torch.nn.parameter import Parameter
 from vllm.distributed import get_tensor_model_parallel_world_size
@@ -420,7 +419,8 @@ def custom_moe_swiglu_group_dequantize(
     - up_proj_scale: [num_experts, intermediate_size, hidden_size // 128]
     - down_proj_weight: [num_experts, intermediate_size, hidden_size]
     - down_proj_scale: [num_experts, hidden_size, intermediate_size // 128]
-    - masked_routing_weights: [num_experts, num_tokens] (token dim may be padded to 64-align)
+    - masked_routing_weights: [num_experts, num_tokens]
+      (token dim may be padded to 64-align)
     - group_size: group size for weight scale
     - e_score_correction_bias: unused (kept for compiler index compatibility)
     - gate_proj_bias: [num_experts, intermediate_size]

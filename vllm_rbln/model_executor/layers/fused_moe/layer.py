@@ -69,12 +69,15 @@ def custom_moe_glu(
     - gate_proj_weight: [num_experts, intermediate_size, hidden_size]
     - up_proj_weight: [num_experts, intermediate_size, hidden_size]
     - down_proj_weight: [num_experts, hidden_size, intermediate_size]
-    - masked_routing_weight: [num_experts, batch * seq_len] (token dim may be padded to 64-align)
+    - masked_routing_weight: [num_experts, batch * seq_len]
+      (token dim may be padded to 64-align)
 
     Returns:
         torch.Tensor: [batch * seq_len, hidden_size]
     """
-    assert hidden_states.dtype == masked_routing_weight.dtype, "hidden_states and masked_routing_weight must have the same dtype"
+    assert hidden_states.dtype == masked_routing_weight.dtype, (
+        "hidden_states and masked_routing_weight must have the same dtype"
+    )
 
     num_tokens = hidden_states.shape[0]
     out = torch.zeros_like(hidden_states)
@@ -210,9 +213,7 @@ def get_tokens_mask_DP(num_tokens: int, dp_rank: int, left=1.0, right=0.0):
     # num_tokens_across_dp: [dp_size]
     my_num_tokens = num_tokens_across_dp[dp_rank]  # scalar tensor
     pos = torch.arange(num_tokens, dtype=torch.int32)  # [t]
-    tokens_mask = torch.where(
-        pos < my_num_tokens, left, right
-    )  # [t]
+    tokens_mask = torch.where(pos < my_num_tokens, left, right)  # [t]
     tokens_mask = tokens_mask.reshape(-1, 1)  # [t, 1]
     return tokens_mask
 
@@ -331,27 +332,32 @@ def fused_moe_forward_rbln(
         # Pad hidden_states to max_pad so all DP ranks have the same tensor size
         hidden_flat = hidden_states.reshape(t, -1)  # [t, H]
         if t < max_pad:
-            hidden_flat = F.pad(hidden_flat, (0, 0, 0, max_pad - t), value=0.0)  # [max_pad, H]
+            hidden_flat = F.pad(
+                hidden_flat, (0, 0, 0, max_pad - t), value=0.0
+            )  # [max_pad, H]
 
         if envs.VLLM_RBLN_DISPATCH_ALL2ALL:
-            # --- Router DP path: local routing → all_gather logits → all2all dispatch later ---
+            # --- Router DP path: local routing → all_gather logits ---
             router_logits = router(hidden_states)
             router_logits_2d = router_logits.reshape(t, -1)  # [t, E]
             E = router_logits_2d.shape[-1]
 
             if t < max_pad:
-                router_logits_2d = F.pad(router_logits_2d, (0, 0, 0, max_pad - t), value=0.0)  # [max_pad, E]
+                router_logits_2d = F.pad(
+                    router_logits_2d, (0, 0, 0, max_pad - t), value=0.0
+                )  # [max_pad, E]
 
             # all_gather router_logits across DP ranks
-            # [max_pad, E] → [1, max_pad*E] → all_gather → [R, max_pad*E] → [R*max_pad, E]
-            rl_flat = router_logits_2d.reshape(1, -1)  # [1, max_pad*E]
+            rl_flat = router_logits_2d.reshape(1, -1)
             all_rl_flat = get_dp_group().all_gather(rl_flat, dim=0)  # [R, max_pad*E]
             all_router_logits = all_rl_flat.reshape(R * max_pad, E)  # [R*max_pad, E]
         else:
             # --- origin/dev path: all-gather hidden first → router on full tokens ---
             # all-gather hidden_states across DP ranks (also serves as dispatch)
             hidden_for_gather = hidden_flat.unsqueeze(0)  # [1, max_pad, H]
-            all_hidden = get_dp_group().all_gather(hidden_for_gather, dim=0)  # [R, max_pad, H]
+            all_hidden = get_dp_group().all_gather(
+                hidden_for_gather, dim=0
+            )  # [R, max_pad, H]
             gathered_hidden = all_hidden.reshape(R * max_pad, H_dim)
 
             # Router on all gathered tokens (no Router DP)
@@ -363,12 +369,12 @@ def fused_moe_forward_rbln(
         # [E, R*max_pad] for dim=0 topk (select top_k experts per token)
         all_router_logits_t = all_router_logits.transpose(0, 1)  # [E, R*max_pad]
 
-        scoring_func = getattr(self, 'scoring_func', 'softmax')
-        e_score_correction_bias = getattr(self, 'e_score_correction_bias', None)
+        scoring_func = getattr(self, "scoring_func", "softmax")
+        e_score_correction_bias = getattr(self, "e_score_correction_bias", None)
 
         ## FIXME(kblee): proper handling for score_func and self.renomalize conditions
         # deepseekv3 style: minimax m2.5
-        if scoring_func == 'sigmoid':
+        if scoring_func == "sigmoid":
             # scores_t = torch.sigmoid(all_router_logits_t)  # [E, R*max_pad]
 
             # sigmoid scoring with optional e_score_correction_bias
@@ -376,10 +382,16 @@ def fused_moe_forward_rbln(
             scores_t = scores.transpose(0, 1)  # [E, R*max_pad]
             scores_for_topk = scores_t
             if e_score_correction_bias is not None:
-                scores_for_topk = scores_t + e_score_correction_bias.unsqueeze(1)  # [E, 1]
+                scores_for_topk = scores_t + e_score_correction_bias.unsqueeze(
+                    1
+                )  # [E, 1]
             _, selected_experts = torch.topk(scores_for_topk, k=self.top_k, dim=0)
-            topk_weights = scores_t.gather(0, selected_experts)  # weights from original scores
-            topk_weights = topk_weights / topk_weights.sum(dim=0, keepdim=True).clamp_min(1e-20)
+            topk_weights = scores_t.gather(
+                0, selected_experts
+            )  # weights from original scores
+            topk_weights = topk_weights / topk_weights.sum(
+                dim=0, keepdim=True
+            ).clamp_min(1e-20)
         elif self.renormalize:
             # post_norm: topk first, then softmax on selected values
             topk_weights, selected_experts = torch.topk(
@@ -408,13 +420,17 @@ def fused_moe_forward_rbln(
             if T <= 8:
                 pad_size = 64 - (T % 64)
                 tokens_mask = F.pad(tokens_mask, (0, pad_size), value=0.0)
-                masked_routing_weights = F.pad(masked_routing_weights, (0, pad_size), value=0.0)
+                masked_routing_weights = F.pad(
+                    masked_routing_weights, (0, pad_size), value=0.0
+                )
 
             # [R*max_pad(+pad), E] * [R*max_pad(+pad), 1] (broadcast)
             masked_routing_weights = masked_routing_weights * tokens_mask
-            masked_routing_weights_depadded = F.pad(masked_routing_weights, (0, -pad_size), value=0.0)
+            masked_routing_weights_depadded = F.pad(
+                masked_routing_weights, (0, -pad_size), value=0.0
+            )
 
-        # --- Pre-compute routing logit slices (used by dispatch and/or combine all2all) ---
+        # --- Pre-compute routing logit slices (used by all2all) ---
         if envs.VLLM_RBLN_DISPATCH_ALL2ALL or envs.VLLM_RBLN_COMBINE_ALL2ALL:
             # all_routing_3d: [E, R, max_pad] for CCL send/receive kernels
             all_routing_3d = masked_routing_weights_depadded.reshape(E, R, max_pad)
@@ -422,10 +438,14 @@ def fused_moe_forward_rbln(
             # Prepare per-rank router_logits slices
             e = E // R  # local experts per rank
             # send_rl: [E, max_pad] — this rank's routing for all experts
-            send_rl = all_routing_3d[:, self.moe_parallel_config.dp_rank, :]  # (E, max_pad)
+            send_rl = all_routing_3d[
+                :, self.moe_parallel_config.dp_rank, :
+            ]  # (E, max_pad)
             # recv_rl: [e, R*max_pad] — local experts' routing across all ranks
             e_start = self.moe_parallel_config.dp_rank * e
-            recv_rl = all_routing_3d[e_start : e_start + e].reshape(e, R * max_pad)  # (e, T)
+            recv_rl = all_routing_3d[e_start : e_start + e].reshape(
+                e, R * max_pad
+            )  # (e, T)
 
         # --- Step 4: Dispatch tokens across DP ranks ---
         if envs.VLLM_RBLN_DISPATCH_ALL2ALL:
@@ -433,13 +453,11 @@ def fused_moe_forward_rbln(
             # hidden_flat: [max_pad, H] (already padded above)
 
             # ccl_dispatch_send
-            send_buffer, send_sizes = (
-                torch.ops.rbln_custom_ops.ccl_dispatch_send(
-                    hidden_flat,
-                    send_rl,
-                    self.send_mask,
-                    self.moe_parallel_config.dp_rank,
-                )
+            send_buffer, send_sizes = torch.ops.rbln_custom_ops.ccl_dispatch_send(
+                hidden_flat,
+                send_rl,
+                self.send_mask,
+                self.moe_parallel_config.dp_rank,
             )
 
             # ccl_all2all_x (naive P2P)
@@ -466,7 +484,7 @@ def fused_moe_forward_rbln(
         final_hidden_states = self.quant_method.apply(
             layer=self,
             x=gathered_hidden,
-            router_logits=masked_routing_weights, # [E*max_pad, T_padded]
+            router_logits=masked_routing_weights,  # [E*max_pad, T_padded]
         )
 
         # --- Step 6: Combine partial results and extract this rank's output ---
@@ -500,7 +518,9 @@ def fused_moe_forward_rbln(
                 combine_recv_buf,
                 send_rl,
                 self.send_mask,
-                combine_3d[self.moe_parallel_config.dp_rank],  # local rank's own contribution
+                combine_3d[
+                    self.moe_parallel_config.dp_rank
+                ],  # local rank's own contribution
                 self.moe_parallel_config.dp_rank,
             )
             # final_hidden_states: (max_pad, H)
@@ -510,9 +530,13 @@ def fused_moe_forward_rbln(
                 # reduce_scatter: each rank receives only its own summed portion
                 hidden_shape_dp = (-1, 1, H_dim)
                 all_hidden_states = final_hidden_states.reshape(hidden_shape_dp)
-                assert all_hidden_states.shape[0] % self.moe_parallel_config.dp_size == 0
+                assert (
+                    all_hidden_states.shape[0] % self.moe_parallel_config.dp_size == 0
+                )
 
-                final_hidden_states = get_dp_group().reduce_scatter(all_hidden_states, dim=0)
+                final_hidden_states = get_dp_group().reduce_scatter(
+                    all_hidden_states, dim=0
+                )
                 assert final_hidden_states.shape[0] == max_pad
             else:
                 all_hidden_states = get_dp_group().all_reduce(final_hidden_states)
@@ -539,18 +563,22 @@ def fused_moe_forward_rbln(
     # transpose to [E, t] for dim=0 topk (matching detach_topk branch)
     router_logits_t = router_logits_2d.transpose(0, 1)  # [E, t]
 
-    scoring_func = getattr(self, 'scoring_func', 'softmax')
-    e_score_correction_bias = getattr(self, 'e_score_correction_bias', None)
+    scoring_func = getattr(self, "scoring_func", "softmax")
+    e_score_correction_bias = getattr(self, "e_score_correction_bias", None)
 
-    if scoring_func == 'sigmoid':
+    if scoring_func == "sigmoid":
         # DeepSeek-V3 style: sigmoid scoring with optional e_score_correction_bias
         scores_t = torch.sigmoid(router_logits_t)  # [E, t]
         scores_for_topk = scores_t
         if e_score_correction_bias is not None:
             scores_for_topk = scores_t + e_score_correction_bias.unsqueeze(1)  # [E, 1]
         _, selected_experts = torch.topk(scores_for_topk, k=self.top_k, dim=0)
-        topk_weights = scores_t.gather(0, selected_experts)  # weights from original scores
-        topk_weights = topk_weights / topk_weights.sum(dim=0, keepdim=True).clamp_min(1e-20)
+        topk_weights = scores_t.gather(
+            0, selected_experts
+        )  # weights from original scores
+        topk_weights = topk_weights / topk_weights.sum(dim=0, keepdim=True).clamp_min(
+            1e-20
+        )
     elif self.renormalize:
         topk_weights, selected_experts = torch.topk(
             router_logits_t, k=self.top_k, dim=0
@@ -581,11 +609,15 @@ def fused_moe_forward_rbln(
         if T <= 8:
             pad_size = 64 - (T % 64)
             tokens_mask = F.pad(tokens_mask, (0, pad_size), value=0.0)
-            masked_routing_weights = F.pad(masked_routing_weights, (0, pad_size), value=0.0)
+            masked_routing_weights = F.pad(
+                masked_routing_weights, (0, pad_size), value=0.0
+            )
 
         # [t(+pad), E] * [t(+pad), 1] (broadcast)
         masked_routing_weights = masked_routing_weights * tokens_mask
-        masked_routing_weights_depadded = F.pad(masked_routing_weights, (0, -pad_size), value=0.0)
+        masked_routing_weights_depadded = F.pad(
+            masked_routing_weights, (0, -pad_size), value=0.0
+        )
 
     # pass as [t, E] to quant_method.apply (it will be reshaped inside)
     final_hidden_states = self.quant_method.apply(
@@ -668,7 +700,9 @@ def _fused_moe_init_with_all2all(self, *args, **kwargs):
     use_dispatch_all2all = envs.VLLM_RBLN_DISPATCH_ALL2ALL
     use_combine_all2all = envs.VLLM_RBLN_COMBINE_ALL2ALL
 
-    if self.moe_parallel_config.dp_size > 1 and (use_dispatch_all2all or use_combine_all2all):
+    if self.moe_parallel_config.dp_size > 1 and (
+        use_dispatch_all2all or use_combine_all2all
+    ):
         R = self.moe_parallel_config.dp_size
         E = self.global_num_experts
         # send_mask doubles as expert_map for combine_receive (same matrix)
@@ -680,15 +714,21 @@ def _fused_moe_init_with_all2all(self, *args, **kwargs):
             ),
         )
         logger.info(
-            f"[RBLN] FusedMoE all2all masks registered "
-            f"(dispatch={use_dispatch_all2all}, combine={use_combine_all2all}): "
-            f"R={R}, E={E}, "
-            f"send_mask={self.send_mask.shape}"
+            "[RBLN] FusedMoE all2all masks registered "
+            "(dispatch=%s, combine=%s): "
+            "R=%s, E=%s, "
+            "send_mask=%s",
+            use_dispatch_all2all,
+            use_combine_all2all,
+            R,
+            E,
+            self.send_mask.shape,
         )
     elif self.moe_parallel_config.dp_size > 1:
         logger.info(
-            f"[RBLN] FusedMoE using all-gather dispatch: "
-            f"R={self.moe_parallel_config.dp_size}, E={self.global_num_experts}"
+            "[RBLN] FusedMoE using all-gather dispatch: R=%s, E=%s",
+            self.moe_parallel_config.dp_size,
+            self.global_num_experts,
         )
 
 

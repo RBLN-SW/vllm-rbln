@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import torch
-import torch.nn.functional as F
 import vllm.model_executor.layers.quantization.mxfp4 as upstream
 from vllm.model_executor.layers.fused_moe import (
     FusedMoE,
@@ -124,7 +123,8 @@ def custom_moe_glu_mxfp4(
     - down_proj_blocks: uint8 [num_experts, hidden_size, intermediate_size // 2]
     - down_proj_scales: [num_experts, hidden_size, intermediate_size // 32]
     - down_proj_bias: [num_experts, hidden_size]
-    - masked_routing_weights: [num_experts, num_tokens] (token dim may be padded to 64-align)
+    - masked_routing_weights: [num_experts, num_tokens]
+      (token dim may be padded to 64-align)
     - alpha: [], constant
     - limit: [], constant
     - expert_map: [num_experts],
@@ -149,7 +149,9 @@ def custom_moe_glu_mxfp4(
 
     # routing weight token dim may be padded to 64-align; slice to actual num_tokens
     # masked_routing_weights: [E, num_tokens(+pad)] → [num_tokens, E]
-    routing_t = masked_routing_weights.transpose(0, 1)[:num_tokens, :]  # [num_tokens, E]
+    routing_t = masked_routing_weights.transpose(0, 1)[
+        :num_tokens, :
+    ]  # [num_tokens, E]
     output = torch.zeros(num_tokens, hidden_size, dtype=dtype)
 
     # Dequantize all expert weights once
@@ -177,15 +179,14 @@ def custom_moe_glu_mxfp4(
             global_expert_idx = local_expert_idx
 
         # Find tokens routed to this expert
-        # top_k_indices: [num_tokens, k]
-        expert_mask = top_k_indices == global_expert_idx  # [num_tokens, k]
-        token_indices, k_indices = expert_mask.nonzero(as_tuple=True)
+        expert_weights = routing_t[:, global_expert_idx]  # [num_tokens]
+        token_indices = expert_weights.nonzero(as_tuple=True)[0]
 
         if len(token_indices) == 0:
             continue
 
         # Get routing weights for these tokens
-        weights = routing_weights[token_indices, k_indices]  # [num_selected_tokens]
+        weights = expert_weights[token_indices]  # [num_selected_tokens]
 
         # Get hidden states for selected tokens
         selected_hidden = hidden_states[token_indices]  # [num_selected, hidden_size]
