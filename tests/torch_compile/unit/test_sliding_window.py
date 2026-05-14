@@ -279,6 +279,63 @@ class TestRunnerSlidingMath:
         assert input_ids.tolist() == [800, 801, 802, 803]
         assert total == _MAX_SPEC_DECODE_LEN
 
+    def test_zero_drafts_non_boundary_slide_full_locally(self):
+        """Local rank with zero drafts off the boundary: previously this
+        rank would have voted query_len=1 (no-spec) and relied on cross-DP
+        MAX to lift to num_spec_tokens+1. Now the scheduler fills the
+        deficit locally via slide=num_spec_tokens, so the runner builds
+        a full num_spec_tokens+1 window without any cross-DP help."""
+        import numpy as np
+
+        max_model_len = 2048
+        token_ids = np.zeros((1, max_model_len), dtype=np.int32)
+        # Past tokens at positions [97..99] then base at 100.
+        token_ids[0, 97] = 970
+        token_ids[0, 98] = 980
+        token_ids[0, 99] = 990
+        token_ids[0, 100] = 1000  # base
+
+        positions, input_ids, total = self._run_sliding_math(
+            num_reqs=1,
+            num_scheduled_per_req=[1],
+            slide_per_req=[_NUM_SPEC_TOKENS],
+            num_computed_per_req=[100],
+            token_ids_cpu=token_ids,
+            max_model_len=max_model_len,
+        )
+
+        # Full num_spec_tokens+1 window built purely locally.
+        assert positions.tolist() == [97, 98, 99, 100]
+        assert input_ids.tolist() == [970, 980, 990, 1000]
+        assert total == _MAX_SPEC_DECODE_LEN
+
+    def test_partial_drafts_non_boundary_slide_pads_remainder(self):
+        """Local rank with 1 draft (out of num_spec_tokens=3) off the
+        boundary: scheduler slides by num_spec - kept = 2 so the window
+        becomes 2 past + 1 base + 1 draft = num_spec_tokens+1."""
+        import numpy as np
+
+        max_model_len = 2048
+        token_ids = np.zeros((1, max_model_len), dtype=np.int32)
+        # Past at [98..99], base at 100, draft at 101.
+        token_ids[0, 98] = 980
+        token_ids[0, 99] = 990
+        token_ids[0, 100] = 1000  # base
+        token_ids[0, 101] = 1010  # draft
+
+        positions, input_ids, total = self._run_sliding_math(
+            num_reqs=1,
+            num_scheduled_per_req=[2],  # 1 base + 1 draft
+            slide_per_req=[2],
+            num_computed_per_req=[100],
+            token_ids_cpu=token_ids,
+            max_model_len=max_model_len,
+        )
+
+        assert positions.tolist() == [98, 99, 100, 101]
+        assert input_ids.tolist() == [980, 990, 1000, 1010]
+        assert total == _MAX_SPEC_DECODE_LEN
+
     def test_mixed_batch_per_req_independence(self):
         """Req A: no slide (full window starts at T). Req B: slide=2.
         Both contribute their own 4-position window into the flat layout
@@ -605,8 +662,9 @@ class TestSlidingEdgeCases:
 
     def test_no_boundary_no_slide_entry_far_from_block_end(self):
         """A decode req whose full num_spec_tokens+1 window fits inside
-        the current block must not get a slide entry (sanity for the
-        condition `effective_remaining < max_spec_decode_len`)."""
+        the current block AND whose proposer returned the full set of
+        drafts must not get a slide entry (sanity for the
+        condition `desired_slide > 0`)."""
         scheduler = _scheduler()
         # remaining_in_block from this position = block_size - 100 = 924,
         # comfortably larger than max_spec_decode_len (4).
@@ -622,3 +680,79 @@ class TestSlidingEdgeCases:
             len(sched_out.scheduled_spec_decode_tokens[req.request_id])
             == _NUM_SPEC_TOKENS
         )
+
+
+# ---------------------------------------------------------------------------
+# Variable-length proposer support: sliding pads query window when the
+# proposer (ngram, suffix decoding, etc.) returns fewer than
+# num_spec_tokens drafts, even off the block boundary. This is the
+# unified always-full-spec design — every decode step's query length is
+# num_spec_tokens + 1 at runtime.
+# ---------------------------------------------------------------------------
+
+
+class TestSlidingVariableLengthPadding:
+    """Verify sliding fires off the boundary when the proposer returns
+    fewer than num_spec_tokens drafts. The shortage is padded with past
+    positions so the runtime query window stays at num_spec_tokens + 1.
+    """
+
+    def test_zero_drafts_far_from_boundary_slides_full(self):
+        """ngram miss (0 drafts proposed) far from any boundary should
+        still record slide_distance = num_spec_tokens so the runtime
+        query window is padded to num_spec_tokens + 1."""
+        scheduler = _scheduler()
+        # num_computed=100, remaining_in_block = 924 (no boundary), but
+        # the proposer returns 0 drafts → padding needed.
+        req = _request(100, "A")
+        advance_to_decode(scheduler, req)
+        # No spec_token_ids set → proposer miss equivalent.
+
+        sched_out = scheduler.schedule()
+
+        rid = req.request_id
+        assert sched_out.spec_decode_slide_distance[rid] == _NUM_SPEC_TOKENS
+        # Actual advance is still 1 (only the base, no drafts kept).
+        assert sched_out.num_scheduled_tokens[rid] == 1
+        assert rid not in sched_out.scheduled_spec_decode_tokens
+
+    def test_partial_drafts_far_from_boundary_slides_to_full(self):
+        """ngram partial hit (k < num_spec drafts) far from boundary
+        should record slide_distance = num_spec_tokens - k so the
+        runtime window is padded to num_spec_tokens + 1."""
+        scheduler = _scheduler()
+        req = _request(100, "A")
+        advance_to_decode(scheduler, req)
+        # Proposer returns 1 draft (< num_spec_tokens=3).
+        req.spec_token_ids = [42]
+
+        sched_out = scheduler.schedule()
+
+        rid = req.request_id
+        # slide = num_spec_tokens (3) - kept_drafts (1) = 2.
+        assert sched_out.spec_decode_slide_distance[rid] == 2
+        # Actual advance: 1 base + 1 draft = 2.
+        assert sched_out.num_scheduled_tokens[rid] == 2
+        # The single proposed draft is retained (boundary didn't squeeze).
+        assert sched_out.scheduled_spec_decode_tokens[rid] == [42]
+
+    def test_partial_drafts_at_boundary_combines_pad_and_trim(self):
+        """When BOTH variable-length padding AND boundary squeeze apply,
+        slide_distance covers the combined deficit and drafts get
+        trimmed to fit `effective_remaining - 1`."""
+        scheduler = _scheduler()
+        # num_computed=1022 → remaining_in_block=2 → effective_remaining=2.
+        req = _request(1022, "A")
+        advance_to_decode(scheduler, req)
+        # Proposer returns 2 drafts.
+        req.spec_token_ids = [11, 22]
+
+        sched_out = scheduler.schedule()
+
+        rid = req.request_id
+        # new_n = min(old_n=3, effective_remaining=2) = 2
+        # slide = max_spec_decode_len(4) - new_n(2) = 2
+        assert sched_out.spec_decode_slide_distance[rid] == 2
+        assert sched_out.num_scheduled_tokens[rid] == 2
+        # Drafts trimmed to (new_n - 1) = 1 kept.
+        assert sched_out.scheduled_spec_decode_tokens[rid] == [11]
