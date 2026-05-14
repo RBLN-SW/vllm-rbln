@@ -111,9 +111,10 @@ class RBLNOptimumWhisperForConditionalGeneration(
             # must still feed every slot. Point unused slots at a scratch
             # block so their K/V writes don't touch the active prefill block
             # or any other request's KV cache.
-            assert model_input.dummy_block is not None, (
-                "Whisper prefill requires dummy_block from the scheduler."
-            )
+            assert (
+                model_input.dummy_block is not None
+                and model_input.dummy_block == self.batch_size
+            ), "Whisper prefill requires dummy_block from the scheduler."
             decoder_block_tables = torch.full(
                 (self.batch_size, 1), model_input.dummy_block, dtype=torch.int16
             )
