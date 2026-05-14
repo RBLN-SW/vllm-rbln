@@ -2,13 +2,28 @@
 
 ## Why this exists
 
-The spec-decode sliding window lets each decode request keep a **fixed
-query length of `num_spec_tokens + 1`** even when its `num_computed_tokens`
-sits near a KV block boundary. Instead of dropping drafts (the old
-collective fallback), the runner slides the query window **backward** by
-`slide_distance` past positions whose KV is already in the current block,
-then discards the past positions' logits at sampling time. The decision is
-**per-request**, so peers in the same batch keep running full spec.
+The spec-decode sliding window gives every decode step a **fixed query
+length of `num_spec_tokens + 1`**, regardless of how many drafts the
+proposer returned or whether the request sits near a KV cache block
+boundary. The scheduler closes any deficit by sliding the query window
+**backward** by `slide_distance` past positions whose KV is already in
+the current block, and the runner re-feeds those past tokens (idempotent
+KV re-write) and discards their logits at sampling time. The decision is
+**per-request and purely local** — no cross-DP collective is needed to
+agree on a common shape because every rank arrives at the same shape
+independently.
+
+This unifies two situations that previously needed different paths:
+
+- **Variable-length proposers** (ngram, suffix decoding): when the
+  proposer returns fewer than `num_spec_tokens` drafts, sliding pads the
+  length deficit so the runtime shape stays at `num_spec_tokens + 1`.
+- **Block boundary**: when `remaining_in_block < num_spec_tokens + 1`,
+  sliding also covers the boundary squeeze, and any drafts that would
+  have crossed the boundary get trimmed in `scheduled_spec_decode_tokens`.
+
+Both paths converge to the same invariant — single-shape decode at
+runtime — so `no_spec` compile variants are no longer needed.
 
 This doc captures the **runtime log evidence** that the design works as
 intended — pulled from a real `vllm bench serve` run on MiniMax-M2.5 (DP=4,
@@ -17,18 +32,18 @@ intended — pulled from a real `vllm bench serve` run on MiniMax-M2.5 (DP=4,
 
 ## What we expect to see
 
-When a request's `num_computed_tokens % block_size` enters
-`{1021, 1022, 1023}` (the last `num_spec_tokens` positions of a 1024 block),
-the scheduler should:
+For every decode step the scheduler should:
 
-1. Slide by `4 − remaining_in_block` past positions.
-2. Trim `scheduled_spec_decode_tokens` so the effective new commit fits in
-   `remaining_in_block`.
+1. Pad each req's query window to `num_spec_tokens + 1` via
+   `slide_distance = max_spec_decode_len − min(old_n, effective_remaining)`.
+2. Trim `scheduled_spec_decode_tokens` only when the boundary actually
+   squeezed the advance (when length-only padding fires, drafts are kept
+   as-is).
 
 And the runner should:
 
-3. Prepend the past tokens to `input_ids` / `positions` so the model sees
-   a full `num_spec_tokens + 1` window.
+3. Prepend the past tokens to `input_ids` / `positions` so the model
+   always sees a `num_spec_tokens + 1` window.
 4. Confine `slot_mapping` to the **current** block — no KV write crosses
    into the next block.
 5. Exclude past positions from `logits_indices` so the rejection sampler
@@ -48,13 +63,18 @@ spec-decode sliding: req=<id>
   slide=<S> advance=<A> proposed_drafts=<P> kept_drafts=<K>
 ```
 
-- `slide` = `num_spec_tokens + 1 − R`: how many past positions to prepend.
-- `advance` = `min(R, M)`: the new `num_scheduled_tokens` cap for this step
-  (1 base + up to `advance − 1` drafts).
-- `proposed_drafts` = `old_n − 1`: how many drafts the ngram proposer
-  actually returned **before** the sliding-induced trim.
-- `kept_drafts` = `max(advance − 1, 0)`: the **cap** on drafts after trim.
-  Drafts are dropped exactly when `proposed_drafts > kept_drafts`.
+- `slide` = `max_spec_decode_len − min(old_n, effective_remaining)`:
+  how many past positions to prepend. Covers both the variable-length
+  proposer deficit (`old_n < max_spec_decode_len`) and the boundary
+  squeeze (`effective_remaining < max_spec_decode_len`).
+- `advance` = `min(old_n, effective_remaining)`: the new
+  `num_scheduled_tokens` cap for this step (1 base + up to `advance − 1`
+  drafts).
+- `proposed_drafts` = `old_n − 1`: how many drafts the proposer actually
+  returned **before** any sliding-induced trim.
+- `kept_drafts` = `max(advance − 1, 0)`: the cap on drafts after trim.
+  Drafts are dropped only when `proposed_drafts > kept_drafts` — for
+  length-only padding (no boundary), they stay equal.
 
 ### Runner (`rbln_model_runner.py`, gated by env var)
 

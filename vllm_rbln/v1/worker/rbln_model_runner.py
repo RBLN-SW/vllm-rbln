@@ -2176,14 +2176,15 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # compile decode graph considering decode batch buckets
         for batch_bucket_size in self.bucketing_manager.decode_batch_buckets:
-            # Full-spec-or-no-spec design: at runtime the per-rank query
-            # length is exactly 1 (single-token decode) or num_spec_tokens + 1
-            # (full spec); intermediate values never occur because the
-            # scheduler enforces a per-request binary block-boundary
-            # decision. Compile exactly those two shapes (or just {1} when
-            # spec decode is disabled).
+            # Always-full-spec design: with sliding window padding, every
+            # decode step's runtime query length is num_spec_tokens + 1
+            # regardless of the proposer's output length or block-boundary
+            # position. The scheduler enforces this by sliding the query
+            # window backward to cover any deficit (variable-length drafts
+            # OR boundary squeeze). Only the spec-disabled case still uses
+            # query_len = 1.
             if self.num_spec_tokens > 0:
-                query_len_range = [1, self.num_spec_tokens + 1]
+                query_len_range = [self.num_spec_tokens + 1]
             else:
                 query_len_range = [1]
             for query_len in query_len_range:
@@ -2690,20 +2691,25 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         assert self.dummy_run_state is not None
         (attn_metadata, num_input_tokens, input_ids, positions) = self.dummy_run_state
 
-        # This rank is DP-idle (no scheduled work). Report query_len=1 so
-        # every DP rank takes the same all-reduce branch in get_dp_padding;
-        # a peer rank running spec decode will raise the cross-DP max above
-        # 1 and we must reshape this rank's dummy input_ids/positions to
-        # match, otherwise (input_ids[1], max_pads_across_dp) doesn't hit a
-        # warmup-compiled slot and triggers a hot-path model_wrapper
-        # recompile.
-        spec_decode_max_query_len = 1 if self.num_spec_tokens > 0 else None
+        # This rank is DP-idle (no scheduled work). Under the always-full-spec
+        # design the runtime model_wrapper shape is unconditionally
+        # (bucket, num_spec_tokens + 1) whenever spec decode is configured —
+        # the scheduler pads every executing rank's query window to that
+        # length via sliding, so a peer's cross-DP MAX vote is always
+        # num_spec_tokens + 1. We must report the same value here (rather
+        # than 1) so the MAX agrees and the shape we drive matches the
+        # warmup-compiled full-spec slot. Reporting 1 would let a all-idle
+        # step collapse to (bucket, 1), which is no longer warmup-compiled
+        # and triggers a hot-path model_wrapper recompile.
+        spec_decode_max_query_len = (
+            self.num_spec_tokens + 1 if self.num_spec_tokens > 0 else None
+        )
         # Participate in the cross-DP step_no_spec_required OR-reduce so
         # peers running execute_model don't block waiting for our collective
         # vote. An idle dummy_run rank never trips a local boundary, so we
-        # always contribute 0. We don't need the result locally — dummy_run
-        # already uses query_len=1 and will shape-match via the existing
-        # max_tokens_per_req_across_dp gather below.
+        # always contribute 0. (The OR-reduce itself is now a no-op under
+        # the always-full-spec design, but the collective is kept for shape
+        # uniformity guarantees with peers.)
         dp_size = self.vllm_config.parallel_config.data_parallel_size
         if dp_size > 1 and self.num_spec_tokens > 0:
             dp_rank = self.vllm_config.parallel_config.data_parallel_rank
@@ -2732,15 +2738,13 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         bucket_input_ids = input_ids[batch_bucket_size]
         bucket_positions = positions[batch_bucket_size]
 
-        if (
-            max_tokens_per_req_across_dp is not None
-            and max_tokens_per_req_across_dp > 1
-        ):
-            # Expand local dummy from (bucket, 1) to (bucket, query_len) with
-            # zero-pad tokens so the shape matches the warmup-compiled spec
-            # decode slot used by peers this step. Values are irrelevant —
-            # the output of an idle DP rank is discarded.
-            ql = max_tokens_per_req_across_dp
+        if self.num_spec_tokens > 0:
+            # Expand local dummy from (bucket, 1) to
+            # (bucket, num_spec_tokens + 1) with zero-pad tokens so the
+            # shape matches the single warmup-compiled full-spec decode
+            # slot. Values are irrelevant — an idle DP rank's output is
+            # discarded.
+            ql = self.num_spec_tokens + 1
             bucket_input_ids = torch.zeros(
                 (bucket_input_ids.shape[0], ql),
                 device=bucket_input_ids.device,
@@ -3140,18 +3144,16 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
                 num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
 
-            # Local query_len choice on top of (possibly scrubbed) state.
-            # Reporting on every rank (1 when no local drafts) keeps the
-            # get_dp_padding all-reduce structure consistent. Cross-DP MAX
-            # inside get_dp_padding lifts no-drafts ranks up to peers'
-            # query_len=num_spec_tokens+1 for shape uniformity.
+            # Always-full-spec design: the scheduler pads every decode
+            # req's query window to num_spec_tokens + 1 via sliding, so
+            # this rank's local query length is unconditionally
+            # num_spec_tokens + 1 whenever spec is configured. The
+            # cross-DP MAX inside get_dp_padding is effectively a no-op
+            # (every rank votes the same value) but kept for shape
+            # uniformity guarantees.
             spec_decode_max_query_len: int | None = None
             if self.num_spec_tokens > 0:
-                spec_decode_max_query_len = (
-                    self.num_spec_tokens + 1
-                    if scheduler_output.scheduled_spec_decode_tokens
-                    else 1
-                )
+                spec_decode_max_query_len = self.num_spec_tokens + 1
 
             # Prepare the decoder inputs.
             (
