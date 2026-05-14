@@ -541,7 +541,7 @@ class RBLNOptimumScheduler(Scheduler):
             # The dummy block is pinned to the last block in the pool, which
             # is removed from the free queue and never allocated to a real
             # request.
-            dummy_block = 6
+            dummy_block = self.kv_cache_manager.get_dummy_block()
         elif self.cache_config.enable_prefix_caching:
             num_decode_reqs = len(scheduled_running_reqs)
             if num_decode_reqs > 0 and num_decode_reqs < self.max_num_running_reqs:

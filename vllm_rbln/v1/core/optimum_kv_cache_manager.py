@@ -216,5 +216,8 @@ class RBLNKVCacheManager(KVCacheManager):
         # prefix caching uses a separate dummy block managed by the prefix
         # cache manager.
         if self.block_pool.dummy_block is not None:
+            # In V1, block ID 0 is the null_block, so scheduler-side block
+            # IDs start at 1. The compiler expects valid blocks to start at
+            # 0, so shift by -1 to translate into compiler-space.
             return self.block_pool.dummy_block.block_id - 1
         return self.prefix_cache_manager.get_dummy_block()
