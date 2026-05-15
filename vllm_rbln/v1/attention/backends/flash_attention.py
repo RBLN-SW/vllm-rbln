@@ -1069,6 +1069,25 @@ class RBLNFlashAttentionMetadataBuilder(
         self.is_causal = envs.VLLM_RBLN_FLASH_CAUSAL_ATTN
         self.is_batch_attention_opt = envs.VLLM_RBLN_BATCH_ATTN_OPT
 
+        self._swa_cache_seq_lens_buf: torch.Tensor | None = None
+        self._swa_cache_offsets_buf: torch.Tensor | None = None
+
+    def _to_device_inplace(
+        self, cpu_tensor: torch.Tensor, attr_name: str
+    ) -> torch.Tensor:
+        buf: torch.Tensor | None = getattr(self, attr_name)
+        if (
+            buf is None
+            or buf.shape != cpu_tensor.shape
+            or buf.dtype != cpu_tensor.dtype
+        ):
+            buf = torch.empty(
+                cpu_tensor.shape, dtype=cpu_tensor.dtype, device=self.device
+            )
+            setattr(self, attr_name, buf)
+        buf.copy_(cpu_tensor)
+        return buf
+
     def reorder_batch(
         self, input_batch: "InputBatch", scheduler_output: "SchedulerOutput"
     ) -> bool:
@@ -1083,6 +1102,7 @@ class RBLNFlashAttentionMetadataBuilder(
         batch_pad=None,
         is_prefill=False,
     ) -> RBLNFlashAttentionMetadata:
+        use_dt = envs.VLLM_RBLN_USE_DEVICE_TENSOR
         num_reqs = common_attn_metadata.num_reqs
         num_actual_tokens = common_attn_metadata.num_actual_tokens
         max_query_len = common_attn_metadata.max_query_len
@@ -1091,15 +1111,28 @@ class RBLNFlashAttentionMetadataBuilder(
         seq_lens = common_attn_metadata.seq_lens
         block_tables_tensor = common_attn_metadata.block_table_tensor
         slot_mapping = common_attn_metadata.slot_mapping
-        query_seq_lens = query_start_loc[1:] - query_start_loc[:-1]
-        num_computed_tokens = seq_lens - query_seq_lens
+        if use_dt:
+            # Prefer the pre-existing CPU copy to avoid an extra D2H sync;
+            # arithmetic stays on CPU until .to(self.device) in the constructor.
+            query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
+            _seq_lens_cpu = common_attn_metadata._seq_lens_cpu
+            seq_lens_cpu = (
+                _seq_lens_cpu[:num_reqs]
+                if _seq_lens_cpu is not None
+                else seq_lens[:num_reqs].cpu()
+            )
+            query_seq_lens = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+            num_computed_tokens_cpu = seq_lens_cpu - query_seq_lens
+            seq_idx = positions[query_start_loc_cpu[:num_reqs]].view(-1, 1)
+        else:
+            query_seq_lens = query_start_loc[1:] - query_start_loc[:-1]
+            num_computed_tokens = seq_lens - query_seq_lens
+            seq_idx = positions[query_start_loc[:num_reqs]].view(-1, 1)
 
         cu_prefix_query_lens = None
         prefix_kv_lens = None
         suffix_kv_lens = None
         prefix_scheduler_metadata = None
-
-        seq_idx = positions[query_start_loc[:num_reqs]].view(-1, 1)
 
         # The length of the partition equals the block size.
         partition_len = self.block_size
@@ -1158,7 +1191,9 @@ class RBLNFlashAttentionMetadataBuilder(
                     max_seq_len,
                     dtype=torch.float16 if self.enforce_eager else torch.float32,
                 )
-                for batch_index, batch_step in enumerate(seq_lens):
+                for batch_index, batch_step in enumerate(
+                    seq_lens_cpu if use_dt else seq_lens
+                ):
                     decode_attention_mask[batch_index, :, :, :, : batch_step + 1] = 1
                 attn_masks = decode_attention_mask
                 attn_masks = attn_masks.to(self.device)
@@ -1168,10 +1203,12 @@ class RBLNFlashAttentionMetadataBuilder(
         local_block_tables = None
         swa_attn_masks = None
         if sliding_window := getattr(self.kv_cache_spec, "sliding_window", None):
-            num_computed_tokens = (
-                num_computed_tokens[:num_reqs].view(-1, 1).to(torch.int16)
+            nct_src = (
+                num_computed_tokens_cpu if use_dt else num_computed_tokens[:num_reqs]
             )
-            seq_lens = seq_lens[:num_reqs].view(-1, 1).to(torch.int16)
+            sl_src = seq_lens_cpu if use_dt else seq_lens[:num_reqs]
+            num_computed_tokens = nct_src.view(-1, 1).to(torch.int16)
+            seq_lens = sl_src.view(-1, 1).to(torch.int16)
             query_lens = seq_lens - num_computed_tokens
             cache_seq_lens = torch.clamp(num_computed_tokens, max=sliding_window)
             cache_offsets = cache_seq_lens + query_lens
@@ -1210,10 +1247,14 @@ class RBLNFlashAttentionMetadataBuilder(
             prefix_scheduler_metadata=prefix_scheduler_metadata,
             is_prefill=is_prefill,
             attn_masks=attn_masks,
-            cache_seq_lens=cache_seq_lens.to(self.device)
+            cache_seq_lens=self._to_device_inplace(
+                cache_seq_lens, "_swa_cache_seq_lens_buf"
+            )
             if cache_seq_lens is not None
             else None,
-            cache_offsets=cache_offsets.to(self.device)
+            cache_offsets=self._to_device_inplace(
+                cache_offsets, "_swa_cache_offsets_buf"
+            )
             if cache_offsets is not None
             else None,
             local_block_tables=local_block_tables.to(self.device)

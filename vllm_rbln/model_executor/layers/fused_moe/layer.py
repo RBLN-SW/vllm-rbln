@@ -53,6 +53,7 @@ if envs.VLLM_RBLN_MOE_USE_OPT_KERNEL:
         up_proj_weight: torch.Tensor,
         down_proj_weight: torch.Tensor,
         masked_routing_weight: torch.Tensor,
+        scoring_func: str,
         topk: int,
         post_norm: bool,
         expert_map: torch.Tensor | None = None,
@@ -91,6 +92,7 @@ if envs.VLLM_RBLN_MOE_USE_OPT_KERNEL:
         up_proj_weight: torch.Tensor,
         down_proj_weight: torch.Tensor,
         masked_routing_weight: torch.Tensor,
+        scoring_func: str,
         topk: int,
         post_norm: bool,
         expert_map: torch.Tensor | None = None,
@@ -241,7 +243,7 @@ def unquantized_fused_moe_method_rbln(
     return final_hidden_states.reshape(orig_shape)
 
 
-def get_tokens_mask(num_tokens: int, left=1.0, right=0.0):
+def get_tokens_mask(num_tokens: int, left=1.0, right=0.0, device=None):
     num_tokens_across_dp = get_forward_context().dp_metadata.num_tokens_across_dp_cpu
     num_tokens_across_dp = num_tokens_across_dp.unsqueeze(1)
     if num_tokens_across_dp.size(0) == 1:
@@ -253,6 +255,8 @@ def get_tokens_mask(num_tokens: int, left=1.0, right=0.0):
         pos < num_tokens_across_dp, left, right
     )  # [dp_size, max_pad]
     tokens_mask = tokens_mask.reshape(-1, 1)  # [dp_size * max_pad, 1]
+    if device is not None:
+        tokens_mask = tokens_mask.to(device)
     return tokens_mask
 
 
@@ -273,7 +277,9 @@ def get_masked_routing_weights(router_logits, top_k, renormalize, expert_map):
 
     use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
     if use_moe_tokens_mask:
-        tokens_mask = get_tokens_mask(router_logits.shape[0], 1.0, 0.0)
+        tokens_mask = get_tokens_mask(
+            router_logits.shape[0], 1.0, 0.0, device=selected_weights.device
+        )
         selected_weights = selected_weights * tokens_mask
 
     n_expert = router_logits.shape[1]
@@ -339,7 +345,7 @@ def unquantized_fused_moe_method_custom(
     tokens_mask = None
     use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
     if use_moe_tokens_mask:
-        tokens_mask = get_tokens_mask(num_tokens)
+        tokens_mask = get_tokens_mask(num_tokens, device=router_logits.device)
 
     final_hidden_states = torch.ops.rbln_custom_ops.custom_moe_glu(
         hidden_states,
@@ -381,6 +387,16 @@ def unquantized_fused_optimize_moe_method_custom(
     hidden_states = x.reshape(num_tokens, -1)
     router_logits = router_logits.reshape(num_tokens, -1)
 
+    # Pre-score routing inputs at caller side; compiler custom op routing
+    # expects already-scored values (no sigmoid applied inside the kernel).
+    scoring_func = getattr(layer, "scoring_func", None)
+    assert scoring_func is not None, "FusedMoE.scoring_func must be set"
+    assert scoring_func in {"softmax", "sigmoid"}
+    if scoring_func == "sigmoid":
+        router_logits = torch.sigmoid(router_logits.to(torch.float32)).to(
+            router_logits.dtype
+        )
+
     expert_map_const = None
     if layer.expert_map is not None:
         assert getattr(layer, "expert_map_const", None) is not None
@@ -391,16 +407,19 @@ def unquantized_fused_optimize_moe_method_custom(
     tokens_mask = None
     use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
     if use_moe_tokens_mask:
-        tokens_mask = get_tokens_mask(num_tokens)
+        tokens_mask = get_tokens_mask(num_tokens, device=router_logits.device)
 
     # optimum-rbln/src/optimum/rbln/transformers/models/qwen3_moe/
     # qwen3_moe_architecture.py
+    # Keep argument order aligned with rebel custom_op schema:
+    # (..., router_logits, scoring_func, topk, post_norm, ...)
     final_hidden_states = torch.ops.rbln_custom_ops.custom_moe_glu(
         hidden_states,
         gate_proj_weight,
         up_proj_weight,
         down_proj_weight,
         router_logits,
+        scoring_func,
         layer.top_k,
         layer.renormalize,
         expert_map_const,

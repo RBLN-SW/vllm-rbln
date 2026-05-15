@@ -242,7 +242,7 @@ def test_compile_model_builds_expected_rbln_compile_options(
 
     assert output is compiled_sentinel
     assert captured["model"] is model
-    assert captured["backend"] == "rbln"
+    assert captured["backend"] is medusa_module.logged_rbln_backend
     assert captured["dynamic"] is False
 
     options = cast(dict[str, Any], captured["options"])
