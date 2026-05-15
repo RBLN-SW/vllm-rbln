@@ -23,6 +23,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.medusa import MedusaProposer
 
 import vllm_rbln.rbln_envs as envs
+from vllm_rbln.torch_compile_backend import logged_rbln_backend
 
 
 class RBLNMedusaProposer(MedusaProposer):
@@ -74,7 +75,7 @@ class RBLNMedusaProposer(MedusaProposer):
 
         return torch.compile(
             model,
-            backend="rbln",
+            backend=logged_rbln_backend,
             options=copy(options),
             dynamic=False,
         )

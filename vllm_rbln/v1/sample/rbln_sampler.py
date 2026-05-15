@@ -24,6 +24,7 @@ except ImportError:
     has_torch_rbln = False
 
 from vllm_rbln.logger import init_logger
+from vllm_rbln.torch_compile_backend import logged_rbln_backend
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler as VLLMSampler
 import rebel
@@ -175,7 +176,7 @@ class RBLNTopKTopPSampler(nn.Module):
             rbln_top_k_top_p_sample,
             dynamic=False,
             fullgraph=True,
-            backend="rbln",
+            backend=logged_rbln_backend,
             options=options,
         )
         self.forward = self.forward_rbln

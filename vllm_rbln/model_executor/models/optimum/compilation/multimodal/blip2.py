@@ -22,5 +22,5 @@ def get_param_blip2(
     language_model_config = get_language_model_config(
         batch_size, max_model_len, block_size, tp_size
     )
-    param = {"text_model": language_model_config}
+    param = {"language_model": language_model_config}
     return param
