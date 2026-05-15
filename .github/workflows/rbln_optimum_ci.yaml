@@ -41,8 +41,6 @@ on:
 
 env:
   REBEL_VLLM_PRE_COMPILED_DIR: ${{ secrets.VLLM_PRE_COMPILED_DIR }}
-  RBLN_VERBOSE: 6
-  RBLN_COMPILER_LOG_LEVEL: 5
 
 jobs:
   get-compiler-version:
@@ -62,7 +60,6 @@ jobs:
         shell: bash
     env:
       NUM_INPUT_PROMPT: 1
-      RBLN_VERBOSE: 6
       VLLM_LOGGING_LEVEL: DEBUG
     steps:
       - name: Install uv CLI
@@ -165,7 +162,6 @@ jobs:
         shell: bash
     env:
       NUM_INPUT_PROMPT: 1
-      RBLN_VERBOSE: 6
       VLLM_LOGGING_LEVEL: DEBUG
     steps:
       - name: Install uv CLI
@@ -293,7 +289,6 @@ jobs:
         shell: bash
     env:
       NUM_INPUT_PROMPT: 1
-      RBLN_VERBOSE: 6
       VLLM_LOGGING_LEVEL: DEBUG
     steps:
       - name: Install uv CLI

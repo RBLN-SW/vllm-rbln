@@ -52,10 +52,6 @@ on:
         required: false
         type: string
 
-env:
-  RBLN_VERBOSE: 6
-  RBLN_COMPILER_LOG_LEVEL: 5
-
 jobs:
   pytest:
     name: Pytest (${{ matrix.test_type.name }})
