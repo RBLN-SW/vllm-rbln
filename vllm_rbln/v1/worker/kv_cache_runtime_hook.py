@@ -50,6 +50,50 @@ _TRACE_CALLSITE: bool = (
 )
 _CALLSITE_LOGGED: bool = False
 
+# Mutation hook (zero / random) cap.
+# 매 forward 마다 모든 layer × 모든 block 을 덮는 비용 (≈layer당 수백 ms × 16
+# layer = 수 초 / forward) 이 커서, 첫 N 회 forward 만 mutation 을 실제로 수행
+# 하고 그 이후엔 즉시 return 하도록 제한.
+#
+# 값 의미:
+#   -1 (default): 무제한 — 기존 동작 (매 forward 마다 덮어씀).
+#    0          : never — hook 등록은 되지만 mutation 한 번도 안 함 (no-op).
+#    N (>=1)    : step ∈ [0, N) 에서만 mutation, step >= N 부터 no-op.
+#
+# 주의: 이 cap 은 mutation 모드 (zero/random) 에만 적용. bench / bench_reused /
+# bench_chunked / debug 는 영향 없음.
+#
+# Parity 관점: zero/random 으로 KV cache 를 덮으면 그 이후 forward 의 attention
+# 이 corrupt 된 history 를 read 하므로 일반적으로 parity 가 깨짐. 단:
+#   - 첫 prefill 이전 (= step=0 미실행) 까지만 mutation 했다면 parity 통과 가능
+#   - 단순히 cap 을 작게 두는 것만으론 parity 통과 보장 안 됨. cap 이후의
+#     attention 이 mutation 된 cache 를 read 하지 않는 영역만 사용해야 OK.
+#   - parity check 결과로 시각적으로 확인 권장.
+_MUTATE_MAX_STEPS: int = int(
+    os.environ.get("VLLM_RBLN_KV_CACHE_RT_HOOK_MAX_STEPS", "-1")
+)
+_MUTATE_CAP_NOTIFIED: bool = False
+
+
+def _mutation_capped(step: int) -> bool:
+    """True 면 이 step 에서 mutation 을 skip 해야 함."""
+    return _MUTATE_MAX_STEPS >= 0 and step >= _MUTATE_MAX_STEPS
+
+
+def _maybe_notify_mutation_cap(step: int, mode_label: str) -> None:
+    """Cap 진입 시점에 한 번만 로그를 찍어 사용자가 동작 변화를 인지하도록."""
+    global _MUTATE_CAP_NOTIFIED
+    if _MUTATE_CAP_NOTIFIED:
+        return
+    if _MUTATE_MAX_STEPS >= 0 and step == _MUTATE_MAX_STEPS:
+        print(
+            f"******************** [kv_cache_rt_hook][{mode_label}] mutation "
+            f"cap reached at step={step} (VLLM_RBLN_KV_CACHE_RT_HOOK_MAX_STEPS"
+            f"={_MUTATE_MAX_STEPS}). Subsequent forwards skip mutation.",
+            flush=True,
+        )
+        _MUTATE_CAP_NOTIFIED = True
+
 
 def register_kv_cache_runtime_hook(
     hook: Optional[KVCacheRuntimeHook],
@@ -193,7 +237,13 @@ def _runtime_zero_hook(
     phase: str,
     step: int,
 ) -> None:
-    """모든 layer × 모든 block: fetch → zero → update."""
+    """모든 layer × 모든 block: fetch → zero → update.
+
+    `_MUTATE_MAX_STEPS` cap 으로 초반 N 회 forward 만 실제 mutation 수행.
+    """
+    if _mutation_capped(step):
+        _maybe_notify_mutation_cap(step, "ZERO")
+        return
     for name, layer_t in kv_caches_by_name.items():
         host = _make_host_buffer(layer_t)
         for b in range(num_blocks):
@@ -218,7 +268,13 @@ def _runtime_random_hook(
     phase: str,
     step: int,
 ) -> None:
-    """모든 layer × 모든 block: fetch → N(0,1) → update."""
+    """모든 layer × 모든 block: fetch → N(0,1) → update.
+
+    `_MUTATE_MAX_STEPS` cap 으로 초반 N 회 forward 만 실제 mutation 수행.
+    """
+    if _mutation_capped(step):
+        _maybe_notify_mutation_cap(step, "RAND")
+        return
     for name, layer_t in kv_caches_by_name.items():
         host = _make_host_buffer(layer_t)
         for b in range(num_blocks):
@@ -239,7 +295,7 @@ def _runtime_random_hook(
 # ---------- bench (no mutation, per-layer timer) ------------------------
 
 # Module-level bench stats — per-layer round-trip timings in nanoseconds.
-# Each entry: (fetch_ns, update_ns, bytes, num_blocks_called).
+# Each entry: (fetch_ns, update_ns, bytes, num_calls).
 _BENCH_SAMPLES: List[tuple] = []
 _BENCH_WARMUP_FORWARDS = 2
 
@@ -293,7 +349,7 @@ def _runtime_bench_hook(
         if (step - _BENCH_WARMUP_FORWARDS) % 10 == 0:
             s = runtime_bench_summary()
             if s:
-                print("******************** CUMULATIVE " + s, flush=True)
+                print("******************** CUMULATIVE/LAYER " + s, flush=True)
 
 
 def runtime_bench_summary() -> Optional[str]:
@@ -391,7 +447,7 @@ def _runtime_bench_reused_hook(
         if (step - _BENCH_WARMUP_FORWARDS) % 10 == 0:
             s = runtime_bench_summary()
             if s:
-                print("******************** CUMULATIVE " + s, flush=True)
+                print("******************** CUMULATIVE/LAYER " + s, flush=True)
 
 
 def _runtime_bench_chunked_hook(
@@ -481,7 +537,7 @@ def _runtime_bench_chunked_hook(
                 print("******************** CUMULATIVE/LAYER " + s, flush=True)
             cs = runtime_chunk_summary()
             if cs:
-                print("******************** CUMULATIVE/CHUNK " + cs, flush=True)
+                print("******************** CUMULATIVE/CHUNK\n" + cs, flush=True)
 
 
 def runtime_chunk_summary() -> Optional[str]:
@@ -596,9 +652,9 @@ if _MODE in ("bench", "bench_reused", "bench_chunked"):
     def _print_bench_summary() -> None:
         s = runtime_bench_summary()
         if s:
-            print("******************** LAYER " + s, flush=True)
+            print("******************** FINAL/LAYER " + s, flush=True)
         cs = runtime_chunk_summary()
         if cs:
-            print("******************** CHUNK\n" + cs, flush=True)
+            print("******************** FINAL/CHUNK\n" + cs, flush=True)
 
     atexit.register(_print_bench_summary)

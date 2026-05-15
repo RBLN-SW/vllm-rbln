@@ -52,6 +52,46 @@ _TRACE_CALLSITE: bool = (
 )
 _CALLSITE_LOGGED: bool = False
 
+# Mutation hook (zero / random) cap.
+# 매 forward 마다 모든 layer 를 덮는 비용이 커서, 첫 N 회 forward 만 mutation 을
+# 실제 수행하고 그 이후엔 즉시 return 하도록 제한.
+#
+# 값 의미:
+#   -1 (default): 무제한 — 기존 동작 (매 forward 마다 덮어씀).
+#    0          : never — hook 등록은 되지만 mutation 한 번도 안 함 (no-op).
+#    N (>=1)    : step ∈ [0, N) 에서만 mutation, step >= N 부터 no-op.
+#
+# 주의: 이 cap 은 mutation 모드 (zero/random) 에만 적용. bench / bench_storage /
+# bench_pinned / bench_reused / bench_chunked / bench_base / debug 는 영향 없음.
+#
+# Parity 관점: zero/random 으로 KV cache 를 덮으면 그 이후 forward 의 attention
+# 이 corrupt 된 history 를 read 하므로 일반적으로 parity 가 깨짐. cap 으로 mutation
+# 횟수를 줄여도 parity 통과를 자동 보장하진 않음 — 결과 확인 필요.
+_MUTATE_MAX_STEPS: int = int(
+    os.environ.get("VLLM_RBLN_KV_CACHE_HOOK_MAX_STEPS", "-1")
+)
+_MUTATE_CAP_NOTIFIED: bool = False
+
+
+def _mutation_capped(step: int) -> bool:
+    """True 면 이 step 에서 mutation 을 skip 해야 함."""
+    return _MUTATE_MAX_STEPS >= 0 and step >= _MUTATE_MAX_STEPS
+
+
+def _maybe_notify_mutation_cap(step: int, mode_label: str) -> None:
+    """Cap 진입 시점에 한 번만 로그를 찍어 사용자가 동작 변화를 인지하도록."""
+    global _MUTATE_CAP_NOTIFIED
+    if _MUTATE_CAP_NOTIFIED:
+        return
+    if _MUTATE_MAX_STEPS >= 0 and step == _MUTATE_MAX_STEPS:
+        print(
+            f"******************** [kv_cache_hook][{mode_label}] mutation "
+            f"cap reached at step={step} (VLLM_RBLN_KV_CACHE_HOOK_MAX_STEPS"
+            f"={_MUTATE_MAX_STEPS}). Subsequent forwards skip mutation.",
+            flush=True,
+        )
+        _MUTATE_CAP_NOTIFIED = True
+
 
 def register_kv_cache_torch_hook(hook: Optional[KVCacheTorchHook]) -> None:
     """Register (or clear, by passing None) the global KV-cache torch hook.
@@ -97,7 +137,7 @@ def run_kv_cache_torch_hook(
     _STEP += 1
 
 
-def _default_debug_hook(
+def _torch_debug_hook(
     kv_caches: Sequence[torch.Tensor], phase: str, step: int
 ) -> None:
     """Round-trip every layer through CPU and log a few stats.
@@ -169,7 +209,12 @@ def _zero_hook(
     Installed via VLLM_RBLN_KV_CACHE_HOOK_MODE=zero. The whole cache buffer
     is zeroed (CPU side) and copied back to device, so the next attention
     sees no history — parity should break sharply.
+
+    `_MUTATE_MAX_STEPS` cap 으로 초반 N 회 forward 만 실제 mutation 수행.
     """
+    if _mutation_capped(step):
+        _maybe_notify_mutation_cap(step, "ZERO")
+        return
     for i, t in enumerate(kv_caches):
         cpu_t = t.to("cpu")
         if i == 0:
@@ -188,7 +233,12 @@ def _random_hook(
     Installed via VLLM_RBLN_KV_CACHE_HOOK_MODE=random. Different garbage
     each step; useful to confirm parity break is from data corruption,
     not from a specific zero pattern.
+
+    `_MUTATE_MAX_STEPS` cap 으로 초반 N 회 forward 만 실제 mutation 수행.
     """
+    if _mutation_capped(step):
+        _maybe_notify_mutation_cap(step, "RAND")
+        return
     for i, t in enumerate(kv_caches):
         cpu_t = t.to("cpu")
         if i == 0:
@@ -261,7 +311,7 @@ def _torch_bench_hook(
         if (step - _BENCH_WARMUP_FORWARDS) % 10 == 0:
             s = torch_bench_summary()
             if s:
-                print("******************** CUMULATIVE " + s, flush=True)
+                print("******************** CUMULATIVE/LAYER " + s, flush=True)
 
 
 def torch_bench_summary() -> Optional[str]:
@@ -381,7 +431,7 @@ def _torch_bench_storage_hook(
         if (step - _BENCH_WARMUP_FORWARDS) % 10 == 0:
             s = torch_bench_summary()
             if s:
-                print("******************** CUMULATIVE " + s, flush=True)
+                print("******************** CUMULATIVE/LAYER " + s, flush=True)
 
 
 # pre-allocated per-layer aligned host buffers; lazily filled on first call.
@@ -450,7 +500,7 @@ def _torch_bench_pinned_hook(
         if (step - _BENCH_WARMUP_FORWARDS) % 10 == 0:
             s = torch_bench_summary()
             if s:
-                print("******************** CUMULATIVE " + s, flush=True)
+                print("******************** CUMULATIVE/LAYER " + s, flush=True)
 
 
 # Chunk bench: chunk-단위 sample (layer 전체 cumulative 는 _BENCH_SAMPLES 에 들어감)
@@ -661,7 +711,7 @@ def _torch_bench_reused_hook(
         if (step - _BENCH_WARMUP_FORWARDS) % 10 == 0:
             s = torch_bench_summary()
             if s:
-                print("******************** CUMULATIVE " + s, flush=True)
+                print("******************** CUMULATIVE/LAYER " + s, flush=True)
 
 
 def _torch_bench_base_hook(
@@ -721,117 +771,26 @@ def _torch_bench_base_hook(
         if (step - _BENCH_WARMUP_FORWARDS) % 5 == 0:
             s = torch_bench_summary()
             if s:
-                print("******************** CUMULATIVE " + s, flush=True)
+                print("******************** CUMULATIVE/LAYER " + s, flush=True)
 
+
+# ---------- env-driven default install ----------------------------------
 
 _MODE = os.environ.get("VLLM_RBLN_KV_CACHE_HOOK_MODE", "").lower()
 _DEBUG_ENV = os.environ.get("VLLM_RBLN_KV_CACHE_HOOK_DEBUG", "0").lower() in (
     "1",
     "true",
 )
-if _MODE == "bench_base":
-    _HOOK = _torch_bench_base_hook
+
+# Mode dispatch — order kept consistent with kv_cache_runtime_hook.py
+# (debug → mutation → bench... in increasing complexity).
+if _MODE == "debug" or _DEBUG_ENV:
+    _HOOK = _torch_debug_hook
     print(
-        "******************** [kv_cache_hook] MODE=bench_base → base tensor "
-        "round-trip (contiguous fast path)",
+        "******************** [kv_cache_hook] MODE=debug → "
+        "round-trip + log per layer (lightweight inspection)",
         flush=True,
     )
-
-    import atexit
-
-    def _print_torch_bench_base_summary() -> None:
-        s = torch_bench_summary()
-        if s:
-            print("******************** FINAL " + s, flush=True)
-
-    atexit.register(_print_torch_bench_base_summary)
-elif _MODE == "bench_chunked":
-    _HOOK = _torch_bench_chunked_hook
-    print(
-        "******************** [kv_cache_hook] MODE=bench_chunked → reused "
-        f"host buffer + chunk-{_BLOCKS_PER_CHUNK} K/V split copy_ "
-        "(per-chunk and per-layer samples both recorded)",
-        flush=True,
-    )
-
-    import atexit
-
-    def _print_torch_bench_chunked_summary() -> None:
-        s = torch_bench_summary()
-        if s:
-            print("******************** FINAL/LAYER " + s, flush=True)
-        cs = torch_chunk_summary()
-        if cs:
-            print("******************** FINAL/CHUNK\n" + cs, flush=True)
-
-    atexit.register(_print_torch_bench_chunked_summary)
-elif _MODE == "bench_reused":
-    _HOOK = _torch_bench_reused_hook
-    print(
-        "******************** [kv_cache_hook] MODE=bench_reused → per-layer "
-        "round-trip using plain torch.empty CPU buffer reused across "
-        "forwards (alignment-free; isolates reuse factor)",
-        flush=True,
-    )
-
-    import atexit
-
-    def _print_torch_bench_reused_summary() -> None:
-        s = torch_bench_summary()
-        if s:
-            print("******************** FINAL " + s, flush=True)
-
-    atexit.register(_print_torch_bench_reused_summary)
-elif _MODE == "bench_pinned":
-    _HOOK = _torch_bench_pinned_hook
-    print(
-        "******************** [kv_cache_hook] MODE=bench_pinned → per-layer "
-        "round-trip using pre-allocated 4KB-aligned host buffer reused "
-        "across forwards (mirrors runtime path's host-side primitive)",
-        flush=True,
-    )
-
-    import atexit
-
-    def _print_torch_bench_pinned_summary() -> None:
-        s = torch_bench_summary()
-        if s:
-            print("******************** FINAL " + s, flush=True)
-
-    atexit.register(_print_torch_bench_pinned_summary)
-elif _MODE == "bench_storage":
-    _HOOK = _torch_bench_storage_hook
-    print(
-        "******************** [kv_cache_hook] MODE=bench_storage → per-layer "
-        "round-trip on view.untyped_storage() wrapped as 1-D int8 contiguous "
-        "(should hit is_direct_copy fast path)",
-        flush=True,
-    )
-
-    import atexit
-
-    def _print_torch_bench_storage_summary() -> None:
-        s = torch_bench_summary()
-        if s:
-            print("******************** FINAL " + s, flush=True)
-
-    atexit.register(_print_torch_bench_storage_summary)
-elif _MODE == "bench":
-    _HOOK = _torch_bench_hook
-    print(
-        "******************** [kv_cache_hook] MODE=bench → per-layer "
-        "round-trip latency timer (no mutation)",
-        flush=True,
-    )
-
-    import atexit
-
-    def _print_torch_bench_summary() -> None:
-        s = torch_bench_summary()
-        if s:
-            print("******************** " + s, flush=True)
-
-    atexit.register(_print_torch_bench_summary)
 elif _MODE == "zero":
     _HOOK = _zero_hook
     print(
@@ -846,11 +805,72 @@ elif _MODE == "random":
         "overwriting KV cache with N(0,1) on every forward",
         flush=True,
     )
-elif _MODE == "debug" or _DEBUG_ENV:
-    _HOOK = _default_debug_hook
+elif _MODE == "bench":
+    _HOOK = _torch_bench_hook
     print(
-        "******************** [kv_cache_hook] "
-        "VLLM_RBLN_KV_CACHE_HOOK_DEBUG=1 → "
-        "default debug hook installed (round-trip + log)",
+        "******************** [kv_cache_hook] MODE=bench → per-layer "
+        "round-trip latency timer (no mutation)",
         flush=True,
     )
+elif _MODE == "bench_reused":
+    _HOOK = _torch_bench_reused_hook
+    print(
+        "******************** [kv_cache_hook] MODE=bench_reused → per-layer "
+        "round-trip using plain torch.empty CPU buffer reused across "
+        "forwards (alignment-free; isolates reuse factor)",
+        flush=True,
+    )
+elif _MODE == "bench_chunked":
+    _HOOK = _torch_bench_chunked_hook
+    print(
+        "******************** [kv_cache_hook] MODE=bench_chunked → reused "
+        f"host buffer + chunk-{_BLOCKS_PER_CHUNK} K/V split copy_ "
+        "(per-chunk and per-layer samples both recorded)",
+        flush=True,
+    )
+elif _MODE == "bench_storage":
+    _HOOK = _torch_bench_storage_hook
+    print(
+        "******************** [kv_cache_hook] MODE=bench_storage → per-layer "
+        "round-trip on view.untyped_storage() wrapped as 1-D int8 contiguous "
+        "(should hit is_direct_copy fast path)",
+        flush=True,
+    )
+elif _MODE == "bench_pinned":
+    _HOOK = _torch_bench_pinned_hook
+    print(
+        "******************** [kv_cache_hook] MODE=bench_pinned → per-layer "
+        "round-trip using pre-allocated 4KB-aligned host buffer reused "
+        "across forwards (mirrors runtime path's host-side primitive)",
+        flush=True,
+    )
+elif _MODE == "bench_base":
+    _HOOK = _torch_bench_base_hook
+    print(
+        "******************** [kv_cache_hook] MODE=bench_base → base tensor "
+        "round-trip (contiguous fast path)",
+        flush=True,
+    )
+
+
+# Register an atexit hook so bench summary is printed at process end if
+# any benchmark mode was active.
+if _MODE in (
+    "bench",
+    "bench_reused",
+    "bench_chunked",
+    "bench_storage",
+    "bench_pinned",
+    "bench_base",
+):
+    import atexit
+
+    def _print_bench_summary() -> None:
+        s = torch_bench_summary()
+        if s:
+            print("******************** FINAL/LAYER " + s, flush=True)
+        cs = torch_chunk_summary()
+        if cs:
+            print("******************** FINAL/CHUNK\n" + cs, flush=True)
+
+    atexit.register(_print_bench_summary)
