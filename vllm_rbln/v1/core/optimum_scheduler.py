@@ -585,9 +585,7 @@ class RBLNOptimumScheduler(Scheduler):
         self._pending_free_mm_hashes = []
         return scheduler_output
 
-    def _free_request(
-        self, request: Request, delay_free_blocks: bool = False
-    ):
+    def _free_request(self, request: Request, delay_free_blocks: bool = False):
         # Capture mm hashes and notify the EC connector before super()
         # tears the request down — base._free_blocks deletes self.requests[id]
         # so we can't recover mm_features afterwards.
