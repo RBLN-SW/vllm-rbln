@@ -54,6 +54,7 @@ on:
 
 env:
   RBLN_VERBOSE: 6
+  RBLN_COMPILER_LOG_LEVEL: 5
 
 jobs:
   pytest:

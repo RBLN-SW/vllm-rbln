@@ -41,6 +41,8 @@ on:
 
 env:
   REBEL_VLLM_PRE_COMPILED_DIR: ${{ secrets.VLLM_PRE_COMPILED_DIR }}
+  RBLN_VERBOSE: 6
+  RBLN_COMPILER_LOG_LEVEL: 5
 
 jobs:
   get-compiler-version:
