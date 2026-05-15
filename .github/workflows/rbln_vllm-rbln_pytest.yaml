@@ -292,8 +292,8 @@ jobs:
             echo "Error: rebel_compiler_version is not set"
             exit 1
           fi
-          echo "rebel-compiler ${VERSION}"
-          uv pip install --system --extra-index-url ${{ secrets.DEV_PKG_URL }} rebel-compiler=="${VERSION}"
+          echo "rebel-compiler ${VERSION}.prod"
+          uv pip install --system --extra-index-url ${{ secrets.DEV_PKG_URL }} rebel-compiler=="${VERSION}.prod"
 
       - name: Download wheel artifact
         if: steps.should_skip.outputs.skip != 'true'
