@@ -170,16 +170,7 @@ class RBLNTopKTopPSampler(nn.Module):
         use_dt = envs.VLLM_RBLN_USE_DEVICE_TENSOR
         options: dict = {}
         if not use_dt:
-            options["compile_context"] = (
-                compile_context
-                if compile_context
-                else (
-                    rebel.CompileContext(use_global_ctx=True)
-                    if "use_global_ctx"
-                    in inspect.signature(rebel.CompileContext).parameters
-                    else rebel.CompileContext()
-                )
-            )
+            options["compile_context"] = compile_context
         if envs.VLLM_RBLN_COMPILE_STRICT_MODE:
             options["mode"] = "strict"
 
@@ -229,6 +220,13 @@ class RBLNSampler(VLLMSampler):
         compile_context: rebel.CompileContext = None,
     ):
         super().__init__()
+        # If using device tensor in rbln_model_runner
+        # or triggered by optimum_model_runner
+        if compile_context is None:
+            if "use_global_ctx" in inspect.signature(rebel.CompileContext).parameters:
+                compile_context = rebel.CompileContext(use_global_ctx=True)
+            else:
+                compile_context = rebel.CompileContext()
         if logprobs_mode in ("raw_logprobs", "raw_logits"):
             self.topk_topp_sampler = RBLNTopKTopPSampler(
                 logprobs_mode=logprobs_mode,
@@ -243,16 +241,7 @@ class RBLNSampler(VLLMSampler):
         use_dt = envs.VLLM_RBLN_USE_DEVICE_TENSOR
         options: dict = {}
         if not use_dt:
-            options["compile_context"] = (
-                compile_context
-                if compile_context
-                else (
-                    rebel.CompileContext(use_global_ctx=True)
-                    if "use_global_ctx"
-                    in inspect.signature(rebel.CompileContext).parameters
-                    else rebel.CompileContext()
-                )
-            )
+            options["compile_context"] = compile_context
         if envs.VLLM_RBLN_COMPILE_STRICT_MODE:
             options["mode"] = "strict"
 
