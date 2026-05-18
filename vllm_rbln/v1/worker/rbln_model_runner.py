@@ -5153,8 +5153,15 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 src_block_ids: list[int],
                 dst_block_ids: list[int],
                 direction: Literal["h2d", "d2h"],
+                view_block_size: int,
             ) -> None:
-                """Copy kv blocks between different buffers."""
+                """Copy kv blocks between host and device buffers.
+
+                `view_block_size` reinterprets the canonical KV cache layout's
+                block_dim for this call (e.g. `sliding_window` on an HMA-shared
+                pool whose canonical view is Full). The runtime rescales
+                block indices so `src_block_ids` are taken in view-block units.
+                """
                 if (
                     not src_kv_caches
                     or not dst_kv_caches
@@ -5171,15 +5178,14 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 runtime = self.runtime_holder[0]
                 if direction == "h2d":
                     kv_caches = src_kv_caches
-                    copy_fn = runtime._update_kv_cache
+                    copy_fn = runtime._view_and_update_kv_cache
                 else:
                     kv_caches = dst_kv_caches
-                    copy_fn = runtime._fetch_kv_cache
+                    copy_fn = runtime._view_and_fetch_kv_cache
 
                 for idx in src_block_ids:
                     for kv_name, kv_cache in kv_caches.items():
-                        block_size = kv_cache.shape[-2]
-                        copy_fn(kv_cache, idx, 0, block_size, kv_name)
+                        copy_fn(kv_cache, idx, 0, view_block_size, kv_name, view_block_size)
 
             kv_transfer_group.set_host_xfer_buffer_ops(rbln_copy_kv_blocks)
 
