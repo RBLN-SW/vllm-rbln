@@ -52,6 +52,7 @@ from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
+    DraftTokenIds,
     ModelRunnerOutput,
 )
 from vllm.v1.utils import report_usage_stats
@@ -412,6 +413,10 @@ class RBLNWorker(WorkerBase):
             # NOTE(RBLN): Apply CPU affinity only after compile/warm-up.
             self._ensure_rbln_cpu_affinity_after_warmup()
 
+        # Reset the seed to ensure that the random state is not affected by
+        # the model initialization and profiling.
+        set_random_seed(self.model_config.seed)
+
         return time.perf_counter() - st
 
     def get_model(self) -> nn.Module:
@@ -456,8 +461,8 @@ class RBLNWorker(WorkerBase):
 
         return None
 
-    # def take_draft_token_ids(self) -> DraftTokenIds | None:
-    #     return self.model_runner.take_draft_token_ids()
+    def take_draft_token_ids(self) -> DraftTokenIds | None:
+        return self.model_runner.take_draft_token_ids()
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None):
         # Check if profiling is enabled
