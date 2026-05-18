@@ -62,7 +62,6 @@ from vllm.v1.worker.worker_base import WorkerBase
 
 import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
-from vllm_rbln.platform import RblnPlatform
 from vllm_rbln.v1.worker.rbln_model_runner import RBLNModelRunner
 from vllm_rbln.v1.worker.utils import (
     estimate_available_memory,
@@ -96,9 +95,6 @@ class RBLNWorker(WorkerBase):
             distributed_init_method=distributed_init_method,
             is_driver_worker=is_driver_worker,
         )
-        # For compatibility with VLLM_WORKER_MULTIPROC_METHOD=spawn.
-        # See comment in maybe_override_eager_mode_device for details.
-        RblnPlatform.maybe_override_eager_mode_device(vllm_config)
         self.device = self.device_config.device
 
         self.local_world_size = (

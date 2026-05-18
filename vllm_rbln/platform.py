@@ -154,26 +154,6 @@ class RblnPlatform(Platform):
                 )
 
     @classmethod
-    def maybe_override_eager_mode_device(cls, vllm_config: VllmConfig) -> None:
-        """Force ``device_type='rbln'`` for the vLLM model + enforce_eager path.
-
-        Ideally this mutation should be avoided so that subprocesses spawned under
-        VLLM_WORKER_MULTIPROC_METHOD=spawn (which re-import this module fresh)
-        observe identical values to the parent without any extra plumbing.
-        But the standard ``enforce_eager`` configuration lives on ``model_config``,
-        which isn't available at class-definition time.
-
-        TODO: This path itself is a temporary workaround.
-        Remove this when it's retired.
-        """
-        if (
-            envs.VLLM_RBLN_USE_VLLM_MODEL
-            and not envs.VLLM_RBLN_USE_DEVICE_TENSOR
-            and vllm_config.model_config.enforce_eager
-        ):
-            cls.device_type = "rbln"
-
-    @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
@@ -182,8 +162,6 @@ class RblnPlatform(Platform):
         if scheduler_config.async_scheduling:
             scheduler_config.async_scheduling = False
             logger.warning("Async scheduler not supported on RBLN.")
-
-        cls.maybe_override_eager_mode_device(vllm_config)
 
         if envs.VLLM_RBLN_USE_VLLM_MODEL:
             cls.validate_and_setup_prerequisite(vllm_config)
@@ -228,17 +206,18 @@ class RblnPlatform(Platform):
 
             # FIXME(jiwoo.park) This is a temporary workaround.
             if model_config.enforce_eager:
+                if not envs.VLLM_RBLN_USE_DEVICE_TENSOR:
+                    raise ValueError(
+                        "enforce_eager=True requires VLLM_RBLN_USE_DEVICE_TENSOR=1. "
+                        "Eager mode bypasses torch.compile, so ops must dispatch "
+                        "to a real device='rbln' rather than the compile-backend "
+                        "fake-CPU tensors used by the default vLLM model path."
+                    )
                 hf_config = vllm_config.model_config.hf_config
                 assert not hasattr(hf_config, "sliding_window") or not getattr(
                     hf_config, "use_sliding_window", True
                 )
 
-                # cls.device_type was already set to "rbln" by
-                # maybe_override_eager_mode_device(); propagate that into
-                # device_config (DeviceConfig.__post_init__ already ran with
-                # the pre-override value).
-                vllm_config.device_config.device_type = cls.device_type
-                vllm_config.device_config.device = torch.device(cls.device_type)
                 # NOTE - force dtype into fp16 for eager mode
                 model_config.dtype = torch.float16
 
