@@ -788,19 +788,16 @@ class RBLNModelRunner:
         """
         :return: tuple[input_ids, inputs_embeds, positions, intermediate_tensors]
         """
-        is_first_rank = get_pp_group().is_first_rank
-
         # For text-only models
         input_ids = self.input_ids[:num_input_tokens]
         inputs_embeds = None
 
         positions = self.positions[:num_input_tokens]
 
-        if is_first_rank:
+        if get_pp_group().is_first_rank:
             intermediate_tensors = None
         else:
             assert intermediate_tensors is not None
-            raise NotImplementedError
 
         input_ids = input_ids.view(num_reqs, -1)
         positions = positions.view(num_reqs, -1)
@@ -1352,7 +1349,17 @@ class RBLNModelRunner:
         if get_pp_group().is_first_rank:
             intermediate_tensors = None
         else:
-            raise NotImplementedError
+            intermediate_tensors = self.model.make_empty_intermediate_tensors(
+                batch_size=num_tokens_unpadded,
+                dtype=self.model_config.dtype,
+                device=self.device,
+            )
+            intermediate_tensors = IntermediateTensors(
+                {
+                    k: v.view(num_reqs_padded, num_tokens_per_req, -1)
+                    for k, v in intermediate_tensors.items()
+                }
+            )
 
         # NOTE(RBLN): Clone tensors to make tensors non-view tensors.
         input_ids = input_ids.view(num_reqs, num_tokens_per_req).clone()
