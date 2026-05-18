@@ -160,6 +160,44 @@ def _make_host_buffer(layer_tensor: torch.Tensor) -> torch.Tensor:
     return buf.view(layer_tensor.dtype).reshape(layer_tensor.shape)
 
 
+def _log_parity_fingerprint(
+    source_label: str, step: int, phase: str, layer_t: torch.Tensor
+) -> None:
+    """Layer 0 의 비교용 fingerprint 출력. 양쪽 path 가 *동일한 포맷*으로
+    호출하므로 두 run 의 로그를 grep "PARITY/" 후 시각 비교 가능.
+
+    layer_t 는 CPU 에 있는 bf16/fp16 tensor (layer 0 shape).
+    Step 0 의 layer 0 한 번만 호출 권장 (sha1 800 MB 비용 ~1초).
+    """
+    import hashlib
+
+    t = layer_t.contiguous()
+    raw_bytes = t.view(torch.int8).reshape(-1).numpy().tobytes()
+    sha = hashlib.sha1(raw_bytes).hexdigest()[:16]
+    f32 = t.float()
+    flat = t.reshape(-1)
+    head = flat[:16].float().tolist()
+    tail = flat[-16:].float().tolist()
+    print(
+        f"******************** [PARITY/{source_label}] step={step} phase={phase} "
+        f"shape={tuple(t.shape)} dtype={t.dtype} "
+        f"n_bytes={len(raw_bytes)} sha1={sha} "
+        f"min={f32.min().item():+.6f} max={f32.max().item():+.6f} "
+        f"mean={f32.mean().item():+.6f}",
+        flush=True,
+    )
+    print(
+        f"******************** [PARITY/{source_label}] step={step} "
+        f"first16={[f'{v:+.6f}' for v in head]}",
+        flush=True,
+    )
+    print(
+        f"******************** [PARITY/{source_label}] step={step} "
+        f"last16={[f'{v:+.6f}' for v in tail]}",
+        flush=True,
+    )
+
+
 def _runtime_debug_hook(
     runtime: Any,
     kv_caches_by_name: Dict[str, torch.Tensor],
@@ -172,7 +210,9 @@ def _runtime_debug_hook(
 
     두 호출 형태를 시도해서 어느 쪽이 동작하는지 확인:
       (1) layer_name=None: 전체 KV cache 한 번에 fetch (block_idx=0)
-      (2) layer_name=<first_layer>: 그 layer 의 block 0 만 fetch
+      (2) layer_name=<first_layer>: 그 layer 의 모든 block 을 fetch 후
+          host buffer 를 layer_t.shape 으로 reshape → torch path 와
+          동일한 형태로 [PARITY/runtime] fingerprint 출력 (step=0).
     """
     if step >= 3:
         return
@@ -184,12 +224,16 @@ def _runtime_debug_hook(
 
     # ── try (1) layer_name=None ─────────────────────────────────────────
     try:
+        print(f"******************** [kv_cache_rt_hook][DBG/all] runtime._get_kv_cache_size(None) START")
         total_bytes = runtime._get_kv_cache_size(None)
+        print(f"******************** [kv_cache_rt_hook][DBG/all] runtime._get_kv_cache_size(None) DONE")
         num_fp16 = (total_bytes + 1) // 2
         host_all = aligned_tensor(
             num_fp16, dtype=np.float16, alignment=0x1000, tensor_type="pt"
         )
+        print(f"******************** [kv_cache_rt_hook][DBG/all] runtime._fetch_kv_cache(host_all, 0, 0, block_size, None) START")
         runtime._fetch_kv_cache(host_all, 0, 0, block_size, None)
+        print(f"******************** [kv_cache_rt_hook][DBG/all] runtime._fetch_kv_cache(host_all, 0, 0, block_size, None) DONE")
         head = host_all.view(layer_t.dtype)[:8].float().tolist()
         print(
             f"******************** [kv_cache_rt_hook][DBG/all] step={step} "
@@ -197,7 +241,9 @@ def _runtime_debug_hook(
             f"first8={[f'{v:+.4f}' for v in head]}",
             flush=True,
         )
+        print(f"******************** [kv_cache_rt_hook][DBG/all] runtime._update_kv_cache(host_all, 0, 0, block_size, None) START")
         runtime._update_kv_cache(host_all, 0, 0, block_size, None)
+        print(f"******************** [kv_cache_rt_hook][DBG/all] runtime._update_kv_cache(host_all, 0, 0, block_size, None) DONE")
     except Exception as e:
         print(
             f"******************** [kv_cache_rt_hook][DBG/all] step={step} "
@@ -205,22 +251,35 @@ def _runtime_debug_hook(
             flush=True,
         )
 
-    # ── try (2) layer_name=first_name ───────────────────────────────────
+    # ── try (2) layer_name=first_name: layer 0 전체 fetch + parity ──────
     try:
+        print(f"******************** [kv_cache_rt_hook][DBG/layer] runtime._get_kv_cache_size(first_name) START")
         layer_bytes = runtime._get_kv_cache_size(first_name)
+        print(f"******************** [kv_cache_rt_hook][DBG/layer] runtime._get_kv_cache_size(first_name) DONE")
         num_fp16 = (layer_bytes + 1) // 2
         host_one = aligned_tensor(
             num_fp16, dtype=np.float16, alignment=0x1000, tensor_type="pt"
         )
-        runtime._fetch_kv_cache(host_one, 0, 0, block_size, first_name)
+        # Layer 0 의 *모든 block* 을 fetch — host_one 에 layer 전체가 채워짐
+        print(f"******************** [kv_cache_rt_hook][DBG/layer] runtime._fetch_kv_cache(host_one, 0, 0, block_size, first_name) START")
+        for b in range(num_blocks):
+            runtime._fetch_kv_cache(host_one, b, 0, block_size, first_name)
+        print(f"******************** [kv_cache_rt_hook][DBG/layer] runtime._fetch_kv_cache(host_one, 0, 0, block_size, first_name) DONE")
         head = host_one.view(layer_t.dtype)[:8].float().tolist()
         print(
             f"******************** [kv_cache_rt_hook][DBG/layer] step={step} "
             f"phase={phase} layer={first_name} bytes={layer_bytes} "
-            f"first8={[f'{v:+.4f}' for v in head]}",
+            f"num_blocks={num_blocks} first8={[f'{v:+.4f}' for v in head]}",
             flush=True,
         )
-        runtime._update_kv_cache(host_one, 0, 0, block_size, first_name)
+        # Parity fingerprint — step 0 의 layer 0 한 번만 (sha1 비용 amortize)
+        if step == 0:
+            layer_view = host_one.view(layer_t.dtype).reshape(layer_t.shape)
+            _log_parity_fingerprint("runtime", step, phase, layer_view)
+        print(f"******************** [kv_cache_rt_hook][DBG/layer] runtime._update_kv_cache(host_one, 0, 0, block_size, first_name) START")
+        for b in range(num_blocks):
+            runtime._update_kv_cache(host_one, b, 0, block_size, first_name)
+        print(f"******************** [kv_cache_rt_hook][DBG/layer] runtime._update_kv_cache(host_one, 0, 0, block_size, first_name) DONE")
     except Exception as e:
         print(
             f"******************** [kv_cache_rt_hook][DBG/layer] step={step} "
@@ -319,6 +378,7 @@ def _runtime_bench_hook(
     step: int,
 ) -> None:
     """fetch then update, no mutation. layer-unit timer."""
+    num_blocks = 3
     warmup = step < _BENCH_WARMUP_FORWARDS
     f_total = u_total = 0
     n_layers = len(kv_caches_by_name)
@@ -332,7 +392,7 @@ def _runtime_bench_hook(
             runtime._update_kv_cache(host, b, 0, block_size, name)
         t2 = time.perf_counter_ns()
         if not warmup:
-            nbytes = layer_t.numel() * layer_t.element_size()
+            nbytes = layer_t.numel() * layer_t.element_size() / 378 * num_blocks
             _BENCH_SAMPLES.append((t1 - t0, t2 - t1, nbytes, num_blocks))
             f_total += t1 - t0
             u_total += t2 - t1

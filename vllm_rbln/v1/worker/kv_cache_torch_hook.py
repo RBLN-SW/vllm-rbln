@@ -137,6 +137,47 @@ def run_kv_cache_torch_hook(
     _STEP += 1
 
 
+def _log_parity_fingerprint(
+    source_label: str, step: int, phase: str, layer_t: torch.Tensor
+) -> None:
+    """Layer 0 의 비교용 fingerprint 출력. 양쪽 path 가 *동일한 포맷*으로
+    호출하므로 두 run 의 로그를 grep "PARITY/" 후 시각 비교 가능.
+
+    layer_t 는 CPU 에 있는 bf16/fp16 tensor (layer 0 shape).
+    Step 0 의 layer 0 한 번만 호출 권장 (sha1 800 MB 비용 ~1초).
+    """
+    import hashlib
+
+    t = layer_t.contiguous()
+    raw_bytes = t.view(torch.int8).reshape(-1).numpy().tobytes()
+    sha = hashlib.sha1(raw_bytes).hexdigest()[:16]
+    f32 = t.float()
+    flat = t.reshape(-1)
+    head = flat[:16].float().tolist()
+    tail = flat[-16:].float().tolist()
+    print(
+        f"******************** [PARITY/{source_label}] step={step} phase={phase} "
+        f"shape={tuple(t.shape)} dtype={t.dtype} "
+        f"n_bytes={len(raw_bytes)} sha1={sha} "
+        f"min={f32.min().item():+.6f} max={f32.max().item():+.6f} "
+        f"mean={f32.mean().item():+.6f}",
+        flush=True,
+    )
+    print(
+        f"******************** [PARITY/{source_label}] step={step} "
+        f"first16={[f'{v:+.6f}' for v in head]}",
+        flush=True,
+    )
+    print(
+        f"******************** [PARITY/{source_label}] step={step} "
+        f"last16={[f'{v:+.6f}' for v in tail]}",
+        flush=True,
+    )
+
+
+_PARITY_LOGGED: bool = False
+
+
 def _torch_debug_hook(
     kv_caches: Sequence[torch.Tensor], phase: str, step: int
 ) -> None:
@@ -144,7 +185,13 @@ def _torch_debug_hook(
 
     Installed automatically when VLLM_RBLN_KV_CACHE_HOOK_DEBUG=1.
     Logs every step in {0, 1, 2} and then every 50 steps, to avoid spam.
+
+    PARITY 로그: 첫 *non-warmup* forward 의 layer 0 fingerprint 를 한 번만
+    출력. Runtime hook 은 warmup 동안 호출되지 않으므로 (_STEP=0 = 첫 정식
+    forward), torch path 도 같은 시점에서 비교하기 위해 warmup 동안엔 PARITY
+    출력을 건너뛴다.
     """
+    global _PARITY_LOGGED
     should_log = step < 3 or step % 50 == 0
     show_values = step < 2  # only the first two steps, to keep output small
     for i, t in enumerate(kv_caches):
@@ -174,6 +221,18 @@ def _torch_debug_hook(
                     ),
                     flush=True,
                 )
+        # Parity fingerprint — first non-warmup forward only (step 조건 무관).
+        # Runtime hook 은 warmup 동안 호출 X 라 _STEP=0 가 첫 정식 forward.
+        # Torch 도 같은 시점에서 출력해야 데이터 비교 의미 있음.
+        if i == 0 and not _PARITY_LOGGED:
+            try:
+                from vllm_rbln.torch_compile_backend import is_warmup_active
+                warmup_now = is_warmup_active()
+            except Exception:
+                warmup_now = False
+            if not warmup_now:
+                _log_parity_fingerprint("torch", step, phase, cpu_t)
+                _PARITY_LOGGED = True
         t.copy_(cpu_t.to(t.device))
 
 
@@ -288,6 +347,8 @@ def _torch_bench_hook(
     f_total = u_total = 0
     n_layers = len(kv_caches)
     for t in kv_caches:
+        print(f"******************** [kv_cache_hook][BENCH] t.shape={t.shape}, t.size={t.numel()}, t.element_size={t.element_size()}, t.nbytes={t.numel() * t.element_size()}")
+        # src = t[:, 0:1, :, :, :, :]
         t0 = time.perf_counter_ns()
         cpu_t = t.to("cpu")
         t1 = time.perf_counter_ns()
