@@ -15,6 +15,7 @@
 import time
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import torch
 from rebel.kv_cache import aligned_tensor
 from vllm import envs
@@ -31,6 +32,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorRole,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl_connector import (
+    NixlAgentMetadata,
     NixlConnector,
     NixlConnectorMetadata,
     NixlConnectorScheduler,
@@ -38,6 +40,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl_connector import (
     ReqId,
 )
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.kv_cache_interface import SlidingWindowSpec
 
 from vllm_rbln.logger import init_logger
 
@@ -274,6 +277,37 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
         self._logical_num_blocks = self.num_blocks
         self._block_size[self.engine_id] = self.block_size
 
+        # Per-group spec cache used by `_get_block_descs_ids` to route
+        # SWA groups to the shorter SWA desc range. Indexed by the same
+        # group index the scheduler hands us in `local_block_ids` /
+        # `remote_block_ids`.
+        self._group_specs = [
+            g.kv_cache_spec for g in self.kv_cache_config.kv_cache_groups
+        ]
+
+        # Ratio of physical block_size to SWA's sliding_window — drives
+        # the SWA-side desc length (`block_len // _sw_ratio`). All SWA
+        # groups share the same ratio in RBLN's hybrid layout
+        # (physical block_size is uniform across groups, and the SWA
+        # kernel always uses `sliding_window` for its slot 0). `None`
+        # signals "no SWA group present" or "ratio == 1" (degenerate
+        # case where SWA descs would equal Full descs); both collapse
+        # to the Full-only desc layout.
+        self._sw_ratio: int | None = None
+        for spec in self._group_specs:
+            if isinstance(spec, SlidingWindowSpec):
+                assert spec.block_size % spec.sliding_window == 0
+                ratio = spec.block_size // spec.sliding_window
+                if ratio == 1:
+                    continue
+                if self._sw_ratio is None:
+                    self._sw_ratio = ratio
+                else:
+                    assert self._sw_ratio == ratio, (
+                        "RBLN NIXL connector assumes a single SWA ratio "
+                        f"across groups, got {self._sw_ratio} vs {ratio}"
+                    )
+
     def initialize_host_xfer_buffer(self, kv_caches: dict[str, torch.Tensor]) -> None:
         """Allocate one rebel-aligned host buffer per layer."""
         assert self.kv_cache_layout == "HND", (
@@ -306,3 +340,276 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
             return
         assert self.use_host_buffer
         self.copy_blocks = copy_operation
+
+    # ------------------------------------------------------------------
+    # Per-group host-xfer with view_block_size
+    # ------------------------------------------------------------------
+    #
+    # Upstream iterates `local_block_ids` per group and calls
+    # `self.copy_blocks(...)` without group context. For an HMA-shared pool
+    # canonicalised to Full, the SWA group only needs `sliding_window` bytes
+    # per block but would otherwise transport the full `block_size`. Override
+    # both call sites to pass a per-group `view_block_size` so the runtime
+    # can rescale block strides at transport time (see
+    # `runtime._view_and_*_kv_cache`).
+
+    def _group_view_block_size(self, group_idx: int) -> int:
+        """SWA group -> `sliding_window`, otherwise the spec's `block_size`."""
+        spec = self._group_specs[group_idx]
+        if isinstance(spec, SlidingWindowSpec):
+            return spec.sliding_window
+        return spec.block_size
+
+    def sync_recved_kv_to_device(self, req_id: str, meta: "ReqMeta") -> None:
+        assert self.use_host_buffer
+        assert self.copy_blocks is not None
+        for group_idx, group_block_ids in enumerate(meta.local_physical_block_ids):
+            self.copy_blocks(
+                self.host_xfer_buffers,
+                self.device_kv_caches,
+                group_block_ids,
+                group_block_ids,
+                "h2d",
+                self._group_view_block_size(group_idx),
+            )
+
+    def save_kv_to_host(self, metadata: NixlConnectorMetadata) -> None:
+        assert self.use_host_buffer
+        assert self.copy_blocks is not None
+        for req_id, meta in metadata.reqs_to_save.items():
+            meta.local_physical_block_ids = self._logical_to_kernel_block_ids(
+                meta.local_block_ids
+            )
+            for group_idx, group_block_ids in enumerate(meta.local_physical_block_ids):
+                self.copy_blocks(
+                    self.device_kv_caches,
+                    self.host_xfer_buffers,
+                    group_block_ids,
+                    group_block_ids,
+                    "d2h",
+                    self._group_view_block_size(group_idx),
+                )
+
+    # ------------------------------------------------------------------
+    # Hybrid Full + SWA desc layout
+    # ------------------------------------------------------------------
+    #
+    # The runner registers one canonical Full-attention layer per HMA
+    # pool, so the underlying NIXL memory regions are Full-attention
+    # sized (block_size bytes per region per block). On top of those
+    # regions we publish two desc ranges that share the same base
+    # addresses:
+    #
+    #   [0, num_full_descs):
+    #       Full-size descriptors — one per region per block, length
+    #       block_size. Read by Full-attention groups.
+    #
+    #   [num_full_descs, 2 * num_full_descs):
+    #       SWA-size descriptors — same base addresses, length
+    #       sliding_window. Read by SWA groups, which only need the
+    #       first `sliding_window` bytes (the in-place ring buffer
+    #       always pins kernel slot 0 at the block's base offset, so
+    #       the SWA payload is a contiguous prefix of the Full block).
+    #
+    # `_get_block_descs_ids` dispatches per group: SWA groups pick from
+    # the upper range, Full groups from the lower range. One
+    # `make_prepped_xfer` call per request, total bytes match what the
+    # kernel actually needs.
+
+    def register_local_xfer_handler(
+        self,
+        block_size: int,
+    ) -> tuple[int, list[tuple[int, int, int]]]:
+        assert self.kv_topo is not None
+        assert not self.kv_topo.is_kv_layout_blocks_first, (
+            "RBLN NIXL connector only supports FA layout (K and V in "
+            "separate regions), not FlashInfer."
+        )
+        assert not self._has_mamba, (
+            "RBLN NIXL connector does not support Mamba layers."
+        )
+
+        block_size_ratio = self.block_size // block_size
+        local_base_addresses = self.kv_caches_base_addr[self.engine_id][self.tp_rank]
+        num_blocks = self.num_blocks * block_size_ratio
+        blocks_data: list[tuple[int, int, int]] = []
+
+        # Two passes when SWA is present: Full descs first, then SWA descs
+        # at the same base addresses but `sliding_window`-sized.
+        length_divisors = [1] if self._sw_ratio is None else [1, self._sw_ratio]
+        for divisor in length_divisors:
+            for i, base_addr in enumerate(local_base_addresses):
+                kv_block_len = (
+                    self.get_backend_aware_kv_block_len(
+                        layer_idx=i, first_split=True, mamba_view=False
+                    )
+                    // block_size_ratio
+                    // divisor
+                )
+                stride = self.block_len_per_layer[i] // block_size_ratio
+                for block_id in range(num_blocks):
+                    addr = base_addr + block_id * stride
+                    blocks_data.append((addr, kv_block_len, self.device_id))
+
+        logger.debug(
+            "Created %s local blocks (Full + SWA) for engine %s rank %s",
+            len(blocks_data),
+            self.engine_id,
+            self.tp_rank,
+        )
+
+        descs = self.nixl_wrapper.get_xfer_descs(blocks_data, self.nixl_memory_type)
+        return self.nixl_wrapper.prep_xfer_dlist("NIXL_INIT_AGENT", descs), blocks_data
+
+    def add_remote_agent(
+        self,
+        nixl_agent_meta: NixlAgentMetadata,
+        remote_tp_rank: int = 0,
+        remote_tp_size: int = 1,
+    ) -> str:
+        engine_id = nixl_agent_meta.engine_id
+        if remote_tp_rank in self._remote_agents.get(engine_id, {}):
+            logger.debug(
+                "Remote agent with engine_id %s and rank %s already "
+                "exchanged metadata, skip handshake.",
+                engine_id,
+                remote_tp_rank,
+            )
+            return self._remote_agents[engine_id][remote_tp_rank]
+
+        if engine_id not in self._tp_size:
+            self._tp_size[engine_id] = remote_tp_size
+        if engine_id not in self._block_size:
+            self._block_size[engine_id] = nixl_agent_meta.block_size
+
+        remote_agent_name = self.nixl_wrapper.add_remote_agent(
+            nixl_agent_meta.agent_metadata
+        )
+
+        assert self.kv_topo is not None
+        kv_topo = self.kv_topo
+        assert not kv_topo.is_kv_layout_blocks_first, (
+            "RBLN NIXL connector only supports FA layout."
+        )
+        assert not self.use_mla, "RBLN NIXL connector does not support MLA."
+
+        block_size_ratio = kv_topo.block_size_ratio_from_engine_id(engine_id)
+
+        if engine_id not in self.dst_num_blocks:
+            self.dst_num_blocks[engine_id] = nixl_agent_meta.num_blocks
+
+        self.kv_caches_base_addr[engine_id][remote_tp_rank] = (
+            nixl_agent_meta.kv_caches_base_addr
+        )
+        self._validate_remote_agent_handshake(nixl_agent_meta, remote_tp_size)
+
+        tp_ratio = self.kv_topo.tp_ratio_from_engine_id(engine_id)
+        indexes_into_remote = (
+            not self.kv_topo.replicates_kv_cache(engine_id) and tp_ratio > 0
+        )
+
+        # Heterogeneous TP path (P TP > D TP): logically split own regions
+        # into |tp_ratio| chunks. Mirrors upstream; preserved verbatim
+        # because RBLN may run heterogeneous TP in the future.
+        if (
+            tp_ratio < 0
+            and not self.use_mla
+            and tp_ratio not in self.src_xfer_handles_by_tp_ratio
+        ):
+            self.src_xfer_handles_by_tp_ratio[tp_ratio] = []
+            for i in range(-tp_ratio):
+                split_blocks_data = []
+                for memory_region in self.src_blocks_data:
+                    addr, local_block_len, own_tp_rank = memory_region
+                    remote_block_len = local_block_len // (-tp_ratio)
+                    addr = addr + i * remote_block_len
+                    split_blocks_data.append((addr, remote_block_len, own_tp_rank))
+                descs = self.nixl_wrapper.get_xfer_descs(
+                    split_blocks_data, self.nixl_memory_type
+                )
+                handle = self.nixl_wrapper.prep_xfer_dlist("NIXL_INIT_AGENT", descs)
+                self.src_xfer_handles_by_tp_ratio[tp_ratio].append(handle)
+
+        blocks_data: list[tuple[int, int, int]] = []
+        num_blocks = nixl_agent_meta.num_blocks
+
+        # Two passes when SWA is present: Full descs first, then SWA descs
+        # at the same base addresses (same `page_size` stride — the remote
+        # tensor's physical block stride is still Full-sized), shorter
+        # desc length.
+        length_divisors = [1] if self._sw_ratio is None else [1, self._sw_ratio]
+        for divisor in length_divisors:
+            for i, base_addr in enumerate(nixl_agent_meta.kv_caches_base_addr):
+                local_block_len = self.get_backend_aware_kv_block_len(
+                    layer_idx=i, first_split=True, mamba_view=False
+                )
+                remote_kv_block_len = local_block_len // block_size_ratio
+                if block_size_ratio > 1:
+                    local_block_len = remote_kv_block_len
+                if tp_ratio < 0 and not self.use_mla:
+                    local_block_len = local_block_len // (-tp_ratio)
+                desc_len = local_block_len // divisor
+                rank_offset = (
+                    self.tp_rank % tp_ratio * remote_kv_block_len
+                    if indexes_into_remote
+                    else 0
+                )
+                page_size = nixl_agent_meta.block_lens[i]
+                for block_id in range(num_blocks):
+                    addr = base_addr + block_id * page_size + rank_offset
+                    blocks_data.append(
+                        (addr, desc_len, nixl_agent_meta.device_id)
+                    )
+
+        logger.debug(
+            "Created %s remote blocks (Full + SWA) for dst engine %s "
+            "remote rank %s local rank %s",
+            len(blocks_data),
+            engine_id,
+            remote_tp_rank,
+            self.tp_rank,
+        )
+
+        descs = self.nixl_wrapper.get_xfer_descs(blocks_data, self.nixl_memory_type)
+        self.dst_xfer_side_handles[engine_id][remote_tp_rank] = (
+            self.nixl_wrapper.prep_xfer_dlist(remote_agent_name, descs)
+        )
+
+        if block_size_ratio > 1:
+            self.src_xfer_handles_by_block_size[nixl_agent_meta.block_size] = (
+                self.register_local_xfer_handler(nixl_agent_meta.block_size)[0]
+            )
+
+        return remote_agent_name
+
+    def _get_block_descs_ids(
+        self,
+        engine_id: str,
+        block_ids: BlockIds,
+        block_size_ratio: float | None = None,
+    ) -> np.ndarray:
+        num_blocks = self.dst_num_blocks[engine_id]
+        if block_size_ratio is not None:
+            num_blocks = int(num_blocks * block_size_ratio)
+
+        region_ids = np.arange(self.num_regions)[:, None]
+
+        if self._sw_ratio is None:
+            # Pure-Full layout: single desc range, matches upstream.
+            ids = np.concatenate(block_ids)[None, :]
+            return (region_ids * num_blocks + ids).flatten()
+
+        num_full_descs = self.num_regions * num_blocks
+        all_descs: list[np.ndarray] = []
+        for g, group in enumerate(block_ids):
+            if not group:
+                continue
+            is_sw = isinstance(self._group_specs[g], SlidingWindowSpec)
+            offset = num_full_descs if is_sw else 0
+            group_arr = np.asarray(group)[None, :]
+            all_descs.append(
+                (region_ids * num_blocks + group_arr + offset).flatten()
+            )
+        if not all_descs:
+            return np.array([], dtype=np.int64)
+        return np.concatenate(all_descs)
