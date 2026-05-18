@@ -100,7 +100,7 @@ from vllm_rbln.v1.attention.kv_cache_bindings import (
     validate_shared_attention_kv_cache_contiguity,
 )
 from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
-from vllm_rbln.v1.worker.utils import get_kv_cache_names, prepare_kernel_block_sizes
+from vllm_rbln.v1.worker.utils import prepare_kernel_block_sizes
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -1754,9 +1754,9 @@ class RBLNModelRunner:
         )
 
         if not self.model_config.enforce_eager and envs.VLLM_RBLN_COMPILE_MODEL:
-            kv_cache_names = get_kv_cache_names(kv_caches, num_attn_module)
-            for kv_cache, name in zip(self.kv_caches, kv_cache_names):
-                self.compile_context.mark_static_address(kv_cache, name)
+            assert len(kv_caches) == len(self.kv_caches)
+            for k, v in kv_caches.items():
+                self.compile_context.mark_static_address(v, k)
 
         return kv_caches
 
