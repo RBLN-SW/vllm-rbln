@@ -73,6 +73,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
+from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
@@ -206,9 +207,11 @@ class RBLNModelRunner:
         # NOTE(Jiayi): We put the entire draft model on the last PP rank.
         # This is not ideal if there are many layers in the draft model.
         if self.speculative_config and get_pp_group().is_last_rank:
-            self.drafter: NgramProposer
+            self.drafter: NgramProposer | SuffixDecodingProposer
             if self.speculative_config.method == "ngram":
                 self.drafter = NgramProposer(self.vllm_config)
+            elif self.speculative_config.method == "suffix":
+                self.drafter = SuffixDecodingProposer(self.vllm_config)
             else:
                 raise ValueError(
                     "Unsupported speculative decoding method: "
@@ -1343,6 +1346,10 @@ class RBLNModelRunner:
                 self.input_batch.num_tokens_no_spec,
                 self.input_batch.token_ids_cpu,
             )
+        elif spec_config.method == "suffix":
+            assert isinstance(sampled_token_ids, list)
+            assert isinstance(self.drafter, SuffixDecodingProposer)
+            draft_token_ids = self.drafter.propose(self.input_batch, sampled_token_ids)
 
         return draft_token_ids
 
