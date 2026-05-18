@@ -96,14 +96,6 @@ class RblnPlatform(Platform):
     def inference_mode():
         return torch.no_grad()
 
-    # @classmethod
-    # def set_device(cls, device: torch.device) -> None:
-    #     """
-    #     Set the device for the current platform.
-    #     """
-    #     logger.warning("set_device is not supported on RBLN.")
-    #     pass
-
     @classmethod
     def pre_register_and_update(
         cls, parser: "FlexibleArgumentParser | None" = None
@@ -137,43 +129,42 @@ class RblnPlatform(Platform):
         if scheduler_config.async_scheduling:
             logger.warning(
                 "Asynchronous scheduling is not supported on RBLN. "
-                "Setting async_scheduling to False."
+                "Overriding scheduler_config.async_scheduling to False."
             )
             scheduler_config.async_scheduling = False
 
         if envs.VLLM_RBLN_USE_VLLM_MODEL:
+            if vllm_config.lora_config is not None:
+                raise ValueError("LoRA is not supported on RBLN.")
+
             cls._validate_and_setup_prerequisite(vllm_config)
 
             if envs.VLLM_RBLN_ENFORCE_MODEL_FP32:
-                logger.info("original model_config.dtype = %s", model_config.dtype)
-                if model_config.dtype == torch.bfloat16:
-                    logger.warning("bfloat16 is not supported on RBLN.")
-
-                # FIXME - force model dtype into fp32 for graph compilation
-                model_config.dtype = torch.float
-                assert model_config.dtype == torch.float
-                logger.info("RBLN enforce model_config.dtype as torch.float")
-
-                if (lora_config := vllm_config.lora_config) is not None:
-                    lora_config.lora_dtype = torch.float
-                    logger.info("RBLN enforce lora_config.lora_dtype as torch.float")
-
-                if (speculative_config := vllm_config.speculative_config) is not None:
-                    speculative_config.draft_model_config.dtype = torch.float
-                    logger.info("RBLN enforce draft_model_config.dtype as torch.float")
+                if model_config.dtype != torch.float32:
+                    # FIXME(RBLN): force model dtype into fp32 for graph compilation
+                    original_dtype = model_config.dtype
+                    model_config.dtype = torch.float32
+                    logger.info(
+                        "Overriding model_config.dtype from %s to %s.",
+                        original_dtype,
+                        model_config.dtype,
+                    )
             else:
-                dtype = model_config.dtype
-                logger.info("original model_config.dtype = %s", dtype)
-                if (
-                    dtype != torch.bfloat16
-                    and dtype != torch.float16
-                    and dtype != torch.float
+                if model_config.dtype not in (
+                    torch.float32,
+                    torch.float16,
+                    torch.bfloat16,
                 ):
                     logger.warning(
-                        "%s not supported on RBLN, only fp32,fp16,bf16 supported", dtype
+                        "Unsupported dtype for RBLN: %s. Falling back to %s. "
+                        "Supported dtypes are torch.float32, torch.float16, "
+                        "and torch.bfloat16.",
+                        model_config.dtype,
+                        torch.float32,
                     )
-                    model_config.dtype = torch.float
-                logger.info("RBLN use model_config.dtype = %s", model_config.dtype)
+                    model_config.dtype = torch.float32
+
+            logger.info("Using model_config.dtype for RBLN: %s", model_config.dtype)
 
             if parallel_config.worker_cls == "auto":
                 parallel_config.worker_cls = (
@@ -195,18 +186,44 @@ class RblnPlatform(Platform):
                 vllm_config.device_config.device = torch.device(
                     RblnPlatform.device_type
                 )
-                # NOTE - force dtype into fp16 for eager mode
+                # RBLN(NOTE): force dtype into fp16 for eager mode
                 model_config.dtype = torch.float16
-
-                if (lora_config := vllm_config.lora_config) is not None:
-                    lora_config.lora_dtype = torch.float16
 
             if vllm_config.speculative_config is not None and envs.VLLM_RBLN_SAMPLER:
                 # FIXME(RBLN): make RBLNSampler compatible with speculative decoding
                 logger.warning(
-                    "Using RBLNSampler with speculative decoding is not supported yet."
+                    "RBLNSampler is not yet compatible with speculative decoding. "
+                    "Disabling VLLM_RBLN_SAMPLER."
                 )
                 envs.VLLM_RBLN_SAMPLER = False
+
+            from vllm.config import CompilationMode
+
+            if vllm_config.compilation_config.mode != CompilationMode.NONE:
+                logger.info(
+                    "vLLM compilation mode is not used on RBLN because "
+                    "@support_torch_compile is not supported. "
+                    "Overriding compilation_config.mode from %s to %s.",
+                    vllm_config.compilation_config.mode,
+                    CompilationMode.NONE,
+                )
+                vllm_config.compilation_config.mode = CompilationMode.NONE
+                if (
+                    len(vllm_config.compilation_config.custom_ops) == 1
+                    and vllm_config.compilation_config.custom_ops[0] == "none"
+                ):
+                    logger.debug(
+                        "Clearing compilation_config.custom_ops because "
+                        "vLLM compilation mode is disabled on RBLN."
+                    )
+                    vllm_config.compilation_config.custom_ops = []
+
+            if not model_config.disable_cascade_attn:
+                logger.warning(
+                    "Cascade attention is not supported on RBLN. "
+                    "Overriding model_config.disable_cascade_attn to True."
+                )
+                model_config.disable_cascade_attn = True
 
         else:
             # NOTE(eunji.lee):
@@ -263,25 +280,6 @@ class RblnPlatform(Platform):
                 ),
                 parallel_config.distributed_executor_backend,
             )
-
-        if envs.VLLM_RBLN_USE_VLLM_MODEL:
-            from vllm.config import CompilationMode
-
-            if vllm_config.compilation_config.mode != CompilationMode.NONE:
-                logger.info("RBLN doesn't @support_torch_compile decorator")
-                vllm_config.compilation_config.mode = CompilationMode.NONE
-                if (
-                    len(vllm_config.compilation_config.custom_ops) == 1
-                    and vllm_config.compilation_config.custom_ops[0] == "none"
-                ):
-                    vllm_config.compilation_config.custom_ops = []
-
-            if not model_config.disable_cascade_attn:
-                logger.warning(
-                    "Cascade attention is not supported on RBLN. "
-                    "Disabling cascade attention."
-                )
-                model_config.disable_cascade_attn = True
 
     @classmethod
     def is_pin_memory_available(cls):
