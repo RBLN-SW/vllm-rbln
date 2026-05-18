@@ -47,9 +47,17 @@ class RBLNEagleProposer(EagleProposer):
     def __init__(self, vllm_config: VllmConfig, device: torch.device, runner=None):
         super().__init__(vllm_config, device, runner)
 
-        from rebel import CompileContext
+        if runner is not None and getattr(runner, "compile_context", None) is not None:
+            self.compile_context = runner.compile_context
+        else:
+            import inspect
 
-        self.compile_context = CompileContext(use_weight_sharing=True)
+            from rebel.compile_context import CompileContext
+
+            compile_ctx_args = {"use_weight_sharing": True}
+            if "use_global_ctx" in inspect.signature(CompileContext).parameters:
+                compile_ctx_args["use_global_ctx"] = True
+            self.compile_context = CompileContext(**compile_ctx_args)
 
         if self.supports_mm_inputs:
             raise NotImplementedError("Multimodal inputs are not supported yet.")
@@ -152,9 +160,16 @@ class RBLNEagleProposer(EagleProposer):
             hidden_states = target_hidden_states.view(*input_ids.shape, -1)
             inputs_embeds = None
 
+        runner_ctx = getattr(self.runner, "compile_context", None)
+        proposer_in_runner_session = (
+            runner_ctx is not None
+            and getattr(self.compile_context, "session_id", None)
+            == getattr(runner_ctx, "session_id", None)
+        )
         if (
             not self.vllm_config.speculative_config.enforce_eager
             and envs.VLLM_RBLN_COMPILE_MODEL
+            and not proposer_in_runner_session
         ):
             self.compile_context.mark_static_address(self.runner.kv_caches[-1])
 
@@ -436,9 +451,16 @@ class RBLNEagleProposer(EagleProposer):
             hidden_states = target_hidden_states.view(*input_ids.shape, -1)
             inputs_embeds = None
 
+        runner_ctx = getattr(self.runner, "compile_context", None)
+        proposer_in_runner_session = (
+            runner_ctx is not None
+            and getattr(self.compile_context, "session_id", None)
+            == getattr(runner_ctx, "session_id", None)
+        )
         if (
             not self.vllm_config.speculative_config.enforce_eager
             and envs.VLLM_RBLN_COMPILE_MODEL
+            and not proposer_in_runner_session
         ):
             self.compile_context.mark_static_address(self.runner.kv_caches[-1])
 
