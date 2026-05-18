@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -49,6 +50,20 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+# Emulation toggles for isolating individual KV-transfer cost components in
+# end-to-end measurements. Orthogonal — combine to zero out both at once.
+#   VLLM_RBLN_EMULATE_HOST_XFER_NOOP: skip h2d/d2h copies (host_xfer_buffers
+#     <-> device_kv_caches). `sync_recved_kv_to_device` / `save_kv_to_host`
+#     still iterate but each `self.copy_blocks(...)` call is a no-op.
+#   VLLM_RBLN_EMULATE_NIXL_NOOP: skip the NIXL RDMA `READ`. Notifies P-side
+#     so its sender-side blocks release normally, and immediately marks the
+#     receiving request as done locally.
+_EMULATE_HOST_XFER_NOOP = os.environ.get(
+    "VLLM_RBLN_EMULATE_HOST_XFER_NOOP", "").lower() in ("1", "true")
+_EMULATE_NIXL_NOOP = os.environ.get(
+    "VLLM_RBLN_EMULATE_NIXL_NOOP", "").lower() in ("1", "true")
 
 
 class RblnNixlConnector(NixlConnector):
@@ -309,16 +324,54 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
                     )
 
     def initialize_host_xfer_buffer(self, kv_caches: dict[str, torch.Tensor]) -> None:
-        """Allocate one rebel-aligned host buffer per layer."""
+        """Allocate one rebel-aligned host buffer per layer.
+
+        Under `VLLM_RBLN_EMULATE_HOST_XFER_NOOP=1` or
+        `VLLM_RBLN_EMULATE_NIXL_NOOP=1`, all layers share a single
+        allocation: buffer content is never read/written in emulation
+        (copy_blocks and RDMA both no-op), and upstream NIXL's
+        `register_kv_caches` dedups same-`data_ptr` views via its HMA
+        path, so registration completes without errors.
+
+        The shared-allocation path asserts uniform shape across all
+        layers, which is the only case the canonical-layer filter
+        currently produces. Any future deviation will surface here
+        rather than silently waste/leak memory.
+        """
         assert self.kv_cache_layout == "HND", (
             "RBLN NIXL Connector only supports HND layout"
         )
         xfer_buffers: dict[str, torch.Tensor] = {}
+
+        emulate = _EMULATE_HOST_XFER_NOOP or _EMULATE_NIXL_NOOP
         try:
-            for layer_name, kv_cache in kv_caches.items():
-                xfer_buffers[layer_name] = aligned_tensor(kv_cache.numel()).reshape(
-                    kv_cache.shape
+            if emulate and kv_caches:
+                # All filtered layers must share the same shape — assert
+                # rather than handle heterogeneous shapes implicitly.
+                items = list(kv_caches.items())
+                first_name, first_cache = items[0]
+                first_shape = first_cache.shape
+                for name, kv in items[1:]:
+                    assert kv.shape == first_shape, (
+                        "Emulation expects uniform host_xfer_buffer shape "
+                        "across layers; got "
+                        f"{tuple(first_shape)} for {first_name!r} vs "
+                        f"{tuple(kv.shape)} for {name!r}"
+                    )
+                shared = aligned_tensor(first_cache.numel()).reshape(first_shape)
+                for layer_name, _ in items:
+                    xfer_buffers[layer_name] = shared
+                logger.info(
+                    "Emulation: host xfer buffers share one %.1f MB "
+                    "allocation across %d layer(s).",
+                    first_cache.numel() * shared.element_size() / (1024 * 1024),
+                    len(kv_caches),
                 )
+            else:
+                for layer_name, kv_cache in kv_caches.items():
+                    xfer_buffers[layer_name] = aligned_tensor(
+                        kv_cache.numel()
+                    ).reshape(kv_cache.shape)
         except MemoryError as e:
             logger.error("RblnNixlConnectorWorker gets %s", e)
             raise
@@ -335,11 +388,28 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
         self.host_xfer_buffers = xfer_buffers
 
     def set_host_xfer_buffer_ops(self, copy_operation: CopyBlocksOp):
-        """Assign copy (d2h, h2d) operations when host buffer is used."""
+        """Assign copy (d2h, h2d) operations when host buffer is used.
+
+        Under `VLLM_RBLN_EMULATE_HOST_XFER_NOOP=1`, the caller-supplied
+        `copy_operation` is replaced with a no-op so upstream's
+        `sync_recved_kv_to_device` / `save_kv_to_host` become free.
+        """
         if self.kv_buffer_device != "cpu":
             return
         assert self.use_host_buffer
-        self.copy_blocks = copy_operation
+        if _EMULATE_HOST_XFER_NOOP:
+            logger.info(
+                "VLLM_RBLN_EMULATE_HOST_XFER_NOOP is set; h2d/d2h copies "
+                "will be no-op for this worker."
+            )
+            self.copy_blocks = self._noop_copy_blocks
+        else:
+            self.copy_blocks = copy_operation
+
+    @staticmethod
+    def _noop_copy_blocks(*args, **kwargs) -> None:
+        """No-op stand-in for the h2d/d2h callback under emulation."""
+        return None
 
     # ------------------------------------------------------------------
     # Per-group host-xfer with view_block_size
@@ -613,3 +683,61 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
         if not all_descs:
             return np.array([], dtype=np.int64)
         return np.concatenate(all_descs)
+
+    def _read_blocks(
+        self,
+        local_block_ids: BlockIds,
+        remote_block_ids: BlockIds,
+        dst_engine_id: str,
+        request_id: str,
+        remote_request_id: str,
+        remote_rank: int,
+        local_xfer_side_handle: int,
+        remote_xfer_side_handle: int,
+    ) -> None:
+        """Override to optionally short-circuit the NIXL RDMA `READ` for
+        cost-isolation measurements.
+
+        Under `VLLM_RBLN_EMULATE_NIXL_NOOP=1`:
+          * Skip `make_prepped_xfer` + `transfer` (no data movement).
+          * `send_notif` to P-side so its sender blocks release normally
+            (avoids waiting on `VLLM_NIXL_ABORT_REQUEST_TIMEOUT`).
+          * Touch `self._recving_transfers[request_id]` so the next
+            `_pop_done_transfers` poll reports this request as done.
+
+        Otherwise delegate to upstream as a normal RDMA-backed transfer.
+        """
+        if not _EMULATE_NIXL_NOOP:
+            return super()._read_blocks(
+                local_block_ids,
+                remote_block_ids,
+                dst_engine_id,
+                request_id,
+                remote_request_id,
+                remote_rank,
+                local_xfer_side_handle,
+                remote_xfer_side_handle,
+            )
+
+        # Match upstream notif_id format so P-side's `_get_new_notifs`
+        # correlates the completion against its in-flight send list.
+        notif_id = f"{remote_request_id}:{self.world_size}".encode()
+        agent_name = self._remote_agents[dst_engine_id][remote_rank]
+        try:
+            self.nixl_wrapper.send_notif(agent_name, notif_msg=notif_id)
+        except Exception as e:
+            self._log_failure(
+                failure_type="notification_failed",
+                msg="P worker blocks will be freed after timeout.",
+                req_id=request_id,
+                error=e,
+                dst_engine_id=dst_engine_id,
+                remote_rank=remote_rank,
+                remote_agent_name=agent_name,
+            )
+            self.xfer_stats.record_failed_notification()
+
+        # `_recving_transfers` is a defaultdict[list]; touching the key
+        # creates an empty handle list, which `_pop_done_transfers` reports
+        # as completed on the next `get_finished` poll.
+        _ = self._recving_transfers[request_id]
