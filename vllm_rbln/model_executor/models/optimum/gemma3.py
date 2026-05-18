@@ -88,6 +88,7 @@ class RBLNOptimumGemma3ForConditionalGeneration(
         super().__init__(vllm_config=vllm_config)
         # NOTE:
         # model_config.vocab_size != tokenizer.vocab_size in Gemma3
+        assert self.kv_block_adapter is not None
         self.setup_decoder_mixin(
             attn_impl=self.attn_impl,
             vocab_size=self.model_config.get_vocab_size,

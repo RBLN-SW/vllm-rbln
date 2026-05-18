@@ -52,9 +52,6 @@ on:
         required: false
         type: string
 
-env:
-  RBLN_VERBOSE: 6
-
 jobs:
   pytest:
     name: Pytest (${{ matrix.test_type.name }})
@@ -70,6 +67,10 @@ jobs:
             },
             {
               name : "worker",
+              runner : "rbln-sw-k8s-general"
+            },
+            {
+              name : "optimum_compile",
               runner : "rbln-sw-k8s-general"
             },
           ]
@@ -116,6 +117,11 @@ jobs:
               ;;
             "worker")
               if [[ "$COMMIT_MESSAGE" == *"[skip worker]"* ]]; then
+                SKIP=true
+              fi
+              ;;
+            "optimum_compile")
+              if [[ "$COMMIT_MESSAGE" == *"[skip optimum_compile]"* ]]; then
                 SKIP=true
               fi
               ;;
@@ -177,6 +183,9 @@ jobs:
               ;;
             "worker")
               pytest tests/v1/worker/test_rebel_optimum_model_runner.py -vv --durations 0
+              ;;
+            "optimum_compile")
+              pytest tests/optimum_compile -vv --durations 0
               ;;
           esac
 
@@ -302,10 +311,10 @@ jobs:
             VLLM_CPU_URL="${{ steps.parse_index_url.outputs.VLLM_CPU_URL }}"
             uv pip install --system packaging setuptools wheel simphile pynvml huggingface_hub setuptools_scm fire pytest pytest-asyncio pytest-xdist
             if [ -n "${{ inputs.optimum_rbln_version }}" ]; then
-              uv pip install --system --force-reinstall --no-cache-dir dist/vllm_rbln*.whl --constraint <(echo "optimum-rbln==${{ inputs.optimum_rbln_version }}") --index-url http://pypi-cache.devpi.svc.cluster.local/root/pypi/+simple/ --extra-index-url "${VLLM_CPU_URL}" --extra-index-url https://download.pytorch.org/whl/cpu --index-strategy unsafe-best-match
+              uv pip install --system --force-reinstall --no-cache-dir dist/vllm_rbln*.whl --constraint <(echo "optimum-rbln==${{ inputs.optimum_rbln_version }}") --index-url http://pypi-cache.devpi.svc.cluster.local/root/pypi/+simple/ --extra-index-url "${VLLM_CPU_URL}" --extra-index-url https://download.pytorch.org/whl/cpu  --extra-index-url https://pypi.org/simple --index-strategy unsafe-best-match
               echo "optimum-rbln ${{ inputs.optimum_rbln_version }}"
             else
-              uv pip install --system --force-reinstall --no-cache-dir dist/vllm_rbln*.whl --index-url http://pypi-cache.devpi.svc.cluster.local/root/pypi/+simple/ --extra-index-url "${VLLM_CPU_URL}" --extra-index-url https://download.pytorch.org/whl/cpu --index-strategy unsafe-best-match
+              uv pip install --system --force-reinstall --no-cache-dir dist/vllm_rbln*.whl --index-url http://pypi-cache.devpi.svc.cluster.local/root/pypi/+simple/ --extra-index-url "${VLLM_CPU_URL}" --extra-index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple --index-strategy unsafe-best-match
             fi
 
       - name: Run pytest

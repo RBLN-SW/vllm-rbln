@@ -18,6 +18,11 @@ from dataclasses import dataclass, field
 
 import torch
 from vllm.config import VllmConfig
+from vllm.distributed.ec_transfer.ec_connector.base import (
+    ECConnectorMetadata,
+    ECConnectorRole,
+)
+from vllm.distributed.ec_transfer.ec_connector.factory import ECConnectorFactory
 from vllm.distributed.kv_events import EventPublisherFactory
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.v1.core.encoder_cache_manager import (
@@ -126,6 +131,13 @@ class RBLNOptimumScheduler(Scheduler):
             self.parallel_config.data_parallel_rank,
         )
         self.ec_connector = None
+        if self.vllm_config.ec_transfer_config is not None:
+            self.ec_connector = ECConnectorFactory.create_connector(
+                config=self.vllm_config, role=ECConnectorRole.SCHEDULER
+            )
+
+        self._pending_free_mm_hashes: list[str] = []
+
         num_gpu_blocks = self.cache_config.num_gpu_blocks
         assert num_gpu_blocks is not None and num_gpu_blocks > 0
 
@@ -390,6 +402,13 @@ class RBLNOptimumScheduler(Scheduler):
                 if request.num_cached_tokens < 0:
                     request.num_cached_tokens = request.num_computed_tokens
 
+                # EC Connector: track multimodal features that need remote
+                # loading or local encoding for this request.
+                if self.ec_connector is not None and request.has_encoder_inputs:
+                    for i, feature in enumerate(request.mm_features):
+                        if self.ec_connector.has_cache_item(feature.identifier):
+                            self.ec_connector.update_state_after_alloc(request, i)
+
             # re-queue requests skipped in this pass ahead of older skipped items.
             if step_skipped_waiting:
                 self.skipped_waiting.prepend_requests(step_skipped_waiting)
@@ -536,17 +555,47 @@ class RBLNOptimumScheduler(Scheduler):
             # It contains the request IDs that are finished in between
             # the previous and the current steps.
             finished_req_ids=self.finished_req_ids,
-            free_encoder_mm_hashes=[],
+            free_encoder_mm_hashes=self._pending_free_mm_hashes,
             new_block_ids_to_zero=None,  # It is used for Mamba models
             block_table_dict=block_table_dict,
             cached_block_table=cached_block_table,
             cached_length=cached_length,
             dummy_block=dummy_block,
         )
+
+        # Build the connector meta for ECConnector.
+        # Also pre-fetch mm_hashes from the waiting queue so the consumer
+        # can pull encoder caches in the background before they are needed.
+        if self.ec_connector is not None:
+            for request in self.waiting:
+                if request.has_encoder_inputs:
+                    for i, feature in enumerate(request.mm_features):
+                        if self.ec_connector.has_cache_item(feature.identifier):
+                            self.ec_connector.update_state_after_alloc(request, i)
+
+            ec_meta: ECConnectorMetadata = self.ec_connector.build_connector_meta(
+                scheduler_output
+            )
+            scheduler_output.ec_connector_metadata = ec_meta
+
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
         # self._update_after_schedule(scheduler_output)
+
+        self._pending_free_mm_hashes = []
         return scheduler_output
+
+    def _free_request(self, request: Request, delay_free_blocks: bool = False):
+        # Capture mm hashes and notify the EC connector before super()
+        # tears the request down — base._free_blocks deletes self.requests[id]
+        # so we can't recover mm_features afterwards.
+        if request.mm_features:
+            if self.ec_connector is not None:
+                self.ec_connector.request_finished(request)
+            self._pending_free_mm_hashes.extend(
+                f.identifier for f in request.mm_features
+            )
+        return super()._free_request(request, delay_free_blocks=delay_free_blocks)
 
     def update_block_table_dict(
         self, request: Request, block_table_dict: dict[str, torch.Tensor]

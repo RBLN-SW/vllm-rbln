@@ -46,6 +46,7 @@ from vllm.distributed.kv_transfer import (
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.lora.request import LoRARequest
 from vllm.platforms import current_platform
+from vllm.profiler.wrapper import TorchProfilerWrapper
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.utils.torch_utils import set_random_seed
@@ -64,6 +65,7 @@ from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.worker.rbln_model_runner import RBLNModelRunner
 from vllm_rbln.v1.worker.utils import (
     estimate_available_memory,
+    estimate_model_kernel_size,
     get_rbln_planned_affinity_cpu_count,
     set_cpu_affinity,
     set_omp_num_threads,
@@ -109,10 +111,9 @@ class RBLNWorker(WorkerBase):
         profiler_config = vllm_config.profiler_config
         # Set up profiler if profiling is enabled
         if profiler_config.torch_profiler_dir:
-            torch_profiler_trace_dir = profiler_config.torch_profiler_dir
             logger.info(
                 "Profiling enabled. Traces will be saved to: %s",
-                torch_profiler_trace_dir,
+                profiler_config.torch_profiler_dir,
             )
             logger.debug(
                 "Profiler config: record_shapes=%s,"
@@ -123,19 +124,11 @@ class RBLNWorker(WorkerBase):
                 profiler_config.torch_profiler_with_flops,
                 profiler_config.torch_profiler_use_gzip,
             )
-            self.profiler = torch.profiler.profile(
-                activities=[
-                    torch.profiler.ProfilerActivity.CPU,
-                ],
-                record_shapes=profiler_config.torch_profiler_record_shapes,
-                profile_memory=profiler_config.torch_profiler_with_memory,
-                with_stack=profiler_config.torch_profiler_with_stack,
-                with_flops=profiler_config.torch_profiler_with_flops,
-                on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                    torch_profiler_trace_dir,
-                    worker_name=f"{vllm_config.instance_id}-rank-{self.rank}",
-                    use_gzip=profiler_config.torch_profiler_use_gzip,
-                ),
+            self.profiler = TorchProfilerWrapper(
+                profiler_config,
+                worker_name=f"{vllm_config.instance_id}-rank-{self.rank}",
+                local_rank=self.local_rank,
+                activities=["CPU"],
             )
         else:
             self.profiler = None
@@ -291,7 +284,7 @@ class RBLNWorker(WorkerBase):
             packed_num_elems = 1
 
         n_model_bytes = 0
-        for key, value in params_dict.items():
+        for value in params_dict.values():
             if value.is_floating_point():
                 n_model_bytes += value.numel() * value.element_size()
             else:
@@ -301,13 +294,61 @@ class RBLNWorker(WorkerBase):
 
         logger.info("n_model_bytes = %.2f GB", n_model_bytes / 1024**3)
 
-        available_memory_estimate = estimate_available_memory(
+        estimate_kwargs = dict(
             model_config=self.model_config,
             parallel_config=self.parallel_config,
-            n_model_bytes=n_model_bytes,
             num_runtimes=num_runtimes,
             gpu_memory_utilization=self.cache_config.gpu_memory_utilization,
         )
+
+        speculative_config = getattr(self, "speculative_config", None)
+        drafter = getattr(self.model_runner, "drafter", None)
+        draft_model = getattr(drafter, "model", None)
+        draft_model_config = getattr(speculative_config, "draft_model_config", None)
+        draft_parallel_config = getattr(
+            speculative_config,
+            "draft_parallel_config",
+            None,
+        )
+
+        if draft_model is not None and draft_model_config is not None:
+            if draft_parallel_config is None:
+                draft_parallel_config = self.parallel_config
+
+            draft_quantization = getattr(draft_model_config, "quantization", None)
+            if draft_quantization is not None:
+                raise ValueError(
+                    f"draft model quantization is not supported: {draft_quantization}"
+                )
+
+            model_kernel_size = estimate_model_kernel_size(
+                model_config=self.model_config,
+                parallel_config=self.parallel_config,
+                n_model_bytes=n_model_bytes,
+            )
+
+            num_draft_runtimes = 1 + decode_batch_buckets_count
+            draft_n_model_bytes = 0
+
+            for value in draft_model.parameters():
+                draft_n_model_bytes += value.numel() * value.element_size()
+
+            draft_kernel_size = estimate_model_kernel_size(
+                model_config=draft_model_config,
+                parallel_config=draft_parallel_config,
+                n_model_bytes=draft_n_model_bytes,
+            )
+            estimate_kwargs["num_runtimes"] = num_runtimes + num_draft_runtimes
+            estimate_kwargs["kernel_size"] = model_kernel_size + draft_kernel_size
+            logger.info("draft_n_model_bytes = %.2f GB", draft_n_model_bytes / 1024**3)
+            logger.info(
+                "draft_model_kernel_size = %.2f GB",
+                draft_kernel_size / 1024**3,
+            )
+        else:
+            estimate_kwargs["n_model_bytes"] = n_model_bytes
+
+        available_memory_estimate = estimate_available_memory(**estimate_kwargs)
 
         logger.info(
             "available_memory_estimate = %.2f GiB", available_memory_estimate / 1024**3
@@ -532,7 +573,9 @@ class RBLNWorker(WorkerBase):
             # only print profiler results on rank 0
             if self.local_rank == 0:
                 print(
-                    self.profiler.key_averages().table(sort_by="self_cuda_time_total")
+                    self.profiler.profiler.key_averages().table(
+                        sort_by="self_cpu_time_total"
+                    )
                 )
 
     def execute_dummy_batch(self) -> None:

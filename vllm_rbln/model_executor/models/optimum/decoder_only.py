@@ -31,6 +31,7 @@ class RBLNOptimumForCausalLM(
         vllm_config: VllmConfig,
     ) -> None:
         super().__init__(vllm_config=vllm_config)
+        assert self.kv_block_adapter is not None
         self.setup_decoder_mixin(
             attn_impl=self.attn_impl,
             vocab_size=self.model_config.get_vocab_size,
