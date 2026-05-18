@@ -289,7 +289,7 @@ class RBLNFlashAttnMLAImpl(MLAAttentionImpl[RBLNFlashAttentionMetadata]):
             kv_c_normed,
             k_pe,
             kv_cache,
-            attn_metadata.seq_lens.to(torch.int32) if envs.VLLM_RBLN_BATCH_ATTN_OPT and not attn_metadata.is_prefill else attn_metadata.seq_lens.to(torch.int16),
+            attn_metadata.seq_lens.to(torch.int16),
             attn_metadata.block_tables.to(torch.int16),
             self.scale_tensor,
         )

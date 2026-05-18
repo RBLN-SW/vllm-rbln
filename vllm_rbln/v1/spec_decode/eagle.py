@@ -315,6 +315,10 @@ class RBLNEagleProposer(EagleProposer):
                 )
                 inputs_embeds = None
 
+            # NOTE(RBLN): Subsequent autoregressive call has input shape
+            # [batch_bucket_size, 1] — each batch's single slot is its own
+            # "last" position. (subsequent → q=k+1 padding).
+            last_token_indices = self.arange[:batch_bucket_size]
             # Run the model.
             with set_forward_context(
                 per_layer_attn_metadata,
@@ -331,7 +335,7 @@ class RBLNEagleProposer(EagleProposer):
                     positions=positions,
                     hidden_states=hidden_states,
                     inputs_embeds=inputs_embeds,
-                    last_token_indices=None,
+                    last_token_indices=last_token_indices,
                 )
             draft_token_ids = logits[:batch_size].argmax(dim=-1)
             draft_token_ids_list.append(draft_token_ids)
@@ -572,7 +576,7 @@ class RBLNEagleProposer(EagleProposer):
             input_ids: torch.Tensor,
             positions: torch.Tensor,
             hidden_states: torch.Tensor,
-            last_token_indices: torch.Tensor | None = None,
+            last_token_indices: torch.Tensor,
             inputs_embeds: torch.Tensor | None = None,
         ):
             ret_hidden_states = self.model(
@@ -589,11 +593,7 @@ class RBLNEagleProposer(EagleProposer):
 
             hidden_states = hidden_states.view(-1, self.hidden_size)
             last_hidden_states = last_hidden_states.view(-1, self.hidden_size)
-            sample_hidden_states = (
-                last_hidden_states[last_token_indices]
-                if last_token_indices is not None
-                else last_hidden_states
-            )
+            sample_hidden_states = last_hidden_states[last_token_indices]
             logits = self.model.compute_logits(sample_hidden_states)
 
             return hidden_states, logits
