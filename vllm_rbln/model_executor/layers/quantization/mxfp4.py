@@ -106,6 +106,7 @@ def custom_moe_glu_mxfp4(
     down_proj_scales: torch.Tensor,
     down_proj_bias: torch.Tensor,
     router_logits: torch.Tensor,
+    scoring_func: str,
     alpha: torch.Tensor,
     limit: torch.Tensor,
     k: int,
@@ -153,17 +154,28 @@ def custom_moe_glu_mxfp4(
     alpha_val = alpha.item()
     limit_val = limit.item()
 
-    # Compute top-k routing
-    # router_logits: [num_tokens, num_global_experts]
-    top_k_values, top_k_indices = torch.topk(router_logits, k, dim=-1)
-
-    # Apply softmax to get routing weights (only over selected experts)
-    if post_norm:
-        routing_weights = torch.softmax(top_k_values, dim=-1)
+    routing_scores = router_logits.float()
+    # Match rebel router behavior:
+    # - softmax: score->topk, with optional pre/post normalization
+    # - sigmoid: sigmoid(score)->topk, optional renormalization on selected topk
+    if scoring_func == "sigmoid":
+        # Sigmoid mode expects pre-scored inputs from caller.
+        routing_weights_full = routing_scores
+        _, top_k_indices = torch.topk(routing_weights_full, k, dim=-1)
+        routing_weights = torch.gather(
+            routing_weights_full, dim=-1, index=top_k_indices
+        )
+        if post_norm:
+            routing_weights = routing_weights / routing_weights.sum(
+                dim=-1, keepdim=True
+            ).clamp_min(1e-20)
     else:
-        # Pre-norm: softmax over all experts, then select top-k
-        all_weights = torch.softmax(router_logits, dim=-1)
-        routing_weights = torch.gather(all_weights, dim=-1, index=top_k_indices)
+        top_k_values, top_k_indices = torch.topk(routing_scores, k, dim=-1)
+        if post_norm:
+            routing_weights = torch.softmax(top_k_values, dim=-1)
+        else:
+            all_weights = torch.softmax(routing_scores, dim=-1)
+            routing_weights = torch.gather(all_weights, dim=-1, index=top_k_indices)
 
     # Initialize output
     output = torch.zeros(num_tokens, hidden_size, dtype=dtype)
@@ -240,6 +252,7 @@ def custom_moe_glu_mxfp4_fake(
     down_proj_scales: torch.Tensor,
     down_proj_bias: torch.Tensor,
     router_logits: torch.Tensor,
+    scoring_func: str,
     alpha: torch.Tensor,
     limit: torch.Tensor,
     k: int,
@@ -413,6 +426,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # router_logits = router_logits.view(-1, self.num_experts)
         # router_logits = router_logits.view(-1, self.moe.num_experts)
 
+        # Pre-score routing inputs at caller side; compiler custom op routing
+        # expects already-scored values (no sigmoid applied inside the kernel).
+        scoring_func = getattr(layer, "scoring_func", None)
+        assert scoring_func is not None, "FusedMoE.scoring_func must be set"
+        assert scoring_func in {"softmax", "sigmoid"}
+        if scoring_func == "sigmoid":
+            router_logits = torch.sigmoid(router_logits.to(torch.float32)).to(
+                router_logits.dtype
+            )
+
         if layer.activation == MoEActivation.SWIGLUOAI:
             expert_map_const = None
             if layer.expert_map is not None:
@@ -423,7 +446,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             tokens_mask = None
             use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
             if use_moe_tokens_mask:
-                tokens_mask = get_tokens_mask(num_tokens)
+                tokens_mask = get_tokens_mask(num_tokens, device=router_logits.device)
 
             if layer.use_grouped_topk:
                 n_group = layer.num_expert_group
@@ -444,6 +467,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.down_proj_scales,
                 layer.down_proj_bias,
                 router_logits,
+                scoring_func,
                 self.swiglu_alpha,
                 self.swiglu_limit,
                 layer.top_k,
