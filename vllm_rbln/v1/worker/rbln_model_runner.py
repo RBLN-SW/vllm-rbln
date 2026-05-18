@@ -2226,6 +2226,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         total_tokens=decode_max_seq_len,
                         num_computed_tokens=decode_max_seq_len,
                         num_kv_cache_groups=num_kv_cache_groups,
+                        extra_blocks=1,
                         sampling_params=None
                         if self.is_pooling_model
                         else SamplingParams(temperature=0.0),
@@ -2334,11 +2335,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         num_kv_cache_groups: int,
         sampling_params: SamplingParams | None = None,
         pooling_params: PoolingParams | None = None,
+        extra_blocks: int = 0,
     ) -> None:
         num_blocks = (
             round_up(total_tokens, self.cache_config.block_size)
             // self.cache_config.block_size
-        )
+        ) + extra_blocks
         prompt_token_ids = list(range(total_tokens))
         # the dummy block maintained by BlockPool (null_block)
         null_block_id = 0
