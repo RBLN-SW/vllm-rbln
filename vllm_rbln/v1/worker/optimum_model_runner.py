@@ -1301,7 +1301,7 @@ class RBLNOptimumModelRunner(
         logger.debug("Bucket sizes for RBLN sampler: %s", self.bucket_sizes)
         with torch.inference_mode():
             for bucket_size in self.bucket_sizes:
-                self.pooled_tensors[bucket_size] = torch.empty(
+                self.pooled_tensors[bucket_size] = torch.zeros(
                     (bucket_size, self.model_config.get_vocab_size()),
                     dtype=self.model.dtype,
                 )
