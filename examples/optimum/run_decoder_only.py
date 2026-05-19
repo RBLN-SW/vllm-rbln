@@ -126,7 +126,7 @@ async def main(
 def entry_point(
     max_seq_len: int = 4096,
     num_input_prompt: int = 1,
-    model_id: str = "/llama2-7b_batch2",
+    model_id: str = "meta-llama/Llama-3.1-8B-Instruct",
     prompt_txt: str = "/prompts/copy_prompts.txt",
     golden_json: str = "/golden/golden_llama7b_result_copy_prompts.json",
 ):
