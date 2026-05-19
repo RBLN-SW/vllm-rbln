@@ -304,6 +304,7 @@ class RBLNSampler(VLLMSampler):
         vocab_size = logits.shape[-1]
         bad = (sampled < 0) | (sampled >= vocab_size)
         if bad.any():
+            print("@@@ logits", logits)
             print("OOB sampled:", sampled.tolist(), "vocab:", vocab_size, flush=True)
             raise RuntimeError("sampled OOB BEFORE gather")
         if processed_logprobs is not None:
