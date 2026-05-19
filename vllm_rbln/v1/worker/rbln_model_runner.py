@@ -2264,6 +2264,15 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 else None,
             )
             assert decode_batch == len(dummy_decode_requests)
+            # NOTE(RBLN): Sampler warmup bypasses RBLNScheduler.schedule()
+            # and would default to query_len=1, producing a separate
+            # (decode q=1) model_wrapper graph that runtime never calls
+            # (always-full-spec sliding forces q=k+1). -> warmup reuse
+            if self.num_spec_tokens > 0:
+                for req_id in dummy_decode_num_scheduled_tokens:
+                    dummy_decode_num_scheduled_tokens[req_id] = (
+                        self.num_spec_tokens + 1
+                    )
             so, cso = self._make_dummy_scheduler_outputs(
                 dummy_decode_requests,
                 dummy_decode_num_scheduled_tokens,
