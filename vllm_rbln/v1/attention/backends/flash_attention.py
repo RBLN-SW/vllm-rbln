@@ -1207,11 +1207,13 @@ class RBLNFlashAttentionMetadataBuilder(
                 num_computed_tokens_cpu if use_dt else num_computed_tokens[:num_reqs]
             )
             sl_src = seq_lens_cpu if use_dt else seq_lens[:num_reqs]
-            num_computed_tokens = nct_src.view(-1, 1).to(torch.int16)
-            seq_lens = sl_src.view(-1, 1).to(torch.int16)
+            num_computed_tokens = nct_src.view(-1, 1)
+            seq_lens = sl_src.view(-1, 1)
             query_lens = seq_lens - num_computed_tokens
             cache_seq_lens = torch.clamp(num_computed_tokens, max=sliding_window)
             cache_offsets = cache_seq_lens + query_lens
+            cache_seq_lens = cache_seq_lens.to(torch.int16)
+            cache_offsets = cache_offsets.to(torch.int16)
             if not is_prefill:
                 cache_seq_lens = rbln_utils.pad(cache_seq_lens, 0, batch_pad)
                 cache_offsets = rbln_utils.pad(cache_offsets, 0, batch_pad)
