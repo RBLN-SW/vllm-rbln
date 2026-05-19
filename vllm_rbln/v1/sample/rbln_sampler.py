@@ -413,8 +413,13 @@ class RBLNSampler(VLLMSampler):
         # NOTE:
         # in-place division triggers buffer key error
         # in torchinductor
+        # NOTE:
+        # Greedy requests use a small temperature (1e-3) so softmax collapses
+        # to a near one-hot at argmax. _SAMPLING_EPS (1e-5) is too small here —
+        # it pushes logits past softmax's safe exp range and overflows.
+        _GREEDY_EPS = 1e-3
         if not all_random:
-            temp = torch.where(temp < _SAMPLING_EPS, _SAMPLING_EPS, temp)
+            temp = torch.where(temp < _SAMPLING_EPS, _GREEDY_EPS, temp)
         return logits.div(temp.unsqueeze(dim=1))
 
 
