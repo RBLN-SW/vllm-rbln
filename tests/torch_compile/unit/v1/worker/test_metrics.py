@@ -65,22 +65,21 @@ class TestStepMetricsAddMeasurement:
 
 
 class TestOutlierRemoval:
-    """Test _without_outlier_f and _without_outlier_i edge cases."""
+    """Test _without_outlier edge cases."""
 
     def test_empty_list(self):
         m = StepMetrics()
-        assert m._without_outlier_f([]) == []
-        assert m._without_outlier_i([]) == []
+        assert m._without_outlier([]) == []
 
     def test_single_element(self):
         m = StepMetrics()
-        assert m._without_outlier_f([42.0]) == [42.0]
-        assert m._without_outlier_i([42]) == [42]
+        assert m._without_outlier([42.0]) == [42.0]
+        assert m._without_outlier([42]) == [42]
 
     def test_two_elements_removes_farthest_from_mean(self):
         """With [1.0, 100.0], mean=50.5. Both deviate 49.5 — first max wins."""
         m = StepMetrics()
-        result = m._without_outlier_f([1.0, 100.0])
+        result = m._without_outlier([1.0, 100.0])
         # index(max(deviations)) returns 0 when deviations are equal
         assert len(result) == 1
         assert result == [100.0]
@@ -88,26 +87,26 @@ class TestOutlierRemoval:
     def test_obvious_outlier_removed(self):
         m = StepMetrics()
         values = [10.0, 10.1, 9.9, 10.0, 500.0]
-        result = m._without_outlier_f(values)
+        result = m._without_outlier(values)
         assert 500.0 not in result
         assert len(result) == 4
 
     def test_all_identical_values(self):
         """All deviations are 0 — removes first element (index 0)."""
         m = StepMetrics()
-        result = m._without_outlier_f([5.0, 5.0, 5.0])
+        result = m._without_outlier([5.0, 5.0, 5.0])
         assert len(result) == 2
         assert all(v == 5.0 for v in result)
 
     def test_negative_values(self):
         m = StepMetrics()
-        result = m._without_outlier_f([-100.0, 1.0, 2.0, 3.0])
+        result = m._without_outlier([-100.0, 1.0, 2.0, 3.0])
         assert -100.0 not in result
         assert len(result) == 3
 
     def test_outlier_removal_int(self):
         m = StepMetrics()
-        result = m._without_outlier_i([10, 11, 9, 10, 999])
+        result = m._without_outlier([10, 11, 9, 10, 999])
         assert 999 not in result
         assert len(result) == 4
 
