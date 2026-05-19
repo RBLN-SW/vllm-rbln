@@ -413,8 +413,8 @@ class RBLNSampler(VLLMSampler):
         # NOTE:
         # in-place division triggers buffer key error
         # in torchinductor
-        # if not all_random:
-        temp = torch.where(temp < _SAMPLING_EPS, 0.1, temp)
+        if not all_random:
+            temp = torch.where(temp < _SAMPLING_EPS, _SAMPLING_EPS, temp)
         return logits.div(temp.unsqueeze(dim=1))
 
 
