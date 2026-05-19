@@ -223,7 +223,10 @@ class RBLNEagleProposer(EagleProposer):
 
         block_size = self.block_size
         assert block_size > 0, "block_size has not been initialized."
-        for token_index in range(self.num_speculative_tokens - 1):
+        # NOTE(RBLN): Only slot 0 of the padded window carries valid data; slots 1..k
+        # are junk and filtered out of KV-cache writes via PADDING_SLOT_ID.
+        padded_q_len = self.num_speculative_tokens + 1
+        for _ in range(self.num_speculative_tokens - 1):
             # Update the inputs
             # cast to int32 is crucial when eagle model is compiled.
             # tensor.argmax returns int64 by default.
@@ -268,6 +271,14 @@ class RBLNEagleProposer(EagleProposer):
             common_attn_metadata.slot_mapping.masked_fill_(
                 exceeds_max_model_len, PADDING_SLOT_ID
             )
+            # Pad slot_mapping to padded_q_len with PADDING_SLOT_ID in
+            # slots 1..k so attention's KV write skips the junk slots.
+            slot_mapping_valid = common_attn_metadata.slot_mapping.view(
+                batch_size, 1
+            )
+            common_attn_metadata.slot_mapping = rbln_utils.pad(
+                slot_mapping_valid, 1, padded_q_len, PADDING_SLOT_ID
+            ).view(-1)
 
             # Rebuild attention metadata
             extra_attn_metadata_args = {}
@@ -301,21 +312,27 @@ class RBLNEagleProposer(EagleProposer):
                 inputs_embeds = self.inputs_embeds[:batch_size]
             else:
                 # NOTE(RBLN): reshape tensors in the same way as the RBLN model runner.
-                input_ids = self.input_ids[:batch_bucket_size].view(
+                input_ids_view = self.input_ids[:batch_bucket_size].view(
                     batch_bucket_size, 1
                 )
-                positions = self.positions[:batch_bucket_size].view(
+                input_ids_padded = rbln_utils.pad(input_ids_view, 1, padded_q_len, 0)
+                positions_view = self.positions[:batch_bucket_size].view(
                     batch_bucket_size, 1
                 )
-                hidden_states = self.hidden_states[:batch_bucket_size].view(
+                positions_padded = rbln_utils.pad(
+                    positions_view, 1, padded_q_len, -1
+                )
+                hidden_states_view = self.hidden_states[:batch_bucket_size].view(
                     batch_bucket_size, 1, -1
+                )
+                hidden_states_padded = rbln_utils.pad(
+                    hidden_states_view, 1, padded_q_len, 0
                 )
                 inputs_embeds = None
 
-            # NOTE(RBLN): Subsequent autoregressive call has input shape
-            # [batch_bucket_size, 1] — each batch's single slot is its own
-            # "last" position. (subsequent → q=k+1 padding).
-            last_token_indices = self.arange[:batch_bucket_size]
+            # last_token_indices points at slot 0 of each batch (the only
+            # valid slot in the padded q=k+1 window).
+            last_token_indices = self.arange[:batch_bucket_size] * padded_q_len
             # Run the model.
             with set_forward_context(
                 per_layer_attn_metadata,
@@ -328,9 +345,9 @@ class RBLNEagleProposer(EagleProposer):
                 ),
             ):
                 hidden_states, logits = self.model_executable(
-                    input_ids=input_ids,
-                    positions=positions,
-                    hidden_states=hidden_states,
+                    input_ids=input_ids_padded,
+                    positions=positions_padded,
+                    hidden_states=hidden_states_padded,
                     inputs_embeds=inputs_embeds,
                     last_token_indices=last_token_indices,
                 )
