@@ -207,7 +207,7 @@ class RBLNTopKTopPSampler(nn.Module):
                 "per-request generators. Ignoring generators."
             )
         result = self.top_k_top_p_sample(logits, k, p)
-        vocab_size = 50272
+        vocab_size = logits.shape[1]
 
         bad = (result < 0) | (result >= vocab_size)
         if bad.any():
