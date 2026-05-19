@@ -15,6 +15,10 @@
 from typing import TYPE_CHECKING
 
 from vllm_rbln.logger import init_logger
+from vllm_rbln.utils.optimum.registry import (
+    is_enc_dec_arch,
+    is_pooling_arch,
+)
 
 from .common import update_block_size, update_max_num_batched_tokens
 from .params import RBLNParams
@@ -57,6 +61,17 @@ def sync_from_vllm(vllm_config: VllmConfig) -> None:
         )
         vllm_config.cache_config.block_size = params.kvcache_block_size
         vllm_config.cache_config.user_specified_block_size = True
+
+    # Enc-dec and pooling models usually
+    # don't use paged KV cache (except for Qwen3 models),
+    # so block_size has no real effect
+    # — default it to max_seq_len so users aren't forced
+    # to specify it explicitly.
+    if not vllm_config.cache_config.user_specified_block_size:
+        hf_config = vllm_config.model_config.hf_config
+        if is_enc_dec_arch(hf_config) or is_pooling_arch(hf_config):
+            vllm_config.cache_config.block_size = vllm_config.model_config.max_model_len
+            vllm_config.cache_config.user_specified_block_size = True
 
     if not vllm_config.cache_config.user_specified_block_size:
         raise ValueError(
