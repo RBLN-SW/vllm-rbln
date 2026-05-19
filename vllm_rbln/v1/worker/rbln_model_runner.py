@@ -103,6 +103,7 @@ from vllm_rbln.v1.attention.kv_cache_bindings import (
 )
 from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
+from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
 from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
 from vllm_rbln.v1.worker.utils import prepare_kernel_block_sizes
 
@@ -207,11 +208,13 @@ class RBLNModelRunner:
         # NOTE(Jiayi): We put the entire draft model on the last PP rank.
         # This is not ideal if there are many layers in the draft model.
         if self.speculative_config and get_pp_group().is_last_rank:
-            self.drafter: NgramProposer | SuffixDecodingProposer
+            self.drafter: RBLNMedusaProposer | NgramProposer | SuffixDecodingProposer
             if self.speculative_config.method == "ngram":
                 self.drafter = NgramProposer(self.vllm_config)
             elif self.speculative_config.method == "suffix":
                 self.drafter = SuffixDecodingProposer(self.vllm_config)
+            elif self.speculative_config.method == "medusa":
+                self.drafter = RBLNMedusaProposer(self.vllm_config, self.device)
             else:
                 raise ValueError(
                     "Unsupported speculative decoding method: "
@@ -1350,6 +1353,23 @@ class RBLNModelRunner:
             assert isinstance(sampled_token_ids, list)
             assert isinstance(self.drafter, SuffixDecodingProposer)
             draft_token_ids = self.drafter.propose(self.input_batch, sampled_token_ids)
+        elif spec_config.method == "medusa":
+            assert isinstance(sampled_token_ids, list)
+            assert isinstance(self.drafter, RBLNMedusaProposer)
+
+            if spec_decode_metadata is None:
+                hidden_states = sample_hidden_states.view(-1, self.drafter.hidden_size)
+            else:
+                batch_indices = torch.arange(
+                    len(sampled_token_ids), device=sample_hidden_states.device
+                )
+                last_token_indices = torch.tensor(
+                    [len(t) - 1 for t in sampled_token_ids],
+                    device=sample_hidden_states.device,
+                )
+                hidden_states = sample_hidden_states[batch_indices, last_token_indices]
+
+            draft_token_ids = self.drafter.propose(hidden_states, sampling_metadata)
 
         return draft_token_ids
 
@@ -2247,3 +2267,7 @@ class RBLNModelRunner:
         # 4. sampler
         for size in range(self.max_num_reqs):
             self._dummy_sampler_run(size)
+
+        # 5. drafter
+        if self.speculative_config and self.speculative_config.method == "medusa":
+            self.drafter.dummy_run(self.max_num_reqs)
