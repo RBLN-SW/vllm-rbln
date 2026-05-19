@@ -12,14 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
-import os
 
 import fire
 from transformers import WhisperProcessor
 from vllm import AsyncEngineArgs, AsyncLLMEngine, SamplingParams
 
+VALID_TASKS = {"transcribe", "translate"}
 
-def generate_prompts(batch_size: int, model_id: str):
+
+def generate_prompts(
+    batch_size: int,
+    model_id: str,
+    task: str,
+    language: str,
+):
     from datasets import load_dataset
 
     dataset = load_dataset(
@@ -32,7 +38,8 @@ def generate_prompts(batch_size: int, model_id: str):
     messages = []
     processor = WhisperProcessor.from_pretrained(model_id)
     forced_decoder_ids = processor.get_decoder_prompt_ids(
-        language="en", task="transcribe"
+        language=language,
+        task=task,
     )
     forced_decoder_ids = [idx for _, idx in forced_decoder_ids]
     for item in dataset:
@@ -69,8 +76,13 @@ async def generate(engine: AsyncLLMEngine, request_id, request):
 async def main(
     inputs: list,
     model_id: str,
+    max_num_seqs: int,
 ):
-    engine_args = AsyncEngineArgs(model=model_id, limit_mm_per_prompt={"audio": 1})
+    engine_args = AsyncEngineArgs(
+        model=model_id,
+        limit_mm_per_prompt={"audio": 1},
+        max_num_seqs=max_num_seqs,
+    )
 
     engine = AsyncLLMEngine.from_engine_args(engine_args)
 
@@ -89,21 +101,24 @@ async def main(
 
 def entry_point(
     num_input_prompt: int = 1,
-    model_id: str = "/whisper-base-b4-wo-token-timestamps",
+    model_id: str = "openai/whisper-base",
+    max_num_seqs: int = 1,
+    task: str = "translate",
+    language: str = "ko",
 ):
-    inputs = generate_prompts(num_input_prompt, model_id)
+    if task not in VALID_TASKS:
+        raise ValueError(
+            f"Invalid task {task!r}. Whisper supports: {sorted(VALID_TASKS)}"
+        )
+    inputs = generate_prompts(num_input_prompt, model_id, task, language)
     asyncio.run(
         main(
             inputs=inputs,
             model_id=model_id,
+            max_num_seqs=max_num_seqs,
         )
     )
 
 
 if __name__ == "__main__":
-    # NOTE To avoid multiprocessing issues
-    # `VLLM_WORKER_MULTIPROC_METHOD` must be set to "spawn".
-    # for both V0 and V1.
-    # https://github.com/vllm-project/vllm/issues/26581
-    os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
     fire.Fire(entry_point)
