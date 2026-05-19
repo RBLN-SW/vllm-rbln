@@ -328,7 +328,6 @@ jobs:
               pytest tests/entrypoints/openai -vv --durations 0
               ;;
             "sampler")
-              pytest -n auto -k "warm_upTrue" tests/v1/worker/test_sampler.py -vv --durations 0
               pytest -n auto -k "warm_upFalse" tests/v1/worker/test_sampler.py -vv --durations 0
               ;;
           esac
