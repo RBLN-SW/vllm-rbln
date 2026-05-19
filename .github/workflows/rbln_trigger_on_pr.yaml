@@ -1,4 +1,4 @@
-name: vllm-rbln / PR
+name: CI / vllm-rbln / Trigger on PR
 
 on:
   pull_request:

@@ -1,4 +1,4 @@
-name: Dispatch / Pkg Update
+name: CD / Pkg Update / Dispatch
 on:
   workflow_dispatch:
     inputs:

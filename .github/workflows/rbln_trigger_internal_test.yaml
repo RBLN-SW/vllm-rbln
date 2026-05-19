@@ -1,4 +1,4 @@
-name: CI / Trigger internal test
+name: CI / Internal Test / workflow_call
 
 on:
   workflow_call:

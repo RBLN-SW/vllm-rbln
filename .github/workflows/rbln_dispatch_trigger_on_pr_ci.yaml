@@ -1,4 +1,4 @@
-name: CI / Dispatch / Check pr 
+name: CI / vllm-rbln / Dispatch on external PR
 
 on:
   workflow_dispatch:

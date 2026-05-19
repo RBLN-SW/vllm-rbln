@@ -1,4 +1,4 @@
-name: Pkg Update for vllm-rbln
+name: CD / Pkg Update / workflow_call
 on:
   workflow_call:
     inputs:

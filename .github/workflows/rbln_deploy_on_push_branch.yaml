@@ -1,0 +1,14 @@
+name: CD / Upload Package to Internal PyPI / Trigger on Push (dev,main)
+
+on:
+  push:
+    branches:
+      - dev
+      - main
+
+jobs:
+  deploy-on-push:
+    uses: ./.github/workflows/rbln_deploy_internal.yaml
+    with:
+      ref: ${{ github.sha }}
+    secrets: inherit

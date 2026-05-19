@@ -1,5 +1,5 @@
 
-name: CI / PR / vllm-rbln with optimum
+name: CI / vllm-rbln with Optimum / workflow_call
 
 on:
   workflow_dispatch:
