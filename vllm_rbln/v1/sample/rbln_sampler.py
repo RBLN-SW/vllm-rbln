@@ -275,6 +275,7 @@ class RBLNSampler(VLLMSampler):
         predict_bonus_token: bool = False,
         logprobs_mode_override: LogprobsMode | None = None,
     ) -> SamplerOutput:
+        print("@@ raw logits", logits)
         logprobs_mode = logprobs_mode_override or self.logprobs_mode
         # NOTE(woosuk): Use the original logits (before any penalties or
         # temperature scaling) for the top-k logprobs.
@@ -350,7 +351,11 @@ class RBLNSampler(VLLMSampler):
         # in torchinductor
         if not all_random:
             temp = torch.where(temp < _SAMPLING_EPS, 1.0, temp)
-        return logits.div(temp.unsqueeze(dim=1))
+        print("@@ temp", temp)
+        print("@@ before logits", logits)
+        result = logits.div(temp.unsqueeze(dim=1))
+        print("@@ after logits", logits)
+        return result
 
 
 WARM_UP_CONFIGS = [
