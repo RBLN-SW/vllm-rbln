@@ -264,6 +264,63 @@ class RBLNSampler(VLLMSampler):
     def greedy_sample(self, logits: torch.Tensor) -> torch.Tensor:
         return self._compiled_greedy_sample(logits)
 
+    def sample(
+        self,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+        logprobs_mode_override: LogprobsMode | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Sample logits based on sampling metadata.
+
+        The various logits processing functions called in this method
+        may update the logits tensor in-place.
+        """
+
+        logprobs_mode = logprobs_mode_override or self.logprobs_mode
+        assert not (sampling_metadata.all_greedy and sampling_metadata.all_random)
+        if not sampling_metadata.all_greedy:
+            greedy_sampled = None
+        else:
+            # It runs only all_greedy is True
+            greedy_sampled = self.greedy_sample(logits)
+            if sampling_metadata.all_greedy:
+                processed_logprobs = None
+                if sampling_metadata.max_num_logprobs is not None:
+                    if logprobs_mode == "processed_logits":
+                        processed_logprobs = logits
+                    elif logprobs_mode == "processed_logprobs":
+                        processed_logprobs = self.compute_logprobs(logits)
+                return greedy_sampled, processed_logprobs
+
+        assert sampling_metadata.temperature is not None
+
+        # Apply temperature.
+        logits = self.apply_temperature(
+            logits, sampling_metadata.temperature, sampling_metadata.all_random
+        )
+
+        # Apply logits processors that only apply to random sampling
+        # (argmax invariant)
+        for processor in sampling_metadata.logitsprocs.argmax_invariant:
+            logits = processor.apply(logits)
+
+        # Apply top_k and/or top_p.
+        random_sampled, processed_logprobs = self.topk_topp_sampler(
+            logits,
+            sampling_metadata.generators,
+            sampling_metadata.top_k,
+            sampling_metadata.top_p,
+        )
+
+        assert greedy_sampled is None, (
+            "Upstream vLLM runs greedy and random sampling "
+            "separately and merges the results, "
+            "but vLLM RBLN processes greedy and random requests together: "
+            "greedy requests are routed through the random-sampling path "
+            "with a very small temperature value."
+        )
+        return random_sampled, processed_logprobs
+
     def apply_penalties(
         self,
         logits: torch.Tensor,
@@ -356,8 +413,8 @@ class RBLNSampler(VLLMSampler):
         # NOTE:
         # in-place division triggers buffer key error
         # in torchinductor
-        if not all_random:
-            temp = torch.where(temp < _SAMPLING_EPS, _SAMPLING_EPS, temp)
+        # if not all_random:
+        temp = torch.where(temp < _SAMPLING_EPS, 0.1, temp)
         return logits.div(temp.unsqueeze(dim=1))
 
 
