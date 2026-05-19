@@ -2265,7 +2265,7 @@ class RBLNModelRunner:
                 _ = self.compute_logits(hidden_states)
 
         # 4. sampler
-        for size in range(self.max_num_reqs):
+        for size in range(1, self.max_num_reqs):
             self._dummy_sampler_run(size)
 
         # 5. drafter
