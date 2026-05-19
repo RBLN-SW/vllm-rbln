@@ -1171,9 +1171,9 @@ class RBLNFlashAttentionMetadataBuilder(
         swa_attn_masks = None
         if sliding_window := getattr(self.kv_cache_spec, "sliding_window", None):
             num_computed_tokens = (
-                num_computed_tokens[:num_reqs].view(-1, 1).to(torch.int16)
+                num_computed_tokens[:num_reqs].view(-1, 1)
             )
-            seq_lens = seq_lens[:num_reqs].view(-1, 1).to(torch.int16)
+            seq_lens = seq_lens[:num_reqs].view(-1, 1)
             query_lens = seq_lens - num_computed_tokens
             cache_seq_lens = torch.clamp(num_computed_tokens, max=sliding_window)
             cache_offsets = cache_seq_lens + query_lens
