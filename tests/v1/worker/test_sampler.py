@@ -18,6 +18,7 @@ from torch._dynamo.testing import CompileCounter
 from vllm.platforms import current_platform
 
 from .utils import (
+    _schedule_cached_reqs,
     _schedule_new_request_from_request,
     create_model_runner,
     fake_load_model,
@@ -225,6 +226,84 @@ def test_forward_sampling_parameters(
 # TODO mix the requests with different sampling parameters
 
 
+@pytest.mark.parametrize("top_p", [0.7, 1.0])
+@pytest.mark.parametrize("top_k", [0, 3])
+@pytest.mark.parametrize("temperature", [0.0, 1.0])
+@pytest.mark.parametrize(
+    "presence_penalty, frequency_penalty, repetition_penalty",
+    [(0.0, 0.0, 1.0), (2.0, 2.0, 2.0)],
+    ids=["no_penalty", "all_penalty"],
+)
+def test_no_nan_logits_with_padded_bucket(
+    monkeypatch,
+    top_p,
+    top_k,
+    temperature,
+    presence_penalty,
+    frequency_penalty,
+    repetition_penalty,
+):
+    """When use_rbln_sampler=True and num_reqs < bucket_size, the pooled tensor
+    holding padded logits has unused rows that the sampler still processes with
+    padded sampling metadata. Default temperature=1.0 / top_k=vocab_size in
+    RBLNInputBatch must keep those padded rows from producing NaN that taints
+    the active rows' sampled token ids — for any sampling-param combination.
+    """
+    monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1")
+    monkeypatch.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
+    monkeypatch.setenv("VLLM_RBLN_ENABLE_WARM_UP", "False")
+
+    # max_num_seqs=4 with 3 reqs -> decode uses bucket_size=4, one padded row.
+    runner = create_model_runner(max_num_seqs=4)
+    vocab_size = runner.model_config.get_vocab_size()
+
+    reqs = [
+        make_request(
+            request_id=f"req_{i}",
+            prompt_token_ids=[1, 2, 3],
+            top_p=top_p,
+            top_k=top_k,
+            temperature=temperature,
+            presence_penalty=presence_penalty,
+            frequency_penalty=frequency_penalty,
+            repetition_penalty=repetition_penalty,
+        )
+        for i in range(3)
+    ]
+
+    def assert_no_nan_in_pooled(output):
+        # No row of the pooled logits tensor — active or padded — should
+        # contain NaN. NaN in pad rows can still propagate into the active
+        # sampled token ids through any cross-row sampler op.
+        pooled = runner.pooled_tensors[runner.bucket_size]
+        assert not torch.isnan(pooled).any(), (
+            f"NaN found in pooled logits (bucket_size={runner.bucket_size})"
+        )
+        for sampled_ids in output.sampled_token_ids:
+            for token_id in sampled_ids:
+                assert 0 <= token_id < vocab_size, (
+                    f"Out-of-vocab sampled token id {token_id} "
+                    f"(vocab_size={vocab_size})"
+                )
+
+    # Prefill is single-req per step (no padding); just run it.
+    for i, req in enumerate(reqs):
+        scheduler_output = _schedule_new_request_from_request(
+            req, block_ids=([i],), outer_block_ids=[i]
+        )
+        runner.execute_model(scheduler_output)
+        runner.sample_tokens(grammar_output=None)
+
+    for req in reqs:
+        req.num_computed_tokens = 3
+
+    # Decode all together: num_reqs=3, bucket_size=4 -> row 3 is padding.
+    scheduler_output = _schedule_cached_reqs(reqs, new_block_ids=[None, None, None])
+    runner.execute_model(scheduler_output)
+    output = runner.sample_tokens(grammar_output=None)
+    assert_no_nan_in_pooled(output)
+
+
 def test_sampler_logits_reshape_prevents_torch_compile_recompile(monkeypatch):
     """
     Test to ensure that the sampler does not recompile
@@ -269,7 +348,7 @@ def test_sampler_logits_reshape_prevents_torch_compile_recompile(monkeypatch):
 
     runner.model.compute_logits = compute_logits_flaky
 
-    for i in range(2):
+    def _step(i: int) -> None:
         req = make_request(request_id=f"req_{i}", prompt_token_ids=[1, 2, 3])
         scheduler_output = _schedule_new_request_from_request(
             req, block_ids=([0],), outer_block_ids=[0]
@@ -277,6 +356,16 @@ def test_sampler_logits_reshape_prevents_torch_compile_recompile(monkeypatch):
         runner.execute_model(scheduler_output)
         _ = runner.sample_tokens(grammar_output=None)
 
-    # Should compile only one graph for the sampler.
-    # If recompilation happens, the counter will be more than 3 and fail the assertion.
-    assert compile_counter.frame_count == 3
+    # First iteration warms the compile cache (strided logits).
+    _step(0)
+    initial_frame_count = compile_counter.frame_count
+
+    # Second iteration uses a different stride. The sampler must reuse
+    # the same compiled graph instead of recompiling.
+    _step(1)
+
+    assert compile_counter.frame_count == initial_frame_count, (
+        "Sampler recompiled when logits stride changed: "
+        f"frame_count went from {initial_frame_count} to "
+        f"{compile_counter.frame_count}"
+    )

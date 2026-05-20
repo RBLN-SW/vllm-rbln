@@ -14,10 +14,13 @@
 
 from collections import defaultdict
 from dataclasses import dataclass, field
+from typing import TypeVar
 
 from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)
+
+T = TypeVar("T", int, float)
 
 
 @dataclass
@@ -48,16 +51,7 @@ class StepMetrics:
         if ccl_time is not None:
             self.ccl_times.append(ccl_time)
 
-    def _without_outlier_f(self, values: list[float]) -> list[float]:
-        """Return values excluding one outlier (max absolute deviation)."""
-        if len(values) <= 1:
-            return values
-        mean = sum(values) / len(values)
-        deviations = [abs(v - mean) for v in values]
-        max_idx = deviations.index(max(deviations))
-        return [v for i, v in enumerate(values) if i != max_idx]
-
-    def _without_outlier_i(self, values: list[int]) -> list[int]:
+    def _without_outlier(self, values: list[T]) -> list[T]:
         """Return values excluding one outlier (max absolute deviation)."""
         if len(values) <= 1:
             return values
@@ -70,9 +64,7 @@ class StepMetrics:
         """Get average latency in milliseconds,
         optionally ignoring one outlier."""
         values = (
-            self._without_outlier_f(self.latencies)
-            if ignore_outlier
-            else self.latencies
+            self._without_outlier(self.latencies) if ignore_outlier else self.latencies
         )
         return sum(values) / len(values) * 1000 if values else 0.0
 
@@ -82,12 +74,10 @@ class StepMetrics:
         if not self.latencies or not self.token_counts:
             return 0.0
         latencies = (
-            self._without_outlier_f(self.latencies)
-            if ignore_outlier
-            else self.latencies
+            self._without_outlier(self.latencies) if ignore_outlier else self.latencies
         )
         tokens = (
-            self._without_outlier_i(self.token_counts)
+            self._without_outlier(self.token_counts)
             if ignore_outlier
             else self.token_counts
         )
@@ -99,7 +89,7 @@ class StepMetrics:
         """Get average host time in microseconds,
         optionally ignoring one outlier."""
         values = (
-            self._without_outlier_i(self.host_times)
+            self._without_outlier(self.host_times)
             if ignore_outlier
             else self.host_times
         )
@@ -109,7 +99,7 @@ class StepMetrics:
         """Get average device time in microseconds,
         optionally ignoring one outlier."""
         values = (
-            self._without_outlier_i(self.device_times)
+            self._without_outlier(self.device_times)
             if ignore_outlier
             else self.device_times
         )
@@ -119,9 +109,7 @@ class StepMetrics:
         """Get average ccl time in microseconds,
         optionally ignoring one outlier."""
         values = (
-            self._without_outlier_i(self.ccl_times)
-            if ignore_outlier
-            else self.ccl_times
+            self._without_outlier(self.ccl_times) if ignore_outlier else self.ccl_times
         )
         return sum(values) / len(values) if values else 0.0
 

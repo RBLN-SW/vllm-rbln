@@ -16,10 +16,7 @@ import torch
 import vllm.model_executor.layers.attention.attention as vllm_attn
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
-from vllm.model_executor.layers.attention.attention import (
-    Attention,
-    get_attention_context,
-)
+from vllm.model_executor.layers.attention.attention import Attention
 from vllm.model_executor.layers.attention.kv_transfer_utils import (
     maybe_transfer_kv_layer,
 )
@@ -71,13 +68,29 @@ def _resolve_kv_cache(attn_metadata, layer_index: int) -> torch.Tensor:
     return attn_metadata.kv_caches[layer_index]
 
 
+def _rbln_get_attention_context(layer_name: str):
+    # NOTE(0.19): Upstream get_attention_context() in 0.19+ reads
+    # `attn_layer.kv_cache` as part of its return tuple. Under torch.compile
+    # that attribute access is lifted into the FX graph as a buffer (a meta
+    # tensor on RBLN), which later fails in rebel-compiler's `.cpu()`
+    # conversion. Reimplement locally and skip the `.kv_cache` attribute
+    # read entirely. If upstream stops lifting the buffer, this override can
+    # be replaced with a direct call to `get_attention_context`.
+    forward_context = get_forward_context()
+    attn_metadata = forward_context.attn_metadata
+    if isinstance(attn_metadata, dict):
+        attn_metadata = attn_metadata[layer_name]
+    attn_layer = forward_context.no_compile_layers[layer_name]
+    return attn_metadata, attn_layer
+
+
 def _rbln_unified_attention(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
     layer_name: str,
 ) -> torch.Tensor:
-    attn_metadata, self, _kv_cache, _ = get_attention_context(layer_name)
+    attn_metadata, self = _rbln_get_attention_context(layer_name)
 
     # NOTE(RBLN) - To represent kv cache as model input,
     # modify attention instead of using the attention layer's embedded
@@ -104,7 +117,7 @@ def _rbln_unified_attention_with_output(
     # that ensures torch.compile preserves ordering between KV cache update and
     # attention forward.
     del kv_cache_dummy_dep
-    attn_metadata, self, _kv_cache, _ = get_attention_context(layer_name)
+    attn_metadata, self = _rbln_get_attention_context(layer_name)
 
     # NOTE(RBLN) - To represent kv cache as model input,
     # modify attention instead of using the attention layer's embedded

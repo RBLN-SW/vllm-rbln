@@ -77,16 +77,6 @@ async def client(server):
         yield async_client
 
 
-@pytest.mark.parametrize(
-    "server_args",
-    [
-        pytest.param(
-            ["--disable-frontend-multiprocessing"],
-            id="disable-frontend-multiprocessing",
-        )
-    ],
-    indirect=True,
-)
 @pytest.mark.asyncio
 async def test_request_cancellation(server: RemoteOpenAIServer):
     # clunky test: send an ungodly amount of load in with short timeouts

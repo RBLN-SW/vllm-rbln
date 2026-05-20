@@ -123,6 +123,7 @@ def _make_vllm_config(
         ),
         cache_config=_make_cache_config(),
         scheduler_config=_make_scheduler_config(),
+        device_config=SimpleNamespace(device=torch.device("cpu"), device_type="cpu"),
         kv_transfer_config=None,
         instance_id="test-instance",
     )
@@ -179,6 +180,7 @@ def _fake_super_init(
     self.parallel_config = vllm_config.parallel_config
     self.cache_config = vllm_config.cache_config
     self.scheduler_config = vllm_config.scheduler_config
+    self.device_config = vllm_config.device_config
 
 
 def _create_worker(

@@ -36,6 +36,7 @@ class RBLNKVCacheCoordinator(UnitaryKVCacheCoordinator):
         pcp_world_size: int,
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        is_encoder_decoder: bool = False,
     ):
         self.kv_cache_config = kv_cache_config
         self.max_model_len = max_model_len
@@ -47,6 +48,7 @@ class RBLNKVCacheCoordinator(UnitaryKVCacheCoordinator):
             hash_block_size,
             enable_kv_cache_events,
             metrics_collector,
+            is_encoder_decoder=is_encoder_decoder,
         )
 
         # Needs special handling for find_longest_cache_hit if eagle is enabled

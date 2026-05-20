@@ -54,13 +54,17 @@ register_backend(name="bypass", compiler_fn=bypass_backend)
 class RblnPlatform(Platform):
     _enum = PlatformEnum.OOT
 
-    # TODO(jiwoo.park): GroupCoordinator uses the device_name
-    # when torch.device(device_name) is called.
-    # But we don't support the 'rbln'' device yet.
-    # To support this, we must use PyTorch-RBLN
+    # Compute device_name/device_type/dist_backend once at class definition
+    # from env vars so that subprocesses spawned under
+    # VLLM_WORKER_MULTIPROC_METHOD=spawn (which re-import this module fresh)
+    # observe identical values to the parent without any extra plumbing.
+    _USE_DEVICE_TENSOR: bool = (
+        envs.VLLM_RBLN_USE_VLLM_MODEL and envs.VLLM_RBLN_USE_DEVICE_TENSOR
+    )
     plugin_name: str = "rbln"
-    device_name: str = "cpu"
-    device_type: str = "cpu"
+    device_name: str = "rbln" if _USE_DEVICE_TENSOR else "cpu"
+    device_type: str = "rbln" if _USE_DEVICE_TENSOR else "cpu"
+    dist_backend: str = "rbln-ccl" if _USE_DEVICE_TENSOR else ""
     dispatch_key: str = "CPU"
     ray_device_key: str = "RBLN"
     simple_compile_backend = "bypass"
@@ -161,16 +165,6 @@ class RblnPlatform(Platform):
 
         if envs.VLLM_RBLN_USE_VLLM_MODEL:
             cls.validate_and_setup_prerequisite(vllm_config)
-            if envs.VLLM_RBLN_USE_DEVICE_TENSOR:
-                # Use RBLN device tensors for torch.compile/runtime on the
-                # native vLLM model path.
-                RblnPlatform.device_name = "rbln"
-                RblnPlatform.device_type = "rbln"
-                RblnPlatform.dist_backend = "rbln-ccl"
-                vllm_config.device_config.device_type = RblnPlatform.device_type
-                vllm_config.device_config.device = torch.device(
-                    RblnPlatform.device_type
-                )
 
             if envs.VLLM_RBLN_ENFORCE_MODEL_FP32:
                 logger.info("original model_config.dtype = %s", model_config.dtype)
@@ -212,16 +206,18 @@ class RblnPlatform(Platform):
 
             # FIXME(jiwoo.park) This is a temporary workaround.
             if model_config.enforce_eager:
+                if not envs.VLLM_RBLN_USE_DEVICE_TENSOR:
+                    raise ValueError(
+                        "enforce_eager=True requires VLLM_RBLN_USE_DEVICE_TENSOR=1. "
+                        "Eager mode bypasses torch.compile, so ops must dispatch "
+                        "to a real device='rbln' rather than the compile-backend "
+                        "fake-CPU tensors used by the default vLLM model path."
+                    )
                 hf_config = vllm_config.model_config.hf_config
                 assert not hasattr(hf_config, "sliding_window") or not getattr(
                     hf_config, "use_sliding_window", True
                 )
 
-                RblnPlatform.device_type = "rbln"
-                vllm_config.device_config.device_type = RblnPlatform.device_type
-                vllm_config.device_config.device = torch.device(
-                    RblnPlatform.device_type
-                )
                 # NOTE - force dtype into fp16 for eager mode
                 model_config.dtype = torch.float16
 

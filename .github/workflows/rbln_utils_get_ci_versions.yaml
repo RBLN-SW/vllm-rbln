@@ -1,0 +1,52 @@
+name: Utils / Get CI versions
+
+# Reusable workflow that exposes the version lists defined in
+# .github/ci-versions.json as workflow outputs, so multiple workflows can share
+# the same matrix dimensions without duplicating literal lists.
+#
+# `vllm_versions` in the JSON is split into "stable" (must pass) and "dev"
+# (allowed to fail / partial support). Consumers pick the slice they care
+# about:
+#   - vllm_versions_all    : stable + dev (broad coverage, e.g. fsw dispatch)
+#   - vllm_versions_stable : stable only  (e.g. optimum CI)
+#   - vllm_versions_dev    : dev only     (e.g. continue-on-error gate)
+
+on:
+  workflow_call:
+    outputs:
+      vllm_versions_all:
+        description: "JSON array of all vllm versions (stable + dev)"
+        value: ${{ jobs.get-versions.outputs.vllm_versions_all }}
+      vllm_versions_stable:
+        description: "JSON array of stable vllm versions"
+        value: ${{ jobs.get-versions.outputs.vllm_versions_stable }}
+      vllm_versions_dev:
+        description: "JSON array of dev (failure-allowed) vllm versions"
+        value: ${{ jobs.get-versions.outputs.vllm_versions_dev }}
+
+jobs:
+  get-versions:
+    runs-on: ubuntu-latest
+    outputs:
+      vllm_versions_all: ${{ steps.read.outputs.vllm_versions_all }}
+      vllm_versions_stable: ${{ steps.read.outputs.vllm_versions_stable }}
+      vllm_versions_dev: ${{ steps.read.outputs.vllm_versions_dev }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            .github/ci-versions.json
+          sparse-checkout-cone-mode: false
+
+      - id: read
+        run: |
+          FILE=.github/ci-versions.json
+          ALL=$(jq -c '.vllm_versions.stable + .vllm_versions.dev' "$FILE")
+          STABLE=$(jq -c '.vllm_versions.stable' "$FILE")
+          DEV=$(jq -c '.vllm_versions.dev' "$FILE")
+          echo "vllm_versions_all=${ALL}" >> "$GITHUB_OUTPUT"
+          echo "vllm_versions_stable=${STABLE}" >> "$GITHUB_OUTPUT"
+          echo "vllm_versions_dev=${DEV}" >> "$GITHUB_OUTPUT"
+          echo "all=${ALL}"
+          echo "stable=${STABLE}"
+          echo "dev=${DEV}"
