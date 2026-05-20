@@ -43,7 +43,10 @@ dependencies = [
     "torch",
     "torchvision",
     "torchaudio",
-    "optimum-rbln>=0.10.4a0",
+    # optimum-rbln dropped on this branch: optimum-rbln==0.10.4a0 hard-pins
+    # transformers==4.57.6, which conflicts with lmcache 0.4.5 (transformers
+    # >=5.4). The LMCache KV-transfer path does not use the optimum model
+    # executor, so it is excluded here to unblock the transformers-5 stack.
 ]
 
 [project.optional-dependencies]
@@ -133,7 +136,7 @@ environments = [
 
 [[tool.uv.index]]
 name = "vllm-cpu"
-url = "https://wheels.vllm.ai/0.18.0/cpu"
+url = "https://wheels.vllm.ai/0.19.1/cpu"
 explicit = true
 
 [[tool.uv.index]]

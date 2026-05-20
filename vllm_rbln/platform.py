@@ -33,13 +33,13 @@ from vllm.utils.torch_utils import _StreamPlaceholder
 
 import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
-from vllm_rbln.utils.optimum.converter import sync_vllm_and_optimum
-from vllm_rbln.utils.optimum.predicates import is_qwen3_pooling
-from vllm_rbln.utils.optimum.registry import (
-    is_enc_dec_arch,
-    is_multi_modal,
-    is_pooling_arch,
-)
+
+# NOTE: optimum helpers (sync_vllm_and_optimum / predicates / registry) are
+# imported lazily inside the methods that use them. They pull in `optimum`,
+# which is an optional dependency on this branch (dropped to allow the
+# transformers-5 / lmcache-0.4.5 stack). Importing them at module top would
+# make the platform plugin fail to load when optimum is absent, even for the
+# KV-transfer path that never touches the optimum model executor.
 
 logger = init_logger(__name__)
 
@@ -264,6 +264,8 @@ class RblnPlatform(Platform):
             # breaking CLS pooling. Set it to False for pooling models.
             # ModelConfig.is_encoder_decoder is a @cached_property that's
             # already evaluated by this point, so invalidate the cache too.
+            from vllm_rbln.utils.optimum.registry import is_pooling_arch
+
             hf_config = model_config.hf_config
             if is_pooling_arch(hf_config) and getattr(
                 hf_config, "is_encoder_decoder", False
@@ -271,6 +273,8 @@ class RblnPlatform(Platform):
                 hf_config.is_encoder_decoder = False
                 with contextlib.suppress(KeyError):
                     del model_config.__dict__["is_encoder_decoder"]
+
+            from vllm_rbln.utils.optimum.converter import sync_vllm_and_optimum
 
             cls.disable_unsupported_prefix_caching(vllm_config)
             sync_vllm_and_optimum(vllm_config)
@@ -355,6 +359,13 @@ class RblnPlatform(Platform):
 
         else:
             # Prefix caching is supported only for decoder-only models for now.
+            from vllm_rbln.utils.optimum.predicates import is_qwen3_pooling
+            from vllm_rbln.utils.optimum.registry import (
+                is_enc_dec_arch,
+                is_multi_modal,
+                is_pooling_arch,
+            )
+
             if is_qwen3_pooling(vllm_config.model_config):
                 # Qwen3 pooling model does not support prefix caching for now.
                 cls._disable_prefix_caching(vllm_config, "Qwen3 pooling models")
