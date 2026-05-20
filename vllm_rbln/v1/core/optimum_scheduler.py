@@ -192,6 +192,7 @@ class RBLNOptimumScheduler(Scheduler):
             metrics_collector=self.kv_metrics_collector,
             attn_block_size=attn_block_size,
             max_num_seqs=self.max_num_running_reqs,
+            is_encoder_decoder=self.is_encoder_decoder,
         )
         self.perf_metrics: ModelMetrics | None = None
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
@@ -536,7 +537,14 @@ class RBLNOptimumScheduler(Scheduler):
         self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
 
         # Calculate the dummy block index.
-        if self.cache_config.enable_prefix_caching:
+        if self.is_encoder_decoder:
+            # Whisper requires a dummy block as scratch space to pad the
+            # decoder's block table during the prefill step.
+            # The dummy block is pinned to the last block in the pool, which
+            # is removed from the free queue and never allocated to a real
+            # request.
+            dummy_block = self.kv_cache_manager.get_dummy_block()
+        elif self.cache_config.enable_prefix_caching:
             num_decode_reqs = len(scheduled_running_reqs)
             if num_decode_reqs > 0 and num_decode_reqs < self.max_num_running_reqs:
                 dummy_block = self.kv_cache_manager.get_dummy_block()
