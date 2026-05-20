@@ -987,6 +987,18 @@ class RBLNModelRunner:
         logits: torch.Tensor | None,
         spec_decode_metadata: SpecDecodeMetadata | None,
     ) -> SamplerOutput:
+        if self.is_intermediate_chunked_prefill:
+            # NOTE(RBLN): During intermediate chunked prefill, skip sampling and return
+            # empty tensor with expected shape for performance. The output is discarded
+            # anyway through discard_request_mask.
+            assert logits is not None
+            return SamplerOutput(
+                sampled_token_ids=torch.full(
+                    (1, 1), -1, dtype=torch.int32, device=logits.device
+                ),
+                logprobs_tensors=None,
+            )
+
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
         if spec_decode_metadata is None:
@@ -1297,7 +1309,8 @@ class RBLNModelRunner:
             )
             # TODO(RBLN): supports mtp and extract hidden states
             if spec_config.use_eagle():
-                propose_draft_token_ids(sampler_output.sampled_token_ids)
+                if input_fits_in_drafter:
+                    propose_draft_token_ids(sampler_output.sampled_token_ids)
             else:
                 propose_drafts_after_bookkeeping = input_fits_in_drafter
 
@@ -1387,9 +1400,17 @@ class RBLNModelRunner:
                     batch_indices, last_token_indices
                 ]
 
-            draft_token_ids = self.drafter.propose(
-                target_hidden_states, sampling_metadata
-            )
+            if self.is_intermediate_chunked_prefill:
+                draft_token_ids = torch.zeros(
+                    target_hidden_states.shape[0],
+                    spec_config.num_speculative_tokens,
+                    device=target_hidden_states.device,
+                    dtype=torch.int64,
+                )
+            else:
+                draft_token_ids = self.drafter.propose(
+                    target_hidden_states, sampling_metadata
+                )
         elif spec_config.use_eagle():
             assert isinstance(self.drafter, RBLNEagleProposer)
             assert isinstance(sampled_token_ids, torch.Tensor)
@@ -2261,10 +2282,8 @@ class RBLNModelRunner:
         return bool(num_computed_tokens < (num_tokens_no_spec - 1))
 
     @property
-    def is_last_prefill(self) -> bool:
-        num_computed_tokens = self.input_batch.num_computed_tokens_cpu[0]
-        num_prompt_tokens = self.input_batch.num_prompt_tokens[0]
-        return bool((num_computed_tokens + self.max_num_tokens) >= num_prompt_tokens)
+    def is_intermediate_chunked_prefill(self) -> bool:
+        return self.is_prefill and bool(self.discard_request_mask[0])
 
     @property
     def use_wrapped_compute_logits(self) -> bool:
@@ -2377,13 +2396,13 @@ class RBLNModelRunner:
                 _ = self.compute_logits(hidden_states)
 
         # 4. sampler
-        for size in range(1, self.max_num_reqs):
+        for size in range(1, self.max_num_reqs + 1):
             self._dummy_sampler_run(size)
 
         # 5. drafter
         if self.speculative_config:
             if self.speculative_config.method == "medusa":
-                self.drafter.dummy_run(self.max_num_reqs)
+                self.drafter.dummy_run()
             elif self.speculative_config.use_eagle():
                 # prefill
                 self.drafter.dummy_run(1, self.max_num_tokens, True)

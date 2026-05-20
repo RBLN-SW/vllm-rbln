@@ -134,6 +134,14 @@ class RBLNEagleProposer(EagleProposer):
                 last_token_indices=token_indices_to_sample_padded,
             )
 
+        if self.runner.is_intermediate_chunked_prefill:
+            return torch.zeros(
+                num_reqs,
+                self.num_speculative_tokens,
+                device=self.device,
+                dtype=torch.int64,
+            )
+
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1:
             draft_tokens_ids = logits[:num_reqs].argmax(dim=-1)

@@ -17,7 +17,6 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from vllm.config import VllmConfig
 from vllm.distributed import get_dp_group, get_pp_group, get_tp_group
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -40,6 +39,9 @@ class RBLNMedusaProposer(MedusaProposer):
         super().__init__(vllm_config, device)
 
         self.max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
+        self.hidden_states = torch.zeros(
+            self.max_num_seqs, self.hidden_size, device=self.device, dtype=self.dtype
+        )
 
         from rebel.compile_context import CompileContext
 
@@ -98,27 +100,20 @@ class RBLNMedusaProposer(MedusaProposer):
         target_hidden_states: torch.Tensor,  # [B, H]
         sampling_metadata: SamplingMetadata,
     ) -> torch.Tensor:
-        if target_hidden_states.shape[0] != self.max_num_seqs:
-            pad_len = self.max_num_seqs - target_hidden_states.shape[0]
-            target_hidden_states = F.pad(
-                target_hidden_states, pad=(0, 0, 0, pad_len), mode="constant"
-            )
+        batch_size = target_hidden_states.shape[0]
+        self.hidden_states[:batch_size] = target_hidden_states
 
         # Generate blocks and compute logits
-        logits = self.model_executable(target_hidden_states)
+        logits = self.model_executable(self.hidden_states)
 
         # Compute argmax for each Medusa head and stack into a single tensor
         # Shape: [batch_size, num_heads]
-        draft_tokens = torch.stack([logit.argmax(dim=-1) for logit in logits], dim=1)
+        draft_tokens = torch.stack(
+            [logit[:batch_size].argmax(dim=-1) for logit in logits], dim=1
+        )
 
         return draft_tokens
 
     @torch.inference_mode()
-    def dummy_run(self, num_reqs: int) -> None:
-        hidden_states = torch.zeros(
-            (num_reqs, self.hidden_size),
-            dtype=self.dtype,
-            device=self.device,
-        )
-
-        self.model_executable(hidden_states)
+    def dummy_run(self) -> None:
+        self.model_executable(self.hidden_states)
