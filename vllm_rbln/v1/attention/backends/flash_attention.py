@@ -1143,7 +1143,6 @@ class RBLNFlashAttentionMetadataBuilder(
         num_partition = max_seq_len // partition_len
         cs = seq_idx.repeat(1, num_partition)
         pidx = torch.arange(num_partition, dtype=torch.int32)
-        # RBLN - seq_lens tensor dtype SHOULD be int16
         dyn_size_for_partitions = torch.clamp(
             cs - pidx * partition_len, 0, partition_len
         )
@@ -1207,7 +1206,7 @@ class RBLNFlashAttentionMetadataBuilder(
                 num_computed_tokens_cpu if use_dt else num_computed_tokens[:num_reqs]
             )
             sl_src = seq_lens_cpu if use_dt else seq_lens[:num_reqs]
-            num_computed_tokens = nct_src.view(-1, 1)   
+            num_computed_tokens = nct_src.view(-1, 1)
             seq_lens = sl_src.view(-1, 1)
             query_lens = seq_lens - num_computed_tokens
             cache_seq_lens = torch.clamp(num_computed_tokens, max=sliding_window)
