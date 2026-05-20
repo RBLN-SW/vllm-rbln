@@ -49,7 +49,7 @@ class RBLNInputBatch(InputBatch):
             # which propagate into the sampled token ids as out-of-vocab values.
             # Those ids are later used as indices in torch.gather (e.g. for logprobs),
             # triggering an "index out of bounds" RuntimeError in the CPU kernel.
-            self.temperature_cpu_tensor.fill_(1.0)
+            # self.temperature_cpu_tensor.fill_(1.0)
 
     def refresh_metadata_rbln(self, bucket_size: int):
         """Apply any batch updates to sampling metadata."""
