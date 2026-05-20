@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for the sliding-window past-token approach.
+"""Unit tests for the query backfill past-token approach.
 
 Two test groups:
   1) Scheduler-side: a boundary-affected req gets `slide_distance` recorded
@@ -71,7 +71,7 @@ def _request(num_tokens, req_id):
 # ---------------------------------------------------------------------------
 
 
-class TestSchedulerSliding:
+class TestSchedulerBackfill:
     def test_no_boundary_full_spec_no_slide(self):
         """prompt=1024 → remaining_in_block=1024 ≫ max_spec=4 → no slide,
         full spec runs."""
@@ -126,8 +126,8 @@ class TestSchedulerSliding:
         # No drafts survive when only 1 token of advance fits.
         assert rid not in sched_out.scheduled_spec_decode_tokens
 
-    def test_step_no_spec_required_stays_false_under_sliding(self):
-        """The legacy collective flag must remain False — sliding handles
+    def test_step_no_spec_required_stays_false_under_backfill(self):
+        """The legacy collective flag must remain False — backfill handles
         every boundary case per-req."""
         scheduler = _scheduler()
         req = _request(1022, "A")
@@ -165,7 +165,7 @@ class TestSchedulerSliding:
 # ---------------------------------------------------------------------------
 
 
-class TestRunnerSlidingMath:
+class TestRunnerBackfillMath:
     """Mirror the per-req block at the top of
     RBLNModelRunner._prepare_inputs to verify that past tokens land
     at the start of input_ids and positions shift backward by slide."""
@@ -180,7 +180,7 @@ class TestRunnerSlidingMath:
         token_ids_cpu,
         max_model_len,
     ):
-        """Reimplement the sliding chunk of _prepare_inputs as pure numpy
+        """Reimplement the backfill chunk of _prepare_inputs as pure numpy
         so we can assert on positions / input_ids without spinning up the
         full runner."""
         import numpy as np
@@ -395,9 +395,9 @@ class TestRunnerSlidingMath:
 # ---------------------------------------------------------------------------
 
 
-class TestSlidingLogitsIndices:
+class TestBackfillLogitsIndices:
     """Verify that the existing _calc_spec_decode_metadata math, when fed
-    query-aware cu_num_tokens (= cumsum of query_lengths, sliding-aware),
+    query-aware cu_num_tokens (= cumsum of query_lengths, backfill-aware),
     yields logits_indices that point only at the NEW positions of each
     req's window — past positions are excluded automatically. No code
     change was required for this; the test pins down the invariant so
@@ -495,13 +495,13 @@ class TestSlidingLogitsIndices:
 # ---------------------------------------------------------------------------
 
 
-class TestSlidingDraftTokenExtraction:
+class TestBackfillDraftTokenExtraction:
     """Verify that the draft token ids the rejection sampler validates
     against are the post-trim drafts (not the pre-slide originals).
 
     In _calc_spec_decode_metadata the draft token tensor is extracted as:
         draft_token_ids = input_ids[logits_indices][target_logits_indices + 1]
-    Under sliding, input_ids has past tokens prepended at flat positions
+    Under backfill, input_ids has past tokens prepended at flat positions
     [0..slide-1], the base at [slide], and the (effective_remaining-1)
     surviving drafts at [slide+1..query_length-1]. The extraction must
     pull exactly those surviving drafts — no past, no original-but-dropped
@@ -556,7 +556,7 @@ class TestSlidingDraftTokenExtraction:
         assert draft_tokens.tolist() == [11, 22, 33]
 
     def test_slide_2_extracts_only_surviving_draft(self):
-        """Sliding scenario: slide=2 prepends 2 past tokens; only 1 draft
+        """Backfill scenario: slide=2 prepends 2 past tokens; only 1 draft
         survives the scheduler's trim. The extraction must skip the past
         slots AND skip the original-but-dropped drafts (D2, D3) — only
         the kept draft D1 should be returned."""
@@ -614,11 +614,11 @@ class TestSlidingDraftTokenExtraction:
 # ---------------------------------------------------------------------------
 
 
-class TestSlidingEdgeCases:
-    """Verify the sliding-window logic stays a no-op when spec decode is
+class TestBackfillEdgeCases:
+    """Verify the query backfill logic stays a no-op when spec decode is
     disabled (num_spec_tokens=0), when the running req is in prefill
     phase, or when the boundary simply isn't reached. These are the
-    guards the per-req sliding block depends on; a regression that
+    guards the per-req backfill block depends on; a regression that
     removes one of them would silently change behavior for non-spec or
     prefill workloads.
     """
@@ -644,7 +644,7 @@ class TestSlidingEdgeCases:
         assert req.request_id not in sched_out.scheduled_spec_decode_tokens
 
     def test_prefill_req_no_slide_entry(self):
-        """The sliding decision is gated on `not is_prefill(request)`,
+        """The backfill decision is gated on `not is_prefill(request)`,
         so a req still in prefill must never appear in
         spec_decode_slide_distance even if num_computed % block_size is
         near the boundary."""
@@ -656,7 +656,7 @@ class TestSlidingEdgeCases:
 
         sched_out = scheduler.schedule()
 
-        # Prefill reqs are excluded from the sliding block (is_prefill
+        # Prefill reqs are excluded from the backfill block (is_prefill
         # guard), so the dict stays empty regardless of position-in-block.
         assert sched_out.spec_decode_slide_distance == {}
 
@@ -683,7 +683,7 @@ class TestSlidingEdgeCases:
 
 
 # ---------------------------------------------------------------------------
-# Variable-length proposer support: sliding pads query window when the
+# Variable-length proposer support: backfill pads query window when the
 # proposer (ngram, suffix decoding, etc.) returns fewer than
 # num_spec_tokens drafts, even off the block boundary. This is the
 # unified always-full-spec design — every decode step's query length is
@@ -691,8 +691,8 @@ class TestSlidingEdgeCases:
 # ---------------------------------------------------------------------------
 
 
-class TestSlidingVariableLengthPadding:
-    """Verify sliding fires off the boundary when the proposer returns
+class TestBackfillVariableLengthPadding:
+    """Verify backfill fires off the boundary when the proposer returns
     fewer than num_spec_tokens drafts. The shortage is padded with past
     positions so the runtime query window stays at num_spec_tokens + 1.
     """

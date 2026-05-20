@@ -45,7 +45,13 @@ logger = init_logger(__name__)
 class RBLNSchedulerOutput(SchedulerOutput):
     """SchedulerOutput extended with KV cache copy operations for sub-block
     prefix caching, a legacy boundary-induced no-spec flag, and per-request
-    sliding-window slide distances for fixed-length spec decode."""
+    sliding-window slide distances for fixed-length spec decode.
+
+    Naming: "sliding-window" and "query backfill" refer to the same
+    mechanism. Code-level identifiers below (``spec_decode_slide_distance``,
+    ``slide_distance``, etc.) keep the ``slide``/``sliding`` naming for
+    stability; user-facing log prefixes and docs use ``backfill``.
+    """
 
     kv_cache_copy_ops: list[KVCacheCopyOp] = field(default_factory=list)
     # NOTE(RBLN): Legacy flag from the collective-fallback approach. Set
@@ -420,8 +426,8 @@ class RBLNScheduler(Scheduler):
                     # proposed_drafts > kept_drafts ⇒ boundary forced
                     # some drafts out; proposed_drafts == kept_drafts ⇒
                     # only length padding, no draft drop.
-                    logger.info(
-                        "spec-decode sliding: req=%s "
+                    logger.debug(
+                        "spec-decode backfill: req=%s "
                         "num_computed=%d remaining_in_block=%d "
                         "remaining_in_maxlen=%d slide=%d "
                         "advance=%d proposed_drafts=%d kept_drafts=%d",
