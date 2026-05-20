@@ -1,4 +1,4 @@
-# Copyright 2026 Rebellions Inc. All rights reserved.
+# Copyright 2025 Rebellions Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -262,8 +262,6 @@ class RBLNFlashAttnMLAImpl(MLAAttentionImpl[RBLNFlashAttentionMetadata]):
             k_pe:        [batch, seq_len, qk_rope_head_dim]
             kv_cache:    [num_blocks, block_size, head_size]
         """
-        b_size, q_len, _, _ = q.size()
-
         # Q → latent space via W_UK_T: project q_nope down to kv_lora_rank
         # q: [B, S, H, D] → transpose to [B, H, S, D] for matmul
         decode_q_nope, decode_q_pe = q.split(
@@ -289,8 +287,8 @@ class RBLNFlashAttnMLAImpl(MLAAttentionImpl[RBLNFlashAttentionMetadata]):
             kv_c_normed,
             k_pe,
             kv_cache,
-            attn_metadata.seq_lens.to(torch.int32) if envs.VLLM_RBLN_BATCH_ATTN_OPT and b_size > 1 else attn_metadata.seq_lens.to(torch.int16),
-            attn_metadata.block_tables.to(torch.int16),
+            attn_metadata.seq_lens,
+            attn_metadata.block_tables,
             self.scale_tensor,
         )
 
