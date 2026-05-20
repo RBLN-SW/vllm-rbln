@@ -136,6 +136,8 @@ class RBLNOptimumScheduler(Scheduler):
                 config=self.vllm_config, role=ECConnectorRole.SCHEDULER
             )
 
+        self._pending_free_mm_hashes: list[str] = []
+
         num_gpu_blocks = self.cache_config.num_gpu_blocks
         assert num_gpu_blocks is not None and num_gpu_blocks > 0
 
@@ -190,6 +192,7 @@ class RBLNOptimumScheduler(Scheduler):
             metrics_collector=self.kv_metrics_collector,
             attn_block_size=attn_block_size,
             max_num_seqs=self.max_num_running_reqs,
+            is_encoder_decoder=self.is_encoder_decoder,
         )
         self.perf_metrics: ModelMetrics | None = None
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
@@ -534,7 +537,14 @@ class RBLNOptimumScheduler(Scheduler):
         self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
 
         # Calculate the dummy block index.
-        if self.cache_config.enable_prefix_caching:
+        if self.is_encoder_decoder:
+            # Whisper requires a dummy block as scratch space to pad the
+            # decoder's block table during the prefill step.
+            # The dummy block is pinned to the last block in the pool, which
+            # is removed from the free queue and never allocated to a real
+            # request.
+            dummy_block = self.kv_cache_manager.get_dummy_block()
+        elif self.cache_config.enable_prefix_caching:
             num_decode_reqs = len(scheduled_running_reqs)
             if num_decode_reqs > 0 and num_decode_reqs < self.max_num_running_reqs:
                 dummy_block = self.kv_cache_manager.get_dummy_block()
@@ -553,7 +563,7 @@ class RBLNOptimumScheduler(Scheduler):
             # It contains the request IDs that are finished in between
             # the previous and the current steps.
             finished_req_ids=self.finished_req_ids,
-            free_encoder_mm_hashes=[],
+            free_encoder_mm_hashes=self._pending_free_mm_hashes,
             new_block_ids_to_zero=None,  # It is used for Mamba models
             block_table_dict=block_table_dict,
             cached_block_table=cached_block_table,
@@ -579,7 +589,21 @@ class RBLNOptimumScheduler(Scheduler):
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
         # self._update_after_schedule(scheduler_output)
+
+        self._pending_free_mm_hashes = []
         return scheduler_output
+
+    def _free_request(self, request: Request, delay_free_blocks: bool = False):
+        # Capture mm hashes and notify the EC connector before super()
+        # tears the request down — base._free_blocks deletes self.requests[id]
+        # so we can't recover mm_features afterwards.
+        if request.mm_features:
+            if self.ec_connector is not None:
+                self.ec_connector.request_finished(request)
+            self._pending_free_mm_hashes.extend(
+                f.identifier for f in request.mm_features
+            )
+        return super()._free_request(request, delay_free_blocks=delay_free_blocks)
 
     def update_block_table_dict(
         self, request: Request, block_table_dict: dict[str, torch.Tensor]
