@@ -130,14 +130,7 @@ def rbln_top_k_top_p_sample(
     return sampled
 
 
-@torch.library.custom_op("rbln::argmax", mutates_args=())
-def argmax(logits: torch.Tensor) -> torch.Tensor:
-    return torch.argmax(logits, dim=-1)
-
-
-@torch.library.register_fake("rbln::argmax")
-def argmax_fake(logits: torch.Tensor) -> torch.Tensor:
-    return torch.argmax(logits, dim=-1)
+# NOTE(eunji): argmax op is registered in the compiler
 
 
 def rbln_greedy_sample(logits: torch.Tensor) -> torch.Tensor:
