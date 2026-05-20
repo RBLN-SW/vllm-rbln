@@ -12,14 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 import time
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
 from rebel.kv_cache import aligned_tensor
-from vllm import envs
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     BlockIds,
@@ -43,6 +41,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl_connector import (
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import SlidingWindowSpec
 
+import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
 
 if TYPE_CHECKING:
@@ -50,20 +49,6 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
-
-
-# Emulation toggles for isolating individual KV-transfer cost components in
-# end-to-end measurements. Orthogonal — combine to zero out both at once.
-#   VLLM_RBLN_EMULATE_HOST_XFER_NOOP: skip h2d/d2h copies (host_xfer_buffers
-#     <-> device_kv_caches). `sync_recved_kv_to_device` / `save_kv_to_host`
-#     still iterate but each `self.copy_blocks(...)` call is a no-op.
-#   VLLM_RBLN_EMULATE_NIXL_NOOP: skip the NIXL RDMA `READ`. Notifies P-side
-#     so its sender-side blocks release normally, and immediately marks the
-#     receiving request as done locally.
-_EMULATE_HOST_XFER_NOOP = os.environ.get(
-    "VLLM_RBLN_EMULATE_HOST_XFER_NOOP", "").lower() in ("1", "true")
-_EMULATE_NIXL_NOOP = os.environ.get(
-    "VLLM_RBLN_EMULATE_NIXL_NOOP", "").lower() in ("1", "true")
 
 
 class RblnNixlConnector(NixlConnector):
@@ -307,27 +292,55 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
         # kernel always uses `sliding_window` for its slot 0). `None`
         # signals "no SWA group present" or "ratio == 1" (degenerate
         # case where SWA descs would equal Full descs); both collapse
-        # to the Full-only desc layout.
+        # to the Full-only desc layout. `VLLM_RBLN_NIXL_SWA_VIEW_OPT=0`
+        # forces this collapse even when SWA groups are present, so the
+        # SWA group transports full block_size bytes per block — a
+        # baseline for measuring the optimization's payoff.
         self._sw_ratio: int | None = None
-        for spec in self._group_specs:
-            if isinstance(spec, SlidingWindowSpec):
-                assert spec.block_size % spec.sliding_window == 0
-                ratio = spec.block_size // spec.sliding_window
-                if ratio == 1:
-                    continue
-                if self._sw_ratio is None:
-                    self._sw_ratio = ratio
-                else:
-                    assert self._sw_ratio == ratio, (
-                        "RBLN NIXL connector assumes a single SWA ratio "
-                        f"across groups, got {self._sw_ratio} vs {ratio}"
-                    )
+        if envs.VLLM_RBLN_NIXL_SWA_VIEW_OPT:
+            for spec in self._group_specs:
+                if isinstance(spec, SlidingWindowSpec):
+                    assert spec.block_size % spec.sliding_window == 0
+                    ratio = spec.block_size // spec.sliding_window
+                    if ratio == 1:
+                        continue
+                    if self._sw_ratio is None:
+                        self._sw_ratio = ratio
+                    else:
+                        assert self._sw_ratio == ratio, (
+                            "RBLN NIXL connector assumes a single SWA ratio "
+                            f"across groups, got {self._sw_ratio} vs {ratio}"
+                        )
+        else:
+            logger.info(
+                "VLLM_RBLN_NIXL_SWA_VIEW_OPT is disabled; SWA groups will "
+                "transport block_size bytes per block (baseline mode)."
+            )
+
+        # Emulation toggles short-circuit actual KV data movement, so any
+        # generated tokens are not the result of a real prefill→decode KV
+        # transfer. Warn loudly at worker startup so a stale `1` left in the
+        # env doesn't silently produce garbage outputs in a real run.
+        if envs.VLLM_RBLN_NIXL_EMULATE_HOST_XFER_NOOP:
+            logger.warning(
+                "VLLM_RBLN_NIXL_EMULATE_HOST_XFER_NOOP=1: h2d/d2h host xfer "
+                "copies are stubbed out. KV data is not moved between host "
+                "buffers and device memory — inference outputs will be "
+                "incorrect. Dev-only; unset for real runs."
+            )
+        if envs.VLLM_RBLN_NIXL_EMULATE_REMOTE_XFER_NOOP:
+            logger.warning(
+                "VLLM_RBLN_NIXL_EMULATE_REMOTE_XFER_NOOP=1: NIXL RDMA `READ` "
+                "is skipped. KV blocks are not fetched from the remote peer "
+                "— inference outputs will be incorrect. Dev-only; unset for "
+                "real runs."
+            )
 
     def initialize_host_xfer_buffer(self, kv_caches: dict[str, torch.Tensor]) -> None:
         """Allocate one rebel-aligned host buffer per layer.
 
-        Under `VLLM_RBLN_EMULATE_HOST_XFER_NOOP=1` or
-        `VLLM_RBLN_EMULATE_NIXL_NOOP=1`, all layers share a single
+        Under `VLLM_RBLN_NIXL_EMULATE_HOST_XFER_NOOP=1` or
+        `VLLM_RBLN_NIXL_EMULATE_REMOTE_XFER_NOOP=1`, all layers share a single
         allocation: buffer content is never read/written in emulation
         (copy_blocks and RDMA both no-op), and upstream NIXL's
         `register_kv_caches` dedups same-`data_ptr` views via its HMA
@@ -343,7 +356,10 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
         )
         xfer_buffers: dict[str, torch.Tensor] = {}
 
-        emulate = _EMULATE_HOST_XFER_NOOP or _EMULATE_NIXL_NOOP
+        emulate = (
+            envs.VLLM_RBLN_NIXL_EMULATE_HOST_XFER_NOOP
+            or envs.VLLM_RBLN_NIXL_EMULATE_REMOTE_XFER_NOOP
+        )
         try:
             if emulate and kv_caches:
                 # All filtered layers must share the same shape — assert
@@ -390,18 +406,14 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
     def set_host_xfer_buffer_ops(self, copy_operation: CopyBlocksOp):
         """Assign copy (d2h, h2d) operations when host buffer is used.
 
-        Under `VLLM_RBLN_EMULATE_HOST_XFER_NOOP=1`, the caller-supplied
+        Under `VLLM_RBLN_NIXL_EMULATE_HOST_XFER_NOOP=1`, the caller-supplied
         `copy_operation` is replaced with a no-op so upstream's
         `sync_recved_kv_to_device` / `save_kv_to_host` become free.
         """
         if self.kv_buffer_device != "cpu":
             return
         assert self.use_host_buffer
-        if _EMULATE_HOST_XFER_NOOP:
-            logger.info(
-                "VLLM_RBLN_EMULATE_HOST_XFER_NOOP is set; h2d/d2h copies "
-                "will be no-op for this worker."
-            )
+        if envs.VLLM_RBLN_NIXL_EMULATE_HOST_XFER_NOOP:
             self.copy_blocks = self._noop_copy_blocks
         else:
             self.copy_blocks = copy_operation
@@ -424,9 +436,15 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
     # `runtime._view_and_*_kv_cache`).
 
     def _group_view_block_size(self, group_idx: int) -> int:
-        """SWA group -> `sliding_window`, otherwise the spec's `block_size`."""
+        """SWA group -> `sliding_window`, otherwise the spec's `block_size`.
+
+        Gated on `_sw_ratio is not None` so it stays consistent with the
+        desc-range layout chosen at `__init__`: when the SWA view opt is
+        off (or no SWA spec exists), descs are registered Full-sized and
+        the host xfer must transport the same Full-sized blocks.
+        """
         spec = self._group_specs[group_idx]
-        if isinstance(spec, SlidingWindowSpec):
+        if self._sw_ratio is not None and isinstance(spec, SlidingWindowSpec):
             return spec.sliding_window
         return spec.block_size
 
@@ -698,7 +716,7 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
         """Override to optionally short-circuit the NIXL RDMA `READ` for
         cost-isolation measurements.
 
-        Under `VLLM_RBLN_EMULATE_NIXL_NOOP=1`:
+        Under `VLLM_RBLN_NIXL_EMULATE_REMOTE_XFER_NOOP=1`:
           * Skip `make_prepped_xfer` + `transfer` (no data movement).
           * `send_notif` to P-side so its sender blocks release normally
             (avoids waiting on `VLLM_NIXL_ABORT_REQUEST_TIMEOUT`).
@@ -707,7 +725,7 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
 
         Otherwise delegate to upstream as a normal RDMA-backed transfer.
         """
-        if not _EMULATE_NIXL_NOOP:
+        if not envs.VLLM_RBLN_NIXL_EMULATE_REMOTE_XFER_NOOP:
             return super()._read_blocks(
                 local_block_ids,
                 remote_block_ids,
