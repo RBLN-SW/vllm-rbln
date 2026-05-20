@@ -31,6 +31,7 @@ from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.models.interfaces import (
+    supports_eagle3,
     supports_realtime,
     supports_transcription,
 )
@@ -208,13 +209,24 @@ class RBLNModelRunner:
         # NOTE(Jiayi): We put the entire draft model on the last PP rank.
         # This is not ideal if there are many layers in the draft model.
         if self.speculative_config and get_pp_group().is_last_rank:
-            self.drafter: RBLNMedusaProposer | NgramProposer | SuffixDecodingProposer
+            self.drafter: (
+                RBLNEagleProposer
+                | RBLNMedusaProposer
+                | NgramProposer
+                | SuffixDecodingProposer
+            )
             if self.speculative_config.method == "ngram":
                 self.drafter = NgramProposer(self.vllm_config)
             elif self.speculative_config.method == "suffix":
                 self.drafter = SuffixDecodingProposer(self.vllm_config)
             elif self.speculative_config.method == "medusa":
                 self.drafter = RBLNMedusaProposer(self.vllm_config, self.device)
+            elif self.speculative_config.use_eagle():
+                self.drafter = RBLNEagleProposer(self.vllm_config, self.device, self)
+                if self.speculative_config.method == "eagle3":
+                    self.use_aux_hidden_state_outputs = (
+                        self.drafter.eagle3_use_aux_hidden_state
+                    )
             else:
                 raise ValueError(
                     "Unsupported speculative decoding method: "
@@ -1204,7 +1216,6 @@ class RBLNModelRunner:
 
         with record_function_or_nullcontext("rbln_model_runner: postprocess"):
             hidden_states, aux_hidden_states, logits = model_output
-            assert aux_hidden_states is None
 
             if not get_pp_group().is_last_rank:
                 # Return the intermediate tensors.
@@ -1284,8 +1295,11 @@ class RBLNModelRunner:
                 spec_decode_common_attn_metadata.max_seq_len + self.num_spec_tokens
                 <= self.effective_drafter_max_model_len
             )
-            # TODO(RBLN): supports eagle, mtp and extract hidden states
-            propose_drafts_after_bookkeeping = input_fits_in_drafter
+            # TODO(RBLN): supports mtp and extract hidden states
+            if spec_config.use_eagle():
+                propose_draft_token_ids(sampler_output.sampled_token_ids)
+            else:
+                propose_drafts_after_bookkeeping = input_fits_in_drafter
 
         with record_function_or_nullcontext("rbln_model_runner: bookkeep"):
             (
@@ -1358,7 +1372,9 @@ class RBLNModelRunner:
             assert isinstance(self.drafter, RBLNMedusaProposer)
 
             if spec_decode_metadata is None:
-                hidden_states = sample_hidden_states.view(-1, self.drafter.hidden_size)
+                target_hidden_states = sample_hidden_states.view(
+                    -1, self.drafter.hidden_size
+                )
             else:
                 batch_indices = torch.arange(
                     len(sampled_token_ids), device=sample_hidden_states.device
@@ -1367,9 +1383,70 @@ class RBLNModelRunner:
                     [len(t) - 1 for t in sampled_token_ids],
                     device=sample_hidden_states.device,
                 )
-                hidden_states = sample_hidden_states[batch_indices, last_token_indices]
+                target_hidden_states = sample_hidden_states[
+                    batch_indices, last_token_indices
+                ]
 
-            draft_token_ids = self.drafter.propose(hidden_states, sampling_metadata)
+            draft_token_ids = self.drafter.propose(
+                target_hidden_states, sampling_metadata
+            )
+        elif spec_config.use_eagle():
+            assert isinstance(self.drafter, RBLNEagleProposer)
+            assert isinstance(sampled_token_ids, torch.Tensor)
+
+            next_token_ids, valid_sampled_tokens_count = (
+                self.drafter.prepare_next_token_ids_padded(
+                    common_attn_metadata,
+                    sampled_token_ids,
+                    self.requests,
+                    self.input_batch,
+                    self.discard_request_mask,
+                )
+            )
+
+            target_hidden_states = hidden_states
+            num_rejected_tokens: torch.Tensor | None = None
+            if spec_decode_metadata is None:
+                token_indices_to_sample = None
+                num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+                target_token_ids = self.input_ids[:num_scheduled_tokens]
+                target_positions = self.positions[:num_scheduled_tokens]
+                if self.use_aux_hidden_state_outputs:
+                    assert aux_hidden_states is not None
+                    target_hidden_states = torch.cat(
+                        [h[:num_scheduled_tokens] for h in aux_hidden_states], dim=-1
+                    )
+                else:
+                    target_hidden_states = hidden_states[:num_scheduled_tokens]
+            else:
+                (
+                    common_attn_metadata,
+                    token_indices_to_sample,
+                    num_rejected_tokens,
+                ) = self.drafter.prepare_inputs_padded(
+                    common_attn_metadata,
+                    spec_decode_metadata,
+                    valid_sampled_tokens_count,
+                )
+                total_num_tokens = common_attn_metadata.num_actual_tokens
+                target_token_ids = self.input_ids[:total_num_tokens]
+                target_positions = self.positions[:total_num_tokens]
+                if self.use_aux_hidden_state_outputs:
+                    assert aux_hidden_states is not None
+                    target_hidden_states = torch.cat(
+                        [h.view(-1, h.shape[-1]) for h in aux_hidden_states], dim=-1
+                    )
+
+            draft_token_ids = self.drafter.propose(
+                target_token_ids=target_token_ids,
+                target_positions=target_positions,
+                target_hidden_states=target_hidden_states,
+                next_token_ids=next_token_ids,
+                token_indices_to_sample=token_indices_to_sample,
+                common_attn_metadata=common_attn_metadata,
+                mm_embed_inputs=None,
+                num_rejected_tokens=num_rejected_tokens,
+            )
 
         return draft_token_ids
 
@@ -1394,7 +1471,21 @@ class RBLNModelRunner:
             self.drafter.load_model(self.model)
 
         if self.use_aux_hidden_state_outputs:
-            raise NotImplementedError
+            if not supports_eagle3(self.get_model()):
+                raise RuntimeError(
+                    "Model does not support EAGLE3 interface but "
+                    "aux_hidden_state_outputs was requested"
+                )
+            aux_layers = self._get_eagle3_aux_layers_from_config()
+            if aux_layers:
+                logger.info(
+                    "Using auxiliary layers from speculative config: %s",
+                    aux_layers,
+                )
+            else:
+                aux_layers = self.model.get_eagle3_default_aux_hidden_state_layers()
+
+            self.model.set_aux_hidden_state_layers(aux_layers)
 
         # NOTE(RBLN): This wrapper is designed to be compiled by torch.compile.
         # It handles the forward pass of the underlying model and computes
@@ -1426,8 +1517,17 @@ class RBLNModelRunner:
                 and self.logits_processor is not None
             ):
                 if token_indices is not None:
-                    hidden_states = hidden_states[:, token_indices]
-                logits = self.model.compute_logits(hidden_states)
+                    sample_hidden_states = hidden_states[:, token_indices]
+                    # NOTE(RBLN): token_indices points to the last-token positions used
+                    # for sampling. EAGLE needs the full hidden_states during prefill,
+                    # so do not slice them here.
+                    if not (
+                        self.speculative_config and self.speculative_config.use_eagle()
+                    ):
+                        hidden_states = sample_hidden_states
+                else:
+                    sample_hidden_states = hidden_states
+                logits = self.model.compute_logits(sample_hidden_states)
                 logits = logits.view(-1, logits.size(-1))
 
             return hidden_states, aux_hidden_states, logits
@@ -1444,6 +1544,21 @@ class RBLNModelRunner:
 
             self.model_executable = self._compile(model_wrapper)
             self.compute_logits = self._compile(self.model.compute_logits)
+
+    def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:
+        """Extract Eagle3 auxiliary layer indices from speculative config."""
+        if not (self.speculative_config and self.speculative_config.draft_model_config):
+            return None
+
+        hf_config = self.speculative_config.draft_model_config.hf_config
+        if not hasattr(hf_config, "eagle_aux_hidden_state_layer_ids"):
+            return None
+
+        layer_ids = hf_config.eagle_aux_hidden_state_layer_ids
+        if layer_ids and isinstance(layer_ids, (list, tuple)):
+            return tuple(layer_ids)
+
+        return None
 
     def _get_prompt_logprobs_dict(
         self,
@@ -1647,8 +1762,6 @@ class RBLNModelRunner:
                 token_indices=token_indices,
             )
 
-        # TODO(RBLN): dummy run for drafter model
-
         self.input_batch.num_tokens_no_spec[:num_reqs] = 0
 
     @torch.inference_mode()
@@ -1775,7 +1888,10 @@ class RBLNModelRunner:
                     num_metadata_builders=1,  # not use ubatching
                 )
 
-        # RBLN(TODO): Initialize drafter attention backend
+        # Initialize drafter attention backend
+        if self.speculative_config and self.speculative_config.use_eagle():
+            assert isinstance(self.drafter, RBLNEagleProposer)
+            self.drafter.initialize_attn_backend(kv_cache_config, kernel_block_sizes)
 
     def may_reinitialize_input_batch(
         self, kv_cache_config: KVCacheConfig, kernel_block_sizes: list[int]
@@ -2026,6 +2142,10 @@ class RBLNModelRunner:
             for k, v in kv_caches.items():
                 self.compile_context.mark_static_address(v, k)
 
+        if self.speculative_config and self.speculative_config.use_eagle():
+            assert isinstance(self.drafter, RBLNEagleProposer)
+            self.drafter.initialize_kv_cache_tensors()
+
         return kv_caches
 
     def maybe_add_kv_sharing_layers_to_kv_cache_groups(
@@ -2236,11 +2356,7 @@ class RBLNModelRunner:
     def warmup_model(self) -> None:
         logger.info("Compile and warming up model.")
         # 1. prefill
-        self._dummy_run(
-            1,
-            self.max_num_tokens,
-            True,
-        )
+        self._dummy_run(1, self.max_num_tokens, True)
 
         # 2. decode
         query_lens = [1]
@@ -2248,11 +2364,7 @@ class RBLNModelRunner:
             query_lens.append(self.speculative_config.num_speculative_tokens + 1)
         for num_req in self.bucketing_manager.decode_batch_buckets:
             for query_len in query_lens:
-                self._dummy_run(
-                    num_req,
-                    query_len,
-                    False,
-                )
+                self._dummy_run(num_req, query_len, False)
 
         # 3. compute_logits
         if not self.use_wrapped_compute_logits:
@@ -2269,5 +2381,13 @@ class RBLNModelRunner:
             self._dummy_sampler_run(size)
 
         # 5. drafter
-        if self.speculative_config and self.speculative_config.method == "medusa":
-            self.drafter.dummy_run(self.max_num_reqs)
+        if self.speculative_config:
+            if self.speculative_config.method == "medusa":
+                self.drafter.dummy_run(self.max_num_reqs)
+            elif self.speculative_config.use_eagle():
+                # prefill
+                self.drafter.dummy_run(1, self.max_num_tokens, True)
+
+                # decode
+                for num_req in self.bucketing_manager.decode_batch_buckets:
+                    self.drafter.dummy_run(num_req, 1, False)

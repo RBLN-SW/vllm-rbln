@@ -189,14 +189,6 @@ class RblnPlatform(Platform):
                 # RBLN(NOTE): force dtype into fp16 for eager mode
                 model_config.dtype = torch.float16
 
-            if vllm_config.speculative_config is not None and envs.VLLM_RBLN_SAMPLER:
-                # FIXME(RBLN): make RBLNSampler compatible with speculative decoding
-                logger.warning(
-                    "RBLNSampler is not yet compatible with speculative decoding. "
-                    "Disabling VLLM_RBLN_SAMPLER."
-                )
-                envs.VLLM_RBLN_SAMPLER = False
-
             from vllm.config import CompilationMode
 
             if vllm_config.compilation_config.mode != CompilationMode.NONE:
