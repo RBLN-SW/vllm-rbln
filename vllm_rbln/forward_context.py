@@ -118,9 +118,7 @@ class RBLNDPMetadata(DPMetadata):
             req_mask_t = torch.tensor(
                 [req_mask_shifted] * dp_size, device="cpu", dtype=torch.int32
             )
-            num_reqs_across_dp_cpu = (
-                encoded_across_dp & req_mask_t
-            ) >> token_bits
+            num_reqs_across_dp_cpu = (encoded_across_dp & req_mask_t) >> token_bits
 
         return num_tokens_across_dp_cpu, num_reqs_across_dp_cpu
 
