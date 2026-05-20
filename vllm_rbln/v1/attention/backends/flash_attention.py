@@ -1718,8 +1718,8 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         kv_cache,
                         attn_metadata.attn_masks,
                         self.scale,
-                        attn_metadata.seq_lens.to(torch.int16),
-                        attn_metadata.block_tables.to(torch.int16),
+                        attn_metadata.seq_lens,
+                        attn_metadata.block_tables,
                         self.scale,  # dummy
                     ]
                     if not envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
