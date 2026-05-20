@@ -42,6 +42,7 @@ class RBLNKVCacheManager(KVCacheManager):
         metrics_collector: KVCacheMetricsCollector | None = None,
         attn_block_size: int | None = None,
         max_num_seqs: int = 1,
+        is_encoder_decoder: bool = False,
     ) -> None:
         """
         RBLNKVCacheManager = KVCacheManager + PrefixKVCacheManager.
@@ -69,6 +70,7 @@ class RBLNKVCacheManager(KVCacheManager):
             pcp_world_size=pcp_world_size,
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
+            is_encoder_decoder=is_encoder_decoder,
         )
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
@@ -210,4 +212,12 @@ class RBLNKVCacheManager(KVCacheManager):
         return self.prefix_cache_manager.get_blocks(request_id)
 
     def get_dummy_block(self) -> int:
+        # Encoder-decoder models reserve a dummy block in the block pool;
+        # prefix caching uses a separate dummy block managed by the prefix
+        # cache manager.
+        if self.block_pool.dummy_block is not None:
+            # In V1, block ID 0 is the null_block, so scheduler-side block
+            # IDs start at 1. The compiler expects valid blocks to start at
+            # 0, so shift by -1 to translate into compiler-space.
+            return self.block_pool.dummy_block.block_id - 1
         return self.prefix_cache_manager.get_dummy_block()
