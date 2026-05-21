@@ -38,7 +38,7 @@ dependencies = [
     "pyyaml",
     "datasets",
     "qwen_vl_utils",
-    "vllm==0.18.0+cpu",
+    "vllm==0.18.1.dev2+g4a5535958.d20260417.cpu",
     "torch",
     "torchvision",
     "torchaudio",
@@ -140,8 +140,13 @@ name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
+[[tool.uv.index]]
+name = "rebellions"
+url = "https://pypi.rebellions.in/simple"
+explicit = true
+
 [tool.uv.sources]
-vllm = { index = "vllm-cpu" }
+vllm = { index = "rebellions" }
 torch = { index = "pytorch-cpu" }
 torchvision = { index = "pytorch-cpu" }
 torchaudio = { index = "pytorch-cpu" }
