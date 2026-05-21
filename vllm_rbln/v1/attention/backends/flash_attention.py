@@ -1169,9 +1169,7 @@ class RBLNFlashAttentionMetadataBuilder(
         local_block_tables = None
         swa_attn_masks = None
         if sliding_window := getattr(self.kv_cache_spec, "sliding_window", None):
-            num_computed_tokens = (
-                num_computed_tokens[:num_reqs].view(-1, 1)
-            )
+            num_computed_tokens = num_computed_tokens[:num_reqs].view(-1, 1)
             seq_lens = seq_lens[:num_reqs].view(-1, 1)
             query_lens = seq_lens - num_computed_tokens
             cache_seq_lens = torch.clamp(num_computed_tokens, max=sliding_window)
@@ -1211,10 +1209,10 @@ class RBLNFlashAttentionMetadataBuilder(
             prefix_scheduler_metadata=prefix_scheduler_metadata,
             is_prefill=is_prefill,
             attn_masks=attn_masks,
-            cache_seq_lens=cache_seq_lens.to(self.device).to(torch.int16)
+            cache_seq_lens=cache_seq_lens.to(self.device)
             if cache_seq_lens is not None
             else None,
-            cache_offsets=cache_offsets.to(self.device).to(torch.int16)
+            cache_offsets=cache_offsets.to(self.device)
             if cache_offsets is not None
             else None,
             local_block_tables=local_block_tables.to(self.device)
