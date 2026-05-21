@@ -13,6 +13,7 @@
 # limitations under the License.
 import os
 from copy import copy
+from typing import Any
 
 import numpy as np
 import torch
@@ -31,6 +32,7 @@ import vllm_rbln.rbln_envs as envs
 import vllm_rbln.utils as rbln_utils
 from vllm_rbln.logger import init_logger
 from vllm_rbln.torch_compile_backend import logged_rbln_backend
+from vllm_rbln.forward_context import RBLNDPMetadata
 from vllm_rbln.v1.attention.kv_cache_bindings import (
     attach_kv_cache_bindings,
     build_kv_cache_forward_context_kwargs,
@@ -56,6 +58,18 @@ class RBLNEagleProposer(EagleProposer):
 
         if self.supports_mm_inputs:
             raise NotImplementedError("Multimodal inputs are not supported yet.")
+
+    def _dp_forward_context_args(
+        self, num_input_tokens: int, num_padded_tokens: int
+    ) -> tuple[torch.Tensor | None, int | None]:
+        dp_size = self.vllm_config.parallel_config.data_parallel_size
+        if dp_size <= 1:
+            return None, None
+        dp_rank = self.vllm_config.parallel_config.data_parallel_rank
+        num_tokens_across_dp = RBLNDPMetadata.num_tokens_across_dp(
+            num_input_tokens, dp_size, dp_rank
+        )
+        return num_tokens_across_dp, num_padded_tokens
 
     def propose(
         self,
@@ -102,8 +116,6 @@ class RBLNEagleProposer(EagleProposer):
         batch_bucket_size = self.runner.bucketing_manager.find_decode_batch_bucket(
             batch_size
         )
-        num_padded_tokens = None
-        num_tokens_across_dp = None
         extra_attn_metadata_args = {}
         extra_attn_metadata_args["positions"] = target_positions.cpu()
         extra_attn_metadata_args["batch_pad"] = batch_bucket_size
@@ -154,6 +166,13 @@ class RBLNEagleProposer(EagleProposer):
             )
             hidden_states = target_hidden_states.view(*input_ids.shape, -1)
             inputs_embeds = None
+
+        num_padded_first_pass = (
+            inputs_embeds.shape[0] if input_ids is None else input_ids.numel()
+        )
+        num_tokens_across_dp, num_padded_tokens = self._dp_forward_context_args(
+            num_input_tokens, num_padded_first_pass
+        )
 
         with set_forward_context(
             per_layer_attn_metadata,
@@ -226,6 +245,9 @@ class RBLNEagleProposer(EagleProposer):
         # NOTE(RBLN): Only slot 0 of the padded window carries valid data; slots 1..k
         # are junk and filtered out of KV-cache writes via PADDING_SLOT_ID.
         padded_q_len = self.num_speculative_tokens + 1
+        sub_num_tokens_across_dp, sub_num_padded_tokens = (
+            self._dp_forward_context_args(batch_size, batch_bucket_size * padded_q_len)
+        )
         for _ in range(self.num_speculative_tokens - 1):
             # Update the inputs
             # cast to int32 is crucial when eagle model is compiled.
@@ -338,8 +360,8 @@ class RBLNEagleProposer(EagleProposer):
                 per_layer_attn_metadata,
                 self.vllm_config,
                 num_tokens=batch_size,
-                num_tokens_across_dp=None,
-                num_padded_tokens=None,
+                num_tokens_across_dp=sub_num_tokens_across_dp,
+                num_padded_tokens=sub_num_padded_tokens,
                 additional_kwargs=build_kv_cache_forward_context_kwargs(
                     getattr(self.runner, "kv_cache_bases", None)
                 ),
@@ -357,6 +379,110 @@ class RBLNEagleProposer(EagleProposer):
         # [batch_size, num_speculative_tokens]
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
         return draft_token_ids
+
+    def prepare_dummy_attn_metadata(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        batch_bucket_size: int,
+        positions: torch.Tensor,
+    ) -> dict[str, Any]:
+        # NOTE(RBLN): Draft attention metadata for the DP dummy run.
+
+        per_layer_attn_metadata: dict[str, Any] = {}
+        extra_attn_metadata_args = {
+            "positions": positions,
+            "batch_pad": batch_bucket_size,
+            "is_prefill": False,
+        }
+        for attn_group in self.draft_attn_groups:
+            attn_metadata = attn_group.get_metadata_builder().build(
+                common_prefix_len=0,
+                common_attn_metadata=common_attn_metadata,
+                fast_build=True,
+                **extra_attn_metadata_args,
+            )
+            attach_kv_cache_bindings(
+                attn_metadata,
+                self.runner.kv_caches,
+                getattr(self.runner, "kv_cache_bases", None),
+                getattr(self.runner, "kv_cache_view_infos", None),
+            )
+            for layer_name in attn_group.layer_names:
+                per_layer_attn_metadata[layer_name] = attn_metadata
+        return per_layer_attn_metadata
+
+    def dummy_propose(
+        self,
+        per_layer_attn_metadata: dict[str, Any],
+        batch_bucket_size: int,
+    ) -> None:
+        if self.num_speculative_tokens <= 0:
+            return
+
+        padded_q_len = self.num_speculative_tokens + 1
+        flat_tokens = batch_bucket_size * padded_q_len
+        device = self.input_ids.device
+
+        input_ids = torch.zeros(
+            (batch_bucket_size, padded_q_len),
+            device=device,
+            dtype=self.input_ids.dtype,
+        )
+        positions = torch.zeros(
+            (batch_bucket_size, padded_q_len),
+            device=device,
+            dtype=self.positions.dtype,
+        )
+        hidden_states = torch.zeros(
+            (batch_bucket_size, padded_q_len, self.hidden_size),
+            device=device,
+            dtype=self.hidden_states.dtype,
+        )
+        last_token_indices = self.arange[:batch_bucket_size] * padded_q_len
+        fwd_ctx_kwargs = build_kv_cache_forward_context_kwargs(
+            getattr(self.runner, "kv_cache_bases", None)
+        )
+
+        # First-pass matches the busy peer's pre-loop `set_forward_context`.
+        nta_dp, npt = self._dp_forward_context_args(flat_tokens, flat_tokens)
+        with set_forward_context(
+            per_layer_attn_metadata,
+            self.vllm_config,
+            num_tokens=flat_tokens,
+            num_tokens_across_dp=nta_dp,
+            num_padded_tokens=npt,
+            additional_kwargs=fwd_ctx_kwargs,
+        ):
+            _ = self.model_executable(
+                input_ids=input_ids,
+                positions=positions,
+                hidden_states=hidden_states,
+                inputs_embeds=None,
+                last_token_indices=last_token_indices,
+            )
+
+        # Subsequent loop matches the busy peer's k-1 iterations.
+        if self.num_speculative_tokens == 1:
+            return
+        sub_nta_dp, sub_npt = self._dp_forward_context_args(
+            batch_bucket_size, flat_tokens
+        )
+        for _ in range(self.num_speculative_tokens - 1):
+            with set_forward_context(
+                per_layer_attn_metadata,
+                self.vllm_config,
+                num_tokens=batch_bucket_size,
+                num_tokens_across_dp=sub_nta_dp,
+                num_padded_tokens=sub_npt,
+                additional_kwargs=fwd_ctx_kwargs,
+            ):
+                _ = self.model_executable(
+                    input_ids=input_ids,
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    inputs_embeds=None,
+                    last_token_indices=last_token_indices,
+                )
 
     def prefill_only(
         self,
@@ -397,8 +523,6 @@ class RBLNEagleProposer(EagleProposer):
         batch_bucket_size = self.runner.bucketing_manager.find_decode_batch_bucket(
             batch_size
         )
-        num_padded_tokens = None
-        num_tokens_across_dp = None
         extra_attn_metadata_args = {}
         extra_attn_metadata_args["positions"] = target_positions.cpu()
         extra_attn_metadata_args["batch_pad"] = batch_bucket_size
@@ -449,6 +573,13 @@ class RBLNEagleProposer(EagleProposer):
             )
             hidden_states = target_hidden_states.view(*input_ids.shape, -1)
             inputs_embeds = None
+
+        num_padded_first_pass = (
+            inputs_embeds.shape[0] if input_ids is None else input_ids.numel()
+        )
+        num_tokens_across_dp, num_padded_tokens = self._dp_forward_context_args(
+            num_input_tokens, num_padded_first_pass
+        )
 
         with set_forward_context(
             per_layer_attn_metadata,

@@ -222,6 +222,7 @@ class DummyRunState(NamedTuple):
     num_input_tokens: int
     input_ids: dict[int, torch.Tensor]
     positions: dict[int, torch.Tensor]
+    draft_attn_metadata: dict[int, dict[str, Any]] | None = None
 
 
 class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
@@ -2539,6 +2540,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         attn_metadata_bucket: dict[int, dict[str, Any]] = {}
         input_ids_bucket: dict[int, torch.Tensor] = {}
         positions_bucket: dict[int, torch.Tensor] = {}
+        build_draft_dummy = isinstance(
+            getattr(self, "drafter", None), RBLNEagleProposer
+        )
+        draft_attn_metadata_bucket: dict[int, dict[str, Any]] | None = (
+            {} if build_draft_dummy else None
+        )
 
         for batch_bucket_size in self.bucketing_manager.decode_batch_buckets:
             attn_metadata: dict[str, Any] = {}
@@ -2625,11 +2632,21 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             input_ids_bucket[batch_bucket_size] = input_ids.to(self.device)
             positions_bucket[batch_bucket_size] = positions.to(self.device)
 
+            if draft_attn_metadata_bucket is not None:
+                draft_attn_metadata_bucket[batch_bucket_size] = (
+                    self.drafter.prepare_dummy_attn_metadata(
+                        common_attn_metadata=common_attn_metadata,
+                        batch_bucket_size=batch_bucket_size,
+                        positions=self.positions.cpu.clone(),
+                    )
+                )
+
         return DummyRunState(
             attn_metadata=attn_metadata_bucket,
             num_input_tokens=num_input_tokens,
             input_ids=input_ids_bucket,
             positions=positions_bucket,
+            draft_attn_metadata=draft_attn_metadata_bucket,
         )
 
     def _prepare_dummy_input_batch(self) -> InputBatch:
@@ -2736,7 +2753,10 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     @torch.inference_mode()
     def dummy_run(self) -> None:
         assert self.dummy_run_state is not None
-        (attn_metadata, num_input_tokens, input_ids, positions) = self.dummy_run_state
+        attn_metadata = self.dummy_run_state.attn_metadata
+        num_input_tokens = self.dummy_run_state.num_input_tokens
+        input_ids = self.dummy_run_state.input_ids
+        positions = self.dummy_run_state.positions
 
         # This rank is DP-idle (no scheduled work). Under the always-full-spec
         # design the runtime model_wrapper shape is unconditionally
@@ -2831,6 +2851,13 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 selected_token_indices=token_indices,
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
+            )
+
+        draft_attn_metadata = self.dummy_run_state.draft_attn_metadata
+        if draft_attn_metadata is not None and self.num_spec_tokens > 0:
+            self.drafter.dummy_propose(
+                per_layer_attn_metadata=draft_attn_metadata[batch_bucket_size],
+                batch_bucket_size=batch_bucket_size,
             )
 
     def _bookkeeping_sync(
