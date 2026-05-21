@@ -25,9 +25,16 @@ Usage (with VLLM_RBLN_USE_DEVICE_TENSOR=1, KV cache lives on device='rbln'):
         for i, t in enumerate(kv_caches):
             cpu_t = t.to("cpu")           # pull to CPU for inspection
             # ... do anything with cpu_t (read or modify) ...
-            t.copy_(cpu_t.to(t.device))   # write back to the rbln tensor
+            t.copy_(cpu_t)                # write back (direct h2v, no
+                                          # intermediate RBLN tensor)
 
     register_kv_cache_torch_hook(my_hook)
+
+NOTE: prefer ``t.copy_(cpu_t)`` over ``t.copy_(cpu_t.to(t.device))`` for the
+write-back. The latter allocates an intermediate RBLN tensor and does *two*
+DMAs (cpu→rbln_intermediate, then rbln→rbln target) instead of a single h2v.
+For 800 MB / layer this roughly doubles the update-direction cost; see
+``guides/results.md`` (2026-05-18 section) for measurements.
 
 The hook fires once per execute_model() call, *after* the forward pass has
 populated the KV cache and *before* the next decode step is dispatched, so
@@ -315,15 +322,6 @@ def _random_hook(
 _BENCH_SAMPLES: List[tuple] = []
 _BENCH_WARMUP_FORWARDS = 2
 
-# Reference to runner's kv_cache_bases (contiguous int8 raw storages, set by
-# model_runner just before invoking the hook). Empty when dedup disabled.
-_BASES: List[torch.Tensor] = []
-
-
-def set_kv_cache_bases(bases: Sequence[torch.Tensor]) -> None:
-    global _BASES
-    _BASES = list(bases)
-
 
 def _torch_bench_hook(
     kv_caches: Sequence[torch.Tensor], phase: str, step: int
@@ -347,8 +345,6 @@ def _torch_bench_hook(
     f_total = u_total = 0
     n_layers = len(kv_caches)
     for t in kv_caches:
-        print(f"******************** [kv_cache_hook][BENCH] t.shape={t.shape}, t.size={t.numel()}, t.element_size={t.element_size()}, t.nbytes={t.numel() * t.element_size()}")
-        # src = t[:, 0:1, :, :, :, :]
         t0 = time.perf_counter_ns()
         cpu_t = t.to("cpu")
         t1 = time.perf_counter_ns()
@@ -411,362 +407,171 @@ def torch_bench_summary() -> Optional[str]:
     )
 
 
-def _wrap_storage_as_int8_1d(
-    view_t: torch.Tensor, layer_bytes: int
-) -> torch.Tensor:
-    """Wrap view_t's underlying storage as a contiguous 1-D int8 tensor,
-    narrowed to ``layer_bytes`` from the storage start.
 
-    The layer view comes from a permute/reshape of a contiguous int8 raw
-    buffer allocated in ``_allocate_kv_cache_tensors``. The returned tensor
-    shares that same storage but is plain contiguous int8, so ``.to('cpu')``
-    should hit the ``is_direct_copy()`` fast path in RBLNCopy.cpp.
-
-    NOTE: starts at storage offset 0 (not the view's storage_offset). When
-    a single storage backs multiple layers (shared_by case in dedup), this
-    measures the *first* layer-sized slice. With dedup disabled in our
-    config, each layer has its own storage so this is equivalent to the
-    layer's own bytes.
-    """
-    storage = view_t.untyped_storage()
-    nbytes = storage.nbytes()
-    size = min(layer_bytes, nbytes)
-    base = torch.empty(0, dtype=torch.int8, device=view_t.device)
-    base.set_(storage, 0, (nbytes,))
-    return base.narrow(0, 0, size)
+# ---------- bench_1block: K+V 1-block round-trip (runtime 등가 비교) -----
 
 
-def _torch_bench_storage_hook(
+def _torch_bench_1block_hook(
     kv_caches: Sequence[torch.Tensor], phase: str, step: int
 ) -> None:
-    """Per-layer round-trip on the layer view's *underlying storage*,
-    wrapped as a contiguous 1-D int8 tensor. No mutation in practice (we
-    write back the same bytes we read).
+    """첫 block (K + V) 만 round-trip — runtime hook 의 `_fetch_kv_cache(...,
+    block_idx=0, ...)` 호출과 등가 DMA 수 (K 1 block + V 1 block = 2 DMA).
 
-    Goal: confirm/refute the hypothesis that the view path is slow because
-    is_direct_copy() in RBLNCopy.cpp rejects non-contig views and falls
-    through to a strided→contig re-copy. If the storage-direct path is
-    fast (≈runtime path), the bottleneck is on the torch side and the fix
-    is to expose a contiguous wrapper to user code.
+    layer view shape `(2, num_blocks, n_head, 1, block_size, head_dim)` 에서
+    K = `t[0, 0:1]`, V = `t[1, 0:1]` 슬라이스. 두 슬라이스 각각 fast path
+    (is_direct_copy) 통과해야 runtime 과 동등 비교가 됨.
+
+    Update direction 은 1-copy 패턴 (`slice.copy_(cpu_slice)`) 사용 — 즉 기존
+    K/V slice 에 직접 h2v.
     """
     warmup = step < _BENCH_WARMUP_FORWARDS
     if step == 0 and kv_caches:
-        v = kv_caches[0]
-        layer_bytes = v.numel() * v.element_size()
-        s = v.untyped_storage()
-        flat = _wrap_storage_as_int8_1d(v, layer_bytes)
+        t = kv_caches[0]
+        k = t[0, 0:1]
+        v = t[1, 0:1]
         print(
-            f"******************** [kv_cache_hook][BENCH_STORAGE/info] "
-            f"step=0 phase={phase} num_layers={len(kv_caches)} | "
-            f"view: shape={tuple(v.shape)} stride={v.stride()} "
-            f"dtype={v.dtype} contig={v.is_contiguous()} "
-            f"storage_nbytes={s.nbytes()} tensor_nbytes={layer_bytes} "
-            f"storage_offset={v.storage_offset()} | "
-            f"flat: shape={tuple(flat.shape)} dtype={flat.dtype} "
-            f"contig={flat.is_contiguous()} device={flat.device}",
+            f"******************** [kv_cache_hook][BENCH_1BLOCK/info] step=0 "
+            f"phase={phase} num_layers={len(kv_caches)} "
+            f"layer shape={tuple(t.shape)} stride={t.stride()} "
+            f"dtype={t.dtype} device={t.device} | "
+            f"k_slice shape={tuple(k.shape)} contig={k.is_contiguous()} "
+            f"nbytes={k.numel() * k.element_size()} | "
+            f"v_slice shape={tuple(v.shape)} contig={v.is_contiguous()} "
+            f"nbytes={v.numel() * v.element_size()}",
             flush=True,
         )
     f_total = u_total = 0
     n_layers = len(kv_caches)
     for t in kv_caches:
-        layer_bytes = t.numel() * t.element_size()
-        flat = _wrap_storage_as_int8_1d(t, layer_bytes)
+        k_slice = t[0, 0:1]
+        v_slice = t[1, 0:1]
         t0 = time.perf_counter_ns()
-        cpu_t = flat.to("cpu")
+        cpu_k = k_slice.to("cpu")
+        cpu_v = v_slice.to("cpu")
         t1 = time.perf_counter_ns()
-        flat.copy_(cpu_t.to(flat.device))
+        k_slice.copy_(cpu_k)
+        v_slice.copy_(cpu_v)
         t2 = time.perf_counter_ns()
         if not warmup:
-            _BENCH_SAMPLES.append((t1 - t0, t2 - t1, layer_bytes, 1))
+            nbytes = (
+                k_slice.numel() * k_slice.element_size()
+                + v_slice.numel() * v_slice.element_size()
+            )
+            _BENCH_SAMPLES.append((t1 - t0, t2 - t1, nbytes, 2))
             f_total += t1 - t0
             u_total += t2 - t1
     if not warmup and n_layers > 0:
-        print(
-            f"******************** [kv_cache_hook][BENCH_STORAGE] "
-            f"step={step} phase={phase} per_layer "
-            f"fetch_mean={f_total/n_layers/1e3:.2f}µs "
-            f"update_mean={u_total/n_layers/1e3:.2f}µs "
-            f"bytes={(kv_caches[0].numel() * kv_caches[0].element_size())/1e6:.2f}MB",
-            flush=True,
+        nbytes = (
+            kv_caches[0][0, 0:1].numel() * kv_caches[0].element_size()
+            + kv_caches[0][1, 0:1].numel() * kv_caches[0].element_size()
         )
-        if (step - _BENCH_WARMUP_FORWARDS) % 10 == 0:
-            s = torch_bench_summary()
-            if s:
-                print("******************** CUMULATIVE/LAYER " + s, flush=True)
-
-
-# pre-allocated per-layer aligned host buffers; lazily filled on first call.
-_PINNED_HOSTS: List[torch.Tensor] = []
-
-
-def _torch_bench_pinned_hook(
-    kv_caches: Sequence[torch.Tensor], phase: str, step: int
-) -> None:
-    """Per-layer round-trip using a *pre-allocated 4KB-aligned* host buffer
-    (same primitive as the runtime path), reused across forwards.
-
-    Tests whether the gap vs runtime path is explained by host-side cost
-    (alloc/free + page faults + alignment), not the DMA call itself.
-    """
-    global _PINNED_HOSTS
-    warmup = step < _BENCH_WARMUP_FORWARDS
-    if not _PINNED_HOSTS and kv_caches:
-        import numpy as np
-        from rebel.kv_cache import aligned_tensor
-
-        for t in kv_caches:
-            nbytes = t.numel() * t.element_size()
-            num_fp16 = (nbytes + 1) // 2
-            buf = aligned_tensor(
-                num_fp16, dtype=np.float16,
-                alignment=0x1000, tensor_type="pt",
-            )
-            _PINNED_HOSTS.append(buf.view(t.dtype).reshape(t.shape))
-        h0 = _PINNED_HOSTS[0]
-        v0 = kv_caches[0]
         print(
-            f"******************** [kv_cache_hook][BENCH_PINNED/info] "
-            f"step={step} phase={phase} num_layers={len(kv_caches)} | "
-            f"view: shape={tuple(v0.shape)} stride={v0.stride()} "
-            f"dtype={v0.dtype} contig={v0.is_contiguous()} device={v0.device} | "
-            f"host: shape={tuple(h0.shape)} stride={h0.stride()} "
-            f"dtype={h0.dtype} contig={h0.is_contiguous()} "
-            f"data_ptr=0x{h0.data_ptr():x} "
-            f"4KB_aligned={h0.data_ptr() % 0x1000 == 0}",
-            flush=True,
-        )
-    f_total = u_total = 0
-    n_layers = len(kv_caches)
-    for i, t in enumerate(kv_caches):
-        host = _PINNED_HOSTS[i]
-        t0 = time.perf_counter_ns()
-        host.copy_(t)            # device → host (DMA into aligned reused buf)
-        t1 = time.perf_counter_ns()
-        t.copy_(host)            # host → device
-        t2 = time.perf_counter_ns()
-        if not warmup:
-            nbytes = t.numel() * t.element_size()
-            _BENCH_SAMPLES.append((t1 - t0, t2 - t1, nbytes, 1))
-            f_total += t1 - t0
-            u_total += t2 - t1
-    if not warmup and n_layers > 0:
-        print(
-            f"******************** [kv_cache_hook][BENCH_PINNED] "
-            f"step={step} phase={phase} per_layer "
-            f"fetch_mean={f_total/n_layers/1e3:.2f}µs "
-            f"update_mean={u_total/n_layers/1e3:.2f}µs "
-            f"bytes={(kv_caches[0].numel() * kv_caches[0].element_size())/1e6:.2f}MB",
-            flush=True,
-        )
-        if (step - _BENCH_WARMUP_FORWARDS) % 10 == 0:
-            s = torch_bench_summary()
-            if s:
-                print("******************** CUMULATIVE/LAYER " + s, flush=True)
-
-
-# Chunk bench: chunk-단위 sample (layer 전체 cumulative 는 _BENCH_SAMPLES 에 들어감)
-# Each entry: (fetch_ns, update_ns, chunk_bytes, num_blocks_in_chunk).
-_TORCH_CHUNK_SAMPLES: List[tuple] = []
-_BLOCKS_PER_CHUNK = int(
-    os.environ.get("VLLM_RBLN_KV_CACHE_BLOCKS_PER_CHUNK", "64")
-)
-
-
-def _torch_bench_chunked_hook(
-    kv_caches: Sequence[torch.Tensor], phase: str, step: int
-) -> None:
-    """Per-chunk round-trip: reused host buffer + 64-block slice copy_.
-
-    Layer view shape `(2, num_blocks, n_head, 1, block_size, head_dim)`.
-    dim 0 = K/V index. 두 쪽이 메모리상 396 MB gap 으로 분리되어 있어
-    한 번에 묶지 못함 → K, V 분리 slice (각각 contig) 로 chunk 당 2 copy_.
-
-    Sample 종류:
-      - _TORCH_CHUNK_SAMPLES : chunk 단위 (K+V 합) timing
-      - _BENCH_SAMPLES       : layer 전체 (chunk 합) timing, bench_reused 와 같은 형식
-    """
-    global _PINNED_HOSTS
-    warmup = step < _BENCH_WARMUP_FORWARDS
-    if not _PINNED_HOSTS and kv_caches:
-        for t in kv_caches:
-            buf = torch.empty(t.shape, dtype=t.dtype, device="cpu")
-            buf.zero_()  # pre-fault all pages
-            _PINNED_HOSTS.append(buf)
-        v0 = kv_caches[0]
-        num_blocks = v0.shape[1]
-        h0 = _PINNED_HOSTS[0]
-        print(
-            f"******************** [kv_cache_hook][BENCH_CHUNKED/info] "
-            f"step={step} phase={phase} num_layers={len(kv_caches)} "
-            f"num_blocks={num_blocks} blocks_per_chunk={_BLOCKS_PER_CHUNK} | "
-            f"view: shape={tuple(v0.shape)} stride={v0.stride()} "
-            f"dtype={v0.dtype} contig={v0.is_contiguous()} | "
-            f"k_slice[0,:64] contig={v0[0, :_BLOCKS_PER_CHUNK].is_contiguous()} | "
-            f"host: shape={tuple(h0.shape)} contig={h0.is_contiguous()} "
-            f"4KB_aligned={h0.data_ptr() % 0x1000 == 0}",
-            flush=True,
-        )
-    f_layer_total = u_layer_total = 0
-    n_layers = len(kv_caches)
-    for i, t in enumerate(kv_caches):
-        host = _PINNED_HOSTS[i]
-        num_blocks = t.shape[1]
-        layer_fetch_ns = layer_update_ns = 0
-        for chunk_start in range(0, num_blocks, _BLOCKS_PER_CHUNK):
-            chunk_end = min(chunk_start + _BLOCKS_PER_CHUNK, num_blocks)
-            n_in_chunk = chunk_end - chunk_start
-
-            k_dev = t[0, chunk_start:chunk_end]
-            k_host = host[0, chunk_start:chunk_end]
-            v_dev = t[1, chunk_start:chunk_end]
-            v_host = host[1, chunk_start:chunk_end]
-
-            t0 = time.perf_counter_ns()
-            k_host.copy_(k_dev)
-            v_host.copy_(v_dev)
-            t1 = time.perf_counter_ns()
-            k_dev.copy_(k_host)
-            v_dev.copy_(v_host)
-            t2 = time.perf_counter_ns()
-            if not warmup:
-                # bytes per block (K+V) — layer 전체에서 균등 분할.
-                bytes_per_block = (
-                    t.numel() * t.element_size() // num_blocks
-                )
-                chunk_bytes = n_in_chunk * bytes_per_block
-                _TORCH_CHUNK_SAMPLES.append(
-                    (t1 - t0, t2 - t1, chunk_bytes, n_in_chunk)
-                )
-            layer_fetch_ns += t1 - t0
-            layer_update_ns += t2 - t1
-        if not warmup:
-            nbytes = t.numel() * t.element_size()
-            _BENCH_SAMPLES.append(
-                (layer_fetch_ns, layer_update_ns, nbytes, 1)
-            )
-            f_layer_total += layer_fetch_ns
-            u_layer_total += layer_update_ns
-    if not warmup and n_layers > 0:
-        print(
-            f"******************** [kv_cache_hook][BENCH_CHUNKED] step={step} "
+            f"******************** [kv_cache_hook][BENCH_1BLOCK] step={step} "
             f"phase={phase} per_layer "
-            f"fetch_mean={f_layer_total/n_layers/1e3:.2f}µs "
-            f"update_mean={u_layer_total/n_layers/1e3:.2f}µs "
-            f"bytes={(kv_caches[0].numel() * kv_caches[0].element_size())/1e6:.2f}MB",
+            f"fetch_mean={f_total/n_layers/1e3:.2f}µs "
+            f"update_mean={u_total/n_layers/1e3:.2f}µs "
+            f"bytes={nbytes/1e6:.2f}MB calls/layer=(2,2)",
             flush=True,
         )
         if (step - _BENCH_WARMUP_FORWARDS) % 10 == 0:
             s = torch_bench_summary()
             if s:
                 print("******************** CUMULATIVE/LAYER " + s, flush=True)
-            cs = torch_chunk_summary()
-            if cs:
-                print("******************** CUMULATIVE/CHUNK\n" + cs, flush=True)
 
 
-def torch_chunk_summary() -> Optional[str]:
-    if not _TORCH_CHUNK_SAMPLES:
-        return None
-    import statistics
+# ---------- bench_1block_reused: 1-block + reused host buffer ------------
 
-    full = [
-        s for s in _TORCH_CHUNK_SAMPLES if s[3] == _BLOCKS_PER_CHUNK
-    ]
-    leftover = [
-        s for s in _TORCH_CHUNK_SAMPLES if s[3] != _BLOCKS_PER_CHUNK
-    ]
-
-    def stats(samples, label):
-        if not samples:
-            return ""
-        fetch = [s[0] for s in samples]
-        update = [s[1] for s in samples]
-        total = [f + u for f, u in zip(fetch, update)]
-        n_in_chunk = samples[0][3]
-        chunk_bytes = samples[0][2]
-
-        def pct(xs, p):
-            s = sorted(xs)
-            return s[int(len(s) * p / 100)]
-
-        def mean(xs):
-            return sum(xs) / len(xs)
-
-        return (
-            f"  [{label}] samples={len(samples)} "
-            f"n_blocks_per_chunk={n_in_chunk} "
-            f"chunk_bytes={chunk_bytes/1e6:.2f}MB\n"
-            f"    fetch  µs : mean={mean(fetch)/1e3:9.2f} "
-            f"median={statistics.median(fetch)/1e3:9.2f} "
-            f"p99={pct(fetch,99)/1e3:9.2f}\n"
-            f"    update µs : mean={mean(update)/1e3:9.2f} "
-            f"median={statistics.median(update)/1e3:9.2f} "
-            f"p99={pct(update,99)/1e3:9.2f}\n"
-            f"    total  µs : mean={mean(total)/1e3:9.2f} "
-            f"median={statistics.median(total)/1e3:9.2f} "
-            f"p99={pct(total,99)/1e3:9.2f}\n"
-            f"    GB/s (round-trip): "
-            f"{(2 * chunk_bytes) / (mean(total) / 1e9) / 1e9:.3f}"
-        )
-
-    parts = [
-        f"[kv_cache_hook][CHUNK] total_chunks={len(_TORCH_CHUNK_SAMPLES)}"
-    ]
-    parts.append(stats(full, f"full({_BLOCKS_PER_CHUNK} blk)"))
-    if leftover:
-        parts.append(stats(leftover, f"leftover({leftover[0][3]} blk)"))
-    return "\n".join(parts)
+_PINNED_HOSTS_1BLOCK_K: List[torch.Tensor] = []
+_PINNED_HOSTS_1BLOCK_V: List[torch.Tensor] = []
 
 
-def _torch_bench_reused_hook(
+def _torch_bench_1block_reused_hook(
     kv_caches: Sequence[torch.Tensor], phase: str, step: int
 ) -> None:
-    """Per-layer round-trip using a plain torch.empty CPU buffer, reused
-    across forwards. No special alignment / pre-fault.
+    """1-block round-trip + reused CPU host buffer (K, V 각각 1번씩 pre-alloc).
 
-    Companion to bench_pinned: tests whether the win is from *reuse alone*
-    or also requires the 4KB-aligned/pre-faulted aligned_tensor.
+    Fair vs runtime `bench_1block_reused` — 양쪽 다:
+      - 1 block 분만 transfer (K + V = 2 DMA / direction)
+      - host buffer 한 번 alloc 후 forward 마다 reuse
+      - 매 step 마다 fetch + update 1 layer 당 2 호출씩.
     """
-    global _PINNED_HOSTS  # reuse the slot, but fill with plain empty
+    global _PINNED_HOSTS_1BLOCK_K, _PINNED_HOSTS_1BLOCK_V
     warmup = step < _BENCH_WARMUP_FORWARDS
-    if not _PINNED_HOSTS and kv_caches:
+    if not _PINNED_HOSTS_1BLOCK_K and kv_caches:
         for t in kv_caches:
-            buf = torch.empty(t.shape, dtype=t.dtype, device="cpu")
-            _PINNED_HOSTS.append(buf)
-        h0 = _PINNED_HOSTS[0]
-        v0 = kv_caches[0]
+            k = t[0, 0:1]
+            v = t[1, 0:1]
+            _PINNED_HOSTS_1BLOCK_K.append(
+                torch.empty(k.shape, dtype=t.dtype, device="cpu")
+            )
+            _PINNED_HOSTS_1BLOCK_V.append(
+                torch.empty(v.shape, dtype=t.dtype, device="cpu")
+            )
+        t = kv_caches[0]
+        k = t[0, 0:1]
+        v = t[1, 0:1]
+        h_k = _PINNED_HOSTS_1BLOCK_K[0]
         print(
-            f"******************** [kv_cache_hook][BENCH_REUSED/info] "
-            f"step={step} phase={phase} num_layers={len(kv_caches)} | "
-            f"view: shape={tuple(v0.shape)} contig={v0.is_contiguous()} "
-            f"device={v0.device} | "
-            f"host: shape={tuple(h0.shape)} dtype={h0.dtype} "
-            f"contig={h0.is_contiguous()} "
-            f"data_ptr=0x{h0.data_ptr():x} "
-            f"4KB_aligned={h0.data_ptr() % 0x1000 == 0}",
+            f"******************** [kv_cache_hook][BENCH_1BLOCK_REUSED/info] "
+            f"step=0 phase={phase} num_layers={len(kv_caches)} "
+            f"layer shape={tuple(t.shape)} stride={t.stride()} | "
+            f"k_slice shape={tuple(k.shape)} contig={k.is_contiguous()} "
+            f"nbytes={k.numel() * k.element_size()} | "
+            f"host_k shape={tuple(h_k.shape)} contig={h_k.is_contiguous()} "
+            f"4KB_aligned={h_k.data_ptr() % 0x1000 == 0}",
             flush=True,
         )
     f_total = u_total = 0
     n_layers = len(kv_caches)
+    # 첫 정식 step (== _BENCH_WARMUP_FORWARDS) 의 layer 별 timing 을 모아 dump
+    # — forward queue contention 가설 검증용 (첫 layer 만 큰지 분포 확인).
+    dump_layerwise = (step == _BENCH_WARMUP_FORWARDS)
+    layer_fetch_ns = []
+    layer_update_ns = []
     for i, t in enumerate(kv_caches):
-        host = _PINNED_HOSTS[i]
+        k_slice = t[0, 0:1]
+        v_slice = t[1, 0:1]
+        host_k = _PINNED_HOSTS_1BLOCK_K[i]
+        host_v = _PINNED_HOSTS_1BLOCK_V[i]
         t0 = time.perf_counter_ns()
-        host.copy_(t)
+        host_k.copy_(k_slice)
+        host_v.copy_(v_slice)
         t1 = time.perf_counter_ns()
-        t.copy_(host)
+        k_slice.copy_(host_k)
+        v_slice.copy_(host_v)
         t2 = time.perf_counter_ns()
+        if dump_layerwise:
+            layer_fetch_ns.append(t1 - t0)
+            layer_update_ns.append(t2 - t1)
         if not warmup:
-            nbytes = t.numel() * t.element_size()
-            _BENCH_SAMPLES.append((t1 - t0, t2 - t1, nbytes, 1))
+            nbytes = (
+                k_slice.numel() * k_slice.element_size()
+                + v_slice.numel() * v_slice.element_size()
+            )
+            _BENCH_SAMPLES.append((t1 - t0, t2 - t1, nbytes, 2))
             f_total += t1 - t0
             u_total += t2 - t1
-    if not warmup and n_layers > 0:
+    if dump_layerwise:
+        f_strs = ",".join(f"{n/1e3:.0f}" for n in layer_fetch_ns)
+        u_strs = ",".join(f"{n/1e3:.0f}" for n in layer_update_ns)
         print(
-            f"******************** [kv_cache_hook][BENCH_REUSED] "
+            f"******************** [kv_cache_hook][BENCH_1BLOCK_REUSED] "
+            f"step={step} phase={phase} per_layer LAYERWISE (µs)\n"
+            f"  fetch  : [{f_strs}]\n"
+            f"  update : [{u_strs}]",
+            flush=True,
+        )
+    if not warmup and n_layers > 0:
+        nbytes = (
+            kv_caches[0][0, 0:1].numel() * kv_caches[0].element_size()
+            + kv_caches[0][1, 0:1].numel() * kv_caches[0].element_size()
+        )
+        print(
+            f"******************** [kv_cache_hook][BENCH_1BLOCK_REUSED] "
             f"step={step} phase={phase} per_layer "
             f"fetch_mean={f_total/n_layers/1e3:.2f}µs "
             f"update_mean={u_total/n_layers/1e3:.2f}µs "
-            f"bytes={(kv_caches[0].numel() * kv_caches[0].element_size())/1e6:.2f}MB",
+            f"bytes={nbytes/1e6:.2f}MB calls/layer=(2,2)",
             flush=True,
         )
         if (step - _BENCH_WARMUP_FORWARDS) % 10 == 0:
@@ -774,65 +579,6 @@ def _torch_bench_reused_hook(
             if s:
                 print("******************** CUMULATIVE/LAYER " + s, flush=True)
 
-
-def _torch_bench_base_hook(
-    kv_caches: Sequence[torch.Tensor], phase: str, step: int
-) -> None:
-    """Round-trip a *layer-sized slice* of kv_cache_bases per forward.
-
-    base 텐서는 dedup된 1-D int8 raw storage 라서 그 자체로 거대(uniform
-    mode 면 모든 layer 합본). 측정 단위는 layer 1개 분량 (≈792 MB) — base 의
-    첫 `layer_bytes` 만큼을 narrow() 로 잘라 contiguous slice 로 `.to('cpu')`
-    → host→device 복사. RBLNCopy.cpp 의 `is_direct_copy()` fast path 를 타고
-    view 기반 bench 에서 보였던 strided→contiguous re-copy 가 없어야 함.
-    """
-    if not _BASES or not kv_caches:
-        if step == _BENCH_WARMUP_FORWARDS:
-            print(
-                "******************** [kv_cache_hook][BENCH_BASE] "
-                "kv_cache_bases empty (dedup disabled) — nothing to bench. "
-                "_kv_cache_layer_tensors() 는 self.kv_caches 를 그대로 반환 "
-                "→ materialize_kv_cache_view 호출 안 됨",
-                flush=True,
-            )
-        return
-    warmup = step < _BENCH_WARMUP_FORWARDS
-    layer_bytes = (
-        kv_caches[0].numel() * kv_caches[0].element_size()
-    )
-    base_t = _BASES[0]
-    slice_size = min(layer_bytes, base_t.numel())  # base 가 int8 라 numel==bytes
-    slice_t = base_t.narrow(0, 0, slice_size)
-    if step == 0:
-        first_layer = kv_caches[0]
-        print(
-            f"******************** [kv_cache_hook][BENCH_BASE/info] "
-            f"num_bases={len(_BASES)} num_layers={len(kv_caches)} "
-            f"base0 shape={tuple(base_t.shape)} dtype={base_t.dtype} "
-            f"device={base_t.device} numel={base_t.numel()} "
-            f"contig={base_t.is_contiguous()} | "
-            f"layer0 shape={tuple(first_layer.shape)} dtype={first_layer.dtype} "
-            f"device={first_layer.device} contig={first_layer.is_contiguous()} "
-            f"→ dedup ACTIVE, materialize_kv_cache_view 호출됨",
-            flush=True,
-        )
-    t0 = time.perf_counter_ns()
-    cpu_t = slice_t.to("cpu")
-    t1 = time.perf_counter_ns()
-    slice_t.copy_(cpu_t.to(slice_t.device))
-    t2 = time.perf_counter_ns()
-    if not warmup:
-        _BENCH_SAMPLES.append((t1 - t0, t2 - t1, slice_size, 1))
-        print(
-            f"******************** [kv_cache_hook][BENCH_BASE] step={step} "
-            f"phase={phase} slice_bytes={slice_size/1e6:.2f}MB "
-            f"fetch={(t1-t0)/1e3:.2f}µs update={(t2-t1)/1e3:.2f}µs",
-            flush=True,
-        )
-        if (step - _BENCH_WARMUP_FORWARDS) % 5 == 0:
-            s = torch_bench_summary()
-            if s:
-                print("******************** CUMULATIVE/LAYER " + s, flush=True)
 
 
 # ---------- env-driven default install ----------------------------------
@@ -873,65 +619,30 @@ elif _MODE == "bench":
         "round-trip latency timer (no mutation)",
         flush=True,
     )
-elif _MODE == "bench_reused":
-    _HOOK = _torch_bench_reused_hook
+elif _MODE == "bench_1block":
+    _HOOK = _torch_bench_1block_hook
     print(
-        "******************** [kv_cache_hook] MODE=bench_reused → per-layer "
-        "round-trip using plain torch.empty CPU buffer reused across "
-        "forwards (alignment-free; isolates reuse factor)",
+        "******************** [kv_cache_hook] MODE=bench_1block → K+V "
+        "1-block slice round-trip (runtime _fetch/_update 와 동등 DMA 수)",
         flush=True,
     )
-elif _MODE == "bench_chunked":
-    _HOOK = _torch_bench_chunked_hook
+elif _MODE == "bench_1block_reused":
+    _HOOK = _torch_bench_1block_reused_hook
     print(
-        "******************** [kv_cache_hook] MODE=bench_chunked → reused "
-        f"host buffer + chunk-{_BLOCKS_PER_CHUNK} K/V split copy_ "
-        "(per-chunk and per-layer samples both recorded)",
-        flush=True,
-    )
-elif _MODE == "bench_storage":
-    _HOOK = _torch_bench_storage_hook
-    print(
-        "******************** [kv_cache_hook] MODE=bench_storage → per-layer "
-        "round-trip on view.untyped_storage() wrapped as 1-D int8 contiguous "
-        "(should hit is_direct_copy fast path)",
-        flush=True,
-    )
-elif _MODE == "bench_pinned":
-    _HOOK = _torch_bench_pinned_hook
-    print(
-        "******************** [kv_cache_hook] MODE=bench_pinned → per-layer "
-        "round-trip using pre-allocated 4KB-aligned host buffer reused "
-        "across forwards (mirrors runtime path's host-side primitive)",
-        flush=True,
-    )
-elif _MODE == "bench_base":
-    _HOOK = _torch_bench_base_hook
-    print(
-        "******************** [kv_cache_hook] MODE=bench_base → base tensor "
-        "round-trip (contiguous fast path)",
+        "******************** [kv_cache_hook] MODE=bench_1block_reused → "
+        "K+V 1-block slice + pre-allocated CPU host buffer (reuse)",
         flush=True,
     )
 
 
 # Register an atexit hook so bench summary is printed at process end if
 # any benchmark mode was active.
-if _MODE in (
-    "bench",
-    "bench_reused",
-    "bench_chunked",
-    "bench_storage",
-    "bench_pinned",
-    "bench_base",
-):
+if _MODE in ("bench", "bench_1block", "bench_1block_reused"):
     import atexit
 
     def _print_bench_summary() -> None:
         s = torch_bench_summary()
         if s:
             print("******************** FINAL/LAYER " + s, flush=True)
-        cs = torch_chunk_summary()
-        if cs:
-            print("******************** FINAL/CHUNK\n" + cs, flush=True)
 
     atexit.register(_print_bench_summary)

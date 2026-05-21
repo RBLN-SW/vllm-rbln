@@ -149,10 +149,7 @@ from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
 from vllm_rbln.v1.worker.kv_cache_runtime_hook import (
     run_kv_cache_runtime_hook,
 )
-from vllm_rbln.v1.worker.kv_cache_torch_hook import (
-    run_kv_cache_torch_hook,
-    set_kv_cache_bases,
-)
+from vllm_rbln.v1.worker.kv_cache_torch_hook import run_kv_cache_torch_hook
 from vllm_rbln.v1.worker.metrics import PerformanceTracker, collect_metrics
 from vllm_rbln.v1.worker.utils import get_kv_cache_names
 
@@ -3050,7 +3047,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # VLLM_RBLN_USE_DEVICE_TENSOR=1). Inspect via .to('cpu'); write
             # back with tensor.copy_(modified.to(tensor.device)).
             phase_str = "prefill" if is_prefill_phase else "decode"
-            set_kv_cache_bases(self.kv_cache_bases)
             run_kv_cache_torch_hook(
                 self._kv_cache_layer_tensors(), phase_str
             )

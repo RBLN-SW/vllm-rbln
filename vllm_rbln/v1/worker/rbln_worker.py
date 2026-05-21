@@ -614,6 +614,23 @@ class RBLNWorker(WorkerBase):
             if self.model_runner.e2e_performance_tracker:
                 self.model_runner.e2e_performance_tracker.print_final_stats()
 
+        # KV cache bench hook 의 final summary — atexit 가 EngineCore subprocess
+        # 에서 fire 못하는 케이스 보강. shutdown 은 synchronous 라 항상 호출됨.
+        try:
+            from vllm_rbln.v1.worker.kv_cache_torch_hook import torch_bench_summary
+            s = torch_bench_summary()
+            if s:
+                print(f"******************** FINAL/LAYER {s}", flush=True)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("torch hook summary skip: %s", e)
+        try:
+            from vllm_rbln.v1.worker.kv_cache_runtime_hook import runtime_bench_summary
+            s = runtime_bench_summary()
+            if s:
+                print(f"******************** FINAL/LAYER {s}", flush=True)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("runtime hook summary skip: %s", e)
+
 
 def init_worker_distributed_environment(
     vllm_config: VllmConfig,
