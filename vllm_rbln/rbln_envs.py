@@ -32,7 +32,6 @@ if TYPE_CHECKING:
     VLLM_RBLN_USE_MOE_TOKENS_MASK: bool = True
     VLLM_RBLN_ENFORCE_MODEL_FP32: bool = False
     VLLM_RBLN_MOE_CUSTOM_KERNEL: bool = True
-    VLLM_RBLN_MOE_USE_OPT_KERNEL: bool = True
     VLLM_RBLN_DP_INPUT_ALL_GATHER: bool = True
     VLLM_RBLN_LOGITS_ALL_GATHER: bool = True
     VLLM_RBLN_NUM_RAY_NODES: int = 1
@@ -46,6 +45,9 @@ if TYPE_CHECKING:
     VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS: list[int] = []
     VLLM_RBLN_USE_CUSTOM_KERNEL: bool = False
     VLLM_RBLN_AUTO_PORT: bool = True
+    VLLM_RBLN_CCL_ALL2ALL_P2P: bool = False
+    VLLM_RBLN_DISPATCH_ALL2ALL: bool = False
+    VLLM_RBLN_COMBINE_ALL2ALL: bool = False
     VLLM_RBLN_MOE_REDUCE_SCATTER: bool = False
     VLLM_RBLN_SUB_BLOCK_CACHE: bool = True
     VLLM_RBLN_USE_DEVICE_TENSOR: bool = False
@@ -190,17 +192,10 @@ environment_variables = {
             in ("true", "1")
         )
     ),
-    # use moe custom kernel, by default disabled
+    # use moe custom kernel (optimized), by default enabled
     "VLLM_RBLN_MOE_CUSTOM_KERNEL": (
         lambda: (
             os.environ.get("VLLM_RBLN_MOE_CUSTOM_KERNEL", "True").lower()
-            in ("true", "1")
-        )
-    ),
-    # enable moe optimization if RBLN_MoE_OPT is set to 1
-    "VLLM_RBLN_MOE_USE_OPT_KERNEL": (
-        lambda: (
-            os.environ.get("VLLM_RBLN_MOE_USE_OPT_KERNEL", "True").lower()
             in ("true", "1")
         )
     ),
@@ -266,6 +261,27 @@ environment_variables = {
     ),
     "VLLM_RBLN_PROFILER": (
         lambda: os.environ.get("RBLN_PROFILER", "False").lower() in ("true", "1")
+    ),
+    # Use naive P2P all2all (AllToAllX) instead of recursive doubling (AllToAllV)
+    "VLLM_RBLN_CCL_ALL2ALL_P2P": (
+        lambda: (
+            os.environ.get("VLLM_RBLN_CCL_ALL2ALL_P2P", "False").lower()
+            in ("true", "1")
+        )
+    ),
+    # Use all2all dispatch instead of all-gather for MoE DP dispatch
+    "VLLM_RBLN_DISPATCH_ALL2ALL": (
+        lambda: (
+            os.environ.get("VLLM_RBLN_DISPATCH_ALL2ALL", "False").lower()
+            in ("true", "1")
+        )
+    ),
+    # Use all2all combine instead of reduce-scatter for MoE DP combine
+    "VLLM_RBLN_COMBINE_ALL2ALL": (
+        lambda: (
+            os.environ.get("VLLM_RBLN_COMBINE_ALL2ALL", "False").lower()
+            in ("true", "1")
+        )
     ),
     # Enable sub-block prefix caching.
     # Sub-block size equals max_num_batched_tokens (prefill chunk size).
