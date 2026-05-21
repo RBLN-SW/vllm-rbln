@@ -380,6 +380,18 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.num_spec_tokens = 0
         if self.speculative_config:
             self.num_spec_tokens = self.speculative_config.num_speculative_tokens
+            # Fixed-length speculative decoding: the runtime query length is
+            # either 1 (no-spec, single-token decode) or num_spec_tokens + 1
+            # (full spec). The max value must be a power of two for the MoE
+            # multicast — max_pads_across_dp / num_tokens uses integer
+            # division and a non-pow2 divisor produces a shape-truncation
+            # path that fails to compile.
+            _max_q = self.num_spec_tokens + 1
+            assert _max_q > 0 and (_max_q & (_max_q - 1)) == 0, (
+                "num_speculative_tokens + 1 must be a power of two on RBLN; "
+                f"got num_speculative_tokens={self.num_spec_tokens} "
+                f"(num_speculative_tokens + 1 = {_max_q})"
+            )
 
         # Request states.
         self.requests: dict[str, CachedRequestState] = {}
@@ -1164,6 +1176,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         scheduler_output: SchedulerOutput,
         num_scheduled_tokens: np.ndarray,
         num_padded_tokens: int | None = None,
+        spec_decode_max_query_len: int | None = None,
     ) -> tuple[
         dict[str, Any],
         Any,
@@ -1174,6 +1187,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         int,
         int | None,
         Any | None,
+        int | None,
     ]:
         """
         :return: tuple[
@@ -1339,13 +1353,18 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         )
 
         is_prefill_phase = self.is_prefill_phase()
-        (batch_bucket_size, num_padded_tokens, num_tokens_across_dp) = (
-            self.get_dp_padding(
-                total_num_scheduled_tokens,
-                initial_batch_bucket_size,
-                num_padded_tokens,
-                is_prefill_phase,
-            )
+        (
+            batch_bucket_size,
+            num_padded_tokens,
+            num_tokens_across_dp,
+            max_tokens_per_req_across_dp,
+        ) = self.get_dp_padding(
+            total_num_scheduled_tokens,
+            num_reqs,
+            initial_batch_bucket_size,
+            num_padded_tokens,
+            is_prefill_phase,
+            spec_decode_max_query_len=spec_decode_max_query_len,
         )
         assert batch_bucket_size is not None
         # Prepare the attention metadata for each KV cache group and make layers
@@ -1459,6 +1478,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             batch_bucket_size,
             num_padded_tokens,
             num_tokens_across_dp,
+            max_tokens_per_req_across_dp,
         )
 
     def _compile_model(self, model):
@@ -1683,10 +1703,22 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     def get_dp_padding(
         self,
         num_tokens: int,
+        num_reqs: int,
         batch_bucket_size: int | None,
         num_padded_tokens: int | None = None,
         is_prefill: bool = False,
-    ) -> tuple[int | None, int | None, torch.Tensor | None]:
+        spec_decode_max_query_len: int | None = None,
+    ) -> tuple[int | None, int | None, torch.Tensor | None, int | None]:
+        """
+        Returns:
+            batch_bucket_size, num_padded_tokens, num_tokens_across_dp_cpu,
+            max_tokens_per_req_across_dp:
+                cross-DP max of per-rank max(per-req scheduled length), only
+                populated for the path-B specialized_moe_decode + spec-decode
+                runtime case; None otherwise. Callers use this to pad local
+                input_ids to the same per-req length used in num_padded_tokens
+                so the model_wrapper compile cache hits the warmup slot.
+        """
         dp_size = self.vllm_config.parallel_config.data_parallel_size
         dp_rank = self.vllm_config.parallel_config.data_parallel_rank
 
@@ -1694,7 +1726,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             assert num_padded_tokens is None, (
                 "num_padded_tokens should not be applied for non-DP case"
             )
-            return batch_bucket_size, num_padded_tokens, None
+            return batch_bucket_size, num_padded_tokens, None, None
 
         if num_padded_tokens is not None:
             assert self.specialized_moe_decode, (
@@ -1710,25 +1742,58 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             num_tokens_across_dp_cpu = RBLNDPMetadata.num_tokens_across_dp(
                 num_tokens, dp_size, dp_rank
             )
-            return (batch_bucket_size, num_padded_tokens, num_tokens_across_dp_cpu)
+            return (
+                batch_bucket_size,
+                num_padded_tokens,
+                num_tokens_across_dp_cpu,
+                None,
+            )
 
-        num_tokens_across_dp_cpu, max_decode_tokens = (
-            RBLNDPMetadata.num_tokens_across_dp_with_max_decode_tokens(
-                num_tokens, dp_size, dp_rank, is_prefill
+        num_tokens_across_dp_cpu, num_reqs_across_dp_cpu = (
+            RBLNDPMetadata.num_tokens_and_reqs_across_dp(
+                num_tokens, num_reqs, dp_size, dp_rank, is_prefill
             )
         )
 
-        any_prefill = max_decode_tokens is None
+        max_tokens_per_req_across_dp: int | None = None
+        any_prefill = num_reqs_across_dp_cpu is None
         if any_prefill or not self.specialized_moe_decode:
             num_padded_tokens = self.max_num_batched_tokens
         else:
-            assert max_decode_tokens is not None
+            assert num_reqs_across_dp_cpu is not None
+            max_batch_size = int(torch.max(num_reqs_across_dp_cpu).item())
             batch_bucket_size = self.bucketing_manager.find_decode_batch_bucket(
-                max_decode_tokens
+                max_batch_size
             )
-            num_padded_tokens = batch_bucket_size
+            assert batch_bucket_size is not None
+            # Determine max_tokens_per_req as cross-DP max of per-rank
+            # max(per-req scheduled length). When spec decode is active the
+            # caller pre-computes a pow2-rounded local value so the resulting
+            # num_padded_tokens always matches the actual padded tensor size
+            # produced by pad_speculative_draft_tokens (and aligns with the
+            # pow2 query_len set exercised during warmup).
+            if spec_decode_max_query_len is not None:
+                max_per_req_across_dp = RBLNDPMetadata.num_tokens_across_dp(
+                    spec_decode_max_query_len, dp_size, dp_rank
+                )
+                max_tokens_per_req = int(max_per_req_across_dp.max().item())
+            else:
+                # Pure single-token decode: ceil(num_tokens/num_reqs) suffices
+                # and is 1 for the standard case.
+                clamped_reqs = num_reqs_across_dp_cpu.clamp(min=1)
+                tokens_per_req_per_rank = (
+                    num_tokens_across_dp_cpu + clamped_reqs - 1
+                ) // clamped_reqs
+                max_tokens_per_req = int(tokens_per_req_per_rank.max().item())
+            num_padded_tokens = batch_bucket_size * max_tokens_per_req
+            max_tokens_per_req_across_dp = max_tokens_per_req
 
-        return batch_bucket_size, num_padded_tokens, num_tokens_across_dp_cpu
+        return (
+            batch_bucket_size,
+            num_padded_tokens,
+            num_tokens_across_dp_cpu,
+            max_tokens_per_req_across_dp,
+        )
 
     def _pool(
         self,
@@ -2015,9 +2080,16 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # compile decode graph considering decode batch buckets
         for batch_bucket_size in self.bucketing_manager.decode_batch_buckets:
-            query_len_range = (
-                range(1, self.num_spec_tokens + 2) if self.num_spec_tokens > 0 else [1]
-            )
+            # Full-spec-or-no-spec design: at runtime the per-rank query
+            # length is exactly 1 (single-token decode) or num_spec_tokens + 1
+            # (full spec); intermediate values never occur because the
+            # scheduler enforces a per-request binary block-boundary
+            # decision. Compile exactly those two shapes (or just {1} when
+            # spec decode is disabled).
+            if self.num_spec_tokens > 0:
+                query_len_range = [1, self.num_spec_tokens + 1]
+            else:
+                query_len_range = [1]
             for query_len in query_len_range:
                 dummy_decode_requests: list[NewRequestData] = []
                 dummy_decode_num_scheduled_tokens: dict[str, int] = {}
@@ -2074,6 +2146,11 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # FIXME: remove this code after #474(sampler with decode batch) is merged
         # compile sampler for all possible decode batches
         max_decode_batch = self.bucketing_manager.decode_batch_buckets[-1]
+        # Sampler batch at runtime equals the number of sampling positions
+        # this step, which depends on num_reqs the scheduler actually batches
+        # (any integer in 1..max_decode_batch). Unlike model_wrapper's query
+        # length, sampler shape has no cross-DP padding tie-in, so warm up
+        # every integer batch size to avoid hot-path sampler recompiles.
         dummy_decode_requests = []
         dummy_decode_num_scheduled_tokens = {}
         for decode_batch in range(1, max_decode_batch + 1):
@@ -2517,10 +2594,34 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         assert self.dummy_run_state is not None
         (attn_metadata, num_input_tokens, input_ids, positions) = self.dummy_run_state
 
-        (batch_bucket_size, num_padded_tokens, num_tokens_across_dp) = (
-            self.get_dp_padding(
-                num_input_tokens, self.bucketing_manager.decode_batch_buckets[0]
-            )
+        # This rank is DP-idle (no scheduled work). Report query_len=1 so
+        # every DP rank takes the same all-reduce branch in get_dp_padding;
+        # a peer rank running spec decode will raise the cross-DP max above
+        # 1 and we must reshape this rank's dummy input_ids/positions to
+        # match, otherwise (input_ids[1], max_pads_across_dp) doesn't hit a
+        # warmup-compiled slot and triggers a hot-path model_wrapper
+        # recompile.
+        spec_decode_max_query_len = 1 if self.num_spec_tokens > 0 else None
+        # Participate in the cross-DP step_no_spec_required OR-reduce so
+        # peers running execute_model don't block waiting for our collective
+        # vote. An idle dummy_run rank never trips a local boundary, so we
+        # always contribute 0. We don't need the result locally — dummy_run
+        # already uses query_len=1 and will shape-match via the existing
+        # max_tokens_per_req_across_dp gather below.
+        dp_size = self.vllm_config.parallel_config.data_parallel_size
+        if dp_size > 1 and self.num_spec_tokens > 0:
+            dp_rank = self.vllm_config.parallel_config.data_parallel_rank
+            _ = RBLNDPMetadata.num_tokens_across_dp(0, dp_size, dp_rank)
+        (
+            batch_bucket_size,
+            num_padded_tokens,
+            num_tokens_across_dp,
+            max_tokens_per_req_across_dp,
+        ) = self.get_dp_padding(
+            num_input_tokens,
+            1,
+            self.bucketing_manager.decode_batch_buckets[0],
+            spec_decode_max_query_len=spec_decode_max_query_len,
         )
 
         assert (
@@ -2534,6 +2635,26 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         bucket_attn_metadata = attn_metadata[batch_bucket_size]
         bucket_input_ids = input_ids[batch_bucket_size]
         bucket_positions = positions[batch_bucket_size]
+
+        if (
+            max_tokens_per_req_across_dp is not None
+            and max_tokens_per_req_across_dp > 1
+        ):
+            # Expand local dummy from (bucket, 1) to (bucket, query_len) with
+            # zero-pad tokens so the shape matches the warmup-compiled spec
+            # decode slot used by peers this step. Values are irrelevant —
+            # the output of an idle DP rank is discarded.
+            ql = max_tokens_per_req_across_dp
+            bucket_input_ids = torch.zeros(
+                (bucket_input_ids.shape[0], ql),
+                device=bucket_input_ids.device,
+                dtype=bucket_input_ids.dtype,
+            )
+            bucket_positions = torch.zeros(
+                (bucket_positions.shape[0], ql),
+                device=bucket_positions.device,
+                dtype=bucket_positions.dtype,
+            )
 
         if get_pp_group().is_first_rank:
             intermediate_tensors = None
@@ -2869,6 +2990,64 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
 
+            # Cross-DP collective decision for boundary-induced no-spec.
+            # Scheduler marks `step_no_spec_required` when at least one local
+            # decode req's drafts had to be dropped due to a block boundary.
+            # OR-reduce across DP: if ANY rank tripped the boundary, EVERY
+            # rank must drop its drafts this step, otherwise the boundary-hit
+            # rank would be cross-DP-padded back up to num_spec_tokens+1 and
+            # write pad-position KV past its block boundary. A False result
+            # (no rank hit boundary) means any local no-spec is purely
+            # "no drafts proposed" and peers that do have drafts can safely
+            # run full spec — the cross-DP MAX in get_dp_padding then pads
+            # the no-drafts ranks into lookahead-allocated slots, which is
+            # functionally safe (pad-position outputs are discarded by the
+            # rejection sampler).
+            local_step_no_spec_required = (
+                isinstance(scheduler_output, RBLNSchedulerOutput)
+                and scheduler_output.step_no_spec_required
+            )
+            dp_size = self.vllm_config.parallel_config.data_parallel_size
+            if dp_size > 1 and self.num_spec_tokens > 0:
+                dp_rank = self.vllm_config.parallel_config.data_parallel_rank
+                per_rank_flag = RBLNDPMetadata.num_tokens_across_dp(
+                    1 if local_step_no_spec_required else 0,
+                    dp_size,
+                    dp_rank,
+                )
+                step_no_spec_required = int(per_rank_flag.sum().item()) > 0
+            else:
+                step_no_spec_required = local_step_no_spec_required
+
+            # Collective scrub: a peer rank tripped the boundary, so drop
+            # any drafts this rank may have committed. After the scrub,
+            # `scheduled_spec_decode_tokens` is empty on every rank, so
+            # downstream tensors built by `_prepare_inputs` are uniformly
+            # sized for query_len=1 across DP.
+            if step_no_spec_required and scheduler_output.scheduled_spec_decode_tokens:
+                scheduler_output.scheduled_spec_decode_tokens.clear()
+                for req_id in list(scheduler_output.num_scheduled_tokens):
+                    scheduler_output.num_scheduled_tokens[req_id] = 1
+                scheduler_output.total_num_scheduled_tokens = sum(
+                    scheduler_output.num_scheduled_tokens.values()
+                )
+                tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
+                num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
+                num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
+
+            # Local query_len choice on top of (possibly scrubbed) state.
+            # Reporting on every rank (1 when no local drafts) keeps the
+            # get_dp_padding all-reduce structure consistent. Cross-DP MAX
+            # inside get_dp_padding lifts no-drafts ranks up to peers'
+            # query_len=num_spec_tokens+1 for shape uniformity.
+            spec_decode_max_query_len: int | None = None
+            if self.num_spec_tokens > 0:
+                spec_decode_max_query_len = (
+                    self.num_spec_tokens + 1
+                    if scheduler_output.scheduled_spec_decode_tokens
+                    else 1
+                )
+
             # Prepare the decoder inputs.
             (
                 attn_metadata,
@@ -2880,8 +3059,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 batch_bucket_size,
                 num_padded_tokens,
                 num_tokens_across_dp,
+                max_tokens_per_req_across_dp,
             ) = self._prepare_inputs(
-                scheduler_output, num_scheduled_tokens_np, num_padded_tokens
+                scheduler_output,
+                num_scheduled_tokens_np,
+                num_padded_tokens,
+                spec_decode_max_query_len=spec_decode_max_query_len,
             )
 
             slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
@@ -2902,15 +3085,30 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         assert input_ids is not None
         is_prefill_phase = self.is_prefill_phase()
 
-        # Padding length for speculative decoding by num_speculative_tokens
-        if scheduler_output.scheduled_spec_decode_tokens:
-            max_spec_decode_len = (
-                max(
-                    len(s)
-                    for s in scheduler_output.scheduled_spec_decode_tokens.values()
-                )
-                + 1
-            )
+        # Padding length for speculative decoding by num_speculative_tokens.
+        # Gate on the cross-DP max (max_tokens_per_req_across_dp) so that a
+        # rank with no local drafts still pads its input_ids/positions to the
+        # same per-req length other ranks use. Gating only on the local
+        # scheduled_spec_decode_tokens leaves the (input_ids[1],
+        # max_pads_across_dp) tuple inconsistent across DP and triggers a
+        # hot-path model_wrapper recompile.
+        if (
+            max_tokens_per_req_across_dp is not None
+            and max_tokens_per_req_across_dp > 1
+        ):
+            max_spec_decode_len = max_tokens_per_req_across_dp
+        elif (
+            max_tokens_per_req_across_dp is None
+            and scheduler_output.scheduled_spec_decode_tokens
+        ):
+            # Non-DP (dp_size==1): no cross-DP gather happened, use the
+            # local pow2-rounded value as-is.
+            assert spec_decode_max_query_len is not None
+            max_spec_decode_len = spec_decode_max_query_len
+        else:
+            max_spec_decode_len = None
+
+        if max_spec_decode_len is not None:
             num_scheduled_tokens_per_req = torch.tensor(
                 [
                     scheduler_output.num_scheduled_tokens[i]

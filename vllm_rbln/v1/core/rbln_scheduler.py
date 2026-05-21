@@ -44,9 +44,21 @@ logger = init_logger(__name__)
 @dataclass
 class RBLNSchedulerOutput(SchedulerOutput):
     """SchedulerOutput extended with KV cache copy operations for sub-block
-    prefix caching."""
+    prefix caching and a flag distinguishing boundary-induced no-spec from
+    naturally-no-spec steps."""
 
     kv_cache_copy_ops: list[KVCacheCopyOp] = field(default_factory=list)
+    # NOTE(RBLN): Set True when this step's spec_decode_cap was forced to 1
+    # by the per-request block-boundary check (a running decode req's
+    # remaining_in_block or remaining_in_maxlen can't hold a full
+    # num_spec_tokens+1 window). The runner OR-reduces this across DP and
+    # drops all drafts collectively on True, so no DP rank ends up writing
+    # pad-position KV past its block boundary. A False value combined with
+    # a locally empty `scheduled_spec_decode_tokens` instead means "no
+    # drafts proposed this step" (e.g., ngram lookup miss); in that case
+    # peer ranks that do have drafts must still be allowed to run full
+    # spec, so the runner takes the cross-DP MAX rather than collapsing.
+    step_no_spec_required: bool = False
 
 
 def is_prefill(request: Request) -> bool:
@@ -156,6 +168,15 @@ class RBLNScheduler(Scheduler):
         # spec_decode_cap propagates the tightest remaining_in_block constraint
         # to all subsequent requests so no request exceeds it.
         spec_decode_cap = self.block_size
+        # NOTE(RBLN): set True only when the per-request binary block-boundary
+        # check below trips for at least one running decode req — i.e., the
+        # rank must drop drafts because they would cross block_size or
+        # max_model_len. This is distinct from "no drafts proposed" (e.g.,
+        # ngram lookup miss), which leaves this flag False. The runner uses
+        # this distinction to decide whether to collective-fallback across DP
+        # (boundary-induced no-spec) or let peers run full spec (no-drafts
+        # case).
+        step_no_spec_required = False
 
         # First, schedule the RUNNING requests.
         # NOTE(RBLN): Prioritize prefill requests. Given our constraint that the prefill
@@ -321,20 +342,37 @@ class RBLNScheduler(Scheduler):
                 # next step when applicable.
                 request.spec_token_ids = []
 
-            # NOTE(RBLN): Update spec_decode_cap with the tightest constraint
-            # for this request: remaining space in the current block and remaining
-            # tokens until max_model_len. Done here (after confirmed scheduling)
-            # so that only actually scheduled requests affect the cap, and
-            # num_new_tokens reflects all prior adjustments. Even single-token
-            # decode requests must constrain the cap because the runner pads all
-            # requests to max_spec_decode_len.
+            # NOTE(RBLN): Full-spec-or-no-spec block-boundary decision.
+            # Under fixed-length spec decode the runtime query length must be
+            # exactly 1 (no-spec) or num_spec_tokens + 1 (full spec) — these
+            # are the only two warmup-compiled shapes. Pick a binary
+            # per-request cap (max_spec_decode_len when this req's
+            # remaining block / maxlen can hold a full-spec window, else 1)
+            # and propagate the tightest local choice to spec_decode_cap.
+            # The retroactive trim below uses the final cap to align every
+            # scheduled req's num_scheduled_tokens onto the same pow2 shape,
+            # so the runner-side pad to max_spec_decode_len never writes
+            # past anyone's block boundary.
             if not is_prefill(request):
-                tokens_used_in_block = request.num_computed_tokens % self.block_size
-                remaining_in_block = self.block_size - tokens_used_in_block
-                remaining_in_maxlen = self.max_model_len - request.num_computed_tokens
-                spec_decode_cap = min(
-                    remaining_in_block, remaining_in_maxlen, spec_decode_cap
-                )
+                if self.num_spec_tokens > 0:
+                    max_spec_decode_len = self.num_spec_tokens + 1
+                    tokens_used_in_block = request.num_computed_tokens % self.block_size
+                    remaining_in_block = self.block_size - tokens_used_in_block
+                    remaining_in_maxlen = (
+                        self.max_model_len - request.num_computed_tokens
+                    )
+                    if (
+                        remaining_in_block >= max_spec_decode_len
+                        and remaining_in_maxlen >= max_spec_decode_len
+                    ):
+                        this_req_cap = max_spec_decode_len
+                    else:
+                        this_req_cap = 1
+                        step_no_spec_required = True
+                    spec_decode_cap = min(spec_decode_cap, this_req_cap)
+                else:
+                    # No spec configured at all — single-token decode, cap to 1.
+                    spec_decode_cap = 1
 
             # Encoder-related.
             if encoder_inputs_to_schedule:
@@ -876,6 +914,7 @@ class RBLNScheduler(Scheduler):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
+            step_no_spec_required=step_no_spec_required,
         )
 
         # Drain pending copy ops from the KV cache manager.
