@@ -22,7 +22,6 @@ for ``rebel.get_npu_name() == None``, the cache-disabled conflict check, and
 the ``compile_only`` option injection at the compile sites.
 """
 
-import os
 from types import SimpleNamespace
 
 import pytest
