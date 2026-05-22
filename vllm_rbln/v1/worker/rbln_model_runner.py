@@ -3535,7 +3535,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # if this flag is set, nn.modules parameters are treated
             # as model input
             torch._dynamo.config.inline_inbuilt_nn_modules = False
-            torch._dynamo.config.cache_size_limit = 64
+            torch._dynamo.config.cache_size_limit = 8888
             # RBLN compile context to mark static address for kv cache tensor
             # if tensor is set to have static address,
             # similar to RBLN kv cache binding
