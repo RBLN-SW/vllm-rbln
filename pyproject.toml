@@ -39,7 +39,7 @@ dependencies = [
     # datasets <3 references pa.PyExtensionType, removed in pyarrow >=21
     "datasets>=3.3.0",
     "qwen_vl_utils",
-    "vllm>=0.18.0,<0.20",
+    "vllm==0.19.1",
     "torch",
     "torchvision",
     "torchaudio",
@@ -133,7 +133,7 @@ environments = [
 
 [[tool.uv.index]]
 name = "vllm-cpu"
-url = "https://wheels.vllm.ai/0.18.0/cpu"
+url = "https://wheels.vllm.ai/0.19.1/cpu"
 explicit = true
 
 [[tool.uv.index]]
