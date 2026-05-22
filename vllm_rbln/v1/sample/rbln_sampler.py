@@ -402,7 +402,7 @@ class RBLNSampler(VLLMSampler):
     def apply_temperature(
         self,
         logits: torch.Tensor,
-        temp: torch.Tensor,
+        temperature: torch.Tensor,
         all_random: bool,
     ) -> torch.Tensor:
         # NOTE:
@@ -414,8 +414,10 @@ class RBLNSampler(VLLMSampler):
         # it pushes logits past softmax's safe exp range and overflows.
         _GREEDY_EPS = 1e-3
         if not all_random:
-            temp = torch.where(temp < _SAMPLING_EPS, _GREEDY_EPS, temp)
-        return logits.div(temp.unsqueeze(dim=1))
+            temperature = torch.where(
+                temperature < _SAMPLING_EPS, _GREEDY_EPS, temperature
+            )
+        return logits.div(temperature.unsqueeze(dim=1))
 
 
 WARM_UP_CONFIGS = [
