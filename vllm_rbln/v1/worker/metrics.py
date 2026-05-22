@@ -121,7 +121,7 @@ class StepMetrics:
         """Get average prepare time (PrepareInputs + PrepareOutputs around Run)
         in microseconds, optionally ignoring one outlier."""
         values = (
-            self._without_outlier_i(self.prepare_times)
+            self._without_outlier(self.prepare_times)
             if ignore_outlier
             else self.prepare_times
         )
