@@ -12,27 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# NOTE(RBLN): Runtime monkey-patches applied when the RBLN plugin is loaded.
+from vllm_rbln.models.qwen2_moe import patched_qwen2_moe_forward
+from vllm_rbln.patches import register_patch
 
-from vllm_rbln.patches.registry import (
-    PatchDescriptor,
-    apply_registered_patches,
-    register_patch,
-)
-
-# ruff: noqa: F401
-from . import (
-    attention,
-    fused_moe,
-    models_utils,
-    qwen2_moe,
-    rotary_embedding,
-    shared_fused_moe,
-    vocab_parallel_embedding,
-)
-
-__all__ = (
-    "PatchDescriptor",
-    "apply_registered_patches",
-    "register_patch",
-)
+register_patch(
+    target="vllm.model_executor.models.qwen2_moe.Qwen2MoeSparseMoeBlock.forward",
+    reason=(
+        "To remove the unnecessary reshape and use the RBLN FusedMoE router-callable "
+        "interface. (PR#367)"
+    ),
+    owner_module=__name__,
+)(patched_qwen2_moe_forward)

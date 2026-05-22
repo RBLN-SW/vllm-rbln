@@ -153,6 +153,9 @@ def _validate_registry_layout() -> None:
     descriptor_targets: set[str] = set()
 
     for descriptor in _REGISTERED_PATCH_DESCRIPTORS:
+        if descriptor.condition is not None and not descriptor.condition():
+            continue
+
         if not MIN_PATCH_PRIORITY <= descriptor.priority <= MAX_PATCH_PRIORITY:
             raise ValueError(
                 "patch descriptor priority must be between "
