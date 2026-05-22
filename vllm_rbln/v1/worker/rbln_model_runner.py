@@ -1491,6 +1491,11 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 "the cached compiled binary will be reused."
             )
             options["cache_dir"] = os.path.join(envs.VLLM_CACHE_ROOT, "rbln")
+        if envs.VLLM_RBLN_COMPILE_ONLY:
+            # Compile + cache each graph on a dummy device so a CPU-only host
+            # (no NPU) can populate the cache; see check_and_update_config,
+            # which guarantees the compile cache is enabled in this mode.
+            options["compile_only"] = True
 
         # compile compute_logits
         # FIXME(jiwoo.park): method assignment for torch.compile

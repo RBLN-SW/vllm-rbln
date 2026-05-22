@@ -80,7 +80,19 @@ class RblnPlatform(Platform):
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
-        assert (device_name := rebel.get_npu_name(device_id))
+        # rebel.get_npu_name() returns None on a host without an NPU mounted
+        # (e.g. a CPU-only compile worker) and otherwise falls back to the
+        # RBLN_TARGET_SOC env var. When it is None we cannot determine a target
+        # SOC, so surface an actionable error instead of a bare AssertionError.
+        device_name = rebel.get_npu_name(device_id)
+        if not device_name:
+            raise RuntimeError(
+                "Could not determine the RBLN NPU name "
+                f"(rebel.get_npu_name({device_id}) returned None). On a host "
+                "without an NPU mounted (e.g. a CPU-only compile worker running "
+                "with VLLM_RBLN_COMPILE_ONLY=1), set RBLN_TARGET_SOC to the "
+                "target SOC (e.g. RBLN-CA25) so compilation can target it."
+            )
         return device_name
 
     @staticmethod
@@ -156,6 +168,17 @@ class RblnPlatform(Platform):
             raise ValueError(
                 "RBLN does not officially support disabling chunked prefill. "
                 "Please don't disable chunked prefill by yourself."
+            )
+
+        if envs.VLLM_RBLN_COMPILE_ONLY and envs.VLLM_DISABLE_COMPILE_CACHE:
+            # Compile-only compiles each graph and writes the .rbln artifact to
+            # the compile cache (the runtime is built on a dummy device so no
+            # NPU is needed). With the cache disabled there is nowhere to write
+            # the artifact, so the two options are mutually exclusive.
+            raise ValueError(
+                "VLLM_RBLN_COMPILE_ONLY=1 needs the compile cache enabled to "
+                "write compiled artifacts to disk; do not set "
+                "VLLM_DISABLE_COMPILE_CACHE=1 together with it."
             )
 
         parallel_config = vllm_config.parallel_config
