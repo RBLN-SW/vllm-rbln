@@ -174,7 +174,7 @@ class RBLNOptimumGemma4ForConditionalGeneration(
             output = self.model.language_model.prefill_decoder(
                 inputs_embeds=inputs_embeds,
                 cache_position=cache_position,
-                attention_mask=attention_mask,
+                # attention_mask=attention_mask,
                 local_block_tables=local_block_table_id,
                 block_tables=block_tables,
                 token_type_ids=token_type_ids,
