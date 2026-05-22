@@ -170,16 +170,31 @@ class RblnPlatform(Platform):
                 "Please don't disable chunked prefill by yourself."
             )
 
-        if envs.VLLM_RBLN_COMPILE_ONLY and envs.VLLM_DISABLE_COMPILE_CACHE:
-            # Compile-only compiles each graph and writes the .rbln artifact to
-            # the compile cache (the runtime is built on a dummy device so no
-            # NPU is needed). With the cache disabled there is nowhere to write
-            # the artifact, so the two options are mutually exclusive.
-            raise ValueError(
-                "VLLM_RBLN_COMPILE_ONLY=1 needs the compile cache enabled to "
-                "write compiled artifacts to disk; do not set "
-                "VLLM_DISABLE_COMPILE_CACHE=1 together with it."
-            )
+        if envs.VLLM_RBLN_COMPILE_ONLY:
+            # Compile-only injects the compile_only torch.compile option. The
+            # optimum-rbln path is not torch.compile-based, so the flag has no
+            # meaning there and conflicts with that path; it only applies to the
+            # vLLM-native (torch.compile) path, which VLLM_RBLN_USE_VLLM_MODEL
+            # selects.
+            if not envs.VLLM_RBLN_USE_VLLM_MODEL:
+                raise ValueError(
+                    "VLLM_RBLN_COMPILE_ONLY=1 is a torch.compile option and only "
+                    "applies to the vLLM-native model path; set "
+                    "VLLM_RBLN_USE_VLLM_MODEL=1 to use it. The optimum-rbln path "
+                    "is not torch.compile-based, so compile-only conflicts with "
+                    "it."
+                )
+            if envs.VLLM_DISABLE_COMPILE_CACHE:
+                # Compile-only compiles each graph and writes the .rbln artifact
+                # to the compile cache (the runtime is built on a dummy device
+                # so no NPU is needed). With the cache disabled there is nowhere
+                # to write the artifact, so the two options are mutually
+                # exclusive.
+                raise ValueError(
+                    "VLLM_RBLN_COMPILE_ONLY=1 needs the compile cache enabled "
+                    "to write compiled artifacts to disk; do not set "
+                    "VLLM_DISABLE_COMPILE_CACHE=1 together with it."
+                )
 
         parallel_config = vllm_config.parallel_config
         use_model_parallel = (

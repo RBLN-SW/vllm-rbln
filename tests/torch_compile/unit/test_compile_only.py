@@ -85,13 +85,26 @@ def _stub_config(dp=1, tp=1, pp=1, ep=False, chunked_prefill=True):
 
 def test_validate_rejects_compile_only_with_cache_disabled(monkeypatch):
     monkeypatch.setenv("VLLM_RBLN_COMPILE_ONLY", "1")
+    monkeypatch.setenv("VLLM_RBLN_USE_VLLM_MODEL", "1")
     monkeypatch.setenv("VLLM_DISABLE_COMPILE_CACHE", "1")
     with pytest.raises(ValueError, match="compile cache"):
         RblnPlatform.validate_and_setup_prerequisite(_stub_config())
 
 
+def test_validate_rejects_compile_only_without_vllm_model(monkeypatch):
+    # compile-only only applies to the vLLM-native model path; on the
+    # optimum-rbln path (VLLM_RBLN_USE_VLLM_MODEL unset) it must error rather
+    # than silently do nothing.
+    monkeypatch.setenv("VLLM_RBLN_COMPILE_ONLY", "1")
+    monkeypatch.delenv("VLLM_RBLN_USE_VLLM_MODEL", raising=False)
+    monkeypatch.setenv("VLLM_DISABLE_COMPILE_CACHE", "0")
+    with pytest.raises(ValueError, match="VLLM_RBLN_USE_VLLM_MODEL"):
+        RblnPlatform.validate_and_setup_prerequisite(_stub_config())
+
+
 def test_validate_allows_compile_only_with_cache_enabled(monkeypatch):
     monkeypatch.setenv("VLLM_RBLN_COMPILE_ONLY", "1")
+    monkeypatch.setenv("VLLM_RBLN_USE_VLLM_MODEL", "1")
     monkeypatch.setenv("VLLM_DISABLE_COMPILE_CACHE", "0")
     # Must not raise.
     RblnPlatform.validate_and_setup_prerequisite(_stub_config())
