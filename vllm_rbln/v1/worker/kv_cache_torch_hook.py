@@ -79,6 +79,24 @@ _MUTATE_MAX_STEPS: int = int(
 )
 _MUTATE_CAP_NOTIFIED: bool = False
 
+# Bench hook cap. bench / bench_1block / bench_1block_reused 모드는 매 forward
+# 마다 모든 layer 의 host↔device round-trip 을 수행해 total runtime 의 큰 부분
+# 을 차지함. 초반 N 회 forward 만 측정/round-trip 하고 그 이후엔 즉시 return
+# 해서 전체 실행 시간을 줄이기 위한 cap.
+#
+# 값 의미:
+#   -1 (default): 무제한 — 기존 동작 (매 forward 마다 round-trip + 측정).
+#    0          : never — hook 등록만 되고 round-trip 한 번도 안 함.
+#    N (>=1)    : step ∈ [0, N) 에서만 round-trip + 측정, step >= N 부터 no-op.
+#
+# 주의: cap 이 warmup (=_BENCH_WARMUP_FORWARDS) 보다 작거나 같으면 samples 가
+# 비어서 BENCH/CUMULATIVE/FINAL summary 가 안 찍힘. 유효 sample 을 얻으려면
+# cap > _BENCH_WARMUP_FORWARDS 로 설정해야 함.
+_BENCH_MAX_STEPS: int = int(
+    os.environ.get("VLLM_RBLN_KV_CACHE_HOOK_BENCH_MAX_STEPS", "-1")
+)
+_BENCH_CAP_NOTIFIED: bool = False
+
 
 def _mutation_capped(step: int) -> bool:
     """True 면 이 step 에서 mutation 을 skip 해야 함."""
@@ -98,6 +116,31 @@ def _maybe_notify_mutation_cap(step: int, mode_label: str) -> None:
             flush=True,
         )
         _MUTATE_CAP_NOTIFIED = True
+
+
+def _bench_capped(step: int) -> bool:
+    """True 면 이 step 에서 bench round-trip 을 skip 해야 함."""
+    return _BENCH_MAX_STEPS >= 0 and step >= _BENCH_MAX_STEPS
+
+
+def _maybe_notify_bench_cap(step: int, mode_label: str) -> None:
+    """Cap 진입 시점에 한 번만 로그를 찍어 사용자가 동작 변화를 인지하도록.
+    cap 직후 summary 도 같이 dump — 짧은 run 에서 atexit 까지 못 갈 때 대비."""
+    global _BENCH_CAP_NOTIFIED
+    if _BENCH_CAP_NOTIFIED:
+        return
+    if _BENCH_MAX_STEPS >= 0 and step == _BENCH_MAX_STEPS:
+        print(
+            f"******************** [kv_cache_hook][{mode_label}] bench "
+            f"cap reached at step={step} "
+            f"(VLLM_RBLN_KV_CACHE_HOOK_BENCH_MAX_STEPS="
+            f"{_BENCH_MAX_STEPS}). Subsequent forwards skip round-trip.",
+            flush=True,
+        )
+        s = torch_bench_summary()
+        if s:
+            print("******************** CAPPED/LAYER " + s, flush=True)
+        _BENCH_CAP_NOTIFIED = True
 
 
 def register_kv_cache_torch_hook(hook: Optional[KVCacheTorchHook]) -> None:
@@ -327,6 +370,9 @@ def _torch_bench_hook(
     kv_caches: Sequence[torch.Tensor], phase: str, step: int
 ) -> None:
     """per-layer round-trip latency timer. no mutation."""
+    if _bench_capped(step):
+        _maybe_notify_bench_cap(step, "BENCH")
+        return
     warmup = step < _BENCH_WARMUP_FORWARDS
     if step == 0 and kv_caches:
         t0 = kv_caches[0]
@@ -424,6 +470,9 @@ def _torch_bench_1block_hook(
     Update direction 은 1-copy 패턴 (`slice.copy_(cpu_slice)`) 사용 — 즉 기존
     K/V slice 에 직접 h2v.
     """
+    if _bench_capped(step):
+        _maybe_notify_bench_cap(step, "BENCH_1BLOCK")
+        return
     warmup = step < _BENCH_WARMUP_FORWARDS
     if step == 0 and kv_caches:
         t = kv_caches[0]
@@ -496,6 +545,9 @@ def _torch_bench_1block_reused_hook(
       - 매 step 마다 fetch + update 1 layer 당 2 호출씩.
     """
     global _PINNED_HOSTS_1BLOCK_K, _PINNED_HOSTS_1BLOCK_V
+    if _bench_capped(step):
+        _maybe_notify_bench_cap(step, "BENCH_1BLOCK_REUSED")
+        return
     warmup = step < _BENCH_WARMUP_FORWARDS
     if not _PINNED_HOSTS_1BLOCK_K and kv_caches:
         for t in kv_caches:

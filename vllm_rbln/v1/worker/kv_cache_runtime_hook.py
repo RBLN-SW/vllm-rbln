@@ -74,6 +74,24 @@ _MUTATE_MAX_STEPS: int = int(
 )
 _MUTATE_CAP_NOTIFIED: bool = False
 
+# Bench hook cap. bench / bench_1block / bench_1block_reused 모드는 매 forward
+# 마다 모든 layer 의 host↔device round-trip 을 수행해 total runtime 의 큰 부분
+# 을 차지함. 초반 N 회 forward 만 측정/round-trip 하고 그 이후엔 즉시 return
+# 해서 전체 실행 시간을 줄이기 위한 cap.
+#
+# 값 의미:
+#   -1 (default): 무제한 — 기존 동작 (매 forward 마다 round-trip + 측정).
+#    0          : never — hook 등록만 되고 round-trip 한 번도 안 함.
+#    N (>=1)    : step ∈ [0, N) 에서만 round-trip + 측정, step >= N 부터 no-op.
+#
+# 주의: cap 이 warmup (=_BENCH_WARMUP_FORWARDS) 보다 작거나 같으면 samples 가
+# 비어서 BENCH/CUMULATIVE/FINAL summary 가 안 찍힘. 유효 sample 을 얻으려면
+# cap > _BENCH_WARMUP_FORWARDS 로 설정해야 함.
+_BENCH_MAX_STEPS: int = int(
+    os.environ.get("VLLM_RBLN_KV_CACHE_RT_HOOK_BENCH_MAX_STEPS", "-1")
+)
+_BENCH_CAP_NOTIFIED: bool = False
+
 
 def _mutation_capped(step: int) -> bool:
     """True 면 이 step 에서 mutation 을 skip 해야 함."""
@@ -93,6 +111,31 @@ def _maybe_notify_mutation_cap(step: int, mode_label: str) -> None:
             flush=True,
         )
         _MUTATE_CAP_NOTIFIED = True
+
+
+def _bench_capped(step: int) -> bool:
+    """True 면 이 step 에서 bench round-trip 을 skip 해야 함."""
+    return _BENCH_MAX_STEPS >= 0 and step >= _BENCH_MAX_STEPS
+
+
+def _maybe_notify_bench_cap(step: int, mode_label: str) -> None:
+    """Cap 진입 시점에 한 번만 로그를 찍어 사용자가 동작 변화를 인지하도록.
+    cap 직후 summary 도 같이 dump — 짧은 run 에서 atexit 까지 못 갈 때 대비."""
+    global _BENCH_CAP_NOTIFIED
+    if _BENCH_CAP_NOTIFIED:
+        return
+    if _BENCH_MAX_STEPS >= 0 and step == _BENCH_MAX_STEPS:
+        print(
+            f"******************** [kv_cache_rt_hook][{mode_label}] bench "
+            f"cap reached at step={step} "
+            f"(VLLM_RBLN_KV_CACHE_RT_HOOK_BENCH_MAX_STEPS="
+            f"{_BENCH_MAX_STEPS}). Subsequent forwards skip round-trip.",
+            flush=True,
+        )
+        s = runtime_bench_summary()
+        if s:
+            print("******************** CAPPED/LAYER " + s, flush=True)
+        _BENCH_CAP_NOTIFIED = True
 
 
 def register_kv_cache_runtime_hook(
@@ -356,6 +399,9 @@ def _runtime_random_hook(
 # Module-level bench stats — per-layer round-trip timings in nanoseconds.
 # Each entry: (fetch_ns, update_ns, bytes, num_calls).
 _BENCH_SAMPLES: List[tuple] = []
+# Per-DMA-call samples (1 fetch 또는 1 update 호출 1번). entry: (ns, bytes, kind)
+# kind = "fetch" | "update". per-call overhead 와 DMA bandwidth 를 분리해서 보기 위함.
+_BENCH_CALL_SAMPLES: List[tuple] = []
 _BENCH_WARMUP_FORWARDS = 2
 
 # Pre-allocated per-layer host buffers (lazily filled on first forward).
@@ -377,6 +423,9 @@ def _runtime_bench_1block_hook(
     Host buffer 는 매번 fresh alloc (`_make_host_buffer` — runtime hook 의
     `bench` 와 일치, fresh-alloc baseline).
     """
+    if _bench_capped(step):
+        _maybe_notify_bench_cap(step, "BENCH_1BLOCK")
+        return
     warmup = step < _BENCH_WARMUP_FORWARDS
     if step == 0 and kv_caches_by_name:
         first_name, first_t = next(iter(kv_caches_by_name.items()))
@@ -438,6 +487,9 @@ def _runtime_bench_1block_reused_hook(
     host buffer 한 번 alloc 후 reuse.
     """
     global _RT_PINNED_HOSTS
+    if _bench_capped(step):
+        _maybe_notify_bench_cap(step, "BENCH_1BLOCK_REUSED")
+        return
     warmup = step < _BENCH_WARMUP_FORWARDS
     if not _RT_PINNED_HOSTS and kv_caches_by_name:
         for name, layer_t in kv_caches_by_name.items():
@@ -497,24 +549,134 @@ def _runtime_bench_hook(
     phase: str,
     step: int,
 ) -> None:
-    """fetch then update, no mutation. layer-unit timer."""
+    """fetch then update, no mutation. layer-unit timer.
+
+    추가 로깅:
+      - step=0: per-forward 총 bytes / 총 DMA call 수 / per-block bytes 정보 (BENCH/info).
+      - 첫 non-warmup step (= _BENCH_WARMUP_FORWARDS): layer 0 의 block 별
+        fetch/update 시간 (LAYERWISE) — 첫 block 이 특별히 느린지 등 패턴 확인.
+      - 매 forward: 모든 (layer × block × {fetch,update}) call 시간을
+        _BENCH_CALL_SAMPLES 에 push → summary 에서 per-call 분포 계산.
+    """
+    if _bench_capped(step):
+        _maybe_notify_bench_cap(step, "BENCH")
+        return
     warmup = step < _BENCH_WARMUP_FORWARDS
+
+    if step == 0 and kv_caches_by_name:
+        first_name, first_t = next(iter(kv_caches_by_name.items()))
+        layer_nbytes = first_t.numel() * first_t.element_size()
+        per_block_nbytes = layer_nbytes // max(num_blocks, 1)
+        n_layers0 = len(kv_caches_by_name)
+        forward_nbytes = layer_nbytes * n_layers0
+        # fetch + update 양방향, layer × block 마다 1 call
+        calls_per_forward = 2 * num_blocks * n_layers0
+        print(
+            f"******************** [kv_cache_rt_hook][BENCH/info] step=0 "
+            f"phase={phase} num_layers={n_layers0} num_blocks={num_blocks} "
+            f"block_size={block_size} | "
+            f"per_block={per_block_nbytes/1e6:.2f}MB "
+            f"per_layer={layer_nbytes/1e6:.2f}MB "
+            f"per_forward(round-trip)={2*forward_nbytes/1e6:.2f}MB "
+            f"calls/forward={calls_per_forward} | "
+            f"layer0 name={first_name} shape={tuple(first_t.shape)} "
+            f"dtype={first_t.dtype} device={first_t.device}",
+            flush=True,
+        )
+
+    # 첫 non-warmup step: layer 0 block 별 시간 분포 dump (LAYERWISE 디버그)
+    dump_blockwise = (step == _BENCH_WARMUP_FORWARDS) and bool(kv_caches_by_name)
+
     f_total = u_total = 0
     n_layers = len(kv_caches_by_name)
-    for name, layer_t in kv_caches_by_name.items():
+    blockwise_fetch_ns: List[int] = []
+    blockwise_update_ns: List[int] = []
+
+    for layer_idx, (name, layer_t) in enumerate(kv_caches_by_name.items()):
         host = _make_host_buffer(layer_t)
+        per_block_nbytes = (
+            (layer_t.numel() * layer_t.element_size()) // max(num_blocks, 1)
+        )
+        # ── fetch direction ─────────────────────────────────────────────
         t0 = time.perf_counter_ns()
-        for b in range(num_blocks):
-            runtime._fetch_kv_cache(host, b, 0, block_size, name)
+        if dump_blockwise and layer_idx == 0:
+            # block 별 timing — _BENCH_CALL_SAMPLES 갱신은 아래 일반 path 와
+            # 중복 안 되게 여기서만 처리.
+            for b in range(num_blocks):
+                bt0 = time.perf_counter_ns()
+                runtime._fetch_kv_cache(host, b, 0, block_size, name)
+                bt1 = time.perf_counter_ns()
+                blockwise_fetch_ns.append(bt1 - bt0)
+                if not warmup:
+                    _BENCH_CALL_SAMPLES.append(
+                        (bt1 - bt0, per_block_nbytes, "fetch")
+                    )
+        else:
+            for b in range(num_blocks):
+                bt0 = time.perf_counter_ns()
+                runtime._fetch_kv_cache(host, b, 0, block_size, name)
+                bt1 = time.perf_counter_ns()
+                if not warmup:
+                    _BENCH_CALL_SAMPLES.append(
+                        (bt1 - bt0, per_block_nbytes, "fetch")
+                    )
         t1 = time.perf_counter_ns()
-        for b in range(num_blocks):
-            runtime._update_kv_cache(host, b, 0, block_size, name)
+        # ── update direction ────────────────────────────────────────────
+        if dump_blockwise and layer_idx == 0:
+            for b in range(num_blocks):
+                bt0 = time.perf_counter_ns()
+                runtime._update_kv_cache(host, b, 0, block_size, name)
+                bt1 = time.perf_counter_ns()
+                blockwise_update_ns.append(bt1 - bt0)
+                if not warmup:
+                    _BENCH_CALL_SAMPLES.append(
+                        (bt1 - bt0, per_block_nbytes, "update")
+                    )
+        else:
+            for b in range(num_blocks):
+                bt0 = time.perf_counter_ns()
+                runtime._update_kv_cache(host, b, 0, block_size, name)
+                bt1 = time.perf_counter_ns()
+                if not warmup:
+                    _BENCH_CALL_SAMPLES.append(
+                        (bt1 - bt0, per_block_nbytes, "update")
+                    )
         t2 = time.perf_counter_ns()
         if not warmup:
             nbytes = layer_t.numel() * layer_t.element_size()
             _BENCH_SAMPLES.append((t1 - t0, t2 - t1, nbytes, num_blocks))
             f_total += t1 - t0
             u_total += t2 - t1
+
+    if dump_blockwise and blockwise_fetch_ns:
+        f_strs = ",".join(f"{n/1e3:.0f}" for n in blockwise_fetch_ns)
+        u_strs = ",".join(f"{n/1e3:.0f}" for n in blockwise_update_ns)
+        # block 별 GB/s 도 같이 — overhead 가 첫 호출에 몰리는 패턴 확인용
+        first_t2 = next(iter(kv_caches_by_name.values()))
+        per_block_nbytes = (
+            (first_t2.numel() * first_t2.element_size()) // max(num_blocks, 1)
+        )
+        f_gbps = [
+            (per_block_nbytes / n) if n > 0 else 0.0
+            for n in blockwise_fetch_ns
+        ]  # bytes/ns = GB/s
+        u_gbps = [
+            (per_block_nbytes / n) if n > 0 else 0.0
+            for n in blockwise_update_ns
+        ]
+        f_gbps_strs = ",".join(f"{g:.2f}" for g in f_gbps)
+        u_gbps_strs = ",".join(f"{g:.2f}" for g in u_gbps)
+        print(
+            f"******************** [kv_cache_rt_hook][BENCH/LAYERWISE] "
+            f"step={step} layer0 num_blocks={num_blocks} "
+            f"per_block={per_block_nbytes/1e6:.2f}MB\n"
+            f"  fetch  µs : [{f_strs}]\n"
+            f"  update µs : [{u_strs}]\n"
+            f"  fetch  GB/s: [{f_gbps_strs}]\n"
+            f"  update GB/s: [{u_gbps_strs}]",
+            flush=True,
+        )
+
     if not warmup and n_layers > 0:
         first_t = next(iter(kv_caches_by_name.values()))
         nbytes = first_t.numel() * first_t.element_size()
@@ -549,7 +711,7 @@ def runtime_bench_summary() -> Optional[str]:
     def mean(xs):
         return sum(xs) / len(xs)
 
-    return (
+    layer_block = (
         f"[kv_cache_rt_hook][BENCH] samples={len(_BENCH_SAMPLES)} "
         f"bytes_per_layer={nbytes / 1e6:.2f}MB "
         f"calls_per_layer=(fetch={nblocks},update={nblocks})\n"
@@ -562,9 +724,41 @@ def runtime_bench_summary() -> Optional[str]:
         f"  total  µs : mean={mean(total)/1e3:9.2f} "
         f"median={statistics.median(total)/1e3:9.2f} "
         f"p99={pct(total,99)/1e3:9.2f}\n"
-        f"  GB/s (round-trip): "
-        f"{(2 * nbytes) / (mean(total) / 1e9) / 1e9:.3f}"
+        f"  GB/s (round-trip, layer-unit, host↔device): "
+        f"{(2 * nbytes) / (mean(total) / 1e9) / 1e9:.3f}\n"
+        f"      ↑ 1 layer 의 fetch (N blocks) + update (N blocks) 6 호출 "
+        f"전체 시간 기준."
     )
+
+    # ── per-call (1 fetch / 1 update DMA) 분포 ──────────────────────────
+    if not _BENCH_CALL_SAMPLES:
+        return layer_block
+
+    f_call_ns = [s[0] for s in _BENCH_CALL_SAMPLES if s[2] == "fetch"]
+    u_call_ns = [s[0] for s in _BENCH_CALL_SAMPLES if s[2] == "update"]
+    call_nbytes = _BENCH_CALL_SAMPLES[0][1]  # per-block bytes (= per-call DMA bytes)
+
+    def fmt_call(label: str, xs: List[int]) -> str:
+        if not xs:
+            return f"  {label} µs : (no samples)"
+        # bytes/ns = GB/s. mean(xs) ns → call_nbytes / mean(xs) GB/s
+        gbps = call_nbytes / mean(xs) if mean(xs) > 0 else 0.0
+        return (
+            f"  {label:<6s} µs : mean={mean(xs)/1e3:9.2f} "
+            f"median={statistics.median(xs)/1e3:9.2f} "
+            f"p99={pct(xs, 99)/1e3:9.2f}  →  GB/s={gbps:6.3f}"
+        )
+
+    call_block = (
+        f"\n[kv_cache_rt_hook][BENCH/PER-CALL] "
+        f"calls={len(_BENCH_CALL_SAMPLES)} per_call_bytes="
+        f"{call_nbytes/1e6:.2f}MB\n"
+        f"{fmt_call('fetch', f_call_ns)}\n"
+        f"{fmt_call('update', u_call_ns)}\n"
+        f"      ↑ 1 호출당 transfer GB/s. layer-unit 보다 보통 살짝 높음 "
+        f"(loop iter 사이 idle 미포함)."
+    )
+    return layer_block + call_block
 
 
 # ---------- env-driven default install ----------------------------------
