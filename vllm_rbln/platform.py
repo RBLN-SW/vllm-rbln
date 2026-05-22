@@ -31,6 +31,7 @@ from torch._dynamo import register_backend
 from vllm.platforms import Platform, PlatformEnum
 from vllm.utils.torch_utils import _StreamPlaceholder
 
+torch._dynamo.config.recompile_limit = 8888
 
 import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger

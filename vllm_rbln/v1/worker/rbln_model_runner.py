@@ -562,7 +562,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             parallel_config.data_parallel_size > 1
             and envs.VLLM_RBLN_SPECIALIZE_MOE_DECODE
         )
-        torch._dynamo.config.recompile_limit = 8888
 
     def _enable_performance_tracker(self):
         if envs.VLLM_RBLN_METRICS:
