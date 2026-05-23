@@ -69,6 +69,10 @@ class RBLNEagleProposer(EagleProposer):
         num_tokens_across_dp = RBLNDPMetadata.num_tokens_across_dp(
             num_input_tokens, dp_size, dp_rank
         )
+        pads_across_dp = RBLNDPMetadata.num_tokens_across_dp(
+            num_padded_tokens, dp_size, dp_rank
+        )
+        num_padded_tokens = int(pads_across_dp.max().item())
         return num_tokens_across_dp, num_padded_tokens
 
     def propose(
