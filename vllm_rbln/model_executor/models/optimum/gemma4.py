@@ -29,7 +29,13 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 
 from .base import ModelInputForRBLN, version_error
 from .model_base import RBLNOptimumDecoderMixin, RBLNOptimumModelBase
-from .optimum_attention import HybridAttentionImageManager, HybridAttentionImageStrategy
+from .optimum_attention import (
+    AttentionManager,
+    InnerAttentionEntry,
+    InnerAttentionStrategy,
+    InnerR1,
+    InnerR2,
+)
 
 logger = init_logger(__name__)
 
@@ -69,21 +75,16 @@ class RBLNOptimumGemma4ForConditionalGeneration(
             decoder_batch_sizes=self.model.rbln_config.language_model.decoder_batch_sizes,
             num_blocks=self.kv_block_adapter._estimated_num_blocks(),
         )
-        self.strategy = HybridAttentionImageStrategy(PAD_TOKEN_ID)
-        self.attention_manager: HybridAttentionImageManager = (
-            HybridAttentionImageManager(self.strategy)
-        )
-        # config = vllm_config.model_config.hf_config
-        # with self._mark_language_model(vllm_config):
-        #     self.language_model = self.model.language_model
-        # with self._mark_tower_model(vllm_config, "image"):
+        self.strategy = InnerAttentionStrategy()
+        self.attention_manager: AttentionManager[
+            InnerAttentionStrategy, InnerAttentionEntry, InnerR1, InnerR2
+        ] = AttentionManager(self.strategy)
         from transformers import AutoModelForImageTextToText
 
         hf_model_id = "google/gemma-4-31B-it"
         # FIXME It triggers thread creation failure
         # because of nested multi-threading in multi-processing
         # libgomp: Thread creation failed: Resource temporarily unavailable
-        # !!!!!!! Segfault encountered !!!!!!!
         hf_model = (
             AutoModelForImageTextToText.from_pretrained(hf_model_id)
             .to(dtype=torch.bfloat16)
@@ -91,7 +92,6 @@ class RBLNOptimumGemma4ForConditionalGeneration(
         )
         self.model.vision_tower = hf_model.model.vision_tower
         self.model.embed_vision = hf_model.model.embed_vision
-        # self.vision_tower = self.model.vision_tower
 
     def forward(self, model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
         input_ids = model_input.input_tokens
@@ -105,15 +105,13 @@ class RBLNOptimumGemma4ForConditionalGeneration(
         request_nums = input_ids.shape[0]
 
         # In prefill phase, the length of list must be 1
-        sliding_window_table_ids, padded_cache_lengths, attention_masks = (
-            self.attention_manager.get(
-                is_prompt,
-                self.decoder_batch_size,
-                running_requests_ids,
-                finished_requests_ids,
-                input_ids=input_ids,
-            )
+        sliding_window_table_ids = self.attention_manager.get(
+            is_prompt,
+            self.decoder_batch_size,
+            running_requests_ids,
+            finished_requests_ids,
         )
+
         kwargs = self.preprocess_for_decoder(
             is_prompt, block_tables, input_ids, position_ids
         )
@@ -145,29 +143,22 @@ class RBLNOptimumGemma4ForConditionalGeneration(
             )
             if self.model.language_model.prefill_decoder is None:
                 raise version_error
-            assert attention_masks is not None
-            attention_mask = attention_masks[0]
-            print("@@@ token_type_ids", token_type_ids)
-            print("@@@@ prefill_decoder", inputs_embeds)
+
             output = self.model.language_model.prefill_decoder(
                 inputs_embeds=inputs_embeds,
                 cache_position=cache_position,
-                # attention_mask=attention_mask,
-                local_block_tables=local_block_table_id,
-                block_tables=block_tables,
+                # local_block_tables=local_block_table_id,
+                # block_tables=block_tables,
                 token_type_ids=token_type_ids,
+                batch_idx=0,
             )
             logits = output.logits
-            # updated_attention_mask = output.attention_mask
-            updated_padded_cache_length = output.padded_cache_lengths
-            print("@@ attention_mask", attention_mask)
             assert len(running_requests_ids) == 1
             self.attention_manager.add(
                 running_requests_id=running_requests_ids[0],
                 local_table_id=sliding_window_table_ids[0],
-                pad_len=updated_padded_cache_length,
-                attention_mask=attention_mask.unsqueeze(0),  # unused
             )
+            print("[prefill] logits", logits)
         else:
             if self.model.language_model.decoders is None:
                 raise ValueError("Decoders is None")
@@ -175,34 +166,24 @@ class RBLNOptimumGemma4ForConditionalGeneration(
             self.model.language_model.decoder = self.model.language_model.decoders[
                 padded_batch_size
             ]
-            (
-                local_block_table_id,
-                cache_position,
-                position_ids,
-                attention_mask,
-            ) = self.attention_manager.preprocess(
+            local_block_table_id, cache_position = self.attention_manager.preprocess(
                 sliding_window_table_ids,
                 cache_position,
                 request_nums,
                 padded_batch_size,
-                pad_lens=padded_cache_lengths,
-                attention_masks=attention_masks,
             )
-
-            # attention_mask = self.attention_manager.update(
-            #     running_requests_ids,
-            #     attention_mask,
-            #     cache_position,
-            # )
-
+            print("[decode] input_ids", input_ids)
+            print("[decode] cache_position", cache_position)
             logits = self.model.language_model.decoder(
                 input_ids=input_ids,
+                inputs_embeds=None,
                 cache_position=cache_position,
-                block_tables=block_tables,
-                local_block_tables=local_block_table_id,
-                # attention_mask=attention_mask,
-                position_ids=position_ids,
+                # block_tables=block_tables,
+                # local_block_tables=local_block_table_id,
+                position_ids=cache_position.clone(),  # FIXME duplicated
             ).logits
+            print("[decode] logits", logits)
+            print("[decode] argmax", logits.argmax(dim=-1))
 
         if not is_prompt:
             logits = logits[:request_nums]
