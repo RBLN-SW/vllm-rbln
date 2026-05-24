@@ -3344,6 +3344,51 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             )
             logits_indices = unpadded_to_padded[logits_indices.to(torch.int64)]
 
+            # Mirror the layout change for slot_mapping.
+            if slot_mappings_by_group is not None:
+                total_padded_tokens = num_reqs * max_spec_decode_len
+
+                def _remap_slot_mapping(sm: torch.Tensor) -> torch.Tensor:
+                    new_sm = torch.full(
+                        (total_padded_tokens,),
+                        -1,
+                        dtype=sm.dtype,
+                        device=sm.device,
+                    )
+                    new_sm[unpadded_to_padded] = sm[:num_input_tokens]
+                    return new_sm
+
+                slot_mappings_by_group = {
+                    gid: _remap_slot_mapping(sm)
+                    for gid, sm in slot_mappings_by_group.items()
+                }
+                # Rebuild per-layer dict so same-group layers share the same
+                # remapped tensor (matches the original aliasing in
+                # `_get_slot_mappings`).
+                if isinstance(slot_mappings, dict):
+                    new_slot_mappings: dict[str, torch.Tensor] = {}
+                    for gid, kv_cache_group in enumerate(
+                        self.kv_cache_config.kv_cache_groups
+                    ):
+                        sm = slot_mappings_by_group[gid]
+                        for layer_name in kv_cache_group.layer_names:
+                            new_slot_mappings[layer_name] = sm
+                    slot_mappings = new_slot_mappings
+
+                # Push the padded slot_mapping back into per-layer
+                # attn_metadata. The attention builder
+                # (flash_attention.py:1116/1252) already stamped the unpadded
+                # tensor here, so we overwrite in-place.
+                if attn_metadata is not None:
+                    for gid, kv_cache_group in enumerate(
+                        self.kv_cache_config.kv_cache_groups
+                    ):
+                        sm = slot_mappings_by_group[gid]
+                        for layer_name in kv_cache_group.layer_names:
+                            md = attn_metadata.get(layer_name)
+                            if md is not None and hasattr(md, "slot_mapping"):
+                                md.slot_mapping = sm
+
         # Run the model.
         # Use persistent buffers for CUDA graphs.
         # When spec decode is enabled, defer connector finalization
