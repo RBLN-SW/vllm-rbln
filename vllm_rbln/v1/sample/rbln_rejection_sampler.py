@@ -253,12 +253,20 @@ class RBLNRejectionSampler(RejectionSampler):
             dtype=torch.int64,  # Consistent with SamplerOutput.sampled_token_ids.
         )
 
+        # `active_mask` is in batch space: True for rows with any draft.
         active_mask = torch.tensor(
             [n > 0 for n in num_draft_tokens],
             device=output_token_ids.device,
             dtype=torch.bool,
         )  # [batch_size]
 
+        # ------------------------------------------------------------------
+        # 1) Build NPU primitive inputs (packed-then-padded layout).
+        # The NPU primitive expects draft (B*K,) int32 and target (B*K, V) fp16,
+        # where for batch i the valid entries occupy positions
+        # [i*K, i*K + num_draft_tokens[i]); the remaining tail per batch is
+        # padding (zeros) and is gated by cu_num_draft_tokens inside the kernel.
+        # ------------------------------------------------------------------
         reshaped_draft_token_ids = torch.zeros(
             batch_size * max_spec_len, dtype=torch.int32
         )
@@ -278,8 +286,17 @@ class RBLNRejectionSampler(RejectionSampler):
             ].to(torch.float16)
             src_offset += n
 
+        # NPU primitive expects cu_num_draft_tokens in int32; vLLM hands it over
+        # as int64 (inherited from num_draft_tokens cumsum), so cast explicitly.
         cu_num_draft_tokens_i32 = cu_num_draft_tokens.to(torch.int32).contiguous()
 
+        # ------------------------------------------------------------------
+        # 2) Call the NPU primitive.
+        # Returns:
+        #   selected_token_ids : (B, K) int — per-batch padded recovered tokens.
+        #   num_accepted       : (B,)   int — per-batch number of accepted draft
+        #                                     tokens (in [0, num_draft_tokens[i]]).
+        # ------------------------------------------------------------------
         selected_token_ids, num_accepted = self.compiled_rejection_sample(
             reshaped_draft_token_ids,
             reshaped_target_probs,
@@ -288,22 +305,31 @@ class RBLNRejectionSampler(RejectionSampler):
             sampling_metadata.top_p,
         )
 
+        # ------------------------------------------------------------------
+        # 3) Compose per-position output for the first K columns:
+        #      j < num_accepted[i]          -> draft token (accepted as-is)
+        #      j == num_accepted[i] (active) -> NPU-recovered token from target
+        #      j > num_accepted[i]          -> PLACEHOLDER (left untouched)
+        # ------------------------------------------------------------------
         num_accepted_per_batch = num_accepted.reshape(batch_size).to(torch.int64)
         positions = torch.arange(
             max_spec_len, device=output_token_ids.device
         ).unsqueeze(0)  # (1, K)
-        pos_mask = positions < num_accepted_per_batch.unsqueeze(1)  # (B, K)
 
+        # 3a) Accepted positions: write the draft token unchanged.
+        accepted_pos_mask = positions < num_accepted_per_batch.unsqueeze(1)  # (B, K)
         output_token_ids[:, :max_spec_len] = torch.where(
-            pos_mask,
+            accepted_pos_mask,
             reshaped_draft_token_ids.reshape(batch_size, max_spec_len).to(torch.int64),
             output_token_ids[:, :max_spec_len],
         )
 
+        # 3b) First-reject position (only for active rows): write recovered token.
+        # Inactive rows have num_accepted=0 which would otherwise hit col 0, but
+        # col 0 belongs to the bonus token for those rows (handled in 4c).
         recovered_pos_mask = (
             positions == num_accepted_per_batch.unsqueeze(1)
-        ) & active_mask.unsqueeze(1)
-
+        ) & active_mask.unsqueeze(1)  # (B, K)
         output_token_ids[:, :max_spec_len] = torch.where(
             recovered_pos_mask,
             selected_token_ids.to(torch.int64),
@@ -311,14 +337,15 @@ class RBLNRejectionSampler(RejectionSampler):
         )
 
         # ------------------------------------------------------------------
-        # 4) Scatter back into batch-space `output_token_ids`.
+        # 4) Scatter the bonus token into `output_token_ids`.
         # ------------------------------------------------------------------
-        # `active_mask` is in batch space: True for rows with any draft.
-        all_accepted_active = num_accepted == max_spec_len
         bonus = bonus_token_ids.squeeze(-1).to(torch.int64)
+
+        # 4a) Fully-accepted active rows: emit the bonus token at the last col.
+        all_accepted_active = num_accepted == max_spec_len
         output_token_ids[all_accepted_active, -1] = bonus[all_accepted_active]
 
-        # # 4c) Inactive rows (no drafts): only the bonus token at col 0.
+        # 4b) Inactive rows (no drafts): only the bonus token at col 0.
         output_token_ids[~active_mask, 0] = bonus[~active_mask]
         return output_token_ids
 
