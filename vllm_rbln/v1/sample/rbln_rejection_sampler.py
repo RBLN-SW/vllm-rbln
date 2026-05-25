@@ -379,11 +379,10 @@ class RBLNRejectionSampler(RejectionSampler):
         )
 
         # 3b) First-reject position: write the NPU-recovered token.
-        # ~all_accepted_active makes the "all-accept -> no recovery" invariant explicit.
         recovered_pos_mask = (
             (positions == num_accepted_per_batch.unsqueeze(1))
-            & active_mask.unsqueeze(1)
-            & ~all_accepted_active.unsqueeze(1)
+            & active_mask.unsqueeze(1)  # To skip inactive row (num_draft_tokens == 0)
+            & ~all_accepted_active.unsqueeze(1)  # all-accept -> no recovery
         )  # (B, K)
         output_token_ids[:, :max_spec_len] = torch.where(
             recovered_pos_mask,
