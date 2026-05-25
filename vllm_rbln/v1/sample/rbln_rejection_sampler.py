@@ -18,59 +18,101 @@
 from dataclasses import replace
 
 import torch
-from vllm.sampling_params import _SAMPLING_EPS
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
 from vllm_rbln.logger import init_logger
+from vllm_rbln.v1.sample.rbln_sampler import random_sample
 
 logger = init_logger(__name__)
 
 PLACEHOLDER_TOKEN_ID = -1
 GREEDY_TEMPERATURE = 0
+GREEDY_EPS = 1e-3
 # Maximum number of speculative draft tokens allowed per request in a single
 # step. Bounded to [1, 32] by the rbln::rejection_sample NPU primitive.
 MAX_SPEC_LEN = 32
 
 
-# @torch.library.custom_op("rbln::rejection_sample", mutates_args=())
-# def rejection_sample(
-#     draft_token_ids: torch.Tensor,
-#     target_probs: torch.Tensor,
-#     cu_num_draft_tokens: torch.Tensor,
-#     top_k: torch.Tensor | None,
-#     top_p: torch.Tensor | None,
-# ) -> tuple[torch.Tensor, torch.Tensor]:
-#     num_requests = cu_num_draft_tokens.shape[0]
-#     max_spec_len = draft_token_ids.shape[0] // num_requests
-#     # max_spec_len = draft_token_ids.shape[1]
+@torch.library.custom_op("rbln::rejection_sample", mutates_args=())
+def rejection_sample(
+    draft_token_ids: torch.Tensor,
+    target_probs: torch.Tensor,
+    cu_num_draft_tokens: torch.Tensor,
+    top_k: torch.Tensor | None,
+    top_p: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reference CPU implementation of the rbln::rejection_sample NPU primitive.
 
-#     output_tokens = torch.zeros((num_requests, max_spec_len), dtype=torch.int32)
-#     num_accepted = torch.ones(num_requests, dtype=torch.int32)
-#     num_accepted[0] = 0
-#     output_tokens.fill_(7)
-#     return output_tokens, num_accepted
+    Inputs (packed-then-padded layout):
+      draft_token_ids     : (B*K,)   int32
+      target_probs        : (B*K, V) f16 / f32  (one-hot for greedy, scaled
+                                                 logits otherwise)
+      cu_num_draft_tokens : (B,)     int  — cumulative end offsets, cu[-1] = N
+      top_k               : (B,)     int  | None
+      top_p               : (B,)     f32  | None
+
+    Outputs (per-batch padded layout):
+      out_tokens   : (B, K) int32  — recovered token at the first-reject slot.
+                                     Other positions are filler; the caller
+                                     masks them by num_accepted.
+      num_accepted : (B,)   int32  — count of consecutive accepts before the
+                                     first reject (== n_i when all accepted).
+
+    Per-row sampling delegates to `apply_top_k_top_p`. Per-batch top_k / top_p
+    is expanded to per-row via repeat_interleave so the existing
+    apply_top_k_top_p (which expects (N,) k/p) can be reused without changes.
+    """
+    B = cu_num_draft_tokens.shape[0]
+    K = draft_token_ids.shape[0] // B
+    device = draft_token_ids.device
+
+    # Expand per-batch top_k / top_p to per-row (B*K,).
+    k_row = top_k.repeat_interleave(K) if top_k is not None else None
+    p_row = top_p.repeat_interleave(K) if top_p is not None else None
+
+    target_probs = apply_top_k_top_p(
+        target_probs.to(torch.float32), k_row, p_row
+    )  # (B*K, V)
+    sampled = random_sample(target_probs, {})  # (B*K, )
+    sampled = sampled.view(B, K).to(torch.int32)
+    drafts = draft_token_ids.view(B, K).to(torch.int32)
+
+    out_tokens = torch.zeros((B, K), dtype=torch.int32, device=device)
+    num_accepted = torch.zeros((B,), dtype=torch.int32, device=device)
+
+    cu = cu_num_draft_tokens.to(torch.int64).tolist()
+    for i in range(B):
+        start = 0 if i == 0 else cu[i - 1]
+        n_i = cu[i] - start
+        for j in range(n_i):
+            if sampled[i, j].item() == drafts[i, j].item():
+                num_accepted[i] += 1
+            else:
+                out_tokens[i, j] = sampled[i, j]
+                break
+
+    return out_tokens, num_accepted
 
 
-# @rejection_sample.register_fake
-# def rejection_sample_fake(
-#     draft_token_ids: torch.Tensor,
-#     target_probs: torch.Tensor,
-#     cu_num_draft_tokens: torch.Tensor,
-#     top_k: torch.Tensor | None,
-#     top_p: torch.Tensor | None,
-# ) -> tuple[torch.Tensor, torch.Tensor]:
-#     num_requests = cu_num_draft_tokens.shape[0]
-#     max_spec_len = draft_token_ids.shape[0] // num_requests
-#     # max_spec_len = draft_token_ids.shape[1]
-
-#     output_tokens = torch.zeros((num_requests, max_spec_len), dtype=torch.int32)
-#     num_accepted = torch.ones(num_requests, dtype=torch.int32)
-#     num_accepted[0] = 0
-#     output_tokens.fill_(7)
-#     return output_tokens, num_accepted
+@rejection_sample.register_fake
+def rejection_sample_fake(
+    draft_token_ids: torch.Tensor,
+    target_probs: torch.Tensor,
+    cu_num_draft_tokens: torch.Tensor,
+    top_k: torch.Tensor | None,
+    top_p: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """FakeTensor body — only output shape/dtype matters for torch.compile."""
+    B = cu_num_draft_tokens.shape[0]
+    K = draft_token_ids.shape[0] // B
+    device = draft_token_ids.device
+    out_tokens = torch.empty((B, K), dtype=torch.int32, device=device)
+    num_accepted = torch.empty((B,), dtype=torch.int32, device=device)
+    return out_tokens, num_accepted
 
 
 def rbln_random_sample(
@@ -93,7 +135,6 @@ def rbln_random_sample(
 # TODO(RBLN): Enable RBLNSampler for
 # - apply_bad_words_with_drafts
 # - apply_all_penalties
-# - apply_top_k_top_p
 class RBLNRejectionSampler(RejectionSampler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -262,33 +303,45 @@ class RBLNRejectionSampler(RejectionSampler):
 
         # ------------------------------------------------------------------
         # 1) Build NPU primitive inputs (packed-then-padded layout).
-        # The NPU primitive expects draft (B*K,) int32 and target (B*K, V) fp16,
-        # where for batch i the valid entries occupy positions
-        # [i*K, i*K + num_draft_tokens[i]); the remaining tail per batch is
-        # padding (zeros) and is gated by cu_num_draft_tokens inside the kernel.
+        # NPU expects the first N = sum(num_draft_tokens) rows to be the
+        # concat of valid drafts/probs across batches and the remaining
+        # B*K - N rows to be tail padding (zeros). `draft_token_ids` and
+        # `target_probs` come in already concatenated, so we just copy into
+        # the front of the B*K buffer.
         # ------------------------------------------------------------------
+        N = num_tokens  # = sum(num_draft_tokens)
         reshaped_draft_token_ids = torch.zeros(
             batch_size * max_spec_len, dtype=torch.int32
         )
         reshaped_target_probs = torch.zeros(
             batch_size * max_spec_len, vocab_size, dtype=torch.float16
         )
+        reshaped_draft_token_ids[:N] = draft_token_ids.to(torch.int32)
+        # FIXME float16
+        reshaped_target_probs[:N] = target_probs.to(torch.float16)
+
+        # Per-batch padded view of drafts for the scatter in section 3a. NPU's
+        # input is packed-then-padded, but `output_token_ids` is per-batch
+        # padded, so we materialize a (B, K) view that aligns row-by-row with
+        # `selected_token_ids` and `output_token_ids`.
+        draft_per_batch = torch.full(
+            (batch_size, max_spec_len),
+            PLACEHOLDER_TOKEN_ID,
+            dtype=torch.int64,
+            device=output_token_ids.device,
+        )
         src_offset = 0
         for i, n in enumerate(num_draft_tokens):
             if n == 0:
                 continue
-            dst_offset = i * max_spec_len
-            reshaped_draft_token_ids[dst_offset : dst_offset + n] = draft_token_ids[
-                src_offset : src_offset + n
-            ].to(torch.int32)
-            reshaped_target_probs[dst_offset : dst_offset + n] = target_probs[
-                src_offset : src_offset + n
-            ].to(torch.float16)
+            draft_per_batch[i, :n] = draft_token_ids[src_offset : src_offset + n].to(
+                torch.int64
+            )
             src_offset += n
 
-        # NPU primitive expects cu_num_draft_tokens in int32; vLLM hands it over
-        # as int64 (inherited from num_draft_tokens cumsum), so cast explicitly.
-        cu_num_draft_tokens_i32 = cu_num_draft_tokens.to(torch.int32).contiguous()
+        # NPU primitive expects cu_num_draft_tokens in int32; vLLM hands it
+        # over as int64 (inherited from num_draft_tokens cumsum).
+        cu_num_draft_tokens_i32 = cu_num_draft_tokens.to(torch.int32)
 
         # ------------------------------------------------------------------
         # 2) Call the NPU primitive.
@@ -315,21 +368,23 @@ class RBLNRejectionSampler(RejectionSampler):
         positions = torch.arange(
             max_spec_len, device=output_token_ids.device
         ).unsqueeze(0)  # (1, K)
+        all_accepted_active = (num_accepted_per_batch == max_spec_len) & active_mask
 
         # 3a) Accepted positions: write the draft token unchanged.
         accepted_pos_mask = positions < num_accepted_per_batch.unsqueeze(1)  # (B, K)
         output_token_ids[:, :max_spec_len] = torch.where(
             accepted_pos_mask,
-            reshaped_draft_token_ids.reshape(batch_size, max_spec_len).to(torch.int64),
+            draft_per_batch,
             output_token_ids[:, :max_spec_len],
         )
 
-        # 3b) First-reject position (only for active rows): write recovered token.
-        # Inactive rows have num_accepted=0 which would otherwise hit col 0, but
-        # col 0 belongs to the bonus token for those rows (handled in 4c).
+        # 3b) First-reject position: write the NPU-recovered token.
+        # ~all_accepted_active makes the "all-accept -> no recovery" invariant explicit.
         recovered_pos_mask = (
-            positions == num_accepted_per_batch.unsqueeze(1)
-        ) & active_mask.unsqueeze(1)  # (B, K)
+            (positions == num_accepted_per_batch.unsqueeze(1))
+            & active_mask.unsqueeze(1)
+            & ~all_accepted_active.unsqueeze(1)
+        )  # (B, K)
         output_token_ids[:, :max_spec_len] = torch.where(
             recovered_pos_mask,
             selected_token_ids.to(torch.int64),
@@ -339,10 +394,10 @@ class RBLNRejectionSampler(RejectionSampler):
         # ------------------------------------------------------------------
         # 4) Scatter the bonus token into `output_token_ids`.
         # ------------------------------------------------------------------
+        # [batch_size, 1] -> [batch_size]
         bonus = bonus_token_ids.squeeze(-1).to(torch.int64)
 
         # 4a) Fully-accepted active rows: emit the bonus token at the last col.
-        all_accepted_active = num_accepted == max_spec_len
         output_token_ids[all_accepted_active, -1] = bonus[all_accepted_active]
 
         # 4b) Inactive rows (no drafts): only the bonus token at col 0.
@@ -393,7 +448,7 @@ def apply_sampling_constraints(
         cu_num_draft_tokens,
         num_tokens,
         replace_from=GREEDY_TEMPERATURE,
-        replace_to=_SAMPLING_EPS,
+        replace_to=GREEDY_EPS,
     )
     # NOTE(woosuk): Update `logits` in place to avoid allocating a new tensor.
     logits.div_(temperature.unsqueeze(-1))
@@ -407,7 +462,7 @@ def expand_batch_to_tokens(
     cu_num_tokens: torch.Tensor,  # [batch_size]
     num_tokens: int,
     replace_from: int = 0,
-    replace_to: int = 0,
+    replace_to: int | float = 0,
 ) -> torch.Tensor:
     """Expand [batch_size] tensor to [num_tokens] tensor based on the number of
     tokens per batch in cu_num_tokens.
@@ -443,7 +498,7 @@ def torch_expand_kernel(
     cu_num_tokens: torch.Tensor,
     num_tokens: int,
     replace_from: int = 0,
-    replace_to: int = 0,
+    replace_to: int | float = 0,
 ) -> torch.Tensor:
     prev = torch.zeros_like(cu_num_tokens)
     prev[1:] = cu_num_tokens[:-1]
@@ -466,8 +521,3 @@ def torch_expand_kernel(
             expanded_x = torch.cat([expanded_x, pad], dim=0)
 
     return expanded_x
-
-
-def select_valid_request_sampling_metadata(base_tensor, num_draft_tokens):
-    mask = torch.tensor([ids > 0 for ids in num_draft_tokens])
-    return base_tensor[mask]
