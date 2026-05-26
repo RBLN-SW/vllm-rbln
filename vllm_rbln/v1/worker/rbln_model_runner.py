@@ -1298,6 +1298,16 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.seq_lens.np[num_reqs:].fill(0)
         self.seq_lens.copy_to_gpu()
 
+        num_tokens_np = np.array(
+            [self.requests[r].num_tokens for r in self.input_batch.req_ids],
+            dtype=np.int32,
+        )
+        self.discard_request_mask.np[:num_reqs] = (
+            self.seq_lens.np[:num_reqs] < num_tokens_np
+        )
+        self.discard_request_mask.np[num_reqs:].fill(False)
+        self.discard_request_mask.copy_to_gpu(num_reqs)
+
         # Copy the tensors to the GPU.
         # TODO(jiwoo.park) Currently, this code is meaningless.(overhead)
         # The input_ids may be padded by chunk size and max batch size.
