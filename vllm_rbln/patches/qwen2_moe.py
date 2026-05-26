@@ -12,14 +12,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from vllm_rbln.models.qwen2_moe import patched_qwen2_moe_forward
+import torch
+from vllm.model_executor.models.qwen2_moe import Qwen2MoeSparseMoeBlock
+
 from vllm_rbln.patches import register_patch
 
-register_patch(
+
+@register_patch(
     target="vllm.model_executor.models.qwen2_moe.Qwen2MoeSparseMoeBlock.forward",
     reason=(
         "To remove the unnecessary reshape and use the RBLN FusedMoE router-callable "
         "interface. (PR#367)"
     ),
-    owner_module=__name__,
-)(patched_qwen2_moe_forward)
+)
+def patched_qwen2_moe_forward(
+    self: Qwen2MoeSparseMoeBlock, hidden_states: torch.Tensor
+) -> torch.Tensor:
+    def router(h: torch.Tensor) -> torch.Tensor:
+        return self.gate(h)[0]
+
+    final_hidden_states = self.experts(hidden_states=hidden_states, router=router)
+    if self.shared_expert:
+        final_hidden_states = final_hidden_states[0] + final_hidden_states[1]
+
+    if self.tp_size > 1:
+        final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(
+            final_hidden_states
+        )
+
+    return final_hidden_states

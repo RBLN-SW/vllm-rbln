@@ -12,10 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from vllm_rbln.models.qwen3_moe import patched_qwen3_moe_forward
+import torch
+from vllm.distributed import tensor_model_parallel_all_reduce
+from vllm.model_executor.models.qwen3_moe import Qwen3MoeSparseMoeBlock
+
 from vllm_rbln.patches import register_patch
 
-register_patch(
+
+@register_patch(
     target="vllm.model_executor.models.qwen3_moe.Qwen3MoeSparseMoeBlock.forward",
     reason=(
         "Replace Qwen3MoeSparseMoeBlock.forward with an RBLN-friendly form. "
@@ -23,5 +27,21 @@ register_patch(
         "(2) Call `tensor_model_parallel_all_reduce` directly instead of "
         "`self.experts.maybe_all_reduce_tensor_model_parallel`."
     ),
-    owner_module=__name__,
-)(patched_qwen3_moe_forward)
+)
+def patched_qwen3_moe_forward(
+    self: Qwen3MoeSparseMoeBlock, hidden_states: torch.Tensor
+) -> torch.Tensor:
+    assert hidden_states.dim() == 3  # [B, L, H]
+
+    def router(h: torch.Tensor) -> torch.Tensor:
+        return self.gate(h)[0]
+
+    shared_out, fused_out = self.experts(hidden_states=hidden_states, router=router)
+    final_hidden_states = (
+        shared_out + fused_out if shared_out is not None else fused_out
+    )
+
+    if self.tp_size > 1:
+        final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+
+    return final_hidden_states
