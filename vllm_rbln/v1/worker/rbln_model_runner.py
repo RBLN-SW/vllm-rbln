@@ -2174,7 +2174,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # to reduce the warmup length to a reasonable value for now.
         # This is mainly because we still have to run the computation over
         # the padded tokens in speculative decoding scenario as well.
-        decode_max_seq_len = self.max_model_len // 2
+        # DEBUG (int16 overflow verification, dummy-run only): cap the
+        # warmup seq_len so seq_idx fits in int16 (attention kernel call
+        # site casts attn_metadata.seq_lens to int16 — values > 32767
+        # wrap into negatives). Remove once the proper kernel-side fix
+        # lands.
+        decode_max_seq_len = min(self.max_model_len // 2, 16384)
 
         # compile decode graph considering decode batch buckets
         for batch_bucket_size in self.bucketing_manager.decode_batch_buckets:
@@ -2250,6 +2255,13 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # (any integer in 1..max_decode_batch). Unlike model_wrapper's query
         # length, sampler shape has no cross-DP padding tie-in, so warm up
         # every integer batch size to avoid hot-path sampler recompiles.
+        # When spec decoding is active, the sampler query window matches
+        # the decode model's: num_spec_tokens + 1. Mirror the decode warmup
+        # pattern (override num_scheduled + pass scheduled_spec_decode_tokens)
+        # so the sampler graph is compiled for the full-spec shape.
+        sampler_query_len = (
+            self.num_spec_tokens + 1 if self.num_spec_tokens > 0 else 1
+        )
         dummy_decode_requests = []
         dummy_decode_num_scheduled_tokens = {}
         for decode_batch in range(1, max_decode_batch + 1):
@@ -2267,10 +2279,21 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 else None,
             )
             assert decode_batch == len(dummy_decode_requests)
+            for req_id in dummy_decode_num_scheduled_tokens:
+                dummy_decode_num_scheduled_tokens[req_id] = sampler_query_len
+            spec_tokens = (
+                {
+                    req.req_id: [0] * (sampler_query_len - 1)
+                    for req in dummy_decode_requests
+                }
+                if sampler_query_len > 1
+                else {}
+            )
             so, cso = self._make_dummy_scheduler_outputs(
                 dummy_decode_requests,
                 dummy_decode_num_scheduled_tokens,
                 num_kv_cache_groups,
+                scheduled_spec_decode_tokens=spec_tokens,
             )
             batch_bucket_size = self.bucketing_manager.find_decode_batch_bucket(
                 decode_batch
