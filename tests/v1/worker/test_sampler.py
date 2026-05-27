@@ -197,8 +197,8 @@ def test_forward_sampler_mode_and_structured_output(
 @pytest.mark.parametrize(
     "warm_up",
     [
-        pytest.param(True, marks=pytest.mark.warm_up, id="warm_upTrue"),
-        pytest.param(False, id="warm_upFalse"),
+        pytest.param(True, marks=pytest.mark.warm_up, id="warm_up_true"),
+        pytest.param(False, id="warm_up_false"),
     ],
 )
 def test_forward_sampling_parameters(
