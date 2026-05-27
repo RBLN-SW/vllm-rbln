@@ -43,6 +43,11 @@ from vllm_rbln.utils.optimum.registry import (
 
 logger = init_logger(__name__)
 
+# Default max_num_seqs on RBLN when the user does not set it explicitly.
+# Upstream vLLM resolves an unset max_num_seqs to a context-dependent value
+# (256 for RBLN, see EngineArgs.get_batch_defaults); we default to 1 instead.
+RBLN_DEFAULT_MAX_NUM_SEQS = 1
+
 
 def bypass_backend(graph_module: torch.fx.GraphModule, example_inputs):
     return graph_module.forward
@@ -102,9 +107,44 @@ class RblnPlatform(Platform):
         return "vllm_rbln.distributed.rbln_communicator.RblnCommunicator"  # noqa
 
     @classmethod
+    def _override_default_max_num_seqs(cls) -> None:
+        """Make an unset max_num_seqs default to RBLN_DEFAULT_MAX_NUM_SEQS.
+
+        vLLM resolves an unset (None) max_num_seqs to a context-dependent
+        default (256 for RBLN) inside EngineArgs.get_batch_defaults(). We wrap
+        that method so the default becomes RBLN_DEFAULT_MAX_NUM_SEQS for both
+        the `vllm serve` (OPENAI_API_SERVER) and `LLM(...)` (LLM_CLASS) entry
+        points. Values the user sets explicitly are not None, so they bypass
+        this default and are left untouched.
+        """
+        from vllm.engine.arg_utils import EngineArgs
+
+        if getattr(EngineArgs, "_rbln_max_num_seqs_patched", False):
+            return
+
+        orig_get_batch_defaults = EngineArgs.get_batch_defaults.__func__
+
+        def get_batch_defaults(cls_, world_size):
+            from vllm.usage.usage_lib import UsageContext
+
+            default_batched_tokens, _ = orig_get_batch_defaults(cls_, world_size)
+            default_max_num_seqs = {
+                UsageContext.LLM_CLASS: RBLN_DEFAULT_MAX_NUM_SEQS,
+                UsageContext.OPENAI_API_SERVER: RBLN_DEFAULT_MAX_NUM_SEQS,
+            }
+            return default_batched_tokens, default_max_num_seqs
+
+        EngineArgs.get_batch_defaults = classmethod(get_batch_defaults)
+        EngineArgs._rbln_max_num_seqs_patched = True
+
+    @classmethod
     def pre_register_and_update(
         cls, parser: "FlexibleArgumentParser | None" = None
     ) -> None:
+        # Called before max_num_seqs is resolved from None to its default in
+        # EngineArgs.create_engine_config(), for every entry point.
+        cls._override_default_max_num_seqs()
+
         if parser is None:
             return
 
