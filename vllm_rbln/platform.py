@@ -43,9 +43,7 @@ from vllm_rbln.utils.optimum.registry import (
 
 logger = init_logger(__name__)
 
-# Default max_num_seqs on RBLN when the user does not set it explicitly.
-# Upstream vLLM resolves an unset max_num_seqs to a context-dependent value
-# (256 for RBLN, see EngineArgs.get_batch_defaults); we default to 1 instead.
+# RBLN default for an unset max_num_seqs (upstream vLLM defaults to 256).
 RBLN_DEFAULT_MAX_NUM_SEQS = 1
 
 
@@ -108,14 +106,10 @@ class RblnPlatform(Platform):
 
     @classmethod
     def _override_default_max_num_seqs(cls) -> None:
-        """Make an unset max_num_seqs default to RBLN_DEFAULT_MAX_NUM_SEQS.
+        """Default an unset max_num_seqs to RBLN_DEFAULT_MAX_NUM_SEQS.
 
-        vLLM resolves an unset (None) max_num_seqs to a context-dependent
-        default (256 for RBLN) inside EngineArgs.get_batch_defaults(). We wrap
-        that method so the default becomes RBLN_DEFAULT_MAX_NUM_SEQS for both
-        the `vllm serve` (OPENAI_API_SERVER) and `LLM(...)` (LLM_CLASS) entry
-        points. Values the user sets explicitly are not None, so they bypass
-        this default and are left untouched.
+        Wraps EngineArgs.get_batch_defaults() so RBLN's default applies to both
+        `vllm serve` and `LLM(...)`. Explicit values are not None and untouched.
         """
         from vllm.engine.arg_utils import EngineArgs
 
@@ -141,8 +135,7 @@ class RblnPlatform(Platform):
     def pre_register_and_update(
         cls, parser: "FlexibleArgumentParser | None" = None
     ) -> None:
-        # Called before max_num_seqs is resolved from None to its default in
-        # EngineArgs.create_engine_config(), for every entry point.
+        # Runs before max_num_seqs is resolved from None to its default.
         cls._override_default_max_num_seqs()
 
         if parser is None:
