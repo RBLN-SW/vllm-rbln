@@ -58,6 +58,11 @@ class RblnNixlConnector(NixlConnector):
         KVConnectorBase_V1.__init__(self, vllm_config, role, kv_cache_config)
         assert vllm_config.kv_transfer_config is not None
         assert vllm_config.kv_transfer_config.engine_id is not None
+        assert vllm_config.kv_transfer_config.kv_buffer_device != "rbln", (
+            "RblnNixlConnector is host-bounce only (kv_buffer_device='cpu'). "
+            "For device-to-device (kv_buffer_device='rbln') use "
+            "RblnNixlDirectConnector."
+        )
         self.kv_cache_config = kv_cache_config
         self.engine_id: EngineId = vllm_config.kv_transfer_config.engine_id
         self.kv_transfer_config = vllm_config.kv_transfer_config
@@ -238,13 +243,11 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
     def __init__(
         self, vllm_config: VllmConfig, engine_id: str, kv_cache_config: "KVCacheConfig"
     ) -> None:
-        assert (
-            vllm_config.kv_transfer_config.kv_buffer_device != "rbln"
-        ), (
-            "RblnNixlConnector is host-bounce only (kv_buffer_device='cpu'). "
-            "For device-to-device (kv_buffer_device='rbln') use "
-            "RblnNixlDirectConnector."
-        )
+        # NOTE: the kv_buffer_device guard now lives on the *connector*
+        # __init__ (RblnNixlConnector rejects "rbln", RblnNixlDirectConnector
+        # requires it). Keeping it off the worker lets
+        # RblnNixlDirectConnectorWorker subclass this worker without
+        # inheriting an assert that would reject its own ("rbln") buffer.
         super().__init__(vllm_config, engine_id, kv_cache_config)
 
         self.use_host_buffer = self.kv_buffer_device == "cpu"

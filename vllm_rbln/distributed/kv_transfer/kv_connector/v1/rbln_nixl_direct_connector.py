@@ -50,17 +50,22 @@ What this connector deliberately does NOT do, compared to
   NIXL talks to the NPU buffer directly.
 """
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import torch
 from vllm.config import VllmConfig
+from vllm.distributed.kv_transfer.kv_connector.v1 import (
+    nixl_connector as _up,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     CopyBlocksOp,
+    KVConnectorBase_V1,
     KVConnectorRole,
 )
 
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl_connector import (
     RblnNixlConnector,
+    RblnNixlConnectorScheduler,
     RblnNixlConnectorWorker,
 )
 from vllm_rbln.logger import init_logger
@@ -82,12 +87,42 @@ class RblnNixlDirectConnector(RblnNixlConnector):
         role: KVConnectorRole,
         kv_cache_config: "KVCacheConfig",
     ) -> None:
-        super().__init__(vllm_config, role, kv_cache_config)
-        if role == KVConnectorRole.WORKER:
-            # Replace the host-bounce worker with the direct one.
-            self.connector_worker = RblnNixlDirectConnectorWorker(
-                vllm_config, self.engine_id, kv_cache_config,
+        # Do NOT call RblnNixlConnector.__init__: it asserts
+        # kv_buffer_device != "rbln". The direct path *requires* "rbln",
+        # so we replicate the small base body here, swapping in the
+        # direct worker and the opposite assert. Scheduler-side behavior
+        # is identical to the host-bounce connector, so the scheduler
+        # class is reused as-is.
+        KVConnectorBase_V1.__init__(self, vllm_config, role, kv_cache_config)
+        assert vllm_config.kv_transfer_config is not None
+        assert vllm_config.kv_transfer_config.engine_id is not None
+        assert vllm_config.kv_transfer_config.kv_buffer_device == "rbln", (
+            "RblnNixlDirectConnector is device-to-device only "
+            "(kv_buffer_device='rbln'). For the host-bounce path "
+            "(kv_buffer_device='cpu') use RblnNixlConnector."
+        )
+        self.kv_cache_config = kv_cache_config
+        self.engine_id = vllm_config.kv_transfer_config.engine_id
+        self.kv_transfer_config = vllm_config.kv_transfer_config
+        if role == KVConnectorRole.SCHEDULER:
+            self.connector_scheduler = RblnNixlConnectorScheduler(
+                vllm_config, self.engine_id, kv_cache_config
             )
+            self.connector_worker = None
+        elif role == KVConnectorRole.WORKER:
+            self.connector_scheduler = None
+            self.connector_worker = RblnNixlDirectConnectorWorker(
+                vllm_config, self.engine_id, kv_cache_config
+            )
+
+    def finalize_kv_cache_registration(self) -> None:
+        """Run the worker's deferred NIXL registration. Invoked by
+        RBLNWorker.compile_or_warm_up_model after warm-up has allocated
+        the KV cache physical views (see
+        RblnNixlDirectConnectorWorker.register_kv_caches for why this is
+        deferred). No-op on the scheduler side."""
+        if self.connector_worker is not None:
+            self.connector_worker.finalize_kv_cache_registration()
 
 
 class RblnNixlDirectConnectorWorker(RblnNixlConnectorWorker):
@@ -100,6 +135,9 @@ class RblnNixlDirectConnectorWorker(RblnNixlConnectorWorker):
         engine_id: str,
         kv_cache_config: "KVCacheConfig",
     ) -> None:
+        assert vllm_config.kv_transfer_config.kv_buffer_device == "rbln", (
+            "RblnNixlDirectConnectorWorker requires kv_buffer_device='rbln'."
+        )
         super().__init__(vllm_config, engine_id, kv_cache_config)
         # Late import — if nixl-rbln isn't installed we want the
         # failure surface to be obviously a missing dependency, not a
@@ -114,6 +152,16 @@ class RblnNixlDirectConnectorWorker(RblnNixlConnectorWorker):
                 "~/codebase/nixl-rbln  "
                 f"(import failed: {e})"
             ) from e
+
+        # Direct path registers NPU memory, not host DRAM. The platform
+        # reports "DRAM" (host-bounce default) so we override here.
+        self.nixl_memory_type = "VRAM"
+        # Register/transfer over the RBLN backend. super().__init__ has
+        # already built the NixlWrapper with the *previous* backend list
+        # (default ["UCX"]), so RBLN was NOT auto-created with empty
+        # params — register_kv_caches creates it with the right
+        # rbln_ctx_ptr via nixl_rbln.ensure_rbln_backend before use.
+        self.nixl_backends = ["RBLN"]
 
     # ---- host-bounce removal ------------------------------------------
 
@@ -137,94 +185,351 @@ class RblnNixlDirectConnectorWorker(RblnNixlConnectorWorker):
         """No copy ops to wire — see `initialize_host_xfer_buffer`."""
         return
 
-    # ---- the actual direct register path ------------------------------
+    # ---- device-id resolution -----------------------------------------
 
-    def register_kv_caches(
-        self,
-        kv_caches: dict[str, torch.Tensor],
-    ) -> None:
-        """Register every KV cache tensor with NIXL via `nixl_rbln`.
+    def _resolve_ctx_device_id(self, kv_caches: dict[str, torch.Tensor]) -> int:
+        """Find the NPU device id whose global RblnContext is live.
 
-        Called once at worker init time by the base class. Each
-        tensor's `data_ptr()` is the vmem vaddr produced by
-        torch_rbln; `nixl_rbln.register` translates it to the NPU
-        dva, looks up the matching RblnContext, and hands NIXL a
-        dmabuf-backed MR.
-
-        This method intentionally keeps any handles it gets back on
-        `self` so they live as long as the worker does. NIXL holds
-        them via its own rkey table; we just need to keep the Python
-        reference alive to prevent GC.
+        The KV cache tensors are vmem-backed but appear as CPU tensors
+        (device_type="cpu"), so ``tensor.get_device()`` is -1 and useless
+        here. The model compile created a global RblnContext on the
+        worker's physical NPU (the RBLN_DEVICES entry, which
+        rbln_worker._init_device_env does NOT remap to 0). Pick the first
+        candidate whose ``Context.from_key(global_key_at_device(d))`` is
+        non-None.
         """
-        import nixl_rbln  # already imported in __init__, just for the name
+        import os
 
-        agent = self._get_or_create_agent()  # base-class helper
-        device_id = self._get_device_id()    # base-class helper
+        import rebel
 
-        self._direct_regs: list[Any] = []
-        for layer_name, tensor in kv_caches.items():
-            reg = nixl_rbln.register(
-                agent,
-                tensor.data_ptr(),
-                tensor.numel() * tensor.element_size(),
-                device_id=device_id,
-                mem="VRAM",
-            )
-            self._direct_regs.append(reg)
-            logger.debug(
-                "RblnNixlDirectConnector: registered KV cache layer "
-                "%s (vaddr=0x%x size=%dB) directly with NIXL",
-                layer_name,
-                tensor.data_ptr(),
-                tensor.numel() * tensor.element_size(),
-            )
+        _C = rebel._C
 
+        def _ctx_at(d: int):
+            try:
+                return _C.Context.from_key(_C.Context.global_key_at_device(d))
+            except Exception:  # noqa: BLE001
+                return None
+
+        t0 = next(iter(kv_caches.values()))
+        candidates: list[int] = []
+        idx = getattr(t0.device, "index", None)
+        if idx is not None:
+            candidates.append(int(idx))
+        rbln_devices = os.environ.get("RBLN_DEVICES", "")
+        if rbln_devices:
+            try:
+                candidates.append(int(rbln_devices.split(",")[0]))
+            except ValueError:
+                pass
+        candidates.append(0)
+        seen: set[int] = set()
+        candidates = [c for c in candidates if not (c in seen or seen.add(c))]
+
+        chosen = next((c for c in candidates if _ctx_at(c) is not None), None)
         logger.info(
-            "RblnNixlDirectConnector: %d KV cache layer(s) registered "
-            "directly (no host staging)",
-            len(self._direct_regs),
+            "RblnNixlDirectConnector: ctx device_id candidates=%s chosen=%s "
+            "(t.device=%s get_device=%d RBLN_DEVICES=%r)",
+            candidates,
+            chosen,
+            t0.device,
+            t0.get_device(),
+            rbln_devices,
+        )
+        if chosen is None:
+            # Debug safety net: scan so the log shows which device ids
+            # actually own a live context.
+            live = [d for d in range(32) if _ctx_at(d) is not None]
+            logger.warning(
+                "RblnNixlDirectConnector: no candidate had a live "
+                "RblnContext; scan found live contexts at device ids %s",
+                live,
+            )
+            chosen = live[0] if live else None
+        assert chosen is not None, (
+            "RblnNixlDirectConnector: could not find a live RblnContext for "
+            "any NPU device id; cannot create the RBLN NIXL backend."
+        )
+        return chosen
+
+    # ---- deferred registration (post-warmup) --------------------------
+
+    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
+        """Defer the real registration until after model warm-up.
+
+        register_kv_caches is called from initialize_kv_cache, *before*
+        the warm-up forward. At that point the KV cache vmem entries are
+        still EMPTY (torch.empty(device="rbln") allocates lazily) — they
+        have no physical view, so the vaddr->dva translation would fail
+        in ensure_synced_on_device. The physical view is only allocated
+        when the compiled model runs (warm-up), which RBLNWorker drives
+        in compile_or_warm_up_model *after* this call.
+
+        So we stash the caches here and do the actual NIXL registration
+        in finalize_kv_cache_registration(), which RBLNWorker invokes
+        once warm-up has materialized the physical views. The KV cache
+        vmem entries (hence vaddr/dva) are stable for the worker's
+        lifetime, so registering post-warm-up still describes the memory
+        the model reads/writes on every subsequent forward.
+        """
+        self._pending_kv_caches = kv_caches
+        logger.info(
+            "RblnNixlDirectConnector: deferring registration of %d KV "
+            "cache layer(s) until after warm-up (physical views are not "
+            "allocated yet).",
+            len(kv_caches),
         )
 
-    def deregister_kv_caches(self) -> None:
+    def finalize_kv_cache_registration(self) -> None:
+        """Run the deferred NIXL registration. Idempotent; a no-op if
+        registration already ran or there is nothing pending. Called by
+        RBLNWorker after warm_up_model() has allocated the KV cache
+        physical views."""
+        pending = getattr(self, "_pending_kv_caches", None)
+        if pending is None:
+            return
+        self._pending_kv_caches = None
+        self._register_kv_caches_impl(pending)
+
+    # ---- the actual direct register path ------------------------------
+
+    def _register_kv_caches_impl(self, kv_caches: dict[str, torch.Tensor]) -> None:
+        """Direct-vmem variant of NixlConnectorWorker.register_kv_caches.
+
+        This is a faithful copy of the upstream method body (pinned to
+        the installed vllm version), changed only where device-to-device
+        RBLN registration needs it:
+
+        * the RBLN NIXL backend is created with the right RblnContext
+          pointer (via ``nixl_rbln.ensure_rbln_backend``) before any
+          ``register_memory`` call;
+        * the single base-address derivation (``cache.data_ptr()``
+          upstream) is translated from a vmem vaddr to the NPU device
+          address (dva), with per-region byte-offset handling for the
+          K/V-split case.
+
+        Everything downstream — ``seen_base_addresses`` ->
+        ``kv_caches_base_addr``, ``caches_data`` -> ``register_memory``,
+        and the transfer-side descriptor math in ``_read_blocks`` /
+        ``register_local_xfer_handler`` — derives from that one point,
+        so converting it once keeps register + transfer dva-consistent.
+
+        ``nixl_memory_type`` ("VRAM") and ``nixl_backends`` (["RBLN"])
+        are set on the worker in ``__init__``.
+        """
         import nixl_rbln
-        agent = self._get_or_create_agent()
-        for reg in getattr(self, "_direct_regs", []):
-            try:
-                nixl_rbln.deregister(agent, reg)
-            except Exception as e:  # noqa: BLE001
-                logger.warning(
-                    "RblnNixlDirectConnector: deregister failed: %s", e,
-                )
-        self._direct_regs = []
 
-    # ---- placeholders for base-class helpers used above --------------
-    #
-    # `_get_or_create_agent` and `_get_device_id` are not actually
-    # methods on the upstream `NixlConnectorWorker` we inherit from
-    # (the upstream worker owns its agent privately). This connector
-    # is checked in as a *design template* — the integration glue to
-    # actually call it from inside RblnModelRunner is the next ticket,
-    # and that's where these helpers will be wired up. For now, the
-    # import + class structure compiles and the failure path
-    # (no nixl_rbln installed) is exercised at worker init.
+        self.kv_topo = _up.TpKVTopology(
+            tp_rank=self.tp_rank,
+            engine_id=self.engine_id,
+            remote_tp_size=self._tp_size,
+            remote_block_size=self._block_size,
+            is_mla=self.use_mla,
+            total_num_kv_heads=self.model_config.get_total_num_kv_heads(),
+            attn_backends=self.attn_backends,
+            tensor_shape=next(iter(kv_caches.values())).shape
+            if not self._has_mamba
+            else None,
+            is_mamba=self._has_mamba,
+        )
+        self.compat_hash = _up.compute_nixl_compatibility_hash(
+            self.vllm_config, self.backend_name, self.kv_topo.cross_layers_blocks
+        )
 
-    def _get_or_create_agent(self):
-        # upstream NixlConnectorWorker.__init__ creates a `nixl_agent`
-        # and stashes it as `self.nixl_wrapper`. Reuse if present.
-        agent = getattr(self, "nixl_wrapper", None)
-        if agent is None:
-            raise RuntimeError(
-                "RblnNixlDirectConnector: no nixl_agent on the "
-                "worker. Upstream NixlConnectorWorker normally owns "
-                "one; this code path expects the same. If you see "
-                "this in production, the upstream layout has shifted "
-                "and we need to refresh the assumption.",
+        # --- delta: create the RBLN backend on the RblnContext that owns
+        # the KV cache vmem before registering.
+        #
+        # device_id resolution: under device_type="cpu" the vmem-backed
+        # KV cache tensors report get_device()==-1, so we can't rely on
+        # it. The global RblnContext was created by the model compile on
+        # the worker's physical NPU (RBLN_DEVICES, not remapped to 0).
+        # Pick the candidate device id whose global RblnContext actually
+        # resolves.
+        device_id = self._resolve_ctx_device_id(kv_caches)
+        nixl_rbln.ensure_rbln_backend(self.nixl_wrapper, device_id)
+
+        # Direct path never stages through a host buffer.
+        assert not self.use_host_buffer
+        xfer_buffers = kv_caches
+        assert not self.host_xfer_buffers, (
+            "host_xfer_buffer should not be initialized when "
+            f"kv_buffer_device is {self.kv_buffer_device}"
+        )
+
+        logger.info(
+            "Registering KV_Caches (direct vmem). use_mla: %s, "
+            "kv_buffer_device: %s, device_id: %d",
+            self.use_mla,
+            self.kv_buffer_device,
+            device_id,
+        )
+
+        caches_data = []
+        # With hybrid allocator, layers can share a kv cache tensor.
+        seen_base_addresses = []
+        tensor_size_bytes = None
+        self.block_len_per_layer = list[int]()
+        # --- delta: NIXL memory regions to register with the RBLN backend.
+        # The RBLN UMD export (rblnExportMemoryByDvaNoCbForRCCL) only accepts
+        # an *allocation-base* dva; a mid-allocation dva (e.g. the V view of a
+        # K/V-split entry at entry_base + K_size) is rejected with rc=-2. So
+        # we register ONE MR per vmem entry covering the *whole* entry at its
+        # base dva, and rely on NIXL transferring sub-ranges of a registered
+        # region (K and V block addresses both fall inside the entry MR). The
+        # K/V split is still reflected in seen_base_addresses / block_len /
+        # num_regions below, which drive the transfer descriptors.
+        mr_descs: list[tuple[int, int, int, str]] = []
+        mr_seen_bases: set[int] = set()
+        for layer_name, cache_or_caches in xfer_buffers.items():
+            layer_spec = self._layer_specs[layer_name]
+            if isinstance(layer_spec, _up.UniformTypeKVCacheSpecs):
+                layer_spec = layer_spec.kv_cache_specs[layer_name]
+            cache_list = self.kv_topo.get_transfer_cache_regions(
+                cache_or_caches, layer_spec
             )
-        return agent
+            physical_page_size = (
+                layer_spec.page_size_bytes
+                if isinstance(layer_spec, _up.MambaSpec)
+                else layer_spec.page_size_bytes
+                // self._physical_blocks_per_logical_kv_block
+            )
+            # For when registering multiple tensors eg K/V in separate regions.
+            physical_page_size = physical_page_size // len(cache_list)
+            if self.kv_topo._cross_layers_blocks:
+                physical_page_size = physical_page_size * len(
+                    self.kv_cache_config.kv_cache_tensors
+                )
+            num_blocks = (
+                self._logical_num_blocks
+                if isinstance(layer_spec, _up.MambaSpec)
+                else self.num_blocks
+            )
+            curr_tensor_size_bytes = num_blocks * physical_page_size
+            if tensor_size_bytes is None:
+                tensor_size_bytes = curr_tensor_size_bytes
 
-    def _get_device_id(self) -> int:
-        # vllm-rbln currently only supports a single NPU device per
-        # worker. This will need to grow when we support multi-NPU
-        # workers, at which point this connector would have to register
-        # each KV cache to the worker's local NPU.
-        return 0
+            # --- delta: materialize the vmem physical view. Under
+            # VLLM_RBLN_USE_DEVICE_TENSOR the KV cache is created with
+            # torch.empty(device="rbln") (RBLNModelRunner.
+            # _allocate_kv_cache_tensors), which leaves the vmem entry in
+            # the EMPTY sub-state with no physical view until the first
+            # device write. NIXL has to register real NPU memory, and
+            # vaddr_to_dva -> ensure_synced_on_device requires the
+            # physical view to exist. A one-time in-place zero_() forces
+            # the entry to allocate it (EMPTY -> PHYSICAL_VIEW_IS_LATEST)
+            # and zero-inits the cache, which is harmless. The vmem entry
+            # (hence vaddr/dva) is stable for the worker's lifetime, so
+            # the model's later writes land in the same registered memory.
+            cache_or_caches.zero_()
+
+            # --- delta: derive the dva of the vmem ENTRY base once, then
+            # add each region's byte offset. The K/V-split case yields K
+            # and V as views into one vmem entry where
+            # V.data_ptr() == entry_base + K_size; get_device_addrs
+            # expects the entry-base vaddr, so we convert that and add the
+            # (vaddr) offset to the returned dva.
+            entry_base_vaddr = cache_or_caches.data_ptr()
+            entry_base_dva = nixl_rbln.vaddr_to_dva(entry_base_vaddr)
+            # Register one MR covering the whole vmem entry at its base dva
+            # (see mr_descs comment above). Dedup shared/HMA entries.
+            if entry_base_dva not in mr_seen_bases:
+                mr_seen_bases.add(entry_base_dva)
+                entry_nbytes = (
+                    cache_or_caches.numel() * cache_or_caches.element_size()
+                )
+                mr_descs.append(
+                    (entry_base_dva, entry_nbytes,
+                     max(cache_or_caches.get_device(), 0), "")
+                )
+            for cache in cache_list:
+                region_offset = cache.data_ptr() - entry_base_vaddr
+                base_addr = entry_base_dva + region_offset
+                if base_addr in seen_base_addresses:
+                    logger.debug(
+                        "Skipping %s because it's already seen", layer_name
+                    )
+                    continue
+                logger.debug(
+                    "Registering layer %s shape %s: vaddr=0x%x(+0x%x) "
+                    "-> dva=0x%x",
+                    layer_name,
+                    cache.shape,
+                    entry_base_vaddr,
+                    region_offset,
+                    base_addr,
+                )
+                seen_base_addresses.append(base_addr)
+                if isinstance(layer_spec, _up.MambaSpec):
+                    self.block_len_per_layer.append(
+                        physical_page_size
+                        // self._physical_blocks_per_logical_kv_block
+                    )
+                else:
+                    self.block_len_per_layer.append(physical_page_size)
+
+                assert cache.shape[0] == num_blocks, (
+                    "All kv cache tensors must have the same number of blocks"
+                )
+                if not self.use_mla:
+                    assert tensor_size_bytes == curr_tensor_size_bytes, (
+                        "All kv cache tensors must have the same size"
+                    )
+                self.device_id = max(cache.get_device(), 0)
+                caches_data.append(
+                    (base_addr, curr_tensor_size_bytes, self.device_id, "")
+                )
+
+        logger.debug(
+            "Different block lengths collected: %s", set(self.block_len_per_layer)
+        )
+        assert len(self.block_len_per_layer) == len(seen_base_addresses)
+
+        self.kv_caches_base_addr[self.engine_id][self.tp_rank] = seen_base_addresses
+        self.num_regions = len(caches_data)
+
+        if self.kv_topo.is_kv_layout_blocks_first:
+            self.num_regions *= 2
+
+        self.num_descs = self.num_regions * self.num_blocks
+
+        # Register whole-entry MRs (mr_descs), NOT the per-K/V-region
+        # caches_data: the RBLN backend rejects mid-allocation (V offset)
+        # dvas. num_regions / kv_caches_base_addr keep the K/V split so the
+        # transfer descriptors address K and V correctly within these MRs.
+        logger.info(
+            "RblnNixlDirectConnector: registering %d whole-entry MR(s) "
+            "covering %d transfer region(s) (K/V split).",
+            len(mr_descs),
+            self.num_regions,
+        )
+        descs = self.nixl_wrapper.get_reg_descs(mr_descs, self.nixl_memory_type)
+        logger.debug("Registering MR descs: %s", mr_descs)
+        self.nixl_wrapper.register_memory(descs, backends=self.nixl_backends)
+        logger.debug("Done registering descs")
+        self._registered_descs.append(descs)
+
+        self.device_kv_caches = kv_caches
+        self.dst_num_blocks[self.engine_id] = self.num_blocks
+
+        # Register local/src descr for NIXL xfer.
+        self.src_xfer_handles_by_block_size[self.block_size], self.src_blocks_data = (
+            self.register_local_xfer_handler(self.block_size)
+        )
+
+        # After KV Caches registered, listen for new connections.
+        agent_metadata = _up.NixlAgentMetadata(
+            engine_id=self.engine_id,
+            agent_metadata=self.nixl_wrapper.get_agent_metadata(),
+            device_id=self.device_id,
+            kv_caches_base_addr=self.kv_caches_base_addr[self.engine_id][self.tp_rank],
+            num_blocks=self.num_blocks,
+            block_lens=self.block_len_per_layer,
+            kv_cache_layout=self.kv_cache_layout,
+            block_size=self.block_size,
+            ssm_sizes=self._mamba_ssm_size,
+        )
+        assert self.compat_hash is not None
+        encoder = _up.msgspec.msgpack.Encoder()
+        self.xfer_handshake_metadata = _up.NixlHandshakePayload(
+            compatibility_hash=self.compat_hash,
+            agent_metadata_bytes=encoder.encode(agent_metadata),
+        )
