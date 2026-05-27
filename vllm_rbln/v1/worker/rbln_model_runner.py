@@ -89,7 +89,7 @@ from vllm.v1.worker.utils import (
 
 from vllm_rbln import envs
 from vllm_rbln.compilation.backends import rbln_backend
-from vllm_rbln.forward_context import set_forward_context
+from vllm_rbln.forward_context import RBLNDPMetadata, set_forward_context
 from vllm_rbln.logger import init_logger
 from vllm_rbln.utils import pad
 from vllm_rbln.v1.attention.backends.flash_attention import (
@@ -1159,8 +1159,9 @@ class RBLNModelRunner:
                 num_scheduled_tokens_np,
             )
 
-            num_reqs_padded = self._determine_batch_padding(num_reqs)
-            num_tokens_padded, num_tokens_across_dp = None, None
+            num_reqs_padded, num_tokens_padded, num_tokens_across_dp = (
+                self._determine_batch_padding(num_reqs, num_tokens_unpadded)
+            )
 
             use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
 
@@ -1707,9 +1708,6 @@ class RBLNModelRunner:
         num_scheduled_tokens = np.array(num_scheduled_tokens_list, dtype=np.int32)
         num_tokens_unpadded = int(num_scheduled_tokens.sum())
 
-        num_reqs_padded = num_reqs
-        num_tokens_padded, num_tokens_across_dp = None, None
-
         seq_lens_np = self.seq_lens.numpy()
         seq_lens_np[:num_reqs] = num_scheduled_tokens
         seq_lens_np[num_reqs:] = 0
@@ -1721,6 +1719,10 @@ class RBLNModelRunner:
             self.input_batch.num_tokens_no_spec[:num_reqs] = num_scheduled_tokens
         else:
             self.input_batch.num_tokens_no_spec[:num_reqs] = 1
+
+        num_reqs_padded, num_tokens_padded, num_tokens_across_dp = (
+            self._determine_batch_padding(num_reqs, num_tokens_unpadded)
+        )
 
         cum_num_tokens, _ = self._get_cumsum_and_arange(num_scheduled_tokens)
         query_start_loc_np = self.query_start_loc.numpy()
@@ -2337,15 +2339,34 @@ class RBLNModelRunner:
     def _determine_batch_padding(
         self,
         num_reqs_unpadded: int,
-    ) -> int:
+        num_tokens_unpadded: int,
+    ) -> tuple[int, int | None, torch.Tensor | None]:
         num_reqs_padded = (
             self.bucketing_manager.find_decode_batch_bucket(num_reqs_unpadded)
             if not self.is_prefill
             else num_reqs_unpadded
         )
+        if self.parallel_config.data_parallel_size == 1:
+            return num_reqs_padded, None, None
+
+        num_tokens_across_dp, max_decode_tokens = (
+            RBLNDPMetadata.num_tokens_across_dp_with_max_decode_tokens(
+                num_tokens_unpadded,
+                self.parallel_config.data_parallel_size,
+                self.parallel_config.data_parallel_rank,
+                self.is_prefill,
+            )
+        )
+        if max_decode_tokens is None or not self.specialized_moe_decode:
+            num_tokens_padded = self.max_num_tokens
+        else:
+            num_reqs_padded = self.bucketing_manager.find_decode_batch_bucket(
+                max_decode_tokens
+            )
+            num_tokens_padded = num_reqs_padded
 
         # TODO(RBLN): Determine pads across dp
-        return num_reqs_padded
+        return num_reqs_padded, num_tokens_padded, num_tokens_across_dp
 
     def _update_kv_cache_base_bindings(
         self,

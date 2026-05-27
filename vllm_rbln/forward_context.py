@@ -30,6 +30,7 @@ from vllm.forward_context import (
 )
 from vllm.platforms import current_platform
 
+from vllm_rbln import envs
 from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)
@@ -144,16 +145,16 @@ def set_forward_context(
         vfc.forward_start_time = time.perf_counter()
 
     dp_metadata: DPMetadata | None = None
-    # if (vllm_config.parallel_config.data_parallel_size > 1
-    # or envs.VLLM_RBLN_USE_MOE_TOKENS_MASK) and (
-    #     attn_metadata is not None or num_tokens is not None
-    # ):
-    #     dp_metadata = RBLNDPMetadata.make(
-    #         vllm_config.parallel_config,
-    #         num_tokens or 0,
-    #         num_tokens_across_dp,
-    #         num_padded_tokens,
-    #     )
+    if (
+        vllm_config.parallel_config.data_parallel_size > 1
+        or envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
+    ) and (attn_metadata is not None or num_tokens is not None):
+        dp_metadata = RBLNDPMetadata.make(
+            vllm_config.parallel_config,
+            num_tokens or 0,
+            num_tokens_across_dp,
+            num_padded_tokens,
+        )
 
     additional_kwargs = current_platform.set_additional_forward_context(**kwargs)
 

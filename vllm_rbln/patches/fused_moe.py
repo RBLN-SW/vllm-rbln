@@ -148,18 +148,30 @@ elif envs.VLLM_RBLN_MOE_CUSTOM_KERNEL:
 
 
 def multicast(
-    x: torch.Tensor,  # [num_tokens, hidden_size]
+    x: torch.Tensor,
     dp_rank: int,
 ) -> torch.Tensor:
-    num_tokens, _ = x.shape
-    x = x.reshape(1, -1, x.size(-1))
+    """Gather every DP rank's hidden_states into ``[dp_size, max_pad, H]``.
+
+    Args:
+        x: Local hidden_states of any shape with last dim ``H``. ``max_pad``
+            (from ``RBLNDPMetadata``) must be a multiple of the token count.
+        dp_rank: Caller's rank within the DP group.
+
+    Returns:
+        Tensor of shape ``[dp_size, max_pad, H]``, identical on every rank.
+        Padded positions carry duplicate tokens - mask them out before
+        consuming (see ``get_tokens_mask``).
+    """
+    x = x.reshape(1, -1, x.size(-1))  # [1, num_tokens, H]
+    _, num_tokens, _ = x.shape
 
     assert (dp_metadata := get_forward_context().dp_metadata) is not None
     max_pad = dp_metadata.max_pads_across_dp.shape[0]
     num_repeat = max_pad // num_tokens
-
+    # TODO(RBLN): evaluate various padding approaches
     x = x.repeat(num_repeat, 1, 1)
-    x = x.reshape(1, max_pad, -1)
+    x = x.reshape(1, max_pad, -1)  # [1, max_pad, H]
 
     if not envs.VLLM_RBLN_DP_INPUT_ALL_GATHER:
         all_buffer = None
@@ -178,12 +190,42 @@ def multicast(
 
 
 def get_tokens_mask(num_tokens: int, left=1.0, right=0.0) -> torch.Tensor:
+    """Real-vs-padding mask aligned with the DP multicast output layout.
+
+    For every DP rank's slot in the multicast buffer, positions before
+    that rank's actual token count get ``left`` and the reset get ``right``.
+    Multiply this mask into routing weights (default ``(1.0, 0.0)``) or,
+    with ``(0.0, float('-inf'))``, add it to router logits before softmax
+    to suppress padded positions.
+
+    In the DP=1 path no padding exists, so ``num_tokens`` is used as the
+    pad length and the result is all ``left`` (effectively a no-op).
+
+    Example:
+        DP=2, ``max_pad=4``, rank 0 has 3 real tokens, rank 1 has 2.
+        With defaults ``(left=1.0, right=0.0)``::
+
+            rank 0 slot: [1.0, 1.0, 1.0, 0.0]
+            rank 1 slot: [1.0, 1.0, 0.0, 0.0]
+
+        Flattened return: ``[[1.0],[1.0],[1.0],[0.0],[1.0],[1.0],[0.0],[0.0]]``
+        with shape ``[8, 1]``.
+
+    Args:
+        num_tokens: Used as ``max_pad`` only when DP=1 (where the metadata's
+            ``max_pads_across_dp`` is ``None``); ignored otherwise
+        left: Value for real-token positions.
+        right: Value for padded positions.
+
+    Returns:
+        Tensor of shape ``[dp_size * max_pad, 1]``.
+    """
     assert (dp_metadata := get_forward_context().dp_metadata) is not None
-    num_tokens_across_dp = dp_metadata.max_tokens_across_dp_cpu.unsqueeze(1)
+    num_tokens_across_dp = dp_metadata.num_tokens_across_dp_cpu.unsqueeze(1)
 
     max_pad = (
         num_tokens
-        if num_tokens_across_dp.shape[0] == 1
+        if num_tokens_across_dp.shape[0] == 1  # DP=1
         else dp_metadata.max_pads_across_dp.shape[0]
     )
     pos = torch.arange(max_pad, dtype=torch.int32).unsqueeze(0)
@@ -313,8 +355,18 @@ def patched_fused_moe_forward(
     router: Callable[[torch.Tensor], torch.Tensor],
 ) -> torch.Tensor:
     assert self.quant_method is not None
+
     if self.moe_parallel_config.dp_size > 1:
-        raise NotImplementedError
+        org_hidden_shape = hidden_states.shape
+
+        # NOTE(RBLN): DP gather
+        # Each rank holds only its own tokens, but the MoE experts are sharded
+        # across DP ranks. Replicate every rank's hidden_states to every rank
+        # so each can route the full batch through its local expert shard.
+        #   [num_tokens, H] -> [dp_size, max_pad, H]
+        # max_pad is agreed collectively in RBLNDPMetadata and is identical on every
+        # rank, sh shapes match for the all_reduce below.
+        hidden_states = multicast(hidden_states, self.moe_parallel_config.dp_rank)
 
     router_logits = router(hidden_states)
 
@@ -323,5 +375,20 @@ def patched_fused_moe_forward(
         x=hidden_states,
         router_logits=router_logits,
     )
+
+    if self.moe_parallel_config.dp_size > 1:
+        assert not envs.VLLM_RBLN_MOE_REDUCE_SCATTER
+        # NOTE(RBLN): all_reduce + slice; every rank receives the full sum
+        # [dp_size * max_pad, 1, H], then indexes its own range
+        # [dp_rank * max_pad : + num_tokens].
+        all_hidden_states = get_dp_group().all_reduce(final_hidden_states)
+        hidden_shape_dp = (-1, 1, org_hidden_shape[-1])
+        final_hidden_states = all_hidden_states.reshape(hidden_shape_dp)
+
+        max_pad = get_forward_context().dp_metadata.max_pads_across_dp.shape[0]
+        num_tokens = org_hidden_shape[:-1].numel()
+        start = self.moe_parallel_config.dp_rank * max_pad
+        end = start + num_tokens
+        final_hidden_states = final_hidden_states[start:end].reshape(org_hidden_shape)
 
     return final_hidden_states
