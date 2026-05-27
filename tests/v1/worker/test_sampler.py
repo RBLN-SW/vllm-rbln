@@ -29,6 +29,7 @@ from .utils import (
 DEVICE = current_platform.device_type
 
 
+@pytest.mark.bucketing
 @pytest.mark.parametrize(
     "num_seqs, expected_bucket_sizes",
     [
@@ -163,6 +164,7 @@ def test_get_bucket_sizes(monkeypatch, num_seqs: int, expected_bucket_sizes: lis
     assert len(runner.pooled_tensors) == len(expected_bucket_sizes)
 
 
+@pytest.mark.sampler_mode
 @pytest.mark.parametrize("use_rbln_sampler", [False])
 @pytest.mark.parametrize("use_structured_output", [True, False])
 def test_forward_sampler_mode_and_structured_output(
@@ -184,6 +186,7 @@ def test_forward_sampler_mode_and_structured_output(
     forward_steps(reqs)
 
 
+@pytest.mark.param_sweep
 @pytest.mark.parametrize("top_p", [0.7, 1.0])
 @pytest.mark.parametrize("top_k", [0, 3])
 @pytest.mark.parametrize("temperature", [0.0, 1.0])
@@ -191,7 +194,13 @@ def test_forward_sampler_mode_and_structured_output(
 @pytest.mark.parametrize("presence_penalty", [0.0, 2.0])
 @pytest.mark.parametrize("frequency_penalty", [0.0, 2.0])
 @pytest.mark.parametrize("repetition_penalty", [1.0, 2.0])
-@pytest.mark.parametrize("warm_up", [True, False], ids=["warm_upTrue", "warm_upFalse"])
+@pytest.mark.parametrize(
+    "warm_up",
+    [
+        pytest.param(True, marks=pytest.mark.warm_up, id="warm_upTrue"),
+        pytest.param(False, id="warm_upFalse"),
+    ],
+)
 def test_forward_sampling_parameters(
     monkeypatch,
     top_p,
@@ -226,6 +235,7 @@ def test_forward_sampling_parameters(
 # TODO mix the requests with different sampling parameters
 
 
+@pytest.mark.nan_guard
 @pytest.mark.parametrize("top_p", [0.7, 1.0])
 @pytest.mark.parametrize("top_k", [0, 3])
 @pytest.mark.parametrize("temperature", [0.0, 1.0])
@@ -324,6 +334,7 @@ def test_no_nan_logits_with_padded_bucket(
     assert_no_nan_in_pooled(output)
 
 
+@pytest.mark.recompile_guard
 def test_sampler_logits_reshape_prevents_torch_compile_recompile(monkeypatch):
     """
     Test to ensure that the sampler does not recompile
