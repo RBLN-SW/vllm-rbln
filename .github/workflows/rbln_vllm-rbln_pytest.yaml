@@ -205,7 +205,7 @@ jobs:
     strategy:
       fail-fast: ${{ inputs.fail_fast }}
       matrix:
-        test_type: 
+        test_type:
           [
             {
               name : "openai",
@@ -340,8 +340,9 @@ jobs:
               pytest tests/entrypoints/llm -vv --durations 0
               ;;
             "sampler")
-              pytest -n auto -k "warm_upTrue" tests/v1/worker/test_sampler.py -vv --durations 0
-              pytest -n auto -k "warm_upFalse" tests/v1/worker/test_sampler.py -vv --durations 0
+              pytest -n auto -k "warm_up_true" tests/v1/worker/test_sampler.py -vv --durations 0
+              pytest -n auto -k "warm_up_false" tests/v1/worker/test_sampler.py -vv --durations 0
+              pytest -n auto -k "not warm_up_true and not warm_up_false" tests/v1/worker/test_sampler.py -vv --durations 0
               ;;
           esac
 
