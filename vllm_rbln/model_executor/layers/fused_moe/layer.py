@@ -404,9 +404,7 @@ def unquantized_fused_optimize_moe_method_custom(
     assert scoring_func is not None, "FusedMoE.scoring_func must be set"
     assert scoring_func in {"softmax", "sigmoid"}
     if scoring_func == "sigmoid":
-        router_logits = torch.sigmoid(router_logits.to(torch.float32)).to(
-            router_logits.dtype
-        )
+        router_logits = torch.sigmoid(router_logits)
 
     expert_map_const = None
     if layer.expert_map is not None:
