@@ -43,13 +43,32 @@ class RBLNInputBatch(InputBatch):
             #   - failure site:    https://github.com/vllm-project/vllm/blob/01efc7ef781391e744ed08c3292817a773d654e6/vllm/v1/sample/ops/topk_topp_sampler.py#L151
             self.top_k.fill_(self.vocab_size)
             self.top_k_cpu_tensor.fill_(self.vocab_size)
+            # Default top_p to 1.0
+            self.top_p.fill_(1.0)
+            self.top_p_cpu_tensor.fill_(1.0)
             # Default temperature to 1.0 to guard against NaN logits.
             #
             # Why: top_k / top_p applied to unscaled logits can produce NaNs,
             # which propagate into the sampled token ids as out-of-vocab values.
             # Those ids are later used as indices in torch.gather (e.g. for logprobs),
             # triggering an "index out of bounds" RuntimeError in the CPU kernel.
+            self.temperature.fill_(1.0)
             self.temperature_cpu_tensor.fill_(1.0)
+            # Default penalties to no-ops (frequency/presence=0, repetition=1).
+            #
+            # Why: apply_penalties does `logits -= penalty * mask` and
+            # `logits = logits / repetition_penalty` over the full padded
+            # batch. If a pad row's penalty is NaN (from torch.empty), then
+            # NaN * 0 = NaN contaminates every position; if repetition is 0,
+            # the division yields inf. Either way the pad row leaves
+            # apply_penalties unusable for the rest of the sampler pipeline.
+            self.frequency_penalties_cpu_tensor.fill_(0.0)
+            self.presence_penalties_cpu_tensor.fill_(0.0)
+            self.repetition_penalties_cpu_tensor.fill_(1.0)
+
+            self.frequency_penalties.fill_(0.0)
+            self.presence_penalties.fill_(0.0)
+            self.repetition_penalties.fill_(1.0)
 
     def refresh_metadata_rbln(self, bucket_size: int):
         """Apply any batch updates to sampling metadata."""

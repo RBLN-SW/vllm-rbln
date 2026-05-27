@@ -191,7 +191,9 @@ def test_forward_sampler_mode_and_structured_output(
 @pytest.mark.parametrize("presence_penalty", [0.0, 2.0])
 @pytest.mark.parametrize("frequency_penalty", [0.0, 2.0])
 @pytest.mark.parametrize("repetition_penalty", [1.0, 2.0])
-@pytest.mark.parametrize("warm_up", [True, False], ids=["warm_upTrue", "warm_upFalse"])
+@pytest.mark.parametrize(
+    "warm_up", [True, False], ids=["warm_up_true", "warm_up_false"]
+)
 def test_forward_sampling_parameters(
     monkeypatch,
     top_p,
@@ -245,16 +247,36 @@ def test_no_nan_logits_with_padded_bucket(
 ):
     """When use_rbln_sampler=True and num_reqs < bucket_size, the pooled tensor
     holding padded logits has unused rows that the sampler still processes with
-    padded sampling metadata. Default temperature=1.0 / top_k=vocab_size in
-    RBLNInputBatch must keep those padded rows from producing NaN that taints
-    the active rows' sampled token ids — for any sampling-param combination.
+    padded sampling metadata. RBLNInputBatch must explicitly initialize every
+    sampling-param tensor's pad rows to safe defaults — otherwise a NaN/garbage
+    value from torch.empty() propagates through penalty / top_k / top_p ops
+    into NaN logits and out-of-vocab sampled tokens.
+
+    To make this deterministic regardless of allocator state, torch.empty is
+    patched during runner construction so every uninitialized float tensor
+    starts as NaN. Any missing init guard in RBLNInputBatch will then surface.
     """
     monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1")
     monkeypatch.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
     monkeypatch.setenv("VLLM_RBLN_ENABLE_WARM_UP", "False")
 
     # max_num_seqs=4 with 3 reqs -> decode uses bucket_size=4, one padded row.
-    runner = create_model_runner(max_num_seqs=4)
+    # Force torch.empty to return NaN-filled float tensors during init so the
+    # test does not rely on lucky zero-page allocations.
+    real_empty = torch.empty
+
+    def empty_nan(*args, **kwargs):
+        t = real_empty(*args, **kwargs)
+        if t.is_floating_point():
+            t.fill_(float("nan"))
+        return t
+
+    torch.empty = empty_nan
+    try:
+        runner = create_model_runner(max_num_seqs=4)
+    finally:
+        torch.empty = real_empty
+
     vocab_size = runner.model_config.get_vocab_size()
 
     reqs = [
@@ -348,7 +370,7 @@ def test_sampler_logits_reshape_prevents_torch_compile_recompile(monkeypatch):
 
     runner.model.compute_logits = compute_logits_flaky
 
-    for i in range(2):
+    def run_step(i):
         req = make_request(request_id=f"req_{i}", prompt_token_ids=[1, 2, 3])
         scheduler_output = _schedule_new_request_from_request(
             req, block_ids=([0],), outer_block_ids=[0]
@@ -356,6 +378,15 @@ def test_sampler_logits_reshape_prevents_torch_compile_recompile(monkeypatch):
         runner.execute_model(scheduler_output)
         _ = runner.sample_tokens(grammar_output=None)
 
-    # Should compile only one graph for the sampler.
-    # If recompilation happens, the counter will be more than 3 and fail the assertion.
-    assert compile_counter.frame_count == 3
+    # 1st iter: stride-changed logits — initial compilation happens here.
+    run_step(0)
+    baseline_frames = compile_counter.frame_count
+    assert baseline_frames > 0, "sampler should have been compiled on the first call"
+
+    # 2nd iter: normal-stride logits — reshape in sample_tokens should keep the
+    # sampler input shape/stride identical, so no recompilation should occur.
+    run_step(1)
+    assert compile_counter.frame_count == baseline_frames, (
+        f"sampler recompiled across stride change: "
+        f"{baseline_frames} -> {compile_counter.frame_count}"
+    )
