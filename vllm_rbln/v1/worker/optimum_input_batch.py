@@ -32,13 +32,24 @@ class RBLNInputBatch(InputBatch):
         if use_rbln_sampler:
             # Overwrite sampling_metadata with RBLN sampling metadata
             self.sampling_metadata = self._make_sampling_metadata_rbln(self.num_reqs)
-            # Add top_k as vocab_size
-            # to prevent runtime error while running top_p_top_k_ops
-            # https://github.com/vllm-project/vllm/blob/01efc7ef781391e744ed08c3292817a773d654e6/vllm/v1/worker/gpu_input_batch.py#L348
-            # If not, error will be raised here:
-            # https://github.com/vllm-project/vllm/blob/01efc7ef781391e744ed08c3292817a773d654e6/vllm/v1/sample/ops/topk_topp_sampler.py#L151
+            # Default top_k to vocab_size to guard
+            # against runtime errors in top_k/top_p ops:
+            # an unset top_k is still used as an index
+            # in the fused kernel, so vocab_size
+            # acts as "no filtering" while staying in a valid range.
+            #
+            # Refs:
+            #   - upstream default: https://github.com/vllm-project/vllm/blob/01efc7ef781391e744ed08c3292817a773d654e6/vllm/v1/worker/gpu_input_batch.py#L348
+            #   - failure site:    https://github.com/vllm-project/vllm/blob/01efc7ef781391e744ed08c3292817a773d654e6/vllm/v1/sample/ops/topk_topp_sampler.py#L151
             self.top_k.fill_(self.vocab_size)
             self.top_k_cpu_tensor.fill_(self.vocab_size)
+            # Default temperature to 1.0 to guard against NaN logits.
+            #
+            # Why: top_k / top_p applied to unscaled logits can produce NaNs,
+            # which propagate into the sampled token ids as out-of-vocab values.
+            # Those ids are later used as indices in torch.gather (e.g. for logprobs),
+            # triggering an "index out of bounds" RuntimeError in the CPU kernel.
+            self.temperature_cpu_tensor.fill_(1.0)
 
     def refresh_metadata_rbln(self, bucket_size: int):
         """Apply any batch updates to sampling metadata."""
