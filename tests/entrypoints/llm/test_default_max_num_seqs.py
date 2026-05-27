@@ -36,16 +36,22 @@ MODEL_NAME = MODEL_DIR + "/opt_125m_batch2"
 
 # The RBLN default an unset max_num_seqs resolves to (see vllm_rbln.platform).
 RBLN_DEFAULT_MAX_NUM_SEQS = 1
-# opt_125m_batch2 is compiled for batch size 2, so the explicit value we set to
-# check it is preserved must not exceed the compiled batch.
+# opt_125m_batch2 is compiled for batch size 2, so the explicit value we serve
+# to check it is preserved must not exceed the compiled batch.
 EXPLICIT_MAX_NUM_SEQS = 2
+# The production default an unset max_num_seqs would have taken upstream. The
+# override must leave it untouched when set explicitly, but a 256-batch model
+# OOMs here, so this value is checked without loading a model (see below).
+ORIGINAL_MAX_NUM_SEQS = 256
 
 # VLLM_RBLN_USE_VLLM_MODEL selects the runtime backend: 0 = optimum path,
 # 1 = vLLM-native model path. The default must hold for both.
 # FIXME MODE=1 is skipped for now.
 MODES = ["0"]
 
-pytestmark = pytest.mark.skipif(
+# Only the tests that actually load opt_125m_batch2 need the pre-compiled model;
+# the model-free test below runs unconditionally.
+requires_model = pytest.mark.skipif(
     not os.path.isdir(MODEL_NAME),
     reason=(
         "Pre-compiled RBLN model not found; set REBEL_VLLM_PRE_COMPILED_DIR to "
@@ -70,6 +76,7 @@ def _load_max_num_seqs(monkeypatch, mode: str, **llm_kwargs) -> int:
                 raise
 
 
+@requires_model
 @pytest.mark.parametrize("mode", MODES)
 def test_llm_unset_max_num_seqs_defaults_to_one(monkeypatch, mode):
     resolved = _load_max_num_seqs(monkeypatch, mode)
@@ -79,11 +86,52 @@ def test_llm_unset_max_num_seqs_defaults_to_one(monkeypatch, mode):
     )
 
 
-# FIXME EXPLICIT_MAX_NUM_SEQS=256 test is required. But it is hard to test because of OOM and limited resources.
+@requires_model
 @pytest.mark.parametrize("mode", MODES)
 def test_llm_explicit_max_num_seqs_is_preserved(monkeypatch, mode):
     resolved = _load_max_num_seqs(monkeypatch, mode, max_num_seqs=EXPLICIT_MAX_NUM_SEQS)
     assert resolved == EXPLICIT_MAX_NUM_SEQS, (
         f"LLM(...) with VLLM_RBLN_USE_VLLM_MODEL={mode} must preserve an explicit "
         f"max_num_seqs={EXPLICIT_MAX_NUM_SEQS}, got {resolved}"
+    )
+
+
+def test_original_max_seqs_is_preserved_without_model():
+    """Explicitly requesting the upstream default max_num_seqs (256) keeps it 256.
+
+    The RBLN override only rewrites the default for an *unset* max_num_seqs
+    (upstream's 256 -> 1); an explicitly-set value must pass through untouched.
+    256 is the value that matters here: it is upstream's original implicit
+    default, the exact number the override now reinterprets when max_num_seqs is
+    left unset. So we confirm that asking for it explicitly still resolves to
+    256, not the RBLN default of 1.
+
+    A 256-batch model would OOM here, so instead of serving one we drive vLLM's
+    own unset-default resolution directly, with the override applied and a stub
+    model_config, so no model is loaded.
+    """
+    from types import SimpleNamespace
+
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.usage.usage_lib import UsageContext
+
+    from vllm_rbln.platform import RblnPlatform
+
+    # Apply the override exactly as pre_register_and_update does in production.
+    RblnPlatform._override_default_max_num_seqs()
+
+    # model is never loaded (no create_model_config call); max_num_batched_tokens
+    # is pinned so the stub model_config is never dereferenced.
+    engine_args = EngineArgs(
+        model=MODEL_NAME,
+        max_num_seqs=ORIGINAL_MAX_NUM_SEQS,
+        max_num_batched_tokens=2048,
+    )
+    engine_args._set_default_max_num_seqs_and_batched_tokens_args(
+        UsageContext.LLM_CLASS, model_config=SimpleNamespace(max_model_len=4096)
+    )
+
+    assert engine_args.max_num_seqs == ORIGINAL_MAX_NUM_SEQS, (
+        "the RBLN override must leave an explicitly-set max_num_seqs "
+        f"({ORIGINAL_MAX_NUM_SEQS}) untouched, got {engine_args.max_num_seqs}"
     )

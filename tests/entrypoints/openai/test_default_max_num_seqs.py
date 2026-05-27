@@ -63,9 +63,7 @@ def _serve_env(mode: str) -> dict[str, str]:
 
 def _served_max_num_seqs(server: RemoteOpenAIServer) -> int:
     """Read the running server's resolved max_num_seqs from /server_info."""
-    resp = requests.get(
-        server.url_for("server_info"), params={"config_format": "json"}
-    )
+    resp = requests.get(server.url_for("server_info"), params={"config_format": "json"})
     resp.raise_for_status()
     return resp.json()["vllm_config"]["scheduler_config"]["max_num_seqs"]
 
