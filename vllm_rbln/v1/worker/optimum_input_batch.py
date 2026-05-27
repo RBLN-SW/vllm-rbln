@@ -43,7 +43,7 @@ class RBLNInputBatch(InputBatch):
             #   - failure site:    https://github.com/vllm-project/vllm/blob/01efc7ef781391e744ed08c3292817a773d654e6/vllm/v1/sample/ops/topk_topp_sampler.py#L151
             self.top_k.fill_(self.vocab_size)
             self.top_k_cpu_tensor.fill_(self.vocab_size)
-            # Default top_p to 1.0 ("no filtering") for the same reason:
+            # Default top_p to 1.0
             self.top_p.fill_(1.0)
             self.top_p_cpu_tensor.fill_(1.0)
             # Default temperature to 1.0 to guard against NaN logits.
@@ -52,6 +52,7 @@ class RBLNInputBatch(InputBatch):
             # which propagate into the sampled token ids as out-of-vocab values.
             # Those ids are later used as indices in torch.gather (e.g. for logprobs),
             # triggering an "index out of bounds" RuntimeError in the CPU kernel.
+            self.temperature.fill_(1.0)
             self.temperature_cpu_tensor.fill_(1.0)
             # Default penalties to no-ops (frequency/presence=0, repetition=1).
             #
