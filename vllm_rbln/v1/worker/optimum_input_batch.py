@@ -66,6 +66,10 @@ class RBLNInputBatch(InputBatch):
             self.presence_penalties_cpu_tensor.fill_(0.0)
             self.repetition_penalties_cpu_tensor.fill_(1.0)
 
+            self.frequency_penalties.fill_(0.0)
+            self.presence_penalties.fill_(0.0)
+            self.repetition_penalties.fill_(1.0)
+
     def refresh_metadata_rbln(self, bucket_size: int):
         """Apply any batch updates to sampling metadata."""
         # NOTE(eunji.lee):
