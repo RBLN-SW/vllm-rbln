@@ -237,6 +237,13 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
     def __init__(
         self, vllm_config: VllmConfig, engine_id: str, kv_cache_config: "KVCacheConfig"
     ) -> None:
+        assert (
+            vllm_config.kv_transfer_config.kv_buffer_device != "rbln"
+        ), (
+            "RblnNixlConnector is host-bounce only (kv_buffer_device='cpu'). "
+            "For device-to-device (kv_buffer_device='rbln') use "
+            "RblnNixlDirectConnector."
+        )
         super().__init__(vllm_config, engine_id, kv_cache_config)
 
         self.use_host_buffer = self.kv_buffer_device == "cpu"
