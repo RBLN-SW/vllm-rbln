@@ -212,6 +212,10 @@ jobs:
               runner : "rbln-sw-k8s-ca22-4"
             },
             {
+              name : "llm",
+              runner : "rbln-sw-k8s-ca22-1"
+            },
+            {
               name : "sampler",
               runner : "rbln-sw-k8s-ca22-1"
             },
@@ -258,6 +262,11 @@ jobs:
           case "${{ matrix.test_type.name }}" in
             "openai")
               if [[ "$COMMIT_MESSAGE" == *"[skip openai]"* ]]; then
+                SKIP=true
+              fi
+              ;;
+            "llm")
+              if [[ "$COMMIT_MESSAGE" == *"[skip llm]"* ]]; then
                 SKIP=true
               fi
               ;;
@@ -326,6 +335,9 @@ jobs:
           case "${{ matrix.test_type.name }}" in
             "openai")
               pytest tests/entrypoints/openai -vv --durations 0
+              ;;
+            "llm")
+              pytest tests/entrypoints/llm -vv --durations 0
               ;;
             "sampler")
               pytest -n auto -k "warm_upTrue" tests/v1/worker/test_sampler.py -vv --durations 0
