@@ -447,8 +447,15 @@ class RblnPlatform(Platform):
 
     @classmethod
     def get_nixl_supported_devices(cls) -> dict[str, tuple[str, ...]]:
+        # RBLN reports device_type="cpu" (see device_name). NIXL looks up
+        # _NIXL_SUPPORTED_DEVICE[device_type], so to allow the device-to-device
+        # path (kv_buffer_device="rbln", RblnNixlDirectConnector) we must
+        # register "rbln" as an allowed kv_buffer under the "cpu" key.
+        # "cpu" kv_buffer stays allowed for the host-bounce RblnNixlConnector.
+        # Which connector may use which kv_buffer is enforced by an assert in
+        # each connector (host-bounce rejects "rbln"; direct requires "rbln").
         return {
-            "rbln": ("cpu",),
+            "cpu": ("cpu", "rbln"),
         }
 
     @classmethod
