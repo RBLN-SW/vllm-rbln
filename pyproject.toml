@@ -76,16 +76,6 @@ rbln = "vllm_rbln:register"
 rbln_new_models = "vllm_rbln:register_model"
 rbln_custom_ops = "vllm_rbln:register_ops"
 
-[tool.pytest.ini_options]
-markers = [
-    "bucketing: sampler bucket-size computation (test_get_bucket_sizes)",
-    "sampler_mode: sampler mode / structured-output forward path",
-    "param_sweep: full sampling-parameter combination sweep (large)",
-    "warm_up: param_sweep cases running with VLLM_RBLN_ENABLE_WARM_UP=True",
-    "nan_guard: padded-bucket NaN / out-of-vocab guard",
-    "recompile_guard: sampler torch.compile recompile guard",
-]
-
 [tool.setuptools_scm]
 version_file = "vllm_rbln/_version.py"
 

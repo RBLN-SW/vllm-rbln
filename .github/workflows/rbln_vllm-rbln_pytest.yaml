@@ -328,9 +328,9 @@ jobs:
               pytest tests/entrypoints/openai -vv --durations 0
               ;;
             "sampler")
-              pytest -n auto -m "param_sweep and warm_up" tests/v1/worker/test_sampler.py -vv --durations 0
-              pytest -n auto -m "param_sweep and not warm_up" tests/v1/worker/test_sampler.py -vv --durations 0
-              pytest -n auto -m "not param_sweep" tests/v1/worker/test_sampler.py -vv --durations 0
+              pytest -n auto -k "warm_up_true" tests/v1/worker/test_sampler.py -vv --durations 0
+              pytest -n auto -k "warm_up_false" tests/v1/worker/test_sampler.py -vv --durations 0
+              pytest -n auto -k "not warm_up_true and not warm_up_false" tests/v1/worker/test_sampler.py -vv --durations 0
               ;;
           esac
 
