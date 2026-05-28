@@ -42,6 +42,9 @@ from vllm_rbln.utils.optimum.registry import (
 
 logger = init_logger(__name__)
 
+# RBLN default for an unset max_num_seqs (upstream vLLM defaults to 256).
+RBLN_DEFAULT_MAX_NUM_SEQS = 1
+
 
 def bypass_backend(graph_module: torch.fx.GraphModule, example_inputs):
     return graph_module.forward
@@ -95,9 +98,39 @@ class RblnPlatform(Platform):
         return torch.no_grad()
 
     @classmethod
+    def _override_default_max_num_seqs(cls) -> None:
+        """Default an unset max_num_seqs to RBLN_DEFAULT_MAX_NUM_SEQS.
+
+        Wraps EngineArgs.get_batch_defaults() so RBLN's default applies to both
+        `vllm serve` and `LLM(...)`. Explicit values are not None and untouched.
+        """
+        from vllm.engine.arg_utils import EngineArgs
+
+        if getattr(EngineArgs, "_rbln_max_num_seqs_patched", False):
+            return
+
+        orig_get_batch_defaults = EngineArgs.get_batch_defaults.__func__
+
+        def get_batch_defaults(cls_, world_size):
+            from vllm.usage.usage_lib import UsageContext
+
+            default_batched_tokens, _ = orig_get_batch_defaults(cls_, world_size)
+            default_max_num_seqs = {
+                UsageContext.LLM_CLASS: RBLN_DEFAULT_MAX_NUM_SEQS,
+                UsageContext.OPENAI_API_SERVER: RBLN_DEFAULT_MAX_NUM_SEQS,
+            }
+            return default_batched_tokens, default_max_num_seqs
+
+        EngineArgs.get_batch_defaults = classmethod(get_batch_defaults)
+        EngineArgs._rbln_max_num_seqs_patched = True
+
+    @classmethod
     def pre_register_and_update(
         cls, parser: "FlexibleArgumentParser | None" = None
     ) -> None:
+        # Runs before max_num_seqs is resolved from None to its default.
+        cls._override_default_max_num_seqs()
+
         if parser is None:
             return
 
