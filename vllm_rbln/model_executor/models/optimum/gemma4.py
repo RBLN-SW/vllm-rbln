@@ -26,6 +26,11 @@ from vllm.model_executor.models.gemma4_mm import (
 from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.model_executor.models.interfaces_base import VllmModelForTextGeneration
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.inputs import PlaceholderRange
+from vllm.multimodal.processing import (
+    ProcessorInputs,
+    TimingContext,
+)
 
 from .base import ModelInputForRBLN, version_error
 from .model_base import RBLNOptimumDecoderMixin, RBLNOptimumModelBase
@@ -72,29 +77,88 @@ class RBLNGemma4MultiModalProcessor(Gemma4MultiModalProcessor):
             f"Expected each image block to be {EXPECTED_IMAGE_TOKENS} tokens, "
             f"got {block_lengths.tolist()}"
         )
-        padded_seq_len = 0
-        for image_start in image_starts:
-            # Align the block start to the next prefill-chunk boundary so the whole
-            # image block stays within a single prefill chunk. The negation makes
-            # `% chunk` yield the distance UP to the next multiple (0 when already
-            # aligned), instead of the distance past the previous one. With chunk=512:
-            #   pos=530: (-530) % 512 = (-530 + 1024) % 512 = 494  # up to next (1024)
-            #   pos=512: (-512) % 512 = 0                          # already aligned
-            #   pos=0:   (   0) % 512 = 0                          # already aligned
-            #   pos=1:   (  -1) % 512 = 511                        # 511 -> reach 512
-            pos = int(image_start) + padded_seq_len
-            pad_needed = (-pos) % IMAGE_PREFILL_CHUNK_SIZE
-            padded_seq_len += pad_needed
-        # Left padding for Gemma4 image boundary alignment
-        prompt_ids = [PAD_TOKEN_ID] * padded_seq_len + prompt_ids
-        return prompt_ids
+        # Pad both BEFORE and AFTER each image block so no prefill chunk mixes
+        # image tokens with text tokens:
+        #   - pre-pad  : align block start    to a multiple of chunk_size
+        #                (image block always starts a fresh chunk)
+        #   - post-pad : align position after block to a multiple of chunk_size
+        #                (following text always starts a fresh chunk)
+        # `(-len(out)) % chunk` gives the distance UP to the next multiple
+        # (0 when already aligned). Long image blocks (> chunk) span multiple
+        # chunks naturally; only the tail of the last chunk needs post-pad.
+        starts = image_starts.tolist()
+        ends = image_ends.tolist()
+        out: list[int] = []
+        cursor = 0
+        # Per-block layout in the padded prompt, used to rebuild PlaceholderRange
+        # so downstream `is_embed` reflects which slots are real image-token
+        # positions vs PAD fillers inserted for chunk alignment.
+        block_info: list[
+            tuple[int, int, int]
+        ] = []  # (new_offset, block_length, post_pad)
+        for s, e in zip(starts, ends):
+            # text / markers (e.g. boi) before this image block
+            out.extend(prompt_ids[cursor:s])
+            # pre-pad → image block starts on chunk boundary
+            out.extend([PAD_TOKEN_ID] * ((-len(out)) % IMAGE_PREFILL_CHUNK_SIZE))
+            new_offset = len(out)
+            block_length = e - s + 1
+            # image block itself
+            out.extend(prompt_ids[s : e + 1])
+            # post-pad → next position (eoi/text) starts on chunk boundary
+            post_pad = (-len(out)) % IMAGE_PREFILL_CHUNK_SIZE
+            out.extend([PAD_TOKEN_ID] * post_pad)
+            block_info.append((new_offset, block_length, post_pad))
+            cursor = e + 1
+        # trailing text after the last image block
+        out.extend(prompt_ids[cursor:])
+        print("@@@ image_starts", image_starts)
+        print("@@@ added pad tokens", len(out) - len(prompt_ids))
+        print("@@@ block_info (new_offset, block_length, post_pad)", block_info)
+        return out, block_info
 
-    def apply(self, *args, **kwargs):
-        # NOTE: Check if padding works correctly
-        output = super().apply(*args, **kwargs)
-        prompt_ids = self._pad_for_gemma4(output["prompt_token_ids"])
+    def apply(
+        self,
+        inputs: ProcessorInputs,
+        timing_ctx: TimingContext,
+    ):
+        output = super().apply(inputs, timing_ctx)
+        padded_prompt_ids, block_info = self._pad_for_gemma4(output["prompt_token_ids"])
+        output["prompt_token_ids"] = padded_prompt_ids
 
-        output["prompt_token_ids"] = prompt_ids
+        # Rebuild image PlaceholderRanges to reflect the inserted padding:
+        #   - offset   : shifted to the image block's start in the padded prompt
+        #   - length   : block_length + post_pad (cover the trailing PAD slots
+        #                that share the same prefill chunk as the image block)
+        #   - is_embed : [True]*block_length + [False]*post_pad
+        # Downstream model code reads `is_embed` to decide which slots receive
+        # vision-tower embeddings and which are PAD fillers.
+        image_ranges = (
+            output["mm_placeholders"].get("image")
+            if output.get("mm_placeholders")
+            else None
+        )
+        if image_ranges:
+            assert len(image_ranges) == len(block_info), (
+                f"placeholder/block count mismatch: "
+                f"{len(image_ranges)} vs {len(block_info)}"
+            )
+            new_ranges = []
+            for new_offset, block_length, post_pad in block_info:
+                is_embed = torch.cat(
+                    [
+                        torch.ones(block_length, dtype=torch.bool),
+                        torch.zeros(post_pad, dtype=torch.bool),
+                    ]
+                )
+                new_ranges.append(
+                    PlaceholderRange(
+                        offset=new_offset,
+                        length=block_length + post_pad,
+                        is_embed=is_embed,
+                    )
+                )
+            output["mm_placeholders"]["image"] = new_ranges
 
         return output
 
@@ -174,12 +238,25 @@ class RBLNOptimumGemma4ForConditionalGeneration(
             inputs_embeds = None
             prefill_batch_idx = sliding_window_table_ids[0]
             local_block_table_id = torch.tensor([prefill_batch_idx], dtype=torch.int16)
-            # FIXME It should be delivered from runner
+            # Prefer the `is_embed` mask propagated from the multimodal processor
+            # via the runner — it accounts for PAD slots inserted for chunk
+            # alignment, which a token-id check cannot detect (PAD shares the
+            # text token-id space, not the image one).
             # FIXME It should allow video_token_ids, audio_token_ids as well.
             # https://github.com/huggingface/transformers/blob/0588858f54c8c79d28497d3ad6eac3417b716c49/src/transformers/processing_utils.py#L897
-            mm_token_type_ids = torch.zeros_like(input_ids)
-            mm_token_type_ids[input_ids == self.model.config.image_token_id] = 1
+            if model_input.is_embed is not None:
+                mm_token_type_ids = model_input.is_embed.to(dtype=input_ids.dtype)
+                assert mm_token_type_ids.shape == input_ids.shape, (
+                    f"is_embed shape {tuple(mm_token_type_ids.shape)} "
+                    f"!= input_ids shape {tuple(input_ids.shape)}"
+                )
+            else:
+                mm_token_type_ids = torch.zeros_like(input_ids)
+                mm_token_type_ids[input_ids == self.model.config.image_token_id] = 1
             pixel_values, image_position_ids = self.get_image_values(model_input)
+            print("@@@ input_ids", input_ids)
+            print("@@@ mm_token_type_ids", mm_token_type_ids)
+            print("@@@ is_embed (from runner)", model_input.is_embed)
             inputs_embeds = self.model._preprocess_prefill(
                 input_ids,
                 inputs_embeds,
@@ -190,6 +267,7 @@ class RBLNOptimumGemma4ForConditionalGeneration(
                 raise version_error
             assert attention_masks is not None
             attention_mask = attention_masks[0]
+            print("@@@ attention_mask", attention_mask)
             output = self.model.language_model.prefill_decoder(
                 inputs_embeds=inputs_embeds,
                 cache_position=cache_position,
@@ -199,6 +277,7 @@ class RBLNOptimumGemma4ForConditionalGeneration(
             )
             logits = output.logits
             updated_padded_cache_length = output.padded_cache_lengths
+            print("@@@ updated_padded_cache_length", updated_padded_cache_length)
             updated_attention_mask = output.attention_mask
 
             assert len(running_requests_ids) == 1
@@ -215,6 +294,7 @@ class RBLNOptimumGemma4ForConditionalGeneration(
             self.model.language_model.decoder = self.model.language_model.decoders[
                 padded_batch_size
             ]
+            print("@@@ [decode] padded_cache_lengths", padded_cache_lengths)
             (
                 local_block_table_id,
                 cache_position,
@@ -233,6 +313,9 @@ class RBLNOptimumGemma4ForConditionalGeneration(
                 attention_mask,
                 cache_position,
             )
+            print("@@@ position_ids", position_ids)
+            print("@@@ input_ids", input_ids)
+            print("@@@ cache_position", cache_position)
             logits = self.model.language_model.decoder(
                 input_ids=input_ids,
                 cache_position=cache_position,

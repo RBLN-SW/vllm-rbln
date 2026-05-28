@@ -42,7 +42,6 @@ def generate_prompts(batch_size: int, model_id: str):
                 "content": [
                     {"type": "image"},
                     {"type": "text", "text": dataset[i]["question"]},
-                    {"type": "image"},
                 ],
             },
         ]

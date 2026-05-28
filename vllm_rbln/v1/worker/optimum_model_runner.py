@@ -478,6 +478,7 @@ class RBLNOptimumModelRunner(
         ):
             is_prefill = True
 
+        is_embed = None
         if is_prefill:
             (
                 input_ids,
@@ -487,6 +488,7 @@ class RBLNOptimumModelRunner(
                 cached_lengths,
                 multi_modal_kwargs,
                 running_request_ids,
+                is_embed,
             ) = self._prepare_prefill(scheduler_output)
         else:
             cached_block_tables = []
@@ -510,6 +512,7 @@ class RBLNOptimumModelRunner(
             input_tokens=input_ids,
             input_positions=positions,
             multi_modal_kwargs=multi_modal_kwargs if is_prefill else None,
+            is_embed=is_embed if is_prefill else None,
             block_tables=block_tables,
             running_requests_ids=running_request_ids,
             finished_requests_ids=list(finished_requests_ids),
@@ -581,6 +584,7 @@ class RBLNOptimumModelRunner(
         list[int],
         BatchedTensorInputs | None,
         list[str],
+        torch.Tensor | None,
     ]:
         running_request_ids = []
         batched_mm_inputs: BatchedTensorInputs | None = None
@@ -651,6 +655,35 @@ class RBLNOptimumModelRunner(
         if self.supports_mm_inputs:
             batched_mm_inputs = self._extract_mm_kwargs(scheduler_output)
 
+        # Build a full-prompt boolean mask marking which token positions hold
+        # vision-tower embedding slots (True) vs PAD/text (False), from each
+        # MultiModalFeatureSpec.mm_position.is_embed. Used by the model's
+        # forward() to place image embeddings precisely (including respecting
+        # PAD slots inserted for chunk alignment in the processor). Only built
+        # for the new-request path; resumed-from-cache reqs reuse prior cache
+        # so the model does not need a fresh mask.
+        seq_len = len(prompt_tokens)
+        is_embed_mask: torch.Tensor | None = None
+        if len(scheduler_output.scheduled_new_reqs) == 1 and getattr(
+            scheduled, "mm_features", None
+        ):
+            total_cached = sum(cached_length) if self.enable_prefix_caching else 0
+            mask = torch.zeros(seq_len, dtype=torch.bool)
+            for feature in scheduled.mm_features:
+                pos = feature.mm_position
+                offset = pos.offset - total_cached
+                length = pos.length
+                if offset + length <= 0 or offset >= seq_len:
+                    continue  # block fully outside this prompt slice
+                start = max(0, offset)
+                end = min(seq_len, offset + length)
+                feat_is_embed = pos.is_embed
+                if feat_is_embed is None:
+                    mask[start:end] = True
+                else:
+                    mask[start:end] = feat_is_embed[start - offset : end - offset]
+            is_embed_mask = mask.unsqueeze(0)  # [1, seq_len]
+
         input_tokens = torch.tensor(prompt_tokens).unsqueeze(0)
         input_positions = torch.tensor(input_positions).unsqueeze(0)
         block_table = block_table.unsqueeze(0)
@@ -664,6 +697,7 @@ class RBLNOptimumModelRunner(
             cached_length,
             batched_mm_inputs,
             running_request_ids,
+            is_embed_mask,
         )
 
     def _prepare_decode(

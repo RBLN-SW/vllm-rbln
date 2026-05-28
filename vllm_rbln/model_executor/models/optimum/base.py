@@ -34,6 +34,11 @@ class ModelInputForRBLN:
     cached_block_tables: list[int] = field(default_factory=list)  # for prefix caching
     cached_lengths: list[int] = field(default_factory=list)  # for prefix caching
     multi_modal_kwargs: BatchedTensorInputs | None = None
+    # Full-prompt boolean mask marking which token positions correspond to
+    # vision-tower embedding slots (True) vs PAD/text (False). Built from
+    # `MultiModalFeatureSpec.mm_position.is_embed` during prefill. None on
+    # decode steps (no new multi-modal data).
+    is_embed: torch.Tensor | None = None
     dummy_block: int | None = None  # for prefix caching
 
 
