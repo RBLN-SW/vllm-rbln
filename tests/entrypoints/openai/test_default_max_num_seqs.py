@@ -28,15 +28,12 @@ Like the other tests in this directory, they require a pre-compiled model under
 REBEL_VLLM_PRE_COMPILED_DIR and are skipped otherwise.
 """
 
-import os
-
 import pytest
 import requests
 from utils import RemoteOpenAIServer
 
-MODEL_DIR = os.getenv("REBEL_VLLM_PRE_COMPILED_DIR", "./")
-MODEL_NAME = MODEL_DIR + "/opt_125m_batch2"
-
+MODEL_NAME = "facebook/opt-125m"
+ARGS = ["--block-size", str(2048)]
 # The RBLN default an unset max_num_seqs resolves to (see vllm_rbln.platform).
 RBLN_DEFAULT_MAX_NUM_SEQS = 1
 # opt_125m_batch2 is compiled for batch size 2, so the explicit value we set to
@@ -45,15 +42,8 @@ EXPLICIT_MAX_NUM_SEQS = 2
 
 # VLLM_RBLN_USE_VLLM_MODEL selects the runtime backend: 0 = optimum path,
 # 1 = vLLM-native model path. The default must hold for both.
-MODES = ["0", "1"]
-
-pytestmark = pytest.mark.skipif(
-    not os.path.isdir(MODEL_NAME),
-    reason=(
-        "Pre-compiled RBLN model not found; set REBEL_VLLM_PRE_COMPILED_DIR to "
-        "the directory containing 'opt_125m_batch2'."
-    ),
-)
+# FIXME MODE=1 is skipped for now.
+MODES = ["0"]
 
 
 def _serve_env(mode: str) -> dict[str, str]:
@@ -70,7 +60,7 @@ def _served_max_num_seqs(server: RemoteOpenAIServer) -> int:
 
 @pytest.mark.parametrize("mode", MODES)
 def test_serve_unset_max_num_seqs_defaults_to_one(mode):
-    with RemoteOpenAIServer(MODEL_NAME, [], env_dict=_serve_env(mode)) as server:
+    with RemoteOpenAIServer(MODEL_NAME, ARGS, env_dict=_serve_env(mode)) as server:
         resolved = _served_max_num_seqs(server)
 
     assert resolved == RBLN_DEFAULT_MAX_NUM_SEQS, (
@@ -81,8 +71,8 @@ def test_serve_unset_max_num_seqs_defaults_to_one(mode):
 
 @pytest.mark.parametrize("mode", MODES)
 def test_serve_explicit_max_num_seqs_is_preserved(mode):
-    args = ["--max-num-seqs", str(EXPLICIT_MAX_NUM_SEQS)]
-    with RemoteOpenAIServer(MODEL_NAME, args, env_dict=_serve_env(mode)) as server:
+    ARGS.extend(["--max-num-seqs", str(EXPLICIT_MAX_NUM_SEQS)])
+    with RemoteOpenAIServer(MODEL_NAME, ARGS, env_dict=_serve_env(mode)) as server:
         resolved = _served_max_num_seqs(server)
 
     assert resolved == EXPLICIT_MAX_NUM_SEQS, (

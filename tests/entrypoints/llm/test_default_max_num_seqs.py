@@ -14,7 +14,7 @@
 
 """Offline LLM(...) coverage for the RBLN max_num_seqs default.
 
-`a860d0d6` makes an unset max_num_seqs resolve to 1 on RBLN (upstream vLLM
+An unset max_num_seqs resolve to 1 on RBLN (upstream vLLM
 defaults to 256), while leaving an explicitly-set value untouched. This module
 exercises the `LLM(...)` (UsageContext.LLM_CLASS) entry point; the `vllm serve`
 counterpart lives in tests/entrypoints/openai/test_default_max_num_seqs.py. Both
@@ -25,14 +25,12 @@ Like the other entrypoints tests, this requires a pre-compiled model under
 REBEL_VLLM_PRE_COMPILED_DIR and is skipped otherwise.
 """
 
-import os
-
 import pytest
 from vllm import LLM
 from vllm.distributed import cleanup_dist_env_and_memory
 
-MODEL_DIR = os.getenv("REBEL_VLLM_PRE_COMPILED_DIR", "./")
-MODEL_NAME = MODEL_DIR + "/opt_125m_batch2"
+MODEL_NAME = "facebook/opt-125m"
+BLOCK_SIZE = 2048
 
 # The RBLN default an unset max_num_seqs resolves to (see vllm_rbln.platform).
 RBLN_DEFAULT_MAX_NUM_SEQS = 1
@@ -49,21 +47,11 @@ ORIGINAL_MAX_NUM_SEQS = 256
 # FIXME MODE=1 is skipped for now.
 MODES = ["0"]
 
-# Only the tests that actually load opt_125m_batch2 need the pre-compiled model;
-# the model-free test below runs unconditionally.
-requires_model = pytest.mark.skipif(
-    not os.path.isdir(MODEL_NAME),
-    reason=(
-        "Pre-compiled RBLN model not found; set REBEL_VLLM_PRE_COMPILED_DIR to "
-        "the directory containing 'opt_125m_batch2'."
-    ),
-)
-
 
 def _load_max_num_seqs(monkeypatch, mode: str, **llm_kwargs) -> int:
     monkeypatch.setenv("VLLM_RBLN_USE_VLLM_MODEL", mode)
     monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
-    llm = LLM(model=MODEL_NAME, **llm_kwargs)
+    llm = LLM(model=MODEL_NAME, block_size=BLOCK_SIZE, **llm_kwargs)
     try:
         return llm.llm_engine.vllm_config.scheduler_config.max_num_seqs
     finally:
@@ -76,7 +64,6 @@ def _load_max_num_seqs(monkeypatch, mode: str, **llm_kwargs) -> int:
                 raise
 
 
-@requires_model
 @pytest.mark.parametrize("mode", MODES)
 def test_llm_unset_max_num_seqs_defaults_to_one(monkeypatch, mode):
     resolved = _load_max_num_seqs(monkeypatch, mode)
@@ -86,7 +73,6 @@ def test_llm_unset_max_num_seqs_defaults_to_one(monkeypatch, mode):
     )
 
 
-@requires_model
 @pytest.mark.parametrize("mode", MODES)
 def test_llm_explicit_max_num_seqs_is_preserved(monkeypatch, mode):
     resolved = _load_max_num_seqs(monkeypatch, mode, max_num_seqs=EXPLICIT_MAX_NUM_SEQS)
