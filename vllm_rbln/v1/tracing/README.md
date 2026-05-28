@@ -99,6 +99,67 @@ Interpretation: queue/TTFT mean = X% → <verdict>
 `<verdict>` is one of `COMPUTE-BOUNDED`, `QUEUE-BOUNDED`,
 or `QUEUE-DOMINATED`.
 
+## Background: dispatch bubble at `max_concurrency = DP_size`
+
+A counter-intuitive observation when `max_concurrency` is set equal to
+data-parallel size (so at most one in-flight request per replica):
+residual queue time of roughly **one chunk latency** persists, regardless
+of total prefill length.
+
+### Observation
+
+| Setup | service | queue | queue / chunk_latency |
+| --- | --- | --- | --- |
+| ISL=1024 (2 chunks of ~200 ms) | 400 ms | ~190 ms | ≈ 1 |
+| ISL=512  (1 chunk of ~200 ms)  | 200 ms | ~180 ms | ≈ 1 |
+
+Queue tracks **one chunk latency**, independent of total service time.
+Reducing prefill length does not reduce queue — only reducing chunk size
+does.
+
+### Mechanism — dispatch / availability sync mismatch
+
+```
+time  →   t_N            t_N+1          t_N+2
+          │              │              │
+          ▼              ▼              ▼
+replica:  ┌──iter N────┐┌──iter N+1───┐┌──iter N+2───┐
+          │ prefill A  ││ (empty step ││ prefill B   │
+          │ (last)     ││  = bubble)  ││             │
+          └────────────┘└─────────────┘└─────────────┘
+                         ▲     ▲
+                  A done │     │ B arrives at LB
+                         (stats publish lag + dispatch latency)
+                         → iter N+1's schedule() already passed
+                         → B picked up only at iter N+2
+                         → queue(B) ≈ 1 chunk latency
+```
+
+When prefill A completes, the replica becomes idle but the LB dispatcher
+does not observe this synchronously — `DPCoordinator` publishes engine
+counts on a fixed cycle (default 100 ms, see
+`min_stats_update_interval_ms` in `vllm/v1/engine/coordinator.py`). The
+next scheduler iteration on that replica therefore proceeds **empty
+(a bubble)** because no new request was visible to `schedule()`. When a
+new request finally arrives during the bubble iteration, it cannot be
+picked up until that iteration completes — adding one chunk latency to
+its TTFT.
+
+### Implications
+
+- The residual queue is **not an LB algorithm bug**; it is the
+  unavoidable cost of asynchronous dispatch given iteration-atomic
+  prefill processing.
+- Queue scales with **chunk size**, not total prefill length. Reducing
+  `--max-num-batched-tokens` (the per-step chunk budget) shrinks the
+  residual queue proportionally.
+- `max_concurrency = 1` (full serialization) drives queue to zero by
+  ensuring arrivals are always timed to just-completed iterations, at
+  the cost of `1/DP` throughput.
+- A truly synchronous dispatch path (replica → LB completion callback,
+  rather than periodic stats publish) would eliminate the bubble without
+  giving up throughput.
+
 ## Fallback wrapper (no `vllm-rbln` install required)
 
 If you want to keep the server unchanged or skip the `vllm-rbln` CLI shim,
