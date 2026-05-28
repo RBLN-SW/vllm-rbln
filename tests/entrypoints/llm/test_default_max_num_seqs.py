@@ -1,4 +1,4 @@
-# Copyright 2025 Rebellions Inc. All rights reserved.
+# Copyright 2026 Rebellions Inc. All rights reserved.
 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,19 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Offline LLM(...) coverage for the RBLN max_num_seqs default.
-
-An unset max_num_seqs resolve to 1 on RBLN (upstream vLLM
-defaults to 256), while leaving an explicitly-set value untouched. This module
-exercises the `LLM(...)` (UsageContext.LLM_CLASS) entry point; the `vllm serve`
-counterpart lives in tests/entrypoints/openai/test_default_max_num_seqs.py. Both
-run across the two runtime backends selected by VLLM_RBLN_USE_VLLM_MODEL
-(0 = optimum, 1 = vLLM-native).
-
-Like the other entrypoints tests, this requires a pre-compiled model under
-REBEL_VLLM_PRE_COMPILED_DIR and is skipped otherwise.
-"""
-
 import pytest
 from vllm import LLM
 from vllm.distributed import cleanup_dist_env_and_memory
@@ -32,18 +19,9 @@ from vllm.distributed import cleanup_dist_env_and_memory
 MODEL_NAME = "facebook/opt-125m"
 BLOCK_SIZE = 2048
 
-# The RBLN default an unset max_num_seqs resolves to (see vllm_rbln.platform).
 RBLN_DEFAULT_MAX_NUM_SEQS = 1
-# opt_125m_batch2 is compiled for batch size 2, so the explicit value we serve
-# to check it is preserved must not exceed the compiled batch.
 EXPLICIT_MAX_NUM_SEQS = 2
-# The production default an unset max_num_seqs would have taken upstream. The
-# override must leave it untouched when set explicitly, but a 256-batch model
-# OOMs here, so this value is checked without loading a model (see below).
 ORIGINAL_MAX_NUM_SEQS = 256
-
-# VLLM_RBLN_USE_VLLM_MODEL selects the runtime backend: 0 = optimum path,
-# 1 = vLLM-native model path. The default must hold for both.
 # FIXME MODE=1 is skipped for now.
 MODES = ["0"]
 

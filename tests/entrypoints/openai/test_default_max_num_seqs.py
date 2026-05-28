@@ -1,4 +1,4 @@
-# Copyright 2025 Rebellions Inc. All rights reserved.
+# Copyright 2026 Rebellions Inc. All rights reserved.
 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,22 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-"""End-to-end `vllm serve` coverage for the RBLN max_num_seqs default.
-
-`a860d0d6` makes an unset max_num_seqs resolve to 1 on RBLN (upstream vLLM
-defaults to 256), while leaving an explicitly-set value untouched. This module
-exercises the `vllm serve` (UsageContext.OPENAI_API_SERVER) entry point; the
-`LLM(...)` counterpart lives in tests/entrypoints/llm/test_default_max_num_seqs.py.
-Both run across the two runtime backends selected by VLLM_RBLN_USE_VLLM_MODEL
-(0 = optimum, 1 = vLLM-native).
-
-The resolved value is read straight from the live server via its /server_info
-dev endpoint (enabled with VLLM_SERVER_DEV_MODE), so no log scraping is needed.
-
-Like the other tests in this directory, they require a pre-compiled model under
-REBEL_VLLM_PRE_COMPILED_DIR and are skipped otherwise.
-"""
 
 import pytest
 import requests
