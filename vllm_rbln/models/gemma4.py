@@ -493,7 +493,16 @@ class Gemma4DecoderLayer(nn.Module):
             prefix=f"{prefix}.self_attn",
         )
 
-        layer_intermediate_size = config.intermediate_size
+        first_kv_shared_layer_idx = config.num_hidden_layers - getattr(
+            config, "num_kv_shared_layers", 0
+        )
+        is_kv_shared_layer = layer_idx >= first_kv_shared_layer_idx > 0
+        use_double_wide_mlp = (
+            getattr(config, "use_double_wide_mlp", False) and is_kv_shared_layer
+        )
+        layer_intermediate_size = config.intermediate_size * (
+            2 if use_double_wide_mlp else 1
+        )
         self.mlp = Gemma4MLP(
             hidden_size=self.hidden_size,
             intermediate_size=layer_intermediate_size,
