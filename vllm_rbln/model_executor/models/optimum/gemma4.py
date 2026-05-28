@@ -91,30 +91,36 @@ class RBLNGemma4MultiModalProcessor(Gemma4MultiModalProcessor):
         out: list[int] = []
         cursor = 0
         # Per-block layout in the padded prompt, used to rebuild PlaceholderRange
-        # so downstream `is_embed` reflects which slots are real image-token
-        # positions vs PAD fillers inserted for chunk alignment.
+        # so downstream `is_embed` reflects which slots are image-token positions
+        # (1) vs PAD fillers (-1) inserted for chunk alignment, both pre and post.
         block_info: list[
-            tuple[int, int, int]
-        ] = []  # (new_offset, block_length, post_pad)
+            tuple[int, int, int, int]
+        ] = []  # (range_start, pre_pad, block_length, post_pad)
         for s, e in zip(starts, ends):
             # text / markers (e.g. boi) before this image block
             out.extend(prompt_ids[cursor:s])
+            # range_start: where pre-pad begins (= placeholder range offset so
+            # that pre-pad slots are inside the range, marked with -1).
+            range_start = len(out)
             # pre-pad → image block starts on chunk boundary
-            out.extend([PAD_TOKEN_ID] * ((-len(out)) % IMAGE_PREFILL_CHUNK_SIZE))
-            new_offset = len(out)
+            pre_pad = (-len(out)) % IMAGE_PREFILL_CHUNK_SIZE
+            out.extend([PAD_TOKEN_ID] * pre_pad)
             block_length = e - s + 1
             # image block itself
             out.extend(prompt_ids[s : e + 1])
             # post-pad → next position (eoi/text) starts on chunk boundary
             post_pad = (-len(out)) % IMAGE_PREFILL_CHUNK_SIZE
             out.extend([PAD_TOKEN_ID] * post_pad)
-            block_info.append((new_offset, block_length, post_pad))
+            block_info.append((range_start, pre_pad, block_length, post_pad))
             cursor = e + 1
         # trailing text after the last image block
         out.extend(prompt_ids[cursor:])
         print("@@@ image_starts", image_starts)
         print("@@@ added pad tokens", len(out) - len(prompt_ids))
-        print("@@@ block_info (new_offset, block_length, post_pad)", block_info)
+        print(
+            "@@@ block_info (range_start, pre_pad, block_length, post_pad)",
+            block_info,
+        )
         return out, block_info
 
     def apply(
@@ -127,12 +133,17 @@ class RBLNGemma4MultiModalProcessor(Gemma4MultiModalProcessor):
         output["prompt_token_ids"] = padded_prompt_ids
 
         # Rebuild image PlaceholderRanges to reflect the inserted padding:
-        #   - offset   : shifted to the image block's start in the padded prompt
-        #   - length   : block_length + post_pad (cover the trailing PAD slots
-        #                that share the same prefill chunk as the image block)
-        #   - is_embed : [True]*block_length + [False]*post_pad
-        # Downstream model code reads `is_embed` to decide which slots receive
-        # vision-tower embeddings and which are PAD fillers.
+        #   - offset   : start of the pre-pad slot (just after the previous
+        #                text), so both pre-pad and post-pad live inside the
+        #                range
+        #   - length   : pre_pad + block_length + post_pad
+        #   - is_embed : int tensor of
+        #                  [-1]*pre_pad + [1]*block_length + [-1]*post_pad
+        #                ( 1 = vision-tower embedding slot,
+        #                 -1 = PAD filler inserted for chunk alignment,
+        #                  0 = text — never appears inside this range)
+        # Downstream model code reads `is_embed` to know exactly which slots
+        # receive image embeddings vs which are PADs.
         image_ranges = (
             output["mm_placeholders"].get("image")
             if output.get("mm_placeholders")
@@ -144,17 +155,19 @@ class RBLNGemma4MultiModalProcessor(Gemma4MultiModalProcessor):
                 f"{len(image_ranges)} vs {len(block_info)}"
             )
             new_ranges = []
-            for new_offset, block_length, post_pad in block_info:
+            for range_start, pre_pad, block_length, post_pad in block_info:
                 is_embed = torch.cat(
                     [
-                        torch.ones(block_length, dtype=torch.bool),
-                        torch.zeros(post_pad, dtype=torch.bool),
+                        # FIXME embed value should be boolean type.
+                        torch.full((pre_pad,), -1, dtype=torch.int64),
+                        torch.ones(block_length, dtype=torch.int64),
+                        torch.full((post_pad,), -1, dtype=torch.int64),
                     ]
                 )
                 new_ranges.append(
                     PlaceholderRange(
-                        offset=new_offset,
-                        length=block_length + post_pad,
+                        offset=range_start,
+                        length=pre_pad + block_length + post_pad,
                         is_embed=is_embed,
                     )
                 )
@@ -174,6 +187,11 @@ class RBLNOptimumGemma4ForConditionalGeneration(
     VllmModelForTextGeneration,
     SupportsMultiModal,
 ):
+    # Opt-in flag read by the runner to build the per-position `is_embed`
+    # label mask (1=image, -1=PAD, 0=text) from MultiModalFeatureSpec and
+    # pass it through ModelInputForRBLN. Only Gemma-family models need this.
+    requires_is_embed: bool = True
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -238,24 +256,19 @@ class RBLNOptimumGemma4ForConditionalGeneration(
             inputs_embeds = None
             prefill_batch_idx = sliding_window_table_ids[0]
             local_block_table_id = torch.tensor([prefill_batch_idx], dtype=torch.int16)
-            # Prefer the `is_embed` mask propagated from the multimodal processor
-            # via the runner — it accounts for PAD slots inserted for chunk
-            # alignment, which a token-id check cannot detect (PAD shares the
-            # text token-id space, not the image one).
-            # FIXME It should allow video_token_ids, audio_token_ids as well.
-            # https://github.com/huggingface/transformers/blob/0588858f54c8c79d28497d3ad6eac3417b716c49/src/transformers/processing_utils.py#L897
             if model_input.is_embed is not None:
-                mm_token_type_ids = model_input.is_embed.to(dtype=input_ids.dtype)
-                assert mm_token_type_ids.shape == input_ids.shape, (
-                    f"is_embed shape {tuple(mm_token_type_ids.shape)} "
+                assert model_input.is_embed.shape == input_ids.shape, (
+                    f"is_embed shape {tuple(model_input.is_embed.shape)} "
                     f"!= input_ids shape {tuple(input_ids.shape)}"
                 )
+                mm_token_type_ids = model_input.is_embed
             else:
+                # text-only data
                 mm_token_type_ids = torch.zeros_like(input_ids)
-                mm_token_type_ids[input_ids == self.model.config.image_token_id] = 1
             pixel_values, image_position_ids = self.get_image_values(model_input)
-            print("@@@ input_ids", input_ids)
+            print("@@@ input_ids", input_ids.shape, input_ids)
             print("@@@ mm_token_type_ids", mm_token_type_ids)
+            print("@@@ count", (mm_token_type_ids == -1).sum().item())
             print("@@@ is_embed (from runner)", model_input.is_embed)
             inputs_embeds = self.model._preprocess_prefill(
                 input_ids,

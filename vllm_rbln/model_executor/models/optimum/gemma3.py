@@ -26,6 +26,7 @@ from vllm.model_executor.models.gemma3_mm import (
 from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.model_executor.models.interfaces_base import VllmModelForTextGeneration
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.inputs import PlaceholderRange
 
 from .base import ModelInputForRBLN, version_error
 from .model_base import RBLNOptimumDecoderMixin, RBLNOptimumModelBase
@@ -37,15 +38,19 @@ PAD_TOKEN_ID = 0
 
 
 class RBLNGemma3MultiModalProcessor(Gemma3MultiModalProcessor):
-    def _pad_for_gemma3(self, prompt_ids: list[int]):
+    def _pad_for_gemma3(self, prompt_ids: list[int]) -> tuple[list[int], int]:
         token_type_ids = (
             torch.tensor(prompt_ids) == self.info.get_hf_processor().image_token_id
         )
 
         image_prefill_chunk_size = self.info.get_hf_processor().image_seq_length
-        # Find image start positions
+        # Find image start positions. Cast to Python int so downstream arithmetic
+        # stays in int-land — torch.where(...) yields 0-d tensors, and propagating
+        # those into `padded_seq_len` makes it a tensor too, which then poisons
+        # `PlaceholderRange.offset` and trips msgspec validation on the IPC path
+        # (`Expected int, got array`).
         image_starts = [
-            s
+            int(s)
             for s in torch.where(token_type_ids)[0]
             if torch.all(token_type_ids[s : s + image_prefill_chunk_size])
         ]
@@ -58,14 +63,42 @@ class RBLNGemma3MultiModalProcessor(Gemma3MultiModalProcessor):
             padded_seq_len += pad_needed
         # Left padding for Gemma3 image boundary alignment
         prompt_ids = [PAD_TOKEN_ID] * padded_seq_len + prompt_ids
-        return prompt_ids
+        return prompt_ids, padded_seq_len
 
     def apply(self, *args, **kwargs):
         # NOTE: Check if padding works correctly
         output = super().apply(*args, **kwargs)
-        prompt_ids = self._pad_for_gemma3(output["prompt_token_ids"])
+        padded_prompt_ids, padded_seq_len = self._pad_for_gemma3(
+            output["prompt_token_ids"]
+        )
+        output["prompt_token_ids"] = padded_prompt_ids
 
-        output["prompt_token_ids"] = prompt_ids
+        # Shift each image PlaceholderRange.offset by the prepended pad length.
+        #
+        # Only `offset` needs updating — `length` and `is_embed` stay as-is —
+        # because in Gemma3:
+        #   1. PAD is inserted only at the FRONT of the prompt (left-padding).
+        #   2. Each image is a fixed `image_seq_length` that fits exactly in
+        #      one chunk.
+        # → No PAD ever lands inside a placeholder range; every slot in the
+        #   range is still an image-embedding slot.
+        #
+        # (Contrast Gemma4: variable-length blocks with PAD on both sides
+        # within a chunk → its `length` and `is_embed` get rebuilt too.)
+        image_ranges = (
+            output["mm_placeholders"].get("image")
+            if output.get("mm_placeholders")
+            else None
+        )
+        if image_ranges and padded_seq_len:
+            output["mm_placeholders"]["image"] = [
+                PlaceholderRange(
+                    offset=r.offset + padded_seq_len,
+                    length=r.length,
+                    is_embed=r.is_embed,
+                )
+                for r in image_ranges
+            ]
 
         return output
 
@@ -81,6 +114,11 @@ class RBLNOptimumGemma3ForConditionalGeneration(
     VllmModelForTextGeneration,
     SupportsMultiModal,
 ):
+    # Opt-in flag read by the runner to build the per-position `is_embed`
+    # label mask (1=image, 0=text/PAD) from MultiModalFeatureSpec and pass
+    # it through ModelInputForRBLN. Only Gemma-family models need this.
+    requires_is_embed: bool = True
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -143,12 +181,18 @@ class RBLNOptimumGemma3ForConditionalGeneration(
             inputs_embeds = None
             prefill_batch_idx = sliding_window_table_ids[0]
             local_block_table_id = torch.tensor([prefill_batch_idx], dtype=torch.int16)
-            # FIXME It is disappeared in transformers 5.5.4
-            # token_type_ids model_input != token_type_ids of gemma3
-            # https://github.com/huggingface/transformers/blob/d0c9c66d1c09df3cd70bf036e813d88337b20d4c/src/transformers/models/gemma3/processing_gemma3.py#L143
-            token_type_ids = torch.zeros_like(input_ids)
-            token_type_ids[input_ids == self.model.config.image_token_index] = 1
 
+            if model_input.is_embed is not None:
+                assert model_input.is_embed.shape == input_ids.shape, (
+                    f"is_embed shape {tuple(model_input.is_embed.shape)} "
+                    f"!= input_ids shape {tuple(input_ids.shape)}"
+                )
+                mm_token_type_ids = (model_input.is_embed == 1).to(
+                    dtype=input_ids.dtype
+                )
+            else:
+                # text-only input
+                mm_token_type_ids = torch.zeros_like(input_ids)
             pixel_values = self.get_pixel_values(model_input)
             inputs_embeds = self.model._preprocess_prefill(
                 input_ids, inputs_embeds, pixel_values
@@ -163,7 +207,7 @@ class RBLNOptimumGemma3ForConditionalGeneration(
                 attention_mask=attention_mask,
                 local_block_tables=local_block_table_id,
                 block_tables=block_tables,
-                token_type_ids=token_type_ids,
+                token_type_ids=mm_token_type_ids,
             )
             logits = output.logits
             updated_attention_mask = output.attention_mask
