@@ -43,7 +43,6 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
-import vllm_rbln.model_executor.layers.rotary_embedding.gemma4_rope  # noqa: F401
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -70,18 +69,7 @@ from vllm.transformers_utils.model_arch_config_convertor import (
     ModelArchConfigConvertorBase,
 )
 
-
-def _gemma4_materialized_v_proj_weight(weight: torch.Tensor) -> torch.Tensor:
-    copied = weight.clone()
-    flat = copied.flatten()
-    original = flat[0].clone()
-    delta = torch.tensor(
-        torch.finfo(copied.dtype).eps,
-        dtype=torch.float32,
-        device=copied.device,
-    )
-    flat[0] = (original.float() + delta).to(dtype=copied.dtype)
-    return copied
+import vllm_rbln.model_executor.layers.rotary_embedding.gemma4_rope  # noqa: F401
 
 
 class Gemma4TextConfig(PretrainedConfig):
@@ -219,7 +207,7 @@ def _patch_gemma4_tokenizer_compat() -> None:
                     f"but got: {type(value)}"
                 )
 
-    patched._vllm_rbln_gemma4_patched = True
+    patched._vllm_rbln_gemma4_patched = True  # type: ignore[attr-defined]
     PreTrainedTokenizerBase._set_model_specific_special_tokens = patched
 
 
@@ -571,9 +559,7 @@ class Gemma4DecoderLayer(nn.Module):
             gate = self.per_layer_input_gate(hidden_states)
             gate = torch.nn.functional.gelu(gate, approximate="tanh")
             per_layer_hidden_states = gate * per_layer_input
-            per_layer_hidden_states = self.per_layer_projection(
-                per_layer_hidden_states
-            )
+            per_layer_hidden_states = self.per_layer_projection(per_layer_hidden_states)
             per_layer_hidden_states = self.post_per_layer_input_norm(
                 per_layer_hidden_states
             )
@@ -791,9 +777,7 @@ class Gemma4Model(nn.Module):
         ):
             layer_per_input = None
             if per_layer_inputs is not None:
-                layer_per_input = per_layer_inputs[
-                    ..., self.start_layer + layer_idx, :
-                ]
+                layer_per_input = per_layer_inputs[..., self.start_layer + layer_idx, :]
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
@@ -957,10 +941,6 @@ class Gemma4ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
             config.num_key_value_heads,
         )
 
-        # NOTE(RBLN): This is a workaround to materialize Gemma4 full-attention v_proj weights from k_proj as near-copies,
-        # to avoid compilation failure when the value of k and v are identical, and v_norm is present.
-        materialize_v_proj = os.getenv("GEMMA4_MATERIALIZE_V_PROJ", "False").lower() in ("true", "1")
-
         num_attention_heads = config.num_attention_heads
 
         def actual_dims_for_layer(layer_idx: int) -> tuple[int, int]:
@@ -1036,11 +1016,7 @@ class Gemma4ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
                     if match and int(match.group(1)) in k_eq_v_layer_indices:
                         yield name, pad_for_layer(name, weight)
                         v_name = name.replace("k_proj", "v_proj")
-                        v_weight = (
-                            _gemma4_materialized_v_proj_weight(weight)
-                            if materialize_v_proj
-                            else weight.clone()
-                        )
+                        v_weight = weight.clone()
                         yield v_name, pad_for_layer(v_name, v_weight)
                         continue
 
