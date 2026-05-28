@@ -75,9 +75,7 @@ class RBLNMedusaProposer(MedusaProposer):
         if not envs.VLLM_DISABLE_COMPILE_CACHE:
             options["cache_dir"] = os.path.join(envs.VLLM_CACHE_ROOT, "rbln")
         if envs.VLLM_RBLN_COMPILE_ONLY:
-            # Compile + cache on a dummy device so a CPU-only host can populate
-            # the cache without an NPU (see RblnPlatform.check_and_update_config).
-            options["compile_only"] = True
+            options["mode"] = ["strict", "compile_only"]
 
         return torch.compile(
             model,

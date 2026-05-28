@@ -168,7 +168,8 @@ def test_compile_only_injected_into_options(monkeypatch, module_path):
     monkeypatch.delenv("VLLM_DISABLE_COMPILE_CACHE", raising=False)
 
     options = _capture_compile_options(monkeypatch, module)
-    assert options["compile_only"] is True
+    assert "compile_only" in options["mode"]
+    assert "strict" in options["mode"]
     # compile-only requires a cache_dir to write the artifact to.
     assert options.get("cache_dir")
 
@@ -189,4 +190,4 @@ def test_compile_only_absent_when_flag_unset(monkeypatch, module_path):
     monkeypatch.delenv("VLLM_DISABLE_COMPILE_CACHE", raising=False)
 
     options = _capture_compile_options(monkeypatch, module)
-    assert "compile_only" not in options
+    assert options["mode"] == "strict"
