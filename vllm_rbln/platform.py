@@ -304,6 +304,28 @@ class RblnPlatform(Platform):
                     "RBLN_PROFILER is not supported when using vLLM model parallel "
                     "(TP, DP, EP, or PP)."
                 )
+
+            if (
+                parallel_config.data_parallel_size > 1
+                and scheduler_config.max_num_batched_tokens
+                % scheduler_config.max_num_seqs
+                != 0
+            ):
+                raise ValueError(
+                    "max_num_batched_tokens must be divisible by max_num_seqs "
+                    "when DP enabled."
+                )
+
+            if (
+                parallel_config.data_parallel_size > 1
+                or parallel_config.enable_expert_parallel
+            ) and not envs.VLLM_RBLN_USE_MOE_TOKENS_MASK:
+                raise ValueError(
+                    "VLLM_RBLN_USE_MOE_TOKENS_MASK is required when DP or EP enabled: "
+                    "the mask marks padded tokens introduced by DP multicast. "
+                    "Set VLLM_RBLN_USE_MOE_TOKENS_MASK=1 (default)."
+                )
+
             os.environ["RBLN_CTX_STANDALONE"] = "1"
             ccl_async_mode = os.environ.get("RBLN_FORCE_CCL_ASYNC")
             # NOTE If users don't set RBLN_FORCE_CCL_ASYNC, we will set it to 1

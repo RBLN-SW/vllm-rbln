@@ -28,12 +28,8 @@ if TYPE_CHECKING:
     VLLM_RBLN_FLASH_CAUSAL_ATTN: bool = True
     VLLM_RBLN_BATCH_ATTN_OPT: bool = False
     VLLM_RBLN_DISABLE_MM: bool = False
-    VLLM_RBLN_DP_IMPL: str = "padded_decode"
     VLLM_RBLN_USE_MOE_TOKENS_MASK: bool = True
     VLLM_RBLN_ENFORCE_MODEL_FP32: bool = False
-    VLLM_RBLN_MOE_CUSTOM_KERNEL: bool = True
-    VLLM_RBLN_MOE_USE_OPT_KERNEL: bool = True
-    VLLM_RBLN_DP_INPUT_ALL_GATHER: bool = True
     VLLM_RBLN_LOGITS_ALL_GATHER: bool = True
     VLLM_RBLN_NUM_RAY_NODES: int = 1
     VLLM_RBLN_METRICS: bool = False
@@ -46,24 +42,8 @@ if TYPE_CHECKING:
     VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS: list[int] = []
     VLLM_RBLN_USE_CUSTOM_KERNEL: bool = False
     VLLM_RBLN_AUTO_PORT: bool = True
-    VLLM_RBLN_MOE_REDUCE_SCATTER: bool = False
     VLLM_RBLN_PROFILER: bool = False
     VLLM_RBLN_SUB_BLOCK_CACHE: bool = True
-
-
-def get_dp_impl() -> str:
-    dp_impl = os.environ.get("VLLM_RBLN_DP_IMPL")
-    if dp_impl is None:
-        return "padded_decode"
-    # default is padded_decode
-    # dummy_prefill will be deprecated in the future
-    choices = set(["padded_decode", "dummy_prefill"])
-    current_impl = dp_impl.lower()
-    if current_impl not in choices:
-        raise ValueError(
-            f"Invalid VLLM_RBLN_DP_IMPL: {current_impl}, Valid choices: {choices}"
-        )
-    return current_impl
 
 
 def get_decode_batch_bucket_strategy() -> str:
@@ -167,8 +147,6 @@ environment_variables = {
     "VLLM_RBLN_DISABLE_MM": (
         lambda: os.environ.get("VLLM_RBLN_DISABLE_MM", "False").lower() in ("true", "1")
     ),
-    # DP implementation, see choices in get_dp_impl
-    "VLLM_RBLN_DP_IMPL": get_dp_impl,
     # If true, it uses the tokens mask applied to moe expert kernel
     "VLLM_RBLN_USE_MOE_TOKENS_MASK": (
         lambda: (
@@ -187,27 +165,6 @@ environment_variables = {
     "VLLM_RBLN_ENFORCE_MODEL_FP32": (
         lambda: (
             os.environ.get("VLLM_RBLN_ENFORCE_MODEL_FP32", "False").lower()
-            in ("true", "1")
-        )
-    ),
-    # use moe custom kernel, by default disabled
-    "VLLM_RBLN_MOE_CUSTOM_KERNEL": (
-        lambda: (
-            os.environ.get("VLLM_RBLN_MOE_CUSTOM_KERNEL", "True").lower()
-            in ("true", "1")
-        )
-    ),
-    # enable moe optimization if RBLN_MoE_OPT is set to 1
-    "VLLM_RBLN_MOE_USE_OPT_KERNEL": (
-        lambda: (
-            os.environ.get("VLLM_RBLN_MOE_USE_OPT_KERNEL", "True").lower()
-            in ("true", "1")
-        )
-    ),
-    # DP_INPUT_ALL_GATHER, use DP input all_gather
-    "VLLM_RBLN_DP_INPUT_ALL_GATHER": (
-        lambda: (
-            os.environ.get("VLLM_RBLN_DP_INPUT_ALL_GATHER", "True").lower()
             in ("true", "1")
         )
     ),
@@ -255,13 +212,6 @@ environment_variables = {
     "VLLM_RBLN_USE_CUSTOM_KERNEL": (
         lambda: (
             os.environ.get("RBLN_USE_CUSTOM_KERNEL", "False").lower() in ("true", "1")
-        )
-    ),
-    # Use reduce_scatter instead of all_reduce in MoE combine phase
-    "VLLM_RBLN_MOE_REDUCE_SCATTER": (
-        lambda: (
-            os.environ.get("VLLM_RBLN_MOE_REDUCE_SCATTER", "False").lower()
-            in ("true", "1")
         )
     ),
     "VLLM_RBLN_PROFILER": (

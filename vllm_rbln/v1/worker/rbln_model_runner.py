@@ -337,7 +337,10 @@ class RBLNModelRunner:
             self.bucketing_manager.decode_batch_buckets,
         )
 
-        self.specialized_moe_decode = False
+        self.specialized_moe_decode = (
+            parallel_config.data_parallel_size > 1
+            and envs.VLLM_RBLN_SPECIALIZE_MOE_DECODE
+        )
 
     def _get_positions(self, num_tokens: Any):
         assert not isinstance(num_tokens, int)
@@ -1695,7 +1698,12 @@ class RBLNModelRunner:
 
     @torch.inference_mode()
     def _dummy_run(
-        self, num_reqs: int, num_tokens_per_req: int, is_prefill: bool
+        self,
+        num_reqs: int,
+        num_tokens_per_req: int,
+        is_prefill: bool,
+        *,
+        num_tokens_padded: int | None = None,
     ) -> None:
         """
         Run a dummy forward pass to warm up for the model.
@@ -1720,9 +1728,10 @@ class RBLNModelRunner:
         else:
             self.input_batch.num_tokens_no_spec[:num_reqs] = 1
 
-        num_reqs_padded, num_tokens_padded, num_tokens_across_dp = (
+        num_reqs_padded, _num_tokens_padded, num_tokens_across_dp = (
             self._determine_batch_padding(num_reqs, num_tokens_unpadded)
         )
+        num_tokens_padded = num_tokens_padded or _num_tokens_padded
 
         cum_num_tokens, _ = self._get_cumsum_and_arange(num_scheduled_tokens)
         query_start_loc_np = self.query_start_loc.numpy()
@@ -2365,7 +2374,6 @@ class RBLNModelRunner:
             )
             num_tokens_padded = num_reqs_padded
 
-        # TODO(RBLN): Determine pads across dp
         return num_reqs_padded, num_tokens_padded, num_tokens_across_dp
 
     def _update_kv_cache_base_bindings(
@@ -2405,6 +2413,18 @@ class RBLNModelRunner:
         for num_req in self.bucketing_manager.decode_batch_buckets:
             for query_len in query_lens:
                 self._dummy_run(num_req, query_len, False)
+
+        if self.specialized_moe_decode:
+            # NOTE(RBLN): Compile decode graph with prefill-sized padding to cover
+            # the DP-asymmetric case (this rank decoding while another rank prefills).
+            # The bit-encoded all_reduce in get_dp_padding forces num_padded_tokens
+            # to max_num_tokens whenever any rank prefills, which the small-bucket
+            # decode graphs from 2. decode above cannot satisfy.
+            assert self.speculative_config is None
+            for num_req in self.bucketing_manager.decode_batch_buckets:
+                self._dummy_run(
+                    num_req, 1, False, num_tokens_padded=self.max_num_tokens
+                )
 
         # 3. compute_logits
         if not self.use_wrapped_compute_logits:
