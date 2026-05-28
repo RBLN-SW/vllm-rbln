@@ -80,17 +80,16 @@ class EXAONE4_5ProcessingInfo(Qwen2_5_VLProcessingInfo):
 
 
 class EXAONE4_5MultiModalProcessor(Qwen2_5_VLMultiModalProcessor):
-    def apply(self, *args, **kwargs):
-        hf_processor_mm_kwargs = kwargs.pop("hf_processor_mm_kwargs", {})
-        do_sample_frames = hf_processor_mm_kwargs.get("do_sample_frames", False)
-        if do_sample_frames:
+    def apply(self, inputs, timing_ctx):
+        hf_processor_mm_kwargs = dict(inputs.hf_processor_mm_kwargs or {})
+        if hf_processor_mm_kwargs.get("do_sample_frames", False):
             raise NotImplementedError(
                 "`do_sample_frames=True` is not supported yet. "
                 "Please set `do_sample_frames` to False."
             )
         hf_processor_mm_kwargs.pop("fps", None)
-        kwargs["hf_processor_mm_kwargs"] = hf_processor_mm_kwargs
-        return super().apply(*args, **kwargs)
+        inputs.hf_processor_mm_kwargs = hf_processor_mm_kwargs
+        return super().apply(inputs, timing_ctx)
 
 
 @MULTIMODAL_REGISTRY.register_processor(
