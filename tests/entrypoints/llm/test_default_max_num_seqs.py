@@ -52,6 +52,21 @@ def test_llm_unset_max_num_seqs_defaults_to_one(monkeypatch, mode):
 
 
 @pytest.mark.parametrize("mode", MODES)
+def test_llm_explicit_none_max_num_seqs_defaults_to_one(monkeypatch, mode):
+    """Passing max_num_seqs=None explicitly behaves like omitting it.
+
+    The override resolves an unset value to the RBLN default; an explicit None
+    must take the same path (the resolution only checks `is None`). The serve
+    side has no analogue because its argparse rejects "None"/"null"/"" outright.
+    """
+    resolved = _load_max_num_seqs(monkeypatch, mode, max_num_seqs=None)
+    assert resolved == RBLN_DEFAULT_MAX_NUM_SEQS, (
+        f"LLM(max_num_seqs=None) with VLLM_RBLN_USE_VLLM_MODEL={mode} should "
+        f"default to {RBLN_DEFAULT_MAX_NUM_SEQS}, got {resolved}"
+    )
+
+
+@pytest.mark.parametrize("mode", MODES)
 def test_llm_explicit_max_num_seqs_is_preserved(monkeypatch, mode):
     resolved = _load_max_num_seqs(monkeypatch, mode, max_num_seqs=EXPLICIT_MAX_NUM_SEQS)
     assert resolved == EXPLICIT_MAX_NUM_SEQS, (
