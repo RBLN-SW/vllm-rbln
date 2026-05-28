@@ -1044,8 +1044,7 @@ class Gemma4ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
                     if match and int(match.group(1)) in k_eq_v_layer_indices:
                         yield name, pad_for_layer(name, weight)
                         v_name = name.replace("k_proj", "v_proj")
-                        v_weight = weight.clone()
-                        yield v_name, pad_for_layer(v_name, v_weight)
+                        yield v_name, pad_for_layer(v_name, weight)
                         continue
 
                 yield name, pad_for_layer(name, weight)
