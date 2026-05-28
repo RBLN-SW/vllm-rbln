@@ -345,6 +345,8 @@ class Gemma4Attention(nn.Module):
             rope_parameters = dict(config.rope_parameters)
 
         kv_sharing_target_layer_name = None
+        self.kv_sharing_target_layer_name = None
+        self.layer_name = f"{prefix}.attn"
         self.is_kv_shared_layer = False
         num_kv_shared_layers = getattr(config, "num_kv_shared_layers", 0)
         if num_kv_shared_layers > 0:
@@ -361,6 +363,7 @@ class Gemma4Attention(nn.Module):
                     f"{prefix_before_layers}.layers."
                     f"{kv_shared_layer_index}.self_attn.attn"
                 )
+                self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
 
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -385,6 +388,7 @@ class Gemma4Attention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        shared_kv_tensors: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
         **kwargs,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
@@ -411,8 +415,16 @@ class Gemma4Attention(nn.Module):
                 v = v[..., : self.head_dim]
             v = self.v_norm(v)
             v = v.flatten(-2, -1)
+            if shared_kv_tensors is not None:
+                shared_kv_tensors[self.layer_name] = (k, v)
         else:
-            q = self.rotary_emb(positions, q, k)[0]
+            if shared_kv_tensors is None or self.kv_sharing_target_layer_name is None:
+                raise ValueError("KV-shared Gemma4 layer requires shared K/V tensors.")
+            dummy_k = q[..., : self.kv_size]
+            q = self.rotary_emb(positions, q, dummy_k)[0]
+            k, v = shared_kv_tensors[self.kv_sharing_target_layer_name]
+            k = k.clone()
+            v = v.clone()
 
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
@@ -541,9 +553,11 @@ class Gemma4DecoderLayer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         residual = hidden_states
         hidden_states = self.input_layernorm(residual)
+        shared_kv_tensors = kwargs.pop("shared_kv_tensors", None)
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
+            shared_kv_tensors=shared_kv_tensors,
             **kwargs,
         )
         hidden_states = self.post_attention_layernorm(hidden_states)
@@ -581,6 +595,7 @@ class Gemma4Model(nn.Module):
         self.hidden_size_per_layer_input = getattr(
             config, "hidden_size_per_layer_input", 0
         )
+        self.has_kv_shared_layers = getattr(config, "num_kv_shared_layers", 0) > 0
         self.vocab_size_per_layer_input = getattr(
             config, "vocab_size_per_layer_input", config.vocab_size
         )
@@ -772,6 +787,9 @@ class Gemma4Model(nn.Module):
                     self.hidden_size_per_layer_input,
                 )
 
+        shared_kv_tensors: dict[str, Any] | None = (
+            {} if self.has_kv_shared_layers else None
+        )
         for layer_idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer)
         ):
@@ -783,6 +801,7 @@ class Gemma4Model(nn.Module):
                 hidden_states,
                 residual,
                 per_layer_input=layer_per_input,
+                shared_kv_tensors=shared_kv_tensors,
                 **kwargs,
             )
 

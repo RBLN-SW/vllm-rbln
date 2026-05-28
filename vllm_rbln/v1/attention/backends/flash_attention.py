@@ -1292,8 +1292,6 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         self.block_size = vllm_config.cache_config.block_size
         self.max_model_len = vllm_config.model_config.max_model_len
 
-        if kv_sharing_target_layer_name is not None:
-            raise NotImplementedError("KV sharing is not supported in RBLN.")
         if logits_soft_cap is not None:
             logger.warning_once(
                 "RBLN Attention Backend does not support logits soft cap. "
@@ -1435,6 +1433,11 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         #  block2: 10, block3: 5, ...]
         # attn_output = [batch,H,4,L,D]
         assert kv_cache is not None
+        if self.kv_sharing_target_layer_name is not None:
+            # RBLN custom attention ops update the KV cache inside the op.
+            # KV-shared layers must read the target layer cache without
+            # mutating it again.
+            kv_cache = kv_cache.clone()
 
         if self.sliding_window is not None:
             assert self.sliding_window == kv_cache.size(-2), (
