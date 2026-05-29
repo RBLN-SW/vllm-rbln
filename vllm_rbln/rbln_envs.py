@@ -45,7 +45,6 @@ if TYPE_CHECKING:
     VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS: list[int] = []
     VLLM_RBLN_USE_CUSTOM_KERNEL: bool = False
     VLLM_RBLN_AUTO_PORT: bool = True
-    VLLM_RBLN_CCL_ALL2ALL_P2P: bool = False
     VLLM_RBLN_DISPATCH_ALL2ALL: bool = False
     VLLM_RBLN_COMBINE_ALL2ALL: bool = False
     VLLM_RBLN_MOE_REDUCE_SCATTER: bool = False
@@ -261,13 +260,6 @@ environment_variables = {
     ),
     "VLLM_RBLN_PROFILER": (
         lambda: os.environ.get("RBLN_PROFILER", "False").lower() in ("true", "1")
-    ),
-    # Use naive P2P all2all (AllToAllX) instead of recursive doubling (AllToAllV)
-    "VLLM_RBLN_CCL_ALL2ALL_P2P": (
-        lambda: (
-            os.environ.get("VLLM_RBLN_CCL_ALL2ALL_P2P", "False").lower()
-            in ("true", "1")
-        )
     ),
     # Use all2all dispatch instead of all-gather for MoE DP dispatch
     "VLLM_RBLN_DISPATCH_ALL2ALL": (
