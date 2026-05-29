@@ -72,22 +72,45 @@ class RBLNGemma4MultiModalProcessor(Gemma4MultiModalProcessor):
             f"Expected each image block to be {EXPECTED_IMAGE_TOKENS} tokens, "
             f"got {block_lengths.tolist()}"
         )
-        padded_seq_len = 0
-        for image_start in image_starts:
-            # Align the block start to the next prefill-chunk boundary so the whole
-            # image block stays within a single prefill chunk. The negation makes
-            # `% chunk` yield the distance UP to the next multiple (0 when already
-            # aligned), instead of the distance past the previous one. With chunk=512:
-            #   pos=530: (-530) % 512 = (-530 + 1024) % 512 = 494  # up to next (1024)
-            #   pos=512: (-512) % 512 = 0                          # already aligned
-            #   pos=0:   (   0) % 512 = 0                          # already aligned
-            #   pos=1:   (  -1) % 512 = 511                        # 511 -> reach 512
-            pos = int(image_start) + padded_seq_len
-            pad_needed = (-pos) % IMAGE_PREFILL_CHUNK_SIZE
-            padded_seq_len += pad_needed
-        # Left padding for Gemma4 image boundary alignment
-        prompt_ids = [PAD_TOKEN_ID] * padded_seq_len + prompt_ids
-        return prompt_ids
+        # Pad BOTH before and after each image block so no prefill chunk mixes
+        # image tokens with text tokens. Only aligning the image start (the
+        # earlier "all PAD at front" approach) leaves the chunk's tail filled
+        # with the text that follows the image — violating the no-mixing rule.
+        #
+        #   - pre-pad  : align block start to chunk boundary
+        #                → image block always opens a fresh chunk
+        #   - post-pad : align position right AFTER the block to chunk boundary
+        #                → following text (e.g. eoi, next prompt) always opens
+        #                  a fresh chunk
+        #
+        # `(-len(out)) % chunk` gives the distance UP to the next multiple
+        # (0 when already aligned). Long image blocks (> chunk) span multiple
+        # chunks naturally; only the tail of the last chunk needs post-pad.
+        # With chunk=512:
+        #   len(out)=530 → (-530) % 512 = 494   # bump to next boundary 1024
+        #   len(out)=512 → 0                    # already aligned
+        #   len(out)=0   → 0                    # already aligned
+        #   len(out)=1   → 511                  # 511 pads → reach 512
+        starts = image_starts.tolist()
+        ends = image_ends.tolist()
+        out: list[int] = []
+        cursor = 0
+        for s, e in zip(starts, ends):
+            # text / markers (e.g. boi) before this image block
+            out.extend(prompt_ids[cursor:s])
+            print("@@@ pre-pad", (-len(out)) % IMAGE_PREFILL_CHUNK_SIZE)
+            # pre-pad → image block starts on chunk boundary
+            out.extend([PAD_TOKEN_ID] * ((-len(out)) % IMAGE_PREFILL_CHUNK_SIZE))
+            # image block itself
+            out.extend(prompt_ids[s : e + 1])
+            print("@@@ post-pad", (-len(out)) % IMAGE_PREFILL_CHUNK_SIZE)
+            # post-pad → next position (eoi / text) starts on chunk boundary
+            out.extend([PAD_TOKEN_ID] * ((-len(out)) % IMAGE_PREFILL_CHUNK_SIZE))
+            cursor = e + 1
+        # trailing text after the last image block
+        out.extend(prompt_ids[cursor:])
+        print("@@@ total pad", len(out) - len(prompt_ids))
+        return out
 
     def apply(self, *args, **kwargs):
         # NOTE: Check if padding works correctly
@@ -199,6 +222,7 @@ class RBLNOptimumGemma4ForConditionalGeneration(
             )
             logits = output.logits
             updated_padded_cache_length = output.padded_cache_lengths
+
             updated_attention_mask = output.attention_mask
 
             assert len(running_requests_ids) == 1

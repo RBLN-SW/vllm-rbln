@@ -42,13 +42,12 @@ def generate_prompts(batch_size: int, model_id: str):
                 "content": [
                     {"type": "image"},
                     {"type": "text", "text": dataset[i]["question"]},
-                    {"type": "image"},
                 ],
             },
         ]
         for i in range(batch_size)
     ]
-    images = [[dataset[i]["image"], dataset[i]["image"]] for i in range(batch_size)]
+    images = [[dataset[i]["image"]] for i in range(batch_size)]
     # images = [[dataset[i]["image"]] for i in range(batch_size)]
 
     texts = processor.apply_chat_template(
@@ -112,8 +111,8 @@ async def main(
 
 
 def entry_point(
-    num_input_prompt: int = 5,
-    model_id: str = "./gemma4-31b-b4",
+    num_input_prompt: int = 1,
+    model_id: str = "/home/eunji.lee/nas_data/0529_models/gemma4-31b-b1-new",
 ):
     asyncio.run(
         main(
