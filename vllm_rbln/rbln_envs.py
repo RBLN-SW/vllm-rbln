@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_MOE_REDUCE_SCATTER: bool = False
     VLLM_RBLN_SUB_BLOCK_CACHE: bool = True
     VLLM_RBLN_USE_DEVICE_TENSOR: bool = False
+    VLLM_RBLN_GEMMA4_PAD_QKV_PROJ: bool = False
 
 
 def get_dp_impl() -> str:
@@ -278,6 +279,13 @@ environment_variables = {
     "VLLM_RBLN_USE_DEVICE_TENSOR": (
         lambda: (
             os.environ.get("VLLM_RBLN_USE_DEVICE_TENSOR", "False").lower()
+            in ("true", "1")
+        )
+    ),
+    # Pad Gemma4 QKV projection shapes for mixed attention layers.
+    "VLLM_RBLN_GEMMA4_PAD_QKV_PROJ": (
+        lambda: (
+            os.environ.get("VLLM_RBLN_GEMMA4_PAD_QKV_PROJ", "False").lower()
             in ("true", "1")
         )
     ),

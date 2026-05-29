@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 import re
 from collections.abc import Iterable
 from contextlib import suppress
@@ -69,7 +68,7 @@ from vllm.transformers_utils.model_arch_config_convertor import (
     ModelArchConfigConvertorBase,
 )
 
-import vllm_rbln.model_executor.layers.rotary_embedding.gemma4_rope  # noqa: F401
+import vllm_rbln.rbln_envs as envs
 
 
 class Gemma4TextConfig(PretrainedConfig):
@@ -462,7 +461,7 @@ class Gemma4DecoderLayer(nn.Module):
         else:
             num_kv_heads = config.num_key_value_heads
 
-        if os.environ.get("GEMMA4_PAD_QKV_PROJ", "False").lower() in ("true", "1"):
+        if envs.VLLM_RBLN_GEMMA4_PAD_QKV_PROJ:
             # NOTE(RBLN): This is a workaround to avoid compilation failure
             # when the value of num_kv_heads differs between full-attention and
             # sliding-attention layers.
@@ -957,10 +956,7 @@ class Gemma4ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
                 if layer_type == "full_attention":
                     k_eq_v_layer_indices.add(idx)
 
-        pad_qkv = os.environ.get("GEMMA4_PAD_QKV_PROJ", "False").lower() in (
-            "true",
-            "1",
-        )
+        pad_qkv = envs.VLLM_RBLN_GEMMA4_PAD_QKV_PROJ
         padded_head_dim = max(
             getattr(config, "global_head_dim", 0) or 0, config.head_dim
         )
