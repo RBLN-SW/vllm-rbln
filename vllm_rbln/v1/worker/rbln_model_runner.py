@@ -2778,7 +2778,11 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self,
         copy_ops: "list[KVCacheCopyOp]",
     ) -> None:
-        if self.model_config.enforce_eager or not envs.VLLM_RBLN_COMPILE_MODEL:
+        if (
+            envs.VLLM_RBLN_USE_DEVICE_TENSOR
+            or self.model_config.enforce_eager
+            or not envs.VLLM_RBLN_COMPILE_MODEL
+        ):
             for op in copy_ops:
                 for kv_cache in self.kv_caches:
                     kv_cache[:, op.dst_block_id, :, :, : op.num_tokens, :] = kv_cache[
@@ -3038,11 +3042,16 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 host_time = None
                 device_time = None
                 ccl_time = None
+                prepare_time = None
 
                 if reports is not None and len(reports) > 0:
                     host_time = reports[0].get("total_host", None)
                     device_time = reports[0].get("total_device", None)
                     ccl_time = reports[0].get("total_ccl", None)
+                if reports is not None and len(reports) > 1:
+                    prepare_time = reports[1].get("prepare_input_us", 0) + reports[
+                        1
+                    ].get("prepare_output_us", 0)
 
                 if is_prefill_phase:
                     self.performance_tracker.record_prefill(
@@ -3051,6 +3060,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         host_time=host_time,
                         device_time=device_time,
                         ccl_time=ccl_time,
+                        prepare_time=prepare_time,
                         request_ids=self.input_batch.req_ids,
                     )
                 else:
@@ -3064,6 +3074,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         host_time=host_time,
                         device_time=device_time,
                         ccl_time=ccl_time,
+                        prepare_time=prepare_time,
                         padded_decode=padded_decode,
                         request_ids=self.input_batch.req_ids,
                     )

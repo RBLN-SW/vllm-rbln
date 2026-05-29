@@ -23,11 +23,10 @@ import torch
 @pytest.fixture(autouse=True)
 def fresh_inductor_cache_per_test(monkeypatch):
     worker_id = os.environ.get("PYTEST_XDIST_WORKER", "root")
-    cache_dir = f"/tmp/torchinductor_{worker_id}"
+    cache_dir = f"/tmp/torchinductor_{worker_id}_{os.getpid()}"
     shutil.rmtree(cache_dir, ignore_errors=True)
-
+    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", cache_dir)
     torch._dynamo.reset()
-
     yield
 
 
