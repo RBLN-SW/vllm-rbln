@@ -1488,6 +1488,10 @@ class RBLNModelRunner:
         )
         if hasattr(self.model, "logits_processor"):
             self.logits_processor = self.model.logits_processor
+        elif self.model_config.is_multimodal_model and hasattr(
+            self.model.get_language_model(), "logits_processor"
+        ):
+            self.logits_processor = self.model.get_language_model().logits_processor
         else:
             self.logits_processor = None
         # TODO(RBLN): load lora
