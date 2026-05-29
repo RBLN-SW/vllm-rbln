@@ -417,6 +417,7 @@ class RBLNSampler(VLLMSampler):
             temperature = torch.where(
                 temperature < _SAMPLING_EPS, _GREEDY_EPS, temperature
             )
+        temperature = temperature.to(logits.dtype)
         return logits.div(temperature.unsqueeze(dim=1))
 
 
@@ -427,6 +428,13 @@ WARM_UP_CONFIGS = [
         "all_greedy": True,
         "all_random": False,
         "temperature": 0.0,
+    },
+    {
+        "name": "no_penalty_random",
+        "no_penalties": True,
+        "all_greedy": False,
+        "all_random": True,
+        "temperature": 0.5,
     },
     {
         "name": "no_penalty_topp",
