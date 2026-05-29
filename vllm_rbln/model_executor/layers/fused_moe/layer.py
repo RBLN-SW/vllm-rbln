@@ -24,7 +24,6 @@ from vllm.model_executor.layers.fused_moe.layer import (
 import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
 from vllm_rbln.model_executor.layers.fused_moe.all2all import (  # noqa: F401 — registers custom ops on import
-    CCL_ALL2ALL_GROUP_ID,
     ccl_combine_receive,  # noqa: F811
     ccl_combine_send,  # noqa: F811
     prepare_send_mask_matrix,
@@ -229,18 +228,6 @@ def _apply_grouped_topk_torch(
 ):
     """Apply grouped topk routing in PyTorch.
 
-    Mirrors the relay `_apply_grouped_topk_mask` structure with two branches:
-      * `e_score_correction_bias is not None`: scatter selected groups into a
-        `[T, G, epg]` tensor filled with `-inf`, flatten to `[E, T]`, then run
-        topk routing on the full expert space — bias indices align with expert
-        IDs, so the bias add must happen there.
-      * No bias: run topk routing on the smaller gathered `[topk_group*epg, T]`
-        space, then scatter the result back to `[E, T]`.
-
-    The trailing topk + scatter blocks correspond to relay's
-    `contrib_topk_routing` kernel, so the compiler can pattern-match each
-    branch to a single kernel.
-
     Args:
         router_logits_2d: [T, E] raw router logits.
         top_k: Number of experts to select per token.
@@ -287,8 +274,6 @@ def _apply_grouped_topk_torch(
         # [T, G, epg] -> [G, epg, T] -> [E, T]
         scores_t = grouped_masked.permute(1, 2, 0).reshape(E, T)
 
-        # contrib_topk_routing-equivalent on full [E, T]: bias-shifted topk for
-        # selection, but weights come from the unbiased scores.
         scores_for_topk = scores_t + e_score_correction_bias.unsqueeze(1)
         _, selected_experts = torch.topk(scores_for_topk, k=top_k, dim=0)
         topk_weights = scores_t.gather(0, selected_experts)
@@ -307,7 +292,6 @@ def _apply_grouped_topk_torch(
     # Flatten gathered groups to [topk_group*epg, T] and run topk routing there.
     gathered_flat = gathered.permute(1, 2, 0).reshape(-1, T)  # [topk_group*epg, T]
 
-    # contrib_topk_routing-equivalent on [topk_group*epg, T]
     if scoring_func == "softmax":
         if renormalize:
             # post_norm: topk first, then softmax on selected values
@@ -633,7 +617,7 @@ def fused_moe_forward_rbln(
                 send_buffer,
                 send_sizes,
                 self.moe_parallel_config.dp_size,
-                CCL_ALL2ALL_GROUP_ID,
+                get_dp_group().unique_name,
             )
 
             # ccl_dispatch_receive → unpacked: [R, max_pad, H]
@@ -671,12 +655,12 @@ def fused_moe_forward_rbln(
                 )
             )
 
-            # ccl_all2all_x: exchange combine buffers (reuse same group ID)
+            # ccl_all2all_x: all2all transfer of combined buffers
             combine_recv_buf = torch.ops.rbln_custom_ops.ccl_all2all_x_kernel(
                 combine_send_buf,
                 combine_send_sizes,
                 self.moe_parallel_config.dp_size,
-                CCL_ALL2ALL_GROUP_ID,
+                get_dp_group().unique_name,
             )
 
             # ccl_combine_receive: unpack + sum-reduce → (max_pad, H)
@@ -812,11 +796,6 @@ def fused_moe_forward_rbln(
                 ).clamp_min(1e-20)
             masked_routing_weights = torch.zeros_like(router_logits_t)  # [E, t]
             masked_routing_weights.scatter_(0, selected_experts, topk_weights)
-
-    # Restore dtype to match hidden_states BEFORE tokens_mask multiply
-    # (scatter_ promotes to float32, but LowerTopKRouting fuses
-    #  scatter+cast(bf16) into contrib_topk_routing with bf16 output;
-    #  multiply must happen after the cast so types match)
 
     use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
     if use_moe_tokens_mask:

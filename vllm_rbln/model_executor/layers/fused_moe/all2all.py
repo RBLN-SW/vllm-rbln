@@ -110,7 +110,7 @@ def ccl_all2all_x_kernel(
     send_buffer: Tensor,
     send_sizes: Tensor,
     ccl_world_size: int,
-    group_id: int,
+    group_name: str,
 ) -> Tensor:
     # CPU stub — returns zeros of correct shape.
     # Real communication happens on device via CCL runtime (rcclAllToAllX).
@@ -125,7 +125,7 @@ def _ccl_all2all_x_kernel_fake(
     send_buffer: Tensor,
     send_sizes: Tensor,
     ccl_world_size: int,
-    group_id: int,
+    group_name: str,
 ) -> Tensor:
     R_dim = ccl_world_size
     t_dim = send_buffer.shape[1]
@@ -320,9 +320,3 @@ def _ccl_combine_receive_fake(
     t_dim = recv_buffer.shape[1]
     H_dim = recv_buffer.shape[2]
     return torch.empty(t_dim, H_dim, dtype=recv_buffer.dtype)
-
-
-# ---------------------------------------------------------------------------
-# CCL All2All group ID
-# ---------------------------------------------------------------------------
-CCL_ALL2ALL_GROUP_ID = 42  ## may make problem in multiple layers ?
