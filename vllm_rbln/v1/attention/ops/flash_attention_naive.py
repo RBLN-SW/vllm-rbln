@@ -16,6 +16,8 @@ import torch
 
 from vllm_rbln import envs
 
+from . import triton_flash_attention_naive  # noqa: F401
+
 
 @torch.library.custom_op(
     "rbln_custom_ops::flash_attention_naive_prefill", mutates_args=["kv_cache"]
@@ -173,18 +175,31 @@ def flash_attention_naive_prefill(
     sinks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if envs.VLLM_RBLN_COMPILE_MODEL:
-        return torch.ops.rbln_custom_ops.flash_attention_naive_prefill(
-            q,
-            k,
-            v,
-            kv_cache,
-            mask,
-            scale,
-            seq_idx,
-            block_tables,
-            scale,  # dummy
-            sinks,
-        )
+        if envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
+            return torch.ops.rbln_triton_ops.flash_attention_naive_prefill(
+                q,
+                k,
+                v,
+                kv_cache,
+                mask,
+                scale,
+                seq_idx,
+                block_tables,
+                scale,  # dummy
+            )
+        else:
+            return torch.ops.rbln_custom_ops.flash_attention_naive_prefill(
+                q,
+                k,
+                v,
+                kv_cache,
+                mask,
+                scale,
+                seq_idx,
+                block_tables,
+                scale,  # dummy
+                sinks,
+            )
 
     raise NotImplementedError
 
@@ -201,17 +216,30 @@ def flash_attention_naive_decode(
     sinks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if envs.VLLM_RBLN_COMPILE_MODEL:
-        return torch.ops.rbln_custom_ops.flash_attention_naive_decode(
-            q,
-            k,
-            v,
-            kv_cache,
-            mask,
-            scale,
-            seq_idx,
-            block_tables,
-            scale,  # dummy
-            sinks,
-        )
+        if envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
+            return torch.ops.rbln_triton_ops.flash_attention_naive_decode(
+                q,
+                k,
+                v,
+                kv_cache,
+                mask,
+                scale,
+                seq_idx,
+                block_tables,
+                scale,  # dummy
+            )
+        else:
+            return torch.ops.rbln_custom_ops.flash_attention_naive_decode(
+                q,
+                k,
+                v,
+                kv_cache,
+                mask,
+                scale,
+                seq_idx,
+                block_tables,
+                scale,  # dummy
+                sinks,
+            )
 
     raise NotImplementedError

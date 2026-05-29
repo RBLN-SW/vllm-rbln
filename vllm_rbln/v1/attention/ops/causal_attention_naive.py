@@ -14,6 +14,10 @@
 
 import torch
 
+from vllm_rbln import envs
+
+from ..ops import triton_causal_attention_naive  # noqa: F401
+
 
 @torch.library.custom_op(
     "rbln_custom_ops::causal_attention_naive_prefill", mutates_args=["kv_cache"]
@@ -77,3 +81,79 @@ def _(
     sinks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(q)
+
+
+def causal_attention_naive_prefill(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    kv_cache: torch.Tensor,
+    seq_idx: torch.Tensor,
+    scale: torch.Tensor,
+    block_tables: torch.Tensor,
+    sinks: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if envs.VLLM_RBLN_COMPILE_MODEL:
+        if envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
+            return torch.ops.rbln_triton_ops.causal_attention_naive_prefill(
+                q,
+                k,
+                v,
+                kv_cache,
+                seq_idx,
+                scale,
+                block_tables,
+                scale,  # dummy
+            )
+        else:
+            return torch.ops.rbln_custom_ops.causal_attention_naive_prefill(
+                q,
+                k,
+                v,
+                kv_cache,
+                seq_idx,
+                scale,
+                block_tables,
+                scale,  # dummy
+                sinks,
+            )
+
+    raise NotImplementedError
+
+
+def causal_attention_naive_decode(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    kv_cache: torch.Tensor,
+    seq_idx: torch.Tensor,
+    scale: torch.Tensor,
+    block_tables: torch.Tensor,
+    sinks: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if envs.VLLM_RBLN_COMPILE_MODEL:
+        if envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
+            return torch.ops.rbln_triton_ops.causal_attention_naive_decode(
+                q,
+                k,
+                v,
+                kv_cache,
+                seq_idx,
+                scale,
+                block_tables,
+                scale,  # dummy
+            )
+        else:
+            return torch.ops.rbln_custom_ops.causal_attention_naive_decode(
+                q,
+                k,
+                v,
+                kv_cache,
+                seq_idx,
+                scale,
+                block_tables,
+                scale,  # dummy
+                sinks,
+            )
+
+    raise NotImplementedError
