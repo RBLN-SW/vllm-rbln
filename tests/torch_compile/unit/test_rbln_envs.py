@@ -92,6 +92,11 @@ def test_rbln_envs():
         got {rbln_envs.VLLM_RBLN_METRICS}"
     )
 
+    assert rbln_envs.VLLM_RBLN_METRICS_FILE == "", (
+        f"Expected VLLM_RBLN_METRICS_FILE to be empty by default, \
+        got {rbln_envs.VLLM_RBLN_METRICS_FILE}"
+    )
+
     assert not rbln_envs.VLLM_RBLN_AUTO_PORT, (
         f"Expected VLLM_RBLN_AUTO_PORT to be False, \
         got {rbln_envs.VLLM_RBLN_AUTO_PORT}"
