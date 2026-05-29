@@ -23,6 +23,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.medusa import MedusaProposer
 
 import vllm_rbln.rbln_envs as envs
+from vllm_rbln.torch_compile_backend import logged_rbln_backend
 
 
 class RBLNMedusaProposer(MedusaProposer):
@@ -69,12 +70,14 @@ class RBLNMedusaProposer(MedusaProposer):
             "guard_filter_fn": torch.compiler.keep_tensor_guards_unsafe,
             "mode": "strict",
         }
+        if envs.VLLM_RBLN_USE_DEVICE_TENSOR:
+            options["model_trace_method"] = "export"
         if not envs.VLLM_DISABLE_COMPILE_CACHE:
             options["cache_dir"] = os.path.join(envs.VLLM_CACHE_ROOT, "rbln")
 
         return torch.compile(
             model,
-            backend="rbln",
+            backend=logged_rbln_backend,
             options=copy(options),
             dynamic=False,
         )

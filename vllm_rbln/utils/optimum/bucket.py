@@ -12,25 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-import shutil
-from unittest.mock import patch
-
-import pytest
-import torch
+import bisect
+from functools import cache
 
 
-@pytest.fixture(autouse=True)
-def fresh_inductor_cache_per_test(monkeypatch):
-    worker_id = os.environ.get("PYTEST_XDIST_WORKER", "root")
-    cache_dir = f"/tmp/torchinductor_{worker_id}_{os.getpid()}"
-    shutil.rmtree(cache_dir, ignore_errors=True)
-    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", cache_dir)
-    torch._dynamo.reset()
-    yield
-
-
-@pytest.fixture(autouse=True)
-def skip_sync_vllm_and_optimum():
-    with patch("vllm_rbln.platform.sync_vllm_and_optimum"):
-        yield
+@cache
+def select_bucket_size(original_batch_size: int, bucket_sizes: tuple) -> int:
+    index = bisect.bisect_left(bucket_sizes, original_batch_size)
+    return bucket_sizes[index]
