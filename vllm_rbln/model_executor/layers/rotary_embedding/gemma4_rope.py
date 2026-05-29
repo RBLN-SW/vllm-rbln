@@ -45,8 +45,7 @@ class Gemma4RotaryEmbedding(RotaryEmbedding):
 
     def _compute_inv_freq(self, base: float) -> torch.Tensor:
         freq_exponents = (
-            torch.arange(0, 2 * self.rope_angles, 2, dtype=torch.float)
-            / self.head_size
+            torch.arange(0, 2 * self.rope_angles, 2, dtype=torch.float) / self.head_size
         )
         inv_freq = 1.0 / (base**freq_exponents)
 
@@ -137,5 +136,5 @@ def gemma4_get_rope(
 
 
 if not getattr(rope_module.get_rope, "_vllm_rbln_gemma4_patched", False):
-    gemma4_get_rope._vllm_rbln_gemma4_patched = True
+    gemma4_get_rope._vllm_rbln_gemma4_patched = True  # type: ignore[attr-defined]
     rope_module.get_rope = gemma4_get_rope
