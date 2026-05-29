@@ -19,7 +19,6 @@ from dataclasses import asdict
 
 import pytest
 from vllm import LLM, EngineArgs, SamplingParams
-from vllm.distributed import cleanup_dist_env_and_memory
 from vllm.inputs import TokensPrompt
 from vllm.v1.metrics.reader import Counter, Metric
 
@@ -49,9 +48,8 @@ def _build_llm(*, enable_prefix_caching: bool) -> LLM:
         enable_chunked_prefill=True,
         max_num_batched_tokens=128,
         enable_prefix_caching=enable_prefix_caching,
-        # First LLM leaks device memory on teardown, so the second LLM
-        # OOMs at default block count. 8 blocks × 1024 = 8192 tokens, enough
-        # to hold the warm-up plus one query.
+        # Use small number of blocks so that two instances can coexist without OOM.
+        # We do this because `del llm` does not realiably clean up device memory.
         num_gpu_blocks_override=8,
         seed=0,
     )
@@ -64,38 +62,20 @@ def _generated_token_ids(outputs) -> list[list[int]]:
     return [list(o.outputs[0].token_ids) for o in outputs]
 
 
-def _cleanup(llm: LLM) -> None:
-    del llm
-    try:
-        cleanup_dist_env_and_memory()
-    except RuntimeError as e:
-        # ignore error when not using torch-rbln
-        if "Cannot access accelerator device when none is available" not in str(e):
-            raise
-
-
 def _run() -> None:
     # Baseline
     baseline = _build_llm(enable_prefix_caching=False)
-    try:
-        baseline_tokens = _generated_token_ids(
-            baseline.generate(PROMPTS, SAMPLING_PARAMS)
-        )
-    finally:
-        _cleanup(baseline)
+    baseline_tokens = _generated_token_ids(baseline.generate(PROMPTS, SAMPLING_PARAMS))
 
     # Prefix-cached
     cached = _build_llm(enable_prefix_caching=True)
-    try:
-        # Warm up prefix cache
-        cached.generate(PROMPTS[0], SAMPLING_PARAMS)
+    # Warm up prefix cache
+    cached.generate(PROMPTS[0], SAMPLING_PARAMS)
 
-        hits_before = _get_counter(cached.get_metrics(), "vllm:prefix_cache_hits")
-        outputs = cached.generate(PROMPTS, SAMPLING_PARAMS)
-        hits_after = _get_counter(cached.get_metrics(), "vllm:prefix_cache_hits")
-        cached_tokens = _generated_token_ids(outputs)
-    finally:
-        _cleanup(cached)
+    hits_before = _get_counter(cached.get_metrics(), "vllm:prefix_cache_hits")
+    outputs = cached.generate(PROMPTS, SAMPLING_PARAMS)
+    hits_after = _get_counter(cached.get_metrics(), "vllm:prefix_cache_hits")
+    cached_tokens = _generated_token_ids(outputs)
 
     # Shared prefix is 1600 tokens (block_size=1024 + 576 trailing). Without
     # sub-block caching each prompt would hit at most one full block, capping
