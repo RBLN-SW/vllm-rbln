@@ -47,6 +47,85 @@ def get_default_eagle_test_model_ids(method: str) -> tuple[str, str]:
         raise ValueError(f"Unsupported speculative method: {method}") from exc
 
 
+# Greedy speculative decoding is only token-for-token lossless when the target
+# model's verify-path logits are bit-identical to its base decode-path logits.
+# On RBLN the two paths run different compiled kernels (batch-shape-1 decode vs
+# batch-shape-N verify), and bf16 arithmetic is non-associative, so the same
+# logit can round to a value that differs by ~1 ULP between the two paths. At a
+# near-tie position that single ULP flips the argmax (e.g. "Paris." vs
+# "Paris,"), which then cascades into a completely different — but equally
+# valid — continuation. This is floating-point noise, not a quality
+# regression, so an exact text/token match is too strict. Instead we require
+# the streams to be identical up to the first divergence and that the first
+# divergence is a genuine near-tie in BOTH models' logprob distributions.
+#
+# logprob(t) = logit(t) - logsumexp(logits), so a logprob *gap* between two
+# tokens equals their raw logit gap. A bf16 ULP near typical LLM logit
+# magnitudes (~10-40) is 0.06-0.25, so a threshold of 0.5 accepts a few-ULP
+# flip while still rejecting a real divergence (where the chosen token wins by
+# a clear margin in at least one model).
+DEFAULT_MAX_LOGPROB_GAP = 0.5
+
+
+def assert_spec_matches_base_within_noise(
+    base_output: Any,
+    spec_output: Any,
+    *,
+    max_logprob_gap: float = DEFAULT_MAX_LOGPROB_GAP,
+) -> None:
+    """Assert a speculative-decode generation matches the base greedy
+    generation, tolerating bf16 near-tie argmax flips.
+
+    ``base_output`` / ``spec_output`` are ``CompletionOutput`` objects (i.e.
+    ``RequestOutput.outputs[i]``) produced with ``SamplingParams(logprobs=k)``
+    so that per-position logprobs are available for the near-tie check.
+    """
+    base_ids = list(base_output.token_ids)
+    spec_ids = list(spec_output.token_ids)
+    base_lps = base_output.logprobs
+    spec_lps = spec_output.logprobs
+    assert base_lps is not None and spec_lps is not None, (
+        "Per-token logprobs are required for the noise-level comparison. "
+        "Pass SamplingParams(logprobs=k) when generating."
+    )
+
+    for pos, (b, s) in enumerate(zip(base_ids, spec_ids)):
+        if b == s:
+            continue
+
+        # First divergence. Accept it only if both tokens are near-tied in
+        # both distributions, which is the signature of a bf16 ULP flip.
+        b_dist = base_lps[pos]
+        s_dist = spec_lps[pos]
+        missing = []
+        if b not in b_dist or s not in b_dist:
+            missing.append("base")
+        if b not in s_dist or s not in s_dist:
+            missing.append("spec")
+        assert not missing, (
+            f"Streams diverge at position {pos} (base token={b}, "
+            f"spec token={s}), but the alternative token is outside the "
+            f"top-{len(b_dist)} logprobs of the {'/'.join(missing)} "
+            f"distribution. The divergence is therefore not a near-tie; "
+            f"either increase `logprobs` or treat this as a real regression."
+        )
+        gap_base = b_dist[b].logprob - b_dist[s].logprob
+        gap_spec = s_dist[s].logprob - s_dist[b].logprob
+        assert gap_base <= max_logprob_gap and gap_spec <= max_logprob_gap, (
+            f"Streams diverge at position {pos} (base token={b}, "
+            f"spec token={s}) and it is NOT a bf16 near-tie: logprob gap in "
+            f"base={gap_base:.4f}, in spec={gap_spec:.4f} "
+            f"(threshold={max_logprob_gap}). This indicates a real "
+            f"correctness regression in the speculative verify path, not "
+            f"floating-point noise."
+        )
+        # Past the first divergence the two runs condition on different
+        # tokens, so further token-by-token comparison is meaningless.
+        return
+
+    # No divergence: the streams are identical (the ideal lossless case).
+
+
 def _load_json(path: str | Path) -> dict[str, Any]:
     with Path(path).open("r", encoding="utf-8") as f:
         return json.load(f)
@@ -277,8 +356,10 @@ def ensure_vllm_compatible_eagle_draft_model(
 
 __all__ = [
     "DEFAULT_EAGLE_TEST_MODEL_IDS",
+    "DEFAULT_MAX_LOGPROB_GAP",
     "DEFAULT_MEDUSA_MODEL_ID",
     "DEFAULT_MODEL_ID",
+    "assert_spec_matches_base_within_noise",
     "ensure_converted_medusa_adapter",
     "ensure_vllm_compatible_eagle_draft_model",
     "get_default_eagle_test_model_ids",

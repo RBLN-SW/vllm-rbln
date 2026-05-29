@@ -23,6 +23,7 @@ from vllm import LLM, SamplingParams
 from .utils import (
     DEFAULT_MEDUSA_MODEL_ID,
     DEFAULT_MODEL_ID,
+    assert_spec_matches_base_within_noise,
     ensure_converted_medusa_adapter,
 )
 
@@ -72,6 +73,9 @@ def test_medusa_matches_base_generation() -> None:
         top_p=1.0,
         max_tokens=8,
         ignore_eos=True,
+        # Needed for the bf16 near-tie check in
+        # assert_spec_matches_base_within_noise.
+        logprobs=20,
     )
 
     base_llm = _build_base_llm()
@@ -92,5 +96,10 @@ def test_medusa_matches_base_generation() -> None:
             base_output.outputs[0].finish_reason
             == medusa_output.outputs[0].finish_reason
         )
-        assert base_output.outputs[0].text == medusa_output.outputs[0].text
-        assert base_output.outputs[0].token_ids == medusa_output.outputs[0].token_ids
+        # Greedy spec decode may flip a near-tie argmax due to bf16 ULP
+        # differences between the base decode and Medusa verify kernels.
+        # Require a match up to the first divergence and that the divergence
+        # (if any) is genuine floating-point noise, not a regression.
+        assert_spec_matches_base_within_noise(
+            base_output.outputs[0], medusa_output.outputs[0]
+        )
