@@ -14,21 +14,18 @@
 
 import os
 
-os.environ["RBLN_PROFILER"] = "0"
-os.environ["RBLN_KERNEL_MODE"] = "triton"
-os.environ["VLLM_USE_V1"] = "1"
-# os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
-os.environ["VLLM_RBLN_USE_VLLM_MODEL"] = "1"
+os.environ["VLLM_RBLN_COMPILE_STRICT_MODE"] = "1"
+os.environ["VLLM_DISABLE_COMPILE_CACHE"] = "1"
 os.environ["VLLM_RBLN_ENABLE_WARM_UP"] = "0"
-os.environ["VLLM_RBLN_COMPILE_STRICT_MODE"] = "0"
+os.environ["VLLM_RBLN_SAMPLER"] = "0"
 os.environ["VLLM_RBLN_ENFORCE_MODEL_FP32"] = "1"
 
 from huggingface_hub import snapshot_download
 from vllm import EngineArgs, LLMEngine, RequestOutput, SamplingParams
 from vllm.lora.request import LoRARequest
 
-MODEL_ID = "meta-llama/Llama-3.2-1B-Instruct"
-SQL_LORA_MODEL_ID = "Rustamshry/Llama3.2-SQL-1B"
+MODEL_ID = "meta-llama/Llama-3.2-3B-Instruct"
+LORA_MODEL_ID = "jeeejeee/llama32-3b-text2sql-spider"
 
 
 def create_test_prompts(
@@ -44,20 +41,11 @@ def create_test_prompts(
         ]
 
     if "sql" in lora_path.lower():
-        question = "What are the vehicle safety testing organizations that operate in the UK and France?"  # noqa
-
-        context = "CREATE TABLE SafetyOrgs (name VARCHAR(20), country VARCHAR(10));\nINSERT INTO SafetyOrgs (name, country) VALUES ('Euro NCAP', 'UK');\nINSERT INTO SafetyOrgs (name, country) VALUES ('ADAC', 'Germany');\nINSERT INTO SafetyOrgs (name, country) VALUES ('UTAC', 'France');\n"  # noqa
-
-        instruction = (
-            "You are a skilled SQL assistant."
-            "Using the given database context, generate the correct SQL query to answer the question.\n\n"  # noqa
-            f"Context: {context.strip()}"
-        )
-
         prompt = (
-            f"### Instruction:\n{instruction}\n\n"
-            f"### Question:\n{question}\n\n"
-            f"### Response:\n"
+            "[user] Write a SQL query to answer the question based on the "
+            "table schema.\n\n context: CREATE TABLE table_name_74 "
+            "(icao VARCHAR, airport VARCHAR)\n\n question: Name the ICAO "
+            "for lilongwe international airport [/user] [assistant]"
         )
         return [
             (
@@ -117,9 +105,9 @@ def initialize_engine() -> LLMEngine:
 
 if __name__ == "__main__":
     engine = initialize_engine()
-    sql_lora_path = snapshot_download(repo_id=SQL_LORA_MODEL_ID)
+    lora_path = snapshot_download(repo_id=LORA_MODEL_ID)
 
     # Note: The order of prompts matters
-    prompts = create_test_prompts(sql_lora_path, 1) + create_test_prompts(None)
+    prompts = create_test_prompts(lora_path, 1) + create_test_prompts(None)
 
     process_requests(engine, prompts)

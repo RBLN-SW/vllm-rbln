@@ -123,6 +123,7 @@ def _make_vllm_config(
         ),
         cache_config=_make_cache_config(),
         scheduler_config=_make_scheduler_config(),
+        device_config=SimpleNamespace(device=torch.device("cpu"), device_type="cpu"),
         kv_transfer_config=None,
         instance_id="test-instance",
     )
@@ -179,6 +180,7 @@ def _fake_super_init(
     self.parallel_config = vllm_config.parallel_config
     self.cache_config = vllm_config.cache_config
     self.scheduler_config = vllm_config.scheduler_config
+    self.device_config = vllm_config.device_config
 
 
 def _create_worker(
@@ -790,6 +792,67 @@ class TestDetermineAvailableMemory:
             worker.determine_available_memory()
         # bf16: 100*2 = 200; uint8 fp8: 50 * 1 * 1.0 * 8 // 8 = 50
         assert est.call_args.kwargs["n_model_bytes"] == 250
+
+    def test_draft_model_kernel_size_is_added(self):
+        worker = self._setup()
+        draft_model = MagicMock()
+        draft_model.parameters.return_value = [
+            torch.zeros(40, dtype=torch.bfloat16),
+        ]
+        worker.model_runner.drafter = SimpleNamespace(model=draft_model)
+        worker.speculative_config = SimpleNamespace(
+            draft_model_config=SimpleNamespace(quantization=None),
+            draft_parallel_config=SimpleNamespace(tensor_parallel_size=1),
+        )
+
+        with (
+            patch("vllm_rbln.v1.worker.rbln_worker.current_platform") as plat,
+            patch(
+                "vllm_rbln.v1.worker.rbln_worker.estimate_model_kernel_size",
+                side_effect=[400, 120],
+            ) as kernel_est,
+            patch(
+                "vllm_rbln.v1.worker.rbln_worker.estimate_available_memory",
+                return_value=10**9,
+            ) as est,
+        ):
+            plat.get_device_name.return_value = "RBLN-CA25"
+            worker.determine_available_memory()
+
+        assert kernel_est.call_count == 2
+        assert kernel_est.call_args_list[0].kwargs["n_model_bytes"] == 300
+        assert kernel_est.call_args_list[1].kwargs["n_model_bytes"] == 80
+        assert est.call_args.kwargs["kernel_size"] == 520
+        assert est.call_args.kwargs["num_runtimes"] == 4
+        assert "n_model_bytes" not in est.call_args.kwargs
+
+    @pytest.mark.parametrize("quantization", ["fp8", "mxfp4", "compressed-tensors"])
+    def test_draft_model_quantization_is_rejected(self, quantization):
+        worker = self._setup()
+        draft_model = MagicMock()
+        draft_model.parameters.return_value = [
+            torch.zeros(100, dtype=torch.bfloat16),
+            torch.zeros(50, dtype=torch.uint8),
+        ]
+        worker.model_runner.drafter = SimpleNamespace(model=draft_model)
+        worker.speculative_config = SimpleNamespace(
+            draft_model_config=SimpleNamespace(quantization=quantization),
+            draft_parallel_config=None,
+        )
+
+        with (
+            patch("vllm_rbln.v1.worker.rbln_worker.current_platform") as plat,
+            patch(
+                "vllm_rbln.v1.worker.rbln_worker.estimate_model_kernel_size",
+                return_value=400,
+            ),
+        ):
+            plat.get_device_name.return_value = "RBLN-CA25"
+            with pytest.raises(
+                ValueError,
+                match="draft model quantization is not supported",
+            ):
+                worker.determine_available_memory()
 
 
 # ===========================================================================

@@ -36,6 +36,11 @@ if the KV cache tensor has a token dimension that can be sliced for partial copy
 The `sub_block_size` is automatically set to prefill chunk size (`max_num_batched_tokens`)
 so that each prefill does not span multiple blocks.
 
+For cross-engine prefix-aware routing (e.g., llm-d):
+enable KV events via `--kv-events-config` in vLLM and
+set the router's token processing block size to vLLM `--max-num-batched-tokens`
+(**not** `--block-size`; see [Using with llm-d](#using-with-llm-d)).
+
 ## Key components
 
 ```
@@ -207,6 +212,133 @@ kv_cache[:, dst_block_id, :, :, :num_tokens, :] = \
   `SubBlockIndex.pop()` whenever the upstream evicts a cached block.
 - **Reset**: `reset_prefix_cache()` clears all sub-block indices and pending
   indexing queue.
+
+## KV cache events
+
+Sub-block caching so far is an intra-engine optimisation:
+one instance serving multiple requests that share a prefix reuses KV locally.
+Prefix-cache-aware routers (e.g. llm-d) extend that reuse *across* engines by
+subscribing to KV events and routing each request to an engine that already
+caches its prefix.
+
+Upstream vLLM emits those events at block granularity.
+For RBLN's 1k–4k token big blocks, that means a partial big block never gets advertised.
+So routers cannot utilize the sub-block prefix information.
+Therefore, we adapt the KV cache manager to emit events at sub-block granularity.
+
+### Contract
+
+When sub-block caching is active, `RBLNKVCacheManager` replaces upstream's
+block events with sub-block-granular ones:
+
+- `BlockStored(parent, [h_0, ..., h_n])`: a chained run of sub-block hashes
+  (each `h_i = hash(h_{i-1}, tokens_i, extras_i)`, with `h_{-1} = parent`)
+  became *newly* cached on this engine.
+- `BlockRemoved([h_0, ..., h_n])`: the *last* big block holding each hash
+  was evicted.
+- `AllBlocksCleared`: all sub-block state cleared.
+
+This is stricter than upstream.
+Upstream emits per-physical-block, so two blocks that happen to hold the same
+hash produce duplicate Store and premature Remove.
+Our Store/Remove fire only on 0↔1 transitions in the per-hash refcount
+(`SubBlockIndex._hash_to_blocks` bucket size), so the stream is a clean
+set-membership view.
+
+#### Why dedup matters here
+
+llm-d's `kvblock.Index` as of 2026-04 treats events as **set-membership**, not
+multiplicity: duplicate Store collapses to one entry, Remove for a missing key
+is a no-op.
+So a single Remove can cause the router to drop a hash the pod still caches in
+another block, and re-route away from a still-warm pod.
+Upstream GPU deployments see this rarely because block-level hash collisions are rare.
+
+Sub-block caching makes the collision path the *common* one.
+Partial matches are serviced by an intra-engine sub-block copy:
+the source big block and the freshly-allocated destination big block both carry
+the same prefix sub-block hashes from the moment of the copy.
+Every partial match mints a handful of duplicates.
+Without dedup, the first eviction of either block would incorrectly signal
+"gone" to llm-d.
+
+Dedup'ing at the hash-refcount level in the engine gives routers exactly the
+set-membership stream they already model, and sidesteps the multiplicity
+mismatch entirely.
+
+#### Dedup is chain-safe
+
+We say that a `BlockStored` event is *chain-safe* if it carries a contiguous,
+reconstructible hash chain:
+using the event's `parent_block_hash` as the seed, re-hashing `token_ids`
+sub-block by sub-block reproduces `block_hashes` entry-by-entry.
+A consumer that re-hashes the prompt to key its index depends on this.
+
+We need dedup to preserve chain-safety.
+If dedup dropped `h_1` out of `[h_0, h_1, h_2]` and emitted `[h_0, h_2]`,
+the consumer would compute `hash(h_0, tokens_h_2)` and miss `h_2`'s real value
+(whose parent is `h_1`, not `h_0`).
+
+Here, dedup never creates such gaps.
+Within one `SubBlockIndex.update` call,
+the "already indexed elsewhere" hashes form a contiguous prefix of the argument list,
+and the fresh hashes form a contiguous suffix.
+This is a consequence of position-chained hashing: if some other block holds
+`h_k`, that block also holds `h_0..h_{k-1}`.
+So we emit one event covering the fresh suffix.
+
+### Single-group only (for now)
+
+Events are gated to single-group configs, matching upstream's current
+restriction (`need_disable_hybrid_kv_cache_manager` in `vllm/config/vllm.py`
+trips when events are enabled).  Our per-group dedup would otherwise emit
+the same bare hash from each group and consumers couldn't disambiguate.
+
+Upstream vLLM is lifting this: `vllm-project/vllm@cc07dad789` (#37688) drops
+the gate and adds `group_idx` to `BlockStored` / `BlockRemoved`.  Once that
+feature is released, we can lift our assert and pass `group_idx` in our
+emissions.
+
+### No in-process consumer
+
+`Scheduler.take_events` feeds events directly to the external
+`KVEventPublisher` (ZMQ); nothing in-engine reads them, and KV connectors
+publish their own events rather than subscribing to the manager's.
+This allows us to change emission granularity unilaterally.
+
+### Using with llm-d
+
+llm-d's `precise-prefix-cache-scorer` chunks incoming prompts at its
+configured block size, looks those keys up in the index it builds from our
+events, and scores pods by how many consecutive blocks match.  Routing
+works iff the scorer's `blockSize` equals the engine's emitted
+`block_size` — our sub-block size, which is the prefill chunk size
+(`--max-num-batched-tokens`).
+
+> **Not** vLLM's `--block-size`.  For stock vLLM those two happen to be
+> the same knob, so generic guides tell you to align `--block-size` with
+> `blockSize`.  Here, `--block-size` is the big-block size (used for
+> attention-kernel layout) while the scorer sees sub-block events.  Align
+> `blockSize` with `--max-num-batched-tokens`, not `--block-size`.
+
+For example, with prefill chunk size 128:
+
+- vllm-rbln:
+  ```
+  vllm serve ... \
+      --enable-prefix-caching \
+      --max-num-batched-tokens=128 \
+      --kv-events-config='{"enable_kv_cache_events": true, "publisher": "zmq", ...}'
+  ```
+- EPP `prefix-cache-scorer` plugin:
+  ```
+  tokenProcessorConfig:
+    blockSize: 128
+  ```
+
+llm-d doesn't need to know anything about the big-block layout.
+Other event fields (`token_ids`, `parent_block_hash`, `extra_keys`,
+`lora_name`) are forwarded as-is from upstream vLLM.
 
 ## Interaction with KV Connectors
 

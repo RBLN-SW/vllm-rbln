@@ -52,9 +52,6 @@ on:
         required: false
         type: string
 
-env:
-  RBLN_VERBOSE: 6
-
 jobs:
   pytest:
     name: Pytest (${{ matrix.test_type.name }})
@@ -70,6 +67,10 @@ jobs:
             },
             {
               name : "worker",
+              runner : "rbln-sw-k8s-general"
+            },
+            {
+              name : "optimum_compile",
               runner : "rbln-sw-k8s-general"
             },
           ]
@@ -116,6 +117,11 @@ jobs:
               ;;
             "worker")
               if [[ "$COMMIT_MESSAGE" == *"[skip worker]"* ]]; then
+                SKIP=true
+              fi
+              ;;
+            "optimum_compile")
+              if [[ "$COMMIT_MESSAGE" == *"[skip optimum_compile]"* ]]; then
                 SKIP=true
               fi
               ;;
@@ -178,6 +184,9 @@ jobs:
             "worker")
               pytest tests/v1/worker/test_rebel_optimum_model_runner.py -vv --durations 0
               ;;
+            "optimum_compile")
+              pytest tests/optimum_compile -vv --durations 0
+              ;;
           esac
 
       - name: Skip message
@@ -196,11 +205,15 @@ jobs:
     strategy:
       fail-fast: ${{ inputs.fail_fast }}
       matrix:
-        test_type: 
+        test_type:
           [
             {
               name : "openai",
               runner : "rbln-sw-k8s-ca22-4"
+            },
+            {
+              name : "llm",
+              runner : "rbln-sw-k8s-ca22-1"
             },
             {
               name : "sampler",
@@ -249,6 +262,11 @@ jobs:
           case "${{ matrix.test_type.name }}" in
             "openai")
               if [[ "$COMMIT_MESSAGE" == *"[skip openai]"* ]]; then
+                SKIP=true
+              fi
+              ;;
+            "llm")
+              if [[ "$COMMIT_MESSAGE" == *"[skip llm]"* ]]; then
                 SKIP=true
               fi
               ;;
@@ -318,9 +336,13 @@ jobs:
             "openai")
               pytest tests/entrypoints/openai -vv --durations 0
               ;;
+            "llm")
+              pytest tests/entrypoints/llm -vv --durations 0
+              ;;
             "sampler")
-              pytest -n auto -k "warm_upTrue" tests/v1/worker/test_sampler.py -vv --durations 0
-              pytest -n auto -k "warm_upFalse" tests/v1/worker/test_sampler.py -vv --durations 0
+              pytest -n auto -k "warm_up_true" tests/v1/worker/test_sampler.py -vv --durations 0
+              pytest -n auto -k "warm_up_false" tests/v1/worker/test_sampler.py -vv --durations 0
+              pytest -n auto -k "not warm_up_true and not warm_up_false" tests/v1/worker/test_sampler.py -vv --durations 0
               ;;
           esac
 

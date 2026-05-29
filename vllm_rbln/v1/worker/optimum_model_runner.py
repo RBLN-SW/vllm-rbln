@@ -74,8 +74,8 @@ import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
 from vllm_rbln.model_executor.model_loader.rbln_model_loader import get_optimum_model
 from vllm_rbln.model_executor.models.optimum import ModelInputForRBLN
-from vllm_rbln.utils.optimum.common import select_bucket_size
-from vllm_rbln.utils.optimum.configuration import is_qwen3_pooling
+from vllm_rbln.utils.optimum.bucket import select_bucket_size
+from vllm_rbln.utils.optimum.predicates import is_qwen3_pooling
 from vllm_rbln.utils.optimum.registry import get_rbln_model_info
 from vllm_rbln.v1.core.optimum_scheduler import RBLNSchedulerOutput
 from vllm_rbln.v1.sample import WARM_UP_CONFIGS, RBLNSampler
@@ -115,7 +115,7 @@ class RBLNOptimumModelRunner(
         # it’s important to set the is_encoder_decoder flag to False.
         # This prevents the scheduler from applying text generation settings.
         _, model_cls_name = get_rbln_model_info(vllm_config.model_config)
-        if is_qwen3_pooling(vllm_config):
+        if is_qwen3_pooling(vllm_config.model_config):
             # NOTE The architecture of Qwen3-Embedding model in huggingface
             # is `Qwen3ForCausalLM`. But it have to be mapped to `Qwen3Model`
             # for optimum-rbln.
@@ -362,7 +362,10 @@ class RBLNOptimumModelRunner(
             # EC consumer with cached encoder output: run the decoder
             # with pre-computed embeddings instead of the full model
             # forward (which would require the vision encoder runtime).
-            if self.is_ec_consumer and model_input.is_prompt and self.encoder_cache:
+
+            new_reqs = scheduler_output.scheduled_new_reqs
+            prefill_has_mm = bool(new_reqs) and bool(new_reqs[0].mm_features)
+            if self.is_ec_consumer and model_input.is_prompt and prefill_has_mm:
                 with capture_ctx as model_reports:
                     hidden_states = self._run_decoder_with_cached_encoder(
                         model_input, scheduler_output
@@ -741,6 +744,12 @@ class RBLNOptimumModelRunner(
         # and handling the second as a new request.
         for req_id in scheduler_output.finished_req_ids:
             self.input_batch.remove_request(req_id)
+
+        # Free cached encoder outputs signalled by the scheduler.
+        # Without this, encoder_cache grows unboundedly on the EC consumer
+        # and stale mm entries linger across requests.
+        for mm_hash in scheduler_output.free_encoder_mm_hashes:
+            self.encoder_cache.pop(mm_hash, None)
 
         # Zero GPU memory for freshly allocated cache blocks to prevent
         # stale NaN/data from corrupting attention or SSM computation.
@@ -1301,7 +1310,7 @@ class RBLNOptimumModelRunner(
         logger.debug("Bucket sizes for RBLN sampler: %s", self.bucket_sizes)
         with torch.inference_mode():
             for bucket_size in self.bucket_sizes:
-                self.pooled_tensors[bucket_size] = torch.empty(
+                self.pooled_tensors[bucket_size] = torch.zeros(
                     (bucket_size, self.model_config.get_vocab_size()),
                     dtype=self.model.dtype,
                 )

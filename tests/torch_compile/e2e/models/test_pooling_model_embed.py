@@ -51,7 +51,7 @@ def run_vllm_score(llm_kwargs: dict) -> None:
     input_prompts = queries + documents
 
     try:
-        llm = LLM(task="embed", **llm_kwargs)
+        llm = LLM(runner="pooling", **llm_kwargs)
 
         outputs = llm.embed(input_prompts)
         embeddings = torch.tensor([o.outputs.embedding for o in outputs])
