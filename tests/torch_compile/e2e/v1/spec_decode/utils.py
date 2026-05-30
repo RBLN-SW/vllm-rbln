@@ -47,83 +47,94 @@ def get_default_eagle_test_model_ids(method: str) -> tuple[str, str]:
         raise ValueError(f"Unsupported speculative method: {method}") from exc
 
 
-# Greedy speculative decoding is only token-for-token lossless when the target
-# model's verify-path logits are bit-identical to its base decode-path logits.
-# On RBLN the two paths run different compiled kernels (batch-shape-1 decode vs
-# batch-shape-N verify), and bf16 arithmetic is non-associative, so the same
-# logit can round to a value that differs by ~1 ULP between the two paths. At a
-# near-tie position that single ULP flips the argmax (e.g. "Paris." vs
-# "Paris,"), which then cascades into a completely different — but equally
-# valid — continuation. This is floating-point noise, not a quality
-# regression, so an exact text/token match is too strict. Instead we require
-# the streams to be identical up to the first divergence and that the first
-# divergence is a genuine near-tie in BOTH models' logprob distributions.
+# Greedy speculative decoding should reproduce, token for token, what the
+# target model would greedily generate on the SAME trajectory. It is truly
+# lossless only when the verify-path logits are bit-identical to the base
+# path's, but on RBLN the two run different compiled kernels (batch-shape-1
+# decode/prefill vs batch-shape-N verify) and bf16 arithmetic is
+# non-associative, so a logit can differ by ~1 ULP and flip the argmax at a
+# near-tie (e.g. "Paris." vs "Paris,"). That is floating-point noise, not a
+# quality regression, so an exact text/token match is too strict.
 #
-# logprob(t) = logit(t) - logsumexp(logits), so a logprob *gap* between two
-# tokens equals their raw logit gap. A bf16 ULP near typical LLM logit
-# magnitudes (~10-40) is 0.06-0.25, so a threshold of 0.5 accepts a few-ULP
-# flip while still rejecting a real divergence (where the chosen token wins by
-# a clear margin in at least one model).
-DEFAULT_MAX_LOGPROB_GAP = 0.5
+# To check this at EVERY position (not just up to the first divergence, which
+# is blind to anything after the cascade), we teacher-force the spec-generated
+# sequence back through the non-speculative base model: for each position we
+# feed the spec prefix and let the base model generate one token, exposing its
+# greedy choice and per-token logprobs there. We accept the spec token if it is
+# the base argmax OR within `max_logprob_gap` of it (a near-tie). A position
+# where the base model favours a different token by a clear margin is a real
+# divergence and fails. (We use generation logprobs rather than prompt_logprobs
+# because the latter is currently broken on RBLN.)
+#
+# The gap is taken WITHIN the base distribution at a single position, where the
+# shared logsumexp cancels, so logprob_gap == raw logit_gap. (We never subtract
+# logprobs across engines, whose logsumexp differ.)
+#
+# Note: teacher forcing uses the base PREFILL kernel as reference, which itself
+# differs from the verify kernel by bf16 ULP, so the near-tie tolerance is
+# still required. 0.25 ~= 1-2 ULP at typical argmax magnitudes (~16-32, where a
+# bf16 ULP is 0.125); a real verify-path bug diverges by >=~1 nat.
+DEFAULT_MAX_LOGPROB_GAP = 0.25
 
 
 def assert_spec_matches_base_within_noise(
-    base_output: Any,
-    spec_output: Any,
+    base_llm: Any,
+    prompt_token_ids: list[int],
+    spec_token_ids: list[int],
     *,
     max_logprob_gap: float = DEFAULT_MAX_LOGPROB_GAP,
+    logprobs: int = 20,
 ) -> None:
-    """Assert a speculative-decode generation matches the base greedy
-    generation, tolerating bf16 near-tie argmax flips.
+    """Teacher-force the spec-decoded sequence through the non-speculative
+    ``base_llm`` and assert every generated token is the base model's greedy
+    choice, tolerating bf16 near-tie argmax flips.
 
-    ``base_output`` / ``spec_output`` are ``CompletionOutput`` objects (i.e.
-    ``RequestOutput.outputs[i]``) produced with ``SamplingParams(logprobs=k)``
-    so that per-position logprobs are available for the near-tie check.
+    Each position is teacher-forced independently: the spec trajectory prefix
+    (``prompt_token_ids + spec_token_ids[:i]``) is fed back and the base model
+    generates one token, exposing its greedy choice and per-token logprobs at
+    that position. All prefixes are submitted in a single batched ``generate``
+    call (and share KV via prefix caching).
+
+    NOTE: we intentionally use the per-token generation logprobs path rather
+    than ``prompt_logprobs``; the latter is currently broken on RBLN
+    (``_get_prompt_logprobs_dict`` -> ``gather_logprobs`` shape mismatch).
     """
-    base_ids = list(base_output.token_ids)
-    spec_ids = list(spec_output.token_ids)
-    base_lps = base_output.logprobs
-    spec_lps = spec_output.logprobs
-    assert base_lps is not None and spec_lps is not None, (
-        "Per-token logprobs are required for the noise-level comparison. "
-        "Pass SamplingParams(logprobs=k) when generating."
+    from vllm import SamplingParams
+
+    prompt_token_ids = list(prompt_token_ids)
+    spec_token_ids = list(spec_token_ids)
+
+    prompts = [
+        {"prompt_token_ids": prompt_token_ids + spec_token_ids[:i]}
+        for i in range(len(spec_token_ids))
+    ]
+    base_outs = base_llm.generate(
+        prompts,
+        SamplingParams(max_tokens=1, temperature=0.0, logprobs=logprobs),
     )
 
-    for pos, (b, s) in enumerate(zip(base_ids, spec_ids)):
-        if b == s:
+    offenders = []
+    for i, (tok, out) in enumerate(zip(spec_token_ids, base_outs, strict=True)):
+        dist = out.outputs[0].logprobs[0]
+        assert dist is not None, f"no logprobs at spec position {i}"
+        argmax_tok = max(dist.items(), key=lambda kv: kv[1].logprob)[0]
+        if tok not in dist:
+            # spec token is outside the base top-k => far from argmax.
+            offenders.append((i, tok, argmax_tok, float("inf")))
             continue
+        argmax_logprob = dist[argmax_tok].logprob
+        gap = argmax_logprob - dist[tok].logprob
+        if gap > max_logprob_gap:
+            offenders.append((i, tok, argmax_tok, gap))
 
-        # First divergence. Accept it only if both tokens are near-tied in
-        # both distributions, which is the signature of a bf16 ULP flip.
-        b_dist = base_lps[pos]
-        s_dist = spec_lps[pos]
-        missing = []
-        if b not in b_dist or s not in b_dist:
-            missing.append("base")
-        if b not in s_dist or s not in s_dist:
-            missing.append("spec")
-        assert not missing, (
-            f"Streams diverge at position {pos} (base token={b}, "
-            f"spec token={s}), but the alternative token is outside the "
-            f"top-{len(b_dist)} logprobs of the {'/'.join(missing)} "
-            f"distribution. The divergence is therefore not a near-tie; "
-            f"either increase `logprobs` or treat this as a real regression."
+    assert not offenders, (
+        "Spec-decoded tokens diverge from the base model's greedy choice by "
+        f"more than {max_logprob_gap} logprob (not a bf16 near-tie):\n"
+        + "\n".join(
+            f"  pos {i}: spec={tok} base_argmax={am} gap={gap:.4f}"
+            for i, tok, am, gap in offenders
         )
-        gap_base = b_dist[b].logprob - b_dist[s].logprob
-        gap_spec = s_dist[s].logprob - s_dist[b].logprob
-        assert gap_base <= max_logprob_gap and gap_spec <= max_logprob_gap, (
-            f"Streams diverge at position {pos} (base token={b}, "
-            f"spec token={s}) and it is NOT a bf16 near-tie: logprob gap in "
-            f"base={gap_base:.4f}, in spec={gap_spec:.4f} "
-            f"(threshold={max_logprob_gap}). This indicates a real "
-            f"correctness regression in the speculative verify path, not "
-            f"floating-point noise."
-        )
-        # Past the first divergence the two runs condition on different
-        # tokens, so further token-by-token comparison is meaningless.
-        return
-
-    # No divergence: the streams are identical (the ideal lossless case).
+    )
 
 
 def _load_json(path: str | Path) -> dict[str, Any]:

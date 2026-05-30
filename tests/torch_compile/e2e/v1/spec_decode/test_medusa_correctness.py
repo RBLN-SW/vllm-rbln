@@ -73,33 +73,24 @@ def test_medusa_matches_base_generation() -> None:
         top_p=1.0,
         max_tokens=8,
         ignore_eos=True,
-        # Needed for the bf16 near-tie check in
-        # assert_spec_matches_base_within_noise.
-        logprobs=20,
     )
 
-    base_llm = _build_base_llm()
-    base_outputs = base_llm.generate(PROMPTS, sampling_params=sampling_params)
-    # Release the baseline engine before compiling the Medusa variant.
-    del base_llm
+    # Generate with Medusa speculative decoding first, then teacher-force the
+    # resulting tokens through the base model and check, at every position,
+    # that each spec token is the base model's greedy choice (up to bf16
+    # near-tie flips). Only one engine is alive at a time to bound memory.
+    medusa_llm = _build_medusa_llm()
+    spec_req = medusa_llm.generate(PROMPTS, sampling_params=sampling_params)[0]
+    prompt_token_ids = list(spec_req.prompt_token_ids)
+    spec_token_ids = list(spec_req.outputs[0].token_ids)
+    del medusa_llm
     gc.collect()
 
-    medusa_llm = _build_medusa_llm()
-    medusa_outputs = medusa_llm.generate(PROMPTS, sampling_params=sampling_params)
-
-    assert len(base_outputs) == len(medusa_outputs)
-
-    for base_output, medusa_output in zip(base_outputs, medusa_outputs, strict=True):
-        assert base_output.prompt == medusa_output.prompt
-        assert len(base_output.outputs) == len(medusa_output.outputs) == 1
-        assert (
-            base_output.outputs[0].finish_reason
-            == medusa_output.outputs[0].finish_reason
-        )
-        # Greedy spec decode may flip a near-tie argmax due to bf16 ULP
-        # differences between the base decode and Medusa verify kernels.
-        # Require a match up to the first divergence and that the divergence
-        # (if any) is genuine floating-point noise, not a regression.
+    base_llm = _build_base_llm()
+    try:
         assert_spec_matches_base_within_noise(
-            base_output.outputs[0], medusa_output.outputs[0]
+            base_llm, prompt_token_ids, spec_token_ids
         )
+    finally:
+        del base_llm
+        gc.collect()

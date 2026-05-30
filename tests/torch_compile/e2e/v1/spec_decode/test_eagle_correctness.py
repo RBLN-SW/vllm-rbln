@@ -80,37 +80,24 @@ def test_eagle_matches_base_generation(method: str, max_tokens: int) -> None:
         top_p=1.0,
         max_tokens=max_tokens,
         ignore_eos=True,
-        # Needed for the bf16 near-tie check in
-        # assert_spec_matches_base_within_noise.
-        logprobs=20,
     )
 
-    base_llm = _build_base_llm(method)
-    base_outputs = base_llm.generate(PROMPTS, sampling_params=sampling_params)
-    # Release the baseline engine before compiling the speculative variant.
-    del base_llm
+    # Generate with EAGLE speculative decoding first, then teacher-force the
+    # resulting tokens through the base model and check, at every position,
+    # that each spec token is the base model's greedy choice (up to bf16
+    # near-tie flips). Only one engine is alive at a time to bound memory.
+    eagle_llm = _build_eagle_llm(method)
+    spec_req = eagle_llm.generate(PROMPTS, sampling_params=sampling_params)[0]
+    prompt_token_ids = list(spec_req.prompt_token_ids)
+    spec_token_ids = list(spec_req.outputs[0].token_ids)
+    del eagle_llm
     gc.collect()
 
-    eagle_llm = _build_eagle_llm(method)
-    eagle_outputs = eagle_llm.generate(PROMPTS, sampling_params=sampling_params)
-
-    assert len(base_outputs) == len(eagle_outputs)
-
+    base_llm = _build_base_llm(method)
     try:
-        for base_output, eagle_output in zip(base_outputs, eagle_outputs, strict=True):
-            assert base_output.prompt == eagle_output.prompt
-            assert len(base_output.outputs) == len(eagle_output.outputs) == 1
-            assert (
-                base_output.outputs[0].finish_reason
-                == eagle_output.outputs[0].finish_reason
-            )
-            # Greedy spec decode may flip a near-tie argmax due to bf16 ULP
-            # differences between the base decode and EAGLE verify kernels.
-            # Require a match up to the first divergence and that the
-            # divergence (if any) is genuine floating-point noise.
-            assert_spec_matches_base_within_noise(
-                base_output.outputs[0], eagle_output.outputs[0]
-            )
+        assert_spec_matches_base_within_noise(
+            base_llm, prompt_token_ids, spec_token_ids
+        )
     finally:
-        del eagle_llm
+        del base_llm
         gc.collect()
