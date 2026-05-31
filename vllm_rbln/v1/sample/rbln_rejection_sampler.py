@@ -68,7 +68,6 @@ def rejection_sample(
     """
     B = cu_num_draft_tokens.shape[0]
     K = draft_token_ids.shape[0] // B
-    device = draft_token_ids.device
 
     # Expand per-batch top_k / top_p to per-row (B*K,).
     k_row = top_k.repeat_interleave(K) if top_k is not None else None
@@ -78,11 +77,11 @@ def rejection_sample(
         target_probs.to(torch.float32), k_row, p_row
     )  # (B*K, V)
     sampled = random_sample(target_probs, {})  # (B*K, )
-    sampled = sampled.view(B, K).to(torch.int32)
-    drafts = draft_token_ids.view(B, K).to(torch.int32)
+    sampled = sampled.reshape((-1, K)).to(torch.int32)
+    drafts = draft_token_ids.reshape((-1, K)).to(torch.int32)
 
-    out_tokens = torch.zeros((B, K), dtype=torch.int32, device=device)
-    num_accepted = torch.zeros((B,), dtype=torch.int32, device=device)
+    out_tokens = torch.zeros((B, K), dtype=torch.int32)
+    num_accepted = torch.zeros((B,), dtype=torch.int32)
 
     cu = cu_num_draft_tokens.to(torch.int64).tolist()
     for i in range(B):
