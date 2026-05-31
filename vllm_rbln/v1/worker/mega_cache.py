@@ -84,6 +84,7 @@ def save(model: str) -> None:
         return
     path = bundle_path(model)
     try:
+        rbln_mega_cache.flush_to_bundle()
         result = torch.compiler.save_cache_artifacts()
         if result is None:
             return

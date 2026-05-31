@@ -1491,8 +1491,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 "Once the model is compiled for the first time, "
                 "the cached compiled binary will be reused via Mega-Cache."
             )
-            # Mega-only: only mega_cache.bin is durable; fresh .rbln goes
-            # through a tempfile under cache_dir during compile.
             options["cache_dir"] = os.path.join(envs.VLLM_CACHE_ROOT, "rbln")
             options["mega_cache_only"] = True
 
