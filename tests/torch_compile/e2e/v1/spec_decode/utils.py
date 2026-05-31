@@ -47,6 +47,23 @@ def get_default_eagle_test_model_ids(method: str) -> tuple[str, str]:
         raise ValueError(f"Unsupported speculative method: {method}") from exc
 
 
+# A small pool of distinct, deterministic-completion prompts. Batches are built
+# by cycling this pool, so a batch of N exercises the verify kernel at batch
+# size N with varied sequences (not N identical requests).
+_BATCH_PROMPT_POOL = [
+    "The capital of France is",
+    "The largest planet in the solar system is",
+    "The chemical symbol for gold is",
+    "The first person to walk on the Moon was",
+]
+
+
+def make_batch_prompts(batch_size: int) -> list[str]:
+    """Build ``batch_size`` prompts by cycling the prompt pool."""
+    assert batch_size >= 1
+    return [_BATCH_PROMPT_POOL[i % len(_BATCH_PROMPT_POOL)] for i in range(batch_size)]
+
+
 # Greedy speculative decoding should reproduce, token for token, what the
 # target model would greedily generate on the SAME trajectory. It is truly
 # lossless only when the verify-path logits are bit-identical to the base
@@ -72,9 +89,14 @@ def get_default_eagle_test_model_ids(method: str) -> tuple[str, str]:
 #
 # Note: teacher forcing uses the base PREFILL kernel as reference, which itself
 # differs from the verify kernel by bf16 ULP, so the near-tie tolerance is
-# still required. 0.25 ~= 1-2 ULP at typical argmax magnitudes (~16-32, where a
-# bf16 ULP is 0.125); a real verify-path bug diverges by >=~1 nat.
-DEFAULT_MAX_LOGPROB_GAP = 0.25
+# still required. The bound is set from measured data: across all Medusa/Eagle
+# batch=1/8/16 runs the largest gap ever seen was exactly 0.125 (= 1 bf16 ULP
+# at argmax magnitudes ~[16,32)), and only in eagle3 — Medusa and eagle had
+# zero divergence. bf16 gaps are ULP-quantized, so any threshold strictly
+# between the observed 1 ULP (0.125) and the next step (0.25 = 2 ULP) behaves
+# identically; we use 0.2 to keep f32 jitter margin above 0.125 while staying
+# well under 0.25. A real verify-path bug diverges by >=~1 nat, far above this.
+DEFAULT_MAX_LOGPROB_GAP = 0.2
 
 
 def assert_spec_matches_base_within_noise(
@@ -84,10 +106,19 @@ def assert_spec_matches_base_within_noise(
     *,
     max_logprob_gap: float = DEFAULT_MAX_LOGPROB_GAP,
     logprobs: int = 20,
+    seq_idx: int | None = None,
 ) -> None:
     """Teacher-force the spec-decoded sequence through the non-speculative
     ``base_llm`` and assert every generated token is the base model's greedy
     choice, tolerating bf16 near-tie argmax flips.
+
+    A position passes when the spec token is the base argmax, or its logprob
+    gap from the argmax is ``<= max_logprob_gap`` (nats). The gap is taken
+    within the base distribution at a single position, where the shared
+    logsumexp cancels, so it equals the raw logit gap.
+
+    ``seq_idx`` is an optional label for the sequence within a batch, used only
+    to make failure messages identify which batched request diverged.
 
     Each position is teacher-forced independently: the spec trajectory prefix
     (``prompt_token_ids + spec_token_ids[:i]``) is fed back and the base model
@@ -122,14 +153,15 @@ def assert_spec_matches_base_within_noise(
             # spec token is outside the base top-k => far from argmax.
             offenders.append((i, tok, argmax_tok, float("inf")))
             continue
-        argmax_logprob = dist[argmax_tok].logprob
-        gap = argmax_logprob - dist[tok].logprob
+        gap = dist[argmax_tok].logprob - dist[tok].logprob
         if gap > max_logprob_gap:
             offenders.append((i, tok, argmax_tok, gap))
 
+    seq_label = "" if seq_idx is None else f"batch seq {seq_idx}: "
     assert not offenders, (
-        "Spec-decoded tokens diverge from the base model's greedy choice by "
-        f"more than {max_logprob_gap} logprob (not a bf16 near-tie):\n"
+        f"Spec-decoded tokens ({seq_label or 'single seq'}) diverge from the "
+        f"base model's greedy choice by more than {max_logprob_gap} logprob "
+        f"(not a bf16 near-tie):\n"
         + "\n".join(
             f"  pos {i}: spec={tok} base_argmax={am} gap={gap:.4f}"
             for i, tok, am, gap in offenders
@@ -374,4 +406,5 @@ __all__ = [
     "ensure_converted_medusa_adapter",
     "ensure_vllm_compatible_eagle_draft_model",
     "get_default_eagle_test_model_ids",
+    "make_batch_prompts",
 ]
