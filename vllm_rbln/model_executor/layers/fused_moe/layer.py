@@ -499,6 +499,8 @@ def fused_moe_forward_rbln(
             masked_routing_weights_depadded = F.pad(
                 masked_routing_weights, (0, -pad_size), value=0.0
             )
+        else:
+            masked_routing_weights_depadded = masked_routing_weights
 
         # --- Pre-compute routing logit slices (used by all2all) ---
         if envs.VLLM_RBLN_DISPATCH_ALL2ALL or envs.VLLM_RBLN_COMBINE_ALL2ALL:
@@ -736,12 +738,14 @@ def fused_moe_forward_rbln(
         masked_routing_weights_depadded = F.pad(
             masked_routing_weights, (0, -pad_size), value=0.0
         )
+    else:
+        masked_routing_weights_depadded = masked_routing_weights
 
     # pass as [t, E] to quant_method.apply (it will be reshaped inside)
     final_hidden_states = self.quant_method.apply(
         layer=self,
         x=hidden_states,
-        router_logits=masked_routing_weights,
+        router_logits=masked_routing_weights_depadded,
     )
 
     return final_hidden_states
