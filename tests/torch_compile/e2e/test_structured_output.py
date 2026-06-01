@@ -52,7 +52,7 @@ ENV = {
 
 @pytest.fixture(scope="module", params=["greedy", "random"])
 def sampling_kwargs(request: pytest.FixtureRequest) -> dict:
-    """Sampling kwargs for greedy (temp=0) and random (from model's generation_config)."""
+    """Sampling kwargs for greedy (temp=0) and random (from model gen config)."""
     if request.param == "greedy":
         return {"temperature": 0.0}
     gen_cfg = GenerationConfig.from_pretrained(MODEL_ID)
