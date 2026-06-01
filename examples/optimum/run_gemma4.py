@@ -48,7 +48,6 @@ def generate_prompts(batch_size: int, model_id: str):
         for i in range(batch_size)
     ]
     images = [[dataset[i]["image"]] for i in range(batch_size)]
-    # images = [[dataset[i]["image"]] for i in range(batch_size)]
 
     texts = processor.apply_chat_template(
         messages,
@@ -87,7 +86,6 @@ async def main(
 ):
     engine_args = AsyncEngineArgs(
         model=model_id,
-        limit_mm_per_prompt={"image": 1},
         mm_processor_kwargs={"max_soft_tokens": 280},
     )
 
@@ -111,8 +109,8 @@ async def main(
 
 
 def entry_point(
-    num_input_prompt: int = 10,
-    model_id: str = "/home/eunji.lee/nas_data/0529_models/gemma4-31b-b1-new",
+    num_input_prompt: int = 1,
+    model_id: str = "./gemma4-31b-b4",
 ):
     asyncio.run(
         main(
