@@ -140,6 +140,7 @@ from vllm_rbln.v1.attention.kv_cache_bindings import (
 )
 from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 from vllm_rbln.v1.sample import RBLNSampler
+from vllm_rbln.v1.sample.cpu_rejection_sampler import CPURBLNRejectionSampler
 from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
@@ -318,6 +319,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         else:
             logger.info("Using default vLLM sampler.")
             sampler = Sampler(logprobs_mode=self.model_config.logprobs_mode)
+
         self.sampler = sampler
 
         # Lazy initialization
@@ -375,7 +377,10 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     "Unknown speculative decoding method: "
                     f"{self.speculative_config.method}"
                 )
-            self.rejection_sampler = RBLNRejectionSampler(self.sampler)
+            if self.use_rbln_sampler:
+                self.rejection_sampler = RBLNRejectionSampler(self.sampler)
+            else:
+                self.rejection_sampler = CPURBLNRejectionSampler(self.sampler)
 
         self.num_spec_tokens = 0
         if self.speculative_config:
