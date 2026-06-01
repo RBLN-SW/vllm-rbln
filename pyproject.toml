@@ -140,9 +140,14 @@ environments = [
     "sys_platform == 'linux' and platform_machine == 'x86_64'"
 ]
 
+# vllm +cpu wheels come from Rebellions' mirror (same index as
+# rebel-compiler / torch-rbln / optimum-rbln). It hosts every supported vllm
+# build under one URL — unlike wheels.vllm.ai, whose index path is
+# version-specific (…/0.19.1/cpu) — so the `vllm>=0.18,<0.20` pin resolves to
+# the best available (currently 0.19.1+cpu) from a single index.
 [[tool.uv.index]]
-name = "vllm-cpu"
-url = "https://wheels.vllm.ai/0.19.1/cpu"
+name = "rebellions"
+url = "https://pypi.rebellions.in/simple"
 explicit = true
 
 [[tool.uv.index]]
@@ -151,7 +156,7 @@ url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
 [tool.uv.sources]
-vllm = { index = "vllm-cpu" }
+vllm = { index = "rebellions" }
 torch = { index = "pytorch-cpu" }
 torchvision = { index = "pytorch-cpu" }
 torchaudio = { index = "pytorch-cpu" }
