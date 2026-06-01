@@ -16,7 +16,7 @@ import pytest
 import torch
 from vllm import LLM
 
-from .utils import patch_and_run
+from ..utils import patch_and_run
 
 LLM_PARAMS = [
     {
