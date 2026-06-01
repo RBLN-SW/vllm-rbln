@@ -33,7 +33,6 @@ from vllm.utils.torch_utils import _StreamPlaceholder
 
 import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
-from vllm_rbln.utils.optimum.converter import sync_vllm_and_optimum
 from vllm_rbln.utils.optimum.predicates import is_qwen3_pooling
 from vllm_rbln.utils.optimum.registry import (
     is_enc_dec_arch,
@@ -306,6 +305,12 @@ class RblnPlatform(Platform):
                     del model_config.__dict__["is_encoder_decoder"]
 
             cls.disable_unsupported_prefix_caching(vllm_config)
+            # Imported lazily: optimum-rbln is an optional extra and is only
+            # needed by the optimum model backend (this branch). The
+            # core/type2 path above never reaches here, so the default
+            # (optimum-less) install stays importable.
+            from vllm_rbln.utils.optimum.converter import sync_vllm_and_optimum
+
             sync_vllm_and_optimum(vllm_config)
 
         if (
