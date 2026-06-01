@@ -87,7 +87,7 @@ async def main(
 ):
     engine_args = AsyncEngineArgs(
         model=model_id,
-        limit_mm_per_prompt={"image": 2},
+        limit_mm_per_prompt={"image": 1},
         mm_processor_kwargs={"max_soft_tokens": 280},
     )
 
