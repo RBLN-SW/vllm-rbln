@@ -26,12 +26,13 @@ from enum import Enum
 
 import pytest
 from pydantic import BaseModel
+from transformers import GenerationConfig
 from vllm import LLM, SamplingParams
 from vllm.sampling_params import StructuredOutputsParams
 
 from .utils import patch_and_run
 
-MODEL_ID = "meta-llama/Llama-3.2-1B-Instruct"
+MODEL_ID = "Qwen/Qwen3-1.7B"
 
 LLM_KWARGS = {
     "model": MODEL_ID,
@@ -45,22 +46,37 @@ LLM_KWARGS = {
 ENV = {
     "VLLM_RBLN_USE_VLLM_MODEL": "1",
     "VLLM_DISABLE_COMPILE_CACHE": "1",
+    "VLLM_RBLN_SAMPLER": "1",
 }
 
 
-def _run_choice() -> None:
+@pytest.fixture(scope="module", params=["greedy", "random"])
+def sampling_kwargs(request: pytest.FixtureRequest) -> dict:
+    """Sampling kwargs for greedy (temp=0) and random (from model gen config)."""
+    if request.param == "greedy":
+        return {"temperature": 0.0}
+    gen_cfg = GenerationConfig.from_pretrained(MODEL_ID)
+    return {
+        "temperature": gen_cfg.temperature,
+        "top_p": gen_cfg.top_p,
+        "top_k": gen_cfg.top_k,
+    }
+
+
+def _run_choice(sampling_kwargs: dict) -> None:
     choices = ["Positive", "Negative"]
     llm = LLM(**LLM_KWARGS)
     outputs = llm.generate(
         prompts="Classify this sentiment: vLLM is wonderful!",
         sampling_params=SamplingParams(
-            structured_outputs=StructuredOutputsParams(choice=choices)
+            **sampling_kwargs,
+            structured_outputs=StructuredOutputsParams(choice=choices),
         ),
     )
     assert outputs[0].outputs[0].text in choices
 
 
-def _run_regex() -> None:
+def _run_regex(sampling_kwargs: dict) -> None:
     llm = LLM(**LLM_KWARGS)
     outputs = llm.generate(
         prompts=(
@@ -69,16 +85,17 @@ def _run_regex() -> None:
             "Example result: alan.turing@enigma.com\n"
         ),
         sampling_params=SamplingParams(
-            structured_outputs=StructuredOutputsParams(regex=r"\w+@\w+\.com\n")
+            **sampling_kwargs,
+            structured_outputs=StructuredOutputsParams(regex=r"\w+@\w+\.com\n?"),
         ),
     )
     text = outputs[0].outputs[0].text
-    assert re.fullmatch(r"\w+@\w+\.com\n", text), (
+    assert re.fullmatch(r"\w+@\w+\.com\n?", text), (
         f"Output does not match regex: {text!r}"
     )
 
 
-def _run_json() -> None:
+def _run_json(sampling_kwargs: dict) -> None:
     class CarType(str, Enum):
         sedan = "sedan"
         suv = "SUV"
@@ -97,6 +114,7 @@ def _run_json() -> None:
             "of the most iconic car from the 90's"
         ),
         sampling_params=SamplingParams(
+            **sampling_kwargs,
             max_tokens=32,
             structured_outputs=StructuredOutputsParams(
                 json=CarDescription.model_json_schema()
@@ -111,7 +129,7 @@ def _run_json() -> None:
     assert car.car_type in CarType
 
 
-def _run_grammar() -> None:
+def _run_grammar(sampling_kwargs: dict) -> None:
     simplified_sql_grammar = """
         root ::= select_statement
 
@@ -132,7 +150,8 @@ def _run_grammar() -> None:
             "from the 'users' table."
         ),
         sampling_params=SamplingParams(
-            structured_outputs=StructuredOutputsParams(grammar=simplified_sql_grammar)
+            **sampling_kwargs,
+            structured_outputs=StructuredOutputsParams(grammar=simplified_sql_grammar),
         ),
     )
     text = outputs[0].outputs[0].text
@@ -141,7 +160,7 @@ def _run_grammar() -> None:
     assert " where " in text
 
 
-def _run_structural_tag() -> None:
+def _run_structural_tag(sampling_kwargs: dict) -> None:
     structural_tag_obj = {
         "type": "structural_tag",
         "structures": [
@@ -183,9 +202,10 @@ What is the weather in New York City?
     outputs = llm.generate(
         prompts=prompt,
         sampling_params=SamplingParams(
+            **sampling_kwargs,
             structured_outputs=StructuredOutputsParams(
                 structural_tag=json.dumps(structural_tag_obj)
-            )
+            ),
         ),
     )
     text = outputs[0].outputs[0].text
@@ -201,21 +221,31 @@ What is the weather in New York City?
     assert "city" in params
 
 
-def test_choice_sentiment_classification(monkeypatch: pytest.MonkeyPatch) -> None:
-    patch_and_run(monkeypatch, ENV, _run_choice)
+def test_choice_sentiment_classification(
+    monkeypatch: pytest.MonkeyPatch, sampling_kwargs: dict
+) -> None:
+    patch_and_run(monkeypatch, ENV, _run_choice, sampling_kwargs)
 
 
-def test_regex_email_format(monkeypatch: pytest.MonkeyPatch) -> None:
-    patch_and_run(monkeypatch, ENV, _run_regex)
+def test_regex_email_format(
+    monkeypatch: pytest.MonkeyPatch, sampling_kwargs: dict
+) -> None:
+    patch_and_run(monkeypatch, ENV, _run_regex, sampling_kwargs)
 
 
-def test_json_car_description(monkeypatch: pytest.MonkeyPatch) -> None:
-    patch_and_run(monkeypatch, ENV, _run_json)
+def test_json_car_description(
+    monkeypatch: pytest.MonkeyPatch, sampling_kwargs: dict
+) -> None:
+    patch_and_run(monkeypatch, ENV, _run_json, sampling_kwargs)
 
 
-def test_grammar_sql_query(monkeypatch: pytest.MonkeyPatch) -> None:
-    patch_and_run(monkeypatch, ENV, _run_grammar)
+def test_grammar_sql_query(
+    monkeypatch: pytest.MonkeyPatch, sampling_kwargs: dict
+) -> None:
+    patch_and_run(monkeypatch, ENV, _run_grammar, sampling_kwargs)
 
 
-def test_structural_tag_function_call(monkeypatch: pytest.MonkeyPatch) -> None:
-    patch_and_run(monkeypatch, ENV, _run_structural_tag)
+def test_structural_tag_function_call(
+    monkeypatch: pytest.MonkeyPatch, sampling_kwargs: dict
+) -> None:
+    patch_and_run(monkeypatch, ENV, _run_structural_tag, sampling_kwargs)
