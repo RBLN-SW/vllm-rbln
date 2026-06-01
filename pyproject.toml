@@ -142,7 +142,7 @@ environments = [
 
 [[tool.uv.index]]
 name = "vllm-cpu"
-url = "https://wheels.vllm.ai/0.18.0/cpu"
+url = "https://wheels.vllm.ai/0.19.1/cpu"
 explicit = true
 
 [[tool.uv.index]]
