@@ -43,10 +43,19 @@ dependencies = [
     "torch",
     "torchvision",
     "torchaudio",
-    "optimum-rbln>=0.10.4",
 ]
 
 [project.optional-dependencies]
+# optimum-rbln pins transformers==4.57.6, which conflicts with consumers that
+# need newer transformers (e.g. lmcache>=0.4.5 requires transformers>=5.4).
+# It is only imported by the optimum model backend
+# (vllm_rbln.model_executor.models.optimum.* / utils.optimum.*), which is
+# registered lazily by module path — the core/type2 path never imports it.
+# Keep it optional so the default install stays transformers-agnostic; install
+# `vllm-rbln[optimum]` to use the optimum backend.
+optimum = [
+    "optimum-rbln>=0.10.4",
+]
 test = [
     "pytest",
     "pytest-asyncio",
