@@ -2259,9 +2259,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # the decode model's: num_spec_tokens + 1. Mirror the decode warmup
         # pattern (override num_scheduled + pass scheduled_spec_decode_tokens)
         # so the sampler graph is compiled for the full-spec shape.
-        sampler_query_len = (
-            self.num_spec_tokens + 1 if self.num_spec_tokens > 0 else 1
-        )
+        sampler_query_len = self.num_spec_tokens + 1 if self.num_spec_tokens > 0 else 1
         dummy_decode_requests = []
         dummy_decode_num_scheduled_tokens = {}
         for decode_batch in range(1, max_decode_batch + 1):
@@ -3290,9 +3288,9 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 - num_scheduled_tokens_i64.cumsum(0)[req_indices]
                 + num_scheduled_tokens_i64[req_indices]
             )
-            unpadded_to_padded = (
-                req_indices * max_spec_decode_len + token_offsets
-            ).to(logits_indices.device)
+            unpadded_to_padded = (req_indices * max_spec_decode_len + token_offsets).to(
+                logits_indices.device
+            )
             logits_indices = unpadded_to_padded[logits_indices.to(torch.int64)]
 
         # Run the model.

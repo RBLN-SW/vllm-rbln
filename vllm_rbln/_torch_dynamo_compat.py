@@ -67,9 +67,7 @@ def _patch_compile_event_logger() -> None:
     _PATCHED = True
 
     cel = _du.CompileEventLogger
-    cel.increment_toplevel = staticmethod(
-        _silence_no_toplevel(cel.increment_toplevel)
-    )
+    cel.increment_toplevel = staticmethod(_silence_no_toplevel(cel.increment_toplevel))
     cel.add_to_set_toplevel = staticmethod(
         _silence_no_toplevel(cel.add_to_set_toplevel)
     )
