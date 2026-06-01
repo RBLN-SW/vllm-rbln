@@ -31,7 +31,6 @@ if TYPE_CHECKING:
     VLLM_RBLN_DP_IMPL: str = "padded_decode"
     VLLM_RBLN_USE_MOE_TOKENS_MASK: bool = True
     VLLM_RBLN_ENFORCE_MODEL_FP32: bool = False
-    VLLM_RBLN_MOE_CUSTOM_KERNEL: bool = True
     VLLM_RBLN_DP_INPUT_ALL_GATHER: bool = True
     VLLM_RBLN_LOGITS_ALL_GATHER: bool = True
     VLLM_RBLN_NUM_RAY_NODES: int = 1
@@ -188,13 +187,6 @@ environment_variables = {
     "VLLM_RBLN_ENFORCE_MODEL_FP32": (
         lambda: (
             os.environ.get("VLLM_RBLN_ENFORCE_MODEL_FP32", "False").lower()
-            in ("true", "1")
-        )
-    ),
-    # use moe custom kernel (optimized), by default enabled
-    "VLLM_RBLN_MOE_CUSTOM_KERNEL": (
-        lambda: (
-            os.environ.get("VLLM_RBLN_MOE_CUSTOM_KERNEL", "True").lower()
             in ("true", "1")
         )
     ),

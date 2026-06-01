@@ -43,8 +43,8 @@ def fused_moe_custom__init__(self, *args, **kwargs):
     )
 
 
-# Define custom_moe_glu op for VLLM_RBLN_MOE_CUSTOM_KERNEL
-# When disabled, falls back to PyTorch native loop implementation.
+# Define custom_moe_glu op. The body below is the PyTorch reference
+# implementation; on device it is replaced by the RBLN custom kernel.
 @torch.library.custom_op(
     "rbln_custom_ops::custom_moe_glu",
     mutates_args=(),
@@ -105,88 +105,6 @@ def custom_moe_glu_fake(
     down_proj_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
-
-
-def unquantized_fused_moe_method_rbln(
-    self: UnquantizedFusedMoEMethod,
-    layer: FusedMoE,
-    x: torch.Tensor,
-    router_logits: torch.Tensor,
-):
-    # selected_experts
-    w1 = layer.w13_weight
-    w2 = layer.w2_weight
-
-    orig_shape = x.shape  # noqa: F841
-    hidden_size = x.shape[-1]
-    num_tokens = x.shape[:-1].numel()  # noqa: F841
-    num_experts = w1.shape[0]
-    intermediate_size = w2.shape[-1]
-    dtype = x.dtype
-    top_k = layer.top_k
-
-    hidden_states = x
-    gating_output = router_logits
-    topk_weights = gating_output.softmax(dim=-1, dtype=torch.float)
-    topk_weights = topk_weights.to(torch.float)
-    topk_weights, selected_experts = topk_weights.topk(top_k, dim=-1)
-    if layer.renormalize:
-        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-
-    if layer.expert_map is not None:
-        selected_experts = layer.expert_map[selected_experts]
-
-    final_hidden_states = None
-
-    # 1. build expert_mask & expert_weights
-    # 2. FFN
-    # topk_weights, expert_weights, expert_mask.shape = [b, seq, top_k]
-    # NOTE - convert for loop scalar operation into tensor compare
-
-    # [1,num_tokens,hidden_size]
-    hidden_states = hidden_states.reshape(1, num_tokens, -1)
-    # [num_experts,1,1,1]
-    expert_idx_array = torch.arange(0, num_experts).reshape(num_experts, 1, 1, 1)
-    # [1,1,num_tokens,topk]
-    selected_experts_array = selected_experts.reshape(-1, 1, num_tokens, top_k)
-    # [num_experts,1,num_tokens,topk]
-    expert_mask_array = selected_experts_array == expert_idx_array
-    # [num_experts,1,num_tokens,topk]
-    topk_weights_array = topk_weights.reshape(-1, 1, num_tokens, top_k)
-    # [num_experts,1,num_tokens,1]
-    expert_weights_array = (topk_weights_array * expert_mask_array).sum(
-        dim=-1, keepdim=True
-    )
-    # [1,num_tokens,1]
-    temp_expert_weights = expert_weights_array[0]
-    # NOTE - make explicit dependence between hidden_states and expert_weights
-    # [1,num_tokens,hidden_size]
-    # [1,num_tokens,1] <- broadcast add
-    hidden_states = hidden_states + temp_expert_weights - temp_expert_weights
-    # [num_experts,1,num_tokens,1] -> [num_experts,1,num_tokens,hidden_size]
-    hidden_states = hidden_states.to(dtype)
-    expert_weights_array = expert_weights_array.broadcast_to(
-        (num_experts, 1, num_tokens, hidden_size)
-    ).to(dtype)
-    # solution1. make custom operation for expert loop
-    # solution2. add dummy use of expert_weights_array
-    for expert_idx in range(num_experts):
-        expert_w1 = w1[expert_idx]
-        expert_w2 = w2[expert_idx]
-        expert_weights = expert_weights_array[expert_idx]
-        x = F.linear(hidden_states, expert_w1)
-        gate = F.silu(x[..., :intermediate_size])
-        x = x[..., intermediate_size:] * gate
-        x = F.linear(x, expert_w2)
-
-        current_hidden_states = x * expert_weights
-        if final_hidden_states is None:
-            final_hidden_states = current_hidden_states
-        else:
-            final_hidden_states = final_hidden_states + current_hidden_states
-
-    assert final_hidden_states is not None
-    return final_hidden_states.reshape(orig_shape)
 
 
 def get_tokens_mask(num_tokens: int, left=1.0, right=0.0, device=None):
@@ -909,10 +827,6 @@ def _fused_moe_init_with_all2all(self, *args, **kwargs):
 FusedMoE.__init__ = _fused_moe_init_with_all2all
 FusedMoE.forward_oot = fused_moe_forward_rbln
 
-if envs.VLLM_RBLN_MOE_CUSTOM_KERNEL:
-    logger.info("[RBLN] fused moe, RBLN moe custom kernel")
-    UnquantizedFusedMoEMethod.apply = unquantized_fused_moe_method_custom
-else:
-    logger.info("[RBLN] fused moe, pytorch native kernel")
-    UnquantizedFusedMoEMethod.apply = unquantized_fused_moe_method_rbln
+logger.info("[RBLN] fused moe, RBLN moe custom kernel")
+UnquantizedFusedMoEMethod.apply = unquantized_fused_moe_method_custom
 FusedMoE.naive_multicast = fused_moe_naive_multicast_rbln
