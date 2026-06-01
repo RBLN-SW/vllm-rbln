@@ -230,15 +230,12 @@ class RBLNEagleProposer(EagleProposer):
             self.token_arange_np[: batch_size + 1]
         ).clone()
 
-        # In padded drafter batch, we need to adjust the sequence lengths
-        # to remove the "padding" (i.e. rejected tokens).
-        # Only apply this adjustment when we have rejected tokens
-        # (i.e., not the first proposal).
-        if self.num_speculative_tokens > 1 and num_rejected_tokens_gpu is not None:
-            common_attn_metadata.seq_lens -= num_rejected_tokens_gpu
-            # Invalidate the CPU-side shadows to avoid H<>D sync.
-            common_attn_metadata._seq_lens_cpu = None
-            common_attn_metadata._num_computed_tokens_cpu = None
+        if self.num_speculative_tokens > 1:
+            common_attn_metadata.seq_lens = common_attn_metadata.seq_lens.clone()
+            if num_rejected_tokens_gpu is not None:
+                common_attn_metadata.seq_lens -= num_rejected_tokens_gpu
+                common_attn_metadata._seq_lens_cpu = None
+                common_attn_metadata._num_computed_tokens_cpu = None
 
         block_size = self.block_size
         assert block_size > 0, "block_size has not been initialized."
@@ -246,8 +243,15 @@ class RBLNEagleProposer(EagleProposer):
         # are junk and filtered out of KV-cache writes via PADDING_SLOT_ID.
         padded_q_len = self.num_speculative_tokens + 1
         sub_num_tokens_across_dp, sub_num_padded_tokens = (
-            self._dp_forward_context_args(batch_size, batch_bucket_size * padded_q_len)
+            self._dp_forward_context_args(
+                batch_bucket_size * padded_q_len, batch_bucket_size * padded_q_len
+            )
         )
+
+        if batch_bucket_size > batch_size:
+            self.input_ids[batch_size:batch_bucket_size].fill_(0)
+            self.positions[batch_size:batch_bucket_size].fill_(-1)
+            self.hidden_states[batch_size:batch_bucket_size].fill_(0)
         for _ in range(self.num_speculative_tokens - 1):
             # Update the inputs
             # cast to int32 is crucial when eagle model is compiled.
@@ -298,9 +302,13 @@ class RBLNEagleProposer(EagleProposer):
             slot_mapping_valid = common_attn_metadata.slot_mapping.view(
                 batch_size, 1
             )
-            common_attn_metadata.slot_mapping = rbln_utils.pad(
+            slot_mapping_q_padded = rbln_utils.pad(
                 slot_mapping_valid, 1, padded_q_len, PADDING_SLOT_ID
-            ).view(-1)
+            )
+            slot_mapping_full = rbln_utils.pad(
+                slot_mapping_q_padded, 0, batch_bucket_size, PADDING_SLOT_ID
+            )
+            common_attn_metadata.slot_mapping = slot_mapping_full.view(-1)
 
             # Rebuild attention metadata
             extra_attn_metadata_args = {}
@@ -323,10 +331,9 @@ class RBLNEagleProposer(EagleProposer):
                 for layer_name in attn_group.layer_names:
                     per_layer_attn_metadata[layer_name] = attn_metadata
 
-            # copy inputs to buffer
             self.input_ids[:batch_size] = input_ids
             self._set_positions(batch_size, clamped_positions)
-            self.hidden_states[: hidden_states.shape[0]] = hidden_states
+            self.hidden_states[:batch_size] = hidden_states[:batch_size]
             if self.supports_mm_inputs:
                 self.inputs_embeds[:batch_size] = self.model.embed_input_ids(input_ids)
 
@@ -359,7 +366,7 @@ class RBLNEagleProposer(EagleProposer):
             with set_forward_context(
                 per_layer_attn_metadata,
                 self.vllm_config,
-                num_tokens=batch_size,
+                num_tokens=batch_bucket_size * padded_q_len,
                 num_tokens_across_dp=sub_num_tokens_across_dp,
                 num_padded_tokens=sub_num_padded_tokens,
                 additional_kwargs=build_kv_cache_forward_context_kwargs(
@@ -373,6 +380,10 @@ class RBLNEagleProposer(EagleProposer):
                     inputs_embeds=inputs_embeds,
                     last_token_indices=last_token_indices,
                 )
+
+            hidden_states = hidden_states[
+                self.arange[:batch_bucket_size] * padded_q_len
+            ]
             draft_token_ids = logits[:batch_size].argmax(dim=-1)
             draft_token_ids_list.append(draft_token_ids)
 
@@ -464,16 +475,14 @@ class RBLNEagleProposer(EagleProposer):
         # Subsequent loop matches the busy peer's k-1 iterations.
         if self.num_speculative_tokens == 1:
             return
-        sub_nta_dp, sub_npt = self._dp_forward_context_args(
-            batch_bucket_size, flat_tokens
-        )
+        
         for _ in range(self.num_speculative_tokens - 1):
             with set_forward_context(
                 per_layer_attn_metadata,
                 self.vllm_config,
-                num_tokens=batch_bucket_size,
-                num_tokens_across_dp=sub_nta_dp,
-                num_padded_tokens=sub_npt,
+                num_tokens=flat_tokens,
+                num_tokens_across_dp=nta_dp,
+                num_padded_tokens=npt,
                 additional_kwargs=fwd_ctx_kwargs,
             ):
                 _ = self.model_executable(
