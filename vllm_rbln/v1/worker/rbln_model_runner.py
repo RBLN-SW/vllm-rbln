@@ -3248,14 +3248,24 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             _slide_distance_map = (
                 getattr(scheduler_output, "spec_decode_slide_distance", {}) or {}
             )
-            num_scheduled_tokens_per_req = torch.tensor(
+            # Build the scheduling tensor on CPU and only `.to(device)` at
+            # consumer boundaries — mirrors the non-spec path where the
+            # eventual `logits_indices.to(self.device)` is the only place a
+            # device hop happens. Doing the cumsum / repeat_interleave
+            # remap on the device side hits a CPU-vs-device indexing
+            # mismatch under VLLM_RBLN_USE_DEVICE_TENSOR=1, because
+            # `input_ids.device` (cpu staging in dummy run) and
+            # `logits_indices.device` (rbln) diverge.
+            num_scheduled_tokens_per_req_cpu = torch.tensor(
                 [
                     scheduler_output.num_scheduled_tokens[i]
                     + _slide_distance_map.get(i, 0)
                     for i in self.input_batch.req_ids
                 ],
-                device=input_ids.device,
                 dtype=torch.int32,
+            )
+            num_scheduled_tokens_per_req = num_scheduled_tokens_per_req_cpu.to(
+                input_ids.device
             )
             input_ids = rbln_utils.pad_speculative_draft_tokens(
                 input_ids,
@@ -3271,17 +3281,18 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # [req0_tokens, req1_tokens, ...] layout. After per-request padding,
             # flatten order changes to fixed-stride rows
             # [req0(max_spec), req1(max_spec), ...], so remap indices.
-            num_scheduled_tokens_i64 = num_scheduled_tokens_per_req.to(torch.int64)
+            num_scheduled_tokens_i64 = num_scheduled_tokens_per_req_cpu.to(torch.int64)
             req_indices = torch.repeat_interleave(
-                torch.arange(num_reqs, device=logits_indices.device),
-                num_scheduled_tokens_i64,
+                torch.arange(num_reqs), num_scheduled_tokens_i64
             )
             token_offsets = (
-                torch.arange(num_input_tokens, device=logits_indices.device)
+                torch.arange(num_input_tokens)
                 - num_scheduled_tokens_i64.cumsum(0)[req_indices]
                 + num_scheduled_tokens_i64[req_indices]
             )
-            unpadded_to_padded = req_indices * max_spec_decode_len + token_offsets
+            unpadded_to_padded = (
+                req_indices * max_spec_decode_len + token_offsets
+            ).to(logits_indices.device)
             logits_indices = unpadded_to_padded[logits_indices.to(torch.int64)]
 
         # Run the model.
