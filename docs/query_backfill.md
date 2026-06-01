@@ -169,11 +169,13 @@ total**, exactly matching `Σ (proposed_drafts − kept_drafts)`.
 ```bash
 export VLLM_RBLN_BACKFILL_TRACE_REQS=3
 vllm serve MiniMaxAI/MiniMax-M2.5 \
+  --port 8000 \
   --data-parallel-size 4 --enable-expert-parallel \
   --max-model-len 196608 --block-size 1024 \
-  --max-num-seqs 8 --enable-chunked-prefill \
-  --speculative-config '{"method":"ngram","num_speculative_tokens":3,
-                         "prompt_lookup_max":5,"prompt_lookup_min":2}'
+  --enable-chunked-prefill --max-num-batched-tokens 512 --max-num-seqs 8 \
+  --gpu-memory-utilization 0.8 --trust-remote-code \
+  --speculative-config '{"method": "ngram", "num_speculative_tokens": 3, "prompt_lookup_max": 5, "prompt_lookup_min": 2}' \
+  --override-generation-config '{"temperature": 0.1, "top_p": 0.9}'
 
 vllm bench serve --model MiniMaxAI/MiniMax-M2.5 \
   --base-url http://127.0.0.1:8000 --endpoint /v1/completions \
