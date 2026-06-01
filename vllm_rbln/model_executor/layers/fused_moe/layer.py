@@ -38,8 +38,10 @@ def fused_moe_custom__init__(self, *args, **kwargs):
     )
 
 
-# Define custom_moe_glu op based on environment variable
-# VLLM_RBLN_MOE_USE_OPT_KERNEL: uses topk, post_norm, expert_map parameters
+# Define custom_moe_glu op based on environment variable. Routing (topk +
+# scoring + optional grouped-topk) is computed in PyTorch by
+# fused_moe_forward_rbln; the ops below only apply pre-computed routing weights.
+# VLLM_RBLN_MOE_USE_OPT_KERNEL: uses expert_map parameter
 # VLLM_RBLN_MOE_CUSTOM_KERNEL: uses expert_select_count parameter
 if envs.VLLM_RBLN_MOE_USE_OPT_KERNEL:
 
@@ -53,9 +55,6 @@ if envs.VLLM_RBLN_MOE_USE_OPT_KERNEL:
         up_proj_weight: torch.Tensor,
         down_proj_weight: torch.Tensor,
         masked_routing_weight: torch.Tensor,
-        scoring_func: str,
-        topk: int,
-        post_norm: bool,
         expert_map: torch.Tensor | None = None,
         gate_proj_bias: torch.Tensor | None = None,
         up_proj_bias: torch.Tensor | None = None,
@@ -67,24 +66,36 @@ if envs.VLLM_RBLN_MOE_USE_OPT_KERNEL:
         """
         Customized MoE GLU operation (optimized kernel version).
 
+        Routing (topk + softmax/sigmoid, optional grouped-topk) is computed
+        in PyTorch by ``fused_moe_forward_rbln``; this op only applies the
+        pre-computed routing weights.
+
         Expected tensor shapes:
         - hidden_states: [batch * seq_len, hidden_size]
         - gate_proj_weight: [num_experts, intermediate_size, hidden_size]
         - up_proj_weight: [num_experts, intermediate_size, hidden_size]
         - down_proj_weight: [num_experts, hidden_size, intermediate_size]
-        - masked_routing_weight: [batch * seq_len, num_experts]
+        - masked_routing_weight: [num_experts, batch * seq_len]
+          (token dim may be padded to 64-align)
 
         Returns:
             torch.Tensor: [batch * seq_len, hidden_size]
         """
+        assert hidden_states.dtype == masked_routing_weight.dtype, (
+            "hidden_states and masked_routing_weight must have the same dtype"
+        )
+
+        num_tokens = hidden_states.shape[0]
         out = torch.zeros_like(hidden_states)
         expert_cnt = gate_proj_weight.shape[0]
+        # routing weight token dim may be padded to 64-align; slice to num_tokens
+        routing_t = masked_routing_weight.transpose(0, 1)[:num_tokens, :]  # [T, E]
         for i in range(expert_cnt):
             gate = torch.nn.functional.linear(hidden_states, gate_proj_weight[i])
             up = torch.nn.functional.linear(hidden_states, up_proj_weight[i])
             mul = torch.nn.functional.silu(gate) * up
             down = torch.nn.functional.linear(mul, down_proj_weight[i])
-            out += down * masked_routing_weight[:, i : i + 1]
+            out += down * routing_t[:, i : i + 1]
         return out
 
     @custom_moe_glu.register_fake
@@ -94,9 +105,6 @@ if envs.VLLM_RBLN_MOE_USE_OPT_KERNEL:
         up_proj_weight: torch.Tensor,
         down_proj_weight: torch.Tensor,
         masked_routing_weight: torch.Tensor,
-        scoring_func: str,
-        topk: int,
-        post_norm: bool,
         expert_map: torch.Tensor | None = None,
         gate_proj_bias: torch.Tensor | None = None,
         up_proj_bias: torch.Tensor | None = None,
@@ -124,31 +132,41 @@ else:
         up_proj_bias: torch.Tensor | None = None,
         down_proj_bias: torch.Tensor | None = None,
         dp_mask: torch.Tensor | None = None,
-        n_group: int | None = None,
-        topk_group: int | None = None,
     ) -> torch.Tensor:
         """
         Customized MoE GLU operation (custom kernel version).
+
+        Routing (topk + softmax/sigmoid, optional grouped-topk) is computed
+        in PyTorch by ``fused_moe_forward_rbln``; this op only applies the
+        pre-computed routing weights.
 
         Expected tensor shapes:
         - hidden_states: [batch * seq_len, hidden_size]
         - gate_proj_weight: [num_experts, intermediate_size, hidden_size]
         - up_proj_weight: [num_experts, intermediate_size, hidden_size]
         - down_proj_weight: [num_experts, hidden_size, intermediate_size]
-        - masked_routing_weight: [batch * seq_len, num_experts]
+        - masked_routing_weight: [num_experts, batch * seq_len]
+          (token dim may be padded to 64-align)
         - expert_select_count: [num_experts]
 
         Returns:
             torch.Tensor: [batch * seq_len, hidden_size]
         """
+        assert hidden_states.dtype == masked_routing_weight.dtype, (
+            "hidden_states and masked_routing_weight must have the same dtype"
+        )
+
+        num_tokens = hidden_states.shape[0]
         out = torch.zeros_like(hidden_states)
         expert_cnt = gate_proj_weight.shape[0]
+        # routing weight token dim may be padded to 64-align; slice to num_tokens
+        routing_t = masked_routing_weight.transpose(0, 1)[:num_tokens, :]  # [T, E]
         for i in range(expert_cnt):
             gate = torch.nn.functional.linear(hidden_states, gate_proj_weight[i])
             up = torch.nn.functional.linear(hidden_states, up_proj_weight[i])
             mul = torch.nn.functional.silu(gate) * up
             down = torch.nn.functional.linear(mul, down_proj_weight[i])
-            out += down * masked_routing_weight[:, i : i + 1]
+            out += down * routing_t[:, i : i + 1]
         return out
 
     @custom_moe_glu.register_fake
@@ -163,8 +181,6 @@ else:
         up_proj_bias: torch.Tensor | None = None,
         down_proj_bias: torch.Tensor | None = None,
         dp_mask: torch.Tensor | None = None,
-        n_group: int | None = None,
-        topk_group: int | None = None,
     ) -> torch.Tensor:
         return torch.empty_like(hidden_states)
 
@@ -251,6 +267,107 @@ def unquantized_fused_moe_method_rbln(
     return final_hidden_states.reshape(orig_shape)
 
 
+def _apply_grouped_topk_torch(
+    router_logits_2d,  # [T, E] - raw logits (not transposed)
+    top_k,
+    num_expert_group,
+    topk_group,
+    scoring_func="softmax",
+    renormalize=True,
+    e_score_correction_bias=None,
+):
+    """Apply grouped topk routing in PyTorch.
+
+    Groups experts, selects top groups per token, then applies topk routing
+    within selected groups, and scatters results back to full expert space.
+
+    Args:
+        router_logits_2d: [T, E] raw router logits.
+        top_k: Number of experts to select per token.
+        num_expert_group: Number of expert groups (G).
+        topk_group: Number of top groups to select per token.
+        scoring_func: "softmax", "sigmoid", or None.
+        renormalize: Whether to renormalize routing weights after topk.
+        e_score_correction_bias: Optional [E] bias tensor (used with sigmoid).
+
+    Returns:
+        masked_routing_weights: [E, T] tensor with topk routing weights.
+    """
+    T, E = router_logits_2d.shape
+    G = num_expert_group
+    epg = E // G  # experts per group
+
+    # Step 1: Reshape to groups [T, G, E/G]
+    grouped = router_logits_2d.reshape(T, G, epg)
+
+    # Step 2: Score each group by sum of top-2 expert values
+    group_top2_values, _ = torch.topk(grouped, 2, dim=2)  # [T, G, 2]
+    group_scores = group_top2_values.sum(dim=2)  # [T, G]
+
+    # Step 3: Select top topk_group groups per token
+    _, selected_group_idx = torch.topk(group_scores, topk_group, dim=1)  # [T, tg]
+
+    # Step 4: Gather selected groups [T, topk_group, epg]
+    idx_expanded = selected_group_idx.unsqueeze(-1).expand(-1, -1, epg)
+    gathered = torch.gather(grouped, 1, idx_expanded)  # [T, topk_group, epg]
+
+    # Transpose to [topk_group, epg, T] then flatten to [topk_group*epg, T]
+    gathered_t = gathered.permute(1, 2, 0).reshape(-1, T)  # [topk_group*epg, T]
+
+    # Step 5: Apply topk routing on gathered experts
+    if scoring_func == "sigmoid":
+        scores_for_topk = gathered_t
+        if e_score_correction_bias is not None:
+            # Gather bias for selected groups per token
+            bias_grouped = e_score_correction_bias.reshape(G, epg)  # [G, epg]
+            bias_idx = selected_group_idx.unsqueeze(-1).expand(-1, -1, epg)
+            gathered_bias = torch.gather(
+                bias_grouped.unsqueeze(0).expand(T, -1, -1), 1, bias_idx
+            )  # [T, topk_group, epg]
+            gathered_bias_t = gathered_bias.permute(1, 2, 0).reshape(-1, T)
+            scores_for_topk = gathered_t + gathered_bias_t
+            _, selected_experts = torch.topk(scores_for_topk, k=top_k, dim=0)
+            topk_weights = gathered_t.gather(0, selected_experts)
+        else:
+            topk_weights, selected_experts = torch.topk(
+                scores_for_topk, k=top_k, dim=0
+            )
+        if renormalize:
+            topk_weights = topk_weights / topk_weights.sum(
+                dim=0, keepdim=True
+            ).clamp_min(1e-20)
+    elif scoring_func == "softmax":
+        if renormalize:
+            # post_norm: topk first (renormalize handles normalization)
+            topk_weights, selected_experts = torch.topk(gathered_t, k=top_k, dim=0)
+        else:
+            # pre_norm: softmax first, then topk
+            sw = F.softmax(gathered_t, dim=0)
+            topk_weights, selected_experts = torch.topk(sw, k=top_k, dim=0)
+    else:
+        if renormalize:
+            topk_weights, selected_experts = torch.topk(gathered_t, k=top_k, dim=0)
+            topk_weights = F.softmax(topk_weights, dim=0)
+        else:
+            topk_weights, selected_experts = torch.topk(gathered_t, k=top_k, dim=0)
+
+    # Create masked routing in gathered space [topk_group*epg, T]
+    routed_flat = torch.zeros_like(gathered_t)
+    routed_flat.scatter_(0, selected_experts, topk_weights)
+
+    # Reshape back: [topk_group, epg, T] -> [T, topk_group, epg]
+    routed_3d = routed_flat.reshape(topk_group, epg, T)
+    routed_t = routed_3d.permute(2, 0, 1)  # [T, topk_group, epg]
+
+    # Scatter back to full [T, G, epg]
+    result = torch.zeros(T, G, epg, dtype=routed_t.dtype, device=routed_t.device)
+    idx_expanded = selected_group_idx.unsqueeze(-1).expand(-1, -1, epg)
+    result.scatter_(1, idx_expanded, routed_t)
+
+    # Reshape to [T, E] then transpose to [E, T]
+    return result.reshape(T, E).transpose(0, 1)  # [E, T]
+
+
 def get_tokens_mask(num_tokens: int, left=1.0, right=0.0, device=None):
     num_tokens_across_dp = get_forward_context().dp_metadata.num_tokens_across_dp_cpu
     num_tokens_across_dp = num_tokens_across_dp.unsqueeze(1)
@@ -327,48 +444,37 @@ def unquantized_fused_moe_method_custom(
     x: torch.Tensor,
     router_logits: torch.Tensor,
 ):
-    # selected_experts
+    # routing (topk + scoring + optional grouped-topk) is computed in PyTorch;
+    # the custom op below only applies the resulting [E, T] weights.
     # w1 : gate_proj, w2 : down_proj, w3 : up_proj
     orig_shape = x.shape  # noqa: F841
     num_tokens = orig_shape[:-1].numel()  # noqa: F841
     intermediate_size = layer.w2_weight.shape[-1]
 
-    # w13_weight- merged weight for gate_proj(w1_weight) and up_proj (w3_weight)
-    # w2_weight - down_proj
-    # gate_proj_weight - first half, layer.w13_weight[:intermediate_size]
-    # up_proj_weight - second half, layer.w13_weight[intermediate_size:]
-    # down_proj_weights = layer.w2_weight
     gate_proj_weight = layer.w13_weight[:, :intermediate_size, :]
     up_proj_weight = layer.w13_weight[:, intermediate_size:, :]
     down_proj_weight = layer.w2_weight
 
     # expected tensor shape - [num_tokens, -1]
     hidden_states = x.reshape(num_tokens, -1)
-    router_logits = router_logits.reshape(num_tokens, -1)
 
-    if layer.use_grouped_topk:
-        raise NotImplementedError("Grouped topk case is not supported")
+    # [num_experts, num_tokens(+pad)] masked routing weights
+    masked_routing_weights_t = build_masked_routing_weights(layer, router_logits, x)
 
-    masked_routing_weights, expert_select_count = get_masked_routing_weights(
-        router_logits, layer.top_k, layer.renormalize, layer.expert_map
-    )
-
-    tokens_mask = None
-    use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
-    if use_moe_tokens_mask:
-        tokens_mask = get_tokens_mask(num_tokens, device=router_logits.device)
+    # count selected tokens for each expert index
+    expert_select_count = (masked_routing_weights_t > 0).sum(dim=1).to(torch.int32)
 
     final_hidden_states = torch.ops.rbln_custom_ops.custom_moe_glu(
         hidden_states,
         gate_proj_weight,
         up_proj_weight,
         down_proj_weight,
-        masked_routing_weights,
+        masked_routing_weights_t,
         expert_select_count,
         None,
         None,
         None,
-        tokens_mask,
+        None,
     )
     return final_hidden_states.reshape(orig_shape)
 
@@ -379,32 +485,22 @@ def unquantized_fused_optimize_moe_method_custom(
     x: torch.Tensor,
     router_logits: torch.Tensor,
 ):
-    # selected_experts
+    # routing (topk + scoring + optional grouped-topk) is computed in PyTorch;
+    # the custom op below only applies the resulting [E, T] weights.
     # w1 : gate_proj, w2 : down_proj, w3 : up_proj
     orig_shape = x.shape  # noqa: F841
     num_tokens = orig_shape[:-1].numel()  # noqa: F841
     intermediate_size = layer.w2_weight.shape[-1]
 
-    # w13_weight- merged weight for gate_proj(w1_weight) and up_proj (w3_weight)
-    # w2_weight - down_proj
-    # gate_proj_weight - first half, layer.w13_weight[:intermediate_size]
-    # up_proj_weight - second half, layer.w13_weight[intermediate_size:]
-    # down_proj_weights = layer.w2_weight
     gate_proj_weight = layer.w13_weight[:, :intermediate_size, :]
     up_proj_weight = layer.w13_weight[:, intermediate_size:, :]
     down_proj_weight = layer.w2_weight
 
     # expected tensor shape - [num_tokens, -1]
     hidden_states = x.reshape(num_tokens, -1)
-    router_logits = router_logits.reshape(num_tokens, -1)
 
-    # Pre-score routing inputs at caller side; compiler custom op routing
-    # expects already-scored values (no sigmoid applied inside the kernel).
-    scoring_func = getattr(layer, "scoring_func", None)
-    assert scoring_func is not None, "FusedMoE.scoring_func must be set"
-    assert scoring_func in {"softmax", "sigmoid"}
-    if scoring_func == "sigmoid":
-        router_logits = torch.sigmoid(router_logits)
+    # [num_experts, num_tokens(+pad)] masked routing weights
+    masked_routing_weights_t = build_masked_routing_weights(layer, router_logits, x)
 
     expert_map_const = None
     if layer.expert_map is not None:
@@ -413,33 +509,142 @@ def unquantized_fused_optimize_moe_method_custom(
         # PyTorch 2.10+ Dynamo when capture_scalar_outputs is false (pytorch#163807).
         expert_map_const = torch.tensor(layer.expert_map_const, dtype=torch.int32)
 
-    tokens_mask = None
-    use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
-    if use_moe_tokens_mask:
-        tokens_mask = get_tokens_mask(num_tokens, device=router_logits.device)
-
     # optimum-rbln/src/optimum/rbln/transformers/models/qwen3_moe/
     # qwen3_moe_architecture.py
-    # Keep argument order aligned with rebel custom_op schema:
-    # (..., router_logits, scoring_func, topk, post_norm, ...)
     final_hidden_states = torch.ops.rbln_custom_ops.custom_moe_glu(
         hidden_states,
         gate_proj_weight,
         up_proj_weight,
         down_proj_weight,
-        router_logits,
-        scoring_func,
-        layer.top_k,
-        layer.renormalize,
+        masked_routing_weights_t,
         expert_map_const,
         None,
         None,
         None,
-        tokens_mask,
-        n_group,
-        topk_group,
+        None,
     )
     return final_hidden_states.reshape(orig_shape)
+
+
+def compute_masked_routing_weights(
+    self: FusedMoE, router_logits: torch.Tensor, num_tokens: int
+) -> torch.Tensor:
+    """Compute [E, T] masked routing weights in PyTorch.
+
+    topk + scoring (softmax/sigmoid) and optional grouped-topk are applied
+    here so the downstream custom op only applies the pre-computed weights.
+
+    Returns:
+        torch.Tensor: [num_experts, num_tokens] with non-selected entries zeroed.
+    """
+    router_logits_2d = router_logits.reshape(num_tokens, -1)  # [T, E]
+    scoring_func = getattr(self, "scoring_func", "softmax")
+    e_score_correction_bias = getattr(self, "e_score_correction_bias", None)
+    use_grouped_topk = getattr(self, "use_grouped_topk", False)
+
+    if scoring_func == "sigmoid":
+        if use_grouped_topk:
+            masked_routing_weights = _apply_grouped_topk_torch(
+                router_logits_2d,
+                self.top_k,
+                self.num_expert_group,
+                self.topk_group,
+                scoring_func=scoring_func,
+                renormalize=self.renormalize,
+                e_score_correction_bias=e_score_correction_bias,
+            )  # [E, T]
+        else:
+            router_logits_t = router_logits_2d.transpose(0, 1)  # [E, T]
+            # DeepSeek-V3 style: sigmoid scoring with optional correction bias
+            scores_t = torch.sigmoid(router_logits_t)  # [E, T]
+            scores_for_topk = scores_t
+            if e_score_correction_bias is not None:
+                scores_for_topk = scores_t + e_score_correction_bias.unsqueeze(1)
+            _, selected_experts = torch.topk(scores_for_topk, k=self.top_k, dim=0)
+            topk_weights = scores_t.gather(0, selected_experts)
+            topk_weights = topk_weights / topk_weights.sum(
+                dim=0, keepdim=True
+            ).clamp_min(1e-20)
+            masked_routing_weights = torch.zeros_like(router_logits_t)
+            masked_routing_weights.scatter_(0, selected_experts, topk_weights)
+    elif self.renormalize:
+        if use_grouped_topk:
+            masked_routing_weights = _apply_grouped_topk_torch(
+                router_logits_2d,
+                self.top_k,
+                self.num_expert_group,
+                self.topk_group,
+                scoring_func=scoring_func,
+                renormalize=self.renormalize,
+                e_score_correction_bias=e_score_correction_bias,
+            )  # [E, T]
+        else:
+            router_logits_t = router_logits_2d.transpose(0, 1)  # [E, T]
+            # post_norm: topk first, then softmax on selected values
+            topk_weights, selected_experts = torch.topk(
+                router_logits_t, k=self.top_k, dim=0
+            )
+            topk_weights = F.softmax(topk_weights, dim=0)
+            masked_routing_weights = torch.zeros_like(router_logits_t)
+            masked_routing_weights.scatter_(0, selected_experts, topk_weights)
+    else:
+        if use_grouped_topk:
+            masked_routing_weights = _apply_grouped_topk_torch(
+                router_logits_2d,
+                self.top_k,
+                self.num_expert_group,
+                self.topk_group,
+                scoring_func=scoring_func,
+                renormalize=self.renormalize,
+                e_score_correction_bias=e_score_correction_bias,
+            )  # [E, T]
+        else:
+            router_logits_t = router_logits_2d.transpose(0, 1)  # [E, T]
+            # pre_norm: softmax first, then topk
+            routing_weights = F.softmax(router_logits_t, dim=0)
+            topk_weights, selected_experts = torch.topk(
+                routing_weights, k=self.top_k, dim=0
+            )
+            masked_routing_weights = torch.zeros_like(router_logits_t)
+            masked_routing_weights.scatter_(0, selected_experts, topk_weights)
+
+    return masked_routing_weights  # [E, T]
+
+
+def build_masked_routing_weights(
+    layer: FusedMoE, router_logits: torch.Tensor, hidden_states: torch.Tensor
+) -> torch.Tensor:
+    """Build [E, T(+pad)] masked routing weights for the routing-free custom ops.
+
+    Computes topk + scoring (+ optional grouped-topk), applies the per-rank
+    token mask with 64-align padding, and casts to ``hidden_states.dtype`` so
+    the downstream custom ops (which assert matching dtypes) only need to apply
+    the weights. Shared by the unquantized custom/optimize, fp8 and
+    compressed-tensors MoE apply paths.
+    """
+    num_tokens = hidden_states.shape[:-1].numel()
+    masked_routing_weights = compute_masked_routing_weights(
+        layer, router_logits, num_tokens
+    )  # [E, T]
+
+    if envs.VLLM_RBLN_USE_MOE_TOKENS_MASK:
+        tokens_mask = get_tokens_mask(num_tokens).transpose(1, 0)  # [1, T]
+        tokens_mask = tokens_mask.to(masked_routing_weights.dtype)
+
+        # token dim 64-align padding (compiler requires >= 64 along token dim)
+        token_dim = masked_routing_weights.shape[1]
+        if token_dim <= 8:
+            pad_size = 64 - (token_dim % 64)
+            tokens_mask = F.pad(tokens_mask, (0, pad_size), value=0.0)
+            masked_routing_weights = F.pad(
+                masked_routing_weights, (0, pad_size), value=0.0
+            )
+
+        # [E, T(+pad)] * [1, T(+pad)] (broadcast)
+        masked_routing_weights = masked_routing_weights * tokens_mask
+
+    # custom MoE ops assert routing weights share hidden_states dtype
+    return masked_routing_weights.to(hidden_states.dtype)
 
 
 def fused_moe_forward_rbln(
@@ -465,7 +670,11 @@ def fused_moe_forward_rbln(
         hidden_states = self.naive_multicast(hidden_states)
     router_logits = router(hidden_states)
 
-    # Matrix multiply.
+    # NOTE: routing (topk + scoring + optional grouped-topk) is computed in
+    # PyTorch inside each quant method's apply via build_masked_routing_weights
+    # for the routing-free custom ops (unquantized custom/optimize, fp8,
+    # compressed-tensors). Methods that still route inside the compiler op
+    # (e.g. mxfp4) receive the raw router_logits unchanged.
     final_hidden_states = self.quant_method.apply(
         layer=self,
         x=hidden_states,
