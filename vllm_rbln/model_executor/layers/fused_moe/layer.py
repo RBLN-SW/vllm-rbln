@@ -162,7 +162,9 @@ def _apply_grouped_topk_torch(
     G = num_expert_group
     epg = E // G  # experts per group
 
-    # Step 1: Reshape to groups [T, G, E/G]
+    # Step 1: Apply scoring function & reshape to groups [T, G, E/G]
+    if scoring_func == "sigmoid":
+        router_logits_2d = torch.sigmoid(router_logits_2d)
     grouped = router_logits_2d.reshape(T, G, epg)
 
     # Step 2: Score each group by sum of top-2 expert values
