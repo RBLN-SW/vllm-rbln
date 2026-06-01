@@ -500,11 +500,147 @@ class RBLNWorker(WorkerBase):
 
                 raise
 
+        # After compile/warm-up: if dynamic KV is enabled, query the rbln
+        # executor's actual per-block bytes and reallocate KV cache with
+        # the maximized num_blocks (replaces the manual estimate that was
+        # used at initialize_from_config time). No-op when the env var is
+        # off or the model was not compiled with a mark_dynamic'd KV.
+        self._maybe_recompute_kv_blocks_from_compiled_profile()
+
         # After warm-up: apply CPU affinity only (threads already set pre-compile).
         self._ensure_rbln_cpu_affinity_after_warmup()
         self.model_runner._enable_performance_tracker()
 
         return time.perf_counter() - st
+
+    def _maybe_recompute_kv_blocks_from_compiled_profile(self) -> None:
+        """If VLLM_RBLN_USE_DYNAMIC_KV_CACHE is enabled, query each
+        compiled artifact's `kv_cache_memory_profile()` for the exact
+        per-block bytes (incl. real chiplet sharding / 2 MiB alignment)
+        and reallocate the KV cache with a maximized num_blocks.
+
+        Must be called AFTER `warm_up_model()` so the rbln executor
+        exists in `model_runner.runtime_holder`.
+        """
+        if not envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
+            return
+
+        runtime_holder = getattr(self.model_runner, "runtime_holder", None)
+        if not runtime_holder:
+            logger.warning(
+                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE is set but "
+                "runtime_holder is empty — skipping KV reallocation."
+            )
+            return
+
+        # All compiled artifacts share the same dynamic-KV layout (same
+        # mark_dynamic hint / same dynamic_shape_info JSON). Use the max
+        # per-block bytes across artifacts/chiplets as a safe upper bound.
+        # TODO(joonsoo): Verify whether this code works on multi-chiplet environment.
+        per_block_bytes = 0
+        for runtime in runtime_holder:
+            executor = getattr(runtime, "_executor", None)
+            if executor is None:
+                continue
+            try:
+                profile = executor.kv_cache_memory_profile()
+            except Exception as e:  # pylint: disable=broad-exception-caught
+                logger.warning(
+                    "kv_cache_memory_profile() failed (%s); skipping "
+                    "dynamic KV reallocation.",
+                    e,
+                )
+                return
+            for _chiplet_id, delta in profile.addition.device_memory_usage.items():
+                per_block_bytes = max(per_block_bytes, delta)
+            logger.warning(
+                "[Dynamic KV] compiled profile: base=%s addition=%s",
+                profile.base,
+                profile.addition,
+            )
+
+        if per_block_bytes <= 0:
+            logger.warning(
+                "[Dynamic KV] no dynamic KV slot in compiled artifacts; "
+                "skipping reallocation."
+            )
+            return
+
+        kv_cache_config = self.model_runner.kv_cache_config
+        old_num_blocks = kv_cache_config.num_blocks
+        if old_num_blocks <= 0:
+            logger.warning(
+                "Existing num_blocks <= 0; skipping reallocation."
+            )
+            return
+
+        # The total KV memory budget that vllm originally allocated, derived
+        # from sum(kv_cache_tensors[i].size). Recompute num_blocks using the
+        # compiled per-block bytes as ground truth.
+        total_kv_bytes = sum(t.size for t in kv_cache_config.kv_cache_tensors)
+        if total_kv_bytes <= 0:
+            logger.warning(
+                "Total KV bytes <= 0; skipping reallocation."
+            )
+            return
+
+        new_num_blocks = int(total_kv_bytes // per_block_bytes)
+
+        logger.warning(
+            "[Dynamic KV] per_block_bytes(compiled)=%d, "
+            "total_kv_budget_bytes=%d, old_num_blocks=%d, "
+            "computed_num_bufs=%d",
+            per_block_bytes,
+            total_kv_bytes,
+            old_num_blocks,
+            new_num_blocks,
+        )
+
+        if new_num_blocks <= 0:
+            logger.warning(
+                "[Dynamic KV] computed_num_bufs=%d <= 0; "
+                "skipping reallocation.",
+                new_num_blocks,
+            )
+            return
+        if new_num_blocks == old_num_blocks:
+            logger.warning(
+                "[Dynamic KV] computed_num_bufs=%d == old_num_blocks; "
+                "no reallocation needed.",
+                new_num_blocks,
+            )
+            return
+
+        self._reallocate_kv_cache(new_num_blocks)
+
+    def _reallocate_kv_cache(self, new_num_blocks: int) -> None:
+        """Re-initialize the model_runner's KV cache with `new_num_blocks`.
+
+        Existing KV tensors are replaced; `mark_dynamic` is re-applied by
+        `RBLNModelRunner.initialize_kv_cache_tensors`. No torch.compile
+        recompile occurs because the affected dim is mark_dynamic'd, and
+        the rbln runtime's `apply_adaptive_size_buffers` picks up the new
+        shape on the next forward call.
+        """
+        old_cfg = self.model_runner.kv_cache_config
+        old_num_blocks = old_cfg.num_blocks
+
+        new_cfg = copy.deepcopy(old_cfg)
+        new_cfg.num_blocks = new_num_blocks
+        # Each kv_cache_tensor's size is num_blocks * group.page_size_bytes.
+        # Scale proportionally so all derived fields stay consistent.
+        for kv_tensor in new_cfg.kv_cache_tensors:
+            kv_tensor.size = (kv_tensor.size * new_num_blocks) // old_num_blocks
+
+        self.cache_config.num_gpu_blocks = new_num_blocks
+        self.cache_config.num_cpu_blocks = new_num_blocks
+
+        logger.warning(
+            "[Dynamic KV] reallocating KV cache: %d → %d blocks",
+            old_num_blocks,
+            new_num_blocks,
+        )
+        self.model_runner.initialize_kv_cache(new_cfg)
 
     def get_model(self) -> nn.Module:
         return self.model_runner.get_model()

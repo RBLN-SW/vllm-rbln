@@ -4359,6 +4359,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         .view(kv_cache_shape)
                     )
                     kv_caches[layer_name] = typed_base.permute(*inv_order)
+                    torch._dynamo.mark_dynamic(kv_caches[layer_name], 1)
                     kv_cache_base_tensors[layer_name] = typed_base
                     kv_cache_view_infos[layer_name] = KVCacheViewInfo(
                         view_shape=kv_cache_shape,

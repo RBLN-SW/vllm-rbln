@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_MOE_REDUCE_SCATTER: bool = False
     VLLM_RBLN_SUB_BLOCK_CACHE: bool = True
     VLLM_RBLN_USE_DEVICE_TENSOR: bool = False
+    VLLM_RBLN_USE_DYNAMIC_KV_CACHE: bool = False
 
 
 def get_dp_impl() -> str:
@@ -278,6 +279,18 @@ environment_variables = {
     "VLLM_RBLN_USE_DEVICE_TENSOR": (
         lambda: (
             os.environ.get("VLLM_RBLN_USE_DEVICE_TENSOR", "False").lower()
+            in ("true", "1")
+        )
+    ),
+    # After torch.compile produces the rbln executor, query its
+    # kv_cache_memory_profile() to get the EXACT per-block bytes
+    # (incl. real chiplet sharding / alignment) instead of vllm's
+    # manual estimate, and reallocate KV cache with the maximized
+    # num_blocks. Requires the model to be compiled with mark_dynamic
+    # on the kv_cache num_blocks dim. Opt-in until proven stable.
+    "VLLM_RBLN_USE_DYNAMIC_KV_CACHE": (
+        lambda: (
+            os.environ.get("VLLM_RBLN_USE_DYNAMIC_KV_CACHE", "False").lower()
             in ("true", "1")
         )
     ),

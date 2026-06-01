@@ -25,6 +25,7 @@ def parse_args():
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--block-size", type=int, default=1024)
     parser.add_argument("--enable-expert-parallel", action="store_true")
+    parser.add_argument("--num-gpu-blocks-override", type=int, default=None)
     return parser.parse_args()
 
 
@@ -50,6 +51,7 @@ def main():
         max_num_batched_tokens=128,
         gpu_memory_utilization=0.9,
         enable_expert_parallel=args.enable_expert_parallel,
+        num_gpu_blocks_override=args.num_gpu_blocks_override,
     )
 
     # Generate texts from the prompts. The output is a list of RequestOutput
