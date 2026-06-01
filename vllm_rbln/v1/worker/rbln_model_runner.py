@@ -143,6 +143,7 @@ from vllm_rbln.v1.sample import RBLNSampler
 from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
+from vllm_rbln.v1.worker import mega_cache
 from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
 from vllm_rbln.v1.worker.metrics import PerformanceTracker, collect_metrics
 from vllm_rbln.v1.worker.utils import get_kv_cache_names
@@ -1488,9 +1489,10 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         if not envs.VLLM_DISABLE_COMPILE_CACHE:
             logger.info(
                 "Once the model is compiled for the first time, "
-                "the cached compiled binary will be reused."
+                "the cached compiled binary will be reused via Mega-Cache."
             )
             options["cache_dir"] = os.path.join(envs.VLLM_CACHE_ROOT, "rbln")
+            options["mega_cache_only"] = True
 
         # compile compute_logits
         # FIXME(jiwoo.park): method assignment for torch.compile
@@ -1969,11 +1971,13 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
     @torch.inference_mode()
     def warm_up_model(self) -> None:
+        mega_cache.load(self.model_config.model)
         set_warmup_active(True)
         try:
             self._warm_up_model_inner()
         finally:
             set_warmup_active(False)
+        mega_cache.save(self.model_config.model)
 
     def _warm_up_model_inner(self) -> None:
         num_kv_cache_groups = len(self.kv_cache_config.kv_cache_groups)
