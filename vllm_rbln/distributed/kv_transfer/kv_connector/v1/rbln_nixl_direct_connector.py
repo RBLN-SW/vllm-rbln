@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""SR-122 Design-2 connector — direct vmem-backed NIXL registration.
+"""
 
 This is a sibling of `RblnNixlConnector` that **does not** create a CPU
 host-staging buffer and **does not** drive D2H/H2D bounce copies on
@@ -24,30 +24,6 @@ it, so existing deployments keep working and only consumers that opt
 into the direct path see the new behavior. Switch via
 `kv_transfer_config.kv_connector="RblnNixlDirectConnector"`.
 
-Requirements layered on top of `RblnNixlConnector`:
-
-* `nixl-rbln` (this adapter) installed in the same venv. If the
-  package is missing the connector still imports — the worker
-  initializer is the late binding point that errors with a clear
-  message, so a misconfigured environment shows up at startup, not
-  inside the first transfer.
-* NIC capable of `ibv_reg_dmabuf_mr` (Mellanox CX-5+ on the firmware
-  levels we've seen; Intel `irdma` and Broadcom Thor decline with
-  EOPNOTSUPP). See `nixl-rbln/docs/dmabuf-fd-handoff.md` for the
-  design point that would remove this requirement.
-* KV cache tensors must already be `PHYSICAL_VIEW_IS_LATEST` or
-  `SYNCED` by the time the connector tries to register them. The
-  default vllm-rbln allocation path allocates KV cache via
-  `rebel::torch::rbln_v_malloc_eager`, which is exactly that state,
-  so this is satisfied for the standard P/D-disaggregation flow.
-
-What this connector deliberately does NOT do, compared to
-`RblnNixlConnector`:
-
-* No `host_xfer_buffers` allocation — no
-  `rebel.kv_cache.aligned_tensor` per layer.
-* No `copy_blocks` callback wiring — there's nothing to copy because
-  NIXL talks to the NPU buffer directly.
 """
 
 from typing import TYPE_CHECKING
@@ -122,6 +98,14 @@ class RblnNixlDirectConnector(RblnNixlConnector):
         if self.connector_worker is not None:
             self.connector_worker.finalize_kv_cache_registration()
 
+    def set_runtime_holder(self, runtime_holder) -> None:
+        """Receive the model runner's runtime_holder (propagated by
+        RBLNModelRunner._propagate_runtime_holder). The worker reads the
+        RblnContext pointer straight from the live runtime, avoiding a
+        device-keyed global Context lookup. No-op on the scheduler side."""
+        if self.connector_worker is not None:
+            self.connector_worker._runtime_holder = runtime_holder
+
 
 class RblnNixlDirectConnectorWorker(RblnNixlConnectorWorker):
     """Worker that registers KV caches via the `nixl_rbln` adapter
@@ -143,8 +127,6 @@ class RblnNixlDirectConnectorWorker(RblnNixlConnectorWorker):
             raise RuntimeError(
                 "RblnNixlDirectConnector requires the 'nixl-rbln' "
                 "adapter package to be installed in the same venv. "
-                "Install with: uv pip install -e "
-                "~/codebase/nixl-rbln  "
                 f"(import failed: {e})"
             ) from e
 
@@ -152,6 +134,7 @@ class RblnNixlDirectConnectorWorker(RblnNixlConnectorWorker):
         # reports "DRAM" (host-bounce default) so we override here.
         self.nixl_memory_type = "VRAM"
         self.nixl_backends = ["RBLN"]
+        self._runtime_holder = None
 
     # ---- host-bounce removal ------------------------------------------
 
@@ -172,69 +155,14 @@ class RblnNixlDirectConnectorWorker(RblnNixlConnectorWorker):
         """No copy ops to wire — see `initialize_host_xfer_buffer`."""
         return
 
-    # ---- device-id resolution -----------------------------------------
-
-    def _resolve_ctx_device_id(self, kv_caches: dict[str, torch.Tensor]) -> int:
-        """The NPU device id whose global RblnContext owns the KV cache.
-
-        In device-tensor mode (which this connector requires) the KV cache is
-        a real ``rbln`` tensor, so its in-process device index —
-        ``tensor.get_device()`` — is exactly the id the global RblnContext is
-        keyed on. The rebel runtime remaps this worker's masked RBLN_DEVICES
-        entry to a local 0-based index; ``$RBLN_DEVICES`` keeps the *physical*
-        id (e.g. "1"), which is NOT the in-process context id, so we read it
-        off the tensor rather than the env var. Validate a live context exists
-        there before handing the id to the RBLN NIXL backend.
-        """
-        import os
-
-        import rebel
-
-        t0 = next(iter(kv_caches.values()))
-        device_id = t0.get_device()
-        assert device_id >= 0, (
-            "RblnNixlDirectConnector: KV cache tensor reports no device "
-            f"(get_device()={device_id}, device={t0.device}); expected an "
-            "'rbln' device tensor (is VLLM_RBLN_USE_DEVICE_TENSOR=1 set?)."
-        )
-
-        try:
-            ctx = rebel._C.Context.from_key(
-                rebel._C.Context.global_key_at_device(device_id))
-        except Exception:  # noqa: BLE001
-            ctx = None
-        assert ctx is not None, (
-            "RblnNixlDirectConnector: no live RblnContext at device id "
-            f"{device_id} (t.device={t0.device}); cannot create the RBLN NIXL "
-            "backend."
-        )
-
-        logger.info(
-            "RblnNixlDirectConnector: ctx device_id=%d (t.device=%s, "
-            "RBLN_DEVICES=%r)",
-            device_id, t0.device, os.environ.get("RBLN_DEVICES", ""),
-        )
-        return device_id
-
     # ---- deferred registration (post-warmup) --------------------------
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
-        """Defer the real registration until after model warm-up.
+        """Stash the caches; register in finalize_kv_cache_registration().
 
-        register_kv_caches is called from initialize_kv_cache, *before*
-        the warm-up forward. At that point the KV cache vmem entries are
-        still EMPTY (torch.empty(device="rbln") allocates lazily) — they
-        have no physical view, so the vaddr->dva translation would fail
-        in ensure_synced_on_device. The physical view is only allocated
-        when the compiled model runs (warm-up), which RBLNWorker drives
-        in compile_or_warm_up_model *after* this call.
-
-        So we stash the caches here and do the actual NIXL registration
-        in finalize_kv_cache_registration(), which RBLNWorker invokes
-        once warm-up has materialized the physical views. The KV cache
-        vmem entries (hence vaddr/dva) are stable for the worker's
-        lifetime, so registering post-warm-up still describes the memory
-        the model reads/writes on every subsequent forward.
+        Called before warm-up, when the KV vmem entries are still EMPTY (no
+        physical view) so vaddr->dva would fail. RBLNWorker calls finalize
+        after warm-up has materialized the (lifetime-stable) physical views.
         """
         self._pending_kv_caches = kv_caches
         logger.info(
@@ -300,16 +228,12 @@ class RblnNixlDirectConnectorWorker(RblnNixlConnectorWorker):
             self.vllm_config, self.backend_name, self.kv_topo.cross_layers_blocks
         )
 
-        # --- delta: create the RBLN backend on the RblnContext that owns
-        # the KV cache vmem before registering.
-        #
-        # device_id resolution: under device_type="cpu" the vmem-backed
-        # KV cache tensors report get_device()==-1, so we can't rely on
-        # it. The global RblnContext was created by the model compile on
-        # the worker's physical NPU (RBLN_DEVICES, not remapped to 0).
-        # Pick the candidate device id whose global RblnContext actually
-        # resolves.
-        device_id = self._resolve_ctx_device_id(kv_caches)
+        # Device id for the RBLN backend's RblnContext.
+        device_id = next(iter(kv_caches.values())).get_device()
+        assert device_id >= 0, (
+            "RblnNixlDirectConnector: KV cache is not an 'rbln' device tensor "
+            "(is VLLM_RBLN_USE_DEVICE_TENSOR=1 set?)."
+        )
 
         # Direct path never stages through a host buffer.
         assert not self.use_host_buffer
@@ -401,13 +325,23 @@ class RblnNixlDirectConnectorWorker(RblnNixlConnectorWorker):
                     )
                 regions.append((cache_or_caches, region_offset, full_block_len))
 
+        # RblnContext pointer straight from the live model runtime (propagated
+        # via set_runtime_holder). No device-keyed global-Context fallback:
+        # the runtime holder must be set by the time we register.
+        assert self._runtime_holder, (
+            "RblnNixlDirectConnector: runtime_holder not set — RBLNModelRunner "
+            "must propagate it via set_runtime_holder before registration."
+        )
+        rbln_ctx_ptr = self._runtime_holder[0]._runtime_handle.get_context().rbln_ctx_ptr
+
         # Delegate vmem-vaddr -> NPU-dva, chiplet sharding and MR registration
         # to nixl-rbln. It registers one whole-entry MR per chiplet shard and
         # returns the physical transfer tables (base addrs + block lens),
         # already chiplet-expanded so the base connector's descriptor math is
         # correct without this connector knowing the chiplet count.
         xfer = nixl_rbln.register_kv_regions(
-            self.nixl_wrapper, regions, device_id, mem=self.nixl_memory_type
+            self.nixl_wrapper, regions, device_id, mem=self.nixl_memory_type,
+            rbln_ctx_ptr=rbln_ctx_ptr,
         )
         self.device_id = device_id
         self.block_len_per_layer = list(xfer.block_lens)
