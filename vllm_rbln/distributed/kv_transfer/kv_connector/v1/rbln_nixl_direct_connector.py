@@ -13,11 +13,11 @@
 # limitations under the License.
 """Direct (D2D) RBLN NIXL connector — sibling of RblnNixlConnector with no CPU
 host-staging/bounce: registers KV cache tensors straight with NIXL's RBLN
-backend (NPU dmabuf MR) via the nixl_rbln adapter. Opt in with
+backend (device-memory MR) via the nixl_rbln adapter. Opt in with
 kv_transfer_config.kv_connector="RblnNixlDirectConnector".
 """
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.config import VllmConfig
@@ -81,7 +81,7 @@ class RblnNixlDirectConnector(RblnNixlConnector):
     def finalize_kv_cache_registration(self) -> None:
         """Run the worker's deferred NIXL registration. Invoked by
         RBLNWorker.compile_or_warm_up_model after warm-up has allocated
-        the KV cache physical views (see
+        the KV cache backing memory (see
         RblnNixlDirectConnectorWorker.register_kv_caches for why this is
         deferred). No-op on the scheduler side."""
         if self.connector_worker is not None:
@@ -119,7 +119,7 @@ class RblnNixlDirectConnectorWorker(RblnNixlConnectorWorker):
                 f"(import failed: {e})"
             ) from e
 
-        # Direct path registers NPU memory, not host DRAM. The platform
+        # Direct path registers device memory, not host DRAM. The platform
         # reports "DRAM" (host-bounce default) so we override here.
         self.nixl_memory_type = "VRAM"
         self.nixl_backends = ["RBLN"]
@@ -131,12 +131,12 @@ class RblnNixlDirectConnectorWorker(RblnNixlConnectorWorker):
         self, kv_caches: dict[str, torch.Tensor],
     ) -> None:
         """Direct path: there is no host xfer buffer. NIXL talks to
-        NPU memory through the dmabuf MR the RBLN plugin built; no
+        device memory through the MR the RBLN plugin built; no
         staging needed."""
         if self.use_host_buffer:
             logger.info(
                 "RblnNixlDirectConnector: ignoring kv_buffer_device='cpu' "
-                "— direct-vmem path registers NPU memory with NIXL "
+                "— direct path registers device memory with NIXL "
                 "directly, no host staging buffer needed.",
             )
 
@@ -149,14 +149,14 @@ class RblnNixlDirectConnectorWorker(RblnNixlConnectorWorker):
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         """Stash the caches; register in finalize_kv_cache_registration().
 
-        Called before warm-up, when the KV vmem entries are still EMPTY (no
-        physical view) so vaddr->dva would fail. RBLNWorker calls finalize
-        after warm-up has materialized the (lifetime-stable) physical views.
+        Called before warm-up, when the KV cache entries are still EMPTY (no
+        backing memory) so registration would fail. RBLNWorker calls finalize
+        after warm-up has materialized the (lifetime-stable) backing memory.
         """
         self._pending_kv_caches = kv_caches
         logger.info(
             "RblnNixlDirectConnector: deferring registration of %d KV "
-            "cache layer(s) until after warm-up (physical views are not "
+            "cache layer(s) until after warm-up (backing memory is not "
             "allocated yet).",
             len(kv_caches),
         )
@@ -165,7 +165,7 @@ class RblnNixlDirectConnectorWorker(RblnNixlConnectorWorker):
         """Run the deferred NIXL registration. Idempotent; a no-op if
         registration already ran or there is nothing pending. Called by
         RBLNWorker after warm_up_model() has allocated the KV cache
-        physical views."""
+        backing memory."""
         pending = getattr(self, "_pending_kv_caches", None)
         if pending is None:
             return
@@ -175,10 +175,10 @@ class RblnNixlDirectConnectorWorker(RblnNixlConnectorWorker):
     # ---- the actual direct register path ------------------------------
 
     def _register_kv_caches_impl(self, kv_caches: dict[str, torch.Tensor]) -> None:
-        """Direct-vmem variant of NixlConnectorWorker.register_kv_caches:
+        """Direct variant of NixlConnectorWorker.register_kv_caches:
         build the upstream topology, hand the logical K/V regions to
-        nixl_rbln.register_kv_regions (vaddr->dva, chiplet sharding, MR reg),
-        and feed the returned physical tables into the base transfer state.
+        nixl_rbln.register_kv_regions (address translation, sharding, MR reg),
+        and feed the returned transfer tables into the base transfer state.
         """
         import nixl_rbln
 
@@ -215,7 +215,7 @@ class RblnNixlDirectConnectorWorker(RblnNixlConnectorWorker):
         )
 
         logger.info(
-            "Registering KV_Caches (direct vmem). use_mla: %s, "
+            "Registering KV_Caches (direct). use_mla: %s, "
             "kv_buffer_device: %s, device_id: %d",
             self.use_mla,
             self.kv_buffer_device,
@@ -224,9 +224,7 @@ class RblnNixlDirectConnectorWorker(RblnNixlConnectorWorker):
 
         tensor_size_bytes = None
         # Logical K/V regions (entry_tensor, byte_offset, full_block_len) for
-        # nixl-rbln, which does vaddr->dva, chiplet sharding and MR registration
-        # and returns the physical tables — so this connector never sees dvas or
-        # the chiplet count, only torch tensors and logical byte offsets.
+        # nixl-rbln
         regions: list[tuple[Any, int, int]] = []
         for layer_name, cache_or_caches in xfer_buffers.items():
             layer_spec = self._layer_specs[layer_name]
@@ -256,19 +254,13 @@ class RblnNixlDirectConnectorWorker(RblnNixlConnectorWorker):
             if tensor_size_bytes is None:
                 tensor_size_bytes = curr_tensor_size_bytes
 
-            # Materialize the vmem physical view: device-tensor KV caches are
-            # torch.empty(device="rbln") (EMPTY, no physical view) until first
-            # written, but vaddr->dva needs it. A one-time zero_() allocates it
-            # (harmless); the vmem entry is stable for the worker's lifetime.
+            # Materialize the backing memory of kv_cache
             cache_or_caches.zero_()
 
-            # Collect this entry's logical K/V regions. K and V are views into
-            # one vmem entry (V at entry_base + K_size); pass the entry tensor
-            # plus the view's byte offset so nixl-rbln converts the entry base
-            # (and its chiplet shards) once.
-            entry_base_vaddr = cache_or_caches.data_ptr()
+            # Collect this entry's logical K/V regions.
+            entry_base_addr = cache_or_caches.data_ptr()
             for cache in cache_list:
-                region_offset = cache.data_ptr() - entry_base_vaddr
+                region_offset = cache.data_ptr() - entry_base_addr
                 if isinstance(layer_spec, nixl_connector.MambaSpec):
                     full_block_len = (
                         physical_page_size
@@ -286,20 +278,17 @@ class RblnNixlDirectConnectorWorker(RblnNixlConnectorWorker):
                     )
                 regions.append((cache_or_caches, region_offset, full_block_len))
 
-        # RblnContext pointer straight from the live model runtime (propagated
-        # via set_runtime_holder). No device-keyed global-Context fallback:
-        # the runtime holder must be set by the time we register.
         assert self._runtime_holder, (
             "RblnNixlDirectConnector: runtime_holder not set — RBLNModelRunner "
             "must propagate it via set_runtime_holder before registration."
         )
         rbln_ctx_ptr = self._runtime_holder[0]._runtime_handle.get_context().rbln_ctx_ptr
 
-        # Delegate vmem-vaddr -> NPU-dva, chiplet sharding and MR registration
-        # to nixl-rbln. It registers one whole-entry MR per chiplet shard and
-        # returns the physical transfer tables (base addrs + block lens),
-        # already chiplet-expanded so the base connector's descriptor math is
-        # correct without this connector knowing the chiplet count.
+        # Delegate sharding and MR registration to nixl-rbln. It registers
+        # one whole-entry MR per shard and returns the transfer tables
+        # (base addrs + block lens), already shard-expanded so the base
+        # connector's descriptor math is correct without this connector
+        # knowing the shard count.
         xfer = nixl_rbln.register_kv_regions(
             self.nixl_wrapper, regions, device_id, mem=self.nixl_memory_type,
             rbln_ctx_ptr=rbln_ctx_ptr,
@@ -317,7 +306,7 @@ class RblnNixlDirectConnectorWorker(RblnNixlConnectorWorker):
 
         logger.info(
             "RblnNixlDirectConnector: registered %d transfer region(s) "
-            "across %d chiplet shard(s) (K/V split).",
+            "across %d shard(s) (K/V split).",
             self.num_regions, xfer.n_shards,
         )
 
