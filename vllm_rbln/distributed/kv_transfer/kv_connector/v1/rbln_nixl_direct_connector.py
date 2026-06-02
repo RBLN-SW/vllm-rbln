@@ -11,19 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
-
-This is a sibling of `RblnNixlConnector` that **does not** create a CPU
-host-staging buffer and **does not** drive D2H/H2D bounce copies on
-every block transfer. Instead it asks the `nixl_rbln` adapter to
-register the KV cache tensors directly with NIXL's RBLN backend, so
-the NIC's dmabuf MR points straight at NPU memory.
-
-It is registered alongside `RblnNixlConnector` rather than replacing
-it, so existing deployments keep working and only consumers that opt
-into the direct path see the new behavior. Switch via
-`kv_transfer_config.kv_connector="RblnNixlDirectConnector"`.
-
+"""Direct (D2D) RBLN NIXL connector — sibling of RblnNixlConnector with no CPU
+host-staging/bounce: registers KV cache tensors straight with NIXL's RBLN
+backend (NPU dmabuf MR) via the nixl_rbln adapter. Opt in with
+kv_transfer_config.kv_connector="RblnNixlDirectConnector".
 """
 
 from typing import TYPE_CHECKING
@@ -186,28 +177,10 @@ class RblnNixlDirectConnectorWorker(RblnNixlConnectorWorker):
     # ---- the actual direct register path ------------------------------
 
     def _register_kv_caches_impl(self, kv_caches: dict[str, torch.Tensor]) -> None:
-        """Direct-vmem variant of NixlConnectorWorker.register_kv_caches.
-
-        This is a faithful copy of the upstream method body (pinned to
-        the installed vllm version), changed only where device-to-device
-        RBLN registration needs it:
-
-        * the RBLN NIXL backend is created with the right RblnContext
-          pointer (via ``nixl_rbln.ensure_rbln_backend``) before any
-          ``register_memory`` call;
-        * the single base-address derivation (``cache.data_ptr()``
-          upstream) is translated from a vmem vaddr to the NPU device
-          address (dva), with per-region byte-offset handling for the
-          K/V-split case.
-
-        Everything downstream — ``seen_base_addresses`` ->
-        ``kv_caches_base_addr``, ``caches_data`` -> ``register_memory``,
-        and the transfer-side descriptor math in ``_read_blocks`` /
-        ``register_local_xfer_handler`` — derives from that one point,
-        so converting it once keeps register + transfer dva-consistent.
-
-        ``nixl_memory_type`` ("VRAM") and ``nixl_backends`` (["RBLN"])
-        are set on the worker in ``__init__``.
+        """Direct-vmem variant of NixlConnectorWorker.register_kv_caches:
+        build the upstream topology, hand the logical K/V regions to
+        nixl_rbln.register_kv_regions (vaddr->dva, chiplet sharding, MR reg),
+        and feed the returned physical tables into the base transfer state.
         """
         import nixl_rbln
 
@@ -252,12 +225,10 @@ class RblnNixlDirectConnectorWorker(RblnNixlConnectorWorker):
         )
 
         tensor_size_bytes = None
-        # Logical K/V regions handed to nixl-rbln: each is (entry_tensor,
-        # byte_offset_within_entry, full_block_len). nixl-rbln does the
-        # vmem-vaddr -> NPU-dva translation, the chiplet sharding and the MR
-        # registration, and returns the physical transfer tables. This
-        # connector therefore never sees NPU dvas or the chiplet count — it
-        # only ever deals in torch tensors and logical byte offsets.
+        # Logical K/V regions (entry_tensor, byte_offset, full_block_len) for
+        # nixl-rbln, which does vaddr->dva, chiplet sharding and MR registration
+        # and returns the physical tables — so this connector never sees dvas or
+        # the chiplet count, only torch tensors and logical byte offsets.
         regions: list[tuple[Any, int, int]] = []
         for layer_name, cache_or_caches in xfer_buffers.items():
             layer_spec = self._layer_specs[layer_name]
@@ -287,18 +258,10 @@ class RblnNixlDirectConnectorWorker(RblnNixlConnectorWorker):
             if tensor_size_bytes is None:
                 tensor_size_bytes = curr_tensor_size_bytes
 
-            # --- delta: materialize the vmem physical view. Under
-            # VLLM_RBLN_USE_DEVICE_TENSOR the KV cache is created with
-            # torch.empty(device="rbln") (RBLNModelRunner.
-            # _allocate_kv_cache_tensors), which leaves the vmem entry in
-            # the EMPTY sub-state with no physical view until the first
-            # device write. NIXL has to register real NPU memory, and
-            # vaddr_to_dva -> ensure_synced_on_device requires the
-            # physical view to exist. A one-time in-place zero_() forces
-            # the entry to allocate it (EMPTY -> PHYSICAL_VIEW_IS_LATEST)
-            # and zero-inits the cache, which is harmless. The vmem entry
-            # (hence vaddr/dva) is stable for the worker's lifetime, so
-            # the model's later writes land in the same registered memory.
+            # Materialize the vmem physical view: device-tensor KV caches are
+            # torch.empty(device="rbln") (EMPTY, no physical view) until first
+            # written, but vaddr->dva needs it. A one-time zero_() allocates it
+            # (harmless); the vmem entry is stable for the worker's lifetime.
             cache_or_caches.zero_()
 
             # Collect this entry's logical K/V regions. K and V are views into
