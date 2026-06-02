@@ -378,7 +378,11 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     f"{self.speculative_config.method}"
                 )
             if self.use_rbln_sampler:
-                self.rejection_sampler = RBLNRejectionSampler(self.sampler)
+                self.rejection_sampler = RBLNRejectionSampler(
+                    self.sampler,
+                    seed=self.vllm_config.model_config.seed,
+                    compile_context=self.compile_context,
+                )
             else:
                 self.rejection_sampler = CPURejectionSampler(self.sampler)
 

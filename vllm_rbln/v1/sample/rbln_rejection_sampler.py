@@ -15,8 +15,17 @@
 # Copied from vllm.v1.sample.rejection_sampler: https://github.com/vllm-project/vllm/blob/v0.13.0/vllm/v1/sample/rejection_sampler.py
 # Search for NOTE(RBLN) or TODO(RBLN) for details
 
+import inspect
 from dataclasses import replace
 
+import rebel
+
+try:
+    import torch.rbln
+
+    has_torch_rbln = True
+except ImportError:
+    has_torch_rbln = False
 import torch
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -24,6 +33,7 @@ from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
+import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.sample.rbln_sampler import random_sample
 
@@ -137,8 +147,27 @@ def rbln_random_sample(
 # - apply_all_penalties
 class RBLNRejectionSampler(RejectionSampler):
     def __init__(self, *args, **kwargs):
+        seed = kwargs.pop("seed", None)
+        compile_context = kwargs.pop("compile_context", None)
         super().__init__(*args, **kwargs)
-        options = {"mode": "strict"}
+        rebel.manual_seed(seed)
+        options: dict = {}
+        use_dt = envs.VLLM_RBLN_USE_DEVICE_TENSOR
+        if compile_context is None:
+            if "use_global_ctx" in inspect.signature(rebel.CompileContext).parameters:
+                compile_context = rebel.CompileContext(use_global_ctx=True)
+            else:
+                compile_context = rebel.CompileContext()
+        if not use_dt:
+            options["compile_context"] = compile_context
+        if envs.VLLM_RBLN_COMPILE_STRICT_MODE:
+            options["mode"] = "strict"
+
+        if has_torch_rbln or use_dt:
+            options["tensor_parallel_size"] = 1
+            if not use_dt:
+                options["use_global_ctx"] = True
+                options["global_device_id"] = 0
         self.compiled_rejection_sample = torch.compile(
             rbln_random_sample,
             dynamic=False,
