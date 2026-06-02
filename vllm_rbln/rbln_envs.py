@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_MOE_REDUCE_SCATTER: bool = False
     VLLM_RBLN_SUB_BLOCK_CACHE: bool = True
     VLLM_RBLN_USE_DEVICE_TENSOR: bool = False
+    VLLM_RBLN_USE_W8A8_FP8: bool = False
 
 
 def get_dp_impl() -> str:
@@ -279,6 +280,13 @@ environment_variables = {
         lambda: (
             os.environ.get("VLLM_RBLN_USE_DEVICE_TENSOR", "False").lower()
             in ("true", "1")
+        )
+    ),
+    # Use W8A8 block fp8 (quantize activations to fp8) instead of W8A16
+    # (weight-only fp8 dequant). evt0 does not support w8a8; opt-in for evt1.
+    "VLLM_RBLN_USE_W8A8_FP8": (
+        lambda: (
+            os.environ.get("VLLM_RBLN_USE_W8A8_FP8", "False").lower() in ("true", "1")
         )
     ),
 }

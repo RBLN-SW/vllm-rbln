@@ -126,6 +126,101 @@ class RBLNW8A16BlockFp8LinearOp:
         return output
 
 
+class RBLNW8A8BlockFp8LinearOp:
+    """
+    This class executes a RBLN Blocked FP8 (W8A8) linear layer.
+
+    Unlike the W8A16 op, the activation is dynamically quantized to fp8
+    (per (1, block_k) group along K) before the matmul. The block scales
+    depend only on the block index, so dequantizing both operands and
+    running a single GEMM is numerically equivalent to a real block fp8
+    GEMM with fp32 accumulation per block.
+    """
+
+    FP8_DTYPE = torch.float8_e4m3fn
+
+    def __init__(
+        self,
+        weight_group_shape: GroupShape,
+        act_quant_group_shape: GroupShape,
+    ):
+        self.weight_group_shape = weight_group_shape
+        self.act_quant_group_shape = act_quant_group_shape
+        logger.info(
+            "RBLN W8A8 block fp8 weight group shape = %s", self.weight_group_shape
+        )
+        logger.info(
+            "RBLN W8A8 block fp8 act quant group shape = %s",
+            self.act_quant_group_shape,
+        )
+        assert self.act_quant_group_shape == GroupShape(1, 128)
+
+    def apply(
+        self,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        input_scale: torch.Tensor | None = None,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        # activation_scheme is dynamic for block quant, so input_scale is
+        # always None and recomputed per group here.
+        return self._w8a8_block_fp8_matmul(
+            input,
+            weight,
+            weight_scale,
+            list(self.weight_group_shape),
+            bias,
+        )
+
+    def _per_token_group_quant_fp8(
+        self,
+        x: torch.Tensor,
+        group_size: int,
+        eps: float = 1e-10,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        finfo = torch.finfo(self.FP8_DTYPE)
+        orig_shape = x.shape
+        x_g = x.reshape(-1, group_size).to(torch.float32)
+        amax = x_g.abs().amax(dim=-1, keepdim=True).clamp_min(eps)
+        scale = amax / finfo.max
+        x_q = (x_g / scale).clamp(finfo.min, finfo.max).to(self.FP8_DTYPE)
+        x_q = x_q.reshape(orig_shape)
+        scale = scale.reshape(*orig_shape[:-1], orig_shape[-1] // group_size)
+        return x_q, scale
+
+    def _w8a8_block_fp8_matmul(
+        self,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        block_size: list[int],
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        _input_dtype = input.dtype
+        out_features, in_features = weight.shape
+        bs0, bs1 = int(block_size[0]), int(block_size[1])
+        out_blocks = out_features // bs0
+        in_blocks = in_features // bs1
+
+        # 1) Activation: dynamic per-(1, block_k) fp8 quant along K.
+        x_q, x_scale = self._per_token_group_quant_fp8(input, bs1)
+        # 2) Activation dequant: expand each K-block scale over block_k cols.
+        x_deq = x_q.to(_input_dtype) * x_scale.repeat_interleave(bs1, dim=-1).to(
+            _input_dtype
+        )
+
+        # 3) Weight dequant (identical to the W8A16 path).
+        weight = weight.view(out_blocks, bs0, in_blocks, bs1).to(_input_dtype)
+        weight_scale = weight_scale.view(out_blocks, in_blocks).to(_input_dtype)
+        scaled_weight = (weight * weight_scale[:, None, :, None]).reshape(
+            out_features, in_features
+        )
+
+        # 4) GEMM.
+        return torch.nn.functional.linear(x_deq, scaled_weight, bias)
+
+
 class Fp8LinearMethod(LinearMethodBase):
     """Linear method for FP8.
     Supports loading FP8 checkpoints with static weight scale and
@@ -165,7 +260,12 @@ class Fp8LinearMethod(LinearMethodBase):
         if self.block_quant:
             assert not self.act_q_static
             assert self.weight_block_size is not None
-            self.w8a8_block_fp8_linear = RBLNW8A16BlockFp8LinearOp(
+            block_fp8_op_cls = (
+                RBLNW8A8BlockFp8LinearOp
+                if envs.VLLM_RBLN_USE_W8A8_FP8
+                else RBLNW8A16BlockFp8LinearOp
+            )
+            self.w8a8_block_fp8_linear = block_fp8_op_cls(
                 weight_group_shape=GroupShape(*self.weight_block_size),
                 act_quant_group_shape=self.act_q_group_shape,
             )
@@ -459,6 +559,22 @@ def custom_moe_swiglu_group_dequantize(
         return weight.to(hidden_states.dtype) * expanded.to(hidden_states.dtype)
 
     in_block_size = int(group_size.item())
+
+    def _maybe_quant_act(state: torch.Tensor) -> torch.Tensor:
+        # W8A8: dynamically quantize expert activations to fp8 per
+        # (1, in_block_size) group along the contraction dim, then dequant.
+        if not envs.VLLM_RBLN_USE_W8A8_FP8:
+            return state
+        fp8_dtype = torch.float8_e4m3fn
+        finfo = torch.finfo(fp8_dtype)
+        orig_shape = state.shape
+        s_g = state.reshape(-1, in_block_size).to(torch.float32)
+        amax = s_g.abs().amax(dim=-1, keepdim=True).clamp_min(1e-10)
+        scale = amax / finfo.max
+        q = (s_g / scale).clamp(finfo.min, finfo.max).to(fp8_dtype)
+        deq = (q.to(state.dtype) * scale.to(state.dtype)).reshape(orig_shape)
+        return deq
+
     gate_out_block = (
         gate_proj_weight.shape[1] + gate_proj_scale.shape[1] - 1
     ) // gate_proj_scale.shape[1]
@@ -526,7 +642,7 @@ def custom_moe_swiglu_group_dequantize(
         if token_idx.numel() == 0:
             continue
 
-        current_state = hidden_states[token_idx]
+        current_state = _maybe_quant_act(hidden_states[token_idx])
         gate = torch.nn.functional.linear(
             current_state,
             gate_proj_weight_dq[expert_idx],
@@ -537,7 +653,7 @@ def custom_moe_swiglu_group_dequantize(
             up_proj_weight_dq[expert_idx],
             up_proj_bias[expert_idx] if up_proj_bias is not None else None,
         )
-        swiglu = torch.nn.functional.silu(gate) * up
+        swiglu = _maybe_quant_act(torch.nn.functional.silu(gate) * up)
         down = torch.nn.functional.linear(
             swiglu,
             down_proj_weight_dq[expert_idx],
