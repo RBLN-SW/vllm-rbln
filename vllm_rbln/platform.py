@@ -449,20 +449,6 @@ class RblnPlatform(Platform):
 
     @classmethod
     def get_nixl_supported_devices(cls) -> dict[str, tuple[str, ...]]:
-        # NIXL looks up _NIXL_SUPPORTED_DEVICE[device_type] and then checks
-        # kv_buffer_device against the allowed tuple. device_type depends on
-        # the runtime mode:
-        #   * host-bounce / non-device-tensor mode -> device_type="cpu"
-        #     (RblnNixlConnector, kv_buffer_device="cpu").
-        #   * device-tensor mode (VLLM_RBLN_USE_DEVICE_TENSOR=1) ->
-        #     device_type="rbln". This is the mode the direct path
-        #     (RblnNixlDirectConnector, kv_buffer_device="rbln") needs,
-        #     because only then are KV caches real NPU vmem tensors
-        #     (see RBLNModelRunner._allocate_kv_cache_tensors) rather than
-        #     meta tensors.
-        # "rbln" is allowed as a kv_buffer under both keys so the direct
-        # connector works regardless of which device_type the platform
-        # reports; the connector's own assert enforces the correct pairing.
         return {
             "cpu": ("cpu", "rbln"),
             "rbln": ("rbln", "cpu"),
