@@ -43,6 +43,7 @@ def _attach_metrics_file_handler() -> None:
     try:
         logger.addHandler(make_file_handler(path))
     except OSError as e:
+        _metrics_file_attached = False
         logger.warning("Failed to open metrics file %s: %s", path, e)
 
 
