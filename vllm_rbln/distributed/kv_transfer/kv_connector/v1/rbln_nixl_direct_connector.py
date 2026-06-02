@@ -21,9 +21,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from vllm.config import VllmConfig
-from vllm.distributed.kv_transfer.kv_connector.v1 import (
-    nixl_connector as _up,
-)
+from vllm.distributed.kv_transfer.kv_connector.v1 import nixl_connector
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     CopyBlocksOp,
     KVConnectorBase_V1,
@@ -184,7 +182,7 @@ class RblnNixlDirectConnectorWorker(RblnNixlConnectorWorker):
         """
         import nixl_rbln
 
-        self.kv_topo = _up.TpKVTopology(
+        self.kv_topo = nixl_connector.TpKVTopology(
             tp_rank=self.tp_rank,
             engine_id=self.engine_id,
             remote_tp_size=self._tp_size,
@@ -197,7 +195,7 @@ class RblnNixlDirectConnectorWorker(RblnNixlConnectorWorker):
             else None,
             is_mamba=self._has_mamba,
         )
-        self.compat_hash = _up.compute_nixl_compatibility_hash(
+        self.compat_hash = nixl_connector.compute_nixl_compatibility_hash(
             self.vllm_config, self.backend_name, self.kv_topo.cross_layers_blocks
         )
 
@@ -232,14 +230,14 @@ class RblnNixlDirectConnectorWorker(RblnNixlConnectorWorker):
         regions: list[tuple[Any, int, int]] = []
         for layer_name, cache_or_caches in xfer_buffers.items():
             layer_spec = self._layer_specs[layer_name]
-            if isinstance(layer_spec, _up.UniformTypeKVCacheSpecs):
+            if isinstance(layer_spec, nixl_connector.UniformTypeKVCacheSpecs):
                 layer_spec = layer_spec.kv_cache_specs[layer_name]
             cache_list = self.kv_topo.get_transfer_cache_regions(
                 cache_or_caches, layer_spec
             )
             physical_page_size = (
                 layer_spec.page_size_bytes
-                if isinstance(layer_spec, _up.MambaSpec)
+                if isinstance(layer_spec, nixl_connector.MambaSpec)
                 else layer_spec.page_size_bytes
                 // self._physical_blocks_per_logical_kv_block
             )
@@ -251,7 +249,7 @@ class RblnNixlDirectConnectorWorker(RblnNixlConnectorWorker):
                 )
             num_blocks = (
                 self._logical_num_blocks
-                if isinstance(layer_spec, _up.MambaSpec)
+                if isinstance(layer_spec, nixl_connector.MambaSpec)
                 else self.num_blocks
             )
             curr_tensor_size_bytes = num_blocks * physical_page_size
@@ -271,7 +269,7 @@ class RblnNixlDirectConnectorWorker(RblnNixlConnectorWorker):
             entry_base_vaddr = cache_or_caches.data_ptr()
             for cache in cache_list:
                 region_offset = cache.data_ptr() - entry_base_vaddr
-                if isinstance(layer_spec, _up.MambaSpec):
+                if isinstance(layer_spec, nixl_connector.MambaSpec):
                     full_block_len = (
                         physical_page_size
                         // self._physical_blocks_per_logical_kv_block
@@ -332,7 +330,7 @@ class RblnNixlDirectConnectorWorker(RblnNixlConnectorWorker):
         )
 
         # After KV Caches registered, listen for new connections.
-        agent_metadata = _up.NixlAgentMetadata(
+        agent_metadata = nixl_connector.NixlAgentMetadata(
             engine_id=self.engine_id,
             agent_metadata=self.nixl_wrapper.get_agent_metadata(),
             device_id=self.device_id,
@@ -344,8 +342,8 @@ class RblnNixlDirectConnectorWorker(RblnNixlConnectorWorker):
             ssm_sizes=self._mamba_ssm_size,
         )
         assert self.compat_hash is not None
-        encoder = _up.msgspec.msgpack.Encoder()
-        self.xfer_handshake_metadata = _up.NixlHandshakePayload(
+        encoder = nixl_connector.msgspec.msgpack.Encoder()
+        self.xfer_handshake_metadata = nixl_connector.NixlHandshakePayload(
             compatibility_hash=self.compat_hash,
             agent_metadata_bytes=encoder.encode(agent_metadata),
         )
