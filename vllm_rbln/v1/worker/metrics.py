@@ -12,15 +12,39 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import TypeVar
 
-from vllm_rbln.logger import init_logger
+import vllm_rbln.rbln_envs as envs
+from vllm_rbln.logger import init_logger, make_file_handler
 
 logger = init_logger(__name__)
 
 T = TypeVar("T", int, float)
+
+_metrics_file_attached = False
+
+
+def _attach_metrics_file_handler() -> None:
+    """Mirror metrics output to VLLM_RBLN_METRICS_FILE if configured.
+
+    The configured path is suffixed with the worker pid so concurrent workers
+    (TP/DP) write to separate files instead of clobbering one another. Runs at
+    most once; a failure to open the file is logged and stdout output is kept.
+    """
+    global _metrics_file_attached
+    if _metrics_file_attached or not envs.VLLM_RBLN_METRICS_FILE:
+        return
+    _metrics_file_attached = True
+    root, ext = os.path.splitext(envs.VLLM_RBLN_METRICS_FILE)
+    path = f"{root}.{os.getpid()}{ext}"
+    try:
+        logger.addHandler(make_file_handler(path))
+    except OSError as e:
+        _metrics_file_attached = False
+        logger.warning("Failed to open metrics file %s: %s", path, e)
 
 
 @dataclass
@@ -276,6 +300,7 @@ class PerformanceTracker:
         )
 
     def print_final_stats(self):
+        _attach_metrics_file_handler()
         logger.info("=" * 80)
         if self.name:
             logger.info("FINAL PERFORMANCE STATISTICS [%s]", self.name)

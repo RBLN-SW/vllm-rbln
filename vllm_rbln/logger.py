@@ -155,6 +155,25 @@ def _configure_vllm_root_logger() -> None:
         dictConfig(logging_config)
 
 
+def make_file_handler(file_path: str) -> logging.FileHandler:
+    """Create a file handler using the same format as the stdout handler.
+
+    Args:
+        file_path: Destination path for the log file.
+
+    Returns:
+        A :class:`logging.FileHandler` whose output matches console output.
+
+    Example:
+        >>> logger.addHandler(make_file_handler("/tmp/metrics.log"))
+    """
+    from vllm.logging_utils import NewLineFormatter
+
+    handler = logging.FileHandler(file_path)
+    handler.setFormatter(NewLineFormatter(_FORMAT))
+    return handler
+
+
 def init_logger(name: str) -> _VllmLogger:
     """The main purpose of this function is to ensure that loggers are
     retrieved in such a way that we can be sure the root vllm logger has
