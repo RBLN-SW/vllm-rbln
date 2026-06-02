@@ -325,7 +325,7 @@ def get_autobind_cpu_ids(
 
     # Log binding information
     if len(ranks_in_same_numa) > 1:
-        logger.info(
+        logger.debug(
             "auto thread-binding: rank %d (rank_across_dp %d) "
             "-> NUMA node %d, CPUs: %s (exclusive allocation, "
             "shared NUMA node with ranks %s, id, physical core): %s",
@@ -337,7 +337,7 @@ def get_autobind_cpu_ids(
             [(x.id, x.physical_core) for x in logical_cpu_list],
         )
     else:
-        logger.info(
+        logger.debug(
             "auto thread-binding: rank %d (rank_across_dp %d) "
             "-> NUMA node %d, CPUs: %s (exclusive allocation, "
             "id, physical core): %s",
@@ -429,7 +429,7 @@ def set_cpu_affinity(
                     actual_cpu_ids,
                 )
             else:
-                logger.info(
+                logger.debug(
                     "Set CPU affinity for rank %d (local_rank %d): CPUs %s",
                     rank,
                     local_rank,
@@ -444,7 +444,7 @@ def set_cpu_affinity(
             )
             raise
     elif local_omp_cpuid == "nobind":
-        logger.info(
+        logger.debug(
             "Skipping CPU affinity binding for rank %d (local_rank %d): nobind",
             rank,
             local_rank,
@@ -480,7 +480,7 @@ def set_omp_num_threads(
     # Directly set PyTorch's thread count for this process
     torch.set_num_threads(num_threads)
 
-    logger.info(
+    logger.debug(
         "Set torch.num_threads to %d for rank %d (local_rank %d)",
         num_threads,
         rank,
