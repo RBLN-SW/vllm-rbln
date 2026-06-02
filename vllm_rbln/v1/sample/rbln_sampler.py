@@ -39,6 +39,37 @@ import vllm_rbln.rbln_envs as envs
 logger = init_logger(__name__)
 
 
+def resolve_compile_context(
+    compile_context: rebel.CompileContext | None,
+) -> rebel.CompileContext:
+    """Return a default CompileContext when one is not provided.
+
+    Used when running through the device tensor path in rbln_model_runner or
+    when triggered by optimum_model_runner.
+    """
+    if compile_context is not None:
+        return compile_context
+    if "use_global_ctx" in inspect.signature(rebel.CompileContext).parameters:
+        return rebel.CompileContext(use_global_ctx=True)
+    return rebel.CompileContext()
+
+
+def build_compile_options(compile_context: rebel.CompileContext) -> dict:
+    """Build the torch.compile ``options`` dict shared by the RBLN samplers."""
+    use_dt = envs.VLLM_RBLN_USE_DEVICE_TENSOR
+    options: dict = {}
+    if not use_dt:
+        options["compile_context"] = compile_context
+    if envs.VLLM_RBLN_COMPILE_STRICT_MODE:
+        options["mode"] = "strict"
+    if has_torch_rbln or use_dt:
+        options["tensor_parallel_size"] = 1
+        if not use_dt:
+            options["use_global_ctx"] = True
+            options["global_device_id"] = 0
+    return options
+
+
 def random_sample(
     probs: torch.Tensor,
     generators: dict[int, torch.Generator],
@@ -160,20 +191,9 @@ class RBLNTopKTopPSampler(nn.Module):
         )
 
         rebel.manual_seed(seed)
-        use_dt = envs.VLLM_RBLN_USE_DEVICE_TENSOR
-        options: dict = {}
-        if not use_dt:
-            options["compile_context"] = compile_context
-        if envs.VLLM_RBLN_COMPILE_STRICT_MODE:
-            options["mode"] = "strict"
-        if use_dt:
+        options = build_compile_options(compile_context)
+        if envs.VLLM_RBLN_USE_DEVICE_TENSOR:
             options["model_trace_method"] = "export"
-
-        if has_torch_rbln or use_dt:
-            options["tensor_parallel_size"] = 1
-            if not use_dt:
-                options["use_global_ctx"] = True
-                options["global_device_id"] = 0
 
         self._compiled_rbln_topk_topp_sampler = torch.compile(
             rbln_top_k_top_p_sample,
@@ -217,11 +237,7 @@ class RBLNSampler(VLLMSampler):
         super().__init__()
         # If using device tensor in rbln_model_runner
         # or triggered by optimum_model_runner
-        if compile_context is None:
-            if "use_global_ctx" in inspect.signature(rebel.CompileContext).parameters:
-                compile_context = rebel.CompileContext(use_global_ctx=True)
-            else:
-                compile_context = rebel.CompileContext()
+        compile_context = resolve_compile_context(compile_context)
         if logprobs_mode in ("raw_logprobs", "raw_logits"):
             self.topk_topp_sampler = RBLNTopKTopPSampler(
                 logprobs_mode=logprobs_mode,
@@ -233,18 +249,7 @@ class RBLNSampler(VLLMSampler):
                 f"RBLN Sampling does not support logprobs_mode: {logprobs_mode}. "
                 "Using native sampler instead."
             )
-        use_dt = envs.VLLM_RBLN_USE_DEVICE_TENSOR
-        options: dict = {}
-        if not use_dt:
-            options["compile_context"] = compile_context
-        if envs.VLLM_RBLN_COMPILE_STRICT_MODE:
-            options["mode"] = "strict"
-
-        if has_torch_rbln or use_dt:
-            options["tensor_parallel_size"] = 1
-            if not use_dt:
-                options["use_global_ctx"] = True
-                options["global_device_id"] = 0
+        options = build_compile_options(compile_context)
         # FIXME compiling both greedy and top-k top-p sampling
         # causes some issues in torchinductor.
         self._compiled_greedy_sample = torch.compile(
