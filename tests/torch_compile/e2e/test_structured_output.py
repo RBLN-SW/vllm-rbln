@@ -27,10 +27,10 @@ from enum import Enum
 import pytest
 from pydantic import BaseModel
 from transformers import GenerationConfig
-from vllm import LLM, SamplingParams
+from vllm import SamplingParams
 from vllm.sampling_params import StructuredOutputsParams
 
-from .utils import patch_and_run
+from .utils import managed_llm
 
 MODEL_ID = "Qwen/Qwen3-1.7B"
 
@@ -63,39 +63,45 @@ def sampling_kwargs(request: pytest.FixtureRequest) -> dict:
     }
 
 
-def _run_choice(sampling_kwargs: dict) -> None:
+def test_choice_sentiment_classification(
+    monkeypatch: pytest.MonkeyPatch, sampling_kwargs: dict
+) -> None:
     choices = ["Positive", "Negative"]
-    llm = LLM(**LLM_KWARGS)
-    outputs = llm.generate(
-        prompts="Classify this sentiment: vLLM is wonderful!",
-        sampling_params=SamplingParams(
-            **sampling_kwargs,
-            structured_outputs=StructuredOutputsParams(choice=choices),
-        ),
-    )
+    with managed_llm(monkeypatch, ENV, **LLM_KWARGS) as llm:
+        outputs = llm.generate(
+            prompts="Classify this sentiment: vLLM is wonderful!",
+            sampling_params=SamplingParams(
+                **sampling_kwargs,
+                structured_outputs=StructuredOutputsParams(choice=choices),
+            ),
+        )
     assert outputs[0].outputs[0].text in choices
 
 
-def _run_regex(sampling_kwargs: dict) -> None:
-    llm = LLM(**LLM_KWARGS)
-    outputs = llm.generate(
-        prompts=(
-            "Generate an example email address for Alan Turing, "
-            "who works in Enigma. End in .com and new line. "
-            "Example result: alan.turing@enigma.com\n"
-        ),
-        sampling_params=SamplingParams(
-            **sampling_kwargs,
-            structured_outputs=StructuredOutputsParams(regex=r"\w+@\w+\.com\n?"),
-        ),
-    )
+def test_regex_email_format(
+    monkeypatch: pytest.MonkeyPatch, sampling_kwargs: dict
+) -> None:
+    with managed_llm(monkeypatch, ENV, **LLM_KWARGS) as llm:
+        outputs = llm.generate(
+            prompts=(
+                "Generate an example email address for Alan Turing, "
+                "who works in Enigma. End in .com and new line. "
+                "Example result: alan.turing@enigma.com\n"
+            ),
+            sampling_params=SamplingParams(
+                **sampling_kwargs,
+                structured_outputs=StructuredOutputsParams(regex=r"\w+@\w+\.com\n?"),
+            ),
+        )
     text = outputs[0].outputs[0].text
     assert re.fullmatch(r"\w+@\w+\.com\n?", text), (
         f"Output does not match regex: {text!r}"
     )
 
 
-def _run_json(sampling_kwargs: dict) -> None:
+def test_json_car_description(
+    monkeypatch: pytest.MonkeyPatch, sampling_kwargs: dict
+) -> None:
     class CarType(str, Enum):
         sedan = "sedan"
         suv = "SUV"
@@ -107,20 +113,20 @@ def _run_json(sampling_kwargs: dict) -> None:
         model: str
         car_type: CarType
 
-    llm = LLM(**LLM_KWARGS)
-    outputs = llm.generate(
-        prompts=(
-            "Generate a JSON with the brand, model and car_type "
-            "of the most iconic car from the 90's"
-        ),
-        sampling_params=SamplingParams(
-            **sampling_kwargs,
-            max_tokens=32,
-            structured_outputs=StructuredOutputsParams(
-                json=CarDescription.model_json_schema()
+    with managed_llm(monkeypatch, ENV, **LLM_KWARGS) as llm:
+        outputs = llm.generate(
+            prompts=(
+                "Generate a JSON with the brand, model and car_type "
+                "of the most iconic car from the 90's"
             ),
-        ),
-    )
+            sampling_params=SamplingParams(
+                **sampling_kwargs,
+                max_tokens=32,
+                structured_outputs=StructuredOutputsParams(
+                    json=CarDescription.model_json_schema()
+                ),
+            ),
+        )
     text = outputs[0].outputs[0].text
     parsed = json.loads(text)
     car = CarDescription(**parsed)
@@ -129,7 +135,9 @@ def _run_json(sampling_kwargs: dict) -> None:
     assert car.car_type in CarType
 
 
-def _run_grammar(sampling_kwargs: dict) -> None:
+def test_grammar_sql_query(
+    monkeypatch: pytest.MonkeyPatch, sampling_kwargs: dict
+) -> None:
     simplified_sql_grammar = """
         root ::= select_statement
 
@@ -143,24 +151,28 @@ def _run_grammar(sampling_kwargs: dict) -> None:
 
         number ::= "1 " | "2 "
     """
-    llm = LLM(**LLM_KWARGS)
-    outputs = llm.generate(
-        prompts=(
-            "Generate a SQL query to show the 'username' and 'email' "
-            "from the 'users' table."
-        ),
-        sampling_params=SamplingParams(
-            **sampling_kwargs,
-            structured_outputs=StructuredOutputsParams(grammar=simplified_sql_grammar),
-        ),
-    )
+    with managed_llm(monkeypatch, ENV, **LLM_KWARGS) as llm:
+        outputs = llm.generate(
+            prompts=(
+                "Generate a SQL query to show the 'username' and 'email' "
+                "from the 'users' table."
+            ),
+            sampling_params=SamplingParams(
+                **sampling_kwargs,
+                structured_outputs=StructuredOutputsParams(
+                    grammar=simplified_sql_grammar
+                ),
+            ),
+        )
     text = outputs[0].outputs[0].text
     assert text.startswith("SELECT "), f"Expected SQL SELECT, got: {text!r}"
     assert " from " in text
     assert " where " in text
 
 
-def _run_structural_tag(sampling_kwargs: dict) -> None:
+def test_structural_tag_function_call(
+    monkeypatch: pytest.MonkeyPatch, sampling_kwargs: dict
+) -> None:
     structural_tag_obj = {
         "type": "structural_tag",
         "structures": [
@@ -198,16 +210,16 @@ Example:
 
 What is the weather in New York City?
 """
-    llm = LLM(**LLM_KWARGS)
-    outputs = llm.generate(
-        prompts=prompt,
-        sampling_params=SamplingParams(
-            **sampling_kwargs,
-            structured_outputs=StructuredOutputsParams(
-                structural_tag=json.dumps(structural_tag_obj)
+    with managed_llm(monkeypatch, ENV, **LLM_KWARGS) as llm:
+        outputs = llm.generate(
+            prompts=prompt,
+            sampling_params=SamplingParams(
+                **sampling_kwargs,
+                structured_outputs=StructuredOutputsParams(
+                    structural_tag=json.dumps(structural_tag_obj)
+                ),
             ),
-        ),
-    )
+        )
     text = outputs[0].outputs[0].text
 
     assert "<function=get_weather>" in text, (
@@ -219,33 +231,3 @@ What is the weather in New York City?
     assert match is not None, f"Could not extract function call from: {text!r}"
     params = json.loads(match.group(1))
     assert "city" in params
-
-
-def test_choice_sentiment_classification(
-    monkeypatch: pytest.MonkeyPatch, sampling_kwargs: dict
-) -> None:
-    patch_and_run(monkeypatch, ENV, _run_choice, sampling_kwargs)
-
-
-def test_regex_email_format(
-    monkeypatch: pytest.MonkeyPatch, sampling_kwargs: dict
-) -> None:
-    patch_and_run(monkeypatch, ENV, _run_regex, sampling_kwargs)
-
-
-def test_json_car_description(
-    monkeypatch: pytest.MonkeyPatch, sampling_kwargs: dict
-) -> None:
-    patch_and_run(monkeypatch, ENV, _run_json, sampling_kwargs)
-
-
-def test_grammar_sql_query(
-    monkeypatch: pytest.MonkeyPatch, sampling_kwargs: dict
-) -> None:
-    patch_and_run(monkeypatch, ENV, _run_grammar, sampling_kwargs)
-
-
-def test_structural_tag_function_call(
-    monkeypatch: pytest.MonkeyPatch, sampling_kwargs: dict
-) -> None:
-    patch_and_run(monkeypatch, ENV, _run_structural_tag, sampling_kwargs)
