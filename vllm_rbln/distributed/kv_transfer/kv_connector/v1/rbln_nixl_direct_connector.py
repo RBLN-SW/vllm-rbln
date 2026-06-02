@@ -421,50 +421,52 @@ class RblnNixlDirectConnectorWorker(RblnNixlConnectorWorker):
             # the model's later writes land in the same registered memory.
             cache_or_caches.zero_()
 
-            # --- delta: derive the dva of the vmem ENTRY base once, then
-            # add each region's byte offset. The K/V-split case yields K
-            # and V as views into one vmem entry where
-            # V.data_ptr() == entry_base + K_size; get_device_addrs
-            # expects the entry-base vaddr, so we convert that and add the
-            # (vaddr) offset to the returned dva.
+            # --- delta: vmem-vaddr -> NPU dva(s). On a multi-chiplet device
+            # (e.g. RBLN-CR03, 4 chiplets) the KV cache entry is sharded:
+            # get_device_addrs returns one base dva per chiplet `area`. Each
+            # area is an equal-size, structure-preserving 1/N slice (the
+            # sharded head dim reduced N-fold; dim order preserved), so a
+            # region at logical byte offset `off` with per-block stride
+            # `blk` maps, within chiplet c, to `area_dva[c] + off//N` with
+            # stride `blk//N`. Both P and D run identical code, so region
+            # order matches and chiplet c reads from remote chiplet c.
+            # N==1 reduces to the original single-device path.
             entry_base_vaddr = cache_or_caches.data_ptr()
-            entry_base_dva = nixl_rbln.vaddr_to_dva(entry_base_vaddr)
-            # Register one MR covering the whole vmem entry at its base dva
-            # (see mr_descs comment above). Dedup shared/HMA entries.
-            if entry_base_dva not in mr_seen_bases:
-                mr_seen_bases.add(entry_base_dva)
-                entry_nbytes = (
-                    cache_or_caches.numel() * cache_or_caches.element_size()
-                )
-                mr_descs.append(
-                    (entry_base_dva, entry_nbytes,
-                     max(cache_or_caches.get_device(), 0), "")
-                )
+            area_dvas = nixl_rbln.vaddr_to_dvas(entry_base_vaddr)
+            n_shards = len(area_dvas)
+            entry_nbytes = cache_or_caches.numel() * cache_or_caches.element_size()
+            assert entry_nbytes % n_shards == 0, (
+                f"entry size {entry_nbytes} not divisible by {n_shards} shards"
+            )
+            shard_area_size = entry_nbytes // n_shards
+            dev_id = max(cache_or_caches.get_device(), 0)
+            # One whole-entry MR per shard (chiplet area base dva). The RBLN
+            # dma-buf export wants an allocation-base dva; each area base is
+            # exactly that. Transfer descriptors address sub-ranges of these
+            # MRs. Dedup shared/HMA entries.
+            for area_dva in area_dvas:
+                if area_dva not in mr_seen_bases:
+                    mr_seen_bases.add(area_dva)
+                    mr_descs.append((area_dva, shard_area_size, dev_id, ""))
             for cache in cache_list:
                 region_offset = cache.data_ptr() - entry_base_vaddr
-                base_addr = entry_base_dva + region_offset
-                if base_addr in seen_base_addresses:
-                    logger.debug(
-                        "Skipping %s because it's already seen", layer_name
-                    )
-                    continue
-                logger.debug(
-                    "Registering layer %s shape %s: vaddr=0x%x(+0x%x) "
-                    "-> dva=0x%x",
-                    layer_name,
-                    cache.shape,
-                    entry_base_vaddr,
-                    region_offset,
-                    base_addr,
+                assert region_offset % n_shards == 0, (
+                    f"region offset {region_offset} not divisible by "
+                    f"{n_shards} shards"
                 )
-                seen_base_addresses.append(base_addr)
                 if isinstance(layer_spec, _up.MambaSpec):
-                    self.block_len_per_layer.append(
+                    full_block_len = (
                         physical_page_size
                         // self._physical_blocks_per_logical_kv_block
                     )
                 else:
-                    self.block_len_per_layer.append(physical_page_size)
+                    full_block_len = physical_page_size
+                assert full_block_len % n_shards == 0, (
+                    f"block len {full_block_len} not divisible by "
+                    f"{n_shards} shards"
+                )
+                shard_region_offset = region_offset // n_shards
+                shard_block_len = full_block_len // n_shards
 
                 assert cache.shape[0] == num_blocks, (
                     "All kv cache tensors must have the same number of blocks"
@@ -473,9 +475,21 @@ class RblnNixlDirectConnectorWorker(RblnNixlConnectorWorker):
                     assert tensor_size_bytes == curr_tensor_size_bytes, (
                         "All kv cache tensors must have the same size"
                     )
-                self.device_id = max(cache.get_device(), 0)
-                caches_data.append(
-                    (base_addr, curr_tensor_size_bytes, self.device_id, "")
+                self.device_id = dev_id
+                for area_dva in area_dvas:
+                    base_addr = area_dva + shard_region_offset
+                    if base_addr in seen_base_addresses:
+                        logger.debug("Skipping %s (seen)", layer_name)
+                        continue
+                    seen_base_addresses.append(base_addr)
+                    self.block_len_per_layer.append(shard_block_len)
+                    caches_data.append(
+                        (base_addr, num_blocks * shard_block_len,
+                         self.device_id, "")
+                    )
+                logger.debug(
+                    "Layer %s region off=0x%x: %d shard(s) blk_len=0x%x",
+                    layer_name, region_offset, n_shards, shard_block_len,
                 )
 
         logger.debug(
