@@ -90,9 +90,7 @@ class RblnNixlDirectConnector(RblnNixlConnector):
         # Do NOT call RblnNixlConnector.__init__: it asserts
         # kv_buffer_device != "rbln". The direct path *requires* "rbln",
         # so we replicate the small base body here, swapping in the
-        # direct worker and the opposite assert. Scheduler-side behavior
-        # is identical to the host-bounce connector, so the scheduler
-        # class is reused as-is.
+        # direct worker and the opposite assert.
         KVConnectorBase_V1.__init__(self, vllm_config, role, kv_cache_config)
         assert vllm_config.kv_transfer_config is not None
         assert vllm_config.kv_transfer_config.engine_id is not None
@@ -139,9 +137,6 @@ class RblnNixlDirectConnectorWorker(RblnNixlConnectorWorker):
             "RblnNixlDirectConnectorWorker requires kv_buffer_device='rbln'."
         )
         super().__init__(vllm_config, engine_id, kv_cache_config)
-        # Late import — if nixl-rbln isn't installed we want the
-        # failure surface to be obviously a missing dependency, not a
-        # cryptic AttributeError deep inside register_kv_caches.
         try:
             import nixl_rbln  # noqa: F401
         except ImportError as e:
@@ -156,11 +151,6 @@ class RblnNixlDirectConnectorWorker(RblnNixlConnectorWorker):
         # Direct path registers NPU memory, not host DRAM. The platform
         # reports "DRAM" (host-bounce default) so we override here.
         self.nixl_memory_type = "VRAM"
-        # Register/transfer over the RBLN backend. super().__init__ has
-        # already built the NixlWrapper with the *previous* backend list
-        # (default ["UCX"]), so RBLN was NOT auto-created with empty
-        # params — register_kv_caches creates it with the right
-        # rbln_ctx_ptr via nixl_rbln.ensure_rbln_backend before use.
         self.nixl_backends = ["RBLN"]
 
     # ---- host-bounce removal ------------------------------------------
@@ -171,9 +161,6 @@ class RblnNixlDirectConnectorWorker(RblnNixlConnectorWorker):
         """Direct path: there is no host xfer buffer. NIXL talks to
         NPU memory through the dmabuf MR the RBLN plugin built; no
         staging needed."""
-        # Intentionally leave self.host_xfer_buffers empty / unset.
-        # The base class default (host bounce) is what we're opting
-        # out of.
         if self.use_host_buffer:
             logger.info(
                 "RblnNixlDirectConnector: ignoring kv_buffer_device='cpu' "
@@ -188,68 +175,46 @@ class RblnNixlDirectConnectorWorker(RblnNixlConnectorWorker):
     # ---- device-id resolution -----------------------------------------
 
     def _resolve_ctx_device_id(self, kv_caches: dict[str, torch.Tensor]) -> int:
-        """Find the NPU device id whose global RblnContext is live.
+        """The NPU device id whose global RblnContext owns the KV cache.
 
-        The KV cache tensors are vmem-backed but appear as CPU tensors
-        (device_type="cpu"), so ``tensor.get_device()`` is -1 and useless
-        here. The model compile created a global RblnContext on the
-        worker's physical NPU (the RBLN_DEVICES entry, which
-        rbln_worker._init_device_env does NOT remap to 0). Pick the first
-        candidate whose ``Context.from_key(global_key_at_device(d))`` is
-        non-None.
+        In device-tensor mode (which this connector requires) the KV cache is
+        a real ``rbln`` tensor, so its in-process device index —
+        ``tensor.get_device()`` — is exactly the id the global RblnContext is
+        keyed on. The rebel runtime remaps this worker's masked RBLN_DEVICES
+        entry to a local 0-based index; ``$RBLN_DEVICES`` keeps the *physical*
+        id (e.g. "1"), which is NOT the in-process context id, so we read it
+        off the tensor rather than the env var. Validate a live context exists
+        there before handing the id to the RBLN NIXL backend.
         """
         import os
 
         import rebel
 
-        _C = rebel._C
-
-        def _ctx_at(d: int):
-            try:
-                return _C.Context.from_key(_C.Context.global_key_at_device(d))
-            except Exception:  # noqa: BLE001
-                return None
-
         t0 = next(iter(kv_caches.values()))
-        candidates: list[int] = []
-        idx = getattr(t0.device, "index", None)
-        if idx is not None:
-            candidates.append(int(idx))
-        rbln_devices = os.environ.get("RBLN_DEVICES", "")
-        if rbln_devices:
-            try:
-                candidates.append(int(rbln_devices.split(",")[0]))
-            except ValueError:
-                pass
-        candidates.append(0)
-        seen: set[int] = set()
-        candidates = [c for c in candidates if not (c in seen or seen.add(c))]
+        device_id = t0.get_device()
+        assert device_id >= 0, (
+            "RblnNixlDirectConnector: KV cache tensor reports no device "
+            f"(get_device()={device_id}, device={t0.device}); expected an "
+            "'rbln' device tensor (is VLLM_RBLN_USE_DEVICE_TENSOR=1 set?)."
+        )
 
-        chosen = next((c for c in candidates if _ctx_at(c) is not None), None)
+        try:
+            ctx = rebel._C.Context.from_key(
+                rebel._C.Context.global_key_at_device(device_id))
+        except Exception:  # noqa: BLE001
+            ctx = None
+        assert ctx is not None, (
+            "RblnNixlDirectConnector: no live RblnContext at device id "
+            f"{device_id} (t.device={t0.device}); cannot create the RBLN NIXL "
+            "backend."
+        )
+
         logger.info(
-            "RblnNixlDirectConnector: ctx device_id candidates=%s chosen=%s "
-            "(t.device=%s get_device=%d RBLN_DEVICES=%r)",
-            candidates,
-            chosen,
-            t0.device,
-            t0.get_device(),
-            rbln_devices,
+            "RblnNixlDirectConnector: ctx device_id=%d (t.device=%s, "
+            "RBLN_DEVICES=%r)",
+            device_id, t0.device, os.environ.get("RBLN_DEVICES", ""),
         )
-        if chosen is None:
-            # Debug safety net: scan so the log shows which device ids
-            # actually own a live context.
-            live = [d for d in range(32) if _ctx_at(d) is not None]
-            logger.warning(
-                "RblnNixlDirectConnector: no candidate had a live "
-                "RblnContext; scan found live contexts at device ids %s",
-                live,
-            )
-            chosen = live[0] if live else None
-        assert chosen is not None, (
-            "RblnNixlDirectConnector: could not find a live RblnContext for "
-            "any NPU device id; cannot create the RBLN NIXL backend."
-        )
-        return chosen
+        return device_id
 
     # ---- deferred registration (post-warmup) --------------------------
 
