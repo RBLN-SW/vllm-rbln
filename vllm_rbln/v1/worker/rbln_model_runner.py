@@ -88,7 +88,7 @@ from vllm.v1.worker.utils import (
 )
 
 from vllm_rbln import envs
-from vllm_rbln.compilation.backends import rbln_backend
+from vllm_rbln.compilation.backends import rbln_backend, set_compile_stage
 from vllm_rbln.forward_context import RBLNDPMetadata, set_forward_context
 from vllm_rbln.logger import init_logger
 from vllm_rbln.utils import pad
@@ -2407,51 +2407,54 @@ class RBLNModelRunner:
 
     def warmup_model(self) -> None:
         logger.info("Compile and warming up model.")
-        # 1. prefill
-        self._dummy_run(1, self.max_num_tokens, True)
 
-        # 2. decode
-        query_lens = [1]
-        if self.speculative_config:
-            query_lens.append(self.speculative_config.num_speculative_tokens + 1)
-        for num_req in self.bucketing_manager.decode_batch_buckets:
-            for query_len in query_lens:
-                self._dummy_run(num_req, query_len, False)
+        with set_compile_stage("warmup"):
+            # 1. prefill
+            self._dummy_run(1, self.max_num_tokens, True)
 
-        if self.specialized_moe_decode:
-            # NOTE(RBLN): Compile decode graph with prefill-sized padding to cover
-            # the DP-asymmetric case (this rank decoding while another rank prefills).
-            # The bit-encoded all_reduce in get_dp_padding forces num_padded_tokens
-            # to max_num_tokens whenever any rank prefills, which the small-bucket
-            # decode graphs from 2. decode above cannot satisfy.
-            assert self.speculative_config is None
+            # 2. decode
+            query_lens = [1]
+            if self.speculative_config:
+                query_lens.append(self.speculative_config.num_speculative_tokens + 1)
             for num_req in self.bucketing_manager.decode_batch_buckets:
-                self._dummy_run(
-                    num_req, 1, False, num_tokens_padded=self.max_num_tokens
-                )
+                for query_len in query_lens:
+                    self._dummy_run(num_req, query_len, False)
 
-        # 3. compute_logits
-        if not self.use_wrapped_compute_logits:
-            for size in self.bucketing_manager.batch_buckets:
-                hidden_states = torch.randn(
-                    (size, self.model_config.get_hidden_size()),
-                    device=self.device,
-                    dtype=self.dtype,
-                )
-                _ = self.compute_logits(hidden_states)
-
-        # 4. sampler
-        for size in range(1, self.max_num_reqs + 1):
-            self._dummy_sampler_run(size)
-
-        # 5. drafter
-        if self.speculative_config:
-            if self.speculative_config.method == "medusa":
-                self.drafter.dummy_run()
-            elif self.speculative_config.use_eagle():
-                # prefill
-                self.drafter.dummy_run(1, self.max_num_tokens, True)
-
-                # decode
+            if self.specialized_moe_decode:
+                # NOTE(RBLN): Compile decode graph with prefill-sized padding to cover
+                # the DP-asymmetric case (this rank decoding while another rank
+                # prefills). The bit-encoded all_reduce in get_dp_padding forces
+                # num_padded_tokens to max_num_tokens whenever any rank prefills,
+                # which the small-bucket decode graphs from 2. decode above cannot
+                # satisfy.
+                assert self.speculative_config is None
                 for num_req in self.bucketing_manager.decode_batch_buckets:
-                    self.drafter.dummy_run(num_req, 1, False)
+                    self._dummy_run(
+                        num_req, 1, False, num_tokens_padded=self.max_num_tokens
+                    )
+
+            # 3. compute_logits
+            if not self.use_wrapped_compute_logits:
+                for size in self.bucketing_manager.batch_buckets:
+                    hidden_states = torch.randn(
+                        (size, self.model_config.get_hidden_size()),
+                        device=self.device,
+                        dtype=self.dtype,
+                    )
+                    _ = self.compute_logits(hidden_states)
+
+            # 4. sampler
+            for size in range(1, self.max_num_reqs + 1):
+                self._dummy_sampler_run(size)
+
+            # 5. drafter
+            if self.speculative_config:
+                if self.speculative_config.method == "medusa":
+                    self.drafter.dummy_run()
+                elif self.speculative_config.use_eagle():
+                    # prefill
+                    self.drafter.dummy_run(1, self.max_num_tokens, True)
+
+                    # decode
+                    for num_req in self.bucketing_manager.decode_batch_buckets:
+                        self.drafter.dummy_run(num_req, 1, False)
