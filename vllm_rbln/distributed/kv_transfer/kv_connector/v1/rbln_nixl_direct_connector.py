@@ -345,7 +345,6 @@ class RblnNixlDirectConnectorWorker(RblnNixlConnectorWorker):
         # Pick the candidate device id whose global RblnContext actually
         # resolves.
         device_id = self._resolve_ctx_device_id(kv_caches)
-        nixl_rbln.ensure_rbln_backend(self.nixl_wrapper, device_id)
 
         # Direct path never stages through a host buffer.
         assert not self.use_host_buffer
@@ -363,22 +362,14 @@ class RblnNixlDirectConnectorWorker(RblnNixlConnectorWorker):
             device_id,
         )
 
-        caches_data = []
-        # With hybrid allocator, layers can share a kv cache tensor.
-        seen_base_addresses = []
         tensor_size_bytes = None
-        self.block_len_per_layer = list[int]()
-        # --- delta: NIXL memory regions to register with the RBLN backend.
-        # The RBLN UMD export (rblnExportMemoryByDvaNoCbForRCCL) only accepts
-        # an *allocation-base* dva; a mid-allocation dva (e.g. the V view of a
-        # K/V-split entry at entry_base + K_size) is rejected with rc=-2. So
-        # we register ONE MR per vmem entry covering the *whole* entry at its
-        # base dva, and rely on NIXL transferring sub-ranges of a registered
-        # region (K and V block addresses both fall inside the entry MR). The
-        # K/V split is still reflected in seen_base_addresses / block_len /
-        # num_regions below, which drive the transfer descriptors.
-        mr_descs: list[tuple[int, int, int, str]] = []
-        mr_seen_bases: set[int] = set()
+        # Logical K/V regions handed to nixl-rbln: each is (entry_tensor,
+        # byte_offset_within_entry, full_block_len). nixl-rbln does the
+        # vmem-vaddr -> NPU-dva translation, the chiplet sharding and the MR
+        # registration, and returns the physical transfer tables. This
+        # connector therefore never sees NPU dvas or the chiplet count — it
+        # only ever deals in torch tensors and logical byte offsets.
+        regions: list[tuple[Any, int, int]] = []
         for layer_name, cache_or_caches in xfer_buffers.items():
             layer_spec = self._layer_specs[layer_name]
             if isinstance(layer_spec, _up.UniformTypeKVCacheSpecs):
@@ -421,39 +412,13 @@ class RblnNixlDirectConnectorWorker(RblnNixlConnectorWorker):
             # the model's later writes land in the same registered memory.
             cache_or_caches.zero_()
 
-            # --- delta: vmem-vaddr -> NPU dva(s). On a multi-chiplet device
-            # (e.g. RBLN-CR03, 4 chiplets) the KV cache entry is sharded:
-            # get_device_addrs returns one base dva per chiplet `area`. Each
-            # area is an equal-size, structure-preserving 1/N slice (the
-            # sharded head dim reduced N-fold; dim order preserved), so a
-            # region at logical byte offset `off` with per-block stride
-            # `blk` maps, within chiplet c, to `area_dva[c] + off//N` with
-            # stride `blk//N`. Both P and D run identical code, so region
-            # order matches and chiplet c reads from remote chiplet c.
-            # N==1 reduces to the original single-device path.
+            # Collect this entry's logical K/V regions. K and V are views into
+            # one vmem entry (V at entry_base + K_size); pass the entry tensor
+            # plus the view's byte offset so nixl-rbln converts the entry base
+            # (and its chiplet shards) once.
             entry_base_vaddr = cache_or_caches.data_ptr()
-            area_dvas = nixl_rbln.vaddr_to_dvas(entry_base_vaddr)
-            n_shards = len(area_dvas)
-            entry_nbytes = cache_or_caches.numel() * cache_or_caches.element_size()
-            assert entry_nbytes % n_shards == 0, (
-                f"entry size {entry_nbytes} not divisible by {n_shards} shards"
-            )
-            shard_area_size = entry_nbytes // n_shards
-            dev_id = max(cache_or_caches.get_device(), 0)
-            # One whole-entry MR per shard (chiplet area base dva). The RBLN
-            # dma-buf export wants an allocation-base dva; each area base is
-            # exactly that. Transfer descriptors address sub-ranges of these
-            # MRs. Dedup shared/HMA entries.
-            for area_dva in area_dvas:
-                if area_dva not in mr_seen_bases:
-                    mr_seen_bases.add(area_dva)
-                    mr_descs.append((area_dva, shard_area_size, dev_id, ""))
             for cache in cache_list:
                 region_offset = cache.data_ptr() - entry_base_vaddr
-                assert region_offset % n_shards == 0, (
-                    f"region offset {region_offset} not divisible by "
-                    f"{n_shards} shards"
-                )
                 if isinstance(layer_spec, _up.MambaSpec):
                     full_block_len = (
                         physical_page_size
@@ -461,12 +426,6 @@ class RblnNixlDirectConnectorWorker(RblnNixlConnectorWorker):
                     )
                 else:
                     full_block_len = physical_page_size
-                assert full_block_len % n_shards == 0, (
-                    f"block len {full_block_len} not divisible by "
-                    f"{n_shards} shards"
-                )
-                shard_region_offset = region_offset // n_shards
-                shard_block_len = full_block_len // n_shards
 
                 assert cache.shape[0] == num_blocks, (
                     "All kv cache tensors must have the same number of blocks"
@@ -475,51 +434,32 @@ class RblnNixlDirectConnectorWorker(RblnNixlConnectorWorker):
                     assert tensor_size_bytes == curr_tensor_size_bytes, (
                         "All kv cache tensors must have the same size"
                     )
-                self.device_id = dev_id
-                for area_dva in area_dvas:
-                    base_addr = area_dva + shard_region_offset
-                    if base_addr in seen_base_addresses:
-                        logger.debug("Skipping %s (seen)", layer_name)
-                        continue
-                    seen_base_addresses.append(base_addr)
-                    self.block_len_per_layer.append(shard_block_len)
-                    caches_data.append(
-                        (base_addr, num_blocks * shard_block_len,
-                         self.device_id, "")
-                    )
-                logger.debug(
-                    "Layer %s region off=0x%x: %d shard(s) blk_len=0x%x",
-                    layer_name, region_offset, n_shards, shard_block_len,
-                )
+                regions.append((cache_or_caches, region_offset, full_block_len))
 
-        logger.debug(
-            "Different block lengths collected: %s", set(self.block_len_per_layer)
+        # Delegate vmem-vaddr -> NPU-dva, chiplet sharding and MR registration
+        # to nixl-rbln. It registers one whole-entry MR per chiplet shard and
+        # returns the physical transfer tables (base addrs + block lens),
+        # already chiplet-expanded so the base connector's descriptor math is
+        # correct without this connector knowing the chiplet count.
+        xfer = nixl_rbln.register_kv_regions(
+            self.nixl_wrapper, regions, device_id, mem=self.nixl_memory_type
         )
-        assert len(self.block_len_per_layer) == len(seen_base_addresses)
+        self.device_id = device_id
+        self.block_len_per_layer = list(xfer.block_lens)
+        self.kv_caches_base_addr[self.engine_id][self.tp_rank] = xfer.base_addrs
+        self._registered_descs.append(xfer.reg_handle)
+        assert len(self.block_len_per_layer) == len(xfer.base_addrs)
 
-        self.kv_caches_base_addr[self.engine_id][self.tp_rank] = seen_base_addresses
-        self.num_regions = len(caches_data)
-
+        self.num_regions = len(xfer.base_addrs)
         if self.kv_topo.is_kv_layout_blocks_first:
             self.num_regions *= 2
-
         self.num_descs = self.num_regions * self.num_blocks
 
-        # Register whole-entry MRs (mr_descs), NOT the per-K/V-region
-        # caches_data: the RBLN backend rejects mid-allocation (V offset)
-        # dvas. num_regions / kv_caches_base_addr keep the K/V split so the
-        # transfer descriptors address K and V correctly within these MRs.
         logger.info(
-            "RblnNixlDirectConnector: registering %d whole-entry MR(s) "
-            "covering %d transfer region(s) (K/V split).",
-            len(mr_descs),
-            self.num_regions,
+            "RblnNixlDirectConnector: registered %d transfer region(s) "
+            "across %d chiplet shard(s) (K/V split).",
+            self.num_regions, xfer.n_shards,
         )
-        descs = self.nixl_wrapper.get_reg_descs(mr_descs, self.nixl_memory_type)
-        logger.debug("Registering MR descs: %s", mr_descs)
-        self.nixl_wrapper.register_memory(descs, backends=self.nixl_backends)
-        logger.debug("Done registering descs")
-        self._registered_descs.append(descs)
 
         self.device_kv_caches = kv_caches
         self.dst_num_blocks[self.engine_id] = self.num_blocks
