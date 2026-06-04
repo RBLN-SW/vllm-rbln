@@ -25,9 +25,9 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler, SamplerOutput
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
-from vllm_rbln.v1.sample.rbln_rejection_sampler import (
+from vllm_rbln.v1.sample.cpu_rejection_sampler import (
     PLACEHOLDER_TOKEN_ID,
-    RBLNRejectionSampler,
+    CPURejectionSampler,
 )
 
 from .utils import create_allowed_token_ids
@@ -39,11 +39,11 @@ DEVICE = "cpu"
 def rejection_sampler():
     mock_sampler = Mock(spec=Sampler)
     mock_sampler.logprobs_mode = "raw_logprobs"
-    return RBLNRejectionSampler(mock_sampler)
+    return CPURejectionSampler(mock_sampler)
 
 
 def mock_sampler_output(
-    rejection_sampler: RBLNRejectionSampler, bonus_token_ids: torch.Tensor
+    rejection_sampler: CPURejectionSampler, bonus_token_ids: torch.Tensor
 ):
     rejection_sampler.sampler.return_value = SamplerOutput(
         sampled_token_ids=bonus_token_ids, logprobs_tensors=None
@@ -489,7 +489,7 @@ def estimate_rejection_sampling_pdf(
     """
     mock_sampler = Mock(spec=Sampler)
     mock_sampler.logprobs_mode = "raw_logprobs"
-    rejection_sampler = RBLNRejectionSampler(mock_sampler)
+    rejection_sampler = CPURejectionSampler(mock_sampler)
     num_tokens = num_samples * k
     # Repeat draft probs num_samples * k times.
     draft_probs = draft_probs.reshape(1, 1, vocab_size).repeat(num_samples, k, 1)

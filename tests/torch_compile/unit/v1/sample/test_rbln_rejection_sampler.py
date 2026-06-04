@@ -12,28 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Parity tests for RBLNRejectionSampler against the CPU reference sampler.
-
-Instead of hardcoding expected outputs, we treat the CPU rejection sampler
-(`cpu_rejection_sampler.rejection_sample`, upstream-faithful) as the oracle and
-assert the RBLN sampler (real compiled NPU primitive — NOT mocked) produces the
-SAME `output_token_ids` for identical inputs.
-
-Both `rejection_sample` entry points share the same signature, so we feed them
-the same tensors. Determinism: with `all_greedy=True` the CPU path takes the
-`target_probs.argmax` branch, and feeding one-hot `target_probs` makes the RBLN
-NPU primitive sample that same argmax token — so a correct RBLN implementation
-must match the CPU output bit-for-bit.
-
-Two cases:
-  - test_uniform_*  : every request has the SAME num_draft_tokens (== max_spec_len)
-  - test_varying_*  : requests have DIFFERENT num_draft_tokens, including a
-                      zero-draft request that only emits its bonus token
-
-NOTE: requires the `rbln` runtime (NPU), like the other tests under
-tests/torch_compile (they import vllm_rbln modules that pull in `rebel`).
-"""
-
 from types import SimpleNamespace
 import pytest
 import torch
@@ -44,11 +22,6 @@ from vllm_rbln.v1.sample.cpu_rejection_sampler import (
 from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
 from vllm_rbln.v1.sample.rbln_sampler import RBLNSampler
 
-
-# Module-scoped: CompileContext(use_global_ctx=True) is one-per-process, so
-# building a fresh context (and device runtime) per test makes the second
-# test's device jobs abort (SYS_TASK_ABORTED / SYS_ENODEV). Share a single
-# sampler across the module instead.
 @pytest.fixture(scope="module")
 def rejection_sampler(monkeypatch_module):
     monkeypatch_module.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
@@ -73,32 +46,59 @@ def _one_hot(target_tokens: list[int], vocab_size: int) -> torch.Tensor:
 
 
 def _build_inputs(*, num_draft_tokens, draft_token_ids, target_tokens,
-                  max_spec_len, bonus_token_ids, vocab_size=64):
-    # NOTE: vocab_size must be a multiple of 64 — the rejection_sample NPU
-    # primitive (contrib_top_k_top_p_sample) is built on 64-lane splats and
-    # the rebel compiler aborts (core dump) on non-multiple-of-64 vocab.
+                  max_spec_len, bonus_token_ids, vocab_size=64,
+                  top_k=None, top_p=None):
+    # NOTE: vocab_size must be a multiple of 64 because of primitive constraint
     """Build the shared argument tuple for both rejection_sample entry points.
 
     `draft_token_ids` / `target_tokens` are in packed layout (concatenation
     over requests, length N = sum(num_draft_tokens)).
+
+    When `top_k` / `top_p` (per-batch lists) are given, the metadata switches
+    to all_random sampling. The probs stay one-hot, so both paths remain
+    deterministic and comparable:
+      - RBLN primitive: any top_k >= 1 / top_p filter keeps the hot token
+        (it is the row max) and every other surviving prob is 0, so the
+        probs/q argmax always picks the hot token.
+      - CPU reference: prob[draft] is exactly 1 (accept for any u) or 0
+        (reject for any u), and the recovered-token argmax picks the hot
+        token, independent of the uniform/exponential draws.
     """
     draft = torch.tensor(draft_token_ids, dtype=torch.int32)
     num_tokens = draft.shape[0]
+    batch_size = len(num_draft_tokens)
     assert num_tokens == sum(num_draft_tokens) == len(target_tokens)
 
     cu_num_draft_tokens = torch.tensor(num_draft_tokens, dtype=torch.int64).cumsum(0)
     target_probs = _one_hot(target_tokens, vocab_size)
     bonus = torch.tensor(bonus_token_ids, dtype=torch.int64).reshape(-1, 1)
 
-    # all_greedy -> CPU takes the argmax branch; top_k/top_p None -> RBLN NPU
-    # primitive samples the one-hot row verbatim (== argmax).
-    sampling_metadata = SimpleNamespace(
-        all_greedy=True,
-        all_random=False,
-        top_k=None,
-        top_p=None,
-        generators={},
-    )
+    if top_k is None and top_p is None:
+        # all_greedy -> CPU takes the argmax branch; top_k/top_p None -> RBLN NPU
+        # primitive samples the one-hot row verbatim (== argmax).
+        sampling_metadata = SimpleNamespace(
+            all_greedy=True,
+            all_random=False,
+            top_k=None,
+            top_p=None,
+            generators={},
+        )
+    else:
+        # all_random -> CPU takes the accept-threshold branch
+        # (target_probs[draft] >= u); RBLN NPU primitive applies the
+        # top_k/top_p masks before sampling. See the docstring above for why
+        # one-hot probs keep both paths deterministic.
+        sampling_metadata = SimpleNamespace(
+            all_greedy=False,
+            all_random=True,
+            # temperature != 0 -> no request is treated as greedy.
+            temperature=torch.ones(batch_size, dtype=torch.float32),
+            top_k=(torch.tensor(top_k, dtype=torch.int32)
+                   if top_k is not None else None),
+            top_p=(torch.tensor(top_p, dtype=torch.float32)
+                   if top_p is not None else None),
+            generators={},
+        )
     return (
         draft,
         list(num_draft_tokens),
@@ -149,3 +149,58 @@ def test_varying_num_draft_tokens(rejection_sampler):
         bonus_token_ids=[9, 8, 7],
     )
     _assert_rbln_matches_cpu(rejection_sampler, inputs)
+
+# FIXME top-p/top-k sampling is non-deterministic.
+# So it requires multiple interations and check the stochastic distribution.
+# def test_top_k_random_sampling(rejection_sampler):
+#     """Per-batch top_k with all_random sampling metadata.
+
+#     b0: top_k=1 (collapses to argmax), all targets match -> all accepted.
+#     b1: top_k=4, mismatch at pos 1 -> recover with the hot target token.
+#     RBLN output must equal the CPU reference output.
+#     """
+#     inputs = _build_inputs(
+#         num_draft_tokens=[3, 3],
+#         draft_token_ids=[1, 2, 3, 4, 5, 6],  # packed: b0=[1,2,3], b1=[4,5,6]
+#         target_tokens=[1, 2, 3, 4, 7, 0],   # b1 pos1 mismatches (7 != 5)
+#         max_spec_len=3,
+#         bonus_token_ids=[9, 8],
+#         top_k=[1, 4],
+#     )
+#     _assert_rbln_matches_cpu(rejection_sampler, inputs)
+
+
+# def test_top_p_random_sampling(rejection_sampler):
+#     """Per-batch top_p with all_random sampling metadata.
+
+#     Includes a zero-draft request (bonus only) on the random path.
+#     b0: 3 drafts all accepted. b1: 0 drafts. b2: reject at pos 0 -> recover.
+#     RBLN output must equal the CPU reference output.
+#     """
+#     inputs = _build_inputs(
+#         num_draft_tokens=[3, 0, 2],
+#         draft_token_ids=[1, 2, 3, 4, 5],  # packed: b0=[1,2,3], b1=[], b2=[4,5]
+#         target_tokens=[1, 2, 3, 6, 0],   # b2 pos0 mismatches (6 != 4)
+#         max_spec_len=3,
+#         bonus_token_ids=[9, 8, 7],
+#         top_p=[0.9, 0.5, 0.3],
+#     )
+#     _assert_rbln_matches_cpu(rejection_sampler, inputs)
+
+
+# def test_top_k_top_p_random_sampling(rejection_sampler):
+#     """top_k and top_p applied together with all_random sampling metadata.
+
+#     b0: 2 drafts, mismatch at pos 1 -> recover. b1: 3 drafts all accepted
+#     -> bonus. RBLN output must equal the CPU reference output.
+#     """
+#     inputs = _build_inputs(
+#         num_draft_tokens=[2, 3],
+#         draft_token_ids=[1, 2, 3, 4, 5],  # packed: b0=[1,2], b1=[3,4,5]
+#         target_tokens=[1, 7, 3, 4, 5],   # b0 pos1 mismatches (7 != 2)
+#         max_spec_len=3,
+#         bonus_token_ids=[9, 8],
+#         top_k=[8, 2],
+#         top_p=[0.95, 0.4],
+#     )
+#     _assert_rbln_matches_cpu(rejection_sampler, inputs)
