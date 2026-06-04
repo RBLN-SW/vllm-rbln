@@ -531,20 +531,13 @@ class RBLNWorker(WorkerBase):
         return
 
     def shutdown(self) -> None:
-        logger.info("v1 rbln_worker shutdown called")
         # has_kv_transfer_group can be None during interpreter shutdown.
         if ensure_kv_transfer_shutdown is not None:
             ensure_kv_transfer_shutdown()
         if self.profiler is not None:
             self.profiler.shutdown()
 
-        # if envs.VLLM_RBLN_METRICS:
-        #     if self.model_runner.performance_tracker:
-        #         self.model_runner.performance_tracker.print_final_stats()
-        #     if self.model_runner.sampler_performance_tracker:
-        #         self.model_runner.sampler_performance_tracker.print_final_stats()
-        #     if self.model_runner.e2e_performance_tracker:
-        #         self.model_runner.e2e_performance_tracker.print_final_stats()
+        self.model_runner.performance_ctx.print_stats()
 
     def _ensure_rbln_host_threads_before_compile(self) -> None:
         """Set OpenMP / torch / numba threads before ``warm_up_model()`` without

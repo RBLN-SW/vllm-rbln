@@ -106,6 +106,7 @@ from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
 from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
+from vllm_rbln.v1.worker.metrics_v2 import PerformanceContext, ProfileSection
 from vllm_rbln.v1.worker.utils import prepare_kernel_block_sizes
 
 if TYPE_CHECKING:
@@ -341,6 +342,8 @@ class RBLNModelRunner:
             parallel_config.data_parallel_size > 1
             and envs.VLLM_RBLN_SPECIALIZE_MOE_DECODE
         )
+
+        self.performance_ctx = PerformanceContext("runner")
 
     def _get_positions(self, num_tokens: Any):
         assert not isinstance(num_tokens, int)
@@ -1004,18 +1007,22 @@ class RBLNModelRunner:
 
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
-        if spec_decode_metadata is None:
-            return self.sampler(
-                logits=logits,
-                sampling_metadata=sampling_metadata,
-            )
+        with self.performance_ctx.profile(
+            section=ProfileSection.SAMPLER,
+            token_count=logits.shape[0] if logits is not None else 0,
+        ):
+            if spec_decode_metadata is None:
+                return self.sampler(
+                    logits=logits,
+                    sampling_metadata=sampling_metadata,
+                )
 
-        return self.rejection_sampler(
-            spec_decode_metadata,
-            None,  # draft_probs
-            logits,
-            sampling_metadata,
-        )
+            return self.rejection_sampler(
+                spec_decode_metadata,
+                None,  # draft_probs
+                logits,
+                sampling_metadata,
+            )
 
     def _bookkeeping_sync(
         self,
@@ -1219,6 +1226,11 @@ class RBLNModelRunner:
                 num_tokens_across_dp=num_tokens_across_dp,
                 num_padded_tokens=num_tokens_padded,
                 **build_kv_cache_forward_context_kwargs(self.kv_cache_bases),
+            ),
+            self.performance_ctx.profile(
+                self.is_prefill,
+                section=ProfileSection.MODEL,
+                token_count=num_scheduled_tokens,
             ),
             record_function_or_nullcontext("rbln_model_runner: forward"),
         ):

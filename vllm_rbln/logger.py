@@ -57,6 +57,25 @@ DEFAULT_LOGGIN_CONFIG: dict[str, dict[str, Any] | Any] = {
 }
 
 
+def make_file_handler(file_path: str) -> logging.FileHandler:
+    """Create a file handler using the same format as the stdout handler.
+
+    Args:
+        file_path: Destination path for the log file.
+
+    Returns:
+        A :class:`logging.FileHandler` whose output matches console output.
+
+    Example:
+        >>> logger.addHandler(make_file_handler("/tmp/metrics.log"))
+    """
+    from vllm.logging_utils import NewLineFormatter
+
+    handler = logging.FileHandler(file_path)
+    handler.setFormatter(NewLineFormatter(_FORMAT))
+    return handler
+
+
 def _configure_vllm_root_logger() -> None:
     logging_config: dict[str, dict[str, Any] | Any] = {}
 

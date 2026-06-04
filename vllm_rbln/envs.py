@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_LOGITS_ALL_GATHER: bool = True
     VLLM_RBLN_NUM_RAY_NODES: int = 1
     VLLM_RBLN_METRICS: bool = False
+    VLLM_RBLN_METRICS_FILE: str = ""
     VLLM_RBLN_NUMA: bool = True
     VLLM_RBLN_SORT_BATCH: bool = False
     VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY: str = "exponential"
@@ -182,6 +183,10 @@ environment_variables = {
     "VLLM_RBLN_METRICS": (
         lambda: os.environ.get("VLLM_RBLN_METRICS", "False").lower() in ("true", "1")
     ),
+    # Mirror the final performance report to this file (in addition to stdout).
+    # The worker pid is appended before the extension to keep TP/DP workers
+    # from clobbering each other. Empty disables file output.
+    "VLLM_RBLN_METRICS_FILE": lambda: os.environ.get("VLLM_RBLN_METRICS_FILE", ""),
     # Enable NUMA-based CPU affinity binding for OpenMP threads
     "VLLM_RBLN_NUMA": (
         lambda: os.environ.get("VLLM_RBLN_NUMA", "True").lower() in ("true", "1")
