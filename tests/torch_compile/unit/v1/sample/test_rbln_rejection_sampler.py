@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -22,10 +23,12 @@ from vllm_rbln.v1.sample.cpu_rejection_sampler import (
 from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
 from vllm_rbln.v1.sample.rbln_sampler import RBLNSampler
 
+
 @pytest.fixture(scope="module")
 def rejection_sampler(monkeypatch_module):
     monkeypatch_module.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
     from rebel.compile_context import CompileContext
+
     seed = 42
     compile_context = CompileContext(use_global_ctx=True, use_weight_sharing=True)
     sampler = RBLNSampler(
@@ -45,9 +48,17 @@ def _one_hot(target_tokens: list[int], vocab_size: int) -> torch.Tensor:
     return probs
 
 
-def _build_inputs(*, num_draft_tokens, draft_token_ids, target_tokens,
-                  max_spec_len, bonus_token_ids, vocab_size=64,
-                  top_k=None, top_p=None):
+def _build_inputs(
+    *,
+    num_draft_tokens,
+    draft_token_ids,
+    target_tokens,
+    max_spec_len,
+    bonus_token_ids,
+    vocab_size=64,
+    top_k=None,
+    top_p=None,
+):
     # NOTE: vocab_size must be a multiple of 64 because of primitive constraint
     """Build the shared argument tuple for both rejection_sample entry points.
 
@@ -93,10 +104,12 @@ def _build_inputs(*, num_draft_tokens, draft_token_ids, target_tokens,
             all_random=True,
             # temperature != 0 -> no request is treated as greedy.
             temperature=torch.ones(batch_size, dtype=torch.float32),
-            top_k=(torch.tensor(top_k, dtype=torch.int32)
-                   if top_k is not None else None),
-            top_p=(torch.tensor(top_p, dtype=torch.float32)
-                   if top_p is not None else None),
+            top_k=(
+                torch.tensor(top_k, dtype=torch.int32) if top_k is not None else None
+            ),
+            top_p=(
+                torch.tensor(top_p, dtype=torch.float32) if top_p is not None else None
+            ),
             generators={},
         )
     return (
@@ -126,9 +139,9 @@ def test_uniform_num_draft_tokens(rejection_sampler):
     RBLN output must equal the CPU reference output.
     """
     inputs = _build_inputs(
-        num_draft_tokens=[3, 3],            # identical across requests
+        num_draft_tokens=[3, 3],  # identical across requests
         draft_token_ids=[1, 2, 3, 4, 5, 6],  # packed: b0=[1,2,3], b1=[4,5,6]
-        target_tokens=[1, 2, 3, 4, 7, 0],   # b1 pos1 mismatches (7 != 5)
+        target_tokens=[1, 2, 3, 4, 7, 0],  # b1 pos1 mismatches (7 != 5)
         max_spec_len=3,
         bonus_token_ids=[9, 8],
     )
@@ -142,13 +155,14 @@ def test_varying_num_draft_tokens(rejection_sampler):
     at pos 0. RBLN output must equal the CPU reference output.
     """
     inputs = _build_inputs(
-        num_draft_tokens=[3, 0, 2],      # differ across requests
+        num_draft_tokens=[3, 0, 2],  # differ across requests
         draft_token_ids=[1, 2, 3, 4, 5],  # packed: b0=[1,2,3], b1=[], b2=[4,5]
-        target_tokens=[1, 2, 3, 6, 0],   # b2 pos0 mismatches (6 != 4)
+        target_tokens=[1, 2, 3, 6, 0],  # b2 pos0 mismatches (6 != 4)
         max_spec_len=3,
         bonus_token_ids=[9, 8, 7],
     )
     _assert_rbln_matches_cpu(rejection_sampler, inputs)
+
 
 # FIXME top-p/top-k sampling is non-deterministic.
 # So it requires multiple interations and check the stochastic distribution.
