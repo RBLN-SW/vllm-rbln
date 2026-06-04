@@ -15,10 +15,13 @@
 from typing import Union
 
 import torch
-from vllm.config import VllmConfig
+from vllm.config import ModelConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.pooler import DispatchPooler, Pooler
-from vllm.model_executor.layers.pooler.activations import PoolerNormalize
+from vllm.model_executor.layers.pooler.activations import (
+    PoolerNormalize,
+    resolve_classifier_act_fn,
+)
 from vllm.model_executor.layers.pooler.seqwise import (
     EmbeddingPoolerHead,
     SequencePooler,
@@ -44,12 +47,19 @@ _DECODER_POOLING_ARCHS = {"Qwen3Model"}
 
 class RBLNClassifierPooler(Pooler):
     """
-    A pooler for RBLN models that simply wraps pre-processed
-    hidden states into vLLM's PoolerOutput format.
+    Pooler for RBLN classify/score models.
+
+    The RBLN model already returns pooled classifier logits on-device, so no
+    pooling step is needed here. We only apply the classification activation
+    (sigmoid/softmax, resolved from the HF config exactly as vLLM's
+    ClassifierPoolerHead does) gated by PoolingParams.use_activation, so that
+    `.score()`/`.classify()` outputs match vLLM upstream semantics instead of
+    leaking raw logits.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, model_config: ModelConfig) -> None:
         super().__init__()
+        self.activation = resolve_classifier_act_fn(model_config)
 
     def get_supported_tasks(self) -> set[PoolingTask]:
         return {"classify"}
@@ -59,9 +69,14 @@ class RBLNClassifierPooler(Pooler):
         hidden_states: Union[torch.Tensor, list[torch.Tensor]],
         pooling_metadata: PoolingMetadata,
     ) -> PoolerOutput:
-        # RBLN models return already pooled/processed states for classification
-        # No additional pooling needed - just format for vllm compatibility
-        return hidden_states
+        # hidden_states are already-pooled classifier logits from the RBLN model.
+        flags = [p.use_activation for p in pooling_metadata.pooling_params]
+        if len(set(flags)) == 1:
+            return self.activation(hidden_states) if flags[0] else hidden_states
+        return [
+            self.activation(logits) if f else logits
+            for logits, f in zip(hidden_states, flags)
+        ]
 
 
 class RBLNOptimumForEncoderModel(RBLNOptimumModelBase, VllmModelForPooling):
@@ -83,7 +98,7 @@ class RBLNOptimumForEncoderModel(RBLNOptimumModelBase, VllmModelForPooling):
         if not self.is_decoder_pooling_arch():
             pooler_config.seq_pooling_type = "CLS"
         if self.is_classification_arch():
-            self.pooler = RBLNClassifierPooler()
+            self.pooler = RBLNClassifierPooler(vllm_config.model_config)
         else:
             # https://github.com/vllm-project/vllm/blob/72506c98349d6bcd32b4e33eec7b5513453c1502/docs/models/pooling_models.md?plain=1#L312
             # encode task is split into `token_embed` and `token_classify` tasks
