@@ -297,6 +297,12 @@ def _apply_grouped_topk_torch(
     G = num_expert_group
     epg = E // G  # experts per group
 
+    # Step 0: Apply scoring function on logits before grouping.
+    # For sigmoid, group scores and final routing weights must be computed
+    # from the sigmoid-activated scores (matching reference grouped_topk).
+    if scoring_func == "sigmoid":
+        router_logits_2d = router_logits_2d.sigmoid()
+
     # Step 1: Reshape to groups [T, G, E/G]
     grouped = router_logits_2d.reshape(T, G, epg)
 
