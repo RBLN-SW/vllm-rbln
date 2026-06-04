@@ -43,6 +43,9 @@ from vllm_rbln.utils.optimum.registry import (
 
 logger = init_logger(__name__)
 
+# RBLN default for an unset max_num_seqs (upstream vLLM defaults to 256).
+RBLN_DEFAULT_MAX_NUM_SEQS = 1
+
 
 def bypass_backend(graph_module: torch.fx.GraphModule, example_inputs):
     return graph_module.forward
@@ -54,13 +57,17 @@ register_backend(name="bypass", compiler_fn=bypass_backend)
 class RblnPlatform(Platform):
     _enum = PlatformEnum.OOT
 
-    # TODO(jiwoo.park): GroupCoordinator uses the device_name
-    # when torch.device(device_name) is called.
-    # But we don't support the 'rbln'' device yet.
-    # To support this, we must use PyTorch-RBLN
+    # Compute device_name/device_type/dist_backend once at class definition
+    # from env vars so that subprocesses spawned under
+    # VLLM_WORKER_MULTIPROC_METHOD=spawn (which re-import this module fresh)
+    # observe identical values to the parent without any extra plumbing.
+    _USE_DEVICE_TENSOR: bool = (
+        envs.VLLM_RBLN_USE_VLLM_MODEL and envs.VLLM_RBLN_USE_DEVICE_TENSOR
+    )
     plugin_name: str = "rbln"
-    device_name: str = "cpu"
-    device_type: str = "cpu"
+    device_name: str = "rbln" if _USE_DEVICE_TENSOR else "cpu"
+    device_type: str = "rbln" if _USE_DEVICE_TENSOR else "cpu"
+    dist_backend: str = "rbln-ccl" if _USE_DEVICE_TENSOR else ""
     dispatch_key: str = "CPU"
     ray_device_key: str = "RBLN"
     simple_compile_backend = "bypass"
@@ -73,7 +80,19 @@ class RblnPlatform(Platform):
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
-        assert (device_name := rebel.get_npu_name(device_id))
+        # rebel.get_npu_name() returns None on a host without an NPU mounted
+        # (e.g. a CPU-only compile worker) and otherwise falls back to the
+        # RBLN_TARGET_SOC env var. When it is None we cannot determine a target
+        # SOC, so surface an actionable error instead of a bare AssertionError.
+        device_name = rebel.get_npu_name(device_id)
+        if not device_name:
+            raise RuntimeError(
+                "Could not determine the RBLN NPU name "
+                f"(rebel.get_npu_name({device_id}) returned None). On a host "
+                "without an NPU mounted (e.g. a CPU-only compile worker running "
+                "with VLLM_RBLN_COMPILE_ONLY=1), set RBLN_TARGET_SOC to the "
+                "target SOC (e.g. RBLN-CA25) so compilation can target it."
+            )
         return device_name
 
     @staticmethod
@@ -98,9 +117,39 @@ class RblnPlatform(Platform):
         return "vllm_rbln.distributed.rbln_communicator.RblnCommunicator"  # noqa
 
     @classmethod
+    def _override_default_max_num_seqs(cls) -> None:
+        """Default an unset max_num_seqs to RBLN_DEFAULT_MAX_NUM_SEQS.
+
+        Wraps EngineArgs.get_batch_defaults() so RBLN's default applies to both
+        `vllm serve` and `LLM(...)`. Explicit values are not None and untouched.
+        """
+        from vllm.engine.arg_utils import EngineArgs
+
+        if getattr(EngineArgs, "_rbln_max_num_seqs_patched", False):
+            return
+
+        orig_get_batch_defaults = EngineArgs.get_batch_defaults.__func__
+
+        def get_batch_defaults(cls_, world_size):
+            from vllm.usage.usage_lib import UsageContext
+
+            default_batched_tokens, _ = orig_get_batch_defaults(cls_, world_size)
+            default_max_num_seqs = {
+                UsageContext.LLM_CLASS: RBLN_DEFAULT_MAX_NUM_SEQS,
+                UsageContext.OPENAI_API_SERVER: RBLN_DEFAULT_MAX_NUM_SEQS,
+            }
+            return default_batched_tokens, default_max_num_seqs
+
+        EngineArgs.get_batch_defaults = classmethod(get_batch_defaults)
+        EngineArgs._rbln_max_num_seqs_patched = True
+
+    @classmethod
     def pre_register_and_update(
         cls, parser: "FlexibleArgumentParser | None" = None
     ) -> None:
+        # Runs before max_num_seqs is resolved from None to its default.
+        cls._override_default_max_num_seqs()
+
         if parser is None:
             return
 
@@ -120,6 +169,32 @@ class RblnPlatform(Platform):
                 "RBLN does not officially support disabling chunked prefill. "
                 "Please don't disable chunked prefill by yourself."
             )
+
+        if envs.VLLM_RBLN_COMPILE_ONLY:
+            # Compile-only injects the compile_only torch.compile option. The
+            # optimum-rbln path is not torch.compile-based, so the flag has no
+            # meaning there and conflicts with that path; it only applies to the
+            # vLLM-native (torch.compile) path, which VLLM_RBLN_USE_VLLM_MODEL
+            # selects.
+            if not envs.VLLM_RBLN_USE_VLLM_MODEL:
+                raise ValueError(
+                    "VLLM_RBLN_COMPILE_ONLY=1 is a torch.compile option and only "
+                    "applies to the vLLM-native model path; set "
+                    "VLLM_RBLN_USE_VLLM_MODEL=1 to use it. The optimum-rbln path "
+                    "is not torch.compile-based, so compile-only conflicts with "
+                    "it."
+                )
+            if envs.VLLM_DISABLE_COMPILE_CACHE:
+                # Compile-only compiles each graph and writes the .rbln artifact
+                # to the compile cache (the runtime is built on a dummy device
+                # so no NPU is needed). With the cache disabled there is nowhere
+                # to write the artifact, so the two options are mutually
+                # exclusive.
+                raise ValueError(
+                    "VLLM_RBLN_COMPILE_ONLY=1 needs the compile cache enabled "
+                    "to write compiled artifacts to disk; do not set "
+                    "VLLM_DISABLE_COMPILE_CACHE=1 together with it."
+                )
 
         parallel_config = vllm_config.parallel_config
         use_model_parallel = (
@@ -161,16 +236,6 @@ class RblnPlatform(Platform):
 
         if envs.VLLM_RBLN_USE_VLLM_MODEL:
             cls.validate_and_setup_prerequisite(vllm_config)
-            if envs.VLLM_RBLN_USE_DEVICE_TENSOR:
-                # Use RBLN device tensors for torch.compile/runtime on the
-                # native vLLM model path.
-                RblnPlatform.device_name = "rbln"
-                RblnPlatform.device_type = "rbln"
-                RblnPlatform.dist_backend = "rbln-ccl"
-                vllm_config.device_config.device_type = RblnPlatform.device_type
-                vllm_config.device_config.device = torch.device(
-                    RblnPlatform.device_type
-                )
 
             if envs.VLLM_RBLN_ENFORCE_MODEL_FP32:
                 logger.info("original model_config.dtype = %s", model_config.dtype)
@@ -212,16 +277,18 @@ class RblnPlatform(Platform):
 
             # FIXME(jiwoo.park) This is a temporary workaround.
             if model_config.enforce_eager:
+                if not envs.VLLM_RBLN_USE_DEVICE_TENSOR:
+                    raise ValueError(
+                        "enforce_eager=True requires VLLM_RBLN_USE_DEVICE_TENSOR=1. "
+                        "Eager mode bypasses torch.compile, so ops must dispatch "
+                        "to a real device='rbln' rather than the compile-backend "
+                        "fake-CPU tensors used by the default vLLM model path."
+                    )
                 hf_config = vllm_config.model_config.hf_config
                 assert not hasattr(hf_config, "sliding_window") or not getattr(
                     hf_config, "use_sliding_window", True
                 )
 
-                RblnPlatform.device_type = "rbln"
-                vllm_config.device_config.device_type = RblnPlatform.device_type
-                vllm_config.device_config.device = torch.device(
-                    RblnPlatform.device_type
-                )
                 # NOTE - force dtype into fp16 for eager mode
                 model_config.dtype = torch.float16
 

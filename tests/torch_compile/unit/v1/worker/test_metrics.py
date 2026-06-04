@@ -12,10 +12,12 @@ Covers StepMetrics, PrefillMetricsByRequestID, and PerformanceTracker
 with focus on edge cases, statistical correctness, and error paths.
 """
 
+import os
 from unittest.mock import patch
 
 import pytest
 
+import vllm_rbln.v1.worker.metrics as metrics_module
 from vllm_rbln.v1.worker.metrics import (
     PerformanceTracker,
     PrefillMetricsByRequestID,
@@ -65,22 +67,21 @@ class TestStepMetricsAddMeasurement:
 
 
 class TestOutlierRemoval:
-    """Test _without_outlier_f and _without_outlier_i edge cases."""
+    """Test _without_outlier edge cases."""
 
     def test_empty_list(self):
         m = StepMetrics()
-        assert m._without_outlier_f([]) == []
-        assert m._without_outlier_i([]) == []
+        assert m._without_outlier([]) == []
 
     def test_single_element(self):
         m = StepMetrics()
-        assert m._without_outlier_f([42.0]) == [42.0]
-        assert m._without_outlier_i([42]) == [42]
+        assert m._without_outlier([42.0]) == [42.0]
+        assert m._without_outlier([42]) == [42]
 
     def test_two_elements_removes_farthest_from_mean(self):
         """With [1.0, 100.0], mean=50.5. Both deviate 49.5 — first max wins."""
         m = StepMetrics()
-        result = m._without_outlier_f([1.0, 100.0])
+        result = m._without_outlier([1.0, 100.0])
         # index(max(deviations)) returns 0 when deviations are equal
         assert len(result) == 1
         assert result == [100.0]
@@ -88,26 +89,26 @@ class TestOutlierRemoval:
     def test_obvious_outlier_removed(self):
         m = StepMetrics()
         values = [10.0, 10.1, 9.9, 10.0, 500.0]
-        result = m._without_outlier_f(values)
+        result = m._without_outlier(values)
         assert 500.0 not in result
         assert len(result) == 4
 
     def test_all_identical_values(self):
         """All deviations are 0 — removes first element (index 0)."""
         m = StepMetrics()
-        result = m._without_outlier_f([5.0, 5.0, 5.0])
+        result = m._without_outlier([5.0, 5.0, 5.0])
         assert len(result) == 2
         assert all(v == 5.0 for v in result)
 
     def test_negative_values(self):
         m = StepMetrics()
-        result = m._without_outlier_f([-100.0, 1.0, 2.0, 3.0])
+        result = m._without_outlier([-100.0, 1.0, 2.0, 3.0])
         assert -100.0 not in result
         assert len(result) == 3
 
     def test_outlier_removal_int(self):
         m = StepMetrics()
-        result = m._without_outlier_i([10, 11, 9, 10, 999])
+        result = m._without_outlier([10, 11, 9, 10, 999])
         assert 999 not in result
         assert len(result) == 4
 
@@ -423,3 +424,44 @@ class TestPrintFinalStats:
         pt.record_decode(0.01, 1, padded_decode=True)
         # Should not raise
         pt.print_final_stats()
+
+
+class TestMetricsFileOutput:
+    """Verify VLLM_RBLN_METRICS_FILE mirrors the final report to a file."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_handler_state(self):
+        metrics_module._metrics_file_attached = False
+        original = list(metrics_module.logger.handlers)
+        yield
+        for handler in list(metrics_module.logger.handlers):
+            if handler not in original:
+                metrics_module.logger.removeHandler(handler)
+                handler.close()
+        metrics_module._metrics_file_attached = False
+
+    def test_no_file_when_env_unset(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("VLLM_RBLN_METRICS_FILE", raising=False)
+        pt = PerformanceTracker("MODEL")
+        pt.record_prefill(0.5, 100, request_ids=["req-1"])
+        pt.print_final_stats()
+        assert list(tmp_path.iterdir()) == []
+
+    def test_writes_pid_suffixed_file(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("VLLM_RBLN_METRICS_FILE", str(tmp_path / "metrics.log"))
+        pt = PerformanceTracker("MODEL")
+        pt.record_prefill(0.5, 100, request_ids=["req-1"])
+        pt.print_final_stats()
+        expected = tmp_path / f"metrics.{os.getpid()}.log"
+        assert expected.exists()
+        content = expected.read_text()
+        assert "FINAL PERFORMANCE STATISTICS [MODEL]" in content
+        assert "PREFILL METRICS" in content
+
+    def test_handler_attached_once(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("VLLM_RBLN_METRICS_FILE", str(tmp_path / "metrics.log"))
+        before = len(metrics_module.logger.handlers)
+        pt = PerformanceTracker("MODEL")
+        pt.print_final_stats()
+        pt.print_final_stats()
+        assert len(metrics_module.logger.handlers) - before == 1
