@@ -405,7 +405,6 @@ def custom_moe_swiglu_group_dequantize(
     down_proj_scale: torch.Tensor,
     masked_routing_weights: torch.Tensor,
     group_size: torch.Tensor,
-    e_score_correction_bias: torch.Tensor | None = None,
     gate_proj_bias: torch.Tensor | None = None,
     up_proj_bias: torch.Tensor | None = None,
     down_proj_bias: torch.Tensor | None = None,
@@ -431,7 +430,6 @@ def custom_moe_swiglu_group_dequantize(
     - masked_routing_weights: [num_experts, num_tokens]
       (token dim may be padded to 64-align)
     - group_size: group size for weight scale
-    - e_score_correction_bias: unused (kept for compiler index compatibility)
     - gate_proj_bias: [num_experts, intermediate_size]
     - up_proj_bias: [num_experts, intermediate_size]
     - down_proj_bias: [num_experts, hidden_size]
@@ -545,7 +543,6 @@ def custom_moe_swiglu_group_dequantize_fake(
     down_proj_scale: torch.Tensor,
     masked_routing_weights: torch.Tensor,
     group_size: torch.Tensor,
-    e_score_correction_bias: torch.Tensor | None = None,
     gate_proj_bias: torch.Tensor | None = None,
     up_proj_bias: torch.Tensor | None = None,
     down_proj_bias: torch.Tensor | None = None,
@@ -884,7 +881,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 down_proj_weight_scale,
                 masked_routing_weights,
                 torch.tensor(self.weight_block_size[1], dtype=torch.int32),
-                None,  # e_score_correction_bias (routing done externally)
                 None,  # gate_proj_bias
                 None,  # up_proj_bias
                 None,  # down_proj_bias

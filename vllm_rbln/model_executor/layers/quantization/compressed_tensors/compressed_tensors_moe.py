@@ -235,7 +235,6 @@ class CompressedTensorsW8A16Fp8MoEMethod(upstream.CompressedTensorsMoEMethod):
                 down_proj_weight_scale,
                 masked_routing_weights,
                 torch.tensor(group_size, dtype=torch.int32),
-                None,  # e_score_correction_bias (routing done externally)
                 None,  # gate_proj_bias
                 None,  # up_proj_bias
                 None,  # down_proj_bias
