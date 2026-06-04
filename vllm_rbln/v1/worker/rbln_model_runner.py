@@ -1928,8 +1928,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # > num_reqs), and RBLNRejectionSampler derives both the per-request
         # (bonus) and per-token (target) shapes from the *original* per-request
         # SamplingMetadata. Padding it there mis-sizes the bonus temperature
-        # broadcast and trips expand_batch_to_tokens. See
-        # docs/spec_decode_device_tensor_pad_fix.md.
+        # broadcast and trips expand_batch_to_tokens.
         if (
             envs.VLLM_RBLN_USE_DEVICE_TENSOR
             and spec_decode_metadata is None

@@ -24,7 +24,7 @@ broadcast and hid the bug.
 
 This test drives >= 2 concurrent requests (``max_num_seqs >= 2``) with repeated
 n-grams (so the ngram proposer actually drafts) and asserts the engine no
-longer crashes. See docs/spec_decode_device_tensor_pad_fix.md.
+longer crashes.
 """
 
 from __future__ import annotations
