@@ -143,6 +143,7 @@ def rbln_random_sample(
 class RBLNRejectionSampler(RejectionSampler):
     def __init__(self, *args, **kwargs):
         seed = kwargs.pop("seed", None)
+        assert seed is not None, "seed cannot be None."
         compile_context = kwargs.pop("compile_context", None)
         super().__init__(*args, **kwargs)
         rebel.manual_seed(seed)

@@ -320,6 +320,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             logger.info("Using default vLLM sampler.")
             sampler = Sampler(logprobs_mode=self.model_config.logprobs_mode)
 
+        # FIXME not compiled?
         self.sampler = sampler
 
         # Lazy initialization
