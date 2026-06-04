@@ -25,7 +25,28 @@ def parse_args():
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--block-size", type=int, default=1024)
     parser.add_argument("--enable-expert-parallel", action="store_true")
+    parser.add_argument("--apply-chat-template", action="store_true")
     return parser.parse_args()
+
+
+def _format_prompts_for_model(
+    tokenizer, prompts: list[str], use_chat_template: bool
+) -> list[str]:
+    if not use_chat_template:
+        return prompts
+    if not getattr(tokenizer, "chat_template", None):
+        raise ValueError(
+            "Tokenizer has no chat_template; omit --apply-chat-template or use an "
+            "instruct-tuned checkpoint."
+        )
+    return [
+        tokenizer.apply_chat_template(
+            [{"role": "user", "content": text}],
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+        for text in prompts
+    ]
 
 
 def main():
@@ -52,12 +73,16 @@ def main():
         enable_expert_parallel=args.enable_expert_parallel,
     )
 
+    tokenizer = llm.get_tokenizer()
+    raw_prompts = _format_prompts_for_model(
+        tokenizer, prompts, use_chat_template=args.apply_chat_template
+    )
+
     # Generate texts from the prompts. The output is a list of RequestOutput
     # objects that contain the prompt, generated text, and other information.
-    outputs = llm.generate(prompts, SamplingParams(temperature=0.0))
+    outputs = llm.generate(raw_prompts, SamplingParams(temperature=0.0))
     # Print the outputs.
-    for output in outputs:
-        prompt = output.prompt
+    for output, prompt in zip(outputs, prompts):
         generated_text = output.outputs[0].text
         print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
 

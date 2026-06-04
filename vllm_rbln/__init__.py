@@ -58,9 +58,11 @@ def register_ops():
         import vllm_rbln.model_executor.layers.quantization.fp8  # noqa
         import vllm_rbln.model_executor.layers.rotary_embedding.base  # noqa
         import vllm_rbln.model_executor.layers.rotary_embedding.deepseek_scaling_rope  # noqa
+        import vllm_rbln.model_executor.layers.rotary_embedding.gemma4_rope  # noqa
         import vllm_rbln.model_executor.layers.vocab_parallel_embedding  # noqa
         import vllm_rbln.model_executor.model_loader.weight_loader  # noqa
         import vllm_rbln.models.deepseek_v2  # noqa
+        import vllm_rbln.models.gemma4  # noqa
         import vllm_rbln.models.gpt_oss  # noqa
         import vllm_rbln.models.qwen2  # noqa
         import vllm_rbln.models.qwen2_moe  # noqa
