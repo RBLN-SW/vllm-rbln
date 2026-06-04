@@ -379,7 +379,16 @@ class RBLNRejectionSampler(RejectionSampler):
         positions = torch.arange(
             max_spec_len, device=output_token_ids.device
         ).unsqueeze(0)  # (1, K)
-        all_accepted_active = (num_accepted_per_batch == max_spec_len) & active_mask
+        # NOTE: all-accept is per-row: a row accepted ALL of ITS OWN drafts
+        # (num_draft_tokens[i], which may be < max_spec_len).
+        num_draft_tokens_t = torch.tensor(
+            num_draft_tokens,
+            dtype=num_accepted_per_batch.dtype,
+            device=output_token_ids.device,
+        )
+        all_accepted_active = (
+            num_accepted_per_batch == num_draft_tokens_t
+        ) & active_mask
 
         # 3a) Accepted positions: write the draft token unchanged.
         accepted_pos_mask = positions < num_accepted_per_batch.unsqueeze(1)  # (B, K)
@@ -409,8 +418,14 @@ class RBLNRejectionSampler(RejectionSampler):
         # cast like basic-slice assignment), so cast to output_token_ids dtype.
         bonus = bonus_token_ids.squeeze(-1).to(output_token_ids.dtype)
 
-        # 4a) Fully-accepted active rows: emit the bonus token at the last col.
-        output_token_ids[all_accepted_active, -1] = bonus[all_accepted_active]
+        # 4a) Fully-accepted active rows: emit the bonus token right after the
+        # row's own last draft (column num_draft_tokens[i], == max_spec_len
+        # only for full rows) — mirrors the upstream Triton kernel.
+        batch_idx = torch.arange(batch_size, device=output_token_ids.device)
+        output_token_ids[
+            batch_idx[all_accepted_active],
+            num_draft_tokens_t[all_accepted_active],
+        ] = bonus[all_accepted_active]
         # 4b) Inactive rows (no drafts): only the bonus token at col 0.
         output_token_ids[~active_mask, 0] = bonus[~active_mask]
         # FIXME For now, to be consistent with the cpu sampler..
