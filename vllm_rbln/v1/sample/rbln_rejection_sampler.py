@@ -56,15 +56,15 @@ def rejection_sample(
       draft_token_ids     : (B*K,)   int32
       target_probs        : (B*K, V) f16 / f32  (one-hot for greedy, scaled
                                                  logits otherwise)
-      cu_num_draft_tokens : (B,)     int  — cumulative end offsets, cu[-1] = N
-      top_k               : (B,)     int  | None
+      cu_num_draft_tokens : (B,)     int32  — cumulative end offsets, cu[-1] = N
+      top_k               : (B,)     int32  | None
       top_p               : (B,)     f32  | None
 
     Outputs (per-batch padded layout):
-      out_tokens   : (B, K) int32  — recovered token at the first-reject slot.
+      out_tokens   : (B, K) int64  — recovered token at the first-reject slot.
                                      Other positions are filler; the caller
                                      masks them by num_accepted.
-      num_accepted : (B,)   int32  — count of consecutive accepts before the
+      num_accepted : (B,)   int64  — count of consecutive accepts before the
                                      first reject (== n_i when all accepted).
 
     Per-row sampling delegates to `apply_top_k_top_p`. Per-batch top_k / top_p
@@ -86,8 +86,8 @@ def rejection_sample(
     sampled = sampled.view(B, K).to(torch.int32)
     drafts = draft_token_ids.view(B, K).to(torch.int32)
 
-    out_tokens = torch.zeros((B, K), dtype=torch.int32, device=device)
-    num_accepted = torch.zeros((B,), dtype=torch.int32, device=device)
+    out_tokens = torch.zeros((B, K), dtype=torch.int64, device=device)
+    num_accepted = torch.zeros((B,), dtype=torch.int64, device=device)
 
     cu = cu_num_draft_tokens.to(torch.int64).tolist()
     for i in range(B):
@@ -115,8 +115,8 @@ def rejection_sample_fake(
     B = cu_num_draft_tokens.shape[0]
     K = draft_token_ids.shape[0] // B
     device = draft_token_ids.device
-    out_tokens = torch.empty((B, K), dtype=torch.int32, device=device)
-    num_accepted = torch.empty((B,), dtype=torch.int32, device=device)
+    out_tokens = torch.empty((B, K), dtype=torch.int64, device=device)
+    num_accepted = torch.empty((B,), dtype=torch.int64, device=device)
     return out_tokens, num_accepted
 
 
@@ -127,14 +127,14 @@ def rbln_random_sample(
     top_k: torch.Tensor | None,
     top_p: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    output_tokens, acceptance_rate = torch.ops.rbln.rejection_sample(
+    out_tokens, acceptance_rate = torch.ops.rbln.rejection_sample(
         draft_token_ids,
         target_probs,
         cu_num_draft_tokens,
         top_k,
         top_p,
     )
-    return output_tokens, acceptance_rate
+    return out_tokens, acceptance_rate
 
 
 # TODO(RBLN): Enable RBLNSampler for
@@ -235,8 +235,12 @@ class RBLNRejectionSampler(RejectionSampler):
         )
 
         # Compute probability distribution from target logits.
-        # target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
-        target_probs = target_logits.to(torch.float32)
+        if sampling_metadata.all_greedy:
+            # For greedy decoding, `target_logits` is already a one-hot tensor
+            # where the max logit is set to 1 and the rest are set to 0.
+            target_probs = target_logits
+        else:
+            target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
 
         output_token_ids = self.rejection_sample(
             metadata.draft_token_ids,
@@ -278,7 +282,7 @@ class RBLNRejectionSampler(RejectionSampler):
         draft_probs: torch.Tensor | None,
         # [num_tokens, vocab_size]
         target_probs: torch.Tensor,
-        # [batch_size, 1]
+        # [batch_size, 1], int32
         bonus_token_ids: torch.Tensor,
         sampling_metadata: SamplingMetadata,
     ) -> torch.Tensor:
@@ -323,16 +327,15 @@ class RBLNRejectionSampler(RejectionSampler):
             batch_size * max_spec_len, dtype=torch.int32
         )
         reshaped_target_probs = torch.zeros(
-            batch_size * max_spec_len, vocab_size, dtype=torch.float16
+            batch_size * max_spec_len, vocab_size, dtype=target_probs.dtype
         )
-        reshaped_draft_token_ids[:N] = draft_token_ids.to(torch.int32)
-        # FIXME float16
-        reshaped_target_probs[:N] = target_probs.to(torch.float16)
+        reshaped_draft_token_ids[:N] = draft_token_ids
+        reshaped_target_probs[:N] = target_probs
 
         # Per-batch padded view of drafts for the scatter in section 3a. NPU's
         # input is packed-then-padded, but `output_token_ids` is per-batch
         # padded, so we materialize a (B, K) view that aligns row-by-row with
-        # `selected_token_ids` and `output_token_ids`.
+        # `recovered_token_ids` and `output_token_ids`.
         draft_per_batch = torch.full(
             (batch_size, max_spec_len),
             PLACEHOLDER_TOKEN_ID,
@@ -343,9 +346,7 @@ class RBLNRejectionSampler(RejectionSampler):
         for i, n in enumerate(num_draft_tokens):
             if n == 0:
                 continue
-            draft_per_batch[i, :n] = draft_token_ids[src_offset : src_offset + n].to(
-                torch.int64
-            )
+            draft_per_batch[i, :n] = draft_token_ids[src_offset : src_offset + n]
             src_offset += n
 
         # NPU primitive expects cu_num_draft_tokens in int32; vLLM hands it
@@ -355,11 +356,11 @@ class RBLNRejectionSampler(RejectionSampler):
         # ------------------------------------------------------------------
         # 2) Call the NPU primitive.
         # Returns:
-        #   selected_token_ids : (B, K) int — per-batch padded recovered tokens.
+        #   recovered_token_ids : (B, K) int — per-batch padded recovered tokens.
         #   num_accepted       : (B,)   int — per-batch number of accepted draft
         #                                     tokens (in [0, num_draft_tokens[i]]).
         # ------------------------------------------------------------------
-        selected_token_ids, num_accepted = self.compiled_rejection_sample(
+        recovered_token_ids, num_accepted = self.compiled_rejection_sample(
             reshaped_draft_token_ids,
             reshaped_target_probs,
             cu_num_draft_tokens_i32,
@@ -373,7 +374,7 @@ class RBLNRejectionSampler(RejectionSampler):
         #      j == num_accepted[i] (active) -> NPU-recovered token from target
         #      j > num_accepted[i]          -> PLACEHOLDER (left untouched)
         # ------------------------------------------------------------------
-        num_accepted_per_batch = num_accepted.reshape(batch_size).to(torch.int64)
+        num_accepted_per_batch = num_accepted.reshape(batch_size)
         positions = torch.arange(
             max_spec_len, device=output_token_ids.device
         ).unsqueeze(0)  # (1, K)
@@ -395,7 +396,7 @@ class RBLNRejectionSampler(RejectionSampler):
         )  # (B, K)
         output_token_ids[:, :max_spec_len] = torch.where(
             recovered_pos_mask,
-            selected_token_ids.to(torch.int64),
+            recovered_token_ids,
             output_token_ids[:, :max_spec_len],
         )
 
@@ -403,14 +404,17 @@ class RBLNRejectionSampler(RejectionSampler):
         # 4) Scatter the bonus token into `output_token_ids`.
         # ------------------------------------------------------------------
         # [batch_size, 1] -> [batch_size]
-        bonus = bonus_token_ids.squeeze(-1).to(torch.int64)
+        # NOTE: boolean-mask index_put below requires dtype match (it does NOT
+        # cast like basic-slice assignment), so cast to output_token_ids dtype.
+        bonus = bonus_token_ids.squeeze(-1).to(output_token_ids.dtype)
 
         # 4a) Fully-accepted active rows: emit the bonus token at the last col.
         output_token_ids[all_accepted_active, -1] = bonus[all_accepted_active]
-
         # 4b) Inactive rows (no drafts): only the bonus token at col 0.
         output_token_ids[~active_mask, 0] = bonus[~active_mask]
-        return output_token_ids
+        # FIXME For now, to be consistent with the cpu sampler..
+        result = output_token_ids.to(torch.int32)
+        return result
 
 
 # NOTE(RBLN): This function was copied without modification to replace

@@ -119,7 +119,6 @@ class CPURejectionSampler(RejectionSampler):
         )
         # Compute probability distribution from target logits.
         target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
-
         output_token_ids = rejection_sample(
             metadata.draft_token_ids,
             metadata.num_draft_tokens,
@@ -178,7 +177,6 @@ def rejection_sample(
     assert target_probs.is_contiguous()
     assert bonus_token_ids.is_contiguous()
     assert target_probs.shape == (num_tokens, vocab_size)
-
     # Create output buffer.
     output_token_ids = torch.full(
         (batch_size, max_spec_len + 1),
