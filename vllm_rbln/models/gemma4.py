@@ -19,6 +19,7 @@ from itertools import islice
 from typing import Any
 
 import torch
+import vllm.model_executor.layers.rotary_embedding as rotary_embedding
 from torch import nn
 from transformers import AutoConfig, PretrainedConfig
 from transformers.tokenization_utils_base import AddedToken, PreTrainedTokenizerBase
@@ -42,7 +43,6 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -364,7 +364,7 @@ class Gemma4Attention(nn.Module):
                 )
                 self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
 
-        self.rotary_emb = get_rope(
+        self.rotary_emb = rotary_embedding.get_rope(
             self.head_dim,
             max_position=max_position_embeddings,
             rope_parameters=rope_parameters,
