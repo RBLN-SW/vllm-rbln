@@ -120,6 +120,14 @@ def is_arch_supported(
     config: PretrainedConfig, model_set: dict[str, tuple[str, str]]
 ) -> bool:
     architectures = getattr(config, "architectures", [])
+    import vllm.model_executor.models as me_models
+    registry = me_models.ModelRegistry
+    # if architectures is not registry.get_supported_archs():
+    #     raise ValueError(
+    #         f"Model architectures {architectures} are not supported on upstream vLLM "
+    #         f"for now. Supported architectures: "
+    #         f"{registry.get_supported_archs()}"
+    #     )
     return any(
         arch in _RBLN_SUPPORTED_MODELS and arch in model_set for arch in architectures
     )
