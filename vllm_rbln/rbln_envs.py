@@ -254,7 +254,11 @@ environment_variables = {
     ),
     # Auto port
     "VLLM_RBLN_AUTO_PORT": (
-        lambda: os.environ.get("VLLM_RBLN_AUTO_PORT", "False").lower() in ("true", "1")
+        lambda: os.environ.get(
+            "VLLM_RBLN_AUTO_PORT",
+            os.environ.get("VLLM_RBLN_USE_DEVICE_TENSOR", "False"),
+        ).lower()
+        in ("true", "1")
     ),
     # Decode batch bucket manual buckets
     "VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS": get_decode_batch_bucket_manual_buckets,  # noqa E501
