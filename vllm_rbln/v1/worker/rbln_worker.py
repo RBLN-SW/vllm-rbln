@@ -95,7 +95,7 @@ class RBLNWorker(WorkerBase):
             distributed_init_method=distributed_init_method,
             is_driver_worker=is_driver_worker,
         )
-        self.device = torch.device(current_platform.device_type)
+        self.device = self.device_config.device
 
         self.local_world_size = (
             self.parallel_config.world_size // envs.VLLM_RBLN_NUM_RAY_NODES

@@ -14,9 +14,8 @@
 
 import pytest
 import torch
-from vllm import LLM
 
-from .utils import patch_and_run
+from ..utils import managed_llm
 
 LLM_PARAMS = [
     {
@@ -34,7 +33,17 @@ def get_detailed_instruct(task_description: str, query: str) -> str:
     return f"Instruct: {task_description}\nQuery:{query}"
 
 
-def run_vllm_score(llm_kwargs: dict) -> None:
+@pytest.mark.parametrize("llm_params", LLM_PARAMS)
+def test_pooling_model_embed(
+    monkeypatch: pytest.MonkeyPatch,
+    llm_params: dict,
+) -> None:
+    env = {
+        "VLLM_RBLN_USE_VLLM_MODEL": "1",
+        "VLLM_DISABLE_COMPILE_CACHE": "1",
+        "VLLM_RBLN_COMPILE_STRICT_MODE": "1",
+    }
+
     task = "Given a query, retrieve relevant passages that answer the query"
 
     queries = [
@@ -50,37 +59,18 @@ def run_vllm_score(llm_kwargs: dict) -> None:
     ]
     input_prompts = queries + documents
 
-    try:
-        llm = LLM(runner="pooling", **llm_kwargs)
-
+    with managed_llm(monkeypatch, env, runner="pooling", **llm_params) as llm:
         outputs = llm.embed(input_prompts)
-        embeddings = torch.tensor([o.outputs.embedding for o in outputs])
-        scores = embeddings[:2] @ embeddings[2:].T
+    embeddings = torch.tensor([o.outputs.embedding for o in outputs])
+    scores = embeddings[:2] @ embeddings[2:].T
 
-        assert scores[0][0] > scores[0][1], (
-            f'The score between the "{queries[0]}" and the "{documents[0]}" '
-            f'should be larger than the score between the "{queries[0]}" '
-            f'and the "{documents[1]}".'
-        )
-        assert scores[1][0] < scores[1][1], (
-            f'The score between the "{queries[1]}" and the "{documents[0]}" '
-            f'should be smaller than the score between the "{queries[1]}" '
-            f'and the "{documents[1]}".'
-        )
-
-    except Exception as e:
-        raise e
-
-
-@pytest.mark.parametrize("llm_params", LLM_PARAMS)
-def test_pooling_model_embed(
-    monkeypatch: pytest.MonkeyPatch,
-    llm_params: dict,
-) -> None:
-    env = {
-        "VLLM_RBLN_USE_VLLM_MODEL": "1",
-        "VLLM_DISABLE_COMPILE_CACHE": "1",
-        "VLLM_RBLN_COMPILE_STRICT_MODE": "1",
-    }
-
-    patch_and_run(monkeypatch, env, run_vllm_score, llm_kwargs=llm_params)
+    assert scores[0][0] > scores[0][1], (
+        f'The score between the "{queries[0]}" and the "{documents[0]}" '
+        f'should be larger than the score between the "{queries[0]}" '
+        f'and the "{documents[1]}".'
+    )
+    assert scores[1][0] < scores[1][1], (
+        f'The score between the "{queries[1]}" and the "{documents[0]}" '
+        f'should be smaller than the score between the "{queries[1]}" '
+        f'and the "{documents[1]}".'
+    )

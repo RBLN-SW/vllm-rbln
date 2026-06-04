@@ -12,12 +12,39 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from collections import defaultdict
 from dataclasses import dataclass, field
+from typing import TypeVar
 
-from vllm_rbln.logger import init_logger
+import vllm_rbln.rbln_envs as envs
+from vllm_rbln.logger import init_logger, make_file_handler
 
 logger = init_logger(__name__)
+
+T = TypeVar("T", int, float)
+
+_metrics_file_attached = False
+
+
+def _attach_metrics_file_handler() -> None:
+    """Mirror metrics output to VLLM_RBLN_METRICS_FILE if configured.
+
+    The configured path is suffixed with the worker pid so concurrent workers
+    (TP/DP) write to separate files instead of clobbering one another. Runs at
+    most once; a failure to open the file is logged and stdout output is kept.
+    """
+    global _metrics_file_attached
+    if _metrics_file_attached or not envs.VLLM_RBLN_METRICS_FILE:
+        return
+    _metrics_file_attached = True
+    root, ext = os.path.splitext(envs.VLLM_RBLN_METRICS_FILE)
+    path = f"{root}.{os.getpid()}{ext}"
+    try:
+        logger.addHandler(make_file_handler(path))
+    except OSError as e:
+        _metrics_file_attached = False
+        logger.warning("Failed to open metrics file %s: %s", path, e)
 
 
 @dataclass
@@ -29,6 +56,7 @@ class StepMetrics:
     host_times: list[int] = field(default_factory=list)
     device_times: list[int] = field(default_factory=list)
     ccl_times: list[int] = field(default_factory=list)
+    prepare_times: list[int] = field(default_factory=list)
 
     def add_measurement(
         self,
@@ -37,6 +65,7 @@ class StepMetrics:
         host_time: int | None = None,
         device_time: int | None = None,
         ccl_time: int | None = None,
+        prepare_time: int | None = None,
     ):
         """Add a latency, token count, and timing measurements."""
         self.latencies.append(latency)
@@ -47,17 +76,10 @@ class StepMetrics:
             self.device_times.append(device_time)
         if ccl_time is not None:
             self.ccl_times.append(ccl_time)
+        if prepare_time is not None:
+            self.prepare_times.append(prepare_time)
 
-    def _without_outlier_f(self, values: list[float]) -> list[float]:
-        """Return values excluding one outlier (max absolute deviation)."""
-        if len(values) <= 1:
-            return values
-        mean = sum(values) / len(values)
-        deviations = [abs(v - mean) for v in values]
-        max_idx = deviations.index(max(deviations))
-        return [v for i, v in enumerate(values) if i != max_idx]
-
-    def _without_outlier_i(self, values: list[int]) -> list[int]:
+    def _without_outlier(self, values: list[T]) -> list[T]:
         """Return values excluding one outlier (max absolute deviation)."""
         if len(values) <= 1:
             return values
@@ -70,9 +92,7 @@ class StepMetrics:
         """Get average latency in milliseconds,
         optionally ignoring one outlier."""
         values = (
-            self._without_outlier_f(self.latencies)
-            if ignore_outlier
-            else self.latencies
+            self._without_outlier(self.latencies) if ignore_outlier else self.latencies
         )
         return sum(values) / len(values) * 1000 if values else 0.0
 
@@ -82,12 +102,10 @@ class StepMetrics:
         if not self.latencies or not self.token_counts:
             return 0.0
         latencies = (
-            self._without_outlier_f(self.latencies)
-            if ignore_outlier
-            else self.latencies
+            self._without_outlier(self.latencies) if ignore_outlier else self.latencies
         )
         tokens = (
-            self._without_outlier_i(self.token_counts)
+            self._without_outlier(self.token_counts)
             if ignore_outlier
             else self.token_counts
         )
@@ -99,7 +117,7 @@ class StepMetrics:
         """Get average host time in microseconds,
         optionally ignoring one outlier."""
         values = (
-            self._without_outlier_i(self.host_times)
+            self._without_outlier(self.host_times)
             if ignore_outlier
             else self.host_times
         )
@@ -109,7 +127,7 @@ class StepMetrics:
         """Get average device time in microseconds,
         optionally ignoring one outlier."""
         values = (
-            self._without_outlier_i(self.device_times)
+            self._without_outlier(self.device_times)
             if ignore_outlier
             else self.device_times
         )
@@ -119,9 +137,17 @@ class StepMetrics:
         """Get average ccl time in microseconds,
         optionally ignoring one outlier."""
         values = (
-            self._without_outlier_i(self.ccl_times)
+            self._without_outlier(self.ccl_times) if ignore_outlier else self.ccl_times
+        )
+        return sum(values) / len(values) if values else 0.0
+
+    def get_avg_prepare_time(self, ignore_outlier: bool = True) -> float:
+        """Get average prepare time (PrepareInputs + PrepareOutputs around Run)
+        in microseconds, optionally ignoring one outlier."""
+        values = (
+            self._without_outlier(self.prepare_times)
             if ignore_outlier
-            else self.ccl_times
+            else self.prepare_times
         )
         return sum(values) / len(values) if values else 0.0
 
@@ -147,6 +173,10 @@ class StepMetrics:
                 )
             if self.ccl_times:
                 logger.info("  Average ccl time: %.2f us", self.get_avg_ccl_time())
+            if self.prepare_times:
+                logger.info(
+                    "  Average prepare time: %.2f us", self.get_avg_prepare_time()
+                )
         else:
             logger.info("%s METRICS: No data recorded", stat_type)
 
@@ -165,10 +195,16 @@ class PrefillMetricsByRequestID:
         host_time: int | None = None,
         device_time: int | None = None,
         ccl_time: int | None = None,
+        prepare_time: int | None = None,
     ):
         """Add a latency and token count measurement."""
         self.metrics[request_id].add_measurement(
-            latency, token_count, host_time, device_time, ccl_time
+            latency,
+            token_count,
+            host_time,
+            device_time,
+            ccl_time,
+            prepare_time,
         )
 
     def get_avg_latency_per_request(self) -> dict[str, float]:
@@ -207,6 +243,7 @@ class PerformanceTracker:
         host_time: int | None = None,
         device_time: int | None = None,
         ccl_time: int | None = None,
+        prepare_time: int | None = None,
         request_ids: list[str] | None = None,
     ):
         """Record prefill step metrics."""
@@ -220,11 +257,22 @@ class PerformanceTracker:
             )
             request_id = request_ids[0]
         self.prefill_metrics.add_measurement(
-            latency, token_count, host_time, device_time, ccl_time
+            latency,
+            token_count,
+            host_time,
+            device_time,
+            ccl_time,
+            prepare_time,
         )
         if request_id:
             self.prefill_metrics_by_request_id.add_measurement(
-                request_id, latency, token_count, host_time, device_time, ccl_time
+                request_id,
+                latency,
+                token_count,
+                host_time,
+                device_time,
+                ccl_time,
+                prepare_time,
             )
 
     def record_decode(
@@ -234,6 +282,7 @@ class PerformanceTracker:
         host_time: int | None = None,
         device_time: int | None = None,
         ccl_time: int | None = None,
+        prepare_time: int | None = None,
         padded_decode: bool = False,
         request_ids: list[str] | None = None,
     ):
@@ -241,9 +290,17 @@ class PerformanceTracker:
         if self.check_dummy_request(request_ids):
             return
         metrics = self.padded_decode_metrics if padded_decode else self.decode_metrics
-        metrics.add_measurement(latency, token_count, host_time, device_time, ccl_time)
+        metrics.add_measurement(
+            latency,
+            token_count,
+            host_time,
+            device_time,
+            ccl_time,
+            prepare_time,
+        )
 
     def print_final_stats(self):
+        _attach_metrics_file_handler()
         logger.info("=" * 80)
         if self.name:
             logger.info("FINAL PERFORMANCE STATISTICS [%s]", self.name)
@@ -276,10 +333,15 @@ def collect_metrics(
     host_time = None
     device_time = None
     ccl_time = None
+    prepare_time = None
     if reports is not None and len(reports) > 0:
         host_time = reports[0].get("total_host", None)
         device_time = reports[0].get("total_device", None)
         ccl_time = reports[0].get("total_ccl", None)
+    if reports is not None and len(reports) > 1:
+        prepare_time = reports[1].get("prepare_input_us", 0) + reports[1].get(
+            "prepare_output_us", 0
+        )
     if is_prefill:
         performance_tracker.record_prefill(
             execution_time,
@@ -287,6 +349,7 @@ def collect_metrics(
             host_time=host_time,
             device_time=device_time,
             ccl_time=ccl_time,
+            prepare_time=prepare_time,
         )
     else:
         performance_tracker.record_decode(
@@ -295,4 +358,5 @@ def collect_metrics(
             host_time=host_time,
             device_time=device_time,
             ccl_time=ccl_time,
+            prepare_time=prepare_time,
         )
