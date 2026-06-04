@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_MOE_REDUCE_SCATTER: bool = False
     VLLM_RBLN_SUB_BLOCK_CACHE: bool = True
     VLLM_RBLN_USE_DEVICE_TENSOR: bool = False
+    VLLM_RBLN_COMPILE_ONLY: bool = False
 
 
 def get_dp_impl() -> str:
@@ -284,6 +285,17 @@ environment_variables = {
         lambda: (
             os.environ.get("VLLM_RBLN_USE_DEVICE_TENSOR", "False").lower()
             in ("true", "1")
+        )
+    ),
+    # Compile-only mode for NPU-less (CPU-only) hosts such as CI build workers.
+    # When set, the rbln torch.compile backend compiles + caches each graph and
+    # builds its runtime on a dummy device (no NPU required); the populated
+    # cache is later reused by a real NPU host via cache-hit. The target SOC is
+    # taken from rebel.get_npu_name(), which falls back to RBLN_TARGET_SOC, so
+    # set RBLN_TARGET_SOC (e.g. RBLN-CA25) on a host without an NPU mounted.
+    "VLLM_RBLN_COMPILE_ONLY": (
+        lambda: (
+            os.environ.get("VLLM_RBLN_COMPILE_ONLY", "False").lower() in ("true", "1")
         )
     ),
 }
