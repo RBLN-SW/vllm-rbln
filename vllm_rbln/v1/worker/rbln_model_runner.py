@@ -1814,37 +1814,52 @@ class RBLNModelRunner:
 
     @torch.inference_mode()
     def _dummy_sampler_run(self, num_reqs: int) -> None:
+        from vllm_rbln.v1.sample import WARM_UP_CONFIGS
+
         logits = torch.randn(
             (num_reqs, self.model_config.get_vocab_size()),
             device=self.device,
             dtype=self.dtype,
         )
-
-        dummy_tensors = lambda v: torch.full((num_reqs,), v, device=self.device)
-        dummy_metadata = SamplingMetadata(
-            temperature=None,
-            all_greedy=True,
-            all_random=False,
-            top_p=None,
-            top_k=None,
-            generators={},
-            max_num_logprobs=None,
-            no_penalties=True,
-            prompt_token_ids=None,
-            frequency_penalties=dummy_tensors(0.1),
-            presence_penalties=dummy_tensors(0.1),
-            repetition_penalties=dummy_tensors(0.1),
-            output_token_ids=[],
-            allowed_token_ids_mask=None,
-            bad_words_token_ids={},
-            logitsprocs=LogitsProcessors(),
-            spec_token_ids=[[] for _ in range(num_reqs)],
+        dummy_tensors = (
+            lambda v: torch.full((num_reqs,), v, device=self.device)
+            if v is not None
+            else None
         )
 
-        _ = self.sampler(
-            logits=logits,
-            sampling_metadata=dummy_metadata,
-        )
+        for config in WARM_UP_CONFIGS:
+            dummy_metadata = SamplingMetadata(
+                temperature=dummy_tensors(config.get("temperature")),
+                all_greedy=config.get("all_greedy", True),
+                all_random=config.get("all_random", False),
+                top_p=dummy_tensors(config.get("top_p")),
+                top_k=dummy_tensors(config.get("top_k")),
+                generators={},
+                max_num_logprobs=None,
+                no_penalties=config.get("no_penalties", True),
+                prompt_token_ids=torch.zeros(
+                    (num_reqs, 1), dtype=torch.long, device=self.device
+                )
+                if not config.get("no_penalties", True)
+                else None,
+                frequency_penalties=dummy_tensors(
+                    config.get("frequency_penalties", 0.1)
+                ),
+                presence_penalties=dummy_tensors(config.get("presence_penalties", 0.1)),
+                repetition_penalties=dummy_tensors(
+                    config.get("repetition_penalties", 0.1)
+                ),
+                output_token_ids=[],
+                allowed_token_ids_mask=None,
+                bad_words_token_ids={},
+                logitsprocs=LogitsProcessors(),
+                spec_token_ids=[[] for _ in range(num_reqs)],
+            )
+
+            _ = self.sampler(
+                logits=logits,
+                sampling_metadata=dummy_metadata,
+            )
 
     def initialize_attn_backend(self, kv_cache_config: KVCacheConfig) -> None:
         """
