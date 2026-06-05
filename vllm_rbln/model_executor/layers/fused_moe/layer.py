@@ -571,6 +571,11 @@ def compute_masked_routing_weights(
             scores_for_topk = scores_t + e_score_correction_bias.unsqueeze(1)
         _, selected_experts = torch.topk(scores_for_topk, k=self.top_k, dim=0)
         topk_weights = scores_t.gather(0, selected_experts)
+        # clamp_min epsilon (1e-20, hard-coded) guards against division by
+        # zero when all selected weights sum to 0. 1e-20 is below the
+        # representable range of low-precision dtypes, so it is
+        # saturated to the smallest representable positive value
+        # instead of rounding to 0, preserving the div-by-zero guard.
         topk_weights = topk_weights / topk_weights.sum(
             dim=0, keepdim=True
         ).clamp_min(1e-20)
