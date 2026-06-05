@@ -5267,7 +5267,10 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 dst_block_ids: list[int],
                 direction: Literal["h2d", "d2h"],
             ) -> None:
-                """Copy kv blocks between different buffers."""
+                """Copy kv blocks between host xfer buffer and device kv
+                cache. Splits K/V (dim 0) first so each per-block view
+                is contiguous, hitting `_copy_from_rbln`'s direct-DMA
+                fast path. Requires VLLM_RBLN_USE_DEVICE_TENSOR=1."""
                 if (
                     not src_kv_caches
                     or not dst_kv_caches
@@ -5280,19 +5283,13 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     f"src_block_ids: {src_block_ids}"
                     f"dst_block_ids: {dst_block_ids}"
                 )
-                assert len(self.runtime_holder) > 0, "Runtime holder is not initialized"
-                runtime = self.runtime_holder[0]
-                if direction == "h2d":
-                    kv_caches = src_kv_caches
-                    copy_fn = runtime._update_kv_cache
-                else:
-                    kv_caches = dst_kv_caches
-                    copy_fn = runtime._fetch_kv_cache
-
-                for idx in src_block_ids:
-                    for kv_name, kv_cache in kv_caches.items():
-                        block_size = kv_cache.shape[-2]
-                        copy_fn(kv_cache, idx, 0, block_size, kv_name)
+                for layer_name, dst_cache in dst_kv_caches.items():
+                    src_cache = src_kv_caches[layer_name]
+                    for kv in range(dst_cache.shape[0]):
+                        dst_kv = dst_cache[kv]
+                        src_kv = src_cache[kv]
+                        for idx in src_block_ids:
+                            dst_kv[idx].copy_(src_kv[idx])
 
             kv_transfer_group.set_host_xfer_buffer_ops(rbln_copy_kv_blocks)
 
