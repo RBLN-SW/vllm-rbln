@@ -30,6 +30,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
     KVConnectorRole,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1 import nixl_connector
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl_connector import (
     NixlAgentMetadata,
     NixlConnector,
@@ -51,6 +52,20 @@ logger = init_logger(__name__)
 
 
 class RblnNixlConnector(NixlConnector):
+    """RBLN's NIXL KV connector. A single `RblnNixlConnectorWorker` runs
+    both paths and branches internally on
+    `kv_transfer_config.kv_buffer_device`:
+
+    * `"cpu"`  → host-bounce: page-aligned host staging, RDMA over DRAM
+      via the RBLN NIXL backend's `ibv_reg_mr` path.
+    * `"rbln"` → D2D: RBLN NIXL backend's `ibv_reg_dmabuf_mr` path on
+      the device memory exported by the `nixl_rbln` adapter; no host
+      staging.
+
+    Both paths use the same RBLN backend / RDMA NICs; the only
+    difference is which memory segment (DRAM_SEG vs VRAM_SEG) is
+    registered. Both require `VLLM_RBLN_USE_DEVICE_TENSOR=1`."""
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -60,10 +75,13 @@ class RblnNixlConnector(NixlConnector):
         KVConnectorBase_V1.__init__(self, vllm_config, role, kv_cache_config)
         assert vllm_config.kv_transfer_config is not None
         assert vllm_config.kv_transfer_config.engine_id is not None
-        assert vllm_config.kv_transfer_config.kv_buffer_device != "rbln", (
-            "RblnNixlConnector is host-bounce only (kv_buffer_device='cpu'). "
-            "For device-to-device (kv_buffer_device='rbln') use "
-            "RblnNixlDirectConnector."
+        kv_buffer_device = vllm_config.kv_transfer_config.kv_buffer_device
+        assert kv_buffer_device in ("cpu", "rbln"), (
+            "RblnNixlConnector requires kv_buffer_device in "
+            f"{{'cpu', 'rbln'}}; got {kv_buffer_device!r}."
+        )
+        assert envs.VLLM_RBLN_USE_DEVICE_TENSOR, (
+            "RblnNixlConnector requires VLLM_RBLN_USE_DEVICE_TENSOR=1."
         )
         self.kv_cache_config = kv_cache_config
         self.engine_id: EngineId = vllm_config.kv_transfer_config.engine_id
@@ -78,6 +96,19 @@ class RblnNixlConnector(NixlConnector):
             self.connector_worker = RblnNixlConnectorWorker(
                 vllm_config, self.engine_id, kv_cache_config
             )
+
+    def finalize_kv_cache_registration(self) -> None:
+        """Run the worker's deferred NIXL registration after warm-up
+        materializes the KV cache backing memory. No-op on host-bounce."""
+        if self.connector_worker is not None:
+            self.connector_worker.finalize_kv_cache_registration()
+
+    def set_runtime_holder(self, runtime_holder) -> None:
+        """Forward the runner's runtime_holder to the worker. The D2D
+        path reads the RblnContext pointer from it in
+        `_register_kv_caches_impl`."""
+        if self.connector_worker is not None:
+            self.connector_worker._runtime_holder = runtime_holder
 
 
 class RblnNixlConnectorScheduler(NixlConnectorScheduler):
@@ -256,16 +287,33 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
     def __init__(
         self, vllm_config: VllmConfig, engine_id: str, kv_cache_config: "KVCacheConfig"
     ) -> None:
-        # NOTE: the kv_buffer_device guard now lives on the *connector*
-        # __init__ (RblnNixlConnector rejects "rbln", RblnNixlDirectConnector
-        # requires it). Keeping it off the worker lets
-        # RblnNixlDirectConnectorWorker subclass this worker without
-        # inheriting an assert that would reject its own ("rbln") buffer.
         super().__init__(vllm_config, engine_id, kv_cache_config)
+
+        # Both paths transport via the RBLN NIXL backend. The plugin
+        # advertises DRAM_SEG (host pinned MR via ibv_reg_mr) and
+        # VRAM_SEG (device dmabuf via ibv_reg_dmabuf_mr) — host-bounce
+        # uses the former, D2D the latter.
+        try:
+            import nixl_rbln  # noqa: F401
+        except ImportError as e:
+            raise RuntimeError(
+                "RblnNixlConnectorWorker requires the 'nixl-rbln' adapter "
+                f"package. (import failed: {e})"
+            ) from e
+        self.nixl_backends = ["RBLN"]
 
         # `RblnPlatform.device_type = "cpu"` makes upstream skip the host
         # buffer; restore it — NIXL cannot register RBLN device memory.
         self.use_host_buffer = self.kv_buffer_device == "cpu"
+
+        # D2D registers VRAM (device dmabuf); host-bounce keeps DRAM.
+        if self.kv_buffer_device == "rbln":
+            self.nixl_memory_type = "VRAM"
+
+        # D2D-only state, declared on both paths so set_runtime_holder /
+        # finalize_kv_cache_registration can access without a getattr probe.
+        self._runtime_holder: list | None = None
+        self._pending_kv_caches: dict[str, torch.Tensor] | None = None
 
         # Pin to logical values. Upstream would otherwise multiply by the
         # attention backend's kernel ratio, which doesn't reflect per-spec
@@ -295,6 +343,40 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
                 "real runs."
             )
 
+    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
+        """Wire KV caches into NIXL.
+
+        D2D (`kv_buffer_device="rbln"`): stash and defer; backing memory
+        isn't materialized until warm-up. Backend creation happens in
+        `_register_kv_caches_impl` via `nixl_rbln.register_kv_regions`.
+
+        Host-bounce (`kv_buffer_device="cpu"`): create the RBLN backend
+        on the agent so upstream's `register_memory(..., backends=["RBLN"])`
+        resolves, then run the standard registration. Per-worker process
+        sees exactly one rbln device via `RBLN_DEVICES`, so device 0 is
+        always the local one.
+        """
+        if self.kv_buffer_device == "rbln":
+            self._pending_kv_caches = kv_caches
+            logger.info(
+                "RblnNixlConnectorWorker (D2D): deferring registration of "
+                "%d KV cache layer(s) until after warm-up.",
+                len(kv_caches),
+            )
+            return
+        import nixl_rbln
+        nixl_rbln.ensure_rbln_backend(self.nixl_wrapper, device_id=0)
+        super().register_kv_caches(kv_caches)
+
+    def finalize_kv_cache_registration(self) -> None:
+        """Run the deferred D2D registration. No-op on host-bounce and
+        on re-entry (idempotent via `_pending_kv_caches`)."""
+        if self._pending_kv_caches is None:
+            return
+        pending = self._pending_kv_caches
+        self._pending_kv_caches = None
+        self._register_kv_caches_impl(pending)
+
     def initialize_host_xfer_buffer(self, kv_caches: dict[str, torch.Tensor]) -> None:
         """Allocate one rebel-aligned host buffer per layer.
 
@@ -315,38 +397,48 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
         )
         xfer_buffers: dict[str, torch.Tensor] = {}
 
+        def _aligned_like(kv_cache: torch.Tensor) -> torch.Tensor:
+            """Page-aligned host buffer with `kv_cache`'s shape and dtype.
+            `aligned_tensor` only knows fp16 (numpy has no bfloat16), so
+            we size by byte count and view-cast to the target dtype."""
+            bytes_needed = kv_cache.numel() * kv_cache.element_size()
+            assert bytes_needed % 2 == 0, (
+                "kv_cache byte footprint must be a multiple of 2 "
+                f"(aligned_tensor backing dtype), got {bytes_needed}"
+            )
+            raw_fp16 = aligned_tensor(bytes_needed // 2)
+            return raw_fp16.view(kv_cache.dtype).view(kv_cache.shape)
+
         emulate = (
             envs.VLLM_RBLN_NIXL_EMULATE_HOST_XFER_NOOP
             or envs.VLLM_RBLN_NIXL_EMULATE_REMOTE_XFER_NOOP
         )
         try:
             if emulate and kv_caches:
-                # All filtered layers must share the same shape — assert
-                # rather than handle heterogeneous shapes implicitly.
+                # All filtered layers must share the same shape and dtype.
                 items = list(kv_caches.items())
                 first_name, first_cache = items[0]
                 first_shape = first_cache.shape
+                first_dtype = first_cache.dtype
                 for name, kv in items[1:]:
-                    assert kv.shape == first_shape, (
-                        "Emulation expects uniform host_xfer_buffer shape "
+                    assert kv.shape == first_shape and kv.dtype == first_dtype, (
+                        "Emulation expects uniform host_xfer_buffer shape/dtype "
                         "across layers; got "
-                        f"{tuple(first_shape)} for {first_name!r} vs "
-                        f"{tuple(kv.shape)} for {name!r}"
+                        f"{tuple(first_shape)}/{first_dtype} for {first_name!r} vs "
+                        f"{tuple(kv.shape)}/{kv.dtype} for {name!r}"
                     )
-                shared = aligned_tensor(first_cache.numel()).reshape(first_shape)
+                shared = _aligned_like(first_cache)
                 for layer_name, _ in items:
                     xfer_buffers[layer_name] = shared
                 logger.info(
                     "Emulation: host xfer buffers share one %.1f MB "
                     "allocation across %d layer(s).",
-                    first_cache.numel() * shared.element_size() / (1024 * 1024),
+                    shared.numel() * shared.element_size() / (1024 * 1024),
                     len(kv_caches),
                 )
             else:
                 for layer_name, kv_cache in kv_caches.items():
-                    xfer_buffers[layer_name] = aligned_tensor(
-                        kv_cache.numel()
-                    ).reshape(kv_cache.shape)
+                    xfer_buffers[layer_name] = _aligned_like(kv_cache)
         except MemoryError as e:
             logger.error("RblnNixlConnectorWorker gets %s", e)
             raise
@@ -439,3 +531,171 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
         # creates an empty handle list, which `_pop_done_transfers` reports
         # as completed on the next `get_finished` poll.
         _ = self._recving_transfers[request_id]
+
+    def _register_kv_caches_impl(self, kv_caches: dict[str, torch.Tensor]) -> None:
+        """Direct variant of NixlConnectorWorker.register_kv_caches:
+        build the upstream topology, hand the logical K/V regions to
+        `nixl_rbln.register_kv_regions` (address translation, sharding,
+        MR reg), and feed the returned transfer tables into the base
+        transfer state.
+        """
+        import nixl_rbln
+
+        self.kv_topo = nixl_connector.TpKVTopology(
+            tp_rank=self.tp_rank,
+            engine_id=self.engine_id,
+            remote_tp_size=self._tp_size,
+            remote_block_size=self._block_size,
+            is_mla=self.use_mla,
+            total_num_kv_heads=self.model_config.get_total_num_kv_heads(),
+            attn_backends=self.attn_backends,
+            tensor_shape=next(iter(kv_caches.values())).shape
+            if not self._has_mamba
+            else None,
+            is_mamba=self._has_mamba,
+        )
+        self.compat_hash = nixl_connector.compute_nixl_compatibility_hash(
+            self.vllm_config, self.backend_name, self.kv_topo.cross_layers_blocks
+        )
+
+        # Device id for the RBLN backend's RblnContext.
+        device_id = next(iter(kv_caches.values())).get_device()
+        assert device_id >= 0, (
+            "RblnNixlConnectorWorker (D2D): KV cache is not an 'rbln' "
+            "device tensor (is VLLM_RBLN_USE_DEVICE_TENSOR=1 set?)."
+        )
+
+        # Direct path never stages through a host buffer.
+        assert not self.use_host_buffer
+        xfer_buffers = kv_caches
+        assert not self.host_xfer_buffers, (
+            "host_xfer_buffer should not be initialized when "
+            f"kv_buffer_device is {self.kv_buffer_device}"
+        )
+
+        logger.info(
+            "Registering KV_Caches (direct). use_mla: %s, "
+            "kv_buffer_device: %s, device_id: %d",
+            self.use_mla,
+            self.kv_buffer_device,
+            device_id,
+        )
+
+        tensor_size_bytes = None
+        # Logical K/V regions (entry_tensor, byte_offset, full_block_len)
+        # for nixl-rbln.
+        regions: list[tuple[Any, int, int]] = []
+        for layer_name, cache_or_caches in xfer_buffers.items():
+            layer_spec = self._layer_specs[layer_name]
+            if isinstance(layer_spec, nixl_connector.UniformTypeKVCacheSpecs):
+                layer_spec = layer_spec.kv_cache_specs[layer_name]
+            cache_list = self.kv_topo.get_transfer_cache_regions(
+                cache_or_caches, layer_spec
+            )
+            physical_page_size = (
+                layer_spec.page_size_bytes
+                if isinstance(layer_spec, nixl_connector.MambaSpec)
+                else layer_spec.page_size_bytes
+                // self._physical_blocks_per_logical_kv_block
+            )
+            # For when registering multiple tensors eg K/V in separate
+            # regions.
+            physical_page_size = physical_page_size // len(cache_list)
+            if self.kv_topo._cross_layers_blocks:
+                physical_page_size = physical_page_size * len(
+                    self.kv_cache_config.kv_cache_tensors
+                )
+            num_blocks = (
+                self._logical_num_blocks
+                if isinstance(layer_spec, nixl_connector.MambaSpec)
+                else self.num_blocks
+            )
+            curr_tensor_size_bytes = num_blocks * physical_page_size
+            if tensor_size_bytes is None:
+                tensor_size_bytes = curr_tensor_size_bytes
+
+            # Materialize the backing memory of kv_cache.
+            cache_or_caches.zero_()
+
+            # Collect this entry's logical K/V regions.
+            entry_base_addr = cache_or_caches.data_ptr()
+            for cache in cache_list:
+                region_offset = cache.data_ptr() - entry_base_addr
+                if isinstance(layer_spec, nixl_connector.MambaSpec):
+                    full_block_len = (
+                        physical_page_size
+                        // self._physical_blocks_per_logical_kv_block
+                    )
+                else:
+                    full_block_len = physical_page_size
+
+                assert cache.shape[0] == num_blocks, (
+                    "All kv cache tensors must have the same number of blocks"
+                )
+                if not self.use_mla:
+                    assert tensor_size_bytes == curr_tensor_size_bytes, (
+                        "All kv cache tensors must have the same size"
+                    )
+                regions.append((cache_or_caches, region_offset, full_block_len))
+
+        assert self._runtime_holder, (
+            "RblnNixlConnectorWorker (D2D): runtime_holder not set — "
+            "RBLNModelRunner must propagate it via set_runtime_holder "
+            "before registration."
+        )
+        rbln_ctx_ptr = (
+            self._runtime_holder[0]._runtime_handle.get_context().rbln_ctx_ptr
+        )
+
+        # Delegate sharding and MR registration to nixl-rbln. It registers
+        # one whole-entry MR per shard and returns the transfer tables
+        # (base addrs + block lens), already shard-expanded so the base
+        # connector's descriptor math is correct without this connector
+        # knowing the shard count.
+        xfer = nixl_rbln.register_kv_regions(
+            self.nixl_wrapper, regions, device_id, mem=self.nixl_memory_type,
+            rbln_ctx_ptr=rbln_ctx_ptr,
+        )
+        self.device_id = device_id
+        self.block_len_per_layer = list(xfer.block_lens)
+        self.kv_caches_base_addr[self.engine_id][self.tp_rank] = xfer.base_addrs
+        self._registered_descs.append(xfer.reg_handle)
+        assert len(self.block_len_per_layer) == len(xfer.base_addrs)
+
+        self.num_regions = len(xfer.base_addrs)
+        if self.kv_topo.is_kv_layout_blocks_first:
+            self.num_regions *= 2
+        self.num_descs = self.num_regions * self.num_blocks
+
+        logger.info(
+            "RblnNixlConnectorWorker (D2D): registered %d transfer "
+            "region(s) across %d shard(s) (K/V split).",
+            self.num_regions, xfer.n_shards,
+        )
+
+        self.device_kv_caches = kv_caches
+        self.dst_num_blocks[self.engine_id] = self.num_blocks
+
+        # Register local/src descr for NIXL xfer.
+        self.src_xfer_handles_by_block_size[self.block_size], self.src_blocks_data = (
+            self.register_local_xfer_handler(self.block_size)
+        )
+
+        # After KV Caches registered, listen for new connections.
+        agent_metadata = nixl_connector.NixlAgentMetadata(
+            engine_id=self.engine_id,
+            agent_metadata=self.nixl_wrapper.get_agent_metadata(),
+            device_id=self.device_id,
+            kv_caches_base_addr=self.kv_caches_base_addr[self.engine_id][self.tp_rank],
+            num_blocks=self.num_blocks,
+            block_lens=self.block_len_per_layer,
+            kv_cache_layout=self.kv_cache_layout,
+            block_size=self.block_size,
+            ssm_sizes=self._mamba_ssm_size,
+        )
+        assert self.compat_hash is not None
+        encoder = nixl_connector.msgspec.msgpack.Encoder()
+        self.xfer_handshake_metadata = nixl_connector.NixlHandshakePayload(
+            compatibility_hash=self.compat_hash,
+            agent_metadata_bytes=encoder.encode(agent_metadata),
+        )
