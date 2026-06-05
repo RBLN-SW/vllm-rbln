@@ -55,7 +55,7 @@ class TestDeferredRegistration:
 
     def test_register_defers_until_finalize(self):
         worker = _create_direct_worker()
-        impl_calls = []
+        impl_calls: list[dict] = []
         worker._register_kv_caches_impl = impl_calls.append
 
         kv_caches = {"layer.0": MagicMock()}
@@ -72,7 +72,7 @@ class TestDeferredRegistration:
 
     def test_finalize_is_idempotent(self):
         worker = _create_direct_worker()
-        impl_calls = []
+        impl_calls: list[dict] = []
         worker._register_kv_caches_impl = impl_calls.append
         worker.register_kv_caches({"layer.0": MagicMock()})
 
@@ -83,7 +83,7 @@ class TestDeferredRegistration:
 
     def test_finalize_without_pending_is_noop(self):
         worker = _create_direct_worker()
-        impl_calls = []
+        impl_calls: list[dict] = []
         worker._register_kv_caches_impl = impl_calls.append
 
         worker.finalize_kv_cache_registration()
@@ -148,10 +148,11 @@ def test_platform_supports_rbln_kv_buffer_for_nixl():
 
 
 def test_direct_connector_registered_in_factory():
-    import vllm_rbln.distributed.kv_transfer.kv_connector.factory  # noqa: F401
     from vllm.distributed.kv_transfer.kv_connector.factory import (
         KVConnectorFactory,
     )
+
+    import vllm_rbln.distributed.kv_transfer.kv_connector.factory  # noqa: F401
 
     cls = KVConnectorFactory.get_connector_class_by_name("RblnNixlDirectConnector")
     assert cls is RblnNixlDirectConnector
