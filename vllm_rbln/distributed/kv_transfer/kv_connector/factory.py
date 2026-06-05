@@ -20,11 +20,6 @@ KVConnectorFactory.register_connector(
     "RblnNixlConnector",
 )
 KVConnectorFactory.register_connector(
-    "RblnNixlDirectConnector",
-    "vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl_direct_connector",
-    "RblnNixlDirectConnector",
-)
-KVConnectorFactory.register_connector(
     "RBLNLMCacheConnectorV1",
     "vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_lmcache_connector",
     "RBLNLMCacheConnectorV1",
