@@ -15,7 +15,12 @@
 import os
 
 import torch
-from compressed_tensors.compressors.quantized_compressors import unpack_from_int32
+try:
+    from compressed_tensors.compressors.quantized_compressors import unpack_from_int32
+except ModuleNotFoundError as e:
+    if e.name != "compressed_tensors.compressors.quantized_compressors":
+        raise
+    from compressed_tensors.compressors.pack_quantized.helpers import unpack_from_int32
 from vllm.model_executor.kernels.linear import (  # noqa: E501
     MPLinearKernel,
     MPLinearLayerConfig,

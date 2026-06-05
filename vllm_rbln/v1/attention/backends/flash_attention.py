@@ -1361,13 +1361,15 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         kv_cache: torch.Tensor,
         attn_metadata: RBLNFlashAttentionMetadata,
         output: torch.Tensor | None = None,
+        output_scale: torch.Tensor | None = None,
+        output_block_scale: torch.Tensor | None = None
     ) -> torch.Tensor:
         """Forward pass with xFormers and PagedAttention.
 
         Args:
-            query:  shape = [num_tokens, num_heads * head_size]
-            key:    shape = [num_tokens, num_kv_heads * head_size]
-            value:  shape = [num_tokens, num_kv_heads * head_size]
+            query:  shape = [num_tokens, num_heads, head_size]
+            key:    shape = [num_tokens, num_kv_heads, head_size]
+            value:  shape = [num_tokens, num_kv_heads, head_size]
             kv_cache shape= [2, num_blocks,
                                 block_size * num_kv_heads * head_size]
 
@@ -1390,12 +1392,29 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         # C - max_seq_len
         # NB- num batch
 
+        if output_scale is not None or output_block_scale is not None:
+            raise NotImplementedError(
+                "fused output quantization is not yet supported"
+                " for RBLNFlashAttentionImpl"
+            )
+
         # 1. query reshape for custom operation
-        # query = [b_size(batch), q_len(query len), num_heads * head_size]
-        b_size, q_len, _ = query.size()
-        query = query.view(b_size, q_len, self.num_heads, self.head_size).transpose(
-            1, 2
-        )
+        # vLLM v1 uses a flattened (varlen) layout: query/key/value arrive as
+        # [num_tokens, num_heads, head_size] where num_tokens is the total
+        # number of tokens across all requests in the batch (concatenated and
+        # delineated by query_start_loc), NOT [batch, q_len, hidden].
+        #
+        # RBLN custom ops expect an explicit [batch, H, G, L, D] layout, so we
+        # map num_tokens -> (batch, query_len) using the prefill/decode split:
+        #   - prefill: a single sequence per step, so batch=1, q_len=num_tokens
+        #   - decode : one query token per request, so batch=num_tokens, q_len=1
+        num_tokens = query.shape[0]
+        if attn_metadata.is_prefill:
+            b_size, q_len = 1, num_tokens
+        else:
+            b_size, q_len = num_tokens, 1
+        query = query.view(b_size, q_len, self.num_heads, self.head_size)
+        query = query.transpose(1, 2)
         query = query.view(
             b_size, self.num_kv_heads, self.num_queries_per_kv, q_len, self.head_size
         )
@@ -1731,20 +1750,29 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                     )
 
         # 2. attention output reshape for attention backend return
-        # attn_output = [batch,H*4,L,D] -> [batch,L,H*4,D] -> [batch,L,H*4*D]
+        # attn_output = [batch, H*G, L, D] -> [batch, L, H*G, D]
+        # -> [num_tokens, H*G*D] to match vLLM v1's flattened layout.
         if self.enforce_eager or not envs.VLLM_RBLN_COMPILE_MODEL:
             attn_output = attn_output.reshape(
                 b_size, self.num_heads, q_len, self.head_size
             ).transpose(1, 2)
             attn_output = attn_output.reshape(
-                b_size, q_len, self.num_heads * self.head_size
+                num_tokens, self.num_heads * self.head_size
             )
         else:
             attn_output = attn_output.view(
                 b_size, self.num_heads, q_len, self.head_size
             ).transpose(1, 2)
-            attn_output = attn_output.view(
-                b_size, q_len, self.num_heads * self.head_size
+            attn_output = attn_output.reshape(
+                num_tokens, self.num_heads * self.head_size
             )
-        # attn_output = [batch,L,H*4*D]
+
+        # vLLM v1 ignores the return value of impl.forward() and instead reads
+        # the pre-allocated `output` buffer (shape [num_tokens, num_heads,
+        # head_size]). Write the result in-place so the caller sees it.
+        if output is not None:
+            output.reshape(num_tokens, self.num_heads * self.head_size).copy_(
+                attn_output
+            )
+            return output
         return attn_output

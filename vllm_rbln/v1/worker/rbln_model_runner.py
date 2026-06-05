@@ -150,6 +150,7 @@ from vllm_rbln.v1.worker.utils import get_kv_cache_names
 if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
     from vllm.v1.core.sched.output import GrammarOutput
+    from vllm.v1.worker.block_table import MultiGroupBlockTable
 
 logger = init_logger(__name__)
 
@@ -423,7 +424,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             vocab_size=self.model_config.get_vocab_size(),
             block_sizes=[self.cache_config.block_size],
             kernel_block_sizes=[self.cache_config.block_size],
-            is_spec_decode=bool(self.vllm_config.speculative_config),
+            num_spec_tokens=self.num_spec_tokens,
             logitsprocs=build_logitsprocs(
                 self.vllm_config,
                 self.device,
@@ -1171,6 +1172,36 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         return encoder_seq_lens
 
+    def _compute_slot_mapping(
+        self,
+        block_table: "MultiGroupBlockTable",
+        req_indices: np.ndarray,
+        positions_np: np.ndarray,
+        num_tokens: int,
+    ) -> None:
+        """Compute slot mapping on CPU for each KV cache group.
+
+        vLLM >=0.22 replaced the numpy slot-mapping computation with a Triton
+        kernel that runs on GPU tensors (``BlockTable.compute_slot_mapping`` now
+        takes ``(num_reqs, query_start_loc, positions)``). RBLN has no Triton
+        backend and runs on CPU, so we reimplement the original numpy logic and
+        copy the result into the buffer the rest of the runner reads from
+        (``slot_mapping.gpu``).
+        """
+        for blk_table in block_table.block_tables:
+            block_table_indices = (
+                req_indices * blk_table.max_num_blocks_per_req
+                + positions_np // blk_table.block_size
+            )
+            block_numbers = blk_table.block_table.np.ravel()[block_table_indices]
+            block_offsets = positions_np % blk_table.block_size
+            np.add(
+                block_numbers * blk_table.block_size,
+                block_offsets,
+                out=blk_table.slot_mapping.np[: req_indices.shape[0]],
+            )
+            blk_table.slot_mapping.copy_to_gpu(num_tokens)
+
     def _prepare_inputs(
         self,
         scheduler_output: SchedulerOutput,
@@ -1267,8 +1298,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             out=self.input_ids.cpu[:total_query_tokens],
         )
 
-        self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
-        self.input_batch.block_table.commit_slot_mapping(total_query_tokens)
+        self._compute_slot_mapping(
+            self.input_batch.block_table,
+            req_indices,
+            positions_np,
+            total_num_scheduled_tokens,
+        )
 
         # Prepare the attention metadata.
         self.query_start_loc.np[0] = 0
@@ -2480,8 +2515,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             out=input_ids[:total_num_scheduled_tokens],
         )
 
-        input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
-        input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
+        self._compute_slot_mapping(
+            input_batch.block_table,
+            req_indices,
+            positions_np,
+            total_num_scheduled_tokens,
+        )
 
         query_start_loc_np = self.query_start_loc.np.copy()
         query_start_loc_np[0] = 0
@@ -2627,7 +2666,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             vocab_size=self.model_config.get_vocab_size(),
             block_sizes=[self.cache_config.block_size],
             kernel_block_sizes=[self.cache_config.block_size],
-            is_spec_decode=bool(self.vllm_config.speculative_config),
+            num_spec_tokens=self.num_spec_tokens,
             logitsprocs=build_logitsprocs(
                 self.vllm_config,
                 self.device,
@@ -2665,7 +2704,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 block_sizes=block_sizes,
                 kernel_block_sizes=kernel_block_sizes,
                 max_num_blocks_per_req=max_num_blocks,
-                is_spec_decode=bool(self.vllm_config.speculative_config),
+                num_spec_tokens=self.num_spec_tokens,
                 logitsprocs=dummy_input_batch.logitsprocs,
                 logitsprocs_need_output_token_ids=dummy_input_batch.logitsprocs_need_output_token_ids,
                 is_pooling_model=self.is_pooling_model,
@@ -4550,7 +4589,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 block_sizes=block_sizes,
                 kernel_block_sizes=kernel_block_sizes,
                 max_num_blocks_per_req=max_num_blocks,
-                is_spec_decode=bool(self.vllm_config.speculative_config),
+                num_spec_tokens=self.num_spec_tokens,
                 logitsprocs=self.input_batch.logitsprocs,
                 logitsprocs_need_output_token_ids=self.input_batch.logitsprocs_need_output_token_ids,
                 is_pooling_model=self.is_pooling_model,

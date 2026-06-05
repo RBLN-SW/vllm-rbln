@@ -35,6 +35,7 @@ from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 # ---------------------------------------------------------------------------
 _upstream_init = Attention.__init__
 _upstream_get_kv_cache_spec = Attention.get_kv_cache_spec
+_upstream_forward = Attention.forward
 
 
 def _rbln_attention_init(self, *args, **kwargs) -> None:
@@ -71,23 +72,6 @@ def _resolve_kv_cache(attn_metadata, layer_index: int) -> torch.Tensor:
     return attn_metadata.kv_caches[layer_index]
 
 
-def _rbln_unified_attention(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    layer_name: str,
-) -> torch.Tensor:
-    attn_metadata, self, _kv_cache, _ = get_attention_context(layer_name)
-
-    # NOTE(RBLN) - To represent kv cache as model input,
-    # modify attention instead of using the attention layer's embedded
-    # kv cache (self.kv_cache); use attention metadata's kv cache.
-    # attention metadata's kv cache must equal the attention layer's
-    # embedded kv cache.
-    kv_cache = _resolve_kv_cache(attn_metadata, self.layer_index)
-
-    output = self.impl.forward(self, query, key, value, kv_cache, attn_metadata)
-    return output
 
 
 def _rbln_unified_attention_with_output(
@@ -125,6 +109,42 @@ def _rbln_unified_attention_with_output(
     )
 
 
+def _rbln_attention_forward(
+    self,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    output_shape: torch.Size | None = None,
+) -> torch.Tensor:
+    """Bridge RBLN's batched layout to vLLM v1's flattened attention path.
+
+    The RBLN model runner feeds the model a batched ``[batch, seq, hidden]``
+    layout (see the ``view(num_reqs, -1)`` workaround in the model runner and
+    the decode batch padding on dim -2). vLLM v1's ``Attention.forward``, on the
+    other hand, assumes a flattened ``[num_tokens, hidden]`` layout: it derives
+    ``num_tokens = query.shape[0]`` and allocates the ``output`` buffer from it.
+
+    With a 3D input, ``query.shape[0]`` is the batch size (e.g. 1 for prefill),
+    so the output buffer is sized for a single token while the actual query has
+    ``batch * seq`` tokens, raising:
+        RuntimeError: shape '[130, 2048]' is invalid for input of size 2048
+
+    To keep RBLN's batched design intact, flatten the leading dims before
+    delegating to the upstream forward (which sizes ``output`` correctly and
+    calls the impl with a flattened query), then restore the batched shape.
+    """
+    if query.dim() <= 2:
+        return _upstream_forward(self, query, key, value, output_shape)
+
+    leading_dims = query.shape[:-1]
+    query_2d = query.reshape(-1, query.shape[-1])
+    key_2d = key.reshape(-1, key.shape[-1]) if key is not None else key
+    value_2d = value.reshape(-1, value.shape[-1]) if value is not None else value
+
+    output = _upstream_forward(self, query_2d, key_2d, value_2d, output_shape)
+    return output.reshape(*leading_dims, output.shape[-1])
+
+
 def _rbln_get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
     # Block size may get updated after model loading, refresh it
     block_size = vllm_config.cache_config.block_size
@@ -151,10 +171,10 @@ def _rbln_get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         )
 
 
-vllm_attn.unified_attention = maybe_transfer_kv_layer(_rbln_unified_attention)
 vllm_attn.unified_attention_with_output = maybe_transfer_kv_layer(
     _rbln_unified_attention_with_output
 )
 
 Attention.__init__ = _rbln_attention_init
 Attention.get_kv_cache_spec = _rbln_get_kv_cache_spec
+Attention.forward = _rbln_attention_forward

@@ -223,13 +223,13 @@ def _set_forward_context(
         )
 
     forward_context = create_forward_context(
-        attn_metadata,
-        vllm_config,
-        virtual_engine,
-        dp_metadata,
-        cudagraph_runtime_mode,
-        batch_descriptor,
-        ubatch_slices,
+        attn_metadata=attn_metadata,
+        vllm_config=vllm_config,
+        dp_metadata=dp_metadata,
+        cudagraph_runtime_mode=cudagraph_runtime_mode,
+        batch_descriptor=batch_descriptor,
+        ubatch_slices=ubatch_slices,
+        additional_kwargs=additional_kwargs,
     )
     if additional_kwargs:
         existing_additional_kwargs = getattr(forward_context, "additional_kwargs", None)

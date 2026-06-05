@@ -15,6 +15,43 @@
 import vllm_rbln.rbln_envs as envs
 
 
+def _try_import_optional(module_name: str):
+    import importlib
+
+    from vllm_rbln.logger import init_logger
+
+    logger = init_logger(__name__)
+    try:
+        importlib.import_module(module_name)
+    except (ImportError, AttributeError) as e:
+        logger.warning("[RBLN] Skipping optional patch %s: %s", module_name, e)
+
+
+def _patch_cleanup_dist_env_and_memory():
+    from vllm.v1.engine import core as engine_core
+    from vllm_rbln.logger import init_logger
+
+    if getattr(engine_core, "_rbln_cleanup_patched", False):
+        return
+
+    logger = init_logger(__name__)
+    orig_cleanup = engine_core.cleanup_dist_env_and_memory
+
+    def cleanup_dist_env_and_memory(*args, **kwargs):
+        try:
+            return orig_cleanup(*args, **kwargs)
+        except RuntimeError as e:
+            if "Cannot access accelerator device when none is available" not in str(e):
+                raise
+            logger.debug(
+                "Skipping accelerator cache cleanup because no accelerator is available"
+            )
+            return None
+
+    engine_core.cleanup_dist_env_and_memory = cleanup_dist_env_and_memory
+    engine_core._rbln_cleanup_patched = True
+
+
 def register():
     """Register the RBLN platform."""
     return "vllm_rbln.platform.RblnPlatform"
@@ -53,15 +90,18 @@ def register_ops():
     import vllm_rbln.distributed.ec_transfer.ec_connector.factory  # noqa
 
     if envs.VLLM_RBLN_USE_VLLM_MODEL:
+        _patch_cleanup_dist_env_and_memory()
         import vllm_rbln.model_executor.layers.attention.attention  # noqa
         import vllm_rbln.distributed.kv_transfer.kv_connector.factory  # noqa
         import vllm_rbln.forward_context  # noqa
         import vllm_rbln.lora.layer  # noqa
         import vllm_rbln.model_executor.layers.fused_moe.layer  # noqa
         import vllm_rbln.model_executor.layers.logits_processor  # noqa
-        import vllm_rbln.model_executor.layers.quantization.kernels.mixed_precision  # noqa
-        import vllm_rbln.model_executor.layers.quantization.mxfp4  # noqa
-        import vllm_rbln.model_executor.layers.quantization.fp8  # noqa
+        _try_import_optional(
+            "vllm_rbln.model_executor.layers.quantization.kernels.mixed_precision"
+        )
+        _try_import_optional("vllm_rbln.model_executor.layers.quantization.mxfp4")
+        _try_import_optional("vllm_rbln.model_executor.layers.quantization.fp8")
         import vllm_rbln.model_executor.layers.rotary_embedding.base  # noqa
         import vllm_rbln.model_executor.layers.rotary_embedding.deepseek_scaling_rope  # noqa
         import vllm_rbln.model_executor.layers.vocab_parallel_embedding  # noqa
