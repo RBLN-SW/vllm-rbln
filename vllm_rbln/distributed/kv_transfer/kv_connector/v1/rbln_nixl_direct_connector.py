@@ -124,11 +124,13 @@ class RblnNixlDirectConnectorWorker(RblnNixlConnectorWorker):
         self.nixl_memory_type = "VRAM"
         self.nixl_backends = ["RBLN"]
         self._runtime_holder = None
+        self._pending_kv_caches: dict[str, torch.Tensor] | None = None
 
     # ---- host-bounce removal ------------------------------------------
 
     def initialize_host_xfer_buffer(
-        self, kv_caches: dict[str, torch.Tensor],
+        self,
+        kv_caches: dict[str, torch.Tensor],
     ) -> None:
         """Direct path: there is no host xfer buffer. NIXL talks to
         device memory through the MR the RBLN plugin built; no
@@ -166,7 +168,7 @@ class RblnNixlDirectConnectorWorker(RblnNixlConnectorWorker):
         registration already ran or there is nothing pending. Called by
         RBLNWorker after warm_up_model() has allocated the KV cache
         backing memory."""
-        pending = getattr(self, "_pending_kv_caches", None)
+        pending = self._pending_kv_caches
         if pending is None:
             return
         self._pending_kv_caches = None
@@ -263,8 +265,7 @@ class RblnNixlDirectConnectorWorker(RblnNixlConnectorWorker):
                 region_offset = cache.data_ptr() - entry_base_addr
                 if isinstance(layer_spec, nixl_connector.MambaSpec):
                     full_block_len = (
-                        physical_page_size
-                        // self._physical_blocks_per_logical_kv_block
+                        physical_page_size // self._physical_blocks_per_logical_kv_block
                     )
                 else:
                     full_block_len = physical_page_size
@@ -282,7 +283,9 @@ class RblnNixlDirectConnectorWorker(RblnNixlConnectorWorker):
             "RblnNixlDirectConnector: runtime_holder not set — RBLNModelRunner "
             "must propagate it via set_runtime_holder before registration."
         )
-        rbln_ctx_ptr = self._runtime_holder[0]._runtime_handle.get_context().rbln_ctx_ptr
+        rbln_ctx_ptr = (
+            self._runtime_holder[0]._runtime_handle.get_context().rbln_ctx_ptr
+        )
 
         # Delegate sharding and MR registration to nixl-rbln. It registers
         # one whole-entry MR per shard and returns the transfer tables
@@ -290,7 +293,10 @@ class RblnNixlDirectConnectorWorker(RblnNixlConnectorWorker):
         # connector's descriptor math is correct without this connector
         # knowing the shard count.
         xfer = nixl_rbln.register_kv_regions(
-            self.nixl_wrapper, regions, device_id, mem=self.nixl_memory_type,
+            self.nixl_wrapper,
+            regions,
+            device_id,
+            mem=self.nixl_memory_type,
             rbln_ctx_ptr=rbln_ctx_ptr,
         )
         self.device_id = device_id
@@ -307,7 +313,8 @@ class RblnNixlDirectConnectorWorker(RblnNixlConnectorWorker):
         logger.info(
             "RblnNixlDirectConnector: registered %d transfer region(s) "
             "across %d shard(s) (K/V split).",
-            self.num_regions, xfer.n_shards,
+            self.num_regions,
+            xfer.n_shards,
         )
 
         self.device_kv_caches = kv_caches
