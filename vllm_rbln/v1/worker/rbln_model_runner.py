@@ -1972,8 +1972,15 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     @torch.inference_mode()
     def warm_up_model(self) -> None:
         set_warmup_active(True)
+        offload_ctx = (
+            torch.rbln.offload()
+            if envs.VLLM_RBLN_USE_DEVICE_TENSOR
+            and has_torch_rbln
+            else nullcontext()
+        )
         try:
-            self._warm_up_model_inner()
+            with offload_ctx:
+                self._warm_up_model_inner()
         finally:
             set_warmup_active(False)
 
