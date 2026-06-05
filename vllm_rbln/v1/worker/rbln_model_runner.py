@@ -2063,6 +2063,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             allowed_token_ids_mask=_pad_2d(metadata.allowed_token_ids_mask, 0),
             bad_words_token_ids=metadata.bad_words_token_ids,
             logitsprocs=metadata.logitsprocs,
+            spec_token_ids=metadata.spec_token_ids,
         )
 
     def _sample(
@@ -2083,8 +2084,17 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             )
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
+        # NOTE(RBLN): Only pad on the non-spec path. In device-tensor mode the
+        # plain sampler consumes [padded_batch, vocab] logits directly, so its
+        # per-request metadata must be padded to match. The spec-decode path is
+        # different: target logits are [num_tokens + batch_size, vocab] (always
+        # > num_reqs), and RBLNRejectionSampler derives both the per-request
+        # (bonus) and per-token (target) shapes from the *original* per-request
+        # SamplingMetadata. Padding it there mis-sizes the bonus temperature
+        # broadcast and trips expand_batch_to_tokens.
         if (
             envs.VLLM_RBLN_USE_DEVICE_TENSOR
+            and spec_decode_metadata is None
             and logits is not None
             and logits.shape[0] > self.input_batch.num_reqs
         ):
