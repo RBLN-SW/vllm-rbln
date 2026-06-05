@@ -39,6 +39,31 @@ logger = init_logger(__name__)
 
 @dataclass
 class RBLNDPMetadata(DPMetadata):
+    """Cross-DP shape synchronization for MoE + speculative decoding.
+
+    Motivation
+    ----------
+    MoE models with data parallelism require every DP rank to step with the
+    same ``(batch, query_len)`` input shape: the MoE layers fire cross-rank
+    all-reduce / all-to-all for expert dispatch, so any shape divergence
+    either hangs the collective or triggers a hot-path recompile.
+    Speculative decoding makes per-rank decisions diverge naturally -- a rank
+    with drafts wants ``query_len = num_spec_tokens + 1`` while a rank with an
+    ngram miss or a KV-block-boundary request would locally want ``1``.
+
+    Key idea
+    --------
+    1. Bit-packed cross-DP all-reduce (``num_tokens_and_reqs_across_dp``):
+       pack ``(is_prefill, num_reqs, num_tokens)`` into one int32 and run a
+       single gloo all-reduce on the existing CPU group, so every rank learns
+       the per-rank vectors and lifts shape decisions via MAX without extra
+       collectives.
+    2. Query backfill (see ``RBLNScheduler``) makes each rank's per-request
+       query window uniformly ``num_spec_tokens + 1`` *before* communication,
+       so the cross-DP MAX only has to resolve the batch dimension -- the
+       query dimension is already an agreed invariant.
+    """
+
     max_pads_across_dp: torch.Tensor | None = None
 
     @staticmethod

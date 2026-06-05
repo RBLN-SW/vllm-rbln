@@ -12,6 +12,41 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""RBLN scheduler with spec-decode query backfill.
+
+Motivation
+----------
+Speculative decode on RBLN otherwise needs two decode query shapes per
+step: ``num_spec_tokens + 1`` for the full-spec path and ``1`` for the
+boundary-induced no-spec fallback (when ``remaining_in_block`` /
+``remaining_in_maxlen`` cannot fit the full window, or a variable-length
+proposer such as ngram returns fewer drafts). Two shapes force two compile
+variants of the decode graph, a cross-DP ``step_no_spec_required``
+OR-reduce to agree on the per-step shape, and runtime branching that the
+``specialized_moe_decode`` path cannot reconcile in a single graph.
+
+Key idea
+--------
+The scheduler unconditionally keeps every decode step's query window at
+``num_spec_tokens + 1`` by back-filling the deficit with past positions
+whose KV is already in the current block::
+
+    slide_distance = max_spec_decode_len - min(old_n, effective_remaining)
+
+The runner prepends ``slide_distance`` past tokens to ``input_ids`` /
+``positions``; the model re-runs them through attention (an idempotent KV
+re-write) and their logits are pruned from ``logits_indices`` so the
+sampler never sees them. The decision is per-request and purely local, so
+every DP rank arrives at the same shape with no extra collective. Result:
+a single ``(batch, num_spec_tokens + 1)`` decode graph -- the ``no_spec``
+variant and the ``step_no_spec_required`` collective become unused.
+
+Naming: the mechanism is **query backfill**. Some code-level identifiers
+(``slide_distance``, ``spec_decode_slide_distance``, ...) still carry the
+older ``slide``/``sliding`` naming for stability across modules, but they
+refer to query backfill -- not a separate mechanism.
+"""
+
 import itertools
 import time
 from dataclasses import dataclass, field
