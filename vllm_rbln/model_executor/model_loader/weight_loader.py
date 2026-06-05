@@ -816,6 +816,17 @@ def load_AXK1_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[
         if spec_layer is not None:
             continue
 
+        if name.endswith(".mlp.gate.weight"):
+            if is_pp_missing_parameter(name, self):
+                continue
+            if name not in params_dict:
+                continue
+            param = params_dict[name]
+            weight_loader_fn = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader_fn(param, loaded_weight.to(torch.float32))
+            loaded_params.add(name)
+            continue
+
         if "shared_experts.gate_up_proj" in name:
             gate_name = name.replace(
                 "shared_experts.gate_up_proj", "shared_experts.gate_proj"

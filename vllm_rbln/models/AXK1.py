@@ -18,7 +18,11 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from vllm.distributed import tensor_model_parallel_all_reduce
-from vllm.model_executor.layers.linear import ColumnParallelLinear, RowParallelLinear
+from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models import AXK1 as _axk1_mod
 from vllm.model_executor.models.AXK1 import AXK1Attention, AXK1MoE
@@ -28,7 +32,7 @@ log = logging.getLogger("torch._dynamo")
 
 def __AXK1_moe_forward_rsd(self, hidden_states: torch.Tensor) -> torch.Tensor:
     shared_output, final_hidden_states = self.experts(
-        hidden_states=hidden_states, router=lambda x: self.gate(x)[0]
+        hidden_states=hidden_states, router=lambda x: self.gate(x.to(torch.float32))[0]
     )
     if hidden_states.dtype != torch.float16:
         final_hidden_states = final_hidden_states * self.routed_scaling_factor
@@ -139,6 +143,33 @@ class AXK1MLP(nn.Module):
         return x
 
 
+_axk1_moe_init = AXK1MoE.__init__
+
+
+def __AXK1_moe_init_rbln(
+    self,
+    config,
+    parallel_config,
+    quant_config: QuantizationConfig | None = None,
+    prefix: str = "",
+) -> None:
+    _axk1_moe_init(self, config, parallel_config, quant_config, prefix)
+    e_score_correction_bias = self.gate.e_score_correction_bias
+    self.gate = ReplicatedLinear(
+        config.hidden_size,
+        config.n_routed_experts,
+        bias=False,
+        quant_config=None,
+        params_dtype=torch.float32,
+        prefix=f"{prefix}.gate",
+    )
+    if e_score_correction_bias is not None:
+        self.gate.e_score_correction_bias = e_score_correction_bias
+    if hasattr(self.experts, "_gate"):
+        self.experts._gate = self.gate
+
+
+AXK1MoE.__init__ = __AXK1_moe_init_rbln
 AXK1MoE.forward = __AXK1_moe_forward_rsd
 AXK1Attention.forward = __AXK1_attention_forward
 _axk1_mod.AXK1MLP = AXK1MLP
