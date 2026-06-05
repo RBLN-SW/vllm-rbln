@@ -1974,8 +1974,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         set_warmup_active(True)
         offload_ctx = (
             torch.rbln.offload()
-            if envs.VLLM_RBLN_USE_DEVICE_TENSOR
-            and has_torch_rbln
+            if envs.VLLM_RBLN_USE_DEVICE_TENSOR and has_torch_rbln
             else nullcontext()
         )
         try:
