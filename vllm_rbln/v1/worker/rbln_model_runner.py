@@ -596,24 +596,44 @@ class RBLNModelRunner:
         self,
         scheduler_output: "SchedulerOutput",
         num_scheduled_tokens: np.ndarray,
-    ) -> tuple[torch.Tensor, SpecDecodeMetadata | None]:
-        total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
-        assert total_num_scheduled_tokens > 0
-        num_reqs = self.input_batch.num_reqs
-        assert num_reqs > 0
+    ) -> tuple[torch.Tensor, SpecDecodeMetadata | None, np.ndarray, int]:
+        assert scheduler_output.total_num_scheduled_tokens > 0
+        assert (num_reqs := self.input_batch.num_reqs) > 0
+        logical_num_tokens = num_scheduled_tokens
+
+        # NOTE(RBLN): Build the fixed full-spec query only when the scheduler
+        # actually kept draft tokens. Unsafe boundary cases and zero-draft
+        # ngram/suffix steps clear scheduled_spec_decode_tokens and run with
+        # the logical query length, usually qlen=1.
+        use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
+        if use_spec_decode and self.num_spec_tokens > 0 and not self.is_prefill:
+            target_query_len = self.num_spec_tokens + 1
+            query_lengths = np.full(num_reqs, target_query_len, dtype=np.int32)
+            backfill = query_lengths - logical_num_tokens
+
+            assert np.all(backfill >= 0), (
+                f"query_lengths={query_lengths}, "
+                f"logical_num_tokens={logical_num_tokens}"
+            )
+        else:
+            query_lengths = logical_num_tokens
+            backfill = np.zeros_like(logical_num_tokens)
+
+        total_query_tokens = int(query_lengths.sum())
 
         # Get request indices.
         # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
-        req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens)
+        req_indices = np.repeat(self.arange_np[:num_reqs], query_lengths)
 
         # cu_num_tokens: [2, 5, 3] -> [2, 7, 10]
         # arange: [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
-        cu_num_tokens, arange = self._get_cumsum_and_arange(num_scheduled_tokens)
+        cu_num_tokens, arange = self._get_cumsum_and_arange(query_lengths)
 
         # Get positions.
-        positions_np = self.positions_np[:total_num_scheduled_tokens]
+        positions_np = self.positions_np[:total_query_tokens]
         np.add(
-            self.input_batch.num_computed_tokens_cpu[req_indices],
+            self.input_batch.num_computed_tokens_cpu[req_indices]
+            - backfill[req_indices],
             arange,
             out=positions_np,
         )
@@ -634,7 +654,7 @@ class RBLNModelRunner:
             self.input_batch.token_ids_cpu_tensor.flatten(),
             0,
             token_indices_tensor,
-            out=self.input_ids[:total_num_scheduled_tokens],
+            out=self.input_ids[:total_query_tokens],
         )
 
         self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
@@ -647,7 +667,7 @@ class RBLNModelRunner:
 
         seq_lens_np = self.seq_lens.numpy()
         seq_lens_np[:num_reqs] = (
-            self.input_batch.num_computed_tokens_cpu[:num_reqs] + num_scheduled_tokens
+            self.input_batch.num_computed_tokens_cpu[:num_reqs] + logical_num_tokens
         )
         seq_lens_np[num_reqs:].fill(0)
 
@@ -659,7 +679,6 @@ class RBLNModelRunner:
         discard_request_mask_np = self.discard_request_mask.numpy()
         discard_request_mask_np[:num_reqs] = seq_lens_np[:num_reqs] < num_tokens_np
 
-        use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
         if not use_spec_decode:
             # NOTE(woosuk): Due to chunked prefills, the batch may contain
             # partial requests. While we should not sample any token
@@ -697,6 +716,8 @@ class RBLNModelRunner:
         return (
             logits_indices,
             spec_decode_metadata,
+            query_lengths,
+            total_query_tokens,
         )
 
     def _build_attention_metadata(
@@ -919,8 +940,6 @@ class RBLNModelRunner:
         num_reqs: int,
         num_reqs_padded: int,
         num_input_tokens: int,
-        num_scheduled_tokens: list[int],
-        max_scheduled_spec_decode_token: int,
         logits_indices: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> tuple[
@@ -936,42 +955,14 @@ class RBLNModelRunner:
         ]
         """
         # For text-only models
-        input_ids = self.input_ids[:num_input_tokens]
+        input_ids = self.input_ids[:num_input_tokens].view(num_reqs, -1)
+        positions = self.positions[:num_input_tokens].view(num_reqs, -1)
         inputs_embeds = None
-
-        positions = self.positions[:num_input_tokens]
 
         if get_pp_group().is_first_rank:
             intermediate_tensors = None
         else:
             assert intermediate_tensors is not None
-
-        if max_scheduled_spec_decode_token:
-            assert self.is_prefill is False
-            max_scheduled_decode_token = max_scheduled_spec_decode_token + 1
-            padded_input_ids = input_ids.new_zeros(num_reqs, max_scheduled_decode_token)
-            padded_positions = positions.new_zeros(num_reqs, max_scheduled_decode_token)
-
-            start = 0
-            for req_idx, num_tokens in enumerate(num_scheduled_tokens):
-                end = start + num_tokens
-                padded_input_ids[req_idx, :num_tokens] = input_ids[start:end]
-                padded_positions[req_idx, :num_tokens] = positions[start:end]
-
-                padded_start = req_idx * max_scheduled_decode_token
-                logits_indices[start:end] = torch.arange(
-                    padded_start,
-                    padded_start + num_tokens,
-                    device=logits_indices.device,
-                    dtype=logits_indices.dtype,
-                )
-
-                start = end
-            input_ids = padded_input_ids
-            positions = padded_positions
-
-        input_ids = input_ids.view(num_reqs, -1)
-        positions = positions.view(num_reqs, -1)
 
         if self.is_prefill:
             input_ids = pad(input_ids, -1, self.max_num_tokens)
@@ -1162,24 +1153,28 @@ class RBLNModelRunner:
             req_ids = self.input_batch.req_ids
             tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
             num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
-            num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
 
-            logits_indices, spec_decode_metadata = self._prepare_inputs(
+            (
+                logits_indices,
+                spec_decode_metadata,
+                query_lengths,
+                num_query_tokens,
+            ) = self._prepare_inputs(
                 scheduler_output,
                 num_scheduled_tokens_np,
             )
 
             num_reqs_padded, num_tokens_padded, num_tokens_across_dp = (
-                self._determine_batch_padding(num_reqs, num_tokens_unpadded)
+                self._determine_batch_padding(num_reqs, num_query_tokens)
             )
 
             use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
 
             attn_metadata, spec_decode_common_attn_metadata = (
                 self._build_attention_metadata(
-                    num_tokens=num_tokens_unpadded,
+                    num_tokens=num_query_tokens,
                     num_tokens_padded=num_tokens_padded,
-                    max_query_len=int(num_scheduled_tokens_np.max()),
+                    max_query_len=int(query_lengths.max()),
                     num_reqs=num_reqs,
                     num_reqs_padded=num_reqs_padded,
                     logits_indices=logits_indices,
@@ -1187,16 +1182,6 @@ class RBLNModelRunner:
                 )
             )
 
-            max_scheduled_spec_decode_token = (
-                max(
-                    [
-                        len(t)
-                        for t in scheduler_output.scheduled_spec_decode_tokens.values()
-                    ]
-                )
-                if scheduler_output.scheduled_spec_decode_tokens
-                else 0
-            )
             (
                 input_ids,
                 inputs_embeds,
@@ -1206,9 +1191,7 @@ class RBLNModelRunner:
             ) = self._preprocess(
                 num_reqs,
                 num_reqs_padded,
-                num_tokens_unpadded,
-                tokens,
-                max_scheduled_spec_decode_token,
+                num_query_tokens,
                 logits_indices,
                 intermediate_tensors,
             )
@@ -1222,7 +1205,7 @@ class RBLNModelRunner:
             set_forward_context(
                 attn_metadata,
                 self.vllm_config,
-                num_tokens=num_scheduled_tokens,
+                num_tokens=num_query_tokens,
                 num_tokens_across_dp=num_tokens_across_dp,
                 num_padded_tokens=num_tokens_padded,
                 **build_kv_cache_forward_context_kwargs(self.kv_cache_bases),
@@ -1821,19 +1804,26 @@ class RBLNModelRunner:
             device=self.device,
             dtype=self.dtype,
         )
-        dummy_tensors = (
-            lambda v: torch.full((num_reqs,), v, device=self.device)
-            if v is not None
-            else None
-        )
+
+        def dummy_float_tensor(buffer: torch.Tensor, value: float | None):
+            if value is None:
+                return None
+            return buffer[:num_reqs].fill_(float(value))
+
+        def dummy_int_tensor(buffer: torch.Tensor, value: int | float | None):
+            if value is None:
+                return None
+            return buffer[:num_reqs].fill_(int(value))
 
         for config in WARM_UP_CONFIGS:
             dummy_metadata = SamplingMetadata(
-                temperature=dummy_tensors(config.get("temperature")),
+                temperature=dummy_float_tensor(
+                    self.input_batch.temperature, config.get("temperature")
+                ),
                 all_greedy=config.get("all_greedy", True),
                 all_random=config.get("all_random", False),
-                top_p=dummy_tensors(config.get("top_p")),
-                top_k=dummy_tensors(config.get("top_k")),
+                top_p=dummy_float_tensor(self.input_batch.top_p, config.get("top_p")),
+                top_k=dummy_int_tensor(self.input_batch.top_k, config.get("top_k")),
                 generators={},
                 max_num_logprobs=None,
                 no_penalties=config.get("no_penalties", True),
@@ -1842,12 +1832,17 @@ class RBLNModelRunner:
                 )
                 if not config.get("no_penalties", True)
                 else None,
-                frequency_penalties=dummy_tensors(
-                    config.get("frequency_penalties", 0.1)
+                frequency_penalties=dummy_float_tensor(
+                    self.input_batch.frequency_penalties,
+                    config.get("frequency_penalties", 0.1),
                 ),
-                presence_penalties=dummy_tensors(config.get("presence_penalties", 0.1)),
-                repetition_penalties=dummy_tensors(
-                    config.get("repetition_penalties", 0.1)
+                presence_penalties=dummy_float_tensor(
+                    self.input_batch.presence_penalties,
+                    config.get("presence_penalties", 0.1),
+                ),
+                repetition_penalties=dummy_float_tensor(
+                    self.input_batch.repetition_penalties,
+                    config.get("repetition_penalties", 0.1),
                 ),
                 output_token_ids=[],
                 allowed_token_ids_mask=None,
