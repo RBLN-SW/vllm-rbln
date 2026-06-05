@@ -88,7 +88,12 @@ class RBLNEagleProposer(EagleProposer):
 
         # Build attention metadata
         num_reqs = self.runner.input_batch.num_reqs
-        num_reqs_padded = self.runner._determine_batch_padding(num_reqs)
+        self.runner.bucketing_manager.find_decode_batch_bucket(num_reqs)
+        num_reqs_padded = (
+            self.runner.bucketing_manager.find_decode_batch_bucket(num_reqs)
+            if not is_prefill
+            else num_reqs
+        )
         per_layer_attn_metadata: dict[str, object] = {}
         for attn_group in self.draft_attn_groups:
             attn_metadata = attn_group.get_metadata_builder().build(
