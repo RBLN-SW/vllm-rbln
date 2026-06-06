@@ -16,92 +16,97 @@
 
 from __future__ import annotations
 
-import gc
-
 import pytest
-from vllm import LLM, SamplingParams
+from vllm import SamplingParams
 
+from ...utils import managed_llm
 from .utils import (
+    assert_spec_matches_base_within_noise,
     ensure_vllm_compatible_eagle_draft_model,
     get_default_eagle_test_model_ids,
+    make_batch_prompts,
 )
 
-PROMPTS = [
-    "The capital of France is",
-]
 NUM_SPECULATIVE_TOKENS = 3
 
+# Batch sizes to exercise: batch=1 covers the single-sequence path, while
+# batch=8/16 exercises the wider verify-kernel shapes where bf16 rounding can
+# differ from the base path.
+BATCH_SIZES = [1, 8, 16]
 
-def _build_base_llm(method: str) -> LLM:
+
+def _base_llm_kwargs(method: str, max_num_seqs: int) -> dict:
     base_model_id, _ = get_default_eagle_test_model_ids(method)
-    return LLM(
-        model=base_model_id,
-        max_model_len=2048,
-        block_size=1024,
-        enable_chunked_prefill=True,
-        max_num_batched_tokens=256,
-        max_num_seqs=1,
-        disable_log_stats=False,
-        tensor_parallel_size=1,
-    )
+    return {
+        "model": base_model_id,
+        "max_model_len": 2048,
+        "block_size": 1024,
+        "enable_chunked_prefill": True,
+        "max_num_batched_tokens": 256,
+        "max_num_seqs": max_num_seqs,
+        "disable_log_stats": False,
+        "tensor_parallel_size": 1,
+    }
 
 
-def _build_eagle_llm(method: str) -> LLM:
+def _eagle_llm_kwargs(method: str, max_num_seqs: int) -> dict:
     base_model_id, draft_model_id = get_default_eagle_test_model_ids(method)
     draft_model_id = ensure_vllm_compatible_eagle_draft_model(
         eagle_model_id=draft_model_id,
         base_model_id=base_model_id,
     )
-    return LLM(
-        model=base_model_id,
-        max_model_len=2048,
-        block_size=1024,
-        enable_chunked_prefill=True,
-        max_num_batched_tokens=256,
-        max_num_seqs=1,
-        speculative_config={
+    return {
+        "model": base_model_id,
+        "max_model_len": 2048,
+        "block_size": 1024,
+        "enable_chunked_prefill": True,
+        "max_num_batched_tokens": 256,
+        "max_num_seqs": max_num_seqs,
+        "speculative_config": {
             "method": method,
             "model": draft_model_id,
             "num_speculative_tokens": NUM_SPECULATIVE_TOKENS,
         },
-        disable_log_stats=False,
-        tensor_parallel_size=1,
-    )
+        "disable_log_stats": False,
+        "tensor_parallel_size": 1,
+    }
 
 
+@pytest.mark.parametrize("batch_size", BATCH_SIZES)
 @pytest.mark.parametrize(
     ("method", "max_tokens"),
     [("eagle", 8), ("eagle3", 32)],
 )
-def test_eagle_matches_base_generation(method: str, max_tokens: int) -> None:
+def test_eagle_matches_base_generation(
+    monkeypatch: pytest.MonkeyPatch, method: str, max_tokens: int, batch_size: int
+) -> None:
     sampling_params = SamplingParams(
         temperature=0.0,
         top_p=1.0,
         max_tokens=max_tokens,
         ignore_eos=True,
     )
+    prompts = make_batch_prompts(batch_size)
 
-    base_llm = _build_base_llm(method)
-    base_outputs = base_llm.generate(PROMPTS, sampling_params=sampling_params)
-    # Release the baseline engine before compiling the speculative variant.
-    del base_llm
-    gc.collect()
+    # Generate with EAGLE speculative decoding first, then teacher-force the
+    # resulting tokens through the base model and check, at every position,
+    # that each spec token is the base model's greedy choice (up to bf16
+    # near-tie flips). Only one engine is alive at a time to bound memory:
+    # managed_llm shuts the eagle engine down deterministically before the base
+    # engine is built.
+    with managed_llm(
+        monkeypatch, **_eagle_llm_kwargs(method, max_num_seqs=batch_size)
+    ) as eagle_llm:
+        spec_reqs = eagle_llm.generate(prompts, sampling_params=sampling_params)
+        captured = [
+            (list(req.prompt_token_ids), list(req.outputs[0].token_ids))
+            for req in spec_reqs
+        ]
 
-    eagle_llm = _build_eagle_llm(method)
-    eagle_outputs = eagle_llm.generate(PROMPTS, sampling_params=sampling_params)
-
-    assert len(base_outputs) == len(eagle_outputs)
-
-    try:
-        for base_output, eagle_output in zip(base_outputs, eagle_outputs, strict=True):
-            assert base_output.prompt == eagle_output.prompt
-            assert len(base_output.outputs) == len(eagle_output.outputs) == 1
-            assert (
-                base_output.outputs[0].finish_reason
-                == eagle_output.outputs[0].finish_reason
+    with managed_llm(
+        monkeypatch, **_base_llm_kwargs(method, max_num_seqs=batch_size)
+    ) as base_llm:
+        for seq_idx, (prompt_token_ids, spec_token_ids) in enumerate(captured):
+            assert_spec_matches_base_within_noise(
+                base_llm, prompt_token_ids, spec_token_ids, seq_idx=seq_idx
             )
-            assert base_output.outputs[0].text == eagle_output.outputs[0].text
-            assert base_output.outputs[0].token_ids == eagle_output.outputs[0].token_ids
-    finally:
-        del eagle_llm
-        gc.collect()

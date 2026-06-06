@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_LOGITS_ALL_GATHER: bool = True
     VLLM_RBLN_NUM_RAY_NODES: int = 1
     VLLM_RBLN_METRICS: bool = False
+    VLLM_RBLN_METRICS_FILE: str = ""
     VLLM_RBLN_NUMA: bool = True
     VLLM_RBLN_SORT_BATCH: bool = False
     VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY: str = "exponential"
@@ -49,6 +50,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_MOE_REDUCE_SCATTER: bool = False
     VLLM_RBLN_SUB_BLOCK_CACHE: bool = True
     VLLM_RBLN_USE_DEVICE_TENSOR: bool = False
+    VLLM_RBLN_COMPILE_ONLY: bool = False
 
 
 def get_dp_impl() -> str:
@@ -112,6 +114,18 @@ def get_decode_batch_bucket_manual_buckets() -> list[int]:
             f"Invalid VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS: "
             f"{manual_buckets}, {e}"
         ) from e
+
+
+def use_auto_port() -> bool:
+    raw = os.environ.get("VLLM_RBLN_AUTO_PORT")
+    if raw is not None:
+        return raw.lower() in ("true", "1")
+    # Default follows device-tensor mode: auto port is on when
+    # VLLM_RBLN_USE_DEVICE_TENSOR is enabled.
+    return os.environ.get("VLLM_RBLN_USE_DEVICE_TENSOR", "False").lower() in (
+        "true",
+        "1",
+    )
 
 
 # extended environments
@@ -225,6 +239,10 @@ environment_variables = {
     "VLLM_RBLN_METRICS": (
         lambda: os.environ.get("VLLM_RBLN_METRICS", "False").lower() in ("true", "1")
     ),
+    # Mirror the final performance report to this file (in addition to stdout).
+    # The worker pid is appended before the extension to keep TP/DP workers
+    # from clobbering each other. Empty disables file output.
+    "VLLM_RBLN_METRICS_FILE": lambda: os.environ.get("VLLM_RBLN_METRICS_FILE", ""),
     # Enable NUMA-based CPU affinity binding for OpenMP threads
     "VLLM_RBLN_NUMA": (
         lambda: os.environ.get("VLLM_RBLN_NUMA", "True").lower() in ("true", "1")
@@ -247,9 +265,7 @@ environment_variables = {
         os.environ.get("VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT", 1)
     ),
     # Auto port
-    "VLLM_RBLN_AUTO_PORT": (
-        lambda: os.environ.get("VLLM_RBLN_AUTO_PORT", "False").lower() in ("true", "1")
-    ),
+    "VLLM_RBLN_AUTO_PORT": use_auto_port,
     # Decode batch bucket manual buckets
     "VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS": get_decode_batch_bucket_manual_buckets,  # noqa E501
     "VLLM_RBLN_USE_CUSTOM_KERNEL": (
@@ -279,6 +295,17 @@ environment_variables = {
         lambda: (
             os.environ.get("VLLM_RBLN_USE_DEVICE_TENSOR", "False").lower()
             in ("true", "1")
+        )
+    ),
+    # Compile-only mode for NPU-less (CPU-only) hosts such as CI build workers.
+    # When set, the rbln torch.compile backend compiles + caches each graph and
+    # builds its runtime on a dummy device (no NPU required); the populated
+    # cache is later reused by a real NPU host via cache-hit. The target SOC is
+    # taken from rebel.get_npu_name(), which falls back to RBLN_TARGET_SOC, so
+    # set RBLN_TARGET_SOC (e.g. RBLN-CA25) on a host without an NPU mounted.
+    "VLLM_RBLN_COMPILE_ONLY": (
+        lambda: (
+            os.environ.get("VLLM_RBLN_COMPILE_ONLY", "False").lower() in ("true", "1")
         )
     ),
 }
