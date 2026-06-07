@@ -42,11 +42,7 @@ dependencies = [
     "torch",
     "torchvision",
     "torchaudio",
-<<<<<<< HEAD
-    "optimum-rbln>=0.10.4",
-=======
     "optimum-rbln",
->>>>>>> 571c1ab6 (update pyproject.toml)
 ]
 
 [project.optional-dependencies]
