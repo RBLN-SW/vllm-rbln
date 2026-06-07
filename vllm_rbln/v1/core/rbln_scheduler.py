@@ -504,6 +504,26 @@ class RBLNScheduler(Scheduler):
                         # zero slide on all reqs. (Only variable-length
                         # proposers reach here; fixed-length backfill is always
                         # in-block since num_spec+1 <= block_size.)
+                        #
+                        # Invariant guard: a fixed-length proposer must never
+                        # reach a cross-block step — it compiles no no-spec graph
+                        # and its DP-idle peers vote num_spec+1, so electing
+                        # no-spec here would hot-path recompile AND break the
+                        # cross-DP full-spec shape agreement. The only way to get
+                        # here with fixed length is max_model_len % block_size in
+                        # (0, num_spec+1) with a request reaching the final block,
+                        # which is unsupported; fail loudly instead of corrupting.
+                        assert self.vllm_config.speculative_config.method in (
+                            "ngram",
+                            "suffix",
+                        ), (
+                            "cross-block no-spec fallback fired for fixed-length "
+                            f"proposer "
+                            f"'{self.vllm_config.speculative_config.method}'; "
+                            "fixed-length spec decode must stay full-spec-only. "
+                            "Likely max_model_len % block_size < num_spec_tokens+1 "
+                            "and a request reached the final block."
+                        )
                         step_no_spec_required = True
                         logger.debug(
                             "spec-decode no-spec fallback (cross-block "
