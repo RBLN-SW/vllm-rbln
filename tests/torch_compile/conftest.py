@@ -25,6 +25,22 @@ from vllm.config import (
 from vllm.plugins import load_general_plugins
 
 
+def pytest_collection_modifyitems(items):
+    """Run ``test_rbln_envs`` first in the session.
+
+    ``vllm_rbln.platform`` mutates module-level ``rbln_envs`` attributes
+    at runtime (e.g. sets ``VLLM_RBLN_SAMPLER = False`` when
+    ``speculative_config`` is present, see ``platform.py:260``).  Any
+    earlier test that instantiates a vLLM config with spec-decode
+    enabled leaves the env-defaults test asserting on dirty state and
+    failing.  ``importlib.reload`` does not undo the mutation because
+    it lives in the module ``__dict__`` and shadows the lazy
+    ``__getattr__`` lambda.  Run the env-defaults test first instead of
+    polluting the test source with reset boilerplate.
+    """
+    items.sort(key=lambda item: 0 if item.name == "test_rbln_envs" else 1)
+
+
 def pytest_configure(config):
     # Must run before test collection so that monkey patches applied by
     # `register_ops()` are in place before any test module does
