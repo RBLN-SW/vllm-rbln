@@ -127,13 +127,15 @@ class RBLNInputBatch(InputBatch):
             or self.logits_processing_needs_token_ids[:num_reqs].any()
         )
         if needs_prompt_token_ids:
-            # The prompt tokens are used only for applying penalties or
-            # step pooling during the sampling/pooling process.
-            # Hence copy these tensors only when there are requests which
-            # need penalties/step_pooler to be applied.
-            # vLLM 0.19 renamed _make_prompt_token_ids_tensor to _cpu_tensor.
+            # NOTE(0.18): _make_prompt_token_ids_tensor was renamed to
+            # _make_prompt_token_ids_cpu_tensor in 0.19 and now returns a CPU
+            # tensor; the caller is responsible for the device upload.
+            # When 0.18 support is dropped, replace this block with a direct
+            # call to _cpu_tensor.
             if hasattr(self, "_make_prompt_token_ids_cpu_tensor"):
-                prompt_token_ids = self._make_prompt_token_ids_cpu_tensor()
+                prompt_token_ids = self._make_prompt_token_ids_cpu_tensor().to(
+                    device=self.device, non_blocking=True
+                )
             else:
                 prompt_token_ids = self._make_prompt_token_ids_tensor()
         else:

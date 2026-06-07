@@ -78,6 +78,7 @@ class RBLNOptimumScheduler(Scheduler):
         kv_cache_config: KVCacheConfig,
         structured_output_manager: StructuredOutputManager,
         block_size: int,
+        hash_block_size: int | None = None,
         mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
         include_finished_set: bool = False,
         log_stats: bool = False,
@@ -142,6 +143,10 @@ class RBLNOptimumScheduler(Scheduler):
         assert num_gpu_blocks is not None and num_gpu_blocks > 0
 
         self.block_size = self.cache_config.block_size
+        assert hash_block_size == self.block_size, (
+            "RBLNOptimumScheduler assumes hash_block_size == block_size "
+            f"(got {hash_block_size} != {self.block_size})"
+        )
         # req_id -> Request
         self.requests: dict[str, Request] = {}
         # Scheduling policy
@@ -182,13 +187,14 @@ class RBLNOptimumScheduler(Scheduler):
         self.kv_cache_manager = RBLNKVCacheManager(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
+            max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
             enable_caching=self.cache_config.enable_prefix_caching,
             use_eagle=False,
             log_stats=self.log_stats,
             enable_kv_cache_events=False,
             dcp_world_size=1,
             pcp_world_size=1,
-            hash_block_size=self.block_size,
+            hash_block_size=hash_block_size,
             metrics_collector=self.kv_metrics_collector,
             attn_block_size=attn_block_size,
             max_num_seqs=self.max_num_running_reqs,
@@ -197,6 +203,12 @@ class RBLNOptimumScheduler(Scheduler):
         self.perf_metrics: ModelMetrics | None = None
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
             self.perf_metrics = ModelMetrics(vllm_config)
+
+        # NOTE(vllm 0.22): inherited _update_after_schedule/update_from_output
+        # read this attribute. Always False on RBLN (no routed-experts return).
+        self.enable_return_routed_experts = (
+            vllm_config.model_config.enable_return_routed_experts
+        )
         # Encoder-related.
         # It is not used in RBLN.
         # But for reuse original functions(e.g. free_request) in vLLM,
