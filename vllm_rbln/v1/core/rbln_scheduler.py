@@ -44,8 +44,13 @@ a new block, a short draft would need backfill from the PREVIOUS block,
 which the single-block decode path can't express. That step falls back to
 no-spec (query_len = 1) via the ``step_no_spec_required`` cross-DP OR-reduce
 (any rank tripping it -> every rank drops to no-spec). Fixed-length
-proposers (EAGLE/EAGLE3/MEDUSA) never hit this (``num_spec + 1 <=
-block_size`` keeps their backfill in-block), so they stay full-spec only.
+proposers (EAGLE/EAGLE3/MEDUSA) stay full-spec only: ``num_spec + 1 <=
+block_size`` keeps their backfill in-block at every interior boundary. The
+sole exception is the ``max_model_len`` edge -- decode is capped to
+``max_model_len - 1`` (reserved final position), so a final partial block of
+size ``m = max_model_len % block_size <= num_spec + 1`` squeezes even a full
+draft into a cross-block window. That is unsupported for fixed length and a
+runtime assert rejects it (align ``max_model_len`` to ``block_size``).
 
 Compile coverage & guards
 -------------------------
@@ -501,18 +506,24 @@ class RBLNScheduler(Scheduler):
                         # back to no-spec (query_len=1): set the flag and let
                         # the runner's cross-DP OR-reduce drop EVERY rank to
                         # no-spec (any rank → all) and scrub query_len to 1 +
-                        # zero slide on all reqs. (Only variable-length
-                        # proposers reach here; fixed-length backfill is always
-                        # in-block since num_spec+1 <= block_size.)
+                        # zero slide on all reqs. Variable-length proposers reach
+                        # here at a block-interior boundary (draft shortfall);
+                        # fixed-length proposers only at the max_model_len edge
+                        # (see the guard below) and are rejected there.
                         #
                         # Invariant guard: a fixed-length proposer must never
                         # reach a cross-block step — it compiles no no-spec graph
                         # and its DP-idle peers vote num_spec+1, so electing
                         # no-spec here would hot-path recompile AND break the
-                        # cross-DP full-spec shape agreement. The only way to get
-                        # here with fixed length is max_model_len % block_size in
-                        # (0, num_spec+1) with a request reaching the final block,
-                        # which is unsupported; fail loudly instead of corrupting.
+                        # cross-DP full-spec shape agreement. Fixed length can
+                        # only land here at the max_model_len edge: decode steps
+                        # are capped to `max_model_len - 1 - num_computed` (the
+                        # reserved final position, above), so at a final partial
+                        # block of size m = max_model_len % block_size the window
+                        # is squeezed to old_n = min(num_spec+1, m-1) even with
+                        # FULL drafts -> desired_slide > 0 whenever m <=
+                        # num_spec+1. That config is unsupported for fixed length;
+                        # fail loudly instead of silently hot-pathing/corrupting.
                         assert self.vllm_config.speculative_config.method in (
                             "ngram",
                             "suffix",
@@ -521,8 +532,13 @@ class RBLNScheduler(Scheduler):
                             f"proposer "
                             f"'{self.vllm_config.speculative_config.method}'; "
                             "fixed-length spec decode must stay full-spec-only. "
-                            "Likely max_model_len % block_size < num_spec_tokens+1 "
-                            "and a request reached the final block."
+                            "Cause: the final block is too short for a full "
+                            "speculative window once the scheduler reserves the "
+                            "last position (decode capped to max_model_len-1), "
+                            "i.e. 0 < max_model_len % block_size <= "
+                            "num_spec_tokens+1 and a request reached the final "
+                            "block. Align max_model_len to block_size (or keep "
+                            "max_model_len % block_size > num_spec_tokens+1)."
                         )
                         step_no_spec_required = True
                         logger.debug(
