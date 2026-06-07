@@ -34,7 +34,7 @@ from vllm.v1.core.kv_cache_utils import get_uniform_page_size
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheSpec
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
-from vllm.v1.worker.worker_base import WorkerBase
+from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
@@ -263,7 +263,13 @@ class RBLNOptimumWorker(WorkerBase):
     def load_model(self, *, load_dummy_weights: bool = False):
         self.model_runner.load_model()
 
-    def compile_or_warm_up_model(self) -> None:
+    def compile_or_warm_up_model(self) -> CompilationTimes:
+        # NOTE(vllm 0.22): the executor unconditionally accesses
+        # `.language_model` / `.encoder` on the returned value, so we must
+        # return a CompilationTimes instead of None.
+        # FIXME include auto compile time
+        compilation_times = CompilationTimes(language_model=0.0, encoder=0.0)
+
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
@@ -271,16 +277,17 @@ class RBLNOptimumWorker(WorkerBase):
         # EC producer has no decoder — skip warmup entirely.
         if self.model_runner.is_ec_producer_only:
             logger.info("EC producer: skipping warmup (no decoder).")
-            return
+            return compilation_times
 
         if not envs.VLLM_RBLN_ENABLE_WARM_UP:
             logger.info(
                 "Warm up is disabled. Set VLLM_RBLN_ENABLE_WARM_UP=1 to enable warm up."
             )
-            return
+            return compilation_times
 
         logger.info("Running dummy warm up.")
         self.model_runner.dummy_sampler_run()
+        return compilation_times
 
     def get_model(self) -> nn.Module:
         return self.model_runner.get_model()

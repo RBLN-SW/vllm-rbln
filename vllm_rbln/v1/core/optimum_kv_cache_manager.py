@@ -33,6 +33,7 @@ class RBLNKVCacheManager(KVCacheManager):
         kv_cache_config: KVCacheConfig,
         max_model_len: int,
         hash_block_size: int,
+        max_num_batched_tokens: int | None = None,
         enable_caching: bool = True,
         use_eagle: bool = False,
         log_stats: bool = False,
@@ -50,6 +51,9 @@ class RBLNKVCacheManager(KVCacheManager):
         between inner blocks and outer blocks for prefix caching.
         """
         self.max_model_len = max_model_len
+        assert max_model_len == max_num_batched_tokens, (
+            "max_num_batched_tokens must be equal to max_model_len for RBLNKVCacheManager"
+        )
 
         self.enable_caching = enable_caching
         self.use_eagle = use_eagle
@@ -63,6 +67,7 @@ class RBLNKVCacheManager(KVCacheManager):
         self.coordinator = RBLNKVCacheCoordinator(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
+            max_num_batched_tokens=max_num_batched_tokens,
             use_eagle=self.use_eagle,
             enable_caching=self.enable_caching,
             enable_kv_cache_events=enable_kv_cache_events,
