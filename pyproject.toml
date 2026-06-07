@@ -38,11 +38,15 @@ dependencies = [
     "pyyaml",
     "datasets",
     "qwen_vl_utils",
-    "vllm==0.18.0+cpu",
+    "vllm==0.22.0+cpu",
     "torch",
     "torchvision",
     "torchaudio",
+<<<<<<< HEAD
     "optimum-rbln>=0.10.4",
+=======
+    "optimum-rbln",
+>>>>>>> 571c1ab6 (update pyproject.toml)
 ]
 
 [project.optional-dependencies]
@@ -132,7 +136,7 @@ environments = [
 
 [[tool.uv.index]]
 name = "vllm-cpu"
-url = "https://wheels.vllm.ai/0.18.0/cpu"
+url = "https://wheels.vllm.ai/0.22.0/cpu"
 explicit = true
 
 [[tool.uv.index]]
@@ -141,6 +145,7 @@ url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
 [tool.uv.sources]
+optimum-rbln = { path = "../optimum-rbln", editable = true }
 vllm = { index = "vllm-cpu" }
 torch = { index = "pytorch-cpu" }
 torchvision = { index = "pytorch-cpu" }
