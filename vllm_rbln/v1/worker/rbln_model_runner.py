@@ -1974,7 +1974,9 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         set_warmup_active(True)
         offload_ctx = (
             torch.rbln.offload()
-            if envs.VLLM_RBLN_USE_DEVICE_TENSOR and has_torch_rbln
+            if envs.VLLM_RBLN_USE_DEVICE_TENSOR
+            and has_torch_rbln
+            and envs.VLLM_RBLN_OFFLOAD
             else nullcontext()
         )
         try:
@@ -3607,7 +3609,9 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         model_loader = get_model_loader(self.load_config)
         offload_ctx = (
             torch.rbln.offload()
-            if envs.VLLM_RBLN_USE_DEVICE_TENSOR and has_torch_rbln
+            if envs.VLLM_RBLN_USE_DEVICE_TENSOR
+            and has_torch_rbln
+            and envs.VLLM_RBLN_OFFLOAD
             else nullcontext()
         )
         with offload_ctx:

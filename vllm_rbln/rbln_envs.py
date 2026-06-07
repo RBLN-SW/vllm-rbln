@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_MOE_REDUCE_SCATTER: bool = False
     VLLM_RBLN_SUB_BLOCK_CACHE: bool = True
     VLLM_RBLN_USE_DEVICE_TENSOR: bool = False
+    VLLM_RBLN_OFFLOAD: bool = True
     VLLM_RBLN_COMPILE_ONLY: bool = False
 
 
@@ -286,6 +287,11 @@ environment_variables = {
             os.environ.get("VLLM_RBLN_USE_DEVICE_TENSOR", "False").lower()
             in ("true", "1")
         )
+    ),
+    # Gate for torch.rbln.offload() wrapping of load_model/warm-up under
+    # device_tensor mode. Default on; set to 0 to measure the no-offload baseline.
+    "VLLM_RBLN_OFFLOAD": (
+        lambda: (os.environ.get("VLLM_RBLN_OFFLOAD", "True").lower() in ("true", "1"))
     ),
     # Compile-only mode for NPU-less (CPU-only) hosts such as CI build workers.
     # When set, the rbln torch.compile backend compiles + caches each graph and
