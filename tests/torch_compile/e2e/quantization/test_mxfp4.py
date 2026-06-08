@@ -43,6 +43,10 @@ ENV = {
     "VLLM_RBLN_USE_VLLM_MODEL": "1",
     "VLLM_DISABLE_COMPILE_CACHE": "1",
     "VLLM_RBLN_COMPILE_STRICT_MODE": "1",
+    # gpt-oss alternates sliding-window and full attention, producing
+    # multi-group KV caches, which RBLN sub-block prefix caching does not
+    # support yet.
+    "VLLM_RBLN_SUB_BLOCK_CACHE": "false",
 }
 
 # (prompt, expected substring) pairs verified by greedy decoding.
