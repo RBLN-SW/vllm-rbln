@@ -52,7 +52,8 @@ class RBLNKVCacheManager(KVCacheManager):
         """
         self.max_model_len = max_model_len
         assert max_model_len == max_num_batched_tokens, (
-            "max_num_batched_tokens must be equal to max_model_len for RBLNKVCacheManager"
+            "max_num_batched_tokens must be equal to "
+            "max_model_len for RBLNKVCacheManager"
         )
 
         self.enable_caching = enable_caching
