@@ -227,10 +227,8 @@ class RBLNFlashAttentionMetadataBuilder(
         local_block_tables = None
         swa_attn_masks = None
         if sliding_window := getattr(self.kv_cache_spec, "sliding_window", None):
-            num_computed_tokens = (
-                num_computed_tokens[:num_reqs].view(-1, 1).to(torch.int16)
-            )
-            seq_lens = seq_lens[:num_reqs].view(-1, 1).to(torch.int16)
+            num_computed_tokens = num_computed_tokens[:num_reqs].view(-1, 1)
+            seq_lens = seq_lens[:num_reqs].view(-1, 1)
             query_lens = seq_lens - num_computed_tokens
             cache_seq_lens = torch.clamp(num_computed_tokens, max=sliding_window)
             cache_offsets = cache_seq_lens + query_lens
@@ -461,9 +459,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                     key,
                     value,
                     kv_cache,
-                    attn_metadata.cache_seq_lens.to(torch.int32)
-                    if self.is_batch_attention_opt and b_size > 1
-                    else attn_metadata.cache_seq_lens,
+                    attn_metadata.cache_seq_lens,
                     attn_metadata.cache_offsets,
                     self.scale,
                     attn_metadata.local_block_tables,
@@ -481,9 +477,9 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         key,
                         value,
                         kv_cache,
-                        attn_metadata.seq_lens.to(torch.int16),
+                        attn_metadata.seq_lens,
                         self.scale,
-                        attn_metadata.block_tables.to(torch.int16),
+                        attn_metadata.block_tables,
                         self.sinks,
                     )
                 else:
@@ -492,9 +488,9 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         key,
                         value,
                         kv_cache,
-                        attn_metadata.seq_lens.to(torch.int16),
+                        attn_metadata.seq_lens,
                         self.scale,
-                        attn_metadata.block_tables.to(torch.int16),
+                        attn_metadata.block_tables,
                         self.sinks,
                     )
             else:
@@ -509,8 +505,8 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         value,
                         kv_cache,
                         self.scale,
-                        attn_metadata.seq_lens.to(torch.int16),
-                        attn_metadata.block_tables.to(torch.int16),
+                        attn_metadata.seq_lens,
+                        attn_metadata.block_tables,
                         self.sinks,
                     )
                 else:
@@ -520,8 +516,8 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         value,
                         kv_cache,
                         self.scale,
-                        attn_metadata.seq_lens.to(torch.int16),
-                        attn_metadata.block_tables.to(torch.int16),
+                        attn_metadata.seq_lens,
+                        attn_metadata.block_tables,
                         self.sinks,
                     )
         else:
@@ -533,9 +529,9 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         value,
                         kv_cache,
                         attn_metadata.attn_masks,
-                        attn_metadata.seq_lens.to(torch.int16),
+                        attn_metadata.seq_lens,
                         self.scale,
-                        attn_metadata.block_tables.to(torch.int16),
+                        attn_metadata.block_tables,
                         self.sinks,
                     )
                 else:
@@ -545,9 +541,9 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         value,
                         kv_cache,
                         attn_metadata.attn_masks,
-                        attn_metadata.seq_lens.to(torch.int16),
+                        attn_metadata.seq_lens,
                         self.scale,
-                        attn_metadata.block_tables.to(torch.int16),
+                        attn_metadata.block_tables,
                         self.sinks,
                     )
             else:
@@ -559,8 +555,8 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         kv_cache,
                         attn_metadata.attn_masks,
                         self.scale,
-                        attn_metadata.seq_lens.to(torch.int16),
-                        attn_metadata.block_tables.to(torch.int16),
+                        attn_metadata.seq_lens,
+                        attn_metadata.block_tables,
                         self.sinks,
                     )
                 else:
@@ -571,8 +567,8 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         kv_cache,
                         attn_metadata.attn_masks,
                         self.scale,
-                        attn_metadata.seq_lens.to(torch.int16),
-                        attn_metadata.block_tables.to(torch.int16),
+                        attn_metadata.seq_lens,
+                        attn_metadata.block_tables,
                         self.sinks,
                     )
 
