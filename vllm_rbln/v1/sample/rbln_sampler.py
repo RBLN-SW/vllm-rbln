@@ -110,7 +110,6 @@ class RBLNTopKTopPSampler(nn.Module):
             "RBLN Sampling does not support returning logits/logprobs"
         )
 
-        rebel.manual_seed(seed)
         options = build_compile_options(compile_context)
         if envs.VLLM_RBLN_USE_DEVICE_TENSOR:
             options["model_trace_method"] = "export"
