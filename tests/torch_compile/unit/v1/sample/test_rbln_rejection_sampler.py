@@ -20,7 +20,10 @@ import torch
 from vllm_rbln.v1.sample.cpu_rejection_sampler import (
     rejection_sample as cpu_rejection_sample,
 )
-from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
+from vllm_rbln.v1.sample.rbln_rejection_sampler import (
+    RBLNRejectionSampler,
+    rbln_rejection_sample,
+)
 from vllm_rbln.v1.sample.rbln_sampler import RBLNSampler
 
 
@@ -132,6 +135,21 @@ def _assert_rbln_matches_cpu(sampler, inputs):
     )
 
 
+def _assert_eager_matches_cpu(sampler, inputs, monkeypatch):
+    """Same comparison as `_assert_rbln_matches_cpu`, but forces the eager path.
+
+    Swapping `compiled_rejection_sample` for the plain (uncompiled) wrapper makes
+    `torch.ops.rbln.rejection_sample` run its registered CPU reference body
+    instead of the device kernel; the high-level output format is unchanged.
+    """
+    monkeypatch.setattr(sampler, "compiled_rejection_sample", rbln_rejection_sample)
+    out_eager = sampler.rejection_sample(*inputs).to(torch.int64)
+    out_cpu = cpu_rejection_sample(*inputs).to(torch.int64)
+    assert torch.equal(out_eager, out_cpu), (
+        f"\nEAGER (op CPU body):\n{out_eager}\nCPU (reference):\n{out_cpu}"
+    )
+
+
 def test_uniform_num_draft_tokens(rejection_sampler):
     """Same num_draft_tokens (== max_spec_len) for every request.
 
@@ -162,3 +180,29 @@ def test_varying_num_draft_tokens(rejection_sampler):
         bonus_token_ids=[9, 8, 7],
     )
     _assert_rbln_matches_cpu(rejection_sampler, inputs)
+
+
+def test_uniform_num_draft_tokens_eager(rejection_sampler, monkeypatch):
+    """Eager-path counterpart of `test_uniform_num_draft_tokens`: the registered
+    `torch.ops.rbln.rejection_sample` CPU body must match the CPU reference."""
+    inputs = _build_inputs(
+        num_draft_tokens=[3, 3],
+        draft_token_ids=[1, 2, 3, 4, 5, 6],
+        target_tokens=[1, 2, 3, 4, 7, 0],
+        max_spec_len=3,
+        bonus_token_ids=[9, 8],
+    )
+    _assert_eager_matches_cpu(rejection_sampler, inputs, monkeypatch)
+
+
+def test_varying_num_draft_tokens_eager(rejection_sampler, monkeypatch):
+    """Eager-path counterpart of `test_varying_num_draft_tokens`, including a
+    zero-draft request and tail padding (N=5 < B*K=9)."""
+    inputs = _build_inputs(
+        num_draft_tokens=[3, 0, 2],
+        draft_token_ids=[1, 2, 3, 4, 5],
+        target_tokens=[1, 2, 3, 6, 0],
+        max_spec_len=3,
+        bonus_token_ids=[9, 8, 7],
+    )
+    _assert_eager_matches_cpu(rejection_sampler, inputs, monkeypatch)
