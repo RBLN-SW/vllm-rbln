@@ -13,6 +13,8 @@
 # limitations under the License.
 """Triton kernels for Attention"""
 
+import os
+
 import torch
 from rebel import triton
 from rebel.triton import language as tl
@@ -403,7 +405,14 @@ def attention_naive_decode(
 
 
 def warmup(func, *args):
-    kernel = func.warmup(*args, grid=(1,), host_layout="1:2:3")
+    compute_dtype = os.environ.get("RBLN_COMP_DTYPE", "bfloat")
+    assert compute_dtype in ("dlfloat", "bfloat"), (
+        f"RBLN_COMP_DTYPE must be 'dlfloat' or 'bfloat', got '{compute_dtype}'"
+    )
+    compute_dtype = {"bfloat": "bf16", "dlfloat": "dlf16"}[compute_dtype]
+    kernel = func.warmup(
+        *args, grid=(1,), host_layout="1:2:3", compute_dtype=compute_dtype
+    )
     rblib.write_rtosa(kernel, args)
 
     return kernel
@@ -429,6 +438,7 @@ def attention_naive_prefill_wrapper(
     mask = mask.to(torch.float32)
     kv_cache = kv_cache.to(torch.float32)
     qk_scale = qk_scale.to(torch.float32)
+    seq_idx = seq_idx.to(torch.int32)
 
     output = torch.empty_like(query)
 
@@ -488,6 +498,7 @@ def attention_naive_decode_wrapper(
     mask = mask.to(torch.float32)
     kv_cache = kv_cache.to(torch.float32)
     qk_scale = qk_scale.to(torch.float32)
+    seq_idx = seq_idx.to(torch.int32)
 
     output = torch.empty_like(query)
 
