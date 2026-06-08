@@ -270,10 +270,6 @@ class RBLNRejectionSampler(RejectionSampler):
             draft_per_batch[i, :n] = draft_token_ids[src_offset : src_offset + n]
             src_offset += n
 
-        # NPU primitive expects cu_num_draft_tokens in int32; vLLM hands it
-        # over as int64 (inherited from num_draft_tokens cumsum).
-        cu_num_draft_tokens_i32 = cu_num_draft_tokens.to(torch.int32)
-
         # ------------------------------------------------------------------
         # 2) Call the NPU primitive.
         # Returns:
@@ -284,7 +280,7 @@ class RBLNRejectionSampler(RejectionSampler):
         recovered_token_ids, num_accepted = self.compiled_rejection_sample(
             reshaped_draft_token_ids,
             reshaped_target_probs,
-            cu_num_draft_tokens_i32,
+            cu_num_draft_tokens,
             sampling_metadata.top_k,
             sampling_metadata.top_p,
         )
