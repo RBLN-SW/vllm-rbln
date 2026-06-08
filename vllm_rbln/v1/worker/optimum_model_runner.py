@@ -177,7 +177,6 @@ class RBLNOptimumModelRunner(
             self.pooled_tensors: dict[int, torch.Tensor] = {}
             sampler = RBLNSampler(
                 logprobs_mode=self.model_config.logprobs_mode,
-                seed=self.vllm_config.model_config.seed,
             )
         else:
             logger.info("Using default vLLM sampler.")
