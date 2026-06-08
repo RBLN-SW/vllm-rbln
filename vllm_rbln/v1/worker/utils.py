@@ -23,7 +23,8 @@ import torch
 from vllm.config import ModelConfig, ParallelConfig
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.platforms import CpuArchEnum, current_platform
-from vllm.platforms.cpu import CpuPlatform, LogicalCPUInfo
+from vllm.platforms.cpu import CpuPlatform
+from vllm.utils.cpu_resource_utils import LogicalCPUInfo
 
 import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
