@@ -23,7 +23,8 @@ dies during cleanup.
 We wrap empty_cache() to swallow that one case; other errors propagate.
 Applied via register_ops() at plugin load.
 """
-
+# NOTE(eunji.lee):
+# required test: torch-rbln 2.11.0 + vllm 0.22.0
 import torch
 
 from vllm_rbln.logger import init_logger
@@ -59,4 +60,4 @@ def _patch_accelerator_empty_cache() -> None:
     )
 
 
-_patch_accelerator_empty_cache()
+# _patch_accelerator_empty_cache()
