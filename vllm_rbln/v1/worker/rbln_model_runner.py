@@ -313,7 +313,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             logger.info("Using RBLN sampler: %s", self.use_rbln_sampler)
             sampler = RBLNSampler(
                 logprobs_mode=self.model_config.logprobs_mode,
-                seed=self.vllm_config.model_config.seed,
                 compile_context=self.compile_context,
             )
         else:
