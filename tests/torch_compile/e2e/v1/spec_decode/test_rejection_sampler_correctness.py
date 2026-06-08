@@ -22,7 +22,7 @@ import pytest
 from vllm import SamplingParams
 
 from ...utils import managed_llm
-from .utils import DEFAULT_MODEL_ID, assert_spec_matches_base_within_noise
+from .utils import assert_spec_matches_base_within_noise
 
 # Repeated n-grams so the ngram proposer finds prompt-lookup matches and drafts
 # tokens; distinct content across requests keeps the batch heterogeneous.
@@ -31,11 +31,11 @@ PROMPTS = [
     "over the lazy dog. The quick brown fox",
     "one two three four one two three four one two three four one two three",
 ]
-
+MODEL_ID = "Qwen/Qwen3-0.6B"
 
 def _base_llm_kwargs() -> dict:
     return {
-        "model": DEFAULT_MODEL_ID,
+        "model": MODEL_ID,
         "max_model_len": 2048,
         "block_size": 1024,
         "enable_chunked_prefill": True,
