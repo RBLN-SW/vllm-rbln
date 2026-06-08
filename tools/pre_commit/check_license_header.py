@@ -17,20 +17,20 @@ import re
 import sys
 from enum import Enum
 
-# Creation-year convention: a file keeps the year it was first created, so any
-# year from the project's first year through the current year is valid. We
-# reject only future years (typos like a year that hasn't happened yet). This
-# way no annual maintenance is needed -- the upper bound moves with the clock.
+# Minimum valid copyright year (the project's first year). Any year from this
+# onward is accepted -- we intentionally do NOT cap at the current year, so the
+# check never depends on the system clock and never rejects a "future" year.
 MIN_YEAR = 2025
-CURRENT_YEAR = datetime.date.today().year
 
-# Year stamped on a header that is auto-added to a brand-new file == the year
-# the file is first added.
-NEW_HEADER_YEAR = CURRENT_YEAR
+# Year stamped on a header auto-added to a file that has none. Defaults to the
+# current year, but any year >= MIN_YEAR is valid, so this is only a sensible
+# default and is never enforced as an upper bound.
+NEW_HEADER_YEAR = datetime.date.today().year
 
 
 def _year_ok(year):
-    return MIN_YEAR <= int(year) <= CURRENT_YEAR
+    return int(year) >= MIN_YEAR
+
 
 # Matches the Rebellions copyright line with any 4-digit year. The trailing
 # "All rights reserved." is optional so that older one-line variants are still
@@ -40,9 +40,7 @@ COPYRIGHT_RE = re.compile(r"#\s*Copyright\s+(?P<year>\d{4})\s+Rebellions Inc\.")
 # A single representative line from the Apache license body. We detect the body
 # by this marker rather than by an exact multi-line match, so files that differ
 # only in separator style (blank line vs. "#") are still treated as complete.
-LICENSE_MARKER = (
-    '# Licensed under the Apache License, Version 2.0 (the "License");'
-)
+LICENSE_MARKER = '# Licensed under the Apache License, Version 2.0 (the "License");'
 
 
 def _copyright_line(year):
@@ -60,8 +58,7 @@ LICENSE_BODY_LINES = [
     "\n",
     "# Unless required by applicable law or agreed to in writing, software\n",
     '# distributed under the License is distributed on an "AS IS" BASIS,\n',
-    "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, "
-    "either express or implied.\n",
+    "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n",
     "# See the License for the specific language governing permissions and\n",
     "# limitations under the License.\n",
 ]
@@ -139,7 +136,7 @@ def add_header(file_path, status):
         # Insert the license body right after the existing copyright line.
         for i, line in enumerate(lines):
             if COPYRIGHT_RE.match(line.strip()):
-                lines[i + 1:i + 1] = ["\n", *LICENSE_BODY_LINES]
+                lines[i + 1 : i + 1] = ["\n", *LICENSE_BODY_LINES]
                 break
 
     elif status == LicenseStatus.MISSING_COPYRIGHT:
@@ -175,15 +172,19 @@ def main():
     failed = any(fixed.values()) or wrong_year
 
     if any(fixed.values()):
-        print("The following files were missing the RBLN License header "
-              "(auto-added; please review and re-stage):")
+        print(
+            "The following files were missing the RBLN License header "
+            "(auto-added; please review and re-stage):"
+        )
         for paths in fixed.values():
             for file_path in paths:
                 print(f"  {file_path}")
 
     if wrong_year:
-        print(f"The following files have a copyright year outside "
-              f"{MIN_YEAR}..{CURRENT_YEAR} (fix the year manually):")
+        print(
+            f"The following files have a copyright year earlier than "
+            f"{MIN_YEAR} (fix the year manually):"
+        )
         for file_path in wrong_year:
             print(f"  {file_path}")
 
