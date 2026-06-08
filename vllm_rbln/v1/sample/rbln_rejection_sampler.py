@@ -21,14 +21,12 @@ import rebel
 import torch
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
 from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.sample.rbln_sampler import (
     build_compile_options,
-    random_sample,
     resolve_compile_context,
 )
 
@@ -42,85 +40,7 @@ GREEDY_EPS = 1e-3
 MAX_SPEC_LEN = 32
 
 
-@torch.library.custom_op("rbln::rejection_sample", mutates_args=())
-def rejection_sample(
-    draft_token_ids: torch.Tensor,
-    target_probs: torch.Tensor,
-    cu_num_draft_tokens: torch.Tensor,
-    top_k: torch.Tensor | None,
-    top_p: torch.Tensor | None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Reference CPU implementation of the rbln::rejection_sample NPU primitive.
-
-    Inputs (packed-then-padded layout):
-      draft_token_ids     : (B*K,)   int32
-      target_probs        : (B*K, V) f16 / f32  (one-hot for greedy, scaled
-                                                 logits otherwise)
-      cu_num_draft_tokens : (B,)     int32  — cumulative end offsets, cu[-1] = N
-      top_k               : (B,)     int32  | None
-      top_p               : (B,)     f32  | None
-
-    Outputs (per-batch padded layout):
-      out_tokens   : (B, K) int64  — recovered token at the first-reject slot.
-                                     Other positions are filler; the caller
-                                     masks them by num_accepted.
-      num_accepted : (B,)   int64  — count of consecutive accepts before the
-                                     first reject (== n_i when all accepted).
-
-    Per-row sampling delegates to `apply_top_k_top_p`. Per-batch top_k / top_p
-    is expanded to per-row via repeat_interleave so the existing
-    apply_top_k_top_p (which expects (N,) k/p) can be reused without changes.
-    """
-    B = cu_num_draft_tokens.shape[0]
-    K = draft_token_ids.shape[0] // B
-    device = draft_token_ids.device
-
-    # Expand per-batch top_k / top_p to per-row (B*K,).
-    k_row = top_k.repeat_interleave(K) if top_k is not None else None
-    p_row = top_p.repeat_interleave(K) if top_p is not None else None
-
-    target_probs = apply_top_k_top_p(
-        target_probs.to(torch.float32), k_row, p_row
-    )  # (B*K, V)
-    sampled = random_sample(target_probs, {})  # (B*K, )
-    sampled = sampled.view(B, K).to(torch.int32)
-    drafts = draft_token_ids.view(B, K).to(torch.int32)
-
-    out_tokens = torch.zeros((B, K), dtype=torch.int64, device=device)
-    num_accepted = torch.zeros((B,), dtype=torch.int64, device=device)
-
-    cu = cu_num_draft_tokens.to(torch.int64).tolist()
-    for i in range(B):
-        start = 0 if i == 0 else cu[i - 1]
-        n_i = cu[i] - start
-        for j in range(n_i):
-            if sampled[i, j].item() == drafts[i, j].item():
-                num_accepted[i] += 1
-            else:
-                out_tokens[i, j] = sampled[i, j]
-                break
-
-    return out_tokens, num_accepted
-
-
-@rejection_sample.register_fake
-def rejection_sample_fake(
-    draft_token_ids: torch.Tensor,
-    target_probs: torch.Tensor,
-    cu_num_draft_tokens: torch.Tensor,
-    top_k: torch.Tensor | None,
-    top_p: torch.Tensor | None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """FakeTensor body — only output shape/dtype matters for torch.compile."""
-    B = cu_num_draft_tokens.shape[0]
-    K = draft_token_ids.shape[0] // B
-    device = draft_token_ids.device
-    out_tokens = torch.empty((B, K), dtype=torch.int64, device=device)
-    num_accepted = torch.empty((B,), dtype=torch.int64, device=device)
-    return out_tokens, num_accepted
-
-
-def rbln_random_sample(
+def rbln_rejection_sample(
     draft_token_ids: torch.Tensor,
     target_probs: torch.Tensor,
     cu_num_draft_tokens: torch.Tensor,
@@ -150,7 +70,7 @@ class RBLNRejectionSampler(RejectionSampler):
         compile_context = resolve_compile_context(compile_context)
         options = build_compile_options(compile_context)
         self.compiled_rejection_sample = torch.compile(
-            rbln_random_sample,
+            rbln_rejection_sample,
             dynamic=False,
             fullgraph=True,
             backend="rbln",
