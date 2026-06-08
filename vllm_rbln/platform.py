@@ -108,6 +108,10 @@ class RblnPlatform(Platform):
         pass
 
     @classmethod
+    def manual_seed_all(cls, seed: int) -> None:
+        rebel.manual_seed(seed)
+
+    @classmethod
     def is_pin_memory_available(cls):
         logger.warning("Pin memory is not supported on RBLN.")
         return False
@@ -134,10 +138,13 @@ class RblnPlatform(Platform):
             from vllm.usage.usage_lib import UsageContext
 
             default_batched_tokens, _ = orig_get_batch_defaults(cls_, world_size)
+            # Cover every usage context plus None (create_engine_config's
+            # usage_context is UsageContext | None);
+            # otherwise .get(ctx, DEFAULT_MAX_NUM_SEQS) falls through to 128.
             default_max_num_seqs = {
-                UsageContext.LLM_CLASS: RBLN_DEFAULT_MAX_NUM_SEQS,
-                UsageContext.OPENAI_API_SERVER: RBLN_DEFAULT_MAX_NUM_SEQS,
+                ctx: RBLN_DEFAULT_MAX_NUM_SEQS for ctx in UsageContext
             }
+            default_max_num_seqs[None] = RBLN_DEFAULT_MAX_NUM_SEQS
             return default_batched_tokens, default_max_num_seqs
 
         EngineArgs.get_batch_defaults = classmethod(get_batch_defaults)
