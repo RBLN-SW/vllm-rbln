@@ -111,6 +111,10 @@ class RblnPlatform(Platform):
         pass
 
     @classmethod
+    def manual_seed_all(cls, seed: int) -> None:
+        rebel.manual_seed(seed)
+
+    @classmethod
     def is_pin_memory_available(cls):
         logger.warning("Pin memory is not supported on RBLN.")
         return False
