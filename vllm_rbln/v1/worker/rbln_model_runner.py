@@ -36,6 +36,7 @@ from vllm.model_executor.models.interfaces import (
     supports_transcription,
 )
 from vllm.model_executor.models.interfaces_base import (
+    VllmModelForPooling,
     is_pooling_model,
     is_text_generation_model,
 )
@@ -66,6 +67,7 @@ from vllm.v1.outputs import (
     LogprobsLists,
     LogprobsTensors,
     ModelRunnerOutput,
+    PoolerOutput,
     SamplerOutput,
 )
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
@@ -118,6 +120,49 @@ AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 PerLayerAttnMetadata: TypeAlias = AttnMetadataDict  #  | list[AttnMetadataDict]
 
 
+def _copy_pooler_output(
+    raw_pooler_output: PoolerOutput, finished_mask: list[bool]
+) -> list[torch.Tensor | None]:
+    num_reqs = len(finished_mask)
+
+    if isinstance(raw_pooler_output, torch.Tensor):
+        if raw_pooler_output.shape[0] != num_reqs:
+            raise ValueError(
+                "Pooler output batch size does not match finished mask size: "
+                f"{raw_pooler_output.shape[0]} != {num_reqs}"
+            )
+
+        num_finished = sum(finished_mask)
+        if num_finished == 0:
+            return [None] * num_reqs
+        if num_finished == num_reqs:
+            return list(raw_pooler_output)
+
+        # partial finished
+        finished_indices = [i for i, include in enumerate(finished_mask) if include]
+        index_tensor = torch.tensor(
+            finished_indices, device=raw_pooler_output.device, dtype=torch.long
+        )
+        finished_outputs = raw_pooler_output.index_select(0, index_tensor)
+        partial_pooler_output: list[torch.Tensor | None] = [None] * num_reqs
+        for i, out in zip(finished_indices, finished_outputs):
+            partial_pooler_output[i] = out
+        return partial_pooler_output
+
+    assert isinstance(raw_pooler_output, list)
+    if len(raw_pooler_output) != num_reqs:
+        raise ValueError(
+            "Pooler output batch size does not match finished mask size: "
+            f"{len(raw_pooler_output)} != {num_reqs}."
+        )
+
+    pooler_output: list[torch.Tensor | None] = [None] * num_reqs
+    for i, (out, include) in enumerate(zip(raw_pooler_output, finished_mask)):
+        if include and out is not None:
+            pooler_output[i] = out
+    return pooler_output
+
+
 class ExecuteModelState(NamedTuple):
     """Ephemeral cached state transferred between execute_model() and
     sample_tokens(), after execute_model() returns None."""
@@ -161,6 +206,10 @@ class RBLNModelRunner:
             cache_config.cache_dtype, model_config
         )
 
+        # Pooling models
+        self.is_pooling_model = model_config.runner_type == "pooling"
+
+        # These will be overridden in load_model()
         self.max_model_len = model_config.max_model_len
         self.max_num_tokens = scheduler_config.max_num_batched_tokens
         self.max_num_reqs = scheduler_config.max_num_seqs
@@ -272,11 +321,11 @@ class RBLNModelRunner:
                 self.vllm_config,
                 self.device,
                 self.pin_memory,
-                False,
+                self.is_pooling_model,
                 custom_logitsprocs,
             ),
             logitsprocs_need_output_token_ids=bool(custom_logitsprocs),
-            is_pooling_model=False,
+            is_pooling_model=self.is_pooling_model,
             cp_kv_cache_interleave_size=parallel_config.cp_kv_cache_interleave_size,
         )
 
@@ -348,6 +397,43 @@ class RBLNModelRunner:
     def _get_positions(self, num_tokens: Any):
         assert not isinstance(num_tokens, int)
         return self.positions[:num_tokens]
+
+    def _init_model_kwargs(self):
+        model_kwargs = dict[str, Any]()
+
+        if not self.is_pooling_model:
+            return model_kwargs
+
+        num_reqs = self.input_batch.num_reqs
+        pooling_params = self.input_batch.get_pooling_params()
+
+        token_type_id_requests = dict[int, Any]()
+        for i, param in enumerate(pooling_params):
+            if (
+                param.extra_kwargs is not None
+                and (token_types := param.extra_kwargs.get("compressed_token_type_ids"))
+                is not None
+            ):
+                token_type_id_requests[i] = token_types
+
+        if len(token_type_id_requests) == 0:
+            return model_kwargs
+
+        # TODO(RBLN): RBLN keeps seq_lens on CPU for now. If this becomes a device
+        # tensor, switch to a CPU-side cached length buffer to avoid device copy.
+        seq_lens = self.seq_lens[:num_reqs].tolist()
+        token_type_ids = []
+
+        for i in range(num_reqs):
+            seq_len_i = seq_lens[i]
+            pos = token_type_id_requests.get(i, seq_len_i)
+            ids = (torch.arange(seq_len_i) >= pos).int()
+            token_type_ids.append(ids)
+
+        token_type_ids_cpu = torch.empty(sum(seq_lens), dtype=torch.int32)
+        torch.cat(token_type_ids, out=token_type_ids_cpu)
+        model_kwargs["token_type_ids"] = token_type_ids_cpu
+        return model_kwargs
 
     def _may_reorder_batch(self, scheduler_output: "SchedulerOutput") -> None:
         # NOTE(RBLN): Unlike upstream GPUModelRunner, we do not split mixed batches
@@ -424,6 +510,15 @@ class RBLNModelRunner:
                 generator.manual_seed(sampling_params.seed)
             else:
                 generator = None
+
+            if self.is_pooling_model:
+                assert pooling_params is not None
+                task = pooling_params.task
+                assert task is not None, "You did not set `task` in the API"
+
+                model = cast(VllmModelForPooling, self.get_model())
+                to_update = model.pooler.get_pooling_updates(task)
+                to_update.apply(pooling_params)
 
             req_state = CachedRequestState(
                 req_id=req_id,
@@ -935,6 +1030,53 @@ class RBLNModelRunner:
 
         return tuple(tasks)
 
+    def _pool(
+        self,
+        hidden_states: torch.Tensor,
+        num_scheduled_tokens: int,
+        num_scheduled_tokens_np: np.ndarray,
+        # kv_connector_output: KVConnectorOutput | None,
+    ) -> ModelRunnerOutput:
+        num_reqs = self.input_batch.num_reqs
+        assert num_reqs == len(self.input_batch.pooling_params), (
+            "Either all or none of the requests in a batch must be pooling request"
+        )
+
+        hidden_states = hidden_states[:num_scheduled_tokens]
+        seq_lens_cpu = self.seq_lens[:num_reqs]
+
+        pooling_metadata = self.input_batch.get_pooling_metadata()
+        pooling_metadata.build_pooling_cursor(
+            num_scheduled_tokens_np, seq_lens_cpu, device=hidden_states.device
+        )
+
+        model = cast(VllmModelForPooling, self.model)
+        raw_pooler_output: PoolerOutput = model.pooler(
+            hidden_states=hidden_states, pooling_metadata=pooling_metadata
+        )
+
+        finished_mask = [
+            seq_len == prompt_len
+            for seq_len, prompt_len in zip(seq_lens_cpu, pooling_metadata.prompt_lens)
+        ]
+
+        model_runner_output = ModelRunnerOutput(
+            req_ids=self.input_batch.req_ids.copy(),
+            req_id_to_index=self.input_batch.req_id_to_index.copy(),
+            kv_connector_output=None,
+        )
+
+        if raw_pooler_output is None or not any(finished_mask):
+            model_runner_output.pooler_output = [None] * num_reqs
+            return model_runner_output
+
+        model_runner_output.pooler_output = _copy_pooler_output(
+            raw_pooler_output=raw_pooler_output,
+            finished_mask=finished_mask,
+        )
+
+        return model_runner_output
+
     def _preprocess(
         self,
         num_reqs: int,
@@ -948,10 +1090,16 @@ class RBLNModelRunner:
         torch.Tensor,
         IntermediateTensors | None,
         torch.Tensor,
+        dict[str, Any],
     ]:
         """
         :return: tuple[
-            input_ids, inputs_embeds, positions, intermediate_tensors, logits_indices
+            input_ids,
+            inputs_embeds,
+            positions,
+            intermediate_tensors,
+            logits_indices,
+            model_kwargs,
         ]
         """
         # For text-only models
@@ -971,12 +1119,17 @@ class RBLNModelRunner:
             input_ids = pad(input_ids, 0, num_reqs_padded)
             positions = pad(positions, 0, num_reqs_padded)
 
+        model_kwargs = {
+            **self._init_model_kwargs(),
+        }
+
         return (
             input_ids,
             inputs_embeds,
             positions,
             intermediate_tensors,
             logits_indices,
+            model_kwargs,
         )
 
     def _sample(
@@ -1188,6 +1341,7 @@ class RBLNModelRunner:
                 positions,
                 intermediate_tensors,
                 logits_indices,
+                model_kwargs,
             ) = self._preprocess(
                 num_reqs,
                 num_reqs_padded,
@@ -1223,6 +1377,7 @@ class RBLNModelRunner:
                 intermediate_tensors=intermediate_tensors,
                 inputs_embeds=inputs_embeds,
                 token_indices=token_indices,
+                **model_kwargs,
             )
 
         with record_function_or_nullcontext("rbln_model_runner: postprocess"):
@@ -1232,6 +1387,14 @@ class RBLNModelRunner:
                 # Return the intermediate tensors.
                 assert isinstance(hidden_states, IntermediateTensors)
                 return hidden_states
+
+            if self.is_pooling_model:
+                # Return the pooling output.
+                return self._pool(
+                    hidden_states.flatten(0, -2),
+                    num_scheduled_tokens,
+                    num_scheduled_tokens_np,
+                )
 
             sample_hidden_states = hidden_states
             assert self.use_wrapped_compute_logits
@@ -1520,12 +1683,14 @@ class RBLNModelRunner:
             intermediate_tensors: IntermediateTensors | None = None,
             inputs_embeds: torch.Tensor | None = None,
             token_indices: torch.Tensor | None = None,
+            **kwargs,
         ):
             model_output = self.model(
                 input_ids=input_ids,
                 positions=positions,
                 intermediate_tensors=intermediate_tensors,
                 inputs_embeds=inputs_embeds,
+                **kwargs,
             )
 
             logits = None
@@ -1997,7 +2162,7 @@ class RBLNModelRunner:
                 is_spec_decode=bool(self.speculative_config),
                 logitsprocs=self.input_batch.logitsprocs,
                 logitsprocs_need_output_token_ids=self.input_batch.logitsprocs_need_output_token_ids,
-                is_pooling_model=False,
+                is_pooling_model=self.is_pooling_model,
             )
 
         assert self._init_block_sizes == block_sizes, (
@@ -2324,7 +2489,7 @@ class RBLNModelRunner:
 
     @property
     def use_wrapped_compute_logits(self) -> bool:
-        return True
+        return not self.is_pooling_model
 
     def _attach_kv_cache_bindings(
         self, attn_metadata: PerLayerAttnMetadata | None
@@ -2466,8 +2631,9 @@ class RBLNModelRunner:
                     _ = self.compute_logits(hidden_states)
 
             # 4. sampler
-            for size in range(1, self.max_num_reqs + 1):
-                self._dummy_sampler_run(size)
+            if not self.is_pooling_model:
+                for size in range(1, self.max_num_reqs + 1):
+                    self._dummy_sampler_run(size)
 
             # 5. drafter
             if self.speculative_config:
