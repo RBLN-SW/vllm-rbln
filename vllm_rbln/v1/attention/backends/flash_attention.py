@@ -1129,9 +1129,6 @@ class RBLNFlashAttentionMetadataBuilder(
             num_computed_tokens = seq_lens - query_seq_lens
             seq_idx = positions[query_start_loc[:num_reqs]].view(-1, 1)
 
-        # custom (triton) kernel's to_dynamic_index rejects int64 seq_lens
-        seq_idx = seq_idx.to(torch.int32)
-
         cu_prefix_query_lens = None
         prefix_kv_lens = None
         suffix_kv_lens = None
