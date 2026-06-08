@@ -58,7 +58,7 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
 )
 from vllm.v1.utils import report_usage_stats
-from vllm.v1.worker.worker_base import WorkerBase
+from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
@@ -445,7 +445,7 @@ class RBLNWorker(WorkerBase):
         )
         self._rbln_cpu_affinity_applied = True
 
-    def compile_or_warm_up_model(self) -> float:
+    def compile_or_warm_up_model(self) -> CompilationTimes:
         st = time.perf_counter()
         if self.parallel_config.data_parallel_size > 1:
             if envs.VLLM_RBLN_DP_IMPL == "padded_decode":
@@ -473,7 +473,9 @@ class RBLNWorker(WorkerBase):
             logger.warning("skipping compile_or_warm_up_model")
 
             self._ensure_rbln_cpu_affinity_after_warmup()
-            return time.perf_counter() - st
+            return CompilationTimes(
+                language_model=time.perf_counter() - st, encoder=0.0
+            )
         else:
             try:
                 self.model_runner.warm_up_model()
@@ -504,7 +506,7 @@ class RBLNWorker(WorkerBase):
         self._ensure_rbln_cpu_affinity_after_warmup()
         self.model_runner._enable_performance_tracker()
 
-        return time.perf_counter() - st
+        return CompilationTimes(language_model=time.perf_counter() - st, encoder=0.0)
 
     def get_model(self) -> nn.Module:
         return self.model_runner.get_model()
