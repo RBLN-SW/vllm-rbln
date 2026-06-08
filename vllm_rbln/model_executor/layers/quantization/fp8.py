@@ -513,6 +513,7 @@ def custom_moe_swiglu_group_dequantize(
     down_proj_bias: torch.Tensor | None = None,
     expert_map: torch.Tensor | None = None,
     dp_mask: torch.Tensor | None = None,
+    hidden_states_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Customized MoE SwiGLU operation.
@@ -574,6 +575,16 @@ def custom_moe_swiglu_group_dequantize(
         q = (s_g / scale).clamp(finfo.min, finfo.max).to(fp8_dtype)
         deq = (q.to(state.dtype) * scale.to(state.dtype)).reshape(orig_shape)
         return deq
+
+    # W8A8: the caller hands us fp8-quantized hidden_states plus a
+    # per-(token, K-block) scale. Dequantize back to the compute dtype so the
+    # reference matmuls below run in bf16, exactly like the W8A16 path. When
+    # W8A8 is off, hidden_states is already the unquantized activation.
+    if hidden_states_scale is not None:
+        compute_dtype = router_logits.dtype
+        hidden_states = hidden_states.to(compute_dtype) * hidden_states_scale.to(
+            compute_dtype
+        ).repeat_interleave(in_block_size, dim=-1)
 
     gate_out_block = (
         gate_proj_weight.shape[1] + gate_proj_scale.shape[1] - 1
@@ -642,7 +653,9 @@ def custom_moe_swiglu_group_dequantize(
         if token_idx.numel() == 0:
             continue
 
-        current_state = _maybe_quant_act(hidden_states[token_idx])
+        # Input activation is already (de)quantized above; only the swiglu
+        # intermediate is quantized inside the op for the down projection.
+        current_state = hidden_states[token_idx]
         gate = torch.nn.functional.linear(
             current_state,
             gate_proj_weight_dq[expert_idx],
@@ -687,8 +700,9 @@ def custom_moe_swiglu_group_dequantize_fake(
     down_proj_bias: torch.Tensor | None = None,
     expert_map: torch.Tensor | None = None,
     dp_mask: torch.Tensor | None = None,
+    hidden_states_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    return torch.empty_like(hidden_states)
+    return torch.empty_like(hidden_states, dtype=router_logits.dtype)
 
 
 class Fp8MoEMethod(FusedMoEMethodBase):
@@ -1016,6 +1030,29 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if use_moe_tokens_mask:
             tokens_mask = get_tokens_mask(num_tokens, device=router_logits.device)
 
+        # W8A8: dynamically quantize hidden_states to fp8 per (1, block_k) group
+        # along the contraction dim and hand both the fp8 tensor and the
+        # per-(token, K-block) scale to the compiler custom op.
+        if envs.VLLM_RBLN_USE_W8A8_FP8:
+            fp8_dtype = torch.float8_e4m3fn
+            finfo = torch.finfo(fp8_dtype)
+            in_block_size = int(self.weight_block_size[1])
+            hs_shape = hidden_states.shape
+            s_g = hidden_states.reshape(-1, in_block_size).to(torch.float32)
+            amax = s_g.abs().amax(dim=-1, keepdim=True).clamp_min(1e-10)
+            scale = amax / finfo.max
+            hidden_states = (
+                (s_g / scale)
+                .clamp(finfo.min, finfo.max)
+                .to(fp8_dtype)
+                .reshape(hs_shape)
+            )
+            hidden_states_scale = scale.reshape(
+                hs_shape[0], hs_shape[1] // in_block_size
+            )
+        else:
+            hidden_states_scale = None
+
         final_hidden_states = (
             torch.ops.rbln_custom_ops.custom_moe_swiglu_group_dequantize(
                 hidden_states,
@@ -1038,6 +1075,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 None,  # down_proj_bias
                 expert_map_const,
                 tokens_mask,
+                hidden_states_scale,
             )
         )
 
