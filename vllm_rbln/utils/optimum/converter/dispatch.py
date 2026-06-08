@@ -15,6 +15,7 @@
 import hashlib
 import json
 import os
+from importlib.metadata import PackageNotFoundError, version
 from typing import TYPE_CHECKING
 
 import vllm_rbln.rbln_envs as envs
@@ -53,6 +54,31 @@ def _strip_runtime_only_keys(obj: dict) -> dict:
     return obj
 
 
+# Packages whose version changes the compiled binary, so a version bump must
+# invalidate the cache to avoid loading an artifact built by a different
+# toolchain.
+_TOOLCHAIN_PACKAGES: tuple[str, ...] = ("rebel-compiler", "optimum-rbln")
+
+
+def _toolchain_versions() -> dict[str, str]:
+    """Resolve installed versions of the compile-time toolchain packages.
+
+    A missing package maps to ``"unknown"`` so hashing stays deterministic
+    instead of raising when a package can't be located.
+    """
+    versions: dict[str, str] = {}
+    for pkg in _TOOLCHAIN_PACKAGES:
+        try:
+            versions[pkg] = version(pkg)
+        except PackageNotFoundError:
+            logger.warning(
+                "Could not resolve version of %s for cache key; using 'unknown'.",
+                pkg,
+            )
+            versions[pkg] = "unknown"
+    return versions
+
+
 def _generate_model_path_name(
     vllm_config: VllmConfig,
 ) -> str:
@@ -64,14 +90,16 @@ def _generate_model_path_name(
     tp_size = envs.VLLM_RBLN_TP_SIZE
     additional_config = vllm_config.additional_config.get("rbln_config", None)
 
-    # FIXME: To avoid cache collisions, the cache key should also include
-    # the versions of the compiler and optimum-rbln.
+    # The compiled binary depends on the toolchain that produced it, so the
+    # toolchain versions are part of the cache key to avoid collisions across
+    # compiler / optimum-rbln upgrades.
     config_dict = {
         "model_name": model_name,
         "batch_size": batch_size,
         "block_size": block_size,
         "max_model_len": max_model_len,
         "tp_size": tp_size,
+        "toolchain_versions": _toolchain_versions(),
     }
     if additional_config:
         config_dict["rbln_config"] = _strip_runtime_only_keys(additional_config)
