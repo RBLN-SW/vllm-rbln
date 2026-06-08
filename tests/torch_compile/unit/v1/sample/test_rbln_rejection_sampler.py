@@ -125,8 +125,8 @@ def _build_inputs(
 
 
 def _assert_rbln_matches_cpu(sampler, inputs):
-    out_rbln = sampler.rejection_sample(*inputs).cpu().to(torch.int64)
-    out_cpu = cpu_rejection_sample(*inputs).cpu().to(torch.int64)
+    out_rbln = sampler.rejection_sample(*inputs).to(torch.int64)
+    out_cpu = cpu_rejection_sample(*inputs).to(torch.int64)
     assert torch.equal(out_rbln, out_cpu), (
         f"\nRBLN:\n{out_rbln}\nCPU (reference):\n{out_cpu}"
     )
