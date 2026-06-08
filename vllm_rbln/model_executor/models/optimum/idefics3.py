@@ -21,7 +21,10 @@ from vllm.model_executor.models.idefics3 import (
     Idefics3ImagePixelInputs,
     ImageInputs,
 )
-from vllm.model_executor.models.interfaces import SupportsMultiModal
+from vllm.model_executor.models.interfaces import (
+    MultiModalEmbeddings,
+    SupportsMultiModal,
+)
 
 from .base import ModelInputForRBLN
 from .model_base import RBLNOptimumDecoderMixin, RBLNOptimumModelBase
@@ -32,6 +35,13 @@ logger = init_logger(__name__)
 class RBLNOptimumIdefics3ForConditionalGeneration(
     RBLNOptimumModelBase, RBLNOptimumDecoderMixin, SupportsMultiModal
 ):
+    @classmethod
+    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
+        if modality.startswith("image"):
+            return "<image>"
+
+        raise ValueError("Only image modality is supported")
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -62,27 +72,16 @@ class RBLNOptimumIdefics3ForConditionalGeneration(
         )
 
         if is_prompt:
-            if model_input.multi_modal_kwargs:
-                image_input = self._parse_and_validate_image_input(
-                    **model_input.multi_modal_kwargs
-                )
-
-            # Only when image input is given
-            if image_input is not None:
-                pixel_values = image_input["pixel_values"].unsqueeze(0)
-                pixel_attention_mask = image_input["pixel_attention_mask"].unsqueeze(0)
-            else:
-                pixel_values = None
-                pixel_attention_mask = None
-
             block_tables = kwargs.pop("block_tables")
             input_ids = kwargs.pop("input_ids")
             cache_position = kwargs.pop("cache_position")
 
-            inputs_embeds = self.model._preprocess_prefill(
-                input_ids=input_ids,
-                pixel_values=pixel_values,
-                pixel_attention_mask=pixel_attention_mask,
+            multimodal_embeddings = self.embed_multimodal(
+                **(model_input.multi_modal_kwargs or {})
+            )
+            inputs_embeds = self.embed_input_ids(
+                input_ids,
+                multimodal_embeddings or None,
             )
             logits = self.model.text_model.prefill_decoder(
                 inputs_embeds=inputs_embeds,
@@ -98,6 +97,96 @@ class RBLNOptimumIdefics3ForConditionalGeneration(
         if not is_prompt:
             logits = logits[:request_nums]
         return logits
+
+    def get_language_model(self):
+        return self.model.text_model
+
+    def _process_image_input(self, image_input: ImageInputs) -> list[torch.Tensor]:
+        # FIXME new API in optimum-rbln
+        if image_input["type"] == "image_embeds":
+            return list(image_input["data"])
+
+        # Replicates the vision-encode portion of optimum-rbln's
+        # _preprocess_prefill (vision_model + connector); optimum-rbln does not
+        # expose a standalone get_image_features for Idefics3.
+        model = self.model
+        config = model.config
+        pixel_values = image_input["pixel_values"].unsqueeze(0)
+        pixel_attention_mask = image_input["pixel_attention_mask"].unsqueeze(0)
+
+        batch_size, num_images = pixel_values.shape[:2]
+        pixel_values = pixel_values.to(dtype=model.dtype)
+        pixel_values = pixel_values.view(batch_size * num_images, *pixel_values.shape[2:])
+
+        # Drop fully-padded (all-zero) images.
+        nb_values_per_image = pixel_values.shape[1:].numel()
+        real_images_inds = (pixel_values == 0.0).sum(
+            dim=(-1, -2, -3)
+        ) != nb_values_per_image
+        pixel_values = pixel_values[real_images_inds].contiguous()
+
+        pixel_attention_mask = pixel_attention_mask.view(
+            batch_size * num_images, *pixel_attention_mask.shape[2:]
+        )
+        pixel_attention_mask = pixel_attention_mask[real_images_inds].contiguous()
+
+        patch_size = config.vision_config.patch_size
+        patches_subgrid = pixel_attention_mask.unfold(1, patch_size, patch_size)
+        patches_subgrid = patches_subgrid.unfold(2, patch_size, patch_size)
+        patch_attention_mask = (patches_subgrid.sum(dim=(-1, -2)) > 0).bool()
+
+        image_hidden_states = model.vision_model(
+            pixel_values=pixel_values,
+            patch_attention_mask=patch_attention_mask,
+            return_dict=True,
+        ).last_hidden_state
+
+        # Pixel-shuffle connector, run per image.
+        connector_out_size = [
+            image_hidden_states.shape[0],
+            image_hidden_states.shape[1] // config.scale_factor**2,
+            config.text_config.hidden_size,
+        ]
+        connector_outputs = torch.empty(
+            size=connector_out_size, dtype=torch.float32, device="cpu"
+        )
+        for i in range(image_hidden_states.shape[0]):
+            model.connector(
+                image_hidden_states[i : i + 1], out=connector_outputs[i : i + 1]
+            )
+
+        return list(connector_outputs)
+
+    def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
+        image_input = self._parse_and_validate_image_input(**kwargs)
+        if image_input is None:
+            return []
+
+        return self._process_image_input(image_input)
+
+    def embed_input_ids(
+        self,
+        input_ids: torch.Tensor,
+        multimodal_embeddings: MultiModalEmbeddings | None = None,
+        *,
+        is_multimodal: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        # Mirrors optimum-rbln's inputs_merger: image tokens are in-vocab, so
+        # scatter the connector outputs over the image-token positions.
+        config = self.model.config
+        if is_multimodal is None:
+            is_multimodal = input_ids == config.image_token_id
+
+        inputs_embeds = self.model.get_input_embeddings()(input_ids)
+
+        if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
+            return inputs_embeds
+
+        mm_embeds = torch.cat(list(multimodal_embeddings)).to(
+            inputs_embeds.device, inputs_embeds.dtype
+        )
+        scatter_mask = is_multimodal.unsqueeze(-1).expand_as(inputs_embeds)
+        return inputs_embeds.masked_scatter(scatter_mask, mm_embeds)
 
     def _validate_pixel_values(self, data: torch.Tensor) -> torch.Tensor:
         h = w = self.model.config.vision_config.image_size
