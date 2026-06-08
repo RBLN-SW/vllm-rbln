@@ -216,7 +216,7 @@ class RBLNOptimumModelRunner(
                 self.is_pooling_model,
                 self.vllm_config.model_config.logits_processors,
             ),
-            is_spec_decode=False,  # No spec decode in optimum model runner
+            num_spec_tokens=0,  # No spec decode in optimum model runner
             is_pooling_model=self.is_pooling_model,
             use_rbln_sampler=self.use_rbln_sampler,
         )
