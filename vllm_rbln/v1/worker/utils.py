@@ -23,7 +23,11 @@ import torch
 from vllm.config import ModelConfig, ParallelConfig
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.platforms import CpuArchEnum, current_platform
-from vllm.platforms.cpu import CpuPlatform, LogicalCPUInfo
+from vllm.utils.cpu_resource_utils import (
+    LogicalCPUInfo,
+    get_allowed_cpu_list,
+    get_visible_memory_node,
+)
 
 import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
@@ -242,7 +246,8 @@ def get_autobind_cpu_ids(
     Returns:
         Comma-separated string of CPU IDs, or "all" or "nobind".
     """
-    allowed_numa_nodes, logical_cpu_list = CpuPlatform.get_allowed_cpu_core_node_list()
+    allowed_numa_nodes = get_visible_memory_node()
+    logical_cpu_list = get_allowed_cpu_list()
 
     # Calculate rank_across_dp for CPU binding
     # This ensures different DP groups get different CPU allocations
