@@ -18,19 +18,12 @@ End-to-end correctness for the RBLN rejection sampler (greedy path).
 
 from __future__ import annotations
 
-import os
-
 import pytest
 from vllm import SamplingParams
 
 from ...utils import managed_llm
 from .utils import assert_spec_matches_base_within_noise
 
-os.environ["VLLM_RBLN_USE_VLLM_MODEL"] = "1"
-os.environ["VLLM_RBLN_COMPILE_STRICT_MODE"] = "1"
-os.environ["VLLM_DISABLE_COMPILE_CACHE"] = "1"
-os.environ["VLLM_RBLN_ENABLE_WARM_UP"] = "1"
-os.environ["VLLM_RBLN_SAMPLER"] = "1"
 # Repeated n-grams so the ngram proposer finds prompt-lookup matches and drafts
 # tokens; distinct content across requests keeps the batch heterogeneous.
 PROMPTS = [

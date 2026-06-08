@@ -49,7 +49,7 @@ def main():
         "A robot may not injure a human being",
         "The capital of France is",
     ]
-    sampling_params = SamplingParams(temperature=0.0, max_tokens=128)
+    sampling_params = SamplingParams(temperature=0.1, top_p=0.9, max_tokens=128)
     outputs = llm.generate(prompts, sampling_params=sampling_params)
 
     for output in outputs:
