@@ -28,7 +28,7 @@ from vllm import SamplingParams
 
 from ..utils import managed_llm
 
-MODEL_ID = "RedHatAI/Qwen3-1.7B-FP8-dynamic"
+MODEL_ID = "Qwen/Qwen3-1.7B-FP8"
 
 LLM_KWARGS = {
     "model": MODEL_ID,
