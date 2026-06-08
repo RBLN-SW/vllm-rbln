@@ -15,7 +15,10 @@ from typing import Any
 
 import torch
 from vllm.config import VllmConfig
-from vllm.model_executor.models.interfaces import SupportsMultiModal
+from vllm.model_executor.models.interfaces import (
+    MultiModalEmbeddings,
+    SupportsMultiModal,
+)
 from vllm.model_executor.models.paligemma import (
     PaliGemmaImageEmbeddingInputs,
     PaliGemmaImageInputs,
@@ -27,10 +30,19 @@ from vllm_rbln.model_executor.models.optimum.base import ModelInputForRBLN
 
 from .model_base import RBLNOptimumDecoderMixin, RBLNOptimumModelBase
 
+PAD_TOKEN_ID = 0
+
 
 class RBLNOptimumPaliGemmaForConditionalGeneration(
     RBLNOptimumModelBase, RBLNOptimumDecoderMixin, SupportsMultiModal
 ):
+    @classmethod
+    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
+        if modality.startswith("image"):
+            return None
+
+        raise ValueError("Only image modality is supported")
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -61,18 +73,16 @@ class RBLNOptimumPaliGemmaForConditionalGeneration(
         )
 
         if is_prompt:
-            if model_input.multi_modal_kwargs:
-                pixel_values = self.get_pixel_values(model_input)
-            else:
-                pixel_values = None
-
             block_tables = kwargs.pop("block_tables")
             input_ids = kwargs.pop("input_ids")
             cache_position = kwargs.pop("cache_position")
 
-            inputs_embeds = self.model._preprocess_prefill(
-                input_ids=input_ids,
-                pixel_values=pixel_values,
+            multimodal_embeddings = self.embed_multimodal(
+                **(model_input.multi_modal_kwargs or {})
+            )
+            inputs_embeds = self.embed_input_ids(
+                input_ids,
+                multimodal_embeddings or None,
             )
             logits = self.model.language_model.prefill_decoder(
                 inputs_embeds=inputs_embeds,
@@ -99,20 +109,56 @@ class RBLNOptimumPaliGemmaForConditionalGeneration(
             logits = logits[:request_nums]
         return logits
 
-    def get_pixel_values(self, model_input: ModelInputForRBLN):
-        image_input = None
+    def get_language_model(self):
+        return self.model.language_model
 
-        if model_input.multi_modal_kwargs:
-            image_input = self._parse_and_validate_image_input(
-                **model_input.multi_modal_kwargs
-            )
-            if image_input is not None:
-                assert image_input["type"] == "pixel_values"
-                pixel_values = image_input["data"]
+    def _process_image_input(
+        self, image_input: PaliGemmaImageInputs
+    ) -> list[torch.Tensor]:
+        if image_input["type"] == "image_embeds":
+            return list(image_input["data"])
+
+        # Vision tower + multi-modal projector, compiled by optimum-rbln.
+        # Returns (num_images, num_image_tokens, hidden_size).
+        image_features = self.model.get_image_features(image_input["data"])
+        return list(image_features)
+
+    def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
+        image_input = self._parse_and_validate_image_input(**kwargs)
+        if image_input is None:
+            return []
+
+        return self._process_image_input(image_input)
+
+    def embed_input_ids(
+        self,
+        input_ids: torch.Tensor,
+        multimodal_embeddings: MultiModalEmbeddings | None = None,
+        *,
+        is_multimodal: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        # Mirrors the merge semantics of optimum-rbln's _preprocess_prefill:
+        # replace OOV image tokens with PAD for the text embedding lookup,
+        # then scatter the image features over the image-token positions.
+        config = self.model.config
+        if is_multimodal is None:
+            is_multimodal = input_ids == config.image_token_id
+
+        if config.image_token_id >= config.text_config.vocab_size:
+            llm_input_ids = input_ids.masked_fill(is_multimodal, PAD_TOKEN_ID)
         else:
-            pixel_values = None
+            llm_input_ids = input_ids
+        inputs_embeds = self.model.get_input_embeddings()(llm_input_ids)
 
-        return pixel_values
+        if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
+            return inputs_embeds
+
+        # Flatten per-image embeddings into (num_mm_tokens, hidden_size).
+        mm_embeds = torch.cat(list(multimodal_embeddings)).to(
+            inputs_embeds.device, inputs_embeds.dtype
+        )
+        scatter_mask = is_multimodal.unsqueeze(-1).expand_as(inputs_embeds)
+        return inputs_embeds.masked_scatter(scatter_mask, mm_embeds)
 
     def _parse_and_validate_image_input(
         self, **kwargs: Any
