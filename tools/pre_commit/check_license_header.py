@@ -12,18 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import datetime
 import re
 import sys
 from enum import Enum
 
-# Years accepted in the Rebellions copyright line. To "open up" a new year,
-# just add it here -- e.g. add "2027" when the year rolls over. The check and
-# the auto-fixer both read from this list.
-ALLOWED_YEARS = ("2025", "2026")
+# Creation-year convention: a file keeps the year it was first created, so any
+# year from the project's first year through the current year is valid. We
+# reject only future years (typos like a year that hasn't happened yet). This
+# way no annual maintenance is needed -- the upper bound moves with the clock.
+MIN_YEAR = 2025
+CURRENT_YEAR = datetime.date.today().year
 
-# Year used when auto-adding a brand-new copyright line. Defaults to the most
-# recent allowed year.
-NEW_HEADER_YEAR = ALLOWED_YEARS[-1]
+# Year stamped on a header that is auto-added to a brand-new file == the year
+# the file is first added.
+NEW_HEADER_YEAR = CURRENT_YEAR
+
+
+def _year_ok(year):
+    return MIN_YEAR <= int(year) <= CURRENT_YEAR
 
 # Matches the Rebellions copyright line with any 4-digit year. The trailing
 # "All rights reserved." is optional so that older one-line variants are still
@@ -88,7 +95,7 @@ def check_license_header_status(file_path):
         match = COPYRIGHT_RE.match(stripped)
         if match:
             has_copyright = True
-            if match.group("year") in ALLOWED_YEARS:
+            if _year_ok(match.group("year")):
                 copyright_year_ok = True
         if stripped == LICENSE_MARKER:
             has_license_body = True
@@ -176,7 +183,7 @@ def main():
 
     if wrong_year:
         print(f"The following files have a copyright year outside "
-              f"{ALLOWED_YEARS} (fix the year manually):")
+              f"{MIN_YEAR}..{CURRENT_YEAR} (fix the year manually):")
         for file_path in wrong_year:
             print(f"  {file_path}")
 
