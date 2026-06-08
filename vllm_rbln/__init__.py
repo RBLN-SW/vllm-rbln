@@ -49,6 +49,7 @@ def register_ops():
     # propagated event (wrap-based approaches at warm_up_model / execute_model
     # / dummy_run did not work for this code path), so we silence the raise
     # here. See ``_torch_dynamo_compat.py`` for details.
+    import vllm_rbln._torch_accelerator_compat  # noqa
     import vllm_rbln._torch_dynamo_compat  # noqa
     import vllm_rbln.distributed.ec_transfer.ec_connector.factory  # noqa
 
