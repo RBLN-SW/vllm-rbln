@@ -23,7 +23,10 @@ from vllm.model_executor.models.gemma3_mm import (
     Gemma3MultiModalProcessor,
     Gemma3ProcessingInfo,
 )
-from vllm.model_executor.models.interfaces import SupportsMultiModal
+from vllm.model_executor.models.interfaces import (
+    MultiModalEmbeddings,
+    SupportsMultiModal,
+)
 from vllm.model_executor.models.interfaces_base import VllmModelForTextGeneration
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
@@ -81,6 +84,13 @@ class RBLNOptimumGemma3ForConditionalGeneration(
     VllmModelForTextGeneration,
     SupportsMultiModal,
 ):
+    @classmethod
+    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
+        if modality.startswith("image"):
+            return "<start_of_image>"
+
+        raise ValueError("Only image modality is supported")
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -140,7 +150,6 @@ class RBLNOptimumGemma3ForConditionalGeneration(
         block_tables = kwargs.pop("block_tables")
 
         if is_prompt:
-            inputs_embeds = None
             prefill_batch_idx = sliding_window_table_ids[0]
             local_block_table_id = torch.tensor([prefill_batch_idx], dtype=torch.int16)
             # token_type_ids model_input != token_type_ids of gemma3
@@ -148,9 +157,12 @@ class RBLNOptimumGemma3ForConditionalGeneration(
             token_type_ids = torch.zeros_like(input_ids)
             token_type_ids[input_ids == self.model.config.image_token_index] = 1
 
-            pixel_values = self.get_pixel_values(model_input)
-            inputs_embeds = self.model._preprocess_prefill(
-                input_ids, inputs_embeds, pixel_values
+            multimodal_embeddings = self.embed_multimodal(
+                **(model_input.multi_modal_kwargs or {})
+            )
+            inputs_embeds = self.embed_input_ids(
+                input_ids,
+                multimodal_embeddings or None,
             )
             if self.model.language_model.prefill_decoder is None:
                 raise version_error
@@ -215,20 +227,61 @@ class RBLNOptimumGemma3ForConditionalGeneration(
             logits = logits[:request_nums]
         return logits
 
-    def get_pixel_values(self, model_input: ModelInputForRBLN):
-        image_input = None
+    def get_language_model(self):
+        return self.model.language_model
 
-        if model_input.multi_modal_kwargs:
-            image_input = self._parse_and_validate_image_input(
-                **model_input.multi_modal_kwargs
-            )
-            if image_input is not None:
-                assert image_input["type"] == "pixel_values"
-                pixel_values = image_input["pixel_values"]
+    def _process_image_input(
+        self, image_input: Gemma3ImageInputs
+    ) -> list[torch.Tensor]:
+        assert image_input["type"] == "pixel_values"
+        pixel_values = image_input["pixel_values"]
+        num_patches = image_input["num_patches"]
+
+        # Vision tower + multi-modal projector, compiled by optimum-rbln.
+        # Returns (num_patches_total, mm_tokens_per_image, hidden_size).
+        image_embeds = self.model.get_image_features(pixel_values)
+
+        if num_patches is None:
+            return list(image_embeds)
+        return [e.flatten(0, 1) for e in image_embeds.split(num_patches.tolist())]
+
+    def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
+        image_input = self._parse_and_validate_image_input(**kwargs)
+        if image_input is None:
+            return []
+
+        return self._process_image_input(image_input)
+
+    def embed_input_ids(
+        self,
+        input_ids: torch.Tensor,
+        multimodal_embeddings: MultiModalEmbeddings | None = None,
+        *,
+        is_multimodal: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        # Mirrors the merge semantics of optimum-rbln's _preprocess_prefill:
+        # replace OOV image tokens with PAD for the text embedding lookup,
+        # then scatter the image embeddings over the image-token positions.
+        config = self.model.config
+        if is_multimodal is None:
+            is_multimodal = input_ids == config.image_token_index
+
+        if config.image_token_index >= self.model.vocab_size:
+            llm_input_ids = input_ids.masked_fill(is_multimodal, PAD_TOKEN_ID)
         else:
-            pixel_values = None
+            llm_input_ids = input_ids
+        inputs_embeds = self.model.get_input_embeddings()(llm_input_ids)
 
-        return pixel_values
+        if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
+            return inputs_embeds
+
+        # Flatten per-item embeddings into (num_mm_tokens, hidden_size);
+        # works for both a list of 2D tensors and a 3D tensor.
+        mm_embeds = torch.cat(list(multimodal_embeddings)).to(
+            inputs_embeds.device, inputs_embeds.dtype
+        )
+        scatter_mask = is_multimodal.unsqueeze(-1).expand_as(inputs_embeds)
+        return inputs_embeds.masked_scatter(scatter_mask, mm_embeds)
 
     def _parse_and_validate_image_input(
         self, **kwargs: Any
