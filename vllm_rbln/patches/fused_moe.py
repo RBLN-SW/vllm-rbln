@@ -39,6 +39,7 @@ def custom_moe_glu(
     up_proj_weight: torch.Tensor,
     down_proj_weight: torch.Tensor,
     masked_routing_weight: torch.Tensor,
+    scoring_func: str,
     topk: int,
     post_norm: bool,
     expert_map: torch.Tensor | None = None,
@@ -78,6 +79,7 @@ def custom_moe_glu_fake(
     up_proj_weight: torch.Tensor,
     down_proj_weight: torch.Tensor,
     masked_routing_weight: torch.Tensor,
+    scoring_func: str,
     topk: int,
     post_norm: bool,
     expert_map: torch.Tensor | None = None,
@@ -192,6 +194,15 @@ def patched_unquantized_fused_moe_method_optimized(
     hidden_states = x.reshape(num_tokens, -1)
     router_logits = router_logits.reshape(num_tokens, -1)
 
+    # Pre-score routing inputs at caller side; compiler custom op routing
+    # expects already-scored values (no sigmoid applied inside the kernel).
+    assert layer.scoring_func is not None, "scoring_func must be set"
+    assert layer.scoring_func in {"softmax", "sigmoid"}
+    if layer.scoring_func == "sigmoid":
+        router_logits = torch.sigmoid(router_logits.to(torch.float32)).to(
+            router_logits.dtype
+        )
+
     tokens_mask = (
         get_tokens_mask(num_tokens) if envs.VLLM_RBLN_USE_MOE_TOKENS_MASK else None
     )
@@ -202,6 +213,7 @@ def patched_unquantized_fused_moe_method_optimized(
         up_proj_weight,
         down_proj_weight,
         router_logits,
+        layer.scoring_func,
         layer.top_k,
         layer.renormalize,
         layer.expert_map,
@@ -214,9 +226,9 @@ def patched_unquantized_fused_moe_method_optimized(
 
 
 @register_patch(
-    target="vllm.model_executor.layers.fused_moe.layer.FusedMoE.forward_oot",
+    target="vllm.model_executor.layers.fused_moe.layer.FusedMoE.forward",
     reason=(
-        "Override FusedMoE.forward_oot to support RBLN MoE DP execution: "
+        "Override FusedMoE.forward to support RBLN MoE DP execution: "
         "multicast hidden states across DP ranks, compute router logits after "
         "multicast, call the patched quant_method.apply path, and combine "
         "DP outputs. (PR#145)"
