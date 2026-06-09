@@ -32,8 +32,8 @@ def patched_qwen2_moe_forward(
         return self.gate(h)[0]
 
     final_hidden_states = self.experts(hidden_states=hidden_states, router=router)
-    if self.shared_expert:
-        final_hidden_states = final_hidden_states[0] + final_hidden_states[1]
+    if self.shared_expert is not None:
+        final_hidden_states = final_hidden_states + self.shared_expert(hidden_states)
 
     if self.tp_size > 1:
         final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(

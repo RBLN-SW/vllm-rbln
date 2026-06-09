@@ -104,7 +104,6 @@ class RBLNDPMetadata(DPMetadata):
             num_tokens_across_dp_cpu = num_tokens_across_dp
             max_pad = num_padded_tokens
 
-            max_tokens_across_dp_cpu = torch.max(num_tokens_across_dp_cpu)
             max_pads_across_dp = torch.empty(max_pad, device="cpu")
         else:
             assert num_tokens_across_dp is None, (
@@ -116,11 +115,9 @@ class RBLNDPMetadata(DPMetadata):
             num_tokens_across_dp_cpu = torch.tensor(
                 [num_tokens], device="cpu", dtype=torch.int32
             )
-            max_tokens_across_dp_cpu = num_tokens
             max_pads_across_dp = None
 
         return RBLNDPMetadata(
-            max_tokens_across_dp_cpu,
             num_tokens_across_dp_cpu,
             max_pads_across_dp=max_pads_across_dp,
         )
@@ -161,7 +158,6 @@ def set_forward_context(
     forward_context = create_forward_context(
         attn_metadata,
         vllm_config,
-        virtual_engine,
         dp_metadata,
         additional_kwargs=additional_kwargs,
     )

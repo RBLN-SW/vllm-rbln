@@ -13,15 +13,19 @@
 # limitations under the License.
 """CPU affinity utilities for RBLN worker."""
 
+import json
 import math
 import os
 import platform
+import re
+import subprocess
 from collections.abc import Callable
 
 import torch
 from vllm.config import ModelConfig, ParallelConfig
 from vllm.platforms import CpuArchEnum, current_platform
-from vllm.platforms.cpu import CpuPlatform, LogicalCPUInfo
+from vllm.platforms.cpu import CpuPlatform
+from vllm.utils.cpu_resource_utils import LogicalCPUInfo
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     EncoderOnlyAttentionSpec,
@@ -232,6 +236,49 @@ def estimate_available_memory(
     return available_dram_bytes
 
 
+# NOTE(RBLN): CpuPlatform.get_allowed_cpu_core_node_list() was removed in
+# https://github.com/vllm-project/vllm/pull/36487. Reimplemented here so
+# get_autobind_cpu_ids() can still resolve allowed NUMA nodes and logical CPUs.
+def get_allowed_cpu_core_node_list() -> tuple[list[int], list[LogicalCPUInfo]]:
+    assert platform.system() == "Linux"
+
+    # Init LogicalCPUInfo from lscpu
+    lscpu_output = subprocess.check_output(
+        "lscpu -J -e=CPU,CORE,NODE", shell=True, text=True
+    )
+    lscpu_output = re.sub(r'"node":\s*-\s*(,|\n)', r'"node": 0\1', lscpu_output)
+    logical_cpu_list: list[LogicalCPUInfo] = json.loads(
+        lscpu_output, object_hook=LogicalCPUInfo.json_decoder
+    )["cpus"]
+
+    # Filter CPUs with invalid attributes
+    logical_cpu_list = [
+        x for x in logical_cpu_list if -1 not in (x.id, x.physical_core, x.numa_node)
+    ]
+
+    # Filter allowed CPUs
+    if hasattr(os, "sched_getaffinity"):
+        allowed_cpu_id_list = os.sched_getaffinity(0)
+    else:
+        raise NotImplementedError("Unsupported OS")
+    logical_cpu_list = [x for x in logical_cpu_list if x.id in allowed_cpu_id_list]
+
+    # Get allowed NUMA nodes
+    allowed_numa_nodes = set()
+    for x in logical_cpu_list:
+        allowed_numa_nodes.add(x.numa_node)  # type: ignore
+    allowed_numa_nodes_list = sorted(allowed_numa_nodes)
+
+    env_key = CpuPlatform.device_control_env_var
+    if env_key in os.environ and os.environ[env_key] != "":
+        visible_nodes = [int(s) for s in os.environ[env_key].split(",")]
+        allowed_numa_nodes_list = [
+            x for x in sorted(list(set(visible_nodes))) if x in allowed_numa_nodes
+        ]
+
+    return allowed_numa_nodes_list, logical_cpu_list
+
+
 def get_autobind_cpu_ids(
     rank: int,
     local_rank: int,
@@ -249,7 +296,7 @@ def get_autobind_cpu_ids(
     Returns:
         Comma-separated string of CPU IDs, or "all" or "nobind".
     """
-    allowed_numa_nodes, logical_cpu_list = CpuPlatform.get_allowed_cpu_core_node_list()
+    allowed_numa_nodes, logical_cpu_list = get_allowed_cpu_core_node_list()
 
     # Calculate rank_across_dp for CPU binding
     # This ensures different DP groups get different CPU allocations

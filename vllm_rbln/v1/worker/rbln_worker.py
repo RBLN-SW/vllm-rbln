@@ -56,7 +56,7 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
 )
 from vllm.v1.utils import report_usage_stats
-from vllm.v1.worker.worker_base import WorkerBase
+from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 import vllm_rbln.envs as envs
 from vllm_rbln.logger import init_logger
@@ -368,7 +368,7 @@ class RBLNWorker(WorkerBase):
         self.model_runner.initialize_kv_cache(kv_cache_config)
 
     @instrument(span_name="Warmup (NPU)")
-    def compile_or_warm_up_model(self) -> float:
+    def compile_or_warm_up_model(self) -> CompilationTimes:
         # NOTE(RBLN): Manual timing since RBLN does not support @support_torch_compile.
         st = time.perf_counter()
 
@@ -417,7 +417,7 @@ class RBLNWorker(WorkerBase):
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
 
-        return time.perf_counter() - st
+        return CompilationTimes(language_model=time.perf_counter() - st, encoder=0.0)
 
     def get_model(self) -> nn.Module:
         return self.model_runner.get_model()

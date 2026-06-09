@@ -13,6 +13,7 @@
 # limitations under the License.
 import os
 from copy import copy
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -40,11 +41,19 @@ from vllm_rbln.v1.spec_decode.utils import (
     eagle_prepare_next_token_padded,
 )
 
+if TYPE_CHECKING:
+    from vllm_rbln.v1.worker.rbln_model_runner import RBLNModelRunner
+
 logger = init_logger(__name__)
 
 
 class RBLNEagleProposer(EagleProposer):
-    def __init__(self, vllm_config: VllmConfig, device: torch.device, runner=None):
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        device: torch.device,
+        runner: "RBLNModelRunner",
+    ):
         super().__init__(vllm_config, device, runner)
 
         if self.supports_mm_inputs:
@@ -52,6 +61,7 @@ class RBLNEagleProposer(EagleProposer):
 
         from rebel import CompileContext
 
+        self.runner = runner
         self.compile_context = CompileContext(use_weight_sharing=True)
 
     def propose(

@@ -11,19 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
-from vllm.model_executor.layers.attention.attention import (
-    Attention,
-    get_attention_context,
-)
+from vllm.model_executor.layers.attention.attention import Attention
 from vllm.model_executor.layers.attention.kv_transfer_utils import (
     maybe_transfer_kv_layer,
 )
 from vllm.model_executor.models.utils import extract_layer_index
-from vllm.v1.attention.backend import AttentionType
+from vllm.v1.attention.backend import AttentionMetadata, AttentionType
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 
 from vllm_rbln.patches import register_patch
@@ -31,9 +29,18 @@ from vllm_rbln.v1.attention.backends.flash_attention import RBLNFlashAttentionMe
 from vllm_rbln.v1.attention.kv_cache_bindings import materialize_kv_cache_view
 from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.attention import MLAAttention
+
 attention_original_init = Attention.__init__
+attention_original_forward = Attention.forward
 
 
+# NOTE(RBLN) - To represent kv cache as model input,
+# modify attention instead of using the attention layer's embedded
+# kv cache (self.kv_cache); use attention metadata's kv cache.
+# attention metadata's kv cache must equal the attention layer's
+# embedded kv cache.
 def _resolve_kv_cache(
     attn_metadata: RBLNFlashAttentionMetadata, layer_index: int
 ) -> torch.Tensor:
@@ -54,32 +61,46 @@ def _resolve_kv_cache(
     return attn_metadata.kv_caches[layer_index]
 
 
+def _get_attention_context(
+    layer_name: str,
+) -> tuple[Any, "Attention | MLAAttention", torch.Tensor]:
+    """Extract attention context for a given layer."""
+    forward_context = get_forward_context()
+    attn_metadata_raw = forward_context.attn_metadata
+    attn_metadata: AttentionMetadata
+    if isinstance(attn_metadata_raw, dict):
+        attn_metadata = attn_metadata_raw[layer_name]
+    elif isinstance(attn_metadata_raw, list):
+        # list[dict[str, AttentionMetadata]]: used in speculative decoding
+        # where [0] is the base-model (non-speculative) metadata dict.
+        attn_metadata = attn_metadata_raw[0][layer_name]
+    else:
+        attn_metadata = attn_metadata_raw
+    attn_layer: Attention | MLAAttention = forward_context.no_compile_layers[layer_name]
+    kv_cache = _resolve_kv_cache(attn_metadata, attn_layer.layer_index)
+    slot_mapping = forward_context.slot_mapping
+    assert isinstance(slot_mapping, dict), (
+        f"Expected slot_mapping to be a dict, got {type(slot_mapping)}. "
+    )
+    return attn_metadata, attn_layer, kv_cache
+
+
 @register_patch(
-    target="vllm.model_executor.layers.attention.attention.unified_attention",
-    reason=(
-        "RBLN needs unified_attention to resolve KV cache from attention "
-        "metadata or deduplicated KV-cache base tensors instead of the "
-        "attention layer's embedded KV cache."
-    ),
+    target="vllm.model_executor.layers.attention.Attention.forward",
+    reason="To preserve RBLN-specific attention output shape.",
 )
-@maybe_transfer_kv_layer
-def patched_unified_attention(
+def patched_attention_forward(
+    self: Attention,
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    layer_name: str,
+    output_shape: torch.Size | None = None,
 ) -> torch.Tensor:
-    attn_metadata, self, _, _ = get_attention_context(layer_name)
-
-    # NOTE(RBLN) - To represent kv cache as model input,
-    # modify attention instead of using the attention layer's embedded
-    # kv cache (self.kv_cache); use attention metadata's kv cache.
-    # attention metadata's kv cache must equal the attention layer's
-    # embedded kv cache.
-    kv_cache = _resolve_kv_cache(attn_metadata, self.layer_index)
-
-    output = self.impl.forward(self, query, key, value, kv_cache, attn_metadata)
-    return output
+    if not output_shape:
+        output_shape = query.shape
+        output = attention_original_forward(self, query, key, value, output_shape)
+        return output.view(output_shape)
+    return attention_original_forward(self, query, key, value, output_shape)
 
 
 @register_patch(
@@ -107,16 +128,10 @@ def patched_unified_attention_with_output(
     # that ensures torch.compile preserves ordering between KV cache update and
     # attention forward.
     del kv_cache_dummy_dep
-    attn_metadata, self, _, _ = get_attention_context(layer_name)
+    attn_metadata, attn, kv_cache = _get_attention_context(layer_name)
 
-    # NOTE(RBLN) - To represent kv cache as model input,
-    # modify attention instead of using the attention layer's embedded
-    # kv cache (self.kv_cache); use attention metadata's kv cache.
-    # attention metadata's kv cache must equal the attention layer's
-    # embedded kv cache.
-    kv_cache = _resolve_kv_cache(attn_metadata, self.layer_index)
-    self.impl.forward(
-        self,
+    attn.impl.forward(
+        attn,
         query,
         key,
         value,

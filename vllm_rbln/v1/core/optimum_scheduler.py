@@ -398,10 +398,6 @@ class RBLNOptimumScheduler(Scheduler):
                 # by prefix caching may cause incorrect computation
                 # of new_blocks during the decode phase.
                 request.num_computed_tokens = 0
-                # NOTE(fix): num_cached_tokens defaults to -1.
-                # It is used for logging and metrics.
-                if request.num_cached_tokens < 0:
-                    request.num_cached_tokens = request.num_computed_tokens
 
                 # EC Connector: track multimodal features that need remote
                 # loading or local encoding for this request.

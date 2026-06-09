@@ -28,7 +28,6 @@ from . import (
     qwen2_moe,
     qwen3_moe,
     rotary_embedding,
-    shared_fused_moe,
     vocab_parallel_embedding,
 )
 

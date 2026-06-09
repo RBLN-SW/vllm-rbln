@@ -316,7 +316,7 @@ class RBLNModelRunner:
             vocab_size=model_config.get_vocab_size(),
             block_sizes=[cache_config.block_size],
             kernel_block_sizes=[cache_config.block_size],
-            is_spec_decode=bool(self.speculative_config),
+            num_spec_tokens=self.num_spec_tokens,
             logitsprocs=build_logitsprocs(
                 self.vllm_config,
                 self.device,
@@ -751,8 +751,6 @@ class RBLNModelRunner:
             token_indices_tensor,
             out=self.input_ids[:total_query_tokens],
         )
-
-        self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
 
         # Prepare the attention metadata.
         query_start_loc_np = self.query_start_loc.numpy()
@@ -2159,7 +2157,7 @@ class RBLNModelRunner:
                 block_sizes=block_sizes,
                 kernel_block_sizes=kernel_block_sizes,
                 max_num_blocks_per_req=max_num_blocks,
-                is_spec_decode=bool(self.speculative_config),
+                num_spec_tokens=self.num_spec_tokens,
                 logitsprocs=self.input_batch.logitsprocs,
                 logitsprocs_need_output_token_ids=self.input_batch.logitsprocs_need_output_token_ids,
                 is_pooling_model=self.is_pooling_model,

@@ -98,6 +98,10 @@ class RblnPlatform(Platform):
         return torch.no_grad()
 
     @classmethod
+    def manual_seed_all(cls, seed: int) -> None:
+        pass
+
+    @classmethod
     def _override_default_max_num_seqs(cls) -> None:
         """Default an unset max_num_seqs to RBLN_DEFAULT_MAX_NUM_SEQS.
 

@@ -359,25 +359,27 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         value: torch.Tensor,
         kv_cache: torch.Tensor,
         attn_metadata: RBLNFlashAttentionMetadata,
-        output: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        output: torch.Tensor,
+        output_scale: torch.Tensor | None = None,
+        output_block_scale: torch.Tensor | None = None,
+    ) -> None:
         """Forward pass with RBLNFlashAttention.
 
         Args:
-            query:  shape = [num_tokens, num_heads * head_size]
-            key:    shape = [num_tokens, num_kv_heads * head_size]
-            value:  shape = [num_tokens, num_kv_heads * head_size]
-            kv_cache shape= [2, num_blocks,
-                                block_size * num_kv_heads * head_size]
+            query:  shape = [num_tokens, num_heads, head_size]
+            key:    shape = [num_tokens, num_kv_heads, head_size]
+            value:  shape = [num_tokens, num_kv_heads, head_size]
+            kv_cache shape= [2, num_blocks, num_kv_heads, 1,
+                                block_size, head_size]
 
         Shape that we expect:
-            kv_cache  = [2][num_blocks, num_kv_heads, 1, block_size, head_size]
+            kv_cache  = [2, num_blocks, num_kv_heads, 1, block_size, head_size]
             key       = [1, num_kv_heads, 1, block_size, head_size]
             query     = [1, num_kv_heads, 4, query_len, head_size]
             key_t     = [1, num_kv_heads, 1, head_size, block_size]
 
         Returns:
-            attn_out  = [num_tokens, num_heads * head_size]
+            attn_out  = [num_tokens, num_heads, head_size]
 
             hidden_size = num_heads * head_size
         """
@@ -389,10 +391,15 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         # L - query length
         # C - max_seq_len
         # NB- num batch
+        if output_scale is not None or output_block_scale is not None:
+            raise RuntimeError(
+                "Fused output quantization is not yet supported for RBLNFlashAttention."
+            )
 
         # 1. query reshape for custom operation
-        # query = [b_size(batch), q_len(query len), num_heads * head_size]
-        b_size, q_len, _ = query.size()
+        num_tokens = query.shape[0]
+        b_size = attn_metadata.seq_lens.shape[0]
+        q_len = num_tokens // b_size
         query = query.view(b_size, q_len, self.num_heads, self.head_size).transpose(
             1, 2
         )
@@ -573,20 +580,20 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                     )
 
         # 2. attention output reshape for attention backend return
-        # attn_output = [batch,H*4,L,D] -> [batch,L,H*4,D] -> [batch,L,H*4*D]
+        # attn_output = [batch,H*4,L,D] -> [batch,L,H*4,D] -> [batch*L,H*4,D]
         if self.enforce_eager or not envs.VLLM_RBLN_COMPILE_MODEL:
             attn_output = attn_output.reshape(
                 b_size, self.num_heads, q_len, self.head_size
             ).transpose(1, 2)
             attn_output = attn_output.reshape(
-                b_size, q_len, self.num_heads * self.head_size
+                b_size * q_len, self.num_heads, self.head_size
             )
         else:
             attn_output = attn_output.view(
                 b_size, self.num_heads, q_len, self.head_size
             ).transpose(1, 2)
             attn_output = attn_output.view(
-                b_size, q_len, self.num_heads * self.head_size
+                b_size * q_len, self.num_heads, self.head_size
             )
-        # attn_output = [batch,L,H*4*D]
-        return attn_output
+
+        output.copy_(attn_output)
