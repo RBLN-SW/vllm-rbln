@@ -418,8 +418,7 @@ def warmup(func, *args):
     return kernel
 
 
-@triton_op("rbln_triton_ops::attention_naive_prefill", mutates_args=())
-def attention_naive_prefill_wrapper(
+def _attention_naive(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -429,7 +428,14 @@ def attention_naive_prefill_wrapper(
     qk_scale: torch.Tensor,
     block_table: torch.Tensor,
     dummy: torch.Tensor,
+    kernel,
 ) -> torch.Tensor:
+    # prefill/decode share this body; only the compiled triton ``kernel`` differs.
+    # Float tensors enter as an fp32 carrier so the kernel compiles against one
+    # uniform float type (tl.dot operands must match); triton_rbln's RTOSA fixup
+    # rewrites f32 -> the device compute dtype (bf16/dlf16 per RBLN_COMP_DTYPE).
+    # seq_idx enters as an int32 carrier (to_dynamic_index rejects int64) and is
+    # lowered to i16 by the same fixup. output.to(original_dtype) restores dtype.
     original_dtype = query.dtype
 
     query = query.to(torch.float32)
@@ -473,9 +479,35 @@ def attention_naive_prefill_wrapper(
         NUM_BATCH,
         DIM_BLOCK_TABLE,
     ]
-    warmup(attention_naive_prefill, *params)
+    warmup(kernel, *params)
 
     return output.to(original_dtype)
+
+
+@triton_op("rbln_triton_ops::attention_naive_prefill", mutates_args=())
+def attention_naive_prefill_wrapper(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    kv_cache: torch.Tensor,
+    mask: torch.Tensor,
+    seq_idx: torch.Tensor,
+    qk_scale: torch.Tensor,
+    block_table: torch.Tensor,
+    dummy: torch.Tensor,
+) -> torch.Tensor:
+    return _attention_naive(
+        query,
+        key,
+        value,
+        kv_cache,
+        mask,
+        seq_idx,
+        qk_scale,
+        block_table,
+        dummy,
+        attention_naive_prefill,
+    )
 
 
 @triton_op("rbln_triton_ops::attention_naive_decode", mutates_args=())
@@ -490,53 +522,18 @@ def attention_naive_decode_wrapper(
     block_table: torch.Tensor,
     dummy: torch.Tensor,
 ) -> torch.Tensor:
-    original_dtype = query.dtype
-
-    query = query.to(torch.float32)
-    key = key.to(torch.float32)
-    value = value.to(torch.float32)
-    mask = mask.to(torch.float32)
-    kv_cache = kv_cache.to(torch.float32)
-    qk_scale = qk_scale.to(torch.float32)
-    seq_idx = seq_idx.to(torch.int32)
-
-    output = torch.empty_like(query)
-
-    query = rblib.align_tensor_last_dim_to_64(query)
-    key = rblib.align_tensor_last_dim_to_64(key)
-    value = rblib.align_tensor_last_dim_to_64(value)
-
-    NUM_HEAD = query.shape[1]
-    NUM_GROUP = query.shape[2]
-    HEAD_DIM = query.shape[-1]
-    QUERY_LEN = query.shape[-2]
-    PARTITION_SIZE = kv_cache.shape[-2]
-    NUM_BATCH = query.shape[0]
-    DIM_BLOCK_TABLE = block_table.dim()
-
-    params = [
+    return _attention_naive(
         query,
         key,
         value,
         kv_cache,
         mask,
-        output,
         seq_idx,
         qk_scale,
         block_table,
-        qk_scale,
-        NUM_HEAD,
-        NUM_GROUP,
-        HEAD_DIM,
-        QUERY_LEN,
-        PARTITION_SIZE,
-        NUM_BATCH,
-        DIM_BLOCK_TABLE,
-    ]
-
-    warmup(attention_naive_decode, *params)
-
-    return output.to(original_dtype)
+        dummy,
+        attention_naive_decode,
+    )
 
 
 @register_fake("rbln_triton_ops::attention_naive_prefill")
