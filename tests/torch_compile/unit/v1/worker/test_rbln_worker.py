@@ -357,8 +357,8 @@ class TestInterfaceCompliance:
         assert "self" in params
         assert "scheduler_output" in params
 
-    def test_compile_or_warm_up_model_returns_float(self):
-        """compile_or_warm_up_model must return a float (elapsed time)."""
+    def test_compile_or_warm_up_model_returns(self):
+        """compile_or_warm_up_model must return a CompilationTimes (elapsed time)."""
         from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
 
         sig = inspect.signature(RBLNWorker.compile_or_warm_up_model)
