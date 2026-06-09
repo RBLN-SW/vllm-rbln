@@ -21,19 +21,20 @@ from vllm.model_executor.models.blip2 import (
     Blip2ImageInputs,
     Blip2ImagePixelInputs,
 )
-from vllm.model_executor.models.interfaces import (
-    MultiModalEmbeddings,
-    SupportsMultiModal,
-)
+from vllm.model_executor.models.interfaces import MultiModalEmbeddings
 
 from .base import ModelInputForRBLN
-from .model_base import RBLNOptimumDecoderMixin, RBLNOptimumModelBase
+from .model_base import (
+    RBLNOptimumDecoderMixin,
+    RBLNOptimumModelBase,
+    RBLNOptimumMultimodalMixin,
+)
 
 logger = init_logger(__name__)
 
 
 class RBLNOptimumBlip2ForConditionalGeneration(
-    RBLNOptimumModelBase, RBLNOptimumDecoderMixin, SupportsMultiModal
+    RBLNOptimumModelBase, RBLNOptimumDecoderMixin, RBLNOptimumMultimodalMixin
 ):
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
@@ -103,9 +104,7 @@ class RBLNOptimumBlip2ForConditionalGeneration(
     def get_language_model(self):
         return self.model.language_model
 
-    def _process_image_input(
-        self, image_input: Blip2ImageInputs
-    ) -> list[torch.Tensor]:
+    def _process_image_input(self, image_input: Blip2ImageInputs) -> list[torch.Tensor]:
         # FIXME new API in optimum-rbln
         if image_input["type"] == "image_embeds":
             return list(image_input["data"])

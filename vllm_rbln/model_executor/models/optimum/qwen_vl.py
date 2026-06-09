@@ -17,10 +17,7 @@ from typing import Any
 import torch
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.model_executor.models.interfaces import (
-    MultiModalEmbeddings,
-    SupportsMultiModal,
-)
+from vllm.model_executor.models.interfaces import MultiModalEmbeddings
 from vllm.model_executor.models.qwen2_5_vl import (
     Qwen2_5_VLImageEmbeddingInputs,
     Qwen2_5_VLImagePixelInputs,
@@ -35,13 +32,17 @@ from vllm.model_executor.models.qwen2_vl import (
 )
 
 from .base import ModelInputForRBLN
-from .model_base import RBLNOptimumDecoderMixin, RBLNOptimumModelBase
+from .model_base import (
+    RBLNOptimumDecoderMixin,
+    RBLNOptimumModelBase,
+    RBLNOptimumMultimodalMixin,
+)
 
 logger = init_logger(__name__)
 
 
 class RBLNOptimumQwenVLForConditionalGeneration(
-    RBLNOptimumModelBase, RBLNOptimumDecoderMixin, SupportsMultiModal, ABC
+    RBLNOptimumModelBase, RBLNOptimumDecoderMixin, RBLNOptimumMultimodalMixin, ABC
 ):
     """
     Unified class for both Qwen2-VL and Qwen2.5-VL models.
@@ -455,7 +456,9 @@ class RBLNOptimumQwenVLForConditionalGeneration(
             # Qwen2.5-VL: second_per_grid_ts is per-video metadata; carry the
             # first feature's value as a best-effort for mixed batches.
             if "second_per_grid_ts" in video_caches[0]:
-                video_input["second_per_grid_ts"] = video_caches[0]["second_per_grid_ts"]
+                video_input["second_per_grid_ts"] = video_caches[0][
+                    "second_per_grid_ts"
+                ]
             deepstack_video_embeds = _concat_deepstack(
                 video_caches, "deepstack_video_embeds"
             )

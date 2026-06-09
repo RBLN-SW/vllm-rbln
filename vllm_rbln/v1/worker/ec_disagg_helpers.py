@@ -94,15 +94,8 @@ class ECDisaggHelpersMixin:
         model_input: ModelInputForRBLN,
         scheduler_output: "SchedulerOutput",
     ) -> None:
-        """Run the vision encoder only and save results to the EC connector
-        (producer-only path).
-
-        Model-agnostic: delegates to the model's embed_multimodal() so any
-        SupportsMultiModal model can act as a producer. The cached payload is
-        whatever embed_multimodal() returns (a list of per-item embeddings for
-        the simple models, or an encode dict with grid_thw/deepstack for
-        Qwen-VL); the matching consumer side knows how to merge it back.
-        """
+        """Producer path: run the vision encoder (model.embed_multimodal) and
+        cache the result for the consumer to merge back."""
         mm_kwargs = model_input.multi_modal_kwargs or {}
         encode_output = self.model.embed_multimodal(**mm_kwargs)
 
@@ -116,16 +109,8 @@ class ECDisaggHelpersMixin:
         model_input: ModelInputForRBLN,
         scheduler_output: "SchedulerOutput",
     ) -> torch.Tensor:
-        """Consumer path: gather cached encoder outputs for the request's
-        mm_features and run the prefill decoder.
-
-        The text+vision merge is delegated to the model. Models exposing
-        build_prefill_inputs() (e.g. Qwen-VL, which needs mrope position_embed
-        and deepstack) build their own prefill kwargs; otherwise the generic
-        path flattens the cached per-item embeddings and merges them with
-        embed_input_ids() into inputs_embeds. get_language_model().prefill_decoder
-        is used for both so the path is model-agnostic.
-        """
+        """Consumer path: gather the cached encoder outputs, let the model
+        merge them (model.build_prefill_inputs), and run the prefill decoder."""
         if not scheduler_output.scheduled_new_reqs:
             raise RuntimeError("EC consumer: no scheduled_new_reqs on prefill step.")
         req = scheduler_output.scheduled_new_reqs[0]
@@ -153,22 +138,12 @@ class ECDisaggHelpersMixin:
         cache_position = kwargs.pop("cache_position")
         block_tables = kwargs.pop("block_tables")
 
-        if hasattr(self.model, "build_prefill_inputs"):
-            prefill_params = self.model.build_prefill_inputs(
-                input_ids,
-                cached_mm_outputs,
-                cache_position=cache_position,
-                running_requests_ids=model_input.running_requests_ids,
-            )
-        else:
-            # Generic merge: each cached output is a list of per-item
-            # multimodal token embeddings.
-            mm_embeds = [t for out in cached_mm_outputs for t in out]
-            inputs_embeds = self.model.embed_input_ids(input_ids, mm_embeds or None)
-            prefill_params = {
-                "inputs_embeds": inputs_embeds,
-                "cache_position": cache_position,
-            }
+        prefill_params = self.model.build_prefill_inputs(
+            input_ids,
+            cached_mm_outputs,
+            cache_position=cache_position,
+            running_requests_ids=model_input.running_requests_ids,
+        )
 
         language_model = self.model.get_language_model()
         logits = language_model.prefill_decoder(

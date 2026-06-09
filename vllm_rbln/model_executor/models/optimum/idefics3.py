@@ -21,19 +21,20 @@ from vllm.model_executor.models.idefics3 import (
     Idefics3ImagePixelInputs,
     ImageInputs,
 )
-from vllm.model_executor.models.interfaces import (
-    MultiModalEmbeddings,
-    SupportsMultiModal,
-)
+from vllm.model_executor.models.interfaces import MultiModalEmbeddings
 
 from .base import ModelInputForRBLN
-from .model_base import RBLNOptimumDecoderMixin, RBLNOptimumModelBase
+from .model_base import (
+    RBLNOptimumDecoderMixin,
+    RBLNOptimumModelBase,
+    RBLNOptimumMultimodalMixin,
+)
 
 logger = init_logger(__name__)
 
 
 class RBLNOptimumIdefics3ForConditionalGeneration(
-    RBLNOptimumModelBase, RBLNOptimumDecoderMixin, SupportsMultiModal
+    RBLNOptimumModelBase, RBLNOptimumDecoderMixin, RBLNOptimumMultimodalMixin
 ):
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
@@ -116,7 +117,9 @@ class RBLNOptimumIdefics3ForConditionalGeneration(
 
         batch_size, num_images = pixel_values.shape[:2]
         pixel_values = pixel_values.to(dtype=model.dtype)
-        pixel_values = pixel_values.view(batch_size * num_images, *pixel_values.shape[2:])
+        pixel_values = pixel_values.view(
+            batch_size * num_images, *pixel_values.shape[2:]
+        )
 
         # Drop fully-padded (all-zero) images.
         nb_values_per_image = pixel_values.shape[1:].numel()
