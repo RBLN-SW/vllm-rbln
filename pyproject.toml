@@ -42,7 +42,7 @@ dependencies = [
     "torch",
     "torchvision",
     "torchaudio",
-    "optimum-rbln",
+    "optimum-rbln==0.11.0a0",
 ]
 
 [project.optional-dependencies]
@@ -141,7 +141,6 @@ url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
 [tool.uv.sources]
-optimum-rbln = { git = "ssh://git@github.com/RBLN-SW/optimum-rbln.git", branch = "update_latest_transformers" }
 vllm = { index = "vllm-cpu" }
 torch = { index = "pytorch-cpu" }
 torchvision = { index = "pytorch-cpu" }
