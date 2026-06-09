@@ -22,7 +22,7 @@ import pytest
 from vllm import SamplingParams
 
 from ...utils import managed_llm
-from .utils import assert_spec_matches_base_within_noise
+from ..spec_decode.utils import assert_spec_matches_base_within_noise
 
 # Repeated n-grams so the ngram proposer finds prompt-lookup matches and drafts
 # tokens; distinct content across requests keeps the batch heterogeneous.
