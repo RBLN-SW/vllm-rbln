@@ -18,7 +18,7 @@ from unittest.mock import patch
 
 import pytest
 from vllm.platforms import CpuArchEnum
-from vllm.platforms.cpu import LogicalCPUInfo
+from vllm.utils.cpu_resource_utils import LogicalCPUInfo
 
 from vllm_rbln.v1.worker.utils import (
     estimate_available_memory,
