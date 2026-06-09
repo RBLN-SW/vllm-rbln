@@ -35,6 +35,13 @@ class ModelInputForRBLN:
     cached_lengths: list[int] = field(default_factory=list)  # for prefix caching
     multi_modal_kwargs: BatchedTensorInputs | None = None
     dummy_block: int | None = None  # for prefix caching
+    # Per-position multimodal mask [1, seq_len] built by the runner from the
+    # scheduler's mm_features: 1 = embedding slot, -1 = chunk-align PAD,
+    # 0 = text. Prefill only; None otherwise.
+    is_embed: torch.Tensor | None = None
+    # Merged input embeddings built by the runner (embed_multimodal +
+    # embed_input_ids) for models that delegate the merge. Prefill only.
+    inputs_embeds: torch.Tensor | None = None
 
 
 version_error = RuntimeError(

@@ -106,6 +106,34 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: "ECConnectorOutput | None" = None
 
 
+def _build_is_embed_mask(mm_features: list, seq_len: int) -> torch.Tensor:
+    """Build a per-position int64 multimodal mask of shape [1, seq_len].
+
+    Values: 1 = vision-tower embedding slot, -1 = chunk-alignment PAD filler,
+    0 = text. Overlays each MultiModalFeatureSpec.mm_position.is_embed onto a
+    zero mask; features fully outside [0, seq_len) are skipped and partially
+    overlapping ranges are clipped.
+    """
+    mask = torch.zeros(seq_len, dtype=torch.int64)
+    for feature in mm_features:
+        pos = feature.mm_position
+        offset = pos.offset
+        length = pos.length
+        if offset + length <= 0 or offset >= seq_len:
+            continue  # placeholder fully outside this prompt slice
+        start = max(0, offset)
+        end = min(seq_len, offset + length)
+        feat_is_embed = pos.is_embed
+        if feat_is_embed is None:
+            # Legacy bool-style placeholder: the whole range is embedding slots.
+            mask[start:end] = 1
+        else:
+            mask[start:end] = feat_is_embed[start - offset : end - offset].to(
+                mask.dtype
+            )
+    return mask.unsqueeze(0)  # [1, seq_len]
+
+
 class RBLNOptimumModelRunner(
     LoRAModelRunnerMixin, ECConnectorModelRunnerMixin, ECDisaggHelpersMixin
 ):
@@ -488,10 +516,12 @@ class RBLNOptimumModelRunner(
                 cached_lengths,
                 multi_modal_kwargs,
                 running_request_ids,
+                is_embed,
             ) = self._prepare_prefill(scheduler_output)
         else:
             cached_block_tables = []
             cached_lengths = []
+            is_embed = None
             input_ids, positions, block_tables, running_request_ids = (
                 self._prepare_decode(scheduler_output)
             )
@@ -519,6 +549,7 @@ class RBLNOptimumModelRunner(
             # FIXME unify the variable name is_prefill and is_prompt
             is_prompt=is_prefill,
             dummy_block=scheduler_output.dummy_block,
+            is_embed=is_embed if is_prefill else None,
         )
         return model_input, num_scheduled_tokens_np
 
@@ -582,6 +613,7 @@ class RBLNOptimumModelRunner(
         list[int],
         BatchedTensorInputs | None,
         list[str],
+        torch.Tensor | None,
     ]:
         running_request_ids = []
         batched_mm_inputs: BatchedTensorInputs | None = None
@@ -649,8 +681,17 @@ class RBLNOptimumModelRunner(
 
         running_request_ids.append(req_id)
 
+        is_embed = None
         if self.supports_mm_inputs:
             batched_mm_inputs = self._extract_mm_kwargs(scheduler_output)
+            # Per-position multimodal mask, sourced from scheduler metadata
+            # (more precise than matching input_ids == image_token_index).
+            if len(scheduler_output.scheduled_new_reqs) == 1 and getattr(
+                scheduled, "mm_features", None
+            ):
+                is_embed = _build_is_embed_mask(
+                    scheduled.mm_features, len(prompt_tokens)
+                )
 
         input_tokens = torch.tensor(prompt_tokens).unsqueeze(0)
         input_positions = torch.tensor(input_positions).unsqueeze(0)
@@ -665,6 +706,7 @@ class RBLNOptimumModelRunner(
             cached_length,
             batched_mm_inputs,
             running_request_ids,
+            is_embed,
         )
 
     def _prepare_decode(
