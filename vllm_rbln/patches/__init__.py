@@ -16,13 +16,17 @@
 
 from vllm_rbln.patches.registry import (
     PatchDescriptor,
+    RegistrationDescriptor,
+    add_registration,
     apply_registered_patches,
+    apply_registrations,
     register_patch,
 )
 
 # ruff: noqa: F401
 from . import (
     attention,
+    block_fp8_linear,
     fused_moe,
     models_utils,
     qwen2_moe,
@@ -33,6 +37,9 @@ from . import (
 
 __all__ = (
     "PatchDescriptor",
+    "RegistrationDescriptor",
+    "add_registration",
     "apply_registered_patches",
+    "apply_registrations",
     "register_patch",
 )

@@ -27,6 +27,14 @@ DEFAULT_PATCH_PRIORITY = 50
 
 
 @dataclass(frozen=True)
+class RegistrationDescriptor:
+    key: str
+    owner_module: str
+    callback: Callable[[], None]
+    reason: str
+
+
+@dataclass(frozen=True)
 class PatchDescriptor:
     key: str
     owner_module: str
@@ -38,7 +46,41 @@ class PatchDescriptor:
     priority: int = DEFAULT_PATCH_PRIORITY
 
 
+_REGISTERED_REGISTRATION_DESCRIPTORS: list[RegistrationDescriptor] = []
 _REGISTERED_PATCH_DESCRIPTORS: list[PatchDescriptor] = []
+
+
+def add_registration(
+    *,
+    reason: str,
+) -> Callable[[Callable[[], None]], Callable[[], None]]:
+    """Add a registration callback."""
+
+    def _decorator(callback: Callable[[], None]) -> Callable[[], None]:
+        callback_name = getattr(
+            callback,
+            "__qualname__",
+            getattr(callback, "__name__", type(callback).__qualname__),
+        )
+
+        descriptor_owner_module = callback.__module__
+        descriptor_key = f"{descriptor_owner_module}.{callback_name}"
+
+        for descriptor in _REGISTERED_REGISTRATION_DESCRIPTORS:
+            if descriptor.key == descriptor_key:
+                return callback
+
+        _REGISTERED_REGISTRATION_DESCRIPTORS.append(
+            RegistrationDescriptor(
+                key=descriptor_key,
+                owner_module=descriptor_owner_module,
+                callback=callback,
+                reason=reason,
+            )
+        )
+        return callback
+
+    return _decorator
 
 
 def register_patch(
@@ -80,7 +122,7 @@ def register_patch(
         replacement_name = getattr(
             replacement,
             "__qualname__",
-            replacement.__name__,
+            getattr(replacement, "__name__", type(replacement).__qualname__),
         )
         descriptor_owner_module = owner_module or replacement.__module__
         descriptor_key = key or (f"{descriptor_owner_module}.{replacement_name}")
@@ -105,13 +147,35 @@ def register_patch(
     return _decorator
 
 
+_applied_registration_keys: set[str] = set()
 _applied_patch_keys: set[str] = set()
 
 
-def _import_modules(module_names: Iterable[str], *, kind: str) -> None:
-    for module_name in module_names:
-        logger.debug("Enabling %s via module import: %s.", kind, module_name)
-        import_module(module_name)
+def get_registered_registration_descriptors() -> list[RegistrationDescriptor]:
+    return sorted(_REGISTERED_REGISTRATION_DESCRIPTORS, key=lambda d: d.key)
+
+
+def apply_registrations() -> None:
+    for descriptor in get_registered_registration_descriptors():
+        if descriptor.key in _applied_registration_keys:
+            continue
+
+        logger.debug(
+            "Applying registration %s (owner=%s). Reason: %s",
+            descriptor.key,
+            descriptor.owner_module,
+            descriptor.reason,
+        )
+
+        try:
+            descriptor.callback()
+        except Exception as exc:
+            raise RuntimeError(
+                "Failed to apply registration "
+                f"{descriptor.key} from {descriptor.owner_module}"
+            ) from exc
+
+        _applied_registration_keys.add(descriptor.key)
 
 
 def _sort_patch_descriptors(
@@ -148,7 +212,7 @@ def _verify_target_patch(descriptor: PatchDescriptor) -> None:
         raise RuntimeError(f"Failed to patch target: {descriptor.target}")
 
 
-def _validate_registry_layout() -> None:
+def _validate_patch_registry_layout() -> None:
     descriptor_keys: set[str] = set()
     descriptor_targets: set[str] = set()
 
@@ -173,7 +237,7 @@ def _validate_registry_layout() -> None:
 
 
 def get_registered_patch_descriptors() -> list[PatchDescriptor]:
-    _validate_registry_layout()
+    _validate_patch_registry_layout()
     return _sort_patch_descriptors(_REGISTERED_PATCH_DESCRIPTORS)
 
 
