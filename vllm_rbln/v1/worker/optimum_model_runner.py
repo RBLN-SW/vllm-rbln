@@ -359,6 +359,14 @@ class RBLNOptimumModelRunner(
                 # Return empty ModelRunnerOutput if there's no work to do.
                 return EMPTY_MODEL_RUNNER_OUTPUT
 
+            # Multimodal embedding paths (which method runs where):
+            #   producer    -> _execute_mm_encoder              : embed_multimodal only (encode + cache)
+            #   consumer     -> _run_decoder_with_cached_encoder : embed_input_ids only (merge cached embeds)
+            #                   (via model.build_prefill_inputs)
+            #   no EC (plain) -> _build_inputs_embeds            : embed_multimodal + embed_input_ids
+            # EC splits encode (producer) and merge (consumer) across processes;
+            # without EC a single process does both in _build_inputs_embeds.
+
             # EC Producer early-exit: run vision encoder only,
             # save results to EC connector, then return empty output.
             if self.is_ec_producer:
@@ -445,13 +453,7 @@ class RBLNOptimumModelRunner(
     def _build_inputs_embeds(
         self, model_input: ModelInputForRBLN
     ) -> ModelInputForRBLN:
-        """Run the model's multimodal encode + merge and attach inputs_embeds.
-
-        Centralizes what each model used to do inside forward(): vision encode
-        (embed_multimodal) followed by the text/vision merge (embed_input_ids),
-        using the runner-built is_embed mask to locate the embedding slots.
-        Returns a copy of model_input with inputs_embeds populated.
-        """
+        """Attach inputs_embeds via embed_multimodal + embed_input_ids (is_embed mask)."""
         mm_embeds = self.model.embed_multimodal(
             **(model_input.multi_modal_kwargs or {})
         )
