@@ -36,6 +36,10 @@ logger = init_logger(__name__)
 class RBLNOptimumLlavaForConditionalGeneration(
     RBLNOptimumModelBase, RBLNOptimumDecoderMixin, RBLNOptimumMultimodalMixin
 ):
+    # The runner builds inputs_embeds (embed_multimodal + embed_input_ids) and
+    # passes it via model_input; forward consumes model_input.inputs_embeds.
+    runner_computes_inputs_embeds = True
+
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality.startswith("image"):
@@ -113,15 +117,9 @@ class RBLNOptimumLlavaForConditionalGeneration(
                 padded_batch_size
             ]
 
-        inputs_embeds = None
-        if is_prompt:
-            multimodal_embeddings = self.embed_multimodal(
-                **(model_input.multi_modal_kwargs or {})
-            )
-            inputs_embeds = self.embed_input_ids(
-                input_ids,
-                multimodal_embeddings or None,
-            )
+        # inputs_embeds is built by the runner (embed_multimodal +
+        # embed_input_ids) and passed via model_input (prefill only).
+        inputs_embeds = model_input.inputs_embeds if is_prompt else None
 
         logits = self._forward(
             is_prefill=is_prompt,

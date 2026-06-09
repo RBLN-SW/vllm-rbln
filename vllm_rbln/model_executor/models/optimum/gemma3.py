@@ -85,6 +85,10 @@ class RBLNOptimumGemma3ForConditionalGeneration(
     VllmModelForTextGeneration,
     RBLNOptimumMultimodalMixin,
 ):
+    # The runner builds inputs_embeds (embed_multimodal + embed_input_ids) and
+    # passes it via model_input; forward consumes model_input.inputs_embeds.
+    runner_computes_inputs_embeds = True
+
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality.startswith("image"):
@@ -153,18 +157,16 @@ class RBLNOptimumGemma3ForConditionalGeneration(
         if is_prompt:
             prefill_batch_idx = sliding_window_table_ids[0]
             local_block_table_id = torch.tensor([prefill_batch_idx], dtype=torch.int16)
-            # token_type_ids model_input != token_type_ids of gemma3
-            # https://github.com/huggingface/transformers/blob/d0c9c66d1c09df3cd70bf036e813d88337b20d4c/src/transformers/models/gemma3/processing_gemma3.py#L143
-            token_type_ids = torch.zeros_like(input_ids)
-            token_type_ids[input_ids == self.model.config.image_token_index] = 1
+            # Image-token positions come from the runner-built is_embed mask
+            # (1 = embedding slot); falls back to all-text when absent.
+            if model_input.is_embed is not None:
+                token_type_ids = (model_input.is_embed == 1).to(input_ids.dtype)
+            else:
+                token_type_ids = torch.zeros_like(input_ids)
 
-            multimodal_embeddings = self.embed_multimodal(
-                **(model_input.multi_modal_kwargs or {})
-            )
-            inputs_embeds = self.embed_input_ids(
-                input_ids,
-                multimodal_embeddings or None,
-            )
+            # inputs_embeds is built by the runner (embed_multimodal +
+            # embed_input_ids) and passed via model_input.
+            inputs_embeds = model_input.inputs_embeds
             if self.model.language_model.prefill_decoder is None:
                 raise version_error
             assert attention_masks is not None

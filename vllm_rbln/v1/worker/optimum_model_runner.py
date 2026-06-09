@@ -14,6 +14,7 @@
 import contextlib
 import logging
 import time
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, NamedTuple, Union, cast
 
 import numpy as np
@@ -400,6 +401,11 @@ class RBLNOptimumModelRunner(
                             model_input, scheduler_output
                         )
                 else:
+                    if (
+                        getattr(self.model, "runner_computes_inputs_embeds", False)
+                        and model_input.is_prompt
+                    ):
+                        model_input = self._build_inputs_embeds(model_input)
                     with capture_ctx as model_reports:
                         hidden_states = self.model(model_input)
                 if (
@@ -435,6 +441,29 @@ class RBLNOptimumModelRunner(
             ec_connector_output=ec_connector_output,
         )
         return None
+
+    def _build_inputs_embeds(
+        self, model_input: ModelInputForRBLN
+    ) -> ModelInputForRBLN:
+        """Run the model's multimodal encode + merge and attach inputs_embeds.
+
+        Centralizes what each model used to do inside forward(): vision encode
+        (embed_multimodal) followed by the text/vision merge (embed_input_ids),
+        using the runner-built is_embed mask to locate the embedding slots.
+        Returns a copy of model_input with inputs_embeds populated.
+        """
+        mm_embeds = self.model.embed_multimodal(
+            **(model_input.multi_modal_kwargs or {})
+        )
+        is_mm = None
+        if model_input.is_embed is not None:
+            is_mm = model_input.is_embed == 1
+        inputs_embeds = self.model.embed_input_ids(
+            model_input.input_tokens,
+            mm_embeds or None,
+            is_multimodal=is_mm,
+        )
+        return replace(model_input, inputs_embeds=inputs_embeds)
 
     def mask_block_table(
         self,
