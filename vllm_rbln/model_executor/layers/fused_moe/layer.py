@@ -421,29 +421,12 @@ def fused_moe_forward_rbln(
             tokens_mask = get_tokens_mask(
                 max_pad, device=masked_routing_weights.device
             ).transpose(1, 0)  # [1, R*max_pad]
-
-            ## token dim padding (dim 0 right pad)
-            T = masked_routing_weights.shape[1]
-            pad_size = 0
-            if T <= 8:
-                pad_size = 64 - (T % 64)
-                tokens_mask = F.pad(tokens_mask, (0, pad_size), value=0.0)
-                masked_routing_weights = F.pad(
-                    masked_routing_weights, (0, pad_size), value=0.0
-                )
-
-            # [R*max_pad(+pad), E] * [R*max_pad(+pad), 1] (broadcast)
             masked_routing_weights = masked_routing_weights * tokens_mask
-            masked_routing_weights_depadded = F.pad(
-                masked_routing_weights, (0, -pad_size), value=0.0
-            )
-        else:
-            masked_routing_weights_depadded = masked_routing_weights
 
         # --- Pre-compute routing logit slices (used by all2all) ---
         if envs.VLLM_RBLN_DISPATCH_ALL2ALL or envs.VLLM_RBLN_COMBINE_ALL2ALL:
             # all_routing_3d: [E, R, max_pad] for CCL send/receive kernels
-            all_routing_3d = masked_routing_weights_depadded.reshape(E, R, max_pad)
+            all_routing_3d = masked_routing_weights.reshape(E, R, max_pad)
 
             # Prepare per-rank router_logits slices
             e = E // R  # local experts per rank
@@ -661,29 +644,14 @@ def fused_moe_forward_rbln(
             num_tokens, device=masked_routing_weights.device
         ).transpose(1, 0)  # [1, t]
 
-        ## token dim padding (dim 1 right pad)
-        T = masked_routing_weights.shape[1]
-        pad_size = 0
-        if T <= 8:
-            pad_size = 64 - (T % 64)
-            tokens_mask = F.pad(tokens_mask, (0, pad_size), value=0.0)
-            masked_routing_weights = F.pad(
-                masked_routing_weights, (0, pad_size), value=0.0
-            )
-
-        # [t(+pad), E] * [t(+pad), 1] (broadcast)
+        # [t, E] * [t, 1] (broadcast)
         masked_routing_weights = masked_routing_weights * tokens_mask
-        masked_routing_weights_depadded = F.pad(
-            masked_routing_weights, (0, -pad_size), value=0.0
-        )
-    else:
-        masked_routing_weights_depadded = masked_routing_weights
 
     # pass as [t, E] to quant_method.apply (it will be reshaped inside)
     final_hidden_states = self.quant_method.apply(
         layer=self,
         x=hidden_states,
-        router_logits=masked_routing_weights_depadded,
+        router_logits=masked_routing_weights,
     )
 
     return final_hidden_states
