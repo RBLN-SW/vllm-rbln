@@ -339,7 +339,7 @@ class RBLNOptimumModelRunner(
                         scheduler_output,
                         encoder_cache=self.encoder_cache,
                     ):
-                        self._run_encoder_and_save(model_input, scheduler_output)
+                        self._execute_mm_encoder(model_input, scheduler_output)
                 return self._make_producer_output(scheduler_output)
 
             # Prepare the decoder inputs.

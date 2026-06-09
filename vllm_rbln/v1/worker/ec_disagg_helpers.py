@@ -52,11 +52,19 @@ class ECDisaggHelpersMixin:
     def _make_producer_output(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput:
-        """Build a ModelRunnerOutput that tells the engine core every
-        request is finished (by returning the EOS token).
+        """Build a ModelRunnerOutput that finishes every request by emitting
+        the EOS token.
 
-        Without this, the engine keeps scheduling decode steps for a
-        request that will never produce real tokens.
+        Without this, the engine keeps scheduling decode steps for a request
+        that will never produce real tokens.
+
+        NOTE: This intentionally diverges from upstream's
+        make_empty_encoder_model_runner_output, which emits a ``[[0]]``
+        placeholder instead of EOS. On RBLN the producer engine has no LLM and
+        relies on EOS to terminate the request here; a plain placeholder token
+        would be treated as generated output and keep the request scheduling.
+        Revisit if the producer-side scheduler learns to finish encoder-only
+        requests on its own (then this could reuse the upstream helper).
         """
         if not scheduler_output.num_scheduled_tokens:
             return EMPTY_MODEL_RUNNER_OUTPUT
@@ -89,13 +97,19 @@ class ECDisaggHelpersMixin:
             sampled_token_ids=[[eos] for _ in req_ids],
         )
 
-    def _run_encoder_and_save(
+    def _execute_mm_encoder(
         self,
         model_input: ModelInputForRBLN,
         scheduler_output: "SchedulerOutput",
     ) -> None:
-        """Producer path: run the vision encoder (model.embed_multimodal) and
-        cache the result for the consumer to merge back."""
+        """Producer path: run the multimodal encoder and cache the result.
+
+        RBLN analog of vLLM's _execute_mm_encoder. Unlike upstream — where the
+        same method also feeds the normal forward — RBLN runs the encoder
+        inside model.forward on the non-disaggregated path, so this is used
+        only by the EC producer: vision encode via model.embed_multimodal,
+        then cache + push to the connector for the consumer to merge back.
+        """
         mm_kwargs = model_input.multi_modal_kwargs or {}
         encode_output = self.model.embed_multimodal(**mm_kwargs)
 
@@ -110,7 +124,13 @@ class ECDisaggHelpersMixin:
         scheduler_output: "SchedulerOutput",
     ) -> torch.Tensor:
         """Consumer path: gather the cached encoder outputs, let the model
-        merge them (model.build_prefill_inputs), and run the prefill decoder."""
+        merge them (model.build_prefill_inputs), and run the prefill decoder.
+
+        RBLN-specific: upstream has no direct analog because its consumer
+        reuses the normal forward with a connector-populated encoder_cache.
+        RBLN runs encode inside model.forward, so the cached-encoder prefill
+        is an explicit step here.
+        """
         if not scheduler_output.scheduled_new_reqs:
             raise RuntimeError("EC consumer: no scheduled_new_reqs on prefill step.")
         req = scheduler_output.scheduled_new_reqs[0]
