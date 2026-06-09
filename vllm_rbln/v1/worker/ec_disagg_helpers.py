@@ -158,11 +158,15 @@ class ECDisaggHelpersMixin:
         cache_position = kwargs.pop("cache_position")
         block_tables = kwargs.pop("block_tables")
 
+        is_multimodal = None
+        if model_input.is_embed is not None:
+            is_multimodal = model_input.is_embed == 1
         prefill_params = self.model.build_prefill_inputs(
             input_ids,
             cached_mm_outputs,
             cache_position=cache_position,
             running_requests_ids=model_input.running_requests_ids,
+            is_multimodal=is_multimodal,
         )
 
         language_model = self.model.get_language_model()

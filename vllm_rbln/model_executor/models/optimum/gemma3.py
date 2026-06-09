@@ -240,6 +240,7 @@ class RBLNOptimumGemma3ForConditionalGeneration(
         *,
         cache_position: torch.Tensor | None = None,
         running_requests_ids: list[str] | None = None,
+        is_multimodal: torch.Tensor | None = None,
     ) -> dict:
         # EC disaggregation (cached-encoder prefill) is not yet supported for
         # Gemma3. Its prefill uses hybrid sliding-window attention whose state

@@ -439,9 +439,13 @@ class RBLNOptimumMultimodalMixin(SupportsMultiModal):
         *,
         cache_position: torch.Tensor | None = None,
         running_requests_ids: list[str] | None = None,
+        is_multimodal: torch.Tensor | None = None,
     ) -> dict:
         # Each cached output is a list of per-item multimodal token embeddings
-        # (as returned by embed_multimodal()).
+        # (as returned by embed_multimodal()). is_multimodal (the runner-built
+        # is_embed mask) locates the embedding slots, matching the non-EC path.
         mm_embeds = [t for out in cached_mm_outputs for t in out]
-        inputs_embeds = self.embed_input_ids(input_ids, mm_embeds or None)
+        inputs_embeds = self.embed_input_ids(
+            input_ids, mm_embeds or None, is_multimodal=is_multimodal
+        )
         return {"inputs_embeds": inputs_embeds, "cache_position": cache_position}

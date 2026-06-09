@@ -399,13 +399,16 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         *,
         cache_position: torch.Tensor | None = None,
         running_requests_ids: list[str] | None = None,
+        is_multimodal: torch.Tensor | None = None,
     ) -> dict:
         """Build prefill_decoder kwargs from cached encoder outputs (EC consumer).
 
         Reconstructs image/video embeds + grid_thw (+ deepstack) from the
         per-feature dicts produced by embed_multimodal(), runs the merge via
         preprocess_prefill, and stashes rope_deltas for the decode phase.
-        cache_position is unused (Qwen feeds positions via position_embed).
+        cache_position is unused (Qwen feeds positions via position_embed), and
+        is_multimodal is unused (optimum scatters by image/video token id, which
+        the single-class is_embed mask cannot distinguish).
         """
         model_dtype = self.dtype
 
