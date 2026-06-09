@@ -17,7 +17,10 @@ from typing import Any
 import torch
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.model_executor.models.interfaces import SupportsMultiModal
+from vllm.model_executor.models.interfaces import (
+    MultiModalEmbeddings,
+    SupportsMultiModal,
+)
 from vllm.model_executor.models.qwen2_5_vl import (
     Qwen2_5_VLImageEmbeddingInputs,
     Qwen2_5_VLImagePixelInputs,
@@ -44,6 +47,15 @@ class RBLNOptimumQwenVLForConditionalGeneration(
     Unified class for both Qwen2-VL and Qwen2.5-VL models.
     Automatically detects model type based on the model configuration.
     """
+
+    @classmethod
+    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
+        if modality.startswith("image"):
+            return "<|vision_start|><|image_pad|><|vision_end|>"
+        if modality.startswith("video"):
+            return "<|vision_start|><|video_pad|><|vision_end|>"
+
+        raise ValueError("Only image or video modality is supported")
 
     def __init__(
         self,
@@ -362,6 +374,107 @@ class RBLNOptimumQwenVLForConditionalGeneration(
 
         # fallback return if both are None
         return None
+
+    def get_language_model(self):
+        return self.model
+
+    def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
+        """Vision-only encode entry point (SupportsMultiModal / EC producer).
+
+        Unlike the simple MM models (which return a list of per-image token
+        embeddings), Qwen's cacheable unit is the dict returned by encode():
+        image/video embeds + grid_thw (+ deepstack for Qwen3-VL). It is consumed
+        on the decode side by build_prefill_inputs().
+        """
+        image_input = self._parse_and_validate_image_input(**kwargs)
+        video_input = self._parse_and_validate_video_input(**kwargs)
+        if image_input is None and video_input is None:
+            return []
+
+        return self.encode(image_input, video_input)
+
+    def build_prefill_inputs(
+        self,
+        input_ids: torch.Tensor,
+        cached_mm_outputs: list[dict],
+        *,
+        cache_position: torch.Tensor | None = None,
+        running_requests_ids: list[str] | None = None,
+    ) -> dict:
+        """Build prefill_decoder kwargs from cached encoder outputs (EC consumer).
+
+        Reconstructs image/video embeds + grid_thw (+ deepstack) from the
+        per-feature dicts produced by embed_multimodal(), runs the merge via
+        preprocess_prefill, and stashes rope_deltas for the decode phase.
+        cache_position is unused (Qwen feeds positions via position_embed).
+        """
+        model_dtype = self.dtype
+
+        image_caches = [c for c in cached_mm_outputs if "image_embeds" in c]
+        video_caches = [c for c in cached_mm_outputs if "video_embeds" in c]
+
+        def _concat_deepstack(caches: list[dict], key: str):
+            present = [c for c in caches if c.get(key) is not None]
+            if not present:
+                return None
+            num_layers = len(present[0][key])
+            return [
+                torch.cat([c[key][layer].to(model_dtype) for c in present], dim=0)
+                for layer in range(num_layers)
+            ]
+
+        image_input = None
+        video_input = None
+        deepstack_image_embeds = None
+        deepstack_video_embeds = None
+
+        if image_caches:
+            image_embeds = torch.cat(
+                [c["image_embeds"].to(model_dtype) for c in image_caches], dim=0
+            )
+            image_grid_thw = torch.cat(
+                [c["image_grid_thw"].to(torch.int64) for c in image_caches], dim=0
+            )
+            image_input = self._create_image_embedding_inputs(
+                image_embeds=image_embeds, image_grid_thw=image_grid_thw
+            )
+            deepstack_image_embeds = _concat_deepstack(
+                image_caches, "deepstack_image_embeds"
+            )
+
+        if video_caches:
+            video_embeds = torch.cat(
+                [c["video_embeds"].to(model_dtype) for c in video_caches], dim=0
+            )
+            video_grid_thw = torch.cat(
+                [c["video_grid_thw"].to(torch.int64) for c in video_caches], dim=0
+            )
+            video_input = self._create_video_embedding_inputs(
+                video_embeds=video_embeds, video_grid_thw=video_grid_thw
+            )
+            # Qwen2.5-VL: second_per_grid_ts is per-video metadata; carry the
+            # first feature's value as a best-effort for mixed batches.
+            if "second_per_grid_ts" in video_caches[0]:
+                video_input["second_per_grid_ts"] = video_caches[0]["second_per_grid_ts"]
+            deepstack_video_embeds = _concat_deepstack(
+                video_caches, "deepstack_video_embeds"
+            )
+
+        attention_mask = torch.ones_like(input_ids)
+        prefill_params = self.preprocess_prefill(
+            input_ids,
+            attention_mask,
+            image_input,
+            video_input,
+            deepstack_image_embeds=deepstack_image_embeds,
+            deepstack_video_embeds=deepstack_video_embeds,
+        )
+
+        rope_deltas = prefill_params.pop("rope_deltas", None)
+        if rope_deltas is not None and running_requests_ids:
+            self.rope_deltas[running_requests_ids[0]] = rope_deltas.item()
+
+        return prefill_params
 
 
 class RBLNOptimumQwen2_5_VLForConditionalGeneration(
