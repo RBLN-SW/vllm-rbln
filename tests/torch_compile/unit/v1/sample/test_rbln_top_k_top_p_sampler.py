@@ -1,4 +1,4 @@
-# Copyright 2025 Rebellions Inc. All rights reserved.
+# Copyright 2026 Rebellions Inc. All rights reserved.
 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,12 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import pytest
-
-
-@pytest.fixture(scope="module", autouse=True)
-def common_specdec_env(monkeypatch_module):
-    monkeypatch_module.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
-    monkeypatch_module.setenv("VLLM_DISABLE_COMPILE_CACHE", "1")
-    monkeypatch_module.setenv("VLLM_RBLN_ENABLE_WARM_UP", "1")
-    monkeypatch_module.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+# FIXME add pytest
