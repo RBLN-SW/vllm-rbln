@@ -215,6 +215,7 @@ class RBLNRejectionSampler(RejectionSampler):
         batch_size = len(num_draft_tokens)
         num_tokens = draft_token_ids.shape[0]
         vocab_size = target_probs.shape[-1]
+        device = target_probs.device
         assert draft_token_ids.is_contiguous()
         assert draft_probs is None or draft_probs.is_contiguous()
         assert target_probs.is_contiguous()
@@ -226,12 +227,13 @@ class RBLNRejectionSampler(RejectionSampler):
             (batch_size, max_spec_len + 1),
             PLACEHOLDER_TOKEN_ID,
             dtype=torch.int64,  # Consistent with SamplerOutput.sampled_token_ids.
+            device=device,
         )
 
         # `active_mask` is in batch space: True for rows with any draft.
         active_mask = torch.tensor(
             [n > 0 for n in num_draft_tokens],
-            device=output_token_ids.device,
+            device=device,
             dtype=torch.bool,
         )  # [batch_size]
 
@@ -245,10 +247,15 @@ class RBLNRejectionSampler(RejectionSampler):
         # ------------------------------------------------------------------
         N = num_tokens  # = sum(num_draft_tokens)
         reshaped_draft_token_ids = torch.zeros(
-            batch_size * max_spec_len, dtype=torch.int32
+            batch_size * max_spec_len,
+            dtype=torch.int32,
+            device=device,
         )
         reshaped_target_probs = torch.zeros(
-            batch_size * max_spec_len, vocab_size, dtype=target_probs.dtype
+            batch_size * max_spec_len,
+            vocab_size,
+            dtype=target_probs.dtype,
+            device=device,
         )
         reshaped_draft_token_ids[:N] = draft_token_ids
         reshaped_target_probs[:N] = target_probs
@@ -261,7 +268,7 @@ class RBLNRejectionSampler(RejectionSampler):
             (batch_size, max_spec_len),
             PLACEHOLDER_TOKEN_ID,
             dtype=torch.int64,
-            device=output_token_ids.device,
+            device=device,
         )
         src_offset = 0
         for i, n in enumerate(num_draft_tokens):
@@ -269,6 +276,13 @@ class RBLNRejectionSampler(RejectionSampler):
                 continue
             draft_per_batch[i, :n] = draft_token_ids[src_offset : src_offset + n]
             src_offset += n
+
+        # FIXME required for device tensor?
+        cu_num_draft_tokens = cu_num_draft_tokens.to(device=device)
+        if sampling_metadata.top_k is not None:
+            sampling_metadata.top_k = sampling_metadata.top_k.to(device=device)
+        if sampling_metadata.top_p is not None:
+            sampling_metadata.top_p = sampling_metadata.top_p.to(device=device)
 
         # ------------------------------------------------------------------
         # 2) Call the NPU primitive.
@@ -293,14 +307,15 @@ class RBLNRejectionSampler(RejectionSampler):
         # ------------------------------------------------------------------
         num_accepted_per_batch = num_accepted.reshape(batch_size)
         positions = torch.arange(
-            max_spec_len, device=output_token_ids.device
+            max_spec_len,
+            device=device,
         ).unsqueeze(0)  # (1, K)
         # NOTE: all-accept is per-row: a row accepted ALL of ITS OWN drafts
         # (num_draft_tokens[i], which may be < max_spec_len).
         num_draft_tokens_t = torch.tensor(
             num_draft_tokens,
             dtype=num_accepted_per_batch.dtype,
-            device=output_token_ids.device,
+            device=device,
         )
         all_accepted_active = (
             num_accepted_per_batch == num_draft_tokens_t
@@ -332,12 +347,14 @@ class RBLNRejectionSampler(RejectionSampler):
         # [batch_size, 1] -> [batch_size]
         # NOTE: boolean-mask index_put below requires dtype match (it does NOT
         # cast like basic-slice assignment), so cast to output_token_ids dtype.
-        bonus = bonus_token_ids.squeeze(-1).to(output_token_ids.dtype)
+        bonus = bonus_token_ids.squeeze(-1).to(
+            dtype=output_token_ids.dtype, device=device
+        )
 
         # 4a) Fully-accepted active rows: emit the bonus token right after the
         # row's own last draft (column num_draft_tokens[i], == max_spec_len
         # only for full rows) — mirrors the upstream Triton kernel.
-        batch_idx = torch.arange(batch_size, device=output_token_ids.device)
+        batch_idx = torch.arange(batch_size, device=device)
         output_token_ids[
             batch_idx[all_accepted_active],
             num_draft_tokens_t[all_accepted_active],
