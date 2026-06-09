@@ -15,10 +15,7 @@ from typing import Any
 
 import torch
 from vllm.config import VllmConfig
-from vllm.model_executor.models.interfaces import (
-    MultiModalEmbeddings,
-    SupportsMultiModal,
-)
+from vllm.model_executor.models.interfaces import MultiModalEmbeddings
 from vllm.model_executor.models.paligemma import (
     PaliGemmaImageEmbeddingInputs,
     PaliGemmaImageInputs,
@@ -28,13 +25,17 @@ from vllm.model_executor.models.paligemma import (
 from optimum.rbln.configuration_utils import RBLNModelConfig
 from vllm_rbln.model_executor.models.optimum.base import ModelInputForRBLN
 
-from .model_base import RBLNOptimumDecoderMixin, RBLNOptimumModelBase
+from .model_base import (
+    RBLNOptimumDecoderMixin,
+    RBLNOptimumModelBase,
+    RBLNOptimumMultimodalMixin,
+)
 
 PAD_TOKEN_ID = 0
 
 
 class RBLNOptimumPaliGemmaForConditionalGeneration(
-    RBLNOptimumModelBase, RBLNOptimumDecoderMixin, SupportsMultiModal
+    RBLNOptimumModelBase, RBLNOptimumDecoderMixin, RBLNOptimumMultimodalMixin
 ):
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:

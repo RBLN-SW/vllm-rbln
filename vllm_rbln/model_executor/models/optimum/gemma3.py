@@ -23,15 +23,16 @@ from vllm.model_executor.models.gemma3_mm import (
     Gemma3MultiModalProcessor,
     Gemma3ProcessingInfo,
 )
-from vllm.model_executor.models.interfaces import (
-    MultiModalEmbeddings,
-    SupportsMultiModal,
-)
+from vllm.model_executor.models.interfaces import MultiModalEmbeddings
 from vllm.model_executor.models.interfaces_base import VllmModelForTextGeneration
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
 from .base import ModelInputForRBLN, version_error
-from .model_base import RBLNOptimumDecoderMixin, RBLNOptimumModelBase
+from .model_base import (
+    RBLNOptimumDecoderMixin,
+    RBLNOptimumModelBase,
+    RBLNOptimumMultimodalMixin,
+)
 from .optimum_attention import HybridAttentionImageManager, HybridAttentionImageStrategy
 
 logger = init_logger(__name__)
@@ -88,7 +89,7 @@ class RBLNOptimumGemma3ForConditionalGeneration(
     RBLNOptimumModelBase,
     RBLNOptimumDecoderMixin,
     VllmModelForTextGeneration,
-    SupportsMultiModal,
+    RBLNOptimumMultimodalMixin,
 ):
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:

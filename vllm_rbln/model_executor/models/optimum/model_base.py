@@ -20,6 +20,7 @@ import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.model_executor.models.interfaces_base import VllmModelForTextGeneration
 from vllm.v1.sample.metadata import SamplingMetadata
 
@@ -445,3 +446,32 @@ class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
         self, hidden_states: torch.Tensor, sampling_metadata: SamplingMetadata
     ) -> torch.Tensor:
         return self.logits_processor(None, hidden_states, sampling_metadata)
+
+
+class RBLNOptimumMultimodalMixin(SupportsMultiModal):
+    """Shared multimodal interface for optimum models.
+
+    Centralizes the default encoder-cache (EC) consumer merge. The producer
+    caches whatever embed_multimodal() returns; on the consumer side this
+    default build_prefill_inputs() flattens those per-item embeddings and
+    merges them via embed_input_ids() — sufficient for models whose
+    prefill_decoder takes (inputs_embeds, cache_position, block_tables).
+
+    Models that need extra prefill state override it: Qwen-VL builds mrope
+    position_embed / deepstack, and Gemma3 raises (its hybrid sliding-window
+    attention prefill is not wired for EC yet).
+    """
+
+    def build_prefill_inputs(
+        self,
+        input_ids: torch.Tensor,
+        cached_mm_outputs: list,
+        *,
+        cache_position: torch.Tensor | None = None,
+        running_requests_ids: list[str] | None = None,
+    ) -> dict:
+        # Each cached output is a list of per-item multimodal token embeddings
+        # (as returned by embed_multimodal()).
+        mm_embeds = [t for out in cached_mm_outputs for t in out]
+        inputs_embeds = self.embed_input_ids(input_ids, mm_embeds or None)
+        return {"inputs_embeds": inputs_embeds, "cache_position": cache_position}

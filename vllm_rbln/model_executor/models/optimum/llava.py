@@ -16,10 +16,7 @@ from typing import Union
 import torch
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.model_executor.models.interfaces import (
-    MultiModalEmbeddings,
-    SupportsMultiModal,
-)
+from vllm.model_executor.models.interfaces import MultiModalEmbeddings
 from vllm.model_executor.models.llava import (
     LlavaImageInputs,
     LlavaImagePixelInputs,
@@ -27,13 +24,17 @@ from vllm.model_executor.models.llava import (
 )
 
 from .base import ModelInputForRBLN, version_error
-from .model_base import RBLNOptimumDecoderMixin, RBLNOptimumModelBase
+from .model_base import (
+    RBLNOptimumDecoderMixin,
+    RBLNOptimumModelBase,
+    RBLNOptimumMultimodalMixin,
+)
 
 logger = init_logger(__name__)
 
 
 class RBLNOptimumLlavaForConditionalGeneration(
-    RBLNOptimumModelBase, RBLNOptimumDecoderMixin, SupportsMultiModal
+    RBLNOptimumModelBase, RBLNOptimumDecoderMixin, RBLNOptimumMultimodalMixin
 ):
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
@@ -137,9 +138,7 @@ class RBLNOptimumLlavaForConditionalGeneration(
     def get_language_model(self):
         return self.model.language_model
 
-    def _process_image_input(
-        self, image_input: LlavaImageInputs
-    ) -> list[torch.Tensor]:
+    def _process_image_input(self, image_input: LlavaImageInputs) -> list[torch.Tensor]:
         pixel_values = image_input["pixel_values"]
         if image_input["type"] == "pixel_values_pixtral":
             image_sizes = torch.tensor(pixel_values.shape[-2:]).unsqueeze(0)
