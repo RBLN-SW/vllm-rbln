@@ -72,6 +72,9 @@ from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
 from vllm_rbln.model_executor.model_loader.rbln_model_loader import get_optimum_model
+from vllm_rbln.model_executor.models.optimum.ec_producer import (
+    build_ec_producer_model,
+)
 from vllm_rbln.model_executor.models.optimum import ModelInputForRBLN
 from vllm_rbln.utils.optimum.bucket import select_bucket_size
 from vllm_rbln.utils.optimum.predicates import is_qwen3_pooling
@@ -269,7 +272,12 @@ class RBLNOptimumModelRunner(
     @instrument(span_name="Loading (RBLN)")
     def load_model(self) -> None:
         with set_current_vllm_config(self.vllm_config, check_compile=False):
-            self.model = get_optimum_model(vllm_config=self.vllm_config)
+            if self.is_ec_producer_only:
+                # EC producer loads only the vision encoder (no LLM); kept out
+                # of the normal model path so model_base stays EC-agnostic.
+                self.model = build_ec_producer_model(self.vllm_config)
+            else:
+                self.model = get_optimum_model(vllm_config=self.vllm_config)
         self.use_optimum_lora = getattr(self.model.model.rbln_config, "use_lora", None)
         if self.lora_config and not self.use_optimum_lora:
             raise RuntimeError(

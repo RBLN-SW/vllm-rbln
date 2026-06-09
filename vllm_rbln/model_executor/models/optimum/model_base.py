@@ -110,22 +110,27 @@ class KVCacheBlockAdapter:
         return new_estimated
 
 
-class _ProducerOptimumModelProxy:
-    """Lightweight proxy replacing the full optimum model for EC producers.
+def resolve_optimum_model(
+    vllm_config: VllmConfig,
+) -> tuple[str | None, Any, str]:
+    """Resolve ``(valid_path, model_cls, model_cls_name)`` for the optimum model.
 
-    Only the visual encoder submodule is loaded; LLM compiled models
-    (.rbln files for prefill/decode) are never touched.
+    ``valid_path`` is the pre-compiled / cache-hit directory, or ``None`` on a
+    cache miss (the caller must then compile). ``model_cls`` is the optimum-rbln
+    class for that path, or ``None`` when ``valid_path`` is ``None``.
     """
-
-    def __init__(self, visual: Any, rbln_config: Any) -> None:
-        self.visual = visual
-        self.rbln_config = rbln_config
-
-    def get_kvcache_num_blocks(self) -> int:
-        return getattr(self.rbln_config, "kvcache_num_blocks", 1)
-
-    def get_attn_impl(self) -> None:
-        return None
+    hf_config = vllm_config.model_config.hf_config
+    cached_model_path = vllm_config.additional_config.get("cached_model_path")
+    _, model_cls_name = get_rbln_model_info(hf_config)
+    model_path = vllm_config.model_config.model
+    if os.path.exists(model_path):
+        valid_path = model_path
+    elif cached_model_path and os.path.exists(cached_model_path):
+        valid_path = cached_model_path
+    else:
+        valid_path = None
+    model_cls = getattr(optimum.rbln, model_cls_name) if valid_path is not None else None
+    return valid_path, model_cls, model_cls_name
 
 
 class RBLNOptimumModelBase(nn.Module):
@@ -145,14 +150,9 @@ class RBLNOptimumModelBase(nn.Module):
         self.cache_config = vllm_config.cache_config
         self.init_model()
         self.batch_size = self.scheduler_config.max_num_seqs
-        if self._is_ec_producer_only():
-            # Producer has no LLM; KV cache is not meaningful. Worker's
-            # determine_available_memory() short-circuits when adapter is None.
-            self.kv_block_adapter = None
-        else:
-            self.kv_block_adapter = KVCacheBlockAdapter(
-                vllm_config, self._resolve_kvcache_num_blocks()
-            )
+        self.kv_block_adapter = KVCacheBlockAdapter(
+            vllm_config, self._resolve_kvcache_num_blocks()
+        )
 
     def _resolve_kvcache_num_blocks(self) -> int:
         """Prefer model-provided KV-cache block count;
@@ -172,44 +172,26 @@ class RBLNOptimumModelBase(nn.Module):
             return int(self.scheduler_config.max_num_seqs)
 
     def init_model(self) -> None:
-        hf_config = self.model_config.hf_config
-        cached_model_path = self.vllm_config.additional_config.get("cached_model_path")
         rbln_overrides = self.vllm_config.additional_config.get("rbln_config", {})
-        _, model_cls_name = get_rbln_model_info(hf_config)
-        model_path = self.vllm_config.model_config.model
-        if os.path.exists(model_path):
-            valid_path = model_path
-        elif cached_model_path and os.path.exists(cached_model_path):
-            valid_path = cached_model_path
-        else:
-            valid_path = None
+        valid_path, model_cls, model_cls_name = resolve_optimum_model(self.vllm_config)
 
         if valid_path is not None:
-            # pre-compiled OR cache-hit
-            model_cls = getattr(optimum.rbln, model_cls_name)
-            assert model_cls is not None
-            # FIXME decouple producer logic from model_base.py
-            if self._is_ec_producer_only():
-                if model_cls_name != "RBLNQwen3VLForConditionalGeneration":
-                    raise ValueError("Disaggregation is not supported for this model.")
-                visual = model_cls.load_visual_encoder(valid_path)
-                model = _ProducerOptimumModelProxy(visual, visual.rbln_config)
-            else:
-                # NOTE:
-                # ``sync_vllm_and_optimum`` already narrowed user overrides
-                # down to device-only keys; we forward only those here.
-                model = model_cls.from_pretrained(
-                    valid_path,
-                    rbln_config=rbln_overrides,
-                )
-                self.vllm_config.model_config.model = valid_path
-        else:
-            assert not self._is_ec_producer_only(), (
-                "Disaggregated Encoder is only supported for pre-compiled model."
+            # pre-compiled OR cache-hit.
+            # NOTE:
+            # ``sync_vllm_and_optimum`` already narrowed user overrides
+            # down to device-only keys; we forward only those here.
+            model = model_cls.from_pretrained(
+                valid_path,
+                rbln_config=rbln_overrides,
             )
+            self.vllm_config.model_config.model = valid_path
+        else:
             # cache miss: compile the model and save it to the cache for reuse.
+            cached_model_path = self.vllm_config.additional_config.get(
+                "cached_model_path"
+            )
             spec = RBLNCompileSpec.for_architecture(
-                hf_config,
+                self.model_config.hf_config,
                 batch_size=self.scheduler_config.max_num_seqs,
                 block_size=get_attn_block_size(self.vllm_config),
                 max_model_len=self.model_config.max_model_len,
@@ -239,18 +221,6 @@ class RBLNOptimumModelBase(nn.Module):
             if hasattr(model, "get_attn_impl")
             else None
         )
-
-    # ------------------------------------------------------------------
-    # EC disaggregation helpers
-    # ------------------------------------------------------------------
-
-    def _is_ec_producer_only(self) -> bool:
-        ec = getattr(self.vllm_config, "ec_transfer_config", None)
-        return ec is not None and ec.is_ec_producer and not ec.is_ec_consumer
-
-    def _is_ec_consumer_only(self) -> bool:
-        ec = getattr(self.vllm_config, "ec_transfer_config", None)
-        return ec is not None and ec.is_ec_consumer and not ec.is_ec_producer
 
     @property
     def dtype(self) -> torch.dtype:

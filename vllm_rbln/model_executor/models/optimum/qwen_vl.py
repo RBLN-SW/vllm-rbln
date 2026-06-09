@@ -64,8 +64,6 @@ class RBLNOptimumQwenVLForConditionalGeneration(
     ) -> None:
         super().__init__(vllm_config=vllm_config)
         self.rope_deltas: dict = dict()
-        if self._is_ec_producer_only():
-            return
         assert self.kv_block_adapter is not None
         self.setup_decoder_mixin(
             attn_impl=self.attn_impl,
