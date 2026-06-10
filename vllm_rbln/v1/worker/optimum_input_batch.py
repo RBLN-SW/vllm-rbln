@@ -127,7 +127,7 @@ class RBLNInputBatch(InputBatch):
             or self.logits_processing_needs_token_ids[:num_reqs].any()
         )
         if needs_prompt_token_ids:
-           prompt_token_ids = self._make_prompt_token_ids_tensor()
+            prompt_token_ids = self._make_prompt_token_ids_tensor()
         else:
             prompt_token_ids = None
 
