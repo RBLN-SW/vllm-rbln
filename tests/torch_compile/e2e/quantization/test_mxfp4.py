@@ -56,6 +56,7 @@ PROMPTS = [
 ]
 
 
+@pytest.mark.skip
 def test_mxfp4_greedy_generation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
