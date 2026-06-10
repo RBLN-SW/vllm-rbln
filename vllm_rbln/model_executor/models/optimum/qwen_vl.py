@@ -316,6 +316,7 @@ class RBLNOptimumQwenVLForConditionalGeneration(
             )
 
         # NOTE: preprocess_prefill also use dtype casting.
+        # eunji.lee): dtype casting is required
         inputs_embeds = self.model.embed_tokens(input_ids).to(self.dtype)
         position_embeds = []
         for b_id, request_id in enumerate(running_requests_ids):
