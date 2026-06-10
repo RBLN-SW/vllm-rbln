@@ -143,10 +143,6 @@ class RBLNOptimumScheduler(Scheduler):
         assert num_gpu_blocks is not None and num_gpu_blocks > 0
 
         self.block_size = self.cache_config.block_size
-        assert hash_block_size == self.block_size, (
-            "RBLNOptimumScheduler assumes hash_block_size == block_size "
-            f"(got {hash_block_size} != {self.block_size})"
-        )
         # req_id -> Request
         self.requests: dict[str, Request] = {}
         # Scheduling policy
@@ -184,6 +180,9 @@ class RBLNOptimumScheduler(Scheduler):
             attn_block_size = self.vllm_config.additional_config["attn_block_size"]
         else:
             attn_block_size = None
+        # Create the KV cache manager.
+        if hash_block_size is None:
+            hash_block_size = block_size
         self.kv_cache_manager = RBLNKVCacheManager(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
