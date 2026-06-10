@@ -437,6 +437,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     self.speculative_config,
                     self.device,
                     compile_context=self.compile_context,
+                    # Fixed spec length for static rejection-sample op shape.
+                    num_spec_tokens=self.speculative_config.num_speculative_tokens,
                 )
             else:
                 self.rejection_sampler = CPURejectionSampler(
