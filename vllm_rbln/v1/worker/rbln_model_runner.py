@@ -156,11 +156,11 @@ logger = init_logger(__name__)
 
 
 def compute_slot_mapping_np(block_table, req_indices, positions_np, num_tokens):
-    """Numpy slot mapping (pre-v0.22 BlockTable behavior).
+    """Numpy slot mapping.
 
-    vLLM v0.22 replaced BlockTable.compute_slot_mapping with a Triton kernel,
-    which is unavailable on RBLN. CP/DCP are not supported on RBLN, so the
-    plain (block_number * block_size + offset) mapping is sufficient.
+    vLLM's BlockTable.compute_slot_mapping is a Triton kernel, which is
+    unavailable on RBLN. CP/DCP are not supported on RBLN, so the plain
+    (block_number * block_size + offset) mapping is sufficient.
     """
     for bt in block_table.block_tables:
         indices = req_indices * bt.max_num_blocks_per_req + (
@@ -325,8 +325,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 compile_ctx_args["use_global_ctx"] = True
             self.compile_context = CompileContext(**compile_ctx_args)
             # Expose for attention metadata builders to register their
-            # persistent buffers as DRAM-static (vLLM v0.22 lifts metadata
-            # via forward context, not wrapper args).
+            # persistent buffers as DRAM-static.
             from vllm_rbln.torch_compile_backend import set_compile_context
 
             set_compile_context(self.compile_context)

@@ -146,9 +146,8 @@ def _rbln_unified_attention_with_output(
     # embedded kv cache.
     kv_cache = _resolve_kv_cache(attn_metadata, self.layer_index)
 
-    # NOTE: vLLM v0.22 Attention.forward flattens q/k/v to
-    # [num_tokens, heads, head_size]; restore [batch, q_len, hidden]
-    # expected by the RBLN impl.
+    # Attention.forward flattens q/k/v to [num_tokens, heads, head_size];
+    # restore the [batch, q_len, hidden] layout expected by the RBLN impl.
     num_tokens = query.shape[0]
     q_len = attn_metadata.max_query_len
     batch = attn_metadata.seq_lens.shape[0]

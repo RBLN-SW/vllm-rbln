@@ -877,8 +877,6 @@ class RBLNScheduler(Scheduler):
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 # Count the number of prefix cached tokens.
-                # vLLM v0.22 replaced Request.num_cached_tokens with
-                # prefill_stats (consumed once by the output processor).
                 if request.prefill_stats is not None:
                     request.prefill_stats.set(
                         num_prompt_tokens=request.num_prompt_tokens,

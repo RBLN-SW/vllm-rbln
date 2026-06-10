@@ -1118,8 +1118,8 @@ class RBLNFlashAttentionMetadataBuilder(
         query_max_seq_len = common_attn_metadata.max_seq_len
         query_start_loc = common_attn_metadata.query_start_loc
         seq_lens = common_attn_metadata.seq_lens
-        # vLLM v0.22 passes the full [max_num_reqs, ...] block table; slice to
-        # the active requests so RBLN batch padding produces [batch_pad, ...].
+        # Slice the full [max_num_reqs, ...] block table to the active
+        # requests so RBLN batch padding produces [batch_pad, ...].
         block_tables_tensor = common_attn_metadata.block_table_tensor[:num_reqs]
         slot_mapping = common_attn_metadata.slot_mapping
         if use_dt:
@@ -1247,8 +1247,7 @@ class RBLNFlashAttentionMetadataBuilder(
             query_start_loc=query_start_loc,
             max_seq_len=query_max_seq_len,
             # Persistent buffers keep stable data_ptrs across steps so the
-            # compiled artifact's DRAM key-address map can track host writes
-            # (vLLM v0.22 routes these via forward context instead of args).
+            # compiled artifact's DRAM key-address map can track host writes.
             seq_lens=self._to_device_inplace(seq_lens_tensor, "_seq_lens_buf")
             if not self.is_batch_attention_opt or is_prefill or batch_pad <= 1
             else self._to_device_inplace(seq_idx, "_seq_idx_buf"),

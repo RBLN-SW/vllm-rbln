@@ -108,7 +108,7 @@ def _adapt_runtime_inputs(
 ) -> Any:
     """Adapt dynamo's full lifted-arg call to the compiled runtime IO contract.
 
-    vLLM v0.22 routes KV caches and attention metadata through the forward
+    vLLM routes KV caches and attention metadata through the forward
     context, so dynamo lifts them as graph placeholders. The rebel compiler
     excludes static-marked / folded tensors from the runtime IO, leaving
     fewer runtime inputs than dynamo passes at each call. Map runtime

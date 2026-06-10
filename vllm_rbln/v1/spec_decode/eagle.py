@@ -188,7 +188,6 @@ class RBLNEagleProposer(EagleProposer):
         )
         hidden_states = hidden_states[token_indices_to_sample]
 
-        # NOTE(RBLN): tree attention was removed in vLLM v0.22
         draft_token_ids = logits[:batch_size].argmax(dim=-1)
 
         if self.allowed_attn_types is not None and not isinstance(
