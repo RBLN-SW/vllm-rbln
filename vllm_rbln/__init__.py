@@ -58,7 +58,6 @@ def register_ops():
         import vllm_rbln.forward_context  # noqa
         import vllm_rbln.lora.layer  # noqa
         import vllm_rbln.model_executor.layers.fused_moe.layer  # noqa
-        import vllm_rbln.model_executor.layers.fused_moe.shared_fused_moe  # noqa
         import vllm_rbln.model_executor.layers.logits_processor  # noqa
         import vllm_rbln.model_executor.layers.quantization.kernels.mixed_precision  # noqa
         import vllm_rbln.model_executor.layers.quantization.mxfp4  # noqa

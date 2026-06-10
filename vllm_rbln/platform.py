@@ -33,7 +33,6 @@ from vllm.utils.torch_utils import _StreamPlaceholder
 
 import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
-from vllm_rbln.utils.optimum.converter import sync_vllm_and_optimum
 from vllm_rbln.utils.optimum.predicates import is_qwen3_pooling
 from vllm_rbln.utils.optimum.registry import (
     is_enc_dec_arch,
@@ -98,6 +97,10 @@ class RblnPlatform(Platform):
     @staticmethod
     def inference_mode():
         return torch.no_grad()
+
+    @classmethod
+    def manual_seed_all(cls, seed: int) -> None:
+        pass
 
     @classmethod
     def set_device(cls, device: torch.device) -> None:
@@ -330,6 +333,8 @@ class RblnPlatform(Platform):
                     del model_config.__dict__["is_encoder_decoder"]
 
             cls.disable_unsupported_prefix_caching(vllm_config)
+            from vllm_rbln.utils.optimum.converter import sync_vllm_and_optimum
+
             sync_vllm_and_optimum(vllm_config)
 
         if (
