@@ -50,6 +50,7 @@ refer to query backfill -- not a separate mechanism.
 import itertools
 import time
 from dataclasses import dataclass, field
+from typing import Any
 
 from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
@@ -161,6 +162,19 @@ class RBLNScheduler(Scheduler):
                     "sub_block_size=%d.",
                     sub_block_size,
                 )
+
+        # NOTE(RBLN): Blocks allocated for a running (decode) request that is
+        # then evicted by the "disable mixed batching" path (see schedule())
+        # are already committed in the KV-cache coordinator but never reach the
+        # model runner, because the evicted request is dropped from this step's
+        # output. On the next step `allocate_slots` returns an empty delta (the
+        # coordinator already holds the block), so the block id would be lost
+        # to the runner forever — leaving a stale block-id 0 in the request's
+        # block table. This is observable for block-aligned prompts, whose
+        # second block is allocated exactly on the prefill->decode transition
+        # step that the eviction targets. We stash the dropped delta here and
+        # re-emit it on the request's next scheduled step. Keyed by request_id.
+        self._stranded_new_blocks: dict[str, KVCacheBlocks] = {}
 
     def schedule(self) -> RBLNSchedulerOutput:
         # Copied from vllm.v1.core.sched.Scheduler.schedule: https://github.com/vllm-project/vllm/blob/v0.18.0/vllm/v1/core/sched/scheduler.py#L338-L927
@@ -892,12 +906,28 @@ class RBLNScheduler(Scheduler):
                 # be scheduled together with the other running requests in the decoding
                 # phase.
                 for req in scheduled_running_reqs:
-                    req_to_new_blocks.pop(req.request_id)
+                    evicted_blocks = req_to_new_blocks.pop(req.request_id)
                     num_scheduled_tokens.pop(req.request_id)
                     req.spec_token_ids = scheduled_spec_decode_tokens.pop(
                         req.request_id, []
                     )
                     scheduled_encoder_inputs.pop(req.request_id, None)
+
+                    # NOTE(RBLN): The block delta allocated for this evicted
+                    # request is already committed in the coordinator but is
+                    # being dropped from this step's output. Stash it (merging
+                    # with any delta stranded on a previous consecutive
+                    # eviction) so it is re-emitted to the runner on the
+                    # request's next scheduled step. Skip empty deltas.
+                    if evicted_blocks is not None and any(
+                        len(g) > 0 for g in evicted_blocks.get_block_ids()
+                    ):
+                        prev = self._stranded_new_blocks.get(req.request_id)
+                        self._stranded_new_blocks[req.request_id] = (
+                            prev + evicted_blocks
+                            if prev is not None
+                            else evicted_blocks
+                        )
 
                 scheduled_running_reqs.clear()
                 token_budget = prefill_token_budget
@@ -978,6 +1008,22 @@ class RBLNScheduler(Scheduler):
                 for req in scheduled_new_reqs
             ]
 
+        # NOTE(RBLN): Re-emit any block delta that was stranded when a running
+        # request was evicted by the "disable mixed batching" path on a prior
+        # step. The coordinator already holds these blocks, so this step's
+        # `allocate_slots` returned an empty delta for them; prepending the
+        # stranded delta (allocated earlier) ahead of this step's delta keeps
+        # the runner's block table in sync (the runner appends deltas in
+        # order). Only requests actually scheduled this step (cached/running)
+        # carry their delta to the runner, so drain on emit.
+        if self._stranded_new_blocks:
+            for req in scheduled_running_reqs:
+                stranded = self._stranded_new_blocks.pop(req.request_id, None)
+                if stranded is not None:
+                    req_to_new_blocks[req.request_id] = (
+                        stranded + req_to_new_blocks[req.request_id]
+                    )
+
         with record_function_or_nullcontext("schedule: make_cached_request_data"):
             cached_reqs_data = self._make_cached_request_data(
                 scheduled_running_reqs,
@@ -1046,6 +1092,14 @@ class RBLNScheduler(Scheduler):
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
         return scheduler_output
+
+    def _free_request(
+        self, request: Request, delay_free_blocks: bool = False
+    ) -> dict[str, Any] | None:
+        # Drop any block delta stashed for re-emit; the request is finishing and
+        # will never be scheduled again, so the stash would otherwise leak.
+        self._stranded_new_blocks.pop(request.request_id, None)
+        return super()._free_request(request, delay_free_blocks)
 
     def update_from_output(
         self,

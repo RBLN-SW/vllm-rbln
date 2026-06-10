@@ -77,6 +77,7 @@ def _llm_kwargs() -> dict:
     )
 
 
+@pytest.mark.skip(reason="CI is currently running without torch-rbln")
 def test_ngram_device_tensor_multi_batch(monkeypatch: pytest.MonkeyPatch) -> None:
     # Random (non-greedy) sampling so the temperature tensor is actually
     # consumed in the bonus path — this is where the broadcast used to fail.
