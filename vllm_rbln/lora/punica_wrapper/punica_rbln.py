@@ -56,7 +56,6 @@ class PunicaWrapperRBLN(PunicaWrapperBase):
         y: torch.Tensor,
         x: Union[tuple[torch.Tensor, ...], torch.Tensor],
         lora_b_stacked: tuple[torch.Tensor, ...],
-        lora_bias_stacked: tuple[torch.Tensor, ...] | None,
         output_slices: tuple[int, ...],
         offset_start: int = 0,
         add_inputs: bool = True,
@@ -69,8 +68,7 @@ class PunicaWrapperRBLN(PunicaWrapperBase):
         offset = offset_start
         for i in range(len(lora_b_stacked)):
             slice = output_slices[i]
-            y[:, offset:offset+slice] +=
-                x[i] @ lora_b_stacked[i] + lora_bias_stacked[i]
+            y[:, offset:offset+slice] += x[i] @ lora_b_stacked[i]
             offset += slice
         """
         raise NotImplementedError
