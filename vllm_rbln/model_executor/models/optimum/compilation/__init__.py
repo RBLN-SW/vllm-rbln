@@ -156,9 +156,8 @@ class RBLNCompileSpec:
                 f"Unknown multimodal model alias: {model_name}. "
                 f"Supported aliases: {sorted(_COMPILE_MULTIMODAL_FNS.keys())}"
             )
-        architectures = getattr(config, "architectures", [])
         return cls(
-            model_cls=get_multimodal_cls(architectures[0]),
+            model_cls=get_multimodal_cls(),
             rbln_config=compile_fn(batch_size, max_model_len, block_size, tp_size),
         )
 
