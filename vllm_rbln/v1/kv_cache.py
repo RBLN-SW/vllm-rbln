@@ -53,6 +53,7 @@ class RBLNSlidingWindowManager(SingleTypeKVCacheManager):
         new_computed_blocks: Sequence[KVCacheBlock],
         total_computed_tokens: int,
         num_tokens_main_model: int,
+        apply_admission_cap: bool = False,
     ) -> int:
         return 0 if self.req_to_blocks[request_id] else 1
 
