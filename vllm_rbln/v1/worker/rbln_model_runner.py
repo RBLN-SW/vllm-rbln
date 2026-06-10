@@ -155,27 +155,6 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def compute_slot_mapping_np(block_table, req_indices, positions_np, num_tokens):
-    """Numpy slot mapping.
-
-    vLLM's BlockTable.compute_slot_mapping is a Triton kernel, which is
-    unavailable on RBLN. CP/DCP are not supported on RBLN, so the plain
-    (block_number * block_size + offset) mapping is sufficient.
-    """
-    for bt in block_table.block_tables:
-        indices = req_indices * bt.max_num_blocks_per_req + (
-            positions_np // bt.block_size
-        )
-        block_numbers = bt.block_table.np.ravel()[indices]
-        block_offsets = positions_np % bt.block_size
-        np.add(
-            block_numbers * bt.block_size,
-            block_offsets,
-            out=bt.slot_mapping.np[:num_tokens],
-        )
-        bt.slot_mapping.copy_to_gpu(num_tokens)
-
-
 # Wrapper for ModelRunnerOutput to support overlapped execution.
 class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
     def __init__(
@@ -1303,7 +1282,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             out=self.input_ids.cpu[:total_query_tokens],
         )
 
-        compute_slot_mapping_np(
+        compute_slot_mapping_cpu(
             self.input_batch.block_table, req_indices, positions_np, total_query_tokens
         )
 
@@ -2527,7 +2506,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             out=input_ids[:total_num_scheduled_tokens],
         )
 
-        compute_slot_mapping_np(
+        compute_slot_mapping_cpu(
             input_batch.block_table,
             req_indices,
             positions_np,
