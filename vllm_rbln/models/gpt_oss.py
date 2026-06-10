@@ -224,9 +224,15 @@ if True:
         return loaded_params
 
     def __gpt_oss_moe_forward_rsd(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Flatten to 2D so the router Linear emits [T, E] directly; a 3D
+        # router output makes the compiler MoE pass fold reshape+transpose
+        # into an invalid 2-axis transpose on 3D data.
+        orig_shape = hidden_states.shape
+        hidden_states = hidden_states.reshape(-1, orig_shape[-1])
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router=self.router
         )
+        final_hidden_states = final_hidden_states.reshape(orig_shape)
         tp_size = get_tensor_model_parallel_world_size()
         if tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)

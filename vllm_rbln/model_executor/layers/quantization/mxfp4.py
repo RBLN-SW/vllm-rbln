@@ -451,6 +451,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             if use_moe_tokens_mask:
                 tokens_mask = get_tokens_mask(num_tokens, device=router_logits.device)
 
+            # 3D inputs break the compiler MoE pass (2-axis transpose on 3D)
+            assert hidden_states.ndim == 2 and router_logits.ndim == 2
             final_hidden_states = torch.ops.rbln_custom_ops.custom_moe_glu_mxfp4(
                 hidden_states,
                 layer.gate_proj_blocks,

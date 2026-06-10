@@ -876,6 +876,15 @@ class RBLNScheduler(Scheduler):
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
+                # Count the number of prefix cached tokens.
+                # vLLM v0.22 replaced Request.num_cached_tokens with
+                # prefill_stats (consumed once by the output processor).
+                if request.prefill_stats is not None:
+                    request.prefill_stats.set(
+                        num_prompt_tokens=request.num_prompt_tokens,
+                        num_local_cached_tokens=num_computed_tokens,
+                        num_external_cached_tokens=0,
+                    )
                 # Encoder-related.
                 if encoder_inputs_to_schedule:
                     scheduled_encoder_inputs[request_id] = encoder_inputs_to_schedule

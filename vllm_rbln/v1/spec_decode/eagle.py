@@ -19,7 +19,7 @@ import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.distributed.parallel_state import get_dp_group, get_pp_group, get_tp_group
-from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
@@ -188,6 +188,7 @@ class RBLNEagleProposer(EagleProposer):
         )
         hidden_states = hidden_states[token_indices_to_sample]
 
+        # NOTE(RBLN): tree attention was removed in vLLM v0.22
         draft_token_ids = logits[:batch_size].argmax(dim=-1)
 
         if self.allowed_attn_types is not None and not isinstance(

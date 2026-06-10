@@ -155,6 +155,27 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def compute_slot_mapping_np(block_table, req_indices, positions_np, num_tokens):
+    """Numpy slot mapping (pre-v0.22 BlockTable behavior).
+
+    vLLM v0.22 replaced BlockTable.compute_slot_mapping with a Triton kernel,
+    which is unavailable on RBLN. CP/DCP are not supported on RBLN, so the
+    plain (block_number * block_size + offset) mapping is sufficient.
+    """
+    for bt in block_table.block_tables:
+        indices = req_indices * bt.max_num_blocks_per_req + (
+            positions_np // bt.block_size
+        )
+        block_numbers = bt.block_table.np.ravel()[indices]
+        block_offsets = positions_np % bt.block_size
+        np.add(
+            block_numbers * bt.block_size,
+            block_offsets,
+            out=bt.slot_mapping.np[:num_tokens],
+        )
+        bt.slot_mapping.copy_to_gpu(num_tokens)
+
+
 # Wrapper for ModelRunnerOutput to support overlapped execution.
 class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
     def __init__(
@@ -303,6 +324,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             if "use_global_ctx" in inspect.signature(CompileContext).parameters:
                 compile_ctx_args["use_global_ctx"] = True
             self.compile_context = CompileContext(**compile_ctx_args)
+            # Expose for attention metadata builders to register their
+            # persistent buffers as DRAM-static (vLLM v0.22 lifts metadata
+            # via forward context, not wrapper args).
+            from vllm_rbln.torch_compile_backend import set_compile_context
+
+            set_compile_context(self.compile_context)
         else:
             self.compile_context = None
         self.runtime_holder: list = []
@@ -1277,11 +1304,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             out=self.input_ids.cpu[:total_query_tokens],
         )
 
-        compute_slot_mapping_cpu(
-            self.input_batch.block_table,
-            req_indices,
-            positions_np,
-            total_num_scheduled_tokens,
+        compute_slot_mapping_np(
+            self.input_batch.block_table, req_indices, positions_np, total_query_tokens
         )
 
         # Prepare the attention metadata.
@@ -2504,7 +2528,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             out=input_ids[:total_num_scheduled_tokens],
         )
 
-        compute_slot_mapping_cpu(
+        compute_slot_mapping_np(
             input_batch.block_table,
             req_indices,
             positions_np,
@@ -4960,6 +4984,13 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             assert len(kv_cache_names) == len(self.kv_caches)
             for kv_cache, name in zip(self.kv_caches, kv_cache_names):
                 self.compile_context.mark_static_address(kv_cache, name)
+            # Deduplicated base tensors are what dynamo actually lifts when
+            # kv_cache_bases bindings are active; without marking them too,
+            # they stay graph inputs and break the runtime IO contract.
+            for base_index, base in enumerate(self.kv_cache_bases):
+                self.compile_context.mark_static_address(
+                    base, f"kv_cache_base.{base_index}"
+                )
 
         self._log_kv_cache_info(kv_cache_config, kv_caches)
         return kv_caches

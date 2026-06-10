@@ -88,7 +88,7 @@ def rope_forward_oot(
     )
 
     query_shape = query.shape
-    query = query.view(batch_size, seq_len, -1, self.head_size)
+    query = query.reshape(batch_size, seq_len, -1, self.head_size)
     query_rot = query[..., : self.rotary_dim]
     query_rot = query_rot.transpose(1, 2)
     query_rot = query_rot * cos + rotate_fn(query_rot) * sin
@@ -101,7 +101,7 @@ def rope_forward_oot(
         query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
 
     key_shape = key.shape
-    key = key.view(batch_size, seq_len, -1, self.head_size)
+    key = key.reshape(batch_size, seq_len, -1, self.head_size)
     key_rot = key[..., : self.rotary_dim]
     key_rot = key_rot.transpose(1, 2)
     key_rot = key_rot * cos + rotate_fn(key_rot) * sin
