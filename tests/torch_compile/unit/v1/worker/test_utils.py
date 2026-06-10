@@ -406,10 +406,12 @@ class TestGetAutobindCpuIds:
             _make_cpu(7, 3, 1),  # NUMA 1, core 3
         ]
 
-    @patch("vllm_rbln.v1.worker.utils.get_allowed_cpu_core_node_list")
-    def test_basic_single_rank(self, mock_get_allowed_cpus):
+    @patch("vllm_rbln.v1.worker.utils.get_allowed_cpu_list")
+    @patch("vllm_rbln.v1.worker.utils.get_visible_memory_node")
+    def test_basic_single_rank(self, mock_nodes, mock_cpus):
         cpus = self._simple_cpu_list()
-        mock_get_allowed_cpus.return_value = ([0, 1], cpus)
+        mock_nodes.return_value = [0, 1]
+        mock_cpus.return_value = cpus
 
         parallel_cfg = _make_parallel_config(tp_size=1)
         result = get_autobind_cpu_ids(
@@ -425,10 +427,12 @@ class TestGetAutobindCpuIds:
             any(c.id == cid and c.numa_node == 0 for c in cpus) for cid in cpu_ids
         )
 
-    @patch("vllm_rbln.v1.worker.utils.get_allowed_cpu_core_node_list")
-    def test_rank_round_robins_numa_nodes(self, mock_get_allowed_cpus):
+    @patch("vllm_rbln.v1.worker.utils.get_allowed_cpu_list")
+    @patch("vllm_rbln.v1.worker.utils.get_visible_memory_node")
+    def test_rank_round_robins_numa_nodes(self, mock_nodes, mock_cpus):
         cpus = self._simple_cpu_list()
-        mock_get_allowed_cpus.return_value = ([0, 1], cpus)
+        mock_nodes.return_value = [0, 1]
+        mock_cpus.return_value = cpus
         parallel_cfg = _make_parallel_config(tp_size=2)
 
         r0 = get_autobind_cpu_ids(0, 0, parallel_cfg, lambda cpus: cpus)
@@ -439,20 +443,24 @@ class TestGetAutobindCpuIds:
         r1_ids = set(int(x) for x in r1.split(","))
         assert r0_ids.isdisjoint(r1_ids), "Ranks should not share CPUs"
 
-    @patch("vllm_rbln.v1.worker.utils.get_allowed_cpu_core_node_list")
-    def test_no_available_numa_returns_all(self, mock_get_allowed_cpus):
+    @patch("vllm_rbln.v1.worker.utils.get_allowed_cpu_list")
+    @patch("vllm_rbln.v1.worker.utils.get_visible_memory_node")
+    def test_no_available_numa_returns_all(self, mock_nodes, mock_cpus):
         """If allowed NUMA nodes don't have CPUs, return 'all'."""
-        mock_get_allowed_cpus.return_value = ([], [])
+        mock_nodes.return_value = []
+        mock_cpus.return_value = []
 
         parallel_cfg = _make_parallel_config()
         result = get_autobind_cpu_ids(0, 0, parallel_cfg, lambda cpus: cpus)
         assert result == "all"
 
-    @patch("vllm_rbln.v1.worker.utils.get_allowed_cpu_core_node_list")
-    def test_cpu_selector_filters_threads(self, mock_get_allowed_cpus):
+    @patch("vllm_rbln.v1.worker.utils.get_allowed_cpu_list")
+    @patch("vllm_rbln.v1.worker.utils.get_visible_memory_node")
+    def test_cpu_selector_filters_threads(self, mock_nodes, mock_cpus):
         """cpu_selector=lambda cpus: cpus[:1] should pick one thread per core."""
         cpus = self._simple_cpu_list()
-        mock_get_allowed_cpus.return_value = ([0, 1], cpus)
+        mock_nodes.return_value = [0, 1]
+        mock_cpus.return_value = cpus
 
         parallel_cfg = _make_parallel_config(tp_size=1)
         result = get_autobind_cpu_ids(
@@ -465,12 +473,14 @@ class TestGetAutobindCpuIds:
         # NUMA 0 has 2 cores, should get 2 CPUs (one per core)
         assert len(cpu_ids) == 2
 
-    @patch("vllm_rbln.v1.worker.utils.get_allowed_cpu_core_node_list")
-    def test_multiple_ranks_same_numa_exclusive_allocation(self, mock_get_allowed_cpus):
+    @patch("vllm_rbln.v1.worker.utils.get_allowed_cpu_list")
+    @patch("vllm_rbln.v1.worker.utils.get_visible_memory_node")
+    def test_multiple_ranks_same_numa_exclusive_allocation(self, mock_nodes, mock_cpus):
         """When 2 ranks map to the same NUMA node, CPUs are split."""
         # Single NUMA node with 4 cores, 1 thread each
         cpus = [_make_cpu(i, i, 0) for i in range(4)]
-        mock_get_allowed_cpus.return_value = ([0], cpus)
+        mock_nodes.return_value = [0]
+        mock_cpus.return_value = cpus
 
         parallel_cfg = _make_parallel_config(tp_size=2)
 
@@ -482,11 +492,13 @@ class TestGetAutobindCpuIds:
         assert r0_ids.isdisjoint(r1_ids)
         assert len(r0_ids) + len(r1_ids) == 4
 
-    @patch("vllm_rbln.v1.worker.utils.get_allowed_cpu_core_node_list")
-    def test_uneven_cpu_split(self, mock_get_allowed_cpus):
+    @patch("vllm_rbln.v1.worker.utils.get_allowed_cpu_list")
+    @patch("vllm_rbln.v1.worker.utils.get_visible_memory_node")
+    def test_uneven_cpu_split(self, mock_nodes, mock_cpus):
         """3 CPUs split between 2 ranks: one gets 2, other gets 1."""
         cpus = [_make_cpu(i, i, 0) for i in range(3)]
-        mock_get_allowed_cpus.return_value = ([0], cpus)
+        mock_nodes.return_value = [0]
+        mock_cpus.return_value = cpus
 
         parallel_cfg = _make_parallel_config(tp_size=2)
 
@@ -497,11 +509,13 @@ class TestGetAutobindCpuIds:
         r1_count = len(r1.split(","))
         assert {r0_count, r1_count} == {1, 2}
 
-    @patch("vllm_rbln.v1.worker.utils.get_allowed_cpu_core_node_list")
-    def test_dp_rank_affects_binding(self, mock_get_allowed_cpus):
+    @patch("vllm_rbln.v1.worker.utils.get_allowed_cpu_list")
+    @patch("vllm_rbln.v1.worker.utils.get_visible_memory_node")
+    def test_dp_rank_affects_binding(self, mock_nodes, mock_cpus):
         """Data parallelism changes rank_across_dp calculation."""
         cpus = [_make_cpu(i, i, 0) for i in range(8)]
-        mock_get_allowed_cpus.return_value = ([0], cpus)
+        mock_nodes.return_value = [0]
+        mock_cpus.return_value = cpus
 
         dp_cfg = SimpleNamespace(
             tensor_parallel_size=1,
@@ -517,11 +531,13 @@ class TestGetAutobindCpuIds:
         # With single NUMA node, both ranks share, so rank 1 gets second half
         assert len(cpu_ids) == 4
 
-    @patch("vllm_rbln.v1.worker.utils.get_allowed_cpu_core_node_list")
-    def test_empty_allocation_returns_all(self, mock_get_allowed_cpus):
+    @patch("vllm_rbln.v1.worker.utils.get_allowed_cpu_list")
+    @patch("vllm_rbln.v1.worker.utils.get_visible_memory_node")
+    def test_empty_allocation_returns_all(self, mock_nodes, mock_cpus):
         """If cpu_selector returns empty lists, should fallback to 'all'."""
         cpus = [_make_cpu(0, 0, 0)]
-        mock_get_allowed_cpus.return_value = ([0], cpus)
+        mock_nodes.return_value = [0]
+        mock_cpus.return_value = cpus
 
         # 2 ranks but only 1 CPU in the only NUMA node
         parallel_cfg = _make_parallel_config(tp_size=2)
