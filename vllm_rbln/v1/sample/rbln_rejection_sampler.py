@@ -259,6 +259,7 @@ class RBLNRejectionSampler(RejectionSampler):
             "happens when structured output is used together with speculative "
             "decoding. Use the CPU rejection sampler for this combination."
         )
+        device = target_probs.device
         assert draft_token_ids.is_contiguous()
         assert draft_probs is None or draft_probs.is_contiguous()
         assert target_probs.is_contiguous()
@@ -323,9 +324,9 @@ class RBLNRejectionSampler(RejectionSampler):
         # FIXME required for device tensor?
         # cu_num_draft_tokens = cu_num_draft_tokens.to(device=cpu_device)
         if sampling_metadata.top_k is not None:
-            sampling_metadata.top_k = sampling_metadata.top_k.to(device=cpu_device)
+            sampling_metadata.top_k = sampling_metadata.top_k.to(device=device)
         if sampling_metadata.top_p is not None:
-            sampling_metadata.top_p = sampling_metadata.top_p.to(device=cpu_device)
+            sampling_metadata.top_p = sampling_metadata.top_p.to(device=device)
 
         # ------------------------------------------------------------------
         # 2) Call the NPU primitive.
@@ -334,9 +335,9 @@ class RBLNRejectionSampler(RejectionSampler):
         #   num_accepted       : (B,)   int — per-batch number of accepted draft
         #                                     tokens (in [0, num_draft_tokens[i]]).
         # ------------------------------------------------------------------
-        reshaped_draft_token_ids = reshaped_draft_token_ids.to(cpu_device)
-        reshaped_target_probs = reshaped_target_probs.to(cpu_device)
-        cu_num_draft_tokens = cu_num_draft_tokens.to(cpu_device)
+        reshaped_draft_token_ids = reshaped_draft_token_ids.to(device)
+        reshaped_target_probs = reshaped_target_probs.to(device)
+        cu_num_draft_tokens = cu_num_draft_tokens.to(device)
         recovered_token_ids, num_accepted = self.compiled_rejection_sample(
             reshaped_draft_token_ids,
             reshaped_target_probs,
