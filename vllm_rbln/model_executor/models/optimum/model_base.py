@@ -198,6 +198,9 @@ class RBLNOptimumModelBase(nn.Module):
                 # NOTE:
                 # ``sync_vllm_and_optimum`` already narrowed user overrides
                 # down to device-only keys; we forward only those here.
+                rbln_overrides = dict(rbln_overrides)
+                if self._is_ec_consumer_only():
+                    rbln_overrides["_load_visual_runtime"] = False
                 model = model_cls.from_pretrained(
                     valid_path,
                     rbln_config=rbln_overrides,

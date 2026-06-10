@@ -315,7 +315,8 @@ class RBLNOptimumQwenVLForConditionalGeneration(
                 " expected {padded_batch_size}.",
             )
 
-        inputs_embeds = self.model.embed_tokens(input_ids)
+        # NOTE(eunji.lee): dtype casting is required
+        inputs_embeds = self.model.embed_tokens(input_ids).to(self.dtype)
         position_embeds = []
         for b_id, request_id in enumerate(running_requests_ids):
             delta = cache_position[b_id] + self.rope_deltas[request_id]
