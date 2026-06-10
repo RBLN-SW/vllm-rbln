@@ -252,6 +252,17 @@ def estimate_available_memory(
     rsd_replicas = (rsd_size // num_key_value_heads) or 1 if "ca" in device_name else 1
     available_dram_bytes = available_dram_bytes // rsd_replicas
 
+    if "cr" in device_name and num_key_value_heads % rsd_size != 0:
+        # KV heads are sharded across chiplets, so when they do not divide
+        # evenly a chiplet holds ceil(H / N) heads while owning only 1/N of
+        # DRAM. The bottleneck chiplet limits the usable KV pool to
+        # H / (N * ceil(H / N)) of the uniform estimate (e.g. 10 heads on 4
+        # chiplets -> 10/12), otherwise the per-chiplet allocator OOMs.
+        heads_per_chiplet = math.ceil(num_key_value_heads / rsd_size)
+        available_dram_bytes = (
+            available_dram_bytes * num_key_value_heads
+        ) // (rsd_size * heads_per_chiplet)
+
     check_oom(available_dram_bytes)
 
     return available_dram_bytes

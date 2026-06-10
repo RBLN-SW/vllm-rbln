@@ -26,6 +26,7 @@ from vllm.v1.request import Request
 @dataclass(frozen=True)
 class RBLNSlidingWindowSpec(SlidingWindowSpec):
     def __post_init__(self):
+        super().__post_init__()
         # NOTE: The block size here means to be the physical block size. The
         # logical kernel_block_size that the kernel actually uses is equal to
         # sliding_window. The physical block is split into logical blocks.
