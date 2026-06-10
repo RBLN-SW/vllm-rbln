@@ -187,10 +187,11 @@ class RBLNOptimumModelBase(nn.Module):
         if valid_path is not None:
             # pre-compiled OR cache-hit
             model_cls = getattr(optimum.rbln, model_cls_name)
+            ec_enabled_model = model_cls_name == "RBLNQwen3VLForConditionalGeneration"
             assert model_cls is not None
             # FIXME decouple producer logic from model_base.py
             if self._is_ec_producer_only():
-                if model_cls_name != "RBLNQwen3VLForConditionalGeneration":
+                if not ec_enabled_model:
                     raise ValueError("Disaggregation is not supported for this model.")
                 visual = model_cls.load_visual_encoder(valid_path)
                 model = _ProducerOptimumModelProxy(visual, visual.rbln_config)
@@ -200,6 +201,10 @@ class RBLNOptimumModelBase(nn.Module):
                 # down to device-only keys; we forward only those here.
                 rbln_overrides = dict(rbln_overrides)
                 if self._is_ec_consumer_only():
+                    if not ec_enabled_model:
+                        raise ValueError(
+                            "Disaggregation is not supported for this model."
+                        )
                     rbln_overrides["_load_visual_runtime"] = False
                 model = model_cls.from_pretrained(
                     valid_path,
