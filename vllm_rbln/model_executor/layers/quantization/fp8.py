@@ -30,7 +30,6 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     create_fp8_input_scale,
     create_fp8_scale_parameter,
     create_fp8_weight_parameter,
-    maybe_post_process_fp8_weight_block,
     process_fp8_weight_block_strategy,
     process_fp8_weight_tensor_strategy,
     validate_fp8_block_shape,
@@ -324,8 +323,11 @@ class Fp8LinearMethod(LinearMethodBase):
             else None
         )
 
-        if self.block_quant:
-            maybe_post_process_fp8_weight_block(layer)
+        # vLLM 0.22 removed the maybe_post_process_fp8_weight_block() wrapper.
+        # It only requantized weights for DeepGemm (CUDA Hopper/Blackwell), which
+        # is never selected on RBLN (CPU/NPU), so it was a no-op here and is
+        # dropped. The low-level deepgemm_post_process_fp8_weight_block helper
+        # still exists upstream if a DeepGemm path is ever needed.
 
     def apply(
         self,

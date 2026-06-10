@@ -19,16 +19,48 @@ import platform
 from collections import defaultdict
 from collections.abc import Callable
 
+import numpy as np
 import torch
 from vllm.config import ModelConfig, ParallelConfig
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.platforms import CpuArchEnum, current_platform
-from vllm.platforms.cpu import CpuPlatform, LogicalCPUInfo
+from vllm.platforms.cpu import CpuPlatform
+from vllm.utils.cpu_resource_utils import LogicalCPUInfo
+from vllm.v1.worker.block_table import MultiGroupBlockTable
 
 import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+def compute_slot_mapping_cpu(
+    block_table: MultiGroupBlockTable,
+    req_indices: np.ndarray,
+    positions_np: np.ndarray,
+    total_num_scheduled_tokens: int,
+) -> None:
+    """Compute slot_mapping on CPU and sync to device.
+
+    vLLM 0.19 replaced the numpy slot_mapping path with a Triton kernel that
+    RBLN (CPU) cannot dispatch, so we always compute via numpy and push to
+    device ourselves. The same code works on 0.18 since all referenced
+    buffer attributes (``block_table.np``, ``slot_mapping.np``,
+    ``copy_to_gpu``) exist on both versions.
+    """
+    num_tokens = req_indices.shape[0]
+    for bt in block_table.block_tables:
+        block_table_indices = (
+            req_indices * bt.max_num_blocks_per_req + positions_np // bt.block_size
+        )
+        block_numbers = bt.block_table.np.ravel()[block_table_indices]
+        block_offsets = positions_np % bt.block_size
+        np.add(
+            block_numbers * bt.block_size,
+            block_offsets,
+            out=bt.slot_mapping.np[:num_tokens],
+        )
+        bt.slot_mapping.copy_to_gpu(total_num_scheduled_tokens)
 
 
 def estimate_model_kernel_size(
@@ -225,6 +257,53 @@ def estimate_available_memory(
     return available_dram_bytes
 
 
+# NOTE(RBLN): CpuPlatform.get_allowed_cpu_core_node_list() was removed in
+# https://github.com/vllm-project/vllm/pull/36487. Reimplemented here so
+# get_autobind_cpu_ids() can still resolve allowed NUMA nodes and logical CPUs.
+def get_allowed_cpu_core_node_list() -> tuple[list[int], list[LogicalCPUInfo]]:
+    import json
+    import re
+    import subprocess
+
+    assert platform.system() == "Linux"
+
+    # Init LogicalCPUInfo from lscpu
+    lscpu_output = subprocess.check_output(
+        "lscpu -J -e=CPU,CORE,NODE", shell=True, text=True
+    )
+    lscpu_output = re.sub(r'"node":\s*-\s*(,|\n)', r'"node": 0\1', lscpu_output)
+    logical_cpu_list: list[LogicalCPUInfo] = json.loads(
+        lscpu_output, object_hook=LogicalCPUInfo.json_decoder
+    )["cpus"]
+
+    # Filter CPUs with invalid attributes
+    logical_cpu_list = [
+        x for x in logical_cpu_list if -1 not in (x.id, x.physical_core, x.numa_node)
+    ]
+
+    # Filter allowed CPUs
+    if hasattr(os, "sched_getaffinity"):
+        allowed_cpu_id_list = os.sched_getaffinity(0)
+    else:
+        raise NotImplementedError("Unsupported OS")
+    logical_cpu_list = [x for x in logical_cpu_list if x.id in allowed_cpu_id_list]
+
+    # Get allowed NUMA nodes
+    allowed_numa_nodes = set()
+    for x in logical_cpu_list:
+        allowed_numa_nodes.add(x.numa_node)  # type: ignore
+    allowed_numa_nodes_list = sorted(allowed_numa_nodes)
+
+    env_key = CpuPlatform.device_control_env_var
+    if env_key in os.environ and os.environ[env_key] != "":
+        visible_nodes = [int(s) for s in os.environ[env_key].split(",")]
+        allowed_numa_nodes_list = [
+            x for x in sorted(list(set(visible_nodes))) if x in allowed_numa_nodes
+        ]
+
+    return allowed_numa_nodes_list, logical_cpu_list
+
+
 def get_autobind_cpu_ids(
     rank: int,
     local_rank: int,
@@ -242,7 +321,7 @@ def get_autobind_cpu_ids(
     Returns:
         Comma-separated string of CPU IDs, or "all" or "nobind".
     """
-    allowed_numa_nodes, logical_cpu_list = CpuPlatform.get_allowed_cpu_core_node_list()
+    allowed_numa_nodes, logical_cpu_list = get_allowed_cpu_core_node_list()
 
     # Calculate rank_across_dp for CPU binding
     # This ensures different DP groups get different CPU allocations
