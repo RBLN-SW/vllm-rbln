@@ -47,12 +47,23 @@ def _register_fp8_block_kernel() -> None:
 
 @add_registration(reason="Register RBLN OOT implementations.")
 def register_rbln_oot_implementations() -> None:
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        ParallelLMHead,
+        VocabParallelEmbedding,
+    )
+
     from vllm_rbln.model_executor.layers.fused_moe.layer import FusedMoE, RBLNFusedMoE
     from vllm_rbln.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
         RBLNUnquantizedFusedMoEMethod,
         UnquantizedFusedMoEMethod,
     )
+    from vllm_rbln.model_executor.layers.vocab_parallel_embedding import (
+        RBLNParallelLMHead,
+        RBLNVocabParallelEmbedding,
+    )
 
     _register_oot(FusedMoE, RBLNFusedMoE)
     _register_oot(UnquantizedFusedMoEMethod, RBLNUnquantizedFusedMoEMethod)
+    _register_oot(VocabParallelEmbedding, RBLNVocabParallelEmbedding)
+    _register_oot(ParallelLMHead, RBLNParallelLMHead)
     _register_fp8_block_kernel()

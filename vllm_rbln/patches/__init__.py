@@ -33,7 +33,6 @@ from . import (
     qwen2_moe,
     qwen3_moe,
     rotary_embedding,
-    vocab_parallel_embedding,
 )
 
 __all__ = (
