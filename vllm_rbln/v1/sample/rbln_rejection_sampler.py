@@ -212,14 +212,14 @@ class RBLNRejectionSampler(RejectionSampler):
         batch_size = len(num_draft_tokens)
         num_tokens = draft_token_ids.shape[0]
         vocab_size = target_probs.shape[-1]
-        # NOTE(eunji.lee):
-        # Currently, rejection sampler only available in cpu input tensor
-        if envs.VLLM_RBLN_USE_DEVICE_TENSOR == 1:
-            logger.warning_once(
-                "VLLM_RBLN_USE_DEVICE_TENSOR is enabled, but the RBLN rejection "
-                "sampler only supports CPU input tensors. Forcing rejection sampler "
-                "inputs to CPU."
-            )
+        # # NOTE(eunji.lee):
+        # # Currently, rejection sampler only available in cpu input tensor
+        # if envs.VLLM_RBLN_USE_DEVICE_TENSOR == 1:
+        #     logger.warning_once(
+        #         "VLLM_RBLN_USE_DEVICE_TENSOR is enabled, but the RBLN rejection "
+        #         "sampler only supports CPU input tensors. Forcing rejection sampler "
+        #         "inputs to CPU."
+        #     )
         cpu_device = "cpu"
         device = target_probs.device
         assert draft_token_ids.is_contiguous()
