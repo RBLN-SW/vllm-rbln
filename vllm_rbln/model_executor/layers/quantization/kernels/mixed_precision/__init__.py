@@ -19,18 +19,6 @@ from vllm_rbln.model_executor.layers.quantization.kernels.mixed_precision.unpack
     RBLNInt8UnpackedLinearKernel,
 )
 
-# vLLM 0.22 selects mixed-precision (WNA16) kernels from a per-platform registry
-# (``_POSSIBLE_KERNELS``) keyed by ``PlatformEnum`` inside
-# ``choose_mp_linear_kernel``. The RBLN platform is OOT and has no built-in
-# entry, so the lookup raises ``KeyError: <PlatformEnum.OOT>``. Register our
-# torch-native unpacked kernel for the OOT platform via the public API rather
-# than monkeypatching ``choose_mp_linear_kernel``: callers such as
-# ``compressed_tensors_wNa16`` import that function *by name* at module load, so
-# a late attribute swap on the module would never be observed by them.
-#
-# ``choose_mp_linear_kernel`` only consults ``kernel.get_min_capability()`` when
-# the platform reports a compute capability; RBLN's ``get_device_capability()``
-# returns ``None``, so our kernel's ``NotImplementedError`` there is never hit.
 if RBLNInt8UnpackedLinearKernel not in linear._POSSIBLE_KERNELS.get(
     PlatformEnum.OOT, []
 ):

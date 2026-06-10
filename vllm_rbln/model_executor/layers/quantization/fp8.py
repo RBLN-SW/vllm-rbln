@@ -558,10 +558,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        # NOTE(RBLN): vLLM 0.22 made FusedMoE.intermediate_size_per_partition and
-        # .hidden_size read-only properties (backed by moe_config), so they must
-        # not be assigned here; FusedMoE.__init__ already populates them. Mirror
-        # upstream Fp8MoEMethod.create_weights and only set the plain attributes.
         layer.num_experts = num_experts
         layer.orig_dtype = params_dtype
         layer.weight_block_size = None
