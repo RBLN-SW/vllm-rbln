@@ -28,6 +28,8 @@ from . import (
     attention,
     block_fp8_linear,
     fused_moe,
+    gpt_oss,
+    gpt_oss_mxfp4_config,
     models_utils,
     qwen2_moe,
     qwen3_moe,

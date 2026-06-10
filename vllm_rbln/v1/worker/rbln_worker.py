@@ -204,7 +204,12 @@ class RBLNWorker(WorkerBase):
             )
             # FIXME(RBLN) - for now, mxfp4/fp8 quantization is only supported
             quantization = self.model_config.quantization
-            assert quantization in ("mxfp4", "fp8", "compressed-tensors")
+            assert quantization in (
+                "mxfp4",
+                "gpt_oss_mxfp4",
+                "fp8",
+                "compressed-tensors",
+            )
 
             if quantization == "compressed-tensors":
                 qcfg = (
@@ -232,7 +237,7 @@ class RBLNWorker(WorkerBase):
             if quantization == "fp8":
                 nbits_per_param = 8
                 packed_num_elems = 1
-            elif quantization == "mxfp4":
+            elif quantization in ("mxfp4", "gpt_oss_mxfp4"):
                 if "ca" in device_name:
                     # ATOM DOES NOT support mxfp4 quantization, handled by bf16
                     nbits_per_param = 16
