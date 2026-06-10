@@ -15,6 +15,7 @@
 from typing import Union, final
 
 import torch
+from vllm.lora.punica_wrapper import utils as punica_utils
 from vllm.lora.punica_wrapper.punica_base import PunicaWrapperBase
 
 from vllm_rbln.lora.inputs import LoRAInputs
@@ -176,3 +177,15 @@ class PunicaWrapperRBLN(PunicaWrapperBase):
     @property
     def sampler_indices_padded(self) -> torch.Tensor:
         return LoRAInputs.get_sampler_indices_padded()
+
+
+# FIXME(RBLN): LoRA metadata copies request pinned CPU memory, but RBLN
+# PrivateUse1 does not provide a pinned-memory allocator.
+if not getattr(punica_utils, "_rbln_async_tensor_h2d_patched", False):
+    async_tensor_h2d = punica_utils.async_tensor_h2d
+
+    def async_tensor_h2d_without_pin_memory(data, dtype, device, pin_memory=False):
+        return async_tensor_h2d(data, dtype, device, pin_memory=False)
+
+    punica_utils.async_tensor_h2d = async_tensor_h2d_without_pin_memory
+    punica_utils._rbln_async_tensor_h2d_patched = True
