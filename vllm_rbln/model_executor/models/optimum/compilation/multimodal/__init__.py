@@ -16,7 +16,7 @@
 from collections.abc import Callable
 from typing import Any
 
-from optimum.rbln import RBLNAutoModelForImageTextToText, RBLNAutoModelForVision2Seq
+from optimum.rbln import RBLNAutoModel
 
 from .blip2 import get_param_blip2
 from .gemma3 import get_param_gemma3
@@ -31,11 +31,8 @@ from .qwen import (
 )
 
 
-def get_multimodal_cls(architecture: str) -> type[Any]:
-    if architecture == "Gemma3ForConditionalGeneration":
-        return RBLNAutoModelForImageTextToText
-    else:
-        return RBLNAutoModelForVision2Seq
+def get_multimodal_cls() -> type[Any]:
+    return RBLNAutoModel
 
 
 _COMPILE_MULTIMODAL_FNS: dict[str, Callable[[int, int, int, int], dict]] = {
