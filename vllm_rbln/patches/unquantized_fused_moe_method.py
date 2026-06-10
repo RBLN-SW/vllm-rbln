@@ -12,15 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from vllm.model_executor.layers.fused_moe import FusedMoE
+from vllm.model_executor.layers.fused_moe import UnquantizedFusedMoEMethod
 
 from vllm_rbln.logger import init_logger
-from vllm_rbln.model_executor.layers.fused_moe.layer import RBLNFusedMoE
+from vllm_rbln.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+    RBLNUnquantizedFusedMoEMethod,
+)
 from vllm_rbln.patches import add_registration
 
 logger = init_logger(__name__)
 
 
-@add_registration(reason="Register RBLNFusedMoE for vLLM OOT platform.")
+@add_registration(
+    reason="Register RBLNUnquantizedFusedMoEMethod for vLLM OOT platform."
+)
 def register_rbln_unquantized_fused_moe_method() -> None:
-    FusedMoE.register_oot(RBLNFusedMoE)
+    UnquantizedFusedMoEMethod.register_oot(RBLNUnquantizedFusedMoEMethod)

@@ -30,7 +30,7 @@ from vllm.model_executor.layers.quantization.mxfp4 import (
 
 from vllm_rbln import envs
 from vllm_rbln.logger import init_logger
-from vllm_rbln.patches.fused_moe import get_tokens_mask
+from vllm_rbln.model_executor.layers.fused_moe.utils import get_tokens_mask
 
 logger = init_logger(__name__)
 

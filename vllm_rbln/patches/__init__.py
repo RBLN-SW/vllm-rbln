@@ -34,6 +34,7 @@ from . import (
     qwen2_moe,
     qwen3_moe,
     rotary_embedding,
+    unquantized_fused_moe_method,
     vocab_parallel_embedding,
 )
 
