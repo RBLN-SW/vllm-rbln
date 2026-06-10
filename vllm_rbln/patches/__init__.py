@@ -26,15 +26,13 @@ from vllm_rbln.patches.registry import (
 # ruff: noqa: F401
 from . import (
     attention,
-    block_fp8_linear,
-    fused_moe,
     gpt_oss,
     gpt_oss_mxfp4_config,
     models_utils,
+    oot,
     qwen2_moe,
     qwen3_moe,
     rotary_embedding,
-    unquantized_fused_moe_method,
     vocab_parallel_embedding,
 )
 

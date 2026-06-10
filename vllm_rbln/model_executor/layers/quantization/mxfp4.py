@@ -112,6 +112,13 @@ def custom_moe_glu_mxfp4_fake(
 
 
 class RBLNGptOssMxfp4Config(GptOssMxfp4Config):
+    """GPT-OSS MXFP4 quantization config for RBLN.
+
+    This keeps upstream GPT-OSS MXFP4 quantization detection and non-MoE
+    fallbacks, but selects the RBLN MoE quantization method for routed experts
+    so GPT-OSS MXFP4 MoE layers execute through the RBLN custom op.
+    """
+
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> QuantizeMethodBase | None:
