@@ -864,8 +864,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         # None without DP) is dropped at trace time instead of raising under
         # torch.compile and forcing a graph break.
         use_moe_tokens_mask = (
-            envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
-            and layer.moe_parallel_config.dp_size > 1
+            envs.VLLM_RBLN_USE_MOE_TOKENS_MASK and layer.moe_parallel_config.dp_size > 1
         )
         if use_moe_tokens_mask:
             tokens_mask = get_tokens_mask(num_tokens, device=router_logits.device)

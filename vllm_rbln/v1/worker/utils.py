@@ -259,9 +259,9 @@ def estimate_available_memory(
         # H / (N * ceil(H / N)) of the uniform estimate (e.g. 10 heads on 4
         # chiplets -> 10/12), otherwise the per-chiplet allocator OOMs.
         heads_per_chiplet = math.ceil(num_key_value_heads / rsd_size)
-        available_dram_bytes = (
-            available_dram_bytes * num_key_value_heads
-        ) // (rsd_size * heads_per_chiplet)
+        available_dram_bytes = (available_dram_bytes * num_key_value_heads) // (
+            rsd_size * heads_per_chiplet
+        )
 
     check_oom(available_dram_bytes)
 
