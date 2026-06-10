@@ -99,10 +99,6 @@ class RblnPlatform(Platform):
         return torch.no_grad()
 
     @classmethod
-    def manual_seed_all(cls, seed: int) -> None:
-        pass
-
-    @classmethod
     def set_device(cls, device: torch.device) -> None:
         """
         Set the device for the current platform.
