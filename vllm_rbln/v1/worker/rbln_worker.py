@@ -229,7 +229,6 @@ class RBLNWorker(WorkerBase):
             )
             # FIXME(RBLN) - for now, mxfp4/fp8 quantization is only supported
             quantization = self.model_config.quantization
-            # vLLM 0.22 reports gpt-oss's mxfp4 as "gpt_oss_mxfp4".
             assert quantization in (
                 "mxfp4",
                 "gpt_oss_mxfp4",

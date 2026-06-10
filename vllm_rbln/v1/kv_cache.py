@@ -26,9 +26,6 @@ from vllm.v1.request import Request
 @dataclass(frozen=True)
 class RBLNSlidingWindowSpec(SlidingWindowSpec):
     def __post_init__(self):
-        # Run the parent post-init so inherited defaults (e.g. head_size_v,
-        # which vLLM 0.22 added and uses in page_size_bytes) are populated;
-        # otherwise head_size_v stays None and real_page_size_bytes raises.
         super().__post_init__()
         # NOTE: The block size here means to be the physical block size. The
         # logical kernel_block_size that the kernel actually uses is equal to

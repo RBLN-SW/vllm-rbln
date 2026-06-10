@@ -480,12 +480,4 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 # We do this because upstream uses Mxfp4MoEMethod for all non-xpu platforms
 # and it doesn't expose interface for OOT kernels.
 upstream.Mxfp4MoEMethod = Mxfp4MoEMethod
-
-# vLLM 0.22 routes gpt-oss (quant_method "gpt_oss_mxfp4") through a separate
-# GptOssMxfp4MoEMethod, selected by module-global name in
-# Mxfp4Config.get_quant_method() for RoutedExperts layers. Our Mxfp4MoEMethod
-# is written for the gpt-oss swigluoai MoE (and pairs with
-# _load_weights_mxfp4_custom), so override this class too; otherwise upstream's
-# GptOssMxfp4MoEMethod.apply() is used and rejects the router_logits kwarg that
-# our FusedMoE forward passes.
 upstream.GptOssMxfp4MoEMethod = Mxfp4MoEMethod
