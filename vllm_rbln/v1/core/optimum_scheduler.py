@@ -369,6 +369,15 @@ class RBLNOptimumScheduler(Scheduler):
                     # Update the block table to the return output.
                     self.update_block_table_dict(request, block_table_dict)
 
+                if request.prefill_stats is not None:
+                    num_local_cached_tokens = sum(cached_length)
+                    assert num_local_cached_tokens <= request.num_prompt_tokens
+                    request.prefill_stats.set(
+                        num_prompt_tokens=request.num_prompt_tokens,
+                        num_local_cached_tokens=num_local_cached_tokens,
+                        num_external_cached_tokens=0,
+                    )
+
                 # Request was already popped from self.waiting
                 # unless it was re-added above due to new_blocks being None.
                 request = request_queue.pop_request()
@@ -398,10 +407,6 @@ class RBLNOptimumScheduler(Scheduler):
                 # by prefix caching may cause incorrect computation
                 # of new_blocks during the decode phase.
                 request.num_computed_tokens = 0
-                # NOTE(fix): num_cached_tokens defaults to -1.
-                # It is used for logging and metrics.
-                if request.num_cached_tokens < 0:
-                    request.num_cached_tokens = request.num_computed_tokens
 
                 # EC Connector: track multimodal features that need remote
                 # loading or local encoding for this request.

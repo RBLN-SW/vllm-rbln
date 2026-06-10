@@ -15,7 +15,7 @@
 import os
 
 import torch
-from compressed_tensors.compressors.quantized_compressors import unpack_from_int32
+from compressed_tensors import unpack_from_int32
 from vllm.model_executor.kernels.linear import (  # noqa: E501
     MPLinearKernel,
     MPLinearLayerConfig,

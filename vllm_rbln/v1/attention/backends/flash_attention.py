@@ -1363,23 +1363,27 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         kv_cache: torch.Tensor,
         attn_metadata: RBLNFlashAttentionMetadata,
         output: torch.Tensor | None = None,
+        output_scale: torch.Tensor | None = None,
+        output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass with xFormers and PagedAttention.
 
         Args:
-            query:  shape = [num_tokens, num_heads * head_size]
-            key:    shape = [num_tokens, num_kv_heads * head_size]
-            value:  shape = [num_tokens, num_kv_heads * head_size]
-            kv_cache shape= [2, num_blocks,
-                                block_size * num_kv_heads * head_size]
+            query:  shape = [num_tokens, num_heads, head_size]
+            key:    shape = [num_tokens, num_kv_heads, head_size]
+            value:  shape = [num_tokens, num_kv_heads, head_size]
+            kv_cache shape= [2, num_blocks, num_kv_heads, 1,
+                             block_size, head_size]
 
         Shape that we expect:
-            kv_cache  = [2][num_blocks, num_kv_heads, 1, block_size, head_size]
-            key       = [1, num_kv_heads, 1, block_size, head_size]
-            query     = [1, num_kv_heads, 4, query_len, head_size]
-            key_t     = [1, num_kv_heads, 1, head_size, block_size]
+            kv_cache  = [2, num_blocks, num_kv_heads, 1, block_size, head_size]
+            key       = [batch, num_kv_heads, 1, query_len, head_size]
+            query     = [batch, num_kv_heads, num_queries_per_kv,
+                         query_len, head_size]
+            key_t     = [batch, num_kv_heads, 1, head_size, block_size]
         Returns:
-            attn_out  = [num_tokens, num_heads * head_size]
+            attn_out  = [num_tokens, num_heads, head_size] if output is given,
+                        otherwise [batch, query_len, num_heads * head_size]
 
             hidden_size = num_heads * head_size
         """
@@ -1391,21 +1395,27 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         # L - query length
         # C - max_seq_len
         # NB- num batch
+        if output_scale is not None or output_block_scale is not None:
+            raise NotImplementedError(
+                "fused output quantization is not yet supported for "
+                "RBLNFlashAttentionImpl"
+            )
 
-        # 1. query reshape for custom operation
-        # query = [b_size(batch), q_len(query len), num_heads * head_size]
-        b_size, q_len, _ = query.size()
-        query = query.view(b_size, q_len, self.num_heads, self.head_size).transpose(
-            1, 2
-        )
+        # NOTE(RBLN): vLLM passes q/k/v as [num_tokens, heads, head_size].
+        # Convert that single contract to RBLN's [batch, kv_heads, groups, len, dim].
+        assert query.dim() == 3
+        b_size = 1 if attn_metadata.is_prefill else attn_metadata.block_tables.size(0)
+        q_len = query.size(0) // b_size
+        query = query.view(b_size, q_len, self.num_heads, self.head_size)
+        key = key.view(b_size, q_len, self.num_kv_heads, self.head_size)
+        value = value.view(b_size, q_len, self.num_kv_heads, self.head_size)
+        query = query.transpose(1, 2)
         query = query.view(
             b_size, self.num_kv_heads, self.num_queries_per_kv, q_len, self.head_size
         )
-        key = key.view(b_size, q_len, self.num_kv_heads, self.head_size).transpose(1, 2)
+        key = key.transpose(1, 2)
         key = key.view(b_size, self.num_kv_heads, 1, q_len, self.head_size)
-        value = value.view(b_size, q_len, self.num_kv_heads, self.head_size).transpose(
-            1, 2
-        )
+        value = value.transpose(1, 2)
         value = value.view(b_size, self.num_kv_heads, 1, q_len, self.head_size)
 
         # NOTE - for cache update,
@@ -1747,4 +1757,10 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                 b_size, q_len, self.num_heads * self.head_size
             )
         # attn_output = [batch,L,H*4*D]
+        if output is not None:
+            attn_output = attn_output.view(
+                b_size * q_len, self.num_heads, self.head_size
+            )
+            output.copy_(attn_output)
+            return output
         return attn_output

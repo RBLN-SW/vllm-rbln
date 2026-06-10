@@ -19,16 +19,16 @@ import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.distributed.parallel_state import get_dp_group, get_pp_group, get_tp_group
-from vllm.forward_context import set_forward_context
-from vllm.v1.attention.backends.tree_attn import TreeAttentionMetadata
-from vllm.v1.attention.backends.utils import CommonAttentionMetadata
+from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.spec_decode.eagle import PADDING_SLOT_ID, EagleProposer
+from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.spec_decode.utils import PADDING_SLOT_ID
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 import vllm_rbln.rbln_envs as envs
 import vllm_rbln.utils as rbln_utils
+from vllm_rbln.forward_context import set_forward_context
 from vllm_rbln.logger import init_logger
 from vllm_rbln.torch_compile_backend import logged_rbln_backend
 from vllm_rbln.v1.attention.kv_cache_bindings import (
@@ -187,10 +187,6 @@ class RBLNEagleProposer(EagleProposer):
             else target_positions[token_indices_to_sample]
         )
         hidden_states = hidden_states[token_indices_to_sample]
-
-        if isinstance(attn_metadata, TreeAttentionMetadata):
-            # NOTE(RBLN): tree attention is not supported
-            raise NotImplementedError("Tree attention is not supported")
 
         draft_token_ids = logits[:batch_size].argmax(dim=-1)
 

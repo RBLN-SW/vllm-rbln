@@ -19,8 +19,8 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 import torch
-from vllm.v1.attention.backends.utils import CommonAttentionMetadata
-from vllm.v1.spec_decode.eagle import PADDING_SLOT_ID
+from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.spec_decode.utils import PADDING_SLOT_ID
 
 import vllm_rbln.v1.spec_decode.eagle as eagle_module
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
