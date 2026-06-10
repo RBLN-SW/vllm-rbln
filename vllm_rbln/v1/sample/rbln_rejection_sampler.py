@@ -66,6 +66,15 @@ class RBLNRejectionSampler(RejectionSampler):
         seed = kwargs.pop("seed", None)
         assert seed is not None, "seed cannot be None."
         compile_context = kwargs.pop("compile_context", None)
+        # NOTE(RBLN): Static spec length used to pad the rejection-sample inputs
+        # to a fixed shape. The compiled `rbln_rejection_sample` is compiled with
+        # dynamic=False, so feeding it the per-step actual `metadata.max_spec_len`
+        # (which varies 1..num_spec_tokens under variable-length methods like
+        # ngram) forces a recompile for every distinct value. Padding to the
+        # config-fixed `num_spec_tokens` instead keeps the op shape static.
+        num_spec_tokens = kwargs.pop("num_spec_tokens", None)
+        assert num_spec_tokens is not None, "num_spec_tokens cannot be None."
+        self.num_spec_tokens = num_spec_tokens
         super().__init__(*args, **kwargs)
         rebel.manual_seed(seed)
         compile_context = resolve_compile_context(compile_context)
@@ -167,7 +176,12 @@ class RBLNRejectionSampler(RejectionSampler):
         output_token_ids = self.rejection_sample(
             metadata.draft_token_ids,
             metadata.num_draft_tokens,
-            metadata.max_spec_len,
+            # NOTE(RBLN): Pad to the fixed config spec length (not the per-step
+            # actual `metadata.max_spec_len`) so the compiled op shape stays
+            # static across steps. Correctness is unchanged: cu_num_draft_tokens
+            # / num_draft_tokens (actual) drive the gather, out_accept clamp and
+            # per-request output composition; the extra columns stay PLACEHOLDER.
+            self.num_spec_tokens,
             metadata.cu_num_draft_tokens,
             draft_probs,
             target_probs,
@@ -197,6 +211,9 @@ class RBLNRejectionSampler(RejectionSampler):
         draft_token_ids: torch.Tensor,
         # [batch_size]
         num_draft_tokens: list[int],
+        # Fixed pad length for the per-batch buffers (= num_spec_tokens), kept
+        # constant so the compiled rejection-sample op shape is static. NOT the
+        # per-step actual max draft count.
         max_spec_len: int,
         # [batch_size]
         cu_num_draft_tokens: torch.Tensor,
