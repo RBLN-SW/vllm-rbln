@@ -179,7 +179,6 @@ class RBLNDPMetadata(DPMetadata):
             )
             max_pads_across_dp = None
 
-        # NOTE: vLLM v0.22 removed DPMetadata.max_tokens_across_dp_cpu
         return RBLNDPMetadata(
             num_tokens_across_dp_cpu,
             max_pads_across_dp=max_pads_across_dp,

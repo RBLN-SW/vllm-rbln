@@ -100,7 +100,6 @@ class RblnPlatform(Platform):
 
     @classmethod
     def manual_seed_all(cls, seed: int) -> None:
-        # torch.manual_seed already covers RBLN; no per-device RNG to seed
         pass
 
     @classmethod
