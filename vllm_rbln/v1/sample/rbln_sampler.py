@@ -411,6 +411,7 @@ class RBLNSampler(VLLMSampler):
         # it pushes logits past softmax's safe exp range and overflows.
         if not all_random:
             temperature = torch.where(temperature < _SAMPLING_EPS, 1e-3, temperature)
+        temperature = temperature.to(logits.dtype)
         return logits.div(temperature.unsqueeze(dim=1))
 
 
@@ -423,11 +424,11 @@ WARM_UP_CONFIGS = [
         "temperature": 0.0,
     },
     {
-        "name": "no_penalty_temp_only",
+        "name": "no_penalty_random",
         "no_penalties": True,
         "all_greedy": False,
         "all_random": True,
-        "temperature": 0.1,
+        "temperature": 0.5,
     },
     {
         "name": "no_penalty_topp",
