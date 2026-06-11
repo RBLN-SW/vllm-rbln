@@ -60,5 +60,4 @@ def _patch_accelerator_empty_cache() -> None:
         "'no accelerator available' raise on CPU-only torch builds"
     )
 
-
-# _patch_accelerator_empty_cache()
+_patch_accelerator_empty_cache()
