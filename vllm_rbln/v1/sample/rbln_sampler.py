@@ -145,7 +145,6 @@ class RBLNTopKTopPSampler(nn.Module):
     def __init__(
         self,
         logprobs_mode: LogprobsMode = "raw_logprobs",
-        seed: int = 42,
         compile_context: rebel.CompileContext = None,
     ):
         # TODO(rbln): Merge more ops to rbln context.
@@ -157,7 +156,6 @@ class RBLNTopKTopPSampler(nn.Module):
             "RBLN Sampling does not support returning logits/logprobs"
         )
 
-        rebel.manual_seed(seed)
         options = {
             "compile_context": compile_context
             if compile_context
@@ -212,13 +210,12 @@ class RBLNSampler(VLLMSampler):
     def __init__(
         self,
         logprobs_mode: LogprobsMode = "raw_logprobs",
-        seed: int = 42,
         compile_context: rebel.CompileContext = None,
     ):
         super().__init__()
         if logprobs_mode in ("raw_logprobs", "raw_logits"):
             self.topk_topp_sampler = RBLNTopKTopPSampler(
-                logprobs_mode=logprobs_mode, seed=seed, compile_context=compile_context
+                logprobs_mode=logprobs_mode, compile_context=compile_context
             )
         else:
             logger.warning_once(

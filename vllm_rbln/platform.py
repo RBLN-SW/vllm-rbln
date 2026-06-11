@@ -99,7 +99,7 @@ class RblnPlatform(Platform):
 
     @classmethod
     def manual_seed_all(cls, seed: int) -> None:
-        pass
+        rebel.manual_seed(seed)
 
     @classmethod
     def _override_default_max_num_seqs(cls) -> None:
