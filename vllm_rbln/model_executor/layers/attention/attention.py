@@ -145,17 +145,6 @@ def _rbln_unified_attention_with_output(
     # attention metadata's kv cache must equal the attention layer's
     # embedded kv cache.
     kv_cache = _resolve_kv_cache(attn_metadata, self.layer_index)
-
-    # Attention.forward flattens q/k/v to [num_tokens, heads, head_size];
-    # restore the [batch, q_len, hidden] layout expected by the RBLN impl.
-    num_tokens = query.shape[0]
-    q_len = attn_metadata.max_query_len
-    batch = attn_metadata.seq_lens.shape[0]
-    need = batch * q_len
-    query = query[:need].reshape(batch, q_len, -1)
-    key = key[:need].reshape(batch, q_len, -1)
-    value = value[:need].reshape(batch, q_len, -1)
-
     self.impl.forward(
         self,
         query,
@@ -163,7 +152,7 @@ def _rbln_unified_attention_with_output(
         value,
         kv_cache,
         attn_metadata,
-        output=output[:need].reshape(batch, q_len, -1),
+        output=output,
         output_scale=output_scale,
         output_block_scale=output_block_scale,
     )

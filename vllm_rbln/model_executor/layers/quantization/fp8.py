@@ -859,13 +859,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             expert_map_const = torch.tensor(layer.expert_map_const, dtype=torch.int32)
 
         tokens_mask = None
-        # Only needed for data-parallel padding; skip when dp_size == 1 so
-        # get_tokens_mask() (which reads forward_context.dp_metadata and would be
-        # None without DP) is dropped at trace time instead of raising under
-        # torch.compile and forcing a graph break.
-        use_moe_tokens_mask = (
-            envs.VLLM_RBLN_USE_MOE_TOKENS_MASK and layer.moe_parallel_config.dp_size > 1
-        )
+        use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
         if use_moe_tokens_mask:
             tokens_mask = get_tokens_mask(num_tokens, device=router_logits.device)
 
