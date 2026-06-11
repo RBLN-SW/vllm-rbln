@@ -54,9 +54,18 @@ def resolve_compile_context(
     return rebel.CompileContext()
 
 
-def build_compile_options(compile_context: rebel.CompileContext) -> dict:
-    """Build the torch.compile ``options`` dict shared by the RBLN samplers."""
-    use_dt = envs.VLLM_RBLN_USE_DEVICE_TENSOR
+def build_compile_options(
+    compile_context: rebel.CompileContext, use_dt: bool | None = None
+) -> dict:
+    """Build the torch.compile ``options`` dict shared by the RBLN samplers.
+
+    ``use_dt`` defaults to the VLLM_RBLN_USE_DEVICE_TENSOR env. Pass ``False``
+    to force host (CPU) compile options even under device-tensor mode — the
+    RBLN samplers run on host tensors (inputs/outputs are marshalled at the
+    _sample boundary), so they always compile with the host option set.
+    """
+    if use_dt is None:
+        use_dt = envs.VLLM_RBLN_USE_DEVICE_TENSOR
     options: dict = {}
     if not use_dt:
         options["compile_context"] = compile_context
@@ -112,9 +121,9 @@ class RBLNTopKTopPSampler(nn.Module):
         )
 
         rebel.manual_seed(seed)
-        options = build_compile_options(compile_context)
-        if envs.VLLM_RBLN_USE_DEVICE_TENSOR:
-            options["model_trace_method"] = "export"
+        # RBLN samplers run on host (CPU) tensors even in device-tensor mode, so
+        # always compile with host options (single graph, no device export).
+        options = build_compile_options(compile_context, use_dt=False)
 
         self._compiled_rbln_topk_topp_sampler = torch.compile(
             rbln_top_k_top_p_sample,
@@ -129,6 +138,12 @@ class RBLNTopKTopPSampler(nn.Module):
     def top_k_top_p_sample(
         self, logits: torch.Tensor, k: torch.Tensor | None, p: torch.Tensor | None
     ) -> torch.Tensor:
+        logger.info(
+            "[SMPLDEV] top_k_top_p input logits.device=%s k.device=%s p.device=%s",
+            logits.device,
+            getattr(k, "device", None),
+            getattr(p, "device", None),
+        )
         return self._compiled_rbln_topk_topp_sampler(logits, k, p)
 
     def forward_rbln(
@@ -170,7 +185,8 @@ class RBLNSampler(VLLMSampler):
                 f"RBLN Sampling does not support logprobs_mode: {logprobs_mode}. "
                 "Using native sampler instead."
             )
-        options = build_compile_options(compile_context)
+        # Host (CPU) compile options — RBLN samplers run on host tensors.
+        options = build_compile_options(compile_context, use_dt=False)
         # FIXME compiling both greedy and top-k top-p sampling
         # causes some issues in torchinductor.
         self._compiled_greedy_sample = torch.compile(
@@ -183,6 +199,7 @@ class RBLNSampler(VLLMSampler):
 
     @torch.compiler.disable
     def greedy_sample(self, logits: torch.Tensor) -> torch.Tensor:
+        logger.info("[SMPLDEV] greedy_sample input logits.device=%s", logits.device)
         return self._compiled_greedy_sample(logits)
 
     def sample(

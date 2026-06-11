@@ -78,7 +78,9 @@ class RBLNRejectionSampler(RejectionSampler):
         super().__init__(*args, **kwargs)
         rebel.manual_seed(seed)
         compile_context = resolve_compile_context(compile_context)
-        options = build_compile_options(compile_context)
+        # Host (CPU) compile options — the rejection sampler runs on host
+        # tensors (inputs marshalled to CPU at the _sample boundary).
+        options = build_compile_options(compile_context, use_dt=False)
         self.compiled_rejection_sample = torch.compile(
             rbln_rejection_sample,
             dynamic=False,
@@ -131,6 +133,9 @@ class RBLNRejectionSampler(RejectionSampler):
         # logits tensor. This means any in-place operations on bonus_logits
         # won't affect the original logits tensor.
         assert logits is not None
+        # NOTE(RBLN): logits and the spec-decode metadata are marshalled to host
+        # (CPU) by the caller (_sample) under device-tensor mode, and the output
+        # is restored to the device there. This forward runs entirely on host.
         bonus_logits = logits[bonus_logits_indices]
         bonus_sampler_output = self.sampler(
             logits=bonus_logits,
@@ -320,6 +325,19 @@ class RBLNRejectionSampler(RejectionSampler):
         reshaped_draft_token_ids = reshaped_draft_token_ids.to(cpu_device)
         reshaped_target_probs = reshaped_target_probs.to(cpu_device)
         cu_num_draft_tokens = cu_num_draft_tokens.to(cpu_device)
+        # NOTE(RBLN): The compiled rejection-sample op runs on host (CPU) tensors
+        # even under device-tensor mode. Guard that every input is on CPU.
+        assert reshaped_draft_token_ids.device.type == "cpu"
+        assert reshaped_target_probs.device.type == "cpu"
+        assert cu_num_draft_tokens.device.type == "cpu"
+        assert (
+            sampling_metadata.top_k is None
+            or sampling_metadata.top_k.device.type == "cpu"
+        )
+        assert (
+            sampling_metadata.top_p is None
+            or sampling_metadata.top_p.device.type == "cpu"
+        )
         recovered_token_ids, num_accepted = self.compiled_rejection_sample(
             reshaped_draft_token_ids,
             reshaped_target_probs,
@@ -329,6 +347,9 @@ class RBLNRejectionSampler(RejectionSampler):
         )
         recovered_token_ids = recovered_token_ids.to(cpu_device)
         num_accepted = num_accepted.to(cpu_device)
+        # The op output is consumed by the host-side composition below.
+        assert recovered_token_ids.device.type == "cpu"
+        assert num_accepted.device.type == "cpu"
 
         # ------------------------------------------------------------------
         # 3) Compose per-position output for the first K columns:

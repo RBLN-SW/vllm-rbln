@@ -17,6 +17,7 @@ import itertools
 import os
 import time
 from collections import defaultdict
+from dataclasses import replace
 from collections.abc import Iterator, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from copy import copy, deepcopy
@@ -291,20 +292,54 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         else:
             self.max_encoder_len = 0
 
+        # NOTE(RBLN): Two compile contexts.
+        # - self.compile_context: the MODEL's context. Host CompileContext in
+        #   host-tensor mode; None in device-tensor mode (the model compiles via
+        #   the device/export path, which builds its own context internally).
+        # - self._sampler_compile_context: the SAMPLER's context (shared by the
+        #   RBLNSampler greedy/top-k-top-p graphs AND the rejection-sample kernel).
+        #   The RBLN samplers always run on HOST tensors and always compile onto
+        #   the global_at_device(0) session (use_global_ctx=True), which is backed
+        #   by a created runtime Context (a uuid/private session is NOT backed by a
+        #   device and fails with SYS_ENODEV "[context] create failed").
+        #   * Host-tensor mode: the same object as the model's context (shared).
+        #   * Device-tensor mode: a separate object on the same global_at_device(0)
+        #     session, with weight sharing disabled (the host sampler has no
+        #     weights to share with the export model).
+        import inspect
+
+        from rebel.compile_context import CompileContext
+
+        compile_ctx_args = {}
+        if "use_weight_sharing" in inspect.signature(CompileContext).parameters:
+            compile_ctx_args["use_weight_sharing"] = True
+        if "use_global_ctx" in inspect.signature(CompileContext).parameters:
+            compile_ctx_args["use_global_ctx"] = True
+
+        # NOTE(RBLN): host (CPU) sampler compile context. Experiments showed:
+        #  - hand-made CompileContext(use_global_ctx=True): compiles OK but the
+        #    host sampler kernel hits a firmware Translation fault / Nullptr
+        #    dereference at runtime when coexisting with the device-tensor model
+        #    on the single shared context (RBLN_CTX_STANDALONE=0 under model
+        #    parallel).
+        #  - get_or_create_compile_context (the model's device-oriented context):
+        #    the host (cpu-input) sampler graph fails the RblnTensor optimization
+        #    pass at COMPILE time (RBLNCompileError).
+        # i.e. host-sampler + device-model on one context is structurally
+        # unsupported. Keep the hand-made context (at least compiles); the real
+        # fix needs a separate device context (RBLN_CTX_STANDALONE=1) or running
+        # the sampler ops off-NPU.
         if not envs.VLLM_RBLN_USE_DEVICE_TENSOR:
-            # Only provide use_global_ctx if CompileContext supports it
-            import inspect
-
-            from rebel.compile_context import CompileContext
-
-            compile_ctx_args = {}
-            if "use_weight_sharing" in inspect.signature(CompileContext).parameters:
-                compile_ctx_args["use_weight_sharing"] = True
-            if "use_global_ctx" in inspect.signature(CompileContext).parameters:
-                compile_ctx_args["use_global_ctx"] = True
             self.compile_context = CompileContext(**compile_ctx_args)
+            self._sampler_compile_context = self.compile_context
         else:
             self.compile_context = None
+            # The host sampler has no weights to share with the device model, so
+            # weight sharing is disabled for its (separate) compile context.
+            sampler_ctx_args = dict(compile_ctx_args)
+            if "use_weight_sharing" in inspect.signature(CompileContext).parameters:
+                sampler_ctx_args["use_weight_sharing"] = False
+            self._sampler_compile_context = CompileContext(**sampler_ctx_args)
         self.runtime_holder: list = []
 
         # Sampler
@@ -314,7 +349,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             sampler = RBLNSampler(
                 logprobs_mode=self.model_config.logprobs_mode,
                 seed=self.vllm_config.model_config.seed,
-                compile_context=self.compile_context,
+                compile_context=self._sampler_compile_context,
             )
         else:
             logger.info("Using default vLLM sampler.")
@@ -382,7 +417,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 self.rejection_sampler = RBLNRejectionSampler(
                     self.sampler,
                     seed=self.vllm_config.model_config.seed,
-                    compile_context=self.compile_context,
+                    # Host compile context (sampler runs on host tensors).
+                    compile_context=self._sampler_compile_context,
                     # Fixed spec length for static rejection-sample op shape.
                     num_spec_tokens=self.speculative_config.num_speculative_tokens,
                 )
@@ -438,7 +474,15 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             is_spec_decode=bool(self.vllm_config.speculative_config),
             logitsprocs=build_logitsprocs(
                 self.vllm_config,
-                self.device,
+                # NOTE(RBLN): The RBLN sampler always runs on host (CPU) tensors
+                # (logits are marshalled to CPU at the _sample boundary). The
+                # builtin logits processors (e.g. MinP) build internal tensors on
+                # this device and apply them to the logits inside the sampler, so
+                # if they stayed on the rbln device they would collide with the
+                # CPU logits (device-tensor eager op -> crash). The model
+                # executable never receives logitsprocs, so building them on CPU
+                # is safe and only affects the host sampler path.
+                (torch.device("cpu") if self.use_rbln_sampler else self.device),
                 self.pin_memory,
                 self.is_pooling_model,
                 custom_logitsprocs,
@@ -2078,6 +2122,42 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             spec_token_ids=metadata.spec_token_ids,
         )
 
+    @staticmethod
+    def _sampling_metadata_to_cpu(metadata: SamplingMetadata) -> SamplingMetadata:
+        """Move SamplingMetadata tensor fields to CPU (host sampler boundary)."""
+
+        def _c(t):
+            return t.cpu() if isinstance(t, torch.Tensor) else t
+
+        return replace(
+            metadata,
+            temperature=_c(metadata.temperature),
+            top_p=_c(metadata.top_p),
+            top_k=_c(metadata.top_k),
+            prompt_token_ids=_c(metadata.prompt_token_ids),
+            frequency_penalties=_c(metadata.frequency_penalties),
+            presence_penalties=_c(metadata.presence_penalties),
+            repetition_penalties=_c(metadata.repetition_penalties),
+            allowed_token_ids_mask=_c(metadata.allowed_token_ids_mask),
+        )
+
+    @staticmethod
+    def _spec_metadata_to_cpu(metadata: SpecDecodeMetadata) -> SpecDecodeMetadata:
+        """Move SpecDecodeMetadata index/tensor fields to CPU."""
+
+        def _c(t):
+            return t.cpu() if isinstance(t, torch.Tensor) else t
+
+        return replace(
+            metadata,
+            draft_token_ids=_c(metadata.draft_token_ids),
+            cu_num_draft_tokens=_c(metadata.cu_num_draft_tokens),
+            cu_num_sampled_tokens=_c(metadata.cu_num_sampled_tokens),
+            target_logits_indices=_c(metadata.target_logits_indices),
+            bonus_logits_indices=_c(metadata.bonus_logits_indices),
+            logits_indices=_c(metadata.logits_indices),
+        )
+
     def _sample(
         self,
         logits: torch.Tensor | None,
@@ -2096,6 +2176,27 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             )
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
+
+        # NOTE(RBLN): The RBLN samplers (normal + rejection) run on host (CPU)
+        # tensors. In device-tensor mode logits / sampling metadata / spec metadata
+        # arrive on the rbln device, so this is the single marshaling boundary:
+        # move the sampler inputs to CPU here and restore the output to the device
+        # after sampling (below). Host-tensor mode is a no-op.
+        orig_device = logits.device if logits is not None else None
+        if (
+            envs.VLLM_RBLN_USE_DEVICE_TENSOR
+            and logits is not None
+            and logits.device.type != "cpu"
+        ):
+            assert orig_device.type == "rbln", (
+                "device-tensor mode expects logits on the rbln device, "
+                f"got {orig_device}"
+            )
+            logits = logits.cpu()
+            sampling_metadata = self._sampling_metadata_to_cpu(sampling_metadata)
+            if spec_decode_metadata is not None:
+                spec_decode_metadata = self._spec_metadata_to_cpu(spec_decode_metadata)
+
         # NOTE(RBLN): Only pad on the non-spec path. In device-tensor mode the
         # plain sampler consumes [padded_batch, vocab] logits directly, so its
         # per-request metadata must be padded to match. The spec-decode path is
@@ -2119,6 +2220,13 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # use a dummy context manager that does nothing
             capture_ctx = contextlib.nullcontext()
         sampler_start_time = time.perf_counter()
+        logger.info(
+            "[SMPLDEV] spec=%s logits.device=%s temp.device=%s top_k.device=%s",
+            spec_decode_metadata is not None,
+            logits.device if logits is not None else None,
+            getattr(sampling_metadata.temperature, "device", None),
+            getattr(sampling_metadata.top_k, "device", None),
+        )
         with capture_ctx as sampler_reports:
             if spec_decode_metadata is None:
                 sampler_output = self.sampler(
@@ -2135,6 +2243,21 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 self._update_states_after_model_execute(
                     sampler_output.sampled_token_ids
                 )
+
+        # NOTE(RBLN): Restore the host sampler output to the original (rbln)
+        # device — the other half of the marshaling boundary above. Host-tensor
+        # mode is a no-op.
+        if (
+            envs.VLLM_RBLN_USE_DEVICE_TENSOR
+            and orig_device is not None
+            and orig_device.type != "cpu"
+            and sampler_output.sampled_token_ids is not None
+            and sampler_output.sampled_token_ids.device != orig_device
+        ):
+            sampler_output.sampled_token_ids = sampler_output.sampled_token_ids.to(
+                orig_device
+            )
+
         if envs.VLLM_RBLN_METRICS and self.sampler_performance_tracker is not None:
             collect_metrics(
                 self.sampler_performance_tracker,
@@ -2652,7 +2775,15 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             is_spec_decode=bool(self.vllm_config.speculative_config),
             logitsprocs=build_logitsprocs(
                 self.vllm_config,
-                self.device,
+                # NOTE(RBLN): The RBLN sampler always runs on host (CPU) tensors
+                # (logits are marshalled to CPU at the _sample boundary). The
+                # builtin logits processors (e.g. MinP) build internal tensors on
+                # this device and apply them to the logits inside the sampler, so
+                # if they stayed on the rbln device they would collide with the
+                # CPU logits (device-tensor eager op -> crash). The model
+                # executable never receives logitsprocs, so building them on CPU
+                # is safe and only affects the host sampler path.
+                (torch.device("cpu") if self.use_rbln_sampler else self.device),
                 self.pin_memory,
                 self.is_pooling_model,
                 custom_logitsprocs,
