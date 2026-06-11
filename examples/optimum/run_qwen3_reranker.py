@@ -41,17 +41,27 @@ def format_instruction(instruction, query, doc):
     return text
 
 
-def process_inputs(pairs, instruction, max_length, suffix_tokens, tokenizer):
+def process_inputs(
+    pairs, instruction, max_length, suffix_tokens, tokenizer
+) -> list[TokensPrompt]:
     messages = [format_instruction(instruction, query, doc) for query, doc in pairs]
-    messages = tokenizer.apply_chat_template(
-        messages, tokenize=True, add_generation_prompt=False, enable_thinking=False
+    # transformers>=5 defaults `return_dict=True`, which would yield a
+    # BatchEncoding instead of token-id lists. Force the list form so the
+    # token ids can be sliced and concatenated with the suffix tokens.
+    token_ids = tokenizer.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=False,
+        enable_thinking=False,
+        return_dict=False,
     )
-    messages = [ele[:max_length] + suffix_tokens for ele in messages]
-    messages = [TokensPrompt(prompt_token_ids=ele) for ele in messages]
-    return messages
+    return [
+        TokensPrompt(prompt_token_ids=ids[:max_length] + suffix_tokens)
+        for ids in token_ids
+    ]
 
 
-def get_input_prompts(model_id, max_length, suffix_tokens, tokenizer) -> list[str]:
+def get_input_prompts(max_length, suffix_tokens, tokenizer) -> list[TokensPrompt]:
     task = "Given a web search query, retrieve relevant passages that answer the query"
     queries = [
         "What is the capital of China?",
@@ -67,28 +77,18 @@ def get_input_prompts(model_id, max_length, suffix_tokens, tokenizer) -> list[st
     ]
 
     pairs = list(zip(queries, documents))
-    inputs = process_inputs(
+    return process_inputs(
         pairs, task, max_length - len(suffix_tokens), suffix_tokens, tokenizer
     )
-
-    return inputs
 
 
 async def generate(
     engine: AsyncLLMEngine,
-    prompt_tokens: list[int],
-    model: str,
+    prompt: TokensPrompt,
     request_id: int,
     true_token: int,
     false_token: int,
 ):
-    print(f"generate request_id={request_id}, prompt_tokens={prompt_tokens}")
-    example_input = {
-        "stream": True,
-        "temperature": 0.0,
-        "request_id": str(request_id),
-    }
-
     sampling_params = SamplingParams(
         temperature=0,
         max_tokens=1,
@@ -96,35 +96,27 @@ async def generate(
         allowed_token_ids=[true_token, false_token],
     )
 
-    results_generator = engine.generate(
-        prompt_tokens,
-        sampling_params,
-        example_input["request_id"],
-    )
-
-    # get the results
     final_output = None
-    async for request_output in results_generator:
+    async for request_output in engine.generate(
+        prompt, sampling_params, str(request_id)
+    ):
         final_output = request_output
     return final_output
 
 
 def compute_logits(outputs, true_token, false_token):
     scores = []
-    for i in range(len(outputs)):
-        final_logits = outputs[i].outputs[0].logprobs[-1]
-        if true_token not in final_logits:
-            true_logit = -10
-        else:
-            true_logit = final_logits[true_token].logprob
-        if false_token not in final_logits:
-            false_logit = -10
-        else:
-            false_logit = final_logits[false_token].logprob
+    for output in outputs:
+        final_logits = output.outputs[0].logprobs[-1]
+        true_logit = (
+            final_logits[true_token].logprob if true_token in final_logits else -10
+        )
+        false_logit = (
+            final_logits[false_token].logprob if false_token in final_logits else -10
+        )
         true_score = math.exp(true_logit)
         false_score = math.exp(false_logit)
-        score = true_score / (true_score + false_score)
-        scores.append(score)
+        scores.append(true_score / (true_score + false_score))
     return scores
 
 
@@ -143,11 +135,9 @@ async def main(
     false_token = tokenizer("no", add_special_tokens=False).input_ids[0]
 
     engine = AsyncLLMEngine.from_engine_args(engine_args)
-    prompt_tokens_list = get_input_prompts(
-        model_id, max_seq_len, suffix_tokens, tokenizer
-    )
+    prompts = get_input_prompts(max_seq_len, suffix_tokens, tokenizer)
     futures = []
-    for i, p in enumerate(prompt_tokens_list):
+    for i, prompt in enumerate(prompts):
         if i == num_input_prompt:
             break
 
@@ -155,8 +145,7 @@ async def main(
             asyncio.create_task(
                 generate(
                     engine,
-                    prompt_tokens=p,
-                    model=model_id,
+                    prompt=prompt,
                     request_id=i,
                     true_token=true_token,
                     false_token=false_token,
