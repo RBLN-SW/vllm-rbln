@@ -42,6 +42,7 @@ from vllm_rbln.utils.optimum.registry import (
 
 logger = init_logger(__name__)
 
+USE_DEVICE_TENSOR: bool = False
 # RBLN default for an unset max_num_seqs (upstream vLLM defaults to 256).
 RBLN_DEFAULT_MAX_NUM_SEQS = 1
 
@@ -55,12 +56,15 @@ register_backend(name="bypass", compiler_fn=bypass_backend)
 
 class RblnPlatform(Platform):
     _enum = PlatformEnum.OOT
-    # TODO(RBLN): GroupCoordinator uses the device_name
-    # when torch.device(device_name) is called.
-    # But we don't support the 'rbln' device yet.
-    # To support this, we must use PyTorch-RBLN
-    device_name: str = "cpu"
-    device_type: str = "cpu"
+
+    # Compute device_name/device_type/dist_backend once at class definition
+    # from env vars so that subprocesses spawned under
+    # VLLM_WORKER_MULTIPROC_METHOD=spawn (which re-import this module fresh)
+    # observe identical values to the parent without any extra plumbing.
+    plugin_name: str = "rbln"
+    device_name: str = "rbln" if USE_DEVICE_TENSOR else "cpu"
+    device_type: str = "rbln" if USE_DEVICE_TENSOR else "cpu"
+    dist_backend: str = "rbln-ccl" if USE_DEVICE_TENSOR else ""
     dispatch_key: str = "CPU"
     ray_device_key: str = "RBLN"
     device_control_env_var: str = "RBLN_DEVICES"
@@ -211,16 +215,19 @@ class RblnPlatform(Platform):
 
             # FIXME(jiwoo.park) This is a temporary workaround.
             if model_config.enforce_eager:
+                if not USE_DEVICE_TENSOR:
+                    raise ValueError(
+                        "enforce_eager=True requires VLLM_RBLN_USE_DEVICE_TENSOR=1. "
+                        "Eager mode bypasses torch.compile, so ops must dispatch "
+                        "to a real device='rbln' rather than the compile-backend "
+                        "fake-CPU tensors used by the default vLLM model path."
+                    )
+
                 hf_config = vllm_config.model_config.hf_config
                 assert not hasattr(hf_config, "sliding_window") or not getattr(
                     hf_config, "use_sliding_window", True
                 )
 
-                RblnPlatform.device_type = "rbln"
-                vllm_config.device_config.device_type = RblnPlatform.device_type
-                vllm_config.device_config.device = torch.device(
-                    RblnPlatform.device_type
-                )
                 # RBLN(NOTE): force dtype into fp16 for eager mode
                 model_config.dtype = torch.float16
 

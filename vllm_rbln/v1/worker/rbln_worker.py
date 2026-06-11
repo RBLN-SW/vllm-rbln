@@ -157,7 +157,7 @@ class RBLNWorker(WorkerBase):
 
     @instrument(span_name="Init device")
     def init_device(self) -> None:
-        self.device = torch.device(current_platform.device_type)
+        self.device = self.device_config.device
 
         # Initialize the distributed environment.
         init_worker_distributed_environment(
