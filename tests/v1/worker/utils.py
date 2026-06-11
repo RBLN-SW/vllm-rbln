@@ -218,6 +218,10 @@ def get_vllm_config(async_scheduling=False, max_num_seqs=None):
     )
     additional_config = {
         "attn_block_size": OB_SIZE,
+        # FIXME: prefill_chunk_size vs. prefix_block_size
+        "rbln_config": {
+            "prefill_chunk_size": OB_SIZE // 2,
+        },
     }
     structured_outputs_config = StructuredOutputsConfig(
         backend="guidance",
