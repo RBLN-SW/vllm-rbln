@@ -288,6 +288,13 @@ class RblnPlatform(Platform):
                 if (lora_config := vllm_config.lora_config) is not None:
                     lora_config.lora_dtype = torch.float16
 
+            if vllm_config.speculative_config is not None and envs.VLLM_RBLN_SAMPLER:
+                # FIXME(RBLN): make RBLNSampler compatible with speculative decoding
+                logger.warning(
+                    "Using RBLNSampler with speculative decoding is not supported yet."
+                )
+                envs.VLLM_RBLN_SAMPLER = False
+
         else:
             # NOTE(eunji.lee):
             # It is for multimodal models

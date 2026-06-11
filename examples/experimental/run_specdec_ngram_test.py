@@ -13,16 +13,18 @@
 # limitations under the License.
 import os
 
+os.environ["RBLN_USE_CUSTOM_KERNEL"] = "1"
 os.environ["VLLM_RBLN_USE_VLLM_MODEL"] = "1"
 os.environ["VLLM_RBLN_COMPILE_STRICT_MODE"] = "1"
 os.environ["VLLM_DISABLE_COMPILE_CACHE"] = "1"
 os.environ["VLLM_RBLN_ENABLE_WARM_UP"] = "1"
+os.environ["VLLM_RBLN_SAMPLER"] = "0"
 
 from vllm import LLM, SamplingParams
 from vllm.v1.metrics.reader import Counter, Vector
 
 MODEL_ID = "meta-llama/Llama-3.2-1B-Instruct"
-NUM_SPECULATIVE_TOKENS = 3
+NUM_SPECULATIVE_TOKENS = 4
 NUM_PROMPT_LOOKUP_MAX = 5
 NUM_PROMPT_LOOKUP_MIN = 2
 
