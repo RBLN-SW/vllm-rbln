@@ -303,11 +303,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             if "use_global_ctx" in inspect.signature(CompileContext).parameters:
                 compile_ctx_args["use_global_ctx"] = True
             self.compile_context = CompileContext(**compile_ctx_args)
-            # Expose for attention metadata builders to register their
-            # persistent buffers as DRAM-static.
-            from vllm_rbln.torch_compile_backend import set_compile_context
-
-            set_compile_context(self.compile_context)
         else:
             self.compile_context = None
         self.runtime_holder: list = []
@@ -1283,7 +1278,10 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         )
 
         compute_slot_mapping_cpu(
-            self.input_batch.block_table, req_indices, positions_np, total_query_tokens
+            self.input_batch.block_table,
+            req_indices,
+            positions_np,
+            total_num_scheduled_tokens,
         )
 
         # Prepare the attention metadata.
@@ -4962,13 +4960,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             assert len(kv_cache_names) == len(self.kv_caches)
             for kv_cache, name in zip(self.kv_caches, kv_cache_names):
                 self.compile_context.mark_static_address(kv_cache, name)
-            # Deduplicated base tensors are what dynamo actually lifts when
-            # kv_cache_bases bindings are active; without marking them too,
-            # they stay graph inputs and break the runtime IO contract.
-            for base_index, base in enumerate(self.kv_cache_bases):
-                self.compile_context.mark_static_address(
-                    base, f"kv_cache_base.{base_index}"
-                )
 
         self._log_kv_cache_info(kv_cache_config, kv_caches)
         return kv_caches

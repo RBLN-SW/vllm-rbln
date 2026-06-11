@@ -37,17 +37,6 @@ logger = init_logger(__name__)
 
 _warmup_active: bool = False
 
-_compile_context: Any = None
-
-
-def set_compile_context(ctx: Any) -> None:
-    global _compile_context
-    _compile_context = ctx
-
-
-def get_compile_context() -> Any:
-    return _compile_context
-
 _SELF_FILENAME = os.path.abspath(__file__)
 
 _CALL_CHAIN_DEPTH = 3
@@ -100,85 +89,4 @@ def logged_rbln_backend(graph_module: Any, inputs: list[Any], **kwargs: Any) -> 
     t0 = time.perf_counter()
     result = _rbln_backend(graph_module, inputs, **kwargs)
     log("rbln_backend done: %.2fs", time.perf_counter() - t0)
-    return _adapt_runtime_inputs(result, inputs, graph_module)
-
-
-def _adapt_runtime_inputs(
-    runtime: Any, example_inputs: list[Any], graph_module: Any = None
-) -> Any:
-    """Adapt dynamo's full lifted-arg call to the compiled runtime IO contract.
-
-    vLLM routes KV caches and attention metadata through the forward
-    context, so dynamo lifts them as graph placeholders. The rebel compiler
-    excludes static-marked / folded tensors from the runtime IO, leaving
-    fewer runtime inputs than dynamo passes at each call. Map runtime
-    inputs back to placeholder positions by (shape, dtype) in order.
-    """
-    num_inputs = getattr(runtime, "_num_inputs", None)
-    profiles = getattr(runtime, "_input_profile", None)
-    if num_inputs is None or profiles is None or num_inputs >= len(example_inputs):
-        return runtime
-
-    # Runtime input names are "args_<N>" where N is the example-input index.
-    name_to_index = getattr(runtime, "_input_name_to_index", None) or {}
-    if len(name_to_index) == num_inputs:
-        keep_by_name = [-1] * num_inputs
-        for name, rt_index in name_to_index.items():
-            if name.startswith("args_") and name[5:].isdigit():
-                arg_index = int(name[5:])
-                if arg_index < len(example_inputs):
-                    keep_by_name[rt_index] = arg_index
-        if all(i >= 0 for i in keep_by_name):
-            logger.info(
-                "rbln runtime expects %d/%d dynamo args; name-matched %s -> %s",
-                num_inputs,
-                len(example_inputs),
-                list(name_to_index.keys()),
-                keep_by_name,
-            )
-
-            def adapted_by_name(*args: Any):
-                return runtime(*[args[i] for i in keep_by_name])
-
-            return adapted_by_name
-        logger.warning(
-            "rbln runtime input names %s not matched; "
-            "falling back to shape matching",
-            list(name_to_index.keys()),
-        )
-
-    keep: list[int] = []
-    cursor = 0
-    for profile in profiles:
-        matched = False
-        while cursor < len(example_inputs):
-            t = example_inputs[cursor]
-            if (
-                isinstance(t, torch.Tensor)
-                and tuple(t.shape) == tuple(profile.shape)
-                and t.dtype == profile.dtype
-            ):
-                keep.append(cursor)
-                cursor += 1
-                matched = True
-                break
-            cursor += 1
-        if not matched:
-            logger.warning(
-                "rbln runtime input adaptation failed (profile %s); "
-                "passing dynamo args through unchanged",
-                profile,
-            )
-            return runtime
-
-    logger.info(
-        "rbln runtime expects %d/%d dynamo args; selected placeholders %s",
-        num_inputs,
-        len(example_inputs),
-        keep,
-    )
-
-    def adapted(*args: Any):
-        return runtime(*[args[i] for i in keep])
-
-    return adapted
+    return result

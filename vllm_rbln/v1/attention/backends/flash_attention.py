@@ -1075,25 +1075,16 @@ class RBLNFlashAttentionMetadataBuilder(
     def _to_device_inplace(
         self, cpu_tensor: torch.Tensor, attr_name: str
     ) -> torch.Tensor:
-        # Keyed by (name, shape, dtype): prefill/decode alternate shapes for
-        # the same logical tensor, and each compiled graph needs a stable
-        # data_ptr across steps for DRAM key-address tracking.
-        if not hasattr(self, "_persistent_bufs"):
-            self._persistent_bufs: dict[tuple, torch.Tensor] = {}
-        key = (attr_name, tuple(cpu_tensor.shape), cpu_tensor.dtype)
-        buf = self._persistent_bufs.get(key)
-        if buf is None:
+        buf: torch.Tensor | None = getattr(self, attr_name)
+        if (
+            buf is None
+            or buf.shape != cpu_tensor.shape
+            or buf.dtype != cpu_tensor.dtype
+        ):
             buf = torch.empty(
                 cpu_tensor.shape, dtype=cpu_tensor.dtype, device=self.device
             )
-            self._persistent_bufs[key] = buf
-            from vllm_rbln.torch_compile_backend import get_compile_context
-
-            ctx = get_compile_context()
-            if ctx is not None:
-                ctx.mark_static_address(
-                    buf, f"attn.{attr_name}.{'x'.join(map(str, buf.shape))}"
-                )
+            setattr(self, attr_name, buf)
         buf.copy_(cpu_tensor)
         return buf
 
@@ -1118,9 +1109,7 @@ class RBLNFlashAttentionMetadataBuilder(
         query_max_seq_len = common_attn_metadata.max_seq_len
         query_start_loc = common_attn_metadata.query_start_loc
         seq_lens = common_attn_metadata.seq_lens
-        # Slice the full [max_num_reqs, ...] block table to the active
-        # requests so RBLN batch padding produces [batch_pad, ...].
-        block_tables_tensor = common_attn_metadata.block_table_tensor[:num_reqs]
+        block_tables_tensor = common_attn_metadata.block_table_tensor
         slot_mapping = common_attn_metadata.slot_mapping
         if use_dt:
             # Prefer the pre-existing CPU copy to avoid an extra D2H sync;
@@ -1246,14 +1235,10 @@ class RBLNFlashAttentionMetadataBuilder(
             max_query_len=max_query_len,
             query_start_loc=query_start_loc,
             max_seq_len=query_max_seq_len,
-            # Persistent buffers keep stable data_ptrs across steps so the
-            # compiled artifact's DRAM key-address map can track host writes.
-            seq_lens=self._to_device_inplace(seq_lens_tensor, "_seq_lens_buf")
+            seq_lens=seq_lens_tensor.to(self.device)
             if not self.is_batch_attention_opt or is_prefill or batch_pad <= 1
-            else self._to_device_inplace(seq_idx, "_seq_idx_buf"),
-            block_tables=self._to_device_inplace(
-                block_tables_tensor, "_block_tables_buf"
-            ),
+            else seq_idx.to(self.device),
+            block_tables=block_tables_tensor.to(self.device),
             slot_mapping=slot_mapping,
             use_cascade=False,
             common_prefix_len=common_prefix_len,
@@ -1402,9 +1387,6 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
 
             hidden_size = num_heads * head_size
         """
-        assert output_scale is None and output_block_scale is None, (
-            "fp8 output quantization is not supported on RBLN"
-        )
         # B - num_blocks == num_partitions
         # S - block_size == partition_size
         # H - num_kv_heads
