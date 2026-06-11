@@ -43,6 +43,13 @@ def register_model():
 
 
 def register_ops():
+    # torch 2.10 added a strict raise in CompileEventLogger.increment_toplevel
+    # / add_to_set_toplevel when no outermost chromium event is active. The
+    # RBLN custom torch.compile backend ends up calling those without a
+    # propagated event (wrap-based approaches at warm_up_model / execute_model
+    # / dummy_run did not work for this code path), so we silence the raise
+    # here. See ``_torch_dynamo_compat.py`` for details.
+    import vllm_rbln._torch_dynamo_compat  # noqa
     import vllm_rbln.distributed.ec_transfer.ec_connector.factory  # noqa
 
     if envs.VLLM_RBLN_USE_VLLM_MODEL:

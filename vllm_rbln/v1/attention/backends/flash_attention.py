@@ -1131,6 +1131,9 @@ class RBLNFlashAttentionMetadataBuilder(
             num_computed_tokens = seq_lens - query_seq_lens
             seq_idx = positions[query_start_loc[:num_reqs]].view(-1, 1)
 
+        # custom (triton) kernel's to_dynamic_index rejects int64 seq_lens
+        seq_idx = seq_idx.to(torch.int32)
+
         cu_prefix_query_lens = None
         prefix_kv_lens = None
         suffix_kv_lens = None
@@ -1145,10 +1148,9 @@ class RBLNFlashAttentionMetadataBuilder(
         num_partition = max_seq_len // partition_len
         cs = seq_idx.repeat(1, num_partition)
         pidx = torch.arange(num_partition, dtype=torch.int32)
-        # RBLN - seq_lens tensor dtype SHOULD be int16
         dyn_size_for_partitions = torch.clamp(
             cs - pidx * partition_len, 0, partition_len
-        ).to(torch.int16)
+        )
         seq_lens_tensor = dyn_size_for_partitions
 
         assert batch_pad is not None, "batch_pad is required for RBLN Attention Backend"
@@ -1209,8 +1211,8 @@ class RBLNFlashAttentionMetadataBuilder(
                 num_computed_tokens_cpu if use_dt else num_computed_tokens[:num_reqs]
             )
             sl_src = seq_lens_cpu if use_dt else seq_lens[:num_reqs]
-            num_computed_tokens = nct_src.view(-1, 1).to(torch.int16)
-            seq_lens = sl_src.view(-1, 1).to(torch.int16)
+            num_computed_tokens = nct_src.view(-1, 1)
+            seq_lens = sl_src.view(-1, 1)
             query_lens = seq_lens - num_computed_tokens
             cache_seq_lens = torch.clamp(num_computed_tokens, max=sliding_window)
             cache_offsets = cache_seq_lens + query_lens
@@ -1473,9 +1475,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                     key,
                     value,
                     kv_cache,
-                    attn_metadata.cache_seq_lens.to(torch.int32)
-                    if self.is_batch_attention_opt and b_size > 1
-                    else attn_metadata.cache_seq_lens,
+                    attn_metadata.cache_seq_lens,
                     attn_metadata.cache_offsets,
                     self.scale,
                     attn_metadata.local_block_tables,
@@ -1535,9 +1535,9 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         key,
                         value,
                         kv_cache,
-                        attn_metadata.seq_lens.to(torch.int16),
+                        attn_metadata.seq_lens,
                         self.scale,
-                        attn_metadata.block_tables.to(torch.int16),
+                        attn_metadata.block_tables,
                         self.scale,  # dummy (required by rbln_triton_ops signature)
                     ]
                     if not envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
@@ -1551,9 +1551,9 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         key,
                         value,
                         kv_cache,
-                        attn_metadata.seq_lens.to(torch.int16),
+                        attn_metadata.seq_lens,
                         self.scale,
-                        attn_metadata.block_tables.to(torch.int16),
+                        attn_metadata.block_tables,
                         self.scale,  # dummy (required by rbln_triton_ops signature)
                     ]
                     if not envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
@@ -1596,8 +1596,8 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         value,
                         kv_cache,
                         self.scale,
-                        attn_metadata.seq_lens.to(torch.int16),
-                        attn_metadata.block_tables.to(torch.int16),
+                        attn_metadata.seq_lens,
+                        attn_metadata.block_tables,
                         self.scale,  # dummy
                     ]
                     if not envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
@@ -1612,8 +1612,8 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         value,
                         kv_cache,
                         self.scale,
-                        attn_metadata.seq_lens.to(torch.int16),
-                        attn_metadata.block_tables.to(torch.int16),
+                        attn_metadata.seq_lens,
+                        attn_metadata.block_tables,
                         self.scale,  # dummy
                     ]
                     if not envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
@@ -1650,9 +1650,9 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         value,
                         kv_cache,
                         attn_metadata.attn_masks,
-                        attn_metadata.seq_lens.to(torch.int16),
+                        attn_metadata.seq_lens,
                         self.scale,
-                        attn_metadata.block_tables.to(torch.int16),
+                        attn_metadata.block_tables,
                         self.scale,  # dummy (required by rbln_triton_ops signature)
                     ]
                     if not envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
@@ -1667,9 +1667,9 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         value,
                         kv_cache,
                         attn_metadata.attn_masks,
-                        attn_metadata.seq_lens.to(torch.int16),
+                        attn_metadata.seq_lens,
                         self.scale,
-                        attn_metadata.block_tables.to(torch.int16),
+                        attn_metadata.block_tables,
                         self.scale,  # dummy (required by rbln_triton_ops signature)
                     ]
                     if not envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
@@ -1705,8 +1705,8 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         kv_cache,
                         attn_metadata.attn_masks,
                         self.scale,
-                        attn_metadata.seq_lens.to(torch.int16),
-                        attn_metadata.block_tables.to(torch.int16),
+                        attn_metadata.seq_lens,
+                        attn_metadata.block_tables,
                         self.scale,  # dummy
                     ]
                     if not envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
@@ -1722,8 +1722,8 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         kv_cache,
                         attn_metadata.attn_masks,
                         self.scale,
-                        attn_metadata.seq_lens.to(torch.int16),
-                        attn_metadata.block_tables.to(torch.int16),
+                        attn_metadata.seq_lens,
+                        attn_metadata.block_tables,
                         self.scale,  # dummy
                     ]
                     if not envs.VLLM_RBLN_USE_CUSTOM_KERNEL:

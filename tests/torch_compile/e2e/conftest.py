@@ -14,4 +14,4 @@
 
 # TODO: drop these once the LoRA and KV-connector e2e suites are stable
 # under the nightly FSW matrix.
-collect_ignore = ["v1/lora", "v1/kv_connector"]
+collect_ignore = ["v1/kv_connector"]
