@@ -31,6 +31,8 @@ isolated. The math mirrors the per-req block at the top of
 RBLNModelRunner._prepare_inputs.
 """
 
+import pytest
+
 from tests.torch_compile.unit.v1.core.utils import (
     advance_to_decode,
     create_requests,
@@ -158,6 +160,184 @@ class TestSchedulerBackfill:
         assert sched_out.spec_decode_slide_distance["B"] == 2
         assert sched_out.num_scheduled_tokens["B"] == 2
         assert sched_out.scheduled_spec_decode_tokens["B"] == [11]
+
+
+# ---------------------------------------------------------------------------
+# Cross-block no-spec fallback: variable-length proposers can hit a step whose
+# backfill window would cross a KV block boundary and must drop to no-spec;
+# fixed-length proposers never reach that branch (guarded by an assert).
+# ---------------------------------------------------------------------------
+
+
+def _set_method(scheduler, method):
+    """Override the proposer method on the scheduler's SpeculativeConfig.
+
+    Only the cross-block guard reads ``method``; the scheduling math itself is
+    method-agnostic. Setting it lets us exercise fixed-length behavior without
+    standing up a real draft model. ``object.__setattr__`` bypasses pydantic
+    frozen-field protection.
+    """
+    object.__setattr__(scheduler.vllm_config.speculative_config, "method", method)
+
+
+class TestCrossBlockNoSpecFallback:
+    # ---- variable-length: the problem situation occurs AND no-spec fixes it --
+
+    def test_variable_length_cross_block_elects_no_spec(self):
+        """ngram (variable-length), just entered a new block
+        (num_computed=1024 -> used_in_block=0), proposer returned 0 drafts ->
+        desired_slide = 4 - 1 = 3 > 0 -> backfill would cross into the previous
+        block. The scheduler must elect no-spec and NOT record a (cross-block)
+        slide for that req."""
+        scheduler = _scheduler()  # default method == "ngram" (variable-length)
+        assert scheduler.vllm_config.speculative_config.method == "ngram"
+        req = _request(1024, "A")
+        advance_to_decode(scheduler, req)
+        req.spec_token_ids = []  # variable-length proposer found no match
+
+        sched_out = scheduler.schedule()
+
+        rid = req.request_id
+        assert sched_out.step_no_spec_required is True
+        # cross-block must NOT record an in-block slide; it drops to no-spec
+        assert rid not in sched_out.spec_decode_slide_distance
+
+    def test_variable_length_in_block_shortfall_keeps_full_spec(self):
+        """Same 0-draft shortfall but mid-block (num_computed=1500 ->
+        used_in_block=476): desired_slide=3 <= 476 stays in-block -> slide is
+        recorded and no-spec is NOT elected. Confirms the fallback only fires
+        on a genuine block crossing, not on every draft shortfall."""
+        scheduler = _scheduler()
+        req = _request(1500, "A")
+        advance_to_decode(scheduler, req)
+        req.spec_token_ids = []
+
+        sched_out = scheduler.schedule()
+
+        rid = req.request_id
+        assert sched_out.step_no_spec_required is False
+        assert sched_out.spec_decode_slide_distance[rid] == _NUM_SPEC_TOKENS
+
+    @pytest.mark.parametrize(
+        "used_in_block,num_draft,expect_no_spec",
+        [
+            # At a fresh block entry (used_in_block=0) any shortfall crosses:
+            (0, 0, True),  # slide 3 > 0
+            (0, 1, True),  # slide 2 > 0
+            (0, 2, True),  # slide 1 > 0
+            (0, 3, False),  # slide 0 -> full spec, no slide at all
+            # 2 tokens into the block, only the largest shortfall crosses:
+            (2, 0, True),  # slide 3 > 2
+            (2, 1, False),  # slide 2 <= 2 -> in-block backfill
+            # 3 tokens in: even a zero-draft shortfall fits in-block:
+            (3, 0, False),  # slide 3 <= 3 -> in-block backfill
+        ],
+    )
+    def test_variable_length_cross_block_threshold(
+        self, used_in_block, num_draft, expect_no_spec
+    ):
+        """num_draft (= len(spec_token_ids)) and the block-entry offset jointly
+        decide the fallback: cross-block (no-spec) iff
+        (num_spec - num_draft) > used_in_block. Sweeps the exact threshold."""
+        scheduler = _scheduler()  # ngram (variable-length)
+        req = _request(_BLOCK_SIZE + used_in_block, "A")
+        advance_to_decode(scheduler, req)
+        req.spec_token_ids = [0] * num_draft
+
+        sched_out = scheduler.schedule()
+
+        rid = req.request_id
+        assert sched_out.step_no_spec_required is expect_no_spec
+        if expect_no_spec:
+            # cross-block elects no-spec and records no slide
+            assert rid not in sched_out.spec_decode_slide_distance
+        else:
+            # in-block: slide recorded iff there was a shortfall to pad
+            desired_slide = _NUM_SPEC_TOKENS - num_draft
+            if desired_slide > 0:
+                assert sched_out.spec_decode_slide_distance[rid] == desired_slide
+
+    # ---- fixed-length: no-spec never arises ---------------------------------
+
+    def test_fixed_length_block_entry_no_no_spec(self):
+        """Fixed-length (eagle) always supplies num_spec drafts. At a fresh
+        block entry desired_slide = 4 - 4 = 0 -> no slide, no no-spec."""
+        scheduler = _scheduler()
+        _set_method(scheduler, "eagle")
+        req = _request(1024, "A")
+        advance_to_decode(scheduler, req)
+        req.spec_token_ids = [1, 2, 3]  # fixed-length always supplies num_spec
+
+        sched_out = scheduler.schedule()
+
+        rid = req.request_id
+        assert sched_out.step_no_spec_required is False
+        assert rid not in sched_out.spec_decode_slide_distance
+
+    def test_fixed_length_boundary_squeeze_stays_in_block(self):
+        """Fixed-length at the block-END squeeze (num_computed=1022 ->
+        remaining=2) backfills in-block (slide=2 <= used_in_block=1022) and
+        never elects no-spec."""
+        scheduler = _scheduler()
+        _set_method(scheduler, "medusa")
+        req = _request(1022, "A")
+        advance_to_decode(scheduler, req)
+        req.spec_token_ids = [11, 22, 33]
+
+        sched_out = scheduler.schedule()
+
+        rid = req.request_id
+        assert sched_out.step_no_spec_required is False
+        assert sched_out.spec_decode_slide_distance[rid] == 2
+
+    # ---- invariant guard: fixed-length must never reach cross-block ---------
+
+    @pytest.mark.parametrize(
+        "m,expect_assert",
+        [
+            # m = max_model_len % block_size = the final partial block's size.
+            # The scheduler caps each decode step to
+            #   num_new_tokens <= max_model_len - 1 - num_computed   (rbln_scheduler
+            # reserves the last position; "input position must not exceed
+            # max_model_len" under spec decode). So at the final-block entry
+            # (used_in_block=0, remaining_in_maxlen=m) even with FULL drafts:
+            #   old_n  = min(num_spec+1, m-1)
+            #   new_n  = min(old_n, m) = old_n
+            #   desired_slide = num_spec+1 - old_n  > 0  iff  m-1 < num_spec+1
+            # => cross-block iff m <= num_spec+1, safe iff m >= num_spec+2.
+            # The shortfall is from the maxlen reservation, NOT a draft shortage.
+            (2, True),  # rem_max=2 -> old_n=1 -> slide 3 -> cross-block
+            (3, True),  # rem_max=3 -> old_n=2 -> slide 2 -> cross-block
+            (4, True),  # rem_max=4 -> old_n=3 -> slide 1 (m == num_spec+1)
+            (5, False),  # rem_max=5 -> old_n=4 -> slide 0 (m == num_spec+2, safe)
+            (6, False),  # safe
+        ],
+    )
+    def test_fixed_length_maxlen_edge_threshold(self, m, expect_assert):
+        """The ONLY real way a fixed-length proposer reaches cross-block: a
+        misaligned max_model_len whose final block is too short to hold a full
+        num_spec+1 window. The shortfall comes from the scheduler's maxlen
+        reservation (max_model_len-1), NOT a draft shortage (eagle always
+        supplies num_spec). Sweeps m: m <= num_spec+1 must fail loudly (assert),
+        m >= num_spec+2 stays full-spec. (m==0 aligned and m==1 degenerate are
+        safe and covered by the other fixed-length tests.)
+
+        self.max_model_len is read from model_config, not the create_scheduler
+        arg (which only sets scheduler_config), so it is patched directly.
+        """
+        scheduler = _scheduler()
+        scheduler.max_model_len = _BLOCK_SIZE + m  # final block holds m tokens
+        _set_method(scheduler, "eagle")
+        req = _request(_BLOCK_SIZE, "A")  # decode starts at the block boundary
+        advance_to_decode(scheduler, req)
+        req.spec_token_ids = [1, 2, 3]  # full drafts (realistic fixed-length)
+
+        if expect_assert:
+            with pytest.raises(AssertionError, match="fixed-length"):
+                scheduler.schedule()
+        else:
+            sched_out = scheduler.schedule()
+            assert sched_out.step_no_spec_required is False
 
 
 # ---------------------------------------------------------------------------

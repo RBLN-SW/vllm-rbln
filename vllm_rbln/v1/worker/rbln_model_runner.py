@@ -385,18 +385,22 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.num_spec_tokens = 0
         if self.speculative_config:
             self.num_spec_tokens = self.speculative_config.num_speculative_tokens
-            # Fixed-length speculative decoding: the runtime query length is
-            # either 1 (no-spec, single-token decode) or num_spec_tokens + 1
-            # (full spec). The max value must be a power of two for the MoE
-            # multicast — max_pads_across_dp / num_tokens uses integer
-            # division and a non-pow2 divisor produces a shape-truncation
-            # path that fails to compile.
-            _max_q = self.num_spec_tokens + 1
-            assert _max_q > 0 and (_max_q & (_max_q - 1)) == 0, (
-                "num_speculative_tokens + 1 must be a power of two on RBLN; "
-                f"got num_speculative_tokens={self.num_spec_tokens} "
-                f"(num_speculative_tokens + 1 = {_max_q})"
-            )
+            # The runtime query length is 1 (no-spec) or num_spec_tokens + 1
+            # (full spec). Under data parallel, that max value must be a power
+            # of two for the MoE cross-rank multicast — max_pads_across_dp /
+            # num_tokens uses integer division and a non-pow2 divisor produces
+            # a shape-truncation path that fails to compile. Without DP there
+            # is no cross-rank multicast, so any num_speculative_tokens is
+            # allowed.
+            dp_size = self.vllm_config.parallel_config.data_parallel_size
+            if dp_size > 1:
+                _max_q = self.num_spec_tokens + 1
+                assert _max_q > 0 and (_max_q & (_max_q - 1)) == 0, (
+                    "num_speculative_tokens + 1 must be a power of two on RBLN "
+                    "when data parallel is enabled (MoE cross-DP multicast); "
+                    f"got num_speculative_tokens={self.num_spec_tokens} "
+                    f"(num_speculative_tokens + 1 = {_max_q})"
+                )
 
         # Request states.
         self.requests: dict[str, CachedRequestState] = {}
@@ -1227,6 +1231,28 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             slide_arr = np.zeros(num_reqs, dtype=np.int32)
         query_lengths = num_scheduled_tokens + slide_arr
         total_query_tokens = int(query_lengths.sum())
+
+        # Runtime guard: a backfilled (slide) query window must stay within the
+        # request's CURRENT KV block. If slide > tokens_used_in_block the window
+        # reaches into the PREVIOUS block, which the single-block decode path
+        # cannot express and would otherwise silently corrupt KV. The scheduler
+        # prevents this by firing the cross-DP no-spec fallback (which clears
+        # slide for the step); assert here so any unhandled cross-block backfill
+        # fails loudly instead of producing wrong KV.
+        if slide_distance_map:
+            block_size = self.cache_config.block_size
+            num_computed = self.input_batch.num_computed_tokens_cpu[:num_reqs]
+            tokens_used_in_block = num_computed % block_size
+            cross_block = slide_arr > tokens_used_in_block
+            assert not cross_block.any(), (
+                "cross-block backfill reached the decode path: slide exceeds "
+                "tokens_used_in_block, so the query window spans two KV blocks. "
+                "The scheduler's cross-block no-spec fallback should have "
+                "prevented this. "
+                f"slide={slide_arr.tolist()}, "
+                f"tokens_used_in_block={tokens_used_in_block.tolist()}, "
+                f"num_computed={num_computed.tolist()}, block_size={block_size}"
+            )
 
         # Get request indices.
         # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
@@ -2206,15 +2232,23 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # compile decode graph considering decode batch buckets
         for batch_bucket_size in self.bucketing_manager.decode_batch_buckets:
-            # Always-full-spec design: with sliding window padding, every
-            # decode step's runtime query length is num_spec_tokens + 1
-            # regardless of the proposer's output length or block-boundary
-            # position. The scheduler enforces this by sliding the query
-            # window backward to cover any deficit (variable-length drafts
-            # OR boundary squeeze). Only the spec-disabled case still uses
-            # query_len = 1.
+            # Decode query length is num_spec_tokens + 1 (full spec) for every
+            # step that the scheduler can pad via in-block query backfill.
+            #
+            # Variable-length proposers (ngram, suffix) can hit a step that
+            # CANNOT reach full spec: right after entering a new block, a short
+            # draft would need backfill past tokens from the PREVIOUS block
+            # (cross-block) — unsupported. The scheduler falls back that step
+            # to no-spec (query_len = 1). So compile the q=1 graph too, or that
+            # rare fallback triggers a hot-path recompile. Fixed-length
+            # proposers (EAGLE/EAGLE3/MEDUSA) never cross-block (backfill only
+            # fires at the block-end squeeze, where in-block past is always
+            # sufficient), so they need full spec only.
             if self.num_spec_tokens > 0:
-                query_len_range = [self.num_spec_tokens + 1]
+                if self.speculative_config.method in ("ngram", "suffix"):
+                    query_len_range = [1, self.num_spec_tokens + 1]
+                else:
+                    query_len_range = [self.num_spec_tokens + 1]
             else:
                 query_len_range = [1]
             for query_len in query_len_range:
@@ -2244,11 +2278,16 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     if query_len > 1
                     else {}
                 )
+                # query_len == 1 in the variable-length range is the no-spec
+                # fallback iteration: flag it so execute_model drives the
+                # runtime no-spec path (spec_decode_max_query_len=1 -> maxp =
+                # batch_bucket * 1) and compiles the decode-only no-spec graph.
                 so, cso = self._make_dummy_scheduler_outputs(
                     dummy_decode_requests,
                     dummy_decode_num_scheduled_tokens,
                     num_kv_cache_groups,
                     scheduled_spec_decode_tokens=spec_tokens,
+                    step_no_spec_required=(query_len == 1 and self.num_spec_tokens > 0),
                 )
                 current_intermediate_tensors = self.decode_intermediate_tensors.get(
                     batch_bucket_size
@@ -2367,8 +2406,18 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         num_scheduled_tokens: dict[str, int],
         num_kv_cache_groups: int,
         scheduled_spec_decode_tokens: dict[str, list[int]] | None = None,
+        step_no_spec_required: bool = False,
     ) -> tuple[SchedulerOutput, SchedulerOutput]:
-        sched_output = SchedulerOutput(
+        # When step_no_spec_required is requested (the warmup no-spec /
+        # query_len=1 iteration for variable-length proposers), emit an
+        # RBLNSchedulerOutput carrying the flag so execute_model takes the
+        # EXACT same path the runtime cross-block no-spec fallback does:
+        # step_no_spec_required -> spec_decode_max_query_len=1 -> get_dp_padding
+        # produces num_padded = batch_bucket * 1 (maxp=8 for bucket 8). Without
+        # this the plain SchedulerOutput never trips the flag, so the no-spec
+        # decode-only graph (input (b,1), max_pads=batch_bucket) is never
+        # compiled and the runtime no-spec step / DP-idle dummy_run hot-paths.
+        sched_output_kwargs = dict(
             scheduled_new_reqs=requests,
             scheduled_cached_reqs=CachedRequestData.make_empty(),
             num_scheduled_tokens=num_scheduled_tokens,
@@ -2380,6 +2429,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             free_encoder_mm_hashes=[],
             kv_connector_metadata=None,
         )
+        if step_no_spec_required:
+            sched_output: SchedulerOutput = RBLNSchedulerOutput(
+                **sched_output_kwargs, step_no_spec_required=True
+            )
+        else:
+            sched_output = SchedulerOutput(**sched_output_kwargs)
         cleanup_sched_output = SchedulerOutput(
             scheduled_new_reqs=[],
             scheduled_cached_reqs=CachedRequestData.make_empty(),
@@ -2737,25 +2792,32 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         assert self.dummy_run_state is not None
         (attn_metadata, num_input_tokens, input_ids, positions) = self.dummy_run_state
 
-        # This rank is DP-idle (no scheduled work). Under the always-full-spec
-        # design the runtime model_wrapper shape is unconditionally
-        # (bucket, num_spec_tokens + 1) whenever spec decode is configured —
-        # the scheduler pads every executing rank's query window to that
-        # length via sliding, so a peer's cross-DP MAX vote is always
-        # num_spec_tokens + 1. We must report the same value here (rather
-        # than 1) so the MAX agrees and the shape we drive matches the
-        # warmup-compiled full-spec slot. Reporting 1 would let a all-idle
-        # step collapse to (bucket, 1), which is no longer warmup-compiled
-        # and triggers a hot-path model_wrapper recompile.
-        spec_decode_max_query_len = (
-            self.num_spec_tokens + 1 if self.num_spec_tokens > 0 else None
-        )
-        # Participate in the cross-DP step_no_spec_required OR-reduce so
-        # peers running execute_model don't block waiting for our collective
-        # vote. An idle dummy_run rank never trips a local boundary, so we
-        # always contribute 0. (The OR-reduce itself is now a no-op under
-        # the always-full-spec design, but the collective is kept for shape
-        # uniformity guarantees with peers.)
+        # This rank is DP-idle (no scheduled work). Vote the decode query
+        # length for the cross-DP MAX; the final shape is the MAX over all
+        # ranks' votes (computed in get_dp_padding below).
+        #
+        # Variable-length proposers (ngram, suffix) can elect no-spec on a
+        # cross-block step, in which case every executing peer votes 1. This
+        # idle rank must then also vote the MINIMUM (1) — voting num_spec+1
+        # would force the MAX up and drag the no-spec peers back to a
+        # boundary-crossing full-spec shape. The q=1 graph IS warmup-compiled
+        # for variable-length, so driving it is safe.
+        #
+        # Fixed-length proposers (EAGLE/EAGLE3/MEDUSA) never elect no-spec and
+        # do NOT compile a q=1 graph, so they must vote num_spec+1 (an all-idle
+        # step then drives the compiled full-spec slot; voting 1 would collapse
+        # to an uncompiled (bucket, 1) and trigger a hot-path recompile).
+        if self.num_spec_tokens > 0:
+            if self.speculative_config.method in ("ngram", "suffix"):
+                spec_decode_max_query_len = 1
+            else:
+                spec_decode_max_query_len = self.num_spec_tokens + 1
+        else:
+            spec_decode_max_query_len = None
+        # Participate in the cross-DP step_no_spec_required OR-reduce so peers
+        # running execute_model don't block waiting for our collective vote.
+        # An idle rank never elects no-spec locally, so it contributes 0; the
+        # OR result is consumed by the executing peers.
         dp_size = self.vllm_config.parallel_config.data_parallel_size
         if dp_size > 1 and self.num_spec_tokens > 0:
             dp_rank = self.vllm_config.parallel_config.data_parallel_rank
@@ -2785,12 +2847,16 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         bucket_positions = positions[batch_bucket_size]
 
         if self.num_spec_tokens > 0:
-            # Expand local dummy from (bucket, 1) to
-            # (bucket, num_spec_tokens + 1) with zero-pad tokens so the
-            # shape matches the single warmup-compiled full-spec decode
-            # slot. Values are irrelevant — an idle DP rank's output is
-            # discarded.
-            ql = self.num_spec_tokens + 1
+            # Expand the local (bucket, 1) dummy to (bucket, ql) with zero pads
+            # so the shape matches whatever the cross-DP MAX decided: num_spec+1
+            # on a full-spec step, or 1 when every executing peer elected
+            # no-spec (cross-block, variable-length only). Values are irrelevant
+            # — an idle DP rank's output is discarded.
+            ql = (
+                max_tokens_per_req_across_dp
+                if max_tokens_per_req_across_dp is not None
+                else self.num_spec_tokens + 1
+            )
             bucket_input_ids = torch.zeros(
                 (bucket_input_ids.shape[0], ql),
                 device=bucket_input_ids.device,
@@ -3174,13 +3240,17 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             else:
                 step_no_spec_required = local_step_no_spec_required
 
-            # Collective scrub: a peer rank tripped the boundary, so drop
-            # any drafts this rank may have committed. After the scrub,
-            # `scheduled_spec_decode_tokens` is empty on every rank, so
-            # downstream tensors built by `_prepare_inputs` are uniformly
-            # sized for query_len=1 across DP.
-            if step_no_spec_required and scheduler_output.scheduled_spec_decode_tokens:
+            # Collective scrub: some rank elected no-spec this step (a
+            # cross-block backfill that can't reach full spec), so via the
+            # OR-reduce EVERY rank drops to query_len=1. Drop any drafts this
+            # rank committed AND zero any in-block slide (backfill) it
+            # scheduled, so `_prepare_inputs` builds a uniform query_len=1
+            # graph across DP. Runs whenever the global flag is set, even if
+            # this rank had no drafts/slide locally (a peer tripped it).
+            if step_no_spec_required:
                 scheduler_output.scheduled_spec_decode_tokens.clear()
+                if isinstance(scheduler_output, RBLNSchedulerOutput):
+                    scheduler_output.spec_decode_slide_distance.clear()
                 for req_id in list(scheduler_output.num_scheduled_tokens):
                     scheduler_output.num_scheduled_tokens[req_id] = 1
                 scheduler_output.total_num_scheduled_tokens = sum(
@@ -3190,16 +3260,40 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
                 num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
 
-            # Always-full-spec design: the scheduler pads every decode
-            # req's query window to num_spec_tokens + 1 via sliding, so
-            # this rank's local query length is unconditionally
-            # num_spec_tokens + 1 whenever spec is configured. The
-            # cross-DP MAX inside get_dp_padding is effectively a no-op
-            # (every rank votes the same value) but kept for shape
-            # uniformity guarantees.
+                # Verify the no-spec scrub actually eliminated every cross-block
+                # condition: with all slides cleared and every query_len forced
+                # to 1, a backfill window can no longer span two KV blocks. If
+                # this fails the scrub is incomplete and the downstream decode
+                # would still cross a block boundary.
+                assert all(
+                    v == 1 for v in scheduler_output.num_scheduled_tokens.values()
+                ), (
+                    "no-spec scrub left a query_len != 1: "
+                    f"{scheduler_output.num_scheduled_tokens}"
+                )
+                assert not getattr(
+                    scheduler_output, "spec_decode_slide_distance", {}
+                ), (
+                    "no-spec scrub left a non-empty slide map, so a cross-block "
+                    "backfill can still occur: "
+                    f"{getattr(scheduler_output, 'spec_decode_slide_distance', {})}"
+                )
+
+            # Decode shape vote for the cross-DP MAX. Normally the scheduler
+            # pads every decode req's query window to num_spec_tokens + 1 via
+            # in-block backfill, so the local query length is num_spec_tokens +
+            # 1. But when the cross-DP OR-reduce above elected no-spec this
+            # step (some rank hit a cross-block backfill that can't reach full
+            # spec), the collective scrub forced query_len = 1 on every rank;
+            # vote 1 so the MAX agrees on the (bucket, 1) no-spec graph instead
+            # of padding back up to num_spec_tokens + 1 (which would write
+            # pad-position KV past the block boundary). Both shapes are
+            # warmup-compiled for variable-length proposers.
             spec_decode_max_query_len: int | None = None
             if self.num_spec_tokens > 0:
-                spec_decode_max_query_len = self.num_spec_tokens + 1
+                spec_decode_max_query_len = (
+                    1 if step_no_spec_required else self.num_spec_tokens + 1
+                )
 
             # Prepare the decoder inputs.
             (
