@@ -29,149 +29,136 @@ from pydantic import BaseModel
 from vllm import LLM, SamplingParams
 from vllm.sampling_params import StructuredOutputsParams
 
+from .utils import patch_and_run
+
 MODEL_ID = "meta-llama/Llama-3.2-1B-Instruct"
 
+LLM_KWARGS = {
+    "model": MODEL_ID,
+    "max_model_len": 4096,
+    "max_num_seqs": 4,
+    "block_size": 1024,
+    "max_num_batched_tokens": 128,
+    "enable_chunked_prefill": True,
+}
 
-@pytest.fixture(scope="module")
-def llm(monkeypatch_module):
-    """Module-scoped LLM instance shared across all structured output tests."""
-    monkeypatch_module.setenv("VLLM_RBLN_USE_VLLM_MODEL", "1")
-    monkeypatch_module.setenv("VLLM_DISABLE_COMPILE_CACHE", "1")
-    return LLM(
-        model=MODEL_ID,
-        max_model_len=4096,
-        max_num_seqs=4,
-        block_size=1024,
-        max_num_batched_tokens=128,
-        enable_chunked_prefill=True,
+ENV = {
+    "VLLM_RBLN_USE_VLLM_MODEL": "1",
+    "VLLM_DISABLE_COMPILE_CACHE": "1",
+}
+
+
+def _run_choice() -> None:
+    choices = ["Positive", "Negative"]
+    llm = LLM(**LLM_KWARGS)
+    outputs = llm.generate(
+        prompts="Classify this sentiment: vLLM is wonderful!",
+        sampling_params=SamplingParams(
+            structured_outputs=StructuredOutputsParams(choice=choices)
+        ),
+    )
+    assert outputs[0].outputs[0].text in choices
+
+
+def _run_regex() -> None:
+    llm = LLM(**LLM_KWARGS)
+    outputs = llm.generate(
+        prompts=(
+            "Generate an example email address for Alan Turing, "
+            "who works in Enigma. End in .com and new line. "
+            "Example result: alan.turing@enigma.com\n"
+        ),
+        sampling_params=SamplingParams(
+            structured_outputs=StructuredOutputsParams(regex=r"\w+@\w+\.com\n")
+        ),
+    )
+    text = outputs[0].outputs[0].text
+    assert re.fullmatch(r"\w+@\w+\.com\n", text), (
+        f"Output does not match regex: {text!r}"
     )
 
 
-class TestChoiceStructuredOutput:
-    """Test choice-based structured output."""
+def _run_json() -> None:
+    class CarType(str, Enum):
+        sedan = "sedan"
+        suv = "SUV"
+        truck = "Truck"
+        coupe = "Coupe"
 
-    def test_sentiment_classification(self, llm):
-        choices = ["Positive", "Negative"]
-        outputs = llm.generate(
-            prompts="Classify this sentiment: vLLM is wonderful!",
-            sampling_params=SamplingParams(
-                structured_outputs=StructuredOutputsParams(choice=choices)
+    class CarDescription(BaseModel):
+        brand: str
+        model: str
+        car_type: CarType
+
+    llm = LLM(**LLM_KWARGS)
+    outputs = llm.generate(
+        prompts=(
+            "Generate a JSON with the brand, model and car_type "
+            "of the most iconic car from the 90's"
+        ),
+        sampling_params=SamplingParams(
+            max_tokens=32,
+            structured_outputs=StructuredOutputsParams(
+                json=CarDescription.model_json_schema()
             ),
-        )
-        assert outputs[0].outputs[0].text in choices
+        ),
+    )
+    text = outputs[0].outputs[0].text
+    parsed = json.loads(text)
+    car = CarDescription(**parsed)
+    assert isinstance(car.brand, str)
+    assert isinstance(car.model, str)
+    assert car.car_type in CarType
 
 
-class TestRegexStructuredOutput:
-    """Test regex-constrained structured output."""
+def _run_grammar() -> None:
+    simplified_sql_grammar = """
+        root ::= select_statement
 
-    def test_email_format(self, llm):
-        outputs = llm.generate(
-            prompts=(
-                "Generate an example email address for Alan Turing, "
-                "who works in Enigma. End in .com and new line. "
-                "Example result: alan.turing@enigma.com\n"
-            ),
-            sampling_params=SamplingParams(
-                structured_outputs=StructuredOutputsParams(regex=r"\w+@\w+\.com\n")
-            ),
-        )
-        text = outputs[0].outputs[0].text
-        assert re.fullmatch(r"\w+@\w+\.com\n", text), (
-            f"Output does not match regex: {text!r}"
-        )
+        select_statement ::= "SELECT " column " from " table " where " condition
 
+        column ::= "col_1 " | "col_2 "
 
-class TestJsonStructuredOutput:
-    """Test JSON schema-constrained structured output."""
+        table ::= "table_1 " | "table_2 "
 
-    def test_car_description(self, llm):
-        class CarType(str, Enum):
-            sedan = "sedan"
-            suv = "SUV"
-            truck = "Truck"
-            coupe = "Coupe"
+        condition ::= column "= " number
 
-        class CarDescription(BaseModel):
-            brand: str
-            model: str
-            car_type: CarType
-
-        outputs = llm.generate(
-            prompts=(
-                "Generate a JSON with the brand, model and car_type "
-                "of the most iconic car from the 90's"
-            ),
-            sampling_params=SamplingParams(
-                max_tokens=32,
-                structured_outputs=StructuredOutputsParams(
-                    json=CarDescription.model_json_schema()
-                ),
-            ),
-        )
-        text = outputs[0].outputs[0].text
-        parsed = json.loads(text)
-        # Validate it conforms to the schema
-        car = CarDescription(**parsed)
-        assert isinstance(car.brand, str)
-        assert isinstance(car.model, str)
-        assert car.car_type in CarType
+        number ::= "1 " | "2 "
+    """
+    llm = LLM(**LLM_KWARGS)
+    outputs = llm.generate(
+        prompts=(
+            "Generate a SQL query to show the 'username' and 'email' "
+            "from the 'users' table."
+        ),
+        sampling_params=SamplingParams(
+            structured_outputs=StructuredOutputsParams(grammar=simplified_sql_grammar)
+        ),
+    )
+    text = outputs[0].outputs[0].text
+    assert text.startswith("SELECT "), f"Expected SQL SELECT, got: {text!r}"
+    assert " from " in text
+    assert " where " in text
 
 
-class TestGrammarStructuredOutput:
-    """Test EBNF grammar-constrained structured output."""
+def _run_structural_tag() -> None:
+    structural_tag_obj = {
+        "type": "structural_tag",
+        "structures": [
+            {
+                "begin": "<function=get_weather>",
+                "schema": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+                "end": "</function>",
+            }
+        ],
+        "triggers": ["<function="],
+    }
 
-    def test_sql_query(self, llm):
-        simplified_sql_grammar = """
-            root ::= select_statement
-
-            select_statement ::= "SELECT " column " from " table " where " condition
-
-            column ::= "col_1 " | "col_2 "
-
-            table ::= "table_1 " | "table_2 "
-
-            condition ::= column "= " number
-
-            number ::= "1 " | "2 "
-        """
-        outputs = llm.generate(
-            prompts=(
-                "Generate a SQL query to show the 'username' and 'email' "
-                "from the 'users' table."
-            ),
-            sampling_params=SamplingParams(
-                structured_outputs=StructuredOutputsParams(
-                    grammar=simplified_sql_grammar
-                )
-            ),
-        )
-        text = outputs[0].outputs[0].text
-        assert text.startswith("SELECT "), f"Expected SQL SELECT, got: {text!r}"
-        assert " from " in text
-        assert " where " in text
-
-
-class TestStructuralTagStructuredOutput:
-    """Test structural_tag-constrained structured output."""
-
-    def test_function_call_tag(self, llm):
-        structural_tag_obj = {
-            "type": "structural_tag",
-            "structures": [
-                {
-                    "begin": "<function=get_weather>",
-                    "schema": {
-                        "type": "object",
-                        "properties": {"city": {"type": "string"}},
-                        "required": ["city"],
-                    },
-                    "end": "</function>",
-                }
-            ],
-            "triggers": ["<function="],
-        }
-
-        prompt = """You have access to the following function to retrieve the weather:
+    prompt = """You have access to the following function to retrieve the weather:
 {
     "name": "get_weather",
     "parameters": {
@@ -192,26 +179,43 @@ Example:
 
 What is the weather in New York City?
 """
-        outputs = llm.generate(
-            prompts=prompt,
-            sampling_params=SamplingParams(
-                structured_outputs=StructuredOutputsParams(
-                    structural_tag=json.dumps(structural_tag_obj)
-                )
-            ),
-        )
-        text = outputs[0].outputs[0].text
+    llm = LLM(**LLM_KWARGS)
+    outputs = llm.generate(
+        prompts=prompt,
+        sampling_params=SamplingParams(
+            structured_outputs=StructuredOutputsParams(
+                structural_tag=json.dumps(structural_tag_obj)
+            )
+        ),
+    )
+    text = outputs[0].outputs[0].text
 
-        # Verify the function call tags are present
-        assert "<function=get_weather>" in text, (
-            f"Expected function call tag in output: {text!r}"
-        )
-        assert "</function>" in text, (
-            f"Expected closing function tag in output: {text!r}"
-        )
+    assert "<function=get_weather>" in text, (
+        f"Expected function call tag in output: {text!r}"
+    )
+    assert "</function>" in text, f"Expected closing function tag in output: {text!r}"
 
-        # Extract and validate JSON between tags
-        match = re.search(r"<function=get_weather>(.*?)</function>", text, re.DOTALL)
-        assert match is not None, f"Could not extract function call from: {text!r}"
-        params = json.loads(match.group(1))
-        assert "city" in params
+    match = re.search(r"<function=get_weather>(.*?)</function>", text, re.DOTALL)
+    assert match is not None, f"Could not extract function call from: {text!r}"
+    params = json.loads(match.group(1))
+    assert "city" in params
+
+
+def test_choice_sentiment_classification(monkeypatch: pytest.MonkeyPatch) -> None:
+    patch_and_run(monkeypatch, ENV, _run_choice)
+
+
+def test_regex_email_format(monkeypatch: pytest.MonkeyPatch) -> None:
+    patch_and_run(monkeypatch, ENV, _run_regex)
+
+
+def test_json_car_description(monkeypatch: pytest.MonkeyPatch) -> None:
+    patch_and_run(monkeypatch, ENV, _run_json)
+
+
+def test_grammar_sql_query(monkeypatch: pytest.MonkeyPatch) -> None:
+    patch_and_run(monkeypatch, ENV, _run_grammar)
+
+
+def test_structural_tag_function_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    patch_and_run(monkeypatch, ENV, _run_structural_tag)
