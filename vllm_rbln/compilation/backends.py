@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import itertools
+import traceback
 from collections.abc import Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -27,6 +29,7 @@ logger = init_logger(__name__)
 
 _compile_counter = itertools.count(1)
 _current_stage = ContextVar("rbln_backend_current_stage", default="runtime")
+_SELF_FILE = Path(__file__).resolve()
 
 _DTYPE_SHORT = {
     torch.float64: "f64",
@@ -79,6 +82,37 @@ def current_stage() -> str:
     return _current_stage.get()
 
 
+def _format_callsite(frame: traceback.FrameSummary) -> str:
+    path = Path(frame.filename).resolve()
+    parts = path.parts
+
+    if "vllm_rbln" in parts:
+        idx = parts.index("vllm_rbln")
+        rel_path = "/".join(parts[idx:])
+    else:
+        rel_path = path.name
+
+    return f"{rel_path}:{frame.lineno}({frame.name})"
+
+
+def _find_rbln_callsite() -> str:
+    # Walk from the current frame outward and return the nearest vllm_rbln
+    # frame that triggered this Dynamo backend invocation.
+    for frame in reversed(traceback.extract_stack()):
+        if frame.filename.startswith("<"):
+            continue
+
+        path = Path(frame.filename).resolve()
+        if path == _SELF_FILE:
+            continue
+        if "vllm_rbln" not in path.parts:
+            continue
+
+        return _format_callsite(frame)
+
+    return "unknown"
+
+
 # TODO(RBLN): Implement RBLN-specific backend like VllmBackend
 def rbln_backend(
     graph: fx.GraphModule, example_inputs: Sequence[Any], **kwargs: Any
@@ -93,9 +127,10 @@ def rbln_backend(
     stage = current_stage()
     log_fn = logger.warning if stage == "runtime" else logger.debug
     log_fn(
-        "rbln_backend: stage=%s #%d graph inputs=%s",
+        "rbln_backend: stage=%s #%d caller=%s graph inputs=%s",
         stage,
         compile_id,
+        _find_rbln_callsite(),
         "; ".join(parts),
     )
     return _rbln_backend(graph, example_inputs, **kwargs)
