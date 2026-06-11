@@ -25,6 +25,7 @@ except ImportError:
     has_torch_rbln = False
 
 from vllm.config.model import LogprobsMode
+from vllm.sampling_params import _SAMPLING_EPS
 from vllm.v1.outputs import LogprobsTensors, SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler as VLLMSampler
@@ -37,8 +38,6 @@ from vllm_rbln.v1.sample.ops.penalties import (
 )
 
 logger = init_logger(__name__)
-
-_SAMPLING_EPS = 1e-5
 
 
 def random_sample(
@@ -79,12 +78,6 @@ def apply_top_k_top_p(
     a dual-pivot algorithm is implemented in rebel and
     it will be used to avoid the sorting step and improve efficiency.
     """
-    # NOTE This function is used when falling back to eager execution
-    # due to RBLN compilation failure.
-    # If both k and p are None, return the argmax (greedy sampling).
-    if k is None and p is None:
-        return logits.argmax(dim=-1).view(-1)
-
     logits_sort, logits_idx = logits.sort(dim=-1, descending=False, stable=True)
     if k is not None:
         # Apply top-k.
@@ -136,6 +129,16 @@ def rbln_top_k_top_p_sample(
     probs = torch.nn.functional.softmax(logits, dim=-1)
     sampled = torch.ops.rbln.top_k_top_p(probs, k, p)
     return sampled
+
+
+def rbln_greedy_sample(logits: torch.Tensor) -> torch.Tensor:
+    """Implementation of RBLN greedy sampling.
+
+    To avoid self parameter issues when torch.compile is used,
+    we define this as a static method.
+    """
+    # NOTE(RBLN): argmax op is registered in the compiler
+    return torch.ops.rbln.argmax(logits)
 
 
 class RBLNTopKTopPSampler(nn.Module):
@@ -223,6 +226,93 @@ class RBLNSampler(VLLMSampler):
                 "Using native sampler instead."
             )
 
+        options = {
+            "compile_context": compile_context
+            if compile_context
+            else (
+                rebel.CompileContext(use_global_ctx=True)
+                if "use_global_ctx"
+                in inspect.signature(rebel.CompileContext).parameters
+                else rebel.CompileContext()
+            )
+        }
+        if envs.VLLM_RBLN_COMPILE_STRICT_MODE:
+            options["mode"] = "strict"
+
+        if has_torch_rbln:
+            options["use_global_ctx"] = True
+            options["global_device_id"] = 0
+            options["tensor_parallel_size"] = 1
+
+        self._compiled_greedy_sample = torch.compile(
+            rbln_greedy_sample,
+            dynamic=False,
+            fullgraph=True,
+            backend=rbln_backend,
+            options=options,
+        )
+
+    @torch.compiler.disable
+    def greedy_sample(self, logits: torch.Tensor) -> torch.Tensor:
+        return self._compiled_greedy_sample(logits)
+
+    def sample(
+        self,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+        logprobs_mode_override: LogprobsMode | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Sample logits based on sampling metadata.
+
+        The various logits processing functions called in this method
+        may update the logits tensor in-place.
+        """
+
+        logprobs_mode = logprobs_mode_override or self.logprobs_mode
+        assert not (sampling_metadata.all_greedy and sampling_metadata.all_random)
+        if not sampling_metadata.all_greedy:
+            greedy_sampled = None
+        else:
+            # It runs only all_greedy is True
+            greedy_sampled = self.greedy_sample(logits)
+            if sampling_metadata.all_greedy:
+                processed_logprobs = None
+                if sampling_metadata.max_num_logprobs is not None:
+                    if logprobs_mode == "processed_logits":
+                        processed_logprobs = logits
+                    elif logprobs_mode == "processed_logprobs":
+                        processed_logprobs = self.compute_logprobs(logits)
+                return greedy_sampled, processed_logprobs
+
+        assert sampling_metadata.temperature is not None
+
+        # Apply temperature.
+        logits = self.apply_temperature(
+            logits, sampling_metadata.temperature, sampling_metadata.all_random
+        )
+
+        # Apply logits processors that only apply to random sampling
+        # (argmax invariant)
+        for processor in sampling_metadata.logitsprocs.argmax_invariant:
+            logits = processor.apply(logits)
+
+        # Apply top_k and/or top_p.
+        random_sampled, processed_logprobs = self.topk_topp_sampler(
+            logits,
+            sampling_metadata.generators,
+            sampling_metadata.top_k,
+            sampling_metadata.top_p,
+        )
+
+        assert greedy_sampled is None, (
+            "Upstream vLLM runs greedy and random sampling "
+            "separately and merges the results, "
+            "but vLLM RBLN processes greedy and random requests together: "
+            "greedy requests are routed through the random-sampling path "
+            "with a very small temperature value."
+        )
+        return random_sampled, processed_logprobs
+
     def apply_penalties(
         self,
         logits: torch.Tensor,
@@ -240,13 +330,6 @@ class RBLNSampler(VLLMSampler):
                 output_token_ids,
             )
         return logits
-
-    def greedy_sample(self, logits: torch.Tensor) -> torch.Tensor:
-        # NOTE:
-        # If there are any parameters for top-k or top-p,
-        # this function works as a greedy sampler.
-        sampled, _ = self.topk_topp_sampler(logits, dict(), None, None)
-        return sampled
 
     def forward(
         self,
@@ -316,15 +399,19 @@ class RBLNSampler(VLLMSampler):
     def apply_temperature(
         self,
         logits: torch.Tensor,
-        temp: torch.Tensor,
+        temperature: torch.Tensor,
         all_random: bool,
     ) -> torch.Tensor:
         # NOTE:
         # in-place division triggers buffer key error
         # in torchinductor
+        # NOTE:
+        # Greedy requests use a small temperature (1e-3) so softmax collapses
+        # to a near one-hot at argmax. _SAMPLING_EPS (1e-5) is too small here —
+        # it pushes logits past softmax's safe exp range and overflows.
         if not all_random:
-            temp = torch.where(temp < _SAMPLING_EPS, 1.0, temp)
-        return logits.div(temp.unsqueeze(dim=1))
+            temperature = torch.where(temperature < _SAMPLING_EPS, 1e-3, temperature)
+        return logits.div(temperature.unsqueeze(dim=1))
 
 
 WARM_UP_CONFIGS = [
@@ -334,6 +421,13 @@ WARM_UP_CONFIGS = [
         "all_greedy": True,
         "all_random": False,
         "temperature": 0.0,
+    },
+    {
+        "name": "no_penalty_temp_only",
+        "no_penalties": True,
+        "all_greedy": False,
+        "all_random": True,
+        "temperature": 0.1,
     },
     {
         "name": "no_penalty_topp",
