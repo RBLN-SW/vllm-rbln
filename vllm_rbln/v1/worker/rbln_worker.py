@@ -500,6 +500,15 @@ class RBLNWorker(WorkerBase):
 
                 raise
 
+        # The D2D path of RblnNixlConnector (kv_buffer_device="rbln") defers
+        # its NIXL registration until the KV cache physical views exist,
+        # which only happens once warm-up has run the compiled model.
+        if has_kv_transfer_group():
+            connector = get_kv_transfer_group()
+            finalize = getattr(connector, "finalize_kv_cache_registration", None)
+            if finalize is not None:
+                finalize()
+
         # After warm-up: apply CPU affinity only (threads already set pre-compile).
         self._ensure_rbln_cpu_affinity_after_warmup()
         self.model_runner._enable_performance_tracker()

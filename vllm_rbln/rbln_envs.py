@@ -51,6 +51,9 @@ if TYPE_CHECKING:
     VLLM_RBLN_SUB_BLOCK_CACHE: bool = True
     VLLM_RBLN_USE_DEVICE_TENSOR: bool = False
     VLLM_RBLN_COMPILE_ONLY: bool = False
+    VLLM_RBLN_NIXL_EMULATE_HOST_XFER_NOOP: bool = False
+    VLLM_RBLN_NIXL_EMULATE_REMOTE_XFER_NOOP: bool = False
+    VLLM_RBLN_NIXL_SWA_VIEW_OPT: bool = False
 
 
 def get_dp_impl() -> str:
@@ -307,6 +310,31 @@ environment_variables = {
         lambda: (
             os.environ.get("VLLM_RBLN_COMPILE_ONLY", "False").lower() in ("true", "1")
         )
+    ),
+    # Emulation toggles for isolating KV-transfer cost components in P/D
+    # disaggregation end-to-end measurements (dev-only). Orthogonal — combine
+    # to zero out both at once.
+    #   HOST_XFER_NOOP: replace h2d/d2h copies between host_xfer_buffers and
+    #     device_kv_caches with a no-op stand-in.
+    #   REMOTE_XFER_NOOP: skip the NIXL RDMA `READ` (remote-side fetch).
+    #     Notifies P-side so its sender blocks release normally, and marks
+    #     the receiving request as done locally on the next
+    #     `_pop_done_transfers` poll.
+    "VLLM_RBLN_NIXL_EMULATE_HOST_XFER_NOOP": lambda: (
+        os.environ.get("VLLM_RBLN_NIXL_EMULATE_HOST_XFER_NOOP", "False").lower()
+        in ("true", "1")
+    ),
+    "VLLM_RBLN_NIXL_EMULATE_REMOTE_XFER_NOOP": lambda: (
+        os.environ.get("VLLM_RBLN_NIXL_EMULATE_REMOTE_XFER_NOOP", "False").lower()
+        in ("true", "1")
+    ),
+    # Publish a second SWA-sized descriptor range alongside the Full-sized
+    # range at the same NIXL base addresses, so SWA groups transfer only
+    # `sliding_window` bytes per block over RDMA. Host-side h2d/d2h still
+    # moves the full block — only the remote RDMA payload is trimmed.
+    "VLLM_RBLN_NIXL_SWA_VIEW_OPT": lambda: (
+        os.environ.get("VLLM_RBLN_NIXL_SWA_VIEW_OPT", "False").lower()
+        in ("true", "1")
     ),
 }
 
