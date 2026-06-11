@@ -438,16 +438,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 )
 
             tokens_mask = None
-            # The tokens mask only carries data-parallel padding info. With
-            # dp_size == 1 there is nothing to mask, and get_tokens_mask() would
-            # read forward_context.dp_metadata (None without DP) and call
-            # .unsqueeze on it -- raising under torch.compile and forcing a graph
-            # break. Gate on the static dp_size so the call is dropped at trace
-            # time when DP is inactive.
-            use_moe_tokens_mask = (
-                envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
-                and layer.moe_parallel_config.dp_size > 1
-            )
+            use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
             if use_moe_tokens_mask:
                 tokens_mask = get_tokens_mask(num_tokens, device=router_logits.device)
 
