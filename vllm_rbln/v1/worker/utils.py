@@ -288,6 +288,7 @@ def get_autobind_cpu_ids(
     Returns:
         Comma-separated string of CPU IDs, or "all" or "nobind".
     """
+    # NOTE: It should be checked.
     allowed_numa_nodes = get_visible_memory_node()
     logical_cpu_list = get_allowed_cpu_list()
 
