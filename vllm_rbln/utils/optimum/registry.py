@@ -127,13 +127,6 @@ def is_arch_supported(
 
 def validate_arch_supported(config: PretrainedConfig) -> None:
     """Validate the model's architecture is known to upstream vLLM.
-
-    Call this once, BEFORE any RBLN-specific architecture remap (e.g. the
-    ``Qwen3ForCausalLM`` -> ``Qwen3Model`` mapping done by the model runner):
-    the remapped name may not exist in upstream vLLM's registry, whereas the
-    original HF architecture does. Kept out of :func:`is_arch_supported` so the
-    routing predicates stay side-effect-free and are not re-validated on every
-    call.
     """
     architectures = getattr(config, "architectures", [])
     import vllm.model_executor.models as me_models
