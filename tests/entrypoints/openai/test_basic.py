@@ -20,7 +20,7 @@ import pytest
 import pytest_asyncio
 from utils import RemoteOpenAIServer
 
-MODEL_DIR = os.getenv("REBEL_VLLM_PRE_COMPILED_DIR", "./")
+MODEL_DIR = os.getenv("REBEL_VLLM_PRE_COMPILED_DIR", "/mnt/shared_data/users/ci_vllm")
 MODEL_NAME = MODEL_DIR + "/opt_125m_batch2"
 MAX_TOKENS = 1
 
@@ -34,7 +34,6 @@ def server_args(request: pytest.FixtureRequest) -> list[str]:
     >>> @pytest.mark.parametrize(
     >>>     "server_args",
     >>>     [
-    >>>         ["--disable-frontend-multiprocessing"],
     >>>         [
     >>>             "--model=NousResearch/Hermes-3-Llama-3.1-70B",
     >>>             "--enable-auto-tool-choice",
@@ -45,8 +44,7 @@ def server_args(request: pytest.FixtureRequest) -> list[str]:
     >>> def test_foo(server, client):
     >>>     ...
 
-    This will run `test_foo` twice with servers with:
-    - `--disable-frontend-multiprocessing`
+    This will run `test_foo` with a server with:
     - `--model=NousResearch/Hermes-3-Llama-3.1-70B --enable-auto-tool-choice`.
 
     """
@@ -77,16 +75,6 @@ async def client(server):
         yield async_client
 
 
-@pytest.mark.parametrize(
-    "server_args",
-    [
-        pytest.param(
-            ["--disable-frontend-multiprocessing"],
-            id="disable-frontend-multiprocessing",
-        )
-    ],
-    indirect=True,
-)
 @pytest.mark.asyncio
 async def test_request_cancellation(server: RemoteOpenAIServer):
     # clunky test: send an ungodly amount of load in with short timeouts
