@@ -31,8 +31,6 @@ if TYPE_CHECKING:
     VLLM_RBLN_DP_IMPL: str = "padded_decode"
     VLLM_RBLN_USE_MOE_TOKENS_MASK: bool = True
     VLLM_RBLN_ENFORCE_MODEL_FP32: bool = False
-    VLLM_RBLN_MOE_CUSTOM_KERNEL: bool = True
-    VLLM_RBLN_MOE_USE_OPT_KERNEL: bool = True
     VLLM_RBLN_DP_INPUT_ALL_GATHER: bool = True
     VLLM_RBLN_LOGITS_ALL_GATHER: bool = True
     VLLM_RBLN_NUM_RAY_NODES: int = 1
@@ -47,6 +45,8 @@ if TYPE_CHECKING:
     VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS: list[int] = []
     VLLM_RBLN_USE_CUSTOM_KERNEL: bool = False
     VLLM_RBLN_AUTO_PORT: bool = True
+    VLLM_RBLN_DISPATCH_ALL2ALL: bool = False
+    VLLM_RBLN_COMBINE_ALL2ALL: bool = False
     VLLM_RBLN_MOE_REDUCE_SCATTER: bool = False
     VLLM_RBLN_SUB_BLOCK_CACHE: bool = True
     VLLM_RBLN_USE_DEVICE_TENSOR: bool = False
@@ -114,6 +114,18 @@ def get_decode_batch_bucket_manual_buckets() -> list[int]:
             f"Invalid VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS: "
             f"{manual_buckets}, {e}"
         ) from e
+
+
+def use_auto_port() -> bool:
+    raw = os.environ.get("VLLM_RBLN_AUTO_PORT")
+    if raw is not None:
+        return raw.lower() in ("true", "1")
+    # Default follows device-tensor mode: auto port is on when
+    # VLLM_RBLN_USE_DEVICE_TENSOR is enabled.
+    return os.environ.get("VLLM_RBLN_USE_DEVICE_TENSOR", "False").lower() in (
+        "true",
+        "1",
+    )
 
 
 # extended environments
@@ -192,20 +204,6 @@ environment_variables = {
             in ("true", "1")
         )
     ),
-    # use moe custom kernel, by default disabled
-    "VLLM_RBLN_MOE_CUSTOM_KERNEL": (
-        lambda: (
-            os.environ.get("VLLM_RBLN_MOE_CUSTOM_KERNEL", "True").lower()
-            in ("true", "1")
-        )
-    ),
-    # enable moe optimization if RBLN_MoE_OPT is set to 1
-    "VLLM_RBLN_MOE_USE_OPT_KERNEL": (
-        lambda: (
-            os.environ.get("VLLM_RBLN_MOE_USE_OPT_KERNEL", "True").lower()
-            in ("true", "1")
-        )
-    ),
     # DP_INPUT_ALL_GATHER, use DP input all_gather
     "VLLM_RBLN_DP_INPUT_ALL_GATHER": (
         lambda: (
@@ -253,9 +251,7 @@ environment_variables = {
         os.environ.get("VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT", 1)
     ),
     # Auto port
-    "VLLM_RBLN_AUTO_PORT": (
-        lambda: os.environ.get("VLLM_RBLN_AUTO_PORT", "False").lower() in ("true", "1")
-    ),
+    "VLLM_RBLN_AUTO_PORT": use_auto_port,
     # Decode batch bucket manual buckets
     "VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS": get_decode_batch_bucket_manual_buckets,  # noqa E501
     "VLLM_RBLN_USE_CUSTOM_KERNEL": (
@@ -272,6 +268,20 @@ environment_variables = {
     ),
     "VLLM_RBLN_PROFILER": (
         lambda: os.environ.get("RBLN_PROFILER", "False").lower() in ("true", "1")
+    ),
+    # Use all2all dispatch instead of all-gather for MoE DP dispatch
+    "VLLM_RBLN_DISPATCH_ALL2ALL": (
+        lambda: (
+            os.environ.get("VLLM_RBLN_DISPATCH_ALL2ALL", "False").lower()
+            in ("true", "1")
+        )
+    ),
+    # Use all2all combine instead of reduce-scatter for MoE DP combine
+    "VLLM_RBLN_COMBINE_ALL2ALL": (
+        lambda: (
+            os.environ.get("VLLM_RBLN_COMBINE_ALL2ALL", "False").lower()
+            in ("true", "1")
+        )
     ),
     # Enable sub-block prefix caching.
     # Sub-block size equals max_num_batched_tokens (prefill chunk size).

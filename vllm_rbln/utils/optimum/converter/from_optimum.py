@@ -85,14 +85,6 @@ def sync_from_optimum(
         )
         vllm_config.scheduler_config.max_num_seqs = params.batch_size
 
-    # In case of encoder-decoder models,
-    # update max_num_seqs in encoder_scheduler_config as well
-    vllm_config.scheduler_config.max_num_batched_tokens = max(
-        vllm_config.model_config.max_model_len,
-        vllm_config.scheduler_config.max_num_seqs,
-    )
-    update_max_num_batched_tokens(vllm_config, params.max_seq_len)
-
     # Set max_model_len in model_config based on rbln_config.json
     if vllm_config.model_config.max_model_len != params.max_seq_len:
         logger.info(
@@ -103,6 +95,14 @@ def sync_from_optimum(
             params.max_seq_len,
         )
         vllm_config.model_config.max_model_len = params.max_seq_len
+
+    # In case of encoder-decoder models,
+    # update max_num_seqs in encoder_scheduler_config as well
+    vllm_config.scheduler_config.max_num_batched_tokens = max(
+        vllm_config.model_config.max_model_len,
+        vllm_config.scheduler_config.max_num_seqs,
+    )
+    update_max_num_batched_tokens(vllm_config, params.max_seq_len)
 
     # Set block_size in cache_config based on rbln_config.json
     update_block_size(vllm_config, params.kvcache_block_size, params.prefill_chunk_size)
