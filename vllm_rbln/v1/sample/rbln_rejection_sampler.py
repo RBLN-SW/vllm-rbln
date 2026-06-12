@@ -309,7 +309,11 @@ class RBLNRejectionSampler(RejectionSampler):
         )
         recovered_token_ids = recovered_token_ids.to(cpu_device)
         num_accepted = num_accepted.to(cpu_device)
-
+        # NOTE(RBLN): The NPU primitive may occasionally return a negative
+        # num_accepted. Clamp to 0 so downstream masks stay valid (a negative
+        # value would make accepted_pos_mask empty and shift the recovery
+        # position out of range).
+        num_accepted = num_accepted.clamp(min=0)
         # ------------------------------------------------------------------
         # 3) Compose per-position output for the first K columns:
         #      j < num_accepted[i]          -> draft token (accepted as-is)
@@ -374,6 +378,29 @@ class RBLNRejectionSampler(RejectionSampler):
         output_token_ids[~active_mask, 0] = bonus[~active_mask]
         # FIXME For now, to be consistent with the cpu sampler..
         result = output_token_ids.to(torch.int32)
+
+        # DEBUG(RBLN): verify the empty-row hypothesis behind the spurious
+        # `assert num_tokens_scheduled > 0` crash in vllm core.
+        # RejectionSampler.parse_output keeps only tokens that are
+        # (!= PLACEHOLDER_TOKEN_ID) & (< vocab_size). For an active spec row
+        # (num_draft_tokens[i] = D >= 1) the scheduler expects 1..D+1 such valid
+        # tokens. If a row yields 0 (all rejected + invalid recovered token) the
+        # scheduler skips its rejection rollback; if it yields > D+1, num_rejected
+        # goes negative. Either way num_computed_tokens over-advances and the next
+        # step schedules 0 tokens. This assert pinpoints the offending row.
+        _valid_per_row = ((result != PLACEHOLDER_TOKEN_ID) & (result < vocab_size)).sum(
+            dim=1
+        )
+        _hi = num_draft_tokens_t + 1
+        _bad = active_mask & ((_valid_per_row < 1) | (_valid_per_row > _hi))
+        assert not _bad.any(), (
+            "rejection sampler valid-token count out of range for active rows "
+            f"{_bad.nonzero().flatten().tolist()}: "
+            f"valid_per_row={_valid_per_row[_bad].tolist()}, "
+            f"num_draft_tokens={num_draft_tokens_t[_bad].tolist()}, "
+            f"num_accepted={num_accepted_per_batch[_bad].tolist()}, "
+            f"vocab_size={vocab_size}"
+        )
         return result
 
 
