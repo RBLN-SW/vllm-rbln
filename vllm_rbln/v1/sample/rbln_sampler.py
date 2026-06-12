@@ -12,18 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # isort: off
-import inspect
 import torch
 import torch.nn as nn
 from vllm.sampling_params import _SAMPLING_EPS
 from vllm_rbln.v1.sample.ops.logprobs import batched_count_greater_than
-
-try:
-    import torch.rbln
-
-    has_torch_rbln = True
-except ImportError:
-    has_torch_rbln = False
 
 from vllm_rbln.logger import init_logger
 from vllm_rbln.torch_compile_backend import logged_rbln_backend
@@ -35,40 +27,10 @@ from vllm.v1.outputs import LogprobsTensors, SamplerOutput
 from vllm_rbln.v1.sample.ops.penalties import (
     apply_all_penalties as rbln_apply_all_penalties,
 )
+from vllm_rbln.v1.worker.utils import resolve_compile_context, build_compile_options
 import vllm_rbln.rbln_envs as envs
 
 logger = init_logger(__name__)
-
-
-def resolve_compile_context(
-    compile_context: rebel.CompileContext | None,
-) -> rebel.CompileContext:
-    """Return a default CompileContext when one is not provided.
-
-    Used when running through the device tensor path in rbln_model_runner or
-    when triggered by optimum_model_runner.
-    """
-    if compile_context is not None:
-        return compile_context
-    if "use_global_ctx" in inspect.signature(rebel.CompileContext).parameters:
-        return rebel.CompileContext(use_global_ctx=True)
-    return rebel.CompileContext()
-
-
-def build_compile_options(compile_context: rebel.CompileContext) -> dict:
-    """Build the torch.compile ``options`` dict shared by the RBLN samplers."""
-    use_dt = envs.VLLM_RBLN_USE_DEVICE_TENSOR
-    options: dict = {}
-    if not use_dt:
-        options["compile_context"] = compile_context
-    if envs.VLLM_RBLN_COMPILE_STRICT_MODE:
-        options["mode"] = "strict"
-    if has_torch_rbln or use_dt:
-        options["tensor_parallel_size"] = 1
-        if not use_dt:
-            options["use_global_ctx"] = True
-            options["global_device_id"] = 0
-    return options
 
 
 def rbln_top_k_top_p_sample(

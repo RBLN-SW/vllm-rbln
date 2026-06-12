@@ -13,14 +13,22 @@
 # limitations under the License.
 """CPU affinity utilities for RBLN worker."""
 
+import inspect
 import math
 import os
 import platform
 from collections import defaultdict
 from collections.abc import Callable
 
-import numpy as np
+import rebel
 import torch
+
+try:
+    import torch.rbln
+
+    has_torch_rbln = True
+except ImportError:
+    has_torch_rbln = False
 from vllm.config import ModelConfig, ParallelConfig
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.platforms import CpuArchEnum, current_platform
@@ -576,3 +584,39 @@ def get_kv_cache_names(
         for layer_name in layer_names:
             kv_cache_names.append(layer_name)
     return kv_cache_names
+
+
+def resolve_compile_context(
+    compile_context: rebel.CompileContext | None,
+) -> rebel.CompileContext | None:
+    """Return a default CompileContext when one is not provided.
+
+    Used when running through the device tensor path in rbln_model_runner or
+    when triggered by optimum_model_runner.
+    """
+    use_dt = envs.VLLM_RBLN_USE_DEVICE_TENSOR
+    if use_dt:
+        return None
+    if compile_context is not None:
+        return compile_context
+    if "use_global_ctx" in inspect.signature(rebel.CompileContext).parameters:
+        return rebel.CompileContext(use_global_ctx=True)
+    if "use_weight_sharing" in inspect.signature(rebel.CompileContext).parameters:
+        return rebel.CompileContext(use_weight_sharing=True)
+    return rebel.CompileContext()
+
+
+def build_compile_options(compile_context: rebel.CompileContext) -> dict:
+    """Build the torch.compile ``options`` dict shared by the RBLN samplers."""
+    use_dt = envs.VLLM_RBLN_USE_DEVICE_TENSOR
+    options: dict = {}
+    if not use_dt:
+        options["compile_context"] = compile_context
+    if envs.VLLM_RBLN_COMPILE_STRICT_MODE:
+        options["mode"] = "strict"
+    if has_torch_rbln or use_dt:
+        options["tensor_parallel_size"] = 1
+        if not use_dt:
+            options["use_global_ctx"] = True
+            options["global_device_id"] = 0
+    return options
