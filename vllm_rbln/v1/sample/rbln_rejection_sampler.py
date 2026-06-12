@@ -25,6 +25,7 @@ from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
 from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.worker.utils import build_compile_options, resolve_compile_context
+import vllm_rbln.rbln_envs as envs
 
 logger = init_logger(__name__)
 
