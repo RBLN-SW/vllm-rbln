@@ -245,12 +245,8 @@ def unquantized_fused_moe_method_custom(
     up_proj_weight = layer.w13_weight[:, intermediate_size:, :]
     down_proj_weight = layer.w2_weight
 
-    # expected tensor shape - [num_tokens, -1]
     hidden_states = x.reshape(num_tokens, -1)
-    masked_routing_weights = router_logits.reshape(num_tokens, -1)
-
-    # transpose to [num_experts, num_tokens] for custom_moe_glu
-    masked_routing_weights_t = masked_routing_weights.transpose(0, 1)
+    masked_routing_weights = router_logits
 
     expert_map_const = None
     if layer.expert_map is not None:
@@ -264,7 +260,7 @@ def unquantized_fused_moe_method_custom(
         gate_proj_weight,
         up_proj_weight,
         down_proj_weight,
-        masked_routing_weights_t,
+        masked_routing_weights,
         expert_map_const,
         None,
         None,
