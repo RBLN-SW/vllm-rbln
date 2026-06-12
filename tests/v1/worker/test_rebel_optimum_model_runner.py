@@ -63,11 +63,11 @@ def get_vllm_config(async_scheduling=False):
         cache_config=cache_config,
         model_config=model_config,
         scheduler_config=scheduler_config,
-        # FIXME: prefill_chunk_size vs. prefix_block_size
         additional_config={
+            "prefix_block_size": 4,
             "rbln_config": {
-                "prefill_chunk_size": BLOCK_SIZE // 2,
-            }
+                "prefill_chunk_size": 4,
+            },
         },
     )
     return vllm_config
