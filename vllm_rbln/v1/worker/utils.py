@@ -559,11 +559,14 @@ def resolve_compile_context(
     return rebel.CompileContext()
 
 
-def build_compile_options(compile_context: rebel.CompileContext) -> dict:
+def build_compile_options(compile_context: rebel.CompileContext | None) -> dict:
     """Build the torch.compile ``options`` dict shared by the RBLN samplers."""
     use_dt = envs.VLLM_RBLN_USE_DEVICE_TENSOR
     options: dict = {}
     if not use_dt:
+        assert compile_context is not None, (
+            "compile_context must be set when VLLM_RBLN_USE_DEVICE_TENSOR=0"
+        )
         options["compile_context"] = compile_context
     if envs.VLLM_RBLN_COMPILE_STRICT_MODE:
         options["mode"] = "strict"
