@@ -936,3 +936,116 @@ class TestBackfillVariableLengthPadding:
         assert sched_out.num_scheduled_tokens[rid] == 2
         # Drafts trimmed to (new_n - 1) = 1 kept.
         assert sched_out.scheduled_spec_decode_tokens[rid] == [11]
+
+
+# ---------------------------------------------------------------------------
+# Issue 1: a prompt shorter than num_spec_tokens has too few committed
+# positions to backfill a full speculative window (desired_slide >
+# available_past). That is a SUBSET of the can't-backfill condition, so the
+# scheduler must elect no-spec instead of crashing on the old hard assert.
+# ---------------------------------------------------------------------------
+
+
+class TestShortPromptNoSpecFallback:
+    def test_short_prompt_elects_no_spec_not_assert(self):
+        """prompt (2) < num_spec_tokens (3). After one decode num_computed=2,
+        but a full window needs to slide back desired_slide=3 positions
+        (available_past=2 < 3). The old code asserted ("prompt shorter than
+        num_spec_tokens") and crashed the engine. Since available_past >=
+        tokens_used_in_block always holds, this case is just a cross-block
+        backfill that can't reach full spec -> it must elect no-spec.
+
+        BEFORE FIX (bug reproduced): with the hard
+        ``assert desired_slide <= available_past`` still present in
+        rbln_scheduler.py (Issue 1), ``scheduler.schedule()`` below raises
+        ``AssertionError: ... prompt is shorter than num_spec_tokens`` and the
+        engine crashes -> this test FAILS.
+        AFTER FIX: that assert is removed; control falls through to the
+        cross-block branch which elects no-spec -> this test PASSES.
+        """
+        scheduler = _scheduler()  # ngram (variable-length)
+        assert scheduler.vllm_config.speculative_config.method == "ngram"
+        req = _request(2, "A")  # prompt < num_spec_tokens
+        advance_to_decode(scheduler, req)
+        assert req.num_computed_tokens == 2
+        req.spec_token_ids = []  # no drafts -> desired_slide = num_spec = 3
+
+        # Must NOT raise AssertionError ("prompt is shorter than ...").
+        sched_out = scheduler.schedule()
+
+        rid = req.request_id
+        assert sched_out.step_no_spec_required is True
+        # cross-block / short-prompt must NOT record an in-block slide
+        assert rid not in sched_out.spec_decode_slide_distance
+
+    # NOTE: a fixed-length proposer cannot reach the short-prompt
+    # can't-backfill condition: it always supplies num_spec drafts, so
+    # desired_slide = (num_spec+1) - (1 + num_spec) = 0 and the sliding block is
+    # skipped entirely. The only way fixed-length reaches the cross-block guard
+    # (and must fail loudly) is the misaligned max_model_len edge, covered by
+    # TestCrossBlockNoSpecFallback.test_fixed_length_maxlen_edge_threshold.
+
+
+# ---------------------------------------------------------------------------
+# Issue 2: on a cross-block no-spec step the scheduler optimistically advances
+# num_computed_tokens by (1 bonus + num_drafts) in _update_after_schedule. The
+# runner's no-spec scrub must NOT clear scheduled_spec_decode_tokens, because
+# the engine's update_from_output reads it to roll the draft advance back
+# (num_rejected = num_draft_tokens - num_accepted). Clearing it strands the
+# advance and over-counts num_computed_tokens by the dropped draft count on
+# EVERY cross-block no-spec step.
+# ---------------------------------------------------------------------------
+
+from tests.torch_compile.unit.v1.core.utils import create_runner_output  # noqa: E402
+from vllm_rbln.v1.worker.rbln_model_runner import (  # noqa: E402
+    scrub_scheduler_output_for_no_spec,
+)
+
+
+class TestCrossBlockNoSpecRollback:
+    def test_cross_block_no_spec_rolls_back_num_computed(self):
+        """Reproduces the reported Issue 2 (observed, not hypothetical).
+
+        BEFORE FIX (bug reproduced): with
+        ``scheduler_output.scheduled_spec_decode_tokens.clear()`` still present
+        in ``scrub_scheduler_output_for_no_spec``, the cleared dict makes the
+        engine's ``update_from_output`` skip the draft rollback, so the final
+        assert sees ``num_computed_tokens == 1026`` (1024 + 1 bonus + 1
+        never-verified draft) and this test FAILS (``1026 == 1025``).
+        AFTER FIX: the clear is removed (the dict survives for the rollback) and
+        ``_prepare_inputs`` is told to take the no-spec path via
+        ``spec_decode_max_query_len==1`` instead, so the draft is rolled back to
+        ``num_computed_tokens == 1025`` and this test PASSES.
+        """
+        scheduler = _scheduler()  # ngram (variable-length)
+        req = _request(_BLOCK_SIZE, "A")  # decode starts at a fresh block entry
+        advance_to_decode(scheduler, req)
+        assert req.num_computed_tokens == _BLOCK_SIZE  # 1024
+
+        # 1 draft at a fresh block entry: old_n = 1 bonus + 1 draft = 2,
+        # desired_slide = (num_spec+1) - 2 = 2 > used_in_block(0) -> cross-block
+        # -> no-spec, but a draft WAS scheduled (so there is something to roll
+        # back).
+        req.spec_token_ids = [777]
+
+        sched_out = scheduler.schedule()
+        rid = req.request_id
+        assert sched_out.step_no_spec_required is True
+        # _update_after_schedule advanced num_computed optimistically by old_n=2
+        # (1 bonus + 1 draft); not yet rolled back.
+        assert req.num_computed_tokens == _BLOCK_SIZE + 2  # 1026
+        # the scheduler must keep the draft recorded for the rollback below
+        assert sched_out.scheduled_spec_decode_tokens[rid] == [777]
+
+        # The runner forces query_len=1 for the collective no-spec step.
+        scrub_scheduler_output_for_no_spec(sched_out)
+        assert sched_out.num_scheduled_tokens[rid] == 1
+
+        # The model emits a single (no-spec) token; the engine must roll the
+        # never-verified draft back out of num_computed_tokens.
+        scheduler.update_from_output(sched_out, create_runner_output(sched_out, 1))
+
+        # Correct: 1024 prompt + 1 real decoded token = 1025. The dropped draft
+        # is rolled back. BUG (scheduled_spec_decode_tokens cleared in the
+        # scrub): rollback is skipped and it stays at 1026.
+        assert req.num_computed_tokens == _BLOCK_SIZE + 1  # 1025
