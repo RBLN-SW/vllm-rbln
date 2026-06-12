@@ -120,23 +120,35 @@ def is_arch_supported(
     config: PretrainedConfig, model_set: dict[str, tuple[str, str]]
 ) -> bool:
     architectures = getattr(config, "architectures", [])
-    import vllm.model_executor.models as me_models
-
-    registry = me_models.ModelRegistry
-    supported_archs = registry.get_supported_archs()
-    if not any(arch in supported_archs for arch in architectures):
-        raise ValueError(
-            f"Model architectures {architectures} are not supported on upstream vLLM "
-            f"for now. Supported architectures: "
-            f"{supported_archs}"
-        )
     return any(
         arch in _RBLN_SUPPORTED_MODELS and arch in model_set for arch in architectures
     )
 
 
+def validate_arch_supported(config: PretrainedConfig) -> None:
+    """Validate the model's architecture is known to upstream vLLM.
+
+    Call this once, BEFORE any RBLN-specific architecture remap (e.g. the
+    ``Qwen3ForCausalLM`` -> ``Qwen3Model`` mapping done by the model runner):
+    the remapped name may not exist in upstream vLLM's registry, whereas the
+    original HF architecture does. Kept out of :func:`is_arch_supported` so the
+    routing predicates stay side-effect-free and are not re-validated on every
+    call.
+    """
+    architectures = getattr(config, "architectures", [])
+    import vllm.model_executor.models as me_models
+
+    supported_archs = me_models.ModelRegistry.get_supported_archs()
+    if not any(arch in supported_archs for arch in architectures):
+        raise ValueError(
+            f"Model architectures {architectures} are not supported on upstream "
+            f"vLLM for now. Supported architectures: {supported_archs}"
+        )
+
+
 def get_rbln_model_info(config: PretrainedConfig) -> tuple[str, str]:
     architectures = getattr(config, "architectures", [])
+
     for arch in architectures:
         if arch in _RBLN_SUPPORTED_MODELS:
             model_name, model_cls_name = _RBLN_SUPPORTED_MODELS[arch]
