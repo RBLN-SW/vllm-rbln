@@ -23,12 +23,8 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
-import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
-from vllm_rbln.v1.sample.rbln_sampler import (
-    build_compile_options,
-    resolve_compile_context,
-)
+from vllm_rbln.v1.worker.utils import build_compile_options, resolve_compile_context
 
 logger = init_logger(__name__)
 
