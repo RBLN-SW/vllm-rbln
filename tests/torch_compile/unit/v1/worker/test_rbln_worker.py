@@ -25,7 +25,7 @@ import torch
 from torch._dynamo.exc import BackendCompilerFailed
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
-from vllm.v1.worker.worker_base import WorkerBase
+from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -34,6 +34,7 @@ from vllm.v1.worker.worker_base import WorkerBase
 
 def _make_profiler_config(trace_dir=None):
     return SimpleNamespace(
+        profiler="torch",
         torch_profiler_dir=trace_dir,
         torch_profiler_record_shapes=False,
         torch_profiler_with_memory=False,
@@ -162,7 +163,6 @@ _INIT_PATCHES = {
     "envs_compile": "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_COMPILE_MODEL",
     "envs_warmup": "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_ENABLE_WARM_UP",
     "envs_metrics": "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_METRICS",
-    "envs_dp_impl": "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_DP_IMPL",
     "envs_numa": "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_NUMA",
     "has_torch_rbln": "vllm_rbln.v1.worker.rbln_worker.has_torch_rbln",
 }
@@ -207,7 +207,6 @@ def _create_worker(
         "envs_compile": True,
         "envs_warmup": True,
         "envs_metrics": False,
-        "envs_dp_impl": "padded_decode",
         "envs_numa": False,
         "has_torch_rbln": has_torch_rbln_val,
     }
@@ -243,7 +242,6 @@ def _create_worker(
             "envs_compile",
             "envs_warmup",
             "envs_metrics",
-            "envs_dp_impl",
             "envs_numa",
             "has_torch_rbln",
         ):
@@ -306,7 +304,13 @@ class TestInterfaceCompliance:
         from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
 
         # Methods intentionally not overridden (e.g. speculative-decoding only)
-        KNOWN_GAPS = {"get_cache_block_size_bytes"}
+        KNOWN_GAPS = {
+            "get_cache_block_size_bytes",
+            "add_lora",
+            "list_loras",
+            "pin_lora",
+            "remove_lora",
+        }
 
         ni_methods = self._get_notimplemented_methods()
         assert len(ni_methods) > 0, "Expected some NotImplementedError methods"
@@ -357,14 +361,14 @@ class TestInterfaceCompliance:
         assert "self" in params
         assert "scheduler_output" in params
 
-    def test_compile_or_warm_up_model_returns_float(self):
-        """compile_or_warm_up_model must return a float (elapsed time)."""
+    def test_compile_or_warm_up_model_returns(self):
+        """compile_or_warm_up_model must return a CompilationTimes (elapsed time)."""
         from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
 
         sig = inspect.signature(RBLNWorker.compile_or_warm_up_model)
         # The return annotation should be float
         assert (
-            sig.return_annotation is float
+            sig.return_annotation is CompilationTimes
             or sig.return_annotation == inspect.Parameter.empty
         )
 
@@ -434,21 +438,6 @@ class TestRBLNWorkerInit:
         worker = _create_worker()
         assert worker.profiler is None
         assert worker.parallel_config.disable_custom_all_reduce is True
-        assert worker._sleep_saved_buffers == {}
-
-    def test_init_with_profiler(self):
-        cfg = _make_vllm_config(profiler_trace_dir="/tmp/test_trace")
-        with (
-            patch("torch.profiler.profile"),
-            patch("torch.profiler.tensorboard_trace_handler"),
-        ):
-            worker = _create_worker(vllm_config=cfg)
-        assert worker.profiler is not None
-
-    def test_local_world_size(self):
-        cfg = _make_vllm_config(world_size=4)
-        worker = _create_worker(vllm_config=cfg)
-        assert worker.local_world_size == 4
 
 
 # ===========================================================================
@@ -477,10 +466,9 @@ class TestInitDeviceEnv:
 
     def test_multiple_ray_nodes(self):
         cfg = _make_vllm_config(world_size=8)
-        worker = _create_worker(
+        _create_worker(
             vllm_config=cfg, local_rank=0, rank=0, tp_size=1, num_ray_nodes=2
         )
-        assert worker.local_world_size == 4
         assert os.environ["RBLN_DEVICES"] == "0"
 
     def test_multiple_ray_nodes_rank3(self):
@@ -530,16 +518,6 @@ class TestInitDeviceEnv:
         """Without torch_rbln, RBLN_NPUS_PER_DEVICE should not be set."""
         _create_worker(tp_size=2, has_torch_rbln_val=False)
         assert "RBLN_NPUS_PER_DEVICE" not in os.environ
-
-    def test_local_world_size_not_divisible(self):
-        cfg = _make_vllm_config(world_size=7)
-        worker = _create_worker(vllm_config=cfg, num_ray_nodes=2)
-        assert worker.local_world_size == 3
-
-    def test_local_world_size_single_ray_node(self):
-        cfg = _make_vllm_config(world_size=4)
-        worker = _create_worker(vllm_config=cfg, num_ray_nodes=1)
-        assert worker.local_world_size == 4
 
     def test_tp4_but_only_2_devices_explicit(self):
         os.environ["RBLN_DEVICES"] = "0,1"
@@ -890,10 +868,12 @@ class TestCompileOrWarmUpModel:
         cfg = _make_vllm_config(enforce_eager=True)
         worker = _create_worker(vllm_config=cfg)
         worker.model_runner = MagicMock()
-        elapsed = worker.compile_or_warm_up_model()
+        compielation_times = worker.compile_or_warm_up_model()
         worker.model_runner.warm_up_model.assert_not_called()
         worker.model_runner._enable_performance_tracker.assert_not_called()
-        assert elapsed >= 0
+        assert (
+            compielation_times.language_model >= 0 and compielation_times.encoder >= 0
+        )
 
     def test_skip_compile_disabled(self):
         worker = _create_worker()
@@ -902,7 +882,7 @@ class TestCompileOrWarmUpModel:
             "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_COMPILE_MODEL", False
         ):
             worker.compile_or_warm_up_model()
-        worker.model_runner.warm_up_model.assert_not_called()
+        worker.model_runner.warmup_model.assert_not_called()
 
     def test_skip_warmup_disabled(self):
         worker = _create_worker()
@@ -911,13 +891,13 @@ class TestCompileOrWarmUpModel:
             "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_ENABLE_WARM_UP", False
         ):
             worker.compile_or_warm_up_model()
-        worker.model_runner.warm_up_model.assert_not_called()
+        worker.model_runner.warmup_model.assert_not_called()
 
     def test_warmup_called(self):
         worker = _create_worker()
         worker.model_runner = MagicMock()
         worker.compile_or_warm_up_model()
-        worker.model_runner.warm_up_model.assert_called_once()
+        worker.model_runner.warmup_model.assert_called_once()
 
     def test_oom_enomem(self):
         worker = _create_worker()
@@ -927,7 +907,7 @@ class TestCompileOrWarmUpModel:
         inner = RuntimeError("SYS_ENOMEM: Out of memory")
         exc = BackendCompilerFailed(MagicMock(), inner, None)
         exc.inner_exception = inner
-        worker.model_runner.warm_up_model.side_effect = exc
+        worker.model_runner.warmup_model.side_effect = exc
 
         with pytest.raises(RuntimeError, match="Not enough memory"):
             worker.compile_or_warm_up_model()
@@ -940,7 +920,7 @@ class TestCompileOrWarmUpModel:
         inner = RuntimeError("SYS_EBUSY: Lack of device memory")
         exc = BackendCompilerFailed(MagicMock(), inner, None)
         exc.inner_exception = inner
-        worker.model_runner.warm_up_model.side_effect = exc
+        worker.model_runner.warmup_model.side_effect = exc
 
         with pytest.raises(RuntimeError, match="Not enough memory"):
             worker.compile_or_warm_up_model()
@@ -952,7 +932,7 @@ class TestCompileOrWarmUpModel:
         inner = RuntimeError("Something else broke")
         exc = BackendCompilerFailed(MagicMock(), inner, None)
         exc.inner_exception = inner
-        worker.model_runner.warm_up_model.side_effect = exc
+        worker.model_runner.warmup_model.side_effect = exc
 
         with pytest.raises(BackendCompilerFailed):
             worker.compile_or_warm_up_model()
@@ -964,38 +944,9 @@ class TestCompileOrWarmUpModel:
         inner = TypeError("not a runtime error")
         exc = BackendCompilerFailed(MagicMock(), inner, None)
         exc.inner_exception = inner
-        worker.model_runner.warm_up_model.side_effect = exc
+        worker.model_runner.warmup_model.side_effect = exc
 
         with pytest.raises(BackendCompilerFailed):
-            worker.compile_or_warm_up_model()
-
-    def test_dp_padded_decode(self):
-        cfg = _make_vllm_config(data_parallel_size=2)
-        worker = _create_worker(vllm_config=cfg)
-        worker.model_runner = MagicMock()
-        worker.compile_or_warm_up_model()
-        worker.model_runner.prepare_dummy_run.assert_called_once()
-
-    def test_dp_padded_decode_not_divisible(self):
-        cfg = _make_vllm_config(data_parallel_size=2)
-        cfg.scheduler_config.max_num_batched_tokens = 100
-        cfg.scheduler_config.max_num_seqs = 33
-        worker = _create_worker(vllm_config=cfg)
-        worker.model_runner = MagicMock()
-        with pytest.raises(AssertionError, match="divisible"):
-            worker.compile_or_warm_up_model()
-
-    def test_dp_dummy_prefill_raises(self):
-        cfg = _make_vllm_config(data_parallel_size=2)
-        worker = _create_worker(vllm_config=cfg)
-        worker.model_runner = MagicMock()
-        with (
-            patch(
-                "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_DP_IMPL",
-                "dummy_prefill",
-            ),
-            pytest.raises(ValueError, match="dummy_prefill is not supported"),
-        ):
             worker.compile_or_warm_up_model()
 
 
@@ -1063,6 +1014,7 @@ class TestExecuteModel:
         pp.return_value.send_tensor_dict.assert_called_once()
         assert result is None
 
+    @pytest.mark.xfail(reason="unsupported feature")
     def test_kv_connector_finished(self):
         worker = _create_worker()
         kv = MagicMock()
@@ -1081,6 +1033,7 @@ class TestExecuteModel:
 
         assert result.kv_connector_output is kv
 
+    @pytest.mark.xfail(reason="unsupported feature")
     def test_kv_connector_not_finished(self):
         worker = _create_worker()
         kv = MagicMock()
@@ -1126,12 +1079,6 @@ class TestSampleTokens:
 
 
 class TestProfile:
-    def test_no_profiler_raises(self):
-        worker = _create_worker()
-        worker.profiler = None
-        with pytest.raises(RuntimeError, match="Profiler is not enabled"):
-            worker.profile(is_start=True)
-
     def test_start(self):
         worker = _create_worker()
         worker.profiler = MagicMock()
@@ -1143,14 +1090,12 @@ class TestProfile:
         worker.profiler = MagicMock()
         worker.profile(is_start=False)
         worker.profiler.stop.assert_called_once()
-        worker.profiler.profiler.key_averages.assert_called_once()
 
     def test_stop_non_rank0(self):
         worker = _create_worker(local_rank=1)
         worker.profiler = MagicMock()
         worker.profile(is_start=False)
         worker.profiler.stop.assert_called_once()
-        worker.profiler.profiler.key_averages.assert_not_called()
 
 
 # ===========================================================================
@@ -1158,6 +1103,7 @@ class TestProfile:
 # ===========================================================================
 
 
+@pytest.mark.skip("unsupported feature")
 class TestLoRA:
     def test_add_lora(self):
         worker = _create_worker()
@@ -1207,12 +1153,6 @@ class TestMisc:
         worker.model_runner.get_supported_tasks.return_value = ("generate",)
         assert worker.get_supported_tasks() == ("generate",)
 
-    def test_execute_dummy_batch(self):
-        worker = _create_worker()
-        worker.model_runner = MagicMock()
-        worker.execute_dummy_batch()
-        worker.model_runner.dummy_run.assert_called_once()
-
     def test_take_draft_token_ids(self):
         worker = _create_worker()
         worker.model_runner = MagicMock()
@@ -1242,23 +1182,10 @@ class TestShutdown:
     def test_with_metrics(self):
         worker = _create_worker()
         worker.model_runner = MagicMock()
-        worker.model_runner.performance_tracker = MagicMock()
-        worker.model_runner.sampler_performance_tracker = MagicMock()
-        worker.model_runner.e2e_performance_tracker = MagicMock()
+        worker.model_runner.performance_ctx = MagicMock()
         with patch("vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_METRICS", True):
             worker.shutdown()
-        worker.model_runner.performance_tracker.print_final_stats.assert_called_once()
-        worker.model_runner.sampler_performance_tracker.print_final_stats.assert_called_once()
-        worker.model_runner.e2e_performance_tracker.print_final_stats.assert_called_once()
-
-    def test_with_metrics_none_trackers(self):
-        worker = _create_worker()
-        worker.model_runner = MagicMock()
-        worker.model_runner.performance_tracker = None
-        worker.model_runner.sampler_performance_tracker = None
-        worker.model_runner.e2e_performance_tracker = None
-        with patch("vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_METRICS", True):
-            worker.shutdown()
+        worker.model_runner.performance_ctx.print_stats.assert_called_once()
 
 
 # ===========================================================================

@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import torch
-from vllm.v1.attention.backends.utils import CommonAttentionMetadata
+from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer

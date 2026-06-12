@@ -52,25 +52,9 @@ def register_ops():
         apply_registered_patches()
 
         # import vllm_rbln.distributed.kv_transfer.kv_connector.factory  # noqa
-        # import vllm_rbln.forward_context  # noqa
         # import vllm_rbln.lora.layer  # noqa
-        # import vllm_rbln.model_executor.layers.fused_moe.layer  # noqa
-        # import vllm_rbln.model_executor.layers.fused_moe.shared_fused_moe  # noqa
-        # import vllm_rbln.model_executor.layers.logits_processor  # noqa
         # import vllm_rbln.model_executor.layers.quantization.kernels.mixed_precision  # noqa
-        # import vllm_rbln.model_executor.layers.quantization.mxfp4  # noqa
-        # import vllm_rbln.model_executor.layers.quantization.fp8  # noqa
         # import vllm_rbln.model_executor.layers.rotary_embedding.deepseek_scaling_rope  # noqa
         # import vllm_rbln.model_executor.model_loader.weight_loader  # noqa
         # import vllm_rbln.models.deepseek_v2  # noqa
-        # import vllm_rbln.models.gpt_oss  # noqa
-        # import vllm_rbln.models.qwen2  # noqa
-        # import vllm_rbln.models.qwen2_moe  # noqa
-        # import vllm_rbln.models.qwen3  # noqa
-        # import vllm_rbln.models.qwen3_moe  # noqa
         # import vllm_rbln.models.minimax_m2  # noqa
-        # from vllm_rbln.triton_kernels import attention  # noqa
-        # from vllm_rbln.triton_kernels import causal_attention  # noqa
-        # from vllm_rbln.triton_kernels import flash_attention  # noqa
-        # from vllm_rbln.triton_kernels import flash_causal_attention  # noqa
-        # from vllm_rbln.triton_kernels import sliding_window_attention  # noqa
