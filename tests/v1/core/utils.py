@@ -100,9 +100,7 @@ def create_scheduler(
         cache_config=cache_config,
         structured_outputs_config=structured_outputs_config,
         additional_config={
-            "attn_block_size": outer_block_size,
             "prefix_block_size": block_size,
-            # FIXME: prefill_chunk_size vs. prefix_block_size
             "rbln_config": {
                 "prefill_chunk_size": block_size,
             },
