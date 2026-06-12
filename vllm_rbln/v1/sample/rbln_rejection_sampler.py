@@ -15,6 +15,8 @@
 # Copied from vllm.v1.sample.rejection_sampler: https://github.com/vllm-project/vllm/blob/v0.13.0/vllm/v1/sample/rejection_sampler.py
 # Search for NOTE(RBLN) or TODO(RBLN) for details
 
+import contextlib
+import time
 from dataclasses import replace
 
 import torch
@@ -24,6 +26,7 @@ from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
 from vllm_rbln.logger import init_logger
+from vllm_rbln.v1.worker.metrics import PerformanceTracker, collect_metrics
 from vllm_rbln.v1.worker.utils import build_compile_options, resolve_compile_context
 
 logger = init_logger(__name__)
@@ -57,6 +60,8 @@ def rbln_rejection_sample(
 # - apply_bad_words_with_drafts
 # - apply_all_penalties
 class RBLNRejectionSampler(RejectionSampler):
+    rej_sampler_performance_tracker = PerformanceTracker("REJ_SAMPLER")
+
     def __init__(self, *args, **kwargs):
         compile_context = kwargs.pop("compile_context", None)
         super().__init__(*args, **kwargs)
@@ -155,17 +160,31 @@ class RBLNRejectionSampler(RejectionSampler):
             target_probs = target_logits
         else:
             target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
-
-        output_token_ids = self.rejection_sample(
-            metadata.draft_token_ids,
-            metadata.num_draft_tokens,
-            metadata.max_spec_len,
-            metadata.cu_num_draft_tokens,
-            draft_probs,
-            target_probs,
-            bonus_token_ids,
-            sampling_metadata,
-        )
+        if hasattr(rebel, "capture_reports"):
+            capture_ctx = rebel.capture_reports()
+        else:
+            # use a dummy context manager that does nothing
+            capture_ctx = contextlib.nullcontext()
+        with capture_ctx as sampler_outputs:
+            sampler_start_time = time.perf_counter()
+            output_token_ids = self.rejection_sample(
+                metadata.draft_token_ids,
+                metadata.num_draft_tokens,
+                metadata.max_spec_len,
+                metadata.cu_num_draft_tokens,
+                draft_probs,
+                target_probs,
+                bonus_token_ids,
+                sampling_metadata,
+            )
+            collect_metrics(
+                self.rej_sampler_performance_tracker,
+                True,
+                start_time=sampler_start_time,
+                end_time=time.perf_counter(),
+                reports=sampler_outputs,
+                token_count=0,
+            )
 
         logprobs_tensors = None
         if sampling_metadata.max_num_logprobs is not None:
@@ -208,15 +227,7 @@ class RBLNRejectionSampler(RejectionSampler):
         batch_size = len(num_draft_tokens)
         num_tokens = draft_token_ids.shape[0]
         vocab_size = target_probs.shape[-1]
-        # # NOTE(eunji.lee):
-        # # Currently, rejection sampler only available in cpu input tensor
-        # if envs.VLLM_RBLN_USE_DEVICE_TENSOR == 1:
-        #     logger.warning_once(
-        #         "VLLM_RBLN_USE_DEVICE_TENSOR is enabled, but the RBLN rejection "
-        #         "sampler only supports CPU input tensors. Forcing rejection sampler "
-        #         "inputs to CPU."
-        #     )
-        cpu_device = "cpu"
+
         device = target_probs.device
         assert draft_token_ids.is_contiguous()
         assert draft_probs is None or draft_probs.is_contiguous()
