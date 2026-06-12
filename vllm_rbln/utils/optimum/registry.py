@@ -126,8 +126,7 @@ def is_arch_supported(
 
 
 def validate_arch_supported(config: PretrainedConfig) -> None:
-    """Validate the model's architecture is known to upstream vLLM.
-    """
+    """Validate the model's architecture is known to upstream vLLM."""
     architectures = getattr(config, "architectures", [])
     import vllm.model_executor.models as me_models
 

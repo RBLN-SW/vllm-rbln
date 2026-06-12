@@ -112,11 +112,6 @@ class RBLNOptimumModelRunner(
     input_batch: RBLNInputBatch
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
-        # FIXME: For RBLN support Enc-only model which based on enc-dec config.
-        # When using an encoder-only model (such as T5EncoderModel)
-        # with a config designed for enc-dec architectures,
-        # it’s important to set the is_encoder_decoder flag to False.
-        # This prevents the scheduler from applying text generation settings.
         # Validate against upstream vLLM's registry BEFORE the Qwen3 arch remap
         # below — the remapped name (Qwen3Model) is not in upstream vLLM, but the
         # original HF arch (Qwen3ForCausalLM) is.
