@@ -703,8 +703,8 @@ def custom_moe_swiglu_group_fake(
     expert_map: torch.Tensor | None = None,
     dp_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    return torch.empty_like(hidden_states, dtype=router_logits.dtype)
-
+    # FIXME (taehoon): this is a workaround for now, we need to give it real compute type
+    return torch.empty_like(hidden_states, dtype=torch.bfloat16)
 
 @torch.library.custom_op(
     "rbln_custom_ops::custom_moe_swiglu_group_dequantize",
@@ -1224,6 +1224,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             finfo = torch.finfo(fp8_dtype)
             in_block_size = int(self.weight_block_size[1])
             hs_shape = hidden_states.shape
+            # we expect rebel_compiler to convert below to qnn_quantize
+            # TODO: we need to make sure this is as expected in the tvm graph
             s_g = hidden_states.reshape(-1, in_block_size).to(torch.float32)
             amax = s_g.abs().amax(dim=-1, keepdim=True).clamp_min(1e-10)
             scale = amax / finfo.max
@@ -1233,6 +1235,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 .to(fp8_dtype)
                 .reshape(hs_shape)
             )
+            # end of qnn_quantize
             hidden_states_scale = scale.reshape(
                 hs_shape[0], hs_shape[1] // in_block_size
             )
