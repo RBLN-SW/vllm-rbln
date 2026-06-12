@@ -155,6 +155,46 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def scrub_scheduler_output_for_no_spec(scheduler_output: "SchedulerOutput") -> None:
+    """Force every scheduled request to query_len=1 for a collective no-spec step.
+
+    Some rank elected no-spec this step (a cross-block backfill that can't reach
+    a full speculative window), so via the cross-DP OR-reduce EVERY rank must
+    drop to ``query_len=1`` and ``_prepare_inputs`` must build a uniform
+    no-spec graph.
+
+    We zero any in-block slide and force ``num_scheduled_tokens`` to 1, but we
+    must NOT clear ``scheduled_spec_decode_tokens``: the engine's
+    ``update_from_output`` reads that dict to roll back the optimistic
+    ``num_computed_tokens`` advance applied in ``_update_after_schedule``
+    (``num_rejected = num_draft_tokens - num_accepted``). Clearing it here
+    strands that advance and over-counts ``num_computed_tokens`` by the dropped
+    draft count on every cross-block no-spec step. ``_prepare_inputs`` is told to
+    take the no-spec path explicitly via ``spec_decode_max_query_len=1`` rather
+    than by inspecting this dict.
+    """
+    if isinstance(scheduler_output, RBLNSchedulerOutput):
+        scheduler_output.spec_decode_slide_distance.clear()
+    for req_id in list(scheduler_output.num_scheduled_tokens):
+        scheduler_output.num_scheduled_tokens[req_id] = 1
+    scheduler_output.total_num_scheduled_tokens = sum(
+        scheduler_output.num_scheduled_tokens.values()
+    )
+
+    # Verify the no-spec scrub actually eliminated every cross-block condition:
+    # with all slides cleared and every query_len forced to 1, a backfill window
+    # can no longer span two KV blocks. If this fails the scrub is incomplete and
+    # the downstream decode would still cross a block boundary.
+    assert all(v == 1 for v in scheduler_output.num_scheduled_tokens.values()), (
+        f"no-spec scrub left a query_len != 1: {scheduler_output.num_scheduled_tokens}"
+    )
+    assert not getattr(scheduler_output, "spec_decode_slide_distance", {}), (
+        "no-spec scrub left a non-empty slide map, so a cross-block "
+        "backfill can still occur: "
+        f"{getattr(scheduler_output, 'spec_decode_slide_distance', {})}"
+    )
+
+
 # Wrapper for ModelRunnerOutput to support overlapped execution.
 class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
     def __init__(
@@ -1341,7 +1381,19 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # Common case (1D positions)
             self.positions.copy_to_gpu(total_query_tokens)
 
-        use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
+        # A collective no-spec step (cross-block backfill that can't reach a
+        # full window on some rank) is signalled explicitly via
+        # spec_decode_max_query_len == 1. In that case build the no-spec
+        # (query_len=1) inputs regardless of scheduled_spec_decode_tokens, which
+        # the runner deliberately leaves intact so the engine's
+        # update_from_output can roll back the optimistic num_computed_tokens
+        # advance. Without this gate, removing the old in-place
+        # scheduled_spec_decode_tokens.clear() would leave this dict non-empty
+        # and wrongly drive the spec-decode input path while num_scheduled is 1.
+        force_no_spec = spec_decode_max_query_len == 1
+        use_spec_decode = (
+            not force_no_spec and len(scheduler_output.scheduled_spec_decode_tokens) > 0
+        )
         if not use_spec_decode:
             # NOTE(woosuk): Due to chunked prefills, the batch may contain
             # partial requests. While we should not sample any token
@@ -3247,36 +3299,10 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # graph across DP. Runs whenever the global flag is set, even if
             # this rank had no drafts/slide locally (a peer tripped it).
             if step_no_spec_required:
-                scheduler_output.scheduled_spec_decode_tokens.clear()
-                if isinstance(scheduler_output, RBLNSchedulerOutput):
-                    scheduler_output.spec_decode_slide_distance.clear()
-                for req_id in list(scheduler_output.num_scheduled_tokens):
-                    scheduler_output.num_scheduled_tokens[req_id] = 1
-                scheduler_output.total_num_scheduled_tokens = sum(
-                    scheduler_output.num_scheduled_tokens.values()
-                )
+                scrub_scheduler_output_for_no_spec(scheduler_output)
                 tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
                 num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
                 num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
-
-                # Verify the no-spec scrub actually eliminated every cross-block
-                # condition: with all slides cleared and every query_len forced
-                # to 1, a backfill window can no longer span two KV blocks. If
-                # this fails the scrub is incomplete and the downstream decode
-                # would still cross a block boundary.
-                assert all(
-                    v == 1 for v in scheduler_output.num_scheduled_tokens.values()
-                ), (
-                    "no-spec scrub left a query_len != 1: "
-                    f"{scheduler_output.num_scheduled_tokens}"
-                )
-                assert not getattr(
-                    scheduler_output, "spec_decode_slide_distance", {}
-                ), (
-                    "no-spec scrub left a non-empty slide map, so a cross-block "
-                    "backfill can still occur: "
-                    f"{getattr(scheduler_output, 'spec_decode_slide_distance', {})}"
-                )
 
             # Decode shape vote for the cross-DP MAX. Normally the scheduler
             # pads every decode req's query window to num_spec_tokens + 1 via
