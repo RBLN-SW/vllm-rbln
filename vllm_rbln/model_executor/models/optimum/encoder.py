@@ -35,6 +35,12 @@ from .model_base import RBLNOptimumModelBase
 
 logger = init_logger(__name__)
 
+# Decoder-based pooling architectures that must NOT be forced to CLS pooling.
+# Qwen3 embedding/reranker (HF arch ``Qwen3ForCausalLM``) is remapped to
+# ``Qwen3Model`` by the model runner and uses LAST-token pooling, like any
+# decoder-based embedder — CLS (token 0) would be wrong for a causal model.
+_DECODER_POOLING_ARCHS = {"Qwen3Model"}
+
 
 class RBLNClassifierPooler(Pooler):
     """
@@ -46,7 +52,7 @@ class RBLNClassifierPooler(Pooler):
         super().__init__()
 
     def get_supported_tasks(self) -> set[PoolingTask]:
-        return {"classify", "score"}
+        return {"classify"}
 
     def forward(
         self,
@@ -69,18 +75,13 @@ class RBLNOptimumForEncoderModel(RBLNOptimumModelBase, VllmModelForPooling):
     ) -> None:
         super().__init__(vllm_config=vllm_config)
         pooler_config = vllm_config.model_config.pooler_config
-        # NOTE:
-        # In vLLM, the default pooling type is set to LAST token pooling,
-        # which is suitable for decoder or encoder-decoder models.
-        # However, for encoder-only models (e.g., BERT),
-        # CLS token pooling is more appropriate.
-        # Therefore, we override the pooling type to CLS here.
-        pooler_config.pooling_type = "CLS"
-        # NOTE: Setting pooling_type after PoolerConfig init doesn't update
-        # seq_pooling_type (already set to model default, e.g. "MEAN" for T5).
-        # Set it directly to ensure CLS pooling is used.
-        pooler_config.seq_pooling_type = "CLS"
         assert pooler_config is not None
+        # Encoder-only models (e.g. BERT/RoBERTa) use CLS-token pooling, so we
+        # override vLLM's resolved sequence pooling type to CLS. Decoder-based
+        # pooling models (e.g. Qwen3 embedding) must keep their LAST-token
+        # pooling — see _DECODER_POOLING_ARCHS.
+        if not self.is_decoder_pooling_arch():
+            pooler_config.seq_pooling_type = "CLS"
         if self.is_classification_arch():
             self.pooler = RBLNClassifierPooler()
         else:
@@ -114,6 +115,14 @@ class RBLNOptimumForEncoderModel(RBLNOptimumModelBase, VllmModelForPooling):
             [],
         )
         return len(architectures) > 0 and "Classification" in architectures[0]
+
+    def is_decoder_pooling_arch(self):
+        architectures = getattr(
+            self.model_config.hf_config,
+            "architectures",
+            [],
+        )
+        return len(architectures) > 0 and architectures[0] in _DECODER_POOLING_ARCHS
 
     def preprocess(
         self,
