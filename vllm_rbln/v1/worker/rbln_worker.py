@@ -472,7 +472,7 @@ class RBLNWorker(WorkerBase):
         )
         self._rbln_cpu_affinity_applied = True
 
-    def compile_or_warm_up_model(self) -> "CompilationTimes":
+    def compile_or_warm_up_model(self) -> CompilationTimes:
         st = time.perf_counter()
         if self.parallel_config.data_parallel_size > 1:
             if envs.VLLM_RBLN_DP_IMPL == "padded_decode":
