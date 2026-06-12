@@ -475,21 +475,23 @@ class RBLNScheduler(Scheduler):
                 desired_slide = max_spec_decode_len - new_n
 
                 if desired_slide > 0:
-                    available_past = request.num_computed_tokens
                     assert effective_remaining >= 1, (
                         f"effective_remaining must be >= 1; req {req_id} has "
                         f"remaining_in_block={remaining_in_block}, "
                         f"remaining_in_maxlen={remaining_in_maxlen}"
                     )
-                    assert desired_slide <= available_past, (
-                        f"sliding window requires available_past "
-                        f"({available_past}) >= desired_slide "
-                        f"({desired_slide}); req {req_id}. This means "
-                        f"the prompt is shorter than num_spec_tokens "
-                        f"({self.num_spec_tokens}); RBLN spec decode "
-                        f"requires prompts of at least num_spec_tokens "
-                        f"committed positions before the first decode."
-                    )
+                    # A prompt shorter than num_spec_tokens has too few committed
+                    # positions to backfill a full window
+                    # (desired_slide > available_past). Because
+                    # available_past = num_computed_tokens >= tokens_used_in_block
+                    # always holds, that shortfall is strictly a SUBSET of the
+                    # cross-block (can't-backfill) condition below
+                    # (desired_slide > available_past >= tokens_used_in_block
+                    #  ==> desired_slide > tokens_used_in_block). So we no longer
+                    # hard-assert here; control falls through to the cross-block
+                    # branch which elects no-spec (and still fails loudly for
+                    # fixed-length proposers via the guard there).
+                    #
                     # The backfilled past tokens must live in the SAME KV
                     # cache block as the new token(s). `available_past`
                     # (total committed tokens) only guarantees the prompt is
