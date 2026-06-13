@@ -51,11 +51,6 @@ class RBLNKVCacheManager(KVCacheManager):
         between inner blocks and outer blocks for prefix caching.
         """
         self.max_model_len = max_model_len
-        assert max_model_len == max_num_batched_tokens, (
-            f"max_model_len({max_model_len}) must be equal to "
-            f"max_num_batched_tokens({max_num_batched_tokens}) for RBLNKVCacheManager"
-        )
-
         self.enable_caching = enable_caching
         self.use_eagle = use_eagle
         self.log_stats = log_stats
@@ -64,7 +59,11 @@ class RBLNKVCacheManager(KVCacheManager):
         # this comment because when the log stats is enabled there are still
         # potential configs we could expose in the future.
         self.prefix_cache_stats = PrefixCacheStats() if log_stats else None
-
+        # NOTE(eunji.lee):
+        # max_num_batched_tokens may exceed max_model_len. It only feeds the
+        # recycling-aware admission cap for SWA / chunked-local specs, and even
+        # there it is clamped by max_model_len. Full/cross-attention block
+        # allocation (e.g. Whisper) sizes purely off the request's own tokens.
         self.coordinator = RBLNKVCacheCoordinator(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
