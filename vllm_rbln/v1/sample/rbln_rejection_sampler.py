@@ -290,13 +290,6 @@ class RBLNRejectionSampler(RejectionSampler):
             draft_per_batch[i, :n] = draft_token_ids[src_offset : src_offset + n]
             src_offset += n
 
-        # FIXME required for device tensor?
-        # cu_num_draft_tokens = cu_num_draft_tokens.to(device=cpu_device)
-        if sampling_metadata.top_k is not None:
-            sampling_metadata.top_k = sampling_metadata.top_k.to(device=device)
-        if sampling_metadata.top_p is not None:
-            sampling_metadata.top_p = sampling_metadata.top_p.to(device=device)
-
         # ------------------------------------------------------------------
         # 2) Call the NPU primitive.
         # Returns:
