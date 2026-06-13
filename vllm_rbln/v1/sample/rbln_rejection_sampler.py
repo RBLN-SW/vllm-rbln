@@ -25,6 +25,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
+import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.worker.metrics import PerformanceTracker, collect_metrics
 from vllm_rbln.v1.worker.utils import build_compile_options, resolve_compile_context
@@ -60,11 +61,12 @@ def rbln_rejection_sample(
 # - apply_bad_words_with_drafts
 # - apply_all_penalties
 class RBLNRejectionSampler(RejectionSampler):
-    rej_sampler_performance_tracker = PerformanceTracker("REJ_SAMPLER")
-
     def __init__(self, *args, **kwargs):
         compile_context = kwargs.pop("compile_context", None)
         super().__init__(*args, **kwargs)
+        self.rej_sampler_performance_tracker: PerformanceTracker | None = None
+        if envs.VLLM_RBLN_METRICS:
+            self.rej_sampler_performance_tracker = PerformanceTracker("REJ_SAMPLER")
         compile_context = resolve_compile_context(compile_context)
         options = build_compile_options(compile_context)
         self.compiled_rejection_sample = torch.compile(
@@ -177,14 +179,18 @@ class RBLNRejectionSampler(RejectionSampler):
                 bonus_token_ids,
                 sampling_metadata,
             )
-            collect_metrics(
-                self.rej_sampler_performance_tracker,
-                True,
-                start_time=sampler_start_time,
-                end_time=time.perf_counter(),
-                reports=sampler_outputs,
-                token_count=0,
-            )
+            if (
+                envs.VLLM_RBLN_METRICS
+                and self.rej_sampler_performance_tracker is not None
+            ):
+                collect_metrics(
+                    self.rej_sampler_performance_tracker,
+                    True,
+                    start_time=sampler_start_time,
+                    end_time=time.perf_counter(),
+                    reports=sampler_outputs,
+                    token_count=0,
+                )
 
         logprobs_tensors = None
         if sampling_metadata.max_num_logprobs is not None:

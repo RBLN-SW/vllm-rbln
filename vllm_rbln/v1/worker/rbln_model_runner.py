@@ -2105,10 +2105,30 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 sampling_metadata, logits.shape[0]
             )
         if spec_decode_metadata is None:
-            sampler_output = self.sampler(
-                logits=logits,
-                sampling_metadata=sampling_metadata,
-            )
+            # Non-spec path: track with sampler_performance_tracker. The
+            # rejection sampler path is tracked separately inside
+            # RBLNRejectionSampler via rej_sampler_performance_tracker.
+            if hasattr(rebel, "capture_reports"):
+                capture_ctx = rebel.capture_reports()
+            else:
+                # use a dummy context manager that does nothing
+                capture_ctx = contextlib.nullcontext()
+            sampler_start_time = time.perf_counter()
+            with capture_ctx as sampler_reports:
+                sampler_output = self.sampler(
+                    logits=logits,
+                    sampling_metadata=sampling_metadata,
+                )
+            if envs.VLLM_RBLN_METRICS and self.sampler_performance_tracker is not None:
+                collect_metrics(
+                    self.sampler_performance_tracker,
+                    self.is_prefill_phase(),
+                    start_time=sampler_start_time,
+                    end_time=time.perf_counter(),
+                    reports=sampler_reports,
+                    token_count=0,
+                    # the performance of sampler doesn't depend on token count
+                )
         else:
             sampler_output = self.rejection_sampler(
                 spec_decode_metadata,
