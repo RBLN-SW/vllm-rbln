@@ -64,6 +64,9 @@ class RBLNKVCacheManager(KVCacheManager):
         # recycling-aware admission cap for SWA / chunked-local specs, and even
         # there it is clamped by max_model_len. Full/cross-attention block
         # allocation (e.g. Whisper) sizes purely off the request's own tokens.
+        assert max_num_batched_tokens is not None, (
+            "max_num_batched_tokens must be set in `sync_vllm_and_optimum`."
+        )
         self.coordinator = RBLNKVCacheCoordinator(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
