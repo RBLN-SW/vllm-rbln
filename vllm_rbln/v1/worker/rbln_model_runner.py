@@ -155,6 +155,45 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+# [OPT] Monkey-patch InputBatch.swap_states to copy only the valid token range.
+# token_ids_cpu/is_token_ids are [max_num_reqs, max_model_len]; a full-row swap
+# copies max_model_len(=131072) int32 ≈ 512KB/row. Under PDD decode request
+# turnover, _may_reorder_batch issues many swaps/step → ~0.85ms. We wrap the
+# upstream swap_states with NARROWED VIEWS of those two arrays (sharing memory),
+# so the original logic copies only :n columns (n = max valid token count of the
+# two rows) — all other field swaps run unchanged. No base-vLLM edit, robust to
+# upstream changes (delegates to the original method). num_tokens_no_spec is the
+# exact valid length without speculative decode.
+_RBLN_ORIG_SWAP_STATES = InputBatch.swap_states
+
+
+def _rbln_fast_swap_states(self, i1: int, i2: int) -> None:
+    n1 = int(self.num_tokens_no_spec[i1])
+    n2 = int(self.num_tokens_no_spec[i2])
+    n = n1 if n1 >= n2 else n2
+    full_tok = self.token_ids_cpu
+    full_is = self.is_token_ids
+    if n >= full_tok.shape[1]:
+        _RBLN_ORIG_SWAP_STATES(self, i1, i2)
+        return
+    try:
+        self.token_ids_cpu = full_tok[:, :n]
+        self.is_token_ids = full_is[:, :n]
+        _RBLN_ORIG_SWAP_STATES(self, i1, i2)
+    finally:
+        self.token_ids_cpu = full_tok
+        self.is_token_ids = full_is
+
+
+# Toggle with VLLM_RBLN_FAST_SWAP=0 to restore the original full-row swap (baseline).
+if (
+    os.environ.get("VLLM_RBLN_FAST_SWAP", "1") == "1"
+    and getattr(InputBatch.swap_states, "__name__", "") != "_rbln_fast_swap_states"
+):
+    InputBatch.swap_states = _rbln_fast_swap_states
+    logger.info("[vllm-rbln] patched InputBatch.swap_states (valid-range copy)")
+
+
 # Wrapper for ModelRunnerOutput to support overlapped execution.
 class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
     def __init__(
