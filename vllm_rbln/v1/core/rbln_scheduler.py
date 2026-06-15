@@ -1093,6 +1093,16 @@ class RBLNScheduler(Scheduler):
         self._stranded_new_blocks.pop(request.request_id, None)
         return super()._free_request(request, delay_free_blocks)
 
+    def _preempt_request(self, request: Request, timestamp: float) -> None:
+        # Preemption frees ALL of the request's blocks (kv_cache_manager.free),
+        # including any block stashed for re-emit. The request lives on and may
+        # later re-enter the decode batch, where the merge would otherwise
+        # prepend a now-freed (and possibly reused) block id to its block table.
+        # Drop the stash so the resumed request relies solely on the fresh
+        # block ids sent on resume.
+        self._stranded_new_blocks.pop(request.request_id, None)
+        super()._preempt_request(request, timestamp)
+
     def update_from_output(
         self,
         scheduler_output: SchedulerOutput,
