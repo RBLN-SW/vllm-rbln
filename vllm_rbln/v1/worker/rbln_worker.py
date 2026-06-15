@@ -504,10 +504,20 @@ class RBLNWorker(WorkerBase):
         # its NIXL registration until the KV cache physical views exist,
         # which only happens once warm-up has run the compiled model.
         if has_kv_transfer_group():
-            connector = get_kv_transfer_group()
-            finalize = getattr(connector, "finalize_kv_cache_registration", None)
-            if finalize is not None:
-                finalize()
+            # MultiConnector wraps children in `_connectors` and does NOT
+            # forward this RBLN-specific hook, so a plain getattr on the
+            # top-level group silently skips the nested RblnNixlConnector
+            # whose deferred D2D registration must be finalized here. Without
+            # it kv_topo stays None and NixlConnectorWorker.get_finished()
+            # asserts on the first request. Walk into MultiConnector._connectors
+            # recursively, mirroring RBLNModelRunner._propagate_runtime_holder.
+            pending = [get_kv_transfer_group()]
+            while pending:
+                conn = pending.pop()
+                finalize = getattr(conn, "finalize_kv_cache_registration", None)
+                if finalize is not None:
+                    finalize()
+                pending.extend(getattr(conn, "_connectors", ()) or ())
 
         # After warm-up: apply CPU affinity only (threads already set pre-compile).
         self._ensure_rbln_cpu_affinity_after_warmup()
