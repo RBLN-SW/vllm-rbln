@@ -200,9 +200,10 @@ class RBLNCompileSpec:
         assert block_size == max_model_len, (
             "block_size must be equal to max_model_len for Whisper models."
         )
-        assert max_model_len == config.max_length, (
+        assert max_model_len == config.max_target_positions, (
             f"max_model_len ({max_model_len}) must match the Whisper model's "
-            f"max_length ({config.max_length}) from the HuggingFace config."
+            f"max_target_positions ({config.max_target_positions}) "
+            "from the HuggingFace config."
         )
         return cls(
             model_cls=RBLNAutoModelForSpeechSeq2Seq,
