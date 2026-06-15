@@ -15,6 +15,7 @@
 import itertools
 import time
 from dataclasses import dataclass, field
+from typing import Any
 
 from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
@@ -103,6 +104,47 @@ class RBLNScheduler(Scheduler):
                     "Cache-aware routers must set token processing block size to "
                     "sub_block_size=%d.",
                     sub_block_size,
+                )
+
+        # NOTE(RBLN): Block deltas already committed in the KV cache manager
+        # but not yet delivered to the model runner because the request was
+        # evicted from the scheduler output. Running/cached requests need
+        # these deltas re-emitted. If a request leaves the running path,
+        # lifecycle hooks clear its pending delta before it can resume with
+        # a full block table.
+        self._pending_runner_block_deltas: dict[str, KVCacheBlocks] = {}
+
+    def _add_pending_runner_block_delta(
+        self,
+        request_id: str,
+        block_delta: KVCacheBlocks | None,
+    ) -> None:
+        if not (
+            block_delta is not None
+            and any(len(group) > 0 for group in block_delta.get_block_ids())
+        ):
+            return
+
+        assert block_delta is not None
+        prev = self._pending_runner_block_deltas.get(request_id)
+        self._pending_runner_block_deltas[request_id] = (
+            prev + block_delta if prev is not None else block_delta
+        )
+
+    def _drain_pending_runner_block_deltas(
+        self,
+        scheduled_running_reqs: list[Request],
+        req_to_new_blocks: dict[str, KVCacheBlocks],
+    ) -> None:
+        """Attach pending block deltas to cached requests before output."""
+        for req in scheduled_running_reqs:
+            if (
+                pending_delta := self._pending_runner_block_deltas.pop(
+                    req.request_id, None
+                )
+            ) is not None:
+                req_to_new_blocks[req.request_id] = (
+                    pending_delta + req_to_new_blocks[req.request_id]
                 )
 
     def schedule(self) -> RBLNSchedulerOutput:
@@ -722,12 +764,14 @@ class RBLNScheduler(Scheduler):
                 # be scheduled together with the other running requests in the decoding
                 # phase.
                 for req in scheduled_running_reqs:
-                    req_to_new_blocks.pop(req.request_id)
+                    evicted_delta = req_to_new_blocks.pop(req.request_id)
                     num_scheduled_tokens.pop(req.request_id)
                     req.spec_token_ids = scheduled_spec_decode_tokens.pop(
                         req.request_id, []
                     )
                     scheduled_encoder_inputs.pop(req.request_id, None)
+
+                    self._add_pending_runner_block_delta(req.request_id, evicted_delta)
 
                 scheduled_running_reqs.clear()
                 token_budget = prefill_token_budget
@@ -803,25 +847,20 @@ class RBLNScheduler(Scheduler):
                     self.kv_cache_manager.get_num_common_prefix_blocks(any_request_id)
                 )
 
+        # NOTE(RBLN): Reconcile block deltas already committed in the KV cache
+        # manager but not yet delivered to the model runner.
+        self._drain_pending_runner_block_deltas(
+            scheduled_running_reqs,
+            req_to_new_blocks,
+        )
+
         # Construct the scheduler output.
-        if self.use_v2_model_runner:
-            scheduled_new_reqs = scheduled_new_reqs + scheduled_resumed_reqs
-            scheduled_resumed_reqs = []
-            new_reqs_data = [
-                NewRequestData.from_request(
-                    req,
-                    req_to_new_blocks[req.request_id].get_block_ids(),
-                    req._all_token_ids,
-                )
-                for req in scheduled_new_reqs
-            ]
-        else:
-            new_reqs_data = [
-                NewRequestData.from_request(
-                    req, req_to_new_blocks[req.request_id].get_block_ids()
-                )
-                for req in scheduled_new_reqs
-            ]
+        new_reqs_data = [
+            NewRequestData.from_request(
+                req, req_to_new_blocks[req.request_id].get_block_ids()
+            )
+            for req in scheduled_new_reqs
+        ]
 
         with record_function_or_nullcontext("schedule: make_cached_request_data"):
             cached_reqs_data = self._make_cached_request_data(
@@ -889,6 +928,22 @@ class RBLNScheduler(Scheduler):
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
         return scheduler_output
+
+    def _preempt_request(
+        self, request: Request, timestamp: float
+    ) -> dict[str, Any] | None:
+        # Preempted requests resume with full block tables, so pending deltas
+        # from the previous running state are stale.
+        self._pending_runner_block_deltas.pop(request.request_id, None)
+        return super()._preempt_request(request, timestamp)
+
+    def _free_request(
+        self, request: Request, delay_free_blocks: bool = False
+    ) -> dict[str, Any] | None:
+        # Drop any pending runner block delta; the request is finishing and will
+        # never be scheduled again.
+        self._pending_runner_block_deltas.pop(request.request_id, None)
+        return super()._free_request(request, delay_free_blocks)
 
     def update_from_output(
         self,
