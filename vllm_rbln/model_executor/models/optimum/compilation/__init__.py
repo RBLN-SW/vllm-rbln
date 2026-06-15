@@ -51,6 +51,24 @@ def _deep_merge(base: dict, overrides: dict) -> None:
             base[key] = value
 
 
+def _sync_submodule_tp_with_device(rbln_config: dict) -> None:
+    """Align each submodule's ``tensor_parallel_size`` with its device count.
+
+    A submodule (e.g. ``visual``) is configured on a fixed set of devices via
+    its nested ``device`` list, but optimum-rbln requires its
+    ``tensor_parallel_size`` to match that device count. The user only supplies
+    ``device``, so we derive ``tensor_parallel_size`` from ``len(device)`` here.
+    The top-level config is left untouched (its TP is driven by
+    ``VLLM_RBLN_TP_SIZE``).
+    """
+    for value in rbln_config.values():
+        if not isinstance(value, dict):
+            continue
+        device = value.get("device")
+        if isinstance(device, list) and device:
+            value["tensor_parallel_size"] = len(device)
+
+
 @dataclass
 class RBLNCompileSpec:
     """Resolved (model_cls, rbln_config) ready to feed optimum-rbln."""
@@ -94,6 +112,12 @@ class RBLNCompileSpec:
         # so we don't silently overwrite compile-critical fields.
         if rbln_overrides:
             _deep_merge(spec.rbln_config, rbln_overrides)
+
+        # A submodule's tensor_parallel_size must match its device count.
+        # The user only specifies ``device`` per submodule, so derive the
+        # submodule's tensor_parallel_size from the number of devices assigned
+        # to it (e.g. ``visual.device``); falls back to the merged default.
+        _sync_submodule_tp_with_device(spec.rbln_config)
         return spec
 
     @classmethod
