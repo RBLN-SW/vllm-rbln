@@ -1236,7 +1236,9 @@ class RBLNFlashAttentionMetadataBuilder(
         if is_prefill:
             seq_lens = seq_lens_tensor.to(self.device)
         elif isinstance(self.kv_cache_spec, MLAAttentionSpec):
-            assert self.is_batch_attention_opt, "batch_attn_opt required for MLAAttention decoder"
+            assert self.is_batch_attention_opt, (
+                "batch_attn_opt required for MLAAttention decoder"
+            )
             seq_lens = seq_idx.to(self.device)
         else:
             if not self.is_batch_attention_opt or batch_pad <= 1:
