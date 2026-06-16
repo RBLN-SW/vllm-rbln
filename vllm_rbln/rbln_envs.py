@@ -333,8 +333,7 @@ environment_variables = {
     # `sliding_window` bytes per block over RDMA. Host-side h2d/d2h still
     # moves the full block — only the remote RDMA payload is trimmed.
     "VLLM_RBLN_NIXL_SWA_VIEW_OPT": lambda: (
-        os.environ.get("VLLM_RBLN_NIXL_SWA_VIEW_OPT", "False").lower()
-        in ("true", "1")
+        os.environ.get("VLLM_RBLN_NIXL_SWA_VIEW_OPT", "False").lower() in ("true", "1")
     ),
 }
 

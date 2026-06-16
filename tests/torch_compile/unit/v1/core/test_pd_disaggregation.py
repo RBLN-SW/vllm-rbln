@@ -567,8 +567,9 @@ def _build_connector_worker(
         if not nixl_rbln_available
         else patch.dict(sys.modules, {})
     )
-    with modules_patch, patch.object(
-        RblnNixlConnectorWorker.__mro__[1], "__init__", fake_super_init
+    with (
+        modules_patch,
+        patch.object(RblnNixlConnectorWorker.__mro__[1], "__init__", fake_super_init),
     ):
         return RblnNixlConnectorWorker(
             vllm_config=vllm_config,
@@ -674,13 +675,12 @@ def _emulation_env(host_xfer_noop=False, remote_xfer_noop=False):
     }
 
 
-
 class TestRblnNixlConnectorWorkerNoopCopyBlocks:
     """`_noop_copy_blocks` is the static stand-in installed under
     `VLLM_RBLN_NIXL_EMULATE_HOST_XFER_NOOP=1`."""
 
     def test_accepts_arbitrary_signature_returns_none(self):
-        from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl_connector import (
+        from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl_connector import (  # noqa: E501
             RblnNixlConnectorWorker,
         )
 
@@ -723,8 +723,9 @@ class TestRblnNixlConnectorWorkerEmulationHostXfer:
 
     def test_initialize_buffer_shares_one_allocation_under_emulation(self):
         import os
-        import torch
         from unittest.mock import patch
+
+        import torch
 
         with patch.dict(
             os.environ, _emulation_env(host_xfer_noop=True, remote_xfer_noop=False)
@@ -732,8 +733,7 @@ class TestRblnNixlConnectorWorkerEmulationHostXfer:
             worker = _build_connector_worker()
             worker.kv_cache_layout = "HND"
             kv_caches = {
-                f"layer{i}": torch.zeros(4, 2, dtype=torch.float32)
-                for i in range(3)
+                f"layer{i}": torch.zeros(4, 2, dtype=torch.float32) for i in range(3)
             }
             worker.initialize_host_xfer_buffer(kv_caches)
 
@@ -742,17 +742,16 @@ class TestRblnNixlConnectorWorkerEmulationHostXfer:
             for b in buffers[1:]:
                 assert b is buffers[0]
             # Order preserved (P/D NIXL region indexing depends on it).
-            assert list(worker.host_xfer_buffers.keys()) == list(
-                kv_caches.keys()
-            )
+            assert list(worker.host_xfer_buffers.keys()) == list(kv_caches.keys())
 
     def test_emulation_also_active_when_remote_xfer_noop_set(self):
         """Either emulation flag triggers shared-allocation: NIXL-noop on
         its own still expects host buffers to be a fixed allocation since
         no actual transport ever touches them."""
         import os
-        import torch
         from unittest.mock import patch
+
+        import torch
 
         with patch.dict(
             os.environ, _emulation_env(host_xfer_noop=False, remote_xfer_noop=True)
@@ -760,8 +759,7 @@ class TestRblnNixlConnectorWorkerEmulationHostXfer:
             worker = _build_connector_worker()
             worker.kv_cache_layout = "HND"
             kv_caches = {
-                f"layer{i}": torch.zeros(4, 2, dtype=torch.float32)
-                for i in range(2)
+                f"layer{i}": torch.zeros(4, 2, dtype=torch.float32) for i in range(2)
             }
             worker.initialize_host_xfer_buffer(kv_caches)
 
@@ -770,9 +768,10 @@ class TestRblnNixlConnectorWorkerEmulationHostXfer:
 
     def test_emulation_asserts_uniform_shape(self):
         import os
+        from unittest.mock import patch
+
         import pytest
         import torch
-        from unittest.mock import patch
 
         with patch.dict(os.environ, _emulation_env(host_xfer_noop=True)):
             worker = _build_connector_worker()
@@ -786,8 +785,9 @@ class TestRblnNixlConnectorWorkerEmulationHostXfer:
 
     def test_no_emulation_keeps_per_layer_allocation(self):
         import os
-        import torch
         from unittest.mock import patch
+
+        import torch
 
         with patch.dict(
             os.environ, _emulation_env(host_xfer_noop=False, remote_xfer_noop=False)
@@ -795,8 +795,7 @@ class TestRblnNixlConnectorWorkerEmulationHostXfer:
             worker = _build_connector_worker()
             worker.kv_cache_layout = "HND"
             kv_caches = {
-                f"layer{i}": torch.zeros(4, 2, dtype=torch.float32)
-                for i in range(3)
+                f"layer{i}": torch.zeros(4, 2, dtype=torch.float32) for i in range(3)
             }
             worker.initialize_host_xfer_buffer(kv_caches)
 
@@ -830,9 +829,10 @@ class TestRblnNixlConnectorWorkerEmulationReadBlocks:
         worker = self._setup_worker()
         super_cls = type(worker).__mro__[1]
         super_read = MagicMock(name="super_read_blocks")
-        with patch.dict(
-            os.environ, _emulation_env(remote_xfer_noop=True)
-        ), patch.object(super_cls, "_read_blocks", super_read):
+        with (
+            patch.dict(os.environ, _emulation_env(remote_xfer_noop=True)),
+            patch.object(super_cls, "_read_blocks", super_read),
+        ):
             worker._read_blocks(
                 local_block_ids=[[1]],
                 remote_block_ids=[[1]],
@@ -863,9 +863,10 @@ class TestRblnNixlConnectorWorkerEmulationReadBlocks:
         worker.nixl_wrapper.send_notif.side_effect = RuntimeError("boom")
         super_cls = type(worker).__mro__[1]
 
-        with patch.dict(
-            os.environ, _emulation_env(remote_xfer_noop=True)
-        ), patch.object(super_cls, "_read_blocks", MagicMock()):
+        with (
+            patch.dict(os.environ, _emulation_env(remote_xfer_noop=True)),
+            patch.object(super_cls, "_read_blocks", MagicMock()),
+        ):
             # Should not raise; failure is logged and stats recorded.
             worker._read_blocks(
                 local_block_ids=[[1]],
@@ -891,9 +892,10 @@ class TestRblnNixlConnectorWorkerEmulationReadBlocks:
         super_cls = type(worker).__mro__[1]
         super_read = MagicMock(name="super_read_blocks")
 
-        with patch.dict(
-            os.environ, _emulation_env(remote_xfer_noop=False)
-        ), patch.object(super_cls, "_read_blocks", super_read):
+        with (
+            patch.dict(os.environ, _emulation_env(remote_xfer_noop=False)),
+            patch.object(super_cls, "_read_blocks", super_read),
+        ):
             worker._read_blocks(
                 local_block_ids=[[1]],
                 remote_block_ids=[[1]],
@@ -927,6 +929,7 @@ class TestRblnNixlConnectorWorkerSWARatio:
     def test_pure_full_keeps_sw_ratio_none(self):
         import os
         from unittest.mock import patch
+
         from vllm.v1.kv_cache_interface import FullAttentionSpec
 
         with patch.dict(os.environ, {"VLLM_RBLN_NIXL_SWA_VIEW_OPT": "1"}):
@@ -939,15 +942,14 @@ class TestRblnNixlConnectorWorkerSWARatio:
     def test_hybrid_full_swa_derives_ratio(self):
         import os
         from unittest.mock import patch
+
         from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
 
         with patch.dict(os.environ, {"VLLM_RBLN_NIXL_SWA_VIEW_OPT": "1"}):
             worker = _build_connector_worker(
                 kv_cache_specs=[
                     _spec_mock(FullAttentionSpec, block_size=1024),
-                    _spec_mock(
-                        SlidingWindowSpec, block_size=1024, sliding_window=128
-                    ),
+                    _spec_mock(SlidingWindowSpec, block_size=1024, sliding_window=128),
                 ]
             )
         assert worker._sw_ratio == 8
@@ -959,14 +961,13 @@ class TestRblnNixlConnectorWorkerSWARatio:
         no-op. `_sw_ratio` stays `None` to keep the pure-Full path."""
         import os
         from unittest.mock import patch
+
         from vllm.v1.kv_cache_interface import SlidingWindowSpec
 
         with patch.dict(os.environ, {"VLLM_RBLN_NIXL_SWA_VIEW_OPT": "1"}):
             worker = _build_connector_worker(
                 kv_cache_specs=[
-                    _spec_mock(
-                        SlidingWindowSpec, block_size=128, sliding_window=128
-                    )
+                    _spec_mock(SlidingWindowSpec, block_size=128, sliding_window=128)
                 ]
             )
         assert worker._sw_ratio is None
@@ -974,17 +975,14 @@ class TestRblnNixlConnectorWorkerSWARatio:
     def test_multiple_swa_groups_with_consistent_ratio(self):
         import os
         from unittest.mock import patch
+
         from vllm.v1.kv_cache_interface import SlidingWindowSpec
 
         with patch.dict(os.environ, {"VLLM_RBLN_NIXL_SWA_VIEW_OPT": "1"}):
             worker = _build_connector_worker(
                 kv_cache_specs=[
-                    _spec_mock(
-                        SlidingWindowSpec, block_size=1024, sliding_window=128
-                    ),
-                    _spec_mock(
-                        SlidingWindowSpec, block_size=1024, sliding_window=128
-                    ),
+                    _spec_mock(SlidingWindowSpec, block_size=1024, sliding_window=128),
+                    _spec_mock(SlidingWindowSpec, block_size=1024, sliding_window=128),
                 ]
             )
         assert worker._sw_ratio == 8
@@ -993,44 +991,50 @@ class TestRblnNixlConnectorWorkerSWARatio:
         """The dual-range layout assumes a single SWA desc length, so
         groups with different ratios are rejected at __init__."""
         import os
-        import pytest
         from unittest.mock import patch
+
+        import pytest
         from vllm.v1.kv_cache_interface import SlidingWindowSpec
 
-        with patch.dict(os.environ, {"VLLM_RBLN_NIXL_SWA_VIEW_OPT": "1"}):
-            with pytest.raises(AssertionError, match="single SWA ratio"):
-                _build_connector_worker(
-                    kv_cache_specs=[
-                        _spec_mock(
-                            SlidingWindowSpec,
-                            block_size=1024,
-                            sliding_window=128,
-                        ),
-                        _spec_mock(
-                            SlidingWindowSpec,
-                            block_size=1024,
-                            sliding_window=256,
-                        ),
-                    ]
-                )
+        with (
+            patch.dict(os.environ, {"VLLM_RBLN_NIXL_SWA_VIEW_OPT": "1"}),
+            pytest.raises(AssertionError, match="single SWA ratio"),
+        ):
+            _build_connector_worker(
+                kv_cache_specs=[
+                    _spec_mock(
+                        SlidingWindowSpec,
+                        block_size=1024,
+                        sliding_window=128,
+                    ),
+                    _spec_mock(
+                        SlidingWindowSpec,
+                        block_size=1024,
+                        sliding_window=256,
+                    ),
+                ]
+            )
 
     def test_non_multiple_sliding_window_asserts(self):
         import os
-        import pytest
         from unittest.mock import patch
+
+        import pytest
         from vllm.v1.kv_cache_interface import SlidingWindowSpec
 
-        with patch.dict(os.environ, {"VLLM_RBLN_NIXL_SWA_VIEW_OPT": "1"}):
-            with pytest.raises(AssertionError):
-                _build_connector_worker(
-                    kv_cache_specs=[
-                        _spec_mock(
-                            SlidingWindowSpec,
-                            block_size=1024,
-                            sliding_window=300,
-                        )
-                    ]
-                )
+        with (
+            patch.dict(os.environ, {"VLLM_RBLN_NIXL_SWA_VIEW_OPT": "1"}),
+            pytest.raises(AssertionError),
+        ):
+            _build_connector_worker(
+                kv_cache_specs=[
+                    _spec_mock(
+                        SlidingWindowSpec,
+                        block_size=1024,
+                        sliding_window=300,
+                    )
+                ]
+            )
 
 
 class TestRblnNixlConnectorWorkerGetBlockDescsIds:
@@ -1075,9 +1079,7 @@ class TestRblnNixlConnectorWorkerGetBlockDescsIds:
         worker = self._worker(
             [
                 _spec_mock(FullAttentionSpec, block_size=1024),
-                _spec_mock(
-                    SlidingWindowSpec, block_size=1024, sliding_window=128
-                ),
+                _spec_mock(SlidingWindowSpec, block_size=1024, sliding_window=128),
             ],
             num_blocks=4,
             num_regions=2,
@@ -1096,9 +1098,7 @@ class TestRblnNixlConnectorWorkerGetBlockDescsIds:
         worker = self._worker(
             [
                 _spec_mock(FullAttentionSpec, block_size=1024),
-                _spec_mock(
-                    SlidingWindowSpec, block_size=1024, sliding_window=128
-                ),
+                _spec_mock(SlidingWindowSpec, block_size=1024, sliding_window=128),
             ],
             num_blocks=4,
             num_regions=2,
@@ -1113,9 +1113,7 @@ class TestRblnNixlConnectorWorkerGetBlockDescsIds:
         worker = self._worker(
             [
                 _spec_mock(FullAttentionSpec, block_size=1024),
-                _spec_mock(
-                    SlidingWindowSpec, block_size=1024, sliding_window=128
-                ),
+                _spec_mock(SlidingWindowSpec, block_size=1024, sliding_window=128),
             ],
             num_blocks=4,
             num_regions=2,
@@ -1137,15 +1135,14 @@ class TestRblnNixlConnectorWorkerSWAViewOptToggle:
         consults neither (early returns on `_sw_ratio is None`)."""
         import os
         from unittest.mock import patch
+
         from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
 
         with patch.dict(os.environ, {"VLLM_RBLN_NIXL_SWA_VIEW_OPT": "0"}):
             worker = _build_connector_worker(
                 kv_cache_specs=[
                     _spec_mock(FullAttentionSpec, block_size=1024),
-                    _spec_mock(
-                        SlidingWindowSpec, block_size=1024, sliding_window=128
-                    ),
+                    _spec_mock(SlidingWindowSpec, block_size=1024, sliding_window=128),
                 ]
             )
         assert worker._sw_ratio is None
@@ -1156,15 +1153,14 @@ class TestRblnNixlConnectorWorkerSWAViewOptToggle:
         same Full-sized range as Full groups."""
         import os
         from unittest.mock import patch
+
         from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
 
         with patch.dict(os.environ, {"VLLM_RBLN_NIXL_SWA_VIEW_OPT": "0"}):
             worker = _build_connector_worker(
                 kv_cache_specs=[
                     _spec_mock(FullAttentionSpec, block_size=1024),
-                    _spec_mock(
-                        SlidingWindowSpec, block_size=1024, sliding_window=128
-                    ),
+                    _spec_mock(SlidingWindowSpec, block_size=1024, sliding_window=128),
                 ],
                 num_blocks=4,
             )
@@ -1182,15 +1178,14 @@ class TestRblnNixlConnectorWorkerSWAViewOptToggle:
         ::test_hybrid_full_swa_derives_ratio`."""
         import os
         from unittest.mock import patch
+
         from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
 
         with patch.dict(os.environ, {"VLLM_RBLN_NIXL_SWA_VIEW_OPT": "1"}):
             worker = _build_connector_worker(
                 kv_cache_specs=[
                     _spec_mock(FullAttentionSpec, block_size=1024),
-                    _spec_mock(
-                        SlidingWindowSpec, block_size=1024, sliding_window=128
-                    ),
+                    _spec_mock(SlidingWindowSpec, block_size=1024, sliding_window=128),
                 ]
             )
         assert worker._sw_ratio == 8
@@ -1229,8 +1224,9 @@ class TestRblnNixlConnectorInitAsserts:
 
     def test_rejects_unknown_kv_buffer_device(self):
         import os
-        import pytest
         from unittest.mock import patch
+
+        import pytest
         from vllm.distributed.kv_transfer.kv_connector.v1.base import (
             KVConnectorRole,
         )
@@ -1239,18 +1235,21 @@ class TestRblnNixlConnectorInitAsserts:
             RblnNixlConnector,
         )
 
-        with patch.dict(os.environ, {"VLLM_RBLN_USE_DEVICE_TENSOR": "1"}):
-            with pytest.raises(AssertionError, match="kv_buffer_device"):
-                RblnNixlConnector(
-                    vllm_config=self._vllm_config(kv_buffer_device="cuda"),
-                    role=KVConnectorRole.SCHEDULER,
-                    kv_cache_config=MagicMock(),
-                )
+        with (
+            patch.dict(os.environ, {"VLLM_RBLN_USE_DEVICE_TENSOR": "1"}),
+            pytest.raises(AssertionError, match="kv_buffer_device"),
+        ):
+            RblnNixlConnector(
+                vllm_config=self._vllm_config(kv_buffer_device="cuda"),
+                role=KVConnectorRole.SCHEDULER,
+                kv_cache_config=MagicMock(),
+            )
 
     def test_requires_use_device_tensor(self):
         import os
-        import pytest
         from unittest.mock import patch
+
+        import pytest
         from vllm.distributed.kv_transfer.kv_connector.v1.base import (
             KVConnectorRole,
         )
@@ -1259,15 +1258,15 @@ class TestRblnNixlConnectorInitAsserts:
             RblnNixlConnector,
         )
 
-        with patch.dict(os.environ, {"VLLM_RBLN_USE_DEVICE_TENSOR": "0"}):
-            with pytest.raises(
-                AssertionError, match="VLLM_RBLN_USE_DEVICE_TENSOR"
-            ):
-                RblnNixlConnector(
-                    vllm_config=self._vllm_config(kv_buffer_device="rbln"),
-                    role=KVConnectorRole.SCHEDULER,
-                    kv_cache_config=MagicMock(),
-                )
+        with (
+            patch.dict(os.environ, {"VLLM_RBLN_USE_DEVICE_TENSOR": "0"}),
+            pytest.raises(AssertionError, match="VLLM_RBLN_USE_DEVICE_TENSOR"),
+        ):
+            RblnNixlConnector(
+                vllm_config=self._vllm_config(kv_buffer_device="rbln"),
+                role=KVConnectorRole.SCHEDULER,
+                kv_cache_config=MagicMock(),
+            )
 
 
 class TestRblnNixlConnectorSchedulerHostBufferFlag:
@@ -1286,6 +1285,7 @@ class TestRblnNixlConnectorSchedulerHostBufferFlag:
 
     def _build(self, kv_buffer_device):
         from unittest.mock import patch
+
         from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl_connector import (  # noqa: E501
             RblnNixlConnectorScheduler,
         )
@@ -1354,13 +1354,13 @@ class TestRblnNixlConnectorWorkerEmulationWarningsAtInit:
         import os
         from unittest.mock import patch
 
-        with patch.dict(
-            os.environ, {"VLLM_RBLN_NIXL_EMULATE_HOST_XFER_NOOP": "1"}
-        ):
-            with patch(
+        with (
+            patch.dict(os.environ, {"VLLM_RBLN_NIXL_EMULATE_HOST_XFER_NOOP": "1"}),
+            patch(
                 "vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl_connector.logger"
-            ) as mock_logger:
-                _build_connector_worker(kv_buffer_device="cpu")
+            ) as mock_logger,
+        ):
+            _build_connector_worker(kv_buffer_device="cpu")
         # At least one warning mentioning the env var fired.
         assert any(
             "VLLM_RBLN_NIXL_EMULATE_HOST_XFER_NOOP" in str(call_args)
@@ -1371,13 +1371,13 @@ class TestRblnNixlConnectorWorkerEmulationWarningsAtInit:
         import os
         from unittest.mock import patch
 
-        with patch.dict(
-            os.environ, {"VLLM_RBLN_NIXL_EMULATE_REMOTE_XFER_NOOP": "1"}
-        ):
-            with patch(
+        with (
+            patch.dict(os.environ, {"VLLM_RBLN_NIXL_EMULATE_REMOTE_XFER_NOOP": "1"}),
+            patch(
                 "vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl_connector.logger"
-            ) as mock_logger:
-                _build_connector_worker(kv_buffer_device="cpu")
+            ) as mock_logger,
+        ):
+            _build_connector_worker(kv_buffer_device="cpu")
         assert any(
             "VLLM_RBLN_NIXL_EMULATE_REMOTE_XFER_NOOP" in str(call_args)
             for call_args in mock_logger.warning.call_args_list
@@ -1387,22 +1387,22 @@ class TestRblnNixlConnectorWorkerEmulationWarningsAtInit:
         import os
         from unittest.mock import patch
 
-        with patch.dict(
-            os.environ,
-            {
-                "VLLM_RBLN_NIXL_EMULATE_HOST_XFER_NOOP": "0",
-                "VLLM_RBLN_NIXL_EMULATE_REMOTE_XFER_NOOP": "0",
-            },
-        ):
-            with patch(
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "VLLM_RBLN_NIXL_EMULATE_HOST_XFER_NOOP": "0",
+                    "VLLM_RBLN_NIXL_EMULATE_REMOTE_XFER_NOOP": "0",
+                },
+            ),
+            patch(
                 "vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl_connector.logger"
-            ) as mock_logger:
-                _build_connector_worker(kv_buffer_device="cpu")
+            ) as mock_logger,
+        ):
+            _build_connector_worker(kv_buffer_device="cpu")
         # No emulation warnings at all — separate from upstream's own logs.
         emul_calls = [
-            c
-            for c in mock_logger.warning.call_args_list
-            if "EMULATE" in str(c)
+            c for c in mock_logger.warning.call_args_list if "EMULATE" in str(c)
         ]
         assert emul_calls == []
 
@@ -1426,11 +1426,13 @@ class TestRblnNixlConnectorWorkerRegisterKvCachesDispatch:
             rbln_nixl_connector as conn_mod,
         )
 
-        with patch.object(
-            conn_mod.NixlConnectorWorker, "register_kv_caches"
-        ) as super_register:
-            with patch("nixl_rbln.ensure_rbln_backend") as ensure_backend:
-                worker.register_kv_caches(kv_caches)
+        with (
+            patch.object(
+                conn_mod.NixlConnectorWorker, "register_kv_caches"
+            ) as super_register,
+            patch("nixl_rbln.ensure_rbln_backend") as ensure_backend,
+        ):
+            worker.register_kv_caches(kv_caches)
 
         super_register.assert_not_called()
         ensure_backend.assert_not_called()
@@ -1438,6 +1440,7 @@ class TestRblnNixlConnectorWorkerRegisterKvCachesDispatch:
 
     def test_cpu_creates_backend_and_delegates_to_super(self):
         from unittest.mock import patch
+
         from vllm_rbln.distributed.kv_transfer.kv_connector.v1 import (
             rbln_nixl_connector as conn_mod,
         )
@@ -1448,11 +1451,13 @@ class TestRblnNixlConnectorWorkerRegisterKvCachesDispatch:
         worker.nixl_wrapper = MagicMock()
         kv_caches = {"l0": MagicMock()}
 
-        with patch.object(
-            conn_mod.NixlConnectorWorker, "register_kv_caches"
-        ) as super_register:
-            with patch("nixl_rbln.ensure_rbln_backend") as ensure_backend:
-                worker.register_kv_caches(kv_caches)
+        with (
+            patch.object(
+                conn_mod.NixlConnectorWorker, "register_kv_caches"
+            ) as super_register,
+            patch("nixl_rbln.ensure_rbln_backend") as ensure_backend,
+        ):
+            worker.register_kv_caches(kv_caches)
 
         ensure_backend.assert_called_once_with(worker.nixl_wrapper, device_id=0)
         super_register.assert_called_once_with(kv_caches)
@@ -1525,9 +1530,7 @@ class TestRblnNixlConnectorWorkerSetHostXferBufferOps:
         worker = _build_connector_worker(kv_buffer_device="cpu")
         worker.use_host_buffer = True
         sentinel = MagicMock()
-        with patch.dict(
-            os.environ, {"VLLM_RBLN_NIXL_EMULATE_HOST_XFER_NOOP": "0"}
-        ):
+        with patch.dict(os.environ, {"VLLM_RBLN_NIXL_EMULATE_HOST_XFER_NOOP": "0"}):
             worker.set_host_xfer_buffer_ops(sentinel)
         assert worker.copy_blocks is sentinel
 
@@ -1541,9 +1544,6 @@ class TestRblnNixlConnectorSetRuntimeHolder:
     def _make_connector(self, role):
         import os
         from unittest.mock import patch
-        from vllm.distributed.kv_transfer.kv_connector.v1.base import (
-            KVConnectorRole,
-        )
 
         from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl_connector import (  # noqa: E501
             RblnNixlConnector,
@@ -1555,21 +1555,25 @@ class TestRblnNixlConnectorSetRuntimeHolder:
         vllm_config.kv_transfer_config.kv_buffer_device = "rbln"
         # Side-step the scheduler/worker construction — we only test the
         # outer set_runtime_holder method.
-        with patch.dict(os.environ, {"VLLM_RBLN_USE_DEVICE_TENSOR": "1"}):
-            with patch(
+        with (
+            patch.dict(os.environ, {"VLLM_RBLN_USE_DEVICE_TENSOR": "1"}),
+            patch(
                 "vllm_rbln.distributed.kv_transfer.kv_connector.v1."
                 "rbln_nixl_connector.RblnNixlConnectorScheduler"
-            ), patch(
+            ),
+            patch(
                 "vllm_rbln.distributed.kv_transfer.kv_connector.v1."
                 "rbln_nixl_connector.RblnNixlConnectorWorker"
-            ), patch.object(
+            ),
+            patch.object(
                 RblnNixlConnector.__mro__[1], "__init__", lambda *a, **k: None
-            ):
-                return RblnNixlConnector(
-                    vllm_config=vllm_config,
-                    role=role,
-                    kv_cache_config=MagicMock(),
-                )
+            ),
+        ):
+            return RblnNixlConnector(
+                vllm_config=vllm_config,
+                role=role,
+                kv_cache_config=MagicMock(),
+            )
 
     def test_worker_role_forwards_holder(self):
         from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -1720,9 +1724,7 @@ class TestRblnNixlConnectorWorkerRegisterKvCachesImpl:
             _cross_layers_blocks=False,
             cross_layers_blocks=False,
         )
-        topo.get_transfer_cache_regions.side_effect = self._split_kv(
-            worker.num_blocks
-        )
+        topo.get_transfer_cache_regions.side_effect = self._split_kv(worker.num_blocks)
         _, nc_patch = self._patch_nixl_connector(topo)
         try:
             with pytest.raises(AssertionError, match="runtime_holder"):
@@ -1734,9 +1736,9 @@ class TestRblnNixlConnectorWorkerRegisterKvCachesImpl:
         """Happy path: nixl-rbln is invoked with `mem='VRAM'` (D2D
         signature), and the returned `base_addrs` / `block_lens` /
         `reg_handle` are absorbed into the worker's transfer state."""
-        from unittest.mock import patch
         import sys
         import types
+        from unittest.mock import patch
 
         worker = self._prep_worker()
         spec = self._layer_spec(page_size_bytes=4096)
@@ -1755,40 +1757,38 @@ class TestRblnNixlConnectorWorkerRegisterKvCachesImpl:
         fake_nixl_rbln.ensure_rbln_backend = MagicMock()
 
         # Stub upstream nixl_connector helpers used inside the impl.
-        with patch.dict(sys.modules, {"nixl_rbln": fake_nixl_rbln}):
-            with patch(
+        with (
+            patch.dict(sys.modules, {"nixl_rbln": fake_nixl_rbln}),
+            patch(
                 "vllm_rbln.distributed.kv_transfer.kv_connector.v1."
                 "rbln_nixl_connector.nixl_connector"
-            ) as nc:
-                topo = MagicMock(
-                    is_kv_layout_blocks_first=False,
-                    _cross_layers_blocks=False,
-                    cross_layers_blocks=False,
-                )
-                topo.get_transfer_cache_regions.side_effect = self._split_kv(
-                    worker.num_blocks
-                )
-                nc.TpKVTopology.return_value = topo
-                nc.compute_nixl_compatibility_hash.return_value = "hash"
-                # Don't import MambaSpec / UniformTypeKVCacheSpecs paths.
-                nc.MambaSpec = type("MambaSpec", (), {})
-                nc.UniformTypeKVCacheSpecs = type(
-                    "UniformTypeKVCacheSpecs", (), {}
-                )
-                # Encode handshake payload without touching real msgspec.
-                nc.NixlAgentMetadata = MagicMock()
-                nc.NixlHandshakePayload = MagicMock()
-                nc.msgspec.msgpack.Encoder.return_value.encode.return_value = (
-                    b"meta"
-                )
-                # Short-circuit register_local_xfer_handler so the test
-                # focuses on _register_kv_caches_impl's own state writes.
-                with patch.object(
-                    worker,
-                    "register_local_xfer_handler",
-                    return_value=("local-handle", [(0x0, 0, 0)]),
-                ):
-                    worker._register_kv_caches_impl(kv_caches)
+            ) as nc,
+        ):
+            topo = MagicMock(
+                is_kv_layout_blocks_first=False,
+                _cross_layers_blocks=False,
+                cross_layers_blocks=False,
+            )
+            topo.get_transfer_cache_regions.side_effect = self._split_kv(
+                worker.num_blocks
+            )
+            nc.TpKVTopology.return_value = topo
+            nc.compute_nixl_compatibility_hash.return_value = "hash"
+            # Don't import MambaSpec / UniformTypeKVCacheSpecs paths.
+            nc.MambaSpec = type("MambaSpec", (), {})
+            nc.UniformTypeKVCacheSpecs = type("UniformTypeKVCacheSpecs", (), {})
+            # Encode handshake payload without touching real msgspec.
+            nc.NixlAgentMetadata = MagicMock()
+            nc.NixlHandshakePayload = MagicMock()
+            nc.msgspec.msgpack.Encoder.return_value.encode.return_value = b"meta"
+            # Short-circuit register_local_xfer_handler so the test
+            # focuses on _register_kv_caches_impl's own state writes.
+            with patch.object(
+                worker,
+                "register_local_xfer_handler",
+                return_value=("local-handle", [(0x0, 0, 0)]),
+            ):
+                worker._register_kv_caches_impl(kv_caches)
 
         # nixl-rbln was called once, with VRAM segment.
         fake_nixl_rbln.register_kv_regions.assert_called_once()
@@ -1799,10 +1799,7 @@ class TestRblnNixlConnectorWorkerRegisterKvCachesImpl:
         # Returned tables threaded into the worker state.
         assert worker.device_id == 0
         assert worker.block_len_per_layer == [256, 256]
-        assert (
-            worker.kv_caches_base_addr[worker.engine_id][0]
-            == [0x20000, 0x20100]
-        )
+        assert worker.kv_caches_base_addr[worker.engine_id][0] == [0x20000, 0x20100]
         assert worker._registered_descs == ["reg-handle"]
 
         # Region counts: 2 regions, layout-blocks-first=False so no x2.
@@ -1813,8 +1810,7 @@ class TestRblnNixlConnectorWorkerRegisterKvCachesImpl:
         assert worker.device_kv_caches is kv_caches
         assert worker.dst_num_blocks[worker.engine_id] == worker.num_blocks
         assert (
-            worker.src_xfer_handles_by_block_size[worker.block_size]
-            == "local-handle"
+            worker.src_xfer_handles_by_block_size[worker.block_size] == "local-handle"
         )
 
 
@@ -1888,6 +1884,7 @@ class TestRblnNixlConnectorWorkerRegisterKvCachesUpstream:
             # `ensure_rbln_backend` to assert no call.
             try:
                 import nixl_rbln  # noqa: F401
+
                 have_real = True
             except ImportError:
                 have_real = False
@@ -1911,9 +1908,7 @@ class TestRblnNixlConnectorWorkerD2DRequiresNixlRbln:
         import pytest
 
         with pytest.raises(RuntimeError, match="nixl-rbln"):
-            _build_connector_worker(
-                kv_buffer_device="rbln", nixl_rbln_available=False
-            )
+            _build_connector_worker(kv_buffer_device="rbln", nixl_rbln_available=False)
 
     def test_d2d_with_nixl_rbln_succeeds(self):
         """Symmetric sanity — same arguments but with nixl_rbln present
