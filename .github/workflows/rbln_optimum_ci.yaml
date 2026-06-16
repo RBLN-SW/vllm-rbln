@@ -127,28 +127,28 @@ jobs:
         run: >
           python3 examples/optimum/run_qwen3_embedding.py
           --num_input_prompt $((2 * ${{ env.NUM_INPUT_PROMPT }}))
-          --model_id ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/qwen3-embedding-0_6b-32k_kv4k_batch1
+          --model_id ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/ci_tf5/qwen3-embedding-0_6b-32k_kv4k_batch1
 
       - name : Run Qwen3-reranker (V1)
         run: >
           python3 examples/optimum/run_qwen3_reranker.py
           --max_seq_len 32768
           --num_input_prompt $((2 * ${{ env.NUM_INPUT_PROMPT }}))
-          --model_id ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/qwen3-reranker-0_6b-40k_kv4k_batch2
+          --model_id ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/ci_tf5/qwen3-reranker-0_6b-40k_kv4k_batch2
 
       - name: Run gemma2 model (hybrid attention) (V1)
         run: >
           python3 examples/optimum/run_basic.py
-          --model_id ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/gemma-2-2b-8k_batch4
+          --model_id ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/ci_tf5/gemma-2-2b-8k_batch4
 
       - name : Run text embedding model (V1)
         run: >
           python3 examples/optimum/run_encoder_only.py
           --num_input_prompt ${{ env.NUM_INPUT_PROMPT }}
-          --model_id ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/bge-m3-1k-batch4
+          --model_id ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/ci_tf5/bge-m3-1k-batch4
           --q_prompt_txt ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/prompts/q_prompts.txt
           --p_prompt_txt ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/prompts/p_prompts.txt
-          --golden_json ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/golden/golden_bge_m3_result_qp_prompts.json
+          --golden_json ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/ci_tf5/golden/golden_bge_m3_result_qp_prompts.json
 
   test_vllm_rbln_rsd4:
     needs: [get-compiler-version]
@@ -229,53 +229,53 @@ jobs:
         run: >
           python3 examples/optimum/run_decoder_only.py
           --num_input_prompt ${{ env.NUM_INPUT_PROMPT }}
-          --model_id ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/llama2-7b_batch2
+          --model_id ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/ci_tf5/llama2-7b_batch2
           --prompt_txt ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/prompts/copy_prompts.txt
-          --golden_json ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/golden/golden_llama7b_result_copy_prompts.json
+          --golden_json ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/ci_tf5/golden/golden_llama7b_result_copy_prompts.json
 
       - name: Run decoder-only test (Flash-attention mode) (V1)
         run: >
           python3 examples/optimum/run_decoder_only.py
           --num_input_prompt ${{ env.NUM_INPUT_PROMPT }}
-          --model_id ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/llama3_2-3b-128k_kv16k_batch4
+          --model_id ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/ci_tf5/llama3_2-3b-128k_kv16k_batch4
           --prompt_txt ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/prompts/copy_prompts.txt
-          --golden_json ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/golden/golden_llama3_2_3b_instruct_128k_copy_prompts.json
+          --golden_json ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/ci_tf5/golden/golden_llama3_2_3b_instruct_128k_copy_prompts.json
 
       - name : Run Llava-next (Eager mode) (V1)
         run: >
            python3 examples/optimum/run_llava.py
            --num_input_prompt ${{ env.NUM_INPUT_PROMPT }}
-           --model_id ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/llava-v1.6-mistral-7b-hf-32k-b4/
+           --model_id ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/ci_tf5/llava-v1.6-mistral-7b-hf-32k-b4/
 
       - name : Run Llava-next (Flash-attention mode) (V1)
         run: >
           python3 examples/optimum/run_llava.py
           --num_input_prompt ${{ env.NUM_INPUT_PROMPT }}
-          --model_id ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/llava-v1.6-mistral-7b-hf-32k-b4-kv16k
+          --model_id ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/ci_tf5/llava-v1.6-mistral-7b-hf-32k-b4-kv16k
 
       - name : Run Idefics3 (Eager mode) (V1)
         run: >
           python3 examples/optimum/run_idefics3.py
           --num_input_prompt ${{ env.NUM_INPUT_PROMPT }}
-          --model_id ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/idefics3-8b-llama3-32k-b4
+          --model_id ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/ci_tf5/idefics3-8b-llama3-32k-b4
 
       - name : Run Idefics3 (Flash-attention mode) (V1)
         run: >
           python3 examples/optimum/run_idefics3.py
           --num_input_prompt ${{ env.NUM_INPUT_PROMPT }}
-          --model_id ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/idefics3-8b-llama3-32k-b4-kv16k
+          --model_id ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/ci_tf5/idefics3-8b-llama3-32k-b4-kv16k
 
       - name : Run Blip2 (V1)
         run: >
           python3 examples/optimum/run_blip2.py
           --num_input_prompt ${{ env.NUM_INPUT_PROMPT }}
-          --model_id ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/blip2-opt-2.7b-2k-b4
+          --model_id ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/ci_tf5/blip2-opt-2.7b-2k-b4
 
       - name : Run PaliGemma (Eager mode) (V1)
         run: >
           python3 examples/optimum/run_paligemma.py
           --num_input_prompt ${{ env.NUM_INPUT_PROMPT }}
-          --model_id ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/paligemma-3b-8k-b4
+          --model_id ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/ci_tf5/paligemma-3b-8k-b4
 
   test_vllm_rbln_rsd8:
     needs: [get-compiler-version]
@@ -356,5 +356,5 @@ jobs:
         run: >
           python3 examples/optimum/run_qwen_vl.py
           --num_input_prompt ${{ env.NUM_INPUT_PROMPT }}
-          --model_id ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/qwen2_5-vl-7b-32k-b4-kv16k
+          --model_id ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/ci_tf5/qwen2_5-vl-7b-32k-b4-kv16k
 

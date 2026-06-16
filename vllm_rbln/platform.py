@@ -99,16 +99,16 @@ class RblnPlatform(Platform):
         return torch.no_grad()
 
     @classmethod
-    def manual_seed_all(cls, seed: int) -> None:
-        pass
-
-    @classmethod
     def set_device(cls, device: torch.device) -> None:
         """
         Set the device for the current platform.
         """
         logger.warning("set_device is not supported on RBLN.")
         pass
+
+    @classmethod
+    def manual_seed_all(cls, seed: int) -> None:
+        rebel.manual_seed(seed)
 
     @classmethod
     def is_pin_memory_available(cls):

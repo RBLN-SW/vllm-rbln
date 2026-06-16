@@ -42,7 +42,8 @@ dependencies = [
     "torch",
     "torchvision",
     "torchaudio",
-    "optimum-rbln>=0.10.4",
+    "torchcodec",
+    "optimum-rbln==0.11.0a6",
 ]
 
 [project.optional-dependencies]
@@ -145,6 +146,7 @@ vllm = { index = "vllm-cpu" }
 torch = { index = "pytorch-cpu" }
 torchvision = { index = "pytorch-cpu" }
 torchaudio = { index = "pytorch-cpu" }
+torchcodec = { index = "pytorch-cpu" }
 
 [tool.typos.default]
 binary = false

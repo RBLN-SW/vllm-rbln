@@ -19,6 +19,7 @@ from transformers import PretrainedConfig
 
 import optimum.rbln
 from optimum.rbln import (
+    RBLNAutoModel,
     RBLNAutoModelForCausalLM,
     RBLNAutoModelForSpeechSeq2Seq,
 )
@@ -30,10 +31,7 @@ from vllm_rbln.utils.optimum.registry import (
     is_pooling_arch,
 )
 
-from .multimodal import (
-    _COMPILE_MULTIMODAL_FNS,
-    get_multimodal_cls,
-)
+from .multimodal import _COMPILE_MULTIMODAL_FNS
 
 
 def _deep_merge(base: dict, overrides: dict) -> None:
@@ -49,6 +47,24 @@ def _deep_merge(base: dict, overrides: dict) -> None:
             _deep_merge(existing, value)
         else:
             base[key] = value
+
+
+def _sync_submodule_tp_with_device(rbln_config: dict) -> None:
+    """Align each submodule's ``tensor_parallel_size`` with its device count.
+
+    A submodule (e.g. ``visual``) is configured on a fixed set of devices via
+    its nested ``device`` list, but optimum-rbln requires its
+    ``tensor_parallel_size`` to match that device count. The user only supplies
+    ``device``, so we derive ``tensor_parallel_size`` from ``len(device)`` here.
+    The top-level config is left untouched (its TP is driven by
+    ``VLLM_RBLN_TP_SIZE``).
+    """
+    for value in rbln_config.values():
+        if not isinstance(value, dict):
+            continue
+        device = value.get("device")
+        if isinstance(device, list) and device:
+            value["tensor_parallel_size"] = len(device)
 
 
 @dataclass
@@ -94,6 +110,12 @@ class RBLNCompileSpec:
         # so we don't silently overwrite compile-critical fields.
         if rbln_overrides:
             _deep_merge(spec.rbln_config, rbln_overrides)
+
+        # A submodule's tensor_parallel_size must match its device count.
+        # The user only specifies ``device`` per submodule, so derive the
+        # submodule's tensor_parallel_size from the number of devices assigned
+        # to it (e.g. ``visual.device``); falls back to the merged default.
+        _sync_submodule_tp_with_device(spec.rbln_config)
         return spec
 
     @classmethod
@@ -156,9 +178,8 @@ class RBLNCompileSpec:
                 f"Unknown multimodal model alias: {model_name}. "
                 f"Supported aliases: {sorted(_COMPILE_MULTIMODAL_FNS.keys())}"
             )
-        architectures = getattr(config, "architectures", [])
         return cls(
-            model_cls=get_multimodal_cls(architectures[0]),
+            model_cls=RBLNAutoModel,
             rbln_config=compile_fn(batch_size, max_model_len, block_size, tp_size),
         )
 
@@ -177,9 +198,10 @@ class RBLNCompileSpec:
         assert block_size == max_model_len, (
             "block_size must be equal to max_model_len for Whisper models."
         )
-        assert max_model_len == config.max_length, (
+        assert max_model_len == config.max_target_positions, (
             f"max_model_len ({max_model_len}) must match the Whisper model's "
-            f"max_length ({config.max_length}) from the HuggingFace config."
+            f"max_target_positions ({config.max_target_positions}) "
+            "from the HuggingFace config."
         )
         return cls(
             model_cls=RBLNAutoModelForSpeechSeq2Seq,
