@@ -64,12 +64,22 @@ def _generated_token_ids(outputs) -> list[list[int]]:
     return [list(o.outputs[0].token_ids) for o in outputs]
 
 
-# TODO: re-enable True once the device tensor path is stable
-@pytest.mark.parametrize("use_device_tensor", [False])
+@pytest.mark.parametrize("use_device_tensor", [False, True])
 def test_sub_block_prefix_cache_matches_baseline(
     monkeypatch: pytest.MonkeyPatch, use_device_tensor: bool
 ) -> None:
     env = {"VLLM_RBLN_USE_DEVICE_TENSOR": "1" if use_device_tensor else "0"}
+
+    # RblnPlatform freezes device attrs at import; re-sync after env change.
+    from vllm_rbln.platform import RblnPlatform
+
+    dev = "rbln" if use_device_tensor else "cpu"
+    monkeypatch.setattr(RblnPlatform, "_USE_DEVICE_TENSOR", use_device_tensor)
+    monkeypatch.setattr(RblnPlatform, "device_type", dev)
+    monkeypatch.setattr(RblnPlatform, "device_name", dev)
+    monkeypatch.setattr(
+        RblnPlatform, "dist_backend", "rbln-ccl" if use_device_tensor else ""
+    )
 
     # Each engine is shut down before the next is built, so they never coexist.
     with managed_llm(
