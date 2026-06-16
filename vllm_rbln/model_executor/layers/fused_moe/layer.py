@@ -622,7 +622,9 @@ def build_masked_routing_weights(
     )  # [E, T]
 
     if envs.VLLM_RBLN_USE_MOE_TOKENS_MASK:
-        tokens_mask = get_tokens_mask(num_tokens).transpose(1, 0)  # [1, T]
+        tokens_mask = get_tokens_mask(
+            num_tokens, device=masked_routing_weights.device
+        ).transpose(1, 0)  # [1, T]
         tokens_mask = tokens_mask.to(masked_routing_weights.dtype)
 
         # token dim 64-align padding (compiler requires >= 64 along token dim)
