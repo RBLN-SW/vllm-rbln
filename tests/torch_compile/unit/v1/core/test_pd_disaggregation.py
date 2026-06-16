@@ -20,6 +20,7 @@ Tests cover:
 """
 
 from dataclasses import dataclass, field
+from typing import Any
 from unittest.mock import MagicMock
 
 from vllm.v1.outputs import KVConnectorOutput
@@ -513,6 +514,7 @@ def _build_connector_worker(
     num_blocks=128,
     block_size=64,
     kv_cache_specs=None,
+    nixl_rbln_available=True,
 ):
     """Create a RblnNixlConnectorWorker through its __init__ with the
     upstream NixlConnectorWorker side effects stubbed out.
@@ -523,8 +525,14 @@ def _build_connector_worker(
     Omit it to leave `MagicMock`'s default empty iteration in place —
     keeps `_group_specs == []` and `_sw_ratio is None`.
 
+    `nixl_rbln_available`: when False, the worker's `import nixl_rbln`
+    raises ImportError so the upstream-NIXL fallback path is exercised
+    (`_use_rbln_nixl_backend = False`). Default True keeps the existing
+    RBLN-backend behavior for all pre-existing tests.
+
     Returns the constructed worker so tests can inspect post-__init__ state.
     """
+    import sys
     from unittest.mock import patch
 
     from vllm.config import CacheConfig
@@ -552,7 +560,14 @@ def _build_connector_worker(
         self.kv_buffer_device = kv_buffer_device
         self._block_size = {}
 
-    with patch.object(
+    modules_patch = (
+        # Mask `nixl_rbln` from sys.modules so `import nixl_rbln` raises
+        # ImportError, simulating an environment without the adapter.
+        patch.dict(sys.modules, {"nixl_rbln": None})
+        if not nixl_rbln_available
+        else patch.dict(sys.modules, {})
+    )
+    with modules_patch, patch.object(
         RblnNixlConnectorWorker.__mro__[1], "__init__", fake_super_init
     ):
         return RblnNixlConnectorWorker(
@@ -1735,7 +1750,7 @@ class TestRblnNixlConnectorWorkerRegisterKvCachesImpl:
         xfer_result.reg_handle = "reg-handle"
         xfer_result.n_shards = 1
 
-        fake_nixl_rbln = types.ModuleType("nixl_rbln")
+        fake_nixl_rbln: Any = types.ModuleType("nixl_rbln")
         fake_nixl_rbln.register_kv_regions = MagicMock(return_value=xfer_result)
         fake_nixl_rbln.ensure_rbln_backend = MagicMock()
 
@@ -1801,3 +1816,110 @@ class TestRblnNixlConnectorWorkerRegisterKvCachesImpl:
             worker.src_xfer_handles_by_block_size[worker.block_size]
             == "local-handle"
         )
+
+
+# ---------------------------------------------------------------------------
+# Upstream-NIXL fallback (no nixl-rbln adapter installed)
+# ---------------------------------------------------------------------------
+#
+# When `nixl_rbln` is not importable the worker leaves `nixl_backends` /
+# `nixl_memory_type` at upstream defaults (UCX / DRAM) for the
+# host-bounce path and rejects D2D outright.
+
+
+class TestRblnNixlConnectorWorkerBackendSelection:
+    """`_use_rbln_nixl_backend` flag follows nixl_rbln import availability,
+    and only the RBLN-backend branch touches `nixl_backends` /
+    `nixl_memory_type`."""
+
+    def test_rbln_backend_when_nixl_rbln_present(self):
+        worker = _build_connector_worker(
+            kv_buffer_device="cpu", nixl_rbln_available=True
+        )
+        assert worker._use_rbln_nixl_backend is True
+        assert worker.nixl_backends == ["RBLN"]
+
+    def test_upstream_backend_when_nixl_rbln_absent(self):
+        worker = _build_connector_worker(
+            kv_buffer_device="cpu", nixl_rbln_available=False
+        )
+        assert worker._use_rbln_nixl_backend is False
+        # `nixl_backends` is owned by the upstream parent's __init__;
+        # the helper's fake super_init doesn't replay it, so the
+        # attribute may simply not exist. Whatever upstream set must
+        # NOT have been overridden to ["RBLN"].
+        assert getattr(worker, "nixl_backends", None) != ["RBLN"]
+
+    def test_upstream_path_leaves_nixl_memory_type_at_default(self):
+        """The `kv_buffer_device == 'rbln'` block is the only place
+        `nixl_memory_type` is raised to VRAM, and that branch is only
+        reachable with nixl_rbln available. On the upstream cpu path
+        the attribute either stays untouched or simply isn't set by
+        the helper's fake super_init — must not be VRAM either way."""
+        worker = _build_connector_worker(
+            kv_buffer_device="cpu", nixl_rbln_available=False
+        )
+        assert getattr(worker, "nixl_memory_type", "DRAM") != "VRAM"
+
+
+class TestRblnNixlConnectorWorkerRegisterKvCachesUpstream:
+    """`register_kv_caches` on the upstream cpu path skips
+    `ensure_rbln_backend` (nixl-rbln isn't there to call) and goes
+    straight through to the parent's standard registration."""
+
+    def test_upstream_cpu_skips_ensure_rbln_backend(self):
+        from unittest.mock import patch
+
+        from vllm_rbln.distributed.kv_transfer.kv_connector.v1 import (
+            rbln_nixl_connector as conn_mod,
+        )
+
+        worker = _build_connector_worker(
+            kv_buffer_device="cpu", nixl_rbln_available=False
+        )
+        worker.nixl_wrapper = MagicMock()
+        kv_caches = {"l0": MagicMock()}
+
+        with patch.object(
+            conn_mod.NixlConnectorWorker, "register_kv_caches"
+        ) as super_register:
+            # Even if the test process *does* have nixl_rbln importable,
+            # the worker's flag says we shouldn't touch it — wrap
+            # `ensure_rbln_backend` to assert no call.
+            try:
+                import nixl_rbln  # noqa: F401
+                have_real = True
+            except ImportError:
+                have_real = False
+            if have_real:
+                with patch("nixl_rbln.ensure_rbln_backend") as ensure:
+                    worker.register_kv_caches(kv_caches)
+                ensure.assert_not_called()
+            else:
+                worker.register_kv_caches(kv_caches)
+
+        super_register.assert_called_once_with(kv_caches)
+        assert worker._pending_kv_caches is None
+
+
+class TestRblnNixlConnectorWorkerD2DRequiresNixlRbln:
+    """D2D (`kv_buffer_device='rbln'`) can't proceed without nixl-rbln —
+    `__init__` rejects with a clear hint instead of failing deep in
+    `_register_kv_caches_impl`."""
+
+    def test_d2d_without_nixl_rbln_raises(self):
+        import pytest
+
+        with pytest.raises(RuntimeError, match="nixl-rbln"):
+            _build_connector_worker(
+                kv_buffer_device="rbln", nixl_rbln_available=False
+            )
+
+    def test_d2d_with_nixl_rbln_succeeds(self):
+        """Symmetric sanity — same arguments but with nixl_rbln present
+        constructs cleanly and enters the RBLN-backend branch."""
+        worker = _build_connector_worker(
+            kv_buffer_device="rbln", nixl_rbln_available=True
+        )
+        assert worker._use_rbln_nixl_backend is True
+        assert worker.nixl_memory_type == "VRAM"
