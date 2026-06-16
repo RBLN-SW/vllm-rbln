@@ -97,12 +97,20 @@ class RBLNOptimumForEncoderModel(RBLNOptimumModelBase, VllmModelForPooling):
         # pooling — see _DECODER_POOLING_ARCHS.
         if not self.is_decoder_pooling_arch():
             pooler_config.seq_pooling_type = "CLS"
+        # https://github.com/vllm-project/vllm/blob/v0.22.0/docs/models/pooling_models/scoring.md
+        # vLLM groups score()-capable models into three "score types"
+        # (docs/models/pooling_models, score_types.svg). Which pooler we build
+        # below depends on which one this model is:
+        #   score type        task                    score computation          example
+        #   ----------------  ----------------------  -------------------------  ------------
+        #   cross-encoder     classify (num_labels=1) joint input -> classifier  bge-reranker
+        #   bi-encoder        embed                   cosine of two embeddings   bge-m3
+        #   late-interaction  token_embed             token-wise MaxSim          (n/a here)
+        # Cross-encoders need the classifier head/activation (RBLNClassifierPooler);
+        # everything else is served by the embed / token_embed pooler.
         if self.is_classification_arch():
             self.pooler = RBLNClassifierPooler(vllm_config.model_config)
         else:
-            # https://github.com/vllm-project/vllm/blob/72506c98349d6bcd32b4e33eec7b5513453c1502/docs/models/pooling_models.md?plain=1#L312
-            # encode task is split into `token_embed` and `token_classify` tasks
-            #
             # Build the "embed" pooler without sentence-transformers projection.
             # vllm's pooler_for_embed() loads the ST Dense layer via
             # _load_st_projector, but RBLN encoder models produce raw hidden
