@@ -30,9 +30,9 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 import vllm_rbln.rbln_envs as envs
 import vllm_rbln.utils as rbln_utils
+from vllm_rbln.forward_context import RBLNDPMetadata
 from vllm_rbln.logger import init_logger
 from vllm_rbln.torch_compile_backend import logged_rbln_backend
-from vllm_rbln.forward_context import RBLNDPMetadata
 from vllm_rbln.v1.attention.kv_cache_bindings import (
     attach_kv_cache_bindings,
     build_kv_cache_forward_context_kwargs,
@@ -242,10 +242,8 @@ class RBLNEagleProposer(EagleProposer):
         # NOTE(RBLN): Only slot 0 of the padded window carries valid data; slots 1..k
         # are junk and filtered out of KV-cache writes via PADDING_SLOT_ID.
         padded_q_len = self.num_speculative_tokens + 1
-        sub_num_tokens_across_dp, sub_num_padded_tokens = (
-            self._dp_forward_context_args(
-                batch_bucket_size * padded_q_len, batch_bucket_size * padded_q_len
-            )
+        sub_num_tokens_across_dp, sub_num_padded_tokens = self._dp_forward_context_args(
+            batch_bucket_size * padded_q_len, batch_bucket_size * padded_q_len
         )
 
         if batch_bucket_size > batch_size:
@@ -299,9 +297,7 @@ class RBLNEagleProposer(EagleProposer):
             )
             # Pad slot_mapping to padded_q_len with PADDING_SLOT_ID in
             # slots 1..k so attention's KV write skips the junk slots.
-            slot_mapping_valid = common_attn_metadata.slot_mapping.view(
-                batch_size, 1
-            )
+            slot_mapping_valid = common_attn_metadata.slot_mapping.view(batch_size, 1)
             slot_mapping_q_padded = rbln_utils.pad(
                 slot_mapping_valid, 1, padded_q_len, PADDING_SLOT_ID
             )
@@ -348,9 +344,7 @@ class RBLNEagleProposer(EagleProposer):
                 positions_view = self.positions[:batch_bucket_size].view(
                     batch_bucket_size, 1
                 )
-                positions_padded = rbln_utils.pad(
-                    positions_view, 1, padded_q_len, -1
-                )
+                positions_padded = rbln_utils.pad(positions_view, 1, padded_q_len, -1)
                 hidden_states_view = self.hidden_states[:batch_bucket_size].view(
                     batch_bucket_size, 1, -1
                 )
@@ -475,7 +469,7 @@ class RBLNEagleProposer(EagleProposer):
         # Subsequent loop matches the busy peer's k-1 iterations.
         if self.num_speculative_tokens == 1:
             return
-        
+
         for _ in range(self.num_speculative_tokens - 1):
             with set_forward_context(
                 per_layer_attn_metadata,
