@@ -38,11 +38,11 @@ dependencies = [
     "pyyaml",
     "datasets",
     "qwen_vl_utils",
-    "vllm==0.19.1",
+    "vllm==0.18.0+cpu",
     "torch",
     "torchvision",
     "torchaudio",
-    "optimum-rbln @ git+https://github.com/rbln-sw/optimum-rbln.git@integrations/gemma4",
+    "optimum-rbln>=0.10.4a1",
 ]
 
 [project.optional-dependencies]
@@ -132,7 +132,7 @@ environments = [
 
 [[tool.uv.index]]
 name = "vllm-cpu"
-url = "https://wheels.vllm.ai/0.19.1/cpu"
+url = "https://wheels.vllm.ai/0.18.0/cpu"
 explicit = true
 
 [[tool.uv.index]]

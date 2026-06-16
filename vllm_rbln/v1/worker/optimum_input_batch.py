@@ -43,13 +43,32 @@ class RBLNInputBatch(InputBatch):
             #   - failure site:    https://github.com/vllm-project/vllm/blob/01efc7ef781391e744ed08c3292817a773d654e6/vllm/v1/sample/ops/topk_topp_sampler.py#L151
             self.top_k.fill_(self.vocab_size)
             self.top_k_cpu_tensor.fill_(self.vocab_size)
+            # Default top_p to 1.0
+            self.top_p.fill_(1.0)
+            self.top_p_cpu_tensor.fill_(1.0)
             # Default temperature to 1.0 to guard against NaN logits.
             #
             # Why: top_k / top_p applied to unscaled logits can produce NaNs,
             # which propagate into the sampled token ids as out-of-vocab values.
             # Those ids are later used as indices in torch.gather (e.g. for logprobs),
             # triggering an "index out of bounds" RuntimeError in the CPU kernel.
+            self.temperature.fill_(1.0)
             self.temperature_cpu_tensor.fill_(1.0)
+            # Default penalties to no-ops (frequency/presence=0, repetition=1).
+            #
+            # Why: apply_penalties does `logits -= penalty * mask` and
+            # `logits = logits / repetition_penalty` over the full padded
+            # batch. If a pad row's penalty is NaN (from torch.empty), then
+            # NaN * 0 = NaN contaminates every position; if repetition is 0,
+            # the division yields inf. Either way the pad row leaves
+            # apply_penalties unusable for the rest of the sampler pipeline.
+            self.frequency_penalties_cpu_tensor.fill_(0.0)
+            self.presence_penalties_cpu_tensor.fill_(0.0)
+            self.repetition_penalties_cpu_tensor.fill_(1.0)
+
+            self.frequency_penalties.fill_(0.0)
+            self.presence_penalties.fill_(0.0)
+            self.repetition_penalties.fill_(1.0)
 
     def refresh_metadata_rbln(self, bucket_size: int):
         """Apply any batch updates to sampling metadata."""
@@ -112,26 +131,9 @@ class RBLNInputBatch(InputBatch):
             # step pooling during the sampling/pooling process.
             # Hence copy these tensors only when there are requests which
             # need penalties/step_pooler to be applied.
-            # vLLM 0.19 renamed _make_prompt_token_ids_tensor to _cpu_tensor.
-            if hasattr(self, "_make_prompt_token_ids_cpu_tensor"):
-                prompt_token_ids = self._make_prompt_token_ids_cpu_tensor()
-            else:
-                prompt_token_ids = self._make_prompt_token_ids_tensor()
+            prompt_token_ids = self._make_prompt_token_ids_tensor()
         else:
             prompt_token_ids = None
-
-        # Only set output_token_ids if required by the current requests'
-        # sampling parameters.
-        needs_output_token_ids = (
-            not self.no_penalties
-            or bool(self.bad_words_token_ids)
-            or self.logitsprocs_need_output_token_ids
-        )
-        output_token_ids = (
-            cast(list[list[int]], self.req_output_token_ids)
-            if needs_output_token_ids
-            else []
-        )
 
         allowed_token_ids_mask: torch.Tensor | None = None
         if not self.no_allowed_token_ids:
@@ -155,7 +157,7 @@ class RBLNInputBatch(InputBatch):
             frequency_penalties=self.frequency_penalties[:num_reqs],
             presence_penalties=self.presence_penalties[:num_reqs],
             repetition_penalties=self.repetition_penalties[:num_reqs],
-            output_token_ids=output_token_ids,
+            output_token_ids=cast(list[list[int]], self.req_output_token_ids),
             no_penalties=self.no_penalties,
             allowed_token_ids_mask=allowed_token_ids_mask,
             bad_words_token_ids=self.bad_words_token_ids,
