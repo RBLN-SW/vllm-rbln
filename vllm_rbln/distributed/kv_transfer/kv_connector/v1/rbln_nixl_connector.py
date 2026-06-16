@@ -290,26 +290,39 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
     ) -> None:
         super().__init__(vllm_config, engine_id, kv_cache_config)
 
-        # Both paths transport via the RBLN NIXL backend. The plugin
-        # advertises DRAM_SEG (host pinned MR via ibv_reg_mr) and
-        # VRAM_SEG (device dmabuf via ibv_reg_dmabuf_mr) — host-bounce
-        # uses the former, D2D the latter.
+        # Pick the NIXL transport backend.
+        #   * nixl-rbln installed  → use RBLN backend on both paths
+        #     (host-bounce DRAM_SEG / D2D VRAM_SEG via ibv_reg{,_dmabuf}_mr).
+        #   * nixl-rbln absent     → upstream defaults stand (UCX backend,
+        #     DRAM only). D2D (`kv_buffer_device="rbln"`) requires the
+        #     RBLN backend and is rejected here.
         try:
             import nixl_rbln  # noqa: F401
-        except ImportError as e:
+
+            self._use_rbln_nixl_backend = True
+        except ImportError:
+            self._use_rbln_nixl_backend = False
+
+        if self._use_rbln_nixl_backend:
+            self.nixl_backends = ["RBLN"]
+            # D2D registers VRAM (device dmabuf); host-bounce keeps DRAM.
+            if self.kv_buffer_device == "rbln":
+                self.nixl_memory_type = "VRAM"
+        elif self.kv_buffer_device == "rbln":
             raise RuntimeError(
-                "RblnNixlConnectorWorker requires the 'nixl-rbln' adapter "
-                f"package. (import failed: {e})"
-            ) from e
-        self.nixl_backends = ["RBLN"]
+                "kv_buffer_device='rbln' (D2D) requires the 'nixl-rbln' "
+                "adapter package; install it or set kv_buffer_device='cpu' "
+                "to fall back to the upstream NIXL (UCX) host-bounce path."
+            )
+        else:
+            logger.info(
+                "RblnNixlConnectorWorker: nixl-rbln not available — "
+                "using upstream NIXL (UCX) on the host-bounce path."
+            )
 
         # `RblnPlatform.device_type = "cpu"` makes upstream skip the host
         # buffer; restore it — NIXL cannot register RBLN device memory.
         self.use_host_buffer = self.kv_buffer_device == "cpu"
-
-        # D2D registers VRAM (device dmabuf); host-bounce keeps DRAM.
-        if self.kv_buffer_device == "rbln":
-            self.nixl_memory_type = "VRAM"
 
         # D2D-only state, declared on both paths so set_runtime_holder /
         # finalize_kv_cache_registration can access without a getattr probe.
@@ -389,11 +402,11 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
         isn't materialized until warm-up. Backend creation happens in
         `_register_kv_caches_impl` via `nixl_rbln.register_kv_regions`.
 
-        Host-bounce (`kv_buffer_device="cpu"`): create the RBLN backend
-        on the agent so upstream's `register_memory(..., backends=["RBLN"])`
-        resolves, then run the standard registration. Per-worker process
-        sees exactly one rbln device via `RBLN_DEVICES`, so device 0 is
-        always the local one.
+        Host-bounce (`kv_buffer_device="cpu"`): when nixl-rbln is
+        available, create the RBLN backend on the agent so upstream's
+        `register_memory(..., backends=["RBLN"])` resolves. Otherwise
+        fall straight through to upstream's UCX-backed registration —
+        the host xfer buffers are plain DRAM in either case.
         """
         if self.kv_buffer_device == "rbln":
             self._pending_kv_caches = kv_caches
@@ -403,8 +416,10 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
                 len(kv_caches),
             )
             return
-        import nixl_rbln
-        nixl_rbln.ensure_rbln_backend(self.nixl_wrapper, device_id=0)
+        if self._use_rbln_nixl_backend:
+            import nixl_rbln
+
+            nixl_rbln.ensure_rbln_backend(self.nixl_wrapper, device_id=0)
         super().register_kv_caches(kv_caches)
 
     def finalize_kv_cache_registration(self) -> None:
