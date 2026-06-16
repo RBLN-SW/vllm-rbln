@@ -205,9 +205,10 @@ class RBLNOptimumScheduler(Scheduler):
 
         # NOTE(vllm 0.22): inherited _update_after_schedule/update_from_output
         # read this attribute. Always False on RBLN (no routed-experts return).
-        self.enable_return_routed_experts = (
-            vllm_config.model_config.enable_return_routed_experts
-        )
+        if vllm_config.model_config.enable_return_routed_experts:
+            raise NotImplementedError("enable_return_routed_experts is not supported.")
+
+        self.enable_return_routed_experts = False
         # Encoder-related.
         # It is not used in RBLN.
         # But for reuse original functions(e.g. free_request) in vLLM,
