@@ -24,13 +24,13 @@ from vllm.distributed.kv_transfer.kv_connector.utils import (
     EngineId,
     yield_req_data,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1 import nixl_connector
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     CopyBlocksOp,
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1 import nixl_connector
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl_connector import (
     NixlAgentMetadata,
     NixlConnector,
@@ -677,8 +677,7 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
                 region_offset = cache.data_ptr() - entry_base_addr
                 if isinstance(layer_spec, nixl_connector.MambaSpec):
                     full_block_len = (
-                        physical_page_size
-                        // self._physical_blocks_per_logical_kv_block
+                        physical_page_size // self._physical_blocks_per_logical_kv_block
                     )
                 else:
                     full_block_len = physical_page_size
@@ -707,7 +706,10 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
         # connector's descriptor math is correct without this connector
         # knowing the shard count.
         xfer = nixl_rbln.register_kv_regions(
-            self.nixl_wrapper, regions, device_id, mem=self.nixl_memory_type,
+            self.nixl_wrapper,
+            regions,
+            device_id,
+            mem=self.nixl_memory_type,
             rbln_ctx_ptr=rbln_ctx_ptr,
         )
         self.device_id = device_id
@@ -724,7 +726,8 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
         logger.info(
             "RblnNixlConnectorWorker (D2D): registered %d transfer "
             "region(s) across %d shard(s) (K/V split).",
-            self.num_regions, xfer.n_shards,
+            self.num_regions,
+            xfer.n_shards,
         )
 
         self.device_kv_caches = kv_caches
@@ -797,9 +800,7 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
             "RBLN NIXL connector only supports FA layout (K and V in "
             "separate regions), not FlashInfer."
         )
-        assert not self._has_mamba, (
-            "RBLN NIXL connector does not support Mamba layers."
-        )
+        assert not self._has_mamba, "RBLN NIXL connector does not support Mamba layers."
 
         block_size_ratio = self.block_size // block_size
         local_base_addresses = self.kv_caches_base_addr[self.engine_id][self.tp_rank]
@@ -899,15 +900,11 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
                     addr, local_block_len, own_tp_rank = memory_region
                     remote_block_len = local_block_len // (-tp_ratio)
                     addr = addr + i * remote_block_len
-                    split_blocks_data.append(
-                        (addr, remote_block_len, own_tp_rank)
-                    )
+                    split_blocks_data.append((addr, remote_block_len, own_tp_rank))
                 descs = self.nixl_wrapper.get_xfer_descs(
                     split_blocks_data, self.nixl_memory_type
                 )
-                handle = self.nixl_wrapper.prep_xfer_dlist(
-                    "NIXL_INIT_AGENT", descs
-                )
+                handle = self.nixl_wrapper.prep_xfer_dlist("NIXL_INIT_AGENT", descs)
                 self.src_xfer_handles_by_tp_ratio[tp_ratio].append(handle)
 
         blocks_data: list[tuple[int, int, int]] = []
@@ -937,9 +934,7 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
                 page_size = nixl_agent_meta.block_lens[i]
                 for block_id in range(num_blocks):
                     addr = base_addr + block_id * page_size + rank_offset
-                    blocks_data.append(
-                        (addr, desc_len, nixl_agent_meta.device_id)
-                    )
+                    blocks_data.append((addr, desc_len, nixl_agent_meta.device_id))
 
         logger.debug(
             "Created %s remote blocks (%s) for dst engine %s "
@@ -988,7 +983,5 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
             is_sw = isinstance(self._group_specs[g], SlidingWindowSpec)
             offset = num_full_descs if is_sw else 0
             group_arr = np.asarray(group)[None, :]
-            all_descs.append(
-                (region_ids * num_blocks + group_arr + offset).flatten()
-            )
+            all_descs.append((region_ids * num_blocks + group_arr + offset).flatten())
         return np.concatenate(all_descs) if all_descs else np.empty(0, dtype=int)
