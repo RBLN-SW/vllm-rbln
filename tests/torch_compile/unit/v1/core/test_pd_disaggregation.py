@@ -533,6 +533,7 @@ def _build_connector_worker(
     Returns the constructed worker so tests can inspect post-__init__ state.
     """
     import sys
+    import types
     from unittest.mock import patch
 
     from vllm.config import CacheConfig
@@ -565,7 +566,11 @@ def _build_connector_worker(
         # ImportError, simulating an environment without the adapter.
         patch.dict(sys.modules, {"nixl_rbln": None})
         if not nixl_rbln_available
-        else patch.dict(sys.modules, {})
+        # Inject a stub so `import nixl_rbln` in __init__ succeeds whether or
+        # not the adapter is actually installed (it is absent on CI /
+        # non-RBLN hosts). __init__ only imports it; tests that drive the
+        # impl patch in their own detailed fake module.
+        else patch.dict(sys.modules, {"nixl_rbln": types.ModuleType("nixl_rbln")})
     )
     with (
         modules_patch,
@@ -1415,6 +1420,8 @@ class TestRblnNixlConnectorWorkerRegisterKvCachesDispatch:
     upstream's flow after creating the RBLN backend on the agent."""
 
     def test_rbln_stashes_kv_caches_and_returns(self):
+        import sys
+        import types
         from unittest.mock import patch
 
         worker = _build_d2d_worker()
@@ -1426,19 +1433,23 @@ class TestRblnNixlConnectorWorkerRegisterKvCachesDispatch:
             rbln_nixl_connector as conn_mod,
         )
 
+        fake_nixl_rbln: Any = types.ModuleType("nixl_rbln")
+        fake_nixl_rbln.ensure_rbln_backend = MagicMock()
         with (
+            patch.dict(sys.modules, {"nixl_rbln": fake_nixl_rbln}),
             patch.object(
                 conn_mod.NixlConnectorWorker, "register_kv_caches"
             ) as super_register,
-            patch("nixl_rbln.ensure_rbln_backend") as ensure_backend,
         ):
             worker.register_kv_caches(kv_caches)
 
         super_register.assert_not_called()
-        ensure_backend.assert_not_called()
+        fake_nixl_rbln.ensure_rbln_backend.assert_not_called()
         assert worker._pending_kv_caches is kv_caches
 
     def test_cpu_creates_backend_and_delegates_to_super(self):
+        import sys
+        import types
         from unittest.mock import patch
 
         from vllm_rbln.distributed.kv_transfer.kv_connector.v1 import (
@@ -1451,15 +1462,19 @@ class TestRblnNixlConnectorWorkerRegisterKvCachesDispatch:
         worker.nixl_wrapper = MagicMock()
         kv_caches = {"l0": MagicMock()}
 
+        fake_nixl_rbln: Any = types.ModuleType("nixl_rbln")
+        fake_nixl_rbln.ensure_rbln_backend = MagicMock()
         with (
+            patch.dict(sys.modules, {"nixl_rbln": fake_nixl_rbln}),
             patch.object(
                 conn_mod.NixlConnectorWorker, "register_kv_caches"
             ) as super_register,
-            patch("nixl_rbln.ensure_rbln_backend") as ensure_backend,
         ):
             worker.register_kv_caches(kv_caches)
 
-        ensure_backend.assert_called_once_with(worker.nixl_wrapper, device_id=0)
+        fake_nixl_rbln.ensure_rbln_backend.assert_called_once_with(
+            worker.nixl_wrapper, device_id=0
+        )
         super_register.assert_called_once_with(kv_caches)
         # The D2D-only slot must stay clear on the host-bounce path.
         assert worker._pending_kv_caches is None
@@ -1711,6 +1726,10 @@ class TestRblnNixlConnectorWorkerRegisterKvCachesImpl:
         `connector.set_runtime_holder` before warm-up. If
         `_register_kv_caches_impl` runs first, the impl must fail
         loudly instead of dereferencing `None`."""
+        import sys
+        import types
+        from unittest.mock import patch
+
         import pytest
 
         worker = self._prep_worker(runtime_holder=None)
@@ -1727,7 +1746,10 @@ class TestRblnNixlConnectorWorkerRegisterKvCachesImpl:
         topo.get_transfer_cache_regions.side_effect = self._split_kv(worker.num_blocks)
         _, nc_patch = self._patch_nixl_connector(topo)
         try:
-            with pytest.raises(AssertionError, match="runtime_holder"):
+            with (
+                patch.dict(sys.modules, {"nixl_rbln": types.ModuleType("nixl_rbln")}),
+                pytest.raises(AssertionError, match="runtime_holder"),
+            ):
                 worker._register_kv_caches_impl(kv_caches)
         finally:
             nc_patch.stop()
