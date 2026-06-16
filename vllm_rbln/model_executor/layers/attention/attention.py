@@ -27,7 +27,6 @@ from vllm.model_executor.models.utils import extract_layer_index
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 
-import vllm_rbln.rbln_envs as envs
 from vllm_rbln.v1.attention.kv_cache_bindings import materialize_kv_cache_view
 from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 
@@ -152,30 +151,8 @@ def _rbln_get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         )
 
 
-# NOTE(RBLN) fsw-inference#325: in the device-tensor (export) compile path,
-# some rebel-compiler/driver versions split the attention forward into multiple
-# distinct-named executors when a KV connector is active, so rebel's nameless
-# `create_runtime` aborts warm-up with "All executors must have the same name".
-# Fix B (verified on the cluster image): exclude the KV-transfer wrapper from
-# the dynamo-traced graph via `torch._dynamo.disable`, so it can never feed the
-# split. The wrapper still runs eagerly at runtime — wait_for_layer_load /
-# save_kv_layer fire for real KV transfer; only dynamo tracing graph-breaks
-# over it. `torch._dynamo.disable(maybe_transfer_kv_layer(f))` is the same
-# object as decorating the inner `wrapper` with `@torch._dynamo.disable`.
-#
-# Gated on VLLM_RBLN_USE_DEVICE_TENSOR: the multi-executor abort only happens in
-# the device-tensor path (which RblnNixlConnector forces). The disable inserts a
-# per-attention-layer graph break, so we keep the plain single-graph compile for
-# normal (non-device-tensor) serving to avoid a needless regression there.
-def _kv_layer_wrapper(func):
-    wrapped = maybe_transfer_kv_layer(func)
-    if envs.VLLM_RBLN_USE_DEVICE_TENSOR:
-        wrapped = torch._dynamo.disable(wrapped)
-    return wrapped
-
-
-vllm_attn.unified_attention = _kv_layer_wrapper(_rbln_unified_attention)
-vllm_attn.unified_attention_with_output = _kv_layer_wrapper(
+vllm_attn.unified_attention = maybe_transfer_kv_layer(_rbln_unified_attention)
+vllm_attn.unified_attention_with_output = maybe_transfer_kv_layer(
     _rbln_unified_attention_with_output
 )
 
