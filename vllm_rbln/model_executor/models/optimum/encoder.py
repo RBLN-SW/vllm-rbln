@@ -105,7 +105,7 @@ class RBLNOptimumForEncoderModel(RBLNOptimumModelBase, VllmModelForPooling):
         #   ----------------  -----------  ----------------------  ------------
         #   cross-encoder     classify     joint -> classifier     bge-reranker
         #   bi-encoder        embed        cosine of 2 embeddings  bge-m3
-        #   late-interaction  token_embed  token-wise MaxSim       (none here)
+        #   late-interaction  token_embed  token-wise MaxSim            - 
         # Cross-encoders (classify, num_labels=1) use the classifier head/
         # activation (RBLNClassifierPooler); others use the embed/token_embed pooler.
         if self.is_classification_arch():
