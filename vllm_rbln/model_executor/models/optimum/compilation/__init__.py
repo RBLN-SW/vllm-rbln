@@ -18,10 +18,7 @@ from typing import Any
 from transformers import PretrainedConfig
 
 import optimum.rbln
-from optimum.rbln import (
-    RBLNAutoModelForCausalLM,
-    RBLNAutoModelForSpeechSeq2Seq,
-)
+from optimum.rbln import RBLNAutoModel
 from vllm_rbln.utils.optimum.registry import (
     get_rbln_model_info,
     is_enc_dec_arch,
@@ -30,10 +27,7 @@ from vllm_rbln.utils.optimum.registry import (
     is_pooling_arch,
 )
 
-from .multimodal import (
-    _COMPILE_MULTIMODAL_FNS,
-    get_multimodal_cls,
-)
+from .multimodal import _COMPILE_MULTIMODAL_FNS
 
 
 def _deep_merge(base: dict, overrides: dict) -> None:
@@ -136,7 +130,7 @@ class RBLNCompileSpec:
         if block_size != max_model_len:
             rbln_config["kvcache_partition_len"] = block_size
             rbln_config["attn_impl"] = "flash_attn"
-        return cls(model_cls=RBLNAutoModelForCausalLM, rbln_config=rbln_config)
+        return cls(model_cls=RBLNAutoModel, rbln_config=rbln_config)
 
     @classmethod
     def _for_pooling(
@@ -181,7 +175,7 @@ class RBLNCompileSpec:
                 f"Supported aliases: {sorted(_COMPILE_MULTIMODAL_FNS.keys())}"
             )
         return cls(
-            model_cls=get_multimodal_cls(),
+            model_cls=RBLNAutoModel,
             rbln_config=compile_fn(batch_size, max_model_len, block_size, tp_size),
         )
 
@@ -206,7 +200,7 @@ class RBLNCompileSpec:
             "from the HuggingFace config."
         )
         return cls(
-            model_cls=RBLNAutoModelForSpeechSeq2Seq,
+            model_cls=RBLNAutoModel,
             rbln_config={
                 "tensor_parallel_size": tp_size,
                 "batch_size": batch_size,

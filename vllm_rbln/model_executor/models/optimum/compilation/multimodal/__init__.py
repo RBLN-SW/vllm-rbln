@@ -14,9 +14,6 @@
 # limitations under the License.
 
 from collections.abc import Callable
-from typing import Any
-
-from optimum.rbln import RBLNAutoModel
 
 from .blip2 import get_param_blip2
 from .gemma3 import get_param_gemma3
@@ -29,11 +26,6 @@ from .qwen import (
     get_param_qwen3_vl,
     get_param_qwen3_vl_moe,
 )
-
-
-def get_multimodal_cls() -> type[Any]:
-    return RBLNAutoModel
-
 
 _COMPILE_MULTIMODAL_FNS: dict[str, Callable[[int, int, int, int], dict]] = {
     "blip2": get_param_blip2,
