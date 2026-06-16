@@ -4658,7 +4658,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 continue
             full_layer = next(
                 (
-                    ln for ln in pool_layers
+                    ln
+                    for ln in pool_layers
                     if isinstance(layer_to_spec.get(ln), FullAttentionSpec)
                 ),
                 None,

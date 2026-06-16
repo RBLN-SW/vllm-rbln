@@ -620,12 +620,10 @@ def _make_kv_cache_config(pools, layer_specs):
     `layer_specs`: dict layer_name -> KVCacheSpec.
     """
     kv_cache_config = MagicMock()
-    kv_cache_config.kv_cache_tensors = [
-        MagicMock(shared_by=pool) for pool in pools
-    ]
+    kv_cache_config.kv_cache_tensors = [MagicMock(shared_by=pool) for pool in pools]
     # Drive `_attn_group_iterator` via attn_groups[i][j].
     # Each AttentionGroup needs `layer_names` and `kv_cache_spec`.
-    grouped: dict[type, dict] = {}
+    grouped: dict[int, dict] = {}
     for layer_name, spec in layer_specs.items():
         grouped.setdefault(id(spec), {"spec": spec, "layers": []})["layers"].append(
             layer_name
@@ -647,8 +645,8 @@ class TestSelectCanonicalKvLayersPerPool:
         runner.attn_groups = attn_groups
         # `_attn_group_iterator` is itertools.chain.from_iterable(attn_groups);
         # bind it via the same class so the implementation under test is reached.
-        runner._attn_group_iterator = (
-            RBLNModelRunner._attn_group_iterator.__get__(runner)
+        runner._attn_group_iterator = RBLNModelRunner._attn_group_iterator.__get__(
+            runner
         )
         runner._select_canonical_kv_layers_per_pool = (
             RBLNModelRunner._select_canonical_kv_layers_per_pool.__get__(runner)
