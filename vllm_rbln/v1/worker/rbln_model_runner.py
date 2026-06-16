@@ -1474,12 +1474,11 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
             if isinstance(kv_cache_group_spec.kv_cache_spec, EncoderOnlyAttentionSpec):
                 # Encoder-only layers do not have KV cache, so we need to
-                # create a dummy block table and slot mapping for them.
-                device_kwarg = (
-                    {} if envs.VLLM_RBLN_USE_DEVICE_TENSOR else {"device": self.device}
-                )
+                # create a dummy block table and slot mapping for them. Keep it
+                # on self.device to match the real block table (get_device_tensor)
+                # and the slot_mapping below so the whole batch stays on-device.
                 blk_table_tensor = torch.zeros(
-                    (num_reqs, 1), dtype=torch.int32, **device_kwarg
+                    (num_reqs, 1), dtype=torch.int32, device=self.device
                 )
                 slot_mapping = torch.zeros(
                     (total_query_tokens,),
@@ -1980,9 +1979,9 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 **self._extract_mm_kwargs(scheduler_output),
             }
         else:
-            # For text-only models, we use token ids as input. Under device-tensor
-            # mode, use the CPU buffer so view/pad/clone stay on CPU; it is moved
-            # to self.device just before model_executable.
+            # For text-only models, we use token ids as input. Use the device
+            # buffer directly so input_ids flows e2e as a device tensor with no
+            # CPU staging.
             input_ids = self.input_ids.gpu[:num_input_tokens]
             inputs_embeds = None
             model_kwargs = self._init_model_kwargs(num_input_tokens)
