@@ -101,13 +101,13 @@ class RBLNOptimumForEncoderModel(RBLNOptimumModelBase, VllmModelForPooling):
         # vLLM groups score()-capable models into three "score types"
         # (docs/models/pooling_models, score_types.svg). Which pooler we build
         # below depends on which one this model is:
-        #   score type        task                    score computation          example
-        #   ----------------  ----------------------  -------------------------  ------------
-        #   cross-encoder     classify (num_labels=1) joint input -> classifier  bge-reranker
-        #   bi-encoder        embed                   cosine of two embeddings   bge-m3
-        #   late-interaction  token_embed             token-wise MaxSim          (n/a here)
-        # Cross-encoders need the classifier head/activation (RBLNClassifierPooler);
-        # everything else is served by the embed / token_embed pooler.
+        #   score type        task         score computation       example
+        #   ----------------  -----------  ----------------------  ------------
+        #   cross-encoder     classify     joint -> classifier     bge-reranker
+        #   bi-encoder        embed        cosine of 2 embeddings  bge-m3
+        #   late-interaction  token_embed  token-wise MaxSim       (none here)
+        # Cross-encoders (classify, num_labels=1) use the classifier head/
+        # activation (RBLNClassifierPooler); others use the embed/token_embed pooler.
         if self.is_classification_arch():
             self.pooler = RBLNClassifierPooler(vllm_config.model_config)
         else:
