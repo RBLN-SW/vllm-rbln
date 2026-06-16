@@ -292,20 +292,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         else:
             self.max_encoder_len = 0
 
-        if not envs.VLLM_RBLN_USE_DEVICE_TENSOR:
-            # Only provide use_global_ctx if CompileContext supports it
-            import inspect
-
-            from rebel.compile_context import CompileContext
-
-            compile_ctx_args = {}
-            if "use_weight_sharing" in inspect.signature(CompileContext).parameters:
-                compile_ctx_args["use_weight_sharing"] = True
-            if "use_global_ctx" in inspect.signature(CompileContext).parameters:
-                compile_ctx_args["use_global_ctx"] = True
-            self.compile_context = CompileContext(**compile_ctx_args)
-        else:
-            self.compile_context = None
+        self.compile_context = None
         self.runtime_holder: list = []
 
         # Sampler
@@ -1335,11 +1322,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # from these partial requests, we do so for simplicity.
             # We will ignore the sampled tokens from the partial requests.
             # TODO: Support prompt logprobs.
-            logits_indices = (
-                query_start_loc_cpu
-                if envs.VLLM_RBLN_USE_DEVICE_TENSOR
-                else query_start_loc
-            )[1:] - 1
+            logits_indices = query_start_loc_cpu[1:] - 1
             num_draft_tokens = None
             spec_decode_metadata = None
             num_sampled_tokens = np.ones(num_reqs, dtype=np.int32)
@@ -1494,12 +1477,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             if isinstance(kv_cache_group_spec.kv_cache_spec, EncoderOnlyAttentionSpec):
                 # Encoder-only layers do not have KV cache, so we need to
                 # create a dummy block table and slot mapping for them.
-                device_kwarg = (
-                    {} if envs.VLLM_RBLN_USE_DEVICE_TENSOR else {"device": self.device}
-                )
-                blk_table_tensor = torch.zeros(
-                    (num_reqs, 1), dtype=torch.int32, **device_kwarg
-                )
+                blk_table_tensor = torch.zeros((num_reqs, 1), dtype=torch.int32)
                 slot_mapping = torch.zeros(
                     (total_query_tokens,),
                     dtype=torch.int64,
@@ -1508,11 +1486,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 num_common_prefix_blocks = 0
             else:
                 blk_table = self.input_batch.block_table[kv_cache_group_id]
-                blk_table_tensor = (
-                    blk_table.get_cpu_tensor()[:num_reqs]
-                    if envs.VLLM_RBLN_USE_DEVICE_TENSOR
-                    else blk_table.get_device_tensor(num_reqs)
-                )
+                blk_table_tensor = blk_table.get_cpu_tensor()[:num_reqs]
                 slot_mapping = blk_table.slot_mapping.gpu[:total_query_tokens]
 
                 # Fill unused with -1. Needed for reshape_and_cache in full cuda
@@ -1614,10 +1588,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             "mode": "strict",
             "_runtime_holder": self.runtime_holder,
         }
-        if envs.VLLM_RBLN_USE_DEVICE_TENSOR:
-            options["model_trace_method"] = "export"
-        else:
-            options["compile_context"] = self.compile_context
+        options["model_trace_method"] = "export"
         if not envs.VLLM_DISABLE_COMPILE_CACHE:
             logger.info(
                 "Once the model is compiled for the first time, "
@@ -1976,7 +1947,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # _prepare_inputs may reorder the batch, so we must gather multi
         # modal outputs after that to ensure the correct order
-        use_dt = envs.VLLM_RBLN_USE_DEVICE_TENSOR
         if (
             self.supports_mm_inputs
             and get_pp_group().is_first_rank
@@ -2004,18 +1974,18 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 **self._extract_mm_kwargs(scheduler_output),
             }
         else:
-            # For text-only models, we use token ids as input. Under device-tensor
-            # mode, use the CPU buffer so view/pad/clone stay on CPU; it is moved
-            # to self.device just before model_executable.
-            ids_buf = self.input_ids.cpu if use_dt else self.input_ids.gpu
+            # For text-only models, we use token ids as input. Use the CPU
+            # buffer so view/pad/clone stay on CPU; it is moved to self.device
+            # just before model_executable.
+            ids_buf = self.input_ids.cpu
             input_ids = ids_buf[:num_input_tokens]
             inputs_embeds = None
             model_kwargs = self._init_model_kwargs(num_input_tokens)
         if self.uses_mrope:
-            pos_buf = self.mrope_positions.cpu if use_dt else self.mrope_positions.gpu
+            pos_buf = self.mrope_positions.cpu
             positions = pos_buf[:, :num_input_tokens]
         else:
-            pos_buf = self.positions.cpu if use_dt else self.positions.gpu
+            pos_buf = self.positions.cpu
             positions = pos_buf[:num_input_tokens]
 
         if (
@@ -2116,8 +2086,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # SamplingMetadata. Padding it there mis-sizes the bonus temperature
         # broadcast and trips expand_batch_to_tokens.
         if (
-            envs.VLLM_RBLN_USE_DEVICE_TENSOR
-            and spec_decode_metadata is None
+            spec_decode_metadata is None
             and logits is not None
             and logits.shape[0] > self.input_batch.num_reqs
         ):
@@ -2925,11 +2894,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         req_ids_output_copy = self.input_batch.req_ids.copy()
         req_id_to_index_output_copy = self.input_batch.req_id_to_index.copy()
 
-        num_sampled_tokens = (
-            self.input_batch.num_reqs
-            if envs.VLLM_RBLN_USE_DEVICE_TENSOR
-            else sampler_output.sampled_token_ids.shape[0]
-        )
+        num_sampled_tokens = self.input_batch.num_reqs
         sampled_token_ids = sampler_output.sampled_token_ids[:num_sampled_tokens]
         logprobs_tensors = sampler_output.logprobs_tensors
         invalid_req_indices = []
@@ -3106,20 +3071,11 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self,
         copy_ops: "list[KVCacheCopyOp]",
     ) -> None:
-        if (
-            envs.VLLM_RBLN_USE_DEVICE_TENSOR
-            or self.model_config.enforce_eager
-            or not envs.VLLM_RBLN_COMPILE_MODEL
-        ):
-            for op in copy_ops:
-                for kv_cache in self.kv_caches:
-                    kv_cache[:, op.dst_block_id, :, :, : op.num_tokens, :] = kv_cache[
-                        :, op.src_block_id, :, :, : op.num_tokens, :
-                    ]
-        else:
-            runtime = self.runtime_holder[0]
-            for op in copy_ops:
-                runtime._copy_kv_cache(op.src_block_id, op.dst_block_id, op.num_tokens)
+        for op in copy_ops:
+            for kv_cache in self.kv_caches:
+                kv_cache[:, op.dst_block_id, :, :, : op.num_tokens, :] = kv_cache[
+                    :, op.src_block_id, :, :, : op.num_tokens, :
+                ]
 
     @staticmethod
     def _is_kv_connector_warm_up_phase(scheduler_output: "SchedulerOutput") -> bool:
@@ -3332,9 +3288,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # eventual `logits_indices.to(self.device)` is the only place a
             # device hop happens. Doing the cumsum / repeat_interleave
             # remap on the device side hits a CPU-vs-device indexing
-            # mismatch under VLLM_RBLN_USE_DEVICE_TENSOR=1, because
-            # `input_ids.device` (cpu staging in dummy run) and
-            # `logits_indices.device` (rbln) diverge.
+            # mismatch, because `input_ids.device` (cpu staging in dummy run)
+            # and `logits_indices.device` (rbln) diverge.
             num_scheduled_tokens_per_req_cpu = torch.tensor(
                 [
                     scheduler_output.num_scheduled_tokens[i]
@@ -3637,10 +3592,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     else:  # decode
                         # selected_token_indices is for valid decode tokens
                         # token_indices == None, selected = torch.tensor([0])
-                        if self.speculative_config is None:
-                            if not envs.VLLM_RBLN_USE_DEVICE_TENSOR:
-                                logits = logits[:num_input_tokens]
-                        else:
+                        if self.speculative_config is not None:
                             batch_indices = torch.arange(
                                 self.input_batch.num_reqs, device=self.device
                             )
@@ -4704,16 +4656,9 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         """
         kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-            if envs.VLLM_RBLN_USE_DEVICE_TENSOR:
-                device = self.device
-                tensor = torch.empty(
-                    kv_cache_tensor.size, dtype=torch.int8, device=device
-                )
-            else:
-                device = "cpu" if not envs.VLLM_RBLN_COMPILE_MODEL else "meta"
-                tensor = torch.zeros(
-                    kv_cache_tensor.size, dtype=torch.int8, device=device
-                )
+            tensor = torch.empty(
+                kv_cache_tensor.size, dtype=torch.int8, device=self.device
+            )
             for layer_name in kv_cache_tensor.shared_by:
                 kv_cache_raw_tensors[layer_name] = tensor
 
@@ -5055,16 +5000,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self.kv_caches,
             num_attn_module,
         )
-        if (
-            not envs.VLLM_RBLN_USE_DEVICE_TENSOR
-            and not self.model_config.enforce_eager
-            and envs.VLLM_RBLN_COMPILE_MODEL
-        ):
-            kv_cache_names = get_kv_cache_names(kv_caches, num_attn_module)
-            assert len(kv_cache_names) == len(self.kv_caches)
-            for kv_cache, name in zip(self.kv_caches, kv_cache_names):
-                self.compile_context.mark_static_address(kv_cache, name)
-
         self._log_kv_cache_info(kv_cache_config, kv_caches)
         return kv_caches
 

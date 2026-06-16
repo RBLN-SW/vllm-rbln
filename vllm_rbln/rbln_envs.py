@@ -53,7 +53,6 @@ if TYPE_CHECKING:
     VLLM_RBLN_COMBINE_ALL2ALL: bool = False
     VLLM_RBLN_MOE_REDUCE_SCATTER: bool = False
     VLLM_RBLN_SUB_BLOCK_CACHE: bool = True
-    VLLM_RBLN_USE_DEVICE_TENSOR: bool = False
     VLLM_RBLN_DISABLE_OFFLOAD: bool = False
     VLLM_RBLN_COMPILE_ONLY: bool = False
 
@@ -143,15 +142,7 @@ def get_decode_batch_bucket_manual_buckets() -> list[int]:
 
 
 def use_auto_port() -> bool:
-    raw = os.environ.get("VLLM_RBLN_AUTO_PORT")
-    if raw is not None:
-        return raw.lower() in ("true", "1")
-    # Default follows device-tensor mode: auto port is on when
-    # VLLM_RBLN_USE_DEVICE_TENSOR is enabled.
-    return os.environ.get("VLLM_RBLN_USE_DEVICE_TENSOR", "False").lower() in (
-        "true",
-        "1",
-    )
+    return os.environ.get("VLLM_RBLN_AUTO_PORT", "True").lower() in ("true", "1")
 
 
 # extended environments
@@ -313,15 +304,6 @@ environment_variables = {
     # Sub-block size equals max_num_batched_tokens (prefill chunk size).
     "VLLM_RBLN_SUB_BLOCK_CACHE": lambda: (
         os.environ.get("VLLM_RBLN_SUB_BLOCK_CACHE", "True").lower() in ("true", "1")
-    ),
-    # Use RBLN device tensors end-to-end (platform device_type="rbln",
-    # KV cache / inputs on device, CPU-first attention metadata, padded
-    # sampling metadata, no CompileContext). Opt-in until stable.
-    "VLLM_RBLN_USE_DEVICE_TENSOR": (
-        lambda: (
-            os.environ.get("VLLM_RBLN_USE_DEVICE_TENSOR", "False").lower()
-            in ("true", "1")
-        )
     ),
     # Disable RBLN file offloading during model load / warm-up even when
     # VLLM_RBLN_USE_DEVICE_TENSOR is set. Kill-switch for the offload path;

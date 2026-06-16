@@ -57,17 +57,10 @@ def resolve_compile_context(
 
 def build_compile_options(compile_context: rebel.CompileContext) -> dict:
     """Build the torch.compile ``options`` dict shared by the RBLN samplers."""
-    use_dt = envs.VLLM_RBLN_USE_DEVICE_TENSOR
     options: dict = {}
-    if not use_dt:
-        options["compile_context"] = compile_context
     if envs.VLLM_RBLN_COMPILE_STRICT_MODE:
         options["mode"] = "strict"
-    if has_torch_rbln or use_dt:
-        options["tensor_parallel_size"] = 1
-        if not use_dt:
-            options["use_global_ctx"] = True
-            options["global_device_id"] = 0
+    options["tensor_parallel_size"] = 1
     return options
 
 
@@ -112,8 +105,7 @@ class RBLNTopKTopPSampler(nn.Module):
         )
 
         options = build_compile_options(compile_context)
-        if envs.VLLM_RBLN_USE_DEVICE_TENSOR:
-            options["model_trace_method"] = "export"
+        options["model_trace_method"] = "export"
 
         self._compiled_rbln_topk_topp_sampler = torch.compile(
             rbln_top_k_top_p_sample,
