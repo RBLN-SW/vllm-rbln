@@ -612,12 +612,15 @@ def test_propose_multistep_updates_metadata_and_rebuilds_attention():
             return first_hidden_states, logits
 
         assert len(calls) == 2
-        assert input_ids.shape == (4, 1)
-        assert positions.shape == (4, 1)
-        assert hidden_states.shape == (4, 1, 4)
-        assert last_token_indices is None
+        assert input_ids.shape == (4, 3)
+        assert positions.shape == (4, 3)
+        assert hidden_states.shape == (4, 3, 4)
+        torch.testing.assert_close(
+            last_token_indices,
+            torch.tensor([0, 3, 6, 9], dtype=torch.int32),
+        )
 
-        expected_hidden = torch.zeros((4, 1, 4), dtype=torch.float32)
+        expected_hidden = torch.zeros((4, 3, 4), dtype=torch.float32)
         expected_hidden[0, 0] = first_hidden_states[1]
         expected_hidden[1, 0] = first_hidden_states[3]
         torch.testing.assert_close(hidden_states, expected_hidden)
@@ -626,7 +629,7 @@ def test_propose_multistep_updates_metadata_and_rebuilds_attention():
             [[0.0, 1.0, 0.0, 8.0, 0.0], [0.0, 1.0, 0.0, 0.0, 9.0]],
             dtype=torch.float32,
         )
-        return torch.zeros((4, 4), dtype=torch.float32), logits
+        return torch.zeros((12, 4), dtype=torch.float32), logits
 
     fake.model_executable = model_executable
 
@@ -649,7 +652,7 @@ def test_propose_multistep_updates_metadata_and_rebuilds_attention():
     torch.testing.assert_close(cad.seq_lens, torch.tensor([10, 1], dtype=torch.int32))
     torch.testing.assert_close(
         cad.slot_mapping,
-        torch.tensor([47, PADDING_SLOT_ID], dtype=torch.int64),
+        torch.tensor([47] + [PADDING_SLOT_ID] * 11, dtype=torch.int64),
     )
     torch.testing.assert_close(
         output,
