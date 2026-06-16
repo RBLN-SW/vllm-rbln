@@ -133,7 +133,8 @@ def make_fake_proposer(
     fake.positions = torch.full((max_num_tokens,), -1, dtype=torch.int64)
     fake.hidden_states = torch.zeros((max_num_tokens, hidden_size), dtype=torch.float32)
     fake.vllm_config = SimpleNamespace(
-        speculative_config=SimpleNamespace(enforce_eager=True)
+        speculative_config=SimpleNamespace(enforce_eager=True),
+        parallel_config=SimpleNamespace(data_parallel_size=1),
     )
     fake.num_speculative_tokens = num_speculative_tokens
     fake.uses_mrope = False
@@ -151,6 +152,9 @@ def make_fake_proposer(
     fake._set_positions = _set_positions
     fake.set_inputs_first_pass = lambda **kwargs: (
         RBLNEagleProposer.set_inputs_first_pass(fake, **kwargs)
+    )
+    fake._dp_forward_context_args = lambda *args, **kwargs: (
+        RBLNEagleProposer._dp_forward_context_args(fake, *args, **kwargs)
     )
     return fake, builder
 
