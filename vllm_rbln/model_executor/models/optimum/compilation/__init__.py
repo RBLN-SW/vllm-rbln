@@ -18,7 +18,11 @@ from typing import Any
 from transformers import PretrainedConfig
 
 import optimum.rbln
-from optimum.rbln import RBLNAutoModel
+from optimum.rbln import (
+    RBLNAutoModel,
+    RBLNAutoModelForCausalLM,
+    RBLNAutoModelForSpeechSeq2Seq,
+)
 from vllm_rbln.utils.optimum.registry import (
     get_rbln_model_info,
     is_enc_dec_arch,
@@ -130,7 +134,7 @@ class RBLNCompileSpec:
         if block_size != max_model_len:
             rbln_config["kvcache_partition_len"] = block_size
             rbln_config["attn_impl"] = "flash_attn"
-        return cls(model_cls=RBLNAutoModel, rbln_config=rbln_config)
+        return cls(model_cls=RBLNAutoModelForCausalLM, rbln_config=rbln_config)
 
     @classmethod
     def _for_pooling(
@@ -200,7 +204,7 @@ class RBLNCompileSpec:
             "from the HuggingFace config."
         )
         return cls(
-            model_cls=RBLNAutoModel,
+            model_cls=RBLNAutoModelForSpeechSeq2Seq,
             rbln_config={
                 "tensor_parallel_size": tp_size,
                 "batch_size": batch_size,
