@@ -24,7 +24,6 @@ from vllm.model_executor.models.gemma4_mm import (
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
-from .base import ModelInputForRBLN
 from .gemma3 import (
     PAD_TOKEN_ID,
     RBLNOptimumGemma3ForConditionalGeneration,
@@ -166,11 +165,8 @@ class RBLNOptimumGemma4ForConditionalGeneration(
         pixel_values = image_input["pixel_values"]
         pixel_position_ids = image_input["pixel_position_ids"]
 
-        # Vision tower + multi-modal projector, compiled by optimum-rbln.
-        # Returns (num_patches_total, mm_tokens_per_image, hidden_size).
         image_embeds = self.model.get_image_features(
-            pixel_values=pixel_values,
-            pixel_position_ids=pixel_position_ids
+            pixel_values=pixel_values, pixel_position_ids=pixel_position_ids
         )
 
         return image_embeds
