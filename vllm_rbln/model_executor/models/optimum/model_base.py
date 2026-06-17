@@ -14,6 +14,7 @@
 import json
 import math
 import os
+from dataclasses import replace
 from typing import Any
 
 import torch
@@ -37,6 +38,7 @@ from vllm_rbln.utils.optimum.block_size import get_attn_block_size
 from vllm_rbln.utils.optimum.bucket import select_bucket_size
 from vllm_rbln.utils.optimum.registry import get_rbln_model_info
 
+from .base import ModelInputForRBLN
 from .compilation import RBLNCompileSpec
 
 logger = init_logger(__name__)
@@ -470,6 +472,33 @@ class RBLNOptimumMultimodalMixin(SupportsMultiModal):
     Shared multimodal interface for optimum models.
     """
 
+    def build_forward_inputs(
+        self,
+        model_input: ModelInputForRBLN,
+        mrope_position_deltas: dict[str, float],
+    ) -> ModelInputForRBLN:
+        """Compute the model-specific forward inputs at the runner level and
+        return an updated ``model_input``. Mirrors upstream vLLM, where the
+        runner produces ``inputs_embeds`` (and, for MRoPE models, positions).
+
+        Default: simple multimodal models embed at prefill
+        (``embed_multimodal`` + ``embed_input_ids``) and pass ``input_ids``
+        through at decode. ``mrope_position_deltas`` (runner-owned per-request
+        MRoPE state) is unused here; MRoPE models (e.g. Qwen-VL) override this.
+        """
+        if not model_input.is_prompt:
+            return model_input
+        multimodal_embeddings = self.embed_multimodal(
+            **(model_input.multi_modal_kwargs or {})
+        )
+        # int64 mirrors the dtype the model forward used to embed with
+        # (previously cast in preprocess_for_decoder before embed_input_ids).
+        inputs_embeds = self.embed_input_ids(
+            model_input.input_tokens.to(torch.int64),
+            multimodal_embeddings or None,
+        )
+        return replace(model_input, inputs_embeds=inputs_embeds)
+
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings | dict:
         # Default vision-only encode path shared by the simple MM models: parse
         # the image input and return per-image token embeddings. Models with a
@@ -543,6 +572,7 @@ class RBLNOptimumMultimodalMixin(SupportsMultiModal):
         *,
         cache_position: torch.Tensor | None = None,
         running_requests_ids: list[str] | None = None,
+        mrope_position_deltas: dict[str, float] | None = None,
     ) -> dict:
         # NOTE: this default is currently unreachable. init_model() gates the EC
         # producer/consumer path on ec_enabled_model ==

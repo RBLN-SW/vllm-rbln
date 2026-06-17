@@ -193,6 +193,7 @@ class RBLNOptimumGemma3ForConditionalGeneration(
         *,
         cache_position: torch.Tensor | None = None,
         running_requests_ids: list[str] | None = None,
+        mrope_position_deltas: dict[str, float] | None = None,
     ) -> dict:
         # NOTE: this guard is currently unreachable — init_model() only enables
         # the EC path for "RBLNQwen3VLForConditionalGeneration", so Gemma3 never
