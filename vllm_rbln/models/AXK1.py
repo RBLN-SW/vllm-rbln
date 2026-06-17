@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging
-
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -22,8 +20,6 @@ from vllm.model_executor.layers.linear import ColumnParallelLinear, RowParallelL
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models import AXK1 as _axk1_mod
 from vllm.model_executor.models.AXK1 import AXK1Attention, AXK1MoE
-
-log = logging.getLogger("torch._dynamo")
 
 
 def __AXK1_moe_forward_rsd(self, hidden_states: torch.Tensor) -> torch.Tensor:
