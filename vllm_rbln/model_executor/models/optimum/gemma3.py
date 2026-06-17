@@ -37,7 +37,18 @@ PAD_TOKEN_ID = 0
 
 
 class RBLNGemma3MultiModalProcessor(Gemma3MultiModalProcessor):
-    def _pad_for_gemma3(self, prompt_ids: list[int]):
+    """Left-pads ``prompt_token_ids`` so image blocks align to prefill chunk
+    boundaries."""
+
+    def apply(self, *args, **kwargs):
+        # NOTE: Check if padding works correctly
+        output = super().apply(*args, **kwargs)
+        output["prompt_token_ids"] = self._pad_image_boundaries(
+            output["prompt_token_ids"]
+        )
+        return output
+
+    def _pad_image_boundaries(self, prompt_ids: list[int]) -> list[int]:
         token_type_ids = (
             torch.tensor(prompt_ids) == self.info.get_hf_processor().image_token_id
         )
@@ -59,15 +70,6 @@ class RBLNGemma3MultiModalProcessor(Gemma3MultiModalProcessor):
         # Left padding for Gemma3 image boundary alignment
         prompt_ids = [PAD_TOKEN_ID] * padded_seq_len + prompt_ids
         return prompt_ids
-
-    def apply(self, *args, **kwargs):
-        # NOTE: Check if padding works correctly
-        output = super().apply(*args, **kwargs)
-        prompt_ids = self._pad_for_gemma3(output["prompt_token_ids"])
-
-        output["prompt_token_ids"] = prompt_ids
-
-        return output
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -140,18 +142,10 @@ class RBLNOptimumGemma3ForConditionalGeneration(
         block_tables = kwargs.pop("block_tables")
 
         if is_prompt:
-            inputs_embeds = None
             prefill_batch_idx = sliding_window_table_ids[0]
             local_block_table_id = torch.tensor([prefill_batch_idx], dtype=torch.int16)
-            # FIXME It is disappeared in transformers 5.5.4
-            # token_type_ids model_input != token_type_ids of gemma3
-            # https://github.com/huggingface/transformers/blob/d0c9c66d1c09df3cd70bf036e813d88337b20d4c/src/transformers/models/gemma3/processing_gemma3.py#L143
-            token_type_ids = torch.zeros_like(input_ids)
-            token_type_ids[input_ids == self.model.config.image_token_index] = 1
-
-            pixel_values = self.get_pixel_values(model_input)
-            inputs_embeds = self.model._preprocess_prefill(
-                input_ids, inputs_embeds, pixel_values
+            inputs_embeds, token_type_ids = self._build_prefill_embeds(
+                model_input, input_ids
             )
             if self.model.language_model.prefill_decoder is None:
                 raise version_error
@@ -215,6 +209,21 @@ class RBLNOptimumGemma3ForConditionalGeneration(
         if not is_prompt:
             logits = logits[:request_nums]
         return logits
+
+    def _build_prefill_embeds(
+        self, model_input: ModelInputForRBLN, input_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build ``inputs_embeds`` and ``mm_token_type_ids`` for the prefill pass.
+        Subclasses override to plug in model-specific multimodal handling."""
+        # FIXME It is disappeared in transformers 5.5.4
+        # token_type_ids model_input != token_type_ids of gemma3
+        # https://github.com/huggingface/transformers/blob/d0c9c66d1c09df3cd70bf036e813d88337b20d4c/src/transformers/models/gemma3/processing_gemma3.py#L143
+        mm_token_type_ids = torch.zeros_like(input_ids)
+        mm_token_type_ids[input_ids == self.model.config.image_token_index] = 1
+
+        pixel_values = self.get_pixel_values(model_input)
+        inputs_embeds = self.model._preprocess_prefill(input_ids, None, pixel_values)
+        return inputs_embeds, mm_token_type_ids
 
     def get_pixel_values(self, model_input: ModelInputForRBLN):
         image_input = None

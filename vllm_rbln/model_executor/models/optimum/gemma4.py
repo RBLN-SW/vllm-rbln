@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import torch
-from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.gemma4_mm import (
     Gemma4AudioInputs,
@@ -23,21 +22,30 @@ from vllm.model_executor.models.gemma4_mm import (
     Gemma4ProcessingInfo,
     Gemma4VideoInputs,
 )
-from vllm.model_executor.models.interfaces import SupportsMultiModal
-from vllm.model_executor.models.interfaces_base import VllmModelForTextGeneration
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
-from .base import ModelInputForRBLN, version_error
-from .model_base import RBLNOptimumDecoderMixin, RBLNOptimumModelBase
-from .optimum_attention import HybridAttentionImageManager, HybridAttentionImageStrategy
+from .base import ModelInputForRBLN
+from .gemma3 import (
+    PAD_TOKEN_ID,
+    RBLNOptimumGemma3ForConditionalGeneration,
+)
 
 logger = init_logger(__name__)
 
-PAD_TOKEN_ID = 0
-
 
 class RBLNGemma4MultiModalProcessor(Gemma4MultiModalProcessor):
-    def _pad_for_gemma4(self, prompt_ids: list[int]):
+    """Left-pads ``prompt_token_ids`` so image blocks align to prefill chunk
+    boundaries."""
+
+    def apply(self, *args, **kwargs):
+        # NOTE: Check if padding works correctly
+        output = super().apply(*args, **kwargs)
+        output["prompt_token_ids"] = self._pad_image_boundaries(
+            output["prompt_token_ids"]
+        )
+        return output
+
+    def _pad_image_boundaries(self, prompt_ids: list[int]) -> list[int]:
         token_type_ids = (
             torch.tensor(prompt_ids) == self.info.get_hf_processor().image_token_id
         )
@@ -134,15 +142,6 @@ class RBLNGemma4MultiModalProcessor(Gemma4MultiModalProcessor):
         # inside optimum-rbln at attention time (gemma4_runtime_utils.py).
         return [PAD_TOKEN_ID] * padded_seq_len + prompt_ids
 
-    def apply(self, *args, **kwargs):
-        # NOTE: Check if padding works correctly
-        output = super().apply(*args, **kwargs)
-        prompt_ids = self._pad_for_gemma4(output["prompt_token_ids"])
-
-        output["prompt_token_ids"] = prompt_ids
-
-        return output
-
 
 @MULTIMODAL_REGISTRY.register_processor(
     RBLNGemma4MultiModalProcessor,
@@ -150,147 +149,24 @@ class RBLNGemma4MultiModalProcessor(Gemma4MultiModalProcessor):
     dummy_inputs=Gemma4DummyInputsBuilder,
 )
 class RBLNOptimumGemma4ForConditionalGeneration(
-    RBLNOptimumModelBase,
-    RBLNOptimumDecoderMixin,
-    VllmModelForTextGeneration,
-    SupportsMultiModal,
+    RBLNOptimumGemma3ForConditionalGeneration
 ):
-    def __init__(
-        self,
-        vllm_config: VllmConfig,
-        prefix: str = "",
-    ) -> None:
-        super().__init__(vllm_config=vllm_config)
-        # NOTE:
-        # model_config.vocab_size != tokenizer.vocab_size in Gemma3
-        assert self.kv_block_adapter is not None
-        self.setup_decoder_mixin(
-            attn_impl=self.attn_impl,
-            vocab_size=self.model_config.get_vocab_size,
-            use_multiple_decoder=getattr(
-                self.model.rbln_config.language_model,
-                "use_multiple_decoder",
-                False,
-            ),
-            default_batch_size=self.scheduler_config.max_num_seqs,
-            decoder_batch_sizes=self.model.rbln_config.language_model.decoder_batch_sizes,
-            num_blocks=self.kv_block_adapter._estimated_num_blocks(),
+    def _build_prefill_embeds(
+        self, model_input: ModelInputForRBLN, input_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # FIXME It should be delivered from runner
+        # FIXME It should allow video_token_ids, audio_token_ids as well.
+        # https://github.com/huggingface/transformers/blob/0588858f54c8c79d28497d3ad6eac3417b716c49/src/transformers/processing_utils.py#L897
+        mm_token_type_ids = torch.zeros_like(input_ids)
+        mm_token_type_ids[input_ids == self.model.config.image_token_id] = 1
+        pixel_values, image_position_ids = self.get_image_values(model_input)
+        inputs_embeds = self.model._preprocess_prefill(
+            input_ids,
+            None,
+            pixel_values,
+            image_position_ids=image_position_ids,
         )
-        self.strategy = HybridAttentionImageStrategy(PAD_TOKEN_ID)
-        self.attention_manager: HybridAttentionImageManager = (
-            HybridAttentionImageManager(self.strategy)
-        )
-
-    def forward(self, model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
-        input_ids = model_input.input_tokens
-        position_ids = model_input.input_positions
-        block_tables = model_input.block_tables
-
-        is_prompt = model_input.is_prompt
-
-        finished_requests_ids = model_input.finished_requests_ids
-        running_requests_ids = model_input.running_requests_ids
-        request_nums = input_ids.shape[0]
-
-        # In prefill phase, the length of list must be 1
-        sliding_window_table_ids, padded_cache_lengths, attention_masks = (
-            self.attention_manager.get(
-                is_prompt,
-                self.decoder_batch_size,
-                running_requests_ids,
-                finished_requests_ids,
-                input_ids=input_ids,
-            )
-        )
-
-        kwargs = self.preprocess_for_decoder(
-            is_prompt, block_tables, input_ids, position_ids
-        )
-
-        # [prefill] the length of the padded cache is calculated
-        # during the forward pass and stored in self.sliding_window_table.
-        # [decode] `cache_position` and `position_ids` are distinguished
-        # due to the padding space reserved for the sliding window.
-        cache_position = kwargs.pop("cache_position")
-        input_ids = kwargs.pop("input_ids")
-        block_tables = kwargs.pop("block_tables")
-
-        if is_prompt:
-            inputs_embeds = None
-            prefill_batch_idx = sliding_window_table_ids[0]
-            local_block_table_id = torch.tensor([prefill_batch_idx], dtype=torch.int16)
-            # FIXME It should be delivered from runner
-            # FIXME It should allow video_token_ids, audio_token_ids as well.
-            # https://github.com/huggingface/transformers/blob/0588858f54c8c79d28497d3ad6eac3417b716c49/src/transformers/processing_utils.py#L897
-            mm_token_type_ids = torch.zeros_like(input_ids)
-            mm_token_type_ids[input_ids == self.model.config.image_token_id] = 1
-            pixel_values, image_position_ids = self.get_image_values(model_input)
-            inputs_embeds = self.model._preprocess_prefill(
-                input_ids,
-                inputs_embeds,
-                pixel_values,
-                image_position_ids=image_position_ids,
-            )
-            if self.model.language_model.prefill_decoder is None:
-                raise version_error
-            assert attention_masks is not None
-            attention_mask = attention_masks[0]
-            output = self.model.language_model.prefill_decoder(
-                inputs_embeds=inputs_embeds,
-                cache_position=cache_position,
-                attention_mask=attention_mask,
-                local_block_tables=local_block_table_id,
-                block_tables=block_tables,
-                token_type_ids=mm_token_type_ids,
-            )
-            logits = output.logits
-            updated_padded_cache_length = output.padded_cache_lengths
-            updated_attention_mask = output.attention_mask
-
-            assert len(running_requests_ids) == 1
-            self.attention_manager.add(
-                running_requests_id=running_requests_ids[0],
-                local_table_id=sliding_window_table_ids[0],
-                pad_len=updated_padded_cache_length,
-                attention_mask=updated_attention_mask,
-            )
-        else:
-            if self.model.language_model.decoders is None:
-                raise ValueError("Decoders is None")
-            padded_batch_size = kwargs.pop("padded_batch_size", self.decoder_batch_size)
-            self.model.language_model.decoder = self.model.language_model.decoders[
-                padded_batch_size
-            ]
-            (
-                local_block_table_id,
-                cache_position,
-                position_ids,
-                attention_mask,
-            ) = self.attention_manager.preprocess(
-                sliding_window_table_ids,
-                cache_position,
-                request_nums,
-                padded_batch_size,
-                pad_lens=padded_cache_lengths,
-                attention_masks=attention_masks,
-            )
-            attention_mask = self.attention_manager.update(
-                running_requests_ids,
-                attention_mask,
-                cache_position,
-            )
-            logits = self.model.language_model.decoder(
-                input_ids=input_ids,
-                cache_position=cache_position,
-                block_tables=block_tables,
-                local_block_tables=local_block_table_id,
-                position_ids=position_ids,  # FIXME duplicated?
-                attention_mask=attention_mask,
-            ).logits
-
-        if not is_prompt:
-            logits = logits[:request_nums]
-        return logits
+        return inputs_embeds, mm_token_type_ids
 
     def get_image_values(
         self, model_input: ModelInputForRBLN
