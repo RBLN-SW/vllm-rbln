@@ -35,6 +35,10 @@ class ModelInputForRBLN:
     cached_lengths: list[int] = field(default_factory=list)  # for prefix caching
     multi_modal_kwargs: BatchedTensorInputs | None = None
     dummy_block: int | None = None  # for prefix caching
+    # Prefill input embeddings, computed at the runner level for multimodal
+    # models (embed_multimodal + embed_input_ids) and consumed by the model
+    # forward. Mirrors upstream vLLM where the runner produces inputs_embeds.
+    inputs_embeds: torch.Tensor | None = None
 
 
 version_error = RuntimeError(
