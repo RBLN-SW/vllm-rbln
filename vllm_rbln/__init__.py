@@ -28,6 +28,10 @@ def register_model():
             "Gemma3ForConditionalGeneration",
             "vllm_rbln.model_executor.models.optimum.gemma3:RBLNOptimumGemma3ForConditionalGeneration",
         )
+        ModelRegistry.register_model(
+            "Gemma4ForConditionalGeneration",
+            "vllm_rbln.model_executor.models.optimum.gemma4:RBLNOptimumGemma4ForConditionalGeneration",
+        )
 
 
 def register_ops():
