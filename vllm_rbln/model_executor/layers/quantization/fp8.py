@@ -1131,6 +1131,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         num_tokens = orig_shape[:-1].numel()  # noqa: F841
         hidden_states = x.reshape(num_tokens, -1)
         masked_routing_weights = router_logits
+        # scoring_func / e_score_correction_bias are passed to the custom op below;
+        # resolve them from the layer (mirrors fused_moe.layer). Without this they
+        # are undefined names, which make Dynamo graph-break at the custom op call
+        # -- splitting the activation quantization into its own subgraph.
+        scoring_func = getattr(layer, "scoring_func", "softmax")
+        e_score_correction_bias = getattr(layer, "e_score_correction_bias", None)
         intermediate_size = layer.w2_weight.shape[-1]
 
         # w13_weight: merged gate(up) weights, w2_weight: down weights
@@ -1157,6 +1163,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         tokens_mask = None
         use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
         if use_moe_tokens_mask:
+            # Local import to avoid a quantization<->fused_moe circular import.
+            from vllm_rbln.model_executor.layers.fused_moe.layer import (
+                get_tokens_mask,
+            )
+
             tokens_mask = get_tokens_mask(num_tokens, device=router_logits.device)
 
         # W8A8: dynamically quantize hidden_states to fp8 per (1, block_k) group
