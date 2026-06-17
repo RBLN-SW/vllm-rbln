@@ -73,16 +73,11 @@ class RBLNOptimumIdefics3ForConditionalGeneration(
 
         if is_prompt:
             block_tables = kwargs.pop("block_tables")
-            input_ids = kwargs.pop("input_ids")
             cache_position = kwargs.pop("cache_position")
 
-            multimodal_embeddings = self.embed_multimodal(
-                **(model_input.multi_modal_kwargs or {})
-            )
-            inputs_embeds = self.embed_input_ids(
-                input_ids,
-                multimodal_embeddings or None,
-            )
+            # inputs_embeds are computed at the runner level (embed_multimodal
+            # + embed_input_ids); see RBLNOptimumModelRunner._maybe_embed_inputs.
+            inputs_embeds = model_input.inputs_embeds
             logits = self.model.text_model.prefill_decoder(
                 inputs_embeds=inputs_embeds,
                 cache_position=cache_position,

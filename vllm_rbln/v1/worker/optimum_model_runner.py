@@ -14,6 +14,7 @@
 import contextlib
 import logging
 import time
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, NamedTuple, Union, cast
 
 import numpy as np
@@ -73,6 +74,9 @@ import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
 from vllm_rbln.model_executor.model_loader.rbln_model_loader import get_optimum_model
 from vllm_rbln.model_executor.models.optimum import ModelInputForRBLN
+from vllm_rbln.model_executor.models.optimum.model_base import (
+    RBLNOptimumMultimodalMixin,
+)
 from vllm_rbln.utils.optimum.bucket import select_bucket_size
 from vllm_rbln.utils.optimum.predicates import is_qwen3_pooling
 from vllm_rbln.utils.optimum.registry import (
@@ -368,6 +372,7 @@ class RBLNOptimumModelRunner(
                         )
                 else:
                     with capture_ctx as model_reports:
+                        model_input = self._maybe_embed_inputs(model_input)
                         hidden_states = self.model(model_input)
                 if (
                     envs.VLLM_RBLN_METRICS
@@ -402,6 +407,38 @@ class RBLNOptimumModelRunner(
             ec_connector_output=ec_connector_output,
         )
         return None
+
+    def _maybe_embed_inputs(self, model_input: ModelInputForRBLN) -> ModelInputForRBLN:
+        """Compute prefill ``inputs_embeds`` at the runner level for
+        multimodal models, mirroring upstream vLLM.
+
+        Runs the vision encoder (``embed_multimodal``) and merges the result
+        into the text embeddings (``embed_input_ids``), attaching the result
+        to ``model_input.inputs_embeds`` for the model forward to consume.
+
+        Left untouched: decode steps, non-multimodal models, and models with
+        a custom prefill (``merges_embeds_in_runner=False``, e.g. Qwen-VL)
+        that still embed inside their own forward.
+        """
+        if not model_input.is_prompt:
+            return model_input
+        model = self.model
+        if not isinstance(model, RBLNOptimumMultimodalMixin):
+            return model_input
+        if not model.merges_embeds_in_runner:
+            return model_input
+
+        # int64 mirrors the dtype the model forward used to embed with
+        # (previously cast in preprocess_for_decoder before embed_input_ids).
+        input_ids = model_input.input_tokens.to(torch.int64)
+        multimodal_embeddings = model.embed_multimodal(
+            **(model_input.multi_modal_kwargs or {})
+        )
+        inputs_embeds = model.embed_input_ids(
+            input_ids,
+            multimodal_embeddings or None,
+        )
+        return replace(model_input, inputs_embeds=inputs_embeds)
 
     def mask_block_table(
         self,

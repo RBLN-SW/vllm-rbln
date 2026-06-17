@@ -163,13 +163,9 @@ class RBLNOptimumGemma3ForConditionalGeneration(
             token_type_ids = torch.zeros_like(input_ids)
             token_type_ids[input_ids == self.model.config.image_token_index] = 1
 
-            multimodal_embeddings = self.embed_multimodal(
-                **(model_input.multi_modal_kwargs or {})
-            )
-            inputs_embeds = self.embed_input_ids(
-                input_ids,
-                multimodal_embeddings or None,
-            )
+            # inputs_embeds are computed at the runner level (embed_multimodal
+            # + embed_input_ids); see RBLNOptimumModelRunner._maybe_embed_inputs.
+            inputs_embeds = model_input.inputs_embeds
             if self.model.language_model.prefill_decoder is None:
                 raise version_error
             assert attention_masks is not None

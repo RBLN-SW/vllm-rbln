@@ -112,15 +112,11 @@ class RBLNOptimumLlavaForConditionalGeneration(
                 padded_batch_size
             ]
 
-        inputs_embeds = None
-        if is_prompt:
-            multimodal_embeddings = self.embed_multimodal(
-                **(model_input.multi_modal_kwargs or {})
-            )
-            inputs_embeds = self.embed_input_ids(
-                input_ids,
-                multimodal_embeddings or None,
-            )
+        # For prefill, inputs_embeds are computed at the runner level
+        # (embed_multimodal + embed_input_ids); see
+        # RBLNOptimumModelRunner._maybe_embed_inputs. Decode embeds from
+        # input_ids inside _forward.
+        inputs_embeds = model_input.inputs_embeds if is_prompt else None
 
         logits = self._forward(
             is_prefill=is_prompt,
