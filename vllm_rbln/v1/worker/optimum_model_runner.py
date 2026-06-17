@@ -416,16 +416,12 @@ class RBLNOptimumModelRunner(
         into the text embeddings (``embed_input_ids``), attaching the result
         to ``model_input.inputs_embeds`` for the model forward to consume.
 
-        Left untouched: decode steps, non-multimodal models, and models with
-        a custom prefill (``merges_embeds_in_runner=False``, e.g. Qwen-VL)
-        that still embed inside their own forward.
+        Left untouched: decode steps and non-multimodal models.
         """
         if not model_input.is_prompt:
             return model_input
         model = self.model
         if not isinstance(model, RBLNOptimumMultimodalMixin):
-            return model_input
-        if not model.merges_embeds_in_runner:
             return model_input
 
         # int64 mirrors the dtype the model forward used to embed with
