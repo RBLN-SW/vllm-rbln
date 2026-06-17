@@ -1027,6 +1027,7 @@ class RBLNFlashAttentionMetadata:
     cache_seq_lens: torch.Tensor | None = None
     cache_offsets: torch.Tensor | None = None
     local_block_tables: torch.Tensor | None = None
+    swa_attn_masks: torch.Tensor | None = None
 
 
 class RBLNFlashAttentionMetadataBuilder(
@@ -1191,6 +1192,7 @@ class RBLNFlashAttentionMetadataBuilder(
         cache_seq_lens = None
         cache_offsets = None
         local_block_tables = None
+        swa_attn_masks = None
         if sliding_window := getattr(self.kv_cache_spec, "sliding_window", None):
             nct_src = (
                 num_computed_tokens_cpu if use_dt else num_computed_tokens[:num_reqs]
@@ -1204,6 +1206,12 @@ class RBLNFlashAttentionMetadataBuilder(
             if not is_prefill:
                 cache_seq_lens = rbln_utils.pad(cache_seq_lens, 0, batch_pad)
                 cache_offsets = rbln_utils.pad(cache_offsets, 0, batch_pad)
+                # Generate sliding window attention mask for decode
+                # mask[b, s] = 1.0 if s <= cache_seq_lens[b] else 0.0
+                positions = torch.arange(sliding_window)[None, :]
+                swa_attn_masks = torch.where(positions - cache_seq_lens > 0, 0.0, 1.0)[
+                    :, None, None, :
+                ]
 
             local_block_tables = block_tables_tensor[..., :1]
 
@@ -1253,6 +1261,9 @@ class RBLNFlashAttentionMetadataBuilder(
             else None,
             local_block_tables=local_block_tables.to(self.device)
             if local_block_tables is not None
+            else None,
+            swa_attn_masks=swa_attn_masks.to(self.device)
+            if swa_attn_masks is not None
             else None,
         )
 
@@ -1338,6 +1349,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                 self.sinks = self.sinks[:, None]
 
         self.is_causal = envs.VLLM_RBLN_FLASH_CAUSAL_ATTN
+        self.is_batch_attention_opt = envs.VLLM_RBLN_BATCH_ATTN_OPT
         self.is_normal = (self.block_size == self.max_model_len) and (
             self.sinks is None
         )
@@ -1476,6 +1488,10 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                     self.scale,  # dummy
                 ]
                 if not envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
+                    if self.is_batch_attention_opt and b_size > 1:
+                        decode_args.append(attn_metadata.swa_attn_masks)
+                    else:
+                        decode_args.append(None)
                     decode_args.append(self.sinks)
                 attn_output = sliding_window_attention_naive_decode(  # noqa: E501
                     *decode_args,
