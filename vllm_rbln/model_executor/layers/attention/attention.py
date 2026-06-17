@@ -16,6 +16,7 @@ import torch
 import vllm.model_executor.layers.attention.attention as vllm_attn
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.forward_context import ForwardContext, get_forward_context
+from vllm.model_executor.layers.attention import mla_attention as _mla_attention_mod
 from vllm.model_executor.layers.attention.attention import Attention
 from vllm.model_executor.layers.attention.kv_transfer_utils import (
     maybe_transfer_kv_layer,
@@ -193,9 +194,32 @@ Attention.__init__ = _rbln_attention_init
 Attention.forward = _rbln_attention_forward
 Attention.get_kv_cache_spec = _rbln_get_kv_cache_spec
 
+
 # ---------------------------------------------------------------------------
 # MLAAttention overrides for RBLN
 # ---------------------------------------------------------------------------
+class _RBLNNoOpMLAPrefillBackend:
+    """No-op stand-in for vLLM's MLA prefill backend.
+
+    vLLM 0.22 ``MLAAttention.__init__`` instantiates a prefill backend via
+    ``get_mla_prefill_backend()``. On RBLN ``get_device_capability()`` is None,
+    so the selector unconditionally returns the FlashAttn backend, which then
+    asserts on the absent ``flash_attn_varlen_func``. RBLN drives MLA through
+    its own attention backend / custom ops and never touches
+    ``MLAAttention.prefill_backend``, so we swap in this stub to keep
+    ``__init__`` from crashing on NPU.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        pass
+
+
+def _rbln_get_mla_prefill_backend(vllm_config) -> type[_RBLNNoOpMLAPrefillBackend]:
+    return _RBLNNoOpMLAPrefillBackend
+
+
+_mla_attention_mod.get_mla_prefill_backend = _rbln_get_mla_prefill_backend
+
 _original_mla_attention_init = MLAAttention.__init__
 
 
