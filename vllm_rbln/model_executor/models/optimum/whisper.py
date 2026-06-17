@@ -34,6 +34,15 @@ class RBLNOptimumWhisperForConditionalGeneration(
         vllm_config: VllmConfig,
     ) -> None:
         super().__init__(vllm_config=vllm_config)
+        # WhisperForConditionalGeneration inherits SupportsLoRA, so vLLM
+        # accepts a `--lora-modules`/`lora_config` for this model. The RBLN
+        # backend does not support LoRA yet, so reject it explicitly instead
+        # of silently ignoring the adapters.
+        if vllm_config.lora_config is not None:
+            raise NotImplementedError(
+                "LoRA is not supported for Whisper on the RBLN backend. "
+                "Please run the model without LoRA adapters."
+            )
         assert self.kv_block_adapter is not None
         self.setup_decoder_mixin(
             attn_impl=self.attn_impl,
