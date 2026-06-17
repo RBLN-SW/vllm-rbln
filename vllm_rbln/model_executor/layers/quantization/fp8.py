@@ -502,12 +502,8 @@ def custom_moe_swiglu_group(
     up_proj_scale: torch.Tensor,
     down_proj_weight: torch.Tensor,
     down_proj_scale: torch.Tensor,
-    router_logits: torch.Tensor,
-    scoring_func: str,
+    masked_routing_weights: torch.Tensor,
     group_size: torch.Tensor,
-    topk: int,
-    post_norm: bool = True,
-    e_score_correction_bias: torch.Tensor | None = None,
     gate_proj_bias: torch.Tensor | None = None,
     up_proj_bias: torch.Tensor | None = None,
     down_proj_bias: torch.Tensor | None = None,
@@ -515,10 +511,15 @@ def custom_moe_swiglu_group(
     dp_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
-    Customized MoE SwiGLU operation.
+    Customized MoE SwiGLU operation (W8A8 block-fp8) with pre-computed routing.
+
+    Routing (softmax + topk) is done externally, exactly like
+    custom_moe_swiglu_group_dequantize; the only differences are the fp8 activation
+    plus its per-(token, K-block) scale, and the fp8 quantization of the swiglu
+    intermediate before the down projection.
 
     Expected tensor shapes:
-    - hidden_states: [batch*seq_len, hidden_size]
+    - hidden_states: [batch*seq_len, hidden_size]  (fp8)
     - hidden_states_scale: [batch*seq_len, hidden_size // 128]
     - gate_proj_weight: [num_experts, hidden_size, intermediate_size]
     - gate_proj_scale: [num_experts, intermediate_size, hidden_size // 128]
@@ -526,13 +527,13 @@ def custom_moe_swiglu_group(
     - up_proj_scale: [num_experts, intermediate_size, hidden_size // 128]
     - down_proj_weight: [num_experts, intermediate_size, hidden_size]
     - down_proj_scale: [num_experts, hidden_size, intermediate_size // 128]
-    - router_logits: [batch*seq_len, num_experts]
+    - masked_routing_weights: [num_experts, num_tokens]
+      (token dim may be padded to 64-align)
     - group_size: group size for weight scale
-    - topk: top k experts to select
-    - e_score_correction_bias:
     - gate_proj_bias: [num_experts, intermediate_size]
     - up_proj_bias: [num_experts, intermediate_size]
     - down_proj_bias: [num_experts, hidden_size]
+    - expert_map: [num_experts] mapping global -> local expert index (-1 for non-local)
 
     Returns:
         Tensor: [batch * seq_len, hidden_size]
@@ -581,7 +582,7 @@ def custom_moe_swiglu_group(
     # reference matmuls below run in bf16, exactly like the W8A16 path. When
     # W8A8 is off, hidden_states is already the unquantized activation.
     if hidden_states_scale is not None:
-        compute_dtype = router_logits.dtype
+        compute_dtype = masked_routing_weights.dtype
         hidden_states = hidden_states.to(compute_dtype) * hidden_states_scale.to(
             compute_dtype
         ).repeat_interleave(in_block_size, dim=-1)
@@ -603,59 +604,24 @@ def custom_moe_swiglu_group(
         down_proj_weight, down_proj_scale, in_block_size, down_out_block
     )
 
-    routing_scores = router_logits.float()
-    # Match rebel router behavior:
-    # - softmax: select topk on logits (post_norm) or on softmax weights (pre_norm)
-    # - sigmoid: select topk on sigmoid(+optional bias), optional post topk renorm
-    if scoring_func == "softmax":
-        if post_norm:
-            _, topk_ids = torch.topk(routing_scores, topk, dim=-1, sorted=False)
-            topk_values = routing_scores.gather(1, topk_ids)
-            topk_weights = torch.softmax(topk_values, dim=-1)
-        else:
-            all_weights = torch.softmax(routing_scores, dim=-1)
-            _, topk_ids = torch.topk(all_weights, topk, dim=-1, sorted=False)
-            topk_weights = all_weights.gather(1, topk_ids)
-    else:
-        # Sigmoid mode expects pre-scored inputs from caller.
-        routing_weights = routing_scores
-        scores_for_choice = routing_weights
-        if e_score_correction_bias is not None:
-            scores_for_choice = scores_for_choice + e_score_correction_bias
-        _, topk_ids = torch.topk(scores_for_choice, topk, dim=-1, sorted=False)
-        topk_weights = routing_weights.gather(1, topk_ids)
-        if post_norm:
-            topk_weights = topk_weights / topk_weights.sum(
-                dim=-1, keepdim=True
-            ).clamp_min(1e-20)
-
-    topk_weights = topk_weights.to(hidden_states.dtype)
-
-    if dp_mask is not None:
-        topk_weights = topk_weights * dp_mask.to(topk_weights.dtype)
-
+    num_tokens, hidden_size = hidden_states.shape
     num_experts = gate_proj_weight_dq.shape[0]
-    if expert_map is not None:
-        safe_expert_map = torch.where(expert_map < 0, num_experts - 1, expert_map).to(
-            topk_ids.dtype
-        )
-        topk_ids = safe_expert_map[topk_ids]
+    dtype = hidden_states.dtype
 
-    final_hidden_states = torch.zeros_like(hidden_states)
-    expert_mask = torch.nn.functional.one_hot(
-        topk_ids, num_classes=num_experts
-    ).permute(2, 1, 0)
-    expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero(as_tuple=False)
+    # masked_routing_weights: [E, T_padded] (softmax + topk done externally).
+    routing_t = masked_routing_weights[:, :num_tokens]
 
-    for expert_idx_tensor in expert_hit:
-        expert_idx = int(expert_idx_tensor.item())
-        topk_slot, token_idx = torch.where(expert_mask[expert_idx])
-        if token_idx.numel() == 0:
+    final_hidden_states = torch.zeros(num_tokens, hidden_size, dtype=dtype)
+
+    for expert_idx in range(num_experts):
+        expert_weights = routing_t[expert_idx]  # [T]
+        token_indices = expert_weights.nonzero(as_tuple=True)[0]
+        if token_indices.numel() == 0:
             continue
 
-        # Input activation is already (de)quantized above; only the swiglu
-        # intermediate is quantized inside the op for the down projection.
-        current_state = hidden_states[token_idx]
+        weights = expert_weights[token_indices]  # [num_selected]
+        current_state = hidden_states[token_indices]  # [num_selected, hidden_size]
+
         gate = torch.nn.functional.linear(
             current_state,
             gate_proj_weight_dq[expert_idx],
@@ -666,15 +632,17 @@ def custom_moe_swiglu_group(
             up_proj_weight_dq[expert_idx],
             up_proj_bias[expert_idx] if up_proj_bias is not None else None,
         )
+        # Input activation is already (de)quantized above; only the swiglu
+        # intermediate is quantized here for the down projection (W8A8).
         swiglu = _maybe_quant_act(torch.nn.functional.silu(gate) * up)
         down = torch.nn.functional.linear(
             swiglu,
             down_proj_weight_dq[expert_idx],
             down_proj_bias[expert_idx] if down_proj_bias is not None else None,
         )
-        current_hidden_states = down * topk_weights[token_idx, topk_slot, None]
+        current_hidden_states = down * weights.unsqueeze(-1)
         final_hidden_states.index_add_(
-            0, token_idx, current_hidden_states.to(final_hidden_states.dtype)
+            0, token_indices, current_hidden_states.to(dtype)
         )
 
     return final_hidden_states
@@ -690,12 +658,8 @@ def custom_moe_swiglu_group_fake(
     up_proj_scale: torch.Tensor,
     down_proj_weight: torch.Tensor,
     down_proj_scale: torch.Tensor,
-    router_logits: torch.Tensor,
-    scoring_func: str,
+    masked_routing_weights: torch.Tensor,
     group_size: torch.Tensor,
-    topk: int,
-    post_norm: bool = True,
-    e_score_correction_bias: torch.Tensor | None = None,
     gate_proj_bias: torch.Tensor | None = None,
     up_proj_bias: torch.Tensor | None = None,
     down_proj_bias: torch.Tensor | None = None,
@@ -1131,12 +1095,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         num_tokens = orig_shape[:-1].numel()  # noqa: F841
         hidden_states = x.reshape(num_tokens, -1)
         masked_routing_weights = router_logits
-        # scoring_func / e_score_correction_bias are passed to the custom op below;
-        # resolve them from the layer (mirrors fused_moe.layer). Without this they
-        # are undefined names, which make Dynamo graph-break at the custom op call
-        # -- splitting the activation quantization into its own subgraph.
-        scoring_func = getattr(layer, "scoring_func", "softmax")
-        e_score_correction_bias = getattr(layer, "e_score_correction_bias", None)
         intermediate_size = layer.w2_weight.shape[-1]
 
         # w13_weight: merged gate(up) weights, w2_weight: down weights
@@ -1202,14 +1160,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 up_proj_weight_scale,
                 down_proj_weight,
                 down_proj_weight_scale,
-                router_logits,
-                # Keep arg order aligned with rebel custom_op schema:
-                # (..., router_logits, scoring_func, group_size, topk, post_norm, ...)
-                scoring_func,
+                # Routing (softmax + topk) done externally; arg order mirrors the
+                # custom_moe_swiglu_group_dequantize schema with the fp8 activation
+                # scale inserted at index 1.
+                masked_routing_weights,
                 torch.tensor(self.weight_block_size[1], dtype=torch.int32),
-                layer.top_k,
-                layer.renormalize,
-                e_score_correction_bias,
                 None,  # gate_proj_bias
                 None,  # up_proj_bias
                 None,  # down_proj_bias
