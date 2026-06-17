@@ -85,8 +85,7 @@ class RBLNOptimumQwenVLForConditionalGeneration(
             "rope_deltas": preprocess_outputs[2],
         }
 
-    def encode(self, image_input, video_input) -> dict:
-        # sync with optimum encode()
+    def _process_image_input(self, image_input) -> dict:
         result = {}
         if image_input is not None and image_input.get("type") == "pixel_values":
             visual_out = self.model.visual(
@@ -101,6 +100,10 @@ class RBLNOptimumQwenVLForConditionalGeneration(
             else:
                 result["image_embeds"] = visual_out
             result["image_grid_thw"] = image_input["image_grid_thw"]
+        return result
+
+    def _process_video_input(self, video_input) -> dict:
+        result = {}
         if video_input is not None and video_input.get("type") == "pixel_values_videos":
             visual_out = self.model.visual(
                 video_input["pixel_values_videos"],
@@ -394,7 +397,12 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         if image_input is None and video_input is None:
             return []
 
-        return self.encode(image_input, video_input)
+        # Merge the per-modality encoder outputs into a single cacheable dict
+        # (consumed on the decode side by build_prefill_inputs()).
+        result = {}
+        result.update(self._process_image_input(image_input))
+        result.update(self._process_video_input(video_input))
+        return result
 
     def build_prefill_inputs(
         self,

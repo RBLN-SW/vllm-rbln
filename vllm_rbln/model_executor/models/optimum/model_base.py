@@ -20,7 +20,10 @@ import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.models.interfaces import SupportsMultiModal
+from vllm.model_executor.models.interfaces import (
+    MultiModalEmbeddings,
+    SupportsMultiModal,
+)
 from vllm.model_executor.models.interfaces_base import VllmModelForTextGeneration
 from vllm.v1.sample.metadata import SamplingMetadata
 
@@ -460,6 +463,17 @@ class RBLNOptimumMultimodalMixin(SupportsMultiModal):
     """
     Shared multimodal interface for optimum models.
     """
+
+    def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
+        # Default vision-only encode path shared by the simple MM models: parse
+        # the image input and return per-image token embeddings. Models with a
+        # richer cacheable unit (e.g. Qwen-VL, which also handles video) override
+        # this.
+        image_input = self._parse_and_validate_image_input(**kwargs)
+        if image_input is None:
+            return []
+
+        return self._process_image_input(image_input)
 
     def build_prefill_inputs(
         self,

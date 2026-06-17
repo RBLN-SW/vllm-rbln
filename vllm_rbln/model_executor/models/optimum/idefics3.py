@@ -160,13 +160,6 @@ class RBLNOptimumIdefics3ForConditionalGeneration(
 
         return list(connector_outputs)
 
-    def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
-        image_input = self._parse_and_validate_image_input(**kwargs)
-        if image_input is None:
-            return []
-
-        return self._process_image_input(image_input)
-
     def embed_input_ids(
         self,
         input_ids: torch.Tensor,
