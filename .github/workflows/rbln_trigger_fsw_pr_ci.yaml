@@ -2,7 +2,7 @@ name: Trigger FSW PR CI for vLLM-RBLN
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
     inputs:
       ref:
@@ -45,5 +45,6 @@ jobs:
                 "sha": "${{ github.event.pull_request.head.sha }}",
                 "pr_number": "${{ github.event.number }}",
                 "actor": "${{ github.actor }}",
-                "vllm_version": "${{ matrix.vllm_version }}"
+                "vllm_version": "${{ matrix.vllm_version }}",
+                "run_e2e": ${{ contains(github.event.pull_request.labels.*.name, 'pytest(e2e)') }}
               }

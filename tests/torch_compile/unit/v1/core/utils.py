@@ -186,8 +186,6 @@ def create_scheduler(
 
     # TODO(RBLN): support async scheduling
     assert not async_scheduling
-    # TODO(RBLN): support specluative decoding
-    assert not num_speculative_tokens
 
     model_config = ModelConfig(
         model=model,

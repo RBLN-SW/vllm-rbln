@@ -25,24 +25,23 @@ def register_model():
         from vllm import ModelRegistry
 
         ModelRegistry.register_model(
-            "T5WithLMHeadModel",
-            "vllm_rbln.model_executor.models.optimum.t5:RBLNT5ForConditionalGeneration",
-        )
-        ModelRegistry.register_model(
-            "T5ForConditionalGeneration",
-            "vllm_rbln.model_executor.models.optimum.t5:RBLNT5ForConditionalGeneration",
-        )
-        ModelRegistry.register_model(
-            "T5EncoderModel",
-            "vllm_rbln.model_executor.models.optimum.encoder:RBLNOptimumForEncoderModel",
-        )
-        ModelRegistry.register_model(
             "Gemma3ForConditionalGeneration",
             "vllm_rbln.model_executor.models.optimum.gemma3:RBLNOptimumGemma3ForConditionalGeneration",
+        )
+        ModelRegistry.register_model(
+            "Gemma4ForConditionalGeneration",
+            "vllm_rbln.model_executor.models.optimum.gemma4:RBLNOptimumGemma4ForConditionalGeneration",
         )
 
 
 def register_ops():
+    # torch 2.10 added a strict raise in CompileEventLogger.increment_toplevel
+    # / add_to_set_toplevel when no outermost chromium event is active. The
+    # RBLN custom torch.compile backend ends up calling those without a
+    # propagated event (wrap-based approaches at warm_up_model / execute_model
+    # / dummy_run did not work for this code path), so we silence the raise
+    # here. See ``_torch_dynamo_compat.py`` for details.
+    import vllm_rbln._torch_dynamo_compat  # noqa
     import vllm_rbln.distributed.ec_transfer.ec_connector.factory  # noqa
 
     if envs.VLLM_RBLN_USE_VLLM_MODEL:

@@ -210,16 +210,9 @@ class RblnPlatform(Platform):
                     "(TP, DP, EP, or PP)."
                 )
             os.environ["RBLN_CTX_STANDALONE"] = "1"
-            ccl_async_mode = os.environ.get("RBLN_FORCE_CCL_ASYNC")
-            # NOTE If users don't set RBLN_FORCE_CCL_ASYNC, we will set it to 1
-            # to enable async mode by default for better performance.
-            # However, if users explicitly set RBLN_FORCE_CCL_ASYNC to 0,
-            # we will respect their choice but print a warning message.
-            if ccl_async_mode is None:
-                os.environ["RBLN_FORCE_CCL_ASYNC"] = "1"
-            elif ccl_async_mode == "0":
+            if os.environ.get("RBLN_RUNTIME_FORCE_SYNC") == "1":
                 logger.warning(
-                    "RBLN_FORCE_CCL_ASYNC is set to 0, "
+                    "RBLN_RUNTIME_FORCE_SYNC=1 forces the synchronous runtime, "
                     "which may cause performance degradation "
                     "when using vLLM model parallel (TP, DP, EP, or PP)."
                 )
@@ -294,13 +287,6 @@ class RblnPlatform(Platform):
 
                 if (lora_config := vllm_config.lora_config) is not None:
                     lora_config.lora_dtype = torch.float16
-
-            if vllm_config.speculative_config is not None and envs.VLLM_RBLN_SAMPLER:
-                # FIXME(RBLN): make RBLNSampler compatible with speculative decoding
-                logger.warning(
-                    "Using RBLNSampler with speculative decoding is not supported yet."
-                )
-                envs.VLLM_RBLN_SAMPLER = False
 
         else:
             # NOTE(eunji.lee):
