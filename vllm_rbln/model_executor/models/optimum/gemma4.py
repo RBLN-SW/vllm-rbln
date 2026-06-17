@@ -38,7 +38,6 @@ class RBLNGemma4MultiModalProcessor(Gemma4MultiModalProcessor):
     boundaries."""
 
     def apply(self, *args, **kwargs):
-        # NOTE: Check if padding works correctly
         output = super().apply(*args, **kwargs)
         output["prompt_token_ids"] = self._pad_image_boundaries(
             output["prompt_token_ids"]
@@ -46,6 +45,14 @@ class RBLNGemma4MultiModalProcessor(Gemma4MultiModalProcessor):
         return output
 
     def _pad_image_boundaries(self, prompt_ids: list[int]) -> list[int]:
+        """Left-pad ``prompt_token_ids`` so each image block aligns to a prefill
+        chunk boundary.
+
+        The padding only inflates the prompt length vLLM sees, so vLLM allocates
+        enough KV-cache blocks. The actual chunk-aligned attention is handled
+        inside optimum-rbln, which infers the padding length from these
+        left-padded tokens.
+        """
         token_type_ids = (
             torch.tensor(prompt_ids) == self.info.get_hf_processor().image_token_id
         )
