@@ -35,6 +35,7 @@ class ECDisaggHelpersMixin:
 
     Expects the host class to provide:
       - self.model, self.model_config, self.encoder_cache
+      - self.mrope_position_deltas
       - self.maybe_save_ec_to_connector (from ECConnectorModelRunnerMixin)
     """
 
@@ -44,6 +45,7 @@ class ECDisaggHelpersMixin:
         model: Any
         model_config: "ModelConfig"
         encoder_cache: dict[str, Any]
+        mrope_position_deltas: dict[str, float]
 
         def maybe_save_ec_to_connector(
             self, encoder_cache: dict[str, Any], mm_hash: str
@@ -143,6 +145,7 @@ class ECDisaggHelpersMixin:
             cached_mm_outputs,
             cache_position=cache_position,
             running_requests_ids=model_input.running_requests_ids,
+            mrope_position_deltas=self.mrope_position_deltas,
         )
 
         language_model = self.model.get_language_model()
