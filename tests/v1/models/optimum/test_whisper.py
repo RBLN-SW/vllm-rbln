@@ -109,9 +109,7 @@ class TestLanguageDetectionPrompt:
 class TestParseLanguageDetectionOutput:
     def test_extracts_language_code(self, tokenizer):
         token_id = tokenizer.convert_tokens_to_ids("<|de|>")
-        assert (
-            Whisper.parse_language_detection_output([token_id], tokenizer) == "de"
-        )
+        assert Whisper.parse_language_detection_output([token_id], tokenizer) == "de"
 
     def test_only_first_token_is_used(self, tokenizer):
         de = tokenizer.convert_tokens_to_ids("<|de|>")
@@ -123,8 +121,7 @@ class TestParseLanguageDetectionOutput:
         ids = Whisper.get_language_token_ids(tokenizer)
         for code, token_id in zip(ISO639_1_SUPPORTED_LANGS, ids):
             assert (
-                Whisper.parse_language_detection_output([token_id], tokenizer)
-                == code
+                Whisper.parse_language_detection_output([token_id], tokenizer) == code
             )
 
     def test_non_language_token_rejected(self, tokenizer):
@@ -149,15 +146,10 @@ class TestGenerationPromptUsesGivenLanguage:
     def test_given_language_embedded_in_prompt(self):
         prompt = Whisper.get_generation_prompt(_stt_params("ko"))
         text = prompt["decoder_prompt"]["prompt"]
-        assert (
-            text
-            == "<|startoftranscript|><|ko|><|transcribe|><|notimestamps|>"
-        )
+        assert text == "<|startoftranscript|><|ko|><|transcribe|><|notimestamps|>"
 
     def test_task_type_embedded(self):
-        prompt = Whisper.get_generation_prompt(
-            _stt_params("en", task_type="translate")
-        )
+        prompt = Whisper.get_generation_prompt(_stt_params("en", task_type="translate"))
         assert "<|translate|>" in prompt["decoder_prompt"]["prompt"]
 
     def test_request_prompt_prefixed(self):
