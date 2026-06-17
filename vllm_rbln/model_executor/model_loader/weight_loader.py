@@ -35,8 +35,6 @@ from vllm.model_executor.models import (
 from vllm.model_executor.models.deepseek_v2 import get_spec_layer_idx_from_weight_name
 from vllm.model_executor.models.utils import is_pp_missing_parameter
 
-from vllm_rbln.model_executor.layers.fused_moe.shared_fused_moe import SharedFusedMoE
-
 logger = init_logger(__name__)
 
 # Following isort, docstring requires a dummy line
@@ -789,8 +787,10 @@ def load_AXK1_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[
     else:
         stacked_params_mapping.extend(mla_params_mapping)
 
-    expert_params_mapping = SharedFusedMoE.make_expert_params_mapping(
-        model=self,
+    # vLLM 0.22: make_expert_params_mapping takes a leading `model` arg
+    # (dev-0.22.0 dropped the RBLN SharedFusedMoE wrapper).
+    expert_params_mapping = FusedMoE.make_expert_params_mapping(
+        self,
         ckpt_gate_proj_name="gate_proj",
         ckpt_down_proj_name="down_proj",
         ckpt_up_proj_name="up_proj",
