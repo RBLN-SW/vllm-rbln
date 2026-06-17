@@ -84,7 +84,8 @@ class RBLNGemma4MultiModalProcessor(Gemma4MultiModalProcessor):
         image_ends = torch.where(token_type_ids & ~next_is_image)[0]
         block_lengths = image_ends - image_starts + 1
         assert torch.all(block_lengths < EXPECTED_IMAGE_TOKENS), (
-            f"Expected each image block to be less than {EXPECTED_IMAGE_TOKENS} tokens, "
+            f"Expected each image block to be less than "
+            f"{EXPECTED_IMAGE_TOKENS} tokens, "
             f"got {block_lengths.tolist()}"
         )
         # Pad BOTH before and after each image block so no prefill chunk mixes
