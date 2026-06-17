@@ -29,7 +29,7 @@ from .blip2 import RBLNOptimumBlip2ForConditionalGeneration  # noqa: F401
 from .decoder_only import RBLNOptimumForCausalLM
 from .encoder import RBLNOptimumForEncoderModel
 from .gemma3 import RBLNOptimumGemma3ForConditionalGeneration  # noqa: F401
-from .gemma4 import RBLNOptimumGemma4ForConditionalGeneration  # noqa: F401
+# from .gemma4 import RBLNOptimumGemma4ForConditionalGeneration  # noqa: F401
 from .idefics3 import RBLNOptimumIdefics3ForConditionalGeneration  # noqa: F401
 from .llava import RBLNOptimumLlavaForConditionalGeneration  # noqa: F401
 from .llava_next import RBLNOptimumLlavaNextForConditionalGeneration  # noqa: F401
