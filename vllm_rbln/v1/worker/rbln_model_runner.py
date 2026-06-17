@@ -156,6 +156,141 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+# [OPT] Row-indirection for the two large InputBatch token arrays under reorder.
+#
+# token_ids_cpu/is_token_ids are [max_num_reqs, max_model_len]; a full-row swap
+# copies ~5 bytes * max_model_len per row (512KB int32 + 128KB bool at 131072).
+# Under batched-decode reorder these are the dominant per-step cost and it grows
+# linearly with sequence length. With VLLM_RBLN_TOK_INDIRECT the reorder no
+# longer copies those rows: it physically swaps every OTHER (small) field as
+# usual so the device batch stays sorted, and tracks where each logical slot's
+# token row physically lives via a per-InputBatch permutation `_tok_row`
+# (slot -> physical row). All token-row reads/writes in the model runner are
+# redirected through `_tok_row`. The map is materialized back to identity only
+# on churn steps (add/condense), so the base add_request/condense run unchanged.
+_RBLN_ORIG_SWAP_STATES = InputBatch.swap_states
+_RBLN_ORIG_MAKE_PROMPT = InputBatch._make_prompt_token_ids_tensor
+
+
+def _rbln_get_tok_row(ib: InputBatch) -> np.ndarray:
+    tr = getattr(ib, "_tok_row", None)
+    if tr is None:
+        tr = np.arange(ib.max_num_reqs, dtype=np.int64)
+        ib._tok_row = tr
+    return tr
+
+
+class _RowRedirect:
+    """Thin numpy-array facade that remaps the first (row) index through a
+    permutation. Used to temporarily wrap token_ids_cpu/is_token_ids during
+    add_request so its `arr[slot, sl] = ...` writes land at the physical row
+    `_tok_row[slot]` — no token-row copy, base add_request unmodified.
+
+    add_request/update_req_spec only ever index these arrays as `[row, slice]`
+    (verified against base source), so __setitem__/__getitem__ + shape/dtype
+    passthrough is sufficient."""
+
+    __slots__ = ("_a", "_tr")
+
+    def __init__(self, arr: np.ndarray, tok_row: np.ndarray):
+        self._a = arr
+        self._tr = tok_row
+
+    def _map(self, idx):
+        if isinstance(idx, tuple):
+            return (int(self._tr[idx[0]]),) + idx[1:]
+        return int(self._tr[idx])
+
+    def __setitem__(self, idx, val):
+        self._a[self._map(idx)] = val
+
+    def __getitem__(self, idx):
+        return self._a[self._map(idx)]
+
+    @property
+    def shape(self):
+        return self._a.shape
+
+    @property
+    def dtype(self):
+        return self._a.dtype
+
+
+def _rbln_indirect_swap_states(self, i1: int, i2: int) -> None:
+    # Swap all small fields normally (keeps the device batch physically
+    # sorted), but skip the big token-row copy by narrowing the two arrays to
+    # zero-width views; instead pointer-swap the logical->physical row map.
+    tr = _rbln_get_tok_row(self)
+    full_tok = self.token_ids_cpu
+    full_is = self.is_token_ids
+    try:
+        self.token_ids_cpu = full_tok[:, :0]
+        self.is_token_ids = full_is[:, :0]
+        _RBLN_ORIG_SWAP_STATES(self, i1, i2)
+    finally:
+        self.token_ids_cpu = full_tok
+        self.is_token_ids = full_is
+    tr[i1], tr[i2] = tr[i2], tr[i1]
+
+
+def _rbln_indirect_make_prompt_token_ids_tensor(self):
+    # Prompt-logprobs path reads token_ids_cpu[:num_reqs] by slot; under
+    # indirection slot i's tokens live at row _tok_row[i], so feed the base
+    # method a row-permuted copy. Rare (only when prompt_logprobs requested).
+    tr = getattr(self, "_tok_row", None)
+    if tr is None:
+        return _RBLN_ORIG_MAKE_PROMPT(self)
+    full = self.token_ids_cpu
+    try:
+        self.token_ids_cpu = full[tr]
+        return _RBLN_ORIG_MAKE_PROMPT(self)
+    finally:
+        self.token_ids_cpu = full
+
+
+def _rbln_fast_swap_states(self, i1: int, i2: int) -> None:
+    # [OPT] valid-range swap: copy only the :n valid token columns instead of
+    # the full max_model_len row. Cheaper than baseline full-row copy but cost
+    # still scales with sequence length (n). Alternative to indirection.
+    n1 = int(self.num_tokens_no_spec[i1])
+    n2 = int(self.num_tokens_no_spec[i2])
+    n = n1 if n1 >= n2 else n2
+    full_tok = self.token_ids_cpu
+    full_is = self.is_token_ids
+    if n >= full_tok.shape[1]:
+        _RBLN_ORIG_SWAP_STATES(self, i1, i2)
+        return
+    try:
+        self.token_ids_cpu = full_tok[:, :n]
+        self.is_token_ids = full_is[:, :n]
+        _RBLN_ORIG_SWAP_STATES(self, i1, i2)
+    finally:
+        self.token_ids_cpu = full_tok
+        self.is_token_ids = full_is
+
+
+# Technique selection (mutually exclusive): indirection > valid-range > baseline.
+# Baseline = unpatched base swap_states (full max_model_len row copy).
+_RBLN_TOK_INDIRECT = os.environ.get("VLLM_RBLN_TOK_INDIRECT", "False").lower() in (
+    "true",
+    "1",
+)
+_RBLN_FAST_SWAP = os.environ.get("VLLM_RBLN_FAST_SWAP", "False").lower() in ("true", "1")
+if _RBLN_TOK_INDIRECT:
+    if getattr(InputBatch.swap_states, "__name__", "") != "_rbln_indirect_swap_states":
+        InputBatch.swap_states = _rbln_indirect_swap_states
+        InputBatch._make_prompt_token_ids_tensor = (
+            _rbln_indirect_make_prompt_token_ids_tensor
+        )
+        logger.info("[vllm-rbln] patched InputBatch for token-row indirection")
+elif _RBLN_FAST_SWAP:
+    if getattr(InputBatch.swap_states, "__name__", "") != "_rbln_fast_swap_states":
+        InputBatch.swap_states = _rbln_fast_swap_states
+        logger.info("[vllm-rbln] patched InputBatch.swap_states (valid-range copy)")
+else:
+    logger.info("[vllm-rbln] InputBatch.swap_states unpatched (baseline full-row copy)")
+
+
 # Wrapper for ModelRunnerOutput to support overlapped execution.
 class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
     def __init__(
@@ -323,6 +458,21 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # FIXME not compiled?
         self.sampler = sampler
+
+        # Token-row indirection (see module-level patch). Disabled with spec
+        # decode, whose draft paths read token_ids_cpu by raw slot.
+        self._tok_indirect = envs.VLLM_RBLN_TOK_INDIRECT
+        if self._tok_indirect and self.speculative_config is not None:
+            logger.warning(
+                "[vllm-rbln] VLLM_RBLN_TOK_INDIRECT is incompatible with "
+                "speculative decode; disabling token-row indirection."
+            )
+            self._tok_indirect = False
+        if self._tok_indirect and not envs.VLLM_RBLN_SORT_BATCH:
+            logger.warning(
+                "[vllm-rbln] VLLM_RBLN_TOK_INDIRECT has no effect without "
+                "VLLM_RBLN_SORT_BATCH (no reorder happens)."
+            )
 
         # Lazy initialization
         self.compute_logits_model: nn.Module
@@ -662,6 +812,92 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         )
         return model_kwargs
 
+    def _tok_phys(self, slot):
+        """Map logical slot(s) -> physical token-row index. Identity unless
+        token-row indirection is active."""
+        if not self._tok_indirect:
+            return slot
+        return _rbln_get_tok_row(self.input_batch)[slot]
+
+    def _materialize_tok_row(self) -> None:
+        """Realize the slot->physical permutation into the token arrays and
+        reset it to identity. No longer on the hot path (add via row-redirect
+        and condense via pointer-swap are both copy-free); retained as a
+        debug/fallback helper. No-op if identity."""
+        if not self._tok_indirect:
+            return
+        ib = self.input_batch
+        tr = getattr(ib, "_tok_row", None)
+        if tr is None:
+            return
+        nr = ib.num_reqs
+        identity = np.arange(ib.max_num_reqs, dtype=np.int64)
+        if nr > 0 and not np.array_equal(tr, identity):
+            # new_row[i] = old_row[tr[i]] over the valid column range; RHS fancy
+            # indexing returns a copy so there is no aliasing.
+            n = int(ib.num_tokens_no_spec[:nr].max())
+            if n > 0:
+                ib.token_ids_cpu[:, :n] = ib.token_ids_cpu[tr, :n]
+                ib.is_token_ids[:, :n] = ib.is_token_ids[tr, :n]
+        ib._tok_row = identity
+
+    def _indirect_add_requests(self, reqs_to_add, scheduled_spec_tokens) -> None:
+        """Add new/resumed requests. Under indirection, wrap the token arrays
+        in a row-redirect facade so base add_request writes each new request's
+        tokens to its physical row `_tok_row[slot]` (a free row by the bijection
+        invariant) — copy-free, no materialize. Falls back to plain add when
+        indirection is off."""
+        ib = self.input_batch
+        if not self._tok_indirect:
+            for request in reqs_to_add:
+                ib.add_request(request)
+                ib.update_req_spec_token_ids(request, scheduled_spec_tokens)
+            return
+        if not reqs_to_add:
+            return
+        tr = _rbln_get_tok_row(ib)
+        real_tok = ib.token_ids_cpu
+        real_is = ib.is_token_ids
+        try:
+            ib.token_ids_cpu = _RowRedirect(real_tok, tr)
+            ib.is_token_ids = _RowRedirect(real_is, tr)
+            for request in reqs_to_add:
+                ib.add_request(request)
+                ib.update_req_spec_token_ids(request, scheduled_spec_tokens)
+        finally:
+            ib.token_ids_cpu = real_tok
+            ib.is_token_ids = real_is
+
+    def _indirect_condense(self) -> None:
+        """Run base condense() but skip the big token-row copy: narrow the two
+        token arrays to zero-width views (so condense's row moves are no-ops),
+        then pointer-update _tok_row from the (last -> empty) moves condense
+        records. Copy-free; works for any _tok_row state. Falls back to plain
+        condense when indirection is off."""
+        ib = self.input_batch
+        if not self._tok_indirect:
+            ib.condense()
+            return
+        tr = _rbln_get_tok_row(ib)
+        mvb = ib.batch_update_builder
+        moved0 = len(mvb.moved)
+        full_tok = ib.token_ids_cpu
+        full_is = ib.is_token_ids
+        try:
+            ib.token_ids_cpu = full_tok[:, :0]
+            ib.is_token_ids = full_is[:, :0]
+            ib.condense()
+        finally:
+            ib.token_ids_cpu = full_tok
+            ib.is_token_ids = full_is
+        # condense appends (last_req_index, empty_index, UNIDIRECTIONAL) per
+        # move; mirror each as a _tok_row pointer swap to keep the permutation
+        # a bijection. (reorder runs after condense, so this slice is condense's
+        # moves only.)
+        for entry in mvb.moved[moved0:]:
+            src, dst = int(entry[0]), int(entry[1])
+            tr[src], tr[dst] = tr[dst], tr[src]
+
     def _may_reorder_batch(self, scheduler_output: SchedulerOutput) -> None:
         """
         Update the order of requests in the batch based on the attention
@@ -937,7 +1173,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 start_token_index = num_computed_tokens
                 end_token_index = num_computed_tokens + len(new_token_ids)
                 self.input_batch.token_ids_cpu[
-                    req_index, start_token_index:end_token_index
+                    self._tok_phys(req_index), start_token_index:end_token_index
                 ] = new_token_ids
                 self.input_batch.num_tokens_no_spec[req_index] = end_token_index
 
@@ -945,13 +1181,14 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self.input_batch.update_req_spec_token_ids(req_state, scheduled_spec_tokens)
 
         # Add the new or resumed requests to the persistent batch.
-        # The smaller empty indices are filled first.
-        for request in reqs_to_add:
-            self.input_batch.add_request(request)
-            self.input_batch.update_req_spec_token_ids(request, scheduled_spec_tokens)
+        # Token-row indirection: write each new request's tokens to its physical
+        # row via a row-redirect facade — copy-free, no materialize needed.
+        self._indirect_add_requests(reqs_to_add, scheduled_spec_tokens)
 
-        # Condense the batched states if there are gaps left by removed requests
-        self.input_batch.condense()
+        # Condense the batched states if there are gaps left by removed requests.
+        # Token-row indirection: skip the big token-row copy and pointer-update
+        # _tok_row from condense's recorded moves instead (copy-free).
+        self._indirect_condense()
         # Allow attention backend to reorder the batch, potentially
         self._may_reorder_batch(scheduler_output)
         # Refresh batch metadata with any pending updates.
@@ -1268,8 +1505,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
         # -> [0, 1, M, M + 1, M + 2, M + 3, M + 4, 2 * M, 2 * M + 1, 2 * M + 2]
         # where M is the max_model_len.
+        # Token-row indirection: tokens for logical slot live at physical row
+        # _tok_row[slot]; other device arrays keep using req_indices (slot
+        # order), which reorder already sorted physically.
+        tok_rows = self._tok_phys(req_indices)
         token_indices = (
-            positions_np + req_indices * self.input_batch.token_ids_cpu.shape[1]
+            positions_np + tok_rows * self.input_batch.token_ids_cpu.shape[1]
         )
 
         # NOTE(woosuk): We use torch.index_select instead of np.take here
@@ -2950,8 +3191,9 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 f"{self.max_model_len}"
             )
 
-            self.input_batch.token_ids_cpu[req_idx, start_idx:end_idx] = sampled_ids
-            self.input_batch.is_token_ids[req_idx, start_idx:end_idx] = True
+            phys_idx = self._tok_phys(req_idx)
+            self.input_batch.token_ids_cpu[phys_idx, start_idx:end_idx] = sampled_ids
+            self.input_batch.is_token_ids[phys_idx, start_idx:end_idx] = True
             self.input_batch.num_tokens_no_spec[req_idx] = end_idx
 
             req_id = req_ids[req_idx]
