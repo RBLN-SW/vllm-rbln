@@ -2207,12 +2207,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # to reduce the warmup length to a reasonable value for now.
         # This is mainly because we still have to run the computation over
         # the padded tokens in speculative decoding scenario as well.
-        # DEBUG (int16 overflow verification, dummy-run only): cap the
-        # warmup seq_len so seq_idx fits in int16 (attention kernel call
-        # site casts attn_metadata.seq_lens to int16 — values > 32767
-        # wrap into negatives). Remove once the proper kernel-side fix
-        # lands.
-        decode_max_seq_len = min(self.max_model_len // 2, 16384)
+        # Stay within a single partition (block_size // 2) — required for
+        # spec decode correctness.
+        decode_max_seq_len = min(
+            self.max_model_len // 2,
+            self.cache_config.block_size // 2,
+        )
 
         # compile decode graph considering decode batch buckets
         for batch_bucket_size in self.bucketing_manager.decode_batch_buckets:
