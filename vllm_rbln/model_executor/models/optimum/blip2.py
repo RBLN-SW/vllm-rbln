@@ -21,7 +21,6 @@ from vllm.model_executor.models.blip2 import (
     Blip2ImageInputs,
     Blip2ImagePixelInputs,
 )
-from vllm.model_executor.models.interfaces import MultiModalEmbeddings
 
 from .base import ModelInputForRBLN
 from .model_base import (
@@ -136,30 +135,6 @@ class RBLNOptimumBlip2ForConditionalGeneration(
         # (num_images, num_query_tokens, text_hidden_size)
         language_model_inputs = model.language_projection(query_output)
         return list(language_model_inputs)
-
-    def embed_input_ids(
-        self,
-        input_ids: torch.Tensor,
-        multimodal_embeddings: MultiModalEmbeddings | None = None,
-        *,
-        is_multimodal: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        # Mirrors optimum-rbln's _preprocess_prefill: scatter the Q-Former
-        # outputs over the image-token positions.
-        config = self.model.config
-        if is_multimodal is None:
-            is_multimodal = input_ids == config.image_token_index
-
-        inputs_embeds = self.model.get_input_embeddings()(input_ids)
-
-        if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
-            return inputs_embeds
-
-        mm_embeds = torch.cat(list(multimodal_embeddings)).to(
-            inputs_embeds.device, inputs_embeds.dtype
-        )
-        scatter_mask = is_multimodal.unsqueeze(-1).expand_as(inputs_embeds)
-        return inputs_embeds.masked_scatter(scatter_mask, mm_embeds)
 
     def _parse_and_validate_image_input(self, **kwargs: Any) -> Blip2ImageInputs | None:
         pixel_values = kwargs.pop("pixel_values", None)

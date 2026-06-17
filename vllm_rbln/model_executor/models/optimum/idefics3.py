@@ -21,7 +21,6 @@ from vllm.model_executor.models.idefics3 import (
     Idefics3ImagePixelInputs,
     ImageInputs,
 )
-from vllm.model_executor.models.interfaces import MultiModalEmbeddings
 
 from .base import ModelInputForRBLN
 from .model_base import (
@@ -160,29 +159,9 @@ class RBLNOptimumIdefics3ForConditionalGeneration(
 
         return list(connector_outputs)
 
-    def embed_input_ids(
-        self,
-        input_ids: torch.Tensor,
-        multimodal_embeddings: MultiModalEmbeddings | None = None,
-        *,
-        is_multimodal: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        # Mirrors optimum-rbln's inputs_merger: image tokens are in-vocab, so
-        # scatter the connector outputs over the image-token positions.
-        config = self.model.config
-        if is_multimodal is None:
-            is_multimodal = input_ids == config.image_token_id
-
-        inputs_embeds = self.model.get_input_embeddings()(input_ids)
-
-        if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
-            return inputs_embeds
-
-        mm_embeds = torch.cat(list(multimodal_embeddings)).to(
-            inputs_embeds.device, inputs_embeds.dtype
-        )
-        scatter_mask = is_multimodal.unsqueeze(-1).expand_as(inputs_embeds)
-        return inputs_embeds.masked_scatter(scatter_mask, mm_embeds)
+    def _image_token_id(self) -> int:
+        # idefics3's HF config names the placeholder `image_token_id`.
+        return self.model.config.image_token_id
 
     def _validate_pixel_values(self, data: torch.Tensor) -> torch.Tensor:
         h = w = self.model.config.vision_config.image_size

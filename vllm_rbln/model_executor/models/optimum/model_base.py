@@ -475,6 +475,45 @@ class RBLNOptimumMultimodalMixin(SupportsMultiModal):
 
         return self._process_image_input(image_input)
 
+    def _image_token_id(self) -> int:
+        # Token id of the multimodal placeholder. Default reads the HF config's
+        # `image_token_index`; subclasses whose config names it differently
+        # (e.g. `image_token_id`) override this.
+        return self.model.config.image_token_index
+
+    def _embed_text_tokens(
+        self, input_ids: torch.Tensor, is_multimodal: torch.Tensor
+    ) -> torch.Tensor:
+        # Text-token embedding lookup. Default assumes the placeholder is
+        # in-vocab, so a plain lookup suffices. Models whose placeholder is OOV
+        # override this to PAD-mask the placeholder positions first.
+        return self.model.get_input_embeddings()(input_ids)
+
+    def embed_input_ids(
+        self,
+        input_ids: torch.Tensor,
+        multimodal_embeddings: MultiModalEmbeddings | None = None,
+        *,
+        is_multimodal: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        # Mirrors optimum-rbln's _preprocess_prefill: embed the text tokens,
+        # then scatter the per-item multimodal embeddings over the placeholder
+        # positions.
+        if is_multimodal is None:
+            is_multimodal = input_ids == self._image_token_id()
+
+        inputs_embeds = self._embed_text_tokens(input_ids, is_multimodal)
+
+        if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
+            return inputs_embeds
+
+        # Flatten per-item embeddings into (num_mm_tokens, hidden_size).
+        mm_embeds = torch.cat(list(multimodal_embeddings)).to(
+            inputs_embeds.device, inputs_embeds.dtype
+        )
+        scatter_mask = is_multimodal.unsqueeze(-1).expand_as(inputs_embeds)
+        return inputs_embeds.masked_scatter(scatter_mask, mm_embeds)
+
     def build_prefill_inputs(
         self,
         input_ids: torch.Tensor,

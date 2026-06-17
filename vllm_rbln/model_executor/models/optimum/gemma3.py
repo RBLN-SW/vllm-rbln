@@ -23,7 +23,6 @@ from vllm.model_executor.models.gemma3_mm import (
     Gemma3MultiModalProcessor,
     Gemma3ProcessingInfo,
 )
-from vllm.model_executor.models.interfaces import MultiModalEmbeddings
 from vllm.model_executor.models.interfaces_base import VllmModelForTextGeneration
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
@@ -271,36 +270,15 @@ class RBLNOptimumGemma3ForConditionalGeneration(
             return list(image_embeds)
         return [e.flatten(0, 1) for e in image_embeds.split(num_patches.tolist())]
 
-    def embed_input_ids(
-        self,
-        input_ids: torch.Tensor,
-        multimodal_embeddings: MultiModalEmbeddings | None = None,
-        *,
-        is_multimodal: torch.Tensor | None = None,
+    def _embed_text_tokens(
+        self, input_ids: torch.Tensor, is_multimodal: torch.Tensor
     ) -> torch.Tensor:
-        # Mirrors the merge semantics of optimum-rbln's _preprocess_prefill:
-        # replace OOV image tokens with PAD for the text embedding lookup,
-        # then scatter the image embeddings over the image-token positions.
+        # Gemma3's image token can be OOV; PAD-mask those positions before the
+        # text embedding lookup (mirrors optimum-rbln's _preprocess_prefill).
         config = self.model.config
-        if is_multimodal is None:
-            is_multimodal = input_ids == config.image_token_index
-
         if config.image_token_index >= self.model.vocab_size:
-            llm_input_ids = input_ids.masked_fill(is_multimodal, PAD_TOKEN_ID)
-        else:
-            llm_input_ids = input_ids
-        inputs_embeds = self.model.get_input_embeddings()(llm_input_ids)
-
-        if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
-            return inputs_embeds
-
-        # Flatten per-item embeddings into (num_mm_tokens, hidden_size);
-        # works for both a list of 2D tensors and a 3D tensor.
-        mm_embeds = torch.cat(list(multimodal_embeddings)).to(
-            inputs_embeds.device, inputs_embeds.dtype
-        )
-        scatter_mask = is_multimodal.unsqueeze(-1).expand_as(inputs_embeds)
-        return inputs_embeds.masked_scatter(scatter_mask, mm_embeds)
+            input_ids = input_ids.masked_fill(is_multimodal, PAD_TOKEN_ID)
+        return self.model.get_input_embeddings()(input_ids)
 
     def _parse_and_validate_image_input(
         self, **kwargs: Any
