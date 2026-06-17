@@ -1065,8 +1065,8 @@ class TestRblnNixlConnectorSchedulerHostBufferFlag:
 class TestRblnNixlConnectorWorkerD2DInit:
     """Worker `__init__` under `kv_buffer_device='rbln'` flips
     `use_host_buffer`, raises `nixl_memory_type` to VRAM, and primes the
-    deferred-registration slots that `set_runtime_holder` /
-    `finalize_kv_cache_registration` later consume."""
+    deferred-registration slot that `finalize_kv_cache_registration` later
+    consumes."""
 
     def test_d2d_init_state(self):
         worker = _build_d2d_worker()
@@ -1074,10 +1074,9 @@ class TestRblnNixlConnectorWorkerD2DInit:
         assert worker.use_host_buffer is False
         # VRAM segment: nixl-rbln uses ibv_reg_dmabuf_mr for device dmabufs.
         assert worker.nixl_memory_type == "VRAM"
-        # Both deferred-registration slots are declared up-front so other
-        # methods can check them without a `getattr` probe.
+        # Deferred-registration slot declared up-front so other methods can
+        # check it without a `getattr` probe.
         assert worker._pending_kv_caches is None
-        assert worker._runtime_holder is None
         # Block-size pins still apply on the D2D path.
         assert worker.num_blocks == 128
         assert worker.block_size == 64
@@ -1227,70 +1226,6 @@ class TestRblnNixlConnectorWorkerSetHostXferBufferOps:
         assert worker.copy_blocks is sentinel
 
 
-class TestRblnNixlConnectorSetRuntimeHolder:
-    """`RblnNixlConnector.set_runtime_holder` forwards the runner's holder
-    onto the worker so `_register_kv_caches_impl` can resolve the
-    RblnContext pointer at registration time. Scheduler-role connector
-    has no worker — the forward is a guarded no-op."""
-
-    def _make_connector(self, role):
-        import os
-        from unittest.mock import patch
-
-        from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl_connector import (  # noqa: E501
-            RblnNixlConnector,
-        )
-
-        vllm_config = MagicMock()
-        vllm_config.kv_transfer_config = MagicMock()
-        vllm_config.kv_transfer_config.engine_id = "test-engine"
-        vllm_config.kv_transfer_config.kv_buffer_device = "rbln"
-        # Side-step the scheduler/worker construction — we only test the
-        # outer set_runtime_holder method.
-        with (
-            patch.dict(os.environ, {"VLLM_RBLN_USE_DEVICE_TENSOR": "1"}),
-            patch(
-                "vllm_rbln.distributed.kv_transfer.kv_connector.v1."
-                "rbln_nixl_connector.RblnNixlConnectorScheduler"
-            ),
-            patch(
-                "vllm_rbln.distributed.kv_transfer.kv_connector.v1."
-                "rbln_nixl_connector.RblnNixlConnectorWorker"
-            ),
-            patch.object(
-                RblnNixlConnector.__mro__[1], "__init__", lambda *a, **k: None
-            ),
-        ):
-            return RblnNixlConnector(
-                vllm_config=vllm_config,
-                role=role,
-                kv_cache_config=MagicMock(),
-            )
-
-    def test_worker_role_forwards_holder(self):
-        from vllm.distributed.kv_transfer.kv_connector.v1.base import (
-            KVConnectorRole,
-        )
-
-        connector = self._make_connector(KVConnectorRole.WORKER)
-        # Worker is a MagicMock from our patched class above; set
-        # _runtime_holder explicitly so the assignment is observable.
-        connector.connector_worker._runtime_holder = None
-        holder = ["sentinel"]
-        connector.set_runtime_holder(holder)
-        assert connector.connector_worker._runtime_holder is holder
-
-    def test_scheduler_role_is_safe_noop(self):
-        from vllm.distributed.kv_transfer.kv_connector.v1.base import (
-            KVConnectorRole,
-        )
-
-        connector = self._make_connector(KVConnectorRole.SCHEDULER)
-        # No worker on the scheduler side — must not raise.
-        connector.connector_worker = None
-        connector.set_runtime_holder(["sentinel"])
-
-
 class TestRblnNixlConnectorWorkerRegisterKvCachesImpl:
     """`_register_kv_caches_impl` (the deferred D2D body) is what
     `finalize_kv_cache_registration` calls after warm-up materializes
@@ -1303,7 +1238,7 @@ class TestRblnNixlConnectorWorkerRegisterKvCachesImpl:
     invoked with the right memory segment for D2D (`mem='VRAM'`).
     """
 
-    def _prep_worker(self, runtime_holder=("ctx_sentinel",)):
+    def _prep_worker(self):
         """Build a D2D worker and back-fill every attribute that the real
         upstream `NixlConnectorWorker.__init__` would have set, so
         `_register_kv_caches_impl` can run without `AttributeError`."""
@@ -1325,15 +1260,6 @@ class TestRblnNixlConnectorWorkerRegisterKvCachesImpl:
         worker._registered_descs = []
         worker.dst_num_blocks = {}
         worker.src_xfer_handles_by_block_size = {}
-
-        if runtime_holder is not None:
-            ctx = MagicMock()
-            ctx.rbln_ctx_ptr = 0x1000
-            holder_entry = MagicMock()
-            holder_entry._runtime_handle.get_context.return_value = ctx
-            worker._runtime_holder = [holder_entry]
-        else:
-            worker._runtime_holder = None
         return worker
 
     def _layer_spec(self, page_size_bytes=4096):
@@ -1398,39 +1324,6 @@ class TestRblnNixlConnectorWorkerRegisterKvCachesImpl:
         nc.msgspec.msgpack.Encoder.return_value.encode.return_value = b"meta"
         return nc, nc_patch
 
-    def test_asserts_runtime_holder_present(self):
-        """The runner sets `_runtime_holder` via
-        `connector.set_runtime_holder` before warm-up. If
-        `_register_kv_caches_impl` runs first, the impl must fail
-        loudly instead of dereferencing `None`."""
-        import sys
-        import types
-        from unittest.mock import patch
-
-        import pytest
-
-        worker = self._prep_worker(runtime_holder=None)
-        worker._layer_specs = {
-            "l0": self._layer_spec(),
-            "l1": self._layer_spec(),
-        }
-        kv_caches = self._kv_caches(num_blocks=worker.num_blocks)
-        topo = MagicMock(
-            is_kv_layout_blocks_first=False,
-            _cross_layers_blocks=False,
-            cross_layers_blocks=False,
-        )
-        topo.get_transfer_cache_regions.side_effect = self._split_kv(worker.num_blocks)
-        _, nc_patch = self._patch_nixl_connector(topo)
-        try:
-            with (
-                patch.dict(sys.modules, {"nixl_rbln": types.ModuleType("nixl_rbln")}),
-                pytest.raises(AssertionError, match="runtime_holder"),
-            ):
-                worker._register_kv_caches_impl(kv_caches)
-        finally:
-            nc_patch.stop()
-
     def test_registers_with_vram_segment_and_captures_xfer_tables(self):
         """Happy path: nixl-rbln is invoked with `mem='VRAM'` (D2D
         signature), and the returned `base_addrs` / `block_lens` /
@@ -1462,7 +1355,12 @@ class TestRblnNixlConnectorWorkerRegisterKvCachesImpl:
                 "vllm_rbln.distributed.kv_transfer.kv_connector.v1."
                 "rbln_nixl_connector.nixl_connector"
             ) as nc,
+            patch(
+                "vllm_rbln.distributed.kv_transfer.kv_connector.v1."
+                "rbln_nixl_connector.Context"
+            ) as mock_ctx,
         ):
+            mock_ctx.from_key.return_value.rbln_ctx_ptr = 0x1000
             topo = MagicMock(
                 is_kv_layout_blocks_first=False,
                 _cross_layers_blocks=False,
@@ -1488,6 +1386,13 @@ class TestRblnNixlConnectorWorkerRegisterKvCachesImpl:
                 return_value=("local-handle", [(0x0, 0, 0)]),
             ):
                 worker._register_kv_caches_impl(kv_caches)
+
+        # rbln_ctx_ptr is resolved from the tensor's device id via the
+        # global-at-device Context lookup, not from a runtime handle.
+        mock_ctx.global_key_at_device.assert_called_once_with(0)
+        mock_ctx.from_key.assert_called_once_with(
+            mock_ctx.global_key_at_device.return_value
+        )
 
         # nixl-rbln was called once, with VRAM segment.
         fake_nixl_rbln.register_kv_regions.assert_called_once()
