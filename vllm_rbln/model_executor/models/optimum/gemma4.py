@@ -202,21 +202,7 @@ class RBLNOptimumGemma4ForConditionalGeneration(
                 mm_input_by_modality["image"] = self._parse_and_validate_image_input(
                     **kwargs
                 )
-            # FIXME Not implemented yet.
-            # if (
-            #     input_key == "pixel_values_videos"
-            #     and "video" not in mm_input_by_modality
-            # ):
-            #     mm_input_by_modality["video"] = self._parse_and_validate_video_input(
-            #         **kwargs
-            #     )
-            # if (
-            #     input_key == "input_features_padded"
-            #     and "audio" not in mm_input_by_modality
-            # ):
-            #     mm_input_by_modality["audio"] = self._parse_and_validate_audio_input(
-            #         **kwargs
-            #     )
+            # NOTE: Other multimodal types (audio, video) will be implemented later.
 
         return mm_input_by_modality
 
