@@ -31,12 +31,11 @@ if TYPE_CHECKING:
     VLLM_RBLN_DP_IMPL: str = "padded_decode"
     VLLM_RBLN_USE_MOE_TOKENS_MASK: bool = True
     VLLM_RBLN_ENFORCE_MODEL_FP32: bool = False
-    VLLM_RBLN_MOE_CUSTOM_KERNEL: bool = True
-    VLLM_RBLN_MOE_USE_OPT_KERNEL: bool = True
     VLLM_RBLN_DP_INPUT_ALL_GATHER: bool = True
     VLLM_RBLN_LOGITS_ALL_GATHER: bool = True
     VLLM_RBLN_NUM_RAY_NODES: int = 1
     VLLM_RBLN_METRICS: bool = False
+    VLLM_RBLN_METRICS_FILE: str = ""
     VLLM_RBLN_NUMA: bool = True
     VLLM_RBLN_SORT_BATCH: bool = False
     VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY: str = "exponential"
@@ -46,10 +45,13 @@ if TYPE_CHECKING:
     VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS: list[int] = []
     VLLM_RBLN_USE_CUSTOM_KERNEL: bool = False
     VLLM_RBLN_AUTO_PORT: bool = True
+    VLLM_RBLN_DISPATCH_ALL2ALL: bool = False
+    VLLM_RBLN_COMBINE_ALL2ALL: bool = False
     VLLM_RBLN_MOE_REDUCE_SCATTER: bool = False
     VLLM_RBLN_SUB_BLOCK_CACHE: bool = True
     VLLM_RBLN_USE_DEVICE_TENSOR: bool = False
     VLLM_RBLN_USE_W8A8_FP8: bool = False
+    VLLM_RBLN_COMPILE_ONLY: bool = False
 
 
 def get_dp_impl() -> str:
@@ -113,6 +115,18 @@ def get_decode_batch_bucket_manual_buckets() -> list[int]:
             f"Invalid VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS: "
             f"{manual_buckets}, {e}"
         ) from e
+
+
+def use_auto_port() -> bool:
+    raw = os.environ.get("VLLM_RBLN_AUTO_PORT")
+    if raw is not None:
+        return raw.lower() in ("true", "1")
+    # Default follows device-tensor mode: auto port is on when
+    # VLLM_RBLN_USE_DEVICE_TENSOR is enabled.
+    return os.environ.get("VLLM_RBLN_USE_DEVICE_TENSOR", "False").lower() in (
+        "true",
+        "1",
+    )
 
 
 # extended environments
@@ -191,20 +205,6 @@ environment_variables = {
             in ("true", "1")
         )
     ),
-    # use moe custom kernel, by default disabled
-    "VLLM_RBLN_MOE_CUSTOM_KERNEL": (
-        lambda: (
-            os.environ.get("VLLM_RBLN_MOE_CUSTOM_KERNEL", "True").lower()
-            in ("true", "1")
-        )
-    ),
-    # enable moe optimization if RBLN_MoE_OPT is set to 1
-    "VLLM_RBLN_MOE_USE_OPT_KERNEL": (
-        lambda: (
-            os.environ.get("VLLM_RBLN_MOE_USE_OPT_KERNEL", "True").lower()
-            in ("true", "1")
-        )
-    ),
     # DP_INPUT_ALL_GATHER, use DP input all_gather
     "VLLM_RBLN_DP_INPUT_ALL_GATHER": (
         lambda: (
@@ -226,6 +226,10 @@ environment_variables = {
     "VLLM_RBLN_METRICS": (
         lambda: os.environ.get("VLLM_RBLN_METRICS", "False").lower() in ("true", "1")
     ),
+    # Mirror the final performance report to this file (in addition to stdout).
+    # The worker pid is appended before the extension to keep TP/DP workers
+    # from clobbering each other. Empty disables file output.
+    "VLLM_RBLN_METRICS_FILE": lambda: os.environ.get("VLLM_RBLN_METRICS_FILE", ""),
     # Enable NUMA-based CPU affinity binding for OpenMP threads
     "VLLM_RBLN_NUMA": (
         lambda: os.environ.get("VLLM_RBLN_NUMA", "True").lower() in ("true", "1")
@@ -248,9 +252,7 @@ environment_variables = {
         os.environ.get("VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT", 1)
     ),
     # Auto port
-    "VLLM_RBLN_AUTO_PORT": (
-        lambda: os.environ.get("VLLM_RBLN_AUTO_PORT", "False").lower() in ("true", "1")
-    ),
+    "VLLM_RBLN_AUTO_PORT": use_auto_port,
     # Decode batch bucket manual buckets
     "VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS": get_decode_batch_bucket_manual_buckets,  # noqa E501
     "VLLM_RBLN_USE_CUSTOM_KERNEL": (
@@ -267,6 +269,20 @@ environment_variables = {
     ),
     "VLLM_RBLN_PROFILER": (
         lambda: os.environ.get("RBLN_PROFILER", "False").lower() in ("true", "1")
+    ),
+    # Use all2all dispatch instead of all-gather for MoE DP dispatch
+    "VLLM_RBLN_DISPATCH_ALL2ALL": (
+        lambda: (
+            os.environ.get("VLLM_RBLN_DISPATCH_ALL2ALL", "False").lower()
+            in ("true", "1")
+        )
+    ),
+    # Use all2all combine instead of reduce-scatter for MoE DP combine
+    "VLLM_RBLN_COMBINE_ALL2ALL": (
+        lambda: (
+            os.environ.get("VLLM_RBLN_COMBINE_ALL2ALL", "False").lower()
+            in ("true", "1")
+        )
     ),
     # Enable sub-block prefix caching.
     # Sub-block size equals max_num_batched_tokens (prefill chunk size).
@@ -287,6 +303,17 @@ environment_variables = {
     "VLLM_RBLN_USE_W8A8_FP8": (
         lambda: (
             os.environ.get("VLLM_RBLN_USE_W8A8_FP8", "False").lower() in ("true", "1")
+        )
+    ),
+    # Compile-only mode for NPU-less (CPU-only) hosts such as CI build workers.
+    # When set, the rbln torch.compile backend compiles + caches each graph and
+    # builds its runtime on a dummy device (no NPU required); the populated
+    # cache is later reused by a real NPU host via cache-hit. The target SOC is
+    # taken from rebel.get_npu_name(), which falls back to RBLN_TARGET_SOC, so
+    # set RBLN_TARGET_SOC (e.g. RBLN-CA25) on a host without an NPU mounted.
+    "VLLM_RBLN_COMPILE_ONLY": (
+        lambda: (
+            os.environ.get("VLLM_RBLN_COMPILE_ONLY", "False").lower() in ("true", "1")
         )
     ),
 }

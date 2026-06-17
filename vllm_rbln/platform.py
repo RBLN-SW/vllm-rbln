@@ -80,7 +80,19 @@ class RblnPlatform(Platform):
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
-        assert (device_name := rebel.get_npu_name(device_id))
+        # rebel.get_npu_name() returns None on a host without an NPU mounted
+        # (e.g. a CPU-only compile worker) and otherwise falls back to the
+        # RBLN_TARGET_SOC env var. When it is None we cannot determine a target
+        # SOC, so surface an actionable error instead of a bare AssertionError.
+        device_name = rebel.get_npu_name(device_id)
+        if not device_name:
+            raise RuntimeError(
+                "Could not determine the RBLN NPU name "
+                f"(rebel.get_npu_name({device_id}) returned None). On a host "
+                "without an NPU mounted (e.g. a CPU-only compile worker running "
+                "with VLLM_RBLN_COMPILE_ONLY=1), set RBLN_TARGET_SOC to the "
+                "target SOC (e.g. RBLN-CA25) so compilation can target it."
+            )
         return device_name
 
     @staticmethod
@@ -158,6 +170,32 @@ class RblnPlatform(Platform):
                 "Please don't disable chunked prefill by yourself."
             )
 
+        if envs.VLLM_RBLN_COMPILE_ONLY:
+            # Compile-only injects the compile_only torch.compile option. The
+            # optimum-rbln path is not torch.compile-based, so the flag has no
+            # meaning there and conflicts with that path; it only applies to the
+            # vLLM-native (torch.compile) path, which VLLM_RBLN_USE_VLLM_MODEL
+            # selects.
+            if not envs.VLLM_RBLN_USE_VLLM_MODEL:
+                raise ValueError(
+                    "VLLM_RBLN_COMPILE_ONLY=1 is a torch.compile option and only "
+                    "applies to the vLLM-native model path; set "
+                    "VLLM_RBLN_USE_VLLM_MODEL=1 to use it. The optimum-rbln path "
+                    "is not torch.compile-based, so compile-only conflicts with "
+                    "it."
+                )
+            if envs.VLLM_DISABLE_COMPILE_CACHE:
+                # Compile-only compiles each graph and writes the .rbln artifact
+                # to the compile cache (the runtime is built on a dummy device
+                # so no NPU is needed). With the cache disabled there is nowhere
+                # to write the artifact, so the two options are mutually
+                # exclusive.
+                raise ValueError(
+                    "VLLM_RBLN_COMPILE_ONLY=1 needs the compile cache enabled "
+                    "to write compiled artifacts to disk; do not set "
+                    "VLLM_DISABLE_COMPILE_CACHE=1 together with it."
+                )
+
         parallel_config = vllm_config.parallel_config
         use_model_parallel = (
             parallel_config.tensor_parallel_size > 1
@@ -172,16 +210,9 @@ class RblnPlatform(Platform):
                     "(TP, DP, EP, or PP)."
                 )
             os.environ["RBLN_CTX_STANDALONE"] = "1"
-            ccl_async_mode = os.environ.get("RBLN_FORCE_CCL_ASYNC")
-            # NOTE If users don't set RBLN_FORCE_CCL_ASYNC, we will set it to 1
-            # to enable async mode by default for better performance.
-            # However, if users explicitly set RBLN_FORCE_CCL_ASYNC to 0,
-            # we will respect their choice but print a warning message.
-            if ccl_async_mode is None:
-                os.environ["RBLN_FORCE_CCL_ASYNC"] = "1"
-            elif ccl_async_mode == "0":
+            if os.environ.get("RBLN_RUNTIME_FORCE_SYNC") == "1":
                 logger.warning(
-                    "RBLN_FORCE_CCL_ASYNC is set to 0, "
+                    "RBLN_RUNTIME_FORCE_SYNC=1 forces the synchronous runtime, "
                     "which may cause performance degradation "
                     "when using vLLM model parallel (TP, DP, EP, or PP)."
                 )
@@ -256,13 +287,6 @@ class RblnPlatform(Platform):
 
                 if (lora_config := vllm_config.lora_config) is not None:
                     lora_config.lora_dtype = torch.float16
-
-            if vllm_config.speculative_config is not None and envs.VLLM_RBLN_SAMPLER:
-                # FIXME(RBLN): make RBLNSampler compatible with speculative decoding
-                logger.warning(
-                    "Using RBLNSampler with speculative decoding is not supported yet."
-                )
-                envs.VLLM_RBLN_SAMPLER = False
 
         else:
             # NOTE(eunji.lee):

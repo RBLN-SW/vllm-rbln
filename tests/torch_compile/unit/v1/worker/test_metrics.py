@@ -1,10 +1,16 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-#
+
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-#
+
 #     http://www.apache.org/licenses/LICENSE-2.0
+
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Tests for vllm_rbln.v1.worker.metrics module.
 
@@ -12,10 +18,12 @@ Covers StepMetrics, PrefillMetricsByRequestID, and PerformanceTracker
 with focus on edge cases, statistical correctness, and error paths.
 """
 
+import os
 from unittest.mock import patch
 
 import pytest
 
+import vllm_rbln.v1.worker.metrics as metrics_module
 from vllm_rbln.v1.worker.metrics import (
     PerformanceTracker,
     PrefillMetricsByRequestID,
@@ -422,3 +430,44 @@ class TestPrintFinalStats:
         pt.record_decode(0.01, 1, padded_decode=True)
         # Should not raise
         pt.print_final_stats()
+
+
+class TestMetricsFileOutput:
+    """Verify VLLM_RBLN_METRICS_FILE mirrors the final report to a file."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_handler_state(self):
+        metrics_module._metrics_file_attached = False
+        original = list(metrics_module.logger.handlers)
+        yield
+        for handler in list(metrics_module.logger.handlers):
+            if handler not in original:
+                metrics_module.logger.removeHandler(handler)
+                handler.close()
+        metrics_module._metrics_file_attached = False
+
+    def test_no_file_when_env_unset(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("VLLM_RBLN_METRICS_FILE", raising=False)
+        pt = PerformanceTracker("MODEL")
+        pt.record_prefill(0.5, 100, request_ids=["req-1"])
+        pt.print_final_stats()
+        assert list(tmp_path.iterdir()) == []
+
+    def test_writes_pid_suffixed_file(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("VLLM_RBLN_METRICS_FILE", str(tmp_path / "metrics.log"))
+        pt = PerformanceTracker("MODEL")
+        pt.record_prefill(0.5, 100, request_ids=["req-1"])
+        pt.print_final_stats()
+        expected = tmp_path / f"metrics.{os.getpid()}.log"
+        assert expected.exists()
+        content = expected.read_text()
+        assert "FINAL PERFORMANCE STATISTICS [MODEL]" in content
+        assert "PREFILL METRICS" in content
+
+    def test_handler_attached_once(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("VLLM_RBLN_METRICS_FILE", str(tmp_path / "metrics.log"))
+        before = len(metrics_module.logger.handlers)
+        pt = PerformanceTracker("MODEL")
+        pt.print_final_stats()
+        pt.print_final_stats()
+        assert len(metrics_module.logger.handlers) - before == 1

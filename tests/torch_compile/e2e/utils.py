@@ -12,32 +12,37 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import multiprocessing
-from collections.abc import Callable
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
 import pytest
+from vllm import LLM
 
 
-def patch_and_run(
+@contextmanager
+def managed_llm(
     monkeypatch: pytest.MonkeyPatch,
-    env: dict,
-    target_func: Callable,
-    *target_func_args: Any,
-    **target_func_kwargs: dict[str, Any],
-):
-    with monkeypatch.context() as m:
-        for k, i in env.items():
-            m.setenv(k, i)
+    env: dict | None = None,
+    **llm_kwargs: Any,
+) -> Iterator[LLM]:
+    """Set env vars, build an ``LLM``, and deterministically free it on exit.
 
-        # rebellions SDK somewhat requires LLM instance to be
-        # instantiated in separated process
-        p = multiprocessing.Process(
-            target=target_func,
-            args=target_func_args,
-            kwargs=target_func_kwargs,
-        )
-        p.start()
-        p.join()
+    vLLM tears its EngineCore subprocess down only through a GC-lazy
+    ``weakref.finalize``. Relying on that both leaks device memory across tests
+    until GC happens to run (cross-test OOM) and can block the process at
+    interpreter exit (CI hang). Calling the explicit, bounded shutdown
+    (``terminate -> join(5s) -> SIGKILL``) kills EngineCore immediately, so the
+    kernel driver reclaims the device before the next test builds its engine.
 
-        assert not p.exitcode, f"Process exited with code {p.exitcode}"
+    ``monkeypatch`` is the test's fixture; the env vars are reverted at test
+    teardown. ``env`` may be omitted when the env is set elsewhere (e.g. a
+    module-scoped fixture); the deterministic teardown still applies.
+    """
+    for key, value in (env or {}).items():
+        monkeypatch.setenv(key, value)
+    llm = LLM(**llm_kwargs)
+    try:
+        yield llm
+    finally:
+        llm.llm_engine.engine_core.shutdown()
