@@ -28,9 +28,6 @@ from vllm.model_executor.layers.fused_moe.config import (
 from vllm.model_executor.utils import set_weight_attrs
 
 from vllm_rbln.logger import init_logger
-from vllm_rbln.model_executor.layers.fused_moe.layer import (
-    build_masked_routing_weights,
-)
 
 logger = init_logger(__name__)
 
@@ -196,7 +193,7 @@ class CompressedTensorsW8A16Fp8MoEMethod(upstream.CompressedTensorsMoEMethod):
         orig_shape = x.shape
         num_tokens = orig_shape[:-1].numel()
         hidden_states = x.reshape(num_tokens, -1)
-        masked_routing_weights = build_masked_routing_weights(layer, router_logits, x)
+        masked_routing_weights = router_logits
 
         intermediate_size = layer.w2_weight.shape[-1]
 
@@ -224,23 +221,21 @@ class CompressedTensorsW8A16Fp8MoEMethod(upstream.CompressedTensorsMoEMethod):
         if layer.expert_map is not None:
             expert_map_const = torch.tensor(layer._expert_map_list, dtype=torch.int32)
 
-        final_hidden_states = (
-            torch.ops.rbln_custom_ops.custom_moe_swiglu_group_dequantize(
-                hidden_states,
-                gate_proj_weight,
-                gate_proj_weight_scale,
-                up_proj_weight,
-                up_proj_weight_scale,
-                down_proj_weight,
-                down_proj_weight_scale,
-                masked_routing_weights,
-                torch.tensor(group_size, dtype=torch.int32),
-                None,  # gate_proj_bias
-                None,  # up_proj_bias
-                None,  # down_proj_bias
-                expert_map_const,
-                None,  # dp_mask (handled externally)
-            )
+        final_hidden_states = torch.ops.rbln_custom_ops.custom_moe_glu_group_dequantize(
+            hidden_states,
+            gate_proj_weight,
+            gate_proj_weight_scale,
+            up_proj_weight,
+            up_proj_weight_scale,
+            down_proj_weight,
+            down_proj_weight_scale,
+            masked_routing_weights,
+            torch.tensor(group_size, dtype=torch.int32),
+            layer.activation.value,
+            None,  # gate_proj_bias
+            None,  # up_proj_bias
+            None,  # down_proj_bias
+            expert_map_const,
         )
 
         return final_hidden_states.reshape(orig_shape)
