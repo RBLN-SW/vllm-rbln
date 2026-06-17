@@ -117,16 +117,9 @@ class RBLNOptimumGemma3ForConditionalGeneration(
             # `image_token_id`. Subclasses override `_image_token_id()` accordingly.
             token_type_ids[input_ids == self._image_token_id()] = 1
 
-            multimodal_embeddings = self.embed_multimodal(
-                **(model_input.multi_modal_kwargs or {})
-            )
-            # Pass through as-is: `embed_input_ids` already treats None / len()==0 as
-            # "text only". A bare `... or None` raises on Gemma4, whose multimodal
-            # embeddings are a Tensor ("Boolean value of Tensor ... is ambiguous").
-            inputs_embeds = self.embed_input_ids(
-                input_ids,
-                multimodal_embeddings,
-            )
+            # inputs_embeds are computed at the runner level (embed_multimodal
+            # + embed_input_ids); see RBLNOptimumModelRunner._maybe_embed_inputs.
+            inputs_embeds = model_input.inputs_embeds
             if self.model.language_model.prefill_decoder is None:
                 raise version_error
             assert attention_masks is not None

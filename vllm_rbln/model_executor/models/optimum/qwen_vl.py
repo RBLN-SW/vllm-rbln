@@ -49,6 +49,11 @@ class RBLNOptimumQwenVLForConditionalGeneration(
     Automatically detects model type based on the model configuration.
     """
 
+    # Qwen-VL prefill uses a custom preprocess_prefill (rope_deltas /
+    # position embeddings) rather than the embed_input_ids merge pattern,
+    # so it embeds inside its own forward instead of at the runner level.
+    merges_embeds_in_runner: bool = False
+
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality.startswith("image"):
