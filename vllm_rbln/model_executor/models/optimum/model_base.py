@@ -464,16 +464,32 @@ class RBLNOptimumMultimodalMixin(SupportsMultiModal):
     Shared multimodal interface for optimum models.
     """
 
-    def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
+    def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings | dict:
         # Default vision-only encode path shared by the simple MM models: parse
         # the image input and return per-image token embeddings. Models with a
         # richer cacheable unit (e.g. Qwen-VL, which also handles video) override
         # this.
+        #
+        # NOTE: Upstream vLLM's MultiModalEmbeddings is only
+        # list[Tensor] | Tensor | tuple[Tensor, ...] and does not admit a dict.
+        # Models whose cacheable unit is richer than per-item embeddings (e.g.
+        # Qwen-VL: image/video embeds + grid_thw + optional deepstack) return
+        # that unit as a dict, so vLLM-RBLN widens the contract to also allow
+        # dict instead of forcing it into a positional tuple.
         image_input = self._parse_and_validate_image_input(**kwargs)
         if image_input is None:
             return []
 
         return self._process_image_input(image_input)
+
+    def _process_image_input(self, image_input: object) -> list[torch.Tensor] | dict:
+        # Encode a validated image input into the model's cacheable multimodal
+        # unit: per-image token embeddings (list[torch.Tensor]) for the simple
+        # models, or a richer dict (e.g. Qwen-VL). Consumed by the default
+        # embed_multimodal() above.
+        raise NotImplementedError(
+            "`_process_image_input` must be implemented for each model."
+        )
 
     def _image_token_id(self) -> int:
         # Token id of the multimodal placeholder. Default reads the HF config's

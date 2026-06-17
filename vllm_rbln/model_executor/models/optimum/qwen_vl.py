@@ -384,7 +384,7 @@ class RBLNOptimumQwenVLForConditionalGeneration(
     def get_language_model(self):
         return self.model
 
-    def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
+    def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings | dict:
         """Vision-only encode entry point (SupportsMultiModal / EC producer).
 
         Unlike the simple MM models (which return a list of per-image token
