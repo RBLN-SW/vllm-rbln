@@ -103,7 +103,7 @@ def entry_point(
     num_input_prompt: int = 1,
     model_id: str = "openai/whisper-base",
     max_num_seqs: int = 1,
-    task: str = "translate",
+    task: str = "transcribe",
     language: str = "ko",
 ):
     if task not in VALID_TASKS:

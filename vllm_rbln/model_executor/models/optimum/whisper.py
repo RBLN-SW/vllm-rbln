@@ -14,55 +14,35 @@
 
 import torch
 from vllm.config import VllmConfig
-from vllm.logger import init_logger
-from vllm.model_executor.models.interfaces import (
-    SupportsMultiModal,
-    SupportsTranscription,
-)
 from vllm.model_executor.models.whisper import (
-    ISO639_1_SUPPORTED_LANGS,
     WhisperAudioInputs,
+    WhisperForConditionalGeneration,
 )
 from vllm.utils.jsontree import json_map_leaves
 
 from .base import ModelInputForRBLN
 from .model_base import RBLNOptimumDecoderMixin, RBLNOptimumModelBase
 
-logger = init_logger(__name__)
-
 
 class RBLNOptimumWhisperForConditionalGeneration(
     RBLNOptimumModelBase,
     RBLNOptimumDecoderMixin,
-    SupportsTranscription,
-    SupportsMultiModal,
+    WhisperForConditionalGeneration,
 ):
-    # Whisper only supports audio-conditioned generation.
-    supports_transcription_only = True
-    supports_segment_timestamp = True
-    supported_languages = ISO639_1_SUPPORTED_LANGS
-
-    @classmethod
-    def validate_language(cls, language: str | None) -> str | None:
-        if language is None:
-            # TODO language should be optional and can be guessed.
-            # For now we default to en. See
-            # https://github.com/huggingface/transformers/blob/main/src/transformers/models/whisper/generation_whisper.py#L1520
-            logger.warning(
-                "Defaulting to language='en'. If you wish to transcribe "
-                "audio in a different language, pass the `language` field "
-                "in the TranscriptionRequest."
-            )
-            language = "en"
-        return super().validate_language(language)
-
-    # FIXME more method needed
-
     def __init__(
         self,
         vllm_config: VllmConfig,
     ) -> None:
         super().__init__(vllm_config=vllm_config)
+        # WhisperForConditionalGeneration inherits SupportsLoRA, so vLLM
+        # accepts a `--lora-modules`/`lora_config` for this model. The RBLN
+        # backend does not support LoRA yet, so reject it explicitly instead
+        # of silently ignoring the adapters.
+        if vllm_config.lora_config is not None:
+            raise NotImplementedError(
+                "LoRA is not supported for Whisper on the RBLN backend. "
+                "Please run the model without LoRA adapters."
+            )
         assert self.kv_block_adapter is not None
         self.setup_decoder_mixin(
             attn_impl=self.attn_impl,
