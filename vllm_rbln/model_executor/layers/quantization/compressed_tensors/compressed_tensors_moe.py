@@ -67,8 +67,9 @@ class CompressedTensorsW8A16Fp8MoEMethod(upstream.CompressedTensorsMoEMethod):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        layer.intermediate_size_per_partition = intermediate_size_per_partition
-        layer.hidden_size = hidden_size
+        # NOTE: hidden_size and intermediate_size_per_partition are read-only
+        # @property on FusedMoE in vLLM 0.22 (no setter); the local args are
+        # used directly below. Only assign the settable attributes here.
         layer.num_experts = num_experts
         layer.orig_dtype = params_dtype
         layer.weight_block_size = self.weight_block_size
@@ -254,6 +255,16 @@ class CompressedTensorsW8A16Fp8MoEMethod(upstream.CompressedTensorsMoEMethod):
 
 
 upstream.CompressedTensorsW8A16Fp8MoEMethod = CompressedTensorsW8A16Fp8MoEMethod
+# vLLM 0.22 split the compressed-tensors MoE methods into per-scheme submodules,
+# and get_moe_method() imports CompressedTensorsW8A16Fp8MoEMethod lazily straight
+# from the submodule (`from .compressed_tensors_moe_w8a16_fp8 import ...`).
+# Patching only the package attribute above is therefore not picked up, so also
+# override the class in the submodule the factory actually imports from.
+import vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w8a16_fp8 as _upstream_w8a16_moe_mod  # noqa: E402, E501
+
+_upstream_w8a16_moe_mod.CompressedTensorsW8A16Fp8MoEMethod = (
+    CompressedTensorsW8A16Fp8MoEMethod
+)
 
 # ---------------------------------------------------------------------------
 # Override non-MoE CompressedTensorsW8A16Fp8 scheme to skip Marlin (GPU-only)
