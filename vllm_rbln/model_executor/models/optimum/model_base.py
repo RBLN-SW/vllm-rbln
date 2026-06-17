@@ -457,17 +457,8 @@ class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
 
 
 class RBLNOptimumMultimodalMixin(SupportsMultiModal):
-    """Shared multimodal interface for optimum models.
-
-    Centralizes the default encoder-cache (EC) consumer merge. The producer
-    caches whatever embed_multimodal() returns; on the consumer side this
-    default build_prefill_inputs() flattens those per-item embeddings and
-    merges them via embed_input_ids() — sufficient for models whose
-    prefill_decoder takes (inputs_embeds, cache_position, block_tables).
-
-    Models that need extra prefill state override it: Qwen-VL builds mrope
-    position_embed / deepstack, and Gemma3 raises (its hybrid sliding-window
-    attention prefill is not wired for EC yet).
+    """
+    Shared multimodal interface for optimum models.
     """
 
     def build_prefill_inputs(
@@ -478,8 +469,10 @@ class RBLNOptimumMultimodalMixin(SupportsMultiModal):
         cache_position: torch.Tensor | None = None,
         running_requests_ids: list[str] | None = None,
     ) -> dict:
-        # Each cached output is a list of per-item multimodal token embeddings
-        # (as returned by embed_multimodal()).
+        # EC consumer prefill only, and so far only validated on Qwen-VL.
+        # Gemma3 overrides this because its prefill is incompatible with the
+        # generic path here. The remaining models inherit this default but
+        # have not been validated against the EC consumer path yet.
         mm_embeds = [t for out in cached_mm_outputs for t in out]
         inputs_embeds = self.embed_input_ids(input_ids, mm_embeds or None)
         return {"inputs_embeds": inputs_embeds, "cache_position": cache_position}
