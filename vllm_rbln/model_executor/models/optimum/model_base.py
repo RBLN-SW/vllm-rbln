@@ -538,10 +538,11 @@ class RBLNOptimumMultimodalMixin(SupportsMultiModal):
         cache_position: torch.Tensor | None = None,
         running_requests_ids: list[str] | None = None,
     ) -> dict:
-        # EC consumer prefill only, and so far only validated on Qwen-VL.
-        # Gemma3 overrides this because its prefill is incompatible with the
-        # generic path here. The remaining models inherit this default but
-        # have not been validated against the EC consumer path yet.
+        # NOTE: this default is currently unreachable. init_model() gates the EC
+        # producer/consumer path on ec_enabled_model ==
+        # "RBLNQwen3VLForConditionalGeneration", so no non-Qwen model enters the
+        # EC path today. It is kept as the shared interface contract / placeholder
+        # until more models are EC-enabled.
         mm_embeds = [t for out in cached_mm_outputs for t in out]
         inputs_embeds = self.embed_input_ids(input_ids, mm_embeds or None)
         return {"inputs_embeds": inputs_embeds, "cache_position": cache_position}

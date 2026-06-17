@@ -244,11 +244,9 @@ class RBLNOptimumGemma3ForConditionalGeneration(
         cache_position: torch.Tensor | None = None,
         running_requests_ids: list[str] | None = None,
     ) -> dict:
-        # EC disaggregation (cached-encoder prefill) is not yet supported for
-        # Gemma3. Its prefill uses hybrid sliding-window attention whose state
-        # (attention_mask / local_block_tables / token_type_ids, tracked by
-        # attention_manager) is not produced by the generic EC consumer path,
-        # so a dedicated implementation is required before EC can be enabled.
+        # NOTE: this guard is currently unreachable — init_model() only enables
+        # the EC path for "RBLNQwen3VLForConditionalGeneration", so Gemma3 never
+        # enters here today. It documents the contract for when EC is extended.
         raise NotImplementedError(
             "EC disaggregation is not implemented for Gemma3: its hybrid "
             "sliding-window attention prefill needs attention_manager state "
