@@ -409,7 +409,8 @@ def custom_moe_glu_group_dequantize(
     expert_map: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
-    Customized MoE GLU operation with pre-computed routing weights and group dequantization.
+    Customized MoE GLU operation with pre-computed routing weights and
+    group dequantization.
 
     Expected tensor shapes:
     - hidden_states: [batch*seq_len, hidden_size]
@@ -848,23 +849,21 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             assert getattr(layer, "expert_map_const", None) is not None
             expert_map_const = torch.tensor(layer.expert_map_const, dtype=torch.int32)
 
-        final_hidden_states = (
-            torch.ops.rbln_custom_ops.custom_moe_glu_group_dequantize(
-                hidden_states,
-                gate_proj_weight,
-                gate_proj_weight_scale,
-                up_proj_weight,
-                up_proj_weight_scale,
-                down_proj_weight,
-                down_proj_weight_scale,
-                masked_routing_weights,
-                torch.tensor(self.weight_block_size[1], dtype=torch.int32),
-                layer.activation.value,
-                None,  # gate_proj_bias
-                None,  # up_proj_bias
-                None,  # down_proj_bias
-                expert_map_const,
-            )
+        final_hidden_states = torch.ops.rbln_custom_ops.custom_moe_glu_group_dequantize(
+            hidden_states,
+            gate_proj_weight,
+            gate_proj_weight_scale,
+            up_proj_weight,
+            up_proj_weight_scale,
+            down_proj_weight,
+            down_proj_weight_scale,
+            masked_routing_weights,
+            torch.tensor(self.weight_block_size[1], dtype=torch.int32),
+            layer.activation.value,
+            None,  # gate_proj_bias
+            None,  # up_proj_bias
+            None,  # down_proj_bias
+            expert_map_const,
         )
 
         return final_hidden_states.reshape(orig_shape)
