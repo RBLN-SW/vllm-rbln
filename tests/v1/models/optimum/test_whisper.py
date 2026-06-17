@@ -140,6 +140,28 @@ class TestParseLanguageDetectionOutput:
             Whisper.parse_language_detection_output([0], tokenizer)
 
 
+class TestValidateLanguage:
+    """``validate_language`` gates the request ``language`` before serving uses it."""
+
+    def test_none_passes_through_for_auto_detection(self):
+        # None is allowed: serving falls back to explicit language detection.
+        assert Whisper.validate_language(None) is None
+
+    @pytest.mark.parametrize("code", ["ko", "en"])
+    def test_supported_language_returned_unchanged(self, code):
+        assert Whisper.validate_language(code) == code
+
+    def test_non_native_language_warns_but_is_accepted(self):
+        # A valid ISO 639-1 code that isn't natively supported is accepted with
+        # a warning rather than rejected.
+        assert "la" not in Whisper.supported_languages
+        assert Whisper.validate_language("la") == "la"
+
+    def test_unsupported_language_rejected(self):
+        with pytest.raises(ValueError):
+            Whisper.validate_language("zz")
+
+
 class TestGenerationPromptUsesGivenLanguage:
     """When a language is supplied it is used directly (no detection)."""
 
