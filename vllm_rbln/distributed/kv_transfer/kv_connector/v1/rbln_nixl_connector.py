@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
+from rebel._C import Context
 from rebel.kv_cache import aligned_tensor
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.utils import (
@@ -103,13 +104,6 @@ class RblnNixlConnector(NixlConnector):
         materializes the KV cache backing memory. No-op on host-bounce."""
         if self.connector_worker is not None:
             self.connector_worker.finalize_kv_cache_registration()
-
-    def set_runtime_holder(self, runtime_holder) -> None:
-        """Forward the runner's runtime_holder to the worker. The D2D
-        path reads the RblnContext pointer from it in
-        `_register_kv_caches_impl`."""
-        if self.connector_worker is not None:
-            self.connector_worker._runtime_holder = runtime_holder
 
 
 class RblnNixlConnectorScheduler(NixlConnectorScheduler):
@@ -324,9 +318,6 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
         # buffer; restore it — NIXL cannot register RBLN device memory.
         self.use_host_buffer = self.kv_buffer_device == "cpu"
 
-        # D2D-only state, declared on both paths so set_runtime_holder /
-        # finalize_kv_cache_registration can access without a getattr probe.
-        self._runtime_holder: list | None = None
         self._pending_kv_caches: dict[str, torch.Tensor] | None = None
 
         # Pin to logical values. Upstream would otherwise multiply by the
@@ -566,14 +557,8 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
                     )
                 regions.append((cache_or_caches, region_offset, full_block_len))
 
-        assert self._runtime_holder, (
-            "RblnNixlConnectorWorker (D2D): runtime_holder not set — "
-            "RBLNModelRunner must propagate it via set_runtime_holder "
-            "before registration."
-        )
-        rbln_ctx_ptr = (
-            self._runtime_holder[0]._runtime_handle.get_context().rbln_ctx_ptr
-        )
+        ctx = Context.from_key(Context.global_key_at_device(device_id))
+        rbln_ctx_ptr = ctx.rbln_ctx_ptr
 
         # Delegate sharding and MR registration to nixl-rbln. It registers
         # one whole-entry MR per shard and returns the transfer tables
