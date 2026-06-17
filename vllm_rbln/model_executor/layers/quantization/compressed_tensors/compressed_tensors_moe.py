@@ -238,7 +238,6 @@ class CompressedTensorsW8A16Fp8MoEMethod(upstream.CompressedTensorsMoEMethod):
                 None,  # up_proj_bias
                 None,  # down_proj_bias
                 expert_map_const,
-                None,  # dp_mask (handled externally)
             )
         )
 
