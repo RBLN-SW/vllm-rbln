@@ -23,7 +23,15 @@ from vllm.model_executor.models.AXK1 import AXK1Attention, AXK1MoE
 
 
 def __AXK1_moe_forward_rsd(self, hidden_states: torch.Tensor) -> torch.Tensor:
-    shared_output, final_hidden_states = self.experts(
+    # RBLN's fused_moe_forward_rbln returns only the routed (fused) output, so
+    # compute the shared experts separately here (matches dev-0.22.0's
+    # DeepseekV2 RBLN MoE forward). self.experts was constructed with
+    # shared_experts= for the GPU path, but the RBLN path does not fuse them.
+    shared_output = None
+    if self.shared_experts is not None:
+        shared_output = self.shared_experts(hidden_states)
+
+    final_hidden_states = self.experts(
         hidden_states=hidden_states, router=lambda x: self.gate(x)[0]
     )
     if hidden_states.dtype != torch.float16:
