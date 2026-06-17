@@ -39,6 +39,10 @@ class ModelInputForRBLN:
     # models (embed_multimodal + embed_input_ids) and consumed by the model
     # forward. Mirrors upstream vLLM where the runner produces inputs_embeds.
     inputs_embeds: torch.Tensor | None = None
+    # MRoPE position embeddings (cos/sin), computed at the runner level for
+    # models that use multimodal rotary positions (e.g. Qwen-VL) and consumed
+    # by the model forward. None for models without MRoPE.
+    position_embed: torch.Tensor | None = None
 
 
 version_error = RuntimeError(
