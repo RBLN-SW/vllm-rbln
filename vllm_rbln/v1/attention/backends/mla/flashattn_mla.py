@@ -18,10 +18,10 @@ from vllm.model_executor.layers.attention.mla_attention import (
     MLACommonBackend,
 )
 from vllm.model_executor.layers.linear import ColumnParallelLinear
+from vllm.utils.torch_utils import is_quantized_kv_cache
 from vllm.v1.attention.backend import (
     AttentionType,
     MLAAttentionImpl,
-    is_quantized_kv_cache,
 )
 from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
 
