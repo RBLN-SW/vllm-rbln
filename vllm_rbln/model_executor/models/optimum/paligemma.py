@@ -123,17 +123,13 @@ class RBLNOptimumPaliGemmaForConditionalGeneration(
         image_features = self.model.get_image_features(image_input["data"])
         return list(image_features)
 
-    def _image_token_id(self) -> int:
-        # PaliGemma's HF config names the placeholder `image_token_id`.
-        return self.model.config.image_token_id
-
     def _embed_text_tokens(
         self, input_ids: torch.Tensor, is_multimodal: torch.Tensor
     ) -> torch.Tensor:
         # PaliGemma's image token can be OOV; PAD-mask those positions before
         # the text embedding lookup (mirrors optimum-rbln's _preprocess_prefill).
         config = self.model.config
-        if config.image_token_id >= config.text_config.vocab_size:
+        if config.image_token_index >= config.text_config.vocab_size:
             input_ids = input_ids.masked_fill(is_multimodal, PAD_TOKEN_ID)
         return self.model.get_input_embeddings()(input_ids)
 

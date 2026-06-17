@@ -160,7 +160,9 @@ class RBLNOptimumIdefics3ForConditionalGeneration(
         return list(connector_outputs)
 
     def _image_token_id(self) -> int:
-        # idefics3's HF config names the placeholder `image_token_id`.
+        # Idefics3Config exposes only `image_token_id` (no `image_token_index`
+        # attribute_map alias, unlike PaliGemma/Gemma3/LLaVA), so the mixin
+        # default would raise AttributeError here.
         return self.model.config.image_token_id
 
     def _validate_pixel_values(self, data: torch.Tensor) -> torch.Tensor:
