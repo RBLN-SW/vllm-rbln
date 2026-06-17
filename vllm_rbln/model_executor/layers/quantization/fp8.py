@@ -14,6 +14,7 @@
 
 import torch
 import vllm.model_executor.layers.quantization.fp8 as upstream
+import vllm_rbln.rbln_envs as envs
 from torch.nn.parameter import Parameter
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.kernels.linear import init_fp8_linear_kernel
