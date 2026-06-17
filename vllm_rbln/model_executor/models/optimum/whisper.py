@@ -12,177 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import math
-
-import numpy as np
 import torch
-from vllm.config import ModelConfig, SpeechToTextConfig, VllmConfig
-from vllm.config.speech_to_text import SpeechToTextParams
-from vllm.inputs import (
-    ExplicitEncoderDecoderPrompt,
-    PromptType,
-    TextPrompt,
-)
-from vllm.logger import init_logger
-from vllm.model_executor.models.interfaces import (
-    SupportsMultiModal,
-    SupportsTranscription,
-)
+from vllm.config import VllmConfig
 from vllm.model_executor.models.whisper import (
-    ISO639_1_SUPPORTED_LANGS,
     WhisperAudioInputs,
+    WhisperForConditionalGeneration,
 )
-from vllm.transformers_utils.processor import cached_processor_from_config
 from vllm.utils.jsontree import json_map_leaves
 
 from .base import ModelInputForRBLN
 from .model_base import RBLNOptimumDecoderMixin, RBLNOptimumModelBase
 
-logger = init_logger(__name__)
-
 
 class RBLNOptimumWhisperForConditionalGeneration(
     RBLNOptimumModelBase,
     RBLNOptimumDecoderMixin,
-    SupportsTranscription,
-    SupportsMultiModal,
+    WhisperForConditionalGeneration,
 ):
-    # Whisper only supports audio-conditioned generation.
-    supports_transcription_only = True
-    supports_segment_timestamp = True
-    supports_explicit_language_detection = True
-    supported_languages = ISO639_1_SUPPORTED_LANGS
-
-    @classmethod
-    def validate_language(cls, language: str | None) -> str | None:
-        if language is None:
-            logger.debug(
-                "No language specified. Language will be auto-detected "
-                "from audio. To skip detection, pass the `language` field "
-                "in the TranscriptionRequest."
-            )
-            return None
-        return super().validate_language(language)
-
-    @classmethod
-    def get_generation_prompt(
-        cls,
-        stt_params: SpeechToTextParams,
-    ) -> PromptType:
-        audio = stt_params.audio
-        stt_config = stt_params.stt_config
-        language = stt_params.language
-        task_type = stt_params.task_type
-        request_prompt = stt_params.request_prompt
-
-        if language is None:
-            raise ValueError(
-                "Language must be specified when creating the Whisper prompt"
-            )
-
-        decoder_text = (
-            f"<|prev|>{request_prompt}" if request_prompt else ""
-        ) + f"<|startoftranscript|><|{language}|><|{task_type}|><|notimestamps|>"
-
-        return ExplicitEncoderDecoderPrompt(
-            encoder_prompt=TextPrompt(
-                prompt="",  # Whisper does not support encoder prompt.
-                multi_modal_data={"audio": (audio, stt_config.sample_rate)},
-            ),
-            decoder_prompt=TextPrompt(prompt=decoder_text),
-        )
-
-    @classmethod
-    def get_language_token_ids(
-        cls,
-        tokenizer: object,
-    ) -> list[int]:
-        """Return token IDs for all supported language tokens.
-
-        Used with ``SamplingParams.allowed_token_ids`` to constrain
-        language detection to only produce valid language tokens.
-        """
-        token_ids = [
-            tokenizer.convert_tokens_to_ids(f"<|{lang_code}|>")  # type: ignore[attr-defined]
-            for lang_code in cls.supported_languages
-        ]
-        return token_ids
-
-    @classmethod
-    def get_language_detection_prompt(
-        cls,
-        audio: np.ndarray,
-        stt_config: SpeechToTextConfig,
-    ) -> PromptType:
-        """Return a prompt that elicits a single language token from Whisper.
-
-        Feed only ``<|startoftranscript|>`` as the decoder input so the model
-        predicts the most likely language token (e.g. ``<|de|>``).
-        """
-        return ExplicitEncoderDecoderPrompt(
-            encoder_prompt=TextPrompt(
-                prompt="",
-                multi_modal_data={"audio": (audio, stt_config.sample_rate)},
-            ),
-            decoder_prompt=TextPrompt(prompt="<|startoftranscript|>"),
-        )
-
-    @classmethod
-    def parse_language_detection_output(
-        cls,
-        token_ids: list[int],
-        tokenizer: object,
-    ) -> str | None:
-        """Parse the language token predicted by Whisper.
-
-        Decodes the first token ID and extracts the language code from the
-        ``<|xx|>`` format. Expects a valid language token from constrained generation.
-        """
-
-        decoded = tokenizer.decode(  # type: ignore[attr-defined]
-            [token_ids[0]],
-            skip_special_tokens=False,
-        )
-        # Whisper language tokens have the form <|xx|>
-        assert decoded.startswith("<|") and decoded.endswith("|>")
-        lang_code = decoded[2:-2]
-        assert lang_code in cls.supported_languages
-        return lang_code
-
-    @classmethod
-    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
-        if modality.startswith("audio"):
-            return None
-
-        raise ValueError("Only audio modality is supported")
-
-    @classmethod
-    def get_speech_to_text_config(
-        cls, model_config: ModelConfig, task_type: str
-    ) -> SpeechToTextConfig:
-        processor = cached_processor_from_config(model_config)
-
-        return SpeechToTextConfig(
-            max_audio_clip_s=processor.feature_extractor.chunk_length,
-            sample_rate=processor.feature_extractor.sampling_rate,
-        )
-
-    @classmethod
-    def get_num_audio_tokens(
-        cls,
-        audio_duration_s: float,
-        stt_config: SpeechToTextConfig,
-        model_config: ModelConfig,
-    ) -> int | None:
-        processor = cached_processor_from_config(model_config)
-        hop_length = processor.feature_extractor.hop_length
-        assert hop_length is not None
-        # NOTE(NickLucche) user can't pass encoder
-        # prompts directly at least not to Whisper.
-        # One indicator of the encoder amount of processing
-        # is the log-mel spectogram length.
-        return math.ceil(audio_duration_s * stt_config.sample_rate / hop_length)
-
     def __init__(
         self,
         vllm_config: VllmConfig,
