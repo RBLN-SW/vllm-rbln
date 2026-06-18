@@ -20,7 +20,6 @@ from vllm.model_executor.models.gemma3_mm import (
     Gemma3ImageInputs,
     Gemma3ImagePixelInputs,
 )
-from vllm.model_executor.models.interfaces_base import VllmModelForTextGeneration
 
 from .base import ModelInputForRBLN, version_error
 from .model_base import (
@@ -39,7 +38,6 @@ class RBLNOptimumGemma3ForConditionalGeneration(
     RBLNOptimumModelBase,
     RBLNOptimumMultimodalMixin,
     RBLNOptimumDecoderMixin,
-    VllmModelForTextGeneration,
 ):
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
