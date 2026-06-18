@@ -13,11 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import fire  # noqa: E402
-from datasets import load_dataset  # noqa: E402
-from qwen_vl_utils import process_vision_info  # noqa: E402
-from transformers import AutoProcessor, AutoTokenizer  # noqa: E402
-from vllm import LLM, SamplingParams  # noqa: E402
+import os
+
+import fire
+from datasets import load_dataset
+from qwen_vl_utils import process_vision_info
+from transformers import AutoProcessor, AutoTokenizer
+from vllm import LLM, SamplingParams
 
 # If the video is too long
 # set `VLLM_ENGINE_ITERATION_TIMEOUT_S` to a higher timeout value.
@@ -162,6 +164,7 @@ def main(
     num_input_prompt: int = 4,
     model_id: str = "LGAI-EXAONE/EXAONE-4.5-33B",  # noqa: E501
 ):
+    os.environ["VLLM_RBLN_TP_SIZE"] = "4"
     llm = LLM(
         model=model_id,
         block_size=4096,

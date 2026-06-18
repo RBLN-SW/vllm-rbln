@@ -12,11 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-
 import fire
 from datasets import load_dataset
-from transformers import AutoProcessor, AutoTokenizer
+from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 
 
@@ -24,49 +22,25 @@ def generate_prompts(batch_size: int, model_id: str):
     dataset = load_dataset("lmms-lab/llava-bench-in-the-wild", split="train").shuffle(
         seed=42
     )
-    processor = AutoProcessor.from_pretrained(model_id, padding_side="left")
-    messages = [
-        [
-            {
-                "role": "system",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": "You are a helpful assistant."
-                        "Answer the each question based on the image.",
-                    }
-                ],
-            },
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image"},
-                    {"type": "text", "text": dataset[i]["question"]},
-                ],
-            },
-        ]
-        for i in range(batch_size)
-    ]
-    images = [[dataset[i]["image"]] for i in range(batch_size)]
 
-    texts = processor.apply_chat_template(
-        messages,
-        add_generation_prompt=True,
-        tokenize=False,
-    )
+    prompts = []
+    for i in range(batch_size):
+        image = dataset[i]["image"]
+        question = dataset[i]["question"]
 
-    return [
-        {"prompt": text, "multi_modal_data": {"image": image}}
-        for text, image in zip(texts, images)
-    ]
+        # Use simple QA template because BLIP2 don't have default chat template.
+        text_prompt = f"Question: {question}\nAnswer:"
+
+        prompts.append({"prompt": text_prompt, "multi_modal_data": {"image": [image]}})
+
+    return prompts
 
 
 def main(
     num_input_prompt: int = 10,
-    model_id: str = "llava-hf/llava-v1.6-mistral-7b-hf",
+    model_id: str = "Salesforce/blip2-opt-2.7b",
 ):
-    os.environ["VLLM_RBLN_TP_SIZE"] = "4"
-    llm = LLM(model=model_id, block_size=16384, max_num_seqs=1)
+    llm = LLM(model=model_id, block_size=4096)
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     inputs = generate_prompts(num_input_prompt, model_id)
 

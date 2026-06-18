@@ -44,9 +44,13 @@ def get_input_prompts() -> list[str]:
 
 def main(
     num_input_prompt: int = 2,
-    model_id: str = "/qwen3-0.6b-b1-embedding",
+    model_id: str = "Qwen/Qwen3-Embedding-0.6B",
 ):
-    llm = LLM(model=model_id, runner="pooling")
+    llm = LLM(
+        model=model_id,
+        block_size=4096,
+        runner="pooling",
+    )
     pooling_params = PoolingParams(task="embed")
 
     prompt_list = get_input_prompts()

@@ -125,20 +125,20 @@ jobs:
       
       - name : Run Qwen3-embedding (V1)
         run: >
-          python3 examples/optimum/pre-compiled/pooling_models/run_qwen3_embedding.py
+          python3 examples/optimum/pooling_models/run_qwen3_embedding.py
           --num_input_prompt $((2 * ${{ env.NUM_INPUT_PROMPT }}))
           --model_id ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/qwen3-embedding-0_6b-32k_kv4k_batch1
 
       - name : Run Qwen3-reranker (V1)
         run: >
-          python3 examples/optimum/pre-compiled/pooling_models/run_qwen3_reranker.py
+          python3 examples/optimum/pooling_models/run_qwen3_reranker.py
           --max_seq_len 32768
           --num_input_prompt $((2 * ${{ env.NUM_INPUT_PROMPT }}))
           --model_id ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/qwen3-reranker-0_6b-40k_kv4k_batch2
 
       - name: Run gemma2 model (hybrid attention) (V1)
         run: >
-          python3 examples/optimum/run_basic.py
+          python3 examples/optimum/decoder_models/run_basic.py
           --model_id ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/gemma-2-2b-8k_batch4
 
       - name : Run text embedding model (V1)

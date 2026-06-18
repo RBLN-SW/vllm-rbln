@@ -100,7 +100,7 @@ def compute_logits(outputs, true_token, false_token):
 def main(
     max_seq_len: int = 32768,
     num_input_prompt: int = 2,
-    model_id: str = "/qwen3-0.6b-b1",
+    model_id: str = "Qwen/Qwen3-Reranker-0.6B",
 ):
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     tokenizer.padding_side = "left"
@@ -110,7 +110,11 @@ def main(
     true_token = tokenizer("yes", add_special_tokens=False).input_ids[0]
     false_token = tokenizer("no", add_special_tokens=False).input_ids[0]
 
-    llm = LLM(model=model_id)
+    llm = LLM(
+        model=model_id,
+        block_size=4096,
+        max_model_len=max_seq_len,
+    )
     prompts = get_input_prompts(max_seq_len, suffix_tokens, tokenizer)
     prompts = prompts[:num_input_prompt]
 

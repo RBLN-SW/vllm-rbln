@@ -16,44 +16,25 @@ import os
 
 import fire
 from datasets import load_dataset
-from transformers import AutoProcessor, AutoTokenizer
+from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 
 
-def generate_prompts(batch_size: int, model_id: str):
-    dataset = load_dataset("lmms-lab/llava-bench-in-the-wild", split="train").shuffle(
-        seed=42
+def generate_prompts(batch_size: int):
+    images = []
+    texts = []
+    dataset = (
+        load_dataset("takara-ai/image_captions", split="train", streaming=True)
+        .take(batch_size)
+        .shuffle(seed=42)
     )
-    processor = AutoProcessor.from_pretrained(model_id, padding_side="left")
-    messages = [
-        [
-            {
-                "role": "system",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": "You are a helpful assistant."
-                        "Answer the each question based on the image.",
-                    }
-                ],
-            },
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image"},
-                    {"type": "text", "text": dataset[i]["question"]},
-                ],
-            },
-        ]
-        for i in range(batch_size)
-    ]
-    images = [[dataset[i]["image"]] for i in range(batch_size)]
 
-    texts = processor.apply_chat_template(
-        messages,
-        add_generation_prompt=True,
-        tokenize=False,
-    )
+    for example in dataset:
+        images.append(example["image"])
+    # NOTE
+    # "caption en" means "generate caption in English"
+    # "caption es" means "generate caption in Spanish"
+    texts = ["caption en"] * batch_size
 
     return [
         {"prompt": text, "multi_modal_data": {"image": image}}
@@ -63,12 +44,12 @@ def generate_prompts(batch_size: int, model_id: str):
 
 def main(
     num_input_prompt: int = 10,
-    model_id: str = "llava-hf/llava-v1.6-mistral-7b-hf",
+    model_id: str = "google/paligemma2-3b-pt-224",
 ):
     os.environ["VLLM_RBLN_TP_SIZE"] = "4"
-    llm = LLM(model=model_id, block_size=16384, max_num_seqs=1)
+    llm = LLM(model=model_id, block_size=4096)
     tokenizer = AutoTokenizer.from_pretrained(model_id)
-    inputs = generate_prompts(num_input_prompt, model_id)
+    inputs = generate_prompts(num_input_prompt)
 
     sampling_params = SamplingParams(
         temperature=0,

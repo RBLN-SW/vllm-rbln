@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+
 import fire
 from datasets import load_dataset
 from qwen_vl_utils import process_vision_info
@@ -192,22 +194,22 @@ def main(
     # NOTE: This example supports Qwen2-VL, Qwen2.5-VL, and Qwen3-VL.
     model_id: str = "Qwen/Qwen3-VL-2B-Instruct",
 ):
-    # NOTE: We can set the device to run submodules
-    # by passing `rbln_config` to `additional_config`
-    # Unless specified, OOM may occur when running the vision-related submodules
-    # For example, the tensor parallel size of the language is 16,
-    # and the vision submodule is 1,
-    # we can set the device allocation as follows to optimally utilize RBLN memory:
-    # https://github.com/rebellions-sw/rbln_model_zoo/blob/6b015d28cda7bff2935108ece7d32ae8590cc35c/huggingface/transformers/image-text-to-text/qwen2.5-vl/qwen2.5-vl-7b/inference.py#L36
-    # llm = LLM(model=model_id, additional_config={
-    #     "rbln_config": {
-    #         "device": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
-    #         "visual": {
-    #             "device": [16],
-    #         }
-    #     }
-    # })
-    llm = LLM(model=model_id, block_size=4096, max_model_len=8192, max_num_seqs=1)
+    # tp size for main module
+    os.environ["VLLM_RBLN_TP_SIZE"] = "16"
+    llm = LLM(
+        model=model_id,
+        block_size=4096,
+        max_model_len=8192,
+        max_num_seqs=1,
+        additional_config={
+            "rbln_config": {
+                "device": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+                "visual": {
+                    "device": [16],
+                },
+            }
+        },
+    )
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     inputs = generate_prompts_image(num_input_prompt, model_id)
     # inputs = generate_prompts_video(num_input_prompt, model_id)

@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 import os
 
 import fire
@@ -21,70 +20,67 @@ from vllm import LLM, SamplingParams
 
 
 def generate_prompts(batch_size: int, model_id: str):
-    dataset = load_dataset("lmms-lab/llava-bench-in-the-wild", split="train").shuffle(
-        seed=42
-    )
+    dataset = load_dataset("HuggingFaceM4/ChartQA", split="train").shuffle(seed=42)
     processor = AutoProcessor.from_pretrained(model_id, padding_side="left")
     messages = [
         [
             {
-                "role": "system",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": "You are a helpful assistant."
-                        "Answer the each question based on the image.",
-                    }
-                ],
-            },
-            {
                 "role": "user",
                 "content": [
                     {"type": "image"},
-                    {"type": "text", "text": dataset[i]["question"]},
+                    {
+                        "type": "text",
+                        "text": dataset[i]["query"],
+                    },
                 ],
             },
         ]
         for i in range(batch_size)
     ]
     images = [[dataset[i]["image"]] for i in range(batch_size)]
-
     texts = processor.apply_chat_template(
         messages,
         add_generation_prompt=True,
         tokenize=False,
     )
 
-    return [
+    inputs = [
         {"prompt": text, "multi_modal_data": {"image": image}}
         for text, image in zip(texts, images)
     ]
+    labels = [dataset[i]["label"] for i in range(batch_size)]
+    return inputs, labels
 
 
 def main(
-    num_input_prompt: int = 10,
-    model_id: str = "llava-hf/llava-v1.6-mistral-7b-hf",
+    num_input_prompt: int = 4,
+    model_id: str = "mistralai/Pixtral-12B-2409",
 ):
     os.environ["VLLM_RBLN_TP_SIZE"] = "4"
-    llm = LLM(model=model_id, block_size=16384, max_num_seqs=1)
+    llm = LLM(model=model_id, block_size=4096)
     tokenizer = AutoTokenizer.from_pretrained(model_id)
-    inputs = generate_prompts(num_input_prompt, model_id)
+    inputs, labels = generate_prompts(num_input_prompt, model_id)
 
     sampling_params = SamplingParams(
         temperature=0,
         ignore_eos=False,
         skip_special_tokens=True,
         stop_token_ids=[tokenizer.eos_token_id],
-        max_tokens=200,
+        max_tokens=500,
     )
 
     results = llm.generate(inputs, sampling_params)
 
-    for i, result in enumerate(results):
+    for i, (result, label) in enumerate(zip(results, labels)):
+        label_str = str(label)
         output = result.outputs[0].text
-        print(f"===================== Output {i} ==============================")
+
+        print("=" * 80)
+        print(f"[{i}] Label:")
+        print(f"{label_str}\n")
+        print(f"[{i}] Model Output:")
         print(output)
-        print("===============================================================\n")
+        print("=" * 80 + "\n")
 
 
 if __name__ == "__main__":
