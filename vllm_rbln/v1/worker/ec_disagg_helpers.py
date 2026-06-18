@@ -106,13 +106,14 @@ class ECDisaggHelpersMixin:
             self.encoder_cache[mm_hash] = encode_output
             self.maybe_save_ec_to_connector(self.encoder_cache, mm_hash)
 
-    def _run_decoder_with_cached_encoder(
+    def _run_prefill_with_cached_encoder(
         self,
         model_input: ModelInputForRBLN,
         scheduler_output: "SchedulerOutput",
     ) -> torch.Tensor:
-        """Consumer path: gather the cached encoder outputs, let the model
-        merge them (model.build_prefill_inputs), and run the prefill decoder."""
+        """Consumer prefill path: gather the cached encoder outputs, let the
+        model merge them (model.build_prefill_inputs_from_cache), and run the prefill
+        decoder (optimum-rbln's prefill runtime)."""
         if not scheduler_output.scheduled_new_reqs:
             raise RuntimeError("EC consumer: no scheduled_new_reqs on prefill step.")
         req = scheduler_output.scheduled_new_reqs[0]
@@ -140,7 +141,7 @@ class ECDisaggHelpersMixin:
         cache_position = kwargs.pop("cache_position")
         block_tables = kwargs.pop("block_tables")
 
-        prefill_params = self.model.build_prefill_inputs(
+        prefill_params = self.model.build_prefill_inputs_from_cache(
             input_ids,
             cached_mm_outputs,
             cache_position=cache_position,

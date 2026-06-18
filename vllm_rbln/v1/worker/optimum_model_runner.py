@@ -374,12 +374,12 @@ class RBLNOptimumModelRunner(
                 prefill_has_mm = bool(new_reqs) and bool(new_reqs[0].mm_features)
                 if self.is_ec_consumer and model_input.is_prompt and prefill_has_mm:
                     with capture_ctx as model_reports:
-                        hidden_states = self._run_decoder_with_cached_encoder(
+                        hidden_states = self._run_prefill_with_cached_encoder(
                             model_input, scheduler_output
                         )
                 else:
+                    model_input = self._build_forward_inputs(model_input)
                     with capture_ctx as model_reports:
-                        model_input = self._build_forward_inputs(model_input)
                         hidden_states = self.model(model_input)
                 if (
                     envs.VLLM_RBLN_METRICS
