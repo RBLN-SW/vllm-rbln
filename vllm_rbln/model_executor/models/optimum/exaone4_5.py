@@ -17,13 +17,13 @@ from typing import Any
 import torch
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.model_executor.models.exaone4_5 import (
-    EXAONE4_5ImageEmbeddingInputs,
-    EXAONE4_5ImagePixelInputs,
-    EXAONE4_5VideoEmbeddingInputs,
-    EXAONE4_5VideoPixelInputs,
-)
 from vllm.model_executor.models.interfaces import SupportsMultiModal
+from vllm.model_executor.models.qwen2_5_vl import (
+    Qwen2_5_VLImageEmbeddingInputs,
+    Qwen2_5_VLImagePixelInputs,
+    Qwen2_5_VLVideoEmbeddingInputs,
+    Qwen2_5_VLVideoPixelInputs,
+)
 
 from .base import ModelInputForRBLN
 from .model_base import RBLNOptimumDecoderMixin, RBLNOptimumModelBase
@@ -100,14 +100,14 @@ class RBLNOptimumExaone4_5_ForConditionalGeneration(
         return self.model._preprocess_prefill(**preprocess_args)
 
     def _create_image_pixel_inputs(self, pixel_values, image_grid_thw):
-        return EXAONE4_5ImagePixelInputs(
+        return Qwen2_5_VLImagePixelInputs(
             type="pixel_values",
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
         )
 
     def _create_image_embedding_inputs(self, image_embeds, image_grid_thw):
-        return EXAONE4_5ImageEmbeddingInputs(
+        return Qwen2_5_VLImageEmbeddingInputs(
             type="image_embeds",
             image_embeds=image_embeds,
             image_grid_thw=image_grid_thw,
@@ -117,18 +117,23 @@ class RBLNOptimumExaone4_5_ForConditionalGeneration(
         self,
         pixel_values_videos: torch.Tensor,
         video_grid_thw: torch.Tensor,
+        second_per_grid_ts: torch.Tensor | None = None,
     ):
-        return EXAONE4_5VideoPixelInputs(
+        return Qwen2_5_VLVideoPixelInputs(
             type="pixel_values_videos",
             pixel_values_videos=pixel_values_videos,
             video_grid_thw=video_grid_thw,
+            second_per_grid_ts=second_per_grid_ts,
         )
 
-    def _create_video_embedding_inputs(self, video_embeds, video_grid_thw):
-        return EXAONE4_5VideoEmbeddingInputs(
+    def _create_video_embedding_inputs(
+        self, video_embeds, video_grid_thw, second_per_grid_ts=None
+    ):
+        return Qwen2_5_VLVideoEmbeddingInputs(
             type="video_embeds",
             video_embeds=video_embeds,
             video_grid_thw=video_grid_thw,
+            second_per_grid_ts=second_per_grid_ts,
         )
 
     def forward(self, model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
@@ -241,15 +246,22 @@ class RBLNOptimumExaone4_5_ForConditionalGeneration(
         pixel_values_videos = kwargs.pop("pixel_values_videos", None)
         video_embeds = kwargs.pop("video_embeds", None)
         video_grid_thw = kwargs.pop("video_grid_thw", None)
+        # Parsed only to match the qwen2_5_vl schema; not consumed by the
+        # forward path (optimum-rbln does not take second_per_grid_ts).
+        second_per_grid_ts = kwargs.pop("second_per_grid_ts", None)
 
         if pixel_values_videos is None and video_embeds is None:
             return None
 
         if pixel_values_videos is not None:
-            return self._create_video_pixel_inputs(pixel_values_videos, video_grid_thw)
+            return self._create_video_pixel_inputs(
+                pixel_values_videos, video_grid_thw, second_per_grid_ts
+            )
 
         if video_embeds is not None:
-            return self._create_video_embedding_inputs(video_embeds, video_grid_thw)
+            return self._create_video_embedding_inputs(
+                video_embeds, video_grid_thw, second_per_grid_ts
+            )
 
         # fallback return if both are None
         return None
