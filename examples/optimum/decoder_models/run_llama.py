@@ -12,50 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import asyncio
 import json
 
 import fire
 from simphile import jaccard_similarity
 from transformers import AutoTokenizer
-from vllm import AsyncEngineArgs, AsyncLLMEngine, SamplingParams
-
-
-async def generate(
-    engine: AsyncLLMEngine, prompt: str, model: str, request_id: int, max_tokens: int
-):
-    print(f"generate request_id={request_id}, prompt={prompt}")
-    example_input = {
-        "stream": True,
-        "temperature": 0.0,
-        "request_id": str(request_id),
-    }
-    # start the generation
-    conversation = [{"role": "user", "content": prompt}]
-    tokenizer = AutoTokenizer.from_pretrained(model)
-    chat = tokenizer.apply_chat_template(
-        conversation,
-        add_generation_prompt=True,
-        tokenize=False,
-    )
-
-    results_generator = engine.generate(
-        chat,
-        SamplingParams(
-            temperature=example_input["temperature"],
-            ignore_eos=False,
-            skip_special_tokens=True,
-            stop_token_ids=[tokenizer.eos_token_id],
-            max_tokens=max_tokens,
-        ),
-        example_input["request_id"],
-    )
-
-    # get the results
-    final_output = None
-    async for request_output in results_generator:
-        final_output = request_output
-    return final_output
+from vllm import LLM, SamplingParams
 
 
 def get_input_prompts(prompt_txt: str) -> list[str]:
@@ -87,35 +49,35 @@ def compare_copy_prompt_task_result(
     return total_avg
 
 
-async def main(
-    max_seq_len: int,
-    num_input_prompt: int,
-    model_id: str,
-    prompt_txt: str,
-    golden_json: str,
+def main(
+    max_seq_len: int = 4096,
+    num_input_prompt: int = 1,
+    model_id: str = "/llama2-7b_batch2",
+    prompt_txt: str = "/prompts/copy_prompts.txt",
+    golden_json: str = "/golden/golden_llama7b_result_copy_prompts.json",
 ):
-    engine_args = AsyncEngineArgs(model=model_id)
+    llm = LLM(model=model_id)
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
 
-    engine = AsyncLLMEngine.from_engine_args(engine_args)
-    prompt = get_input_prompts(prompt_txt)
-    futures = []
-    for i, p in enumerate(prompt):
-        if i == num_input_prompt:
-            break
-
-        futures.append(
-            asyncio.create_task(
-                generate(
-                    engine,
-                    prompt=p,
-                    model=model_id,
-                    request_id=i,
-                    max_tokens=max_seq_len,
-                )
-            )
+    prompts = get_input_prompts(prompt_txt)[:num_input_prompt]
+    chats = [
+        tokenizer.apply_chat_template(
+            [{"role": "user", "content": p}],
+            add_generation_prompt=True,
+            tokenize=False,
         )
+        for p in prompts
+    ]
 
-    result = await asyncio.gather(*futures)
+    sampling_params = SamplingParams(
+        temperature=0.0,
+        ignore_eos=False,
+        skip_special_tokens=True,
+        stop_token_ids=[tokenizer.eos_token_id],
+        max_tokens=max_seq_len,
+    )
+
+    result = llm.generate(chats, sampling_params)
 
     score = compare_copy_prompt_task_result(result, golden_json)
     if score < 0.97:
@@ -123,23 +85,5 @@ async def main(
         exit(1)
 
 
-def entry_point(
-    max_seq_len: int = 4096,
-    num_input_prompt: int = 1,
-    model_id: str = "/llama2-7b_batch2",
-    prompt_txt: str = "/prompts/copy_prompts.txt",
-    golden_json: str = "/golden/golden_llama7b_result_copy_prompts.json",
-):
-    asyncio.run(
-        main(
-            max_seq_len=max_seq_len,
-            num_input_prompt=num_input_prompt,
-            model_id=model_id,
-            prompt_txt=prompt_txt,
-            golden_json=golden_json,
-        )
-    )
-
-
 if __name__ == "__main__":
-    fire.Fire(entry_point)
+    fire.Fire(main)

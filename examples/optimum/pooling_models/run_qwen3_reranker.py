@@ -12,12 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import asyncio
 import math
 
 import fire
 from transformers import AutoTokenizer
-from vllm import AsyncEngineArgs, AsyncLLMEngine, SamplingParams
+from vllm import LLM, SamplingParams
 from vllm.inputs import TokensPrompt
 
 SUFFIX = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
@@ -82,28 +81,6 @@ def get_input_prompts(max_length, suffix_tokens, tokenizer) -> list[TokensPrompt
     )
 
 
-async def generate(
-    engine: AsyncLLMEngine,
-    prompt: TokensPrompt,
-    request_id: int,
-    true_token: int,
-    false_token: int,
-):
-    sampling_params = SamplingParams(
-        temperature=0,
-        max_tokens=1,
-        logprobs=20,
-        allowed_token_ids=[true_token, false_token],
-    )
-
-    final_output = None
-    async for request_output in engine.generate(
-        prompt, sampling_params, str(request_id)
-    ):
-        final_output = request_output
-    return final_output
-
-
 def compute_logits(outputs, true_token, false_token):
     scores = []
     for output in outputs:
@@ -120,12 +97,11 @@ def compute_logits(outputs, true_token, false_token):
     return scores
 
 
-async def main(
-    max_seq_len: int,
-    num_input_prompt: int,
-    model_id: str,
+def main(
+    max_seq_len: int = 32768,
+    num_input_prompt: int = 2,
+    model_id: str = "/qwen3-0.6b-b1",
 ):
-    engine_args = AsyncEngineArgs(model=model_id)
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     tokenizer.padding_side = "left"
     tokenizer.pad_token = tokenizer.eos_token
@@ -134,43 +110,21 @@ async def main(
     true_token = tokenizer("yes", add_special_tokens=False).input_ids[0]
     false_token = tokenizer("no", add_special_tokens=False).input_ids[0]
 
-    engine = AsyncLLMEngine.from_engine_args(engine_args)
+    llm = LLM(model=model_id)
     prompts = get_input_prompts(max_seq_len, suffix_tokens, tokenizer)
-    futures = []
-    for i, prompt in enumerate(prompts):
-        if i == num_input_prompt:
-            break
+    prompts = prompts[:num_input_prompt]
 
-        futures.append(
-            asyncio.create_task(
-                generate(
-                    engine,
-                    prompt=prompt,
-                    request_id=i,
-                    true_token=true_token,
-                    false_token=false_token,
-                )
-            )
-        )
+    sampling_params = SamplingParams(
+        temperature=0,
+        max_tokens=1,
+        logprobs=20,
+        allowed_token_ids=[true_token, false_token],
+    )
 
-    result = await asyncio.gather(*futures)
+    result = llm.generate(prompts, sampling_params)
     score = compute_logits(result, true_token, false_token)
     print(f"scores: {score}")
 
 
-def entry_point(
-    max_seq_len: int = 32768,
-    num_input_prompt: int = 2,
-    model_id: str = "/qwen3-0.6b-b1",
-):
-    asyncio.run(
-        main(
-            max_seq_len=max_seq_len,
-            num_input_prompt=num_input_prompt,
-            model_id=model_id,
-        )
-    )
-
-
 if __name__ == "__main__":
-    fire.Fire(entry_point)
+    fire.Fire(main)

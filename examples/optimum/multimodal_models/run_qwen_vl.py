@@ -13,13 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import asyncio
-
 import fire
 from datasets import load_dataset
 from qwen_vl_utils import process_vision_info
 from transformers import AutoProcessor, AutoTokenizer
-from vllm import AsyncEngineArgs, AsyncLLMEngine, SamplingParams
+from vllm import LLM, SamplingParams
 
 # If the video is too long
 # set `VLLM_ENGINE_ITERATION_TIMEOUT_S` to a higher timeout value.
@@ -189,28 +187,10 @@ def generate_prompts_wo_processing(batch_size: int, model_id: str):
     ]
 
 
-async def generate(engine: AsyncLLMEngine, tokenizer, request_id, request):
-    results_generator = engine.generate(
-        request,
-        SamplingParams(
-            temperature=0,
-            ignore_eos=False,
-            skip_special_tokens=True,
-            stop_token_ids=[tokenizer.eos_token_id],
-            max_tokens=200,
-        ),
-        str(request_id),
-    )
-
-    final_output = None
-    async for request_output in results_generator:
-        final_output = request_output
-    return final_output
-
-
-async def main(
-    num_input_prompt: int,
-    model_id: str,
+def main(
+    num_input_prompt: int = 1,
+    # NOTE: This example supports Qwen2-VL, Qwen2.5-VL, and Qwen3-VL.
+    model_id: str = "Qwen/Qwen3-VL-2B-Instruct",
 ):
     # NOTE: We can set the device to run submodules
     # by passing `rbln_config` to `additional_config`
@@ -219,7 +199,7 @@ async def main(
     # and the vision submodule is 1,
     # we can set the device allocation as follows to optimally utilize RBLN memory:
     # https://github.com/rebellions-sw/rbln_model_zoo/blob/6b015d28cda7bff2935108ece7d32ae8590cc35c/huggingface/transformers/image-text-to-text/qwen2.5-vl/qwen2.5-vl-7b/inference.py#L36
-    # engine_args = AsyncEngineArgs(model=model_id, additional_config={
+    # llm = LLM(model=model_id, additional_config={
     #     "rbln_config": {
     #         "device": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
     #         "visual": {
@@ -227,23 +207,21 @@ async def main(
     #         }
     #     }
     # })
-    engine_args = AsyncEngineArgs(
-        model=model_id, block_size=4096, max_model_len=8192, max_num_seqs=1
-    )
-
-    engine = AsyncLLMEngine.from_engine_args(engine_args)
+    llm = LLM(model=model_id, block_size=4096, max_model_len=8192, max_num_seqs=1)
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     inputs = generate_prompts_image(num_input_prompt, model_id)
     # inputs = generate_prompts_video(num_input_prompt, model_id)
     # inputs = generate_prompts_wo_processing(num_input_prompt, model_id)
 
-    futures = []
-    for request_id, request in enumerate(inputs):
-        futures.append(
-            asyncio.create_task(generate(engine, tokenizer, request_id, request))
-        )
+    sampling_params = SamplingParams(
+        temperature=0,
+        ignore_eos=False,
+        skip_special_tokens=True,
+        stop_token_ids=[tokenizer.eos_token_id],
+        max_tokens=200,
+    )
 
-    results = await asyncio.gather(*futures)
+    results = llm.generate(inputs, sampling_params)
 
     for i, result in enumerate(results):
         output = result.outputs[0].text
@@ -252,18 +230,5 @@ async def main(
         print("===============================================================\n")
 
 
-def entry_point(
-    num_input_prompt: int = 1,
-    # NOTE: This example supports Qwen2-VL, Qwen2.5-VL, and Qwen3-VL.
-    model_id: str = "Qwen/Qwen3-VL-2B-Instruct",
-):
-    asyncio.run(
-        main(
-            num_input_prompt=num_input_prompt,
-            model_id=model_id,
-        )
-    )
-
-
 if __name__ == "__main__":
-    fire.Fire(entry_point)
+    fire.Fire(main)
