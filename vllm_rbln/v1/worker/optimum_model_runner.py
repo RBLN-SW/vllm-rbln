@@ -932,6 +932,11 @@ class RBLNOptimumModelRunner(
             self.input_batch.add_request(request)
         # Condense the batched states if there are gaps left by removed requests
         self.input_batch.condense()
+        # Sort requests by length (descending) so the batched dynamic decode
+        # kernel (VLLM_RBLN_BATCH_ATTN_OPT) can honor its per-partition
+        # early-exit contract. Must happen BEFORE refresh_metadata so the
+        # snapshot reflects the sorted order.
+        self._may_reorder_batch(scheduler_output)
 
         # Refresh batch metadata with any pending updates.
         use_padding = self.use_rbln_sampler and self.input_batch.num_reqs > 1
@@ -943,6 +948,38 @@ class RBLNOptimumModelRunner(
             self.input_batch.refresh_metadata_rbln(self.bucket_size)
         else:
             self.input_batch.refresh_metadata()
+
+    def _may_reorder_batch(self, scheduler_output: "RBLNSchedulerOutput") -> None:
+        """Reorder requests in the persistent batch by descending sequence length.
+
+        Enabled by `VLLM_RBLN_SORT_BATCH=1`. Required for the batched dynamic
+        decode kernel (VLLM_RBLN_BATCH_ATTN_OPT) to early-exit on shorter
+        sequences per partition — the kernel processes the first valid_batch[p]
+        rows for partition p, which is only correct when rows are sorted long→short.
+        """
+        if not envs.VLLM_RBLN_SORT_BATCH:
+            return
+        if self.input_batch.num_reqs <= 1:
+            return
+
+        orig_indices = np.arange(self.input_batch.num_reqs)
+        sorted_order = np.argsort(
+            self.input_batch.num_tokens_no_spec[orig_indices] * (-1), kind="stable"
+        )
+        src_indices = orig_indices[sorted_order]
+        src_dest_map = {
+            int(src): int(dst)
+            for src, dst in zip(src_indices, orig_indices, strict=False)
+        }
+
+        for src in src_dest_map:
+            dst = src_dest_map[src]
+            while src != dst:
+                self.input_batch.swap_states(src, dst)
+                # Mark dst as done by updating its destination to itself
+                next_dst = src_dest_map.get(dst, dst)
+                src_dest_map[dst] = dst
+                dst = next_dst
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         pass
