@@ -357,7 +357,7 @@ jobs:
         run: |
           case "${{ matrix.test_type.name }}" in
             "openai")
-              pytest tests/entrypoints/openai -vv --durations 0
+              pytest tests/entrypoints/openai -vv --durations 0 --timeout=30
               ;;
             "llm")
               pytest tests/entrypoints/llm -vv --durations 0
