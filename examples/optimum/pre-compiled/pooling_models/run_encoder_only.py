@@ -16,7 +16,7 @@ import json
 
 import fire
 import torch
-from vllm import LLM, PoolingParams
+from vllm import LLM
 
 THRESHOLD = 0.2
 
@@ -53,14 +53,13 @@ def main(
     golden_json: str = "/golden/golden_bge_m3_result_qp_prompts.json",
 ):
     llm = LLM(model=model)
-    pooling_params = PoolingParams(task="embed")
 
     q_prompt = get_input_prompts(q_prompt_txt)[:num_input_prompt]
     p_prompt = get_input_prompts(p_prompt_txt)[:num_input_prompt]
 
     assert len(q_prompt) == len(p_prompt)
-    q_result = llm.encode(q_prompt, pooling_params)
-    p_result = llm.encode(p_prompt, pooling_params)
+    q_result = llm.encode(q_prompt, pooling_task="embed")
+    p_result = llm.encode(p_prompt, pooling_task="embed")
 
     scores = []
 

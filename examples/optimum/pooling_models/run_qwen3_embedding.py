@@ -14,7 +14,7 @@
 
 import fire
 import torch
-from vllm import LLM, PoolingParams
+from vllm import LLM
 
 
 def get_input_prompts() -> list[str]:
@@ -51,8 +51,6 @@ def main(
         block_size=4096,
         runner="pooling",
     )
-    pooling_params = PoolingParams(task="embed")
-
     prompt_list = get_input_prompts()
     if len(prompt_list) > 2 * num_input_prompt:
         raise RuntimeError(
@@ -61,7 +59,7 @@ def main(
         )
     prompt_list = prompt_list[: num_input_prompt * 2]
 
-    outputs = llm.encode(prompt_list, pooling_params)
+    outputs = llm.encode(prompt_list, pooling_task="embed")
 
     embeddings = torch.stack([o.outputs.data for o in outputs])
     scores = embeddings[:num_input_prompt] @ embeddings[num_input_prompt:].T
