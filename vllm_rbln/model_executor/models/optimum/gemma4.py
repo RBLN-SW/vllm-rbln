@@ -24,7 +24,6 @@ from vllm.model_executor.models.gemma4_mm import (
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
-from .base import ModelInputForRBLN
 from .gemma3 import (
     PAD_TOKEN_ID,
     RBLNOptimumGemma3ForConditionalGeneration,
@@ -159,37 +158,18 @@ class RBLNGemma4MultiModalProcessor(Gemma4MultiModalProcessor):
 class RBLNOptimumGemma4ForConditionalGeneration(
     RBLNOptimumGemma3ForConditionalGeneration
 ):
-    def _build_prefill_embeds(
-        self, model_input: ModelInputForRBLN, input_ids: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # FIXME It should be delivered from runner
-        # FIXME It should allow video_token_ids, audio_token_ids as well.
-        # https://github.com/huggingface/transformers/blob/0588858f54c8c79d28497d3ad6eac3417b716c49/src/transformers/processing_utils.py#L897
-        mm_token_type_ids = torch.zeros_like(input_ids)
-        mm_token_type_ids[input_ids == self.model.config.image_token_id] = 1
-        pixel_values, image_position_ids = self.get_image_values(model_input)
-        inputs_embeds = self.model._preprocess_prefill(
-            input_ids,
-            None,
-            pixel_values,
-            image_position_ids=image_position_ids,
+    def _process_image_input(
+        self, image_input: Gemma4ImageInputs
+    ) -> list[torch.Tensor]:
+        assert image_input["type"] == "pixel_values"
+        pixel_values = image_input["pixel_values"]
+        pixel_position_ids = image_input["pixel_position_ids"]
+
+        image_embeds = self.model.get_image_features(
+            pixel_values=pixel_values, pixel_position_ids=pixel_position_ids
         )
-        return inputs_embeds, mm_token_type_ids
 
-    def get_image_values(
-        self, model_input: ModelInputForRBLN
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        if not model_input.multi_modal_kwargs:
-            return None, None
-
-        multimodal_inputs = self._parse_and_validate_multimodal_inputs(
-            **model_input.multi_modal_kwargs
-        )
-        image_input = multimodal_inputs.get("image")
-        if not isinstance(image_input, Gemma4ImagePixelInputs):
-            return None, None
-
-        return image_input["pixel_values"], image_input["pixel_position_ids"]
+        return image_embeds
 
     def _parse_and_validate_multimodal_inputs(
         self, **kwargs: object
