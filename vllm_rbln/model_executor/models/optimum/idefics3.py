@@ -75,8 +75,6 @@ class RBLNOptimumIdefics3ForConditionalGeneration(
             block_tables = kwargs.pop("block_tables")
             cache_position = kwargs.pop("cache_position")
 
-            # inputs_embeds are computed at the runner level (embed_multimodal
-            # + embed_input_ids); see RBLNOptimumModelRunner._build_forward_inputs.
             inputs_embeds = model_input.inputs_embeds
             logits = self.model.text_model.prefill_decoder(
                 inputs_embeds=inputs_embeds,
