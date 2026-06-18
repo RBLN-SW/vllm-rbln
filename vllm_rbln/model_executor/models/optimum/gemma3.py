@@ -23,7 +23,6 @@ from vllm.model_executor.models.gemma3_mm import (
     Gemma3MultiModalProcessor,
     Gemma3ProcessingInfo,
 )
-from vllm.model_executor.models.interfaces_base import VllmModelForTextGeneration
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
 from .base import ModelInputForRBLN, version_error
@@ -88,7 +87,6 @@ class RBLNOptimumGemma3ForConditionalGeneration(
     RBLNOptimumModelBase,
     RBLNOptimumMultimodalMixin,
     RBLNOptimumDecoderMixin,
-    VllmModelForTextGeneration,
 ):
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
