@@ -32,7 +32,7 @@ logger = init_logger(__name__)
 
 
 class RBLNOptimumLlavaNextForConditionalGeneration(
-    RBLNOptimumModelBase, RBLNOptimumDecoderMixin, RBLNOptimumMultimodalMixin
+    RBLNOptimumModelBase, RBLNOptimumMultimodalMixin, RBLNOptimumDecoderMixin
 ):
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:

@@ -34,7 +34,7 @@ PAD_TOKEN_ID = 0
 
 
 class RBLNOptimumPaliGemmaForConditionalGeneration(
-    RBLNOptimumModelBase, RBLNOptimumDecoderMixin, RBLNOptimumMultimodalMixin
+    RBLNOptimumModelBase, RBLNOptimumMultimodalMixin, RBLNOptimumDecoderMixin
 ):
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:

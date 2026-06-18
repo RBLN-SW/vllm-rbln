@@ -86,9 +86,9 @@ class RBLNGemma3MultiModalProcessor(Gemma3MultiModalProcessor):
 )
 class RBLNOptimumGemma3ForConditionalGeneration(
     RBLNOptimumModelBase,
+    RBLNOptimumMultimodalMixin,
     RBLNOptimumDecoderMixin,
     VllmModelForTextGeneration,
-    RBLNOptimumMultimodalMixin,
 ):
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:

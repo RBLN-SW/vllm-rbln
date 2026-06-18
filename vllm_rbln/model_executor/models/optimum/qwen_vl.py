@@ -42,7 +42,7 @@ logger = init_logger(__name__)
 
 
 class RBLNOptimumQwenVLForConditionalGeneration(
-    RBLNOptimumModelBase, RBLNOptimumDecoderMixin, RBLNOptimumMultimodalMixin, ABC
+    RBLNOptimumModelBase, RBLNOptimumMultimodalMixin, RBLNOptimumDecoderMixin, ABC
 ):
     """
     Unified class for both Qwen2-VL and Qwen2.5-VL models.
