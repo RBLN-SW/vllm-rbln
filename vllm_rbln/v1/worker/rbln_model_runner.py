@@ -292,7 +292,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         else:
             self.max_encoder_len = 0
 
-        self.compile_context = None
         self.runtime_holder: list = []
 
         # Sampler
@@ -301,7 +300,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             logger.info("Using RBLN sampler: %s", self.use_rbln_sampler)
             sampler = RBLNSampler(
                 logprobs_mode=self.model_config.logprobs_mode,
-                compile_context=self.compile_context,
             )
         else:
             logger.info("Using default vLLM sampler.")
@@ -368,7 +366,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             if self.use_rbln_sampler:
                 self.rejection_sampler = RBLNRejectionSampler(
                     self.sampler,
-                    compile_context=self.compile_context,
                 )
             else:
                 self.rejection_sampler = CPURejectionSampler(self.sampler)

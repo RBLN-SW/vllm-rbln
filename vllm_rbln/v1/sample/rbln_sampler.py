@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # isort: off
-import inspect
 import torch
 import torch.nn as nn
 from vllm.sampling_params import _SAMPLING_EPS
@@ -40,22 +39,7 @@ import vllm_rbln.rbln_envs as envs
 logger = init_logger(__name__)
 
 
-def resolve_compile_context(
-    compile_context: rebel.CompileContext | None,
-) -> rebel.CompileContext:
-    """Return a default CompileContext when one is not provided.
-
-    Used when running through the device tensor path in rbln_model_runner or
-    when triggered by optimum_model_runner.
-    """
-    if compile_context is not None:
-        return compile_context
-    if "use_global_ctx" in inspect.signature(rebel.CompileContext).parameters:
-        return rebel.CompileContext(use_global_ctx=True)
-    return rebel.CompileContext()
-
-
-def build_compile_options(compile_context: rebel.CompileContext) -> dict:
+def build_compile_options() -> dict:
     """Build the torch.compile ``options`` dict shared by the RBLN samplers."""
     options: dict = {}
     if envs.VLLM_RBLN_COMPILE_STRICT_MODE:
@@ -93,7 +77,6 @@ class RBLNTopKTopPSampler(nn.Module):
     def __init__(
         self,
         logprobs_mode: LogprobsMode = "raw_logprobs",
-        compile_context: rebel.CompileContext = None,
     ):
         # TODO(rbln): Merge more ops to rbln context.
         #       Currently, we only have softmax in rbln context.
@@ -104,7 +87,7 @@ class RBLNTopKTopPSampler(nn.Module):
             "RBLN Sampling does not support returning logits/logprobs"
         )
 
-        options = build_compile_options(compile_context)
+        options = build_compile_options()
         options["model_trace_method"] = "export"
 
         self._compiled_rbln_topk_topp_sampler = torch.compile(
@@ -143,23 +126,19 @@ class RBLNSampler(VLLMSampler):
     def __init__(
         self,
         logprobs_mode: LogprobsMode = "raw_logprobs",
-        compile_context: rebel.CompileContext = None,
     ):
         super().__init__()
-        # If using device tensor in rbln_model_runner
-        # or triggered by optimum_model_runner
-        compile_context = resolve_compile_context(compile_context)
         if logprobs_mode in ("raw_logprobs", "raw_logits"):
             self.topk_topp_sampler = RBLNTopKTopPSampler(
                 logprobs_mode=logprobs_mode,
-                compile_context=compile_context,
+
             )
         else:
             logger.warning_once(
                 f"RBLN Sampling does not support logprobs_mode: {logprobs_mode}. "
                 "Using native sampler instead."
             )
-        options = build_compile_options(compile_context)
+        options = build_compile_options()
         # FIXME compiling both greedy and top-k top-p sampling
         # causes some issues in torchinductor.
         self._compiled_greedy_sample = torch.compile(

@@ -23,10 +23,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
-from vllm_rbln.v1.sample.rbln_sampler import (
-    build_compile_options,
-    resolve_compile_context,
-)
+from vllm_rbln.v1.sample.rbln_sampler import build_compile_options
 
 PLACEHOLDER_TOKEN_ID = -1
 GREEDY_TEMPERATURE = 0
@@ -58,10 +55,7 @@ def rbln_rejection_sample(
 # - apply_all_penalties
 class RBLNRejectionSampler(RejectionSampler):
     def __init__(self, *args, **kwargs):
-        compile_context = kwargs.pop("compile_context", None)
-        super().__init__(*args, **kwargs)
-        compile_context = resolve_compile_context(compile_context)
-        options = build_compile_options(compile_context)
+        options = build_compile_options()
         self.compiled_rejection_sample = torch.compile(
             rbln_rejection_sample,
             dynamic=False,
