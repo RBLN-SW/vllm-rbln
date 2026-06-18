@@ -393,7 +393,7 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         Unlike the simple MM models (which return a list of per-image token
         embeddings), Qwen's cacheable unit is the dict returned by encode():
         image/video embeds + grid_thw (+ deepstack for Qwen3-VL). It is consumed
-        on the decode side by build_prefill_inputs().
+        on the decode side by build_prefill_inputs_from_cache().
         """
         image_input = self._parse_and_validate_image_input(**kwargs)
         video_input = self._parse_and_validate_video_input(**kwargs)
@@ -401,13 +401,13 @@ class RBLNOptimumQwenVLForConditionalGeneration(
             return []
 
         # Merge the per-modality encoder outputs into a single cacheable dict
-        # (consumed on the decode side by build_prefill_inputs()).
+        # (consumed on the decode side by build_prefill_inputs_from_cache()).
         result = {}
         result.update(self._process_image_input(image_input))
         result.update(self._process_video_input(video_input))
         return result
 
-    def build_prefill_inputs(
+    def build_prefill_inputs_from_cache(
         self,
         input_ids: torch.Tensor,
         cached_mm_outputs: list[dict],

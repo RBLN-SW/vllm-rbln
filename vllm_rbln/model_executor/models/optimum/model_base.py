@@ -572,7 +572,7 @@ class RBLNOptimumMultimodalMixin(SupportsMultiModal):
         scatter_mask = is_multimodal.unsqueeze(-1).expand_as(inputs_embeds)
         return inputs_embeds.masked_scatter(scatter_mask, mm_embeds)
 
-    def build_prefill_inputs(
+    def build_prefill_inputs_from_cache(
         self,
         input_ids: torch.Tensor,
         cached_mm_outputs: list,
