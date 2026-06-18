@@ -114,7 +114,7 @@ class RBLNOptimumLlavaForConditionalGeneration(
 
         # For prefill, inputs_embeds are computed at the runner level
         # (embed_multimodal + embed_input_ids); see
-        # RBLNOptimumModelRunner._maybe_embed_inputs. Decode embeds from
+        # RBLNOptimumModelRunner._build_forward_inputs. Decode embeds from
         # input_ids inside _forward.
         inputs_embeds = model_input.inputs_embeds if is_prompt else None
 

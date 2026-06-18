@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from abc import ABC, abstractmethod
-from dataclasses import replace
 from typing import Any
 
 import torch
@@ -240,59 +239,38 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         """Create video embedding inputs based on model type"""
         pass
 
-    def build_forward_inputs(
+    def build_prefill_forward_inputs(
         self,
         model_input: ModelInputForRBLN,
-        mrope_position_deltas: dict[str, float],
-    ) -> ModelInputForRBLN:
-        """Build forward inputs at the runner level (upstream-aligned).
-
-        Prefill: run ``preprocess_prefill`` (embedding merge + MRoPE) and stash
-        the per-request rope delta in the runner-owned
-        ``mrope_position_deltas``; attach inputs_embeds + position_embed.
-        Decode: compute MRoPE ``position_embed`` from the stored delta. Decode
-        ``inputs_embeds`` are still embedded in ``forward`` (they depend on the
-        padded input_ids produced by ``preprocess_for_decoder``).
+    ) -> tuple[torch.Tensor, torch.Tensor | None, float | None]:
+        """Prefill: run ``preprocess_prefill`` (embedding merge + MRoPE) and
+        return ``(inputs_embeds, position_embed, rope_delta)``. The runner owns
+        and stores the per-request rope delta; this hook only returns it.
         """
         input_ids = model_input.input_tokens
-        if model_input.is_prompt:
-            image_input = None
-            video_input = None
-            if model_input.multi_modal_kwargs:
-                image_input = self._parse_and_validate_image_input(
-                    **model_input.multi_modal_kwargs
-                )
-                video_input = self._parse_and_validate_video_input(
-                    **model_input.multi_modal_kwargs
-                )
-
-            cur_request_id = model_input.running_requests_ids[0]
-            attention_mask = torch.ones_like(input_ids)
-            prefill_params = self.preprocess_prefill(
-                input_ids, attention_mask, image_input, video_input
+        image_input = None
+        video_input = None
+        if model_input.multi_modal_kwargs:
+            image_input = self._parse_and_validate_image_input(
+                **model_input.multi_modal_kwargs
+            )
+            video_input = self._parse_and_validate_video_input(
+                **model_input.multi_modal_kwargs
             )
 
-            for request_id in model_input.finished_requests_ids:
-                mrope_position_deltas.pop(request_id, None)
-            mrope_position_deltas[cur_request_id] = prefill_params["rope_deltas"].item()
-
-            return replace(
-                model_input,
-                inputs_embeds=prefill_params["inputs_embeds"],
-                position_embed=prefill_params["position_embed"],
-            )
-
-        position_embed = self._compute_decode_position_embed(
-            model_input.input_positions,
-            model_input.running_requests_ids,
-            mrope_position_deltas,
+        attention_mask = torch.ones_like(input_ids)
+        prefill_params = self.preprocess_prefill(
+            input_ids, attention_mask, image_input, video_input
         )
-        return replace(model_input, position_embed=position_embed)
+        return (
+            prefill_params["inputs_embeds"],
+            prefill_params["position_embed"],
+            prefill_params["rope_deltas"].item(),
+        )
 
-    def _compute_decode_position_embed(
+    def compute_decode_position_embed(
         self,
-        cache_position: torch.Tensor,
-        running_requests_ids: list[str],
+        model_input: ModelInputForRBLN,
         mrope_position_deltas: dict[str, float],
     ) -> torch.Tensor:
         """Decode-step MRoPE: advance each request's position from its stored
@@ -300,6 +278,8 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         position embeddings (cos/sin). Mirrors upstream vLLM's
         ``get_next_input_positions_tensor``.
         """
+        cache_position = model_input.input_positions
+        running_requests_ids = model_input.running_requests_ids
         # int32 mirrors the cache_position dtype the prior decode path used
         # (cast in preprocess_for_decoder before computing position embeds).
         cache_position = cache_position.to(torch.int32)
@@ -339,8 +319,9 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         cache_position = kwargs.pop("cache_position")
         block_tables = kwargs.pop("block_tables")
 
-        # inputs_embeds / position_embed are computed at the runner level
-        # (build_forward_inputs); see RBLNOptimumModelRunner._maybe_embed_inputs.
+        # inputs_embeds / position_embed are computed at the runner level; see
+        # RBLNOptimumModelRunner._build_forward_inputs (which calls this model's
+        # build_prefill_forward_inputs / compute_decode_position_embed).
         if is_prompt:
             logits = self.model.prefill_decoder(
                 inputs_embeds=model_input.inputs_embeds,
