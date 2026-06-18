@@ -115,8 +115,6 @@ class RBLNOptimumGemma3ForConditionalGeneration(
             # `image_token_id`. Subclasses override `_image_token_id()` accordingly.
             token_type_ids[input_ids == self._image_token_id()] = 1
 
-            # inputs_embeds are computed at the runner level (embed_multimodal
-            # + embed_input_ids); see RBLNOptimumModelRunner._build_forward_inputs.
             inputs_embeds = model_input.inputs_embeds
             if self.model.language_model.prefill_decoder is None:
                 raise version_error
