@@ -40,7 +40,11 @@ def rejection_sampler(monkeypatch_module):
         compile_context=compile_context,
     )
 
-    return RBLNRejectionSampler(sampler, seed=seed, compile_context=compile_context)
+    # num_spec_tokens is now required by RBLNRejectionSampler (static spec pad);
+    # the tests below use max_spec_len=3, so pad to 3.
+    return RBLNRejectionSampler(
+        sampler, seed=seed, compile_context=compile_context, num_spec_tokens=3
+    )
 
 
 def _one_hot(target_tokens: list[int], vocab_size: int) -> torch.Tensor:
