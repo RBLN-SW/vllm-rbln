@@ -102,62 +102,19 @@ class RBLNOptimumIdefics3ForConditionalGeneration(
         return self.model.text_model
 
     def _process_image_input(self, image_input: ImageInputs) -> list[torch.Tensor]:
-        # FIXME new API in optimum-rbln
         if image_input["type"] == "image_embeds":
             return list(image_input["data"])
 
-        # Replicates the vision-encode portion of optimum-rbln's
-        # _preprocess_prefill (vision_model + connector); optimum-rbln does not
-        # expose a standalone get_image_features for Idefics3.
-        model = self.model
-        config = model.config
+        # Vision model + pixel-shuffle connector, compiled by optimum-rbln.
+        # get_image_features expects a leading batch dim
+        # (batch_size, num_images, num_channels, height, width).
         pixel_values = image_input["pixel_values"].unsqueeze(0)
         pixel_attention_mask = image_input["pixel_attention_mask"].unsqueeze(0)
-
-        batch_size, num_images = pixel_values.shape[:2]
-        pixel_values = pixel_values.to(dtype=model.dtype)
-        pixel_values = pixel_values.view(
-            batch_size * num_images, *pixel_values.shape[2:]
-        )
-
-        # Drop fully-padded (all-zero) images.
-        nb_values_per_image = pixel_values.shape[1:].numel()
-        real_images_inds = (pixel_values == 0.0).sum(
-            dim=(-1, -2, -3)
-        ) != nb_values_per_image
-        pixel_values = pixel_values[real_images_inds].contiguous()
-
-        pixel_attention_mask = pixel_attention_mask.view(
-            batch_size * num_images, *pixel_attention_mask.shape[2:]
-        )
-        pixel_attention_mask = pixel_attention_mask[real_images_inds].contiguous()
-
-        patch_size = config.vision_config.patch_size
-        patches_subgrid = pixel_attention_mask.unfold(1, patch_size, patch_size)
-        patches_subgrid = patches_subgrid.unfold(2, patch_size, patch_size)
-        patch_attention_mask = (patches_subgrid.sum(dim=(-1, -2)) > 0).bool()
-
-        image_hidden_states = model.vision_model(
+        image_features = self.model.get_image_features(
             pixel_values=pixel_values,
-            patch_attention_mask=patch_attention_mask,
-            return_dict=True,
-        ).last_hidden_state
-
-        # Pixel-shuffle connector, run per image.
-        connector_out_size = [
-            image_hidden_states.shape[0],
-            image_hidden_states.shape[1] // config.scale_factor**2,
-            config.text_config.hidden_size,
-        ]
-        connector_outputs = torch.empty(
-            size=connector_out_size, dtype=torch.float32, device="cpu"
+            pixel_attention_mask=pixel_attention_mask,
         )
-        for i in range(image_hidden_states.shape[0]):
-            model.connector(
-                image_hidden_states[i : i + 1], out=connector_outputs[i : i + 1]
-            )
-
-        return list(connector_outputs)
+        return list(image_features)
 
     def _image_token_id(self) -> int:
         # Idefics3Config exposes only `image_token_id` (no `image_token_index`

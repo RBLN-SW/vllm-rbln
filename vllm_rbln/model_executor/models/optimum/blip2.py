@@ -104,37 +104,15 @@ class RBLNOptimumBlip2ForConditionalGeneration(
         return self.model.language_model
 
     def _process_image_input(self, image_input: Blip2ImageInputs) -> list[torch.Tensor]:
-        # FIXME new API in optimum-rbln
         if image_input["type"] == "image_embeds":
             return list(image_input["data"])
 
-        # Replicates the vision-encode portion of optimum-rbln's
-        # _preprocess_prefill: vision_model -> Q-Former (query_tokens) ->
-        # language_projection. optimum-rbln does not expose a standalone
-        # get_image_features for BLIP-2.
-        model = self.model
+        # Vision model + Q-Former + language projection, compiled by
+        # optimum-rbln.
         pixel_values = image_input["data"]
-
-        vision_outputs = model.vision_model(pixel_values=pixel_values, return_dict=True)
-        image_embeds = vision_outputs[0]
-        image_attention_mask = torch.ones(
-            image_embeds.size()[:-1], dtype=torch.long, device=image_embeds.device
-        )
-
-        query_tokens = model.query_tokens.expand(image_embeds.shape[0], -1, -1)
-        query_outputs = model.qformer(
-            query_embeds=query_tokens,
-            encoder_hidden_states=image_embeds,
-            encoder_attention_mask=image_attention_mask,
-            return_dict=True,
-        )
-        query_output = query_outputs[0]
-        if query_output.dtype != image_embeds.dtype:
-            query_output = query_output.to(image_embeds.dtype)
-
         # (num_images, num_query_tokens, text_hidden_size)
-        language_model_inputs = model.language_projection(query_output)
-        return list(language_model_inputs)
+        image_features = self.model.get_image_features(pixel_values=pixel_values)
+        return list(image_features)
 
     def _parse_and_validate_image_input(self, **kwargs: Any) -> Blip2ImageInputs | None:
         pixel_values = kwargs.pop("pixel_values", None)
