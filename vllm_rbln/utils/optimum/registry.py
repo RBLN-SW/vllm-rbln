@@ -69,7 +69,8 @@ _RBLN_MULTIMODAL_MODELS = {
     ),
     "Blip2ForConditionalGeneration": ("blip2", "RBLNBlip2ForConditionalGeneration"),
     "Gemma3ForConditionalGeneration": ("gemma3", "RBLNGemma3ForConditionalGeneration"),
-    "Gemma4ForConditionalGeneration": ("gemma4", "RBLNGemma4ForConditionalGeneration"),
+    # "Gemma4ForConditionalGeneration":
+    # ("gemma4", "RBLNGemma4ForConditionalGeneration"),
     "LlavaForConditionalGeneration": ("llava", "RBLNLlavaForConditionalGeneration"),
     "PaliGemmaForConditionalGeneration": (
         "paligemma",
