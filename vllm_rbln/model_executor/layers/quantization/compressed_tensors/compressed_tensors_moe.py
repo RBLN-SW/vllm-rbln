@@ -223,22 +223,21 @@ class CompressedTensorsW8A16Fp8MoEMethod(upstream.CompressedTensorsMoEMethod):
         if layer.expert_map is not None:
             expert_map_const = torch.tensor(layer._expert_map_list, dtype=torch.int32)
 
-        final_hidden_states = (
-            torch.ops.rbln_custom_ops.custom_moe_swiglu_group_dequantize(
-                hidden_states,
-                gate_proj_weight,
-                gate_proj_weight_scale,
-                up_proj_weight,
-                up_proj_weight_scale,
-                down_proj_weight,
-                down_proj_weight_scale,
-                masked_routing_weights,
-                torch.tensor(group_size, dtype=torch.int32),
-                None,  # gate_proj_bias
-                None,  # up_proj_bias
-                None,  # down_proj_bias
-                expert_map_const,
-            )
+        final_hidden_states = torch.ops.rbln_custom_ops.custom_moe_glu_group_dequantize(
+            hidden_states,
+            gate_proj_weight,
+            gate_proj_weight_scale,
+            up_proj_weight,
+            up_proj_weight_scale,
+            down_proj_weight,
+            down_proj_weight_scale,
+            masked_routing_weights,
+            torch.tensor(group_size, dtype=torch.int32),
+            layer.activation.value,
+            None,  # gate_proj_bias
+            None,  # up_proj_bias
+            None,  # down_proj_bias
+            expert_map_const,
         )
 
         return final_hidden_states.reshape(orig_shape)
