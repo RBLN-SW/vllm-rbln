@@ -84,7 +84,9 @@ class RBLNSlidingWindowManager(SingleTypeKVCacheManager):
     ) -> tuple[list[KVCacheBlock], ...]:
         return tuple([] for _ in kv_cache_group_ids)
 
-    def cache_blocks(self, request: Request, num_tokens: int) -> None:
+    def cache_blocks(
+        self, request: Request, num_tokens: int, alignment_tokens: int | None = None
+    ) -> None:
         pass
 
     def remove_skipped_blocks(self, request_id: str, num_computed_tokens: int) -> None:
