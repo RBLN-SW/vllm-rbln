@@ -19,7 +19,6 @@ from transformers import PretrainedConfig
 
 import optimum.rbln
 from optimum.rbln import (
-    RBLNAutoModel,
     RBLNAutoModelForCausalLM,
     RBLNAutoModelForSpeechSeq2Seq,
 )
@@ -171,15 +170,17 @@ class RBLNCompileSpec:
         max_model_len: int,
         tp_size: int,
     ) -> "RBLNCompileSpec":
-        model_name, _ = get_rbln_model_info(config)
+        model_name, model_cls_name = get_rbln_model_info(config)
         compile_fn = _COMPILE_MULTIMODAL_FNS.get(model_name)
         if compile_fn is None:
             raise ValueError(
                 f"Unknown multimodal model alias: {model_name}. "
                 f"Supported aliases: {sorted(_COMPILE_MULTIMODAL_FNS.keys())}"
             )
+        model_cls = getattr(optimum.rbln, model_cls_name)
+        assert model_cls is not None
         return cls(
-            model_cls=RBLNAutoModel,
+            model_cls=model_cls,
             rbln_config=compile_fn(batch_size, max_model_len, block_size, tp_size),
         )
 
