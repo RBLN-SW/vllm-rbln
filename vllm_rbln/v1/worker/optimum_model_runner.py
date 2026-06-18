@@ -85,7 +85,7 @@ from vllm_rbln.utils.optimum.registry import (
 )
 from vllm_rbln.v1.core.optimum_scheduler import RBLNSchedulerOutput
 from vllm_rbln.v1.sample import WARM_UP_CONFIGS, RBLNSampler
-from vllm_rbln.v1.worker.ec_disagg_helpers import ECDisaggHelpersMixin
+from vllm_rbln.v1.worker.ec_disagg_helpers import ECDisaggHelper
 from vllm_rbln.v1.worker.metrics import PerformanceTracker, collect_metrics
 from vllm_rbln.v1.worker.optimum_input_batch import RBLNInputBatch
 
@@ -111,7 +111,7 @@ class ExecuteModelState(NamedTuple):
 
 
 class RBLNOptimumModelRunner(
-    LoRAModelRunnerMixin, ECConnectorModelRunnerMixin, ECDisaggHelpersMixin
+    LoRAModelRunnerMixin, ECConnectorModelRunnerMixin
 ):
     input_batch: RBLNInputBatch
 
@@ -257,6 +257,11 @@ class RBLNOptimumModelRunner(
         # Maps mm_hash → dict of prefill params (inputs_embeds, position_embed, etc.)
         self.encoder_cache: dict[str, Any] = {}
 
+        # EC (encoder-cache) disaggregation logic, owned by the runner and
+        # reached via self.ec_disagg.<...>. It reads the runner's shared state
+        # (encoder_cache, mrope_position_deltas, model, ...) directly.
+        self.ec_disagg = ECDisaggHelper(self)
+
         # Runner-owned per-request MRoPE state (request_id → rope delta), mirroring
         # upstream vLLM's CachedRequestState.mrope_position_delta. Populated at
         # prefill by _build_forward_inputs (and the EC consumer path) and consumed
@@ -345,8 +350,10 @@ class RBLNOptimumModelRunner(
                         scheduler_output,
                         encoder_cache=self.encoder_cache,
                     ):
-                        self._run_encoder_and_save(model_input, scheduler_output)
-                return self._make_producer_output(scheduler_output)
+                        self.ec_disagg.run_encoder_and_save(
+                            model_input, scheduler_output
+                        )
+                return self.ec_disagg.make_producer_output(scheduler_output)
 
             # Prepare the decoder inputs.
             model_input, num_scheduled_tokens_np = self._prepare_inputs(
@@ -374,7 +381,7 @@ class RBLNOptimumModelRunner(
                 prefill_has_mm = bool(new_reqs) and bool(new_reqs[0].mm_features)
                 if self.is_ec_consumer and model_input.is_prompt and prefill_has_mm:
                     with capture_ctx as model_reports:
-                        hidden_states = self._run_prefill_with_cached_encoder(
+                        hidden_states = self.ec_disagg.run_prefill_with_cached_encoder(
                             model_input, scheduler_output
                         )
                 else:
