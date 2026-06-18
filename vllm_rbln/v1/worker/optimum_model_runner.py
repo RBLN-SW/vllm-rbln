@@ -378,8 +378,8 @@ class RBLNOptimumModelRunner(
                             model_input, scheduler_output
                         )
                 else:
-                    model_input = self._build_forward_inputs(model_input)
                     with capture_ctx as model_reports:
+                        model_input = self._build_forward_inputs(model_input)
                         hidden_states = self.model(model_input)
                 if (
                     envs.VLLM_RBLN_METRICS
