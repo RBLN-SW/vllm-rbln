@@ -1754,7 +1754,6 @@ class RBLNModelRunner:
         if not (num_prompt_logprobs_dict := self.num_prompt_logprobs):
             return {}
 
-        in_progress_dict = self.input_batch.in_progress_prompt_logprobs_cpu
         prompt_logprobs_dict: dict[str, LogprobsTensors | None] = {}
 
         # Since prompt logprobs are a rare feature, prioritize simple,
@@ -1778,14 +1777,14 @@ class RBLNModelRunner:
             )
 
             # Set up target LogprobsTensors object.
-            logprobs_tensors = in_progress_dict.get(req_id)
+            logprobs_tensors = request.in_progress_prompt_logprobs_cpu
             if not logprobs_tensors:
                 # Create empty logprobs CPU tensors for the entire prompt.
                 # If chunked, we'll copy in slice by slice.
                 logprobs_tensors = LogprobsTensors.empty_cpu(
                     num_prompt_tokens - 1, num_prompt_logprobs + 1
                 )
-                in_progress_dict[req_id] = logprobs_tensors
+                request.in_progress_prompt_logprobs_cpu = logprobs_tensors
 
             # Determine number of logits to retrieve.
             start_idx = request.num_computed_tokens
@@ -1828,11 +1827,21 @@ class RBLNModelRunner:
                 logprobs, num_prompt_logprobs, tgt_token_ids
             )
 
+            # Transfer
+            chunk_slice = slice(start_idx, start_idx + num_logits)
+            logprobs_tensors.logprob_token_ids[chunk_slice].copy_(
+                token_ids, non_blocking=True
+            )
+            logprobs_tensors.logprobs[chunk_slice].copy_(logprobs, non_blocking=True)
+            logprobs_tensors.selected_token_ranks[chunk_slice].copy_(
+                ranks, non_blocking=True
+            )
+
         # Remove requests that have completed prefill from the batch
         # num_prompt_logprobs_dict.
         for req_id in completed_prefill_reqs:
             del num_prompt_logprobs_dict[req_id]
-            del in_progress_dict[req_id]
+            self.requests[req_id].in_progress_prompt_logprobs_cpu = None
 
         return prompt_logprobs_dict
 
