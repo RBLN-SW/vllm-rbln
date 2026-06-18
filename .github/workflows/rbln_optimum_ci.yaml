@@ -227,7 +227,7 @@ jobs:
 
       - name: Run decoder-only test (eager attn) (V1)
         run: >
-          python3 examples/optimum/decoder_models/run_decoder_only.py
+          python3 examples/optimum/decoder_models/run_llama.py
           --num_input_prompt ${{ env.NUM_INPUT_PROMPT }}
           --model_id ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/llama2-7b_batch2
           --prompt_txt ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/prompts/copy_prompts.txt
@@ -235,7 +235,7 @@ jobs:
 
       - name: Run decoder-only test (Flash-attention mode) (V1)
         run: >
-          python3 examples/optimum/decoder_models/run_decoder_only.py
+          python3 examples/optimum/decoder_models/run_llama.py
           --num_input_prompt ${{ env.NUM_INPUT_PROMPT }}
           --model_id ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/llama3_2-3b-128k_kv16k_batch4
           --prompt_txt ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/prompts/copy_prompts.txt
