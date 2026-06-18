@@ -20,11 +20,11 @@ from transformers import AutoProcessor, AutoTokenizer
 from vllm import LLM, SamplingParams
 
 
-def generate_prompts(batch_size: int, model_id: str):
+def generate_prompts(batch_size: int, model: str):
     dataset = load_dataset("lmms-lab/llava-bench-in-the-wild", split="train").shuffle(
         seed=42
     )
-    processor = AutoProcessor.from_pretrained(model_id, padding_side="left")
+    processor = AutoProcessor.from_pretrained(model, padding_side="left")
     messages = [
         [
             {
@@ -63,12 +63,12 @@ def generate_prompts(batch_size: int, model_id: str):
 
 def main(
     num_input_prompt: int = 10,
-    model_id: str = "llava-hf/llava-v1.6-mistral-7b-hf",
+    model: str = "llava-hf/llava-v1.6-mistral-7b-hf",
 ):
     os.environ["VLLM_RBLN_TP_SIZE"] = "4"
-    llm = LLM(model=model_id, block_size=16384, max_num_seqs=1)
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-    inputs = generate_prompts(num_input_prompt, model_id)
+    llm = LLM(model=model, block_size=16384, max_num_seqs=1)
+    tokenizer = AutoTokenizer.from_pretrained(model)
+    inputs = generate_prompts(num_input_prompt, model)
 
     sampling_params = SamplingParams(
         temperature=0,

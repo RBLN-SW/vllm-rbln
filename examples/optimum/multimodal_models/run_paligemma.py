@@ -44,11 +44,11 @@ def generate_prompts(batch_size: int):
 
 def main(
     num_input_prompt: int = 10,
-    model_id: str = "google/paligemma2-3b-pt-224",
+    model: str = "google/paligemma2-3b-pt-224",
 ):
     os.environ["VLLM_RBLN_TP_SIZE"] = "4"
-    llm = LLM(model=model_id, block_size=4096)
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    llm = LLM(model=model, block_size=4096)
+    tokenizer = AutoTokenizer.from_pretrained(model)
     inputs = generate_prompts(num_input_prompt)
 
     sampling_params = SamplingParams(

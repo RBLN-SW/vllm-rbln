@@ -18,9 +18,9 @@ from transformers import AutoProcessor, AutoTokenizer
 from vllm import LLM, SamplingParams
 
 
-def generate_prompts(batch_size: int, model_id: str):
+def generate_prompts(batch_size: int, model: str):
     dataset = load_dataset("HuggingFaceM4/ChartQA", split="train").shuffle(seed=42)
-    processor = AutoProcessor.from_pretrained(model_id, padding_side="left")
+    processor = AutoProcessor.from_pretrained(model, padding_side="left")
     messages = [
         [
             {
@@ -53,11 +53,11 @@ def generate_prompts(batch_size: int, model_id: str):
 
 def main(
     num_input_prompt: int = 4,
-    model_id: str = "/pixtral-12b-b4",
+    model: str = "/pixtral-12b-b4",
 ):
-    llm = LLM(model=model_id)
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-    inputs, labels = generate_prompts(num_input_prompt, model_id)
+    llm = LLM(model=model)
+    tokenizer = AutoTokenizer.from_pretrained(model)
+    inputs, labels = generate_prompts(num_input_prompt, model)
 
     sampling_params = SamplingParams(
         temperature=0,

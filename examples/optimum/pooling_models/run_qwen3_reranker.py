@@ -100,9 +100,9 @@ def compute_logits(outputs, true_token, false_token):
 def main(
     max_seq_len: int = 32768,
     num_input_prompt: int = 2,
-    model_id: str = "Qwen/Qwen3-Reranker-0.6B",
+    model: str = "Qwen/Qwen3-Reranker-0.6B",
 ):
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    tokenizer = AutoTokenizer.from_pretrained(model)
     tokenizer.padding_side = "left"
     tokenizer.pad_token = tokenizer.eos_token
     suffix_tokens = tokenizer.encode(SUFFIX, add_special_tokens=False)
@@ -111,7 +111,7 @@ def main(
     false_token = tokenizer("no", add_special_tokens=False).input_ids[0]
 
     llm = LLM(
-        model=model_id,
+        model=model,
         block_size=4096,
         max_model_len=max_seq_len,
     )

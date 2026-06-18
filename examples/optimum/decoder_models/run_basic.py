@@ -27,10 +27,10 @@ sampling_params = SamplingParams(temperature=0, top_p=1.0)
 
 
 def main(
-    model_id: str = "meta-llama/Llama-3.2-1B",
+    model: str = "meta-llama/Llama-3.2-1B",
 ):
     # Create an LLM.
-    llm = LLM(model=model_id, block_size=4096)
+    llm = LLM(model=model, block_size=4096)
     # Generate texts from the prompts.
     # The output is a list of RequestOutput objects
     # that contain the prompt, generated text, and other information.

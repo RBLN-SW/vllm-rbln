@@ -42,10 +42,10 @@ def generate_prompts(batch_size: int):
 
 def main(
     num_input_prompt: int = 10,
-    model_id: str = "./paligemma2_b2",
+    model: str = "./paligemma2_b2",
 ):
-    llm = LLM(model=model_id)
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    llm = LLM(model=model)
+    tokenizer = AutoTokenizer.from_pretrained(model)
     inputs = generate_prompts(num_input_prompt)
 
     sampling_params = SamplingParams(

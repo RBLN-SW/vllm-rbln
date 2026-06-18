@@ -30,8 +30,8 @@ VIDEO_URLS = [
 ]
 
 
-def generate_prompts_video(batch_size: int, model_id: str):
-    processor = AutoProcessor.from_pretrained(model_id, padding_side="left")
+def generate_prompts_video(batch_size: int, model: str):
+    processor = AutoProcessor.from_pretrained(model, padding_side="left")
     conversations = [
         [
             {
@@ -72,11 +72,11 @@ def generate_prompts_video(batch_size: int, model_id: str):
     ]
 
 
-def generate_prompts_image(batch_size: int, model_id: str):
+def generate_prompts_image(batch_size: int, model: str):
     dataset = load_dataset("lmms-lab/llava-bench-in-the-wild", split="train").shuffle(
         seed=42
     )
-    processor = AutoProcessor.from_pretrained(model_id, padding_side="left")
+    processor = AutoProcessor.from_pretrained(model, padding_side="left")
     conversations = [
         [
             {
@@ -112,11 +112,11 @@ def generate_prompts_image(batch_size: int, model_id: str):
     ]
 
 
-def generate_prompts_wo_processing(batch_size: int, model_id: str):
+def generate_prompts_wo_processing(batch_size: int, model: str):
     dataset = load_dataset("lmms-lab/llava-bench-in-the-wild", split="train").shuffle(
         seed=42
     )
-    processor = AutoProcessor.from_pretrained(model_id, padding_side="left")
+    processor = AutoProcessor.from_pretrained(model, padding_side="left")
     messages = [
         [
             {
@@ -162,19 +162,19 @@ def generate_prompts_wo_processing(batch_size: int, model_id: str):
 
 def main(
     num_input_prompt: int = 4,
-    model_id: str = "LGAI-EXAONE/EXAONE-4.5-33B",  # noqa: E501
+    model: str = "LGAI-EXAONE/EXAONE-4.5-33B",  # noqa: E501
 ):
     os.environ["VLLM_RBLN_TP_SIZE"] = "4"
     llm = LLM(
-        model=model_id,
+        model=model,
         block_size=4096,
         max_model_len=8192,
         max_num_seqs=1,
     )
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-    inputs = generate_prompts_image(num_input_prompt, model_id)
-    # inputs = generate_prompts_video(num_input_prompt, model_id)
-    # inputs = generate_prompts_wo_processing(num_input_prompt, model_id)
+    tokenizer = AutoTokenizer.from_pretrained(model)
+    inputs = generate_prompts_image(num_input_prompt, model)
+    # inputs = generate_prompts_video(num_input_prompt, model)
+    # inputs = generate_prompts_wo_processing(num_input_prompt, model)
 
     sampling_params = SamplingParams(
         temperature=0,

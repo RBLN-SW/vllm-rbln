@@ -44,10 +44,10 @@ def get_input_prompts() -> list[str]:
 
 def main(
     num_input_prompt: int = 2,
-    model_id: str = "Qwen/Qwen3-Embedding-0.6B",
+    model: str = "Qwen/Qwen3-Embedding-0.6B",
 ):
     llm = LLM(
-        model=model_id,
+        model=model,
         block_size=4096,
         runner="pooling",
     )

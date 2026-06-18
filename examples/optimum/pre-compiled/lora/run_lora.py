@@ -70,7 +70,7 @@ def get_secalign_requests(
 
 def main(
     num_input_prompt: int = 3,
-    model_id: str = "./llama3.1-8b-ab-sec-b4",
+    model: str = "./llama3.1-8b-ab-sec-b4",
     lora_paths: list[str] = None,
     lora_names: list[str] = None,
     lora_int_ids: list[int] = None,
@@ -82,8 +82,8 @@ def main(
     if lora_int_ids is None:
         lora_int_ids = [1, 2]
 
-    llm = LLM(model=model_id, enable_lora=True, max_lora_rank=64, max_loras=2)
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    llm = LLM(model=model, enable_lora=True, max_lora_rank=64, max_loras=2)
+    tokenizer = AutoTokenizer.from_pretrained(model)
 
     assert len(lora_names) == len(lora_paths) and len(lora_paths) == len(lora_int_ids)
     conversations = []

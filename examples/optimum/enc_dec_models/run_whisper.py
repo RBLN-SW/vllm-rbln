@@ -20,7 +20,7 @@ VALID_TASKS = {"transcribe", "translate"}
 
 def generate_prompts(
     batch_size: int,
-    model_id: str,
+    model: str,
     task: str,
     language: str,
 ):
@@ -34,7 +34,7 @@ def generate_prompts(
     )
     dataset = dataset.take(batch_size)
     messages = []
-    processor = WhisperProcessor.from_pretrained(model_id)
+    processor = WhisperProcessor.from_pretrained(model)
     forced_decoder_ids = processor.get_decoder_prompt_ids(
         language=language,
         task=task,
@@ -55,7 +55,7 @@ def generate_prompts(
 
 def main(
     num_input_prompt: int = 1,
-    model_id: str = "openai/whisper-base",
+    model: str = "openai/whisper-base",
     max_num_seqs: int = 1,
     task: str = "transcribe",
     language: str = "ko",
@@ -64,10 +64,10 @@ def main(
         raise ValueError(
             f"Invalid task {task!r}. Whisper supports: {sorted(VALID_TASKS)}"
         )
-    inputs = generate_prompts(num_input_prompt, model_id, task, language)
+    inputs = generate_prompts(num_input_prompt, model, task, language)
 
     llm = LLM(
-        model=model_id,
+        model=model,
         limit_mm_per_prompt={"audio": 1},
         max_num_seqs=max_num_seqs,
     )

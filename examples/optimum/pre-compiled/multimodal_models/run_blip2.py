@@ -18,7 +18,7 @@ from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 
 
-def generate_prompts(batch_size: int, model_id: str):
+def generate_prompts(batch_size: int, model: str):
     dataset = load_dataset("lmms-lab/llava-bench-in-the-wild", split="train").shuffle(
         seed=42
     )
@@ -38,11 +38,11 @@ def generate_prompts(batch_size: int, model_id: str):
 
 def main(
     num_input_prompt: int = 10,
-    model_id: str = "/blip2-opt-2.7b-2k-b4",
+    model: str = "/blip2-opt-2.7b-2k-b4",
 ):
-    llm = LLM(model=model_id)
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-    inputs = generate_prompts(num_input_prompt, model_id)
+    llm = LLM(model=model)
+    tokenizer = AutoTokenizer.from_pretrained(model)
+    inputs = generate_prompts(num_input_prompt, model)
 
     sampling_params = SamplingParams(
         temperature=0,

@@ -46,13 +46,13 @@ def compare_copy_prompt_task_result(scores: list[float], golden_json: str):
 
 
 def main(
-    model_id: str = "/bge-m3-1k-batch4",
+    model: str = "/bge-m3-1k-batch4",
     num_input_prompt: int = 3,
     q_prompt_txt: str = "/prompts/q_prompts.txt",
     p_prompt_txt: str = "/prompts/p_prompts.txt",
     golden_json: str = "/golden/golden_bge_m3_result_qp_prompts.json",
 ):
-    llm = LLM(model=model_id)
+    llm = LLM(model=model)
     pooling_params = PoolingParams(task="embed")
 
     q_prompt = get_input_prompts(q_prompt_txt)[:num_input_prompt]

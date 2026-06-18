@@ -52,12 +52,12 @@ def compare_copy_prompt_task_result(
 def main(
     max_seq_len: int = 4096,
     num_input_prompt: int = 1,
-    model_id: str = "/llama2-7b_batch2",
+    model: str = "/llama2-7b_batch2",
     prompt_txt: str = "/prompts/copy_prompts.txt",
     golden_json: str = "/golden/golden_llama7b_result_copy_prompts.json",
 ):
-    llm = LLM(model=model_id)
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    llm = LLM(model=model)
+    tokenizer = AutoTokenizer.from_pretrained(model)
 
     prompts = get_input_prompts(prompt_txt)[:num_input_prompt]
     chats = [
