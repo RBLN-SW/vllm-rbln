@@ -1,4 +1,4 @@
-name: Pkg Create PR for vllm-rbln
+name: CD / Pkg Update / Create PR (workflow_call)
 on:
   workflow_call:
     inputs:
