@@ -78,6 +78,7 @@ class RBLNOptimumScheduler(Scheduler):
         kv_cache_config: KVCacheConfig,
         structured_output_manager: StructuredOutputManager,
         block_size: int,
+        hash_block_size: int | None = None,
         mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
         include_finished_set: bool = False,
         log_stats: bool = False,
@@ -179,16 +180,20 @@ class RBLNOptimumScheduler(Scheduler):
             attn_block_size = self.vllm_config.additional_config["attn_block_size"]
         else:
             attn_block_size = None
+        # Create the KV cache manager.
+        if hash_block_size is None:
+            hash_block_size = block_size
         self.kv_cache_manager = RBLNKVCacheManager(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
+            max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
             enable_caching=self.cache_config.enable_prefix_caching,
             use_eagle=False,
             log_stats=self.log_stats,
             enable_kv_cache_events=False,
             dcp_world_size=1,
             pcp_world_size=1,
-            hash_block_size=self.block_size,
+            hash_block_size=hash_block_size,
             metrics_collector=self.kv_metrics_collector,
             attn_block_size=attn_block_size,
             max_num_seqs=self.max_num_running_reqs,
@@ -197,6 +202,13 @@ class RBLNOptimumScheduler(Scheduler):
         self.perf_metrics: ModelMetrics | None = None
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
             self.perf_metrics = ModelMetrics(vllm_config)
+
+        # NOTE(vllm 0.22): inherited _update_after_schedule/update_from_output
+        # read this attribute. Always False on RBLN (no routed-experts return).
+        if vllm_config.model_config.enable_return_routed_experts:
+            raise NotImplementedError("enable_return_routed_experts is not supported.")
+
+        self.enable_return_routed_experts = False
         # Encoder-related.
         # It is not used in RBLN.
         # But for reuse original functions(e.g. free_request) in vLLM,
@@ -369,6 +381,15 @@ class RBLNOptimumScheduler(Scheduler):
                     # Update the block table to the return output.
                     self.update_block_table_dict(request, block_table_dict)
 
+                if request.prefill_stats is not None:
+                    num_local_cached_tokens = sum(cached_length)
+                    assert num_local_cached_tokens <= request.num_prompt_tokens
+                    request.prefill_stats.set(
+                        num_prompt_tokens=request.num_prompt_tokens,
+                        num_local_cached_tokens=num_local_cached_tokens,
+                        num_external_cached_tokens=0,
+                    )
+
                 # Request was already popped from self.waiting
                 # unless it was re-added above due to new_blocks being None.
                 request = request_queue.pop_request()
@@ -398,10 +419,6 @@ class RBLNOptimumScheduler(Scheduler):
                 # by prefix caching may cause incorrect computation
                 # of new_blocks during the decode phase.
                 request.num_computed_tokens = 0
-                # NOTE(fix): num_cached_tokens defaults to -1.
-                # It is used for logging and metrics.
-                if request.num_cached_tokens < 0:
-                    request.num_cached_tokens = request.num_computed_tokens
 
                 # EC Connector: track multimodal features that need remote
                 # loading or local encoding for this request.

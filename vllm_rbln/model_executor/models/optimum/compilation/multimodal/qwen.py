@@ -24,11 +24,14 @@ def get_param_qwen2_vl(
     # match the maximum expected resolution to optimize computation.
     param = {
         "visual": {
+            # if tensor_parallel_size of submodule is not specified,
+            # it inherits tensor_parallel_size of main module.
             "max_seq_lens": 6400,
         },
         "tensor_parallel_size": tp_size,
         "max_seq_len": max_model_len,
         "batch_size": batch_size,
+        "use_inputs_embeds": True,
     }
     if block_size != max_model_len:
         attn_impl = "flash_attn" if block_size != max_model_len else "eager"

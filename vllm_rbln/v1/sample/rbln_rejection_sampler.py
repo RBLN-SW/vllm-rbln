@@ -17,7 +17,6 @@
 
 from dataclasses import replace
 
-import rebel
 import torch
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -63,11 +62,8 @@ def rbln_rejection_sample(
 # - apply_all_penalties
 class RBLNRejectionSampler(RejectionSampler):
     def __init__(self, *args, **kwargs):
-        seed = kwargs.pop("seed", None)
-        assert seed is not None, "seed cannot be None."
         compile_context = kwargs.pop("compile_context", None)
         super().__init__(*args, **kwargs)
-        rebel.manual_seed(seed)
         compile_context = resolve_compile_context(compile_context)
         options = build_compile_options(compile_context)
         self.compiled_rejection_sample = torch.compile(

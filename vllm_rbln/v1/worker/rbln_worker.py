@@ -58,7 +58,7 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
 )
 from vllm.v1.utils import report_usage_stats
-from vllm.v1.worker.worker_base import WorkerBase
+from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
@@ -229,7 +229,12 @@ class RBLNWorker(WorkerBase):
             )
             # FIXME(RBLN) - for now, mxfp4/fp8 quantization is only supported
             quantization = self.model_config.quantization
-            assert quantization in ("mxfp4", "fp8", "compressed-tensors")
+            assert quantization in (
+                "mxfp4",
+                "gpt_oss_mxfp4",
+                "fp8",
+                "compressed-tensors",
+            )
 
             if quantization == "compressed-tensors":
                 qcfg = (
@@ -245,19 +250,41 @@ class RBLNWorker(WorkerBase):
                 if not num_bits_set:
                     logger.warning(
                         "compressed-tensors quantization_config has no num_bits; "
-                        "assuming fp8."
+                        "assuming 8-bit (fp8)."
                     )
-                elif num_bits_set != {8}:
+                    num_bits = 8
+                elif len(num_bits_set) == 1:
+                    (num_bits,) = num_bits_set
+                else:
                     raise ValueError(
-                        f"compressed-tensors config has unsupported bit-widths "
-                        f"{num_bits_set}; only 8-bit (fp8) is supported."
+                        f"compressed-tensors config has mixed bit-widths "
+                        f"{num_bits_set}; not supported."
                     )
-                quantization = "fp8"
+
+                if num_bits == 8:
+                    # fp8 weights stay 1 byte/elem (float8) on device; counted in
+                    # the floating-point branch below. Reuse the "fp8" path.
+                    quantization = "fp8"
+                elif num_bits == 4:
+                    # w4a16 (compressed-tensors int4) via
+                    # RBLNInt8UnpackedLinearKernel. Weights are unpacked to int8
+                    # host params but stored 4-bit on device (RBLN_QUANT_BITS=4).
+                    quantization = "int4"
+                else:
+                    raise ValueError(
+                        f"compressed-tensors num_bits={num_bits} not supported; "
+                        f"only 4-bit (int4) or 8-bit (fp8)."
+                    )
 
             if quantization == "fp8":
                 nbits_per_param = 8
                 packed_num_elems = 1
-            elif quantization == "mxfp4":
+            elif quantization == "int4":
+                # Unpacked int8 weight param (1 logical elem per element) is
+                # packed to 4-bit on device.
+                nbits_per_param = 4
+                packed_num_elems = 1
+            elif quantization in ("mxfp4", "gpt_oss_mxfp4"):
                 if "ca" in device_name:
                     # ATOM DOES NOT support mxfp4 quantization, handled by bf16
                     nbits_per_param = 16
@@ -276,7 +303,7 @@ class RBLNWorker(WorkerBase):
                 packed_num_elems = 8 // 4
             else:
                 raise ValueError(
-                    "invalid quantization scheme, candidates = [fp8, mxfp4]"
+                    "invalid quantization scheme, candidates = [fp8, int4, mxfp4]"
                 )
 
         else:
@@ -445,7 +472,7 @@ class RBLNWorker(WorkerBase):
         )
         self._rbln_cpu_affinity_applied = True
 
-    def compile_or_warm_up_model(self) -> float:
+    def compile_or_warm_up_model(self) -> CompilationTimes:
         st = time.perf_counter()
         if self.parallel_config.data_parallel_size > 1:
             if envs.VLLM_RBLN_DP_IMPL == "padded_decode":
@@ -473,7 +500,9 @@ class RBLNWorker(WorkerBase):
             logger.warning("skipping compile_or_warm_up_model")
 
             self._ensure_rbln_cpu_affinity_after_warmup()
-            return time.perf_counter() - st
+            return CompilationTimes(
+                language_model=time.perf_counter() - st, encoder=0.0
+            )
         else:
             try:
                 self.model_runner.warm_up_model()
@@ -504,7 +533,8 @@ class RBLNWorker(WorkerBase):
         self._ensure_rbln_cpu_affinity_after_warmup()
         self.model_runner._enable_performance_tracker()
 
-        return time.perf_counter() - st
+        # TODO(RBLN): support encoder's compilation time
+        return CompilationTimes(language_model=time.perf_counter() - st, encoder=0.0)
 
     def get_model(self) -> nn.Module:
         return self.model_runner.get_model()

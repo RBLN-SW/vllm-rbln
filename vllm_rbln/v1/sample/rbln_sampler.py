@@ -16,6 +16,7 @@ import inspect
 import torch
 import torch.nn as nn
 from vllm.sampling_params import _SAMPLING_EPS
+from vllm_rbln.v1.sample.ops.logprobs import batched_count_greater_than
 
 try:
     import torch.rbln
@@ -99,7 +100,6 @@ class RBLNTopKTopPSampler(nn.Module):
     def __init__(
         self,
         logprobs_mode: LogprobsMode = "raw_logprobs",
-        seed: int = 42,
         compile_context: rebel.CompileContext = None,
     ):
         # TODO(rbln): Merge more ops to rbln context.
@@ -111,7 +111,6 @@ class RBLNTopKTopPSampler(nn.Module):
             "RBLN Sampling does not support returning logits/logprobs"
         )
 
-        rebel.manual_seed(seed)
         options = build_compile_options(compile_context)
         if envs.VLLM_RBLN_USE_DEVICE_TENSOR:
             options["model_trace_method"] = "export"
@@ -152,7 +151,6 @@ class RBLNSampler(VLLMSampler):
     def __init__(
         self,
         logprobs_mode: LogprobsMode = "raw_logprobs",
-        seed: int = 42,
         compile_context: rebel.CompileContext = None,
     ):
         super().__init__()
@@ -162,7 +160,6 @@ class RBLNSampler(VLLMSampler):
         if logprobs_mode in ("raw_logprobs", "raw_logits"):
             self.topk_topp_sampler = RBLNTopKTopPSampler(
                 logprobs_mode=logprobs_mode,
-                seed=seed,
                 compile_context=compile_context,
             )
         else:
@@ -345,6 +342,59 @@ class RBLNSampler(VLLMSampler):
             )
         temperature = temperature.to(logits.dtype)
         return logits.div(temperature.unsqueeze(dim=1))
+
+    # NOTE(eunji.lee):
+    # mark_unbacked torch method should be called outside of torch.compile
+    @staticmethod
+    @torch.compiler.disable
+    def gather_logprobs(
+        logprobs: torch.Tensor,
+        num_logprobs: int,
+        token_ids: torch.Tensor,
+    ) -> LogprobsTensors:
+        """
+        Gather logprobs for topk and sampled/prompt token.
+
+        Args:
+          logprobs: (num tokens) x (vocab) tensor
+          num_logprobs: maximum number of logprobs to
+                        retain per token
+          token_ids: prompt tokens (if prompt logprobs)
+                     or sampled tokens (if sampled
+                     logprobs); 1D token ID tensor
+                     with (num tokens) elements
+                     Must be int64.
+
+        Returns:
+          Top-k int indices tensor, (num tokens) x (num_logprobs + 1)
+          Top-k float logprobs tensor, (num tokens) x (num_logprobs + 1)
+          Sampled token rank tensor, (num tokens)
+        """
+        assert token_ids.dtype == torch.int64
+        # Find the topK values.
+        topk_logprobs, topk_indices = torch.topk(logprobs, num_logprobs, dim=-1)
+
+        # Get with the logprob of the prompt or sampled token.
+        token_ids = token_ids.unsqueeze(-1)
+        token_logprobs = logprobs.gather(-1, token_ids)
+
+        # Compute the ranks of the actual token.
+        # Avoid 0/1 specialization recompile on the batch dimension
+        # of the compiled batched_count_greater_than. mark_unbacked makes
+        # the size fully symbolic so dynamo doesn't specialize when
+        # batch_size transitions from 1 to >=2.
+        # torch._dynamo.decorators.mark_unbacked(logprobs, 0)
+        # torch._dynamo.decorators.mark_unbacked(token_logprobs, 0)
+        token_ranks = batched_count_greater_than(logprobs, token_logprobs)
+
+        # Concatenate together with the topk.
+        indices = torch.cat((token_ids, topk_indices), dim=1)
+        logprobs = torch.cat((token_logprobs, topk_logprobs), dim=1)
+
+        # Use int32 to reduce the tensor size.
+        indices = indices.to(torch.int32)
+
+        return LogprobsTensors(indices, logprobs, token_ranks)
 
 
 WARM_UP_CONFIGS = [

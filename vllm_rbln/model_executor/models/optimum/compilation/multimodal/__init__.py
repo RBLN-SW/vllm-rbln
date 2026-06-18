@@ -14,9 +14,6 @@
 # limitations under the License.
 
 from collections.abc import Callable
-from typing import Any
-
-from optimum.rbln import RBLNAutoModelForImageTextToText, RBLNAutoModelForVision2Seq
 
 from .blip2 import get_param_blip2
 from .gemma3 import get_param_gemma3, get_param_gemma4
@@ -29,14 +26,6 @@ from .qwen import (
     get_param_qwen3_vl,
     get_param_qwen3_vl_moe,
 )
-
-
-def get_multimodal_cls(architecture: str) -> type[Any]:
-    if architecture == "Gemma3ForConditionalGeneration":
-        return RBLNAutoModelForImageTextToText
-    else:
-        return RBLNAutoModelForVision2Seq
-
 
 _COMPILE_MULTIMODAL_FNS: dict[str, Callable[[int, int, int, int], dict]] = {
     "blip2": get_param_blip2,

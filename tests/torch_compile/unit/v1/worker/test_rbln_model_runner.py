@@ -135,7 +135,6 @@ class TestMixinInterfaceCompliance:
         "method_name",
         [
             "allocate_uniform_kv_caches",
-            "ensure_kv_transfer_shutdown",
             "finalize_kv_connector",
             "kv_connector_no_forward",
             "maybe_get_kv_connector_output",

@@ -26,6 +26,7 @@ from vllm.v1.request import Request
 @dataclass(frozen=True)
 class RBLNSlidingWindowSpec(SlidingWindowSpec):
     def __post_init__(self):
+        super().__post_init__()
         # NOTE: The block size here means to be the physical block size. The
         # logical kernel_block_size that the kernel actually uses is equal to
         # sliding_window. The physical block is split into logical blocks.
@@ -52,6 +53,7 @@ class RBLNSlidingWindowManager(SingleTypeKVCacheManager):
         new_computed_blocks: Sequence[KVCacheBlock],
         total_computed_tokens: int,
         num_tokens_main_model: int,
+        apply_admission_cap: bool = False,
     ) -> int:
         return 0 if self.req_to_blocks[request_id] else 1
 
@@ -82,7 +84,9 @@ class RBLNSlidingWindowManager(SingleTypeKVCacheManager):
     ) -> tuple[list[KVCacheBlock], ...]:
         return tuple([] for _ in kv_cache_group_ids)
 
-    def cache_blocks(self, request: Request, num_tokens: int) -> None:
+    def cache_blocks(
+        self, request: Request, num_tokens: int, alignment_tokens: int | None = None
+    ) -> None:
         pass
 
     def remove_skipped_blocks(self, request_id: str, num_computed_tokens: int) -> None:

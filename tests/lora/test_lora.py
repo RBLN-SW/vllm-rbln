@@ -31,9 +31,10 @@ from vllm.entrypoints.openai.api_server import (
 )
 from vllm.lora.request import LoRARequest
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.sampler import Sampler, SamplerOutput
-from vllm.model_executor.sampling_metadata import SamplingMetadata
-from vllm.utils import merge_async_iterators
+from vllm.utils.async_utils import merge_async_iterators
+from vllm.v1.outputs import SamplerOutput
+from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.sampler import Sampler
 
 from vllm_rbln.model_executor.models.optimum import ModelInputForRBLN
 from vllm_rbln.model_executor.models.optimum.model_base import KVCacheBlockAdapter
@@ -206,9 +207,7 @@ async def add_lora():
         block_size=BLOCK_SIZE,
     )
     lora_int_ids = [1, 2, 3, 0, 1, 2]
-    async with build_async_engine_client_from_engine_args(
-        engine_args, disable_frontend_multiprocessing=True
-    ) as llm:
+    async with build_async_engine_client_from_engine_args(engine_args) as llm:
         await add_lora_request(llm, lora_int_ids)
 
 
@@ -224,9 +223,7 @@ async def list_loras():
         block_size=BLOCK_SIZE,
     )
 
-    async with build_async_engine_client_from_engine_args(
-        engine_args, disable_frontend_multiprocessing=True
-    ) as llm:
+    async with build_async_engine_client_from_engine_args(engine_args) as llm:
         lora_ids = await llm.list_loras()
 
     return lora_ids
