@@ -184,7 +184,7 @@ class RBLNOptimumGemma3ForConditionalGeneration(
     def get_language_model(self):
         return self.model.language_model
 
-    def build_prefill_inputs(
+    def build_prefill_inputs_from_cache(
         self,
         input_ids: torch.Tensor,
         cached_mm_outputs: list,
@@ -199,7 +199,7 @@ class RBLNOptimumGemma3ForConditionalGeneration(
         raise NotImplementedError(
             "EC disaggregation is not implemented for Gemma3: its hybrid "
             "sliding-window attention prefill needs attention_manager state "
-            "that build_prefill_inputs does not yet provide."
+            "that build_prefill_inputs_from_cache does not yet provide."
         )
 
     def _process_image_input(
