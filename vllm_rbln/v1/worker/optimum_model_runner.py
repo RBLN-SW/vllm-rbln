@@ -257,6 +257,13 @@ class RBLNOptimumModelRunner(
         # Maps mm_hash → dict of prefill params (inputs_embeds, position_embed, etc.)
         self.encoder_cache: dict[str, Any] = {}
 
+        # Runner-owned per-request MRoPE state (request_id → rope delta), mirroring
+        # upstream vLLM's CachedRequestState.mrope_position_delta. Populated at
+        # prefill by _build_forward_inputs (and the EC consumer path) and consumed
+        # to compute decode-step position embeddings. Model hooks return the delta;
+        # the runner owns storage and finished-request cleanup.
+        self.mrope_position_deltas: dict[str, float] = {}
+
         # Ephemeral state transferred
         # between execute_model() and sample_tokens().
         self.execute_model_state: ExecuteModelState | None = None
@@ -372,7 +379,7 @@ class RBLNOptimumModelRunner(
                         )
                 else:
                     with capture_ctx as model_reports:
-                        model_input = self._maybe_embed_inputs(model_input)
+                        model_input = self._build_forward_inputs(model_input)
                         hidden_states = self.model(model_input)
                 if (
                     envs.VLLM_RBLN_METRICS
@@ -408,33 +415,50 @@ class RBLNOptimumModelRunner(
         )
         return None
 
-    def _maybe_embed_inputs(self, model_input: ModelInputForRBLN) -> ModelInputForRBLN:
-        """Compute prefill ``inputs_embeds`` at the runner level for
+    def _build_forward_inputs(
+        self, model_input: ModelInputForRBLN
+    ) -> ModelInputForRBLN:
+        """Assemble the model's forward inputs at the runner level for
         multimodal models, mirroring upstream vLLM.
 
-        Runs the vision encoder (``embed_multimodal``) and merges the result
-        into the text embeddings (``embed_input_ids``), attaching the result
-        to ``model_input.inputs_embeds`` for the model forward to consume.
+        Prefill: run the model's ``build_prefill_forward_inputs`` (vision encode
+        + text merge, and — for MRoPE models — positions) and attach
+        ``inputs_embeds`` (+ ``position_embed``). The runner owns the per-request
+        MRoPE delta state: the hook returns the delta, the runner stores it.
+        Decode: compute MRoPE ``position_embed`` from the stored delta via the
+        model's ``compute_decode_position_embed`` (``None`` for non-MRoPE models,
+        which pass ``input_ids`` through).
 
-        Left untouched: decode steps and non-multimodal models.
+        Left untouched: non-multimodal models.
         """
-        if not model_input.is_prompt:
-            return model_input
         model = self.model
         if not isinstance(model, RBLNOptimumMultimodalMixin):
             return model_input
 
-        # int64 mirrors the dtype the model forward used to embed with
-        # (previously cast in preprocess_for_decoder before embed_input_ids).
-        input_ids = model_input.input_tokens.to(torch.int64)
-        multimodal_embeddings = model.embed_multimodal(
-            **(model_input.multi_modal_kwargs or {})
+        # Runner owns the per-request MRoPE delta state, including cleanup.
+        for request_id in model_input.finished_requests_ids:
+            self.mrope_position_deltas.pop(request_id, None)
+
+        if model_input.is_prompt:
+            inputs_embeds, position_embed, rope_delta = (
+                model.build_prefill_forward_inputs(model_input)
+            )
+            if rope_delta is not None:
+                self.mrope_position_deltas[model_input.running_requests_ids[0]] = (
+                    rope_delta
+                )
+            return replace(
+                model_input,
+                inputs_embeds=inputs_embeds,
+                position_embed=position_embed,
+            )
+
+        position_embed = model.compute_decode_position_embed(
+            model_input, self.mrope_position_deltas
         )
-        inputs_embeds = model.embed_input_ids(
-            input_ids,
-            multimodal_embeddings or None,
-        )
-        return replace(model_input, inputs_embeds=inputs_embeds)
+        if position_embed is None:
+            return model_input
+        return replace(model_input, position_embed=position_embed)
 
     def mask_block_table(
         self,
