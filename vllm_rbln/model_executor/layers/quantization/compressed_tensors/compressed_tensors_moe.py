@@ -27,9 +27,7 @@ from vllm.model_executor.layers.fused_moe.config import (
 )
 from vllm.model_executor.utils import set_weight_attrs
 
-import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
-from vllm_rbln.model_executor.layers.fused_moe.layer import get_tokens_mask
 
 logger = init_logger(__name__)
 
@@ -190,20 +188,12 @@ class CompressedTensorsW8A16Fp8MoEMethod(upstream.CompressedTensorsMoEMethod):
         x: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        # Routing (topk + scoring + optional grouped-topk) is computed in
+        # PyTorch; the custom op below only applies the resulting [E, T] weights.
         orig_shape = x.shape
         num_tokens = orig_shape[:-1].numel()
         hidden_states = x.reshape(num_tokens, -1)
-        router_logits = router_logits.reshape(num_tokens, -1)
-
-        # Pre-score routing inputs at caller side; compiler custom op routing
-        # expects already-scored values (no sigmoid applied inside the kernel).
-        scoring_func = getattr(layer, "scoring_func", None)
-        assert scoring_func is not None, "FusedMoE.scoring_func must be set"
-        assert scoring_func in {"softmax", "sigmoid"}
-        if scoring_func == "sigmoid":
-            router_logits = torch.sigmoid(router_logits.to(torch.float32)).to(
-                router_logits.dtype
-            )
+        masked_routing_weights = router_logits
 
         intermediate_size = layer.w2_weight.shape[-1]
 
@@ -227,48 +217,25 @@ class CompressedTensorsW8A16Fp8MoEMethod(upstream.CompressedTensorsMoEMethod):
             down_proj_weight_scale = w2_scale
             group_size = self.weight_block_size[1]
 
-        e_score_correction_bias = getattr(layer, "e_score_correction_bias", None)
-
         expert_map_const = None
         if layer.expert_map is not None:
             expert_map_const = torch.tensor(layer._expert_map_list, dtype=torch.int32)
 
-        tokens_mask = None
-        if envs.VLLM_RBLN_USE_MOE_TOKENS_MASK:
-            tokens_mask = get_tokens_mask(num_tokens)
-
-        if layer.use_grouped_topk:
-            n_group = layer.num_expert_group
-            topk_group = layer.topk_group
-        else:
-            n_group = None
-            topk_group = None
-
-        # Keep arg order aligned with rebel custom_op schema:
-        # (..., router_logits, scoring_func, group_size, topk, post_norm, ...)
-        final_hidden_states = (
-            torch.ops.rbln_custom_ops.custom_moe_swiglu_group_dequantize(
-                hidden_states,
-                gate_proj_weight,
-                gate_proj_weight_scale,
-                up_proj_weight,
-                up_proj_weight_scale,
-                down_proj_weight,
-                down_proj_weight_scale,
-                router_logits,
-                scoring_func,
-                torch.tensor(group_size, dtype=torch.int32),
-                layer.top_k,
-                layer.renormalize,
-                e_score_correction_bias,
-                None,  # gate_proj_bias
-                None,  # up_proj_bias
-                None,  # down_proj_bias
-                expert_map_const,
-                tokens_mask,
-                n_group,
-                topk_group,
-            )
+        final_hidden_states = torch.ops.rbln_custom_ops.custom_moe_glu_group_dequantize(
+            hidden_states,
+            gate_proj_weight,
+            gate_proj_weight_scale,
+            up_proj_weight,
+            up_proj_weight_scale,
+            down_proj_weight,
+            down_proj_weight_scale,
+            masked_routing_weights,
+            torch.tensor(group_size, dtype=torch.int32),
+            layer.activation.value,
+            None,  # gate_proj_bias
+            None,  # up_proj_bias
+            None,  # down_proj_bias
+            expert_map_const,
         )
 
         return final_hidden_states.reshape(orig_shape)

@@ -25,20 +25,12 @@ def register_model():
         from vllm import ModelRegistry
 
         ModelRegistry.register_model(
-            "T5WithLMHeadModel",
-            "vllm_rbln.model_executor.models.optimum.t5:RBLNT5ForConditionalGeneration",
-        )
-        ModelRegistry.register_model(
-            "T5ForConditionalGeneration",
-            "vllm_rbln.model_executor.models.optimum.t5:RBLNT5ForConditionalGeneration",
-        )
-        ModelRegistry.register_model(
-            "T5EncoderModel",
-            "vllm_rbln.model_executor.models.optimum.encoder:RBLNOptimumForEncoderModel",
-        )
-        ModelRegistry.register_model(
             "Gemma3ForConditionalGeneration",
             "vllm_rbln.model_executor.models.optimum.gemma3:RBLNOptimumGemma3ForConditionalGeneration",
+        )
+        ModelRegistry.register_model(
+            "Gemma4ForConditionalGeneration",
+            "vllm_rbln.model_executor.models.optimum.gemma4:RBLNOptimumGemma4ForConditionalGeneration",
         )
 
 

@@ -69,6 +69,8 @@ _RBLN_MULTIMODAL_MODELS = {
     ),
     "Blip2ForConditionalGeneration": ("blip2", "RBLNBlip2ForConditionalGeneration"),
     "Gemma3ForConditionalGeneration": ("gemma3", "RBLNGemma3ForConditionalGeneration"),
+    # "Gemma4ForConditionalGeneration":
+    # ("gemma4", "RBLNGemma4ForConditionalGeneration"),
     "LlavaForConditionalGeneration": ("llava", "RBLNLlavaForConditionalGeneration"),
     "PaliGemmaForConditionalGeneration": (
         "paligemma",
@@ -125,8 +127,22 @@ def is_arch_supported(
     )
 
 
+def validate_arch_supported(config: PretrainedConfig) -> None:
+    """Validate the model's architecture is known to upstream vLLM."""
+    architectures = getattr(config, "architectures", [])
+    import vllm.model_executor.models as me_models
+
+    supported_archs = me_models.ModelRegistry.get_supported_archs()
+    if not any(arch in supported_archs for arch in architectures):
+        raise ValueError(
+            f"Model architectures {architectures} are not supported on upstream "
+            f"vLLM for now. Supported architectures: {supported_archs}"
+        )
+
+
 def get_rbln_model_info(config: PretrainedConfig) -> tuple[str, str]:
     architectures = getattr(config, "architectures", [])
+
     for arch in architectures:
         if arch in _RBLN_SUPPORTED_MODELS:
             model_name, model_cls_name = _RBLN_SUPPORTED_MODELS[arch]
