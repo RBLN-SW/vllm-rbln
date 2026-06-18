@@ -55,6 +55,7 @@ def custom_moe_glu(
     up_proj_weight: torch.Tensor,
     down_proj_weight: torch.Tensor,
     masked_routing_weight: torch.Tensor,
+    hidden_act: str,
     expert_map: torch.Tensor | None = None,
     gate_proj_bias: torch.Tensor | None = None,
     up_proj_bias: torch.Tensor | None = None,
@@ -70,6 +71,7 @@ def custom_moe_glu(
     - down_proj_weight: [num_experts, hidden_size, intermediate_size]
     - masked_routing_weight: [num_experts, batch * seq_len]
       (token dim may be padded to 64-align)
+    - hidden_act: gate activation name ("silu"/"swish" or "gelu*")
 
     Returns:
         torch.Tensor: [batch * seq_len, hidden_size]
@@ -77,6 +79,14 @@ def custom_moe_glu(
     assert hidden_states.dtype == masked_routing_weight.dtype, (
         "hidden_states and masked_routing_weight must have the same dtype"
     )
+
+    act = hidden_act.lower()
+    if act in ("silu", "swish"):
+        act_fn = torch.nn.functional.silu
+    elif "gelu" in act:
+        act_fn = torch.nn.functional.gelu
+    else:
+        raise ValueError(f"Unsupported hidden_act={hidden_act!r}")
 
     num_tokens = hidden_states.shape[0]
     out = torch.zeros_like(hidden_states)
@@ -86,7 +96,7 @@ def custom_moe_glu(
     for i in range(expert_cnt):
         gate = torch.nn.functional.linear(hidden_states, gate_proj_weight[i])
         up = torch.nn.functional.linear(hidden_states, up_proj_weight[i])
-        mul = torch.nn.functional.silu(gate) * up
+        mul = act_fn(gate) * up
         down = torch.nn.functional.linear(mul, down_proj_weight[i])
         out += down * routing_t[:, i : i + 1]
     return out
@@ -99,6 +109,7 @@ def custom_moe_glu_fake(
     up_proj_weight: torch.Tensor,
     down_proj_weight: torch.Tensor,
     masked_routing_weight: torch.Tensor,
+    hidden_act: str,
     expert_map: torch.Tensor | None = None,
     gate_proj_bias: torch.Tensor | None = None,
     up_proj_bias: torch.Tensor | None = None,
@@ -261,6 +272,7 @@ def unquantized_fused_moe_method_custom(
         up_proj_weight,
         down_proj_weight,
         masked_routing_weights,
+        layer.activation.value,
         expert_map_const,
         None,
         None,
