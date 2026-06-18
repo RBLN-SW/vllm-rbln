@@ -14,57 +14,6 @@
 # limitations under the License.
 
 import asyncio
-import atexit
-import os
-import site
-
-
-def _ensure_transformers_layer_type_alias() -> str | None:
-    """
-    This ensures compatibility with different versions of transformers.
-    vLLM inspects models in a subprocess, so a regular monkey-patch in the
-    main process is not enough.  We install a .pth file into site-packages
-    so that every Python process (including vllm subprocesses) applies the
-    alias at startup, before any `from ... import` can fail.
-    """
-    # 1. Patch the current process immediately
-    import transformers.configuration_utils as configuration_utils  # pylint: disable=import-outside-toplevel,consider-using-from-import
-
-    if not hasattr(configuration_utils, "ALLOWED_LAYER_TYPES") and hasattr(
-        configuration_utils, "ALLOWED_ATTENTION_LAYER_TYPES"
-    ):
-        configuration_utils.ALLOWED_LAYER_TYPES = (
-            configuration_utils.ALLOWED_ATTENTION_LAYER_TYPES
-        )
-
-    # 2. Install a .pth file so subprocesses also get the patch
-    site_dir = site.getsitepackages()[0]
-    pth_file = os.path.join(site_dir, "exaone_compat.pth")
-    pth_content = (
-        "import importlib; "
-        "mod = importlib.import_module('transformers.configuration_utils'); "
-        "setattr(mod, 'ALLOWED_LAYER_TYPES', getattr(mod, 'ALLOWED_ATTENTION_LAYER_TYPES', None)) "  # noqa: E501
-        "if not hasattr(mod, 'ALLOWED_LAYER_TYPES') and hasattr(mod, 'ALLOWED_ATTENTION_LAYER_TYPES') "  # noqa: E501
-        "else None\n"
-    )
-    try:
-        with open(pth_file, "w") as f:
-            f.write(pth_content)
-    except PermissionError:
-        # Fallback: add to user site-packages
-        user_site = site.getusersitepackages()
-        os.makedirs(user_site, exist_ok=True)
-        pth_file = os.path.join(user_site, "exaone_compat.pth")
-        with open(pth_file, "w") as f:
-            f.write(pth_content)
-
-    return pth_file
-
-
-_pth_file = _ensure_transformers_layer_type_alias()
-if _pth_file:
-    atexit.register(lambda: os.remove(_pth_file) if os.path.exists(_pth_file) else None)
-
 
 import fire  # noqa: E402
 from datasets import load_dataset  # noqa: E402
@@ -234,7 +183,12 @@ async def main(
     num_input_prompt: int,
     model_id: str,
 ):
-    engine_args = AsyncEngineArgs(model=model_id)
+    engine_args = AsyncEngineArgs(
+        model=model_id,
+        block_size=4096,
+        max_model_len=8192,
+        max_num_seqs=1,
+    )
 
     engine = AsyncLLMEngine.from_engine_args(engine_args)
     tokenizer = AutoTokenizer.from_pretrained(model_id)
@@ -259,7 +213,7 @@ async def main(
 
 def entry_point(
     num_input_prompt: int = 4,
-    model_id: str = "/home/kblee/.cache/rbln-exec/compile_results/optimum-exaone4-5/model_id__exaone4.5-32b#batch_size__4#max_seq_len__128000#n_layers__64#tensor_parallel_size__16#vit_seq_lens__16384#kvcache_partition_len__5120#use_attn_mask__False/model",  # noqa: E501
+    model_id: str = "LGAI-EXAONE/EXAONE-4.5-33B",  # noqa: E501
 ):
     asyncio.run(
         main(

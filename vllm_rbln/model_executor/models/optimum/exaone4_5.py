@@ -15,23 +15,15 @@ from abc import ABC
 from typing import Any
 
 import torch
-from transformers.models.exaone4_5.configuration_exaone4_5 import Exaone4_5_Config
-from transformers.models.exaone4_5.processing_exaone4_5 import Exaone4_5_Processor
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.model_executor.models.exaone4_5 import (
+    EXAONE4_5ImageEmbeddingInputs,
+    EXAONE4_5ImagePixelInputs,
+    EXAONE4_5VideoEmbeddingInputs,
+    EXAONE4_5VideoPixelInputs,
+)
 from vllm.model_executor.models.interfaces import SupportsMultiModal
-from vllm.model_executor.models.qwen2_5_vl import (
-    Qwen2_5_VLDummyInputsBuilder,
-    Qwen2_5_VLImageEmbeddingInputs,
-    Qwen2_5_VLImagePixelInputs,
-    Qwen2_5_VLMultiModalProcessor,
-    Qwen2_5_VLProcessingInfo,
-)
-from vllm.model_executor.models.qwen2_vl import (
-    Qwen2VLVideoEmbeddingInputs,
-    Qwen2VLVideoPixelInputs,
-)
-from vllm.multimodal import MULTIMODAL_REGISTRY
 
 from .base import ModelInputForRBLN
 from .model_base import RBLNOptimumDecoderMixin, RBLNOptimumModelBase
@@ -46,57 +38,6 @@ from .optimum_attention import (
 logger = init_logger(__name__)
 
 
-class EXAONE4_5ImageEmbeddingInputs(Qwen2_5_VLImageEmbeddingInputs):
-    pass
-
-
-class EXAONE4_5ImagePixelInputs(Qwen2_5_VLImagePixelInputs):
-    pass
-
-
-# NOTE: EXAONE4_5 does not require second_per_grid_ts.
-class EXAONE4_5VideoPixelInputs(Qwen2VLVideoPixelInputs):
-    pass
-
-
-class EXAONE4_5VideoEmbeddingInputs(Qwen2VLVideoEmbeddingInputs):
-    pass
-
-
-class EXAONE4_5_DummyInputsBuilder(Qwen2_5_VLDummyInputsBuilder):
-    pass
-
-
-class EXAONE4_5ProcessingInfo(Qwen2_5_VLProcessingInfo):
-    def get_hf_config(self):
-        return self.ctx.get_hf_config(Exaone4_5_Config)
-
-    def get_hf_processor(self, **kwargs: object) -> Exaone4_5_Processor:
-        return self.ctx.get_hf_processor(
-            Exaone4_5_Processor,
-            use_fast=kwargs.pop("use_fast", True),
-            **kwargs,
-        )
-
-
-class EXAONE4_5MultiModalProcessor(Qwen2_5_VLMultiModalProcessor):
-    def apply(self, inputs, timing_ctx):
-        hf_processor_mm_kwargs = dict(inputs.hf_processor_mm_kwargs or {})
-        if hf_processor_mm_kwargs.get("do_sample_frames", False):
-            raise NotImplementedError(
-                "`do_sample_frames=True` is not supported yet. "
-                "Please set `do_sample_frames` to False."
-            )
-        hf_processor_mm_kwargs.pop("fps", None)
-        inputs.hf_processor_mm_kwargs = hf_processor_mm_kwargs
-        return super().apply(inputs, timing_ctx)
-
-
-@MULTIMODAL_REGISTRY.register_processor(
-    EXAONE4_5MultiModalProcessor,
-    info=EXAONE4_5ProcessingInfo,
-    dummy_inputs=EXAONE4_5_DummyInputsBuilder,
-)
 class RBLNOptimumExaone4_5_ForConditionalGeneration(
     RBLNOptimumModelBase, RBLNOptimumDecoderMixin, SupportsMultiModal, ABC
 ):
@@ -105,6 +46,7 @@ class RBLNOptimumExaone4_5_ForConditionalGeneration(
         vllm_config: VllmConfig,
     ) -> None:
         super().__init__(vllm_config=vllm_config)
+        assert self.kv_block_adapter is not None
         self.setup_decoder_mixin(
             attn_impl=self.attn_impl,
             vocab_size=self.model_config.get_vocab_size,
