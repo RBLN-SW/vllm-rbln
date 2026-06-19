@@ -15,26 +15,45 @@
 import asyncio
 
 import fire
-from transformers import AutoTokenizer
+from datasets import load_dataset
+from transformers import AutoProcessor, AutoTokenizer
 from vllm import AsyncEngineArgs, AsyncLLMEngine, SamplingParams
 
 
-def generate_prompts(batch_size: int):
-    from datasets import load_dataset
-
-    images = []
-    dataset = (
-        load_dataset("takara-ai/image_captions", split="train", streaming=True)
-        .take(batch_size)
-        .shuffle(seed=42)
+def generate_prompts(batch_size: int, model_id: str):
+    dataset = load_dataset("lmms-lab/llava-bench-in-the-wild", split="train").shuffle(
+        seed=42
     )
+    processor = AutoProcessor.from_pretrained(model_id, padding_side="left")
+    messages = [
+        [
+            {
+                "role": "system",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "You are a helpful assistant."
+                        "Answer the each question based on the image.",
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": dataset[i]["question"]},
+                ],
+            },
+        ]
+        for i in range(batch_size)
+    ]
+    images = [[dataset[i]["image"]] for i in range(batch_size)]
 
-    for example in dataset:
-        images.append(example["image"])
-    # NOTE
-    # "caption en" means "generate caption in English"
-    # "caption es" means "generate caption in Spanish"
-    texts = ["caption en"] * batch_size
+    texts = processor.apply_chat_template(
+        messages,
+        add_generation_prompt=True,
+        tokenize=False,
+    )
 
     return [
         {"prompt": text, "multi_modal_data": {"image": image}}
@@ -42,14 +61,14 @@ def generate_prompts(batch_size: int):
     ]
 
 
-async def generate(engine: AsyncLLMEngine, eos_token_id, request_id, request):
+async def generate(engine: AsyncLLMEngine, tokenizer, request_id, request):
     results_generator = engine.generate(
         request,
         SamplingParams(
             temperature=0,
             ignore_eos=False,
             skip_special_tokens=True,
-            stop_token_ids=[eos_token_id],
+            stop_token_ids=[tokenizer.eos_token_id],
             max_tokens=200,
         ),
         str(request_id),
@@ -62,18 +81,22 @@ async def generate(engine: AsyncLLMEngine, eos_token_id, request_id, request):
 
 
 async def main(
-    inputs: list,
+    num_input_prompt: int,
     model_id: str,
-    eos_token_id: int,
 ):
-    engine_args = AsyncEngineArgs(model=model_id)
+    engine_args = AsyncEngineArgs(
+        model=model_id,
+        mm_processor_kwargs={"max_soft_tokens": 280},
+    )
 
     engine = AsyncLLMEngine.from_engine_args(engine_args)
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    inputs = generate_prompts(num_input_prompt, model_id)
 
     futures = []
     for request_id, request in enumerate(inputs):
         futures.append(
-            asyncio.create_task(generate(engine, eos_token_id, request_id, request))
+            asyncio.create_task(generate(engine, tokenizer, request_id, request))
         )
 
     results = await asyncio.gather(*futures)
@@ -86,16 +109,13 @@ async def main(
 
 
 def entry_point(
-    num_input_prompt: int = 10,
-    model_id: str = "./paligemma2_b2",
+    num_input_prompt: int = 1,
+    model_id: str = "./gemma4-31b-b4",
 ):
-    inputs = generate_prompts(num_input_prompt)
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
     asyncio.run(
         main(
-            inputs=inputs,
+            num_input_prompt=num_input_prompt,
             model_id=model_id,
-            eos_token_id=tokenizer.eos_token_id,
         )
     )
 
