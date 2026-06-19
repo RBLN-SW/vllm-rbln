@@ -42,7 +42,7 @@ def generate_prompts(batch_size: int):
 
 def main(
     num_input_prompt: int = 10,
-    model: str = "./paligemma2_b2",
+    model: str = "/mnt/shared_data/users/ci_vllm/paligemma-3b-8k-b4/",
 ):
     llm = LLM(model=model)
     tokenizer = AutoTokenizer.from_pretrained(model)
