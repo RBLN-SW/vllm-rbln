@@ -56,7 +56,7 @@ def _sync_submodule_tp_with_device(rbln_config: dict) -> None:
     ``tensor_parallel_size`` to match that device count. The user only supplies
     ``device``, so we derive ``tensor_parallel_size`` from ``len(device)`` here.
     The top-level config is left untouched (its TP is driven by
-    ``VLLM_RBLN_TP_SIZE``).
+    ``VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK``).
     """
     for value in rbln_config.values():
         if not isinstance(value, dict):

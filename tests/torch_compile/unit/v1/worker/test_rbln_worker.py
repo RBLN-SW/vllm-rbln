@@ -156,7 +156,7 @@ def env_cleanup():
 # Patches that neutralise heavy dependencies during __init__
 _INIT_PATCHES = {
     "current_platform": "vllm_rbln.v1.worker.rbln_worker.current_platform",
-    "envs_tp": "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_TP_SIZE",
+    "envs_tp": "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK",
     "envs_ray": "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_NUM_RAY_NODES",
     "envs_auto_port": "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_AUTO_PORT",
     "envs_compile": "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_COMPILE_MODEL",

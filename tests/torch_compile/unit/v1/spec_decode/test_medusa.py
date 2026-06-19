@@ -222,7 +222,7 @@ def test_compile_model_builds_expected_rbln_compile_options(
     monkeypatch.setattr(medusa_module, "get_tp_group", lambda: tp_group)
     monkeypatch.setattr(medusa_module, "get_pp_group", lambda: pp_group)
     monkeypatch.setattr(medusa_module, "get_dp_group", lambda: dp_group)
-    monkeypatch.setattr(medusa_module.envs, "VLLM_RBLN_TP_SIZE", 8)
+    monkeypatch.setattr(medusa_module.envs, "VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK", 8)
     monkeypatch.setattr(
         medusa_module.envs, "VLLM_DISABLE_COMPILE_CACHE", disable_compile_cache
     )

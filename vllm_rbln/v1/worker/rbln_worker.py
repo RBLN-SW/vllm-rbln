@@ -147,7 +147,7 @@ class RBLNWorker(WorkerBase):
         world_size = self.local_world_size
         env_var = current_platform.device_control_env_var
 
-        rbln_tp_size = envs.VLLM_RBLN_TP_SIZE
+        rbln_tp_size = envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK
         total_device_count = world_size * rbln_tp_size
 
         if env_var not in os.environ:
