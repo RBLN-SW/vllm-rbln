@@ -475,25 +475,12 @@ class RBLNOptimumMultimodalMixin(SupportsMultiModal):
         self,
         model_input: ModelInputForRBLN,
     ) -> tuple[torch.Tensor, torch.Tensor | None, float | None]:
-        """Assemble the prefill forward inputs at the runner level. Mirrors
-        upstream vLLM, where the runner produces ``inputs_embeds`` (and, for
-        MRoPE models, positions).
-
-        Returns ``(inputs_embeds, position_embed, rope_delta)``. These hooks are
-        pure: the per-request MRoPE delta is *returned* (the runner owns and
-        stores it), never mutated in place.
-
-        Default: simple multimodal models embed (``embed_multimodal`` +
-        ``embed_input_ids``) and have neither MRoPE positions nor a delta. MRoPE
-        models (e.g. Qwen-VL) override this to also return the two.
-        """
         multimodal_embeddings = self.embed_multimodal(
             **(model_input.multi_modal_kwargs or {})
         )
-        # int64 mirrors the dtype the model forward used to embed with
-        # (previously cast in preprocess_for_decoder before embed_input_ids).
+        input_ids = model_input.input_tokens.to(torch.int64)
         inputs_embeds = self.embed_input_ids(
-            model_input.input_tokens.to(torch.int64),
+            input_ids,
             multimodal_embeddings or None,
         )
         return inputs_embeds, None, None
@@ -503,13 +490,7 @@ class RBLNOptimumMultimodalMixin(SupportsMultiModal):
         model_input: ModelInputForRBLN,
         mrope_position_deltas: dict[str, float],
     ) -> torch.Tensor | None:
-        """Decode-step position embeddings, computed at the runner level from
-        the runner-owned ``mrope_position_deltas``.
-
-        Default: ``None`` — simple multimodal models pass ``input_ids`` through
-        at decode and don't use precomputed positions. MRoPE models (e.g.
-        Qwen-VL) override this.
-        """
+        # MRoPE models (e.g. Qwen-VL) override this
         return None
 
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings | dict:

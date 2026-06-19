@@ -319,9 +319,6 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         cache_position = kwargs.pop("cache_position")
         block_tables = kwargs.pop("block_tables")
 
-        # inputs_embeds / position_embed are computed at the runner level; see
-        # RBLNOptimumModelRunner._build_forward_inputs (which calls this model's
-        # build_prefill_forward_inputs / compute_decode_position_embed).
         if is_prompt:
             logits = self.model.prefill_decoder(
                 inputs_embeds=model_input.inputs_embeds,

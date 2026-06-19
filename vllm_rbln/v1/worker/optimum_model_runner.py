@@ -418,24 +418,10 @@ class RBLNOptimumModelRunner(
     def _build_forward_inputs(
         self, model_input: ModelInputForRBLN
     ) -> ModelInputForRBLN:
-        """Assemble the model's forward inputs at the runner level for
-        multimodal models, mirroring upstream vLLM.
-
-        Prefill: run the model's ``build_prefill_forward_inputs`` (vision encode
-        + text merge, and — for MRoPE models — positions) and attach
-        ``inputs_embeds`` (+ ``position_embed``). The runner owns the per-request
-        MRoPE delta state: the hook returns the delta, the runner stores it.
-        Decode: compute MRoPE ``position_embed`` from the stored delta via the
-        model's ``compute_decode_position_embed`` (``None`` for non-MRoPE models,
-        which pass ``input_ids`` through).
-
-        Left untouched: non-multimodal models.
-        """
         model = self.model
         if not isinstance(model, RBLNOptimumMultimodalMixin):
             return model_input
 
-        # Runner owns the per-request MRoPE delta state, including cleanup.
         for request_id in model_input.finished_requests_ids:
             self.mrope_position_deltas.pop(request_id, None)
 
