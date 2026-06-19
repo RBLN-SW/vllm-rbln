@@ -156,7 +156,7 @@ def env_cleanup():
 # Patches that neutralise heavy dependencies during __init__
 _INIT_PATCHES = {
     "current_platform": "vllm_rbln.v1.worker.rbln_worker.current_platform",
-    "envs_tp": "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK",
+    "envs_num_devices": "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK",  # noqa: E501
     "envs_ray": "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_NUM_RAY_NODES",
     "envs_auto_port": "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_AUTO_PORT",
     "envs_compile": "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_COMPILE_MODEL",
@@ -201,7 +201,7 @@ def _create_worker(
         vllm_config = _make_vllm_config()
 
     defaults = {
-        "envs_tp": tp_size,
+        "envs_num_devices": tp_size,
         "envs_ray": num_ray_nodes,
         "envs_auto_port": False,
         "envs_compile": True,
@@ -237,7 +237,7 @@ def _create_worker(
 
         # Patch scalar env values
         for key in (
-            "envs_tp",
+            "envs_num_devices",
             "envs_ray",
             "envs_auto_port",
             "envs_compile",

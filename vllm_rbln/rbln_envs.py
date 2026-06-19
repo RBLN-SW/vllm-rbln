@@ -146,7 +146,9 @@ environment_variables = {
         )
     ),
     # TP Size for RSD.
-    "VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK": lambda: int(os.environ.get("VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK", 1)),
+    "VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK": lambda: int(
+        os.environ.get("VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK", 1)
+    ),
     # Use customized sampler
     "VLLM_RBLN_SAMPLER": (
         lambda: os.environ.get("VLLM_RBLN_SAMPLER", "True").lower() in ("true", "1")

@@ -15,7 +15,7 @@
 
 
 def get_param_exaone4_5(
-    batch_size: int, max_model_len: int, block_size: int, tp_size: int
+    batch_size: int, max_model_len: int, block_size: int, num_devices: int
 ) -> dict:
     param = {
         "visual": {
@@ -23,7 +23,7 @@ def get_param_exaone4_5(
             # it inherits tensor_parallel_size of main module.
             "max_seq_len": 6400,
         },
-        "tensor_parallel_size": tp_size,
+        "num_devices": num_devices,
         "max_seq_len": max_model_len,
         "batch_size": batch_size,
         "use_inputs_embeds": True,

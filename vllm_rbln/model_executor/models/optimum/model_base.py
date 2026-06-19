@@ -224,7 +224,7 @@ class RBLNOptimumModelBase(nn.Module):
                 batch_size=self.scheduler_config.max_num_seqs,
                 block_size=get_attn_block_size(self.vllm_config),
                 max_model_len=self.model_config.max_model_len,
-                tp_size=envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
+                num_devices=envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
                 rbln_overrides=rbln_overrides,
             )
             logger.info(
