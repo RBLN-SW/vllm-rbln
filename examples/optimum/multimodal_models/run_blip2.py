@@ -40,7 +40,9 @@ def main(
     num_input_prompt: int = 10,
     model: str = "Salesforce/blip2-opt-2.7b",
 ):
-    llm = LLM(model=model, block_size=4096)
+    # `max_model_len` of BLIP2 model is 2048
+    # and `block_size` cannot exceeds `max_model_len`.
+    llm = LLM(model=model, block_size=2048)
     tokenizer = AutoTokenizer.from_pretrained(model)
     inputs = generate_prompts(num_input_prompt, model)
 
