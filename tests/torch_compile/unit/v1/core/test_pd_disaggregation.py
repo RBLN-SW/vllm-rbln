@@ -1356,10 +1356,10 @@ class TestRblnNixlConnectorWorkerRegisterKvCachesImpl:
             ) as nc,
             patch(
                 "vllm_rbln.distributed.kv_transfer.kv_connector.v1."
-                "rbln_nixl_connector.Context"
-            ) as mock_ctx,
+                "rbln_nixl_connector.rebel"
+            ) as mock_rebel,
         ):
-            mock_ctx.from_key.return_value.rbln_ctx_ptr = 0x1000
+            mock_rebel.context_of.return_value.rbln_ctx_ptr = 0x1000
             topo = MagicMock(
                 is_kv_layout_blocks_first=False,
                 _cross_layers_blocks=False,
@@ -1386,11 +1386,11 @@ class TestRblnNixlConnectorWorkerRegisterKvCachesImpl:
             ):
                 worker._register_kv_caches_impl(kv_caches)
 
-        # rbln_ctx_ptr is resolved from the tensor's device id via the
-        # global-at-device Context lookup, not from a runtime handle.
-        mock_ctx.global_key_at_device.assert_called_once_with(0)
-        mock_ctx.from_key.assert_called_once_with(
-            mock_ctx.global_key_at_device.return_value
+        # rbln_ctx_ptr is resolved from the KV cache tensor via
+        # rebel.context_of (sugar for the global-at-device Context lookup),
+        # not from a runtime handle.
+        mock_rebel.context_of.assert_called_once_with(
+            next(iter(kv_caches.values()))
         )
 
         # nixl-rbln was called once, with VRAM segment.
