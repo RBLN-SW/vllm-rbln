@@ -16,21 +16,20 @@ from copy import copy
 
 import torch
 import torch.nn as nn
+from rebel import CompileContext
 from vllm.config import VllmConfig
 from vllm.distributed import get_dp_group, get_pp_group, get_tp_group
-from vllm.forward_context import set_forward_context
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.medusa import MedusaProposer
 
 import vllm_rbln.rbln_envs as envs
+from vllm_rbln.forward_context import set_forward_context
 from vllm_rbln.torch_compile_backend import logged_rbln_backend
 
 
 class RBLNMedusaProposer(MedusaProposer):
     def __init__(self, vllm_config: VllmConfig, device: torch.device) -> None:
         super().__init__(vllm_config, device)
-
-        from rebel.compile_context import CompileContext
 
         self.compile_context = CompileContext(use_weight_sharing=True)
 

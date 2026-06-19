@@ -15,7 +15,6 @@ from typing import Any
 
 import torch
 from vllm.config import VllmConfig
-from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.model_executor.models.paligemma import (
     PaliGemmaImageEmbeddingInputs,
     PaliGemmaImageInputs,
@@ -25,12 +24,25 @@ from vllm.model_executor.models.paligemma import (
 from optimum.rbln.configuration_utils import RBLNModelConfig
 from vllm_rbln.model_executor.models.optimum.base import ModelInputForRBLN
 
-from .model_base import RBLNOptimumDecoderMixin, RBLNOptimumModelBase
+from .model_base import (
+    RBLNOptimumDecoderMixin,
+    RBLNOptimumModelBase,
+    RBLNOptimumMultimodalMixin,
+)
+
+PAD_TOKEN_ID = 0
 
 
 class RBLNOptimumPaliGemmaForConditionalGeneration(
-    RBLNOptimumModelBase, RBLNOptimumDecoderMixin, SupportsMultiModal
+    RBLNOptimumModelBase, RBLNOptimumMultimodalMixin, RBLNOptimumDecoderMixin
 ):
+    @classmethod
+    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
+        if modality.startswith("image"):
+            return None
+
+        raise ValueError("Only image modality is supported")
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -61,18 +73,16 @@ class RBLNOptimumPaliGemmaForConditionalGeneration(
         )
 
         if is_prompt:
-            if model_input.multi_modal_kwargs:
-                pixel_values = self.get_pixel_values(model_input)
-            else:
-                pixel_values = None
-
             block_tables = kwargs.pop("block_tables")
             input_ids = kwargs.pop("input_ids")
             cache_position = kwargs.pop("cache_position")
 
-            inputs_embeds = self.model._preprocess_prefill(
-                input_ids=input_ids,
-                pixel_values=pixel_values,
+            multimodal_embeddings = self.embed_multimodal(
+                **(model_input.multi_modal_kwargs or {})
+            )
+            inputs_embeds = self.embed_input_ids(
+                input_ids,
+                multimodal_embeddings or None,
             )
             logits = self.model.language_model.prefill_decoder(
                 inputs_embeds=inputs_embeds,
@@ -99,20 +109,29 @@ class RBLNOptimumPaliGemmaForConditionalGeneration(
             logits = logits[:request_nums]
         return logits
 
-    def get_pixel_values(self, model_input: ModelInputForRBLN):
-        image_input = None
+    def get_language_model(self):
+        return self.model.language_model
 
-        if model_input.multi_modal_kwargs:
-            image_input = self._parse_and_validate_image_input(
-                **model_input.multi_modal_kwargs
-            )
-            if image_input is not None:
-                assert image_input["type"] == "pixel_values"
-                pixel_values = image_input["data"]
-        else:
-            pixel_values = None
+    def _process_image_input(
+        self, image_input: PaliGemmaImageInputs
+    ) -> list[torch.Tensor]:
+        if image_input["type"] == "image_embeds":
+            return list(image_input["data"])
 
-        return pixel_values
+        # Vision tower + multi-modal projector, compiled by optimum-rbln.
+        # Returns (num_images, num_image_tokens, hidden_size).
+        image_features = self.model.get_image_features(image_input["data"])
+        return list(image_features)
+
+    def _embed_text_tokens(
+        self, input_ids: torch.Tensor, is_multimodal: torch.Tensor
+    ) -> torch.Tensor:
+        # PaliGemma's image token can be OOV; PAD-mask those positions before
+        # the text embedding lookup (mirrors optimum-rbln's _preprocess_prefill).
+        config = self.model.config
+        if config.image_token_index >= config.text_config.vocab_size:
+            input_ids = input_ids.masked_fill(is_multimodal, PAD_TOKEN_ID)
+        return self.model.get_input_embeddings()(input_ids)
 
     def _parse_and_validate_image_input(
         self, **kwargs: Any

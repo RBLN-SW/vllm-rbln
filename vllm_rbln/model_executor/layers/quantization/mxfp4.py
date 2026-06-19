@@ -419,3 +419,4 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 # We do this because upstream uses Mxfp4MoEMethod for all non-xpu platforms
 # and it doesn't expose interface for OOT kernels.
 upstream.Mxfp4MoEMethod = Mxfp4MoEMethod
+upstream.GptOssMxfp4MoEMethod = Mxfp4MoEMethod

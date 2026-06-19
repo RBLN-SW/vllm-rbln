@@ -25,7 +25,7 @@ import torch
 from torch._dynamo.exc import BackendCompilerFailed
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
-from vllm.v1.worker.worker_base import WorkerBase
+from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -357,14 +357,14 @@ class TestInterfaceCompliance:
         assert "self" in params
         assert "scheduler_output" in params
 
-    def test_compile_or_warm_up_model_returns_float(self):
-        """compile_or_warm_up_model must return a float (elapsed time)."""
+    def test_compile_or_warm_up_model_returns(self):
+        """compile_or_warm_up_model must return a CompilationTimes (elapsed time)."""
         from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
 
         sig = inspect.signature(RBLNWorker.compile_or_warm_up_model)
-        # The return annotation should be float
+        # The return annotation should be CompilationTimes
         assert (
-            sig.return_annotation is float
+            sig.return_annotation is CompilationTimes
             or sig.return_annotation == inspect.Parameter.empty
         )
 
@@ -893,7 +893,7 @@ class TestCompileOrWarmUpModel:
         elapsed = worker.compile_or_warm_up_model()
         worker.model_runner.warm_up_model.assert_not_called()
         worker.model_runner._enable_performance_tracker.assert_not_called()
-        assert elapsed >= 0
+        assert elapsed.language_model >= 0 and elapsed.encoder >= 0
 
     def test_skip_compile_disabled(self):
         worker = _create_worker()
