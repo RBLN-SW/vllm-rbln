@@ -222,7 +222,7 @@ class RBLNOptimumModelBase(nn.Module):
                 json.dumps(spec.rbln_config, indent=2, default=str),
             )
             model = spec.model_cls.from_pretrained(
-                self.model_config.model, rbln_config=spec.rbln_config
+                self.model_config.model, rbln_config=spec.rbln_config, config=hf_config
             )
             model.save_pretrained(cached_model_path)  # type: ignore[attr-defined]
             self.vllm_config.model_config.model = cached_model_path
