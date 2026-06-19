@@ -16,8 +16,8 @@ import time
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
+import rebel
 import torch
-from rebel._C import Context
 from rebel.kv_cache import aligned_tensor
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.utils import (
@@ -479,7 +479,8 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
         )
 
         # Device id for the RBLN backend's RblnContext.
-        device_id = next(iter(kv_caches.values())).get_device()
+        sample_kv_cache = next(iter(kv_caches.values()))
+        device_id = sample_kv_cache.get_device()
         assert device_id >= 0, (
             "RblnNixlConnectorWorker (D2D): KV cache is not an 'rbln' "
             "device tensor (is VLLM_RBLN_USE_DEVICE_TENSOR=1 set?)."
@@ -557,8 +558,7 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
                     )
                 regions.append((cache_or_caches, region_offset, full_block_len))
 
-        ctx = Context.from_key(Context.global_key_at_device(device_id))
-        rbln_ctx_ptr = ctx.rbln_ctx_ptr
+        rbln_ctx_ptr = rebel.context_of(sample_kv_cache).rbln_ctx_ptr
 
         # Delegate sharding and MR registration to nixl-rbln. It registers
         # one whole-entry MR per shard and returns the transfer tables
