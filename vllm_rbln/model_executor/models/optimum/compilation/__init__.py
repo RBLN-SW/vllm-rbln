@@ -63,7 +63,7 @@ def _sync_submodule_tp_with_device(rbln_config: dict) -> None:
             continue
         device = value.get("device")
         if isinstance(device, list) and device:
-            value["tensor_parallel_size"] = len(device)
+            value["num_devices"] = len(device)
 
 
 @dataclass
@@ -138,7 +138,7 @@ class RBLNCompileSpec:
         num_devices: int,
     ) -> "RBLNCompileSpec":
         rbln_config: dict[str, Any] = {
-            "tensor_parallel_size": num_devices,
+            "num_devices": num_devices,
             "batch_size": batch_size,
             "max_seq_len": max_model_len,
         }
@@ -161,7 +161,7 @@ class RBLNCompileSpec:
         assert model_cls is not None
 
         rbln_config: dict[str, Any] = {
-            "tensor_parallel_size": num_devices,
+            "num_devices": num_devices,
             "batch_size": batch_size,
             "max_seq_len": max_model_len,
         }
@@ -219,7 +219,7 @@ class RBLNCompileSpec:
         return cls(
             model_cls=RBLNAutoModelForSpeechSeq2Seq,
             rbln_config={
-                "tensor_parallel_size": num_devices,
+                "num_devices": num_devices,
                 "batch_size": batch_size,
                 "token_timestamps": False,
             },
