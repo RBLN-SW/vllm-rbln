@@ -380,7 +380,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             if self.use_rbln_sampler:
                 self.rejection_sampler = RBLNRejectionSampler(
                     self.sampler,
-                    seed=self.vllm_config.model_config.seed,
                     compile_context=self.compile_context,
                 )
             else:
