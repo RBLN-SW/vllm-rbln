@@ -2905,8 +2905,9 @@ def test_determine_batch_padding_data_parallel_prefill_uses_max_num_tokens(
 
     calls = []
 
-    def fake_num_tokens_across_dp_with_max_decode_tokens(
+    def fake_num_tokens_and_reqs_across_dp(
         num_tokens,
+        num_reqs,
         dp_size,
         dp_rank,
         is_prefill,
@@ -2914,6 +2915,7 @@ def test_determine_batch_padding_data_parallel_prefill_uses_max_num_tokens(
         calls.append(
             {
                 "num_tokens": num_tokens,
+                "num_reqs": num_reqs,
                 "dp_size": dp_size,
                 "dp_rank": dp_rank,
                 "is_prefill": is_prefill,
@@ -2923,8 +2925,8 @@ def test_determine_batch_padding_data_parallel_prefill_uses_max_num_tokens(
 
     monkeypatch.setattr(
         rbln_model_runner_module.RBLNDPMetadata,
-        "num_tokens_across_dp_with_max_decode_tokens",
-        staticmethod(fake_num_tokens_across_dp_with_max_decode_tokens),
+        "num_tokens_and_reqs_across_dp",
+        staticmethod(fake_num_tokens_and_reqs_across_dp),
     )
 
     monkeypatch.setattr(
@@ -2943,6 +2945,7 @@ def test_determine_batch_padding_data_parallel_prefill_uses_max_num_tokens(
     assert calls == [
         {
             "num_tokens": 64,
+            "num_reqs": 3,
             "dp_size": 2,
             "dp_rank": 0,
             "is_prefill": True,
@@ -2961,8 +2964,8 @@ def test_determine_batch_padding_data_parallel_prefill_uses_max_num_tokens(
 def test_determine_batch_padding_specialized_moe_decode_uses_decode_bucket(
     rbln_model_runner, monkeypatch
 ):
-    """Specialized MoE decode should pad to the max decode-token bucket instead
-    of max_num_tokens."""
+    """Specialized MoE decode should bucket by request count and pad by the
+    request bucket times the per-request query length."""
     ib = rbln_model_runner.input_batch
 
     # Force decode.
@@ -2989,8 +2992,9 @@ def test_determine_batch_padding_specialized_moe_decode_uses_decode_bucket(
 
     calls = []
 
-    def fake_num_tokens_across_dp_with_max_decode_tokens(
+    def fake_num_tokens_and_reqs_across_dp(
         num_tokens,
+        num_reqs,
         dp_size,
         dp_rank,
         is_prefill,
@@ -2998,19 +3002,22 @@ def test_determine_batch_padding_specialized_moe_decode_uses_decode_bucket(
         calls.append(
             {
                 "num_tokens": num_tokens,
+                "num_reqs": num_reqs,
                 "dp_size": dp_size,
                 "dp_rank": dp_rank,
                 "is_prefill": is_prefill,
             }
         )
-        # Simulate this rank having 3 decode tokens and another rank requiring
-        # bucket selection for max decode tokens == 5.
-        return torch.tensor([3, 5], dtype=torch.int32), 5
+        # Simulate this rank having 3 requests with 4 query tokens each, while
+        # another rank requires bucket selection for max request count == 5.
+        return torch.tensor([12, 20], dtype=torch.int32), torch.tensor(
+            [3, 5], dtype=torch.int32
+        )
 
     monkeypatch.setattr(
         rbln_model_runner_module.RBLNDPMetadata,
-        "num_tokens_across_dp_with_max_decode_tokens",
-        staticmethod(fake_num_tokens_across_dp_with_max_decode_tokens),
+        "num_tokens_and_reqs_across_dp",
+        staticmethod(fake_num_tokens_and_reqs_across_dp),
     )
 
     fake_bucketing_manager = FakeBucketingManager(buckets={3: 4, 5: 8})
@@ -3023,13 +3030,14 @@ def test_determine_batch_padding_specialized_moe_decode_uses_decode_bucket(
     num_reqs_padded, num_tokens_padded, num_tokens_across_dp = (
         rbln_model_runner._determine_batch_padding(
             num_reqs_unpadded=3,
-            num_tokens_unpadded=3,
+            num_tokens_unpadded=12,
         )
     )
 
     assert calls == [
         {
-            "num_tokens": 3,
+            "num_tokens": 12,
+            "num_reqs": 3,
             "dp_size": 2,
             "dp_rank": 0,
             "is_prefill": False,
@@ -3037,16 +3045,16 @@ def test_determine_batch_padding_specialized_moe_decode_uses_decode_bucket(
     ]
 
     # First call: initial decode padding for this rank's unpadded request count.
-    # Second call: specialized MoE decode repads using cross-DP max_decode_tokens.
+    # Second call: specialized MoE decode repads using cross-DP max request count.
     assert fake_bucketing_manager.calls == [3, 5]
 
     assert num_reqs_padded == 8
-    assert num_tokens_padded == 8
+    assert num_tokens_padded == 32
 
     assert isinstance(num_tokens_across_dp, torch.Tensor)
     assert num_tokens_across_dp.dtype == torch.int32
     assert num_tokens_across_dp.device.type == "cpu"
-    assert num_tokens_across_dp.tolist() == [3, 5]
+    assert num_tokens_across_dp.tolist() == [12, 20]
 
 
 def test_may_reinitialize_input_batch_rebuilds_on_kernel_block_size_change(

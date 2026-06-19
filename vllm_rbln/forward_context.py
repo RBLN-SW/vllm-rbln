@@ -59,31 +59,63 @@ class RBLNDPMetadata(DPMetadata):
         return num_tokens_tensor
 
     @staticmethod
-    def num_tokens_across_dp_with_max_decode_tokens(
-        num_tokens: int, dp_size: int, dp_rank: int, is_prefill: bool
-    ) -> tuple[torch.Tensor, int | None]:
-        pad_flag = 1 << 16
-        pad_mask = pad_flag - 1
-        assert num_tokens < pad_flag, "num_tokens should be less than pad_flag"
+    def num_tokens_and_reqs_across_dp(
+        num_tokens: int, num_reqs: int, dp_size: int, dp_rank: int, is_prefill: bool
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """All-reduce per-rank (num_tokens, num_reqs, is_prefill) across DP via
+        a single bit-packed int32 and split the result back out.
 
-        if is_prefill:
-            num_tokens |= pad_flag
+        Bit layout (int32, low to high):
+            bits  0..15  num_tokens (max 65535)
+            bits 16..29  num_reqs   (max 16383)
+            bit  30      is_prefill flag
 
-        tokens_across_dp_cpu = RBLNDPMetadata.num_tokens_across_dp(
-            num_tokens, dp_size, dp_rank
+        Returns:
+            num_tokens_across_dp_cpu: per-rank num_tokens (size dp_size).
+            num_reqs_across_dp_cpu: per-rank num_reqs (size dp_size), or None
+                if any rank is in prefill phase.
+        """
+        token_bits = 16
+        req_bits = 14
+        token_mask = (1 << token_bits) - 1
+        req_mask_raw = (1 << req_bits) - 1
+        req_mask_shifted = req_mask_raw << token_bits
+        prefill_flag = 1 << (token_bits + req_bits)
+
+        assert num_tokens <= token_mask, (
+            f"num_tokens={num_tokens} exceeds bit-packed limit {token_mask}"
         )
-        max_across_dp = torch.max(tokens_across_dp_cpu).item()
+        assert num_reqs <= req_mask_raw, (
+            f"num_reqs={num_reqs} exceeds bit-packed limit {req_mask_raw}"
+        )
 
-        if is_prefill or max_across_dp > pad_flag:
-            mask_tensor = torch.tensor(
-                [pad_mask] * dp_size, device="cpu", dtype=torch.int32
-            )
-            num_tokens_across_dp_cpu = tokens_across_dp_cpu & mask_tensor
-            max_across_dp = None
+        encoded = num_tokens | (num_reqs << token_bits)
+        if is_prefill:
+            encoded |= prefill_flag
+
+        encoded_across_dp = RBLNDPMetadata.num_tokens_across_dp(
+            encoded, dp_size, dp_rank
+        )
+
+        prefill_mask = torch.tensor(
+            [prefill_flag] * dp_size, device="cpu", dtype=torch.int32
+        )
+        any_prefill = bool((encoded_across_dp & prefill_mask).any().item())
+
+        token_mask_t = torch.tensor(
+            [token_mask] * dp_size, device="cpu", dtype=torch.int32
+        )
+        num_tokens_across_dp_cpu = encoded_across_dp & token_mask_t
+
+        if any_prefill:
+            num_reqs_across_dp_cpu = None
         else:
-            num_tokens_across_dp_cpu = tokens_across_dp_cpu
+            req_mask_t = torch.tensor(
+                [req_mask_shifted] * dp_size, device="cpu", dtype=torch.int32
+            )
+            num_reqs_across_dp_cpu = (encoded_across_dp & req_mask_t) >> token_bits
 
-        return num_tokens_across_dp_cpu, max_across_dp
+        return num_tokens_across_dp_cpu, num_reqs_across_dp_cpu
 
     @staticmethod
     def make(
