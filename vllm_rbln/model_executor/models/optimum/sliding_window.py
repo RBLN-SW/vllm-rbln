@@ -87,11 +87,13 @@ class RBLNOptimumSlidingWindowAttentionForCausalLM(
             finished_requests_ids,
         )
 
-        kwargs = self.preprocess_for_decoder(
-            is_prompt, block_tables, input_ids, cache_position
-        )
-
-        padded_batch_size = kwargs.pop("padded_batch_size", self.decoder_batch_size)
+        if is_prompt:
+            kwargs = self.preprocess_for_prefill(
+                block_tables, input_ids, cache_position
+            )
+        else:
+            kwargs = self.preprocess_for_decode(block_tables, input_ids, cache_position)
+            padded_batch_size = kwargs.pop("padded_batch_size", self.decoder_batch_size)
 
         # [prefill] the length of the padded cache is calculated
         # during the forward pass and stored in self.sliding_window_table.

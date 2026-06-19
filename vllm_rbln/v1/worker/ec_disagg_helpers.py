@@ -132,8 +132,7 @@ class ECDisaggHelpersMixin:
             cached_mm_outputs.append(self.encoder_cache[mm_hash])
 
         input_ids = model_input.input_tokens
-        kwargs = self.model.preprocess_for_decoder(
-            True,
+        kwargs = self.model.preprocess_for_prefill(
             model_input.block_tables,
             input_ids,
             model_input.input_positions,

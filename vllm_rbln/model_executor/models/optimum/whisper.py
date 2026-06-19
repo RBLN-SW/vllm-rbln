@@ -127,8 +127,7 @@ class RBLNOptimumWhisperForConditionalGeneration(
 
         else:
             cache_position = torch.zeros(request_nums, 1, dtype=torch.int32)
-            kwargs = self.preprocess_for_decoder(
-                is_prompt=False,
+            kwargs = self.preprocess_for_decode(
                 block_tables=block_tables,
                 input_ids=input_ids,
                 cache_position=cache_position,

@@ -281,7 +281,7 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         cache_position = model_input.input_positions
         running_requests_ids = model_input.running_requests_ids
         # int32 mirrors the cache_position dtype the prior decode path used
-        # (cast in preprocess_for_decoder before computing position embeds).
+        # (cast in preprocess_for_decode before computing position embeds).
         cache_position = cache_position.to(torch.int32)
         padded_batch_size = self.decoder_batch_size
         if self.use_multiple_decoder:
@@ -313,9 +313,12 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         request_nums = input_ids.shape[0]
         is_prompt = model_input.is_prompt
 
-        kwargs = self.preprocess_for_decoder(
-            is_prompt, block_tables, input_ids, cache_position
-        )
+        if is_prompt:
+            kwargs = self.preprocess_for_prefill(
+                block_tables, input_ids, cache_position
+            )
+        else:
+            kwargs = self.preprocess_for_decode(block_tables, input_ids, cache_position)
         cache_position = kwargs.pop("cache_position")
         block_tables = kwargs.pop("block_tables")
 

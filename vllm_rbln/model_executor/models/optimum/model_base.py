@@ -353,54 +353,87 @@ class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
             padded_block_tables[mask] = padding_blocks[0]
         return padded_input_ids, padded_position_ids, padded_block_tables
 
-    def preprocess_for_decoder(
+    def _cast_decoder_inputs(
         self,
-        is_prompt: bool,
+        input_ids: torch.Tensor | None,
+        cache_position: torch.Tensor | None,
         block_tables: torch.Tensor,
-        input_ids: torch.Tensor | None = None,
-        cache_position: torch.Tensor | None = None,
-        input_block_ids: list[int] | None = None,
-        dummy_block: int | None = None,
     ):
-        padded_batch_size = None
-        # 1. Set the type
         # TODO: Does it require changing the dtype dynamically?
         input_ids = input_ids.to(torch.int64) if input_ids is not None else None
         cache_position = (
             cache_position.to(torch.int32) if cache_position is not None else None
         )
         block_tables = block_tables.to(torch.int16)
+        return input_ids, cache_position, block_tables
 
-        # 2. Adjust the shape of tensors by squeezing and padding
-        if is_prompt:
-            block_tables = block_tables.squeeze(0)
-            padded_batch_size = 1
-        else:
-            if input_block_ids is None:
-                padded_batch_size = self.decoder_batch_size
-                if input_ids is not None:
-                    request_nums = input_ids.shape[0]
-                # Select lower-bounded batch size in case of multiple decoders
-                if self.use_multiple_decoder:
-                    padded_batch_size = select_bucket_size(
-                        request_nums, self.decoder_batch_sizes
-                    )
+    def preprocess_for_prefill(
+        self,
+        block_tables: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+        cache_position: torch.Tensor | None = None,
+    ):
+        """Cast decoder inputs and reshape ``block_tables`` for a prefill step.
 
-            input_ids, cache_position, block_tables = self.pad_decoder_items(
-                input_ids,
-                cache_position,
-                block_tables,
-                input_block_ids=input_block_ids,
-                padded_batch_size=padded_batch_size,
-                dummy_block=dummy_block,
-            )
-        kwargs = {
+        Prefill processes a single sequence, so there is no batch padding and no
+        decoder-bucket selection: the returned dict carries only the cast
+        ``block_tables`` (with its leading batch dim squeezed), ``input_ids`` and
+        ``cache_position``. Callers that drive the language model from
+        ``inputs_embeds`` simply ignore ``input_ids``.
+        """
+        input_ids, cache_position, block_tables = self._cast_decoder_inputs(
+            input_ids, cache_position, block_tables
+        )
+        block_tables = block_tables.squeeze(0)
+        return {
+            "block_tables": block_tables,
+            "input_ids": input_ids,
+            "cache_position": cache_position,
+        }
+
+    def preprocess_for_decode(
+        self,
+        block_tables: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+        cache_position: torch.Tensor | None = None,
+        input_block_ids: list[int] | None = None,
+        dummy_block: int | None = None,
+    ):
+        """Cast decoder inputs and pad them to a decoder batch for a decode step.
+
+        Unlike prefill, decode runs a padded batch through one of the compiled
+        decoders, so the returned dict additionally carries ``padded_batch_size``
+        (the bucket the batch was padded to).
+        """
+        input_ids, cache_position, block_tables = self._cast_decoder_inputs(
+            input_ids, cache_position, block_tables
+        )
+
+        padded_batch_size = None
+        if input_block_ids is None:
+            padded_batch_size = self.decoder_batch_size
+            if input_ids is not None:
+                request_nums = input_ids.shape[0]
+            # Select lower-bounded batch size in case of multiple decoders
+            if self.use_multiple_decoder:
+                padded_batch_size = select_bucket_size(
+                    request_nums, self.decoder_batch_sizes
+                )
+
+        input_ids, cache_position, block_tables = self.pad_decoder_items(
+            input_ids,
+            cache_position,
+            block_tables,
+            input_block_ids=input_block_ids,
+            padded_batch_size=padded_batch_size,
+            dummy_block=dummy_block,
+        )
+        return {
             "block_tables": block_tables,
             "padded_batch_size": padded_batch_size,
             "input_ids": input_ids,
             "cache_position": cache_position,
         }
-        return kwargs
 
     def _copy_cached_kv_blocks(
         self,

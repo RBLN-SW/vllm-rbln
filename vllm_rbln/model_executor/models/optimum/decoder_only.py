@@ -52,12 +52,10 @@ class RBLNOptimumForCausalLM(
         request_nums = input_ids.shape[0]
         is_prompt = model_input.is_prompt
 
-        kwargs = self.preprocess_for_decoder(
-            is_prompt, block_tables, input_ids, cache_position, dummy_block=dummy_block
-        )
-        padded_batch_size = kwargs.pop("padded_batch_size", self.decoder_batch_size)
-
         if is_prompt:
+            kwargs = self.preprocess_for_prefill(
+                block_tables, input_ids, cache_position
+            )
             if self.model.prefill_decoder is None:
                 raise version_error
             if model_input.cached_block_tables:
@@ -69,6 +67,10 @@ class RBLNOptimumForCausalLM(
                 )
             return self.model.prefill_decoder(**kwargs).logits
         else:
+            kwargs = self.preprocess_for_decode(
+                block_tables, input_ids, cache_position, dummy_block=dummy_block
+            )
+            padded_batch_size = kwargs.pop("padded_batch_size", self.decoder_batch_size)
             self.model.decoder = self.model.decoders[padded_batch_size]
 
             logits = self.model.decoder(**kwargs).logits

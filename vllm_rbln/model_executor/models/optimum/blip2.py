@@ -68,11 +68,10 @@ class RBLNOptimumBlip2ForConditionalGeneration(
 
         request_nums = input_ids.shape[0]
 
-        kwargs = self.preprocess_for_decoder(
-            is_prompt, block_tables, input_ids, cache_position
-        )
-
         if is_prompt:
+            kwargs = self.preprocess_for_prefill(
+                block_tables, input_ids, cache_position
+            )
             block_tables = kwargs.pop("block_tables")
             cache_position = kwargs.pop("cache_position")
 
@@ -83,6 +82,7 @@ class RBLNOptimumBlip2ForConditionalGeneration(
                 block_tables=block_tables,
             ).logits
         else:
+            kwargs = self.preprocess_for_decode(block_tables, input_ids, cache_position)
             padded_batch_size = kwargs.pop("padded_batch_size", self.decoder_batch_size)
             self.model.language_model.decoder = self.model.language_model.decoders[
                 padded_batch_size

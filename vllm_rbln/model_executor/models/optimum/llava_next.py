@@ -99,9 +99,12 @@ class RBLNOptimumLlavaNextForConditionalGeneration(
 
         request_nums = input_ids.shape[0]
 
-        kwargs = self.preprocess_for_decoder(
-            is_prompt, block_tables, input_ids, cache_position
-        )
+        if is_prompt:
+            kwargs = self.preprocess_for_prefill(
+                block_tables, input_ids, cache_position
+            )
+        else:
+            kwargs = self.preprocess_for_decode(block_tables, input_ids, cache_position)
         input_ids = kwargs.pop("input_ids")
         cache_position = kwargs.pop("cache_position")
         block_tables = kwargs.pop("block_tables")
