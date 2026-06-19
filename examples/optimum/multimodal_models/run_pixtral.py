@@ -54,7 +54,7 @@ def generate_prompts(batch_size: int, model: str):
 
 def main(
     num_input_prompt: int = 4,
-    model: str = "mistralai/Pixtral-12B-2409",
+    model: str = "mistral-community/pixtral-12b",
 ):
     os.environ["VLLM_RBLN_TP_SIZE"] = "4"
     llm = LLM(model=model, block_size=4096)
