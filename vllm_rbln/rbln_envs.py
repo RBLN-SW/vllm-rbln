@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_METRICS_FILE: str = ""
     VLLM_RBLN_NUMA: bool = True
     VLLM_RBLN_SORT_BATCH: bool = False
+    VLLM_RBLN_TOK_INDIRECT: bool = False
     VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY: str = "exponential"
     VLLM_RBLN_DECODE_BATCH_BUCKET_MIN: int = 1
     VLLM_RBLN_DECODE_BATCH_BUCKET_STEP: int = 2
@@ -236,6 +237,14 @@ environment_variables = {
     ),
     "VLLM_RBLN_SORT_BATCH": (
         lambda: os.environ.get("VLLM_RBLN_SORT_BATCH", "False").lower() in ("true", "1")
+    ),
+    # Indirect-row reorder for the two large token arrays (token_ids_cpu,
+    # is_token_ids). When set, batch reorder pointer-swaps a per-slot row map
+    # instead of physically copying the [max_num_reqs, max_model_len] rows.
+    # Requires VLLM_RBLN_SORT_BATCH=1; incompatible with speculative decode.
+    "VLLM_RBLN_TOK_INDIRECT": (
+        lambda: os.environ.get("VLLM_RBLN_TOK_INDIRECT", "False").lower()
+        in ("true", "1")
     ),
     # Decode batch bucket strategy [exponential, exp, linear, manual]
     "VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY": get_decode_batch_bucket_strategy,
