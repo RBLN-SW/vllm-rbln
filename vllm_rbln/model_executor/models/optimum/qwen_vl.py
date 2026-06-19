@@ -313,6 +313,12 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         request_nums = input_ids.shape[0]
         is_prompt = model_input.is_prompt
 
+        # FIXME This should be removed in the future
+        # by moving the padding logic into model runner.
+        assert len(model_input.running_requests_ids) == request_nums, (
+            f"The number of running requests is {len(model_input.running_requests_ids)}, "
+            f"but the shape of input_ids is {input_ids.shape}")
+        
         kwargs = self.preprocess_for_decoder(
             is_prompt, block_tables, input_ids, cache_position
         )
