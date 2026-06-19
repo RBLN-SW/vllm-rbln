@@ -393,13 +393,6 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         return self.model
 
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings | dict:
-        """Vision-only encode entry point (SupportsMultiModal / EC producer).
-
-        Unlike the simple MM models (which return a list of per-image token
-        embeddings), Qwen's cacheable unit is the dict returned by encode():
-        image/video embeds + grid_thw (+ deepstack for Qwen3-VL). It is consumed
-        on the decode side by build_prefill_inputs_from_cache().
-        """
         image_input = self._parse_and_validate_image_input(**kwargs)
         video_input = self._parse_and_validate_video_input(**kwargs)
         if image_input is None and video_input is None:
@@ -421,13 +414,8 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         running_requests_ids: list[str] | None = None,
         mrope_position_deltas: dict[str, float] | None = None,
     ) -> dict:
-        """Build prefill_decoder kwargs from cached encoder outputs (EC consumer).
-
-        Reconstructs image/video embeds + grid_thw (+ deepstack) from the
-        per-feature dicts produced by embed_multimodal(), runs the merge via
-        preprocess_prefill, and stashes the rope delta in the runner-owned
-        mrope_position_deltas for the decode phase.
-        cache_position is unused (Qwen feeds positions via position_embed).
+        """
+        Build prefill_decoder kwargs from cached encoder outputs (EC consumer).
         """
         model_dtype = self.dtype
 
