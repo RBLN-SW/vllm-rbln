@@ -18,6 +18,19 @@ from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 from vllm.lora.request import LoRARequest
 
+ADAPTERS = [
+    {
+        "lora_int_id": 1,
+        "lora_name": "abliterated",
+        "lora_path": "reissbaker/llama-3.1-8b-abliterated-lora",
+    },
+    {
+        "lora_int_id": 2,
+        "lora_name": "Meta-SecAlign-8B",
+        "lora_path": "facebook/Meta-SecAlign-8B",
+    },
+]
+
 SEC_ALIGN_DATASET = [
     (
         "Write a short description about the given movie or series.",
@@ -54,8 +67,8 @@ def get_secalign_requests(
     ]
     conversation = [
         [
-            {"role": "user", "content": {prompt}},  # Trusted instruction goes here
-            {"role": "input", "content": {input_text}},
+            {"role": "user", "content": f"{prompt}"},  # Trusted instruction goes here
+            {"role": "input", "content": f"{input_text}"},
             # Untrusted data goes here.
             # No special delimiters are allowed to be here,
             # see https://github.com/facebookresearch/Meta_SecAlign/blob/main/demo.py#L23
@@ -70,27 +83,41 @@ def get_secalign_requests(
 
 def main(
     num_input_prompt: int = 3,
-    model: str = "./llama3.1-8b-ab-sec-b4",
-    lora_paths: list[str] = None,
-    lora_names: list[str] = None,
-    lora_int_ids: list[int] = None,
+    model: str = "meta-llama/Llama-3.1-8B-Instruct",
+    tensor_parallel_size: int = 4,
+    max_seq_len: int = 8192,
+    max_lora_rank: int = 64,
 ):
-    if lora_paths is None:
-        lora_paths = ["llama-3.1-8b-abliterated-lora", "Meta-SecAlign-8B"]
-    if lora_names is None:
-        lora_names = ["llama-3.1-8b-abliterated-lora", "Meta-SecAlign-8B"]
-    if lora_int_ids is None:
-        lora_int_ids = [1, 2]
+    # Compile the base model together with every LoRA adapter. optimum-rbln
+    # accepts `lora_config` as a plain dict and converts it to an
+    # RBLNLoRAConfig; each `lora_path` may be an HF Hub id or a local directory.
+    rbln_config = {
+        "tensor_parallel_size": tensor_parallel_size,
+        "max_seq_len": max_seq_len,
+        "lora_config": {
+            "adapters": ADAPTERS,
+            "max_lora_rank": max_lora_rank,
+        },
+    }
 
-    llm = LLM(model=model, enable_lora=True, max_lora_rank=64, max_loras=2)
+    llm = LLM(
+        model=model,
+        block_size=4096,
+        enable_lora=True,
+        max_lora_rank=max_lora_rank,
+        max_loras=len(ADAPTERS),
+        additional_config={"rbln_config": rbln_config},
+    )
     tokenizer = AutoTokenizer.from_pretrained(model)
 
-    assert len(lora_names) == len(lora_paths) and len(lora_paths) == len(lora_int_ids)
     conversations = []
     lora_requests = []
 
-    for lora_name, lora_path, lora_int_id in zip(lora_names, lora_paths, lora_int_ids):
-        if lora_name == "llama-3.1-8b-abliterated-lora":
+    for adapter in ADAPTERS:
+        lora_name = adapter["lora_name"]
+        lora_path = adapter["lora_path"]
+        lora_int_id = adapter["lora_int_id"]
+        if lora_name == "abliterated":
             abliterated_prompts, abliterated_requests = get_abliterated_requests(
                 num_input_prompt, lora_path, lora_int_id
             )
