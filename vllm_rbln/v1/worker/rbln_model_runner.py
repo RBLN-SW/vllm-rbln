@@ -1874,6 +1874,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         any_prefill = num_reqs_across_dp_cpu is None
         if any_prefill or not self.specialized_moe_decode:
             num_padded_tokens = self.max_num_batched_tokens
+            # In PD disaggregation (any DP rank is in prefill), all padded-decode
+            # steps share the same num_padded_tokens=max_num_batched_tokens, so
+            # routing to the max bucket avoids compiling one padded-decode model
+            # per bucket — only the max bucket's padded-decode is compiled.
+            if any_prefill and self.specialized_moe_decode:
+                batch_bucket_size = self.bucketing_manager.decode_batch_buckets[-1]
         else:
             assert num_reqs_across_dp_cpu is not None
             max_batch_size = int(torch.max(num_reqs_across_dp_cpu).item())
@@ -2281,15 +2287,28 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     batch_bucket_size,
                     query_len,
                 )
-                if self.specialized_moe_decode:
-                    self._execute_dummy_requests(
-                        so,
-                        cso,
-                        current_intermediate_tensors,
-                        num_padded_tokens=self.max_num_batched_tokens,
-                    )
-
                 self._execute_dummy_requests(so, cso, current_intermediate_tensors)
+
+        # In PD disaggregation, any_prefill=True always routes padded-decode to the
+        # max bucket (see get_dp_padding). Compile only the max-bucket padded-decode
+        # to avoid one padded-decode runtime per bucket.
+        if self.specialized_moe_decode:
+            max_decode_bucket = self.bucketing_manager.decode_batch_buckets[-1]
+            max_intermediate_tensors = self.decode_intermediate_tensors.get(
+                max_decode_bucket
+            )
+            assert max_intermediate_tensors is not None
+            logger.info(
+                "Warm-up: padded decode (batch_bucket=%d, num_padded_tokens=%d)",
+                max_decode_bucket,
+                self.max_num_batched_tokens,
+            )
+            self._execute_dummy_requests(
+                so,
+                cso,
+                max_intermediate_tensors,
+                num_padded_tokens=self.max_num_batched_tokens,
+            )
 
         # FIXME: remove this code after #474(sampler with decode batch) is merged
         # compile sampler for all possible decode batches
