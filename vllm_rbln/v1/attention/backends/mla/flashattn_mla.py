@@ -92,6 +92,41 @@ def _(q, kv_c_normed, k_pe, kv_cache, seq_idx, block_tables, scale):
     return _fake_mla_output(q, kv_c_normed)
 
 
+@torch.library.custom_op(
+    "rbln_custom_ops::sparse_attn_deepseek_mla",
+    mutates_args=["latent_cache"],
+)
+def sparse_attn_deepseek_mla_impl(
+    q_mla: torch.Tensor,  # [B, num_heads, T, qk_head_dim+rope]
+    latent_cache: torch.Tensor,  # [num_block, partition_size, 576]
+    latent_kv_c_normed: torch.Tensor,  # [B, T, kv_lora_rank] (512)
+    latent_k_pe: torch.Tensor,  # [B, T, qk_rope_head_dim] (64)
+    # naming to seq_idx? (sync)
+    kv_seq_len: torch.Tensor,
+    # TODO(kblee): remove block args? (sync)
+    block_idx: torch.Tensor,
+    block_offset: torch.Tensor,
+    block_table: torch.Tensor,
+    topk_index: torch.Tensor,  # [B, T, k]
+) -> torch.Tensor:
+    return _fake_mla_output(q_mla, latent_kv_c_normed)
+
+
+@torch.library.register_fake("rbln_custom_ops::sparse_attn_deepseek_mla")
+def _(
+    q_mla,
+    latent_cache,
+    latent_kv_c_normed,
+    latent_k_pe,
+    kv_seq_len,
+    block_idx,
+    block_offset,
+    block_table,
+    topk_index,
+):
+    return _fake_mla_output(q_mla, latent_kv_c_normed)
+
+
 # ---------------------------------------------------------------------------
 # Backend / Impl
 # ---------------------------------------------------------------------------
@@ -253,6 +288,7 @@ class RBLNFlashAttnMLAImpl(MLAAttentionImpl[RBLNFlashAttentionMetadata]):
         output: torch.Tensor | None = None,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
+        topk_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass.
 
@@ -277,6 +313,28 @@ class RBLNFlashAttnMLAImpl(MLAAttentionImpl[RBLNFlashAttentionMetadata]):
         q = torch.cat(
             [decode_ql_nope, decode_q_pe], dim=-1
         )  # [B, H, S, lora_rank+rope]
+
+        if topk_indices is not None:
+            # TODO(kblee): check DeepSeek-V3.2 sparse attn path to args shape or info
+            seq_lens = attn_metadata.seq_lens
+            slot_mapping = attn_metadata.slot_mapping
+            kv_seq_len = seq_lens.view(-1, 1)
+            # TODO(kblee): remove block's configuration after sync
+            block_idx = (slot_mapping // self.block_size).view(-1, 1).to(torch.int16)
+            block_offset = (slot_mapping % self.block_size).view(-1, 1).to(torch.int16)
+            block_table = attn_metadata.block_tables.to(torch.int16)
+            attn_output = torch.ops.rbln_custom_ops.sparse_attn_deepseek_mla(
+                q,
+                kv_cache,
+                kv_c_normed,
+                k_pe,
+                kv_seq_len,
+                block_idx,
+                block_offset,
+                block_table,
+                topk_indices,
+            )
+            return self._v_up_proj(attn_output, layer.W_UV)
 
         # Dispatch to custom kernel
         if attn_metadata.is_prefill:
