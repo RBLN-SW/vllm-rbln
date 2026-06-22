@@ -245,6 +245,7 @@ def _rbln_mla_attention_forward(
     kv_c_normed: torch.Tensor,
     k_pe: torch.Tensor,
     output_shape: torch.Size | None = None,
+    topk_indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if self.calculate_kv_scales:
         torch.ops.vllm.maybe_calc_kv_scales(q, kv_c_normed, k_pe, self.layer_name)
@@ -269,10 +270,17 @@ def _rbln_mla_attention_forward(
                 self_kv_cache,
                 attn_metadata,
                 output=output,
+                topk_indices=topk_indices,
             )
             return output
         return self.impl.forward(
-            self, q, kv_c_normed, k_pe, self_kv_cache, attn_metadata
+            self,
+            q,
+            kv_c_normed,
+            k_pe,
+            self_kv_cache,
+            attn_metadata,
+            topk_indices=topk_indices,
         )
 
     if self.attn_backend.accept_output_buffer:
