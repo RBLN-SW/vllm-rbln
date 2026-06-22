@@ -52,7 +52,9 @@ if TYPE_CHECKING:
     VLLM_RBLN_COMPILE_ONLY: bool = False
     VLLM_RBLN_USE_DEVICE_TENSOR: bool = False
     VLLM_RBLN_DISABLE_OFFLOAD: bool = False
-    VLLM_RBLN_AUTO_PORT: bool = True
+    # Default follows VLLM_RBLN_USE_DEVICE_TENSOR (see use_auto_port), so it is
+    # False unless device-tensor mode is enabled.
+    VLLM_RBLN_AUTO_PORT: bool = False
     VLLM_RBLN_ENFORCE_MODEL_FP32: bool = False
     VLLM_RBLN_NUM_RAY_NODES: int = 1
     VLLM_RBLN_PROFILER: bool = False
