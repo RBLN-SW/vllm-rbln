@@ -617,7 +617,7 @@ class RBLNEagleProposer(EagleProposer):
 
         options = {
             "compile_context": self.compile_context,
-            "tensor_parallel_size": envs.VLLM_RBLN_TP_SIZE,
+            "tensor_parallel_size": envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
             "process_group_dict": process_group_dict,
             "guard_filter_fn": torch.compiler.keep_tensor_guards_unsafe,
             "mode": "strict",

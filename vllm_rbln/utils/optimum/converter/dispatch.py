@@ -61,7 +61,7 @@ def _generate_model_path_name(
     batch_size = vllm_config.scheduler_config.max_num_seqs
     block_size = vllm_config.cache_config.block_size
     max_model_len = vllm_config.model_config.max_model_len
-    tp_size = envs.VLLM_RBLN_TP_SIZE
+    num_devices = envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK
     additional_config = vllm_config.additional_config.get("rbln_config", None)
 
     # FIXME: To avoid cache collisions, the cache key should also include
@@ -71,7 +71,7 @@ def _generate_model_path_name(
         "batch_size": batch_size,
         "block_size": block_size,
         "max_model_len": max_model_len,
-        "tp_size": tp_size,
+        "num_devices": num_devices,
     }
     if additional_config:
         config_dict["rbln_config"] = _strip_runtime_only_keys(additional_config)

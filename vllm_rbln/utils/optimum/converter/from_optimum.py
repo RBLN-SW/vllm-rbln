@@ -109,7 +109,7 @@ def sync_from_optimum(
     # Set num_blocks in cache_config based on rbln_config.json
     update_num_blocks(vllm_config, params.num_blocks)
     # Sync tensor_parallel_size in envs with optimum pre-compiled model
-    envs.VLLM_RBLN_TP_SIZE = params.tensor_parallel_size
+    envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK = params.tensor_parallel_size
 
 
 def update_num_blocks(vllm_config: VllmConfig, num_blocks: int) -> None:
