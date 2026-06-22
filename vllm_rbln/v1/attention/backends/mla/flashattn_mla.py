@@ -127,11 +127,6 @@ def _(
     return _fake_mla_output(q_mla, latent_kv_c_normed)
 
 
-# ---------------------------------------------------------------------------
-# Backend / Impl
-# ---------------------------------------------------------------------------
-
-
 @register_backend(AttentionBackendEnum.FLASH_ATTN_MLA)
 class RBLNFlashAttnMLABackend(MLACommonBackend):
     """MLA backend for RBLN."""
