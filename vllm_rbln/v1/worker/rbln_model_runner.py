@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
 from copy import copy, deepcopy
@@ -22,11 +21,7 @@ import numpy as np
 import torch
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.config.cache import CacheConfig
-from vllm.distributed.parallel_state import (
-    get_dp_group,
-    get_pp_group,
-    get_tp_group,
-)
+from vllm.distributed.parallel_state import get_pp_group
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model_loader
@@ -90,7 +85,12 @@ from vllm.v1.worker.utils import (
 )
 
 from vllm_rbln import envs
-from vllm_rbln.compilation.backends import rbln_backend, set_compile_stage
+from vllm_rbln.compilation import (
+    build_process_group_dict,
+    compile,
+    create_compile_context,
+    set_compile_stage,
+)
 from vllm_rbln.forward_context import RBLNDPMetadata, set_forward_context
 from vllm_rbln.logger import init_logger
 from vllm_rbln.utils import pad
@@ -223,9 +223,7 @@ class RBLNModelRunner:
         # TODO(RBLN): Async scheduling
 
         # NOTE(RBLN): Compilation context for marking the KV cache address as static.
-        from rebel.compile_context import CompileContext
-
-        self.compile_context = CompileContext(
+        self.compile_context = create_compile_context(
             use_weight_sharing=True, use_global_ctx=True
         )
         self.runtime_holder: list = []
@@ -1722,14 +1720,27 @@ class RBLNModelRunner:
             self.model_executable = model_wrapper
             self.compute_logits = self.model.compute_logits
         else:
-            # NOTE(RBLN): Refer to pytorch 2.5 release notes.
-            # To prevent nn.modules parameters to be modmel input, set false.
-            # If this flag is set, nn.modules parameters are treated as model input.
-            torch._dynamo.config.inline_inbuilt_nn_modules = False
-            torch._dynamo.config.cache_size_limit = 64
-
-            self.model_executable = self._compile(model_wrapper)
-            self.compute_logits = self._compile(self.model.compute_logits)
+            process_group_dict = build_process_group_dict()
+            self.model_executable = compile(
+                model_wrapper,
+                dynamic=False,
+                compile_context=self.compile_context,
+                tensor_parallel_size=envs.VLLM_RBLN_TP_SIZE,
+                process_group_dict=process_group_dict,
+                guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
+                runtime_holder=self.runtime_holder,
+                mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
+            )
+            self.compute_logits = compile(
+                self.model.compute_logits,
+                dynamic=False,
+                compile_context=self.compile_context,
+                tensor_parallel_size=envs.VLLM_RBLN_TP_SIZE,
+                process_group_dict=process_group_dict,
+                guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
+                runtime_holder=self.runtime_holder,
+                mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
+            )
 
     def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:
         """Extract Eagle3 auxiliary layer indices from speculative config."""
@@ -2371,10 +2382,6 @@ class RBLNModelRunner:
             for k, v in kv_caches.items():
                 self.compile_context.mark_static_address(v, k)
 
-        if self.speculative_config and self.speculative_config.use_eagle():
-            assert isinstance(self.drafter, RBLNEagleProposer)
-            self.drafter.initialize_kv_cache_tensors()
-
         return kv_caches
 
     def maybe_add_kv_sharing_layers_to_kv_cache_groups(
@@ -2509,38 +2516,6 @@ class RBLNModelRunner:
                 self.kv_cache_bases,
                 self.kv_cache_view_infos,
             )
-
-    def _compile(self, model: torch.nn.Module):
-        tp = get_tp_group()
-        pp = get_pp_group()
-        dp = get_dp_group()
-
-        process_group_dict = {}
-        process_group_dict[tp.device_group.group_name] = tp.ranks
-        process_group_dict[tp.cpu_group.group_name] = tp.ranks
-        process_group_dict[pp.device_group.group_name] = pp.ranks
-        process_group_dict[pp.cpu_group.group_name] = pp.ranks
-        process_group_dict[dp.device_group.group_name] = dp.ranks
-        process_group_dict[dp.cpu_group.group_name] = dp.ranks
-
-        options = {
-            "compile_context": self.compile_context,
-            "tensor_parallel_size": envs.VLLM_RBLN_TP_SIZE,
-            "process_group_dict": process_group_dict,
-            "guard_filter_fn": torch.compiler.keep_tensor_guards_unsafe,
-            "_runtime_holder": self.runtime_holder,
-        }
-        if envs.VLLM_RBLN_COMPILE_STRICT_MODE:
-            options["mode"] = "strict"
-        if not envs.VLLM_DISABLE_COMPILE_CACHE:
-            options["cache_dir"] = os.path.join(envs.VLLM_CACHE_ROOT, "rbln")
-
-        return torch.compile(
-            model,
-            backend=rbln_backend,
-            options=copy(options),
-            dynamic=False,
-        )
 
     def _determine_batch_padding(
         self,

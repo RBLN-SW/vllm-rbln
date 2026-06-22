@@ -11,15 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
-from copy import copy
 from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
-from vllm.distributed.parallel_state import get_dp_group, get_pp_group, get_tp_group
 from vllm.model_executor.models.deepseek_eagle3 import Eagle3DeepseekV2ForCausalLM
 from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
@@ -28,7 +25,10 @@ from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 import vllm_rbln.envs as envs
-from vllm_rbln.compilation.backends import rbln_backend
+from vllm_rbln.compilation import (
+    build_process_group_dict,
+    compile,
+)
 from vllm_rbln.forward_context import set_forward_context
 from vllm_rbln.logger import init_logger
 from vllm_rbln.utils import pad
@@ -59,10 +59,7 @@ class RBLNEagleProposer(EagleProposer):
         if self.supports_mm_inputs:
             raise NotImplementedError
 
-        from rebel import CompileContext
-
         self.runner = runner
-        self.compile_context = CompileContext(use_weight_sharing=True)
 
     def propose(
         self,
@@ -407,7 +404,16 @@ class RBLNEagleProposer(EagleProposer):
         ):
             self.model_executable = model_wrapper
         else:
-            self.model_executable = self._compile(model_wrapper)
+            self.model_executable = compile(
+                model_wrapper,
+                dynamic=False,
+                fullgraph=True,
+                compile_context=self.runner.compile_context,
+                tensor_parallel_size=envs.VLLM_RBLN_TP_SIZE,
+                process_group_dict=build_process_group_dict(),
+                guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
+                mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
+            )
 
     def _build_dummy_attn_metadata(
         self,
@@ -553,36 +559,6 @@ class RBLNEagleProposer(EagleProposer):
                 last_token_indices=None,
             )
 
-    def _compile(self, model):
-        TP = get_tp_group()
-        PP = get_pp_group()
-        DP = get_dp_group()
-
-        process_group_dict = {}
-        process_group_dict[TP.device_group.group_name] = TP.ranks
-        process_group_dict[TP.cpu_group.group_name] = TP.ranks
-        process_group_dict[PP.device_group.group_name] = PP.ranks
-        process_group_dict[PP.cpu_group.group_name] = PP.ranks
-        process_group_dict[DP.device_group.group_name] = DP.ranks
-        process_group_dict[DP.cpu_group.group_name] = DP.ranks
-
-        options = {
-            "compile_context": self.compile_context,
-            "tensor_parallel_size": envs.VLLM_RBLN_TP_SIZE,
-            "process_group_dict": process_group_dict,
-            "guard_filter_fn": torch.compiler.keep_tensor_guards_unsafe,
-            "mode": "strict",
-        }
-        if not envs.VLLM_DISABLE_COMPILE_CACHE:
-            options["cache_dir"] = os.path.join(envs.VLLM_CACHE_ROOT, "rbln")
-
-        return torch.compile(
-            model,
-            backend=rbln_backend,
-            options=copy(options),
-            dynamic=False,
-        )
-
     def _preprocess(
         self,
         num_reqs: int,
@@ -620,7 +596,3 @@ class RBLNEagleProposer(EagleProposer):
             target_hidden_states,
             token_indices_to_sample_padded,
         )
-
-    def initialize_kv_cache_tensors(self):
-        if not self.speculative_config.enforce_eager and envs.VLLM_RBLN_COMPILE_MODEL:
-            self.compile_context.mark_static_address(self.runner.kv_caches[-1])
