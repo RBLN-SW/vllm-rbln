@@ -66,8 +66,11 @@ def _rbln_indexer_cache_init(self, *args, **kwargs) -> None:
     _original_indexer_cache_init(self, *args, **kwargs)
     from vllm.config import get_current_vllm_config
 
-    self.layer_index = extract_layer_index(self.prefix)
     vllm_config = get_current_vllm_config()
+    self.head_dim = vllm_config.model_config.hf_text_config.index_head_dim
+    self.dtype = torch.bfloat16
+
+    self.layer_index = extract_layer_index(self.prefix)
     model_config = vllm_config.model_config
     if model_config is not None:
         start, _end = model_config.get_layers_start_end_indices(
