@@ -239,7 +239,7 @@ def _rbln_mla_attention_init(self, *args, **kwargs) -> None:
     vllm_config = get_current_vllm_config()
     parallel_config = vllm_config.parallel_config
     model_config = vllm_config.model_config
-    # >1 attn module per layer (V3.2 main MLA + indexer): main MLA gets sub=0.
+    #  >1 attention module per layer, the layer_index is base_layer * num_attn_mod + sub
     num_attn_module = rbln_num_attn_module(model_config)
     self.layer_index = rbln_extract_layer_index(self.layer_name, num_attn_module)
     start, _end = model_config.get_layers_start_end_indices(parallel_config)
