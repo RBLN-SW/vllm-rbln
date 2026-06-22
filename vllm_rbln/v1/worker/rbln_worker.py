@@ -220,7 +220,8 @@ class RBLNWorker(WorkerBase):
             self.model_runner.bucketing_manager.decode_batch_buckets_count
         )
 
-        num_runtimes = 1 + (1 + specialized_moe_decode) * decode_batch_buckets_count
+        # 1 prefill + N normal decodes + 1 padded decode (max bucket only)
+        num_runtimes = 1 + decode_batch_buckets_count + specialized_moe_decode
 
         ratio: float = 1.0
         if self.model_config.quantization is not None:

@@ -1872,36 +1872,42 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         max_tokens_per_req_across_dp: int | None = None
         any_prefill = num_reqs_across_dp_cpu is None
-        if any_prefill or not self.specialized_moe_decode:
-            num_padded_tokens = self.max_num_batched_tokens
-        else:
-            assert num_reqs_across_dp_cpu is not None
-            max_batch_size = int(torch.max(num_reqs_across_dp_cpu).item())
-            batch_bucket_size = self.bucketing_manager.find_decode_batch_bucket(
-                max_batch_size
-            )
-            assert batch_bucket_size is not None
-            # Determine max_tokens_per_req as cross-DP max of per-rank
-            # max(per-req scheduled length). When spec decode is active the
-            # caller pre-computes a pow2-rounded local value so the resulting
-            # num_padded_tokens always matches the actual padded tensor size
-            # produced by pad_speculative_draft_tokens (and aligns with the
-            # pow2 query_len set exercised during warmup).
-            if spec_decode_max_query_len is not None:
-                max_per_req_across_dp = RBLNDPMetadata.num_tokens_across_dp(
-                    spec_decode_max_query_len, dp_size, dp_rank
-                )
-                max_tokens_per_req = int(max_per_req_across_dp.max().item())
+        num_padded_tokens = self.max_num_batched_tokens
+
+        if self.specialized_moe_decode:
+            if any_prefill:
+                # PD disaggregation: all padded-decode steps share
+                # num_padded_tokens=max_num_batched_tokens, so route to the max
+                # bucket to compile padded-decode only once.
+                batch_bucket_size = self.bucketing_manager.decode_batch_buckets[-1]
             else:
-                # Pure single-token decode: ceil(num_tokens/num_reqs) suffices
-                # and is 1 for the standard case.
-                clamped_reqs = num_reqs_across_dp_cpu.clamp(min=1)
-                tokens_per_req_per_rank = (
-                    num_tokens_across_dp_cpu + clamped_reqs - 1
-                ) // clamped_reqs
-                max_tokens_per_req = int(tokens_per_req_per_rank.max().item())
-            num_padded_tokens = batch_bucket_size * max_tokens_per_req
-            max_tokens_per_req_across_dp = max_tokens_per_req
+                assert num_reqs_across_dp_cpu is not None
+                max_batch_size = int(torch.max(num_reqs_across_dp_cpu).item())
+                batch_bucket_size = self.bucketing_manager.find_decode_batch_bucket(
+                    max_batch_size
+                )
+                assert batch_bucket_size is not None
+                # Determine max_tokens_per_req as cross-DP max of per-rank
+                # max(per-req scheduled length). When spec decode is active the
+                # caller pre-computes a pow2-rounded local value so the resulting
+                # num_padded_tokens always matches the actual padded tensor size
+                # produced by pad_speculative_draft_tokens (and aligns with the
+                # pow2 query_len set exercised during warmup).
+                if spec_decode_max_query_len is not None:
+                    max_per_req_across_dp = RBLNDPMetadata.num_tokens_across_dp(
+                        spec_decode_max_query_len, dp_size, dp_rank
+                    )
+                    max_tokens_per_req = int(max_per_req_across_dp.max().item())
+                else:
+                    # Pure single-token decode: ceil(num_tokens/num_reqs) suffices
+                    # and is 1 for the standard case.
+                    clamped_reqs = num_reqs_across_dp_cpu.clamp(min=1)
+                    tokens_per_req_per_rank = (
+                        num_tokens_across_dp_cpu + clamped_reqs - 1
+                    ) // clamped_reqs
+                    max_tokens_per_req = int(tokens_per_req_per_rank.max().item())
+                num_padded_tokens = batch_bucket_size * max_tokens_per_req
+                max_tokens_per_req_across_dp = max_tokens_per_req
 
         return (
             batch_bucket_size,
@@ -2225,6 +2231,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         )
 
         # compile decode graph considering decode batch buckets
+        max_decode_bucket = self.bucketing_manager.decode_batch_buckets[-1]
         for batch_bucket_size in self.bucketing_manager.decode_batch_buckets:
             # Always-full-spec design: with sliding window padding, every
             # decode step's runtime query length is num_spec_tokens + 1
@@ -2281,15 +2288,25 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     batch_bucket_size,
                     query_len,
                 )
-                if self.specialized_moe_decode:
+                self._execute_dummy_requests(so, cso, current_intermediate_tensors)
+
+                # In PD disaggregation, any_prefill=True always routes padded-decode
+                # to the max bucket (see get_dp_padding). Compile only at max bucket
+                # to avoid one padded-decode runtime per bucket.
+                if self.specialized_moe_decode and (
+                    batch_bucket_size == max_decode_bucket
+                ):
+                    logger.info(
+                        "Warm-up: padded decode (batch_bucket=%d, num_padded=%d)",
+                        batch_bucket_size,
+                        self.max_num_batched_tokens,
+                    )
                     self._execute_dummy_requests(
                         so,
                         cso,
                         current_intermediate_tensors,
                         num_padded_tokens=self.max_num_batched_tokens,
                     )
-
-                self._execute_dummy_requests(so, cso, current_intermediate_tensors)
 
         # FIXME: remove this code after #474(sampler with decode batch) is merged
         # compile sampler for all possible decode batches
