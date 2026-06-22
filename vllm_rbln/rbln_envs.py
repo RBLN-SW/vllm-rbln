@@ -67,7 +67,6 @@ if TYPE_CHECKING:
     VLLM_RBLN_LOGITS_ALL_GATHER: bool = True
     # --- DATA PARALLEL ---
     VLLM_RBLN_DP_IMPL: str = "padded_decode"
-    VLLM_RBLN_DP_INPUT_ALL_GATHER: bool = True
     # --- MOE ---
     VLLM_RBLN_SPECIALIZE_MOE_DECODE: bool = True
     VLLM_RBLN_USE_MOE_TOKENS_MASK: bool = True
@@ -328,13 +327,6 @@ environment_variables = {
     # --- DATA PARALLEL ---
     # DP implementation, see choices in get_dp_impl
     "VLLM_RBLN_DP_IMPL": get_dp_impl,
-    # DP_INPUT_ALL_GATHER, use DP input all_gather
-    "VLLM_RBLN_DP_INPUT_ALL_GATHER": (
-        lambda: (
-            os.environ.get("VLLM_RBLN_DP_INPUT_ALL_GATHER", "True").lower()
-            in ("true", "1")
-        )
-    ),
     # --- MOE ---
     # If true, it specializes the cases where all instances are at decode stage
     "VLLM_RBLN_SPECIALIZE_MOE_DECODE": (
