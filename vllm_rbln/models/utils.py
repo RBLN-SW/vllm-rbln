@@ -15,6 +15,8 @@
 from collections.abc import Iterable
 
 import torch
+import vllm.model_executor.models.utils as _vllm_model_utils
+import vllm.v1.worker.utils as _vllm_worker_utils
 from torch import nn
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.models.utils import AutoWeightsLoader, PPMissingLayer, logger
@@ -127,3 +129,38 @@ def __auto_weights_loader__load_module(
 
 
 AutoWeightsLoader._load_module = __auto_weights_loader__load_module
+
+
+# layer_index splitting for models with >1 attention module per decoder layer
+_original_extract_layer_index = _vllm_model_utils.extract_layer_index
+
+
+def rbln_extract_layer_index(layer_name: str, num_attn_module: int = 1) -> int:
+    if num_attn_module <= 1 or "attn" not in layer_name:
+        return _original_extract_layer_index(layer_name, num_attn_module)
+
+    int_vals: list[int] = []
+    for subname in layer_name.split("."):
+        try:
+            int_vals.append(int(subname))
+        except ValueError:
+            continue
+    assert int_vals, f"layer name {layer_name} has no integer layer index"
+    base = int_vals[0]
+    sub = int_vals[1] if len(int_vals) >= 2 else int("indexer" in layer_name)
+    return base * num_attn_module + sub
+
+
+def rbln_num_attn_module(model_config) -> int:
+    """Number of KV-cache-bearing attention modules per decoder layer."""
+    hf_config = model_config.hf_config
+    if getattr(hf_config, "model_type", None) == "longcat_flash":
+        return 2
+    text_config = getattr(model_config, "hf_text_config", hf_config)
+    if hasattr(text_config, "index_topk") or hasattr(hf_config, "index_topk"):
+        return 2
+    return 1
+
+
+_vllm_worker_utils.extract_layer_index = rbln_extract_layer_index
+_vllm_model_utils.extract_layer_index = rbln_extract_layer_index

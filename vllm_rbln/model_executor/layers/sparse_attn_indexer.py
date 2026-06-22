@@ -14,7 +14,6 @@ from vllm.model_executor.models.deepseek_v2 import (
     DeepseekV32IndexerCache,
     Indexer,
 )
-from vllm.model_executor.models.utils import extract_layer_index
 
 from vllm_rbln.logger import init_logger
 from vllm_rbln.model_executor.layers.attention.attention import _resolve_kv_cache
@@ -70,13 +69,19 @@ def _rbln_indexer_cache_init(self, *args, **kwargs) -> None:
     self.head_dim = vllm_config.model_config.hf_text_config.index_head_dim
     self.dtype = torch.bfloat16
 
-    self.layer_index = extract_layer_index(self.prefix)
+    from vllm_rbln.models.utils import (
+        rbln_extract_layer_index,
+        rbln_num_attn_module,
+    )
+
     model_config = vllm_config.model_config
+    num_attn_module = rbln_num_attn_module(model_config)
+    self.layer_index = rbln_extract_layer_index(self.prefix, num_attn_module)
     if model_config is not None:
         start, _end = model_config.get_layers_start_end_indices(
             vllm_config.parallel_config
         )
-        self.layer_index -= start
+        self.layer_index -= start * num_attn_module
 
 
 def _rbln_indexer_cache_get_attn_backend(self):

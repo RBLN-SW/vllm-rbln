@@ -17,7 +17,8 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
-from vllm.model_executor.models.utils import extract_layer_index
+
+from vllm_rbln.models.utils import rbln_extract_layer_index as extract_layer_index
 
 
 def _storage_key(tensor: torch.Tensor) -> tuple[int, int]:

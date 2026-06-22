@@ -5190,9 +5190,9 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             kv_cache_view_infos,
         )
 
-        num_attn_module = (
-            2 if self.model_config.hf_config.model_type == "longcat_flash" else 1
-        )
+        from vllm_rbln.models.utils import rbln_num_attn_module
+
+        num_attn_module = rbln_num_attn_module(self.model_config)
         self.kv_cache_bases = []
         self.kv_cache_view_infos = []
         self._update_kv_cache_base_bindings(
