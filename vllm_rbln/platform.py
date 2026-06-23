@@ -444,7 +444,8 @@ class RblnPlatform(Platform):
     @classmethod
     def get_nixl_supported_devices(cls) -> dict[str, tuple[str, ...]]:
         return {
-            "rbln": ("cpu",),
+            "cpu": ("cpu", "rbln"),
+            "rbln": ("rbln", "cpu"),
         }
 
     @classmethod
