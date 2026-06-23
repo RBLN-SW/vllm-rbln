@@ -30,10 +30,7 @@ from vllm_rbln.utils.optimum.registry import (
     is_pooling_arch,
 )
 
-from .multimodal import (
-    _COMPILE_MULTIMODAL_FNS,
-    get_multimodal_cls,
-)
+from .multimodal import _COMPILE_MULTIMODAL_FNS
 
 
 def _deep_merge(base: dict, overrides: dict) -> None:
@@ -51,6 +48,24 @@ def _deep_merge(base: dict, overrides: dict) -> None:
             base[key] = value
 
 
+def _sync_submodule_tp_with_device(rbln_config: dict) -> None:
+    """Align each submodule's ``tensor_parallel_size`` with its device count.
+
+    A submodule (e.g. ``visual``) is configured on a fixed set of devices via
+    its nested ``device`` list, but optimum-rbln requires its
+    ``tensor_parallel_size`` to match that device count. The user only supplies
+    ``device``, so we derive ``tensor_parallel_size`` from ``len(device)`` here.
+    The top-level config is left untouched (its TP is driven by
+    ``VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK``).
+    """
+    for value in rbln_config.values():
+        if not isinstance(value, dict):
+            continue
+        device = value.get("device")
+        if isinstance(device, list) and device:
+            value["num_devices"] = len(device)
+
+
 @dataclass
 class RBLNCompileSpec:
     """Resolved (model_cls, rbln_config) ready to feed optimum-rbln."""
@@ -66,23 +81,35 @@ class RBLNCompileSpec:
         batch_size: int,
         block_size: int,
         max_model_len: int,
-        tp_size: int,
+        num_devices: int,
         rbln_overrides: dict[str, Any] | None = None,
     ) -> "RBLNCompileSpec":
         """Build a compile spec from vllm-rbln inputs, dispatched by architecture."""
         if is_generation_arch(config):
-            spec = cls._for_decoder(batch_size, block_size, max_model_len, tp_size)
+            spec = cls._for_decoder(batch_size, block_size, max_model_len, num_devices)
         elif is_pooling_arch(config):
             spec = cls._for_pooling(
-                config, batch_size, block_size, max_model_len, tp_size
+                config,
+                batch_size,
+                block_size,
+                max_model_len,
+                num_devices,
             )
         elif is_multi_modal(config):
             spec = cls._for_multimodal(
-                config, batch_size, block_size, max_model_len, tp_size
+                config,
+                batch_size,
+                block_size,
+                max_model_len,
+                num_devices,
             )
         elif is_enc_dec_arch(config):
             spec = cls._for_enc_dec(
-                config, batch_size, block_size, max_model_len, tp_size
+                config,
+                batch_size,
+                block_size,
+                max_model_len,
+                num_devices,
             )
         else:
             architectures = getattr(config, "architectures", [])
@@ -94,6 +121,12 @@ class RBLNCompileSpec:
         # so we don't silently overwrite compile-critical fields.
         if rbln_overrides:
             _deep_merge(spec.rbln_config, rbln_overrides)
+
+        # A submodule's tensor_parallel_size must match its device count.
+        # The user only specifies ``device`` per submodule, so derive the
+        # submodule's tensor_parallel_size from the number of devices assigned
+        # to it (e.g. ``visual.device``); falls back to the merged default.
+        _sync_submodule_tp_with_device(spec.rbln_config)
         return spec
 
     @classmethod
@@ -102,10 +135,10 @@ class RBLNCompileSpec:
         batch_size: int,
         block_size: int,
         max_model_len: int,
-        tp_size: int,
+        num_devices: int,
     ) -> "RBLNCompileSpec":
         rbln_config: dict[str, Any] = {
-            "tensor_parallel_size": tp_size,
+            "num_devices": num_devices,
             "batch_size": batch_size,
             "max_seq_len": max_model_len,
         }
@@ -121,14 +154,14 @@ class RBLNCompileSpec:
         batch_size: int,
         block_size: int,
         max_model_len: int,
-        tp_size: int,
+        num_devices: int,
     ) -> "RBLNCompileSpec":
         _, model_cls_name = get_rbln_model_info(config)
         model_cls = getattr(optimum.rbln, model_cls_name)
         assert model_cls is not None
 
         rbln_config: dict[str, Any] = {
-            "tensor_parallel_size": tp_size,
+            "num_devices": num_devices,
             "batch_size": batch_size,
             "max_seq_len": max_model_len,
         }
@@ -147,19 +180,20 @@ class RBLNCompileSpec:
         batch_size: int,
         block_size: int,
         max_model_len: int,
-        tp_size: int,
+        num_devices: int,
     ) -> "RBLNCompileSpec":
-        model_name, _ = get_rbln_model_info(config)
+        model_name, model_cls_name = get_rbln_model_info(config)
         compile_fn = _COMPILE_MULTIMODAL_FNS.get(model_name)
         if compile_fn is None:
             raise ValueError(
                 f"Unknown multimodal model alias: {model_name}. "
                 f"Supported aliases: {sorted(_COMPILE_MULTIMODAL_FNS.keys())}"
             )
-        architectures = getattr(config, "architectures", [])
+        model_cls = getattr(optimum.rbln, model_cls_name)
+        assert model_cls is not None
         return cls(
-            model_cls=get_multimodal_cls(architectures[0]),
-            rbln_config=compile_fn(batch_size, max_model_len, block_size, tp_size),
+            model_cls=model_cls,
+            rbln_config=compile_fn(batch_size, max_model_len, block_size, num_devices),
         )
 
     @classmethod
@@ -169,7 +203,7 @@ class RBLNCompileSpec:
         batch_size: int,
         block_size: int,
         max_model_len: int,
-        tp_size: int,
+        num_devices: int,
     ) -> "RBLNCompileSpec":
         architectures = getattr(config, "architectures", [])
         assert architectures[0] == "WhisperForConditionalGeneration"
@@ -177,14 +211,15 @@ class RBLNCompileSpec:
         assert block_size == max_model_len, (
             "block_size must be equal to max_model_len for Whisper models."
         )
-        assert max_model_len == config.max_length, (
+        assert max_model_len == config.max_target_positions, (
             f"max_model_len ({max_model_len}) must match the Whisper model's "
-            f"max_length ({config.max_length}) from the HuggingFace config."
+            f"max_target_positions ({config.max_target_positions}) "
+            "from the HuggingFace config."
         )
         return cls(
             model_cls=RBLNAutoModelForSpeechSeq2Seq,
             rbln_config={
-                "tensor_parallel_size": tp_size,
+                "num_devices": num_devices,
                 "batch_size": batch_size,
                 "token_timestamps": False,
             },

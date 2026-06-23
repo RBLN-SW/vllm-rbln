@@ -29,6 +29,7 @@ class RBLNKVCacheCoordinator(UnitaryKVCacheCoordinator):
         self,
         kv_cache_config: KVCacheConfig,
         max_model_len: int,
+        max_num_batched_tokens: int,
         use_eagle: bool,
         enable_caching: bool,
         enable_kv_cache_events: bool,
@@ -51,11 +52,18 @@ class RBLNKVCacheCoordinator(UnitaryKVCacheCoordinator):
             is_encoder_decoder=is_encoder_decoder,
         )
 
-        # Needs special handling for find_longest_cache_hit if eagle is enabled
-        self.use_eagle = use_eagle
+        # EAGLE spec decode is not supported on the optimum path. The inherited
+        # find_longest_cache_hit still reads eagle_group_ids (vllm 0.22
+        # replaced the old use_eagle flag), so keep it empty
+        # (empty set == eagle disabled for every group).
+        assert not use_eagle, "EAGLE is not supported on the RBLN optimum path"
+        self.eagle_group_ids: set[int] = set()
+
         self.single_type_managers = tuple(
             get_manager_for_kv_cache_spec(
                 kv_cache_spec=kv_cache_group.kv_cache_spec,
+                max_num_batched_tokens=max_num_batched_tokens,
+                max_model_len=max_model_len,
                 block_pool=self.block_pool,
                 enable_caching=enable_caching,
                 kv_cache_group_id=i,

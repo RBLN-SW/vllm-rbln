@@ -21,17 +21,27 @@ from vllm.model_executor.models.blip2 import (
     Blip2ImageInputs,
     Blip2ImagePixelInputs,
 )
-from vllm.model_executor.models.interfaces import SupportsMultiModal
 
 from .base import ModelInputForRBLN
-from .model_base import RBLNOptimumDecoderMixin, RBLNOptimumModelBase
+from .model_base import (
+    RBLNOptimumDecoderMixin,
+    RBLNOptimumModelBase,
+    RBLNOptimumMultimodalMixin,
+)
 
 logger = init_logger(__name__)
 
 
 class RBLNOptimumBlip2ForConditionalGeneration(
-    RBLNOptimumModelBase, RBLNOptimumDecoderMixin, SupportsMultiModal
+    RBLNOptimumModelBase, RBLNOptimumMultimodalMixin, RBLNOptimumDecoderMixin
 ):
+    @classmethod
+    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
+        if modality.startswith("image"):
+            return None
+
+        raise ValueError("Only image modality is supported")
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -56,10 +66,6 @@ class RBLNOptimumBlip2ForConditionalGeneration(
 
         is_prompt = model_input.is_prompt
 
-        image_input = None
-        pixel_values = None
-
-        padded_batch_size = self.decoder_batch_size
         request_nums = input_ids.shape[0]
 
         kwargs = self.preprocess_for_decoder(
@@ -67,21 +73,16 @@ class RBLNOptimumBlip2ForConditionalGeneration(
         )
 
         if is_prompt:
-            if model_input.multi_modal_kwargs:
-                image_input = self._parse_and_validate_image_input(
-                    **model_input.multi_modal_kwargs
-                )
-                if image_input is not None:
-                    assert image_input["type"] == "pixel_values"
-                    pixel_values = image_input["data"]
-
             block_tables = kwargs.pop("block_tables")
             input_ids = kwargs.pop("input_ids")
             cache_position = kwargs.pop("cache_position")
 
-            inputs_embeds = self.model._preprocess_prefill(
-                pixel_values=pixel_values,
-                input_ids=input_ids,
+            multimodal_embeddings = self.embed_multimodal(
+                **(model_input.multi_modal_kwargs or {})
+            )
+            inputs_embeds = self.embed_input_ids(
+                input_ids,
+                multimodal_embeddings or None,
             )
             logits = self.model.language_model.prefill_decoder(
                 inputs_embeds=inputs_embeds,
@@ -98,6 +99,20 @@ class RBLNOptimumBlip2ForConditionalGeneration(
         if not is_prompt:
             logits = logits[:request_nums]
         return logits
+
+    def get_language_model(self):
+        return self.model.language_model
+
+    def _process_image_input(self, image_input: Blip2ImageInputs) -> list[torch.Tensor]:
+        if image_input["type"] == "image_embeds":
+            return list(image_input["data"])
+
+        # Vision model + Q-Former + language projection, compiled by
+        # optimum-rbln.
+        pixel_values = image_input["data"]
+        # (num_images, num_query_tokens, text_hidden_size)
+        image_features = self.model.get_image_features(pixel_values=pixel_values)
+        return list(image_features)
 
     def _parse_and_validate_image_input(self, **kwargs: Any) -> Blip2ImageInputs | None:
         pixel_values = kwargs.pop("pixel_values", None)

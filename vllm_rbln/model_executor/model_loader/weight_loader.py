@@ -34,8 +34,6 @@ from vllm.model_executor.models import (
 from vllm.model_executor.models.deepseek_v2 import get_spec_layer_idx_from_weight_name
 from vllm.model_executor.models.utils import is_pp_missing_parameter
 
-from vllm_rbln.model_executor.layers.fused_moe.shared_fused_moe import SharedFusedMoE
-
 logger = init_logger(__name__)
 
 # Following isort, docstring requires a dummy line
@@ -474,14 +472,10 @@ def load_deepseek_v2_weights(
 
     # Params for weights, fp8 weight scales, fp8 activation scales
     # (param_name, weight_name, expert_id, shard_id)
-    expert_params_mapping = SharedFusedMoE.make_expert_params_mapping(
-        model=self,
-        ckpt_gate_proj_name="gate_proj",
-        ckpt_down_proj_name="down_proj",
-        ckpt_up_proj_name="up_proj",
-        num_experts=self.config.n_routed_experts,
-        num_redundant_experts=self.num_redundant_experts,
-    )
+    # vLLM 0.22: FusedMoE.make_expert_params_mapping now requires a leading
+    # `model` arg; use the model's own get_expert_mapping() (matches upstream
+    # DeepseekV2ForCausalLM.load_weights and the qwen2/qwen3 loaders below).
+    expert_params_mapping = self.get_expert_mapping()
 
     params_dict = dict(self.named_parameters())
     loaded_params: set[str] = set()
@@ -605,15 +599,16 @@ def load_llama4_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> se
         (".gate_up_proj", ".up_proj", 1),
     ]
     fused_experts_params = False
+    # vLLM 0.22: make_expert_params_mapping gained a leading `model` arg.
     expert_params_mapping = FusedMoE.make_expert_params_mapping(
-        model=self,
+        self,
         ckpt_gate_proj_name="gate_proj",
         ckpt_down_proj_name="down_proj",
         ckpt_up_proj_name="up_proj",
         num_experts=self.num_experts,
     )
     expert_params_mapping_fused = FusedMoE.make_expert_params_mapping(
-        model=self,
+        self,
         ckpt_gate_proj_name="gate_up_proj",
         ckpt_down_proj_name="down_proj",
         ckpt_up_proj_name="gate_up_proj",

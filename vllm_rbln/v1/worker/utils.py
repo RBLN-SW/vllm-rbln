@@ -19,16 +19,51 @@ import platform
 from collections import defaultdict
 from collections.abc import Callable
 
+import numpy as np
 import torch
 from vllm.config import ModelConfig, ParallelConfig
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.platforms import CpuArchEnum, current_platform
-from vllm.platforms.cpu import CpuPlatform, LogicalCPUInfo
+from vllm.utils.cpu_resource_utils import (
+    LogicalCPUInfo,
+    get_allowed_cpu_list,
+    get_visible_memory_node,
+)
+from vllm.v1.worker.block_table import MultiGroupBlockTable
 
 import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+def compute_slot_mapping_cpu(
+    block_table: MultiGroupBlockTable,
+    req_indices: np.ndarray,
+    positions_np: np.ndarray,
+    total_num_scheduled_tokens: int,
+) -> None:
+    """Compute slot_mapping on CPU and sync to device.
+
+    vLLM 0.19 replaced the numpy slot_mapping path with a Triton kernel that
+    RBLN (CPU) cannot dispatch, so we always compute via numpy and push to
+    device ourselves. The same code works on 0.18 since all referenced
+    buffer attributes (``block_table.np``, ``slot_mapping.np``,
+    ``copy_to_gpu``) exist on both versions.
+    """
+    num_tokens = req_indices.shape[0]
+    for bt in block_table.block_tables:
+        block_table_indices = (
+            req_indices * bt.max_num_blocks_per_req + positions_np // bt.block_size
+        )
+        block_numbers = bt.block_table.np.ravel()[block_table_indices]
+        block_offsets = positions_np % bt.block_size
+        np.add(
+            block_numbers * bt.block_size,
+            block_offsets,
+            out=bt.slot_mapping.np[:num_tokens],
+        )
+        bt.slot_mapping.copy_to_gpu(total_num_scheduled_tokens)
 
 
 def estimate_model_kernel_size(
@@ -147,12 +182,12 @@ def estimate_available_memory(
         ATOM_DRAM_NBYTES = 16 * 2**30
         ATOM_SYS_DRAM_NBYTES = 288 * 2**20
         # consider RSD size for ATOM
-        rsd_size = envs.VLLM_RBLN_TP_SIZE
+        rsd_size = envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK
         available_dram_bytes = rsd_size * (ATOM_DRAM_NBYTES - ATOM_SYS_DRAM_NBYTES)
         # ATOM - basic data type fp16
         default_bits_per_param = 16
     elif "cr" in device_name:
-        assert envs.VLLM_RBLN_TP_SIZE == 1
+        assert envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK == 1
         # REBEL - RBLN-CR[xxx]
         # REBEL DRAM - 144GB (quad chips, chiplet) - system(4G) = 140GB
         REBEL_DRAM_NBYTES = 144 * 2**30
@@ -220,6 +255,17 @@ def estimate_available_memory(
     rsd_replicas = max(1, rsd_size // num_key_value_heads)
     available_dram_bytes = available_dram_bytes // rsd_replicas
 
+    if "cr" in device_name and num_key_value_heads % rsd_size != 0:
+        # KV heads are sharded across chiplets, so when they do not divide
+        # evenly a chiplet holds ceil(H / N) heads while owning only 1/N of
+        # DRAM. The bottleneck chiplet limits the usable KV pool to
+        # H / (N * ceil(H / N)) of the uniform estimate (e.g. 10 heads on 4
+        # chiplets -> 10/12), otherwise the per-chiplet allocator OOMs.
+        heads_per_chiplet = math.ceil(num_key_value_heads / rsd_size)
+        available_dram_bytes = (available_dram_bytes * num_key_value_heads) // (
+            rsd_size * heads_per_chiplet
+        )
+
     check_oom(available_dram_bytes)
 
     return available_dram_bytes
@@ -242,7 +288,9 @@ def get_autobind_cpu_ids(
     Returns:
         Comma-separated string of CPU IDs, or "all" or "nobind".
     """
-    allowed_numa_nodes, logical_cpu_list = CpuPlatform.get_allowed_cpu_core_node_list()
+    # NOTE: It should be checked.
+    allowed_numa_nodes = get_visible_memory_node()
+    logical_cpu_list = get_allowed_cpu_list()
 
     # Calculate rank_across_dp for CPU binding
     # This ensures different DP groups get different CPU allocations

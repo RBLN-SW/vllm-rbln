@@ -708,7 +708,12 @@ def _fused_moe_init_with_all2all(self, *args, **kwargs):
 
 
 FusedMoE.__init__ = _fused_moe_init_with_all2all
-FusedMoE.forward_oot = fused_moe_forward_rbln
+# vLLM 0.22: FusedMoE is a PluggableLayer (no more CustomOp.forward_oot dispatch).
+# Its forward delegates to self.runner.forward; we override forward directly to run
+# the RBLN routed-expert path instead. This returns the routed (fused) output only;
+# shared-expert combine and routed_scaling_factor are handled at the model level
+# (see vllm_rbln/models/*.py), since those transforms are model-specific.
+FusedMoE.forward = fused_moe_forward_rbln
 
 logger.info("[RBLN] fused moe, RBLN moe custom kernel")
 UnquantizedFusedMoEMethod.apply = unquantized_fused_moe_method_custom
