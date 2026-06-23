@@ -43,7 +43,6 @@ ENV = {
     "VLLM_RBLN_USE_VLLM_MODEL": "1",
     "VLLM_DISABLE_COMPILE_CACHE": "1",
     "VLLM_RBLN_COMPILE_STRICT_MODE": "1",
-    "RBLN_WEIGHT_FREE": "0",
 }
 
 # (prompt, expected substring) pairs verified by greedy decoding.
@@ -53,6 +52,7 @@ PROMPTS = [
 ]
 
 
+@pytest.mark.CR03
 def test_weight_only_fp8_greedy_generation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
