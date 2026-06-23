@@ -47,10 +47,70 @@ class RBLNSchedulerOutput(SchedulerOutput):
     prefix caching."""
 
     kv_cache_copy_ops: list[KVCacheCopyOp] = field(default_factory=list)
+    # {kv_cache_group_index: {req_id: scratch_block_id}} for the scratch+stable SWA path.
+    # The scratch block is held off req_to_blocks so it needs its own channel to the
+    # metadata builder; hybrid models have one SWA group per layer, hence keyed by group.
+    swa_scratch_block_ids: dict[int, dict[str, int]] = field(default_factory=dict)
 
 
 def is_prefill(request: Request) -> bool:
     return request.num_computed_tokens < request.num_tokens - 1
+
+
+def _collect_swa_scratch_block_ids(kv_cache_manager) -> dict[int, dict[str, int]]:
+    """Per-group, per-request scratch block id for scratch+stable SWA groups.
+
+    Returns ``{kv_cache_group_index: {req_id: scratch_block_id}}``. Hybrid models have
+    one SWA group *per sliding-window layer*, each with its own RBLNScratchStableSWAManager
+    and its own scratch block; the result MUST be keyed by group so the metadata builder
+    uses the scratch block that the group's own KV cache owns (keying by req_id alone
+    collapses all groups onto one block -> cross-layer corruption).
+
+    ``coordinator.single_type_managers[i]`` corresponds to ``kv_cache_groups[i]``, the same
+    index the runner iterates, so the runner can look up its group directly. Works for both
+    the upstream KVCacheManager and RBLNKVCacheManager (both have ``.coordinator``).
+    """
+    # Imported lazily to avoid a circular import at module load.
+    from vllm_rbln.v1.kv_cache import RBLNScratchStableSWAManager
+
+    coordinator = getattr(kv_cache_manager, "coordinator", None)
+    if coordinator is None:
+        return {}
+    out: dict[int, dict[str, int]] = {}
+    for gi, mgr in enumerate(coordinator.single_type_managers):
+        if isinstance(mgr, RBLNScratchStableSWAManager):
+            out[gi] = {
+                req_id: blk.block_id for req_id, blk in mgr.scratch_blocks.items()
+            }
+    return out
+
+
+def _drain_swa_seed_copy_ops(kv_cache_manager) -> "list[KVCacheCopyOp]":
+    """Drain pending prefix-cache-hit scratch-seed copies from scratch+stable SWA groups.
+
+    Returns KVCacheCopyOps (stable->scratch, whole-block) tagged with the owning group id.
+    Block ids are globally unique (one shared block pool), so the runner's copy-across-all-
+    layers is safe. Works for both the upstream and RBLN managers (both have ``.coordinator``).
+    """
+    from vllm_rbln.v1.kv_cache import RBLNScratchStableSWAManager
+
+    coordinator = getattr(kv_cache_manager, "coordinator", None)
+    if coordinator is None:
+        return []
+    ops: list[KVCacheCopyOp] = []
+    for mgr in coordinator.single_type_managers:
+        if isinstance(mgr, RBLNScratchStableSWAManager):
+            for src, dst, num_tokens in mgr.drain_pending_seed_copies():
+                ops.append(
+                    KVCacheCopyOp(
+                        group_id=mgr.kv_cache_group_id,
+                        src_block_id=src,
+                        dst_block_id=dst,
+                        num_tokens=num_tokens,
+                        is_scratch_seed=True,
+                    )
+                )
+    return ops
 
 
 class RBLNScheduler(Scheduler):
@@ -886,6 +946,22 @@ class RBLNScheduler(Scheduler):
             scheduler_output.kv_cache_copy_ops = (
                 self.kv_cache_manager.drain_pending_copy_ops()
             )
+        # scratch+stable SWA: prefix-cache-HIT scratch-seed copies (stable->scratch). These
+        # run through the same KVCacheCopyOp channel the runner already processes; collected
+        # from the coordinator so they work regardless of whether RBLNKVCacheManager is active.
+        seed_copy_ops = _drain_swa_seed_copy_ops(self.kv_cache_manager)
+        if seed_copy_ops:
+            scheduler_output.kv_cache_copy_ops = (
+                scheduler_output.kv_cache_copy_ops + seed_copy_ops
+            )
+        # scratch+stable SWA: per-request scratch block id for the metadata builder.
+        # The scratch blocks live in the coordinator's single_type_managers, which exists
+        # on the upstream KVCacheManager too -- so this must run regardless of whether the
+        # RBLN sub-block manager is active (it is NOT when VLLM_RBLN_SUB_BLOCK_CACHE=false,
+        # e.g. hybrid models), otherwise every request defaults to scratch block 0.
+        scheduler_output.swa_scratch_block_ids = _collect_swa_scratch_block_ids(
+            self.kv_cache_manager
+        )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store

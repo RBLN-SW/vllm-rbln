@@ -138,7 +138,10 @@ from vllm_rbln.v1.attention.kv_cache_bindings import (
     build_kv_cache_forward_context_kwargs,
     validate_shared_attention_kv_cache_contiguity,
 )
-from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
+from vllm_rbln.v1.kv_cache import (
+    RBLNScratchStableSWASpec,
+    RBLNSlidingWindowSpec,
+)
 from vllm_rbln.v1.sample import RBLNSampler
 from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
@@ -1350,6 +1353,11 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         assert batch_bucket_size is not None
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
+        # Step-scoped cache for group-invariant RBLNFlashAttentionMetadataBuilder.build()
+        # work (seq_idx / partitioned seq_lens / num_computed). build() runs once per KV
+        # cache group; this lets groups sharing a block_size reuse the computation (esp.
+        # the hot `repeat`) instead of recomputing it per group. Fresh per step.
+        swa_step_invariant_cache: dict = {}
         for kv_cache_group_id, kv_cache_group_spec in enumerate(
             self.kv_cache_config.kv_cache_groups
         ):
@@ -1430,6 +1438,26 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     extra_attn_metadata_args["positions"] = self.positions.cpu
                     extra_attn_metadata_args["batch_pad"] = batch_bucket_size
                     extra_attn_metadata_args["is_prefill"] = is_prefill_phase
+                    extra_attn_metadata_args["step_cache"] = swa_step_invariant_cache
+                    # NOTE (sgwon): For scratch+stable SWA, per-batch-row scratch block ids, aligned with
+                    # the block-table rows (req order - this is important we need to order by input_batch_req_ids 
+                    # order, which is how the block table is also ordered). The scratch block lives off 
+                    # req_to_blocks, so it is plumbed through this separate channel. The map is keyed by kv-cache 
+                    # group index because hybrid models have one SWA group per layer, each owning a distinct scratch block.
+                    if isinstance(
+                        kv_cache_group_spec.kv_cache_spec, RBLNScratchStableSWASpec
+                    ):
+                        scratch_map = getattr(self, "_swa_scratch_block_ids", {})
+                        group_scratch = scratch_map.get(kv_cache_group_id, {})
+                        req_ids = self.input_batch.req_ids
+                        scratch_ids = torch.tensor(
+                            [
+                                group_scratch.get(req_ids[i], 0)
+                                for i in range(num_reqs)
+                            ],
+                            dtype=torch.int32,
+                        )
+                        extra_attn_metadata_args["swa_scratch_block_ids"] = scratch_ids
                 attn_metadata_i = builder.build(
                     common_prefix_len=common_prefix_len,
                     common_attn_metadata=common_attn_metadata,
@@ -2781,20 +2809,50 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self,
         copy_ops: "list[KVCacheCopyOp]",
     ) -> None:
-        if (
+        if not copy_ops:
+            return
+        eager = (
             envs.VLLM_RBLN_USE_DEVICE_TENSOR
             or self.model_config.enforce_eager
             or not envs.VLLM_RBLN_COMPILE_MODEL
-        ):
-            for op in copy_ops:
-                for kv_cache in self.kv_caches:
-                    kv_cache[:, op.dst_block_id, :, :, : op.num_tokens, :] = kv_cache[
-                        :, op.src_block_id, :, :, : op.num_tokens, :
-                    ]
-        else:
+        )
+
+        if not eager:
+            # Default compiled path: the runtime owns the KV buffers; use the
+            # native offset-0 D2D copy. Offset (straddle) copies are gated off
+            # upstream for this path (no offset-capable D2D copy is available).
             runtime = self.runtime_holder[0]
             for op in copy_ops:
-                runtime._copy_kv_cache(op.src_block_id, op.dst_block_id, op.num_tokens)
+                if op.src_offset or op.dst_offset:
+                    raise NotImplementedError(
+                        "offset KV-cache copy (Case 2 straddle) is unsupported "
+                        "in compiled mode; needs an offset-capable D2D copy"
+                    )
+                runtime._copy_kv_cache(
+                    op.src_block_id, op.dst_block_id, op.num_tokens
+                )
+            return
+
+        # NOTE (sgwon): I added this path because of scratch stable SWA. We enter
+        # this path if we have sub block caching and we have a straddle prefix hit (Case 2).
+        # In device tensor mode, the self.kv_caches ARE the device tensors, so a
+        # slice-assign writes device memory directly. Use a single-block SLICE
+        # `[:, b:b+1]`, NOT fancy/tensor indexing `[:, idx]`: fancy indexing is a
+        # gather/scatter that falls off the device v2v fast path (host bounce),
+        # while a single-block contiguous slice stays a fast device-to-device copy.
+        for op in copy_ops:
+            sb, db = op.src_block_id, op.dst_block_id
+            s0, d0, n = op.src_offset, op.dst_offset, op.num_tokens
+            if s0 or d0:
+                # Straddle: contiguous single-block partial-window slice.
+                for kv_cache in self.kv_caches:
+                    kv_cache[:, db : db + 1, :, :, d0 : d0 + n, :] = kv_cache[
+                        :, sb : sb + 1, :, :, s0 : s0 + n, :
+                    ]
+            else:
+                # Offset-0 seed (Case 1): contiguous whole-block slice (mask hides the tail).
+                for kv_cache in self.kv_caches:
+                    kv_cache[:, db : db + 1] = kv_cache[:, sb : sb + 1]
 
     @staticmethod
     def _is_kv_connector_warm_up_phase(scheduler_output: "SchedulerOutput") -> bool:
@@ -2840,6 +2898,14 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with record_function_or_nullcontext("Preprocess"):
             self._update_states(scheduler_output)
+
+            # scratch+stable SWA: stash per-request scratch block ids for the metadata
+            # builder (the scratch block is off req_to_blocks -> separate channel).
+            self._swa_scratch_block_ids = (
+                scheduler_output.swa_scratch_block_ids
+                if isinstance(scheduler_output, RBLNSchedulerOutput)
+                else {}
+            )
 
             # Process sub-block KV cache copy operations before the forward
             # pass so that partially cached blocks are populated.
@@ -4279,7 +4345,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 kv_cache_spec = next(iter(kv_cache_spec.kv_cache_specs.values()))
             if isinstance(kv_cache_spec, EncoderOnlyAttentionSpec):
                 continue
-            elif isinstance(kv_cache_spec, RBLNSlidingWindowSpec):
+            elif isinstance(
+                kv_cache_spec,
+                (RBLNSlidingWindowSpec, RBLNScratchStableSWASpec),
+            ):
+                # block_size == sliding_window for these SWA specs, so the kernel
+                # block size is the window.
                 kernel_block_sizes.append(kv_cache_spec.sliding_window)
             elif isinstance(kv_cache_spec, AttentionSpec):
                 # This is an attention backend that supports virtual
@@ -4666,13 +4737,22 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             kv_cache_config: Configuration for the KV cache, including the KV
             cache size of each layer
         """
-        if envs.VLLM_RBLN_SUB_BLOCK_CACHE and (
-            len(kv_cache_config.kv_cache_groups) > 1
+        if (
+            envs.VLLM_RBLN_SUB_BLOCK_CACHE
+            and len(kv_cache_config.kv_cache_groups) > 1
+            and not envs.VLLM_RBLN_SWA_SCRATCH_STABLE
         ):
+            # Multi-group sub-block caching is validated ONLY for the
+            # scratch+stable SWA hybrid (full-attn + per-layer SWA groups);
+            # the manager already builds per-group state and the SWA groups
+            # seed their scratch on a sub-block hit. KV-events + multi-group
+            # is still rejected by RBLNKVCacheManager itself. Other untested
+            # multi-group combos remain gated here.
             raise NotImplementedError(
                 "Sub-block prefix caching does not support "
                 "multi-group KV caches yet.  "
-                "Set VLLM_RBLN_SUB_BLOCK_CACHE=false to disable."
+                "Set VLLM_RBLN_SUB_BLOCK_CACHE=false to disable, "
+                "or enable VLLM_RBLN_SWA_SCRATCH_STABLE for the SWA hybrid."
             )
 
         kv_cache_config = deepcopy(kv_cache_config)

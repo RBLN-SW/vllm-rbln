@@ -380,9 +380,15 @@ class RblnPlatform(Platform):
 
         hf_config = vllm_config.model_config.hf_config
 
+        # The scratch+stable (VLLM_RBLN_SWA_SCRATCH_STABLE) SWA path makes
+        # sliding-window blocks prefix-cacheable, so do NOT disable caching for it.
+        swa_caching_supported = envs.VLLM_RBLN_SWA_SCRATCH_STABLE
+
         if envs.VLLM_RBLN_USE_VLLM_MODEL:
-            if getattr(hf_config, "sliding_window", None) is not None and getattr(
-                hf_config, "use_sliding_window", True
+            if (
+                not swa_caching_supported
+                and getattr(hf_config, "sliding_window", None) is not None
+                and getattr(hf_config, "use_sliding_window", True)
             ):
                 cls._disable_prefix_caching(vllm_config, "sliding window models")
 
@@ -397,8 +403,10 @@ class RblnPlatform(Platform):
                 cls._disable_prefix_caching(vllm_config, "multimodal models")
             elif is_pooling_arch(hf_config):
                 cls._disable_prefix_caching(vllm_config, "pooling models")
-            elif getattr(hf_config, "sliding_window", None) is not None and getattr(
-                hf_config, "use_sliding_window", True
+            elif (
+                not swa_caching_supported
+                and getattr(hf_config, "sliding_window", None) is not None
+                and getattr(hf_config, "use_sliding_window", True)
             ):
                 cls._disable_prefix_caching(vllm_config, "sliding window models")
 

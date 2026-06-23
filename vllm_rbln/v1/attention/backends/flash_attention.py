@@ -38,6 +38,7 @@ import vllm_rbln.rbln_envs as envs
 import vllm_rbln.utils as rbln_utils
 from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.attention.kv_cache_bindings import KVCacheViewInfo
+from vllm_rbln.v1.kv_cache import RBLNScratchStableSWASpec
 
 logger = init_logger(__name__)
 
@@ -992,6 +993,79 @@ class RBLNAttentionBackend(AttentionBackend):
         raise RuntimeError("swap_blocks is not used for the RBLN backend.")
 
 
+def scratch_stable_index_tensors(
+    num_computed_tokens: torch.Tensor,
+    query_lens: torch.Tensor,
+    stable_block_tables: torch.Tensor,
+    scratch_block_ids: torch.Tensor,
+    window_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per-request index tensors that drive the scratch+stable SWA kernels.
+
+    With ``block_size == window_size == W``, for a request with ``n`` computed tokens and a
+    chunk of ``query_len`` new tokens:
+
+        cache_seq_len   = min(n, W)          # tokens currently in the rolling scratch window
+        cache_offset    = cache_seq_len + query_len
+        local_seq_idx   = n % W              # append position in the stable block
+        block_idx       = n // W             # which stable block is being written
+        stable_block    = stable_block_tables[req, block_idx]
+        scratch_block   = scratch_block_ids[req]
+
+    ``cache_seq_len``/``cache_offset`` are the existing naive-SWA rolling-window state (used
+    by the scratch attention, which is unchanged). ``stable_block``/``local_seq_idx`` drive
+    the NEW append-only write into the prefix-cacheable stable block. Requires
+    ``local_seq_idx + query_len <= W`` (a chunk never straddles a stable block boundary).
+
+    Args:
+        num_computed_tokens: [NB] or [NB, 1] int.
+        query_lens: [NB] or [NB, 1] int (1 for decode, chunk size for prefill).
+        stable_block_tables: [NB, max_blocks] int — the append-only stable blocks (the full
+            sequence in W-sized blocks; vLLM-managed, prefix-cacheable).
+        scratch_block_ids: [NB] or [NB, 1] int — the per-request mutable scratch block id.
+        window_size: W (== block_size).
+
+    Returns (each [NB, 1] int32):
+        (cache_seq_lens, cache_offsets, scratch_block_table, stable_block_table, local_seq_idx)
+    """
+    W = window_size
+    n = num_computed_tokens.reshape(-1, 1).to(torch.int64)
+    ql = query_lens.reshape(-1, 1).to(torch.int64)
+    max_blocks = stable_block_tables.size(1)
+
+    cache_seq_lens = torch.clamp(n, max=W)
+    cache_offsets = cache_seq_lens + ql
+    local_seq_idx = n % W
+    # End index for the stable-block window_slice: the position just past the newly written
+    # chunk within the block (= local_seq_idx + query_len, in (0, W] by the no-straddle
+    # constraint). window_slice(insert, end, W) with 0 < end <= W returns the first W rows
+    # (the accumulated block, no roll). Must NOT reuse cache_start (= 0 on the first chunk,
+    # a degenerate end=0 slice that zeroes the chunk) nor cache_offset (> W past block 0).
+
+
+    # NOTE (sgwon): Some pretty important assumptions I have are:
+    # 1) local_seq_idx + query_len never exceeds W, so stable_end is always in (0, W].
+    # 2) cache_seq_lens is min(n, W), so cache_seq_lens is always in [0, W].
+    # 3) Window size must be divisible by the prefill chunk size (i.e. query_len divides W), 
+    # so local_seq_idx is always in [0, W) and the chunk always fits in the current stable block
+    # (so we don't have a werid two stable block write case).
+    stable_end = (local_seq_idx + ql).clamp(min=1, max=W)
+    block_idx = (n // W).clamp(min=0, max=max_blocks - 1)
+    stable_block_table = torch.gather(
+        stable_block_tables.to(torch.int64), 1, block_idx
+    )
+    scratch_block_table = scratch_block_ids.reshape(-1, 1).to(torch.int64)
+
+    return (
+        cache_seq_lens.to(torch.int32),
+        cache_offsets.to(torch.int32),
+        scratch_block_table.to(torch.int32),
+        stable_block_table.to(torch.int32),
+        local_seq_idx.to(torch.int32),
+        stable_end.to(torch.int32),
+    )
+
+
 @dataclass
 class RBLNFlashAttentionMetadata:
     num_actual_tokens: int  # Number of tokens excluding padding.
@@ -1025,6 +1099,15 @@ class RBLNFlashAttentionMetadata:
     cache_offsets: torch.Tensor | None = None
     local_block_tables: torch.Tensor | None = None
     swa_attn_masks: torch.Tensor | None = None
+    # for scratch+stable append-only sliding window attention
+    # (scratch_stable_prefix_cache_design.MD). The scratch block holds the live
+    # rolling window (attention reads it); the stable blocks are append-only and
+    # prefix-cacheable. All [NB, 1]/[NB, NBLK] int32 on device.
+    ss_scratch_block_table: torch.Tensor | None = None
+    ss_stable_block_table: torch.Tensor | None = None
+    ss_local_seq_idx: torch.Tensor | None = None
+    # End index for the stable-block window_slice (= local_seq_idx + query_len in (0, W]).
+    ss_stable_end: torch.Tensor | None = None
 
 
 class RBLNFlashAttentionMetadataBuilder(
@@ -1071,6 +1154,14 @@ class RBLNFlashAttentionMetadataBuilder(
 
         self._swa_cache_seq_lens_buf: torch.Tensor | None = None
         self._swa_cache_offsets_buf: torch.Tensor | None = None
+        # reusable device buffers for the scratch+stable SWA index tensors
+        self._swa_ss_scratch_block_buf: torch.Tensor | None = None
+        self._swa_ss_stable_block_buf: torch.Tensor | None = None
+        self._swa_ss_local_seq_idx_buf: torch.Tensor | None = None
+        self._swa_ss_stable_end_buf: torch.Tensor | None = None
+        # decode-path coalesced buffer: the 4 int32 ss_* tensors share one [4,NB,1]
+        # device buffer + a single H2D copy (instead of 4), split into views below.
+        self._swa_ss_stack_buf: torch.Tensor | None = None
 
     def _to_device_inplace(
         self, cpu_tensor: torch.Tensor, attr_name: str
@@ -1101,6 +1192,8 @@ class RBLNFlashAttentionMetadataBuilder(
         positions=None,
         batch_pad=None,
         is_prefill=False,
+        swa_scratch_block_ids=None,
+        step_cache=None,
     ) -> RBLNFlashAttentionMetadata:
         use_dt = envs.VLLM_RBLN_USE_DEVICE_TENSOR
         num_reqs = common_attn_metadata.num_reqs
@@ -1111,43 +1204,71 @@ class RBLNFlashAttentionMetadataBuilder(
         seq_lens = common_attn_metadata.seq_lens
         block_tables_tensor = common_attn_metadata.block_table_tensor
         slot_mapping = common_attn_metadata.slot_mapping
-        if use_dt:
-            # Prefer the pre-existing CPU copy to avoid an extra D2H sync;
-            # arithmetic stays on CPU until .to(self.device) in the constructor.
-            query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
-            _seq_lens_cpu = common_attn_metadata._seq_lens_cpu
-            seq_lens_cpu = (
-                _seq_lens_cpu[:num_reqs]
-                if _seq_lens_cpu is not None
-                else seq_lens[:num_reqs].cpu()
-            )
-            query_seq_lens = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
-            num_computed_tokens_cpu = seq_lens_cpu - query_seq_lens
-            seq_idx = positions[query_start_loc_cpu[:num_reqs]].view(-1, 1)
+        # num_partition is derived from max_model_len (not hardware block count)
+        # to ensure seq_idx/seq_lens dimensions stay within block_table bounds.
+        max_seq_len = self.model_config.max_model_len
+
+        # This bundle (seq_idx, the partitioned seq_lens_tensor whose `repeat` is a hot
+        # Preprocess op, and the num_computed/seq_lens CPU mirrors) depends only on the
+        # batch (query_start_loc/seq_lens/positions) and self.block_size — NOT on the
+        # per-group block table. build() runs once PER KV-CACHE GROUP (7x on gemma
+        # hybrid), so memoize it in a step-scoped cache keyed by block_size: groups
+        # sharing a block_size reuse it (the expensive repeat runs once), groups with a
+        # different block_size recompute. These are CPU intermediates consumed via
+        # .to(device) copies and never mutated in place, so cross-group sharing is safe.
+        num_computed_tokens = None
+        num_computed_tokens_cpu = None
+        seq_lens_cpu = None
+        cached = step_cache.get(self.block_size) if step_cache is not None else None
+        if cached is not None:
+            (
+                seq_idx,
+                seq_lens_tensor,
+                num_computed_tokens,
+                num_computed_tokens_cpu,
+                seq_lens_cpu,
+            ) = cached
         else:
-            query_seq_lens = query_start_loc[1:] - query_start_loc[:-1]
-            num_computed_tokens = seq_lens - query_seq_lens
-            seq_idx = positions[query_start_loc[:num_reqs]].view(-1, 1)
+            if use_dt:
+                # Prefer the pre-existing CPU copy to avoid an extra D2H sync;
+                # arithmetic stays on CPU until .to(self.device) in the constructor.
+                query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
+                _seq_lens_cpu = common_attn_metadata._seq_lens_cpu
+                seq_lens_cpu = (
+                    _seq_lens_cpu[:num_reqs]
+                    if _seq_lens_cpu is not None
+                    else seq_lens[:num_reqs].cpu()
+                )
+                query_seq_lens = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+                num_computed_tokens_cpu = seq_lens_cpu - query_seq_lens
+                seq_idx = positions[query_start_loc_cpu[:num_reqs]].view(-1, 1)
+            else:
+                query_seq_lens = query_start_loc[1:] - query_start_loc[:-1]
+                num_computed_tokens = seq_lens - query_seq_lens
+                seq_idx = positions[query_start_loc[:num_reqs]].view(-1, 1)
+
+            # The length of the partition equals the block size.
+            partition_len = self.block_size
+            num_partition = max_seq_len // partition_len
+            cs = seq_idx.repeat(1, num_partition)
+            pidx = torch.arange(num_partition, dtype=torch.int32)
+            # RBLN - seq_lens tensor dtype SHOULD be int16
+            seq_lens_tensor = torch.clamp(
+                cs - pidx * partition_len, 0, partition_len
+            ).to(torch.int16)
+            if step_cache is not None:
+                step_cache[self.block_size] = (
+                    seq_idx,
+                    seq_lens_tensor,
+                    num_computed_tokens,
+                    num_computed_tokens_cpu,
+                    seq_lens_cpu,
+                )
 
         cu_prefix_query_lens = None
         prefix_kv_lens = None
         suffix_kv_lens = None
         prefix_scheduler_metadata = None
-
-        # The length of the partition equals the block size.
-        partition_len = self.block_size
-        # num_partition is derived from max_model_len (not hardware block count)
-        # to ensure seq_idx/seq_lens dimensions stay within block_table bounds.
-        max_seq_len = self.model_config.max_model_len
-
-        num_partition = max_seq_len // partition_len
-        cs = seq_idx.repeat(1, num_partition)
-        pidx = torch.arange(num_partition, dtype=torch.int32)
-        # RBLN - seq_lens tensor dtype SHOULD be int16
-        dyn_size_for_partitions = torch.clamp(
-            cs - pidx * partition_len, 0, partition_len
-        ).to(torch.int16)
-        seq_lens_tensor = dyn_size_for_partitions
 
         assert batch_pad is not None, "batch_pad is required for RBLN Attention Backend"
 
@@ -1202,6 +1323,15 @@ class RBLNFlashAttentionMetadataBuilder(
         cache_offsets = None
         local_block_tables = None
         swa_attn_masks = None
+        ss_scratch_bt = None
+        ss_stable_bt = None
+        ss_local_seq_idx = None
+        ss_stable_end = None
+        # Pre-transferred device views from the coalesced decode-path H2D (set below).
+        ss_scratch_dev = None
+        ss_stable_dev = None
+        ss_lsi_dev = None
+        ss_end_dev = None
         if sliding_window := getattr(self.kv_cache_spec, "sliding_window", None):
             nct_src = (
                 num_computed_tokens_cpu if use_dt else num_computed_tokens[:num_reqs]
@@ -1223,6 +1353,64 @@ class RBLNFlashAttentionMetadataBuilder(
                 ]
 
             local_block_tables = block_tables_tensor[..., :1]
+
+            # Scratch+stable append-only SWA: the scratch block (off req_to_blocks,
+            # plumbed via swa_scratch_block_ids) holds the live rolling window the
+            # naive attention reads; the stable blocks (block_tables_tensor) are the
+            # append-only, prefix-cacheable copy. cache_seq_lens/cache_offsets above
+            # are reused as-is (identical to clamp(n, W) / +query_len).
+            if isinstance(self.kv_cache_spec, RBLNScratchStableSWASpec):
+                assert swa_scratch_block_ids is not None, (
+                    "scratch+stable SWA metadata missing; the runner must pass "
+                    "swa_scratch_block_ids for RBLNScratchStableSWASpec groups."
+                )
+                bt2d = block_tables_tensor
+                if is_prefill:
+                    bt2d = bt2d.unsqueeze(0)  # [max_blocks] -> [1, max_blocks]
+                bt2d = bt2d[:num_reqs]
+                (
+                    _ss_csl,
+                    _ss_cofs,
+                    ss_scratch_bt,
+                    ss_stable_bt,
+                    ss_local_seq_idx,
+                    ss_stable_end,
+                ) = scratch_stable_index_tensors(
+                    nct_src.reshape(-1, 1),
+                    query_lens.reshape(-1, 1),
+                    bt2d,
+                    swa_scratch_block_ids[:num_reqs],
+                    sliding_window,
+                )
+                if not is_prefill:
+                    ss_scratch_bt = rbln_utils.pad(ss_scratch_bt, 0, batch_pad)
+                    ss_stable_bt = rbln_utils.pad(ss_stable_bt, 0, batch_pad)
+                    ss_local_seq_idx = rbln_utils.pad(ss_local_seq_idx, 0, batch_pad)
+                    ss_stable_end = rbln_utils.pad(ss_stable_end, 0, batch_pad)
+                    # Coalesce the 4 int32 ss_* H2D transfers into a single copy: they are
+                    # all [NB_pad, 1] int32 in the decode path, so stack into one
+                    # [4, NB_pad, 1] buffer, transfer once, and split into contiguous
+                    # views (each [i] of a dim-0 stack is contiguous). Saves 3 of 4 H2D
+                    # copies per SWA group per decode step. Values are identical to the
+                    # per-tensor path -> output is byte-identical.
+                    ss_stack_cpu = torch.stack(
+                        [ss_scratch_bt, ss_stable_bt, ss_local_seq_idx, ss_stable_end],
+                        dim=0,
+                    )
+                    ss_stack_dev = self._to_device_inplace(
+                        ss_stack_cpu, "_swa_ss_stack_buf"
+                    )
+                    ss_scratch_dev = ss_stack_dev[0]
+                    ss_stable_dev = ss_stack_dev[1]
+                    ss_lsi_dev = ss_stack_dev[2]
+                    ss_end_dev = ss_stack_dev[3]
+                else:
+                    # Prefill kernel expects 1D scratch/stable block tables (matches
+                    # the naive prefill convention); local_seq_idx stays 2D [NB, 1].
+                    ss_scratch_bt = ss_scratch_bt.reshape(-1)
+                    ss_stable_bt = ss_stable_bt.reshape(-1)
+                # The attention kernel reads the live window from the scratch block.
+                local_block_tables = ss_scratch_bt
 
         # * seq_idx(batch attention opt decode) - [B, 1],
         #   for each batch, have sequence offset
@@ -1263,6 +1451,36 @@ class RBLNFlashAttentionMetadataBuilder(
             swa_attn_masks=swa_attn_masks.to(self.device)
             if swa_attn_masks is not None
             else None,
+            # Decode path: use the coalesced device views (single H2D above). Prefill
+            # path (ss_*_dev is None): fall back to the per-tensor transfer.
+            ss_scratch_block_table=ss_scratch_dev
+            if ss_scratch_dev is not None
+            else (
+                self._to_device_inplace(ss_scratch_bt, "_swa_ss_scratch_block_buf")
+                if ss_scratch_bt is not None
+                else None
+            ),
+            ss_stable_block_table=ss_stable_dev
+            if ss_stable_dev is not None
+            else (
+                self._to_device_inplace(ss_stable_bt, "_swa_ss_stable_block_buf")
+                if ss_stable_bt is not None
+                else None
+            ),
+            ss_local_seq_idx=ss_lsi_dev
+            if ss_lsi_dev is not None
+            else (
+                self._to_device_inplace(ss_local_seq_idx, "_swa_ss_local_seq_idx_buf")
+                if ss_local_seq_idx is not None
+                else None
+            ),
+            ss_stable_end=ss_end_dev
+            if ss_end_dev is not None
+            else (
+                self._to_device_inplace(ss_stable_end, "_swa_ss_stable_end_buf")
+                if ss_stable_end is not None
+                else None
+            ),
         )
 
         return attn_metadata
@@ -1440,56 +1658,25 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
             assert self.sliding_window == kv_cache.size(-2), (
                 "SWA kernel_block_size must match window_size"
             )
-            assert attn_metadata.cache_seq_lens is not None
-            assert attn_metadata.cache_offsets is not None
-            if envs.VLLM_RBLN_COMPILE_MODEL:
-                if envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
-                    sliding_window_attention_naive_prefill = (
-                        torch.ops.rbln_triton_ops.sliding_window_attention_naive_prefill
-                    )
-                    sliding_window_attention_naive_decode = (
-                        torch.ops.rbln_triton_ops.sliding_window_attention_naive_decode
-                    )
-                else:
-                    sliding_window_attention_naive_prefill = (
-                        torch.ops.rbln_custom_ops.sliding_window_attention_naive_prefill
-                    )
-                    sliding_window_attention_naive_decode = (
-                        torch.ops.rbln_custom_ops.sliding_window_attention_naive_decode
-                    )
-            else:
-                sliding_window_attention_naive_prefill = (
-                    sliding_window_attention_naive_prefill_impl
+            if envs.VLLM_RBLN_SWA_SCRATCH_STABLE:
+                # Scratch+stable append-only SWA path
+                # (scratch_stable_prefix_cache_design.MD). Attention reads the live
+                # window from the scratch block (the unchanged naive SWA kernel) and
+                # additionally appends the new K/V into the prefix-cacheable stable
+                # block. The triton kernels are warmup-green (no SHM-stride bug).
+                assert attn_metadata.ss_scratch_block_table is not None, (
+                    "scratch+stable SWA metadata missing; RBLNScratchStableSWASpec must "
+                    "be the kv-cache spec when VLLM_RBLN_SWA_SCRATCH_STABLE is set"
                 )
-                sliding_window_attention_naive_decode = (
-                    sliding_window_attention_naive_decode_impl
+                assert (
+                    envs.VLLM_RBLN_COMPILE_MODEL and envs.VLLM_RBLN_USE_CUSTOM_KERNEL
+                ), (
+                    "scratch+stable SWA requires the compiled triton kernels "
+                    "(VLLM_RBLN_COMPILE_MODEL=1 RBLN_USE_CUSTOM_KERNEL=1); no eager "
+                    "impl is wired."
                 )
-
-            if not attn_metadata.is_prefill:
-                decode_args = [
-                    query,
-                    key,
-                    value,
-                    kv_cache,
-                    attn_metadata.cache_seq_lens.to(torch.int32)
-                    if self.is_batch_attention_opt and b_size > 1
-                    else attn_metadata.cache_seq_lens,
-                    attn_metadata.cache_offsets,
-                    self.scale,
-                    attn_metadata.local_block_tables,
-                    self.scale,  # dummy
-                ]
-                if not envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
-                    if self.is_batch_attention_opt and b_size > 1:
-                        decode_args.append(attn_metadata.swa_attn_masks)
-                    else:
-                        decode_args.append(None)
-                    decode_args.append(self.sinks)
-                attn_output = sliding_window_attention_naive_decode(  # noqa: E501
-                    *decode_args,
-                )
-            else:
-                prefill_args = [
+                ss_ops = torch.ops.rbln_triton_ops
+                ss_args = [
                     query,
                     key,
                     value,
@@ -1497,14 +1684,86 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                     attn_metadata.cache_seq_lens,
                     attn_metadata.cache_offsets,
                     self.scale,
-                    attn_metadata.local_block_tables,
+                    attn_metadata.ss_scratch_block_table,
+                    attn_metadata.ss_stable_block_table,
+                    attn_metadata.ss_local_seq_idx,
+                    attn_metadata.ss_stable_end,
                     self.scale,  # dummy
                 ]
-                if not envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
-                    prefill_args.append(self.sinks)
-                attn_output = sliding_window_attention_naive_prefill(  # noqa: E501
-                    *prefill_args
-                )
+                if not attn_metadata.is_prefill:
+                    attn_output = (
+                        ss_ops.sliding_window_attention_scratch_stable_decode(*ss_args)
+                    )
+                else:
+                    attn_output = (
+                        ss_ops.sliding_window_attention_scratch_stable_prefill(*ss_args)
+                    )
+            else:
+                assert attn_metadata.cache_seq_lens is not None
+                assert attn_metadata.cache_offsets is not None
+                if envs.VLLM_RBLN_COMPILE_MODEL:
+                    if envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
+                        sliding_window_attention_naive_prefill = (
+                            torch.ops.rbln_triton_ops.sliding_window_attention_naive_prefill
+                        )
+                        sliding_window_attention_naive_decode = (
+                            torch.ops.rbln_triton_ops.sliding_window_attention_naive_decode
+                        )
+                    else:
+                        sliding_window_attention_naive_prefill = (
+                            torch.ops.rbln_custom_ops.sliding_window_attention_naive_prefill
+                        )
+                        sliding_window_attention_naive_decode = (
+                            torch.ops.rbln_custom_ops.sliding_window_attention_naive_decode
+                        )
+                else:
+                    sliding_window_attention_naive_prefill = (
+                        sliding_window_attention_naive_prefill_impl
+                    )
+                    sliding_window_attention_naive_decode = (
+                        sliding_window_attention_naive_decode_impl
+                    )
+
+                if not attn_metadata.is_prefill:
+                    decode_args = [
+                        query,
+                        key,
+                        value,
+                        kv_cache,
+                        attn_metadata.cache_seq_lens.to(torch.int32)
+                        if self.is_batch_attention_opt and b_size > 1
+                        else attn_metadata.cache_seq_lens,
+                        attn_metadata.cache_offsets,
+                        self.scale,
+                        attn_metadata.local_block_tables,
+                        self.scale,  # dummy
+                    ]
+                    if not envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
+                        if self.is_batch_attention_opt and b_size > 1:
+                            decode_args.append(attn_metadata.swa_attn_masks)
+                        else:
+                            decode_args.append(None)
+                        decode_args.append(self.sinks)
+                    attn_output = sliding_window_attention_naive_decode(  # noqa: E501
+                        *decode_args,
+                    )
+                else:
+                    prefill_args = [
+                        query,
+                        key,
+                        value,
+                        kv_cache,
+                        attn_metadata.cache_seq_lens,
+                        attn_metadata.cache_offsets,
+                        self.scale,
+                        attn_metadata.local_block_tables,
+                        self.scale,  # dummy
+                    ]
+                    if not envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
+                        prefill_args.append(self.sinks)
+                    attn_output = sliding_window_attention_naive_prefill(  # noqa: E501
+                        *prefill_args
+                    )
         # actually non-flash paged attention DOES NOT use slot_mapping
         elif self.is_causal:
             if self.is_normal:

@@ -27,8 +27,12 @@ from vllm.model_executor.models.utils import extract_layer_index
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 
+import vllm_rbln.rbln_envs as envs
 from vllm_rbln.v1.attention.kv_cache_bindings import materialize_kv_cache_view
-from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
+from vllm_rbln.v1.kv_cache import (
+    RBLNScratchStableSWASpec,
+    RBLNSlidingWindowSpec,
+)
 
 # ---------------------------------------------------------------------------
 # Snapshots of upstream implementations (used by RBLN overrides)
@@ -134,6 +138,22 @@ def _rbln_get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         assert not vllm_config.model_config.use_mla, (
             "MLA is not supported for slidingwindow"
         )
+        if envs.VLLM_RBLN_SWA_SCRATCH_STABLE:
+            # Scratch + stable SWA path: rolling scratch block for attention (the existing
+            # naive SWA kernel) + append-only stable blocks for prefix caching. Requires
+            # block_size == sliding_window. See scratch_stable_prefix_cache_design.MD.
+            assert block_size == self.sliding_window, (
+                "VLLM_RBLN_SWA_SCRATCH_STABLE requires block_size == sliding_window; got "
+                f"block_size={block_size}, sliding_window={self.sliding_window}. "
+                "Set --block-size to the model's sliding window."
+            )
+            return RBLNScratchStableSWASpec(
+                block_size=block_size,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_size,
+                dtype=self.kv_cache_torch_dtype,
+                sliding_window=self.sliding_window,
+            )
         return RBLNSlidingWindowSpec(
             block_size=block_size,
             num_kv_heads=self.num_kv_heads,

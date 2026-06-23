@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Sequence
+
+import vllm_rbln.rbln_envs as envs
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -77,6 +79,17 @@ class KVCacheCopyOp:
     dst_block_id: int
     # Number of tokens to copy (= num_matched_sub_blocks * sub_block_size).
     num_tokens: int
+    # scratch+stable SWA scratch-seed copy (stable->scratch). Its src is already
+    # ref'd (by req_to_blocks for full-block seeds, or by the sibling sub-block
+    # copy op's touch() for sub-block seeds), so release_copy_ops must NOT free
+    # it again -- doing so would over-free the source block.
+    is_scratch_seed: bool = False
+    # Token-axis offsets within the (block_size-long) window for src and dst.
+    # Used by the Case 2 straddle seed (rolling window crosses two stable blocks
+    # at non-zero offsets). The native offset-0 copy can't express these, so an
+    # op with a non-zero offset is routed through the eager slice-assign path.
+    src_offset: int = 0
+    dst_offset: int = 0
 
 
 class SubBlockHasher:
@@ -406,8 +419,32 @@ class RBLNKVCacheManager(KVCacheManager):
         min_matched: int | None = None
         group_matches: list[_GroupPartialMatch] = []
 
-        for gi in self._group_infos:
+        from vllm_rbln.v1.kv_cache import RBLNScratchStableSWAManager
+
+        for gid, gi in enumerate(self._group_infos):
             num_full_blocks = num_computed_tokens // gi.block_size
+            # Case 2 (straddle) fallback (iii): when a scratch+stable SWA group's
+            # sub-block hit lands past its first block (num_full_blocks > 0), the
+            # rolling window crosses two stable blocks at non-zero offsets. Seeding
+            # that requires an offset-capable device-to-device copy, which the
+            # runtime does not expose (native copy is offset-0; slice-assign
+            # misses the compiled buffers; host round-trip corrupts dlfloat16). So
+            # reject the sub-block match and fall back to full-block prefix caching
+            # for the whole request this step (correct, just less reuse). The Case 2
+            # straddle seed in apply_sub_block_match is retained for the day an
+            # offset-capable D2D copy lands.
+            #
+            # EXCEPTION: in device-tensor mode (VLLM_RBLN_USE_DEVICE_TENSOR) the
+            # KV cache IS a real device='rbln' tensor, so the offset slice-assign
+            # in _process_kv_cache_copy_ops writes device memory directly -> the
+            # straddle seed works and we DON'T reject.
+            mgr = self.coordinator.single_type_managers[gid]
+            if (
+                isinstance(mgr, RBLNScratchStableSWAManager)
+                and num_full_blocks > 0
+                and not envs.VLLM_RBLN_USE_DEVICE_TENSOR
+            ):
+                return None
             sbpb = gi.sub_blocks_per_block
             next_sub_start = num_full_blocks * sbpb
 
@@ -480,12 +517,19 @@ class RBLNKVCacheManager(KVCacheManager):
         owned by *match* are transferred to the pending copy ops (released
         by ``release_copy_ops``).
         """
+        from vllm_rbln.v1.kv_cache import RBLNScratchStableSWAManager
+
         request = match.request
         blocks = self.coordinator.get_blocks(request.request_id)
 
         for i, gm in enumerate(match.group_matches):
             block_list = blocks[i]
             # By this point, the destination block must have been allocated.
+
+
+            # NOTE (sgwon): In scratch stable SWA, this is where the new
+            # request's first stable block (not the scratch!) is being copied 
+            # from the cached stable block. 
             dst_block = block_list[gm.dst_req_block_index]
             self.pending_copy_ops.append(
                 KVCacheCopyOp(
@@ -495,6 +539,65 @@ class RBLNKVCacheManager(KVCacheManager):
                     num_tokens=match.num_tokens,
                 )
             )
+            # scratch+stable SWA: This is where we fill the scratch block. 
+            # The scratch is a LINEAR window buffer (the kernel does
+            # window_insert@cache_start + window_slice ending at cache_end), so
+            # the seed must lay out the rolling window oldest->newest.
+            mgr = self.coordinator.single_type_managers[i]
+            if isinstance(mgr, RBLNScratchStableSWAManager):
+                scratch_id = mgr.scratch_block_id(request.request_id)
+                W = mgr.block_size
+
+                # if m is 0 that means it is the first logical stable block and not a 
+                # straddle case.
+                m = gm.dst_req_block_index
+                split = match.num_tokens  # extra tokens matched in block m (< W)
+                if m == 0:
+                    # Case 1: window = [0, split) -> scratch[0, split). A single
+                    # offset-0 copy; cache_seq_len (= split <= W) masks the tail.
+                    self.pending_copy_ops.append(
+                        KVCacheCopyOp(
+                            group_id=i,
+                            src_block_id=gm.src_block.block_id,
+                            dst_block_id=scratch_id,
+                            num_tokens=split,
+                            is_scratch_seed=True,
+                        )
+                    )
+                else:
+                    # Case 2 (straddle): num_computed = m*W + split, window
+                    # [n-W, n) crosses block m-1 [split, W) ++ block m [0, split):
+                    #   scratch[0, W-split) <- block m-1 [split, W)
+                    #   scratch[W-split, W) <- src[0, split)   (= block m [0,split))
+                    # Drop the offset-0 full-block seed allocate_new_blocks queued
+                    # (it would set the wrong block-aligned window).
+                    mgr.cancel_pending_seed(request.request_id)
+                    prev_block = block_list[m - 1]
+                    assert prev_block is not None and not prev_block.is_null, (
+                        f"Case 2 straddle needs cached block {m - 1}, got null"
+                    )
+                    self.pending_copy_ops.append(
+                        KVCacheCopyOp(
+                            group_id=i,
+                            src_block_id=prev_block.block_id,
+                            dst_block_id=scratch_id,
+                            num_tokens=W - split,
+                            src_offset=split,
+                            dst_offset=0,
+                            is_scratch_seed=True,
+                        )
+                    )
+                    self.pending_copy_ops.append(
+                        KVCacheCopyOp(
+                            group_id=i,
+                            src_block_id=gm.src_block.block_id,
+                            dst_block_id=scratch_id,
+                            num_tokens=split,
+                            src_offset=0,
+                            dst_offset=W - split,
+                            is_scratch_seed=True,
+                        )
+                    )
 
         if self.log_stats:
             assert self.prefix_cache_stats is not None
@@ -568,10 +671,16 @@ class RBLNKVCacheManager(KVCacheManager):
         return ops
 
     def release_copy_ops(self, ops: list[KVCacheCopyOp]) -> None:
-        """Release source-block refs held by previously drained copy ops."""
-        if ops:
+        """Release source-block refs held by previously drained copy ops.
+
+        Scratch-seed ops are skipped: their source block is not ref'd by the
+        op (it is held by req_to_blocks or by the sibling sub-block copy op),
+        so freeing it here would over-free it.
+        """
+        to_release = [op for op in ops if not op.is_scratch_seed]
+        if to_release:
             self.block_pool.free_blocks(
-                [self.block_pool.blocks[op.src_block_id] for op in ops]
+                [self.block_pool.blocks[op.src_block_id] for op in to_release]
             )
 
     def do_pending_indexing(self) -> None:

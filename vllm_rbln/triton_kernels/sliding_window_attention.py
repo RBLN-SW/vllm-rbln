@@ -578,3 +578,749 @@ def _(
     dummy: torch.Tensor,
 ) -> torch.Tensor:
     return torch.empty_like(query)
+
+
+# =====================================================================================
+# SCRATCH + STABLE SWA decode (prefix-caching path; see
+# new_code_plan/scratch_stable_prefix_cache_design.MD).
+#
+# Attention is IDENTICAL to the naive rolling-window decode over the "scratch" block (no
+# two-block join -> no SHM bug). The ONLY addition vs the naive kernel is an append-only
+# write of the new K/V into a separate "stable" block at `local_seq_idx`. The stable block
+# is managed by vLLM like a normal full-attention block so it is prefix-cacheable; it is
+# never read by this kernel (only written here, and read via a D2D copy into scratch on a
+# cache hit). This is the Feb-2026 spec (new_code_plan/original_plan.MD).
+# =====================================================================================
+@triton.jit
+def sliding_window_attention_scratch_stable_decode(
+    query_base,
+    key_base,
+    value_base,
+    kv_cache_base,
+    output_base,
+    cache_seq_len_base,
+    cache_offset_base,
+    qk_scale,
+    block_table_base,  # scratch block table (rolling SWA window)
+    stable_block_table_base,  # NEW: append-only stable block (prefix-cacheable)
+    local_seq_idx_base,  # NEW: write position in the stable block (= seq_idx % block_size)
+    stable_end_base,  # NEW: stable window_slice end (= local_seq_idx + query_len, in (0, W])
+    dummy,
+    NUM_HEAD: tl.constexpr,
+    NUM_GROUP: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    QUERY_LEN: tl.constexpr,  # 1 (decode)
+    WINDOW_SIZE: tl.constexpr,
+    NUM_BATCH: tl.constexpr,
+    NUM_BLOCK: tl.constexpr,
+    DIM_BLOCK_TABLE: tl.constexpr,
+):
+    tl.static_assert(QUERY_LEN == 1)
+    tl.static_assert(NUM_BATCH >= 1)
+    NUM_PARTITION: tl.constexpr = 1
+    WINDOW_AXIS: tl.constexpr = 4
+    PAD_SIZE: tl.constexpr = 63
+
+    for batch_id in tl.static_range(0, NUM_BATCH, 1):
+        block_table_ptr = tl.make_block_ptr(
+            base=block_table_base,
+            shape=(NUM_BATCH, NUM_PARTITION),
+            strides=(NUM_PARTITION, 1),
+            offsets=(batch_id, 0),
+            block_shape=(1, 1),
+            order=(1, 0),
+        )
+        tl.static_assert(len(block_table_ptr.type.element_ty.shape) == DIM_BLOCK_TABLE)
+        stable_block_table_ptr = tl.make_block_ptr(
+            base=stable_block_table_base,
+            shape=(NUM_BATCH, NUM_PARTITION),
+            strides=(NUM_PARTITION, 1),
+            offsets=(batch_id, 0),
+            block_shape=(1, 1),
+            order=(1, 0),
+        )
+        local_seq_idx_ptr = tl.make_block_ptr(
+            base=local_seq_idx_base,
+            shape=(NUM_BATCH, WINDOW_SIZE // WINDOW_SIZE),
+            strides=(WINDOW_SIZE // WINDOW_SIZE, 1),
+            offsets=(batch_id, 0),
+            block_shape=(1, 1),
+            order=(1, 0),
+        )
+        stable_end_ptr = tl.make_block_ptr(
+            base=stable_end_base,
+            shape=(NUM_BATCH, WINDOW_SIZE // WINDOW_SIZE),
+            strides=(WINDOW_SIZE // WINDOW_SIZE, 1),
+            offsets=(batch_id, 0),
+            block_shape=(1, 1),
+            order=(1, 0),
+        )
+        cache_seq_len_ptr = tl.make_block_ptr(
+            base=cache_seq_len_base,
+            shape=(NUM_BATCH, WINDOW_SIZE // WINDOW_SIZE),
+            strides=(WINDOW_SIZE // WINDOW_SIZE, 1),
+            offsets=(batch_id, 0),
+            block_shape=(1, 1),
+            order=(1, 0),
+        )
+        cache_offset_ptr = tl.make_block_ptr(
+            base=cache_offset_base,
+            shape=(NUM_BATCH, WINDOW_SIZE // WINDOW_SIZE),
+            strides=(WINDOW_SIZE // WINDOW_SIZE, 1),
+            offsets=(batch_id, 0),
+            block_shape=(1, 1),
+            order=(1, 0),
+        )
+
+        cache_start = rblib.to_dynamic_index(cache_seq_len_ptr)
+        cache_end = rblib.to_dynamic_index(cache_offset_ptr)
+        block_number = rblib.to_dynamic_index(block_table_ptr)
+        block_number = block_number.cast(tl.int32)
+        stable_block_number = rblib.to_dynamic_index(stable_block_table_ptr)
+        stable_block_number = stable_block_number.cast(tl.int32)
+        local_seq_idx = rblib.to_dynamic_index(local_seq_idx_ptr)
+        stable_end = rblib.to_dynamic_index(stable_end_ptr)
+
+        k_block_ptr = tl.make_block_ptr(
+            base=key_base,
+            shape=(NUM_BATCH, NUM_HEAD, 1, QUERY_LEN, HEAD_DIM),
+            strides=(
+                NUM_HEAD * 1 * QUERY_LEN * HEAD_DIM,
+                1 * QUERY_LEN * HEAD_DIM,
+                QUERY_LEN * HEAD_DIM,
+                HEAD_DIM,
+                1,
+            ),
+            offsets=(batch_id, 0, 0, 0, 0),
+            block_shape=(1, NUM_HEAD, 1, QUERY_LEN, HEAD_DIM),
+            order=(4, 3, 2, 1, 0),
+        )
+        v_block_ptr = tl.make_block_ptr(
+            base=value_base,
+            shape=(NUM_BATCH, NUM_HEAD, 1, QUERY_LEN, HEAD_DIM),
+            strides=(
+                NUM_HEAD * 1 * QUERY_LEN * HEAD_DIM,
+                1 * QUERY_LEN * HEAD_DIM,
+                QUERY_LEN * HEAD_DIM,
+                HEAD_DIM,
+                1,
+            ),
+            offsets=(batch_id, 0, 0, 0, 0),
+            block_shape=(1, NUM_HEAD, 1, QUERY_LEN, HEAD_DIM),
+            order=(4, 3, 2, 1, 0),
+        )
+        k_cache_base_ptr = tl.make_block_ptr(
+            base=kv_cache_base,
+            shape=(2, NUM_BLOCK, NUM_HEAD, 1, WINDOW_SIZE, HEAD_DIM),
+            strides=(
+                NUM_BLOCK * NUM_HEAD * WINDOW_SIZE * HEAD_DIM,
+                NUM_HEAD * WINDOW_SIZE * HEAD_DIM,
+                WINDOW_SIZE * HEAD_DIM,
+                WINDOW_SIZE * HEAD_DIM,
+                HEAD_DIM,
+                1,
+            ),
+            offsets=(0, block_number, 0, 0, 0, 0),
+            block_shape=(1, 1, NUM_HEAD, 1, WINDOW_SIZE, HEAD_DIM),
+            order=(5, 4, 3, 2, 1, 0),
+        )
+        v_cache_base_ptr = tl.make_block_ptr(
+            base=kv_cache_base,
+            shape=(2, NUM_BLOCK, NUM_HEAD, 1, WINDOW_SIZE, HEAD_DIM),
+            strides=(
+                NUM_BLOCK * NUM_HEAD * WINDOW_SIZE * HEAD_DIM,
+                NUM_HEAD * WINDOW_SIZE * HEAD_DIM,
+                WINDOW_SIZE * HEAD_DIM,
+                WINDOW_SIZE * HEAD_DIM,
+                HEAD_DIM,
+                1,
+            ),
+            offsets=(1, block_number, 0, 0, 0, 0),
+            block_shape=(1, 1, NUM_HEAD, 1, WINDOW_SIZE, HEAD_DIM),
+            order=(5, 4, 3, 2, 1, 0),
+        )
+        stable_k_cache_ptr = tl.make_block_ptr(
+            base=kv_cache_base,
+            shape=(2, NUM_BLOCK, NUM_HEAD, 1, WINDOW_SIZE, HEAD_DIM),
+            strides=(
+                NUM_BLOCK * NUM_HEAD * WINDOW_SIZE * HEAD_DIM,
+                NUM_HEAD * WINDOW_SIZE * HEAD_DIM,
+                WINDOW_SIZE * HEAD_DIM,
+                WINDOW_SIZE * HEAD_DIM,
+                HEAD_DIM,
+                1,
+            ),
+            offsets=(0, stable_block_number, 0, 0, 0, 0),
+            block_shape=(1, 1, NUM_HEAD, 1, WINDOW_SIZE, HEAD_DIM),
+            order=(5, 4, 3, 2, 1, 0),
+        )
+        stable_v_cache_ptr = tl.make_block_ptr(
+            base=kv_cache_base,
+            shape=(2, NUM_BLOCK, NUM_HEAD, 1, WINDOW_SIZE, HEAD_DIM),
+            strides=(
+                NUM_BLOCK * NUM_HEAD * WINDOW_SIZE * HEAD_DIM,
+                NUM_HEAD * WINDOW_SIZE * HEAD_DIM,
+                WINDOW_SIZE * HEAD_DIM,
+                WINDOW_SIZE * HEAD_DIM,
+                HEAD_DIM,
+                1,
+            ),
+            offsets=(1, stable_block_number, 0, 0, 0, 0),
+            block_shape=(1, 1, NUM_HEAD, 1, WINDOW_SIZE, HEAD_DIM),
+            order=(5, 4, 3, 2, 1, 0),
+        )
+
+        query_ptr = tl.make_block_ptr(
+            base=query_base,
+            shape=(NUM_BATCH, NUM_HEAD, NUM_GROUP, QUERY_LEN, HEAD_DIM),
+            strides=(
+                NUM_HEAD * NUM_GROUP * QUERY_LEN * HEAD_DIM,
+                NUM_GROUP * QUERY_LEN * HEAD_DIM,
+                QUERY_LEN * HEAD_DIM,
+                HEAD_DIM,
+                1,
+            ),
+            offsets=(batch_id, 0, 0, 0, 0),
+            block_shape=(1, NUM_HEAD, NUM_GROUP, QUERY_LEN, HEAD_DIM),
+            order=(4, 3, 2, 1, 0),
+        )
+        output_ptr = tl.make_block_ptr(
+            base=output_base,
+            shape=(NUM_BATCH, NUM_HEAD, NUM_GROUP, QUERY_LEN, HEAD_DIM),
+            strides=(
+                NUM_HEAD * NUM_GROUP * QUERY_LEN * HEAD_DIM,
+                NUM_GROUP * QUERY_LEN * HEAD_DIM,
+                QUERY_LEN * HEAD_DIM,
+                HEAD_DIM,
+                1,
+            ),
+            offsets=(batch_id, 0, 0, 0, 0),
+            block_shape=(1, NUM_HEAD, NUM_GROUP, QUERY_LEN, HEAD_DIM),
+            order=(4, 3, 2, 1, 0),
+        )
+        q = tl.load(query_ptr)
+
+        # ---- scratch rolling-window attention (identical to the naive decode kernel) ----
+        k_state = tl.load(k_block_ptr)
+        k_state = tl.reshape(k_state, (1, 1, NUM_HEAD, 1, QUERY_LEN, HEAD_DIM))
+        k_base = rblib.dynamic_load(k_cache_base_ptr)
+        k_insert = rblib.window_insert(k_base, k_state, WINDOW_AXIS, cache_start)
+        k_slice = rblib.window_slice(k_insert, cache_end, WINDOW_AXIS, WINDOW_SIZE)
+        rblib.dynamic_store(k_cache_base_ptr, k_slice)
+        # NEW: append the new K into the stable block at local_seq_idx (prefix caching).
+        # SHM-safe whole-block store (mirrors the scratch above): load the stable block,
+        # window_insert at local_seq_idx, slice back to W ending at stable_end (=
+        # local_seq_idx + query_len, in (0, W] by the no-straddle constraint, so the slice
+        # keeps the whole accumulated block [0, W) and never rolls), then a whole-block
+        # dynamic_store. A partial indexed store trips the SHM-stride bug; reusing cache_start
+        # as the end is WRONG (it is 0 on the first chunk -> a degenerate slice that zeroes
+        # the chunk), so stable_end is precomputed on the host and passed in.
+        stable_k_base = rblib.dynamic_load(stable_k_cache_ptr)
+        stable_k_insert = rblib.window_insert(
+            stable_k_base, k_state, WINDOW_AXIS, local_seq_idx
+        )
+        stable_k_slice = rblib.window_slice(
+            stable_k_insert, stable_end, WINDOW_AXIS, WINDOW_SIZE
+        )
+        rblib.dynamic_store(stable_k_cache_ptr, stable_k_slice)
+
+        k_insert = rblib.nn_pad(k_insert, 0.0, WINDOW_AXIS, (0, PAD_SIZE), "constant")
+        k_insert = tl.reshape(
+            k_insert, (1, NUM_HEAD, 1, WINDOW_SIZE + QUERY_LEN + PAD_SIZE, HEAD_DIM)
+        )
+        k_insert = tl.permute(k_insert, (0, 1, 2, 4, 3))
+        k = tl.broadcast_to(
+            k_insert,
+            (1, NUM_HEAD, NUM_GROUP, HEAD_DIM, WINDOW_SIZE + QUERY_LEN + PAD_SIZE),
+        )
+        qk = tl.dot(q, k)
+        qk_scaled = qk * qk_scale
+        window_qk_scaled = rblib.window_softmax(
+            qk_scaled, cache_start, window_size=WINDOW_SIZE
+        )
+
+        v_state = tl.load(v_block_ptr)
+        v_state = tl.reshape(v_state, (1, 1, NUM_HEAD, 1, QUERY_LEN, HEAD_DIM))
+        v_base = rblib.dynamic_load(v_cache_base_ptr)
+        v_insert = rblib.window_insert(v_base, v_state, WINDOW_AXIS, cache_start)
+        v_slice = rblib.window_slice(v_insert, cache_end, WINDOW_AXIS, WINDOW_SIZE)
+        rblib.dynamic_store(v_cache_base_ptr, v_slice)
+        # NEW: append the new V into the stable block at local_seq_idx (SHM-safe
+        # whole-block store; see the K append above for the rationale).
+        stable_v_base = rblib.dynamic_load(stable_v_cache_ptr)
+        stable_v_insert = rblib.window_insert(
+            stable_v_base, v_state, WINDOW_AXIS, local_seq_idx
+        )
+        stable_v_slice = rblib.window_slice(
+            stable_v_insert, stable_end, WINDOW_AXIS, WINDOW_SIZE
+        )
+        rblib.dynamic_store(stable_v_cache_ptr, stable_v_slice)
+
+        v_insert = rblib.nn_pad(
+            v_insert, 0.0, (WINDOW_AXIS), ((0, PAD_SIZE)), "constant"
+        )
+        v_insert = tl.reshape(
+            v_insert, (1, NUM_HEAD, 1, WINDOW_SIZE + QUERY_LEN + PAD_SIZE, HEAD_DIM)
+        )
+        v = tl.broadcast_to(
+            v_insert,
+            (1, NUM_HEAD, NUM_GROUP, WINDOW_SIZE + QUERY_LEN + PAD_SIZE, HEAD_DIM),
+        )
+        attn_out = tl.dot(window_qk_scaled, v)
+        tl.store(output_ptr, attn_out)
+
+
+@triton_op(
+    "rbln_triton_ops::sliding_window_attention_scratch_stable_decode", mutates_args=()
+)
+def sliding_window_attention_scratch_stable_decode_wrapper(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    kv_cache: torch.Tensor,
+    cache_seq_len: torch.Tensor,
+    cache_offset: torch.Tensor,
+    qk_scale: torch.Tensor,
+    block_table: torch.Tensor,
+    stable_block_table: torch.Tensor,
+    local_seq_idx: torch.Tensor,
+    stable_end: torch.Tensor,
+    dummy: torch.Tensor,
+) -> torch.Tensor:
+    """SWA decode over the scratch block (unchanged attention) + append to the stable block."""
+    original_dtype = query.dtype
+
+    query = query.to(torch.float32)
+    key = key.to(torch.float32)
+    value = value.to(torch.float32)
+    kv_cache = kv_cache.to(torch.float32)
+    qk_scale = qk_scale.to(torch.float32)
+    output = torch.empty_like(query)
+
+    query = rblib.align_tensor_last_dim_to_64(query)
+    key = rblib.align_tensor_last_dim_to_64(key)
+    value = rblib.align_tensor_last_dim_to_64(value)
+
+    NUM_HEAD = query.shape[1]
+    NUM_GROUP = query.shape[2]
+    HEAD_DIM = query.shape[-1]
+    QUERY_LEN = query.shape[-2]
+    WINDOW_SIZE = kv_cache.shape[-2]
+    NUM_BATCH = query.shape[0]
+    NUM_BLOCK = kv_cache.shape[1]
+    DIM_BLOCK_TABLE = block_table.dim()
+
+    params = [
+        query,
+        key,
+        value,
+        kv_cache,
+        output,
+        cache_seq_len,
+        cache_offset,
+        qk_scale,
+        block_table,
+        stable_block_table,
+        local_seq_idx,
+        stable_end,
+        qk_scale,
+        NUM_HEAD,
+        NUM_GROUP,
+        HEAD_DIM,
+        QUERY_LEN,
+        WINDOW_SIZE,
+        NUM_BATCH,
+        NUM_BLOCK,
+        DIM_BLOCK_TABLE,
+    ]
+
+    warmup(sliding_window_attention_scratch_stable_decode, *params)
+
+    return output.to(original_dtype)
+
+
+@register_fake("rbln_triton_ops::sliding_window_attention_scratch_stable_decode")
+def _(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    kv_cache: torch.Tensor,
+    cache_seq_len: torch.Tensor,
+    cache_offset: torch.Tensor,
+    qk_scale: torch.Tensor,
+    block_table: torch.Tensor,
+    stable_block_table: torch.Tensor,
+    local_seq_idx: torch.Tensor,
+    stable_end: torch.Tensor,
+    dummy: torch.Tensor,
+) -> torch.Tensor:
+    return torch.empty_like(query)
+
+
+# =====================================================================================
+# SCRATCH + STABLE SWA prefill (chunk of L query rows; NUM_BATCH == 1). Prefill analogue
+# of the scratch+stable decode: attention is IDENTICAL to the naive prefill over the
+# scratch block, plus an append-only write of the L new K/V into the stable block at
+# [local_seq_idx, local_seq_idx + L). Requires local_seq_idx + L <= block_size. No join,
+# no SHM. block_table is 1D for prefill (as in the naive prefill kernel).
+# =====================================================================================
+@triton.jit
+def sliding_window_attention_scratch_stable_prefill(
+    query_base,
+    key_base,
+    value_base,
+    kv_cache_base,
+    output_base,
+    cache_seq_len_base,
+    cache_offset_base,
+    qk_scale,
+    block_table_base,  # 1D scratch block table
+    stable_block_table_base,  # NEW: 1D append-only stable block table (prefix-cacheable)
+    local_seq_idx_base,  # NEW: chunk start in the stable block (= seq_idx % block_size)
+    stable_end_base,  # NEW: stable window_slice end (= local_seq_idx + query_len, in (0, W])
+    dummy,
+    NUM_HEAD: tl.constexpr,
+    NUM_GROUP: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    QUERY_LEN: tl.constexpr,  # L (prefill chunk)
+    WINDOW_SIZE: tl.constexpr,
+    NUM_BATCH: tl.constexpr,
+    NUM_BLOCK: tl.constexpr,
+    DIM_BLOCK_TABLE: tl.constexpr,
+):
+    tl.static_assert(NUM_BATCH == 1)
+    NUM_PARTITION: tl.constexpr = 1
+    WINDOW_AXIS: tl.constexpr = 4
+
+    for batch_id in tl.static_range(0, NUM_BATCH, 1):
+        cache_seq_len_ptr = tl.make_block_ptr(
+            base=cache_seq_len_base,
+            shape=(NUM_BATCH, WINDOW_SIZE // WINDOW_SIZE),
+            strides=(WINDOW_SIZE // WINDOW_SIZE, 1),
+            offsets=(batch_id, 0),
+            block_shape=(1, 1),
+            order=(1, 0),
+        )
+        cache_offset_ptr = tl.make_block_ptr(
+            base=cache_offset_base,
+            shape=(NUM_BATCH, WINDOW_SIZE // WINDOW_SIZE),
+            strides=(WINDOW_SIZE // WINDOW_SIZE, 1),
+            offsets=(batch_id, 0),
+            block_shape=(1, 1),
+            order=(1, 0),
+        )
+        local_seq_idx_ptr = tl.make_block_ptr(
+            base=local_seq_idx_base,
+            shape=(NUM_BATCH, WINDOW_SIZE // WINDOW_SIZE),
+            strides=(WINDOW_SIZE // WINDOW_SIZE, 1),
+            offsets=(batch_id, 0),
+            block_shape=(1, 1),
+            order=(1, 0),
+        )
+        stable_end_ptr = tl.make_block_ptr(
+            base=stable_end_base,
+            shape=(NUM_BATCH, WINDOW_SIZE // WINDOW_SIZE),
+            strides=(WINDOW_SIZE // WINDOW_SIZE, 1),
+            offsets=(batch_id, 0),
+            block_shape=(1, 1),
+            order=(1, 0),
+        )
+
+        # -- get physical block index from block table (1D for prefill) --
+        block_table_ptr = tl.make_block_ptr(
+            base=block_table_base,
+            shape=(NUM_PARTITION,),
+            strides=(1,),
+            offsets=(batch_id,),
+            block_shape=(1,),
+            order=(0,),
+        )
+        tl.static_assert(len(block_table_ptr.type.element_ty.shape) == DIM_BLOCK_TABLE)
+        stable_block_table_ptr = tl.make_block_ptr(
+            base=stable_block_table_base,
+            shape=(NUM_PARTITION,),
+            strides=(1,),
+            offsets=(batch_id,),
+            block_shape=(1,),
+            order=(0,),
+        )
+
+        cache_start = rblib.to_dynamic_index(cache_seq_len_ptr)
+        cache_end = rblib.to_dynamic_index(cache_offset_ptr)
+        local_seq_idx = rblib.to_dynamic_index(local_seq_idx_ptr)
+        stable_end = rblib.to_dynamic_index(stable_end_ptr)
+        block_number = rblib.to_dynamic_index(block_table_ptr)
+        block_number = block_number.cast(tl.int32)
+        stable_block_number = rblib.to_dynamic_index(stable_block_table_ptr)
+        stable_block_number = stable_block_number.cast(tl.int32)
+
+        k_block_ptr = tl.make_block_ptr(
+            base=key_base,
+            shape=(NUM_BATCH, NUM_HEAD, 1, QUERY_LEN, HEAD_DIM),
+            strides=(
+                NUM_HEAD * 1 * QUERY_LEN * HEAD_DIM,
+                1 * QUERY_LEN * HEAD_DIM,
+                QUERY_LEN * HEAD_DIM,
+                HEAD_DIM,
+                1,
+            ),
+            offsets=(batch_id, 0, 0, 0, 0),
+            block_shape=(1, NUM_HEAD, 1, QUERY_LEN, HEAD_DIM),
+            order=(4, 3, 2, 1, 0),
+        )
+        v_block_ptr = tl.make_block_ptr(
+            base=value_base,
+            shape=(NUM_BATCH, NUM_HEAD, 1, QUERY_LEN, HEAD_DIM),
+            strides=(
+                NUM_HEAD * 1 * QUERY_LEN * HEAD_DIM,
+                1 * QUERY_LEN * HEAD_DIM,
+                QUERY_LEN * HEAD_DIM,
+                HEAD_DIM,
+                1,
+            ),
+            offsets=(batch_id, 0, 0, 0, 0),
+            block_shape=(1, NUM_HEAD, 1, QUERY_LEN, HEAD_DIM),
+            order=(4, 3, 2, 1, 0),
+        )
+        k_cache_base_ptr = tl.make_block_ptr(
+            base=kv_cache_base,
+            shape=(2, NUM_BLOCK, NUM_HEAD, 1, WINDOW_SIZE, HEAD_DIM),
+            strides=(
+                NUM_BLOCK * NUM_HEAD * WINDOW_SIZE * HEAD_DIM,
+                NUM_HEAD * WINDOW_SIZE * HEAD_DIM,
+                WINDOW_SIZE * HEAD_DIM,
+                WINDOW_SIZE * HEAD_DIM,
+                HEAD_DIM,
+                1,
+            ),
+            offsets=(0, block_number, 0, 0, 0, 0),
+            block_shape=(1, 1, NUM_HEAD, 1, WINDOW_SIZE, HEAD_DIM),
+            order=(5, 4, 3, 2, 1, 0),
+        )
+        v_cache_base_ptr = tl.make_block_ptr(
+            base=kv_cache_base,
+            shape=(2, NUM_BLOCK, NUM_HEAD, 1, WINDOW_SIZE, HEAD_DIM),
+            strides=(
+                NUM_BLOCK * NUM_HEAD * WINDOW_SIZE * HEAD_DIM,
+                NUM_HEAD * WINDOW_SIZE * HEAD_DIM,
+                WINDOW_SIZE * HEAD_DIM,
+                WINDOW_SIZE * HEAD_DIM,
+                HEAD_DIM,
+                1,
+            ),
+            offsets=(1, block_number, 0, 0, 0, 0),
+            block_shape=(1, 1, NUM_HEAD, 1, WINDOW_SIZE, HEAD_DIM),
+            order=(5, 4, 3, 2, 1, 0),
+        )
+        stable_k_cache_ptr = tl.make_block_ptr(
+            base=kv_cache_base,
+            shape=(2, NUM_BLOCK, NUM_HEAD, 1, WINDOW_SIZE, HEAD_DIM),
+            strides=(
+                NUM_BLOCK * NUM_HEAD * WINDOW_SIZE * HEAD_DIM,
+                NUM_HEAD * WINDOW_SIZE * HEAD_DIM,
+                WINDOW_SIZE * HEAD_DIM,
+                WINDOW_SIZE * HEAD_DIM,
+                HEAD_DIM,
+                1,
+            ),
+            offsets=(0, stable_block_number, 0, 0, 0, 0),
+            block_shape=(1, 1, NUM_HEAD, 1, WINDOW_SIZE, HEAD_DIM),
+            order=(5, 4, 3, 2, 1, 0),
+        )
+        stable_v_cache_ptr = tl.make_block_ptr(
+            base=kv_cache_base,
+            shape=(2, NUM_BLOCK, NUM_HEAD, 1, WINDOW_SIZE, HEAD_DIM),
+            strides=(
+                NUM_BLOCK * NUM_HEAD * WINDOW_SIZE * HEAD_DIM,
+                NUM_HEAD * WINDOW_SIZE * HEAD_DIM,
+                WINDOW_SIZE * HEAD_DIM,
+                WINDOW_SIZE * HEAD_DIM,
+                HEAD_DIM,
+                1,
+            ),
+            offsets=(1, stable_block_number, 0, 0, 0, 0),
+            block_shape=(1, 1, NUM_HEAD, 1, WINDOW_SIZE, HEAD_DIM),
+            order=(5, 4, 3, 2, 1, 0),
+        )
+
+        query_ptr = tl.make_block_ptr(
+            base=query_base,
+            shape=(NUM_BATCH, NUM_HEAD, NUM_GROUP, QUERY_LEN, HEAD_DIM),
+            strides=(
+                NUM_HEAD * NUM_GROUP * QUERY_LEN * HEAD_DIM,
+                NUM_GROUP * QUERY_LEN * HEAD_DIM,
+                QUERY_LEN * HEAD_DIM,
+                HEAD_DIM,
+                1,
+            ),
+            offsets=(batch_id, 0, 0, 0, 0),
+            block_shape=(1, NUM_HEAD, NUM_GROUP, QUERY_LEN, HEAD_DIM),
+            order=(4, 3, 2, 1, 0),
+        )
+        output_ptr = tl.make_block_ptr(
+            base=output_base,
+            shape=(NUM_BATCH, NUM_HEAD, NUM_GROUP, QUERY_LEN, HEAD_DIM),
+            strides=(
+                NUM_HEAD * NUM_GROUP * QUERY_LEN * HEAD_DIM,
+                NUM_GROUP * QUERY_LEN * HEAD_DIM,
+                QUERY_LEN * HEAD_DIM,
+                HEAD_DIM,
+                1,
+            ),
+            offsets=(batch_id, 0, 0, 0, 0),
+            block_shape=(1, NUM_HEAD, NUM_GROUP, QUERY_LEN, HEAD_DIM),
+            order=(4, 3, 2, 1, 0),
+        )
+        q = tl.load(query_ptr)
+
+        # ---- scratch rolling-window attention (identical to the naive prefill kernel) ----
+        k_state = tl.load(k_block_ptr)
+        k_state = tl.reshape(k_state, (1, 1, NUM_HEAD, 1, QUERY_LEN, HEAD_DIM))
+        k_base = rblib.dynamic_load(k_cache_base_ptr)
+        k_insert = rblib.window_insert(k_base, k_state, WINDOW_AXIS, cache_start)
+        k_slice = rblib.window_slice(k_insert, cache_end, WINDOW_AXIS, WINDOW_SIZE)
+        rblib.dynamic_store(k_cache_base_ptr, k_slice)
+        # NEW: append the L new K rows into the stable block at local_seq_idx.
+        # SHM-safe whole-block store (mirrors the scratch above): load the stable block,
+        # window_insert at local_seq_idx, slice back to W ending at stable_end (=
+        # local_seq_idx + query_len, in (0, W] by the no-straddle constraint, so the slice
+        # keeps the whole accumulated block [0, W) and never rolls), then a whole-block
+        # dynamic_store. A partial indexed store trips the SHM-stride bug; reusing cache_start
+        # as the end is WRONG (it is 0 on the first chunk -> a degenerate slice that zeroes
+        # the chunk), so stable_end is precomputed on the host and passed in.
+        stable_k_base = rblib.dynamic_load(stable_k_cache_ptr)
+        stable_k_insert = rblib.window_insert(
+            stable_k_base, k_state, WINDOW_AXIS, local_seq_idx
+        )
+        stable_k_slice = rblib.window_slice(
+            stable_k_insert, stable_end, WINDOW_AXIS, WINDOW_SIZE
+        )
+        rblib.dynamic_store(stable_k_cache_ptr, stable_k_slice)
+
+        k_insert = tl.reshape(
+            k_insert, (1, NUM_HEAD, 1, WINDOW_SIZE + QUERY_LEN, HEAD_DIM)
+        )
+        k_tmp = tl.permute(k_insert, (0, 1, 2, 4, 3))
+        k = tl.broadcast_to(
+            k_tmp, (1, NUM_HEAD, NUM_GROUP, HEAD_DIM, WINDOW_SIZE + QUERY_LEN)
+        )
+        qk = tl.dot(q, k)
+        qk_scaled = qk * qk_scale
+        window_qk_scaled = rblib.window_softmax(
+            qk_scaled, cache_start, window_size=WINDOW_SIZE
+        )
+
+        v_state = tl.load(v_block_ptr)
+        v_state = tl.reshape(v_state, (1, 1, NUM_HEAD, 1, QUERY_LEN, HEAD_DIM))
+        v_base = rblib.dynamic_load(v_cache_base_ptr)
+        v_insert = rblib.window_insert(v_base, v_state, WINDOW_AXIS, cache_start)
+        v_slice = rblib.window_slice(v_insert, cache_end, WINDOW_AXIS, WINDOW_SIZE)
+        rblib.dynamic_store(v_cache_base_ptr, v_slice)
+        # NEW: append the L new V rows into the stable block at local_seq_idx (SHM-safe
+        # whole-block store; see the K append above for the rationale).
+        stable_v_base = rblib.dynamic_load(stable_v_cache_ptr)
+        stable_v_insert = rblib.window_insert(
+            stable_v_base, v_state, WINDOW_AXIS, local_seq_idx
+        )
+        stable_v_slice = rblib.window_slice(
+            stable_v_insert, stable_end, WINDOW_AXIS, WINDOW_SIZE
+        )
+        rblib.dynamic_store(stable_v_cache_ptr, stable_v_slice)
+
+        v_insert = tl.reshape(
+            v_insert, (1, NUM_HEAD, 1, WINDOW_SIZE + QUERY_LEN, HEAD_DIM)
+        )
+        v = tl.broadcast_to(
+            v_insert, (1, NUM_HEAD, NUM_GROUP, WINDOW_SIZE + QUERY_LEN, HEAD_DIM)
+        )
+        attn_out = tl.dot(window_qk_scaled, v)
+        tl.store(output_ptr, attn_out)
+
+
+@triton_op(
+    "rbln_triton_ops::sliding_window_attention_scratch_stable_prefill", mutates_args=()
+)
+def sliding_window_attention_scratch_stable_prefill_wrapper(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    kv_cache: torch.Tensor,
+    cache_seq_len: torch.Tensor,
+    cache_offset: torch.Tensor,
+    qk_scale: torch.Tensor,
+    block_table: torch.Tensor,
+    stable_block_table: torch.Tensor,
+    local_seq_idx: torch.Tensor,
+    stable_end: torch.Tensor,
+    dummy: torch.Tensor,
+) -> torch.Tensor:
+    """SWA prefill over the scratch block (unchanged attention) + append to the stable block."""
+    original_dtype = query.dtype
+
+    query = query.to(torch.float32)
+    key = key.to(torch.float32)
+    value = value.to(torch.float32)
+    kv_cache = kv_cache.to(torch.float32)
+    qk_scale = qk_scale.to(torch.float32)
+    output = torch.empty_like(query)
+
+    query = rblib.align_tensor_last_dim_to_64(query)
+    key = rblib.align_tensor_last_dim_to_64(key)
+    value = rblib.align_tensor_last_dim_to_64(value)
+
+    NUM_HEAD = query.shape[1]
+    NUM_GROUP = query.shape[2]
+    HEAD_DIM = query.shape[-1]
+    QUERY_LEN = query.shape[-2]
+    WINDOW_SIZE = kv_cache.shape[-2]
+    NUM_BATCH = query.shape[0]
+    NUM_BLOCK = kv_cache.shape[1]
+    DIM_BLOCK_TABLE = block_table.dim()
+
+    params = [
+        query,
+        key,
+        value,
+        kv_cache,
+        output,
+        cache_seq_len,
+        cache_offset,
+        qk_scale,
+        block_table,
+        stable_block_table,
+        local_seq_idx,
+        stable_end,
+        qk_scale,
+        NUM_HEAD,
+        NUM_GROUP,
+        HEAD_DIM,
+        QUERY_LEN,
+        WINDOW_SIZE,
+        NUM_BATCH,
+        NUM_BLOCK,
+        DIM_BLOCK_TABLE,
+    ]
+
+    warmup(sliding_window_attention_scratch_stable_prefill, *params)
+
+    return output.to(original_dtype)
+
+
+@register_fake("rbln_triton_ops::sliding_window_attention_scratch_stable_prefill")
+def _(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    kv_cache: torch.Tensor,
+    cache_seq_len: torch.Tensor,
+    cache_offset: torch.Tensor,
+    qk_scale: torch.Tensor,
+    block_table: torch.Tensor,
+    stable_block_table: torch.Tensor,
+    local_seq_idx: torch.Tensor,
+    stable_end: torch.Tensor,
+    dummy: torch.Tensor,
+) -> torch.Tensor:
+    return torch.empty_like(query)
+
+

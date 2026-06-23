@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_MOE_REDUCE_SCATTER: bool = False
     VLLM_RBLN_SUB_BLOCK_CACHE: bool = True
     VLLM_RBLN_USE_DEVICE_TENSOR: bool = False
+    VLLM_RBLN_SWA_SCRATCH_STABLE: bool = False
 
 
 def get_dp_impl() -> str:
@@ -271,6 +272,13 @@ environment_variables = {
     # Sub-block size equals max_num_batched_tokens (prefill chunk size).
     "VLLM_RBLN_SUB_BLOCK_CACHE": lambda: (
         os.environ.get("VLLM_RBLN_SUB_BLOCK_CACHE", "True").lower() in ("true", "1")
+    ),
+    # Use the scratch+stable SWA path (RBLNScratchStableSWASpec + manager + scratch_stable
+    # kernels): rolling scratch block for attention + append-only stable blocks for prefix
+    # caching. Requires block_size == sliding_window. See
+    # new_code_plan/scratch_stable_prefix_cache_design.MD.
+    "VLLM_RBLN_SWA_SCRATCH_STABLE": lambda: (
+        os.environ.get("VLLM_RBLN_SWA_SCRATCH_STABLE", "False").lower() in ("true", "1")
     ),
     # Use RBLN device tensors end-to-end (platform device_type="rbln",
     # KV cache / inputs on device, CPU-first attention metadata, padded
