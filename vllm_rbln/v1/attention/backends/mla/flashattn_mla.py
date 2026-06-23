@@ -98,14 +98,10 @@ def _(q, kv_c_normed, k_pe, kv_cache, seq_idx, block_tables, scale):
 )
 def sparse_attn_deepseek_mla_impl(
     q_mla: torch.Tensor,  # [B, num_heads, T, qk_head_dim+rope]
-    latent_cache: torch.Tensor,  # [num_block, partition_size, 576]
     latent_kv_c_normed: torch.Tensor,  # [B, T, kv_lora_rank] (512)
     latent_k_pe: torch.Tensor,  # [B, T, qk_rope_head_dim] (64)
-    # naming to seq_idx? (sync)
+    latent_cache: torch.Tensor,  # [num_block, partition_size, 576]
     kv_seq_len: torch.Tensor,
-    # TODO(kblee): remove block args? (sync)
-    block_idx: torch.Tensor,
-    block_offset: torch.Tensor,
     block_table: torch.Tensor,
     topk_index: torch.Tensor,  # [B, T, k]
 ) -> torch.Tensor:
@@ -115,12 +111,10 @@ def sparse_attn_deepseek_mla_impl(
 @torch.library.register_fake("rbln_custom_ops::sparse_attn_deepseek_mla")
 def _(
     q_mla,
-    latent_cache,
     latent_kv_c_normed,
     latent_k_pe,
+    latent_cache,
     kv_seq_len,
-    block_idx,
-    block_offset,
     block_table,
     topk_index,
 ):

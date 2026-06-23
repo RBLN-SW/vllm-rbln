@@ -26,6 +26,11 @@ class RBLNDeepseekV32IndexerBackend(AttentionBackend):
     accept_output_buffer: bool = False
 
     @staticmethod
+    def get_name() -> str:
+        # vLLM 0.22: AttentionBackend requires get_name (abstract).
+        return "RBLN_DEEPSEEK_V32_INDEXER"
+
+    @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
         return [64]
 

@@ -33,9 +33,6 @@ def sparse_attn_deepseek_indexer_impl(
     k_indexer_cur: torch.Tensor,  # [B, T, head_dim]
     k_indexer_cache: torch.Tensor,  # [num_block, partition_size, head_dim]
     seq_idx: torch.Tensor,
-    # TODO(kblee): sync with args
-    block_idx: torch.Tensor,
-    block_offset: torch.Tensor,
     block_table: torch.Tensor,
     topk: int,
 ) -> torch.Tensor:
@@ -49,8 +46,6 @@ def _(
     k_indexer_cur,
     k_indexer_cache,
     seq_idx,
-    block_idx,
-    block_offset,
     block_table,
     topk,
 ):
@@ -105,7 +100,8 @@ def _rbln_indexer_forward(
     )
 
     # k [B, S, head_dim]
-    k, _ = self.wk(hidden_states)
+    kw, _ = self.wk_weights_proj(hidden_states)
+    k = kw[..., : self.head_dim]
     k = self.k_norm(k)
     k_pe, k_nope = torch.split(
         k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
