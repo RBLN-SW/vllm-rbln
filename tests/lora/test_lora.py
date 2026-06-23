@@ -207,9 +207,7 @@ async def add_lora():
         block_size=BLOCK_SIZE,
     )
     lora_int_ids = [1, 2, 3, 0, 1, 2]
-    async with build_async_engine_client_from_engine_args(
-        engine_args, disable_frontend_multiprocessing=True
-    ) as llm:
+    async with build_async_engine_client_from_engine_args(engine_args) as llm:
         await add_lora_request(llm, lora_int_ids)
 
 
@@ -225,9 +223,7 @@ async def list_loras():
         block_size=BLOCK_SIZE,
     )
 
-    async with build_async_engine_client_from_engine_args(
-        engine_args, disable_frontend_multiprocessing=True
-    ) as llm:
+    async with build_async_engine_client_from_engine_args(engine_args) as llm:
         lora_ids = await llm.list_loras()
 
     return lora_ids

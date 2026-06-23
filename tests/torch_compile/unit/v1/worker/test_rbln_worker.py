@@ -366,7 +366,7 @@ class TestInterfaceCompliance:
         from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
 
         sig = inspect.signature(RBLNWorker.compile_or_warm_up_model)
-        # The return annotation should be float
+        # The return annotation should be CompilationTimes
         assert (
             sig.return_annotation is CompilationTimes
             or sig.return_annotation == inspect.Parameter.empty

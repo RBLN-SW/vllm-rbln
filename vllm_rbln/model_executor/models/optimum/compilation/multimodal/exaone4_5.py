@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright 2025 Rebellions Inc. All rights reserved.
+# Copyright 2026 Rebellions Inc. All rights reserved.
 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,19 +14,14 @@
 # limitations under the License.
 
 
-def get_param_qwen2_vl(
+def get_param_exaone4_5(
     batch_size: int, max_model_len: int, block_size: int, tp_size: int
 ) -> dict:
-    # Max sequence length for Vision Transformer (ViT), representing the number of patches in an image. # noqa: E501
-    # Example: For a 224x224 pixel image with patch size 14,
-    # this produces 256 patches [(224/14) * (224/14)]. Thus, max_seq_lens must be at least 256. # noqa: E501
-    # RBLN optimization processes inference per image or video frame, so set max_seq_lens to # noqa: E501
-    # match the maximum expected resolution to optimize computation.
     param = {
         "visual": {
             # if tensor_parallel_size of submodule is not specified,
             # it inherits tensor_parallel_size of main module.
-            "max_seq_lens": 6400,
+            "max_seq_len": 6400,
         },
         "tensor_parallel_size": tp_size,
         "max_seq_len": max_model_len,
@@ -38,8 +33,3 @@ def get_param_qwen2_vl(
         param["kvcache_partition_len"] = block_size
         param["attn_impl"] = attn_impl
     return param
-
-
-get_param_qwen2_5_vl = get_param_qwen2_vl
-get_param_qwen3_vl = get_param_qwen2_vl
-get_param_qwen3_vl_moe = get_param_qwen2_vl

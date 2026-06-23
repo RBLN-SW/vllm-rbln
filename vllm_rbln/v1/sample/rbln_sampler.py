@@ -33,6 +33,7 @@ from vllm.v1.sample.sampler import Sampler as VLLMSampler
 import vllm_rbln.envs as envs
 from vllm_rbln.compilation.backends import rbln_backend
 from vllm_rbln.logger import init_logger
+from vllm_rbln.v1.sample.ops.logprobs import batched_count_greater_than
 from vllm_rbln.v1.sample.ops.penalties import (
     apply_all_penalties as rbln_apply_all_penalties,
 )
@@ -410,6 +411,59 @@ class RBLNSampler(VLLMSampler):
             temperature = torch.where(temperature < _SAMPLING_EPS, 1e-3, temperature)
         temperature = temperature.to(logits.dtype)
         return logits.div(temperature.unsqueeze(dim=1))
+
+    # NOTE(eunji.lee):
+    # mark_unbacked torch method should be called outside of torch.compile
+    @staticmethod
+    @torch.compiler.disable
+    def gather_logprobs(
+        logprobs: torch.Tensor,
+        num_logprobs: int,
+        token_ids: torch.Tensor,
+    ) -> LogprobsTensors:
+        """
+        Gather logprobs for topk and sampled/prompt token.
+
+        Args:
+          logprobs: (num tokens) x (vocab) tensor
+          num_logprobs: maximum number of logprobs to
+                        retain per token
+          token_ids: prompt tokens (if prompt logprobs)
+                     or sampled tokens (if sampled
+                     logprobs); 1D token ID tensor
+                     with (num tokens) elements
+                     Must be int64.
+
+        Returns:
+          Top-k int indices tensor, (num tokens) x (num_logprobs + 1)
+          Top-k float logprobs tensor, (num tokens) x (num_logprobs + 1)
+          Sampled token rank tensor, (num tokens)
+        """
+        assert token_ids.dtype == torch.int64
+        # Find the topK values.
+        topk_logprobs, topk_indices = torch.topk(logprobs, num_logprobs, dim=-1)
+
+        # Get with the logprob of the prompt or sampled token.
+        token_ids = token_ids.unsqueeze(-1)
+        token_logprobs = logprobs.gather(-1, token_ids)
+
+        # Compute the ranks of the actual token.
+        # Avoid 0/1 specialization recompile on the batch dimension
+        # of the compiled batched_count_greater_than. mark_unbacked makes
+        # the size fully symbolic so dynamo doesn't specialize when
+        # batch_size transitions from 1 to >=2.
+        # torch._dynamo.decorators.mark_unbacked(logprobs, 0)
+        # torch._dynamo.decorators.mark_unbacked(token_logprobs, 0)
+        token_ranks = batched_count_greater_than(logprobs, token_logprobs)
+
+        # Concatenate together with the topk.
+        indices = torch.cat((token_ids, topk_indices), dim=1)
+        logprobs = torch.cat((token_logprobs, topk_logprobs), dim=1)
+
+        # Use int32 to reduce the tensor size.
+        indices = indices.to(torch.int32)
+
+        return LogprobsTensors(indices, logprobs, token_ranks)
 
 
 WARM_UP_CONFIGS = [
