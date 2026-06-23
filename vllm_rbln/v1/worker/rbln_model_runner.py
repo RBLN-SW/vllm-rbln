@@ -38,7 +38,6 @@ from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.parallel_state import get_dp_group, get_pp_group, get_tp_group
-from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import TensorizerLoader, get_model_loader
@@ -69,6 +68,7 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 
+from vllm_rbln.forward_context import set_forward_context
 from vllm_rbln.v1.core.rbln_scheduler import RBLNSchedulerOutput
 
 if TYPE_CHECKING:
@@ -140,12 +140,13 @@ from vllm_rbln.v1.attention.kv_cache_bindings import (
 )
 from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 from vllm_rbln.v1.sample import RBLNSampler
+from vllm_rbln.v1.sample.cpu_rejection_sampler import CPURejectionSampler
 from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
 from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
 from vllm_rbln.v1.worker.metrics import PerformanceTracker, collect_metrics
-from vllm_rbln.v1.worker.utils import get_kv_cache_names
+from vllm_rbln.v1.worker.utils import compute_slot_mapping_cpu, get_kv_cache_names
 
 if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
@@ -312,12 +313,13 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             logger.info("Using RBLN sampler: %s", self.use_rbln_sampler)
             sampler = RBLNSampler(
                 logprobs_mode=self.model_config.logprobs_mode,
-                seed=self.vllm_config.model_config.seed,
                 compile_context=self.compile_context,
             )
         else:
             logger.info("Using default vLLM sampler.")
             sampler = Sampler(logprobs_mode=self.model_config.logprobs_mode)
+
+        # FIXME not compiled?
         self.sampler = sampler
 
         # Lazy initialization
@@ -375,7 +377,13 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     "Unknown speculative decoding method: "
                     f"{self.speculative_config.method}"
                 )
-            self.rejection_sampler = RBLNRejectionSampler(self.sampler)
+            if self.use_rbln_sampler:
+                self.rejection_sampler = RBLNRejectionSampler(
+                    self.sampler,
+                    compile_context=self.compile_context,
+                )
+            else:
+                self.rejection_sampler = CPURejectionSampler(self.sampler)
 
         self.num_spec_tokens = 0
         if self.speculative_config:
@@ -423,7 +431,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             vocab_size=self.model_config.get_vocab_size(),
             block_sizes=[self.cache_config.block_size],
             kernel_block_sizes=[self.cache_config.block_size],
-            is_spec_decode=bool(self.vllm_config.speculative_config),
+            num_spec_tokens=self.num_spec_tokens,
             logitsprocs=build_logitsprocs(
                 self.vllm_config,
                 self.device,
@@ -1267,8 +1275,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             out=self.input_ids.cpu[:total_query_tokens],
         )
 
-        self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
-        self.input_batch.block_table.commit_slot_mapping(total_query_tokens)
+        compute_slot_mapping_cpu(
+            self.input_batch.block_table,
+            req_indices,
+            positions_np,
+            total_num_scheduled_tokens,
+        )
 
         # Prepare the attention metadata.
         self.query_start_loc.np[0] = 0
@@ -1585,7 +1597,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         process_group_dict[DP.cpu_group.group_name] = DP.ranks
 
         options = {
-            "tensor_parallel_size": envs.VLLM_RBLN_TP_SIZE,
+            "tensor_parallel_size": envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
             "process_group_dict": process_group_dict,
             "guard_filter_fn": torch.compiler.keep_tensor_guards_unsafe,
             "mode": "strict",
@@ -2498,8 +2510,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             out=input_ids[:total_num_scheduled_tokens],
         )
 
-        input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
-        input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
+        compute_slot_mapping_cpu(
+            input_batch.block_table,
+            req_indices,
+            positions_np,
+            total_num_scheduled_tokens,
+        )
 
         query_start_loc_np = self.query_start_loc.np.copy()
         query_start_loc_np[0] = 0
@@ -2645,7 +2661,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             vocab_size=self.model_config.get_vocab_size(),
             block_sizes=[self.cache_config.block_size],
             kernel_block_sizes=[self.cache_config.block_size],
-            is_spec_decode=bool(self.vllm_config.speculative_config),
+            num_spec_tokens=self.num_spec_tokens,
             logitsprocs=build_logitsprocs(
                 self.vllm_config,
                 self.device,
@@ -2683,7 +2699,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 block_sizes=block_sizes,
                 kernel_block_sizes=kernel_block_sizes,
                 max_num_blocks_per_req=max_num_blocks,
-                is_spec_decode=bool(self.vllm_config.speculative_config),
+                num_spec_tokens=self.num_spec_tokens,
                 logitsprocs=dummy_input_batch.logitsprocs,
                 logitsprocs_need_output_token_ids=dummy_input_batch.logitsprocs_need_output_token_ids,
                 is_pooling_model=self.is_pooling_model,
@@ -4576,7 +4592,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 block_sizes=block_sizes,
                 kernel_block_sizes=kernel_block_sizes,
                 max_num_blocks_per_req=max_num_blocks,
-                is_spec_decode=bool(self.vllm_config.speculative_config),
+                num_spec_tokens=self.num_spec_tokens,
                 logitsprocs=self.input_batch.logitsprocs,
                 logitsprocs_need_output_token_ids=self.input_batch.logitsprocs_need_output_token_ids,
                 is_pooling_model=self.is_pooling_model,

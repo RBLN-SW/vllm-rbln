@@ -23,12 +23,15 @@ from vllm.model_executor.models.gemma3_mm import (
     Gemma3MultiModalProcessor,
     Gemma3ProcessingInfo,
 )
-from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.model_executor.models.interfaces_base import VllmModelForTextGeneration
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
 from .base import ModelInputForRBLN, version_error
-from .model_base import RBLNOptimumDecoderMixin, RBLNOptimumModelBase
+from .model_base import (
+    RBLNOptimumDecoderMixin,
+    RBLNOptimumModelBase,
+    RBLNOptimumMultimodalMixin,
+)
 from .optimum_attention import HybridAttentionImageManager, HybridAttentionImageStrategy
 
 logger = init_logger(__name__)
@@ -37,7 +40,22 @@ PAD_TOKEN_ID = 0
 
 
 class RBLNGemma3MultiModalProcessor(Gemma3MultiModalProcessor):
-    def _pad_for_gemma3(self, prompt_ids: list[int]):
+    def apply(self, *args, **kwargs):
+        output = super().apply(*args, **kwargs)
+        output["prompt_token_ids"] = self._pad_image_boundaries(
+            output["prompt_token_ids"]
+        )
+        return output
+
+    def _pad_image_boundaries(self, prompt_ids: list[int]) -> list[int]:
+        """Left-pad ``prompt_token_ids`` so each image block aligns to a prefill
+        chunk boundary.
+
+        The padding only inflates the prompt length vLLM sees, so vLLM allocates
+        enough KV-cache blocks. The actual chunk-aligned attention is handled
+        inside optimum-rbln, which infers the padding length from these
+        left-padded tokens.
+        """
         token_type_ids = (
             torch.tensor(prompt_ids) == self.info.get_hf_processor().image_token_id
         )
@@ -60,15 +78,6 @@ class RBLNGemma3MultiModalProcessor(Gemma3MultiModalProcessor):
         prompt_ids = [PAD_TOKEN_ID] * padded_seq_len + prompt_ids
         return prompt_ids
 
-    def apply(self, *args, **kwargs):
-        # NOTE: Check if padding works correctly
-        output = super().apply(*args, **kwargs)
-        prompt_ids = self._pad_for_gemma3(output["prompt_token_ids"])
-
-        output["prompt_token_ids"] = prompt_ids
-
-        return output
-
 
 @MULTIMODAL_REGISTRY.register_processor(
     RBLNGemma3MultiModalProcessor,
@@ -77,10 +86,17 @@ class RBLNGemma3MultiModalProcessor(Gemma3MultiModalProcessor):
 )
 class RBLNOptimumGemma3ForConditionalGeneration(
     RBLNOptimumModelBase,
+    RBLNOptimumMultimodalMixin,
     RBLNOptimumDecoderMixin,
     VllmModelForTextGeneration,
-    SupportsMultiModal,
 ):
+    @classmethod
+    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
+        if modality.startswith("image"):
+            return "<start_of_image>"
+
+        raise ValueError("Only image modality is supported")
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -140,7 +156,6 @@ class RBLNOptimumGemma3ForConditionalGeneration(
         block_tables = kwargs.pop("block_tables")
 
         if is_prompt:
-            inputs_embeds = None
             prefill_batch_idx = sliding_window_table_ids[0]
             local_block_table_id = torch.tensor([prefill_batch_idx], dtype=torch.int16)
             # token_type_ids model_input != token_type_ids of gemma3
@@ -148,9 +163,12 @@ class RBLNOptimumGemma3ForConditionalGeneration(
             token_type_ids = torch.zeros_like(input_ids)
             token_type_ids[input_ids == self.model.config.image_token_index] = 1
 
-            pixel_values = self.get_pixel_values(model_input)
-            inputs_embeds = self.model._preprocess_prefill(
-                input_ids, inputs_embeds, pixel_values
+            multimodal_embeddings = self.embed_multimodal(
+                **(model_input.multi_modal_kwargs or {})
+            )
+            inputs_embeds = self.embed_input_ids(
+                input_ids,
+                multimodal_embeddings or None,
             )
             if self.model.language_model.prefill_decoder is None:
                 raise version_error
@@ -215,20 +233,50 @@ class RBLNOptimumGemma3ForConditionalGeneration(
             logits = logits[:request_nums]
         return logits
 
-    def get_pixel_values(self, model_input: ModelInputForRBLN):
-        image_input = None
+    def get_language_model(self):
+        return self.model.language_model
 
-        if model_input.multi_modal_kwargs:
-            image_input = self._parse_and_validate_image_input(
-                **model_input.multi_modal_kwargs
-            )
-            if image_input is not None:
-                assert image_input["type"] == "pixel_values"
-                pixel_values = image_input["pixel_values"]
-        else:
-            pixel_values = None
+    def build_prefill_inputs(
+        self,
+        input_ids: torch.Tensor,
+        cached_mm_outputs: list,
+        *,
+        cache_position: torch.Tensor | None = None,
+        running_requests_ids: list[str] | None = None,
+    ) -> dict:
+        # NOTE: this guard is currently unreachable — init_model() only enables
+        # the EC path for "RBLNQwen3VLForConditionalGeneration", so Gemma3 never
+        # enters here today. It documents the contract for when EC is extended.
+        raise NotImplementedError(
+            "EC disaggregation is not implemented for Gemma3: its hybrid "
+            "sliding-window attention prefill needs attention_manager state "
+            "that build_prefill_inputs does not yet provide."
+        )
 
-        return pixel_values
+    def _process_image_input(
+        self, image_input: Gemma3ImageInputs
+    ) -> list[torch.Tensor]:
+        assert image_input["type"] == "pixel_values"
+        pixel_values = image_input["pixel_values"]
+        num_patches = image_input["num_patches"]
+
+        # Vision tower + multi-modal projector, compiled by optimum-rbln.
+        # Returns (num_patches_total, mm_tokens_per_image, hidden_size).
+        image_embeds = self.model.get_image_features(pixel_values)
+
+        if num_patches is None:
+            return list(image_embeds)
+        return [e.flatten(0, 1) for e in image_embeds.split(num_patches.tolist())]
+
+    def _embed_text_tokens(
+        self, input_ids: torch.Tensor, is_multimodal: torch.Tensor
+    ) -> torch.Tensor:
+        # Gemma3's image token can be OOV; PAD-mask those positions before the
+        # text embedding lookup (mirrors optimum-rbln's _preprocess_prefill).
+        config = self.model.config
+        if config.image_token_index >= self.model.vocab_size:
+            input_ids = input_ids.masked_fill(is_multimodal, PAD_TOKEN_ID)
+        return self.model.get_input_embeddings()(input_ids)
 
     def _parse_and_validate_image_input(
         self, **kwargs: Any

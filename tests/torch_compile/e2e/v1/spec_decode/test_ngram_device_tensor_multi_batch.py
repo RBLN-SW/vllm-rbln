@@ -29,10 +29,8 @@ longer crashes.
 
 from __future__ import annotations
 
-from dataclasses import asdict
-
 import pytest
-from vllm import EngineArgs, SamplingParams
+from vllm import SamplingParams
 
 from ...utils import managed_llm
 
@@ -54,7 +52,7 @@ PROMPTS = [
 
 
 def _llm_kwargs() -> dict:
-    args = EngineArgs(
+    return dict(
         model=MODEL_ID,
         # >= 2 so the four prompts batch together and reach the sampler in the
         # same step — the necessary condition for the crash.
@@ -72,13 +70,14 @@ def _llm_kwargs() -> dict:
             "prompt_lookup_min": 2,
         },
         seed=0,
+        disable_log_stats=False,
+        # block_size is validated in the EngineArgs ctor; pass it directly to
+        # LLM so this regression can exercise the RBLN block size.
+        block_size=BLOCK_SIZE,
     )
-    # block_size is validated in the EngineArgs ctor; assign post-hoc to bypass.
-    kwargs = asdict(args)
-    kwargs["block_size"] = BLOCK_SIZE
-    return kwargs
 
 
+@pytest.mark.skip(reason="CI is currently running without torch-rbln")
 def test_ngram_device_tensor_multi_batch(monkeypatch: pytest.MonkeyPatch) -> None:
     # Random (non-greedy) sampling so the temperature tensor is actually
     # consumed in the bonus path — this is where the broadcast used to fail.

@@ -15,7 +15,7 @@
 
 
 def get_param_qwen2_vl(
-    batch_size: int, max_model_len: int, block_size: int, tp_size: int
+    batch_size: int, max_model_len: int, block_size: int, num_devices: int
 ) -> dict:
     # Max sequence length for Vision Transformer (ViT), representing the number of patches in an image. # noqa: E501
     # Example: For a 224x224 pixel image with patch size 14,
@@ -24,11 +24,14 @@ def get_param_qwen2_vl(
     # match the maximum expected resolution to optimize computation.
     param = {
         "visual": {
+            # if num_devices of submodule is not specified,
+            # it inherits num_devices of main module.
             "max_seq_lens": 6400,
         },
-        "tensor_parallel_size": tp_size,
+        "num_devices": num_devices,
         "max_seq_len": max_model_len,
         "batch_size": batch_size,
+        "use_inputs_embeds": True,
     }
     if block_size != max_model_len:
         attn_impl = "flash_attn" if block_size != max_model_len else "eager"

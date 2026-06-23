@@ -27,9 +27,9 @@ def test_rbln_envs():
         got {rbln_envs.VLLM_RBLN_COMPILE_STRICT_MODE}"
     )
 
-    assert rbln_envs.VLLM_RBLN_TP_SIZE == 1, (
-        f"Expected VLLM_RBLN_TP_SIZE to be 1, \
-        got {rbln_envs.VLLM_RBLN_TP_SIZE}"
+    assert rbln_envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK == 1, (
+        f"Expected VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK to be 1, \
+        got {rbln_envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK}"
     )
 
     assert rbln_envs.VLLM_RBLN_SAMPLER, (
@@ -65,11 +65,6 @@ def test_rbln_envs():
     assert not rbln_envs.VLLM_RBLN_ENFORCE_MODEL_FP32, (
         f"Expected VLLM_RBLN_ENFORCE_MODEL_FP32 to be False, \
         got {rbln_envs.VLLM_RBLN_ENFORCE_MODEL_FP32}"
-    )
-
-    assert rbln_envs.VLLM_RBLN_MOE_CUSTOM_KERNEL, (
-        f"Expected VLLM_RBLN_MOE_CUSTOM_KERNEL to be True, \
-        got {rbln_envs.VLLM_RBLN_MOE_CUSTOM_KERNEL}"
     )
 
     assert rbln_envs.VLLM_RBLN_DP_INPUT_ALL_GATHER, (

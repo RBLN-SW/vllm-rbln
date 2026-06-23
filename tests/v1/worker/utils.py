@@ -6,15 +6,15 @@
 
 #     http://www.apache.org/licenses/LICENSE-2.0
 
-import os
-import tempfile
-from collections.abc import Callable
-
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+import os
+import tempfile
+from collections.abc import Callable
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
@@ -212,12 +212,15 @@ def get_vllm_config(async_scheduling=False, max_num_seqs=None):
         seed=42,
     )
     cache_config = CacheConfig(
-        block_size=IB_SIZE,
+        block_size=OB_SIZE,
         cache_dtype="auto",
         enable_prefix_caching=True,
     )
     additional_config = {
-        "attn_block_size": OB_SIZE,
+        "prefix_block_size": IB_SIZE,
+        "rbln_config": {
+            "prefill_chunk_size": IB_SIZE,
+        },
     }
     structured_outputs_config = StructuredOutputsConfig(
         backend="guidance",
