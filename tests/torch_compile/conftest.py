@@ -83,8 +83,7 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(pytest.mark.skip(reason=reason))
         elif not any(soc in target_soc for soc in required):
             reason = (
-                f"requires SOC {'/'.join(required)}; current target is "
-                f"{target_soc}"
+                f"requires SOC {'/'.join(required)}; current target is {target_soc}"
             )
             item.add_marker(pytest.mark.skip(reason=reason))
 
