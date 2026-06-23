@@ -311,22 +311,13 @@ class RBLNFlashAttnMLAImpl(MLAAttentionImpl[RBLNFlashAttentionMetadata]):
 
         if topk_indices is not None:
             # TODO(kblee): check DeepSeek-V3.2 sparse attn path to args shape or info
-            seq_lens = attn_metadata.seq_lens
-            slot_mapping = attn_metadata.slot_mapping
-            kv_seq_len = seq_lens.view(-1, 1)
-            # TODO(kblee): remove block's configuration after sync
-            block_idx = (slot_mapping // self.block_size).view(-1, 1).to(torch.int16)
-            block_offset = (slot_mapping % self.block_size).view(-1, 1).to(torch.int16)
-            block_table = attn_metadata.block_tables.to(torch.int16)
             attn_output = torch.ops.rbln_custom_ops.sparse_attn_deepseek_mla(
                 q,
-                kv_cache,
                 kv_c_normed,
                 k_pe,
-                kv_seq_len,
-                block_idx,
-                block_offset,
-                block_table,
+                kv_cache,
+                attn_metadata.seq_lens,
+                attn_metadata.block_tables,
                 topk_indices,
             )
             return self._v_up_proj(attn_output, layer.W_UV)

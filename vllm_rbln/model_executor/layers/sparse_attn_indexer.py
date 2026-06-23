@@ -88,21 +88,6 @@ def _rbln_indexer_cache_get_attn_backend(self):
     return RBLNDeepseekV32IndexerBackend
 
 
-def _resolve_indexer_index_tensors(
-    self, attn_metadata
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    block_size = self.k_cache.cache_config.block_size
-    seq_lens = attn_metadata.seq_lens
-    block_table = attn_metadata.block_tables
-    slot_mapping = attn_metadata.slot_mapping
-
-    seq_idx = seq_lens.view(-1, 1).to(torch.int16)
-    block_idx = (slot_mapping // block_size).view(-1, 1).to(torch.int16)
-    block_offset = (slot_mapping % block_size).view(-1, 1).to(torch.int16)
-    block_table = block_table.to(torch.int16)
-    return seq_idx, block_idx, block_offset, block_table
-
-
 def _rbln_indexer_forward(
     self,
     hidden_states: torch.Tensor,
@@ -144,18 +129,12 @@ def _rbln_indexer_forward(
         attn_metadata = attn_metadata[self.k_cache.prefix]
     k_cache = _resolve_kv_cache(attn_metadata, self.k_cache.layer_index)
 
-    seq_idx, block_idx, block_offset, block_table = _resolve_indexer_index_tensors(
-        self, attn_metadata
-    )
-
     topk_index = torch.ops.rbln_custom_ops.sparse_attn_deepseek_indexer(
         q_indexer,
         k_indexer_cur,
         k_cache,
-        seq_idx,
-        block_idx,
-        block_offset,
-        block_table,
+        attn_metadata.seq_lens,
+        attn_metadata.block_tables,
         self.topk_tokens,
     )
     return topk_index
