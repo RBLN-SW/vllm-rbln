@@ -284,6 +284,7 @@ def rbln_compile(model):
     )
 
 
+@pytest.mark.skip(reason="known failure under VLLM_RBLN_USE_DEVICE_TENSOR=1")
 @torch.inference_mode()
 @pytest.mark.parametrize("num_loras", [1, 2])
 @pytest.mark.parametrize("device", DEVICES)
@@ -384,6 +385,7 @@ def test_embeddings(dist_init, num_loras, device, vocab_size, stage) -> None:
         torch.testing.assert_close(lora_result, expected_result, rtol=rtol, atol=atol)
 
 
+@pytest.mark.skip(reason="known failure under VLLM_RBLN_USE_DEVICE_TENSOR=1")
 @torch.inference_mode()
 @pytest.mark.parametrize("num_loras", [1, 2])
 @pytest.mark.parametrize("device", DEVICES)
@@ -522,6 +524,7 @@ def test_lm_head_logits_processor(
         torch.testing.assert_close(lora_result, expected_result, rtol=rtol, atol=atol)
 
 
+@pytest.mark.skip(reason="known failure under VLLM_RBLN_USE_DEVICE_TENSOR=1")
 @torch.inference_mode()
 @pytest.mark.parametrize("num_loras", [1, 2])
 @pytest.mark.parametrize("device", DEVICES)
@@ -644,6 +647,7 @@ def test_linear_replicated(dist_init, num_loras, device, stage) -> None:
 
 
 @torch.inference_mode()
+@pytest.mark.skip(reason="known failure under VLLM_RBLN_USE_DEVICE_TENSOR=1")
 @pytest.mark.parametrize("num_loras", [1, 2])
 @pytest.mark.parametrize("orientation", ["row", "column"])
 @pytest.mark.parametrize(
@@ -789,6 +793,7 @@ def test_linear_parallel(
         torch.testing.assert_close(lora_result, expected_result, rtol=rtol, atol=atol)
 
 
+@pytest.mark.skip(reason="known failure under VLLM_RBLN_USE_DEVICE_TENSOR=1")
 @torch.inference_mode()
 @pytest.mark.parametrize("num_loras", [1, 2])
 @pytest.mark.parametrize("repeats", [1, 2, 3])

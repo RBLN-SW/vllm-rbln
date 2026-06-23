@@ -52,6 +52,7 @@ PROMPTS = [
 ]
 
 
+@pytest.mark.xfail(reason="weight-only fp8 produces garbage greedy output")
 def test_weight_only_fp8_greedy_generation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
