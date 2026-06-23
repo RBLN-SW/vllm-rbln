@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_MOE_REDUCE_SCATTER: bool = False
     VLLM_RBLN_SUB_BLOCK_CACHE: bool = True
     VLLM_RBLN_USE_DEVICE_TENSOR: bool = False
+    VLLM_RBLN_DISABLE_OFFLOAD: bool = False
     VLLM_RBLN_COMPILE_ONLY: bool = False
 
 
@@ -294,6 +295,15 @@ environment_variables = {
     "VLLM_RBLN_USE_DEVICE_TENSOR": (
         lambda: (
             os.environ.get("VLLM_RBLN_USE_DEVICE_TENSOR", "False").lower()
+            in ("true", "1")
+        )
+    ),
+    # Disable RBLN file offloading during model load / warm-up even when
+    # VLLM_RBLN_USE_DEVICE_TENSOR is set. Kill-switch for the offload path;
+    # weight host backings stay resident instead of being paged to disk.
+    "VLLM_RBLN_DISABLE_OFFLOAD": (
+        lambda: (
+            os.environ.get("VLLM_RBLN_DISABLE_OFFLOAD", "False").lower()
             in ("true", "1")
         )
     ),
