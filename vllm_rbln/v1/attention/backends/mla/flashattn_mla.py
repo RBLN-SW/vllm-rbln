@@ -124,13 +124,7 @@ def _(
     block_table,
     topk_index,
 ):
-    b, num_heads, seq_len, _ = q_mla.shape
-    kv_lora_rank = latent_kv_c_normed.shape[-1]
-    # TODO(kblee): check different shape? mla attn?
-    groups = kv_lora_rank // 64
-    return torch.empty(
-        (b, num_heads, groups, seq_len, 64), device=q_mla.device, dtype=q_mla.dtype
-    )
+    return _fake_mla_output(q_mla, latent_kv_c_normed)
 
 
 @register_backend(AttentionBackendEnum.FLASH_ATTN_MLA)
@@ -334,13 +328,6 @@ class RBLNFlashAttnMLAImpl(MLAAttentionImpl[RBLNFlashAttentionMetadata]):
                 block_offset,
                 block_table,
                 topk_indices,
-            )
-            # TODO(kblee): workaround ?
-            attn_output = attn_output.transpose(2, 3).reshape(
-                attn_output.shape[0],
-                attn_output.shape[1],
-                attn_output.shape[3],
-                attn_output.shape[2] * attn_output.shape[4],
             )
             return self._v_up_proj(attn_output, layer.W_UV)
 
