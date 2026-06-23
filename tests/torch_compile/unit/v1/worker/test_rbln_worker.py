@@ -156,7 +156,7 @@ def env_cleanup():
 # Patches that neutralise heavy dependencies during __init__
 _INIT_PATCHES = {
     "current_platform": "vllm_rbln.v1.worker.rbln_worker.current_platform",
-    "envs_tp": "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_TP_SIZE",
+    "envs_num_devices": "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK",  # noqa: E501
     "envs_ray": "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_NUM_RAY_NODES",
     "envs_auto_port": "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_AUTO_PORT",
     "envs_compile": "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_COMPILE_MODEL",
@@ -189,7 +189,7 @@ def _create_worker(
     rank=0,
     is_driver_worker=True,
     *,
-    tp_size=1,
+    num_devices=1,
     num_ray_nodes=1,
     has_torch_rbln_val=False,
     envs_overrides=None,
@@ -201,7 +201,7 @@ def _create_worker(
         vllm_config = _make_vllm_config()
 
     defaults = {
-        "envs_tp": tp_size,
+        "envs_num_devices": num_devices,
         "envs_ray": num_ray_nodes,
         "envs_auto_port": False,
         "envs_compile": True,
@@ -237,7 +237,7 @@ def _create_worker(
 
         # Patch scalar env values
         for key in (
-            "envs_tp",
+            "envs_num_devices",
             "envs_ray",
             "envs_auto_port",
             "envs_compile",
@@ -462,7 +462,7 @@ class TestInitDeviceEnv:
         assert os.environ["RBLN_DEVICES"] == "0"
 
     def test_tp4_single_worker(self):
-        _create_worker(tp_size=4)
+        _create_worker(num_devices=4)
         assert os.environ["RBLN_DEVICES"] == "0,1,2,3"
 
     def test_auto_device_multi(self):
@@ -472,13 +472,13 @@ class TestInitDeviceEnv:
 
     def test_tp4_multi_worker_rank1(self):
         cfg = _make_vllm_config(world_size=2)
-        _create_worker(vllm_config=cfg, local_rank=1, rank=1, tp_size=4)
+        _create_worker(vllm_config=cfg, local_rank=1, rank=1, num_devices=4)
         assert os.environ["RBLN_DEVICES"] == "4,5,6,7"
 
     def test_multiple_ray_nodes(self):
         cfg = _make_vllm_config(world_size=8)
         worker = _create_worker(
-            vllm_config=cfg, local_rank=0, rank=0, tp_size=1, num_ray_nodes=2
+            vllm_config=cfg, local_rank=0, rank=0, num_devices=1, num_ray_nodes=2
         )
         assert worker.local_world_size == 4
         assert os.environ["RBLN_DEVICES"] == "0"
@@ -486,13 +486,13 @@ class TestInitDeviceEnv:
     def test_multiple_ray_nodes_rank3(self):
         cfg = _make_vllm_config(world_size=8)
         _create_worker(
-            vllm_config=cfg, local_rank=3, rank=3, tp_size=1, num_ray_nodes=2
+            vllm_config=cfg, local_rank=3, rank=3, num_devices=1, num_ray_nodes=2
         )
         assert os.environ["RBLN_DEVICES"] == "3"
 
     def test_dp_rank_offsets_device_ids(self):
         cfg = _make_vllm_config(world_size=2, data_parallel_rank=1)
-        _create_worker(vllm_config=cfg, local_rank=0, rank=0, tp_size=1)
+        _create_worker(vllm_config=cfg, local_rank=0, rank=0, num_devices=1)
         assert os.environ["RBLN_DEVICES"] == "2"
 
     def test_explicit_device_ids(self):
@@ -504,7 +504,7 @@ class TestInitDeviceEnv:
     def test_explicit_rbln_devices_tp_rank1(self):
         os.environ["RBLN_DEVICES"] = "0,1"
         cfg = _make_vllm_config(world_size=2)
-        _create_worker(vllm_config=cfg, local_rank=1, rank=1, tp_size=2)
+        _create_worker(vllm_config=cfg, local_rank=1, rank=1, num_devices=2)
         assert os.environ["RBLN_DEVICES"] == "2,3"
 
     def test_invalid_device_ids(self):
@@ -518,17 +518,17 @@ class TestInitDeviceEnv:
         with pytest.raises(AssertionError, match="should have device count"):
             _create_worker(vllm_config=cfg)
 
-    def test_tp_size_gt1_sets_npus_env(self):
-        _create_worker(tp_size=2, has_torch_rbln_val=True)
+    def test_num_devices_gt1_sets_npus_env(self):
+        _create_worker(num_devices=2, has_torch_rbln_val=True)
         assert os.environ.get("RBLN_NPUS_PER_DEVICE") == "2"
 
     def test_tp1_no_npus_per_device(self):
-        _create_worker(tp_size=1, has_torch_rbln_val=True)
+        _create_worker(num_devices=1, has_torch_rbln_val=True)
         assert "RBLN_NPUS_PER_DEVICE" not in os.environ
 
-    def test_tp_size_gt1_no_torch_rbln(self):
+    def test_num_devices_gt1_no_torch_rbln(self):
         """Without torch_rbln, RBLN_NPUS_PER_DEVICE should not be set."""
-        _create_worker(tp_size=2, has_torch_rbln_val=False)
+        _create_worker(num_devices=2, has_torch_rbln_val=False)
         assert "RBLN_NPUS_PER_DEVICE" not in os.environ
 
     def test_local_world_size_not_divisible(self):
@@ -544,12 +544,12 @@ class TestInitDeviceEnv:
     def test_tp4_but_only_2_devices_explicit(self):
         os.environ["RBLN_DEVICES"] = "0,1"
         cfg = _make_vllm_config(world_size=2)
-        _create_worker(vllm_config=cfg, local_rank=0, rank=0, tp_size=4)
+        _create_worker(vllm_config=cfg, local_rank=0, rank=0, num_devices=4)
         assert os.environ["RBLN_DEVICES"] == "0,1,2,3"
 
     def test_device_env_with_dp_rank1_tp2(self):
         cfg = _make_vllm_config(world_size=2, data_parallel_rank=1)
-        _create_worker(vllm_config=cfg, local_rank=0, rank=0, tp_size=2)
+        _create_worker(vllm_config=cfg, local_rank=0, rank=0, num_devices=2)
         assert os.environ["RBLN_DEVICES"] == "4,5"
 
 

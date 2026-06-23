@@ -17,6 +17,7 @@ from copy import copy
 import numpy as np
 import torch
 import torch.nn as nn
+from rebel import CompileContext
 from vllm.config import VllmConfig
 from vllm.distributed.parallel_state import get_dp_group, get_pp_group, get_tp_group
 from vllm.v1.attention.backend import CommonAttentionMetadata
@@ -47,8 +48,7 @@ class RBLNEagleProposer(EagleProposer):
     def __init__(self, vllm_config: VllmConfig, device: torch.device, runner=None):
         super().__init__(vllm_config, device, runner)
 
-        from rebel import CompileContext
-
+        self.runner = runner
         self.compile_context = CompileContext(use_weight_sharing=True)
 
         if self.supports_mm_inputs:
@@ -617,7 +617,7 @@ class RBLNEagleProposer(EagleProposer):
 
         options = {
             "compile_context": self.compile_context,
-            "tensor_parallel_size": envs.VLLM_RBLN_TP_SIZE,
+            "tensor_parallel_size": envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
             "process_group_dict": process_group_dict,
             "guard_filter_fn": torch.compiler.keep_tensor_guards_unsafe,
             "mode": "strict",

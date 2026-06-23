@@ -380,7 +380,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             if self.use_rbln_sampler:
                 self.rejection_sampler = RBLNRejectionSampler(
                     self.sampler,
-                    seed=self.vllm_config.model_config.seed,
                     compile_context=self.compile_context,
                 )
             else:
@@ -1598,7 +1597,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         process_group_dict[DP.cpu_group.group_name] = DP.ranks
 
         options = {
-            "tensor_parallel_size": envs.VLLM_RBLN_TP_SIZE,
+            "tensor_parallel_size": envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
             "process_group_dict": process_group_dict,
             "guard_filter_fn": torch.compiler.keep_tensor_guards_unsafe,
             "mode": "strict",

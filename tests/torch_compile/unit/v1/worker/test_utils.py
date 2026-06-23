@@ -124,7 +124,7 @@ class TestEstimateAvailableMemory:
     @patch("vllm_rbln.v1.worker.utils.envs")
     def test_atom_device_basic(self, mock_envs, mock_platform):
         mock_platform.get_device_name.return_value = "RBLN-CA12"
-        mock_envs.VLLM_RBLN_TP_SIZE = 1
+        mock_envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK = 1
 
         model_cfg = _make_model_config()
         parallel_cfg = _make_parallel_config(tp_size=1)
@@ -141,7 +141,7 @@ class TestEstimateAvailableMemory:
     @patch("vllm_rbln.v1.worker.utils.envs")
     def test_rebel_device_basic(self, mock_envs, mock_platform):
         mock_platform.get_device_name.return_value = "RBLN-CR100"
-        mock_envs.VLLM_RBLN_TP_SIZE = 1
+        mock_envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK = 1
 
         model_cfg = _make_model_config()
         parallel_cfg = _make_parallel_config(tp_size=1)
@@ -158,7 +158,7 @@ class TestEstimateAvailableMemory:
     @patch("vllm_rbln.v1.worker.utils.envs")
     def test_unknown_device_raises(self, mock_envs, mock_platform):
         mock_platform.get_device_name.return_value = "RBLN-XX99"
-        mock_envs.VLLM_RBLN_TP_SIZE = 1
+        mock_envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK = 1
 
         model_cfg = _make_model_config()
         parallel_cfg = _make_parallel_config()
@@ -174,7 +174,7 @@ class TestEstimateAvailableMemory:
     @patch("vllm_rbln.v1.worker.utils.envs")
     def test_both_params_and_kernel_raises(self, mock_envs, mock_platform):
         mock_platform.get_device_name.return_value = "RBLN-CA12"
-        mock_envs.VLLM_RBLN_TP_SIZE = 1
+        mock_envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK = 1
 
         model_cfg = _make_model_config()
         parallel_cfg = _make_parallel_config()
@@ -192,7 +192,7 @@ class TestEstimateAvailableMemory:
     def test_estimated_kernel_size_from_params(self, mock_envs, mock_platform):
         """When kernel_size is None, it should be estimated from n_model_params."""
         mock_platform.get_device_name.return_value = "RBLN-CA12"
-        mock_envs.VLLM_RBLN_TP_SIZE = 1
+        mock_envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK = 1
 
         model_cfg = _make_model_config()
         parallel_cfg = _make_parallel_config()
@@ -209,7 +209,7 @@ class TestEstimateAvailableMemory:
     @patch("vllm_rbln.v1.worker.utils.envs")
     def test_estimated_kernel_size_from_bytes(self, mock_envs, mock_platform):
         mock_platform.get_device_name.return_value = "RBLN-CA12"
-        mock_envs.VLLM_RBLN_TP_SIZE = 1
+        mock_envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK = 1
 
         model_cfg = _make_model_config(num_layers=2, vocab_size=64, hidden_size=32)
         parallel_cfg = _make_parallel_config(tp_size=1)
@@ -226,7 +226,7 @@ class TestEstimateAvailableMemory:
     def test_no_params_no_kernel_raises(self, mock_envs, mock_platform):
         """If neither kernel_size nor n_model_params given, should raise."""
         mock_platform.get_device_name.return_value = "RBLN-CA12"
-        mock_envs.VLLM_RBLN_TP_SIZE = 1
+        mock_envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK = 1
 
         model_cfg = _make_model_config()
         parallel_cfg = _make_parallel_config()
@@ -238,7 +238,7 @@ class TestEstimateAvailableMemory:
     @patch("vllm_rbln.v1.worker.utils.envs")
     def test_n_model_params_requires_nbits(self, mock_envs, mock_platform):
         mock_platform.get_device_name.return_value = "RBLN-CA12"
-        mock_envs.VLLM_RBLN_TP_SIZE = 1
+        mock_envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK = 1
 
         model_cfg = _make_model_config()
         parallel_cfg = _make_parallel_config()
@@ -255,7 +255,7 @@ class TestEstimateAvailableMemory:
     def test_oom_raises_memory_error(self, mock_envs, mock_platform):
         """Huge kernel_size should exhaust available memory."""
         mock_platform.get_device_name.return_value = "RBLN-CA12"
-        mock_envs.VLLM_RBLN_TP_SIZE = 1
+        mock_envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK = 1
 
         model_cfg = _make_model_config()
         parallel_cfg = _make_parallel_config()
@@ -276,14 +276,14 @@ class TestEstimateAvailableMemory:
         model_cfg = _make_model_config()
         kernel = 1 * 2**30
 
-        mock_envs.VLLM_RBLN_TP_SIZE = 1
+        mock_envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK = 1
         mem_tp1 = estimate_available_memory(
             model_cfg,
             _make_parallel_config(tp_size=1),
             kernel_size=kernel,
         )
 
-        mock_envs.VLLM_RBLN_TP_SIZE = 4
+        mock_envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK = 4
         mem_tp4 = estimate_available_memory(
             model_cfg,
             _make_parallel_config(tp_size=4),
@@ -297,7 +297,7 @@ class TestEstimateAvailableMemory:
     def test_rebel_requires_tp1(self, mock_envs, mock_platform):
         """REBEL (CR) device asserts tp_size==1."""
         mock_platform.get_device_name.return_value = "RBLN-CR100"
-        mock_envs.VLLM_RBLN_TP_SIZE = 2
+        mock_envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK = 2
 
         model_cfg = _make_model_config()
         parallel_cfg = _make_parallel_config(tp_size=1)
@@ -314,7 +314,7 @@ class TestEstimateAvailableMemory:
     def test_gpu_memory_utilization_effect(self, mock_envs, mock_platform):
         """Lower utilization should give less available memory."""
         mock_platform.get_device_name.return_value = "RBLN-CA12"
-        mock_envs.VLLM_RBLN_TP_SIZE = 1
+        mock_envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK = 1
 
         model_cfg = _make_model_config()
         parallel_cfg = _make_parallel_config()
@@ -339,7 +339,7 @@ class TestEstimateAvailableMemory:
     def test_custom_buffer(self, mock_envs, mock_platform):
         """Explicit buffer should reduce available memory compared to default."""
         mock_platform.get_device_name.return_value = "RBLN-CA12"
-        mock_envs.VLLM_RBLN_TP_SIZE = 1
+        mock_envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK = 1
 
         model_cfg = _make_model_config()
         parallel_cfg = _make_parallel_config()
@@ -363,7 +363,7 @@ class TestEstimateAvailableMemory:
     def test_rsd_replicas_for_large_kv_heads(self, mock_envs, mock_platform):
         """When kv_heads < rsd_size, rsd_replicas > 1 reduces memory."""
         mock_platform.get_device_name.return_value = "RBLN-CA12"
-        mock_envs.VLLM_RBLN_TP_SIZE = 4  # rsd_size = 4
+        mock_envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK = 4  # rsd_size = 4
 
         # num_kv_heads=2, rsd_size=4 → rsd_replicas = 4//2 = 2
         model_cfg_few_heads = _make_model_config(num_kv_heads=2)
