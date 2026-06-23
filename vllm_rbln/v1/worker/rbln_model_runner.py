@@ -146,7 +146,7 @@ from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
 from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
 from vllm_rbln.v1.worker.metrics import PerformanceTracker, collect_metrics
-from vllm_rbln.v1.worker.utils import compute_slot_mapping_cpu, get_kv_cache_names
+from vllm_rbln.v1.worker.utils import compute_slot_mapping_cpu
 
 if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig

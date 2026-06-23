@@ -28,7 +28,6 @@ from vllm_rbln.logger import init_logger
 from vllm_rbln.torch_compile_backend import logged_rbln_backend
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler as VLLMSampler
-import rebel
 from vllm.config.model import LogprobsMode
 from vllm.v1.outputs import LogprobsTensors, SamplerOutput
 from vllm_rbln.v1.sample.ops.penalties import (
@@ -131,7 +130,6 @@ class RBLNSampler(VLLMSampler):
         if logprobs_mode in ("raw_logprobs", "raw_logits"):
             self.topk_topp_sampler = RBLNTopKTopPSampler(
                 logprobs_mode=logprobs_mode,
-
             )
         else:
             logger.warning_once(
