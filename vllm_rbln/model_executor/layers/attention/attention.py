@@ -12,16 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
+from functools import wraps
+
 import torch
 import vllm.model_executor.layers.attention.attention as vllm_attn
 from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.distributed.kv_transfer import (
+    get_kv_transfer_group,
+    has_kv_transfer_group,
+    is_v1_kv_transfer_group,
+)
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention.attention import (
     Attention,
     get_attention_context,
-)
-from vllm.model_executor.layers.attention.kv_transfer_utils import (
-    maybe_transfer_kv_layer,
 )
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.v1.attention.backend import AttentionType
@@ -151,8 +156,76 @@ def _rbln_get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         )
 
 
-vllm_attn.unified_attention = maybe_transfer_kv_layer(_rbln_unified_attention)
-vllm_attn.unified_attention_with_output = maybe_transfer_kv_layer(
+# NOTE(RBLN) fsw-inference#325: with a v1 KV connector + the device-tensor
+# (export) compile path, some rebel-compiler/driver versions split the attention
+# forward into multiple distinct-named executors, so rebel's nameless
+# `create_runtime` aborts warm-up with "All executors must have the same name".
+#
+# Refined fix (vs the upstream fix B that `torch._dynamo.disable`s the whole
+# wrapper and graph-breaks every attention layer): isolate the two connector
+# hook calls behind `@torch._dynamo.disable` helpers. dynamo graph-breaks only
+# at the wait/save calls; the attention `func` itself stays inside the traced
+# graph and is still compiled onto the NPU. The hooks are only reached on the
+# runtime path (connector has bound metadata), so normal serving and warm-up
+# (dummy metadata is None -> early return) incur no graph break at all.
+#
+# This mirrors the upstream change to
+# `vllm/model_executor/layers/attention/kv_transfer_utils.py`; we replicate
+# `maybe_transfer_kv_layer` here so the fix ships with vllm-rbln instead of
+# patching the vendored vllm file.
+
+
+@torch._dynamo.disable
+def _kv_transfer_wait(connector, layer_name):
+    connector.wait_for_layer_load(layer_name)
+
+
+@torch._dynamo.disable
+def _kv_transfer_save(connector, layer_name, kv_cache, attn_metadata):
+    connector.save_kv_layer(layer_name, kv_cache, attn_metadata)
+
+
+def _rbln_maybe_transfer_kv_layer(func):
+    """Like vllm's `maybe_transfer_kv_layer`, but the connector wait/save hooks
+    are routed through `torch._dynamo.disable` helpers so only they graph-break
+    (keeping the attention op in the compiled graph)."""
+    sig = inspect.signature(func)
+    param_names = list(sig.parameters.keys())
+    try:
+        layer_name_index = param_names.index("layer_name")
+    except ValueError as e:
+        raise TypeError(
+            f"Function {func.__name__} must have a 'layer_name' parameter"
+        ) from e
+
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+            return func(*args, **kwargs)
+
+        layer_name = args[layer_name_index]
+        attn_metadata, _, kv_cache, _ = get_attention_context(layer_name)
+        connector = get_kv_transfer_group()
+        if attn_metadata is None or not connector.has_connector_metadata():
+            return func(*args, **kwargs)
+
+        # Wait for KV layer on entry (graph-break: keep connector hook out of
+        # the traced attention graph).
+        _kv_transfer_wait(connector, layer_name)
+
+        # Execute attention — stays in the graph for NPU compile.
+        result = func(*args, **kwargs)
+
+        # Save KV cache layer on exit (graph-break).
+        _kv_transfer_save(connector, layer_name, kv_cache, attn_metadata)
+
+        return result
+
+    return wrapper
+
+
+vllm_attn.unified_attention = _rbln_maybe_transfer_kv_layer(_rbln_unified_attention)
+vllm_attn.unified_attention_with_output = _rbln_maybe_transfer_kv_layer(
     _rbln_unified_attention_with_output
 )
 
