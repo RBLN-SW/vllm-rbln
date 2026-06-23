@@ -12,278 +12,292 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import sys
-import types
 from collections.abc import Callable
-from contextlib import contextmanager
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import cast
 from unittest.mock import Mock
 
 import pytest
 import torch
+from vllm.platforms import current_platform
 from vllm.v1.spec_decode.medusa import MedusaProposer
 
 import vllm_rbln.v1.spec_decode.medusa as medusa_module
 from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
 
+DEVICE = torch.device(current_platform.device_type)
+
 
 class FakeMedusaModel:
+    """Draft model double that records the forward / compute_logits order."""
+
     def __init__(self):
-        self.forward_inputs: list[torch.Tensor] = []
-        self.logit_inputs: list[torch.Tensor] = []
+        self.events: list[tuple[str, torch.Tensor]] = []
 
     def __call__(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        self.forward_inputs.append(hidden_states.clone())
+        self.events.append(("forward", hidden_states.clone()))
         return hidden_states + 100
 
     def compute_logits(self, hidden_states: torch.Tensor) -> list[torch.Tensor]:
-        self.logit_inputs.append(hidden_states.clone())
-        return [
-            hidden_states + 1,
-            hidden_states + 2,
-        ]
+        self.events.append(("compute_logits", hidden_states.clone()))
+        return [hidden_states + 1, hidden_states + 2]
 
 
-class CaptureModel:
-    def __init__(self):
-        self.calls: list[torch.Tensor] = []
+def make_vllm_config(*, max_num_seqs: int = 4, enforce_eager: bool = True):
+    return SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
+        speculative_config=SimpleNamespace(enforce_eager=enforce_eager),
+    )
 
-    def __call__(self, hidden_states: torch.Tensor) -> None:
-        self.calls.append(hidden_states.clone())
 
-
-def make_fake_proposer(
+def make_proposer_stub(
     *,
+    max_num_seqs: int = 4,
     hidden_size: int = 4,
     dtype: torch.dtype = torch.float32,
+    enforce_eager: bool = True,
+    compile_context: object | None = None,
 ) -> RBLNMedusaProposer:
-    fake = object.__new__(RBLNMedusaProposer)
-    fake.hidden_size = hidden_size
-    fake.dtype = dtype
-    fake.device = torch.device("cpu")
-    fake.compile_context = object()
-    fake.vllm_config = SimpleNamespace(
-        speculative_config=SimpleNamespace(enforce_eager=True)
+    """Build a proposer without running the heavy base __init__.
+
+    Used by load_model/propose/dummy_run tests, which only read attributes
+    rather than exercise construction.
+    """
+    stub = object.__new__(RBLNMedusaProposer)
+    stub.max_num_seqs = max_num_seqs
+    stub.hidden_size = hidden_size
+    stub.dtype = dtype
+    stub.device = DEVICE
+    stub.hidden_states = torch.zeros(
+        max_num_seqs, hidden_size, device=DEVICE, dtype=dtype
     )
-    return fake
-
-
-def make_fake_group(group_name: str, ranks: list[int]) -> SimpleNamespace:
-    return SimpleNamespace(
-        device_group=SimpleNamespace(group_name=f"{group_name}_device"),
-        cpu_group=SimpleNamespace(group_name=f"{group_name}_cpu"),
-        ranks=ranks,
+    stub.compile_context = object() if compile_context is None else compile_context
+    stub.vllm_config = make_vllm_config(
+        max_num_seqs=max_num_seqs, enforce_eager=enforce_eager
     )
+    return stub
 
 
-# Verifies that __init__ delegates to the base proposer and creates a compile context.
-def test_init_creates_compile_context_with_weight_sharing(monkeypatch):
-    super_init = Mock()
-    compile_context_instance = object()
-    compile_context_ctor = Mock(return_value=compile_context_instance)
+def patch_base_init(
+    monkeypatch,
+    *,
+    hidden_size: int,
+    dtype: torch.dtype,
+) -> None:
+    """Stand in for MedusaProposer.__init__ so real __init__ can run on RBLN."""
 
     def fake_super_init(self, vllm_config, device):
-        super_init(vllm_config, device)
         self.vllm_config = vllm_config
         self.device = device
-
-    rebel_module = types.ModuleType("rebel")
-    compile_context_module = types.ModuleType("rebel.compile_context")
-    compile_context_module.CompileContext = compile_context_ctor  # type: ignore[attr-defined]
-    rebel_module.compile_context = compile_context_module  # type: ignore[attr-defined]
+        self.hidden_size = hidden_size
+        self.dtype = dtype
 
     monkeypatch.setattr(MedusaProposer, "__init__", fake_super_init)
-    monkeypatch.setitem(sys.modules, "rebel", rebel_module)
-    monkeypatch.setitem(sys.modules, "rebel.compile_context", compile_context_module)
-
-    vllm_config = object()
-    device = torch.device("cpu")
-
-    proposer = RBLNMedusaProposer(vllm_config, device)
-
-    super_init.assert_called_once_with(vllm_config, device)
-    compile_context_ctor.assert_called_once_with(use_weight_sharing=True)
-    assert proposer.compile_context is compile_context_instance
 
 
-# Verifies that Medusa stacks per-head argmax outputs into [batch, num_heads].
-def test_propose_returns_headwise_argmax_stack():
-    fake = make_fake_proposer()
-    fake.model_executable = lambda hidden_states: [
-        torch.tensor(
-            [[0.0, 4.0, 1.0], [5.0, 1.0, 0.0]],
-            dtype=torch.float32,
-        ),
-        torch.tensor(
-            [[7.0, 1.0, 0.0], [0.0, 2.0, 6.0]],
-            dtype=torch.float32,
-        ),
-        torch.tensor(
-            [[0.0, 1.0, 8.0], [9.0, 1.0, 0.0]],
-            dtype=torch.float32,
-        ),
-    ]
+# ---------------------------------------------------------------------------
+# __init__
+# ---------------------------------------------------------------------------
 
-    output = RBLNMedusaProposer.propose(
-        fake,
-        target_hidden_states=torch.zeros((2, fake.hidden_size), dtype=torch.float32),
-        sampling_metadata=None,
+
+# Verifies __init__ preallocates a persistent buffer padded to max_num_seqs.
+def test_init_preallocates_padded_hidden_states(monkeypatch):
+    patch_base_init(monkeypatch, hidden_size=6, dtype=torch.float16)
+    monkeypatch.setattr(
+        medusa_module, "create_compile_context", Mock(return_value=object())
     )
+    vllm_config = make_vllm_config(max_num_seqs=4)
 
-    torch.testing.assert_close(
-        output,
-        torch.tensor([[1, 0, 2], [0, 2, 0]], dtype=torch.int64),
-    )
+    proposer = RBLNMedusaProposer(vllm_config, DEVICE)
+
+    assert proposer.hidden_states.shape == (4, 6)
+    assert proposer.hidden_states.dtype == torch.float16
+    assert proposer.hidden_states.device == DEVICE
+    assert torch.count_nonzero(proposer.hidden_states) == 0
 
 
-# Verifies that eager mode installs the direct model wrapper and skips compile.
-def test_load_model_uses_eager_wrapper_when_enforce_eager(monkeypatch):
-    fake = make_fake_proposer()
-    fake.vllm_config.speculative_config.enforce_eager = True
+# Verifies an injected compile context is used verbatim and no new one is made.
+def test_init_uses_injected_compile_context(monkeypatch):
+    patch_base_init(monkeypatch, hidden_size=4, dtype=torch.float32)
+    create_compile_context = Mock()
+    monkeypatch.setattr(medusa_module, "create_compile_context", create_compile_context)
+    injected = object()
+
+    proposer = RBLNMedusaProposer(make_vllm_config(), DEVICE, compile_context=injected)
+
+    assert proposer.compile_context is injected
+    create_compile_context.assert_not_called()
+
+
+# Verifies __init__ builds a weight-sharing compile context when none is given.
+def test_init_creates_compile_context_when_not_provided(monkeypatch):
+    patch_base_init(monkeypatch, hidden_size=4, dtype=torch.float32)
+    sentinel = object()
+    create_compile_context = Mock(return_value=sentinel)
+    monkeypatch.setattr(medusa_module, "create_compile_context", create_compile_context)
+
+    proposer = RBLNMedusaProposer(make_vllm_config(), DEVICE)
+
+    create_compile_context.assert_called_once_with(use_weight_sharing=True)
+    assert proposer.compile_context is sentinel
+
+
+# ---------------------------------------------------------------------------
+# load_model
+# ---------------------------------------------------------------------------
+
+
+# Verifies either eager trigger installs the direct wrapper and skips compile.
+@pytest.mark.parametrize(
+    ("enforce_eager", "compile_model"),
+    [
+        (True, True),  # enforce_eager arm
+        (False, False),  # VLLM_RBLN_COMPILE_MODEL arm
+    ],
+)
+def test_load_model_uses_eager_wrapper(monkeypatch, enforce_eager, compile_model):
+    fake = make_proposer_stub(enforce_eager=enforce_eager)
     fake_model = FakeMedusaModel()
 
     def fake_super_load_model(self, target_model):
         self.model = fake_model
 
+    compile_mock = Mock(side_effect=AssertionError("compile must not run"))
     monkeypatch.setattr(MedusaProposer, "load_model", fake_super_load_model)
-    monkeypatch.setattr(medusa_module.envs, "VLLM_RBLN_COMPILE_MODEL", True)
-    fake._compile_model = Mock(
-        side_effect=AssertionError("_compile_model should not be used")
-    )
+    monkeypatch.setattr(medusa_module, "compile", compile_mock)
+    monkeypatch.setattr(medusa_module.envs, "VLLM_RBLN_COMPILE_MODEL", compile_model)
 
     RBLNMedusaProposer.load_model(fake, target_model=object())
+
+    compile_mock.assert_not_called()
 
     hidden_states = torch.arange(8, dtype=torch.float32).view(2, 4)
     logits = fake.model_executable(hidden_states)
 
-    fake._compile_model.assert_not_called()
-    torch.testing.assert_close(fake_model.forward_inputs[0], hidden_states)
-    torch.testing.assert_close(fake_model.logit_inputs[0], hidden_states + 100)
+    # Wrapper composes forward(...) then compute_logits(...) in that order.
+    assert [name for name, _ in fake_model.events] == ["forward", "compute_logits"]
+    torch.testing.assert_close(fake_model.events[0][1], hidden_states)
+    torch.testing.assert_close(fake_model.events[1][1], hidden_states + 100)
     torch.testing.assert_close(logits[0], hidden_states + 101)
     torch.testing.assert_close(logits[1], hidden_states + 102)
 
 
-# Verifies that compile mode routes the wrapper through _compile_model.
-def test_load_model_uses_compile_wrapper_when_enabled(monkeypatch):
-    fake = make_fake_proposer()
-    fake.vllm_config.speculative_config.enforce_eager = False
+# Verifies the compile path routes the wrapper through compile() with the
+# proposer's contract args, and mode tracks the strict-mode env flag.
+@pytest.mark.parametrize("strict", [True, False])
+def test_load_model_compiles_wrapper(monkeypatch, strict):
+    fake = make_proposer_stub(enforce_eager=False)
     fake_model = FakeMedusaModel()
     compiled_sentinel = object()
-    captured_wrapper: Callable[[torch.Tensor], list[torch.Tensor]] | None = None
+    process_group_sentinel = object()
+    captured: dict[str, object] = {}
 
     def fake_super_load_model(self, target_model):
         self.model = fake_model
 
-    def fake_compile_model(
-        wrapper: Callable[[torch.Tensor], list[torch.Tensor]],
-    ):
-        nonlocal captured_wrapper
-        captured_wrapper = wrapper
+    def fake_compile(target, **kwargs):
+        captured["target"] = target
+        captured.update(kwargs)
         return compiled_sentinel
 
     monkeypatch.setattr(MedusaProposer, "load_model", fake_super_load_model)
+    monkeypatch.setattr(medusa_module, "compile", fake_compile)
+    monkeypatch.setattr(
+        medusa_module, "build_process_group_dict", lambda: process_group_sentinel
+    )
     monkeypatch.setattr(medusa_module.envs, "VLLM_RBLN_COMPILE_MODEL", True)
-    fake._compile_model = Mock(side_effect=fake_compile_model)
+    monkeypatch.setattr(medusa_module.envs, "VLLM_RBLN_TP_SIZE", 8)
+    monkeypatch.setattr(medusa_module.envs, "VLLM_RBLN_COMPILE_STRICT_MODE", strict)
 
     RBLNMedusaProposer.load_model(fake, target_model=object())
 
     assert fake.model_executable is compiled_sentinel
-    fake._compile_model.assert_called_once()
+    assert captured["dynamic"] is False
+    assert captured["fullgraph"] is True
+    assert captured["compile_context"] is fake.compile_context
+    assert captured["tensor_parallel_size"] == 8
+    assert captured["process_group_dict"] is process_group_sentinel
+    assert captured["guard_filter_fn"] is torch.compiler.keep_tensor_guards_unsafe
+    assert captured["mode"] == ("strict" if strict else "")
 
+    # The compiled target is the wrapper composing forward then compute_logits.
     hidden_states = torch.arange(8, dtype=torch.float32).view(2, 4)
-    assert captured_wrapper is not None
-    logits = captured_wrapper(hidden_states)
-
-    torch.testing.assert_close(fake_model.forward_inputs[0], hidden_states)
-    torch.testing.assert_close(fake_model.logit_inputs[0], hidden_states + 100)
+    target = cast(Callable[[torch.Tensor], list[torch.Tensor]], captured["target"])
+    logits = target(hidden_states)
+    assert [name for name, _ in fake_model.events] == ["forward", "compute_logits"]
     torch.testing.assert_close(logits[0], hidden_states + 101)
     torch.testing.assert_close(logits[1], hidden_states + 102)
 
 
-# Verifies that RBLN compile options include process groups and optional cache_dir.
-@pytest.mark.parametrize(
-    ("disable_compile_cache", "expect_cache_dir"),
-    [
-        (False, True),
-        (True, False),
-    ],
-)
-def test_compile_model_builds_expected_rbln_compile_options(
-    monkeypatch, disable_compile_cache: bool, expect_cache_dir: bool
-):
-    fake = make_fake_proposer()
-    tp_group = make_fake_group("tp", [0, 1])
-    pp_group = make_fake_group("pp", [0])
-    dp_group = make_fake_group("dp", [0, 2])
-    captured: dict[str, Any] = {}
-    compiled_sentinel = object()
-
-    monkeypatch.setattr(medusa_module, "get_tp_group", lambda: tp_group)
-    monkeypatch.setattr(medusa_module, "get_pp_group", lambda: pp_group)
-    monkeypatch.setattr(medusa_module, "get_dp_group", lambda: dp_group)
-    monkeypatch.setattr(medusa_module.envs, "VLLM_RBLN_TP_SIZE", 8)
-    monkeypatch.setattr(
-        medusa_module.envs, "VLLM_DISABLE_COMPILE_CACHE", disable_compile_cache
-    )
-    monkeypatch.setattr(medusa_module.envs, "VLLM_CACHE_ROOT", "/tmp/test-cache")
-
-    def fake_torch_compile(model, backend, options, dynamic):
-        captured["model"] = model
-        captured["backend"] = backend
-        captured["options"] = options
-        captured["dynamic"] = dynamic
-        return compiled_sentinel
-
-    monkeypatch.setattr(medusa_module.torch, "compile", fake_torch_compile)
-
-    model = Mock()
-    output = RBLNMedusaProposer._compile_model(fake, model)
-
-    assert output is compiled_sentinel
-    assert captured["model"] is model
-    assert captured["backend"] is medusa_module.rbln_backend
-    assert captured["dynamic"] is False
-
-    options = cast(dict[str, Any], captured["options"])
-    assert options["compile_context"] is fake.compile_context
-    assert options["tensor_parallel_size"] == 8
-    assert options["guard_filter_fn"] is torch.compiler.keep_tensor_guards_unsafe
-    assert options["mode"] == "strict"
-    assert options["process_group_dict"] == {
-        "tp_device": [0, 1],
-        "tp_cpu": [0, 1],
-        "pp_device": [0],
-        "pp_cpu": [0],
-        "dp_device": [0, 2],
-        "dp_cpu": [0, 2],
-    }
-    if expect_cache_dir:
-        assert options["cache_dir"] == "/tmp/test-cache/rbln"
-    else:
-        assert "cache_dir" not in options
+# ---------------------------------------------------------------------------
+# propose
+# ---------------------------------------------------------------------------
 
 
-# Verifies that dummy_run uses the requested batch size in both context and input shape.
-def test_dummy_run_uses_batch_sized_hidden_states_and_forward_context(monkeypatch):
-    fake = make_fake_proposer(hidden_size=6, dtype=torch.float16)
-    fake.model = CaptureModel()
+# Verifies propose writes the active rows into the persistent buffer in place,
+# preserves padding rows, and hands the whole buffer to the executable.
+def test_propose_uses_padded_hidden_state_buffer():
+    fake = make_proposer_stub(max_num_seqs=4, hidden_size=4)
+    sentinel = torch.full((2, 4), -999.0, dtype=torch.float32)
+    fake.hidden_states[2:] = sentinel
     captured: dict[str, object] = {}
 
-    @contextmanager
-    def fake_forward_context(attn_metadata, vllm_config, num_tokens):
-        captured["attn_metadata"] = attn_metadata
-        captured["vllm_config"] = vllm_config
-        captured["num_tokens"] = num_tokens
-        yield
+    def model_executable(hidden_states: torch.Tensor) -> list[torch.Tensor]:
+        captured["buffer"] = hidden_states
+        return [torch.zeros((4, 3), dtype=torch.float32)]
 
-    monkeypatch.setattr(medusa_module, "set_forward_context", fake_forward_context)
+    fake.model_executable = model_executable
+    target_hidden_states = torch.arange(8, dtype=torch.float32).view(2, 4)
 
-    RBLNMedusaProposer.dummy_run(fake, batch_size=3)
+    RBLNMedusaProposer.propose(
+        fake, target_hidden_states=target_hidden_states, sampling_metadata=None
+    )
 
-    assert captured["attn_metadata"] is None
-    assert captured["vllm_config"] is fake.vllm_config
-    assert captured["num_tokens"] == 3
-    assert len(fake.model.calls) == 1
-    assert fake.model.calls[0].shape == (3, 6)
-    assert fake.model.calls[0].dtype == torch.float16
+    # Same object passed through (static address matters for compile).
+    assert captured["buffer"] is fake.hidden_states
+    torch.testing.assert_close(fake.hidden_states[:2], target_hidden_states)
+    torch.testing.assert_close(fake.hidden_states[2:], sentinel)
+
+
+# Verifies per-head argmax is stacked into [batch, num_heads] for the active
+# batch, ignoring the padded tail rows of the logits.
+def test_propose_returns_headwise_argmax_for_active_batch():
+    fake = make_proposer_stub(max_num_seqs=4, hidden_size=4)
+    pad = [9.0, 9.0, 9.0]
+    fake.model_executable = lambda hidden_states: [
+        torch.tensor([[0.0, 4.0, 1.0], [5.0, 1.0, 0.0], pad, pad]),
+        torch.tensor([[7.0, 1.0, 0.0], [0.0, 2.0, 6.0], pad, pad]),
+        torch.tensor([[0.0, 1.0, 8.0], [9.0, 1.0, 0.0], pad, pad]),
+    ]
+
+    output = RBLNMedusaProposer.propose(
+        fake,
+        target_hidden_states=torch.zeros((2, 4), dtype=torch.float32),
+        sampling_metadata=None,
+    )
+
+    assert output.shape == (2, 3)
+    torch.testing.assert_close(
+        output, torch.tensor([[1, 0, 2], [0, 2, 0]], dtype=torch.int64)
+    )
+
+
+# ---------------------------------------------------------------------------
+# dummy_run
+# ---------------------------------------------------------------------------
+
+
+# Verifies dummy_run executes the persistent buffer rather than a fresh tensor.
+def test_dummy_run_executes_persistent_hidden_states():
+    fake = make_proposer_stub(max_num_seqs=3, hidden_size=6)
+    calls: list[torch.Tensor] = []
+
+    def model_executable(hidden_states: torch.Tensor) -> None:
+        calls.append(hidden_states)
+
+    fake.model_executable = model_executable
+
+    RBLNMedusaProposer.dummy_run(fake)
+
+    assert len(calls) == 1
+    assert calls[0] is fake.hidden_states
