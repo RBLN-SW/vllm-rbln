@@ -17,18 +17,19 @@ from vllm.model_executor.models.deepseek_v2 import DeepseekV2Attention, Deepseek
 
 
 def __deepseek_v2_moe_forward_rsd(self, hidden_states: torch.Tensor) -> torch.Tensor:
-    shared_output, final_hidden_states = self.experts(
+    final_hidden_states = self.experts(
         hidden_states=hidden_states, router=lambda x: self.gate(x)[0]
     )
     # Fix FP16 overflow
     # See DeepseekV2DecoderLayer for more details.
     if hidden_states.dtype != torch.float16:
         final_hidden_states *= self.routed_scaling_factor
-    elif self.shared_experts is not None:
-        shared_output *= 1.0 / self.routed_scaling_factor
 
     if self.shared_experts is not None:
-        final_hidden_states += shared_output
+        shared_output = self.shared_experts(hidden_states)
+        if hidden_states.dtype == torch.float16:
+            shared_output *= 1.0 / self.routed_scaling_factor
+        final_hidden_states = final_hidden_states + shared_output
 
     if self.tp_size > 1:
         final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(

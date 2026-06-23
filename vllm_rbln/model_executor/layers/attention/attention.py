@@ -16,6 +16,7 @@ import torch
 import vllm.model_executor.layers.attention.attention as vllm_attn
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.forward_context import ForwardContext, get_forward_context
+from vllm.model_executor.layers.attention import mla_attention as _mla_attention_mod
 from vllm.model_executor.layers.attention.attention import Attention
 from vllm.model_executor.layers.attention.kv_transfer_utils import (
     maybe_transfer_kv_layer,
@@ -193,9 +194,21 @@ Attention.__init__ = _rbln_attention_init
 Attention.forward = _rbln_attention_forward
 Attention.get_kv_cache_spec = _rbln_get_kv_cache_spec
 
+
 # ---------------------------------------------------------------------------
 # MLAAttention overrides for RBLN
 # ---------------------------------------------------------------------------
+class _RBLNNoOpMLAPrefillBackend:
+    def __init__(self, *args, **kwargs) -> None:
+        pass
+
+
+def _rbln_get_mla_prefill_backend(vllm_config) -> type[_RBLNNoOpMLAPrefillBackend]:
+    return _RBLNNoOpMLAPrefillBackend
+
+
+_mla_attention_mod.get_mla_prefill_backend = _rbln_get_mla_prefill_backend
+
 _original_mla_attention_init = MLAAttention.__init__
 
 
