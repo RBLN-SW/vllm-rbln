@@ -116,7 +116,7 @@ class RBLNWorker(WorkerBase):
         pass
 
     def _init_device_env(self) -> None:
-        world_size = self.parallel_config.world_size
+        world_size = self.parallel_config.world_size // envs.VLLM_RBLN_NUM_RAY_NODES
         env_var = current_platform.device_control_env_var
 
         num_devices = envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK

@@ -31,10 +31,8 @@ if TYPE_CHECKING:
     VLLM_RBLN_SPECIALIZE_MOE_DECODE: bool = True
     VLLM_RBLN_FLASH_CAUSAL_ATTN: bool = True
     VLLM_RBLN_BATCH_ATTN_OPT: bool = False
-    VLLM_RBLN_DISABLE_MM: bool = False
     VLLM_RBLN_USE_MOE_TOKENS_MASK: bool = True
     VLLM_RBLN_ENFORCE_MODEL_FP32: bool = False
-    VLLM_RBLN_LOGITS_ALL_GATHER: bool = True
     VLLM_RBLN_NUM_RAY_NODES: int = 1
     VLLM_RBLN_METRICS: bool = False
     VLLM_RBLN_METRICS_FILE: str = ""
@@ -169,10 +167,6 @@ environment_variables = {
             os.environ.get("VLLM_RBLN_BATCH_ATTN_OPT", "False").lower() in ("true", "1")
         )
     ),
-    # Disable multimodal input
-    "VLLM_RBLN_DISABLE_MM": (
-        lambda: os.environ.get("VLLM_RBLN_DISABLE_MM", "False").lower() in ("true", "1")
-    ),
     # If true, it uses the tokens mask applied to moe expert kernel
     "VLLM_RBLN_USE_MOE_TOKENS_MASK": (
         lambda: (
@@ -191,13 +185,6 @@ environment_variables = {
     "VLLM_RBLN_ENFORCE_MODEL_FP32": (
         lambda: (
             os.environ.get("VLLM_RBLN_ENFORCE_MODEL_FP32", "False").lower()
-            in ("true", "1")
-        )
-    ),
-    # LOGITS_ALL_GATHER, include logits all_gather into model compilation
-    "VLLM_RBLN_LOGITS_ALL_GATHER": (
-        lambda: (
-            os.environ.get("VLLM_RBLN_LOGITS_ALL_GATHER", "True").lower()
             in ("true", "1")
         )
     ),

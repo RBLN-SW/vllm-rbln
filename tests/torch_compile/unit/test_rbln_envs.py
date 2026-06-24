@@ -52,11 +52,6 @@ def test_rbln_envs():
         got {envs.VLLM_RBLN_FLASH_CAUSAL_ATTN}"
     )
 
-    assert not envs.VLLM_RBLN_DISABLE_MM, (
-        f"Expected VLLM_RBLN_DISABLE_MM to be False, \
-        got {envs.VLLM_RBLN_DISABLE_MM}"
-    )
-
     assert envs.VLLM_RBLN_DP_IMPL == "padded_decode", (
         f"Expected VLLM_RBLN_DP_IMPL to be padded_decode, \
         got {envs.VLLM_RBLN_DP_IMPL}"
@@ -75,11 +70,6 @@ def test_rbln_envs():
     assert envs.VLLM_RBLN_DP_INPUT_ALL_GATHER, (
         f"Expected VLLM_RBLN_DP_INPUT_ALL_GATHER to be True, \
         got {envs.VLLM_RBLN_DP_INPUT_ALL_GATHER}"
-    )
-
-    assert envs.VLLM_RBLN_LOGITS_ALL_GATHER, (
-        f"Expected VLLM_RBLN_LOGITS_ALL_GATHER to be True, \
-        got {envs.VLLM_RBLN_LOGITS_ALL_GATHER}"
     )
 
     assert envs.VLLM_RBLN_NUM_RAY_NODES == 1, (
