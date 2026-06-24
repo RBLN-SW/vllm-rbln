@@ -340,15 +340,6 @@ jobs:
               uv pip install --system --force-reinstall --no-cache-dir dist/vllm_rbln*.whl --index-url http://pypi-cache.devpi.svc.cluster.local/root/pypi/+simple/ --extra-index-url "${VLLM_CPU_URL}" --extra-index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple --index-strategy unsafe-best-match
             fi
 
-      # fastapi>=0.137 keeps included routers as `_IncludedRouter` (no `.path`),
-      # which breaks prometheus-fastapi-instrumentator's route-name middleware and
-      # crashes the OpenAI server on every request. Pin below 0.137 until the
-      # instrumentator handles the new route type.
-      - name: Pin fastapi below 0.137 (instrumentator compat)
-        if: steps.should_skip.outputs.skip != 'true'
-        run: |
-          uv pip install --system "fastapi[standard]<0.137"
-
       - name: Run pytest
         if: steps.should_skip.outputs.skip != 'true'
         env:
