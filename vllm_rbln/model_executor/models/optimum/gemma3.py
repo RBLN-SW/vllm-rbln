@@ -319,13 +319,13 @@ class RBLNOptimumGemma3ForConditionalGeneration(
             )
             logits = output.logits
             updated_attention_mask = output.attention_mask
-            updated_padded_cache_length = output.padded_cache_lengths
+            left_pad = int((attention_mask == 0).sum().item())
 
             assert len(running_requests_ids) == 1
             self.attention_manager.add(
                 running_requests_id=running_requests_ids[0],
                 local_table_id=sliding_window_table_ids[0],
-                pad_len=updated_padded_cache_length,
+                pad_len=left_pad,
                 attention_mask=updated_attention_mask,
             )
         else:
