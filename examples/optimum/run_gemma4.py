@@ -86,7 +86,6 @@ async def main(
 ):
     engine_args = AsyncEngineArgs(
         model=model_id,
-        mm_processor_kwargs={"max_soft_tokens": 280},
     )
 
     engine = AsyncLLMEngine.from_engine_args(engine_args)

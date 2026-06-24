@@ -11,7 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Any
+import json
+import os
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.config import VllmConfig
@@ -36,10 +38,60 @@ from .optimum_attention import HybridAttentionImageManager, HybridAttentionImage
 
 logger = init_logger(__name__)
 
+if TYPE_CHECKING:
+    from vllm.multimodal.processing.processor import (
+        BaseMultiModalProcessor as _ProcessorBase,
+    )
+else:
+    _ProcessorBase = object
+
 PAD_TOKEN_ID = 0
 
 
-class RBLNGemma3MultiModalProcessor(Gemma3MultiModalProcessor):
+def _run_length_from(token_types: list[int], start: int, value: int, cap: int) -> int:
+    """Length of the run of ``value`` starting at ``start``, capped at ``cap``.
+
+    Mirrors optimum-rbln's ``_run_length_from`` (decoderonly_runtime_utils.py) so
+    the slot count this processor reserves matches what ``_plan_prefill_chunks``
+    plans at runtime.
+
+    Examples:
+        tt = [0, 0, 0, 1, 1, 1, 1, 0, 0]
+              ^ start=0
+        _run_length_from(tt, 0, value=0, cap=256)  # -> 3  (leading text run)
+        _run_length_from(tt, 3, value=1, cap=256)  # -> 4  (image run)
+        _run_length_from(tt, 3, value=1, cap=2)    # -> 2  (capped at 2)
+    """
+    n = len(token_types)
+    end = min(start + cap, n)
+    i = start
+    while i < end and token_types[i] == value:
+        i += 1
+    return i - start
+
+
+class RBLNChunkedPrefillPadMixin(_ProcessorBase):
+    """Left-pads ``prompt_token_ids`` so vLLM reserves enough KV-cache blocks for
+    optimum-rbln's chunked multimodal prefill.
+
+    vLLM sizes its KV-cache block allocation from the prompt length it sees, while
+    optimum-rbln's chunked prefill (``_plan_prefill_chunks``) may touch cache slots
+    past the real token count: trailing chunk write-extent overhang plus
+    ``kvcache_partition_len`` partition-alignment padding. This mixin replays that
+    planner to compute the highest slot touched (``alloc_len``) and prepends exactly
+    ``alloc_len - query_length`` pad tokens.
+
+    The pad tokens are masked out (attention_mask=0) and stripped before attention
+    inside optimum-rbln, so their placement is irrelevant — only the count matters.
+
+    Shared by gemma3 (single image bucket) and gemma4 (multiple image buckets).
+    Subclasses customize only ``_image_buckets`` (and, once video is supported,
+    ``_token_types``); the bucket-selection and planning logic is identical to
+    optimum-rbln's ``RBLNDecoderOnly*`` mixins.
+    """
+
+    # MRO note: mix in BEFORE the HF ``*MultiModalProcessor`` so this ``apply``
+    # wraps theirs (``super().apply`` resolves to the HF processor).
     def apply(self, *args, **kwargs):
         output = super().apply(*args, **kwargs)
         output["prompt_token_ids"] = self._pad_image_boundaries(
@@ -47,36 +99,120 @@ class RBLNGemma3MultiModalProcessor(Gemma3MultiModalProcessor):
         )
         return output
 
-    def _pad_image_boundaries(self, prompt_ids: list[int]) -> list[int]:
-        """Left-pad ``prompt_token_ids`` so each image block aligns to a prefill
-        chunk boundary.
+    def _rbln_cfg(self) -> dict:
+        cached = getattr(self, "_rbln_cfg_cache", None)
+        if cached is not None:
+            return cached
 
-        The padding only inflates the prompt length vLLM sees, so vLLM allocates
-        enough KV-cache blocks. The actual chunk-aligned attention is handled
-        inside optimum-rbln, which infers the padding length from these
-        left-padded tokens.
+        model_path = self.info.ctx.model_config.model
+        cfg_path = os.path.join(model_path, "language_model", "rbln_config.json")
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+        self._rbln_cfg_cache = cfg
+        return cfg
+
+    def _image_buckets(self) -> list[int]:
+        """Image-prefill bucket sizes, smallest-first-fit candidates.
+
+        Overridden per model: gemma3 has a single ``image_prefill_chunk_size``,
+        gemma4 has a list ``image_prefill_chunk_sizes``. Empty ⇒ no image prefill.
         """
-        token_type_ids = (
-            torch.tensor(prompt_ids) == self.info.get_hf_processor().image_token_id
-        )
+        raise NotImplementedError
 
-        image_prefill_chunk_size = self.info.get_hf_processor().image_seq_length
-        # Find image start positions
-        image_starts = [
-            s
-            for s in torch.where(token_type_ids)[0]
-            if torch.all(token_type_ids[s : s + image_prefill_chunk_size])
-        ]
-        padded_seq_len = 0
-        for image_start in image_starts:
-            pad_needed = (
-                image_prefill_chunk_size
-                - (image_start + padded_seq_len) % image_prefill_chunk_size
+    def _use_image_prefill(self) -> bool:
+        # Mirrors optimum's `use_tt = use_image_prefill and token_type_ids is not None`.
+        # `use_image_prefill` is usually absent in rbln_config, so the presence of
+        # image buckets is the proxy.
+        cfg = self._rbln_cfg()
+        if "use_image_prefill" in cfg:
+            return bool(cfg["use_image_prefill"])
+        return bool(self._image_buckets())
+
+    def _token_types(self, prompt_ids: list[int]) -> list[int]:
+        # 1 = image soft token, 0 = text. (Video=2 lands here once supported.)
+        image_token_id = self.info.get_hf_processor().image_token_id
+        return [1 if t == image_token_id else 0 for t in prompt_ids]
+
+    def _resolve_image_chunk(
+        self, token_types: list[int], step: int, start_type: int
+    ) -> tuple[int, int]:
+        """Return ``(run_len, chunk_size)`` for the image/video run at ``step``.
+
+        Picks the smallest bucket that fits the run — identical to optimum-rbln's
+        ``_resolve_image_chunk``. Reduces to the single bucket for gemma3.
+        """
+        buckets = self._image_buckets()
+        max_bucket = max(buckets)
+        run_len = _run_length_from(token_types, step, start_type, max_bucket + 1)
+        if run_len > max_bucket:
+            modality = "video" if start_type == 2 else "image"
+            raise ValueError(
+                f"{modality.capitalize()} run (token_type={start_type}) starting at "
+                f"position {step} is longer than the largest image-prefill bucket "
+                f"({max_bucket}); no bucket can hold it."
             )
-            padded_seq_len += pad_needed
-        # Left padding for Gemma3 image boundary alignment
-        prompt_ids = [PAD_TOKEN_ID] * padded_seq_len + prompt_ids
-        return prompt_ids
+        return run_len, min(b for b in buckets if b >= run_len)
+
+    def _required_alloc_len(self, token_types: list[int]) -> int:
+        cfg = self._rbln_cfg()
+        prefill_chunk_size = cfg["prefill_chunk_size"]
+        partition_len = cfg.get("kvcache_partition_len")
+        use_tt = self._use_image_prefill()
+
+        query_length = len(token_types)
+        step = 0
+        padded = 0
+        alloc_len = query_length
+        while step < query_length:
+            start_type = token_types[step] if use_tt else 0
+            is_image_prefill = use_tt and start_type > 0
+            if is_image_prefill:
+                run_len, chunk_size = self._resolve_image_chunk(
+                    token_types, step, start_type
+                )
+            else:
+                chunk_size = prefill_chunk_size
+                run_len = (
+                    _run_length_from(token_types, step, 0, prefill_chunk_size)
+                    if use_tt
+                    else prefill_chunk_size
+                )
+
+            if partition_len is not None:
+                offset_in_partition = (step + padded) % partition_len
+                if offset_in_partition + chunk_size > partition_len:
+                    padded += partition_len - offset_in_partition
+
+            is_last_chunk = step + run_len >= query_length
+            if is_last_chunk:
+                tail = query_length - step
+                num_processed = min(tail, run_len) if run_len > 0 else tail
+            else:
+                num_processed = run_len
+
+            alloc_len = max(alloc_len, step + padded + chunk_size)
+            step += num_processed
+
+        return alloc_len
+
+    def _pad_image_boundaries(self, prompt_ids: list[int]) -> list[int]:
+        prompt_ids = list(prompt_ids)
+        token_types = self._token_types(prompt_ids)
+
+        alloc_len = self._required_alloc_len(token_types)
+        pad_len = alloc_len - len(prompt_ids)
+        if pad_len <= 0:
+            return prompt_ids
+        return [PAD_TOKEN_ID] * pad_len + prompt_ids
+
+
+class RBLNGemma3MultiModalProcessor(
+    RBLNChunkedPrefillPadMixin, Gemma3MultiModalProcessor
+):
+    def _image_buckets(self) -> list[int]:
+        # gemma3: single image bucket.
+        size = self._rbln_cfg().get("image_prefill_chunk_size")
+        return [size] if size is not None else []
 
 
 @MULTIMODAL_REGISTRY.register_processor(
