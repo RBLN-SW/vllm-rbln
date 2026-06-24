@@ -17,10 +17,14 @@ from typing import TYPE_CHECKING
 
 from vllm.envs import environment_variables as vllm_envs
 
+from vllm_rbln.logger import init_logger
+
+logger = init_logger(__name__)
+
 if TYPE_CHECKING:
     VLLM_RBLN_COMPILE_MODEL: bool = True
     VLLM_RBLN_COMPILE_STRICT_MODE: bool = False
-    VLLM_RBLN_TP_SIZE: int = 1
+    VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK: int = 1
     VLLM_RBLN_SAMPLER: bool = True
     VLLM_RBLN_ENABLE_WARM_UP: bool = True
     VLLM_RBLN_USE_VLLM_MODEL: bool = False
@@ -45,6 +49,27 @@ if TYPE_CHECKING:
     VLLM_RBLN_AUTO_PORT: bool = True
     VLLM_RBLN_PROFILER: bool = False
     VLLM_RBLN_SUB_BLOCK_CACHE: bool = True
+
+
+def get_num_devices_per_local_rank() -> int:
+    """Number of NPU devices assigned to each local rank.
+
+    Resolves ``VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK``. For backward
+    compatibility the deprecated ``VLLM_RBLN_TP_SIZE`` is still honored as a
+    fallback when the new variable is unset, and emits a deprecation warning.
+    """
+    new_value = os.environ.get("VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK")
+    legacy_value = os.environ.get("VLLM_RBLN_TP_SIZE")
+
+    if legacy_value is not None:
+        logger.warning_once(
+            "VLLM_RBLN_TP_SIZE is deprecated and will be removed in a future "
+            "release. Please use VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK instead."
+        )
+        if new_value is None:
+            return int(legacy_value)
+
+    return int(new_value) if new_value is not None else 1
 
 
 def get_decode_batch_bucket_strategy() -> str:
@@ -112,8 +137,8 @@ environment_variables = {
             in ("true", "1")
         )
     ),
-    # TP Size for RSD.
-    "VLLM_RBLN_TP_SIZE": lambda: int(os.environ.get("VLLM_RBLN_TP_SIZE", 1)),
+    # Number of NPU devices per local rank (was VLLM_RBLN_TP_SIZE).
+    "VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK": get_num_devices_per_local_rank,
     # Use customized sampler
     "VLLM_RBLN_SAMPLER": (
         lambda: os.environ.get("VLLM_RBLN_SAMPLER", "True").lower() in ("true", "1")

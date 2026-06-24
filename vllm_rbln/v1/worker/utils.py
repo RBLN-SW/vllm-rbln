@@ -158,12 +158,12 @@ def estimate_available_memory(
         ATOM_DRAM_NBYTES = 16 * 2**30
         ATOM_SYS_DRAM_NBYTES = 288 * 2**20
         # consider RSD size for ATOM
-        rsd_size = envs.VLLM_RBLN_TP_SIZE
+        rsd_size = envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK
         available_dram_bytes = rsd_size * (ATOM_DRAM_NBYTES - ATOM_SYS_DRAM_NBYTES)
         # ATOM - basic data type fp16
         default_bits_per_param = 16
     elif "cr" in device_name:
-        assert envs.VLLM_RBLN_TP_SIZE == 1
+        assert envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK == 1
         # REBEL - RBLN-CR[xxx]
         # REBEL DRAM - 144GB (quad chips, chiplet) - system(4G) = 140GB
         REBEL_DRAM_NBYTES = 144 * 2**30

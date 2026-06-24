@@ -206,7 +206,7 @@ def test_load_model_compiles_wrapper(monkeypatch, strict):
         medusa_module, "build_process_group_dict", lambda: process_group_sentinel
     )
     monkeypatch.setattr(medusa_module.envs, "VLLM_RBLN_COMPILE_MODEL", True)
-    monkeypatch.setattr(medusa_module.envs, "VLLM_RBLN_TP_SIZE", 8)
+    monkeypatch.setattr(medusa_module.envs, "VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK", 8)
     monkeypatch.setattr(medusa_module.envs, "VLLM_RBLN_COMPILE_STRICT_MODE", strict)
 
     RBLNMedusaProposer.load_model(fake, target_model=object())

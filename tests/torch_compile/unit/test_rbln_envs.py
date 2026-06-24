@@ -27,9 +27,9 @@ def test_rbln_envs():
         got {envs.VLLM_RBLN_COMPILE_STRICT_MODE}"
     )
 
-    assert envs.VLLM_RBLN_TP_SIZE == 1, (
-        f"Expected VLLM_RBLN_TP_SIZE to be 1, \
-        got {envs.VLLM_RBLN_TP_SIZE}"
+    assert envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK == 1, (
+        f"Expected VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK to be 1, \
+        got {envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK}"
     )
 
     assert envs.VLLM_RBLN_SAMPLER, (

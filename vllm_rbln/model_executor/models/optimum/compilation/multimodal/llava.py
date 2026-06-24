@@ -17,12 +17,12 @@ from .common import get_language_model_config
 
 
 def get_param_llava(
-    batch_size: int, max_model_len: int, block_size: int, tp_size: int
+    batch_size: int, max_model_len: int, block_size: int, num_devices: int
 ) -> dict:
     param = {
         "vision_tower": {"output_hidden_states": True},
         "language_model": get_language_model_config(
-            batch_size, max_model_len, block_size, tp_size
+            batch_size, max_model_len, block_size, num_devices
         ),
     }
     return param

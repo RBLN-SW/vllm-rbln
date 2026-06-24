@@ -481,7 +481,7 @@ def test_load_model_compiles_wrapper(monkeypatch, strict):
         eagle_module, "build_process_group_dict", lambda: process_group_sentinel
     )
     monkeypatch.setattr(eagle_module.envs, "VLLM_RBLN_COMPILE_MODEL", True)
-    monkeypatch.setattr(eagle_module.envs, "VLLM_RBLN_TP_SIZE", 8)
+    monkeypatch.setattr(eagle_module.envs, "VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK", 8)
     monkeypatch.setattr(eagle_module.envs, "VLLM_RBLN_COMPILE_STRICT_MODE", strict)
 
     RBLNEagleProposer.load_model(stub, target_model=object())
