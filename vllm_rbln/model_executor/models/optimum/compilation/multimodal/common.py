@@ -15,13 +15,13 @@
 
 
 def get_language_model_config(
-    batch_size: int, max_model_len: int, block_size: int, tp_size: int
+    batch_size: int, max_model_len: int, block_size: int, num_devices: int
 ) -> dict:
     param: dict = {
         "use_inputs_embeds": True,
         "batch_size": batch_size,
         "max_seq_len": max_model_len,
-        "tensor_parallel_size": tp_size,
+        "num_devices": num_devices,
     }
     if block_size != max_model_len:
         attn_impl = "flash_attn" if block_size != max_model_len else "eager"

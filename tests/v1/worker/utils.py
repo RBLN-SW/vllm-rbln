@@ -212,12 +212,15 @@ def get_vllm_config(async_scheduling=False, max_num_seqs=None):
         seed=42,
     )
     cache_config = CacheConfig(
-        block_size=IB_SIZE,
+        block_size=OB_SIZE,
         cache_dtype="auto",
         enable_prefix_caching=True,
     )
     additional_config = {
-        "attn_block_size": OB_SIZE,
+        "prefix_block_size": IB_SIZE,
+        "rbln_config": {
+            "prefill_chunk_size": IB_SIZE,
+        },
     }
     structured_outputs_config = StructuredOutputsConfig(
         backend="guidance",

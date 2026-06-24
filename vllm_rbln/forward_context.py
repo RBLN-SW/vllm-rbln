@@ -166,7 +166,6 @@ class RBLNDPMetadata(DPMetadata):
             num_tokens_across_dp_cpu = num_tokens_across_dp
             max_pad = num_padded_tokens
 
-            max_tokens_across_dp_cpu = torch.max(num_tokens_across_dp_cpu)
             max_pads_across_dp = torch.empty(max_pad, device="cpu")
         else:
             assert num_tokens_across_dp is None, (
@@ -178,11 +177,9 @@ class RBLNDPMetadata(DPMetadata):
             num_tokens_across_dp_cpu = torch.tensor(
                 [num_tokens], device="cpu", dtype=torch.int32
             )
-            max_tokens_across_dp_cpu = num_tokens
             max_pads_across_dp = None
 
         return RBLNDPMetadata(
-            max_tokens_across_dp_cpu,
             num_tokens_across_dp_cpu,
             max_pads_across_dp=max_pads_across_dp,
         )
@@ -192,7 +189,6 @@ class RBLNDPMetadata(DPMetadata):
 def _set_forward_context(
     attn_metadata: Any,
     vllm_config: VllmConfig,
-    virtual_engine: int = 0,
     num_tokens: int | None = None,
     num_tokens_across_dp: torch.Tensor | None = None,
     cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
@@ -225,11 +221,10 @@ def _set_forward_context(
     forward_context = create_forward_context(
         attn_metadata,
         vllm_config,
-        virtual_engine,
-        dp_metadata,
-        cudagraph_runtime_mode,
-        batch_descriptor,
-        ubatch_slices,
+        dp_metadata=dp_metadata,
+        cudagraph_runtime_mode=cudagraph_runtime_mode,
+        batch_descriptor=batch_descriptor,
+        ubatch_slices=ubatch_slices,
     )
     if additional_kwargs:
         existing_additional_kwargs = getattr(forward_context, "additional_kwargs", None)
@@ -279,3 +274,7 @@ def _set_forward_context(
 
 
 vfc.set_forward_context = _set_forward_context
+
+# Importers should prefer this alias so the RBLN-specific kwargs are always
+# accepted even if the monkey-patch above is bypassed by import ordering.
+set_forward_context = _set_forward_context

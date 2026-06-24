@@ -33,7 +33,6 @@ from vllm.utils.torch_utils import _StreamPlaceholder
 
 import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
-from vllm_rbln.utils.optimum.converter import sync_vllm_and_optimum
 from vllm_rbln.utils.optimum.predicates import is_qwen3_pooling
 from vllm_rbln.utils.optimum.registry import (
     is_enc_dec_arch,
@@ -108,6 +107,10 @@ class RblnPlatform(Platform):
         pass
 
     @classmethod
+    def manual_seed_all(cls, seed: int) -> None:
+        rebel.manual_seed(seed)
+
+    @classmethod
     def is_pin_memory_available(cls):
         logger.warning("Pin memory is not supported on RBLN.")
         return False
@@ -134,10 +137,13 @@ class RblnPlatform(Platform):
             from vllm.usage.usage_lib import UsageContext
 
             default_batched_tokens, _ = orig_get_batch_defaults(cls_, world_size)
+            # Cover every usage context plus None (create_engine_config's
+            # usage_context is UsageContext | None);
+            # otherwise .get(ctx, DEFAULT_MAX_NUM_SEQS) falls through to 128.
             default_max_num_seqs = {
-                UsageContext.LLM_CLASS: RBLN_DEFAULT_MAX_NUM_SEQS,
-                UsageContext.OPENAI_API_SERVER: RBLN_DEFAULT_MAX_NUM_SEQS,
+                ctx: RBLN_DEFAULT_MAX_NUM_SEQS for ctx in UsageContext
             }
+            default_max_num_seqs[None] = RBLN_DEFAULT_MAX_NUM_SEQS
             return default_batched_tokens, default_max_num_seqs
 
         EngineArgs.get_batch_defaults = classmethod(get_batch_defaults)
@@ -305,7 +311,8 @@ class RblnPlatform(Platform):
             assert vllm_config.parallel_config.tensor_parallel_size == 1, (
                 "Cannot set tensor_parallel_size for pre-compiled optimum-rbln models. "
                 "If you want to compile with tensor parallelism in vllm-rbln, "
-                "please use the `VLLM_RBLN_TP_SIZE` environment variable instead."
+                "please use the `VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK` "
+                "environment variable instead."
             )
             assert vllm_config.parallel_config.pipeline_parallel_size == 1, (
                 "Pipeline parallelism is not supported in optimum-rbln."
@@ -328,6 +335,8 @@ class RblnPlatform(Platform):
                     del model_config.__dict__["is_encoder_decoder"]
 
             cls.disable_unsupported_prefix_caching(vllm_config)
+            from vllm_rbln.utils.optimum.converter import sync_vllm_and_optimum
+
             sync_vllm_and_optimum(vllm_config)
 
         if (
@@ -374,13 +383,16 @@ class RblnPlatform(Platform):
         if selected_backend and selected_backend != AttentionBackendEnum.FLASH_ATTN:
             logger.info("Cannot use %s backend on RBLN.", selected_backend)
         if attn_selector_config.use_mla:
-            raise NotImplementedError("MLA is not supported on RBLN.")
+            attn_backend_cls = (
+                "vllm_rbln.v1.attention.backends.mla.flashattn_mla."
+                "RBLNFlashAttnMLABackend"
+            )
+            logger.info("Using RBLN MLA Attention Backend: %s", attn_backend_cls)
+            return attn_backend_cls
         if attn_selector_config.use_sparse:
             raise NotImplementedError("Sparse Attention is not supported on RBLN.")
 
-        attn_backend_cls = (
-            "vllm_rbln.v1.attention.backends.flash_attention.RBLNAttentionBackend"
-        )
+        attn_backend_cls = AttentionBackendEnum.FLASH_ATTN.get_path()
         logger.info("Using RBLN Attention Backend: %s", attn_backend_cls)
 
         return attn_backend_cls

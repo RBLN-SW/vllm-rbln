@@ -63,12 +63,17 @@ _RBLN_MULTIMODAL_MODELS = {
         "qwen3_vl_moe",
         "RBLNQwen3VLMoeForConditionalGeneration",
     ),
+    "Exaone4_5_ForConditionalGeneration": (
+        "exaone4_5",
+        "RBLNExaone4_5_ForConditionalGeneration",
+    ),
     "Idefics3ForConditionalGeneration": (
         "idefics3",
         "RBLNIdefics3ForConditionalGeneration",
     ),
     "Blip2ForConditionalGeneration": ("blip2", "RBLNBlip2ForConditionalGeneration"),
     "Gemma3ForConditionalGeneration": ("gemma3", "RBLNGemma3ForConditionalGeneration"),
+    "Gemma4ForConditionalGeneration": ("gemma4", "RBLNGemma4ForConditionalGeneration"),
     "LlavaForConditionalGeneration": ("llava", "RBLNLlavaForConditionalGeneration"),
     "PaliGemmaForConditionalGeneration": (
         "paligemma",

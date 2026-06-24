@@ -661,6 +661,17 @@ class RBLNScheduler(Scheduler):
                         + num_external_computed_tokens
                     )
                     assert num_computed_tokens <= request.num_tokens
+
+                    # Track first scheduled prefill, not post-preemption repeats.
+                    if request.prefill_stats is not None:
+                        assert num_computed_tokens <= request.num_prompt_tokens
+                        request.prefill_stats.set(
+                            num_prompt_tokens=request.num_prompt_tokens,
+                            num_local_cached_tokens=(
+                                num_new_local_computed_tokens + num_sub_block_tokens
+                            ),
+                            num_external_cached_tokens=num_external_computed_tokens,
+                        )
                 else:
                     # KVTransfer: WAITING reqs have num_computed_tokens > 0
                     # after async KV recvs are completed.
@@ -865,9 +876,6 @@ class RBLNScheduler(Scheduler):
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
-                # Count the number of prefix cached tokens.
-                if request.num_cached_tokens < 0:
-                    request.num_cached_tokens = num_computed_tokens
                 # Encoder-related.
                 if encoder_inputs_to_schedule:
                     scheduled_encoder_inputs[request_id] = encoder_inputs_to_schedule
@@ -1092,6 +1100,16 @@ class RBLNScheduler(Scheduler):
         # will never be scheduled again, so the stash would otherwise leak.
         self._stranded_new_blocks.pop(request.request_id, None)
         return super()._free_request(request, delay_free_blocks)
+
+    def _preempt_request(self, request: Request, timestamp: float) -> None:
+        # Preemption frees ALL of the request's blocks (kv_cache_manager.free),
+        # including any block stashed for re-emit. The request lives on and may
+        # later re-enter the decode batch, where the merge would otherwise
+        # prepend a now-freed (and possibly reused) block id to its block table.
+        # Drop the stash so the resumed request relies solely on the fresh
+        # block ids sent on resume.
+        self._stranded_new_blocks.pop(request.request_id, None)
+        super()._preempt_request(request, timestamp)
 
     def update_from_output(
         self,

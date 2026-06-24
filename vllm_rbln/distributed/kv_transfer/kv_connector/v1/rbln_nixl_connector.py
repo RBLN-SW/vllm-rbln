@@ -17,7 +17,6 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 from rebel.kv_cache import aligned_tensor
-from vllm import envs
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     BlockIds,
@@ -30,13 +29,13 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
     KVConnectorRole,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl_connector import (
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
     NixlConnector,
     NixlConnectorMetadata,
     NixlConnectorScheduler,
     NixlConnectorWorker,
-    ReqId,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import ReqId
 from vllm.v1.core.sched.output import SchedulerOutput
 
 from vllm_rbln.logger import init_logger
@@ -209,10 +208,10 @@ class RblnNixlConnectorScheduler(NixlConnectorScheduler):
                 "NIXLConnector request_finished(%s) waiting for %d seconds "
                 "for remote decode to fetch blocks",
                 request.request_id,
-                envs.VLLM_NIXL_ABORT_REQUEST_TIMEOUT,
+                self._kv_lease_duration,
             )
             self._reqs_need_send[request.request_id] = (
-                time.perf_counter() + envs.VLLM_NIXL_ABORT_REQUEST_TIMEOUT
+                time.perf_counter() + self._kv_lease_duration
             )
             # NOTE HMA will "mark" empty/null blocks in groups with 0s (eg SWA ones),
             # trimming down after allocating for the whole sequence length. Empty
