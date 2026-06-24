@@ -225,17 +225,32 @@ class RBLNWorker(WorkerBase):
                 if not num_bits_set:
                     logger.warning(
                         "compressed-tensors quantization_config has no num_bits; "
-                        "assuming fp8."
+                        "assuming 8-bit (fp8)."
                     )
-                elif num_bits_set != {8}:
-                    raise ValueError(
-                        f"compressed-tensors config has unsupported bit-widths "
-                        f"{num_bits_set}; only 8-bit (fp8) is supported."
+                    num_bits = 8
+                elif len(num_bits_set) == 1:
+                    (num_bits,) = num_bits_set
+                else:
+                    raise RuntimeError(
+                        f"compressed-tensors config has mixed bit-widths "
+                        f"{num_bits_set}; not supported."
                     )
-                quantization = "fp8"
+
+                if num_bits == 8:
+                    quantization = "fp8"
+                elif num_bits == 4:
+                    quantization = "int4"
+                else:
+                    raise RuntimeError(
+                        f"compressed-tensors {num_bits=} is not supported; "
+                        f"only 4-bit (int4) or 8-bit (fp8)."
+                    )
 
             if quantization == "fp8":
                 nbits_per_param = 8
+                packed_num_elems = 1
+            elif quantization == "int4":
+                nbits_per_param = 4
                 packed_num_elems = 1
             elif quantization in ("mxfp4", "gpt_oss_mxfp4"):
                 if "ca" in device_name:
@@ -256,7 +271,7 @@ class RBLNWorker(WorkerBase):
                 packed_num_elems = 8 // 4
             else:
                 raise ValueError(
-                    "invalid quantization scheme, candidates = [fp8, mxfp4]"
+                    "invalid quantization scheme, candidates = [fp8, int4, mxfp4]"
                 )
 
         else:

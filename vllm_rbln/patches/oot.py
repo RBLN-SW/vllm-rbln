@@ -45,6 +45,24 @@ def _register_fp8_block_kernel() -> None:
         )
 
 
+def _register_unpacked_wna16_linear_kernel() -> None:
+    from vllm.model_executor.kernels import linear
+    from vllm.platforms import PlatformEnum
+
+    from vllm_rbln.model_executor.kernels.linear.mixed_precision.unpacked_wna16 import (
+        RBLNUnpackedwNa16LinearKernel,
+    )
+
+    kernels = linear._POSSIBLE_KERNELS.setdefault(PlatformEnum.OOT, [])
+    if RBLNUnpackedwNa16LinearKernel not in kernels:
+        kernels.insert(0, RBLNUnpackedwNa16LinearKernel)
+
+        logger.debug(
+            "Registered RBLN unpacked wna16 linear kernel for OOT platform: %s",
+            RBLNUnpackedwNa16LinearKernel.__name__,
+        )
+
+
 @add_registration(reason="Register RBLN OOT implementations.")
 def register_rbln_oot_implementations() -> None:
     from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -67,3 +85,4 @@ def register_rbln_oot_implementations() -> None:
     _register_oot(VocabParallelEmbedding, RBLNVocabParallelEmbedding)
     _register_oot(ParallelLMHead, RBLNParallelLMHead)
     _register_fp8_block_kernel()
+    _register_unpacked_wna16_linear_kernel()
