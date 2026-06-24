@@ -39,11 +39,12 @@ dependencies = [
     "datasets",
     "qwen_vl_utils",
     "vllm==0.22.0+cpu",
+    "fastapi[standard]<0.137",
     "torch",
     "torchvision",
     "torchaudio",
     "torchcodec",
-    "optimum-rbln>=0.11.0a12",
+    "optimum-rbln>=0.11.0a14",
 ]
 
 [project.optional-dependencies]
