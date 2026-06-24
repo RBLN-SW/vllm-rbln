@@ -71,23 +71,22 @@ def _run_length_from(token_types: list[int], start: int, value: int, cap: int) -
 
 
 class RBLNChunkedPrefillPadMixin(_ProcessorBase):
-    """Left-pads ``prompt_token_ids`` so vLLM reserves enough KV-cache blocks for
-    optimum-rbln's chunked multimodal prefill.
+    """Left-pad ``prompt_token_ids`` so vLLM reserves enough KV-cache blocks.
 
-    vLLM sizes its KV-cache block allocation from the prompt length it sees, while
-    optimum-rbln's chunked prefill (``_plan_prefill_chunks``) may touch cache slots
-    past the real token count: trailing chunk write-extent overhang plus
-    ``kvcache_partition_len`` partition-alignment padding. This mixin replays that
-    planner to compute the highest slot touched (``alloc_len``) and prepends exactly
-    ``alloc_len - query_length`` pad tokens.
+    Why:
+        vLLM sizes block allocation from the prompt length, but optimum-rbln's
+        chunked prefill touches extra slots beyond the real tokens (trailing
+        chunk write-extent + ``kvcache_partition_len`` alignment). We replay its
+        planner (``_plan_prefill_chunks``) for the highest slot touched
+        (``alloc_len``) and prepend ``alloc_len - query_length`` pad tokens.
 
-    The pad tokens are masked out (attention_mask=0) and stripped before attention
-    inside optimum-rbln, so their placement is irrelevant — only the count matters.
+    Placement:
+        Pad tokens are masked out and stripped before attention, so only the
+        count matters, not where they go.
 
-    Shared by gemma3 (single image bucket) and gemma4 (multiple image buckets).
-    Subclasses customize only ``_image_buckets`` (and, once video is supported,
-    ``_token_types``); the bucket-selection and planning logic is identical to
-    optimum-rbln's ``RBLNDecoderOnly*`` mixins.
+    Subclasses override ``_image_buckets`` (gemma3: single bucket; gemma4: many)
+    and, once video is supported, ``_token_types``. Bucket-selection and planning
+    mirror optimum-rbln's ``RBLNDecoderOnly*`` mixins.
     """
 
     # MRO note: mix in BEFORE the HF ``*MultiModalProcessor`` so this ``apply``
