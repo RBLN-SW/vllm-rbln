@@ -60,6 +60,11 @@ class RBLNGemma4MultiModalProcessor(
 class RBLNOptimumGemma4ForConditionalGeneration(
     RBLNOptimumGemma3ForConditionalGeneration
 ):
+    def _image_token_id(self) -> int:
+        # Gemma4Config names the image placeholder `image_token_id`
+        # (Gemma3Config uses `image_token_index`, the base-class default).
+        return self.model.config.image_token_id
+
     def _process_image_input(
         self, image_input: Gemma4ImageInputs
     ) -> list[torch.Tensor]:

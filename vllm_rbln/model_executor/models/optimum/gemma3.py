@@ -296,14 +296,20 @@ class RBLNOptimumGemma3ForConditionalGeneration(
             # token_type_ids model_input != token_type_ids of gemma3
             # https://github.com/huggingface/transformers/blob/d0c9c66d1c09df3cd70bf036e813d88337b20d4c/src/transformers/models/gemma3/processing_gemma3.py#L143
             token_type_ids = torch.zeros_like(input_ids)
-            token_type_ids[input_ids == self.model.config.image_token_index] = 1
+            # `_image_token_id()` resolves the placeholder id per model: Gemma3Config
+            # has `image_token_index`, Gemma4Config (which inherits this forward) has
+            # `image_token_id`. Subclasses override `_image_token_id()` accordingly.
+            token_type_ids[input_ids == self._image_token_id()] = 1
 
             multimodal_embeddings = self.embed_multimodal(
                 **(model_input.multi_modal_kwargs or {})
             )
+            # Pass through as-is: `embed_input_ids` already treats None / len()==0 as
+            # "text only". A bare `... or None` raises on Gemma4, whose multimodal
+            # embeddings are a Tensor ("Boolean value of Tensor ... is ambiguous").
             inputs_embeds = self.embed_input_ids(
                 input_ids,
-                multimodal_embeddings or None,
+                multimodal_embeddings,
             )
             if self.model.language_model.prefill_decoder is None:
                 raise version_error
@@ -408,8 +414,9 @@ class RBLNOptimumGemma3ForConditionalGeneration(
     ) -> torch.Tensor:
         # Gemma3's image token can be OOV; PAD-mask those positions before the
         # text embedding lookup (mirrors optimum-rbln's _preprocess_prefill).
-        config = self.model.config
-        if config.image_token_index >= self.model.vocab_size:
+        # `_image_token_id()` resolves per model (Gemma3 `image_token_index` /
+        # Gemma4 `image_token_id`).
+        if self._image_token_id() >= self.model.vocab_size:
             input_ids = input_ids.masked_fill(is_multimodal, PAD_TOKEN_ID)
         return self.model.get_input_embeddings()(input_ids)
 
