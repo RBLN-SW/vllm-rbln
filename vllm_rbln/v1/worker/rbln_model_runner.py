@@ -2580,7 +2580,13 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     )
                 else:
                     blk_table = input_batch.block_table[kv_cache_group_id]
-                    blk_table_tensor = blk_table.get_device_tensor(num_reqs)
+                    # Keep on CPU in device-tensor mode (like _prepare_inputs) so
+                    # .to(device) yields a stable contiguous stride for dynamo.
+                    blk_table_tensor = (
+                        blk_table.get_cpu_tensor()[:num_reqs]
+                        if envs.VLLM_RBLN_USE_DEVICE_TENSOR
+                        else blk_table.get_device_tensor(num_reqs)
+                    )
                     slot_mapping = blk_table.slot_mapping.gpu[
                         :total_num_scheduled_tokens
                     ]
