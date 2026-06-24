@@ -65,7 +65,7 @@ def main(
     num_input_prompt: int = 1,
     model: str = "google/gemma-4-31B-it",
 ):
-    os.environ["VLLM_RBLN_TP_SIZE"] = "4"
+    os.environ["VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK"] = "4"
     llm = LLM(
         model=model, block_size=4096, mm_processor_kwargs={"max_soft_tokens": 280}
     )

@@ -194,8 +194,8 @@ def main(
     # NOTE: This example supports Qwen2-VL, Qwen2.5-VL, and Qwen3-VL.
     model: str = "Qwen/Qwen3-VL-2B-Instruct",
 ):
-    # tp size for main module
-    os.environ["VLLM_RBLN_TP_SIZE"] = "16"
+    # number of devices per local rank for main module
+    os.environ["VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK"] = "16"
     llm = LLM(
         model=model,
         block_size=4096,

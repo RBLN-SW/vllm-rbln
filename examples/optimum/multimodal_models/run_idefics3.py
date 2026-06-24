@@ -65,7 +65,7 @@ def main(
     num_input_prompt: int = 10,
     model: str = "HuggingFaceM4/Idefics3-8B-Llama3",
 ):
-    os.environ["VLLM_RBLN_TP_SIZE"] = "4"
+    os.environ["VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK"] = "4"
     llm = LLM(model=model, block_size=4096)
     tokenizer = AutoTokenizer.from_pretrained(model)
     inputs = generate_prompts(num_input_prompt, model)

@@ -65,7 +65,7 @@ def main(
     num_input_prompt: int = 10,
     model: str = "llava-hf/llava-v1.6-mistral-7b-hf",
 ):
-    os.environ["VLLM_RBLN_TP_SIZE"] = "4"
+    os.environ["VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK"] = "4"
     llm = LLM(model=model, block_size=16384, max_num_seqs=1)
     tokenizer = AutoTokenizer.from_pretrained(model)
     inputs = generate_prompts(num_input_prompt, model)
