@@ -2168,8 +2168,16 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     @torch.inference_mode()
     def warm_up_model(self) -> None:
         set_warmup_active(True)
+        offload_ctx = (
+            torch.rbln.offload()
+            if envs.VLLM_RBLN_USE_DEVICE_TENSOR
+            and has_torch_rbln
+            and not envs.VLLM_RBLN_DISABLE_OFFLOAD
+            else nullcontext()
+        )
         try:
-            self._warm_up_model_inner()
+            with offload_ctx:
+                self._warm_up_model_inner()
         finally:
             set_warmup_active(False)
 
@@ -4062,14 +4070,22 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     def load_model(self) -> None:
         logger.info("Starting to load model %s...", self.model_config.model)
         model_loader = get_model_loader(self.load_config)
-        if not hasattr(self, "model"):
-            logger.info("Loading model from scratch...")
-            self.model = model_loader.load_model(
-                vllm_config=self.vllm_config, model_config=self.model_config
-            )
-        else:
-            logger.info("Model was already initialized. Loading weights inplace...")
-            model_loader.load_weights(self.model, model_config=self.model_config)
+        offload_ctx = (
+            torch.rbln.offload()
+            if envs.VLLM_RBLN_USE_DEVICE_TENSOR
+            and has_torch_rbln
+            and not envs.VLLM_RBLN_DISABLE_OFFLOAD
+            else nullcontext()
+        )
+        with offload_ctx:
+            if not hasattr(self, "model"):
+                logger.info("Loading model from scratch...")
+                self.model = model_loader.load_model(
+                    vllm_config=self.vllm_config, model_config=self.model_config
+                )
+            else:
+                logger.info("Model was already initialized. Loading weights inplace...")
+                model_loader.load_weights(self.model, model_config=self.model_config)
 
         self.model = self.get_model().eval()
         self.compute_logits_model = self.model
