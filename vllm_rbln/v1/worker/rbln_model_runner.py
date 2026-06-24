@@ -222,6 +222,7 @@ class DummyRunState(NamedTuple):
     num_input_tokens: int
     input_ids: dict[int, torch.Tensor]
     positions: dict[int, torch.Tensor]
+    draft_attn_metadata: dict[int, dict[str, Any]] | None = None
 
 
 class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
@@ -1299,6 +1300,16 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.seq_lens.np[num_reqs:].fill(0)
         self.seq_lens.copy_to_gpu()
 
+        num_tokens_np = np.array(
+            [self.requests[r].num_tokens for r in self.input_batch.req_ids],
+            dtype=np.int32,
+        )
+        self.discard_request_mask.np[:num_reqs] = (
+            self.seq_lens.np[:num_reqs] < num_tokens_np
+        )
+        self.discard_request_mask.np[num_reqs:].fill(False)
+        self.discard_request_mask.copy_to_gpu(num_reqs)
+
         # Copy the tensors to the GPU.
         # TODO(jiwoo.park) Currently, this code is meaningless.(overhead)
         # The input_ids may be padded by chunk size and max batch size.
@@ -2157,8 +2168,16 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     @torch.inference_mode()
     def warm_up_model(self) -> None:
         set_warmup_active(True)
+        offload_ctx = (
+            torch.rbln.offload()
+            if envs.VLLM_RBLN_USE_DEVICE_TENSOR
+            and has_torch_rbln
+            and not envs.VLLM_RBLN_DISABLE_OFFLOAD
+            else nullcontext()
+        )
         try:
-            self._warm_up_model_inner()
+            with offload_ctx:
+                self._warm_up_model_inner()
         finally:
             set_warmup_active(False)
 
@@ -2198,12 +2217,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # to reduce the warmup length to a reasonable value for now.
         # This is mainly because we still have to run the computation over
         # the padded tokens in speculative decoding scenario as well.
-        # DEBUG (int16 overflow verification, dummy-run only): cap the
-        # warmup seq_len so seq_idx fits in int16 (attention kernel call
-        # site casts attn_metadata.seq_lens to int16 — values > 32767
-        # wrap into negatives). Remove once the proper kernel-side fix
-        # lands.
-        decode_max_seq_len = min(self.max_model_len // 2, 16384)
+        # Stay within a single partition (block_size // 2) — required for
+        # spec decode correctness.
+        decode_max_seq_len = min(
+            self.max_model_len // 2,
+            self.cache_config.block_size // 2,
+        )
 
         # compile decode graph considering decode batch buckets
         for batch_bucket_size in self.bucketing_manager.decode_batch_buckets:
@@ -2228,6 +2247,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         total_tokens=decode_max_seq_len,
                         num_computed_tokens=decode_max_seq_len,
                         num_kv_cache_groups=num_kv_cache_groups,
+                        extra_blocks=1,
                         sampling_params=None
                         if self.is_pooling_model
                         else SamplingParams(temperature=0.0),
@@ -2336,11 +2356,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         num_kv_cache_groups: int,
         sampling_params: SamplingParams | None = None,
         pooling_params: PoolingParams | None = None,
+        extra_blocks: int = 0,
     ) -> None:
         num_blocks = (
             round_up(total_tokens, self.cache_config.block_size)
             // self.cache_config.block_size
-        )
+        ) + extra_blocks
         prompt_token_ids = list(range(total_tokens))
         # the dummy block maintained by BlockPool (null_block)
         null_block_id = 0
@@ -2543,6 +2564,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         attn_metadata_bucket: dict[int, dict[str, Any]] = {}
         input_ids_bucket: dict[int, torch.Tensor] = {}
         positions_bucket: dict[int, torch.Tensor] = {}
+        build_draft_dummy = isinstance(
+            getattr(self, "drafter", None), RBLNEagleProposer
+        )
+        draft_attn_metadata_bucket: dict[int, dict[str, Any]] | None = (
+            {} if build_draft_dummy else None
+        )
 
         for batch_bucket_size in self.bucketing_manager.decode_batch_buckets:
             attn_metadata: dict[str, Any] = {}
@@ -2561,7 +2588,13 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     )
                 else:
                     blk_table = input_batch.block_table[kv_cache_group_id]
-                    blk_table_tensor = blk_table.get_device_tensor(num_reqs)
+                    # Keep on CPU in device-tensor mode (like _prepare_inputs) so
+                    # .to(device) yields a stable contiguous stride for dynamo.
+                    blk_table_tensor = (
+                        blk_table.get_cpu_tensor()[:num_reqs]
+                        if envs.VLLM_RBLN_USE_DEVICE_TENSOR
+                        else blk_table.get_device_tensor(num_reqs)
+                    )
                     slot_mapping = blk_table.slot_mapping.gpu[
                         :total_num_scheduled_tokens
                     ]
@@ -2629,11 +2662,21 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             input_ids_bucket[batch_bucket_size] = input_ids.to(self.device)
             positions_bucket[batch_bucket_size] = positions.to(self.device)
 
+            if draft_attn_metadata_bucket is not None:
+                draft_attn_metadata_bucket[batch_bucket_size] = (
+                    self.drafter.prepare_dummy_attn_metadata(
+                        common_attn_metadata=common_attn_metadata,
+                        batch_bucket_size=batch_bucket_size,
+                        positions=self.positions.cpu.clone(),
+                    )
+                )
+
         return DummyRunState(
             attn_metadata=attn_metadata_bucket,
             num_input_tokens=num_input_tokens,
             input_ids=input_ids_bucket,
             positions=positions_bucket,
+            draft_attn_metadata=draft_attn_metadata_bucket,
         )
 
     def _prepare_dummy_input_batch(self) -> InputBatch:
@@ -2740,7 +2783,10 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     @torch.inference_mode()
     def dummy_run(self) -> None:
         assert self.dummy_run_state is not None
-        (attn_metadata, num_input_tokens, input_ids, positions) = self.dummy_run_state
+        attn_metadata = self.dummy_run_state.attn_metadata
+        num_input_tokens = self.dummy_run_state.num_input_tokens
+        input_ids = self.dummy_run_state.input_ids
+        positions = self.dummy_run_state.positions
 
         # This rank is DP-idle (no scheduled work). Under the always-full-spec
         # design the runtime model_wrapper shape is unconditionally
@@ -2837,6 +2883,13 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 **model_kwargs,
             )
 
+        draft_attn_metadata = self.dummy_run_state.draft_attn_metadata
+        if draft_attn_metadata is not None and self.num_spec_tokens > 0:
+            self.drafter.dummy_propose(
+                per_layer_attn_metadata=draft_attn_metadata[batch_bucket_size],
+                batch_bucket_size=batch_bucket_size,
+            )
+
     def _bookkeeping_sync(
         self,
         scheduler_output: "SchedulerOutput",
@@ -2883,7 +2936,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         logprobs_lists = None
         if not self.use_async_scheduling:
             # Get the valid generated tokens.
-            if envs.VLLM_RBLN_USE_DEVICE_TENSOR and sampled_token_ids.shape[0] == 0:
+            if envs.VLLM_RBLN_USE_DEVICE_TENSOR or sampled_token_ids.shape[0] == 0:
                 # No tokens were actually sampled (e.g., non-last
                 # chunk in chunked prefill produces empty logits).
                 valid_sampled_token_ids: list[list[int]] = [
@@ -3320,6 +3373,51 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 logits_indices.device
             )
             logits_indices = unpadded_to_padded[logits_indices.to(torch.int64)]
+
+            # Mirror the layout change for slot_mapping.
+            if slot_mappings_by_group is not None:
+                total_padded_tokens = num_reqs * max_spec_decode_len
+
+                def _remap_slot_mapping(sm: torch.Tensor) -> torch.Tensor:
+                    new_sm = torch.full(
+                        (total_padded_tokens,),
+                        -1,
+                        dtype=sm.dtype,
+                        device=sm.device,
+                    )
+                    new_sm[unpadded_to_padded] = sm[:num_input_tokens]
+                    return new_sm
+
+                slot_mappings_by_group = {
+                    gid: _remap_slot_mapping(sm)
+                    for gid, sm in slot_mappings_by_group.items()
+                }
+                # Rebuild per-layer dict so same-group layers share the same
+                # remapped tensor (matches the original aliasing in
+                # `_get_slot_mappings`).
+                if isinstance(slot_mappings, dict):
+                    new_slot_mappings: dict[str, torch.Tensor] = {}
+                    for gid, kv_cache_group in enumerate(
+                        self.kv_cache_config.kv_cache_groups
+                    ):
+                        sm = slot_mappings_by_group[gid]
+                        for layer_name in kv_cache_group.layer_names:
+                            new_slot_mappings[layer_name] = sm
+                    slot_mappings = new_slot_mappings
+
+                # Push the padded slot_mapping back into per-layer
+                # attn_metadata. The attention builder
+                # (flash_attention.py:1116/1252) already stamped the unpadded
+                # tensor here, so we overwrite in-place.
+                if attn_metadata is not None:
+                    for gid, kv_cache_group in enumerate(
+                        self.kv_cache_config.kv_cache_groups
+                    ):
+                        sm = slot_mappings_by_group[gid]
+                        for layer_name in kv_cache_group.layer_names:
+                            md = attn_metadata.get(layer_name)
+                            if md is not None and hasattr(md, "slot_mapping"):
+                                md.slot_mapping = sm
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
@@ -3972,14 +4070,22 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     def load_model(self) -> None:
         logger.info("Starting to load model %s...", self.model_config.model)
         model_loader = get_model_loader(self.load_config)
-        if not hasattr(self, "model"):
-            logger.info("Loading model from scratch...")
-            self.model = model_loader.load_model(
-                vllm_config=self.vllm_config, model_config=self.model_config
-            )
-        else:
-            logger.info("Model was already initialized. Loading weights inplace...")
-            model_loader.load_weights(self.model, model_config=self.model_config)
+        offload_ctx = (
+            torch.rbln.offload()
+            if envs.VLLM_RBLN_USE_DEVICE_TENSOR
+            and has_torch_rbln
+            and not envs.VLLM_RBLN_DISABLE_OFFLOAD
+            else nullcontext()
+        )
+        with offload_ctx:
+            if not hasattr(self, "model"):
+                logger.info("Loading model from scratch...")
+                self.model = model_loader.load_model(
+                    vllm_config=self.vllm_config, model_config=self.model_config
+                )
+            else:
+                logger.info("Model was already initialized. Loading weights inplace...")
+                model_loader.load_weights(self.model, model_config=self.model_config)
 
         self.model = self.get_model().eval()
         self.compute_logits_model = self.model
