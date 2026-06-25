@@ -5173,6 +5173,10 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     f"src_block_ids: {src_block_ids}"
                     f"dst_block_ids: {dst_block_ids}"
                 )
+                # dst_block_ids and direction are part of the fixed
+                # CopyBlocksOp callback signature. P/D uses identical block ids
+                # on both sides (asserted above), so the copy indexes by
+                # src_block_ids; the copy is symmetric, so direction is unused.
                 for layer_name, dst_cache in dst_kv_caches.items():
                     src_cache = src_kv_caches[layer_name]
                     for kv in range(dst_cache.shape[0]):
