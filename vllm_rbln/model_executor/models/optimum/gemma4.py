@@ -15,48 +15,18 @@ import torch
 from vllm.logger import init_logger
 from vllm.model_executor.models.gemma4_mm import (
     Gemma4AudioInputs,
-    Gemma4DummyInputsBuilder,
     Gemma4ImageInputs,
     Gemma4ImagePixelInputs,
-    Gemma4MultiModalProcessor,
-    Gemma4ProcessingInfo,
     Gemma4VideoInputs,
 )
-from vllm.multimodal import MULTIMODAL_REGISTRY
 
 from .gemma3 import (
-    RBLNChunkedPrefillPadMixin,
     RBLNOptimumGemma3ForConditionalGeneration,
 )
 
 logger = init_logger(__name__)
 
 
-class RBLNGemma4MultiModalProcessor(
-    RBLNChunkedPrefillPadMixin, Gemma4MultiModalProcessor
-):
-    # Reuses the shared alloc_len-based left-pad. Gemma4 differs from gemma3 only
-    # in image bucketing: a list of buckets (variable soft-token count per image),
-    # from which the planner picks the smallest bucket that fits each image run —
-    # exactly mirroring optimum-rbln's RBLNGemma4RuntimeModel._resolve_image_chunk.
-    # The old per-image pre/post-pad approach is obsolete: tight-packing plus
-    # dead-tail masking inside optimum-rbln now enforce the no-image/text-mixing
-    # rule, so only the total pad count (not its placement) matters.
-    def _image_buckets(self) -> list[int]:
-        cfg = self._rbln_cfg()
-        sizes = cfg.get("image_prefill_chunk_sizes")
-        if sizes is None:
-            # Some configs persist the scalar form instead of the list.
-            size = cfg.get("image_prefill_chunk_size")
-            return [size] if size is not None else []
-        return list(sizes) if isinstance(sizes, (list, tuple)) else [sizes]
-
-
-@MULTIMODAL_REGISTRY.register_processor(
-    RBLNGemma4MultiModalProcessor,
-    info=Gemma4ProcessingInfo,
-    dummy_inputs=Gemma4DummyInputsBuilder,
-)
 class RBLNOptimumGemma4ForConditionalGeneration(
     RBLNOptimumGemma3ForConditionalGeneration
 ):
