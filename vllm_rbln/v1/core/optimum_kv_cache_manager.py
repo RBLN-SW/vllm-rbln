@@ -94,6 +94,7 @@ class RBLNKVCacheManager(KVCacheManager):
         self.block_size = block_size
         self.needs_chunked_prefill_pad = needs_chunked_prefill_pad
         self.prefill_chunk_size = prefill_chunk_size
+        self.attn_block_size = attn_block_size
         if needs_chunked_prefill_pad:
             assert prefill_chunk_size is not None, (
                 "prefill_chunk_size is required when needs_chunked_prefill_pad "
@@ -121,7 +122,10 @@ class RBLNKVCacheManager(KVCacheManager):
 
     def _chunked_prefill_pad(self, request: Request, query_len: int) -> int:
         chunk_size = self.prefill_chunk_size
-        block_size = self.block_size
+        if self.attn_block_size is None:
+            block_size = self.block_pool.block_size
+        else:
+            block_size = self.attn_block_size
         # Image placeholder ranges within the prompt, sorted by start offset.
         # NOTE: a range covers the whole image block incl. special tokens (gemma3:
         # \n\n+boi+256+eoi+\n\n = 260), not just the 256 image soft tokens.

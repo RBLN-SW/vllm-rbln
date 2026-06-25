@@ -83,6 +83,12 @@ def update_block_size(
     and user-provided prefix_block_size.
     """
     vllm_config.cache_config.user_specified_block_size = True
+    # Persist prefill_chunk_size so the scheduler can size the chunked-prefill
+    # block padding for gemma3/gemma4 (RBLNKVCacheManager.allocate_slots). Both
+    # load paths (from_optimum / from_vllm) funnel through here.
+    if vllm_config.additional_config is None:
+        vllm_config.additional_config = {}
+    vllm_config.additional_config["prefill_chunk_size"] = prefill_chunk_size
     if vllm_config.cache_config.enable_prefix_caching:
         _apply_prefix_caching_block_size(
             vllm_config, kvcache_block_size, prefill_chunk_size
