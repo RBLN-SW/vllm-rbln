@@ -460,7 +460,8 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
 
         # Two passes when SWA is present: Full descs first, then SWA descs
         # at the same base addresses but `sliding_window`-sized.
-        length_divisors = [1] if self._sw_ratio is None else [1, self._sw_ratio]
+        # _sw_ratio is not None here (the None case returned early above).
+        length_divisors = [1, self._sw_ratio]
         for divisor in length_divisors:
             for i, base_addr in enumerate(local_base_addresses):
                 kv_block_len = (
@@ -561,27 +562,14 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
             not self.transfer_topo.is_kv_replicated(engine_id) and tp_ratio > 0
         )
 
-        # Heterogeneous TP path (P TP > D TP): logically split own regions
-        # into |tp_ratio| chunks. Mirrors upstream; preserved verbatim
-        # because RBLN may run heterogeneous TP in the future.
-        if (
-            tp_ratio < 0
-            and not self.use_mla
-            and tp_ratio not in self.src_xfer_handles_by_tp_ratio
-        ):
-            self.src_xfer_handles_by_tp_ratio[tp_ratio] = []
-            for i in range(-tp_ratio):
-                split_blocks_data = []
-                for memory_region in self.src_blocks_data:
-                    addr, local_block_len, own_tp_rank = memory_region
-                    remote_block_len = local_block_len // (-tp_ratio)
-                    addr = addr + i * remote_block_len
-                    split_blocks_data.append((addr, remote_block_len, own_tp_rank))
-                descs = self.nixl_wrapper.get_xfer_descs(
-                    split_blocks_data, self.nixl_memory_type
-                )
-                handle = self.nixl_wrapper.prep_xfer_dlist("NIXL_INIT_AGENT", descs)
-                self.src_xfer_handles_by_tp_ratio[tp_ratio].append(handle)
+        # RBLN runs homogeneous TP (tp_ratio == 1) or local_tp >= remote_tp
+        # (tp_ratio > 0). The remote_tp > local_tp case (tp_ratio < 0) would
+        # need to logically split own regions; it is unsupported and untested,
+        # so reject it instead of carrying the branch.
+        assert tp_ratio >= 0, (
+            "RBLN NIXL connector does not support remote TP > local TP "
+            f"(tp_ratio={tp_ratio})."
+        )
 
         blocks_data: list[tuple[int, int, int]] = []
         num_blocks = nixl_agent_meta.num_blocks
@@ -590,7 +578,8 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
         # at the same base addresses (same `page_size` stride — the
         # remote tensor's physical block stride is still Full-sized),
         # shorter desc length.
-        length_divisors = [1] if self._sw_ratio is None else [1, self._sw_ratio]
+        # _sw_ratio is not None here (the None case returned early above).
+        length_divisors = [1, self._sw_ratio]
         for divisor in length_divisors:
             for i, base_addr in enumerate(nixl_agent_meta.kv_caches_base_addr):
                 local_block_len = self.get_backend_aware_kv_block_len(
@@ -599,8 +588,6 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
                 remote_kv_block_len = local_block_len // block_size_ratio
                 if block_size_ratio > 1:
                     local_block_len = remote_kv_block_len
-                if tp_ratio < 0 and not self.use_mla:
-                    local_block_len = local_block_len // (-tp_ratio)
                 desc_len = local_block_len // divisor
                 rank_offset = (
                     self.tp_rank % tp_ratio * remote_kv_block_len
@@ -649,6 +636,13 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
                 block_size_ratio,
                 physical_blocks_per_logical,
             )
+
+        # The SWA desc formula below indexes physical blocks directly; the
+        # connector pins one physical block per logical block, so the
+        # physical_blocks_per_logical argument does not apply here.
+        assert physical_blocks_per_logical == 1, (
+            "RBLN NIXL connector assumes physical_blocks_per_logical == 1"
+        )
 
         num_blocks = dst_num_blocks
         if block_size_ratio is not None:
