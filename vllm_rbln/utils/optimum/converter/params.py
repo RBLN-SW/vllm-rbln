@@ -203,18 +203,26 @@ class RBLNParams:
 
 
 def _resolve_image_prefill_chunk_sizes(cfg: RblnConfigLike) -> list[int] | None:
-    """Resolve image-prefill buckets, mirroring optimum-rbln.
+    """Resolve image-prefill buckets exactly as optimum-rbln persists them.
 
-    gemma4 persists ``image_prefill_chunk_sizes`` (a list; ``image_prefill_chunk_size``
-    is a derived ``max(...)`` and not stored). gemma3 persists the scalar
-    ``image_prefill_chunk_size``. Returns a list in either case, or ``None`` when
-    neither is present.
+    gemma4 stores ``image_prefill_chunk_sizes`` as a ``list[int]``; gemma3 stores
+    the scalar ``image_prefill_chunk_size`` as an ``int``. Any other type is a
+    config error. Returns ``None`` when neither key is present.
     """
     sizes = _cfg_get(cfg, "image_prefill_chunk_sizes")
     if sizes is not None:
-        return list(sizes) if isinstance(sizes, (list, tuple)) else [sizes]
+        if not isinstance(sizes, list):
+            raise TypeError(
+                "image_prefill_chunk_sizes must be a list[int], got "
+                f"{type(sizes).__name__}"
+            )
+        return sizes
     size = _cfg_get(cfg, "image_prefill_chunk_size")
     if size is not None:
+        if not isinstance(size, int):
+            raise TypeError(
+                f"image_prefill_chunk_size must be an int, got {type(size).__name__}"
+            )
         return [size]
     return None
 
