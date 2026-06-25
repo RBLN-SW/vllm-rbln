@@ -33,7 +33,7 @@ class TestParseDecoder:
         assert params.max_seq_len == 8192
         assert params.kvcache_block_size == 4096
         assert params.prefill_chunk_size == 256
-        # tensor_parallel_size is populated by the caller
+        # num_devices is populated by the caller
         # (`from_rbln_config`), not `_parse_decoder`,
         # so it is not asserted here.
 

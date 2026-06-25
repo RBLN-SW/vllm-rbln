@@ -86,7 +86,7 @@ class RBLNParams:
     max_seq_len: int | None = None
     kvcache_block_size: int | None = None
     prefill_chunk_size: int = 128
-    tensor_parallel_size: int = 1
+    num_devices: int = 1
 
     @classmethod
     def from_rbln_config(
@@ -94,7 +94,7 @@ class RBLNParams:
     ) -> "RBLNParams":
         """Parse rbln_config according to the model architecture."""
         hf_config = vllm_config.model_config.hf_config
-        tensor_parallel_size = _cfg_get(rbln_config, "tensor_parallel_size", 1)
+        num_devices = _cfg_get(rbln_config, "num_devices", 1)
 
         if is_enc_dec_arch(hf_config):
             params = cls._parse_enc_dec(rbln_config)
@@ -105,7 +105,7 @@ class RBLNParams:
         else:
             params = cls._parse_decoder(rbln_config)
 
-        params.tensor_parallel_size = tensor_parallel_size
+        params.num_devices = num_devices
         return params
 
     @classmethod
