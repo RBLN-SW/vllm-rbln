@@ -44,6 +44,9 @@ class RBLNKVCacheManager(KVCacheManager):
         attn_block_size: int | None = None,
         max_num_seqs: int = 1,
         is_encoder_decoder: bool = False,
+        prefill_chunk_size: int | None = None,
+        image_prefill_chunk_sizes: list[int] | None = None,
+        needs_chunked_prefill_pad: bool = False,
     ) -> None:
         """
         RBLNKVCacheManager = KVCacheManager + PrefixKVCacheManager.
@@ -84,6 +87,23 @@ class RBLNKVCacheManager(KVCacheManager):
         self.block_pool = self.coordinator.block_pool
         self.kv_cache_config = kv_cache_config
         block_size = kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size
+        # gemma3/gemma4: optimum-rbln's chunked prefill touches extra KV-cache
+        # slots beyond the prompt length (partition-alignment + trailing chunk
+        # write-extent). `block_size` here equals `kvcache_partition_len`
+        # (compilation sets `kvcache_partition_len = block_size`), so the same
+        # value drives the boundary check in `allocate_slots`.
+        self.block_size = block_size
+        self.needs_chunked_prefill_pad = needs_chunked_prefill_pad
+        self.prefill_chunk_size = prefill_chunk_size
+        # gemma3: single image bucket; gemma4: descending list of buckets.
+        # Used to size the per-image chunk in `_chunked_prefill_pad`.
+        self.image_prefill_chunk_sizes = image_prefill_chunk_sizes
+        self.attn_block_size = attn_block_size
+        if needs_chunked_prefill_pad:
+            assert prefill_chunk_size is not None, (
+                "prefill_chunk_size is required when needs_chunked_prefill_pad "
+                "is set (gemma3/gemma4)."
+            )
         if enable_caching:
             assert attn_block_size is not None, (
                 "attn_block_size must be specified for prefix caching"
@@ -103,6 +123,102 @@ class RBLNKVCacheManager(KVCacheManager):
         self.empty_kv_cache_blocks = KVCacheBlocks(
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
+        # Cache the chunked-prefill padding per request. It depends only on the
+        # prompt (fixed for the request's lifetime), so compute it once at the
+        # first allocate_slots and reuse it on every later (decode) call.
+        self._chunked_prefill_pad_cache: dict[str, int] = {}
+
+    def _image_embed_segments(
+        self, request: Request, query_len: int
+    ) -> list[tuple[int, int]]:
+        """Contiguous image-embed token runs (start, end), sorted by start.
+
+        Uses `mm_position.is_embed` so runs are the actual image tokens, not the
+        whole placeholder (which also holds text-like boi/eoi/\\n\\n tokens).
+        """
+        segments: list[tuple[int, int]] = []
+        for f in request.mm_features:
+            pos = f.mm_position
+            start = pos.offset
+            assert pos.is_embed is not None, (
+                "mm_position.is_embed must be set for image placeholders"
+            )
+            mask = pos.is_embed.tolist()  # per-position embed flags within placeholder
+            i, n = 0, len(mask)
+            while i < n:
+                if mask[i]:
+                    # Start of an embed run; extend `j` to its end.
+                    j = i
+                    while j < n and mask[j]:
+                        j += 1
+                    # Record the run in absolute prompt positions (clamped).
+                    if start + i < query_len:
+                        segments.append((start + i, min(start + j, query_len)))
+                    i = j  # jump past this run
+                else:
+                    i += 1  # text token, skip
+        # Sort by start position (tuple order: by `start`, then `end`) so the
+        # runs are returned in prompt order; features may arrive out of order.
+        segments.sort()
+        return segments
+
+    def _image_chunk_size(self, run_len: int) -> int:
+        buckets = self.image_prefill_chunk_sizes
+        if not buckets:
+            assert self.prefill_chunk_size is not None, (
+                "prefill_chunk_size must be set when image_prefill_chunk_sizes is empty"
+            )
+            return self.prefill_chunk_size
+        # buckets is descending, so `reversed` is ascending: the first bucket
+        # that is >= run_len is the smallest one that fits.
+        chunk = next((b for b in reversed(buckets) if b >= run_len), None)
+        if chunk is None:
+            raise ValueError(
+                f"image run of {run_len} tokens exceeds the largest "
+                f"image-prefill bucket ({buckets[0]})"
+            )
+        return chunk
+
+    def _chunked_prefill_pad(self, request: Request, query_len: int) -> int:
+        # FIXME chunk size?????
+        text_chunk = self.prefill_chunk_size
+        assert text_chunk is not None, (
+            "prefill_chunk_size must be set when needs_chunked_prefill_pad is True"
+        )
+        block_size = (
+            self.attn_block_size
+            if self.attn_block_size is not None
+            else self.block_size
+        )
+        image_segments = self._image_embed_segments(request, query_len)
+        # `step`: next prompt token to process (excludes alignment padding).
+        # `align_pad`: alignment padding so far; the token sits at cache slot
+        #   `step + align_pad`.
+        #
+        # Each run is one chunk: an image run uses its bucket as the chunk size
+        step = 0
+        align_pad = 0
+        while step < query_len:
+            seg_end = next((e for s, e in image_segments if s <= step < e), None)
+            if seg_end is not None:
+                # image run: processed as one bucket-sized chunk.
+                run_len = seg_end - step
+                chunk_size = self._image_chunk_size(run_len)
+            else:
+                # text run: up to the next image, in `text_chunk` pieces.
+                run_end = min(
+                    (s for s, _ in image_segments if s > step), default=query_len
+                )
+                run_len = min(run_end - step, text_chunk)
+                chunk_size = text_chunk
+
+            # Pad to the block boundary if this chunk would straddle one.
+            # `offset_in_block`: this chunk's first cache slot within its block.
+            offset_in_block = (step + align_pad) % block_size
+            if offset_in_block + chunk_size > block_size:
+                align_pad += block_size - offset_in_block
+            step += run_len
+        return align_pad
 
     def free(self, request: Request, preemption: bool = False) -> None:
         """Free the blocks allocated for the request."""
@@ -111,6 +227,7 @@ class RBLNKVCacheManager(KVCacheManager):
                 request.request_id, preemption=preemption
             )
         self.coordinator.free(request.request_id)
+        self._chunked_prefill_pad_cache.pop(request.request_id, None)
 
     def allocate_slots(
         self,
@@ -140,6 +257,18 @@ class RBLNKVCacheManager(KVCacheManager):
         # `num_new_tokens` = 1.
         num_computed_tokens = request.num_computed_tokens
         num_tokens_need_slot = min(request.num_tokens, self.max_model_len)
+        if self.needs_chunked_prefill_pad:
+            # gemma3/gemma4: reserve the partition-alignment + trailing-chunk
+            # slots optimum-rbln's chunked prefill touches beyond the prompt.
+            # The padding is fixed by the prompt; later decode tokens append on
+            # top of it, so compute it once and reuse it on later calls.
+            pad = self._chunked_prefill_pad_cache.get(request.request_id)
+            if pad is None:
+                pad = self._chunked_prefill_pad(
+                    request, min(request.num_prompt_tokens, self.max_model_len)
+                )
+                self._chunked_prefill_pad_cache[request.request_id] = pad
+            num_tokens_need_slot += pad
         num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
             request_id=request.request_id,
             num_tokens=num_tokens_need_slot,

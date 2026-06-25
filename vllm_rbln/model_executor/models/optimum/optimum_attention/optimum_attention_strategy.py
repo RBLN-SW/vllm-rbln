@@ -310,14 +310,9 @@ class HybridAttentionImageStrategy(
         padded_attention_mask = self.pad_to_2d(
             attention_masks, decoder_batch_size, attention_masks[0].shape[1], 0
         )
-
-        # cache_positions:
-        #  the index including padding between text and image
-        # pad_lens:
-        #   the size of padding
-        # position_ids:
-        #   the index of the token to be decoded in the sequence.
-        position_ids = padded_cache_positions - padded_pad_len
+        # FIXME remove the logic
+        position_ids = padded_cache_positions
+        padded_cache_positions = position_ids + padded_pad_len
 
         return (
             padded_local_block_table_ids,

@@ -15,7 +15,11 @@
 
 
 def get_param_qwen2_vl(
-    batch_size: int, max_model_len: int, block_size: int, num_devices: int
+    batch_size: int,
+    max_model_len: int,
+    block_size: int,
+    num_devices: int,
+    prefill_chunk_size: int | None = None,
 ) -> dict:
     # Max sequence length for Vision Transformer (ViT), representing the number of patches in an image. # noqa: E501
     # Example: For a 224x224 pixel image with patch size 14,
@@ -37,6 +41,10 @@ def get_param_qwen2_vl(
         attn_impl = "flash_attn" if block_size != max_model_len else "eager"
         param["kvcache_partition_len"] = block_size
         param["attn_impl"] = attn_impl
+    # Pin prefill_chunk_size so the compiled model stays in sync with the value
+    # used for KV-cache block padding.
+    if prefill_chunk_size is not None:
+        param["prefill_chunk_size"] = prefill_chunk_size
     return param
 
 
