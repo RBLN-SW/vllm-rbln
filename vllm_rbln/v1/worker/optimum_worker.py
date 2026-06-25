@@ -30,6 +30,7 @@ from vllm.distributed.ec_transfer import ensure_ec_transfer_initialized
 from vllm.lora.request import LoRARequest
 from vllm.tasks import SupportedTask
 from vllm.utils.torch_utils import set_random_seed
+from vllm.profiler.wrapper import TorchProfilerWrapper
 from vllm.v1.core.kv_cache_utils import get_uniform_page_size
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheSpec
@@ -67,10 +68,9 @@ class RBLNOptimumWorker(WorkerBase):
         profiler_config = vllm_config.profiler_config
         # Set up profiler if profiling is enabled
         if profiler_config.torch_profiler_dir:
-            torch_profiler_trace_dir = profiler_config.torch_profiler_dir
             logger.info(
                 "Profiling enabled. Traces will be saved to: %s",
-                torch_profiler_trace_dir,
+                profiler_config.torch_profiler_dir,
             )
             logger.debug(
                 "Profiler config: record_shapes=%s,"
@@ -81,19 +81,11 @@ class RBLNOptimumWorker(WorkerBase):
                 profiler_config.torch_profiler_with_flops,
                 profiler_config.torch_profiler_use_gzip,
             )
-            self.profiler = torch.profiler.profile(
-                activities=[
-                    torch.profiler.ProfilerActivity.CPU,
-                ],
-                record_shapes=profiler_config.torch_profiler_record_shapes,
-                profile_memory=profiler_config.torch_profiler_with_memory,
-                with_stack=profiler_config.torch_profiler_with_stack,
-                with_flops=profiler_config.torch_profiler_with_flops,
-                on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                    torch_profiler_trace_dir,
-                    worker_name=f"{vllm_config.instance_id}-rank-{self.rank}",
-                    use_gzip=profiler_config.torch_profiler_use_gzip,
-                ),
+            self.profiler = TorchProfilerWrapper(
+                profiler_config,
+                worker_name=f"{vllm_config.instance_id}-rank-{self.rank}",
+                local_rank=self.local_rank,
+                activities=["CPU"],
             )
         else:
             self.profiler = None
@@ -254,11 +246,6 @@ class RBLNOptimumWorker(WorkerBase):
             self.profiler.start()
         else:
             self.profiler.stop()
-            # only print profiler results on rank 0
-            if self.local_rank == 0:
-                print(
-                    self.profiler.key_averages().table(sort_by="self_cuda_time_total")
-                )
 
     def load_model(self, *, load_dummy_weights: bool = False):
         self.model_runner.load_model()

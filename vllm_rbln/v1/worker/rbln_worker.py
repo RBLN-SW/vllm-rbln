@@ -496,8 +496,15 @@ class RBLNWorker(WorkerBase):
             self.model_config.enforce_eager
             or not envs.VLLM_RBLN_COMPILE_MODEL
             or not envs.VLLM_RBLN_ENABLE_WARM_UP
+            or self.model_runner.supports_mm_inputs
         ):
-            logger.warning("skipping compile_or_warm_up_model")
+            if self.model_runner.supports_mm_inputs and envs.VLLM_RBLN_ENABLE_WARM_UP:
+                logger.warning(
+                    "skipping compile_or_warm_up_model for multimodal model; "
+                    "dummy warm-up does not cover VLM inputs_embeds graphs"
+                )
+            else:
+                logger.warning("skipping compile_or_warm_up_model")
 
             self._ensure_rbln_cpu_affinity_after_warmup()
             return CompilationTimes(
