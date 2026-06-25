@@ -123,6 +123,10 @@ class RBLNKVCacheManager(KVCacheManager):
         self.empty_kv_cache_blocks = KVCacheBlocks(
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
+        # Cache the chunked-prefill padding per request. It depends only on the
+        # prompt (fixed for the request's lifetime), so compute it once at the
+        # first allocate_slots and reuse it on every later (decode) call.
+        self._chunked_prefill_pad_cache: dict[str, int] = {}
 
     def _image_embed_segments(
         self, request: Request, query_len: int
@@ -165,12 +169,19 @@ class RBLNKVCacheManager(KVCacheManager):
         """
         buckets = self.image_prefill_chunk_sizes
         if not buckets:
+            assert self.prefill_chunk_size is not None, (
+                "prefill_chunk_size must be set when image_prefill_chunk_sizes is empty"
+            )
             return self.prefill_chunk_size
         fits = [b for b in buckets if b >= run_len]
         return min(fits) if fits else max(buckets)
 
     def _chunked_prefill_pad(self, request: Request, query_len: int) -> int:
+        # FIXME chunk size?????
         text_chunk = self.prefill_chunk_size
+        assert text_chunk is not None, (
+            "prefill_chunk_size must be set when needs_chunked_prefill_pad is True"
+        )
         block_size = (
             self.attn_block_size
             if self.attn_block_size is not None
@@ -213,6 +224,7 @@ class RBLNKVCacheManager(KVCacheManager):
                 request.request_id, preemption=preemption
             )
         self.coordinator.free(request.request_id)
+        self._chunked_prefill_pad_cache.pop(request.request_id, None)
 
     def allocate_slots(
         self,
@@ -246,11 +258,13 @@ class RBLNKVCacheManager(KVCacheManager):
             # gemma3/gemma4: reserve the partition-alignment + trailing-chunk
             # slots optimum-rbln's chunked prefill touches beyond the prompt.
             # The padding is fixed by the prompt; later decode tokens append on
-            # top of it, so base the pad on the prompt length only.
-            pad = self._chunked_prefill_pad(
-                request, min(request.num_prompt_tokens, self.max_model_len)
-            )
-            print("@@@@ pad", pad)
+            # top of it, so compute it once and reuse it on later calls.
+            pad = self._chunked_prefill_pad_cache.get(request.request_id)
+            if pad is None:
+                pad = self._chunked_prefill_pad(
+                    request, min(request.num_prompt_tokens, self.max_model_len)
+                )
+                self._chunked_prefill_pad_cache[request.request_id] = pad
             num_tokens_need_slot += pad
         num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
             request_id=request.request_id,
