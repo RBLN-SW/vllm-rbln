@@ -225,6 +225,12 @@ class RBLNOptimumModelBase(nn.Module):
                 block_size=get_attn_block_size(self.vllm_config),
                 max_model_len=self.model_config.max_model_len,
                 num_devices=envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
+                # Resolved during sync (from_optimum/from_vllm); pin it at compile
+                # time so the compiled model matches the value used for KV-cache
+                # block padding.
+                prefill_chunk_size=self.vllm_config.additional_config.get(
+                    "prefill_chunk_size"
+                ),
                 rbln_overrides=rbln_overrides,
             )
             logger.info(

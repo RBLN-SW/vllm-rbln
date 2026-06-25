@@ -11,22 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import json
-import os
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import torch
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.gemma3_mm import (
-    Gemma3DummyInputsBuilder,
     Gemma3ImageInputs,
     Gemma3ImagePixelInputs,
-    Gemma3MultiModalProcessor,
-    Gemma3ProcessingInfo,
 )
 from vllm.model_executor.models.interfaces_base import VllmModelForTextGeneration
-from vllm.multimodal import MULTIMODAL_REGISTRY
 
 from .base import ModelInputForRBLN, version_error
 from .model_base import (
@@ -38,187 +32,9 @@ from .optimum_attention import HybridAttentionImageManager, HybridAttentionImage
 
 logger = init_logger(__name__)
 
-if TYPE_CHECKING:
-    from vllm.multimodal.processing.processor import (
-        BaseMultiModalProcessor as _ProcessorBase,
-    )
-else:
-    _ProcessorBase = object
-
 PAD_TOKEN_ID = 0
 
 
-def _run_length_from(token_types: list[int], start: int, value: int, cap: int) -> int:
-    """Length of the run of ``value`` starting at ``start``, capped at ``cap``.
-
-    Mirrors optimum-rbln's ``_run_length_from`` (decoderonly_runtime_utils.py) so
-    the slot count this processor reserves matches what ``_plan_prefill_chunks``
-    plans at runtime.
-
-    Examples:
-        tt = [0, 0, 0, 1, 1, 1, 1, 0, 0]
-              ^ start=0
-        _run_length_from(tt, 0, value=0, cap=256)  # -> 3  (leading text run)
-        _run_length_from(tt, 3, value=1, cap=256)  # -> 4  (image run)
-        _run_length_from(tt, 3, value=1, cap=2)    # -> 2  (capped at 2)
-    """
-    n = len(token_types)
-    end = min(start + cap, n)
-    i = start
-    while i < end and token_types[i] == value:
-        i += 1
-    return i - start
-
-
-class RBLNChunkedPrefillPadMixin(_ProcessorBase):
-    """Left-pad ``prompt_token_ids`` so vLLM reserves enough KV-cache blocks.
-
-    Why:
-        vLLM sizes block allocation from the prompt length, but optimum-rbln's
-        chunked prefill touches extra slots beyond the real tokens (trailing
-        chunk write-extent + ``kvcache_partition_len`` alignment). We replay its
-        planner (``_plan_prefill_chunks``) for the highest slot touched
-        (``alloc_len``) and prepend ``alloc_len - query_length`` pad tokens.
-
-    Placement:
-        Pad tokens are masked out and stripped before attention, so only the
-        count matters, not where they go.
-
-    Subclasses override ``_image_buckets`` (gemma3: single bucket; gemma4: many)
-    and, once video is supported, ``_token_types``. Bucket-selection and planning
-    mirror optimum-rbln's ``RBLNDecoderOnly*`` mixins.
-    """
-
-    # MRO note: mix in BEFORE the HF ``*MultiModalProcessor`` so this ``apply``
-    # wraps theirs (``super().apply`` resolves to the HF processor).
-    def apply(self, *args, **kwargs):
-        output = super().apply(*args, **kwargs)
-        output["prompt_token_ids"] = self._pad_image_boundaries(
-            output["prompt_token_ids"]
-        )
-        return output
-
-    def _rbln_cfg(self) -> dict:
-        cached = getattr(self, "_rbln_cfg_cache", None)
-        if cached is not None:
-            return cached
-
-        model_path = self.info.ctx.model_config.model
-        cfg_path = os.path.join(model_path, "language_model", "rbln_config.json")
-        with open(cfg_path) as f:
-            cfg = json.load(f)
-        self._rbln_cfg_cache = cfg
-        return cfg
-
-    def _image_buckets(self) -> list[int]:
-        """Image-prefill bucket sizes, smallest-first-fit candidates.
-
-        Overridden per model: gemma3 has a single ``image_prefill_chunk_size``,
-        gemma4 has a list ``image_prefill_chunk_sizes``. Empty ⇒ no image prefill.
-        """
-        raise NotImplementedError
-
-    def _use_image_prefill(self) -> bool:
-        # Mirrors optimum's `use_tt = use_image_prefill and token_type_ids is not None`.
-        # `use_image_prefill` is usually absent in rbln_config, so the presence of
-        # image buckets is the proxy.
-        cfg = self._rbln_cfg()
-        if "use_image_prefill" in cfg:
-            return bool(cfg["use_image_prefill"])
-        return bool(self._image_buckets())
-
-    def _token_types(self, prompt_ids: list[int]) -> list[int]:
-        # 1 = image soft token, 0 = text. (Video=2 lands here once supported.)
-        image_token_id = self.info.get_hf_processor().image_token_id
-        return [1 if t == image_token_id else 0 for t in prompt_ids]
-
-    def _resolve_image_chunk(
-        self, token_types: list[int], step: int, start_type: int
-    ) -> tuple[int, int]:
-        """Return ``(run_len, chunk_size)`` for the image/video run at ``step``.
-
-        Picks the smallest bucket that fits the run — identical to optimum-rbln's
-        ``_resolve_image_chunk``. Reduces to the single bucket for gemma3.
-        """
-        buckets = self._image_buckets()
-        max_bucket = max(buckets)
-        run_len = _run_length_from(token_types, step, start_type, max_bucket + 1)
-        if run_len > max_bucket:
-            modality = "video" if start_type == 2 else "image"
-            raise ValueError(
-                f"{modality.capitalize()} run (token_type={start_type}) starting at "
-                f"position {step} is longer than the largest image-prefill bucket "
-                f"({max_bucket}); no bucket can hold it."
-            )
-        return run_len, min(b for b in buckets if b >= run_len)
-
-    def _required_alloc_len(self, token_types: list[int]) -> int:
-        cfg = self._rbln_cfg()
-        prefill_chunk_size = cfg["prefill_chunk_size"]
-        partition_len = cfg.get("kvcache_partition_len")
-        use_tt = self._use_image_prefill()
-
-        query_length = len(token_types)
-        step = 0
-        padded = 0
-        alloc_len = query_length
-        while step < query_length:
-            start_type = token_types[step] if use_tt else 0
-            is_image_prefill = use_tt and start_type > 0
-            if is_image_prefill:
-                run_len, chunk_size = self._resolve_image_chunk(
-                    token_types, step, start_type
-                )
-            else:
-                chunk_size = prefill_chunk_size
-                run_len = (
-                    _run_length_from(token_types, step, 0, prefill_chunk_size)
-                    if use_tt
-                    else prefill_chunk_size
-                )
-
-            if partition_len is not None:
-                offset_in_partition = (step + padded) % partition_len
-                if offset_in_partition + chunk_size > partition_len:
-                    padded += partition_len - offset_in_partition
-
-            is_last_chunk = step + run_len >= query_length
-            if is_last_chunk:
-                tail = query_length - step
-                num_processed = min(tail, run_len) if run_len > 0 else tail
-            else:
-                num_processed = run_len
-
-            alloc_len = max(alloc_len, step + padded + chunk_size)
-            step += num_processed
-
-        return alloc_len
-
-    def _pad_image_boundaries(self, prompt_ids: list[int]) -> list[int]:
-        prompt_ids = list(prompt_ids)
-        token_types = self._token_types(prompt_ids)
-
-        alloc_len = self._required_alloc_len(token_types)
-        pad_len = alloc_len - len(prompt_ids)
-        if pad_len <= 0:
-            return prompt_ids
-        return [PAD_TOKEN_ID] * pad_len + prompt_ids
-
-
-class RBLNGemma3MultiModalProcessor(
-    RBLNChunkedPrefillPadMixin, Gemma3MultiModalProcessor
-):
-    def _image_buckets(self) -> list[int]:
-        # gemma3: single image bucket.
-        size = self._rbln_cfg().get("image_prefill_chunk_size")
-        return [size] if size is not None else []
-
-
-@MULTIMODAL_REGISTRY.register_processor(
-    RBLNGemma3MultiModalProcessor,
-    info=Gemma3ProcessingInfo,
-    dummy_inputs=Gemma3DummyInputsBuilder,
-)
 class RBLNOptimumGemma3ForConditionalGeneration(
     RBLNOptimumModelBase,
     RBLNOptimumMultimodalMixin,
@@ -325,13 +141,13 @@ class RBLNOptimumGemma3ForConditionalGeneration(
             )
             logits = output.logits
             updated_attention_mask = output.attention_mask
-            left_pad = int((attention_mask == 0).sum().item())
+            updated_cache_lengths = output.padded_cache_lengths
 
             assert len(running_requests_ids) == 1
             self.attention_manager.add(
                 running_requests_id=running_requests_ids[0],
                 local_table_id=sliding_window_table_ids[0],
-                pad_len=left_pad,
+                pad_len=updated_cache_lengths,
                 attention_mask=updated_attention_mask,
             )
         else:
