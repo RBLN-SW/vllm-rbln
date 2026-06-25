@@ -14,7 +14,7 @@
 
 from vllm.v1.core.kv_cache_coordinator import UnitaryKVCacheCoordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.single_type_kv_cache_manager import get_manager_for_kv_cache_spec
+from vllm_rbln.v1.core.optimum_single_type_kv_cache_manager import get_manager_for_kv_cache_spec
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
 from vllm_rbln.v1.core.optimum_block_pool import RBLNBlockPool

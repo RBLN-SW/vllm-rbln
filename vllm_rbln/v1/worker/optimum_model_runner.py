@@ -44,7 +44,7 @@ from vllm.tracing import instrument
 from vllm.utils.import_utils import LazyLoader
 from vllm.utils.jsontree import json_map_leaves
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
-
+from vllm_rbln.v1.core.optimum_single_type_kv_cache_manager import HybridAttentionSpec
 # from vllm.utils import LazyLoader, is_pin_memory_available)
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheSpec
@@ -534,7 +534,7 @@ class RBLNOptimumModelRunner(
         block_size = self.vllm_config.cache_config.block_size
         kv_cache_spec: dict[str, KVCacheSpec] = {}
         for layer_idx in range(num_layers):
-            kv_cache_spec[str(layer_idx)] = FullAttentionSpec(
+            kv_cache_spec[str(layer_idx)] = HybridAttentionSpec(
                 block_size=block_size,
                 num_kv_heads=num_kv_heads,
                 head_size=head_size,
