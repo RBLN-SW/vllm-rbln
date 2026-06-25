@@ -86,6 +86,9 @@ class RBLNParams:
     max_seq_len: int | None = None
     kvcache_block_size: int | None = None
     prefill_chunk_size: int = 128
+    # Image-prefill buckets for multimodal models (gemma3: single value;
+    # gemma4: descending list of 128-multiples). None for non-multimodal models.
+    image_prefill_chunk_sizes: list[int] | None = None
     tensor_parallel_size: int = 1
 
     @classmethod
@@ -173,12 +176,47 @@ class RBLNParams:
                     num_blocks = _cfg_get(sub_cfg, "kvcache_num_blocks")
                     break
 
+        # prefill_chunk_size and image-prefill buckets live on the language model
+        # (optimum-rbln stores them on the `language_model` sub-config; gemma3/4
+        # expose them via RBLNGemma{3,4}ForConditionalGenerationConfig).
+        lm_cfg = cfg
+        for submodule_name in ("language_model", "text_model"):
+            sub_cfg = _cfg_get_submodule(cfg, submodule_name)
+            if sub_cfg is not None:
+                lm_cfg = sub_cfg
+                break
+        prefill_chunk_size = _cfg_get(lm_cfg, "prefill_chunk_size")
+        if prefill_chunk_size is None:
+            prefill_chunk_size = _cfg_get(cfg, "prefill_chunk_size", 128)
+        image_prefill_chunk_sizes = _resolve_image_prefill_chunk_sizes(lm_cfg)
+        if image_prefill_chunk_sizes is None:
+            image_prefill_chunk_sizes = _resolve_image_prefill_chunk_sizes(cfg)
+
         return cls(
             num_blocks=num_blocks,
             batch_size=batch_size,
             max_seq_len=max_seq_len,
             kvcache_block_size=kvcache_block_size,
+            prefill_chunk_size=prefill_chunk_size,
+            image_prefill_chunk_sizes=image_prefill_chunk_sizes,
         )
+
+
+def _resolve_image_prefill_chunk_sizes(cfg: RblnConfigLike) -> list[int] | None:
+    """Resolve image-prefill buckets, mirroring optimum-rbln.
+
+    gemma4 persists ``image_prefill_chunk_sizes`` (a list; ``image_prefill_chunk_size``
+    is a derived ``max(...)`` and not stored). gemma3 persists the scalar
+    ``image_prefill_chunk_size``. Returns a list in either case, or ``None`` when
+    neither is present.
+    """
+    sizes = _cfg_get(cfg, "image_prefill_chunk_sizes")
+    if sizes is not None:
+        return list(sizes) if isinstance(sizes, (list, tuple)) else [sizes]
+    size = _cfg_get(cfg, "image_prefill_chunk_size")
+    if size is not None:
+        return [size]
+    return None
 
 
 def _resolve_kvcache_block_size(cfg: RblnConfigLike, *, arch: str) -> int | None:

@@ -45,6 +45,7 @@ class RBLNKVCacheManager(KVCacheManager):
         max_num_seqs: int = 1,
         is_encoder_decoder: bool = False,
         prefill_chunk_size: int | None = None,
+        image_prefill_chunk_sizes: list[int] | None = None,
         needs_chunked_prefill_pad: bool = False,
     ) -> None:
         """
@@ -94,6 +95,9 @@ class RBLNKVCacheManager(KVCacheManager):
         self.block_size = block_size
         self.needs_chunked_prefill_pad = needs_chunked_prefill_pad
         self.prefill_chunk_size = prefill_chunk_size
+        # gemma3: single image bucket; gemma4: descending list of buckets.
+        # Used to size the per-image chunk in `_chunked_prefill_pad`.
+        self.image_prefill_chunk_sizes = image_prefill_chunk_sizes
         self.attn_block_size = attn_block_size
         if needs_chunked_prefill_pad:
             assert prefill_chunk_size is not None, (
@@ -120,40 +124,79 @@ class RBLNKVCacheManager(KVCacheManager):
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
 
+    def _image_embed_segments(
+        self, request: Request, query_len: int
+    ) -> list[tuple[int, int]]:
+        """Contiguous image-embed token runs (start, end), sorted by start.
+
+        Uses `mm_position.is_embed` so runs are the actual image tokens, not the
+        whole placeholder (which also holds text-like boi/eoi/\\n\\n tokens).
+        """
+        segments: list[tuple[int, int]] = []
+        for f in request.mm_features:
+            pos = f.mm_position
+            start = pos.offset
+            assert pos.is_embed is not None, (
+                "mm_position.is_embed must be set for image placeholders"
+            )
+            mask = pos.is_embed.tolist()  # per-position embed flags within placeholder
+            i, n = 0, len(mask)
+            while i < n:
+                if mask[i]:
+                    # Start of an embed run; extend `j` to its end.
+                    j = i
+                    while j < n and mask[j]:
+                        j += 1
+                    # Record the run in absolute prompt positions (clamped).
+                    if start + i < query_len:
+                        segments.append((start + i, min(start + j, query_len)))
+                    i = j  # jump past this run
+                else:
+                    i += 1  # text token, skip
+        segments.sort()
+        return segments
+
+    def _image_chunk_size(self, run_len: int) -> int:
+        """Image-prefill bucket for a run of `run_len` image tokens.
+
+        Mirrors optimum-rbln `_resolve_image_chunk`: the smallest bucket that
+        fits the run. Falls back to the text chunk when no buckets are configured
+        (e.g. text-only), or the largest bucket when the run exceeds all of them.
+        """
+        buckets = self.image_prefill_chunk_sizes
+        if not buckets:
+            return self.prefill_chunk_size
+        fits = [b for b in buckets if b >= run_len]
+        return min(fits) if fits else max(buckets)
+
     def _chunked_prefill_pad(self, request: Request, query_len: int) -> int:
-        chunk_size = self.prefill_chunk_size
-        if self.attn_block_size is None:
-            block_size = self.block_pool.block_size
-        else:
-            block_size = self.attn_block_size
-        # Image placeholder ranges within the prompt, sorted by start offset.
-        # NOTE: a range covers the whole image block incl. special tokens (gemma3:
-        # \n\n+boi+256+eoi+\n\n = 260), not just the 256 image soft tokens.
-        image_ranges = sorted(
-            (f.mm_position.offset, f.mm_position.offset + f.mm_position.length)
-            for f in request.mm_features
+        text_chunk = self.prefill_chunk_size
+        block_size = (
+            self.attn_block_size
+            if self.attn_block_size is not None
+            else self.block_size
         )
+        image_segments = self._image_embed_segments(request, query_len)
         # `step`: next prompt token to process (excludes alignment padding).
         # `align_pad`: alignment padding so far; the token sits at cache slot
         #   `step + align_pad`.
         #
-        # Example: [text 0..99][image 100..359], chunk_size=256
-        #   step=0   text  -> run_end=100 -> run_len=min(100, 256)=100
-        #   step=100 image -> run_end=360 -> run_len=min(260, 256)=256
-        #   step=356 image -> run_end=360 -> run_len=min(4,   256)=4
+        # Each run is one chunk: an image run uses its bucket as the chunk size
         step = 0
         align_pad = 0
         while step < query_len:
-            # End of the current run: an image's end if `step` is inside an image,
-            # else the next image's start (or `query_len`) for a text run.
-            img_end = next((e for s, e in image_ranges if s <= step < e), None)
-            if img_end is not None:
-                run_end = img_end
+            seg_end = next((e for s, e in image_segments if s <= step < e), None)
+            if seg_end is not None:
+                # image run: processed as one bucket-sized chunk.
+                run_len = seg_end - step
+                chunk_size = self._image_chunk_size(run_len)
             else:
+                # text run: up to the next image, in `text_chunk` pieces.
                 run_end = min(
-                    (s for s, _ in image_ranges if s > step), default=query_len
+                    (s for s, _ in image_segments if s > step), default=query_len
                 )
-            run_len = min(run_end - step, chunk_size)
+                run_len = min(run_end - step, text_chunk)
+                chunk_size = text_chunk
 
             # Pad to the block boundary if this chunk would straddle one.
             # `offset_in_block`: this chunk's first cache slot within its block.
