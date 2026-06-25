@@ -2936,7 +2936,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         logprobs_lists = None
         if not self.use_async_scheduling:
             # Get the valid generated tokens.
-            if envs.VLLM_RBLN_USE_DEVICE_TENSOR or sampled_token_ids.shape[0] == 0:
+            if sampled_token_ids.shape[0] == 0:
                 # No tokens were actually sampled (e.g., non-last
                 # chunk in chunked prefill produces empty logits).
                 valid_sampled_token_ids: list[list[int]] = [
