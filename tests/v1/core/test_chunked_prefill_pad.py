@@ -155,7 +155,8 @@ class TestChunkedPrefillPadWithImages:
     def test_image_aligned_no_padding(self):
         # Single image, all runs land within 4096 (multiple of 256).
         mgr = _make_manager(
-            prefill_chunk_size=256, attn_block_size=4096,
+            prefill_chunk_size=256,
+            attn_block_size=4096,
             image_prefill_chunk_sizes=[256],
         )
         req = _request(_image(100, 256, lead=2, trail=2))
@@ -172,7 +173,8 @@ class TestChunkedPrefillPadWithImages:
         #  14    text   3       14   14+4>16  -> +2       2
         #  17    image  4       3    3+4<=16              -
         mgr = _make_manager(
-            prefill_chunk_size=4, attn_block_size=16,
+            prefill_chunk_size=4,
+            attn_block_size=16,
             image_prefill_chunk_sizes=[4],
         )
         req = _request(
@@ -188,7 +190,8 @@ class TestChunkedPrefillPadWithImages:
         #  0     text   2     0    0+2<=8          -
         #  2     image  8     2    2+8>8  -> +6    6
         mgr = _make_manager(
-            prefill_chunk_size=2, attn_block_size=8,
+            prefill_chunk_size=2,
+            attn_block_size=8,
             image_prefill_chunk_sizes=[8],
         )
         req = _request(_image(2, 6))
@@ -204,7 +207,8 @@ class TestChunkedPrefillPadWithImages:
         #  5     text   4     5    5+4<=12          -
         #  7     image  8     7    7+8>12 -> +5     5
         mgr = _make_manager(
-            prefill_chunk_size=4, attn_block_size=12,
+            prefill_chunk_size=4,
+            attn_block_size=12,
             image_prefill_chunk_sizes=[4, 8],
         )
         req = _request(_image(2, 3), _image(7, 6))
