@@ -333,11 +333,12 @@ class TestDummyRunStateFeature:
             "num_input_tokens",
             "input_ids",
             "positions",
+            "draft_attn_metadata",
         )
         assert DummyRunState._fields == expected_fields
 
     def test_field_count(self):
-        assert len(DummyRunState._fields) == 4
+        assert len(DummyRunState._fields) == 5
 
     def test_is_named_tuple(self):
         assert issubclass(DummyRunState, tuple)

@@ -137,10 +137,13 @@ class RblnPlatform(Platform):
             from vllm.usage.usage_lib import UsageContext
 
             default_batched_tokens, _ = orig_get_batch_defaults(cls_, world_size)
+            # Cover every usage context plus None (create_engine_config's
+            # usage_context is UsageContext | None);
+            # otherwise .get(ctx, DEFAULT_MAX_NUM_SEQS) falls through to 128.
             default_max_num_seqs = {
-                UsageContext.LLM_CLASS: RBLN_DEFAULT_MAX_NUM_SEQS,
-                UsageContext.OPENAI_API_SERVER: RBLN_DEFAULT_MAX_NUM_SEQS,
+                ctx: RBLN_DEFAULT_MAX_NUM_SEQS for ctx in UsageContext
             }
+            default_max_num_seqs[None] = RBLN_DEFAULT_MAX_NUM_SEQS
             return default_batched_tokens, default_max_num_seqs
 
         EngineArgs.get_batch_defaults = classmethod(get_batch_defaults)
@@ -310,7 +313,8 @@ class RblnPlatform(Platform):
             assert vllm_config.parallel_config.tensor_parallel_size == 1, (
                 "Cannot set tensor_parallel_size for pre-compiled optimum-rbln models. "
                 "If you want to compile with tensor parallelism in vllm-rbln, "
-                "please use the `VLLM_RBLN_TP_SIZE` environment variable instead."
+                "please use the `VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK` "
+                "environment variable instead."
             )
             assert vllm_config.parallel_config.pipeline_parallel_size == 1, (
                 "Pipeline parallelism is not supported in optimum-rbln."
@@ -390,9 +394,7 @@ class RblnPlatform(Platform):
         if attn_selector_config.use_sparse:
             raise NotImplementedError("Sparse Attention is not supported on RBLN.")
 
-        attn_backend_cls = (
-            "vllm_rbln.v1.attention.backends.flash_attention.RBLNAttentionBackend"
-        )
+        attn_backend_cls = AttentionBackendEnum.FLASH_ATTN.get_path()
         logger.info("Using RBLN Attention Backend: %s", attn_backend_cls)
 
         return attn_backend_cls

@@ -56,14 +56,14 @@ def _sync_submodule_tp_with_device(rbln_config: dict) -> None:
     ``tensor_parallel_size`` to match that device count. The user only supplies
     ``device``, so we derive ``tensor_parallel_size`` from ``len(device)`` here.
     The top-level config is left untouched (its TP is driven by
-    ``VLLM_RBLN_TP_SIZE``).
+    ``VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK``).
     """
     for value in rbln_config.values():
         if not isinstance(value, dict):
             continue
         device = value.get("device")
         if isinstance(device, list) and device:
-            value["tensor_parallel_size"] = len(device)
+            value["num_devices"] = len(device)
 
 
 @dataclass
@@ -81,23 +81,35 @@ class RBLNCompileSpec:
         batch_size: int,
         block_size: int,
         max_model_len: int,
-        tp_size: int,
+        num_devices: int,
         rbln_overrides: dict[str, Any] | None = None,
     ) -> "RBLNCompileSpec":
         """Build a compile spec from vllm-rbln inputs, dispatched by architecture."""
         if is_generation_arch(config):
-            spec = cls._for_decoder(batch_size, block_size, max_model_len, tp_size)
+            spec = cls._for_decoder(batch_size, block_size, max_model_len, num_devices)
         elif is_pooling_arch(config):
             spec = cls._for_pooling(
-                config, batch_size, block_size, max_model_len, tp_size
+                config,
+                batch_size,
+                block_size,
+                max_model_len,
+                num_devices,
             )
         elif is_multi_modal(config):
             spec = cls._for_multimodal(
-                config, batch_size, block_size, max_model_len, tp_size
+                config,
+                batch_size,
+                block_size,
+                max_model_len,
+                num_devices,
             )
         elif is_enc_dec_arch(config):
             spec = cls._for_enc_dec(
-                config, batch_size, block_size, max_model_len, tp_size
+                config,
+                batch_size,
+                block_size,
+                max_model_len,
+                num_devices,
             )
         else:
             architectures = getattr(config, "architectures", [])
@@ -123,10 +135,10 @@ class RBLNCompileSpec:
         batch_size: int,
         block_size: int,
         max_model_len: int,
-        tp_size: int,
+        num_devices: int,
     ) -> "RBLNCompileSpec":
         rbln_config: dict[str, Any] = {
-            "tensor_parallel_size": tp_size,
+            "num_devices": num_devices,
             "batch_size": batch_size,
             "max_seq_len": max_model_len,
         }
@@ -142,14 +154,14 @@ class RBLNCompileSpec:
         batch_size: int,
         block_size: int,
         max_model_len: int,
-        tp_size: int,
+        num_devices: int,
     ) -> "RBLNCompileSpec":
         _, model_cls_name = get_rbln_model_info(config)
         model_cls = getattr(optimum.rbln, model_cls_name)
         assert model_cls is not None
 
         rbln_config: dict[str, Any] = {
-            "tensor_parallel_size": tp_size,
+            "num_devices": num_devices,
             "batch_size": batch_size,
             "max_seq_len": max_model_len,
         }
@@ -168,7 +180,7 @@ class RBLNCompileSpec:
         batch_size: int,
         block_size: int,
         max_model_len: int,
-        tp_size: int,
+        num_devices: int,
     ) -> "RBLNCompileSpec":
         model_name, model_cls_name = get_rbln_model_info(config)
         compile_fn = _COMPILE_MULTIMODAL_FNS.get(model_name)
@@ -181,7 +193,7 @@ class RBLNCompileSpec:
         assert model_cls is not None
         return cls(
             model_cls=model_cls,
-            rbln_config=compile_fn(batch_size, max_model_len, block_size, tp_size),
+            rbln_config=compile_fn(batch_size, max_model_len, block_size, num_devices),
         )
 
     @classmethod
@@ -191,7 +203,7 @@ class RBLNCompileSpec:
         batch_size: int,
         block_size: int,
         max_model_len: int,
-        tp_size: int,
+        num_devices: int,
     ) -> "RBLNCompileSpec":
         architectures = getattr(config, "architectures", [])
         assert architectures[0] == "WhisperForConditionalGeneration"
@@ -207,7 +219,7 @@ class RBLNCompileSpec:
         return cls(
             model_cls=RBLNAutoModelForSpeechSeq2Seq,
             rbln_config={
-                "tensor_parallel_size": tp_size,
+                "num_devices": num_devices,
                 "batch_size": batch_size,
                 "token_timestamps": False,
             },

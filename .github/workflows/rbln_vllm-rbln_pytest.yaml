@@ -332,7 +332,7 @@ jobs:
           shell: bash
           command: |
             VLLM_CPU_URL="${{ steps.parse_index_url.outputs.VLLM_CPU_URL }}"
-            uv pip install --system packaging setuptools wheel simphile pynvml huggingface_hub setuptools_scm fire pytest pytest-asyncio pytest-xdist
+            uv pip install --system packaging setuptools wheel simphile pynvml huggingface_hub setuptools_scm fire pytest pytest-asyncio pytest-xdist pytest-timeout
             if [ -n "${{ inputs.optimum_rbln_version }}" ]; then
               uv pip install --system --force-reinstall --no-cache-dir dist/vllm_rbln*.whl --constraint <(echo "optimum-rbln==${{ inputs.optimum_rbln_version }}") --index-url http://pypi-cache.devpi.svc.cluster.local/root/pypi/+simple/ --extra-index-url "${VLLM_CPU_URL}" --extra-index-url https://download.pytorch.org/whl/cpu  --extra-index-url https://pypi.org/simple --index-strategy unsafe-best-match
               echo "optimum-rbln ${{ inputs.optimum_rbln_version }}"
@@ -348,7 +348,7 @@ jobs:
         run: |
           case "${{ matrix.test_type.name }}" in
             "openai")
-              pytest tests/entrypoints/openai -vv --durations 0
+              pytest tests/entrypoints/openai -vv --durations 0 --timeout=600
               ;;
             "llm")
               pytest tests/entrypoints/llm -vv --durations 0

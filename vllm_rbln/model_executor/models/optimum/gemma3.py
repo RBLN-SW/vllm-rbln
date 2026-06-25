@@ -11,7 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Any
+import json
+import os
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.config import VllmConfig
@@ -23,20 +25,72 @@ from vllm.model_executor.models.gemma3_mm import (
     Gemma3MultiModalProcessor,
     Gemma3ProcessingInfo,
 )
-from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.model_executor.models.interfaces_base import VllmModelForTextGeneration
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
 from .base import ModelInputForRBLN, version_error
-from .model_base import RBLNOptimumDecoderMixin, RBLNOptimumModelBase
+from .model_base import (
+    RBLNOptimumDecoderMixin,
+    RBLNOptimumModelBase,
+    RBLNOptimumMultimodalMixin,
+)
 from .optimum_attention import HybridAttentionImageManager, HybridAttentionImageStrategy
 
 logger = init_logger(__name__)
 
+if TYPE_CHECKING:
+    from vllm.multimodal.processing.processor import (
+        BaseMultiModalProcessor as _ProcessorBase,
+    )
+else:
+    _ProcessorBase = object
+
 PAD_TOKEN_ID = 0
 
 
-class RBLNGemma3MultiModalProcessor(Gemma3MultiModalProcessor):
+def _run_length_from(token_types: list[int], start: int, value: int, cap: int) -> int:
+    """Length of the run of ``value`` starting at ``start``, capped at ``cap``.
+
+    Mirrors optimum-rbln's ``_run_length_from`` (decoderonly_runtime_utils.py) so
+    the slot count this processor reserves matches what ``_plan_prefill_chunks``
+    plans at runtime.
+
+    Examples:
+        tt = [0, 0, 0, 1, 1, 1, 1, 0, 0]
+              ^ start=0
+        _run_length_from(tt, 0, value=0, cap=256)  # -> 3  (leading text run)
+        _run_length_from(tt, 3, value=1, cap=256)  # -> 4  (image run)
+        _run_length_from(tt, 3, value=1, cap=2)    # -> 2  (capped at 2)
+    """
+    n = len(token_types)
+    end = min(start + cap, n)
+    i = start
+    while i < end and token_types[i] == value:
+        i += 1
+    return i - start
+
+
+class RBLNChunkedPrefillPadMixin(_ProcessorBase):
+    """Left-pad ``prompt_token_ids`` so vLLM reserves enough KV-cache blocks.
+
+    Why:
+        vLLM sizes block allocation from the prompt length, but optimum-rbln's
+        chunked prefill touches extra slots beyond the real tokens (trailing
+        chunk write-extent + ``kvcache_partition_len`` alignment). We replay its
+        planner (``_plan_prefill_chunks``) for the highest slot touched
+        (``alloc_len``) and prepend ``alloc_len - query_length`` pad tokens.
+
+    Placement:
+        Pad tokens are masked out and stripped before attention, so only the
+        count matters, not where they go.
+
+    Subclasses override ``_image_buckets`` (gemma3: single bucket; gemma4: many)
+    and, once video is supported, ``_token_types``. Bucket-selection and planning
+    mirror optimum-rbln's ``RBLNDecoderOnly*`` mixins.
+    """
+
+    # MRO note: mix in BEFORE the HF ``*MultiModalProcessor`` so this ``apply``
+    # wraps theirs (``super().apply`` resolves to the HF processor).
     def apply(self, *args, **kwargs):
         output = super().apply(*args, **kwargs)
         output["prompt_token_ids"] = self._pad_image_boundaries(
@@ -44,36 +98,120 @@ class RBLNGemma3MultiModalProcessor(Gemma3MultiModalProcessor):
         )
         return output
 
-    def _pad_image_boundaries(self, prompt_ids: list[int]) -> list[int]:
-        """Left-pad ``prompt_token_ids`` so each image block aligns to a prefill
-        chunk boundary.
+    def _rbln_cfg(self) -> dict:
+        cached = getattr(self, "_rbln_cfg_cache", None)
+        if cached is not None:
+            return cached
 
-        The padding only inflates the prompt length vLLM sees, so vLLM allocates
-        enough KV-cache blocks. The actual chunk-aligned attention is handled
-        inside optimum-rbln, which infers the padding length from these
-        left-padded tokens.
+        model_path = self.info.ctx.model_config.model
+        cfg_path = os.path.join(model_path, "language_model", "rbln_config.json")
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+        self._rbln_cfg_cache = cfg
+        return cfg
+
+    def _image_buckets(self) -> list[int]:
+        """Image-prefill bucket sizes, smallest-first-fit candidates.
+
+        Overridden per model: gemma3 has a single ``image_prefill_chunk_size``,
+        gemma4 has a list ``image_prefill_chunk_sizes``. Empty ⇒ no image prefill.
         """
-        token_type_ids = (
-            torch.tensor(prompt_ids) == self.info.get_hf_processor().image_token_id
-        )
+        raise NotImplementedError
 
-        image_prefill_chunk_size = self.info.get_hf_processor().image_seq_length
-        # Find image start positions
-        image_starts = [
-            s
-            for s in torch.where(token_type_ids)[0]
-            if torch.all(token_type_ids[s : s + image_prefill_chunk_size])
-        ]
-        padded_seq_len = 0
-        for image_start in image_starts:
-            pad_needed = (
-                image_prefill_chunk_size
-                - (image_start + padded_seq_len) % image_prefill_chunk_size
+    def _use_image_prefill(self) -> bool:
+        # Mirrors optimum's `use_tt = use_image_prefill and token_type_ids is not None`.
+        # `use_image_prefill` is usually absent in rbln_config, so the presence of
+        # image buckets is the proxy.
+        cfg = self._rbln_cfg()
+        if "use_image_prefill" in cfg:
+            return bool(cfg["use_image_prefill"])
+        return bool(self._image_buckets())
+
+    def _token_types(self, prompt_ids: list[int]) -> list[int]:
+        # 1 = image soft token, 0 = text. (Video=2 lands here once supported.)
+        image_token_id = self.info.get_hf_processor().image_token_id
+        return [1 if t == image_token_id else 0 for t in prompt_ids]
+
+    def _resolve_image_chunk(
+        self, token_types: list[int], step: int, start_type: int
+    ) -> tuple[int, int]:
+        """Return ``(run_len, chunk_size)`` for the image/video run at ``step``.
+
+        Picks the smallest bucket that fits the run — identical to optimum-rbln's
+        ``_resolve_image_chunk``. Reduces to the single bucket for gemma3.
+        """
+        buckets = self._image_buckets()
+        max_bucket = max(buckets)
+        run_len = _run_length_from(token_types, step, start_type, max_bucket + 1)
+        if run_len > max_bucket:
+            modality = "video" if start_type == 2 else "image"
+            raise ValueError(
+                f"{modality.capitalize()} run (token_type={start_type}) starting at "
+                f"position {step} is longer than the largest image-prefill bucket "
+                f"({max_bucket}); no bucket can hold it."
             )
-            padded_seq_len += pad_needed
-        # Left padding for Gemma3 image boundary alignment
-        prompt_ids = [PAD_TOKEN_ID] * padded_seq_len + prompt_ids
-        return prompt_ids
+        return run_len, min(b for b in buckets if b >= run_len)
+
+    def _required_alloc_len(self, token_types: list[int]) -> int:
+        cfg = self._rbln_cfg()
+        prefill_chunk_size = cfg["prefill_chunk_size"]
+        partition_len = cfg.get("kvcache_partition_len")
+        use_tt = self._use_image_prefill()
+
+        query_length = len(token_types)
+        step = 0
+        padded = 0
+        alloc_len = query_length
+        while step < query_length:
+            start_type = token_types[step] if use_tt else 0
+            is_image_prefill = use_tt and start_type > 0
+            if is_image_prefill:
+                run_len, chunk_size = self._resolve_image_chunk(
+                    token_types, step, start_type
+                )
+            else:
+                chunk_size = prefill_chunk_size
+                run_len = (
+                    _run_length_from(token_types, step, 0, prefill_chunk_size)
+                    if use_tt
+                    else prefill_chunk_size
+                )
+
+            if partition_len is not None:
+                offset_in_partition = (step + padded) % partition_len
+                if offset_in_partition + chunk_size > partition_len:
+                    padded += partition_len - offset_in_partition
+
+            is_last_chunk = step + run_len >= query_length
+            if is_last_chunk:
+                tail = query_length - step
+                num_processed = min(tail, run_len) if run_len > 0 else tail
+            else:
+                num_processed = run_len
+
+            alloc_len = max(alloc_len, step + padded + chunk_size)
+            step += num_processed
+
+        return alloc_len
+
+    def _pad_image_boundaries(self, prompt_ids: list[int]) -> list[int]:
+        prompt_ids = list(prompt_ids)
+        token_types = self._token_types(prompt_ids)
+
+        alloc_len = self._required_alloc_len(token_types)
+        pad_len = alloc_len - len(prompt_ids)
+        if pad_len <= 0:
+            return prompt_ids
+        return [PAD_TOKEN_ID] * pad_len + prompt_ids
+
+
+class RBLNGemma3MultiModalProcessor(
+    RBLNChunkedPrefillPadMixin, Gemma3MultiModalProcessor
+):
+    def _image_buckets(self) -> list[int]:
+        # gemma3: single image bucket.
+        size = self._rbln_cfg().get("image_prefill_chunk_size")
+        return [size] if size is not None else []
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -83,10 +221,17 @@ class RBLNGemma3MultiModalProcessor(Gemma3MultiModalProcessor):
 )
 class RBLNOptimumGemma3ForConditionalGeneration(
     RBLNOptimumModelBase,
+    RBLNOptimumMultimodalMixin,
     RBLNOptimumDecoderMixin,
     VllmModelForTextGeneration,
-    SupportsMultiModal,
 ):
+    @classmethod
+    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
+        if modality.startswith("image"):
+            return "<start_of_image>"
+
+        raise ValueError("Only image modality is supported")
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -148,8 +293,17 @@ class RBLNOptimumGemma3ForConditionalGeneration(
         if is_prompt:
             prefill_batch_idx = sliding_window_table_ids[0]
             local_block_table_id = torch.tensor([prefill_batch_idx], dtype=torch.int16)
-            inputs_embeds, token_type_ids = self._build_prefill_embeds(
-                model_input, input_ids
+            # token_type_ids model_input != token_type_ids of gemma3
+            # https://github.com/huggingface/transformers/blob/d0c9c66d1c09df3cd70bf036e813d88337b20d4c/src/transformers/models/gemma3/processing_gemma3.py#L143
+            token_type_ids = torch.zeros_like(input_ids)
+            token_type_ids[input_ids == self.model.config.image_token_index] = 1
+
+            multimodal_embeddings = self.embed_multimodal(
+                **(model_input.multi_modal_kwargs or {})
+            )
+            inputs_embeds = self.embed_input_ids(
+                input_ids,
+                multimodal_embeddings or None,
             )
             if self.model.language_model.prefill_decoder is None:
                 raise version_error
@@ -165,13 +319,13 @@ class RBLNOptimumGemma3ForConditionalGeneration(
             )
             logits = output.logits
             updated_attention_mask = output.attention_mask
-            updated_padded_cache_length = output.padded_cache_lengths
+            left_pad = int((attention_mask == 0).sum().item())
 
             assert len(running_requests_ids) == 1
             self.attention_manager.add(
                 running_requests_id=running_requests_ids[0],
                 local_table_id=sliding_window_table_ids[0],
-                pad_len=updated_padded_cache_length,
+                pad_len=left_pad,
                 attention_mask=updated_attention_mask,
             )
         else:
@@ -214,35 +368,50 @@ class RBLNOptimumGemma3ForConditionalGeneration(
             logits = logits[:request_nums]
         return logits
 
-    def _build_prefill_embeds(
-        self, model_input: ModelInputForRBLN, input_ids: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build ``inputs_embeds`` and ``mm_token_type_ids`` for the prefill pass.
-        Subclasses override to plug in model-specific multimodal handling."""
-        # FIXME It is disappeared in transformers 5.5.4
-        # token_type_ids model_input != token_type_ids of gemma3
-        # https://github.com/huggingface/transformers/blob/d0c9c66d1c09df3cd70bf036e813d88337b20d4c/src/transformers/models/gemma3/processing_gemma3.py#L143
-        mm_token_type_ids = torch.zeros_like(input_ids)
-        mm_token_type_ids[input_ids == self.model.config.image_token_index] = 1
+    def get_language_model(self):
+        return self.model.language_model
 
-        pixel_values = self.get_pixel_values(model_input)
-        inputs_embeds = self.model._preprocess_prefill(input_ids, None, pixel_values)
-        return inputs_embeds, mm_token_type_ids
+    def build_prefill_inputs(
+        self,
+        input_ids: torch.Tensor,
+        cached_mm_outputs: list,
+        *,
+        cache_position: torch.Tensor | None = None,
+        running_requests_ids: list[str] | None = None,
+    ) -> dict:
+        # NOTE: this guard is currently unreachable — init_model() only enables
+        # the EC path for "RBLNQwen3VLForConditionalGeneration", so Gemma3 never
+        # enters here today. It documents the contract for when EC is extended.
+        raise NotImplementedError(
+            "EC disaggregation is not implemented for Gemma3: its hybrid "
+            "sliding-window attention prefill needs attention_manager state "
+            "that build_prefill_inputs does not yet provide."
+        )
 
-    def get_pixel_values(self, model_input: ModelInputForRBLN):
-        image_input = None
+    def _process_image_input(
+        self, image_input: Gemma3ImageInputs
+    ) -> list[torch.Tensor]:
+        assert image_input["type"] == "pixel_values"
+        pixel_values = image_input["pixel_values"]
+        num_patches = image_input["num_patches"]
 
-        if model_input.multi_modal_kwargs:
-            image_input = self._parse_and_validate_image_input(
-                **model_input.multi_modal_kwargs
-            )
-            if image_input is not None:
-                assert image_input["type"] == "pixel_values"
-                pixel_values = image_input["pixel_values"]
-        else:
-            pixel_values = None
+        # Vision tower + multi-modal projector, compiled by optimum-rbln.
+        # Returns (num_patches_total, mm_tokens_per_image, hidden_size).
+        image_embeds = self.model.get_image_features(pixel_values)
 
-        return pixel_values
+        if num_patches is None:
+            return list(image_embeds)
+        return [e.flatten(0, 1) for e in image_embeds.split(num_patches.tolist())]
+
+    def _embed_text_tokens(
+        self, input_ids: torch.Tensor, is_multimodal: torch.Tensor
+    ) -> torch.Tensor:
+        # Gemma3's image token can be OOV; PAD-mask those positions before the
+        # text embedding lookup (mirrors optimum-rbln's _preprocess_prefill).
+        config = self.model.config
+        if config.image_token_index >= self.model.vocab_size:
+            input_ids = input_ids.masked_fill(is_multimodal, PAD_TOKEN_ID)
+        return self.model.get_input_embeddings()(input_ids)
 
     def _parse_and_validate_image_input(
         self, **kwargs: Any

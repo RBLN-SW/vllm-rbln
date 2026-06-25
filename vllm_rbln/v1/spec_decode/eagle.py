@@ -13,10 +13,12 @@
 # limitations under the License.
 import os
 from copy import copy
+from typing import Any
 
 import numpy as np
 import torch
 import torch.nn as nn
+from rebel import CompileContext
 from vllm.config import VllmConfig
 from vllm.distributed.parallel_state import get_dp_group, get_pp_group, get_tp_group
 from vllm.v1.attention.backend import CommonAttentionMetadata
@@ -28,7 +30,7 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 import vllm_rbln.rbln_envs as envs
 import vllm_rbln.utils as rbln_utils
-from vllm_rbln.forward_context import set_forward_context
+from vllm_rbln.forward_context import RBLNDPMetadata, set_forward_context
 from vllm_rbln.logger import init_logger
 from vllm_rbln.torch_compile_backend import logged_rbln_backend
 from vllm_rbln.v1.attention.kv_cache_bindings import (
@@ -47,12 +49,26 @@ class RBLNEagleProposer(EagleProposer):
     def __init__(self, vllm_config: VllmConfig, device: torch.device, runner=None):
         super().__init__(vllm_config, device, runner)
 
-        from rebel import CompileContext
-
-        self.compile_context = CompileContext(use_weight_sharing=True)
+        self.runner = runner
+        if runner is not None and getattr(runner, "compile_context", None) is not None:
+            self.compile_context = runner.compile_context
+        else:
+            self.compile_context = CompileContext(use_weight_sharing=True)
 
         if self.supports_mm_inputs:
             raise NotImplementedError("Multimodal inputs are not supported yet.")
+
+    def _dp_forward_context_args(
+        self, num_input_tokens: int, num_padded_tokens: int
+    ) -> tuple[torch.Tensor | None, int | None]:
+        dp_size = self.vllm_config.parallel_config.data_parallel_size
+        if dp_size <= 1:
+            return None, None
+        dp_rank = self.vllm_config.parallel_config.data_parallel_rank
+        num_tokens_across_dp = RBLNDPMetadata.num_tokens_across_dp(
+            num_input_tokens, dp_size, dp_rank
+        )
+        return num_tokens_across_dp, num_padded_tokens
 
     def propose(
         self,
@@ -99,8 +115,6 @@ class RBLNEagleProposer(EagleProposer):
         batch_bucket_size = self.runner.bucketing_manager.find_decode_batch_bucket(
             batch_size
         )
-        num_padded_tokens = None
-        num_tokens_across_dp = None
         extra_attn_metadata_args = {}
         extra_attn_metadata_args["positions"] = target_positions.cpu()
         extra_attn_metadata_args["batch_pad"] = batch_bucket_size
@@ -152,11 +166,12 @@ class RBLNEagleProposer(EagleProposer):
             hidden_states = target_hidden_states.view(*input_ids.shape, -1)
             inputs_embeds = None
 
-        if (
-            not self.vllm_config.speculative_config.enforce_eager
-            and envs.VLLM_RBLN_COMPILE_MODEL
-        ):
-            self.compile_context.mark_static_address(self.runner.kv_caches[-1])
+        num_padded_first_pass = (
+            inputs_embeds.shape[0] if input_ids is None else input_ids.numel()
+        )
+        num_tokens_across_dp, num_padded_tokens = self._dp_forward_context_args(
+            num_input_tokens, num_padded_first_pass
+        )
 
         with set_forward_context(
             per_layer_attn_metadata,
@@ -210,19 +225,27 @@ class RBLNEagleProposer(EagleProposer):
             self.token_arange_np[: batch_size + 1]
         ).clone()
 
-        # In padded drafter batch, we need to adjust the sequence lengths
-        # to remove the "padding" (i.e. rejected tokens).
-        # Only apply this adjustment when we have rejected tokens
-        # (i.e., not the first proposal).
-        if self.num_speculative_tokens > 1 and num_rejected_tokens_gpu is not None:
-            common_attn_metadata.seq_lens -= num_rejected_tokens_gpu
-            # Invalidate the CPU-side shadows to avoid H<>D sync.
-            common_attn_metadata._seq_lens_cpu = None
-            common_attn_metadata._num_computed_tokens_cpu = None
+        if self.num_speculative_tokens > 1:
+            common_attn_metadata.seq_lens = common_attn_metadata.seq_lens.clone()
+            if num_rejected_tokens_gpu is not None:
+                common_attn_metadata.seq_lens -= num_rejected_tokens_gpu
+                common_attn_metadata._seq_lens_cpu = None
+                common_attn_metadata._num_computed_tokens_cpu = None
 
         block_size = self.block_size
         assert block_size > 0, "block_size has not been initialized."
-        for token_index in range(self.num_speculative_tokens - 1):
+        # NOTE(RBLN): Only slot 0 of the padded window carries valid data; slots 1..k
+        # are junk and filtered out of KV-cache writes via PADDING_SLOT_ID.
+        padded_q_len = self.num_speculative_tokens + 1
+        sub_num_tokens_across_dp, sub_num_padded_tokens = self._dp_forward_context_args(
+            batch_bucket_size * padded_q_len, batch_bucket_size * padded_q_len
+        )
+
+        if batch_bucket_size > batch_size:
+            self.input_ids[batch_size:batch_bucket_size].fill_(0)
+            self.positions[batch_size:batch_bucket_size].fill_(-1)
+            self.hidden_states[batch_size:batch_bucket_size].fill_(0)
+        for _ in range(self.num_speculative_tokens - 1):
             # Update the inputs
             # cast to int32 is crucial when eagle model is compiled.
             # tensor.argmax returns int64 by default.
@@ -267,6 +290,16 @@ class RBLNEagleProposer(EagleProposer):
             common_attn_metadata.slot_mapping.masked_fill_(
                 exceeds_max_model_len, PADDING_SLOT_ID
             )
+            # Pad slot_mapping to padded_q_len with PADDING_SLOT_ID in
+            # slots 1..k so attention's KV write skips the junk slots.
+            slot_mapping_valid = common_attn_metadata.slot_mapping.view(batch_size, 1)
+            slot_mapping_q_padded = rbln_utils.pad(
+                slot_mapping_valid, 1, padded_q_len, PADDING_SLOT_ID
+            )
+            slot_mapping_full = rbln_utils.pad(
+                slot_mapping_q_padded, 0, batch_bucket_size, PADDING_SLOT_ID
+            )
+            common_attn_metadata.slot_mapping = slot_mapping_full.view(-1)
 
             # Rebuild attention metadata
             extra_attn_metadata_args = {}
@@ -289,10 +322,9 @@ class RBLNEagleProposer(EagleProposer):
                 for layer_name in attn_group.layer_names:
                     per_layer_attn_metadata[layer_name] = attn_metadata
 
-            # copy inputs to buffer
             self.input_ids[:batch_size] = input_ids
             self._set_positions(batch_size, clamped_positions)
-            self.hidden_states[: hidden_states.shape[0]] = hidden_states
+            self.hidden_states[:batch_size] = hidden_states[:batch_size]
             if self.supports_mm_inputs:
                 self.inputs_embeds[:batch_size] = self.model.embed_input_ids(input_ids)
 
@@ -300,41 +332,155 @@ class RBLNEagleProposer(EagleProposer):
                 inputs_embeds = self.inputs_embeds[:batch_size]
             else:
                 # NOTE(RBLN): reshape tensors in the same way as the RBLN model runner.
-                input_ids = self.input_ids[:batch_bucket_size].view(
+                input_ids_view = self.input_ids[:batch_bucket_size].view(
                     batch_bucket_size, 1
                 )
-                positions = self.positions[:batch_bucket_size].view(
+                input_ids_padded = rbln_utils.pad(input_ids_view, 1, padded_q_len, 0)
+                positions_view = self.positions[:batch_bucket_size].view(
                     batch_bucket_size, 1
                 )
-                hidden_states = self.hidden_states[:batch_bucket_size].view(
+                positions_padded = rbln_utils.pad(positions_view, 1, padded_q_len, -1)
+                hidden_states_view = self.hidden_states[:batch_bucket_size].view(
                     batch_bucket_size, 1, -1
+                )
+                hidden_states_padded = rbln_utils.pad(
+                    hidden_states_view, 1, padded_q_len, 0
                 )
                 inputs_embeds = None
 
+            # last_token_indices points at slot 0 of each batch (the only
+            # valid slot in the padded q=k+1 window).
+            last_token_indices = self.arange[:batch_bucket_size] * padded_q_len
             # Run the model.
             with set_forward_context(
                 per_layer_attn_metadata,
                 self.vllm_config,
-                num_tokens=batch_size,
-                num_tokens_across_dp=None,
-                num_padded_tokens=None,
+                num_tokens=batch_bucket_size * padded_q_len,
+                num_tokens_across_dp=sub_num_tokens_across_dp,
+                num_padded_tokens=sub_num_padded_tokens,
                 additional_kwargs=build_kv_cache_forward_context_kwargs(
                     getattr(self.runner, "kv_cache_bases", None)
                 ),
             ):
                 hidden_states, logits = self.model_executable(
-                    input_ids=input_ids,
-                    positions=positions,
-                    hidden_states=hidden_states,
+                    input_ids=input_ids_padded,
+                    positions=positions_padded,
+                    hidden_states=hidden_states_padded,
                     inputs_embeds=inputs_embeds,
-                    last_token_indices=None,
+                    last_token_indices=last_token_indices,
                 )
+
+            hidden_states = hidden_states[
+                self.arange[:batch_bucket_size] * padded_q_len
+            ]
             draft_token_ids = logits[:batch_size].argmax(dim=-1)
             draft_token_ids_list.append(draft_token_ids)
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
         return draft_token_ids
+
+    def prepare_dummy_attn_metadata(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        batch_bucket_size: int,
+        positions: torch.Tensor,
+    ) -> dict[str, Any]:
+        # NOTE(RBLN): Draft attention metadata for the DP dummy run.
+
+        per_layer_attn_metadata: dict[str, Any] = {}
+        extra_attn_metadata_args = {
+            "positions": positions,
+            "batch_pad": batch_bucket_size,
+            "is_prefill": False,
+        }
+        for attn_group in self.draft_attn_groups:
+            attn_metadata = attn_group.get_metadata_builder().build(
+                common_prefix_len=0,
+                common_attn_metadata=common_attn_metadata,
+                fast_build=True,
+                **extra_attn_metadata_args,
+            )
+            attach_kv_cache_bindings(
+                attn_metadata,
+                self.runner.kv_caches,
+                getattr(self.runner, "kv_cache_bases", None),
+                getattr(self.runner, "kv_cache_view_infos", None),
+            )
+            for layer_name in attn_group.layer_names:
+                per_layer_attn_metadata[layer_name] = attn_metadata
+        return per_layer_attn_metadata
+
+    def dummy_propose(
+        self,
+        per_layer_attn_metadata: dict[str, Any],
+        batch_bucket_size: int,
+    ) -> None:
+        if self.num_speculative_tokens <= 0:
+            return
+
+        padded_q_len = self.num_speculative_tokens + 1
+        flat_tokens = batch_bucket_size * padded_q_len
+        device = self.input_ids.device
+
+        input_ids = torch.zeros(
+            (batch_bucket_size, padded_q_len),
+            device=device,
+            dtype=self.input_ids.dtype,
+        )
+        positions = torch.zeros(
+            (batch_bucket_size, padded_q_len),
+            device=device,
+            dtype=self.positions.dtype,
+        )
+        hidden_states = torch.zeros(
+            (batch_bucket_size, padded_q_len, self.hidden_size),
+            device=device,
+            dtype=self.hidden_states.dtype,
+        )
+        last_token_indices = self.arange[:batch_bucket_size] * padded_q_len
+        fwd_ctx_kwargs = build_kv_cache_forward_context_kwargs(
+            getattr(self.runner, "kv_cache_bases", None)
+        )
+
+        # First-pass matches the busy peer's pre-loop `set_forward_context`.
+        nta_dp, npt = self._dp_forward_context_args(flat_tokens, flat_tokens)
+        with set_forward_context(
+            per_layer_attn_metadata,
+            self.vllm_config,
+            num_tokens=flat_tokens,
+            num_tokens_across_dp=nta_dp,
+            num_padded_tokens=npt,
+            additional_kwargs=fwd_ctx_kwargs,
+        ):
+            _ = self.model_executable(
+                input_ids=input_ids,
+                positions=positions,
+                hidden_states=hidden_states,
+                inputs_embeds=None,
+                last_token_indices=last_token_indices,
+            )
+
+        # Subsequent loop matches the busy peer's k-1 iterations.
+        if self.num_speculative_tokens == 1:
+            return
+
+        for _ in range(self.num_speculative_tokens - 1):
+            with set_forward_context(
+                per_layer_attn_metadata,
+                self.vllm_config,
+                num_tokens=flat_tokens,
+                num_tokens_across_dp=nta_dp,
+                num_padded_tokens=npt,
+                additional_kwargs=fwd_ctx_kwargs,
+            ):
+                _ = self.model_executable(
+                    input_ids=input_ids,
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    inputs_embeds=None,
+                    last_token_indices=last_token_indices,
+                )
 
     def prefill_only(
         self,
@@ -375,8 +521,6 @@ class RBLNEagleProposer(EagleProposer):
         batch_bucket_size = self.runner.bucketing_manager.find_decode_batch_bucket(
             batch_size
         )
-        num_padded_tokens = None
-        num_tokens_across_dp = None
         extra_attn_metadata_args = {}
         extra_attn_metadata_args["positions"] = target_positions.cpu()
         extra_attn_metadata_args["batch_pad"] = batch_bucket_size
@@ -428,11 +572,12 @@ class RBLNEagleProposer(EagleProposer):
             hidden_states = target_hidden_states.view(*input_ids.shape, -1)
             inputs_embeds = None
 
-        if (
-            not self.vllm_config.speculative_config.enforce_eager
-            and envs.VLLM_RBLN_COMPILE_MODEL
-        ):
-            self.compile_context.mark_static_address(self.runner.kv_caches[-1])
+        num_padded_first_pass = (
+            inputs_embeds.shape[0] if input_ids is None else input_ids.numel()
+        )
+        num_tokens_across_dp, num_padded_tokens = self._dp_forward_context_args(
+            num_input_tokens, num_padded_first_pass
+        )
 
         with set_forward_context(
             per_layer_attn_metadata,
@@ -568,7 +713,7 @@ class RBLNEagleProposer(EagleProposer):
             input_ids: torch.Tensor,
             positions: torch.Tensor,
             hidden_states: torch.Tensor,
-            last_token_indices: torch.Tensor | None = None,
+            last_token_indices: torch.Tensor,
             inputs_embeds: torch.Tensor | None = None,
         ):
             ret_hidden_states = self.model(
@@ -585,11 +730,7 @@ class RBLNEagleProposer(EagleProposer):
 
             hidden_states = hidden_states.view(-1, self.hidden_size)
             last_hidden_states = last_hidden_states.view(-1, self.hidden_size)
-            sample_hidden_states = (
-                last_hidden_states[last_token_indices]
-                if last_token_indices is not None
-                else last_hidden_states
-            )
+            sample_hidden_states = last_hidden_states[last_token_indices]
             logits = self.model.compute_logits(sample_hidden_states)
 
             return hidden_states, logits
@@ -617,7 +758,7 @@ class RBLNEagleProposer(EagleProposer):
 
         options = {
             "compile_context": self.compile_context,
-            "tensor_parallel_size": envs.VLLM_RBLN_TP_SIZE,
+            "tensor_parallel_size": envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
             "process_group_dict": process_group_dict,
             "guard_filter_fn": torch.compiler.keep_tensor_guards_unsafe,
             "mode": "strict",

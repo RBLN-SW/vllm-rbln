@@ -26,11 +26,19 @@ are tested against the class directly (no compiled model / NPU needed) using a
 real Whisper tokenizer, which is what the detection path consumes in serving.
 """
 
+import inspect
+import textwrap
+
 import numpy as np
 import pytest
 from vllm.config import SpeechToTextConfig
 from vllm.config.speech_to_text import SpeechToTextParams
-from vllm.model_executor.models.whisper import ISO639_1_SUPPORTED_LANGS
+from vllm.model_executor.models.whisper import (
+    ISO639_1_SUPPORTED_LANGS,
+)
+from vllm.model_executor.models.whisper import (
+    WhisperForConditionalGeneration as UpstreamWhisper,
+)
 
 from vllm_rbln.model_executor.models.optimum.whisper import (
     RBLNOptimumWhisperForConditionalGeneration as Whisper,
@@ -186,3 +194,71 @@ class TestGenerationPromptUsesGivenLanguage:
         # filled it in (explicitly or via detection) before this is called.
         with pytest.raises(ValueError):
             Whisper.get_generation_prompt(_stt_params(None))
+
+
+# classmethods copied verbatim from upstream WhisperForConditionalGeneration.
+_COPIED_CLASSMETHODS = [
+    "validate_language",
+    "get_generation_prompt",
+    "get_language_token_ids",
+    "get_language_detection_prompt",
+    "parse_language_detection_output",
+    "get_placeholder_str",
+    "get_speech_to_text_config",
+    "get_num_audio_tokens",
+]
+
+# class-level flags/attributes copied verbatim from upstream.
+_COPIED_ATTRS = [
+    "supports_transcription_only",
+    "supports_segment_timestamp",
+    "supports_explicit_language_detection",
+    "supported_languages",
+]
+
+
+def _normalized_source(func) -> str:
+    """Source of ``func`` with comments and blank/whitespace-only lines removed.
+
+    Intended differences from upstream (e.g. ``# type: ignore[...]`` markers)
+    live in comments, so stripping them lets the comparison focus on behavior.
+    """
+    src = textwrap.dedent(inspect.getsource(func))
+    lines = []
+    for line in src.splitlines():
+        code = line.split("#", 1)[0].rstrip()
+        if code.strip():
+            lines.append(code)
+    return "\n".join(lines)
+
+
+class TestUpstreamSync:
+    """Drift guard for the helper classmethods copied from vLLM.
+
+    The RBLN model reimplements ``forward``/``__init__`` for the backend, but
+    the speech-to-text helper classmethods carry no device/runtime logic and
+    were copied verbatim from vLLM's ``WhisperForConditionalGeneration``. These
+    compare against the installed vLLM and fail when upstream changes them, so a
+    vLLM bump surfaces the drift in CI. On failure, re-sync the copy in
+    ``optimum/whisper.py`` (or update the lists above if a member was
+    intentionally specialized).
+    """
+
+    @pytest.mark.parametrize("name", _COPIED_CLASSMETHODS)
+    def test_classmethod_matches_upstream(self, name):
+        rbln = getattr(Whisper, name).__func__
+        upstream = getattr(UpstreamWhisper, name).__func__
+        assert _normalized_source(rbln) == _normalized_source(upstream), (
+            f"{name} has drifted from vLLM's WhisperForConditionalGeneration. "
+            f"Re-sync the copy in "
+            f"vllm_rbln/model_executor/models/optimum/whisper.py with upstream, "
+            f"or update _COPIED_CLASSMETHODS if it was intentionally specialized."
+        )
+
+    @pytest.mark.parametrize("name", _COPIED_ATTRS)
+    def test_class_attr_matches_upstream(self, name):
+        assert getattr(Whisper, name) == getattr(UpstreamWhisper, name), (
+            f"{name} has drifted from vLLM's WhisperForConditionalGeneration "
+            f"(rbln={getattr(Whisper, name)!r}, "
+            f"upstream={getattr(UpstreamWhisper, name)!r})."
+        )

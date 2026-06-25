@@ -229,6 +229,47 @@ def test_stranded_blocks_cleaned_up_on_finish():
     assert req_a.request_id not in scheduler._stranded_new_blocks
 
 
+def test_stranded_blocks_cleaned_up_on_preempt():
+    """A stashed block delta must be dropped when the request is preempted.
+
+    Preemption frees ALL of the request's blocks (including the stashed one)
+    and returns the request to the waiting queue. If the stash survived, the
+    request could resume, re-enter the decode batch, and have a now-freed
+    (possibly reused) block id re-emitted into its block table.
+    """
+    block_size = 16
+    scheduler = create_scheduler(
+        max_num_batched_tokens=128,
+        max_num_seqs=4,
+        block_size=block_size,
+        num_blocks=10000,
+    )
+
+    req_a = create_requests(
+        num_requests=1, num_tokens=block_size, block_size=block_size, req_ids=["A"]
+    )[0]
+    scheduler.add_request(req_a)
+    out1 = scheduler.schedule()
+    scheduler.update_from_output(out1, create_runner_output(out1, 1))
+
+    req_b = create_requests(
+        num_requests=1, num_tokens=block_size, block_size=block_size, req_ids=["B"]
+    )[0]
+    scheduler.add_request(req_b)
+    scheduler.schedule()
+    # req_a evicted at the boundary -> its block delta is stashed. It stays in
+    # the running queue (eviction only drops it from this step's output).
+    assert req_a.request_id in scheduler._stranded_new_blocks
+    assert req_a in scheduler.running
+
+    # Preempt req_a (frees its blocks). The override must drop the stash so the
+    # freed block id cannot be re-emitted after the request resumes.
+    scheduler.running.remove(req_a)
+    scheduler._preempt_request(req_a, 0.0)
+    assert req_a.status == RequestStatus.PREEMPTED
+    assert req_a.request_id not in scheduler._stranded_new_blocks
+
+
 def test_preempt_during_execution():
     # Test copied from https://github.com/vllm-project/vllm/blob/4fd9d6a85c00ac0186aa9abbeff73fc2ac6c721e/tests/v1/core/test_scheduler.py#L672-L728
 
