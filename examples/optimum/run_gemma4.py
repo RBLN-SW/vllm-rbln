@@ -47,7 +47,7 @@ def generate_prompts(batch_size: int, model_id: str):
         ]
         for i in range(batch_size)
     ]
-    images = [[dataset[i]["image"]] for i in range(batch_size)]
+    images = [[dataset[i]["image"], dataset[i + 1]["image"]] for i in range(batch_size)]
 
     texts = processor.apply_chat_template(
         messages,
@@ -86,6 +86,7 @@ async def main(
 ):
     engine_args = AsyncEngineArgs(
         model=model_id,
+        block_size=4096,
     )
 
     engine = AsyncLLMEngine.from_engine_args(engine_args)
@@ -109,7 +110,7 @@ async def main(
 
 def entry_point(
     num_input_prompt: int = 1,
-    model_id: str = "./gemma4-31b-b4",
+    model_id: str = "google/gemma-4-31B",
 ):
     asyncio.run(
         main(

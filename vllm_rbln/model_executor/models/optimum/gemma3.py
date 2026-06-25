@@ -98,15 +98,28 @@ class RBLNChunkedPrefillPadMixin(_ProcessorBase):
         )
         return output
 
+    def _rbln_cfg_path(self) -> str:
+        model_config = self.info.ctx.model_config
+        model_path = model_config.model
+        print("@@@ model_path", model_path)
+        if not os.path.exists(model_path):
+            model_path = getattr(model_config, "rbln_cached_model_path", None)
+            print("@@@ model_path cached", model_path)
+            if model_path is None:
+                raise RuntimeError(
+                    "cached_model_path must be set when vLLM is initialized."
+                )
+        return os.path.join(model_path, "language_model", "rbln_config.json")
+
     def _rbln_cfg(self) -> dict:
         cached = getattr(self, "_rbln_cfg_cache", None)
+        print("@@@ cached", cached)
         if cached is not None:
             return cached
 
-        model_path = self.info.ctx.model_config.model
-        cfg_path = os.path.join(model_path, "language_model", "rbln_config.json")
-        with open(cfg_path) as f:
+        with open(self._rbln_cfg_path()) as f:
             cfg = json.load(f)
+        print("@@@ cfg", cfg)
         self._rbln_cfg_cache = cfg
         return cfg
 
@@ -197,7 +210,9 @@ class RBLNChunkedPrefillPadMixin(_ProcessorBase):
     def _pad_image_boundaries(self, prompt_ids: list[int]) -> list[int]:
         prompt_ids = list(prompt_ids)
         token_types = self._token_types(prompt_ids)
-
+        # before compilation, just pass getting rbln config (dummy execution)
+        if not os.path.exists(self._rbln_cfg_path()):
+            return prompt_ids
         alloc_len = self._required_alloc_len(token_types)
         pad_len = alloc_len - len(prompt_ids)
         if pad_len <= 0:

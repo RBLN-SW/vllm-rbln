@@ -103,6 +103,14 @@ def _resolve_rbln_config(vllm_config: VllmConfig) -> dict | None:
         _generate_model_path_name(vllm_config=vllm_config),
     )
     vllm_config.additional_config["cached_model_path"] = cached_model_path
+    # The multimodal processor runs in the frontend process and only sees
+    # `model_config` (not `additional_config`). The worker compiles into
+    # `cached_model_path` and rebinds `model_config.model` there, but that
+    # mutation never propagates back to the frontend. Stash the compiled path
+    # on `model_config` so the frontend processor can locate rbln_config.json
+    # after compilation. We avoid touching `model_config.model` itself because
+    # it is still needed as the compile source and the cache-hash key.
+    vllm_config.model_config.rbln_cached_model_path = cached_model_path
     if os.path.exists(os.path.join(cached_model_path, "rbln_config.json")):
         logger.info("Found cached compiled model at %s", cached_model_path)
         vllm_config.model_config.model = cached_model_path
