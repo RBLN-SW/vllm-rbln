@@ -71,13 +71,11 @@ class TestImageChunkSize:
         assert mgr._image_chunk_size(640) == 640
         assert mgr._image_chunk_size(1000) == 1152
 
-    def test_run_exceeds_all_buckets_uses_largest(self):
-        mgr = _make_manager(128, 4096, image_prefill_chunk_sizes=[384, 640, 1152])
-        assert mgr._image_chunk_size(2000) == 1152
-
-    def test_bucket_order_does_not_matter(self):
-        mgr = _make_manager(128, 4096, image_prefill_chunk_sizes=[640, 1152, 384])
-        assert mgr._image_chunk_size(500) == 640
+    def test_run_exceeds_all_buckets_raises(self):
+        # buckets are descending; a run larger than the largest bucket is invalid.
+        mgr = _make_manager(128, 4096, image_prefill_chunk_sizes=[1152, 640, 384])
+        with pytest.raises(ValueError):
+            mgr._image_chunk_size(2000)
 
     def test_no_buckets_falls_back_to_text_chunk(self):
         mgr = _make_manager(256, 4096, image_prefill_chunk_sizes=None)
@@ -209,7 +207,7 @@ class TestChunkedPrefillPadWithImages:
         mgr = _make_manager(
             prefill_chunk_size=4,
             attn_block_size=12,
-            image_prefill_chunk_sizes=[4, 8],
+            image_prefill_chunk_sizes=[8, 4],  # descending, as optimum stores it
         )
         req = _request(_image(2, 3), _image(7, 6))
         assert mgr._chunked_prefill_pad(req, query_len=13) == 5

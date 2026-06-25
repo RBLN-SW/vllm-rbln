@@ -157,24 +157,27 @@ class RBLNKVCacheManager(KVCacheManager):
                     i = j  # jump past this run
                 else:
                     i += 1  # text token, skip
+        # Sort by start position (tuple order: by `start`, then `end`) so the
+        # runs are returned in prompt order; features may arrive out of order.
         segments.sort()
         return segments
 
     def _image_chunk_size(self, run_len: int) -> int:
-        """Image-prefill bucket for a run of `run_len` image tokens.
-
-        Mirrors optimum-rbln `_resolve_image_chunk`: the smallest bucket that
-        fits the run. Falls back to the text chunk when no buckets are configured
-        (e.g. text-only), or the largest bucket when the run exceeds all of them.
-        """
         buckets = self.image_prefill_chunk_sizes
         if not buckets:
             assert self.prefill_chunk_size is not None, (
                 "prefill_chunk_size must be set when image_prefill_chunk_sizes is empty"
             )
             return self.prefill_chunk_size
-        fits = [b for b in buckets if b >= run_len]
-        return min(fits) if fits else max(buckets)
+        # buckets is descending, so `reversed` is ascending: the first bucket
+        # that is >= run_len is the smallest one that fits.
+        chunk = next((b for b in reversed(buckets) if b >= run_len), None)
+        if chunk is None:
+            raise ValueError(
+                f"image run of {run_len} tokens exceeds the largest "
+                f"image-prefill bucket ({buckets[0]})"
+            )
+        return chunk
 
     def _chunked_prefill_pad(self, request: Request, query_len: int) -> int:
         # FIXME chunk size?????
