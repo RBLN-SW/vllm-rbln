@@ -12,17 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
+from functools import wraps
+
 import torch
 import vllm.model_executor.layers.attention.attention as vllm_attn
 from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.distributed.kv_transfer import (
+    get_kv_transfer_group,
+    has_kv_transfer_group,
+    is_v1_kv_transfer_group,
+)
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.model_executor.layers.attention import mla_attention as _mla_attention_mod
 from vllm.model_executor.layers.attention.attention import Attention
-from vllm.model_executor.layers.attention.kv_transfer_utils import (
-    maybe_transfer_kv_layer,
-)
 from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 from vllm.model_executor.models.utils import extract_layer_index
+from vllm.utils.torch_utils import _resolve_layer_name
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 
@@ -186,7 +192,54 @@ def _rbln_get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         )
 
 
-vllm_attn.unified_attention_with_output = maybe_transfer_kv_layer(
+def _rbln_maybe_transfer_kv_layer(func):
+    """RBLN variant of vLLM's ``maybe_transfer_kv_layer`` decorator.
+
+    Upstream reads the attention context (``get_attention_context``, which
+    touches ``forward_context.no_compile_layers[layer_name]`` and the layer's
+    embedded KV cache) BEFORE checking whether the connector actually has
+    metadata. During the RBLN warm-up export compile there is no connector
+    metadata yet, but that read still happens while tracing and freezes the
+    embedded KV cache into the graph as a *constant* instead of letting the
+    attention op resolve it as a graph input. The rebel compiler then shards
+    that baked KV constant with an RSD/EP ``rtosa.strided_slice`` and aborts in
+    the RTOSA constant-fold pass (``dyn_cast<rtosa::ConstantOp>`` on a null
+    op). Compilation only succeeds when the KV cache stays a graph input.
+
+    Fix: short-circuit on ``has_connector_metadata()`` BEFORE touching the
+    attention context, so compile-time traces (no metadata) never embed the KV
+    cache. The hot path additionally uses ``_rbln_get_attention_context``,
+    which leaves ``kv_cache`` as ``None`` (the op resolves KV itself).
+    """
+    sig = inspect.signature(func)
+    param_names = list(sig.parameters.keys())
+    layer_name_index = param_names.index("layer_name")
+
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+            return func(*args, **kwargs)
+
+        # Check connector metadata FIRST, before reading the attention context
+        # (warm-up / compile has no metadata -> never touch the KV cache).
+        connector = get_kv_transfer_group()
+        if not connector.has_connector_metadata():
+            return func(*args, **kwargs)
+
+        layer_name = _resolve_layer_name(args[layer_name_index])
+        attn_metadata, _, kv_cache, _ = _rbln_get_attention_context(layer_name)
+        if attn_metadata is None:
+            return func(*args, **kwargs)
+
+        connector.wait_for_layer_load(layer_name)
+        result = func(*args, **kwargs)
+        connector.save_kv_layer(layer_name, kv_cache, attn_metadata)
+        return result
+
+    return wrapper
+
+
+vllm_attn.unified_attention_with_output = _rbln_maybe_transfer_kv_layer(
     _rbln_unified_attention_with_output
 )
 
