@@ -229,10 +229,6 @@ class RblnPlatform(Platform):
         parallel_config = vllm_config.parallel_config
         scheduler_config = vllm_config.scheduler_config
 
-        if scheduler_config.async_scheduling:
-            scheduler_config.async_scheduling = False
-            logger.warning("Async scheduler not supported on RBLN.")
-
         if envs.VLLM_RBLN_USE_VLLM_MODEL:
             cls.validate_and_setup_prerequisite(vllm_config)
 
@@ -309,6 +305,8 @@ class RblnPlatform(Platform):
             scheduler_config.scheduler_cls = (
                 "vllm_rbln.v1.core.optimum_scheduler.RBLNOptimumScheduler"
             )
+            # Optimum model runner doesn't support async scheduling
+            scheduler_config.async_scheduling = False
 
             assert vllm_config.parallel_config.tensor_parallel_size == 1, (
                 "Cannot set tensor_parallel_size for pre-compiled optimum-rbln models. "

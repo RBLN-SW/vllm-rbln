@@ -173,16 +173,15 @@ class TestMixinInterfaceCompliance:
 
 
 class TestAsyncRBLNModelRunnerOutputFeature:
-    def _make_output(self, num_reqs=3, invalid_indices=None):
+    def _make_output(self, num_reqs=3, invalid_indices=None, device_index=0):
         """Helper to create an AsyncRBLNModelRunnerOutput with controllable state."""
         mro = MagicMock(spec=ModelRunnerOutput)
         sampled = torch.tensor([[10], [20], [30]][:num_reqs])
-        stream = MagicMock()
         output = AsyncRBLNModelRunnerOutput(
             model_runner_output=mro,
             sampled_token_ids=sampled,
             invalid_req_indices=invalid_indices or [],
-            async_output_copy_stream=stream,
+            device_index=device_index,
         )
         return output, mro
 
@@ -194,9 +193,9 @@ class TestAsyncRBLNModelRunnerOutputFeature:
         # Simulate what would happen after the async copy completes:
         # Manually set the internal state that get_output() reads.
         output._sampled_token_ids_cpu = torch.tensor([[10], [20], [30]])
-        output._async_copy_ready_event = MagicMock()
 
-        result = output.get_output()
+        with patch("torch.rbln.synchronize"):
+            result = output.get_output()
 
         # Index 0 and 2 should be cleared (empty lists)
         assert result.sampled_token_ids[0] == []
@@ -208,47 +207,46 @@ class TestAsyncRBLNModelRunnerOutputFeature:
         output, mro = self._make_output(num_reqs=2, invalid_indices=[])
 
         output._sampled_token_ids_cpu = torch.tensor([[10], [20]])
-        output._async_copy_ready_event = MagicMock()
 
-        result = output.get_output()
+        with patch("torch.rbln.synchronize"):
+            result = output.get_output()
         assert result is mro
         assert result.sampled_token_ids == [[10], [20]]
 
-    def test_get_output_synchronizes_event(self):
-        """Verify get_output() calls synchronize on the copy event."""
-        output, mro = self._make_output(num_reqs=1, invalid_indices=[])
-        mock_event = MagicMock()
-        output._async_copy_ready_event = mock_event
+    def test_get_output_synchronizes_device(self):
+        """Verify get_output() synchronizes the rbln device the tensor lives on."""
+        output, _ = self._make_output(num_reqs=1, invalid_indices=[], device_index=7)
         output._sampled_token_ids_cpu = torch.tensor([[42]])
 
-        output.get_output()
-        mock_event.synchronize.assert_called_once()
+        with patch("torch.rbln.synchronize") as mock_sync:
+            output.get_output()
+        mock_sync.assert_called_once_with(7)
 
     def test_get_output_deletes_device_tensor(self):
         """After get_output(), the device tensor reference should be released."""
         output, _ = self._make_output(num_reqs=1, invalid_indices=[])
-        output._async_copy_ready_event = MagicMock()
         output._sampled_token_ids_cpu = torch.tensor([[1]])
 
-        output.get_output()
+        with patch("torch.rbln.synchronize"):
+            output.get_output()
         assert not hasattr(output, "_sampled_token_ids")
 
     def test_all_invalid_indices(self):
         """When all indices are invalid, all sampled tokens should be cleared."""
         output, mro = self._make_output(num_reqs=3, invalid_indices=[0, 1, 2])
         output._sampled_token_ids_cpu = torch.tensor([[1], [2], [3]])
-        output._async_copy_ready_event = MagicMock()
 
-        result = output.get_output()
+        with patch("torch.rbln.synchronize"):
+            result = output.get_output()
         assert result.sampled_token_ids == [[], [], []]
 
     def test_no_invalid_indices(self):
         """When no indices are invalid, all tokens should be preserved."""
         output, mro = self._make_output(num_reqs=2, invalid_indices=[])
         output._sampled_token_ids_cpu = torch.tensor([[5], [6]])
-        output._async_copy_ready_event = MagicMock()
 
-        result = output.get_output()
+        with patch("torch.rbln.synchronize"):
+            result = output.get_output()
         assert result.sampled_token_ids == [[5], [6]]
 
 
@@ -478,12 +476,12 @@ class TestEdgeCases:
             model_runner_output=mro,
             sampled_token_ids=sampled,
             invalid_req_indices=[],
-            async_output_copy_stream=MagicMock(),
+            device_index=0,
         )
         output._sampled_token_ids_cpu = sampled
-        output._async_copy_ready_event = MagicMock()
 
-        result = output.get_output()
+        with patch("torch.rbln.synchronize"):
+            result = output.get_output()
         assert result.sampled_token_ids == []
 
     def test_get_model_returns_model_attribute(self):
