@@ -11,20 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import torch
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.gemma3_mm import (
-    Gemma3DummyInputsBuilder,
     Gemma3ImageInputs,
     Gemma3ImagePixelInputs,
-    Gemma3MultiModalProcessor,
-    Gemma3ProcessingInfo,
 )
 from vllm.model_executor.models.interfaces_base import VllmModelForTextGeneration
-from vllm.multimodal import MULTIMODAL_REGISTRY
 
 from .base import ModelInputForRBLN, version_error
 from .model_base import (
@@ -36,57 +32,9 @@ from .optimum_attention import HybridAttentionImageManager, HybridAttentionImage
 
 logger = init_logger(__name__)
 
-if TYPE_CHECKING:
-    from vllm.multimodal.processing.processor import (
-        BaseMultiModalProcessor as _ProcessorBase,
-    )
-else:
-    _ProcessorBase = object
-
 PAD_TOKEN_ID = 0
 
 
-class RBLNChunkedPrefillPadMixin(_ProcessorBase):
-    """Left-pad ``prompt_token_ids`` so vLLM reserves enough KV-cache blocks.
-
-    Why:
-        vLLM sizes block allocation from the prompt length, but optimum-rbln's
-        chunked prefill touches extra slots beyond the real tokens (trailing
-        chunk write-extent + ``kvcache_partition_len`` alignment). We replay its
-        planner (``_plan_prefill_chunks``) for the highest slot touched
-        (``alloc_len``) and prepend ``alloc_len - query_length`` pad tokens.
-
-    Placement:
-        Pad tokens are masked out and stripped before attention, so only the
-        count matters, not where they go.
-
-    Subclasses override ``_image_buckets`` (gemma3: single bucket; gemma4: many)
-    and, once video is supported, ``_token_types``. Bucket-selection and planning
-    mirror optimum-rbln's ``RBLNDecoderOnly*`` mixins.
-    """
-
-    # MRO note: mix in BEFORE the HF ``*MultiModalProcessor`` so this ``apply``
-    # wraps theirs (``super().apply`` resolves to the HF processor).
-    #
-    def apply(self, *args, **kwargs):
-        output = super().apply(*args, **kwargs)
-        return output
-
-
-class RBLNGemma3MultiModalProcessor(
-    RBLNChunkedPrefillPadMixin, Gemma3MultiModalProcessor
-):
-    def _image_buckets(self) -> list[int]:
-        # gemma3: single image bucket.
-        size = self._rbln_cfg().get("image_prefill_chunk_size")
-        return [size] if size is not None else []
-
-
-@MULTIMODAL_REGISTRY.register_processor(
-    RBLNGemma3MultiModalProcessor,
-    info=Gemma3ProcessingInfo,
-    dummy_inputs=Gemma3DummyInputsBuilder,
-)
 class RBLNOptimumGemma3ForConditionalGeneration(
     RBLNOptimumModelBase,
     RBLNOptimumMultimodalMixin,
