@@ -44,6 +44,8 @@ class RBLNKVCacheManager(KVCacheManager):
         attn_block_size: int | None = None,
         max_num_seqs: int = 1,
         is_encoder_decoder: bool = False,
+        prefill_chunk_size: int | None = None,
+        needs_chunked_prefill_pad: bool = False,
     ) -> None:
         """
         RBLNKVCacheManager = KVCacheManager + PrefixKVCacheManager.
@@ -84,6 +86,19 @@ class RBLNKVCacheManager(KVCacheManager):
         self.block_pool = self.coordinator.block_pool
         self.kv_cache_config = kv_cache_config
         block_size = kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size
+        # gemma3/gemma4: optimum-rbln's chunked prefill touches extra KV-cache
+        # slots beyond the prompt length (partition-alignment + trailing chunk
+        # write-extent). `block_size` here equals `kvcache_partition_len`
+        # (compilation sets `kvcache_partition_len = block_size`), so the same
+        # value drives the boundary check in `allocate_slots`.
+        self.block_size = block_size
+        self.needs_chunked_prefill_pad = needs_chunked_prefill_pad
+        self.prefill_chunk_size = prefill_chunk_size
+        if needs_chunked_prefill_pad:
+            assert prefill_chunk_size is not None, (
+                "prefill_chunk_size is required when needs_chunked_prefill_pad "
+                "is set (gemma3/gemma4)."
+            )
         if enable_caching:
             assert attn_block_size is not None, (
                 "attn_block_size must be specified for prefix caching"
@@ -103,6 +118,46 @@ class RBLNKVCacheManager(KVCacheManager):
         self.empty_kv_cache_blocks = KVCacheBlocks(
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
+
+    def _chunked_prefill_pad(self, request: Request, query_len: int) -> int:
+        chunk_size = self.prefill_chunk_size
+        block_size = self.block_size
+        # Image placeholder ranges within the prompt, sorted by start offset.
+        # NOTE: a range covers the whole image block incl. special tokens (gemma3:
+        # \n\n+boi+256+eoi+\n\n = 260), not just the 256 image soft tokens.
+        image_ranges = sorted(
+            (f.mm_position.offset, f.mm_position.offset + f.mm_position.length)
+            for f in request.mm_features
+        )
+        # `step`: next prompt token to process (excludes alignment padding).
+        # `align_pad`: alignment padding so far; the token sits at cache slot
+        #   `step + align_pad`.
+        #
+        # Example: [text 0..99][image 100..359], chunk_size=256
+        #   step=0   text  -> run_end=100 -> run_len=min(100, 256)=100
+        #   step=100 image -> run_end=360 -> run_len=min(260, 256)=256
+        #   step=356 image -> run_end=360 -> run_len=min(4,   256)=4
+        step = 0
+        align_pad = 0
+        while step < query_len:
+            # End of the current run: an image's end if `step` is inside an image,
+            # else the next image's start (or `query_len`) for a text run.
+            img_end = next((e for s, e in image_ranges if s <= step < e), None)
+            if img_end is not None:
+                run_end = img_end
+            else:
+                run_end = min(
+                    (s for s, _ in image_ranges if s > step), default=query_len
+                )
+            run_len = min(run_end - step, chunk_size)
+
+            # Pad to the block boundary if this chunk would straddle one.
+            # `offset_in_block`: this chunk's first cache slot within its block.
+            offset_in_block = (step + align_pad) % block_size
+            if offset_in_block + chunk_size > block_size:
+                align_pad += block_size - offset_in_block
+            step += run_len
+        return align_pad
 
     def free(self, request: Request, preemption: bool = False) -> None:
         """Free the blocks allocated for the request."""
@@ -140,6 +195,16 @@ class RBLNKVCacheManager(KVCacheManager):
         # `num_new_tokens` = 1.
         num_computed_tokens = request.num_computed_tokens
         num_tokens_need_slot = min(request.num_tokens, self.max_model_len)
+        if self.needs_chunked_prefill_pad:
+            # gemma3/gemma4: reserve the partition-alignment + trailing-chunk
+            # slots optimum-rbln's chunked prefill touches beyond the prompt.
+            # The padding is fixed by the prompt; later decode tokens append on
+            # top of it, so base the pad on the prompt length only.
+            pad = self._chunked_prefill_pad(
+                request, min(request.num_prompt_tokens, self.max_model_len)
+            )
+            print("@@@@ pad", pad)
+            num_tokens_need_slot += pad
         num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
             request_id=request.request_id,
             num_tokens=num_tokens_need_slot,

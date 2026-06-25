@@ -11,8 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import json
-import os
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -47,6 +45,7 @@ else:
 
 PAD_TOKEN_ID = 0
 
+
 class RBLNChunkedPrefillPadMixin(_ProcessorBase):
     """Left-pad ``prompt_token_ids`` so vLLM reserves enough KV-cache blocks.
 
@@ -68,10 +67,11 @@ class RBLNChunkedPrefillPadMixin(_ProcessorBase):
 
     # MRO note: mix in BEFORE the HF ``*MultiModalProcessor`` so this ``apply``
     # wraps theirs (``super().apply`` resolves to the HF processor).
-    # 
+    #
     def apply(self, *args, **kwargs):
         output = super().apply(*args, **kwargs)
         return output
+
 
 class RBLNGemma3MultiModalProcessor(
     RBLNChunkedPrefillPadMixin, Gemma3MultiModalProcessor

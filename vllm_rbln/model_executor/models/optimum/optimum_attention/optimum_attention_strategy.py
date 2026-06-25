@@ -303,7 +303,7 @@ class HybridAttentionImageStrategy(
         padded_local_block_table_ids = self.pad_to_2d(
             local_block_table_ids, decoder_batch_size, 1, pad_value, torch.int16
         )
-        padded_pad_len = self.pad_to_2d(pad_lens, decoder_batch_size, 1, 0)
+        # padded_pad_len = self.pad_to_2d(pad_lens, decoder_batch_size, 1, 0)
         padded_cache_positions = self.pad_to_2d(
             cache_positions, decoder_batch_size, 1, 0
         )
