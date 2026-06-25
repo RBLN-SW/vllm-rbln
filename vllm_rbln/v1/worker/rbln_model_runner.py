@@ -40,9 +40,13 @@ from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_
 from vllm.distributed.parallel_state import get_dp_group, get_pp_group, get_tp_group
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
 from vllm.model_executor.model_loader import TensorizerLoader, get_model_loader
 from vllm.model_executor.models.interfaces import (
+    SupportsMRoPE,
+    SupportsMultiModal,
     supports_eagle3,
+    supports_mrope,
     supports_transcription,
 )
 from vllm.model_executor.models.interfaces_base import (
@@ -52,6 +56,8 @@ from vllm.model_executor.models.interfaces_base import (
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.encoder_budget import MultiModalBudget
+from vllm.multimodal.inputs import MultiModalKwargsItem
+from vllm.multimodal.utils import group_and_batch_mm_kwargs
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams, SamplingType
 from vllm.sequence import IntermediateTensors
@@ -124,6 +130,10 @@ from vllm_rbln.forward_context import RBLNDPMetadata
 from vllm_rbln.logger import init_logger
 from vllm_rbln.lora.inputs import LoRAInputs
 from vllm_rbln.lora.mask import LoRAMask
+from vllm_rbln.model_executor.models.qwen3_vl import (
+    compile_qwen3_vision_tail,
+    preserve_or_trim_multimodal_embeddings,
+)
 from vllm_rbln.torch_compile_backend import (
     logged_rbln_backend,
     set_warmup_active,
@@ -276,7 +286,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # Multi-modal data support
         self.mm_registry = MULTIMODAL_REGISTRY
         self.uses_mrope = model_config.uses_mrope
-        assert not self.uses_mrope, "RBLN does not support M-RoPE."
 
         self.supports_mm_inputs = self.mm_registry.supports_multimodal_inputs(
             model_config
@@ -524,11 +533,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         )
 
         self.mm_budget = (
-            MultiModalBudget(
-                self.model_config,
-                self.scheduler_config,
-                self.mm_registry,
-            )
+            MultiModalBudget(self.vllm_config, self.mm_registry)
             if self.supports_mm_inputs
             else None
         )
@@ -1020,6 +1025,202 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self._init_mrope_positions(req_state)
 
         return req_state
+
+    def _init_mrope_positions(self, req_state: CachedRequestState):
+        model = self.get_model()
+        assert supports_mrope(model), "M-RoPE support is not implemented."
+        assert req_state.prompt_token_ids is not None, (
+            "M-RoPE requires prompt_token_ids to be available."
+        )
+        mrope_model = cast(SupportsMRoPE, model)
+
+        mrope_features = [
+            f for f in req_state.mm_features if f.modality != "prompt_embeds"
+        ]
+        req_state.mrope_positions, req_state.mrope_position_delta = (
+            mrope_model.get_mrope_input_positions(
+                req_state.prompt_token_ids,
+                mrope_features,
+            )
+        )
+
+    def _calc_mrope_positions(self, scheduler_output: "SchedulerOutput"):
+        mrope_pos_ptr = 0
+        for index, req_id in enumerate(self.input_batch.req_ids):
+            req = self.requests[req_id]
+            assert req.mrope_positions is not None
+
+            num_computed_tokens = self.input_batch.num_computed_tokens_cpu[index]
+            num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
+            num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
+                req.prompt_token_ids, req.prompt_embeds
+            )
+
+            if num_computed_tokens + num_scheduled_tokens > num_prompt_tokens:
+                prompt_part_len = max(0, num_prompt_tokens - num_computed_tokens)
+                completion_part_len = max(0, num_scheduled_tokens - prompt_part_len)
+            else:
+                prompt_part_len = num_scheduled_tokens
+                completion_part_len = 0
+
+            assert num_scheduled_tokens == prompt_part_len + completion_part_len
+
+            if prompt_part_len > 0:
+                dst_start = mrope_pos_ptr
+                dst_end = mrope_pos_ptr + prompt_part_len
+                src_start = num_computed_tokens
+                src_end = num_computed_tokens + prompt_part_len
+
+                self.mrope_positions.cpu[:, dst_start:dst_end] = req.mrope_positions[
+                    :, src_start:src_end
+                ]
+                mrope_pos_ptr += prompt_part_len
+
+            if completion_part_len > 0:
+                dst_start = mrope_pos_ptr
+                dst_end = mrope_pos_ptr + completion_part_len
+
+                assert req.mrope_position_delta is not None
+                MRotaryEmbedding.get_next_input_positions_tensor(
+                    out=self.mrope_positions.np,
+                    out_offset=dst_start,
+                    mrope_position_delta=req.mrope_position_delta,
+                    context_len=num_computed_tokens + prompt_part_len,
+                    num_new_tokens=completion_part_len,
+                )
+
+                mrope_pos_ptr += completion_part_len
+
+    def _batch_mm_inputs_from_scheduler(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> tuple[list[str], list[tuple[str, MultiModalKwargsItem]]]:
+        scheduled_encoder_inputs = scheduler_output.scheduled_encoder_inputs
+        if not scheduled_encoder_inputs:
+            return [], []
+
+        mm_hashes = list[str]()
+        mm_kwargs = list[tuple[str, MultiModalKwargsItem]]()
+        for req_id, encoder_input_ids in scheduled_encoder_inputs.items():
+            req_state = self.requests[req_id]
+
+            for mm_input_id in encoder_input_ids:
+                mm_feature = req_state.mm_features[mm_input_id]
+                if mm_feature.data is None:
+                    continue
+
+                mm_hashes.append(mm_feature.identifier)
+                mm_kwargs.append((mm_feature.modality, mm_feature.data))
+
+        return mm_hashes, mm_kwargs
+
+    def _execute_mm_encoder(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> list[torch.Tensor]:
+        mm_hashes, mm_kwargs = self._batch_mm_inputs_from_scheduler(scheduler_output)
+
+        if not mm_kwargs:
+            return []
+
+        pe_indices = [
+            i
+            for i, (modality, _) in enumerate(mm_kwargs)
+            if modality == "prompt_embeds"
+        ]
+        if pe_indices:
+            for i in pe_indices:
+                pe_tensor = mm_kwargs[i][1]["embedding"].data
+                assert isinstance(pe_tensor, torch.Tensor)
+                self.encoder_cache[mm_hashes[i]] = pe_tensor.to(self.device)
+            mm_hashes = [h for i, h in enumerate(mm_hashes) if i not in pe_indices]
+            mm_kwargs = [k for i, k in enumerate(mm_kwargs) if i not in pe_indices]
+            if not mm_kwargs:
+                return []
+
+        model = cast(SupportsMultiModal, self.model)
+        encoder_outputs: list[torch.Tensor] = []
+        for _, num_items, mm_kwargs_batch in group_and_batch_mm_kwargs(
+            mm_kwargs,
+            device=self.device,
+            pin_memory=self.pin_memory,
+        ):
+            batch_outputs = model.embed_multimodal(**mm_kwargs_batch)
+            assert len(batch_outputs) == num_items, (
+                "Multimodal encoder returned an unexpected number of outputs: "
+                f"expected {num_items}, got {len(batch_outputs)}"
+            )
+            encoder_outputs.extend(batch_outputs)
+
+        for mm_hash, output in zip(mm_hashes, encoder_outputs):
+            self.encoder_cache[mm_hash] = output
+            logger.debug("Finish execute for mm hash %s", mm_hash)
+
+        return encoder_outputs
+
+    def _gather_mm_embeddings(
+        self,
+        scheduler_output: "SchedulerOutput",
+        shift_computed_tokens: int = 0,
+    ) -> tuple[list[torch.Tensor], torch.Tensor]:
+        total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+
+        mm_embeds = list[torch.Tensor]()
+        is_mm_embed = torch.zeros(
+            total_num_scheduled_tokens, dtype=torch.bool, device="cpu"
+        )
+
+        req_start_idx = 0
+        for req_id in self.input_batch.req_ids:
+            num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
+            req_state = self.requests[req_id]
+            num_computed_tokens = req_state.num_computed_tokens + shift_computed_tokens
+
+            for mm_feature in req_state.mm_features:
+                pos_info = mm_feature.mm_position
+                start_pos = pos_info.offset
+                num_encoder_tokens = pos_info.length
+
+                if start_pos >= num_computed_tokens + num_scheduled_tokens:
+                    break
+                if start_pos + num_encoder_tokens <= num_computed_tokens:
+                    continue
+
+                start_idx = max(num_computed_tokens - start_pos, 0)
+                end_idx = min(
+                    num_computed_tokens - start_pos + num_scheduled_tokens,
+                    num_encoder_tokens,
+                )
+                assert start_idx < end_idx
+                curr_embeds_start, curr_embeds_end = (
+                    pos_info.get_embeds_indices_in_range(start_idx, end_idx)
+                )
+                if curr_embeds_start == curr_embeds_end:
+                    continue
+
+                mm_hash = mm_feature.identifier
+                encoder_output = self.encoder_cache.get(mm_hash, None)
+                assert encoder_output is not None, f"Encoder cache miss for {mm_hash}."
+
+                if (is_embed := pos_info.is_embed) is not None:
+                    is_embed = is_embed[start_idx:end_idx]
+                    mm_embeds_item = encoder_output[curr_embeds_start:curr_embeds_end]
+                else:
+                    mm_embeds_item = encoder_output[start_idx:end_idx]
+
+                req_start_pos = req_start_idx + start_pos - num_computed_tokens
+                if is_embed is None:
+                    is_mm_embed[req_start_pos + start_idx : req_start_pos + end_idx] = (
+                        True
+                    )
+                else:
+                    is_mm_embed[
+                        req_start_pos + start_idx : req_start_pos + end_idx
+                    ] |= is_embed
+                mm_embeds.append(mm_embeds_item)
+
+            req_start_idx += num_scheduled_tokens
+
+        return mm_embeds, is_mm_embed
 
     def _get_cumsum_and_arange(
         self,
@@ -1583,7 +1784,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             max_tokens_per_req_across_dp,
         )
 
-    def _compile_model(self, model):
+    def _get_compile_options(self, *, model_trace_method: str | None = None):
         TP = get_tp_group()
         PP = get_pp_group()
         DP = get_dp_group()
@@ -1603,10 +1804,15 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             "mode": "strict",
             "_runtime_holder": self.runtime_holder,
         }
-        if envs.VLLM_RBLN_USE_DEVICE_TENSOR:
+        if model_trace_method is not None:
+            options["model_trace_method"] = model_trace_method
+        elif envs.VLLM_RBLN_USE_DEVICE_TENSOR:
             options["model_trace_method"] = "export"
-        else:
+
+        if not envs.VLLM_RBLN_USE_DEVICE_TENSOR:
             options["compile_context"] = self.compile_context
+        else:
+            options.pop("compile_context", None)
         if not envs.VLLM_DISABLE_COMPILE_CACHE:
             logger.info(
                 "Once the model is compiled for the first time, "
@@ -1615,6 +1821,35 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             options["cache_dir"] = os.path.join(envs.VLLM_CACHE_ROOT, "rbln")
         if envs.VLLM_RBLN_COMPILE_ONLY:
             options["mode"] = ["strict", "compile_only"]
+
+        return options
+
+    def _compile_mm_encoder(self) -> None:
+        visual = getattr(self.model, "visual", None)
+        blocks = getattr(visual, "blocks", None)
+        if blocks is None:
+            return
+
+        from rebel.compile_context import CompileContext
+        # options = self._get_compile_options()
+        options ={
+            "compile_context": CompileContext(),
+            "mode": "strict",
+            "model_trace_method": "jittrace"
+        }
+        logger.info(
+            "Compiling Qwen3-VL multimodal encoder tail with %d block(s) "
+            "as a single RBLN graph",
+            len(blocks),
+        )
+        # compile_qwen3_vision_tail(visual, logged_rbln_backend, options)
+
+    def _compile_model(self, model):
+        # Qwen3-VL language prefill/decode share the same module hash. Keep the
+        # trace method explicit so weight-sharing does not register one graph
+        # after export fallback and another as export.
+        trace_method = None
+        options = self._get_compile_options(model_trace_method=trace_method)
 
         # compile compute_logits
         # FIXME(jiwoo.park): method assignment for torch.compile
@@ -1966,21 +2201,29 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # _prepare_inputs may reorder the batch, so we must gather multi
         # modal outputs after that to ensure the correct order
         use_dt = envs.VLLM_RBLN_USE_DEVICE_TENSOR
+        has_mm_features = any(
+            self.requests[req_id].mm_features for req_id in self.input_batch.req_ids
+        )
         if (
             self.supports_mm_inputs
+            and has_mm_features
             and get_pp_group().is_first_rank
             and not self.model_config.is_encoder_decoder
         ):
             # Run the multimodal encoder if any.
             self._execute_mm_encoder(scheduler_output)
-            mm_embeds = self._gather_mm_embeddings(scheduler_output)
+            mm_embeds, is_mm_embed = self._gather_mm_embeddings(scheduler_output)
+            mm_embeds = preserve_or_trim_multimodal_embeddings(
+                self.model, mm_embeds
+            )
 
             # NOTE(woosuk): To unify token ids and soft tokens (vision
             # embeddings), we always use embeddings (rather than token ids)
             # as input to the multimodal model, even when the input is text.
-            inputs_embeds_scheduled = self.model.get_input_embeddings(
-                input_ids=self.input_ids.gpu[:num_scheduled_tokens],
+            inputs_embeds_scheduled = self.model.embed_input_ids(
+                self.input_ids.gpu[:num_scheduled_tokens],
                 multimodal_embeddings=mm_embeds or None,
+                is_multimodal=is_mm_embed,
             )
 
             # TODO(woosuk): Avoid the copy. Optimize.
@@ -1988,10 +2231,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
             input_ids = None
             inputs_embeds = self.inputs_embeds.gpu[:num_input_tokens]
-            model_kwargs = {
-                **self._init_model_kwargs(num_scheduled_tokens),
-                **self._extract_mm_kwargs(scheduler_output),
-            }
+            model_kwargs = self._init_model_kwargs(num_scheduled_tokens)
         else:
             # For text-only models, we use token ids as input. Under device-tensor
             # mode, use the CPU buffer so view/pad/clone stay on CPU; it is moved
@@ -3240,7 +3480,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 model_kwargs,
             ) = self._preprocess(scheduler_output)
 
-        assert input_ids is not None
         is_prefill_phase = self.is_prefill_phase()
 
         # Padding length for speculative decoding by num_speculative_tokens.
@@ -3267,6 +3506,10 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             max_spec_decode_len = None
 
         if max_spec_decode_len is not None:
+            if input_ids is None:
+                raise NotImplementedError(
+                    "Speculative decoding with multimodal inputs is not supported yet."
+                )
             # Sliding window: per-req unpadded flat length is
             # scheduled + slide. `pad_speculative_draft_tokens` and the
             # remap below both rely on this length matching the size of
@@ -3345,8 +3588,10 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
             # FIXME(jiwoo.park) This is a temporary workaround;
             # we must resolve the batch dimension.
-            input_ids = input_ids.view(num_reqs, -1).to(torch.long)
-            positions = positions.view(num_reqs, -1)
+            if input_ids is not None:
+                input_ids = input_ids.view(num_reqs, -1).to(torch.long)
+            if not self.uses_mrope:
+                positions = positions.view(num_reqs, -1)
 
             token_indices = None
             if is_prefill_phase and not self.use_eagle():
@@ -3356,11 +3601,17 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             if is_prefill_phase:
                 # prefill chunk padding
                 prefill_size = self.scheduler_config.max_num_batched_tokens
-                input_ids = rbln_utils.pad(input_ids, -1, prefill_size)
+                if input_ids is not None:
+                    input_ids = rbln_utils.pad(input_ids, -1, prefill_size)
+                if inputs_embeds is not None:
+                    inputs_embeds = rbln_utils.pad(inputs_embeds, 0, prefill_size)
                 positions = rbln_utils.pad(positions, -1, prefill_size)
             else:
                 # decode batch padding
-                input_ids = rbln_utils.pad(input_ids, 0, batch_bucket_size)
+                if input_ids is not None:
+                    input_ids = rbln_utils.pad(input_ids, 0, batch_bucket_size)
+                if inputs_embeds is not None:
+                    inputs_embeds = rbln_utils.pad(inputs_embeds, 0, batch_bucket_size)
                 positions = rbln_utils.pad(positions, -2, batch_bucket_size)
 
             if hasattr(rebel, "capture_reports"):
@@ -4000,11 +4251,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         )
 
         def model_wrapper(
-            input_ids: torch.Tensor,
+            input_ids: torch.Tensor | None,
             positions: torch.Tensor,
             intermediate_tensors: IntermediateTensors | None = None,
             inputs_embeds: torch.Tensor | None = None,
             selected_token_indices: torch.Tensor | None = None,
+            **kwargs: Any,
         ) -> (
             tuple[Any, Any, Any]
             | tuple[Any, Any]
@@ -4025,6 +4277,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 positions=positions,
                 intermediate_tensors=intermediate_tensors,
                 inputs_embeds=inputs_embeds,
+                **kwargs,
             )
 
             logits = None
@@ -4045,7 +4298,10 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     #     contrib_dynamic_take (tensor -> scalar)
                     # aten::index_select --> take -->
                     #     contrib_dynamic_take (tensor -> scalar)
-                    hidden_states = hidden_states[:, selected_token_indices]
+                    if hidden_states.ndim == 2:
+                        hidden_states = hidden_states[selected_token_indices]
+                    else:
+                        hidden_states = hidden_states[:, selected_token_indices]
                 logits = self.compute_logits_model.compute_logits(hidden_states)
                 logits = logits.view(-1, logits.size(-1))
 
@@ -4063,6 +4319,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         if hasattr(self, "drafter"):
             logger.info("Loading drafter model...")
             self.drafter.load_model(self.model)
+        if (
+            self.supports_mm_inputs
+            and not self.model_config.enforce_eager
+            and envs.VLLM_RBLN_COMPILE_MODEL
+        ):
+            self._compile_mm_encoder()
         if self.use_aux_hidden_state_outputs:
             if not supports_eagle3(self.get_model()):
                 raise RuntimeError(

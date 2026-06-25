@@ -54,7 +54,7 @@ def main():
         gpu_memory_utilization=0.9,
         profiler_config={
             "profiler": "torch",
-            "torch_profiler_dir": "./vllm_profile",
+            "torch_profiler_dir": "./vllm_profile_0624",
         },
     )
 
@@ -92,10 +92,10 @@ def main():
     if len(requests) == 1:
         return
 
-    # requests = requests[:3]
-    # llm.start_profile()
-    outputs = llm.generate(requests[1:], sampling_params)
-    # llm.stop_profile()
+    # requests = requests[-4:]
+    llm.start_profile()
+    outputs = llm.generate(requests[-4:], sampling_params)
+    llm.stop_profile()
 
     for (image_path, _), output in zip(images[1:], outputs):
         print(f"{image_path.name}: {output.outputs[0].text}")
