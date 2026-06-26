@@ -205,19 +205,24 @@ class RBLNParams:
 def _resolve_image_prefill_chunk_size(cfg: RblnConfigLike) -> list[int] | None:
     """Resolve image-prefill buckets exactly as optimum-rbln persists them.
 
-    Both gemma3 and gemma4 store ``image_prefill_chunk_size`` as a ``list[int]``
-    (gemma3: single-element list; gemma4: descending multi-bucket list). Any
-    other type is a config error. Returns ``None`` when the key is absent.
+    optimum-rbln stores ``image_prefill_chunk_size`` under one key but with two
+    shapes: gemma3 persists a scalar ``int`` (a single bucket); gemma4 persists
+    a descending ``list[int]`` (multiple buckets). Both are normalized to a
+    ``list[int]``. Any other type is a config error. Returns ``None`` when the
+    key is absent.
     """
     sizes = _cfg_get(cfg, "image_prefill_chunk_size")
-    if sizes is not None:
-        if not isinstance(sizes, list):
-            raise TypeError(
-                "image_prefill_chunk_size must be a list[int], got "
-                f"{type(sizes).__name__}"
-            )
+    if sizes is None:
+        return None
+    if isinstance(sizes, list):
         return sizes
-    return None
+    # bool is an int subclass; reject it explicitly.
+    if isinstance(sizes, int) and not isinstance(sizes, bool):
+        return [sizes]
+    raise TypeError(
+        "image_prefill_chunk_size must be an int or list[int], got "
+        f"{type(sizes).__name__}"
+    )
 
 
 def _resolve_kvcache_block_size(cfg: RblnConfigLike, *, arch: str) -> int | None:
