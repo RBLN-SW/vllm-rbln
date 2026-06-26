@@ -133,3 +133,25 @@ def patched_rope_forward_oot(
         key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
 
     return query, key
+
+
+@register_patch(
+    target="vllm.model_executor.layers.rotary_embedding.mrope.apply_interleaved_rope",
+    reason=(
+        "Avoid advanced indexing/split patterns in upstream M-RoPE that lower "
+        "to unsupported RBLN strided_slice operations."
+    ),
+)
+def patched_apply_interleaved_rope_oot(
+    x: torch.Tensor,
+    mrope_section: list[int],
+) -> torch.Tensor:
+    idx = torch.arange(x.shape[-1], device=x.device)
+    h_mask = ((idx % 3) == 1) & (idx < mrope_section[1] * 3)
+    w_mask = ((idx % 3) == 2) & (idx < mrope_section[2] * 3)
+    # Avoid vLLM's in-place x[..., 1::3] / x[..., 2::3] slice writes. Those
+    # lower to aten::copy_ with a strided slice pattern unsupported by RBLN.
+    h = h_mask.to(dtype=x.dtype)
+    w = w_mask.to(dtype=x.dtype)
+    t = 1 - h - w
+    return x[0] * t + x[1] * h + x[2] * w

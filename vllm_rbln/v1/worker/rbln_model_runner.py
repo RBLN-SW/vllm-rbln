@@ -24,9 +24,14 @@ from vllm.config.cache import CacheConfig
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.models.interfaces import (
+    MultiModalEmbeddings,
+    SupportsMRoPE,
+    SupportsMultiModal,
     supports_eagle3,
+    supports_mrope,
     supports_realtime,
     supports_transcription,
 )
@@ -35,6 +40,9 @@ from vllm.model_executor.models.interfaces_base import (
     is_pooling_model,
     is_text_generation_model,
 )
+from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.inputs import MultiModalKwargsItem, PlaceholderRange
+from vllm.multimodal.utils import group_and_batch_mm_kwargs
 from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
@@ -82,6 +90,7 @@ from vllm.v1.worker.utils import (
     KVCacheSpec,
     add_kv_sharing_layers_to_kv_cache_groups,
     bind_kv_cache,
+    sanity_check_mm_encoder_outputs,
 )
 
 from vllm_rbln import envs
@@ -219,6 +228,14 @@ class RBLNModelRunner:
         # Model-related.
         self.cascade_attn_enabled = not self.model_config.disable_cascade_attn
 
+        # Multi-modal position support. Text-only M-RoPE is still distinct from
+        # normal RoPE because the model expects positions shaped as [3, tokens].
+        self.uses_mrope = model_config.uses_mrope
+        self.mm_registry = MULTIMODAL_REGISTRY
+        self.supports_mm_inputs = self.mm_registry.supports_multimodal_inputs(
+            model_config
+        )
+
         # TODO(RBLN): Multi-modal data support
         # TODO(RBLN): Async scheduling
 
@@ -330,6 +347,11 @@ class RBLNModelRunner:
         self.input_ids = torch.zeros(self.max_num_tokens, dtype=torch.int32)
         self.positions = torch.zeros(self.max_num_tokens, dtype=torch.int64)
         self.positions_np = self.positions.numpy()
+        if self.uses_mrope:
+            self.mrope_positions = torch.zeros(
+                (3, self.max_num_tokens + 1), dtype=torch.int64
+            )
+            self.mrope_positions_np = self.mrope_positions.numpy()
         self.query_start_loc = torch.zeros(self.max_num_reqs + 1, dtype=torch.int32)
         self.seq_lens = torch.zeros(self.max_num_tokens, dtype=torch.int32)
         self.discard_request_mask = torch.zeros(self.max_num_reqs, dtype=torch.bool)
@@ -364,6 +386,7 @@ class RBLNModelRunner:
 
         # Cached outputs.
         self._draft_token_ids: list[list[int]] | torch.Tensor | None = None
+        self.encoder_cache: dict[str, torch.Tensor] = {}
 
         # Ephemeral state transferred between execute_model() and sample_tokens().
         self.execute_model_state: ExecuteModelState | None = None
@@ -393,6 +416,8 @@ class RBLNModelRunner:
 
     def _get_positions(self, num_tokens: Any):
         assert not isinstance(num_tokens, int)
+        if self.uses_mrope:
+            return self.mrope_positions[:, num_tokens]
         return self.positions[:num_tokens]
 
     def _init_model_kwargs(self):
@@ -473,6 +498,9 @@ class RBLNModelRunner:
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
 
+        for mm_hash in scheduler_output.free_encoder_mm_hashes:
+            self.encoder_cache.pop(mm_hash, None)
+
         # Remove the finished requests from the persistent batch.
         for req_id in scheduler_output.finished_req_ids:
             self.input_batch.remove_request(req_id)
@@ -538,6 +566,9 @@ class RBLNModelRunner:
                     if sampling_params.prompt_logprobs == -1
                     else sampling_params.prompt_logprobs
                 )
+
+            if self.uses_mrope:
+                self._init_mrope_positions(req_state)
 
             reqs_to_add.append(req_state)
 
@@ -662,7 +693,32 @@ class RBLNModelRunner:
         # `prompt_token_ids`.
         req_state.output_token_ids.clear()
 
+        if self.uses_mrope:
+            self._init_mrope_positions(req_state)
+
         return req_state
+
+    def _init_mrope_positions(self, req_state: CachedRequestState) -> None:
+        model = self.get_model()
+        assert supports_mrope(model), "M-RoPE support is not implemented."
+        assert req_state.prompt_token_ids is not None, (
+            "M-RoPE requires prompt_token_ids to be available."
+        )
+        mrope_model = cast(SupportsMRoPE, model)
+
+        # `prompt_embeds` is a passthrough modality with no grid metadata.
+        # Treat those positions as text positions for M-RoPE.
+        mrope_features = [
+            feature
+            for feature in req_state.mm_features
+            if feature.modality != "prompt_embeds"
+        ]
+        req_state.mrope_positions, req_state.mrope_position_delta = (
+            mrope_model.get_mrope_input_positions(
+                req_state.prompt_token_ids,
+                mrope_features,
+            )
+        )
 
     def _get_cumsum_and_arange(
         self,
@@ -729,6 +785,8 @@ class RBLNModelRunner:
             arange,
             out=positions_np,
         )
+        if self.uses_mrope:
+            self._calc_mrope_positions(scheduler_output)
 
         # Get token indices.
         # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
@@ -809,6 +867,195 @@ class RBLNModelRunner:
             query_lengths,
             total_query_tokens,
         )
+
+    def _calc_mrope_positions(self, scheduler_output: "SchedulerOutput") -> None:
+        mrope_pos_ptr = 0
+        for index, req_id in enumerate(self.input_batch.req_ids):
+            req = self.requests[req_id]
+            assert req.mrope_positions is not None
+
+            num_computed_tokens = self.input_batch.num_computed_tokens_cpu[index]
+            num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
+            num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
+                req.prompt_token_ids, req.prompt_embeds
+            )
+
+            if num_computed_tokens + num_scheduled_tokens > num_prompt_tokens:
+                prompt_part_len = max(0, num_prompt_tokens - num_computed_tokens)
+                completion_part_len = max(0, num_scheduled_tokens - prompt_part_len)
+            else:
+                prompt_part_len = num_scheduled_tokens
+                completion_part_len = 0
+
+            assert num_scheduled_tokens == prompt_part_len + completion_part_len
+
+            if prompt_part_len > 0:
+                dst_start = mrope_pos_ptr
+                dst_end = mrope_pos_ptr + prompt_part_len
+                src_start = num_computed_tokens
+                src_end = num_computed_tokens + prompt_part_len
+
+                self.mrope_positions[:, dst_start:dst_end] = req.mrope_positions[
+                    :, src_start:src_end
+                ]
+                mrope_pos_ptr += prompt_part_len
+
+            if completion_part_len > 0:
+                dst_start = mrope_pos_ptr
+
+                assert req.mrope_position_delta is not None
+                MRotaryEmbedding.get_next_input_positions_tensor(
+                    out=self.mrope_positions_np,
+                    out_offset=dst_start,
+                    mrope_position_delta=req.mrope_position_delta,
+                    context_len=num_computed_tokens + prompt_part_len,
+                    num_new_tokens=completion_part_len,
+                )
+                mrope_pos_ptr += completion_part_len
+
+    def _batch_mm_inputs_from_scheduler(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> tuple[
+        list[str],
+        list[tuple[str, MultiModalKwargsItem]],
+        list[tuple[str, PlaceholderRange]],
+    ]:
+        scheduled_encoder_inputs = scheduler_output.scheduled_encoder_inputs
+        if not scheduled_encoder_inputs:
+            return [], [], []
+
+        mm_hashes = list[str]()
+        mm_kwargs = list[tuple[str, MultiModalKwargsItem]]()
+        mm_refs = list[tuple[str, PlaceholderRange]]()
+        for req_id, encoder_input_ids in scheduled_encoder_inputs.items():
+            req_state = self.requests[req_id]
+            for mm_input_id in encoder_input_ids:
+                mm_feature = req_state.mm_features[mm_input_id]
+                if mm_feature.data is None:
+                    continue
+                mm_hashes.append(mm_feature.identifier)
+                mm_kwargs.append((mm_feature.modality, mm_feature.data))
+                mm_refs.append((req_id, mm_feature.mm_position))
+
+        return mm_hashes, mm_kwargs, mm_refs
+
+    def _execute_mm_encoder(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> list[torch.Tensor]:
+        mm_hashes, mm_kwargs, _ = self._batch_mm_inputs_from_scheduler(scheduler_output)
+        if not mm_kwargs:
+            return []
+
+        prompt_embed_indices = [
+            idx
+            for idx, (modality, _) in enumerate(mm_kwargs)
+            if modality == "prompt_embeds"
+        ]
+        if prompt_embed_indices:
+            for idx in prompt_embed_indices:
+                prompt_embeds = mm_kwargs[idx][1]["embedding"].data
+                assert isinstance(prompt_embeds, torch.Tensor)
+                self.encoder_cache[mm_hashes[idx]] = prompt_embeds.to(self.device)
+
+            mm_hashes = [
+                mm_hash
+                for idx, mm_hash in enumerate(mm_hashes)
+                if idx not in prompt_embed_indices
+            ]
+            mm_kwargs = [
+                mm_kwarg
+                for idx, mm_kwarg in enumerate(mm_kwargs)
+                if idx not in prompt_embed_indices
+            ]
+            if not mm_kwargs:
+                return []
+
+        model = cast(SupportsMultiModal, self.model)
+        encoder_outputs: list[torch.Tensor] = []
+        for _modality, num_items, mm_kwargs_batch in group_and_batch_mm_kwargs(
+            mm_kwargs,
+            device=self.device,
+            pin_memory=self.pin_memory,
+        ):
+            batch_outputs: MultiModalEmbeddings = model.embed_multimodal(
+                **mm_kwargs_batch
+            )
+            sanity_check_mm_encoder_outputs(
+                batch_outputs,
+                expected_num_items=num_items,
+            )
+            encoder_outputs.extend(batch_outputs)
+
+        for mm_hash, output in zip(mm_hashes, encoder_outputs):
+            self.encoder_cache[mm_hash] = output
+            logger.debug("Finish execute for mm hash %s", mm_hash)
+
+        return encoder_outputs
+
+    def _gather_mm_embeddings(
+        self,
+        scheduler_output: "SchedulerOutput",
+        shift_computed_tokens: int = 0,
+    ) -> tuple[list[torch.Tensor], torch.Tensor]:
+        total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        mm_embeds = list[torch.Tensor]()
+        is_mm_embed = torch.zeros(total_num_scheduled_tokens, dtype=torch.bool)
+
+        req_start_idx = 0
+        for req_id in self.input_batch.req_ids:
+            num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
+            req_state = self.requests[req_id]
+            num_computed_tokens = req_state.num_computed_tokens + shift_computed_tokens
+
+            for mm_feature in req_state.mm_features:
+                pos_info = mm_feature.mm_position
+                start_pos = pos_info.offset
+                num_encoder_tokens = pos_info.length
+
+                if start_pos >= num_computed_tokens + num_scheduled_tokens:
+                    break
+                if start_pos + num_encoder_tokens <= num_computed_tokens:
+                    continue
+
+                start_idx = max(num_computed_tokens - start_pos, 0)
+                end_idx = min(
+                    num_computed_tokens - start_pos + num_scheduled_tokens,
+                    num_encoder_tokens,
+                )
+                assert start_idx < end_idx
+
+                curr_embeds_start, curr_embeds_end = (
+                    pos_info.get_embeds_indices_in_range(start_idx, end_idx)
+                )
+                if curr_embeds_start == curr_embeds_end:
+                    continue
+
+                mm_hash = mm_feature.identifier
+                encoder_output = self.encoder_cache.get(mm_hash, None)
+                assert encoder_output is not None, f"Encoder cache miss for {mm_hash}."
+
+                if (is_embed := pos_info.is_embed) is not None:
+                    is_embed = is_embed[start_idx:end_idx]
+                    mm_embeds_item = encoder_output[curr_embeds_start:curr_embeds_end]
+                else:
+                    mm_embeds_item = encoder_output[start_idx:end_idx]
+
+                req_start_pos = req_start_idx + start_pos - num_computed_tokens
+                if is_embed is None:
+                    is_mm_embed[req_start_pos + start_idx : req_start_pos + end_idx] = (
+                        True
+                    )
+                else:
+                    is_mm_embed[
+                        req_start_pos + start_idx : req_start_pos + end_idx
+                    ] |= is_embed
+                mm_embeds.append(mm_embeds_item)
+
+            req_start_idx += num_scheduled_tokens
+
+        return mm_embeds, is_mm_embed
 
     def _build_attention_metadata(
         self,
@@ -1074,6 +1321,7 @@ class RBLNModelRunner:
 
     def _preprocess(
         self,
+        scheduler_output: "SchedulerOutput",
         num_reqs: int,
         num_reqs_padded: int,
         num_input_tokens: int,
@@ -1097,10 +1345,26 @@ class RBLNModelRunner:
             model_kwargs,
         ]
         """
-        # For text-only models
         input_ids = self.input_ids[:num_input_tokens].view(num_reqs, -1)
-        positions = self.positions[:num_input_tokens].view(num_reqs, -1)
+        if self.uses_mrope:
+            positions = self.mrope_positions[:, :num_input_tokens]
+        else:
+            positions = self.positions[:num_input_tokens].view(num_reqs, -1)
+
         inputs_embeds = None
+
+        if (
+            self.supports_mm_inputs
+            and get_pp_group().is_first_rank
+            and not self.model_config.is_encoder_decoder
+        ):
+            self._execute_mm_encoder(scheduler_output)
+            mm_embeds, is_mm_embed = self._gather_mm_embeddings(scheduler_output)
+            inputs_embeds = self.model.embed_input_ids(
+                self.input_ids[:num_input_tokens],
+                multimodal_embeddings=mm_embeds or None,
+                is_multimodal=is_mm_embed,
+            )
 
         if get_pp_group().is_first_rank:
             intermediate_tensors = None
@@ -1109,17 +1373,25 @@ class RBLNModelRunner:
 
         if self.is_prefill:
             input_ids = pad(input_ids, -1, self.max_num_tokens)
+            if inputs_embeds is not None:
+                inputs_embeds = pad(inputs_embeds, -2, self.max_num_tokens)
             positions = pad(positions, -1, self.max_num_tokens)
         else:
             input_ids = pad(input_ids, 0, num_reqs_padded)
-            positions = pad(positions, 0, num_reqs_padded)
+            if inputs_embeds is not None:
+                inputs_embeds = pad(inputs_embeds, 0, num_reqs_padded)
+            positions = (
+                pad(positions, -1, num_reqs_padded)
+                if self.uses_mrope
+                else pad(positions, 0, num_reqs_padded)
+            )
 
         model_kwargs = {
             **self._init_model_kwargs(),
         }
 
         return (
-            input_ids,
+            input_ids if inputs_embeds is None else None,
             inputs_embeds,
             positions,
             intermediate_tensors,
@@ -1338,6 +1610,7 @@ class RBLNModelRunner:
                 logits_indices,
                 model_kwargs,
             ) = self._preprocess(
+                scheduler_output,
                 num_reqs,
                 num_reqs_padded,
                 num_query_tokens,
@@ -1673,7 +1946,7 @@ class RBLNModelRunner:
         # It handles the forward pass of the underlying model and computes
         # the logits from the hidden_states if necessary.
         def model_wrapper(
-            input_ids: torch.Tensor,
+            input_ids: torch.Tensor | None,
             positions: torch.Tensor,
             intermediate_tensors: IntermediateTensors | None = None,
             inputs_embeds: torch.Tensor | None = None,
@@ -1701,7 +1974,11 @@ class RBLNModelRunner:
                 and self.logits_processor is not None
             ):
                 if token_indices is not None:
-                    sample_hidden_states = hidden_states[:, token_indices]
+                    sample_hidden_states = (
+                        hidden_states[token_indices]
+                        if hidden_states.dim() == 2
+                        else hidden_states[:, token_indices]
+                    )
                     # NOTE(RBLN): token_indices points to the last-token positions used
                     # for sampling. EAGLE needs the full hidden_states during prefill,
                     # so do not slice them here.
@@ -1721,11 +1998,18 @@ class RBLNModelRunner:
             self.compute_logits = self.model.compute_logits
         else:
             process_group_dict = build_process_group_dict()
+            # Multimodal prefill can force export to fall back to JIT trace while
+            # later decode graphs may export cleanly. Weight sharing requires a
+            # single trace method across those graphs.
+            model_trace_method = (
+                "jittrace" if self.model_config.is_multimodal_model else ""
+            )
             self.model_executable = compile(
                 model_wrapper,
                 dynamic=False,
                 compile_context=self.compile_context,
                 tensor_parallel_size=envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
+                model_trace_method=model_trace_method,
                 process_group_dict=process_group_dict,
                 guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
                 runtime_holder=self.runtime_holder,
@@ -1736,6 +2020,7 @@ class RBLNModelRunner:
                 dynamic=False,
                 compile_context=self.compile_context,
                 tensor_parallel_size=envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
+                model_trace_method=model_trace_method,
                 process_group_dict=process_group_dict,
                 guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
                 runtime_holder=self.runtime_holder,
@@ -1929,7 +2214,12 @@ class RBLNModelRunner:
 
         input_ids = self.input_ids[:num_tokens_unpadded]
         inputs_embeds = None
-        positions = self.positions[:num_tokens_unpadded]
+        if self.uses_mrope:
+            dummy_positions = self.mrope_positions_np[:, :num_tokens_unpadded]
+            dummy_positions[:] = np.arange(num_tokens_unpadded, dtype=np.int64)
+            positions = self.mrope_positions[:, :num_tokens_unpadded]
+        else:
+            positions = self.positions[:num_tokens_unpadded]
         token_indices: torch.Tensor | None = None
         if self.use_wrapped_compute_logits and is_prefill:
             token_indices = torch.arange(
@@ -1957,7 +2247,10 @@ class RBLNModelRunner:
 
         # NOTE(RBLN): Clone tensors to make tensors non-view tensors.
         input_ids = input_ids.view(num_reqs, num_tokens_per_req).clone()
-        positions = positions.view(num_reqs, num_tokens_per_req).clone()
+        if self.uses_mrope:
+            positions = positions.clone()
+        else:
+            positions = positions.view(num_reqs, num_tokens_per_req).clone()
 
         with set_forward_context(
             attn_metadata,
