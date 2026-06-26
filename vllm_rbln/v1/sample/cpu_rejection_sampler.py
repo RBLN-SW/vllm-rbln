@@ -448,6 +448,8 @@ def torch_rejection_greedy_sample_kernel(
         t = target_argmax[s:e]
 
         if synthetic_mode:
+            assert uniform_probs is not None
+            assert synthetic_conditional_rates is not None
             u = uniform_probs[s:e]
             rate = synthetic_conditional_rates[:n].to(device=u.device, dtype=u.dtype)
             accepted = u < rate
@@ -516,6 +518,7 @@ def torch_rejection_random_sample_kernel(
         u = uniform_probs[s:e].to(torch.float64)
 
         if synthetic_mode:
+            assert synthetic_conditional_rates is not None
             rate = synthetic_conditional_rates[:n].to(device=u.device, dtype=u.dtype)
             accept = u < rate
         else:
