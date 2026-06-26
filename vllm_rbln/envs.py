@@ -119,6 +119,18 @@ def get_decode_batch_bucket_manual_buckets() -> list[int]:
         ) from e
 
 
+def use_auto_port() -> bool:
+    raw = os.environ.get("VLLM_RBLN_AUTO_PORT")
+    if raw is not None:
+        return raw.lower() in ("true", "1")
+    # Default follows device-tensor mode: auto port is on when
+    # VLLM_RBLN_USE_DEVICE_TENSOR is enabled.
+    return os.environ.get("VLLM_RBLN_USE_DEVICE_TENSOR", "False").lower() in (
+        "true",
+        "1",
+    )
+
+
 # extended environments
 environment_variables = {
     **vllm_envs,
@@ -222,9 +234,7 @@ environment_variables = {
         os.environ.get("VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT", 1)
     ),
     # Auto port
-    "VLLM_RBLN_AUTO_PORT": (
-        lambda: os.environ.get("VLLM_RBLN_AUTO_PORT", "False").lower() in ("true", "1")
-    ),
+    "VLLM_RBLN_AUTO_PORT": use_auto_port,
     # Decode batch bucket manual buckets
     "VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS": get_decode_batch_bucket_manual_buckets,  # noqa E501
     "VLLM_RBLN_USE_CUSTOM_KERNEL": (
