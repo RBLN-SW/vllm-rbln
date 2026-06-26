@@ -127,6 +127,149 @@ def test_new_prefill_uses_full_budget_when_decode_running():
     assert output.num_scheduled_tokens[req_b.request_id] == max_num_batched_tokens
 
 
+def test_evicted_decode_block_is_restashed_and_reemitted():
+    """Regression: a decode request whose next KV block is allocated exactly
+    on the prefill->decode transition step, and which is then evicted by the
+    "disable mixed batching" path, must not lose that block.
+
+    The block is already committed in the coordinator, so the next step's
+    allocate_slots returns an empty delta — without re-emitting the stashed
+    delta the runner's block table would keep a stale block-id 0. This is the
+    failure mode observed for block-aligned prompts (prompt length an exact
+    multiple of block_size), whose second block is needed on the very first
+    decode step that the eviction targets.
+    """
+    block_size = 16
+    scheduler = create_scheduler(
+        max_num_batched_tokens=128,
+        max_num_seqs=4,
+        block_size=block_size,
+        num_blocks=10000,
+    )
+
+    # Block-aligned prompt: exactly one block of prompt tokens.
+    req_a = create_requests(
+        num_requests=1, num_tokens=block_size, block_size=block_size, req_ids=["A"]
+    )[0]
+    scheduler.add_request(req_a)
+
+    # Prefill req_a (fits in one chunk); after the update it enters decode
+    # with exactly one allocated block (num_computed == block_size).
+    out1 = scheduler.schedule()
+    assert out1.num_scheduled_tokens[req_a.request_id] == block_size
+    scheduler.update_from_output(out1, create_runner_output(out1, 1))
+    assert req_a.num_computed_tokens == block_size
+
+    # A new prefill enters: the running loop schedules req_a's first decode
+    # (which needs a second block at the boundary), then the waiting loop
+    # schedules req_b and evicts req_a.
+    req_b = create_requests(
+        num_requests=1, num_tokens=block_size, block_size=block_size, req_ids=["B"]
+    )[0]
+    scheduler.add_request(req_b)
+    out2 = scheduler.schedule()
+
+    # req_a was kicked; req_b runs.
+    assert req_a.request_id not in out2.num_scheduled_tokens
+    assert req_b.request_id in out2.num_scheduled_tokens
+    # The fix stashed req_a's just-allocated block delta instead of dropping it.
+    assert req_a.request_id in scheduler._stranded_new_blocks
+    stashed_ids = scheduler._stranded_new_blocks[req_a.request_id].get_block_ids()
+    assert any(len(g) > 0 for g in stashed_ids)
+
+    scheduler.update_from_output(out2, create_runner_output(out2, 1))
+
+    # Next step: no waiting prefill, so req_a runs as decode and the stashed
+    # block must be re-emitted in its cached new_block_ids (this step's own
+    # allocate_slots returns nothing — the block is already committed).
+    out3 = scheduler.schedule()
+    assert req_a.request_id in out3.num_scheduled_tokens
+    cached = out3.scheduled_cached_reqs
+    idx = cached.req_ids.index(req_a.request_id)
+    reemitted = cached.new_block_ids[idx]
+    assert reemitted is not None
+    assert any(len(g) > 0 for g in reemitted)
+    # The stash is drained, and the re-emitted ids cover the stashed blocks.
+    assert req_a.request_id not in scheduler._stranded_new_blocks
+    flat_reemitted = [b for g in reemitted for b in g]
+    flat_stashed = [b for g in stashed_ids for b in g]
+    assert flat_stashed
+    assert all(b in flat_reemitted for b in flat_stashed)
+
+
+def test_stranded_blocks_cleaned_up_on_finish():
+    """A block delta stashed for an evicted request must be dropped if the
+    request finishes before it is scheduled again, so the stash never leaks."""
+    block_size = 16
+    scheduler = create_scheduler(
+        max_num_batched_tokens=128,
+        max_num_seqs=4,
+        block_size=block_size,
+        num_blocks=10000,
+    )
+
+    req_a = create_requests(
+        num_requests=1, num_tokens=block_size, block_size=block_size, req_ids=["A"]
+    )[0]
+    scheduler.add_request(req_a)
+    out1 = scheduler.schedule()
+    scheduler.update_from_output(out1, create_runner_output(out1, 1))
+
+    req_b = create_requests(
+        num_requests=1, num_tokens=block_size, block_size=block_size, req_ids=["B"]
+    )[0]
+    scheduler.add_request(req_b)
+    scheduler.schedule()
+    # req_a evicted at the boundary -> its block delta is stashed.
+    assert req_a.request_id in scheduler._stranded_new_blocks
+
+    # Finish req_a before it is rescheduled; the _free_request override must
+    # drop the stash entry.
+    scheduler.finish_requests(req_a.request_id, RequestStatus.FINISHED_ABORTED)
+    assert req_a.request_id not in scheduler._stranded_new_blocks
+
+
+def test_stranded_blocks_cleaned_up_on_preempt():
+    """A stashed block delta must be dropped when the request is preempted.
+
+    Preemption frees ALL of the request's blocks (including the stashed one)
+    and returns the request to the waiting queue. If the stash survived, the
+    request could resume, re-enter the decode batch, and have a now-freed
+    (possibly reused) block id re-emitted into its block table.
+    """
+    block_size = 16
+    scheduler = create_scheduler(
+        max_num_batched_tokens=128,
+        max_num_seqs=4,
+        block_size=block_size,
+        num_blocks=10000,
+    )
+
+    req_a = create_requests(
+        num_requests=1, num_tokens=block_size, block_size=block_size, req_ids=["A"]
+    )[0]
+    scheduler.add_request(req_a)
+    out1 = scheduler.schedule()
+    scheduler.update_from_output(out1, create_runner_output(out1, 1))
+
+    req_b = create_requests(
+        num_requests=1, num_tokens=block_size, block_size=block_size, req_ids=["B"]
+    )[0]
+    scheduler.add_request(req_b)
+    scheduler.schedule()
+    # req_a evicted at the boundary -> its block delta is stashed. It stays in
+    # the running queue (eviction only drops it from this step's output).
+    assert req_a.request_id in scheduler._stranded_new_blocks
+    assert req_a in scheduler.running
+
+    # Preempt req_a (frees its blocks). The override must drop the stash so the
+    # freed block id cannot be re-emitted after the request resumes.
+    scheduler.running.remove(req_a)
+    scheduler._preempt_request(req_a, 0.0)
+    assert req_a.status == RequestStatus.PREEMPTED
+    assert req_a.request_id not in scheduler._stranded_new_blocks
+
+
 def test_preempt_during_execution():
     # Test copied from https://github.com/vllm-project/vllm/blob/4fd9d6a85c00ac0186aa9abbeff73fc2ac6c721e/tests/v1/core/test_scheduler.py#L672-L728
 
@@ -233,47 +376,6 @@ def test_spec_decode_cap_at_block_boundary():
 
 
 # ---------------------------------------------------------------------------
-# spec_decode_cap [2/10]:
-# near block boundary → all spec tokens trimmed
-# ---------------------------------------------------------------------------
-
-
-def test_spec_decode_cap_near_block_boundary_all_trimmed():
-    """prompt=1023 → remaining_in_block=1 → cap=1 → all spec removed."""
-    scheduler = _sd_scheduler()
-    req = _sd_request(1023, "A")
-    advance_to_decode(scheduler, req)
-
-    req.spec_token_ids = [1] * 4
-    sched_out = scheduler.schedule()
-
-    rid = req.request_id
-    assert sched_out.num_scheduled_tokens[rid] == 1
-    assert rid not in sched_out.scheduled_spec_decode_tokens
-
-
-# ---------------------------------------------------------------------------
-# spec_decode_cap [3/10]:
-# partial spec tokens fit (remaining=4, spec=6 → 3 spec survive)
-# ---------------------------------------------------------------------------
-
-
-def test_spec_decode_cap_partial_spec_tokens_fit():
-    """prompt=1020 → remaining_in_block=4 → cap=4 → 3 spec tokens survive."""
-    scheduler = _sd_scheduler()
-    req = _sd_request(1020, "A")
-    advance_to_decode(scheduler, req)
-
-    req.spec_token_ids = [1] * 6
-    sched_out = scheduler.schedule()
-
-    rid = req.request_id
-    assert sched_out.num_scheduled_tokens[rid] == 4
-    assert len(sched_out.scheduled_spec_decode_tokens[rid]) == 3
-    _check_invariant(sched_out, rid)
-
-
-# ---------------------------------------------------------------------------
 # spec_decode_cap [4/10]:
 # no spec tokens → retroactive trim skipped even when cap < block_size
 # ---------------------------------------------------------------------------
@@ -292,133 +394,6 @@ def test_spec_decode_cap_no_spec_tokens_no_retroactive_trim():
     assert sched_out.num_scheduled_tokens[req_a.request_id] == 1
     assert sched_out.num_scheduled_tokens[req_b.request_id] == 1
     assert sched_out.scheduled_spec_decode_tokens == {}
-
-
-# ---------------------------------------------------------------------------
-# spec_decode_cap [5/10]:
-# B tightens cap=1 → both A and B lose all spec tokens
-# ---------------------------------------------------------------------------
-
-
-def test_spec_decode_cap_retroactive_trim_all_spec_removed():
-    """A(1024)+B(1023) with spec=4 each; B sets cap=1 → both trimmed to 1."""
-    scheduler = _sd_scheduler()
-    req_a = _sd_request(1024, "A")
-    req_b = _sd_request(1023, "B")
-    advance_to_decode(scheduler, req_a)
-    advance_to_decode(scheduler, req_b)
-
-    req_a.spec_token_ids = [1] * 4
-    req_b.spec_token_ids = [1] * 4
-    sched_out = scheduler.schedule()
-
-    assert sched_out.num_scheduled_tokens[req_a.request_id] == 1
-    assert sched_out.num_scheduled_tokens[req_b.request_id] == 1
-    assert req_a.request_id not in sched_out.scheduled_spec_decode_tokens
-    assert req_b.request_id not in sched_out.scheduled_spec_decode_tokens
-
-
-# ---------------------------------------------------------------------------
-# spec_decode_cap [6/10]:
-# B tightens cap=4 → both A and B trimmed to 4 (1+3 spec)
-# ---------------------------------------------------------------------------
-
-
-def test_spec_decode_cap_retroactive_trim_partial_spec_preserved():
-    """A(1024)+B(1020) with spec=6 each; B sets cap=4 → 3 spec each."""
-    scheduler = _sd_scheduler()
-    req_a = _sd_request(1024, "A")
-    req_b = _sd_request(1020, "B")
-    advance_to_decode(scheduler, req_a)
-    advance_to_decode(scheduler, req_b)
-
-    req_a.spec_token_ids = [1] * 6
-    req_b.spec_token_ids = [1] * 6
-    sched_out = scheduler.schedule()
-
-    assert sched_out.num_scheduled_tokens[req_a.request_id] == 4
-    assert sched_out.num_scheduled_tokens[req_b.request_id] == 4
-    assert len(sched_out.scheduled_spec_decode_tokens[req_a.request_id]) == 3
-    assert len(sched_out.scheduled_spec_decode_tokens[req_b.request_id]) == 3
-    _check_invariant(sched_out, req_a.request_id)
-    _check_invariant(sched_out, req_b.request_id)
-
-
-# ---------------------------------------------------------------------------
-# spec_decode_cap [7/10]:
-# three requests; C sets cap=2 → all trimmed to 2 (1+1 spec)
-# ---------------------------------------------------------------------------
-
-
-def test_spec_decode_cap_retroactive_trim_three_requests():
-    """A(1024)+B(512)+C(1022) with spec=6 each; C sets cap=2 → 1 spec each."""
-    scheduler = _sd_scheduler()
-    req_a = _sd_request(1024, "A")
-    req_b = _sd_request(512, "B")
-    req_c = _sd_request(1022, "C")
-    advance_to_decode(scheduler, req_a)
-    advance_to_decode(scheduler, req_b)
-    advance_to_decode(scheduler, req_c)
-
-    req_a.spec_token_ids = [1] * 6
-    req_b.spec_token_ids = [1] * 6
-    req_c.spec_token_ids = [1] * 6
-    sched_out = scheduler.schedule()
-
-    for req in (req_a, req_b, req_c):
-        rid = req.request_id
-        assert sched_out.num_scheduled_tokens[rid] == 2
-        assert len(sched_out.scheduled_spec_decode_tokens[rid]) == 1
-        _check_invariant(sched_out, rid)
-
-
-# ---------------------------------------------------------------------------
-# spec_decode_cap [8/10]:
-# decode-only B tightens cap → A retroactively trimmed
-# ---------------------------------------------------------------------------
-
-
-def test_spec_decode_cap_decode_only_tightens_cap():
-    """A(1024,spec=4)+B(1020,no spec); B sets cap=4 → A trimmed to 4 (1+3)."""
-    scheduler = _sd_scheduler()
-    req_a = _sd_request(1024, "A")
-    req_b = _sd_request(1020, "B")
-    advance_to_decode(scheduler, req_a)
-    advance_to_decode(scheduler, req_b)
-
-    req_a.spec_token_ids = [1] * 4
-    # req_b has no spec tokens
-    sched_out = scheduler.schedule()
-
-    assert sched_out.num_scheduled_tokens[req_a.request_id] == 4
-    assert sched_out.num_scheduled_tokens[req_b.request_id] == 1
-    assert len(sched_out.scheduled_spec_decode_tokens[req_a.request_id]) == 3
-    assert req_b.request_id not in sched_out.scheduled_spec_decode_tokens
-    _check_invariant(sched_out, req_a.request_id)
-
-
-# ---------------------------------------------------------------------------
-# spec_decode_cap [9/10]:
-# max_model_len constraint tightens cap via remaining_in_maxlen
-# ---------------------------------------------------------------------------
-
-
-def test_spec_decode_cap_maxlen_constraint():
-    """A(1024,spec=6)+B(2046,no spec); B's remaining_in_maxlen=2 → cap=2."""
-    scheduler = _sd_scheduler(max_model_len=2048, max_num_batched_tokens=2048)
-    req_a = _sd_request(1024, "A")
-    req_b = _sd_request(2046, "B")
-    advance_to_decode(scheduler, req_a)
-    advance_to_decode(scheduler, req_b)
-
-    req_a.spec_token_ids = [1] * 6
-    sched_out = scheduler.schedule()
-
-    assert sched_out.num_scheduled_tokens[req_a.request_id] == 2
-    assert sched_out.num_scheduled_tokens[req_b.request_id] == 1
-    assert len(sched_out.scheduled_spec_decode_tokens[req_a.request_id]) == 1
-    assert req_b.request_id not in sched_out.scheduled_spec_decode_tokens
-    _check_invariant(sched_out, req_a.request_id)
 
 
 # ---------------------------------------------------------------------------

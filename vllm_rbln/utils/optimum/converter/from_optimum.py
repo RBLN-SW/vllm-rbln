@@ -85,14 +85,6 @@ def sync_from_optimum(
         )
         vllm_config.scheduler_config.max_num_seqs = params.batch_size
 
-    # In case of encoder-decoder models,
-    # update max_num_seqs in encoder_scheduler_config as well
-    vllm_config.scheduler_config.max_num_batched_tokens = max(
-        vllm_config.model_config.max_model_len,
-        vllm_config.scheduler_config.max_num_seqs,
-    )
-    update_max_num_batched_tokens(vllm_config, params.max_seq_len)
-
     # Set max_model_len in model_config based on rbln_config.json
     if vllm_config.model_config.max_model_len != params.max_seq_len:
         logger.info(
@@ -104,12 +96,27 @@ def sync_from_optimum(
         )
         vllm_config.model_config.max_model_len = params.max_seq_len
 
+    # In case of encoder-decoder models,
+    # update max_num_seqs in encoder_scheduler_config as well
+    vllm_config.scheduler_config.max_num_batched_tokens = max(
+        vllm_config.model_config.max_model_len,
+        vllm_config.scheduler_config.max_num_seqs,
+    )
+    update_max_num_batched_tokens(vllm_config, params.max_seq_len)
+
     # Set block_size in cache_config based on rbln_config.json
-    update_block_size(vllm_config, params.kvcache_block_size, params.prefill_chunk_size)
+    # (also persists prefill_chunk_size / image-prefill buckets into
+    # additional_config).
+    update_block_size(
+        vllm_config,
+        params.kvcache_block_size,
+        params.prefill_chunk_size,
+        params.image_prefill_chunk_sizes,
+    )
     # Set num_blocks in cache_config based on rbln_config.json
     update_num_blocks(vllm_config, params.num_blocks)
     # Sync tensor_parallel_size in envs with optimum pre-compiled model
-    envs.VLLM_RBLN_TP_SIZE = params.tensor_parallel_size
+    envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK = params.tensor_parallel_size
 
 
 def update_num_blocks(vllm_config: VllmConfig, num_blocks: int) -> None:

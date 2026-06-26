@@ -1,10 +1,16 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-#
+
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-#
+
 #     http://www.apache.org/licenses/LICENSE-2.0
+
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Tests for vllm_rbln.v1.worker.utils module.
 
@@ -18,7 +24,7 @@ from unittest.mock import patch
 
 import pytest
 from vllm.platforms import CpuArchEnum
-from vllm.platforms.cpu import LogicalCPUInfo
+from vllm.utils.cpu_resource_utils import LogicalCPUInfo
 
 from vllm_rbln.v1.worker.utils import (
     estimate_available_memory,
@@ -118,7 +124,7 @@ class TestEstimateAvailableMemory:
     @patch("vllm_rbln.v1.worker.utils.envs")
     def test_atom_device_basic(self, mock_envs, mock_platform):
         mock_platform.get_device_name.return_value = "RBLN-CA12"
-        mock_envs.VLLM_RBLN_TP_SIZE = 1
+        mock_envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK = 1
 
         model_cfg = _make_model_config()
         parallel_cfg = _make_parallel_config(tp_size=1)
@@ -135,7 +141,7 @@ class TestEstimateAvailableMemory:
     @patch("vllm_rbln.v1.worker.utils.envs")
     def test_rebel_device_basic(self, mock_envs, mock_platform):
         mock_platform.get_device_name.return_value = "RBLN-CR100"
-        mock_envs.VLLM_RBLN_TP_SIZE = 1
+        mock_envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK = 1
 
         model_cfg = _make_model_config()
         parallel_cfg = _make_parallel_config(tp_size=1)
@@ -152,7 +158,7 @@ class TestEstimateAvailableMemory:
     @patch("vllm_rbln.v1.worker.utils.envs")
     def test_unknown_device_raises(self, mock_envs, mock_platform):
         mock_platform.get_device_name.return_value = "RBLN-XX99"
-        mock_envs.VLLM_RBLN_TP_SIZE = 1
+        mock_envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK = 1
 
         model_cfg = _make_model_config()
         parallel_cfg = _make_parallel_config()
@@ -168,7 +174,7 @@ class TestEstimateAvailableMemory:
     @patch("vllm_rbln.v1.worker.utils.envs")
     def test_both_params_and_kernel_raises(self, mock_envs, mock_platform):
         mock_platform.get_device_name.return_value = "RBLN-CA12"
-        mock_envs.VLLM_RBLN_TP_SIZE = 1
+        mock_envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK = 1
 
         model_cfg = _make_model_config()
         parallel_cfg = _make_parallel_config()
@@ -186,7 +192,7 @@ class TestEstimateAvailableMemory:
     def test_estimated_kernel_size_from_params(self, mock_envs, mock_platform):
         """When kernel_size is None, it should be estimated from n_model_params."""
         mock_platform.get_device_name.return_value = "RBLN-CA12"
-        mock_envs.VLLM_RBLN_TP_SIZE = 1
+        mock_envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK = 1
 
         model_cfg = _make_model_config()
         parallel_cfg = _make_parallel_config()
@@ -203,7 +209,7 @@ class TestEstimateAvailableMemory:
     @patch("vllm_rbln.v1.worker.utils.envs")
     def test_estimated_kernel_size_from_bytes(self, mock_envs, mock_platform):
         mock_platform.get_device_name.return_value = "RBLN-CA12"
-        mock_envs.VLLM_RBLN_TP_SIZE = 1
+        mock_envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK = 1
 
         model_cfg = _make_model_config(num_layers=2, vocab_size=64, hidden_size=32)
         parallel_cfg = _make_parallel_config(tp_size=1)
@@ -220,7 +226,7 @@ class TestEstimateAvailableMemory:
     def test_no_params_no_kernel_raises(self, mock_envs, mock_platform):
         """If neither kernel_size nor n_model_params given, should raise."""
         mock_platform.get_device_name.return_value = "RBLN-CA12"
-        mock_envs.VLLM_RBLN_TP_SIZE = 1
+        mock_envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK = 1
 
         model_cfg = _make_model_config()
         parallel_cfg = _make_parallel_config()
@@ -232,7 +238,7 @@ class TestEstimateAvailableMemory:
     @patch("vllm_rbln.v1.worker.utils.envs")
     def test_n_model_params_requires_nbits(self, mock_envs, mock_platform):
         mock_platform.get_device_name.return_value = "RBLN-CA12"
-        mock_envs.VLLM_RBLN_TP_SIZE = 1
+        mock_envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK = 1
 
         model_cfg = _make_model_config()
         parallel_cfg = _make_parallel_config()
@@ -249,7 +255,7 @@ class TestEstimateAvailableMemory:
     def test_oom_raises_memory_error(self, mock_envs, mock_platform):
         """Huge kernel_size should exhaust available memory."""
         mock_platform.get_device_name.return_value = "RBLN-CA12"
-        mock_envs.VLLM_RBLN_TP_SIZE = 1
+        mock_envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK = 1
 
         model_cfg = _make_model_config()
         parallel_cfg = _make_parallel_config()
@@ -270,14 +276,14 @@ class TestEstimateAvailableMemory:
         model_cfg = _make_model_config()
         kernel = 1 * 2**30
 
-        mock_envs.VLLM_RBLN_TP_SIZE = 1
+        mock_envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK = 1
         mem_tp1 = estimate_available_memory(
             model_cfg,
             _make_parallel_config(tp_size=1),
             kernel_size=kernel,
         )
 
-        mock_envs.VLLM_RBLN_TP_SIZE = 4
+        mock_envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK = 4
         mem_tp4 = estimate_available_memory(
             model_cfg,
             _make_parallel_config(tp_size=4),
@@ -291,7 +297,7 @@ class TestEstimateAvailableMemory:
     def test_rebel_requires_tp1(self, mock_envs, mock_platform):
         """REBEL (CR) device asserts tp_size==1."""
         mock_platform.get_device_name.return_value = "RBLN-CR100"
-        mock_envs.VLLM_RBLN_TP_SIZE = 2
+        mock_envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK = 2
 
         model_cfg = _make_model_config()
         parallel_cfg = _make_parallel_config(tp_size=1)
@@ -308,7 +314,7 @@ class TestEstimateAvailableMemory:
     def test_gpu_memory_utilization_effect(self, mock_envs, mock_platform):
         """Lower utilization should give less available memory."""
         mock_platform.get_device_name.return_value = "RBLN-CA12"
-        mock_envs.VLLM_RBLN_TP_SIZE = 1
+        mock_envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK = 1
 
         model_cfg = _make_model_config()
         parallel_cfg = _make_parallel_config()
@@ -333,7 +339,7 @@ class TestEstimateAvailableMemory:
     def test_custom_buffer(self, mock_envs, mock_platform):
         """Explicit buffer should reduce available memory compared to default."""
         mock_platform.get_device_name.return_value = "RBLN-CA12"
-        mock_envs.VLLM_RBLN_TP_SIZE = 1
+        mock_envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK = 1
 
         model_cfg = _make_model_config()
         parallel_cfg = _make_parallel_config()
@@ -357,7 +363,7 @@ class TestEstimateAvailableMemory:
     def test_rsd_replicas_for_large_kv_heads(self, mock_envs, mock_platform):
         """When kv_heads < rsd_size, rsd_replicas > 1 reduces memory."""
         mock_platform.get_device_name.return_value = "RBLN-CA12"
-        mock_envs.VLLM_RBLN_TP_SIZE = 4  # rsd_size = 4
+        mock_envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK = 4  # rsd_size = 4
 
         # num_kv_heads=2, rsd_size=4 → rsd_replicas = 4//2 = 2
         model_cfg_few_heads = _make_model_config(num_kv_heads=2)
@@ -400,10 +406,12 @@ class TestGetAutobindCpuIds:
             _make_cpu(7, 3, 1),  # NUMA 1, core 3
         ]
 
-    @patch("vllm_rbln.v1.worker.utils.CpuPlatform")
-    def test_basic_single_rank(self, mock_cpu_platform):
+    @patch("vllm_rbln.v1.worker.utils.get_allowed_cpu_list")
+    @patch("vllm_rbln.v1.worker.utils.get_visible_memory_node")
+    def test_basic_single_rank(self, mock_nodes, mock_cpus):
         cpus = self._simple_cpu_list()
-        mock_cpu_platform.get_allowed_cpu_core_node_list.return_value = ([0, 1], cpus)
+        mock_nodes.return_value = [0, 1]
+        mock_cpus.return_value = cpus
 
         parallel_cfg = _make_parallel_config(tp_size=1)
         result = get_autobind_cpu_ids(
@@ -419,10 +427,12 @@ class TestGetAutobindCpuIds:
             any(c.id == cid and c.numa_node == 0 for c in cpus) for cid in cpu_ids
         )
 
-    @patch("vllm_rbln.v1.worker.utils.CpuPlatform")
-    def test_rank_round_robins_numa_nodes(self, mock_cpu_platform):
+    @patch("vllm_rbln.v1.worker.utils.get_allowed_cpu_list")
+    @patch("vllm_rbln.v1.worker.utils.get_visible_memory_node")
+    def test_rank_round_robins_numa_nodes(self, mock_nodes, mock_cpus):
         cpus = self._simple_cpu_list()
-        mock_cpu_platform.get_allowed_cpu_core_node_list.return_value = ([0, 1], cpus)
+        mock_nodes.return_value = [0, 1]
+        mock_cpus.return_value = cpus
         parallel_cfg = _make_parallel_config(tp_size=2)
 
         r0 = get_autobind_cpu_ids(0, 0, parallel_cfg, lambda cpus: cpus)
@@ -433,20 +443,24 @@ class TestGetAutobindCpuIds:
         r1_ids = set(int(x) for x in r1.split(","))
         assert r0_ids.isdisjoint(r1_ids), "Ranks should not share CPUs"
 
-    @patch("vllm_rbln.v1.worker.utils.CpuPlatform")
-    def test_no_available_numa_returns_all(self, mock_cpu_platform):
+    @patch("vllm_rbln.v1.worker.utils.get_allowed_cpu_list")
+    @patch("vllm_rbln.v1.worker.utils.get_visible_memory_node")
+    def test_no_available_numa_returns_all(self, mock_nodes, mock_cpus):
         """If allowed NUMA nodes don't have CPUs, return 'all'."""
-        mock_cpu_platform.get_allowed_cpu_core_node_list.return_value = ([], [])
+        mock_nodes.return_value = []
+        mock_cpus.return_value = []
 
         parallel_cfg = _make_parallel_config()
         result = get_autobind_cpu_ids(0, 0, parallel_cfg, lambda cpus: cpus)
         assert result == "all"
 
-    @patch("vllm_rbln.v1.worker.utils.CpuPlatform")
-    def test_cpu_selector_filters_threads(self, mock_cpu_platform):
+    @patch("vllm_rbln.v1.worker.utils.get_allowed_cpu_list")
+    @patch("vllm_rbln.v1.worker.utils.get_visible_memory_node")
+    def test_cpu_selector_filters_threads(self, mock_nodes, mock_cpus):
         """cpu_selector=lambda cpus: cpus[:1] should pick one thread per core."""
         cpus = self._simple_cpu_list()
-        mock_cpu_platform.get_allowed_cpu_core_node_list.return_value = ([0, 1], cpus)
+        mock_nodes.return_value = [0, 1]
+        mock_cpus.return_value = cpus
 
         parallel_cfg = _make_parallel_config(tp_size=1)
         result = get_autobind_cpu_ids(
@@ -459,12 +473,14 @@ class TestGetAutobindCpuIds:
         # NUMA 0 has 2 cores, should get 2 CPUs (one per core)
         assert len(cpu_ids) == 2
 
-    @patch("vllm_rbln.v1.worker.utils.CpuPlatform")
-    def test_multiple_ranks_same_numa_exclusive_allocation(self, mock_cpu_platform):
+    @patch("vllm_rbln.v1.worker.utils.get_allowed_cpu_list")
+    @patch("vllm_rbln.v1.worker.utils.get_visible_memory_node")
+    def test_multiple_ranks_same_numa_exclusive_allocation(self, mock_nodes, mock_cpus):
         """When 2 ranks map to the same NUMA node, CPUs are split."""
         # Single NUMA node with 4 cores, 1 thread each
         cpus = [_make_cpu(i, i, 0) for i in range(4)]
-        mock_cpu_platform.get_allowed_cpu_core_node_list.return_value = ([0], cpus)
+        mock_nodes.return_value = [0]
+        mock_cpus.return_value = cpus
 
         parallel_cfg = _make_parallel_config(tp_size=2)
 
@@ -476,11 +492,13 @@ class TestGetAutobindCpuIds:
         assert r0_ids.isdisjoint(r1_ids)
         assert len(r0_ids) + len(r1_ids) == 4
 
-    @patch("vllm_rbln.v1.worker.utils.CpuPlatform")
-    def test_uneven_cpu_split(self, mock_cpu_platform):
+    @patch("vllm_rbln.v1.worker.utils.get_allowed_cpu_list")
+    @patch("vllm_rbln.v1.worker.utils.get_visible_memory_node")
+    def test_uneven_cpu_split(self, mock_nodes, mock_cpus):
         """3 CPUs split between 2 ranks: one gets 2, other gets 1."""
         cpus = [_make_cpu(i, i, 0) for i in range(3)]
-        mock_cpu_platform.get_allowed_cpu_core_node_list.return_value = ([0], cpus)
+        mock_nodes.return_value = [0]
+        mock_cpus.return_value = cpus
 
         parallel_cfg = _make_parallel_config(tp_size=2)
 
@@ -491,11 +509,13 @@ class TestGetAutobindCpuIds:
         r1_count = len(r1.split(","))
         assert {r0_count, r1_count} == {1, 2}
 
-    @patch("vllm_rbln.v1.worker.utils.CpuPlatform")
-    def test_dp_rank_affects_binding(self, mock_cpu_platform):
+    @patch("vllm_rbln.v1.worker.utils.get_allowed_cpu_list")
+    @patch("vllm_rbln.v1.worker.utils.get_visible_memory_node")
+    def test_dp_rank_affects_binding(self, mock_nodes, mock_cpus):
         """Data parallelism changes rank_across_dp calculation."""
         cpus = [_make_cpu(i, i, 0) for i in range(8)]
-        mock_cpu_platform.get_allowed_cpu_core_node_list.return_value = ([0], cpus)
+        mock_nodes.return_value = [0]
+        mock_cpus.return_value = cpus
 
         dp_cfg = SimpleNamespace(
             tensor_parallel_size=1,
@@ -511,11 +531,13 @@ class TestGetAutobindCpuIds:
         # With single NUMA node, both ranks share, so rank 1 gets second half
         assert len(cpu_ids) == 4
 
-    @patch("vllm_rbln.v1.worker.utils.CpuPlatform")
-    def test_empty_allocation_returns_all(self, mock_cpu_platform):
+    @patch("vllm_rbln.v1.worker.utils.get_allowed_cpu_list")
+    @patch("vllm_rbln.v1.worker.utils.get_visible_memory_node")
+    def test_empty_allocation_returns_all(self, mock_nodes, mock_cpus):
         """If cpu_selector returns empty lists, should fallback to 'all'."""
         cpus = [_make_cpu(0, 0, 0)]
-        mock_cpu_platform.get_allowed_cpu_core_node_list.return_value = ([0], cpus)
+        mock_nodes.return_value = [0]
+        mock_cpus.return_value = cpus
 
         # 2 ranks but only 1 CPU in the only NUMA node
         parallel_cfg = _make_parallel_config(tp_size=2)

@@ -15,16 +15,24 @@
 
 
 def get_language_model_config(
-    batch_size: int, max_model_len: int, block_size: int, tp_size: int
+    batch_size: int,
+    max_model_len: int,
+    block_size: int,
+    num_devices: int,
+    prefill_chunk_size: int | None = None,
 ) -> dict:
     param: dict = {
         "use_inputs_embeds": True,
         "batch_size": batch_size,
         "max_seq_len": max_model_len,
-        "tensor_parallel_size": tp_size,
+        "num_devices": num_devices,
     }
     if block_size != max_model_len:
         attn_impl = "flash_attn" if block_size != max_model_len else "eager"
         param["attn_impl"] = attn_impl
         param["kvcache_partition_len"] = block_size
+    # Pin prefill_chunk_size so the compiled model stays in sync with the value
+    # used for KV-cache block padding.
+    if prefill_chunk_size is not None:
+        param["prefill_chunk_size"] = prefill_chunk_size
     return param

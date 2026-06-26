@@ -22,7 +22,6 @@ import torch
 import torch.distributed
 import torch.nn as nn
 from vllm.config import VllmConfig, set_current_vllm_config
-from vllm.distributed.ec_transfer import get_ec_transfer
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.model_executor.models.interfaces import (
     supports_transcription,
@@ -76,7 +75,10 @@ from vllm_rbln.model_executor.model_loader.rbln_model_loader import get_optimum_
 from vllm_rbln.model_executor.models.optimum import ModelInputForRBLN
 from vllm_rbln.utils.optimum.bucket import select_bucket_size
 from vllm_rbln.utils.optimum.predicates import is_qwen3_pooling
-from vllm_rbln.utils.optimum.registry import get_rbln_model_info
+from vllm_rbln.utils.optimum.registry import (
+    get_rbln_model_info,
+    validate_arch_supported,
+)
 from vllm_rbln.v1.core.optimum_scheduler import RBLNSchedulerOutput
 from vllm_rbln.v1.sample import WARM_UP_CONFIGS, RBLNSampler
 from vllm_rbln.v1.worker.ec_disagg_helpers import ECDisaggHelpersMixin
@@ -101,6 +103,7 @@ class ExecuteModelState(NamedTuple):
     hidden_states: torch.Tensor
     sample_hidden_states: torch.Tensor
     is_prompt: bool
+    ec_connector_output: "ECConnectorOutput | None" = None
 
 
 class RBLNOptimumModelRunner(
@@ -109,12 +112,12 @@ class RBLNOptimumModelRunner(
     input_batch: RBLNInputBatch
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
-        # FIXME: For RBLN support Enc-only model which based on enc-dec config.
-        # When using an encoder-only model (such as T5EncoderModel)
-        # with a config designed for enc-dec architectures,
-        # it’s important to set the is_encoder_decoder flag to False.
-        # This prevents the scheduler from applying text generation settings.
+        # Validate against upstream vLLM's registry BEFORE the Qwen3 arch remap
+        # below — the remapped name (Qwen3Model) is not in upstream vLLM, but the
+        # original HF arch (Qwen3ForCausalLM) is.
+        validate_arch_supported(vllm_config.model_config)
         _, model_cls_name = get_rbln_model_info(vllm_config.model_config)
+
         if is_qwen3_pooling(vllm_config.model_config):
             # NOTE The architecture of Qwen3-Embedding model in huggingface
             # is `Qwen3ForCausalLM`. But it have to be mapped to `Qwen3Model`
@@ -177,7 +180,6 @@ class RBLNOptimumModelRunner(
             self.pooled_tensors: dict[int, torch.Tensor] = {}
             sampler = RBLNSampler(
                 logprobs_mode=self.model_config.logprobs_mode,
-                seed=self.vllm_config.model_config.seed,
             )
         else:
             logger.info("Using default vLLM sampler.")
@@ -216,7 +218,7 @@ class RBLNOptimumModelRunner(
                 self.is_pooling_model,
                 self.vllm_config.model_config.logits_processors,
             ),
-            is_spec_decode=False,  # No spec decode in optimum model runner
+            num_spec_tokens=0,  # No spec decode in optimum model runner
             is_pooling_model=self.is_pooling_model,
             use_rbln_sampler=self.use_rbln_sampler,
         )
@@ -335,68 +337,61 @@ class RBLNOptimumModelRunner(
                         self._run_encoder_and_save(model_input, scheduler_output)
                 return self._make_producer_output(scheduler_output)
 
-            # EC Consumer: initiate encoder cache loading.
-            # - Prefill steps: block until the cache is ready (needed
-            #   for _run_decoder_with_cached_encoder).
-            # - Decode-only steps: non-blocking — pulls continue in
-            #   background while decode batch runs unblocked.
-            if self.is_ec_consumer:
-                ec = get_ec_transfer()
-                if scheduler_output.ec_connector_metadata is not None:
-                    ec.bind_connector_metadata(scheduler_output.ec_connector_metadata)
-                    has_new_prefill = len(scheduler_output.scheduled_new_reqs) > 0
-                    ec.start_load_caches(self.encoder_cache, blocking=has_new_prefill)
-
             # Prepare the decoder inputs.
             model_input, num_scheduled_tokens_np = self._prepare_inputs(
                 scheduler_output
             )
 
-        with record_function_or_nullcontext("rbln_model_runner: forward"):
-            if hasattr(rebel, "capture_reports"):
-                capture_ctx = rebel.capture_reports()
-            else:
-                # use a dummy context manager that does nothing
-                capture_ctx = contextlib.nullcontext()
-            model_start_time = time.perf_counter()
-            # EC consumer with cached encoder output: run the decoder
-            # with pre-computed embeddings instead of the full model
-            # forward (which would require the vision encoder runtime).
+        has_new_prefill = len(scheduler_output.scheduled_new_reqs) > 0
+        with self.maybe_get_ec_connector_output(
+            scheduler_output,
+            encoder_cache=self.encoder_cache,
+            blocking=has_new_prefill,
+        ) as ec_connector_output:
+            with record_function_or_nullcontext("rbln_model_runner: forward"):
+                if hasattr(rebel, "capture_reports"):
+                    capture_ctx = rebel.capture_reports()
+                else:
+                    # use a dummy context manager that does nothing
+                    capture_ctx = contextlib.nullcontext()
+                model_start_time = time.perf_counter()
+                # EC consumer with cached encoder output: run the decoder
+                # with pre-computed embeddings instead of the full model
+                # forward (which would require the vision encoder runtime).
 
-            new_reqs = scheduler_output.scheduled_new_reqs
-            prefill_has_mm = bool(new_reqs) and bool(new_reqs[0].mm_features)
-            if self.is_ec_consumer and model_input.is_prompt and prefill_has_mm:
-                with capture_ctx as model_reports:
-                    hidden_states = self._run_decoder_with_cached_encoder(
-                        model_input, scheduler_output
+                new_reqs = scheduler_output.scheduled_new_reqs
+                prefill_has_mm = bool(new_reqs) and bool(new_reqs[0].mm_features)
+                if self.is_ec_consumer and model_input.is_prompt and prefill_has_mm:
+                    with capture_ctx as model_reports:
+                        hidden_states = self._run_decoder_with_cached_encoder(
+                            model_input, scheduler_output
+                        )
+                else:
+                    with capture_ctx as model_reports:
+                        hidden_states = self.model(model_input)
+                if (
+                    envs.VLLM_RBLN_METRICS
+                    and self.model_performance_tracker is not None
+                ):
+                    collect_metrics(
+                        self.model_performance_tracker,
+                        model_input.is_prompt,
+                        start_time=model_start_time,
+                        end_time=time.perf_counter(),
+                        reports=model_reports,
+                        token_count=0,
+                        # the performance of sampler doesn't depend on token count
                     )
-            else:
-                with capture_ctx as model_reports:
-                    hidden_states = self.model(model_input)
-            if envs.VLLM_RBLN_METRICS and self.model_performance_tracker is not None:
-                collect_metrics(
-                    self.model_performance_tracker,
-                    model_input.is_prompt,
-                    start_time=model_start_time,
-                    end_time=time.perf_counter(),
-                    reports=model_reports,
-                    token_count=0,
-                    # the performance of sampler doesn't depend on token count
-                )
-            sample_hidden_states = hidden_states.clone()
+                sample_hidden_states = hidden_states.clone()
 
-        with record_function_or_nullcontext("rbln_model_runner: postprocess"):
-            if self.is_pooling_model:
-                return self._pool(
-                    hidden_states, num_scheduled_tokens, num_scheduled_tokens_np
-                )
-            # [batch_size, 1, vocab_size] -> [batch_size, vocab_size]
-            hidden_states = hidden_states.squeeze(1)
-            logits = self.model.compute_logits(hidden_states, None)
-        # EC Consumer cleanup: poll finished transfers and clear metadata.
-        if self.is_ec_consumer:
-            ec.get_finished(scheduler_output.finished_req_ids)
-            ec.clear_connector_metadata()
+            with record_function_or_nullcontext("rbln_model_runner: postprocess"):
+                if self.is_pooling_model:
+                    return self._pool(
+                        hidden_states, num_scheduled_tokens, num_scheduled_tokens_np
+                    )
+                # [batch_size, 1, vocab_size] -> [batch_size, vocab_size]
+                hidden_states = hidden_states.squeeze(1)
+                logits = self.model.compute_logits(hidden_states, None)
 
         self.execute_model_state = ExecuteModelState(
             scheduler_output=scheduler_output,
@@ -404,6 +399,7 @@ class RBLNOptimumModelRunner(
             hidden_states=hidden_states,
             sample_hidden_states=sample_hidden_states,
             is_prompt=model_input.is_prompt,
+            ec_connector_output=ec_connector_output,
         )
         return None
 
@@ -1334,6 +1330,7 @@ class RBLNOptimumModelRunner(
             hidden_states,
             sample_hidden_states,
             is_prompt,
+            ec_connector_output,
         ) = self.execute_model_state
         use_padding = self.use_rbln_sampler and self.input_batch.num_reqs > 1
         # Clear ephemeral state.
@@ -1398,14 +1395,6 @@ class RBLNOptimumModelRunner(
                 spec_decode_metadata=None,
             )
 
-        ec_connector_output = self.get_finished_ec_transfers(scheduler_output)
-        ec_out = None
-        if ec_connector_output != (None, None):
-            ec_out = ECConnectorOutput(
-                finished_sending=ec_connector_output[0],
-                finished_recving=ec_connector_output[1],
-            )
-
         with record_function_or_nullcontext("rbln_model_runner: ModelRunnerOutput"):
             output = ModelRunnerOutput(
                 req_ids=req_ids_output_copy,
@@ -1415,7 +1404,9 @@ class RBLNOptimumModelRunner(
                 prompt_logprobs_dict=prompt_logprobs_dict,
                 pooler_output=[],
                 # kv_connector_output=kv_connector_output,
-                ec_connector_output=ec_out if self.supports_mm_inputs else None,
+                ec_connector_output=(
+                    ec_connector_output if self.supports_mm_inputs else None
+                ),
                 num_nans_in_logits=num_nans_in_logits,
             )
         # FIXME: enable async scheduling
@@ -1446,7 +1437,6 @@ class RBLNOptimumModelRunner(
         if not num_prompt_logprobs_dict:
             return {}
 
-        in_progress_dict = self.input_batch.in_progress_prompt_logprobs_cpu
         prompt_logprobs_dict: dict[str, LogprobsTensors | None] = {}
 
         # Since prompt logprobs are a rare feature, prioritize simple,
@@ -1470,14 +1460,14 @@ class RBLNOptimumModelRunner(
             )
 
             # Set up target LogprobsTensors object.
-            logprobs_tensors = in_progress_dict.get(req_id)
-            if not logprobs_tensors:
+            logprobs_tensors = request.in_progress_prompt_logprobs_cpu
+            if logprobs_tensors is None:
                 # Create empty logprobs CPU tensors for the entire prompt.
                 # If chunked, we'll copy in slice by slice.
                 logprobs_tensors = LogprobsTensors.empty_cpu(
                     num_prompt_tokens - 1, num_prompt_logprobs + 1
                 )
-                in_progress_dict[req_id] = logprobs_tensors
+                request.in_progress_prompt_logprobs_cpu = logprobs_tensors
 
             # Determine number of logits to retrieve.
             start_idx = request.num_computed_tokens
@@ -1534,7 +1524,7 @@ class RBLNOptimumModelRunner(
         # num_prompt_logprobs_dict.
         for req_id in completed_prefill_reqs:
             del num_prompt_logprobs_dict[req_id]
-            del in_progress_dict[req_id]
+            self.requests[req_id].in_progress_prompt_logprobs_cpu = None
 
         # Must synchronize the non-blocking GPU->CPU transfers.
         # if prompt_logprobs_dict:
