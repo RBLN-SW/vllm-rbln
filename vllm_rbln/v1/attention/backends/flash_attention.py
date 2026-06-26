@@ -119,6 +119,26 @@ class RBLNFlashAttentionMetadata:
     local_block_tables: torch.Tensor | None = None
     swa_attn_masks: torch.Tensor | None = None
 
+    def __post_init__(self):
+        # FIXME(RBLN): to_dynamic_index does not accept int64 inputs.Thus in the
+        # VLLM_RBLN_USE_CUSTOM_KERNEL=0 path, rebel-compiler automatically converts
+        # integer tensor inputs to a supported dtype.
+        # However, this preprocessing is somewhat missing in the triton-rbln kernel
+        # path(VLLM_RBLN_USE_CUSTOM_KERNEL=1), so we explicitly cast the input to a
+        # supported dtype here. This can be removed when the triton-rbln kernel path
+        # performs the same dtype conversion.
+
+        if not envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
+            return
+
+        self.seq_lens = self.seq_lens.to(torch.int32)
+        self.cache_seq_lens = (
+            self.cache_seq_lens.to(torch.int32) if self.cache_seq_lens else None
+        )
+        self.cache_offsets = (
+            self.cache_offsets.to(torch.int32) if self.cache_offsets else None
+        )
+
 
 class RBLNFlashAttentionMetadataBuilder(
     AttentionMetadataBuilder[RBLNFlashAttentionMetadata]
@@ -173,10 +193,7 @@ class RBLNFlashAttentionMetadataBuilder(
 
         cs = seq_idx.repeat(1, num_partition)
         pidx = torch.arange(num_partition, dtype=torch.int32)
-        # NOTE(RBLN): seq_lens tensor dtype SHOULD be int16
-        seq_lens_tensor = torch.clamp(cs - pidx * partition_len, 0, partition_len).to(
-            torch.int16
-        )
+        seq_lens_tensor = torch.clamp(cs - pidx * partition_len, 0, partition_len)
 
         attn_masks = None
         if is_prefill:
