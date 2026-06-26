@@ -45,7 +45,7 @@ class RBLNKVCacheManager(KVCacheManager):
         max_num_seqs: int = 1,
         is_encoder_decoder: bool = False,
         prefill_chunk_size: int | None = None,
-        image_prefill_chunk_sizes: list[int] | None = None,
+        image_prefill_chunk_size: list[int] | None = None,
         needs_chunked_prefill_pad: bool = False,
     ) -> None:
         """
@@ -97,7 +97,7 @@ class RBLNKVCacheManager(KVCacheManager):
         self.prefill_chunk_size = prefill_chunk_size
         # gemma3: single image bucket; gemma4: descending list of buckets.
         # Used to size the per-image chunk in `_chunked_prefill_pad`.
-        self.image_prefill_chunk_sizes = image_prefill_chunk_sizes
+        self.image_prefill_chunk_size = image_prefill_chunk_size
         self.attn_block_size = attn_block_size
         if needs_chunked_prefill_pad:
             assert prefill_chunk_size is not None, (
@@ -163,10 +163,10 @@ class RBLNKVCacheManager(KVCacheManager):
         return segments
 
     def _image_chunk_size(self, run_len: int) -> int:
-        buckets = self.image_prefill_chunk_sizes
+        buckets = self.image_prefill_chunk_size
         if not buckets:
             assert self.prefill_chunk_size is not None, (
-                "prefill_chunk_size must be set when image_prefill_chunk_sizes is empty"
+                "prefill_chunk_size must be set when image_prefill_chunk_size is empty"
             )
             return self.prefill_chunk_size
         # buckets is descending, so `reversed` is ascending: the first bucket

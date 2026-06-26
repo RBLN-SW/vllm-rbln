@@ -88,7 +88,7 @@ class RBLNParams:
     prefill_chunk_size: int = 128
     # Image-prefill buckets for multimodal models (gemma3: single value;
     # gemma4: descending list of 128-multiples). None for non-multimodal models.
-    image_prefill_chunk_sizes: list[int] | None = None
+    image_prefill_chunk_size: list[int] | None = None
     tensor_parallel_size: int = 1
 
     @classmethod
@@ -188,9 +188,9 @@ class RBLNParams:
         prefill_chunk_size = _cfg_get(lm_cfg, "prefill_chunk_size")
         if prefill_chunk_size is None:
             prefill_chunk_size = _cfg_get(cfg, "prefill_chunk_size", 128)
-        image_prefill_chunk_sizes = _resolve_image_prefill_chunk_sizes(lm_cfg)
-        if image_prefill_chunk_sizes is None:
-            image_prefill_chunk_sizes = _resolve_image_prefill_chunk_sizes(cfg)
+        image_prefill_chunk_size = _resolve_image_prefill_chunk_size(lm_cfg)
+        if image_prefill_chunk_size is None:
+            image_prefill_chunk_size = _resolve_image_prefill_chunk_size(cfg)
 
         return cls(
             num_blocks=num_blocks,
@@ -198,32 +198,25 @@ class RBLNParams:
             max_seq_len=max_seq_len,
             kvcache_block_size=kvcache_block_size,
             prefill_chunk_size=prefill_chunk_size,
-            image_prefill_chunk_sizes=image_prefill_chunk_sizes,
+            image_prefill_chunk_size=image_prefill_chunk_size,
         )
 
 
-def _resolve_image_prefill_chunk_sizes(cfg: RblnConfigLike) -> list[int] | None:
+def _resolve_image_prefill_chunk_size(cfg: RblnConfigLike) -> list[int] | None:
     """Resolve image-prefill buckets exactly as optimum-rbln persists them.
 
-    gemma4 stores ``image_prefill_chunk_sizes`` as a ``list[int]``; gemma3 stores
-    the scalar ``image_prefill_chunk_size`` as an ``int``. Any other type is a
-    config error. Returns ``None`` when neither key is present.
+    Both gemma3 and gemma4 store ``image_prefill_chunk_size`` as a ``list[int]``
+    (gemma3: single-element list; gemma4: descending multi-bucket list). Any
+    other type is a config error. Returns ``None`` when the key is absent.
     """
-    sizes = _cfg_get(cfg, "image_prefill_chunk_sizes")
+    sizes = _cfg_get(cfg, "image_prefill_chunk_size")
     if sizes is not None:
         if not isinstance(sizes, list):
             raise TypeError(
-                "image_prefill_chunk_sizes must be a list[int], got "
+                "image_prefill_chunk_size must be a list[int], got "
                 f"{type(sizes).__name__}"
             )
         return sizes
-    size = _cfg_get(cfg, "image_prefill_chunk_size")
-    if size is not None:
-        if not isinstance(size, int):
-            raise TypeError(
-                f"image_prefill_chunk_size must be an int, got {type(size).__name__}"
-            )
-        return [size]
     return None
 
 
