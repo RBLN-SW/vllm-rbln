@@ -104,6 +104,8 @@ from vllm_rbln.v1.attention.kv_cache_bindings import (
     build_kv_cache_forward_context_kwargs,
     validate_shared_attention_kv_cache_contiguity,
 )
+from vllm_rbln.v1.core.rbln_scheduler import RBLNSchedulerOutput
+from vllm_rbln.v1.core.rbln_kv_cache_manager import KVCacheCopyOp
 from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
@@ -111,9 +113,6 @@ from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
 from vllm_rbln.v1.worker.input_stager import InputLayout, InputStager, StagedModelInputs
 from vllm_rbln.v1.worker.metrics_v2 import PerformanceContext, ProfileSection
 from vllm_rbln.v1.worker.utils import prepare_kernel_block_sizes
-
-if TYPE_CHECKING:
-    from vllm.v1.core.sched.output import SchedulerOutput
 
 logger = init_logger(__name__)
 
@@ -168,7 +167,7 @@ class ExecuteModelState(NamedTuple):
     """Ephemeral cached state transferred between execute_model() and
     sample_tokens(), after execute_model() returns None."""
 
-    scheduler_output: "SchedulerOutput"
+    scheduler_output: RBLNSchedulerOutput
     logits: torch.Tensor
     spec_decode_metadata: SpecDecodeMetadata | None
     spec_decode_common_attn_metadata: CommonAttentionMetadata | None
@@ -448,7 +447,7 @@ class RBLNModelRunner:
         model_kwargs["token_type_ids"] = token_type_ids_cpu
         return model_kwargs
 
-    def _may_reorder_batch(self, scheduler_output: "SchedulerOutput") -> None:
+    def _may_reorder_batch(self, scheduler_output: RBLNSchedulerOutput) -> None:
         # NOTE(RBLN): Unlike upstream GPUModelRunner, we do not split mixed batches
         # into decode / extend / prefill regions here. The RBLN execution path assumes
         # a homogeneous batch phase and therefore does not use scheduler_output-based
@@ -481,7 +480,7 @@ class RBLNModelRunner:
                 src_to_dst[dst] = dst
                 dst = next_dst
 
-    def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
+    def _update_states(self, scheduler_output: RBLNSchedulerOutput) -> None:
         """Update the cached states and the persistent batch with the scheduler
         output."""
         # Remove finished requests from the cached states.
@@ -702,7 +701,7 @@ class RBLNModelRunner:
 
     def _prepare_inputs(
         self,
-        scheduler_output: "SchedulerOutput",
+        scheduler_output: RBLNSchedulerOutput,
         num_scheduled_tokens: np.ndarray,
     ) -> tuple[torch.Tensor, SpecDecodeMetadata | None, np.ndarray, int]:
         assert scheduler_output.total_num_scheduled_tokens > 0
@@ -1182,7 +1181,7 @@ class RBLNModelRunner:
 
     def _bookkeeping_sync(
         self,
-        scheduler_output: "SchedulerOutput",
+        scheduler_output: RBLNSchedulerOutput,
         sampler_output: SamplerOutput,
         logits: torch.Tensor | None,
         hidden_states: torch.Tensor,
@@ -1289,7 +1288,7 @@ class RBLNModelRunner:
     @torch.inference_mode()
     def execute_model(
         self,
-        scheduler_output: "SchedulerOutput",
+        scheduler_output: RBLNSchedulerOutput,
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         if self.execute_model_state is not None:
@@ -1303,6 +1302,11 @@ class RBLNModelRunner:
         with record_function_or_nullcontext("rbln_model_runner: preprocess"):
             # Update persistent batch states.
             self._update_states(scheduler_output)
+
+            # Process sub-block KV cache copy operations before the forward
+            # pass so that partially cached blocks are populated.
+            if scheduler_output.kv_cache_copy_ops:
+                self._process_kv_cache_copy_ops(scheduler_output.kv_cache_copy_ops)
 
             if not num_scheduled_tokens:
                 return EMPTY_MODEL_RUNNER_OUTPUT
@@ -1520,7 +1524,7 @@ class RBLNModelRunner:
 
     def propose_draft_token_ids(
         self,
-        scheduler_output: "SchedulerOutput",
+        scheduler_output: RBLNSchedulerOutput,
         sampled_token_ids: torch.Tensor | list[list[int]],
         sampling_metadata: SamplingMetadata,
         hidden_states: torch.Tensor,
@@ -2666,3 +2670,22 @@ class RBLNModelRunner:
                     # decode
                     for num_req in self.bucketing_manager.decode_batch_buckets:
                         self.drafter.dummy_run(num_req, 1, False)
+
+    def _process_kv_cache_copy_ops(
+        self, copy_ops: list[KVCacheCopyOp],
+    ) -> None:
+        use_runtime_kv_copy = (
+            not envs.VLLM_RBLN_USE_DEVICE_TENSOR
+            and not self.model_config.enforce_eager
+            and envs.VLLM_RBLN_COMPILE_MODEL
+        )
+        for op in copy_ops:
+            if use_runtime_kv_copy:
+                runtime = self.runtime_holder[0]
+                runtime._copy_kv_cache(op.src_block_id, op.dst_block_id, op.num_tokens)
+            else:
+                for kv_cache in self.kv_caches:
+                    src = op.src_block_id
+                    dst = op.dst_block_id
+                    nt = op.num_tokens
+                    kv_cache[:, dst, :, :, : nt, :] = kv_cache[:, src, :, :, : nt, :]
