@@ -397,6 +397,10 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
             kv_cache_layout=self.kv_cache_layout,
             block_size=self.block_size,
             ssm_sizes=self._mamba_ssm_size,
+            attn_backend_name=self.backend_name,
+            physical_blocks_per_logical_kv_block=(
+                self._physical_blocks_per_logical_kv_block
+            ),
         )
         assert self.compat_hash is not None
         encoder = msgspec.msgpack.Encoder()
