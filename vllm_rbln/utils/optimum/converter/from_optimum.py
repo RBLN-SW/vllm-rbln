@@ -111,7 +111,7 @@ def sync_from_optimum(
         vllm_config,
         params.kvcache_block_size,
         params.prefill_chunk_size,
-        params.image_prefill_chunk_sizes,
+        params.image_prefill_chunk_size,
     )
     # Set num_blocks in cache_config based on rbln_config.json
     update_num_blocks(vllm_config, params.num_blocks)
