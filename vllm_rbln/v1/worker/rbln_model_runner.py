@@ -99,7 +99,7 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
     SamplerOutput,
 )
-from vllm.v1.sample.logits_processor import build_logitsprocs
+from vllm.v1.sample.logits_processor import MoveDirectionality, build_logitsprocs
 from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
@@ -682,24 +682,136 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         if len(self.kv_cache_config.kv_cache_groups) == 0:
             return
 
-        orig_indices = np.arange(len(self.input_batch.req_ids))
-        sorted_order = np.argsort(
-            self.input_batch.num_tokens_no_spec[orig_indices] * (-1), kind="stable"
-        )
+        ib = self.input_batch
+        n = len(ib.req_ids)
+        toks = ib.num_tokens_no_spec[:n]
+
+        # The batch is reordered in place every step, so in steady-state decode
+        # (every sequence grows by 1) it is already sorted and a stable argsort
+        # would return identity. An O(n) "already non-increasing?" check skips
+        # the argsort + reindex entirely on those steps.
+        if n <= 1 or bool(np.all(toks[:-1] >= toks[1:])):
+            return
+
+        orig_indices = np.arange(n)
+        sorted_order = np.argsort(toks * (-1), kind="stable")
         src_indices = orig_indices[sorted_order]
         src_dest_map = {
             int(src): int(dst)
             for src, dst in zip(src_indices, orig_indices, strict=False)
         }
 
-        for src in src_dest_map:
-            dst = src_dest_map[src]
-            while src != dst:
-                self.input_batch.swap_states(src, dst)
-                # Mark dst as done by updating its destination to itself
-                next_dst = src_dest_map.get(dst, dst)
-                src_dest_map[dst] = dst
-                dst = next_dst
+        # Emit the pairwise-swap records that logits processors replay to
+        # realign their per-request state, then apply the permutation to every
+        # field in one vectorized pass. swap_states records moves only for
+        # non-pooling models (the records drive sampling / logits state), so
+        # mirror that.
+        if not ib.is_pooling_model:
+            moved = ib.batch_update_builder.moved
+            for src in src_dest_map:
+                dst = src_dest_map[src]
+                while src != dst:
+                    moved.append((src, dst, MoveDirectionality.SWAP))
+                    next_dst = src_dest_map.get(dst, dst)
+                    src_dest_map[dst] = dst
+                    dst = next_dst
+
+        self._reorder_input_batch(ib, sorted_order)
+
+    def _reorder_input_batch(self, ib, perm: np.ndarray) -> None:
+        """Apply a permutation to all per-request InputBatch state in one
+        vectorized pass (new slot ``k`` takes old index ``perm[k]``).
+
+        Mirrors the field set of upstream ``InputBatch.swap_states``
+        (vllm 0.18.0) but reindexes each field once instead of via N-1
+        pairwise swaps; the logits-processor move records are emitted by
+        the caller. Keep in sync with ``swap_states`` on vLLM bumps —
+        ``test_reorder_matches_swap_states`` guards equivalence.
+
+        The token_ids_cpu / is_token_ids rows are max_model_len wide but only
+        ``[:num_tokens + spec]`` is meaningful, so only the batch's max valid
+        column count (max num_tokens_no_spec + spec length) is reindexed; the
+        rest is don't-care."""
+        n = len(perm)
+        # numpy integer index; valid for advanced indexing of both numpy
+        # arrays and torch tensors below.
+        p = np.asarray(perm)
+
+        # Valid token-column width: bound the (otherwise max_model_len-wide)
+        # token matrices to the batch's max valid length. Permutation-invariant
+        # (max over the same value set), so safe to read before reindexing.
+        max_spec = max((len(s) for s in ib.spec_token_ids[:n]), default=0)
+        valid_w = min(
+            int(ib.num_tokens_no_spec[:n].max()) + max_spec,
+            ib.token_ids_cpu.shape[1],
+        )
+
+        # request id / token bookkeeping (python lists + index dict)
+        ib._req_ids[:n] = [ib._req_ids[i] for i in p]
+        ib.req_output_token_ids[:n] = [ib.req_output_token_ids[i] for i in p]
+        ib.spec_token_ids[:n] = [ib.spec_token_ids[i] for i in p]
+        for k in range(n):
+            rid = ib._req_ids[k]
+            if rid is not None:
+                ib.req_id_to_index[rid] = k
+
+        # per-request scalars (numpy); RHS fancy-indexing copies, so the
+        # in-place assignment is alias-safe.
+        for arr in (
+            ib.num_tokens_no_spec,
+            ib.num_prompt_tokens,
+            ib.num_computed_tokens_cpu,
+        ):
+            arr[:n] = arr[p]
+
+        # token id matrices, narrowed to valid columns
+        ib.token_ids_cpu[:n, :valid_w] = ib.token_ids_cpu[p, :valid_w]
+        ib.is_token_ids[:n, :valid_w] = ib.is_token_ids[p, :valid_w]
+
+        if ib.req_prompt_embeds:
+            ib.req_prompt_embeds = {
+                k: ib.req_prompt_embeds[int(p[k])]
+                for k in range(n)
+                if int(p[k]) in ib.req_prompt_embeds
+            }
+
+        # block tables per kv cache group: CPU rows + counts (device copy is
+        # re-synced downstream during input prep).
+        for bt in ib.block_table.block_tables:
+            bt.num_blocks_per_row[:n] = bt.num_blocks_per_row[p]
+            bt.block_table.np[:n] = bt.block_table.np[p]
+
+        ib.request_lora_mapping[:n] = ib.request_lora_mapping[p]
+
+        if ib.is_pooling_model:
+            return
+
+        # sampling parameters (numpy)
+        for arr in (
+            ib.temperature_cpu,
+            ib.top_p_cpu,
+            ib.top_k_cpu,
+            ib.frequency_penalties_cpu,
+            ib.presence_penalties_cpu,
+            ib.repetition_penalties_cpu,
+            ib.num_accepted_tokens_cpu,
+        ):
+            arr[:n] = arr[p]
+
+        # index-keyed dicts: new slot k inherits old slot p[k]'s entry
+        ib.generators = {
+            k: ib.generators[int(p[k])] for k in range(n) if int(p[k]) in ib.generators
+        }
+        ib.bad_words_token_ids = {
+            k: ib.bad_words_token_ids[int(p[k])]
+            for k in range(n)
+            if int(p[k]) in ib.bad_words_token_ids
+        }
+
+        if ib.allowed_token_ids_mask_cpu_tensor is not None:
+            ib.allowed_token_ids_mask_cpu_tensor[:n] = (
+                ib.allowed_token_ids_mask_cpu_tensor[p]
+            )
 
     # Note: used for model runner override.
     def _init_device_properties(self) -> None:

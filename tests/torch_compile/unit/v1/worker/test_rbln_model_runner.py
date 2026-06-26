@@ -23,6 +23,7 @@ import numpy as np
 import pytest
 import torch
 from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.sample.logits_processor import MoveDirectionality
 from vllm.v1.worker.gpu_input_batch import InputBatch
 
 import vllm_rbln.v1.worker.rbln_model_runner as model_runner_module
@@ -902,13 +903,156 @@ class TestMayReorderBatch:
 
     @staticmethod
     def _make_input_batch_mock(req_ids, num_tokens_no_spec, swap_fn=None):
-        """Build a spec-bound mock of InputBatch with real numpy data."""
+        """Spec-bound InputBatch mock for the early-return paths (env off,
+        no kv groups, already-sorted) that don't reach the reindex."""
         batch = MagicMock(spec=InputBatch)
         batch.req_ids = req_ids
         batch.num_tokens_no_spec = np.array(num_tokens_no_spec)
         if swap_fn is not None:
             batch.swap_states = swap_fn
         return batch
+
+    # --- real InputBatch helpers for the vectorized-reorder (B) tests ---
+
+    @staticmethod
+    def _real_input_batch(
+        num_tokens,
+        rng,
+        max_num_reqs=8,
+        max_model_len=64,
+        vocab_size=100,
+        block_size=16,
+        is_pooling_model=False,
+    ):
+        """Build and populate a real InputBatch with distinct per-slot data
+        in every field that swap_states / _reorder_input_batch touches."""
+        n = len(num_tokens)
+        ib = InputBatch(
+            max_num_reqs=max_num_reqs,
+            max_model_len=max_model_len,
+            max_num_batched_tokens=512,
+            device=torch.device("cpu"),
+            pin_memory=False,
+            vocab_size=vocab_size,
+            block_sizes=[block_size],
+            kernel_block_sizes=[block_size],
+            max_num_blocks_per_req=[max_model_len // block_size],
+            logitsprocs=None,
+            is_spec_decode=False,
+            is_pooling_model=is_pooling_model,
+        )
+        # _req_ids length == num_reqs (the runner uses len(req_ids) as n).
+        ib._req_ids = [f"r{i}" for i in range(n)]
+        ib.req_id_to_index = {f"r{i}": i for i in range(n)}
+        ib.req_output_token_ids[:n] = [[i, i * 10] for i in range(n)]
+        ib.spec_token_ids[:n] = [[i + 1] for i in range(n)]
+        ib.num_tokens_no_spec[:n] = np.asarray(
+            num_tokens, dtype=ib.num_tokens_no_spec.dtype
+        )
+        for name in (
+            "num_prompt_tokens",
+            "num_computed_tokens_cpu",
+            "temperature_cpu",
+            "top_p_cpu",
+            "top_k_cpu",
+            "frequency_penalties_cpu",
+            "presence_penalties_cpu",
+            "repetition_penalties_cpu",
+            "num_accepted_tokens_cpu",
+            "request_lora_mapping",
+        ):
+            arr = getattr(ib, name)
+            arr[:n] = rng.integers(1, 999, size=n).astype(arr.dtype)
+        ib.token_ids_cpu[:n] = rng.integers(0, vocab_size, size=(n, max_model_len))
+        ib.is_token_ids[:n] = rng.integers(0, 2, size=(n, max_model_len)).astype(bool)
+        bt = ib.block_table.block_tables[0]
+        bt.num_blocks_per_row[:n] = rng.integers(0, max_model_len // block_size, size=n)
+        bt.block_table.np[:n] = rng.integers(0, 500, size=bt.block_table.np[:n].shape)
+        # sparse index-keyed dicts (deterministic so ref/ours start identical)
+        ib.generators = {}
+        for i in range(0, n, 2):
+            g = torch.Generator()
+            g.manual_seed(1000 + i)
+            ib.generators[i] = g
+        ib.bad_words_token_ids = {
+            i: [[int(x) for x in rng.integers(0, vocab_size, size=2)]]
+            for i in range(1, n, 3)
+        }
+        ib.req_prompt_embeds = {
+            i: torch.from_numpy(rng.random(4).astype(np.float32))
+            for i in range(0, n, 4)
+        }
+        return ib, n
+
+    @staticmethod
+    def _cycle_pairs(sorted_order):
+        """Pairwise swaps realizing `sorted_order` (mirrors _may_reorder_batch)."""
+        n = len(sorted_order)
+        orig = np.arange(n)
+        m = {int(s): int(d) for s, d in zip(orig[sorted_order], orig)}
+        pairs = []
+        for src in list(m):
+            dst = m[src]
+            while src != dst:
+                pairs.append((src, dst))
+                next_dst = m.get(dst, dst)
+                m[dst] = dst
+                dst = next_dst
+        return pairs
+
+    @staticmethod
+    def _assert_input_batch_equal(a, b, n):
+        assert a._req_ids[:n] == b._req_ids[:n]
+        assert a.req_id_to_index == b.req_id_to_index
+        assert a.req_output_token_ids[:n] == b.req_output_token_ids[:n]
+        assert a.spec_token_ids[:n] == b.spec_token_ids[:n]
+        for name in (
+            "num_tokens_no_spec",
+            "num_prompt_tokens",
+            "num_computed_tokens_cpu",
+            "temperature_cpu",
+            "top_p_cpu",
+            "top_k_cpu",
+            "frequency_penalties_cpu",
+            "presence_penalties_cpu",
+            "repetition_penalties_cpu",
+            "num_accepted_tokens_cpu",
+            "request_lora_mapping",
+        ):
+            np.testing.assert_array_equal(
+                getattr(a, name)[:n], getattr(b, name)[:n], err_msg=name
+            )
+        # token matrices: compare each row only over its meaningful extent
+        # (num_tokens + spec). The vectorized reindex narrows to valid columns,
+        # so the don't-care tail beyond a row's extent need not match
+        # swap_states' full-row copy. Independent of the production valid_w
+        # formula — a too-small valid_w would corrupt some row's [:ext].
+        for k in range(n):
+            ext = int(b.num_tokens_no_spec[k]) + len(b.spec_token_ids[k])
+            np.testing.assert_array_equal(
+                a.token_ids_cpu[k, :ext],
+                b.token_ids_cpu[k, :ext],
+                err_msg="token_ids_cpu",
+            )
+            np.testing.assert_array_equal(
+                a.is_token_ids[k, :ext], b.is_token_ids[k, :ext], err_msg="is_token_ids"
+            )
+        bta = a.block_table.block_tables[0]
+        btb = b.block_table.block_tables[0]
+        np.testing.assert_array_equal(
+            bta.num_blocks_per_row[:n], btb.num_blocks_per_row[:n]
+        )
+        np.testing.assert_array_equal(bta.block_table.np[:n], btb.block_table.np[:n])
+        assert a.batch_update_builder.moved == b.batch_update_builder.moved
+        # index-keyed dicts (generators compared by seed; full-dict replacement
+        # must match swap_dict_values for keys in [0, n))
+        assert {k: g.initial_seed() for k, g in a.generators.items()} == {
+            k: g.initial_seed() for k, g in b.generators.items()
+        }
+        assert a.bad_words_token_ids == b.bad_words_token_ids
+        assert set(a.req_prompt_embeds) == set(b.req_prompt_embeds)
+        for k in a.req_prompt_embeds:
+            assert torch.equal(a.req_prompt_embeds[k], b.req_prompt_embeds[k])
 
     def test_no_reorder_when_env_disabled(self):
         """When VLLM_RBLN_SORT_BATCH is False, no reordering occurs."""
@@ -937,28 +1081,25 @@ class TestMayReorderBatch:
         np.testing.assert_array_equal(batch.num_tokens_no_spec, [5, 10])
 
     def test_reorder_sorts_descending(self):
-        """When enabled and groups exist, reorder by descending num_tokens_no_spec."""
-        swap_log = []
-
-        def mock_swap(src, dst):
-            swap_log.append((src, dst))
-            arr = batch.num_tokens_no_spec
-            arr[src], arr[dst] = arr[dst], arr[src]
-
-        batch = self._make_input_batch_mock(
-            ["a", "b", "c"],
-            [10, 30, 20],
-            swap_fn=mock_swap,
-        )
-        stub = SimpleNamespace(
-            kv_cache_config=SimpleNamespace(kv_cache_groups=[1]),
-            input_batch=batch,
-        )
-        bound = types.MethodType(RBLNModelRunner._may_reorder_batch, stub)
+        """End-to-end: _may_reorder_batch sorts a real batch by descending
+        num_tokens_no_spec, carries per-slot state along, and emits move
+        records."""
+        ib, n = self._real_input_batch([10, 30, 20], np.random.default_rng(0))
+        # Tag token rows so we can verify rows follow the permutation.
+        ib.token_ids_cpu[:n, 0] = [100, 101, 102]
+        runner = object.__new__(RBLNModelRunner)
+        runner.kv_cache_config = SimpleNamespace(kv_cache_groups=[1])
+        runner.input_batch = ib
         with patch("vllm_rbln.v1.worker.rbln_model_runner.envs") as mock_envs:
             mock_envs.VLLM_RBLN_SORT_BATCH = True
-            bound(MagicMock())
-        np.testing.assert_array_equal(batch.num_tokens_no_spec, [30, 20, 10])
+            runner._may_reorder_batch(MagicMock())
+
+        np.testing.assert_array_equal(ib.num_tokens_no_spec[:n], [30, 20, 10])
+        # idx1(30)->slot0, idx2(20)->slot1, idx0(10)->slot2
+        np.testing.assert_array_equal(ib.token_ids_cpu[:n, 0], [101, 102, 100])
+        assert ib.req_id_to_index == {"r1": 0, "r2": 1, "r0": 2}
+        assert ib._req_ids[:n] == ["r1", "r2", "r0"]
+        assert ib.batch_update_builder.moved, "expected emitted move records"
 
     def test_already_sorted_no_swaps(self):
         """If already sorted descending, no swaps needed."""
@@ -981,3 +1122,91 @@ class TestMayReorderBatch:
             mock_envs.VLLM_RBLN_SORT_BATCH = True
             bound(MagicMock())
         assert len(swap_log) == 0
+
+    def test_reorder_matches_swap_states(self):
+        """_reorder_input_batch is equivalent to N-1 swap_states calls
+        across random permutations and every per-request field."""
+        runner = object.__new__(RBLNModelRunner)
+        for trial in range(20):
+            seed_rng = np.random.default_rng(trial)
+            n = int(seed_rng.integers(2, 8))
+            toks = [int(t) for t in seed_rng.integers(1, 50, size=n)]
+            ref, _ = self._real_input_batch(toks, np.random.default_rng(100 + trial))
+            ours, _ = self._real_input_batch(toks, np.random.default_rng(100 + trial))
+            perm = np.argsort(np.asarray(toks) * (-1), kind="stable")
+            pairs = self._cycle_pairs(perm)
+            # reference: realize the permutation via swap_states
+            for i1, i2 in pairs:
+                ref.swap_states(i1, i2)
+            # ours: emit the same move records, then one vectorized reindex
+            for i1, i2 in pairs:
+                ours.batch_update_builder.moved.append(
+                    (i1, i2, MoveDirectionality.SWAP)
+                )
+            runner._reorder_input_batch(ours, perm)
+            self._assert_input_batch_equal(ref, ours, n)
+
+    def test_reorder_allowed_token_ids_mask_gather(self):
+        """(B) allowed_token_ids_mask is permuted correctly (a true gather;
+        upstream swap_states' row tuple-swap is buggy here, so we don't
+        mirror it)."""
+        runner = object.__new__(RBLNModelRunner)
+        ib, n = self._real_input_batch([10, 30, 20], np.random.default_rng(0))
+        rng = np.random.default_rng(7)
+        ib.allowed_token_ids_mask_cpu_tensor = torch.from_numpy(
+            rng.integers(0, 2, size=(8, 100)).astype(bool)
+        )
+        orig = ib.allowed_token_ids_mask_cpu_tensor[:n].clone()
+        perm = np.argsort(np.asarray([10, 30, 20]) * (-1), kind="stable")
+        runner._reorder_input_batch(ib, perm)
+        assert torch.equal(ib.allowed_token_ids_mask_cpu_tensor[:n], orig[perm])
+
+    def test_reorder_narrows_to_valid_width(self):
+        """With num_tokens (+spec) << max_model_len, only the valid token
+        columns are permuted; the don't-care tail (columns >= num_tokens,
+        never read) is left untouched. _reorder_input_batch derives the valid
+        width itself from num_tokens_no_spec + spec length."""
+        runner = object.__new__(RBLNModelRunner)
+        toks = [2, 4, 3]
+        ib, n = self._real_input_batch(toks, np.random.default_rng(0))
+        # _real_input_batch sets one spec token per slot -> valid_w = max + 1.
+        valid_w = max(toks) + 1
+        full_w = ib.token_ids_cpu.shape[1]
+        assert valid_w < full_w
+        ib.token_ids_cpu[:n, valid_w:] = -7  # sentinel in the don't-care tail
+        orig = ib.token_ids_cpu.copy()
+        orig_is = ib.is_token_ids.copy()
+        perm = np.argsort(np.asarray(toks) * (-1), kind="stable")
+        runner._reorder_input_batch(ib, perm)
+        # valid columns are gathered by the permutation ...
+        np.testing.assert_array_equal(
+            ib.token_ids_cpu[:n, :valid_w], orig[perm][:, :valid_w]
+        )
+        np.testing.assert_array_equal(
+            ib.is_token_ids[:n, :valid_w], orig_is[perm][:, :valid_w]
+        )
+        # ... and the tail is untouched (token_ids still the sentinel, and
+        # is_token_ids unchanged — neither is permuted).
+        np.testing.assert_array_equal(
+            ib.token_ids_cpu[:n, valid_w:], np.full((n, full_w - valid_w), -7)
+        )
+        np.testing.assert_array_equal(
+            ib.is_token_ids[:n, valid_w:], orig_is[:n, valid_w:]
+        )
+
+    def test_reorder_pooling_emits_no_move_records(self):
+        """Pooling models carry no sampling/logits state, so the reorder must
+        not emit move records (matching upstream swap_states' early return)."""
+        ib, n = self._real_input_batch(
+            [10, 30, 20], np.random.default_rng(0), is_pooling_model=True
+        )
+        runner = object.__new__(RBLNModelRunner)
+        runner.kv_cache_config = SimpleNamespace(kv_cache_groups=[1])
+        runner.input_batch = ib
+        with patch("vllm_rbln.v1.worker.rbln_model_runner.envs") as mock_envs:
+            mock_envs.VLLM_RBLN_SORT_BATCH = True
+            runner._may_reorder_batch(MagicMock())
+        # Non-sampling state is still reordered ...
+        np.testing.assert_array_equal(ib.num_tokens_no_spec[:n], [30, 20, 10])
+        # ... but no logits-processor move records are emitted.
+        assert ib.batch_update_builder.moved == []
