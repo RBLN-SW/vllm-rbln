@@ -73,7 +73,7 @@ from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
-from vllm.v1.utils import record_function_or_nullcontext
+from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.utils import (
     AttentionGroup,
@@ -93,7 +93,7 @@ from vllm_rbln.compilation import (
 )
 from vllm_rbln.forward_context import RBLNDPMetadata, set_forward_context
 from vllm_rbln.logger import init_logger
-from vllm_rbln.utils import pad
+from vllm_rbln.platform import USE_DEVICE_TENSOR
 from vllm_rbln.v1.attention.backends.flash_attention import (
     RBLNFlashAttentionMetadataBuilder,
 )
@@ -108,6 +108,7 @@ from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
 from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
+from vllm_rbln.v1.worker.input_stager import InputLayout, InputStager, StagedModelInputs
 from vllm_rbln.v1.worker.metrics_v2 import PerformanceContext, ProfileSection
 from vllm_rbln.v1.worker.utils import prepare_kernel_block_sizes
 
@@ -223,8 +224,10 @@ class RBLNModelRunner:
         # TODO(RBLN): Async scheduling
 
         # NOTE(RBLN): Compilation context for marking the KV cache address as static.
-        self.compile_context = create_compile_context(
-            use_weight_sharing=True, use_global_ctx=True
+        self.compile_context = (
+            create_compile_context(use_weight_sharing=True, use_global_ctx=True)
+            if not USE_DEVICE_TENSOR
+            else None
         )
         self.runtime_holder: list = []
 
@@ -329,10 +332,12 @@ class RBLNModelRunner:
         # Persistent buffers
         self.input_ids = torch.zeros(self.max_num_tokens, dtype=torch.int32)
         self.positions = torch.zeros(self.max_num_tokens, dtype=torch.int64)
-        self.positions_np = self.positions.numpy()
-        self.query_start_loc = torch.zeros(self.max_num_reqs + 1, dtype=torch.int32)
+        self.query_start_loc = self._make_buffer(
+            self.max_num_reqs + 1, dtype=torch.int32
+        )
         self.seq_lens = torch.zeros(self.max_num_tokens, dtype=torch.int32)
         self.discard_request_mask = torch.zeros(self.max_num_reqs, dtype=torch.bool)
+        self.input_stager = InputStager(self.device)
 
         # None in the first PP rank. The rest are after load_model
         self.intermediate_tensors: IntermediateTensors | None = None
@@ -394,6 +399,17 @@ class RBLNModelRunner:
     def _get_positions(self, num_tokens: Any):
         assert not isinstance(num_tokens, int)
         return self.positions[:num_tokens]
+
+    def _make_buffer(
+        self, *size: int | torch.SymInt, dtype: torch.dtype, numpy: bool = True
+    ) -> CpuGpuBuffer:
+        return CpuGpuBuffer(
+            *size,
+            dtype=dtype,
+            device=self.device,
+            pin_memory=self.pin_memory,
+            with_numpy=numpy,
+        )
 
     def _init_model_kwargs(self):
         model_kwargs = dict[str, Any]()
@@ -503,7 +519,7 @@ class RBLNModelRunner:
                 sampling_params
                 and sampling_params.sampling_type == SamplingType.RANDOM_SEED
             ):
-                generator = torch.Generator(device=self.device)
+                generator = torch.Generator(device="cpu")
                 generator.manual_seed(sampling_params.seed)
             else:
                 generator = None
@@ -722,7 +738,7 @@ class RBLNModelRunner:
         cu_num_tokens, arange = self._get_cumsum_and_arange(query_lengths)
 
         # Get positions.
-        positions_np = self.positions_np[:total_query_tokens]
+        positions_np = self.positions.numpy()[:total_query_tokens]
         np.add(
             self.input_batch.num_computed_tokens_cpu[req_indices]
             - backfill[req_indices],
@@ -750,10 +766,11 @@ class RBLNModelRunner:
         )
 
         # Prepare the attention metadata.
-        query_start_loc_np = self.query_start_loc.numpy()
+        query_start_loc_np = self.query_start_loc.np
         query_start_loc_np[0] = 0
         query_start_loc_np[1 : num_reqs + 1] = cu_num_tokens
         query_start_loc_np[num_reqs + 1 :].fill(cu_num_tokens[-1])
+        self.query_start_loc.copy_to_gpu()
 
         seq_lens_np = self.seq_lens.numpy()
         seq_lens_np[:num_reqs] = (
@@ -775,7 +792,7 @@ class RBLNModelRunner:
             # from these partial requests, we do so for simplicity.
             # We will ignore the sampled tokens from the partial requests.
             # TODO: Support prompt logprobs.
-            logits_indices = self.query_start_loc[1 : num_reqs + 1] - 1
+            logits_indices = self.query_start_loc.cpu[1 : num_reqs + 1] - 1
             spec_decode_metadata = None
         else:
             # Get the number of draft tokens for each request.
@@ -838,8 +855,8 @@ class RBLNModelRunner:
             return blk_table_tensor
 
         cm_base = CommonAttentionMetadata(
-            query_start_loc=self.query_start_loc[: num_reqs + 1],
-            query_start_loc_cpu=self.query_start_loc[: num_reqs + 1],
+            query_start_loc=self.query_start_loc.gpu[: num_reqs + 1],
+            query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs + 1],
             seq_lens=self.seq_lens[:num_reqs],
             num_reqs=num_reqs,
             num_actual_tokens=num_tokens,
@@ -939,11 +956,11 @@ class RBLNModelRunner:
         target_logits_indices += arange
 
         # Make tensors.
-        cu_num_draft_tokens = torch.from_numpy(cu_num_draft_tokens).to(self.device)
-        cu_num_sampled_tokens = torch.from_numpy(cu_num_sampled_tokens).to(self.device)
-        logits_indices = torch.from_numpy(logits_indices).to(self.device)
-        target_logits_indices = torch.from_numpy(target_logits_indices).to(self.device)
-        bonus_logits_indices = torch.from_numpy(bonus_logits_indices).to(self.device)
+        cu_num_draft_tokens = torch.from_numpy(cu_num_draft_tokens)
+        cu_num_sampled_tokens = torch.from_numpy(cu_num_sampled_tokens)
+        logits_indices = torch.from_numpy(logits_indices)
+        target_logits_indices = torch.from_numpy(target_logits_indices)
+        bonus_logits_indices = torch.from_numpy(bonus_logits_indices)
 
         # Compute the draft token ids.
         # draft_token_indices:      [  1,   2,   3, 105, 106, 208]
@@ -1080,20 +1097,12 @@ class RBLNModelRunner:
         logits_indices: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> tuple[
-        torch.Tensor | None,
-        torch.Tensor | None,
-        torch.Tensor,
-        IntermediateTensors | None,
-        torch.Tensor,
+        StagedModelInputs,
         dict[str, Any],
     ]:
         """
         :return: tuple[
-            input_ids,
-            inputs_embeds,
-            positions,
-            intermediate_tensors,
-            logits_indices,
+            staged_model_inputs,
             model_kwargs,
         ]
         """
@@ -1107,23 +1116,31 @@ class RBLNModelRunner:
         else:
             assert intermediate_tensors is not None
 
-        if self.is_prefill:
-            input_ids = pad(input_ids, -1, self.max_num_tokens)
-            positions = pad(positions, -1, self.max_num_tokens)
-        else:
-            input_ids = pad(input_ids, 0, num_reqs_padded)
-            positions = pad(positions, 0, num_reqs_padded)
+        layout = InputLayout(
+            num_reqs=num_reqs,
+            num_reqs_padded=num_reqs if self.is_prefill else num_reqs_padded,
+            query_len=input_ids.shape[1],
+            query_len_padded=self.max_num_tokens
+            if self.is_prefill
+            else input_ids.shape[1],
+        )
+        staged_model_inputs = self.input_stager.stage(
+            input_ids=input_ids,
+            positions=positions,
+            intermediate_tensors=intermediate_tensors,
+            inputs_embeds=inputs_embeds,
+            token_indices=logits_indices
+            if self.is_prefill and self.use_wrapped_compute_logits
+            else None,
+            layout=layout,
+        )
 
         model_kwargs = {
             **self._init_model_kwargs(),
         }
 
         return (
-            input_ids,
-            inputs_embeds,
-            positions,
-            intermediate_tensors,
-            logits_indices,
+            staged_model_inputs,
             model_kwargs,
         )
 
@@ -1331,11 +1348,7 @@ class RBLNModelRunner:
             )
 
             (
-                input_ids,
-                inputs_embeds,
-                positions,
-                intermediate_tensors,
-                logits_indices,
+                staged_model_inputs,
                 model_kwargs,
             ) = self._preprocess(
                 num_reqs,
@@ -1344,10 +1357,6 @@ class RBLNModelRunner:
                 logits_indices,
                 intermediate_tensors,
             )
-
-        token_indices: torch.Tensor | None = None
-        if self.is_prefill and self.use_wrapped_compute_logits:
-            token_indices = logits_indices
 
         # Run the model.
         with (
@@ -1367,11 +1376,7 @@ class RBLNModelRunner:
             record_function_or_nullcontext("rbln_model_runner: forward"),
         ):
             model_output = self.model_executable(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                token_indices=token_indices,
+                **staged_model_inputs.as_kwargs(),
                 **model_kwargs,
             )
 
@@ -1726,6 +1731,7 @@ class RBLNModelRunner:
                 dynamic=False,
                 compile_context=self.compile_context,
                 tensor_parallel_size=envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
+                model_trace_method="export" if USE_DEVICE_TENSOR else "",
                 process_group_dict=process_group_dict,
                 guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
                 runtime_holder=self.runtime_holder,
@@ -1736,6 +1742,7 @@ class RBLNModelRunner:
                 dynamic=False,
                 compile_context=self.compile_context,
                 tensor_parallel_size=envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
+                model_trace_method="export" if USE_DEVICE_TENSOR else "",
                 process_group_dict=process_group_dict,
                 guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
                 runtime_holder=self.runtime_holder,
@@ -1783,9 +1790,7 @@ class RBLNModelRunner:
                 continue
 
             num_prompt_tokens = len(request.prompt_token_ids)
-            prompt_token_ids = torch.tensor(request.prompt_token_ids).to(
-                self.device, non_blocking=True
-            )
+            prompt_token_ids = torch.tensor(request.prompt_token_ids)
 
             # Set up target LogprobsTensors object.
             logprobs_tensors = request.in_progress_prompt_logprobs_cpu
@@ -1823,7 +1828,7 @@ class RBLNModelRunner:
             # If this is a partial request (i.e. chunked prefill),
             # then there is prompt logprob generated for each index.
             req_idx = self.input_batch.req_id_to_index[req_id]
-            offset = self.query_start_loc[req_idx].item()
+            offset = self.query_start_loc.cpu[req_idx].item()
             prompt_hidden_states = hidden_states[offset : offset + num_logits]
             logits = self.model.compute_logits(prompt_hidden_states)
 
@@ -1915,7 +1920,7 @@ class RBLNModelRunner:
         num_tokens_padded = num_tokens_padded or _num_tokens_padded
 
         cum_num_tokens, _ = self._get_cumsum_and_arange(num_scheduled_tokens)
-        query_start_loc_np = self.query_start_loc.numpy()
+        query_start_loc_np = self.query_start_loc.np
         query_start_loc_np[1 : num_reqs + 1] = cum_num_tokens
 
         attn_metadata, _ = self._build_attention_metadata(
@@ -1956,8 +1961,19 @@ class RBLNModelRunner:
             )
 
         # NOTE(RBLN): Clone tensors to make tensors non-view tensors.
-        input_ids = input_ids.view(num_reqs, num_tokens_per_req).clone()
-        positions = positions.view(num_reqs, num_tokens_per_req).clone()
+        staged_model_input = self.input_stager.stage(
+            input_ids=input_ids.view(num_reqs, num_tokens_per_req),
+            positions=positions.view(num_reqs, num_tokens_per_req),
+            intermediate_tensors=intermediate_tensors,
+            inputs_embeds=inputs_embeds,
+            token_indices=token_indices,
+            layout=InputLayout(
+                num_reqs=num_reqs,
+                num_reqs_padded=num_reqs,
+                query_len=num_tokens_per_req,
+                query_len_padded=num_tokens_per_req,
+            ),
+        )
 
         with set_forward_context(
             attn_metadata,
@@ -1967,13 +1983,7 @@ class RBLNModelRunner:
             num_padded_tokens=num_tokens_padded,
             **build_kv_cache_forward_context_kwargs(self.kv_cache_bases),
         ):
-            _ = self.model_executable(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                token_indices=token_indices,
-            )
+            _ = self.model_executable(**staged_model_input.as_kwargs())
 
         self.input_batch.num_tokens_no_spec[:num_reqs] = 0
 
@@ -1990,12 +2000,12 @@ class RBLNModelRunner:
         def dummy_float_tensor(buffer: torch.Tensor, value: float | None):
             if value is None:
                 return None
-            return buffer[:num_reqs].fill_(float(value))
+            return buffer[:num_reqs].fill_(float(value)).to(self.device)
 
         def dummy_int_tensor(buffer: torch.Tensor, value: int | float | None):
             if value is None:
                 return None
-            return buffer[:num_reqs].fill_(int(value))
+            return buffer[:num_reqs].fill_(int(value)).to(self.device)
 
         for config in WARM_UP_CONFIGS:
             dummy_metadata = SamplingMetadata(
@@ -2206,7 +2216,13 @@ class RBLNModelRunner:
         """
         kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-            device = "cpu" if not envs.VLLM_RBLN_COMPILE_MODEL else "meta"
+            device = (
+                "cpu"
+                if not envs.VLLM_RBLN_COMPILE_MODEL
+                else self.device
+                if USE_DEVICE_TENSOR
+                else "meta"
+            )
             tensor = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=device)
             for layer_name in kv_cache_tensor.shared_by:
                 kv_cache_raw_tensors[layer_name] = tensor
@@ -2377,7 +2393,11 @@ class RBLNModelRunner:
             num_attn_module,
         )
 
-        if not self.model_config.enforce_eager and envs.VLLM_RBLN_COMPILE_MODEL:
+        if (
+            not envs.VLLM_RBLN_USE_DEVICE_TENSOR
+            and not self.model_config.enforce_eager
+            and envs.VLLM_RBLN_COMPILE_MODEL
+        ):
             assert len(kv_caches) == len(self.kv_caches)
             for k, v in kv_caches.items():
                 self.compile_context.mark_static_address(v, k)

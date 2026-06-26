@@ -42,7 +42,16 @@ from vllm_rbln.utils.optimum.registry import (
 
 logger = init_logger(__name__)
 
-USE_DEVICE_TENSOR: bool = False
+try:
+    import torch.rbln  # noqa: F401
+
+    HAS_TORCH_RBLN: bool = True
+except ImportError:
+    HAS_TORCH_RBLN = False
+
+USE_DEVICE_TENSOR: bool = (
+    envs.VLLM_RBLN_USE_VLLM_MODEL and envs.VLLM_RBLN_USE_DEVICE_TENSOR
+)
 # RBLN default for an unset max_num_seqs (upstream vLLM defaults to 256).
 RBLN_DEFAULT_MAX_NUM_SEQS = 1
 

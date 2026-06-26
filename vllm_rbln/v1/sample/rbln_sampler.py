@@ -11,19 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import inspect
-
 import rebel
 import torch
 import torch.nn as nn
-
-try:
-    import torch.rbln
-
-    has_torch_rbln = True
-except ImportError:
-    has_torch_rbln = False
-
 from vllm.config.model import LogprobsMode
 from vllm.sampling_params import _SAMPLING_EPS
 from vllm.v1.outputs import LogprobsTensors, SamplerOutput
@@ -31,8 +21,9 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler as VLLMSampler
 
 import vllm_rbln.envs as envs
-from vllm_rbln.compilation.backends import rbln_backend
+from vllm_rbln.compilation import compile, create_compile_context
 from vllm_rbln.logger import init_logger
+from vllm_rbln.platform import HAS_TORCH_RBLN, USE_DEVICE_TENSOR
 from vllm_rbln.v1.sample.ops.logprobs import batched_count_greater_than
 from vllm_rbln.v1.sample.ops.penalties import (
     apply_all_penalties as rbln_apply_all_penalties,
@@ -146,7 +137,7 @@ class RBLNTopKTopPSampler(nn.Module):
     def __init__(
         self,
         logprobs_mode: LogprobsMode = "raw_logprobs",
-        compile_context: rebel.CompileContext = None,
+        compile_context: rebel.CompileContext | None = None,
     ):
         # TODO(rbln): Merge more ops to rbln context.
         #       Currently, we only have softmax in rbln context.
@@ -157,32 +148,23 @@ class RBLNTopKTopPSampler(nn.Module):
             "RBLN Sampling does not support returning logits/logprobs"
         )
 
-        options = {
-            "compile_context": compile_context
-            if compile_context
-            else (
-                rebel.CompileContext(use_global_ctx=True)
-                if "use_global_ctx"
-                in inspect.signature(rebel.CompileContext).parameters
-                else rebel.CompileContext()
+        compile_context = (
+            compile_context
+            or create_compile_context(
+                use_global_ctx=True,
             )
-        }
-        if envs.VLLM_RBLN_COMPILE_STRICT_MODE:
-            options["mode"] = "strict"
-
-        if has_torch_rbln:
-            options["use_global_ctx"] = True
-            options["global_device_id"] = 0
-            options["tensor_parallel_size"] = 1
-
-        self._compiled_rbln_topk_topp_sampler = torch.compile(
+            if not USE_DEVICE_TENSOR
+            else None
+        )
+        self._compiled_rbln_topk_topp_sampler = compile(
             rbln_top_k_top_p_sample,
             dynamic=False,
             fullgraph=True,
-            backend=rbln_backend,
-            options=options,
+            compile_context=compile_context,
+            tensor_parallel_size=1 if USE_DEVICE_TENSOR or HAS_TORCH_RBLN else None,
+            model_trace_method="export" if USE_DEVICE_TENSOR else "",
+            mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
         )
-        self.forward = self.forward_rbln
 
     @torch.compiler.disable
     def top_k_top_p_sample(
@@ -190,7 +172,7 @@ class RBLNTopKTopPSampler(nn.Module):
     ) -> torch.Tensor:
         return self._compiled_rbln_topk_topp_sampler(logits, k, p)
 
-    def forward_rbln(
+    def forward(
         self,
         logits: torch.Tensor,
         generators: dict[int, torch.Generator],
@@ -211,7 +193,7 @@ class RBLNSampler(VLLMSampler):
     def __init__(
         self,
         logprobs_mode: LogprobsMode = "raw_logprobs",
-        compile_context: rebel.CompileContext = None,
+        compile_context: rebel.CompileContext | None = None,
     ):
         super().__init__()
         if logprobs_mode in ("raw_logprobs", "raw_logits"):
@@ -224,30 +206,21 @@ class RBLNSampler(VLLMSampler):
                 "Using native sampler instead."
             )
 
-        options = {
-            "compile_context": compile_context
-            if compile_context
-            else (
-                rebel.CompileContext(use_global_ctx=True)
-                if "use_global_ctx"
-                in inspect.signature(rebel.CompileContext).parameters
-                else rebel.CompileContext()
+        compile_context = (
+            compile_context
+            or create_compile_context(
+                use_global_ctx=True,
             )
-        }
-        if envs.VLLM_RBLN_COMPILE_STRICT_MODE:
-            options["mode"] = "strict"
-
-        if has_torch_rbln:
-            options["use_global_ctx"] = True
-            options["global_device_id"] = 0
-            options["tensor_parallel_size"] = 1
-
-        self._compiled_greedy_sample = torch.compile(
+            if not USE_DEVICE_TENSOR
+            else None
+        )
+        self._compiled_greedy_sample = compile(
             rbln_greedy_sample,
             dynamic=False,
             fullgraph=True,
-            backend=rbln_backend,
-            options=options,
+            compile_context=compile_context,
+            tensor_parallel_size=1 if USE_DEVICE_TENSOR or HAS_TORCH_RBLN else None,
+            mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
         )
 
     @torch.compiler.disable

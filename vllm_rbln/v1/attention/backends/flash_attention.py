@@ -155,14 +155,14 @@ class RBLNFlashAttentionMetadataBuilder(
         is_prefill: bool,
     ) -> RBLNFlashAttentionMetadata:
         num_reqs = common_attn_metadata.num_reqs
-        query_start_loc = common_attn_metadata.query_start_loc
+        query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
         seq_lens = common_attn_metadata.seq_lens
         block_tables_tensor = common_attn_metadata.block_table_tensor
 
-        query_seq_lens = query_start_loc[1:] - query_start_loc[:-1]
-        num_computed_tokens = seq_lens - query_seq_lens
+        query_seq_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+        num_computed_tokens = seq_lens - query_seq_lens_cpu
 
-        seq_idx = positions[query_start_loc[:num_reqs]].view(-1, 1)
+        seq_idx = positions[query_start_loc_cpu[:num_reqs]].view(-1, 1)
 
         # The length of the partition equals the block size.
         partition_len = self.block_size
