@@ -155,6 +155,30 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def resolve_spec_decode_pad_len(
+    *,
+    is_prefill_phase: bool,
+    spec_decode_max_query_len: int | None,
+) -> int | None:
+    """Per-request flat length the decode reshape/pad must use, or None.
+
+    Under the unified sliding-window scheme every decode req's flat length is
+    spec_decode_max_query_len (= num_spec_tokens+1, cross-DP consistent via the
+    step_no_spec_required OR-reduce). Returns None when no padding is needed:
+    prefill phase, spec disabled (None), or the no-spec scrub (==1, already
+    rectangular). Keying off this value avoids the ragged-reshape crash the old
+    proxy gate hit (max_tokens_per_req_across_dp / scheduled_spec_decode_tokens
+    could both read "no spec" on a still-ragged step).
+    """
+    if (
+        not is_prefill_phase
+        and spec_decode_max_query_len is not None
+        and spec_decode_max_query_len > 1
+    ):
+        return spec_decode_max_query_len
+    return None
+
+
 # Wrapper for ModelRunnerOutput to support overlapped execution.
 class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
     def __init__(
@@ -3296,28 +3320,11 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         assert input_ids is not None
         is_prefill_phase = self.is_prefill_phase()
 
-        # Padding length for speculative decoding by num_speculative_tokens.
-        # Gate on the cross-DP max (max_tokens_per_req_across_dp) so that a
-        # rank with no local drafts still pads its input_ids/positions to the
-        # same per-req length other ranks use. Gating only on the local
-        # scheduled_spec_decode_tokens leaves the (input_ids[1],
-        # max_pads_across_dp) tuple inconsistent across DP and triggers a
-        # hot-path model_wrapper recompile.
-        if (
-            max_tokens_per_req_across_dp is not None
-            and max_tokens_per_req_across_dp > 1
-        ):
-            max_spec_decode_len = max_tokens_per_req_across_dp
-        elif (
-            max_tokens_per_req_across_dp is None
-            and scheduler_output.scheduled_spec_decode_tokens
-        ):
-            # Non-DP (dp_size==1): no cross-DP gather happened, use the
-            # local pow2-rounded value as-is.
-            assert spec_decode_max_query_len is not None
-            max_spec_decode_len = spec_decode_max_query_len
-        else:
-            max_spec_decode_len = None
+        # Per-req pad length for spec decode. See resolve_spec_decode_pad_len.
+        max_spec_decode_len = resolve_spec_decode_pad_len(
+            is_prefill_phase=is_prefill_phase,
+            spec_decode_max_query_len=spec_decode_max_query_len,
+        )
 
         if max_spec_decode_len is not None:
             # Sliding window: per-req unpadded flat length is
@@ -3443,6 +3450,17 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
             # FIXME(jiwoo.park) This is a temporary workaround;
             # we must resolve the batch dimension.
+            # Reshape needs a rectangular batch; fail with context if a ragged
+            # buffer slips past the spec-decode padding above.
+            assert input_ids.numel() % num_reqs == 0, (
+                "ragged batch reached decode reshape: "
+                f"numel={input_ids.numel()} num_reqs={num_reqs} "
+                f"max_spec_decode_len={max_spec_decode_len} "
+                f"is_prefill_phase={is_prefill_phase} "
+                f"spec_dict={len(scheduler_output.scheduled_spec_decode_tokens)} "
+                "slide="
+                f"{len(getattr(scheduler_output, 'spec_decode_slide_distance', {}))}"
+            )
             input_ids = input_ids.view(num_reqs, -1).to(torch.long)
             positions = positions.view(num_reqs, -1)
 
