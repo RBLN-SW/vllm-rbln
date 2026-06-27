@@ -2135,11 +2135,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     def warm_up_model(self) -> None:
         set_warmup_active(True)
         offload_ctx = (
-            torch.rbln.offload()
-            if envs.VLLM_RBLN_USE_DEVICE_TENSOR
-            and has_torch_rbln
-            and not envs.VLLM_RBLN_DISABLE_OFFLOAD
-            else nullcontext()
+            torch.rbln.offload() if envs.VLLM_RBLN_DISABLE_OFFLOAD else nullcontext()
         )
         try:
             with offload_ctx:
@@ -2556,11 +2552,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     blk_table = input_batch.block_table[kv_cache_group_id]
                     # Keep on CPU in device-tensor mode (like _prepare_inputs) so
                     # .to(device) yields a stable contiguous stride for dynamo.
-                    blk_table_tensor = (
-                        blk_table.get_cpu_tensor()[:num_reqs]
-                        if envs.VLLM_RBLN_USE_DEVICE_TENSOR
-                        else blk_table.get_device_tensor(num_reqs)
-                    )
+                    blk_table_tensor = blk_table.get_cpu_tensor()[:num_reqs]
                     slot_mapping = blk_table.slot_mapping.gpu[
                         :total_num_scheduled_tokens
                     ]
@@ -4021,9 +4013,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         model_loader = get_model_loader(self.load_config)
         offload_ctx = (
             torch.rbln.offload()
-            if envs.VLLM_RBLN_USE_DEVICE_TENSOR
-            and has_torch_rbln
-            and not envs.VLLM_RBLN_DISABLE_OFFLOAD
+            if not envs.VLLM_RBLN_DISABLE_OFFLOAD
             else nullcontext()
         )
         with offload_ctx:
