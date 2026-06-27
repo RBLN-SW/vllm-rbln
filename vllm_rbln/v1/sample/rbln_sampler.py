@@ -17,13 +17,6 @@ import torch.nn as nn
 from vllm.sampling_params import _SAMPLING_EPS
 from vllm_rbln.v1.sample.ops.logprobs import batched_count_greater_than
 
-try:
-    import torch.rbln
-
-    has_torch_rbln = True
-except ImportError:
-    has_torch_rbln = False
-
 from vllm_rbln.logger import init_logger
 from vllm_rbln.torch_compile_backend import logged_rbln_backend
 from vllm.v1.sample.metadata import SamplingMetadata
