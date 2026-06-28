@@ -15,8 +15,6 @@
 # Copied from vllm.v1.sample.rejection_sampler: https://github.com/vllm-project/vllm/blob/v0.13.0/vllm/v1/sample/rejection_sampler.py
 # Search for NOTE(RBLN) or TODO(RBLN) for details
 
-import contextlib
-import time
 from dataclasses import replace
 
 import torch
@@ -25,9 +23,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
-import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
-from vllm_rbln.v1.worker.metrics import PerformanceTracker, collect_metrics
 from vllm_rbln.v1.worker.utils import build_compile_options, resolve_compile_context
 
 logger = init_logger(__name__)
@@ -64,9 +60,6 @@ class RBLNRejectionSampler(RejectionSampler):
     def __init__(self, *args, **kwargs):
         compile_context = kwargs.pop("compile_context", None)
         super().__init__(*args, **kwargs)
-        self.rej_sampler_performance_tracker: PerformanceTracker | None = None
-        if envs.VLLM_RBLN_METRICS:
-            self.rej_sampler_performance_tracker = PerformanceTracker("REJ_SAMPLER")
         compile_context = resolve_compile_context(compile_context)
         options = build_compile_options(compile_context)
         self.compiled_rejection_sample = torch.compile(
@@ -162,36 +155,16 @@ class RBLNRejectionSampler(RejectionSampler):
             target_probs = target_logits
         else:
             target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
-        if hasattr(rebel, "capture_reports"):
-            capture_ctx = rebel.capture_reports()
-        else:
-            # use a dummy context manager that does nothing
-            capture_ctx = contextlib.nullcontext()
-        with capture_ctx as sampler_outputs:
-            sampler_start_time = time.perf_counter()
-            output_token_ids = self.rejection_sample(
-                metadata.draft_token_ids,
-                metadata.num_draft_tokens,
-                metadata.max_spec_len,
-                metadata.cu_num_draft_tokens,
-                draft_probs,
-                target_probs,
-                bonus_token_ids,
-                sampling_metadata,
-            )
-            if (
-                envs.VLLM_RBLN_METRICS
-                and self.rej_sampler_performance_tracker is not None
-            ):
-                collect_metrics(
-                    self.rej_sampler_performance_tracker,
-                    True,
-                    start_time=sampler_start_time,
-                    end_time=time.perf_counter(),
-                    reports=sampler_outputs,
-                    token_count=0,
-                )
-
+        output_token_ids = self.rejection_sample(
+            metadata.draft_token_ids,
+            metadata.num_draft_tokens,
+            metadata.max_spec_len,
+            metadata.cu_num_draft_tokens,
+            draft_probs,
+            target_probs,
+            bonus_token_ids,
+            sampling_metadata,
+        )
         logprobs_tensors = None
         if sampling_metadata.max_num_logprobs is not None:
             logprobs_tensors = self._get_logprobs_tensors(

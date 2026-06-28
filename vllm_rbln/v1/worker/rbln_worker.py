@@ -649,12 +649,6 @@ class RBLNWorker(WorkerBase):
                 self.model_runner.sampler_performance_tracker.print_final_stats()
             if self.model_runner.e2e_performance_tracker:
                 self.model_runner.e2e_performance_tracker.print_final_stats()
-            rejection_sampler = getattr(self.model_runner, "rejection_sampler", None)
-            rej_sampler_performance_tracker = getattr(
-                rejection_sampler, "rej_sampler_performance_tracker", None
-            )
-            if rej_sampler_performance_tracker:
-                rej_sampler_performance_tracker.print_final_stats()
 
 
 def init_worker_distributed_environment(

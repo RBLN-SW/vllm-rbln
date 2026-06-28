@@ -29,6 +29,7 @@ try:
     has_torch_rbln = True
 except ImportError:
     has_torch_rbln = False
+import numpy as np
 from vllm.config import ModelConfig, ParallelConfig
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.platforms import CpuArchEnum, current_platform
