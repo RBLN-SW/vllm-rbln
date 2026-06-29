@@ -51,7 +51,6 @@ plugins:
 nav:
   - Home: index.md
   - Environment Variables: env_vars.md
-  - Adding an Environment Variable: adding_env_vars.md
   - Bucketing: bucketing.md
   - Sub-block Prefix Caching: sub_block_prefix_caching.md
 
