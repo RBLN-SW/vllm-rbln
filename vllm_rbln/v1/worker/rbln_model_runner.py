@@ -14,8 +14,9 @@
 
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
+from contextlib import nullcontext
 from copy import copy, deepcopy
-from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, cast
+from typing import Any, NamedTuple, TypeAlias, cast
 
 import numpy as np
 import torch
@@ -93,7 +94,7 @@ from vllm_rbln.compilation import (
 )
 from vllm_rbln.forward_context import RBLNDPMetadata, set_forward_context
 from vllm_rbln.logger import init_logger
-from vllm_rbln.platform import USE_DEVICE_TENSOR
+from vllm_rbln.platform import HAS_TORCH_RBLN, USE_DEVICE_TENSOR
 from vllm_rbln.v1.attention.backends.flash_attention import (
     RBLNFlashAttentionMetadataBuilder,
 )
@@ -104,8 +105,8 @@ from vllm_rbln.v1.attention.kv_cache_bindings import (
     build_kv_cache_forward_context_kwargs,
     validate_shared_attention_kv_cache_contiguity,
 )
-from vllm_rbln.v1.core.rbln_scheduler import RBLNSchedulerOutput
 from vllm_rbln.v1.core.rbln_kv_cache_manager import KVCacheCopyOp
+from vllm_rbln.v1.core.rbln_scheduler import RBLNSchedulerOutput
 from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
@@ -1645,9 +1646,17 @@ class RBLNModelRunner:
         )
 
         model_loader = get_model_loader(self.load_config)
-        self.model = model_loader.load_model(
-            vllm_config=self.vllm_config, model_config=self.model_config
-        )
+        offload_context = nullcontext
+        if (
+            HAS_TORCH_RBLN
+            and envs.VLLM_RBLN_USE_DEVICE_TENSOR
+            and not envs.VLLM_RBLN_DISABLE_OFFLOAD
+        ):
+            offload_context = torch.rbln.offload
+        with offload_context():
+            self.model = model_loader.load_model(
+                vllm_config=self.vllm_config, model_config=self.model_config
+            )
         if hasattr(self.model, "logits_processor"):
             self.logits_processor = self.model.logits_processor
         elif self.model_config.is_multimodal_model and hasattr(
@@ -1689,13 +1698,14 @@ class RBLNModelRunner:
             token_indices: torch.Tensor | None = None,
             **kwargs,
         ):
-            model_output = self.model(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **kwargs,
-            )
+            with offload_context():
+                model_output = self.model(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **kwargs,
+                )
 
             logits = None
             if self.use_aux_hidden_state_outputs:
@@ -1741,6 +1751,8 @@ class RBLNModelRunner:
                 runtime_holder=self.runtime_holder,
                 mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
             )
+            # NOTE(RBLN): We compile compute_logits separately to cover cases when
+            # `self.use_wrapped_compute_logits` is `False`
             self.compute_logits = compile(
                 self.model.compute_logits,
                 dynamic=False,
@@ -2672,7 +2684,8 @@ class RBLNModelRunner:
                         self.drafter.dummy_run(num_req, 1, False)
 
     def _process_kv_cache_copy_ops(
-        self, copy_ops: list[KVCacheCopyOp],
+        self,
+        copy_ops: list[KVCacheCopyOp],
     ) -> None:
         use_runtime_kv_copy = (
             not envs.VLLM_RBLN_USE_DEVICE_TENSOR
@@ -2688,4 +2701,4 @@ class RBLNModelRunner:
                     src = op.src_block_id
                     dst = op.dst_block_id
                     nt = op.num_tokens
-                    kv_cache[:, dst, :, :, : nt, :] = kv_cache[:, src, :, :, : nt, :]
+                    kv_cache[:, dst, :, :, :nt, :] = kv_cache[:, src, :, :, :nt, :]
