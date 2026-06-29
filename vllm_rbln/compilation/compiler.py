@@ -73,7 +73,7 @@ def compile(
     dynamic: bool = False,
     fullgraph: bool = False,
     compile_context: CompileContext | None = None,
-    tensor_parallel_size: int | None = None,
+    num_devices: int | None = None,
     model_trace_method: str = "",
     process_group_dict: dict[str, list[int]] | None = None,
     guard_filter_fn: Callable | None = None,
@@ -91,7 +91,7 @@ def compile(
         options[key] = value
 
     set_option("compile_context", compile_context)
-    set_option("tensor_parallel_size", tensor_parallel_size)
+    set_option("num_devices", num_devices)
     set_option("model_trace_method", model_trace_method)
     set_option("process_group_dict", process_group_dict)
     set_option("guard_filter_fn", guard_filter_fn)

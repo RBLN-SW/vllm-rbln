@@ -161,7 +161,7 @@ class RBLNTopKTopPSampler(nn.Module):
             dynamic=False,
             fullgraph=True,
             compile_context=compile_context,
-            tensor_parallel_size=1 if USE_DEVICE_TENSOR or HAS_TORCH_RBLN else None,
+            num_devices=1 if USE_DEVICE_TENSOR or HAS_TORCH_RBLN else None,
             model_trace_method="export" if USE_DEVICE_TENSOR else "",
             mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
         )
@@ -219,7 +219,7 @@ class RBLNSampler(VLLMSampler):
             dynamic=False,
             fullgraph=True,
             compile_context=compile_context,
-            tensor_parallel_size=1 if USE_DEVICE_TENSOR or HAS_TORCH_RBLN else None,
+            num_devices=1 if USE_DEVICE_TENSOR or HAS_TORCH_RBLN else None,
             mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
         )
 

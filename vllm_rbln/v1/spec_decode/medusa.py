@@ -67,7 +67,7 @@ class RBLNMedusaProposer(MedusaProposer):
                 dynamic=False,
                 fullgraph=True,
                 compile_context=self.compile_context,
-                tensor_parallel_size=envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
+                num_devices=envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
                 model_trace_method="export" if USE_DEVICE_TENSOR else "",
                 process_group_dict=build_process_group_dict(),
                 guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
