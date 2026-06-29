@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from vllm.envs import environment_variables as vllm_envs
@@ -20,6 +21,157 @@ from vllm.envs import environment_variables as vllm_envs
 from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+@dataclass(frozen=True)
+class EnvMeta:
+    """Documentation metadata for a VLLM_RBLN_* environment variable.
+
+    SSOT for the env var docs. The runtime parsing lives in
+    ``environment_variables``; this only describes the variable for
+    linting and doc generation.
+    """
+
+    description: str
+    default: object = None
+    type: str = ""
+    deprecated: str = ""
+
+
+# SSOT for VLLM_RBLN_* env var documentation. Every VLLM_RBLN_* key in
+# ``environment_variables`` must have an entry here (enforced by
+# tools/pre_commit/check_env_metadata.py). Docs are generated from this.
+ENV_METADATA: dict[str, EnvMeta] = {
+    "VLLM_RBLN_COMPILE_MODEL": EnvMeta(
+        "If true, compile models using torch.compile. "
+        "Otherwise, run the CPU eager mode if possible.",
+        default=True, type="bool"),
+    "VLLM_RBLN_COMPILE_STRICT_MODE": EnvMeta(
+        "If true, compile models using torch.compile strict mode.",
+        default=False, type="bool"),
+    "VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK": EnvMeta(
+        "Number of NPU devices assigned to each local rank. The "
+        "deprecated VLLM_RBLN_TP_SIZE is honored as a fallback.",
+        default=1, type="int"),
+    "VLLM_RBLN_SAMPLER": EnvMeta(
+        "Use the customized RBLN sampler.",
+        default=True, type="bool"),
+    "VLLM_RBLN_ENABLE_WARM_UP": EnvMeta(
+        "Enable model warm-up before serving.",
+        default=True, type="bool"),
+    "VLLM_RBLN_USE_VLLM_MODEL": EnvMeta(
+        "If true, use the natively compiled vLLM model instead of the "
+        "optimum-rbln compiled model.",
+        default=False, type="bool"),
+    "VLLM_RBLN_FLASH_CAUSAL_ATTN": EnvMeta(
+        "Use flash attention for causal attention.",
+        default=True, type="bool"),
+    "VLLM_RBLN_BATCH_ATTN_OPT": EnvMeta(
+        "Use batch attention optimization for paged attention.",
+        default=False, type="bool"),
+    "VLLM_RBLN_DISABLE_MM": EnvMeta(
+        "Disable multimodal input.",
+        default=False, type="bool"),
+    "VLLM_RBLN_DP_IMPL": EnvMeta(
+        "Data-parallel implementation. Choices: padded_decode, "
+        "dummy_prefill (dummy_prefill will be deprecated).",
+        default="padded_decode", type="str"),
+    "VLLM_RBLN_USE_MOE_TOKENS_MASK": EnvMeta(
+        "If true, apply the tokens mask to the MoE expert kernel.",
+        default=True, type="bool"),
+    "VLLM_RBLN_SPECIALIZE_MOE_DECODE": EnvMeta(
+        "If true, specialize the case where all instances are at the "
+        "decode stage for MoE models.",
+        default=True, type="bool"),
+    "VLLM_RBLN_ENFORCE_MODEL_FP32": EnvMeta(
+        "Enforce the model data type to fp32 instead of "
+        "model_config.dtype.",
+        default=False, type="bool"),
+    "VLLM_RBLN_DP_INPUT_ALL_GATHER": EnvMeta(
+        "Use DP input all_gather.",
+        default=True, type="bool"),
+    "VLLM_RBLN_LOGITS_ALL_GATHER": EnvMeta(
+        "Include the logits all_gather in model compilation.",
+        default=True, type="bool"),
+    "VLLM_RBLN_NUM_RAY_NODES": EnvMeta(
+        "Number of Ray nodes.",
+        default=1, type="int"),
+    "VLLM_RBLN_METRICS": EnvMeta(
+        "Enable performance metrics collection.",
+        default=False, type="bool"),
+    "VLLM_RBLN_METRICS_FILE": EnvMeta(
+        "Mirror the final performance report to this file (in addition "
+        "to stdout). The worker pid is appended before the extension to "
+        "keep TP/DP workers from clobbering each other. Empty disables "
+        "file output.",
+        default="", type="str"),
+    "VLLM_RBLN_NUMA": EnvMeta(
+        "Enable NUMA-based CPU affinity binding for OpenMP threads.",
+        default=True, type="bool"),
+    "VLLM_RBLN_SORT_BATCH": EnvMeta(
+        "Sort the batch before execution.",
+        default=False, type="bool"),
+    "VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY": EnvMeta(
+        "Decode batch bucket strategy. Choices: exponential, exp, "
+        "linear, manual.",
+        default="exponential", type="str"),
+    "VLLM_RBLN_DECODE_BATCH_BUCKET_MIN": EnvMeta(
+        "Minimum decode batch bucket size.",
+        default=1, type="int"),
+    "VLLM_RBLN_DECODE_BATCH_BUCKET_STEP": EnvMeta(
+        "Decode batch bucket step size.",
+        default=2, type="int"),
+    "VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT": EnvMeta(
+        "Maximum decode batch bucket size.",
+        default=1, type="int"),
+    "VLLM_RBLN_AUTO_PORT": EnvMeta(
+        "Automatically pick a free port. Defaults to on when "
+        "VLLM_RBLN_USE_DEVICE_TENSOR is enabled.",
+        default=False, type="bool"),
+    "VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS": EnvMeta(
+        "Comma-separated decode batch sizes used when the bucket "
+        "strategy is 'manual'.",
+        default=[], type="list[int]"),
+    "VLLM_RBLN_USE_CUSTOM_KERNEL": EnvMeta(
+        "Use custom kernels. Reads the RBLN_USE_CUSTOM_KERNEL env var.",
+        default=False, type="bool"),
+    "VLLM_RBLN_MOE_REDUCE_SCATTER": EnvMeta(
+        "Use reduce_scatter instead of all_reduce in the MoE combine "
+        "phase.",
+        default=False, type="bool"),
+    "VLLM_RBLN_PROFILER": EnvMeta(
+        "Enable the RBLN profiler. Reads the RBLN_PROFILER env var.",
+        default=False, type="bool"),
+    "VLLM_RBLN_DISPATCH_ALL2ALL": EnvMeta(
+        "Use all2all dispatch instead of all-gather for MoE DP dispatch.",
+        default=False, type="bool"),
+    "VLLM_RBLN_COMBINE_ALL2ALL": EnvMeta(
+        "Use all2all combine instead of reduce-scatter for MoE DP "
+        "combine.",
+        default=False, type="bool"),
+    "VLLM_RBLN_SUB_BLOCK_CACHE": EnvMeta(
+        "Enable sub-block prefix caching. Sub-block size equals "
+        "max_num_batched_tokens (prefill chunk size).",
+        default=True, type="bool"),
+    "VLLM_RBLN_USE_DEVICE_TENSOR": EnvMeta(
+        "Use RBLN device tensors end-to-end (platform device_type "
+        "'rbln', KV cache / inputs on device, CPU-first attention "
+        "metadata, padded sampling metadata, no CompileContext). "
+        "Opt-in until stable.",
+        default=False, type="bool"),
+    "VLLM_RBLN_DISABLE_OFFLOAD": EnvMeta(
+        "Disable RBLN file offloading during model load / warm-up even "
+        "when VLLM_RBLN_USE_DEVICE_TENSOR is set. Kill-switch for the "
+        "offload path.",
+        default=False, type="bool"),
+    "VLLM_RBLN_COMPILE_ONLY": EnvMeta(
+        "Compile-only mode for NPU-less (CPU-only) hosts such as CI "
+        "build workers. Compiles + caches each graph on a dummy device; "
+        "the cache is later reused by a real NPU host. Set "
+        "RBLN_TARGET_SOC (e.g. RBLN-CA25) on a host without an NPU.",
+        default=False, type="bool"),
+}
+
 
 if TYPE_CHECKING:
     VLLM_RBLN_COMPILE_MODEL: bool = True
