@@ -124,7 +124,8 @@ def _linkify(text: str, known: set[str], current: str) -> str:
 _BOOL_NOTE = (
     '!!! note "Boolean variables"\n'
     "    A `bool` variable is **true** when set to `1` or `true` "
-    "(case-insensitive). Any other value, or leaving it unset, is **false**."
+    "(case-insensitive) and **false** for any other value. When unset, the "
+    "variable's own default (shown with each entry) applies."
 )
 
 

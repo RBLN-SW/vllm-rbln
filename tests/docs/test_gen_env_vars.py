@@ -43,14 +43,23 @@ def _stub_open(name, mode="r"):
     return buf
 
 
+# Stub mkdocs_gen_files only while importing the generator (its module-level
+# main() calls mkdocs_gen_files.open). Restore the original entry afterwards so
+# the global module table is not left mutated for other tests.
+_orig_mgf = sys.modules.get("mkdocs_gen_files")
 sys.modules["mkdocs_gen_files"] = types.SimpleNamespace(open=_stub_open)  # type: ignore[assignment]
-
-_spec = importlib.util.spec_from_file_location(
-    "gen_env_vars", _ROOT / "docs" / "gen_env_vars.py"
-)
-assert _spec is not None and _spec.loader is not None
-gen = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(gen)  # runs main() -> writes to _written via stub
+try:
+    _spec = importlib.util.spec_from_file_location(
+        "gen_env_vars", _ROOT / "docs" / "gen_env_vars.py"
+    )
+    assert _spec is not None and _spec.loader is not None
+    gen = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(gen)  # runs main() -> writes to _written via stub
+finally:
+    if _orig_mgf is not None:
+        sys.modules["mkdocs_gen_files"] = _orig_mgf
+    else:
+        del sys.modules["mkdocs_gen_files"]
 
 
 def _rec(name, **kw):
