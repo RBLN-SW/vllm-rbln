@@ -70,6 +70,7 @@ from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, Schedul
 
 from vllm_rbln.forward_context import set_forward_context
 from vllm_rbln.v1.core.rbln_scheduler import RBLNSchedulerOutput
+from vllm_rbln.v1.worker.utils import resolve_compile_context
 
 if TYPE_CHECKING:
     from vllm_rbln.v1.core.rbln_kv_cache_manager import KVCacheCopyOp
@@ -292,20 +293,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         else:
             self.max_encoder_len = 0
 
-        if not envs.VLLM_RBLN_USE_DEVICE_TENSOR:
-            # Only provide use_global_ctx if CompileContext supports it
-            import inspect
-
-            from rebel.compile_context import CompileContext
-
-            compile_ctx_args = {}
-            if "use_weight_sharing" in inspect.signature(CompileContext).parameters:
-                compile_ctx_args["use_weight_sharing"] = True
-            if "use_global_ctx" in inspect.signature(CompileContext).parameters:
-                compile_ctx_args["use_global_ctx"] = True
-            self.compile_context = CompileContext(**compile_ctx_args)
-        else:
-            self.compile_context = None
+        self.compile_context = resolve_compile_context(compile_context=None)
         self.runtime_holder: list = []
 
         # Sampler
@@ -2156,7 +2144,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 token_count=0,
                 # the performance of sampler doesn't depend on token count
             )
-
         return sampler_output
 
     def compute_logits(
@@ -5063,6 +5050,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             kv_cache_names = get_kv_cache_names(kv_caches, num_attn_module)
             assert len(kv_cache_names) == len(self.kv_caches)
             for kv_cache, name in zip(self.kv_caches, kv_cache_names):
+                assert self.compile_context is not None
                 self.compile_context.mark_static_address(kv_cache, name)
 
         self._log_kv_cache_info(kv_cache_config, kv_caches)
