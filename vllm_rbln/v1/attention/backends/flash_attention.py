@@ -1100,6 +1100,47 @@ class RBLNFlashAttentionMetadataBuilder(
     ) -> bool:
         return False
 
+    def _build_prefill_attn_mask(
+        self, seq_idx: torch.Tensor, max_seq_len: int
+    ) -> torch.Tensor:
+        """Build the chunked causal attention mask for a prefill step."""
+        prefill_chunk_size = self.chunked_prefill_size
+        chunked_attention_mask = torch.zeros(
+            1,
+            1,
+            1,
+            prefill_chunk_size,
+            max_seq_len,
+            dtype=self._mask_dtype,
+        )
+        causal_mask = 1 - torch.triu(
+            torch.ones(1, 1, prefill_chunk_size, prefill_chunk_size),
+            diagonal=1,
+        )
+        step = seq_idx[0].cpu()
+        if step >= prefill_chunk_size:
+            chunked_attention_mask[:, :, :, :, :step] = 1
+        chunked_attention_mask[:, :, :, :, step : step + prefill_chunk_size] = causal_mask
+        # FIXME cpu handling -> device?
+        return chunked_attention_mask.to(self.device)
+
+    def _build_decode_attn_mask(
+        self, seq_lens_cpu: torch.Tensor, batch_pad: int, max_seq_len: int
+    ) -> torch.Tensor:
+        """Build the per-batch attention mask for a decode step."""
+        decode_attention_mask = torch.zeros(
+            batch_pad,
+            1,
+            1,
+            1,
+            max_seq_len,
+            dtype=self._mask_dtype,
+        )
+        for batch_index, batch_step in enumerate(seq_lens_cpu):
+            decode_attention_mask[batch_index, :, :, :, : batch_step + 1] = 1
+        # FIXME cpu handling -> device?
+        return decode_attention_mask.to(self.device)
+
     def build(
         self,
         common_prefix_len: int,
@@ -1159,47 +1200,16 @@ class RBLNFlashAttentionMetadataBuilder(
             # NOTE(jiwoo.park) prefill's block_tables must be a 1D tensor.
             block_tables_tensor = block_tables_tensor[0]
             if not self.is_causal:
-                prefill_chunk_size = self.chunked_prefill_size
-                chunked_attention_mask = torch.zeros(
-                    1,
-                    1,
-                    1,
-                    prefill_chunk_size,
-                    max_seq_len,
-                    dtype=self._mask_dtype,
-                )
-                causal_mask = 1 - torch.triu(
-                    torch.ones(1, 1, prefill_chunk_size, prefill_chunk_size),
-                    diagonal=1,
-                )
-                step = seq_idx[0].cpu()
-                if step >= prefill_chunk_size:
-                    chunked_attention_mask[:, :, :, :, :step] = 1
-                chunked_attention_mask[:, :, :, :, step : step + prefill_chunk_size] = (
-                    causal_mask
-                )
-                attn_masks = chunked_attention_mask
-                # FIXME cpu handling -> device?
-                attn_masks = attn_masks.to(self.device)
+                attn_masks = self._build_prefill_attn_mask(seq_idx, max_seq_len)
         else:
             # batch padding
             seq_idx = rbln_utils.pad(seq_idx, 0, batch_pad)
             seq_lens_tensor = rbln_utils.pad(seq_lens_tensor, 0, batch_pad)
             block_tables_tensor = rbln_utils.pad(block_tables_tensor, 0, batch_pad)
             if not self.is_causal:
-                decode_attention_mask = torch.zeros(
-                    batch_pad,
-                    1,
-                    1,
-                    1,
-                    max_seq_len,
-                    dtype=self._mask_dtype,
+                attn_masks = self._build_decode_attn_mask(
+                    seq_lens_cpu, batch_pad, max_seq_len
                 )
-                for batch_index, batch_step in enumerate(seq_lens_cpu):
-                    decode_attention_mask[batch_index, :, :, :, : batch_step + 1] = 1
-                attn_masks = decode_attention_mask
-                # FIXME cpu handling -> device?
-                attn_masks = attn_masks.to(self.device)
 
         cache_seq_lens = None
         cache_offsets = None
