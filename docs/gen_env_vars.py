@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import ast
+import re
 from pathlib import Path
 
 ENVS_PATH = Path(__file__).resolve().parent.parent / "vllm_rbln" / "rbln_envs.py"
@@ -88,6 +89,37 @@ _INTRO = (
     "`vllm_rbln/rbln_envs.py`."
 )
 
+# One-line orientation shown under each category heading.
+_CATEGORY_INTRO = {
+    "Compilation & model loading": "How models are compiled, cached, and "
+    "loaded onto the NPU.",
+    "Attention": "Attention kernel selection and optimizations.",
+    "Sampling & batching": "Sampler behavior and decode-time batch bucketing.",
+    "Parallelism (TP / DP / Ray)": "Tensor/data parallelism and multi-node "
+    "Ray settings.",
+    "Mixture of Experts (MoE)": "Expert routing, dispatch, and combine "
+    "strategies for MoE models.",
+    "Device tensors & memory": "On-device tensor mode, offloading, prefix "
+    "caching, and port allocation.",
+    "Observability": "Performance metrics and profiling.",
+    "Miscellaneous": "Other runtime toggles.",
+}
+
+_VAR_RE = re.compile(r"\bVLLM_RBLN_[A-Z0-9_]+\b")
+
+
+def _linkify(text: str, known: set[str], current: str) -> str:
+    """Turn other VLLM_RBLN_* names in prose into links to their section."""
+
+    def repl(match: re.Match) -> str:
+        name = match.group(0)
+        if name == current or name not in known:
+            return name  # skip self-references and unknown (e.g. deprecated aliases)
+        return f"[{name}](#{name.lower()})"
+
+    return _VAR_RE.sub(repl, text)
+
+
 _BOOL_NOTE = (
     '!!! note "Boolean variables"\n'
     "    A `bool` variable is **true** when set to `1` or `true` "
@@ -105,19 +137,21 @@ def _meta_line(rec: dict) -> str:
     return " · ".join(parts)
 
 
-def _entry(rec: dict) -> str:
+def _entry(rec: dict, known: set[str]) -> str:
     """Render one variable: monospace heading, meta line, description."""
     lines = [f"### `{rec['name']}`", ""]
     meta = _meta_line(rec)
     if meta:
         lines += [meta, ""]
-    lines.append(rec["description"])
+    lines.append(_linkify(rec["description"], known, rec["name"]))
     if rec["deprecated"]:
-        lines += ["", '!!! warning "Deprecated"', f"    {rec['deprecated']}"]
+        deprecated = _linkify(rec["deprecated"], known, rec["name"])
+        lines += ["", '!!! warning "Deprecated"', f"    {deprecated}"]
     return "\n".join(lines)
 
 
 def render(records: list[dict]) -> str:
+    known = {rec["name"] for rec in records}
     by_cat: dict[str, list[dict]] = {}
     for rec in records:
         by_cat.setdefault(rec["category"] or "Miscellaneous", []).append(rec)
@@ -133,8 +167,11 @@ def render(records: list[dict]) -> str:
             continue
         seen.add(cat)
         parts += ["", f"## {cat}"]
+        intro = _CATEGORY_INTRO.get(cat)
+        if intro:
+            parts += ["", intro]
         for rec in sorted(by_cat[cat], key=lambda r: r["name"]):
-            parts += ["", _entry(rec)]
+            parts += ["", _entry(rec, known)]
     return "\n".join(parts) + "\n"
 
 

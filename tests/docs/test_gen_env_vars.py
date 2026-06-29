@@ -124,6 +124,33 @@ def test_render_deprecated_admonition():
     assert "    use VLLM_RBLN_NEW" in out
 
 
+def test_render_category_intro():
+    out = gen.render([_rec("VLLM_RBLN_A", category="Attention")])
+    assert "## Attention" in out
+    assert "Attention kernel selection" in out
+
+
+def test_render_cross_links_known_vars():
+    out = gen.render(
+        [
+            _rec(
+                "VLLM_RBLN_A",
+                description="See VLLM_RBLN_B and self VLLM_RBLN_A and "
+                "ghost VLLM_RBLN_GHOST.",
+                category="Attention",
+            ),
+            _rec("VLLM_RBLN_B", category="Attention"),
+        ]
+    )
+    # known other var -> linked to its anchor
+    assert "[VLLM_RBLN_B](#vllm_rbln_b)" in out
+    # self-reference is not linked
+    assert "[VLLM_RBLN_A]" not in out
+    # unknown name (e.g. a deprecated alias) stays plain text
+    assert "ghost VLLM_RBLN_GHOST." in out
+    assert "[VLLM_RBLN_GHOST]" not in out
+
+
 def test_read_metadata_real_file():
     src = (_ROOT / "vllm_rbln" / "rbln_envs.py").read_text(encoding="utf-8")
     recs = gen.read_metadata(src)
