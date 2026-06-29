@@ -3,9 +3,12 @@ from pathlib import Path
 
 _MOD_PATH = (
     Path(__file__).resolve().parents[2]
-    / "tools" / "pre_commit" / "check_env_metadata.py"
+    / "tools"
+    / "pre_commit"
+    / "check_env_metadata.py"
 )
 _spec = importlib.util.spec_from_file_location("check_env_metadata", _MOD_PATH)
+assert _spec is not None and _spec.loader is not None
 check_env_metadata = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(check_env_metadata)
 
@@ -15,8 +18,10 @@ parse_source = check_env_metadata.parse_source
 
 def test_check_passes_when_consistent():
     env_keys = {"VLLM_RBLN_FOO", "VLLM_RBLN_BAR"}
-    meta = {"VLLM_RBLN_FOO": "A clear description.",
-            "VLLM_RBLN_BAR": "Another clear description."}
+    meta = {
+        "VLLM_RBLN_FOO": "A clear description.",
+        "VLLM_RBLN_BAR": "Another clear description.",
+    }
     assert check(env_keys, meta) == []
 
 
@@ -29,8 +34,7 @@ def test_check_flags_missing_metadata():
 
 def test_check_flags_orphan_metadata():
     env_keys = {"VLLM_RBLN_FOO"}
-    meta = {"VLLM_RBLN_FOO": "A clear description.",
-            "VLLM_RBLN_GHOST": "Stale entry."}
+    meta = {"VLLM_RBLN_FOO": "A clear description.", "VLLM_RBLN_GHOST": "Stale entry."}
     errors = check(env_keys, meta)
     assert any("VLLM_RBLN_GHOST" in e and "orphan" in e for e in errors)
 
@@ -50,7 +54,7 @@ def test_check_flags_too_short_description():
 
 
 def test_parse_source_extracts_keys_and_descriptions():
-    src = '''
+    src = """
 from vllm.envs import environment_variables as vllm_envs
 
 environment_variables = {
@@ -62,14 +66,14 @@ environment_variables = {
 ENV_METADATA = {
     "VLLM_RBLN_FOO": EnvMeta("A clear description.", default=True, type="bool"),
 }
-'''
+"""
     env_keys, meta = parse_source(src)
     assert env_keys == {"VLLM_RBLN_FOO"}
     assert meta == {"VLLM_RBLN_FOO": "A clear description."}
 
 
 def test_parse_source_handles_concatenated_description():
-    src = '''
+    src = """
 environment_variables = {
     **vllm_envs,
     "VLLM_RBLN_FOO": lambda: True,
@@ -81,8 +85,9 @@ ENV_METADATA = {
         "and the second part.",
         default=True, type="bool"),
 }
-'''
+"""
     env_keys, meta = parse_source(src)
     assert env_keys == {"VLLM_RBLN_FOO"}
-    assert meta == {"VLLM_RBLN_FOO": "First part of the description "
-                                     "and the second part."}
+    assert meta == {
+        "VLLM_RBLN_FOO": "First part of the description and the second part."
+    }

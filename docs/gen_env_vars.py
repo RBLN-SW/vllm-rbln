@@ -24,12 +24,17 @@ _FIELDS = ("description", "default", "type", "deprecated")
 
 def _find_metadata_dict(tree: ast.Module) -> ast.Dict | None:
     for node in ast.walk(tree):
-        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) \
-                and node.target.id == "ENV_METADATA" and isinstance(node.value, ast.Dict):
-            return node.value
-        if isinstance(node, ast.Assign) \
-                and any(isinstance(t, ast.Name) and t.id == "ENV_METADATA" for t in node.targets) \
-                and isinstance(node.value, ast.Dict):
+        if isinstance(node, ast.AnnAssign):
+            target = node.target
+        elif isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+        else:
+            continue
+        if (
+            isinstance(target, ast.Name)
+            and target.id == "ENV_METADATA"
+            and isinstance(node.value, ast.Dict)
+        ):
             return node.value
     return None
 
@@ -45,8 +50,13 @@ def read_metadata(src: str) -> list[dict]:
     for key, value in zip(meta_dict.keys, meta_dict.values):
         if not (isinstance(key, ast.Constant) and isinstance(key.value, str)):
             continue
-        rec = {"name": key.value, "description": "", "default": None,
-               "type": "", "deprecated": ""}
+        rec = {
+            "name": key.value,
+            "description": "",
+            "default": None,
+            "type": "",
+            "deprecated": "",
+        }
         if isinstance(value, ast.Call):
             if value.args:
                 rec["description"] = ast.literal_eval(value.args[0])
@@ -62,20 +72,25 @@ def _fmt_default(default) -> str:
 
 
 def _table(rows: list[dict]) -> str:
-    lines = ["| Name | Type | Default | Description |",
-             "|------|------|---------|-------------|"]
+    lines = [
+        "| Name | Type | Default | Description |",
+        "|------|------|---------|-------------|",
+    ]
     for r in rows:
         lines.append(
             f"| `{r['name']}` | {r['type']} | {_fmt_default(r['default'])} "
-            f"| {r['description']} |")
+            f"| {r['description']} |"
+        )
     return "\n".join(lines)
 
 
 def render(records: list[dict]) -> str:
-    active = sorted((r for r in records if not r["deprecated"]),
-                    key=lambda r: r["name"])
-    deprecated = sorted((r for r in records if r["deprecated"]),
-                        key=lambda r: r["name"])
+    active = sorted(
+        (r for r in records if not r["deprecated"]), key=lambda r: r["name"]
+    )
+    deprecated = sorted(
+        (r for r in records if r["deprecated"]), key=lambda r: r["name"]
+    )
     parts = [
         "# RBLN Environment Variables",
         "",

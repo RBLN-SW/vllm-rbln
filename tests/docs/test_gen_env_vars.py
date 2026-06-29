@@ -43,37 +43,60 @@ def _stub_open(name, mode="r"):
     return buf
 
 
-sys.modules["mkdocs_gen_files"] = types.SimpleNamespace(open=_stub_open)
+sys.modules["mkdocs_gen_files"] = types.SimpleNamespace(open=_stub_open)  # type: ignore[assignment]
 
 _spec = importlib.util.spec_from_file_location(
-    "gen_env_vars", _ROOT / "docs" / "gen_env_vars.py")
+    "gen_env_vars", _ROOT / "docs" / "gen_env_vars.py"
+)
+assert _spec is not None and _spec.loader is not None
 gen = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(gen)  # runs main() -> writes to _written via stub
 
 
 def test_render_active_row():
-    out = gen.render([
-        {"name": "VLLM_RBLN_A", "description": "Desc A.",
-         "default": True, "type": "bool", "deprecated": ""},
-    ])
+    out = gen.render(
+        [
+            {
+                "name": "VLLM_RBLN_A",
+                "description": "Desc A.",
+                "default": True,
+                "type": "bool",
+                "deprecated": "",
+            },
+        ]
+    )
     assert "# RBLN Environment Variables" in out
     assert "| `VLLM_RBLN_A` | bool | `True` | Desc A. |" in out
     assert "## Deprecated" not in out
 
 
 def test_render_none_default_is_blank():
-    out = gen.render([
-        {"name": "VLLM_RBLN_B", "description": "Desc B.",
-         "default": None, "type": "bool", "deprecated": ""},
-    ])
+    out = gen.render(
+        [
+            {
+                "name": "VLLM_RBLN_B",
+                "description": "Desc B.",
+                "default": None,
+                "type": "bool",
+                "deprecated": "",
+            },
+        ]
+    )
     assert "| `VLLM_RBLN_B` | bool |  | Desc B. |" in out
 
 
 def test_render_deprecated_section():
-    out = gen.render([
-        {"name": "VLLM_RBLN_OLD", "description": "Old one.",
-         "default": None, "type": "bool", "deprecated": "use VLLM_RBLN_NEW"},
-    ])
+    out = gen.render(
+        [
+            {
+                "name": "VLLM_RBLN_OLD",
+                "description": "Old one.",
+                "default": None,
+                "type": "bool",
+                "deprecated": "use VLLM_RBLN_NEW",
+            },
+        ]
+    )
     assert "## Deprecated" in out
     assert "VLLM_RBLN_OLD" in out
 
