@@ -1148,7 +1148,9 @@ class RBLNFlashAttentionMetadataBuilder(
         dyn_size_for_partitions = torch.clamp(
             cs - pidx * partition_len, 0, partition_len
         )
-        seq_lens_tensor = dyn_size_for_partitions
+        seq_lens_tensor = dyn_size_for_partitions.to(self.device)
+        block_tables_tensor = block_tables_tensor.to(self.device)
+        seq_idx = seq_idx.to(self.device)
 
         assert batch_pad is not None, "batch_pad is required for RBLN Attention Backend"
 
@@ -1170,7 +1172,7 @@ class RBLNFlashAttentionMetadataBuilder(
                     torch.ones(1, 1, prefill_chunk_size, prefill_chunk_size),
                     diagonal=1,
                 )
-                step = seq_idx[0]
+                step = seq_idx[0].cpu()
                 if step >= prefill_chunk_size:
                     chunked_attention_mask[:, :, :, :, :step] = 1
                 chunked_attention_mask[:, :, :, :, step : step + prefill_chunk_size] = (
@@ -1184,13 +1186,9 @@ class RBLNFlashAttentionMetadataBuilder(
             print("@@@@ seq_idx before pad: ", seq_idx)
             print("@@@@ seq_lens_tensor before pad: ", seq_lens_tensor)
             print("@@@@ block_tables_tensor before pad: ", block_tables_tensor)
-            seq_idx = rbln_utils.pad(seq_idx, 0, batch_pad).to(self.device)
-            seq_lens_tensor = rbln_utils.pad(seq_lens_tensor, 0, batch_pad).to(
-                self.device
-            )
-            block_tables_tensor = rbln_utils.pad(block_tables_tensor, 0, batch_pad).to(
-                self.device
-            )
+            seq_idx = rbln_utils.pad(seq_idx, 0, batch_pad)
+            seq_lens_tensor = rbln_utils.pad(seq_lens_tensor, 0, batch_pad)
+            block_tables_tensor = rbln_utils.pad(block_tables_tensor, 0, batch_pad)
             if not self.is_causal:
                 decode_attention_mask = torch.zeros(
                     batch_pad,
