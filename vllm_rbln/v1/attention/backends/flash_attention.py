@@ -1078,6 +1078,8 @@ class RBLNFlashAttentionMetadataBuilder(
     def _to_device_inplace(
         self, cpu_tensor: torch.Tensor, attr_name: str
     ) -> torch.Tensor:
+        print("@@@ attr_name: ", attr_name)
+        print("@@@ cpu_tensor: ", cpu_tensor)
         buf: torch.Tensor | None = getattr(self, attr_name)
         if (
             buf is None
@@ -1244,6 +1246,18 @@ class RBLNFlashAttentionMetadataBuilder(
             else:
                 seq_lens = seq_idx
 
+        # Set device buffer
+        cache_seq_lens = (
+            self._to_device_inplace(cache_seq_lens, "_swa_cache_seq_lens_buf")
+            if cache_seq_lens is not None
+            else None
+        )
+        cache_offsets = (
+            self._to_device_inplace(cache_offsets, "_swa_cache_offsets_buf")
+            if cache_offsets is not None
+            else None
+        )
+
         attn_metadata = RBLNFlashAttentionMetadata(
             num_actual_tokens=num_actual_tokens,
             max_query_len=max_query_len,
@@ -1261,16 +1275,8 @@ class RBLNFlashAttentionMetadataBuilder(
             prefix_scheduler_metadata=prefix_scheduler_metadata,
             is_prefill=is_prefill,
             attn_masks=attn_masks,
-            cache_seq_lens=self._to_device_inplace(
-                cache_seq_lens, "_swa_cache_seq_lens_buf"
-            )
-            if cache_seq_lens is not None
-            else None,
-            cache_offsets=self._to_device_inplace(
-                cache_offsets, "_swa_cache_offsets_buf"
-            )
-            if cache_offsets is not None
-            else None,
+            cache_seq_lens=cache_seq_lens,
+            cache_offsets=cache_offsets,
             local_block_tables=local_block_tables,
             swa_attn_masks=swa_attn_masks,
         )
