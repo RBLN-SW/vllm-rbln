@@ -275,10 +275,16 @@ class RBLNEagleProposer(EagleProposer):
                 block_numbers = clamped_positions[0] // self.block_size
             else:
                 block_numbers = clamped_positions // self.block_size
-            block_ids = common_attn_metadata.block_table_tensor.gather(
-                dim=1, index=block_numbers.view(-1, 1)
+            # NOTE(RBLN): With VLLM_RBLN_USE_DEVICE_TENSOR=1 the block table is
+            # kept on CPU while block_numbers (from self.positions.gpu) is on the
+            # RBLN device. gather requires self and index on the same device, so
+            # align the index to the table, then move block_ids back to the
+            # positions' device for the downstream slot_mapping arithmetic.
+            block_table_tensor = common_attn_metadata.block_table_tensor
+            block_ids = block_table_tensor.gather(
+                dim=1, index=block_numbers.view(-1, 1).to(block_table_tensor.device)
             )
-            block_ids = block_ids.view(-1)
+            block_ids = block_ids.view(-1).to(clamped_positions.device)
             if self.uses_mrope:
                 common_attn_metadata.slot_mapping = (
                     block_ids * self.block_size + clamped_positions[0] % self.block_size
