@@ -19,7 +19,7 @@ from pathlib import Path
 
 ENVS_PATH = Path(__file__).resolve().parent.parent / "vllm_rbln" / "rbln_envs.py"
 
-_FIELDS = ("description", "default", "type", "deprecated")
+_FIELDS = ("description", "default", "type", "deprecated", "category")
 
 
 def _find_metadata_dict(tree: ast.Module) -> ast.Dict | None:
@@ -56,6 +56,7 @@ def read_metadata(src: str) -> list[dict]:
             "default": None,
             "type": "",
             "deprecated": "",
+            "category": "",
         }
         if isinstance(value, ast.Call):
             if value.args:
@@ -67,57 +68,72 @@ def read_metadata(src: str) -> list[dict]:
     return records
 
 
+# Order in which functional categories are rendered. Any category not listed
+# here (and the empty/untagged one) is appended afterwards, alphabetically,
+# under its own name or "Miscellaneous".
+_CATEGORY_ORDER = [
+    "Compilation & model loading",
+    "Attention",
+    "Sampling & batching",
+    "Parallelism (TP / DP / Ray)",
+    "Mixture of Experts (MoE)",
+    "Device tensors & memory",
+    "Observability",
+    "Miscellaneous",
+]
+
+_INTRO = (
+    "Environment variables specific to vllm-rbln. All are prefixed with "
+    "`VLLM_RBLN_`. This page is generated from `ENV_METADATA` in "
+    "`vllm_rbln/rbln_envs.py`."
+)
+
 _BOOL_NOTE = (
-    "These variables are read as **true** when set to `1` or `true` "
-    "(case-insensitive). Any other value, or leaving them unset, is **false**."
+    '!!! note "Boolean variables"\n'
+    "    A `bool` variable is **true** when set to `1` or `true` "
+    "(case-insensitive). Any other value, or leaving it unset, is **false**."
 )
 
 
-def _entry(rec: dict) -> str:
-    """Render a single variable as a section: heading, description, default."""
-    lines = [f"### {rec['name']}", "", rec["description"]]
+def _meta_line(rec: dict) -> str:
+    """One-line type/default summary shown under each variable heading."""
+    parts = []
+    if rec["type"]:
+        parts.append(f"`{rec['type']}`")
     if rec["default"] is not None:
-        lines += ["", f"Defaults to `{rec['default']!r}`."]
+        parts.append(f"default: `{rec['default']!r}`")
+    return " · ".join(parts)
+
+
+def _entry(rec: dict) -> str:
+    """Render one variable: monospace heading, meta line, description."""
+    lines = [f"### `{rec['name']}`", ""]
+    meta = _meta_line(rec)
+    if meta:
+        lines += [meta, ""]
+    lines.append(rec["description"])
     if rec["deprecated"]:
-        lines += ["", f"**Deprecated.** {rec['deprecated']}"]
+        lines += ["", '!!! warning "Deprecated"', f"    {rec['deprecated']}"]
     return "\n".join(lines)
 
 
 def render(records: list[dict]) -> str:
-    active = [r for r in records if not r["deprecated"]]
-    deprecated = sorted(
-        (r for r in records if r["deprecated"]), key=lambda r: r["name"]
+    by_cat: dict[str, list[dict]] = {}
+    for rec in records:
+        by_cat.setdefault(rec["category"] or "Miscellaneous", []).append(rec)
+
+    ordered = _CATEGORY_ORDER + sorted(
+        cat for cat in by_cat if cat not in _CATEGORY_ORDER
     )
 
-    # Group active vars by value kind so booleans can share a parsing note.
-    groups = [
-        ("Boolean variables", [r for r in active if r["type"] == "bool"], _BOOL_NOTE),
-        ("Numeric variables", [r for r in active if r["type"] == "int"], ""),
-        (
-            "String and list variables",
-            [r for r in active if r["type"] not in ("bool", "int")],
-            "",
-        ),
-    ]
-
-    parts = [
-        "# RBLN Environment Variables",
-        "",
-        "Environment variables specific to vllm-rbln. All are prefixed with "
-        "`VLLM_RBLN_`. This page is generated from `ENV_METADATA` in "
-        "`vllm_rbln/rbln_envs.py`.",
-    ]
-    for title, items, note in groups:
-        if not items:
+    parts = ["# RBLN Environment Variables", "", _INTRO, "", _BOOL_NOTE]
+    seen = set()
+    for cat in ordered:
+        if cat in seen or cat not in by_cat:
             continue
-        parts += ["", f"## {title}"]
-        if note:
-            parts += ["", note]
-        for rec in sorted(items, key=lambda r: r["name"]):
-            parts += ["", _entry(rec)]
-    if deprecated:
-        parts += ["", "## Deprecated variables"]
-        for rec in deprecated:
+        seen.add(cat)
+        parts += ["", f"## {cat}"]
+        for rec in sorted(by_cat[cat], key=lambda r: r["name"]):
             parts += ["", _entry(rec)]
     return "\n".join(parts) + "\n"
 

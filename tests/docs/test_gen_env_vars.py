@@ -53,88 +53,75 @@ gen = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(gen)  # runs main() -> writes to _written via stub
 
 
-def test_render_active_section():
+def _rec(name, **kw):
+    rec = {
+        "name": name,
+        "description": "Desc.",
+        "default": None,
+        "type": "bool",
+        "deprecated": "",
+        "category": "Miscellaneous",
+    }
+    rec.update(kw)
+    return rec
+
+
+def test_render_entry_heading_and_meta_line():
     out = gen.render(
         [
-            {
-                "name": "VLLM_RBLN_A",
-                "description": "Desc A.",
-                "default": True,
-                "type": "bool",
-                "deprecated": "",
-            },
+            _rec(
+                "VLLM_RBLN_A",
+                description="Desc A.",
+                default=True,
+                type="bool",
+                category="Attention",
+            )
         ]
     )
     assert "# RBLN Environment Variables" in out
-    assert "## Boolean variables" in out
-    assert "### VLLM_RBLN_A" in out
+    assert "## Attention" in out
+    # monospace heading + type/default meta line
+    assert "### `VLLM_RBLN_A`" in out
+    assert "`bool` · default: `True`" in out
     assert "Desc A." in out
-    assert "Defaults to `True`." in out
-    assert "## Deprecated variables" not in out
 
 
-def test_render_none_default_omits_defaults_line():
+def test_render_none_default_omits_default():
+    out = gen.render([_rec("VLLM_RBLN_B", default=None, type="bool")])
+    assert "### `VLLM_RBLN_B`" in out
+    assert "`bool`" in out
+    assert "default:" not in out
+
+
+def test_render_groups_by_category_in_order():
     out = gen.render(
         [
-            {
-                "name": "VLLM_RBLN_B",
-                "description": "Desc B.",
-                "default": None,
-                "type": "bool",
-                "deprecated": "",
-            },
+            _rec("VLLM_RBLN_M1", category="Miscellaneous"),
+            _rec("VLLM_RBLN_C1", category="Compilation & model loading"),
+            _rec("VLLM_RBLN_A1", category="Attention"),
         ]
     )
-    assert "### VLLM_RBLN_B" in out
-    assert "Defaults to" not in out
-
-
-def test_render_groups_by_type():
-    out = gen.render(
-        [
-            {
-                "name": "VLLM_RBLN_B1",
-                "description": "b.",
-                "default": True,
-                "type": "bool",
-                "deprecated": "",
-            },
-            {
-                "name": "VLLM_RBLN_N1",
-                "description": "n.",
-                "default": 1,
-                "type": "int",
-                "deprecated": "",
-            },
-            {
-                "name": "VLLM_RBLN_S1",
-                "description": "s.",
-                "default": "x",
-                "type": "str",
-                "deprecated": "",
-            },
-        ]
+    assert "## Compilation & model loading" in out
+    assert "## Attention" in out
+    assert "## Miscellaneous" in out
+    # canonical order: Compilation before Attention before Miscellaneous
+    assert (
+        out.index("## Compilation & model loading")
+        < out.index("## Attention")
+        < out.index("## Miscellaneous")
     )
-    assert "## Boolean variables" in out
-    assert "## Numeric variables" in out
-    assert "## String and list variables" in out
 
 
-def test_render_deprecated_section():
-    out = gen.render(
-        [
-            {
-                "name": "VLLM_RBLN_OLD",
-                "description": "Old one.",
-                "default": None,
-                "type": "bool",
-                "deprecated": "use VLLM_RBLN_NEW",
-            },
-        ]
-    )
-    assert "## Deprecated variables" in out
-    assert "### VLLM_RBLN_OLD" in out
-    assert "**Deprecated.** use VLLM_RBLN_NEW" in out
+def test_render_untagged_category_falls_back_to_misc():
+    out = gen.render([_rec("VLLM_RBLN_X", category="")])
+    assert "## Miscellaneous" in out
+
+
+def test_render_deprecated_admonition():
+    out = gen.render([_rec("VLLM_RBLN_OLD", deprecated="use VLLM_RBLN_NEW")])
+    assert "### `VLLM_RBLN_OLD`" in out
+    assert '!!! warning "Deprecated"' in out
+    assert "    use VLLM_RBLN_NEW" in out
 
 
 def test_read_metadata_real_file():
@@ -146,6 +133,8 @@ def test_read_metadata_real_file():
     assert "VLLM_RBLN_COMPILE_MODEL" in names
     auto_port = next(r for r in recs if r["name"] == "VLLM_RBLN_AUTO_PORT")
     assert auto_port["default"] is None  # conditional default
+    # every entry is tagged with a functional category
+    assert all(r["category"] for r in recs)
 
 
 def test_module_main_wrote_env_vars_page():

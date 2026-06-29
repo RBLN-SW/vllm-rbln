@@ -54,6 +54,20 @@ nav:
   - Bucketing: bucketing.md
   - Sub-block Prefix Caching: sub_block_prefix_caching.md
 
+extra_css:
+  - stylesheets/extra.css
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+
 extra:
   version:
     provider: mike
