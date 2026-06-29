@@ -1226,19 +1226,21 @@ class RBLNFlashAttentionMetadataBuilder(
         #   for each batch, have sequence offset
         # * seq_lens_tensor(otherwise)      - [B, P],
         #   have dynamic size for each partition
-        # FIXME optimization?
-        if is_prefill:
-            seq_lens = seq_lens_tensor
-        elif isinstance(self.kv_cache_spec, MLAAttentionSpec):
+        # seq_idx is used only for batch-attention-opt decode (see shape note
+        # above); otherwise fall back to the per-partition seq_lens_tensor.
+        is_mla_decode = not is_prefill and isinstance(
+            self.kv_cache_spec, MLAAttentionSpec
+        )
+        if is_mla_decode:
             assert self.is_batch_attention_opt, (
                 "batch_attn_opt required for MLAAttention decoder"
             )
-            seq_lens = seq_idx
-        else:
-            if not self.is_batch_attention_opt or batch_pad <= 1:
-                seq_lens = seq_lens_tensor
-            else:
-                seq_lens = seq_idx
+        use_seq_idx = (
+            not is_prefill
+            and self.is_batch_attention_opt
+            and (is_mla_decode or batch_pad > 1)
+        )
+        seq_lens = seq_idx if use_seq_idx else seq_lens_tensor
 
         # Reuse the device buffer for cache_seq_lens and cache_offsets
         # to avoid extra vmem reallocation.
