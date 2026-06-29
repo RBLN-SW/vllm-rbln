@@ -18,6 +18,8 @@ Parses rbln_envs.py with the ast module (no import) so it stays free of the
 vllm runtime dependency and runs in pre-commit's isolated environment.
 """
 
+from __future__ import annotations
+
 import argparse
 import ast
 import sys

@@ -66,3 +66,23 @@ ENV_METADATA = {
     env_keys, meta = parse_source(src)
     assert env_keys == {"VLLM_RBLN_FOO"}
     assert meta == {"VLLM_RBLN_FOO": "A clear description."}
+
+
+def test_parse_source_handles_concatenated_description():
+    src = '''
+environment_variables = {
+    **vllm_envs,
+    "VLLM_RBLN_FOO": lambda: True,
+}
+
+ENV_METADATA = {
+    "VLLM_RBLN_FOO": EnvMeta(
+        "First part of the description "
+        "and the second part.",
+        default=True, type="bool"),
+}
+'''
+    env_keys, meta = parse_source(src)
+    assert env_keys == {"VLLM_RBLN_FOO"}
+    assert meta == {"VLLM_RBLN_FOO": "First part of the description "
+                                     "and the second part."}
