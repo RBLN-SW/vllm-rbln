@@ -61,6 +61,19 @@ class RblnPlatform(Platform):
     # VLLM_WORKER_MULTIPROC_METHOD=spawn (which re-import this module fresh)
     # observe identical values to the parent without any extra plumbing.
     _USE_VLLM_MODEL: bool = envs.VLLM_RBLN_USE_VLLM_MODEL
+
+    # The vLLM-model path runs on the RBLN device and requires torch-rbln
+    # (provides the torch.rbln extension); fail fast if it is missing.
+    if _USE_VLLM_MODEL:
+        try:
+            import torch.rbln  # noqa: F401
+        except ImportError as e:
+            raise ImportError(
+                "torch-rbln is not installed. VLLM_RBLN_USE_VLLM_MODEL=1 "
+                "requires torch-rbln (provides the torch.rbln extension). "
+                "Install torch-rbln to use the vLLM-model path."
+            ) from e
+
     plugin_name: str = "rbln"
     device_name: str = "rbln" if _USE_VLLM_MODEL else "cpu"
     device_type: str = "rbln" if _USE_VLLM_MODEL else "cpu"
