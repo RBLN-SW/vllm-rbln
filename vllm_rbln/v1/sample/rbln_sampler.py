@@ -38,6 +38,7 @@ def build_compile_options() -> dict:
         options["mode"] = "strict"
     # FIXME rename this to `num_devices`
     options["tensor_parallel_size"] = 1
+    options["model_trace_method"] = "export"
     return options
 
 
@@ -81,7 +82,6 @@ class RBLNTopKTopPSampler(nn.Module):
         )
 
         options = build_compile_options()
-        options["model_trace_method"] = "export"
 
         self._compiled_rbln_topk_topp_sampler = torch.compile(
             rbln_top_k_top_p_sample,

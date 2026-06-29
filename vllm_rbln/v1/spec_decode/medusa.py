@@ -16,7 +16,6 @@ from copy import copy
 
 import torch
 import torch.nn as nn
-from rebel import CompileContext
 from vllm.config import VllmConfig
 from vllm.distributed import get_dp_group, get_pp_group, get_tp_group
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -30,8 +29,6 @@ from vllm_rbln.torch_compile_backend import logged_rbln_backend
 class RBLNMedusaProposer(MedusaProposer):
     def __init__(self, vllm_config: VllmConfig, device: torch.device) -> None:
         super().__init__(vllm_config, device)
-
-        self.compile_context = CompileContext(use_weight_sharing=True)
 
     def load_model(self, target_model: nn.Module) -> None:
         super().load_model(target_model)
@@ -62,8 +59,14 @@ class RBLNMedusaProposer(MedusaProposer):
         process_group_dict[DP.device_group.group_name] = DP.ranks
         process_group_dict[DP.cpu_group.group_name] = DP.ranks
 
+        # NOTE(RBLN): Match the main model runner's compile options. The draft
+        # model must NOT pass its own compile_context: in export mode the backend
+        # auto-uses a single global per-device CompileContext for const-buffer
+        # index coordination. Supplying a separate context makes the draft graphs
+        # reserve buf_idx in an independent pool, which then collides with the
+        # main model's const buffers (SYS_TASK_ABORTED / "const buffer index
+        # collision").
         options = {
-            "compile_context": self.compile_context,
             "tensor_parallel_size": envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
             "process_group_dict": process_group_dict,
             "guard_filter_fn": torch.compiler.keep_tensor_guards_unsafe,
