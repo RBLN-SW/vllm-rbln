@@ -172,7 +172,7 @@ def rejection_sample(
     batch_size = len(num_draft_tokens)
     num_tokens = draft_token_ids.shape[0]
     vocab_size = target_probs.shape[-1]
-    device = target_probs.device  # FIXME device tensor is not allowed.
+    device = target_probs.device
     assert draft_token_ids.is_contiguous()
     assert draft_probs is None or draft_probs.is_contiguous()
     assert target_probs.is_contiguous()
