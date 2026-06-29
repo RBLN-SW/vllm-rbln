@@ -52,7 +52,6 @@ PROMPTS = [
 ]
 
 
-@pytest.mark.CR03
 def test_weight_only_fp8_greedy_generation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

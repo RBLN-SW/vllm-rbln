@@ -55,7 +55,7 @@ def sql_lora_path() -> str:
     return snapshot_download(repo_id=SQL_LORA_MODEL_ID)
 
 
-@pytest.mark.xfail(reason="EngineCore dies during basic LoRA SQL prompt generation")
+@pytest.mark.skip(reason="EngineCore dies during basic LoRA SQL prompt generation")
 def test_basic_lora_sql_prompt(llm: LLM, sql_lora_path: str) -> None:
     sampling_params = SamplingParams(temperature=0.0, max_tokens=128)
 

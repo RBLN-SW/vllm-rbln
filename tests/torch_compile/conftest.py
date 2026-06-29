@@ -24,39 +24,12 @@ from vllm.config import (
 )
 from vllm.plugins import load_general_plugins
 
-# SOC markers: a test marked with one of these runs only when the current
-# RBLN target SOC matches; on any other SOC it is skipped. Matching is by
-# substring so it works regardless of the vendor prefix (e.g. REBEL-CR03,
-# RBLN-CA25).
-SOC_MARKERS = ("CR03", "CA25")
 
+def pytest_collection_modifyitems(items):
+    """Run ``test_rbln_envs`` first in the session.
 
-def _current_target_soc() -> str | None:
-    """Resolve the current RBLN target SOC (upper-cased) for marker skipping.
-
-    Prefer the ``RBLN_TARGET_SOC`` env var (set on CPU-only/compile workers
-    and in CI); fall back to the live NPU name when an NPU is mounted.
-    Returns ``None`` when the SOC cannot be determined.
-    """
-    soc = os.environ.get("RBLN_TARGET_SOC")
-    if soc:
-        return soc.upper()
-    try:
-        import rebel
-
-        name = rebel.get_npu_name()
-        if name:
-            return name.upper()
-    except Exception:
-        pass
-    return None
-
-
-def pytest_collection_modifyitems(config, items):
-    """Run ``test_rbln_envs`` first, then apply SOC-marker skips.
-
-    Ordering: ``vllm_rbln.platform`` mutates module-level ``rbln_envs``
-    attributes at runtime (e.g. sets ``VLLM_RBLN_SAMPLER = False`` when
+    ``vllm_rbln.platform`` mutates module-level ``rbln_envs`` attributes
+    at runtime (e.g. sets ``VLLM_RBLN_SAMPLER = False`` when
     ``speculative_config`` is present, see ``platform.py:260``).  Any
     earlier test that instantiates a vLLM config with spec-decode
     enabled leaves the env-defaults test asserting on dirty state and
@@ -64,37 +37,11 @@ def pytest_collection_modifyitems(config, items):
     it lives in the module ``__dict__`` and shadows the lazy
     ``__getattr__`` lambda.  Run the env-defaults test first instead of
     polluting the test source with reset boilerplate.
-
-    SOC markers: tests marked with a SOC name (see ``SOC_MARKERS``) only
-    run when the current target SOC matches; otherwise they are skipped.
     """
     items.sort(key=lambda item: 0 if item.name == "test_rbln_envs" else 1)
 
-    target_soc = _current_target_soc()
-    for item in items:
-        required = [soc for soc in SOC_MARKERS if item.get_closest_marker(soc)]
-        if not required:
-            continue
-        if target_soc is None:
-            reason = (
-                f"requires SOC {'/'.join(required)} but the target SOC could "
-                "not be determined (set RBLN_TARGET_SOC)"
-            )
-            item.add_marker(pytest.mark.skip(reason=reason))
-        elif not any(soc in target_soc for soc in required):
-            reason = (
-                f"requires SOC {'/'.join(required)}; current target is {target_soc}"
-            )
-            item.add_marker(pytest.mark.skip(reason=reason))
-
 
 def pytest_configure(config):
-    for soc in SOC_MARKERS:
-        config.addinivalue_line(
-            "markers",
-            f"{soc}: run only when the RBLN target SOC is {soc} "
-            "(skipped on any other SOC)",
-        )
     # Must run before test collection so that monkey patches applied by
     # `register_ops()` are in place before any test module does
     # `from vllm.xxx import yyy` at import time and captures the original symbol.
