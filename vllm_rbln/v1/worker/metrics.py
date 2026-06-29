@@ -299,6 +299,29 @@ class PerformanceTracker:
             prepare_time,
         )
 
+    def record(self, report: "StepReport") -> None:
+        if report.is_prefill:
+            self.record_prefill(
+                report.latency,
+                report.token_count,
+                host_time=report.host_time,
+                device_time=report.device_time,
+                ccl_time=report.ccl_time,
+                prepare_time=report.prepare_time,
+                request_ids=report.request_ids,
+            )
+        else:
+            self.record_decode(
+                report.latency,
+                report.token_count,
+                host_time=report.host_time,
+                device_time=report.device_time,
+                ccl_time=report.ccl_time,
+                prepare_time=report.prepare_time,
+                padded_decode=report.padded_decode,
+                request_ids=report.request_ids,
+            )
+
     def print_final_stats(self):
         _attach_metrics_file_handler()
         logger.info("=" * 80)
@@ -345,7 +368,11 @@ class StepReport:
         start_time: float,
         end_time: float,
         reports: list[dict] | None,
-        **meta,
+        *,
+        token_count: int = 0,
+        is_prefill: bool = False,
+        padded_decode: bool = False,
+        request_ids: list[str] | None = None,
     ) -> "StepReport":
         host_time = device_time = ccl_time = prepare_time = None
         if reports:
@@ -358,11 +385,14 @@ class StepReport:
             )
         return cls(
             latency=end_time - start_time,
+            token_count=token_count,
             host_time=host_time,
             device_time=device_time,
             ccl_time=ccl_time,
             prepare_time=prepare_time,
-            **meta,
+            is_prefill=is_prefill,
+            padded_decode=padded_decode,
+            request_ids=request_ids,
         )
 
     def merged_with(self, other: "StepReport | None") -> "StepReport":
@@ -384,29 +414,6 @@ class StepReport:
             prepare_time=_add(self.prepare_time, other.prepare_time),
         )
 
-    def record(self, performance_tracker: PerformanceTracker) -> None:
-        if self.is_prefill:
-            performance_tracker.record_prefill(
-                self.latency,
-                self.token_count,
-                host_time=self.host_time,
-                device_time=self.device_time,
-                ccl_time=self.ccl_time,
-                prepare_time=self.prepare_time,
-                request_ids=self.request_ids,
-            )
-        else:
-            performance_tracker.record_decode(
-                self.latency,
-                self.token_count,
-                host_time=self.host_time,
-                device_time=self.device_time,
-                ccl_time=self.ccl_time,
-                prepare_time=self.prepare_time,
-                padded_decode=self.padded_decode,
-                request_ids=self.request_ids,
-            )
-
 
 def collect_metrics(
     performance_tracker: PerformanceTracker,
@@ -416,10 +423,12 @@ def collect_metrics(
     reports: list[dict],
     token_count: int,
 ) -> None:
-    StepReport.from_reports(
-        start_time,
-        end_time,
-        reports,
-        token_count=token_count,
-        is_prefill=is_prefill,
-    ).record(performance_tracker)
+    performance_tracker.record(
+        StepReport.from_reports(
+            start_time,
+            end_time,
+            reports,
+            token_count=token_count,
+            is_prefill=is_prefill,
+        )
+    )

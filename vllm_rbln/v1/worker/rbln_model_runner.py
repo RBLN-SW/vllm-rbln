@@ -602,7 +602,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
     def _flush_pending_model_report(self):
         if self.performance_tracker is not None and self._pending_model_report:
-            self._pending_model_report.record(self.performance_tracker)
+            self.performance_tracker.record(self._pending_model_report)
             self._pending_model_report = None
 
     def _get_positions(self, num_tokens: Any):
@@ -2169,7 +2169,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 if model_report is not None
                 else sampler_report
             )
-            combined.record(self.performance_tracker)
+            self.performance_tracker.record(combined)
 
         return sampler_output
 
