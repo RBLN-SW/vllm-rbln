@@ -89,15 +89,27 @@ class RBLNCompileSpec:
             spec = cls._for_decoder(batch_size, block_size, max_model_len, num_devices)
         elif is_pooling_arch(config):
             spec = cls._for_pooling(
-                config, batch_size, block_size, max_model_len, num_devices
+                config,
+                batch_size,
+                block_size,
+                max_model_len,
+                num_devices,
             )
         elif is_multi_modal(config):
             spec = cls._for_multimodal(
-                config, batch_size, block_size, max_model_len, num_devices
+                config,
+                batch_size,
+                block_size,
+                max_model_len,
+                num_devices,
             )
         elif is_enc_dec_arch(config):
             spec = cls._for_enc_dec(
-                config, batch_size, block_size, max_model_len, num_devices
+                config,
+                batch_size,
+                block_size,
+                max_model_len,
+                num_devices,
             )
         else:
             architectures = getattr(config, "architectures", [])
