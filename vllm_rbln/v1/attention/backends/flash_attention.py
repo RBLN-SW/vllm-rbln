@@ -1118,7 +1118,9 @@ class RBLNFlashAttentionMetadataBuilder(
         step = seq_idx[0].cpu()
         if step >= prefill_chunk_size:
             chunked_attention_mask[:, :, :, :, :step] = 1
-        chunked_attention_mask[:, :, :, :, step : step + prefill_chunk_size] = causal_mask
+        chunked_attention_mask[:, :, :, :, step : step + prefill_chunk_size] = (
+            causal_mask
+        )
         # FIXME cpu handling -> device?
         return chunked_attention_mask.to(self.device)
 
