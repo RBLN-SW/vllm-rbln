@@ -67,7 +67,7 @@ class RBLNMedusaProposer(MedusaProposer):
         # main model's const buffers (SYS_TASK_ABORTED / "const buffer index
         # collision").
         options = {
-            "tensor_parallel_size": envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
+            "num_devices": envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
             "process_group_dict": process_group_dict,
             "guard_filter_fn": torch.compiler.keep_tensor_guards_unsafe,
             "mode": "strict",
