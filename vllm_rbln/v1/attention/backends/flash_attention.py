@@ -1080,8 +1080,6 @@ class RBLNFlashAttentionMetadataBuilder(
     def _to_device_inplace(
         self, cpu_tensor: torch.Tensor, attr_name: str
     ) -> torch.Tensor:
-        print("@@@ attr_name: ", attr_name)
-        print("@@@ cpu_tensor: ", cpu_tensor)
         buf: torch.Tensor | None = getattr(self, attr_name)
         if (
             buf is None
