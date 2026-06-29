@@ -164,13 +164,16 @@ ENV_METADATA: dict[str, EnvMeta] = {
     "VLLM_RBLN_DISABLE_OFFLOAD": EnvMeta(
         "Disable RBLN file offloading during model load / warm-up even "
         "when VLLM_RBLN_USE_DEVICE_TENSOR is set. Kill-switch for the "
-        "offload path.",
+        "offload path; weight host backings stay resident instead of "
+        "being paged to disk.",
         default=False, type="bool"),
     "VLLM_RBLN_COMPILE_ONLY": EnvMeta(
         "Compile-only mode for NPU-less (CPU-only) hosts such as CI "
         "build workers. Compiles + caches each graph on a dummy device; "
-        "the cache is later reused by a real NPU host. Set "
-        "RBLN_TARGET_SOC (e.g. RBLN-CA25) on a host without an NPU.",
+        "the cache is later reused by a real NPU host via cache-hit. "
+        "The target SOC is taken from rebel.get_npu_name(), which falls "
+        "back to RBLN_TARGET_SOC (e.g. RBLN-CA25) on a host without an "
+        "NPU.",
         default=False, type="bool"),
 }
 
@@ -311,135 +314,106 @@ def use_auto_port() -> bool:
 # extended environments
 environment_variables = {
     **vllm_envs,
-    # If true, will compile models using torch.compile.
-    # Otherwise, run the CPU eager mode, if possible.
     "VLLM_RBLN_COMPILE_MODEL": (
         lambda: (
             os.environ.get("VLLM_RBLN_COMPILE_MODEL", "True").lower() in ("true", "1")
         )
     ),
-    # If true, will compile models using strict mode.
     "VLLM_RBLN_COMPILE_STRICT_MODE": (
         lambda: (
             os.environ.get("VLLM_RBLN_COMPILE_STRICT_MODE", "False").lower()
             in ("true", "1")
         )
     ),
-    # Number of NPU devices per local rank (was VLLM_RBLN_TP_SIZE).
     "VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK": get_num_devices_per_local_rank,
-    # Use customized sampler
     "VLLM_RBLN_SAMPLER": (
         lambda: os.environ.get("VLLM_RBLN_SAMPLER", "True").lower() in ("true", "1")
     ),
-    # Enable warm_up
     "VLLM_RBLN_ENABLE_WARM_UP": (
         lambda: (
             os.environ.get("VLLM_RBLN_ENABLE_WARM_UP", "True").lower() in ("true", "1")
         )
     ),
-    # If true, it uses the natively compiled vLLM model
-    # rather than the optimum-rbln compiled model.
     "VLLM_RBLN_USE_VLLM_MODEL": (
         lambda: (
             os.environ.get("VLLM_RBLN_USE_VLLM_MODEL", "False").lower() in ("true", "1")
         )
     ),
-    # Use flash attention for causal attention
     "VLLM_RBLN_FLASH_CAUSAL_ATTN": (
         lambda: (
             os.environ.get("VLLM_RBLN_FLASH_CAUSAL_ATTN", "True").lower()
             in ("true", "1")
         )
     ),
-    # Use batch attention optimization for paged attention
     "VLLM_RBLN_BATCH_ATTN_OPT": (
         lambda: (
             os.environ.get("VLLM_RBLN_BATCH_ATTN_OPT", "False").lower() in ("true", "1")
         )
     ),
-    # Disable multimodal input
     "VLLM_RBLN_DISABLE_MM": (
         lambda: os.environ.get("VLLM_RBLN_DISABLE_MM", "False").lower() in ("true", "1")
     ),
-    # DP implementation, see choices in get_dp_impl
     "VLLM_RBLN_DP_IMPL": get_dp_impl,
-    # If true, it uses the tokens mask applied to moe expert kernel
     "VLLM_RBLN_USE_MOE_TOKENS_MASK": (
         lambda: (
             os.environ.get("VLLM_RBLN_USE_MOE_TOKENS_MASK", "True").lower()
             in ("true", "1")
         )
     ),
-    # If true, it specializes the cases where all instances are at decode stage
     "VLLM_RBLN_SPECIALIZE_MOE_DECODE": (
         lambda: (
             os.environ.get("VLLM_RBLN_SPECIALIZE_MOE_DECODE", "True").lower()
             in ("true", "1")
         )
     ),
-    # enforce model data type into fp32 not model_config.dtype
     "VLLM_RBLN_ENFORCE_MODEL_FP32": (
         lambda: (
             os.environ.get("VLLM_RBLN_ENFORCE_MODEL_FP32", "False").lower()
             in ("true", "1")
         )
     ),
-    # DP_INPUT_ALL_GATHER, use DP input all_gather
     "VLLM_RBLN_DP_INPUT_ALL_GATHER": (
         lambda: (
             os.environ.get("VLLM_RBLN_DP_INPUT_ALL_GATHER", "True").lower()
             in ("true", "1")
         )
     ),
-    # LOGITS_ALL_GATHER, include logits all_gather into model compilation
     "VLLM_RBLN_LOGITS_ALL_GATHER": (
         lambda: (
             os.environ.get("VLLM_RBLN_LOGITS_ALL_GATHER", "True").lower()
             in ("true", "1")
         )
     ),
-    # Number of Ray nodes
     "VLLM_RBLN_NUM_RAY_NODES": lambda: int(
         os.environ.get("VLLM_RBLN_NUM_RAY_NODES", 1)
     ),
     "VLLM_RBLN_METRICS": (
         lambda: os.environ.get("VLLM_RBLN_METRICS", "False").lower() in ("true", "1")
     ),
-    # Mirror the final performance report to this file (in addition to stdout).
-    # The worker pid is appended before the extension to keep TP/DP workers
-    # from clobbering each other. Empty disables file output.
     "VLLM_RBLN_METRICS_FILE": lambda: os.environ.get("VLLM_RBLN_METRICS_FILE", ""),
-    # Enable NUMA-based CPU affinity binding for OpenMP threads
     "VLLM_RBLN_NUMA": (
         lambda: os.environ.get("VLLM_RBLN_NUMA", "True").lower() in ("true", "1")
     ),
     "VLLM_RBLN_SORT_BATCH": (
         lambda: os.environ.get("VLLM_RBLN_SORT_BATCH", "False").lower() in ("true", "1")
     ),
-    # Decode batch bucket strategy [exponential, exp, linear, manual]
     "VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY": get_decode_batch_bucket_strategy,
-    # Decode batch bucket min
     "VLLM_RBLN_DECODE_BATCH_BUCKET_MIN": lambda: int(
         os.environ.get("VLLM_RBLN_DECODE_BATCH_BUCKET_MIN", 1)
     ),
-    # Decode batch bucket step
     "VLLM_RBLN_DECODE_BATCH_BUCKET_STEP": lambda: int(
         os.environ.get("VLLM_RBLN_DECODE_BATCH_BUCKET_STEP", 2)
     ),
-    # Decode batch bucket limit
     "VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT": lambda: int(
         os.environ.get("VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT", 1)
     ),
-    # Auto port
     "VLLM_RBLN_AUTO_PORT": use_auto_port,
-    # Decode batch bucket manual buckets
     "VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS": get_decode_batch_bucket_manual_buckets,  # noqa E501
     "VLLM_RBLN_USE_CUSTOM_KERNEL": (
         lambda: (
             os.environ.get("RBLN_USE_CUSTOM_KERNEL", "False").lower() in ("true", "1")
         )
     ),
-    # Use reduce_scatter instead of all_reduce in MoE combine phase
     "VLLM_RBLN_MOE_REDUCE_SCATTER": (
         lambda: (
             os.environ.get("VLLM_RBLN_MOE_REDUCE_SCATTER", "False").lower()
@@ -449,49 +423,33 @@ environment_variables = {
     "VLLM_RBLN_PROFILER": (
         lambda: os.environ.get("RBLN_PROFILER", "False").lower() in ("true", "1")
     ),
-    # Use all2all dispatch instead of all-gather for MoE DP dispatch
     "VLLM_RBLN_DISPATCH_ALL2ALL": (
         lambda: (
             os.environ.get("VLLM_RBLN_DISPATCH_ALL2ALL", "False").lower()
             in ("true", "1")
         )
     ),
-    # Use all2all combine instead of reduce-scatter for MoE DP combine
     "VLLM_RBLN_COMBINE_ALL2ALL": (
         lambda: (
             os.environ.get("VLLM_RBLN_COMBINE_ALL2ALL", "False").lower()
             in ("true", "1")
         )
     ),
-    # Enable sub-block prefix caching.
-    # Sub-block size equals max_num_batched_tokens (prefill chunk size).
     "VLLM_RBLN_SUB_BLOCK_CACHE": lambda: (
         os.environ.get("VLLM_RBLN_SUB_BLOCK_CACHE", "True").lower() in ("true", "1")
     ),
-    # Use RBLN device tensors end-to-end (platform device_type="rbln",
-    # KV cache / inputs on device, CPU-first attention metadata, padded
-    # sampling metadata, no CompileContext). Opt-in until stable.
     "VLLM_RBLN_USE_DEVICE_TENSOR": (
         lambda: (
             os.environ.get("VLLM_RBLN_USE_DEVICE_TENSOR", "False").lower()
             in ("true", "1")
         )
     ),
-    # Disable RBLN file offloading during model load / warm-up even when
-    # VLLM_RBLN_USE_DEVICE_TENSOR is set. Kill-switch for the offload path;
-    # weight host backings stay resident instead of being paged to disk.
     "VLLM_RBLN_DISABLE_OFFLOAD": (
         lambda: (
             os.environ.get("VLLM_RBLN_DISABLE_OFFLOAD", "False").lower()
             in ("true", "1")
         )
     ),
-    # Compile-only mode for NPU-less (CPU-only) hosts such as CI build workers.
-    # When set, the rbln torch.compile backend compiles + caches each graph and
-    # builds its runtime on a dummy device (no NPU required); the populated
-    # cache is later reused by a real NPU host via cache-hit. The target SOC is
-    # taken from rebel.get_npu_name(), which falls back to RBLN_TARGET_SOC, so
-    # set RBLN_TARGET_SOC (e.g. RBLN-CA25) on a host without an NPU mounted.
     "VLLM_RBLN_COMPILE_ONLY": (
         lambda: (
             os.environ.get("VLLM_RBLN_COMPILE_ONLY", "False").lower() in ("true", "1")
