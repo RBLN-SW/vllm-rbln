@@ -53,7 +53,7 @@ gen = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(gen)  # runs main() -> writes to _written via stub
 
 
-def test_render_active_row():
+def test_render_active_section():
     out = gen.render(
         [
             {
@@ -66,11 +66,14 @@ def test_render_active_row():
         ]
     )
     assert "# RBLN Environment Variables" in out
-    assert "| `VLLM_RBLN_A` | bool | `True` | Desc A. |" in out
-    assert "## Deprecated" not in out
+    assert "## Boolean variables" in out
+    assert "### VLLM_RBLN_A" in out
+    assert "Desc A." in out
+    assert "Defaults to `True`." in out
+    assert "## Deprecated variables" not in out
 
 
-def test_render_none_default_is_blank():
+def test_render_none_default_omits_defaults_line():
     out = gen.render(
         [
             {
@@ -82,7 +85,39 @@ def test_render_none_default_is_blank():
             },
         ]
     )
-    assert "| `VLLM_RBLN_B` | bool |  | Desc B. |" in out
+    assert "### VLLM_RBLN_B" in out
+    assert "Defaults to" not in out
+
+
+def test_render_groups_by_type():
+    out = gen.render(
+        [
+            {
+                "name": "VLLM_RBLN_B1",
+                "description": "b.",
+                "default": True,
+                "type": "bool",
+                "deprecated": "",
+            },
+            {
+                "name": "VLLM_RBLN_N1",
+                "description": "n.",
+                "default": 1,
+                "type": "int",
+                "deprecated": "",
+            },
+            {
+                "name": "VLLM_RBLN_S1",
+                "description": "s.",
+                "default": "x",
+                "type": "str",
+                "deprecated": "",
+            },
+        ]
+    )
+    assert "## Boolean variables" in out
+    assert "## Numeric variables" in out
+    assert "## String and list variables" in out
 
 
 def test_render_deprecated_section():
@@ -97,8 +132,9 @@ def test_render_deprecated_section():
             },
         ]
     )
-    assert "## Deprecated" in out
-    assert "VLLM_RBLN_OLD" in out
+    assert "## Deprecated variables" in out
+    assert "### VLLM_RBLN_OLD" in out
+    assert "**Deprecated.** use VLLM_RBLN_NEW" in out
 
 
 def test_read_metadata_real_file():

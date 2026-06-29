@@ -67,41 +67,58 @@ def read_metadata(src: str) -> list[dict]:
     return records
 
 
-def _fmt_default(default) -> str:
-    return "" if default is None else f"`{default!r}`"
+_BOOL_NOTE = (
+    "These variables are read as **true** when set to `1` or `true` "
+    "(case-insensitive). Any other value, or leaving them unset, is **false**."
+)
 
 
-def _table(rows: list[dict]) -> str:
-    lines = [
-        "| Name | Type | Default | Description |",
-        "|------|------|---------|-------------|",
-    ]
-    for r in rows:
-        lines.append(
-            f"| `{r['name']}` | {r['type']} | {_fmt_default(r['default'])} "
-            f"| {r['description']} |"
-        )
+def _entry(rec: dict) -> str:
+    """Render a single variable as a section: heading, description, default."""
+    lines = [f"### {rec['name']}", "", rec["description"]]
+    if rec["default"] is not None:
+        lines += ["", f"Defaults to `{rec['default']!r}`."]
+    if rec["deprecated"]:
+        lines += ["", f"**Deprecated.** {rec['deprecated']}"]
     return "\n".join(lines)
 
 
 def render(records: list[dict]) -> str:
-    active = sorted(
-        (r for r in records if not r["deprecated"]), key=lambda r: r["name"]
-    )
+    active = [r for r in records if not r["deprecated"]]
     deprecated = sorted(
         (r for r in records if r["deprecated"]), key=lambda r: r["name"]
     )
+
+    # Group active vars by value kind so booleans can share a parsing note.
+    groups = [
+        ("Boolean variables", [r for r in active if r["type"] == "bool"], _BOOL_NOTE),
+        ("Numeric variables", [r for r in active if r["type"] == "int"], ""),
+        (
+            "String and list variables",
+            [r for r in active if r["type"] not in ("bool", "int")],
+            "",
+        ),
+    ]
+
     parts = [
         "# RBLN Environment Variables",
         "",
         "Environment variables specific to vllm-rbln. All are prefixed with "
         "`VLLM_RBLN_`. This page is generated from `ENV_METADATA` in "
         "`vllm_rbln/rbln_envs.py`.",
-        "",
-        _table(active),
     ]
+    for title, items, note in groups:
+        if not items:
+            continue
+        parts += ["", f"## {title}"]
+        if note:
+            parts += ["", note]
+        for rec in sorted(items, key=lambda r: r["name"]):
+            parts += ["", _entry(rec)]
     if deprecated:
-        parts += ["", "## Deprecated", "", _table(deprecated)]
+        parts += ["", "## Deprecated variables"]
+        for rec in deprecated:
+            parts += ["", _entry(rec)]
     return "\n".join(parts) + "\n"
 
 
