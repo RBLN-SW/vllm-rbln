@@ -36,7 +36,7 @@ dependencies = [
     "setuptools>=64",
     "setuptools-scm>=8",
     "pyyaml",
-    "datasets",
+    "datasets>=4.0.0",
     "qwen_vl_utils",
     "vllm==0.22.0+cpu",
     "fastapi[standard]<0.137",
@@ -44,7 +44,7 @@ dependencies = [
     "torchvision",
     "torchaudio",
     "torchcodec",
-    "optimum-rbln>=0.11.0a15",
+    "optimum-rbln>=0.11.0",
 ]
 
 [project.optional-dependencies]
