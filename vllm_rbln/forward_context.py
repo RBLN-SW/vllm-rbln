@@ -139,6 +139,35 @@ class RBLNDPMetadata(DPMetadata):
 
         if any_prefill:
             num_reqs_across_dp_cpu = None
+            # [ragged-probe-dp] (fsw-inference#356) num_reqs_across_dp -> None
+            # because >=1 DP rank is in prefill this step. When the LOCAL rank
+            # is decode (is_prefill=False) this is exactly what forces
+            # max_tokens_per_req_across_dp=None upstream (get_dp_padding path-3),
+            # disabling the speculative pad while a stale per-req slide may still
+            # be applied -> ragged input_ids -> view(num_reqs,-1) crash. Decode
+            # the all-reduced word to show WHICH rank(s) prefilled. Silent unless
+            # the local rank is decode (the crash-relevant contradiction).
+            if not is_prefill:
+                _per_rank = [
+                    (
+                        _r,
+                        int(_e) & token_mask,
+                        (int(_e) & req_mask_shifted) >> token_bits,
+                        bool(int(_e) & prefill_flag),
+                    )
+                    for _r, _e in enumerate(encoded_across_dp.tolist())
+                ]
+                logger.warning(
+                    "[ragged-probe-dp] num_reqs_across_dp=None (any_prefill "
+                    "across DP) local_rank=%d local_is_prefill=%s "
+                    "local_num_tokens=%d local_num_reqs=%d "
+                    "per_rank[(rank,tokens,reqs,is_prefill)]=%s",
+                    dp_rank,
+                    is_prefill,
+                    num_tokens,
+                    num_reqs,
+                    _per_rank,
+                )
         else:
             req_mask_t = torch.tensor(
                 [req_mask_shifted] * dp_size, device="cpu", dtype=torch.int32
