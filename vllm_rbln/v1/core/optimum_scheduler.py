@@ -187,11 +187,11 @@ class RBLNOptimumScheduler(Scheduler):
         archs = getattr(vllm_config.model_config.hf_config, "architectures", None) or []
         needs_chunked_prefill_pad = any("Gemma3" in a or "Gemma4" in a for a in archs)
         prefill_chunk_size = None
-        image_prefill_chunk_sizes = None
+        image_prefill_chunk_size = None
         if needs_chunked_prefill_pad and vllm_config.additional_config is not None:
             prefill_chunk_size = vllm_config.additional_config.get("prefill_chunk_size")
-            image_prefill_chunk_sizes = vllm_config.additional_config.get(
-                "image_prefill_chunk_sizes"
+            image_prefill_chunk_size = vllm_config.additional_config.get(
+                "image_prefill_chunk_size"
             )
 
         # Create the KV cache manager.
@@ -213,7 +213,7 @@ class RBLNOptimumScheduler(Scheduler):
             max_num_seqs=self.max_num_running_reqs,
             is_encoder_decoder=self.is_encoder_decoder,
             prefill_chunk_size=prefill_chunk_size,
-            image_prefill_chunk_sizes=image_prefill_chunk_sizes,
+            image_prefill_chunk_size=image_prefill_chunk_size,
             needs_chunked_prefill_pad=needs_chunked_prefill_pad,
         )
         self.perf_metrics: ModelMetrics | None = None

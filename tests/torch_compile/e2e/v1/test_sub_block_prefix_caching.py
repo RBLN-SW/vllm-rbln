@@ -66,8 +66,8 @@ def _generated_token_ids(outputs) -> list[list[int]]:
 @pytest.mark.parametrize(
     "use_device_tensor",
     [
-        False,
-        pytest.param(True, marks=pytest.mark.skip(reason="temporarily skipped")),
+        pytest.param(False, marks=pytest.mark.skip(reason="temporarily skipped")),
+        True,
     ],
 )
 def test_sub_block_prefix_cache_matches_baseline(

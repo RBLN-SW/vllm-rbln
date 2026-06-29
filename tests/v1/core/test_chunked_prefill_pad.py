@@ -31,12 +31,12 @@ from vllm_rbln.v1.core.optimum_kv_cache_manager import RBLNKVCacheManager
 def _make_manager(
     prefill_chunk_size: int,
     attn_block_size: int,
-    image_prefill_chunk_sizes: list[int] | None = None,
+    image_prefill_chunk_size: list[int] | None = None,
 ) -> RBLNKVCacheManager:
     mgr = object.__new__(RBLNKVCacheManager)
     mgr.prefill_chunk_size = prefill_chunk_size
     mgr.attn_block_size = attn_block_size
-    mgr.image_prefill_chunk_sizes = image_prefill_chunk_sizes
+    mgr.image_prefill_chunk_size = image_prefill_chunk_size
     return mgr
 
 
@@ -64,7 +64,7 @@ def _image(offset: int, num_tokens: int, *, lead: int = 0, trail: int = 0):
 
 class TestImageChunkSize:
     def test_smallest_bucket_that_fits(self):
-        mgr = _make_manager(128, 4096, image_prefill_chunk_sizes=[1152, 640, 384])
+        mgr = _make_manager(128, 4096, image_prefill_chunk_size=[1152, 640, 384])
         assert mgr._image_chunk_size(256) == 384
         assert mgr._image_chunk_size(384) == 384
         assert mgr._image_chunk_size(385) == 640
@@ -73,18 +73,18 @@ class TestImageChunkSize:
 
     def test_run_exceeds_all_buckets_raises(self):
         # buckets are descending; a run larger than the largest bucket is invalid.
-        mgr = _make_manager(128, 4096, image_prefill_chunk_sizes=[1152, 640, 384])
+        mgr = _make_manager(128, 4096, image_prefill_chunk_size=[1152, 640, 384])
         with pytest.raises(ValueError):
             mgr._image_chunk_size(2000)
 
     def test_no_buckets_falls_back_to_text_chunk(self):
-        mgr = _make_manager(256, 4096, image_prefill_chunk_sizes=None)
+        mgr = _make_manager(256, 4096, image_prefill_chunk_size=None)
         assert mgr._image_chunk_size(256) == 256
-        mgr_empty = _make_manager(256, 4096, image_prefill_chunk_sizes=[])
+        mgr_empty = _make_manager(256, 4096, image_prefill_chunk_size=[])
         assert mgr_empty._image_chunk_size(256) == 256
 
     def test_gemma3_single_bucket(self):
-        mgr = _make_manager(256, 4096, image_prefill_chunk_sizes=[256])
+        mgr = _make_manager(256, 4096, image_prefill_chunk_size=[256])
         assert mgr._image_chunk_size(256) == 256
 
 
@@ -155,7 +155,7 @@ class TestChunkedPrefillPadWithImages:
         mgr = _make_manager(
             prefill_chunk_size=256,
             attn_block_size=4096,
-            image_prefill_chunk_sizes=[256],
+            image_prefill_chunk_size=[256],
         )
         req = _request(_image(100, 256, lead=2, trail=2))
         assert mgr._chunked_prefill_pad(req, query_len=1000) == 0
@@ -173,7 +173,7 @@ class TestChunkedPrefillPadWithImages:
         mgr = _make_manager(
             prefill_chunk_size=4,
             attn_block_size=16,
-            image_prefill_chunk_sizes=[4],
+            image_prefill_chunk_size=[4],
         )
         req = _request(
             _image(3, 4),
@@ -190,7 +190,7 @@ class TestChunkedPrefillPadWithImages:
         mgr = _make_manager(
             prefill_chunk_size=2,
             attn_block_size=8,
-            image_prefill_chunk_sizes=[8],
+            image_prefill_chunk_size=[8],
         )
         req = _request(_image(2, 6))
         assert mgr._chunked_prefill_pad(req, query_len=8) == 6
@@ -207,7 +207,7 @@ class TestChunkedPrefillPadWithImages:
         mgr = _make_manager(
             prefill_chunk_size=4,
             attn_block_size=12,
-            image_prefill_chunk_sizes=[8, 4],  # descending, as optimum stores it
+            image_prefill_chunk_size=[8, 4],  # descending, as optimum stores it
         )
         req = _request(_image(2, 3), _image(7, 6))
         assert mgr._chunked_prefill_pad(req, query_len=13) == 5
