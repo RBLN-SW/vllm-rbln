@@ -1126,10 +1126,8 @@ class RBLNFlashAttentionMetadataBuilder(
         )
         query_seq_lens = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
         num_computed_tokens_cpu = seq_lens_cpu - query_seq_lens
-        seq_idx = positions[query_start_loc_cpu[:num_reqs]].view(-1, 1)
-
         # custom (triton) kernel's to_dynamic_index rejects int64 seq_lens
-        seq_idx = seq_idx.to(torch.int32)
+        seq_idx = positions[query_start_loc_cpu[:num_reqs]].view(-1, 1).to(torch.int32)
 
         cu_prefix_query_lens = None
         prefix_kv_lens = None
@@ -1183,9 +1181,6 @@ class RBLNFlashAttentionMetadataBuilder(
                 attn_masks = attn_masks.to(self.device)
         else:
             # batch padding
-            print("@@@@ seq_idx before pad: ", seq_idx)
-            print("@@@@ seq_lens_tensor before pad: ", seq_lens_tensor)
-            print("@@@@ block_tables_tensor before pad: ", block_tables_tensor)
             seq_idx = rbln_utils.pad(seq_idx, 0, batch_pad)
             seq_lens_tensor = rbln_utils.pad(seq_lens_tensor, 0, batch_pad)
             block_tables_tensor = rbln_utils.pad(block_tables_tensor, 0, batch_pad)
@@ -1209,8 +1204,8 @@ class RBLNFlashAttentionMetadataBuilder(
         local_block_tables = None
         swa_attn_masks = None
         if sliding_window := getattr(self.kv_cache_spec, "sliding_window", None):
-            num_computed_tokens = num_computed_tokens_cpu.view(-1, 1)
-            seq_lens = seq_lens_cpu.view(-1, 1)
+            num_computed_tokens = num_computed_tokens_cpu.to(self.device).view(-1, 1)
+            seq_lens = seq_lens_cpu.to(self.device).view(-1, 1)
             query_lens = seq_lens - num_computed_tokens
             cache_seq_lens = torch.clamp(num_computed_tokens, max=sliding_window)
             cache_offsets = cache_seq_lens + query_lens
@@ -1219,10 +1214,11 @@ class RBLNFlashAttentionMetadataBuilder(
                 cache_offsets = rbln_utils.pad(cache_offsets, 0, batch_pad)
                 # Generate sliding window attention mask for decode
                 # mask[b, s] = 1.0 if s <= cache_seq_lens[b] else 0.0
-                positions = torch.arange(sliding_window)[None, :]
+                # [None, :] = unsqueeze(0) to broadcast over batch dimension
+                positions = torch.arange(sliding_window, device=self.device)[None, :]
                 swa_attn_masks = torch.where(positions - cache_seq_lens > 0, 0.0, 1.0)[
                     :, None, None, :
-                ].to(self.device)
+                ]
 
             local_block_tables = block_tables_tensor[..., :1]
 
@@ -1244,7 +1240,9 @@ class RBLNFlashAttentionMetadataBuilder(
             else:
                 seq_lens = seq_idx
 
-        # Set device buffer
+        # Reuse the device buffer for cache_seq_lens and cache_offsets
+        # to avoid extra vmem reallocation.
+        # FIXME just slicing the buffer to reuse vmvm to make the most of buffer.
         cache_seq_lens = (
             self._to_device_inplace(cache_seq_lens, "_swa_cache_seq_lens_buf")
             if cache_seq_lens is not None
