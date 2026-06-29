@@ -61,6 +61,8 @@ def build_compile_options(compile_context: rebel.CompileContext) -> dict:
     options: dict = {}
     if not use_dt:
         options["compile_context"] = compile_context
+    else:
+        options["model_trace_method"] = "export"
     if envs.VLLM_RBLN_COMPILE_STRICT_MODE:
         options["mode"] = "strict"
     if has_torch_rbln or use_dt:

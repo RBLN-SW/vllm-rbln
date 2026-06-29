@@ -763,14 +763,20 @@ class RBLNEagleProposer(EagleProposer):
         process_group_dict[DP.cpu_group.group_name] = DP.ranks
 
         options = {
-            "compile_context": self.compile_context,
             "tensor_parallel_size": envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
             "process_group_dict": process_group_dict,
             "guard_filter_fn": torch.compiler.keep_tensor_guards_unsafe,
             "mode": "strict",
         }
+        # NOTE(RBLN): Mirror the main model runner: compile_context and the
+        # export trace method are mutually exclusive. In device-tensor mode the
+        # export path manages weights itself, so passing compile_context (weight
+        # sharing) on top corrupts the per-graph runtime context and the second
+        # compiled graph (the q=k+1 decode loop) fails at submission.
         if envs.VLLM_RBLN_USE_DEVICE_TENSOR:
             options["model_trace_method"] = "export"
+        else:
+            options["compile_context"] = self.compile_context
         if not envs.VLLM_DISABLE_COMPILE_CACHE:
             logger.info(
                 "Once the model is compiled for the first time, "
