@@ -2,6 +2,11 @@ site_name: vllm-rbln
 theme:
   name: material
 
+# Local-only brainstorming specs/plans live under docs/superpowers/ (gitignored);
+# keep them out of the built site.
+exclude_docs: |
+  superpowers/
+
 plugins:
   - search
   - gen-files:
@@ -10,6 +15,7 @@ plugins:
   - mike
 
 nav:
+  - Home: index.md
   - Environment Variables: env_vars.md
   - Bucketing: bucketing.md
   - Sub-block Prefix Caching: sub_block_prefix_caching.md
