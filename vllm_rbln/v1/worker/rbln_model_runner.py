@@ -3342,9 +3342,13 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     slot_mappings = new_slot_mappings
 
                 # Push the padded slot_mapping back into per-layer
-                # attn_metadata. The attention builder
-                # (flash_attention.py:1116/1252) already stamped the unpadded
-                # tensor here, so we overwrite in-place.
+                # attn_metadata, overwriting the unpadded tensor the attention
+                # builder stamped on RBLNFlashAttentionMetadata.slot_mapping.
+                # FIXME: no current consumer reads this field -- the attention
+                # path indexes KV via block_tables and reads slot_mapping from
+                # forward_context, not from attn_metadata. This write (and the
+                # field) is likely dead; remove once verified by a runtime
+                # decode smoke test.
                 if attn_metadata is not None:
                     for gid, kv_cache_group in enumerate(
                         self.kv_cache_config.kv_cache_groups
