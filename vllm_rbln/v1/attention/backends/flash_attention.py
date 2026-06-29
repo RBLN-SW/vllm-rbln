@@ -1068,6 +1068,8 @@ class RBLNFlashAttentionMetadataBuilder(
         self.chunked_prefill_size = self.scheduler_config.max_num_batched_tokens
 
         self.enforce_eager = get_current_vllm_config().model_config.enforce_eager
+        # flash-attn requires fp16 masks in eager mode; fp32 otherwise.
+        self._mask_dtype = torch.float16 if self.enforce_eager else torch.float32
 
         self.is_causal = envs.VLLM_RBLN_FLASH_CAUSAL_ATTN
         self.is_batch_attention_opt = envs.VLLM_RBLN_BATCH_ATTN_OPT
@@ -1164,7 +1166,7 @@ class RBLNFlashAttentionMetadataBuilder(
                     1,
                     prefill_chunk_size,
                     max_seq_len,
-                    dtype=torch.float16 if self.enforce_eager else torch.float32,
+                    dtype=self._mask_dtype,
                 )
                 causal_mask = 1 - torch.triu(
                     torch.ones(1, 1, prefill_chunk_size, prefill_chunk_size),
@@ -1191,7 +1193,7 @@ class RBLNFlashAttentionMetadataBuilder(
                     1,
                     1,
                     max_seq_len,
-                    dtype=torch.float16 if self.enforce_eager else torch.float32,
+                    dtype=self._mask_dtype,
                 )
                 for batch_index, batch_step in enumerate(seq_lens_cpu):
                     decode_attention_mask[batch_index, :, :, :, : batch_step + 1] = 1
