@@ -95,6 +95,12 @@ repos:
     language: system
     always_run: true
     pass_filenames: false
+  - id: check-env-metadata
+    name: Check VLLM_RBLN env var metadata
+    entry: python tools/pre_commit/check_env_metadata.py
+    language: python
+    files: ^vllm_rbln/rbln_envs\.py$
+    pass_filenames: false
   # Keep `suggestion` last
   - id: suggestion
     name: Suggestion
