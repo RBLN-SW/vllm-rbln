@@ -35,7 +35,10 @@ jobs:
         run: git fetch origin gh-pages --depth=1 || true
       - name: Deploy release version
         if: startsWith(github.ref, 'refs/tags/v')
-        run: mike deploy --push --update-aliases "${GITHUB_REF_NAME}" latest
+        run: |
+          mike deploy --push --update-aliases "${GITHUB_REF_NAME}" latest
+          # Idempotent: keep the site root redirecting to the newest release.
+          mike set-default --push latest
       - name: Deploy dev version
         if: github.ref == 'refs/heads/main'
         run: mike deploy --push dev
