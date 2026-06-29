@@ -61,6 +61,7 @@ def _rec(name, **kw):
         "type": "bool",
         "deprecated": "",
         "category": "Miscellaneous",
+        "choices": (),
     }
     rec.update(kw)
     return rec
@@ -124,6 +125,18 @@ def test_render_deprecated_admonition():
     assert "    use VLLM_RBLN_NEW" in out
 
 
+def test_render_choices():
+    out = gen.render(
+        [_rec("VLLM_RBLN_C", type="str", default="a", choices=("a", "b", "c"))]
+    )
+    assert "Possible values: `a`, `b`, `c`." in out
+
+
+def test_render_no_choices_omits_line():
+    out = gen.render([_rec("VLLM_RBLN_D", type="bool", default=True)])
+    assert "Possible values" not in out
+
+
 def test_render_category_intro():
     out = gen.render([_rec("VLLM_RBLN_A", category="Attention")])
     assert "## Attention" in out
@@ -162,6 +175,9 @@ def test_read_metadata_real_file():
     assert auto_port["default"] is None  # conditional default
     # every entry is tagged with a functional category
     assert all(r["category"] for r in recs)
+    # choices are parsed from EnvMeta (tuple) for variables that define them
+    dp = next(r for r in recs if r["name"] == "VLLM_RBLN_DP_IMPL")
+    assert dp["choices"] == ("padded_decode", "dummy_prefill")
 
 
 def test_module_main_wrote_env_vars_page():

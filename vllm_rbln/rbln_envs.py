@@ -27,9 +27,9 @@ logger = init_logger(__name__)
 class EnvMeta:
     """Documentation metadata for a VLLM_RBLN_* environment variable.
 
-    SSOT for the env var docs. The runtime parsing lives in
-    ``environment_variables``; this only describes the variable for
-    linting and doc generation.
+    SSOT for the env var docs and for the runtime ``choices`` of variables
+    that accept a fixed set of values. The value parsing still lives in
+    ``environment_variables``; the getters read ``choices`` from here.
     """
 
     description: str
@@ -37,6 +37,7 @@ class EnvMeta:
     type: str = ""
     deprecated: str = ""  # non-empty marks the var deprecated (for docs/lint)
     category: str = ""  # functional group for docs (see ENV_METADATA)
+    choices: tuple[str, ...] = ()  # valid values; SSOT for getters + docs
 
 
 # SSOT for VLLM_RBLN_* env var documentation. Every VLLM_RBLN_* key in
@@ -101,11 +102,11 @@ ENV_METADATA: dict[str, EnvMeta] = {
         category="Miscellaneous",
     ),
     "VLLM_RBLN_DP_IMPL": EnvMeta(
-        "Data-parallel implementation. Choices: padded_decode, "
-        "dummy_prefill (dummy_prefill will be deprecated).",
+        "Data-parallel implementation. `dummy_prefill` will be deprecated.",
         default="padded_decode",
         type="str",
         category="Parallelism (TP / DP / Ray)",
+        choices=("padded_decode", "dummy_prefill"),
     ),
     "VLLM_RBLN_USE_MOE_TOKENS_MASK": EnvMeta(
         "If true, apply the tokens mask to the MoE expert kernel.",
@@ -172,10 +173,12 @@ ENV_METADATA: dict[str, EnvMeta] = {
         category="Sampling & batching",
     ),
     "VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY": EnvMeta(
-        "Decode batch bucket strategy. Choices: exponential, exp, linear, manual.",
+        "Decode batch bucket strategy. `exp` is an alias for `exponential`; "
+        "`manual` requires VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS.",
         default="exponential",
         type="str",
         category="Sampling & batching",
+        choices=("exponential", "exp", "linear", "manual"),
     ),
     "VLLM_RBLN_DECODE_BATCH_BUCKET_MIN": EnvMeta(
         "Minimum decode batch bucket size.",
@@ -343,7 +346,7 @@ def get_dp_impl() -> str:
         return "padded_decode"
     # default is padded_decode
     # dummy_prefill will be deprecated in the future
-    choices = set(["padded_decode", "dummy_prefill"])
+    choices = set(ENV_METADATA["VLLM_RBLN_DP_IMPL"].choices)
     current_impl = dp_impl.lower()
     if current_impl not in choices:
         raise ValueError(
@@ -358,7 +361,7 @@ def get_decode_batch_bucket_strategy() -> str:
     )
     if decode_batch_bucket_strategy is None:
         return "exponential"
-    choices = set(["exponential", "exp", "linear", "manual"])
+    choices = set(ENV_METADATA["VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY"].choices)
     current_strategy = decode_batch_bucket_strategy.lower()
     if current_strategy not in choices:
         raise ValueError(

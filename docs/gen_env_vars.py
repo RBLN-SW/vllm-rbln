@@ -20,7 +20,7 @@ from pathlib import Path
 
 ENVS_PATH = Path(__file__).resolve().parent.parent / "vllm_rbln" / "rbln_envs.py"
 
-_FIELDS = ("description", "default", "type", "deprecated", "category")
+_FIELDS = ("description", "default", "type", "deprecated", "category", "choices")
 
 
 def _find_metadata_dict(tree: ast.Module) -> ast.Dict | None:
@@ -58,6 +58,7 @@ def read_metadata(src: str) -> list[dict]:
             "type": "",
             "deprecated": "",
             "category": "",
+            "choices": (),
         }
         if isinstance(value, ast.Call):
             if value.args:
@@ -144,6 +145,9 @@ def _entry(rec: dict, known: set[str]) -> str:
     if meta:
         lines += [meta, ""]
     lines.append(_linkify(rec["description"], known, rec["name"]))
+    if rec["choices"]:
+        values = ", ".join(f"`{c}`" for c in rec["choices"])
+        lines += ["", f"Possible values: {values}."]
     if rec["deprecated"]:
         deprecated = _linkify(rec["deprecated"], known, rec["name"])
         lines += ["", '!!! warning "Deprecated"', f"    {deprecated}"]
