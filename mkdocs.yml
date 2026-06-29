@@ -1,0 +1,19 @@
+site_name: vllm-rbln
+theme:
+  name: material
+
+plugins:
+  - search
+  - gen-files:
+      scripts:
+        - docs/gen_env_vars.py
+  - mike
+
+nav:
+  - Environment Variables: env_vars.md
+  - Bucketing: bucketing.md
+  - Sub-block Prefix Caching: sub_block_prefix_caching.md
+
+extra:
+  version:
+    provider: mike
