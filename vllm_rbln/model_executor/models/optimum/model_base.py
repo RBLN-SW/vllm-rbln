@@ -481,7 +481,7 @@ class RBLNOptimumMultimodalMixin(SupportsMultiModal):
         input_ids = model_input.input_tokens.to(torch.int64)
         inputs_embeds = self.embed_input_ids(
             input_ids,
-            multimodal_embeddings or None,
+            multimodal_embeddings,
         )
         return inputs_embeds, None, None
 
@@ -574,5 +574,5 @@ class RBLNOptimumMultimodalMixin(SupportsMultiModal):
         # EC path today. It is kept as the shared interface contract / placeholder
         # until more models are EC-enabled.
         mm_embeds = [t for out in cached_mm_outputs for t in out]
-        inputs_embeds = self.embed_input_ids(input_ids, mm_embeds or None)
+        inputs_embeds = self.embed_input_ids(input_ids, mm_embeds)
         return {"inputs_embeds": inputs_embeds, "cache_position": cache_position}
