@@ -30,7 +30,6 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
-    MLAAttentionSpec,
 )
 
 if TYPE_CHECKING:
@@ -204,8 +203,8 @@ def flash_attention_naive_prefill_impl(
     - kv_cache: [2, num_blocks, n_kv_heads, 1, partition_size, head_dim]
       Key and value cache
     - mask: [batch, 1, 1, seq_len, max_seq_len]
-    - seq_idx: [batch, num_partitions]
-      number of already cached tokens in each partition
+    - seq_idx: [batch, 1]
+      sequence position (number of already cached tokens)
     - block_tables: [num_partitions,] for prefill,
                     [batch, num_partitions] for decode
     - sinks: [n_heads, sink_len] (optional)
@@ -347,8 +346,8 @@ def flash_causal_attention_naive_prefill_impl(
       Value states for current input
     - kv_cache: [2, num_blocks, n_kv_heads, 1, partition_size, head_dim]
       Key and value cache
-    - seq_idx: [batch, num_partitions]
-      number of already cached tokens in each partition
+    - seq_idx: [batch, 1]
+      sequence position (number of already cached tokens)
     - block_tables: [num_partitions,] for prefill,
                     [batch, num_partitions] for decode
     - sinks: [n_heads, sink_len] (optional)
@@ -1471,10 +1470,10 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                     self.scale,  # dummy
                 ]
                 if not envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
-                    if self.is_batch_attention_opt and b_size > 1:
-                        decode_args.append(attn_metadata.swa_attn_masks)
-                    else:
-                        decode_args.append(None)
+                    use_swa_mask = self.is_batch_attention_opt and b_size > 1
+                    decode_args.append(
+                        attn_metadata.swa_attn_masks if use_swa_mask else None
+                    )
                     decode_args.append(self.sinks)
                 attn_output = sliding_window_attention_naive_decode(  # noqa: E501
                     *decode_args,
