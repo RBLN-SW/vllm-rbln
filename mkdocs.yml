@@ -1,6 +1,40 @@
 site_name: vllm-rbln
+site_url: https://rbln-sw.github.io/vllm-rbln/
+repo_url: https://github.com/RBLN-SW/vllm-rbln
+repo_name: RBLN-SW/vllm-rbln
 theme:
   name: material
+  logo: assets/rebellions_logo.png
+  favicon: assets/favicon.png
+  icon:
+    repo: fontawesome/brands/github
+  palette:
+    # Light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: black
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    # Dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: black
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - navigation.instant
+    - navigation.top
+    - navigation.sections
+    - navigation.footer
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.tooltips
 
 # Local-only brainstorming specs/plans live under docs/superpowers/ (gitignored);
 # keep them out of the built site.
