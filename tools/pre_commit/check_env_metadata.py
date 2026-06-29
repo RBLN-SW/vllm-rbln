@@ -43,12 +43,18 @@ def _description_of(value: ast.expr) -> str | None:
     # or the `description` keyword. Return None if not a string literal.
     if not isinstance(value, ast.Call):
         return None
-    if value.args and isinstance(value.args[0], ast.Constant) \
-            and isinstance(value.args[0].value, str):
+    if (
+        value.args
+        and isinstance(value.args[0], ast.Constant)
+        and isinstance(value.args[0].value, str)
+    ):
         return value.args[0].value
     for kw in value.keywords:
-        if kw.arg == "description" and isinstance(kw.value, ast.Constant) \
-                and isinstance(kw.value.value, str):
+        if (
+            kw.arg == "description"
+            and isinstance(kw.value, ast.Constant)
+            and isinstance(kw.value.value, str)
+        ):
             return kw.value.value
     return None
 
@@ -60,8 +66,11 @@ def _find_dict(tree: ast.Module, name: str) -> ast.Dict | None:
             for t in node.targets:
                 if isinstance(t, ast.Name) and t.id == name:
                     target = node.value
-        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) \
-                and node.target.id == name:
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == name
+        ):
             target = node.value
         if isinstance(target, ast.Dict):
             return target
@@ -94,13 +103,11 @@ def check(env_keys: set[str], meta: dict[str, str]) -> list[str]:
     for key in sorted(env_keys - meta.keys()):
         errors.append(f"{key}: missing ENV_METADATA entry")
     for key in sorted(meta.keys() - env_keys):
-        errors.append(
-            f"{key}: orphan ENV_METADATA entry (no VLLM_RBLN_* getter)")
+        errors.append(f"{key}: orphan ENV_METADATA entry (no VLLM_RBLN_* getter)")
     for key in sorted(env_keys & meta.keys()):
         desc = meta[key].strip()
         if len(desc) < MIN_DESC_LEN:
-            errors.append(
-                f"{key}: description too short (min {MIN_DESC_LEN} chars)")
+            errors.append(f"{key}: description too short (min {MIN_DESC_LEN} chars)")
     return errors
 
 
