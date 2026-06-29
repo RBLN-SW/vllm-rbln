@@ -21,25 +21,7 @@ def register():
 
 
 def register_model():
-    if not envs.VLLM_RBLN_USE_VLLM_MODEL:
-        from vllm import ModelRegistry
-
-        ModelRegistry.register_model(
-            "T5WithLMHeadModel",
-            "vllm_rbln.model_executor.models.optimum.t5:RBLNT5ForConditionalGeneration",
-        )
-        ModelRegistry.register_model(
-            "T5ForConditionalGeneration",
-            "vllm_rbln.model_executor.models.optimum.t5:RBLNT5ForConditionalGeneration",
-        )
-        ModelRegistry.register_model(
-            "T5EncoderModel",
-            "vllm_rbln.model_executor.models.optimum.encoder:RBLNOptimumForEncoderModel",
-        )
-        ModelRegistry.register_model(
-            "Gemma3ForConditionalGeneration",
-            "vllm_rbln.model_executor.models.optimum.gemma3:RBLNOptimumGemma3ForConditionalGeneration",
-        )
+    pass
 
 
 def register_ops():
@@ -52,14 +34,17 @@ def register_ops():
     import vllm_rbln._torch_dynamo_compat  # noqa
     import vllm_rbln.distributed.ec_transfer.ec_connector.factory  # noqa
 
+    if not envs.VLLM_RBLN_USE_DEVICE_TENSOR:
+        import vllm_rbln._torch_accelerator_compat  # noqa
+
     if envs.VLLM_RBLN_USE_VLLM_MODEL:
         import vllm_rbln.model_executor.layers.attention.attention  # noqa
         import vllm_rbln.distributed.kv_transfer.kv_connector.factory  # noqa
         import vllm_rbln.forward_context  # noqa
         import vllm_rbln.lora.layer  # noqa
         import vllm_rbln.model_executor.layers.fused_moe.layer  # noqa
-        import vllm_rbln.model_executor.layers.fused_moe.shared_fused_moe  # noqa
         import vllm_rbln.model_executor.layers.logits_processor  # noqa
+        import vllm_rbln.model_executor.layers.mla  # noqa
         import vllm_rbln.model_executor.layers.quantization.kernels.mixed_precision  # noqa
         import vllm_rbln.model_executor.layers.quantization.mxfp4  # noqa
         import vllm_rbln.model_executor.layers.quantization.fp8  # noqa
@@ -80,3 +65,6 @@ def register_ops():
         from vllm_rbln.triton_kernels import flash_attention  # noqa
         from vllm_rbln.triton_kernels import flash_causal_attention  # noqa
         from vllm_rbln.triton_kernels import sliding_window_attention  # noqa
+        from vllm_rbln.v1.attention.backends.mla.flashattn_mla import (  # noqa: F401
+            RBLNFlashAttnMLABackend,
+        )

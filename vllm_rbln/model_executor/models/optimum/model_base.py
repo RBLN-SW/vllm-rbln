@@ -20,6 +20,10 @@ import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.models.interfaces import (
+    MultiModalEmbeddings,
+    SupportsMultiModal,
+)
 from vllm.model_executor.models.interfaces_base import VllmModelForTextGeneration
 from vllm.v1.sample.metadata import SamplingMetadata
 
@@ -186,10 +190,11 @@ class RBLNOptimumModelBase(nn.Module):
         if valid_path is not None:
             # pre-compiled OR cache-hit
             model_cls = getattr(optimum.rbln, model_cls_name)
+            ec_enabled_model = model_cls_name == "RBLNQwen3VLForConditionalGeneration"
             assert model_cls is not None
             # FIXME decouple producer logic from model_base.py
             if self._is_ec_producer_only():
-                if model_cls_name != "RBLNQwen3VLForConditionalGeneration":
+                if not ec_enabled_model:
                     raise ValueError("Disaggregation is not supported for this model.")
                 visual = model_cls.load_visual_encoder(valid_path)
                 model = _ProducerOptimumModelProxy(visual, visual.rbln_config)
@@ -197,6 +202,13 @@ class RBLNOptimumModelBase(nn.Module):
                 # NOTE:
                 # ``sync_vllm_and_optimum`` already narrowed user overrides
                 # down to device-only keys; we forward only those here.
+                rbln_overrides = dict(rbln_overrides)
+                if self._is_ec_consumer_only():
+                    if not ec_enabled_model:
+                        raise ValueError(
+                            "Disaggregation is not supported for this model."
+                        )
+                    rbln_overrides["_load_visual_runtime"] = False
                 model = model_cls.from_pretrained(
                     valid_path,
                     rbln_config=rbln_overrides,
@@ -212,7 +224,13 @@ class RBLNOptimumModelBase(nn.Module):
                 batch_size=self.scheduler_config.max_num_seqs,
                 block_size=get_attn_block_size(self.vllm_config),
                 max_model_len=self.model_config.max_model_len,
-                tp_size=envs.VLLM_RBLN_TP_SIZE,
+                num_devices=envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
+                # Resolved during sync (from_optimum/from_vllm); pin it at compile
+                # time so the compiled model matches the value used for KV-cache
+                # block padding.
+                prefill_chunk_size=self.vllm_config.additional_config.get(
+                    "prefill_chunk_size"
+                ),
                 rbln_overrides=rbln_overrides,
             )
             logger.info(
@@ -445,3 +463,92 @@ class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
         self, hidden_states: torch.Tensor, sampling_metadata: SamplingMetadata
     ) -> torch.Tensor:
         return self.logits_processor(None, hidden_states, sampling_metadata)
+
+
+class RBLNOptimumMultimodalMixin(SupportsMultiModal):
+    """
+    Shared multimodal interface for optimum models.
+    """
+
+    def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings | dict:
+        # Default vision-only encode path shared by the simple MM models: parse
+        # the image input and return per-image token embeddings. Models with a
+        # richer cacheable unit (e.g. Qwen-VL, which also handles video) override
+        # this.
+        #
+        # NOTE: Upstream vLLM's MultiModalEmbeddings is only
+        # list[Tensor] | Tensor | tuple[Tensor, ...] and does not admit a dict.
+        # Models whose cacheable unit is richer than per-item embeddings (e.g.
+        # Qwen-VL: image/video embeds + grid_thw + optional deepstack) return
+        # that unit as a dict, so vLLM-RBLN widens the contract to also allow
+        # dict instead of forcing it into a positional tuple.
+        image_input = self._parse_and_validate_image_input(**kwargs)
+        if image_input is None:
+            return []
+
+        return self._process_image_input(image_input)
+
+    def _process_image_input(self, image_input: object) -> list[torch.Tensor] | dict:
+        # Encode a validated image input into the model's cacheable multimodal
+        # unit: per-image token embeddings (list[torch.Tensor]) for the simple
+        # models, or a richer dict (e.g. Qwen-VL). Consumed by the default
+        # embed_multimodal() above.
+        raise NotImplementedError(
+            "`_process_image_input` must be implemented for each model."
+        )
+
+    def _image_token_id(self) -> int:
+        # Token id of the multimodal placeholder. Default reads the HF config's
+        # `image_token_index`; subclasses whose config names it differently
+        # (e.g. `image_token_id`) override this.
+        return self.model.config.image_token_index
+
+    def _embed_text_tokens(
+        self, input_ids: torch.Tensor, is_multimodal: torch.Tensor
+    ) -> torch.Tensor:
+        # Text-token embedding lookup. Default assumes the placeholder is
+        # in-vocab, so a plain lookup suffices. Models whose placeholder is OOV
+        # override this to PAD-mask the placeholder positions first.
+        return self.model.get_input_embeddings()(input_ids)
+
+    def embed_input_ids(
+        self,
+        input_ids: torch.Tensor,
+        multimodal_embeddings: MultiModalEmbeddings | None = None,
+        *,
+        is_multimodal: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        # Mirrors optimum-rbln's _preprocess_prefill: embed the text tokens,
+        # then scatter the per-item multimodal embeddings over the placeholder
+        # positions.
+        if is_multimodal is None:
+            is_multimodal = input_ids == self._image_token_id()
+
+        inputs_embeds = self._embed_text_tokens(input_ids, is_multimodal)
+
+        if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
+            return inputs_embeds
+
+        # Flatten per-item embeddings into (num_mm_tokens, hidden_size).
+        mm_embeds = torch.cat(list(multimodal_embeddings)).to(
+            inputs_embeds.device, inputs_embeds.dtype
+        )
+        scatter_mask = is_multimodal.unsqueeze(-1).expand_as(inputs_embeds)
+        return inputs_embeds.masked_scatter(scatter_mask, mm_embeds)
+
+    def build_prefill_inputs(
+        self,
+        input_ids: torch.Tensor,
+        cached_mm_outputs: list,
+        *,
+        cache_position: torch.Tensor | None = None,
+        running_requests_ids: list[str] | None = None,
+    ) -> dict:
+        # NOTE: this default is currently unreachable. init_model() gates the EC
+        # producer/consumer path on ec_enabled_model ==
+        # "RBLNQwen3VLForConditionalGeneration", so no non-Qwen model enters the
+        # EC path today. It is kept as the shared interface contract / placeholder
+        # until more models are EC-enabled.
+        mm_embeds = [t for out in cached_mm_outputs for t in out]
+        inputs_embeds = self.embed_input_ids(input_ids, mm_embeds or None)
+        return {"inputs_embeds": inputs_embeds, "cache_position": cache_position}

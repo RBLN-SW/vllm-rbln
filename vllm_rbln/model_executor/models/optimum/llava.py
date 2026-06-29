@@ -16,7 +16,6 @@ from typing import Union
 import torch
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.model_executor.models.llava import (
     LlavaImageInputs,
     LlavaImagePixelInputs,
@@ -24,14 +23,25 @@ from vllm.model_executor.models.llava import (
 )
 
 from .base import ModelInputForRBLN, version_error
-from .model_base import RBLNOptimumDecoderMixin, RBLNOptimumModelBase
+from .model_base import (
+    RBLNOptimumDecoderMixin,
+    RBLNOptimumModelBase,
+    RBLNOptimumMultimodalMixin,
+)
 
 logger = init_logger(__name__)
 
 
 class RBLNOptimumLlavaForConditionalGeneration(
-    RBLNOptimumModelBase, RBLNOptimumDecoderMixin, SupportsMultiModal
+    RBLNOptimumModelBase, RBLNOptimumMultimodalMixin, RBLNOptimumDecoderMixin
 ):
+    @classmethod
+    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
+        if modality.startswith("image"):
+            return "<image>"
+
+        raise ValueError("Only image modality is supported")
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -54,21 +64,13 @@ class RBLNOptimumLlavaForConditionalGeneration(
         is_prefill: bool,
         block_tables: torch.Tensor,
         input_ids: torch.LongTensor = None,
-        pixel_values: torch.FloatTensor | None = None,
-        image_sizes: torch.LongTensor | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
         cache_position: Union[
             list[torch.Tensor], torch.Tensor
         ] = None,  # vllm keyword argument
         **kwargs,
     ):
         if is_prefill:
-            # NOTE inputs_embeds will be generated inside _preprocess_prefill
-            inputs_embeds = self.model._preprocess_prefill(
-                input_ids=input_ids,
-                pixel_values=pixel_values,
-                image_sizes=image_sizes,
-            )
-
             if self.model.language_model.prefill_decoder is None:
                 raise version_error
 
@@ -97,20 +99,6 @@ class RBLNOptimumLlavaForConditionalGeneration(
         is_prompt = model_input.is_prompt
 
         request_nums = input_ids.shape[0]
-        if model_input.multi_modal_kwargs:
-            image_input = self._parse_and_validate_image_input(
-                **model_input.multi_modal_kwargs
-            )
-            if image_input is not None:
-                if image_input["type"] == "pixel_values":
-                    pixel_values = image_input["pixel_values"]
-                    image_sizes = None
-                elif image_input["type"] == "pixel_values_pixtral":
-                    pixel_values = image_input["pixel_values"]
-                    image_sizes = torch.tensor(pixel_values.shape[-2:]).unsqueeze(0)
-        else:
-            pixel_values = None
-            image_sizes = None
 
         kwargs = self.preprocess_for_decoder(
             is_prompt, block_tables, input_ids, cache_position
@@ -124,18 +112,47 @@ class RBLNOptimumLlavaForConditionalGeneration(
                 padded_batch_size
             ]
 
+        inputs_embeds = None
+        if is_prompt:
+            multimodal_embeddings = self.embed_multimodal(
+                **(model_input.multi_modal_kwargs or {})
+            )
+            inputs_embeds = self.embed_input_ids(
+                input_ids,
+                multimodal_embeddings or None,
+            )
+
         logits = self._forward(
             is_prefill=is_prompt,
             block_tables=block_tables,
             input_ids=input_ids,
-            pixel_values=pixel_values,
-            image_sizes=image_sizes,
+            inputs_embeds=inputs_embeds,
             cache_position=cache_position,
         )
 
         if not is_prompt:
             logits = logits[:request_nums]
         return logits
+
+    def get_language_model(self):
+        return self.model.language_model
+
+    def _process_image_input(self, image_input: LlavaImageInputs) -> list[torch.Tensor]:
+        pixel_values = image_input["pixel_values"]
+        if image_input["type"] == "pixel_values_pixtral":
+            image_sizes = torch.tensor(pixel_values.shape[-2:]).unsqueeze(0)
+        else:
+            image_sizes = None
+
+        config = self.model.config
+        # Vision tower + multi-modal projector, compiled by optimum-rbln.
+        image_features = self.model.get_image_features(
+            pixel_values=pixel_values,
+            vision_feature_layer=config.vision_feature_layer,
+            vision_feature_select_strategy=config.vision_feature_select_strategy,
+            image_sizes=image_sizes,
+        )
+        return list(image_features)
 
     def _parse_and_validate_image_input(
         self, **kwargs: object

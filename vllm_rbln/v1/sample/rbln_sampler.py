@@ -16,6 +16,7 @@ import inspect
 import torch
 import torch.nn as nn
 from vllm.sampling_params import _SAMPLING_EPS
+from vllm_rbln.v1.sample.ops.logprobs import batched_count_greater_than
 
 try:
     import torch.rbln
@@ -39,80 +40,35 @@ import vllm_rbln.rbln_envs as envs
 logger = init_logger(__name__)
 
 
-def random_sample(
-    probs: torch.Tensor,
-    generators: dict[int, torch.Generator],
-) -> torch.Tensor:
-    """Randomly sample from the probabilities.
+def resolve_compile_context(
+    compile_context: rebel.CompileContext | None,
+) -> rebel.CompileContext:
+    """Return a default CompileContext when one is not provided.
 
-    We use this function instead of torch.multinomial because torch.multinomial
-    causes CPU-GPU synchronization.
+    Used when running through the device tensor path in rbln_model_runner or
+    when triggered by optimum_model_runner.
     """
-    q = torch.empty_like(probs)
-    # NOTE(woosuk): To batch-process the requests without their own seeds,
-    # which is the common case, we first assume that every request does
-    # not have its own seed. Then, we overwrite the values for the requests
-    # that have their own seeds.
-    if len(generators) != probs.shape[0]:
-        q.exponential_()
-    if generators:
-        # TODO(woosuk): This can be slow because we handle each request
-        # one by one. Optimize this.
-        for i, generator in generators.items():
-            q[i].exponential_(generator=generator)
-    return probs.div_(q).argmax(dim=-1).view(-1)
+    if compile_context is not None:
+        return compile_context
+    if "use_global_ctx" in inspect.signature(rebel.CompileContext).parameters:
+        return rebel.CompileContext(use_global_ctx=True)
+    return rebel.CompileContext()
 
 
-def apply_top_k_top_p(
-    logits: torch.Tensor,
-    k: torch.Tensor | None,
-    p: torch.Tensor | None,
-) -> torch.Tensor:
-    """
-    Mock implementation of `top_k_top_p`
-    used for torch ops registration.
-    This function currently performs standard top-p, top-k (nucleus)
-    sampling that includes sorting the probabilities.
-    It serves as a placeholder implementation — in the actual version,
-    a dual-pivot algorithm is implemented in rebel and
-    it will be used to avoid the sorting step and improve efficiency.
-    """
-    logits_sort, logits_idx = logits.sort(dim=-1, descending=False, stable=True)
-    if k is not None:
-        # Apply top-k.
-        top_k_mask = logits_sort.size(1) - k.to(torch.long)  # shape: B
-        # Get all the top_k values.
-        top_k_mask = logits_sort.gather(1, top_k_mask.unsqueeze(dim=1))
-        top_k_mask = logits_sort < top_k_mask
-        logits_sort.masked_fill_(top_k_mask, -float("inf"))
-
-    if p is not None:
-        # Apply top-p.
-        probs_sort = logits_sort.softmax(dim=-1)
-        probs_sum = torch.cumsum(probs_sort, dim=-1, out=probs_sort)
-        top_p_mask = probs_sum <= 1 - p.unsqueeze(dim=1)
-        # at least one
-        top_p_mask[:, -1] = False
-        logits_sort.masked_fill_(top_p_mask, -float("inf"))
-
-    # Re-sort the probabilities.
-    logits = logits_sort.scatter(dim=-1, index=logits_idx, src=logits_sort)
-    # Select the sampled token.
-    return random_sample(logits, {})
-
-
-@torch.library.custom_op("rbln::top_k_top_p", mutates_args=())
-def top_k_top_p(
-    logits: torch.Tensor, k: torch.Tensor | None, p: torch.Tensor | None
-) -> torch.Tensor:
-    return apply_top_k_top_p(logits, k, p)
-
-
-@top_k_top_p.register_fake
-def top_k_top_p_fake(
-    logits: torch.Tensor, k: torch.Tensor | None, p: torch.Tensor | None
-) -> torch.Tensor:
-    return apply_top_k_top_p(logits, k, p)
+def build_compile_options(compile_context: rebel.CompileContext) -> dict:
+    """Build the torch.compile ``options`` dict shared by the RBLN samplers."""
+    use_dt = envs.VLLM_RBLN_USE_DEVICE_TENSOR
+    options: dict = {}
+    if not use_dt:
+        options["compile_context"] = compile_context
+    if envs.VLLM_RBLN_COMPILE_STRICT_MODE:
+        options["mode"] = "strict"
+    if has_torch_rbln or use_dt:
+        options["tensor_parallel_size"] = 1
+        if not use_dt:
+            options["use_global_ctx"] = True
+            options["global_device_id"] = 0
+    return options
 
 
 def rbln_top_k_top_p_sample(
@@ -130,9 +86,6 @@ def rbln_top_k_top_p_sample(
     return sampled
 
 
-# NOTE(eunji): argmax op is registered in the compiler
-
-
 def rbln_greedy_sample(logits: torch.Tensor) -> torch.Tensor:
     """
     Implementation of RBLN greedy sampling.
@@ -147,7 +100,6 @@ class RBLNTopKTopPSampler(nn.Module):
     def __init__(
         self,
         logprobs_mode: LogprobsMode = "raw_logprobs",
-        seed: int = 42,
         compile_context: rebel.CompileContext = None,
     ):
         # TODO(rbln): Merge more ops to rbln context.
@@ -159,21 +111,9 @@ class RBLNTopKTopPSampler(nn.Module):
             "RBLN Sampling does not support returning logits/logprobs"
         )
 
-        rebel.manual_seed(seed)
-        use_dt = envs.VLLM_RBLN_USE_DEVICE_TENSOR
-        options: dict = {}
-        if not use_dt:
-            options["compile_context"] = compile_context
-        if envs.VLLM_RBLN_COMPILE_STRICT_MODE:
-            options["mode"] = "strict"
-        if use_dt:
+        options = build_compile_options(compile_context)
+        if envs.VLLM_RBLN_USE_DEVICE_TENSOR:
             options["model_trace_method"] = "export"
-
-        if has_torch_rbln or use_dt:
-            options["tensor_parallel_size"] = 1
-            if not use_dt:
-                options["use_global_ctx"] = True
-                options["global_device_id"] = 0
 
         self._compiled_rbln_topk_topp_sampler = torch.compile(
             rbln_top_k_top_p_sample,
@@ -211,21 +151,15 @@ class RBLNSampler(VLLMSampler):
     def __init__(
         self,
         logprobs_mode: LogprobsMode = "raw_logprobs",
-        seed: int = 42,
         compile_context: rebel.CompileContext = None,
     ):
         super().__init__()
         # If using device tensor in rbln_model_runner
         # or triggered by optimum_model_runner
-        if compile_context is None:
-            if "use_global_ctx" in inspect.signature(rebel.CompileContext).parameters:
-                compile_context = rebel.CompileContext(use_global_ctx=True)
-            else:
-                compile_context = rebel.CompileContext()
+        compile_context = resolve_compile_context(compile_context)
         if logprobs_mode in ("raw_logprobs", "raw_logits"):
             self.topk_topp_sampler = RBLNTopKTopPSampler(
                 logprobs_mode=logprobs_mode,
-                seed=seed,
                 compile_context=compile_context,
             )
         else:
@@ -233,18 +167,7 @@ class RBLNSampler(VLLMSampler):
                 f"RBLN Sampling does not support logprobs_mode: {logprobs_mode}. "
                 "Using native sampler instead."
             )
-        use_dt = envs.VLLM_RBLN_USE_DEVICE_TENSOR
-        options: dict = {}
-        if not use_dt:
-            options["compile_context"] = compile_context
-        if envs.VLLM_RBLN_COMPILE_STRICT_MODE:
-            options["mode"] = "strict"
-
-        if has_torch_rbln or use_dt:
-            options["tensor_parallel_size"] = 1
-            if not use_dt:
-                options["use_global_ctx"] = True
-                options["global_device_id"] = 0
+        options = build_compile_options(compile_context)
         # FIXME compiling both greedy and top-k top-p sampling
         # causes some issues in torchinductor.
         self._compiled_greedy_sample = torch.compile(
@@ -419,6 +342,59 @@ class RBLNSampler(VLLMSampler):
             )
         temperature = temperature.to(logits.dtype)
         return logits.div(temperature.unsqueeze(dim=1))
+
+    # NOTE(eunji.lee):
+    # mark_unbacked torch method should be called outside of torch.compile
+    @staticmethod
+    @torch.compiler.disable
+    def gather_logprobs(
+        logprobs: torch.Tensor,
+        num_logprobs: int,
+        token_ids: torch.Tensor,
+    ) -> LogprobsTensors:
+        """
+        Gather logprobs for topk and sampled/prompt token.
+
+        Args:
+          logprobs: (num tokens) x (vocab) tensor
+          num_logprobs: maximum number of logprobs to
+                        retain per token
+          token_ids: prompt tokens (if prompt logprobs)
+                     or sampled tokens (if sampled
+                     logprobs); 1D token ID tensor
+                     with (num tokens) elements
+                     Must be int64.
+
+        Returns:
+          Top-k int indices tensor, (num tokens) x (num_logprobs + 1)
+          Top-k float logprobs tensor, (num tokens) x (num_logprobs + 1)
+          Sampled token rank tensor, (num tokens)
+        """
+        assert token_ids.dtype == torch.int64
+        # Find the topK values.
+        topk_logprobs, topk_indices = torch.topk(logprobs, num_logprobs, dim=-1)
+
+        # Get with the logprob of the prompt or sampled token.
+        token_ids = token_ids.unsqueeze(-1)
+        token_logprobs = logprobs.gather(-1, token_ids)
+
+        # Compute the ranks of the actual token.
+        # Avoid 0/1 specialization recompile on the batch dimension
+        # of the compiled batched_count_greater_than. mark_unbacked makes
+        # the size fully symbolic so dynamo doesn't specialize when
+        # batch_size transitions from 1 to >=2.
+        # torch._dynamo.decorators.mark_unbacked(logprobs, 0)
+        # torch._dynamo.decorators.mark_unbacked(token_logprobs, 0)
+        token_ranks = batched_count_greater_than(logprobs, token_logprobs)
+
+        # Concatenate together with the topk.
+        indices = torch.cat((token_ids, topk_indices), dim=1)
+        logprobs = torch.cat((token_logprobs, topk_logprobs), dim=1)
+
+        # Use int32 to reduce the tensor size.
+        indices = indices.to(torch.int32)
+
+        return LogprobsTensors(indices, logprobs, token_ranks)
 
 
 WARM_UP_CONFIGS = [
