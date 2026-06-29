@@ -10,6 +10,11 @@ on:
 permissions:
   contents: write
 
+# Serialize gh-pages pushes so a tag and a main push can't race.
+concurrency:
+  group: gh-pages
+  cancel-in-progress: false
+
 jobs:
   deploy:
     runs-on: rbln-sw-k8s-general
