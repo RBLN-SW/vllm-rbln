@@ -35,7 +35,7 @@ class EnvMeta:
     description: str
     default: object = None
     type: str = ""
-    deprecated: str = ""
+    deprecated: str = ""  # non-empty marks the var deprecated (for docs/lint)
 
 
 # SSOT for VLLM_RBLN_* env var documentation. Every VLLM_RBLN_* key in
@@ -127,20 +127,22 @@ ENV_METADATA: dict[str, EnvMeta] = {
     "VLLM_RBLN_AUTO_PORT": EnvMeta(
         "Automatically pick a free port. Defaults to on when "
         "VLLM_RBLN_USE_DEVICE_TENSOR is enabled.",
-        default=False, type="bool"),
+        default=None, type="bool"),
     "VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS": EnvMeta(
         "Comma-separated decode batch sizes used when the bucket "
         "strategy is 'manual'.",
         default=[], type="list[int]"),
     "VLLM_RBLN_USE_CUSTOM_KERNEL": EnvMeta(
-        "Use custom kernels. Reads the RBLN_USE_CUSTOM_KERNEL env var.",
+        "Use custom kernels. Controlled by the RBLN_USE_CUSTOM_KERNEL "
+        "env var (not VLLM_RBLN_USE_CUSTOM_KERNEL).",
         default=False, type="bool"),
     "VLLM_RBLN_MOE_REDUCE_SCATTER": EnvMeta(
         "Use reduce_scatter instead of all_reduce in the MoE combine "
         "phase.",
         default=False, type="bool"),
     "VLLM_RBLN_PROFILER": EnvMeta(
-        "Enable the RBLN profiler. Reads the RBLN_PROFILER env var.",
+        "Enable the RBLN profiler. Controlled by the RBLN_PROFILER env "
+        "var (not VLLM_RBLN_PROFILER).",
         default=False, type="bool"),
     "VLLM_RBLN_DISPATCH_ALL2ALL": EnvMeta(
         "Use all2all dispatch instead of all-gather for MoE DP dispatch.",
