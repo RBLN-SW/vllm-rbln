@@ -82,6 +82,7 @@ def test_read_metadata_real_file():
     src = (_ROOT / "vllm_rbln" / "rbln_envs.py").read_text(encoding="utf-8")
     recs = gen.read_metadata(src)
     names = {r["name"] for r in recs}
+    # Change-detector: bump when ENV_METADATA gains/loses an entry.
     assert len(recs) == 35
     assert "VLLM_RBLN_COMPILE_MODEL" in names
     auto_port = next(r for r in recs if r["name"] == "VLLM_RBLN_AUTO_PORT")

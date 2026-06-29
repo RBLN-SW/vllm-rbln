@@ -98,4 +98,5 @@ def main() -> None:
         f.write(render(records))
 
 
+# mkdocs-gen-files executes this module as a script, so main() runs at import.
 main()
