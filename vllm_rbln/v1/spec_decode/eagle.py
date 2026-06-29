@@ -756,13 +756,6 @@ class RBLNEagleProposer(EagleProposer):
         process_group_dict[DP.device_group.group_name] = DP.ranks
         process_group_dict[DP.cpu_group.group_name] = DP.ranks
 
-        # NOTE(RBLN): Match the main model runner's compile options exactly.
-        # The draft model must NOT pass its own compile_context: in export mode
-        # the backend auto-uses a single global per-device CompileContext for
-        # const-buffer index coordination. Supplying a separate context makes the
-        # draft graphs reserve buf_idx in an independent pool, which then collides
-        # with the main model's const buffers (SYS_TASK_ABORTED / "const buffer
-        # index collision"). Share the runner's runtime_holder like the main model.
         options = {
             "num_devices": envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
             "process_group_dict": process_group_dict,
