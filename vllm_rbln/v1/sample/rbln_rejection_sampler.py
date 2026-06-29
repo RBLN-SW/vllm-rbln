@@ -55,6 +55,7 @@ def rbln_rejection_sample(
 # - apply_all_penalties
 class RBLNRejectionSampler(RejectionSampler):
     def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         options = build_compile_options()
         self.compiled_rejection_sample = torch.compile(
             rbln_rejection_sample,
