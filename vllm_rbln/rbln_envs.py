@@ -56,6 +56,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_USE_DEVICE_TENSOR: bool = False
     VLLM_RBLN_DISABLE_OFFLOAD: bool = False
     VLLM_RBLN_COMPILE_ONLY: bool = False
+    VLLM_RBLN_NIXL_SWA_VIEW_OPT: bool = False
 
 
 def get_num_devices_per_local_rank() -> int:
@@ -342,6 +343,13 @@ environment_variables = {
         lambda: (
             os.environ.get("VLLM_RBLN_COMPILE_ONLY", "False").lower() in ("true", "1")
         )
+    ),
+    # Publish a second SWA-sized descriptor range alongside the Full-sized
+    # range at the same NIXL base addresses, so SWA groups transfer only
+    # `sliding_window` bytes per block over RDMA. Host-side h2d/d2h still
+    # moves the full block — only the remote RDMA payload is trimmed.
+    "VLLM_RBLN_NIXL_SWA_VIEW_OPT": lambda: (
+        os.environ.get("VLLM_RBLN_NIXL_SWA_VIEW_OPT", "False").lower() in ("true", "1")
     ),
 }
 

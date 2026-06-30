@@ -12,15 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
+"""RBLN NIXL KV-cache transfer connector (mirrors vLLM's v1/nixl/ layout)."""
 
-KVConnectorFactory.register_connector(
-    "RblnNixlConnector",
-    "vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl",
-    "RblnNixlConnector",
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.connector import (
+    RblnNixlConnector,
 )
-KVConnectorFactory.register_connector(
-    "RBLNLMCacheConnectorV1",
-    "vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_lmcache_connector",
-    "RBLNLMCacheConnectorV1",
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.scheduler import (
+    RblnNixlConnectorScheduler,
 )
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.worker import (
+    RblnNixlConnectorWorker,
+)
+
+__all__ = [
+    "RblnNixlConnector",
+    "RblnNixlConnectorScheduler",
+    "RblnNixlConnectorWorker",
+]
