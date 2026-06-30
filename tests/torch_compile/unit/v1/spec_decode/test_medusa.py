@@ -73,6 +73,7 @@ def make_fake_group(group_name: str, ranks: list[int]) -> SimpleNamespace:
         ranks=ranks,
     )
 
+
 # Verifies that Medusa stacks per-head argmax outputs into [batch, num_heads].
 def test_propose_returns_headwise_argmax_stack():
     fake = make_fake_proposer()
