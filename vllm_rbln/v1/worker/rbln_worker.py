@@ -21,14 +21,6 @@ from typing import TYPE_CHECKING
 
 import numba
 import torch
-
-try:
-    import torch.rbln
-
-    has_torch_rbln = True
-except ImportError:
-    has_torch_rbln = False
-
 import torch.nn as nn
 from torch._dynamo.exc import BackendCompilerFailed
 from vllm.config import VllmConfig, set_current_vllm_config
@@ -180,7 +172,7 @@ class RBLNWorker(WorkerBase):
             selected_devices,
         )
 
-        if has_torch_rbln and num_devices > 1:
+        if num_devices > 1:
             os.environ["RBLN_NPUS_PER_DEVICE"] = str(num_devices)
 
     def init_device(self) -> None:
@@ -684,14 +676,8 @@ def init_worker_distributed_environment(
 
     new_backend = backend
     if envs.VLLM_RBLN_AUTO_PORT:
-        if has_torch_rbln:
-            new_backend = "rbln-ccl"
-            os.environ["RCCL_PORT_GEN"] = "1"
-        else:
-            logger.warning(
-                "Cannot use auto port because torch-rbln is not installed. "
-                "You may need to install torch-rbln to use auto port feature."
-            )
+        new_backend = "rbln-ccl"
+        os.environ["RCCL_PORT_GEN"] = "1"
 
     init_distributed_environment(
         world_size,

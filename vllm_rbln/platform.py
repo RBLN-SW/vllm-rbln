@@ -60,13 +60,24 @@ class RblnPlatform(Platform):
     # from env vars so that subprocesses spawned under
     # VLLM_WORKER_MULTIPROC_METHOD=spawn (which re-import this module fresh)
     # observe identical values to the parent without any extra plumbing.
-    _USE_DEVICE_TENSOR: bool = (
-        envs.VLLM_RBLN_USE_VLLM_MODEL and envs.VLLM_RBLN_USE_DEVICE_TENSOR
-    )
+    _USE_VLLM_MODEL: bool = envs.VLLM_RBLN_USE_VLLM_MODEL
+
+    # The vLLM-model path runs on the RBLN device and requires torch-rbln
+    # (provides the torch.rbln extension); fail fast if it is missing.
+    if _USE_VLLM_MODEL:
+        try:
+            import torch.rbln  # noqa: F401
+        except ImportError as e:
+            raise ImportError(
+                "torch-rbln is not installed. VLLM_RBLN_USE_VLLM_MODEL=1 "
+                "requires torch-rbln (provides the torch.rbln extension). "
+                "Install torch-rbln to use the vLLM-model path."
+            ) from e
+
     plugin_name: str = "rbln"
-    device_name: str = "rbln" if _USE_DEVICE_TENSOR else "cpu"
-    device_type: str = "rbln" if _USE_DEVICE_TENSOR else "cpu"
-    dist_backend: str = "rbln-ccl" if _USE_DEVICE_TENSOR else ""
+    device_name: str = "rbln" if _USE_VLLM_MODEL else "cpu"
+    device_type: str = "rbln" if _USE_VLLM_MODEL else "cpu"
+    dist_backend: str = "rbln-ccl" if _USE_VLLM_MODEL else ""
     dispatch_key: str = "CPU"
     ray_device_key: str = "RBLN"
     simple_compile_backend = "bypass"
@@ -276,13 +287,6 @@ class RblnPlatform(Platform):
 
             # FIXME(jiwoo.park) This is a temporary workaround.
             if model_config.enforce_eager:
-                if not envs.VLLM_RBLN_USE_DEVICE_TENSOR:
-                    raise ValueError(
-                        "enforce_eager=True requires VLLM_RBLN_USE_DEVICE_TENSOR=1. "
-                        "Eager mode bypasses torch.compile, so ops must dispatch "
-                        "to a real device='rbln' rather than the compile-backend "
-                        "fake-CPU tensors used by the default vLLM model path."
-                    )
                 hf_config = vllm_config.model_config.hf_config
                 assert not hasattr(hf_config, "sliding_window") or not getattr(
                     hf_config, "use_sliding_window", True

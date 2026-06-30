@@ -1068,6 +1068,8 @@ class RBLNFlashAttentionMetadataBuilder(
         self.chunked_prefill_size = self.scheduler_config.max_num_batched_tokens
 
         self.enforce_eager = get_current_vllm_config().model_config.enforce_eager
+        # flash-attn requires fp16 masks in eager mode; fp32 otherwise.
+        self._mask_dtype = torch.float16 if self.enforce_eager else torch.float32
 
         self.is_causal = envs.VLLM_RBLN_FLASH_CAUSAL_ATTN
         self.is_batch_attention_opt = envs.VLLM_RBLN_BATCH_ATTN_OPT
@@ -1096,6 +1098,49 @@ class RBLNFlashAttentionMetadataBuilder(
     ) -> bool:
         return False
 
+    def _build_prefill_attn_mask(
+        self, seq_idx: torch.Tensor, max_seq_len: int
+    ) -> torch.Tensor:
+        """Build the chunked causal attention mask for a prefill step."""
+        prefill_chunk_size = self.chunked_prefill_size
+        chunked_attention_mask = torch.zeros(
+            1,
+            1,
+            1,
+            prefill_chunk_size,
+            max_seq_len,
+            dtype=self._mask_dtype,
+        )
+        causal_mask = 1 - torch.triu(
+            torch.ones(1, 1, prefill_chunk_size, prefill_chunk_size),
+            diagonal=1,
+        )
+        step = seq_idx[0].cpu()
+        if step >= prefill_chunk_size:
+            chunked_attention_mask[:, :, :, :, :step] = 1
+        chunked_attention_mask[:, :, :, :, step : step + prefill_chunk_size] = (
+            causal_mask
+        )
+        # FIXME cpu handling -> device?
+        return chunked_attention_mask.to(self.device)
+
+    def _build_decode_attn_mask(
+        self, seq_lens_cpu: torch.Tensor, batch_pad: int, max_seq_len: int
+    ) -> torch.Tensor:
+        """Build the per-batch attention mask for a decode step."""
+        decode_attention_mask = torch.zeros(
+            batch_pad,
+            1,
+            1,
+            1,
+            max_seq_len,
+            dtype=self._mask_dtype,
+        )
+        for batch_index, batch_step in enumerate(seq_lens_cpu):
+            decode_attention_mask[batch_index, :, :, :, : batch_step + 1] = 1
+        # FIXME cpu handling -> device?
+        return decode_attention_mask.to(self.device)
+
     def build(
         self,
         common_prefix_len: int,
@@ -1105,7 +1150,6 @@ class RBLNFlashAttentionMetadataBuilder(
         batch_pad=None,
         is_prefill=False,
     ) -> RBLNFlashAttentionMetadata:
-        use_dt = envs.VLLM_RBLN_USE_DEVICE_TENSOR
         num_reqs = common_attn_metadata.num_reqs
         num_actual_tokens = common_attn_metadata.num_actual_tokens
         max_query_len = common_attn_metadata.max_query_len
@@ -1114,26 +1158,19 @@ class RBLNFlashAttentionMetadataBuilder(
         seq_lens = common_attn_metadata.seq_lens
         block_tables_tensor = common_attn_metadata.block_table_tensor
         slot_mapping = common_attn_metadata.slot_mapping
-        if use_dt:
-            # Prefer the pre-existing CPU copy to avoid an extra D2H sync;
-            # arithmetic stays on CPU until .to(self.device) in the constructor.
-            query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
-            _seq_lens_cpu = common_attn_metadata._seq_lens_cpu
-            seq_lens_cpu = (
-                _seq_lens_cpu[:num_reqs]
-                if _seq_lens_cpu is not None
-                else seq_lens[:num_reqs].cpu()
-            )
-            query_seq_lens = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
-            num_computed_tokens_cpu = seq_lens_cpu - query_seq_lens
-            seq_idx = positions[query_start_loc_cpu[:num_reqs]].view(-1, 1)
-        else:
-            query_seq_lens = query_start_loc[1:] - query_start_loc[:-1]
-            num_computed_tokens = seq_lens - query_seq_lens
-            seq_idx = positions[query_start_loc[:num_reqs]].view(-1, 1)
-
+        # Prefer the pre-existing CPU copy to avoid an extra D2H sync;
+        # arithmetic stays on CPU until .to(self.device) in the constructor.
+        query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
+        _seq_lens_cpu = common_attn_metadata._seq_lens_cpu
+        seq_lens_cpu = (
+            _seq_lens_cpu[:num_reqs]
+            if _seq_lens_cpu is not None
+            else seq_lens[:num_reqs].cpu()
+        )
+        query_seq_lens = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+        num_computed_tokens_cpu = seq_lens_cpu - query_seq_lens
         # custom (triton) kernel's to_dynamic_index rejects int64 seq_lens
-        seq_idx = seq_idx.to(torch.int32)
+        seq_idx = positions[query_start_loc_cpu[:num_reqs]].view(-1, 1).to(torch.int32)
 
         cu_prefix_query_lens = None
         prefix_kv_lens = None
@@ -1152,7 +1189,9 @@ class RBLNFlashAttentionMetadataBuilder(
         dyn_size_for_partitions = torch.clamp(
             cs - pidx * partition_len, 0, partition_len
         )
-        seq_lens_tensor = dyn_size_for_partitions
+        seq_lens_tensor = dyn_size_for_partitions.to(self.device)
+        block_tables_tensor = block_tables_tensor.to(self.device)
+        seq_idx = seq_idx.to(self.device)
 
         assert batch_pad is not None, "batch_pad is required for RBLN Attention Backend"
 
@@ -1161,59 +1200,24 @@ class RBLNFlashAttentionMetadataBuilder(
             # NOTE(jiwoo.park) prefill's block_tables must be a 1D tensor.
             block_tables_tensor = block_tables_tensor[0]
             if not self.is_causal:
-                prefill_chunk_size = self.chunked_prefill_size
-                chunked_attention_mask = torch.zeros(
-                    1,
-                    1,
-                    1,
-                    prefill_chunk_size,
-                    max_seq_len,
-                    dtype=torch.float16 if self.enforce_eager else torch.float32,
-                )
-                causal_mask = 1 - torch.triu(
-                    torch.ones(1, 1, prefill_chunk_size, prefill_chunk_size),
-                    diagonal=1,
-                )
-                step = seq_idx[0]
-                if step >= prefill_chunk_size:
-                    chunked_attention_mask[:, :, :, :, :step] = 1
-                chunked_attention_mask[:, :, :, :, step : step + prefill_chunk_size] = (
-                    causal_mask
-                )
-                attn_masks = chunked_attention_mask
-                attn_masks = attn_masks.to(self.device)
+                attn_masks = self._build_prefill_attn_mask(seq_idx, max_seq_len)
         else:
             # batch padding
             seq_idx = rbln_utils.pad(seq_idx, 0, batch_pad)
             seq_lens_tensor = rbln_utils.pad(seq_lens_tensor, 0, batch_pad)
             block_tables_tensor = rbln_utils.pad(block_tables_tensor, 0, batch_pad)
             if not self.is_causal:
-                decode_attention_mask = torch.zeros(
-                    batch_pad,
-                    1,
-                    1,
-                    1,
-                    max_seq_len,
-                    dtype=torch.float16 if self.enforce_eager else torch.float32,
+                attn_masks = self._build_decode_attn_mask(
+                    seq_lens_cpu, batch_pad, max_seq_len
                 )
-                for batch_index, batch_step in enumerate(
-                    seq_lens_cpu if use_dt else seq_lens
-                ):
-                    decode_attention_mask[batch_index, :, :, :, : batch_step + 1] = 1
-                attn_masks = decode_attention_mask
-                attn_masks = attn_masks.to(self.device)
 
         cache_seq_lens = None
         cache_offsets = None
         local_block_tables = None
         swa_attn_masks = None
         if sliding_window := getattr(self.kv_cache_spec, "sliding_window", None):
-            nct_src = (
-                num_computed_tokens_cpu if use_dt else num_computed_tokens[:num_reqs]
-            )
-            sl_src = seq_lens_cpu if use_dt else seq_lens[:num_reqs]
-            num_computed_tokens = nct_src.view(-1, 1)
-            seq_lens = sl_src.view(-1, 1)
+            num_computed_tokens = num_computed_tokens_cpu.to(self.device).view(-1, 1)
+            seq_lens = seq_lens_cpu.to(self.device).view(-1, 1)
             query_lens = seq_lens - num_computed_tokens
             cache_seq_lens = torch.clamp(num_computed_tokens, max=sliding_window)
             cache_offsets = cache_seq_lens + query_lens
@@ -1222,7 +1226,8 @@ class RBLNFlashAttentionMetadataBuilder(
                 cache_offsets = rbln_utils.pad(cache_offsets, 0, batch_pad)
                 # Generate sliding window attention mask for decode
                 # mask[b, s] = 1.0 if s <= cache_seq_lens[b] else 0.0
-                positions = torch.arange(sliding_window)[None, :]
+                # [None, :] = unsqueeze(0) to broadcast over batch dimension
+                positions = torch.arange(sliding_window, device=self.device)[None, :]
                 swa_attn_masks = torch.where(positions - cache_seq_lens > 0, 0.0, 1.0)[
                     :, None, None, :
                 ]
@@ -1233,18 +1238,35 @@ class RBLNFlashAttentionMetadataBuilder(
         #   for each batch, have sequence offset
         # * seq_lens_tensor(otherwise)      - [B, P],
         #   have dynamic size for each partition
-        if is_prefill:
-            seq_lens = seq_lens_tensor.to(self.device)
-        elif isinstance(self.kv_cache_spec, MLAAttentionSpec):
+        # seq_idx is used only for batch-attention-opt decode (see shape note
+        # above); otherwise fall back to the per-partition seq_lens_tensor.
+        is_mla_decode = not is_prefill and isinstance(
+            self.kv_cache_spec, MLAAttentionSpec
+        )
+        if is_mla_decode:
             assert self.is_batch_attention_opt, (
                 "batch_attn_opt required for MLAAttention decoder"
             )
-            seq_lens = seq_idx.to(self.device)
-        else:
-            if not self.is_batch_attention_opt or batch_pad <= 1:
-                seq_lens = seq_lens_tensor.to(self.device)
-            else:
-                seq_lens = seq_idx.to(self.device)
+        use_seq_idx = (
+            not is_prefill
+            and self.is_batch_attention_opt
+            and (is_mla_decode or batch_pad > 1)
+        )
+        seq_lens = seq_idx if use_seq_idx else seq_lens_tensor
+
+        # Reuse the device buffer for cache_seq_lens and cache_offsets
+        # to avoid extra vmem reallocation.
+        # FIXME just slicing the buffer to reuse vmvm to make the most of buffer.
+        cache_seq_lens = (
+            self._to_device_inplace(cache_seq_lens, "_swa_cache_seq_lens_buf")
+            if cache_seq_lens is not None
+            else None
+        )
+        cache_offsets = (
+            self._to_device_inplace(cache_offsets, "_swa_cache_offsets_buf")
+            if cache_offsets is not None
+            else None
+        )
 
         attn_metadata = RBLNFlashAttentionMetadata(
             num_actual_tokens=num_actual_tokens,
@@ -1252,7 +1274,7 @@ class RBLNFlashAttentionMetadataBuilder(
             query_start_loc=query_start_loc,
             max_seq_len=query_max_seq_len,
             seq_lens=seq_lens,
-            block_tables=block_tables_tensor.to(self.device),
+            block_tables=block_tables_tensor,
             slot_mapping=slot_mapping,
             use_cascade=False,
             common_prefix_len=common_prefix_len,
@@ -1263,22 +1285,10 @@ class RBLNFlashAttentionMetadataBuilder(
             prefix_scheduler_metadata=prefix_scheduler_metadata,
             is_prefill=is_prefill,
             attn_masks=attn_masks,
-            cache_seq_lens=self._to_device_inplace(
-                cache_seq_lens, "_swa_cache_seq_lens_buf"
-            )
-            if cache_seq_lens is not None
-            else None,
-            cache_offsets=self._to_device_inplace(
-                cache_offsets, "_swa_cache_offsets_buf"
-            )
-            if cache_offsets is not None
-            else None,
-            local_block_tables=local_block_tables.to(self.device)
-            if local_block_tables is not None
-            else None,
-            swa_attn_masks=swa_attn_masks.to(self.device)
-            if swa_attn_masks is not None
-            else None,
+            cache_seq_lens=cache_seq_lens,
+            cache_offsets=cache_offsets,
+            local_block_tables=local_block_tables,
+            swa_attn_masks=swa_attn_masks,
         )
 
         return attn_metadata

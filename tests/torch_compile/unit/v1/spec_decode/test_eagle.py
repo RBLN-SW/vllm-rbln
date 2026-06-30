@@ -143,7 +143,6 @@ def make_fake_proposer(
     fake.token_arange_np = np.arange(max_num_tokens + 1, dtype=np.int32)
     fake.block_size = 4
     fake.max_model_len = max_model_len
-    fake.compile_context = SimpleNamespace(mark_static_address=Mock())
     fake.backup_next_token_ids = FakeBackupNextTokenIds(size=8)
 
     def _set_positions(num_tokens: int, positions: torch.Tensor) -> None:

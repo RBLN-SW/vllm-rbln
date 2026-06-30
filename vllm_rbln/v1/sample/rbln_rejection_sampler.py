@@ -23,14 +23,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
-import vllm_rbln.rbln_envs as envs
-from vllm_rbln.logger import init_logger
-from vllm_rbln.v1.sample.rbln_sampler import (
-    build_compile_options,
-    resolve_compile_context,
-)
-
-logger = init_logger(__name__)
+from vllm_rbln.v1.sample.rbln_sampler import build_compile_options
 
 PLACEHOLDER_TOKEN_ID = -1
 GREEDY_TEMPERATURE = 0
@@ -62,10 +55,8 @@ def rbln_rejection_sample(
 # - apply_all_penalties
 class RBLNRejectionSampler(RejectionSampler):
     def __init__(self, *args, **kwargs):
-        compile_context = kwargs.pop("compile_context", None)
         super().__init__(*args, **kwargs)
-        compile_context = resolve_compile_context(compile_context)
-        options = build_compile_options(compile_context)
+        options = build_compile_options()
         self.compiled_rejection_sample = torch.compile(
             rbln_rejection_sample,
             dynamic=False,
@@ -214,12 +205,6 @@ class RBLNRejectionSampler(RejectionSampler):
         vocab_size = target_probs.shape[-1]
         # NOTE(eunji.lee):
         # Currently, rejection sampler only available in cpu input tensor
-        if envs.VLLM_RBLN_USE_DEVICE_TENSOR == 1:
-            logger.warning_once(
-                "VLLM_RBLN_USE_DEVICE_TENSOR is enabled, but the RBLN rejection "
-                "sampler only supports CPU input tensors. Forcing rejection sampler "
-                "inputs to CPU."
-            )
         cpu_device = "cpu"
         assert draft_token_ids.is_contiguous()
         assert draft_probs is None or draft_probs.is_contiguous()
