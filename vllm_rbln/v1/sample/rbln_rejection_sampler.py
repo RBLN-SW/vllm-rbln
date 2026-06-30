@@ -64,6 +64,15 @@ class RBLNRejectionSampler(RejectionSampler):
     def __init__(self, *args, **kwargs):
         compile_context = kwargs.pop("compile_context", None)
         super().__init__(*args, **kwargs)
+        # NOTE(RBLN): synthetic-acceptance mode (vllm 0.22) is implemented only
+        # in the CPU rejection sampler. The NPU `rbln::rejection_sample`
+        # primitive ignores the synthetic rates, so refuse it here instead of
+        # silently sampling normally.
+        assert not self.synthetic_mode, (
+            "RBLNRejectionSampler does not support synthetic rejection "
+            "sampling (rejection_sample_method='synthetic'). Use the CPU "
+            "rejection sampler for this mode."
+        )
         compile_context = resolve_compile_context(compile_context)
         options = build_compile_options(compile_context)
         self.compiled_rejection_sample = torch.compile(
