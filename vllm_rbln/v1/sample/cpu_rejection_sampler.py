@@ -452,7 +452,10 @@ def torch_rejection_greedy_sample_kernel(
             assert synthetic_conditional_rates is not None
             u = uniform_probs[s:e]
             rate = synthetic_conditional_rates[:n].to(device=u.device, dtype=u.dtype)
-            accepted = u < rate
+            # NOTE(RBLN): -1 marks padded/invalid draft ids that must be
+            # rejected (vllm PR #46533); without this the synthetic path could
+            # accept the placeholder and emit -1 as a real token.
+            accepted = (u < rate) & (d >= 0)
             rej = ~accepted
             if rej.any():
                 k = int(rej.to(torch.int64).argmax().item())
@@ -517,14 +520,20 @@ def torch_rejection_random_sample_kernel(
         d_ids = draft_token_ids[s:e].to(torch.int64)
         u = uniform_probs[s:e].to(torch.float64)
 
+        # NOTE(RBLN): -1 marks padded/invalid draft ids that must be rejected
+        # (vllm PR #46533). Clamp them to 0 so the prob gathers below never
+        # index out of bounds, then force-reject those positions via neg_mask.
+        neg_mask = d_ids < 0
+
         if synthetic_mode:
             assert synthetic_conditional_rates is not None
             rate = synthetic_conditional_rates[:n].to(device=u.device, dtype=u.dtype)
             accept = u < rate
         else:
+            safe_ids = d_ids.clamp_min(0)
             t_prob = (
                 target_probs[s:e]
-                .gather(1, d_ids.unsqueeze(1))
+                .gather(1, safe_ids.unsqueeze(1))
                 .squeeze(1)
                 .to(torch.float64)
             )
@@ -534,11 +543,13 @@ def torch_rejection_random_sample_kernel(
             else:
                 d_prob = (
                     draft_probs[s:e]
-                    .gather(1, d_ids.unsqueeze(1))
+                    .gather(1, safe_ids.unsqueeze(1))
                     .squeeze(1)
                     .to(torch.float64)
                 )
                 accept = (d_prob > 0) & ((t_prob / d_prob) >= u)
+
+        accept = accept & ~neg_mask
 
         if (~accept).any():
             k = int((~accept).to(torch.int64).argmax().item())
@@ -614,7 +625,10 @@ def torch_sample_recovered_tokens_kernel(
             prob = target_probs[s:e].to(torch.float32)
             d_ids = draft_token_ids[s:e].to(torch.int64)
             prob = prob.clone()
-            prob.scatter_(1, d_ids.unsqueeze(1), 0.0)
+            # NOTE(RBLN): clamp padded/invalid (-1) draft ids so scatter_ does
+            # not index out of bounds (vllm PR #46533). The recovered token is
+            # still sampled from the target distribution for those positions.
+            prob.scatter_(1, d_ids.clamp_min(0).unsqueeze(1), 0.0)
         else:
             prob = torch.maximum(
                 target_probs[s:e].to(torch.float32)
