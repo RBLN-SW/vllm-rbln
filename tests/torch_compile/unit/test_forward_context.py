@@ -25,7 +25,6 @@ def attn_metadata_mock():
     )
 
     attn_metadata_mock = MagicMock(spec=RBLNFlashAttentionMetadata)
-    attn_metadata_mock.num_actual_tokens = 16
     return attn_metadata_mock
 
 
