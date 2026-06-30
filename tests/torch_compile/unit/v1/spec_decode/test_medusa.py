@@ -60,7 +60,6 @@ def make_fake_proposer(
     fake.hidden_size = hidden_size
     fake.dtype = dtype
     fake.device = torch.device("cpu")
-    fake.compile_context = object()
     fake.vllm_config = SimpleNamespace(
         speculative_config=SimpleNamespace(enforce_eager=True)
     )
@@ -73,31 +72,6 @@ def make_fake_group(group_name: str, ranks: list[int]) -> SimpleNamespace:
         cpu_group=SimpleNamespace(group_name=f"{group_name}_cpu"),
         ranks=ranks,
     )
-
-
-# Verifies that __init__ delegates to the base proposer and creates a compile context.
-def test_init_creates_compile_context_with_weight_sharing(monkeypatch):
-    super_init = Mock()
-    compile_context_instance = object()
-    compile_context_ctor = Mock(return_value=compile_context_instance)
-
-    def fake_super_init(self, vllm_config, device):
-        super_init(vllm_config, device)
-        self.vllm_config = vllm_config
-        self.device = device
-
-    monkeypatch.setattr(MedusaProposer, "__init__", fake_super_init)
-    monkeypatch.setattr(medusa_module, "CompileContext", compile_context_ctor)
-
-    vllm_config = object()
-    device = torch.device("cpu")
-
-    proposer = RBLNMedusaProposer(vllm_config, device)
-
-    super_init.assert_called_once_with(vllm_config, device)
-    compile_context_ctor.assert_called_once_with(use_weight_sharing=True)
-    assert proposer.compile_context is compile_context_instance
-
 
 # Verifies that Medusa stacks per-head argmax outputs into [batch, num_heads].
 def test_propose_returns_headwise_argmax_stack():
@@ -238,7 +212,6 @@ def test_compile_model_builds_expected_rbln_compile_options(
     assert captured["dynamic"] is False
 
     options = cast(dict[str, Any], captured["options"])
-    assert options["compile_context"] is fake.compile_context
     assert options["tensor_parallel_size"] == 8
     assert options["guard_filter_fn"] is torch.compiler.keep_tensor_guards_unsafe
     assert options["mode"] == "strict"

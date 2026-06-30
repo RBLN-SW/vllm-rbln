@@ -30,15 +30,11 @@ from vllm_rbln.v1.sample.rbln_sampler import RBLNSampler
 @pytest.fixture(scope="module")
 def rejection_sampler(monkeypatch_module):
     monkeypatch_module.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
-    from rebel.compile_context import CompileContext
-
-    compile_context = CompileContext(use_global_ctx=True, use_weight_sharing=True)
     sampler = RBLNSampler(
         logprobs_mode="raw_logprobs",
-        compile_context=compile_context,
     )
 
-    return RBLNRejectionSampler(sampler, compile_context=compile_context)
+    return RBLNRejectionSampler(sampler)
 
 
 def _one_hot(target_tokens: list[int], vocab_size: int) -> torch.Tensor:
