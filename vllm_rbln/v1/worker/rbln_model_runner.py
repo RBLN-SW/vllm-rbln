@@ -3450,41 +3450,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         ):
             self._attach_kv_cache_bindings(attn_metadata)
 
-            # [ragged-prefill-probe] Verify the ragged-batch hypothesis
-            # (fsw-inference#356): the view below requires a rectangular
-            # buffer (numel % num_reqs == 0). Log the full batch shape
-            # context whenever it is NOT rectangular -- this fires exactly
-            # at the crash precondition and is silent otherwise.
-            _probe_numel = input_ids.numel()
-            if num_reqs > 0 and _probe_numel % num_reqs != 0:
-                _probe_slide = (
-                    getattr(scheduler_output, "spec_decode_slide_distance", {}) or {}
-                )
-                _probe_per_req = [
-                    (
-                        rid,
-                        int(scheduler_output.num_scheduled_tokens.get(rid, -1)),
-                        int(_probe_slide.get(rid, 0)),
-                    )
-                    for rid in self.input_batch.req_ids
-                ]
-                logger.error(
-                    "[ragged-prefill-probe] RAGGED batch before view: "
-                    "numel=%d num_reqs=%d (numel%%num_reqs=%d) "
-                    "is_prefill_phase=%s max_spec_decode_len=%s "
-                    "max_tokens_per_req_across_dp=%s "
-                    "n_scheduled_spec_decode_tokens=%d "
-                    "per_req[(req_id, num_scheduled, slide)]=%s",
-                    _probe_numel,
-                    num_reqs,
-                    _probe_numel % num_reqs,
-                    is_prefill_phase,
-                    max_spec_decode_len,
-                    max_tokens_per_req_across_dp,
-                    len(scheduler_output.scheduled_spec_decode_tokens),
-                    _probe_per_req,
-                )
-
             # FIXME(jiwoo.park) This is a temporary workaround;
             # we must resolve the batch dimension.
             input_ids = input_ids.view(num_reqs, -1).to(torch.long)

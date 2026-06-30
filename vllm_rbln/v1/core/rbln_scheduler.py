@@ -980,27 +980,6 @@ class RBLNScheduler(Scheduler):
                             self.ec_connector.update_state_after_alloc(request, i)
 
                 if promoted_from_waiting_for_remote_kvs:
-                    # [ragged-prefill-probe] Verify the root-cause hypothesis
-                    # (fsw-inference#356): this `continue` assumes a promoted
-                    # remote-KV request is single-token decode and bypasses the
-                    # prefill-batch-size-1 mixing-disable below. A block-unaligned
-                    # prompt instead needs a local prefill of its last partial
-                    # block (num_new_tokens > 1 => is_prefill-phase). Logging
-                    # num_new_tokens here shows, per step, whether several such
-                    # prefill-phase promotes are being batched together.
-                    logger.warning(
-                        "[ragged-prefill-probe] promote req=%s num_new_tokens=%d "
-                        "num_computed=%d num_prompt=%d num_tokens=%d "
-                        "block_size=%d num_computed%%block=%d is_prefill_like=%s",
-                        request_id,
-                        num_new_tokens,
-                        num_computed_tokens,
-                        request.num_prompt_tokens,
-                        request.num_tokens,
-                        self.block_size,
-                        num_computed_tokens % self.block_size,
-                        num_new_tokens > 1,
-                    )
                     # NOTE(RBLN): We can continue to schedule the next request
                     # because scheduled new request is added as decoding phase.
                     continue
