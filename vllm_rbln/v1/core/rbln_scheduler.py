@@ -1010,17 +1010,25 @@ class RBLNScheduler(Scheduler):
                 if promoted_from_waiting_for_remote_kvs:
                     # NOTE(RBLN): A request promoted from WAITING_FOR_REMOTE_KVS is
                     # decode-ready: its prompt KV was prefilled on the remote
-                    # (producer) instance, so exactly one new token is decoded this
-                    # step. A partial remote match (num_new_tokens > 1) would leave a
-                    # local "remainder prefill" that must not join the decode batch;
-                    # that is unsupported here -- fail loudly instead of silently
-                    # corrupting the (batch, num_spec+1) decode shape downstream
-                    # (input_ids.view(num_reqs, -1)).
-                    assert num_new_tokens == 1, (
-                        f"promoted remote-KV request {request_id} has "
-                        f"num_new_tokens={num_new_tokens} (expected 1); a partial "
+                    # (producer) instance, so it joins as a single-token decode.
+                    #
+                    # PRIMARY guard: it must NOT be in prefill. A partial remote
+                    # match leaves a local "remainder prefill" (is_prefill) that
+                    # cannot mix into the (batch, num_spec+1) decode shape -- fail
+                    # loudly instead of silently corrupting
+                    # input_ids.view(num_reqs, -1) downstream. The num_new_tokens
+                    # == 1 check is the equivalent single-token precondition that
+                    # `_decide_spec_slide(new_n=1)` below relies on (given the
+                    # earlier `assert num_new_tokens > 0`).
+                    assert not is_prefill(request), (
+                        f"promoted remote-KV request {request_id} is still in "
+                        f"prefill (num_new_tokens={num_new_tokens}); a partial "
                         "remote KV match leaves a local prefill remainder that "
                         "cannot mix into the decode batch."
+                    )
+                    assert num_new_tokens == 1, (
+                        f"promoted remote-KV request {request_id} has "
+                        f"num_new_tokens={num_new_tokens} (expected 1)."
                     )
                     # This promotion path bypasses the running-loop spec/slide
                     # block above, so apply the SAME sliding-window backfill via
@@ -1029,10 +1037,10 @@ class RBLNScheduler(Scheduler):
                     # freshly promoted req carries 0 drafts, so without this
                     # backfill its window stays length 1 while running peers run
                     # at num_spec+1 and the runner would zero-pad it (garbage KV)
-                    # instead of re-feeding real past tokens. num_new_tokens == 1
+                    # instead of re-feeding real past tokens. not is_prefill
                     # (asserted) so the advance is never boundary-trimmed
                     # (new_n == 1).
-                    if not is_prefill(request) and self.num_spec_tokens > 0:
+                    if self.num_spec_tokens > 0:
                         slide_distance, cross_block_no_spec = self._decide_spec_slide(
                             request, new_n=1
                         )
