@@ -1243,19 +1243,16 @@ class TestShutdown:
         worker = _create_worker()
         worker.model_runner = MagicMock()
         worker.model_runner.performance_tracker = MagicMock()
-        worker.model_runner.sampler_performance_tracker = MagicMock()
         worker.model_runner.e2e_performance_tracker = MagicMock()
         with patch("vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_METRICS", True):
             worker.shutdown()
         worker.model_runner.performance_tracker.print_final_stats.assert_called_once()
-        worker.model_runner.sampler_performance_tracker.print_final_stats.assert_called_once()
         worker.model_runner.e2e_performance_tracker.print_final_stats.assert_called_once()
 
     def test_with_metrics_none_trackers(self):
         worker = _create_worker()
         worker.model_runner = MagicMock()
         worker.model_runner.performance_tracker = None
-        worker.model_runner.sampler_performance_tracker = None
         worker.model_runner.e2e_performance_tracker = None
         with patch("vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_METRICS", True):
             worker.shutdown()

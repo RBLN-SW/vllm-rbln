@@ -146,7 +146,11 @@ from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
 from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
-from vllm_rbln.v1.worker.metrics import PerformanceTracker, collect_metrics
+from vllm_rbln.v1.worker.metrics import (
+    PerformanceTracker,
+    StepReport,
+    collect_metrics,
+)
 from vllm_rbln.v1.worker.utils import compute_slot_mapping_cpu, get_kv_cache_names
 
 if TYPE_CHECKING:
@@ -584,8 +588,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         )
 
         self.performance_tracker: PerformanceTracker | None = None
-        self.sampler_performance_tracker: PerformanceTracker | None = None
         self.e2e_performance_tracker: PerformanceTracker | None = None
+        self._pending_model_report: StepReport | None = None
         self.e2e_start_time: float = 0.0
         self.e2e_end_time: float = 0.0
 
@@ -598,9 +602,13 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
     def _enable_performance_tracker(self):
         if envs.VLLM_RBLN_METRICS:
-            self.performance_tracker = PerformanceTracker("MODEL")
-            self.sampler_performance_tracker = PerformanceTracker("SAMPLER")
+            self.performance_tracker = PerformanceTracker("MODEL+SAMPLER")
             self.e2e_performance_tracker = PerformanceTracker("E2E")
+
+    def _flush_pending_model_report(self):
+        if self.performance_tracker is not None and self._pending_model_report:
+            self.performance_tracker.record(self._pending_model_report)
+            self._pending_model_report = None
 
     def _get_positions(self, num_tokens: Any):
         if isinstance(num_tokens, int):
@@ -2104,6 +2112,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # and sampling, and return empty tensor with expected shape. The output
         # is discarded anyway (discard_sampled_tokens_req_indices).
         if logits is not None and logits.shape[0] == 0:
+            self._flush_pending_model_report()
             return SamplerOutput(
                 sampled_token_ids=torch.empty(
                     0, 1, dtype=torch.int32, device=logits.device
@@ -2151,16 +2160,21 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 self._update_states_after_model_execute(
                     sampler_output.sampled_token_ids
                 )
-        if envs.VLLM_RBLN_METRICS and self.sampler_performance_tracker is not None:
-            collect_metrics(
-                self.sampler_performance_tracker,
-                self.is_prefill_phase(),
-                start_time=sampler_start_time,
-                end_time=time.perf_counter(),
-                reports=sampler_reports,
-                token_count=0,
-                # the performance of sampler doesn't depend on token count
+        if envs.VLLM_RBLN_METRICS and self.performance_tracker is not None:
+            sampler_report = StepReport.from_reports(
+                sampler_start_time,
+                time.perf_counter(),
+                sampler_reports,
+                is_prefill=self.is_prefill_phase(),
             )
+            model_report = self._pending_model_report
+            self._pending_model_report = None
+            combined = (
+                model_report.merged_with(sampler_report)
+                if model_report is not None
+                else sampler_report
+            )
+            self.performance_tracker.record(combined)
 
         return sampler_output
 
@@ -3517,48 +3531,21 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     **model_kwargs,
                 )
             if self.performance_tracker is not None:
-                # Record performance metrics
-                model_end_time = time.perf_counter()
-                model_execution_time = model_end_time - model_start_time
-                host_time = None
-                device_time = None
-                ccl_time = None
-                prepare_time = None
-
-                if reports is not None and len(reports) > 0:
-                    host_time = reports[0].get("total_host", None)
-                    device_time = reports[0].get("total_device", None)
-                    ccl_time = reports[0].get("total_ccl", None)
-                if reports is not None and len(reports) > 1:
-                    prepare_time = reports[1].get("prepare_input_us", 0) + reports[
-                        1
-                    ].get("prepare_output_us", 0)
-
-                if is_prefill_phase:
-                    self.performance_tracker.record_prefill(
-                        model_execution_time,
-                        num_scheduled_tokens,
-                        host_time=host_time,
-                        device_time=device_time,
-                        ccl_time=ccl_time,
-                        prepare_time=prepare_time,
-                        request_ids=self.input_batch.req_ids,
-                    )
-                else:
-                    padded_decode = (
-                        num_padded_tokens is not None
-                        and num_padded_tokens != batch_bucket_size
-                    )
-                    self.performance_tracker.record_decode(
-                        model_execution_time,
-                        num_scheduled_tokens,
-                        host_time=host_time,
-                        device_time=device_time,
-                        ccl_time=ccl_time,
-                        prepare_time=prepare_time,
-                        padded_decode=padded_decode,
-                        request_ids=self.input_batch.req_ids,
-                    )
+                # Stash model timing; combined with sampler timing in _sample().
+                padded_decode = (
+                    not is_prefill_phase
+                    and num_padded_tokens is not None
+                    and num_padded_tokens != batch_bucket_size
+                )
+                self._pending_model_report = StepReport.from_reports(
+                    model_start_time,
+                    time.perf_counter(),
+                    reports,
+                    token_count=num_scheduled_tokens,
+                    is_prefill=is_prefill_phase,
+                    padded_decode=padded_decode,
+                    request_ids=self.input_batch.req_ids,
+                )
 
         with record_function_or_nullcontext("Postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -3582,6 +3569,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 if not broadcast_pp_output:
                     hidden_states.kv_connector_output = kv_connector_output
                     self.kv_connector_output = kv_connector_output
+                    self._flush_pending_model_report()
                     return hidden_states
                 # NOTE - DO NOT all_gather_group for RBLN pp
                 get_pp_group().send_tensor_dict(hidden_states.tensors)
@@ -3589,6 +3577,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             else:
                 # for last-pipeline stages, return hidden states
                 if self.is_pooling_model:
+                    self._flush_pending_model_report()
                     return self._pool(
                         hidden_states.flatten(0, -2),
                         num_scheduled_tokens,
