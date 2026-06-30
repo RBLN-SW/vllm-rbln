@@ -282,7 +282,9 @@ class RBLNModelRunner:
                     "Unsupported speculative decoding method: "
                     f"{self.speculative_config.method}"
                 )
-            self.rejection_sampler = RBLNRejectionSampler(self.sampler)
+            self.rejection_sampler = RBLNRejectionSampler(
+                self.sampler, self.compile_context
+            )
 
         self.num_spec_tokens = 0
         if self.speculative_config:
@@ -1647,11 +1649,7 @@ class RBLNModelRunner:
 
         model_loader = get_model_loader(self.load_config)
         offload_context = nullcontext
-        if (
-            HAS_TORCH_RBLN
-            and envs.VLLM_RBLN_USE_DEVICE_TENSOR
-            and not envs.VLLM_RBLN_DISABLE_OFFLOAD
-        ):
+        if HAS_TORCH_RBLN and USE_DEVICE_TENSOR and not envs.VLLM_RBLN_DISABLE_OFFLOAD:
             offload_context = torch.rbln.offload
         with offload_context():
             self.model = model_loader.load_model(
@@ -2410,7 +2408,7 @@ class RBLNModelRunner:
         )
 
         if (
-            not envs.VLLM_RBLN_USE_DEVICE_TENSOR
+            not USE_DEVICE_TENSOR
             and not self.model_config.enforce_eager
             and envs.VLLM_RBLN_COMPILE_MODEL
         ):
@@ -2688,7 +2686,7 @@ class RBLNModelRunner:
         copy_ops: list[KVCacheCopyOp],
     ) -> None:
         use_runtime_kv_copy = (
-            not envs.VLLM_RBLN_USE_DEVICE_TENSOR
+            not USE_DEVICE_TENSOR
             and not self.model_config.enforce_eager
             and envs.VLLM_RBLN_COMPILE_MODEL
         )

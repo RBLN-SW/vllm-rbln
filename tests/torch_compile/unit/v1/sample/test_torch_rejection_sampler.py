@@ -35,6 +35,11 @@ from .utils import create_allowed_token_ids
 DEVICE = "cpu"
 
 
+@pytest.fixture(autouse=True)
+def use_torch_rejection_sampler(monkeypatch):
+    monkeypatch.setenv("VLLM_RBLN_SAMPLER", "0")
+
+
 @pytest.fixture
 def rejection_sampler():
     mock_sampler = Mock(spec=Sampler)
