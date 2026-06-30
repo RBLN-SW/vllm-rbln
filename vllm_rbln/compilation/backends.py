@@ -21,7 +21,7 @@ from typing import Any
 
 import torch
 import torch.fx as fx
-from rebel.core.torch_compile import rbln_backend as _rbln_backend
+from rebel.core.torch_compile import rbln_backend as rbln_torch_compile_backend
 
 from vllm_rbln.logger import init_logger
 
@@ -114,7 +114,7 @@ def _find_rbln_callsite() -> str:
 
 
 # TODO(RBLN): Implement RBLN-specific backend like VllmBackend
-def rbln_backend(
+def _rbln_backend(
     graph: fx.GraphModule, example_inputs: Sequence[Any], **kwargs: Any
 ) -> Any:
     compile_id = next(_compile_counter)
@@ -133,4 +133,7 @@ def rbln_backend(
         _find_rbln_callsite(),
         "; ".join(parts),
     )
-    return _rbln_backend(graph, example_inputs, **kwargs)
+    return rbln_torch_compile_backend(graph, example_inputs, **kwargs)
+
+
+rbln_backend = _rbln_backend
