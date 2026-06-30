@@ -430,10 +430,14 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             if self.use_rbln_sampler:
                 self.rejection_sampler = RBLNRejectionSampler(
                     self.sampler,
+                    self.speculative_config,
+                    self.device,
                     compile_context=self.compile_context,
                 )
             else:
-                self.rejection_sampler = CPURejectionSampler(self.sampler)
+                self.rejection_sampler = CPURejectionSampler(
+                    self.sampler, self.speculative_config, self.device
+                )
 
         self.num_spec_tokens = 0
         if self.speculative_config:
