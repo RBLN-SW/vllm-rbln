@@ -3291,23 +3291,11 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 isinstance(scheduler_output, RBLNSchedulerOutput)
                 and scheduler_output.step_no_spec_required
             )
-            # fsw-inference#356: a prefilling DP peer makes get_dp_padding return
-            # max_tokens_per_req_across_dp=None (any_prefill), which disables the
-            # speculative pad (max_spec_decode_len=None) on the DECODE ranks. A
-            # decode rank must then build a uniform query_len=1 batch, i.e. it
-            # must scrub its per-req slide; otherwise the leftover slide yields a
-            # ragged input_ids and input_ids.view(num_reqs, -1) crashes. Fold the
-            # local prefill flag into the cross-DP OR-reduce so a prefilling peer
-            # trips the collective no-spec scrub on every decode rank. The
-            # prefilling rank itself must NOT scrub (scrub forces every
-            # num_scheduled_tokens to 1, which would truncate its prompt), so the
-            # scrub below is additionally gated on `not local_is_prefill`.
-            local_is_prefill = self.is_prefill_phase()
             dp_size = self.vllm_config.parallel_config.data_parallel_size
             if dp_size > 1 and self.num_spec_tokens > 0:
                 dp_rank = self.vllm_config.parallel_config.data_parallel_rank
                 per_rank_flag = RBLNDPMetadata.num_tokens_across_dp(
-                    1 if (local_step_no_spec_required or local_is_prefill) else 0,
+                    1 if local_step_no_spec_required else 0,
                     dp_size,
                     dp_rank,
                 )
@@ -3322,11 +3310,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # scheduled, so `_prepare_inputs` builds a uniform query_len=1
             # graph across DP. Runs whenever the global flag is set, even if
             # this rank had no drafts/slide locally (a peer tripped it).
-            # Gate the scrub on `not local_is_prefill` (fsw-inference#356): a
-            # prefilling rank trips the collective flag above so its decode peers
-            # scrub, but it must keep its own multi-token prompt (scrub forces
-            # query_len=1). Decode ranks behave exactly as before.
-            if step_no_spec_required and not local_is_prefill:
+            if step_no_spec_required:
                 scrub_scheduler_output_for_no_spec(scheduler_output)
                 tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
                 num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
