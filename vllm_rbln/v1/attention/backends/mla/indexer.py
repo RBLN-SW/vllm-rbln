@@ -32,7 +32,7 @@ class RBLNDeepseekV32IndexerBackend(AttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        return [64]
+        return [MultipleOf(64)]
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
