@@ -18,7 +18,6 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn as nn
-from rebel import CompileContext
 from vllm.config import VllmConfig
 from vllm.distributed.parallel_state import get_dp_group, get_pp_group, get_tp_group
 from vllm.v1.attention.backend import CommonAttentionMetadata
@@ -50,11 +49,6 @@ class RBLNEagleProposer(EagleProposer):
         super().__init__(vllm_config, device, runner)
 
         self.runner = runner
-        if runner is not None and getattr(runner, "compile_context", None) is not None:
-            self.compile_context = runner.compile_context
-        else:
-            self.compile_context = CompileContext(use_weight_sharing=True)
-
         if self.supports_mm_inputs:
             raise NotImplementedError("Multimodal inputs are not supported yet.")
 
@@ -275,10 +269,16 @@ class RBLNEagleProposer(EagleProposer):
                 block_numbers = clamped_positions[0] // self.block_size
             else:
                 block_numbers = clamped_positions // self.block_size
-            block_ids = common_attn_metadata.block_table_tensor.gather(
-                dim=1, index=block_numbers.view(-1, 1)
+            # NOTE(RBLN): With VLLM_RBLN_USE_DEVICE_TENSOR=1 the block table is
+            # kept on CPU while block_numbers (from self.positions.gpu) is on the
+            # RBLN device. gather requires self and index on the same device, so
+            # align the index to the table, then move block_ids back to the
+            # positions' device for the downstream slot_mapping arithmetic.
+            block_table_tensor = common_attn_metadata.block_table_tensor
+            block_ids = block_table_tensor.gather(
+                dim=1, index=block_numbers.view(-1, 1).to(block_table_tensor.device)
             )
-            block_ids = block_ids.view(-1)
+            block_ids = block_ids.view(-1).to(clamped_positions.device)
             if self.uses_mrope:
                 common_attn_metadata.slot_mapping = (
                     block_ids * self.block_size + clamped_positions[0] % self.block_size
@@ -757,8 +757,7 @@ class RBLNEagleProposer(EagleProposer):
         process_group_dict[DP.cpu_group.group_name] = DP.ranks
 
         options = {
-            "compile_context": self.compile_context,
-            "tensor_parallel_size": envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
+            "num_devices": envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
             "process_group_dict": process_group_dict,
             "guard_filter_fn": torch.compiler.keep_tensor_guards_unsafe,
             "mode": "strict",

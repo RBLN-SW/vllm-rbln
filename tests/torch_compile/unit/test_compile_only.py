@@ -147,7 +147,6 @@ def _capture_compile_options(monkeypatch, module):
         if hasattr(module, name)
     )
     proposer = proposer_cls.__new__(proposer_cls)
-    proposer.compile_context = object()
     proposer._compile_model(lambda x: x)
     return captured["options"]
 
