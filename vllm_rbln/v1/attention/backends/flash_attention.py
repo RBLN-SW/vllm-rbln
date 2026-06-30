@@ -997,24 +997,9 @@ class RBLNAttentionBackend(AttentionBackend):
 
 @dataclass
 class RBLNFlashAttentionMetadata:
-    num_actual_tokens: int  # Number of tokens excluding padding.
-    max_query_len: int
-    query_start_loc: torch.Tensor
-    max_seq_len: int
     seq_lens: torch.Tensor
     block_tables: torch.Tensor
     slot_mapping: torch.Tensor
-
-    # For cascade attention.
-    use_cascade: bool | None
-    common_prefix_len: int | None
-    cu_prefix_query_lens: torch.Tensor | None
-    prefix_kv_lens: torch.Tensor | None
-    suffix_kv_lens: torch.Tensor | None
-
-    # Optional aot scheduling
-    scheduler_metadata: torch.Tensor | None = None
-    prefix_scheduler_metadata: torch.Tensor | None = None
 
     # To distinguish prefill and decode
     is_prefill: bool = True
@@ -1151,10 +1136,6 @@ class RBLNFlashAttentionMetadataBuilder(
         is_prefill=False,
     ) -> RBLNFlashAttentionMetadata:
         num_reqs = common_attn_metadata.num_reqs
-        num_actual_tokens = common_attn_metadata.num_actual_tokens
-        max_query_len = common_attn_metadata.max_query_len
-        query_max_seq_len = common_attn_metadata.max_seq_len
-        query_start_loc = common_attn_metadata.query_start_loc
         seq_lens = common_attn_metadata.seq_lens
         block_tables_tensor = common_attn_metadata.block_table_tensor
         slot_mapping = common_attn_metadata.slot_mapping
@@ -1171,11 +1152,6 @@ class RBLNFlashAttentionMetadataBuilder(
         num_computed_tokens_cpu = seq_lens_cpu - query_seq_lens
         # custom (triton) kernel's to_dynamic_index rejects int64 seq_lens
         seq_idx = positions[query_start_loc_cpu[:num_reqs]].view(-1, 1).to(torch.int32)
-
-        cu_prefix_query_lens = None
-        prefix_kv_lens = None
-        suffix_kv_lens = None
-        prefix_scheduler_metadata = None
 
         # The length of the partition equals the block size.
         partition_len = self.block_size
@@ -1269,20 +1245,9 @@ class RBLNFlashAttentionMetadataBuilder(
         )
 
         attn_metadata = RBLNFlashAttentionMetadata(
-            num_actual_tokens=num_actual_tokens,
-            max_query_len=max_query_len,
-            query_start_loc=query_start_loc,
-            max_seq_len=query_max_seq_len,
             seq_lens=seq_lens,
             block_tables=block_tables_tensor,
             slot_mapping=slot_mapping,
-            use_cascade=False,
-            common_prefix_len=common_prefix_len,
-            scheduler_metadata=None,
-            cu_prefix_query_lens=cu_prefix_query_lens,
-            prefix_kv_lens=prefix_kv_lens,
-            suffix_kv_lens=suffix_kv_lens,
-            prefix_scheduler_metadata=prefix_scheduler_metadata,
             is_prefill=is_prefill,
             attn_masks=attn_masks,
             cache_seq_lens=cache_seq_lens,
