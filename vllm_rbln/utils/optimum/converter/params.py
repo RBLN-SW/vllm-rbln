@@ -86,9 +86,10 @@ class RBLNParams:
     max_seq_len: int | None = None
     kvcache_block_size: int | None = None
     prefill_chunk_size: int = 128
+    num_devices: int = 1
     # Image-prefill buckets for multimodal models (gemma3: single value;
     # gemma4: descending list of 128-multiples). None for non-multimodal models.
-    image_prefill_chunk_sizes: list[int] | None = None
+    image_prefill_chunk_size: list[int] | None = None
     tensor_parallel_size: int = 1
 
     @classmethod
@@ -97,7 +98,7 @@ class RBLNParams:
     ) -> "RBLNParams":
         """Parse rbln_config according to the model architecture."""
         hf_config = vllm_config.model_config.hf_config
-        tensor_parallel_size = _cfg_get(rbln_config, "tensor_parallel_size", 1)
+        num_devices = _cfg_get(rbln_config, "num_devices", 1)
 
         if is_enc_dec_arch(hf_config):
             params = cls._parse_enc_dec(rbln_config)
@@ -108,7 +109,7 @@ class RBLNParams:
         else:
             params = cls._parse_decoder(rbln_config)
 
-        params.tensor_parallel_size = tensor_parallel_size
+        params.num_devices = num_devices
         return params
 
     @classmethod
@@ -188,9 +189,9 @@ class RBLNParams:
         prefill_chunk_size = _cfg_get(lm_cfg, "prefill_chunk_size")
         if prefill_chunk_size is None:
             prefill_chunk_size = _cfg_get(cfg, "prefill_chunk_size", 128)
-        image_prefill_chunk_sizes = _resolve_image_prefill_chunk_sizes(lm_cfg)
-        if image_prefill_chunk_sizes is None:
-            image_prefill_chunk_sizes = _resolve_image_prefill_chunk_sizes(cfg)
+        image_prefill_chunk_size = _resolve_image_prefill_chunk_size(lm_cfg)
+        if image_prefill_chunk_size is None:
+            image_prefill_chunk_size = _resolve_image_prefill_chunk_size(cfg)
 
         return cls(
             num_blocks=num_blocks,
@@ -198,33 +199,31 @@ class RBLNParams:
             max_seq_len=max_seq_len,
             kvcache_block_size=kvcache_block_size,
             prefill_chunk_size=prefill_chunk_size,
-            image_prefill_chunk_sizes=image_prefill_chunk_sizes,
+            image_prefill_chunk_size=image_prefill_chunk_size,
         )
 
 
-def _resolve_image_prefill_chunk_sizes(cfg: RblnConfigLike) -> list[int] | None:
+def _resolve_image_prefill_chunk_size(cfg: RblnConfigLike) -> list[int] | None:
     """Resolve image-prefill buckets exactly as optimum-rbln persists them.
 
-    gemma4 stores ``image_prefill_chunk_sizes`` as a ``list[int]``; gemma3 stores
-    the scalar ``image_prefill_chunk_size`` as an ``int``. Any other type is a
-    config error. Returns ``None`` when neither key is present.
+    optimum-rbln stores ``image_prefill_chunk_size`` under one key but with two
+    shapes: gemma3 persists a scalar ``int`` (a single bucket); gemma4 persists
+    a descending ``list[int]`` (multiple buckets). Both are normalized to a
+    ``list[int]``. Any other type is a config error. Returns ``None`` when the
+    key is absent.
     """
-    sizes = _cfg_get(cfg, "image_prefill_chunk_sizes")
-    if sizes is not None:
-        if not isinstance(sizes, list):
-            raise TypeError(
-                "image_prefill_chunk_sizes must be a list[int], got "
-                f"{type(sizes).__name__}"
-            )
+    sizes = _cfg_get(cfg, "image_prefill_chunk_size")
+    if sizes is None:
+        return None
+    if isinstance(sizes, list):
         return sizes
-    size = _cfg_get(cfg, "image_prefill_chunk_size")
-    if size is not None:
-        if not isinstance(size, int):
-            raise TypeError(
-                f"image_prefill_chunk_size must be an int, got {type(size).__name__}"
-            )
-        return [size]
-    return None
+    # bool is an int subclass; reject it explicitly.
+    if isinstance(sizes, int) and not isinstance(sizes, bool):
+        return [sizes]
+    raise TypeError(
+        "image_prefill_chunk_size must be an int or list[int], got "
+        f"{type(sizes).__name__}"
+    )
 
 
 def _resolve_kvcache_block_size(cfg: RblnConfigLike, *, arch: str) -> int | None:
