@@ -43,8 +43,8 @@ def flash_causal_attention_naive_prefill_impl(
       Value states for current input
     - kv_cache: [2, num_blocks, n_kv_heads, 1, partition_size, head_dim]
       Key and value cache
-    - seq_idx: [batch, num_partitions]
-      number of already cached tokens in each partition
+    - seq_idx: [batch, 1]
+      sequence position number of already cached tokens
     - block_tables: [num_partitions,] for prefill,
                     [batch, num_partitions] for decode
     - sinks: [n_heads, sink_len] (optional)
@@ -66,7 +66,7 @@ def flash_causal_attention_naive_prefill_impl(
 
     # Calculate the starting position (number of tokens already in cache)
     # seq_idx contains tokens per partition that are already cached
-    cache_start_pos = int(seq_idx[0].sum().item())
+    cache_start_pos = int(seq_idx[0][0].item())
     total_seq_len = cache_start_pos + seq_len
 
     # Step 1: Write KV cache
@@ -239,7 +239,7 @@ def flash_causal_attention_naive_decode_impl(
     outputs = []
     for b in range(batch_size):
         # Calculate the starting position (number of tokens already in cache)
-        cache_start_pos = int(seq_idx[b].sum().item())
+        cache_start_pos = int(seq_idx[b][0].item())
         total_seq_len = cache_start_pos + seq_len  # seq_len is 1 for decode
 
         if total_seq_len == 0:

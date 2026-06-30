@@ -45,8 +45,8 @@ def flash_attention_naive_prefill_impl(
     - kv_cache: [2, num_blocks, n_kv_heads, 1, partition_size, head_dim]
       Key and value cache
     - mask: [batch, 1, 1, seq_len, max_seq_len]
-    - seq_idx: [batch, num_partitions]
-      number of already cached tokens in each partition
+    - seq_idx: [batch, 1]
+      sequence position number of already cached tokens
     - block_tables: [num_partitions,] for prefill,
                     [batch, num_partitions] for decode
     - sinks: [n_heads, sink_len] (optional)
