@@ -224,6 +224,125 @@ class TestPDDisaggregationScheduler:
         ]
         assert [req.request_id for req in scheduler.waiting] == [local.request_id]
 
+    def test_promoted_decode_query_window_backfill_before_after(self):
+        """REGRESSION for the observed crash: num_reqs=7, input_ids size 19.
+
+        Decode-only PD instance, num_spec_tokens=3, so each decode query window
+        is unified to num_spec+1 = 4 (3 draft slots + 1 bonus token). The runner
+        builds input_ids with per-req length = num_scheduled +
+        spec_decode_slide_distance (rbln_model_runner.py:1262), i.e.
+        ``input_ids.numel == sum(window)`` where window = num_scheduled + slide.
+
+        Batch -- every req is a single-token decode with 0 drafts, so
+        scheduled_spec_decode_tokens is empty and (dp_size==1) the runner guard
+        skips pad_speculative_draft_tokens, leaving the raw windows for the view:
+          * 4 running decode reqs: num_scheduled=1, slide=3 -> window 4.
+          * 3 remote-KV reqs promoted in the SAME step (num_new_tokens == 1).
+
+        BEFORE the fix, promoted reqs took the waiting-loop ``continue`` without
+        the sliding backfill -> no slide -> window 1. input_ids.numel =
+        4*4 + 3*1 = 19, num_reqs=7, 19 % 7 != 0 -> input_ids.view(7,-1) raised.
+
+        AFTER the fix, the promotion path applies the same backfill as the
+        running loop -> each promoted req gets slide=num_spec -> window 4 ->
+        input_ids.numel = 7*4 = 28, 28 % 7 == 0 -> uniform, view is safe.
+        """
+        NUM_SPEC = 3
+        # promoted num_tokens = matched + 1 -> num_new_tokens == 1; matched=19
+        # so num_computed=19 and 19 % 16 = 3 keeps the backfill window in-block.
+        matched = 19
+        scheduler = create_scheduler(
+            block_size=_BLOCK_SIZE,
+            num_blocks=_NUM_BLOCKS,
+            max_num_seqs=_MAX_NUM_SEQS,
+            num_speculative_tokens=NUM_SPEC,
+            use_kv_connector=MockKVConfig(matched_tokens=matched, is_async=True),
+        )
+
+        # 4 running decode reqs (draft=0), kept mid-block.
+        decodes = [
+            _create_pd_request(10, f"d{i}", do_remote_prefill=False) for i in range(4)
+        ]
+        for d in decodes:
+            advance_to_decode(scheduler, d)
+
+        # 3 remote-KV reqs, each a genuine single-token decode (num_new == 1).
+        promoted = [_create_pd_request(matched + 1, f"p{i}") for i in range(3)]
+        for p in promoted:
+            scheduler.add_request(p)
+
+        out_a = scheduler.schedule()
+        for p in promoted:
+            assert p.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+
+        # Complete KV recv for ALL promoted reqs in a SINGLE recv step (one
+        # update_from_output) so they are promoted together in the next
+        # schedule. Calling the per-req helper repeatedly would re-apply the
+        # same scheduler output multiple times and corrupt decode state.
+        mro = create_runner_output(out_a, 1)
+        mro.kv_connector_output = KVConnectorOutput(
+            finished_recving={p.request_id for p in promoted}
+        )
+        scheduler.update_from_output(out_a, mro)
+
+        out = scheduler.schedule()
+        ns = out.num_scheduled_tokens
+        slide = dict(getattr(out, "spec_decode_slide_distance", {}) or {})
+        promoted_ids = {p.request_id for p in promoted}
+
+        # Every req is a single-token decode; the draft dict is empty.
+        assert all(v == 1 for v in ns.values())
+        assert out.scheduled_spec_decode_tokens == {}
+        for p in promoted:
+            assert p.status == RequestStatus.RUNNING
+
+        # --- BEFORE fix (counterfactual): promoted reqs had no slide. ---
+        before_window = {
+            r: ns[r] + (0 if r in promoted_ids else slide.get(r, 0)) for r in ns
+        }
+        assert {before_window[p.request_id] for p in promoted} == {1}
+        assert {before_window[d.request_id] for d in decodes} == {NUM_SPEC + 1}
+        before_total = sum(before_window.values())
+        assert before_total == 19  # 4*4 + 3*1
+        assert before_total % len(ns) != 0  # 19 % 7 -> input_ids.view(7,-1) crash
+
+        # --- AFTER fix: promoted reqs get the same backfill (slide==num_spec). ---
+        for p in promoted:
+            assert slide[p.request_id] == NUM_SPEC
+        after_window = {r: ns[r] + slide.get(r, 0) for r in ns}
+        assert set(after_window.values()) == {NUM_SPEC + 1}  # all windows == 4
+        after_total = sum(after_window.values())
+        assert after_total == 28  # 7 * 4
+        assert after_total % len(ns) == 0  # uniform -> view is safe
+
+    def test_promoted_partial_kv_match_is_rejected(self):
+        """A promoted remote-KV request must be a genuine single-token decode:
+        its prompt KV was prefilled remotely, so num_new_tokens == 1. A partial
+        remote match (num_tokens > matched + 1) would leave a local prefill
+        remainder that cannot mix into the decode batch -- the scheduler asserts
+        loudly rather than emit a corrupt (non-uniform) decode batch.
+        """
+        import pytest
+
+        matched = _BLOCK_SIZE  # 16
+        # num_tokens = matched + 5 -> num_new_tokens == 5 (> 1): partial match.
+        remote = _create_pd_request(matched + 5, "remote")
+        scheduler = create_scheduler(
+            block_size=_BLOCK_SIZE,
+            num_blocks=_NUM_BLOCKS,
+            max_num_seqs=_MAX_NUM_SEQS,
+            num_speculative_tokens=3,
+            use_kv_connector=MockKVConfig(matched_tokens=matched, is_async=True),
+        )
+        scheduler.add_request(remote)
+
+        out1 = scheduler.schedule()
+        assert remote.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+        _simulate_kv_transfer_completion(scheduler, out1, remote.request_id)
+
+        with pytest.raises(AssertionError, match="num_new_tokens"):
+            scheduler.schedule()
+
 
 # ===========================================================================
 # NIXL connector tests
