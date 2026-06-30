@@ -59,6 +59,8 @@ def build_compile_options(compile_context: rebel.CompileContext) -> dict:
     """Build the torch.compile ``options`` dict shared by the RBLN samplers."""
     use_dt = envs.VLLM_RBLN_USE_DEVICE_TENSOR
     options: dict = {}
+    if use_dt:
+        options["model_trace_method"] = "export"
     if not use_dt:
         options["compile_context"] = compile_context
     if envs.VLLM_RBLN_COMPILE_STRICT_MODE:
