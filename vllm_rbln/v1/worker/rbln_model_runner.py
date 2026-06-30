@@ -1928,25 +1928,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         any_prefill = num_reqs_across_dp_cpu is None
         if any_prefill or not self.specialized_moe_decode:
             num_padded_tokens = self.max_num_batched_tokens
-            # [ragged-probe-dp] (fsw-inference#356) record WHY
-            # max_tokens_per_req_across_dp stays None (= no speculative pad this
-            # step). Silent on genuine prefill; fires only when the local rank
-            # is decode (is_prefill=False) yet this None-path is taken -- the
-            # precondition for the ragged view(num_reqs,-1) crash.
-            if not is_prefill:
-                logger.warning(
-                    "[ragged-probe-dp] max_tokens_per_req_across_dp=None via "
-                    "get_dp_padding path-3: any_prefill=%s "
-                    "(num_reqs_across_dp is None) specialized_moe_decode=%s "
-                    "spec_decode_max_query_len=%s num_tokens=%s num_reqs=%s "
-                    "dp_rank=%s",
-                    any_prefill,
-                    self.specialized_moe_decode,
-                    spec_decode_max_query_len,
-                    num_tokens,
-                    num_reqs,
-                    dp_rank,
-                )
         else:
             assert num_reqs_across_dp_cpu is not None
             max_batch_size = int(torch.max(num_reqs_across_dp_cpu).item())
