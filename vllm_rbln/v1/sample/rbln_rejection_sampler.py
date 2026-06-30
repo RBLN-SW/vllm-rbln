@@ -221,6 +221,18 @@ class RBLNRejectionSampler(RejectionSampler):
                 "inputs to CPU."
             )
         cpu_device = "cpu"
+        # NOTE(RBLN): The NPU `rbln::rejection_sample` primitive does not
+        # handle the -1 placeholder draft id (used for grammar-invalid spec
+        # tokens when structured output is combined with speculative decoding;
+        # see vllm PR #46533). It would either emit -1 as a real token or read
+        # out of bounds. Fail fast here instead; the CPU rejection sampler
+        # handles this case. TODO(RBLN): handle -1 in the primitive.
+        assert bool((draft_token_ids >= 0).all()), (
+            "RBLNRejectionSampler received placeholder (-1) draft token ids, "
+            "which the NPU rejection_sample primitive does not support. This "
+            "happens when structured output is used together with speculative "
+            "decoding. Use the CPU rejection sampler for this combination."
+        )
         assert draft_token_ids.is_contiguous()
         assert draft_probs is None or draft_probs.is_contiguous()
         assert target_probs.is_contiguous()
