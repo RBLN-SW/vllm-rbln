@@ -33,6 +33,7 @@ def register_ops():
     # here. See ``_torch_dynamo_compat.py`` for details.
     import vllm_rbln._torch_dynamo_compat  # noqa
     import vllm_rbln.distributed.ec_transfer.ec_connector.factory  # noqa
+    import vllm_rbln.v1.tracing.patches  # noqa
 
     if not envs.VLLM_RBLN_USE_DEVICE_TENSOR:
         import vllm_rbln._torch_accelerator_compat  # noqa

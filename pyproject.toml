@@ -71,6 +71,9 @@ Homepage="https://rebellions.ai"
 Documentation="https://docs.rbln.ai"
 Repository="https://github.com/rbln-sw/vllm-rbln"
 
+[project.scripts]
+vllm-rbln = "vllm_rbln.cli:main"
+
 [project.entry-points."vllm.platform_plugins"]
 rbln = "vllm_rbln:register"
 
