@@ -128,6 +128,7 @@ from vllm_rbln.logger import init_logger
 from vllm_rbln.lora.inputs import LoRAInputs
 from vllm_rbln.lora.mask import LoRAMask
 from vllm_rbln.torch_compile_backend import (
+    is_warmup_active,
     logged_rbln_backend,
     set_warmup_active,
 )
@@ -3661,7 +3662,13 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 return _mo, _reports
 
             _gil_probe = os.environ.get("VLLM_RBLN_GIL_PROBE") == "1"
-            if self._device_executor is not None:
+            # Bypass the device thread during warmup: warmup compiles the
+            # forward AND the sampler back-to-back, and the weight-free
+            # transform's vmem accounting breaks if the forward runs on the
+            # executor thread while the sampler runs inline on the main thread
+            # (RUN_INTERNAL vmem verify in _sample). Warmup must stay inline;
+            # the executor is only for real decode steps (post-warmup overlap).
+            if self._device_executor is not None and not is_warmup_active():
                 # C7 scaffold: submit the forward to the device thread but join
                 # immediately -- functionally identical to inline execution.
                 # Exercises the cross-thread submission plumbing before we

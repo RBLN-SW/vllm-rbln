@@ -47,6 +47,10 @@ def set_warmup_active(active: bool) -> None:
     _warmup_active = active
 
 
+def is_warmup_active() -> bool:
+    return _warmup_active
+
+
 def _summarize_inputs(inputs: list[Any]) -> str:
     parts = []
     for t in inputs:
