@@ -3530,15 +3530,66 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 LoRAInputs.set_sampler_indices_padded(sampler_indices_padded)
 
             model_start_time = time.perf_counter()
-            with capture_ctx as reports:
-                model_output = self.model_executable(
-                    input_ids=input_ids,
-                    positions=positions,
-                    intermediate_tensors=intermediate_tensors,
-                    selected_token_indices=token_indices,
-                    inputs_embeds=inputs_embeds,
-                    **model_kwargs,
+            # GIL-availability probe (off by default; VLLM_RBLN_GIL_PROBE=1).
+            # Measures whether the GIL is actually free during forward. A
+            # background thread spins a pure-Python counter (which needs the
+            # GIL to advance). We compare its rate while the main thread runs
+            # forward vs. a calibration where the main thread sleeps (GIL
+            # free). ratio~1.0 => GIL is free during forward => offloading
+            # forward to a bg thread would let all_reduce(N+1) overlap it
+            # (approach (b) viable). ratio~0 => Python dispatch around run()
+            # holds the GIL and (b) won't help -> need runtime async (a).
+            _gil_probe = os.environ.get("VLLM_RBLN_GIL_PROBE") == "1"
+            if _gil_probe and not is_prefill_phase:
+                import threading as _thr
+
+                _st = {"n": 0, "go": True}
+
+                def _spin() -> None:
+                    while _st["go"]:
+                        _st["n"] += 1
+
+                # Calibration: main thread releases the GIL (sleep) so the
+                # spinner runs unobstructed for a known window.
+                _t = _thr.Thread(target=_spin, daemon=True)
+                _t.start()
+                _cal_dt = 0.005
+                time.sleep(_cal_dt)
+                _free_rate = _st["n"] / _cal_dt
+                _st["n"] = 0
+                _t0 = time.perf_counter()
+                with capture_ctx as reports:
+                    model_output = self.model_executable(
+                        input_ids=input_ids,
+                        positions=positions,
+                        intermediate_tensors=intermediate_tensors,
+                        selected_token_indices=token_indices,
+                        inputs_embeds=inputs_embeds,
+                        **model_kwargs,
+                    )
+                _fwd_dt = time.perf_counter() - _t0
+                _during = _st["n"] / _fwd_dt if _fwd_dt > 0 else 0.0
+                _st["go"] = False
+                _t.join(timeout=1.0)
+                _ratio = _during / _free_rate if _free_rate > 0 else 0.0
+                logger.info(
+                    "GIL_PROBE forward_ms=%.2f free_rate=%.0f/s "
+                    "during_rate=%.0f/s gil_free_ratio=%.2f",
+                    _fwd_dt * 1e3,
+                    _free_rate,
+                    _during,
+                    _ratio,
                 )
+            else:
+                with capture_ctx as reports:
+                    model_output = self.model_executable(
+                        input_ids=input_ids,
+                        positions=positions,
+                        intermediate_tensors=intermediate_tensors,
+                        selected_token_indices=token_indices,
+                        inputs_embeds=inputs_embeds,
+                        **model_kwargs,
+                    )
             if self.performance_tracker is not None:
                 # Record performance metrics
                 model_end_time = time.perf_counter()
