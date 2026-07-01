@@ -311,6 +311,12 @@ class ExecuteModelState(NamedTuple):
     sample_hidden_states: torch.Tensor | None
     aux_hidden_states: list[torch.Tensor] | None
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
+    # C9a deferral (decode fast path): the forward is still running on the
+    # device thread and hidden_states/logits above are None -- sample_tokens
+    # resolves them from this future's (model_output, reports) result. The
+    # device thread's FIFO keeps fwd(N) ahead of sample(N). None on the
+    # non-deferred immediate-join path.
+    fwd_future: "Future | None" = None
 
 
 class DummyRunState(NamedTuple):
@@ -3802,11 +3808,50 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # executor thread while the sampler runs inline on the main thread
             # (RUN_INTERNAL vmem verify in _sample). Warmup must stay inline;
             # the executor is only for real decode steps (post-warmup overlap).
+            # C9a fast-path deferral gate: only the plain decode path where the
+            # post-forward tail reduces to an unpack (logits comes straight from
+            # model_output -- no slicing for no-spec + device-tensor + no-LoRA),
+            # and the outer Forward/KV-connector contexts are no-ops safe to exit
+            # while the forward is still running on the device thread.
+            _fast_defer = (
+                self._async_forward
+                and not is_warmup_active()
+                and not is_prefill_phase
+                and self.speculative_config is None
+                and self.use_async_scheduling
+                and envs.VLLM_RBLN_USE_DEVICE_TENSOR
+                and self.use_wrapped_compute_logits()  # no LoRA
+                and not has_kv_transfer_group()  # KV connector ctx is nullcontext
+                and get_pp_group().world_size == 1
+                and not self.is_pooling_model
+            )
             if self._async_forward and not is_warmup_active():
                 if self._device_executor is None:
                     self._device_executor = _DeviceForwardExecutor(
                         self.device.index if self.device.index is not None else 0
                     )
+                if _fast_defer:
+                    # C9a: submit the forward but DON'T join here. Stash the
+                    # future; sample_tokens resolves it (still ahead of the
+                    # sampler on the device FIFO). No overlap yet -- the join
+                    # lands inside sample_tokens, before EM(N+1) -- this commit
+                    # only proves the future hand-off keeps parity. Report
+                    # aggregation (_pending_model_report) is metrics-only and is
+                    # skipped on this path.
+                    fwd_future = self._device_executor.submit(_run_forward)
+                    self.execute_model_state = ExecuteModelState(
+                        scheduler_output,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        slot_mappings,
+                        fwd_future=fwd_future,
+                    )
+                    self.kv_connector_output = kv_connector_output
+                    return None
                 # C7 scaffold: submit the forward to the device thread but join
                 # immediately -- functionally identical to inline execution.
                 # Exercises the cross-thread submission plumbing before we
@@ -4022,9 +4067,24 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             sample_hidden_states,
             aux_hidden_states,
             slot_mappings,
+            fwd_future,
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
+
+        # C9a: resolve a deferred forward. The device FIFO already ran fwd(N)
+        # (this .result() returns without blocking once it's the head of the
+        # queue), so we just unpack model_output. On the fast path the post-
+        # forward tail is only this unpack: logits comes straight from the model
+        # (wrapped compute_logits) with no slicing for no-spec + device-tensor.
+        if fwd_future is not None:
+            model_output, _reports = fwd_future.result()
+            if self.use_aux_hidden_state_outputs:
+                hidden_states, aux_hidden_states, logits = model_output
+            else:
+                hidden_states, logits = model_output
+                aux_hidden_states = None
+            sample_hidden_states = hidden_states
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None and logits.shape[0] > 0:
