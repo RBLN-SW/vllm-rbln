@@ -25,12 +25,19 @@ gpt-oss-120b EP+DP4, device-tensor 경로에서 매 decode step 도는 DP `gloo:
 | `929be43`,`6caa1ef` | docs: deferral 설계 + C9 난관/eager_out 가능성 | — |
 | `526854a` | refactor: **C8** `set_forward_context`를 `_run_forward` 안으로 | **✅ 6-layer A/B 0 mismatch** |
 | `c80de05` | chore: **C9 eager_out 프로브** (`VLLM_RBLN_EAGEROUT_PROBE=1`) | — |
-| `8cd86dd` | fix: executor 스레드 `torch.rbln.set_device` (device context) | ⏳ 검증대기 |
-| `4a5e961` | fix: **warmup 중 executor 우회**(`is_warmup_active` 게이트) | ⏳ 검증대기 |
+| `8cd86dd` | fix: executor 스레드 `torch.rbln.set_device` (device context) | ✅ 검증됨 (2026-07-01, 아래) |
+| `4a5e961` | fix: **warmup 중 executor 우회**(`is_warmup_active` 게이트) | ✅ 검증됨 |
+| `9561d02` | fix: device-forward executor **lazy 생성**(post-warmup) | ✅ 검증됨 |
+| `b9ce798` | fix: **probe pre-alloc dtype**(int32 (B,1)→int64 (B,)) — argmax op에 맞춤 | ✅ (프로브 crash 해소) |
 
-**정합성은 이미 해결**(0 mismatch). 남은 건 실제 overlap = **C9(deferral)**.
+**정합성·vmem fix 모두 검증 완료**(0 mismatch). 남은 건 실제 overlap = **C9(deferral)**.
 
-> **⚠️ 최신 상태(2026-07-01)**: C7 executor(`VLLM_RBLN_ASYNC_FORWARD=1`)에서 warmup 중 `vmem_size ... verify.cc:77` 크래시가 있었고 **두 개의 fix를 넣었다**(위 `8cd86dd`, `4a5e961` — 상세 §5). **이 fix들과 eager_out alias는 아직 실측 검증 못 함**(원 서버가 다른 사용자 DP4로 계속 점유되어 exclusive 확보 실패 — 이게 이주 이유). **다른 서버(exclusive)에서 §2 STEP 1~2를 돌리면 fix 검증 + alias 확보가 한 번에 된다.**
+> **✅ 최신 상태(2026-07-01, exclusive box에서 실측 완료)**: 아래 세 가지 전부 확인됨 —
+> 1. **vmem fix 3단계 검증**: `VLLM_RBLN_ASYNC_FORWARD=1`(프로브 없이)로 warmup+generation 완주, `verify.cc:77` 크래시 없음. → `8cd86dd`+`4a5e961`+`9561d02` 유효.
+> 2. **ASYNC_FORWARD 정합성**: sync baseline 대비 **16 prompts 0 mismatch**.
+> 3. **EAGEROUT alias 판정 = `alias=False`** (구조적). 원 프로브가 `verify.cc:77`로 크래시했던 건 async가 아니라 **프로브 pre-alloc dtype 버그**(int32 (B,1) vs argmax의 int64 (B,))였음 — `b9ce798`로 수정. 수정 후: eager_out은 컴파일된 greedy_sample op(=`rbln::argmax`, (B,) int64) 출력은 pre-alloc 가능하나, **최종 `sampled_token_ids`는 `forward()`가 op 뒤에서 항상 `sampled.to(int32).unsqueeze(-1)`로 새 버퍼를 만들어** 절대 alias되지 않음(rbln_sampler.py:313,320). → **naive path (가) 불가**, §3/deferred_design 참조.
+>
+> **주의**: 이 실측은 vllm-rbln `async-overlap-prototype`에 **dev merge된 상태**(`828d06b`)에서 됨. dev merge 전 HEAD(`9561d02`)에서는 gpt-oss-120b MoE MXFP4가 `rtosa.add_n` shape verify로 컴파일 크래시했음(rebel_compiler dev와의 궁합) — **dev를 merge/rebase한 최신 브랜치를 쓸 것.** 또한 venv에 `torch_rbln`(rbln device backend 등록)이 설치돼 있어야 함.
 
 ## 2. 지금 당장 할 일 (다른 서버에서)
 
