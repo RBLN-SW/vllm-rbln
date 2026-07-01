@@ -1980,7 +1980,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     max_batch_size
                 )
                 assert batch_bucket_size is not None
-                # Caller pre-computes pow2-rounded value to align with padded tensor shape.
+                # Caller pre-computes pow2-rounded value to match padded shape.
                 if spec_decode_max_query_len is not None:
                     max_per_req_across_dp = RBLNDPMetadata.num_tokens_across_dp(
                         spec_decode_max_query_len, dp_size, dp_rank
@@ -2310,7 +2310,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         logger.info("Warm-up: prefill (seq_len=%d)", prefill_seq_len)
         self._execute_dummy_requests(so, cso, self.prefill_intermediate_tensors)
 
-        # FIXME(RBLN): cap at block_size // 2 (single-block-per-request limit + spec decode).
+        # FIXME(RBLN): cap at block_size//2 (single-block/req limit + spec decode).
         decode_max_seq_len = min(
             self.max_model_len // 2,
             self.cache_config.block_size // 2,
