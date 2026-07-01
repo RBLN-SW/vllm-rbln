@@ -15,9 +15,12 @@
 import contextlib
 import itertools
 import os
+import queue
+import threading
 import time
 from collections import defaultdict
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from concurrent.futures import Future
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from copy import copy, deepcopy
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Union, cast
@@ -153,6 +156,47 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput
 
 logger = init_logger(__name__)
+
+
+class _DeviceForwardExecutor:
+    """Single background thread that runs device tasks in submission order.
+
+    The NPU executes one compiled graph at a time, so a single dedicated
+    thread owns all device submission (FIFO preserves device-order data
+    dependencies). Offloading the host-blocking forward here lets the main
+    worker thread run ahead and issue the next step's DP gloo all_reduce while
+    a prior forward is still in flight -- the RBLN analogue of CUDA's
+    asynchronous kernel submission. Gated by VLLM_RBLN_ASYNC_FORWARD; see
+    RBLNModelRunner.execute_model.
+    """
+
+    def __init__(self) -> None:
+        self._q: queue.Queue = queue.Queue()
+        self._thread = threading.Thread(
+            target=self._run, name="rbln-device-forward", daemon=True
+        )
+        self._thread.start()
+
+    def _run(self) -> None:
+        while True:
+            item = self._q.get()
+            if item is None:
+                return
+            fn, fut = item
+            if not fut.set_running_or_notify_cancel():
+                continue
+            try:
+                fut.set_result(fn())
+            except BaseException as e:  # noqa: BLE001 - propagate to caller
+                fut.set_exception(e)
+
+    def submit(self, fn: Callable[[], Any]) -> Future:
+        fut: Future = Future()
+        self._q.put((fn, fut))
+        return fut
+
+    def shutdown(self) -> None:
+        self._q.put(None)
 
 
 # Wrapper for ModelRunnerOutput to support overlapped execution.
@@ -553,6 +597,15 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # execute_model() and sample_tokens().
         self.execute_model_state: ExecuteModelState | None = None
         self.kv_connector_output: KVConnectorOutput | None = None
+
+        # Optional device-execution thread for overlapping the DP gloo
+        # all_reduce with forward (VLLM_RBLN_ASYNC_FORWARD=1). None => run the
+        # forward inline on the worker thread, as before.
+        self._device_executor: _DeviceForwardExecutor | None = (
+            _DeviceForwardExecutor()
+            if os.environ.get("VLLM_RBLN_ASYNC_FORWARD") == "1"
+            else None
+        )
 
         self.max_batch_size = (
             self.scheduler_config.max_num_seqs
@@ -3530,36 +3583,13 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 LoRAInputs.set_sampler_indices_padded(sampler_indices_padded)
 
             model_start_time = time.perf_counter()
-            # GIL-availability probe (off by default; VLLM_RBLN_GIL_PROBE=1).
-            # Measures whether the GIL is actually free during forward. A
-            # background thread spins a pure-Python counter (which needs the
-            # GIL to advance). We compare its rate while the main thread runs
-            # forward vs. a calibration where the main thread sleeps (GIL
-            # free). ratio~1.0 => GIL is free during forward => offloading
-            # forward to a bg thread would let all_reduce(N+1) overlap it
-            # (approach (b) viable). ratio~0 => Python dispatch around run()
-            # holds the GIL and (b) won't help -> need runtime async (a).
-            _gil_probe = os.environ.get("VLLM_RBLN_GIL_PROBE") == "1"
-            if _gil_probe and not is_prefill_phase:
-                import threading as _thr
 
-                _st = {"n": 0, "go": True}
-
-                def _spin() -> None:
-                    while _st["go"]:
-                        _st["n"] += 1
-
-                # Calibration: main thread releases the GIL (sleep) so the
-                # spinner runs unobstructed for a known window.
-                _t = _thr.Thread(target=_spin, daemon=True)
-                _t.start()
-                _cal_dt = 0.005
-                time.sleep(_cal_dt)
-                _free_rate = _st["n"] / _cal_dt
-                _st["n"] = 0
-                _t0 = time.perf_counter()
-                with capture_ctx as reports:
-                    model_output = self.model_executable(
+            def _run_forward():
+                # The whole forward (incl. capture_reports context) runs on
+                # whichever thread calls this, so device submission and its
+                # report capture stay on one thread.
+                with capture_ctx as _reports:
+                    _mo = self.model_executable(
                         input_ids=input_ids,
                         positions=positions,
                         intermediate_tensors=intermediate_tensors,
@@ -3567,6 +3597,37 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         inputs_embeds=inputs_embeds,
                         **model_kwargs,
                     )
+                return _mo, _reports
+
+            _gil_probe = os.environ.get("VLLM_RBLN_GIL_PROBE") == "1"
+            if self._device_executor is not None:
+                # C7 scaffold: submit the forward to the device thread but join
+                # immediately -- functionally identical to inline execution.
+                # Exercises the cross-thread submission plumbing before we
+                # actually defer the join (later step).
+                model_output, reports = self._device_executor.submit(
+                    _run_forward
+                ).result()
+            elif _gil_probe and not is_prefill_phase:
+                # GIL-availability probe (VLLM_RBLN_GIL_PROBE=1). A background
+                # thread spins a pure-Python counter (needs the GIL) during
+                # forward vs. a sleep calibration, to estimate how much of the
+                # GIL is free while the device runs. ratio~1.0 => GIL free
+                # during forward => offloading it lets all_reduce overlap.
+                _st = {"n": 0, "go": True}
+
+                def _spin() -> None:
+                    while _st["go"]:
+                        _st["n"] += 1
+
+                _t = threading.Thread(target=_spin, daemon=True)
+                _t.start()
+                _cal_dt = 0.005
+                time.sleep(_cal_dt)
+                _free_rate = _st["n"] / _cal_dt
+                _st["n"] = 0
+                _t0 = time.perf_counter()
+                model_output, reports = _run_forward()
                 _fwd_dt = time.perf_counter() - _t0
                 _during = _st["n"] / _fwd_dt if _fwd_dt > 0 else 0.0
                 _st["go"] = False
@@ -3581,15 +3642,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     _ratio,
                 )
             else:
-                with capture_ctx as reports:
-                    model_output = self.model_executable(
-                        input_ids=input_ids,
-                        positions=positions,
-                        intermediate_tensors=intermediate_tensors,
-                        selected_token_indices=token_indices,
-                        inputs_embeds=inputs_embeds,
-                        **model_kwargs,
-                    )
+                model_output, reports = _run_forward()
             if self.performance_tracker is not None:
                 # Record performance metrics
                 model_end_time = time.perf_counter()
