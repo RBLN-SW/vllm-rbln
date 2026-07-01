@@ -71,7 +71,6 @@ def _make_runner_stub(**overrides):
         sampler=MagicMock(),
         rejection_sampler=MagicMock(),
         performance_tracker=None,
-        sampler_performance_tracker=None,
         e2e_performance_tracker=None,
         uses_mrope=False,
         positions=MagicMock(),
@@ -135,7 +134,6 @@ class TestMixinInterfaceCompliance:
         "method_name",
         [
             "allocate_uniform_kv_caches",
-            "ensure_kv_transfer_shutdown",
             "finalize_kv_connector",
             "kv_connector_no_forward",
             "maybe_get_kv_connector_output",
@@ -334,11 +332,12 @@ class TestDummyRunStateFeature:
             "num_input_tokens",
             "input_ids",
             "positions",
+            "draft_attn_metadata",
         )
         assert DummyRunState._fields == expected_fields
 
     def test_field_count(self):
-        assert len(DummyRunState._fields) == 4
+        assert len(DummyRunState._fields) == 5
 
     def test_is_named_tuple(self):
         assert issubclass(DummyRunState, tuple)

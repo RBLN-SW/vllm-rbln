@@ -36,13 +36,15 @@ dependencies = [
     "setuptools>=64",
     "setuptools-scm>=8",
     "pyyaml",
-    "datasets",
+    "datasets>=4.0.0",
     "qwen_vl_utils",
-    "vllm==0.18.0+cpu",
+    "vllm==0.22.0+cpu",
+    "fastapi[standard]<0.137",
     "torch",
     "torchvision",
     "torchaudio",
-    "optimum-rbln>=0.10.4",
+    "torchcodec",
+    "optimum-rbln>=0.11.0",
 ]
 
 [project.optional-dependencies]
@@ -132,7 +134,7 @@ environments = [
 
 [[tool.uv.index]]
 name = "vllm-cpu"
-url = "https://wheels.vllm.ai/0.18.0/cpu"
+url = "https://wheels.vllm.ai/0.22.0/cpu"
 explicit = true
 
 [[tool.uv.index]]
@@ -145,6 +147,7 @@ vllm = { index = "vllm-cpu" }
 torch = { index = "pytorch-cpu" }
 torchvision = { index = "pytorch-cpu" }
 torchaudio = { index = "pytorch-cpu" }
+torchcodec = { index = "pytorch-cpu" }
 
 [tool.typos.default]
 binary = false

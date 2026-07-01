@@ -105,11 +105,18 @@ def sync_from_optimum(
     update_max_num_batched_tokens(vllm_config, params.max_seq_len)
 
     # Set block_size in cache_config based on rbln_config.json
-    update_block_size(vllm_config, params.kvcache_block_size, params.prefill_chunk_size)
+    # (also persists prefill_chunk_size / image-prefill buckets into
+    # additional_config).
+    update_block_size(
+        vllm_config,
+        params.kvcache_block_size,
+        params.prefill_chunk_size,
+        params.image_prefill_chunk_size,
+    )
     # Set num_blocks in cache_config based on rbln_config.json
     update_num_blocks(vllm_config, params.num_blocks)
-    # Sync tensor_parallel_size in envs with optimum pre-compiled model
-    envs.VLLM_RBLN_TP_SIZE = params.tensor_parallel_size
+    # Sync num_devices in envs with optimum pre-compiled model
+    envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK = params.num_devices
 
 
 def update_num_blocks(vllm_config: VllmConfig, num_blocks: int) -> None:

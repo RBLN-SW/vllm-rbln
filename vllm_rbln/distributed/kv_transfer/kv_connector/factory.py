@@ -16,7 +16,7 @@ from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 
 KVConnectorFactory.register_connector(
     "RblnNixlConnector",
-    "vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl_connector",
+    "vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl",
     "RblnNixlConnector",
 )
 KVConnectorFactory.register_connector(

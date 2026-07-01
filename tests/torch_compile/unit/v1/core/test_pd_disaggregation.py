@@ -20,6 +20,7 @@ Tests cover:
 """
 
 from dataclasses import dataclass, field
+from typing import Any
 from unittest.mock import MagicMock
 
 from vllm.v1.outputs import KVConnectorOutput
@@ -224,6 +225,125 @@ class TestPDDisaggregationScheduler:
         ]
         assert [req.request_id for req in scheduler.waiting] == [local.request_id]
 
+    def test_promoted_decode_query_window_backfill_before_after(self):
+        """REGRESSION for the observed crash: num_reqs=7, input_ids size 19.
+
+        Decode-only PD instance, num_spec_tokens=3, so each decode query window
+        is unified to num_spec+1 = 4 (3 draft slots + 1 bonus token). The runner
+        builds input_ids with per-req length = num_scheduled +
+        spec_decode_slide_distance (rbln_model_runner.py:1262), i.e.
+        ``input_ids.numel == sum(window)`` where window = num_scheduled + slide.
+
+        Batch -- every req is a single-token decode with 0 drafts, so
+        scheduled_spec_decode_tokens is empty and (dp_size==1) the runner guard
+        skips pad_speculative_draft_tokens, leaving the raw windows for the view:
+          * 4 running decode reqs: num_scheduled=1, slide=3 -> window 4.
+          * 3 remote-KV reqs promoted in the SAME step (num_new_tokens == 1).
+
+        BEFORE the fix, promoted reqs took the waiting-loop ``continue`` without
+        the sliding backfill -> no slide -> window 1. input_ids.numel =
+        4*4 + 3*1 = 19, num_reqs=7, 19 % 7 != 0 -> input_ids.view(7,-1) raised.
+
+        AFTER the fix, the promotion path applies the same backfill as the
+        running loop -> each promoted req gets slide=num_spec -> window 4 ->
+        input_ids.numel = 7*4 = 28, 28 % 7 == 0 -> uniform, view is safe.
+        """
+        NUM_SPEC = 3
+        # promoted num_tokens = matched + 1 -> num_new_tokens == 1; matched=19
+        # so num_computed=19 and 19 % 16 = 3 keeps the backfill window in-block.
+        matched = 19
+        scheduler = create_scheduler(
+            block_size=_BLOCK_SIZE,
+            num_blocks=_NUM_BLOCKS,
+            max_num_seqs=_MAX_NUM_SEQS,
+            num_speculative_tokens=NUM_SPEC,
+            use_kv_connector=MockKVConfig(matched_tokens=matched, is_async=True),
+        )
+
+        # 4 running decode reqs (draft=0), kept mid-block.
+        decodes = [
+            _create_pd_request(10, f"d{i}", do_remote_prefill=False) for i in range(4)
+        ]
+        for d in decodes:
+            advance_to_decode(scheduler, d)
+
+        # 3 remote-KV reqs, each a genuine single-token decode (num_new == 1).
+        promoted = [_create_pd_request(matched + 1, f"p{i}") for i in range(3)]
+        for p in promoted:
+            scheduler.add_request(p)
+
+        out_a = scheduler.schedule()
+        for p in promoted:
+            assert p.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+
+        # Complete KV recv for ALL promoted reqs in a SINGLE recv step (one
+        # update_from_output) so they are promoted together in the next
+        # schedule. Calling the per-req helper repeatedly would re-apply the
+        # same scheduler output multiple times and corrupt decode state.
+        mro = create_runner_output(out_a, 1)
+        mro.kv_connector_output = KVConnectorOutput(
+            finished_recving={p.request_id for p in promoted}
+        )
+        scheduler.update_from_output(out_a, mro)
+
+        out = scheduler.schedule()
+        ns = out.num_scheduled_tokens
+        slide = dict(getattr(out, "spec_decode_slide_distance", {}) or {})
+        promoted_ids = {p.request_id for p in promoted}
+
+        # Every req is a single-token decode; the draft dict is empty.
+        assert all(v == 1 for v in ns.values())
+        assert out.scheduled_spec_decode_tokens == {}
+        for p in promoted:
+            assert p.status == RequestStatus.RUNNING
+
+        # --- BEFORE fix (counterfactual): promoted reqs had no slide. ---
+        before_window = {
+            r: ns[r] + (0 if r in promoted_ids else slide.get(r, 0)) for r in ns
+        }
+        assert {before_window[p.request_id] for p in promoted} == {1}
+        assert {before_window[d.request_id] for d in decodes} == {NUM_SPEC + 1}
+        before_total = sum(before_window.values())
+        assert before_total == 19  # 4*4 + 3*1
+        assert before_total % len(ns) != 0  # 19 % 7 -> input_ids.view(7,-1) crash
+
+        # --- AFTER fix: promoted reqs get the same backfill (slide==num_spec). ---
+        for p in promoted:
+            assert slide[p.request_id] == NUM_SPEC
+        after_window = {r: ns[r] + slide.get(r, 0) for r in ns}
+        assert set(after_window.values()) == {NUM_SPEC + 1}  # all windows == 4
+        after_total = sum(after_window.values())
+        assert after_total == 28  # 7 * 4
+        assert after_total % len(ns) == 0  # uniform -> view is safe
+
+    def test_promoted_partial_kv_match_is_rejected(self):
+        """A promoted remote-KV request must be a genuine single-token decode:
+        its prompt KV was prefilled remotely, so num_new_tokens == 1. A partial
+        remote match (num_tokens > matched + 1) would leave a local prefill
+        remainder that cannot mix into the decode batch -- the scheduler asserts
+        loudly rather than emit a corrupt (non-uniform) decode batch.
+        """
+        import pytest
+
+        matched = _BLOCK_SIZE  # 16
+        # num_tokens = matched + 5 -> num_new_tokens == 5 (> 1): partial match.
+        remote = _create_pd_request(matched + 5, "remote")
+        scheduler = create_scheduler(
+            block_size=_BLOCK_SIZE,
+            num_blocks=_NUM_BLOCKS,
+            max_num_seqs=_MAX_NUM_SEQS,
+            num_speculative_tokens=3,
+            use_kv_connector=MockKVConfig(matched_tokens=matched, is_async=True),
+        )
+        scheduler.add_request(remote)
+
+        out1 = scheduler.schedule()
+        assert remote.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+        _simulate_kv_transfer_completion(scheduler, out1, remote.request_id)
+
+        with pytest.raises(AssertionError, match="num_new_tokens"):
+            scheduler.schedule()
+
 
 # ===========================================================================
 # NIXL connector tests
@@ -280,7 +400,7 @@ def _make_scheduler_output(req_id, block_ids, num_scheduled_tokens, is_new=True)
 
 def _create_connector_scheduler():
     """Create an RblnNixlConnectorScheduler with mocked-out dependencies."""
-    from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl_connector import (
+    from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl import (
         RblnNixlConnectorScheduler,
     )
 
@@ -302,6 +422,7 @@ def _create_connector_scheduler():
     sched._reqs_in_batch = set()
     sched._reqs_not_processed = set()
     sched._block_ids_need_save = {}
+    sched._kv_lease_duration = 30
 
     return sched
 
@@ -387,3 +508,1418 @@ class TestPDDisaggregationNixlConnector:
         assert params["do_remote_prefill"] is True
         assert params["remote_engine_id"] == "test-engine"
         assert "done" in sched._reqs_need_send
+
+
+# ===========================================================================
+# RBLNSlidingWindowManager.allocate_new_computed_blocks
+# ===========================================================================
+#
+# The D-side P/D receive path routes through `allocate_new_computed_blocks`
+# rather than `allocate_new_blocks`. The RBLN SWA kernel uses a single
+# in-place ring-buffered block, so this override forces "one block per
+# request" regardless of how many computed tokens the scheduler hands us.
+
+
+def _make_swa_manager():
+    """Build an RBLNSlidingWindowManager with the minimum state its
+    `allocate_new_computed_blocks` reaches into."""
+    from collections import defaultdict
+
+    from vllm_rbln.v1.kv_cache import RBLNSlidingWindowManager
+
+    mgr = object.__new__(RBLNSlidingWindowManager)
+    mgr.num_cached_block = {}
+    mgr.req_to_blocks = defaultdict(list)
+    mgr.block_pool = MagicMock()
+    # `get_new_blocks(n)` returns a list of n fresh KVCacheBlock objects.
+    mgr.block_pool.get_new_blocks.side_effect = lambda n: [
+        MagicMock(name=f"block_{i}") for i in range(n)
+    ]
+    return mgr
+
+
+class TestRBLNSlidingWindowManager:
+    """`allocate_new_computed_blocks` enforces the SWA kernel's
+    one-block-per-request invariant on the receive path."""
+
+    def test_allocates_single_block_for_remote_prefill(self):
+        """One block regardless of `num_external_computed_tokens` size."""
+        mgr = _make_swa_manager()
+
+        mgr.allocate_new_computed_blocks(
+            request_id="req-0",
+            new_computed_blocks=[],
+            num_local_computed_tokens=0,
+            num_external_computed_tokens=2674,
+        )
+
+        assert len(mgr.req_to_blocks["req-0"]) == 1
+        # Sentinel set so a follow-up call hits the fast path.
+        assert mgr.num_cached_block["req-0"] == 0
+        mgr.block_pool.get_new_blocks.assert_called_once_with(1)
+
+    def test_no_allocation_when_no_external_tokens(self):
+        """Setting num_external_computed_tokens=0 still records the
+        sentinel but does not allocate."""
+        mgr = _make_swa_manager()
+
+        mgr.allocate_new_computed_blocks(
+            request_id="req-0",
+            new_computed_blocks=[],
+            num_local_computed_tokens=0,
+            num_external_computed_tokens=0,
+        )
+
+        assert mgr.req_to_blocks["req-0"] == []
+        assert mgr.num_cached_block["req-0"] == 0
+        mgr.block_pool.get_new_blocks.assert_not_called()
+
+    def test_running_request_fast_path_is_noop(self):
+        """Second call for the same request (already in num_cached_block)
+        is a no-op."""
+        mgr = _make_swa_manager()
+        mgr.num_cached_block["req-0"] = 0
+        mgr.req_to_blocks["req-0"] = [MagicMock(name="existing")]
+
+        mgr.allocate_new_computed_blocks(
+            request_id="req-0",
+            new_computed_blocks=[],
+            num_local_computed_tokens=128,
+            num_external_computed_tokens=512,
+        )
+
+        assert len(mgr.req_to_blocks["req-0"]) == 1
+        mgr.block_pool.get_new_blocks.assert_not_called()
+
+    def test_rejects_prefix_cache_hits(self):
+        """`find_longest_cache_hit` is overridden to return empty, so a
+        non-empty new_computed_blocks is a contract violation."""
+        import pytest
+
+        mgr = _make_swa_manager()
+
+        with pytest.raises(AssertionError):
+            mgr.allocate_new_computed_blocks(
+                request_id="req-0",
+                new_computed_blocks=[MagicMock(name="leaked_hit")],
+                num_local_computed_tokens=0,
+                num_external_computed_tokens=128,
+            )
+
+
+# ===========================================================================
+# RblnNixlConnectorWorker
+# ===========================================================================
+#
+# We exercise the worker __init__ and host-buffer helpers without touching
+# the upstream NIXL agent — `super().__init__` is patched out, and we
+# inject only the attributes our overrides read.
+
+
+def _spec_mock(cls, **attrs):
+    """Build a MagicMock that `isinstance(..., cls)` matches.
+
+    Tests build per-group `kv_cache_spec` stand-ins this way so
+    `__init__` can walk them without pulling in the real
+    `KVCacheConfig` / `KVCacheGroup` plumbing.
+    """
+    m = MagicMock(spec=cls)
+    for k, v in attrs.items():
+        setattr(m, k, v)
+    return m
+
+
+def _build_connector_worker(
+    kv_buffer_device="cpu",
+    num_blocks=128,
+    block_size=64,
+    kv_cache_specs=None,
+    nixl_rbln_available=True,
+):
+    """Create a RblnNixlConnectorWorker through its __init__ with the
+    upstream NixlConnectorWorker side effects stubbed out.
+
+    `kv_cache_specs` (optional): list of `kv_cache_spec` objects (one per
+    group). When provided, `kv_cache_config.kv_cache_groups` is wired so
+    `__init__` populates `_group_specs` / `_sw_ratio` from real specs.
+    Omit it to leave `MagicMock`'s default empty iteration in place —
+    keeps `_group_specs == []` and `_sw_ratio is None`.
+
+    `nixl_rbln_available`: when False, the worker's `import nixl_rbln`
+    raises ImportError so the upstream-NIXL fallback path is exercised
+    (`_use_rbln_nixl_backend = False`). Default True keeps the existing
+    RBLN-backend behavior for all pre-existing tests.
+
+    Returns the constructed worker so tests can inspect post-__init__ state.
+    """
+    import sys
+    import types
+    from unittest.mock import patch
+
+    from vllm.config import CacheConfig
+
+    from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl import (
+        RblnNixlConnectorWorker,
+    )
+
+    vllm_config = MagicMock()
+    vllm_config.cache_config = CacheConfig(block_size=block_size)
+    kv_cache_config = MagicMock()
+    kv_cache_config.num_blocks = num_blocks
+    if kv_cache_specs is not None:
+        kv_cache_config.kv_cache_groups = [
+            MagicMock(kv_cache_spec=spec) for spec in kv_cache_specs
+        ]
+
+    def fake_super_init(self, vllm_config_, engine_id_, kv_cache_config_):
+        # Set just the attributes our overrides touch / depend on. The real
+        # NixlConnectorWorker.__init__ does a lot more, including NIXL agent
+        # creation — we don't want any of that in a unit test.
+        self.vllm_config = vllm_config_
+        self.engine_id = engine_id_
+        self.kv_cache_config = kv_cache_config_
+        self.kv_buffer_device = kv_buffer_device
+        self._block_size = {}
+
+    modules_patch = (
+        # Mask `nixl_rbln` from sys.modules so `import nixl_rbln` raises
+        # ImportError, simulating an environment without the adapter.
+        patch.dict(sys.modules, {"nixl_rbln": None})
+        if not nixl_rbln_available
+        # Inject a stub so `import nixl_rbln` in __init__ succeeds whether or
+        # not the adapter is actually installed (it is absent on CI /
+        # non-RBLN hosts). __init__ only imports it; tests that drive the
+        # impl patch in their own detailed fake module.
+        else patch.dict(sys.modules, {"nixl_rbln": types.ModuleType("nixl_rbln")})
+    )
+    with (
+        modules_patch,
+        patch.object(RblnNixlConnectorWorker.__mro__[1], "__init__", fake_super_init),
+    ):
+        return RblnNixlConnectorWorker(
+            vllm_config=vllm_config,
+            engine_id="test-engine",
+            kv_cache_config=kv_cache_config,
+        )
+
+
+class TestRblnNixlConnectorWorkerInit:
+    """`__init__` recovers the host-buffer flag (upstream sets it False
+    because `RblnPlatform.device_type == 'cpu'`) and pins block sizes to
+    logical values."""
+
+    def test_recovers_host_buffer_for_cpu_kv_device(self):
+        worker = _build_connector_worker(kv_buffer_device="cpu")
+        assert worker.use_host_buffer is True
+
+    def test_no_host_buffer_when_kv_device_is_non_cpu(self):
+        worker = _build_connector_worker(kv_buffer_device="cuda")
+        assert worker.use_host_buffer is False
+
+    def test_pins_logical_block_sizes(self):
+        worker = _build_connector_worker(num_blocks=128, block_size=64)
+        assert worker.num_blocks == 128
+        assert worker.block_size == 64
+        assert worker._physical_blocks_per_logical_kv_block == 1
+        assert worker._logical_num_blocks == 128
+
+
+class TestRblnNixlConnectorWorkerHostBuffer:
+    """`initialize_host_xfer_buffer` / `set_host_xfer_buffer_ops` honor
+    HND layout, allocate one rebel-aligned buffer per filtered layer, and
+    preserve insertion order (matters for NIXL region indexing in P/D)."""
+
+    def _patch_worker(self, kv_cache_layout="HND"):
+        worker = _build_connector_worker()
+        worker.kv_cache_layout = kv_cache_layout
+        return worker
+
+    def test_one_buffer_per_layer_preserves_order(self):
+        """Iterates `kv_caches.items()` in input order; result dict keeps
+        that order — load-bearing for P/D region <-> layer mapping."""
+        import torch
+
+        worker = self._patch_worker()
+        kv_caches = {
+            f"model.layers.{i}.attn": torch.zeros(4, 2, dtype=torch.float32)
+            for i in (3, 1, 7, 0)
+        }
+
+        worker.initialize_host_xfer_buffer(kv_caches)
+
+        assert list(worker.host_xfer_buffers.keys()) == list(kv_caches.keys())
+        for name, original in kv_caches.items():
+            assert worker.host_xfer_buffers[name].shape == original.shape
+
+    def test_asserts_hnd_layout(self):
+        import pytest
+        import torch
+
+        worker = self._patch_worker(kv_cache_layout="NHD")
+        with pytest.raises(AssertionError, match="HND"):
+            worker.initialize_host_xfer_buffer(
+                {"layer0": torch.zeros(4, 2, dtype=torch.float32)}
+            )
+
+    def test_set_ops_noop_when_kv_buffer_not_cpu(self):
+        """When kv_buffer_device is not 'cpu' the operation is a no-op —
+        host-buffer copies aren't needed."""
+        worker = _build_connector_worker(kv_buffer_device="cuda")
+
+        sentinel = MagicMock(name="copy_op")
+        worker.set_host_xfer_buffer_ops(sentinel)
+
+        assert not hasattr(worker, "copy_blocks") or worker.copy_blocks is not sentinel
+
+    def test_set_ops_assigns_copy_when_kv_buffer_is_cpu(self):
+        worker = _build_connector_worker(kv_buffer_device="cpu")
+
+        sentinel = MagicMock(name="copy_op")
+        worker.set_host_xfer_buffer_ops(sentinel)
+
+        assert worker.copy_blocks is sentinel
+
+
+# ---------------------------------------------------------------------------
+# VLLM_RBLN_NIXL_SWA_VIEW_OPT — NIXL desc layout scope
+# ---------------------------------------------------------------------------
+#
+# `_group_specs` / `_sw_ratio` derivation in `__init__`, and the
+# per-group dispatch in `_get_block_descs_ids`. Host h2d/d2h copy is
+# out of scope for this toggle.
+
+
+class TestRblnNixlConnectorWorkerSWARatio:
+    """`__init__` walks `kv_cache_groups` to populate `_group_specs` and
+    derive `_sw_ratio` (drives the dual desc-range layout downstream)."""
+
+    def test_pure_full_keeps_sw_ratio_none(self):
+        import os
+        from unittest.mock import patch
+
+        from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+        with patch.dict(os.environ, {"VLLM_RBLN_NIXL_SWA_VIEW_OPT": "1"}):
+            worker = _build_connector_worker(
+                kv_cache_specs=[_spec_mock(FullAttentionSpec, block_size=1024)]
+            )
+        assert len(worker._group_specs) == 1
+        assert worker._sw_ratio is None
+
+    def test_hybrid_full_swa_derives_ratio(self):
+        import os
+        from unittest.mock import patch
+
+        from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
+
+        with patch.dict(os.environ, {"VLLM_RBLN_NIXL_SWA_VIEW_OPT": "1"}):
+            worker = _build_connector_worker(
+                kv_cache_specs=[
+                    _spec_mock(FullAttentionSpec, block_size=1024),
+                    _spec_mock(SlidingWindowSpec, block_size=1024, sliding_window=128),
+                ]
+            )
+        assert worker._sw_ratio == 8
+        assert len(worker._group_specs) == 2
+
+    def test_ratio_one_collapses_to_none(self):
+        """`sliding_window == block_size` is degenerate: SWA desc length
+        equals Full desc length, so the dual-range layout would be a
+        no-op. `_sw_ratio` stays `None` to keep the pure-Full path."""
+        import os
+        from unittest.mock import patch
+
+        from vllm.v1.kv_cache_interface import SlidingWindowSpec
+
+        with patch.dict(os.environ, {"VLLM_RBLN_NIXL_SWA_VIEW_OPT": "1"}):
+            worker = _build_connector_worker(
+                kv_cache_specs=[
+                    _spec_mock(SlidingWindowSpec, block_size=128, sliding_window=128)
+                ]
+            )
+        assert worker._sw_ratio is None
+
+    def test_multiple_swa_groups_with_consistent_ratio(self):
+        import os
+        from unittest.mock import patch
+
+        from vllm.v1.kv_cache_interface import SlidingWindowSpec
+
+        with patch.dict(os.environ, {"VLLM_RBLN_NIXL_SWA_VIEW_OPT": "1"}):
+            worker = _build_connector_worker(
+                kv_cache_specs=[
+                    _spec_mock(SlidingWindowSpec, block_size=1024, sliding_window=128),
+                    _spec_mock(SlidingWindowSpec, block_size=1024, sliding_window=128),
+                ]
+            )
+        assert worker._sw_ratio == 8
+
+    def test_mismatched_swa_ratios_assert(self):
+        """The dual-range layout assumes a single SWA desc length, so
+        groups with different ratios are rejected at __init__."""
+        import os
+        from unittest.mock import patch
+
+        import pytest
+        from vllm.v1.kv_cache_interface import SlidingWindowSpec
+
+        with (
+            patch.dict(os.environ, {"VLLM_RBLN_NIXL_SWA_VIEW_OPT": "1"}),
+            pytest.raises(AssertionError, match="single SWA ratio"),
+        ):
+            _build_connector_worker(
+                kv_cache_specs=[
+                    _spec_mock(
+                        SlidingWindowSpec,
+                        block_size=1024,
+                        sliding_window=128,
+                    ),
+                    _spec_mock(
+                        SlidingWindowSpec,
+                        block_size=1024,
+                        sliding_window=256,
+                    ),
+                ]
+            )
+
+    def test_non_multiple_sliding_window_asserts(self):
+        import os
+        from unittest.mock import patch
+
+        import pytest
+        from vllm.v1.kv_cache_interface import SlidingWindowSpec
+
+        with (
+            patch.dict(os.environ, {"VLLM_RBLN_NIXL_SWA_VIEW_OPT": "1"}),
+            pytest.raises(AssertionError),
+        ):
+            _build_connector_worker(
+                kv_cache_specs=[
+                    _spec_mock(
+                        SlidingWindowSpec,
+                        block_size=1024,
+                        sliding_window=300,
+                    )
+                ]
+            )
+
+
+class TestRblnNixlConnectorWorkerGetBlockDescsIds:
+    """`_get_block_descs_ids` lays out dual desc ranges sharing the same
+    Full-region base addresses: Full descs in [0, num_regions*num_blocks),
+    SWA descs in [num_regions*num_blocks, 2*num_regions*num_blocks).
+
+    With `_sw_ratio is None` (opt off, pure Full, or degenerate ratio==1)
+    it collapses to upstream's single concat path.
+    """
+
+    def _worker(self, specs, num_blocks=4, num_regions=2, opt_on=True):
+        import os
+        from unittest.mock import patch
+
+        env_val = "1" if opt_on else "0"
+        with patch.dict(os.environ, {"VLLM_RBLN_NIXL_SWA_VIEW_OPT": env_val}):
+            worker = _build_connector_worker(
+                kv_cache_specs=specs, num_blocks=num_blocks
+            )
+        worker.dst_num_blocks = {"test-engine": num_blocks}
+        worker.num_regions = num_regions
+        # super()._compute_desc_ids (the _sw_ratio-is-None delegation path)
+        # reads these base-worker attrs that the lightweight mock skips.
+        worker._has_mamba = False
+        return worker
+
+    def test_pure_full_uses_lower_range_no_offset(self):
+        from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+        worker = self._worker(
+            [_spec_mock(FullAttentionSpec, block_size=1024)],
+            num_blocks=4,
+            num_regions=2,
+        )
+        # `_sw_ratio` is None -> single-range concat path (matches upstream).
+        # region 0: 0*4 + [1,2] = [1, 2]
+        # region 1: 1*4 + [1,2] = [5, 6]
+        out = worker._compute_desc_ids([[1, 2]], 4, None, 1)
+        assert list(out) == [1, 2, 5, 6]
+
+    def test_hybrid_routes_full_low_swa_high(self):
+        from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
+
+        worker = self._worker(
+            [
+                _spec_mock(FullAttentionSpec, block_size=1024),
+                _spec_mock(SlidingWindowSpec, block_size=1024, sliding_window=128),
+            ],
+            num_blocks=4,
+            num_regions=2,
+        )
+        # num_full_descs = num_regions * num_blocks = 8
+        # Full  [g=0, block 0]: regions -> [0, 4]
+        # SWA   [g=1, block 1]: regions -> [8+1, 8+5] = [9, 13]
+        out = worker._compute_desc_ids([[0], [1]], 4, None, 1)
+        assert list(out) == [0, 4, 9, 13]
+
+    def test_block_size_ratio_scales_num_blocks(self):
+        """A non-None block_size_ratio scales dst_num_blocks (hetero
+        local/remote block sizes); the SWA offset uses the scaled count."""
+        from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
+
+        worker = self._worker(
+            [
+                _spec_mock(FullAttentionSpec, block_size=1024),
+                _spec_mock(SlidingWindowSpec, block_size=1024, sliding_window=128),
+            ],
+            num_blocks=4,
+            num_regions=2,
+        )
+        # block_size_ratio=2 -> num_blocks = 4*2 = 8, num_full_descs = 16
+        # Full [g=0, block 0]: region 0 -> 0*8+0 = 0;  region 1 -> 1*8+0 = 8
+        # SWA  [g=1, block 1]: region 0 -> 0*8+1+16 = 17; region 1 -> 1*8+1+16 = 25
+        out = worker._compute_desc_ids([[0], [1]], 4, 2, 1)
+        assert list(out) == [0, 8, 17, 25]
+
+    def test_empty_group_skipped(self):
+        """Some requests touch only one group's blocks — the empty groups
+        must drop out without contributing stray indices."""
+        from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
+
+        worker = self._worker(
+            [
+                _spec_mock(FullAttentionSpec, block_size=1024),
+                _spec_mock(SlidingWindowSpec, block_size=1024, sliding_window=128),
+            ],
+            num_blocks=4,
+            num_regions=2,
+        )
+        out = worker._compute_desc_ids([[], [2]], 4, None, 1)
+        # Only SWA contributes; num_full_descs=8; regions -> [8+2, 8+6]
+        assert list(out) == [10, 14]
+
+    def test_all_empty_returns_empty_array(self):
+        from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
+
+        worker = self._worker(
+            [
+                _spec_mock(FullAttentionSpec, block_size=1024),
+                _spec_mock(SlidingWindowSpec, block_size=1024, sliding_window=128),
+            ],
+            num_blocks=4,
+            num_regions=2,
+        )
+        out = worker._compute_desc_ids([[], []], 4, None, 1)
+        assert list(out) == []
+
+
+class TestRblnNixlConnectorWorkerSWAViewOptToggle:
+    """`VLLM_RBLN_NIXL_SWA_VIEW_OPT=0` collapses the hybrid SWA path back to
+    the single Full-sized desc layout even when SlidingWindowSpec groups
+    exist. The opt gates `_group_specs` / `_sw_ratio` derivation *and*
+    the per-group desc dispatch.
+    """
+
+    def test_opt_off_skips_group_specs_and_ratio(self):
+        """Env off: derivation block doesn't run, so both `_group_specs`
+        and `_sw_ratio` stay at their no-op defaults — the desc dispatch
+        consults neither (early returns on `_sw_ratio is None`)."""
+        import os
+        from unittest.mock import patch
+
+        from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
+
+        with patch.dict(os.environ, {"VLLM_RBLN_NIXL_SWA_VIEW_OPT": "0"}):
+            worker = _build_connector_worker(
+                kv_cache_specs=[
+                    _spec_mock(FullAttentionSpec, block_size=1024),
+                    _spec_mock(SlidingWindowSpec, block_size=1024, sliding_window=128),
+                ]
+            )
+        assert worker._sw_ratio is None
+        assert worker._group_specs == []
+
+    def test_opt_off_get_block_descs_uses_single_range(self):
+        """No SWA-side desc offset: SWA group's block_ids resolve into the
+        same Full-sized range as Full groups."""
+        import os
+        from unittest.mock import patch
+
+        from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
+
+        with patch.dict(os.environ, {"VLLM_RBLN_NIXL_SWA_VIEW_OPT": "0"}):
+            worker = _build_connector_worker(
+                kv_cache_specs=[
+                    _spec_mock(FullAttentionSpec, block_size=1024),
+                    _spec_mock(SlidingWindowSpec, block_size=1024, sliding_window=128),
+                ],
+                num_blocks=4,
+            )
+        worker.dst_num_blocks = {"test-engine": 4}
+        worker.num_regions = 2
+        worker._has_mamba = False
+        # Both groups' block_ids concat into one Full-sized range
+        # without the `num_full_descs` offset.
+        # Concatenated block_ids: [0, 1] → region 0: [0, 1], region 1: [4, 5]
+        out = worker._compute_desc_ids([[0], [1]], 4, None, 1)
+        assert list(out) == [0, 1, 4, 5]
+
+    def test_opt_on_default_keeps_derivation(self):
+        """Sanity: with the toggle explicitly set ON, derivation works
+        exactly like `TestRblnNixlConnectorWorkerSWARatio
+        ::test_hybrid_full_swa_derives_ratio`."""
+        import os
+        from unittest.mock import patch
+
+        from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
+
+        with patch.dict(os.environ, {"VLLM_RBLN_NIXL_SWA_VIEW_OPT": "1"}):
+            worker = _build_connector_worker(
+                kv_cache_specs=[
+                    _spec_mock(FullAttentionSpec, block_size=1024),
+                    _spec_mock(SlidingWindowSpec, block_size=1024, sliding_window=128),
+                ]
+            )
+        assert worker._sw_ratio == 8
+        assert len(worker._group_specs) == 2
+
+
+# ---------------------------------------------------------------------------
+# kv_buffer_device="rbln" (D2D) coverage on the unified connector
+# ---------------------------------------------------------------------------
+#
+# Cover the D2D branches on the unified worker: init-time invariants,
+# deferred-registration flow, host-xfer-ops gating, runtime_holder
+# forwarding, and the `_register_kv_caches_impl` body. NIXL/RBLN
+# runtime is fully mocked.
+
+
+def _build_d2d_worker(**kw):
+    """Convenience around `_build_connector_worker(kv_buffer_device='rbln')`
+    that turns env-toggle-gated logger.warning calls into no-ops for
+    cleaner test failure messages."""
+    kw.setdefault("kv_buffer_device", "rbln")
+    return _build_connector_worker(**kw)
+
+
+class TestRblnNixlConnectorInitAsserts:
+    """Outer `RblnNixlConnector.__init__` validates `kv_buffer_device` and
+    requires `VLLM_RBLN_USE_DEVICE_TENSOR=1` before constructing either
+    the scheduler or worker side."""
+
+    def _vllm_config(self, kv_buffer_device="cpu"):
+        cfg = MagicMock()
+        cfg.kv_transfer_config = MagicMock()
+        cfg.kv_transfer_config.engine_id = "test-engine"
+        cfg.kv_transfer_config.kv_buffer_device = kv_buffer_device
+        return cfg
+
+    def test_rejects_unknown_kv_buffer_device(self):
+        import os
+        from unittest.mock import patch
+
+        import pytest
+        from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+            KVConnectorRole,
+        )
+
+        from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl import (  # noqa: E501
+            RblnNixlConnector,
+        )
+
+        with (
+            patch.dict(os.environ, {"VLLM_RBLN_USE_DEVICE_TENSOR": "1"}),
+            pytest.raises(AssertionError, match="kv_buffer_device"),
+        ):
+            RblnNixlConnector(
+                vllm_config=self._vllm_config(kv_buffer_device="cuda"),
+                role=KVConnectorRole.SCHEDULER,
+                kv_cache_config=MagicMock(),
+            )
+
+    def test_requires_use_device_tensor(self):
+        import os
+        from unittest.mock import patch
+
+        import pytest
+        from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+            KVConnectorRole,
+        )
+
+        from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl import (  # noqa: E501
+            RblnNixlConnector,
+        )
+
+        with (
+            patch.dict(os.environ, {"VLLM_RBLN_USE_DEVICE_TENSOR": "0"}),
+            pytest.raises(AssertionError, match="VLLM_RBLN_USE_DEVICE_TENSOR"),
+        ):
+            RblnNixlConnector(
+                vllm_config=self._vllm_config(kv_buffer_device="rbln"),
+                role=KVConnectorRole.SCHEDULER,
+                kv_cache_config=MagicMock(),
+            )
+
+
+class TestRblnNixlConnectorSchedulerHostBufferFlag:
+    """`RblnNixlConnectorScheduler.use_host_buffer` mirrors
+    `kv_buffer_device == 'cpu'` so scheduler-side helpers can branch
+    without re-reading the env at every call."""
+
+    def _vllm_config(self, kv_buffer_device):
+        cfg = MagicMock()
+        cfg.kv_transfer_config = MagicMock()
+        cfg.kv_transfer_config.engine_id = "test-engine"
+        cfg.kv_transfer_config.kv_buffer_device = kv_buffer_device
+        cfg.parallel_config = MagicMock()
+        cfg.parallel_config.tensor_parallel_size = 1
+        return cfg
+
+    def _build(self, kv_buffer_device):
+        from unittest.mock import patch
+
+        from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl import (  # noqa: E501
+            RblnNixlConnectorScheduler,
+        )
+
+        def fake_super_init(self, vllm_config_, engine_id_, kv_cache_config_):
+            self.vllm_config = vllm_config_
+            self.engine_id = engine_id_
+            self.kv_cache_config = kv_cache_config_
+
+        with patch.object(
+            RblnNixlConnectorScheduler.__mro__[1], "__init__", fake_super_init
+        ):
+            return RblnNixlConnectorScheduler(
+                vllm_config=self._vllm_config(kv_buffer_device),
+                engine_id="test-engine",
+                kv_cache_config=MagicMock(),
+            )
+
+    def test_cpu_sets_host_buffer_true(self):
+        scheduler = self._build("cpu")
+        assert scheduler.use_host_buffer is True
+
+    def test_rbln_clears_host_buffer(self):
+        scheduler = self._build("rbln")
+        assert scheduler.use_host_buffer is False
+
+
+class TestRblnNixlConnectorWorkerD2DInit:
+    """Worker `__init__` under `kv_buffer_device='rbln'` flips
+    `use_host_buffer`, raises `nixl_memory_type` to VRAM, and primes the
+    deferred-registration slot that `finalize_kv_cache_registration` later
+    consumes."""
+
+    def test_d2d_init_state(self):
+        worker = _build_d2d_worker()
+        # Host buffer disabled — D2D path runs directly off the device tensor.
+        assert worker.use_host_buffer is False
+        # VRAM segment: nixl-rbln uses ibv_reg_dmabuf_mr for device dmabufs.
+        assert worker.nixl_memory_type == "VRAM"
+        # Deferred-registration slot declared up-front so other methods can
+        # check it without a `getattr` probe.
+        assert worker._pending_kv_caches is None
+        # Block-size pins still apply on the D2D path.
+        assert worker.num_blocks == 128
+        assert worker.block_size == 64
+
+    def test_cpu_init_leaves_nixl_memory_type_alone(self):
+        """The `kv_buffer_device == 'rbln'` block is the only place
+        `nixl_memory_type` is raised to VRAM. On the cpu path our
+        override does nothing — upstream's value (whatever the platform
+        returns from `get_nixl_memory_type`, default DRAM) survives.
+        The fake super-init in the helper doesn't replay upstream's
+        full set-up, so the attribute may simply not exist; assert
+        only that we didn't accidentally raise it to VRAM."""
+        worker = _build_connector_worker(kv_buffer_device="cpu")
+        assert getattr(worker, "nixl_memory_type", "DRAM") != "VRAM"
+
+
+class TestRblnNixlConnectorWorkerRegisterKvCachesDispatch:
+    """`register_kv_caches` is the path fork. On D2D the backing memory
+    isn't allocated yet (warm-up does that), so the call stashes the
+    kv_caches and returns; the real NIXL registration runs later in
+    `finalize_kv_cache_registration`. On host-bounce it goes through
+    upstream's flow after creating the RBLN backend on the agent."""
+
+    def test_rbln_stashes_kv_caches_and_returns(self):
+        import sys
+        import types
+        from unittest.mock import patch
+
+        worker = _build_d2d_worker()
+        kv_caches = {"l0": MagicMock(), "l1": MagicMock()}
+
+        # Make sure super().register_kv_caches is NOT called on the D2D
+        # path and that ensure_rbln_backend stays untouched.
+        from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl import (
+            worker as conn_mod,
+        )
+
+        fake_nixl_rbln: Any = types.ModuleType("nixl_rbln")
+        fake_nixl_rbln.ensure_rbln_backend = MagicMock()
+        with (
+            patch.dict(sys.modules, {"nixl_rbln": fake_nixl_rbln}),
+            patch.object(
+                conn_mod.NixlConnectorWorker, "register_kv_caches"
+            ) as super_register,
+        ):
+            worker.register_kv_caches(kv_caches)
+
+        super_register.assert_not_called()
+        fake_nixl_rbln.ensure_rbln_backend.assert_not_called()
+        assert worker._pending_kv_caches is kv_caches
+
+    def test_cpu_creates_backend_and_delegates_to_super(self):
+        import sys
+        import types
+        from unittest.mock import patch
+
+        from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl import (
+            worker as conn_mod,
+        )
+
+        worker = _build_connector_worker(kv_buffer_device="cpu")
+        # nixl_wrapper is provided by upstream __init__; helper's fake
+        # super_init doesn't, so install a stand-in.
+        worker.nixl_wrapper = MagicMock()
+        kv_caches = {"l0": MagicMock()}
+
+        fake_nixl_rbln: Any = types.ModuleType("nixl_rbln")
+        fake_nixl_rbln.ensure_rbln_backend = MagicMock()
+        with (
+            patch.dict(sys.modules, {"nixl_rbln": fake_nixl_rbln}),
+            patch.object(
+                conn_mod.NixlConnectorWorker, "register_kv_caches"
+            ) as super_register,
+        ):
+            worker.register_kv_caches(kv_caches)
+
+        fake_nixl_rbln.ensure_rbln_backend.assert_called_once_with(
+            worker.nixl_wrapper, device_id=0
+        )
+        super_register.assert_called_once_with(kv_caches)
+        # The D2D-only slot must stay clear on the host-bounce path.
+        assert worker._pending_kv_caches is None
+
+
+class TestRblnNixlConnectorWorkerFinalizeKvCacheRegistration:
+    """`finalize_kv_cache_registration` is the deferred-dispatch hook.
+    No pending kv_caches → no-op (idempotent, also fires on the
+    host-bounce path where there's nothing to do). Pending present →
+    swap to `None` and hand to `_register_kv_caches_impl`."""
+
+    def test_no_pending_is_noop(self):
+        from unittest.mock import patch
+
+        worker = _build_d2d_worker()
+        assert worker._pending_kv_caches is None
+        with patch.object(worker, "_register_kv_caches_impl") as impl:
+            worker.finalize_kv_cache_registration()
+        impl.assert_not_called()
+
+    def test_pending_dispatches_to_impl_and_clears(self):
+        from unittest.mock import patch
+
+        worker = _build_d2d_worker()
+        kv_caches = {"l0": MagicMock()}
+        worker._pending_kv_caches = kv_caches
+
+        with patch.object(worker, "_register_kv_caches_impl") as impl:
+            worker.finalize_kv_cache_registration()
+
+        impl.assert_called_once_with(kv_caches)
+        # Slot must be cleared before impl is called so a second invocation
+        # is a guaranteed no-op (idempotent on re-entry).
+        assert worker._pending_kv_caches is None
+
+    def test_double_call_is_safe(self):
+        """Second invocation finds `_pending_kv_caches is None` and exits
+        before `_register_kv_caches_impl` is touched again."""
+        from unittest.mock import patch
+
+        worker = _build_d2d_worker()
+        worker._pending_kv_caches = {"l0": MagicMock()}
+        with patch.object(worker, "_register_kv_caches_impl") as impl:
+            worker.finalize_kv_cache_registration()
+            worker.finalize_kv_cache_registration()
+        assert impl.call_count == 1
+
+
+class TestRblnNixlConnectorWorkerSetHostXferBufferOps:
+    """`set_host_xfer_buffer_ops` is called by the runner regardless of
+    `kv_buffer_device`. On D2D there's no host buffer to copy through,
+    so the call must short-circuit and leave `copy_blocks` unset."""
+
+    def test_rbln_returns_without_setting_copy_blocks(self):
+        worker = _build_d2d_worker()
+        sentinel = MagicMock()
+        worker.set_host_xfer_buffer_ops(sentinel)
+        # copy_blocks must not have been assigned to the runner-supplied op.
+        assert getattr(worker, "copy_blocks", None) is not sentinel
+
+    def test_cpu_assigns_copy_blocks(self):
+        """Sanity: on the host-bounce path the runner-supplied callback
+        is installed verbatim."""
+        worker = _build_connector_worker(kv_buffer_device="cpu")
+        worker.use_host_buffer = True
+        sentinel = MagicMock()
+        worker.set_host_xfer_buffer_ops(sentinel)
+        assert worker.copy_blocks is sentinel
+
+
+class TestRblnNixlConnectorWorkerRegisterKvCachesImpl:
+    """`_register_kv_caches_impl` (the deferred D2D body) is what
+    `finalize_kv_cache_registration` calls after warm-up materializes
+    the backing memory. End-to-end mocking: stub `nixl_rbln`,
+    `nixl_connector.TpKVTopology`, the metadata encoder, and the worker
+    attributes the upstream `__init__` would normally populate.
+
+    Verifies the post-call worker state captures what nixl-rbln returned
+    (base addrs, block lens, region counts) and that `nixl-rbln` is
+    invoked with the right memory segment for D2D (`mem='VRAM'`).
+    """
+
+    def _prep_worker(self):
+        """Build a D2D worker and back-fill every attribute that the real
+        upstream `NixlConnectorWorker.__init__` would have set, so
+        `_register_kv_caches_impl` can run without `AttributeError`."""
+        worker = _build_d2d_worker()
+        worker.tp_rank = 0
+        # 0.22 TransferTopology(tp_size=self.world_size) — base __init__ sets
+        # world_size; the lightweight mock back-fills it.
+        worker.world_size = 1
+        worker._tp_size = {worker.engine_id: 1}
+        worker.use_mla = False
+        worker._has_mamba = False
+        worker.attn_backends = []
+        worker.backend_name = "rbln"
+        worker.kv_cache_layout = "HND"
+        worker._mamba_ssm_size = 0
+        worker.model_config = MagicMock()
+        worker.model_config.get_total_num_kv_heads.return_value = 8
+        worker.host_xfer_buffers = {}
+        worker.nixl_wrapper = MagicMock()
+        worker.nixl_wrapper.get_agent_metadata.return_value = b"agent-meta"
+        worker.kv_caches_base_addr = {worker.engine_id: {0: None}}
+        worker._registered_descs = []
+        worker.dst_num_blocks = {}
+        worker.src_xfer_handles_by_block_size = {}
+        return worker
+
+    def _layer_spec(self, page_size_bytes=4096):
+        """Stand-in for FullAttentionSpec — only attrs the impl reads."""
+        from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+        spec = MagicMock(spec=FullAttentionSpec)
+        spec.page_size_bytes = page_size_bytes
+        return spec
+
+    def _kv_caches(self, base_ptr=0x10000, num_blocks=128):
+        """Two-layer kv_caches; each layer's tensor must support
+        `.shape`, `.data_ptr()`, `.zero_()`, `.get_device()`. The impl
+        also walks the values via `next(iter(...))` for tensor_shape /
+        device_id."""
+        kv = {}
+        for i, name in enumerate(("l0", "l1")):
+            t = MagicMock()
+            # Full layer tensor: (K/V=2, num_blocks, heads, ..., head_dim).
+            t.shape = (2, num_blocks, 8, 1, 64, 64)
+            t.data_ptr.return_value = base_ptr + i * 0x10000
+            t.get_device.return_value = 0
+            t.zero_ = MagicMock()
+            kv[name] = t
+        return kv
+
+    def _split_kv(self, num_blocks):
+        """Mimic `kv_topo.get_transfer_cache_regions` returning K and V
+        as separate region tensors, each with `shape[0] == num_blocks`
+        (the per-K / per-V view the impl asserts against)."""
+
+        def _split(cache, _spec):
+            k = MagicMock()
+            v = MagicMock()
+            for region, off in ((k, 0), (v, 0x100)):
+                region.shape = (num_blocks, 8, 1, 64, 64)
+                region.data_ptr.return_value = cache.data_ptr() + off
+            return [k, v]
+
+        return _split
+
+    def _patch_nixl_connector(self, topo):
+        """Patch the 0.22 NIXL symbols `_register_kv_caches_impl` imports
+        directly (the v0.20 package split removed the `nixl_connector`
+        module the impl used to namespace through).
+
+        `isinstance(layer_spec, {UniformTypeKVCacheSpecs, MambaSpec})`
+        requires real types (MagicMock breaks isinstance), so install
+        dummy classes the spec MagicMocks won't match.
+        """
+        from unittest.mock import patch
+
+        msgspec_mock = MagicMock()
+        msgspec_mock.msgpack.Encoder.return_value.encode.return_value = b"meta"
+        nc_patch = patch.multiple(
+            "vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.worker",
+            TransferTopology=MagicMock(return_value=topo),
+            compute_nixl_compatibility_hash=MagicMock(return_value="hash"),
+            MambaSpec=type("MambaSpec", (), {}),
+            UniformTypeKVCacheSpecs=type("UniformTypeKVCacheSpecs", (), {}),
+            NixlAgentMetadata=MagicMock(),
+            NixlHandshakePayload=MagicMock(),
+            msgspec=msgspec_mock,
+        )
+        nc_patch.start()
+        return msgspec_mock, nc_patch
+
+    def test_registers_with_vram_segment_and_captures_xfer_tables(self):
+        """Happy path: nixl-rbln is invoked with `mem='VRAM'` (D2D
+        signature), and the returned `base_addrs` / `block_lens` /
+        `reg_handle` are absorbed into the worker's transfer state."""
+        import sys
+        import types
+        from unittest.mock import patch
+
+        worker = self._prep_worker()
+        spec = self._layer_spec(page_size_bytes=4096)
+        worker._layer_specs = {"l0": spec, "l1": spec}
+        kv_caches = self._kv_caches(num_blocks=worker.num_blocks)
+
+        # nixl-rbln returns base addrs / block lens / a reg handle.
+        xfer_result = MagicMock()
+        xfer_result.base_addrs = [0x20000, 0x20100]
+        xfer_result.block_lens = [256, 256]
+        xfer_result.reg_handle = "reg-handle"
+        xfer_result.n_shards = 1
+
+        fake_nixl_rbln: Any = types.ModuleType("nixl_rbln")
+        fake_nixl_rbln.register_kv_regions = MagicMock(return_value=xfer_result)
+        fake_nixl_rbln.ensure_rbln_backend = MagicMock()
+
+        # Stub the 0.22 NIXL symbols the impl imports directly.
+        topo = MagicMock(
+            is_kv_layout_blocks_first=False,
+            _cross_layers_blocks=False,
+            cross_layers_blocks=False,
+        )
+        topo.get_transfer_cache_regions.side_effect = self._split_kv(worker.num_blocks)
+        _, nc_patch = self._patch_nixl_connector(topo)
+        try:
+            # Short-circuit register_local_xfer_handler so the test
+            # focuses on _register_kv_caches_impl's own state writes.
+            with (
+                patch.dict(sys.modules, {"nixl_rbln": fake_nixl_rbln}),
+                patch(
+                    "vllm_rbln.distributed.kv_transfer.kv_connector.v1."
+                    "rbln_nixl.worker.rebel"
+                ) as mock_rebel,
+                patch.object(
+                    worker,
+                    "register_local_xfer_handler",
+                    return_value=("local-handle", [(0x0, 0, 0)]),
+                ),
+            ):
+                mock_rebel.context_of.return_value.rbln_ctx_ptr = 0x1000
+                worker._register_kv_caches_impl(kv_caches)
+        finally:
+            nc_patch.stop()
+
+        # rbln_ctx_ptr is resolved from the KV cache tensor via
+        # rebel.context_of (sugar for the global-at-device Context lookup),
+        # not from a runtime handle.
+        mock_rebel.context_of.assert_called_once_with(next(iter(kv_caches.values())))
+
+        # nixl-rbln was called once, with VRAM segment.
+        fake_nixl_rbln.register_kv_regions.assert_called_once()
+        called_kwargs = fake_nixl_rbln.register_kv_regions.call_args.kwargs
+        assert called_kwargs["mem"] == "VRAM"
+        assert called_kwargs["rbln_ctx_ptr"] == 0x1000
+
+        # Returned tables threaded into the worker state.
+        assert worker.device_id == 0
+        assert worker.block_len_per_layer == [256, 256]
+        assert worker.kv_caches_base_addr[worker.engine_id][0] == [0x20000, 0x20100]
+        assert worker._registered_descs == ["reg-handle"]
+
+        # Region counts: 2 regions, layout-blocks-first=False so no x2.
+        assert worker.num_regions == 2
+        assert worker.num_descs == 2 * worker.num_blocks
+
+        # Final hand-offs.
+        assert worker.device_kv_caches is kv_caches
+        assert worker.dst_num_blocks[worker.engine_id] == worker.num_blocks
+        assert (
+            worker.src_xfer_handles_by_block_size[worker.block_size] == "local-handle"
+        )
+
+    def test_constructs_transfer_topology_with_0_22_kwargs(self):
+        """D2D registration builds the 0.22 TransferTopology with the
+        renamed ctor signature (tp_size=self.world_size, block_size=...).
+        The happy-path test fully mocks TransferTopology, so a wrong kwarg
+        name would slip through — this asserts the exact call."""
+        import sys
+        import types
+        from unittest.mock import patch
+
+        from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl import (
+            worker as worker_mod,
+        )
+
+        worker = self._prep_worker()
+        spec = self._layer_spec(page_size_bytes=4096)
+        worker._layer_specs = {"l0": spec, "l1": spec}
+        kv_caches = self._kv_caches(num_blocks=worker.num_blocks)
+
+        xfer_result = MagicMock()
+        xfer_result.base_addrs = [0x20000, 0x20100]
+        xfer_result.block_lens = [256, 256]
+        xfer_result.reg_handle = "reg-handle"
+        xfer_result.n_shards = 1
+        fake_nixl_rbln: Any = types.ModuleType("nixl_rbln")
+        fake_nixl_rbln.register_kv_regions = MagicMock(return_value=xfer_result)
+        fake_nixl_rbln.ensure_rbln_backend = MagicMock()
+
+        topo = MagicMock(
+            is_kv_layout_blocks_first=False,
+            _cross_layers_blocks=False,
+            cross_layers_blocks=False,
+        )
+        topo.get_transfer_cache_regions.side_effect = self._split_kv(worker.num_blocks)
+        _, nc_patch = self._patch_nixl_connector(topo)
+        try:
+            with (
+                patch.dict(sys.modules, {"nixl_rbln": fake_nixl_rbln}),
+                patch(
+                    "vllm_rbln.distributed.kv_transfer.kv_connector.v1."
+                    "rbln_nixl.worker.rebel"
+                ) as mock_rebel,
+                patch.object(
+                    worker,
+                    "register_local_xfer_handler",
+                    return_value=("local-handle", [(0x0, 0, 0)]),
+                ),
+            ):
+                mock_rebel.context_of.return_value.rbln_ctx_ptr = 0x1000
+                worker._register_kv_caches_impl(kv_caches)
+
+            # `TransferTopology` is the patch.multiple mock while `nc_patch`
+            # is active. Assert the exact 0.22 ctor kwargs.
+            worker_mod.TransferTopology.assert_called_once_with(
+                tp_rank=0,
+                tp_size=1,
+                block_size=64,
+                engine_id="test-engine",
+                is_mla=False,
+                total_num_kv_heads=8,
+                attn_backends=[],
+                tensor_shape=(2, 128, 8, 1, 64, 64),
+                is_mamba=False,
+            )
+        finally:
+            nc_patch.stop()
+
+
+# ---------------------------------------------------------------------------
+# Upstream-NIXL fallback (no nixl-rbln adapter installed)
+# ---------------------------------------------------------------------------
+#
+# When `nixl_rbln` is not importable the worker leaves `nixl_backends` /
+# `nixl_memory_type` at upstream defaults (UCX / DRAM) for the
+# host-bounce path and rejects D2D outright.
+
+
+class TestRblnNixlConnectorWorkerBackendSelection:
+    """`_use_rbln_nixl_backend` flag follows nixl_rbln import availability,
+    and only the RBLN-backend branch touches `nixl_backends` /
+    `nixl_memory_type`."""
+
+    def test_rbln_backend_when_nixl_rbln_present(self):
+        worker = _build_connector_worker(
+            kv_buffer_device="cpu", nixl_rbln_available=True
+        )
+        assert worker._use_rbln_nixl_backend is True
+        assert worker.nixl_backends == ["RBLN"]
+
+    def test_upstream_backend_when_nixl_rbln_absent(self):
+        worker = _build_connector_worker(
+            kv_buffer_device="cpu", nixl_rbln_available=False
+        )
+        assert worker._use_rbln_nixl_backend is False
+        # `nixl_backends` is owned by the upstream parent's __init__;
+        # the helper's fake super_init doesn't replay it, so the
+        # attribute may simply not exist. Whatever upstream set must
+        # NOT have been overridden to ["RBLN"].
+        assert getattr(worker, "nixl_backends", None) != ["RBLN"]
+
+    def test_upstream_path_leaves_nixl_memory_type_at_default(self):
+        """The `kv_buffer_device == 'rbln'` block is the only place
+        `nixl_memory_type` is raised to VRAM, and that branch is only
+        reachable with nixl_rbln available. On the upstream cpu path
+        the attribute either stays untouched or simply isn't set by
+        the helper's fake super_init — must not be VRAM either way."""
+        worker = _build_connector_worker(
+            kv_buffer_device="cpu", nixl_rbln_available=False
+        )
+        assert getattr(worker, "nixl_memory_type", "DRAM") != "VRAM"
+
+
+class TestRblnNixlConnectorWorkerRegisterKvCachesUpstream:
+    """`register_kv_caches` on the upstream cpu path skips
+    `ensure_rbln_backend` (nixl-rbln isn't there to call) and goes
+    straight through to the parent's standard registration."""
+
+    def test_upstream_cpu_skips_ensure_rbln_backend(self):
+        from unittest.mock import patch
+
+        from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl import (
+            worker as conn_mod,
+        )
+
+        worker = _build_connector_worker(
+            kv_buffer_device="cpu", nixl_rbln_available=False
+        )
+        worker.nixl_wrapper = MagicMock()
+        kv_caches = {"l0": MagicMock()}
+
+        with patch.object(
+            conn_mod.NixlConnectorWorker, "register_kv_caches"
+        ) as super_register:
+            # Even if the test process *does* have nixl_rbln importable,
+            # the worker's flag says we shouldn't touch it — wrap
+            # `ensure_rbln_backend` to assert no call.
+            try:
+                import nixl_rbln  # noqa: F401
+
+                have_real = True
+            except ImportError:
+                have_real = False
+            if have_real:
+                with patch("nixl_rbln.ensure_rbln_backend") as ensure:
+                    worker.register_kv_caches(kv_caches)
+                ensure.assert_not_called()
+            else:
+                worker.register_kv_caches(kv_caches)
+
+        super_register.assert_called_once_with(kv_caches)
+        assert worker._pending_kv_caches is None
+
+
+class TestRblnNixlConnectorWorkerD2DRequiresNixlRbln:
+    """D2D (`kv_buffer_device='rbln'`) can't proceed without nixl-rbln —
+    `__init__` rejects with a clear hint instead of failing deep in
+    `_register_kv_caches_impl`."""
+
+    def test_d2d_without_nixl_rbln_raises(self):
+        import pytest
+
+        with pytest.raises(RuntimeError, match="nixl-rbln"):
+            _build_connector_worker(kv_buffer_device="rbln", nixl_rbln_available=False)
+
+    def test_d2d_with_nixl_rbln_succeeds(self):
+        """Symmetric sanity — same arguments but with nixl_rbln present
+        constructs cleanly and enters the RBLN-backend branch."""
+        worker = _build_connector_worker(
+            kv_buffer_device="rbln", nixl_rbln_available=True
+        )
+        assert worker._use_rbln_nixl_backend is True
+        assert worker.nixl_memory_type == "VRAM"
+
+
+# ---------------------------------------------------------------------------
+# 0.22-bump regression coverage: the connector overrides that gained the most
+# surface in the vLLM 0.22 NIXL adaptation, plus the rbln_nixl/ package split.
+# ---------------------------------------------------------------------------
+
+
+class TestRblnNixlConnectorWorkerRegisterLocalXferHandler:
+    """`register_local_xfer_handler` branches on `_sw_ratio`: `None`
+    delegates to upstream's Full-only layout; otherwise it emits a dual
+    (Full + SWA) desc range over `length_divisors=[1, _sw_ratio]`."""
+
+    def test_sw_ratio_none_delegates_to_super(self):
+        from unittest.mock import patch
+
+        worker = _build_connector_worker()  # _sw_ratio is None
+        assert worker._sw_ratio is None
+        base = type(worker).__mro__[1]  # NixlConnectorWorker
+        sentinel = ("handle", [(0, 0, 0)])
+        with patch.object(
+            base, "register_local_xfer_handler", return_value=sentinel
+        ) as mock_super:
+            out = worker.register_local_xfer_handler(32)
+        assert out is sentinel
+        mock_super.assert_called_once_with(32)
+
+    def test_swa_builds_dual_desc_ranges(self):
+        from unittest.mock import patch
+
+        worker = _build_connector_worker(num_blocks=4, block_size=64)
+        worker._sw_ratio = 2
+        worker._has_mamba = False
+        worker.tp_rank = 0
+        worker.device_id = 0
+        worker.transfer_topo = MagicMock(is_kv_layout_blocks_first=False)
+        worker.kv_caches_base_addr = {worker.engine_id: {0: [0x1000, 0x2000]}}
+        worker.block_len_per_layer = [256, 256]
+        worker.nixl_memory_type = "DRAM"
+        worker.nixl_wrapper = MagicMock()
+
+        with patch.object(worker, "get_backend_aware_kv_block_len", return_value=256):
+            worker.register_local_xfer_handler(64)  # block_size_ratio == 1
+
+        worker.nixl_wrapper.get_xfer_descs.assert_called_once()
+        blocks_data = worker.nixl_wrapper.get_xfer_descs.call_args[0][0]
+        # 2 passes (Full + SWA) x 2 layers x num_blocks(4) = 16; a single
+        # Full-only pass would be 8 -> the dual range is confirmed.
+        assert len(blocks_data) == 16
+
+
+def _remote_agent_meta():
+    meta = MagicMock()
+    meta.engine_id = "remote-eng"
+    meta.block_size = 64
+    meta.block_lens = [256, 256]
+    meta.physical_blocks_per_logical_kv_block = 1
+    meta.num_blocks = 8
+    meta.kv_caches_base_addr = [0x5000, 0x6000]
+    meta.device_id = 1
+    meta.agent_metadata = b"x"
+    return meta
+
+
+class TestRblnNixlConnectorWorkerAddRemoteAgent:
+    """`add_remote_agent` 0.22 surface: `_sw_ratio is None` delegates to
+    upstream; the SWA path must register the remote engine in the
+    TransferTopology and build its TPMapping BEFORE any topology lookup
+    (the 0.22 handshake prelude — omitting it raised KeyError at runtime)."""
+
+    def test_sw_ratio_none_delegates_to_super(self):
+        from unittest.mock import patch
+
+        worker = _build_connector_worker()  # _sw_ratio is None
+        assert worker._sw_ratio is None
+        meta = _remote_agent_meta()
+        base = type(worker).__mro__[1]
+        with patch.object(
+            base, "add_remote_agent", return_value="super-agent"
+        ) as mock_super:
+            out = worker.add_remote_agent(meta, 0, 1)
+        assert out == "super-agent"
+        mock_super.assert_called_once_with(meta, 0, 1)
+
+    def test_idempotent_skips_when_already_handshaked(self):
+        worker = _build_connector_worker()
+        worker._sw_ratio = 2
+        worker.transfer_topo = MagicMock()
+        worker._remote_agents = {"remote-eng": {0: "existing-agent"}}
+        meta = _remote_agent_meta()
+        out = worker.add_remote_agent(meta, 0, 1)
+        assert out == "existing-agent"
+        worker.transfer_topo.register_remote_engine.assert_not_called()
+
+    def test_registers_remote_engine_before_topology_lookups(self):
+        import collections
+        from unittest.mock import patch
+
+        from vllm.distributed.kv_transfer.kv_connector.utils import (
+            EngineTransferInfo,
+        )
+
+        worker = _build_connector_worker(num_blocks=4, block_size=64)
+        worker._sw_ratio = 2
+        worker._has_mamba = False
+        worker.use_mla = False
+        worker.tp_rank = 0
+        worker._group_spec_types = ()
+        worker.nixl_memory_type = "DRAM"
+
+        topo = MagicMock(is_kv_layout_blocks_first=False)
+        topo.block_size_ratio.return_value = 1
+        topo.tp_ratio.return_value = 1
+        topo.is_kv_replicated.return_value = True
+        worker.transfer_topo = topo
+
+        worker.tp_mappings = {}
+        worker.dst_num_blocks = {}
+        worker._remote_agents = {}
+        worker.kv_caches_base_addr = collections.defaultdict(dict)
+        worker.dst_xfer_side_handles = collections.defaultdict(dict)
+        worker.src_xfer_handles_by_block_size = {}
+        worker.src_blocks_data = []
+        worker.nixl_wrapper = MagicMock()
+        worker.nixl_wrapper.add_remote_agent.return_value = "remote-agent-name"
+
+        meta = _remote_agent_meta()
+        mapping_sentinel = MagicMock(name="tp_mapping")
+        with (
+            patch(
+                "vllm_rbln.distributed.kv_transfer.kv_connector.v1."
+                "rbln_nixl.worker.compute_tp_mapping",
+                return_value=mapping_sentinel,
+            ) as mock_ctm,
+            patch.object(worker, "_validate_remote_agent_handshake"),
+            patch.object(worker, "get_backend_aware_kv_block_len", return_value=256),
+        ):
+            out = worker.add_remote_agent(meta, 0, 1)
+
+        # Prelude: remote engine registered with EngineTransferInfo from meta.
+        topo.register_remote_engine.assert_called_once()
+        eng_id_arg, eti = topo.register_remote_engine.call_args[0]
+        assert eng_id_arg == "remote-eng"
+        assert isinstance(eti, EngineTransferInfo)
+        assert eti.remote_tp_size == 1
+        assert eti.remote_block_size == 64
+        assert eti.remote_block_len == 256
+        assert eti.remote_physical_blocks_per_logical == 1
+
+        # TPMapping built from the topology and stashed under the engine id.
+        mock_ctm.assert_called_once_with(
+            transfer_topology=topo, remote_tp_size=1, group_spec_types=()
+        )
+        assert worker.tp_mappings["remote-eng"] is mapping_sentinel
+
+        # The renamed 0.22 TransferTopology methods are consulted.
+        topo.block_size_ratio.assert_called_once_with(64)
+        topo.tp_ratio.assert_called_once_with(1)
+        topo.is_kv_replicated.assert_called_once_with("remote-eng")
+
+        # ORDERING GUARD: register_remote_engine must precede any topology
+        # lookup. This is exactly what the 0.22 handshake prelude established;
+        # removing/misplacing it would flip the order and (with a real topo)
+        # raise KeyError in get_engine_info.
+        names = [c[0] for c in topo.mock_calls if c[0]]
+        assert "register_remote_engine" in names
+        assert "block_size_ratio" in names
+        assert names.index("register_remote_engine") < names.index("block_size_ratio")
+
+        assert out == "remote-agent-name"
+
+
+class TestRblnNixlConnectorFactoryRegistration:
+    """The package split moved the connector to `...v1.rbln_nixl`; the factory
+    registration must point at the new path so it still resolves by name."""
+
+    def test_factory_registers_and_resolves_rbln_nixl_connector(self):
+        from vllm.distributed.kv_transfer.kv_connector.factory import (
+            KVConnectorFactory,
+        )
+
+        import vllm_rbln.distributed.kv_transfer.kv_connector.factory  # noqa: F401
+
+        assert "RblnNixlConnector" in KVConnectorFactory._registry
+        # Resolve through the factory's stored loader: a wrong module path in
+        # factory.py would raise here (ImportError / AttributeError).
+        cls = KVConnectorFactory._registry["RblnNixlConnector"]()
+        assert cls.__name__ == "RblnNixlConnector"
+
+    def test_package_reexports_three_classes(self):
+        import importlib
+
+        mod = importlib.import_module(
+            "vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl"
+        )
+        for name in (
+            "RblnNixlConnector",
+            "RblnNixlConnectorScheduler",
+            "RblnNixlConnectorWorker",
+        ):
+            assert hasattr(mod, name), f"missing re-export: {name}"
