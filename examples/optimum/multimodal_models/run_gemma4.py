@@ -67,7 +67,8 @@ def main(
 ):
     os.environ["VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK"] = "4"
     llm = LLM(
-        model=model, block_size=4096, mm_processor_kwargs={"max_soft_tokens": 280}
+        model=model,
+        block_size=4096,
     )
     tokenizer = AutoTokenizer.from_pretrained(model)
     inputs = generate_prompts(num_input_prompt, model)
