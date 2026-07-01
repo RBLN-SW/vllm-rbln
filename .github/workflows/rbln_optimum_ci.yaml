@@ -143,7 +143,7 @@ jobs:
 
       - name : Run text embedding model (V1)
         run: >
-          python3 examples/optimum/pre-compiled/pooling_models/run_encoder_only.py
+          python3 examples/optimum/pre_compiled/pooling_models/run_encoder_only.py
           --num_input_prompt ${{ env.NUM_INPUT_PROMPT }}
           --model ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/bge-m3-1k-batch4
           --q_prompt_txt ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/prompts/q_prompts.txt
@@ -227,7 +227,7 @@ jobs:
 
       - name: Run decoder-only test (eager attn) (V1)
         run: >
-          python3 examples/optimum/pre-compiled/decoder_models/run_llama.py
+          python3 examples/optimum/pre_compiled/decoder_models/run_llama.py
           --num_input_prompt ${{ env.NUM_INPUT_PROMPT }}
           --model ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/llama2-7b_batch2
           --prompt_txt ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/prompts/copy_prompts.txt
@@ -235,7 +235,7 @@ jobs:
 
       - name: Run decoder-only test (Flash-attention mode) (V1)
         run: >
-          python3 examples/optimum/pre-compiled/decoder_models/run_llama.py
+          python3 examples/optimum/pre_compiled/decoder_models/run_llama.py
           --num_input_prompt ${{ env.NUM_INPUT_PROMPT }}
           --model ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/llama3_2-3b-128k_kv16k_batch4
           --prompt_txt ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/prompts/copy_prompts.txt
@@ -255,25 +255,25 @@ jobs:
 
       - name : Run Idefics3 (Eager mode) (V1)
         run: >
-          python3 examples/optimum/pre-compiled/multimodal_models/run_idefics3.py
+          python3 examples/optimum/pre_compiled/multimodal_models/run_idefics3.py
           --num_input_prompt ${{ env.NUM_INPUT_PROMPT }}
           --model ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/idefics3-8b-llama3-32k-b4
 
       - name : Run Idefics3 (Flash-attention mode) (V1)
         run: >
-          python3 examples/optimum/pre-compiled/multimodal_models/run_idefics3.py
+          python3 examples/optimum/pre_compiled/multimodal_models/run_idefics3.py
           --num_input_prompt ${{ env.NUM_INPUT_PROMPT }}
           --model ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/idefics3-8b-llama3-32k-b4-kv16k
 
       - name : Run Blip2 (V1)
         run: >
-          python3 examples/optimum/pre-compiled/multimodal_models/run_blip2.py
+          python3 examples/optimum/pre_compiled/multimodal_models/run_blip2.py
           --num_input_prompt ${{ env.NUM_INPUT_PROMPT }}
           --model ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/blip2-opt-2.7b-2k-b4
 
       - name : Run PaliGemma (Eager mode) (V1)
         run: >
-          python3 examples/optimum/pre-compiled/multimodal_models/run_paligemma.py
+          python3 examples/optimum/pre_compiled/multimodal_models/run_paligemma.py
           --num_input_prompt ${{ env.NUM_INPUT_PROMPT }}
           --model ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/paligemma-3b-8k-b4
 
