@@ -613,15 +613,15 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.kv_connector_output: KVConnectorOutput | None = None
 
         # Optional device-execution thread for overlapping the DP gloo
-        # all_reduce with forward (VLLM_RBLN_ASYNC_FORWARD=1). None => run the
-        # forward inline on the worker thread, as before.
-        self._device_executor: _DeviceForwardExecutor | None = (
-            _DeviceForwardExecutor(
-                self.device.index if self.device.index is not None else 0
-            )
-            if os.environ.get("VLLM_RBLN_ASYNC_FORWARD") == "1"
-            else None
+        # all_reduce with forward (VLLM_RBLN_ASYNC_FORWARD=1). Created LAZILY on
+        # the first real (post-warmup) execute_model, NOT here: merely having
+        # the extra thread alive during warmup breaks the weight-free transform
+        # vmem (sampler crash) even when warmup runs inline. Deferring creation
+        # keeps warmup byte-identical to the non-async path.
+        self._async_forward: bool = (
+            os.environ.get("VLLM_RBLN_ASYNC_FORWARD") == "1"
         )
+        self._device_executor: _DeviceForwardExecutor | None = None
 
         self.max_batch_size = (
             self.scheduler_config.max_num_seqs
@@ -3668,7 +3668,11 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # executor thread while the sampler runs inline on the main thread
             # (RUN_INTERNAL vmem verify in _sample). Warmup must stay inline;
             # the executor is only for real decode steps (post-warmup overlap).
-            if self._device_executor is not None and not is_warmup_active():
+            if self._async_forward and not is_warmup_active():
+                if self._device_executor is None:
+                    self._device_executor = _DeviceForwardExecutor(
+                        self.device.index if self.device.index is not None else 0
+                    )
                 # C7 scaffold: submit the forward to the device thread but join
                 # immediately -- functionally identical to inline execution.
                 # Exercises the cross-thread submission plumbing before we
