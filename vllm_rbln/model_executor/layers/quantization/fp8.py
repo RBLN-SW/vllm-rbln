@@ -452,10 +452,10 @@ class Fp8LinearMethod(LinearMethodBase):
 
 
 @torch.library.custom_op(
-    "rbln_custom_ops::custom_moe_swiglu_group",
+    "rbln_custom_ops::custom_moe_glu_w8a8",
     mutates_args=(),
 )
-def custom_moe_swiglu_group(
+def custom_moe_glu_w8a8(
     hidden_states: torch.Tensor,
     hidden_states_scale: torch.Tensor,
     gate_proj_weight: torch.Tensor,
@@ -476,7 +476,7 @@ def custom_moe_swiglu_group(
     Customized MoE SwiGLU operation (W8A8 block-fp8) with pre-computed routing.
 
     Routing (softmax + topk) is done externally, exactly like
-    custom_moe_swiglu_group_dequantize; the only differences are the fp8 activation
+    custom_moe_glu_group_dequantize; the only differences are the fp8 activation
     plus its per-(token, K-block) scale, and the fp8 quantization of the swiglu
     intermediate before the down projection.
 
@@ -610,8 +610,8 @@ def custom_moe_swiglu_group(
     return final_hidden_states
 
 
-@custom_moe_swiglu_group.register_fake
-def custom_moe_swiglu_group_fake(
+@custom_moe_glu_w8a8.register_fake
+def custom_moe_glu_w8a8_fake(
     hidden_states: torch.Tensor,
     hidden_states_scale: torch.Tensor,
     gate_proj_weight: torch.Tensor,
@@ -1123,7 +1123,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             hidden_states_scale = scale.reshape(
                 hs_shape[0], hs_shape[1] // in_block_size
             )
-            final_hidden_states = torch.ops.rbln_custom_ops.custom_moe_swiglu_group(
+            final_hidden_states = torch.ops.rbln_custom_ops.custom_moe_glu_w8a8(
                 hidden_states,
                 hidden_states_scale,
                 gate_proj_weight,
@@ -1133,7 +1133,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 down_proj_weight,
                 down_proj_weight_scale,
                 # Routing (softmax + topk) done externally; arg order mirrors the
-                # custom_moe_swiglu_group_dequantize schema with the fp8 activation
+                # custom_moe_glu_group_dequantize schema with the fp8 activation
                 # scale inserted at index 1.
                 masked_routing_weights,
                 torch.tensor(self.weight_block_size[1], dtype=torch.int32),
