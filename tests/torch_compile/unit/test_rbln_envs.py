@@ -67,11 +67,6 @@ def test_rbln_envs():
         got {rbln_envs.VLLM_RBLN_ENFORCE_MODEL_FP32}"
     )
 
-    assert rbln_envs.VLLM_RBLN_DP_INPUT_ALL_GATHER, (
-        f"Expected VLLM_RBLN_DP_INPUT_ALL_GATHER to be True, \
-        got {rbln_envs.VLLM_RBLN_DP_INPUT_ALL_GATHER}"
-    )
-
     assert rbln_envs.VLLM_RBLN_LOGITS_ALL_GATHER, (
         f"Expected VLLM_RBLN_LOGITS_ALL_GATHER to be True, \
         got {rbln_envs.VLLM_RBLN_LOGITS_ALL_GATHER}"

@@ -761,8 +761,8 @@ class TestDetermineAvailableMemory:
         ):
             plat.get_device_name.return_value = "RBLN-CA25"
             worker.determine_available_memory()
-        # 1 + (1 + 1) * 2 = 5
-        assert est.call_args.kwargs["num_runtimes"] == 5
+        # 1 prefill + 2 normal decodes + 1 padded decode (max bucket only) = 4
+        assert est.call_args.kwargs["num_runtimes"] == 4
 
     def test_mixed_dtype_params(self):
         """bf16 params counted as attention, non-bf16 as experts."""
@@ -1243,19 +1243,16 @@ class TestShutdown:
         worker = _create_worker()
         worker.model_runner = MagicMock()
         worker.model_runner.performance_tracker = MagicMock()
-        worker.model_runner.sampler_performance_tracker = MagicMock()
         worker.model_runner.e2e_performance_tracker = MagicMock()
         with patch("vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_METRICS", True):
             worker.shutdown()
         worker.model_runner.performance_tracker.print_final_stats.assert_called_once()
-        worker.model_runner.sampler_performance_tracker.print_final_stats.assert_called_once()
         worker.model_runner.e2e_performance_tracker.print_final_stats.assert_called_once()
 
     def test_with_metrics_none_trackers(self):
         worker = _create_worker()
         worker.model_runner = MagicMock()
         worker.model_runner.performance_tracker = None
-        worker.model_runner.sampler_performance_tracker = None
         worker.model_runner.e2e_performance_tracker = None
         with patch("vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_METRICS", True):
             worker.shutdown()

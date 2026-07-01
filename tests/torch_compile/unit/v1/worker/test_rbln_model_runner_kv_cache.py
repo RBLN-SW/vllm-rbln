@@ -16,8 +16,7 @@
 
 Tests _add_dummy_requests, _make_dummy_scheduler_outputs,
 select_common_block_size, _prepare_kernel_block_sizes,
-_allocate_kv_cache_tensors, _process_kv_cache_copy_ops,
-and _propagate_runtime_holder.
+_allocate_kv_cache_tensors, and _process_kv_cache_copy_ops.
 """
 
 from unittest.mock import MagicMock, patch
@@ -511,93 +510,123 @@ class TestProcessKvCacheCopyOps:
 
 
 # ============================================================
-# _propagate_runtime_holder Tests
+# _select_canonical_kv_layers_per_pool Tests
 # ============================================================
+#
+# Pick one Full-preferred layer per HMA pool. `mark_static_address` is
+# last-write-wins on storage->name, and the NIXL connector uses the
+# chosen layer's view as its descriptor stride, so both need a single
+# canonical layer per pool with `cache.shape[0] == num_blocks` (logical).
 
 
-class _ConnectorWithHolder:
-    """Stub for an RBLN-aware connector exposing set_runtime_holder."""
+def _make_kv_cache_config(pools, layer_specs):
+    """Build a minimal KVCacheConfig-like object.
 
-    def __init__(self) -> None:
-        self.holder: list | None = None
+    `pools`: list of `shared_by` lists, one per HMA pool.
+    `layer_specs`: dict layer_name -> KVCacheSpec.
+    """
+    kv_cache_config = MagicMock()
+    kv_cache_config.kv_cache_tensors = [MagicMock(shared_by=pool) for pool in pools]
+    # Drive `_attn_group_iterator` via attn_groups[i][j].
+    # Each AttentionGroup needs `layer_names` and `kv_cache_spec`.
+    grouped: dict[int, dict] = {}
+    for layer_name, spec in layer_specs.items():
+        grouped.setdefault(id(spec), {"spec": spec, "layers": []})["layers"].append(
+            layer_name
+        )
+    attn_groups = [
+        [MagicMock(layer_names=g["layers"], kv_cache_spec=g["spec"])]
+        for g in grouped.values()
+    ]
+    return kv_cache_config, attn_groups
 
-    def set_runtime_holder(self, runtime_holder: list) -> None:
-        self.holder = runtime_holder
 
+class TestSelectCanonicalKvLayersPerPool:
+    """`_select_canonical_kv_layers_per_pool` picks one layer per HMA
+    pool, preferring Full-attention (whose view is at logical block
+    granularity)."""
 
-class _PlainConnector:
-    """Stub for a connector without set_runtime_holder (e.g. NIXL)."""
+    def _bind(self, attn_groups):
+        runner = object.__new__(RBLNModelRunner)
+        runner.attn_groups = attn_groups
+        # `_attn_group_iterator` is itertools.chain.from_iterable(attn_groups);
+        # bind it via the same class so the implementation under test is reached.
+        runner._attn_group_iterator = RBLNModelRunner._attn_group_iterator.__get__(
+            runner
+        )
+        runner._select_canonical_kv_layers_per_pool = (
+            RBLNModelRunner._select_canonical_kv_layers_per_pool.__get__(runner)
+        )
+        return runner
 
+    def test_prefers_full_attention_layer(self):
+        """A pool with both Full and SWA layers picks the Full one — its
+        view has `cache.shape[-2] == block_size` (logical)."""
+        from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
 
-class _MultiConnectorStub:
-    """Stub mimicking vLLM MultiConnector: has _connectors, no set_runtime_holder."""
+        full_spec = MagicMock(spec=FullAttentionSpec)
+        swa_spec = MagicMock(spec=SlidingWindowSpec)
+        kv_cache_config, attn_groups = _make_kv_cache_config(
+            pools=[["layer.swa", "layer.full"]],
+            layer_specs={"layer.full": full_spec, "layer.swa": swa_spec},
+        )
+        runner = self._bind(attn_groups)
 
-    def __init__(self, children: list[object]) -> None:
-        self._connectors = children
+        chosen = runner._select_canonical_kv_layers_per_pool(kv_cache_config)
 
+        assert chosen == {"layer.full"}
 
-class TestPropagateRuntimeHolder:
-    """Test _propagate_runtime_holder: walks MultiConnector children."""
+    def test_falls_back_to_first_layer_when_no_full(self):
+        """Pure-SWA pool (no Full layer) falls back to the first layer in
+        `shared_by`."""
+        from vllm.v1.kv_cache_interface import SlidingWindowSpec
 
-    def test_direct_connector_with_set_runtime_holder(self):
-        """Top-level connector that exposes the method receives the holder."""
-        connector = _ConnectorWithHolder()
-        holder = [object()]
+        swa_spec = MagicMock(spec=SlidingWindowSpec)
+        kv_cache_config, attn_groups = _make_kv_cache_config(
+            pools=[["layer.swa.0", "layer.swa.1"]],
+            layer_specs={"layer.swa.0": swa_spec, "layer.swa.1": swa_spec},
+        )
+        runner = self._bind(attn_groups)
 
-        RBLNModelRunner._propagate_runtime_holder(connector, holder)
+        chosen = runner._select_canonical_kv_layers_per_pool(kv_cache_config)
 
-        assert connector.holder is holder
+        assert chosen == {"layer.swa.0"}
 
-    def test_direct_connector_without_set_runtime_holder(self):
-        """Top-level connector without the method is silently skipped."""
-        connector = _PlainConnector()
-        holder = [object()]
+    def test_skips_pool_with_empty_shared_by(self):
+        """A pool whose `shared_by` is empty doesn't contribute a layer."""
+        from vllm.v1.kv_cache_interface import FullAttentionSpec
 
-        # Must not raise
-        RBLNModelRunner._propagate_runtime_holder(connector, holder)
+        full_spec = MagicMock(spec=FullAttentionSpec)
+        kv_cache_config, attn_groups = _make_kv_cache_config(
+            pools=[[], ["layer.full"]],
+            layer_specs={"layer.full": full_spec},
+        )
+        runner = self._bind(attn_groups)
 
-    def test_multi_connector_walks_children(self):
-        """MultiConnector itself lacks the method; children that have it get it."""
-        rbln_child = _ConnectorWithHolder()
-        nixl_child = _PlainConnector()
-        multi = _MultiConnectorStub([nixl_child, rbln_child])
-        holder = [object()]
+        chosen = runner._select_canonical_kv_layers_per_pool(kv_cache_config)
 
-        RBLNModelRunner._propagate_runtime_holder(multi, holder)
+        assert chosen == {"layer.full"}
 
-        assert rbln_child.holder is holder
+    def test_one_canonical_layer_per_pool(self):
+        """Multiple HMA pools, each Full+SWA — one Full per pool, no overlap."""
+        from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
 
-    def test_multi_connector_propagates_to_all_rbln_children(self):
-        """Every child with set_runtime_holder receives the same holder."""
-        child_a = _ConnectorWithHolder()
-        child_b = _ConnectorWithHolder()
-        multi = _MultiConnectorStub([child_a, child_b])
-        holder = [object()]
+        full_spec = MagicMock(spec=FullAttentionSpec)
+        swa_spec = MagicMock(spec=SlidingWindowSpec)
+        kv_cache_config, attn_groups = _make_kv_cache_config(
+            pools=[
+                ["pool0.swa", "pool0.full"],
+                ["pool1.swa", "pool1.full"],
+            ],
+            layer_specs={
+                "pool0.full": full_spec,
+                "pool0.swa": swa_spec,
+                "pool1.full": full_spec,
+                "pool1.swa": swa_spec,
+            },
+        )
+        runner = self._bind(attn_groups)
 
-        RBLNModelRunner._propagate_runtime_holder(multi, holder)
+        chosen = runner._select_canonical_kv_layers_per_pool(kv_cache_config)
 
-        assert child_a.holder is holder
-        assert child_b.holder is holder
-
-    def test_nested_multi_connector(self):
-        """Nested MultiConnectors are walked recursively."""
-        inner_child = _ConnectorWithHolder()
-        inner = _MultiConnectorStub([inner_child])
-        outer = _MultiConnectorStub([inner])
-        holder = [object()]
-
-        RBLNModelRunner._propagate_runtime_holder(outer, holder)
-
-        assert inner_child.holder is holder
-
-    def test_holder_reference_is_shared_not_copied(self):
-        """The list itself is passed (lazy runtime population relies on this)."""
-        connector = _ConnectorWithHolder()
-        holder: list = []
-
-        RBLNModelRunner._propagate_runtime_holder(connector, holder)
-
-        # Mutating the original list must be visible via the connector.
-        holder.append("rt")
-        assert connector.holder is holder
-        assert connector.holder[0] == "rt"
+        assert chosen == {"pool0.full", "pool1.full"}

@@ -15,27 +15,21 @@
 import time
 from typing import TYPE_CHECKING, Any
 
-import torch
-from rebel.kv_cache import aligned_tensor
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     BlockIds,
-    EngineId,
     yield_req_data,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
-    CopyBlocksOp,
-    KVConnectorBase_V1,
     KVConnectorMetadata,
-    KVConnectorRole,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
-    NixlConnector,
     NixlConnectorMetadata,
     NixlConnectorScheduler,
-    NixlConnectorWorker,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import ReqId
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+    ReqId,
+)
 from vllm.v1.core.sched.output import SchedulerOutput
 
 from vllm_rbln.logger import init_logger
@@ -45,31 +39,6 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
-
-
-class RblnNixlConnector(NixlConnector):
-    def __init__(
-        self,
-        vllm_config: VllmConfig,
-        role: KVConnectorRole,
-        kv_cache_config: "KVCacheConfig",
-    ) -> None:
-        KVConnectorBase_V1.__init__(self, vllm_config, role, kv_cache_config)
-        assert vllm_config.kv_transfer_config is not None
-        assert vllm_config.kv_transfer_config.engine_id is not None
-        self.kv_cache_config = kv_cache_config
-        self.engine_id: EngineId = vllm_config.kv_transfer_config.engine_id
-        self.kv_transfer_config = vllm_config.kv_transfer_config
-        if role == KVConnectorRole.SCHEDULER:
-            self.connector_scheduler: RblnNixlConnectorScheduler | None = (
-                RblnNixlConnectorScheduler(vllm_config, self.engine_id, kv_cache_config)
-            )
-            self.connector_worker: RblnNixlConnectorWorker | None = None
-        elif role == KVConnectorRole.WORKER:
-            self.connector_scheduler = None
-            self.connector_worker = RblnNixlConnectorWorker(
-                vllm_config, self.engine_id, kv_cache_config
-            )
 
 
 class RblnNixlConnectorScheduler(NixlConnectorScheduler):
@@ -90,7 +59,6 @@ class RblnNixlConnectorScheduler(NixlConnectorScheduler):
     ) -> KVConnectorMetadata:
         meta = NixlConnectorMetadata()
 
-        # Loop through scheduled reqs and convert to ReqMeta.
         for req_id, (req, block_ids) in self._reqs_need_recv.items():
             assert req.kv_transfer_params is not None
             meta.add_new_req_to_recv(
@@ -125,6 +93,7 @@ class RblnNixlConnectorScheduler(NixlConnectorScheduler):
                 is_partial = (
                     req.num_computed_tokens + num_scheduled_tokens
                 ) < req.num_prompt_tokens
+
                 if not is_partial:
                     new_block_id_groups = self._block_ids_need_save.pop(req_id)
                     clipped_block_id_groups = self.get_sw_clipped_blocks(
@@ -229,42 +198,3 @@ class RblnNixlConnectorScheduler(NixlConnectorScheduler):
             remote_port=self.side_channel_port,
             tp_size=self.vllm_config.parallel_config.tensor_parallel_size,
         )
-
-
-class RblnNixlConnectorWorker(NixlConnectorWorker):
-    """Implementation of Worker side methods"""
-
-    def __init__(
-        self, vllm_config: VllmConfig, engine_id: str, kv_cache_config: "KVCacheConfig"
-    ) -> None:
-        super().__init__(vllm_config, engine_id, kv_cache_config)
-
-        self.use_host_buffer = self.kv_buffer_device == "cpu"
-
-    def initialize_host_xfer_buffer(self, kv_caches: dict[str, torch.Tensor]) -> None:
-        """
-        Initialize transfer buffer in CPU mem for accelerators
-        NOT directly supported by NIXL (e.g., RBLN)
-        """
-        assert self.kv_cache_layout == "HND", (
-            "RBLN NIXL Connector only supports HND layout"
-        )
-        xfer_buffers: dict[str, torch.Tensor] = {}
-        try:
-            for layer_name, kv_cache in kv_caches.items():
-                xfer_buffers[layer_name] = aligned_tensor(kv_cache.numel()).reshape(
-                    kv_cache.shape
-                )
-        except MemoryError as e:
-            logger.error("RblnNixlConnectorWorker gets %s", e)
-            raise
-
-        self.host_xfer_buffers = xfer_buffers
-
-    def set_host_xfer_buffer_ops(self, copy_operation: CopyBlocksOp):
-        """Assign copy (d2h, h2d) operations when host buffer is used."""
-        # Set a no-op if the host buffer is not cpu.
-        if self.kv_buffer_device != "cpu":
-            return
-        assert self.use_host_buffer
-        self.copy_blocks = copy_operation
