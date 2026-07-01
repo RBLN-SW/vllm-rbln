@@ -123,3 +123,15 @@ exclusive box에서 `VLLM_RBLN_EAGEROUT_PROBE=1` 실행(프로브 dtype 버그 `
 3. **sampling_metadata 버퍼 재사용 race (1/16 mismatch)**: `_make_sampling_metadata`가 `temperature`/`top_k`/`top_p`를 persistent 버퍼의 슬라이스/`copy_`로 반환 → EM(N+1)이 in-place로 덮는데 device sample_task(N)가 동시에 읽음. GPU는 single-stream 순서로 안전, RBLN device 스레드는 아님. → enqueue 시점(main)에 metadata의 **모든 tensor 필드를 `.clone()`**(`dataclasses.replace`)해 device sampler가 private 버퍼를 읽게. **token 0,1은 맞고 2부터 발산**했던 게 실제 overlap 시작 시점과 일치 → race 확증.
 
 **남은 것(C10)**: full-layer `--profile`로 `gloo:all_reduce ∩ forward`(rebel/sync_run) > 0 정량 + cadence(c10d start-to-start) 감소 확인. 6-layer 정합성은 끝났고, overlap **정량**만 남음.
+
+### 2026-07-01 overlap 정량 시도 — deferral engage 확인 + full-layer는 toolchain 블로커(async 무관)
+- **deferral engage 확인**: 실제 decode(warmup=False)에서 `C9_DIAG ... fast_defer=True` (전 rank). 즉 C9b 경로가 실제로 탄다. 정합성 0 mismatch와 합쳐 **기능적으로 정확·활성**.
+- **6-layer overlap = 0.0% (측정 부적합, 실패 아님)**: trace(`profile/rbln_*_dp{r}/*.pt.trace.json.gz`)에서 `gloo:all_reduce ∩ rebel/sync_run` = 0. 이유는 6-layer forward가 **~1.35ms**로 메인 스레드의 host prep(EM(N+1)의 _update_states+_prepare_inputs)보다 짧아 **overlap 창 자체가 없음**. 원 report가 full-layer에서만 측정한 이유. (또 trace상 forward가 메인 tid에 붙어 나오는 kineto attribution 관찰 — full-layer면 forward가 지배적이라 명확해질 것.)
+- **profiler 활성화 방법(중요)**: 이 vllm-executor(dev) 버전은 `VLLM_TORCH_PROFILER_DIR`를 config로 안 읽어 `llm.start_profile()`이 "Profiler is not enabled"로 죽는다. parity_runner에 `--profile`일 때 `llm_args["profiler_config"]=ProfilerConfig(profiler="torch", torch_profiler_dir=...)` 주입 패치 필요(vllm_rbln이 dir을 per-rank `profile/rbln_*_dp{r}`로 재작성). **이 패치는 vllm-executor working tree에만 있고 미커밋**(harness repo).
+- **full-layer 블로커(async·C9 완전 무관 — 격리 증명 완료)**: `--num-hidden-layers` 빼면 warmup forward(`sync_runtime.py:268 run`, `_execute_dummy_requests→execute_model→_run_forward`)가 device에서 **`(System) code=504 SYS_TASK_ABORTED ... WaitForCompletion, seq=1815`**로 죽는다(처음 1회는 502 SYS_BUSY였으나 이후 일관되게 504). **매번 동일한 device job seq=1815**에서 abort. 격리 테스트 3종 전부 동일 재현:
+  1. 내 branch + `ASYNC_FORWARD=1` → seq=1815 abort
+  2. 내 branch + `DISABLE_ASYNC=1`(sync) → seq=1815 abort
+  3. **plain `dev` vllm-rbln(async 커밋 0개) + sync → seq=1815 abort**
+  → async / C9 / C8 / profiler 전부 배제. **full-layer gpt-oss forward 컴파일 그래프가 이 로컬 환경에서 실행 불가**. `--profile` 유무와도 무관(6-layer는 profile 포함 정상). DP collective라 seq=1815에서 전 rank 동시 abort(로그상 "first rank"는 순서일 뿐).
+  - **원인 후보**: 로컬 **rebel `dev519`(b5d77d38)** vs CI가 PASS하는 **`dev508`(452723e9)** — 11 커밋 차 regression 가능성. CI(obedients `schedule-rebel-rebel-compiler-ci` build 36, job gpt-oss-120b-ep-dp4-b1-mml131072-bks1024)는 **정확히 같은 MODEL_CMD로 PASS**(THRESHOLD 0.99, `run-model-test.sh`, docker image, 8-NPU udc-08). 즉 config·모델은 정상, 로컬 toolchain/box 문제.
+- **다음 액션(overlap 정량)**: full-layer가 되는 환경 필요 — (a) rebel을 CI의 dev508로 맞추거나, (b) CI 환경/8-NPU 박스에서 실행. 그 뒤 `--profile`(parity_runner ProfilerConfig 주입 패치 필요, 위) + `scratchpad/overlap_quant.py`로 `gloo∩forward` 정량. **deferral engage·6-layer 정합성은 이미 확인**됐으니 남은 건 full-layer overlap 수치뿐이고, 그 블로커는 async와 무관한 toolchain 이슈.
