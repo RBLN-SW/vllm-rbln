@@ -99,7 +99,7 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
     SamplerOutput,
 )
-from vllm.v1.sample.logits_processor import build_logitsprocs
+from vllm.v1.sample.logits_processor import MoveDirectionality, build_logitsprocs
 from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
@@ -151,7 +151,11 @@ from vllm_rbln.v1.worker.metrics import (
     StepReport,
     collect_metrics,
 )
-from vllm_rbln.v1.worker.utils import compute_slot_mapping_cpu, get_kv_cache_names
+from vllm_rbln.v1.worker.utils import (
+    compute_slot_mapping_cpu,
+    get_kv_cache_names,
+    reorder_input_batch,
+)
 
 if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
@@ -718,43 +722,48 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         return model_kwargs
 
     def _may_reorder_batch(self, scheduler_output: SchedulerOutput) -> None:
+        """Sort the persistent batch by descending ``num_tokens_no_spec`` so the
+        RBLN attention backend sees a length-ordered batch. Override of the
+        upstream (MLA-oriented) hook; gated by ``VLLM_RBLN_SORT_BATCH``.
         """
-        Update the order of requests in the batch based on the attention
-        backend's needs. For example, some attention backends (namely MLA) may
-        want to separate requests based on if the attention computation will be
-        compute-bound or memory-bound.
-
-        Args:
-            scheduler_output: The scheduler output.
-        """
-        # Attention free models have zero kv_cache_goups, however models
-        # like Mamba are also attention free but use the kv_cache for
-        # keeping its internal state. This is why we check the number
-        # of kv_cache groups instead of solely checking
-        # for self.model_config.is_attention_free.
         if not envs.VLLM_RBLN_SORT_BATCH:
             return
+        # Zero kv_cache_groups == attention-free model; nothing to order for.
         if len(self.kv_cache_config.kv_cache_groups) == 0:
             return
 
-        orig_indices = np.arange(len(self.input_batch.req_ids))
-        sorted_order = np.argsort(
-            self.input_batch.num_tokens_no_spec[orig_indices] * (-1), kind="stable"
-        )
+        ib = self.input_batch
+        n = len(ib.req_ids)
+        toks = ib.num_tokens_no_spec[:n]
+
+        # The batch is reordered in place every step, so in steady-state decode
+        # it is already sorted and a stable argsort would be identity; skip via
+        # an O(n) non-increasing check.
+        if n <= 1 or bool(np.all(toks[:-1] >= toks[1:])):
+            return
+
+        orig_indices = np.arange(n)
+        sorted_order = np.argsort(toks * (-1), kind="stable")
         src_indices = orig_indices[sorted_order]
         src_dest_map = {
             int(src): int(dst)
             for src, dst in zip(src_indices, orig_indices, strict=False)
         }
 
-        for src in src_dest_map:
-            dst = src_dest_map[src]
-            while src != dst:
-                self.input_batch.swap_states(src, dst)
-                # Mark dst as done by updating its destination to itself
-                next_dst = src_dest_map.get(dst, dst)
-                src_dest_map[dst] = dst
-                dst = next_dst
+        # Emit the pairwise-swap records logits processors replay to realign
+        # their per-request state (only for non-pooling models, matching
+        # swap_states), then apply the permutation in one pass.
+        if not ib.is_pooling_model:
+            moved = ib.batch_update_builder.moved
+            for src in src_dest_map:
+                dst = src_dest_map[src]
+                while src != dst:
+                    moved.append((src, dst, MoveDirectionality.SWAP))
+                    next_dst = src_dest_map.get(dst, dst)
+                    src_dest_map[dst] = dst
+                    dst = next_dst
+
+        reorder_input_batch(ib, sorted_order)
 
     # Note: used for model runner override.
     def _init_device_properties(self) -> None:
