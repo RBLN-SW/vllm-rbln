@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-
 import torch
 import vllm.model_executor.layers.quantization.fp8 as upstream
 import vllm_rbln.rbln_envs as envs
@@ -260,14 +258,6 @@ class Fp8LinearMethod(LinearMethodBase):
                 weight_group_shape=GroupShape(*self.weight_block_size),
                 act_quant_group_shape=self.act_q_group_shape,
             )
-            # Ablation hook: an always-W8A16 op so specific layers (e.g. QKV) can
-            # run fp8-weight x fp16-activation (no activation quant) even when the
-            # global flag selects W8A8 -- used to localize where the fp8 error
-            # comes from. Routed per-layer in apply() via VLLM_RBLN_QKV_W8A16.
-            self.w8a16_block_fp8_linear = RBLNW8A16BlockFp8LinearOp(
-                weight_group_shape=GroupShape(*self.weight_block_size),
-                act_quant_group_shape=self.act_q_group_shape,
-            )
         # NOTE(RBLN): the non-block (per-tensor/channel) path dequantizes to
         # BF16 in apply() and runs a plain GEMM, so no scaled-mm kernel is
         # built here. upstream's init_fp8_linear_kernel cannot be used on RBLN
@@ -429,15 +419,7 @@ class Fp8LinearMethod(LinearMethodBase):
         # (fp8 -> dequantize bf16 -> bf16 torch.nn.functional.linear).
         if self.block_quant:
             assert self.weight_block_size is not None
-            block_op = self.w8a8_block_fp8_linear
-            # Ablation: force QKV projections to W8A16 (fp8 weight x fp16
-            # activation, no activation quant) to isolate where the fp8
-            # error comes from. Opt-in via VLLM_RBLN_QKV_W8A16=1.
-            if os.environ.get("VLLM_RBLN_QKV_W8A16", "0") == "1" and getattr(
-                layer, "prefix", ""
-            ).endswith("qkv_proj"):
-                block_op = self.w8a16_block_fp8_linear
-            return block_op.apply(
+            return self.w8a8_block_fp8_linear.apply(
                 input=x,
                 weight=layer.weight,
                 weight_scale=layer.weight_scale,
