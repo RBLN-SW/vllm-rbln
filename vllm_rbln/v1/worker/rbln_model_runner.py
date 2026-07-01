@@ -3470,6 +3470,37 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             if positions.device.type == "cpu":
                 positions = positions.to(self.device, non_blocking=True)
 
+            # Async-scheduling token feedback on the device-tensor path.
+            # The optimistic scheduler appends a PLACEHOLDER token per decode
+            # request (the real sampled token isn't known at schedule time), so
+            # input_ids (built from input_ids.cpu) holds placeholders at the
+            # decode positions. _prepare_input_ids scatters the on-device
+            # prev_sampled_token_ids into input_ids.gpu, but device-tensor mode
+            # consumes input_ids.cpu -> that feedback is lost. Re-apply it here,
+            # directly on the on-device input_ids the model actually runs, so the
+            # previous step's token replaces the placeholder. Stays on-device (no
+            # host sync) so forward(N) still overlaps all_reduce(N+1).
+            # Decode-only fast path: one query token per request; falls back
+            # (leaves placeholders) for prefill / mixed / new-request batches.
+            if (
+                envs.VLLM_RBLN_USE_DEVICE_TENSOR
+                and self.use_async_scheduling
+                and input_ids is not None
+                and not is_prefill_phase
+                and self.input_batch.prev_sampled_token_ids is not None
+            ):
+                prev = self.input_batch.prev_sampled_token_ids
+                prev_map = self.input_batch.prev_req_id_to_index
+                req_ids = self.input_batch.req_ids
+                if prev_map is not None and all(r in prev_map for r in req_ids):
+                    perm = torch.tensor(
+                        [prev_map[r] for r in req_ids],
+                        dtype=torch.long,
+                        device=input_ids.device,
+                    )
+                    n = len(req_ids)
+                    input_ids[:n, 0] = prev[perm, 0].to(input_ids.dtype)
+
             if self.lora_config is not None:
                 lora_ids = [
                     self.requests[req_id].lora_request.lora_int_id
