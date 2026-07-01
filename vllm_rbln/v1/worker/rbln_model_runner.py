@@ -2179,6 +2179,43 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         else:
             # use a dummy context manager that does nothing
             capture_ctx = contextlib.nullcontext()
+        # C9 de-risk probe (VLLM_RBLN_EAGEROUT_PROBE=1, default off): does rebel's
+        # eager_out (set_out_tensor) let us pre-allocate the sampler's
+        # sampled_token_ids so the main thread holds the handle before the device
+        # runs? This is the crux of deferring the sampler to the device thread
+        # while keeping bookkeeping on the main thread (path (a)). Logs whether
+        # the returned tensor aliases the pre-allocated one.
+        _eagerout_probe = (
+            os.environ.get("VLLM_RBLN_EAGEROUT_PROBE") == "1"
+            and spec_decode_metadata is None
+            and logits is not None
+        )
+        if _eagerout_probe:
+            from rebel.core.torch_eager import eager_execution_helper
+
+            _pre = torch.empty(
+                (logits.shape[0], 1), dtype=torch.int32, device=logits.device
+            )
+            _helper = eager_execution_helper()
+            _helper.set_out_tensor([_pre])
+            try:
+                with capture_ctx as sampler_reports:
+                    sampler_output = self.sampler(
+                        logits=logits,
+                        sampling_metadata=sampling_metadata,
+                    )
+            finally:
+                _helper.clear_out_tensor()
+            _sid = sampler_output.sampled_token_ids
+            logger.info(
+                "EAGEROUT_PROBE alias=%s pre_shape=%s sampled_shape=%s "
+                "sampled_dtype=%s",
+                _sid.data_ptr() == _pre.data_ptr(),
+                tuple(_pre.shape),
+                tuple(_sid.shape),
+                _sid.dtype,
+            )
+            return sampler_output
         sampler_start_time = time.perf_counter()
         with capture_ctx as sampler_reports:
             if spec_decode_metadata is None:
