@@ -124,6 +124,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ENV_METADATA check failed in {args.path}:", file=sys.stderr)
         for err in errors:
             print(f"  - {err}", file=sys.stderr)
+        print(
+            "\nEvery VLLM_RBLN_* entry in `environment_variables` needs a matching "
+            "`ENV_METADATA` entry (and vice versa) with a non-empty description.\n"
+            "Fix `vllm_rbln/rbln_envs.py` following the "
+            '"Adding an Environment Variable" section in CONTRIBUTING.md.',
+            file=sys.stderr,
+        )
         return 1
     return 0
 
