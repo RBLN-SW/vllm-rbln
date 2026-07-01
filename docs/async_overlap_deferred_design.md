@@ -82,3 +82,26 @@ exclusive box에서 `VLLM_RBLN_EAGEROUT_PROBE=1` 실행(프로브 dtype 버그 `
 - **(가′) 수정된 (가)**: sampler를 고쳐 최종 int32 (B,1) 출력을 **메인이 pre-alloc한 버퍼에 쓰게** 한다 — 예: `forward()`의 `.to(int32)`를 `torch.empty((B,1),int32)` pre-alloc + `copy_`/`out=`로 대체하고 그 버퍼를 eager_out/handshake로 메인이 선확보. sampler에 침습적이나 (나)보다 race 표면이 작음.
 - **(나)** bookkeeping을 device 스레드로 + input_batch 동시성 처리(스냅샷/lock). 침습적·위험하나 sampler 안 건드림.
 - 권장: **(가′) 우선 조사** — `.to(int32)` 한 곳만 pre-alloc 버퍼로 돌리면 되는지 PoC. 막히면 (나).
+
+## C9 (가′) 구현 계획 — 코드 정독으로 확정한 상세 (2026-07-01)
+
+### 결정적 단순화 (fast path에서 확인)
+- **decode fast path**(=`not is_prefill` ∧ `speculative_config is None` ∧ `VLLM_RBLN_USE_DEVICE_TENSOR` ∧ no-LoRA(`use_wrapped_compute_logits()==True`) ∧ PP world_size==1 ∧ no-grammar)에서는:
+  - `logits`가 `model_output`에서 **그대로** 나온다 — compute_logits는 wrapped(모델 내부), decode/no-spec/device_tensor 분기(rbln_model_runner.py:3950-3964)는 **slicing 없음**. 즉 execute_model의 post-forward tail(3869-3990)이 fast path에선 사실상 **unpack뿐**.
+  - `_bookkeeping_sync`의 async 분기(3199-3244)는 **값이 아니라 핸들만** 필요: `prev_sampled_token_ids = sampled_token_ids`(D2H 없음), `sampled_ids=[-1]` placeholder로 host bookkeeping. `_get_nans_in_logits`는 기본 off, `_get_prompt_logprobs_dict`는 decode에서 no-op. → **메인 스레드가 device 대기 없이 bookkeeping 가능**(핸들만 있으면).
+
+### (가′)의 실제 메커니즘 = copy_ into 메인-pre-alloc 버퍼 (eager_out 아님)
+- eager_out은 컴파일 op 출력만 잡고 `.to(int32)` 뒤 최종 핸들은 못 잡음(alias=False, 위). 그래서 (가′)은 eager_out 대신:
+  - 메인: `out_buf = torch.empty((num_reqs,1), int32, device=rbln)` 로 **핸들 선확보**(device alloc만, compute 없음). `prev_sampled_token_ids = out_buf` 로 bookkeeping은 이 핸들 사용.
+  - device 스레드(sample_task): sampler 실행 → 최종 `sampled (B,1) int32` → `out_buf.copy_(sampled)`(in-place, device op). copy_는 값을 나중에 채우지만 **핸들은 불변** → 메인은 안 기다림.
+
+### 2-커밋 분할 (각 6-layer A/B 0 mismatch 검증)
+- **C9a (plumbing, overlap 0 — 격리 검증)**: fast path에서 execute_model이 forward closure를 device executor에 submit하되 **join 안 함**, future를 ExecuteModelState에 stash, `return None`. `sample_tokens` 시작부에서 `future.result()`로 model_output 받아 기존 흐름 그대로. → "logits가 device-thread closure 경유 + future 핸드오프"가 정합성 유지하는지만 검증(타이밍 이득 없음, worker 순서상 join이 ST(N) 안에서 일어나 all_reduce(N+1) 전).
+  - **주의(반드시)**: forward를 감싸는 컨텍스트를 closure 안으로. `set_forward_context`+`capture_ctx`는 이미 `_run_forward` 안(C8). 하지만 **`maybe_get_kv_connector_output`(:3678)이 forward를 밖에서 감싼다** — defer 시 이 `with`가 forward(async) 전에 exit. fast path에선 KV connector no-op이라 무해할 **가능성**이나, closure 안으로 옮기거나 no-op임을 명시 검증할 것. `self.kv_connector_output` 대입/`_pending_model_report`(reports 처리)도 join 후 sample_tokens에서 재현.
+- **C9b (overlap 개방)**: `sample_tokens`가 (1) `out_buf` 메인 pre-alloc, (2) sample_task=[fwd_future.result()→_sample→out_buf.copy_(sampled)]를 **동일 device executor에 enqueue(FIFO)**, (3) 메인은 out_buf 핸들로 bookkeeping(no-wait) + `prev_sampled_token_ids=out_buf`, (4) `AsyncRBLNModelRunnerOutput`이 sample_task future를 join 후 out_buf D2H. execute_model은 forward만 submit하고 **return None**(join 제거) → 메인이 EM(N+1) host prep+all_reduce를 fwd(N)/sample(N)와 동시 실행.
+  - FIFO 보장: fwd(N)→sample(N)→fwd(N+1). 토큰 피드백(N+1)은 fwd_task(N+1) 안에서 `prev_sampled_token_ids(N)=out_buf(N)`를 읽고, sample(N)이 이미 채움. **토큰 피드백을 fwd_task 안(device)으로 이동** 필수(현재 execute_model 메인 3723-3740).
+  - **out_buf 수명**: step마다 새 `out_buf`(N+1이 N을 덮어쓰지 않게). AsyncOutput이 N의 out_buf 참조 보유 → get_output까지 생존.
+- **C10**: full-layer `--profile`로 `gloo:all_reduce ∩ forward` > 0 정량.
+
+### 스코프/폴백
+- 위 fast-path 조건 하나라도 불충족(prefill/mixed/spec/grammar/LoRA/PP) → **C7 즉시-join 경로로 fallback**(현행 `submit(...).result()`). 게이트는 execute_model 진입부 조건 + sample_tokens의 grammar_output 체크.
