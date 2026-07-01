@@ -115,3 +115,11 @@ exclusive box에서 `VLLM_RBLN_EAGEROUT_PROBE=1` 실행(프로브 dtype 버그 `
 3. **토큰 피드백을 fwd_task 안(device)로 이동**: 현재 execute_model 메인(3711-3740)에서 `prev_sampled_token_ids`를 input_ids에 scatter. overlap 시 fwd(N+1) 피드백은 sample(N)이 채운 prev(N)을 읽어야 하는데, 메인 EM(N+1)에 있으면 sample(N) **완료 전**에 실행돼 stale. FIFO상 fwd_task(N+1) 안에 두면 sample(N) 뒤라 안전. 피드백이 읽는 host 상태(prev_req_id_to_index, req_ids, perm)도 enqueue 스냅샷.
 
 **out_buf 수명/더블버퍼**: step마다 새 `out_buf=(num_reqs,1)int32`. `AsyncRBLNModelRunnerOutput`이 out_buf 참조 보유 → get_output(sample_task future join 후 D2H)까지 생존. N+1이 N을 덮지 않음.
+
+### C9b 착지(커밋 `d55098b`) — 정합성 검증 완료(16 prompts 0 mismatch)
+위 3난관 전부 구현·검증. 구현 중 드러난 **동시성 버그 3개**(각 A/B로 확인):
+1. **inplace on inference tensor (thread-local)**: `execute_model`/`sample_tokens`는 `@inference_mode`지만 thread-local이라 device 스레드/`async_output_busy_loop` 스레드엔 안 걸림. main에서 만든 inference tensor(out_buf, `_sampled_token_ids_cpu`)에 그 스레드들이 inplace(`copy_`, token-feedback scatter)하면 금지됨. → `_DeviceForwardExecutor._run`이 각 task를 `torch.inference_mode()`로 감싸고, `get_output`의 D2H도 감쌈.
+2. **SYS_ENODEV (좀비)**: 크래시한 run이 device 메모리를 안 풀어 다음 run이 device 등록 실패. 코드 아님 — 크래시 후 반드시 내 `python3`/`VLLM::` 프로세스 kill + `/dev/shm` 정리.
+3. **sampling_metadata 버퍼 재사용 race (1/16 mismatch)**: `_make_sampling_metadata`가 `temperature`/`top_k`/`top_p`를 persistent 버퍼의 슬라이스/`copy_`로 반환 → EM(N+1)이 in-place로 덮는데 device sample_task(N)가 동시에 읽음. GPU는 single-stream 순서로 안전, RBLN device 스레드는 아님. → enqueue 시점(main)에 metadata의 **모든 tensor 필드를 `.clone()`**(`dataclasses.replace`)해 device sampler가 private 버퍼를 읽게. **token 0,1은 맞고 2부터 발산**했던 게 실제 overlap 시작 시점과 일치 → race 확증.
+
+**남은 것(C10)**: full-layer `--profile`로 `gloo:all_reduce ∩ forward`(rebel/sync_run) > 0 정량 + cadence(c10d start-to-start) 감소 확인. 6-layer 정합성은 끝났고, overlap **정량**만 남음.

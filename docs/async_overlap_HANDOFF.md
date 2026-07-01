@@ -29,8 +29,10 @@ gpt-oss-120b EP+DP4, device-tensor 경로에서 매 decode step 도는 DP `gloo:
 | `4a5e961` | fix: **warmup 중 executor 우회**(`is_warmup_active` 게이트) | ✅ 검증됨 |
 | `9561d02` | fix: device-forward executor **lazy 생성**(post-warmup) | ✅ 검증됨 |
 | `b9ce798` | fix: **probe pre-alloc dtype**(int32 (B,1)→int64 (B,)) — argmax op에 맞춤 | ✅ (프로브 crash 해소) |
+| `96acef3` | feat: **C9a** forward deferral (fast path, join in sample_tokens) | ✅ 6-layer 0 mismatch |
+| `d55098b` | feat: **C9b** sampler를 device 스레드로 → all_reduce↔forward overlap | ✅ 6-layer 0 mismatch |
 
-**정합성·vmem fix 모두 검증 완료**(0 mismatch). 남은 건 실제 overlap = **C9(deferral)**.
+**정합성·vmem fix·C9 deferral 모두 검증 완료**(전부 0 mismatch). 남은 건 **overlap 정량**(full-layer `--profile`, C10) 뿐 — deferred_design.md 하단 참조.
 
 > **✅ 최신 상태(2026-07-01, exclusive box에서 실측 완료)**: 아래 세 가지 전부 확인됨 —
 > 1. **vmem fix 3단계 검증**: `VLLM_RBLN_ASYNC_FORWARD=1`(프로브 없이)로 warmup+generation 완주, `verify.cc:77` 크래시 없음. → `8cd86dd`+`4a5e961`+`9561d02` 유효.
