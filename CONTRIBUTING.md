@@ -131,9 +131,11 @@ choices = set(ENV_METADATA["VLLM_RBLN_MY_MODE"].choices)  # in the getter
 **What happens automatically:** the pre-commit hook `check-env-metadata` fails on
 a missing/orphan entry or empty description; the docs env var page regenerates
 from `ENV_METADATA` on every build (never edit it by hand); and mentioning
-another `VLLM_RBLN_*` variable in a description auto-links to it. To add a new
-docs **category**, also list it in `_CATEGORY_ORDER` / `_CATEGORY_INTRO` in
-`docs/gen_env_vars.py`.
+another `VLLM_RBLN_*` variable in a description auto-links to it. A new
+`category` string renders automatically (appended after the known ones, no
+intro line) — you only touch `_CATEGORY_ORDER` / `_CATEGORY_INTRO` in
+`docs/gen_env_vars.py` if you want a specific position or a one-line
+description for it.
 
 Before pushing: `pre-commit run check-env-metadata --all-files` passes and
 `mkdocs build` shows the variable.
