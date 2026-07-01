@@ -116,11 +116,20 @@ PY
 | `VLLM_RBLN_GIL_PROBE=1` | forward 중 GIL 여유 측정(디버그). |
 | `VLLM_RBLN_EAGEROUT_PROBE=1` | sampler 출력 eager_out pre-alloc alias 확인(C9 de-risk). |
 
-## 5. 환경 경합 교훈 (반드시 숙지)
-- 이 박스류는 **공유**. **동시에 두 DP4/EP 잡 불가** — 두 번째의 RCCL init이 `[Rccl] fail rcclCommInitRank ret=-12`로 죽음(collective 배타 자원). 남이 DP4/EP 돌리면 **어느 device 잡아도 무의미** → 박스 exclusive 대기 필요.
-- device 0은 heavy-use라 잔여 상태가 weight-free transform `vmem_size ... verify.cc:77`를 깨기도. free window도 모델로드~register ~12s 사이 `SYS_ENODEV` TOCTOU로 뺏길 수 있음.
-- 내 좀비/leak 정리: `kill -9` 내 `VLLM::` 프로세스만(프로세스 타이틀이 `VLLM::`라 `pkill -f` 안 잡힘), `find /dev/shm -maxdepth 1 -user $USER -delete`. 남의 프로세스는 절대 건드리지 말 것.
-- **다른 서버로 옮기는 이유가 이 경합** — 새 박스는 exclusive면 STEP 1~4 그대로 진행 가능.
+## 5. 이미 잡은 실제 코드 버그 + 환경 경합 (반드시 숙지)
+
+### (해결됨) C7 executor 스레드 device context 버그 → vmem 실패
+- 증상: `VLLM_RBLN_ASYNC_FORWARD=1` 일 때 init/warmup 에서 `RUN_INTERNAL (vmem_size >= transform.op_replay()[0].src_elem_count()... verify.cc:77)` / `register device ID: 0`.
+- bisect 로 확정: plain·OPTIMISTIC-only 는 정상 generation, **ASYNC_FORWARD(=`_DeviceForwardExecutor`)만** vmem 실패 → **내 코드 버그**(환경 아님, device 번호 무관).
+- 원인: executor **스레드가 rbln device context 를 안 물려받아** device 0 으로 폴백 → weight-free transform vmem 을 엉뚱한 device 에 할당.
+- 수정(커밋됨): `_DeviceForwardExecutor._run` 에서 **첫 task 실행 시 lazy 하게** `torch.rbln.set_device(worker_device_index)` 호출. (스레드 생성 시점엔 device 미등록이라 `SYS_ENODEV` → lazy 필수. `current_platform.set_device` 는 RBLN no-op 이라 `torch.rbln` API 직접 사용.) vLLM `async_output_busy_loop`(multiproc_executor.py:929-938)가 같은 이유로 스레드에 set_device 하는 것과 동일 패턴.
+- **교훈: device 스레드에서 device 작업 하려면 반드시 그 스레드에 device context 설정.** C9 에서 sampler/bookkeeping 을 device 스레드로 옮길 때도 동일하게 필요. (검증은 exclusive box 대기 중이었음 — 새 박스에서 STEP 2 로 확인.)
+
+### 환경 경합
+- 이 박스류는 **공유**. **동시에 두 DP4/EP 잡 불가** — 두 번째의 RCCL init 이 `[Rccl] fail rcclCommInitRank ret=-12`(collective 배타 자원). 남이 DP4/EP 돌리면 어느 device 잡아도 무의미 → **박스 exclusive 필요**(그래서 서버 이주).
+- free window 도 모델로드~register ~12s 사이 `SYS_ENODEV` TOCTOU 로 뺏길 수 있음. `ps -eo user,args|grep VLLM::` 로 남의 잡 0 확인 후 실행.
+- 내 좀비/leak 정리: `kill -9` **내** `VLLM::` 프로세스만(`pkill -f` 는 `VLLM::` 타이틀 못 잡음), `find /dev/shm -maxdepth 1 -user $USER -delete`. 남의 프로세스 절대 금지.
+- offload 캐시(`~/.cache/rbln_cache/offload`) 오염은 vmem 원인 **아님**(지워도 재발했음). 위 device-context 가 진짜 원인이었다.
 
 ## 6. 요약: fresh agent 체크리스트
 1. `git checkout async-overlap-prototype` (vllm-rbln), editable install 확인.
