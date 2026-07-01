@@ -44,11 +44,7 @@ dependencies = [
     "torchvision",
     "torchaudio",
     "torchcodec",
-<<<<<<< auto-update-optimum-rbln-0.11.1a1
     "optimum-rbln>=0.11.1a1",
-=======
-    "optimum-rbln>=0.11.1a0",
->>>>>>> dev
 ]
 
 [project.optional-dependencies]
