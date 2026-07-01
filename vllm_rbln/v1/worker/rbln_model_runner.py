@@ -170,7 +170,8 @@ class _DeviceForwardExecutor:
     RBLNModelRunner.execute_model.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, device_index: int) -> None:
+        self._device_index = device_index
         self._q: queue.Queue = queue.Queue()
         self._thread = threading.Thread(
             target=self._run, name="rbln-device-forward", daemon=True
@@ -178,11 +179,23 @@ class _DeviceForwardExecutor:
         self._thread.start()
 
     def _run(self) -> None:
+        device_set = False
         while True:
             item = self._q.get()
             if item is None:
                 return
             fn, fut = item
+            # A new thread does NOT inherit the main thread's rbln device
+            # context; without this it defaults to device 0, so device work here
+            # (e.g. the weight-free transform vmem alloc) targets the wrong
+            # device and fails (RUN_INTERNAL vmem verify / register device 0).
+            # Set it lazily on the first task -- doing it at thread creation is
+            # too early (device not registered yet -> SYS_ENODEV). By the first
+            # execute_model the device is up. (current_platform.set_device is a
+            # no-op on RBLN, so use the torch.rbln API directly.)
+            if not device_set:
+                torch.rbln.set_device(self._device_index)
+                device_set = True
             if not fut.set_running_or_notify_cancel():
                 continue
             try:
@@ -602,7 +615,9 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # all_reduce with forward (VLLM_RBLN_ASYNC_FORWARD=1). None => run the
         # forward inline on the worker thread, as before.
         self._device_executor: _DeviceForwardExecutor | None = (
-            _DeviceForwardExecutor()
+            _DeviceForwardExecutor(
+                self.device.index if self.device.index is not None else 0
+            )
             if os.environ.get("VLLM_RBLN_ASYNC_FORWARD") == "1"
             else None
         )
