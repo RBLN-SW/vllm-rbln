@@ -80,6 +80,7 @@ _CATEGORY_ORDER = [
     "Parallelism (TP / DP / Ray)",
     "Mixture of Experts (MoE)",
     "Device tensors & memory",
+    "KV transfer (NIXL)",
     "Observability",
     "Miscellaneous",
 ]
@@ -102,6 +103,7 @@ _CATEGORY_INTRO = {
     "strategies for MoE models.",
     "Device tensors & memory": "On-device tensor mode, offloading, prefix "
     "caching, and port allocation.",
+    "KV transfer (NIXL)": "Disaggregated KV-cache transfer over the NIXL connector.",
     "Observability": "Performance metrics and profiling.",
     "Miscellaneous": "Other runtime toggles.",
 }
