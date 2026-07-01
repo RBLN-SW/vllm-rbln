@@ -105,3 +105,13 @@ exclusive box에서 `VLLM_RBLN_EAGEROUT_PROBE=1` 실행(프로브 dtype 버그 `
 
 ### 스코프/폴백
 - 위 fast-path 조건 하나라도 불충족(prefill/mixed/spec/grammar/LoRA/PP) → **C7 즉시-join 경로로 fallback**(현행 `submit(...).result()`). 게이트는 execute_model 진입부 조건 + sample_tokens의 grammar_output 체크.
+
+### C9a 착지(커밋 `96acef3`) + C9b의 남은 난관 (코드 정독으로 확정, 2026-07-01)
+**C9a 완료·검증**(16 prompts 0 mismatch): execute_model이 fast path에서 forward를 submit만 하고 future stash+return None, sample_tokens 시작부에서 `fwd_future.result()`로 unpack. overlap은 아직 0(join이 ST(N) 안, EM(N+1) 전). gate: `_async_forward ∧ ¬warmup ∧ decode ∧ spec None ∧ async_sched ∧ device_tensor ∧ no-LoRA ∧ ¬has_kv_transfer_group ∧ pp==1 ∧ ¬pooling`.
+
+**C9b(overlap 개방)에서 반드시 풀 것 — 셋 다 코드로 확인됨**:
+1. **bookkeeping이 device 값 참조 회피**: `_bookkeeping_sync` async 분기(3199-3254)는 대부분 host지만 끝에서 `_get_prompt_logprobs_dict(hidden_states[:n], …)`(:3251)로 hidden_states를 슬라이스한다. 메인이 overlap하려면 `fwd_future.result()`를 **안 해야** 하고 → 메인엔 hidden_states가 없다. decode fast path엔 prompt-logprobs가 없으니 **handle-only bookkeeping 변형**(hidden_states/logits 불참조, `prev_sampled_token_ids=out_buf` + token_ids_cpu에 `[-1]` placeholder + num_tokens 갱신만) 필요. `_get_nans_in_logits`는 기본 off라 무관.
+2. **sampling_metadata 스냅샷(race)**: sample_task가 device 스레드에서 `self.input_batch.sampling_metadata`를 읽는데, 메인의 EM(N+1) `_update_states`(:3402)가 **동시에** input_batch를 mutate → race. enqueue 시점(메인)에 sampling_metadata(및 sampler가 읽는 input_batch 파생값)를 **스냅샷**해 task에 넘길 것. (bookkeeping은 메인 ST(N)에서 EM(N+1) 전에 순차 실행되므로 bookkeeping↔update_states race는 없음 — sampler만 문제.)
+3. **토큰 피드백을 fwd_task 안(device)로 이동**: 현재 execute_model 메인(3711-3740)에서 `prev_sampled_token_ids`를 input_ids에 scatter. overlap 시 fwd(N+1) 피드백은 sample(N)이 채운 prev(N)을 읽어야 하는데, 메인 EM(N+1)에 있으면 sample(N) **완료 전**에 실행돼 stale. FIFO상 fwd_task(N+1) 안에 두면 sample(N) 뒤라 안전. 피드백이 읽는 host 상태(prev_req_id_to_index, req_ids, perm)도 enqueue 스냅샷.
+
+**out_buf 수명/더블버퍼**: step마다 새 `out_buf=(num_reqs,1)int32`. `AsyncRBLNModelRunnerOutput`이 out_buf 참조 보유 → get_output(sample_task future join 후 D2H)까지 생존. N+1이 N을 덮지 않음.
