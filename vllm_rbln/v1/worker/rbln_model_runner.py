@@ -3772,6 +3772,15 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 # inputs, and does not need to wait for bookkeeping to finish.
                 propose_draft_token_ids(sampled_token_ids)
 
+        # Async scheduling caches this step's sampled tokens on-device in
+        # prev_sampled_token_ids via the `is None` guard in _bookkeeping_sync.
+        # Reset to None here (before bookkeeping) so the guard stores THIS
+        # step's tokens; without it the value freezes at the first decode
+        # token and every later step re-feeds it. Mirrors gpu_model_runner
+        # (which resets prev_sampled_token_ids right before bookkeeping).
+        if self.use_async_scheduling:
+            self.input_batch.prev_sampled_token_ids = None
+
         with record_function_or_nullcontext("Bookkeep"):
             # NOTE:
             # is_prefill is changed after bookkeeping
