@@ -3474,15 +3474,13 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
+        # NOTE: set_forward_context is entered inside _run_forward (below), not
+        # here, so the (module-global) forward context is active on whichever
+        # thread actually runs the forward. This is required once the forward is
+        # deferred to the device thread: the outer with-block exits before the
+        # forward runs. Nothing between here and the forward reads the forward
+        # context (only model_executable does), so narrowing its scope is safe.
         with (
-            set_forward_context(
-                attn_metadata,
-                self.vllm_config,
-                num_tokens=num_input_tokens,
-                num_tokens_across_dp=num_tokens_across_dp,
-                num_padded_tokens=num_padded_tokens,
-                additional_kwargs=self._get_kv_cache_forward_context_kwargs(),
-            ),
             record_function_or_nullcontext("Forward"),
             self.maybe_get_kv_connector_output(
                 scheduler_output,
@@ -3585,10 +3583,21 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             model_start_time = time.perf_counter()
 
             def _run_forward():
-                # The whole forward (incl. capture_reports context) runs on
-                # whichever thread calls this, so device submission and its
-                # report capture stay on one thread.
-                with capture_ctx as _reports:
+                # forward + its forward-context and capture_reports all run on
+                # whichever thread calls this (the device thread once deferred),
+                # so the module-global forward context is active on that thread
+                # for the duration of the device submission.
+                with (
+                    set_forward_context(
+                        attn_metadata,
+                        self.vllm_config,
+                        num_tokens=num_input_tokens,
+                        num_tokens_across_dp=num_tokens_across_dp,
+                        num_padded_tokens=num_padded_tokens,
+                        additional_kwargs=self._get_kv_cache_forward_context_kwargs(),
+                    ),
+                    capture_ctx as _reports,
+                ):
                     _mo = self.model_executable(
                         input_ids=input_ids,
                         positions=positions,
