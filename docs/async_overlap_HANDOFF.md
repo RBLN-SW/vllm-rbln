@@ -24,9 +24,13 @@ gpt-oss-120b EP+DP4, device-tensor 경로에서 매 decode step 도는 DP `gloo:
 | `87b8c0f` | feat: **C7** `_DeviceForwardExecutor` (forward를 device 스레드에서 실행, 즉시 join) | **✅ 6-layer A/B 0 mismatch** |
 | `929be43`,`6caa1ef` | docs: deferral 설계 + C9 난관/eager_out 가능성 | — |
 | `526854a` | refactor: **C8** `set_forward_context`를 `_run_forward` 안으로 | **✅ 6-layer A/B 0 mismatch** |
-| (HEAD) | chore: **C9 eager_out 프로브** (`VLLM_RBLN_EAGEROUT_PROBE=1`) | ⏳ **미검증**(환경 경합) |
+| `c80de05` | chore: **C9 eager_out 프로브** (`VLLM_RBLN_EAGEROUT_PROBE=1`) | — |
+| `8cd86dd` | fix: executor 스레드 `torch.rbln.set_device` (device context) | ⏳ 검증대기 |
+| `4a5e961` | fix: **warmup 중 executor 우회**(`is_warmup_active` 게이트) | ⏳ 검증대기 |
 
 **정합성은 이미 해결**(0 mismatch). 남은 건 실제 overlap = **C9(deferral)**.
+
+> **⚠️ 최신 상태(2026-07-01)**: C7 executor(`VLLM_RBLN_ASYNC_FORWARD=1`)에서 warmup 중 `vmem_size ... verify.cc:77` 크래시가 있었고 **두 개의 fix를 넣었다**(위 `8cd86dd`, `4a5e961` — 상세 §5). **이 fix들과 eager_out alias는 아직 실측 검증 못 함**(원 서버가 다른 사용자 DP4로 계속 점유되어 exclusive 확보 실패 — 이게 이주 이유). **다른 서버(exclusive)에서 §2 STEP 1~2를 돌리면 fix 검증 + alias 확보가 한 번에 된다.**
 
 ## 2. 지금 당장 할 일 (다른 서버에서)
 
@@ -64,6 +68,8 @@ python3 -m vllm_rbln_exec.parity_runner --task r --model gpt-oss-120b --ep --dp 
   2>&1 | tee /tmp/c9probe.log
 grep "EAGEROUT_PROBE alias" /tmp/c9probe.log | head
 ```
+이 한 번의 실행이 **두 가지를 동시에** 준다: (1) `ASYNC_FORWARD=1` 경로가 **warmup vmem 크래시 없이 generation 완료** → §5 fix 2개 검증, (2) `EAGEROUT_PROBE alias` 값 → C9 방향. 만약 `vmem_size ... verify.cc:77`가 또 뜨면 fix가 불완전한 것이니 §5 재검토(스레드 device context / warmup 경계).
+
 **판정** (프로브는 `_sample`에서 sampler 출력을 `EagerExecutionHelper.set_out_tensor`로 pre-alloc 후 alias 여부 로깅):
 - `alias=True` → **rebel eager_out가 sampler 출력을 pre-alloc 텐서로 alias함** → 메인 스레드가 device 실행 전 핸들 선확보 가능 → **path (가) 확정, C9 구현 진행**(§3).
 - `alias=False` → sampler 출력이 eager_out로 안 잡힘 → §3 (나)안(bookkeeping을 device 스레드로 + input_batch 동시성) 검토.
@@ -130,6 +136,11 @@ PY
 - free window 도 모델로드~register ~12s 사이 `SYS_ENODEV` TOCTOU 로 뺏길 수 있음. `ps -eo user,args|grep VLLM::` 로 남의 잡 0 확인 후 실행.
 - 내 좀비/leak 정리: `kill -9` **내** `VLLM::` 프로세스만(`pkill -f` 는 `VLLM::` 타이틀 못 잡음), `find /dev/shm -maxdepth 1 -user $USER -delete`. 남의 프로세스 절대 금지.
 - offload 캐시(`~/.cache/rbln_cache/offload`) 오염은 vmem 원인 **아님**(지워도 재발했음). 위 device-context 가 진짜 원인이었다.
+
+## 5.5 병렬 작업(다른 서버) 시 주의
+- **코드/문서는 이 브랜치(`async-overlap-prototype`)에 전부 push됨** — 다른 서버에서 `git fetch && git checkout async-overlap-prototype` 하면 그대로 쓸 수 있다. 별도 준비물 없음(이 3개 docs + 코드).
+- 단 **repo 밖 전제**는 새 서버가 갖춰야 함: `~/codebase/vllm-executor`(parity 하네스 + editable venv), gpt-oss-120b 접근, **exclusive한 RBLN 8-NPU 박스**(§5 RCCL 배타). scratchpad의 baseline/스크립트는 세션-로컬이라 안 옮겨짐 → STEP 1~4 명령이 문서에 embed돼 있으니 그걸로 재생성.
+- **브랜치 충돌 방지**: 다른 서버 agent가 *검증만* 하면(STEP 1~2 실행, alias 읽기) commit 불필요 → 충돌 없음. *C9 구현까지* 하면 이 브랜치에 push하게 되므로, **원 세션과 동시 push 금지** — 둘 중 하나만 구현하거나, 새 서버는 `async-overlap-prototype-2` 같은 분기 브랜치에서 작업 후 나중에 머지. (fetch로 최신 받고 시작할 것.)
 
 ## 6. 요약: fresh agent 체크리스트
 1. `git checkout async-overlap-prototype` (vllm-rbln), editable install 확인.
