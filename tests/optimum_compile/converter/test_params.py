@@ -33,7 +33,7 @@ class TestParseDecoder:
         assert params.max_seq_len == 8192
         assert params.kvcache_block_size == 4096
         assert params.prefill_chunk_size == 256
-        # tensor_parallel_size is populated by the caller
+        # num_devices is populated by the caller
         # (`from_rbln_config`), not `_parse_decoder`,
         # so it is not asserted here.
 
@@ -183,3 +183,44 @@ class TestParseMultimodal:
         }
         params = RBLNParams._parse_multimodal(cfg)
         assert params.batch_size == 2
+
+
+class TestImagePrefillChunkSize:
+    def _cfg(self, value):
+        return {
+            "language_model": {
+                "kvcache_num_blocks": 16,
+                "batch_size": 1,
+                "max_seq_len": 2048,
+                "kvcache_partition_len": 128,
+                "image_prefill_chunk_size": value,
+            },
+        }
+
+    def test_gemma3_int_normalized_to_list(self):
+        params = RBLNParams._parse_multimodal(self._cfg(256))
+        assert params.image_prefill_chunk_size == [256]
+
+    def test_gemma4_list_passes_through(self):
+        params = RBLNParams._parse_multimodal(self._cfg([1152, 640, 384]))
+        assert params.image_prefill_chunk_size == [1152, 640, 384]
+
+    def test_absent_is_none(self):
+        cfg = {
+            "language_model": {
+                "kvcache_num_blocks": 16,
+                "batch_size": 1,
+                "max_seq_len": 2048,
+                "kvcache_partition_len": 128,
+            },
+        }
+        params = RBLNParams._parse_multimodal(cfg)
+        assert params.image_prefill_chunk_size is None
+
+    def test_invalid_type_raises(self):
+        with pytest.raises(TypeError):
+            RBLNParams._parse_multimodal(self._cfg("256"))
+
+    def test_bool_rejected(self):
+        with pytest.raises(TypeError):
+            RBLNParams._parse_multimodal(self._cfg(True))

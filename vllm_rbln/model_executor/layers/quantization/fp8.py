@@ -17,7 +17,6 @@ import vllm.model_executor.layers.quantization.fp8 as upstream
 import vllm_rbln.rbln_envs as envs
 from torch.nn.parameter import Parameter
 from vllm.distributed import get_tensor_model_parallel_world_size
-from vllm.model_executor.kernels.linear import init_fp8_linear_kernel
 from vllm.model_executor.layers.fused_moe import (
     FusedMoE,
     FusedMoEMethodBase,
@@ -31,20 +30,15 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     create_fp8_input_scale,
     create_fp8_scale_parameter,
     create_fp8_weight_parameter,
-    maybe_post_process_fp8_weight_block,
     process_fp8_weight_block_strategy,
     process_fp8_weight_tensor_strategy,
     validate_fp8_block_shape,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
-    kFp8DynamicTensorSym,
-    kFp8DynamicTokenSym,
-    kFp8StaticTensorSym,
 )
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     all_close_1d,
-    cutlass_fp8_supported,
     per_tensor_dequantize,
 )
 from vllm.model_executor.parameter import (
@@ -113,16 +107,13 @@ class RBLNW8A16BlockFp8LinearOp:
         _input_dtype = input.dtype
         out_features, in_features = weight.shape
         bs0, bs1 = int(block_size[0]), int(block_size[1])
-        out_blocks = out_features // bs0
         in_blocks = in_features // bs1
-
-        weight = weight.view(out_blocks, bs0, in_blocks, bs1).to(_input_dtype)
-        weight_scale = weight_scale.view(out_blocks, in_blocks).to(_input_dtype)
-        scaled_weight = (weight * weight_scale[:, None, :, None]).reshape(
+        oc_rep = weight_scale.repeat_interleave(bs0, dim=0)[:out_features, :]
+        w3 = weight.view(out_features, in_blocks, bs1).to(_input_dtype)
+        scaled_weight = (w3 * oc_rep[:, :, None].to(_input_dtype)).view(
             out_features, in_features
         )
-        output = torch.nn.functional.linear(input, scaled_weight, bias)
-        return output
+        return torch.nn.functional.linear(input, scaled_weight, bias)
 
 
 class RBLNW8A8BlockFp8LinearOp:
@@ -240,7 +231,6 @@ class Fp8LinearMethod(LinearMethodBase):
 
     def __init__(self, quant_config: Fp8Config):
         self.quant_config = quant_config
-        self.out_dtype = torch.get_default_dtype()
 
         # For GPUs that lack FP8 hardware support, we can leverage the Marlin
         # kernel for fast weight-only FP8 quantization
@@ -268,21 +258,11 @@ class Fp8LinearMethod(LinearMethodBase):
                 weight_group_shape=GroupShape(*self.weight_block_size),
                 act_quant_group_shape=self.act_q_group_shape,
             )
-        else:
-            # Use per-token quantization for better perf if dynamic and cutlass
-            if self.act_q_static:
-                activation_quant_key = kFp8StaticTensorSym
-            elif cutlass_fp8_supported():
-                activation_quant_key = kFp8DynamicTokenSym
-            else:
-                activation_quant_key = kFp8DynamicTensorSym
-
-            self.fp8_linear = init_fp8_linear_kernel(
-                activation_quant_key=activation_quant_key,
-                weight_quant_key=kFp8StaticTensorSym,
-                out_dtype=torch.get_default_dtype(),
-                module_name=self.__class__.__name__,
-            )
+        # NOTE(RBLN): the non-block (per-tensor/channel) path dequantizes to
+        # BF16 in apply() and runs a plain GEMM, so no scaled-mm kernel is
+        # built here. upstream's init_fp8_linear_kernel cannot be used on RBLN
+        # anyway: it selects from _POSSIBLE_FP8_KERNELS[current_platform._enum],
+        # which has no entry for the RBLN OOT platform.
 
     def create_weights(
         self,
@@ -423,8 +403,11 @@ class Fp8LinearMethod(LinearMethodBase):
             else None
         )
 
-        if self.block_quant:
-            maybe_post_process_fp8_weight_block(layer)
+        # vLLM 0.22 removed the maybe_post_process_fp8_weight_block() wrapper.
+        # It only requantized weights for DeepGemm (CUDA Hopper/Blackwell), which
+        # is never selected on RBLN (CPU/NPU), so it was a no-op here and is
+        # dropped. The low-level deepgemm_post_process_fp8_weight_block helper
+        # still exists upstream if a DeepGemm path is ever needed.
 
     def apply(
         self,
@@ -432,45 +415,10 @@ class Fp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # use BF16 dequant
-        # fp8 -> dequantize bf16 -> bf16 torch.nn.functional.linear
-        if True:
-            if self.block_quant:
-                assert self.weight_block_size is not None
-                return self.w8a8_block_fp8_linear.apply(
-                    input=x,
-                    weight=layer.weight,
-                    weight_scale=layer.weight_scale,
-                    input_scale=layer.input_scale,
-                    bias=bias,
-                )
-            else:
-                # per-tensor/channel: dequant to BF16 and run GEMM
-                weight_fp8 = layer.weight.to(torch.bfloat16)
-                weight_scale = layer.weight_scale.to(torch.bfloat16)
-                if weight_scale.numel() == 1:
-                    # Per-tensor: simple scalar multiplication
-                    weight_bf16 = weight_fp8 * weight_scale
-                else:
-                    # Multiple scales (fused modules like QKV)
-                    # Try to infer correct broadcasting
-                    # weight is [K, N], scale could be [num_logical_weights]
-                    # Need to figure out how to broadcast - for now just try
-                    # direct multiplication
-                    if (
-                        weight_scale.dim() == 1
-                        and weight_scale.shape[0] == weight_fp8.shape[0]
-                    ):
-                        # Per-row scaling
-                        weight_bf16 = weight_fp8 * weight_scale.unsqueeze(1)
-                    else:
-                        # Fallback
-                        weight_bf16 = weight_fp8 * weight_scale
-                return torch.nn.functional.linear(x, weight_bf16.t(), bias)
-
+        # RBLN always dequantizes to BF16 and runs a plain GEMM
+        # (fp8 -> dequantize bf16 -> bf16 torch.nn.functional.linear).
         if self.block_quant:
             assert self.weight_block_size is not None
-
             return self.w8a8_block_fp8_linear.apply(
                 input=x,
                 weight=layer.weight,
@@ -478,15 +426,29 @@ class Fp8LinearMethod(LinearMethodBase):
                 input_scale=layer.input_scale,
                 bias=bias,
             )
-
-        return self.fp8_linear.apply(
-            input=x,
-            weight=layer.weight,
-            weight_scale=layer.weight_scale,
-            out_dtype=self.out_dtype,
-            input_scale=layer.input_scale,
-            bias=bias,
-        )
+        else:
+            # per-tensor/channel: dequant to BF16 and run GEMM
+            weight_fp8 = layer.weight.to(torch.bfloat16)
+            weight_scale = layer.weight_scale.to(torch.bfloat16)
+            if weight_scale.numel() == 1:
+                # Per-tensor: simple scalar multiplication
+                weight_bf16 = weight_fp8 * weight_scale
+            else:
+                # Multiple scales (fused modules like QKV)
+                # Try to infer correct broadcasting
+                # weight is [K, N], scale could be [num_logical_weights]
+                # Need to figure out how to broadcast - for now just try
+                # direct multiplication
+                if (
+                    weight_scale.dim() == 1
+                    and weight_scale.shape[0] == weight_fp8.shape[0]
+                ):
+                    # Per-row scaling
+                    weight_bf16 = weight_fp8 * weight_scale.unsqueeze(1)
+                else:
+                    # Fallback
+                    weight_bf16 = weight_fp8 * weight_scale
+            return torch.nn.functional.linear(x, weight_bf16.t(), bias)
 
 
 @torch.library.custom_op(
@@ -841,8 +803,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        layer.intermediate_size_per_partition = intermediate_size_per_partition
-        layer.hidden_size = hidden_size
         layer.num_experts = num_experts
         layer.orig_dtype = params_dtype
         layer.weight_block_size = None

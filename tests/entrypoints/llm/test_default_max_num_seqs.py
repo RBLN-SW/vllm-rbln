@@ -107,7 +107,9 @@ def test_original_max_seqs_is_preserved_without_model():
         max_num_batched_tokens=2048,
     )
     engine_args._set_default_max_num_seqs_and_batched_tokens_args(
-        UsageContext.LLM_CLASS, model_config=SimpleNamespace(max_model_len=4096)
+        UsageContext.LLM_CLASS,
+        model_config=SimpleNamespace(max_model_len=4096),
+        parallel_config=SimpleNamespace(use_batched_dp_moe=False),
     )
 
     assert engine_args.max_num_seqs == ORIGINAL_MAX_NUM_SEQS, (

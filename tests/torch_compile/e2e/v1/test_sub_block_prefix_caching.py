@@ -15,10 +15,9 @@
 from __future__ import annotations
 
 import random
-from dataclasses import asdict
 
 import pytest
-from vllm import EngineArgs, SamplingParams
+from vllm import SamplingParams
 from vllm.inputs import TokensPrompt
 from vllm.v1.metrics.reader import Counter, Metric
 
@@ -41,7 +40,7 @@ def _get_counter(metrics: list[Metric], name: str) -> int:
 
 
 def _llm_kwargs(*, enable_prefix_caching: bool) -> dict:
-    args = EngineArgs(
+    return dict(
         model="Qwen/Qwen3-0.6B",
         max_num_seqs=1,
         max_model_len=4096,
@@ -53,11 +52,11 @@ def _llm_kwargs(*, enable_prefix_caching: bool) -> dict:
         # assertion below exercises.
         num_gpu_blocks_override=8,
         seed=0,
+        disable_log_stats=False,
+        # block_size is validated in the EngineArgs ctor; pass it directly to
+        # LLM so this regression can exercise the RBLN block size.
+        block_size=BLOCK_SIZE,
     )
-    # block_size is validated in the EngineArgs ctor; assign post-hoc to bypass.
-    kwargs = asdict(args)
-    kwargs["block_size"] = BLOCK_SIZE
-    return kwargs
 
 
 def _generated_token_ids(outputs) -> list[list[int]]:
@@ -67,8 +66,8 @@ def _generated_token_ids(outputs) -> list[list[int]]:
 @pytest.mark.parametrize(
     "use_device_tensor",
     [
-        False,
-        pytest.param(True, marks=pytest.mark.skip(reason="temporarily skipped")),
+        pytest.param(False, marks=pytest.mark.skip(reason="temporarily skipped")),
+        True,
     ],
 )
 def test_sub_block_prefix_cache_matches_baseline(
