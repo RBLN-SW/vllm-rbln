@@ -2300,8 +2300,11 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         if _eagerout_probe:
             from rebel.core.torch_eager import eager_execution_helper
 
+            # Match the compiled greedy-sample op output exactly (rbln::argmax
+            # returns shape (B,) int64); a smaller/narrower buffer trips the
+            # runtime vmem verify (vmem_size >= src_elem_count * dtype_size).
             _pre = torch.empty(
-                (logits.shape[0], 1), dtype=torch.int32, device=logits.device
+                (logits.shape[0],), dtype=torch.int64, device=logits.device
             )
             _helper = eager_execution_helper()
             _helper.set_out_tensor([_pre])
