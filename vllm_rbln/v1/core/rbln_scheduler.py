@@ -60,6 +60,7 @@ from vllm.v1.core.kv_cache_utils import init_none_hash
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
+from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutputs
 from vllm.v1.outputs import ModelRunnerOutput
@@ -1159,3 +1160,23 @@ class RBLNScheduler(Scheduler):
         if match is not None:
             self.kv_cache_manager.release_sub_block_match(match)
         return None, 0
+
+
+class RBLNAsyncScheduler(RBLNScheduler, AsyncScheduler):
+    """RBLNScheduler with async-scheduling (optimistic) semantics.
+
+    Plain RBLNScheduler can't fill the engine's batch_queue: schedule(N+1)
+    sizes a running decode request as
+    num_tokens_with_spec + num_output_placeholders - num_computed_tokens,
+    which is <= 0 until update_from_output(N) appends N's real token. So the
+    next step (and its DP gloo all_reduce) only runs after step N's output --
+    serial, no overlap with forward(N)'s NPU work.
+
+    AsyncScheduler fixes this by bumping num_output_placeholders at schedule
+    time (and reconciling on output). Compose via MRO:
+    RBLNAsyncScheduler -> RBLNScheduler -> AsyncScheduler -> Scheduler.
+    RBLNScheduler.schedule() calls self._update_after_schedule() and
+    update_from_output() calls super().update_from_output() (base ->
+    _update_request_with_output); RBLNScheduler defines neither hook, so both
+    resolve to AsyncScheduler. Selected only when async_scheduling is set.
+    """

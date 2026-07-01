@@ -229,9 +229,9 @@ class RblnPlatform(Platform):
         parallel_config = vllm_config.parallel_config
         scheduler_config = vllm_config.scheduler_config
 
-        if scheduler_config.async_scheduling:
+        # TEMP toggle for sync-vs-async A/B profiling: force sync when set.
+        if os.environ.get("VLLM_RBLN_DISABLE_ASYNC") == "1":
             scheduler_config.async_scheduling = False
-            logger.warning("Async scheduler not supported on RBLN.")
 
         if envs.VLLM_RBLN_USE_VLLM_MODEL:
             cls.validate_and_setup_prerequisite(vllm_config)
@@ -270,9 +270,24 @@ class RblnPlatform(Platform):
                 parallel_config.worker_cls = (
                     "vllm_rbln.v1.worker.rbln_worker.RBLNWorker"
                 )
-            scheduler_config.scheduler_cls = (
-                "vllm_rbln.v1.core.rbln_scheduler.RBLNScheduler"
-            )
+            if (
+                scheduler_config.async_scheduling
+                and os.environ.get("VLLM_RBLN_OPTIMISTIC_SCHED") == "1"
+            ):
+                # Optimistic scheduler is required for the batch_queue to
+                # actually pipeline (so all_reduce(N+1) overlaps forward(N)).
+                # Output is bit-identical to sync once the two device-tensor
+                # token-feedback bugs are fixed (per-step prev_sampled reset +
+                # applying the feedback to the .cpu-sourced input_ids the model
+                # actually runs) -- see docs/async_overlap_report.md. Gated on
+                # for now (decode-only feedback fast path); off by default.
+                scheduler_config.scheduler_cls = (
+                    "vllm_rbln.v1.core.rbln_scheduler.RBLNAsyncScheduler"
+                )
+            else:
+                scheduler_config.scheduler_cls = (
+                    "vllm_rbln.v1.core.rbln_scheduler.RBLNScheduler"
+                )
 
             # FIXME(jiwoo.park) This is a temporary workaround.
             if model_config.enforce_eager:
@@ -309,6 +324,8 @@ class RblnPlatform(Platform):
             scheduler_config.scheduler_cls = (
                 "vllm_rbln.v1.core.optimum_scheduler.RBLNOptimumScheduler"
             )
+            # Optimum model runner doesn't support async scheduling
+            scheduler_config.async_scheduling = False
 
             assert vllm_config.parallel_config.tensor_parallel_size == 1, (
                 "Cannot set tensor_parallel_size for pre-compiled optimum-rbln models. "
