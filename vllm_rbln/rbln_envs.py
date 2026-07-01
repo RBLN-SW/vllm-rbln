@@ -378,6 +378,12 @@ environment_variables = {
     "VLLM_RBLN_DECODE_BATCH_BUCKET_STEP": lambda: int(
         os.environ.get("VLLM_RBLN_DECODE_BATCH_BUCKET_STEP", 2)
     ),
+    # Decode batch bucket limit
+    "VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT": lambda: int(
+        os.environ.get("VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT", 1)
+    ),
+    # Decode batch bucket manual buckets
+    "VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS": get_decode_batch_bucket_manual_buckets,  # noqa E501
     # Use W8A8 block fp8 (quantize activations to fp8) instead of W8A16
     # (weight-only fp8 dequant). evt0 does not support w8a8; opt-in for evt1.
     "VLLM_RBLN_USE_W8A8_FP8": (
@@ -385,12 +391,6 @@ environment_variables = {
             os.environ.get("VLLM_RBLN_USE_W8A8_FP8", "False").lower() in ("true", "1")
         )
     ),
-    # Decode batch bucket limit
-    "VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT": lambda: int(
-        os.environ.get("VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT", 1)
-    ),
-    # Decode batch bucket manual buckets
-    "VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS": get_decode_batch_bucket_manual_buckets,  # noqa E501
     # --- NIXL ---
     # Publish a second SWA-sized descriptor range alongside the Full-sized
     # range at the same NIXL base addresses, so SWA groups transfer only
