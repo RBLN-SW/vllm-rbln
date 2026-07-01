@@ -39,6 +39,29 @@ FIFO 실행: `fwd(N) → sample(N) → fwd(N+1) → sample(N+1) …`
 2. 최종 full-layer `--profile` 트레이스로 `gloo:all_reduce ∩ forward` > 0 확인(리포트 §5 방법·정량 스크립트).
 
 ## 커밋 계획 (이 문서 위)
-- C8: fwd_task 로 forward+postprocess+forward_context 추출 (즉시 join, 동작 동일) — context-on-device-thread 검증.
+- C8 ✅: set_forward_context 를 `_run_forward` 안으로 (즉시 join). 6-layer A/B 0 mismatch 검증됨(커밋 `526854a1`).
 - C9: sample_task 추출 + EM/ST deferral + 토큰 피드백 이동 + AsyncOutput join, decode-only 스코프 — overlap 개방.
 - C10: full-layer 프로파일 정량 + 필요시 fallback/race 보강.
+
+## 2026-07-01 추가 검증 — C9 의 진짜 난관 (코드로 확인)
+
+### (확인 ✅) 워커 인프라가 overlap 을 지원한다
+`multiproc_executor.py`:
+- `worker_busy_loop`(메인 워커 스레드, :944)는 RPC(EM/ST)를 처리하고 `handle_output` 호출.
+- `handle_output`(:916)은 **async scheduling 이면 output 을 `async_output_queue` 에 넣고 즉시 리턴**(:921-922).
+- `get_output()`(device sync/materialize)은 **별도 `async_output_busy_loop` 스레드**(:926-942)에서 `enqueue_output`(:906-907) 을 통해 실행.
+
+→ ST(N) 이 device 를 기다리지 않고 `AsyncRBLNModelRunnerOutput` 를 반환하면, 워커 메인 스레드는 즉시 EM(N+1) 로 진행한다. overlap 의 필요 인프라는 이미 있다.
+
+### (진짜 난관) bookkeeping 의 sampler-output 핸들 확보 (RBLN vs GPU 차이)
+GPU 가 overlap 되는 실제 이유: forward/sampler 가 **async 제출**이라, 메인 스레드는 sampler output **device 텐서 핸들**만 들고(값은 `AsyncGPUModelRunnerOutput.get_output` 에서 나중에 D2H) `_bookkeeping_sync` 를 **메인 스레드에서 순차** 처리한다. 그래서 device 는 앞서 달리고, 메인 host 작업(EM(N)→ST(N)/bookkeeping→EM(N+1))은 순차라 **input_batch race 가 없다**. `_bookkeeping_sync` 는 sampled_token_ids 의 **값이 아니라 핸들**만 있으면 된다(`prev_sampled_token_ids = sampled_token_ids` 는 no-sync; req 매핑/invalid 인덱스는 host).
+
+RBLN 문제: `DynamoRuntime.run` 이 **동기**라 sampler 출력 텐서 핸들이 device 스레드가 run() 을 끝낼 때까지 나오지 않는다(출력 텐서가 run() **안**에서 `torch.empty` 로 할당됨, sync_runtime.py). 따라서:
+- sampler 를 device 스레드로 보내면 → 메인 스레드 bookkeeping 이 핸들을 못 얻어 막힌다.
+- bookkeeping 을 busy_loop/device 스레드로 옮기면 → EM(N+1) 의 `_update_states`(execute_model 맨 앞, :3164)와 `input_batch` 를 **동시** 접근 → race. 게다가 `_update_states(N+1)` 가 bookkeeping(N) 완료를 기다리면 all_reduce(N+1) 가 다시 forward(N) 뒤로 밀려 overlap 소멸.
+
+### C9 로 가는 두 갈래
+- **(가) rebel 출력 텐서 pre-alloc (eager_out)**: `sync_runtime.py` 의 `eager_execution_helper().out_tensors` 경로로 출력 텐서를 **미리 할당해 핸들을 메인 스레드가 선확보** → GPU 처럼 bookkeeping 을 메인 스레드에서 no-wait 순차 처리, device 스레드는 그 텐서를 채우기만. input_batch race 없음. **가장 GPU 에 충실**하나 rebel eager_out 경로 이해 필요.
+- **(나) bookkeeping 을 device 스레드로 + input_batch 동시성 처리**: 필요한 host 상태를 enqueue 시점 스냅샷, `input_batch` 쓰기를 fwd/sample task 안으로 국한, `_update_states(N+1)` 와 disjoint 함을 보장(또는 lock). 더 침습적·위험.
+
+권장: (가) 를 우선 조사. 안 되면 (나).
