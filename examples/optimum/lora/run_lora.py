@@ -84,7 +84,7 @@ def get_secalign_requests(
 def main(
     num_input_prompt: int = 3,
     model: str = "meta-llama/Llama-3.1-8B-Instruct",
-    tensor_parallel_size: int = 4,
+    num_devices: int = 4,
     max_seq_len: int = 8192,
     max_lora_rank: int = 64,
 ):
@@ -92,7 +92,7 @@ def main(
     # accepts `lora_config` as a plain dict and converts it to an
     # RBLNLoRAConfig; each `lora_path` may be an HF Hub id or a local directory.
     rbln_config = {
-        "tensor_parallel_size": tensor_parallel_size,
+        "num_devices": num_devices,
         "max_seq_len": max_seq_len,
         "lora_config": {
             "adapters": ADAPTERS,
