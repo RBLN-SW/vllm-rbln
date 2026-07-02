@@ -1,0 +1,33 @@
+/* vllm-rbln docs — readability tweaks for the generated env var reference. */
+
+/* Each VLLM_RBLN_* variable is an h3 with a monospace name. Give it a little
+   breathing room and a subtle left accent so entries are easy to scan. */
+.md-typeset h3 > code {
+  font-size: 0.85em;
+  font-weight: 700;
+  background: var(--md-code-bg-color);
+  padding: 0.1em 0.4em;
+  border-radius: 0.2em;
+}
+
+.md-typeset h3 {
+  scroll-margin-top: 4rem;
+  padding-top: 0.4rem;
+  border-top: 1px solid var(--md-default-fg-color--lightest);
+}
+
+/* The type/default meta line directly under each heading. */
+.md-typeset h3 + p {
+  margin-top: 0.2rem;
+  color: var(--md-default-fg-color--light);
+  font-size: 0.8rem;
+}
+
+.md-typeset h3 + p code {
+  font-size: 0.95em;
+}
+
+/* Wider content column so long descriptions wrap less awkwardly. */
+.md-grid {
+  max-width: 68rem;
+}

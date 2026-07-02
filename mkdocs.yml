@@ -1,0 +1,73 @@
+site_name: vllm-rbln
+site_url: https://rbln-sw.github.io/vllm-rbln/
+repo_url: https://github.com/RBLN-SW/vllm-rbln
+repo_name: RBLN-SW/vllm-rbln
+theme:
+  name: material
+  logo: assets/rebellions_logo.png
+  favicon: assets/favicon.png
+  icon:
+    repo: fontawesome/brands/github
+  palette:
+    # Light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: black
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    # Dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: black
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - navigation.instant
+    - navigation.top
+    - navigation.sections
+    - navigation.footer
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.tooltips
+
+# Local-only brainstorming specs/plans live under docs/superpowers/ (gitignored);
+# keep them out of the built site.
+exclude_docs: |
+  superpowers/
+
+plugins:
+  - search
+  - gen-files:
+      scripts:
+        - docs/gen_env_vars.py
+  - mike
+
+nav:
+  - Home: index.md
+  - Environment Variables: env_vars.md
+  - Bucketing: bucketing.md
+  - Sub-block Prefix Caching: sub_block_prefix_caching.md
+
+extra_css:
+  - stylesheets/extra.css
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+
+extra:
+  version:
+    provider: mike

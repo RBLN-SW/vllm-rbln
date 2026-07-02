@@ -65,6 +65,11 @@ dev = [
     "huggingface_hub",
     "fire",
 ]
+docs = [
+    "mkdocs-material",
+    "mkdocs-gen-files",
+    "mike",
+]
 
 [project.urls]
 Homepage="https://rebellions.ai"

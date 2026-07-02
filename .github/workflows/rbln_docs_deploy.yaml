@@ -1,0 +1,44 @@
+name: docs-deploy
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+# Serialize gh-pages pushes so a tag and a main push can't race.
+concurrency:
+  group: gh-pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: rbln-sw-k8s-general
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
+        with:
+          python-version: "3.12"
+      - name: Install docs dependencies
+        run: pip install mkdocs-material mkdocs-gen-files mike
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+      - name: Fetch gh-pages
+        run: git fetch origin gh-pages --depth=1 || true
+      - name: Deploy release version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          mike deploy --push --update-aliases "${GITHUB_REF_NAME}" latest
+          # Idempotent: keep the site root redirecting to the newest release.
+          mike set-default --push latest
+      - name: Deploy dev version
+        if: github.ref == 'refs/heads/main'
+        run: mike deploy --push dev

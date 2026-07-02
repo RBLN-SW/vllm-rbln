@@ -82,6 +82,66 @@ All pull requests **must**:
 
 ------
 
+## Adding an Environment Variable
+
+All `VLLM_RBLN_*` environment variables live in `vllm_rbln/rbln_envs.py`, which
+is the **single source of truth**: the runtime reads the value, the user-facing
+env var docs are generated from it, and a pre-commit lint blocks anything left
+undocumented. Adding one is two steps.
+
+**1. Add the runtime getter** to the `environment_variables` dict (the code that
+reads/parses the value). For validation or a non-trivial default, write a helper
+function (see `get_dp_impl`) and reference it.
+
+```python
+"VLLM_RBLN_MY_FLAG": (
+    lambda: os.environ.get("VLLM_RBLN_MY_FLAG", "False").lower() in ("true", "1")
+),
+```
+
+**2. Add a matching `ENV_METADATA` entry.** The key must be identical to the
+getter key, and the `description` must be non-empty — the lint enforces both.
+
+```python
+"VLLM_RBLN_MY_FLAG": EnvMeta(
+    "Short sentence describing what this flag does and when to set it.",
+    default=False,
+    type="bool",
+    category="Miscellaneous",
+),
+```
+
+`EnvMeta` fields: `description` (required), `default`, `type`
+(`"bool"`/`"int"`/`"str"`/`"list[int]"`…), `category` (docs grouping),
+`deprecated` (non-empty marks it deprecated), `choices` (tuple of valid values).
+
+**Variables with a fixed set of values:** put the values in `choices` and read
+them back in the getter — do **not** hardcode the set.
+
+```python
+"VLLM_RBLN_MY_MODE": EnvMeta(
+    "Selects the operating mode.",
+    default="fast", type="str", category="Miscellaneous",
+    choices=("fast", "accurate"),
+),
+
+choices = set(ENV_METADATA["VLLM_RBLN_MY_MODE"].choices)  # in the getter
+```
+
+**What happens automatically:** the pre-commit hook `check-env-metadata` fails on
+a missing/orphan entry or empty description; the docs env var page regenerates
+from `ENV_METADATA` on every build (never edit it by hand); and mentioning
+another `VLLM_RBLN_*` variable in a description auto-links to it. A new
+`category` string renders automatically (appended after the known ones, no
+intro line) — you only touch `_CATEGORY_ORDER` / `_CATEGORY_INTRO` in
+`docs/gen_env_vars.py` if you want a specific position or a one-line
+description for it.
+
+Before pushing: `pre-commit run check-env-metadata --all-files` passes and
+`mkdocs build` shows the variable.
+
+------
+
 ## Merge Policy
 
 All of the following must be satisfied for a PR to be merged:
