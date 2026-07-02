@@ -11,13 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from abc import ABC
 from typing import Any
 
 import torch
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.model_executor.models.interfaces import SupportsMultiModal
+from vllm.model_executor.models.interfaces import MultiModalEmbeddings
 from vllm.model_executor.models.qwen2_5_vl import (
     Qwen2_5_VLImageEmbeddingInputs,
     Qwen2_5_VLImagePixelInputs,
@@ -26,7 +25,11 @@ from vllm.model_executor.models.qwen2_5_vl import (
 )
 
 from .base import ModelInputForRBLN
-from .model_base import RBLNOptimumDecoderMixin, RBLNOptimumModelBase
+from .model_base import (
+    RBLNOptimumDecoderMixin,
+    RBLNOptimumModelBase,
+    RBLNOptimumMultimodalMixin,
+)
 from .optimum_attention import (
     AttentionManager,
     InnerAttentionEntry,
@@ -39,8 +42,18 @@ logger = init_logger(__name__)
 
 
 class RBLNOptimumExaone4_5_ForConditionalGeneration(
-    RBLNOptimumModelBase, RBLNOptimumDecoderMixin, SupportsMultiModal, ABC
+    RBLNOptimumModelBase, RBLNOptimumMultimodalMixin, RBLNOptimumDecoderMixin
 ):
+    # EXAONE-4.5 reuses the Qwen2.5-VL multimodal placeholders.
+    @classmethod
+    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
+        if modality.startswith("image"):
+            return "<|vision_start|><|image_pad|><|vision_end|>"
+        if modality.startswith("video"):
+            return "<|vision_start|><|video_pad|><|vision_end|>"
+
+        raise ValueError("Only image or video modality is supported")
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -98,6 +111,88 @@ class RBLNOptimumExaone4_5_ForConditionalGeneration(
 
         # Call the actual preprocessing
         return self.model._preprocess_prefill(**preprocess_args)
+
+    def build_prefill_forward_inputs(
+        self,
+        model_input: ModelInputForRBLN,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, float | None]:
+        """Prefill: merge text + multimodal embeddings and return
+        ``(inputs_embeds, position_embed, rope_delta)``. EXAONE-4.5 does not use
+        MRoPE, so ``position_embed`` and ``rope_delta`` are always ``None``.
+        """
+        input_ids = model_input.input_tokens
+        image_input = None
+        video_input = None
+        if model_input.multi_modal_kwargs:
+            image_input = self._parse_and_validate_image_input(
+                **model_input.multi_modal_kwargs
+            )
+            video_input = self._parse_and_validate_video_input(
+                **model_input.multi_modal_kwargs
+            )
+
+        attention_mask = torch.ones_like(input_ids)
+        inputs_embeds = self.preprocess_prefill(
+            input_ids, attention_mask, image_input, video_input
+        )
+        return inputs_embeds, None, None
+
+    def get_language_model(self):
+        return self.model
+
+    def _image_token_id(self) -> int:
+        # EXAONE-4.5's HF config names the placeholder `image_token_id`
+        # (not `image_token_index` as the mixin default assumes).
+        return self.model.config.image_token_id
+
+    def _process_image_input(self, image_input) -> dict:
+        result = {}
+        if image_input is not None and image_input.get("type") == "pixel_values":
+            image_embeds = self.model.visual(
+                image_input["pixel_values"], grid_thw=image_input["image_grid_thw"]
+            )
+            result["image_embeds"] = image_embeds
+            result["image_grid_thw"] = image_input["image_grid_thw"]
+        return result
+
+    def _process_video_input(self, video_input) -> dict:
+        result = {}
+        if video_input is not None and video_input.get("type") == "pixel_values_videos":
+            video_embeds = self.model.visual(
+                video_input["pixel_values_videos"],
+                grid_thw=video_input["video_grid_thw"],
+            )
+            result["video_embeds"] = video_embeds
+            result["video_grid_thw"] = video_input["video_grid_thw"]
+        return result
+
+    def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings | dict:
+        image_input = self._parse_and_validate_image_input(**kwargs)
+        video_input = self._parse_and_validate_video_input(**kwargs)
+        if image_input is None and video_input is None:
+            return []
+
+        result = {}
+        result.update(self._process_image_input(image_input))
+        result.update(self._process_video_input(video_input))
+        return result
+
+    def build_prefill_inputs(
+        self,
+        input_ids: torch.Tensor,
+        cached_mm_outputs: list,
+        *,
+        cache_position: torch.Tensor | None = None,
+        running_requests_ids: list[str] | None = None,
+    ) -> dict:
+        # NOTE: this guard is currently unreachable — init_model() only enables
+        # the EC path for "RBLNQwen3VLForConditionalGeneration", so EXAONE-4.5
+        # never enters here today. It documents the contract for when EC is
+        # extended: the sliding-window/hybrid-cache prefill needs the
+        # attention_manager state that build_prefill_inputs does not yet provide.
+        raise NotImplementedError(
+            "EC disaggregation is not implemented for EXAONE-4.5."
+        )
 
     def _create_image_pixel_inputs(self, pixel_values, image_grid_thw):
         return Qwen2_5_VLImagePixelInputs(
@@ -169,22 +264,7 @@ class RBLNOptimumExaone4_5_ForConditionalGeneration(
         block_tables = kwargs.pop("block_tables")
 
         if is_prompt:
-            image_input = None
-            video_input = None
-            if model_input.multi_modal_kwargs:
-                image_input = self._parse_and_validate_image_input(
-                    **model_input.multi_modal_kwargs
-                )
-                video_input = self._parse_and_validate_video_input(
-                    **model_input.multi_modal_kwargs
-                )
-            if image_input is None and video_input is None:
-                inputs_embeds = None
-
-            attention_mask = torch.ones_like(input_ids)
-            inputs_embeds = self.preprocess_prefill(
-                input_ids, attention_mask, image_input, video_input
-            )
+            inputs_embeds = model_input.inputs_embeds
             prefill_batch_idx = sliding_window_table_ids[0]
             local_block_table_id = torch.tensor([prefill_batch_idx], dtype=torch.int16)
             logits = self.model.prefill_decoder(
