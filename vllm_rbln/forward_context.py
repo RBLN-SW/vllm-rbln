@@ -36,6 +36,19 @@ from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)
 
+# VLLM_RBLN_OVERLAP_PROBE feasibility state. Each step, right after the real
+# (correctness-bearing) all_reduce, we fire an *extra* async DP all_reduce and
+# collect it at the next step -- so its gloo network runs on pt_gloo_runloop
+# while forward(N) executes on the main thread. If the collect-wait at step N+1
+# is ~0ms, that collective fully overlapped forward(N): direct proof that
+# all_reduce(N+1) CAN overlap forward(N) on a single host thread. The real
+# all_reduce is untouched (parity preserved); this shadow is issued + collected
+# unconditionally every step by all ranks => collective order stays identical
+# across ranks (no deadlock). It is a visualization probe, NOT the production
+# path (which moves the real collective and must handle prefill/ragged steps).
+_ar_prefetch_handle = None
+_ar_prefetch_tensor = None
+
 
 @dataclass
 class RBLNDPMetadata(DPMetadata):
@@ -82,13 +95,43 @@ class RBLNDPMetadata(DPMetadata):
         from vllm.distributed.parallel_state import get_dp_group
 
         import os as _os, time as _time, sys as _sys
+        _span = _os.environ.get("VLLM_RBLN_SPAN_LOG") == "1"
         _t0 = _time.perf_counter()
         dist.all_reduce(num_tokens_tensor, group=get_dp_group().cpu_group)
-        if _os.environ.get("VLLM_RBLN_SPAN_LOG") == "1":
+        if _span:
             print(
                 "SPAN allreduce %d %.6f %.6f" % (_os.getpid(), _t0, _time.perf_counter()),
                 file=_sys.stderr, flush=True,
             )
+
+        # VLLM_RBLN_OVERLAP_PROBE: prefetch an async all_reduce that overlaps the
+        # upcoming forward, and collect the one fired during the previous forward.
+        if _os.environ.get("VLLM_RBLN_OVERLAP_PROBE") == "1":
+            global _ar_prefetch_handle, _ar_prefetch_tensor
+            if _ar_prefetch_handle is not None:
+                # This wait resolves the collective issued during the PREVIOUS
+                # step's forward. ~0ms here == it fully overlapped that forward.
+                _wt0 = _time.perf_counter()
+                _ar_prefetch_handle.wait()
+                if _span:
+                    print(
+                        "SPAN ar_collect %d %.6f %.6f"
+                        % (_os.getpid(), _wt0, _time.perf_counter()),
+                        file=_sys.stderr, flush=True,
+                    )
+            # Fire all_reduce(N+1) now; its gloo network runs on pt_gloo_runloop
+            # while forward(N) executes on this (main) thread.
+            _ar_prefetch_tensor = num_tokens_tensor.clone()
+            _it0 = _time.perf_counter()
+            _ar_prefetch_handle = dist.all_reduce(
+                _ar_prefetch_tensor, group=get_dp_group().cpu_group, async_op=True
+            )
+            if _span:
+                print(
+                    "SPAN ar_issue %d %.6f %.6f"
+                    % (_os.getpid(), _it0, _time.perf_counter()),
+                    file=_sys.stderr, flush=True,
+                )
         return num_tokens_tensor
 
     @staticmethod
