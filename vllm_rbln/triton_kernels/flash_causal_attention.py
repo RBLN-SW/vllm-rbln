@@ -13,6 +13,8 @@
 # limitations under the License.
 """Triton kernels for Causal Attention"""
 
+import os
+
 import torch
 from rebel import triton
 from rebel.triton import language as tl
@@ -30,7 +32,7 @@ def flash_causal_attention_naive_prefill(
     qk_scale,
     seq_idx_base,
     block_table_base,  # 1D vector, block_table[batch]
-    block_size,  # dummy (scalar)
+    dummy,
     NUM_HEAD: tl.constexpr,  # 8, num_kv_head
     NUM_GROUP: tl.constexpr,  # 4, num_head/num_kv_head=32/8=4
     HEAD_DIM: tl.constexpr,  # 64, head_dim
@@ -272,7 +274,7 @@ def flash_causal_attention_naive_decode(
     qk_scale,
     seq_idx_base,
     block_table_base,  # 2D tensor, block_table[batch][partition]
-    block_size,  # dummy (scalar)
+    dummy,
     NUM_HEAD: tl.constexpr,  # 8, num_kv_head
     NUM_GROUP: tl.constexpr,  # 4, num_head/num_kv_head=32/8=4
     HEAD_DIM: tl.constexpr,  # 64, head_dim
@@ -507,14 +509,20 @@ def flash_causal_attention_naive_decode(
 
 
 def warmup(func, *args):
-    kernel = func.warmup(*args, grid=(1,), host_layout="1:2:3")
+    compute_dtype = os.environ.get("RBLN_COMP_DTYPE", "bfloat")
+    assert compute_dtype in ("dlfloat", "bfloat"), (
+        f"RBLN_COMP_DTYPE must be 'dlfloat' or 'bfloat', got '{compute_dtype}'"
+    )
+    compute_dtype = {"bfloat": "bf16", "dlfloat": "dlf16"}[compute_dtype]
+    kernel = func.warmup(
+        *args, grid=(1,), host_layout="1:2:3", compute_dtype=compute_dtype
+    )
     rblib.write_rtosa(kernel, args)
 
     return kernel
 
 
-@triton_op("rbln_triton_ops::flash_causal_attention_naive_prefill", mutates_args=())
-def flash_causal_attention_naive_prefill_wrapper(
+def _flash_causal_attention_naive(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -522,8 +530,15 @@ def flash_causal_attention_naive_prefill_wrapper(
     qk_scale: torch.Tensor,
     seq_idx: torch.Tensor,
     block_table: torch.Tensor,
-    dummy0: torch.Tensor,
+    dummy: torch.Tensor,
+    kernel,
 ) -> torch.Tensor:
+    # prefill/decode share this body; only the compiled triton ``kernel`` differs.
+    # Float tensors enter as an fp32 carrier so the kernel compiles against one
+    # uniform float type (tl.dot operands must match); triton_rbln's RTOSA fixup
+    # rewrites f32 -> the device compute dtype (bf16/dlf16 per RBLN_COMP_DTYPE).
+    # seq_idx enters as an int32 carrier (to_dynamic_index rejects int64) and is
+    # lowered to i16 by the same fixup. output.to(original_dtype) restores dtype.
     original_dtype = query.dtype
 
     query = query.to(torch.float32)
@@ -531,6 +546,7 @@ def flash_causal_attention_naive_prefill_wrapper(
     value = value.to(torch.float32)
     kv_cache = kv_cache.to(torch.float32)
     qk_scale = qk_scale.to(torch.float32)
+    seq_idx = seq_idx.to(torch.int32)
 
     output = torch.empty_like(query)
 
@@ -568,10 +584,33 @@ def flash_causal_attention_naive_prefill_wrapper(
         NUM_BLOCK,
         DIM_BLOCK_TABLE,
     ]
-
-    warmup(flash_causal_attention_naive_prefill, *params)
+    warmup(kernel, *params)
 
     return output.to(original_dtype)
+
+
+@triton_op("rbln_triton_ops::flash_causal_attention_naive_prefill", mutates_args=())
+def flash_causal_attention_naive_prefill_wrapper(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    kv_cache: torch.Tensor,
+    qk_scale: torch.Tensor,
+    seq_idx: torch.Tensor,
+    block_table: torch.Tensor,
+    dummy: torch.Tensor,
+) -> torch.Tensor:
+    return _flash_causal_attention_naive(
+        query,
+        key,
+        value,
+        kv_cache,
+        qk_scale,
+        seq_idx,
+        block_table,
+        dummy,
+        flash_causal_attention_naive_prefill,
+    )
 
 
 @register_fake("rbln_triton_ops::flash_causal_attention_naive_prefill")
@@ -583,7 +622,7 @@ def _(
     qk_scale: torch.Tensor,
     seq_idx: torch.Tensor,
     block_table: torch.Tensor,
-    dummy0: torch.Tensor,
+    dummy: torch.Tensor,
 ) -> torch.Tensor:
     return torch.empty_like(query)
 
@@ -597,56 +636,19 @@ def flash_causal_attention_naive_decode_wrapper(
     qk_scale: torch.Tensor,
     seq_idx: torch.Tensor,
     block_table: torch.Tensor,
-    dummy0: torch.Tensor,
+    dummy: torch.Tensor,
 ) -> torch.Tensor:
-    original_dtype = query.dtype
-
-    query = query.to(torch.float32)
-    key = key.to(torch.float32)
-    value = value.to(torch.float32)
-    kv_cache = kv_cache.to(torch.float32)
-    qk_scale = qk_scale.to(torch.float32)
-
-    output = torch.empty_like(query)
-
-    query = rblib.align_tensor_last_dim_to_64(query)
-    key = rblib.align_tensor_last_dim_to_64(key)
-    value = rblib.align_tensor_last_dim_to_64(value)
-
-    NUM_HEAD = query.shape[1]
-    NUM_GROUP = query.shape[2]
-    HEAD_DIM = query.shape[-1]
-    QUERY_LEN = query.shape[-2]
-    PARTITION_SIZE = kv_cache.shape[-2]
-    MAX_SEQ_LEN = PARTITION_SIZE * seq_idx.shape[1]
-    NUM_BLOCK = kv_cache.shape[1]
-    NUM_BATCH = query.shape[0]
-    DIM_BLOCK_TABLE = block_table.dim()
-
-    params = [
+    return _flash_causal_attention_naive(
         query,
         key,
         value,
         kv_cache,
-        output,
         qk_scale,
         seq_idx,
         block_table,
-        qk_scale,
-        NUM_HEAD,
-        NUM_GROUP,
-        HEAD_DIM,
-        QUERY_LEN,
-        NUM_BATCH,
-        PARTITION_SIZE,
-        MAX_SEQ_LEN,
-        NUM_BLOCK,
-        DIM_BLOCK_TABLE,
-    ]
-
-    warmup(flash_causal_attention_naive_decode, *params)
-
-    return output.to(original_dtype)
+        dummy,
+        flash_causal_attention_naive_decode,
+    )
 
 
 @register_fake("rbln_triton_ops::flash_causal_attention_naive_decode")
@@ -658,6 +660,6 @@ def _(
     qk_scale: torch.Tensor,
     seq_idx: torch.Tensor,
     block_table: torch.Tensor,
-    dummy0: torch.Tensor,
+    dummy: torch.Tensor,
 ) -> torch.Tensor:
     return torch.empty_like(query)
