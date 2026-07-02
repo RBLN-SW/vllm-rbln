@@ -45,8 +45,8 @@ dependencies = [
     "torchaudio",
     "torchcodec",
     "optimum-rbln>=0.11.1a1",
-    # dev marker → rebel-compiler에만 prerelease(nightly) 허용 (PEP 440).
-    # 정확한 버전 핀은 uv.lock 담당. bump: uv lock --upgrade-package rebel-compiler
+    # dev marker → allow prerelease (nightly) for rebel-compiler only (PEP 440).
+    # Exact version pinning is uv.lock's job. Bump: uv lock --upgrade-package rebel-compiler
     "rebel-compiler~=0.11.1.dev0",
 ]
 
@@ -134,12 +134,13 @@ follow_imports = "silent"
 environments = [
     "sys_platform == 'linux' and platform_machine == 'x86_64'"
 ]
-# 3개 rbln index를 동시 등록하고 spec(prerelease 마커/연산자)이 선택을 결정한다.
-# RFC #738 §4.4 결정: rebel-compiler뿐 아니라 서드파티 패키지도 rbln index에서
-# 해석될 수 있는 cross-index 리스크까지 검토 후 수용 (index 전환 없는 dev↔release
-# 운용을 위해). 정확한 버전 재현은 uv.lock 담당 — lock 없는 설치는 계약 밖.
+# Register all three rbln indexes at once; the spec (prerelease marker/operator)
+# decides which version gets selected. Decision per RFC #738 §4.4: the cross-index
+# risk that third-party packages (not just rebel-compiler) may resolve from rbln
+# indexes was reviewed and accepted, to keep a fixed index config across dev/release.
+# Exact reproduction is uv.lock's job — installs without the lock are out of contract.
 index-strategy = "unsafe-best-match"
-prerelease = "if-necessary-or-explicit"   # uv 기본값을 명시 고정 — prerelease는 마커 있는 패키지(또는 prerelease만 존재하는 패키지)로 한정
+prerelease = "if-necessary-or-explicit"   # pin uv's default explicitly — prereleases only for packages with a marker (or prerelease-only packages)
 
 [[tool.uv.index]]
 name = "vllm-cpu"

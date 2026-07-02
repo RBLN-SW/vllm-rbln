@@ -61,13 +61,15 @@ Requirements:
 - Linux x86_64 with access to the internal network (Nexus / internal PyPI)
 - Python **3.12** for this dev workflow (`rebel-compiler` nightly wheels are currently cp312-only; the package itself targets 3.10-3.13)
 
-Internal indexes require credentials (set once, e.g. in your shell profile):
+Internal indexes require your **LDAP account** credentials (set once, e.g. in your shell profile):
 
 ```bash
-export UV_INDEX_RBLN_NEXUS_NIGHTLY_USERNAME=<udc-nexus-user>
-export UV_INDEX_RBLN_NEXUS_NIGHTLY_PASSWORD=<udc-nexus-password>
-export UV_INDEX_REBELLIONS_USERNAME=<internal-pypi-user>
-export UV_INDEX_REBELLIONS_PASSWORD=<internal-pypi-password>
+export UV_INDEX_RBLN_NEXUS_NIGHTLY_USERNAME=<ldap-username>
+export UV_INDEX_RBLN_NEXUS_NIGHTLY_PASSWORD=<ldap-password>
+export UV_INDEX_REBELLIONS_USERNAME=<ldap-username>
+export UV_INDEX_REBELLIONS_PASSWORD=<ldap-password>
+export UV_INDEX_RBLN_RELEASE_USERNAME=<ldap-username>
+export UV_INDEX_RBLN_RELEASE_PASSWORD=<ldap-password>
 ```
 
 Then install the locked, team-identical environment with a single command:
@@ -80,7 +82,19 @@ To bump `rebel-compiler` to the latest nightly (do not edit `pyproject.toml`):
 
 ```bash
 uv lock --upgrade-package rebel-compiler
+# or pin a specific version:
+uv lock --upgrade-package rebel-compiler==0.11.1.dev200
 # commit the updated uv.lock
+```
+
+Available versions can be checked by browsing the index directly
+(e.g. <https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/rebel-compiler/>,
+LDAP login required), or:
+
+```bash
+curl -s -u "$UV_INDEX_RBLN_NEXUS_NIGHTLY_USERNAME:$UV_INDEX_RBLN_NEXUS_NIGHTLY_PASSWORD" \
+  https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/rebel-compiler/ \
+  | grep -oE 'rebel_compiler-[0-9][A-Za-z0-9.+]*' | sort -uV | tail -10
 ```
 
 ### 📚 Documentation
