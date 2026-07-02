@@ -648,17 +648,25 @@ class RBLNWorker(WorkerBase):
 
     def shutdown(self) -> None:
         logger.info("v1 rbln_worker shutdown called")
-        # has_kv_transfer_group can be None during interpreter shutdown.
-        if ensure_kv_transfer_shutdown is not None:
-            ensure_kv_transfer_shutdown()
-        if self.profiler is not None:
-            self.profiler.shutdown()
-
+        # Dump the final performance stats FIRST, before any teardown. The
+        # EngineCore is shut down with a zero-second grace period, so this method
+        # runs inside a window where the worker process may be reaped at any
+        # moment. print_final_stats() only reads already-collected Python-side
+        # counters (no device / KV / model access), so it is safe to run before
+        # the teardown steps below. Doing so previously-blocking work such as
+        # ensure_kv_transfer_shutdown() ahead of it consumed the whole grace
+        # window and truncated (or fully dropped, for P/D engines) the dump.
         if envs.VLLM_RBLN_METRICS:
             if self.model_runner.performance_tracker:
                 self.model_runner.performance_tracker.print_final_stats()
             if self.model_runner.e2e_performance_tracker:
                 self.model_runner.e2e_performance_tracker.print_final_stats()
+
+        # has_kv_transfer_group can be None during interpreter shutdown.
+        if ensure_kv_transfer_shutdown is not None:
+            ensure_kv_transfer_shutdown()
+        if self.profiler is not None:
+            self.profiler.shutdown()
 
 
 def init_worker_distributed_environment(
