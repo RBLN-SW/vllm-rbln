@@ -31,6 +31,8 @@ from vllm.model_executor.models.qwen2_vl import (
     Qwen2VLVideoPixelInputs,
 )
 
+from vllm_rbln.utils.optimum.bucket import select_bucket_size
+
 from .base import ModelInputForRBLN
 from .model_base import (
     RBLNOptimumDecoderMixin,
@@ -63,7 +65,6 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         vllm_config: VllmConfig,
     ) -> None:
         super().__init__(vllm_config=vllm_config)
-        self.rope_deltas: dict = dict()
         if self._is_ec_producer_only():
             return
         assert self.kv_block_adapter is not None
@@ -238,92 +239,59 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         """Create video embedding inputs based on model type"""
         pass
 
-    def forward(self, model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
-        input_ids = model_input.input_tokens
-        cache_position = model_input.input_positions
-        block_tables = model_input.block_tables
-
-        request_nums = input_ids.shape[0]
-        finished_requests_ids = model_input.finished_requests_ids
-        running_requests_ids = model_input.running_requests_ids
-
-        is_prompt = model_input.is_prompt
-
-        if is_prompt:
-            image_input = None
-            video_input = None
-            if model_input.multi_modal_kwargs:
-                image_input = self._parse_and_validate_image_input(
-                    **model_input.multi_modal_kwargs
-                )
-                video_input = self._parse_and_validate_video_input(
-                    **model_input.multi_modal_kwargs
-                )
-
-            if image_input is None and video_input is None:
-                inputs_embeds = None
-
-            cur_request_id = running_requests_ids[0]
-            attention_mask = torch.ones_like(input_ids)
-
-            prefill_params = self.preprocess_prefill(
-                input_ids, attention_mask, image_input, video_input
-            )
-
-            if finished_requests_ids:
-                for request_id in finished_requests_ids:
-                    self.rope_deltas.pop(request_id, None)
-            self.rope_deltas[cur_request_id] = prefill_params["rope_deltas"].item()
-            prefill_params.pop("rope_deltas")
-
-        kwargs = self.preprocess_for_decoder(
-            is_prompt, block_tables, input_ids, cache_position
-        )
-        cache_position = kwargs.pop("cache_position")
-        block_tables = kwargs.pop("block_tables")
-
-        if is_prompt:
-            logits = self.model.prefill_decoder(
-                **prefill_params,
-                block_tables=block_tables,
-            ).logits
-        else:
-            padded_batch_size = kwargs.pop("padded_batch_size", self.decoder_batch_size)
-            self.model.decoder = self.model.decoders[padded_batch_size]
-            input_ids = kwargs.pop("input_ids")
-
-            inputs_embeds, position_embed = self._preprocess_embeds(
-                input_ids, cache_position, running_requests_ids, padded_batch_size
-            )
-            logits = self.model.decoder(
-                inputs_embeds=inputs_embeds,
-                cache_position=cache_position,
-                position_embed=position_embed,
-                block_tables=block_tables,
-            ).logits
-        if not is_prompt:
-            logits = logits[:request_nums]
-        return logits
-
-    def _preprocess_embeds(
+    def build_prefill_forward_inputs(
         self,
-        input_ids: torch.LongTensor,
-        cache_position: torch.LongTensor,
-        running_requests_ids: list[str],
-        padded_batch_size: int,
-    ):
-        if padded_batch_size != cache_position.shape[0]:
-            raise RuntimeError(
-                f"Cache position size mismatch: got {cache_position.shape[0]},",
-                " expected {padded_batch_size}.",
+        model_input: ModelInputForRBLN,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, float | None]:
+        """Prefill: run ``preprocess_prefill`` (embedding merge + MRoPE) and
+        return ``(inputs_embeds, position_embed, rope_delta)``. The runner owns
+        and stores the per-request rope delta; this hook only returns it.
+        """
+        input_ids = model_input.input_tokens
+        image_input = None
+        video_input = None
+        if model_input.multi_modal_kwargs:
+            image_input = self._parse_and_validate_image_input(
+                **model_input.multi_modal_kwargs
+            )
+            video_input = self._parse_and_validate_video_input(
+                **model_input.multi_modal_kwargs
             )
 
-        # NOTE: preprocess_prefill also use dtype casting.
-        # eunji.lee): dtype casting is required
-        inputs_embeds = self.model.embed_tokens(input_ids).to(self.dtype)
+        attention_mask = torch.ones_like(input_ids)
+        prefill_params = self.preprocess_prefill(
+            input_ids, attention_mask, image_input, video_input
+        )
+        return (
+            prefill_params["inputs_embeds"],
+            prefill_params["position_embed"],
+            prefill_params["rope_deltas"].item(),
+        )
+
+    def compute_decode_position_embed(
+        self,
+        model_input: ModelInputForRBLN,
+        mrope_position_deltas: dict[str, float],
+    ) -> torch.Tensor:
+        """Decode-step MRoPE: advance each request's position from its stored
+        delta (``cache_position + mrope_position_delta``) and return the padded
+        position embeddings (cos/sin). Mirrors upstream vLLM's
+        ``get_next_input_positions_tensor``.
+        """
+        cache_position = model_input.input_positions
+        running_requests_ids = model_input.running_requests_ids
+        # int32 mirrors the cache_position dtype the prior decode path used
+        # (cast in preprocess_for_decoder before computing position embeds).
+        cache_position = cache_position.to(torch.int32)
+        padded_batch_size = self.decoder_batch_size
+        if self.use_multiple_decoder:
+            padded_batch_size = select_bucket_size(
+                len(running_requests_ids), self.decoder_batch_sizes
+            )
+
         position_embeds = []
         for b_id, request_id in enumerate(running_requests_ids):
-            delta = cache_position[b_id] + self.rope_deltas[request_id]
+            delta = cache_position[b_id] + mrope_position_deltas[request_id]
             position_ids = torch.arange(1).view(1, -1)
             position_ids = position_ids.add(delta)
             position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
@@ -333,12 +301,52 @@ class RBLNOptimumQwenVLForConditionalGeneration(
             position_embeds.append(position_embed)
 
         for _ in range(padded_batch_size - len(running_requests_ids)):
-            position_embed = torch.zeros_like(position_embeds[0])
-            position_embeds.append(position_embed)
+            position_embeds.append(torch.zeros_like(position_embeds[0]))
 
-        position_embeds = torch.cat(position_embeds, dim=1)
+        return torch.cat(position_embeds, dim=1)
 
-        return inputs_embeds, position_embeds
+    def forward(self, model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
+        input_ids = model_input.input_tokens
+        cache_position = model_input.input_positions
+        block_tables = model_input.block_tables
+
+        request_nums = input_ids.shape[0]
+        is_prompt = model_input.is_prompt
+
+        # FIXME This should be removed in the future
+        # by moving the padding logic into model runner.
+        assert len(model_input.running_requests_ids) == request_nums, (
+            f"The number of running requests is "
+            f"{len(model_input.running_requests_ids)}, "
+            f"but the shape of input_ids is {input_ids.shape}"
+        )
+
+        kwargs = self.preprocess_for_decoder(
+            is_prompt, block_tables, input_ids, cache_position
+        )
+        cache_position = kwargs.pop("cache_position")
+        block_tables = kwargs.pop("block_tables")
+
+        if is_prompt:
+            logits = self.model.prefill_decoder(
+                inputs_embeds=model_input.inputs_embeds,
+                position_embed=model_input.position_embed,
+                block_tables=block_tables,
+            ).logits
+        else:
+            padded_batch_size = kwargs.pop("padded_batch_size", self.decoder_batch_size)
+            self.model.decoder = self.model.decoders[padded_batch_size]
+            input_ids = kwargs.pop("input_ids")
+            inputs_embeds = self.model.embed_tokens(input_ids).to(self.dtype)
+            logits = self.model.decoder(
+                inputs_embeds=inputs_embeds,
+                cache_position=cache_position,
+                position_embed=model_input.position_embed,
+                block_tables=block_tables,
+            ).logits
+        if not is_prompt:
+            logits = logits[:request_nums]
+        return logits
 
     def _parse_and_validate_image_input(self, **kwargs: Any) -> Any | None:
         pixel_values = kwargs.pop("pixel_values", None)
@@ -385,39 +393,29 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         return self.model
 
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings | dict:
-        """Vision-only encode entry point (SupportsMultiModal / EC producer).
-
-        Unlike the simple MM models (which return a list of per-image token
-        embeddings), Qwen's cacheable unit is the dict returned by encode():
-        image/video embeds + grid_thw (+ deepstack for Qwen3-VL). It is consumed
-        on the decode side by build_prefill_inputs().
-        """
         image_input = self._parse_and_validate_image_input(**kwargs)
         video_input = self._parse_and_validate_video_input(**kwargs)
         if image_input is None and video_input is None:
             return []
 
         # Merge the per-modality encoder outputs into a single cacheable dict
-        # (consumed on the decode side by build_prefill_inputs()).
+        # (consumed on the decode side by build_prefill_inputs_from_cache()).
         result = {}
         result.update(self._process_image_input(image_input))
         result.update(self._process_video_input(video_input))
         return result
 
-    def build_prefill_inputs(
+    def build_prefill_inputs_from_cache(
         self,
         input_ids: torch.Tensor,
         cached_mm_outputs: list[dict],
         *,
         cache_position: torch.Tensor | None = None,
         running_requests_ids: list[str] | None = None,
+        mrope_position_deltas: dict[str, float] | None = None,
     ) -> dict:
-        """Build prefill_decoder kwargs from cached encoder outputs (EC consumer).
-
-        Reconstructs image/video embeds + grid_thw (+ deepstack) from the
-        per-feature dicts produced by embed_multimodal(), runs the merge via
-        preprocess_prefill, and stashes rope_deltas for the decode phase.
-        cache_position is unused (Qwen feeds positions via position_embed).
+        """
+        Build prefill_decoder kwargs from cached encoder outputs (EC consumer).
         """
         model_dtype = self.dtype
 
@@ -484,8 +482,12 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         )
 
         rope_deltas = prefill_params.pop("rope_deltas", None)
-        if rope_deltas is not None and running_requests_ids:
-            self.rope_deltas[running_requests_ids[0]] = rope_deltas.item()
+        if (
+            rope_deltas is not None
+            and running_requests_ids
+            and mrope_position_deltas is not None
+        ):
+            mrope_position_deltas[running_requests_ids[0]] = rope_deltas.item()
 
         return prefill_params
 
