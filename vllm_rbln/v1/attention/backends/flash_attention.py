@@ -205,8 +205,7 @@ def flash_attention_naive_prefill_impl(
     - mask: [batch, 1, 1, seq_len, max_seq_len]
     - seq_idx: [batch, 1]
       sequence position (number of already cached tokens)
-    - block_tables: [num_partitions,] for prefill,
-                    [batch, num_partitions] for decode
+    - block_tables: [batch, num_partitions] for prefill and decode
     - sinks: [n_heads, sink_len] (optional)
 
     Returns:
@@ -224,7 +223,7 @@ def flash_attention_naive_prefill_impl(
         s = seq_idx[0][0]
         e = s + seq_len
         # NOTE: this reference impl works only for single partition
-        block = block_tables[0].to(torch.int32)
+        block = block_tables[0][0].to(torch.int32)
         k_state = (
             kv_cache[0][block].unsqueeze(0).slice_scatter(k, dim=3, start=s, end=e)
         )
@@ -348,8 +347,7 @@ def flash_causal_attention_naive_prefill_impl(
       Key and value cache
     - seq_idx: [batch, 1]
       sequence position (number of already cached tokens)
-    - block_tables: [num_partitions,] for prefill,
-                    [batch, num_partitions] for decode
+    - block_tables: [batch, num_partitions] for prefill and decode
     - sinks: [n_heads, sink_len] (optional)
 
     Returns:
@@ -365,7 +363,7 @@ def flash_causal_attention_naive_prefill_impl(
 
     batch_size, n_kv_heads, n_groups, seq_len, head_dim = q.shape
     partition_size = kv_cache.size(-2)
-    num_partitions = block_tables.shape[0]
+    num_partitions = block_tables.shape[1]
 
     # Calculate the starting position (number of tokens already in cache)
     # seq_idx contains tokens per partition that are already cached
@@ -375,7 +373,7 @@ def flash_causal_attention_naive_prefill_impl(
     # Step 1: Write KV cache
     # We need to write seq_len new tokens starting at cache_start_pos
     for p in range(num_partitions):
-        block_idx = block_tables[p].to(torch.int32)
+        block_idx = block_tables[0, p].to(torch.int32)
 
         # Calculate how many tokens to write to this partition
         partition_start = p * partition_size
@@ -435,7 +433,7 @@ def flash_causal_attention_naive_prefill_impl(
 
     gathered_pos = 0
     for p in range(num_partitions):
-        block_idx = block_tables[p].to(torch.int32)
+        block_idx = block_tables[0, p].to(torch.int32)
 
         # Calculate how many tokens are in this partition after writing
         partition_start = p * partition_size
@@ -706,7 +704,7 @@ def sliding_window_attention_naive_prefill_impl(
     - cache_offset: [batch, 1]
       ending position after insertion (cache_seq_len + query_len)
     - scale: []. Attention scale factor
-    - block_tables: [batch] for prefill, [batch, 1] for decode
+    - block_tables: [batch, 1] for prefill and decode
     - sinks: [n_heads, sink_len] (optional)
 
     Returns:
@@ -721,7 +719,7 @@ def sliding_window_attention_naive_prefill_impl(
     seq_len = q.size(-2)
     cache_start = int(cache_seq_len[0][0].item())
     cache_end = int(cache_offset[0][0].item())
-    block = int(block_tables[0].item())
+    block = int(block_tables[0][0].item())
 
     k_cache = kv_cache[0][block].unsqueeze(0)
     k_cache_curr = torch.cat([k_cache[:, :, :, :cache_start, :], k], dim=3)
@@ -1144,8 +1142,7 @@ class RBLNFlashAttentionMetadataBuilder(
 
         attn_masks = None
         if is_prefill:
-            # NOTE(jiwoo.park) prefill's block_tables must be a 1D tensor.
-            block_tables_tensor = block_tables_tensor[0]
+            block_tables_tensor = block_tables_tensor[:1]
             if not self.is_causal:
                 prefill_chunk_size = self.chunked_prefill_size
                 chunked_attention_mask = torch.zeros(
@@ -1386,7 +1383,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         # NOTE(RBLN): vLLM passes q/k/v as [num_tokens, heads, head_size].
         # Convert that single contract to RBLN's [batch, kv_heads, groups, len, dim].
         assert query.dim() == 3
-        b_size = 1 if attn_metadata.is_prefill else attn_metadata.block_tables.size(0)
+        b_size = attn_metadata.block_tables.size(0)
         q_len = query.size(0) // b_size
         query = query.view(b_size, q_len, self.num_heads, self.head_size)
         key = key.view(b_size, q_len, self.num_kv_heads, self.head_size)
