@@ -149,4 +149,18 @@ full-layer는 이 박스 KMD(3.3.0~rc2, TDR 6s)에서 timeout이라, **layer를 
 - **정합성 (전부 sync baseline 대비 0 mismatch)**: 6L·12L·18L async 모두 IDENTICAL. deferral engage(`fast_defer=True`)도 재확인. → **C9b 기능 정확성 확정.**
 - **C9b 버그 발견+수정 (커밋 `6491df7`)**: 18L async가 `WorkerAsyncOutputCopy`에서 `RUN_INTERNAL vmem entry has no device mem`로 죽음. 원인: deferred `get_output`이 out_buf를 async-output 스레드에서 뒤늦게 D2H하는데, 파이프라인이 앞서 나가면(긴 forward/profiler 부하) out_buf의 device backing이 이미 회수됨. **수정: D2H를 `sample_task`(device 스레드, out_buf 갓 채운 직후)에서 하고 host 텐서를 반환**, get_output은 그것만 읽음. 6L에선 forward가 짧아 안 걸렸던 timing 버그(12L도 profiler 부하 주면 재현).
 - **overlap 실측 = 0.0% (6L·18L 공통, 중요한 negative 결과)**: `--profile` 트레이스에서 `gloo:all_reduce ∩ rebel/sync_run` 교집합 = 0ms. 18L forward가 step당 ~2.2ms로 충분히 긴데도 0 → "forward가 짧아서"가 아님. 트레이스상 all_reduce-wait(`device_communicator` busy-wait)와 forward가 **같은 tid에서 교대로 직렬** 실행. 즉 **deferral 기계(fwd_task device 스레드 + AsyncOutput 즉시 리턴)는 도는데, 메인 워커가 forward(N) 도중 EM(N+1)의 `_prepare_inputs`(all_reduce N+1)로 앞서 나가지 못함** → all_reduce와 forward가 여전히 직렬.
-- **다음 조사(overlap 실현)**: 왜 파이프라인이 앞서 안 나가는가 — 후보: (a) 엔진이 `get_output(N)`을 EM(N+1) 전에 inline 호출해 메인 블록(리포트 §48-54의 async_output_busy_loop deferral이 실제론 안 먹힐 수 있음), (b) 낙관적 스케줄러 batch_queue depth가 실제로 안 채워짐, (c) `_run_forward`가 device executor가 아니라 메인에서 실행되는지 재확인(트레이스 tid 귀속이 모호 — one-shot `threading.current_thread().name` 로그로 확정). deferral·정합성·수명버그는 해결됐고, 남은 건 이 **pipeline-runahead** 문제.
+- **다음 조사(overlap 실현)**: 왜 파이프라인이 앞서 안 나가는가 — 후보: (a) 엔진이 `get_output(N)`을 EM(N+1) 전에 inline 호출해 메인 블록, (b) 낙관적 스케줄러 batch_queue depth, (c) `_run_forward` tid 재확인. **(아래 2026-07-02 정정으로 이 절의 "overlap=0" 결론은 폐기됨.)**
+
+### 2026-07-02 정정 — overlap은 실제로 됨 (74%), 이전 "0%"는 측정 오류
+reduced-layer(18L)에서 **host perf_counter span 로깅**(`VLLM_RBLN_SPAN_LOG=1`; forward=device 스레드, all_reduce=`forward_context.num_tokens_across_dp`, 둘 다 pid 태깅)으로 재측정한 결과:
+- **decode all_reduce ∩ forward = 74.3%** (rank별 70~78%; all_reduce span의 39/56이 forward 구간에 완전 포함). all_reduce가 forward 시작 후 1~3ms에 발행되어 forward 안에서 끝남.
+- all_reduce(N)은 EM(N)에서 forward(N) submit **전**에 나가므로, forward(N) **내부**에서 도는 all_reduce는 **N+1번째** → **all_reduce(N+1)이 forward(N) 도중 실행되고 sampler(N)를 안 기다림**(FIFO상 sampler보다 앞). ⇒ **목표(§0) 달성.**
+- **worker 인프라 확인**: `multiproc_executor.worker_busy_loop`는 async면 `handle_output`이 AsyncOutput을 `async_output_queue`에 넣고 즉시 다음 RPC 처리 → get_output(device join)은 별도 `async_output_busy_loop` 스레드. 메인은 EM(N)→ST(N)→EM(N+1)을 device 대기 없이 진행(runahead OK).
+
+**왜 이전에 "overlap=0/3.6%"로 오판했나 (중요, 재현 방지):**
+1. **kineto/torch-profiler가 device-스레드 forward(`rebel/sync_run`)를 메인 tid로 오귀속** → Perfetto·`gloo∩rebel/sync_run` quant 모두 거짓 0%. **RBLN에서 overlap 측정은 트레이스가 아니라 host perf_counter span으로 해야 함.**
+2. 전체-run `isect(fwd, allreduce)`가 **prefill/straggler의 거대한 all_reduce wait span**(수십~수백ms, cross-rank 동기 skew)에 희석돼 3.6%로 나옴. **decode 스텝만(<10ms span)** 걸러야 진짜 74%가 보임.
+
+**측정 재현**: `VLLM_RBLN_SPAN_LOG=1` + async 18L 실행 → `SPAN fwd <pid> <t0> <t1>` / `SPAN allreduce <pid> <t0> <t1>` 로그를 pid별로 모아 `<10ms` span만 isect.
+
+**남은 것**: (a) 18L에서 3/4 지점 `RUN_INTERNAL EnsureSyncedOnPhysicalView`(vmem 수명 버그, get_output D2H fix와 다른 경로 — 추가 조사), (b) overlap 74% → 잔여 25%(짧은 forward/긴 all_reduce-wait 스텝) 개선, (c) full-layer는 여전히 박스 KMD/TDR timeout.
