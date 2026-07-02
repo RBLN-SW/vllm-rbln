@@ -44,7 +44,7 @@ dependencies = [
     "torchvision",
     "torchaudio",
     "torchcodec",
-    "torch-rbln==0.2.2",
+    "torch-rbln~=0.2.2.dev0",
     "optimum-rbln>=0.11.1a1",
 ]
 
