@@ -14,7 +14,6 @@
 
 import torch
 import vllm.model_executor.layers.quantization.fp8 as upstream
-import vllm_rbln.rbln_envs as envs
 from torch.nn.parameter import Parameter
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.fused_moe import (
@@ -48,6 +47,7 @@ from vllm.model_executor.parameter import (
 )
 from vllm.model_executor.utils import set_weight_attrs
 
+import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)
@@ -419,7 +419,10 @@ class Fp8LinearMethod(LinearMethodBase):
         # (fp8 -> dequantize bf16 -> bf16 torch.nn.functional.linear).
         if self.block_quant:
             assert self.weight_block_size is not None
-            return self.w8a8_block_fp8_linear.apply(
+            # block_fp8_op_cls is a conditional over two op classes with an
+            # identical .apply(); mypy widens the union to object, so silence
+            # the attr-defined false positive here.
+            return self.w8a8_block_fp8_linear.apply(  # type: ignore[attr-defined]
                 input=x,
                 weight=layer.weight,
                 weight_scale=layer.weight_scale,
@@ -818,21 +821,23 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 tokens_mask,
             )
         else:
-            final_hidden_states = torch.ops.rbln_custom_ops.custom_moe_glu_group_dequantize(
-                hidden_states,
-                gate_proj_weight,
-                gate_proj_weight_scale,
-                up_proj_weight,
-                up_proj_weight_scale,
-                down_proj_weight,
-                down_proj_weight_scale,
-                masked_routing_weights,
-                torch.tensor(self.weight_block_size[1], dtype=torch.int32),
-                layer.activation.value,
-                None,  # gate_proj_bias
-                None,  # up_proj_bias
-                None,  # down_proj_bias
-                expert_map_const,
+            final_hidden_states = (
+                torch.ops.rbln_custom_ops.custom_moe_glu_group_dequantize(
+                    hidden_states,
+                    gate_proj_weight,
+                    gate_proj_weight_scale,
+                    up_proj_weight,
+                    up_proj_weight_scale,
+                    down_proj_weight,
+                    down_proj_weight_scale,
+                    masked_routing_weights,
+                    torch.tensor(self.weight_block_size[1], dtype=torch.int32),
+                    layer.activation.value,
+                    None,  # gate_proj_bias
+                    None,  # up_proj_bias
+                    None,  # down_proj_bias
+                    expert_map_const,
+                )
             )
 
         return final_hidden_states.reshape(orig_shape)
