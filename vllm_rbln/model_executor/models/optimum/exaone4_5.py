@@ -167,11 +167,6 @@ class RBLNOptimumExaone4_5_ForConditionalGeneration(
         return result
 
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings | dict:
-        """Vision-only encode entry point (SupportsMultiModal / EC producer).
-
-        Like Qwen-VL, the cacheable unit is a dict of image/video embeds plus
-        their grid_thw rather than a flat list of per-item embeddings.
-        """
         image_input = self._parse_and_validate_image_input(**kwargs)
         video_input = self._parse_and_validate_video_input(**kwargs)
         if image_input is None and video_input is None:
