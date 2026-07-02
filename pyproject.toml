@@ -45,6 +45,9 @@ dependencies = [
     "torchaudio",
     "torchcodec",
     "optimum-rbln>=0.11.1a1",
+    # dev marker → rebel-compiler에만 prerelease(nightly) 허용 (PEP 440).
+    # 정확한 버전 핀은 uv.lock 담당. bump: uv lock --upgrade-package rebel-compiler
+    "rebel-compiler~=0.11.1.dev0",
 ]
 
 [project.optional-dependencies]
@@ -131,6 +134,12 @@ follow_imports = "silent"
 environments = [
     "sys_platform == 'linux' and platform_machine == 'x86_64'"
 ]
+# 3개 rbln index를 동시 등록하고 spec(prerelease 마커/연산자)이 선택을 결정한다.
+# RFC #738 §4.4 결정: rebel-compiler뿐 아니라 서드파티 패키지도 rbln index에서
+# 해석될 수 있는 cross-index 리스크까지 검토 후 수용 (index 전환 없는 dev↔release
+# 운용을 위해). 정확한 버전 재현은 uv.lock 담당 — lock 없는 설치는 계약 밖.
+index-strategy = "unsafe-best-match"
+prerelease = "if-necessary-or-explicit"   # uv 기본값을 명시 고정 — prerelease는 마커 있는 패키지(또는 prerelease만 존재하는 패키지)로 한정
 
 [[tool.uv.index]]
 name = "vllm-cpu"
@@ -141,6 +150,18 @@ explicit = true
 name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
 explicit = true
+
+[[tool.uv.index]]
+name = "rbln-nexus-nightly"
+url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/"
+
+[[tool.uv.index]]
+name = "rebellions"
+url = "https://pypi.rebellions.in/simple/"
+
+[[tool.uv.index]]
+name = "rbln-release"
+url = "https://pypi.rbln.ai/simple/"
 
 [tool.uv.sources]
 vllm = { index = "vllm-cpu" }
