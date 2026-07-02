@@ -3902,7 +3902,13 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
             model_start_time = time.perf_counter()
 
+            _span_log = (
+                os.environ.get("VLLM_RBLN_SPAN_LOG") == "1"
+                and not is_warmup_active()
+            )
+
             def _run_forward():
+                _sp0 = time.perf_counter() if _span_log else 0.0
                 # forward + its forward-context and capture_reports all run on
                 # whichever thread calls this (the device thread once deferred),
                 # so the module-global forward context is active on that thread
@@ -3932,6 +3938,10 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         inputs_embeds=inputs_embeds,
                         **model_kwargs,
                     )
+                if _span_log:
+                    import sys as _sys
+                    print("SPAN fwd %d %.6f %.6f" % (os.getpid(), _sp0, time.perf_counter()),
+                          file=_sys.stderr, flush=True)
                 return _mo, _reports
 
             _gil_probe = os.environ.get("VLLM_RBLN_GIL_PROBE") == "1"

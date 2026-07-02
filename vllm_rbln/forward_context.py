@@ -81,7 +81,14 @@ class RBLNDPMetadata(DPMetadata):
         )
         from vllm.distributed.parallel_state import get_dp_group
 
+        import os as _os, time as _time, sys as _sys
+        _t0 = _time.perf_counter()
         dist.all_reduce(num_tokens_tensor, group=get_dp_group().cpu_group)
+        if _os.environ.get("VLLM_RBLN_SPAN_LOG") == "1":
+            print(
+                "SPAN allreduce %d %.6f %.6f" % (_os.getpid(), _t0, _time.perf_counter()),
+                file=_sys.stderr, flush=True,
+            )
         return num_tokens_tensor
 
     @staticmethod
