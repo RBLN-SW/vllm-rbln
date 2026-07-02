@@ -55,6 +55,34 @@ cd vllm-rbln
 pip install -e . --extra-index-url https://wheels.vllm.ai/0.22.0/cpu --extra-index-url https://download.pytorch.org/whl/cpu
 ```
 
+### 🛠️ Development setup (uv)
+
+Requirements:
+- Linux x86_64 with access to the internal network (Nexus / internal PyPI)
+- Python **3.12** for this dev workflow (`rebel-compiler` nightly wheels are currently cp312-only; the package itself targets 3.10-3.13)
+
+Internal indexes require credentials (set once, e.g. in your shell profile):
+
+```bash
+export UV_INDEX_RBLN_NEXUS_NIGHTLY_USERNAME=<udc-nexus-user>
+export UV_INDEX_RBLN_NEXUS_NIGHTLY_PASSWORD=<udc-nexus-password>
+export UV_INDEX_REBELLIONS_USERNAME=<internal-pypi-user>
+export UV_INDEX_REBELLIONS_PASSWORD=<internal-pypi-password>
+```
+
+Then install the locked, team-identical environment with a single command:
+
+```bash
+uv sync
+```
+
+To bump `rebel-compiler` to the latest nightly (do not edit `pyproject.toml`):
+
+```bash
+uv lock --upgrade-package rebel-compiler
+# commit the updated uv.lock
+```
+
 ### 📚 Documentation
 
 - [Overview & Supported Models](https://docs.rbln.ai/software/model_serving/vllm_support/vllm-rbln.html)
