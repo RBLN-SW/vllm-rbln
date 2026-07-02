@@ -88,6 +88,8 @@ class RBLNTopKTopPSampler(nn.Module):
             num_devices=1 if USE_DEVICE_TENSOR or HAS_TORCH_RBLN else None,
             model_trace_method="export" if USE_DEVICE_TENSOR else "",
             mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
+            use_global_ctx=True if HAS_TORCH_RBLN and not USE_DEVICE_TENSOR else None,
+            global_device_id=0 if HAS_TORCH_RBLN and not USE_DEVICE_TENSOR else None,
         )
 
     @torch.compiler.disable

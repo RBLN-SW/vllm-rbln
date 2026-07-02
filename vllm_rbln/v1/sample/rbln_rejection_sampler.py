@@ -301,6 +301,8 @@ class RblnRejectionSamplerImpl(RejectionSamplerImpl):
             compile_context=compile_context,
             num_devices=1 if USE_DEVICE_TENSOR or HAS_TORCH_RBLN else None,
             mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
+            use_global_ctx=True if HAS_TORCH_RBLN and not USE_DEVICE_TENSOR else None,
+            global_device_id=0 if HAS_TORCH_RBLN and not USE_DEVICE_TENSOR else None,
         )
 
     def rejection_sample(
