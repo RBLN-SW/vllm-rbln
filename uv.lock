@@ -549,7 +549,7 @@ name = "exceptiongroup"
 version = "1.3.1"
 source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
 dependencies = [
-    { name = "typing-extensions", marker = "python_full_version < '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "typing-extensions", marker = "python_full_version < '3.11' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
 ]
 sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/exceptiongroup/1.3.1/exceptiongroup-1.3.1.tar.gz", hash = "sha256:8b412432c6055b0b7d14c310000ae93352ed6754f70fa8f7c34141f91c4e3219" }
 wheels = [
@@ -1964,6 +1964,18 @@ wheels = [
 ]
 
 [[package]]
+name = "pytest-timeout"
+version = "2.4.0"
+source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
+dependencies = [
+    { name = "pytest", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+]
+sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/pytest-timeout/2.4.0/pytest_timeout-2.4.0.tar.gz", hash = "sha256:7e68e90b01f9eff71332b25001f85c75495fc4e3a836701876183c4bcfd0540a" }
+wheels = [
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/pytest-timeout/2.4.0/pytest_timeout-2.4.0-py3-none-any.whl", hash = "sha256:c42667e5cdadb151aeb5b26d114aff6bdf5a907f176a007a30b940d3d865b5c2" },
+]
+
+[[package]]
 name = "pytest-xdist"
 version = "3.8.0"
 source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
@@ -2866,6 +2878,7 @@ test = [
     { name = "pytest", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "pytest-asyncio", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "pytest-cov", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "pytest-timeout", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "pytest-xdist", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
 ]
 
@@ -2882,6 +2895,7 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'test'" },
     { name = "pytest-asyncio", marker = "extra == 'test'" },
     { name = "pytest-cov", marker = "extra == 'test'" },
+    { name = "pytest-timeout", marker = "extra == 'test'" },
     { name = "pytest-xdist", marker = "extra == 'test'" },
     { name = "pyyaml" },
     { name = "qwen-vl-utils" },

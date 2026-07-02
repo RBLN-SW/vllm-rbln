@@ -56,6 +56,7 @@ test = [
     "pytest-asyncio",
     "pytest-xdist",
     "pytest-cov",
+    "pytest-timeout",
 ]
 build = [
     "build",

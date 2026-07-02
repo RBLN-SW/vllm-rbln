@@ -153,9 +153,6 @@ jobs:
             exit 1
           fi
           uv sync --locked --python 3.12 --extra test --extra dev
-          # pytest-timeout is not in the lock/extras but is required by --timeout in the arc job;
-          # install it here so both jobs share the same environment recipe.
-          uv pip install pytest-timeout
           # rebel-compiler version override (escape hatch)
           if [ -n "${{ inputs.rebel_compiler_version }}" ]; then
             uv pip install --no-deps "rebel-compiler==${{ inputs.rebel_compiler_version }}" --extra-index-url "${{ secrets.DEV_PKG_URL }}"
@@ -308,8 +305,6 @@ jobs:
               exit 1
             fi
             uv sync --locked --python 3.12 --extra test --extra dev
-            # pytest-timeout is not in the lock/extras but is required by --timeout below.
-            uv pip install pytest-timeout
             # rebel-compiler version override (escape hatch)
             if [ -n "${{ inputs.rebel_compiler_version }}" ]; then
               uv pip install --no-deps "rebel-compiler==${{ inputs.rebel_compiler_version }}" --extra-index-url "${{ secrets.DEV_PKG_URL }}"
