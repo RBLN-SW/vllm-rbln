@@ -82,10 +82,8 @@ class RBLNDPMetadata(DPMetadata):
         from vllm.distributed.parallel_state import get_dp_group
 
         import os as _os, time as _time, sys as _sys
-        import torch as _torch
         _t0 = _time.perf_counter()
-        with _torch.profiler.record_function("c9_all_reduce"):
-            dist.all_reduce(num_tokens_tensor, group=get_dp_group().cpu_group)
+        dist.all_reduce(num_tokens_tensor, group=get_dp_group().cpu_group)
         if _os.environ.get("VLLM_RBLN_SPAN_LOG") == "1":
             print(
                 "SPAN allreduce %d %.6f %.6f" % (_os.getpid(), _t0, _time.perf_counter()),

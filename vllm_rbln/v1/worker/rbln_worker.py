@@ -133,6 +133,20 @@ class RBLNWorker(WorkerBase):
                 local_rank=self.local_rank,
                 activities=["CPU"],
             )
+            # The deferred RBLN forward (VLLM_RBLN_ASYNC_FORWARD) runs on a
+            # raw device-executor thread. The profiler's default thread-local
+            # callbacks never see that thread, so its ops emit 0 events and
+            # the trace shows a false 0% all_reduce/forward overlap.
+            # profile_all_threads makes the callbacks global so the trace
+            # captures every thread, like a GPU trace would.
+            # torch.profiler.profile reads experimental_config lazily at
+            # start(), so setting it on the wrapped profiler here is
+            # sufficient.
+            from torch._C._profiler import _ExperimentalConfig
+
+            self.profiler.profiler.experimental_config = _ExperimentalConfig(
+                profile_all_threads=True
+            )
         else:
             self.profiler = None
 

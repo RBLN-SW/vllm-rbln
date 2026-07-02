@@ -3929,16 +3929,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         additional_kwargs=self._get_kv_cache_forward_context_kwargs(),
                     ),
                     capture_ctx as _reports,
-                    # NOTE: this record_function is a NO-OP for the torch
-                    # profiler when the forward is deferred -- record_function is
-                    # thread-local and this runs on the device executor thread,
-                    # which torch.profiler never entered, so it emits 0 events
-                    # (verified). torch.profiler/Perfetto therefore CANNOT show
-                    # the all_reduce/forward overlap on RBLN. Measure overlap
-                    # with VLLM_RBLN_SPAN_LOG=1 host perf_counter spans instead
-                    # (see docs/async_overlap_HANDOFF.md). Kept only to mark the
-                    # forward span for the inline (non-deferred) path.
-                    torch.profiler.record_function("c9_forward"),
                 ):
                     _mo = self.model_executable(
                         input_ids=input_ids,
