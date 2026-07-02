@@ -257,11 +257,6 @@ class RBLNOptimumModelRunner(
         # Maps mm_hash → dict of prefill params (inputs_embeds, position_embed, etc.)
         self.encoder_cache: dict[str, Any] = {}
 
-        # Runner-owned per-request MRoPE state (request_id → rope delta), mirroring
-        # upstream vLLM's CachedRequestState.mrope_position_delta. Populated at
-        # prefill by _build_forward_inputs (and the EC consumer path) and consumed
-        # to compute decode-step position embeddings. Model hooks return the delta;
-        # the runner owns storage and finished-request cleanup.
         self.mrope_position_deltas: dict[str, float] = {}
 
         # Ephemeral state transferred
