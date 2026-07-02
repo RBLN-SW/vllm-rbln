@@ -1,11 +1,19 @@
 # async overlap — GPU vs RBLN 방향성 Q&A (근거 정리)
 
-> 2026-07-02. STEP 1 판정((가) 확정, `async_overlap_RESUME.md` §2) 직후 나눈 방향성 논의를 정리.
-> 목적: "GPU에선 되는 overlap이 RBLN에선 왜 안 되나, GIL/stream/Event가 각각 어떤 역할인가"를
-> 코드 근거와 함께 못박아, (A) 런타임 glue 경량화로 가는 전제를 명확히 한다.
-> 결론 먼저: **병목은 stream/Event 부재가 아니라 forward 제출 사이의 두꺼운 host glue(디코드 forward의
-> ~68%를 GIL 잡은 채 도는 Python dispatch/prepare_inputs/address-patch)다.** threading(별도 host
-> 스레드) 방향은 유저가 완전 배제. 남은 길은 (A) 그 glue를 런타임 레벨에서 줄이는 것.
+> **⚠️ 2026-07-02 정정: 이 문서의 "병목 = 두꺼운 host glue(GIL 68% 점유)" 결론은 폐기됐다.**
+> 그 68%는 GIL_PROBE 아티팩트였고, 무왜곡 트레이스 재분석 결과 forward는 ~73% GIL-free(=`.run()`의
+> device drain, `EnsureAllTasksCompleted`). **진짜 병목 = RBLN forward `.run()`가 worker 스레드를
+> ~4.1ms 블로킹**해서 execute_model(N)이 forward 도중 리턴 못 함 → execute_model(N+1)이 forward(N)과
+> 못 겹침. **해법 = forward를 non-blocking으로(drain 미루기).** 최신 판정은 `async_overlap_RESUME.md` §2.
+> (아래 Q1~Q4의 GPU vs RBLN 메커니즘 설명 — GPU는 async forward로 host가 비어 저절로 겹침, RBLN은
+> forward가 blocking이라 안 됨, 타깃 all_reduce는 host gloo — 은 여전히 유효. "host glue가 병목/GIL 68%"
+> 표현만 위 정정으로 대체해서 읽을 것.)
+
+> 2026-07-02. GPU vs RBLN overlap 방향성 논의 정리.
+> 목적: "GPU에선 되는 overlap이 RBLN에선 왜 안 되나, GIL/stream/Event가 각각 어떤 역할인가".
+> 결론(정정본): 병목은 stream/Event 부재도, host glue도 아니라 **RBLN forward `.run()`의 blocking(device
+> drain)**이다. threading은 유저 배제. 남은 길 = forward를 non-blocking으로 만들어 기존 async scheduling이
+> execute_model(N+1)을 forward(N)과 겹치게 하는 것.
 
 ---
 

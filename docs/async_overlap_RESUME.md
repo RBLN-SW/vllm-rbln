@@ -1,11 +1,27 @@
 # async overlap — RESUME (다음 세션 단일 진입점)
 
-> 2026-07-02 갱신 (STEP 1 판정 완료). 이 파일 하나로 다음 세션에서 바로 이어서 진행한다.
-> **방향 확정: 단일 host 스레드로 GPU처럼 overlap을 낸다. multi-threading(구 `_DeviceForwardExecutor`) 방식은 기각.**
-> **★ STEP 1 결과(§2): (가) 확정 — decode forward가 GIL을 ~68% 점유. 단일 스레드로는 forward의 ~⅓만
-> 겹침 가능 → vLLM Python 레벨만으론 불가. 다음 결정은 유저 몫: (A) rebel 런타임 glue 경량화 vs (B) threading 재검토.**
-> 측정 도구: `docs/async_overlap_scripts/{overlap_from_spans.py, span_to_perfetto.py}`.
-> GPU vs RBLN 방향성 Q&A(왜 GPU는 되고 RBLN은 안 되나, GIL/stream/Event 역할): `docs/async_overlap_gpu_vs_rbln_QA.md`.
+> 2026-07-02 갱신 (STEP 1 판정 **정정됨**). 이 파일 하나로 다음 세션에서 바로 이어서 진행한다.
+> **방향 확정: 단일 host 스레드. multi-threading(구 `_DeviceForwardExecutor`) 방식은 기각(코드 제거 완료).**
+>
+> **★★ STEP 1 정정 (중요): 이전의 "(가) forward가 GIL 68% 점유" 판정은 GIL_PROBE의 spin 스레드가
+> forward를 18배 왜곡해 만든 아티팩트였다. 트레이스(무왜곡) 재분석 결과 실제는 (나):**
+> **decode forward host-walk ~6ms 중 ~4.1ms가 `.run()`의 device-완료 대기(`EnsureAllTasksCompleted`,
+> `runtime_instance.cc:1187/1197`)이고 이 구간은 GIL을 놓는다(`compiled_model.cc:50` `gil_scoped_release`).
+> 즉 forward는 ~73% GIL-free(device drain). GIL-잡는 Python glue는 ~1.5ms(~25%)뿐.**
+>
+> **→ overlap이 안 되는 진짜 이유: async scheduling(이미 ON)이 문제가 아니라, RBLN forward `.run()`이
+> worker 스레드를 4.1ms 블로킹해서 execute_model(N)이 forward 도중 리턴을 못 함 → execute_model(N+1)이
+> forward(N)과 못 겹침. GPU는 forward가 async라 worker가 비어서 저절로 겹침.**
+> **→ 해야 할 일: RBLN forward를 non-blocking으로(=`.run()`의 output drain을 뒤로 미뤄 device 핸들만
+> 리턴, sync는 sample_tokens에서). 그러면 vLLM 기존 async scheduling이 execute_model(N+1) prepare
+> (DP all_reduce 포함)를 forward(N)과 겹친다. vLLM 스케줄러/구조는 안 건드림.**
+>
+> 측정 도구: `docs/async_overlap_scripts/`(overlap_from_spans, span_to_perfetto, selftime_breakdown,
+> step_breakdown, analyze_profile_trace, distill_profile_trace, span_overlap_viz).
+> GPU vs RBLN 방향성 Q&A: `docs/async_overlap_gpu_vs_rbln_QA.md` (단, 그 문서의 "host glue가 병목"
+> 결론은 이 정정으로 폐기 — 병목은 blocking forward).
+> 실증: `VLLM_RBLN_OVERLAP_PROBE=1`(forward_context.py) — all_reduce(N+1)을 async 프리페치해 forward(N)과
+> 겹침을 증명(collect wait 0.004ms, all_reduce ~100% 숨김). 단 shadow(추가 collective)라 지연은 안 줄임.
 
 ## 0. 목표
 gpt-oss-120b EP+DP4 decode에서 매 step 도는 DP `gloo:all_reduce`(N+1)를 NPU forward(N) 실행 구간에
@@ -14,12 +30,13 @@ GPU처럼(후처리 없이) 보이게** 한다. **반드시 단일 스레드**�
 
 ## 1. 지금까지의 핵심 발견 (측정 근거 포함)
 
-### (F1) RBLN 제출은 이미 non-blocking — µs 단위
-18층 sync 런에서 `DynamoRuntime.run()`(제출 호출) wall time을 계측(임시 프로브, revert됨):
-**중앙값 0.01ms, p90 ~0.25ms** (rank×decode 2496콜). 즉 `run()`은 device 완료를 안 기다리고 드라이버
-커맨드 큐에 넣고 즉시 리턴한다. 출력도 device-tensor를 **D2H 없이** 리턴(`sync_runtime.py:274`).
-→ **rebel_compiler C++/`run_async` 신설 불필요.** 드라이버 큐는 이미 GPU 스트림처럼 FIFO 비동기
-(`runtime_instance.cc:1163-1231`, `rblnSubmitJob`/`rblnWaitJob`).
+### (F1) ⚠️ 정정됨 — RBLN 제출은 non-blocking이 아니다 (§2 참조)
+[구 주장, 폐기] "임시 프로브에서 `DynamoRuntime.run()` 중앙값 0.01ms → run()은 즉시 리턴, run_async 불필요."
+→ **틀림.** 무왜곡 트레이스 self-time에서 `<built-in method run of PyCapsule>`(= `_runtime_handle.run()`,
+`sync_runtime.py:268`)는 **~4.1ms/step**이고, 이는 `RuntimeInstance::Run`의 `EnsureAllTasksCompleted()`
+device drain(`runtime_instance.cc:1187/1197`) 때문이다. 구 프로브가 µs를 본 건 측정 범위 오류로 추정.
+**즉 forward는 blocking이고, 이걸 non-blocking으로 만드는 게 핵심 작업(§2).** (`rblnSubmitJob` 자체는 async지만
+Run()이 출력 복사 전에 drain해서 결과적으로 blocking.)
 
 ### (F2) 그런데 `model_executable()` 전체는 decode당 ~3.5ms (host)
 SPAN fwd(= `_run_forward` = 컴파일 그래프 전체 실행) 중앙값 **3.5ms**. 개별 `.run()`은 µs인데 전체가
@@ -41,27 +58,39 @@ GPU식 "device 트랙"까지 원하면 kineto plugin이 필요하나(torch 2.11�
 + `IActivityProfiler`/`GenericTraceActivity` API 완비, torch_rbln엔 미구현), **overlap이 실제로 나기
 전엔 불필요**. 후처리 방식도 기각(유저).
 
-## 2. ★ STEP 1 판정 완료 (2026-07-02) — **(가) 확정**: forward가 GIL의 ~68%를 점유
+## 2. ★ STEP 1 판정 정정 (2026-07-02) — **(나) 확정**: forward는 GIL-free device drain
 
-GIL_PROBE 실측(gpt-oss-120b EP+DP4 18층 decode, 2회 실행: 오염본 /tmp/gil.log + 클린본
-`RBLN_VERBOSE=warning` /tmp/gil2.log). warm(steady) 244샘플, **클린 캘리브레이션(free_rate≥85M/s)
-154샘플에서 `gil_free_ratio` 중앙값 0.33 (mean 0.32, p10–p90 0.30–0.34)**. during 30.6M/s vs
-무경합 95.2M/s → **forward 중 GIL이 ~68% 점유됨(=(가))**. 근거 3:
-1. 디버그 로깅(dev 빌드 `RBLN_VERBOSE=debug` 기본값이 켜놓은 `[D] [runtime]` 스퓸, 로그의 80%)을
-   `RBLN_VERBOSE=warning`으로 꺼도 ratio 동일 ~0.32 → 낮은 during_rate은 CPU 경합이 아니라 진짜 GIL 점유.
-2. spin 스레드 붙이면 forward가 (F2의) 3.5ms→~65ms로 18배 폭증. GIL-free forward라면 안 느려짐.
-   이 폭증 자체가 subgraph별 fine-grained Python dispatch(prepare_inputs/address-patch)가 GIL을
-   잡았다 놨다 반복(switch-interval ping-pong)한다는 signature.
-3. 4 rank 전부 일관.
+**이전 판정 (가)는 폐기.** GIL_PROBE로 `gil_free_ratio≈0.32`(GIL 68% 점유)를 얻었으나, 이는 프로브의
+spin 스레드가 forward를 3.5ms→~65ms(18배)로 왜곡한 **측정 아티팩트**였다. 무왜곡 트레이스(--profile)를
+op별 self-time으로 재분석한 결과가 진실:
 
-**함의(=RESUME §2 (가) 브랜치)**: 단일 host 스레드로는 DP all_reduce를 forward 창의 **최대 ~⅓**에만
-겹칠 수 있음 → **vLLM Python 레벨만으로는 GPU식 overlap 불가**. 남은 길 두 갈래(유저 결정 필요):
-- **(A) 런타임 submission glue 경량화**: rebel_compiler에서 그래프 실행의 host-side dispatch/
-  prepare_inputs/address-patch 비용을 줄여 GIL 점유 시간 자체를 축소. §3의 drain 계측과 함께,
-  "3.5ms forward의 host time 분해"를 rebel 런타임 프로파일로 재현해야 함(어디서 GIL을 잡는지).
-- **(B) threading 재검토**: 단일 스레드 제약(유저가 기각했던 방향)을 다시 열지 여부. GIL을 놓는 별도
-  스레드에서 all_reduce를 돌리면 그 ~68% 구간에도 겹칠 수 있으나, torch profile GPU식 표시/정합성
-  재작업 부담이 큼.
+**decode forward host-walk ~5.99ms/step 분해 (baseline 트레이스, `selftime_breakdown.py`/`fwd_breakdown`):**
+| 구간 | 시간 | GIL |
+|---|---|---|
+| `.run()` — NPU forward 완료 대기(`EnsureAllTasksCompleted`) | ~4.1ms (64%) | **놓음** (`compiled_model.cc:50` gil_scoped_release) |
+| prepare_inputs/outputs (address-patch, CS DMA) | ~0.6ms (9%) | **놓음** (:80/:82) |
+| torch.compile guards + aten + vllm-rbln python glue | ~1.5ms (25%) | 잡음 |
+
+→ **forward는 ~73% GIL-free** (실제 gil_free_ratio≈0.73). `.run()`의 4.1ms는 host가 GIL 놓고 NPU가
+forward 도는 걸 기다리는 **device drain**(`runtime_instance.cc:1187 force_sync / :1197 multi-output copy 전`).
+= 원래 RESUME이 (나)로 적어둔 그 케이스.
+
+**overlap이 안 되는 진짜 원인 (async scheduling 무관)**: async scheduling은 이미 ON이고 정상. 문제는
+**RBLN forward `.run()`이 worker 스레드를 4.1ms 블로킹**해서 `execute_model(N)`이 forward 도중 리턴을
+못 하는 것. 그래서 `execute_model(N+1)`(그 안의 `_prepare_inputs`→`get_dp_padding`→DP all_reduce)이
+forward(N) 도중 시작을 못 함 → 직렬. GPU는 forward가 async(커널 launch 후 즉시 리턴)라 worker가 비어서
+기존 async scheduling이 execute_model(N+1) prepare를 forward(N)과 저절로 겹침.
+
+**해야 할 일 (기존 vLLM 틀 유지)**: RBLN forward를 **non-blocking**으로 — `.run()`의 output drain/copy를
+뒤로 미뤄 device-tensor 핸들만 리턴하고, 실제 device sync는 소비 시점(`sample_tokens`)으로 이동. 그러면
+worker가 forward 도중 비어서 vLLM async scheduling이 execute_model(N+1)을 forward(N)과 겹친다.
+(콜 체인: `execute_model`:3337 → `_prepare_inputs`:1247 → `get_dp_padding`:1916 → `num_tokens_across_dp`
+→ `dist.all_reduce` `forward_context.py:100`. 전부 worker.)
+
+**실증 완료**: `VLLM_RBLN_OVERLAP_PROBE=1`(forward_context.py)로 all_reduce(N+1)을 async 프리페치 →
+forward(N)의 GIL-free device 대기 동안 gloo runloop이 완료 → collect wait 0.004ms(vs blocking 0.6~2.4ms),
+all_reduce ~100% 숨김, 데드락 없음. 단 이건 shadow(추가 collective)라 지연 자체는 안 줄임(가능성 증명용).
+진짜 해법은 위 "non-blocking forward".
 
 ### STEP 1 재현 레시피 (~15분 첫 실행. **캐시가 decode-bucket JIT은 못 건너뜀** — 매 프로세스 재컴파일)
 ```bash
@@ -75,11 +104,11 @@ VLLM_RBLN_OPTIMISTIC_SCHED=1 VLLM_RBLN_GIL_PROBE=1 \
 python3 -m vllm_rbln_exec.parity_runner --task r --model gpt-oss-120b --ep --dp 4 --rsd 1 \
   --max-model-len 131072 --block-size 1024 --max-num-batched-tokens 512 --batch 1 \
   --num-hidden-layers 18 --max-num-blocks 129 --max-tokens 16 --num-prompts 4 2>&1 | tee /tmp/gil2.log
-# 분석: forward_ms>1000(=컴파일 오염) 버리고, free_rate>=85M(=무경합 캘리브)만 골라 ratio 중앙값.
-# ratio ~0.32 재확인되면 (가). (판정 스크립트는 세션 히스토리 참고: fwd<=1000 & free>=85e6 필터.)
+# [주의] GIL_PROBE ratio는 spin 스레드가 forward를 왜곡하므로 신뢰 불가(§2 정정). 대신 --profile
+# 트레이스 self-time으로 forward 분해(selftime_breakdown.py / fwd_breakdown)가 신뢰 소스.
 ```
 
-## 3. (나)로 판명 시 — drain 지점과 다음 작업
+## 3. ★ 확정된 다음 작업 — drain 제거로 forward를 non-blocking 화 (§2의 해법)
 `model_executable` 안의 host-sync(drain)는 `RuntimeInstance::Run`에서:
 - 그래프 중간 host op 실행 전 (`runtime_instance.cc:788` `EnsureAllTasksCompleted`)
 - const-buffer device op 전 (`:878`), multi-output copy 전 (`:1204`)
