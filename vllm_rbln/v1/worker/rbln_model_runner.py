@@ -306,18 +306,13 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
         This function blocks until the copy is finished.
         """
         if self._sample_future is not None:
-            # Wait for the deferred sample_task, drain the device so the
-            # pre-alloc'd buffer is filled, then start the D2H. get_output runs
-            # on the async-output thread, not the @inference_mode worker thread,
-            # so re-enter InferenceMode -- the buffers were allocated as
-            # inference tensors and the in-place copy is otherwise rejected.
-            self._sample_future.result()
+            # The deferred sample_task already performed the D2H on the device
+            # thread and returns the host copy. We must NOT touch the device
+            # tensor here: by now the pipeline has run ahead and out_buf's device
+            # backing may be reclaimed (RUN_INTERNAL "no device mem").
+            self._sampled_token_ids_cpu = self._sample_future.result()
+        else:
             torch.rbln.synchronize(self._device_index)
-            with torch.inference_mode():
-                self._sampled_token_ids_cpu.copy_(
-                    self._sampled_token_ids, non_blocking=True
-                )
-        torch.rbln.synchronize(self._device_index)
 
         # Release the device tensor once the copy has completed
         del self._sampled_token_ids
@@ -4260,7 +4255,13 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     num_reqs_override=num_reqs,
                 )
                 out_buf.copy_(sampler_output.sampled_token_ids[:num_reqs])
-                return sampler_output
+                # D2H here, on the device thread, while out_buf is fresh and the
+                # device context is valid. Deferring the copy to get_output (on
+                # the async-output thread) races the vmem manager reclaiming
+                # out_buf's device backing once the pipeline runs ahead --
+                # RUN_INTERNAL "vmem entry has no device mem" at longer forward
+                # or under profiler load. Return the host copy for get_output.
+                return out_buf.to("cpu")
 
             sample_future = self._device_executor.submit(_sample_task)
 
