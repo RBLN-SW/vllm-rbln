@@ -45,6 +45,9 @@ dependencies = [
     "torchaudio",
     "torchcodec",
     "optimum-rbln>=0.11.1a1",
+    # dev marker → allow prerelease (nightly) for rebel-compiler only (PEP 440).
+    # Exact version pinning is uv.lock's job. Bump: uv lock --upgrade-package rebel-compiler
+    "rebel-compiler~=0.11.1.dev0",
 ]
 
 [project.optional-dependencies]
@@ -53,6 +56,7 @@ test = [
     "pytest-asyncio",
     "pytest-xdist",
     "pytest-cov",
+    "pytest-timeout",
 ]
 build = [
     "build",
@@ -131,6 +135,13 @@ follow_imports = "silent"
 environments = [
     "sys_platform == 'linux' and platform_machine == 'x86_64'"
 ]
+# Register all three rbln indexes at once; the spec (prerelease marker/operator)
+# decides which version gets selected. Decision per RFC #738 §4.4: the cross-index
+# risk that third-party packages (not just rebel-compiler) may resolve from rbln
+# indexes was reviewed and accepted, to keep a fixed index config across dev/release.
+# Exact reproduction is uv.lock's job — installs without the lock are out of contract.
+index-strategy = "unsafe-best-match"
+prerelease = "if-necessary-or-explicit"   # pin uv's default explicitly — prereleases only for packages with a marker (or prerelease-only packages)
 
 [[tool.uv.index]]
 name = "vllm-cpu"
@@ -141,6 +152,18 @@ explicit = true
 name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
 explicit = true
+
+[[tool.uv.index]]
+name = "rbln-nexus-nightly"
+url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/"
+
+[[tool.uv.index]]
+name = "rebellions"
+url = "https://pypi.rebellions.in/simple/"
+
+[[tool.uv.index]]
+name = "rbln-release"
+url = "https://pypi.rbln.ai/simple/"
 
 [tool.uv.sources]
 vllm = { index = "vllm-cpu" }

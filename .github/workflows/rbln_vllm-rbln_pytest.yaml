@@ -82,13 +82,6 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      - name: Parse vllm-cpu index URL from pyproject.toml
-        id: parse_index_url
-        run: |
-          VLLM_CPU_URL=$(python3 -c "import tomllib; f=open('pyproject.toml','rb'); config=tomllib.load(f); print(next(i['url'] for i in config.get('tool',{}).get('uv',{}).get('index',[]) if i.get('name')=='vllm-cpu'))")
-          echo "Parsed vllm-cpu URL: ${VLLM_CPU_URL}"
-          echo "VLLM_CPU_URL=${VLLM_CPU_URL}" >> $GITHUB_OUTPUT
-
       - name: Get commit message
         id: get_commit_message
         run: |
@@ -108,7 +101,7 @@ jobs:
           COMMIT_MESSAGE: ${{ steps.get_commit_message.outputs.message }}
         run: |
           SKIP=false
-          
+
           case "${{ matrix.test_type.name }}" in
             "core")
               if [[ "$COMMIT_MESSAGE" == *"[skip core]"* ]]; then
@@ -131,49 +124,42 @@ jobs:
               fi
               ;;
           esac
-          
+
           echo "skip=$SKIP" >> $GITHUB_OUTPUT
           echo "Skip decision: $SKIP"
 
-      - name: Set up Python 3.12
+      - name: Install uv
         if: steps.should_skip.outputs.skip != 'true'
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+        uses: astral-sh/setup-uv@v5
 
-      - name: Install rebel-compiler
+      - name: Install build-essential
         if: steps.should_skip.outputs.skip != 'true'
         run: |
           for i in {1..3}; do
             sudo apt-get update && break || sleep 10
           done
           sudo apt-get install -y build-essential
-          python3 -m pip uninstall rebel-compiler -y
-          VERSION="${{ inputs.rebel_compiler_version }}"
-          if [ -z "$VERSION" ]; then
-            echo "Error: rebel_compiler_version is not set"
+
+      - name: Create test environment via uv sync
+        if: steps.should_skip.outputs.skip != 'true'
+        env:
+          UV_INDEX_RBLN_NEXUS_NIGHTLY_USERNAME: ${{ secrets.UDC_NEXUS_USERNAME }}
+          UV_INDEX_RBLN_NEXUS_NIGHTLY_PASSWORD: ${{ secrets.UDC_NEXUS_PASSWORD }}
+          UV_INDEX_REBELLIONS_USERNAME: ${{ secrets.REBEL_PYPI_USERNAME }}
+          UV_INDEX_REBELLIONS_PASSWORD: ${{ secrets.REBEL_PYPI_PASSWORD }}
+        run: |
+          if [ -z "$UV_INDEX_RBLN_NEXUS_NIGHTLY_USERNAME" ] || [ -z "$UV_INDEX_REBELLIONS_USERNAME" ]; then
+            echo "::error::UDC_NEXUS_USERNAME/PASSWORD and REBEL_PYPI_USERNAME/PASSWORD secrets not available to this repo — add repo/org secrets (LDAP account)"
             exit 1
           fi
-          echo "rebel-compiler ${VERSION}"
-          python3 -m pip install --extra-index-url ${{ secrets.DEV_PKG_URL }} rebel-compiler=="${VERSION}"
-
-      - name: Download wheel artifact
-        if: steps.should_skip.outputs.skip != 'true'
-        uses: actions/download-artifact@v4
-        with:
-          name: vllm-wheel
-          path: dist
-
-      - name: Install local vllm-rbln package and dependencies
-        if: steps.should_skip.outputs.skip != 'true'
-        run: |
-          VLLM_CPU_URL="${{ steps.parse_index_url.outputs.VLLM_CPU_URL }}"
-          pip install packaging setuptools wheel simphile pynvml huggingface_hub setuptools_scm fire pytest pytest-asyncio
+          uv sync --locked --python 3.12 --extra test --extra dev
+          # rebel-compiler version override (escape hatch)
+          if [ -n "${{ inputs.rebel_compiler_version }}" ]; then
+            uv pip install --no-deps "rebel-compiler==${{ inputs.rebel_compiler_version }}" --extra-index-url "${{ secrets.DEV_PKG_URL }}"
+          fi
+          # optimum-rbln version override (escape hatch)
           if [ -n "${{ inputs.optimum_rbln_version }}" ]; then
-            pip install --force-reinstall --no-cache-dir dist/vllm_rbln*.whl --constraint <(echo "optimum-rbln==${{ inputs.optimum_rbln_version }}") --index-url http://pypi-cache.devpi.svc.cluster.local/root/pypi/+simple/ --extra-index-url "${VLLM_CPU_URL}" --extra-index-url https://download.pytorch.org/whl/cpu --trusted-host pypi-cache.devpi.svc.cluster.local --extra-index-url https://pypi.org/simple
-            echo "optimum-rbln ${{ inputs.optimum_rbln_version }}"
-          else
-            pip install --force-reinstall --no-cache-dir dist/vllm_rbln*.whl --index-url http://pypi-cache.devpi.svc.cluster.local/root/pypi/+simple/ --extra-index-url "${VLLM_CPU_URL}" --extra-index-url https://download.pytorch.org/whl/cpu --trusted-host pypi-cache.devpi.svc.cluster.local --extra-index-url https://pypi.org/simple
+            uv pip install --no-deps "optimum-rbln==${{ inputs.optimum_rbln_version }}"
           fi
 
       - name: Run pytest
@@ -184,13 +170,13 @@ jobs:
         run: |
           case "${{ matrix.test_type.name }}" in
             "core")
-              pytest tests/v1/core -vv --durations 0
+              uv run --no-sync pytest tests/v1/core -vv --durations 0
               ;;
             "worker")
-              pytest tests/v1/worker/test_rebel_optimum_model_runner.py -vv --durations 0
+              uv run --no-sync pytest tests/v1/worker/test_rebel_optimum_model_runner.py -vv --durations 0
               ;;
             "optimum_compile")
-              pytest tests/optimum_compile -vv --durations 0
+              uv run --no-sync pytest tests/optimum_compile -vv --durations 0
               ;;
           esac
 
@@ -240,13 +226,6 @@ jobs:
       - name: Fix git ownership
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
-      - name: Parse vllm-cpu index URL from pyproject.toml
-        id: parse_index_url
-        run: |
-          VLLM_CPU_URL=$(python3 -c "import tomllib; f=open('pyproject.toml','rb'); config=tomllib.load(f); print(next(i['url'] for i in config.get('tool',{}).get('uv',{}).get('index',[]) if i.get('name')=='vllm-cpu'))")
-          echo "Parsed vllm-cpu URL: ${VLLM_CPU_URL}"
-          echo "VLLM_CPU_URL=${VLLM_CPU_URL}" >> $GITHUB_OUTPUT
 
       - name: Get commit message
         id: get_commit_message
@@ -298,32 +277,22 @@ jobs:
         run: |
           pip install uv
 
-      - name: Install rebel-compiler
+      - name: Install build-essential
         if: steps.should_skip.outputs.skip != 'true'
         run: |
           for i in {1..3}; do
             apt-get update && break || sleep 10
           done
           apt-get install -y build-essential
-          uv pip uninstall --system rebel-compiler
-          VERSION="${{ inputs.rebel_compiler_version }}"
-          if [ -z "$VERSION" ]; then
-            echo "Error: rebel_compiler_version is not set"
-            exit 1
-          fi
-          echo "rebel-compiler ${VERSION}"
-          uv pip install --system --extra-index-url ${{ secrets.DEV_PKG_URL }} rebel-compiler=="${VERSION}"
 
-      - name: Download wheel artifact
-        if: steps.should_skip.outputs.skip != 'true'
-        uses: actions/download-artifact@v4
-        with:
-          name: vllm-wheel
-          path: dist
-
-      - name: Install local vllm-rbln package and dependencies
+      - name: Create test environment via uv sync
         if: steps.should_skip.outputs.skip != 'true'
         uses: nick-fields/retry@v3
+        env:
+          UV_INDEX_RBLN_NEXUS_NIGHTLY_USERNAME: ${{ secrets.UDC_NEXUS_USERNAME }}
+          UV_INDEX_RBLN_NEXUS_NIGHTLY_PASSWORD: ${{ secrets.UDC_NEXUS_PASSWORD }}
+          UV_INDEX_REBELLIONS_USERNAME: ${{ secrets.REBEL_PYPI_USERNAME }}
+          UV_INDEX_REBELLIONS_PASSWORD: ${{ secrets.REBEL_PYPI_PASSWORD }}
         with:
           timeout_minutes: 15
           max_attempts: 3
@@ -331,13 +300,18 @@ jobs:
           retry_on: any
           shell: bash
           command: |
-            VLLM_CPU_URL="${{ steps.parse_index_url.outputs.VLLM_CPU_URL }}"
-            uv pip install --system packaging setuptools wheel simphile pynvml huggingface_hub setuptools_scm fire pytest pytest-asyncio pytest-xdist pytest-timeout
+            if [ -z "$UV_INDEX_RBLN_NEXUS_NIGHTLY_USERNAME" ] || [ -z "$UV_INDEX_REBELLIONS_USERNAME" ]; then
+              echo "::error::UDC_NEXUS_USERNAME/PASSWORD and REBEL_PYPI_USERNAME/PASSWORD secrets not available to this repo — add repo/org secrets (LDAP account)"
+              exit 1
+            fi
+            uv sync --locked --python 3.12 --extra test --extra dev
+            # rebel-compiler version override (escape hatch)
+            if [ -n "${{ inputs.rebel_compiler_version }}" ]; then
+              uv pip install --no-deps "rebel-compiler==${{ inputs.rebel_compiler_version }}" --extra-index-url "${{ secrets.DEV_PKG_URL }}"
+            fi
+            # optimum-rbln version override (escape hatch)
             if [ -n "${{ inputs.optimum_rbln_version }}" ]; then
-              uv pip install --system --force-reinstall --no-cache-dir dist/vllm_rbln*.whl --constraint <(echo "optimum-rbln==${{ inputs.optimum_rbln_version }}") --index-url http://pypi-cache.devpi.svc.cluster.local/root/pypi/+simple/ --extra-index-url "${VLLM_CPU_URL}" --extra-index-url https://download.pytorch.org/whl/cpu  --extra-index-url https://pypi.org/simple --index-strategy unsafe-best-match
-              echo "optimum-rbln ${{ inputs.optimum_rbln_version }}"
-            else
-              uv pip install --system --force-reinstall --no-cache-dir dist/vllm_rbln*.whl --index-url http://pypi-cache.devpi.svc.cluster.local/root/pypi/+simple/ --extra-index-url "${VLLM_CPU_URL}" --extra-index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple --index-strategy unsafe-best-match
+              uv pip install --no-deps "optimum-rbln==${{ inputs.optimum_rbln_version }}"
             fi
 
       - name: Run pytest
@@ -348,18 +322,18 @@ jobs:
         run: |
           case "${{ matrix.test_type.name }}" in
             "openai")
-              pytest tests/entrypoints/openai -vv --durations 0 --timeout=600
+              uv run --no-sync pytest tests/entrypoints/openai -vv --durations 0 --timeout=600
               ;;
             "llm")
-              pytest tests/entrypoints/llm -vv --durations 0
+              uv run --no-sync pytest tests/entrypoints/llm -vv --durations 0
               ;;
             "sampler")
-              pytest -n auto -k "warm_up_true" tests/v1/worker/test_sampler.py -vv --durations 0
-              pytest -n auto -k "warm_up_false" tests/v1/worker/test_sampler.py -vv --durations 0
-              pytest -n auto -k "not warm_up_true and not warm_up_false" tests/v1/worker/test_sampler.py -vv --durations 0
+              uv run --no-sync pytest -n auto -k "warm_up_true" tests/v1/worker/test_sampler.py -vv --durations 0
+              uv run --no-sync pytest -n auto -k "warm_up_false" tests/v1/worker/test_sampler.py -vv --durations 0
+              uv run --no-sync pytest -n auto -k "not warm_up_true and not warm_up_false" tests/v1/worker/test_sampler.py -vv --durations 0
               ;;
             "models")
-              pytest tests/v1/models -vv --durations 0
+              uv run --no-sync pytest tests/v1/models -vv --durations 0
               ;;
           esac
 
