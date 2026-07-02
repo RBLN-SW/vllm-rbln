@@ -15,15 +15,21 @@
 > **→ non-blocking forward는 조사 결과 "쉬운 flag skip" 불가(§3): `.run()` drain은 decode 그래프의
 > mid-graph host-op/const-buffer가 강제하는 필수 sync라, 없애려면 컴파일러 레벨 그래프 재구성 필요
 > = 정합성-안전 최소변경 아님 → 미구현.**
-> **→ 실현 가능한 경로 = all_reduce 프리페치(§3 하단, `VLLM_RBLN_OVERLAP_PROBE` 실증): forward의
-> GIL-free drain 창에 gloo가 all_reduce(N+1)을 돌림. forward_context만 수정, vLLM 구조 불변.**
+> **→ 실현 가능한 경로 = all_reduce 프리페치(§3 하단, `VLLM_RBLN_OVERLAP=1`): forward의 GIL-free
+> drain 창에 gloo가 all_reduce(N+1)을 돌림. forward_context.py만 수정, vLLM 구조 불변.**
 >
 > 측정 도구: `docs/async_overlap_scripts/`(overlap_from_spans, span_to_perfetto, selftime_breakdown,
 > step_breakdown, analyze_profile_trace, distill_profile_trace, span_overlap_viz).
 > GPU vs RBLN 방향성 Q&A: `docs/async_overlap_gpu_vs_rbln_QA.md` (단, 그 문서의 "host glue가 병목"
 > 결론은 이 정정으로 폐기 — 병목은 blocking forward).
-> 실증: `VLLM_RBLN_OVERLAP_PROBE=1`(forward_context.py) — all_reduce(N+1)을 async 프리페치해 forward(N)과
-> 겹침을 증명(collect wait 0.004ms, all_reduce ~100% 숨김). 단 shadow(추가 collective)라 지연은 안 줄임.
+>
+> **★ 구현 상태 (2026-07-02, 미검증)**: `VLLM_RBLN_OVERLAP=1` — 실제 DP all_reduce를 한 step 앞당겨
+> async 발사(prefetch)하고 다음 step에서 collect하는 파이프라인을 `forward_context.py`
+> `num_tokens_and_reqs_across_dp`에 구현(기본 off). arm/collect 결정을 reduce 결과로만 내려 데드락 없음.
+> steady decode에서 정확, prefill/ragged 전이는 1-step stale(self-heal). **박스 점유로 런타임 parity·
+> overlap 검증 못 함 — 박스 비면 SPAN ar_collect(=barrier 포함 실제 wait)로 긴 all_reduce까지 숨는지 확인 필요.**
+> (구 `VLLM_RBLN_OVERLAP_PROBE` shadow는 제거됨. 그 collect 0.004ms는 sync 직후라 skew-free여서 짧은
+> network만 숨긴 것 — 긴/barrier-heavy all_reduce 숨김은 이 real move로 재측정해야 확인됨.)
 
 ## 0. 목표
 gpt-oss-120b EP+DP4 decode에서 매 step 도는 DP `gloo:all_reduce`(N+1)를 NPU forward(N) 실행 구간에
@@ -83,16 +89,17 @@ forward 도는 걸 기다리는 **device drain**(`runtime_instance.cc:1187 force
 forward(N) 도중 시작을 못 함 → 직렬. GPU는 forward가 async(커널 launch 후 즉시 리턴)라 worker가 비어서
 기존 async scheduling이 execute_model(N+1) prepare를 forward(N)과 저절로 겹침.
 
-**해야 할 일 (기존 vLLM 틀 유지)**: RBLN forward를 **non-blocking**으로 — `.run()`의 output drain/copy를
-뒤로 미뤄 device-tensor 핸들만 리턴하고, 실제 device sync는 소비 시점(`sample_tokens`)으로 이동. 그러면
-worker가 forward 도중 비어서 vLLM async scheduling이 execute_model(N+1)을 forward(N)과 겹친다.
+**두 가지 후보 (§3에서 실현가능성 판정)**:
+- (a) RBLN forward를 non-blocking으로 → 그러면 vLLM async scheduling이 저절로 겹침. **§3 결과: mid-graph
+  host-op/const-buffer drain 때문에 flag로 불가, 컴파일러 재구성 필요 → 미채택.**
+- (b) all_reduce(N+1)만 프리페치(forward drain의 GIL-free 창에 gloo가 돌림) → **채택, `VLLM_RBLN_OVERLAP=1`로 구현(미검증).**
 (콜 체인: `execute_model`:3337 → `_prepare_inputs`:1247 → `get_dp_padding`:1916 → `num_tokens_across_dp`
-→ `dist.all_reduce` `forward_context.py:100`. 전부 worker.)
+→ `dist.all_reduce` `forward_context.py`. 전부 worker.)
 
-**실증 완료**: `VLLM_RBLN_OVERLAP_PROBE=1`(forward_context.py)로 all_reduce(N+1)을 async 프리페치 →
-forward(N)의 GIL-free device 대기 동안 gloo runloop이 완료 → collect wait 0.004ms(vs blocking 0.6~2.4ms),
-all_reduce ~100% 숨김, 데드락 없음. 단 이건 shadow(추가 collective)라 지연 자체는 안 줄임(가능성 증명용).
-진짜 해법은 위 "non-blocking forward".
+**주의(중요)**: 이전에 shadow 프로브에서 잰 collect 0.004ms(=all_reduce ~100% 숨김)는 **실제 blocking
+all_reduce 직후(rank sync됨, skew=0)에 shadow를 쏴서** 짧은 network만 숨긴 결과였음. **긴/barrier-heavy
+all_reduce가 숨는지는 증명 못 했음.** (b) real move(`VLLM_RBLN_OVERLAP`)는 한 step 앞당겨 쏘므로 barrier
+skew까지 숨길 여지가 있으나 **미검증** — SPAN ar_collect(barrier 포함 실제 wait)로 재측정 필요(박스 대기).
 
 ### STEP 1 재현 레시피 (~15분 첫 실행. **캐시가 decode-bucket JIT은 못 건너뜀** — 매 프로세스 재컴파일)
 ```bash
@@ -128,13 +135,21 @@ python3 -m vllm_rbln_exec.parity_runner --task r --model gpt-oss-120b --ep --dp 
 - **런타임 trace 확정은 exclusive 박스 필요**(현재 yw.kim DP4 점유로 대기). trace로 `Wait job success.
   seq=` 발생 지점/횟수 확인 시 위 추정 검증됨.
 
-### → 실제로 가능한 overlap 경로 = all_reduce 프리페치 (§2 실증, `VLLM_RBLN_OVERLAP_PROBE`)
+### → 실제로 가능한 overlap 경로 = all_reduce 프리페치 (`VLLM_RBLN_OVERLAP=1`, 구현됨·미검증)
 forward를 non-blocking으로 못 만들어도, forward의 `.run()`이 drain 동안 **GIL을 놓으므로** 별도 스레드
 (gloo `pt_gloo_runloop`)가 그 창을 쓸 수 있음. all_reduce(N+1)을 forward(N) 전에 async로 발사하면
-gloo가 drain 창에 완료 → 실증됨(collect 0.004ms, all_reduce ~100% 숨김). **이게 RBLN에서 mid-graph
-drain을 못 없애는 한 유일하게 실현 가능한 방향.** 프로덕션화 과제: 실제 all_reduce를 프리페치로 이동
-(현재는 shadow) + decode 상수 가정의 prefill/ragged 전이 안전 처리(scheduler depth-2 lookahead 또는
-전이 시 blocking fallback). vllm-rbln 내부(forward_context)만 수정, vLLM 구조 불변.
+gloo가 drain 창에 완료. **이게 RBLN에서 mid-graph drain을 못 없애는 한 유일하게 실현 가능한 방향.**
+
+**구현(`forward_context.py` `num_tokens_and_reqs_across_dp`, 기본 off)**: 파이프라인 —
+(1) armed면 이전 step에 발사한 all_reduce를 collect(SPAN ar_collect), 아니면 blocking all_reduce;
+(2) reduce 결과가 steady uniform decode(no prefill, 모든 rank 동일 num_tokens)면 다음 step용 all_reduce를
+async arm(SPAN ar_issue), 아니면 disarm. arm/collect 결정을 reduce 결과로만 → 모든 rank 대칭 → 데드락 없음.
+decode에서 정확, 전이는 1-step stale(self-heal). vLLM 구조 불변.
+
+**검증 필요(박스 대기)**: ① parity(sync baseline 대비 token 0 mismatch, §4), ② overlap 실측 —
+**SPAN ar_collect가 barrier skew 포함해도 낮은지**(낮으면 긴 all_reduce까지 숨은 것; 이게 shadow가
+증명 못 한 핵심). ③ 전이(decode→prefill) 안전성. 검증 통과 시 프로덕션화(전이는 scheduler depth-2
+lookahead로 완전 해결 가능).
 
 ## 4. 정합성/overlap 검증 레시피
 ```bash

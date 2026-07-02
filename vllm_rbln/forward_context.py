@@ -36,18 +36,13 @@ from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)
 
-# VLLM_RBLN_OVERLAP_PROBE feasibility state. Each step, right after the real
-# (correctness-bearing) all_reduce, we fire an *extra* async DP all_reduce and
-# collect it at the next step -- so its gloo network runs on pt_gloo_runloop
-# while forward(N) executes on the main thread. If the collect-wait at step N+1
-# is ~0ms, that collective fully overlapped forward(N): direct proof that
-# all_reduce(N+1) CAN overlap forward(N) on a single host thread. The real
-# all_reduce is untouched (parity preserved); this shadow is issued + collected
-# unconditionally every step by all ranks => collective order stays identical
-# across ranks (no deadlock). It is a visualization probe, NOT the production
-# path (which moves the real collective and must handle prefill/ragged steps).
-_ar_prefetch_handle = None
-_ar_prefetch_tensor = None
+# VLLM_RBLN_OVERLAP pipeline state: the in-flight async DP all_reduce prefetched
+# during the previous forward, and its (in-place reduced) result tensor. Every
+# rank collects the pending one and issues the next one every step, so the
+# collective order is identical across ranks (no deadlock). See
+# num_tokens_across_dp for the mechanism/caveats.
+_pipe_handle = None
+_pipe_tensor = None
 
 
 @dataclass
@@ -95,43 +90,13 @@ class RBLNDPMetadata(DPMetadata):
         from vllm.distributed.parallel_state import get_dp_group
 
         import os as _os, time as _time, sys as _sys
-        _span = _os.environ.get("VLLM_RBLN_SPAN_LOG") == "1"
         _t0 = _time.perf_counter()
         dist.all_reduce(num_tokens_tensor, group=get_dp_group().cpu_group)
-        if _span:
+        if _os.environ.get("VLLM_RBLN_SPAN_LOG") == "1":
             print(
                 "SPAN allreduce %d %.6f %.6f" % (_os.getpid(), _t0, _time.perf_counter()),
                 file=_sys.stderr, flush=True,
             )
-
-        # VLLM_RBLN_OVERLAP_PROBE: prefetch an async all_reduce that overlaps the
-        # upcoming forward, and collect the one fired during the previous forward.
-        if _os.environ.get("VLLM_RBLN_OVERLAP_PROBE") == "1":
-            global _ar_prefetch_handle, _ar_prefetch_tensor
-            if _ar_prefetch_handle is not None:
-                # This wait resolves the collective issued during the PREVIOUS
-                # step's forward. ~0ms here == it fully overlapped that forward.
-                _wt0 = _time.perf_counter()
-                _ar_prefetch_handle.wait()
-                if _span:
-                    print(
-                        "SPAN ar_collect %d %.6f %.6f"
-                        % (_os.getpid(), _wt0, _time.perf_counter()),
-                        file=_sys.stderr, flush=True,
-                    )
-            # Fire all_reduce(N+1) now; its gloo network runs on pt_gloo_runloop
-            # while forward(N) executes on this (main) thread.
-            _ar_prefetch_tensor = num_tokens_tensor.clone()
-            _it0 = _time.perf_counter()
-            _ar_prefetch_handle = dist.all_reduce(
-                _ar_prefetch_tensor, group=get_dp_group().cpu_group, async_op=True
-            )
-            if _span:
-                print(
-                    "SPAN ar_issue %d %.6f %.6f"
-                    % (_os.getpid(), _it0, _time.perf_counter()),
-                    file=_sys.stderr, flush=True,
-                )
         return num_tokens_tensor
 
     @staticmethod
@@ -173,9 +138,29 @@ class RBLNDPMetadata(DPMetadata):
         if is_prefill:
             encoded |= prefill_flag
 
-        encoded_across_dp = RBLNDPMetadata.num_tokens_across_dp(
-            encoded, dp_size, dp_rank
-        )
+        import os as _os2, time as _time2, sys as _sys2
+        from vllm.distributed.parallel_state import get_dp_group as _get_dp_group
+        _overlap = _os2.environ.get("VLLM_RBLN_OVERLAP") == "1"
+        _span2 = _os2.environ.get("VLLM_RBLN_SPAN_LOG") == "1"
+        global _pipe_handle, _pipe_tensor
+        # VLLM_RBLN_OVERLAP: if the pipeline is armed, this step's cross-DP metadata
+        # was already prefetched (async all_reduce issued at the previous step, so
+        # its gloo network + barrier settled during the previous forward's GIL-free
+        # device drain). Collect it here instead of a blocking all_reduce. The
+        # arm/collect decisions below are derived purely from the reduced result, so
+        # every rank runs the identical collective sequence (no deadlock).
+        if _overlap and _pipe_handle is not None:
+            _w0 = _time2.perf_counter()
+            _pipe_handle.wait()
+            encoded_across_dp = _pipe_tensor
+            _pipe_handle = None
+            if _span2:
+                print("SPAN ar_collect %d %.6f %.6f" % (_os2.getpid(), _w0, _time2.perf_counter()),
+                      file=_sys2.stderr, flush=True)
+        else:
+            encoded_across_dp = RBLNDPMetadata.num_tokens_across_dp(
+                encoded, dp_size, dp_rank
+            )
 
         prefill_mask = torch.tensor(
             [prefill_flag] * dp_size, device="cpu", dtype=torch.int32
@@ -194,6 +179,35 @@ class RBLNDPMetadata(DPMetadata):
                 [req_mask_shifted] * dp_size, device="cpu", dtype=torch.int32
             )
             num_reqs_across_dp_cpu = (encoded_across_dp & req_mask_t) >> token_bits
+
+        # VLLM_RBLN_OVERLAP: arm the NEXT step's all_reduce now (async), so its gloo
+        # work overlaps THIS step's forward. Only arm on steady uniform decode
+        # (no rank prefilling, all ranks equal num_tokens) so the collected value is
+        # valid next step; otherwise disarm (next step falls back to a blocking
+        # all_reduce). `_steady` comes from the reduced result -> identical on all
+        # ranks -> arm/disarm stays in lockstep (no collective-order divergence).
+        # LIMITATION: a decode->prefill / ragged transition is detected one step
+        # late, so the transitioning step reads a stale (previous) vector once before
+        # self-healing. Safe for steady decode; needs scheduler lookahead for the
+        # general case. UNVERIFIED at runtime (pending exclusive box).
+        if _overlap:
+            _steady = (not any_prefill) and bool(
+                (num_tokens_across_dp_cpu == num_tokens_across_dp_cpu[0]).all().item()
+            )
+            if _steady:
+                _loc = [0] * dp_size
+                _loc[dp_rank] = encoded
+                _pipe_tensor = torch.tensor(_loc, device="cpu", dtype=torch.int32)
+                _i0 = _time2.perf_counter()
+                _pipe_handle = dist.all_reduce(
+                    _pipe_tensor, group=_get_dp_group().cpu_group, async_op=True
+                )
+                if _span2:
+                    print("SPAN ar_issue %d %.6f %.6f" % (_os2.getpid(), _i0, _time2.perf_counter()),
+                          file=_sys2.stderr, flush=True)
+            else:
+                _pipe_handle = None
+                _pipe_tensor = None
 
         return num_tokens_across_dp_cpu, num_reqs_across_dp_cpu
 
