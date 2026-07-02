@@ -50,9 +50,17 @@ def resolve_compile_context(
     """
     if compile_context is not None:
         return compile_context
-    if "use_global_ctx" in inspect.signature(rebel.CompileContext).parameters:
-        return rebel.CompileContext(use_global_ctx=True)
-    return rebel.CompileContext()
+    # Set BOTH use_weight_sharing and use_global_ctx when supported. Returning on
+    # the first matching flag dropped use_weight_sharing, which broke weight-free
+    # meta-const materialization (MetaConstDescriptorGen: "constant data not
+    # materialized" at prefill compile). Pass both.
+    params = inspect.signature(rebel.CompileContext).parameters
+    ctx_args = {}
+    if "use_weight_sharing" in params:
+        ctx_args["use_weight_sharing"] = True
+    if "use_global_ctx" in params:
+        ctx_args["use_global_ctx"] = True
+    return rebel.CompileContext(**ctx_args)
 
 
 def build_compile_options(compile_context: rebel.CompileContext) -> dict:
