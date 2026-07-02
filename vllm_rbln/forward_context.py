@@ -140,7 +140,13 @@ class RBLNDPMetadata(DPMetadata):
 
         import os as _os2, time as _time2, sys as _sys2
         from vllm.distributed.parallel_state import get_dp_group as _get_dp_group
-        _overlap = _os2.environ.get("VLLM_RBLN_OVERLAP") == "1"
+        from vllm_rbln.torch_compile_backend import is_warmup_active as _is_warmup
+        # Never pipeline during warmup: warmup replays prefill(512-tok) AND decode
+        # (1-tok) dummy shapes back-to-back, so a one-step-stale prefetch feeds the
+        # wrong per-rank count -> wrong MoE max_pad -> reshape crash. Warmup uses the
+        # blocking all_reduce (exact per-step counts). Also keeps the pipeline
+        # disarmed entering real generation (no stale handle carried in).
+        _overlap = _os2.environ.get("VLLM_RBLN_OVERLAP") == "1" and not _is_warmup()
         _span2 = _os2.environ.get("VLLM_RBLN_SPAN_LOG") == "1"
         global _pipe_handle, _pipe_tensor
         # VLLM_RBLN_OVERLAP: if the pipeline is armed, this step's cross-DP metadata

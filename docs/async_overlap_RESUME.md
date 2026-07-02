@@ -23,13 +23,14 @@
 > GPU vs RBLN 방향성 Q&A: `docs/async_overlap_gpu_vs_rbln_QA.md` (단, 그 문서의 "host glue가 병목"
 > 결론은 이 정정으로 폐기 — 병목은 blocking forward).
 >
-> **★ 구현 상태 (2026-07-02, 미검증)**: `VLLM_RBLN_OVERLAP=1` — 실제 DP all_reduce를 한 step 앞당겨
-> async 발사(prefetch)하고 다음 step에서 collect하는 파이프라인을 `forward_context.py`
-> `num_tokens_and_reqs_across_dp`에 구현(기본 off). arm/collect 결정을 reduce 결과로만 내려 데드락 없음.
-> steady decode에서 정확, prefill/ragged 전이는 1-step stale(self-heal). **박스 점유로 런타임 parity·
-> overlap 검증 못 함 — 박스 비면 SPAN ar_collect(=barrier 포함 실제 wait)로 긴 all_reduce까지 숨는지 확인 필요.**
-> (구 `VLLM_RBLN_OVERLAP_PROBE` shadow는 제거됨. 그 collect 0.004ms는 sync 직후라 skew-free여서 짧은
-> network만 숨긴 것 — 긴/barrier-heavy all_reduce 숨김은 이 real move로 재측정해야 확인됨.)
+> **★ 구현+검증 (2026-07-02)**: `VLLM_RBLN_OVERLAP=1`(기본 off, `forward_context.py`
+> `num_tokens_and_reqs_across_dp` + warmup 게이트) — DP all_reduce를 한 step 앞당겨 async 발사→다음 step
+> collect. **런타임 검증(§3): ✅ steady decode에서 all_reduce가 forward에 완전히 숨음(ar_collect 0.019ms,
+> barrier 포함, 4 rank×64) — 긴 all_reduce까지 숨김 확인.** **❌ prefill↔decode 전이에서 crash(치명):
+> num_tokens_across_dp가 MoE max_pad=그래프 SHAPE를 결정 → 1-step-stale speculation이 전이에서 wrong-token이
+> 아니라 shape reshape crash. multi-prompt 테스트에서 재현.** → 메커니즘은 검증됐으나 프로덕션엔
+> **scheduler depth-2 lookahead로 speculation 제거 필요**(§3 다음작업). lookahead 없이는 decode-only/전이없는
+> 워크로드만 안전.
 
 ## 0. 목표
 gpt-oss-120b EP+DP4 decode에서 매 step 도는 DP `gloo:all_reduce`(N+1)를 NPU forward(N) 실행 구간에
@@ -146,10 +147,26 @@ gloo가 drain 창에 완료. **이게 RBLN에서 mid-graph drain을 못 없애�
 async arm(SPAN ar_issue), 아니면 disarm. arm/collect 결정을 reduce 결과로만 → 모든 rank 대칭 → 데드락 없음.
 decode에서 정확, 전이는 1-step stale(self-heal). vLLM 구조 불변.
 
-**검증 필요(박스 대기)**: ① parity(sync baseline 대비 token 0 mismatch, §4), ② overlap 실측 —
-**SPAN ar_collect가 barrier skew 포함해도 낮은지**(낮으면 긴 all_reduce까지 숨은 것; 이게 shadow가
-증명 못 한 핵심). ③ 전이(decode→prefill) 안전성. 검증 통과 시 프로덕션화(전이는 scheduler depth-2
-lookahead로 완전 해결 가능).
+**★ 런타임 검증 결과 (2026-07-02, 박스 exclusive 시):**
+- ✅ **overlap 작동 확인**: warmup 게이트(`not is_warmup_active()`, forward_context.py) 추가 후 steady
+  decode에서 `ar_collect` 중앙값 **0.019ms** (4 rank, 64 collect, **barrier skew 포함**). vs blocking
+  all_reduce 0.6~2.4ms. **→ 긴/barrier-heavy all_reduce도 실제 decode에선 forward에 완전히 숨음.**
+  (shadow의 0.004ms는 sync직후 skew=0이라 짧은 network만 숨긴 것이었고, 이 real move는 barrier까지 숨김.)
+- ❌ **prefill↔decode 전이에서 shape-fatal 크래시(치명)**: 전이 step이 stale decode 값(max_pad=1)을
+  prefill 그래프에 먹여 MoE `all_hidden.reshape(R*max_pad, H)` 크래시(`4×512×2880` → `4,2880` invalid).
+  기본 multi-prompt 테스트(프롬프트 길이 상이 → DP rank 전이 desync)에서 1/4 진행 후 크래시.
+  **원인: DP all_reduce 결과(num_tokens_across_dp)가 max_pad=컴파일 그래프 SHAPE를 결정 → speculation이
+  틀리면 wrong-token이 아니라 crash. 1-step lag로 전이 step은 stale값을 쓰기 전에 감지 불가.**
+- **결론: overlap 메커니즘은 검증됨(steady decode). 그러나 shape-critical이라 speculation은 전이에서
+  crash → 프로덕션 불가. 유일한 완전 해법 = scheduler depth-2 lookahead로 N+1의 (is_prefill, num_tokens)를
+  forward(N) 시점에 알아 speculation 제거.** (lookahead 없이는 decode-only/전이없는 워크로드만 안전.)
+- parity(token 0 mismatch)는 완주 run이 없어 미확인(전이 crash로 중단).
+
+### 다음 작업 (프로덕션화)
+scheduler depth-2 lookahead 배선: 낙관 스케줄러가 이미 N+1 batch를 결정하므로, worker `execute_model(N)`이
+N+1의 num_tokens/is_prefill를 받아 프리페치를 **정확한 값으로** 발사(speculation 제거) → 전이 crash 해소.
+이게 되면 decode·prefill 무관하게 안전 + overlap 유지. (vLLM executor↔worker 인터페이스에 N+1 메타 전달 필요 —
+"vLLM 구조 최소 변경"의 경계에 있음, 유저와 범위 상의.)
 
 ## 4. 정합성/overlap 검증 레시피
 ```bash
