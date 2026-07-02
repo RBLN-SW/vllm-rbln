@@ -250,9 +250,9 @@ class Fp8LinearMethod(LinearMethodBase):
             assert not self.act_q_static
             assert self.weight_block_size is not None
             block_fp8_op_cls = (
-                RBLNW8A8BlockFp8LinearOp
-                if envs.VLLM_RBLN_USE_W8A8_FP8
-                else RBLNW8A16BlockFp8LinearOp
+                RBLNW8A16BlockFp8LinearOp
+                if envs.VLLM_RBLN_USE_W8A16
+                else RBLNW8A8BlockFp8LinearOp
             )
             self.w8a8_block_fp8_linear = block_fp8_op_cls(
                 weight_group_shape=GroupShape(*self.weight_block_size),
@@ -466,6 +466,7 @@ def custom_moe_glu_w8a8(
     down_proj_scale: torch.Tensor,
     masked_routing_weights: torch.Tensor,
     group_size: torch.Tensor,
+    hidden_act: str,
     gate_proj_bias: torch.Tensor | None = None,
     up_proj_bias: torch.Tensor | None = None,
     down_proj_bias: torch.Tensor | None = None,
@@ -473,11 +474,11 @@ def custom_moe_glu_w8a8(
     dp_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
-    Customized MoE SwiGLU operation (W8A8 block-fp8) with pre-computed routing.
+    Customized MoE GLU operation (W8A8 block-fp8) with pre-computed routing.
 
     Routing (softmax + topk) is done externally, exactly like
     custom_moe_glu_group_dequantize; the only differences are the fp8 activation
-    plus its per-(token, K-block) scale, and the fp8 quantization of the swiglu
+    plus its per-(token, K-block) scale, and the fp8 quantization of the GLU
     intermediate before the down projection.
 
     Expected tensor shapes:
@@ -492,6 +493,7 @@ def custom_moe_glu_w8a8(
     - masked_routing_weights: [num_experts, num_tokens]
       (token dim may be padded to 64-align)
     - group_size: group size for weight scale
+    - hidden_act: gate activation name ("silu"/"swish" or "gelu*")
     - gate_proj_bias: [num_experts, intermediate_size]
     - up_proj_bias: [num_experts, intermediate_size]
     - down_proj_bias: [num_experts, hidden_size]
@@ -524,11 +526,9 @@ def custom_moe_glu_w8a8(
 
     in_block_size = int(group_size.item())
 
-    def _maybe_quant_act(state: torch.Tensor) -> torch.Tensor:
-        # W8A8: dynamically quantize expert activations to fp8 per
+    def _quant_glu_intermediate(state: torch.Tensor) -> torch.Tensor:
+        # Dynamically quantize the GLU intermediate to fp8 per
         # (1, in_block_size) group along the contraction dim, then dequant.
-        if not envs.VLLM_RBLN_USE_W8A8_FP8:
-            return state
         fp8_dtype = torch.float8_e4m3fn
         finfo = torch.finfo(fp8_dtype)
         orig_shape = state.shape
@@ -570,6 +570,14 @@ def custom_moe_glu_w8a8(
     num_experts = gate_proj_weight_dq.shape[0]
     dtype = hidden_states.dtype
 
+    act = hidden_act.lower()
+    if act in ("silu", "swish"):
+        act_fn = torch.nn.functional.silu
+    elif "gelu" in act:
+        act_fn = torch.nn.functional.gelu
+    else:
+        raise ValueError(f"Unsupported hidden_act={hidden_act!r}")
+
     # masked_routing_weights: [E, T_padded] (softmax + topk done externally).
     routing_t = masked_routing_weights[:, :num_tokens]
 
@@ -594,11 +602,11 @@ def custom_moe_glu_w8a8(
             up_proj_weight_dq[expert_idx],
             up_proj_bias[expert_idx] if up_proj_bias is not None else None,
         )
-        # Input activation is already (de)quantized above; only the swiglu
+        # Input activation is already (de)quantized above; only the GLU
         # intermediate is quantized here for the down projection (W8A8).
-        swiglu = _maybe_quant_act(torch.nn.functional.silu(gate) * up)
+        glu = _quant_glu_intermediate(act_fn(gate) * up)
         down = torch.nn.functional.linear(
-            swiglu,
+            glu,
             down_proj_weight_dq[expert_idx],
             down_proj_bias[expert_idx] if down_proj_bias is not None else None,
         )
@@ -622,6 +630,7 @@ def custom_moe_glu_w8a8_fake(
     down_proj_scale: torch.Tensor,
     masked_routing_weights: torch.Tensor,
     group_size: torch.Tensor,
+    hidden_act: str,
     gate_proj_bias: torch.Tensor | None = None,
     up_proj_bias: torch.Tensor | None = None,
     down_proj_bias: torch.Tensor | None = None,
@@ -629,7 +638,7 @@ def custom_moe_glu_w8a8_fake(
     dp_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     # FIXME (taehoon): this is a workaround for now, we need to give it real compute type
-    return torch.empty_like(hidden_states, dtype=torch.bfloat16)
+    return torch.empty_like(hidden_states, dtype=hidden_states_scale.dtype)
 
 @torch.library.custom_op(
     "rbln_custom_ops::custom_moe_glu_group_dequantize",
@@ -1103,7 +1112,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         # W8A8: dynamically quantize hidden_states to fp8 per (1, block_k) group
         # along the contraction dim and hand both the fp8 tensor and the
         # per-(token, K-block) scale to the compiler custom op.
-        if envs.VLLM_RBLN_USE_W8A8_FP8:
+        if not envs.VLLM_RBLN_USE_W8A16:
             fp8_dtype = torch.float8_e4m3fn
             finfo = torch.finfo(fp8_dtype)
             in_block_size = int(self.weight_block_size[1])
@@ -1137,6 +1146,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 # scale inserted at index 1.
                 masked_routing_weights,
                 torch.tensor(self.weight_block_size[1], dtype=torch.int32),
+                layer.activation.value,
                 None,  # gate_proj_bias
                 None,  # up_proj_bias
                 None,  # down_proj_bias

@@ -82,7 +82,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT: int = 1
     VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS: list[int] = []
     # --- QUANTIZATION ---
-    VLLM_RBLN_USE_W8A8_FP8: bool = False
+    VLLM_RBLN_USE_W8A16: bool = False
     # --- NIXL ---
     VLLM_RBLN_NIXL_SWA_VIEW_OPT: bool = False
 
@@ -384,11 +384,11 @@ environment_variables = {
     ),
     # Decode batch bucket manual buckets
     "VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS": get_decode_batch_bucket_manual_buckets,  # noqa E501
-    # Use W8A8 block fp8 (quantize activations to fp8) instead of W8A16
-    # (weight-only fp8 dequant). evt0 does not support w8a8; opt-in for evt1.
-    "VLLM_RBLN_USE_W8A8_FP8": (
+    # Use W8A16 block fp8 (weight-only dequant) instead of W8A8 (dynamic
+    # activation fp8 quant). Default is W8A8; set True for evt0 compatibility.
+    "VLLM_RBLN_USE_W8A16": (
         lambda: (
-            os.environ.get("VLLM_RBLN_USE_W8A8_FP8", "False").lower() in ("true", "1")
+            os.environ.get("VLLM_RBLN_USE_W8A16", "False").lower() in ("true", "1")
         )
     ),
     # --- NIXL ---
