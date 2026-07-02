@@ -4196,6 +4196,13 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 model_loader.load_weights(self.model, model_config=self.model_config)
 
         self.model = self.get_model().eval()
+        # weight-free compile hard-errors on non-contiguous CPU weights.
+        for p in self.model.parameters():
+            if not p.is_contiguous():
+                p.set_(p.contiguous())
+        for b in self.model.buffers():
+            if not b.is_contiguous():
+                b.set_(b.contiguous())
         self.compute_logits_model = self.model
         if self.model_config.is_multimodal_model and hasattr(
             self.model.get_language_model(), "logits_processor"
