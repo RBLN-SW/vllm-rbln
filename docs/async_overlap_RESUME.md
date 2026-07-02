@@ -1,8 +1,11 @@
 # async overlap — RESUME (다음 세션 단일 진입점)
 
-> 2026-07-02 갱신. 이 파일 하나로 다음 세션에서 바로 이어서 진행한다.
+> 2026-07-02 갱신 (STEP 1 판정 완료). 이 파일 하나로 다음 세션에서 바로 이어서 진행한다.
 > **방향 확정: 단일 host 스레드로 GPU처럼 overlap을 낸다. multi-threading(구 `_DeviceForwardExecutor`) 방식은 기각.**
+> **★ STEP 1 결과(§2): (가) 확정 — decode forward가 GIL을 ~68% 점유. 단일 스레드로는 forward의 ~⅓만
+> 겹침 가능 → vLLM Python 레벨만으론 불가. 다음 결정은 유저 몫: (A) rebel 런타임 glue 경량화 vs (B) threading 재검토.**
 > 측정 도구: `docs/async_overlap_scripts/{overlap_from_spans.py, span_to_perfetto.py}`.
+> GPU vs RBLN 방향성 Q&A(왜 GPU는 되고 RBLN은 안 되나, GIL/stream/Event 역할): `docs/async_overlap_gpu_vs_rbln_QA.md`.
 
 ## 0. 목표
 gpt-oss-120b EP+DP4 decode에서 매 step 도는 DP `gloo:all_reduce`(N+1)를 NPU forward(N) 실행 구간에
@@ -38,33 +41,43 @@ GPU식 "device 트랙"까지 원하면 kineto plugin이 필요하나(torch 2.11�
 + `IActivityProfiler`/`GenericTraceActivity` API 완비, torch_rbln엔 미구현), **overlap이 실제로 나기
 전엔 불필요**. 후처리 방식도 기각(유저).
 
-## 2. ★ 미해결 — 다음 세션 첫 작업: 3.5ms forward host 시간의 정체 판정
+## 2. ★ STEP 1 판정 완료 (2026-07-02) — **(가) 확정**: forward가 GIL의 ~68%를 점유
 
-단일 스레드 overlap 가능 여부는 (F2)의 3.5ms가 무엇이냐에 달림:
-- **(가) GIL 잡는 Python glue** → 그 시간 동안 같은 스레드의 all_reduce가 못 돎 → **단일 스레드 overlap
-  원천 불가**. 유일한 길은 런타임/컴파일 레벨에서 그 glue를 줄이는 것(prepare_inputs/address-patch 경량화).
-- **(나) device drain 대기(GIL 놓음)** → 그래프 중간 host op이 device 결과를 기다리며 blocking →
-  그 drain 지점을 없애거나 뒤로 미루면 **단일 스레드로도 all_reduce(N+1)를 그 사이에 낼 수 있음**.
+GIL_PROBE 실측(gpt-oss-120b EP+DP4 18층 decode, 2회 실행: 오염본 /tmp/gil.log + 클린본
+`RBLN_VERBOSE=warning` /tmp/gil2.log). warm(steady) 244샘플, **클린 캘리브레이션(free_rate≥85M/s)
+154샘플에서 `gil_free_ratio` 중앙값 0.33 (mean 0.32, p10–p90 0.30–0.34)**. during 30.6M/s vs
+무경합 95.2M/s → **forward 중 GIL이 ~68% 점유됨(=(가))**. 근거 3:
+1. 디버그 로깅(dev 빌드 `RBLN_VERBOSE=debug` 기본값이 켜놓은 `[D] [runtime]` 스퓸, 로그의 80%)을
+   `RBLN_VERBOSE=warning`으로 꺼도 ratio 동일 ~0.32 → 낮은 during_rate은 CPU 경합이 아니라 진짜 GIL 점유.
+2. spin 스레드 붙이면 forward가 (F2의) 3.5ms→~65ms로 18배 폭증. GIL-free forward라면 안 느려짐.
+   이 폭증 자체가 subgraph별 fine-grained Python dispatch(prepare_inputs/address-patch)가 GIL을
+   잡았다 놨다 반복(switch-interval ping-pong)한다는 signature.
+3. 4 rank 전부 일관.
 
-### 판정 방법 (STEP 1, ~15분: 컴파일 + 생성)
+**함의(=RESUME §2 (가) 브랜치)**: 단일 host 스레드로는 DP all_reduce를 forward 창의 **최대 ~⅓**에만
+겹칠 수 있음 → **vLLM Python 레벨만으로는 GPU식 overlap 불가**. 남은 길 두 갈래(유저 결정 필요):
+- **(A) 런타임 submission glue 경량화**: rebel_compiler에서 그래프 실행의 host-side dispatch/
+  prepare_inputs/address-patch 비용을 줄여 GIL 점유 시간 자체를 축소. §3의 drain 계측과 함께,
+  "3.5ms forward의 host time 분해"를 rebel 런타임 프로파일로 재현해야 함(어디서 GIL을 잡는지).
+- **(B) threading 재검토**: 단일 스레드 제약(유저가 기각했던 방향)을 다시 열지 여부. GIL을 놓는 별도
+  스레드에서 all_reduce를 돌리면 그 ~68% 구간에도 겹칠 수 있으나, torch profile GPU식 표시/정합성
+  재작업 부담이 큼.
+
+### STEP 1 재현 레시피 (~15분 첫 실행. **캐시가 decode-bucket JIT은 못 건너뜀** — 매 프로세스 재컴파일)
 ```bash
 cd ~/codebase/vllm-executor && source .venv/bin/activate
 export VLLM_RBLN_USE_DEVICE_TENSOR=1 TORCH_RBLN_DISABLE_FALLBACK=compile_error VLLM_RBLN_AUTO_PORT=1 \
   RBLN_WEIGHT_FREE=1 VLLM_RBLN_BATCH_ATTN_OPT=1 VLLM_RBLN_SORT_BATCH=1 VLLM_RBLN_MOE_REDUCE_SCATTER=1 \
-  SPDLOG_LEVEL=warning VLLM_LOGGING_LEVEL=INFO RBLN_DEVICES=0,1,2,3
-# 캐시 재사용 위해 --cache-ignore 빼기(첫 컴파일만 오래 걸리고 이후 즉시). GIL_PROBE는 inline 경로에서 동작.
+  SPDLOG_LEVEL=warning RBLN_VERBOSE=warning VLLM_LOGGING_LEVEL=INFO RBLN_DEVICES=0,1,2,3
+# RBLN_VERBOSE=warning 필수: venv _C.so는 dev 빌드라 기본 debug → [D] 런타임 스퓸이 로그 80% 차지.
+# SPDLOG_LEVEL은 런타임 로거에 무관(레벨은 RBLN_VERBOSE/RBLN_VERBOSITY가 결정, flags.cc:613).
 VLLM_RBLN_OPTIMISTIC_SCHED=1 VLLM_RBLN_GIL_PROBE=1 \
 python3 -m vllm_rbln_exec.parity_runner --task r --model gpt-oss-120b --ep --dp 4 --rsd 1 \
   --max-model-len 131072 --block-size 1024 --max-num-batched-tokens 512 --batch 1 \
-  --num-hidden-layers 18 --max-num-blocks 129 --max-tokens 16 --num-prompts 4 2>&1 | tee /tmp/gil.log
-grep "GIL_PROBE" /tmp/gil.log | tail -20   # gil_free_ratio 확인
+  --num-hidden-layers 18 --max-num-blocks 129 --max-tokens 16 --num-prompts 4 2>&1 | tee /tmp/gil2.log
+# 분석: forward_ms>1000(=컴파일 오염) 버리고, free_rate>=85M(=무경합 캘리브)만 골라 ratio 중앙값.
+# ratio ~0.32 재확인되면 (가). (판정 스크립트는 세션 히스토리 참고: fwd<=1000 & free>=85e6 필터.)
 ```
-`GIL_PROBE forward_ms=.. gil_free_ratio=X` 로그(rbln_model_runner.py:4005 블록):
-- **ratio ~1.0 (GIL free)** → (나). forward가 device drain을 기다리며 GIL 놓는다 →
-  그 drain 지점을 찾아(아래 §3) 제거/지연하면 단일 스레드 overlap 가능. STEP 2로.
-- **ratio ~0 (GIL held)** → (가). Python glue가 host를 잡는다 → 단일 스레드 불가.
-  결론: vllm 레벨로는 못 풀고 rebel_compiler 런타임에서 submission glue 경량화가 필요.
-  (이 경우 유저와 방향 재논의: 런타임 최적화 vs threading 재검토.)
 
 ## 3. (나)로 판명 시 — drain 지점과 다음 작업
 `model_executable` 안의 host-sync(drain)는 `RuntimeInstance::Run`에서:
