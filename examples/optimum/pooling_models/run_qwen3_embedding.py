@@ -12,11 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import asyncio
-
 import fire
 import torch
-from vllm import AsyncEngineArgs, AsyncLLMEngine, PoolingParams
+from vllm import LLM
 
 
 def get_input_prompts() -> list[str]:
@@ -44,51 +42,24 @@ def get_input_prompts() -> list[str]:
     return inputs_texts
 
 
-async def embed(engine: AsyncLLMEngine, prompt: str, model: str, request_id: int):
-    print(f"embed request_id={request_id}, prompt={prompt}")
-    pooling_params = PoolingParams(task="embed")
-    results_generator = engine.encode(
-        prompt,
-        pooling_params,
-        str(request_id),
-    )
-
-    # get the results
-    final_output = None
-    async for request_output in results_generator:
-        final_output = request_output
-    return final_output
-
-
-async def main(
-    num_input_prompt: int,
-    model_id: str,
+def main(
+    num_input_prompt: int = 2,
+    model: str = "Qwen/Qwen3-Embedding-0.6B",
 ):
-    engine_args = AsyncEngineArgs(model=model_id, runner="pooling")
-
-    engine = AsyncLLMEngine.from_engine_args(engine_args)
+    llm = LLM(
+        model=model,
+        block_size=4096,
+        runner="pooling",
+    )
     prompt_list = get_input_prompts()
     if len(prompt_list) > 2 * num_input_prompt:
         raise RuntimeError(
             "The len(QUERIES) and len(DOCUMENTS) ",
             "should be equal with 2 * `num_input_prompt`.",
         )
-    futures = []
-    for i, p in enumerate(prompt_list):
-        if i == num_input_prompt * 2:
-            break
-        futures.append(
-            asyncio.create_task(
-                embed(
-                    engine,
-                    prompt=p,
-                    model=model_id,
-                    request_id=i,
-                )
-            )
-        )
+    prompt_list = prompt_list[: num_input_prompt * 2]
 
-    outputs = await asyncio.gather(*futures)
+    outputs = llm.encode(prompt_list, pooling_task="embed")
 
     embeddings = torch.stack([o.outputs.data for o in outputs])
     scores = embeddings[:num_input_prompt] @ embeddings[num_input_prompt:].T
@@ -96,17 +67,5 @@ async def main(
     print(f"scores: {scores.tolist()}")
 
 
-def entry_point(
-    num_input_prompt: int = 2,
-    model_id: str = "/qwen3-0.6b-b1-embedding",
-):
-    asyncio.run(
-        main(
-            num_input_prompt=num_input_prompt,
-            model_id=model_id,
-        )
-    )
-
-
 if __name__ == "__main__":
-    fire.Fire(entry_point)
+    fire.Fire(main)

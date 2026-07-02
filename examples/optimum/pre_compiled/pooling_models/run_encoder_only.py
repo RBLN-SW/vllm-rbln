@@ -12,12 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import asyncio
 import json
 
 import fire
 import torch
-from vllm import AsyncEngineArgs, AsyncLLMEngine, PoolingParams
+from vllm import LLM
 
 THRESHOLD = 0.2
 
@@ -46,47 +45,21 @@ def compare_copy_prompt_task_result(scores: list[float], golden_json: str):
             exit(1)
 
 
-async def encode(engine, prompt, request_id):
-    pooling_params = PoolingParams(task="embed")
-    results_generator = engine.encode(
-        prompt=prompt, pooling_params=pooling_params, request_id=str(request_id)
-    )
-    # get the results
-    final_output = None
-    async for request_output in results_generator:
-        final_output = request_output
-    return final_output
-
-
-async def get_result(engine, model_id, prompt, num_input_prompt):
-    futures = []
-
-    for i, p in enumerate(prompt):
-        if i == num_input_prompt:
-            break
-
-        futures.append(asyncio.create_task(encode(engine, p, i)))
-    results = await asyncio.gather(*futures)
-
-    return results
-
-
-async def main(
-    model_id: str,
-    num_input_prompt: int,
-    q_prompt_txt: str,
-    p_prompt_txt: str,
-    golden_json: str,
+def main(
+    model: str = "/bge-m3-1k-batch4",
+    num_input_prompt: int = 3,
+    q_prompt_txt: str = "/prompts/q_prompts.txt",
+    p_prompt_txt: str = "/prompts/p_prompts.txt",
+    golden_json: str = "/golden/golden_bge_m3_result_qp_prompts.json",
 ):
-    engine_args = AsyncEngineArgs(model=model_id)
+    llm = LLM(model=model)
 
-    engine = AsyncLLMEngine.from_engine_args(engine_args)
-    q_prompt = get_input_prompts(q_prompt_txt)
-    p_prompt = get_input_prompts(p_prompt_txt)
+    q_prompt = get_input_prompts(q_prompt_txt)[:num_input_prompt]
+    p_prompt = get_input_prompts(p_prompt_txt)[:num_input_prompt]
 
     assert len(q_prompt) == len(p_prompt)
-    q_result = await get_result(engine, model_id, q_prompt, num_input_prompt)
-    p_result = await get_result(engine, model_id, p_prompt, num_input_prompt)
+    q_result = llm.encode(q_prompt, pooling_task="embed")
+    p_result = llm.encode(p_prompt, pooling_task="embed")
 
     scores = []
 
@@ -105,23 +78,5 @@ async def main(
     compare_copy_prompt_task_result(scores, golden_json)
 
 
-def entry_point(
-    num_input_prompt: int = 3,
-    model_id: str = "/bge-m3-1k-batch4",
-    q_prompt_txt: str = "/prompts/q_prompts.txt",
-    p_prompt_txt: str = "/prompts/p_prompts.txt",
-    golden_json: str = "/golden/golden_bge_m3_result_qp_prompts.json",
-):
-    asyncio.run(
-        main(
-            num_input_prompt=num_input_prompt,
-            model_id=model_id,
-            q_prompt_txt=q_prompt_txt,
-            p_prompt_txt=p_prompt_txt,
-            golden_json=golden_json,
-        )
-    )
-
-
 if __name__ == "__main__":
-    fire.Fire(entry_point)
+    fire.Fire(main)

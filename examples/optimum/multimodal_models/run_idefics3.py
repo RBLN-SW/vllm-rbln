@@ -12,19 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import asyncio
+import os
 
 import fire
 from datasets import load_dataset
 from transformers import AutoProcessor, AutoTokenizer
-from vllm import AsyncEngineArgs, AsyncLLMEngine, SamplingParams
+from vllm import LLM, SamplingParams
 
 
-def generate_prompts(batch_size: int, model_id: str):
+def generate_prompts(batch_size: int, model: str):
     dataset = load_dataset("lmms-lab/llava-bench-in-the-wild", split="train").shuffle(
         seed=42
     )
-    processor = AutoProcessor.from_pretrained(model_id, padding_side="left")
+    processor = AutoProcessor.from_pretrained(model, padding_side="left")
     messages = [
         [
             {
@@ -61,42 +61,24 @@ def generate_prompts(batch_size: int, model_id: str):
     ]
 
 
-async def generate(engine: AsyncLLMEngine, tokenizer, request_id, request):
-    results_generator = engine.generate(
-        request,
-        SamplingParams(
-            temperature=0,
-            ignore_eos=False,
-            skip_special_tokens=True,
-            stop_token_ids=[tokenizer.eos_token_id],
-            max_tokens=200,
-        ),
-        str(request_id),
+def main(
+    num_input_prompt: int = 10,
+    model: str = "HuggingFaceM4/Idefics3-8B-Llama3",
+):
+    os.environ["VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK"] = "4"
+    llm = LLM(model=model, block_size=4096)
+    tokenizer = AutoTokenizer.from_pretrained(model)
+    inputs = generate_prompts(num_input_prompt, model)
+
+    sampling_params = SamplingParams(
+        temperature=0,
+        ignore_eos=False,
+        skip_special_tokens=True,
+        stop_token_ids=[tokenizer.eos_token_id],
+        max_tokens=200,
     )
 
-    final_output = None
-    async for request_output in results_generator:
-        final_output = request_output
-    return final_output
-
-
-async def main(
-    num_input_prompt: int,
-    model_id: str,
-):
-    engine_args = AsyncEngineArgs(model=model_id)
-
-    engine = AsyncLLMEngine.from_engine_args(engine_args)
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-    inputs = generate_prompts(num_input_prompt, model_id)
-
-    futures = []
-    for request_id, request in enumerate(inputs):
-        futures.append(
-            asyncio.create_task(generate(engine, tokenizer, request_id, request))
-        )
-
-    results = await asyncio.gather(*futures)
+    results = llm.generate(inputs, sampling_params)
 
     for i, result in enumerate(results):
         output = result.outputs[0].text
@@ -105,17 +87,5 @@ async def main(
         print("===============================================================\n")
 
 
-def entry_point(
-    num_input_prompt: int = 10,
-    model_id: str = "/gemma3-4b-conditional-b4-flash",
-):
-    asyncio.run(
-        main(
-            num_input_prompt=num_input_prompt,
-            model_id=model_id,
-        )
-    )
-
-
 if __name__ == "__main__":
-    fire.Fire(entry_point)
+    fire.Fire(main)

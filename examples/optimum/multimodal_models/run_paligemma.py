@@ -12,17 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import asyncio
+import os
 
 import fire
+from datasets import load_dataset
 from transformers import AutoTokenizer
-from vllm import AsyncEngineArgs, AsyncLLMEngine, SamplingParams
+from vllm import LLM, SamplingParams
 
 
 def generate_prompts(batch_size: int):
-    from datasets import load_dataset
-
     images = []
+    texts = []
     dataset = (
         load_dataset("takara-ai/image_captions", split="train", streaming=True)
         .take(batch_size)
@@ -42,41 +42,24 @@ def generate_prompts(batch_size: int):
     ]
 
 
-async def generate(engine: AsyncLLMEngine, eos_token_id, request_id, request):
-    results_generator = engine.generate(
-        request,
-        SamplingParams(
-            temperature=0,
-            ignore_eos=False,
-            skip_special_tokens=True,
-            stop_token_ids=[eos_token_id],
-            max_tokens=200,
-        ),
-        str(request_id),
+def main(
+    num_input_prompt: int = 10,
+    model: str = "google/paligemma2-3b-pt-224",
+):
+    os.environ["VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK"] = "4"
+    llm = LLM(model=model, block_size=8192, max_model_len=8192)
+    tokenizer = AutoTokenizer.from_pretrained(model)
+    inputs = generate_prompts(num_input_prompt)
+
+    sampling_params = SamplingParams(
+        temperature=0,
+        ignore_eos=False,
+        skip_special_tokens=True,
+        stop_token_ids=[tokenizer.eos_token_id],
+        max_tokens=200,
     )
 
-    final_output = None
-    async for request_output in results_generator:
-        final_output = request_output
-    return final_output
-
-
-async def main(
-    inputs: list,
-    model_id: str,
-    eos_token_id: int,
-):
-    engine_args = AsyncEngineArgs(model=model_id)
-
-    engine = AsyncLLMEngine.from_engine_args(engine_args)
-
-    futures = []
-    for request_id, request in enumerate(inputs):
-        futures.append(
-            asyncio.create_task(generate(engine, eos_token_id, request_id, request))
-        )
-
-    results = await asyncio.gather(*futures)
+    results = llm.generate(inputs, sampling_params)
 
     for i, result in enumerate(results):
         output = result.outputs[0].text
@@ -85,20 +68,5 @@ async def main(
         print("===============================================================\n")
 
 
-def entry_point(
-    num_input_prompt: int = 10,
-    model_id: str = "./paligemma2_b2",
-):
-    inputs = generate_prompts(num_input_prompt)
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-    asyncio.run(
-        main(
-            inputs=inputs,
-            model_id=model_id,
-            eos_token_id=tokenizer.eos_token_id,
-        )
-    )
-
-
 if __name__ == "__main__":
-    fire.Fire(entry_point)
+    fire.Fire(main)

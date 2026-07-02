@@ -45,7 +45,7 @@ def main(model_id: str):
 
 
 def entry_point(
-    model_id: str = "./bge-reranker-base",
+    model_id: str = "BAAI/bge-reranker-v2-m3",
 ):
     main(model_id=model_id)
 
