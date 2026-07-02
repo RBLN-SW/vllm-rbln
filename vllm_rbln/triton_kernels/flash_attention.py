@@ -97,11 +97,11 @@ def flash_attention_naive_prefill(
         for partition_id in tl.static_range(0, NP, 1):
             BT_block_ptr = tl.make_block_ptr(
                 base=block_table,
-                shape=(NP,),
-                strides=(1,),
-                offsets=(partition_id,),
-                block_shape=(1,),
-                order=(0,),
+                shape=(NB, NP),
+                strides=(NP, 1),
+                offsets=(batch_id, partition_id),
+                block_shape=(1, 1),
+                order=(1, 0),
             )
             tl.static_assert(len(BT_block_ptr.type.element_ty.shape) == DIM_BLOCK_TABLE)
             SP_block_ptr = tl.make_block_ptr(

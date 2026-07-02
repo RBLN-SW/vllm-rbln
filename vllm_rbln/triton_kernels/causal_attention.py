@@ -46,11 +46,11 @@ def causal_attention_naive_prefill(
         # -- get physical block index from block table --
         block_table_ptr = tl.make_block_ptr(
             base=block_table_base,
-            shape=(NUM_PARTITION,),
-            strides=(1,),
-            offsets=(batch_id,),
-            block_shape=(1,),
-            order=(0,),
+            shape=(NUM_BATCH, NUM_PARTITION),
+            strides=(NUM_PARTITION, 1),
+            offsets=(batch_id, 0),
+            block_shape=(1, 1),
+            order=(1, 0),
         )
         tl.static_assert(len(block_table_ptr.type.element_ty.shape) == DIM_BLOCK_TABLE)
         # seq_idx = {batch, num_partition}

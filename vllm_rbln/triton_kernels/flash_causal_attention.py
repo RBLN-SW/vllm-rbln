@@ -29,7 +29,7 @@ def flash_causal_attention_naive_prefill(
     output_base,
     qk_scale,
     seq_idx_base,
-    block_table_base,  # 1D vector, block_table[batch]
+    block_table_base,  # 2D tensor, block_table[batch][partition]
     block_size,  # dummy (scalar)
     NUM_HEAD: tl.constexpr,  # 8, num_kv_head
     NUM_GROUP: tl.constexpr,  # 4, num_head/num_kv_head=32/8=4
@@ -127,11 +127,11 @@ def flash_causal_attention_naive_prefill(
             # block_tables[0]
             block_table_ptr = tl.make_block_ptr(
                 base=block_table_base,
-                shape=(NUM_PARTITION,),
-                strides=(1,),
-                offsets=(partition_id,),
-                block_shape=(1,),
-                order=(0,),
+                shape=(NUM_BATCH, NUM_PARTITION),
+                strides=(NUM_PARTITION, 1),
+                offsets=(batch_id, partition_id),
+                block_shape=(1, 1),
+                order=(1, 0),
             )
             tl.static_assert(
                 len(block_table_ptr.type.element_ty.shape) == DIM_BLOCK_TABLE

@@ -30,7 +30,7 @@ def sliding_window_attention_naive_prefill(
     cache_seq_len_base,
     cache_offset_base,
     qk_scale,
-    block_table_base,  # 1D vector, block_tables[batch]
+    block_table_base,  # 2D tensor, block_tables[batch][partition]
     dummy,
     NUM_HEAD: tl.constexpr,
     NUM_GROUP: tl.constexpr,
@@ -67,11 +67,11 @@ def sliding_window_attention_naive_prefill(
         # -- get physical block index from block table --
         block_table_ptr = tl.make_block_ptr(
             base=block_table_base,
-            shape=(NUM_PARTITION,),
-            strides=(1,),
-            offsets=(batch_id,),
-            block_shape=(1,),
-            order=(0,),
+            shape=(NUM_BATCH, NUM_PARTITION),
+            strides=(NUM_PARTITION, 1),
+            offsets=(batch_id, 0),
+            block_shape=(1, 1),
+            order=(1, 0),
         )
         tl.static_assert(len(block_table_ptr.type.element_ty.shape) == DIM_BLOCK_TABLE)
 
