@@ -14,6 +14,7 @@
 import contextlib
 import logging
 import time
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, NamedTuple, Union, cast
 
 import numpy as np
@@ -73,6 +74,9 @@ import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
 from vllm_rbln.model_executor.model_loader.rbln_model_loader import get_optimum_model
 from vllm_rbln.model_executor.models.optimum import ModelInputForRBLN
+from vllm_rbln.model_executor.models.optimum.model_base import (
+    RBLNOptimumMultimodalMixin,
+)
 from vllm_rbln.utils.optimum.bucket import select_bucket_size
 from vllm_rbln.utils.optimum.predicates import is_qwen3_pooling
 from vllm_rbln.utils.optimum.registry import (
@@ -253,6 +257,8 @@ class RBLNOptimumModelRunner(
         # Maps mm_hash → dict of prefill params (inputs_embeds, position_embed, etc.)
         self.encoder_cache: dict[str, Any] = {}
 
+        self.mrope_position_deltas: dict[str, float] = {}
+
         # Ephemeral state transferred
         # between execute_model() and sample_tokens().
         self.execute_model_state: ExecuteModelState | None = None
@@ -363,11 +369,12 @@ class RBLNOptimumModelRunner(
                 prefill_has_mm = bool(new_reqs) and bool(new_reqs[0].mm_features)
                 if self.is_ec_consumer and model_input.is_prompt and prefill_has_mm:
                     with capture_ctx as model_reports:
-                        hidden_states = self._run_decoder_with_cached_encoder(
+                        hidden_states = self._run_prefill_with_cached_encoder(
                             model_input, scheduler_output
                         )
                 else:
                     with capture_ctx as model_reports:
+                        model_input = self._build_forward_inputs(model_input)
                         hidden_states = self.model(model_input)
                 if (
                     envs.VLLM_RBLN_METRICS
@@ -402,6 +409,37 @@ class RBLNOptimumModelRunner(
             ec_connector_output=ec_connector_output,
         )
         return None
+
+    def _build_forward_inputs(
+        self, model_input: ModelInputForRBLN
+    ) -> ModelInputForRBLN:
+        model = self.model
+        if not isinstance(model, RBLNOptimumMultimodalMixin):
+            return model_input
+
+        for request_id in model_input.finished_requests_ids:
+            self.mrope_position_deltas.pop(request_id, None)
+
+        if model_input.is_prompt:
+            inputs_embeds, position_embed, rope_delta = (
+                model.build_prefill_forward_inputs(model_input)
+            )
+            if rope_delta is not None:
+                self.mrope_position_deltas[model_input.running_requests_ids[0]] = (
+                    rope_delta
+                )
+            return replace(
+                model_input,
+                inputs_embeds=inputs_embeds,
+                position_embed=position_embed,
+            )
+
+        position_embed = model.compute_decode_position_embed(
+            model_input, self.mrope_position_deltas
+        )
+        if position_embed is None:
+            return model_input
+        return replace(model_input, position_embed=position_embed)
 
     def mask_block_table(
         self,

@@ -71,7 +71,6 @@ def _make_runner_stub(**overrides):
         sampler=MagicMock(),
         rejection_sampler=MagicMock(),
         performance_tracker=None,
-        sampler_performance_tracker=None,
         e2e_performance_tracker=None,
         uses_mrope=False,
         positions=MagicMock(),

@@ -1,4 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
 # Copyright 2025 Rebellions Inc. All rights reserved.
 
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,18 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .common import get_language_model_config
+"""RBLN NIXL KV-cache transfer connector (mirrors vLLM's v1/nixl/ layout)."""
 
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.connector import (
+    RblnNixlConnector,
+)
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.scheduler import (
+    RblnNixlConnectorScheduler,
+)
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.worker import (
+    RblnNixlConnectorWorker,
+)
 
-def get_param_blip2(
-    batch_size: int,
-    max_model_len: int,
-    block_size: int,
-    num_devices: int,
-    prefill_chunk_size: int | None = None,
-) -> dict:
-    language_model_config = get_language_model_config(
-        batch_size, max_model_len, block_size, num_devices, prefill_chunk_size
-    )
-    param = {"language_model": language_model_config}
-    return param
+__all__ = [
+    "RblnNixlConnector",
+    "RblnNixlConnectorScheduler",
+    "RblnNixlConnectorWorker",
+]

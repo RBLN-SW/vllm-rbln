@@ -180,6 +180,20 @@ class RBLNOptimumScheduler(Scheduler):
             attn_block_size = self.vllm_config.additional_config["attn_block_size"]
         else:
             attn_block_size = None
+        # gemma3/gemma4: optimum-rbln's chunked prefill touches extra KV-cache
+        # slots beyond the prompt (partition-alignment + trailing chunk
+        # write-extent), so `allocate_slots` must reserve them. `prefill_chunk_size`
+        # is persisted into `additional_config` during `sync_vllm_and_optimum`.
+        archs = getattr(vllm_config.model_config.hf_config, "architectures", None) or []
+        needs_chunked_prefill_pad = any("Gemma3" in a or "Gemma4" in a for a in archs)
+        prefill_chunk_size = None
+        image_prefill_chunk_size = None
+        if needs_chunked_prefill_pad and vllm_config.additional_config is not None:
+            prefill_chunk_size = vllm_config.additional_config.get("prefill_chunk_size")
+            image_prefill_chunk_size = vllm_config.additional_config.get(
+                "image_prefill_chunk_size"
+            )
+
         # Create the KV cache manager.
         if hash_block_size is None:
             hash_block_size = block_size
@@ -198,6 +212,9 @@ class RBLNOptimumScheduler(Scheduler):
             attn_block_size=attn_block_size,
             max_num_seqs=self.max_num_running_reqs,
             is_encoder_decoder=self.is_encoder_decoder,
+            prefill_chunk_size=prefill_chunk_size,
+            image_prefill_chunk_size=image_prefill_chunk_size,
+            needs_chunked_prefill_pad=needs_chunked_prefill_pad,
         )
         self.perf_metrics: ModelMetrics | None = None
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
