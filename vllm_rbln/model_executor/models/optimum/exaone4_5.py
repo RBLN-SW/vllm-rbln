@@ -112,6 +112,31 @@ class RBLNOptimumExaone4_5_ForConditionalGeneration(
         # Call the actual preprocessing
         return self.model._preprocess_prefill(**preprocess_args)
 
+    def build_prefill_forward_inputs(
+        self,
+        model_input: ModelInputForRBLN,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, float | None]:
+        """Prefill: merge text + multimodal embeddings and return
+        ``(inputs_embeds, position_embed, rope_delta)``. EXAONE-4.5 does not use
+        MRoPE, so ``position_embed`` and ``rope_delta`` are always ``None``.
+        """
+        input_ids = model_input.input_tokens
+        image_input = None
+        video_input = None
+        if model_input.multi_modal_kwargs:
+            image_input = self._parse_and_validate_image_input(
+                **model_input.multi_modal_kwargs
+            )
+            video_input = self._parse_and_validate_video_input(
+                **model_input.multi_modal_kwargs
+            )
+
+        attention_mask = torch.ones_like(input_ids)
+        inputs_embeds = self.preprocess_prefill(
+            input_ids, attention_mask, image_input, video_input
+        )
+        return inputs_embeds, None, None
+
     def get_language_model(self):
         return self.model
 
@@ -244,22 +269,7 @@ class RBLNOptimumExaone4_5_ForConditionalGeneration(
         block_tables = kwargs.pop("block_tables")
 
         if is_prompt:
-            image_input = None
-            video_input = None
-            if model_input.multi_modal_kwargs:
-                image_input = self._parse_and_validate_image_input(
-                    **model_input.multi_modal_kwargs
-                )
-                video_input = self._parse_and_validate_video_input(
-                    **model_input.multi_modal_kwargs
-                )
-            if image_input is None and video_input is None:
-                inputs_embeds = None
-
-            attention_mask = torch.ones_like(input_ids)
-            inputs_embeds = self.preprocess_prefill(
-                input_ids, attention_mask, image_input, video_input
-            )
+            inputs_embeds = model_input.inputs_embeds
             prefill_batch_idx = sliding_window_table_ids[0]
             local_block_table_id = torch.tensor([prefill_batch_idx], dtype=torch.int16)
             logits = self.model.prefill_decoder(
