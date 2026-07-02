@@ -3195,6 +3195,25 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             else nullcontext()
         )
 
+    @staticmethod
+    def _handle_kv_connector_preemptions(scheduler_output: "SchedulerOutput") -> None:
+        """Notify the KV connector of preempted requests before their blocks are
+        reused.
+
+        vLLM 0.18 -> 0.22 changed ``KVConnector.handle_preemptions`` from taking a
+        ``preempted_req_ids: set[str]`` to taking the connector metadata
+        (``MultiConnector`` asserts ``MultiKVConnectorMetadata``). Pass
+        ``scheduler_output.kv_connector_metadata`` to match the 0.22 signature;
+        passing the old req-id set makes MultiConnector raise AssertionError on
+        any preemption. Skipped when metadata is None (connector warm-up phase).
+        """
+        if not (scheduler_output.preempted_req_ids and has_kv_transfer_group()):
+            return
+        kv_connector_metadata = scheduler_output.kv_connector_metadata
+        if kv_connector_metadata is None:
+            return
+        get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -3209,10 +3228,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 "after execute_model() returns None."
             )
 
-        if scheduler_output.preempted_req_ids and has_kv_transfer_group():
-            get_kv_transfer_group().handle_preemptions(
-                scheduler_output.preempted_req_ids
-            )
+        self._handle_kv_connector_preemptions(scheduler_output)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with record_function_or_nullcontext("Preprocess"):
