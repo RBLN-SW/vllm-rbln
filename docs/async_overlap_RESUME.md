@@ -12,9 +12,11 @@
 > **→ overlap이 안 되는 진짜 이유: async scheduling(이미 ON)이 문제가 아니라, RBLN forward `.run()`이
 > worker 스레드를 4.1ms 블로킹해서 execute_model(N)이 forward 도중 리턴을 못 함 → execute_model(N+1)이
 > forward(N)과 못 겹침. GPU는 forward가 async라 worker가 비어서 저절로 겹침.**
-> **→ 해야 할 일: RBLN forward를 non-blocking으로(=`.run()`의 output drain을 뒤로 미뤄 device 핸들만
-> 리턴, sync는 sample_tokens에서). 그러면 vLLM 기존 async scheduling이 execute_model(N+1) prepare
-> (DP all_reduce 포함)를 forward(N)과 겹친다. vLLM 스케줄러/구조는 안 건드림.**
+> **→ non-blocking forward는 조사 결과 "쉬운 flag skip" 불가(§3): `.run()` drain은 decode 그래프의
+> mid-graph host-op/const-buffer가 강제하는 필수 sync라, 없애려면 컴파일러 레벨 그래프 재구성 필요
+> = 정합성-안전 최소변경 아님 → 미구현.**
+> **→ 실현 가능한 경로 = all_reduce 프리페치(§3 하단, `VLLM_RBLN_OVERLAP_PROBE` 실증): forward의
+> GIL-free drain 창에 gloo가 all_reduce(N+1)을 돌림. forward_context만 수정, vLLM 구조 불변.**
 >
 > 측정 도구: `docs/async_overlap_scripts/`(overlap_from_spans, span_to_perfetto, selftime_breakdown,
 > step_breakdown, analyze_profile_trace, distill_profile_trace, span_overlap_viz).
@@ -108,16 +110,31 @@ python3 -m vllm_rbln_exec.parity_runner --task r --model gpt-oss-120b --ep --dp 
 # 트레이스 self-time으로 forward 분해(selftime_breakdown.py / fwd_breakdown)가 신뢰 소스.
 ```
 
-## 3. ★ 확정된 다음 작업 — drain 제거로 forward를 non-blocking 화 (§2의 해법)
-`model_executable` 안의 host-sync(drain)는 `RuntimeInstance::Run`에서:
-- 그래프 중간 host op 실행 전 (`runtime_instance.cc:788` `EnsureAllTasksCompleted`)
-- const-buffer device op 전 (`:878`), multi-output copy 전 (`:1204`)
-- Run() 자체는 끝에서 drain 안 함(`:1198`만 Record). `RBLN_RUNTIME_FORCE_SYNC=1`이면 매 op drain(`:1194`).
-계측: 이 지점에 env-gated 카운터 추가(리빌드 필요 — `_C.so`는 venv build이므로 `~/codebase/rebel_compiler`
-편집 후 재설치. `.py`는 editable로 즉시 반영). 목표: decode step당 실제 drain 횟수 = 0으로 만들면
-forward 제출이 온전히 async가 되어 그 사이 all_reduce(N+1) 삽입 가능.
-그 후 vllm-rbln에서 EM(N+1) prep(=all_reduce N+1)을 forward(N) 제출 직후로 파이프라인
-(낙관적 스케줄러 batch_queue depth2 활용), D2H는 immediate AsyncOutput으로 지연(F3에서 race 없음 확인).
+## 3. ★ non-blocking forward 실현가능성 조사 결과 (2026-07-02) — "쉬운 flag skip"은 불가
+
+`.run()`의 ~4.1ms drain(`EnsureAllTasksCompleted`→`rblnWaitJob`, GIL 놓음)이 어디서 나는지 조사:
+- **`:1197` multi-output copy 전 drain은 발동 안 함** (debug 로그에 "Copy slot to output_idx" 0건).
+  device-tensor 모드에선 이 drain이 헛수고라 스킵 가능했겠지만, 애초에 안 탐 → 쉬운 fix 배제.
+- **decode 그래프에 host op이 존재** (로그 "host ops compilation takes N ms" ×4 rank) + **const-buffer
+  op이 step당 ~2개**(debug "const buffer" 128건 = 2×64step). → `:781`(host op 실행 전)과 `:871`
+  (const-buffer op 전)의 `EnsureAllTasksCompleted`가 **의미상 필수 drain**. host op은 device 출력을
+  읽어야 하므로 그 전에 device를 비워야 함 = 그냥 스킵하면 정합성 깨짐.
+- 즉 4.1ms drain의 정체는 **그래프 중간 host-op/const-buffer가 강제하는 mid-graph device sync**.
+  이걸 없애려면 **컴파일러 레벨에서 decode 그래프의 host op을 밖으로 빼는 재구성**이 필요 —
+  런타임 flag로 스킵 불가, 정합성 보장 안 됨. **→ 최소·정합성-안전 변경이 아니므로 (유저 조건상) 미구현.**
+- (device 순서 자체는 stream FIFO(seq chaining, `:1169/:1191`)로 보장돼 non-blocking이 *원리상*
+  안전하나, 위 host-op drain 때문에 실제로 forward가 async가 안 됨. rebel `PyRblnAsyncRuntime`
+  (`runtime.cc:323`, 스레드풀)은 존재하나 Dynamo 경로가 안 씀.)
+- **런타임 trace 확정은 exclusive 박스 필요**(현재 yw.kim DP4 점유로 대기). trace로 `Wait job success.
+  seq=` 발생 지점/횟수 확인 시 위 추정 검증됨.
+
+### → 실제로 가능한 overlap 경로 = all_reduce 프리페치 (§2 실증, `VLLM_RBLN_OVERLAP_PROBE`)
+forward를 non-blocking으로 못 만들어도, forward의 `.run()`이 drain 동안 **GIL을 놓으므로** 별도 스레드
+(gloo `pt_gloo_runloop`)가 그 창을 쓸 수 있음. all_reduce(N+1)을 forward(N) 전에 async로 발사하면
+gloo가 drain 창에 완료 → 실증됨(collect 0.004ms, all_reduce ~100% 숨김). **이게 RBLN에서 mid-graph
+drain을 못 없애는 한 유일하게 실현 가능한 방향.** 프로덕션화 과제: 실제 all_reduce를 프리페치로 이동
+(현재는 shadow) + decode 상수 가정의 prefill/ragged 전이 안전 처리(scheduler depth-2 lookahead 또는
+전이 시 blocking fallback). vllm-rbln 내부(forward_context)만 수정, vLLM 구조 불변.
 
 ## 4. 정합성/overlap 검증 레시피
 ```bash
