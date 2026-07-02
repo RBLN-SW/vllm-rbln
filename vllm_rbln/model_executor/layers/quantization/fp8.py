@@ -467,6 +467,7 @@ def custom_moe_glu_w8a8(
     masked_routing_weights: torch.Tensor,
     group_size: torch.Tensor,
     hidden_act: str,
+    compute_dtype: torch.dtype,
     gate_proj_bias: torch.Tensor | None = None,
     up_proj_bias: torch.Tensor | None = None,
     down_proj_bias: torch.Tensor | None = None,
@@ -544,7 +545,8 @@ def custom_moe_glu_w8a8(
     # reference matmuls below run in bf16, exactly like the W8A16 path. When
     # W8A8 is off, hidden_states is already the unquantized activation.
     if hidden_states_scale is not None:
-        compute_dtype = masked_routing_weights.dtype
+        # compute_dtype is the explicit output/compute dtype passed by the caller
+        # (the saved pre-quant hidden_states dtype: bf16 or dlfp16).
         hidden_states = hidden_states.to(compute_dtype) * hidden_states_scale.to(
             compute_dtype
         ).repeat_interleave(in_block_size, dim=-1)
@@ -631,14 +633,20 @@ def custom_moe_glu_w8a8_fake(
     masked_routing_weights: torch.Tensor,
     group_size: torch.Tensor,
     hidden_act: str,
+    compute_dtype: torch.dtype,
     gate_proj_bias: torch.Tensor | None = None,
     up_proj_bias: torch.Tensor | None = None,
     down_proj_bias: torch.Tensor | None = None,
     expert_map: torch.Tensor | None = None,
     dp_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    # FIXME (taehoon): this is a workaround for now, we need to give it real compute type
-    return torch.empty_like(hidden_states, dtype=hidden_states_scale.dtype)
+    # Output is in the explicit compute dtype passed by the caller (the saved
+    # pre-quant hidden_states dtype — bf16 or dlfp16). hidden_states here is fp8
+    # and hidden_states_scale is fp32, so neither is the right output dtype; and
+    # deriving it from masked_routing_weights is model-dependent. compute_dtype is
+    # a torch-level-only arg (not in the rebel_compiler CUSTOM_OP_SIGS), so it is
+    # ignored by the compiler frontend and never reaches the converter/kernel.
+    return torch.empty_like(hidden_states, dtype=compute_dtype)
 
 @torch.library.custom_op(
     "rbln_custom_ops::custom_moe_glu_group_dequantize",
@@ -1075,6 +1083,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         orig_shape = x.shape  # noqa: F841
         num_tokens = orig_shape[:-1].numel()  # noqa: F841
         hidden_states = x.reshape(num_tokens, -1)
+        # Save the pre-quant activation dtype (bf16/dlfp16 per DTYPE_FORCE) as the
+        # explicit MoE compute/output dtype — passed to the custom op so its
+        # register_fake can declare the correct output dtype. hidden_states is
+        # quantized to fp8 below, so the op can't recover it from its own operands,
+        # and masked_routing_weights.dtype is model-dependent.
+        moe_compute_dtype = hidden_states.dtype
         masked_routing_weights = router_logits
         intermediate_size = layer.w2_weight.shape[-1]
 
@@ -1147,6 +1161,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 masked_routing_weights,
                 torch.tensor(self.weight_block_size[1], dtype=torch.int32),
                 layer.activation.value,
+                moe_compute_dtype,
                 None,  # gate_proj_bias
                 None,  # up_proj_bias
                 None,  # down_proj_bias
