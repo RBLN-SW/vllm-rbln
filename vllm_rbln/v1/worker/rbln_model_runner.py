@@ -13,15 +13,12 @@
 # limitations under the License.
 
 import contextlib
-import dataclasses
 import itertools
 import os
-import queue
 import threading
 import time
 from collections import defaultdict
 from collections.abc import Callable, Iterator, Sequence
-from concurrent.futures import Future
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from copy import copy, deepcopy
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Union, cast
@@ -165,67 +162,6 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-class _DeviceForwardExecutor:
-    """Single background thread that runs device tasks in submission order.
-
-    The NPU executes one compiled graph at a time, so a single dedicated
-    thread owns all device submission (FIFO preserves device-order data
-    dependencies). Offloading the host-blocking forward here lets the main
-    worker thread run ahead and issue the next step's DP gloo all_reduce while
-    a prior forward is still in flight -- the RBLN analogue of CUDA's
-    asynchronous kernel submission. Gated by VLLM_RBLN_ASYNC_FORWARD; see
-    RBLNModelRunner.execute_model.
-    """
-
-    def __init__(self, device_index: int) -> None:
-        self._device_index = device_index
-        self._q: queue.Queue = queue.Queue()
-        self._thread = threading.Thread(
-            target=self._run, name="rbln-device-forward", daemon=True
-        )
-        self._thread.start()
-
-    def _run(self) -> None:
-        device_set = False
-        while True:
-            item = self._q.get()
-            if item is None:
-                return
-            fn, fut = item
-            # A new thread does NOT inherit the main thread's rbln device
-            # context; without this it defaults to device 0, so device work here
-            # (e.g. the weight-free transform vmem alloc) targets the wrong
-            # device and fails (RUN_INTERNAL vmem verify / register device 0).
-            # Set it lazily on the first task -- doing it at thread creation is
-            # too early (device not registered yet -> SYS_ENODEV). By the first
-            # execute_model the device is up. (current_platform.set_device is a
-            # no-op on RBLN, so use the torch.rbln API directly.)
-            if not device_set:
-                torch.rbln.set_device(self._device_index)
-                device_set = True
-            if not fut.set_running_or_notify_cancel():
-                continue
-            try:
-                # execute_model / sample_tokens are @torch.inference_mode, but
-                # that is thread-local -- it does not carry to this thread. Device
-                # tasks do in-place writes to inference tensors allocated on the
-                # main thread (token feedback into input_ids, sampler output into
-                # the pre-alloc'd buffer), which is only allowed inside
-                # InferenceMode. Re-enter it here so every device task matches the
-                # worker's execution mode.
-                with torch.inference_mode():
-                    result = fn()
-                fut.set_result(result)
-            except BaseException as e:  # noqa: BLE001 - propagate to caller
-                fut.set_exception(e)
-
-    def submit(self, fn: Callable[[], Any]) -> Future:
-        fut: Future = Future()
-        self._q.put((fn, fut))
-        return fut
-
-    def shutdown(self) -> None:
-        self._q.put(None)
 def scrub_scheduler_output_for_no_spec(scheduler_output: "SchedulerOutput") -> None:
     """Force every scheduled request to query_len=1 for a collective no-spec step.
 
@@ -274,17 +210,10 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
         sampled_token_ids: torch.Tensor,
         invalid_req_indices: list[int],
         device_index: int,
-        sample_future: "Future | None" = None,
     ):
         self._model_runner_output = model_runner_output
         self._invalid_req_indices = invalid_req_indices
         self._device_index = device_index
-
-        # C9b: when set, the sampler runs on the device thread and has not yet
-        # filled sampled_token_ids. Defer the D2H copy to get_output (after the
-        # future resolves). None on the immediate path -- the tensor is already
-        # populated, so start the copy now.
-        self._sample_future = sample_future
 
         # Keep a reference to the device tensor to avoid it being
         # deallocated until we finish copying it to the host.
@@ -295,24 +224,18 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
             dtype=self._sampled_token_ids.dtype,
             device="cpu",
         )
-        if sample_future is None:
-            self._sampled_token_ids_cpu.copy_(
-                self._sampled_token_ids, non_blocking=True
-            )
+        # Start the D2H copy now; the tensor is already populated. get_output
+        # synchronizes before reading it back.
+        self._sampled_token_ids_cpu.copy_(
+            self._sampled_token_ids, non_blocking=True
+        )
 
     def get_output(self) -> ModelRunnerOutput:
         """Copy the device tensors to the host and return a ModelRunnerOutput.
 
         This function blocks until the copy is finished.
         """
-        if self._sample_future is not None:
-            # The deferred sample_task already performed the D2H on the device
-            # thread and returns the host copy. We must NOT touch the device
-            # tensor here: by now the pipeline has run ahead and out_buf's device
-            # backing may be reclaimed (RUN_INTERNAL "no device mem").
-            self._sampled_token_ids_cpu = self._sample_future.result()
-        else:
-            torch.rbln.synchronize(self._device_index)
+        torch.rbln.synchronize(self._device_index)
 
         # Release the device tensor once the copy has completed
         del self._sampled_token_ids
@@ -338,12 +261,6 @@ class ExecuteModelState(NamedTuple):
     sample_hidden_states: torch.Tensor | None
     aux_hidden_states: list[torch.Tensor] | None
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
-    # C9a deferral (decode fast path): the forward is still running on the
-    # device thread and hidden_states/logits above are None -- sample_tokens
-    # resolves them from this future's (model_output, reports) result. The
-    # device thread's FIFO keeps fwd(N) ahead of sample(N). None on the
-    # non-deferred immediate-join path.
-    fwd_future: "Future | None" = None
 
 
 class DummyRunState(NamedTuple):
@@ -699,17 +616,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # execute_model() and sample_tokens().
         self.execute_model_state: ExecuteModelState | None = None
         self.kv_connector_output: KVConnectorOutput | None = None
-
-        # Optional device-execution thread for overlapping the DP gloo
-        # all_reduce with forward (VLLM_RBLN_ASYNC_FORWARD=1). Created LAZILY on
-        # the first real (post-warmup) execute_model, NOT here: merely having
-        # the extra thread alive during warmup breaks the weight-free transform
-        # vmem (sampler crash) even when warmup runs inline. Deferring creation
-        # keeps warmup byte-identical to the non-async path.
-        self._async_forward: bool = (
-            os.environ.get("VLLM_RBLN_ASYNC_FORWARD") == "1"
-        )
-        self._device_executor: _DeviceForwardExecutor | None = None
 
         self.max_batch_size = (
             self.scheduler_config.max_num_seqs
@@ -3174,84 +3080,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 batch_bucket_size=batch_bucket_size,
             )
 
-    def _bookkeeping_async_fast(
-        self,
-        out_buf: torch.Tensor,
-        num_scheduled_tokens: int,
-    ) -> tuple[
-        dict[str, int],
-        LogprobsLists | None,
-        list[list[int]],
-        dict[str, LogprobsTensors | None],
-        list[str],
-        dict[str, int],
-        list[int],
-    ]:
-        """Handle-only bookkeeping for the C9b decode fast path.
-
-        The sampler runs on the device thread, so the main thread only holds the
-        pre-alloc'd handle (out_buf) -- it must not read any device value. This
-        is the async branch of _bookkeeping_sync stripped to its host-only work:
-        cache out_buf as prev_sampled_token_ids, advance token bookkeeping with
-        [-1] placeholders (the real tokens are D2H'd later in
-        AsyncRBLNModelRunnerOutput.get_output), and copy the req id maps. Gated
-        by the caller to no-prompt-logprobs decode, so prompt_logprobs is {} and
-        nans-in-logits is off -- neither needs hidden_states/logits.
-        """
-        num_reqs = self.input_batch.num_reqs
-        discard_sampled_tokens_req_indices = np.nonzero(
-            self.discard_request_mask.np[:num_reqs]
-        )[0]
-        for i in discard_sampled_tokens_req_indices:
-            gen = self.input_batch.generators.get(int(i))
-            if gen is not None:
-                gen.set_offset(gen.get_offset() - 4)
-
-        req_ids_output_copy = self.input_batch.req_ids.copy()
-        req_id_to_index_output_copy = self.input_batch.req_id_to_index.copy()
-
-        invalid_req_indices = discard_sampled_tokens_req_indices.tolist()
-        invalid_req_indices_set = set(invalid_req_indices)
-
-        # Cache this step's sampled tokens on-device via the handle (out_buf);
-        # the next step feeds them back without a host round-trip.
-        if self.input_batch.prev_sampled_token_ids is None:
-            assert out_buf.shape[-1] == 1
-            self.input_batch.prev_sampled_token_ids = out_buf
-        self.input_batch.prev_req_id_to_index = {
-            req_id: i
-            for i, req_id in enumerate(self.input_batch.req_ids)
-            if i not in invalid_req_indices_set
-        }
-
-        req_ids = self.input_batch.req_ids
-        for req_idx in range(num_reqs):
-            sampled_ids = [-1] if req_idx not in invalid_req_indices_set else None
-            if not sampled_ids:
-                continue
-            start_idx = self.input_batch.num_tokens_no_spec[req_idx]
-            end_idx = start_idx + 1
-            assert end_idx <= self.max_model_len, (
-                "Sampled token IDs exceed the max model length. "
-                f"Total number of tokens: {end_idx} > max_model_len: "
-                f"{self.max_model_len}"
-            )
-            self.input_batch.token_ids_cpu[req_idx, start_idx:end_idx] = sampled_ids
-            self.input_batch.is_token_ids[req_idx, start_idx:end_idx] = True
-            self.input_batch.num_tokens_no_spec[req_idx] = end_idx
-            req_state = self.requests[req_ids[req_idx]]
-            req_state.output_token_ids.extend(sampled_ids)
-
-        return (
-            {},
-            None,
-            [],
-            {},
-            req_ids_output_copy,
-            req_id_to_index_output_copy,
-            invalid_req_indices,
-        )
-
     def _bookkeeping_sync(
         self,
         scheduler_output: "SchedulerOutput",
@@ -3945,64 +3773,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 return _mo, _reports
 
             _gil_probe = os.environ.get("VLLM_RBLN_GIL_PROBE") == "1"
-            # Bypass the device thread during warmup: warmup compiles the
-            # forward AND the sampler back-to-back, and the weight-free
-            # transform's vmem accounting breaks if the forward runs on the
-            # executor thread while the sampler runs inline on the main thread
-            # (RUN_INTERNAL vmem verify in _sample). Warmup must stay inline;
-            # the executor is only for real decode steps (post-warmup overlap).
-            # C9a fast-path deferral gate: only the plain decode path where the
-            # post-forward tail reduces to an unpack (logits comes straight from
-            # model_output -- no slicing for no-spec + device-tensor + no-LoRA),
-            # and the outer Forward/KV-connector contexts are no-ops safe to exit
-            # while the forward is still running on the device thread.
-            _fast_defer = (
-                self._async_forward
-                and not is_warmup_active()
-                and not is_prefill_phase
-                and self.speculative_config is None
-                and self.use_async_scheduling
-                and envs.VLLM_RBLN_USE_DEVICE_TENSOR
-                and self.use_wrapped_compute_logits()  # no LoRA
-                and not has_kv_transfer_group()  # KV connector ctx is nullcontext
-                and get_pp_group().world_size == 1
-                and not self.is_pooling_model
-            )
-            if self._async_forward and not is_warmup_active():
-                if self._device_executor is None:
-                    self._device_executor = _DeviceForwardExecutor(
-                        self.device.index if self.device.index is not None else 0
-                    )
-                if _fast_defer:
-                    # C9a: submit the forward but DON'T join here. Stash the
-                    # future; sample_tokens resolves it (still ahead of the
-                    # sampler on the device FIFO). No overlap yet -- the join
-                    # lands inside sample_tokens, before EM(N+1) -- this commit
-                    # only proves the future hand-off keeps parity. Report
-                    # aggregation (_pending_model_report) is metrics-only and is
-                    # skipped on this path.
-                    fwd_future = self._device_executor.submit(_run_forward)
-                    self.execute_model_state = ExecuteModelState(
-                        scheduler_output,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        slot_mappings,
-                        fwd_future=fwd_future,
-                    )
-                    self.kv_connector_output = kv_connector_output
-                    return None
-                # C7 scaffold: submit the forward to the device thread but join
-                # immediately -- functionally identical to inline execution.
-                # Exercises the cross-thread submission plumbing before we
-                # actually defer the join (later step).
-                model_output, reports = self._device_executor.submit(
-                    _run_forward
-                ).result()
-            elif _gil_probe and not is_prefill_phase:
+            if _gil_probe and not is_prefill_phase:
                 # GIL-availability probe (VLLM_RBLN_GIL_PROBE=1). A background
                 # thread spins a pure-Python counter (needs the GIL) during
                 # forward vs. a sleep calibration, to estimate how much of the
@@ -4210,121 +3981,9 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             sample_hidden_states,
             aux_hidden_states,
             slot_mappings,
-            fwd_future,
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
-
-        # C9b: defer the sampler to the device thread so the main thread never
-        # waits on the device -- it returns AsyncRBLNModelRunnerOutput and moves
-        # on to EM(N+1)'s host prep + all_reduce, which then overlaps fwd(N)/
-        # sample(N). Only on the plain decode fast path: no grammar (its bitmask
-        # runs on the host logits), no prompt-logprobs (bookkeeping would need
-        # hidden_states), async scheduling. Everything else falls through to the
-        # C9a join below.
-        _defer_sampler = (
-            fwd_future is not None
-            and grammar_output is None
-            and self.use_async_scheduling
-            and not self.num_prompt_logprobs
-        )
-        if _defer_sampler:
-            num_reqs = self.input_batch.num_reqs
-            # Main-thread pre-alloc: this handle is what bookkeeping caches and
-            # AsyncOutput D2H's; the device fills it via copy_ inside the task.
-            out_buf = torch.empty(
-                (num_reqs, 1), dtype=torch.int32, device=self.device
-            )
-            # sampling_metadata is reassigned each step, but its tensor fields
-            # (temperature/top_k/top_p/...) are slices of persistent input_batch
-            # buffers that EM(N+1)'s _make_sampling_metadata overwrites in place.
-            # The device sample_task(N) reads them concurrently, so a bare
-            # reference races (GPU is safe via single-stream ordering; the RBLN
-            # device thread is not). Clone the tensor fields here on the main
-            # thread (before EM(N+1)) so the sampler reads private buffers.
-            _live_meta = self.input_batch.sampling_metadata
-            meta_snapshot = dataclasses.replace(
-                _live_meta,
-                **{
-                    _f.name: getattr(_live_meta, _f.name).clone()
-                    for _f in dataclasses.fields(_live_meta)
-                    if isinstance(getattr(_live_meta, _f.name), torch.Tensor)
-                },
-            )
-
-            def _sample_task():
-                model_output, _reports = fwd_future.result()
-                if self.use_aux_hidden_state_outputs:
-                    _hs, _aux, _logits = model_output
-                else:
-                    _hs, _logits = model_output
-                sampler_output = self._sample(
-                    _logits,
-                    None,
-                    sampling_metadata_override=meta_snapshot,
-                    num_reqs_override=num_reqs,
-                )
-                out_buf.copy_(sampler_output.sampled_token_ids[:num_reqs])
-                # D2H here, on the device thread, while out_buf is fresh and the
-                # device context is valid. Deferring the copy to get_output (on
-                # the async-output thread) races the vmem manager reclaiming
-                # out_buf's device backing once the pipeline runs ahead --
-                # RUN_INTERNAL "vmem entry has no device mem" at longer forward
-                # or under profiler load. Return the host copy for get_output.
-                return out_buf.to("cpu")
-
-            sample_future = self._device_executor.submit(_sample_task)
-
-            # Reset so bookkeeping caches THIS step's handle (mirrors the sync
-            # path's reset right before _bookkeeping_sync).
-            self.input_batch.prev_sampled_token_ids = None
-            (
-                num_nans_in_logits,
-                logprobs_lists,
-                valid_sampled_token_ids,
-                prompt_logprobs_dict,
-                req_ids_output_copy,
-                req_id_to_index_output_copy,
-                invalid_req_indices,
-            ) = self._bookkeeping_async_fast(
-                out_buf, scheduler_output.total_num_scheduled_tokens
-            )
-
-            kv_connector_output = self.kv_connector_output
-            self.kv_connector_output = None
-            output = ModelRunnerOutput(
-                req_ids=req_ids_output_copy,
-                req_id_to_index=req_id_to_index_output_copy,
-                sampled_token_ids=valid_sampled_token_ids,
-                logprobs=logprobs_lists,
-                prompt_logprobs_dict=prompt_logprobs_dict,
-                pooler_output=[],
-                kv_connector_output=kv_connector_output,
-                num_nans_in_logits=num_nans_in_logits,
-            )
-            return AsyncRBLNModelRunnerOutput(
-                model_runner_output=output,
-                sampled_token_ids=out_buf,
-                invalid_req_indices=invalid_req_indices,
-                device_index=(
-                    self.device.index if self.device.index is not None else 0
-                ),
-                sample_future=sample_future,
-            )
-
-        # C9a: resolve a deferred forward. The device FIFO already ran fwd(N)
-        # (this .result() returns without blocking once it's the head of the
-        # queue), so we just unpack model_output. On the fast path the post-
-        # forward tail is only this unpack: logits comes straight from the model
-        # (wrapped compute_logits) with no slicing for no-spec + device-tensor.
-        if fwd_future is not None:
-            model_output, _reports = fwd_future.result()
-            if self.use_aux_hidden_state_outputs:
-                hidden_states, aux_hidden_states, logits = model_output
-            else:
-                hidden_states, logits = model_output
-                aux_hidden_states = None
-            sample_hidden_states = hidden_states
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None and logits.shape[0] > 0:
