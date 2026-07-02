@@ -115,15 +115,35 @@ python3 docs/async_overlap_scripts/overlap_from_spans.py /tmp/spans.log
   검증은 18층(이 박스 OK)으로 충분.
 - `--cache-ignore`는 매번 재컴파일(~15분). 반복 실험엔 빼서 컴파일 캐시 재사용.
 
-## 6. 현재 코드 상태 (branch `async-overlap-prototype`, 워킹트리 uncommitted)
-- `vllm_rbln/forward_context.py`: DP all_reduce에 `VLLM_RBLN_SPAN_LOG` host span 로그(`num_tokens_across_dp`). **유지(측정용)**.
-- `vllm_rbln/v1/worker/rbln_model_runner.py`: `_run_forward`의 SPAN fwd 로그. c9 record_function 마커는 제거함.
-  `_DeviceForwardExecutor`/`_fast_defer`/`_sample_task` 등 **구 threading 코드가 아직 남아있음** —
-  (나)로 단일 스레드 확정되면 정리 대상.
-- `vllm_rbln/v1/worker/rbln_worker.py`: `profile_all_threads=True`. 단일 스레드론 불필요하나 무해.
-- 게이트 플래그: `VLLM_RBLN_OPTIMISTIC_SCHED`(낙관 스케줄러 batch_queue depth2, overlap 전제),
-  `VLLM_RBLN_ASYNC_FORWARD`(구 threading — 쓰지 말 것), `VLLM_RBLN_DISABLE_ASYNC`(sync baseline),
-  `VLLM_RBLN_SPAN_LOG`, `VLLM_RBLN_GIL_PROBE`.
+## 5.5 --profile overlap 트레이스 확인 (2026-07-02) — 현 상태 overlap 0% 재확정
+`--profile`(torch profiler) 18층 decode 트레이스 분석(`docs/async_overlap_scripts/analyze_trace2.py`,
+`distill_trace.py`). torch_rbln엔 kineto device 백엔드가 없어 **device 트랙은 없고 host/CPU 트랙만**
+나옴(그래서 device-tail overlap은 이 도구로 안 보임 — host 직렬 여부만 확인 가능).
+- 메인 스레드 steady-state(중앙값): `execute_model` ~7ms [맨 앞 all_reduce ~0.8ms → forward-walk ~6ms]
+  → `sample_tokens` ~8.4ms. **overlap(all_reduce, forward/sample)=0.00ms — 완전 직렬.**
+- gloo는 `pt_gloo_runloop` 별도 스레드에서 돌지만 메인 스레드가 all_reduce 결과를 blocking 대기.
+  첫 step all_reduce 1717ms는 rank 간 startup barrier 대기(steady 아님).
+- **근본 원인(왜 32% GIL 여유가 안 쓰이나)**: GIL 가용성이 아니라 **프로그램 순서**. all_reduce는
+  execute_model 맨 앞(forward_context 셋업)에서 forward보다 먼저 실행되고, AR(N+1)은 sample_tokens(N)
+  뒤에 옴 → forward의 GIL-free 창에 스케줄되는 게 없음. 그 창을 쓰려면 (a) forward host-walk를 얇게((A)) +
+  (b) 스케줄러가 AR(N+1)을 그 창에 삽입. → (A)를 뒷받침.
+- 증류 Perfetto: `docs/async_overlap_scripts/rbln_overlap_dp0_distilled.json`(ui.perfetto.dev 드롭).
+- 운영 발견: decode-bucket 컴파일 캐시는 **재사용됨**(gil2 실행이 캐시 채운 뒤 --profile 실행은 컴파일
+  ~236s로 단축). 첫 콜드 컴파일만 ~50분.
+
+## 6. 현재 코드 상태 (branch `async-overlap-prototype`)
+- **threading 코드 전부 제거됨(2026-07-02, 단일 스레드 (가) 확정 + 유저가 threading 완전 배제)**:
+  `_DeviceForwardExecutor` 클래스, `_async_forward`/`_device_executor` 필드, execute_model의
+  `_fast_defer`/`if self._async_forward` 분기, sample_tokens의 `_defer_sampler`(C9b)/`fwd_future`(C9a)
+  블록, `_bookkeeping_async_fast`, `ExecuteModelState.fwd_future`, `AsyncRBLNModelRunnerOutput.sample_future`,
+  rbln_worker의 `profile_all_threads`, 미사용 import(`queue`/`Future`/`dataclasses`) 모두 삭제.
+  py_compile OK + 레포 전체 dangling ref 0. **런타임 parity 검증은 별도 실행으로 확인.**
+- `vllm_rbln/forward_context.py`: DP all_reduce에 `VLLM_RBLN_SPAN_LOG` host span 로그. **유지(측정용)**.
+- `vllm_rbln/v1/worker/rbln_model_runner.py`: `_run_forward`의 SPAN fwd 로그 + GIL_PROBE 블록 유지(측정용).
+  실행 경로는 이제 inline forward + inline sampler 하나뿐(async-scheduling immediate AsyncOutput은 유지).
+- 게이트 플래그(현재): `VLLM_RBLN_OPTIMISTIC_SCHED`(낙관 스케줄러 depth2), `VLLM_RBLN_DISABLE_ASYNC`
+  (sync baseline), `VLLM_RBLN_SPAN_LOG`, `VLLM_RBLN_GIL_PROBE`. (`VLLM_RBLN_ASYNC_FORWARD` 제거됨.)
+- **필수 env**: `RBLN_VERBOSE=warning`(dev _C.so 기본 debug 스퓸 차단).
 
 ## 7. 핵심 파일:라인
 - forward + SPAN: `rbln_model_runner.py` `_run_forward()`(~3910), `execute_model`(~3509), `sample_tokens`(~4182).
