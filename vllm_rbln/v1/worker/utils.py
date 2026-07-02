@@ -11,13 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU affinity utilities for RBLN worker."""
+"""Utilities for the RBLN worker (CPU affinity, batch reorder, …)."""
 
 import math
 import os
 import platform
 from collections import defaultdict
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -33,6 +34,9 @@ from vllm.v1.worker.block_table import MultiGroupBlockTable
 
 import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
+
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu_input_batch import InputBatch
 
 logger = init_logger(__name__)
 
@@ -576,3 +580,92 @@ def get_kv_cache_names(
         for layer_name in layer_names:
             kv_cache_names.append(layer_name)
     return kv_cache_names
+
+
+def reorder_input_batch(input_batch: "InputBatch", perm: np.ndarray) -> None:
+    """Permute every per-request field of ``input_batch`` in one vectorized
+    pass (new slot ``k`` takes old index ``perm[k]``).
+
+    Mirrors upstream ``InputBatch.swap_states`` (vllm 0.22.0) but reindexes each
+    field once instead of via N-1 pairwise swaps; the caller emits the
+    logits-processor move records. Keep the field set in sync with
+    ``swap_states`` on vLLM bumps -- ``test_reorder_matches_swap_states`` guards
+    equivalence.
+    """
+    ib = input_batch
+    n = len(perm)
+    # numpy index: valid for advanced indexing of both numpy arrays and tensors.
+    p = np.asarray(perm)
+
+    # token_ids_cpu / is_token_ids rows are max_model_len wide but only
+    # [:num_tokens + spec] is meaningful, so reindex just those columns. valid_w
+    # is permutation-invariant (max over the same values), so read it first.
+    max_spec = max((len(s) for s in ib.spec_token_ids[:n]), default=0)
+    valid_w = min(
+        int(ib.num_tokens_no_spec[:n].max()) + max_spec,
+        ib.token_ids_cpu.shape[1],
+    )
+
+    # request id / token bookkeeping (python lists + index dict)
+    ib._req_ids[:n] = [ib._req_ids[i] for i in p]
+    ib.req_output_token_ids[:n] = [ib.req_output_token_ids[i] for i in p]
+    ib.spec_token_ids[:n] = [ib.spec_token_ids[i] for i in p]
+    for k in range(n):
+        rid = ib._req_ids[k]
+        if rid is not None:
+            ib.req_id_to_index[rid] = k
+
+    # per-request scalars; RHS fancy-index copies, so in-place assign is alias-safe
+    for arr in (
+        ib.num_tokens_no_spec,
+        ib.num_prompt_tokens,
+        ib.num_computed_tokens_cpu,
+    ):
+        arr[:n] = arr[p]
+
+    ib.token_ids_cpu[:n, :valid_w] = ib.token_ids_cpu[p, :valid_w]
+    ib.is_token_ids[:n, :valid_w] = ib.is_token_ids[p, :valid_w]
+
+    if ib.req_prompt_embeds:
+        ib.req_prompt_embeds = {
+            k: ib.req_prompt_embeds[int(p[k])]
+            for k in range(n)
+            if int(p[k]) in ib.req_prompt_embeds
+        }
+
+    # block-table CPU rows + counts (device copy re-synced downstream)
+    for bt in ib.block_table.block_tables:
+        bt.num_blocks_per_row[:n] = bt.num_blocks_per_row[p]
+        bt.block_table.np[:n] = bt.block_table.np[p]
+
+    ib.request_lora_mapping[:n] = ib.request_lora_mapping[p]
+
+    # Pooling models carry no sampling / logits state.
+    if ib.is_pooling_model:
+        return
+
+    for arr in (
+        ib.temperature_cpu,
+        ib.top_p_cpu,
+        ib.top_k_cpu,
+        ib.frequency_penalties_cpu,
+        ib.presence_penalties_cpu,
+        ib.repetition_penalties_cpu,
+        ib.num_accepted_tokens_cpu,
+    ):
+        arr[:n] = arr[p]
+
+    # index-keyed dicts: new slot k inherits old slot p[k]'s entry
+    ib.generators = {
+        k: ib.generators[int(p[k])] for k in range(n) if int(p[k]) in ib.generators
+    }
+    ib.bad_words_token_ids = {
+        k: ib.bad_words_token_ids[int(p[k])]
+        for k in range(n)
+        if int(p[k]) in ib.bad_words_token_ids
+    }
+
+    if ib.allowed_token_ids_mask_cpu_tensor is not None:
+        ib.allowed_token_ids_mask_cpu_tensor[:n] = ib.allowed_token_ids_mask_cpu_tensor[
+            p
+        ]
