@@ -162,11 +162,42 @@ decode에서 정확, 전이는 1-step stale(self-heal). vLLM 구조 불변.
   forward(N) 시점에 알아 speculation 제거.** (lookahead 없이는 decode-only/전이없는 워크로드만 안전.)
 - parity(token 0 mismatch)는 완주 run이 없어 미확인(전이 crash로 중단).
 
-### 다음 작업 (프로덕션화)
-scheduler depth-2 lookahead 배선: 낙관 스케줄러가 이미 N+1 batch를 결정하므로, worker `execute_model(N)`이
-N+1의 num_tokens/is_prefill를 받아 프리페치를 **정확한 값으로** 발사(speculation 제거) → 전이 crash 해소.
-이게 되면 decode·prefill 무관하게 안전 + overlap 유지. (vLLM executor↔worker 인터페이스에 N+1 메타 전달 필요 —
-"vLLM 구조 최소 변경"의 경계에 있음, 유저와 범위 상의.)
+### 다음 작업 — 엔진-side DP all_reduce (설계 확정, 미구현: 대규모·fragile 전용 작업)
+
+**목표**: DP num_tokens all_reduce를 worker(forward에 블로킹)가 아니라 **엔진 프로세스**에서 수행 →
+worker의 forward(N)와 cross-process로 자연 overlap + 추측 제거(실제값). GPU가 async forward로 얻는 것을
+RBLN에서 엔진-side로 재현. (worker helper-thread+RPC-peek는 막다름: MessageQueue peek 없음 + step당 RPC 2개.)
+
+**설계 (전부 vllm-rbln, vLLM 파일 미수정 — 런타임 monkey-patch로):**
+1. `RBLNSchedulerOutput`에 `dp_num_tokens_encoded: torch.Tensor|None` 필드 추가(pickle로 worker 전달;
+   `step_no_spec_required` 선례).
+2. `MultiprocExecutor.execute_model` wrap(monkey-patch): scheduler_output에서 이 rank (num_tokens,
+   num_reqs, is_prefill) 도출 → 엔진 DP gloo group(`DPEngineCoreProc.dp_group`, `core.py:1714`)에
+   all_reduce → 결과를 scheduler_output에 stamp → non_block dispatch(=forward(N-1) 중 실행 → overlap).
+   dp_group는 `DPEngineCoreProc.__init__` wrap에서 `model_executor._rbln_dp_group`로 전달.
+3. worker: `num_tokens_and_reqs_across_dp`/`get_dp_padding`가 `scheduler_output.dp_num_tokens_encoded`
+   present면 그 값 사용, 자기 all_reduce 스킵(`_prepare_inputs`→`get_dp_padding`로 필드 plumb).
+4. 구 `VLLM_RBLN_OVERLAP`(worker 프리페치, 추측) 제거/대체. 게이트 `VLLM_RBLN_OVERLAP_ENGINE`.
+
+**하드 서브문제 (각각 데드락/오정합 리스크 — 왜 대규모인지):**
+- **(H1) worker 로직 정확 재현**: 엔진이 scheduler_output만으로 worker의 (num_tokens, num_reqs,
+  is_prefill)를 **정확히** 계산해야(다르면 잘못된 max_pad→shape crash). 그런데 worker는 `total_query_tokens`
+  (spec/query-backfill 조정), `is_prefill_phase()=is_prefills()[0]`(input_batch 상태)로 도출 →
+  **steady decode·no-spec에선 정확 도출 가능**(num_reqs=len(num_scheduled_tokens), num_tokens=total,
+  is_prefill=False), **spec(--rsd 1)/prefill/backfill에선 복잡한 worker 로직 재현 필요.**
+- **(H2) dummy-batch 조율**: idle rank는 `execute_dummy_batch()`(인자 없음)→worker `dummy_run`→자기
+  all_reduce. 엔진으로 옮기면 (a) reduced 값을 worker dummy_run에 넘길 통로가 없음(RPC 인자 추가 필요),
+  (b) real=엔진/dummy=worker면 collective 참여 mismatch→**hang**. real+dummy 모두 엔진에서 일관되게 해야 함.
+- **(H3) exactly-once**: 엔진 루프(`step_with_batch_queue`)의 empty-schedule/ec_consumer/deferred-sampling
+  분기에서 rank별 all_reduce가 정확히 1회씩 매칭돼야(어긋나면 hang). executor.execute_model/dummy를 wrap하면
+  worker의 검증된 "dispatch당 1회" 패턴을 물려받아 완화되나, dummy(H2)와 결합돼 여전히 주의.
+- **(H4) iterative 테스트**: hang=무한 대기, exclusive 박스, 재현당 ~4분+.
+
+**추천**: (H1)이 steady-decode·no-spec에선 tractable하므로, **decode-only 좁은 버전**(spec/prefill/dummy는
+worker-blocking fallback 유지)으로 먼저 만들어 perf 검증 → 이득 확인되면 일반화. 단 fallback과 엔진-side가
+섞이는 step에서 collective mismatch 안 나게 게이트를 globally-consistent하게. 전용 작업 + on-device iteration 필요.
+
+**측정된 이득 상한(참고)**: all_reduce = step의 ~5~12%(barrier 포함 시 rank당 0.6~2.4ms/~15ms). 불균형 서빙에서 큼.
 
 ## 4. 정합성/overlap 검증 레시피
 ```bash
