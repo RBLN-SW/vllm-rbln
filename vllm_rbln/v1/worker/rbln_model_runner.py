@@ -224,17 +224,34 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
             dtype=self._sampled_token_ids.dtype,
             device="cpu",
         )
-        # Start the D2H copy now; the tensor is already populated. get_output
-        # synchronizes before reading it back.
-        self._sampled_token_ids_cpu.copy_(
-            self._sampled_token_ids, non_blocking=True
-        )
+        # In async-forward (RBLN_DYNAMO_ASYNC=defer) mode the forward/sampler are still
+        # in flight on the runtime worker here, so the sampled-token device tensor isn't
+        # populated yet — defer the D2H to get_output(), after draining the async work.
+        # (This deferral is exactly what lets forward(N) overlap step N+1's host prep.)
+        self._defer_copy = os.environ.get("RBLN_DYNAMO_ASYNC") == "defer"
+        if not self._defer_copy:
+            # Start the D2H copy now; the tensor is already populated. get_output
+            # synchronizes before reading it back.
+            self._sampled_token_ids_cpu.copy_(
+                self._sampled_token_ids, non_blocking=True
+            )
 
     def get_output(self) -> ModelRunnerOutput:
         """Copy the device tensors to the host and return a ModelRunnerOutput.
 
         This function blocks until the copy is finished.
         """
+        if self._defer_copy:
+            # Await the non-blocking forward/sampler submissions so the device tensor is
+            # populated, then issue the (now-valid) D2H copy.
+            from rebel.sync_runtime import drain_pending_async
+
+            drain_pending_async()
+            torch.rbln.synchronize(self._device_index)
+            self._sampled_token_ids_cpu.copy_(
+                self._sampled_token_ids, non_blocking=True
+            )
+
         torch.rbln.synchronize(self._device_index)
 
         # Release the device tensor once the copy has completed
