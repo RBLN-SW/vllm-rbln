@@ -68,9 +68,9 @@ export UV_INDEX_RBLN_NEXUS_NIGHTLY_USERNAME=<ldap-username>
 export UV_INDEX_RBLN_NEXUS_NIGHTLY_PASSWORD=<ldap-password>
 export UV_INDEX_REBELLIONS_USERNAME=<ldap-username>
 export UV_INDEX_REBELLIONS_PASSWORD=<ldap-password>
-export UV_INDEX_RBLN_RELEASE_USERNAME=<ldap-username>
-export UV_INDEX_RBLN_RELEASE_PASSWORD=<ldap-password>
 ```
+
+> `rbln-release` (pypi.rbln.ai) uses a separate account system; credentials for it are only needed if the lock ever resolves packages from that index.
 
 Then install the locked, team-identical environment with a single command:
 
