@@ -210,6 +210,7 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
         sampled_token_ids: torch.Tensor,
         invalid_req_indices: list[int],
         device_index: int,
+        pending_snapshot: list | None = None,
     ):
         self._model_runner_output = model_runner_output
         self._invalid_req_indices = invalid_req_indices
@@ -229,6 +230,11 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
         # populated yet — defer the D2H to get_output(), after draining the async work.
         # (This deferral is exactly what lets forward(N) overlap step N+1's host prep.)
         self._defer_copy = os.environ.get("RBLN_DYNAMO_ASYNC") == "defer"
+        # This step's async submissions (forward + sampler), claimed by the runner
+        # right before building this output. The next step's _prepare_inputs drains
+        # them (after its all_reduce, before its device ops); get_output awaits the
+        # same snapshot as a fallback (e.g. the final step, which has no next prep).
+        self._pending_snapshot: list = pending_snapshot or []
         if not self._defer_copy:
             # Start the D2H copy now; the tensor is already populated. get_output
             # synchronizes before reading it back.
@@ -242,15 +248,18 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
         This function blocks until the copy is finished.
         """
         if self._defer_copy:
-            # Await the non-blocking forward/sampler submissions so the device tensor is
+            # Await only this step's forward/sampler submissions so the device tensor is
             # populated, then issue the (now-valid) D2H copy.
-            from rebel.sync_runtime import drain_pending_async
+            from rebel.sync_runtime import await_pending
 
-            drain_pending_async()
+            await_pending(self._pending_snapshot)
             torch.rbln.synchronize(self._device_index)
-            self._sampled_token_ids_cpu.copy_(
-                self._sampled_token_ids, non_blocking=True
-            )
+            # get_output runs on vLLM's WorkerAsyncOutputCopy thread, which is
+            # outside inference_mode; an inplace copy_ into the host buffer that
+            # __init__ allocated under inference_mode is rejected ("Inplace update
+            # to inference tensor outside InferenceMode"). Materialize the host
+            # tensor out-of-place instead (allowed on inference tensors).
+            self._sampled_token_ids_cpu = self._sampled_token_ids.to("cpu")
 
         torch.rbln.synchronize(self._device_index)
 
@@ -1290,10 +1299,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
 
-        # OPTIMIZATION: Start copying the block table first.
-        # This way, we can overlap the copy with the following CPU operations.
-        self.input_batch.block_table.commit_block_table(num_reqs)
-
         # NOTE(RBLN): Sliding-window per-req slide distances from the
         # scheduler. For a boundary-affected req the runner prepends
         # `slide` past positions to the query window so the full
@@ -1312,6 +1317,46 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             slide_arr = np.zeros(num_reqs, dtype=np.int32)
         query_lengths = num_scheduled_tokens + slide_arr
         total_query_tokens = int(query_lengths.sum())
+
+        # NOTE(RBLN async-overlap): compute the cross-DP padding HERE — before any
+        # device H2D op below. get_dp_padding performs the per-step DP num_tokens
+        # all_reduce (a HOST gloo collective, no device work), so doing it first lets
+        # it overlap the PREVIOUS step's still-in-flight forward on the runtime worker.
+        # Immediately after, drain that forward: from this point on _prepare_inputs
+        # issues device work, and concurrent SubmitJob from the main and worker threads
+        # on one context returns SYS_ECANCELLED (-125). Draining here keeps device
+        # submission single-threaded while still hiding the all_reduce latency.
+        # Under sliding window the per-req query length equals num_scheduled + slide,
+        # so max_query_len / cross-DP token count must reflect query_lengths.
+        max_num_scheduled_tokens = int(query_lengths.max())
+        initial_batch_bucket_size = self.bucketing_manager.find_decode_batch_bucket(
+            num_reqs
+        )
+        is_prefill_phase = self.is_prefill_phase()
+        (
+            batch_bucket_size,
+            num_padded_tokens,
+            num_tokens_across_dp,
+            max_tokens_per_req_across_dp,
+        ) = self.get_dp_padding(
+            total_query_tokens,
+            num_reqs,
+            initial_batch_bucket_size,
+            num_padded_tokens,
+            is_prefill_phase,
+            spec_decode_max_query_len=spec_decode_max_query_len,
+        )
+        assert batch_bucket_size is not None
+        _prev_pending = getattr(self, "_prev_step_pending", None)
+        if _prev_pending:
+            from rebel.sync_runtime import await_pending
+
+            await_pending(_prev_pending)
+            self._prev_step_pending = []
+
+        # Start copying the block table (device H2D). Moved below the drain above so
+        # this — the first device op of the step — never races the previous forward.
+        self.input_batch.block_table.commit_block_table(num_reqs)
 
         # Runtime guard: a backfilled (slide) query window must stay within the
         # request's CURRENT KV block. If slide > tokens_used_in_block the window
@@ -1574,29 +1619,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self.num_accepted_tokens.np[num_reqs:].fill(1)
             self.num_accepted_tokens.copy_to_gpu()
 
-        # Under sliding window the actual per-req query length equals
-        # num_scheduled + slide. max_query_len and the cross-DP token count
-        # must therefore reflect query_lengths, not the logical advance.
-        max_num_scheduled_tokens = int(query_lengths.max())
-        initial_batch_bucket_size = self.bucketing_manager.find_decode_batch_bucket(
-            num_reqs
-        )
-
-        is_prefill_phase = self.is_prefill_phase()
-        (
-            batch_bucket_size,
-            num_padded_tokens,
-            num_tokens_across_dp,
-            max_tokens_per_req_across_dp,
-        ) = self.get_dp_padding(
-            total_query_tokens,
-            num_reqs,
-            initial_batch_bucket_size,
-            num_padded_tokens,
-            is_prefill_phase,
-            spec_decode_max_query_len=spec_decode_max_query_len,
-        )
-        assert batch_bucket_size is not None
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
         for kv_cache_group_id, kv_cache_group_spec in enumerate(
@@ -4148,11 +4170,23 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         if not self.use_async_scheduling:
             return output
 
+        # Claim this step's in-flight async submissions (forward + sampler) now that
+        # they've been dispatched. The next step's _prepare_inputs drains them right
+        # after its DP all_reduce (so the all_reduce overlaps this forward) and before
+        # its device H2D ops (so device submission never races across threads).
+        pending_snapshot: list = []
+        if os.environ.get("RBLN_DYNAMO_ASYNC") == "defer":
+            from rebel.sync_runtime import consume_pending_async
+
+            pending_snapshot = consume_pending_async()
+            self._prev_step_pending = pending_snapshot
+
         return AsyncRBLNModelRunnerOutput(
             model_runner_output=output,
             sampled_token_ids=sampler_output.sampled_token_ids,
             invalid_req_indices=invalid_req_indices,
             device_index=self.device.index if self.device.index is not None else 0,
+            pending_snapshot=pending_snapshot,
         )
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
