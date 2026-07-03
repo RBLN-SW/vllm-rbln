@@ -235,36 +235,59 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
         # them (after its all_reduce, before its device ops); get_output awaits the
         # same snapshot as a fallback (e.g. the final step, which has no next prep).
         self._pending_snapshot: list = pending_snapshot or []
+        # Set True once the sampled tokens have been copied to the host. In defer
+        # mode this normally happens in capture_host() (called by the next step's
+        # _prepare_inputs, before that step overwrites the shared sampled-token
+        # buffer); get_output() only copies as a fallback (e.g. the final step).
+        self._captured = False
         if not self._defer_copy:
             # Start the D2H copy now; the tensor is already populated. get_output
             # synchronizes before reading it back.
             self._sampled_token_ids_cpu.copy_(
                 self._sampled_token_ids, non_blocking=True
             )
+            self._captured = True
+
+    def capture_host(self) -> None:
+        """Copy the sampled tokens to the host on the runner's main thread.
+
+        Called from the NEXT step's _prepare_inputs, after its drain has awaited
+        this step's sampler and BEFORE it issues device work that reuses the
+        shared sampled-token buffer (prev_sampled_token_ids is a fixed device
+        tensor, overwritten every step). Deferring this copy to get_output() would
+        race that overwrite and read stale/zero tokens. Runs under execute_model's
+        inference_mode, so the in-place copy_ into the host buffer is allowed.
+        """
+        if self._captured:
+            return
+        torch.rbln.synchronize(self._device_index)
+        self._sampled_token_ids_cpu.copy_(self._sampled_token_ids, non_blocking=False)
+        self._captured = True
 
     def get_output(self) -> ModelRunnerOutput:
         """Copy the device tensors to the host and return a ModelRunnerOutput.
 
         This function blocks until the copy is finished.
         """
-        if self._defer_copy:
-            # Await only this step's forward/sampler submissions so the device tensor is
-            # populated, then issue the (now-valid) D2H copy.
+        if self._defer_copy and not self._captured:
+            # Fallback path (e.g. the final step, which has no next _prepare_inputs
+            # to call capture_host): await this step's forward/sampler, then copy.
+            # The buffer is still intact here because no later step has run. This
+            # runs on vLLM's WorkerAsyncOutputCopy thread (outside inference_mode),
+            # so copy out-of-place — an in-place copy_ into the inference-mode host
+            # buffer is rejected ("Inplace update to inference tensor").
             from rebel.sync_runtime import await_pending
 
             await_pending(self._pending_snapshot)
             torch.rbln.synchronize(self._device_index)
-            # get_output runs on vLLM's WorkerAsyncOutputCopy thread, which is
-            # outside inference_mode; an inplace copy_ into the host buffer that
-            # __init__ allocated under inference_mode is rejected ("Inplace update
-            # to inference tensor outside InferenceMode"). Materialize the host
-            # tensor out-of-place instead (allowed on inference tensors).
             self._sampled_token_ids_cpu = self._sampled_token_ids.to("cpu")
+            self._captured = True
 
         torch.rbln.synchronize(self._device_index)
 
         # Release the device tensor once the copy has completed
-        del self._sampled_token_ids
+        if hasattr(self, "_sampled_token_ids"):
+            del self._sampled_token_ids
 
         valid_sampled_token_ids = self._sampled_token_ids_cpu.tolist()
         for i in self._invalid_req_indices:
@@ -1353,6 +1376,13 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
             await_pending(_prev_pending)
             self._prev_step_pending = []
+            # The previous step's sampler is now complete and its (shared, reused)
+            # sampled-token buffer is not yet overwritten by this step — copy those
+            # tokens to the host now, before the device work below reuses the buffer.
+            _prev_out = getattr(self, "_prev_output", None)
+            if _prev_out is not None:
+                _prev_out.capture_host()
+                self._prev_output = None
 
         # Start copying the block table (device H2D). Moved below the drain above so
         # this — the first device op of the step — never races the previous forward.
@@ -4024,6 +4054,21 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # Clear ephemeral state.
         self.execute_model_state = None
 
+        # In defer mode the model forward and compute_logits were dispatched
+        # non-blocking, so `logits` is a device tensor that may not be populated
+        # yet. self.sampler runs EAGERLY on this thread and reads `logits`, so it
+        # would sample from uncomputed logits (garbage) unless we first wait for
+        # the in-flight forward/compute_logits to finish. (Correctness takes
+        # priority over the all_reduce overlap here; recovering the overlap needs
+        # the sampler itself to run on the async worker.)
+        if os.environ.get("RBLN_DYNAMO_ASYNC") == "defer":
+            from rebel.sync_runtime import drain_pending_async
+
+            drain_pending_async()
+            torch.rbln.synchronize(
+                self.device.index if self.device.index is not None else 0
+            )
+
         # Apply structured output bitmasks if present.
         if grammar_output is not None and logits.shape[0] > 0:
             # NOTE(RBLN): `xgr.apply_token_bitmask_inplace` requires logits
@@ -4181,13 +4226,18 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             pending_snapshot = consume_pending_async()
             self._prev_step_pending = pending_snapshot
 
-        return AsyncRBLNModelRunnerOutput(
+        async_output = AsyncRBLNModelRunnerOutput(
             model_runner_output=output,
             sampled_token_ids=sampler_output.sampled_token_ids,
             invalid_req_indices=invalid_req_indices,
             device_index=self.device.index if self.device.index is not None else 0,
             pending_snapshot=pending_snapshot,
         )
+        if os.environ.get("RBLN_DYNAMO_ASYNC") == "defer":
+            # Hand this output to the next step's _prepare_inputs so it can copy the
+            # sampled tokens to the host (capture_host) before reusing the buffer.
+            self._prev_output = async_output
+        return async_output
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         if self._draft_token_ids is None:
