@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from abc import ABC, abstractmethod
+from dataclasses import replace
 from typing import Any
 
 import torch
@@ -242,11 +243,8 @@ class RBLNOptimumQwenVLForConditionalGeneration(
     def build_prefill_forward_inputs(
         self,
         model_input: ModelInputForRBLN,
-    ) -> tuple[torch.Tensor, torch.Tensor | None, float | None]:
-        """Prefill: run ``preprocess_prefill`` (embedding merge + MRoPE) and
-        return ``(inputs_embeds, position_embed, rope_delta)``. The runner owns
-        and stores the per-request rope delta; this hook only returns it.
-        """
+        mrope_position_deltas: dict[str, float],
+    ) -> ModelInputForRBLN:
         input_ids = model_input.input_tokens
         image_input = None
         video_input = None
@@ -262,10 +260,15 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         prefill_params = self.preprocess_prefill(
             input_ids, attention_mask, image_input, video_input
         )
-        return (
-            prefill_params["inputs_embeds"],
-            prefill_params["position_embed"],
-            prefill_params["rope_deltas"].item(),
+        mrope_position_deltas[model_input.running_requests_ids[0]] = prefill_params[
+            "rope_deltas"
+        ].item()
+        return replace(
+            model_input,
+            inputs_embeds=prefill_params["inputs_embeds"],
+            position_embed=prefill_params["position_embed"],
+            visual_pos_mask=prefill_params.get("visual_pos_mask"),
+            deepstack_embeds=prefill_params.get("deepstack_embeds"),
         )
 
     def compute_decode_position_embed(
@@ -328,11 +331,18 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         block_tables = kwargs.pop("block_tables")
 
         if is_prompt:
-            logits = self.model.prefill_decoder(
-                inputs_embeds=model_input.inputs_embeds,
-                position_embed=model_input.position_embed,
-                block_tables=block_tables,
-            ).logits
+            prefill_kwargs = {
+                "inputs_embeds": model_input.inputs_embeds,
+                "position_embed": model_input.position_embed,
+                "block_tables": block_tables,
+            }
+            # Qwen3-VL / Qwen3-VL-Moe feed visual_pos_mask + deepstack_embeds to
+            # the prefill decoder; Qwen2/2.5-VL leave these None and skip them.
+            if model_input.visual_pos_mask is not None:
+                prefill_kwargs["visual_pos_mask"] = model_input.visual_pos_mask
+            if model_input.deepstack_embeds is not None:
+                prefill_kwargs["deepstack_embeds"] = model_input.deepstack_embeds
+            logits = self.model.prefill_decoder(**prefill_kwargs).logits
         else:
             padded_batch_size = kwargs.pop("padded_batch_size", self.decoder_batch_size)
             self.model.decoder = self.model.decoders[padded_batch_size]
