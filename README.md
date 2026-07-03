@@ -99,33 +99,31 @@ curl -s -u "$UV_INDEX_RBLN_NEXUS_NIGHTLY_USERNAME:$UV_INDEX_RBLN_NEXUS_NIGHTLY_P
 
 #### External contributors (no Rebellions internal network)
 
-`uv sync` and `uv.lock` require access to Rebellions-internal package indexes and
-are for internal development only. External contributors can build a working
-environment from public indexes plus the customer-facing `rbln-release` index:
-
-1. Get SDK access to <https://pypi.rbln.ai/> (Rebellions customer portal account,
-   see <https://docs.rbln.ai/>) and set the credentials:
+`uv.lock` pins packages to Rebellions-internal indexes, so `uv sync` only works
+inside the internal network. Internal nightly builds of `rebel-compiler` are
+not published externally. External contributors instead install `rebel-compiler`
+separately and build the rest of the environment from public indexes:
 
 ```bash
-export UV_INDEX_RBLN_RELEASE_USERNAME=<portal-username>
-export UV_INDEX_RBLN_RELEASE_PASSWORD=<portal-password>
-```
-
-2. Install with the `rebel-compiler` pin overridden to your released SDK version
-   (the dev branch tracks internal nightlies, which are not published externally):
-
-```bash
-echo "rebel-compiler==<your-sdk-version>" > override.txt
+# 1. Create a venv and install rebel-compiler following the official guide
+#    (https://docs.rbln.ai/ — requires a Rebellions customer portal account):
 uv venv --python 3.12
+source .venv/bin/activate
+# ... install rebel-compiler into this venv per the official instructions ...
+
+# 2. Install vllm-rbln, keeping your installed rebel-compiler as-is:
+echo "rebel-compiler==$(python -c 'import importlib.metadata as m; print(m.version("rebel-compiler"))')" > override.txt
 uv pip install -e ".[test]" --override override.txt
 ```
 
-All other dependencies resolve from public indexes (PyPI, `wheels.vllm.ai`,
-`download.pytorch.org`); indexes you cannot authenticate to are skipped.
+The override tells uv to accept your separately installed `rebel-compiler`
+instead of the internal nightly pin in `pyproject.toml`. Everything else
+resolves from public indexes (PyPI, `wheels.vllm.ai`, `download.pytorch.org`);
+internal indexes are skipped automatically.
 
-> Note: the dev branch is validated against internal nightly `rebel-compiler`
-> builds. With an older released SDK, recently added features may not work —
-> CI remains the source of truth for compatibility.
+> Note: the dev branch is validated in CI against internal nightly
+> `rebel-compiler` builds. With a released SDK version some recent features may
+> not work — CI is the source of truth for compatibility.
 
 ### 📚 Documentation
 
