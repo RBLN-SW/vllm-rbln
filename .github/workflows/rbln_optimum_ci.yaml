@@ -91,6 +91,9 @@ jobs:
           UV_INDEX_RBLN_NEXUS_NIGHTLY_PASSWORD: ${{ secrets.UDC_NEXUS_PASSWORD }}
           UV_INDEX_REBELLIONS_USERNAME: ${{ secrets.REBEL_PYPI_USERNAME }}
           UV_INDEX_REBELLIONS_PASSWORD: ${{ secrets.REBEL_PYPI_PASSWORD }}
+          # ponytail: rbln-release index inert until lock bump; maps to same LDAP account as nightly/rebellions
+          UV_INDEX_RBLN_RELEASE_USERNAME: ${{ secrets.REBEL_PYPI_USERNAME }}
+          UV_INDEX_RBLN_RELEASE_PASSWORD: ${{ secrets.REBEL_PYPI_PASSWORD }}
         with:
           timeout_minutes: 15
           max_attempts: 3
@@ -182,6 +185,9 @@ jobs:
           UV_INDEX_RBLN_NEXUS_NIGHTLY_PASSWORD: ${{ secrets.UDC_NEXUS_PASSWORD }}
           UV_INDEX_REBELLIONS_USERNAME: ${{ secrets.REBEL_PYPI_USERNAME }}
           UV_INDEX_REBELLIONS_PASSWORD: ${{ secrets.REBEL_PYPI_PASSWORD }}
+          # ponytail: rbln-release index inert until lock bump; maps to same LDAP account as nightly/rebellions
+          UV_INDEX_RBLN_RELEASE_USERNAME: ${{ secrets.REBEL_PYPI_USERNAME }}
+          UV_INDEX_RBLN_RELEASE_PASSWORD: ${{ secrets.REBEL_PYPI_PASSWORD }}
         with:
           timeout_minutes: 15
           max_attempts: 3
@@ -298,6 +304,9 @@ jobs:
           UV_INDEX_RBLN_NEXUS_NIGHTLY_PASSWORD: ${{ secrets.UDC_NEXUS_PASSWORD }}
           UV_INDEX_REBELLIONS_USERNAME: ${{ secrets.REBEL_PYPI_USERNAME }}
           UV_INDEX_REBELLIONS_PASSWORD: ${{ secrets.REBEL_PYPI_PASSWORD }}
+          # ponytail: rbln-release index inert until lock bump; maps to same LDAP account as nightly/rebellions
+          UV_INDEX_RBLN_RELEASE_USERNAME: ${{ secrets.REBEL_PYPI_USERNAME }}
+          UV_INDEX_RBLN_RELEASE_PASSWORD: ${{ secrets.REBEL_PYPI_PASSWORD }}
         with:
           timeout_minutes: 15
           max_attempts: 3
