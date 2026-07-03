@@ -97,6 +97,36 @@ curl -s -u "$UV_INDEX_RBLN_NEXUS_NIGHTLY_USERNAME:$UV_INDEX_RBLN_NEXUS_NIGHTLY_P
   | grep -oE 'rebel_compiler-[0-9][A-Za-z0-9.+]*' | sort -uV | tail -10
 ```
 
+#### External contributors (no Rebellions internal network)
+
+`uv sync` and `uv.lock` require access to Rebellions-internal package indexes and
+are for internal development only. External contributors can build a working
+environment from public indexes plus the customer-facing `rbln-release` index:
+
+1. Get SDK access to <https://pypi.rbln.ai/> (Rebellions customer portal account,
+   see <https://docs.rbln.ai/>) and set the credentials:
+
+```bash
+export UV_INDEX_RBLN_RELEASE_USERNAME=<portal-username>
+export UV_INDEX_RBLN_RELEASE_PASSWORD=<portal-password>
+```
+
+2. Install with the `rebel-compiler` pin overridden to your released SDK version
+   (the dev branch tracks internal nightlies, which are not published externally):
+
+```bash
+echo "rebel-compiler==<your-sdk-version>" > override.txt
+uv venv --python 3.12
+uv pip install -e ".[test]" --override override.txt
+```
+
+All other dependencies resolve from public indexes (PyPI, `wheels.vllm.ai`,
+`download.pytorch.org`); indexes you cannot authenticate to are skipped.
+
+> Note: the dev branch is validated against internal nightly `rebel-compiler`
+> builds. With an older released SDK, recently added features may not work —
+> CI remains the source of truth for compatibility.
+
 ### 📚 Documentation
 
 - [Overview & Supported Models](https://docs.rbln.ai/software/model_serving/vllm_support/vllm-rbln.html)
