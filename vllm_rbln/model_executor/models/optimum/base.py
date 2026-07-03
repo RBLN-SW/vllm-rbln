@@ -37,6 +37,10 @@ class ModelInputForRBLN:
     dummy_block: int | None = None  # for prefix caching
     inputs_embeds: torch.Tensor | None = None
     position_embed: torch.Tensor | None = None
+    # Qwen3-VL / Qwen3-VL-Moe prefill extras: visual token position mask and
+    # deepstack features. Left None for models that don't use them.
+    visual_pos_mask: torch.Tensor | None = None
+    deepstack_embeds: torch.Tensor | None = None
 
 
 version_error = RuntimeError(
