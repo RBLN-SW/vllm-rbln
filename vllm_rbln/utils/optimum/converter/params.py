@@ -98,7 +98,6 @@ class RBLNParams:
     ) -> "RBLNParams":
         """Parse rbln_config according to the model architecture."""
         hf_config = vllm_config.model_config.hf_config
-        num_devices = _cfg_get(rbln_config, "num_devices", 1)
 
         if is_enc_dec_arch(hf_config):
             params = cls._parse_enc_dec(rbln_config)
@@ -109,7 +108,7 @@ class RBLNParams:
         else:
             params = cls._parse_decoder(rbln_config)
 
-        params.num_devices = num_devices
+        params.num_devices = _resolve_num_devices(rbln_config)
         return params
 
     @classmethod
@@ -201,6 +200,25 @@ class RBLNParams:
             prefill_chunk_size=prefill_chunk_size,
             image_prefill_chunk_size=image_prefill_chunk_size,
         )
+
+
+def _resolve_num_devices(cfg: RblnConfigLike) -> int:
+    """Resolve ``num_devices``, preferring a language-model submodule.
+
+    Multimodal models pin ``num_devices`` on the ``language_model`` /
+    ``text_model`` submodule at compile time (see the multimodal compilation
+    params), so the top-level key is usually absent and defaults to 1. Read the
+    submodule value first, falling back to the top-level key for models that
+    store it there.
+    """
+    for submodule_name in ("language_model", "text_model"):
+        sub_cfg = _cfg_get_submodule(cfg, submodule_name)
+        if sub_cfg is None:
+            continue
+        sub_val = _cfg_get(sub_cfg, "num_devices")
+        if sub_val is not None:
+            return sub_val
+    return _cfg_get(cfg, "num_devices", 1)
 
 
 def _resolve_image_prefill_chunk_size(cfg: RblnConfigLike) -> list[int] | None:
