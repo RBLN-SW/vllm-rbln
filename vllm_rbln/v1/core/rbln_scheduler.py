@@ -1067,6 +1067,21 @@ class RBLNScheduler(Scheduler):
                         req.request_id, []
                     )
                     scheduled_encoder_inputs.pop(req.request_id, None)
+                    # NOTE(RBLN): The evicted decode may have been assigned a
+                    # sliding-window backfill (spec_decode_slide_distance) by the
+                    # running loop earlier this step. It is being dropped from
+                    # num_scheduled_tokens, so its per-step slide entry MUST be
+                    # dropped too -- unlike the block delta above there is nothing
+                    # to restore (the slide is recomputed next step when the req
+                    # is re-scheduled). Leaving it behind makes the scheduler
+                    # output carry a slide for a req that is not scheduled; the
+                    # runner then over-counts num_input_tokens (total_num_scheduled
+                    # + sum(slide)) while the pad window only accounts for the
+                    # scheduled reqs. A prefill evictor is absorbed by the fixed
+                    # DP-prefill pad, but a PDD num_new==1 (decode-classified)
+                    # evictor leaves an all-decode step whose tight spec pad
+                    # (pad_speculative_draft_tokens) then overflows index_copy.
+                    spec_decode_slide_distance.pop(req.request_id, None)
 
                     # NOTE(RBLN): The block delta allocated for this evicted
                     # request is already committed in the coordinator but is
