@@ -65,7 +65,7 @@ class RBLNOptimumForCausalLM(
                     self.model.prefill_decoder,
                     model_input.cached_block_tables,
                     model_input.cached_lengths,
-                    block_tables,
+                    model_input.block_tables,
                 )
             return self.model.prefill_decoder(**kwargs).logits
         else:

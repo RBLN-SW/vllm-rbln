@@ -36,7 +36,6 @@ from vllm_rbln.logger import init_logger
 from vllm_rbln.utils.optimum.predicates import is_qwen3_pooling
 from vllm_rbln.utils.optimum.registry import (
     is_enc_dec_arch,
-    is_multi_modal,
     is_pooling_arch,
 )
 
@@ -431,8 +430,6 @@ class RblnPlatform(Platform):
                 cls._disable_prefix_caching(vllm_config, "Qwen3 pooling models")
             elif is_enc_dec_arch(hf_config):
                 cls._disable_prefix_caching(vllm_config, "encoder-decoder models")
-            elif is_multi_modal(hf_config):
-                cls._disable_prefix_caching(vllm_config, "multimodal models")
             elif is_pooling_arch(hf_config):
                 cls._disable_prefix_caching(vllm_config, "pooling models")
             elif getattr(hf_config, "sliding_window", None) is not None and getattr(

@@ -56,10 +56,6 @@ def load_model(vllm_config: VllmConfig) -> nn.Module:
     model_config = vllm_config.model_config
     logger.info("Loading RBLN model from %s", model_config.model)
     if is_multi_modal(model_config.hf_config):
-        assert vllm_config.cache_config.enable_prefix_caching in (False, None), (
-            "Prefix caching is not supported with multimodal models. "
-            "Please set `enable_prefix_caching` to False."
-        )
         architectures = getattr(model_config.hf_config, "architectures", [])
         if architectures[0] in _RBLN_OPTIMUM_MULTIMODAL_MODELS:
             rbln_model_arch = _RBLN_OPTIMUM_MULTIMODAL_MODELS[architectures[0]]
