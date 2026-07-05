@@ -61,6 +61,9 @@ from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 import vllm_rbln.envs as envs
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.utils import (
+    finalize_kv_cache_registrations,
+)
 from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.worker.rbln_model_runner import RBLNModelRunner
 from vllm_rbln.v1.worker.utils import (
@@ -407,6 +410,15 @@ class RBLNWorker(WorkerBase):
                 logger.info("Skipping compile_or_warm_up_model.")
             else:
                 self.model_runner.warmup_model()
+
+                # Connectors that defer KV-cache registration (RBLN NIXL D2D
+                # and LMCache) finalize it here: the KV cache physical views
+                # only exist once warm-up has run the compiled model. Walk the
+                # connector tree (incl. MultiConnector children) so the hook
+                # still runs when combined with other connectors. Only on a
+                # successful warm-up — not on the skipped or failed path.
+                if has_kv_transfer_group():
+                    finalize_kv_cache_registrations(get_kv_transfer_group())
 
         except BackendCompilerFailed as e:
 

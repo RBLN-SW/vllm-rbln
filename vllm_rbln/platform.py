@@ -126,6 +126,14 @@ class RblnPlatform(Platform):
         rebel.manual_seed(seed)
 
     @classmethod
+    def set_device(cls, device: torch.device) -> None:
+        """
+        Set the device for the current platform.
+        """
+        logger.warning("set_device is not supported on RBLN.")
+        pass
+
+    @classmethod
     def _override_default_max_num_seqs(cls) -> None:
         """Default an unset max_num_seqs to RBLN_DEFAULT_MAX_NUM_SEQS.
 
@@ -479,8 +487,14 @@ class RblnPlatform(Platform):
 
     @classmethod
     def get_nixl_supported_devices(cls) -> dict[str, tuple[str, ...]]:
+        # kv_buffer_device "cpu" is the host-bounce path; "rbln" is the D2D
+        # path (upstream NixlConnectorWorker.__init__ rejects kv_buffer_device
+        # values not listed here). Listed under both device_types because
+        # device_type is "rbln" only when VLLM_RBLN_USE_DEVICE_TENSOR and
+        # VLLM_RBLN_USE_VLLM_MODEL are both set.
         return {
-            "rbln": ("cpu",),
+            "cpu": ("cpu", "rbln"),
+            "rbln": ("rbln", "cpu"),
         }
 
     @classmethod
