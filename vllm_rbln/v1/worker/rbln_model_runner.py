@@ -14,14 +14,18 @@
 
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
-from contextlib import nullcontext
+from contextlib import AbstractContextManager, nullcontext
 from copy import copy, deepcopy
-from typing import Any, NamedTuple, TypeAlias, cast
+from typing import Any, Literal, NamedTuple, TypeAlias, cast
 
 import numpy as np
 import torch
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.config.cache import CacheConfig
+from vllm.distributed.kv_transfer import (
+    get_kv_transfer_group,
+    has_kv_transfer_group,
+)
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -60,6 +64,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     DraftTokenIds,
+    KVConnectorOutput,
     LogprobsLists,
     LogprobsTensors,
     ModelRunnerOutput,
@@ -80,6 +85,9 @@ from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
+from vllm.v1.worker.kv_connector_model_runner_mixin import (
+    KVConnectorModelRunnerMixin,
+)
 from vllm.v1.worker.utils import (
     AttentionGroup,
     AttentionSpec,
@@ -117,7 +125,11 @@ from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
 from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
 from vllm_rbln.v1.worker.input_stager import InputLayout, InputStager, StagedModelInputs
 from vllm_rbln.v1.worker.metrics_v2 import PerformanceContext, ProfileSection
-from vllm_rbln.v1.worker.utils import prepare_kernel_block_sizes, reorder_input_batch
+from vllm_rbln.v1.worker.utils import (
+    get_kv_cache_names,
+    prepare_kernel_block_sizes,
+    reorder_input_batch,
+)
 
 logger = init_logger(__name__)
 
@@ -181,7 +193,7 @@ class ExecuteModelState(NamedTuple):
     aux_hidden_states: list[torch.Tensor] | None
 
 
-class RBLNModelRunner:
+class RBLNModelRunner(KVConnectorModelRunnerMixin):
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -252,6 +264,9 @@ class RBLNModelRunner:
         self.kv_caches: list[torch.Tensor] = []
         self.kv_cache_bases: list[torch.Tensor] = []
         self.kv_cache_view_infos: list[KVCacheViewInfo] = []
+        # KV cache layer names in layer-index order; the deterministic
+        # ordering the KV connector relies on for region<->layer agreement.
+        self.kv_cache_names: list[str] = []
         # Initialize in initialize_kv_cache_tensors
         self.cross_layers_kv_cache: torch.Tensor | None = None
         self.cross_layers_attn_backend: type[AttentionBackend] | None = None
@@ -381,7 +396,9 @@ class RBLNModelRunner:
 
         # Ephemeral state transferred between execute_model() and sample_tokens().
         self.execute_model_state: ExecuteModelState | None = None
-        # self.kv_connector_output: KVConnectorOutput | None = None
+        # KV-connector output carried from execute_model() to sample_tokens()
+        # (and across the PP / pooling / empty-batch paths).
+        self.kv_connector_output: KVConnectorOutput | None = None
 
         # NOTE(RBLN): Initialize bucketing manager
         self.bucketing_manager = get_bucketing_manager(
@@ -1068,7 +1085,7 @@ class RBLNModelRunner:
         hidden_states: torch.Tensor,
         num_scheduled_tokens: int,
         num_scheduled_tokens_np: np.ndarray,
-        # kv_connector_output: KVConnectorOutput | None,
+        kv_connector_output: KVConnectorOutput | None = None,
     ) -> ModelRunnerOutput:
         num_reqs = self.input_batch.num_reqs
         assert num_reqs == len(self.input_batch.pooling_params), (
@@ -1096,7 +1113,7 @@ class RBLNModelRunner:
         model_runner_output = ModelRunnerOutput(
             req_ids=self.input_batch.req_ids.copy(),
             req_id_to_index=self.input_batch.req_id_to_index.copy(),
-            kv_connector_output=None,
+            kv_connector_output=kv_connector_output,
         )
 
         if raw_pooler_output is None or not any(finished_mask):
@@ -1307,6 +1324,28 @@ class RBLNModelRunner:
             req_id_to_index_output_copy,
         )
 
+    @staticmethod
+    def _is_kv_connector_warm_up_phase(scheduler_output: RBLNSchedulerOutput) -> bool:
+        # Warm-up runs the model with a synthetic SchedulerOutput whose
+        # `kv_connector_metadata` is None. The connector lifecycle
+        # (bind/wait/clear) must skip this phase, otherwise stateful
+        # connectors (e.g. LMCache) assert on missing bound metadata.
+        return scheduler_output.kv_connector_metadata is None
+
+    @staticmethod
+    def maybe_get_kv_connector_output(
+        scheduler_output: RBLNSchedulerOutput,
+        defer_finalize: bool = False,
+    ) -> AbstractContextManager[KVConnectorOutput | None]:
+        skip = RBLNModelRunner._is_kv_connector_warm_up_phase(scheduler_output)
+        return (
+            KVConnectorModelRunnerMixin._get_kv_connector_output(
+                scheduler_output, defer_finalize=defer_finalize
+            )
+            if has_kv_transfer_group() and not skip
+            else nullcontext()
+        )
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -1317,6 +1356,11 @@ class RBLNModelRunner:
             raise RuntimeError(
                 "State error: sample_tokens() must be called "
                 "after execute_model() returns None."
+            )
+
+        if scheduler_output.preempted_req_ids and has_kv_transfer_group():
+            get_kv_transfer_group().handle_preemptions(
+                scheduler_output.preempted_req_ids
             )
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
@@ -1331,7 +1375,12 @@ class RBLNModelRunner:
                 self._process_kv_cache_copy_ops(scheduler_output.kv_cache_copy_ops)
 
             if not num_scheduled_tokens:
-                return EMPTY_MODEL_RUNNER_OUTPUT
+                warm_up_phase = scheduler_output.kv_connector_metadata is None
+                if not has_kv_transfer_group() or warm_up_phase:
+                    # Return empty ModelRunnerOutput if there's no work to do.
+                    return EMPTY_MODEL_RUNNER_OUTPUT
+                # KV send/recv even when there is no forward work to do.
+                return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
 
             if self.cache_config.kv_sharing_fast_prefill:
                 assert not self.num_prompt_logprobs, (
@@ -1385,6 +1434,10 @@ class RBLNModelRunner:
             )
 
         # Run the model.
+        # When spec decode is enabled, defer connector finalization
+        # (wait_for_save + clear metadata) until after the draft model runs
+        # in sample_tokens(), so the draft model can also save its KV cache.
+        defer_kv_connector_finalize = self.speculative_config is not None
         with (
             set_forward_context(
                 attn_metadata,
@@ -1400,6 +1453,10 @@ class RBLNModelRunner:
                 token_count=num_scheduled_tokens,
             ),
             record_function_or_nullcontext("rbln_model_runner: forward"),
+            self.maybe_get_kv_connector_output(
+                scheduler_output,
+                defer_finalize=defer_kv_connector_finalize,
+            ) as kv_connector_output,
         ):
             model_output = self.model_executable(
                 **staged_model_inputs.as_kwargs(),
@@ -1410,8 +1467,11 @@ class RBLNModelRunner:
             hidden_states, aux_hidden_states, logits = model_output
 
             if not get_pp_group().is_last_rank:
-                # Return the intermediate tensors.
+                # Return the intermediate tensors; carry the connector output
+                # to the worker (and to sample_tokens via self.kv_connector_output).
                 assert isinstance(hidden_states, IntermediateTensors)
+                hidden_states.kv_connector_output = kv_connector_output
+                self.kv_connector_output = kv_connector_output
                 return hidden_states
 
             if self.is_pooling_model:
@@ -1420,6 +1480,7 @@ class RBLNModelRunner:
                     hidden_states.flatten(0, -2),
                     num_scheduled_tokens,
                     num_scheduled_tokens_np,
+                    kv_connector_output,
                 )
 
             sample_hidden_states = hidden_states
@@ -1436,6 +1497,7 @@ class RBLNModelRunner:
             sample_hidden_states,
             aux_hidden_states,
         )
+        self.kv_connector_output = kv_connector_output
         return None
 
     @torch.inference_mode()
@@ -1443,7 +1505,14 @@ class RBLNModelRunner:
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput:
         if self.execute_model_state is None:
+            # No sampling to do (empty batch already handled, or a PP
+            # intermediate stage). Surface any KV-connector output stashed by
+            # execute_model so finished send/recv notifications still propagate.
+            kv_connector_output = self.kv_connector_output
+            self.kv_connector_output = None
             output = copy(EMPTY_MODEL_RUNNER_OUTPUT)
+            if kv_connector_output is not None:
+                output.kv_connector_output = kv_connector_output
             return output
 
         # Unpack ephemeral state.
@@ -1521,6 +1590,20 @@ class RBLNModelRunner:
         if propose_drafts_after_bookkeeping:
             propose_draft_token_ids(valid_sampled_token_ids)
 
+        # Finalize the KV connector (wait_for_save + clear metadata) after the
+        # draft model runs. With spec decode, this was deferred from the target
+        # model forward so the draft model can also save its KV cache. Skip
+        # during warm-up — the connector context was bypassed in
+        # maybe_get_kv_connector_output, so no metadata was bound.
+        if spec_config is not None and not self._is_kv_connector_warm_up_phase(
+            scheduler_output
+        ):
+            self.finalize_kv_connector()
+
+        # self.kv_connector_output may be modified during drafting.
+        kv_connector_output = self.kv_connector_output
+        self.kv_connector_output = None
+
         with record_function_or_nullcontext("rbln_model_runner: ModelRunnerOutput"):
             output = ModelRunnerOutput(
                 req_ids=req_ids_output_copy,
@@ -1529,6 +1612,7 @@ class RBLNModelRunner:
                 logprobs=logprobs_lists,
                 prompt_logprobs_dict=prompt_logprobs_dict,
                 num_nans_in_logits=num_nans_in_logits,
+                kv_connector_output=kv_connector_output,
             )
 
         return output
@@ -2425,6 +2509,8 @@ class RBLNModelRunner:
             self.kv_caches,
             num_attn_module,
         )
+        self.kv_cache_names = get_kv_cache_names(kv_caches, num_attn_module)
+        assert len(self.kv_cache_names) == len(self.kv_caches)
 
         if (
             not USE_DEVICE_TENSOR
@@ -2495,7 +2581,62 @@ class RBLNModelRunner:
 
         # Reinitialize need to after initialize_attn_backend
         self.may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)
-        _ = self.initialize_kv_cache_tensors(kv_cache_config, kernel_block_sizes)
+        kv_caches = self.initialize_kv_cache_tensors(
+            kv_cache_config, kernel_block_sizes
+        )
+
+        if has_kv_transfer_group():
+            kv_transfer_group = get_kv_transfer_group()
+            if self.cross_layers_kv_cache is not None:
+                assert self.cross_layers_attn_backend is not None
+                kv_transfer_group.register_cross_layers_kv_cache(
+                    self.cross_layers_kv_cache, self.cross_layers_attn_backend
+                )
+            else:
+                # Iterate in layer-index order (self.kv_cache_names): NIXL
+                # assigns region indices in iteration order, and set iteration
+                # would vary with PYTHONHASHSEED, breaking the P/D region <->
+                # layer agreement.
+                ordered_kv_caches = {
+                    name: kv_caches[name] for name in self.kv_cache_names
+                }
+                kv_transfer_group.register_kv_caches(ordered_kv_caches)
+
+            def rbln_copy_kv_blocks(
+                src_kv_caches: dict[str, torch.Tensor],
+                dst_kv_caches: dict[str, torch.Tensor],
+                src_block_ids: list[int],
+                dst_block_ids: list[int],
+                direction: Literal["h2d", "d2h"],
+            ) -> None:
+                """Copy KV blocks between the host xfer buffer and the device KV
+                cache. Splits K/V (dim 0) first so each per-block view is
+                contiguous, hitting `_copy_from_rbln`'s direct-DMA fast path.
+                Requires VLLM_RBLN_USE_DEVICE_TENSOR=1."""
+                if (
+                    not src_kv_caches
+                    or not dst_kv_caches
+                    or not src_block_ids
+                    or not dst_block_ids
+                ):
+                    return
+                assert src_block_ids == dst_block_ids, (
+                    "src_block_ids and dst_block_ids must be the same: "
+                    f"src_block_ids={src_block_ids} dst_block_ids={dst_block_ids}"
+                )
+                # P/D uses identical block ids on both sides (asserted above), so
+                # the copy indexes by src_block_ids; it is symmetric, so the
+                # direction arg (part of the fixed CopyBlocksOp signature) is
+                # unused.
+                for layer_name, dst_cache in dst_kv_caches.items():
+                    src_cache = src_kv_caches[layer_name]
+                    for kv in range(dst_cache.shape[0]):
+                        dst_kv = dst_cache[kv]
+                        src_kv = src_cache[kv]
+                        for idx in src_block_ids:
+                            dst_kv[idx].copy_(src_kv[idx])
+
+            kv_transfer_group.set_host_xfer_buffer_ops(rbln_copy_kv_blocks)
 
         self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
         self.cache_config.num_cpu_blocks = 0

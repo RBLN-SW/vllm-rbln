@@ -16,12 +16,14 @@
 import math
 import os
 import platform
+from collections import defaultdict
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
 from vllm.config import ModelConfig, ParallelConfig
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.utils.cpu_resource_utils import (
     LogicalCPUInfo,
@@ -631,3 +633,33 @@ def reorder_input_batch(input_batch: "InputBatch", perm: np.ndarray) -> None:
         ib.allowed_token_ids_mask_cpu_tensor[:n] = ib.allowed_token_ids_mask_cpu_tensor[
             p
         ]
+
+
+def get_kv_cache_names(
+    kv_caches: dict[str, torch.Tensor],
+    num_attn_module: int = 1,
+) -> list[str]:
+    """Return KV cache layer names ordered by layer index.
+
+    A deterministic, hash-seed-independent ordering is required by the KV
+    connector: NIXL assigns transfer region indices in iteration order, so the
+    P/D region <-> layer agreement breaks if the order varies between runs.
+    Adapted from ``vllm.v1.worker.utils.bind_kv_cache``.
+    """
+    index2name: dict[int, list[str]] = defaultdict(list)
+    for layer_name in kv_caches:
+        index2name[extract_layer_index(layer_name, num_attn_module)].append(layer_name)
+
+    kv_cache_names: list[str] = []
+    for layer_index in sorted(index2name.keys()):
+        layer_names = index2name[layer_index]
+        if len(layer_names) > 1 and not (
+            current_platform.is_cuda_alike()
+            or current_platform.is_xpu()
+            or current_platform.is_cpu()
+        ):
+            # Multiple layers sharing one index (e.g. encoder-decoder cross +
+            # self attention) is only known-safe on GPU/CPU runners.
+            raise NotImplementedError
+        kv_cache_names.extend(layer_names)
+    return kv_cache_names

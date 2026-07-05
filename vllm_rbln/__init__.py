@@ -33,7 +33,7 @@ def register_ops():
         apply_registrations()
         apply_registered_patches()
 
-        # import vllm_rbln.distributed.kv_transfer.kv_connector.factory  # noqa
+        import vllm_rbln.distributed.kv_transfer.kv_connector.factory  # noqa
         # import vllm_rbln.lora.layer  # noqa
         # import vllm_rbln.model_executor.layers.quantization.kernels.mixed_precision  # noqa
         # import vllm_rbln.model_executor.layers.rotary_embedding.deepseek_scaling_rope  # noqa
