@@ -17,6 +17,7 @@ import os
 import time
 
 from transformers import AutoProcessor
+
 os.environ["VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK"] = "4"
 from vllm import LLM, SamplingParams
 

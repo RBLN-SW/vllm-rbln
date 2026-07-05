@@ -188,7 +188,8 @@ class RBLNOptimumModelBase(nn.Module):
             valid_path = cached_model_path
         else:
             valid_path = None
-
+        print("@@@@ max_model_len:", self.model_config.max_model_len)
+        print("@@@@ num_devices", envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK)
         if valid_path is not None:
             # pre-compiled OR cache-hit
             model_cls = getattr(optimum.rbln, model_cls_name)
