@@ -66,7 +66,11 @@ from vllm.v1.outputs import (
     PoolerOutput,
     SamplerOutput,
 )
-from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
+from vllm.v1.sample.logits_processor import (
+    LogitsProcessors,
+    MoveDirectionality,
+    build_logitsprocs,
+)
 from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
@@ -113,7 +117,7 @@ from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
 from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
 from vllm_rbln.v1.worker.input_stager import InputLayout, InputStager, StagedModelInputs
 from vllm_rbln.v1.worker.metrics_v2 import PerformanceContext, ProfileSection
-from vllm_rbln.v1.worker.utils import prepare_kernel_block_sizes
+from vllm_rbln.v1.worker.utils import prepare_kernel_block_sizes, reorder_input_batch
 
 logger = init_logger(__name__)
 
@@ -465,26 +469,38 @@ class RBLNModelRunner:
         ):
             return
 
-        if (n := len(self.input_batch.req_ids)) < 2:
+        ib = self.input_batch
+        n = len(ib.req_ids)
+        toks = ib.num_tokens_no_spec[:n]
+
+        # The batch is reordered in place every step, so in steady-state decode
+        # it is already sorted and a stable argsort would be identity; skip via
+        # an O(n) non-increasing check.
+        if n <= 1 or bool(np.all(toks[:-1] >= toks[1:])):
             return
 
-        sorted_indices = np.argsort(
-            -self.input_batch.num_tokens_no_spec[:n], kind="stable"
-        )
-        if np.array_equal(sorted_indices, np.arange(n)):
-            return
-
+        orig_indices = np.arange(n)
+        sorted_order = np.argsort(toks * (-1), kind="stable")
+        src_indices = orig_indices[sorted_order]
         src_to_dst = {
-            int(src): dst for dst, src in enumerate(sorted_indices) if src != dst
+            int(src): int(dst)
+            for src, dst in zip(src_indices, orig_indices, strict=False)
         }
 
-        for src in tuple(src_to_dst):
-            dst = src_to_dst[src]
-            while src != dst:
-                self.input_batch.swap_states(src, dst)
-                next_dst = src_to_dst.get(dst, dst)
-                src_to_dst[dst] = dst
-                dst = next_dst
+        # Emit the pairwise-swap records logits processors replay to realign
+        # their per-request state (only for non-pooling models, matching
+        # swap_states), then apply the permutation in one pass.
+        if not ib.is_pooling_model:
+            moved = ib.batch_update_builder.moved
+            for src in src_to_dst:
+                dst = src_to_dst[src]
+                while src != dst:
+                    moved.append((src, dst, MoveDirectionality.SWAP))
+                    next_dst = src_to_dst.get(dst, dst)
+                    src_to_dst[dst] = dst
+                    dst = next_dst
+
+        reorder_input_batch(ib, sorted_order)
 
     def _update_states(self, scheduler_output: RBLNSchedulerOutput) -> None:
         """Update the cached states and the persistent batch with the scheduler
