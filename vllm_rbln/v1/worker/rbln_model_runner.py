@@ -2244,7 +2244,9 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         set_warmup_active(True)
         self._make_weights_contiguous()
         offload_ctx = (
-            torch.rbln.offload() if envs.VLLM_RBLN_DISABLE_OFFLOAD else nullcontext()
+            torch.rbln.offload()
+            if not envs.VLLM_RBLN_DISABLE_OFFLOAD
+            else nullcontext()
         )
         try:
             with offload_ctx:
