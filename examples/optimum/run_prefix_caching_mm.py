@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright 2025 Rebellions Inc. All rights reserved.
+# Copyright 2026 Rebellions Inc. All rights reserved.
 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -37,26 +37,6 @@ def load_shared_image():
 # NOTE: This is just a running example. For benchmarking purpose,
 # please see benchmarks/benchmark_prefix_caching.py
 
-# Common prefix.
-# prefix = (
-#     "You are an experienced and insightful school principal, highly skilled in "
-#     "strategically managing and guiding a diverse team of faculty, instructional "
-#     "specialists, and support staff across grade levels. Draft 10–15 thoughtful, "
-#     "open-ended questions for a potential first grade Head Teacher candidate at my "
-#     "independent K–12, all-girls’ school. Our institution strongly emphasizes "
-#     "collaboration, a nurturing sense of community, joyful discovery throughout "
-#     "academic and co-curricular life, and the cultivation of life-long curiosity, "
-#     "resilience, and learning habits. The candidate is interviewing for a first-round "
-#     "panel conversation related to an 8th grade Mathematics teaching role. They bring "
-#     "over 5 years of professional experience, having served as an assistant teacher "
-#     "in a large, co-educational public school, with substantial background in "
-#     "curriculum design, classroom leadership, and instructional strategies for "
-#     "middle school mathematics students."
-# )
-# Shared instruction + output template. Kept identical across prompts so the
-# image + this prefix can be reused by prefix caching; only the trailing
-# question varies. The explicit two-step task and fixed format make the model
-# both describe the image and answer, instead of just completing the sentence.
 prefix = (
     "First, describe the image in one short sentence. "
     "Then, on a new line, answer the question.\n"
@@ -66,13 +46,8 @@ prefix = (
     "Question: "
 )
 
-# Sample prompts. Phrased as explicit questions so the model does not treat
-# them as a fill-in-the-blank continuation and skip the description.
+
 prompts = [
-    # "Hello, my name is",
-    # "The president of the United States is",
-    # "The capital of France is",
-    # "The future of AI is",
     "What is the largest mammal in the world?",
     "Who developed the theory of relativity?",
     "Where is the Great Wall of China located?",
@@ -118,7 +93,6 @@ def main():
     regular_llm = LLM(
         model=MODEL,
         block_size=16384,
-        # max_model_len=32768,
         max_num_seqs=1,
         enable_prefix_caching=False,
     )
@@ -151,7 +125,6 @@ def main():
     prefix_cached_llm = LLM(
         model=MODEL,
         block_size=16384,
-        # max_model_len=32768,
         max_num_seqs=1,
         enable_prefix_caching=True,
     )
