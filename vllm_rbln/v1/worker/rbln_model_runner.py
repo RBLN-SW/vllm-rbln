@@ -283,7 +283,10 @@ class RBLNModelRunner:
                     f"{self.speculative_config.method}"
                 )
             self.rejection_sampler = RBLNRejectionSampler(
-                self.sampler, self.compile_context
+                self.sampler,
+                self.compile_context,
+                self.speculative_config,
+                self.device,
             )
 
         self.num_spec_tokens = 0
