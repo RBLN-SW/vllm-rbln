@@ -283,10 +283,7 @@ environment_variables = {
     ),
     # Auto port
     "VLLM_RBLN_AUTO_PORT": (
-        lambda: (
-            os.environ.get("VLLM_RBLN_AUTO_PORT", "True").lower()
-            in ("true", "1")
-        )
+        lambda: (os.environ.get("VLLM_RBLN_AUTO_PORT", "True").lower() in ("true", "1"))
     ),
     # enforce model data type into fp32 not model_config.dtype
     "VLLM_RBLN_ENFORCE_MODEL_FP32": (
