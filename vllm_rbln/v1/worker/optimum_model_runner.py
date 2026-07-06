@@ -579,6 +579,7 @@ class RBLNOptimumModelRunner(
     def _extract_mm_kwargs(
         self,
         scheduler_output: "SchedulerOutput",
+        num_cached_tokens: int = 0,
     ) -> BatchedTensorInputs:
         if not scheduler_output or not self.is_multimodal_raw_input_only_model:
             return {}
@@ -586,8 +587,15 @@ class RBLNOptimumModelRunner(
         mm_kwargs = list[tuple[str, MultiModalKwargsItem]]()
         for req in scheduler_output.scheduled_new_reqs:
             for feature in req.mm_features:
-                if feature.data is not None:
-                    mm_kwargs.append((feature.modality, feature.data))
+                if feature.data is None:
+                    continue
+                # Skip items whose placeholder tokens fall entirely within the
+                # prefix-cached region: their KV is reused and their tokens are
+                # trimmed off the prefill input, so the encoder must not run.
+                pos = feature.mm_position
+                if pos.offset + pos.length <= num_cached_tokens:
+                    continue
+                mm_kwargs.append((feature.modality, feature.data))
 
         # Input all modalities at once
         mm_kwargs_combined: BatchedTensorInputs = {}
@@ -618,6 +626,7 @@ class RBLNOptimumModelRunner(
         ].num_blocks_per_row
         block_tables_cpu = self.input_batch.block_table.block_tables[0].get_cpu_tensor()
         cached_length = []
+        total_cached_length = 0
 
         if len(scheduler_output.scheduled_new_reqs) == 1:
             # New request started
@@ -675,7 +684,12 @@ class RBLNOptimumModelRunner(
         running_request_ids.append(req_id)
 
         if self.supports_mm_inputs:
-            batched_mm_inputs = self._extract_mm_kwargs(scheduler_output)
+            # Encode only the multimodal items that are not covered by the
+            # prefix cache; the cached ones have their KV reused and their
+            # placeholder tokens trimmed off the prefill input above.
+            batched_mm_inputs = self._extract_mm_kwargs(
+                scheduler_output, num_cached_tokens=total_cached_length
+            )
 
         input_tokens = torch.tensor(prompt_tokens).unsqueeze(0)
         input_positions = torch.tensor(input_positions).unsqueeze(0)
