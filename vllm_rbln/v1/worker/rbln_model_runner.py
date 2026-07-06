@@ -2263,9 +2263,19 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     ) -> torch.Tensor:
         return self.model.compute_logits(hidden_states)
 
+    def _make_weights_contiguous(self) -> None:
+        # weight-free compile hard-errors on non-contiguous CPU weights.
+        for p in self.model.parameters():
+            if not p.is_contiguous():
+                p.set_(p.contiguous())
+        for b in self.model.buffers():
+            if not b.is_contiguous():
+                b.set_(b.contiguous())
+
     @torch.inference_mode()
     def warm_up_model(self) -> None:
         set_warmup_active(True)
+        self._make_weights_contiguous()
         offload_ctx = (
             torch.rbln.offload()
             if envs.VLLM_RBLN_USE_DEVICE_TENSOR
@@ -4196,13 +4206,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 model_loader.load_weights(self.model, model_config=self.model_config)
 
         self.model = self.get_model().eval()
-        # weight-free compile hard-errors on non-contiguous CPU weights.
-        for p in self.model.parameters():
-            if not p.is_contiguous():
-                p.set_(p.contiguous())
-        for b in self.model.buffers():
-            if not b.is_contiguous():
-                b.set_(b.contiguous())
+        self._make_weights_contiguous()
         self.compute_logits_model = self.model
         if self.model_config.is_multimodal_model and hasattr(
             self.model.get_language_model(), "logits_processor"
