@@ -100,12 +100,15 @@ def test_runner_passes_metadata_not_reqid_set(monkeypatch):
     assert spy.received is meta  # metadata, not {"r0"}
 
 
-def test_runner_skips_when_metadata_none(monkeypatch):
-    """Warm-up phase: kv_connector_metadata is None -> connector not called."""
+def test_runner_asserts_when_metadata_none(monkeypatch):
+    """kv_connector_metadata is None with a live transfer group is an invariant
+    violation (the scheduler sets metadata whenever a connector exists) ->
+    assert, matching upstream gpu_model_runner."""
     spy = _DummyConn()
     monkeypatch.setattr(rmr, "has_kv_transfer_group", lambda: True)
     monkeypatch.setattr(rmr, "get_kv_transfer_group", lambda: spy)
-    _RUNNER_FIX(_sched_output({"r0"}, None))
+    with pytest.raises(AssertionError):
+        _RUNNER_FIX(_sched_output({"r0"}, None))
     assert spy.received == "UNSET"
 
 

@@ -14,7 +14,7 @@
 
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import nullcontext
 from copy import copy, deepcopy
 from typing import Any, Literal, NamedTuple, TypeAlias, cast
 
@@ -1326,14 +1326,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         )
 
     @staticmethod
-    def _is_kv_connector_warm_up_phase(scheduler_output: RBLNSchedulerOutput) -> bool:
-        # Warm-up runs the model with a synthetic SchedulerOutput whose
-        # `kv_connector_metadata` is None. The connector lifecycle
-        # (bind/wait/clear) must skip this phase, otherwise stateful
-        # connectors (e.g. LMCache) assert on missing bound metadata.
-        return scheduler_output.kv_connector_metadata is None
-
-    @staticmethod
     def _handle_kv_connector_preemptions(
         scheduler_output: RBLNSchedulerOutput,
     ) -> None:
@@ -1345,28 +1337,18 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         (``MultiConnector`` asserts ``MultiKVConnectorMetadata``). Pass
         ``scheduler_output.kv_connector_metadata`` to match the 0.22 signature;
         passing the old req-id set makes MultiConnector raise AssertionError on
-        any preemption. Skipped when metadata is None (connector warm-up phase).
+        any preemption.
+
+        NOTE(RBLN): unlike upstream (which calls handle_preemptions every step),
+        this is skipped when no request was preempted. Fine for the NIXL and
+        LMCache connectors, but a connector doing per-step evicted-block
+        handling in handle_preemptions would miss calls.
         """
         if not (scheduler_output.preempted_req_ids and has_kv_transfer_group()):
             return
         kv_connector_metadata = scheduler_output.kv_connector_metadata
-        if kv_connector_metadata is None:
-            return
+        assert kv_connector_metadata is not None
         get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
-
-    @staticmethod
-    def maybe_get_kv_connector_output(
-        scheduler_output: RBLNSchedulerOutput,
-        defer_finalize: bool = False,
-    ) -> AbstractContextManager[KVConnectorOutput | None]:
-        skip = RBLNModelRunner._is_kv_connector_warm_up_phase(scheduler_output)
-        return (
-            KVConnectorModelRunnerMixin._get_kv_connector_output(
-                scheduler_output, defer_finalize=defer_finalize
-            )
-            if has_kv_transfer_group() and not skip
-            else nullcontext()
-        )
 
     @torch.inference_mode()
     def execute_model(
@@ -1394,8 +1376,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 self._process_kv_cache_copy_ops(scheduler_output.kv_cache_copy_ops)
 
             if not num_scheduled_tokens:
-                warm_up_phase = scheduler_output.kv_connector_metadata is None
-                if not has_kv_transfer_group() or warm_up_phase:
+                if not has_kv_transfer_group():
                     # Return empty ModelRunnerOutput if there's no work to do.
                     return EMPTY_MODEL_RUNNER_OUTPUT
                 # KV send/recv even when there is no forward work to do.
@@ -1611,12 +1592,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         # Finalize the KV connector (wait_for_save + clear metadata) after the
         # draft model runs. With spec decode, this was deferred from the target
-        # model forward so the draft model can also save its KV cache. Skip
-        # during warm-up — the connector context was bypassed in
-        # maybe_get_kv_connector_output, so no metadata was bound.
-        if spec_config is not None and not self._is_kv_connector_warm_up_phase(
-            scheduler_output
-        ):
+        # model forward so the draft model can also save its KV cache.
+        if spec_config is not None:
             self.finalize_kv_connector()
 
         # self.kv_connector_output may be modified during drafting.
@@ -2850,6 +2827,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self.kv_cache_view_infos = kv_cache_view_infos
 
     def warmup_model(self) -> None:
+        # NOTE(RBLN): Warm-up must not route through execute_model() while a
+        # KV transfer group exists: the KV-connector mixin asserts
+        # scheduler_output.kv_connector_metadata is not None, and only the
+        # scheduler-side connector can build that metadata. _dummy_run calls
+        # the model directly, bypassing the connector lifecycle entirely.
         logger.info("Compile and warming up model.")
 
         with set_compile_stage("warmup"):
