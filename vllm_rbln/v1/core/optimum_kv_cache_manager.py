@@ -343,7 +343,51 @@ class RBLNKVCacheManager(KVCacheManager):
             )
         )
 
-        return cached_block_table, cached_length
+        return self._clamp_cached_blocks_to_mm_boundary(
+            request, cached_block_table, cached_length
+        )
+
+    @staticmethod
+    def _clamp_cached_blocks_to_mm_boundary(
+        request: Request,
+        cached_block_table: list[int],
+        cached_length: list[int],
+    ) -> tuple[list[int], list[int]]:
+        """Trim the cached prefix so it never ends in the middle of an image.
+
+        Each image must be either fully cached or fully recomputed. If the cache
+        stopped inside one, its placeholder tokens and its embeddings would not
+        line up when scattered.
+        """
+        if not request.mm_features or not cached_length:
+            return cached_block_table, cached_length
+
+        boundary = sum(cached_length)
+        # Placeholder ranges do not overlap, so the boundary splits at most one
+        # item. Find where it lands, if inside any.
+        split_start = None
+        for feature in request.mm_features:
+            start = feature.mm_position.offset
+            if start < boundary < start + feature.mm_position.length:
+                split_start = start
+                break
+        if split_start is None:
+            return cached_block_table, cached_length
+
+        # Pull the boundary back to the split item's start so the image is fully
+        # re-encoded, then truncate the (block, length) prefix to it.
+        boundary = split_start
+        new_block_table: list[int] = []
+        new_length: list[int] = []
+        accumulated_tokens = 0
+        for block, length in zip(cached_block_table, cached_length):
+            if accumulated_tokens >= boundary:
+                break
+            take = min(length, boundary - accumulated_tokens)
+            new_block_table.append(block)
+            new_length.append(take)
+            accumulated_tokens += take
+        return new_block_table, new_length
 
     def get_block_table(self, request_id: str) -> torch.Tensor:
         return self.prefix_cache_manager.get_blocks(request_id)

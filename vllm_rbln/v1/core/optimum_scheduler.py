@@ -394,12 +394,6 @@ class RBLNOptimumScheduler(Scheduler):
                         new_computed_blocks,
                         num_new_local_computed_tokens,
                     )
-                    # Keep the cache boundary from splitting a multimodal item.
-                    cached_block_table, cached_length = (
-                        self._clamp_cached_blocks_to_mm_boundary(
-                            request, cached_block_table, cached_length
-                        )
-                    )
                     # Update the block table to the return output.
                     self.update_block_table_dict(request, block_table_dict)
 
@@ -650,53 +644,6 @@ class RBLNOptimumScheduler(Scheduler):
         request_id = request.request_id
         block_table = self.kv_cache_manager.get_block_table(request_id)
         block_table_dict[request_id] = block_table
-
-    def _clamp_cached_blocks_to_mm_boundary(
-        self,
-        request: Request,
-        cached_block_table: list[int],
-        cached_length: list[int],
-    ) -> tuple[list[int], list[int]]:
-        """Shrink the cached prefix so its boundary never splits a multimodal item.
-
-        The cache boundary is quantized to ``ib_size`` tokens, but image
-        placeholder ranges are not necessarily block-aligned. If the boundary
-        landed inside an image, only part of that image's placeholders would
-        remain in the trimmed prefill input while its full embeddings are still
-        produced, so the scatter would misalign. Pull the boundary back to the
-        straddled item's start, so every image is either fully cached or fully
-        re-encoded (the KV copy is token-granular, so a non-block-aligned
-        boundary is fine).
-        """
-        if not request.mm_features or not cached_length:
-            return cached_block_table, cached_length
-
-        boundary = sum(cached_length)
-        # Placeholder ranges do not overlap, so the boundary splits at most one
-        # item. Find where it lands, if inside any.
-        split_start = None
-        for feature in request.mm_features:
-            start = feature.mm_position.offset
-            if start < boundary < start + feature.mm_position.length:
-                split_start = start
-                break
-        if split_start is None:
-            return cached_block_table, cached_length
-
-        # Pull the boundary back to the split item's start so the image is fully
-        # re-encoded, then truncate the (block, length) prefix to it.
-        boundary = split_start
-        new_block_table: list[int] = []
-        new_length: list[int] = []
-        accumulated_tokens = 0
-        for block, length in zip(cached_block_table, cached_length):
-            if accumulated_tokens >= boundary:
-                break
-            take = min(length, boundary - accumulated_tokens)
-            new_block_table.append(block)
-            new_length.append(take)
-            accumulated_tokens += take
-        return new_block_table, new_length
 
     def _preempt_request(
         self,
