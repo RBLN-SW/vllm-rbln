@@ -15,9 +15,6 @@
 import torch
 from vllm.model_executor.layers.fused_moe import FusedMoE, UnquantizedFusedMoEMethod
 
-from vllm_rbln import envs
-from vllm_rbln.model_executor.layers.fused_moe.utils import get_tokens_mask
-
 
 class RBLNUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
     """Unquantized MoE method for the RBLN FusedMoE forward path.
@@ -47,34 +44,17 @@ class RBLNUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         orig_shape = x.shape
         num_tokens = orig_shape[:-1].numel()
         hidden_states = x.reshape(num_tokens, -1)
-        router_logits = router_logits.reshape(num_tokens, -1)
-
-        # Pre-score routing inputs at caller side; compiler custom op routing
-        # expects already-scored values (no sigmoid applied inside the kernel).
-        assert layer.scoring_func is not None, "scoring_func must be set"
-        assert layer.scoring_func in {"softmax", "sigmoid"}
-        if layer.scoring_func == "sigmoid":
-            router_logits = torch.sigmoid(router_logits.to(torch.float32)).to(
-                router_logits.dtype
-            )
-
-        tokens_mask = (
-            get_tokens_mask(num_tokens) if envs.VLLM_RBLN_USE_MOE_TOKENS_MASK else None
-        )
+        masked_routing_weights = router_logits
 
         final_hidden_states = torch.ops.rbln_custom_ops.custom_moe_glu(
             hidden_states,
             gate_proj_weight,
             up_proj_weight,
             down_proj_weight,
-            router_logits,
-            layer.scoring_func,
-            layer.top_k,
-            layer.renormalize,
-            layer.expert_map,
+            masked_routing_weights,
+            layer.activation.value,
             None,
             None,
             None,
-            tokens_mask,
         )
         return final_hidden_states.reshape(orig_shape)

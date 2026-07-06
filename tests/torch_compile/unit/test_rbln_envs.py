@@ -62,11 +62,6 @@ def test_rbln_envs():
         got {envs.VLLM_RBLN_ENFORCE_MODEL_FP32}"
     )
 
-    assert envs.VLLM_RBLN_MOE_CUSTOM_KERNEL, (
-        f"Expected VLLM_RBLN_MOE_CUSTOM_KERNEL to be True, \
-        got {envs.VLLM_RBLN_MOE_CUSTOM_KERNEL}"
-    )
-
     assert envs.VLLM_RBLN_DP_INPUT_ALL_GATHER, (
         f"Expected VLLM_RBLN_DP_INPUT_ALL_GATHER to be True, \
         got {envs.VLLM_RBLN_DP_INPUT_ALL_GATHER}"
