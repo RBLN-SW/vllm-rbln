@@ -378,7 +378,6 @@ class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
 
         # 2. Adjust the shape of tensors by squeezing and padding
         if is_prompt:
-            block_tables = block_tables.squeeze(0)
             padded_batch_size = 1
         else:
             if input_block_ids is None:

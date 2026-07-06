@@ -186,7 +186,9 @@ class RBLNOptimumExaone4_5_ForConditionalGeneration(
                 input_ids, attention_mask, image_input, video_input
             )
             prefill_batch_idx = sliding_window_table_ids[0]
-            local_block_table_id = torch.tensor([prefill_batch_idx], dtype=torch.int16)
+            local_block_table_id = torch.tensor(
+                [[prefill_batch_idx]], dtype=torch.int16
+            )
             logits = self.model.prefill_decoder(
                 input_ids=input_ids,
                 inputs_embeds=inputs_embeds,

@@ -105,7 +105,9 @@ class RBLNOptimumSlidingWindowAttentionForCausalLM(
             if self.model.prefill_decoder is None:
                 raise version_error
             prefill_batch_idx = sliding_window_table_ids[0]
-            local_block_table_id = torch.tensor([prefill_batch_idx], dtype=torch.int16)
+            local_block_table_id = torch.tensor(
+                [[prefill_batch_idx]], dtype=torch.int16
+            )
             output = self.model.prefill_decoder(
                 input_ids=input_ids,
                 cache_position=cache_position,
