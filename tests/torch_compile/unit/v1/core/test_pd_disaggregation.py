@@ -410,33 +410,123 @@ class TestPDDisaggregationScheduler:
         pad_window_sum = sum(ns[r] + slide.get(r, 0) for r in ns)
         assert num_input_tokens == pad_window_sum
 
-    def test_promoted_partial_kv_match_is_rejected(self):
-        """A promoted remote-KV request must be a genuine single-token decode:
-        its prompt KV was prefilled remotely, so num_new_tokens == 1. A partial
-        remote match (num_tokens > matched + 1) would leave a local prefill
-        remainder that cannot mix into the decode batch -- the scheduler asserts
-        loudly rather than emit a corrupt (non-uniform) decode batch.
-        """
-        import pytest
+    def test_promoted_partial_kv_match_scheduled_as_prefill(self):
+        """A PARTIAL remote-KV match (num_tokens > matched + 1) leaves a local
+        prefill remainder. The promoted request must be scheduled as a lone
+        prefill of that remainder -- NOT rejected, and NOT forced into the
+        decode batch.
 
-        matched = _BLOCK_SIZE  # 16
-        # num_tokens = matched + 5 -> num_new_tokens == 5 (> 1): partial match.
-        remote = _create_pd_request(matched + 5, "remote")
+        REGRESSION for the DP4 + LMCache serve crash: the old code asserted
+        `num_new_tokens == 1` in the promotion path and killed the DP rank on
+        every partial prefix-cache hit (gloo cascade -> whole serve dies). With
+        chunk-granular prefix caching a partial match is the norm, so this is
+        the common case, not an edge case.
+        """
+        matched = 2 * _BLOCK_SIZE  # 32 (block-aligned)
+        num_tokens = matched + _BLOCK_SIZE  # 48 -> 16-token remainder
+        scheduler = _create_pd_scheduler(matched_tokens=matched)
+
+        remote = _create_pd_request(num_tokens, "remote")
+        scheduler.add_request(remote)
+
+        # Step 1: async schedule -> WAITING_FOR_REMOTE_KVS, partial match cached.
+        out1 = scheduler.schedule()
+        assert remote.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+        assert remote.num_computed_tokens == matched
+
+        # Step 2: KV transfer completes. Partial hit -> no full-hit decrement,
+        # so num_computed_tokens stays at `matched` and the request is still
+        # is_prefill on promotion.
+        _simulate_kv_transfer_completion(scheduler, out1, remote.request_id)
+
+        # Step 3: promoted -> scheduled as a lone prefill of the remainder.
+        # Must NOT raise.
+        out = scheduler.schedule()
+        assert remote.request_id in out.num_scheduled_tokens
+        assert out.num_scheduled_tokens[remote.request_id] == num_tokens - matched
+        assert remote.request_id in {r.req_id for r in out.scheduled_new_reqs}
+        assert remote.status == RequestStatus.RUNNING
+        # Prefill runs alone (num_reqs == 1): no decode reqs this step.
+        assert out.scheduled_cached_reqs.req_ids == []
+
+    def test_promoted_partial_kv_match_then_reaches_decode(self):
+        """After the remainder prefill step, the request advances to decode via
+        the normal running loop (num_scheduled_tokens == 1). Confirms the fix
+        only touches the first promotion step; the rest is ordinary machinery.
+        """
+        matched = 2 * _BLOCK_SIZE  # 32
+        num_tokens = matched + _BLOCK_SIZE  # 48
+        scheduler = _create_pd_scheduler(matched_tokens=matched)
+
+        remote = _create_pd_request(num_tokens, "remote")
+        scheduler.add_request(remote)
+        out1 = scheduler.schedule()
+        _simulate_kv_transfer_completion(scheduler, out1, remote.request_id)
+
+        # Remainder prefill step.
+        out2 = scheduler.schedule()
+        assert out2.num_scheduled_tokens[remote.request_id] == num_tokens - matched
+
+        # Advance the prefill; the request then becomes decode-ready.
+        scheduler.update_from_output(out2, create_runner_output(out2, 1))
+
+        out3 = scheduler.schedule()
+        assert out3.num_scheduled_tokens[remote.request_id] == 1
+        assert remote.status == RequestStatus.RUNNING
+
+    def test_promoted_partial_kv_match_runs_alone_evicting_decode(self):
+        """A promoted partial-match request takes the ordinary lone-prefill
+        path: it evicts running decodes (no mixed batching) and runs at
+        num_reqs == 1, exactly like a normal chunked prefill.
+        """
+        matched = 2 * _BLOCK_SIZE  # 32
+        num_tokens = matched + _BLOCK_SIZE  # 48
+        scheduler = _create_pd_scheduler(matched_tokens=matched)
+
+        # A running decode request.
+        decode = _create_pd_request(10, "decode", do_remote_prefill=False)
+        advance_to_decode(scheduler, decode)
+
+        # Promoted partial-match remote.
+        remote = _create_pd_request(num_tokens, "remote")
+        scheduler.add_request(remote)
+        # decode scheduled; remote -> WAITING_FOR_REMOTE_KVS
+        out1 = scheduler.schedule()
+        assert remote.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+        _simulate_kv_transfer_completion(
+            scheduler, out1, remote.request_id, sampled_token_id=2
+        )
+
+        # Promotion step: partial prefill -> evicts the running decode, runs alone.
+        out = scheduler.schedule()
+        assert out.num_scheduled_tokens[remote.request_id] == num_tokens - matched
+        assert decode.request_id not in out.num_scheduled_tokens
+
+    def test_promoted_partial_kv_match_with_spec_decode_no_slide(self):
+        """With spec decode enabled, a promoted partial match is still routed as
+        a prefill: it bypasses `_decide_spec_slide` (no slide entry) instead of
+        joining the decode batch. The slide is applied later by the running loop
+        when the request actually reaches decode.
+        """
+        NUM_SPEC = 3
+        matched = 2 * _BLOCK_SIZE  # 32
+        num_tokens = matched + _BLOCK_SIZE  # 48
         scheduler = create_scheduler(
             block_size=_BLOCK_SIZE,
             num_blocks=_NUM_BLOCKS,
             max_num_seqs=_MAX_NUM_SEQS,
-            num_speculative_tokens=3,
+            num_speculative_tokens=NUM_SPEC,
             use_kv_connector=MockKVConfig(matched_tokens=matched, is_async=True),
         )
+        remote = _create_pd_request(num_tokens, "remote")
         scheduler.add_request(remote)
-
         out1 = scheduler.schedule()
-        assert remote.status == RequestStatus.WAITING_FOR_REMOTE_KVS
         _simulate_kv_transfer_completion(scheduler, out1, remote.request_id)
 
-        with pytest.raises(AssertionError, match="num_new_tokens"):
-            scheduler.schedule()
+        out = scheduler.schedule()  # must not raise
+        assert out.num_scheduled_tokens[remote.request_id] == num_tokens - matched
+        slide = dict(getattr(out, "spec_decode_slide_distance", {}) or {})
+        assert remote.request_id not in slide
 
 
 # ===========================================================================

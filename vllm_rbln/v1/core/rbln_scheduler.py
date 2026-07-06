@@ -63,11 +63,15 @@ graph an identical ``(batch_bucket, query_len)`` tensor:
    sets every decode req's query window to ``num_spec_tokens + 1`` (or 1 on
    the no-spec fallback) within this rank. BOTH paths that enter the decode
    batch go through ``_decide_spec_slide``: the running loop AND the
-   ``WAITING_FOR_REMOTE_KVS`` promotion path (a remote-prefilled req joins
-   decode carrying 0 drafts, so it needs the same backfill). After this stage
-   a rank's flat ``input_ids`` is already ``num_reqs * query_len`` -- uniform
-   and reshape-safe. (Prefill never mixes with decode in one rank: the
-   no-mixed-batching eviction keeps a prefill step at ``num_reqs == 1``.)
+   ``WAITING_FOR_REMOTE_KVS`` promotion path when the remote match is FULL (a
+   fully-remote-prefilled req joins decode carrying 0 drafts, so it needs the
+   same backfill). A PARTIAL remote match instead leaves a local remainder
+   prefill; that request is routed through the ordinary lone-prefill path (not
+   the promotion decode shortcut) and reaches decode via the running loop on a
+   later step. After this stage a rank's flat ``input_ids`` is already
+   ``num_reqs * query_len`` -- uniform and reshape-safe. (Prefill never mixes
+   with decode in one rank: the no-mixed-batching eviction keeps a prefill step
+   at ``num_reqs == 1``.)
 2. Runner -- cross-DP reconciliation (query-length axis). ``any_prefill``
    (a DP PEER prefilling) selects the prefill-sized shape; otherwise
    ``pad_speculative_draft_tokens`` lifts each rank's uniform window up to
@@ -833,17 +837,25 @@ class RBLNScheduler(Scheduler):
                     assert num_new_tokens > 0
 
                     if (
-                        not promoted_from_waiting_for_remote_kvs
-                        and len(scheduled_new_reqs) > 0
+                        not promoted_from_waiting_for_remote_kvs or is_prefill(request)
+                    ) and (
+                        len(scheduled_new_reqs) > 0 or len(scheduled_resumed_reqs) > 0
                     ):
-                        # NOTE(RBLN): promoted_from_waiting_for_remote_kvs is False, so
-                        # this waiting request needs local prefill (not remote prefill).
-                        # scheduled_new_reqs is non-empty because a prior iteration of
-                        # this waiting loop already added a request to the decode batch
-                        # from remote prefill.
-                        # In this case, we defer scheduling this local prefill request
-                        # (waiting request) to the next step.
-                        assert len(scheduled_resumed_reqs) == 0
+                        # NOTE(RBLN): This waiting request needs a LOCAL prefill:
+                        # either an ordinary waiting request, or a request promoted
+                        # from WAITING_FOR_REMOTE_KVS whose remote match was PARTIAL
+                        # (num_computed_tokens < num_tokens-1 -> still is_prefill, a
+                        # local "remainder" prefill). A prior iteration of this
+                        # waiting loop already placed a decode-ready (remote-
+                        # prefilled) request into the decode batch -- in
+                        # scheduled_new_reqs (status WAITING) or scheduled_resumed_reqs
+                        # (status PREEMPTED). The no-mixed-batching eviction below
+                        # only clears scheduled_running_reqs, so running a local
+                        # prefill now would illegally mix it with those already-
+                        # scheduled decode reqs. Defer this prefill to the next step;
+                        # it is left un-popped at the queue head and re-tried next
+                        # step (by then a plain WAITING req with num_computed_tokens
+                        # > 0, no longer promoted_from_waiting_for_remote_kvs).
                         break
 
                     # Schedule encoder inputs.
@@ -1007,25 +1019,25 @@ class RBLNScheduler(Scheduler):
                         if self.ec_connector is not None:
                             self.ec_connector.update_state_after_alloc(request, i)
 
-                if promoted_from_waiting_for_remote_kvs:
-                    # NOTE(RBLN): A request promoted from WAITING_FOR_REMOTE_KVS is
-                    # decode-ready: its prompt KV was prefilled on the remote
-                    # (producer) instance, so it joins as a single-token decode.
+                if promoted_from_waiting_for_remote_kvs and not is_prefill(request):
+                    # NOTE(RBLN): A request promoted from WAITING_FOR_REMOTE_KVS
+                    # with a FULL remote match is decode-ready: its whole prompt KV
+                    # was prefilled remotely, so it joins as a single-token decode.
                     #
-                    # PRIMARY guard: it must NOT be in prefill. A partial remote
-                    # match leaves a local "remainder prefill" (is_prefill) that
-                    # cannot mix into the (batch, num_spec+1) decode shape -- fail
-                    # loudly instead of silently corrupting
-                    # input_ids.view(num_reqs, -1) downstream. The num_new_tokens
-                    # == 1 check is the equivalent single-token precondition that
-                    # `_decide_spec_slide(new_n=1)` below relies on (given the
-                    # earlier `assert num_new_tokens > 0`).
-                    assert not is_prefill(request), (
-                        f"promoted remote-KV request {request_id} is still in "
-                        f"prefill (num_new_tokens={num_new_tokens}); a partial "
-                        "remote KV match leaves a local prefill remainder that "
-                        "cannot mix into the decode batch."
-                    )
+                    # A PARTIAL remote match instead leaves a local "remainder
+                    # prefill" (still is_prefill). Such a request is NOT handled
+                    # here -- it falls through to the no-mixed-batching eviction
+                    # block below and runs as a lone prefill (num_reqs == 1),
+                    # exactly like a normal chunked prefill, then reaches decode
+                    # via the running loop on a later step. Routing it through the
+                    # decode path here would leave a non-uniform query length that
+                    # corrupts input_ids.view(num_reqs, -1) downstream.
+                    #
+                    # is_prefill is False here, so num_computed == num_tokens - 1
+                    # and (given the earlier `assert num_new_tokens > 0`)
+                    # num_new_tokens == 1 -- the single-token precondition that
+                    # `_decide_spec_slide(new_n=1)` below relies on. Kept as a
+                    # sanity check.
                     assert num_new_tokens == 1, (
                         f"promoted remote-KV request {request_id} has "
                         f"num_new_tokens={num_new_tokens} (expected 1)."
