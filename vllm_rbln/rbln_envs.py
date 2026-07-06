@@ -387,9 +387,7 @@ environment_variables = {
     # Use W8A16 block fp8 (weight-only dequant) instead of W8A8 (dynamic
     # activation fp8 quant). Default is W8A8; set True for evt0 compatibility.
     "VLLM_RBLN_USE_W8A16": (
-        lambda: (
-            os.environ.get("VLLM_RBLN_USE_W8A16", "False").lower() in ("true", "1")
-        )
+        lambda: os.environ.get("VLLM_RBLN_USE_W8A16", "False").lower() in ("true", "1")
     ),
     # --- NIXL ---
     # Publish a second SWA-sized descriptor range alongside the Full-sized
