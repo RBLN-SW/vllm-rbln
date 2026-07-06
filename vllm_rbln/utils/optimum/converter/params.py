@@ -212,12 +212,20 @@ def _num_devices_of(cfg: RblnConfigLike) -> int | None:
     """
     val = _cfg_get(cfg, "num_devices")
     if val is not None:
+        assert isinstance(val, int), (
+            f"num_devices must be an int, got {type(val).__name__}"
+        )
+        assert val > 0, "num_devices must be a positive integer"
         return val
     compile_cfgs = _cfg_get(cfg, "_compile_cfgs")
     if isinstance(compile_cfgs, list):
         for entry in compile_cfgs:
             entry_val = _cfg_get(entry, "num_devices")
             if entry_val is not None:
+                assert isinstance(entry_val, int), (
+                    f"num_devices must be an int, got {type(entry_val).__name__}"
+                )
+                assert entry_val > 0, "num_devices must be a positive integer"
                 return entry_val
     return None
 
