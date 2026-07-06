@@ -81,8 +81,6 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         )
 
     def get_prefill_decoder(self):
-        # Qwen-VL keeps the prefill runtime at the top level, unlike the
-        # submodule layout assumed by RBLNOptimumMultimodalMixin.
         return self.model.prefill_decoder
 
     def _build_prefill_params(self, preprocess_outputs: tuple) -> dict:

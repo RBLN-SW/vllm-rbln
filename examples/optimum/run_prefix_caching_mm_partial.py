@@ -81,9 +81,7 @@ def build_prompts():
     """
     # Stream so only the first NUM_PROMPTS + 1 rows are fetched instead of the
     # whole (multi-million-image) dataset.
-    dataset = load_dataset(
-        "lmms-lab/LLaVA-ReCap-CC3M", split="train", streaming=True
-    )
+    dataset = load_dataset("lmms-lab/LLaVA-ReCap-CC3M", split="train", streaming=True)
     images = [row["image"] for row in islice(dataset, NUM_PROMPTS + 1)]
     shared_image = images[0]
     # One distinct image per prompt.

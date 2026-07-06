@@ -409,11 +409,6 @@ class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
         return kwargs
 
     def get_prefill_decoder(self) -> runtime_utils.RBLNRuntimeModel:
-        """Return the prefill runtime that owns the KV cache.
-
-        Models whose decoder lives under a submodule override this
-        (e.g. multimodal models keep it at ``self.model.language_model``).
-        """
         return self.model.prefill_decoder
 
     def copy_cached_kv_blocks(
@@ -553,14 +548,8 @@ class RBLNOptimumMultimodalMixin(SupportsMultiModal):
     def _assert_mm_tokens_match(
         self, num_placeholders: int, num_embed_tokens: int
     ) -> None:
-        """Guard that the multimodal placeholder count equals the embed-token count.
-
-        The scatter places one embedding per placeholder token. A mismatch means a
-        prefix-cache boundary split a multimodal item so only part of its
-        placeholders remain while its full embeddings are still produced; the
-        scatter would then misalign (``masked_scatter`` silently consumes only the
-        first ``num_placeholders`` embeddings) and corrupt the inputs. The scheduler
-        clamps the cache boundary to avoid this; this raise is the safety net.
+        """
+        Guard that the multimodal placeholder count equals the embed-token count.
         """
         if num_placeholders != num_embed_tokens:
             raise ValueError(
