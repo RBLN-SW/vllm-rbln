@@ -19,7 +19,6 @@ Single node:
     - To enable padded decode and MoE tokens mask,
     set the following environment variables:
         VLLM_RBLN_USE_MOE_TOKENS_MASK=1 \
-        VLLM_RBLN_DP_IMPL="padded_decode" \
         and other VLLM_RBLN_* environment variables... \
         python examples/experimental/data_parallel.py \
                 --model="Qwen/Qwen1.5-MoE-A2.7B" \

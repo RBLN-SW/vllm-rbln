@@ -52,19 +52,9 @@ def test_rbln_envs():
         got {envs.VLLM_RBLN_FLASH_CAUSAL_ATTN}"
     )
 
-    assert envs.VLLM_RBLN_DP_IMPL == "padded_decode", (
-        f"Expected VLLM_RBLN_DP_IMPL to be padded_decode, \
-        got {envs.VLLM_RBLN_DP_IMPL}"
-    )
-
     assert not envs.VLLM_RBLN_ENFORCE_MODEL_FP32, (
         f"Expected VLLM_RBLN_ENFORCE_MODEL_FP32 to be False, \
         got {envs.VLLM_RBLN_ENFORCE_MODEL_FP32}"
-    )
-
-    assert envs.VLLM_RBLN_DP_INPUT_ALL_GATHER, (
-        f"Expected VLLM_RBLN_DP_INPUT_ALL_GATHER to be True, \
-        got {envs.VLLM_RBLN_DP_INPUT_ALL_GATHER}"
     )
 
     assert envs.VLLM_RBLN_NUM_RAY_NODES == 1, (
