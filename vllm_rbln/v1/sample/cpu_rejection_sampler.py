@@ -129,6 +129,8 @@ class CPURejectionSampler(RejectionSampler):
             target_probs,
             bonus_token_ids,
             sampling_metadata,
+            synthetic_mode=self.synthetic_mode,
+            synthetic_conditional_rates=self.synthetic_conditional_rates,
         )
 
         logprobs_tensors = None
@@ -163,6 +165,8 @@ def rejection_sample(
     # [batch_size, 1]
     bonus_token_ids: torch.Tensor,
     sampling_metadata: SamplingMetadata,
+    synthetic_mode: bool = False,
+    synthetic_conditional_rates: torch.Tensor | None = None,
 ) -> torch.Tensor:
     assert draft_token_ids.ndim == 1
     assert draft_probs is None or draft_probs.ndim == 2
@@ -191,6 +195,19 @@ def rejection_sample(
         is_greedy = None
     else:
         is_greedy = sampling_metadata.temperature == GREEDY_TEMPERATURE
+
+    # NOTE(RBLN): Generate uniform probs up front. Synthetic-acceptance mode
+    # (ported from vllm 0.22) needs them in the greedy kernel too; otherwise
+    # only the random path needs them. Skip when all-greedy and synthetic off.
+    uniform_probs = None
+    if synthetic_mode or not sampling_metadata.all_greedy:
+        uniform_probs = generate_uniform_probs(
+            num_tokens,
+            num_draft_tokens,
+            sampling_metadata.generators,
+            device,
+        )
+
     if not sampling_metadata.all_random:
         # Rejection sampling for greedy sampling requests.
         target_argmax = target_probs.argmax(dim=-1)
@@ -206,18 +223,12 @@ def rejection_sample(
             is_greedy,
             batch_size,
             device,
+            uniform_probs=uniform_probs,
+            synthetic_conditional_rates=synthetic_conditional_rates,
+            synthetic_mode=synthetic_mode,
         )
         if sampling_metadata.all_greedy:
             return output_token_ids
-
-    # Generate uniform probabilities for rejection sampling.
-    # [num_tokens]
-    uniform_probs = generate_uniform_probs(
-        num_tokens,
-        num_draft_tokens,
-        sampling_metadata.generators,
-        device,
-    )
 
     # Sample recovered tokens for each position.
     # [num_tokens]
@@ -234,6 +245,7 @@ def rejection_sample(
 
     # NOTE(RBLN): Call torch_rejection_random_sample_kernel instead of
     # rejection_random_sample_kernel
+    assert uniform_probs is not None
     torch_rejection_random_sample_kernel(
         output_token_ids,
         cu_num_draft_tokens,
@@ -246,6 +258,8 @@ def rejection_sample(
         is_greedy,
         batch_size,
         device,
+        synthetic_conditional_rates=synthetic_conditional_rates,
+        synthetic_mode=synthetic_mode,
     )
 
     return output_token_ids
@@ -402,6 +416,9 @@ def torch_rejection_greedy_sample_kernel(
     is_greedy: torch.Tensor | None,
     batch_size: int,
     device: torch.device,
+    uniform_probs: torch.Tensor | None = None,
+    synthetic_conditional_rates: torch.Tensor | None = None,
+    synthetic_mode: bool = False,
 ) -> None:
     if is_greedy is None:
         is_greedy_mask = torch.ones(batch_size, dtype=torch.bool, device=device)
@@ -430,6 +447,26 @@ def torch_rejection_greedy_sample_kernel(
         d = draft_token_ids[s:e]
         t = target_argmax[s:e]
 
+        if synthetic_mode:
+            assert uniform_probs is not None
+            assert synthetic_conditional_rates is not None
+            u = uniform_probs[s:e]
+            rate = synthetic_conditional_rates[:n].to(device=u.device, dtype=u.dtype)
+            # NOTE(RBLN): -1 marks padded/invalid draft ids that must be
+            # rejected (vllm PR #46533); without this the synthetic path could
+            # accept the placeholder and emit -1 as a real token.
+            accepted = (u < rate) & (d >= 0)
+            rej = ~accepted
+            if rej.any():
+                k = int(rej.to(torch.int64).argmax().item())
+                if k > 0:
+                    output_token_ids[req_idx, :k] = d[:k].to(torch.int32)
+                output_token_ids[req_idx, k] = t[k].to(torch.int32)
+            else:
+                output_token_ids[req_idx, :n] = d.to(torch.int32)
+                output_token_ids[req_idx, n] = bonus_token_ids[req_idx].to(torch.int32)
+            continue
+
         mismatch = d != t
         if mismatch.any():
             k = int(mismatch.to(torch.int64).argmax().item())
@@ -453,6 +490,8 @@ def torch_rejection_random_sample_kernel(
     is_greedy: torch.Tensor | None,
     batch_size: int,
     device: torch.device,
+    synthetic_conditional_rates: torch.Tensor | None = None,
+    synthetic_mode: bool = False,
 ) -> None:
     if is_greedy is None:
         is_greedy_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
@@ -481,20 +520,36 @@ def torch_rejection_random_sample_kernel(
         d_ids = draft_token_ids[s:e].to(torch.int64)
         u = uniform_probs[s:e].to(torch.float64)
 
-        t_prob = (
-            target_probs[s:e].gather(1, d_ids.unsqueeze(1)).squeeze(1).to(torch.float64)
-        )
+        # NOTE(RBLN): -1 marks padded/invalid draft ids that must be rejected
+        # (vllm PR #46533). Clamp them to 0 so the prob gathers below never
+        # index out of bounds, then force-reject those positions via neg_mask.
+        neg_mask = d_ids < 0
 
-        if draft_probs is None:
-            accept = t_prob >= u
+        if synthetic_mode:
+            assert synthetic_conditional_rates is not None
+            rate = synthetic_conditional_rates[:n].to(device=u.device, dtype=u.dtype)
+            accept = u < rate
         else:
-            d_prob = (
-                draft_probs[s:e]
-                .gather(1, d_ids.unsqueeze(1))
+            safe_ids = d_ids.clamp_min(0)
+            t_prob = (
+                target_probs[s:e]
+                .gather(1, safe_ids.unsqueeze(1))
                 .squeeze(1)
                 .to(torch.float64)
             )
-            accept = (d_prob > 0) & ((t_prob / d_prob) >= u)
+
+            if draft_probs is None:
+                accept = t_prob >= u
+            else:
+                d_prob = (
+                    draft_probs[s:e]
+                    .gather(1, safe_ids.unsqueeze(1))
+                    .squeeze(1)
+                    .to(torch.float64)
+                )
+                accept = (d_prob > 0) & ((t_prob / d_prob) >= u)
+
+        accept = accept & ~neg_mask
 
         if (~accept).any():
             k = int((~accept).to(torch.int64).argmax().item())
@@ -570,7 +625,10 @@ def torch_sample_recovered_tokens_kernel(
             prob = target_probs[s:e].to(torch.float32)
             d_ids = draft_token_ids[s:e].to(torch.int64)
             prob = prob.clone()
-            prob.scatter_(1, d_ids.unsqueeze(1), 0.0)
+            # NOTE(RBLN): clamp padded/invalid (-1) draft ids so scatter_ does
+            # not index out of bounds (vllm PR #46533). The recovered token is
+            # still sampled from the target distribution for those positions.
+            prob.scatter_(1, d_ids.clamp_min(0).unsqueeze(1), 0.0)
         else:
             prob = torch.maximum(
                 target_probs[s:e].to(torch.float32)

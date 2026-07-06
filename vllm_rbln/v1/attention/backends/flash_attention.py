@@ -30,7 +30,6 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
-    MLAAttentionSpec,
 )
 
 if TYPE_CHECKING:
@@ -204,8 +203,8 @@ def flash_attention_naive_prefill_impl(
     - kv_cache: [2, num_blocks, n_kv_heads, 1, partition_size, head_dim]
       Key and value cache
     - mask: [batch, 1, 1, seq_len, max_seq_len]
-    - seq_idx: [batch, num_partitions]
-      number of already cached tokens in each partition
+    - seq_idx: [batch, 1]
+      sequence position (number of already cached tokens)
     - block_tables: [num_partitions,] for prefill,
                     [batch, num_partitions] for decode
     - sinks: [n_heads, sink_len] (optional)
@@ -347,8 +346,8 @@ def flash_causal_attention_naive_prefill_impl(
       Value states for current input
     - kv_cache: [2, num_blocks, n_kv_heads, 1, partition_size, head_dim]
       Key and value cache
-    - seq_idx: [batch, num_partitions]
-      number of already cached tokens in each partition
+    - seq_idx: [batch, 1]
+      sequence position (number of already cached tokens)
     - block_tables: [num_partitions,] for prefill,
                     [batch, num_partitions] for decode
     - sinks: [n_heads, sink_len] (optional)
@@ -1072,7 +1071,6 @@ class RBLNFlashAttentionMetadataBuilder(
         self._mask_dtype = torch.float16 if self.enforce_eager else torch.float32
 
         self.is_causal = envs.VLLM_RBLN_FLASH_CAUSAL_ATTN
-        self.is_batch_attention_opt = envs.VLLM_RBLN_BATCH_ATTN_OPT
 
         self._swa_cache_seq_lens_buf: torch.Tensor | None = None
         self._swa_cache_offsets_buf: torch.Tensor | None = None
@@ -1177,10 +1175,6 @@ class RBLNFlashAttentionMetadataBuilder(
         suffix_kv_lens = None
         prefix_scheduler_metadata = None
 
-        # The length of the partition equals the block size.
-        partition_len = self.block_size
-        # num_partition is derived from max_model_len (not hardware block count)
-        # to ensure seq_idx/seq_lens dimensions stay within block_table bounds.
         max_seq_len = self.model_config.max_model_len
 
         num_partition = max_seq_len // partition_len
@@ -1204,7 +1198,6 @@ class RBLNFlashAttentionMetadataBuilder(
         else:
             # batch padding
             seq_idx = rbln_utils.pad(seq_idx, 0, batch_pad)
-            seq_lens_tensor = rbln_utils.pad(seq_lens_tensor, 0, batch_pad)
             block_tables_tensor = rbln_utils.pad(block_tables_tensor, 0, batch_pad)
             if not self.is_causal:
                 attn_masks = self._build_decode_attn_mask(
@@ -1463,9 +1456,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         # if there is not positional embedding,
         # it can be merged into attention mask
         # attn_masks = _make_alibi_bias(alibi_slopes, dtype, seq_lens)
-        # seq_lens_tensor (1, num_partition = 128k / k = 128)
-        # ex) tensor[partition0 = 1024, partition1 = 10,
-        # partition2 = 0, partition3 = 0] for len=1034
+        # seq_lens (B, 1)
         # block_tables tensor (1, num_blocks = 256)
         # ex) tensor[block0 : 0, block1 : 100,
         #  block2: 10, block3: 5, ...]
@@ -1514,10 +1505,10 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                     self.scale,  # dummy
                 ]
                 if not envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
-                    if self.is_batch_attention_opt and b_size > 1:
-                        decode_args.append(attn_metadata.swa_attn_masks)
-                    else:
-                        decode_args.append(None)
+                    use_swa_mask = self.is_batch_attention_opt and b_size > 1
+                    decode_args.append(
+                        attn_metadata.swa_attn_masks if use_swa_mask else None
+                    )
                     decode_args.append(self.sinks)
                 attn_output = sliding_window_attention_naive_decode(  # noqa: E501
                     *decode_args,
@@ -1617,10 +1608,6 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         flash_causal_attention_naive_decode_impl
                     )
 
-                # * batched attention - seq_lens[B, 1] == seq_idx,
-                #   original sequence index
-                # * otherwise         - seq_lens[B, P] == dyn_size_for_partitions,
-                #   dynamic size for each partition
                 if not attn_metadata.is_prefill:
                     decode_args = [
                         query,
