@@ -81,6 +81,8 @@ if TYPE_CHECKING:
     VLLM_RBLN_DECODE_BATCH_BUCKET_STEP: int = 2
     VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT: int = 1
     VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS: list[int] = []
+    # --- QUANTIZATION ---
+    VLLM_RBLN_USE_W8A16: bool = False
     # --- NIXL ---
     VLLM_RBLN_NIXL_SWA_VIEW_OPT: bool = False
 
@@ -382,6 +384,13 @@ environment_variables = {
     ),
     # Decode batch bucket manual buckets
     "VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS": get_decode_batch_bucket_manual_buckets,  # noqa E501
+    # Use W8A16 block fp8 (weight-only dequant) instead of W8A8 (dynamic
+    # activation fp8 quant). Default is W8A8; set True for evt0 compatibility.
+    "VLLM_RBLN_USE_W8A16": (
+        lambda: (
+            os.environ.get("VLLM_RBLN_USE_W8A16", "False").lower() in ("true", "1")
+        )
+    ),
     # --- NIXL ---
     # Publish a second SWA-sized descriptor range alongside the Full-sized
     # range at the same NIXL base addresses, so SWA groups transfer only

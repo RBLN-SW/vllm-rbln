@@ -47,6 +47,7 @@ from vllm.model_executor.parameter import (
 )
 from vllm.model_executor.utils import set_weight_attrs
 
+import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)
@@ -115,6 +116,101 @@ class RBLNW8A16BlockFp8LinearOp:
         return torch.nn.functional.linear(input, scaled_weight, bias)
 
 
+class RBLNW8A8BlockFp8LinearOp:
+    """
+    This class executes a RBLN Blocked FP8 (W8A8) linear layer.
+
+    Unlike the W8A16 op, the activation is dynamically quantized to fp8
+    (per (1, block_k) group along K) before the matmul. The block scales
+    depend only on the block index, so dequantizing both operands and
+    running a single GEMM is numerically equivalent to a real block fp8
+    GEMM with fp32 accumulation per block.
+    """
+
+    FP8_DTYPE = torch.float8_e4m3fn
+
+    def __init__(
+        self,
+        weight_group_shape: GroupShape,
+        act_quant_group_shape: GroupShape,
+    ):
+        self.weight_group_shape = weight_group_shape
+        self.act_quant_group_shape = act_quant_group_shape
+        logger.info(
+            "RBLN W8A8 block fp8 weight group shape = %s", self.weight_group_shape
+        )
+        logger.info(
+            "RBLN W8A8 block fp8 act quant group shape = %s",
+            self.act_quant_group_shape,
+        )
+        assert self.act_quant_group_shape == GroupShape(1, 128)
+
+    def apply(
+        self,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        input_scale: torch.Tensor | None = None,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        # activation_scheme is dynamic for block quant, so input_scale is
+        # always None and recomputed per group here.
+        return self._w8a8_block_fp8_matmul(
+            input,
+            weight,
+            weight_scale,
+            list(self.weight_group_shape),
+            bias,
+        )
+
+    def _per_token_group_quant_fp8(
+        self,
+        x: torch.Tensor,
+        group_size: int,
+        eps: float = 1e-10,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        finfo = torch.finfo(self.FP8_DTYPE)
+        orig_shape = x.shape
+        x_g = x.reshape(-1, group_size).to(torch.float32)
+        amax = x_g.abs().amax(dim=-1, keepdim=True).clamp_min(eps)
+        scale = amax / finfo.max
+        x_q = (x_g / scale).clamp(finfo.min, finfo.max).to(self.FP8_DTYPE)
+        x_q = x_q.reshape(orig_shape)
+        scale = scale.reshape(*orig_shape[:-1], orig_shape[-1] // group_size)
+        return x_q, scale
+
+    def _w8a8_block_fp8_matmul(
+        self,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        block_size: list[int],
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        _input_dtype = input.dtype
+        out_features, in_features = weight.shape
+        bs0, bs1 = int(block_size[0]), int(block_size[1])
+        out_blocks = out_features // bs0
+        in_blocks = in_features // bs1
+
+        # 1) Activation: dynamic per-(1, block_k) fp8 quant along K.
+        x_q, x_scale = self._per_token_group_quant_fp8(input, bs1)
+        # 2) Activation dequant: expand each K-block scale over block_k cols.
+        x_deq = x_q.to(_input_dtype) * x_scale.repeat_interleave(bs1, dim=-1).to(
+            _input_dtype
+        )
+
+        # 3) Weight dequant (identical to the W8A16 path).
+        weight = weight.view(out_blocks, bs0, in_blocks, bs1).to(_input_dtype)
+        weight_scale = weight_scale.view(out_blocks, in_blocks).to(_input_dtype)
+        scaled_weight = (weight * weight_scale[:, None, :, None]).reshape(
+            out_features, in_features
+        )
+
+        # 4) GEMM.
+        return torch.nn.functional.linear(x_deq, scaled_weight, bias)
+
+
 class Fp8LinearMethod(LinearMethodBase):
     """Linear method for FP8.
     Supports loading FP8 checkpoints with static weight scale and
@@ -153,7 +249,12 @@ class Fp8LinearMethod(LinearMethodBase):
         if self.block_quant:
             assert not self.act_q_static
             assert self.weight_block_size is not None
-            self.w8a8_block_fp8_linear = RBLNW8A16BlockFp8LinearOp(
+            block_fp8_op_cls = (
+                RBLNW8A16BlockFp8LinearOp
+                if envs.VLLM_RBLN_USE_W8A16
+                else RBLNW8A8BlockFp8LinearOp
+            )
+            self.w8a8_block_fp8_linear = block_fp8_op_cls(
                 weight_group_shape=GroupShape(*self.weight_block_size),
                 act_quant_group_shape=self.act_q_group_shape,
             )
@@ -318,7 +419,10 @@ class Fp8LinearMethod(LinearMethodBase):
         # (fp8 -> dequantize bf16 -> bf16 torch.nn.functional.linear).
         if self.block_quant:
             assert self.weight_block_size is not None
-            return self.w8a8_block_fp8_linear.apply(
+            # block_fp8_op_cls is a conditional over two op classes with an
+            # identical .apply(); mypy widens the union to object, so silence
+            # the attr-defined false positive here.
+            return self.w8a8_block_fp8_linear.apply(  # type: ignore[attr-defined]
                 input=x,
                 weight=layer.weight,
                 weight_scale=layer.weight_scale,
@@ -348,160 +452,6 @@ class Fp8LinearMethod(LinearMethodBase):
                     # Fallback
                     weight_bf16 = weight_fp8 * weight_scale
             return torch.nn.functional.linear(x, weight_bf16.t(), bias)
-
-
-@torch.library.custom_op(
-    "rbln_custom_ops::custom_moe_glu_group_dequantize",
-    mutates_args=(),
-)
-def custom_moe_glu_group_dequantize(
-    hidden_states: torch.Tensor,
-    gate_proj_weight: torch.Tensor,
-    gate_proj_scale: torch.Tensor,
-    up_proj_weight: torch.Tensor,
-    up_proj_scale: torch.Tensor,
-    down_proj_weight: torch.Tensor,
-    down_proj_scale: torch.Tensor,
-    masked_routing_weights: torch.Tensor,
-    group_size: torch.Tensor,
-    hidden_act: str,
-    gate_proj_bias: torch.Tensor | None = None,
-    up_proj_bias: torch.Tensor | None = None,
-    down_proj_bias: torch.Tensor | None = None,
-    expert_map: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """
-    Customized MoE GLU operation with pre-computed routing weights and
-    group dequantization.
-
-    Expected tensor shapes:
-    - hidden_states: [batch*seq_len, hidden_size]
-    - gate_proj_weight: [num_experts, hidden_size, intermediate_size]
-    - gate_proj_scale: [num_experts, intermediate_size, hidden_size // 128]
-    - up_proj_weight: [num_experts, hidden_size, intermediate_size]
-    - up_proj_scale: [num_experts, intermediate_size, hidden_size // 128]
-    - down_proj_weight: [num_experts, intermediate_size, hidden_size]
-    - down_proj_scale: [num_experts, hidden_size, intermediate_size // 128]
-    - masked_routing_weights: [num_experts, num_tokens]
-      (token dim may be padded to 64-align)
-    - group_size: group size for weight scale
-    - hidden_act: gate activation name ("silu"/"swish" or "gelu*")
-    - gate_proj_bias: [num_experts, intermediate_size]
-    - up_proj_bias: [num_experts, intermediate_size]
-    - down_proj_bias: [num_experts, hidden_size]
-    - expert_map: [num_experts] mapping global -> local expert index (-1 for non-local)
-
-    Returns:
-        Tensor: [batch * seq_len, hidden_size]
-    """
-
-    def _dequantize_blockwise_weight(
-        weight: torch.Tensor,
-        scale: torch.Tensor,
-        in_block_size: int,
-        out_block_size: int | None = None,
-    ) -> torch.Tensor:
-        # `weight` is [num_experts, out_features, in_features].
-        # `scale` is [num_experts, out_blocks, in_blocks].
-        out_features = weight.shape[1]
-        in_features = weight.shape[2]
-        out_blocks = scale.shape[1]
-        out_block_size = out_block_size or (
-            (out_features + out_blocks - 1) // out_blocks
-        )
-
-        expanded = scale.repeat_interleave(out_block_size, dim=1).repeat_interleave(
-            in_block_size, dim=2
-        )
-        expanded = expanded[:, :out_features, :in_features]
-        return weight.to(hidden_states.dtype) * expanded.to(hidden_states.dtype)
-
-    in_block_size = int(group_size.item())
-    gate_out_block = (
-        gate_proj_weight.shape[1] + gate_proj_scale.shape[1] - 1
-    ) // gate_proj_scale.shape[1]
-    down_out_block = (
-        down_proj_weight.shape[1] + down_proj_scale.shape[1] - 1
-    ) // down_proj_scale.shape[1]
-
-    gate_proj_weight_dq = _dequantize_blockwise_weight(
-        gate_proj_weight, gate_proj_scale, in_block_size, gate_out_block
-    )
-    up_proj_weight_dq = _dequantize_blockwise_weight(
-        up_proj_weight, up_proj_scale, in_block_size, gate_out_block
-    )
-    down_proj_weight_dq = _dequantize_blockwise_weight(
-        down_proj_weight, down_proj_scale, in_block_size, down_out_block
-    )
-
-    num_tokens, hidden_size = hidden_states.shape
-    num_experts = gate_proj_weight_dq.shape[0]
-    dtype = hidden_states.dtype
-
-    act = hidden_act.lower()
-    if act in ("silu", "swish"):
-        act_fn = torch.nn.functional.silu
-    elif "gelu" in act:
-        act_fn = torch.nn.functional.gelu
-    else:
-        raise ValueError(f"Unsupported hidden_act={hidden_act!r}")
-
-    # masked_routing_weights: [E, T_padded]
-    routing_t = masked_routing_weights[:, :num_tokens]
-
-    final_hidden_states = torch.zeros(num_tokens, hidden_size, dtype=dtype)
-
-    for expert_idx in range(num_experts):
-        expert_weights = routing_t[expert_idx]  # [T]
-        token_indices = expert_weights.nonzero(as_tuple=True)[0]
-        if token_indices.numel() == 0:
-            continue
-
-        weights = expert_weights[token_indices]  # [num_selected]
-        current_state = hidden_states[token_indices]  # [num_selected, hidden_size]
-
-        gate = torch.nn.functional.linear(
-            current_state,
-            gate_proj_weight_dq[expert_idx],
-            gate_proj_bias[expert_idx] if gate_proj_bias is not None else None,
-        )
-        up = torch.nn.functional.linear(
-            current_state,
-            up_proj_weight_dq[expert_idx],
-            up_proj_bias[expert_idx] if up_proj_bias is not None else None,
-        )
-        glu = act_fn(gate) * up
-        down = torch.nn.functional.linear(
-            glu,
-            down_proj_weight_dq[expert_idx],
-            down_proj_bias[expert_idx] if down_proj_bias is not None else None,
-        )
-        current_hidden_states = down * weights.unsqueeze(-1)
-        final_hidden_states.index_add_(
-            0, token_indices, current_hidden_states.to(dtype)
-        )
-
-    return final_hidden_states
-
-
-@custom_moe_glu_group_dequantize.register_fake
-def custom_moe_glu_group_dequantize_fake(
-    hidden_states: torch.Tensor,
-    gate_proj_weight: torch.Tensor,
-    gate_proj_scale: torch.Tensor,
-    up_proj_weight: torch.Tensor,
-    up_proj_scale: torch.Tensor,
-    down_proj_weight: torch.Tensor,
-    down_proj_scale: torch.Tensor,
-    masked_routing_weights: torch.Tensor,
-    group_size: torch.Tensor,
-    hidden_act: str,
-    gate_proj_bias: torch.Tensor | None = None,
-    up_proj_bias: torch.Tensor | None = None,
-    down_proj_bias: torch.Tensor | None = None,
-    expert_map: torch.Tensor | None = None,
-) -> torch.Tensor:
-    return torch.empty_like(hidden_states)
 
 
 class Fp8MoEMethod(FusedMoEMethodBase):
@@ -785,6 +735,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         orig_shape = x.shape  # noqa: F841
         num_tokens = orig_shape[:-1].numel()  # noqa: F841
         hidden_states = x.reshape(num_tokens, -1)
+        # Save the pre-quant activation dtype (bf16/dlfp16 per DTYPE_FORCE) as the
+        # explicit MoE compute/output dtype — passed to the custom op so its
+        # register_fake can declare the correct output dtype. hidden_states is
+        # quantized to fp8 below, so the op can't recover it from its own operands,
+        # and masked_routing_weights.dtype is model-dependent.
+        moe_compute_dtype = hidden_states.dtype
         masked_routing_weights = router_logits
         intermediate_size = layer.w2_weight.shape[-1]
 
@@ -809,22 +765,80 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             assert getattr(layer, "expert_map_const", None) is not None
             expert_map_const = torch.tensor(layer.expert_map_const, dtype=torch.int32)
 
-        final_hidden_states = torch.ops.rbln_custom_ops.custom_moe_glu_group_dequantize(
-            hidden_states,
-            gate_proj_weight,
-            gate_proj_weight_scale,
-            up_proj_weight,
-            up_proj_weight_scale,
-            down_proj_weight,
-            down_proj_weight_scale,
-            masked_routing_weights,
-            torch.tensor(self.weight_block_size[1], dtype=torch.int32),
-            layer.activation.value,
-            None,  # gate_proj_bias
-            None,  # up_proj_bias
-            None,  # down_proj_bias
-            expert_map_const,
-        )
+        tokens_mask = None
+        use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
+        if use_moe_tokens_mask:
+            # Local import to avoid a quantization<->fused_moe circular import.
+            from vllm_rbln.model_executor.layers.fused_moe.layer import (
+                get_tokens_mask,
+            )
+
+            tokens_mask = get_tokens_mask(num_tokens, device=router_logits.device)
+
+        # W8A8: dynamically quantize hidden_states to fp8 per (1, block_k) group
+        # along the contraction dim and hand both the fp8 tensor and the
+        # per-(token, K-block) scale to the compiler custom op.
+        if not envs.VLLM_RBLN_USE_W8A16:
+            fp8_dtype = torch.float8_e4m3fn
+            finfo = torch.finfo(fp8_dtype)
+            in_block_size = int(self.weight_block_size[1])
+            hs_shape = hidden_states.shape
+            # we expect rebel_compiler to convert below to qnn_quantize
+            # TODO: we need to make sure this is as expected in the tvm graph
+            s_g = hidden_states.reshape(-1, in_block_size).to(torch.float32)
+            amax = s_g.abs().amax(dim=-1, keepdim=True).clamp_min(1e-10)
+            scale = amax / finfo.max
+            hidden_states = (
+                (s_g / scale)
+                .clamp(finfo.min, finfo.max)
+                .to(fp8_dtype)
+                .reshape(hs_shape)
+            )
+            # end of qnn_quantize
+            hidden_states_scale = scale.reshape(
+                hs_shape[0], hs_shape[1] // in_block_size
+            )
+            final_hidden_states = torch.ops.rbln_custom_ops.custom_moe_glu_w8a8(
+                hidden_states,
+                hidden_states_scale,
+                gate_proj_weight,
+                gate_proj_weight_scale,
+                up_proj_weight,
+                up_proj_weight_scale,
+                down_proj_weight,
+                down_proj_weight_scale,
+                # Routing (softmax + topk) done externally; arg order mirrors the
+                # custom_moe_glu_group_dequantize schema with the fp8 activation
+                # scale inserted at index 1.
+                masked_routing_weights,
+                torch.tensor(self.weight_block_size[1], dtype=torch.int32),
+                layer.activation.value,
+                moe_compute_dtype,
+                None,  # gate_proj_bias
+                None,  # up_proj_bias
+                None,  # down_proj_bias
+                expert_map_const,
+                tokens_mask,
+            )
+        else:
+            final_hidden_states = (
+                torch.ops.rbln_custom_ops.custom_moe_glu_group_dequantize(
+                    hidden_states,
+                    gate_proj_weight,
+                    gate_proj_weight_scale,
+                    up_proj_weight,
+                    up_proj_weight_scale,
+                    down_proj_weight,
+                    down_proj_weight_scale,
+                    masked_routing_weights,
+                    torch.tensor(self.weight_block_size[1], dtype=torch.int32),
+                    layer.activation.value,
+                    None,  # gate_proj_bias
+                    None,  # up_proj_bias
+                    None,  # down_proj_bias
+                    expert_map_const,
+                )
+            )
 
         return final_hidden_states.reshape(orig_shape)
 
