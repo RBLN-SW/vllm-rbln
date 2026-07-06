@@ -11,24 +11,63 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU affinity utilities for RBLN worker."""
+"""Utilities for the RBLN worker (CPU affinity, batch reorder, …)."""
 
 import math
 import os
 import platform
 from collections import defaultdict
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 from vllm.config import ModelConfig, ParallelConfig
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.platforms import CpuArchEnum, current_platform
-from vllm.platforms.cpu import CpuPlatform, LogicalCPUInfo
+from vllm.utils.cpu_resource_utils import (
+    LogicalCPUInfo,
+    get_allowed_cpu_list,
+    get_visible_memory_node,
+)
+from vllm.v1.worker.block_table import MultiGroupBlockTable
 
 import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
 
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu_input_batch import InputBatch
+
 logger = init_logger(__name__)
+
+
+def compute_slot_mapping_cpu(
+    block_table: MultiGroupBlockTable,
+    req_indices: np.ndarray,
+    positions_np: np.ndarray,
+    total_num_scheduled_tokens: int,
+) -> None:
+    """Compute slot_mapping on CPU and sync to device.
+
+    vLLM 0.19 replaced the numpy slot_mapping path with a Triton kernel that
+    RBLN (CPU) cannot dispatch, so we always compute via numpy and push to
+    device ourselves. The same code works on 0.18 since all referenced
+    buffer attributes (``block_table.np``, ``slot_mapping.np``,
+    ``copy_to_gpu``) exist on both versions.
+    """
+    num_tokens = req_indices.shape[0]
+    for bt in block_table.block_tables:
+        block_table_indices = (
+            req_indices * bt.max_num_blocks_per_req + positions_np // bt.block_size
+        )
+        block_numbers = bt.block_table.np.ravel()[block_table_indices]
+        block_offsets = positions_np % bt.block_size
+        np.add(
+            block_numbers * bt.block_size,
+            block_offsets,
+            out=bt.slot_mapping.np[:num_tokens],
+        )
+        bt.slot_mapping.copy_to_gpu(total_num_scheduled_tokens)
 
 
 def estimate_model_kernel_size(
@@ -147,12 +186,12 @@ def estimate_available_memory(
         ATOM_DRAM_NBYTES = 16 * 2**30
         ATOM_SYS_DRAM_NBYTES = 288 * 2**20
         # consider RSD size for ATOM
-        rsd_size = envs.VLLM_RBLN_TP_SIZE
+        rsd_size = envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK
         available_dram_bytes = rsd_size * (ATOM_DRAM_NBYTES - ATOM_SYS_DRAM_NBYTES)
         # ATOM - basic data type fp16
         default_bits_per_param = 16
     elif "cr" in device_name:
-        assert envs.VLLM_RBLN_TP_SIZE == 1
+        assert envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK == 1
         # REBEL - RBLN-CR[xxx]
         # REBEL DRAM - 144GB (quad chips, chiplet) - system(4G) = 140GB
         REBEL_DRAM_NBYTES = 144 * 2**30
@@ -217,8 +256,19 @@ def estimate_available_memory(
         buffer = buffer_per_runtime_per_core * num_runtimes
     available_dram_bytes -= buffer
 
-    rsd_replicas = (rsd_size // num_key_value_heads) or 1 if "ca" in device_name else 1
+    rsd_replicas = max(1, rsd_size // num_key_value_heads)
     available_dram_bytes = available_dram_bytes // rsd_replicas
+
+    if "cr" in device_name and num_key_value_heads % rsd_size != 0:
+        # KV heads are sharded across chiplets, so when they do not divide
+        # evenly a chiplet holds ceil(H / N) heads while owning only 1/N of
+        # DRAM. The bottleneck chiplet limits the usable KV pool to
+        # H / (N * ceil(H / N)) of the uniform estimate (e.g. 10 heads on 4
+        # chiplets -> 10/12), otherwise the per-chiplet allocator OOMs.
+        heads_per_chiplet = math.ceil(num_key_value_heads / rsd_size)
+        available_dram_bytes = (available_dram_bytes * num_key_value_heads) // (
+            rsd_size * heads_per_chiplet
+        )
 
     check_oom(available_dram_bytes)
 
@@ -242,7 +292,9 @@ def get_autobind_cpu_ids(
     Returns:
         Comma-separated string of CPU IDs, or "all" or "nobind".
     """
-    allowed_numa_nodes, logical_cpu_list = CpuPlatform.get_allowed_cpu_core_node_list()
+    # NOTE: It should be checked.
+    allowed_numa_nodes = get_visible_memory_node()
+    logical_cpu_list = get_allowed_cpu_list()
 
     # Calculate rank_across_dp for CPU binding
     # This ensures different DP groups get different CPU allocations
@@ -528,3 +580,92 @@ def get_kv_cache_names(
         for layer_name in layer_names:
             kv_cache_names.append(layer_name)
     return kv_cache_names
+
+
+def reorder_input_batch(input_batch: "InputBatch", perm: np.ndarray) -> None:
+    """Permute every per-request field of ``input_batch`` in one vectorized
+    pass (new slot ``k`` takes old index ``perm[k]``).
+
+    Mirrors upstream ``InputBatch.swap_states`` (vllm 0.22.0) but reindexes each
+    field once instead of via N-1 pairwise swaps; the caller emits the
+    logits-processor move records. Keep the field set in sync with
+    ``swap_states`` on vLLM bumps -- ``test_reorder_matches_swap_states`` guards
+    equivalence.
+    """
+    ib = input_batch
+    n = len(perm)
+    # numpy index: valid for advanced indexing of both numpy arrays and tensors.
+    p = np.asarray(perm)
+
+    # token_ids_cpu / is_token_ids rows are max_model_len wide but only
+    # [:num_tokens + spec] is meaningful, so reindex just those columns. valid_w
+    # is permutation-invariant (max over the same values), so read it first.
+    max_spec = max((len(s) for s in ib.spec_token_ids[:n]), default=0)
+    valid_w = min(
+        int(ib.num_tokens_no_spec[:n].max()) + max_spec,
+        ib.token_ids_cpu.shape[1],
+    )
+
+    # request id / token bookkeeping (python lists + index dict)
+    ib._req_ids[:n] = [ib._req_ids[i] for i in p]
+    ib.req_output_token_ids[:n] = [ib.req_output_token_ids[i] for i in p]
+    ib.spec_token_ids[:n] = [ib.spec_token_ids[i] for i in p]
+    for k in range(n):
+        rid = ib._req_ids[k]
+        if rid is not None:
+            ib.req_id_to_index[rid] = k
+
+    # per-request scalars; RHS fancy-index copies, so in-place assign is alias-safe
+    for arr in (
+        ib.num_tokens_no_spec,
+        ib.num_prompt_tokens,
+        ib.num_computed_tokens_cpu,
+    ):
+        arr[:n] = arr[p]
+
+    ib.token_ids_cpu[:n, :valid_w] = ib.token_ids_cpu[p, :valid_w]
+    ib.is_token_ids[:n, :valid_w] = ib.is_token_ids[p, :valid_w]
+
+    if ib.req_prompt_embeds:
+        ib.req_prompt_embeds = {
+            k: ib.req_prompt_embeds[int(p[k])]
+            for k in range(n)
+            if int(p[k]) in ib.req_prompt_embeds
+        }
+
+    # block-table CPU rows + counts (device copy re-synced downstream)
+    for bt in ib.block_table.block_tables:
+        bt.num_blocks_per_row[:n] = bt.num_blocks_per_row[p]
+        bt.block_table.np[:n] = bt.block_table.np[p]
+
+    ib.request_lora_mapping[:n] = ib.request_lora_mapping[p]
+
+    # Pooling models carry no sampling / logits state.
+    if ib.is_pooling_model:
+        return
+
+    for arr in (
+        ib.temperature_cpu,
+        ib.top_p_cpu,
+        ib.top_k_cpu,
+        ib.frequency_penalties_cpu,
+        ib.presence_penalties_cpu,
+        ib.repetition_penalties_cpu,
+        ib.num_accepted_tokens_cpu,
+    ):
+        arr[:n] = arr[p]
+
+    # index-keyed dicts: new slot k inherits old slot p[k]'s entry
+    ib.generators = {
+        k: ib.generators[int(p[k])] for k in range(n) if int(p[k]) in ib.generators
+    }
+    ib.bad_words_token_ids = {
+        k: ib.bad_words_token_ids[int(p[k])]
+        for k in range(n)
+        if int(p[k]) in ib.bad_words_token_ids
+    }
+
+    if ib.allowed_token_ids_mask_cpu_tensor is not None:
+        ib.allowed_token_ids_mask_cpu_tensor[:n] = ib.allowed_token_ids_mask_cpu_tensor[
+            p
+        ]

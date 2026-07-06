@@ -12,15 +12,39 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TypeVar
 
-from vllm_rbln.logger import init_logger
+import vllm_rbln.rbln_envs as envs
+from vllm_rbln.logger import init_logger, make_file_handler
 
 logger = init_logger(__name__)
 
 T = TypeVar("T", int, float)
+
+_metrics_file_attached = False
+
+
+def _attach_metrics_file_handler() -> None:
+    """Mirror metrics output to VLLM_RBLN_METRICS_FILE if configured.
+
+    The configured path is suffixed with the worker pid so concurrent workers
+    (TP/DP) write to separate files instead of clobbering one another. Runs at
+    most once; a failure to open the file is logged and stdout output is kept.
+    """
+    global _metrics_file_attached
+    if _metrics_file_attached or not envs.VLLM_RBLN_METRICS_FILE:
+        return
+    _metrics_file_attached = True
+    root, ext = os.path.splitext(envs.VLLM_RBLN_METRICS_FILE)
+    path = f"{root}.{os.getpid()}{ext}"
+    try:
+        logger.addHandler(make_file_handler(path))
+    except OSError as e:
+        _metrics_file_attached = False
+        logger.warning("Failed to open metrics file %s: %s", path, e)
 
 
 @dataclass
@@ -275,7 +299,31 @@ class PerformanceTracker:
             prepare_time,
         )
 
+    def record(self, report: "StepReport") -> None:
+        if report.is_prefill:
+            self.record_prefill(
+                report.latency,
+                report.token_count,
+                host_time=report.host_time,
+                device_time=report.device_time,
+                ccl_time=report.ccl_time,
+                prepare_time=report.prepare_time,
+                request_ids=report.request_ids,
+            )
+        else:
+            self.record_decode(
+                report.latency,
+                report.token_count,
+                host_time=report.host_time,
+                device_time=report.device_time,
+                ccl_time=report.ccl_time,
+                prepare_time=report.prepare_time,
+                padded_decode=report.padded_decode,
+                request_ids=report.request_ids,
+            )
+
     def print_final_stats(self):
+        _attach_metrics_file_handler()
         logger.info("=" * 80)
         if self.name:
             logger.info("FINAL PERFORMANCE STATISTICS [%s]", self.name)
@@ -296,6 +344,77 @@ class PerformanceTracker:
         logger.info("=" * 80)
 
 
+@dataclass
+class StepReport:
+    """One execution step's timing before it is recorded into a tracker.
+
+    Lets model and sampler timings be summed into a single combined
+    measurement (merged_with) instead of being tracked separately.
+    """
+
+    latency: float
+    token_count: int = 0
+    host_time: int | None = None
+    device_time: int | None = None
+    ccl_time: int | None = None
+    prepare_time: int | None = None
+    is_prefill: bool = False
+    padded_decode: bool = False
+    request_ids: list[str] | None = None
+
+    @classmethod
+    def from_reports(
+        cls,
+        start_time: float,
+        end_time: float,
+        reports: list[dict] | None,
+        *,
+        token_count: int = 0,
+        is_prefill: bool = False,
+        padded_decode: bool = False,
+        request_ids: list[str] | None = None,
+    ) -> "StepReport":
+        host_time = device_time = ccl_time = prepare_time = None
+        if reports:
+            host_time = reports[0].get("total_host", None)
+            device_time = reports[0].get("total_device", None)
+            ccl_time = reports[0].get("total_ccl", None)
+        if reports and len(reports) > 1:
+            prepare_time = reports[1].get("prepare_input_us", 0) + reports[1].get(
+                "prepare_output_us", 0
+            )
+        return cls(
+            latency=end_time - start_time,
+            token_count=token_count,
+            host_time=host_time,
+            device_time=device_time,
+            ccl_time=ccl_time,
+            prepare_time=prepare_time,
+            is_prefill=is_prefill,
+            padded_decode=padded_decode,
+            request_ids=request_ids,
+        )
+
+    def merged_with(self, other: "StepReport | None") -> "StepReport":
+        """Sum `other`'s timings into this step, keeping this step's metadata."""
+        if other is None:
+            return self
+
+        def _add(a: int | None, b: int | None) -> int | None:
+            if a is None and b is None:
+                return None
+            return (a or 0) + (b or 0)
+
+        return replace(
+            self,
+            latency=self.latency + other.latency,
+            host_time=_add(self.host_time, other.host_time),
+            device_time=_add(self.device_time, other.device_time),
+            ccl_time=_add(self.ccl_time, other.ccl_time),
+            prepare_time=_add(self.prepare_time, other.prepare_time),
+        )
+
+
 def collect_metrics(
     performance_tracker: PerformanceTracker,
     is_prefill: bool,
@@ -304,34 +423,12 @@ def collect_metrics(
     reports: list[dict],
     token_count: int,
 ) -> None:
-    execution_time = end_time - start_time
-    host_time = None
-    device_time = None
-    ccl_time = None
-    prepare_time = None
-    if reports is not None and len(reports) > 0:
-        host_time = reports[0].get("total_host", None)
-        device_time = reports[0].get("total_device", None)
-        ccl_time = reports[0].get("total_ccl", None)
-    if reports is not None and len(reports) > 1:
-        prepare_time = reports[1].get("prepare_input_us", 0) + reports[1].get(
-            "prepare_output_us", 0
+    performance_tracker.record(
+        StepReport.from_reports(
+            start_time,
+            end_time,
+            reports,
+            token_count=token_count,
+            is_prefill=is_prefill,
         )
-    if is_prefill:
-        performance_tracker.record_prefill(
-            execution_time,
-            token_count,
-            host_time=host_time,
-            device_time=device_time,
-            ccl_time=ccl_time,
-            prepare_time=prepare_time,
-        )
-    else:
-        performance_tracker.record_decode(
-            execution_time,
-            token_count,
-            host_time=host_time,
-            device_time=device_time,
-            ccl_time=ccl_time,
-            prepare_time=prepare_time,
-        )
+    )

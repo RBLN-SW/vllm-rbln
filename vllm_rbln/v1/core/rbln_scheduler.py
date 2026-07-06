@@ -12,9 +12,106 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""RBLN scheduler with spec-decode query backfill.
+
+Motivation
+----------
+Speculative decode on RBLN otherwise needs two decode query shapes per
+step: ``num_spec_tokens + 1`` for the full-spec path and ``1`` for the
+boundary-induced no-spec fallback (when ``remaining_in_block`` /
+``remaining_in_maxlen`` cannot fit the full window, or a variable-length
+proposer such as ngram returns fewer drafts). Two shapes force two compile
+variants of the decode graph, a cross-DP ``step_no_spec_required``
+OR-reduce to agree on the per-step shape, and runtime branching that the
+``specialized_moe_decode`` path cannot reconcile in a single graph.
+
+Key idea
+--------
+The scheduler unconditionally keeps every decode step's query window at
+``num_spec_tokens + 1`` by back-filling the deficit with past positions
+whose KV is already in the current block::
+
+    slide_distance = max_spec_decode_len - min(old_n, effective_remaining)
+
+The runner prepends ``slide_distance`` past tokens to ``input_ids`` /
+``positions``; the model re-runs them through attention (an idempotent KV
+re-write) and their logits are pruned from ``logits_indices`` so the
+sampler never sees them. Result: a single ``(batch, num_spec_tokens + 1)``
+full-spec decode graph for every step that can be padded in-block.
+
+Cross-block exception (variable-length proposers only): right after entering
+a new block, a short draft would need backfill from the PREVIOUS block,
+which the single-block decode path can't express. That step falls back to
+no-spec (query_len = 1) via the ``step_no_spec_required`` cross-DP OR-reduce
+(any rank tripping it -> every rank drops to no-spec). Fixed-length
+proposers (EAGLE/EAGLE3/MEDUSA) stay full-spec only: ``num_spec + 1 <=
+block_size`` keeps their backfill in-block at every interior boundary. The
+sole exception is the ``max_model_len`` edge -- decode is capped to
+``max_model_len - 1`` (reserved final position), so a final partial block of
+size ``m = max_model_len % block_size <= num_spec + 1`` squeezes even a full
+draft into a cross-block window. That is unsupported for fixed length and a
+runtime assert rejects it (align ``max_model_len`` to ``block_size``).
+
+Decode input shaping pipeline
+-----------------------------
+In short: the **scheduler** unifies query length WITHIN a rank; the
+**runner** then does cross-DP query-length reconciliation AND batch padding.
+These three stages together make every DP rank feed the compiled decode
+graph an identical ``(batch_bucket, query_len)`` tensor:
+
+1. Scheduler (this file) -- intra-rank query-length unification. Backfill
+   sets every decode req's query window to ``num_spec_tokens + 1`` (or 1 on
+   the no-spec fallback) within this rank. BOTH paths that enter the decode
+   batch go through ``_decide_spec_slide``: the running loop AND the
+   ``WAITING_FOR_REMOTE_KVS`` promotion path (a remote-prefilled req joins
+   decode carrying 0 drafts, so it needs the same backfill). After this stage
+   a rank's flat ``input_ids`` is already ``num_reqs * query_len`` -- uniform
+   and reshape-safe. (Prefill never mixes with decode in one rank: the
+   no-mixed-batching eviction keeps a prefill step at ``num_reqs == 1``.)
+2. Runner -- cross-DP reconciliation (query-length axis). ``any_prefill``
+   (a DP PEER prefilling) selects the prefill-sized shape; otherwise
+   ``pad_speculative_draft_tokens`` lifts each rank's uniform window up to
+   ``max_tokens_per_req_across_dp`` (the cross-DP max of per-rank
+   ``spec_decode_max_query_len``) so all ranks agree on ``query_len``. This
+   stage assumes stage 1's intra-rank uniformity -- it does NOT equalize
+   per-req lengths within a rank.
+3. Runner -- batch padding (batch axis). ``input_ids.view(num_reqs, -1)``
+   then ``pad(..., batch_bucket_size)`` pads the batch dimension up to the
+   cross-DP max ``num_reqs`` bucket (e.g. 7 -> 8).
+
+If stage 1 leaves a rank non-uniform (e.g. a promoted req that skipped
+backfill) AND the draft dict is empty (so the runner's pad is gated off),
+stage 3's ``view(num_reqs, -1)`` crashes on the non-divisible flat length --
+the regression this scheduler's promotion-path backfill prevents.
+
+Compile coverage & guards
+-------------------------
+Because ``step_no_spec_required`` can fire at runtime, warmup must compile
+BOTH decode graphs for variable-length proposers: full-spec
+``(batch, num_spec+1)`` and no-spec ``(batch, 1)``. A decode graph's compile
+key has TWO axes -- ``input_ids`` shape AND ``max_pads_across_dp`` size
+(``num_padded``) -- so warmup must reproduce the runtime no-spec graph on
+both. Setting ``query_len = 1`` only fixes the first axis; ``num_padded`` is
+derived from ``step_no_spec_required`` (via ``spec_decode_max_query_len``),
+so the warmup dummy drives the SAME runtime path by emitting an
+``RBLNSchedulerOutput(step_no_spec_required=True)`` rather than hand-mimicking
+inputs. Otherwise the no-spec step hot-path recompiles at runtime.
+
+Two runtime asserts protect the in-block invariant against silent KV
+corruption: (1) no backfill window may cross a block boundary
+(``slide <= tokens_used_in_block``), and (2) once no-spec is elected the
+scrub must clear all slide and force every ``query_len = 1``.
+
+Naming: the mechanism is **query backfill**. Some code-level identifiers
+(``slide_distance``, ``spec_decode_slide_distance``, ...) still carry the
+older ``slide``/``sliding`` naming for stability across modules, but they
+refer to query backfill -- not a separate mechanism.
+"""
+
 import itertools
 import time
 from dataclasses import dataclass, field
+from typing import Any
 
 from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
@@ -44,9 +141,32 @@ logger = init_logger(__name__)
 @dataclass
 class RBLNSchedulerOutput(SchedulerOutput):
     """SchedulerOutput extended with KV cache copy operations for sub-block
-    prefix caching."""
+    prefix caching, a legacy boundary-induced no-spec flag, and per-request
+    sliding-window slide distances for fixed-length spec decode.
+
+    Naming: "sliding-window" and "query backfill" refer to the same
+    mechanism. Code-level identifiers below (``spec_decode_slide_distance``,
+    ``slide_distance``, etc.) keep the ``slide``/``sliding`` naming for
+    stability; user-facing log prefixes and docs use ``backfill``.
+    """
 
     kv_cache_copy_ops: list[KVCacheCopyOp] = field(default_factory=list)
+    # NOTE(RBLN): Set True when at least one running decode req cannot reach
+    # full spec via in-block query backfill — i.e. it just entered a new block
+    # and a variable-length proposer's draft would need backfill from the
+    # PREVIOUS block (cross-block, unsupported). The runner OR-reduces this
+    # across DP: if ANY rank set it, EVERY rank drops to no-spec (query_len=1)
+    # this step. Stays False for fixed-length proposers (their backfill is
+    # always in-block) and for any step paddable in-block.
+    step_no_spec_required: bool = False
+    # NOTE(RBLN): Per-request sliding-window slide distance. For a decode
+    # req whose remaining_in_block (or remaining_in_maxlen) cannot fit the
+    # full num_spec_tokens+1 query window, the runner prepends
+    # `slide_distance` past tokens (from request.output_token_ids) so the
+    # entire query window stays within already-allocated KV slots. Past
+    # positions' logits are discarded; past KV gets idempotently
+    # re-written. Empty / missing key => slide_distance is 0 (no slide).
+    spec_decode_slide_distance: dict[str, int] = field(default_factory=dict)
 
 
 def is_prefill(request: Request) -> bool:
@@ -105,6 +225,65 @@ class RBLNScheduler(Scheduler):
                     sub_block_size,
                 )
 
+        # NOTE(RBLN): Blocks allocated for a running (decode) request that is
+        # then evicted by the "disable mixed batching" path (see schedule())
+        # are already committed in the KV-cache coordinator but never reach the
+        # model runner, because the evicted request is dropped from this step's
+        # output. On the next step `allocate_slots` returns an empty delta (the
+        # coordinator already holds the block), so the block id would be lost
+        # to the runner forever — leaving a stale block-id 0 in the request's
+        # block table. This is observable for block-aligned prompts, whose
+        # second block is allocated exactly on the prefill->decode transition
+        # step that the eviction targets. We stash the dropped delta here and
+        # re-emit it on the request's next scheduled step. Keyed by request_id.
+        self._stranded_new_blocks: dict[str, KVCacheBlocks] = {}
+
+    def _decide_spec_slide(self, request: Request, new_n: int) -> tuple[int, bool]:
+        """Sliding-window backfill decision for one decode request's query
+        window so it reaches ``num_spec_tokens + 1``.
+
+        Returns ``(slide_distance, cross_block_no_spec)``:
+          * ``(slide_distance > 0, False)`` -- in-block backfill: prepend this
+            many already-committed past positions to pad the query window (full
+            spec kept).
+          * ``(0, True)`` -- the backfill window would cross the current KV
+            block boundary, so full spec is impossible this step; the caller
+            must elect no-spec (query_len=1). Fixed-length proposers must never
+            reach this and fail loudly here.
+          * ``(0, False)`` -- no backfill needed (window already full).
+
+        Shared by the running loop and the WAITING_FOR_REMOTE_KVS promotion path
+        so both unify decode query windows identically. ``new_n`` is the
+        boundary-capped advance for this step (>= 1; == 1 for a promoted
+        single-token decode).
+        """
+        desired_slide = (self.num_spec_tokens + 1) - new_n
+        if desired_slide <= 0:
+            return 0, False
+        tokens_used_in_block = request.num_computed_tokens % self.block_size
+        if desired_slide > tokens_used_in_block:
+            # The backfill window reaches back into the PREVIOUS block, which the
+            # single-block decode path cannot express. Variable-length proposers
+            # (ngram/suffix) fall back to no-spec (query_len=1); fixed-length
+            # proposers compile no no-spec graph and their DP-idle peers vote
+            # num_spec+1, so they must stay full-spec-only and are rejected.
+            assert self.vllm_config.speculative_config.method in (
+                "ngram",
+                "suffix",
+            ), (
+                "cross-block no-spec fallback fired for fixed-length proposer "
+                f"'{self.vllm_config.speculative_config.method}'; "
+                "fixed-length spec decode must stay full-spec-only. "
+                "Cause: the final block is too short for a full speculative "
+                "window once the scheduler reserves the last position (decode "
+                "capped to max_model_len-1), i.e. 0 < max_model_len % block_size "
+                "<= num_spec_tokens+1 and a request reached the final block. "
+                "Align max_model_len to block_size (or keep "
+                "max_model_len % block_size > num_spec_tokens+1)."
+            )
+            return 0, True
+        return desired_slide, False
+
     def schedule(self) -> RBLNSchedulerOutput:
         # Copied from vllm.v1.core.sched.Scheduler.schedule: https://github.com/vllm-project/vllm/blob/v0.18.0/vllm/v1/core/sched/scheduler.py#L338-L927
         # The only differences are:
@@ -148,14 +327,19 @@ class RBLNScheduler(Scheduler):
 
         self.kv_cache_manager.new_step_starts()
 
-        # NOTE(RBLN): spec_decode_cap prevents block boundary crossing caused by
-        # runner-side padding. The runner pads all requests in the batch to the
-        # maximum scheduled token length (max_spec_decode_len). If any request
-        # is trimmed due to a block boundary, other requests with more tokens
-        # would cause that trimmed request to be padded beyond its boundary.
-        # spec_decode_cap propagates the tightest remaining_in_block constraint
-        # to all subsequent requests so no request exceeds it.
-        spec_decode_cap = self.block_size
+        # NOTE(RBLN): Set True below if any decode req cannot reach full spec
+        # via in-block query backfill (cross-block, variable-length only); the
+        # runner OR-reduces it across DP so every rank drops to no-spec that
+        # step. Stays False when every backfill is in-block.
+        step_no_spec_required = False
+
+        # NOTE(RBLN): Per-request sliding-window slide distances. For a
+        # running decode req whose remaining_in_block / remaining_in_maxlen
+        # budget can't fit a full num_spec_tokens+1 query window, we record
+        # how many past positions the runner must prepend to the query
+        # window so it stays within already-allocated KV slots. Populated
+        # below as we walk running reqs and detect boundary cases.
+        spec_decode_slide_distance: dict[str, int] = {}
 
         # First, schedule the RUNNING requests.
         # NOTE(RBLN): Prioritize prefill requests. Given our constraint that the prefill
@@ -321,20 +505,121 @@ class RBLNScheduler(Scheduler):
                 # next step when applicable.
                 request.spec_token_ids = []
 
-            # NOTE(RBLN): Update spec_decode_cap with the tightest constraint
-            # for this request: remaining space in the current block and remaining
-            # tokens until max_model_len. Done here (after confirmed scheduling)
-            # so that only actually scheduled requests affect the cap, and
-            # num_new_tokens reflects all prior adjustments. Even single-token
-            # decode requests must constrain the cap because the runner pads all
-            # requests to max_spec_decode_len.
-            if not is_prefill(request):
+            # NOTE(RBLN): Sliding-window per-request boundary decision.
+            # When a decode req's remaining block / maxlen can no longer
+            # hold a full num_spec_tokens+1 window, slide the query window
+            # backward by `desired_slide` past positions whose KV is
+            # already in the current block. The runner re-feeds those past
+            # tokens (idempotent KV re-write) and drops their logits from
+            # sampling, so the effective advance per step is capped at
+            # `effective_remaining` while no KV write crosses the block
+            # boundary. Drafts that would land past the boundary get
+            # trimmed in `scheduled_spec_decode_tokens`. Peers in the
+            # same batch that aren't near a boundary keep running full
+            # spec — the decision is purely per-request.
+            if not is_prefill(request) and self.num_spec_tokens > 0:
+                # Unified sliding-window decision: pad every decode
+                # req's query window to a fixed `num_spec_tokens + 1`,
+                # regardless of how many drafts the proposer returned
+                # or whether the req is near a block boundary.
+                #
+                # - Variable-length proposers (ngram, suffix decoding)
+                #   that return fewer than num_spec_tokens drafts → the
+                #   shortage is filled with past positions (sliding
+                #   pads the length deficit, logits at past positions
+                #   are discarded).
+                # - Fixed-length proposers (MTP, EAGLE) → no padding
+                #   needed off the boundary; sliding only fires when
+                #   the boundary squeezes effective_remaining below
+                #   num_spec_tokens + 1.
+                # - Boundary + variable-length combine naturally:
+                #   `new_n = min(old_n, effective_remaining)` caps
+                #   actual advance, and `desired_slide` pads the rest.
+                #
+                # The runner sees a single decode shape
+                # (batch, num_spec_tokens + 1) — no_spec compile
+                # variants and runtime branching are eliminated.
+                max_spec_decode_len = self.num_spec_tokens + 1
                 tokens_used_in_block = request.num_computed_tokens % self.block_size
                 remaining_in_block = self.block_size - tokens_used_in_block
                 remaining_in_maxlen = self.max_model_len - request.num_computed_tokens
-                spec_decode_cap = min(
-                    remaining_in_block, remaining_in_maxlen, spec_decode_cap
+                effective_remaining = min(remaining_in_block, remaining_in_maxlen)
+
+                req_id = request.request_id
+                old_n = num_scheduled_tokens[req_id]
+                # Cap actual advance by boundary, then pad query
+                # window length via slide.
+                new_n = min(old_n, effective_remaining)
+                desired_slide = max_spec_decode_len - new_n
+
+                if desired_slide > 0:
+                    assert effective_remaining >= 1, (
+                        f"effective_remaining must be >= 1; req {req_id} has "
+                        f"remaining_in_block={remaining_in_block}, "
+                        f"remaining_in_maxlen={remaining_in_maxlen}"
+                    )
+
+                # Unified sliding-window decision (shared with the
+                # WAITING_FOR_REMOTE_KVS promotion path below).
+                slide_distance, cross_block_no_spec = self._decide_spec_slide(
+                    request, new_n
                 )
+                if cross_block_no_spec:
+                    # Backfill window crosses the KV block boundary -> full spec
+                    # impossible this step; elect no-spec (query_len=1) and let
+                    # the runner's cross-DP OR-reduce scrub slide on every rank.
+                    # (`_decide_spec_slide` already rejected fixed-length
+                    # proposers, which must never reach a cross-block step.)
+                    step_no_spec_required = True
+                    logger.debug(
+                        "spec-decode no-spec fallback (cross-block "
+                        "backfill): req=%s num_computed=%d "
+                        "tokens_used_in_block=%d slide=%d proposed_drafts=%d",
+                        req_id,
+                        request.num_computed_tokens,
+                        tokens_used_in_block,
+                        desired_slide,
+                        max(old_n - 1, 0),
+                    )
+                elif slide_distance > 0:
+                    # In-block backfill keeps full spec.
+                    spec_decode_slide_distance[req_id] = slide_distance
+                    # Diagnostic log so end-to-end runs make the
+                    # sliding decision observable. `proposed_drafts` is
+                    # what the proposer returned BEFORE any sliding-induced
+                    # trim (= old_n - 1); compare against `kept_drafts`
+                    # (= max(new_n - 1, 0)): proposed > kept ⇒ boundary
+                    # forced some drafts out; equal ⇒ only length padding.
+                    logger.debug(
+                        "spec-decode backfill: req=%s "
+                        "num_computed=%d remaining_in_block=%d "
+                        "remaining_in_maxlen=%d slide=%d "
+                        "advance=%d proposed_drafts=%d kept_drafts=%d",
+                        req_id,
+                        request.num_computed_tokens,
+                        remaining_in_block,
+                        remaining_in_maxlen,
+                        slide_distance,
+                        new_n,
+                        max(old_n - 1, 0),
+                        max(new_n - 1, 0),
+                    )
+
+                    if old_n > new_n:
+                        token_budget += old_n - new_n
+                        num_scheduled_tokens[req_id] = new_n
+                        num_spec = (
+                            new_n
+                            + request.num_computed_tokens
+                            - request.num_tokens
+                            - request.num_output_placeholders
+                        )
+                        if num_spec > 0 and req_id in scheduled_spec_decode_tokens:
+                            scheduled_spec_decode_tokens[req_id] = (
+                                scheduled_spec_decode_tokens[req_id][:num_spec]
+                            )
+                        elif num_spec <= 0:
+                            scheduled_spec_decode_tokens.pop(req_id, None)
 
             # Encoder-related.
             if encoder_inputs_to_schedule:
@@ -360,39 +645,12 @@ class RBLNScheduler(Scheduler):
             ):
                 break
 
-        # NOTE(RBLN): Retroactively apply spec_decode_cap to requests scheduled
-        # before the cap was tightened. Only needed when spec decode is active
-        # this step (scheduled_spec_decode_tokens non-empty), since that is when
-        # the runner pads all requests to max_spec_decode_len. A request processed
-        # earlier in the loop may have been allocated more tokens than
-        # spec_decode_cap allows; if left uncorrected, the runner would pad a
-        # constrained request up to that larger length, causing it to cross its
-        # block boundary.
-        if spec_decode_cap < self.block_size and scheduled_spec_decode_tokens:
-            for req in scheduled_running_reqs:
-                req_id = req.request_id
-                old_n = num_scheduled_tokens[req_id]
-                if old_n <= spec_decode_cap:
-                    continue
-                new_n = spec_decode_cap
-
-                token_budget += old_n - new_n
-                num_scheduled_tokens[req_id] = new_n
-
-                # Re-trim spec tokens to match the reduced token count.
-                num_spec = (
-                    new_n
-                    + req.num_computed_tokens
-                    - req.num_tokens
-                    - req.num_output_placeholders
-                )
-                if num_spec > 0:
-                    if req_id in scheduled_spec_decode_tokens:
-                        scheduled_spec_decode_tokens[req_id] = (
-                            scheduled_spec_decode_tokens[req_id][:num_spec]
-                        )
-                else:
-                    scheduled_spec_decode_tokens.pop(req_id, None)
+        # NOTE(RBLN): The legacy retroactive trim using spec_decode_cap is
+        # gone — under sliding-window scheduling each boundary-affected
+        # req has already been adjusted in-line (num_scheduled_tokens /
+        # scheduled_spec_decode_tokens trimmed when boundary detected, and
+        # slide_distance recorded for the runner to prepend past tokens).
+        # Reqs that fit a full num_spec_tokens+1 window are untouched.
 
         # Record the LoRAs in scheduled_running_reqs
         scheduled_loras: set[int] = set()
@@ -518,6 +776,17 @@ class RBLNScheduler(Scheduler):
                         + num_external_computed_tokens
                     )
                     assert num_computed_tokens <= request.num_tokens
+
+                    # Track first scheduled prefill, not post-preemption repeats.
+                    if request.prefill_stats is not None:
+                        assert num_computed_tokens <= request.num_prompt_tokens
+                        request.prefill_stats.set(
+                            num_prompt_tokens=request.num_prompt_tokens,
+                            num_local_cached_tokens=(
+                                num_new_local_computed_tokens + num_sub_block_tokens
+                            ),
+                            num_external_cached_tokens=num_external_computed_tokens,
+                        )
                 else:
                     # KVTransfer: WAITING reqs have num_computed_tokens > 0
                     # after async KV recvs are completed.
@@ -722,9 +991,6 @@ class RBLNScheduler(Scheduler):
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
-                # Count the number of prefix cached tokens.
-                if request.num_cached_tokens < 0:
-                    request.num_cached_tokens = num_computed_tokens
                 # Encoder-related.
                 if encoder_inputs_to_schedule:
                     scheduled_encoder_inputs[request_id] = encoder_inputs_to_schedule
@@ -742,8 +1008,48 @@ class RBLNScheduler(Scheduler):
                             self.ec_connector.update_state_after_alloc(request, i)
 
                 if promoted_from_waiting_for_remote_kvs:
-                    # NOTE(RBLN): We can continue to schedule the next request
-                    # because scheduled new request is added as decoding phase.
+                    # NOTE(RBLN): A request promoted from WAITING_FOR_REMOTE_KVS is
+                    # decode-ready: its prompt KV was prefilled on the remote
+                    # (producer) instance, so it joins as a single-token decode.
+                    #
+                    # PRIMARY guard: it must NOT be in prefill. A partial remote
+                    # match leaves a local "remainder prefill" (is_prefill) that
+                    # cannot mix into the (batch, num_spec+1) decode shape -- fail
+                    # loudly instead of silently corrupting
+                    # input_ids.view(num_reqs, -1) downstream. The num_new_tokens
+                    # == 1 check is the equivalent single-token precondition that
+                    # `_decide_spec_slide(new_n=1)` below relies on (given the
+                    # earlier `assert num_new_tokens > 0`).
+                    assert not is_prefill(request), (
+                        f"promoted remote-KV request {request_id} is still in "
+                        f"prefill (num_new_tokens={num_new_tokens}); a partial "
+                        "remote KV match leaves a local prefill remainder that "
+                        "cannot mix into the decode batch."
+                    )
+                    assert num_new_tokens == 1, (
+                        f"promoted remote-KV request {request_id} has "
+                        f"num_new_tokens={num_new_tokens} (expected 1)."
+                    )
+                    # This promotion path bypasses the running-loop spec/slide
+                    # block above, so apply the SAME sliding-window backfill via
+                    # the shared `_decide_spec_slide`. With spec decode on, every
+                    # decode query window is unified to num_spec_tokens+1; a
+                    # freshly promoted req carries 0 drafts, so without this
+                    # backfill its window stays length 1 while running peers run
+                    # at num_spec+1 and the runner would zero-pad it (garbage KV)
+                    # instead of re-feeding real past tokens. not is_prefill
+                    # (asserted) so the advance is never boundary-trimmed
+                    # (new_n == 1).
+                    if self.num_spec_tokens > 0:
+                        slide_distance, cross_block_no_spec = self._decide_spec_slide(
+                            request, new_n=1
+                        )
+                        if cross_block_no_spec:
+                            step_no_spec_required = True
+                        elif slide_distance > 0:
+                            spec_decode_slide_distance[request_id] = slide_distance
+                    # The scheduled new request is added as a decoding-phase req, so
+                    # we can continue to schedule the next request.
                     continue
 
                 # NOTE(RBLN): Reaching this point means that this request can now be
@@ -755,12 +1061,43 @@ class RBLNScheduler(Scheduler):
                 # be scheduled together with the other running requests in the decoding
                 # phase.
                 for req in scheduled_running_reqs:
-                    req_to_new_blocks.pop(req.request_id)
+                    evicted_blocks = req_to_new_blocks.pop(req.request_id)
                     num_scheduled_tokens.pop(req.request_id)
                     req.spec_token_ids = scheduled_spec_decode_tokens.pop(
                         req.request_id, []
                     )
                     scheduled_encoder_inputs.pop(req.request_id, None)
+                    # NOTE(RBLN): The evicted decode may have been assigned a
+                    # sliding-window backfill (spec_decode_slide_distance) by the
+                    # running loop earlier this step. It is being dropped from
+                    # num_scheduled_tokens, so its per-step slide entry MUST be
+                    # dropped too -- unlike the block delta above there is nothing
+                    # to restore (the slide is recomputed next step when the req
+                    # is re-scheduled). Leaving it behind makes the scheduler
+                    # output carry a slide for a req that is not scheduled; the
+                    # runner then over-counts num_input_tokens (total_num_scheduled
+                    # + sum(slide)) while the pad window only accounts for the
+                    # scheduled reqs. A prefill evictor is absorbed by the fixed
+                    # DP-prefill pad, but a PDD num_new==1 (decode-classified)
+                    # evictor leaves an all-decode step whose tight spec pad
+                    # (pad_speculative_draft_tokens) then overflows index_copy.
+                    spec_decode_slide_distance.pop(req.request_id, None)
+
+                    # NOTE(RBLN): The block delta allocated for this evicted
+                    # request is already committed in the coordinator but is
+                    # being dropped from this step's output. Stash it (merging
+                    # with any delta stranded on a previous consecutive
+                    # eviction) so it is re-emitted to the runner on the
+                    # request's next scheduled step. Skip empty deltas.
+                    if evicted_blocks is not None and any(
+                        len(g) > 0 for g in evicted_blocks.get_block_ids()
+                    ):
+                        prev = self._stranded_new_blocks.get(req.request_id)
+                        self._stranded_new_blocks[req.request_id] = (
+                            prev + evicted_blocks
+                            if prev is not None
+                            else evicted_blocks
+                        )
 
                 scheduled_running_reqs.clear()
                 token_budget = prefill_token_budget
@@ -841,6 +1178,22 @@ class RBLNScheduler(Scheduler):
                 for req in scheduled_new_reqs
             ]
 
+        # NOTE(RBLN): Re-emit any block delta that was stranded when a running
+        # request was evicted by the "disable mixed batching" path on a prior
+        # step. The coordinator already holds these blocks, so this step's
+        # `allocate_slots` returned an empty delta for them; prepending the
+        # stranded delta (allocated earlier) ahead of this step's delta keeps
+        # the runner's block table in sync (the runner appends deltas in
+        # order). Only requests actually scheduled this step (cached/running)
+        # carry their delta to the runner, so drain on emit.
+        if self._stranded_new_blocks:
+            for req in scheduled_running_reqs:
+                stranded = self._stranded_new_blocks.pop(req.request_id, None)
+                if stranded is not None:
+                    req_to_new_blocks[req.request_id] = (
+                        stranded + req_to_new_blocks[req.request_id]
+                    )
+
         with record_function_or_nullcontext("schedule: make_cached_request_data"):
             cached_reqs_data = self._make_cached_request_data(
                 scheduled_running_reqs,
@@ -876,6 +1229,8 @@ class RBLNScheduler(Scheduler):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
+            step_no_spec_required=step_no_spec_required,
+            spec_decode_slide_distance=spec_decode_slide_distance,
         )
 
         # Drain pending copy ops from the KV cache manager.
@@ -907,6 +1262,24 @@ class RBLNScheduler(Scheduler):
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
         return scheduler_output
+
+    def _free_request(
+        self, request: Request, delay_free_blocks: bool = False
+    ) -> dict[str, Any] | None:
+        # Drop any block delta stashed for re-emit; the request is finishing and
+        # will never be scheduled again, so the stash would otherwise leak.
+        self._stranded_new_blocks.pop(request.request_id, None)
+        return super()._free_request(request, delay_free_blocks)
+
+    def _preempt_request(self, request: Request, timestamp: float) -> None:
+        # Preemption frees ALL of the request's blocks (kv_cache_manager.free),
+        # including any block stashed for re-emit. The request lives on and may
+        # later re-enter the decode batch, where the merge would otherwise
+        # prepend a now-freed (and possibly reused) block id to its block table.
+        # Drop the stash so the resumed request relies solely on the fresh
+        # block ids sent on resume.
+        self._stranded_new_blocks.pop(request.request_id, None)
+        super()._preempt_request(request, timestamp)
 
     def update_from_output(
         self,

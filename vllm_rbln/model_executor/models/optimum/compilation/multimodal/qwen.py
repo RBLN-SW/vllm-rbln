@@ -15,25 +15,36 @@
 
 
 def get_param_qwen2_vl(
-    batch_size: int, max_model_len: int, block_size: int, tp_size: int
+    batch_size: int,
+    max_model_len: int,
+    block_size: int,
+    num_devices: int,
+    prefill_chunk_size: int | None = None,
 ) -> dict:
     # Max sequence length for Vision Transformer (ViT), representing the number of patches in an image. # noqa: E501
     # Example: For a 224x224 pixel image with patch size 14,
-    # this produces 256 patches [(224/14) * (224/14)]. Thus, max_seq_lens must be at least 256. # noqa: E501
-    # RBLN optimization processes inference per image or video frame, so set max_seq_lens to # noqa: E501
+    # this produces 256 patches [(224/14) * (224/14)]. Thus, max_seq_len must be at least 256. # noqa: E501
+    # RBLN optimization processes inference per image or video frame, so set max_seq_len to # noqa: E501
     # match the maximum expected resolution to optimize computation.
     param = {
         "visual": {
-            "max_seq_lens": 6400,
+            # if num_devices of submodule is not specified,
+            # it inherits num_devices of main module.
+            "max_seq_len": 6400,
         },
-        "tensor_parallel_size": tp_size,
+        "num_devices": num_devices,
         "max_seq_len": max_model_len,
         "batch_size": batch_size,
+        "use_inputs_embeds": True,
     }
     if block_size != max_model_len:
         attn_impl = "flash_attn" if block_size != max_model_len else "eager"
         param["kvcache_partition_len"] = block_size
         param["attn_impl"] = attn_impl
+    # Pin prefill_chunk_size so the compiled model stays in sync with the value
+    # used for KV-cache block padding.
+    if prefill_chunk_size is not None:
+        param["prefill_chunk_size"] = prefill_chunk_size
     return param
 
 

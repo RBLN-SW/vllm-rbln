@@ -97,3 +97,14 @@ def test_get_attn_backend_cls():
         f"Expected 'vllm_rbln.attention.backends.flash_attention.\
         RBLNAttentionBackend', got {attn_backend_cls}"
     )
+
+
+def test_get_nixl_supported_devices():
+    """0.22 NIXL P/D: the platform advertises both host-bounce (cpu) and
+    D2D (rbln) kv_buffer devices, each reachable from the other."""
+    from vllm_rbln.platform import RblnPlatform
+
+    assert RblnPlatform.get_nixl_supported_devices() == {
+        "cpu": ("cpu", "rbln"),
+        "rbln": ("rbln", "cpu"),
+    }

@@ -63,6 +63,12 @@ def get_vllm_config(async_scheduling=False):
         cache_config=cache_config,
         model_config=model_config,
         scheduler_config=scheduler_config,
+        additional_config={
+            "prefix_block_size": 4,
+            "rbln_config": {
+                "prefill_chunk_size": 4,
+            },
+        },
     )
     return vllm_config
 

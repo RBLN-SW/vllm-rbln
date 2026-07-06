@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import sys
-import types
 from collections.abc import Callable
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -88,14 +86,8 @@ def test_init_creates_compile_context_with_weight_sharing(monkeypatch):
         self.vllm_config = vllm_config
         self.device = device
 
-    rebel_module = types.ModuleType("rebel")
-    compile_context_module = types.ModuleType("rebel.compile_context")
-    compile_context_module.CompileContext = compile_context_ctor  # type: ignore[attr-defined]
-    rebel_module.compile_context = compile_context_module  # type: ignore[attr-defined]
-
     monkeypatch.setattr(MedusaProposer, "__init__", fake_super_init)
-    monkeypatch.setitem(sys.modules, "rebel", rebel_module)
-    monkeypatch.setitem(sys.modules, "rebel.compile_context", compile_context_module)
+    monkeypatch.setattr(medusa_module, "CompileContext", compile_context_ctor)
 
     vllm_config = object()
     device = torch.device("cpu")
@@ -222,7 +214,7 @@ def test_compile_model_builds_expected_rbln_compile_options(
     monkeypatch.setattr(medusa_module, "get_tp_group", lambda: tp_group)
     monkeypatch.setattr(medusa_module, "get_pp_group", lambda: pp_group)
     monkeypatch.setattr(medusa_module, "get_dp_group", lambda: dp_group)
-    monkeypatch.setattr(medusa_module.envs, "VLLM_RBLN_TP_SIZE", 8)
+    monkeypatch.setattr(medusa_module.envs, "VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK", 8)
     monkeypatch.setattr(
         medusa_module.envs, "VLLM_DISABLE_COMPILE_CACHE", disable_compile_cache
     )

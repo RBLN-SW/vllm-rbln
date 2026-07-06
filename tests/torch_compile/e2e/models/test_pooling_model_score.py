@@ -13,9 +13,8 @@
 # limitations under the License.
 
 import pytest
-from vllm import LLM
 
-from ..utils import patch_and_run
+from ..utils import managed_llm
 
 LLM_PARAMS = [
     {
@@ -34,7 +33,17 @@ LLM_PARAMS = [
 ]
 
 
-def run_vllm_score(llm_kwargs: dict) -> None:
+@pytest.mark.parametrize("llm_params", LLM_PARAMS)
+def test_pooling_model_score(
+    monkeypatch: pytest.MonkeyPatch,
+    llm_params: dict,
+) -> None:
+    env = {
+        "VLLM_RBLN_USE_VLLM_MODEL": "1",
+        "VLLM_DISABLE_COMPILE_CACHE": "1",
+        "VLLM_RBLN_COMPILE_STRICT_MODE": "1",
+    }
+
     prefix = (
         "<|im_start|>system\nJudge whether the Document meets the "
         + "requirements based on the Query and the Instruct provided. "
@@ -68,9 +77,8 @@ def run_vllm_score(llm_kwargs: dict) -> None:
         document_template.format(doc=doc, suffix=suffix) for doc in documents
     ]
 
-    llm = LLM(runner="pooling", **llm_kwargs)
-
-    outputs = llm.score(templated_queries, templated_documents)
+    with managed_llm(monkeypatch, env, runner="pooling", **llm_params) as llm:
+        outputs = llm.score(templated_queries, templated_documents)
 
     assert outputs[0].outputs.score > 0.8, (
         f"Score ({outputs[0].outputs.score}) should be large."
@@ -84,17 +92,3 @@ def run_vllm_score(llm_kwargs: dict) -> None:
         f"Score ({outputs[2].outputs.score}) should be large."
         f" <Query>: {queries[2]} <Document>: {documents[2]}."
     )
-
-
-@pytest.mark.parametrize("llm_params", LLM_PARAMS)
-def test_pooling_model_score(
-    monkeypatch: pytest.MonkeyPatch,
-    llm_params: dict,
-) -> None:
-    env = {
-        "VLLM_RBLN_USE_VLLM_MODEL": "1",
-        "VLLM_DISABLE_COMPILE_CACHE": "1",
-        "VLLM_RBLN_COMPILE_STRICT_MODE": "1",
-    }
-
-    patch_and_run(monkeypatch, env, run_vllm_score, llm_kwargs=llm_params)

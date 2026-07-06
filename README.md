@@ -31,12 +31,12 @@ You can install this project using `pip` or from source.
 
 ##### Using uv
 ```bash
-uv pip install vllm-rbln --extra-index-url https://wheels.vllm.ai/0.18.0/cpu --torch-backend cpu
+uv pip install vllm-rbln --extra-index-url https://wheels.vllm.ai/0.22.0/cpu --torch-backend cpu
 ```
 
 ##### Using pip
 ```bash
-pip install vllm-rbln --extra-index-url https://wheels.vllm.ai/0.18.0/cpu --extra-index-url https://download.pytorch.org/whl/cpu
+pip install vllm-rbln --extra-index-url https://wheels.vllm.ai/0.22.0/cpu --extra-index-url https://download.pytorch.org/whl/cpu
 ```
 
 #### Or from source
@@ -52,7 +52,7 @@ uv pip install -e .
 ```bash
 git clone https://github.com/rbln-sw/vllm-rbln.git
 cd vllm-rbln
-pip install -e . --extra-index-url https://wheels.vllm.ai/0.18.0/cpu --extra-index-url https://download.pytorch.org/whl/cpu
+pip install -e . --extra-index-url https://wheels.vllm.ai/0.22.0/cpu --extra-index-url https://download.pytorch.org/whl/cpu
 ```
 
 ### 📚 Documentation

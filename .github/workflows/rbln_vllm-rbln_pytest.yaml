@@ -125,6 +125,11 @@ jobs:
                 SKIP=true
               fi
               ;;
+            "models")
+              if [[ "$COMMIT_MESSAGE" == *"[skip models]"* ]]; then
+                SKIP=true
+              fi
+              ;;
           esac
           
           echo "skip=$SKIP" >> $GITHUB_OUTPUT
@@ -219,6 +224,10 @@ jobs:
               name : "sampler",
               runner : "rbln-sw-k8s-ca22-1"
             },
+            {
+              name : "models",
+              runner : "rbln-sw-k8s-ca22-1"
+            },
           ]
     steps:
       - name: Checkout the vllm-rbln repository
@@ -275,6 +284,11 @@ jobs:
                 SKIP=true
               fi
               ;;
+            "models")
+              if [[ "$COMMIT_MESSAGE" == *"[skip models]"* ]]; then
+                SKIP=true
+              fi
+              ;;
           esac
           
           echo "skip=$SKIP" >> $GITHUB_OUTPUT
@@ -318,7 +332,7 @@ jobs:
           shell: bash
           command: |
             VLLM_CPU_URL="${{ steps.parse_index_url.outputs.VLLM_CPU_URL }}"
-            uv pip install --system packaging setuptools wheel simphile pynvml huggingface_hub setuptools_scm fire pytest pytest-asyncio pytest-xdist
+            uv pip install --system packaging setuptools wheel simphile pynvml huggingface_hub setuptools_scm fire pytest pytest-asyncio pytest-xdist pytest-timeout
             if [ -n "${{ inputs.optimum_rbln_version }}" ]; then
               uv pip install --system --force-reinstall --no-cache-dir dist/vllm_rbln*.whl --constraint <(echo "optimum-rbln==${{ inputs.optimum_rbln_version }}") --index-url http://pypi-cache.devpi.svc.cluster.local/root/pypi/+simple/ --extra-index-url "${VLLM_CPU_URL}" --extra-index-url https://download.pytorch.org/whl/cpu  --extra-index-url https://pypi.org/simple --index-strategy unsafe-best-match
               echo "optimum-rbln ${{ inputs.optimum_rbln_version }}"
@@ -334,7 +348,7 @@ jobs:
         run: |
           case "${{ matrix.test_type.name }}" in
             "openai")
-              pytest tests/entrypoints/openai -vv --durations 0
+              pytest tests/entrypoints/openai -vv --durations 0 --timeout=600
               ;;
             "llm")
               pytest tests/entrypoints/llm -vv --durations 0
@@ -343,6 +357,9 @@ jobs:
               pytest -n auto -k "warm_up_true" tests/v1/worker/test_sampler.py -vv --durations 0
               pytest -n auto -k "warm_up_false" tests/v1/worker/test_sampler.py -vv --durations 0
               pytest -n auto -k "not warm_up_true and not warm_up_false" tests/v1/worker/test_sampler.py -vv --durations 0
+              ;;
+            "models")
+              pytest tests/v1/models -vv --durations 0
               ;;
           esac
 

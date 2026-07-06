@@ -15,8 +15,9 @@
 
 import torch
 import torch.nn.functional as F
-from vllm.lora.layers import VocabParallelEmbeddingWithLoRA
+from vllm.lora.layers import VocabParallelEmbeddingWithLoRA, column_parallel_linear
 from vllm.lora.layers.base_linear import BaseLinearLayerWithLoRA
+from vllm.lora.layers.column_parallel_linear import ColumnParallelLinearWithLoRA
 
 
 def base_linear_patched_apply(
@@ -37,6 +38,37 @@ def base_linear_patched_apply(
     )
 
     return lora_output.view(output_org_shape)
+
+
+def rbln_mcp_patched_apply(
+    x: torch.Tensor,
+    bias: torch.Tensor | None,
+    layer: ColumnParallelLinearWithLoRA,
+) -> torch.Tensor:
+    output = layer.base_layer.quant_method.apply(layer.base_layer, x, bias)
+
+    x = x.reshape(-1, x.shape[-1])
+    output_org_shape = output.shape
+    output = output.reshape(-1, output.shape[-1])
+
+    lora_output = layer.punica_wrapper.add_lora_linear(
+        output,
+        x,
+        layer.lora_a_stacked,
+        layer.lora_b_stacked,
+        1.0,
+        layer.output_slices,
+    )
+
+    return lora_output.view(output_org_shape)
+
+
+def column_parallel_patched_apply(
+    self: ColumnParallelLinearWithLoRA,
+    x: torch.Tensor,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return rbln_mcp_patched_apply(x, bias, self)
 
 
 def vocab_parallel_embedding_patched_forward(
@@ -73,4 +105,6 @@ def vocab_parallel_embedding_patched_forward(
 
 
 BaseLinearLayerWithLoRA.apply = base_linear_patched_apply
+column_parallel_linear._mcp_apply = rbln_mcp_patched_apply
+ColumnParallelLinearWithLoRA.apply = column_parallel_patched_apply
 VocabParallelEmbeddingWithLoRA.forward = vocab_parallel_embedding_patched_forward

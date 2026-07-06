@@ -16,21 +16,20 @@ from copy import copy
 
 import torch
 import torch.nn as nn
+from rebel import CompileContext
 from vllm.config import VllmConfig
 from vllm.distributed import get_dp_group, get_pp_group, get_tp_group
-from vllm.forward_context import set_forward_context
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.medusa import MedusaProposer
 
 import vllm_rbln.rbln_envs as envs
+from vllm_rbln.forward_context import set_forward_context
 from vllm_rbln.torch_compile_backend import logged_rbln_backend
 
 
 class RBLNMedusaProposer(MedusaProposer):
     def __init__(self, vllm_config: VllmConfig, device: torch.device) -> None:
         super().__init__(vllm_config, device)
-
-        from rebel.compile_context import CompileContext
 
         self.compile_context = CompileContext(use_weight_sharing=True)
 
@@ -65,7 +64,7 @@ class RBLNMedusaProposer(MedusaProposer):
 
         options = {
             "compile_context": self.compile_context,
-            "tensor_parallel_size": envs.VLLM_RBLN_TP_SIZE,
+            "tensor_parallel_size": envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
             "process_group_dict": process_group_dict,
             "guard_filter_fn": torch.compiler.keep_tensor_guards_unsafe,
             "mode": "strict",
@@ -74,6 +73,8 @@ class RBLNMedusaProposer(MedusaProposer):
             options["model_trace_method"] = "export"
         if not envs.VLLM_DISABLE_COMPILE_CACHE:
             options["cache_dir"] = os.path.join(envs.VLLM_CACHE_ROOT, "rbln")
+        if envs.VLLM_RBLN_COMPILE_ONLY:
+            options["mode"] = ["strict", "compile_only"]
 
         return torch.compile(
             model,
