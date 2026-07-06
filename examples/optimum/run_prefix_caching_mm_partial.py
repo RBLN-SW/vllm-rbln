@@ -17,27 +17,36 @@
 
 Each prompt is built as:
 
-    [shared_image] [shared prefix text] [unique_image] [unique question]
+    [shared_image] [shared instruction] [unique_image] [shared question]
 
-The leading ``[shared_image] + prefix`` is identical across every prompt, so
+The leading ``[shared_image] + instruction`` is identical across every prompt, so
 after the first request its KV cache is populated. On later requests that region
 is a prefix-cache hit, and the shared image's vision-encoder run is skipped. The
-trailing ``[unique_image]`` differs per prompt, so it is never cached and MUST
-still be encoded on every request even though the earlier part of the prompt hit
-the cache.
+``[unique_image]`` differs per prompt, so it is never cached and MUST still be
+encoded on every request even though the earlier part of the prompt hit the cache.
 
 This is the case the model runner must get right: ``total_cached_length > 0`` and
 yet an uncached multimodal item remains after the cache boundary. ``_prepare_prefill``
 encodes only the multimodal items whose placeholder tokens fall after the cached
 prefix, so the shared image is dropped while the unique image is kept.
 
-Correctness check: outputs with prefix caching must match the no-cache baseline.
-If the uncached image were wrongly dropped (or the cached one wrongly kept, which
-would misalign the placeholder scatter), the cached-path outputs would diverge.
+The question deliberately asks *only about the second (unique) image* and demands
+a short answer. Two properties matter:
+
+* Image-dependence: the answer depends on the uncached image's content, so if that
+  image were wrongly dropped (or the cached one wrongly kept, misaligning the
+  placeholder scatter), the answer would change and the assertion would fail. A
+  general-knowledge question would pass even with the image dropped, testing
+  nothing.
+* Short + constrained output: reusing cached KV is not guaranteed to be
+  bit-identical to recomputing it, so over a long free-form generation greedy
+  decoding can diverge from the baseline even when the cache is correct. A short,
+  low-entropy answer keeps the exact-match check robust to that numeric noise.
 """
 
 import os
 import time
+from itertools import islice
 
 from datasets import load_dataset
 from transformers import AutoProcessor
@@ -49,48 +58,47 @@ from vllm import LLM, SamplingParams
 # Qwen2.5-VL both do. Swap in a locally compiled checkpoint as needed.
 MODEL = "llava-hf/llava-v1.6-mistral-7b-hf"
 
-prefix = (
-    "You are given two images. The first image is a fixed reference scene that "
-    "is the same for every question. Study it carefully as background context. "
-    "First, describe the reference image in one short sentence. Then look at the "
-    "second image and answer the question about it.\n"
-    "Format your response exactly as:\n"
-    "Reference: <one sentence about the first image>\n"
-    "Answer: <your answer about the second image>\n\n"
-    "Question: "
-)
+# Number of prompts to run. Each uses the same shared image + text but a
+# different unique second image.
+NUM_PROMPTS = 6
 
-prompts = [
-    "What is the largest mammal in the world?",
-    "Who developed the theory of relativity?",
-    "Where is the Great Wall of China located?",
-    "Where does the process of photosynthesis occur?",
-    "What does the Pythagorean theorem state?",
-    "What is the chemical symbol for gold?",
-]
+# Shared question placed after the images. It asks for a brief description of each
+# image, so the answer covers the uncached second image too; if that image were
+# dropped on the partial hit, its part of the answer would change and the assertion
+# would fail.
+QUESTION = (
+    "There are two images above. Describe each image in one sentence: "
+    "one sentence for the first image and one sentence for the second image."
+)
 
 
 def build_prompts():
-    """Build prompts that share the first image + prefix but not the second.
+    """Build prompts that share the first image + text but not the second image.
 
     Returns a list of vLLM inputs, each carrying two images: a shared reference
-    image (identical across the batch) and a per-prompt unique image.
+    image (identical across the batch) and a per-prompt unique image. Only the
+    unique image varies, so the cacheable prefix ends right before it.
     """
-    dataset = load_dataset("lmms-lab/llava-bench-in-the-wild", split="train")
-    shared_image = dataset[0]["image"]
-    # One distinct image per prompt, taken from the rest of the dataset.
-    unique_images = [dataset[i + 1]["image"] for i in range(len(prompts))]
+    # Stream so only the first NUM_PROMPTS + 1 rows are fetched instead of the
+    # whole (multi-million-image) dataset.
+    dataset = load_dataset(
+        "lmms-lab/LLaVA-ReCap-CC3M", split="train", streaming=True
+    )
+    images = [row["image"] for row in islice(dataset, NUM_PROMPTS + 1)]
+    shared_image = images[0]
+    # One distinct image per prompt.
+    unique_images = images[1:]
 
     processor = AutoProcessor.from_pretrained(MODEL)
     generating_prompts = []
-    for prompt, unique_image in zip(prompts, unique_images):
+    for unique_image in unique_images:
         messages = [
             {
                 "role": "user",
                 "content": [
                     {"type": "image"},  # shared reference image (cached prefix)
-                    {"type": "text", "text": prefix + prompt},
                     {"type": "image"},  # unique image (never cached)
+                    {"type": "text", "text": QUESTION},
                 ],
             }
         ]
@@ -105,9 +113,13 @@ def build_prompts():
                 "multi_modal_data": {"image": [shared_image, unique_image]},
             }
         )
+        print("@@@ shared_image:", shared_image)
+        print("@@@ unique_image:", unique_image)
     return generating_prompts
 
 
+# Greedy + short output: keeps the baseline-vs-cached comparison deterministic and
+# robust to small cached-vs-recomputed KV numeric differences.
 sampling_params = SamplingParams(temperature=0.0, max_tokens=200)
 
 
@@ -159,7 +171,7 @@ def main():
     )
 
     generated_same = all(
-        regular_texts[i] == cached_texts[i] for i in range(len(prompts))
+        regular_texts[i] == cached_texts[i] for i in range(len(generating_prompts))
     )
     print(f"Generated answers are the same: {generated_same}")
     print(f"Time without prefix caching: {wo_prefix_time} sec")

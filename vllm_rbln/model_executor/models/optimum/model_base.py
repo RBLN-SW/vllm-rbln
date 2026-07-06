@@ -188,8 +188,6 @@ class RBLNOptimumModelBase(nn.Module):
             valid_path = cached_model_path
         else:
             valid_path = None
-        print("@@@@ max_model_len:", self.model_config.max_model_len)
-        print("@@@@ num_devices", envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK)
         if valid_path is not None:
             # pre-compiled OR cache-hit
             model_cls = getattr(optimum.rbln, model_cls_name)
@@ -574,6 +572,21 @@ class RBLNOptimumMultimodalMixin(SupportsMultiModal):
         mm_embeds = torch.cat(list(multimodal_embeddings)).to(
             inputs_embeds.device, inputs_embeds.dtype
         )
+        # The scatter assumes one embedding per placeholder token. A mismatch means
+        # masked_scatter would misalign (it silently consumes only the first
+        # ``num_placeholders`` embeddings when there are too many), corrupting the
+        # inputs. This happens if a prefix-cache boundary splits a multimodal item
+        # so only part of its placeholders remain while its full embeddings are
+        # still provided; the scheduler must clamp the cache boundary to avoid it.
+        num_placeholders = int(is_multimodal.sum())
+        if num_placeholders != mm_embeds.shape[0]:
+            raise ValueError(
+                "Multimodal placeholder/embedding count mismatch: "
+                f"{num_placeholders} placeholder positions but "
+                f"{mm_embeds.shape[0]} multimodal embeddings. A prefix-cache "
+                "boundary likely split a multimodal item; the cached prefix must "
+                "not fall inside an image's placeholder range."
+            )
         scatter_mask = is_multimodal.unsqueeze(-1).expand_as(inputs_embeds)
         return inputs_embeds.masked_scatter(scatter_mask, mm_embeds)
 

@@ -245,6 +245,44 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         """Create video embedding inputs based on model type"""
         pass
 
+    def _assert_mm_tokens_match(self, input_ids, image_input, video_input) -> None:
+        """Guard that placeholder count matches the embed-token count.
+
+        Mirrors the check in ``embed_input_ids`` for the shared models. Qwen-VL
+        scatters the visual embeddings inside optimum-rbln, so instead we compare
+        the multimodal placeholder count in (the possibly trimmed) ``input_ids``
+        against the number of embed tokens implied by each item's ``grid_thw``.
+        A mismatch means a prefix-cache boundary split a multimodal item so only
+        part of its placeholders remain while its full embeddings are still
+        produced; the scheduler must clamp the boundary to avoid it. Skipped when
+        the config's token ids / merge size are unavailable.
+        """
+        config = getattr(self.model, "config", None)
+        vision_config = getattr(config, "vision_config", None)
+        merge_size = getattr(vision_config, "spatial_merge_size", None)
+        if merge_size is None:
+            return
+
+        for mm_input, grid_key, token_id in (
+            (image_input, "image_grid_thw", getattr(config, "image_token_id", None)),
+            (video_input, "video_grid_thw", getattr(config, "video_token_id", None)),
+        ):
+            if mm_input is None or token_id is None:
+                continue
+            grid_thw = mm_input.get(grid_key)
+            if grid_thw is None:
+                continue
+            expected = int((grid_thw.prod(dim=-1) // (merge_size**2)).sum())
+            actual = int((input_ids == token_id).sum())
+            if expected != actual:
+                raise ValueError(
+                    f"Multimodal placeholder/embedding count mismatch for token "
+                    f"{token_id}: {actual} placeholder positions but {expected} "
+                    f"embed tokens. A prefix-cache boundary likely split a "
+                    f"multimodal item; the cached prefix must not fall inside its "
+                    f"placeholder range."
+                )
+
     def build_prefill_forward_inputs(
         self,
         model_input: ModelInputForRBLN,
@@ -260,6 +298,8 @@ class RBLNOptimumQwenVLForConditionalGeneration(
             video_input = self._parse_and_validate_video_input(
                 **model_input.multi_modal_kwargs
             )
+
+        self._assert_mm_tokens_match(input_ids, image_input, video_input)
 
         attention_mask = torch.ones_like(input_ids)
         prefill_params = self.preprocess_prefill(

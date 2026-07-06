@@ -394,7 +394,12 @@ class RBLNOptimumScheduler(Scheduler):
                         new_computed_blocks,
                         num_new_local_computed_tokens,
                     )
-
+                    # Keep the cache boundary from splitting a multimodal item.
+                    cached_block_table, cached_length = (
+                        self._clamp_cached_blocks_to_mm_boundary(
+                            request, cached_block_table, cached_length
+                        )
+                    )
                     # Update the block table to the return output.
                     self.update_block_table_dict(request, block_table_dict)
 
@@ -645,6 +650,64 @@ class RBLNOptimumScheduler(Scheduler):
         request_id = request.request_id
         block_table = self.kv_cache_manager.get_block_table(request_id)
         block_table_dict[request_id] = block_table
+
+    def _clamp_cached_blocks_to_mm_boundary(
+        self,
+        request: Request,
+        cached_block_table: list[int],
+        cached_length: list[int],
+    ) -> tuple[list[int], list[int]]:
+        """Shrink the cached prefix so its boundary never splits a multimodal item.
+
+        The cache boundary is quantized to ``ib_size`` (``cache_config.block_size``)
+        tokens, but image placeholder ranges are not necessarily block-aligned. If
+        the boundary landed inside an image, that image would be only partially
+        cached: the prefill re-encodes the whole image, yet only its trailing
+        placeholders remain in the trimmed input, so the multimodal embeddings would
+        scatter out of alignment. Clamp the boundary down to a block boundary at or
+        before the start of the earliest straddled item, so every image is either
+        fully cached or fully re-encoded.
+        """
+        if not request.mm_features or not cached_length:
+            return cached_block_table, cached_length
+
+        ib_size = self.cache_config.block_size
+        mm_ranges = [
+            (f.mm_position.offset, f.mm_position.length) for f in request.mm_features
+        ]
+
+        boundary = sum(cached_length)
+        original_boundary = boundary
+        # Re-check after each clamp: moving the boundary before one item may still
+        # leave it inside an earlier one.
+        changed = True
+        while changed:
+            changed = False
+            for offset, length in mm_ranges:
+                if offset < boundary < offset + length:
+                    boundary = (offset // ib_size) * ib_size
+                    changed = True
+                    break
+
+        if boundary >= original_boundary:
+            return cached_block_table, cached_length
+
+        # Rebuild the (block, length) prefix so its token total equals `boundary`.
+        new_block_table: list[int] = []
+        new_length: list[int] = []
+        acc = 0
+        for block, length in zip(cached_block_table, cached_length):
+            if acc + length <= boundary:
+                new_block_table.append(block)
+                new_length.append(length)
+                acc += length
+            else:
+                remainder = boundary - acc
+                if remainder > 0:
+                    new_block_table.append(block)
+                    new_length.append(remainder)
+                break
+        return new_block_table, new_length
 
     def _preempt_request(
         self,
