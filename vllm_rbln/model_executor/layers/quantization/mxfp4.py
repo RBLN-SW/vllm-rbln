@@ -28,9 +28,7 @@ from vllm.model_executor.layers.quantization.mxfp4 import (
     Mxfp4MoeBackend,
 )
 
-from vllm_rbln import envs
 from vllm_rbln.logger import init_logger
-from vllm_rbln.model_executor.layers.fused_moe.utils import get_tokens_mask
 
 logger = init_logger(__name__)
 
@@ -50,14 +48,10 @@ def custom_moe_glu_mxfp4(
     down_proj_blocks: torch.Tensor,
     down_proj_scales: torch.Tensor,
     down_proj_bias: torch.Tensor,
-    router_logits: torch.Tensor,
-    scoring_func: str,
+    masked_routing_weights: torch.Tensor,
     alpha: torch.Tensor,
     limit: torch.Tensor,
-    k: int,
-    post_norm: bool = True,
     expert_map: torch.Tensor | None = None,
-    dp_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     MoE GLU operation for GPT-OSS with mxfp4 quantization and swigluoai activation.
@@ -73,8 +67,9 @@ def custom_moe_glu_mxfp4(
     - down_proj_blocks: uint8 [num_experts, hidden_size, intermediate_size // 2]
     - down_proj_scales: [num_experts, hidden_size, intermediate_size // 32]
     - down_proj_bias: [num_experts, hidden_size]
-    - router_logits: [num_tokens, num_experts]
-    - scoring_func: str
+    - masked_routing_weights: [num_experts, num_tokens]
+      Pre-scored routing weights (top-k + softmax already applied by the caller);
+      the kernel does NOT route internally. (token dim may be padded to 64-align)
     - alpha: [], constant
     - limit: [], constant
     - expert_map: [num_experts],
@@ -99,14 +94,10 @@ def custom_moe_glu_mxfp4_fake(
     down_proj_blocks: torch.Tensor,
     down_proj_scales: torch.Tensor,
     down_proj_bias: torch.Tensor,
-    router_logits: torch.Tensor,
-    scoring_func: str,
+    masked_routing_weights: torch.Tensor,
     alpha: torch.Tensor,
     limit: torch.Tensor,
-    k: int,
-    post_norm: bool = True,
     expert_map: torch.Tensor | None = None,
-    dp_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
 
@@ -205,23 +196,22 @@ class RBLNGptOssMxfp4MoEMethod(GptOssMxfp4MoEMethod):
         if layer.activation != MoEActivation.SWIGLUOAI:
             raise NotImplementedError(layer.activation)
 
+        # router_logits is now pre-computed masked_routing_weights
+        # (topk + softmax already done in fused_moe_forward_rbln)
         orig_shape = x.shape
         num_tokens = orig_shape[:-1].numel()
         hidden_states = x.reshape(num_tokens, -1)
-        router_logits = router_logits.reshape(num_tokens, -1)
+        masked_routing_weights = router_logits
 
-        # Pre-score routing inputs at caller side; compiler custom op routing
-        # expects already-scored values (no sigmoid applied inside the kernel).
-        assert layer.scoring_func is not None, "FusedMoE.scoring_func must be set"
-        assert layer.scoring_func in {"softmax", "sigmoid"}
-        if layer.scoring_func == "sigmoid":
-            router_logits = torch.sigmoid(router_logits.to(torch.float32)).to(
-                router_logits.dtype
+        expert_map_const = None
+        if layer.expert_map is not None:
+            assert getattr(layer, "expert_map_const", None) is not None
+            # Keep tensor ops only: .tolist() + torch.tensor(list) graph-breaks
+            # under PyTorch 2.10+ Dynamo when capture_scalar_outputs is false
+            # (pytorch#163807); expert_map_const is precomputed in __init__.
+            expert_map_const = torch.tensor(
+                layer.expert_map_const, dtype=torch.int32
             )
-
-        tokens_mask = (
-            get_tokens_mask(num_tokens) if envs.VLLM_RBLN_USE_MOE_TOKENS_MASK else None
-        )
 
         out = torch.ops.rbln_custom_ops.custom_moe_glu_mxfp4(
             hidden_states,
@@ -234,14 +224,10 @@ class RBLNGptOssMxfp4MoEMethod(GptOssMxfp4MoEMethod):
             layer.down_proj_blocks,
             layer.down_proj_scales,
             layer.down_proj_bias,
-            router_logits,
-            layer.scoring_func,
+            masked_routing_weights,
             self.swiglu_alpha,
             self.swiglu_limit,
-            layer.top_k,
-            layer.renormalize,
-            layer.expert_map,
-            tokens_mask,
+            expert_map_const,
         )
         return out.reshape(orig_shape)
 

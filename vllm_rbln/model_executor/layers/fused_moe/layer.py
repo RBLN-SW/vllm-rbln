@@ -214,6 +214,14 @@ class RBLNFusedMoE(FusedMoE):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+
+        # Precompute expert_map as a Python list so quant methods can rebuild an
+        # int32 tensor inside the traced forward without .tolist() graph-breaking
+        # under PyTorch 2.10+ Dynamo (pytorch#163807). Matches main behavior.
+        self.expert_map_const = (
+            self.expert_map.tolist() if self.expert_map is not None else None
+        )
+
         use_dispatch_all2all = envs.VLLM_RBLN_DISPATCH_ALL2ALL
         use_combine_all2all = envs.VLLM_RBLN_COMBINE_ALL2ALL
 
