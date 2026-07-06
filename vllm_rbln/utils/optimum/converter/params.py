@@ -203,13 +203,6 @@ class RBLNParams:
 
 
 def _num_devices_of(cfg: RblnConfigLike) -> int | None:
-    """Read ``num_devices`` from a single config.
-
-    optimum-rbln does not expose ``num_devices`` as a top-level key; it lives
-    inside each entry of ``_compile_cfgs`` (all entries share the same value).
-    Prefer a direct key when present (e.g. an ``RBLNModelConfig`` attribute),
-    then fall back to the compile configs. Returns ``None`` when absent.
-    """
     val = _cfg_get(cfg, "num_devices")
     if val is not None:
         assert isinstance(val, int), (
@@ -231,14 +224,6 @@ def _num_devices_of(cfg: RblnConfigLike) -> int | None:
 
 
 def _resolve_num_devices(cfg: RblnConfigLike) -> int:
-    """Resolve ``num_devices``, preferring a language-model submodule.
-
-    Multimodal models pin ``num_devices`` on the ``language_model`` /
-    ``text_model`` submodule at compile time (see the multimodal compilation
-    params), so the top-level config carries no usable value. Read the
-    submodule first, falling back to the top-level config for single-module
-    models. Defaults to 1 when nothing is found.
-    """
     for submodule_name in ("language_model", "text_model"):
         sub_cfg = _cfg_get_submodule(cfg, submodule_name)
         if sub_cfg is None:
