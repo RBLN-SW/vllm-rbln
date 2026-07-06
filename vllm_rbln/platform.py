@@ -53,6 +53,14 @@ def bypass_backend(graph_module: torch.fx.GraphModule, example_inputs):
 register_backend(name="bypass", compiler_fn=bypass_backend)
 
 
+def _derive_platform_attrs(use_vllm_model: bool) -> dict:
+    return {
+        "device_name": "rbln" if use_vllm_model else "cpu",
+        "device_type": "rbln" if use_vllm_model else "cpu",
+        "dist_backend": "rbln-ccl" if use_vllm_model else "",
+    }
+
+
 class RblnPlatform(Platform):
     _enum = PlatformEnum.OOT
 
@@ -75,9 +83,11 @@ class RblnPlatform(Platform):
             ) from e
 
     plugin_name: str = "rbln"
-    device_name: str = "rbln" if _USE_VLLM_MODEL else "cpu"
-    device_type: str = "rbln" if _USE_VLLM_MODEL else "cpu"
-    dist_backend: str = "rbln-ccl" if _USE_VLLM_MODEL else ""
+    _frozen_attrs = _derive_platform_attrs(_USE_VLLM_MODEL)
+    device_name: str = _frozen_attrs["device_name"]
+    device_type: str = _frozen_attrs["device_type"]
+    dist_backend: str = _frozen_attrs["dist_backend"]
+    del _frozen_attrs
     dispatch_key: str = "CPU"
     ray_device_key: str = "RBLN"
     simple_compile_backend = "bypass"
@@ -236,6 +246,7 @@ class RblnPlatform(Platform):
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
+        cls._guard_import_time_envs()
         model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
         scheduler_config = vllm_config.scheduler_config
@@ -441,6 +452,23 @@ class RblnPlatform(Platform):
                 hf_config, "use_sliding_window", True
             ):
                 cls._disable_prefix_caching(vllm_config, "sliding window models")
+
+    @classmethod
+    def _guard_import_time_envs(cls) -> None:
+        expected = _derive_platform_attrs(envs.VLLM_RBLN_USE_VLLM_MODEL)
+        actual = {name: getattr(cls, name) for name in expected}
+        if expected != actual:
+            details = ", ".join(
+                f"{name}: frozen={actual[name]!r} but current env implies "
+                f"{expected[name]!r}"
+                for name in expected
+                if actual[name] != expected[name]
+            )
+            raise RuntimeError(
+                f"RBLN platform attributes do not match the current env ({details}). "
+                "VLLM_RBLN_USE_VLLM_MODEL is read only once, at `import vllm`. "
+                "Please set it before importing vllm."
+            )
 
     @classmethod
     def support_hybrid_kv_cache(cls) -> bool:

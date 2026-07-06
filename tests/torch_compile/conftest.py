@@ -14,6 +14,14 @@
 
 import os
 
+# Must be set before the vllm imports below. RblnPlatform freezes
+# device_name/device_type/dist_backend from VLLM_RBLN_USE_VLLM_MODEL when
+# vllm_rbln.platform is imported (during `import vllm`), and
+# check_and_update_config raises if they later disagree with the env. Setting
+# it here keeps the frozen attributes consistent with the value the whole test
+# tree runs under.
+os.environ["VLLM_RBLN_USE_VLLM_MODEL"] = "1"
+
 import pytest
 from vllm.config import (
     CacheConfig,
@@ -42,10 +50,10 @@ def pytest_collection_modifyitems(items):
 
 
 def pytest_configure(config):
-    # Must run before test collection so that monkey patches applied by
-    # `register_ops()` are in place before any test module does
-    # `from vllm.xxx import yyy` at import time and captures the original symbol.
-    os.environ["VLLM_RBLN_USE_VLLM_MODEL"] = "1"
+    # VLLM_RBLN_USE_VLLM_MODEL is set at module import above so that monkey
+    # patches applied by `register_ops()` are in place before any test module
+    # does `from vllm.xxx import yyy` at import time and captures the original
+    # symbol.
     # Running torch.compile-based tests in this tree leaves hundreds of
     # background threads alive in the pytest process (we saw ~2400 before
     # the EngineCore spawn). POSIX fork() clones only the calling thread
