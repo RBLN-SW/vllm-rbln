@@ -691,10 +691,6 @@ class RBLNScheduler(Scheduler):
                 request = request_queue.peek_request()
                 request_id = request.request_id
 
-                promoted_from_waiting_for_remote_kvs = (
-                    request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
-                )
-
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(
                     request.status
@@ -836,26 +832,20 @@ class RBLNScheduler(Scheduler):
                     num_new_tokens = min(num_new_tokens, prefill_token_budget)
                     assert num_new_tokens > 0
 
-                    if (
-                        not promoted_from_waiting_for_remote_kvs or is_prefill(request)
-                    ) and (
+                    if is_prefill(request) and (
                         len(scheduled_new_reqs) > 0 or len(scheduled_resumed_reqs) > 0
                     ):
-                        # NOTE(RBLN): This waiting request needs a LOCAL prefill:
-                        # either an ordinary waiting request, or a request promoted
-                        # from WAITING_FOR_REMOTE_KVS whose remote match was PARTIAL
-                        # (num_computed_tokens < num_tokens-1 -> still is_prefill, a
-                        # local "remainder" prefill). A prior iteration of this
-                        # waiting loop already placed a decode-ready (remote-
-                        # prefilled) request into the decode batch -- in
-                        # scheduled_new_reqs (status WAITING) or scheduled_resumed_reqs
-                        # (status PREEMPTED). The no-mixed-batching eviction below
-                        # only clears scheduled_running_reqs, so running a local
-                        # prefill now would illegally mix it with those already-
-                        # scheduled decode reqs. Defer this prefill to the next step;
-                        # it is left un-popped at the queue head and re-tried next
-                        # step (by then a plain WAITING req with num_computed_tokens
-                        # > 0, no longer promoted_from_waiting_for_remote_kvs).
+                        # NOTE(RBLN): Only a request that will run as a LOCAL prefill
+                        # (lone, num_reqs == 1, via the no-mixed-batching eviction
+                        # below) needs deferring. A decode-ready request (not
+                        # is_prefill) instead joins the decode batch at the block
+                        # below and is fine to co-schedule. Defer this prefill
+                        # because a decode-ready request was already admitted this
+                        # step -- in scheduled_new_reqs (status WAITING) or
+                        # scheduled_resumed_reqs (status PREEMPTED) -- and the
+                        # eviction only clears scheduled_running_reqs, so running a
+                        # local prefill now would illegally mix it with those decode
+                        # reqs. Left un-popped at the queue head, re-tried next step.
                         break
 
                     # Schedule encoder inputs.
@@ -1019,19 +1009,14 @@ class RBLNScheduler(Scheduler):
                         if self.ec_connector is not None:
                             self.ec_connector.update_state_after_alloc(request, i)
 
-                if promoted_from_waiting_for_remote_kvs and not is_prefill(request):
-                    # NOTE(RBLN): A request promoted from WAITING_FOR_REMOTE_KVS
-                    # with a FULL remote match is decode-ready: its whole prompt KV
-                    # was prefilled remotely, so it joins as a single-token decode.
-                    #
-                    # A PARTIAL remote match instead leaves a local "remainder
-                    # prefill" (still is_prefill). Such a request is NOT handled
-                    # here -- it falls through to the no-mixed-batching eviction
-                    # block below and runs as a lone prefill (num_reqs == 1),
-                    # exactly like a normal chunked prefill, then reaches decode
-                    # via the running loop on a later step. Routing it through the
-                    # decode path here would leave a non-uniform query length that
-                    # corrupts input_ids.view(num_reqs, -1) downstream.
+                if not is_prefill(request):
+                    # NOTE(RBLN): A decode-ready request joins the decode batch
+                    # here, regardless of how it became decode-ready -- a FULL
+                    # remote-KV match promoted from WAITING_FOR_REMOTE_KVS, a full
+                    # local/sync prefix-cache match, etc. (A PARTIAL match leaves a
+                    # local remainder prefill -> still is_prefill -> falls through to
+                    # the no-mixed-batching eviction block below and runs as a lone
+                    # prefill, reaching decode via the running loop on a later step.)
                     #
                     # is_prefill is False here, so num_computed == num_tokens - 1
                     # and (given the earlier `assert num_new_tokens > 0`)
@@ -1039,7 +1024,7 @@ class RBLNScheduler(Scheduler):
                     # `_decide_spec_slide(new_n=1)` below relies on. Kept as a
                     # sanity check.
                     assert num_new_tokens == 1, (
-                        f"promoted remote-KV request {request_id} has "
+                        f"decode-ready request {request_id} has "
                         f"num_new_tokens={num_new_tokens} (expected 1)."
                     )
                     # This promotion path bypasses the running-loop spec/slide
