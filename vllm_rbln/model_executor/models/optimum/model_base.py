@@ -550,6 +550,26 @@ class RBLNOptimumMultimodalMixin(SupportsMultiModal):
         # override this to PAD-mask the placeholder positions first.
         return self.model.get_input_embeddings()(input_ids)
 
+    def _assert_mm_tokens_match(
+        self, num_placeholders: int, num_embed_tokens: int
+    ) -> None:
+        """Guard that the multimodal placeholder count equals the embed-token count.
+
+        The scatter places one embedding per placeholder token. A mismatch means a
+        prefix-cache boundary split a multimodal item so only part of its
+        placeholders remain while its full embeddings are still produced; the
+        scatter would then misalign (``masked_scatter`` silently consumes only the
+        first ``num_placeholders`` embeddings) and corrupt the inputs. The scheduler
+        clamps the cache boundary to avoid this; this raise is the safety net.
+        """
+        if num_placeholders != num_embed_tokens:
+            raise ValueError(
+                "Multimodal placeholder/embedding count mismatch: "
+                f"{num_placeholders} placeholder positions but {num_embed_tokens} "
+                "embed tokens. A prefix-cache boundary likely split a multimodal "
+                "item; the cached prefix must not fall inside its placeholder range."
+            )
+
     def embed_input_ids(
         self,
         input_ids: torch.Tensor,
@@ -572,21 +592,7 @@ class RBLNOptimumMultimodalMixin(SupportsMultiModal):
         mm_embeds = torch.cat(list(multimodal_embeddings)).to(
             inputs_embeds.device, inputs_embeds.dtype
         )
-        # The scatter assumes one embedding per placeholder token. A mismatch means
-        # masked_scatter would misalign (it silently consumes only the first
-        # ``num_placeholders`` embeddings when there are too many), corrupting the
-        # inputs. This happens if a prefix-cache boundary splits a multimodal item
-        # so only part of its placeholders remain while its full embeddings are
-        # still provided; the scheduler must clamp the cache boundary to avoid it.
-        num_placeholders = int(is_multimodal.sum())
-        if num_placeholders != mm_embeds.shape[0]:
-            raise ValueError(
-                "Multimodal placeholder/embedding count mismatch: "
-                f"{num_placeholders} placeholder positions but "
-                f"{mm_embeds.shape[0]} multimodal embeddings. A prefix-cache "
-                "boundary likely split a multimodal item; the cached prefix must "
-                "not fall inside an image's placeholder range."
-            )
+        self._assert_mm_tokens_match(int(is_multimodal.sum()), mm_embeds.shape[0])
         scatter_mask = is_multimodal.unsqueeze(-1).expand_as(inputs_embeds)
         return inputs_embeds.masked_scatter(scatter_mask, mm_embeds)
 

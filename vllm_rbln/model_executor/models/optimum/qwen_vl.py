@@ -245,17 +245,14 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         """Create video embedding inputs based on model type"""
         pass
 
-    def _assert_mm_tokens_match(self, input_ids, image_input, video_input) -> None:
-        """Guard that placeholder count matches the embed-token count.
+    def _assert_mm_grid_tokens_match(self, input_ids, image_input, video_input) -> None:
+        """Feed grid-derived counts into the shared ``_assert_mm_tokens_match``.
 
-        Mirrors the check in ``embed_input_ids`` for the shared models. Qwen-VL
-        scatters the visual embeddings inside optimum-rbln, so instead we compare
-        the multimodal placeholder count in (the possibly trimmed) ``input_ids``
-        against the number of embed tokens implied by each item's ``grid_thw``.
-        A mismatch means a prefix-cache boundary split a multimodal item so only
-        part of its placeholders remain while its full embeddings are still
-        produced; the scheduler must clamp the boundary to avoid it. Skipped when
-        the config's token ids / merge size are unavailable.
+        Qwen-VL scatters the visual embeddings inside optimum-rbln, so the embed
+        count is derived from each item's ``grid_thw`` (rather than an embeddings
+        tensor) and compared against the multimodal placeholder count in the
+        (possibly trimmed) ``input_ids``. Skipped when the config's token ids /
+        merge size are unavailable.
         """
         config = getattr(self.model, "config", None)
         vision_config = getattr(config, "vision_config", None)
@@ -272,16 +269,9 @@ class RBLNOptimumQwenVLForConditionalGeneration(
             grid_thw = mm_input.get(grid_key)
             if grid_thw is None:
                 continue
-            expected = int((grid_thw.prod(dim=-1) // (merge_size**2)).sum())
-            actual = int((input_ids == token_id).sum())
-            if expected != actual:
-                raise ValueError(
-                    f"Multimodal placeholder/embedding count mismatch for token "
-                    f"{token_id}: {actual} placeholder positions but {expected} "
-                    f"embed tokens. A prefix-cache boundary likely split a "
-                    f"multimodal item; the cached prefix must not fall inside its "
-                    f"placeholder range."
-                )
+            num_embed_tokens = int((grid_thw.prod(dim=-1) // (merge_size**2)).sum())
+            num_placeholders = int((input_ids == token_id).sum())
+            self._assert_mm_tokens_match(num_placeholders, num_embed_tokens)
 
     def build_prefill_forward_inputs(
         self,
@@ -299,7 +289,7 @@ class RBLNOptimumQwenVLForConditionalGeneration(
                 **model_input.multi_modal_kwargs
             )
 
-        self._assert_mm_tokens_match(input_ids, image_input, video_input)
+        self._assert_mm_grid_tokens_match(input_ids, image_input, video_input)
 
         attention_mask = torch.ones_like(input_ids)
         prefill_params = self.preprocess_prefill(
