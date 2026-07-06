@@ -761,8 +761,8 @@ class TestDetermineAvailableMemory:
         ):
             plat.get_device_name.return_value = "RBLN-CA25"
             worker.determine_available_memory()
-        # 1 + (1 + 1) * 2 = 5
-        assert est.call_args.kwargs["num_runtimes"] == 5
+        # 1 prefill + 2 normal decodes + 1 padded decode (max bucket only) = 4
+        assert est.call_args.kwargs["num_runtimes"] == 4
 
     def test_mixed_dtype_params(self):
         """bf16 params counted as attention, non-bf16 as experts."""

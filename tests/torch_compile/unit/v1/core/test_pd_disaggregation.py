@@ -316,6 +316,100 @@ class TestPDDisaggregationScheduler:
         assert after_total == 28  # 7 * 4
         assert after_total % len(ns) == 0  # uniform -> view is safe
 
+    def test_eviction_drops_evicted_decode_slide_distance(self):
+        """REGRESSION for the index_copy crash (``index 4 is out of bounds for
+        dimension 0 with size 4`` in pad_speculative_draft_tokens).
+
+        The no-mixed-batching eviction drops evicted running decodes from
+        num_scheduled_tokens / scheduled_spec_decode_tokens but MUST also drop
+        their spec_decode_slide_distance -- the map added later for the full-spec
+        sliding-window backfill. Left behind, the scheduler output carries a
+        slide for a req that is no longer scheduled; the runner then over-counts
+        num_input_tokens (= total_num_scheduled + sum(slide)) while the pad
+        window only accounts for the scheduled reqs -> index_copy overflow.
+
+        Trigger (PDD-specific): a remote-prefill req admitted DIRECTLY
+        (is_async=False, external match == num_tokens-1 -> num_new == 1) is NOT
+        ``promoted_from_waiting_for_remote_kvs``, so it skips the promote path
+        and hits the eviction path, kicking out the running decodes. Being
+        num_new == 1 it keeps the executed step all-decode (any_prefill=False),
+        so the pad path runs on the leaked-slide-inflated input.
+
+        Not PDD-exclusive, just PDD-fatal: spec_decode_slide_distance is the map
+        added for the full-spec sliding-window backfill, and the eviction loop was
+        never taught to pop it -- so EVERY eviction (including the ordinary
+        prefill-arrives-mid-decode eviction that mixed instances hit constantly)
+        leaks the same inconsistency into the scheduler output. It only crashes in
+        PDD because of how the runner routes the two cases:
+          * prefill evictor (num_new > 1): the executed step has a prefill ->
+            any_prefill=True -> get_dp_padding pads to the fixed
+            max_num_batched_tokens (DP-prefill path) and pad_speculative_draft_
+            tokens is SKIPPED. The leaked-slide-inflated input_ids is absorbed by
+            the large fixed buffer -- no tight per-req layout to overflow, so it
+            was masked all along.
+          * decode evictor (num_new == 1, PDD): the executed step is all-decode ->
+            any_prefill=False -> the tight spec pad (out = num_reqs *
+            max_spec_decode_len) runs, input_ids.numel != sum(window), and
+            index_copy overflows.
+        The fix (pop the slide on eviction) removes the inconsistency at the root,
+        cleaning both the PDD crash and the latent prefill-path leak.
+
+        Drop vs restore: the eviction stashes each evicted req's block delta in
+        ``_stranded_new_blocks`` so the physical KV allocation -- persistent,
+        already committed in the coordinator -- is re-emitted when the req is next
+        scheduled. The slide map is NOT persistent: it is a fresh per-step local
+        dict (rebuilt at the top of ``schedule()`` and recomputed for every
+        running req via ``_decide_spec_slide`` each step). An evicted req is
+        re-scheduled next step and gets its slide recomputed there, so the
+        eviction must simply DROP the stale entry -- there is nothing to restore.
+        Leaving it behind is a pure leak into this step's output.
+        """
+        NUM_SPEC = 3
+        matched = 32  # remote num_tokens = matched+1 -> num_new == 1
+        scheduler = create_scheduler(
+            block_size=_BLOCK_SIZE,
+            num_blocks=_NUM_BLOCKS,
+            max_num_seqs=_MAX_NUM_SEQS,
+            num_speculative_tokens=NUM_SPEC,
+            use_kv_connector=MockKVConfig(matched_tokens=matched, is_async=False),
+        )
+
+        # Running decodes carrying slide (spec active).
+        decodes = [
+            _create_pd_request(10, f"d{i}", do_remote_prefill=False) for i in range(4)
+        ]
+        for d in decodes:
+            advance_to_decode(scheduler, d)
+
+        # Remote-prefill req: matched == num_tokens-1 -> num_new == 1, and
+        # is_async=False -> direct admission (never WAITING) -> not promoted ->
+        # falls through to the no-mixed-batching eviction of the running decodes.
+        remote = _create_pd_request(matched + 1, "remote")
+        scheduler.add_request(remote)
+
+        out = scheduler.schedule()
+        ns = out.num_scheduled_tokens
+        slide = dict(getattr(out, "spec_decode_slide_distance", {}) or {})
+
+        # Eviction happened: only the num_new == 1 remote req is scheduled.
+        assert remote.request_id in ns
+        assert ns[remote.request_id] == 1
+        for d in decodes:
+            assert d.request_id not in ns
+
+        # ROOT BUG: evicted decodes' slide entries must be gone. Before the fix
+        # they leak (stale slide for reqs no longer in num_scheduled_tokens).
+        leaked = sorted(r for r in slide if r not in ns)
+        assert leaked == [], f"stale slide leaked for evicted reqs: {leaked}"
+
+        # Consequence the runner hits: num_input_tokens (total_num_scheduled +
+        # sum(slide)) must equal the pad per-req window sum. A leaked slide makes
+        # the former over-count -> input_ids longer than the pad accounts for.
+        total_num_scheduled = sum(ns.values())
+        num_input_tokens = total_num_scheduled + sum(slide.values())
+        pad_window_sum = sum(ns[r] + slide.get(r, 0) for r in ns)
+        assert num_input_tokens == pad_window_sum
+
     def test_promoted_partial_kv_match_is_rejected(self):
         """A promoted remote-KV request must be a genuine single-token decode:
         its prompt KV was prefilled remotely, so num_new_tokens == 1. A partial
