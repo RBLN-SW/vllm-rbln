@@ -410,19 +410,30 @@ class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
         }
         return kwargs
 
-    def _copy_cached_kv_blocks(
+    def get_prefill_decoder(self) -> runtime_utils.RBLNRuntimeModel:
+        """Return the prefill runtime that owns the KV cache.
+
+        Models whose decoder lives under a submodule override this
+        (e.g. multimodal models keep it at ``self.model.language_model``).
+        """
+        return self.model.prefill_decoder
+
+    def copy_cached_kv_blocks(
         self,
-        prefill_decoder: runtime_utils.RBLNRuntimeModel,
         cached_block_tables: list[int],
         cached_lengths: list[int],
         block_tables: torch.Tensor,
-    ):
-        """Copy cached KV blocks from source to destination blocks.
+    ) -> None:
+        """Copy prefix-cached KV blocks into this request's destination blocks.
+
+        The model runner calls this before the prefill forward so the copy
+        stays an orchestration concern and the model forward remains a pure
+        forward pass.
 
         Args:
-            cached_block_tables: List of source block IDs to copy from
-            cached_lengths: List of cached lengths for each block
-            block_tables: Tensor containing destination block IDs
+            cached_block_tables: Source block IDs to copy from.
+            cached_lengths: Cached length for each source block.
+            block_tables: Tensor whose first row holds the destination block IDs.
         """
         if not cached_block_tables:
             return
@@ -435,6 +446,7 @@ class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
                 len(cached_lengths),
             )
 
+        prefill_decoder = self.get_prefill_decoder()
         # Convert to list once for efficiency
         dst_blocks = block_tables[0].tolist()
 
@@ -460,35 +472,6 @@ class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
                 )
                 logger.error(error_msg)
                 raise RuntimeError(error_msg) from e
-
-    def get_prefill_decoder(self) -> runtime_utils.RBLNRuntimeModel:
-        """Return the prefill runtime that owns the KV cache.
-
-        Models whose decoder lives under a submodule override this
-        (e.g. multimodal models keep it at ``self.model.language_model``).
-        """
-        return self.model.prefill_decoder
-
-    def copy_cached_kv_blocks(
-        self,
-        cached_block_tables: list[int],
-        cached_lengths: list[int],
-        block_tables: torch.Tensor,
-    ) -> None:
-        """Populate destination KV blocks from prefix-cached source blocks.
-
-        The model runner calls this before the prefill forward so the copy
-        stays an orchestration concern and the model forward remains a pure
-        forward pass.
-        """
-        if not cached_block_tables:
-            return
-        self._copy_cached_kv_blocks(
-            self.get_prefill_decoder(),
-            cached_block_tables,
-            cached_lengths,
-            block_tables,
-        )
 
     # It is required for decoder models in openai api server
     def compute_logits(
