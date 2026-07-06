@@ -203,16 +203,6 @@ class RBLNGptOssMxfp4MoEMethod(GptOssMxfp4MoEMethod):
         hidden_states = x.reshape(num_tokens, -1)
         masked_routing_weights = router_logits
 
-        expert_map_const = None
-        if layer.expert_map is not None:
-            assert getattr(layer, "expert_map_const", None) is not None
-            # Keep tensor ops only: .tolist() + torch.tensor(list) graph-breaks
-            # under PyTorch 2.10+ Dynamo when capture_scalar_outputs is false
-            # (pytorch#163807); expert_map_const is precomputed in __init__.
-            expert_map_const = torch.tensor(
-                layer.expert_map_const, dtype=torch.int32
-            )
-
         out = torch.ops.rbln_custom_ops.custom_moe_glu_mxfp4(
             hidden_states,
             layer.gate_proj_blocks,
@@ -227,7 +217,7 @@ class RBLNGptOssMxfp4MoEMethod(GptOssMxfp4MoEMethod):
             masked_routing_weights,
             self.swiglu_alpha,
             self.swiglu_limit,
-            expert_map_const,
+            layer.expert_map,
         )
         return out.reshape(orig_shape)
 
