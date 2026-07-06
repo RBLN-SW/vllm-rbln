@@ -30,6 +30,7 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
+    MLAAttentionSpec,
 )
 
 if TYPE_CHECKING:
@@ -1177,6 +1178,7 @@ class RBLNFlashAttentionMetadataBuilder(
 
         max_seq_len = self.model_config.max_model_len
 
+        partition_len = self.block_size
         num_partition = max_seq_len // partition_len
         cs = seq_idx.repeat(1, num_partition)
         pidx = torch.arange(num_partition, dtype=torch.int32)
