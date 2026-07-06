@@ -111,14 +111,6 @@ class RBLNOptimumLlavaForConditionalGeneration(
             self.model.language_model.decoder = self.model.language_model.decoders[
                 padded_batch_size
             ]
-        else:
-            if model_input.cached_block_tables:
-                self._copy_cached_kv_blocks(
-                    self.model.language_model.prefill_decoder,
-                    model_input.cached_block_tables,
-                    model_input.cached_lengths,
-                    model_input.block_tables,
-                )
 
         inputs_embeds = model_input.inputs_embeds if is_prompt else None
 

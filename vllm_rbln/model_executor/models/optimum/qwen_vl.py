@@ -80,6 +80,11 @@ class RBLNOptimumQwenVLForConditionalGeneration(
             num_blocks=self.kv_block_adapter._estimated_num_blocks(),
         )
 
+    def get_prefill_decoder(self):
+        # Qwen-VL keeps the prefill runtime at the top level, unlike the
+        # submodule layout assumed by RBLNOptimumMultimodalMixin.
+        return self.model.prefill_decoder
+
     def _build_prefill_params(self, preprocess_outputs: tuple) -> dict:
         return {
             "inputs_embeds": preprocess_outputs[0],
@@ -342,13 +347,6 @@ class RBLNOptimumQwenVLForConditionalGeneration(
                 prefill_kwargs["visual_pos_mask"] = model_input.visual_pos_mask
             if model_input.deepstack_embeds is not None:
                 prefill_kwargs["deepstack_embeds"] = model_input.deepstack_embeds
-            if model_input.cached_block_tables:
-                self._copy_cached_kv_blocks(
-                    self.model.prefill_decoder,
-                    model_input.cached_block_tables,
-                    model_input.cached_lengths,
-                    model_input.block_tables,
-                )
             logits = self.model.prefill_decoder(**prefill_kwargs).logits
         else:
             padded_batch_size = kwargs.pop("padded_batch_size", self.decoder_batch_size)

@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import torch
 from vllm.multimodal.inputs import BatchedTensorInputs
@@ -31,8 +31,6 @@ class ModelInputForRBLN:
     running_requests_ids: list[str]
     finished_requests_ids: list[str]
     is_prompt: bool = False
-    cached_block_tables: list[int] = field(default_factory=list)  # for prefix caching
-    cached_lengths: list[int] = field(default_factory=list)  # for prefix caching
     multi_modal_kwargs: BatchedTensorInputs | None = None
     dummy_block: int | None = None  # for prefix caching
     inputs_embeds: torch.Tensor | None = None

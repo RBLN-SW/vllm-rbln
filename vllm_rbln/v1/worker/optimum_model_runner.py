@@ -75,6 +75,7 @@ from vllm_rbln.logger import init_logger
 from vllm_rbln.model_executor.model_loader.rbln_model_loader import get_optimum_model
 from vllm_rbln.model_executor.models.optimum import ModelInputForRBLN
 from vllm_rbln.model_executor.models.optimum.model_base import (
+    RBLNOptimumDecoderMixin,
     RBLNOptimumMultimodalMixin,
 )
 from vllm_rbln.utils.optimum.bucket import select_bucket_size
@@ -375,6 +376,16 @@ class RBLNOptimumModelRunner(
                 else:
                     with capture_ctx as model_reports:
                         model_input = self._build_forward_inputs(model_input)
+                        if model_input.is_prompt and isinstance(
+                            self.model, RBLNOptimumDecoderMixin
+                        ):
+                            # Reuse prefix-cached KV: copy source blocks into
+                            # this request's destination blocks before prefill.
+                            self.model.copy_cached_kv_blocks(
+                                scheduler_output.cached_block_table,
+                                scheduler_output.cached_length,
+                                model_input.block_tables,
+                            )
                         hidden_states = self.model(model_input)
                 if (
                     envs.VLLM_RBLN_METRICS
@@ -508,14 +519,10 @@ class RBLNOptimumModelRunner(
                 input_ids,
                 positions,
                 block_tables,
-                cached_block_tables,
-                cached_lengths,
                 multi_modal_kwargs,
                 running_request_ids,
             ) = self._prepare_prefill(scheduler_output)
         else:
-            cached_block_tables = []
-            cached_lengths = []
             input_ids, positions, block_tables, running_request_ids = (
                 self._prepare_decode(scheduler_output)
             )
@@ -538,8 +545,6 @@ class RBLNOptimumModelRunner(
             block_tables=block_tables,
             running_requests_ids=running_request_ids,
             finished_requests_ids=list(finished_requests_ids),
-            cached_block_tables=cached_block_tables,
-            cached_lengths=cached_lengths,
             # FIXME unify the variable name is_prefill and is_prompt
             is_prompt=is_prefill,
             dummy_block=scheduler_output.dummy_block,
@@ -602,8 +607,6 @@ class RBLNOptimumModelRunner(
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
-        list[int],
-        list[int],
         BatchedTensorInputs | None,
         list[str],
     ]:
@@ -614,7 +617,6 @@ class RBLNOptimumModelRunner(
             0
         ].num_blocks_per_row
         block_tables_cpu = self.input_batch.block_table.block_tables[0].get_cpu_tensor()
-        cached_block_table = []
         cached_length = []
 
         if len(scheduler_output.scheduled_new_reqs) == 1:
@@ -650,7 +652,6 @@ class RBLNOptimumModelRunner(
                 block_ids,
             )
             block_table = scheduler_output.block_table_dict[req_id]
-            cached_block_table = scheduler_output.cached_block_table
             cached_length = scheduler_output.cached_length
             total_cached_length = sum(cached_length)
             if total_cached_length > 0:
@@ -679,14 +680,10 @@ class RBLNOptimumModelRunner(
         input_tokens = torch.tensor(prompt_tokens).unsqueeze(0)
         input_positions = torch.tensor(input_positions).unsqueeze(0)
         block_table = block_table.unsqueeze(0)
-        # NOTE The cached_block_table is not unsqueezed for convenience.
-        # It is used only for prefill
         return (
             input_tokens,
             input_positions,
             block_table,
-            cached_block_table,
-            cached_length,
             batched_mm_inputs,
             running_request_ids,
         )
