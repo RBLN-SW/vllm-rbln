@@ -61,6 +61,9 @@ from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 import vllm_rbln.rbln_envs as envs
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.utils import (
+    finalize_kv_cache_registrations,
+)
 from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.worker.rbln_model_runner import RBLNModelRunner
 from vllm_rbln.v1.worker.utils import (
@@ -220,7 +223,8 @@ class RBLNWorker(WorkerBase):
             self.model_runner.bucketing_manager.decode_batch_buckets_count
         )
 
-        num_runtimes = 1 + (1 + specialized_moe_decode) * decode_batch_buckets_count
+        # 1 prefill + N normal decodes + 1 padded decode (max bucket only)
+        num_runtimes = 1 + decode_batch_buckets_count + specialized_moe_decode
 
         ratio: float = 1.0
         if self.model_config.quantization is not None:
@@ -535,6 +539,14 @@ class RBLNWorker(WorkerBase):
 
                 raise
 
+        # The D2D path of RblnNixlConnector (kv_buffer_device="rbln") defers
+        # its NIXL registration until the KV cache physical views exist, which
+        # only happens once warm-up has run the compiled model. Walk the
+        # connector tree (incl. MultiConnector children) so the hook still runs
+        # when the connector is combined with others.
+        if has_kv_transfer_group():
+            finalize_kv_cache_registrations(get_kv_transfer_group())
+
         # After warm-up: apply CPU affinity only (threads already set pre-compile).
         self._ensure_rbln_cpu_affinity_after_warmup()
         self.model_runner._enable_performance_tracker()
@@ -645,8 +657,6 @@ class RBLNWorker(WorkerBase):
         if envs.VLLM_RBLN_METRICS:
             if self.model_runner.performance_tracker:
                 self.model_runner.performance_tracker.print_final_stats()
-            if self.model_runner.sampler_performance_tracker:
-                self.model_runner.sampler_performance_tracker.print_final_stats()
             if self.model_runner.e2e_performance_tracker:
                 self.model_runner.e2e_performance_tracker.print_final_stats()
 

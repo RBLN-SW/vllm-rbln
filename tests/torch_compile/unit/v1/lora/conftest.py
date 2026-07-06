@@ -50,6 +50,18 @@ from vllm.model_executor.models.interfaces import SupportsLoRA
 HAS_RAY = importlib.util.find_spec("ray") is not None
 
 
+@pytest.fixture(autouse=True)
+def rbln_test_env(monkeypatch):
+    """Apply RBLN env vars to every test under this directory.
+
+    ``vllm_rbln.rbln_envs`` evaluates env vars lazily on each attribute
+    access, so setting them via monkeypatch before the test runs is honored,
+    and monkeypatch undoes them automatically afterwards.
+    """
+    monkeypatch.setenv("VLLM_RBLN_USE_DEVICE_TENSOR", "1")
+    monkeypatch.setenv("VLLM_RBLN_DISABLE_COMPILE_CACHE", "1")
+
+
 def cleanup_dist_env() -> None:
     try:
         cleanup_dist_env_and_memory(shutdown_ray=HAS_RAY)

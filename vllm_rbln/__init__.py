@@ -21,17 +21,7 @@ def register():
 
 
 def register_model():
-    if not envs.VLLM_RBLN_USE_VLLM_MODEL:
-        from vllm import ModelRegistry
-
-        ModelRegistry.register_model(
-            "Gemma3ForConditionalGeneration",
-            "vllm_rbln.model_executor.models.optimum.gemma3:RBLNOptimumGemma3ForConditionalGeneration",
-        )
-        ModelRegistry.register_model(
-            "Gemma4ForConditionalGeneration",
-            "vllm_rbln.model_executor.models.optimum.gemma4:RBLNOptimumGemma4ForConditionalGeneration",
-        )
+    pass
 
 
 def register_ops():

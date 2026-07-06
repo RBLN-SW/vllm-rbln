@@ -64,7 +64,7 @@ def build_compile_options(compile_context: rebel.CompileContext) -> dict:
     if envs.VLLM_RBLN_COMPILE_STRICT_MODE:
         options["mode"] = "strict"
     if has_torch_rbln or use_dt:
-        options["tensor_parallel_size"] = 1
+        options["num_devices"] = 1
         if not use_dt:
             options["use_global_ctx"] = True
             options["global_device_id"] = 0

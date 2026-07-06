@@ -82,11 +82,14 @@ class RBLNCompileSpec:
         block_size: int,
         max_model_len: int,
         num_devices: int,
+        prefill_chunk_size: int | None = None,
         rbln_overrides: dict[str, Any] | None = None,
     ) -> "RBLNCompileSpec":
         """Build a compile spec from vllm-rbln inputs, dispatched by architecture."""
         if is_generation_arch(config):
-            spec = cls._for_decoder(batch_size, block_size, max_model_len, num_devices)
+            spec = cls._for_decoder(
+                batch_size, block_size, max_model_len, num_devices, prefill_chunk_size
+            )
         elif is_pooling_arch(config):
             spec = cls._for_pooling(
                 config,
@@ -102,6 +105,7 @@ class RBLNCompileSpec:
                 block_size,
                 max_model_len,
                 num_devices,
+                prefill_chunk_size,
             )
         elif is_enc_dec_arch(config):
             spec = cls._for_enc_dec(
@@ -136,6 +140,7 @@ class RBLNCompileSpec:
         block_size: int,
         max_model_len: int,
         num_devices: int,
+        prefill_chunk_size: int | None = None,
     ) -> "RBLNCompileSpec":
         rbln_config: dict[str, Any] = {
             "num_devices": num_devices,
@@ -145,6 +150,10 @@ class RBLNCompileSpec:
         if block_size != max_model_len:
             rbln_config["kvcache_partition_len"] = block_size
             rbln_config["attn_impl"] = "flash_attn"
+        # Pin the compiled prefill_chunk_size to the resolved value so it stays
+        # in sync with the one used for KV-cache block padding.
+        if prefill_chunk_size is not None:
+            rbln_config["prefill_chunk_size"] = prefill_chunk_size
         return cls(model_cls=RBLNAutoModelForCausalLM, rbln_config=rbln_config)
 
     @classmethod
@@ -181,6 +190,7 @@ class RBLNCompileSpec:
         block_size: int,
         max_model_len: int,
         num_devices: int,
+        prefill_chunk_size: int | None = None,
     ) -> "RBLNCompileSpec":
         model_name, model_cls_name = get_rbln_model_info(config)
         compile_fn = _COMPILE_MULTIMODAL_FNS.get(model_name)
@@ -191,10 +201,12 @@ class RBLNCompileSpec:
             )
         model_cls = getattr(optimum.rbln, model_cls_name)
         assert model_cls is not None
-        return cls(
-            model_cls=model_cls,
-            rbln_config=compile_fn(batch_size, max_model_len, block_size, num_devices),
+        # Pass the resolved prefill_chunk_size so each compile_fn pins it on the
+        # compiled model, keeping it in sync with the KV-cache block padding.
+        rbln_config = compile_fn(
+            batch_size, max_model_len, block_size, num_devices, prefill_chunk_size
         )
+        return cls(model_cls=model_cls, rbln_config=rbln_config)
 
     @classmethod
     def _for_enc_dec(
