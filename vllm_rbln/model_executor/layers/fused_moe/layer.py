@@ -510,27 +510,19 @@ class RBLNFusedMoE(FusedMoE):
                 # final_hidden_states: (max_pad, H)
             else:
                 # --- reduce_scatter / all_reduce combine path ---
-                if envs.VLLM_RBLN_MOE_REDUCE_SCATTER:
-                    # reduce_scatter: each rank receives only its own summed portion
-                    hidden_shape_dp = (-1, 1, H_dim)
-                    all_hidden_states = final_hidden_states.reshape(hidden_shape_dp)
-                    assert (
-                        all_hidden_states.shape[0] % self.moe_parallel_config.dp_size
-                        == 0
-                    )
 
-                    final_hidden_states = get_dp_group().reduce_scatter(
-                        all_hidden_states, dim=0
-                    )
-                    assert final_hidden_states.shape[0] == max_pad
-                else:
-                    all_hidden_states = get_dp_group().all_reduce(final_hidden_states)
-                    hidden_shape_dp = (-1, 1, H_dim)
-                    final_hidden_states = all_hidden_states.reshape(hidden_shape_dp)
+                # reduce_scatter: each rank receives only its own summed portion
+                hidden_shape_dp = (-1, 1, H_dim)
+                all_hidden_states = final_hidden_states.reshape(hidden_shape_dp)
+                assert (
+                    all_hidden_states.shape[0] % self.moe_parallel_config.dp_size
+                    == 0
+                )
 
-                    start = self.moe_parallel_config.dp_rank * max_pad
-                    end = start + t
-                    final_hidden_states = final_hidden_states[start:end]
+                final_hidden_states = get_dp_group().reduce_scatter(
+                    all_hidden_states, dim=0
+                )
+                assert final_hidden_states.shape[0] == max_pad
 
             final_hidden_states = final_hidden_states[:t]
             final_hidden_states = final_hidden_states.reshape(org_hidden_shape)
