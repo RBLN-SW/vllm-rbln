@@ -27,7 +27,6 @@ import re
 
 import torch
 import vllm.envs as envs
-from rebel.core import mega_cache as rbln_mega_cache
 
 from vllm_rbln.logger import init_logger
 
@@ -38,12 +37,45 @@ def _safe_name(model: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]", "_", model).strip("_") or "unknown"
 
 
-def bundle_path(model: str) -> str:
-    """Per-(model, local_rank) bundle path under VLLM_CACHE_ROOT.
+def _rebel_major_minor(version: str | None = None) -> str:
+    """major.minor of the rebel version; patch bumps stay cache-compatible."""
+    if version is None:
+        try:
+            import rebel
 
-    local_rank disambiguates processes on the same node (each binds to a
-    distinct rbln NPU). Assumes VLLM_CACHE_ROOT is node-local; on a shared
-    filesystem, callers should override VLLM_CACHE_ROOT per node.
+            version = getattr(rebel, "__version__", "") or ""
+        except Exception:  # pylint: disable=broad-exception-caught
+            version = ""
+    match = re.match(r"\s*(\d+)\.(\d+)", version)
+    return f"{match.group(1)}.{match.group(2)}" if match else "unknown"
+
+
+def config_signature(vllm_config) -> str:
+    """Hash of everything that changes the compiled graphs, keying the bundle.
+
+    vLLM config hash + every (vLLM & rbln) env value + rebel major.minor. Errs
+    toward over-inclusion: a spurious factor only costs a recompile, a missed
+    one would poison a bundle.
+    """
+    from vllm_rbln import rbln_envs
+
+    parts: list = [vllm_config.compute_hash()]
+    for name in sorted(rbln_envs.environment_variables):
+        try:
+            value = rbln_envs.environment_variables[name]()
+        except Exception:  # pylint: disable=broad-exception-caught
+            value = "<err>"
+        parts.append(f"{name}={value}")
+    parts.append(f"rebel={_rebel_major_minor()}")
+    digest = hashlib.sha1("|".join(str(p) for p in parts).encode("utf-8"))
+    return digest.hexdigest()[:16]
+
+
+def bundle_path(model: str, sig: str) -> str:
+    """Per-(model, config-signature, local_rank) bundle path under VLLM_CACHE_ROOT.
+
+    `sig` isolates compile configs; local_rank isolates same-node NPUs. Assumes
+    VLLM_CACHE_ROOT is node-local; override per node on a shared filesystem.
     """
     raw = model or "unknown"
     suffix = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:8]
@@ -52,6 +84,7 @@ def bundle_path(model: str) -> str:
         envs.VLLM_CACHE_ROOT,
         "rbln",
         f"{_safe_name(raw)}-{suffix}",
+        sig,
         f"rank{local_rank}",
         "mega_cache.bin",
     )
@@ -62,12 +95,14 @@ def cache_root() -> str:
     return os.path.join(envs.VLLM_CACHE_ROOT, "rbln")
 
 
-def load(model: str) -> None:
+def load(model: str, sig: str) -> None:
     """Restore artifacts from disk so first-compile cache-hits."""
     if envs.VLLM_DISABLE_COMPILE_CACHE:
         return
+    from rebel.core import mega_cache as rbln_mega_cache
+
     rbln_mega_cache.set_dir(cache_root())
-    path = bundle_path(model)
+    path = bundle_path(model, sig)
     if not os.path.isfile(path):
         return
     try:
@@ -78,11 +113,13 @@ def load(model: str) -> None:
         logger.warning("Failed to load rbln mega-cache bundle: %s", exc)
 
 
-def save(model: str) -> None:
+def save(model: str, sig: str) -> None:
     """Persist artifacts atomically. Call only after warm-up succeeds."""
     if envs.VLLM_DISABLE_COMPILE_CACHE:
         return
-    path = bundle_path(model)
+    from rebel.core import mega_cache as rbln_mega_cache
+
+    path = bundle_path(model, sig)
     try:
         rbln_mega_cache.flush_to_bundle()
         result = torch.compiler.save_cache_artifacts()

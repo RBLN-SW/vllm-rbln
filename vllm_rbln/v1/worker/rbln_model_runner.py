@@ -2285,7 +2285,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
     @torch.inference_mode()
     def warm_up_model(self) -> None:
-        mega_cache.load(self.model_config.model)
+        sig = mega_cache.config_signature(self.vllm_config)
+        mega_cache.load(self.model_config.model, sig)
         set_warmup_active(True)
         self._make_weights_contiguous()
         offload_ctx = (
@@ -2300,7 +2301,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 self._warm_up_model_inner()
         finally:
             set_warmup_active(False)
-        mega_cache.save(self.model_config.model)
+        mega_cache.save(self.model_config.model, sig)
 
     def _warm_up_model_inner(self) -> None:
         num_kv_cache_groups = len(self.kv_cache_config.kv_cache_groups)
