@@ -162,12 +162,19 @@ class RBLNRejectionSampler(RejectionSampler):
         )
 
         # Compute probability distribution from target logits.
+        # NOTE(RBLN): Use float16, not the upstream float32. The compiled
+        # rejection_sample graph stores its target_probs input as device half
+        # (dlf16); feeding float32 makes the compiler reinterpret the f32 bits
+        # as dlf16 via a `dummy_cast` (a bit-level relabel, not a numeric
+        # conversion), which corrupts the probabilities so the NPU primitive
+        # returns a negative num_accepted. Casting here trades some rejection-
+        # sampling precision for correctness on the NPU.
         if sampling_metadata.all_greedy:
             # For greedy decoding, `target_logits` is already a one-hot tensor
             # where the max logit is set to 1 and the rest are set to 0.
-            target_probs = target_logits
+            target_probs = target_logits.to(torch.float16)
         else:
-            target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
+            target_probs = target_logits.softmax(dim=-1, dtype=torch.float16)
         output_token_ids = self.rejection_sample(
             metadata.draft_token_ids,
             metadata.num_draft_tokens,
@@ -315,11 +322,6 @@ class RBLNRejectionSampler(RejectionSampler):
             sampling_metadata.top_k,
             sampling_metadata.top_p,
         )
-        # NOTE(RBLN): The NPU primitive may occasionally return a negative
-        # num_accepted. Clamp to 0 so downstream masks stay valid (a negative
-        # value would make accepted_pos_mask empty and shift the recovery
-        # position out of range).
-        num_accepted = num_accepted.clamp(min=0)
         # ------------------------------------------------------------------
         # 3) Compose per-position output for the first K columns:
         #      j < num_accepted[i]          -> draft token (accepted as-is)
@@ -368,9 +370,7 @@ class RBLNRejectionSampler(RejectionSampler):
         # [batch_size, 1] -> [batch_size]
         # NOTE: boolean-mask index_put below requires dtype match (it does NOT
         # cast like basic-slice assignment), so cast to output_token_ids dtype.
-        bonus = bonus_token_ids.squeeze(-1).to(
-            dtype=output_token_ids.dtype
-        )
+        bonus = bonus_token_ids.squeeze(-1).to(dtype=output_token_ids.dtype)
 
         # 4a) Fully-accepted active rows: emit the bonus token right after the
         # row's own last draft (column num_draft_tokens[i], == max_spec_len
