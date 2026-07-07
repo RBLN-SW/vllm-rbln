@@ -21,15 +21,31 @@ temporarily if needed).
 
 ---
 
-## TODO 1 — batch>1 parity on a FULL (non-truncated) model  [highest priority]
-**Why open:** L18-truncated model's MoE/EP reduce-scatter is numerically order-sensitive and
-its argmax is full of near-ties, so **sync itself** differs between `VLLM_RBLN_SORT_BATCH=0`
-and `1` at batch>1 — token parity on L18 is meaningless. The deferred argmax was shown reliable
-(device-vs-host mismatch = 0), so this is a *validation* gap, not a known bug.
-**Do:** run a full (all-layers) gpt-oss on DP4+EP with `--batch N>1`, sync vs defer, compare
-tokens per prompt. Include an **EOS/stop batch>1** case (the dummy-step fix should generalize,
-but batch>1 EOS is untested).
-**Pass:** defer == sync per prompt (greedy) at batch>1 on the full model.
+## TODO 1 — batch>1 parity on a FULL (non-truncated) model  [INVESTIGATED 2026-07-07]
+**Outcome: batch>1 defer is NOT bit-exact to sync, and the cause is NOT the deferral
+feature — it is the async runtime's execution of the multi-token forward.** Details:
+
+- **Sync IS deterministic** run-to-run on the full model at batch>1 (2 runs, 16/16 identical),
+  unlike L18. So the reference is stable and divergence is meaningful.
+- Full model DP4+EP `--batch 4 --num-prompts 4` (16 prompts), tok64, greedy: **defer diverges
+  from sync on ~11/16 prompts** and is **nondeterministic run-to-run** (near-tie token flips,
+  scattered positions). This is *not* the token-0 materialization race (that is fixed — 0 zeros).
+- **Root cause isolated with `RBLN_DYNAMO_ASYNC=1`** (async I/O on the worker thread, but
+  *blocking* await inline — no overlap, no deferred sampler): it *also* diverges from sync AND
+  is nondeterministic at batch>1. So the divergence comes from running the multi-token forward
+  **on the async worker thread** (vs sync's main thread), independent of the overlap/deferral.
+  Likely the cross-rank MoE/EP reduce-scatter losing the tight main-thread lockstep (the per-step
+  DP `num_tokens` all_reduce barrier) that keeps sync's FP reduction order deterministic.
+- **Cannot be fixed by retiming the sampler.** A real fix would need the async worker's forward
+  to reproduce sync's cross-rank ordering — out of scope for this feature and likely a
+  runtime-level concern. `RBLN_DYNAMO_ASYNC=1` is the codebase's intended "functionally-sync
+  validation" mode, so its batch>1 nondeterminism is arguably a runtime defect worth a separate fix.
+
+**Conclusion:** batch=1 is the bit-exact-safe config (see TODO 3 — DONE). batch>1 with the async
+forward produces valid-but-nondeterministic near-tie-different tokens. Recommend gating the
+feature to batch=1 until the async-runtime multi-token nondeterminism is resolved.
+
+**batch>1 EOS/stop:** not run (moot until batch>1 numerics are deterministic).
 
 ## TODO 2 — non-greedy sampling (temperature>0 / top-p / top-k)
 **Why open:** the deferred thunk runs the **same** device sampler with all logits processors,
@@ -42,11 +58,14 @@ non-greedy (check whether anything implicitly assumes greedy/argmax), and that `
 **Pass:** defer == sync under a fixed seed (greedy-equivalent determinism), or matched
 distribution.
 
-## TODO 3 — full-model parity + perf (greedy, batch=1)
-**Why open:** only L18-truncated measured. Confirm the ~19% overlap win and bit-exact parity
-hold on the full model (more layers ⇒ longer forward ⇒ potentially larger overlap benefit, but
-also different all_reduce/forward ratio).
-**Pass:** defer bit-exact to sync + step latency ≤ sync on the full model.
+## TODO 3 — full-model parity + perf (greedy, batch=1)  [DONE 2026-07-07]
+**Verified on full (all-layers) gpt-oss-120b DP4+EP, batch=1:**
+- **Parity:** defer == sync, 4/4 bit-exact, and **deterministic** (run1==run2==sync).
+- **Perf (tok128):** defer decode throughput beats sync **rank-for-rank** (output toks/s
+  27.1→36.7, 28.1→37.0, 29.2→43.5, 46.3→48.5; +5%..+49%). Overlap win holds on the full model.
+- This also confirms the token-0 C++ fix (see async_overlap.md §3) preserves batch=1
+  bit-exactness and perf.
+**Pass:** ✅ defer bit-exact to sync + faster than sync on the full model at batch=1.
 
 ## TODO 4 — spec-decode interaction
 **Why open:** the `_defer_sampler` gate **excludes** spec-decode (deferral is skipped), so spec

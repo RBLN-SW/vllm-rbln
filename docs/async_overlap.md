@@ -7,6 +7,17 @@ collective) behind the NPU **forward**, cutting decode step latency while stayin
 `tok64` output bit-exact to sync. Both fixed-length and **EOS/stop workloads** (early,
 variable-length termination across DP ranks) are bit-exact to sync and deterministic.
 
+**Full-model batch=1 verified (2026-07-07):** on the full (all-layers) gpt-oss-120b DP4+EP,
+batch=1 greedy is **bit-exact to sync + deterministic** (run-to-run), and tok128 decode
+throughput beats sync **rank-for-rank** (+5%..+49%). The token-0 fix (§3) preserves this.
+
+**Scope — batch=1 only for bit-exactness.** At **batch>1** the async forward is *not* bit-exact
+to sync and is **nondeterministic** run-to-run (near-tie token flips). This is **not** a
+deferral bug — it reproduces with `RBLN_DYNAMO_ASYNC=1` (no overlap, eager sampler), i.e. it
+comes from running the multi-token forward on the async worker thread (cross-rank MoE/EP
+reduce-scatter losing sync's main-thread lockstep). See `async_overlap_TODO.md` TODO 1. Until
+that runtime-level nondeterminism is resolved, the feature should be treated as **batch=1**.
+
 The feature is gated behind `RBLN_DYNAMO_ASYNC=defer` (plus RBLN device sampler +
 async scheduling). With the gate off, behavior is identical to dev.
 
@@ -105,6 +116,18 @@ Two repos change. **rebel_compiler has C++ changes (needs a build)**; vllm-rbln 
   `async/async_result_map.cc`** (+ headers): a shared single-worker FIFO async runtime.
   Submissions run in order on one worker thread; `Await(rid, timeout)` blocks on a result
   map until that submission completes (`timeout==0` ⇒ 1 h, i.e. effectively blocking).
+  - **token-0 fix (`async_runtime.cc` `ProcessAsyncIO` + `runtime_instance.h`
+    `WaitForDeviceCompletion()`)**: `RuntimeInstance::Run()` only *dispatches* onto the
+    context's default stream; a later reader sees the output only if it issues on the SAME
+    stream. Sync's D2H readback is on the caller thread (naturally ordered after Run()), but
+    the async worker runs Run() on its own thread while the main thread reads the output back
+    on a different stream — so `Await(rid)` returned *before* the output DMA completed, and a
+    batched output could be read mid-DMA → spurious **token-0** (batch=1's tiny output finished
+    within the timing slop and hid it; batch>1 exposed it). Fix: the worker calls
+    `WaitForDeviceCompletion()` (thin wrapper over the existing `EnsureAllTasksCompleted()`)
+    after `Run()`, so `Await` now implies full materialization. Async-path only; sync `Run()`
+    is unchanged. Overlap is preserved (the drain is on the worker thread; the main thread keeps
+    doing its DP all_reduce). rebel_compiler `async-overlap` 4c57f496.
 - **`rebel/src/pyrbln_impl/runtime.cc`, `pyrbln/compiled_model.cc`** (+ header): the
   `PyRblnAsyncRuntime` binding — `run_io(device_inputs, cpu_inputs, device_outputs,
   cpu_outputs)` submits a graph non-blocking and returns a request id; `await_task(rid,
