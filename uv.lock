@@ -2125,8 +2125,8 @@ wheels = [
 
 [[package]]
 name = "rebel-compiler"
-version = "0.11.1.dev160+g7bd15fb8"
-source = { registry = "https://pypi.rebellions.in/simple/" }
+version = "0.11.1.dev224+gb0b1b8d9"
+source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
 dependencies = [
     { name = "attrs", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "cloudpickle", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
@@ -2147,7 +2147,10 @@ dependencies = [
     { name = "typing-extensions", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
 ]
 wheels = [
-    { url = "https://pypi.rebellions.in/api/package/rebel-compiler/rebel_compiler-0.11.1.dev160+g7bd15fb8-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "sha256:1283b6c86ccff3bc71855a5baaf433ebdb75d55870c4485148dc09d31c4a27ea" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/rebel-compiler/0.11.1.dev224+gb0b1b8d9/rebel_compiler-0.11.1.dev224+gb0b1b8d9-cp310-cp310-manylinux_2_34_x86_64.whl", hash = "md5:8ad24aefa5dedbea3750e17940b5ea68" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/rebel-compiler/0.11.1.dev224+gb0b1b8d9/rebel_compiler-0.11.1.dev224+gb0b1b8d9-cp311-cp311-manylinux_2_34_x86_64.whl", hash = "md5:a973cf7e98c07ed8291ac3fb4b753fdf" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/rebel-compiler/0.11.1.dev224+gb0b1b8d9/rebel_compiler-0.11.1.dev224+gb0b1b8d9-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "md5:43a3d4fdc90bba4004040840767f2ee8" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/rebel-compiler/0.11.1.dev224+gb0b1b8d9/rebel_compiler-0.11.1.dev224+gb0b1b8d9-cp313-cp313-manylinux_2_34_x86_64.whl", hash = "md5:a1e8193d2f9bd4d03ddd686e2a717127" },
 ]
 
 [[package]]
