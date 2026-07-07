@@ -4,7 +4,8 @@ This branch hides the per-step **DP `num_tokens` `all_reduce`** (a host-side glo
 collective) behind the NPU **forward**, cutting decode step latency while staying
 **token-identical to dev's synchronous path** (greedy). Measured on gpt-oss-120b
 (L18, DP4, batch=1, greedy): **2.43 s/it vs dev-sync 3.01 s/it — ~19% faster**, with
-`tok64` output bit-exact to sync.
+`tok64` output bit-exact to sync. Both fixed-length and **EOS/stop workloads** (early,
+variable-length termination across DP ranks) are bit-exact to sync and deterministic.
 
 The feature is gated behind `RBLN_DYNAMO_ASYNC=defer` (plus RBLN device sampler +
 async scheduling). With the gate off, behavior is identical to dev.
@@ -145,9 +146,10 @@ Two repos change. **rebel_compiler has C++ changes (needs a build)**; vllm-rbln 
     until `_ensure_sampled()` runs the deferred argmax thunk once (lock-guarded);
     `_done_event`/`capture_host()` copy the tokens to host on the main thread;
     `get_output()` (runs on vLLM's async-copy thread) **waits** on `_done_event` rather than
-    computing there. `_final_step_capture()` is the last-resort path for a deferred output
-    with no following step (uses `force_sync()`; reached only by discarded EOS trailing
-    steps).
+    computing there. `_final_step_capture()` is a placeholder safety net (emits a host
+    zero-tensor, **no device work**): the async-copy thread is main-thread-affine for RBLN
+    device execution, so running the argmax there would race the main thread's next forward
+    and corrupt its tokens. With the drain below it is no longer reached in practice.
   - `sample_tokens()` — the `_defer_sampler` gate: `RBLN_DYNAMO_ASYNC==defer` + async
     scheduling + RBLN device sampler + device tensor + no spec-decode + logits present +
     not prefill + not warmup, **and not a terminal step** (below). When set: skip the eager
@@ -160,14 +162,25 @@ Two repos change. **rebel_compiler has C++ changes (needs a build)**; vllm-rbln 
     num_prompt_tokens + max_tokens`; look-ahead = `max_concurrent_batches`). The scheduler
     schedules no next step, so there is nowhere to run the deferred argmax on the main
     thread — such a step is **not deferred** and samples eagerly instead (no overlap is lost
-    because there is no next `all_reduce`). EOS/stop stops aren't detectable ahead but
-    self-heal (async look-ahead already dispatched a trailing step that captures the token).
-  - **`_prepare_inputs` deferred drain (the hot path)**: `await_pending(prev step's
-    forward)` → run the deferred argmax **async** (`_ensure_sampled`, `skip_int32_cast`) →
-    `await_pending(consume_pending_async())` to materialize it → **cast int64→int32 on the
-    now-settled result** → publish `prev_sampled_token_ids` (device feedback for the next
-    step) → `capture_host()`. Keeping the argmax async is what preserves the ~19% speedup.
+    because there is no next `all_reduce`). EOS/stop stops aren't detectable ahead; they are
+    handled by the drain below (every deferred output is captured on the main thread).
+  - **`_drain_prev_output()` — main-thread capture of the previous step's deferred output**:
+    `await_pending(prev step's forward)` → run the deferred argmax **async**
+    (`_ensure_sampled`, `skip_int32_cast`) → `await_pending(consume_pending_async())` to
+    materialize it → **cast int64→int32 on the now-settled result** → publish
+    `prev_sampled_token_ids` (device feedback for the next step) → `capture_host()`. Keeping
+    the argmax async is what preserves the ~19% speedup. Called from **two** main-thread
+    sites: (a) the start of each `_prepare_inputs` (the hot decode path), and (b) **before
+    `execute_model`'s empty-step (`num_scheduled_tokens == 0`) early return**. Site (b) is the
+    EOS/stop correctness fix: when one DP rank finishes early, the still-generating ranks run
+    a **DP dummy step** that has no scheduled tokens and returns `EMPTY_MODEL_RUNNER_OUTPUT`
+    before `_prepare_inputs` — without the drain there, the previous real step's deferred
+    output is orphaned (never captured on the main thread), `get_output` falls to the
+    copy-thread `_final_step_capture`, and that output token is lost (racy garbage /
+    placeholder 0) even though the argmax still runs for feedback. Draining at (b) keeps every
+    token captured on the main thread. **Verified**: EOS/stop workload (DP4, `stop_token_ids`,
+    variable lengths) is now bit-exact to sync and deterministic across runs.
   - `_bookkeeping_sync()` tolerates `sampler_output is None` (the deferred phase stores the
     feedback/tokens later).
-  - Eager/terminal `_sample` and `_final_step_capture` wrap the argmax in `force_sync()`
-    (same int32-cast race, but these are once-per-generation so blocking costs nothing).
+  - Eager/terminal `_sample` wraps the argmax in `force_sync()` (same int32-cast race, but
+    once-per-generation so blocking costs nothing).

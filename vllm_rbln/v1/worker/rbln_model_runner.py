@@ -306,42 +306,32 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
         self._done_event.set()
 
     def _final_step_capture(self) -> None:
-        """Last-resort capture for a deferred output with no next _prepare_inputs.
+        """Placeholder capture for a deferred output with no next _prepare_inputs.
 
         With terminal-step detection in sample_tokens (max_tokens-terminal steps are
         sampled eagerly on the main thread, not deferred), the only steps that reach
         here are the extra SPECULATIVE step the async scheduler dispatches after an
-        EOS/stop token — whose output is discarded because the request already
-        finished. So this path is effectively dead for real output tokens; it exists
-        only as a safety net.
+        EOS/stop token — whose output the engine discards because the request already
+        finished.
 
-        Runs the SAME device sampler as every other step (via the deferred thunk), so
-        no host substitution. NOTE: this runs on vLLM's async-copy thread, where RBLN
-        device execution is main-thread-affine and the argmax device graph can return
-        garbage (token 0) — acceptable only because whatever reaches here is discarded.
-        A real output token must never depend on this path (see terminal detection).
+        This runs on vLLM's async-copy thread. Running the deferred argmax device
+        graph here (as an earlier version did) executes device work CONCURRENTLY with
+        the main thread's next forward and corrupts THAT step's kept tokens — a
+        nondeterministic cross-step/-request race that only surfaces on EOS/stop
+        workloads (fixed-length runs never reach this path). RBLN device execution is
+        main-thread-affine, so no device work is safe here. Since whatever reaches
+        here is discarded anyway, fabricate a host placeholder instead of touching the
+        device at all. (The old path already tolerated a garbage token 0 for the same
+        reason — this just removes the device race that produced collateral damage.)
         """
-        from rebel.sync_runtime import (
-            await_pending,
-            consume_pending_async,
-            force_sync,
+        logger.warning(
+            "deferred final-step capture reached on async-copy thread; emitting "
+            "placeholder for discarded speculative step (nreqs=%d)",
+            self._deferred_nreqs,
         )
-
-        # The async-copy thread does not have the RBLN device context bound
-        # (current_platform.set_device is a no-op on RBLN), so bind it here.
-        try:
-            torch.rbln.set_device(self._device_index)
-        except Exception as _e:  # pragma: no cover
-            logger.warning("final-step set_device failed: %s", _e)
-        await_pending(self._pending_snapshot)
-        torch.rbln.synchronize(self._device_index)
-        # Run the argmax blocking so its output is materialized (the async output
-        # path intermittently returns token 0).
-        with force_sync():
-            self._ensure_sampled()
-        await_pending(consume_pending_async())
-        torch.rbln.synchronize(self._device_index)
-        self._sampled_token_ids_cpu = self._sampled_token_ids.to("cpu")
+        self._sampled_token_ids_cpu = torch.zeros(
+            (self._deferred_nreqs, 1), dtype=torch.int64, device="cpu"
+        )
         self._captured = True
 
     def get_output(self) -> ModelRunnerOutput:
@@ -1382,6 +1372,56 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         return encoder_seq_lens
 
+    def _drain_prev_output(self) -> None:
+        """Materialize + capture the previous step's deferred output on the MAIN
+        thread (greedy async-overlap).
+
+        Called at the start of each step's _prepare_inputs, and also before
+        execute_model's empty-step (num_scheduled_tokens == 0) early return. That
+        empty step is the DP dummy step a rank runs when other ranks are still
+        generating — it skips _prepare_inputs, so without this call the previous
+        real step's deferred output is orphaned: its capture_host never runs on the
+        main thread, get_output falls back to the copy-thread _final_step_capture,
+        and the emitted output token is lost (racy garbage / placeholder 0) even
+        though the deferred argmax later runs for feedback. Draining here keeps every
+        deferred output captured on the main thread.
+
+        Settles the previous step's forward/compute_logits via its per-step scoped
+        snapshot (no cross-step accumulation), runs the deferred DEVICE argmax on the
+        now-materialized logits, casts int64->int32 AFTER awaiting the submission
+        (casting before reads an unmaterialized buffer -> token 0), and publishes the
+        tokens as the next step's feedback.
+        """
+        _prev_out = getattr(self, "_prev_output", None)
+        _prev_pending = getattr(self, "_prev_step_pending", None)
+        if _prev_out is None and not _prev_pending:
+            return
+        from rebel.sync_runtime import await_pending, consume_pending_async
+
+        _idx = self.device.index if self.device.index is not None else 0
+        _is_deferred = (
+            _prev_out is not None and _prev_out._deferred_sample_thunk is not None
+        )
+        await_pending(_prev_pending or [])
+        torch.rbln.synchronize(_idx)
+        self._prev_step_pending = []
+        if _prev_out is not None:
+            if _is_deferred:
+                _prev_out._ensure_sampled()
+                await_pending(consume_pending_async())
+                torch.rbln.synchronize(_idx)
+                _prev_out._sampled_token_ids = _prev_out._sampled_token_ids.to(
+                    torch.int32
+                )
+                # Publish this step's sampled tokens as the next step's feedback.
+                # _prepare_input_ids remaps them to the (possibly reordered) batch
+                # via prev_req_id_to_index, so the row order here matches.
+                self.input_batch.prev_sampled_token_ids = (
+                    _prev_out._sampled_token_ids[: _prev_out._deferred_nreqs]
+                )
+            _prev_out.capture_host()
+            self._prev_output = None
+
     def _prepare_inputs(
         self,
         scheduler_output: SchedulerOutput,
@@ -1459,46 +1499,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             spec_decode_max_query_len=spec_decode_max_query_len,
         )
         assert batch_bucket_size is not None
-        _prev_out = getattr(self, "_prev_output", None)
-        _prev_pending = getattr(self, "_prev_step_pending", None)
-        if _prev_out is not None or _prev_pending:
-            from rebel.sync_runtime import await_pending, consume_pending_async
-
-            _idx = self.device.index if self.device.index is not None else 0
-            _is_deferred = (
-                _prev_out is not None
-                and _prev_out._deferred_sample_thunk is not None
-            )
-            # Settle the previous step's forward/compute_logits via its per-step scoped
-            # snapshot (same discipline as the working non-deferred defer path — no
-            # cross-step accumulation), then run the deferred DEVICE argmax on the
-            # now-materialized logits.
-            await_pending(_prev_pending or [])
-            torch.rbln.synchronize(_idx)
-            self._prev_step_pending = []
-            if _prev_out is not None:
-                if _is_deferred:
-                    # Run the deferred argmax ASYNC (submission left in flight so the
-                    # forward↔all_reduce overlap and device pipelining are preserved),
-                    # then await its submission to MATERIALIZE the int64 output before we
-                    # touch it. The sampler skipped the int32 cast (skip_int32_cast) —
-                    # casting before this await reads an unmaterialized buffer and yields
-                    # token 0 at end-of-generation — so cast to int32 here, on the
-                    # now-materialized result.
-                    _prev_out._ensure_sampled()
-                    await_pending(consume_pending_async())
-                    torch.rbln.synchronize(_idx)
-                    _prev_out._sampled_token_ids = _prev_out._sampled_token_ids.to(
-                        torch.int32
-                    )
-                    # Publish this step's sampled tokens as the next step's feedback.
-                    # _prepare_input_ids remaps them to the (possibly reordered) batch
-                    # via prev_req_id_to_index, so the row order here matches.
-                    self.input_batch.prev_sampled_token_ids = (
-                        _prev_out._sampled_token_ids[: _prev_out._deferred_nreqs]
-                    )
-                _prev_out.capture_host()
-                self._prev_output = None
+        self._drain_prev_output()
 
         # Start copying the block table (device H2D). Moved below the drain above so
         # this — the first device op of the step — never races the previous forward.
@@ -3523,6 +3524,11 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 self._process_kv_cache_copy_ops(scheduler_output.kv_cache_copy_ops)
 
             if not num_scheduled_tokens:
+                # This is a DP dummy step (other ranks are still generating). It skips
+                # _prepare_inputs, so capture the previous step's deferred output on
+                # this (main) thread first, or it is orphaned to the copy-thread
+                # _final_step_capture (lost output token — see _drain_prev_output).
+                self._drain_prev_output()
                 warm_up_phase = scheduler_output.kv_connector_metadata is None
                 if not has_kv_transfer_group() or warm_up_phase:
                     # Return empty ModelRunnerOutput if there's no work to do.
