@@ -32,7 +32,7 @@ def sparse_attn_deepseek_indexer_impl(
     q_indexer: torch.Tensor,  # [B, n_head, T, head_dim] (device layout)
     k_indexer_cur: torch.Tensor,  # [B, T, head_dim]
     k_indexer_cache: torch.Tensor,  # [num_block, partition_size, head_dim]
-    softmax_scale: float,
+    softmax_scale: torch.Tensor,
     weights: torch.Tensor,  # [B, T, n_head]
     seq_idx: torch.Tensor,
     block_table: torch.Tensor,
@@ -131,11 +131,14 @@ def _rbln_indexer_forward(
     k_cache = _resolve_kv_cache(attn_metadata, self.k_cache.layer_index)
 
     weights = weights.contiguous()  # [B, T, n_head]
+    softmax_scale = torch.tensor(
+        self.softmax_scale, dtype=torch.float32, device=q_indexer.device
+    )
     topk_index = torch.ops.rbln_custom_ops.sparse_attn_deepseek_indexer(
         q_indexer,
         k_indexer_cur,
         k_cache,
-        self.softmax_scale,
+        softmax_scale,
         weights,
         attn_metadata.seq_lens,
         attn_metadata.block_tables,
