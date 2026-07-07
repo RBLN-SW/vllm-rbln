@@ -56,7 +56,7 @@ from vllm import LLM, SamplingParams
 
 # NOTE: The model must support at least 2 images per prompt. llava-v1.6 and
 # Qwen2.5-VL both do. Swap in a locally compiled checkpoint as needed.
-MODEL = "llava-hf/llava-v1.6-mistral-7b-hf"
+MODEL = "Qwen/Qwen2.5-VL-7B-Instruct"
 
 # Number of prompts to run. Each uses the same shared image + text but a
 # different unique second image.
@@ -111,8 +111,6 @@ def build_prompts():
                 "multi_modal_data": {"image": [shared_image, unique_image]},
             }
         )
-        print("@@@ shared_image:", shared_image)
-        print("@@@ unique_image:", unique_image)
     return generating_prompts
 
 
@@ -144,6 +142,7 @@ def main():
     regular_llm = LLM(
         model=MODEL,
         block_size=16384,
+        max_model_len=32768,
         max_num_seqs=1,
         enable_prefix_caching=False,
         limit_mm_per_prompt={"image": 2},
@@ -157,6 +156,7 @@ def main():
     prefix_cached_llm = LLM(
         model=MODEL,
         block_size=16384,
+        max_model_len=32768,
         max_num_seqs=1,
         enable_prefix_caching=True,
         limit_mm_per_prompt={"image": 2},
