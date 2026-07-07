@@ -92,33 +92,10 @@ def _(q, kv_c_normed, k_pe, kv_cache, seq_idx, block_tables, scale):
     return _fake_mla_output(q, kv_c_normed)
 
 
-@torch.library.custom_op(
-    "rbln_custom_ops::sparse_attn_deepseek_mla",
-    mutates_args=["latent_cache"],
-)
-def sparse_attn_deepseek_mla_impl(
-    q_mla: torch.Tensor,  # [B, num_heads, T, qk_head_dim+rope]
-    latent_kv_c_normed: torch.Tensor,  # [B, T, kv_lora_rank] (512)
-    latent_k_pe: torch.Tensor,  # [B, T, qk_rope_head_dim] (64)
-    latent_cache: torch.Tensor,  # [num_block, partition_size, 576]
-    kv_seq_len: torch.Tensor,
-    block_table: torch.Tensor,
-    topk_index: torch.Tensor,  # [B, T, k]
-) -> torch.Tensor:
-    return _fake_mla_output(q_mla, latent_kv_c_normed)
-
-
-@torch.library.register_fake("rbln_custom_ops::sparse_attn_deepseek_mla")
-def _(
-    q_mla,
-    latent_kv_c_normed,
-    latent_k_pe,
-    latent_cache,
-    kv_seq_len,
-    block_table,
-    topk_index,
-):
-    return _fake_mla_output(q_mla, latent_kv_c_normed)
+# The sparse_attn_deepseek_mla custom op is defined and registered in
+# rebel_compiler; importing the module triggers registration so that
+# torch.ops.rbln_custom_ops.sparse_attn_deepseek_mla is available.
+from rebel.core.op.torch_custom_ops import flash_attn as _rbln_flash_attn_ops  # noqa: F401,E402
 
 
 @register_backend(AttentionBackendEnum.FLASH_ATTN_MLA)

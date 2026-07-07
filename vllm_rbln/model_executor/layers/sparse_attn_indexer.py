@@ -21,40 +21,12 @@ from vllm_rbln.v1.attention.backends.mla.indexer import (
     RBLNDeepseekV32IndexerBackend,
 )
 
+# The sparse_attn_deepseek_indexer custom op is defined and registered in
+# rebel_compiler; importing the module triggers registration so that
+# torch.ops.rbln_custom_ops.sparse_attn_deepseek_indexer is available.
+from rebel.core.op.torch_custom_ops import attn as _rbln_attn_ops  # noqa: F401
+
 logger = init_logger(__name__)
-
-
-@torch.library.custom_op(
-    "rbln_custom_ops::sparse_attn_deepseek_indexer",
-    mutates_args=["k_indexer_cache"],
-)
-def sparse_attn_deepseek_indexer_impl(
-    q_indexer: torch.Tensor,  # [B, n_head, T, head_dim] (device layout)
-    k_indexer_cur: torch.Tensor,  # [B, T, head_dim]
-    k_indexer_cache: torch.Tensor,  # [num_block, partition_size, head_dim]
-    softmax_scale: torch.Tensor,
-    weights: torch.Tensor,  # [B, T, n_head]
-    seq_idx: torch.Tensor,
-    block_table: torch.Tensor,
-    topk: int,
-) -> torch.Tensor:
-    b, _, t, _ = q_indexer.shape
-    return torch.empty((b, t, topk), device=q_indexer.device, dtype=torch.int32)
-
-
-@torch.library.register_fake("rbln_custom_ops::sparse_attn_deepseek_indexer")
-def _(
-    q_indexer,
-    k_indexer_cur,
-    k_indexer_cache,
-    softmax_scale,
-    weights,
-    seq_idx,
-    block_table,
-    topk,
-):
-    b, _, t, _ = q_indexer.shape
-    return torch.empty((b, t, topk), device=q_indexer.device, dtype=torch.int32)
 
 
 _original_indexer_cache_init = DeepseekV32IndexerCache.__init__
