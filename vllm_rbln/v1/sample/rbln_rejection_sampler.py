@@ -369,7 +369,7 @@ class RBLNRejectionSampler(RejectionSampler):
         # NOTE: boolean-mask index_put below requires dtype match (it does NOT
         # cast like basic-slice assignment), so cast to output_token_ids dtype.
         bonus = bonus_token_ids.squeeze(-1).to(
-            dtype=output_token_ids.dtype, device=device
+            dtype=output_token_ids.dtype
         )
 
         # 4a) Fully-accepted active rows: emit the bonus token right after the
