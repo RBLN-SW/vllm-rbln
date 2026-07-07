@@ -21,6 +21,7 @@ an atomic unit only when warm-up has fully succeeded.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
 import re
@@ -50,25 +51,90 @@ def _rebel_major_minor(version: str | None = None) -> str:
     return f"{match.group(1)}.{match.group(2)}" if match else "unknown"
 
 
-def config_signature(vllm_config) -> str:
-    """Hash of everything that changes the compiled graphs, keying the bundle.
+# Per-worker identity that must NOT enter the bundle signature: the rank subdir
+# separates workers and DP replicas compile identically, so the DP-degree lives
+# in parallel_config.compute_hash, not the per-worker index. vLLM's
+# compile_factors already drops LOCAL_RANK / ports but keeps VLLM_DP_RANK*.
+_PER_WORKER_ENV_DROP = frozenset({"VLLM_DP_RANK", "VLLM_DP_RANK_LOCAL"})
 
-    vLLM config hash + every (vLLM & rbln) env value + rebel major.minor. Errs
-    toward over-inclusion: a spurious factor only costs a recompile, a missed
-    one would poison a bundle.
-    """
+
+def _compile_env_factors() -> str:
+    """vLLM's worker-aligned compile env hash (rbln vars are merged into that
+    registry via rbln_envs; per-worker vars are dropped so all ranks share one
+    signature). Fall back to the full registry on old vLLM."""
+    import vllm.envs as vllm_envs
+
+    if hasattr(vllm_envs, "compile_factors"):
+        try:
+            from vllm.config.utils import hash_factors
+
+            factors = vllm_envs.compile_factors()
+            for name in _PER_WORKER_ENV_DROP:
+                factors.pop(name, None)
+            return hash_factors(factors)
+        except Exception:  # pylint: disable=broad-exception-caught
+            pass
     from vllm_rbln import rbln_envs
 
-    parts: list = [vllm_config.compute_hash()]
+    parts = []
     for name in sorted(rbln_envs.environment_variables):
+        if name in _PER_WORKER_ENV_DROP:
+            continue
         try:
             value = rbln_envs.environment_variables[name]()
         except Exception:  # pylint: disable=broad-exception-caught
             value = "<err>"
         parts.append(f"{name}={value}")
-    parts.append(f"rebel={_rebel_major_minor()}")
-    digest = hashlib.sha1("|".join(str(p) for p in parts).encode("utf-8"))
-    return digest.hexdigest()[:16]
+    return "|".join(parts)
+
+
+def _stable_compute_hash(vllm_config) -> str:
+    """vllm_config.compute_hash() leaks per-launch auto-queried open ports via
+    ParallelConfig port fields that are not in its compute_hash ignored set (e.g.
+    _coord_store_port), so the hash changes every launch. Neutralize every
+    "port"-named parallel field around the call — ports never affect the compiled
+    graph — so the signature is launch-stable."""
+    import dataclasses
+
+    pc = getattr(vllm_config, "parallel_config", None)
+    saved: dict = {}
+    if pc is not None and dataclasses.is_dataclass(pc):
+        for field in dataclasses.fields(pc):
+            if "port" in field.name.lower():
+                try:
+                    saved[field.name] = getattr(pc, field.name)
+                    object.__setattr__(pc, field.name, 0)
+                except Exception:  # pylint: disable=broad-exception-caught
+                    saved.pop(field.name, None)
+    try:
+        return vllm_config.compute_hash()
+    finally:
+        for name, value in saved.items():
+            with contextlib.suppress(Exception):
+                object.__setattr__(pc, name, value)
+
+
+def config_signature(vllm_config) -> str:
+    """Hash of everything that changes the compiled graphs, keying the bundle.
+
+    vLLM config hash + vLLM's worker-aligned compile env factors + rebel
+    major.minor. Env factors drop per-worker vars (LOCAL_RANK, ports, ...) and
+    per-launch open ports are blanked, so all TP/DP ranks across launches share
+    one signature and the rank subdir isolates their shards.
+    """
+    cfg = _stable_compute_hash(vllm_config)
+    env = _compile_env_factors()
+    rebel = _rebel_major_minor()
+    digest = hashlib.sha1("|".join([cfg, env, f"rebel={rebel}"]).encode("utf-8"))
+    sig = digest.hexdigest()[:16]
+    logger.info(
+        "mega-cache config_signature=%s (cfg=%s env=%s rebel=%s)",
+        sig,
+        cfg[:8],
+        hashlib.sha1(env.encode("utf-8")).hexdigest()[:8],
+        rebel,
+    )
+    return sig
 
 
 def bundle_path(model: str, sig: str) -> str:
