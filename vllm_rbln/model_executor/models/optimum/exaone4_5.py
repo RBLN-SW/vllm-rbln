@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from dataclasses import replace
 from typing import Any
 
 import torch
@@ -115,10 +116,11 @@ class RBLNOptimumExaone4_5_ForConditionalGeneration(
     def build_prefill_forward_inputs(
         self,
         model_input: ModelInputForRBLN,
-    ) -> tuple[torch.Tensor, torch.Tensor | None, float | None]:
-        """Prefill: merge text + multimodal embeddings and return
-        ``(inputs_embeds, position_embed, rope_delta)``. EXAONE-4.5 does not use
-        MRoPE, so ``position_embed`` and ``rope_delta`` are always ``None``.
+        mrope_position_deltas: dict[str, float],
+    ) -> ModelInputForRBLN:
+        """Prefill: merge text + multimodal embeddings and return a
+        ``model_input`` with ``inputs_embeds`` filled in. EXAONE-4.5 does not use
+        MRoPE, so ``mrope_position_deltas`` is left untouched.
         """
         input_ids = model_input.input_tokens
         image_input = None
@@ -135,7 +137,7 @@ class RBLNOptimumExaone4_5_ForConditionalGeneration(
         inputs_embeds = self.preprocess_prefill(
             input_ids, attention_mask, image_input, video_input
         )
-        return inputs_embeds, None, None
+        return replace(model_input, inputs_embeds=inputs_embeds)
 
     def get_language_model(self):
         return self.model
