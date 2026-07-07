@@ -15,13 +15,18 @@
 """Make torch.accelerator.empty_cache() a no-op when there's no accelerator.
 
 On shutdown, vLLM calls torch.accelerator.empty_cache() for any non-CPU
-platform. RBLN is non-CPU but runs on a CPU-only torch build with no torch
-accelerator (NPU memory belongs to the rebel runtime), so torch 2.11 raises
-"Cannot access accelerator device when none is available" and the EngineCore
-dies during cleanup.
+platform. RBLN is non-CPU but runs on a CPU-only torch build; NPU memory is
+owned by the rebel runtime, so torch has nothing to free. Two shutdown-time
+failure modes have been observed:
+  - torch raises "Cannot access accelerator device when none is available"
+    when no accelerator is registered at all; and
+  - when torch-rbln registers an accelerator, torch instead calls the native
+    torch._C._accelerator_emptyCache(), which dispatches into torch-rbln and
+    needs librbln-thunk.so; on compile/CPU-only nodes without it the native
+    call SEGFAULTS (uncatchable), killing the EngineCore.
 
-We wrap empty_cache() to swallow that one case; other errors propagate.
-Applied via register_ops() at plugin load.
+Since there is nothing to free either way, we make empty_cache() a full no-op
+for RBLN. Applied via register_ops() at plugin load.
 """
 
 # NOTE(eunji.lee):
@@ -36,14 +41,14 @@ _PATCHED = False
 
 
 def _safe_empty_cache(orig):
+    # RBLN has no torch-accelerator memory to free (NPU memory is owned by the
+    # rebel runtime). Routing to the original dispatches into
+    # torch._C._accelerator_emptyCache() -> torch-rbln, which needs
+    # librbln-thunk.so; on compile/CPU-only nodes without it the native call
+    # SEGFAULTS (not a catchable RuntimeError), killing the EngineCore during
+    # shutdown. There is nothing to free either way, so no-op entirely.
     def _wrapper(*args, **kwargs):
-        try:
-            return orig(*args, **kwargs)
-        except RuntimeError as e:
-            # Only swallow the "no accelerator at all" case; surface anything else.
-            if "none is available" in str(e):
-                return None
-            raise
+        return None
 
     return _wrapper
 
