@@ -70,7 +70,7 @@ from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, Schedul
 
 from vllm_rbln.forward_context import set_forward_context
 from vllm_rbln.v1.core.rbln_scheduler import RBLNSchedulerOutput
-from vllm_rbln.v1.worker.utils import resolve_compile_context
+from vllm_rbln.v1.sample.rbln_sampler import resolve_compile_context
 
 if TYPE_CHECKING:
     from vllm_rbln.v1.core.rbln_kv_cache_manager import KVCacheCopyOp
