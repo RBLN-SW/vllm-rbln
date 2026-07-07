@@ -263,6 +263,7 @@ class RBLNSampler(VLLMSampler):
         sampling_metadata: SamplingMetadata,
         predict_bonus_token: bool = False,
         logprobs_mode_override: LogprobsMode | None = None,
+        skip_int32_cast: bool = False,
     ) -> SamplerOutput:
         logprobs_mode = logprobs_mode_override or self.logprobs_mode
         # NOTE(woosuk): Use the original logits (before any penalties or
@@ -310,7 +311,12 @@ class RBLNSampler(VLLMSampler):
             )
 
         # Use int32 to reduce the tensor size.
-        sampled = sampled.to(torch.int32)
+        # Deferred (async-overlap) path: skip the cast here and keep int64. In defer
+        # mode the argmax runs async; casting its output now (before the submission is
+        # awaited) reads an unmaterialized buffer and yields token 0 at end-of-generation.
+        # The caller casts to int32 AFTER awaiting the argmax, on materialized data.
+        if not skip_int32_cast:
+            sampled = sampled.to(torch.int32)
 
         # These are GPU tensors.
         sampler_output = SamplerOutput(

@@ -216,20 +216,42 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
         self._invalid_req_indices = invalid_req_indices
         self._device_index = device_index
 
+        # Deferred sampler: when the argmax is deferred to the next step (greedy
+        # async-overlap), sampled_token_ids is None here and this thunk produces the
+        # device tensor once logits are materialized. Set by the runner; run exactly
+        # once by _ensure_sampled() (from the next step's _prepare_inputs, or here as
+        # a final-step fallback in get_output/capture_host).
+        self._deferred_sample_thunk = None
+        # Set by the runner for deferred outputs: the request count.
+        self._deferred_nreqs = 0
+
         # Keep a reference to the device tensor to avoid it being
         # deallocated until we finish copying it to the host.
         self._sampled_token_ids = sampled_token_ids
 
-        self._sampled_token_ids_cpu = torch.empty(
-            self._sampled_token_ids.shape,
-            dtype=self._sampled_token_ids.dtype,
-            device="cpu",
+        # When deferred, the shape isn't known until the thunk runs; allocate the
+        # host buffer lazily in capture_host()/get_output().
+        self._sampled_token_ids_cpu = (
+            None
+            if sampled_token_ids is None
+            else torch.empty(
+                sampled_token_ids.shape,
+                dtype=sampled_token_ids.dtype,
+                device="cpu",
+            )
         )
         # In async-forward (RBLN_DYNAMO_ASYNC=defer) mode the forward/sampler are still
         # in flight on the runtime worker here, so the sampled-token device tensor isn't
         # populated yet — defer the D2H to get_output(), after draining the async work.
         # (This deferral is exactly what lets forward(N) overlap step N+1's host prep.)
         self._defer_copy = os.environ.get("RBLN_DYNAMO_ASYNC") == "defer"
+        # Deferred-sampler output: the greedy argmax runs on the MAIN thread in the next
+        # step's _prepare_inputs (capture_host). get_output runs on vLLM's async-copy
+        # thread, so it must NOT compute here — it waits on this event for the main
+        # thread's capture, avoiding a race on the shared sampled-token tensor.
+        self._is_deferred_output = sampled_token_ids is None
+        self._done_event = threading.Event()
+        self._lock = threading.Lock()
         # This step's async submissions (forward + sampler), claimed by the runner
         # right before building this output. The next step's _prepare_inputs drains
         # them (after its all_reduce, before its device ops); get_output awaits the
@@ -248,6 +270,17 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
             )
             self._captured = True
 
+    def _ensure_sampled(self) -> None:
+        """Run the deferred argmax exactly once (greedy async-overlap).
+
+        The caller must have materialized this step's logits first (drained the
+        in-flight forward/compute_logits). Idempotent: a no-op once run.
+        """
+        with self._lock:
+            if self._deferred_sample_thunk is not None:
+                self._sampled_token_ids = self._deferred_sample_thunk()
+                self._deferred_sample_thunk = None
+
     def capture_host(self) -> None:
         """Copy the sampled tokens to the host on the runner's main thread.
 
@@ -260,8 +293,55 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
         """
         if self._captured:
             return
+        self._ensure_sampled()
         torch.rbln.synchronize(self._device_index)
+        if self._sampled_token_ids_cpu is None:
+            self._sampled_token_ids_cpu = torch.empty(
+                self._sampled_token_ids.shape,
+                dtype=self._sampled_token_ids.dtype,
+                device="cpu",
+            )
         self._sampled_token_ids_cpu.copy_(self._sampled_token_ids, non_blocking=False)
+        self._captured = True
+        self._done_event.set()
+
+    def _final_step_capture(self) -> None:
+        """Last-resort capture for a deferred output with no next _prepare_inputs.
+
+        With terminal-step detection in sample_tokens (max_tokens-terminal steps are
+        sampled eagerly on the main thread, not deferred), the only steps that reach
+        here are the extra SPECULATIVE step the async scheduler dispatches after an
+        EOS/stop token — whose output is discarded because the request already
+        finished. So this path is effectively dead for real output tokens; it exists
+        only as a safety net.
+
+        Runs the SAME device sampler as every other step (via the deferred thunk), so
+        no host substitution. NOTE: this runs on vLLM's async-copy thread, where RBLN
+        device execution is main-thread-affine and the argmax device graph can return
+        garbage (token 0) — acceptable only because whatever reaches here is discarded.
+        A real output token must never depend on this path (see terminal detection).
+        """
+        from rebel.sync_runtime import (
+            await_pending,
+            consume_pending_async,
+            force_sync,
+        )
+
+        # The async-copy thread does not have the RBLN device context bound
+        # (current_platform.set_device is a no-op on RBLN), so bind it here.
+        try:
+            torch.rbln.set_device(self._device_index)
+        except Exception as _e:  # pragma: no cover
+            logger.warning("final-step set_device failed: %s", _e)
+        await_pending(self._pending_snapshot)
+        torch.rbln.synchronize(self._device_index)
+        # Run the argmax blocking so its output is materialized (the async output
+        # path intermittently returns token 0).
+        with force_sync():
+            self._ensure_sampled()
+        await_pending(consume_pending_async())
+        torch.rbln.synchronize(self._device_index)
+        self._sampled_token_ids_cpu = self._sampled_token_ids.to("cpu")
         self._captured = True
 
     def get_output(self) -> ModelRunnerOutput:
@@ -269,25 +349,24 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
 
         This function blocks until the copy is finished.
         """
-        if self._defer_copy and not self._captured:
-            # Fallback path (e.g. the final step, which has no next _prepare_inputs
-            # to call capture_host): await this step's forward/sampler, then copy.
-            # The buffer is still intact here because no later step has run. This
-            # runs on vLLM's WorkerAsyncOutputCopy thread (outside inference_mode),
-            # so copy out-of-place — an in-place copy_ into the inference-mode host
-            # buffer is rejected ("Inplace update to inference tensor").
+        if self._is_deferred_output:
+            # The deferred argmax runs on the MAIN thread (next step's _prepare_inputs
+            # -> capture_host). Wait for that here instead of racing it on this copy
+            # thread. The final step has no next _prepare_inputs, so fall back after a
+            # short wait.
+            if not self._captured and not self._done_event.wait(timeout=10.0):
+                self._final_step_capture()
+        elif self._defer_copy and not self._captured:
+            # Non-deferred defer path: forward/sampler are done (drained by the next
+            # step or here); copy out-of-place on this thread.
             from rebel.sync_runtime import await_pending
 
             await_pending(self._pending_snapshot)
             torch.rbln.synchronize(self._device_index)
             self._sampled_token_ids_cpu = self._sampled_token_ids.to("cpu")
             self._captured = True
-
-        torch.rbln.synchronize(self._device_index)
-
-        # Release the device tensor once the copy has completed
-        if hasattr(self, "_sampled_token_ids"):
-            del self._sampled_token_ids
+        else:
+            torch.rbln.synchronize(self._device_index)
 
         valid_sampled_token_ids = self._sampled_token_ids_cpu.tolist()
         for i in self._invalid_req_indices:
@@ -559,6 +638,16 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.use_async_scheduling = self.scheduler_config.async_scheduling
         # self.async_output_copy_stream = torch.cuda.Stream() if \
         #     self.use_async_scheduling else None
+        # Async look-ahead depth = the engine's batch_queue size = executor
+        # max_concurrent_batches (see MultiprocExecutor.max_concurrent_batches): 2 for
+        # async scheduling without PP, else pipeline_parallel_size. The terminal-step
+        # detection in sample_tokens uses this to know how far ahead the scheduler has
+        # already committed steps (num_computed_tokens leads the committed outputs by
+        # up to this many placeholder tokens).
+        _pp = self.parallel_config.pipeline_parallel_size
+        self._async_lookahead = (
+            2 if _pp <= 1 and self.use_async_scheduling else _pp
+        )
 
         # Cache the device properties.
         self._init_device_properties()
@@ -1370,17 +1459,44 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             spec_decode_max_query_len=spec_decode_max_query_len,
         )
         assert batch_bucket_size is not None
+        _prev_out = getattr(self, "_prev_output", None)
         _prev_pending = getattr(self, "_prev_step_pending", None)
-        if _prev_pending:
-            from rebel.sync_runtime import await_pending
+        if _prev_out is not None or _prev_pending:
+            from rebel.sync_runtime import await_pending, consume_pending_async
 
-            await_pending(_prev_pending)
+            _idx = self.device.index if self.device.index is not None else 0
+            _is_deferred = (
+                _prev_out is not None
+                and _prev_out._deferred_sample_thunk is not None
+            )
+            # Settle the previous step's forward/compute_logits via its per-step scoped
+            # snapshot (same discipline as the working non-deferred defer path — no
+            # cross-step accumulation), then run the deferred DEVICE argmax on the
+            # now-materialized logits.
+            await_pending(_prev_pending or [])
+            torch.rbln.synchronize(_idx)
             self._prev_step_pending = []
-            # The previous step's sampler is now complete and its (shared, reused)
-            # sampled-token buffer is not yet overwritten by this step — copy those
-            # tokens to the host now, before the device work below reuses the buffer.
-            _prev_out = getattr(self, "_prev_output", None)
             if _prev_out is not None:
+                if _is_deferred:
+                    # Run the deferred argmax ASYNC (submission left in flight so the
+                    # forward↔all_reduce overlap and device pipelining are preserved),
+                    # then await its submission to MATERIALIZE the int64 output before we
+                    # touch it. The sampler skipped the int32 cast (skip_int32_cast) —
+                    # casting before this await reads an unmaterialized buffer and yields
+                    # token 0 at end-of-generation — so cast to int32 here, on the
+                    # now-materialized result.
+                    _prev_out._ensure_sampled()
+                    await_pending(consume_pending_async())
+                    torch.rbln.synchronize(_idx)
+                    _prev_out._sampled_token_ids = _prev_out._sampled_token_ids.to(
+                        torch.int32
+                    )
+                    # Publish this step's sampled tokens as the next step's feedback.
+                    # _prepare_input_ids remaps them to the (possibly reordered) batch
+                    # via prev_req_id_to_index, so the row order here matches.
+                    self.input_batch.prev_sampled_token_ids = (
+                        _prev_out._sampled_token_ids[: _prev_out._deferred_nreqs]
+                    )
                 _prev_out.capture_host()
                 self._prev_output = None
 
@@ -2259,6 +2375,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         spec_decode_metadata: SpecDecodeMetadata | None,
         sampling_metadata_override: "SamplingMetadata | None" = None,
         num_reqs_override: int | None = None,
+        skip_int32_cast: bool = False,
     ) -> SamplerOutput:
         # C9b: when the sampler runs on the device thread (deferred), the main
         # thread's EM(N+1) _update_states may reassign input_batch state
@@ -2310,52 +2427,13 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         else:
             # use a dummy context manager that does nothing
             capture_ctx = contextlib.nullcontext()
-        # C9 de-risk probe (VLLM_RBLN_EAGEROUT_PROBE=1, default off): does rebel's
-        # eager_out (set_out_tensor) let us pre-allocate the sampler's
-        # sampled_token_ids so the main thread holds the handle before the device
-        # runs? This is the crux of deferring the sampler to the device thread
-        # while keeping bookkeeping on the main thread (path (a)). Logs whether
-        # the returned tensor aliases the pre-allocated one.
-        _eagerout_probe = (
-            os.environ.get("VLLM_RBLN_EAGEROUT_PROBE") == "1"
-            and spec_decode_metadata is None
-            and logits is not None
-        )
-        if _eagerout_probe:
-            from rebel.core.torch_eager import eager_execution_helper
-
-            # Match the compiled greedy-sample op output exactly (rbln::argmax
-            # returns shape (B,) int64); a smaller/narrower buffer trips the
-            # runtime vmem verify (vmem_size >= src_elem_count * dtype_size).
-            _pre = torch.empty(
-                (logits.shape[0],), dtype=torch.int64, device=logits.device
-            )
-            _helper = eager_execution_helper()
-            _helper.set_out_tensor([_pre])
-            try:
-                with capture_ctx as sampler_reports:
-                    sampler_output = self.sampler(
-                        logits=logits,
-                        sampling_metadata=sampling_metadata,
-                    )
-            finally:
-                _helper.clear_out_tensor()
-            _sid = sampler_output.sampled_token_ids
-            logger.info(
-                "EAGEROUT_PROBE alias=%s pre_shape=%s sampled_shape=%s "
-                "sampled_dtype=%s",
-                _sid.data_ptr() == _pre.data_ptr(),
-                tuple(_pre.shape),
-                tuple(_sid.shape),
-                _sid.dtype,
-            )
-            return sampler_output
         sampler_start_time = time.perf_counter()
         with capture_ctx as sampler_reports:
             if spec_decode_metadata is None:
                 sampler_output = self.sampler(
                     logits=logits,
                     sampling_metadata=sampling_metadata,
+                    skip_int32_cast=skip_int32_cast,
                 )
             else:
                 sampler_output = self.rejection_sampler(
@@ -3189,8 +3267,16 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             if envs.VLLM_RBLN_USE_DEVICE_TENSOR
             else sampler_output.sampled_token_ids.shape[0]
         )
-        sampled_token_ids = sampler_output.sampled_token_ids[:num_sampled_tokens]
-        logprobs_tensors = sampler_output.logprobs_tensors
+        if sampler_output is None:
+            # Deferred sampler (greedy async-overlap): the argmax runs later, in the
+            # next step's _prepare_inputs. Bookkeeping here only records placeholders
+            # (async scheduling) and per-req counters, none of which need the sampled
+            # values; the token feedback + host D2H are filled by the deferred phase.
+            sampled_token_ids = None
+            logprobs_tensors = None
+        else:
+            sampled_token_ids = sampler_output.sampled_token_ids[:num_sampled_tokens]
+            logprobs_tensors = sampler_output.logprobs_tensors
         invalid_req_indices = []
         logprobs_lists = None
         if not self.use_async_scheduling:
@@ -3229,7 +3315,10 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # These will be copied into input_ids in the next step
             # when preparing inputs.
             # With spec decoding, this is done in propose_draft_token_ids().
-            if self.input_batch.prev_sampled_token_ids is None:
+            if (
+                sampler_output is not None
+                and self.input_batch.prev_sampled_token_ids is None
+            ):
                 assert sampled_token_ids.shape[-1] == 1
                 self.input_batch.prev_sampled_token_ids = sampled_token_ids
             self.input_batch.prev_req_id_to_index = {
@@ -3799,13 +3888,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
             model_start_time = time.perf_counter()
 
-            _span_log = (
-                os.environ.get("VLLM_RBLN_SPAN_LOG") == "1"
-                and not is_warmup_active()
-            )
-
             def _run_forward():
-                _sp0 = time.perf_counter() if _span_log else 0.0
                 # forward + its forward-context and capture_reports all run on
                 # whichever thread calls this (the device thread once deferred),
                 # so the module-global forward context is active on that thread
@@ -3835,48 +3918,9 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         inputs_embeds=inputs_embeds,
                         **model_kwargs,
                     )
-                if _span_log:
-                    import sys as _sys
-                    print("SPAN fwd %d %.6f %.6f" % (os.getpid(), _sp0, time.perf_counter()),
-                          file=_sys.stderr, flush=True)
                 return _mo, _reports
 
-            _gil_probe = os.environ.get("VLLM_RBLN_GIL_PROBE") == "1"
-            if _gil_probe and not is_prefill_phase:
-                # GIL-availability probe (VLLM_RBLN_GIL_PROBE=1). A background
-                # thread spins a pure-Python counter (needs the GIL) during
-                # forward vs. a sleep calibration, to estimate how much of the
-                # GIL is free while the device runs. ratio~1.0 => GIL free
-                # during forward => offloading it lets all_reduce overlap.
-                _st = {"n": 0, "go": True}
-
-                def _spin() -> None:
-                    while _st["go"]:
-                        _st["n"] += 1
-
-                _t = threading.Thread(target=_spin, daemon=True)
-                _t.start()
-                _cal_dt = 0.005
-                time.sleep(_cal_dt)
-                _free_rate = _st["n"] / _cal_dt
-                _st["n"] = 0
-                _t0 = time.perf_counter()
-                model_output, reports = _run_forward()
-                _fwd_dt = time.perf_counter() - _t0
-                _during = _st["n"] / _fwd_dt if _fwd_dt > 0 else 0.0
-                _st["go"] = False
-                _t.join(timeout=1.0)
-                _ratio = _during / _free_rate if _free_rate > 0 else 0.0
-                logger.info(
-                    "GIL_PROBE forward_ms=%.2f free_rate=%.0f/s "
-                    "during_rate=%.0f/s gil_free_ratio=%.2f",
-                    _fwd_dt * 1e3,
-                    _free_rate,
-                    _during,
-                    _ratio,
-                )
-            else:
-                model_output, reports = _run_forward()
+            model_output, reports = _run_forward()
             if self.performance_tracker is not None:
                 # Stash model timing; combined with sampler timing in _sample().
                 padded_decode = (
@@ -4054,14 +4098,70 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # Clear ephemeral state.
         self.execute_model_state = None
 
+        # Deferred sampler (greedy async-overlap): keep forward/compute_logits in
+        # flight so the NEXT step's DP all_reduce overlaps this forward, and run the
+        # argmax later (next _prepare_inputs, after its drain materializes logits).
+        # Only the device sampler + async scheduling + plain greedy decode path.
+        _defer_sampler = (
+            os.environ.get("RBLN_DYNAMO_ASYNC") == "defer"
+            and self.use_async_scheduling
+            and self.use_rbln_sampler
+            and envs.VLLM_RBLN_USE_DEVICE_TENSOR
+            and spec_decode_metadata is None
+            and logits is not None
+            and logits.shape[0] > 0
+            and not self.is_prefill_phase()
+            and not is_warmup_active()
+        )
+
+        # Terminal-step detection. Deferring works by running this step's argmax in
+        # the NEXT step's _prepare_inputs (main thread). But when every scheduled
+        # request reaches max_tokens THIS step, the async scheduler suppresses the
+        # next step entirely (its schedule-time max_tokens guard), so there is no
+        # next _prepare_inputs — the deferred argmax would fall to get_output on the
+        # async-copy thread, where the argmax device graph is unreliable (returns 0).
+        # Such a step has no next all_reduce to hide behind either, so deferring buys
+        # nothing: sample it eagerly on the main thread via the normal (non-defer)
+        # path. (EOS/stop stops are not detectable here — only known post-sampling —
+        # but they self-heal: async look-ahead has already dispatched a trailing step
+        # whose _prepare_inputs captures this token on the main thread.)
+        _terminal_step = False
+        if _defer_sampler:
+            _sched = scheduler_output.num_scheduled_tokens
+            # A request's final decode step (the one producing its max_tokens-th token)
+            # is scheduled with num_computed_tokens trailing the committed outputs by up
+            # to (look-ahead - 1) in-flight placeholder tokens, so it lands at
+            # num_computed_tokens == num_prompt_tokens + max_tokens - look-ahead. Fire when
+            # nc + n + (look-ahead - 1) >= npt + max_tokens: this catches the final step
+            # (verified exact for look-ahead == 2, our async/no-PP config) and, for deeper
+            # look-ahead, at worst fires a step or two early — which only forgoes overlap
+            # on those steps (eager sampling is always correct), never a false negative
+            # that would push the terminal argmax onto the copy thread.
+            _margin = self._async_lookahead - 1
+            _terminal_step = len(_sched) > 0 and all(
+                (
+                    (_rs := self.requests.get(rid)) is not None
+                    and _rs.sampling_params is not None
+                    and _rs.sampling_params.max_tokens is not None
+                    and _rs.num_computed_tokens + n + _margin
+                    >= _rs.num_prompt_tokens + _rs.sampling_params.max_tokens
+                )
+                for rid, n in _sched.items()
+            )
+        if _terminal_step:
+            # Fall through to the eager main-thread sampler (no defer).
+            _defer_sampler = False
+
         # In defer mode the model forward and compute_logits were dispatched
         # non-blocking, so `logits` is a device tensor that may not be populated
-        # yet. self.sampler runs EAGERLY on this thread and reads `logits`, so it
-        # would sample from uncomputed logits (garbage) unless we first wait for
-        # the in-flight forward/compute_logits to finish. (Correctness takes
-        # priority over the all_reduce overlap here; recovering the overlap needs
-        # the sampler itself to run on the async worker.)
-        if os.environ.get("RBLN_DYNAMO_ASYNC") == "defer":
+        # yet. With the HOST sampler (VLLM_RBLN_SAMPLER=0) the argmax runs eagerly
+        # on this thread and would read uncomputed logits (garbage), so we must
+        # drain first. With the RBLN device sampler the argmax is a compiled graph
+        # that submits to the SAME shared async FIFO as the forward/compute_logits,
+        # so it runs after them in order and reads correct logits without a drain —
+        # and skipping the drain lets forward(N) stay in flight so the next step's
+        # DP all_reduce overlaps it.
+        if os.environ.get("RBLN_DYNAMO_ASYNC") == "defer" and not _defer_sampler:
             from rebel.sync_runtime import drain_pending_async
 
             drain_pending_async()
@@ -4080,8 +4180,26 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             )
             logits = logits.to(original_dtype)
 
-        with record_function_or_nullcontext("Sample"):
-            sampler_output = self._sample(logits, spec_decode_metadata)
+        if _defer_sampler:
+            # Skip the argmax now; it runs in the next step's _prepare_inputs. Capture
+            # what the sampler reads (metadata reference is stable across steps; num_reqs
+            # snapshotted) so the deferred call never touches the mutated live batch.
+            sampler_output = None
+            _deferred_sampling_metadata = self.input_batch.sampling_metadata
+            _deferred_num_reqs = self.input_batch.num_reqs
+        else:
+            with record_function_or_nullcontext("Sample"):
+                if os.environ.get("RBLN_DYNAMO_ASYNC") == "defer":
+                    # In defer mode the device argmax's async output is unreliable
+                    # (intermittent token 0); run it blocking so its output is
+                    # materialized. This is the eager/terminal sampler path — the
+                    # overlap is unaffected (only the forward needs to stay async).
+                    from rebel.sync_runtime import force_sync
+
+                    with force_sync():
+                        sampler_output = self._sample(logits, spec_decode_metadata)
+                else:
+                    sampler_output = self._sample(logits, spec_decode_metadata)
 
         is_intermediate_prefill = (
             self.is_prefill_phase() and logits is not None and logits.shape[0] == 0
@@ -4137,7 +4255,11 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # step's tokens; without it the value freezes at the first decode
         # token and every later step re-feeds it. Mirrors gpu_model_runner
         # (which resets prev_sampled_token_ids right before bookkeeping).
-        if self.use_async_scheduling:
+        if self.use_async_scheduling and not _defer_sampler:
+            # In the deferred-sampler path the next step's _prepare_inputs sets
+            # prev_sampled_token_ids directly (from the deferred argmax); resetting it
+            # here would race that (pipeline may interleave this sample_tokens after the
+            # next step's _prepare_inputs) and drop the feedback token.
             self.input_batch.prev_sampled_token_ids = None
 
         with record_function_or_nullcontext("Bookkeep"):
@@ -4221,22 +4343,52 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # its device H2D ops (so device submission never races across threads).
         pending_snapshot: list = []
         if os.environ.get("RBLN_DYNAMO_ASYNC") == "defer":
+            # Per-step scoped claim of THIS step's in-flight submissions (forward +
+            # compute_logits), for the next _prepare_inputs to await. Same discipline
+            # the working non-deferred defer path uses — no cross-step accumulation.
             from rebel.sync_runtime import consume_pending_async
 
             pending_snapshot = consume_pending_async()
             self._prev_step_pending = pending_snapshot
 
-        async_output = AsyncRBLNModelRunnerOutput(
-            model_runner_output=output,
-            sampled_token_ids=sampler_output.sampled_token_ids,
-            invalid_req_indices=invalid_req_indices,
-            device_index=self.device.index if self.device.index is not None else 0,
-            pending_snapshot=pending_snapshot,
-        )
-        if os.environ.get("RBLN_DYNAMO_ASYNC") == "defer":
-            # Hand this output to the next step's _prepare_inputs so it can copy the
-            # sampled tokens to the host (capture_host) before reusing the buffer.
+        if _defer_sampler:
+            async_output = AsyncRBLNModelRunnerOutput(
+                model_runner_output=output,
+                sampled_token_ids=None,
+                invalid_req_indices=invalid_req_indices,
+                device_index=self.device.index if self.device.index is not None else 0,
+                pending_snapshot=pending_snapshot,
+            )
+            # The argmax runs in the next step's _prepare_inputs after its drain
+            # materializes these logits. Capture the metadata/num_reqs so the sampler
+            # never reads the (by-then mutated) live input_batch.
+            _dsm = _deferred_sampling_metadata
+            _dnr = _deferred_num_reqs
+            # skip_int32_cast=True: the argmax runs async, so casting its output to
+            # int32 inside the sampler (before the submission is awaited) reads an
+            # unmaterialized buffer → token 0. Keep int64 here; the drain block casts
+            # to int32 AFTER awaiting the argmax.
+            async_output._deferred_sample_thunk = lambda: self._sample(
+                logits,
+                spec_decode_metadata,
+                sampling_metadata_override=_dsm,
+                num_reqs_override=_dnr,
+                skip_int32_cast=True,
+            ).sampled_token_ids
+            async_output._deferred_nreqs = _dnr
             self._prev_output = async_output
+        else:
+            async_output = AsyncRBLNModelRunnerOutput(
+                model_runner_output=output,
+                sampled_token_ids=sampler_output.sampled_token_ids,
+                invalid_req_indices=invalid_req_indices,
+                device_index=self.device.index if self.device.index is not None else 0,
+                pending_snapshot=pending_snapshot,
+            )
+            if os.environ.get("RBLN_DYNAMO_ASYNC") == "defer":
+                # Hand this output to the next step's _prepare_inputs so it can copy the
+                # sampled tokens to the host (capture_host) before reusing the buffer.
+                self._prev_output = async_output
         return async_output
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
