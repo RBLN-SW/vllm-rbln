@@ -165,12 +165,24 @@ logger = init_logger(__name__)
 
 
 def scrub_scheduler_output_for_no_spec(scheduler_output: "SchedulerOutput") -> None:
-    """Force every scheduled request to query_len=1 for a collective no-spec step.
+    """Force every scheduled DECODE request to query_len=1 for a collective
+    no-spec step.
 
     Some rank elected no-spec this step (a cross-block backfill that can't reach
     a full speculative window), so via the cross-DP OR-reduce EVERY rank must
     drop to ``query_len=1`` and ``_prepare_inputs`` must build a uniform
     no-spec graph.
+
+    PREFILL reqs are EXCLUDED from the clamp: no-spec is a decode-only concern
+    (cross-block backfill on a decoding request). In DP/EP a rank may be running
+    chunked prefill while a *peer* decode rank trips the OR-reduce. Clamping the
+    prefill's chunk query_len to 1 would make its sampled token look like a
+    partial-prefill token (seq_lens < num_tokens), get it discarded, and lose the
+    request. A prefill keeps its full chunk length; the cross-DP query-length
+    axis is reconciled to the prefill shape by ``get_dp_padding`` (any_prefill ->
+    prefill-sized). Prefill reqs are detected from ``scheduler_output``: new reqs
+    are always prefill, and a cached req is still prefilling iff it has produced
+    no output tokens yet.
 
     We zero any in-block slide and force ``num_scheduled_tokens`` to 1, but we
     must NOT clear ``scheduled_spec_decode_tokens``: the engine's
@@ -182,20 +194,39 @@ def scrub_scheduler_output_for_no_spec(scheduler_output: "SchedulerOutput") -> N
     take the no-spec path explicitly via ``spec_decode_max_query_len=1`` rather
     than by inspecting this dict.
     """
+    # Detect prefill reqs: new reqs are always prefill; a cached req is still
+    # prefilling iff it has produced no output tokens yet.
+    prefill_req_ids = {r.req_id for r in scheduler_output.scheduled_new_reqs}
+    _cached = scheduler_output.scheduled_cached_reqs
+    for _rid, _n_out in zip(_cached.req_ids, _cached.num_output_tokens):
+        if _n_out == 0:
+            prefill_req_ids.add(_rid)
     if isinstance(scheduler_output, RBLNSchedulerOutput):
-        scheduler_output.spec_decode_slide_distance.clear()
+        for _rid in list(scheduler_output.spec_decode_slide_distance):
+            if _rid not in prefill_req_ids:
+                del scheduler_output.spec_decode_slide_distance[_rid]
     for req_id in list(scheduler_output.num_scheduled_tokens):
+        # no-spec (query_len=1) is a DECODE concern. A PREFILL req must keep its
+        # chunk query_len; clamping it to 1 discards the prefill's token and
+        # loses the request.
+        if req_id in prefill_req_ids:
+            continue
         scheduler_output.num_scheduled_tokens[req_id] = 1
     scheduler_output.total_num_scheduled_tokens = sum(
         scheduler_output.num_scheduled_tokens.values()
     )
 
-    # Verify the no-spec scrub actually eliminated every cross-block condition:
-    # with all slides cleared and every query_len forced to 1, a backfill window
-    # can no longer span two KV blocks. If this fails the scrub is incomplete and
-    # the downstream decode would still cross a block boundary.
-    assert all(v == 1 for v in scheduler_output.num_scheduled_tokens.values()), (
-        f"no-spec scrub left a query_len != 1: {scheduler_output.num_scheduled_tokens}"
+    # Verify the no-spec scrub eliminated every cross-block condition for the
+    # DECODE reqs: with their slides cleared and query_len forced to 1, a
+    # backfill window can no longer span two KV blocks. Prefill reqs are
+    # intentionally left at their chunk length.
+    assert all(
+        v == 1
+        for rid, v in scheduler_output.num_scheduled_tokens.items()
+        if rid not in prefill_req_ids
+    ), (
+        f"no-spec scrub left a decode query_len != 1: "
+        f"{scheduler_output.num_scheduled_tokens}"
     )
     assert not getattr(scheduler_output, "spec_decode_slide_distance", {}), (
         "no-spec scrub left a non-empty slide map, so a cross-block "
