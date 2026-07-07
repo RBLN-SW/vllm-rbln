@@ -20,15 +20,8 @@ from collections import defaultdict
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
-import torch
-
-try:
-    import torch.rbln
-
-    has_torch_rbln = True
-except ImportError:
-    has_torch_rbln = False
 import numpy as np
+import torch
 from vllm.config import ModelConfig, ParallelConfig
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.platforms import CpuArchEnum, current_platform
