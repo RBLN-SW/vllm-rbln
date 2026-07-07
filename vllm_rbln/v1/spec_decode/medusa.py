@@ -44,8 +44,14 @@ class RBLNMedusaProposer(MedusaProposer):
         self.hidden_states = torch.zeros(
             self.max_num_seqs, self.hidden_size, device=self.device, dtype=self.dtype
         )
-        self.compile_context = compile_context or create_compile_context(
-            use_weight_sharing=True
+        self.compile_context = (
+            compile_context
+            or create_compile_context(
+                use_weight_sharing=True,
+                use_global_ctx=True,
+            )
+            if not USE_DEVICE_TENSOR
+            else None
         )
 
     def load_model(self, target_model: nn.Module) -> None:

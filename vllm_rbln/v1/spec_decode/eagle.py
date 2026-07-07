@@ -433,9 +433,10 @@ class RBLNEagleProposer(EagleProposer):
         query_start_loc[1 : num_reqs + 1] = torch.from_numpy(cum_num_tokens)
 
         return CommonAttentionMetadata(
-            query_start_loc=query_start_loc,
+            query_start_loc=query_start_loc.to(self.device),
             query_start_loc_cpu=query_start_loc,
-            seq_lens=seq_lens,
+            seq_lens=seq_lens.to(self.device),
+            _seq_lens_cpu=seq_lens,
             num_reqs=num_reqs,
             num_actual_tokens=num_tokens,
             max_query_len=num_tokens_per_req,
@@ -514,8 +515,13 @@ class RBLNEagleProposer(EagleProposer):
         common_attn_metadata.num_actual_tokens = num_reqs
         common_attn_metadata.max_query_len = 1
         common_attn_metadata.query_start_loc = self.arange[: num_reqs + 1]
-        common_attn_metadata.query_start_loc_cpu = common_attn_metadata.query_start_loc
-        common_attn_metadata.seq_lens += 1
+        common_attn_metadata.query_start_loc_cpu = (
+            common_attn_metadata.query_start_loc.cpu()
+        )
+        common_attn_metadata._seq_lens_cpu += 1
+        common_attn_metadata.seq_lens = common_attn_metadata._seq_lens_cpu.to(
+            self.device
+        )
 
         num_reqs_padded = self.runner.bucketing_manager.find_decode_batch_bucket(
             num_reqs

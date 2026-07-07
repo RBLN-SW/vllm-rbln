@@ -65,7 +65,7 @@ def placeholder_names(gm: fx.GraphModule, max_len: int = 20) -> list[str]:
 
 def fmt_input(name: str, x: Any) -> str:
     if isinstance(x, torch.Tensor):
-        return f"{name}:{fmt_dtype(x.dtype)}{fmt_shape(x)}"
+        return f"{name}:{fmt_dtype(x.dtype)}{fmt_shape(x)}({x.device})"
     return f"{name}:{type(x).__name__}={x!r}"
 
 

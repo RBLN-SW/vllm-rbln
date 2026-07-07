@@ -879,6 +879,7 @@ class RBLNModelRunner:
             query_start_loc=self.query_start_loc.gpu[: num_reqs + 1],
             query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs + 1],
             seq_lens=self.seq_lens[:num_reqs],
+            _seq_lens_cpu=self.seq_lens[:num_reqs],
             num_reqs=num_reqs,
             num_actual_tokens=num_tokens,
             max_query_len=max_query_len,

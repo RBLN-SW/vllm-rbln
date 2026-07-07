@@ -175,7 +175,7 @@ class RBLNFlashAttentionMetadataBuilder(
     ) -> RBLNFlashAttentionMetadata:
         num_reqs = common_attn_metadata.num_reqs
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
-        seq_lens = common_attn_metadata.seq_lens
+        seq_lens = common_attn_metadata._seq_lens_cpu
         block_tables_tensor = common_attn_metadata.block_table_tensor
 
         query_seq_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
