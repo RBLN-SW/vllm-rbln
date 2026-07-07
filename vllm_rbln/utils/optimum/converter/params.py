@@ -86,6 +86,7 @@ class RBLNParams:
     max_seq_len: int | None = None
     kvcache_block_size: int | None = None
     prefill_chunk_size: int = 128
+    num_devices: int = 1
     # Image-prefill buckets for multimodal models (gemma3: single value;
     # gemma4: descending list of 128-multiples). None for non-multimodal models.
     image_prefill_chunk_size: list[int] | None = None
@@ -97,7 +98,6 @@ class RBLNParams:
     ) -> "RBLNParams":
         """Parse rbln_config according to the model architecture."""
         hf_config = vllm_config.model_config.hf_config
-        tensor_parallel_size = _cfg_get(rbln_config, "tensor_parallel_size", 1)
 
         if is_enc_dec_arch(hf_config):
             params = cls._parse_enc_dec(rbln_config)
@@ -108,7 +108,7 @@ class RBLNParams:
         else:
             params = cls._parse_decoder(rbln_config)
 
-        params.tensor_parallel_size = tensor_parallel_size
+        params.num_devices = _resolve_num_devices(rbln_config)
         return params
 
     @classmethod
@@ -200,6 +200,38 @@ class RBLNParams:
             prefill_chunk_size=prefill_chunk_size,
             image_prefill_chunk_size=image_prefill_chunk_size,
         )
+
+
+def _num_devices_of(cfg: RblnConfigLike) -> int | None:
+    val = _cfg_get(cfg, "num_devices")
+    if val is not None:
+        assert isinstance(val, int), (
+            f"num_devices must be an int, got {type(val).__name__}"
+        )
+        assert val > 0, "num_devices must be a positive integer"
+        return val
+    compile_cfgs = _cfg_get(cfg, "_compile_cfgs")
+    if isinstance(compile_cfgs, list):
+        for entry in compile_cfgs:
+            entry_val = _cfg_get(entry, "num_devices")
+            if entry_val is not None:
+                assert isinstance(entry_val, int), (
+                    f"num_devices must be an int, got {type(entry_val).__name__}"
+                )
+                assert entry_val > 0, "num_devices must be a positive integer"
+                return entry_val
+    return None
+
+
+def _resolve_num_devices(cfg: RblnConfigLike) -> int:
+    for submodule_name in ("language_model", "text_model"):
+        sub_cfg = _cfg_get_submodule(cfg, submodule_name)
+        if sub_cfg is None:
+            continue
+        sub_val = _num_devices_of(sub_cfg)
+        if sub_val is not None:
+            return sub_val
+    return _num_devices_of(cfg) or 1
 
 
 def _resolve_image_prefill_chunk_size(cfg: RblnConfigLike) -> list[int] | None:

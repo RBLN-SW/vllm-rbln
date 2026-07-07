@@ -15,7 +15,11 @@
 
 import pytest
 
-from vllm_rbln.utils.optimum.converter.params import RBLNParams
+from vllm_rbln.utils.optimum.converter.params import (
+    RBLNParams,
+    _num_devices_of,
+    _resolve_num_devices,
+)
 
 
 class TestParseDecoder:
@@ -33,7 +37,7 @@ class TestParseDecoder:
         assert params.max_seq_len == 8192
         assert params.kvcache_block_size == 4096
         assert params.prefill_chunk_size == 256
-        # tensor_parallel_size is populated by the caller
+        # num_devices is populated by the caller
         # (`from_rbln_config`), not `_parse_decoder`,
         # so it is not asserted here.
 
@@ -224,3 +228,77 @@ class TestImagePrefillChunkSize:
     def test_bool_rejected(self):
         with pytest.raises(TypeError):
             RBLNParams._parse_multimodal(self._cfg(True))
+
+
+class TestNumDevicesOf:
+    def test_top_level_num_devices(self):
+        assert _num_devices_of({"num_devices": 4}) == 4
+
+    def test_falls_back_to_compile_cfgs(self):
+        cfg = {"_compile_cfgs": [{"num_devices": 8}]}
+        assert _num_devices_of(cfg) == 8
+
+    def test_top_level_takes_precedence_over_compile_cfgs(self):
+        cfg = {"num_devices": 2, "_compile_cfgs": [{"num_devices": 8}]}
+        assert _num_devices_of(cfg) == 2
+
+    def test_first_compile_cfg_with_num_devices_wins(self):
+        cfg = {"_compile_cfgs": [{}, {"num_devices": 8}, {"num_devices": 16}]}
+        assert _num_devices_of(cfg) == 8
+
+    def test_returns_none_when_absent(self):
+        assert _num_devices_of({}) is None
+
+    def test_returns_none_when_compile_cfgs_lacks_num_devices(self):
+        assert _num_devices_of({"_compile_cfgs": [{}, {}]}) is None
+
+    def test_non_int_raises(self):
+        with pytest.raises(AssertionError, match="num_devices must be an int"):
+            _num_devices_of({"num_devices": "4"})
+
+    def test_non_positive_raises(self):
+        with pytest.raises(AssertionError, match="positive integer"):
+            _num_devices_of({"num_devices": 0})
+
+    def test_compile_cfgs_non_int_raises(self):
+        with pytest.raises(AssertionError, match="num_devices must be an int"):
+            _num_devices_of({"_compile_cfgs": [{"num_devices": 1.5}]})
+
+    def test_compile_cfgs_non_positive_raises(self):
+        with pytest.raises(AssertionError, match="positive integer"):
+            _num_devices_of({"_compile_cfgs": [{"num_devices": -1}]})
+
+
+class TestResolveNumDevices:
+    def test_top_level(self):
+        assert _resolve_num_devices({"num_devices": 4}) == 4
+
+    def test_defaults_to_one_when_absent(self):
+        assert _resolve_num_devices({}) == 1
+
+    def test_reads_from_language_model_submodule(self):
+        cfg = {"language_model": {"num_devices": 8}}
+        assert _resolve_num_devices(cfg) == 8
+
+    def test_reads_from_text_model_submodule(self):
+        cfg = {"text_model": {"num_devices": 8}}
+        assert _resolve_num_devices(cfg) == 8
+
+    def test_language_model_takes_precedence_over_top_level(self):
+        cfg = {"num_devices": 1, "language_model": {"num_devices": 8}}
+        assert _resolve_num_devices(cfg) == 8
+
+    def test_language_model_preferred_over_text_model(self):
+        cfg = {
+            "language_model": {"num_devices": 8},
+            "text_model": {"num_devices": 16},
+        }
+        assert _resolve_num_devices(cfg) == 8
+
+    def test_reads_from_submodule_compile_cfgs(self):
+        cfg = {"language_model": {"_compile_cfgs": [{"num_devices": 8}]}}
+        assert _resolve_num_devices(cfg) == 8
+
+    def test_falls_back_to_top_level_when_submodule_lacks_num_devices(self):
+        cfg = {"num_devices": 4, "language_model": {"batch_size": 2}}
+        assert _resolve_num_devices(cfg) == 4

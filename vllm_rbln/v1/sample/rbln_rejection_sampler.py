@@ -23,8 +23,12 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
+import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
-from vllm_rbln.v1.worker.utils import build_compile_options, resolve_compile_context
+from vllm_rbln.v1.sample.rbln_sampler import (
+    build_compile_options,
+    resolve_compile_context,
+)
 
 logger = init_logger(__name__)
 
@@ -60,6 +64,15 @@ class RBLNRejectionSampler(RejectionSampler):
     def __init__(self, *args, **kwargs):
         compile_context = kwargs.pop("compile_context", None)
         super().__init__(*args, **kwargs)
+        # NOTE(RBLN): synthetic-acceptance mode (vllm 0.22) is implemented only
+        # in the CPU rejection sampler. The NPU `rbln::rejection_sample`
+        # primitive ignores the synthetic rates, so refuse it here instead of
+        # silently sampling normally.
+        assert not self.synthetic_mode, (
+            "RBLNRejectionSampler does not support synthetic rejection "
+            "sampling (rejection_sample_method='synthetic'). Use the CPU "
+            "rejection sampler for this mode."
+        )
         compile_context = resolve_compile_context(compile_context)
         options = build_compile_options(compile_context)
         self.compiled_rejection_sample = torch.compile(
@@ -206,13 +219,32 @@ class RBLNRejectionSampler(RejectionSampler):
         batch_size = len(num_draft_tokens)
         num_tokens = draft_token_ids.shape[0]
         vocab_size = target_probs.shape[-1]
-
-        device = target_probs.device
+        # NOTE(eunji.lee):
+        # Currently, rejection sampler only available in cpu input tensor
+        if envs.VLLM_RBLN_USE_DEVICE_TENSOR == 1:
+            logger.warning_once(
+                "VLLM_RBLN_USE_DEVICE_TENSOR is enabled, but the RBLN rejection "
+                "sampler only supports CPU input tensors. Forcing rejection sampler "
+                "inputs to CPU."
+            )
+        # NOTE(RBLN): The NPU `rbln::rejection_sample` primitive does not
+        # handle the -1 placeholder draft id (used for grammar-invalid spec
+        # tokens when structured output is combined with speculative decoding;
+        # see vllm PR #46533). It would either emit -1 as a real token or read
+        # out of bounds. Fail fast here instead; the CPU rejection sampler
+        # handles this case. TODO(RBLN): handle -1 in the primitive.
+        assert bool((draft_token_ids >= 0).all()), (
+            "RBLNRejectionSampler received placeholder (-1) draft token ids, "
+            "which the NPU rejection_sample primitive does not support. This "
+            "happens when structured output is used together with speculative "
+            "decoding. Use the CPU rejection sampler for this combination."
+        )
         assert draft_token_ids.is_contiguous()
         assert draft_probs is None or draft_probs.is_contiguous()
         assert target_probs.is_contiguous()
         assert bonus_token_ids.is_contiguous()
         assert target_probs.shape == (num_tokens, vocab_size)
+        device = target_probs.device
 
         # Output buffer (batch space). Unwritten slots stay as PLACEHOLDER.
         output_token_ids = torch.full(

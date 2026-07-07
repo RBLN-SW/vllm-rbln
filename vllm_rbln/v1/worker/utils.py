@@ -11,16 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU affinity utilities for RBLN worker."""
+"""Utilities for the RBLN worker (CPU affinity, batch reorder, …)."""
 
-import inspect
 import math
 import os
 import platform
 from collections import defaultdict
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
-import rebel
 import torch
 
 try:
@@ -42,6 +41,9 @@ from vllm.v1.worker.block_table import MultiGroupBlockTable
 
 import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
+
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu_input_batch import InputBatch
 
 logger = init_logger(__name__)
 
@@ -587,40 +589,90 @@ def get_kv_cache_names(
     return kv_cache_names
 
 
-def resolve_compile_context(
-    compile_context: rebel.CompileContext | None,
-) -> rebel.CompileContext | None:
-    """Return a default CompileContext when one is not provided.
+def reorder_input_batch(input_batch: "InputBatch", perm: np.ndarray) -> None:
+    """Permute every per-request field of ``input_batch`` in one vectorized
+    pass (new slot ``k`` takes old index ``perm[k]``).
 
-    Used when running through the device tensor path in rbln_model_runner or
-    when triggered by optimum_model_runner.
+    Mirrors upstream ``InputBatch.swap_states`` (vllm 0.22.0) but reindexes each
+    field once instead of via N-1 pairwise swaps; the caller emits the
+    logits-processor move records. Keep the field set in sync with
+    ``swap_states`` on vLLM bumps -- ``test_reorder_matches_swap_states`` guards
+    equivalence.
     """
-    use_dt = envs.VLLM_RBLN_USE_DEVICE_TENSOR
-    if use_dt:
-        return None
-    if compile_context is not None:
-        return compile_context
-    if "use_global_ctx" in inspect.signature(rebel.CompileContext).parameters:
-        return rebel.CompileContext(use_global_ctx=True)
-    if "use_weight_sharing" in inspect.signature(rebel.CompileContext).parameters:
-        return rebel.CompileContext(use_weight_sharing=True)
-    return rebel.CompileContext()
+    ib = input_batch
+    n = len(perm)
+    # numpy index: valid for advanced indexing of both numpy arrays and tensors.
+    p = np.asarray(perm)
 
+    # token_ids_cpu / is_token_ids rows are max_model_len wide but only
+    # [:num_tokens + spec] is meaningful, so reindex just those columns. valid_w
+    # is permutation-invariant (max over the same values), so read it first.
+    max_spec = max((len(s) for s in ib.spec_token_ids[:n]), default=0)
+    valid_w = min(
+        int(ib.num_tokens_no_spec[:n].max()) + max_spec,
+        ib.token_ids_cpu.shape[1],
+    )
 
-def build_compile_options(compile_context: rebel.CompileContext | None) -> dict:
-    """Build the torch.compile ``options`` dict shared by the RBLN samplers."""
-    use_dt = envs.VLLM_RBLN_USE_DEVICE_TENSOR
-    options: dict = {}
-    if not use_dt:
-        assert compile_context is not None, (
-            "compile_context must be set when VLLM_RBLN_USE_DEVICE_TENSOR=0"
-        )
-        options["compile_context"] = compile_context
-    if envs.VLLM_RBLN_COMPILE_STRICT_MODE:
-        options["mode"] = "strict"
-    if has_torch_rbln or use_dt:
-        options["tensor_parallel_size"] = 1
-        if not use_dt:
-            options["use_global_ctx"] = True
-            options["global_device_id"] = 0
-    return options
+    # request id / token bookkeeping (python lists + index dict)
+    ib._req_ids[:n] = [ib._req_ids[i] for i in p]
+    ib.req_output_token_ids[:n] = [ib.req_output_token_ids[i] for i in p]
+    ib.spec_token_ids[:n] = [ib.spec_token_ids[i] for i in p]
+    for k in range(n):
+        rid = ib._req_ids[k]
+        if rid is not None:
+            ib.req_id_to_index[rid] = k
+
+    # per-request scalars; RHS fancy-index copies, so in-place assign is alias-safe
+    for arr in (
+        ib.num_tokens_no_spec,
+        ib.num_prompt_tokens,
+        ib.num_computed_tokens_cpu,
+    ):
+        arr[:n] = arr[p]
+
+    ib.token_ids_cpu[:n, :valid_w] = ib.token_ids_cpu[p, :valid_w]
+    ib.is_token_ids[:n, :valid_w] = ib.is_token_ids[p, :valid_w]
+
+    if ib.req_prompt_embeds:
+        ib.req_prompt_embeds = {
+            k: ib.req_prompt_embeds[int(p[k])]
+            for k in range(n)
+            if int(p[k]) in ib.req_prompt_embeds
+        }
+
+    # block-table CPU rows + counts (device copy re-synced downstream)
+    for bt in ib.block_table.block_tables:
+        bt.num_blocks_per_row[:n] = bt.num_blocks_per_row[p]
+        bt.block_table.np[:n] = bt.block_table.np[p]
+
+    ib.request_lora_mapping[:n] = ib.request_lora_mapping[p]
+
+    # Pooling models carry no sampling / logits state.
+    if ib.is_pooling_model:
+        return
+
+    for arr in (
+        ib.temperature_cpu,
+        ib.top_p_cpu,
+        ib.top_k_cpu,
+        ib.frequency_penalties_cpu,
+        ib.presence_penalties_cpu,
+        ib.repetition_penalties_cpu,
+        ib.num_accepted_tokens_cpu,
+    ):
+        arr[:n] = arr[p]
+
+    # index-keyed dicts: new slot k inherits old slot p[k]'s entry
+    ib.generators = {
+        k: ib.generators[int(p[k])] for k in range(n) if int(p[k]) in ib.generators
+    }
+    ib.bad_words_token_ids = {
+        k: ib.bad_words_token_ids[int(p[k])]
+        for k in range(n)
+        if int(p[k]) in ib.bad_words_token_ids
+    }
+
+    if ib.allowed_token_ids_mask_cpu_tensor is not None:
+        ib.allowed_token_ids_mask_cpu_tensor[:n] = ib.allowed_token_ids_mask_cpu_tensor[
+            p
+        ]

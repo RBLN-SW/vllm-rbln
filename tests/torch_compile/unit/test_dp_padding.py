@@ -302,9 +302,63 @@ class TestGetDpPadding:
                 batch_bucket_size=8,
                 is_prefill=False,
             )
-        # any_prefill path: bucket left as the initial (caller-provided) value,
+        # any_prefill + specialized_moe_decode → bucket forced to max bucket (8),
         # padded falls back to max_num_batched_tokens.
-        assert bucket == 8  # caller's initial guess preserved on any-prefill path
+        assert bucket == 8  # already max bucket; value unchanged
+        assert padded == 512
+
+    def test_any_prefill_routes_to_max_bucket(self):
+        """In PD disaggregation (any rank in prefill), padded-decode is always
+        routed to the max bucket so only one padded-decode model is compiled."""
+        runner = _FakeRunner(
+            dp_size=4,
+            dp_rank=0,
+            decode_buckets=[1, 4, 8],
+            max_num_batched_tokens=512,
+            specialized_moe_decode=True,
+        )
+        # Rank 1 is in prefill → any_prefill=True.
+        per_rank = [
+            _encode(4, 4, False),
+            _encode(256, 1, True),
+            _encode(4, 4, False),
+            _encode(4, 4, False),
+        ]
+        with _patch_all_reduce(per_rank):
+            bucket, padded, across_dp, _max_per_req = runner.get_dp_padding(
+                num_tokens=4,
+                num_reqs=4,
+                batch_bucket_size=4,  # caller initially chose bucket=4
+                is_prefill=False,
+            )
+        # any_prefill + specialized_moe_decode → forced to max bucket (8)
+        assert bucket == 8
+        assert padded == 512
+
+    def test_any_prefill_non_specialized_moe_does_not_change_bucket(self):
+        """With specialized_moe_decode=False, any_prefill does NOT force max bucket."""
+        runner = _FakeRunner(
+            dp_size=4,
+            dp_rank=0,
+            decode_buckets=[1, 4, 8],
+            max_num_batched_tokens=512,
+            specialized_moe_decode=False,
+        )
+        per_rank = [
+            _encode(4, 4, False),
+            _encode(256, 1, True),
+            _encode(4, 4, False),
+            _encode(4, 4, False),
+        ]
+        with _patch_all_reduce(per_rank):
+            bucket, padded, across_dp, _max_per_req = runner.get_dp_padding(
+                num_tokens=4,
+                num_reqs=4,
+                batch_bucket_size=4,
+                is_prefill=False,
+            )
+        # bucket unchanged (non-specialized path doesn't modify it)
+        assert bucket == 4
         assert padded == 512
 
     def test_non_specialized_moe_uses_max_num_batched_tokens(self):

@@ -23,6 +23,7 @@ from vllm.model_executor.layers.attention.kv_transfer_utils import (
 )
 from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 from vllm.model_executor.models.utils import extract_layer_index
+from vllm.utils.torch_utils import LayerNameType, _resolve_layer_name
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 
@@ -98,13 +99,21 @@ def _resolve_kv_cache(attn_metadata, layer_index: int) -> torch.Tensor:
 
 
 def _rbln_get_attention_context(layer_name: str):
-    """Resolve attention context without reading the layer's KV cache tensor.
+    """Resolve attention context, returning ``kv_cache=None`` by design.
 
-    vLLM's upstream helper reads ``attn_layer.kv_cache`` from no_compile_layers,
-    which can be a meta tensor in the RBLN torch.compile/export path. RBLN uses
-    KV cache tensors from attention metadata instead, so this helper returns
-    the same layer and metadata context while deliberately leaving kv_cache as
-    None.
+    RBLN compiles the model and needs every KV cache to enter the graph as an
+    *input*, not as a baked constant. Dynamo decides this by the read site: a
+    tensor reached via ``forward_context.attn_metadata`` becomes a graph input,
+    while ``attn_layer.kv_cache`` (a module attribute) becomes a ``get_attr``
+    constant. Upstream ``get_attention_context`` reads the latter, and the
+    KV-transfer connector wrapper (``maybe_transfer_kv_layer``) calls it -- so
+    without this override the wrapper would bake the KV cache into the graph,
+    breaking the in-place KV write and adding view nodes that diverge the
+    connector graph from the no-connector graph.
+
+    Returning None avoids both: the wrapper never touches the KV cache.
+    Connectors that do not save per layer ignore the value; the attention op
+    resolves its own KV cache as a graph input via ``_resolve_kv_cache``.
     """
     forward_context = get_forward_context()
     attn_metadata_raw = forward_context.attn_metadata
@@ -130,7 +139,7 @@ def _rbln_unified_attention_with_output(
     key: torch.Tensor,
     value: torch.Tensor,
     output: torch.Tensor,
-    layer_name: str,
+    layer_name: LayerNameType,
     output_scale: torch.Tensor | None = None,
     output_block_scale: torch.Tensor | None = None,
     kv_cache_dummy_dep: torch.Tensor | None = None,
@@ -139,13 +148,12 @@ def _rbln_unified_attention_with_output(
     # that ensures torch.compile preserves ordering between KV cache update and
     # attention forward.
     del kv_cache_dummy_dep
+    layer_name = _resolve_layer_name(layer_name)
     attn_metadata, self, _kv_cache, _ = _rbln_get_attention_context(layer_name)
 
-    # NOTE(RBLN) - To represent kv cache as model input,
-    # modify attention instead of using the attention layer's embedded
-    # kv cache (self.kv_cache); use attention metadata's kv cache.
-    # attention metadata's kv cache must equal the attention layer's
-    # embedded kv cache.
+    # NOTE(RBLN) - To represent kv cache as model input, resolve it from
+    # attention metadata here (a graph input) instead of using the attention
+    # layer's embedded kv cache (self.kv_cache, a baked module attribute).
     kv_cache = _resolve_kv_cache(attn_metadata, self.layer_index)
     self.impl.forward(
         self,
@@ -185,6 +193,14 @@ def _rbln_get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
             dtype=self.kv_cache_torch_dtype,
         )
 
+
+# Override get_attention_context so the connector wrapper never reads the
+# layer's embedded KV cache (it returns None; see _rbln_get_attention_context).
+# This must precede the maybe_transfer_kv_layer re-decoration below: that
+# decorator binds get_attention_context at application time, so re-applying it
+# here makes the connector wrapper capture the RBLN version. The attention op
+# resolves its KV cache as a graph input itself.
+vllm_attn.get_attention_context = _rbln_get_attention_context
 
 vllm_attn.unified_attention_with_output = maybe_transfer_kv_layer(
     _rbln_unified_attention_with_output

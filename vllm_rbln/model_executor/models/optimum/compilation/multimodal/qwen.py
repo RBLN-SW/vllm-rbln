@@ -23,14 +23,14 @@ def get_param_qwen2_vl(
 ) -> dict:
     # Max sequence length for Vision Transformer (ViT), representing the number of patches in an image. # noqa: E501
     # Example: For a 224x224 pixel image with patch size 14,
-    # this produces 256 patches [(224/14) * (224/14)]. Thus, max_seq_lens must be at least 256. # noqa: E501
-    # RBLN optimization processes inference per image or video frame, so set max_seq_lens to # noqa: E501
+    # this produces 256 patches [(224/14) * (224/14)]. Thus, max_seq_len must be at least 256. # noqa: E501
+    # RBLN optimization processes inference per image or video frame, so set max_seq_len to # noqa: E501
     # match the maximum expected resolution to optimize computation.
     param = {
         "visual": {
             # if num_devices of submodule is not specified,
             # it inherits num_devices of main module.
-            "max_seq_lens": 6400,
+            "max_seq_len": 6400,
         },
         "num_devices": num_devices,
         "max_seq_len": max_model_len,
