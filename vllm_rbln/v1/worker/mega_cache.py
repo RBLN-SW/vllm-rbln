@@ -13,8 +13,9 @@
 # limitations under the License.
 """torch.compiler mega-cache bundle helpers for the rbln model runner.
 
-Wraps `torch.compiler.{save,load}_cache_artifacts()` with a per-(model, rank)
-file under VLLM_CACHE_ROOT. The rbln dynamo backend pushes `.rbln` blobs into
+Wraps `torch.compiler.{save,load}_cache_artifacts()` with a
+per-(model, config-signature, rank) file under VLLM_CACHE_ROOT. The rbln dynamo
+backend pushes `.rbln` blobs into
 `CacheArtifactManager` during compile; here we persist/restore the bundle as
 an atomic unit only when warm-up has fully succeeded.
 """
