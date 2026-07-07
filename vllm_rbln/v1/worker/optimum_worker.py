@@ -333,6 +333,8 @@ class RBLNOptimumWorker(WorkerBase):
         raise RuntimeError("It is not required in vLLM RBLN.")
 
     def shutdown(self) -> None:
+        import faulthandler
+        faulthandler.enable(all_threads=True)  # re-arm after tvm_ffi; own SIGSEGV at teardown
         logger.info("v1 optimum_worker shutdown called")
         if envs.VLLM_RBLN_METRICS:
             if self.model_runner.model_performance_tracker:
