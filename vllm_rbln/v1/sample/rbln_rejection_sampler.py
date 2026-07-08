@@ -172,9 +172,9 @@ class RBLNRejectionSampler(RejectionSampler):
         if sampling_metadata.all_greedy:
             # For greedy decoding, `target_logits` is already a one-hot tensor
             # where the max logit is set to 1 and the rest are set to 0.
-            target_probs = target_logits.to(torch.float16)
+            target_probs = target_logits  # [EXPERIMENT] float16 cast 제거 (was .to(float16))
         else:
-            target_probs = target_logits.softmax(dim=-1, dtype=torch.float16)
+            target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)  # [EXPERIMENT] was float16
         output_token_ids = self.rejection_sample(
             metadata.draft_token_ids,
             metadata.num_draft_tokens,
@@ -322,6 +322,9 @@ class RBLNRejectionSampler(RejectionSampler):
             sampling_metadata.top_k,
             sampling_metadata.top_p,
         )
+        # [EXPERIMENT] guard against negative num_accepted (was handled by the
+        # float16 target_probs cast; with bf16 target_probs we clamp instead).
+        num_accepted = num_accepted.clamp(min=0)
         # ------------------------------------------------------------------
         # 3) Compose per-position output for the first K columns:
         #      j < num_accepted[i]          -> draft token (accepted as-is)
