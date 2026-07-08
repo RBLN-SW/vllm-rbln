@@ -36,7 +36,6 @@ def build_compile_options() -> dict:
     options: dict = {}
     if envs.VLLM_RBLN_COMPILE_STRICT_MODE:
         options["mode"] = "strict"
-    # FIXME rename this to `num_devices`
     options["num_devices"] = 1
     options["model_trace_method"] = "export"
     return options

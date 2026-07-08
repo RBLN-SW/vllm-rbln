@@ -43,6 +43,26 @@ def rejection_sampler():
     return CPURejectionSampler(mock_sampler)
 
 
+def make_synthetic_rejection_sampler(
+    conditional_rates: list[float],
+) -> CPURejectionSampler:
+    """Build a CPURejectionSampler in synthetic-acceptance mode.
+
+    `conditional_rates` are the per-position conditional rates the kernels
+    compare uniform samples against (c_i in vllm's synthetic mode). A rate of
+    1.0 always accepts and 0.0 always rejects, since uniform samples are in
+    [0, 1), which makes the tests below deterministic.
+    """
+    mock_sampler = Mock(spec=Sampler)
+    mock_sampler.logprobs_mode = "raw_logprobs"
+    sampler = CPURejectionSampler(mock_sampler)
+    sampler.synthetic_conditional_rates = torch.tensor(
+        conditional_rates, dtype=torch.float32, device=DEVICE
+    )
+    sampler.synthetic_mode = True
+    return sampler
+
+
 def mock_sampler_output(
     rejection_sampler: CPURejectionSampler, bonus_token_ids: torch.Tensor
 ):
@@ -795,5 +815,111 @@ def test_allowed_token_ids(rejection_sampler):
         [[15, -1, -1, -1], [10, 5, 10, -1], [7, 10, 12, 5]],
         dtype=torch.int,
         device=logits.device,
+    )
+    assert torch.equal(output.sampled_token_ids, expected)
+
+
+########################### Tests for Synthetic Mode ####################
+# Synthetic-acceptance mode (ported from vllm 0.22) accepts/rejects draft
+# tokens based on per-position conditional rates rather than the target
+# distribution. These tests also cover the -1 placeholder rejection added in
+# vllm PR #46533.
+def _run(sampler, spec_tokens, output_tokens, all_greedy, draft_probs=None):
+    if all_greedy:
+        metadata = create_sampling_metadata(all_greedy=True)
+    else:
+        temperature = torch.ones(len(spec_tokens), dtype=torch.float32, device=DEVICE)
+        metadata = create_sampling_metadata(all_greedy=False, temperature=temperature)
+    logits = create_logits_tensor(output_tokens)
+    bonus_token_tensor = torch.tensor(
+        [tokens[-1] for tokens in output_tokens], device=logits.device
+    )
+    spec_decode_metadata = create_spec_decode_metadata(spec_tokens, logits)
+    mock_sampler_output(sampler, bonus_token_tensor)
+    return sampler(
+        spec_decode_metadata,
+        draft_probs=draft_probs,
+        logits=logits,
+        sampling_metadata=metadata,
+    )
+
+
+def test_synthetic_greedy_all_accept():
+    """rate=1.0 at every position accepts all drafts and appends the bonus."""
+    sampler = make_synthetic_rejection_sampler([1.0, 1.0, 1.0])
+    # draft == target argmax everywhere; bonus is 4.
+    output = _run(sampler, [[1, 2, 3]], [[1, 2, 3, 4]], all_greedy=True)
+    expected = torch.tensor([[1, 2, 3, 4]], dtype=torch.int, device=DEVICE)
+    assert torch.equal(output.sampled_token_ids, expected)
+
+
+def test_synthetic_greedy_rejects_on_rate():
+    """rate=0.0 forces an early reject even when draft matches the target.
+
+    This is the behavior that distinguishes synthetic mode from standard
+    greedy rejection: position 1 is rejected purely because of its rate, and
+    the target argmax is emitted there.
+    """
+    sampler = make_synthetic_rejection_sampler([1.0, 0.0, 1.0])
+    output = _run(sampler, [[1, 2, 3]], [[1, 2, 3, 4]], all_greedy=True)
+    # pos0 accepted (draft 1); pos1 rejected -> target argmax 2; then stop.
+    expected = torch.tensor(
+        [[1, 2, PLACEHOLDER_TOKEN_ID, PLACEHOLDER_TOKEN_ID]],
+        dtype=torch.int,
+        device=DEVICE,
+    )
+    assert torch.equal(output.sampled_token_ids, expected)
+
+
+def test_synthetic_greedy_rejects_placeholder():
+    """vllm PR #46533: a -1 draft id is rejected even when its rate accepts.
+
+    Without the `draft_token_id >= 0` guard the placeholder would be accepted
+    and emitted as a real token.
+    """
+    sampler = make_synthetic_rejection_sampler([1.0, 1.0, 1.0])
+    # draft = [5, -1, 7]; target argmax = [5, 9, 7]; bonus = 8.
+    output = _run(sampler, [[5, -1, 7]], [[5, 9, 7, 8]], all_greedy=True)
+    # pos0 accepted (5); pos1 placeholder rejected -> target argmax 9; stop.
+    expected = torch.tensor(
+        [[5, 9, PLACEHOLDER_TOKEN_ID, PLACEHOLDER_TOKEN_ID]],
+        dtype=torch.int,
+        device=DEVICE,
+    )
+    assert torch.equal(output.sampled_token_ids, expected)
+
+
+def test_synthetic_random_rejects_placeholder():
+    """vllm PR #46533, random path: a -1 draft id is rejected.
+
+    The recovered token sampled from the (one-hot) target distribution is
+    emitted at the placeholder position instead of -1.
+    """
+    sampler = make_synthetic_rejection_sampler([1.0, 1.0, 1.0])
+    # draft = [5, -1, 7]; target argmax = [5, 9, 7]; bonus = 8.
+    output = _run(sampler, [[5, -1, 7]], [[5, 9, 7, 8]], all_greedy=False)
+    # pos0 accepted (5); pos1 placeholder rejected -> recovered token 9; stop.
+    expected = torch.tensor(
+        [[5, 9, PLACEHOLDER_TOKEN_ID, PLACEHOLDER_TOKEN_ID]],
+        dtype=torch.int,
+        device=DEVICE,
+    )
+    assert torch.equal(output.sampled_token_ids, expected)
+
+
+def test_placeholder_draft_random_non_synthetic(rejection_sampler):
+    """vllm PR #46533, standard random path: a -1 draft id must not crash.
+
+    With draft_probs=None the kernel gathers target probs by draft id; a -1
+    index would read out of bounds (and `scatter_` would raise on CPU). The
+    clamp+force-reject makes the placeholder rejected and replaced by the
+    recovered token.
+    """
+    # draft = [5, -1]; target argmax = [5, 9]; bonus = 8.
+    # Target is one-hot so pos0 (draft 5) is deterministically accepted and
+    # the recovered token at pos1 is 9.
+    output = _run(rejection_sampler, [[5, -1]], [[5, 9, 8]], all_greedy=False)
+    expected = torch.tensor(
+        [[5, 9, PLACEHOLDER_TOKEN_ID]], dtype=torch.int, device=DEVICE
     )
     assert torch.equal(output.sampled_token_ids, expected)

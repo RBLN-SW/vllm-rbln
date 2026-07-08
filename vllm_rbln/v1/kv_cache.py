@@ -40,10 +40,10 @@ class RBLNSlidingWindowManager(SingleTypeKVCacheManager):
     """
     The RBLN SWA kernel uses a single block and slides the contents in-place.
     To support this, this manager:
-    * Allocates a single block per request.
-    * Disables prefix caching. This is technically not needed if we do
-      vllm_config.cache_config.enable_prefix_caching = False,
-      but we keep it here for clarity.
+    * Allocates a single block per request on both the local prefill path
+      (`allocate_new_blocks`) and the KV-connector receive path
+      (`allocate_new_computed_blocks`).
+    * Disables prefix caching.
     """
 
     def get_num_blocks_to_allocate(
@@ -68,6 +68,40 @@ class RBLNSlidingWindowManager(SingleTypeKVCacheManager):
         new_blocks = self.block_pool.get_new_blocks(1)
         self.req_to_blocks[request_id].extend(new_blocks)
         return new_blocks
+
+    def allocate_new_computed_blocks(
+        self,
+        request_id: str,
+        new_computed_blocks: Sequence[KVCacheBlock],
+        num_local_computed_tokens: int,
+        num_external_computed_tokens: int,
+    ) -> None:
+        """One block per request, matching `allocate_new_blocks`.
+
+        Overrides the base `cdiv(num_total_computed_tokens, block_size)`
+        formula — that fits upstream SWA's block-table layout but not
+        RBLN's single-block in-place ring buffer. The D-side P/D
+        receive path routes through here, so without this override D
+        over-allocates and mismatches the P-side single block.
+        """
+        if request_id in self.num_cached_block:
+            assert len(new_computed_blocks) == 0
+            return
+
+        req_blocks = self.req_to_blocks[request_id]
+        assert len(req_blocks) == 0
+        assert not list(new_computed_blocks), (
+            "RBLNSlidingWindowManager does not support prefix-cache hits "
+            "(find_longest_cache_hit returns empty)"
+        )
+
+        # Sentinel for the base-class fast path; 0 because RBLN neither
+        # skips nor pulls from prefix cache.
+        self.num_cached_block[request_id] = 0
+
+        if num_external_computed_tokens > 0:
+            new_blocks = self.block_pool.get_new_blocks(1)
+            req_blocks.extend(new_blocks)
 
     @classmethod
     def find_longest_cache_hit(
