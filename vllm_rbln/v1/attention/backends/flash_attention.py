@@ -1151,10 +1151,6 @@ class RBLNFlashAttentionMetadataBuilder(
         # custom (triton) kernel's to_dynamic_index rejects int64 seq_lens
         seq_idx = positions[query_start_loc_cpu[:num_reqs]].view(-1, 1).to(torch.int32)
 
-        # The length of the partition equals the block size.
-        partition_len = self.block_size
-        # num_partition is derived from max_model_len (not hardware block count)
-        # to ensure seq_idx/seq_lens dimensions stay within block_table bounds.
         max_seq_len = self.model_config.max_model_len
 
         block_tables_tensor = block_tables_tensor.to(self.device)
