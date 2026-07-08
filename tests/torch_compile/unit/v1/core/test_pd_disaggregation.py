@@ -225,6 +225,130 @@ class TestPDDisaggregationScheduler:
         ]
         assert [req.request_id for req in scheduler.waiting] == [local.request_id]
 
+    def test_promoted_partial_kv_match_scheduled_as_prefill(self):
+        """A PARTIAL remote-KV match (num_tokens > matched + 1) leaves a local
+        prefill remainder. The promoted request must be scheduled as a lone
+        prefill of that remainder -- NOT rejected, and NOT forced into the
+        decode batch.
+
+        REGRESSION for the DP4 + LMCache serve crash: treating every promoted
+        request as decode-ready breaks on a partial prefix-cache hit. With
+        chunk-granular prefix caching a partial match is the norm, so this is
+        the common case, not an edge case.
+        """
+        matched = 2 * _BLOCK_SIZE  # 32 (block-aligned)
+        num_tokens = matched + _BLOCK_SIZE  # 48 -> 16-token remainder
+        scheduler = _create_pd_scheduler(matched_tokens=matched)
+
+        remote = _create_pd_request(num_tokens, "remote")
+        scheduler.add_request(remote)
+
+        # Step 1: async schedule -> WAITING_FOR_REMOTE_KVS, partial match cached.
+        out1 = scheduler.schedule()
+        assert remote.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+        assert remote.num_computed_tokens == matched
+
+        # Step 2: KV transfer completes. Partial hit -> no full-hit decrement,
+        # so num_computed_tokens stays at `matched` and the request is still
+        # is_prefill on promotion.
+        _simulate_kv_transfer_completion(scheduler, out1, remote.request_id)
+
+        # Step 3: promoted -> scheduled as a lone prefill of the remainder.
+        # Must NOT raise.
+        out = scheduler.schedule()
+        assert remote.request_id in out.num_scheduled_tokens
+        assert out.num_scheduled_tokens[remote.request_id] == num_tokens - matched
+        assert remote.request_id in {r.req_id for r in out.scheduled_new_reqs}
+        assert remote.status == RequestStatus.RUNNING
+        # Prefill runs alone (num_reqs == 1): no decode reqs this step.
+        assert out.scheduled_cached_reqs.req_ids == []
+
+    def test_promoted_partial_kv_match_then_reaches_decode(self):
+        """After the remainder prefill step, the request advances to decode via
+        the normal running loop (num_scheduled_tokens == 1). Confirms the fix
+        only touches the first promotion step; the rest is ordinary machinery.
+        """
+        matched = 2 * _BLOCK_SIZE  # 32
+        num_tokens = matched + _BLOCK_SIZE  # 48
+        scheduler = _create_pd_scheduler(matched_tokens=matched)
+
+        remote = _create_pd_request(num_tokens, "remote")
+        scheduler.add_request(remote)
+        out1 = scheduler.schedule()
+        _simulate_kv_transfer_completion(scheduler, out1, remote.request_id)
+
+        # Remainder prefill step.
+        out2 = scheduler.schedule()
+        assert out2.num_scheduled_tokens[remote.request_id] == num_tokens - matched
+
+        # Advance the prefill; the request then becomes decode-ready.
+        scheduler.update_from_output(out2, create_runner_output(out2, 1))
+
+        out3 = scheduler.schedule()
+        assert out3.num_scheduled_tokens[remote.request_id] == 1
+        assert remote.status == RequestStatus.RUNNING
+
+    def test_promoted_partial_kv_match_runs_alone_evicting_decode(self):
+        """A promoted partial-match request takes the ordinary lone-prefill
+        path: it evicts running decodes (no mixed batching) and runs at
+        num_reqs == 1, exactly like a normal chunked prefill.
+        """
+        matched = 2 * _BLOCK_SIZE  # 32
+        num_tokens = matched + _BLOCK_SIZE  # 48
+        scheduler = _create_pd_scheduler(matched_tokens=matched)
+
+        # A running decode request.
+        decode = _create_pd_request(10, "decode", do_remote_prefill=False)
+        advance_to_decode(scheduler, decode)
+
+        # Promoted partial-match remote.
+        remote = _create_pd_request(num_tokens, "remote")
+        scheduler.add_request(remote)
+        # decode scheduled; remote -> WAITING_FOR_REMOTE_KVS
+        out1 = scheduler.schedule()
+        assert remote.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+        _simulate_kv_transfer_completion(
+            scheduler, out1, remote.request_id, sampled_token_id=2
+        )
+
+        # Promotion step: partial prefill -> evicts the running decode, runs alone.
+        out = scheduler.schedule()
+        assert out.num_scheduled_tokens[remote.request_id] == num_tokens - matched
+        assert decode.request_id not in out.num_scheduled_tokens
+
+    def test_decode_ready_sync_match_joins_decode_batch(self):
+        """UNIFICATION behavior change: a NON-promoted decode-ready request
+        (sync connector match, num_new_tokens == 1) now JOINS the decode batch
+        instead of evicting the running decodes to run alone. This is the
+        effect of gating the decode shortcut purely on
+        `not is_prefill(request)` (dropping the
+        promoted_from_waiting_for_remote_kvs precondition).
+        """
+        matched = 19
+        num_tokens = matched + 1  # 20 -> num_new_tokens == 1 (decode-ready)
+        scheduler = create_scheduler(
+            block_size=_BLOCK_SIZE,
+            num_blocks=_NUM_BLOCKS,
+            max_num_seqs=_MAX_NUM_SEQS,
+            use_kv_connector=MockKVConfig(matched_tokens=matched, is_async=False),
+        )
+        decodes = [
+            _create_pd_request(10, f"d{i}", do_remote_prefill=False) for i in range(3)
+        ]
+        for d in decodes:
+            advance_to_decode(scheduler, d)
+
+        remote = _create_pd_request(num_tokens, "remote")  # sync full match
+        scheduler.add_request(remote)
+        out = scheduler.schedule()
+        ns = out.num_scheduled_tokens
+
+        # remote joins as a single-token decode; running decodes NOT evicted.
+        assert ns[remote.request_id] == 1
+        assert remote.status == RequestStatus.RUNNING
+        for d in decodes:
+            assert d.request_id in ns
+
 
 # ===========================================================================
 # NIXL connector tests

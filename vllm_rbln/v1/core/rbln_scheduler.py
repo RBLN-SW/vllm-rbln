@@ -432,10 +432,6 @@ class RBLNScheduler(Scheduler):
                 request = request_queue.peek_request()
                 request_id = request.request_id
 
-                promoted_from_waiting_for_remote_kvs = (
-                    request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
-                )
-
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(
                     request.status
@@ -575,18 +571,20 @@ class RBLNScheduler(Scheduler):
                     num_new_tokens = min(num_new_tokens, prefill_token_budget)
                     assert num_new_tokens > 0
 
-                    if (
-                        not promoted_from_waiting_for_remote_kvs
-                        and len(scheduled_new_reqs) > 0
+                    if is_prefill(request) and (
+                        len(scheduled_new_reqs) > 0 or len(scheduled_resumed_reqs) > 0
                     ):
-                        # NOTE(RBLN): promoted_from_waiting_for_remote_kvs is False, so
-                        # this waiting request needs local prefill (not remote prefill).
-                        # scheduled_new_reqs is non-empty because a prior iteration of
-                        # this waiting loop already added a request to the decode batch
-                        # from remote prefill.
-                        # In this case, we defer scheduling this local prefill request
-                        # (waiting request) to the next step.
-                        assert len(scheduled_resumed_reqs) == 0
+                        # NOTE(RBLN): Only a request that will run as a LOCAL prefill
+                        # (lone, num_reqs == 1, via the no-mixed-batching eviction
+                        # below) needs deferring. A decode-ready request (not
+                        # is_prefill) instead joins the decode batch at the block
+                        # below and is fine to co-schedule. Defer this prefill
+                        # because a decode-ready request was already admitted this
+                        # step -- in scheduled_new_reqs (status WAITING) or
+                        # scheduled_resumed_reqs (status PREEMPTED) -- and the
+                        # eviction only clears scheduled_running_reqs, so running a
+                        # local prefill now would illegally mix it with those decode
+                        # reqs. Left un-popped at the queue head, re-tried next step.
                         break
 
                     # Schedule encoder inputs.
@@ -750,9 +748,25 @@ class RBLNScheduler(Scheduler):
                         if self.ec_connector is not None:
                             self.ec_connector.update_state_after_alloc(request, i)
 
-                if promoted_from_waiting_for_remote_kvs:
-                    # NOTE(RBLN): We can continue to schedule the next request
-                    # because scheduled new request is added as decoding phase.
+                if not is_prefill(request):
+                    # NOTE(RBLN): A decode-ready request joins the decode batch
+                    # here, regardless of how it became decode-ready -- a FULL
+                    # remote-KV match promoted from WAITING_FOR_REMOTE_KVS, a full
+                    # local/sync prefix-cache match, etc. (A PARTIAL match leaves a
+                    # local remainder prefill -> still is_prefill -> falls through to
+                    # the no-mixed-batching eviction block below and runs as a lone
+                    # prefill, reaching decode via the running loop on a later step.)
+                    #
+                    # is_prefill is False here, so num_computed == num_tokens - 1
+                    # and (given the earlier `assert num_new_tokens > 0`)
+                    # num_new_tokens == 1 -- the single-token decode precondition.
+                    # Kept as a sanity check.
+                    assert num_new_tokens == 1, (
+                        f"decode-ready request {request_id} has "
+                        f"num_new_tokens={num_new_tokens} (expected 1)."
+                    )
+                    # The scheduled new request is added as a decoding-phase req, so
+                    # we can continue to schedule the next request.
                     continue
 
                 # NOTE(RBLN): Reaching this point means that this request can now be
