@@ -335,8 +335,6 @@ class RBLNKVCacheManager(KVCacheManager):
         num_new_computed_tokens: int,
     ) -> tuple[list[int], list[int]]:
         cached_blocks = new_computed_blocks.get_block_ids()[0]
-        # A hit may end inside an image; the prefill-time partial-hit path
-        # (qwen_vl) reuses the front KV and re-injects only the uncached tail.
         return self.prefix_cache_manager.get_matched_outer_blocks(
             request.request_id,
             cached_blocks,
