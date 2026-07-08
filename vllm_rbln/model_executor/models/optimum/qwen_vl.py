@@ -383,7 +383,7 @@ class RBLNOptimumQwenVLForConditionalGeneration(
 
         For a kept image whose front is cached, the vision encoder still runs on
         the whole image (it is bidirectional); we then keep only the features
-        from the first uncached one on (``mm_embed_slice_starts``) and scatter
+        from the first uncached one on (``mm_embed_tail_starts``) and scatter
         them into the tail's placeholder tokens. A Qwen-VL placeholder token maps
         1:1 to a feature, so the scattered count matches the tail's placeholder
         count.
@@ -396,7 +396,7 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         partial = model_input.partial_prefix
         assert partial is not None
         mm_kwargs = model_input.multi_modal_kwargs or {}
-        slice_starts = partial.mm_embed_slice_starts or {}
+        tail_starts = partial.mm_embed_tail_starts or {}
         image_input = self._parse_and_validate_image_input(**mm_kwargs)
         video_input = self._parse_and_validate_video_input(**mm_kwargs)
 
@@ -428,7 +428,7 @@ class RBLNOptimumQwenVLForConditionalGeneration(
                 pixel_values=mm_input[pixel_key],
                 grid_thw=mm_input[grid_key],
                 token_id=token_id,
-                slice_starts=slice_starts.get(modality, []),
+                tail_starts=tail_starts.get(modality, []),
                 merge=merge,
             )
         return inputs_embeds
@@ -441,7 +441,7 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         pixel_values: torch.Tensor,
         grid_thw: torch.Tensor,
         token_id: int,
-        slice_starts: list[int],
+        tail_starts: list[int],
         merge: int,
     ) -> None:
         """Encode the (whole) items, slice each to its uncached tail, scatter."""
@@ -456,16 +456,16 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         feats = visual_out
         # Per-item feature count == number of placeholder tokens for that item.
         counts = self._mm_feature_counts(grid_thw, merge).tolist()
-        assert len(counts) == len(slice_starts), (
+        assert len(counts) == len(tail_starts), (
             f"kept-item count mismatch: {len(counts)} grids vs "
-            f"{len(slice_starts)} slice starts"
+            f"{len(tail_starts)} tail starts"
         )
         tail_feats = []
         offset = 0
-        for count, start in zip(counts, slice_starts):
+        for count, tail_start in zip(counts, tail_starts):
             item_feats = feats[offset : offset + count]
             offset += count
-            tail_feats.append(item_feats[start:])
+            tail_feats.append(item_feats[tail_start:])
         tail_feats = torch.cat(tail_feats, dim=0).to(inputs_embeds.dtype)
 
         mask = tail_ids == token_id

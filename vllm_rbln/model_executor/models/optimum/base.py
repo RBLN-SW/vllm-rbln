@@ -29,7 +29,7 @@ class PartialPrefixInfo:
     - ``num_cached_tokens``: cache boundary in tokens (= the tail's start).
     - ``mrope_mm_kwargs``: every item's grid (including fully-cached items), for
       the full-prompt ``get_rope_index``.
-    - ``mm_embed_slice_starts``: per kept item (batch order, per modality), the
+    - ``mm_embed_tail_starts``: per kept item (batch order, per modality), the
       first uncached encoder-feature index -- features before it are in the
       reused KV; from it on they are re-scattered into the tail.
     """
@@ -37,7 +37,7 @@ class PartialPrefixInfo:
     full_input_tokens: torch.Tensor
     num_cached_tokens: int
     mrope_mm_kwargs: BatchedTensorInputs | None
-    mm_embed_slice_starts: dict[str, list[int]] | None
+    mm_embed_tail_starts: dict[str, list[int]] | None
 
 
 # FIXME(eunji): In original vLLM, this dataclasss is located in model_runner.

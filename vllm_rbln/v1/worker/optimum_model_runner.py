@@ -588,7 +588,7 @@ class RBLNOptimumModelRunner(
         """Yield the multimodal features not entirely inside the prefix cache.
 
         Single-source filter shared by the encoder batch (``_extract_mm_kwargs``)
-        and the tail feature-slice starts (``_mm_embed_slice_starts``) so the two
+        and the tail feature-slice starts (``_mm_embed_tail_starts``) so the two
         always agree on which items are kept and in what order. An item whose
         placeholder tokens fall entirely within the cached region is skipped: its
         KV is reused and its tokens are trimmed off the prefill input, so the
@@ -627,7 +627,7 @@ class RBLNOptimumModelRunner(
 
         return mm_kwargs_combined
 
-    def _mm_embed_slice_starts(
+    def _mm_embed_tail_starts(
         self,
         scheduler_output: "SchedulerOutput",
         num_cached_tokens: int,
@@ -641,11 +641,11 @@ class RBLNOptimumModelRunner(
         ``max(0, num_cached_tokens - offset)``: features before it are already in
         the reused KV, features from it on must be re-scattered into the tail.
         """
-        slice_starts: dict[str, list[int]] = {}
+        tail_starts: dict[str, list[int]] = {}
         for feature in self._iter_kept_mm_features(scheduler_output, num_cached_tokens):
             start = max(0, num_cached_tokens - feature.mm_position.offset)
-            slice_starts.setdefault(feature.modality, []).append(start)
-        return slice_starts
+            tail_starts.setdefault(feature.modality, []).append(start)
+        return tail_starts
 
     def _extract_prefill_mm_inputs(
         self,
@@ -676,7 +676,7 @@ class RBLNOptimumModelRunner(
             mrope_mm_kwargs=self._extract_mm_kwargs(
                 scheduler_output, num_cached_tokens=0
             ),
-            mm_embed_slice_starts=self._mm_embed_slice_starts(
+            mm_embed_tail_starts=self._mm_embed_tail_starts(
                 scheduler_output, total_cached_length
             ),
         )
