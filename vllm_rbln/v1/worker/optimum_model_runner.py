@@ -514,6 +514,9 @@ class RBLNOptimumModelRunner(
         ):
             is_prefill = True
 
+        full_input_tokens = None
+        num_cached_tokens = 0
+        mrope_mm_kwargs = None
         if is_prefill:
             (
                 input_ids,
@@ -521,6 +524,9 @@ class RBLNOptimumModelRunner(
                 block_tables,
                 multi_modal_kwargs,
                 running_request_ids,
+                full_input_tokens,
+                num_cached_tokens,
+                mrope_mm_kwargs,
             ) = self._prepare_prefill(scheduler_output)
         else:
             input_ids, positions, block_tables, running_request_ids = (
@@ -548,6 +554,9 @@ class RBLNOptimumModelRunner(
             # FIXME unify the variable name is_prefill and is_prompt
             is_prompt=is_prefill,
             dummy_block=scheduler_output.dummy_block,
+            full_input_tokens=full_input_tokens,
+            num_cached_tokens=num_cached_tokens,
+            mrope_mm_kwargs=mrope_mm_kwargs,
         )
         return model_input, num_scheduled_tokens_np
 
@@ -617,6 +626,9 @@ class RBLNOptimumModelRunner(
         torch.Tensor,
         BatchedTensorInputs | None,
         list[str],
+        torch.Tensor | None,
+        int,
+        BatchedTensorInputs | None,
     ]:
         running_request_ids = []
         batched_mm_inputs: BatchedTensorInputs | None = None
@@ -651,6 +663,9 @@ class RBLNOptimumModelRunner(
         seq_len = len(prompt_tokens)
         input_positions = list(range(seq_len))
         num_blocks = num_blocks_per_req[req_index]
+        # Full prompt tokens before any prefix-cache trim; needed by MRoPE
+        # models to recompute positions over the whole prompt on a partial hit.
+        full_prompt_tokens = prompt_tokens
         if self.enable_prefix_caching:
             logger.debug(
                 "Request %s is now scheduled. Prompt tokens: %s, "
@@ -683,6 +698,8 @@ class RBLNOptimumModelRunner(
 
         running_request_ids.append(req_id)
 
+        full_input_tokens = None
+        mrope_mm_kwargs = None
         if self.supports_mm_inputs:
             # Encode only the multimodal items that are not covered by the
             # prefix cache; the cached ones have their KV reused and their
@@ -690,6 +707,15 @@ class RBLNOptimumModelRunner(
             batched_mm_inputs = self._extract_mm_kwargs(
                 scheduler_output, num_cached_tokens=total_cached_length
             )
+            if total_cached_length > 0:
+                # Partial hit: MRoPE models recompute positions over the full
+                # prompt, which needs the untrimmed tokens and every item's
+                # grid (including the cached items dropped from the encoder
+                # batch above). Non-MRoPE models ignore these.
+                full_input_tokens = torch.tensor(full_prompt_tokens).unsqueeze(0)
+                mrope_mm_kwargs = self._extract_mm_kwargs(
+                    scheduler_output, num_cached_tokens=0
+                )
 
         input_tokens = torch.tensor(prompt_tokens).unsqueeze(0)
         input_positions = torch.tensor(input_positions).unsqueeze(0)
@@ -700,6 +726,9 @@ class RBLNOptimumModelRunner(
             block_table,
             batched_mm_inputs,
             running_request_ids,
+            full_input_tokens,
+            total_cached_length,
+            mrope_mm_kwargs,
         )
 
     def _prepare_decode(

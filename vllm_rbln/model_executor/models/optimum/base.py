@@ -39,6 +39,15 @@ class ModelInputForRBLN:
     # deepstack features. Left None for models that don't use them.
     visual_pos_mask: torch.Tensor | None = None
     deepstack_embeds: torch.Tensor | None = None
+    # Partial prefix-cache hit (MRoPE models): the prefill input is trimmed to
+    # the uncached tail, but MRoPE positions must be computed over the FULL
+    # prompt and then sliced to the tail. Carry the full prompt tokens, the
+    # cached-token count, and the all-item multimodal grids (every image/video,
+    # including the cached ones) so the model can recompute positions. Left
+    # None/0 on the no-hit path and for non-MRoPE models.
+    full_input_tokens: torch.Tensor | None = None
+    num_cached_tokens: int = 0
+    mrope_mm_kwargs: BatchedTensorInputs | None = None
 
 
 version_error = RuntimeError(

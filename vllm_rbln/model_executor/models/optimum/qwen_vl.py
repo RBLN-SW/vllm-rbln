@@ -134,6 +134,7 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         video_input,
         deepstack_image_embeds=None,
         deepstack_video_embeds=None,
+        positions_only=False,
     ) -> dict:
         """
         Common preprocessing logic for prefill inputs.
@@ -144,6 +145,12 @@ class RBLNOptimumQwenVLForConditionalGeneration(
             attention_mask: Attention mask
             image_input: Image input data (pixel_values or image_embeds type)
             video_input: Video input data (pixel_values_videos or video_embeds type)
+            positions_only: When True, compute MRoPE positions only. The visual
+                encoder is skipped (``pixel_values``/``image_embeds`` are not
+                passed) while the grids are kept so ``get_rope_index`` still
+                runs. Used to recompute positions over the full prompt on a
+                partial prefix-cache hit. Returns just ``position_embed`` and
+                ``rope_deltas``.
 
         Returns:
             Dict of preprocessed inputs for the model's prefill_decoder
@@ -159,7 +166,10 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         # without EC disagg support (e.g. Qwen2.5-VL) don't accept it.
         if image_input is not None:
             preprocess_args["image_grid_thw"] = image_input["image_grid_thw"]
-            if image_input.get("type") == "image_embeds":
+            if positions_only:
+                # Keep grids for get_rope_index; skip the encoder.
+                preprocess_args["pixel_values"] = None
+            elif image_input.get("type") == "image_embeds":
                 logger.info("Prefill: using cached image embeddings (encoder skipped)")
                 preprocess_args["image_embeds"] = image_input["image_embeds"]
                 preprocess_args["pixel_values"] = None
@@ -173,7 +183,9 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         # Dispatch video inputs: pre-computed embeddings skip the visual encoder.
         if video_input is not None:
             preprocess_args["video_grid_thw"] = video_input["video_grid_thw"]
-            if video_input.get("type") == "video_embeds":
+            if positions_only:
+                preprocess_args["pixel_values_videos"] = None
+            elif video_input.get("type") == "video_embeds":
                 logger.info("Prefill: using cached video embeddings (encoder skipped)")
                 preprocess_args["video_embeds"] = video_input["video_embeds"]
                 preprocess_args["pixel_values_videos"] = None
@@ -193,13 +205,21 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         # encoder path): when image/video embeds come from the EC cache,
         # the visual encoder is skipped and deepstack features must be
         # supplied explicitly.
-        if deepstack_image_embeds is not None:
-            preprocess_args["deepstack_image_embeds"] = deepstack_image_embeds
-        if deepstack_video_embeds is not None:
-            preprocess_args["deepstack_video_embeds"] = deepstack_video_embeds
+        if not positions_only:
+            if deepstack_image_embeds is not None:
+                preprocess_args["deepstack_image_embeds"] = deepstack_image_embeds
+            if deepstack_video_embeds is not None:
+                preprocess_args["deepstack_video_embeds"] = deepstack_video_embeds
 
         # Call the actual preprocessing
         preprocess_outputs = self.model._preprocess_prefill(**preprocess_args)
+        if positions_only:
+            # outputs[1]=position_embed, outputs[2]=rope_deltas across all
+            # Qwen-VL variants (arity of the rest differs, so don't unpack it).
+            return {
+                "position_embed": preprocess_outputs[1],
+                "rope_deltas": preprocess_outputs[2],
+            }
         prefill_params = self._build_prefill_params(preprocess_outputs)
         return prefill_params
 
@@ -293,16 +313,67 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         prefill_params = self.preprocess_prefill(
             input_ids, attention_mask, image_input, video_input
         )
-        mrope_position_deltas[model_input.running_requests_ids[0]] = prefill_params[
-            "rope_deltas"
-        ].item()
+
+        position_embed = prefill_params["position_embed"]
+        rope_deltas = prefill_params["rope_deltas"]
+        if model_input.num_cached_tokens > 0:
+            # Partial prefix-cache hit: the trimmed tail already carries correct
+            # inputs_embeds (the encoder ran only on the uncached images that
+            # remain in the tail), but its MRoPE positions were computed from 0.
+            # Recompute positions over the FULL prompt and slice to the tail so
+            # they continue from the cached prefix.
+            position_embed, rope_deltas = self._recompute_full_mrope_position(
+                model_input
+            )
+
+        mrope_position_deltas[model_input.running_requests_ids[0]] = rope_deltas.item()
         return replace(
             model_input,
             inputs_embeds=prefill_params["inputs_embeds"],
-            position_embed=prefill_params["position_embed"],
+            position_embed=position_embed,
             visual_pos_mask=prefill_params.get("visual_pos_mask"),
             deepstack_embeds=prefill_params.get("deepstack_embeds"),
         )
+
+    def _recompute_full_mrope_position(
+        self, model_input: ModelInputForRBLN
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Recompute MRoPE positions over the full prompt for a partial hit.
+
+        ``get_rope_index`` needs the whole token layout (every ``vision_start``
+        and grid) to assign absolute positions, so it is run over the untrimmed
+        prompt with all items' grids. ``pixel_values`` is left ``None`` so the
+        vision encoder is skipped -- only ``get_rope_index`` and the position
+        embeddings are computed. The result is sliced to the uncached tail.
+
+        Returns the tail ``position_embed`` and the full-sequence
+        ``rope_deltas`` (used for decode-step position continuation).
+        """
+        full_input_ids = model_input.full_input_tokens
+        num_cached = model_input.num_cached_tokens
+
+        image_input = None
+        video_input = None
+        if model_input.mrope_mm_kwargs:
+            image_input = self._parse_and_validate_image_input(
+                **model_input.mrope_mm_kwargs
+            )
+            video_input = self._parse_and_validate_video_input(
+                **model_input.mrope_mm_kwargs
+            )
+
+        attention_mask = torch.ones_like(full_input_ids)
+        params = self.preprocess_prefill(
+            full_input_ids,
+            attention_mask,
+            image_input,
+            video_input,
+            positions_only=True,
+        )
+        # position_embed: [2, batch, 1, N, head_dim]; slice the sequence (dim=-2)
+        # to the uncached tail.
+        position_embed = params["position_embed"][..., num_cached:, :]
+        return position_embed, params["rope_deltas"]
 
     def compute_decode_position_embed(
         self,

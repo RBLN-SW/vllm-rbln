@@ -347,36 +347,53 @@ class RBLNKVCacheManager(KVCacheManager):
             request, cached_block_table, cached_length
         )
 
-    @staticmethod
     def _clamp_cached_blocks_to_mm_boundary(
+        self,
         request: Request,
         cached_block_table: list[int],
         cached_length: list[int],
     ) -> tuple[list[int], list[int]]:
         """Trim the cached prefix so it never ends in the middle of an image.
 
-        Each image must be either fully cached or fully recomputed. If the cache
-        stopped inside one, its placeholder tokens and its embeddings would not
-        line up when scattered.
+        Each image must be either fully cached or fully recomputed. The prefill
+        input is trimmed to ``prompt_tokens[boundary:]`` and the encoder runs on
+        the multimodal items that remain in that tail. If the boundary lands
+        inside an image's vision segment (``<|vision_start|>`` at ``offset - 1``,
+        then ``length`` placeholder tokens), the tail would carry orphaned
+        placeholder tokens whose ``<|vision_start|>`` and/or encoder features are
+        missing, so scatter and ``get_rope_index`` desynchronize. Pull the
+        boundary back to a block-aligned point before that image's
+        ``<|vision_start|>`` so the whole image is re-encoded in the tail.
+
+        The boundary must stay a multiple of the inner block size (``ib_size ==
+        self.block_size``) because KV reuse copies whole inner blocks.
         """
         if not request.mm_features or not cached_length:
             return cached_block_table, cached_length
 
+        ib_size = self.block_size
         boundary = sum(cached_length)
-        # Placeholder ranges do not overlap, so the boundary splits at most one
-        # item. Find where it lands, if inside any.
-        split_start = None
-        for feature in request.mm_features:
-            start = feature.mm_position.offset
-            if start < boundary < start + feature.mm_position.length:
-                split_start = start
+        # Placeholder ranges do not overlap and mm_features are sorted by offset.
+        # The boundary can orphan an image whose placeholder run [offset, offset
+        # + length) it lands in; pulling back may in turn land inside an earlier
+        # image, so iterate until the boundary clears every vision segment.
+        while boundary > 0:
+            split_start = None
+            for feature in request.mm_features:
+                start = feature.mm_position.offset
+                if start <= boundary < start + feature.mm_position.length:
+                    split_start = start
+                    break
+            if split_start is None:
                 break
-        if split_start is None:
+            # Largest inner-block boundary strictly before the image's
+            # <|vision_start|> (at offset - 1), so the whole vision segment lands
+            # in the recomputed tail.
+            boundary = max(0, (split_start - 1) // ib_size * ib_size)
+
+        if boundary == sum(cached_length):
             return cached_block_table, cached_length
 
-        # Pull the boundary back to the split item's start so the image is fully
-        # re-encoded, then truncate the (block, length) prefix to it.
-        boundary = split_start
         new_block_table: list[int] = []
         new_length: list[int] = []
         accumulated_tokens = 0
