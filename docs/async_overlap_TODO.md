@@ -21,9 +21,38 @@ temporarily if needed).
 
 ---
 
-## TODO 1 — batch>1 parity on a FULL (non-truncated) model  [INVESTIGATED 2026-07-07]
-**Outcome: batch>1 defer is NOT bit-exact to sync, and the cause is NOT the deferral
-feature — it is the async runtime's execution of the multi-token forward.** Details:
+## TODO 1 — batch>1 parity on a FULL (non-truncated) model  [ROOT-CAUSED + WORKAROUND 2026-07-08]
+**Resolution:** the batch>1 divergence is the **MoE EP reduce_scatter's cross-rank arrival-order
+FP reduction**, NOT the deferral feature. With `VLLM_RBLN_MOE_REDUCE_SCATTER=0` the defer path is
+**16/16 bit-exact to sync AND deterministic (run1==run2==sync)** on the full model DP4 batch=4.
+
+- **Confirmed root cause:** `VLLM_RBLN_MOE_REDUCE_SCATTER=1` uses a cross-rank reduce_scatter that
+  reduces partial sums in **data-arrival order**. On the async worker thread the per-rank
+  worker-wakeup jitter varies that arrival order run-to-run → different FP sums → near-tie token
+  flips. Sync is deterministic only because all ranks run the forward on their main threads in
+  tight per-step DP-barrier lockstep, giving a consistent arrival order every run.
+- **Localization (how we know):**
+  - L18 **DP1** batch=4 async == sync, deterministic (run1==run2==sync) — no cross-rank collective,
+    so within-rank forward-on-worker is already bit-exact even on the fragile L18.
+  - DP4 async (`RBLN_DYNAMO_ASYNC=1`, no overlap) diverges + nondeterministic → the cause is the
+    cross-rank collective, independent of overlap/deferral.
+  - DP4 async + `RBLN_RUNTIME_FORCE_SYNC=1` (drain after every op) STILL diverges → per-rank op
+    draining does not help (it adds no cross-rank synchronization); rules out a local send-buffer race.
+  - `VLLM_RBLN_MOE_REDUCE_SCATTER=0` (different MoE combine, no arrival-order cross-rank FP sum) →
+    defer 16/16 bit-exact + deterministic. Pinpoints reduce_scatter as the source.
+- **Proper fix (owner: RBLN CCL/runtime):** make the RS=1 reduce_scatter reduce in a **fixed
+  rank order** (deterministic) inside `librbln-ccl.so` — then RS=1 (the faster MoE combine) would
+  also be bit-exact under async. No determinism/algorithm env knob exists in the CCL lib today
+  (only transport flags like `RCCL_FORCE_RDMA`).
+- **Usable now:** run batch>1 async-overlap with `VLLM_RBLN_MOE_REDUCE_SCATTER=0` for bit-exactness.
+  Perf under RS0 (defer vs sync) looked comparable/no-regression in a noisy tok64 read; a clean
+  tok128 RS0 perf measurement is a follow-up.
+
+**Pass:** ✅ defer == sync per prompt at batch>1 on the full model **with RS=0** (16/16, deterministic).
+
+--- (original investigation notes) ---
+Earlier framing before the RS0 experiment (kept for context): the divergence is the async runtime's
+execution of the multi-token forward. Details:
 
 - **Sync IS deterministic** run-to-run on the full model at batch>1 (2 runs, 16/16 identical),
   unlike L18. So the reference is stable and divergence is meaningful.
