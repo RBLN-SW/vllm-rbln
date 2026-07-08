@@ -14,6 +14,7 @@
 import contextlib
 import logging
 import time
+from collections.abc import Iterator
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, NamedTuple, Union, cast
 
@@ -33,10 +34,7 @@ from vllm.model_executor.models.interfaces_base import (
     is_text_generation_model,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
-from vllm.multimodal.inputs import (
-    BatchedTensorInputs,
-    MultiModalKwargsItem,
-)
+from vllm.multimodal.inputs import BatchedTensorInputs
 from vllm.multimodal.utils import group_and_batch_mm_kwargs
 from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
@@ -73,7 +71,10 @@ from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
 from vllm_rbln.model_executor.model_loader.rbln_model_loader import get_optimum_model
-from vllm_rbln.model_executor.models.optimum import ModelInputForRBLN
+from vllm_rbln.model_executor.models.optimum import (
+    ModelInputForRBLN,
+    PartialPrefixInfo,
+)
 from vllm_rbln.model_executor.models.optimum.model_base import (
     RBLNOptimumDecoderMixin,
     RBLNOptimumMultimodalMixin,
@@ -514,10 +515,7 @@ class RBLNOptimumModelRunner(
         ):
             is_prefill = True
 
-        full_input_tokens = None
-        num_cached_tokens = 0
-        mrope_mm_kwargs = None
-        mm_embed_slice_starts = None
+        partial_prefix = None
         if is_prefill:
             (
                 input_ids,
@@ -525,10 +523,7 @@ class RBLNOptimumModelRunner(
                 block_tables,
                 multi_modal_kwargs,
                 running_request_ids,
-                full_input_tokens,
-                num_cached_tokens,
-                mrope_mm_kwargs,
-                mm_embed_slice_starts,
+                partial_prefix,
             ) = self._prepare_prefill(scheduler_output)
         else:
             input_ids, positions, block_tables, running_request_ids = (
@@ -556,10 +551,7 @@ class RBLNOptimumModelRunner(
             # FIXME unify the variable name is_prefill and is_prompt
             is_prompt=is_prefill,
             dummy_block=scheduler_output.dummy_block,
-            full_input_tokens=full_input_tokens,
-            num_cached_tokens=num_cached_tokens,
-            mrope_mm_kwargs=mrope_mm_kwargs,
-            mm_embed_slice_starts=mm_embed_slice_starts,
+            partial_prefix=partial_prefix,
         )
         return model_input, num_scheduled_tokens_np
 
@@ -588,27 +580,42 @@ class RBLNOptimumModelRunner(
             )
         return kv_cache_spec
 
+    def _iter_kept_mm_features(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_cached_tokens: int,
+    ) -> Iterator[Any]:
+        """Yield the multimodal features not entirely inside the prefix cache.
+
+        Single-source filter shared by the encoder batch (``_extract_mm_kwargs``)
+        and the tail feature-slice starts (``_mm_embed_slice_starts``) so the two
+        always agree on which items are kept and in what order. An item whose
+        placeholder tokens fall entirely within the cached region is skipped: its
+        KV is reused and its tokens are trimmed off the prefill input, so the
+        encoder must not run for it.
+        """
+        if not scheduler_output or not self.is_multimodal_raw_input_only_model:
+            return
+        for req in scheduler_output.scheduled_new_reqs:
+            for feature in req.mm_features:
+                if feature.data is None:
+                    continue
+                pos = feature.mm_position
+                if pos.offset + pos.length <= num_cached_tokens:
+                    continue
+                yield feature
+
     def _extract_mm_kwargs(
         self,
         scheduler_output: "SchedulerOutput",
         num_cached_tokens: int = 0,
     ) -> BatchedTensorInputs:
-        if not scheduler_output or not self.is_multimodal_raw_input_only_model:
-            return {}
-
-        mm_kwargs = list[tuple[str, MultiModalKwargsItem]]()
-        for req in scheduler_output.scheduled_new_reqs:
-            for feature in req.mm_features:
-                if feature.data is None:
-                    continue
-                # Skip items whose placeholder tokens fall entirely within the
-                # prefix-cached region: their KV is reused and their tokens are
-                # trimmed off the prefill input, so the encoder must not run.
-                pos = feature.mm_position
-                if pos.offset + pos.length <= num_cached_tokens:
-                    continue
-                mm_kwargs.append((feature.modality, feature.data))
-
+        mm_kwargs = [
+            (feature.modality, feature.data)
+            for feature in self._iter_kept_mm_features(
+                scheduler_output, num_cached_tokens
+            )
+        ]
         # Input all modalities at once
         mm_kwargs_combined: BatchedTensorInputs = {}
         for _, _, mm_kwargs_batch in group_and_batch_mm_kwargs(
@@ -627,24 +634,53 @@ class RBLNOptimumModelRunner(
     ) -> dict[str, list[int]]:
         """Per kept multimodal item, the first uncached encoder-feature index.
 
-        Mirrors the item filter in ``_extract_mm_kwargs`` (same batch order). A
-        Qwen-VL placeholder token maps 1:1 to an encoder feature, so a cache
-        boundary at absolute token ``num_cached_tokens`` splits an item at
-        feature index ``max(0, num_cached_tokens - offset)``: features before it
-        are already in the reused KV, features from it on must be re-scattered
-        into the tail.
+        Same items and order as ``_extract_mm_kwargs`` (both driven by
+        ``_iter_kept_mm_features``). A Qwen-VL placeholder token maps 1:1 to an
+        encoder feature, so a cache boundary at absolute token
+        ``num_cached_tokens`` splits an item at feature index
+        ``max(0, num_cached_tokens - offset)``: features before it are already in
+        the reused KV, features from it on must be re-scattered into the tail.
         """
         slice_starts: dict[str, list[int]] = {}
-        for req in scheduler_output.scheduled_new_reqs:
-            for feature in req.mm_features:
-                if feature.data is None:
-                    continue
-                pos = feature.mm_position
-                if pos.offset + pos.length <= num_cached_tokens:
-                    continue
-                start = max(0, num_cached_tokens - pos.offset)
-                slice_starts.setdefault(feature.modality, []).append(start)
+        for feature in self._iter_kept_mm_features(scheduler_output, num_cached_tokens):
+            start = max(0, num_cached_tokens - feature.mm_position.offset)
+            slice_starts.setdefault(feature.modality, []).append(start)
         return slice_starts
+
+    def _extract_prefill_mm_inputs(
+        self,
+        scheduler_output: "SchedulerOutput",
+        total_cached_length: int,
+        full_prompt_tokens: np.ndarray,
+    ) -> tuple[BatchedTensorInputs | None, PartialPrefixInfo | None]:
+        """Build the prefill multimodal inputs.
+
+        Returns ``(batched_mm_inputs, partial_prefix)``. ``batched_mm_inputs``
+        encodes the items not entirely inside the prefix cache (a partially-
+        cached image is kept and encoded whole; its features are sliced to the
+        uncached tail at scatter time). ``partial_prefix`` is set only on a
+        partial hit (``total_cached_length > 0``); see ``PartialPrefixInfo``.
+        """
+        if not self.supports_mm_inputs:
+            return None, None
+
+        batched_mm_inputs = self._extract_mm_kwargs(
+            scheduler_output, num_cached_tokens=total_cached_length
+        )
+        if total_cached_length <= 0:
+            return batched_mm_inputs, None
+
+        partial_prefix = PartialPrefixInfo(
+            full_input_tokens=torch.tensor(full_prompt_tokens).unsqueeze(0),
+            num_cached_tokens=total_cached_length,
+            mrope_mm_kwargs=self._extract_mm_kwargs(
+                scheduler_output, num_cached_tokens=0
+            ),
+            mm_embed_slice_starts=self._mm_embed_slice_starts(
+                scheduler_output, total_cached_length
+            ),
+        )
+        return batched_mm_inputs, partial_prefix
 
     def _prepare_prefill(
         self,
@@ -655,13 +691,9 @@ class RBLNOptimumModelRunner(
         torch.Tensor,
         BatchedTensorInputs | None,
         list[str],
-        torch.Tensor | None,
-        int,
-        BatchedTensorInputs | None,
-        dict[str, list[int]] | None,
+        PartialPrefixInfo | None,
     ]:
         running_request_ids = []
-        batched_mm_inputs: BatchedTensorInputs | None = None
 
         num_blocks_per_req = self.input_batch.block_table.block_tables[
             0
@@ -728,31 +760,9 @@ class RBLNOptimumModelRunner(
 
         running_request_ids.append(req_id)
 
-        full_input_tokens = None
-        mrope_mm_kwargs = None
-        mm_embed_slice_starts = None
-        if self.supports_mm_inputs:
-            # Encode the multimodal items whose placeholder tokens are not
-            # entirely inside the prefix-cached region. A partially-cached image
-            # is kept here (encoded whole); its features are sliced to the
-            # uncached tail at scatter time (see `mm_embed_slice_starts`).
-            batched_mm_inputs = self._extract_mm_kwargs(
-                scheduler_output, num_cached_tokens=total_cached_length
-            )
-            if total_cached_length > 0:
-                # Partial hit. MRoPE models recompute positions over the full
-                # prompt (needs the untrimmed tokens + every item's grid,
-                # including the fully-cached items dropped from the encoder batch
-                # above). `mm_embed_slice_starts` says where each kept item's
-                # cached front ends so its tail features can be re-scattered.
-                # Non-MRoPE models ignore these.
-                full_input_tokens = torch.tensor(full_prompt_tokens).unsqueeze(0)
-                mrope_mm_kwargs = self._extract_mm_kwargs(
-                    scheduler_output, num_cached_tokens=0
-                )
-                mm_embed_slice_starts = self._mm_embed_slice_starts(
-                    scheduler_output, total_cached_length
-                )
+        batched_mm_inputs, partial_prefix = self._extract_prefill_mm_inputs(
+            scheduler_output, total_cached_length, full_prompt_tokens
+        )
 
         input_tokens = torch.tensor(prompt_tokens).unsqueeze(0)
         input_positions = torch.tensor(input_positions).unsqueeze(0)
@@ -763,10 +773,7 @@ class RBLNOptimumModelRunner(
             block_table,
             batched_mm_inputs,
             running_request_ids,
-            full_input_tokens,
-            total_cached_length,
-            mrope_mm_kwargs,
-            mm_embed_slice_starts,
+            partial_prefix,
         )
 
     def _prepare_decode(

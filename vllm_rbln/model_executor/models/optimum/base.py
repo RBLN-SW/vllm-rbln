@@ -17,6 +17,29 @@ import torch
 from vllm.multimodal.inputs import BatchedTensorInputs
 
 
+@dataclass(frozen=True)
+class PartialPrefixInfo:
+    """A partial prefix-cache hit whose boundary may end inside an image.
+
+    The prefill input is trimmed to the uncached tail; these carry what the
+    (MRoPE) model needs to reconstruct that tail:
+
+    - ``full_input_tokens``: untrimmed prompt tokens. MRoPE positions are
+      computed over the full prompt then sliced to the tail.
+    - ``num_cached_tokens``: cache boundary in tokens (= the tail's start).
+    - ``mrope_mm_kwargs``: every item's grid (including fully-cached items), for
+      the full-prompt ``get_rope_index``.
+    - ``mm_embed_slice_starts``: per kept item (batch order, per modality), the
+      first uncached encoder-feature index -- features before it are in the
+      reused KV; from it on they are re-scattered into the tail.
+    """
+
+    full_input_tokens: torch.Tensor
+    num_cached_tokens: int
+    mrope_mm_kwargs: BatchedTensorInputs | None
+    mm_embed_slice_starts: dict[str, list[int]] | None
+
+
 # FIXME(eunji): In original vLLM, this dataclasss is located in model_runner.
 # And it makes available to decouple the vllm logic and hf model logic
 @dataclass(frozen=True)
@@ -39,19 +62,9 @@ class ModelInputForRBLN:
     # deepstack features. Left None for models that don't use them.
     visual_pos_mask: torch.Tensor | None = None
     deepstack_embeds: torch.Tensor | None = None
-    # Partial prefix-cache hit: the prefill input is trimmed to the uncached
-    # tail. A hit may end inside an image, so:
-    #  - MRoPE positions are recomputed over the FULL prompt then sliced to the
-    #    tail -> need `full_input_tokens`, `num_cached_tokens`, and the all-item
-    #    grids `mrope_mm_kwargs` (every image/video, including cached ones);
-    #  - each kept image's encoder features are sliced to their uncached tail
-    #    before scatter -> `mm_embed_slice_starts` gives, per modality, the first
-    #    uncached feature index for each kept item (in batch order).
-    # Left None/0 on the no-hit path and for non-MRoPE models.
-    full_input_tokens: torch.Tensor | None = None
-    num_cached_tokens: int = 0
-    mrope_mm_kwargs: BatchedTensorInputs | None = None
-    mm_embed_slice_starts: dict[str, list[int]] | None = None
+    # Set only on a partial prefix-cache hit (see PartialPrefixInfo); None on the
+    # no-hit path and for non-MRoPE models.
+    partial_prefix: "PartialPrefixInfo | None" = None
 
 
 version_error = RuntimeError(

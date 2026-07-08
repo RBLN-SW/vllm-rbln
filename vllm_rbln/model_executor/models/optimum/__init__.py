@@ -17,7 +17,10 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
-from vllm_rbln.model_executor.models.optimum.base import ModelInputForRBLN
+from vllm_rbln.model_executor.models.optimum.base import (
+    ModelInputForRBLN,
+    PartialPrefixInfo,
+)
 from vllm_rbln.utils.optimum.registry import (
     _RBLN_MULTIMODAL_MODELS,
     is_enc_dec_arch,
@@ -100,4 +103,9 @@ def load_model(vllm_config: VllmConfig) -> nn.Module:
     return rbln_model.eval()
 
 
-__all__ = ["load_model", "ModelInputForRBLN", "RBLNOptimumForEncoderModel"]
+__all__ = [
+    "load_model",
+    "ModelInputForRBLN",
+    "PartialPrefixInfo",
+    "RBLNOptimumForEncoderModel",
+]

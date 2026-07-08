@@ -161,42 +161,37 @@ class RBLNOptimumQwenVLForConditionalGeneration(
             "attention_mask": attention_mask,
         }
 
-        # Dispatch image inputs: pre-computed embeddings skip the visual encoder.
-        # image_embeds kwarg is only passed when actually present — models
-        # without EC disagg support (e.g. Qwen2.5-VL) don't accept it.
-        if image_input is not None:
-            preprocess_args["image_grid_thw"] = image_input["image_grid_thw"]
+        # Dispatch image/video inputs: pre-computed embeddings skip the visual
+        # encoder. The ``*_embeds`` kwarg is passed only when actually present —
+        # models without EC disagg support (e.g. Qwen2.5-VL) don't accept it.
+        # Per modality: (parsed input, grid key, pixel key, embeds key, label).
+        for mm_input, grid_key, pixel_key, embeds_key, label in (
+            (image_input, "image_grid_thw", "pixel_values", "image_embeds", "image"),
+            (
+                video_input,
+                "video_grid_thw",
+                "pixel_values_videos",
+                "video_embeds",
+                "video",
+            ),
+        ):
+            if mm_input is None:
+                preprocess_args[pixel_key] = None
+                preprocess_args[grid_key] = None
+                continue
+            preprocess_args[grid_key] = mm_input[grid_key]
             if positions_only:
                 # Keep grids for get_rope_index; skip the encoder.
-                preprocess_args["pixel_values"] = None
-            elif image_input.get("type") == "image_embeds":
-                logger.info("Prefill: using cached image embeddings (encoder skipped)")
-                preprocess_args["image_embeds"] = image_input["image_embeds"]
-                preprocess_args["pixel_values"] = None
+                preprocess_args[pixel_key] = None
+            elif mm_input.get("type") == embeds_key:
+                logger.info(
+                    "Prefill: using cached %s embeddings (encoder skipped)", label
+                )
+                preprocess_args[embeds_key] = mm_input[embeds_key]
+                preprocess_args[pixel_key] = None
             else:
-                logger.info("Prefill: running visual encoder (pixel_values)")
-                preprocess_args["pixel_values"] = image_input["pixel_values"]
-        else:
-            preprocess_args["pixel_values"] = None
-            preprocess_args["image_grid_thw"] = None
-
-        # Dispatch video inputs: pre-computed embeddings skip the visual encoder.
-        if video_input is not None:
-            preprocess_args["video_grid_thw"] = video_input["video_grid_thw"]
-            if positions_only:
-                preprocess_args["pixel_values_videos"] = None
-            elif video_input.get("type") == "video_embeds":
-                logger.info("Prefill: using cached video embeddings (encoder skipped)")
-                preprocess_args["video_embeds"] = video_input["video_embeds"]
-                preprocess_args["pixel_values_videos"] = None
-            else:
-                logger.info("Prefill: running visual encoder (pixel_values_videos)")
-                preprocess_args["pixel_values_videos"] = video_input[
-                    "pixel_values_videos"
-                ]
-        else:
-            preprocess_args["pixel_values_videos"] = None
-            preprocess_args["video_grid_thw"] = None
+                logger.info("Prefill: running visual encoder (%s)", pixel_key)
+                preprocess_args[pixel_key] = mm_input[pixel_key]
 
         # Add model-specific parameters
         self._add_model_specific_args(preprocess_args, video_input)
@@ -263,6 +258,16 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         """Create video embedding inputs based on model type"""
         pass
 
+    @staticmethod
+    def _mm_feature_counts(grid_thw: torch.Tensor, merge_size: int) -> torch.Tensor:
+        """Per-item encoder-feature count for a ``grid_thw`` batch.
+
+        Qwen-VL merges each ``merge_size x merge_size`` block of patches into one
+        token, so a placeholder token maps 1:1 to an encoder feature. Returns a
+        1-D tensor with one count per item.
+        """
+        return grid_thw.prod(dim=-1) // (merge_size**2)
+
     def _assert_mm_grid_tokens_match(self, input_ids, image_input, video_input) -> None:
         """Feed grid-derived counts into the shared ``_assert_mm_tokens_match``.
 
@@ -287,7 +292,7 @@ class RBLNOptimumQwenVLForConditionalGeneration(
             grid_thw = mm_input.get(grid_key)
             if grid_thw is None:
                 continue
-            num_embed_tokens = int((grid_thw.prod(dim=-1) // (merge_size**2)).sum())
+            num_embed_tokens = int(self._mm_feature_counts(grid_thw, merge_size).sum())
             num_placeholders = int((input_ids == token_id).sum())
             self._assert_mm_tokens_match(num_placeholders, num_embed_tokens)
 
@@ -296,7 +301,7 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         model_input: ModelInputForRBLN,
         mrope_position_deltas: dict[str, float],
     ) -> ModelInputForRBLN:
-        if model_input.num_cached_tokens > 0:
+        if model_input.partial_prefix is not None:
             return self._build_partial_prefill_forward_inputs(
                 model_input, mrope_position_deltas
             )
@@ -376,31 +381,42 @@ class RBLNOptimumQwenVLForConditionalGeneration(
             self.model.rbln_config.dtype
         )
 
+        partial = model_input.partial_prefix
+        assert partial is not None
         mm_kwargs = model_input.multi_modal_kwargs or {}
-        slice_starts = model_input.mm_embed_slice_starts or {}
+        slice_starts = partial.mm_embed_slice_starts or {}
         image_input = self._parse_and_validate_image_input(**mm_kwargs)
         video_input = self._parse_and_validate_video_input(**mm_kwargs)
 
         config = self.model.config
         merge = config.vision_config.spatial_merge_size
-        if image_input is not None:
+        # (modality, parsed input, pixel key, grid key, placeholder token id)
+        modalities = (
+            (
+                "image",
+                image_input,
+                "pixel_values",
+                "image_grid_thw",
+                config.image_token_id,
+            ),
+            (
+                "video",
+                video_input,
+                "pixel_values_videos",
+                "video_grid_thw",
+                config.video_token_id,
+            ),
+        )
+        for modality, mm_input, pixel_key, grid_key, token_id in modalities:
+            if mm_input is None:
+                continue
             self._scatter_partial_mm_embeds(
                 inputs_embeds,
                 tail_ids,
-                pixel_values=image_input["pixel_values"],
-                grid_thw=image_input["image_grid_thw"],
-                token_id=config.image_token_id,
-                slice_starts=slice_starts.get("image", []),
-                merge=merge,
-            )
-        if video_input is not None:
-            self._scatter_partial_mm_embeds(
-                inputs_embeds,
-                tail_ids,
-                pixel_values=video_input["pixel_values_videos"],
-                grid_thw=video_input["video_grid_thw"],
-                token_id=config.video_token_id,
-                slice_starts=slice_starts.get("video", []),
+                pixel_values=mm_input[pixel_key],
+                grid_thw=mm_input[grid_key],
+                token_id=token_id,
+                slice_starts=slice_starts.get(modality, []),
                 merge=merge,
             )
         return inputs_embeds
@@ -427,7 +443,7 @@ class RBLNOptimumQwenVLForConditionalGeneration(
             )
         feats = visual_out
         # Per-item feature count == number of placeholder tokens for that item.
-        counts = (grid_thw.prod(dim=-1) // (merge**2)).tolist()
+        counts = self._mm_feature_counts(grid_thw, merge).tolist()
         assert len(counts) == len(slice_starts), (
             f"kept-item count mismatch: {len(counts)} grids vs "
             f"{len(slice_starts)} slice starts"
@@ -457,17 +473,19 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         Returns the tail ``position_embed`` and the full-sequence
         ``rope_deltas`` (used for decode-step position continuation).
         """
-        full_input_ids = model_input.full_input_tokens
-        num_cached = model_input.num_cached_tokens
+        partial = model_input.partial_prefix
+        assert partial is not None
+        full_input_ids = partial.full_input_tokens
+        num_cached = partial.num_cached_tokens
 
         image_input = None
         video_input = None
-        if model_input.mrope_mm_kwargs:
+        if partial.mrope_mm_kwargs:
             image_input = self._parse_and_validate_image_input(
-                **model_input.mrope_mm_kwargs
+                **partial.mrope_mm_kwargs
             )
             video_input = self._parse_and_validate_video_input(
-                **model_input.mrope_mm_kwargs
+                **partial.mrope_mm_kwargs
             )
 
         attention_mask = torch.ones_like(full_input_ids)
