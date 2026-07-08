@@ -101,12 +101,17 @@ curl -s -u "$UV_INDEX_RBLN_NEXUS_NIGHTLY_USERNAME:$UV_INDEX_RBLN_NEXUS_NIGHTLY_P
 
 `uv.lock` pins packages to Rebellions-internal indexes, so `uv sync` only works
 inside the internal network. Internal nightly builds of `rebel-compiler` are
-not published externally. External contributors instead install `rebel-compiler`
-separately and build the rest of the environment from public indexes:
+not published externally. External contributors instead:
+
+1. Request an **external LDAP account** via the
+   [Request RBLN SDK/Portal Access](https://rebellions.ai/request-form-rbln-sdk/).
+2. Install `rebel-compiler` with that account, following the
+   [official guide](https://docs.rbln.ai/latest/getting_started/installation_guide.html).
+3. Install `vllm-rbln` on top — everything else resolves from public indexes:
 
 ```bash
-# 1. Create a venv and install rebel-compiler following the official guide
-#    (https://docs.rbln.ai/ — requires a Rebellions customer portal account):
+# 1. Create a venv and install rebel-compiler with your external LDAP account
+#    (per the official guide above):
 uv venv --python 3.12
 source .venv/bin/activate
 # ... install rebel-compiler into this venv per the official instructions ...
@@ -121,9 +126,11 @@ instead of the internal nightly pin in `pyproject.toml`. Everything else
 resolves from public indexes (PyPI, `wheels.vllm.ai`, `download.pytorch.org`);
 internal indexes are skipped automatically.
 
-> Note: the dev branch is validated in CI against internal nightly
-> `rebel-compiler` builds. With a released SDK version some recent features may
-> not work — CI is the source of truth for compatibility.
+> Note: this environment is **not** what CI reproduces. CI always builds from
+> the committed `uv.lock` (internal nightly `rebel-compiler` included), so unless
+> `uv.lock` is updated, your PR is tested against the existing lock — not against
+> the environment you built above. With a released SDK version some recent
+> features may not work locally — CI is the source of truth for compatibility.
 
 ### 📚 Documentation
 
