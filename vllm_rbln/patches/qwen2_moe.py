@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import torch
+from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.model_executor.models.qwen2_moe import Qwen2MoeSparseMoeBlock
 
 from vllm_rbln.patches import register_patch
@@ -36,8 +37,6 @@ def patched_qwen2_moe_forward(
         final_hidden_states = final_hidden_states + self.shared_expert(hidden_states)
 
     if self.tp_size > 1:
-        final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(
-            final_hidden_states
-        )
+        final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
     return final_hidden_states
