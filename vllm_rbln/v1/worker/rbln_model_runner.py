@@ -2473,6 +2473,15 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     @torch.inference_mode()
     def warm_up_model(self) -> None:
         set_warmup_active(True)
+        # Async-forward: run warmup dummies BLOCKING (force_sync) so each DP rank finishes its
+        # forward (incl. its CCL collectives) before the next warmup step. In defer mode the
+        # forward is otherwise submitted non-blocking and the runner races ahead, so the DP ranks
+        # desync across warmup steps and the device collective gets canceled/timed out
+        # (SYS_ECANCELLED 515 / SYS_KERNEL_TIMEOUT 503, esp. while first-touch compilation is
+        # interleaving). force_sync is a no-op for the sync runtime. Generation stays deferred
+        # (overlap) — this only pins warmup.
+        from rebel.sync_runtime import force_sync
+
         offload_ctx = (
             torch.rbln.offload()
             if envs.VLLM_RBLN_USE_DEVICE_TENSOR
@@ -2481,7 +2490,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             else nullcontext()
         )
         try:
-            with offload_ctx:
+            with offload_ctx, force_sync():
                 self._warm_up_model_inner()
         finally:
             set_warmup_active(False)
