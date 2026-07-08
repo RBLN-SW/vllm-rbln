@@ -399,55 +399,28 @@ class TestPDDisaggregationScheduler:
         )
 
     def test_eviction_drops_evicted_decode_slide_distance(self):
-        """REGRESSION for the index_copy crash (``index 4 is out of bounds for
-        dimension 0 with size 4`` in pad_speculative_draft_tokens).
+        """REGRESSION: the no-mixed-batching eviction must drop each evicted
+        running decode's ``spec_decode_slide_distance`` along with its
+        num_scheduled_tokens / scheduled_spec_decode_tokens. Left behind, the
+        scheduler output carries a slide for a req that is no longer scheduled;
+        the runner then over-counts num_input_tokens (= total_num_scheduled +
+        sum(slide)) while the pad window only accounts for the scheduled reqs ->
+        index_copy overflow.
 
-        The no-mixed-batching eviction drops evicted running decodes from
-        num_scheduled_tokens / scheduled_spec_decode_tokens but MUST also drop
-        their spec_decode_slide_distance -- the map added later for the full-spec
-        sliding-window backfill. Left behind, the scheduler output carries a
-        slide for a req that is no longer scheduled; the runner then over-counts
-        num_input_tokens (= total_num_scheduled + sum(slide)) while the pad
-        window only accounts for the scheduled reqs -> index_copy overflow.
+        Trigger: a genuine LOCAL prefill (num_new_tokens > 1 -> is_prefill) is
+        not decode-ready, so it takes the no-mixed-batching eviction path and
+        kicks out the running decodes. (A num_new == 1 decode-ready request no
+        longer evicts -- it joins the decode batch; see
+        ``test_decode_ready_sync_match_joins_decode_batch``.)
 
-        Trigger (PDD-specific): a remote-prefill req admitted DIRECTLY
-        (is_async=False, external match == num_tokens-1 -> num_new == 1) is NOT
-        ``promoted_from_waiting_for_remote_kvs``, so it skips the promote path
-        and hits the eviction path, kicking out the running decodes. Being
-        num_new == 1 it keeps the executed step all-decode (any_prefill=False),
-        so the pad path runs on the leaked-slide-inflated input.
-
-        Not PDD-exclusive, just PDD-fatal: spec_decode_slide_distance is the map
-        added for the full-spec sliding-window backfill, and the eviction loop was
-        never taught to pop it -- so EVERY eviction (including the ordinary
-        prefill-arrives-mid-decode eviction that mixed instances hit constantly)
-        leaks the same inconsistency into the scheduler output. It only crashes in
-        PDD because of how the runner routes the two cases:
-          * prefill evictor (num_new > 1): the executed step has a prefill ->
-            any_prefill=True -> get_dp_padding pads to the fixed
-            max_num_batched_tokens (DP-prefill path) and pad_speculative_draft_
-            tokens is SKIPPED. The leaked-slide-inflated input_ids is absorbed by
-            the large fixed buffer -- no tight per-req layout to overflow, so it
-            was masked all along.
-          * decode evictor (num_new == 1, PDD): the executed step is all-decode ->
-            any_prefill=False -> the tight spec pad (out = num_reqs *
-            max_spec_decode_len) runs, input_ids.numel != sum(window), and
-            index_copy overflows.
-        The fix (pop the slide on eviction) removes the inconsistency at the root,
-        cleaning both the PDD crash and the latent prefill-path leak.
-
-        Drop vs restore: the eviction stashes each evicted req's block delta in
-        ``_stranded_new_blocks`` so the physical KV allocation -- persistent,
-        already committed in the coordinator -- is re-emitted when the req is next
-        scheduled. The slide map is NOT persistent: it is a fresh per-step local
-        dict (rebuilt at the top of ``schedule()`` and recomputed for every
-        running req via ``_decide_spec_slide`` each step). An evicted req is
-        re-scheduled next step and gets its slide recomputed there, so the
-        eviction must simply DROP the stale entry -- there is nothing to restore.
-        Leaving it behind is a pure leak into this step's output.
+        The slide map is a fresh per-step local dict (recomputed via
+        ``_decide_spec_slide`` each step), so an evicted req simply DROPS its
+        stale entry -- there is nothing to restore; leaving it behind is a pure
+        leak into this step's output. (The evicted req's block delta IS stashed
+        in ``_stranded_new_blocks`` and re-emitted next step -- that is separate.)
         """
         NUM_SPEC = 3
-        matched = 32  # remote num_tokens = matched+1 -> num_new == 1
+        matched = 32  # num_tokens = matched + 5 -> num_new == 5 (> 1, a prefill)
         scheduler = create_scheduler(
             block_size=_BLOCK_SIZE,
             num_blocks=_NUM_BLOCKS,
@@ -463,19 +436,18 @@ class TestPDDisaggregationScheduler:
         for d in decodes:
             advance_to_decode(scheduler, d)
 
-        # Remote-prefill req: matched == num_tokens-1 -> num_new == 1, and
-        # is_async=False -> direct admission (never WAITING) -> not promoted ->
-        # falls through to the no-mixed-batching eviction of the running decodes.
-        remote = _create_pd_request(matched + 1, "remote")
+        # Local prefill req: partial match -> num_new == 5 > 1 -> is_prefill, so it
+        # takes the no-mixed-batching eviction of the running decodes.
+        remote = _create_pd_request(matched + 5, "remote")
         scheduler.add_request(remote)
 
         out = scheduler.schedule()
         ns = out.num_scheduled_tokens
         slide = dict(getattr(out, "spec_decode_slide_distance", {}) or {})
 
-        # Eviction happened: only the num_new == 1 remote req is scheduled.
+        # Eviction happened: only the prefill req is scheduled; decodes evicted.
         assert remote.request_id in ns
-        assert ns[remote.request_id] == 1
+        assert ns[remote.request_id] == 5
         for d in decodes:
             assert d.request_id not in ns
 
@@ -492,33 +464,164 @@ class TestPDDisaggregationScheduler:
         pad_window_sum = sum(ns[r] + slide.get(r, 0) for r in ns)
         assert num_input_tokens == pad_window_sum
 
-    def test_promoted_partial_kv_match_is_rejected(self):
-        """A promoted remote-KV request must be a genuine single-token decode:
-        its prompt KV was prefilled remotely, so num_new_tokens == 1. A partial
-        remote match (num_tokens > matched + 1) would leave a local prefill
-        remainder that cannot mix into the decode batch -- the scheduler asserts
-        loudly rather than emit a corrupt (non-uniform) decode batch.
-        """
-        import pytest
+    def test_promoted_partial_kv_match_scheduled_as_prefill(self):
+        """A PARTIAL remote-KV match (num_tokens > matched + 1) leaves a local
+        prefill remainder. The promoted request must be scheduled as a lone
+        prefill of that remainder -- NOT rejected, and NOT forced into the
+        decode batch.
 
-        matched = _BLOCK_SIZE  # 16
-        # num_tokens = matched + 5 -> num_new_tokens == 5 (> 1): partial match.
-        remote = _create_pd_request(matched + 5, "remote")
+        REGRESSION for the DP4 + LMCache serve crash: the old code asserted
+        `num_new_tokens == 1` in the promotion path and killed the DP rank on
+        every partial prefix-cache hit (gloo cascade -> whole serve dies). With
+        chunk-granular prefix caching a partial match is the norm, so this is
+        the common case, not an edge case.
+        """
+        matched = 2 * _BLOCK_SIZE  # 32 (block-aligned)
+        num_tokens = matched + _BLOCK_SIZE  # 48 -> 16-token remainder
+        scheduler = _create_pd_scheduler(matched_tokens=matched)
+
+        remote = _create_pd_request(num_tokens, "remote")
+        scheduler.add_request(remote)
+
+        # Step 1: async schedule -> WAITING_FOR_REMOTE_KVS, partial match cached.
+        out1 = scheduler.schedule()
+        assert remote.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+        assert remote.num_computed_tokens == matched
+
+        # Step 2: KV transfer completes. Partial hit -> no full-hit decrement,
+        # so num_computed_tokens stays at `matched` and the request is still
+        # is_prefill on promotion.
+        _simulate_kv_transfer_completion(scheduler, out1, remote.request_id)
+
+        # Step 3: promoted -> scheduled as a lone prefill of the remainder.
+        # Must NOT raise.
+        out = scheduler.schedule()
+        assert remote.request_id in out.num_scheduled_tokens
+        assert out.num_scheduled_tokens[remote.request_id] == num_tokens - matched
+        assert remote.request_id in {r.req_id for r in out.scheduled_new_reqs}
+        assert remote.status == RequestStatus.RUNNING
+        # Prefill runs alone (num_reqs == 1): no decode reqs this step.
+        assert out.scheduled_cached_reqs.req_ids == []
+
+    def test_promoted_partial_kv_match_then_reaches_decode(self):
+        """After the remainder prefill step, the request advances to decode via
+        the normal running loop (num_scheduled_tokens == 1). Confirms the fix
+        only touches the first promotion step; the rest is ordinary machinery.
+        """
+        matched = 2 * _BLOCK_SIZE  # 32
+        num_tokens = matched + _BLOCK_SIZE  # 48
+        scheduler = _create_pd_scheduler(matched_tokens=matched)
+
+        remote = _create_pd_request(num_tokens, "remote")
+        scheduler.add_request(remote)
+        out1 = scheduler.schedule()
+        _simulate_kv_transfer_completion(scheduler, out1, remote.request_id)
+
+        # Remainder prefill step.
+        out2 = scheduler.schedule()
+        assert out2.num_scheduled_tokens[remote.request_id] == num_tokens - matched
+
+        # Advance the prefill; the request then becomes decode-ready.
+        scheduler.update_from_output(out2, create_runner_output(out2, 1))
+
+        out3 = scheduler.schedule()
+        assert out3.num_scheduled_tokens[remote.request_id] == 1
+        assert remote.status == RequestStatus.RUNNING
+
+    def test_promoted_partial_kv_match_runs_alone_evicting_decode(self):
+        """A promoted partial-match request takes the ordinary lone-prefill
+        path: it evicts running decodes (no mixed batching) and runs at
+        num_reqs == 1, exactly like a normal chunked prefill.
+        """
+        matched = 2 * _BLOCK_SIZE  # 32
+        num_tokens = matched + _BLOCK_SIZE  # 48
+        scheduler = _create_pd_scheduler(matched_tokens=matched)
+
+        # A running decode request.
+        decode = _create_pd_request(10, "decode", do_remote_prefill=False)
+        advance_to_decode(scheduler, decode)
+
+        # Promoted partial-match remote.
+        remote = _create_pd_request(num_tokens, "remote")
+        scheduler.add_request(remote)
+        # decode scheduled; remote -> WAITING_FOR_REMOTE_KVS
+        out1 = scheduler.schedule()
+        assert remote.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+        _simulate_kv_transfer_completion(
+            scheduler, out1, remote.request_id, sampled_token_id=2
+        )
+
+        # Promotion step: partial prefill -> evicts the running decode, runs alone.
+        out = scheduler.schedule()
+        assert out.num_scheduled_tokens[remote.request_id] == num_tokens - matched
+        assert decode.request_id not in out.num_scheduled_tokens
+
+    def test_promoted_partial_kv_match_with_spec_decode_no_slide(self):
+        """With spec decode enabled, a promoted partial match is still routed as
+        a prefill: it bypasses `_decide_spec_slide` (no slide entry) instead of
+        joining the decode batch. The slide is applied later by the running loop
+        when the request actually reaches decode.
+        """
+        NUM_SPEC = 3
+        matched = 2 * _BLOCK_SIZE  # 32
+        num_tokens = matched + _BLOCK_SIZE  # 48
         scheduler = create_scheduler(
             block_size=_BLOCK_SIZE,
             num_blocks=_NUM_BLOCKS,
             max_num_seqs=_MAX_NUM_SEQS,
-            num_speculative_tokens=3,
+            num_speculative_tokens=NUM_SPEC,
             use_kv_connector=MockKVConfig(matched_tokens=matched, is_async=True),
         )
+        remote = _create_pd_request(num_tokens, "remote")
         scheduler.add_request(remote)
-
         out1 = scheduler.schedule()
-        assert remote.status == RequestStatus.WAITING_FOR_REMOTE_KVS
         _simulate_kv_transfer_completion(scheduler, out1, remote.request_id)
 
-        with pytest.raises(AssertionError, match="num_new_tokens"):
-            scheduler.schedule()
+        out = scheduler.schedule()  # must not raise
+        assert out.num_scheduled_tokens[remote.request_id] == num_tokens - matched
+        slide = dict(getattr(out, "spec_decode_slide_distance", {}) or {})
+        assert remote.request_id not in slide
+
+    def test_decode_ready_sync_match_joins_decode_batch(self):
+        """UNIFICATION behavior change: a NON-promoted decode-ready request
+        (sync connector match, num_new_tokens == 1) now JOINS the decode batch
+        (with query backfill) instead of evicting the running decodes to run
+        alone. This is the effect of gating the decode shortcut purely on
+        `not is_prefill(request)` (dropping the promoted_from_waiting_for_remote_kvs
+        precondition).
+        """
+        NUM_SPEC = 3
+        # matched=19 keeps num_computed mid-block (19 % 16 == 3), so the
+        # decode-batch backfill fits in-block and yields a real slide (== 3)
+        # rather than the cross-block no-spec fallback that a block-aligned
+        # num_computed would trigger.
+        matched = 19
+        num_tokens = matched + 1  # 20 -> num_new_tokens == 1 (decode-ready)
+        scheduler = create_scheduler(
+            block_size=_BLOCK_SIZE,
+            num_blocks=_NUM_BLOCKS,
+            max_num_seqs=_MAX_NUM_SEQS,
+            num_speculative_tokens=NUM_SPEC,
+            use_kv_connector=MockKVConfig(matched_tokens=matched, is_async=False),
+        )
+        decodes = [
+            _create_pd_request(10, f"d{i}", do_remote_prefill=False) for i in range(3)
+        ]
+        for d in decodes:
+            advance_to_decode(scheduler, d)
+
+        remote = _create_pd_request(num_tokens, "remote")  # sync full match
+        scheduler.add_request(remote)
+        out = scheduler.schedule()
+        ns = out.num_scheduled_tokens
+
+        # remote joins as a single-token decode; running decodes NOT evicted.
+        assert ns[remote.request_id] == 1
+        for d in decodes:
+            assert d.request_id in ns
+        # decode-batch backfill is applied to the joined request too.
+        slide = dict(getattr(out, "spec_decode_slide_distance", {}) or {})
+        assert slide.get(remote.request_id) == NUM_SPEC
 
 
 # ===========================================================================
