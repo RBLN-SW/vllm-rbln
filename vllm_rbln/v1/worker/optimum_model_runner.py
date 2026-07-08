@@ -585,14 +585,11 @@ class RBLNOptimumModelRunner(
         scheduler_output: "SchedulerOutput",
         num_cached_tokens: int,
     ) -> Iterator[Any]:
-        """Yield the multimodal features not entirely inside the prefix cache.
+        """Yield the mm features not entirely inside the prefix cache.
 
-        Single-source filter shared by the encoder batch (``_extract_mm_kwargs``)
-        and the tail feature-slice starts (``_mm_embed_tail_starts``) so the two
-        always agree on which items are kept and in what order. An item whose
-        placeholder tokens fall entirely within the cached region is skipped: its
-        KV is reused and its tokens are trimmed off the prefill input, so the
-        encoder must not run for it.
+        Shared filter for ``_extract_mm_kwargs`` (encoder batch) and
+        ``_mm_embed_tail_starts`` (tail slice starts) so they agree on kept
+        items and order. A fully-cached item is skipped (its KV is reused).
         """
         if not scheduler_output or not self.is_multimodal_raw_input_only_model:
             return
@@ -632,14 +629,10 @@ class RBLNOptimumModelRunner(
         scheduler_output: "SchedulerOutput",
         num_cached_tokens: int,
     ) -> dict[str, list[int]]:
-        """Per kept multimodal item, the first uncached encoder-feature index.
-
-        Same items and order as ``_extract_mm_kwargs`` (both driven by
-        ``_iter_kept_mm_features``). A Qwen-VL placeholder token maps 1:1 to an
-        encoder feature, so a cache boundary at absolute token
-        ``num_cached_tokens`` splits an item at feature index
-        ``max(0, num_cached_tokens - offset)``: features before it are already in
-        the reused KV, features from it on must be re-scattered into the tail.
+        """Per kept item, the first uncached feature index
+        ``max(0, num_cached_tokens - offset)`` -- features before it are in the
+        reused KV, features from it on are re-scattered into the tail. Same items
+        and order as ``_extract_mm_kwargs``.
         """
         tail_starts: dict[str, list[int]] = {}
         for feature in self._iter_kept_mm_features(scheduler_output, num_cached_tokens):
@@ -656,9 +649,7 @@ class RBLNOptimumModelRunner(
         """Build the prefill multimodal inputs.
 
         Returns ``(batched_mm_inputs, partial_prefix)``. ``batched_mm_inputs``
-        encodes the items not entirely inside the prefix cache (a partially-
-        cached image is kept and encoded whole; its features are sliced to the
-        uncached tail at scatter time). ``partial_prefix`` is set only on a
+        encodes the not-fully-cached items; ``partial_prefix`` is set only on a
         partial hit (``total_cached_length > 0``); see ``PartialPrefixInfo``.
         """
         if not self.supports_mm_inputs:

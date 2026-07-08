@@ -126,11 +126,8 @@ class RBLNOptimumQwen3VLForConditionalGeneration(
         masks: dict[str, torch.Tensor | None],
         deepstacks: dict[str, list[torch.Tensor] | None],
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        """Pack the tail-sliced per-layer deepstack features + visual mask.
-
-        Reuses optimum-rbln's ``_prepare_deepstack`` (same packing as the full
-        prefill), then squeezes the batch dim to match ``_build_prefill_params``.
-        """
+        """Pack tail-sliced deepstack + visual mask via optimum's
+        ``_prepare_deepstack`` (batch dim squeezed to match the full path)."""
         if deepstacks["image"] is None and deepstacks["video"] is None:
             return None, None
         visual_pos_mask, deepstack_visual = self.model._prepare_deepstack(
@@ -148,12 +145,7 @@ class RBLNOptimumQwen3VLForConditionalGeneration(
     def _build_partial_inputs_embeds(
         self, model_input: ModelInputForRBLN
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-        """Tail ``inputs_embeds`` + packed deepstack / visual mask (partial hit).
-
-        The base scatter yields the per-modality tail deepstack side outputs,
-        which are packed here into the decoder's ``visual_pos_mask`` /
-        ``deepstack_embeds``.
-        """
+        """Tail ``inputs_embeds`` + packed deepstack/visual mask (partial hit)."""
         inputs_embeds, masks, deepstacks = self._scatter_tail_mm(model_input)
         visual_pos_mask, deepstack_embeds = self._pack_partial_deepstack(
             masks, deepstacks

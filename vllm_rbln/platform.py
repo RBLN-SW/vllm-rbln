@@ -412,6 +412,11 @@ class RblnPlatform(Platform):
 
     @staticmethod
     def _uses_sliding_window(hf_config) -> bool:
+        """Whether any layer uses sliding-window attention. Reads the text
+        sub-config (multimodal composites nest it), honors a
+        ``use_sliding_window=False`` opt-out, and treats a sliding ``layer_types``
+        entry as sliding. Errs toward True (disabling prefix caching is safe).
+        """
         config = (
             hf_config.get_text_config()
             if hasattr(hf_config, "get_text_config")

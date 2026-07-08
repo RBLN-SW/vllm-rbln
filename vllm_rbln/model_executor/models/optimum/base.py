@@ -19,19 +19,13 @@ from vllm.multimodal.inputs import BatchedTensorInputs
 
 @dataclass(frozen=True)
 class PartialPrefixInfo:
-    """A partial prefix-cache hit whose boundary may end inside an image.
+    """Inputs to rebuild the uncached tail of a partial prefix-cache hit
+    (boundary may end inside an image).
 
-    The prefill input is trimmed to the uncached tail; these carry what the
-    (MRoPE) model needs to reconstruct that tail:
-
-    - ``full_input_tokens``: untrimmed prompt tokens. MRoPE positions are
-      computed over the full prompt then sliced to the tail.
-    - ``num_cached_tokens``: cache boundary in tokens (= the tail's start).
-    - ``mrope_mm_kwargs``: every item's grid (including fully-cached items), for
-      the full-prompt ``get_rope_index``.
-    - ``mm_embed_tail_starts``: per kept item (batch order, per modality), the
-      first uncached encoder-feature index -- features before it are in the
-      reused KV; from it on they are re-scattered into the tail.
+    - ``full_input_tokens``: untrimmed prompt (MRoPE positions computed over it).
+    - ``num_cached_tokens``: cache boundary in tokens (= tail start).
+    - ``mrope_mm_kwargs``: every item's grid (incl. cached) for get_rope_index.
+    - ``mm_embed_tail_starts``: per kept item, first uncached feature index.
     """
 
     full_input_tokens: torch.Tensor

@@ -11,22 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for the Qwen-VL partial prefix-cache-hit helpers.
-
-A partial hit ends inside/after an image, so the prefill is trimmed to the
-uncached tail: each kept image is encoded whole and only the features from the
-first uncached one on are re-scattered. These cover the pure-Python building
-blocks of that path (no NPU / compiled model):
-
-- runner ``_mm_embed_tail_starts`` -- which items are kept, and where each
-  item's uncached tail begins (feature index).
-- model ``_slice_to_tail`` / ``_mm_feature_counts`` -- per-item tail slicing.
-- model ``_encode_and_slice_mm`` -- base (no deepstack) vs Qwen3-VL (per-layer
-  deepstack sliced the same way).
-
-Methods are exercised against the classes with lightweight fakes for ``self``
-(the real classes need a compiled model / NPU to instantiate).
-"""
 
 import types
 
