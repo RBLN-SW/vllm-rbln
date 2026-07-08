@@ -13,6 +13,7 @@
 # limitations under the License.
 """A RBLN worker class."""
 
+import copy
 import os
 import time
 from types import NoneType
@@ -51,6 +52,7 @@ from vllm.tracing import instrument
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import (
+    EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
     DraftTokenIds,
     ModelRunnerOutput,
@@ -59,6 +61,9 @@ from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 import vllm_rbln.envs as envs
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.utils import (
+    finalize_kv_cache_registrations,
+)
 from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.worker.rbln_model_runner import RBLNModelRunner
 from vllm_rbln.v1.worker.utils import (
@@ -406,6 +411,15 @@ class RBLNWorker(WorkerBase):
             else:
                 self.model_runner.warmup_model()
 
+                # Connectors that defer KV-cache registration (RBLN NIXL D2D
+                # and LMCache) finalize it here: the KV cache physical views
+                # only exist once warm-up has run the compiled model. Walk the
+                # connector tree (incl. MultiConnector children) so the hook
+                # still runs when combined with other connectors. Only on a
+                # successful warm-up — not on the skipped or failed path.
+                if has_kv_transfer_group():
+                    finalize_kv_cache_registrations(get_kv_transfer_group())
+
         except BackendCompilerFailed as e:
 
             def is_rbln_oom_error(exc: BaseException | None) -> bool:
@@ -479,7 +493,21 @@ class RBLNWorker(WorkerBase):
         # NOTE(RBLN): DO NOT all_gather_group for RBLN pp
         get_pp_group().send_tensor_dict(output.tensors)
 
-        return None
+        # For PP with a KV connector, surface the connector output the
+        # model runner attached to the intermediate tensors so finished
+        # send/recv notifications still propagate from non-last ranks.
+        kv_connector_output = output.kv_connector_output
+        if not kv_connector_output:
+            return None
+        if (
+            not kv_connector_output.finished_sending
+            and not kv_connector_output.finished_recving
+        ):
+            return EMPTY_MODEL_RUNNER_OUTPUT
+
+        empty_output = copy.copy(EMPTY_MODEL_RUNNER_OUTPUT)
+        empty_output.kv_connector_output = kv_connector_output
+        return empty_output
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         return self.model_runner.take_draft_token_ids()

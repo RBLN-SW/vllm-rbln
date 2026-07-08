@@ -44,6 +44,7 @@ class PatchDescriptor:
     condition: Callable[[], bool] | None = None
     verify: Callable[[], None] | None = None
     priority: int = DEFAULT_PATCH_PRIORITY
+    apply_immediately: bool = False
 
 
 _REGISTERED_REGISTRATION_DESCRIPTORS: list[RegistrationDescriptor] = []
@@ -92,6 +93,7 @@ def register_patch(
     condition: Callable[[], bool] | None = None,
     verify: Callable[[], None] | None = None,
     priority: int = DEFAULT_PATCH_PRIORITY,
+    apply_immediately: bool = False,
 ) -> Callable[[Any], Any]:
     """Register a replacement object as an RBLN patch descriptor.
 
@@ -112,11 +114,25 @@ def register_patch(
             `[MIN_PATCH_PRIORITY(HIGH), MAX_PATCH_PRIORITY(LOW)]`. Lower values are
             applied earlier. Descriptors with the same priority are ordered by
             key. Defaults to `DEFAULT_PATCH_PRIORITY`.
+        apply_immediately: When ``True``, the patch is applied (setattr) at
+            registration time -- i.e. while the decorated module is being
+            imported -- instead of waiting for ``apply_registered_patches``.
+            Use this when other import-time code (e.g. a decorator that
+            snapshots the target into a closure) must observe the patched
+            value before ``apply_registered_patches`` runs. Application order
+            is determined by module import order, so combining this with an
+            explicit ``priority`` raises ``ValueError``.
 
     Returns:
         A decorator that registers the replacement object and returns it
         unchanged.
     """
+    if apply_immediately and priority != DEFAULT_PATCH_PRIORITY:
+        raise ValueError(
+            "apply_immediately=True patches are applied at registration "
+            "(import) time, so 'priority' cannot influence their application "
+            f"order; remove the explicit priority (target={target})."
+        )
 
     def _decorator(replacement: Any) -> Any:
         replacement_name = getattr(
@@ -130,18 +146,28 @@ def register_patch(
             if descriptor.key == descriptor_key:
                 return replacement
 
-        _REGISTERED_PATCH_DESCRIPTORS.append(
-            PatchDescriptor(
-                key=descriptor_key,
-                owner_module=descriptor_owner_module,
-                target=target,
-                replacement=replacement,
-                reason=reason,
-                condition=condition,
-                verify=verify,
-                priority=priority,
-            )
+        new_descriptor = PatchDescriptor(
+            key=descriptor_key,
+            owner_module=descriptor_owner_module,
+            target=target,
+            replacement=replacement,
+            reason=reason,
+            condition=condition,
+            verify=verify,
+            priority=priority,
+            apply_immediately=apply_immediately,
         )
+        _REGISTERED_PATCH_DESCRIPTORS.append(new_descriptor)
+
+        if apply_immediately and (condition is None or condition()):
+            _apply_target_patch(new_descriptor)
+            logger.debug(
+                "Applied custom patch %s immediately at registration "
+                "(owner=%s, target=%s).",
+                new_descriptor.key,
+                new_descriptor.owner_module,
+                new_descriptor.target,
+            )
         return replacement
 
     return _decorator
