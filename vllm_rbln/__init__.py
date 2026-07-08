@@ -33,10 +33,11 @@ def register_ops():
         apply_registrations()
         apply_registered_patches()
 
+        # TODO(RBLN): remove the following imports after we have a better way
         import vllm_rbln.distributed.kv_transfer.kv_connector.factory  # noqa
+        import vllm_rbln.model_executor.model_loader.weight_loader  # noqa
         # import vllm_rbln.lora.layer  # noqa
         # import vllm_rbln.model_executor.layers.quantization.kernels.mixed_precision  # noqa
         # import vllm_rbln.model_executor.layers.rotary_embedding.deepseek_scaling_rope  # noqa
-        # import vllm_rbln.model_executor.model_loader.weight_loader  # noqa
         # import vllm_rbln.models.deepseek_v2  # noqa
         # import vllm_rbln.models.minimax_m2  # noqa
