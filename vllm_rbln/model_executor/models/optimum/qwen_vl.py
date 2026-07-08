@@ -134,7 +134,6 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         video_input,
         deepstack_image_embeds=None,
         deepstack_video_embeds=None,
-        positions_only=False,
     ) -> dict:
         """
         Common preprocessing logic for prefill inputs.
@@ -145,12 +144,6 @@ class RBLNOptimumQwenVLForConditionalGeneration(
             attention_mask: Attention mask
             image_input: Image input data (pixel_values or image_embeds type)
             video_input: Video input data (pixel_values_videos or video_embeds type)
-            positions_only: When True, compute MRoPE positions only. The visual
-                encoder is skipped (``pixel_values``/``image_embeds`` are not
-                passed) while the grids are kept so ``get_rope_index`` still
-                runs. Used to recompute positions over the full prompt on a
-                partial prefix-cache hit. Returns just ``position_embed`` and
-                ``rope_deltas``.
 
         Returns:
             Dict of preprocessed inputs for the model's prefill_decoder
@@ -180,10 +173,7 @@ class RBLNOptimumQwenVLForConditionalGeneration(
                 preprocess_args[grid_key] = None
                 continue
             preprocess_args[grid_key] = mm_input[grid_key]
-            if positions_only:
-                # Keep grids for get_rope_index; skip the encoder.
-                preprocess_args[pixel_key] = None
-            elif mm_input.get("type") == embeds_key:
+            if mm_input.get("type") == embeds_key:
                 logger.info(
                     "Prefill: using cached %s embeddings (encoder skipped)", label
                 )
@@ -200,23 +190,45 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         # encoder path): when image/video embeds come from the EC cache,
         # the visual encoder is skipped and deepstack features must be
         # supplied explicitly.
-        if not positions_only:
-            if deepstack_image_embeds is not None:
-                preprocess_args["deepstack_image_embeds"] = deepstack_image_embeds
-            if deepstack_video_embeds is not None:
-                preprocess_args["deepstack_video_embeds"] = deepstack_video_embeds
+        if deepstack_image_embeds is not None:
+            preprocess_args["deepstack_image_embeds"] = deepstack_image_embeds
+        if deepstack_video_embeds is not None:
+            preprocess_args["deepstack_video_embeds"] = deepstack_video_embeds
 
         # Call the actual preprocessing
         preprocess_outputs = self.model._preprocess_prefill(**preprocess_args)
-        if positions_only:
-            # outputs[1]=position_embed, outputs[2]=rope_deltas across all
-            # Qwen-VL variants (arity of the rest differs, so don't unpack it).
-            return {
-                "position_embed": preprocess_outputs[1],
-                "rope_deltas": preprocess_outputs[2],
-            }
         prefill_params = self._build_prefill_params(preprocess_outputs)
         return prefill_params
+
+    def _compute_mrope_position(
+        self, input_ids, attention_mask, image_input, video_input
+    ) -> dict:
+        """Compute MRoPE positions only, skipping the vision encoder.
+
+        Runs ``get_rope_index`` over ``input_ids`` with each item's grid but no
+        ``pixel_values`` (so the encoder does not run). Used to (re)compute
+        positions over the full prompt on a partial prefix-cache hit. Returns
+        ``{"position_embed", "rope_deltas"}``.
+        """
+        preprocess_args = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+        }
+        for mm_input, grid_key, pixel_key in (
+            (image_input, "image_grid_thw", "pixel_values"),
+            (video_input, "video_grid_thw", "pixel_values_videos"),
+        ):
+            preprocess_args[pixel_key] = None
+            preprocess_args[grid_key] = (
+                mm_input[grid_key] if mm_input is not None else None
+            )
+        # second_per_grid_ts (video, Qwen2.5-VL) feeds get_rope_index too.
+        self._add_model_specific_args(preprocess_args, video_input)
+
+        outputs = self.model._preprocess_prefill(**preprocess_args)
+        # outputs[1]=position_embed, outputs[2]=rope_deltas across all Qwen-VL
+        # variants (the rest of the tuple's arity differs, so don't unpack it).
+        return {"position_embed": outputs[1], "rope_deltas": outputs[2]}
 
     @abstractmethod
     def _add_model_specific_args(self, preprocess_args: dict, video_input: Any):
@@ -489,12 +501,8 @@ class RBLNOptimumQwenVLForConditionalGeneration(
             )
 
         attention_mask = torch.ones_like(full_input_ids)
-        params = self.preprocess_prefill(
-            full_input_ids,
-            attention_mask,
-            image_input,
-            video_input,
-            positions_only=True,
+        params = self._compute_mrope_position(
+            full_input_ids, attention_mask, image_input, video_input
         )
         # position_embed: [2, batch, 1, N, head_dim]; slice the sequence (dim=-2)
         # to the uncached tail.
