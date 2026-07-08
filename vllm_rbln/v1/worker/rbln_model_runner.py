@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
 from contextlib import nullcontext
@@ -1168,14 +1169,13 @@ class RBLNModelRunner:
 
     def _sample(
         self,
-        logits: torch.Tensor | None,
+        logits: torch.Tensor,
         spec_decode_metadata: SpecDecodeMetadata | None,
     ) -> SamplerOutput:
         if self.is_intermediate_chunked_prefill:
             # NOTE(RBLN): During intermediate chunked prefill, skip sampling and return
             # empty tensor with expected shape for performance. The output is discarded
             # anyway through discard_request_mask.
-            assert logits is not None
             return SamplerOutput(
                 sampled_token_ids=torch.full(
                     (1, 1), -1, dtype=torch.int32, device=logits.device
@@ -1187,13 +1187,17 @@ class RBLNModelRunner:
         sampling_metadata = self.input_batch.sampling_metadata
         with self.performance_ctx.profile(
             section=ProfileSection.SAMPLER,
-            token_count=logits.shape[0] if logits is not None else 0,
+            token_count=logits.shape[0],
         ):
             if spec_decode_metadata is None:
-                return self.sampler(
+                bucket = logits.shape[0]
+                num_reqs = self.input_batch.num_reqs
+                padded_md = _pad_sampling_metadata(sampling_metadata, bucket)
+                out = self.sampler(
                     logits=logits,
-                    sampling_metadata=sampling_metadata,
+                    sampling_metadata=padded_md,
                 )
+                return _depad_sampler_output(out, num_reqs)
 
             return self.rejection_sampler(
                 spec_decode_metadata,
@@ -1425,7 +1429,7 @@ class RBLNModelRunner:
 
             sample_hidden_states = hidden_states
             assert self.use_wrapped_compute_logits
-            if not self.is_prefill:
+            if not self.is_prefill and spec_decode_metadata is not None:
                 logits = logits[logits_indices]
 
         self.execute_model_state = ExecuteModelState(
@@ -2686,7 +2690,7 @@ class RBLNModelRunner:
 
             # 4. sampler
             if not self.is_pooling_model:
-                for size in range(1, self.max_num_reqs + 1):
+                for size in self.bucketing_manager.batch_buckets:
                     self._dummy_sampler_run(size)
 
             # 5. drafter
@@ -2720,3 +2724,51 @@ class RBLNModelRunner:
                     dst = op.dst_block_id
                     nt = op.num_tokens
                     kv_cache[:, dst, :, :, :nt, :] = kv_cache[:, src, :, :, :nt, :]
+
+
+def _pad_rows(t: torch.Tensor | None, bucket: int) -> torch.Tensor | None:
+    if t is None:
+        return None
+    if (n := t.shape[0]) >= bucket:
+        return t
+    pad = t[-1:].expand(bucket - n, *t.shape[1:])
+    return torch.cat([t, pad], dim=0)
+
+
+def _pad_sampling_metadata(md: SamplingMetadata, bucket: int) -> SamplingMetadata:
+    def _pad_list(lst):
+        if not lst:
+            return lst
+        return lst + [[] for _ in range(bucket - len(lst))]
+
+    kwargs = dict(
+        temperature=_pad_rows(md.temperature, bucket),
+        top_p=_pad_rows(md.top_p, bucket),
+        top_k=_pad_rows(md.top_k, bucket),
+    )
+    if not md.no_penalties:
+        kwargs.update(
+            frequency_penalties=_pad_rows(md.frequency_penalties, bucket),
+            presence_penalties=_pad_rows(md.presence_penalties, bucket),
+            repetition_penalties=_pad_rows(md.repetition_penalties, bucket),
+            prompt_token_ids=_pad_rows(md.prompt_token_ids, bucket),
+            output_token_ids=_pad_list(md.output_token_ids),
+        )
+    if md.spec_token_ids:
+        kwargs["spec_token_ids"] = _pad_list(md.spec_token_ids)
+
+    return dataclasses.replace(md, **kwargs)
+
+
+def _depad_sampler_output(out: SamplerOutput, num_reqs: int) -> SamplerOutput:
+    lp = out.logprobs_tensors
+    if lp is not None:
+        lp = LogprobsTensors(
+            lp.logprob_token_ids[:num_reqs],
+            lp.logprobs[:num_reqs],
+            lp.selected_token_ranks[:num_reqs],
+        )
+    return SamplerOutput(
+        sampled_token_ids=out.sampled_token_ids[:num_reqs],
+        logprobs_tensors=lp,
+    )
