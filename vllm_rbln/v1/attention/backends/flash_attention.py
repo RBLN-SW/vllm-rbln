@@ -1211,7 +1211,7 @@ class RBLNFlashAttentionMetadataBuilder(
         )
 
         attn_metadata = RBLNFlashAttentionMetadata(
-            seq_lens=seq_lens,
+            seq_lens=seq_idx,
             block_tables=block_tables_tensor,
             slot_mapping=slot_mapping,
             is_prefill=is_prefill,
