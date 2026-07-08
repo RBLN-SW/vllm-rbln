@@ -76,6 +76,7 @@ class RBLNOptimumBlip2ForConditionalGeneration(
             block_tables = kwargs.pop("block_tables")
             cache_position = kwargs.pop("cache_position")
             inputs_embeds = model_input.inputs_embeds
+
             logits = self.model.language_model.prefill_decoder(
                 inputs_embeds=inputs_embeds,
                 cache_position=cache_position,

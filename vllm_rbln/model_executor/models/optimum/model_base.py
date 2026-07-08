@@ -188,6 +188,7 @@ class RBLNOptimumModelBase(nn.Module):
             valid_path = cached_model_path
         else:
             valid_path = None
+
         if valid_path is not None:
             # pre-compiled OR cache-hit
             model_cls = getattr(optimum.rbln, model_cls_name)

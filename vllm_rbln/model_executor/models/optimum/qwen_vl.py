@@ -93,33 +93,19 @@ class RBLNOptimumQwenVLForConditionalGeneration(
     def _process_image_input(self, image_input) -> dict:
         result = {}
         if image_input is not None and image_input.get("type") == "pixel_values":
-            visual_out = self.model.visual(
+            result["image_embeds"] = self.model.visual(
                 image_input["pixel_values"], grid_thw=image_input["image_grid_thw"]
             )
-            # Qwen3-VL.visual returns (image_embeds, deepstack_features),
-            # Qwen2/2.5-VL.visual returns a single tensor.
-            if isinstance(visual_out, tuple):
-                result["image_embeds"] = visual_out[0]
-                if len(visual_out) > 1:
-                    result["deepstack_image_embeds"] = visual_out[1]
-            else:
-                result["image_embeds"] = visual_out
             result["image_grid_thw"] = image_input["image_grid_thw"]
         return result
 
     def _process_video_input(self, video_input) -> dict:
         result = {}
         if video_input is not None and video_input.get("type") == "pixel_values_videos":
-            visual_out = self.model.visual(
+            result["video_embeds"] = self.model.visual(
                 video_input["pixel_values_videos"],
                 grid_thw=video_input["video_grid_thw"],
             )
-            if isinstance(visual_out, tuple):
-                result["video_embeds"] = visual_out[0]
-                if len(visual_out) > 1:
-                    result["deepstack_video_embeds"] = visual_out[1]
-            else:
-                result["video_embeds"] = visual_out
             result["video_grid_thw"] = video_input["video_grid_thw"]
             second_per_grid_ts = video_input.get("second_per_grid_ts", None)
             if second_per_grid_ts is not None:
@@ -132,8 +118,7 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         attention_mask,
         image_input,
         video_input,
-        deepstack_image_embeds=None,
-        deepstack_video_embeds=None,
+        **extra_preprocess_args,
     ) -> dict:
         """
         Common preprocessing logic for prefill inputs.
@@ -144,6 +129,8 @@ class RBLNOptimumQwenVLForConditionalGeneration(
             attention_mask: Attention mask
             image_input: Image input data (pixel_values or image_embeds type)
             video_input: Video input data (pixel_values_videos or video_embeds type)
+            extra_preprocess_args: Passed through to the model's
+                ``_preprocess_prefill`` (e.g. Qwen3-VL's deepstack embeds).
 
         Returns:
             Dict of preprocessed inputs for the model's prefill_decoder
@@ -186,14 +173,8 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         # Add model-specific parameters
         self._add_model_specific_args(preprocess_args, video_input)
 
-        # Forward pre-computed deepstack features (Qwen3-VL disaggregated
-        # encoder path): when image/video embeds come from the EC cache,
-        # the visual encoder is skipped and deepstack features must be
-        # supplied explicitly.
-        if deepstack_image_embeds is not None:
-            preprocess_args["deepstack_image_embeds"] = deepstack_image_embeds
-        if deepstack_video_embeds is not None:
-            preprocess_args["deepstack_video_embeds"] = deepstack_video_embeds
+        # Model-specific pass-through args (e.g. Qwen3-VL deepstack embeds).
+        preprocess_args.update(extra_preprocess_args)
 
         # Call the actual preprocessing
         preprocess_outputs = self.model._preprocess_prefill(**preprocess_args)
@@ -364,37 +345,48 @@ class RBLNOptimumQwenVLForConditionalGeneration(
           because that path's ``get_rope_index`` would choke on the tail's
           orphaned image-pad tokens (their ``<|vision_start|>`` is in the cached
           prefix).
+        - ``visual_pos_mask`` / ``deepstack_embeds``: Qwen3-VL only -- the tail's
+          visual token mask and per-layer deepstack features (also sliced to the
+          tail). ``None`` for Qwen2/2.5-VL.
         - ``position_embed``: MRoPE positions computed over the full prompt and
           sliced to the tail (``_recompute_full_mrope_position``).
         """
-        inputs_embeds = self._build_partial_inputs_embeds(model_input)
+        inputs_embeds, visual_pos_mask, deepstack_embeds = (
+            self._build_partial_inputs_embeds(model_input)
+        )
         position_embed, rope_deltas = self._recompute_full_mrope_position(model_input)
         mrope_position_deltas[model_input.running_requests_ids[0]] = rope_deltas.item()
         return replace(
             model_input,
             inputs_embeds=inputs_embeds,
             position_embed=position_embed,
+            visual_pos_mask=visual_pos_mask,
+            deepstack_embeds=deepstack_embeds,
         )
 
-    def _build_partial_inputs_embeds(
+    def _scatter_tail_mm(
         self, model_input: ModelInputForRBLN
-    ) -> torch.Tensor:
-        """Tail ``inputs_embeds`` with each kept image's tail features scattered.
+    ) -> tuple[
+        torch.Tensor,
+        dict[str, torch.Tensor | None],
+        dict[str, list[torch.Tensor] | None],
+    ]:
+        """Scatter each kept item's uncached-tail features into the tail embeds.
 
-        For a kept image whose front is cached, the vision encoder still runs on
-        the whole image (it is bidirectional); we then keep only the features
-        from the first uncached one on (``mm_embed_tail_starts``) and scatter
-        them into the tail's placeholder tokens. A Qwen-VL placeholder token maps
-        1:1 to a feature, so the scattered count matches the tail's placeholder
-        count.
+        The vision encoder runs on the whole item (bidirectional); only the
+        features from the first uncached one on (``mm_embed_tail_starts``) are
+        scattered into the tail placeholders (1:1 token<->feature). Returns
+        ``(inputs_embeds, masks, sides)``: per-modality tail placeholder ``masks``
+        and per-modality ``sides`` (the encoder's side outputs -- deepstack for
+        Qwen3-VL, ``None`` otherwise) for models that need them downstream.
         """
+        partial = model_input.partial_prefix
+        assert partial is not None
         tail_ids = model_input.input_tokens
         inputs_embeds = self.model.embed_tokens(tail_ids).to(
             self.model.rbln_config.dtype
         )
 
-        partial = model_input.partial_prefix
-        assert partial is not None
         mm_kwargs = model_input.multi_modal_kwargs or {}
         tail_starts = partial.mm_embed_tail_starts or {}
         image_input = self._parse_and_validate_image_input(**mm_kwargs)
@@ -419,57 +411,73 @@ class RBLNOptimumQwenVLForConditionalGeneration(
                 config.video_token_id,
             ),
         )
+        masks: dict[str, torch.Tensor | None] = {"image": None, "video": None}
+        sides: dict[str, list[torch.Tensor] | None] = {"image": None, "video": None}
         for modality, mm_input, pixel_key, grid_key, token_id in modalities:
             if mm_input is None:
                 continue
-            self._scatter_partial_mm_embeds(
-                inputs_embeds,
-                tail_ids,
+            tail_feats, side = self._encode_and_slice_mm(
                 pixel_values=mm_input[pixel_key],
                 grid_thw=mm_input[grid_key],
-                token_id=token_id,
                 tail_starts=tail_starts.get(modality, []),
                 merge=merge,
             )
-        return inputs_embeds
+            mask = tail_ids == token_id
+            inputs_embeds[mask] = tail_feats.to(inputs_embeds.dtype)
+            masks[modality] = mask
+            sides[modality] = side
+        return inputs_embeds, masks, sides
 
-    def _scatter_partial_mm_embeds(
+    def _build_partial_inputs_embeds(
+        self, model_input: ModelInputForRBLN
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        """Tail ``inputs_embeds`` for a partial hit, plus optional prefill extras.
+
+        Returns ``(inputs_embeds, visual_pos_mask, deepstack_embeds)``. Base
+        models have no extra prefill inputs -> the last two are ``None``;
+        Qwen3-VL overrides this to pack its deepstack side outputs.
+        """
+        inputs_embeds, _masks, _sides = self._scatter_tail_mm(model_input)
+        return inputs_embeds, None, None
+
+    @staticmethod
+    def _slice_to_tail(
+        feats: torch.Tensor, counts: list[int], tail_starts: list[int]
+    ) -> torch.Tensor:
+        """Concatenate each item's features cut to its uncached tail.
+
+        ``feats`` is ``[sum(counts), ...]`` (items concatenated in order); item
+        ``i`` contributes ``feats[item_i][tail_starts[i]:]``.
+        """
+        parts = []
+        offset = 0
+        for count, tail_start in zip(counts, tail_starts):
+            parts.append(feats[offset : offset + count][tail_start:])
+            offset += count
+        return torch.cat(parts, dim=0)
+
+    def _encode_and_slice_mm(
         self,
-        inputs_embeds: torch.Tensor,
-        tail_ids: torch.Tensor,
         *,
         pixel_values: torch.Tensor,
         grid_thw: torch.Tensor,
-        token_id: int,
         tail_starts: list[int],
         merge: int,
-    ) -> None:
-        """Encode the (whole) items, slice each to its uncached tail, scatter."""
-        visual_out = self.model.visual(pixel_values, grid_thw=grid_thw)
-        if isinstance(visual_out, tuple):
-            # Qwen3-VL returns deepstack features too; slicing those on a partial
-            # hit is not handled yet.
-            raise NotImplementedError(
-                "Partial prefix-cache hit is not supported for deepstack "
-                "(Qwen3-VL) models yet."
-            )
-        feats = visual_out
+    ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
+        """Encode the whole items, slice each item's features to its tail.
+
+        Returns ``(tail_feats, tail_deepstack)``. Base Qwen2/2.5-VL have no
+        deepstack -> ``tail_deepstack`` is ``None``; Qwen3-VL overrides this to
+        slice its per-layer deepstack features too.
+        """
+        feats = self.model.visual(pixel_values, grid_thw=grid_thw)
         # Per-item feature count == number of placeholder tokens for that item.
         counts = self._mm_feature_counts(grid_thw, merge).tolist()
         assert len(counts) == len(tail_starts), (
             f"kept-item count mismatch: {len(counts)} grids vs "
             f"{len(tail_starts)} tail starts"
         )
-        tail_feats = []
-        offset = 0
-        for count, tail_start in zip(counts, tail_starts):
-            item_feats = feats[offset : offset + count]
-            offset += count
-            tail_feats.append(item_feats[tail_start:])
-        tail_feats = torch.cat(tail_feats, dim=0).to(inputs_embeds.dtype)
-
-        mask = tail_ids == token_id
-        inputs_embeds[mask] = tail_feats
+        return self._slice_to_tail(feats, counts, tail_starts), None
 
     def _recompute_full_mrope_position(
         self, model_input: ModelInputForRBLN
@@ -667,29 +675,21 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         cache_position: torch.Tensor | None = None,
         running_requests_ids: list[str] | None = None,
         mrope_position_deltas: dict[str, float] | None = None,
+        **extra_preprocess_args,
     ) -> dict:
         """
         Build prefill_decoder kwargs from cached encoder outputs (EC consumer).
+
+        ``extra_preprocess_args`` are passed through to ``preprocess_prefill``
+        (e.g. Qwen3-VL forwards its cached deepstack features there).
         """
         model_dtype = self.dtype
 
         image_caches = [c for c in cached_mm_outputs if "image_embeds" in c]
         video_caches = [c for c in cached_mm_outputs if "video_embeds" in c]
 
-        def _concat_deepstack(caches: list[dict], key: str):
-            present = [c for c in caches if c.get(key) is not None]
-            if not present:
-                return None
-            num_layers = len(present[0][key])
-            return [
-                torch.cat([c[key][layer].to(model_dtype) for c in present], dim=0)
-                for layer in range(num_layers)
-            ]
-
         image_input = None
         video_input = None
-        deepstack_image_embeds = None
-        deepstack_video_embeds = None
 
         if image_caches:
             image_embeds = torch.cat(
@@ -700,9 +700,6 @@ class RBLNOptimumQwenVLForConditionalGeneration(
             )
             image_input = self._create_image_embedding_inputs(
                 image_embeds=image_embeds, image_grid_thw=image_grid_thw
-            )
-            deepstack_image_embeds = _concat_deepstack(
-                image_caches, "deepstack_image_embeds"
             )
 
         if video_caches:
@@ -721,9 +718,6 @@ class RBLNOptimumQwenVLForConditionalGeneration(
                 video_input["second_per_grid_ts"] = video_caches[0][
                     "second_per_grid_ts"
                 ]
-            deepstack_video_embeds = _concat_deepstack(
-                video_caches, "deepstack_video_embeds"
-            )
 
         attention_mask = torch.ones_like(input_ids)
         prefill_params = self.preprocess_prefill(
@@ -731,8 +725,7 @@ class RBLNOptimumQwenVLForConditionalGeneration(
             attention_mask,
             image_input,
             video_input,
-            deepstack_image_embeds=deepstack_image_embeds,
-            deepstack_video_embeds=deepstack_video_embeds,
+            **extra_preprocess_args,
         )
 
         rope_deltas = prefill_params.pop("rope_deltas", None)
@@ -835,55 +828,3 @@ class RBLNOptimumQwen2VLForConditionalGeneration(
             video_embeds=video_embeds,
             video_grid_thw=video_grid_thw,
         )
-
-
-class RBLNOptimumQwen3VLForConditionalGeneration(
-    RBLNOptimumQwen2_5_VLForConditionalGeneration
-):
-    """
-    Qwen3-VL reuses Qwen2.5-VL classes with the same implementation.
-    However, since Qwen3-VL does not require second_per_grid_ts,
-    certain methods are overridden to exclude it from the model inputs.
-    """
-
-    def _build_prefill_params(self, preprocess_outputs: tuple) -> dict:
-        # deepstack_embeds
-        # [1, 3, num_patches, embedding_dim] -> [3, num_patches, embedding_dim]
-        deepstack_embeds = preprocess_outputs[4]
-        return {
-            "inputs_embeds": preprocess_outputs[0],
-            "position_embed": preprocess_outputs[1],
-            "rope_deltas": preprocess_outputs[2],
-            "visual_pos_mask": preprocess_outputs[3],
-            "deepstack_embeds": deepstack_embeds.squeeze(0)
-            if deepstack_embeds is not None
-            else None,
-        }
-
-    def _add_model_specific_args(self, preprocess_args: dict, video_input: Any):
-        """Qwen3-VL doesn't need additional arguments"""
-        pass
-
-    def _create_video_pixel_inputs(
-        self,
-        pixel_values_videos: torch.Tensor,
-        video_grid_thw: torch.Tensor,
-        second_per_grid_ts=torch.Tensor | None,
-    ):
-        return Qwen2_5_VLVideoPixelInputs(
-            type="pixel_values_videos",
-            pixel_values_videos=pixel_values_videos,
-            video_grid_thw=video_grid_thw,
-            second_per_grid_ts=second_per_grid_ts,
-        )
-
-
-class RBLNOptimumQwen3VLMoeForConditionalGeneration(
-    RBLNOptimumQwen3VLForConditionalGeneration
-):
-    """
-    Qwen3-VL MoE model shares the same input structure as Qwen3-VL,
-    so it inherits from RBLNOptimumQwen3VLForConditionalGeneration without changes.
-    """
-
-    pass
