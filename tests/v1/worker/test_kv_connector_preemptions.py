@@ -12,22 +12,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""RBLNModelRunner KV-connector preemption call-convention test.
+"""Guard the vLLM KV-connector preemption contract RBLNModelRunner relies on.
 
-vLLM 0.18 -> 0.22 changed ``KVConnector.handle_preemptions`` from taking a
-``preempted_req_ids: set[str]`` to taking the connector metadata
-(``MultiConnector`` asserts ``MultiKVConnectorMetadata``). RBLNModelRunner.
-execute_model still uses the 0.18 convention and passes
-``scheduler_output.preempted_req_ids`` (a set), so on any real KV-cache
-preemption the 0.22 MultiConnector raises AssertionError.
+``RBLNModelRunner.execute_model`` forwards
+``scheduler_output.kv_connector_metadata`` to
+``get_kv_transfer_group().handle_preemptions(...)`` (upstream gpu_model_runner
+parity). Under the MultiConnector setup RBLN uses, that argument is a
+``MultiKVConnectorMetadata``.
 
-These tests reproduce that with dummy sub-connectors (no NIXL / serve needed):
-  - BEFORE: passing the set -> AssertionError.
-  - AFTER:  passing MultiKVConnectorMetadata -> dispatched to each sub-connector.
+This pins the base-class contract that makes that call valid, so a breaking
+change to vLLM's ``MultiConnector.handle_preemptions`` (removed / re-typed /
+different dispatch) is caught here. Whether *our* call site passes the right
+type is left to mypy; this covers the runtime dispatch contract mypy can't see
+-- MultiConnector narrows to ``MultiKVConnectorMetadata`` in its body, below the
+declared ``KVConnectorMetadata`` signature. Hardware-free (no NIXL / serve).
 """
 
-# Third Party
-import pytest
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
     MultiConnector,
@@ -47,75 +47,18 @@ class _DummyMeta(KVConnectorMetadata):
     pass
 
 
-def _multi(children):  # type: ignore[no-untyped-def]
-    # Bypass __init__ (needs a full VllmConfig); handle_preemptions only reads
-    # self._connectors, so this exercises the real 0.22 assert logic.
-    mc = MultiConnector.__new__(MultiConnector)
-    mc._connectors = list(children)
-    return mc
-
-
-def test_multiconnector_rejects_preempted_reqids_set():
-    """BEFORE fix: the runner passes scheduler_output.preempted_req_ids (a set);
-    0.22 MultiConnector.handle_preemptions asserts MultiKVConnectorMetadata."""
-    mc = _multi([_DummyConn(), _DummyConn()])
-    with pytest.raises(AssertionError):
-        mc.handle_preemptions({"req-0", "req-1"})
-
-
-def test_multiconnector_accepts_metadata():
-    """AFTER fix: passing kv_connector_metadata dispatches per sub-connector."""
+def test_multiconnector_dispatches_metadata_to_subconnectors():
+    """The argument type RBLNModelRunner forwards (MultiKVConnectorMetadata) is
+    accepted by MultiConnector.handle_preemptions and dispatched one entry per
+    sub-connector. Fails if vLLM changes the base-class contract."""
     c0, c1 = _DummyConn(), _DummyConn()
-    mc = _multi([c0, c1])
+    # Bypass __init__ (needs a full VllmConfig); handle_preemptions only reads
+    # self._connectors.
+    mc = MultiConnector.__new__(MultiConnector)
+    mc._connectors = [c0, c1]
+
     m0, m1 = _DummyMeta(), _DummyMeta()
     mc.handle_preemptions(MultiKVConnectorMetadata(metadata=(m0, m1)))
+
     assert c0.received is m0
     assert c1.received is m1
-
-
-# --- RBLNModelRunner._handle_kv_connector_preemptions (the fix) ---------------
-# Third Party
-import types  # noqa: E402
-
-# First Party
-import vllm_rbln.v1.worker.rbln_model_runner as rmr  # noqa: E402
-
-_RUNNER_FIX = rmr.RBLNModelRunner._handle_kv_connector_preemptions
-
-
-def _sched_output(preempted, metadata):  # type: ignore[no-untyped-def]
-    return types.SimpleNamespace(
-        preempted_req_ids=preempted, kv_connector_metadata=metadata
-    )
-
-
-def test_runner_passes_metadata_not_reqid_set(monkeypatch):
-    """The fix: runner forwards scheduler_output.kv_connector_metadata (NOT the
-    preempted_req_ids set) to handle_preemptions."""
-    spy = _DummyConn()
-    monkeypatch.setattr(rmr, "has_kv_transfer_group", lambda: True)
-    monkeypatch.setattr(rmr, "get_kv_transfer_group", lambda: spy)
-    meta = MultiKVConnectorMetadata(metadata=())
-    _RUNNER_FIX(_sched_output({"r0"}, meta))
-    assert spy.received is meta  # metadata, not {"r0"}
-
-
-def test_runner_asserts_when_metadata_none(monkeypatch):
-    """kv_connector_metadata is None with a live transfer group is an invariant
-    violation (the scheduler sets metadata whenever a connector exists) ->
-    assert, matching upstream gpu_model_runner."""
-    spy = _DummyConn()
-    monkeypatch.setattr(rmr, "has_kv_transfer_group", lambda: True)
-    monkeypatch.setattr(rmr, "get_kv_transfer_group", lambda: spy)
-    with pytest.raises(AssertionError):
-        _RUNNER_FIX(_sched_output({"r0"}, None))
-    assert spy.received == "UNSET"
-
-
-def test_runner_skips_when_no_preemptions(monkeypatch):
-    """No preempted requests -> connector not called."""
-    spy = _DummyConn()
-    monkeypatch.setattr(rmr, "has_kv_transfer_group", lambda: True)
-    monkeypatch.setattr(rmr, "get_kv_transfer_group", lambda: spy)
-    _RUNNER_FIX(_sched_output(set(), MultiKVConnectorMetadata(metadata=())))
-    assert spy.received == "UNSET"

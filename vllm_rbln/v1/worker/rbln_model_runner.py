@@ -1325,31 +1325,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             req_id_to_index_output_copy,
         )
 
-    @staticmethod
-    def _handle_kv_connector_preemptions(
-        scheduler_output: RBLNSchedulerOutput,
-    ) -> None:
-        """Notify the KV connector of preempted requests before their blocks are
-        reused.
-
-        vLLM 0.18 -> 0.22 changed ``KVConnector.handle_preemptions`` from taking a
-        ``preempted_req_ids: set[str]`` to taking the connector metadata
-        (``MultiConnector`` asserts ``MultiKVConnectorMetadata``). Pass
-        ``scheduler_output.kv_connector_metadata`` to match the 0.22 signature;
-        passing the old req-id set makes MultiConnector raise AssertionError on
-        any preemption.
-
-        NOTE(RBLN): unlike upstream (which calls handle_preemptions every step),
-        this is skipped when no request was preempted. Fine for the NIXL and
-        LMCache connectors, but a connector doing per-step evicted-block
-        handling in handle_preemptions would miss calls.
-        """
-        if not (scheduler_output.preempted_req_ids and has_kv_transfer_group()):
-            return
-        kv_connector_metadata = scheduler_output.kv_connector_metadata
-        assert kv_connector_metadata is not None
-        get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
-
     @torch.inference_mode()
     def execute_model(
         self,
@@ -1362,7 +1337,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 "after execute_model() returns None."
             )
 
-        self._handle_kv_connector_preemptions(scheduler_output)
+        if has_kv_transfer_group():
+            kv_connector_metadata = scheduler_output.kv_connector_metadata
+            assert kv_connector_metadata is not None
+            get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
 
