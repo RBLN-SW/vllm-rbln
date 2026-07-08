@@ -70,6 +70,7 @@ from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, Schedul
 
 from vllm_rbln.forward_context import set_forward_context
 from vllm_rbln.v1.core.rbln_scheduler import RBLNSchedulerOutput
+from vllm_rbln.v1.sample.rbln_sampler import resolve_compile_context
 
 if TYPE_CHECKING:
     from vllm_rbln.v1.core.rbln_kv_cache_manager import KVCacheCopyOp
@@ -410,20 +411,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         else:
             self.max_encoder_len = 0
 
-        if not envs.VLLM_RBLN_USE_DEVICE_TENSOR:
-            # Only provide use_global_ctx if CompileContext supports it
-            import inspect
-
-            from rebel.compile_context import CompileContext
-
-            compile_ctx_args = {}
-            if "use_weight_sharing" in inspect.signature(CompileContext).parameters:
-                compile_ctx_args["use_weight_sharing"] = True
-            if "use_global_ctx" in inspect.signature(CompileContext).parameters:
-                compile_ctx_args["use_global_ctx"] = True
-            self.compile_context = CompileContext(**compile_ctx_args)
-        else:
-            self.compile_context = None
+        self.compile_context = resolve_compile_context(compile_context=None)
         self.runtime_holder: list = []
 
         # Sampler
