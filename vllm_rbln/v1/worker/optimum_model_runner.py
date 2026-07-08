@@ -421,17 +421,8 @@ class RBLNOptimumModelRunner(
             self.mrope_position_deltas.pop(request_id, None)
 
         if model_input.is_prompt:
-            inputs_embeds, position_embed, rope_delta = (
-                model.build_prefill_forward_inputs(model_input)
-            )
-            if rope_delta is not None:
-                self.mrope_position_deltas[model_input.running_requests_ids[0]] = (
-                    rope_delta
-                )
-            return replace(
-                model_input,
-                inputs_embeds=inputs_embeds,
-                position_embed=position_embed,
+            return model.build_prefill_forward_inputs(
+                model_input, self.mrope_position_deltas
             )
 
         position_embed = model.compute_decode_position_embed(

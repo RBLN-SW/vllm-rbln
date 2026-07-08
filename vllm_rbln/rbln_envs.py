@@ -81,6 +81,10 @@ if TYPE_CHECKING:
     VLLM_RBLN_DECODE_BATCH_BUCKET_STEP: int = 2
     VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT: int = 1
     VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS: list[int] = []
+    # --- QUANTIZATION ---
+    # FIXME: erase when CR-03 is no longer supported
+    # Default is device-derived (see get_use_w8a16): True on REBEL evt0
+    VLLM_RBLN_USE_W8A16: bool = False
     # --- NIXL ---
     VLLM_RBLN_NIXL_SWA_VIEW_OPT: bool = False
 
@@ -104,6 +108,27 @@ def get_num_devices_per_local_rank() -> int:
             return int(legacy_value)
 
     return int(new_value) if new_value is not None else 1
+
+
+def get_use_w8a16() -> bool:
+    """Resolve ``VLLM_RBLN_USE_W8A16``, defaulting by device when unset.
+
+    An explicit env var always wins. REBEL evt0 (``RBLN-CR03``) lacks W8A8
+    support, so it defaults to W8A16; all other devices default to W8A8.
+    """
+    value = os.environ.get("VLLM_RBLN_USE_W8A16")
+    if value is not None:
+        return value.lower() in ("true", "1")
+
+    # Lazy import: platform imports this module. get_device_name() raises when
+    # the device is undeterminable (e.g. CPU-only host); fall back to W8A8.
+    from vllm.platforms import current_platform
+
+    try:
+        device_name = current_platform.get_device_name()
+    except Exception:
+        device_name = ""
+    return "cr03" in device_name.lower()
 
 
 def get_dp_impl() -> str:
@@ -382,6 +407,10 @@ environment_variables = {
     ),
     # Decode batch bucket manual buckets
     "VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS": get_decode_batch_bucket_manual_buckets,  # noqa E501
+    # Use W8A16 block fp8 (weight-only dequant) instead of W8A8 (dynamic
+    # activation fp8 quant). When unset, the default is derived from the device:
+    # REBEL evt0 (RBLN-CR03) defaults to W8A16 (no W8A8 support).
+    "VLLM_RBLN_USE_W8A16": get_use_w8a16,
     # --- NIXL ---
     # Publish a second SWA-sized descriptor range alongside the Full-sized
     # range at the same NIXL base addresses, so SWA groups transfer only
