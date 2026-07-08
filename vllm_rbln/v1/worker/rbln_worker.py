@@ -13,6 +13,7 @@
 # limitations under the License.
 """A RBLN worker class."""
 
+import copy
 import os
 import time
 from types import NoneType
@@ -51,6 +52,7 @@ from vllm.tracing import instrument
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import (
+    EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
     DraftTokenIds,
     ModelRunnerOutput,
@@ -491,10 +493,21 @@ class RBLNWorker(WorkerBase):
         # NOTE(RBLN): DO NOT all_gather_group for RBLN pp
         get_pp_group().send_tensor_dict(output.tensors)
 
-        # KV-connector output from non-last PP ranks is surfaced by
-        # sample_tokens() (the model runner stashes it in
-        # self.kv_connector_output), matching upstream 0.22 gpu_worker.
-        return None
+        # For PP with a KV connector, surface the connector output the
+        # model runner attached to the intermediate tensors so finished
+        # send/recv notifications still propagate from non-last ranks.
+        kv_connector_output = output.kv_connector_output
+        if not kv_connector_output:
+            return None
+        if (
+            not kv_connector_output.finished_sending
+            and not kv_connector_output.finished_recving
+        ):
+            return EMPTY_MODEL_RUNNER_OUTPUT
+
+        empty_output = copy.copy(EMPTY_MODEL_RUNNER_OUTPUT)
+        empty_output.kv_connector_output = kv_connector_output
+        return empty_output
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         return self.model_runner.take_draft_token_ids()
