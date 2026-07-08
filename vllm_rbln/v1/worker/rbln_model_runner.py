@@ -2772,17 +2772,21 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 self.is_prefill,
             )
         )
-        if num_reqs_across_dp is None or not self.specialized_moe_decode:
-            num_tokens_padded = self.max_num_tokens
-        else:
-            num_reqs_padded = self.bucketing_manager.find_decode_batch_bucket(
-                int(torch.max(num_reqs_across_dp).item())
-            )
-            assert num_reqs_padded is not None
-            assert torch.all(num_tokens_across_dp % num_reqs_across_dp == 0)
-            tokens_per_req_across_dp = num_tokens_across_dp // num_reqs_across_dp
-            max_tokens_per_req = int(torch.max(tokens_per_req_across_dp).item())
-            num_tokens_padded = num_reqs_padded * max_tokens_per_req
+        num_tokens_padded = self.max_num_tokens
+        if self.specialized_moe_decode:
+            if num_reqs_across_dp is None:
+                # any_prefill (PD disaggregation): route padded-decode to the max
+                # bucket so only ONE padded-decode graph is ever needed.
+                num_reqs_padded = self.bucketing_manager.decode_batch_buckets[-1]
+            else:
+                num_reqs_padded = self.bucketing_manager.find_decode_batch_bucket(
+                    int(torch.max(num_reqs_across_dp).item())
+                )
+                assert num_reqs_padded is not None
+                assert torch.all(num_tokens_across_dp % num_reqs_across_dp == 0)
+                tokens_per_req_across_dp = num_tokens_across_dp // num_reqs_across_dp
+                max_tokens_per_req = int(torch.max(tokens_per_req_across_dp).item())
+                num_tokens_padded = num_reqs_padded * max_tokens_per_req
 
         return num_reqs_padded, num_tokens_padded, num_tokens_across_dp
 
@@ -2844,25 +2848,23 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 # num_padded_tokens to max_num_tokens whenever any rank prefills,
                 # which the small-bucket decode graphs from 2. decode above cannot
                 # satisfy.
-                for num_req in self.bucketing_manager.decode_batch_buckets:
-                    for query_len in query_lens:
-                        self._dummy_run(
-                            num_req,
-                            query_len,
-                            False,
-                            num_tokens_padded=self.max_num_tokens,
-                        )
-                    if self.speculative_config:
-                        # Cover DP-asymmetric decode where a peer runs spec decode.
-                        spec_query_len = (
-                            self.speculative_config.num_speculative_tokens + 1
-                        )
-                        self._dummy_run(
-                            num_req,
-                            1,
-                            False,
-                            num_tokens_padded=num_req * spec_query_len,
-                        )
+                num_req = self.bucketing_manager.decode_batch_buckets[-1]
+                for query_len in query_lens:
+                    self._dummy_run(
+                        num_req,
+                        query_len,
+                        False,
+                        num_tokens_padded=self.max_num_tokens,
+                    )
+                if self.speculative_config:
+                    # Cover DP-asymmetric decode where a peer runs spec decode.
+                    spec_query_len = self.speculative_config.num_speculative_tokens + 1
+                    self._dummy_run(
+                        num_req,
+                        1,
+                        False,
+                        num_tokens_padded=num_req * spec_query_len,
+                    )
 
             # 3. compute_logits
             if not self.use_wrapped_compute_logits:
