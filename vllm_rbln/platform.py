@@ -410,17 +410,30 @@ class RblnPlatform(Platform):
         )
         vllm_config.cache_config.enable_prefix_caching = False
 
+    @staticmethod
+    def _uses_sliding_window(hf_config) -> bool:
+        config = (
+            hf_config.get_text_config()
+            if hasattr(hf_config, "get_text_config")
+            else hf_config
+        )
+        if getattr(config, "sliding_window", None) is not None and getattr(
+            config, "use_sliding_window", True
+        ):
+            return True
+        layer_types = getattr(config, "layer_types", None) or []
+        return any("sliding" in str(layer_type).lower() for layer_type in layer_types)
+
     @classmethod
     def disable_unsupported_prefix_caching(cls, vllm_config: VllmConfig) -> None:
         if not vllm_config.cache_config.enable_prefix_caching:
             return
 
         hf_config = vllm_config.model_config.hf_config
+        has_sliding_window = cls._uses_sliding_window(hf_config)
 
         if envs.VLLM_RBLN_USE_VLLM_MODEL:
-            if getattr(hf_config, "sliding_window", None) is not None and getattr(
-                hf_config, "use_sliding_window", True
-            ):
+            if has_sliding_window:
                 cls._disable_prefix_caching(vllm_config, "sliding window models")
 
         else:
@@ -432,9 +445,7 @@ class RblnPlatform(Platform):
                 cls._disable_prefix_caching(vllm_config, "encoder-decoder models")
             elif is_pooling_arch(hf_config):
                 cls._disable_prefix_caching(vllm_config, "pooling models")
-            elif getattr(hf_config, "sliding_window", None) is not None and getattr(
-                hf_config, "use_sliding_window", True
-            ):
+            elif has_sliding_window:
                 cls._disable_prefix_caching(vllm_config, "sliding window models")
 
     @classmethod
