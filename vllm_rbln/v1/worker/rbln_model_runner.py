@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import dataclasses
+import itertools
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
 from contextlib import nullcontext
@@ -1679,6 +1680,7 @@ class RBLNModelRunner:
             self.model = model_loader.load_model(
                 vllm_config=self.vllm_config, model_config=self.model_config
             )
+        self._make_weights_contiguous()
         if hasattr(self.model, "logits_processor"):
             self.logits_processor = self.model.logits_processor
         elif self.model_config.is_multimodal_model and hasattr(
@@ -2635,6 +2637,12 @@ class RBLNModelRunner:
             return
         self.kv_cache_bases = kv_cache_bases
         self.kv_cache_view_infos = kv_cache_view_infos
+
+    def _make_weights_contiguous(self) -> None:
+        # weight-free compile hard-errors on non-contiguous CPU weights.
+        for t in itertools.chain(self.model.parameters(), self.model.buffers()):
+            if not t.is_contiguous():
+                t.data = t.data.contiguous()
 
     def warmup_model(self) -> None:
         logger.info("Compile and warming up model.")
