@@ -138,12 +138,24 @@ def run(llm, generating_prompts, label):
 def main():
     generating_prompts = build_prompts()
 
+    # Prefix caching enabled.
+    prefix_cached_llm = LLM(
+        model=MODEL,
+        block_size=16384,
+        max_model_len=32768,
+        max_num_seqs=4,
+        enable_prefix_caching=True,
+        limit_mm_per_prompt={"image": 2},
+    )
+    cached_texts, w_prefix_time = run(
+        prefix_cached_llm, generating_prompts, "`enable_prefix_caching=True`"
+    )
     # Baseline: no prefix caching.
     regular_llm = LLM(
         model=MODEL,
         block_size=16384,
         max_model_len=32768,
-        max_num_seqs=1,
+        max_num_seqs=4,
         enable_prefix_caching=False,
         limit_mm_per_prompt={"image": 2},
     )
@@ -151,23 +163,6 @@ def main():
         regular_llm, generating_prompts, "`enable_prefix_caching=False`"
     )
     del regular_llm
-
-    # Prefix caching enabled.
-    prefix_cached_llm = LLM(
-        model=MODEL,
-        block_size=16384,
-        max_model_len=32768,
-        max_num_seqs=1,
-        enable_prefix_caching=True,
-        limit_mm_per_prompt={"image": 2},
-    )
-    # Warmup with the first prompt so the shared image + prefix KV is cached
-    # before the measured run, guaranteeing the later prompts are partial hits.
-    prefix_cached_llm.generate(generating_prompts[0], sampling_params)
-    cached_texts, w_prefix_time = run(
-        prefix_cached_llm, generating_prompts, "`enable_prefix_caching=True`"
-    )
-
     generated_same = all(
         regular_texts[i] == cached_texts[i] for i in range(len(generating_prompts))
     )

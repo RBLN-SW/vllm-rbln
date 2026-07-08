@@ -517,6 +517,7 @@ class RBLNOptimumModelRunner(
         full_input_tokens = None
         num_cached_tokens = 0
         mrope_mm_kwargs = None
+        mm_embed_slice_starts = None
         if is_prefill:
             (
                 input_ids,
@@ -527,6 +528,7 @@ class RBLNOptimumModelRunner(
                 full_input_tokens,
                 num_cached_tokens,
                 mrope_mm_kwargs,
+                mm_embed_slice_starts,
             ) = self._prepare_prefill(scheduler_output)
         else:
             input_ids, positions, block_tables, running_request_ids = (
@@ -557,6 +559,7 @@ class RBLNOptimumModelRunner(
             full_input_tokens=full_input_tokens,
             num_cached_tokens=num_cached_tokens,
             mrope_mm_kwargs=mrope_mm_kwargs,
+            mm_embed_slice_starts=mm_embed_slice_starts,
         )
         return model_input, num_scheduled_tokens_np
 
@@ -617,6 +620,32 @@ class RBLNOptimumModelRunner(
 
         return mm_kwargs_combined
 
+    def _mm_embed_slice_starts(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_cached_tokens: int,
+    ) -> dict[str, list[int]]:
+        """Per kept multimodal item, the first uncached encoder-feature index.
+
+        Mirrors the item filter in ``_extract_mm_kwargs`` (same batch order). A
+        Qwen-VL placeholder token maps 1:1 to an encoder feature, so a cache
+        boundary at absolute token ``num_cached_tokens`` splits an item at
+        feature index ``max(0, num_cached_tokens - offset)``: features before it
+        are already in the reused KV, features from it on must be re-scattered
+        into the tail.
+        """
+        slice_starts: dict[str, list[int]] = {}
+        for req in scheduler_output.scheduled_new_reqs:
+            for feature in req.mm_features:
+                if feature.data is None:
+                    continue
+                pos = feature.mm_position
+                if pos.offset + pos.length <= num_cached_tokens:
+                    continue
+                start = max(0, num_cached_tokens - pos.offset)
+                slice_starts.setdefault(feature.modality, []).append(start)
+        return slice_starts
+
     def _prepare_prefill(
         self,
         scheduler_output: "RBLNSchedulerOutput",
@@ -629,6 +658,7 @@ class RBLNOptimumModelRunner(
         torch.Tensor | None,
         int,
         BatchedTensorInputs | None,
+        dict[str, list[int]] | None,
     ]:
         running_request_ids = []
         batched_mm_inputs: BatchedTensorInputs | None = None
@@ -700,21 +730,28 @@ class RBLNOptimumModelRunner(
 
         full_input_tokens = None
         mrope_mm_kwargs = None
+        mm_embed_slice_starts = None
         if self.supports_mm_inputs:
-            # Encode only the multimodal items that are not covered by the
-            # prefix cache; the cached ones have their KV reused and their
-            # placeholder tokens trimmed off the prefill input above.
+            # Encode the multimodal items whose placeholder tokens are not
+            # entirely inside the prefix-cached region. A partially-cached image
+            # is kept here (encoded whole); its features are sliced to the
+            # uncached tail at scatter time (see `mm_embed_slice_starts`).
             batched_mm_inputs = self._extract_mm_kwargs(
                 scheduler_output, num_cached_tokens=total_cached_length
             )
             if total_cached_length > 0:
-                # Partial hit: MRoPE models recompute positions over the full
-                # prompt, which needs the untrimmed tokens and every item's
-                # grid (including the cached items dropped from the encoder
-                # batch above). Non-MRoPE models ignore these.
+                # Partial hit. MRoPE models recompute positions over the full
+                # prompt (needs the untrimmed tokens + every item's grid,
+                # including the fully-cached items dropped from the encoder batch
+                # above). `mm_embed_slice_starts` says where each kept item's
+                # cached front ends so its tail features can be re-scattered.
+                # Non-MRoPE models ignore these.
                 full_input_tokens = torch.tensor(full_prompt_tokens).unsqueeze(0)
                 mrope_mm_kwargs = self._extract_mm_kwargs(
                     scheduler_output, num_cached_tokens=0
+                )
+                mm_embed_slice_starts = self._mm_embed_slice_starts(
+                    scheduler_output, total_cached_length
                 )
 
         input_tokens = torch.tensor(prompt_tokens).unsqueeze(0)
@@ -729,6 +766,7 @@ class RBLNOptimumModelRunner(
             full_input_tokens,
             total_cached_length,
             mrope_mm_kwargs,
+            mm_embed_slice_starts,
         )
 
     def _prepare_decode(

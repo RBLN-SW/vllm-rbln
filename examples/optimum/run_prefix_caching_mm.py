@@ -55,7 +55,7 @@ prompts = [
     "What does the Pythagorean theorem state?",
     "What is the chemical symbol for gold?",
 ]
-
+os.environ["VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK"] = "4"
 MODEL = "llava-hf/llava-v1.6-mistral-7b-hf"
 
 # Every prompt shares the same image and the same prefix text, so the
@@ -93,7 +93,7 @@ def main():
     regular_llm = LLM(
         model=MODEL,
         block_size=16384,
-        max_num_seqs=1,
+        max_num_seqs=4,
         enable_prefix_caching=False,
     )
 
@@ -125,7 +125,7 @@ def main():
     prefix_cached_llm = LLM(
         model=MODEL,
         block_size=16384,
-        max_num_seqs=1,
+        max_num_seqs=4,
         enable_prefix_caching=True,
     )
 
