@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import rebel  # noqa: F401 — registers rbln custom ops (rebel.ops.torch_custom_ops)
 import torch
 import torch.nn.functional as F
 from vllm.distributed import get_dp_group
@@ -23,9 +24,7 @@ from vllm.model_executor.layers.fused_moe.layer import (
 
 import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
-from vllm_rbln.model_executor.layers.fused_moe.all2all import (  # noqa: F401 — registers custom ops on import
-    ccl_combine_receive,  # noqa: F811
-    ccl_combine_send,  # noqa: F811
+from vllm_rbln.model_executor.layers.fused_moe.all2all import (
     prepare_send_mask_matrix,
 )
 
@@ -41,81 +40,6 @@ def fused_moe_custom__init__(self, *args, **kwargs):
     self.expert_map_const = (
         self.expert_map.tolist() if self.expert_map is not None else None
     )
-
-
-# Define custom_moe_glu op. The body below is the PyTorch reference
-# implementation; on device it is replaced by the RBLN custom kernel.
-@torch.library.custom_op(
-    "rbln_custom_ops::custom_moe_glu",
-    mutates_args=(),
-)
-def custom_moe_glu(
-    hidden_states: torch.Tensor,
-    gate_proj_weight: torch.Tensor,
-    up_proj_weight: torch.Tensor,
-    down_proj_weight: torch.Tensor,
-    masked_routing_weight: torch.Tensor,
-    hidden_act: str,
-    expert_map: torch.Tensor | None = None,
-    gate_proj_bias: torch.Tensor | None = None,
-    up_proj_bias: torch.Tensor | None = None,
-    down_proj_bias: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """
-    Customized MoE GLU operation (custom kernel version).
-
-    Expected tensor shapes:
-    - hidden_states: [batch * seq_len, hidden_size]
-    - gate_proj_weight: [num_experts, intermediate_size, hidden_size]
-    - up_proj_weight: [num_experts, intermediate_size, hidden_size]
-    - down_proj_weight: [num_experts, hidden_size, intermediate_size]
-    - masked_routing_weight: [num_experts, batch * seq_len]
-      (token dim may be padded to 64-align)
-    - hidden_act: gate activation name ("silu"/"swish" or "gelu*")
-
-    Returns:
-        torch.Tensor: [batch * seq_len, hidden_size]
-    """
-    assert hidden_states.dtype == masked_routing_weight.dtype, (
-        "hidden_states and masked_routing_weight must have the same dtype"
-    )
-
-    act = hidden_act.lower()
-    if act in ("silu", "swish"):
-        act_fn = torch.nn.functional.silu
-    elif "gelu" in act:
-        act_fn = torch.nn.functional.gelu
-    else:
-        raise ValueError(f"Unsupported hidden_act={hidden_act!r}")
-
-    num_tokens = hidden_states.shape[0]
-    out = torch.zeros_like(hidden_states)
-    expert_cnt = gate_proj_weight.shape[0]
-    # routing weight token dim may be padded to 64-align; slice to actual num_tokens
-    routing_t = masked_routing_weight.transpose(0, 1)[:num_tokens, :]  # [num_tokens, E]
-    for i in range(expert_cnt):
-        gate = torch.nn.functional.linear(hidden_states, gate_proj_weight[i])
-        up = torch.nn.functional.linear(hidden_states, up_proj_weight[i])
-        mul = act_fn(gate) * up
-        down = torch.nn.functional.linear(mul, down_proj_weight[i])
-        out += down * routing_t[:, i : i + 1]
-    return out
-
-
-@custom_moe_glu.register_fake
-def custom_moe_glu_fake(
-    hidden_states: torch.Tensor,
-    gate_proj_weight: torch.Tensor,
-    up_proj_weight: torch.Tensor,
-    down_proj_weight: torch.Tensor,
-    masked_routing_weight: torch.Tensor,
-    hidden_act: str,
-    expert_map: torch.Tensor | None = None,
-    gate_proj_bias: torch.Tensor | None = None,
-    up_proj_bias: torch.Tensor | None = None,
-    down_proj_bias: torch.Tensor | None = None,
-) -> torch.Tensor:
-    return torch.empty_like(hidden_states)
 
 
 def get_tokens_mask(num_tokens: int, left=1.0, right=0.0, device=None):
