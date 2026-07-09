@@ -2125,7 +2125,7 @@ wheels = [
 
 [[package]]
 name = "rebel-compiler"
-version = "0.11.1.dev630+g1f2f5f92"
+version = "0.11.1.dev160+g7bd15fb8"
 source = { registry = "https://pypi.rebellions.in/simple/" }
 dependencies = [
     { name = "attrs", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
@@ -2147,7 +2147,7 @@ dependencies = [
     { name = "typing-extensions", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
 ]
 wheels = [
-    { url = "https://pypi.rebellions.in/api/package/rebel-compiler/rebel_compiler-0.11.1.dev630+g1f2f5f92-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "sha256:9ff0ccc999e29dfc313770baf01c3e086e1786b1da03f4eb551c0490c93c91e3" },
+    { url = "https://pypi.rebellions.in/api/package/rebel-compiler/rebel_compiler-0.11.1.dev160+g7bd15fb8-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "sha256:1283b6c86ccff3bc71855a5baaf433ebdb75d55870c4485148dc09d31c4a27ea" },
 ]
 
 [[package]]
