@@ -33,10 +33,29 @@ from vllm_rbln.v1.attention.kv_cache_bindings import materialize_kv_cache_view
 from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 
 if TYPE_CHECKING:
-    from vllm.model_executor.layers.attention import MLAAttention
+    from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 
 attention_original_init = Attention.__init__
 attention_original_forward = Attention.forward
+
+
+def _record_pipeline_layer_index(self: "Attention | MLAAttention") -> None:
+    """Record a pipeline-adjusted layer index on an attention layer.
+
+    RBLN resolves each layer's KV cache from attention metadata (a graph
+    input) by index; that index must be relative to the layers that live on
+    this pipeline-parallel rank, so subtract the rank's starting layer.
+    """
+    self.layer_index = extract_layer_index(self.layer_name)
+
+    # NOTE(RBLN): Consider PP
+    vllm_config = get_current_vllm_config()
+    model_config = vllm_config.model_config
+    if model_config is not None:
+        start, _ = model_config.get_layers_start_end_indices(
+            vllm_config.parallel_config
+        )
+        self.layer_index -= start
 
 
 # NOTE(RBLN) - To represent kv cache as model input,
@@ -208,16 +227,7 @@ def patched_attention_init(self: Attention, *args, **kwargs) -> None:
     attention_original_init(self, *args, **kwargs)
 
     # NOTE(RBLN): Layer index is required to use external binding KV cache.
-    self.layer_index = extract_layer_index(self.layer_name)
-
-    # NOTE(RBLN): Consider PP
-    vllm_config = get_current_vllm_config()
-    model_config = vllm_config.model_config
-    if model_config is not None:
-        start, _ = model_config.get_layers_start_end_indices(
-            vllm_config.parallel_config
-        )
-        self.layer_index -= start
+    _record_pipeline_layer_index(self)
 
 
 @register_patch(

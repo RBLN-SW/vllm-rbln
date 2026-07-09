@@ -1,11 +1,11 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -13,43 +13,60 @@
 # limitations under the License.
 
 import torch
-from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.model_executor.models.deepseek_v2 import DeepseekV2Attention, DeepseekV2MoE
 
+from vllm_rbln.patches import register_patch
 
-def __deepseek_v2_moe_forward_rsd(self, hidden_states: torch.Tensor) -> torch.Tensor:
-    if self.n_shared_experts is not None:
-        shared_output = self.shared_experts(hidden_states)
+
+@register_patch(
+    target="vllm.model_executor.models.deepseek_v2.DeepseekV2MoE.forward",
+    reason=(
+        "Replace DeepseekV2MoE.forward with an RBLN-friendly form: call the "
+        "RBLN FusedMoE with a `router` callback and keep 3-D tensors (no "
+        "reshape). All-reduce via `tensor_model_parallel_all_reduce` directly "
+        "because RBLNFusedMoE has no `maybe_all_reduce_tensor_model_parallel` "
+        "method; matches the qwen2_moe/qwen3_moe patches."
+    ),
+)
+def patched_deepseek_v2_moe_forward(
+    self: DeepseekV2MoE, hidden_states: torch.Tensor
+) -> torch.Tensor:
+    final_hidden_states = self.experts(
+        hidden_states=hidden_states, router=lambda x: self.gate(x)[0]
+    )
+    # Fix FP16 overflow
+    # See DeepseekV2DecoderLayer for more details.
     if hidden_states.dtype != torch.float16:
-        final_hidden_states = (
-            self.experts(hidden_states=hidden_states, router=lambda x: self.gate(x)[0])
-            * self.routed_scaling_factor
-        )
-    else:
-        # Fix FP16 overflow
-        # See DeepseekV2DecoderLayer for more details.
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states, router=lambda x: self.gate(x)[0]
-        )
-    if shared_output is not None:
-        if hidden_states.dtype != torch.float16:
-            final_hidden_states = final_hidden_states + shared_output
-        else:
-            # Fix FP16 overflow
-            # See DeepseekV2DecoderLayer for more details.
-            final_hidden_states = final_hidden_states + shared_output * (
-                1.0 / self.routed_scaling_factor
-            )
-    if self.tp_size > 1:
-        final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        final_hidden_states *= self.routed_scaling_factor
 
+    if self.shared_experts is not None:
+        shared_output = self.shared_experts(hidden_states)
+        if hidden_states.dtype == torch.float16:
+            shared_output *= 1.0 / self.routed_scaling_factor
+        final_hidden_states = final_hidden_states + shared_output
+
+    if self.tp_size > 1:
+        final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(
+            final_hidden_states
+        )
+    # FIXME(RBLN) - DO NOT reshape
+    # return final_hidden_states.view(orig_shape)
     return final_hidden_states
 
 
-def __deepseek_v2_attention_forward(
-    self,
+@register_patch(
+    target="vllm.model_executor.models.deepseek_v2.DeepseekV2Attention.forward",
+    reason=(
+        "RBLN non-MLA (use_mla=False) fallback path: materialize K/V per head "
+        "and pad to qk_head_dim so the regular RBLN attention backend can run "
+        "DeepSeek attention. Unused when use_mla=True (DeepseekV2MLAAttention)."
+    ),
+)
+def patched_deepseek_v2_attention_forward(
+    self: DeepseekV2Attention,
     positions: torch.Tensor,
     hidden_states: torch.Tensor,
+    llama_4_scaling: torch.Tensor | None = None,
 ) -> torch.Tensor:
     batch, _, _ = hidden_states.shape
     if self.q_lora_rank is not None:
@@ -93,8 +110,3 @@ def __deepseek_v2_attention_forward(
 
     output, _ = self.o_proj(attn_output)
     return output
-
-
-# reference is from DeepseekV2MoE.forward
-DeepseekV2MoE.forward = __deepseek_v2_moe_forward_rsd
-DeepseekV2Attention.forward = __deepseek_v2_attention_forward

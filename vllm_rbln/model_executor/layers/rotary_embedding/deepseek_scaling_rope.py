@@ -20,47 +20,44 @@ from vllm.model_executor.layers.rotary_embedding.deepseek_scaling_rope import (
 )
 
 
-def deepseek_scaling_rope_forward(
-    self,
-    positions: torch.Tensor,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    offsets: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """PyTorch-native implementation equivalent to forward()."""
-    if offsets is not None:
-        positions = positions + offsets
-    positions = positions.flatten()
+class RBLNDeepseekScalingRotaryEmbedding(DeepseekScalingRotaryEmbedding):
+    """DeepSeek scaling RoPE for RBLN."""
 
-    query_rot = query[..., : self.rotary_dim]
-    key_rot = key[..., : self.rotary_dim]
-    if self.rotary_dim < self.head_size:
-        query_pass = query[..., self.rotary_dim :]
-        key_pass = key[..., self.rotary_dim :]
+    def forward_oot(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """PyTorch-native implementation equivalent to forward()."""
+        assert key is not None
+        cos_sin_cache = self._match_cos_sin_cache_dtype(query)
+        query_rot = query[..., : self.rotary_dim]
+        key_rot = key[..., : self.rotary_dim]
+        if self.rotary_dim < self.head_size:
+            query_pass = query[..., self.rotary_dim :]
+            key_pass = key[..., self.rotary_dim :]
 
-    self.cos_sin_cache = self.cos_sin_cache.to(positions.device)
-    cos_sin = self.cos_sin_cache.index_select(0, positions)
-    cos, sin = cos_sin.chunk(2, dim=-1)
-    if self.is_neox_style:
-        # NOTE(woosuk): Here we assume that the positions tensor has the
-        # shape [batch_size, seq_len].
-        cos = cos.repeat(1, 2).unsqueeze(-2)
-        sin = sin.repeat(1, 2).unsqueeze(-2)
-    else:
-        cos = torch.stack([cos, cos], dim=-1).reshape(cos_sin.shape).unsqueeze(-2)
-        sin = torch.stack([sin, sin], dim=-1).reshape(cos_sin.shape).unsqueeze(-2)
+        cos_sin = cos_sin_cache[
+            torch.add(positions, offsets) if offsets is not None else positions
+        ]
+        cos, sin = cos_sin.chunk(2, dim=-1)
+        if self.is_neox_style:
+            cos = torch.cat((cos, cos), dim=-1).unsqueeze(-2)
+            sin = torch.cat((sin, sin), dim=-1).unsqueeze(-2)
+        else:
+            cos = cos.repeat_interleave(2, dim=-1).unsqueeze(-2)
+            sin = sin.repeat_interleave(2, dim=-1).unsqueeze(-2)
 
-    rotate_fn = rotate_neox if self.is_neox_style else rotate_gptj
-    query_rot = query_rot * cos + rotate_fn(query_rot) * sin
-    key_rot = key_rot * cos + rotate_fn(key_rot) * sin
+        rotate_fn = rotate_neox if self.is_neox_style else rotate_gptj
+        query_rot = query_rot * cos + rotate_fn(query_rot) * sin
+        key_rot = key_rot * cos + rotate_fn(key_rot) * sin
 
-    if self.rotary_dim < self.head_size:
-        query = torch.cat((query_rot, query_pass), dim=-1)
-        key = torch.cat((key_rot, key_pass), dim=-1)
-    else:
-        query = query_rot
-        key = key_rot
-    return query, key
-
-
-DeepseekScalingRotaryEmbedding.forward = deepseek_scaling_rope_forward
+        if self.rotary_dim < self.head_size:
+            query = torch.cat((query_rot, query_pass), dim=-1)
+            key = torch.cat((key_rot, key_pass), dim=-1)
+        else:
+            query = query_rot
+            key = key_rot
+        return query, key
