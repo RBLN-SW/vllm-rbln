@@ -70,6 +70,7 @@ from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, Schedul
 
 from vllm_rbln.forward_context import set_forward_context
 from vllm_rbln.v1.core.rbln_scheduler import RBLNSchedulerOutput
+from vllm_rbln.v1.core.utils import decode_batch_size
 
 if TYPE_CHECKING:
     from vllm_rbln.v1.core.rbln_kv_cache_manager import KVCacheCopyOp
@@ -687,9 +688,9 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.execute_model_state: ExecuteModelState | None = None
         self.kv_connector_output: KVConnectorOutput | None = None
 
-        self.max_batch_size = (
-            self.scheduler_config.max_num_seqs
-            // self.parallel_config.pipeline_parallel_size
+        self.max_batch_size = decode_batch_size(
+            self.scheduler_config.max_num_seqs,
+            self.parallel_config.pipeline_parallel_size,
         )
         self.max_num_seqs = self.scheduler_config.max_num_seqs
         self.max_prefill_batch_size = 1

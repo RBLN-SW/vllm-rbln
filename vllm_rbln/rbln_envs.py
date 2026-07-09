@@ -87,6 +87,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_USE_W8A16: bool = False
     # --- NIXL ---
     VLLM_RBLN_NIXL_SWA_VIEW_OPT: bool = False
+    VLLM_RBLN_PP_BALANCE_DECODE_BATCH: bool = False
 
 
 def get_num_devices_per_local_rank() -> int:
@@ -418,6 +419,17 @@ environment_variables = {
     # moves the full block — only the remote RDMA payload is trimmed.
     "VLLM_RBLN_NIXL_SWA_VIEW_OPT": lambda: (
         os.environ.get("VLLM_RBLN_NIXL_SWA_VIEW_OPT", "False").lower() in ("true", "1")
+    ),
+    # When pipeline_parallel_size > 1, dynamically size each step's decode
+    # batch to ceil(active_decodes / pp_size) (clamped to the compiled
+    # max_num_seqs // pp_size), spreading available decodes across the
+    # pp_size in-flight microbatches instead of packing them into one. This
+    # avoids PP-depth collapse (one stage left idle, ~2x decode latency) after
+    # a pipeline drain. No-op for pp_size == 1. Opt-in; default keeps the
+    # static max_num_seqs // pp_size cap.
+    "VLLM_RBLN_PP_BALANCE_DECODE_BATCH": lambda: (
+        os.environ.get("VLLM_RBLN_PP_BALANCE_DECODE_BATCH", "False").lower()
+        in ("true", "1")
     ),
 }
 

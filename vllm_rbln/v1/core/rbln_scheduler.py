@@ -138,6 +138,7 @@ from vllm_rbln.v1.core.rbln_kv_cache_manager import (
     RBLNKVCacheManager,
     SubBlockMatch,
 )
+from vllm_rbln.v1.core.utils import DecodeAdmissionController
 
 logger = init_logger(__name__)
 
@@ -242,6 +243,21 @@ class RBLNScheduler(Scheduler):
         # re-emit it on the request's next scheduled step. Keyed by request_id.
         self._stranded_new_blocks: dict[str, KVCacheBlocks] = {}
 
+        # NOTE(RBLN): Per-step decode-batch admission. Under PP the engine keeps
+        # pipeline_parallel_size microbatches in flight, so each step's decode
+        # batch must stay <= max_num_seqs // pp_size (== the runner's compiled
+        # bucket ceiling). The controller produces a per-step budget that both
+        # the running loop and the waiting-loop remote-KV promotion share; it
+        # also owns the static-vs-dynamic (PP-balanced) cap choice. See
+        # vllm_rbln/v1/core/utils.py.
+        self._decode_admission = DecodeAdmissionController(
+            max_num_seqs=self.max_num_running_reqs,
+            pipeline_parallel_size=(
+                self.vllm_config.parallel_config.pipeline_parallel_size
+            ),
+            pp_balance_decode=envs.VLLM_RBLN_PP_BALANCE_DECODE_BATCH,
+        )
+
     def _decide_spec_slide(self, request: Request, new_n: int) -> tuple[int, bool]:
         """Sliding-window backfill decision for one decode request's query
         window so it reaches ``num_spec_tokens + 1``.
@@ -287,6 +303,21 @@ class RBLNScheduler(Scheduler):
             )
             return 0, True
         return desired_slide, False
+
+    def _decode_demand(self) -> int:
+        """Total decode demand for this step's PP-balanced admission cap.
+
+        = running decodes + remote-KV requests ready to be admitted (transfer
+        complete, awaiting promotion). Including the ready remote-KV gives the
+        dynamic cap headroom to ramp the decode batch on the P/D-disaggregated
+        decode side; running-only would stall the ramp. Demand is invariant
+        under admission (promoting a ready remote-KV moves it from ready ->
+        running), so this snapshot is exact even as the running/ready split
+        shifts during the waiting loop. Evaluated only when PP balancing is on.
+        """
+        num_running_decodes = sum(1 for r in self.running if not is_prefill(r))
+        num_ready_remote_kv = len(self.finished_recving_kv_req_ids)
+        return num_running_decodes + num_ready_remote_kv
 
     def schedule(self) -> RBLNSchedulerOutput:
         # Copied from vllm.v1.core.sched.Scheduler.schedule: https://github.com/vllm-project/vllm/blob/v0.18.0/vllm/v1/core/sched/scheduler.py#L338-L927
@@ -344,6 +375,13 @@ class RBLNScheduler(Scheduler):
         # window so it stays within already-allocated KV slots. Populated
         # below as we walk running reqs and detect boundary cases.
         spec_decode_slide_distance: dict[str, int] = {}
+
+        # NOTE(RBLN): Per-step decode-batch admission budget shared by the
+        # running loop and the waiting-loop remote-KV promotion. The controller
+        # evaluates `_decode_demand` only when PP balancing is active.
+        decode_budget = self._decode_admission.make_budget(
+            demand_fn=self._decode_demand
+        )
 
         # First, schedule the RUNNING requests.
         # NOTE(RBLN): Prioritize prefill requests. Given our constraint that the prefill
@@ -455,6 +493,14 @@ class RBLNScheduler(Scheduler):
                         if preempted_req in scheduled_running_reqs:
                             preempted_req_id = preempted_req.request_id
                             scheduled_running_reqs.remove(preempted_req)
+                            # NOTE(RBLN): the victim was admitted to this step's
+                            # decode batch (every scheduled_running_reqs member
+                            # is admit()-ed just below its append). It is now
+                            # dropped, so un-admit it -- otherwise the stale
+                            # (over)count makes the can_admit() gate at the end
+                            # of this loop stop admitting early, under-filling
+                            # the decode batch.
+                            decode_budget.discard()
                             token_budget += num_scheduled_tokens.pop(preempted_req_id)
                             req_to_new_blocks.pop(preempted_req_id)
                             scheduled_spec_decode_tokens.pop(preempted_req_id, None)
@@ -485,6 +531,7 @@ class RBLNScheduler(Scheduler):
 
             # Schedule the request.
             scheduled_running_reqs.append(request)
+            decode_budget.admit()
             request_id = request.request_id
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
@@ -640,13 +687,12 @@ class RBLNScheduler(Scheduler):
                     if self.ec_connector is not None:
                         self.ec_connector.update_state_after_alloc(request, i)
 
-            # NOTE(RBLN): We restrict the decode batch size to
-            # (max_num_seqs // pipeline_parallel_size) to prevent pipeline
-            # bubbles.
-            if len(scheduled_running_reqs) >= (
-                self.max_num_running_reqs
-                // self.vllm_config.parallel_config.pipeline_parallel_size
-            ):
+            # NOTE(RBLN): Stop once the per-step decode-batch cap is reached
+            # (== max_num_seqs // pipeline_parallel_size, to prevent pipeline
+            # bubbles and match the runner's compiled bucket). The same budget
+            # also gates remote-KV promotion in the waiting loop below, so the
+            # combined decode batch never exceeds the cap.
+            if not decode_budget.can_admit():
                 break
 
         # NOTE(RBLN): The legacy retroactive trim using spec_decode_cap is
@@ -690,6 +736,31 @@ class RBLNScheduler(Scheduler):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+
+                # NOTE(RBLN): Unified decode-cap admission gate (peek-time, i.e.
+                # BEFORE promotion). `can_admit` enforces two limits:
+                #   * hard cap (always): the compiled decode-bucket ceiling
+                #     (max_num_seqs // pp). The per-step decode batch may never
+                #     exceed it or the runner has no bucket -> crash. This gates
+                #     EVERY candidate that could join the decode batch, including
+                #     ones only discoverable as decode-ready after allocation --
+                #     a full local prefix-cache match, or a decode resumed after
+                #     eviction that fully re-matches locally (both bypass the
+                #     remote-KV status). A plain prefill is deferred here only
+                #     when the batch is physically full; PP's in-flight rotation
+                #     bounds that wait to ~1 step (pp=2).
+                #   * soft cap (only for remote-KV promotions): the balance
+                #     spreading target ceil(demand/pp). Remote-KV requests are in
+                #     the demand snapshot (ready_remote_kv), so they are spread
+                #     like running decodes. Local-prefix / resumed joins are NOT
+                #     in the snapshot, so only the hard cap gates them (the soft
+                #     cap self-corrects next step once they enter `running`).
+                # Running BEFORE promotion keeps a gated remote-KV request in
+                # WAITING_FOR_REMOTE_KVS (re-evaluated next step) instead of
+                # flipping its status and mis-routing it through local prefill.
+                apply_soft_cap = request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+                if not decode_budget.can_admit(apply_soft_cap=apply_soft_cap):
+                    break
 
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(
@@ -1045,6 +1116,14 @@ class RBLNScheduler(Scheduler):
                             step_no_spec_required = True
                         elif slide_distance > 0:
                             spec_decode_slide_distance[request_id] = slide_distance
+                    # NOTE(RBLN): this decode-ready request has just joined the
+                    # decode batch, so count it against the shared per-step cap
+                    # -- regardless of how it became decode-ready (a FULL
+                    # remote-KV match or a full local prefix-cache match). Keyed
+                    # on `is_prefill` (this block), not on how it became
+                    # decode-ready. A PARTIAL remote-KV match stays is_prefill
+                    # (not here) and is counted later via the running loop.
+                    decode_budget.admit()
                     # The scheduled new request is added as a decoding-phase req, so
                     # we can continue to schedule the next request.
                     continue
@@ -1097,6 +1176,10 @@ class RBLNScheduler(Scheduler):
                         )
 
                 scheduled_running_reqs.clear()
+                # NOTE(RBLN): the decode batch was just evicted for a prefill;
+                # clear the admission budget so this step counts only the
+                # prefill (prefill-only step, batch size 1).
+                decode_budget.reset()
                 token_budget = prefill_token_budget
 
                 # NOTE(RBLN): we restrict the prefill batch size to 1 for now.

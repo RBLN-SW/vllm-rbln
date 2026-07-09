@@ -185,6 +185,222 @@ class TestPDDisaggregationScheduler:
         assert output.num_scheduled_tokens[decode.request_id] == 1
         assert output.num_scheduled_tokens[remote.request_id] == 1
 
+    def test_remote_kv_respects_pp_decode_cap(self):
+        """Under PP, remote-KV-promoted decodes must respect the
+        per-step decode cap (max_num_seqs // pp_size).
+
+        pp_size=2, max_num_seqs=4 -> cap 2. Of 3 simultaneously-ready
+        remote-KV requests, at most 2 may join one step's decode batch; the
+        rest stay WAITING_FOR_REMOTE_KVS (deferred).
+
+        Without the fix the waiting loop promotes ALL ready remote-KV decodes
+        (the `//pp_size` cap lives only in the running loop), so the decode
+        batch exceeds the cap -> at runtime this overflows the compiled
+        decode bucket (find_decode_batch_bucket -> None -> assert crash).
+        """
+        num_tokens = 64
+        scheduler = create_scheduler(
+            block_size=_BLOCK_SIZE,
+            num_blocks=_NUM_BLOCKS,
+            max_num_seqs=4,
+            pipeline_parallel_size=2,  # per-step decode cap = 4 // 2 = 2
+            use_kv_connector=MockKVConfig(matched_tokens=num_tokens, is_async=True),
+        )
+        remotes = [_create_pd_request(num_tokens, f"remote{i}") for i in range(3)]
+        for r in remotes:
+            scheduler.add_request(r)
+
+        # Step 1: all three go to WAITING_FOR_REMOTE_KVS.
+        out1 = scheduler.schedule()
+        for r in remotes:
+            assert r.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+
+        # Step 2: mark all three KV transfers complete in one shot.
+        runner_out = create_runner_output(out1, 1)
+        runner_out.kv_connector_output = KVConnectorOutput(
+            finished_recving={r.request_id for r in remotes}
+        )
+        scheduler.update_from_output(out1, runner_out)
+
+        # Step 3: all three are ready, but the per-step decode cap is 2.
+        out3 = scheduler.schedule()
+        scheduled = [r for r in remotes if r.request_id in out3.num_scheduled_tokens]
+        deferred = [
+            r for r in remotes if r.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+        ]
+        assert len(scheduled) == 2, (
+            f"decode batch must be capped at 2, got {len(scheduled)}"
+        )
+        assert len(deferred) == 1, (
+            "the over-cap remote-KV request must stay WAITING_FOR_REMOTE_KVS"
+        )
+
+    def test_pp_decode_cap_counts_running_and_remote(self):
+        """The per-step decode cap is unified across BOTH the running
+        loop and the waiting-loop remote-KV promotion.
+
+        pp_size=2, max_num_seqs=4 -> cap 2. One running decode + two ready
+        remote-KV: the running decode + exactly one remote fill the cap; the
+        second remote is deferred (stays WAITING_FOR_REMOTE_KVS).
+        """
+        num_tokens = 64
+        scheduler = create_scheduler(
+            block_size=_BLOCK_SIZE,
+            num_blocks=_NUM_BLOCKS,
+            max_num_seqs=4,
+            pipeline_parallel_size=2,  # per-step decode cap = 2
+            use_kv_connector=MockKVConfig(matched_tokens=num_tokens, is_async=True),
+        )
+        # One running decode (local prefill -> decode).
+        decode = _create_pd_request(num_tokens, "decode", do_remote_prefill=False)
+        advance_to_decode(scheduler, decode)
+
+        # Two remote-KV requests -> WAITING_FOR_REMOTE_KVS.
+        remotes = [_create_pd_request(num_tokens, f"remote{i}") for i in range(2)]
+        for r in remotes:
+            scheduler.add_request(r)
+        out = scheduler.schedule()  # decode runs; remotes go WAITING_FOR_REMOTE_KVS
+        for r in remotes:
+            assert r.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+
+        # Complete both remote transfers.
+        runner_out = create_runner_output(out, 2)
+        runner_out.kv_connector_output = KVConnectorOutput(
+            finished_recving={r.request_id for r in remotes}
+        )
+        scheduler.update_from_output(out, runner_out)
+
+        # Next step: running decode + 1 remote = cap(2); the 2nd remote defers.
+        out2 = scheduler.schedule()
+        assert decode.request_id in out2.num_scheduled_tokens
+        scheduled_remotes = [
+            r for r in remotes if r.request_id in out2.num_scheduled_tokens
+        ]
+        deferred_remotes = [
+            r for r in remotes if r.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+        ]
+        # running decode + remote decodes
+        total_decode = 1 + len(scheduled_remotes)
+        assert total_decode == 2, (
+            f"unified per-step decode cap is 2, got {total_decode}"
+        )
+        assert len(deferred_remotes) == 1
+
+    def test_pp_balance_decode_ramps_via_demand(self, monkeypatch):
+        """With PP-balanced decode enabled, the dynamic cap counts
+        ready remote-KV requests as demand so the decode batch can ramp up on
+        the P/D-disaggregated decode side.
+
+        pp=2, 10 ready remote-KV, running empty -> demand = 0 + 10 = 10 ->
+        cap = ceil(10/2) = 5, so 5 are admitted this step. A running-only cap
+        would be ceil(0/2)->1 and stall the ramp at 1 admission/step.
+        """
+        monkeypatch.setenv("VLLM_RBLN_PP_BALANCE_DECODE_BATCH", "1")
+        num_tokens = 64
+        scheduler = create_scheduler(
+            block_size=_BLOCK_SIZE,
+            num_blocks=_NUM_BLOCKS,
+            max_num_seqs=32,
+            pipeline_parallel_size=2,  # static cap = 16
+            use_kv_connector=MockKVConfig(matched_tokens=num_tokens, is_async=True),
+        )
+        remotes = [_create_pd_request(num_tokens, f"r{i}") for i in range(10)]
+        for r in remotes:
+            scheduler.add_request(r)
+
+        # Step 1: all -> WAITING_FOR_REMOTE_KVS (running stays empty).
+        out1 = scheduler.schedule()
+        # Mark every transfer complete -> finished_recving_kv_req_ids holds 10.
+        runner_out = create_runner_output(out1, 1)
+        runner_out.kv_connector_output = KVConnectorOutput(
+            finished_recving={r.request_id for r in remotes}
+        )
+        scheduler.update_from_output(out1, runner_out)
+
+        # Step 2: demand = 0 running + 10 ready -> cap = ceil(10/2) = 5.
+        out2 = scheduler.schedule()
+        scheduled = [r for r in remotes if r.request_id in out2.num_scheduled_tokens]
+        assert len(scheduled) == 5, (
+            f"demand-based cap should admit ceil(10/2)=5, got {len(scheduled)}"
+        )
+
+    def test_local_full_match_counts_against_pp_decode_cap(self):
+        """A full LOCAL prefix match (sync connector, num_new_tokens == 1)
+        that becomes decode-ready in the waiting loop is COUNTED against the
+        shared per-step decode cap -- it consumes a slot just like a running
+        decode or a remote-KV promotion.
+
+        pp=2, max_num_seqs=4 -> static cap 2. One running decode + two sync
+        full-matches: the running decode + exactly ONE match fill the cap; the
+        second match is deferred. If the match were not counted (an admit that
+        counted only remote-KV promotions) both matches would join and overflow
+        the cap.
+        """
+        matched = 19
+        scheduler = create_scheduler(
+            block_size=_BLOCK_SIZE,
+            num_blocks=_NUM_BLOCKS,
+            max_num_seqs=4,
+            pipeline_parallel_size=2,  # static per-step decode cap = 4 // 2 = 2
+            use_kv_connector=MockKVConfig(matched_tokens=matched, is_async=False),
+        )
+        # One running decode (no remote prefill -> 0 external tokens -> normal).
+        decode = _create_pd_request(10, "decode", do_remote_prefill=False)
+        advance_to_decode(scheduler, decode)
+        # Two sync full-matches (num_new_tokens == 1 -> decode-ready on schedule).
+        matches = [_create_pd_request(matched + 1, f"m{i}") for i in range(2)]
+        for m in matches:
+            scheduler.add_request(m)
+
+        out = scheduler.schedule()
+        ns = out.num_scheduled_tokens
+        assert decode.request_id in ns
+        scheduled_matches = [m for m in matches if m.request_id in ns]
+        assert len(scheduled_matches) == 1, (
+            "cap=2: running decode + one match fill it; the second match must be "
+            f"counted-out and deferred, got {len(scheduled_matches)} matches"
+        )
+
+    def test_local_full_match_bypasses_soft_cap_hard_only(self, monkeypatch):
+        """A full LOCAL prefix match faces only the HARD cap
+        (compiled bucket ceiling), NOT the soft PP-balance spreading cap: it is
+        not in the demand snapshot, so `apply_soft_cap=False` gates it.
+
+        balance on, pp=2, max_num_seqs=16 (hard cap 8). Two running decodes ->
+        demand 2 -> soft cap ceil(2/2)=1, so the running loop admits only ONE
+        of them (the other spreads to a later step). A sync full-match then
+        still joins THIS step -- past the soft cap (1) but under the hard cap
+        (8) -- proving the soft cap does not gate local matches.
+        """
+        monkeypatch.setenv("VLLM_RBLN_PP_BALANCE_DECODE_BATCH", "1")
+        matched = 19
+        scheduler = create_scheduler(
+            block_size=_BLOCK_SIZE,
+            num_blocks=_NUM_BLOCKS,
+            max_num_seqs=16,
+            pipeline_parallel_size=2,  # hard cap = 16 // 2 = 8
+            use_kv_connector=MockKVConfig(matched_tokens=matched, is_async=False),
+        )
+        decodes = [
+            _create_pd_request(10, f"d{i}", do_remote_prefill=False) for i in range(2)
+        ]
+        for d in decodes:
+            advance_to_decode(scheduler, d)
+        match = _create_pd_request(matched + 1, "m")
+        scheduler.add_request(match)
+
+        out = scheduler.schedule()
+        ns = out.num_scheduled_tokens
+        # soft cap = ceil(2/2) = 1 spreads the running decodes: only one admitted.
+        scheduled_decodes = [d for d in decodes if d.request_id in ns]
+        assert len(scheduled_decodes) == 1, (
+            f"soft cap 1 should admit one running decode, got {len(scheduled_decodes)}"
+        )
+        # the local match bypasses the soft cap (hard-only) and joins this step.
+        assert match.request_id in ns, (
+            "local full match must join past the soft cap (gated only by hard cap)"
+        )
+
     def test_promotion_keeps_decode_batch_and_defers_local_prefill(self):
         """A ready remote-KV request should join the decode batch, while
         a later local prefill stays deferred to the next step.
