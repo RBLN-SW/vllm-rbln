@@ -316,6 +316,73 @@ class TestPDDisaggregationScheduler:
         assert after_total == 28  # 7 * 4
         assert after_total % len(ns) == 0  # uniform -> view is safe
 
+    def test_no_spec_scrub_leaves_promoted_decode_slide(self):
+        """REGRESSION repro for issue #390 A -- ``no-spec scrub left a
+        non-empty slide map``.
+
+        A WAITING_FOR_REMOTE_KVS-promoted request is a DECODE by the
+        scheduler (``not is_prefill``: its prompt KV was computed remotely,
+        so num_computed == num_tokens-1) and legitimately carries a
+        ``spec_decode_slide_distance`` entry (window backfilled to
+        num_spec+1). But it has produced NO output token yet
+        (num_output_tokens == 0).
+
+        ``scrub_scheduler_output_for_no_spec`` detects prefills by
+        "new-req OR num_output_tokens == 0" -> it misclassifies this promoted
+        decode as a prefill, so it neither deletes the slide entry nor clamps
+        the query_len. The final invariant assert (whole slide map must be
+        empty) then fires -> EngineCore crash.
+
+        BEFORE FIX: scrub raised ``AssertionError`` (non-empty slide map).
+        AFTER FIX: the promoted decode is treated as a decode -> slide cleared,
+        query_len clamped to 1, scrub returns cleanly.
+        """
+        NUM_SPEC = 3
+        # matched=19: num_computed=19, 19 % 16 = 3 keeps the backfill in-block
+        # -> slide=NUM_SPEC is recorded (in-block, NOT cross-block no-spec).
+        matched = 19
+        scheduler = create_scheduler(
+            block_size=_BLOCK_SIZE,
+            num_blocks=_NUM_BLOCKS,
+            max_num_seqs=_MAX_NUM_SEQS,
+            num_speculative_tokens=NUM_SPEC,
+            use_kv_connector=MockKVConfig(matched_tokens=matched, is_async=True),
+        )
+
+        # A remote-KV req: single-token decode once promoted (num_new == 1).
+        promoted = _create_pd_request(matched + 1, "p0")
+        scheduler.add_request(promoted)
+
+        out_a = scheduler.schedule()
+        assert promoted.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+
+        mro = create_runner_output(out_a, 1)
+        mro.kv_connector_output = KVConnectorOutput(
+            finished_recving={promoted.request_id}
+        )
+        scheduler.update_from_output(out_a, mro)
+
+        out = scheduler.schedule()
+        rid = promoted.request_id
+
+        # Precondition: promoted req is a decode carrying a slide, no output yet
+        # (== the num_output_tokens==0 that scrub mistakes for a prefill).
+        assert promoted.status == RequestStatus.RUNNING
+        slide = dict(getattr(out, "spec_decode_slide_distance", {}) or {})
+        assert slide.get(rid) == NUM_SPEC
+        assert out.num_scheduled_tokens[rid] == 1
+
+        from vllm_rbln.v1.worker.rbln_model_runner import (
+            scrub_scheduler_output_for_no_spec,
+        )
+
+        # A peer decode rank elected cross-block no-spec -> the cross-DP
+        # OR-reduce forces this rank's scrub. The promoted decode must be
+        # scrubbed like any decode: slide cleared, query_len forced to 1.
+        scrub_scheduler_output_for_no_spec(out)
+        assert not getattr(out, "spec_decode_slide_distance", {})
+        assert out.num_scheduled_tokens[rid] == 1
+
     def test_eviction_drops_evicted_decode_slide_distance(self):
         """REGRESSION for the index_copy crash (``index 4 is out of bounds for
         dimension 0 with size 4`` in pad_speculative_draft_tokens).
