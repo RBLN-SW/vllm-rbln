@@ -95,7 +95,7 @@ def _(q, kv_c_normed, k_pe, kv_cache, seq_idx, block_tables, scale):
 # The sparse_attn_deepseek_mla custom op is defined and registered in
 # rebel_compiler; importing the module triggers registration so that
 # torch.ops.rbln_custom_ops.sparse_attn_deepseek_mla is available.
-from rebel.core.op.torch_custom_ops import flash_attn as _rbln_flash_attn_ops  # noqa: F401,E402
+from rebel.ops.torch_custom_ops import flash_attn as _rbln_flash_attn_ops  # noqa: F401,E402
 
 
 @register_backend(AttentionBackendEnum.FLASH_ATTN_MLA)
