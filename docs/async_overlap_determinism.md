@@ -47,41 +47,47 @@ it (final step → no concurrent forward → safe). Python-only; no rebel_compil
   massively distorts async (thread-heavy) — measure perf only without the profiler.
 - perfetto traces (same L18/b8/tok16 spec): `perfetto_v2/{async,sync}_dp{0-3}.pt.trace.json.gz`.
 
-## batch=1 (DP4): near-tie variation, within the per-input-parity bar
+## batch=1 (DP4): FIXED — the deferred sampler's logprobs was the trigger
 
-batch=1 flips near-tie tail tokens run-to-run more often than batch=8. Investigation
-(session 2026-07-09) established this is **pre-existing (reproduces on the ORIGINAL committed
-code with the session's fix git-stashed) and NOT caused by the get_output fix**. It is also:
-NOT batch composition (identical across gens with the ingestion pinned), NOT cross-thread
-device concurrency (thread timeline is main-thread-serial; get_output takes the wait path),
-NOT prompt transitions (`--num-prompts 1` also flips). It is DP4-collective + low-token
-specific (DP1 deterministic, batch=8 deterministic, only batch=1 DP4 flips): at batch=1
-decode each rank contributes 1 token to the MoE combine (1 real token + 63 padding per
-64-block), suggesting low-count/padding sensitivity in the collective (CCL/kernel domain;
-RBLN CCL reduction is stated order-independent). **Under per-input parity this is accepted
-near-tie variation, not a correctness bug.** If bit-exact batch=1 is ever required, start
-from the MoE combine padding hypothesis (§ next-session below) — but any change MUST be
-re-verified at batch=8 (10-run, cache on/off) to prove no regression.
+Earlier notes attributed batch=1 defer nondeterminism to accepted near-tie variation from
+MoE-combine low-token/padding sensitivity. **That was wrong.** The real cause is computing
+**logprobs inside the deferred sampler** during the overlap window; it is now fixed by not
+computing those (discarded) logprobs there.
 
-Diagnostic note: an `RBLN_DETERMINISTIC_ADMIT` env harness (patches upstream vLLM
-`EngineCore._process_input_queue` to pin ingestion before the first step) was used during
-investigation to isolate MAJOR from MINOR. It is NOT a shipping requirement and is NOT
-needed for per-input-parity validation.
+Evidence (batch=1 DP4 L18, `--repro-run` determinism):
+- **Clean toggle**: defer + logprobs=16 → nondeterministic; defer + `--logprobs 0` →
+  deterministic.
+- **Isolated to the overlap**: `async1` (worker-thread forward, inline await, NO deferral)
+  is deterministic *with logprobs on*. So logprobs compute alone is fine; overlap alone
+  (no logprobs) is fine; only overlap × deferred-logprobs flips.
+- **Sampler is faithful**: device argmax == host argmax at every step — so it is a
+  device-runtime interaction between the overlap and the interposed logprobs graphs, not
+  wrong sampling math.
+- **Refuted hypotheses** (each still flipped): MoE-combine padding (re-zeroing the pad via
+  `get_tokens_mask`), reduce_scatter-specific (RS=0 all_reduce flips too), the get_output
+  copy-thread fix (pre-existing), compute_logprobs-corrupts-argmax (sampler reorder,
+  argmax-first), per-op `RBLN_RUNTIME_FORCE_SYNC`, and disabling the caching allocator
+  (`RBLN_DISABLE_EAGER_CACHE_ALLOC`). The exact device-runtime cause is still open.
+
+**Fix** (`rbln_model_runner.py`, deferred thunk): drop `max_num_logprobs` for the deferred
+sampler. The deferred path already returns `logprobs=None` (`_bookkeeping_sync` with
+`sampler_output=None`), so those logprobs are discarded — dropping them removes both the
+dead work and the nondeterminism trigger. Greedy argmax is unaffected — **token-neutral**:
+batch=1 with-logprobs-stripped == with-logprobs-off, 4/4 bit-identical. **Result: batch=1
+DP4 defer is now deterministic** (repro pass on clean code). Overlap + device sampler
+preserved; the large full-vocab logprobs graphs are no longer run in the deferred window,
+so this is also faster.
+
+**Open (rebel-runtime follow-up)**: returning logprobs *under* overlap. That needs the
+device-runtime interaction understood/fixed so the deferred sampler can compute logprobs
+without perturbing the overlapped forward. Until then, defer returns `logprobs=None`
+(unchanged pre-existing behavior).
 
 ## Reproduce
-Scratchpad `repro.sh <mode> <RS> <batch> <np> <maxtok> <nrepro>` — modes `defer` / `optsync`
-(sync fwd + optimistic sched) / `async1` (worker fwd + inline await) / `none` (plain sync);
-env `MB=<bucket>` for a single decode bucket, `NL` for `--num-hidden-layers`. For per-input
-parity use the parity_runner golden comparison (compares each prompt's output to its sync
-reference by prompt identity). Env flakes are common on rapid re-runs (compiler MLIR
-`setWeightHash`/`completeFuncInitGenResult` nodeID assertion on fresh MB=1/MB=4 compiles,
-RCCL `ret=-12`, gloo "Connection closed by peer") → between runs kill zombies via `ps` (not
-`pgrep -f`), `find /dev/shm -maxdepth 1 -uid $(id -u) -delete`, confirm devices 0.0B, wait.
-
-## Next-session (only if bit-exact batch=1 is wanted)
-1. Device-dump the MoE combine input/output at batch=1 across gens — is the INPUT identical
-   but OUTPUT different? Is the padding region non-zero / varying?
-2. Try zeroing the `fused_moe` send/recv buffers (`fused_moe/layer.py`, `all2all.py`); if it
-   is in the compiled graph, re-verify no recompile break AND re-verify batch=8.
-3. Compare reduce_scatter (RS=1) / all_reduce (RS=0) / all2all combine at batch=1.
-4. If it bottoms out in the CCL binary, escalate to the RBLN CCL/runtime team.
+Scratchpad `runone.sh <tag> <mode> <RS> <batch> <np> <maxtok> <nrepro>` — modes `defer` /
+`optsync` (unset async env + optimistic sched) / `syncref` (`RBLN_DYNAMO_ASYNC=0` +
+optimistic = sync fwd) / `async1` (worker fwd + inline await) / `none` (plain sync). Add
+`--logprobs 0` to disable logprobs. Env flakes are common on rapid re-runs (compiler MLIR
+`setWeightHash`/`completeFuncInitGenResult` nodeID assertion, RCCL `ret=-12`, gloo
+"Connection closed by peer") → between runs kill zombies via `ps` (not `pgrep -f`),
+`find /dev/shm -maxdepth 1 -uid $(id -u) -delete`, confirm devices 0.0B, wait ~20s.
