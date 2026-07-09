@@ -339,9 +339,11 @@ class RBLNRejectionSampler(RejectionSampler):
             sampling_metadata.top_k,
             sampling_metadata.top_p,
         )
-        # [EXPERIMENT] guard against negative num_accepted (was handled by the
-        # float16 target_probs cast; with bf16 target_probs we clamp instead).
-        num_accepted = num_accepted.clamp(min=0)
+        # num_accepted is guaranteed >= 0 by the compiler: the graph's
+        # num_drafts (= cu[i] - cu[i-1]) is now padded consistently with its
+        # sibling operand (both real nn.pad, not a fake contrib_aligned_pad
+        # relabel), so the min(count, num_drafts) clamp can no longer underflow.
+        # No host-side guard needed.
         # ------------------------------------------------------------------
         # 3) Compose per-position output for the first K columns:
         #      j < num_accepted[i]          -> draft token (accepted as-is)

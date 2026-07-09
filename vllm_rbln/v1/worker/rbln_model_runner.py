@@ -5298,14 +5298,10 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.kv_cache_names = get_kv_cache_names(kv_caches, num_attn_module)
         assert len(self.kv_cache_names) == len(self.kv_caches)
 
-        if (
-            not envs.VLLM_RBLN_USE_DEVICE_TENSOR
-            and not self.model_config.enforce_eager
-            and envs.VLLM_RBLN_COMPILE_MODEL
-        ):
-            # `mark_static_address` is last-write-wins on storage->name.
-            # Pin to one canonical layer per pool so the runtime, the
-            # connector's host buffers, and the runtime copy path all
+        if not self.model_config.enforce_eager and envs.VLLM_RBLN_COMPILE_MODEL:
+            # `mark_static_address` / `mark_reference` are last-write-wins on
+            # storage->name. Pin to one canonical layer per pool so the runtime,
+            # the connector's host buffers, and the runtime copy path all
             # address the same name (and the same logical block_id space).
             layers_to_register = self._select_canonical_kv_layers_per_pool(
                 kv_cache_config
@@ -5314,10 +5310,23 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             for kv_cache, name in zip(self.kv_caches, self.kv_cache_names):
                 if name not in layers_to_register:
                     continue
-                logger.debug(
-                    "mark_static_address: name=%s shape=%s", name, kv_cache.shape
-                )
-                self.compile_context.mark_static_address(kv_cache, name)
+                if envs.VLLM_RBLN_USE_DEVICE_TENSOR:
+                    # Device-tensor mode: the KV cache is a device (rbln) input
+                    # (is_external). Mark it a *reference* so the compiler keeps
+                    # it as-is / never casts it (DevTensorType::Reference). Other
+                    # device inputs stay bound but castable values -- only KV
+                    # cache needs the no-cast lock. Requires reference_keys to be
+                    # non-empty for the compiler to scope reference to marked
+                    # keys (else it falls back to "every external is reference").
+                    logger.debug(
+                        "mark_reference: name=%s shape=%s", name, kv_cache.shape
+                    )
+                    self.compile_context.mark_reference(kv_cache, name)
+                else:
+                    logger.debug(
+                        "mark_static_address: name=%s shape=%s", name, kv_cache.shape
+                    )
+                    self.compile_context.mark_static_address(kv_cache, name)
 
         self._log_kv_cache_info(kv_cache_config, kv_caches)
         return kv_caches
