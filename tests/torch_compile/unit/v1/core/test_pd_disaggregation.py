@@ -327,15 +327,18 @@ class TestPDDisaggregationScheduler:
         num_spec+1). But it has produced NO output token yet
         (num_output_tokens == 0).
 
-        ``scrub_scheduler_output_for_no_spec`` detects prefills by
-        "new-req OR num_output_tokens == 0" -> it misclassifies this promoted
-        decode as a prefill, so it neither deletes the slide entry nor clamps
-        the query_len. The final invariant assert (whole slide map must be
-        empty) then fires -> EngineCore crash.
+        The old ``num_output_tokens == 0`` prefill heuristic misclassified this
+        promoted decode as a prefill, so scrub neither deleted its slide entry
+        nor clamped its query_len; the invariant assert (whole slide map must be
+        empty) then fired -> EngineCore crash.
+
+        FIX: scrub identifies prefills via the scheduler's ``is_prefill``
+        (``num_computed < num_tokens - 1``), which puts this promoted decode
+        (``num_computed == num_tokens - 1``) correctly in the decode set -> its
+        slide is cleared and its query_len is clamped to 1.
 
         BEFORE FIX: scrub raised ``AssertionError`` (non-empty slide map).
-        AFTER FIX: the promoted decode is treated as a decode -> slide cleared,
-        query_len clamped to 1, scrub returns cleanly.
+        AFTER FIX: slide cleared, query_len clamped to 1, scrub returns cleanly.
         """
         NUM_SPEC = 3
         # matched=19: num_computed=19, 19 % 16 = 3 keeps the backfill in-block
@@ -365,12 +368,19 @@ class TestPDDisaggregationScheduler:
         out = scheduler.schedule()
         rid = promoted.request_id
 
-        # Precondition: promoted req is a decode carrying a slide, no output yet
-        # (== the num_output_tokens==0 that scrub mistakes for a prefill).
+        # Precondition: promoted req is a scheduler-DECODE (num_computed ==
+        # num_tokens-1) carrying a slide, with no output yet -- exactly the
+        # num_output_tokens==0 that the old heuristic mistook for a prefill.
         assert promoted.status == RequestStatus.RUNNING
         slide = dict(getattr(out, "spec_decode_slide_distance", {}) or {})
         assert slide.get(rid) == NUM_SPEC
         assert out.num_scheduled_tokens[rid] == 1
+
+        # Give the promoted decode a >1 spec query window (the slide backfills it
+        # to num_spec+1) so the query_len clamp is observably exercised, not a
+        # no-op, when scrub treats it as a decode.
+        out.num_scheduled_tokens[rid] = NUM_SPEC + 1
+        out.total_num_scheduled_tokens = sum(out.num_scheduled_tokens.values())
 
         from vllm_rbln.v1.worker.rbln_model_runner import (
             scrub_scheduler_output_for_no_spec,
@@ -378,10 +388,15 @@ class TestPDDisaggregationScheduler:
 
         # A peer decode rank elected cross-block no-spec -> the cross-DP
         # OR-reduce forces this rank's scrub. The promoted decode must be
-        # scrubbed like any decode: slide cleared, query_len forced to 1.
-        scrub_scheduler_output_for_no_spec(out)
-        assert not getattr(out, "spec_decode_slide_distance", {})
-        assert out.num_scheduled_tokens[rid] == 1
+        # scrubbed like any decode: slide cleared AND query_len forced to 1.
+        scrub_scheduler_output_for_no_spec(out, scheduler.requests)
+        assert not getattr(out, "spec_decode_slide_distance", {}), (
+            "promoted decode's slide must be cleared by the no-spec scrub"
+        )
+        assert out.num_scheduled_tokens[rid] == 1, (
+            "promoted decode's query_len must be clamped from "
+            f"{NUM_SPEC + 1} to 1 by the no-spec scrub"
+        )
 
     def test_eviction_drops_evicted_decode_slide_distance(self):
         """REGRESSION for the index_copy crash (``index 4 is out of bounds for

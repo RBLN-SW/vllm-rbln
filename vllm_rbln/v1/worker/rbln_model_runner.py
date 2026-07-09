@@ -17,7 +17,7 @@ import itertools
 import os
 import time
 from collections import defaultdict
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from copy import copy, deepcopy
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Union, cast
@@ -164,7 +164,10 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def scrub_scheduler_output_for_no_spec(scheduler_output: "SchedulerOutput") -> None:
+def scrub_scheduler_output_for_no_spec(
+    scheduler_output: "SchedulerOutput",
+    requests: "Mapping[str, Any]",
+) -> None:
     """Force every scheduled DECODE request to query_len=1 for a collective
     no-spec step.
 
@@ -180,9 +183,15 @@ def scrub_scheduler_output_for_no_spec(scheduler_output: "SchedulerOutput") -> N
     partial-prefill token (seq_lens < num_tokens), get it discarded, and lose the
     request. A prefill keeps its full chunk length; the cross-DP query-length
     axis is reconciled to the prefill shape by ``get_dp_padding`` (any_prefill ->
-    prefill-sized). Prefill reqs are detected from ``scheduler_output``: new reqs
-    are always prefill, and a cached req is still prefilling iff it has produced
-    no output tokens yet.
+    prefill-sized). Prefill reqs are identified by the scheduler's own
+    ``is_prefill`` definition -- ``num_computed_tokens < num_tokens - 1`` -- NOT
+    by ``num_output_tokens == 0``. The latter misclassifies a prefill/decode
+    disaggregation request that received its prompt KV from the producer and was
+    promoted to a decode (``num_computed == num_tokens - 1``, a scheduler-DECODE
+    that may carry a slide, yet no output token yet) as a prefill, leaving its
+    slide uncleared and its query_len unclamped (#390 A). A genuine multi-token
+    prefill chunk always has ``num_computed <= num_tokens - 2``, so it is never
+    misclassified.
 
     We zero any in-block slide and force ``num_scheduled_tokens`` to 1, but we
     must NOT clear ``scheduled_spec_decode_tokens``: the engine's
@@ -194,25 +203,46 @@ def scrub_scheduler_output_for_no_spec(scheduler_output: "SchedulerOutput") -> N
     take the no-spec path explicitly via ``spec_decode_max_query_len=1`` rather
     than by inspecting this dict.
     """
-    # Detect prefill reqs: new reqs are always prefill; a cached req is still
-    # prefilling iff it has produced no output tokens yet.
-    prefill_req_ids = {r.req_id for r in scheduler_output.scheduled_new_reqs}
+    # Identify prefill reqs via the scheduler's is_prefill (num_computed <
+    # num_tokens - 1), evaluated from scheduler_output's authoritative pre-step
+    # counts (num_computed / num_output) plus the static prompt length from
+    # `requests`. Reading num_computed from scheduler_output (not the mutable req
+    # state) keeps this correct regardless of any optimistic num_computed advance.
     _cached = scheduler_output.scheduled_cached_reqs
-    for _rid, _n_out in zip(_cached.req_ids, _cached.num_output_tokens):
-        if _n_out == 0:
-            prefill_req_ids.add(_rid)
+    _cached_num_computed = dict(zip(_cached.req_ids, _cached.num_computed_tokens))
+    _cached_num_output = dict(zip(_cached.req_ids, _cached.num_output_tokens))
+    _new_num_computed = {
+        r.req_id: r.num_computed_tokens for r in scheduler_output.scheduled_new_reqs
+    }
+
+    def _is_prefill(req_id: str) -> bool:
+        state = requests.get(req_id)
+        if state is None:
+            return False
+        num_prompt = len(state.prompt_token_ids)
+        if req_id in _new_num_computed:
+            num_computed = _new_num_computed[req_id]
+            num_output = 0
+        else:
+            num_computed = _cached_num_computed.get(req_id, 0)
+            num_output = _cached_num_output.get(req_id, 0)
+        # num_tokens = prompt + committed output (excludes spec drafts).
+        return num_computed < (num_prompt + num_output) - 1
+
+    prefill_req_ids = {
+        req_id
+        for req_id in scheduler_output.num_scheduled_tokens
+        if _is_prefill(req_id)
+    }
     if isinstance(scheduler_output, RBLNSchedulerOutput):
-        # A req carrying a slide entry is a scheduler-DECODE by construction:
-        # spec_decode_slide_distance is only ever written for `not is_prefill`
-        # reqs (running decodes and WAITING_FOR_REMOTE_KVS-promoted decodes).
-        # The num_output_tokens==0 heuristic above misreads a freshly promoted
-        # remote-KV decode (prompt computed on the producer, so no output yet)
-        # as a prefill; left in prefill_req_ids its slide is neither cleared nor
-        # its query_len clamped, and the invariant assert below fires (#390 A).
-        # Every slide belongs to a decode, so drop the whole map and keep these
-        # reqs out of the prefill set so they get clamped like any decode.
-        prefill_req_ids -= set(scheduler_output.spec_decode_slide_distance)
-        scheduler_output.spec_decode_slide_distance.clear()
+        # A slide entry only ever belongs to a scheduler-DECODE (it is written
+        # only for `not is_prefill` reqs), so drop it for every non-prefill req.
+        # A promoted remote-KV decode is now correctly a decode here, so its
+        # slide is cleared (fixing #390 A). Real prefills never carry a slide,
+        # so the map ends empty (asserted below).
+        for _rid in list(scheduler_output.spec_decode_slide_distance):
+            if _rid not in prefill_req_ids:
+                del scheduler_output.spec_decode_slide_distance[_rid]
     for req_id in list(scheduler_output.num_scheduled_tokens):
         # no-spec (query_len=1) is a DECODE concern. A PREFILL req must keep its
         # chunk query_len; clamping it to 1 discards the prefill's token and
@@ -3437,7 +3467,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # graph across DP. Runs whenever the global flag is set, even if
             # this rank had no drafts/slide locally (a peer tripped it).
             if step_no_spec_required:
-                scrub_scheduler_output_for_no_spec(scheduler_output)
+                scrub_scheduler_output_for_no_spec(scheduler_output, self.requests)
                 tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
                 num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
                 num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
