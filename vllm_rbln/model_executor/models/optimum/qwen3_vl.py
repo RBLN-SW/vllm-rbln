@@ -178,7 +178,7 @@ class RBLNOptimumQwen3VLForConditionalGeneration(
         self,
         pixel_values_videos: torch.Tensor,
         video_grid_thw: torch.Tensor,
-        second_per_grid_ts=torch.Tensor | None,
+        second_per_grid_ts: torch.Tensor | None = None,
     ):
         return Qwen2_5_VLVideoPixelInputs(
             type="pixel_values_videos",
