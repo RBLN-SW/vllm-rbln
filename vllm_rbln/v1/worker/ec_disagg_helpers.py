@@ -149,6 +149,14 @@ class ECDisaggHelpersMixin:
             mrope_position_deltas=self.mrope_position_deltas,
         )
 
+        # Reuse prefix-cached KV: copy source blocks into this request's
+        # destination blocks before prefill (mirrors the non-EC prefill path).
+        self.model.copy_cached_kv_blocks(
+            scheduler_output.cached_block_table,
+            scheduler_output.cached_length,
+            model_input.block_tables,
+        )
+
         language_model = self.model.get_language_model()
         logits = language_model.prefill_decoder(
             **prefill_params,
