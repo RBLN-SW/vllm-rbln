@@ -1334,4 +1334,24 @@ class RBLNAsyncScheduler(RBLNScheduler, AsyncScheduler):
     update_from_output() calls super().update_from_output() (base ->
     _update_request_with_output); RBLNScheduler defines neither hook, so both
     resolve to AsyncScheduler. Selected only when async_scheduling is set.
+
+    KNOWN NON-DETERMINISM (upstream async_scheduling property, not RBLN-specific):
+    the optimistic scheduler dispatches steps non-blocking, so it can begin
+    stepping before all in-flight client requests have been ingested from the
+    EngineCore input queue (vllm.v1.engine.core.EngineCore._process_input_queue
+    only drains what has already arrived). The number of requests admitted before
+    the first prefill therefore varies run-to-run with IPC delivery timing, which
+    changes the prefill/decode interleaving and hence the per-step DP batch
+    composition (num_tokens_across_dp). On EP+DP the MoE forward is NOT invariant
+    to batch composition (the cross-rank dispatch/combine mixes a rank's tokens
+    with its co-batched neighbours), so a *different* composition yields *different*
+    logits — near-tie argmax positions then flip and the emitted tokens differ
+    across otherwise-identical runs. Sync scheduling avoids this only incidentally:
+    its blocking first prefill gives every request time to arrive before step 2,
+    so the composition is always the same. This is expected for optimistic/async
+    scheduling (GPU vLLM has the same batching non-determinism); reproducibility
+    should therefore be validated per-input (input sequence -> output tokens),
+    not by bit-comparing the whole batch's token stream. For strict run-to-run
+    bit-reproducibility use sync scheduling (or ensure the full request set is
+    ingested before the first step).
     """

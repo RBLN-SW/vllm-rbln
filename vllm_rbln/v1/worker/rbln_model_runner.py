@@ -346,15 +346,25 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
             # short wait.
             if not self._captured and not self._done_event.wait(timeout=10.0):
                 self._final_step_capture()
-        elif self._defer_copy and not self._captured:
-            # Non-deferred defer path: forward/sampler are done (drained by the next
-            # step or here); copy out-of-place on this thread.
-            from rebel.sync_runtime import await_pending
+        elif self._defer_copy:
+            # Non-deferred defer path. The D2H MUST run on the MAIN thread (next
+            # step's _prepare_inputs -> capture_host), NOT on this vLLM async-copy
+            # thread: torch.rbln.synchronize + .to("cpu") here submit device work
+            # that races the concurrent worker-thread forward on the shared device
+            # stream (Stream::last_seq_/has_pending_ are non-atomic and touched by
+            # both threads), which perturbs that forward's logits and flips near-tie
+            # argmax tokens run-to-run. So wait for the main-thread capture like the
+            # deferred path; only fall back to a copy-thread D2H if no next step ever
+            # captures it (final step -> no concurrent forward -> the D2H is safe).
+            # When capture_host already ran on the main thread (_captured), there is
+            # nothing to do here — it used a blocking copy, so no synchronize either.
+            if not self._captured and not self._done_event.wait(timeout=10.0):
+                from rebel.sync_runtime import await_pending
 
-            await_pending(self._pending_snapshot)
-            torch.rbln.synchronize(self._device_index)
-            self._sampled_token_ids_cpu = self._sampled_token_ids.to("cpu")
-            self._captured = True
+                await_pending(self._pending_snapshot)
+                torch.rbln.synchronize(self._device_index)
+                self._sampled_token_ids_cpu = self._sampled_token_ids.to("cpu")
+                self._captured = True
         else:
             torch.rbln.synchronize(self._device_index)
 
