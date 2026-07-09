@@ -1516,6 +1516,9 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         causal_attention_naive_decode = (
                             torch.ops.rbln_custom_ops.causal_attention_naive_decode
                         )
+                else:
+                    causal_attention_naive_prefill = causal_attention_naive_prefill_impl
+                    causal_attention_naive_decode = causal_attention_naive_decode_impl
 
                 if not attn_metadata.is_prefill:
                     decode_args = [
@@ -1626,6 +1629,9 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         attention_naive_decode = (
                             torch.ops.rbln_custom_ops.attention_naive_decode
                         )
+                else:
+                    attention_naive_prefill = attention_naive_prefill_impl
+                    attention_naive_decode = attention_naive_decode_impl
 
                 if not attn_metadata.is_prefill:
                     decode_args = [
