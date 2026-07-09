@@ -1144,7 +1144,13 @@ class RBLNFlashAttentionMetadataBuilder(
         max_seq_len = self.model_config.max_model_len
 
         num_partition = max_seq_len // partition_len
-        cs = seq_idx.repeat(1, num_partition)
+        # For decode, the decode token's K/V is written at position seq_idx
+        # via slot_mapping before attention runs.  dyn_size built from the raw
+        # seq_idx covers [0, seq_idx) and misses the just-written slot; +1
+        # corrects this.  Prefill writes K/V as part of the kernel call, so
+        # seq_idx already points to the first new slot and needs no adjustment.
+        _kv_seq_idx = seq_idx if is_prefill else seq_idx + 1
+        cs = _kv_seq_idx.repeat(1, num_partition)
         pidx = torch.arange(num_partition, dtype=torch.int32)
         dyn_size_for_partitions = torch.clamp(
             cs - pidx * partition_len, 0, partition_len
