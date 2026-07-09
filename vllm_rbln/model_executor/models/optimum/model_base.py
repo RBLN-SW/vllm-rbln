@@ -457,11 +457,8 @@ class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
                 )
             except Exception as e:
                 error_msg = (
-                    "Failed to copy KV cache from block %d to block %d at index %d: %s",
-                    src_block,
-                    dst_block,
-                    block_idx,
-                    e,
+                    f"Failed to copy KV cache from block {src_block} to block "
+                    f"{dst_block} at index {block_idx}: {e}"
                 )
                 logger.error(error_msg)
                 raise RuntimeError(error_msg) from e
