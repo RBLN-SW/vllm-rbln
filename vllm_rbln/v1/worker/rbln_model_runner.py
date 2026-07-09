@@ -425,6 +425,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         self.performance_ctx = PerformanceContext("runner")
 
+        self.offload_context = nullcontext
+        if HAS_TORCH_RBLN and USE_DEVICE_TENSOR and not envs.VLLM_RBLN_DISABLE_OFFLOAD:
+            self.offload_context = torch.rbln.offload
+
     def _get_positions(self, num_tokens: Any):
         assert not isinstance(num_tokens, int)
         return self.positions[:num_tokens]
@@ -1731,10 +1735,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         )
 
         model_loader = get_model_loader(self.load_config)
-        offload_context = nullcontext
-        if HAS_TORCH_RBLN and USE_DEVICE_TENSOR and not envs.VLLM_RBLN_DISABLE_OFFLOAD:
-            offload_context = torch.rbln.offload
-        with offload_context():
+        with self.offload_context():
             self.model = model_loader.load_model(
                 vllm_config=self.vllm_config, model_config=self.model_config
             )
@@ -1780,14 +1781,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             token_indices: torch.Tensor | None = None,
             **kwargs,
         ):
-            with offload_context():
-                model_output = self.model(
-                    input_ids=input_ids,
-                    positions=positions,
-                    intermediate_tensors=intermediate_tensors,
-                    inputs_embeds=inputs_embeds,
-                    **kwargs,
-                )
+            model_output = self.model(
+                input_ids=input_ids,
+                positions=positions,
+                intermediate_tensors=intermediate_tensors,
+                inputs_embeds=inputs_embeds,
+                **kwargs,
+            )
 
             logits = None
             if self.use_aux_hidden_state_outputs:
@@ -2829,7 +2829,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # the model directly, bypassing the connector lifecycle entirely.
         logger.info("Compile and warming up model.")
 
-        with set_compile_stage("warmup"):
+        with set_compile_stage("warmup"), self.offload_context():
             # 1. prefill
             self._dummy_run(1, self.max_num_tokens, True)
 
