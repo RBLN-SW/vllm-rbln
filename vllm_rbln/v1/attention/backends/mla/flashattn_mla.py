@@ -12,6 +12,9 @@
 from typing import ClassVar
 
 import torch
+from rebel.ops.torch_custom_ops import (
+    flash_attn as _rbln_flash_attn_ops,  # noqa: F401,E402
+)
 from vllm.config import get_current_vllm_config
 from vllm.config.cache import CacheDType
 from vllm.model_executor.layers.attention.mla_attention import (
@@ -90,12 +93,6 @@ def paged_flash_causal_mla_naive_decode_impl(
 @torch.library.register_fake("rbln_custom_ops::paged_flash_causal_mla_naive_decode")
 def _(q, kv_c_normed, k_pe, kv_cache, seq_idx, block_tables, scale):
     return _fake_mla_output(q, kv_c_normed)
-
-
-# The sparse_attn_deepseek_mla custom op is defined and registered in
-# rebel_compiler; importing the module triggers registration so that
-# torch.ops.rbln_custom_ops.sparse_attn_deepseek_mla is available.
-from rebel.ops.torch_custom_ops import flash_attn as _rbln_flash_attn_ops  # noqa: F401,E402
 
 
 @register_backend(AttentionBackendEnum.FLASH_ATTN_MLA)

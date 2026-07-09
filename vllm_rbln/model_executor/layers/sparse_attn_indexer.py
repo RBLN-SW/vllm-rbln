@@ -9,6 +9,11 @@
 # RBLN backend for the sparse-attention lightning indexer key cache.
 
 import torch
+
+# The sparse_attn_deepseek_indexer custom op is defined and registered in
+# rebel_compiler; importing the module triggers registration so that
+# torch.ops.rbln_custom_ops.sparse_attn_deepseek_indexer is available.
+from rebel.ops.torch_custom_ops import attn as _rbln_attn_ops  # noqa: F401
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.models.deepseek_v2 import (
     DeepseekV32IndexerCache,
@@ -20,11 +25,6 @@ from vllm_rbln.model_executor.layers.attention.attention import _resolve_kv_cach
 from vllm_rbln.v1.attention.backends.mla.indexer import (
     RBLNDeepseekV32IndexerBackend,
 )
-
-# The sparse_attn_deepseek_indexer custom op is defined and registered in
-# rebel_compiler; importing the module triggers registration so that
-# torch.ops.rbln_custom_ops.sparse_attn_deepseek_indexer is available.
-from rebel.ops.torch_custom_ops import attn as _rbln_attn_ops  # noqa: F401
 
 logger = init_logger(__name__)
 
