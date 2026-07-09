@@ -202,9 +202,17 @@ def scrub_scheduler_output_for_no_spec(scheduler_output: "SchedulerOutput") -> N
         if _n_out == 0:
             prefill_req_ids.add(_rid)
     if isinstance(scheduler_output, RBLNSchedulerOutput):
-        for _rid in list(scheduler_output.spec_decode_slide_distance):
-            if _rid not in prefill_req_ids:
-                del scheduler_output.spec_decode_slide_distance[_rid]
+        # A req carrying a slide entry is a scheduler-DECODE by construction:
+        # spec_decode_slide_distance is only ever written for `not is_prefill`
+        # reqs (running decodes and WAITING_FOR_REMOTE_KVS-promoted decodes).
+        # The num_output_tokens==0 heuristic above misreads a freshly promoted
+        # remote-KV decode (prompt computed on the producer, so no output yet)
+        # as a prefill; left in prefill_req_ids its slide is neither cleared nor
+        # its query_len clamped, and the invariant assert below fires (#390 A).
+        # Every slide belongs to a decode, so drop the whole map and keep these
+        # reqs out of the prefill set so they get clamped like any decode.
+        prefill_req_ids -= set(scheduler_output.spec_decode_slide_distance)
+        scheduler_output.spec_decode_slide_distance.clear()
     for req_id in list(scheduler_output.num_scheduled_tokens):
         # no-spec (query_len=1) is a DECODE concern. A PREFILL req must keep its
         # chunk query_len; clamping it to 1 discards the prefill's token and
