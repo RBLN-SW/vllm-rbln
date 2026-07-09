@@ -434,10 +434,9 @@ class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
 
         if len(cached_block_tables) != len(cached_lengths):
             raise ValueError(
-                "Mismatch between cached_block_tables length (%s) "
-                "and cached_lengths length (%s)",
-                len(cached_block_tables),
-                len(cached_lengths),
+                "Mismatch between cached_block_tables length "
+                f"({len(cached_block_tables)}) and cached_lengths length "
+                f"({len(cached_lengths)})"
             )
 
         prefill_decoder = self.get_prefill_decoder()
