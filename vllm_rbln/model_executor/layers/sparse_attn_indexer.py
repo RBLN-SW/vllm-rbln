@@ -24,7 +24,7 @@ from vllm_rbln.v1.attention.backends.mla.indexer import (
 # The sparse_attn_deepseek_indexer custom op is defined and registered in
 # rebel_compiler; importing the module triggers registration so that
 # torch.ops.rbln_custom_ops.sparse_attn_deepseek_indexer is available.
-from rebel.core.op.torch_custom_ops import attn as _rbln_attn_ops  # noqa: F401
+from rebel.ops.torch_custom_ops import attn as _rbln_attn_ops  # noqa: F401
 
 logger = init_logger(__name__)
 
