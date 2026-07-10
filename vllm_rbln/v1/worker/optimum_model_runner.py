@@ -418,12 +418,6 @@ class RBLNOptimumModelRunner(
         model_input: ModelInputForRBLN,
         scheduler_output: "SchedulerOutput",
     ) -> None:
-        """Copy prefix-cached KV into this request's destination blocks before
-        prefill, so a prefix-cache hit reuses the source KV instead of negating
-        it. Shared by the EC and non-EC prefill paths; a no-op unless this is a
-        decoder prefill step (``copy_cached_kv_blocks`` itself no-ops when there
-        is nothing cached).
-        """
         if not (
             model_input.is_prompt and isinstance(self.model, RBLNOptimumDecoderMixin)
         ):

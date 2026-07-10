@@ -504,11 +504,6 @@ class RBLNOptimumMultimodalMixin(SupportsMultiModal):
         # Unused here; see build_prefill_forward_inputs.
         mrope_position_deltas: dict[str, float],
     ) -> ModelInputForRBLN:
-        """Prefill for a partial prefix-cache hit: encode the kept items, drop
-        each item's already-cached leading features (``_build_partial_mm_embeds``),
-        then scatter the uncached tails over the placeholder positions. The
-        cached prefix KV is reused separately via ``copy_cached_kv_blocks``.
-        """
         assert model_input.partial_prefix is not None
         multimodal_embeddings = self.embed_multimodal(
             **(model_input.multi_modal_kwargs or {})
@@ -535,12 +530,6 @@ class RBLNOptimumMultimodalMixin(SupportsMultiModal):
         # richer cacheable unit (e.g. Qwen-VL, which also handles video) override
         # this.
         #
-        # NOTE: Upstream vLLM's MultiModalEmbeddings is only
-        # list[Tensor] | Tensor | tuple[Tensor, ...] and does not admit a dict.
-        # Models whose cacheable unit is richer than per-item embeddings (e.g.
-        # Qwen-VL: image/video embeds + grid_thw + optional deepstack) return
-        # that unit as a dict, so vLLM-RBLN widens the contract to also allow
-        # dict instead of forcing it into a positional tuple.
         image_input = self._parse_and_validate_image_input(**kwargs)
         if image_input is None:
             return []
@@ -633,19 +622,6 @@ class RBLNOptimumMultimodalMixin(SupportsMultiModal):
         partial_prefix: PartialPrefixInfo,
         multimodal_embeddings: MultiModalEmbeddings,
     ) -> MultiModalEmbeddings:
-        """Drop the prefix-cached leading features of each kept item on a
-        partial hit, keeping only its uncached tail.
-
-        The base contract is one embedding tensor per kept item (the list/tuple
-        ``embed_multimodal`` returns), so item ``i`` keeps
-        ``multimodal_embeddings[i][start_i:]`` where ``start_i`` is its first
-        uncached feature index. Unlike Qwen-VL's ``_slice_to_tail`` no per-item
-        ``counts`` are needed, since the items are already separated.
-
-        Models whose ``embed_multimodal`` returns a richer unit (e.g. Qwen-VL's
-        dict, or a single concatenated tensor) build the tail in their own
-        prefill path and do not reach here.
-        """
         tail_starts_by_modality = partial_prefix.mm_embed_tail_starts or {}
         # Base MM models are single-modality (image); flatten to one start list
         # kept-item order, matching the flat per-item embeddings list.
