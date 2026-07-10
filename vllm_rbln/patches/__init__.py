@@ -27,7 +27,7 @@ from vllm_rbln.patches.registry import (
 from . import (
     attention,
     deepseek_v2,
-    fp8_moe_method,
+    fp8_method,
     gpt_oss,
     gpt_oss_mxfp4_config,
     minimax_m2,

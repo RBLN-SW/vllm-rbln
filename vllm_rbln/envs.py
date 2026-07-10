@@ -78,6 +78,10 @@ if TYPE_CHECKING:
     VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS: list[int] = []
     # --- KV CONNECTOR ---
     VLLM_RBLN_NIXL_SWA_VIEW_OPT: bool = False
+    # --- QUANTIZATION ---
+    # FIXME: erase when CR-03 is no longer supported
+    # Default is device-derived (see get_use_w8a16): True on REBEL evt0
+    VLLM_RBLN_USE_W8A16: bool = False
 
 
 def get_num_devices_per_local_rank() -> int:
@@ -159,6 +163,27 @@ def use_auto_port() -> bool:
         "true",
         "1",
     )
+
+
+def get_use_w8a16() -> bool:
+    """Resolve ``VLLM_RBLN_USE_W8A16``, defaulting by device when unset.
+
+    An explicit env var always wins. REBEL evt0 (``RBLN-CR03``) lacks W8A8
+    support, so it defaults to W8A16; all other devices default to W8A8.
+    """
+    value = os.environ.get("VLLM_RBLN_USE_W8A16")
+    if value is not None:
+        return value.lower() in ("true", "1")
+
+    # Lazy import: platform imports this module. get_device_name() raises when
+    # the device is undeterminable (e.g. CPU-only host); fall back to W8A8.
+    from vllm.platforms import current_platform
+
+    try:
+        device_name = current_platform.get_device_name()
+    except Exception:
+        device_name = ""
+    return "cr03" in device_name.lower()
 
 
 # extended environments
@@ -286,6 +311,10 @@ environment_variables = {
             os.environ.get("RBLN_USE_CUSTOM_KERNEL", "False").lower() in ("true", "1")
         )
     ),
+    # Use W8A16 block fp8 (weight-only dequant) instead of W8A8 (dynamic
+    # activation fp8 quant). When unset, the default is derived from the device:
+    # REBEL evt0 (RBLN-CR03) defaults to W8A16 (no W8A8 support).
+    "VLLM_RBLN_USE_W8A16": get_use_w8a16,
     # --- MODEL INPUT / SCHEDULING ---
     "VLLM_RBLN_SORT_BATCH": (
         lambda: os.environ.get("VLLM_RBLN_SORT_BATCH", "False").lower() in ("true", "1")
