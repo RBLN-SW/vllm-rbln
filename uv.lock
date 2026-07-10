@@ -1549,7 +1549,7 @@ wheels = [
 
 [[package]]
 name = "optimum-rbln"
-version = "0.11.1a1"
+version = "0.11.1a2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "accelerate", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
@@ -1562,9 +1562,9 @@ dependencies = [
     { name = "torchvision", marker = "platform_machine == 'x86_64' and platform_python_implementation == 'CPython' and sys_platform == 'linux'" },
     { name = "transformers", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/52/c0/c62c55967f458a9b6ab66a3816022a9f771b08b90789c06313fdc4873dd6/optimum_rbln-0.11.1a1.tar.gz", hash = "sha256:0ec640c317ee413c8a3f0452b41949df607c37621bc693fd143879961899128f", size = 544206, upload-time = "2026-07-01T08:53:58.998Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/b0/21/42bd99d8db65349de8c71e2fd1724a12cd5ab39d4377853c151f778352c4/optimum_rbln-0.11.1a2.tar.gz", hash = "sha256:c7deb1c10df8e5f133a800bf6a24bf8d364d8879e9ce679c6da4fa2eb72927b6", size = 543764, upload-time = "2026-07-08T10:33:51.519Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/a9/58/83774e062219c2514fed3edfc3c685215e1155f359f6a4e728076b6f17a1/optimum_rbln-0.11.1a1-py3-none-any.whl", hash = "sha256:369147fb063865929bd32b92549e901ca586ad740f5cb50495f1e58907535b59", size = 625142, upload-time = "2026-07-01T08:53:56.859Z" },
+    { url = "https://files.pythonhosted.org/packages/39/1a/35ebefa135de6c225f269adc4900a111587896aafe68f0e55d0a1d3da616/optimum_rbln-0.11.1a2-py3-none-any.whl", hash = "sha256:80e47351afb8831bd07d2057cbf4c6205bac2a04706e3c17936fe6065e54c9e4", size = 624660, upload-time = "2026-07-08T10:33:49.169Z" },
 ]
 
 [[package]]
@@ -2606,7 +2606,7 @@ wheels = [
 
 [[package]]
 name = "torch-rbln"
-version = "0.2.3.dev36+g9e7b752"
+version = "0.3.0rc1.dev2+gf44e18388"
 source = { registry = "https://pypi.rebellions.in/simple/" }
 dependencies = [
     { name = "libcst", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
@@ -2617,7 +2617,7 @@ dependencies = [
     { name = "torch", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
 ]
 wheels = [
-    { url = "https://pypi.rebellions.in/api/package/torch-rbln/torch_rbln-0.2.3.dev36+g9e7b752-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "sha256:cc48ec2952bf9c50ea64b2ba4ed5c2d981b0f98a80ef814b69c86892bbb01558" },
+    { url = "https://pypi.rebellions.in/api/package/torch-rbln/torch_rbln-0.3.0rc1.dev2+gf44e18388-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "sha256:308206c6db67005b6130ea73be6e5c24101a74afc1092b160b04ceff495bc505" },
 ]
 
 [[package]]
@@ -2945,7 +2945,7 @@ requires-dist = [
     { name = "fastapi", extras = ["standard"], specifier = "<0.137" },
     { name = "fire", marker = "extra == 'dev'" },
     { name = "huggingface-hub", marker = "extra == 'dev'" },
-    { name = "optimum-rbln", specifier = ">=0.11.1a1" },
+    { name = "optimum-rbln", specifier = ">=0.11.1a2" },
     { name = "packaging", marker = "extra == 'dev'" },
     { name = "pynvml", marker = "extra == 'dev'" },
     { name = "pytest", marker = "extra == 'test'" },
@@ -2961,7 +2961,7 @@ requires-dist = [
     { name = "setuptools-scm", marker = "extra == 'build'" },
     { name = "simphile", marker = "extra == 'dev'" },
     { name = "torch", index = "https://download.pytorch.org/whl/cpu" },
-    { name = "torch-rbln", specifier = "~=0.2.2.dev0" },
+    { name = "torch-rbln", marker = "platform_machine == 'x86_64'", specifier = "~=0.3.0rc0" },
     { name = "torchaudio", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torchcodec", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torchvision", index = "https://download.pytorch.org/whl/cpu" },
