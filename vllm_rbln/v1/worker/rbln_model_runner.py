@@ -2277,9 +2277,11 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         for p in self.model.parameters():
             if not p.is_contiguous():
                 p.set_(p.contiguous())
+            p.requires_grad_(False)
         for b in self.model.buffers():
             if not b.is_contiguous():
                 b.set_(b.contiguous())
+            b.requires_grad_(False)
 
     @torch.inference_mode()
     def warm_up_model(self) -> None:
