@@ -392,6 +392,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.kv_cache_names: list[str] = []
         self.kv_cache_bases: list[torch.Tensor] = []
         self.kv_cache_view_infos: list[KVCacheViewInfo] = []
+        # Layer name -> expected physical shape, for the post-warm-up drift guard.
+        self._kv_expected_physical_by_name: dict[str, tuple[int, ...]] = {}
         # Initialize in initialize_kv_cache_tensors
         self.cross_layers_kv_cache: torch.Tensor | None = None
         self.cross_layers_attn_backend: type[AttentionBackend] | None = None
@@ -2297,6 +2299,52 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 self._warm_up_model_inner()
         finally:
             set_warmup_active(False)
+        # KV physical view is bound after warm-up; check it matches what we built.
+        self._verify_kv_physical_layout()
+
+    def _verify_kv_physical_layout(self) -> None:
+        """Fail loud on KV-cache layout drift.
+
+        Compare the compiler-assigned physical shape against what the framework
+        built; a mismatch means the attention kernel reads wrong memory (silent
+        corruption). Warn by default; ``VLLM_RBLN_STRICT_KV_LAYOUT=1`` raises.
+        """
+        physical_shape = getattr(getattr(torch, "rbln", None), "physical_shape", None)
+        if physical_shape is None:
+            return
+        expected_by_name = self._kv_expected_physical_by_name
+        if not expected_by_name or not self.kv_caches:
+            return
+        strict = os.environ.get("VLLM_RBLN_STRICT_KV_LAYOUT") == "1"
+        total = len(self.kv_caches)
+        checked = 0
+        drift = 0
+        for name, kv in zip(self.kv_cache_names, self.kv_caches):
+            expected = expected_by_name.get(name)
+            if expected is None:
+                continue
+            actual = tuple(physical_shape(kv))
+            if not actual:
+                continue
+            checked += 1
+            if actual != expected:
+                drift += 1
+                msg = (
+                    f"KV cache physical-layout drift for '{name}': framework built "
+                    f"{expected} but device allocated {actual}; the attention kernel "
+                    f"would read wrong memory (silent KV corruption)."
+                )
+                if strict:
+                    raise RuntimeError(msg)
+                logger.warning(
+                    "%s (set VLLM_RBLN_STRICT_KV_LAYOUT=1 to fail hard)", msg
+                )
+        logger.info(
+            "KV layout verify: %d/%d layer(s) had a bound physical view, %d drift.",
+            checked,
+            total,
+            drift,
+        )
 
     def _warm_up_model_inner(self) -> None:
         num_kv_cache_groups = len(self.kv_cache_config.kv_cache_groups)
@@ -5238,6 +5286,13 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         )
         self.kv_cache_names = get_kv_cache_names(kv_caches, num_attn_module)
         assert len(self.kv_cache_names) == len(self.kv_caches)
+        # Expected physical layout per layer (self.kv_cache_view_infos may be
+        # emptied when base-dedup is off, so use the complete local dict).
+        self._kv_expected_physical_by_name = {
+            name: tuple(info.view_shape)
+            for name, info in kv_cache_view_infos.items()
+            if info.view_shape is not None
+        }
 
         if (
             not envs.VLLM_RBLN_USE_DEVICE_TENSOR
