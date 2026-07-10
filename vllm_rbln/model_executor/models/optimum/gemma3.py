@@ -20,7 +20,6 @@ from vllm.model_executor.models.gemma3_mm import (
     Gemma3ImageInputs,
     Gemma3ImagePixelInputs,
 )
-from vllm.model_executor.models.interfaces_base import VllmModelForTextGeneration
 
 from .base import ModelInputForRBLN, version_error
 from .model_base import (
@@ -39,7 +38,6 @@ class RBLNOptimumGemma3ForConditionalGeneration(
     RBLNOptimumModelBase,
     RBLNOptimumMultimodalMixin,
     RBLNOptimumDecoderMixin,
-    VllmModelForTextGeneration,
 ):
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
@@ -117,16 +115,7 @@ class RBLNOptimumGemma3ForConditionalGeneration(
             # `image_token_id`. Subclasses override `_image_token_id()` accordingly.
             token_type_ids[input_ids == self._image_token_id()] = 1
 
-            multimodal_embeddings = self.embed_multimodal(
-                **(model_input.multi_modal_kwargs or {})
-            )
-            # Pass through as-is: `embed_input_ids` already treats None / len()==0 as
-            # "text only". A bare `... or None` raises on Gemma4, whose multimodal
-            # embeddings are a Tensor ("Boolean value of Tensor ... is ambiguous").
-            inputs_embeds = self.embed_input_ids(
-                input_ids,
-                multimodal_embeddings,
-            )
+            inputs_embeds = model_input.inputs_embeds
             if self.model.language_model.prefill_decoder is None:
                 raise version_error
             assert attention_masks is not None
@@ -193,13 +182,14 @@ class RBLNOptimumGemma3ForConditionalGeneration(
     def get_language_model(self):
         return self.model.language_model
 
-    def build_prefill_inputs(
+    def build_prefill_inputs_from_cache(
         self,
         input_ids: torch.Tensor,
         cached_mm_outputs: list,
         *,
         cache_position: torch.Tensor | None = None,
         running_requests_ids: list[str] | None = None,
+        mrope_position_deltas: dict[str, float] | None = None,
     ) -> dict:
         # NOTE: this guard is currently unreachable — init_model() only enables
         # the EC path for "RBLNQwen3VLForConditionalGeneration", so Gemma3 never
@@ -207,7 +197,7 @@ class RBLNOptimumGemma3ForConditionalGeneration(
         raise NotImplementedError(
             "EC disaggregation is not implemented for Gemma3: its hybrid "
             "sliding-window attention prefill needs attention_manager state "
-            "that build_prefill_inputs does not yet provide."
+            "that build_prefill_inputs_from_cache does not yet provide."
         )
 
     def _process_image_input(
