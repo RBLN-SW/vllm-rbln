@@ -48,7 +48,7 @@ dependencies = [
     "optimum-rbln>=0.11.1a1",
     # dev marker → allow prerelease (nightly) for rebel-compiler only (PEP 440).
     # Exact version pinning is uv.lock's job. Bump: uv lock --upgrade-package rebel-compiler
-    "rebel-compiler~=0.11.1.dev0",
+    # "rebel-compiler~=0.11.1.dev0",
 ]
 
 [project.optional-dependencies]
@@ -70,6 +70,11 @@ dev = [
     "huggingface_hub",
     "fire",
 ]
+
+runtime = [
+    "rebel-compiler~=0.11.1.dev0",
+]
+
 
 [project.urls]
 Homepage="https://rebellions.ai"

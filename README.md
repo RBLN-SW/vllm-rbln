@@ -75,8 +75,10 @@ export UV_INDEX_REBELLIONS_PASSWORD=<ldap-password>
 Then install the locked, team-identical environment with a single command:
 
 ```bash
-uv sync
+uv sync --extra runtime
 ```
+
+> `rebel-compiler` is separated into the `runtime` extra — it is required for NPU execution but excluded from the base dependency set. `--extra runtime` installs it alongside the rest of the locked environment.
 
 To bump `rebel-compiler` to the latest nightly (do not edit `pyproject.toml`):
 
@@ -116,15 +118,16 @@ uv venv --python 3.12
 source .venv/bin/activate
 # ... install rebel-compiler into this venv per the official instructions ...
 
-# 2. Install vllm-rbln, keeping your installed rebel-compiler as-is:
-echo "rebel-compiler==$(python -c 'import importlib.metadata as m; print(m.version("rebel-compiler"))')" > override.txt
-uv pip install -e ".[test]" --override override.txt
+# 2. Install vllm-rbln (rebel-compiler is an optional 'runtime' extra,
+#    so your separately installed copy is left untouched):
+uv pip install -e ".[test]"
 ```
 
-The override tells uv to accept your separately installed `rebel-compiler`
-instead of the internal nightly pin in `pyproject.toml`. Everything else
-resolves from public indexes (PyPI, `wheels.vllm.ai`, `download.pytorch.org`);
-internal indexes are skipped automatically.
+`rebel-compiler` is an optional `runtime` extra and is not pulled in by the
+base `test` install, so the resolver never conflicts with your separately
+installed copy. Everything else resolves from public indexes (PyPI,
+`wheels.vllm.ai`, `download.pytorch.org`); internal indexes are skipped
+automatically.
 
 > Note: this environment is **not** what CI reproduces. CI always builds from
 > the committed `uv.lock` (internal nightly `rebel-compiler` included), so unless
