@@ -425,8 +425,7 @@ class RBLNOptimumModelRunner(
         is nothing cached).
         """
         if not (
-            model_input.is_prompt
-            and isinstance(self.model, RBLNOptimumDecoderMixin)
+            model_input.is_prompt and isinstance(self.model, RBLNOptimumDecoderMixin)
         ):
             return
         self.model.copy_cached_kv_blocks(

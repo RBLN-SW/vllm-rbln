@@ -485,18 +485,39 @@ class RBLNOptimumMultimodalMixin(SupportsMultiModal):
         # (e.g. Qwen-VL), which records per-request rope deltas for decode.
         mrope_position_deltas: dict[str, float],
     ) -> ModelInputForRBLN:
+        # Dispatch partial vs full prefill, mirroring the Qwen-VL override.
+        if model_input.partial_prefix is not None:
+            return self._build_partial_prefill_forward_inputs(
+                model_input, mrope_position_deltas
+            )
+
         multimodal_embeddings = self.embed_multimodal(
             **(model_input.multi_modal_kwargs or {})
         )
-        if model_input.partial_prefix is not None:
-            multimodal_embeddings = self._build_partial_mm_embeds(
-                model_input.partial_prefix, multimodal_embeddings
-            )
         input_ids = model_input.input_tokens.to(torch.int64)
-        inputs_embeds = self.embed_input_ids(
-            input_ids,
-            multimodal_embeddings,
+        inputs_embeds = self.embed_input_ids(input_ids, multimodal_embeddings)
+        return replace(model_input, inputs_embeds=inputs_embeds)
+
+    def _build_partial_prefill_forward_inputs(
+        self,
+        model_input: ModelInputForRBLN,
+        # Unused here; see build_prefill_forward_inputs.
+        mrope_position_deltas: dict[str, float],
+    ) -> ModelInputForRBLN:
+        """Prefill for a partial prefix-cache hit: encode the kept items, drop
+        each item's already-cached leading features (``_build_partial_mm_embeds``),
+        then scatter the uncached tails over the placeholder positions. The
+        cached prefix KV is reused separately via ``copy_cached_kv_blocks``.
+        """
+        assert model_input.partial_prefix is not None
+        multimodal_embeddings = self.embed_multimodal(
+            **(model_input.multi_modal_kwargs or {})
         )
+        multimodal_embeddings = self._build_partial_mm_embeds(
+            model_input.partial_prefix, multimodal_embeddings
+        )
+        input_ids = model_input.input_tokens.to(torch.int64)
+        inputs_embeds = self.embed_input_ids(input_ids, multimodal_embeddings)
         return replace(model_input, inputs_embeds=inputs_embeds)
 
     def compute_decode_position_embed(
@@ -648,7 +669,6 @@ class RBLNOptimumMultimodalMixin(SupportsMultiModal):
             )
 
         sliced = [
-            embeds[start:]
-            for embeds, start in zip(multimodal_embeddings, tail_starts)
+            embeds[start:] for embeds, start in zip(multimodal_embeddings, tail_starts)
         ]
         return type(multimodal_embeddings)(sliced)
