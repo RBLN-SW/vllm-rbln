@@ -24,6 +24,9 @@ import torch
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
 
 from vllm_rbln.model_executor.models.optimum import ModelInputForRBLN
+from vllm_rbln.model_executor.models.optimum.model_base import (
+    RBLNOptimumDecoderMixin,
+)
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
@@ -50,6 +53,28 @@ class ECDisaggHelpersMixin:
         def maybe_save_ec_to_connector(
             self, encoder_cache: dict[str, Any], mm_hash: str
         ) -> None: ...
+
+    def reuse_prefix_cached_kv(
+        self,
+        model_input: ModelInputForRBLN,
+        scheduler_output: "SchedulerOutput",
+    ) -> None:
+        """Copy prefix-cached KV into this request's destination blocks before
+        prefill, so a prefix-cache hit reuses the source KV instead of negating
+        it. Shared by the EC and non-EC prefill paths; a no-op unless this is a
+        decoder prefill step (``copy_cached_kv_blocks`` itself no-ops when there
+        is nothing cached).
+        """
+        if not (
+            model_input.is_prompt
+            and isinstance(self.model, RBLNOptimumDecoderMixin)
+        ):
+            return
+        self.model.copy_cached_kv_blocks(
+            scheduler_output.cached_block_table,
+            scheduler_output.cached_length,
+            model_input.block_tables,
+        )
 
     def _make_producer_output(
         self, scheduler_output: "SchedulerOutput"
@@ -149,13 +174,7 @@ class ECDisaggHelpersMixin:
             mrope_position_deltas=self.mrope_position_deltas,
         )
 
-        # Reuse prefix-cached KV: copy source blocks into this request's
-        # destination blocks before prefill (mirrors the non-EC prefill path).
-        self.model.copy_cached_kv_blocks(
-            scheduler_output.cached_block_table,
-            scheduler_output.cached_length,
-            model_input.block_tables,
-        )
+        self.reuse_prefix_cached_kv(model_input, scheduler_output)
 
         language_model = self.model.get_language_model()
         logits = language_model.prefill_decoder(

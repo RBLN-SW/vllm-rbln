@@ -76,7 +76,6 @@ from vllm_rbln.model_executor.models.optimum import (
     PartialPrefixInfo,
 )
 from vllm_rbln.model_executor.models.optimum.model_base import (
-    RBLNOptimumDecoderMixin,
     RBLNOptimumMultimodalMixin,
 )
 from vllm_rbln.utils.optimum.bucket import select_bucket_size
@@ -377,16 +376,7 @@ class RBLNOptimumModelRunner(
                 else:
                     with capture_ctx as model_reports:
                         model_input = self._build_forward_inputs(model_input)
-                        if model_input.is_prompt and isinstance(
-                            self.model, RBLNOptimumDecoderMixin
-                        ):
-                            # Reuse prefix-cached KV: copy source blocks into
-                            # this request's destination blocks before prefill.
-                            self.model.copy_cached_kv_blocks(
-                                scheduler_output.cached_block_table,
-                                scheduler_output.cached_length,
-                                model_input.block_tables,
-                            )
+                        self.reuse_prefix_cached_kv(model_input, scheduler_output)
                         hidden_states = self.model(model_input)
                 if (
                     envs.VLLM_RBLN_METRICS

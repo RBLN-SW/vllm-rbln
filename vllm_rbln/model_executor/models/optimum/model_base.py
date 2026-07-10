@@ -481,6 +481,8 @@ class RBLNOptimumMultimodalMixin(SupportsMultiModal):
     def build_prefill_forward_inputs(
         self,
         model_input: ModelInputForRBLN,
+        # Unused here; kept for a uniform signature with the MRoPE override
+        # (e.g. Qwen-VL), which records per-request rope deltas for decode.
         mrope_position_deltas: dict[str, float],
     ) -> ModelInputForRBLN:
         multimodal_embeddings = self.embed_multimodal(
@@ -500,9 +502,10 @@ class RBLNOptimumMultimodalMixin(SupportsMultiModal):
     def compute_decode_position_embed(
         self,
         model_input: ModelInputForRBLN,
+        # Unused in the base (no decode-time position embed); MRoPE models
+        # (e.g. Qwen-VL) override this and consume the recorded rope deltas.
         mrope_position_deltas: dict[str, float],
     ) -> torch.Tensor | None:
-        # MRoPE models (e.g. Qwen-VL) override this
         return None
 
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings | dict:
