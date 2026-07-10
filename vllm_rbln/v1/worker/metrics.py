@@ -155,9 +155,7 @@ class StepMetrics:
         if self.ccl_times:
             logger.info("  Average ccl time: %.2f us", self.get_avg_ccl_time())
         if self.prepare_times:
-            logger.info(
-                "  Average prepare time: %.2f us", self.get_avg_prepare_time()
-            )
+            logger.info("  Average prepare time: %.2f us", self.get_avg_prepare_time())
 
 
 class PrefillMetricsByRequestID:
@@ -317,8 +315,7 @@ class PerformanceTracker:
             return
         arr = np.asarray(totals, dtype=float)
         logger.info(
-            "  Per-request prefill (ms): mean %.2f | p50 %.2f | max %.2f "
-            "(%d requests)",
+            "  Per-request prefill (ms): mean %.2f | p50 %.2f | max %.2f (%d requests)",
             float(arr.mean()),
             float(np.percentile(arr, 50)),
             float(arr.max()),
