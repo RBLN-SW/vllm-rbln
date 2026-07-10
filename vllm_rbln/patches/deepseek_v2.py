@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import torch
+from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.model_executor.models.deepseek_v2 import DeepseekV2Attention, DeepseekV2MoE
 
 from vllm_rbln.patches import register_patch
@@ -23,9 +24,7 @@ from vllm_rbln.patches import register_patch
     reason=(
         "Replace DeepseekV2MoE.forward with an RBLN-friendly form: call the "
         "RBLN FusedMoE with a `router` callback and keep 3-D tensors (no "
-        "reshape). All-reduce via `tensor_model_parallel_all_reduce` directly "
-        "because RBLNFusedMoE has no `maybe_all_reduce_tensor_model_parallel` "
-        "method; matches the qwen2_moe/qwen3_moe patches."
+        "reshape)."
     ),
 )
 def patched_deepseek_v2_moe_forward(
@@ -46,9 +45,7 @@ def patched_deepseek_v2_moe_forward(
         final_hidden_states = final_hidden_states + shared_output
 
     if self.tp_size > 1:
-        final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(
-            final_hidden_states
-        )
+        final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
     # FIXME(RBLN) - DO NOT reshape
     # return final_hidden_states.view(orig_shape)
     return final_hidden_states
