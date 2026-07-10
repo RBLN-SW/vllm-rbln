@@ -4389,39 +4389,50 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # never reads the (by-then mutated) live input_batch.
             _dsm = _deferred_sampling_metadata
             _dnr = _deferred_num_reqs
-            # Do not compute logprobs in the deferred thunk. The thunk keeps only
-            # .sampled_token_ids and the deferred path already returns logprobs=None
-            # (_bookkeeping_sync with sampler_output=None), so any logprobs the sampler
-            # would compute here are discarded — pure dead work. It is also the trigger
-            # for a batch=1 nondeterminism: with the extra large full-vocab
-            # compute_logprobs / gather_logprobs device work running in this deferred,
-            # overlapped window, batch=1 flips near-tie tokens run-to-run. Verified as a
-            # clean toggle (logprobs on -> nondeterministic; off -> deterministic) and
-            # isolated to the overlap (async1, worker-thread forward WITHOUT the deferral,
-            # stays deterministic with logprobs on). The device sampler still returns the
-            # correct token (device argmax == host argmax at every step), so this is a
-            # device-runtime interaction between the overlap and the interposed logprobs
-            # graphs, not a wrong-math issue. It resisted every fix tried at this layer --
-            # reordering the sampler (argmax first), per-op RBLN_RUNTIME_FORCE_SYNC, and
-            # RBLN_DISABLE_EAGER_CACHE_ALLOC all still flipped -- so the exact cause needs
-            # rebel-runtime investigation. Dropping the discarded logprobs removes the
-            # trigger and the waste at all batch sizes while keeping the overlap and the
-            # (correct) deferred argmax. Returning logprobs *under* overlap is a separate
-            # rebel-runtime follow-up.
-            if _dsm is not None and _dsm.max_num_logprobs is not None:
-                _dsm = copy(_dsm)
-                _dsm.max_num_logprobs = None
+            # Keep logprobs computed in the deferred sampler (do NOT strip
+            # max_num_logprobs). The compiled argmax and the logprobs graphs
+            # (compute_logprobs = full-vocab log_softmax, gather_logprobs) are all
+            # submitted to the async runtime's single FIFO worker; under `defer` those
+            # submissions are non-blocking, so the main thread returns from this thunk
+            # and races ahead to the next step while the worker is still draining the
+            # sampler. With the extra logprobs graphs in flight, that overlap corrupts
+            # near-tie tokens run-to-run at batch=1 — a device-runtime interaction, not
+            # wrong math: the device argmax stays == the host argmax at every step;
+            # logprobs-off is deterministic while logprobs-on flips; and async1 (the
+            # same worker WITHOUT the deferral) is deterministic with logprobs on.
+            # See docs/async_overlap_batch1_rootcause.md.
+            #
+            # Fix: when logprobs are requested, run the deferred sampler under
+            # force_sync so its worker submissions complete inline before the main
+            # thread proceeds, removing the concurrency (verified: batch=1 defer +
+            # logprobs becomes deterministic). This makes only the (small) sampler
+            # synchronous — the forward<->all_reduce overlap already happened in the
+            # prior step and was drained before this runs, so the overlap and the
+            # device sampler are preserved. With no logprobs there are no extra graphs
+            # and the path is already deterministic, so skip force_sync (no cost).
+            _fs_sampler = _dsm is not None and _dsm.max_num_logprobs is not None
+
             # skip_int32_cast=True: the argmax runs async, so casting its output to
             # int32 inside the sampler (before the submission is awaited) reads an
             # unmaterialized buffer → token 0. Keep int64 here; the drain block casts
             # to int32 AFTER awaiting the argmax.
-            async_output._deferred_sample_thunk = lambda: self._sample(
-                logits,
-                spec_decode_metadata,
-                sampling_metadata_override=_dsm,
-                num_reqs_override=_dnr,
-                skip_int32_cast=True,
-            ).sampled_token_ids
+            def _deferred_thunk():
+                if _fs_sampler:
+                    from rebel.sync_runtime import force_sync
+
+                    cm = force_sync()
+                else:
+                    cm = contextlib.nullcontext()
+                with cm:
+                    return self._sample(
+                        logits,
+                        spec_decode_metadata,
+                        sampling_metadata_override=_dsm,
+                        num_reqs_override=_dnr,
+                        skip_int32_cast=True,
+                    ).sampled_token_ids
+
+            async_output._deferred_sample_thunk = _deferred_thunk
             async_output._deferred_nreqs = _dnr
             self._prev_output = async_output
         else:

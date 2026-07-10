@@ -47,41 +47,51 @@ it (final step → no concurrent forward → safe). Python-only; no rebel_compil
   massively distorts async (thread-heavy) — measure perf only without the profiler.
 - perfetto traces (same L18/b8/tok16 spec): `perfetto_v2/{async,sync}_dp{0-3}.pt.trace.json.gz`.
 
-## batch=1 (DP4): FIXED — the deferred sampler's logprobs was the trigger
+## batch=1 (DP4): FIXED — force_sync the deferred sampler when logprobs are on
 
 Earlier notes attributed batch=1 defer nondeterminism to accepted near-tie variation from
-MoE-combine low-token/padding sensitivity. **That was wrong.** The real cause is computing
-**logprobs inside the deferred sampler** during the overlap window; it is now fixed by not
-computing those (discarded) logprobs there.
+MoE-combine low-token/padding sensitivity. **That was wrong.** The real cause is the
+**deferred sampler's logprobs graphs being in flight during the overlap window**: under
+`defer` the sampler's compiled argmax and its logprobs graphs (`compute_logprobs` =
+full-vocab `log_softmax`, `gather_logprobs`) are submitted non-blocking, so the main thread
+races ahead to the next step while the async worker is still draining them. With the extra
+logprobs graphs in flight, that overlap flips near-tie tokens run-to-run at batch=1. See
+`async_overlap_batch1_rootcause.md` for the full analysis.
 
 Evidence (batch=1 DP4 L18, `--repro-run` determinism):
 - **Clean toggle**: defer + logprobs=16 → nondeterministic; defer + `--logprobs 0` →
   deterministic.
-- **Isolated to the overlap**: `async1` (worker-thread forward, inline await, NO deferral)
+- **Isolated to the overlap/deferral**: `async1` (same worker, inline await, NO deferral)
   is deterministic *with logprobs on*. So logprobs compute alone is fine; overlap alone
   (no logprobs) is fine; only overlap × deferred-logprobs flips.
-- **Sampler is faithful**: device argmax == host argmax at every step — so it is a
-  device-runtime interaction between the overlap and the interposed logprobs graphs, not
-  wrong sampling math.
+- **Sampler is faithful**: device argmax == host argmax at every step — a device-runtime
+  interaction between the deferral and the interposed logprobs graphs, not wrong math.
 - **Refuted hypotheses** (each still flipped): MoE-combine padding (re-zeroing the pad via
   `get_tokens_mask`), reduce_scatter-specific (RS=0 all_reduce flips too), the get_output
   copy-thread fix (pre-existing), compute_logprobs-corrupts-argmax (sampler reorder,
   argmax-first), per-op `RBLN_RUNTIME_FORCE_SYNC`, and disabling the caching allocator
-  (`RBLN_DISABLE_EAGER_CACHE_ALLOC`). The exact device-runtime cause is still open.
+  (`RBLN_DISABLE_EAGER_CACHE_ALLOC`).
+- **A `RuntimeInstance::Run()` mutex is moot**: under `defer` every `backend="rbln"` compile
+  — forward, argmax, and each eager single-op graph (torch_rbln recompiles each) — builds
+  the async runtime and runs on the *one* `SharedAsyncWorker` FIFO thread (confirmed by a
+  compile-time probe). All device submits are already serialized on that single thread, so
+  there is no concurrent main-thread `Run()` to serialize. The nondeterminism is the
+  deferral itself, not two threads racing inside `Run()`.
 
-**Fix** (`rbln_model_runner.py`, deferred thunk): drop `max_num_logprobs` for the deferred
-sampler. The deferred path already returns `logprobs=None` (`_bookkeeping_sync` with
-`sampler_output=None`), so those logprobs are discarded — dropping them removes both the
-dead work and the nondeterminism trigger. Greedy argmax is unaffected — **token-neutral**:
-batch=1 with-logprobs-stripped == with-logprobs-off, 4/4 bit-identical. **Result: batch=1
-DP4 defer is now deterministic** (repro pass on clean code). Overlap + device sampler
-preserved; the large full-vocab logprobs graphs are no longer run in the deferred window,
-so this is also faster.
+**Fix** (`rbln_model_runner.py`, deferred thunk): **keep logprobs computed** (do NOT strip
+`max_num_logprobs`), and when logprobs are requested run the deferred `self._sample(...)`
+under `rebel.sync_runtime.force_sync()` so the sampler's worker submissions complete inline
+before the main thread races ahead — removing the concurrency. Only the (small) sampler is
+made synchronous; the forward↔all_reduce overlap already happened in the prior step and was
+drained before the deferred sampler runs, so overlap + device sampler are preserved. Gated
+on logprobs-present, so no-logprobs greedy pays nothing. **Result (clean rebel 30d55c5):
+batch=1 DP4 defer + logprobs is deterministic (4/4 repro identical) and 16/16 inputs
+bit-identical to plain sync.** This supersedes the strip approach (commit `c38f37b4`, which
+dropped the discarded logprobs); the strip is faster but forecloses returning logprobs.
 
-**Open (rebel-runtime follow-up)**: returning logprobs *under* overlap. That needs the
-device-runtime interaction understood/fixed so the deferred sampler can compute logprobs
-without perturbing the overlapped forward. Until then, defer returns `logprobs=None`
-(unchanged pre-existing behavior).
+**Open (rebel-runtime follow-up)**: returning logprobs *under* overlap. The deferred path
+still returns `logprobs=None` (`_bookkeeping_sync` with `sampler_output=None`); the sampler
+now computes them safely, so wiring the return is a follow-up.
 
 ## Reproduce
 Scratchpad `runone.sh <tag> <mode> <RS> <batch> <np> <maxtok> <nrepro>` — modes `defer` /
