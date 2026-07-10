@@ -80,6 +80,32 @@ uv sync --extra runtime
 
 > `rebel-compiler` is separated into the `runtime` extra — it is required for NPU execution but excluded from the base dependency set. `--extra runtime` installs it alongside the rest of the locked environment.
 
+#### pyproject.toml vs uv.lock — what to edit when
+
+| File | Role | Edit by hand? |
+|---|---|---|
+| `pyproject.toml` | Declares dependency **ranges** (what we're compatible with). Ships in the wheel as `Requires-Dist`. | Yes |
+| `uv.lock` | Pins the **exact** versions + hashes of the full graph (what dev/CI actually installs). Never shipped. | **No** — only via `uv` commands |
+
+Common tasks:
+
+```bash
+# Add / remove / change a dependency range:
+#   edit pyproject.toml, then refresh the lock and commit BOTH files
+uv lock
+
+# Bump one package to the latest version allowed by pyproject (lock-only change):
+uv lock --upgrade-package rebel-compiler
+
+# Reproduce the CI-identical environment (never resolves, only installs the lock):
+uv sync --extra runtime
+```
+
+Rules of thumb:
+- If you edited `pyproject.toml`, always run `uv lock` and commit `uv.lock` in the same PR — pre-commit rejects drift between the two.
+- CI installs with `uv sync --locked`, which fails if `uv.lock` doesn't match `pyproject.toml`.
+- Never edit `uv.lock` by hand.
+
 To bump `rebel-compiler` to the latest nightly (do not edit `pyproject.toml`):
 
 ```bash
