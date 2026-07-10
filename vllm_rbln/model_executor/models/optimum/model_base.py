@@ -38,7 +38,7 @@ from vllm_rbln.utils.optimum.block_size import get_attn_block_size
 from vllm_rbln.utils.optimum.bucket import select_bucket_size
 from vllm_rbln.utils.optimum.registry import get_rbln_model_info
 
-from .base import ModelInputForRBLN
+from .base import ModelInputForRBLN, PartialPrefixInfo
 from .compilation import RBLNCompileSpec
 
 logger = init_logger(__name__)
@@ -486,6 +486,10 @@ class RBLNOptimumMultimodalMixin(SupportsMultiModal):
         multimodal_embeddings = self.embed_multimodal(
             **(model_input.multi_modal_kwargs or {})
         )
+        if model_input.partial_prefix is not None:
+            multimodal_embeddings = self._build_partial_mm_embeds(
+                model_input.partial_prefix, multimodal_embeddings
+            )
         input_ids = model_input.input_tokens.to(torch.int64)
         inputs_embeds = self.embed_input_ids(
             input_ids,
@@ -599,3 +603,49 @@ class RBLNOptimumMultimodalMixin(SupportsMultiModal):
         mm_embeds = [t for out in cached_mm_outputs for t in out]
         inputs_embeds = self.embed_input_ids(input_ids, mm_embeds)
         return {"inputs_embeds": inputs_embeds, "cache_position": cache_position}
+
+    def _build_partial_mm_embeds(
+        self,
+        partial_prefix: PartialPrefixInfo,
+        multimodal_embeddings: MultiModalEmbeddings,
+    ) -> MultiModalEmbeddings:
+        """Drop the prefix-cached leading features of each kept item on a
+        partial hit, keeping only its uncached tail.
+
+        The base contract is one embedding tensor per kept item (the list/tuple
+        ``embed_multimodal`` returns), so item ``i`` keeps
+        ``multimodal_embeddings[i][start_i:]`` where ``start_i`` is its first
+        uncached feature index. Unlike Qwen-VL's ``_slice_to_tail`` no per-item
+        ``counts`` are needed, since the items are already separated.
+
+        Models whose ``embed_multimodal`` returns a richer unit (e.g. Qwen-VL's
+        dict, or a single concatenated tensor) build the tail in their own
+        prefill path and do not reach here.
+        """
+        tail_starts_by_modality = partial_prefix.mm_embed_tail_starts or {}
+        # Base MM models are single-modality (image); flatten to one start list
+        # kept-item order, matching the flat per-item embeddings list.
+        if len(tail_starts_by_modality) > 1:
+            raise NotImplementedError(
+                "Partial prefix tail slicing across multiple modalities needs a "
+                "model-specific _build_partial_mm_embeds override."
+            )
+        tail_starts = next(iter(tail_starts_by_modality.values()), [])
+
+        if not isinstance(multimodal_embeddings, (list, tuple)):
+            raise NotImplementedError(
+                "Base partial prefix slicing expects per-item embeddings "
+                f"(list/tuple), got {type(multimodal_embeddings).__name__}; "
+                "override _build_partial_mm_embeds for this representation."
+            )
+        if len(tail_starts) != len(multimodal_embeddings):
+            raise ValueError(
+                f"kept-item count mismatch: {len(multimodal_embeddings)} "
+                f"embeddings vs {len(tail_starts)} tail starts"
+            )
+
+        sliced = [
+            embeds[start:]
+            for embeds, start in zip(multimodal_embeddings, tail_starts)
+        ]
+        return type(multimodal_embeddings)(sliced)

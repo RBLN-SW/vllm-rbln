@@ -654,13 +654,11 @@ class RBLNOptimumModelRunner(
         """
         if not self.supports_mm_inputs:
             return None, None
-
         batched_mm_inputs = self._extract_mm_kwargs(
             scheduler_output, num_cached_tokens=total_cached_length
         )
         if total_cached_length <= 0:
             return batched_mm_inputs, None
-
         partial_prefix = PartialPrefixInfo(
             full_input_tokens=torch.tensor(full_prompt_tokens).unsqueeze(0),
             num_cached_tokens=total_cached_length,
