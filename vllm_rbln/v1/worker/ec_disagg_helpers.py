@@ -24,9 +24,6 @@ import torch
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
 
 from vllm_rbln.model_executor.models.optimum import ModelInputForRBLN
-from vllm_rbln.model_executor.models.optimum.model_base import (
-    RBLNOptimumDecoderMixin,
-)
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
@@ -54,27 +51,11 @@ class ECDisaggHelpersMixin:
             self, encoder_cache: dict[str, Any], mm_hash: str
         ) -> None: ...
 
-    def reuse_prefix_cached_kv(
-        self,
-        model_input: ModelInputForRBLN,
-        scheduler_output: "SchedulerOutput",
-    ) -> None:
-        """Copy prefix-cached KV into this request's destination blocks before
-        prefill, so a prefix-cache hit reuses the source KV instead of negating
-        it. Shared by the EC and non-EC prefill paths; a no-op unless this is a
-        decoder prefill step (``copy_cached_kv_blocks`` itself no-ops when there
-        is nothing cached).
-        """
-        if not (
-            model_input.is_prompt
-            and isinstance(self.model, RBLNOptimumDecoderMixin)
-        ):
-            return
-        self.model.copy_cached_kv_blocks(
-            scheduler_output.cached_block_table,
-            scheduler_output.cached_length,
-            model_input.block_tables,
-        )
+        def reuse_prefix_cached_kv(
+            self,
+            model_input: ModelInputForRBLN,
+            scheduler_output: "SchedulerOutput",
+        ) -> None: ...
 
     def _make_producer_output(
         self, scheduler_output: "SchedulerOutput"

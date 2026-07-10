@@ -76,6 +76,7 @@ from vllm_rbln.model_executor.models.optimum import (
     PartialPrefixInfo,
 )
 from vllm_rbln.model_executor.models.optimum.model_base import (
+    RBLNOptimumDecoderMixin,
     RBLNOptimumMultimodalMixin,
 )
 from vllm_rbln.utils.optimum.bucket import select_bucket_size
@@ -411,6 +412,28 @@ class RBLNOptimumModelRunner(
             ec_connector_output=ec_connector_output,
         )
         return None
+
+    def reuse_prefix_cached_kv(
+        self,
+        model_input: ModelInputForRBLN,
+        scheduler_output: "SchedulerOutput",
+    ) -> None:
+        """Copy prefix-cached KV into this request's destination blocks before
+        prefill, so a prefix-cache hit reuses the source KV instead of negating
+        it. Shared by the EC and non-EC prefill paths; a no-op unless this is a
+        decoder prefill step (``copy_cached_kv_blocks`` itself no-ops when there
+        is nothing cached).
+        """
+        if not (
+            model_input.is_prompt
+            and isinstance(self.model, RBLNOptimumDecoderMixin)
+        ):
+            return
+        self.model.copy_cached_kv_blocks(
+            scheduler_output.cached_block_table,
+            scheduler_output.cached_length,
+            model_input.block_tables,
+        )
 
     def _build_forward_inputs(
         self, model_input: ModelInputForRBLN
