@@ -642,7 +642,16 @@ class RBLNOptimumModelRunner(
         """
         tail_starts: dict[str, list[int]] = {}
         for feature in self._iter_kept_mm_features(scheduler_output, num_cached_tokens):
-            start = max(0, num_cached_tokens - feature.mm_position.offset)
+            pos = feature.mm_position
+            cached_tokens = max(0, num_cached_tokens - pos.offset)
+            # cached_tokens counts placeholder-block tokens, but the tail start is
+            # a feature index. When the block interleaves non-embedding tokens
+            # (idefics3 tile/global separators), is_embed marks the embedding
+            # positions, so the feature index is the True count up to the boundary.
+            if pos.is_embed is None:
+                start = cached_tokens
+            else:
+                start = int(pos.is_embed[:cached_tokens].sum())
             tail_starts.setdefault(feature.modality, []).append(start)
         return tail_starts
 

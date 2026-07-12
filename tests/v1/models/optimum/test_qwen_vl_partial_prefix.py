@@ -27,12 +27,16 @@ from vllm_rbln.v1.worker.optimum_model_runner import RBLNOptimumModelRunner
 HIDDEN = 4
 
 
-def _feature(offset, length, modality="image", data="x"):
+def _feature(offset, length, modality="image", data="x", is_embed=None):
     """Minimal stand-in for a scheduled multimodal feature."""
+    if is_embed is not None:
+        is_embed = torch.tensor(is_embed, dtype=torch.bool)
     return types.SimpleNamespace(
         data=data,
         modality=modality,
-        mm_position=types.SimpleNamespace(offset=offset, length=length),
+        mm_position=types.SimpleNamespace(
+            offset=offset, length=length, is_embed=is_embed
+        ),
     )
 
 
@@ -79,6 +83,23 @@ class TestMmEmbedTailStarts:
     def test_features_without_data_are_skipped(self):
         starts = _mm_embed_tail_starts(
             [_feature(15, 396, data=None), _feature(413, 510)], num_cached=384
+        )
+        assert starts == {"image": [0]}
+
+    def test_is_embed_maps_token_boundary_to_feature_index(self):
+        # idefics3-style block at offset 10 interleaving structural (F) and image
+        # (T) tokens. A boundary 3 tokens in caches [F, T, T] -> 2 embedding
+        # tokens, so the tail starts at feature index 2, not raw token offset 3.
+        starts = _mm_embed_tail_starts(
+            [_feature(10, 7, is_embed=[0, 1, 1, 0, 1, 1, 1])], num_cached=13
+        )
+        assert starts == {"image": [2]}
+
+    def test_is_embed_leading_structural_tokens_start_at_zero(self):
+        # Only a leading structural (non-embedding) token is cached, so no image
+        # feature is cached yet and the whole image is re-injected from 0.
+        starts = _mm_embed_tail_starts(
+            [_feature(10, 7, is_embed=[0, 1, 1, 0, 1, 1, 1])], num_cached=11
         )
         assert starts == {"image": [0]}
 
