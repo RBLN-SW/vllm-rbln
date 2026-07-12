@@ -5321,7 +5321,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     logger.debug(
                         "mark_reference: name=%s shape=%s", name, kv_cache.shape
                     )
-                    self.compile_context.mark_reference(kv_cache, name)
+                    self.compile_context.mark_reference(kv_cache)
                 else:
                     logger.debug(
                         "mark_static_address: name=%s shape=%s", name, kv_cache.shape
