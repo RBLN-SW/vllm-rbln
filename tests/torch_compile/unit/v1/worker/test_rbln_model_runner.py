@@ -334,12 +334,13 @@ class TestDummyRunStateFeature:
             "num_input_tokens",
             "input_ids",
             "positions",
+            "scheduler_output",
             "draft_attn_metadata",
         )
         assert DummyRunState._fields == expected_fields
 
     def test_field_count(self):
-        assert len(DummyRunState._fields) == 5
+        assert len(DummyRunState._fields) == 6
 
     def test_is_named_tuple(self):
         assert issubclass(DummyRunState, tuple)
@@ -350,6 +351,7 @@ class TestDummyRunStateFeature:
             num_input_tokens=32,
             input_ids={0: torch.zeros(32, dtype=torch.long)},
             positions={0: torch.arange(32)},
+            scheduler_output=None,
         )
         assert state.num_input_tokens == 32
         assert isinstance(state.attn_metadata, dict)
@@ -362,6 +364,7 @@ class TestDummyRunStateFeature:
             num_input_tokens=0,
             input_ids={},
             positions={},
+            scheduler_output=None,
         )
         assert state.num_input_tokens == 0
         assert len(state.attn_metadata) == 0

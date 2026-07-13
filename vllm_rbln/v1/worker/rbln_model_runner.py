@@ -70,7 +70,11 @@ from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, Schedul
 
 from vllm_rbln.forward_context import set_forward_context
 from vllm_rbln.v1.core.rbln_scheduler import RBLNSchedulerOutput
-from vllm_rbln.v1.core.utils import decode_batch_size
+from vllm_rbln.v1.core.utils import (
+    decode_batch_size,
+    num_base_tokens,
+    resolve_propagated_token_write,
+)
 
 if TYPE_CHECKING:
     from vllm_rbln.v1.core.rbln_kv_cache_manager import KVCacheCopyOp
@@ -341,6 +345,10 @@ class DummyRunState(NamedTuple):
     num_input_tokens: int
     input_ids: dict[int, torch.Tensor]
     positions: dict[int, torch.Tensor]
+    # The (RBLN) scheduler output this dummy was built from. dummy_run replays
+    # it through _set_step_phase so a stale prefill/decode phase from a prior
+    # real step cannot leak into any is_prefill_phase() read on the idle rank.
+    scheduler_output: "SchedulerOutput"
     draft_attn_metadata: dict[int, dict[str, Any]] | None = None
 
 
@@ -627,7 +635,17 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # None in the first PP rank. The rest are set after load_model.
         self.prefill_intermediate_tensors: IntermediateTensors | None = None
-        self.decode_intermediate_tensors: dict[int, IntermediateTensors] = {}
+        # Keyed by (decode_batch_bucket, query_len): under spec decode the decode
+        # query window is num_spec_tokens + 1 (or 1 on the no-spec fallback), and
+        # the PP inter-stage tensor must carry batch * query_len tokens, so one
+        # template per compiled (bucket, query_len) decode graph is stored.
+        self.decode_intermediate_tensors: dict[
+            tuple[int, int], IntermediateTensors
+        ] = {}
+
+        # This step's prefill/decode classification, stashed from the scheduler
+        # output at the top of each execute_model (see is_prefill_phase()).
+        self._is_prefill_step: bool = False
 
         # OPTIMIZATION: Cache the tensors rather than creating them every step.
         # Keep in int64 to avoid overflow with long context
@@ -1011,8 +1029,20 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     new_token_ids = req_data.new_token_ids[i]
                     # Add the sampled token(s) from the previous step (if any).
                     # This doesn't include "unverified" tokens like spec tokens.
+                    # NOTE(RBLN): new_token_ids is extended backward by num_spec
+                    # (multi-accept propagation) and ends at committed_tip =
+                    # num_computed + base. The number of NEW output tokens is the
+                    # committed delta, computed from base (not len(new_token_ids),
+                    # which now includes the backward-extended catch-up window).
+                    # new_token_ids[-num_new:] still takes the newest tokens
+                    # because the payload ends at committed_tip.
+                    base_out = num_base_tokens(
+                        scheduler_output.num_scheduled_tokens,
+                        scheduled_spec_tokens,
+                        req_id,
+                    )
                     num_new_tokens = (
-                        num_computed_tokens + len(new_token_ids) - req_state.num_tokens
+                        num_computed_tokens + base_out - req_state.num_tokens
                     )
                     if num_new_tokens == 1:
                         # Avoid slicing list in most common case.
@@ -1067,13 +1097,32 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # For the last rank, we don't need to update the token_ids_cpu
             # because the sampled tokens are already cached.
             if not is_last_rank:
-                # Add new_token_ids to token_ids_cpu.
-                start_token_index = num_computed_tokens
-                end_token_index = num_computed_tokens + len(new_token_ids)
-                self.input_batch.token_ids_cpu[
-                    req_index, start_token_index:end_token_index
-                ] = new_token_ids
-                self.input_batch.num_tokens_no_spec[req_index] = end_token_index
+                # NOTE(RBLN): bring this rank's recorded-token cursor
+                # (num_tokens_no_spec) up to committed_tip = num_computed + base
+                # by writing the scheduler-propagated tokens at their ABSOLUTE
+                # position. The payload is extended backward by num_spec so it
+                # spans a prior verify's multi-accept lag; the write idempotently
+                # overwrites any mis-speculated draft slots. See
+                # resolve_propagated_token_write.
+                base = num_base_tokens(
+                    scheduler_output.num_scheduled_tokens,
+                    scheduled_spec_tokens,
+                    req_id,
+                )
+                start_token_index = self.input_batch.num_tokens_no_spec[req_index]
+                write = resolve_propagated_token_write(
+                    start_token_index, num_computed_tokens, base, new_token_ids
+                )
+                if write is not None:
+                    committed_tip, tokens = write
+                    if tokens:
+                        self.input_batch.token_ids_cpu[
+                            req_index, start_token_index:committed_tip
+                        ] = tokens
+                    self.input_batch.is_token_ids[
+                        req_index, start_token_index:committed_tip
+                    ] = True
+                    self.input_batch.num_tokens_no_spec[req_index] = committed_tip
 
             # Add spec_token_ids to token_ids_cpu.
             self.input_batch.update_req_spec_token_ids(req_state, scheduled_spec_tokens)
@@ -2395,6 +2444,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             dummy_prefill_requests,
             dummy_prefill_num_scheduled_tokens,
             num_kv_cache_groups,
+            is_prefill=True,
         )
         logger.info("Warm-up: prefill (seq_len=%d)", prefill_seq_len)
         self._execute_dummy_requests(so, cso, self.prefill_intermediate_tensors)
@@ -2420,13 +2470,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # proposers (EAGLE/EAGLE3/MEDUSA) never cross-block (backfill only
             # fires at the block-end squeeze, where in-block past is always
             # sufficient), so they need full spec only.
-            if self.num_spec_tokens > 0:
-                if self.speculative_config.method in ("ngram", "suffix"):
-                    query_len_range = [1, self.num_spec_tokens + 1]
-                else:
-                    query_len_range = [self.num_spec_tokens + 1]
-            else:
-                query_len_range = [1]
+            query_len_range = self._decode_query_lens()
             for query_len in query_len_range:
                 dummy_decode_requests: list[NewRequestData] = []
                 dummy_decode_num_scheduled_tokens: dict[str, int] = {}
@@ -2467,7 +2511,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     step_no_spec_required=(query_len == 1 and self.num_spec_tokens > 0),
                 )
                 current_intermediate_tensors = self.decode_intermediate_tensors.get(
-                    batch_bucket_size
+                    (batch_bucket_size, query_len)
                 )
                 assert current_intermediate_tensors is not None
 
@@ -2534,7 +2578,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 decode_batch
             )
             current_intermediate_tensors = self.decode_intermediate_tensors.get(
-                batch_bucket_size
+                (batch_bucket_size, sampler_query_len)
             )
             assert current_intermediate_tensors is not None
             logger.info("Warm-up: sampler (decode_batch=%d)", decode_batch)
@@ -2583,17 +2627,18 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         num_kv_cache_groups: int,
         scheduled_spec_decode_tokens: dict[str, list[int]] | None = None,
         step_no_spec_required: bool = False,
+        is_prefill: bool = False,
     ) -> tuple[SchedulerOutput, SchedulerOutput]:
-        # When step_no_spec_required is requested (the warmup no-spec /
-        # query_len=1 iteration for variable-length proposers), emit an
-        # RBLNSchedulerOutput carrying the flag so execute_model takes the
-        # EXACT same path the runtime cross-block no-spec fallback does:
-        # step_no_spec_required -> spec_decode_max_query_len=1 -> get_dp_padding
-        # produces num_padded = batch_bucket * 1 (maxp=8 for bucket 8). Without
-        # this the plain SchedulerOutput never trips the flag, so the no-spec
-        # decode-only graph (input (b,1), max_pads=batch_bucket) is never
-        # compiled and the runtime no-spec step / DP-idle dummy_run hot-paths.
-        sched_output_kwargs = dict(
+        # Always emit RBLNSchedulerOutput (never a plain SchedulerOutput) so the
+        # runner uniformly receives the RBLN fields:
+        #   * step_no_spec_required: on the warmup no-spec / query_len=1
+        #     iteration (variable-length proposers), so execute_model takes the
+        #     EXACT runtime cross-block no-spec path (spec_decode_max_query_len=1
+        #     -> num_padded = batch_bucket * 1) and compiles that decode-only
+        #     graph; a plain SchedulerOutput would never trip it.
+        #   * is_prefill_step: the prefill/decode classification the runner's
+        #     is_prefill_phase() reads (dummies build a known phase up front).
+        sched_output = RBLNSchedulerOutput(
             scheduled_new_reqs=requests,
             scheduled_cached_reqs=CachedRequestData.make_empty(),
             num_scheduled_tokens=num_scheduled_tokens,
@@ -2604,14 +2649,10 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             finished_req_ids=set(),
             free_encoder_mm_hashes=[],
             kv_connector_metadata=None,
+            step_no_spec_required=step_no_spec_required,
+            is_prefill_step=is_prefill,
         )
-        if step_no_spec_required:
-            sched_output: SchedulerOutput = RBLNSchedulerOutput(
-                **sched_output_kwargs, step_no_spec_required=True
-            )
-        else:
-            sched_output = SchedulerOutput(**sched_output_kwargs)
-        cleanup_sched_output = SchedulerOutput(
+        cleanup_sched_output = RBLNSchedulerOutput(
             scheduled_new_reqs=[],
             scheduled_cached_reqs=CachedRequestData.make_empty(),
             num_scheduled_tokens={},
@@ -2885,6 +2926,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             num_input_tokens=num_input_tokens,
             input_ids=input_ids_bucket,
             positions=positions_bucket,
+            scheduler_output=scheduler_output,
             draft_attn_metadata=draft_attn_metadata_bucket,
         )
 
@@ -2992,6 +3034,10 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     @torch.inference_mode()
     def dummy_run(self) -> None:
         assert self.dummy_run_state is not None
+        # Set the phase from the dummy's own scheduler output (decode) so a
+        # stale value from a prior real step cannot contaminate any
+        # is_prefill_phase() read while this DP-idle rank runs the dummy.
+        self._set_step_phase(self.dummy_run_state.scheduler_output)
         attn_metadata = self.dummy_run_state.attn_metadata
         num_input_tokens = self.dummy_run_state.num_input_tokens
         input_ids = self.dummy_run_state.input_ids
@@ -3076,8 +3122,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         if get_pp_group().is_first_rank:
             intermediate_tensors = None
         else:
+            # Key on the actual (possibly spec-expanded) query length so the
+            # PP inter-stage tensor matches the batch * query_len token layout
+            # of bucket_input_ids for this compiled decode graph.
+            decode_query_len = bucket_input_ids.shape[1]
             intermediate_tensors = self.decode_intermediate_tensors.get(
-                batch_bucket_size
+                (batch_bucket_size, decode_query_len)
             )
             assert intermediate_tensors is not None
 
@@ -3398,6 +3448,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         self._handle_kv_connector_preemptions(scheduler_output)
 
+        # NOTE(RBLN): Record this step's prefill/decode classification from the
+        # scheduler-stamped output; is_prefill_phase() reads it (see
+        # _set_step_phase). Done before the empty-batch early return below so
+        # the phase is never stale for this step.
+        self._set_step_phase(scheduler_output)
+
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with record_function_or_nullcontext("Preprocess"):
             self._update_states(scheduler_output)
@@ -3658,10 +3714,16 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                                 md.slot_mapping = sm
 
         # Run the model.
-        # Use persistent buffers for CUDA graphs.
         # When spec decode is enabled, defer connector finalization
-        # (wait_for_save + clear metadata) until after draft model runs.
-        defer_kv_connector_finalize = self.speculative_config is not None
+        # (wait_for_save + clear metadata) until after the draft model runs.
+        # NOTE(RBLN): gate on the last PP rank -- the deferred finalize runs in
+        # the sample path, which only the last rank reaches, so deferring on
+        # non-last ranks would drop their KV save entirely (every PP rank must
+        # finalize its own layers' KV). Only the last rank drafts, so only it
+        # needs to defer.
+        defer_kv_connector_finalize = (
+            self.speculative_config is not None and get_pp_group().is_last_rank
+        )
         with (
             set_forward_context(
                 attn_metadata,
@@ -4484,6 +4546,23 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             ),
         )
 
+    def _decode_query_lens(self) -> list[int]:
+        """Decode query windows the runner compiles a graph for.
+
+        Non-spec decode is a single token (1). Spec decode pads each step to
+        num_spec_tokens + 1 via in-block query backfill; variable-length
+        proposers (ngram, suffix) additionally fall back to no-spec (1) on a
+        cross-block step, so both windows are compiled. Fixed-length proposers
+        (EAGLE/EAGLE3/MEDUSA) never cross-block and use full spec only. This is
+        the single source of truth shared by warm-up graph compilation and the
+        per-(bucket, query_len) intermediate-tensor templates.
+        """
+        if self.num_spec_tokens <= 0:
+            return [1]
+        if self.speculative_config.method in ("ngram", "suffix"):
+            return [1, self.num_spec_tokens + 1]
+        return [self.num_spec_tokens + 1]
+
     def _prepare_decode_intermediate_tensors(self, batch_bucket_size) -> None:
         def _reshape(
             batch_size: int, seq_len: int, intermediate_tensors: IntermediateTensors
@@ -4495,17 +4574,21 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 }
             )
 
+        # One template per compiled decode query length: the PP inter-stage
+        # tensor must carry batch * query_len tokens to match input_ids. seq_len
+        # was previously hardcoded to 1, which undersizes the tensor for spec
+        # decode (query_len == num_spec_tokens + 1) under pipeline parallelism.
         batch_size = batch_bucket_size
-        seq_len = 1
-        self.decode_intermediate_tensors[batch_bucket_size] = _reshape(
-            batch_size,
-            seq_len,
-            self.model.make_empty_intermediate_tensors(
-                batch_size=batch_size * seq_len,
-                dtype=self.model_config.dtype,
-                device=self.device,
-            ),
-        )
+        for seq_len in self._decode_query_lens():
+            self.decode_intermediate_tensors[(batch_bucket_size, seq_len)] = _reshape(
+                batch_size,
+                seq_len,
+                self.model.make_empty_intermediate_tensors(
+                    batch_size=batch_size * seq_len,
+                    dtype=self.model_config.dtype,
+                    device=self.device,
+                ),
+            )
 
     def save_tensorized_model(
         self,
@@ -5591,13 +5674,40 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         return pinned.tolist()
 
     def is_prefills(self) -> np.ndarray:
+        # DEPRECATED: per-rank classification. No longer drives is_prefill_phase
+        # (that reads the scheduler stamp now); kept only for existing direct
+        # unit tests. Remove with the RBLNSchedulerOutput-unification cleanup.
         return (
             self.input_batch.num_computed_tokens_cpu
             < self.input_batch.num_tokens_no_spec - 1
         )
 
+    def _set_step_phase(self, scheduler_output: "SchedulerOutput") -> None:
+        """Record this step's prefill/decode phase from the scheduler stamp.
+
+        RBLNScheduler always emits RBLNSchedulerOutput, and the dummy builder
+        (`_make_dummy_scheduler_outputs`) does too, so every step reaching the
+        runner carries `is_prefill_step`. Assert (rather than default silently)
+        so any future path that feeds a plain SchedulerOutput fails loudly
+        instead of misclassifying the phase as decode.
+        """
+        assert isinstance(scheduler_output, RBLNSchedulerOutput), (
+            "RBLNModelRunner expects RBLNSchedulerOutput carrying is_prefill_step; "
+            f"got {type(scheduler_output).__name__}. The prefill/decode phase is "
+            "stamped by the scheduler and must be present on every step."
+        )
+        self._is_prefill_step = scheduler_output.is_prefill_step
+
     def is_prefill_phase(self) -> bool:
-        return bool(self.is_prefills()[0])
+        # The step's prefill/decode classification, stamped by the scheduler
+        # (RBLNSchedulerOutput.is_prefill_step) and stashed in execute_model.
+        # NOT re-derived from the per-rank input_batch: num_tokens_no_spec is
+        # updated on different paths on the last PP rank (sampling) vs other
+        # ranks (scheduler output), so a runner-side classification diverges
+        # across ranks under spec-decode + PP (a decode step then reads a
+        # prefill-shaped inter-stage tensor on the last rank -> hot-path
+        # recompile and wrong output). The scheduler value is rank-consistent.
+        return self._is_prefill_step
 
     def use_wrapped_compute_logits(self) -> bool:
         return not (self.lora_config is not None)

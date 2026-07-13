@@ -38,6 +38,11 @@ from tests.torch_compile.unit.v1.core.utils import (
     create_requests,
     create_scheduler,
 )
+from vllm_rbln.v1.core.utils import (
+    num_base_tokens,
+    resolve_propagated_token_write,
+    should_defer_spec_step,
+)
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -160,6 +165,243 @@ class TestSchedulerBackfill:
         assert sched_out.spec_decode_slide_distance["B"] == 2
         assert sched_out.num_scheduled_tokens["B"] == 2
         assert sched_out.scheduled_spec_decode_tokens["B"] == [11]
+
+
+class TestSchedulerBackfillUnderPP:
+    """Query backfill (spec decode) composed with pipeline parallelism.
+
+    Backfill shapes the decode QUERY axis (each decode req's window is padded
+    to num_spec_tokens + 1); the PP per-step decode cap
+    (max_num_seqs // pipeline_parallel_size) bounds the BATCH axis. The two are
+    orthogonal, so PP must not change the per-req backfill decision, and the
+    cap must not shrink an admitted req's spec query window.
+    """
+
+    @pytest.mark.parametrize("pp_size", [1, 2])
+    def test_backfill_decision_invariant_under_pp(self, pp_size):
+        """The per-req backfill decision (slide / trim / drafts) is identical
+        under pp_size=1 and pp_size=2: A (mid-block) stays full-spec with no
+        slide; B (at the block boundary) slides 2 and trims to one draft. The
+        batch cap (max_num_seqs // pp) is not reached here (2 reqs, cap 5)."""
+        scheduler = create_scheduler(
+            block_size=_BLOCK_SIZE,
+            num_blocks=100,
+            max_num_seqs=10,  # pp=2 -> per-step cap 5, well above 2 reqs
+            num_speculative_tokens=_NUM_SPEC_TOKENS,
+            pipeline_parallel_size=pp_size,
+        )
+        req_a = _request(512, "A")  # mid-block: full spec, no slide
+        req_b = _request(1022, "B")  # near boundary: slide 2, one draft kept
+        advance_to_decode(scheduler, req_a)
+        advance_to_decode(scheduler, req_b)
+        req_a.spec_token_ids = [1] * _NUM_SPEC_TOKENS
+        req_b.spec_token_ids = [11, 22, 33]
+
+        sched_out = scheduler.schedule()
+
+        assert "A" not in sched_out.spec_decode_slide_distance
+        assert sched_out.num_scheduled_tokens["A"] == _MAX_SPEC_DECODE_LEN
+        assert len(sched_out.scheduled_spec_decode_tokens["A"]) == _NUM_SPEC_TOKENS
+        assert sched_out.spec_decode_slide_distance["B"] == 2
+        assert sched_out.num_scheduled_tokens["B"] == 2
+        assert sched_out.scheduled_spec_decode_tokens["B"] == [11]
+        assert sched_out.step_no_spec_required is False
+
+    def test_decode_cap_bounds_batch_but_preserves_spec_window(self):
+        """The PP decode cap limits how many spec-decodes join one step, but
+        never shrinks an admitted req's spec query window.
+
+        pp=2, max_num_seqs=4 -> per-step cap 2. Three mid-block spec-decodes
+        are ready; exactly two are admitted and each keeps its full window
+        (1 base + num_spec drafts, no slide), the third defers to a later step.
+        """
+        scheduler = create_scheduler(
+            block_size=_BLOCK_SIZE,
+            num_blocks=100,
+            max_num_seqs=4,
+            num_speculative_tokens=_NUM_SPEC_TOKENS,
+            pipeline_parallel_size=2,  # per-step decode cap = 4 // 2 = 2
+        )
+        reqs = [_request(512, f"d{i}") for i in range(3)]  # all mid-block
+        for r in reqs:
+            advance_to_decode(scheduler, r)
+        for r in reqs:
+            r.spec_token_ids = [1] * _NUM_SPEC_TOKENS
+
+        sched_out = scheduler.schedule()
+
+        scheduled = [
+            r.request_id for r in reqs if r.request_id in sched_out.num_scheduled_tokens
+        ]
+        assert len(scheduled) == 2, (
+            f"per-step decode cap is 2, got {len(scheduled)} scheduled"
+        )
+        # each admitted spec-decode keeps its full query window, uncapped.
+        for rid in scheduled:
+            assert sched_out.num_scheduled_tokens[rid] == _MAX_SPEC_DECODE_LEN
+            assert len(sched_out.scheduled_spec_decode_tokens[rid]) == _NUM_SPEC_TOKENS
+            assert rid not in sched_out.spec_decode_slide_distance
+        assert sched_out.step_no_spec_required is False
+
+    @pytest.mark.parametrize("pp_size", [1, 2])
+    def test_variable_length_no_spec_fallback_invariant_under_pp(self, pp_size):
+        """The variable-length (ngram) cross-block no-spec fallback decision is
+        identical under pp_size=1 and pp_size=2: entering a fresh block with a
+        draft shortfall crosses a block boundary and elects no-spec (no slide
+        recorded); the same shortfall mid-block backfills in-block (full spec,
+        slide == num_spec). PP shapes the batch axis, not this per-req/per-step
+        query-window decision."""
+        # Cross-block: fresh block entry (num_computed == block_size), 0 drafts
+        # -> desired slide num_spec > used_in_block 0 -> no-spec.
+        sched_cross = create_scheduler(
+            block_size=_BLOCK_SIZE,
+            num_blocks=100,
+            max_num_seqs=10,
+            num_speculative_tokens=_NUM_SPEC_TOKENS,
+            pipeline_parallel_size=pp_size,
+        )
+        assert sched_cross.vllm_config.speculative_config.method == "ngram"
+        req_cross = _request(_BLOCK_SIZE, "X")
+        advance_to_decode(sched_cross, req_cross)
+        req_cross.spec_token_ids = []  # variable-length proposer found no match
+        out_cross = sched_cross.schedule()
+        assert out_cross.step_no_spec_required is True
+        assert "X" not in out_cross.spec_decode_slide_distance
+
+        # In-block: mid-block (used_in_block large), same 0-draft shortfall
+        # backfills in-block -> full spec, slide == num_spec, no no-spec.
+        sched_in = create_scheduler(
+            block_size=_BLOCK_SIZE,
+            num_blocks=100,
+            max_num_seqs=10,
+            num_speculative_tokens=_NUM_SPEC_TOKENS,
+            pipeline_parallel_size=pp_size,
+        )
+        req_in = _request(1500, "Y")
+        advance_to_decode(sched_in, req_in)
+        req_in.spec_token_ids = []
+        out_in = sched_in.schedule()
+        assert out_in.step_no_spec_required is False
+        assert out_in.spec_decode_slide_distance["Y"] == _NUM_SPEC_TOKENS
+
+    def test_spec_optimistic_overshoot_defers_not_negative(self):
+        """A spec request whose num_computed_tokens has been optimistically
+        advanced PAST num_tokens_with_spec must be deferred, never scheduled
+        with a negative num_new_tokens.
+
+        Spec decode advances num_computed_tokens at schedule time (by
+        1 + num_drafts, assuming acceptance) and only reconciles it in
+        update_from_output. Under PP the engine keeps pipeline_parallel_size
+        batches in flight, so a running request can be re-scheduled before its
+        prior step reconciles -- with few requests filling the pipeline its
+        num_computed_tokens overshoots num_tokens_with_spec (simulated here by
+        advancing it directly). The base-count deferral gate catches this: the
+        request has spec_token_ids and its base (num_tokens - num_computed) is
+        <= 0 (anchor in flight), so it is deferred before num_new_tokens is even
+        computed -- no negative num_scheduled_tokens / bogus spec slide leaks
+        (which would trip `total_num_scheduled_tokens > 0` in the runner).
+        """
+        scheduler = _scheduler()
+        healthy = _request(512, "healthy")  # mid-block: full spec, num_new = 4
+        overshot = _request(512, "overshot")
+        advance_to_decode(scheduler, healthy)
+        advance_to_decode(scheduler, overshot)
+        healthy.spec_token_ids = [1, 2, 3]
+        overshot.spec_token_ids = [1, 2, 3]
+        # Simulate the PP optimistic overshoot: push num_computed_tokens past
+        # num_tokens_with_spec so num_new_tokens = num_tokens_with_spec - it < 0.
+        overshot.num_computed_tokens = overshot.num_tokens_with_spec + 2
+
+        sched_out = scheduler.schedule()
+
+        # The overshot request is deferred (not scheduled this step).
+        assert "overshot" not in sched_out.num_scheduled_tokens
+        assert "overshot" not in sched_out.spec_decode_slide_distance
+        # The healthy request is unaffected -- the skip is per-request.
+        assert sched_out.num_scheduled_tokens["healthy"] == _MAX_SPEC_DECODE_LEN
+        # No negative/zero counts leak out; the runner's `> 0` assert holds.
+        assert sched_out.total_num_scheduled_tokens > 0
+        assert all(v >= 1 for v in sched_out.num_scheduled_tokens.values())
+
+    def test_spec_overshoot_empty_drafts_defers_not_negative(self):
+        """Post-verify overshoot with the drafts already CLEARED: num_computed
+        is optimistically advanced past num_tokens while spec_token_ids is
+        empty, so num_new_tokens goes negative. The base-count deferral gate is
+        guarded by `request.spec_token_ids`, so it does NOT fire here; the
+        `num_new_tokens <= 0` guard must catch it. Otherwise a negative
+        num_scheduled_tokens (plus a bogus spec slide) leaks and trips the
+        runner's `total_num_scheduled_tokens > 0` assert. Discriminates the
+        `<= 0` guard from a plain `== 0` (regression guard)."""
+        scheduler = _scheduler()
+        req = _request(512, "X")
+        advance_to_decode(scheduler, req)
+        req.spec_token_ids = []  # drafts consumed by the prior verify step
+        # Optimistic overshoot: num_computed runs past num_tokens -> num_new < 0.
+        req.num_computed_tokens = req.num_tokens + _NUM_SPEC_TOKENS
+
+        sched_out = scheduler.schedule()
+
+        assert "X" not in sched_out.num_scheduled_tokens  # deferred
+        assert "X" not in sched_out.spec_decode_slide_distance
+        assert sched_out.total_num_scheduled_tokens >= 0  # no negative leak
+
+    def test_spec_pp_defers_verify_when_anchor_in_flight(self):
+        """A verify whose anchor (base) token is still in flight -- num_computed
+        == num_tokens, so base == 0 -- must be deferred, even though the drafts
+        keep num_new_tokens > 0. This is the exact empty-new_token_ids trigger
+        on the non-last PP rank (the IndexError). The `== 0` guard alone does
+        NOT catch it (num_new == num_spec here); the base-count deferral gate
+        does. Discriminates the gate from the plain num_new guard."""
+        scheduler = create_scheduler(
+            block_size=_BLOCK_SIZE,
+            num_blocks=100,
+            max_num_seqs=10,
+            num_speculative_tokens=_NUM_SPEC_TOKENS,
+            pipeline_parallel_size=2,
+        )
+        req = _request(512, "A")
+        advance_to_decode(scheduler, req)
+        req.spec_token_ids = [1, 2, 3]
+        # Anchor in flight: base == 0. With drafts, num_new would be num_spec.
+        req.num_computed_tokens = req.num_tokens
+        assert req.num_tokens_with_spec - req.num_computed_tokens == _NUM_SPEC_TOKENS
+
+        sched_out = scheduler.schedule()
+
+        # Deferred by the base-count gate (a plain `== 0` guard would not fire).
+        assert "A" not in sched_out.num_scheduled_tokens
+
+    def test_spec_pp_extends_new_token_ids_for_multi_accept(self):
+        """Under spec + PP the scheduler extends the non-last-rank new_token_ids
+        payload backward by num_spec so PP0 can catch up its recorded-token
+        cursor after a prior verify's multi-token accept (bug#2). The payload
+        spans all_token_ids[num_computed - num_spec : num_computed + base]
+        instead of the base-only [num_computed : num_computed + base]."""
+        scheduler = create_scheduler(
+            block_size=_BLOCK_SIZE,
+            num_blocks=100,
+            max_num_seqs=10,
+            num_speculative_tokens=_NUM_SPEC_TOKENS,
+            pipeline_parallel_size=2,
+        )
+        req = _request(512, "A")
+        advance_to_decode(scheduler, req)
+        req.spec_token_ids = [1, 2, 3]
+        nc_pre = req.num_computed_tokens  # payload is sliced pre-advance
+
+        sched_out = scheduler.schedule()
+
+        base = sched_out.num_scheduled_tokens["A"] - len(
+            sched_out.scheduled_spec_decode_tokens.get("A", [])
+        )
+        cached = sched_out.scheduled_cached_reqs
+        idx = list(cached.req_ids).index("A")
+        new_token_ids = list(cached.new_token_ids[idx])
+        # Extended backward by num_spec (not the base-only length).
+        assert len(new_token_ids) == base + _NUM_SPEC_TOKENS
+        assert new_token_ids == list(
+            req.all_token_ids[nc_pre - _NUM_SPEC_TOKENS : nc_pre + base]
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1146,3 +1388,74 @@ class TestNoSpecScrubPrefill:
         # decode req (num_output > 0) is NOT a prefill -> gets clamped.
         scrub_scheduler_output_for_no_spec(sched_out, scheduler.requests)
         assert sched_out.num_scheduled_tokens[rid] == 1
+
+
+class TestSpecDecodePropagationHelpers:
+    """Pure helpers extracted from the scheduler + runner non-last-rank token
+    propagation: num_base_tokens and resolve_propagated_token_write."""
+
+    def test_num_base_tokens(self):
+        num_sched = {"A": 4, "B": 1}
+        drafts = {"A": [1, 2, 3]}  # B carries no drafts this step
+        assert num_base_tokens(num_sched, drafts, "A") == 1  # 4 - 3 drafts
+        assert num_base_tokens(num_sched, drafts, "B") == 1  # 1 - 0
+        assert num_base_tokens(num_sched, drafts, "missing") == 0
+
+    def test_write_normal_decode_writes_newest_token(self):
+        # base=1, cursor caught up (== num_computed). Payload is extended
+        # backward by num_spec (positions 97..100); write only the newest.
+        payload = [10, 11, 12, 13]
+        assert resolve_propagated_token_write(
+            cursor=100, num_computed_tokens=100, base=1, new_token_ids=payload
+        ) == (101, [13])
+
+    def test_write_multi_accept_lag_fills_gap(self):
+        # After a verify accepted 3 drafts the cursor lags num_computed by 3;
+        # the extended payload lets PP0 fill positions 97..100 by absolute pos.
+        payload = [10, 11, 12, 13]
+        assert resolve_propagated_token_write(
+            cursor=97, num_computed_tokens=100, base=1, new_token_ids=payload
+        ) == (101, [10, 11, 12, 13])
+
+    def test_write_nothing_when_cursor_at_tip(self):
+        assert (
+            resolve_propagated_token_write(
+                cursor=101, num_computed_tokens=100, base=1, new_token_ids=[10, 11]
+            )
+            is None
+        )
+
+    def test_write_empty_payload_advances_cursor_only(self):
+        # Async GPU-broadcast path: no payload, cursor still advances.
+        assert resolve_propagated_token_write(
+            cursor=100, num_computed_tokens=100, base=1, new_token_ids=[]
+        ) == (101, [])
+
+    def test_write_out_of_window_falls_back_to_tail(self):
+        # Defensive: a payload too short to cover [cursor, committed_tip) falls
+        # back to its tail so the cursor still advances in-bounds.
+        assert resolve_propagated_token_write(
+            cursor=97, num_computed_tokens=100, base=1, new_token_ids=[13]
+        ) == (101, [13])
+
+
+class TestShouldDeferSpecStep:
+    """Pure predicate for the spec+PP running-loop deferral."""
+
+    def test_disabled_when_spec_off(self):
+        # num_spec_tokens == 0: never defers, even for a negative num_new.
+        assert should_defer_spec_step(0, [], -3) is False
+        assert should_defer_spec_step(0, [], 0) is False
+
+    def test_drafts_held_defers_on_base_le_zero(self):
+        # base = num_new - len(drafts). drafts=[1,2,3].
+        assert should_defer_spec_step(3, [1, 2, 3], 3) is True  # base 0
+        assert should_defer_spec_step(3, [1, 2, 3], 0) is True  # base -3
+        assert should_defer_spec_step(3, [1, 2, 3], 4) is False  # base 1
+
+    def test_no_drafts_defers_only_on_negative(self):
+        # base == num_new. Only the post-verify overshoot (negative) defers;
+        # the mundane == 0 and any positive are left to the caller.
+        assert should_defer_spec_step(3, [], -3) is True
+        assert should_defer_spec_step(3, [], 0) is False
+        assert should_defer_spec_step(3, [], 1) is False

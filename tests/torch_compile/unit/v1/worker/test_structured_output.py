@@ -96,7 +96,7 @@ class TestGrammarBitmaskApplication:
                     [],
                 ),
             ),
-            patch.object(runner, "is_prefills", return_value=[False]),
+            patch.object(runner, "is_prefill_phase", return_value=False),
         ):
             runner.sample_tokens(grammar_output)
 
@@ -142,7 +142,7 @@ class TestGrammarBitmaskApplication:
                     [],
                 ),
             ),
-            patch.object(runner, "is_prefills", return_value=[False]),
+            patch.object(runner, "is_prefill_phase", return_value=False),
         ):
             runner.sample_tokens(None)
 
@@ -189,7 +189,7 @@ class TestGrammarBitmaskApplication:
                     [],
                 ),
             ),
-            patch.object(runner, "is_prefills", return_value=[False]),
+            patch.object(runner, "is_prefill_phase", return_value=False),
         ):
             runner.sample_tokens(grammar_output)
 
@@ -410,7 +410,7 @@ class TestLogitsDtypeConversion:
                     [],
                 ),
             ),
-            patch.object(runner, "is_prefills", return_value=[False]),
+            patch.object(runner, "is_prefill_phase", return_value=False),
         ):
             runner.sample_tokens(grammar_output)
 
