@@ -16,11 +16,11 @@ import types
 
 import torch
 
+from vllm_rbln.model_executor.models.optimum.qwen2_vl import (
+    RBLNOptimumQwenVLForConditionalGeneration as QwenVL,
+)
 from vllm_rbln.model_executor.models.optimum.qwen3_vl import (
     RBLNOptimumQwen3VLForConditionalGeneration as Qwen3VL,
-)
-from vllm_rbln.model_executor.models.optimum.qwen_vl import (
-    RBLNOptimumQwenVLForConditionalGeneration as QwenVL,
 )
 from vllm_rbln.v1.worker.optimum_model_runner import RBLNOptimumModelRunner
 
