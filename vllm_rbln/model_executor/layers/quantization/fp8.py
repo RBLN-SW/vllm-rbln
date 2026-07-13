@@ -190,7 +190,6 @@ class RBLNW8A8BlockFp8LinearOp:
         _input_dtype = input.dtype
         out_features, in_features = weight.shape
         bs0, bs1 = int(block_size[0]), int(block_size[1])
-        out_blocks = out_features // bs0
         in_blocks = in_features // bs1
 
         # 1) Activation: dynamic per-(1, block_k) fp8 quant along K.
@@ -199,11 +198,9 @@ class RBLNW8A8BlockFp8LinearOp:
         x_deq = x_q.to(_input_dtype) * x_scale.repeat_interleave(bs1, dim=-1).to(
             _input_dtype
         )
-
-        # 3) Weight dequant (identical to the W8A16 path).
-        weight = weight.view(out_blocks, bs0, in_blocks, bs1).to(_input_dtype)
-        weight_scale = weight_scale.view(out_blocks, in_blocks).to(_input_dtype)
-        scaled_weight = (weight * weight_scale[:, None, :, None]).reshape(
+        oc_rep = weight_scale.repeat_interleave(bs0, dim=0)[:out_features, :]
+        w3 = weight.view(out_features, in_blocks, bs1).to(_input_dtype)
+        scaled_weight = (w3 * oc_rep[:, :, None].to(_input_dtype)).view(
             out_features, in_features
         )
 
