@@ -57,13 +57,35 @@ def _mm_embed_tail_starts(features, num_cached):
     )
 
 
-def _fake_qwen(visual):
-    """Fake ``self`` carrying the pieces ``_encode_and_slice_mm`` touches."""
+def _partial(tail_starts):
+    """Minimal PartialPrefixInfo stand-in carrying per-modality tail starts."""
+    return types.SimpleNamespace(mm_embed_tail_starts=tail_starts)
+
+
+def _merge2_model():
     return types.SimpleNamespace(
-        model=types.SimpleNamespace(visual=visual),
+        config=types.SimpleNamespace(
+            vision_config=types.SimpleNamespace(spatial_merge_size=2)
+        )
+    )
+
+
+def _base_self():
+    """Fake ``self`` for the base ``_build_partial_mm_embeds`` (no ``super()``)."""
+    return types.SimpleNamespace(
+        model=_merge2_model(),
         _mm_feature_counts=QwenVL._mm_feature_counts,
         _slice_to_tail=QwenVL._slice_to_tail,
     )
+
+
+def _qwen3_self():
+    """Uninitialised Qwen3-VL instance: its ``_build_partial_mm_embeds`` calls
+    ``super()``, which needs a real instance, so a namespace won't do. Only
+    ``self.model`` is touched, so skipping ``__init__`` is safe here."""
+    obj = Qwen3VL.__new__(Qwen3VL)
+    obj.model = _merge2_model()
+    return obj
 
 
 class TestMmEmbedTailStarts:
@@ -121,7 +143,7 @@ class TestMmFeatureCounts:
         assert counts == [1584 // 4, 2040 // 4]  # [396, 510]
 
 
-class TestEncodeAndSliceMm:
+class TestBuildPartialMmEmbeds:
     GRID = torch.tensor([[1, 36, 44], [1, 30, 68]])  # counts [396, 510], merge 2
     TOTAL = 396 + 510
 
@@ -130,26 +152,30 @@ class TestEncodeAndSliceMm:
             self.TOTAL, HIDDEN
         )
 
-    def test_base_returns_no_deepstack(self):
+    def test_base_slices_features_no_deepstack(self):
         feats = self._feats()
-        fake = _fake_qwen(lambda pv, grid_thw=None: feats)
-        tail_feats, deepstack = QwenVL._encode_and_slice_mm(
-            fake, pixel_values=None, grid_thw=self.GRID, tail_starts=[369, 0], merge=2
+        mm = {"image_embeds": feats, "image_grid_thw": self.GRID}
+        out = QwenVL._build_partial_mm_embeds(
+            _base_self(), _partial({"image": [369, 0]}), mm
         )
-        assert deepstack is None
-        assert tail_feats.shape[0] == (396 - 369) + 510
-        assert torch.equal(tail_feats[0], feats[369])
-        assert torch.equal(tail_feats[27], feats[396])  # imgB's first feature
+        assert set(out) == {"image_embeds"}  # base carries no deepstack
+        tail = out["image_embeds"]
+        assert tail.shape[0] == (396 - 369) + 510
+        assert torch.equal(tail[0], feats[369])
+        assert torch.equal(tail[27], feats[396])  # imgB's first feature
 
     def test_qwen3_slices_deepstack_per_layer(self):
         feats = self._feats()
         deepstack_layers = [feats + (i + 1) * 100_000 for i in range(3)]
-        fake = _fake_qwen(lambda pv, grid_thw=None: (feats, deepstack_layers))
-        tail_feats, tail_deepstack = Qwen3VL._encode_and_slice_mm(
-            fake, pixel_values=None, grid_thw=self.GRID, tail_starts=[369, 0], merge=2
-        )
+        mm = {
+            "image_embeds": feats,
+            "image_grid_thw": self.GRID,
+            "deepstack_image_embeds": deepstack_layers,
+        }
+        out = _qwen3_self()._build_partial_mm_embeds(_partial({"image": [369, 0]}), mm)
         expected_rows = (396 - 369) + 510
-        assert tail_feats.shape[0] == expected_rows
+        assert out["image_embeds"].shape[0] == expected_rows
+        tail_deepstack = out["deepstack_image_embeds"]
         assert len(tail_deepstack) == 3
         assert all(layer.shape[0] == expected_rows for layer in tail_deepstack)
         # deepstack is sliced with the same boundaries as the main features.
