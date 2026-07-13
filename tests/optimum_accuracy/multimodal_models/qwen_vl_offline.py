@@ -194,21 +194,8 @@ def main(
     # NOTE: This example supports Qwen2-VL, Qwen2.5-VL, and Qwen3-VL.
     model: str = "Qwen/Qwen3-VL-2B-Instruct",
 ):
-    # number of devices per local rank for main module
-    os.environ["VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK"] = "16"
     llm = LLM(
         model=model,
-        block_size=4096,
-        max_model_len=8192,
-        max_num_seqs=1,
-        additional_config={
-            "rbln_config": {
-                "device": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
-                "visual": {
-                    "device": [16],
-                },
-            }
-        },
     )
     tokenizer = AutoTokenizer.from_pretrained(model)
     inputs = generate_prompts_image(num_input_prompt, model)

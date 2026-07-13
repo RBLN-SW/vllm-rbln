@@ -354,7 +354,7 @@ jobs:
 
       - name : Run Qwen2.5_VL (V1)
         run: >
-          python3 examples/optimum/multimodal_models/qwen_vl_offline.py
+          python3 tests/optimum_accuracy/multimodal_models/qwen_vl_offline.py
           --num_input_prompt ${{ env.NUM_INPUT_PROMPT }}
           --model ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/qwen2_5-vl-7b-32k-b4-kv16k
 
