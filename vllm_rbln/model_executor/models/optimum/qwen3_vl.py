@@ -152,6 +152,32 @@ class RBLNOptimumQwen3VLForConditionalGeneration(
         )
         return inputs_embeds, visual_pos_mask, deepstack_embeds
 
+    def _build_partial_inputs_embeds_from_cache(
+        self, model_input: ModelInputForRBLN, cached_mm_outputs: list[dict]
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        """EC analogue of ``_build_partial_inputs_embeds``: tail inputs_embeds +
+        packed deepstack/visual mask, sourced from the encoder cache."""
+        inputs_embeds, masks, deepstacks = self._scatter_cached_tail_mm(
+            model_input, cached_mm_outputs
+        )
+        visual_pos_mask, deepstack_embeds = self._pack_partial_deepstack(
+            masks, deepstacks
+        )
+        return inputs_embeds, visual_pos_mask, deepstack_embeds
+
+    def _slice_cached_side_to_tail(self, caches, spec, counts, starts):
+        """Tail-slice the cached per-layer deepstack for one modality (EC)."""
+        key = f"deepstack_{spec.name}_embeds"
+        present = [c for c in caches if c.get(key) is not None]
+        if not present:
+            return None
+        num_layers = len(present[0][key])
+        layers = [
+            torch.cat([c[key][layer].to(self.dtype) for c in present], dim=0)
+            for layer in range(num_layers)
+        ]
+        return [self._slice_to_tail(layer, counts, starts) for layer in layers]
+
     def build_prefill_inputs_from_cache(
         self,
         input_ids: torch.Tensor,

@@ -434,6 +434,14 @@ class RblnPlatform(Platform):
         if not vllm_config.cache_config.enable_prefix_caching:
             return
 
+        # An EC producer runs only the (vision) encoder and never executes the
+        # LLM, so it holds no KV cache. Prefix caching there is a no-op and its
+        # KV-cache manager is only a placeholder, so disable it explicitly.
+        ec = getattr(vllm_config, "ec_transfer_config", None)
+        if ec is not None and ec.is_ec_producer and not ec.is_ec_consumer:
+            cls._disable_prefix_caching(vllm_config, "EC producer (encoder-only)")
+            return
+
         hf_config = vllm_config.model_config.hf_config
         has_sliding_window = cls._uses_sliding_window(hf_config)
 
