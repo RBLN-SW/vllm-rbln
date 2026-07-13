@@ -183,3 +183,4 @@ _version.py
 profile/
 cache_dir/
 rsd_cache_dir/
+pdd_logs/

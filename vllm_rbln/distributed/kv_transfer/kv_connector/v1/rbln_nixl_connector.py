@@ -47,6 +47,81 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+_EXTERNAL_KV_FORMAT_RAW = "raw"
+_EXTERNAL_KV_FORMAT_RUNTIME_PRIVATE = "host_visible_hnd_to_runtime_private"
+_EXTERNAL_KV_SOURCE_DTYPES = ("auto", "float16", "bfloat16")
+
+
+def _encode_fp16_values_to_rbln_runtime_private(tensor: torch.Tensor) -> torch.Tensor:
+    bits = tensor.view(torch.uint16).to(torch.int32)
+    sign = bits & 0x8000
+    exp = (bits >> 10) & 0x1F
+    mant = bits & 0x03FF
+    abs_bits = bits & 0x7FFF
+
+    private_bits = torch.zeros_like(bits)
+
+    normal = (abs_bits != 0) & (exp != 0)
+    private_exp = exp + 16
+    private_mant = (mant >> 1) + (mant & 1)
+    carry = private_mant >> 9
+    private_exp = private_exp + carry
+    private_mant = private_mant & 0x01FF
+    normal_bits = sign | (private_exp << 9) | private_mant
+    private_bits[normal] = normal_bits[normal]
+
+    subnormal = (abs_bits != 0) & (exp == 0)
+    if subnormal.any():
+        subnormal_mant = mant[subnormal]
+        p = torch.floor(torch.log2(subnormal_mant.to(torch.float32))).to(torch.int32)
+        leading = torch.bitwise_left_shift(torch.ones_like(p), p)
+        subnormal_exp = p + 7
+        subnormal_private_mant = (subnormal_mant - leading) << (9 - p)
+        subnormal_bits = (
+            sign[subnormal] | (subnormal_exp << 9) | subnormal_private_mant
+        )
+        private_bits[subnormal] = subnormal_bits
+
+    return private_bits.to(torch.uint16)
+
+
+def _convert_external_kv_to_rbln_runtime_private(
+    tensor: torch.Tensor,
+    source_dtype: str = "auto",
+) -> torch.Tensor:
+    source_dtype = source_dtype.lower()
+    if source_dtype not in _EXTERNAL_KV_SOURCE_DTYPES:
+        raise ValueError(
+            "Unsupported rbln_external_kv_source_dtype: "
+            f"{source_dtype}. Expected one of {_EXTERNAL_KV_SOURCE_DTYPES}."
+        )
+    if tensor.element_size() != 2:
+        raise ValueError(
+            "RBLN external KV runtime-private conversion expects 16-bit input, "
+            f"got {tensor.dtype}."
+        )
+
+    if source_dtype == "auto":
+        if tensor.dtype == torch.float16:
+            source_dtype = "float16"
+        elif tensor.dtype == torch.bfloat16:
+            source_dtype = "bfloat16"
+        else:
+            raise ValueError(
+                f"{tensor.dtype}"
+            )
+
+    raw_bits = tensor.view(torch.uint16)
+    if source_dtype == "float16":
+        fp16_values = raw_bits.view(torch.float16)
+    else:
+        fp16_values = raw_bits.view(torch.bfloat16).to(torch.float16)
+
+    private_bits = _encode_fp16_values_to_rbln_runtime_private(fp16_values)
+    if tensor.dtype == torch.uint16:
+        return private_bits
+    return private_bits.view(torch.float16)
+
 
 class RblnNixlConnector(NixlConnector):
     def __init__(
@@ -241,6 +316,114 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
         super().__init__(vllm_config, engine_id, kv_cache_config)
 
         self.use_host_buffer = self.kv_buffer_device == "cpu"
+        self.kv_transfer_config = vllm_config.kv_transfer_config
+        assert self.kv_transfer_config is not None
+        self.external_kv_format = str(
+            self.kv_transfer_config.get_from_extra_config(
+                "rbln_external_kv_format", _EXTERNAL_KV_FORMAT_RAW
+            )
+        ).lower()
+        self.external_kv_source_dtype = str(
+            self.kv_transfer_config.get_from_extra_config(
+                "rbln_external_kv_source_dtype", "auto"
+            )
+        ).lower()
+        if self.external_kv_format not in (
+            _EXTERNAL_KV_FORMAT_RAW,
+            _EXTERNAL_KV_FORMAT_RUNTIME_PRIVATE,
+        ):
+            raise ValueError(
+                "Unsupported rbln_external_kv_format: "
+                f"{self.external_kv_format}."
+            )
+        if self.external_kv_source_dtype not in _EXTERNAL_KV_SOURCE_DTYPES:
+            raise ValueError(
+                "Unsupported rbln_external_kv_source_dtype: "
+                f"{self.external_kv_source_dtype}."
+            )
+        if self.external_kv_format == _EXTERNAL_KV_FORMAT_RUNTIME_PRIVATE:
+            logger.debug(
+                "Enabled RBLN external KV conversion: format=%s, source_dtype=%s",
+                self.external_kv_format,
+                self.external_kv_source_dtype,
+            )
+
+    def _remote_nixl_memory_type(self) -> str:
+        assert self.kv_transfer_config is not None
+        configured = self.kv_transfer_config.get_from_extra_config(
+            "remote_nixl_memory_type", None
+        )
+        if configured is not None:
+            return configured
+        if self.use_host_buffer and self.nixl_memory_type == "DRAM":
+            return "VRAM"
+        return self.nixl_memory_type
+
+    def _local_xfer_desc_calls_before_remote(self, remote_engine_id: str) -> int:
+        kv_topo = getattr(self, "kv_topo", None)
+        if kv_topo is None:
+            return 0
+
+        tp_ratio = kv_topo.tp_ratio_from_engine_id(remote_engine_id)
+        if (
+            tp_ratio < 0
+            and not self.use_mla
+            and tp_ratio not in self.src_xfer_handles_by_tp_ratio
+        ):
+            return -tp_ratio
+        return 0
+
+    def _remember_remote_agent_shape(
+        self,
+        remote_engine_id: str,
+        remote_tp_size: int,
+        remote_block_size: int,
+    ) -> None:
+        if remote_engine_id not in self._tp_size:
+            self._tp_size[remote_engine_id] = remote_tp_size
+        if remote_engine_id not in self._block_size:
+            self._block_size[remote_engine_id] = remote_block_size
+
+    def add_remote_agent(
+        self,
+        nixl_agent_meta,
+        remote_tp_rank: int = 0,
+        remote_tp_size: int = 1,
+    ) -> str:
+        remote_memory_type = self._remote_nixl_memory_type()
+        if remote_memory_type == self.nixl_memory_type:
+            return super().add_remote_agent(
+                nixl_agent_meta, remote_tp_rank, remote_tp_size
+            )
+
+        self._remember_remote_agent_shape(
+            nixl_agent_meta.engine_id,
+            remote_tp_size,
+            nixl_agent_meta.block_size,
+        )
+        local_calls_remaining = self._local_xfer_desc_calls_before_remote(
+            nixl_agent_meta.engine_id
+        )
+        remote_call_done = False
+        get_xfer_descs = self.nixl_wrapper.get_xfer_descs
+
+        def get_xfer_descs_with_remote_memory_type(blocks_data, memory_type):
+            nonlocal local_calls_remaining, remote_call_done
+            if local_calls_remaining > 0:
+                local_calls_remaining -= 1
+                return get_xfer_descs(blocks_data, memory_type)
+            if not remote_call_done:
+                remote_call_done = True
+                return get_xfer_descs(blocks_data, remote_memory_type)
+            return get_xfer_descs(blocks_data, memory_type)
+
+        self.nixl_wrapper.get_xfer_descs = get_xfer_descs_with_remote_memory_type
+        try:
+            return super().add_remote_agent(
+                nixl_agent_meta, remote_tp_rank, remote_tp_size
+            )
+        finally:
+            self.nixl_wrapper.get_xfer_descs = get_xfer_descs
 
     def initialize_host_xfer_buffer(self, kv_caches: dict[str, torch.Tensor]) -> None:
         """
@@ -269,3 +452,36 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
             return
         assert self.use_host_buffer
         self.copy_blocks = copy_operation
+
+    def sync_recved_kv_to_device(self, req_id, meta):
+        if self.external_kv_format == _EXTERNAL_KV_FORMAT_RUNTIME_PRIVATE:
+            block_ids = meta.local_physical_block_ids
+            for layer_name, kv_cache in self.host_xfer_buffers.items():
+                block_slice = (
+                    slice(None),
+                    block_ids,
+                    *[slice(None) for _ in range(kv_cache.ndim - 2)],
+                )
+                logger.debug(
+                    "Converting external KV for %s: source_dtype=%s, shape=%s",
+                    layer_name,
+                    self.external_kv_source_dtype,
+                    tuple(kv_cache[block_slice].shape),
+                )
+                kv_cache[block_slice] = _convert_external_kv_to_rbln_runtime_private(
+                    kv_cache[block_slice],
+                    self.external_kv_source_dtype,
+                )
+
+        super().sync_recved_kv_to_device(req_id, meta)
+
+    def get_finished(self) -> tuple[set[str], set[str]]:
+        failed_recv_reqs = set(self._failed_recv_reqs)
+        for req_id in failed_recv_reqs:
+            self._recving_metadata.pop(req_id, None)
+        self._failed_recv_reqs.difference_update(failed_recv_reqs)
+
+        done_sending, done_recving = super().get_finished()
+        if failed_recv_reqs:
+            done_recving = (done_recving or set()) | failed_recv_reqs
+        return done_sending, done_recving
