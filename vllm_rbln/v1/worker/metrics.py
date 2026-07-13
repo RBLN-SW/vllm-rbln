@@ -212,6 +212,12 @@ class PerformanceTracker:
         self.decode_metrics = StepMetrics()
         self.prefill_metrics_by_request_id = PrefillMetricsByRequestID()
         self.padded_decode_metrics = StepMetrics()
+        # Decode steps split per batch bucket.
+        self.decode_metrics_by_bucket: dict[int, StepMetrics] = defaultdict(
+            StepMetrics
+        )
+        # Cold-start steps; counted but excluded from the steady-state metrics.
+        self.cold_start_count = 0
 
     def check_dummy_request(self, request_ids: list[str] | None) -> bool:
         if request_ids:
@@ -269,6 +275,7 @@ class PerformanceTracker:
         prepare_time: int | None = None,
         padded_decode: bool = False,
         request_ids: list[str] | None = None,
+        decode_bucket: int | None = None,
     ):
         """Record decode step metrics."""
         if self.check_dummy_request(request_ids):
@@ -282,8 +289,22 @@ class PerformanceTracker:
             ccl_time,
             prepare_time,
         )
+        # Mirror the (non-padded) DECODE line so per-bucket tables sum to it.
+        if decode_bucket is not None and not padded_decode:
+            self.decode_metrics_by_bucket[decode_bucket].add_measurement(
+                latency,
+                token_count,
+                host_time,
+                device_time,
+                ccl_time,
+                prepare_time,
+            )
 
     def record(self, report: "StepReport") -> None:
+        # Cold-start steps are only counted, never folded into steady metrics.
+        if report.is_cold_start:
+            self.cold_start_count += 1
+            return
         if report.is_prefill:
             self.record_prefill(
                 report.latency,
@@ -304,6 +325,7 @@ class PerformanceTracker:
                 prepare_time=report.prepare_time,
                 padded_decode=report.padded_decode,
                 request_ids=report.request_ids,
+                decode_bucket=report.decode_bucket,
             )
 
     def _show_per_request_prefill(self) -> None:
@@ -338,10 +360,26 @@ class PerformanceTracker:
 
         # Decode stats
         self.decode_metrics.show_stats("DECODE")
+
+        # Per-bucket decode stats (skipped for a single bucket)
+        if len(self.decode_metrics_by_bucket) >= 2:
+            logger.info("-" * 40)
+            for bucket in sorted(self.decode_metrics_by_bucket):
+                self.decode_metrics_by_bucket[bucket].show_stats(
+                    f"DECODE (batch bucket {bucket})"
+                )
         logger.info("-" * 40)
 
         # Padded decode stats
         self.padded_decode_metrics.show_stats("PADDED DECODE")
+
+        # Excluded cold-start count
+        if self.cold_start_count:
+            logger.info("-" * 40)
+            logger.info(
+                "Cold-start steps excluded from steady-state metrics: %d",
+                self.cold_start_count,
+            )
         logger.info("=" * 80)
 
 
@@ -362,6 +400,8 @@ class StepReport:
     is_prefill: bool = False
     padded_decode: bool = False
     request_ids: list[str] | None = None
+    is_cold_start: bool = False
+    decode_bucket: int | None = None
 
     @classmethod
     def from_reports(
@@ -374,6 +414,8 @@ class StepReport:
         is_prefill: bool = False,
         padded_decode: bool = False,
         request_ids: list[str] | None = None,
+        is_cold_start: bool = False,
+        decode_bucket: int | None = None,
     ) -> "StepReport":
         host_time = device_time = ccl_time = prepare_time = None
         if reports:
@@ -394,6 +436,8 @@ class StepReport:
             is_prefill=is_prefill,
             padded_decode=padded_decode,
             request_ids=request_ids,
+            is_cold_start=is_cold_start,
+            decode_bucket=decode_bucket,
         )
 
     def merged_with(self, other: "StepReport | None") -> "StepReport":
@@ -423,6 +467,8 @@ def collect_metrics(
     end_time: float,
     reports: list[dict],
     token_count: int,
+    is_cold_start: bool = False,
+    decode_bucket: int | None = None,
 ) -> None:
     performance_tracker.record(
         StepReport.from_reports(
@@ -431,5 +477,7 @@ def collect_metrics(
             reports,
             token_count=token_count,
             is_prefill=is_prefill,
+            is_cold_start=is_cold_start,
+            decode_bucket=decode_bucket,
         )
     )

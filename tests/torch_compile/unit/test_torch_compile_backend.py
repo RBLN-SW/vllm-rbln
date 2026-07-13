@@ -17,7 +17,9 @@ import logging
 import pytest
 import torch
 
+import vllm_rbln.torch_compile_backend as backend_module
 from vllm_rbln.torch_compile_backend import (
+    hot_path_count,
     logged_rbln_backend,
     set_warmup_active,
 )
@@ -117,3 +119,38 @@ def test_logged_rbln_backend(
 
     # Second line is the timing line.
     assert "done:" in done.getMessage()
+
+
+@pytest.fixture
+def reset_hot_path_count():
+    saved = backend_module._hot_path_compiles
+    backend_module._hot_path_compiles = 0
+    yield
+    backend_module._hot_path_compiles = saved
+
+
+def test_hot_path_count_tracks_only_non_warmup_calls(
+    monkeypatch, reset_warmup_flag, reset_hot_path_count
+):
+    """hot_path_count() counts backend invocations outside the warm-up window."""
+    monkeypatch.setattr(
+        "vllm_rbln.torch_compile_backend._rbln_backend",
+        lambda gm, inputs, **kwargs: None,
+    )
+    gm = torch.fx.symbolic_trace(torch.nn.Identity())
+    inputs = [torch.empty((1,), dtype=torch.int32)]
+
+    assert hot_path_count() == 0
+
+    # Warm-up invocations are not hot-path compiles.
+    set_warmup_active(True)
+    logged_rbln_backend(gm, inputs)
+    logged_rbln_backend(gm, inputs)
+    assert hot_path_count() == 0
+
+    # Invocations after warm-up count as hot-path compiles.
+    set_warmup_active(False)
+    logged_rbln_backend(gm, inputs)
+    assert hot_path_count() == 1
+    logged_rbln_backend(gm, inputs)
+    assert hot_path_count() == 2

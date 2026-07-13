@@ -25,6 +25,7 @@ from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
 import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
+from vllm_rbln.torch_compile_backend import logged_rbln_backend
 from vllm_rbln.v1.sample.rbln_sampler import (
     build_compile_options,
     resolve_compile_context,
@@ -79,7 +80,7 @@ class RBLNRejectionSampler(RejectionSampler):
             rbln_rejection_sample,
             dynamic=False,
             fullgraph=True,
-            backend="rbln",
+            backend=logged_rbln_backend,
             options=options,
         )
 

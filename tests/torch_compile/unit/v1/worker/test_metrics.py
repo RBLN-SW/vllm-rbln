@@ -28,6 +28,7 @@ from vllm_rbln.v1.worker.metrics import (
     PerformanceTracker,
     PrefillMetricsByRequestID,
     StepMetrics,
+    StepReport,
 )
 
 
@@ -370,6 +371,107 @@ class TestRecordDecode:
         assert pt.decode_metrics.host_times == []
 
 
+class TestDecodeBucketRouting:
+    """Decode steps carrying a bucket size are also tallied per bucket."""
+
+    def test_no_bucket_leaves_by_bucket_empty(self):
+        pt = PerformanceTracker()
+        pt.record_decode(0.01, 1)
+        assert pt.decode_metrics_by_bucket == {}
+
+    def test_bucket_routed_to_its_own_metrics(self):
+        pt = PerformanceTracker()
+        pt.record_decode(0.01, 1, decode_bucket=4)
+        pt.record_decode(0.02, 1, decode_bucket=4)
+        pt.record_decode(0.03, 1, decode_bucket=8)
+        assert set(pt.decode_metrics_by_bucket) == {4, 8}
+        assert pt.decode_metrics_by_bucket[4].get_call_counts() == 2
+        assert pt.decode_metrics_by_bucket[8].get_call_counts() == 1
+        # Aggregate decode_metrics still sees every step.
+        assert pt.decode_metrics.get_call_counts() == 3
+
+    def test_padded_decode_not_routed_by_bucket(self):
+        """Padded decodes stay out of the per-bucket tables so those tables
+        sum to the (non-padded) DECODE line."""
+        pt = PerformanceTracker()
+        pt.record_decode(0.01, 1, padded_decode=True, decode_bucket=16)
+        assert pt.padded_decode_metrics.get_call_counts() == 1
+        assert pt.decode_metrics_by_bucket == {}
+
+    def test_record_routes_bucket_from_report(self):
+        pt = PerformanceTracker()
+        pt.record(StepReport(latency=0.01, token_count=1, decode_bucket=4))
+        pt.record(StepReport(latency=0.02, token_count=1, decode_bucket=8))
+        assert set(pt.decode_metrics_by_bucket) == {4, 8}
+
+    def test_prefill_report_never_routed_to_bucket(self):
+        pt = PerformanceTracker()
+        pt.record(
+            StepReport(
+                latency=0.5,
+                token_count=100,
+                is_prefill=True,
+                request_ids=["req-1"],
+            )
+        )
+        assert pt.decode_metrics_by_bucket == {}
+
+
+class TestColdStartExclusion:
+    """Cold-start steps are only counted, never folded into steady metrics."""
+
+    def test_cold_start_excluded_from_decode(self):
+        pt = PerformanceTracker()
+        pt.record(StepReport(latency=0.01, token_count=1, is_cold_start=True))
+        assert pt.cold_start_count == 1
+        assert pt.decode_metrics.get_call_counts() == 0
+        assert pt.decode_metrics_by_bucket == {}
+
+    def test_cold_start_excluded_from_prefill(self):
+        pt = PerformanceTracker()
+        pt.record(
+            StepReport(
+                latency=0.5,
+                token_count=100,
+                is_prefill=True,
+                is_cold_start=True,
+                request_ids=["req-1"],
+            )
+        )
+        assert pt.cold_start_count == 1
+        assert pt.prefill_metrics.get_call_counts() == 0
+
+    def test_steady_step_not_counted_as_cold_start(self):
+        pt = PerformanceTracker()
+        pt.record(StepReport(latency=0.01, token_count=1, decode_bucket=4))
+        assert pt.cold_start_count == 0
+        assert pt.decode_metrics.get_call_counts() == 1
+
+    def test_cold_start_metadata_survives_merge(self):
+        """merged_with keeps the model report's cold-start/bucket metadata."""
+        model = StepReport(latency=0.01, token_count=1, is_cold_start=True,
+                           decode_bucket=8)
+        sampler = StepReport(latency=0.002)
+        combined = model.merged_with(sampler)
+        assert combined.is_cold_start is True
+        assert combined.decode_bucket == 8
+        assert combined.latency == pytest.approx(0.012)
+
+    def test_sampler_side_cold_start_excluded_after_merge(self):
+        """A sampler-only compile is caught by re-checking is_cold_start after
+        the merge (merged_with keeps the model's pre-sampler snapshot)."""
+        pt = PerformanceTracker()
+        model = StepReport(latency=0.01, token_count=1, is_cold_start=False,
+                           decode_bucket=4)
+        sampler = StepReport(latency=0.002)
+        combined = model.merged_with(sampler)
+        combined.is_cold_start = True  # counter grew during the sampler
+        pt.record(combined)
+        assert pt.cold_start_count == 1
+        assert pt.decode_metrics.get_call_counts() == 0
+        assert pt.decode_metrics_by_bucket == {}
+
+
 class TestPrintFinalStats:
     def test_print_with_name(self):
         pt = PerformanceTracker(name="gpu-0")
@@ -393,6 +495,41 @@ class TestPrintFinalStats:
         pt.record_decode(0.01, 1, padded_decode=True)
         # Should not raise
         pt.print_final_stats()
+
+    def test_per_bucket_table_only_when_multiple_buckets(self):
+        pt = PerformanceTracker()
+        pt.record_decode(0.01, 1, decode_bucket=4)
+        with patch("vllm_rbln.v1.worker.metrics.logger") as mock_logger:
+            pt.print_final_stats()
+        calls = " ".join(str(c) for c in mock_logger.info.call_args_list)
+        # Single bucket -> no per-bucket breakdown.
+        assert "batch bucket" not in calls
+
+    def test_per_bucket_table_shown_for_multiple_buckets(self):
+        pt = PerformanceTracker()
+        pt.record_decode(0.01, 1, decode_bucket=4)
+        pt.record_decode(0.02, 1, decode_bucket=8)
+        with patch("vllm_rbln.v1.worker.metrics.logger") as mock_logger:
+            pt.print_final_stats()
+        calls = " ".join(str(c) for c in mock_logger.info.call_args_list)
+        assert "batch bucket 4" in calls
+        assert "batch bucket 8" in calls
+
+    def test_cold_start_line_shown_when_nonzero(self):
+        pt = PerformanceTracker()
+        pt.record(StepReport(latency=0.01, token_count=1, is_cold_start=True))
+        with patch("vllm_rbln.v1.worker.metrics.logger") as mock_logger:
+            pt.print_final_stats()
+        calls = " ".join(str(c) for c in mock_logger.info.call_args_list)
+        assert "Cold-start steps excluded" in calls
+
+    def test_cold_start_line_absent_when_zero(self):
+        pt = PerformanceTracker()
+        pt.record_decode(0.01, 1)
+        with patch("vllm_rbln.v1.worker.metrics.logger") as mock_logger:
+            pt.print_final_stats()
+        calls = " ".join(str(c) for c in mock_logger.info.call_args_list)
+        assert "Cold-start" not in calls
 
 
 class TestMetricsFileOutput:

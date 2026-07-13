@@ -126,6 +126,7 @@ from vllm_rbln.logger import init_logger
 from vllm_rbln.lora.inputs import LoRAInputs
 from vllm_rbln.lora.mask import LoRAMask
 from vllm_rbln.torch_compile_backend import (
+    hot_path_count,
     logged_rbln_backend,
     set_warmup_active,
 )
@@ -644,6 +645,10 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self._pending_model_report: StepReport | None = None
         self.e2e_start_time: float = 0.0
         self.e2e_end_time: float = 0.0
+        # Per-step scratch for cold-start detection and decode-bucket labeling;
+        # set in execute_model, read when building metric reports.
+        self._hp0: int = 0
+        self._step_decode_bucket: int | None = None
 
         self.dummy_run_state: DummyRunState | None = None
 
@@ -2262,6 +2267,9 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 if model_report is not None
                 else sampler_report
             )
+            # merged_with keeps the model report's pre-sampler snapshot; re-check
+            # so a sampler-side compile also counts.
+            combined.is_cold_start = hot_path_count() > self._hp0
             self.performance_tracker.record(combined)
 
         return sampler_output
@@ -3320,6 +3328,9 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         num_padded_tokens: int | None = None,
     ) -> Union[ModelRunnerOutput, IntermediateTensors, None]:
         self.e2e_start_time = time.perf_counter()
+        # Start-of-step snapshot for cold-start detection; bucket set later.
+        self._hp0 = hot_path_count()
+        self._step_decode_bucket = None
         if self.execute_model_state is not None:
             raise RuntimeError(
                 "State error: sample_tokens() must be called "
@@ -3463,6 +3474,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         assert input_ids is not None
         is_prefill_phase = self.is_prefill_phase()
+        # Buckets only apply to decode; stash for the E2E report in sample_tokens.
+        self._step_decode_bucket = None if is_prefill_phase else batch_bucket_size
 
         # Padding length for speculative decoding by num_speculative_tokens.
         # Gate on the cross-DP max (max_tokens_per_req_across_dp) so that a
@@ -3694,6 +3707,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     is_prefill=is_prefill_phase,
                     padded_decode=padded_decode,
                     request_ids=self.input_batch.req_ids,
+                    is_cold_start=hot_path_count() > self._hp0,
+                    decode_bucket=self._step_decode_bucket,
                 )
 
         with record_function_or_nullcontext("Postprocess"):
@@ -3988,6 +4003,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 end_time=self.e2e_end_time,
                 reports=[],
                 token_count=scheduler_output.total_num_scheduled_tokens,
+                is_cold_start=hot_path_count() > self._hp0,
+                decode_bucket=self._step_decode_bucket,
             )
 
         if not self.use_async_scheduling:

@@ -37,6 +37,10 @@ logger = init_logger(__name__)
 
 _warmup_active: bool = False
 
+# Monotonic count of hot-path (post-warm-up) rbln_backend calls; the model
+# runner snapshots it around a step to detect a cold-start compile.
+_hot_path_compiles: int = 0
+
 _SELF_FILENAME = os.path.abspath(__file__)
 
 _CALL_CHAIN_DEPTH = 3
@@ -45,6 +49,11 @@ _CALL_CHAIN_DEPTH = 3
 def set_warmup_active(active: bool) -> None:
     global _warmup_active
     _warmup_active = active
+
+
+def hot_path_count() -> int:
+    """Total rbln_backend invocations seen outside the warm-up window."""
+    return _hot_path_compiles
 
 
 def _summarize_inputs(inputs: list[Any]) -> str:
@@ -78,6 +87,9 @@ def _find_call_chain(depth: int = _CALL_CHAIN_DEPTH) -> str:
 
 def logged_rbln_backend(graph_module: Any, inputs: list[Any], **kwargs: Any) -> Any:
     in_warmup = _warmup_active
+    if not in_warmup:
+        global _hot_path_compiles
+        _hot_path_compiles += 1
     log = logger.info if in_warmup else logger.warning
     phase = "warm-up" if in_warmup else "HOT PATH"
     log(
