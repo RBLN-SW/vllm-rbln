@@ -40,12 +40,19 @@ from .model_base import (
     RBLNOptimumModelBase,
     RBLNOptimumMultimodalMixin,
 )
+from .qwen_vl_prefill import QwenVLPartialPrefixMixin, iter_modalities
 
 logger = init_logger(__name__)
 
 
 class RBLNOptimumQwenVLForConditionalGeneration(
-    RBLNOptimumModelBase, RBLNOptimumMultimodalMixin, RBLNOptimumDecoderMixin, ABC
+    # QwenVLPartialPrefixMixin first so its _build_partial_prefill_forward_inputs
+    # overrides the generic one in RBLNOptimumMultimodalMixin.
+    QwenVLPartialPrefixMixin,
+    RBLNOptimumModelBase,
+    RBLNOptimumMultimodalMixin,
+    RBLNOptimumDecoderMixin,
+    ABC,
 ):
     """
     Unified class for both Qwen2-VL and Qwen2.5-VL models.
@@ -131,31 +138,22 @@ class RBLNOptimumQwenVLForConditionalGeneration(
             "attention_mask": attention_mask,
         }
 
-        # Per modality: (parsed input, grid key, pixel key, embeds key, label).
-        for mm_input, grid_key, pixel_key, embeds_key, label in (
-            (image_input, "image_grid_thw", "pixel_values", "image_embeds", "image"),
-            (
-                video_input,
-                "video_grid_thw",
-                "pixel_values_videos",
-                "video_embeds",
-                "video",
-            ),
-        ):
+        for spec, mm_input in iter_modalities(image_input, video_input):
             if mm_input is None:
-                preprocess_args[pixel_key] = None
-                preprocess_args[grid_key] = None
+                preprocess_args[spec.pixel_key] = None
+                preprocess_args[spec.grid_key] = None
                 continue
-            preprocess_args[grid_key] = mm_input[grid_key]
-            if mm_input.get("type") == embeds_key:
+            preprocess_args[spec.grid_key] = mm_input[spec.grid_key]
+            if mm_input.get("type") == spec.embeds_key:
                 logger.info(
-                    "Prefill: using cached %s embeddings (encoder skipped)", label
+                    "Prefill: using cached %s embeddings (encoder skipped)",
+                    spec.name,
                 )
-                preprocess_args[embeds_key] = mm_input[embeds_key]
-                preprocess_args[pixel_key] = None
+                preprocess_args[spec.embeds_key] = mm_input[spec.embeds_key]
+                preprocess_args[spec.pixel_key] = None
             else:
-                logger.info("Prefill: running visual encoder (%s)", pixel_key)
-                preprocess_args[pixel_key] = mm_input[pixel_key]
+                logger.info("Prefill: running visual encoder (%s)", spec.pixel_key)
+                preprocess_args[spec.pixel_key] = mm_input[spec.pixel_key]
 
         # Add model-specific parameters
         self._add_model_specific_args(preprocess_args, video_input)
@@ -179,13 +177,10 @@ class RBLNOptimumQwenVLForConditionalGeneration(
             "input_ids": input_ids,
             "attention_mask": attention_mask,
         }
-        for mm_input, grid_key, pixel_key in (
-            (image_input, "image_grid_thw", "pixel_values"),
-            (video_input, "video_grid_thw", "pixel_values_videos"),
-        ):
-            preprocess_args[pixel_key] = None
-            preprocess_args[grid_key] = (
-                mm_input[grid_key] if mm_input is not None else None
+        for spec, mm_input in iter_modalities(image_input, video_input):
+            preprocess_args[spec.pixel_key] = None
+            preprocess_args[spec.grid_key] = (
+                mm_input[spec.grid_key] if mm_input is not None else None
             )
         # second_per_grid_ts (video, Qwen2.5-VL) feeds get_rope_index too.
         self._add_model_specific_args(preprocess_args, video_input)
@@ -251,13 +246,11 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         if merge_size is None:
             return
 
-        for mm_input, grid_key, token_id in (
-            (image_input, "image_grid_thw", getattr(config, "image_token_id", None)),
-            (video_input, "video_grid_thw", getattr(config, "video_token_id", None)),
-        ):
+        for spec, mm_input in iter_modalities(image_input, video_input):
+            token_id = getattr(config, spec.token_attr, None)
             if mm_input is None or token_id is None:
                 continue
-            grid_thw = mm_input.get(grid_key)
+            grid_thw = mm_input.get(spec.grid_key)
             if grid_thw is None:
                 continue
             num_embed_tokens = int(self._mm_feature_counts(grid_thw, merge_size).sum())
@@ -297,162 +290,6 @@ class RBLNOptimumQwenVLForConditionalGeneration(
             visual_pos_mask=prefill_params.get("visual_pos_mask"),
             deepstack_embeds=prefill_params.get("deepstack_embeds"),
         )
-
-    def _build_partial_prefill_forward_inputs(
-        self,
-        model_input: ModelInputForRBLN,
-        mrope_position_deltas: dict[str, float],
-    ) -> ModelInputForRBLN:
-        """Prefill for a partial prefix-cache hit (boundary may end inside an
-        image). The cached prefix KV is reused via ``copy_cached_kv_blocks``;
-        here we build the uncached tail's embeds/positions (and Qwen3-VL
-        deepstack). Done manually, not via ``_preprocess_prefill``, whose
-        ``get_rope_index`` chokes on the tail's orphaned image-pad tokens.
-        """
-        inputs_embeds, visual_pos_mask, deepstack_embeds = (
-            self._build_partial_inputs_embeds(model_input)
-        )
-        position_embed, rope_deltas = self._recompute_full_mrope_position(model_input)
-        mrope_position_deltas[model_input.running_requests_ids[0]] = rope_deltas.item()
-        return replace(
-            model_input,
-            inputs_embeds=inputs_embeds,
-            position_embed=position_embed,
-            visual_pos_mask=visual_pos_mask,
-            deepstack_embeds=deepstack_embeds,
-        )
-
-    def _scatter_tail_mm(
-        self, model_input: ModelInputForRBLN
-    ) -> tuple[
-        torch.Tensor,
-        dict[str, torch.Tensor | None],
-        dict[str, list[torch.Tensor] | None],
-    ]:
-        """Scatter each kept item's uncached-tail features into the tail embeds.
-
-        Returns ``(inputs_embeds, masks, sides)``: per-modality tail placeholder
-        masks and encoder side outputs (deepstack for Qwen3-VL, else ``None``).
-        """
-        partial = model_input.partial_prefix
-        assert partial is not None
-        tail_ids = model_input.input_tokens
-        inputs_embeds = self.model.embed_tokens(tail_ids).to(
-            self.model.rbln_config.dtype
-        )
-
-        mm_kwargs = model_input.multi_modal_kwargs or {}
-        tail_starts = partial.mm_embed_tail_starts or {}
-        image_input = self._parse_and_validate_image_input(**mm_kwargs)
-        video_input = self._parse_and_validate_video_input(**mm_kwargs)
-
-        config = self.model.config
-        merge = config.vision_config.spatial_merge_size
-        # (modality, parsed input, pixel key, grid key, placeholder token id)
-        modalities = (
-            (
-                "image",
-                image_input,
-                "pixel_values",
-                "image_grid_thw",
-                config.image_token_id,
-            ),
-            (
-                "video",
-                video_input,
-                "pixel_values_videos",
-                "video_grid_thw",
-                config.video_token_id,
-            ),
-        )
-        masks: dict[str, torch.Tensor | None] = {"image": None, "video": None}
-        sides: dict[str, list[torch.Tensor] | None] = {"image": None, "video": None}
-        for modality, mm_input, pixel_key, grid_key, token_id in modalities:
-            if mm_input is None:
-                continue
-            tail_feats, side = self._encode_and_slice_mm(
-                pixel_values=mm_input[pixel_key],
-                grid_thw=mm_input[grid_key],
-                tail_starts=tail_starts.get(modality, []),
-                merge=merge,
-            )
-            mask = tail_ids == token_id
-            inputs_embeds[mask] = tail_feats.to(inputs_embeds.dtype)
-            masks[modality] = mask
-            sides[modality] = side
-        return inputs_embeds, masks, sides
-
-    def _build_partial_inputs_embeds(
-        self, model_input: ModelInputForRBLN
-    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-        """Tail ``(inputs_embeds, visual_pos_mask, deepstack_embeds)``. Base has
-        no extras (``None``); Qwen3-VL overrides to pack deepstack.
-        """
-        inputs_embeds, _masks, _sides = self._scatter_tail_mm(model_input)
-        return inputs_embeds, None, None
-
-    @staticmethod
-    def _slice_to_tail(
-        feats: torch.Tensor, counts: list[int], tail_starts: list[int]
-    ) -> torch.Tensor:
-        """Concatenate each item's features cut to its tail: item ``i`` keeps
-        ``feats[item_i][tail_starts[i]:]`` (``feats`` = items concatenated)."""
-        parts = []
-        offset = 0
-        for count, tail_start in zip(counts, tail_starts):
-            parts.append(feats[offset : offset + count][tail_start:])
-            offset += count
-        return torch.cat(parts, dim=0)
-
-    def _encode_and_slice_mm(
-        self,
-        *,
-        pixel_values: torch.Tensor,
-        grid_thw: torch.Tensor,
-        tail_starts: list[int],
-        merge: int,
-    ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
-        """Encode whole items, slice each to its tail. Returns ``(tail_feats,
-        tail_deepstack)``; base has no deepstack (``None``), Qwen3-VL overrides.
-        """
-        feats = self.model.visual(pixel_values, grid_thw=grid_thw)
-        counts = self._mm_feature_counts(grid_thw, merge).tolist()
-        assert len(counts) == len(tail_starts), (
-            f"kept-item count mismatch: {len(counts)} grids vs "
-            f"{len(tail_starts)} tail starts"
-        )
-        return self._slice_to_tail(feats, counts, tail_starts), None
-
-    def _recompute_full_mrope_position(
-        self, model_input: ModelInputForRBLN
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Tail ``position_embed`` for a partial hit: MRoPE needs the whole
-        layout, so compute positions over the full prompt (encoder skipped) and
-        slice to the tail. Also returns full-sequence ``rope_deltas`` for decode.
-        """
-        partial = model_input.partial_prefix
-        assert partial is not None
-        full_input_ids = partial.full_input_tokens
-        num_cached = partial.num_cached_tokens
-
-        image_input = None
-        video_input = None
-        if partial.mrope_mm_kwargs:
-            image_input = self._parse_and_validate_image_input(
-                **partial.mrope_mm_kwargs
-            )
-            video_input = self._parse_and_validate_video_input(
-                **partial.mrope_mm_kwargs
-            )
-
-        attention_mask = torch.ones_like(full_input_ids)
-        params = self._compute_mrope_position(
-            full_input_ids, attention_mask, image_input, video_input
-        )
-        # position_embed: [2, batch, 1, N, head_dim]; slice the sequence (dim=-2)
-        # to the uncached tail.
-        position_embed = params["position_embed"][..., num_cached:, :]
-        return position_embed, params["rope_deltas"]
 
     def compute_decode_position_embed(
         self,
