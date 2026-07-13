@@ -41,8 +41,6 @@ class RBLNOptimumQwen3VLForConditionalGeneration(
     ``_pack_deepstack_from_mm``.
     """
 
-    # --- Model-variant contract (override) ---
-
     def _add_model_specific_args(self, preprocess_args: dict, video_input: Any):
         """Qwen3-VL doesn't need additional arguments"""
         pass
@@ -59,8 +57,6 @@ class RBLNOptimumQwen3VLForConditionalGeneration(
             video_grid_thw=video_grid_thw,
             second_per_grid_ts=second_per_grid_ts,
         )
-
-    # --- Multimodal encoding (override) ---
 
     def _process_image_input(self, image_input) -> dict:
         result = {}
@@ -87,8 +83,6 @@ class RBLNOptimumQwen3VLForConditionalGeneration(
             if second_per_grid_ts is not None:
                 result["second_per_grid_ts"] = second_per_grid_ts
         return result
-
-    # --- Prefill entry points (override) ---
 
     def _build_full_prefill_forward_inputs(
         self,
@@ -214,8 +208,6 @@ class RBLNOptimumQwen3VLForConditionalGeneration(
             params["deepstack_embeds"] = deepstack_embeds
         return params
 
-    # --- Prefill shared building blocks (override) ---
-
     def _cache_to_mm(self, cached_mm_outputs: list[dict]) -> dict:
         """Also carry the producer's cached per-layer deepstack."""
         mm = super()._cache_to_mm(cached_mm_outputs)
@@ -251,8 +243,6 @@ class RBLNOptimumQwen3VLForConditionalGeneration(
                 self._slice_to_tail(layer, counts, starts) for layer in layers
             ]
         return sliced
-
-    # --- Deepstack helpers (Qwen3-VL only) ---
 
     def _pack_deepstack_from_mm(
         self, input_ids: torch.Tensor, mm: dict
@@ -314,8 +304,6 @@ class RBLNOptimumQwen3VLForConditionalGeneration(
             deepstack_visual.squeeze(0) if deepstack_visual is not None else None
         )
         return visual_pos_mask, deepstack_embeds
-
-    # --- Forward ---
 
     def forward(self, model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
         """Prefill forward that feeds visual_pos_mask + deepstack to the prefill

@@ -89,8 +89,6 @@ class RBLNOptimumQwenVLForConditionalGeneration(
     Automatically detects model type based on the model configuration.
     """
 
-    # --- Construction & accessors ---
-
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality.startswith("image"):
@@ -124,8 +122,6 @@ class RBLNOptimumQwenVLForConditionalGeneration(
 
     def get_language_model(self):
         return self.model
-
-    # --- Model-variant contract (abstract) ---
 
     @abstractmethod
     def _add_model_specific_args(self, preprocess_args: dict, video_input: Any):
@@ -166,8 +162,6 @@ class RBLNOptimumQwenVLForConditionalGeneration(
     def _create_video_embedding_inputs(self, video_embeds, video_grid_thw) -> Any:
         """Create video embedding inputs based on model type"""
         pass
-
-    # --- Multimodal input parsing & encoding ---
 
     def _parse_and_validate_image_input(self, **kwargs: Any) -> Any | None:
         pixel_values = kwargs.pop("pixel_values", None)
@@ -253,8 +247,6 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         result.update(self._process_image_input(image_input))
         result.update(self._process_video_input(video_input))
         return result
-
-    # --- Prefill entry points ---
 
     def _build_full_prefill_forward_inputs(
         self,
@@ -360,8 +352,6 @@ class RBLNOptimumQwenVLForConditionalGeneration(
             "position_embed": position_embed,
             "cache_position": cache_position,
         }
-
-    # --- Prefill shared building blocks ---
 
     def _cache_to_mm(self, cached_mm_outputs: list[dict]) -> dict:
         """Merge the producer's per-item cached encoder outputs into the same
@@ -517,8 +507,6 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         """Per-item feature/placeholder count from ``grid_thw`` (patches merged
         ``merge_size x merge_size``, 1:1 token<->feature)."""
         return grid_thw.prod(dim=-1) // (merge_size**2)
-
-    # --- Decode & forward ---
 
     def compute_decode_position_embed(
         self,
