@@ -264,16 +264,11 @@ class RBLNOptimumQwenVLForConditionalGeneration(
             num_placeholders = int((input_ids == token_id).sum())
             self._assert_mm_tokens_match(num_placeholders, num_embed_tokens)
 
-    def build_prefill_forward_inputs(
+    def _build_full_prefill_forward_inputs(
         self,
         model_input: ModelInputForRBLN,
         mrope_position_deltas: dict[str, float],
     ) -> ModelInputForRBLN:
-        if model_input.partial_prefix is not None:
-            return self._build_partial_prefill_forward_inputs(
-                model_input, mrope_position_deltas
-            )
-
         input_ids = model_input.input_tokens
         image_input = None
         video_input = None

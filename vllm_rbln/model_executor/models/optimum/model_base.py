@@ -481,16 +481,28 @@ class RBLNOptimumMultimodalMixin(SupportsMultiModal):
     def build_prefill_forward_inputs(
         self,
         model_input: ModelInputForRBLN,
-        # Unused here; kept for a uniform signature with the MRoPE override
-        # (e.g. Qwen-VL), which records per-request rope deltas for decode.
         mrope_position_deltas: dict[str, float],
     ) -> ModelInputForRBLN:
-        # Dispatch partial vs full prefill, mirroring the Qwen-VL override.
+        """Dispatch full vs partial prefix-cache prefill. Shared by every MM
+        model; subclasses override the ``_build_*_prefill_forward_inputs``
+        builders, not this dispatch.
+
+        ``mrope_position_deltas`` is unused in the base builders but forwarded
+        so MRoPE overrides (e.g. Qwen-VL) can record per-request rope deltas.
+        """
         if model_input.partial_prefix is not None:
             return self._build_partial_prefill_forward_inputs(
                 model_input, mrope_position_deltas
             )
+        return self._build_full_prefill_forward_inputs(
+            model_input, mrope_position_deltas
+        )
 
+    def _build_full_prefill_forward_inputs(
+        self,
+        model_input: ModelInputForRBLN,
+        mrope_position_deltas: dict[str, float],
+    ) -> ModelInputForRBLN:
         multimodal_embeddings = self.embed_multimodal(
             **(model_input.multi_modal_kwargs or {})
         )
@@ -501,7 +513,6 @@ class RBLNOptimumMultimodalMixin(SupportsMultiModal):
     def _build_partial_prefill_forward_inputs(
         self,
         model_input: ModelInputForRBLN,
-        # Unused here; see build_prefill_forward_inputs.
         mrope_position_deltas: dict[str, float],
     ) -> ModelInputForRBLN:
         assert model_input.partial_prefix is not None
