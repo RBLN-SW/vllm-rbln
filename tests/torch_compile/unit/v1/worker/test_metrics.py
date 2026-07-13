@@ -449,8 +449,9 @@ class TestColdStartExclusion:
 
     def test_cold_start_metadata_survives_merge(self):
         """merged_with keeps the model report's cold-start/bucket metadata."""
-        model = StepReport(latency=0.01, token_count=1, is_cold_start=True,
-                           decode_bucket=8)
+        model = StepReport(
+            latency=0.01, token_count=1, is_cold_start=True, decode_bucket=8
+        )
         sampler = StepReport(latency=0.002)
         combined = model.merged_with(sampler)
         assert combined.is_cold_start is True
@@ -461,8 +462,9 @@ class TestColdStartExclusion:
         """A sampler-only compile is caught by re-checking is_cold_start after
         the merge (merged_with keeps the model's pre-sampler snapshot)."""
         pt = PerformanceTracker()
-        model = StepReport(latency=0.01, token_count=1, is_cold_start=False,
-                           decode_bucket=4)
+        model = StepReport(
+            latency=0.01, token_count=1, is_cold_start=False, decode_bucket=4
+        )
         sampler = StepReport(latency=0.002)
         combined = model.merged_with(sampler)
         combined.is_cold_start = True  # counter grew during the sampler

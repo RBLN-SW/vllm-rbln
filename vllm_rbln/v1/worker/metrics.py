@@ -213,9 +213,7 @@ class PerformanceTracker:
         self.prefill_metrics_by_request_id = PrefillMetricsByRequestID()
         self.padded_decode_metrics = StepMetrics()
         # Decode steps split per batch bucket.
-        self.decode_metrics_by_bucket: dict[int, StepMetrics] = defaultdict(
-            StepMetrics
-        )
+        self.decode_metrics_by_bucket: dict[int, StepMetrics] = defaultdict(StepMetrics)
         # Cold-start steps; counted but excluded from the steady-state metrics.
         self.cold_start_count = 0
 
