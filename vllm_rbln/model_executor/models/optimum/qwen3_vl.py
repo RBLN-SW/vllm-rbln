@@ -381,23 +381,47 @@ class RBLNOptimumQwen3VLForConditionalGeneration(
         self,
         input_ids: torch.Tensor,
         cached_mm_outputs: list[dict],
-        **kwargs,
+        *,
+        cache_position: torch.Tensor | None = None,
+        running_requests_ids: list[str] | None = None,
+        mrope_position_deltas: dict[str, float] | None = None,
+        model_input: ModelInputForRBLN | None = None,
     ) -> dict:
-        """EC consumer: forward the cached deepstack features, then reuse the
-        common base path."""
+        """EC consumer. Partial hits go through the shared provider path; the
+        full path explicitly injects the cached deepstack into the prefill
+        preprocessing (the encoder is skipped, so it must come from the cache).
+        """
+        if model_input is not None and model_input.partial_prefix is not None:
+            return self._build_partial_prefill_inputs_from_cache(
+                model_input,
+                cached_mm_outputs,
+                cache_position=cache_position,
+                running_requests_ids=running_requests_ids,
+                mrope_position_deltas=mrope_position_deltas,
+            )
+
+        image_input, video_input = self._cache_to_embedding_inputs(cached_mm_outputs)
+        attention_mask = torch.ones_like(input_ids)
+        preprocess_args = self._build_preprocess_args(
+            input_ids, attention_mask, image_input, video_input
+        )
+
         image_caches = [c for c in cached_mm_outputs if "image_embeds" in c]
         video_caches = [c for c in cached_mm_outputs if "video_embeds" in c]
         deepstack_image_embeds, deepstack_video_embeds = self._extract_cached_deepstack(
             image_caches, video_caches
         )
-        extra: dict = {}
         if deepstack_image_embeds is not None:
-            extra["deepstack_image_embeds"] = deepstack_image_embeds
+            preprocess_args["deepstack_image_embeds"] = deepstack_image_embeds
         if deepstack_video_embeds is not None:
-            extra["deepstack_video_embeds"] = deepstack_video_embeds
-        return super().build_prefill_inputs_from_cache(
-            input_ids, cached_mm_outputs, **extra, **kwargs
+            preprocess_args["deepstack_video_embeds"] = deepstack_video_embeds
+
+        outputs = self.model._preprocess_prefill(**preprocess_args)
+        prefill_params = self._build_prefill_params(outputs)
+        self._record_cache_rope_deltas(
+            prefill_params, running_requests_ids, mrope_position_deltas
         )
+        return prefill_params
 
     def _create_video_pixel_inputs(
         self,

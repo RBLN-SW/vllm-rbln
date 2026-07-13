@@ -180,14 +180,28 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         attention_mask,
         image_input,
         video_input,
-        **extra_preprocess_args,
     ) -> dict:
-        """Build ``_preprocess_prefill`` kwargs and run it.
-
-        Cached ``*_embeds`` skip the encoder; ``extra_preprocess_args`` pass
-        through to the model (e.g. Qwen3-VL deepstack embeds).
+        """Build ``_preprocess_prefill`` kwargs and run it. Cached ``*_embeds``
+        skip the encoder.
         """
+        preprocess_args = self._build_preprocess_args(
+            input_ids, attention_mask, image_input, video_input
+        )
+        preprocess_outputs = self.model._preprocess_prefill(**preprocess_args)
+        return self._build_prefill_params(preprocess_outputs)
 
+    def _build_preprocess_args(
+        self,
+        input_ids,
+        attention_mask,
+        image_input,
+        video_input,
+    ) -> dict:
+        """Assemble the per-modality kwargs passed to ``_preprocess_prefill``.
+
+        Qwen3-VL reuses this and adds its cached deepstack kwargs on the EC
+        full-prefill path (see ``build_prefill_inputs_from_cache``).
+        """
         preprocess_args = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
@@ -210,16 +224,8 @@ class RBLNOptimumQwenVLForConditionalGeneration(
                 logger.info("Prefill: running visual encoder (%s)", spec.pixel_key)
                 preprocess_args[spec.pixel_key] = mm_input[spec.pixel_key]
 
-        # Add model-specific parameters
         self._add_model_specific_args(preprocess_args, video_input)
-
-        # Model-specific pass-through args (e.g. Qwen3-VL deepstack embeds).
-        preprocess_args.update(extra_preprocess_args)
-
-        # Call the actual preprocessing
-        preprocess_outputs = self.model._preprocess_prefill(**preprocess_args)
-        prefill_params = self._build_prefill_params(preprocess_outputs)
-        return prefill_params
+        return preprocess_args
 
     def _compute_mrope_position(
         self, input_ids, attention_mask, image_input, video_input
@@ -682,7 +688,6 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         running_requests_ids: list[str] | None = None,
         mrope_position_deltas: dict[str, float] | None = None,
         model_input: ModelInputForRBLN | None = None,
-        **extra_preprocess_args,
     ) -> dict:
         """
         Build prefill_decoder kwargs from cached encoder outputs (EC consumer).
@@ -691,9 +696,6 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         cached embeds are tail-sliced and MRoPE is recomputed over the full
         prompt, mirroring the non-EC partial prefill path. Otherwise the whole
         prompt is rebuilt from the cached embeds.
-
-        ``extra_preprocess_args`` are passed through to ``preprocess_prefill``
-        (e.g. Qwen3-VL forwards its cached deepstack features there).
         """
         if model_input is not None and model_input.partial_prefix is not None:
             return self._build_partial_prefill_inputs_from_cache(
@@ -704,8 +706,22 @@ class RBLNOptimumQwenVLForConditionalGeneration(
                 mrope_position_deltas=mrope_position_deltas,
             )
 
-        model_dtype = self.dtype
+        image_input, video_input = self._cache_to_embedding_inputs(cached_mm_outputs)
+        attention_mask = torch.ones_like(input_ids)
+        prefill_params = self.preprocess_prefill(
+            input_ids, attention_mask, image_input, video_input
+        )
+        self._record_cache_rope_deltas(
+            prefill_params, running_requests_ids, mrope_position_deltas
+        )
+        return prefill_params
 
+    def _cache_to_embedding_inputs(
+        self, cached_mm_outputs: list[dict]
+    ) -> tuple[Any | None, Any | None]:
+        """Rebuild the whole-prompt image/video embedding inputs from the
+        producer's cached encoder outputs (EC full-prefill path)."""
+        model_dtype = self.dtype
         image_caches = [c for c in cached_mm_outputs if "image_embeds" in c]
         video_caches = [c for c in cached_mm_outputs if "video_embeds" in c]
 
@@ -740,15 +756,15 @@ class RBLNOptimumQwenVLForConditionalGeneration(
                     "second_per_grid_ts"
                 ]
 
-        attention_mask = torch.ones_like(input_ids)
-        prefill_params = self.preprocess_prefill(
-            input_ids,
-            attention_mask,
-            image_input,
-            video_input,
-            **extra_preprocess_args,
-        )
+        return image_input, video_input
 
+    @staticmethod
+    def _record_cache_rope_deltas(
+        prefill_params: dict,
+        running_requests_ids: list[str] | None,
+        mrope_position_deltas: dict[str, float] | None,
+    ) -> None:
+        """Pop ``rope_deltas`` off the prefill params and record it for decode."""
         rope_deltas = prefill_params.pop("rope_deltas", None)
         if (
             rope_deltas is not None
@@ -756,8 +772,6 @@ class RBLNOptimumQwenVLForConditionalGeneration(
             and mrope_position_deltas is not None
         ):
             mrope_position_deltas[running_requests_ids[0]] = rope_deltas.item()
-
-        return prefill_params
 
     def _build_partial_prefill_inputs_from_cache(
         self,
