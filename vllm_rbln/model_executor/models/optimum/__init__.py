@@ -38,13 +38,13 @@ from .idefics3 import RBLNOptimumIdefics3ForConditionalGeneration  # noqa: F401
 from .llava import RBLNOptimumLlavaForConditionalGeneration  # noqa: F401
 from .llava_next import RBLNOptimumLlavaNextForConditionalGeneration  # noqa: F401
 from .paligemma import RBLNOptimumPaliGemmaForConditionalGeneration  # noqa: F401
+from .qwen2_vl import (  # noqa: F401
+    RBLNOptimumQwen2_5_VLForConditionalGeneration,
+    RBLNOptimumQwen2VLForConditionalGeneration,
+)
 from .qwen3_vl import (  # noqa: F401
     RBLNOptimumQwen3VLForConditionalGeneration,
     RBLNOptimumQwen3VLMoeForConditionalGeneration,
-)
-from .qwen_vl import (  # noqa: F401
-    RBLNOptimumQwen2_5_VLForConditionalGeneration,
-    RBLNOptimumQwen2VLForConditionalGeneration,
 )
 from .sliding_window import RBLNOptimumSlidingWindowAttentionForCausalLM  # noqa: F401
 from .whisper import RBLNOptimumWhisperForConditionalGeneration  # noqa: F401

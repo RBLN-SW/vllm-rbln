@@ -89,6 +89,8 @@ class RBLNOptimumQwenVLForConditionalGeneration(
     Automatically detects model type based on the model configuration.
     """
 
+    # --- Construction & accessors ---
+
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality.startswith("image"):
@@ -123,51 +125,7 @@ class RBLNOptimumQwenVLForConditionalGeneration(
     def get_language_model(self):
         return self.model
 
-    def _process_image_input(self, image_input) -> dict:
-        result = {}
-        if image_input is not None and image_input.get("type") == "pixel_values":
-            result["image_embeds"] = self.model.visual(
-                image_input["pixel_values"], grid_thw=image_input["image_grid_thw"]
-            )
-            result["image_grid_thw"] = image_input["image_grid_thw"]
-        return result
-
-    def _process_video_input(self, video_input) -> dict:
-        result = {}
-        if video_input is not None and video_input.get("type") == "pixel_values_videos":
-            result["video_embeds"] = self.model.visual(
-                video_input["pixel_values_videos"],
-                grid_thw=video_input["video_grid_thw"],
-            )
-            result["video_grid_thw"] = video_input["video_grid_thw"]
-            second_per_grid_ts = video_input.get("second_per_grid_ts", None)
-            if second_per_grid_ts is not None:
-                result["second_per_grid_ts"] = second_per_grid_ts
-        return result
-
-    def _compute_mrope_position(
-        self, input_ids, attention_mask, image_input, video_input
-    ) -> dict:
-        """MRoPE positions only: run ``get_rope_index`` with grids but no
-        ``pixel_values`` (encoder skipped). Returns ``{position_embed,
-        rope_deltas}``.
-        """
-        preprocess_args = {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-        }
-        for spec, mm_input in iter_modalities(image_input, video_input):
-            preprocess_args[spec.pixel_key] = None
-            preprocess_args[spec.grid_key] = (
-                mm_input[spec.grid_key] if mm_input is not None else None
-            )
-        # second_per_grid_ts (video, Qwen2.5-VL) feeds get_rope_index too.
-        self._add_model_specific_args(preprocess_args, video_input)
-
-        outputs = self.model._preprocess_prefill(**preprocess_args)
-        # outputs[1]/[2] = position_embed/rope_deltas across all variants; the
-        # rest of the tuple's arity differs, so don't unpack it.
-        return {"position_embed": outputs[1], "rope_deltas": outputs[2]}
+    # --- Model-variant contract (abstract) ---
 
     @abstractmethod
     def _add_model_specific_args(self, preprocess_args: dict, video_input: Any):
@@ -209,11 +167,94 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         """Create video embedding inputs based on model type"""
         pass
 
-    @staticmethod
-    def _mm_feature_counts(grid_thw: torch.Tensor, merge_size: int) -> torch.Tensor:
-        """Per-item feature/placeholder count from ``grid_thw`` (patches merged
-        ``merge_size x merge_size``, 1:1 token<->feature)."""
-        return grid_thw.prod(dim=-1) // (merge_size**2)
+    # --- Multimodal input parsing & encoding ---
+
+    def _parse_and_validate_image_input(self, **kwargs: Any) -> Any | None:
+        pixel_values = kwargs.pop("pixel_values", None)
+        image_embeds = kwargs.pop("image_embeds", None)
+        image_grid_thw = kwargs.pop("image_grid_thw", None)
+
+        if pixel_values is None and image_embeds is None:
+            return None
+
+        if pixel_values is not None:
+            return self._create_image_pixel_inputs(
+                pixel_values=pixel_values, image_grid_thw=image_grid_thw
+            )
+
+        if image_embeds is not None:
+            return self._create_image_embedding_inputs(
+                image_embeds=image_embeds, image_grid_thw=image_grid_thw
+            )
+
+        # fallback return if both are None
+        return None
+
+    def _parse_and_validate_video_input(self, **kwargs: object) -> Any | None:
+        pixel_values_videos = kwargs.pop("pixel_values_videos", None)
+        video_embeds = kwargs.pop("video_embeds", None)
+        video_grid_thw = kwargs.pop("video_grid_thw", None)
+        second_per_grid_ts = kwargs.pop("second_per_grid_ts", None)
+
+        if pixel_values_videos is None and video_embeds is None:
+            return None
+
+        if pixel_values_videos is not None:
+            return self._create_video_pixel_inputs(
+                pixel_values_videos, video_grid_thw, second_per_grid_ts
+            )
+
+        if video_embeds is not None:
+            return self._create_video_embedding_inputs(video_embeds, video_grid_thw)
+
+        # fallback return if both are None
+        return None
+
+    def _process_image_input(self, image_input) -> dict:
+        result = {}
+        if image_input is not None and image_input.get("type") == "pixel_values":
+            result["image_embeds"] = self.model.visual(
+                image_input["pixel_values"], grid_thw=image_input["image_grid_thw"]
+            )
+            result["image_grid_thw"] = image_input["image_grid_thw"]
+        return result
+
+    def _process_video_input(self, video_input) -> dict:
+        result = {}
+        if video_input is not None and video_input.get("type") == "pixel_values_videos":
+            result["video_embeds"] = self.model.visual(
+                video_input["pixel_values_videos"],
+                grid_thw=video_input["video_grid_thw"],
+            )
+            result["video_grid_thw"] = video_input["video_grid_thw"]
+            second_per_grid_ts = video_input.get("second_per_grid_ts", None)
+            if second_per_grid_ts is not None:
+                result["second_per_grid_ts"] = second_per_grid_ts
+        return result
+
+    def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings | dict:
+        """Encode the vision inputs into the whole-prompt cacheable unit (per
+        modality: features + grid, plus Qwen3-VL deepstack).
+
+        The single non-EC encode entry point: the EC producer
+        (``_run_encoder_and_save``, which caches the result) and both non-EC
+        prefill builders call it, then scatter (full) or tail-slice + scatter
+        (partial). EC-consumer prefill sources the same representation from the
+        cache via ``_cache_to_mm`` instead.
+        """
+        image_input = self._parse_and_validate_image_input(**kwargs)
+        video_input = self._parse_and_validate_video_input(**kwargs)
+        if image_input is None and video_input is None:
+            return []
+
+        # Merge the per-modality encoder outputs into a single cacheable dict
+        # (consumed on the decode side by build_prefill_inputs_from_cache()).
+        result = {}
+        result.update(self._process_image_input(image_input))
+        result.update(self._process_video_input(video_input))
+        return result
+
+    # --- Prefill entry points ---
 
     def _build_full_prefill_forward_inputs(
         self,
@@ -256,54 +297,90 @@ class RBLNOptimumQwenVLForConditionalGeneration(
             position_embed=position_embed,
         )
 
-    def _build_prefill_position_embed(
-        self, model_input: ModelInputForRBLN
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """MRoPE ``(position_embed, rope_deltas)`` for prefill, unified across
-        full and partial prefix-cache hits.
-
-        Each multimodal item shifts every later token's position, so MRoPE
-        positions depend on the whole prompt layout and cannot be computed from
-        the uncached tail alone. They are therefore always computed over the
-        full prompt with the encoder skipped (grids only), then sliced to the
-        uncached window ``[num_cached:]``:
-
-        - full prefill: ``num_cached == 0``, so the whole prompt is kept;
-        - partial hit: only the uncached tail is kept.
-
-        ``rope_deltas`` is over the full sequence (used for decode positions).
+    def build_prefill_inputs_from_cache(
+        self,
+        input_ids: torch.Tensor,
+        cached_mm_outputs: list[dict],
+        *,
+        cache_position: torch.Tensor | None = None,
+        running_requests_ids: list[str] | None = None,
+        mrope_position_deltas: dict[str, float] | None = None,
+        model_input: ModelInputForRBLN | None = None,
+    ) -> dict:
+        """Build prefill_decoder kwargs from cached encoder outputs (EC
+        consumer). Same flow as the non-EC prefill; the whole-prompt features
+        come from the encoder cache (``_cache_to_mm``) instead of the vision
+        encoder. A partial prefix-cache hit additionally tail-slices via
+        ``_build_partial_prefill_inputs_from_cache``.
         """
-        partial = model_input.partial_prefix
-        if partial is not None:
-            full_input_ids = partial.full_input_tokens
-            num_cached = partial.num_cached_tokens
-            mm_kwargs = partial.mrope_mm_kwargs
-        else:
-            full_input_ids = model_input.input_tokens
-            num_cached = 0
-            mm_kwargs = model_input.multi_modal_kwargs
+        assert model_input is not None
+        if model_input.partial_prefix is not None:
+            return self._build_partial_prefill_inputs_from_cache(
+                model_input,
+                cached_mm_outputs,
+                cache_position=cache_position,
+                running_requests_ids=running_requests_ids,
+                mrope_position_deltas=mrope_position_deltas,
+            )
 
-        image_input = None
-        video_input = None
-        if mm_kwargs:
-            image_input = self._parse_and_validate_image_input(**mm_kwargs)
-            video_input = self._parse_and_validate_video_input(**mm_kwargs)
+        mm = self._cache_to_mm(cached_mm_outputs)
+        inputs_embeds = self.embed_input_ids(input_ids, mm)
+        position_embed, rope_deltas = self._build_prefill_position_embed(model_input)
+        if running_requests_ids and mrope_position_deltas is not None:
+            mrope_position_deltas[running_requests_ids[0]] = rope_deltas.item()
+        return {
+            "inputs_embeds": inputs_embeds,
+            "position_embed": position_embed,
+            "cache_position": cache_position,
+        }
 
-        attention_mask = torch.ones_like(full_input_ids)
-        params = self._compute_mrope_position(
-            full_input_ids, attention_mask, image_input, video_input
-        )
-        # position_embed: [2, batch, 1, N, head_dim]; slice the sequence (dim=-2)
-        # to the uncached window (whole prompt when num_cached == 0).
-        position_embed = params["position_embed"][..., num_cached:, :]
-        return position_embed, params["rope_deltas"]
+    def _build_partial_prefill_inputs_from_cache(
+        self,
+        model_input: ModelInputForRBLN,
+        cached_mm_outputs: list[dict],
+        *,
+        cache_position: torch.Tensor | None,
+        running_requests_ids: list[str] | None,
+        mrope_position_deltas: dict[str, float] | None,
+    ) -> dict:
+        """EC-consumer partial prefill. Same flow as the non-EC
+        ``_build_partial_prefill_forward_inputs``; the tail features come from
+        the encoder cache (``_cache_to_mm``) instead of the vision encoder.
+        """
+        assert model_input.partial_prefix is not None
+        mm = self._cache_to_mm(cached_mm_outputs)
+        mm = self._build_partial_mm_embeds(model_input.partial_prefix, mm)
+        inputs_embeds = self.embed_input_ids(model_input.input_tokens, mm)
+        position_embed, rope_deltas = self._build_prefill_position_embed(model_input)
+        if running_requests_ids and mrope_position_deltas is not None:
+            mrope_position_deltas[running_requests_ids[0]] = rope_deltas.item()
 
-    # --- Partial prefix-cache-hit tail building ----------------------------
-    # Overrides the base RBLNOptimumMultimodalMixin hooks for Qwen-VL's
-    # multi-modality dict representation. ``embed_multimodal`` (encoder) or
-    # ``_cache_to_mm`` (EC cache) produces the whole-prompt features;
-    # ``_build_partial_mm_embeds`` slices them to the uncached tail;
-    # ``embed_input_ids`` scatters them over the placeholder positions.
+        return {
+            "inputs_embeds": inputs_embeds,
+            "position_embed": position_embed,
+            "cache_position": cache_position,
+        }
+
+    # --- Prefill shared building blocks ---
+
+    def _cache_to_mm(self, cached_mm_outputs: list[dict]) -> dict:
+        """Merge the producer's per-item cached encoder outputs into the same
+        whole-prompt representation ``embed_multimodal`` produces (per-modality
+        features concatenated across items). Qwen3-VL overrides to also carry
+        the cached deepstack.
+        """
+        mm: dict = {}
+        for spec in MODALITIES:
+            caches = [c for c in cached_mm_outputs if spec.embeds_key in c]
+            if not caches:
+                continue
+            mm[spec.embeds_key] = torch.cat(
+                [c[spec.embeds_key].to(self.dtype) for c in caches], dim=0
+            )
+            mm[spec.grid_key] = torch.cat(
+                [c[spec.grid_key].to(torch.int64) for c in caches], dim=0
+            )
+        return mm
 
     def _build_partial_mm_embeds(
         self, partial_prefix: Any, multimodal_embeddings: Any
@@ -356,6 +433,72 @@ class RBLNOptimumQwenVLForConditionalGeneration(
             inputs_embeds[mask] = embeds.to(inputs_embeds.dtype)
         return inputs_embeds
 
+    def _build_prefill_position_embed(
+        self, model_input: ModelInputForRBLN
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """MRoPE ``(position_embed, rope_deltas)`` for prefill, unified across
+        full and partial prefix-cache hits.
+
+        Each multimodal item shifts every later token's position, so MRoPE
+        positions depend on the whole prompt layout and cannot be computed from
+        the uncached tail alone. They are therefore always computed over the
+        full prompt with the encoder skipped (grids only), then sliced to the
+        uncached window ``[num_cached:]``:
+
+        - full prefill: ``num_cached == 0``, so the whole prompt is kept;
+        - partial hit: only the uncached tail is kept.
+
+        ``rope_deltas`` is over the full sequence (used for decode positions).
+        """
+        partial = model_input.partial_prefix
+        if partial is not None:
+            full_input_ids = partial.full_input_tokens
+            num_cached = partial.num_cached_tokens
+            mm_kwargs = partial.mrope_mm_kwargs
+        else:
+            full_input_ids = model_input.input_tokens
+            num_cached = 0
+            mm_kwargs = model_input.multi_modal_kwargs
+
+        image_input = None
+        video_input = None
+        if mm_kwargs:
+            image_input = self._parse_and_validate_image_input(**mm_kwargs)
+            video_input = self._parse_and_validate_video_input(**mm_kwargs)
+
+        attention_mask = torch.ones_like(full_input_ids)
+        params = self._compute_mrope_position(
+            full_input_ids, attention_mask, image_input, video_input
+        )
+        # position_embed: [2, batch, 1, N, head_dim]; slice the sequence (dim=-2)
+        # to the uncached window (whole prompt when num_cached == 0).
+        position_embed = params["position_embed"][..., num_cached:, :]
+        return position_embed, params["rope_deltas"]
+
+    def _compute_mrope_position(
+        self, input_ids, attention_mask, image_input, video_input
+    ) -> dict:
+        """MRoPE positions only: run ``get_rope_index`` with grids but no
+        ``pixel_values`` (encoder skipped). Returns ``{position_embed,
+        rope_deltas}``.
+        """
+        preprocess_args = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+        }
+        for spec, mm_input in iter_modalities(image_input, video_input):
+            preprocess_args[spec.pixel_key] = None
+            preprocess_args[spec.grid_key] = (
+                mm_input[spec.grid_key] if mm_input is not None else None
+            )
+        # second_per_grid_ts (video, Qwen2.5-VL) feeds get_rope_index too.
+        self._add_model_specific_args(preprocess_args, video_input)
+
+        outputs = self.model._preprocess_prefill(**preprocess_args)
+        # outputs[1]/[2] = position_embed/rope_deltas across all variants; the
+        # rest of the tuple's arity differs, so don't unpack it.
+        return {"position_embed": outputs[1], "rope_deltas": outputs[2]}
+
     @staticmethod
     def _slice_to_tail(
         feats: torch.Tensor, counts: list[int], tail_starts: list[int]
@@ -368,6 +511,14 @@ class RBLNOptimumQwenVLForConditionalGeneration(
             parts.append(feats[offset : offset + count][tail_start:])
             offset += count
         return torch.cat(parts, dim=0)
+
+    @staticmethod
+    def _mm_feature_counts(grid_thw: torch.Tensor, merge_size: int) -> torch.Tensor:
+        """Per-item feature/placeholder count from ``grid_thw`` (patches merged
+        ``merge_size x merge_size``, 1:1 token<->feature)."""
+        return grid_thw.prod(dim=-1) // (merge_size**2)
+
+    # --- Decode & forward ---
 
     def compute_decode_position_embed(
         self,
@@ -450,152 +601,6 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         if not is_prompt:
             logits = logits[:request_nums]
         return logits
-
-    def _parse_and_validate_image_input(self, **kwargs: Any) -> Any | None:
-        pixel_values = kwargs.pop("pixel_values", None)
-        image_embeds = kwargs.pop("image_embeds", None)
-        image_grid_thw = kwargs.pop("image_grid_thw", None)
-
-        if pixel_values is None and image_embeds is None:
-            return None
-
-        if pixel_values is not None:
-            return self._create_image_pixel_inputs(
-                pixel_values=pixel_values, image_grid_thw=image_grid_thw
-            )
-
-        if image_embeds is not None:
-            return self._create_image_embedding_inputs(
-                image_embeds=image_embeds, image_grid_thw=image_grid_thw
-            )
-
-        # fallback return if both are None
-        return None
-
-    def _parse_and_validate_video_input(self, **kwargs: object) -> Any | None:
-        pixel_values_videos = kwargs.pop("pixel_values_videos", None)
-        video_embeds = kwargs.pop("video_embeds", None)
-        video_grid_thw = kwargs.pop("video_grid_thw", None)
-        second_per_grid_ts = kwargs.pop("second_per_grid_ts", None)
-
-        if pixel_values_videos is None and video_embeds is None:
-            return None
-
-        if pixel_values_videos is not None:
-            return self._create_video_pixel_inputs(
-                pixel_values_videos, video_grid_thw, second_per_grid_ts
-            )
-
-        if video_embeds is not None:
-            return self._create_video_embedding_inputs(video_embeds, video_grid_thw)
-
-        # fallback return if both are None
-        return None
-
-    def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings | dict:
-        """Encode the vision inputs into the whole-prompt cacheable unit (per
-        modality: features + grid, plus Qwen3-VL deepstack).
-
-        The single non-EC encode entry point: the EC producer
-        (``_run_encoder_and_save``, which caches the result) and both non-EC
-        prefill builders call it, then scatter (full) or tail-slice + scatter
-        (partial). EC-consumer prefill sources the same representation from the
-        cache via ``_cache_to_mm`` instead.
-        """
-        image_input = self._parse_and_validate_image_input(**kwargs)
-        video_input = self._parse_and_validate_video_input(**kwargs)
-        if image_input is None and video_input is None:
-            return []
-
-        # Merge the per-modality encoder outputs into a single cacheable dict
-        # (consumed on the decode side by build_prefill_inputs_from_cache()).
-        result = {}
-        result.update(self._process_image_input(image_input))
-        result.update(self._process_video_input(video_input))
-        return result
-
-    def build_prefill_inputs_from_cache(
-        self,
-        input_ids: torch.Tensor,
-        cached_mm_outputs: list[dict],
-        *,
-        cache_position: torch.Tensor | None = None,
-        running_requests_ids: list[str] | None = None,
-        mrope_position_deltas: dict[str, float] | None = None,
-        model_input: ModelInputForRBLN | None = None,
-    ) -> dict:
-        """Build prefill_decoder kwargs from cached encoder outputs (EC
-        consumer). Same flow as the non-EC prefill; the whole-prompt features
-        come from the encoder cache (``_cache_to_mm``) instead of the vision
-        encoder. A partial prefix-cache hit additionally tail-slices via
-        ``_build_partial_prefill_inputs_from_cache``.
-        """
-        assert model_input is not None
-        if model_input.partial_prefix is not None:
-            return self._build_partial_prefill_inputs_from_cache(
-                model_input,
-                cached_mm_outputs,
-                cache_position=cache_position,
-                running_requests_ids=running_requests_ids,
-                mrope_position_deltas=mrope_position_deltas,
-            )
-
-        mm = self._cache_to_mm(cached_mm_outputs)
-        inputs_embeds = self.embed_input_ids(input_ids, mm)
-        position_embed, rope_deltas = self._build_prefill_position_embed(model_input)
-        if running_requests_ids and mrope_position_deltas is not None:
-            mrope_position_deltas[running_requests_ids[0]] = rope_deltas.item()
-        return {
-            "inputs_embeds": inputs_embeds,
-            "position_embed": position_embed,
-            "cache_position": cache_position,
-        }
-
-    def _cache_to_mm(self, cached_mm_outputs: list[dict]) -> dict:
-        """Merge the producer's per-item cached encoder outputs into the same
-        whole-prompt representation ``embed_multimodal`` produces (per-modality
-        features concatenated across items). Qwen3-VL overrides to also carry
-        the cached deepstack.
-        """
-        mm: dict = {}
-        for spec in MODALITIES:
-            caches = [c for c in cached_mm_outputs if spec.embeds_key in c]
-            if not caches:
-                continue
-            mm[spec.embeds_key] = torch.cat(
-                [c[spec.embeds_key].to(self.dtype) for c in caches], dim=0
-            )
-            mm[spec.grid_key] = torch.cat(
-                [c[spec.grid_key].to(torch.int64) for c in caches], dim=0
-            )
-        return mm
-
-    def _build_partial_prefill_inputs_from_cache(
-        self,
-        model_input: ModelInputForRBLN,
-        cached_mm_outputs: list[dict],
-        *,
-        cache_position: torch.Tensor | None,
-        running_requests_ids: list[str] | None,
-        mrope_position_deltas: dict[str, float] | None,
-    ) -> dict:
-        """EC-consumer partial prefill. Same flow as the non-EC
-        ``_build_partial_prefill_forward_inputs``; the tail features come from
-        the encoder cache (``_cache_to_mm``) instead of the vision encoder.
-        """
-        assert model_input.partial_prefix is not None
-        mm = self._cache_to_mm(cached_mm_outputs)
-        mm = self._build_partial_mm_embeds(model_input.partial_prefix, mm)
-        inputs_embeds = self.embed_input_ids(model_input.input_tokens, mm)
-        position_embed, rope_deltas = self._build_prefill_position_embed(model_input)
-        if running_requests_ids and mrope_position_deltas is not None:
-            mrope_position_deltas[running_requests_ids[0]] = rope_deltas.item()
-
-        return {
-            "inputs_embeds": inputs_embeds,
-            "position_embed": position_embed,
-            "cache_position": cache_position,
-        }
 
 
 class RBLNOptimumQwen2_5_VLForConditionalGeneration(
