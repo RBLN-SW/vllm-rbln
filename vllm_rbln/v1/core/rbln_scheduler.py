@@ -765,6 +765,19 @@ class RBLNScheduler(Scheduler):
                         f"decode-ready request {request_id} has "
                         f"num_new_tokens={num_new_tokens} (expected 1)."
                     )
+                    # NOTE(RBLN): This path skips the running-loop backfill guard.
+                    # A decode-ready req enters as a single-token decode (new_n==1,
+                    # asserted above) that the runner backfills to num_spec+1; if the
+                    # num_spec past tokens don't fit the current block the backfill
+                    # would cross into the previous one -> mark unsafe so the batch
+                    # drops to no-spec.
+                    if self.num_spec_tokens > 0:
+                        tokens_used_in_block = (
+                            request.num_computed_tokens % self.block_size
+                        )
+                        required_backfill = self.num_spec_tokens  # (num_spec+1)-1
+                        if required_backfill > tokens_used_in_block:
+                            unsafe_backfill_req_ids.add(request.request_id)
                     # The scheduled new request is added as a decoding-phase req, so
                     # we can continue to schedule the next request.
                     continue
@@ -808,6 +821,15 @@ class RBLNScheduler(Scheduler):
         # safely backfill within its current block, force the whole scheduled decode
         # batch to qlen=1 by trimming logical advance and clearing drafts.
         scheduled_running_req_ids = {req.request_id for req in scheduled_running_reqs}
+        # NOTE(RBLN): Also cover decode-ready reqs that joined via the
+        # not-is_prefill path above (new/resumed: remote-KV or prefix-cache
+        # matches): an unsafe one must force the batch to no-spec too. True
+        # prefill new reqs never enter unsafe_backfill_req_ids, so widening the
+        # set is a no-op for them.
+        scheduled_running_req_ids |= {
+            req.request_id
+            for req in itertools.chain(scheduled_new_reqs, scheduled_resumed_reqs)
+        }
         if unsafe_backfill_req_ids & scheduled_running_req_ids:
             for req in scheduled_running_reqs:
                 req_id = req.request_id
