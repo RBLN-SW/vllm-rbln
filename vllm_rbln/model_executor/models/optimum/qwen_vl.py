@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -78,28 +78,6 @@ def iter_modalities(
     yield MODALITIES[1], video_input
 
 
-# Returns one modality's uncached-tail features for a partial prefix-cache hit,
-# given the modality spec, its per-item uncached-tail start offsets, and the
-# spatial merge size (``None`` when the modality is absent). The two providers
-# below (``_make_encoder_tail_provider`` / ``_make_cache_tail_provider``) differ
-# only in where the features come from — the vision encoder vs the encoder cache.
-TailFeatureFn = Callable[[ModalitySpec, list[int], int], torch.Tensor | None]
-
-
-@dataclass
-class TailFeatureProvider:
-    """Supplies each modality's uncached-tail features for a partial
-    prefix-cache hit. ``features_for(spec, tail_starts, merge)`` returns that
-    modality's tail features (or ``None`` when absent).
-
-    Models with encoder side outputs (Qwen3-VL deepstack) extend this with a
-    subclass that also accumulates those outputs; base Qwen2/2.5-VL needs only
-    ``features_for``.
-    """
-
-    features_for: TailFeatureFn
-
-
 class RBLNOptimumQwenVLForConditionalGeneration(
     RBLNOptimumModelBase,
     RBLNOptimumMultimodalMixin,
@@ -145,13 +123,6 @@ class RBLNOptimumQwenVLForConditionalGeneration(
     def get_language_model(self):
         return self.model
 
-    def _build_prefill_params(self, preprocess_outputs: tuple) -> dict:
-        return {
-            "inputs_embeds": preprocess_outputs[0],
-            "position_embed": preprocess_outputs[1],
-            "rope_deltas": preprocess_outputs[2],
-        }
-
     def _process_image_input(self, image_input) -> dict:
         result = {}
         if image_input is not None and image_input.get("type") == "pixel_values":
@@ -173,59 +144,6 @@ class RBLNOptimumQwenVLForConditionalGeneration(
             if second_per_grid_ts is not None:
                 result["second_per_grid_ts"] = second_per_grid_ts
         return result
-
-    def preprocess_prefill(
-        self,
-        input_ids,
-        attention_mask,
-        image_input,
-        video_input,
-    ) -> dict:
-        """Build ``_preprocess_prefill`` kwargs and run it. Cached ``*_embeds``
-        skip the encoder.
-        """
-        preprocess_args = self._build_preprocess_args(
-            input_ids, attention_mask, image_input, video_input
-        )
-        preprocess_outputs = self.model._preprocess_prefill(**preprocess_args)
-        return self._build_prefill_params(preprocess_outputs)
-
-    def _build_preprocess_args(
-        self,
-        input_ids,
-        attention_mask,
-        image_input,
-        video_input,
-    ) -> dict:
-        """Assemble the per-modality kwargs passed to ``_preprocess_prefill``.
-
-        Qwen3-VL reuses this and adds its cached deepstack kwargs on the EC
-        full-prefill path (see ``build_prefill_inputs_from_cache``).
-        """
-        preprocess_args = {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-        }
-
-        for spec, mm_input in iter_modalities(image_input, video_input):
-            if mm_input is None:
-                preprocess_args[spec.pixel_key] = None
-                preprocess_args[spec.grid_key] = None
-                continue
-            preprocess_args[spec.grid_key] = mm_input[spec.grid_key]
-            if mm_input.get("type") == spec.embeds_key:
-                logger.info(
-                    "Prefill: using cached %s embeddings (encoder skipped)",
-                    spec.name,
-                )
-                preprocess_args[spec.embeds_key] = mm_input[spec.embeds_key]
-                preprocess_args[spec.pixel_key] = None
-            else:
-                logger.info("Prefill: running visual encoder (%s)", spec.pixel_key)
-                preprocess_args[spec.pixel_key] = mm_input[spec.pixel_key]
-
-        self._add_model_specific_args(preprocess_args, video_input)
-        return preprocess_args
 
     def _compute_mrope_position(
         self, input_ids, attention_mask, image_input, video_input
@@ -297,61 +215,23 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         ``merge_size x merge_size``, 1:1 token<->feature)."""
         return grid_thw.prod(dim=-1) // (merge_size**2)
 
-    def _assert_mm_grid_tokens_match(self, input_ids, image_input, video_input) -> None:
-        """Assert each item's grid-derived feature count matches its placeholder
-        count in ``input_ids``. Skipped if token ids / merge size are missing.
-        """
-        config = getattr(self.model, "config", None)
-        vision_config = getattr(config, "vision_config", None)
-        merge_size = getattr(vision_config, "spatial_merge_size", None)
-        if merge_size is None:
-            return
-
-        for spec, mm_input in iter_modalities(image_input, video_input):
-            token_id = getattr(config, spec.token_attr, None)
-            if mm_input is None or token_id is None:
-                continue
-            grid_thw = mm_input.get(spec.grid_key)
-            if grid_thw is None:
-                continue
-            num_embed_tokens = int(self._mm_feature_counts(grid_thw, merge_size).sum())
-            num_placeholders = int((input_ids == token_id).sum())
-            self._assert_mm_tokens_match(num_placeholders, num_embed_tokens)
-
     def _build_full_prefill_forward_inputs(
         self,
         model_input: ModelInputForRBLN,
         mrope_position_deltas: dict[str, float],
     ) -> ModelInputForRBLN:
-        input_ids = model_input.input_tokens
-        image_input = None
-        video_input = None
-        if model_input.multi_modal_kwargs:
-            image_input = self._parse_and_validate_image_input(
-                **model_input.multi_modal_kwargs
-            )
-            video_input = self._parse_and_validate_video_input(
-                **model_input.multi_modal_kwargs
-            )
-
-        self._assert_mm_grid_tokens_match(input_ids, image_input, video_input)
-
-        attention_mask = torch.ones_like(input_ids)
-        prefill_params = self.preprocess_prefill(
-            input_ids, attention_mask, image_input, video_input
-        )
-
-        # Positions come from the shared _build_prefill_position_embed so the
-        # full and partial paths compute MRoPE identically (over the full
-        # prompt, then slice [num_cached:]; num_cached == 0 here keeps the whole
-        # prompt). preprocess_prefill also computed positions internally; that
-        # extra get_rope_index pass is index-only (encoder already ran) and its
-        # position output is discarded here.
+        """Whole-prompt prefill: the partial path without the tail slice
+        (encode the full prompt, then scatter). MRoPE positions come from the
+        shared ``_build_prefill_position_embed`` (num_cached == 0 keeps the
+        whole prompt).
+        """
+        mm = self.embed_multimodal(**(model_input.multi_modal_kwargs or {}))
+        inputs_embeds = self.embed_input_ids(model_input.input_tokens, mm)
         position_embed, rope_deltas = self._build_prefill_position_embed(model_input)
         mrope_position_deltas[model_input.running_requests_ids[0]] = rope_deltas.item()
         return replace(
             model_input,
-            inputs_embeds=prefill_params["inputs_embeds"],
+            inputs_embeds=inputs_embeds,
             position_embed=position_embed,
         )
 
@@ -360,10 +240,14 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         model_input: ModelInputForRBLN,
         mrope_position_deltas: dict[str, float],
     ) -> ModelInputForRBLN:
-        """Build the uncached tail's embeds/positions."""
-        mm_kwargs = model_input.multi_modal_kwargs or {}
-        provider = self._make_encoder_tail_provider(mm_kwargs)
-        inputs_embeds = self._scatter_tail_mm(model_input, provider)
+        """Uncached-tail prefill. Mirrors the base
+        ``RBLNOptimumMultimodalMixin`` flow (encode → tail-slice → scatter),
+        plus the Qwen-VL MRoPE positions.
+        """
+        assert model_input.partial_prefix is not None
+        mm = self.embed_multimodal(**(model_input.multi_modal_kwargs or {}))
+        mm = self._build_partial_mm_embeds(model_input.partial_prefix, mm)
+        inputs_embeds = self.embed_input_ids(model_input.input_tokens, mm)
         position_embed, rope_deltas = self._build_prefill_position_embed(model_input)
         mrope_position_deltas[model_input.running_requests_ids[0]] = rope_deltas.item()
         return replace(
@@ -414,91 +298,62 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         position_embed = params["position_embed"][..., num_cached:, :]
         return position_embed, params["rope_deltas"]
 
-    # --- Partial prefix-cache-hit tail feature providers -------------------
-    # A ``TailFeatureProvider`` yields, per modality, the uncached-tail features
-    # for a partial prefix-cache hit. Its two factories capture the ONLY
-    # difference between the non-EC and EC-consumer partial paths: where
-    # full-item features come from — the vision encoder vs the producer's
-    # encoder cache. ``_scatter_tail_mm`` is otherwise identical for both.
-    # Qwen3-VL overrides the factories to return a ``DeepstackTailProvider``
-    # that also accumulates its deepstack side outputs; base Qwen2/2.5-VL has
-    # no side outputs.
+    # --- Partial prefix-cache-hit tail building ----------------------------
+    # Overrides the base RBLNOptimumMultimodalMixin hooks for Qwen-VL's
+    # multi-modality dict representation. ``embed_multimodal`` (encoder) or
+    # ``_cache_to_mm`` (EC cache) produces the whole-prompt features;
+    # ``_build_partial_mm_embeds`` slices them to the uncached tail;
+    # ``embed_input_ids`` scatters them over the placeholder positions.
 
-    def _make_encoder_tail_provider(self, mm_kwargs: dict) -> TailFeatureProvider:
-        """Tail provider that runs the vision encoder (non-EC path)."""
-        image_input = self._parse_and_validate_image_input(**mm_kwargs)
-        video_input = self._parse_and_validate_video_input(**mm_kwargs)
-        by_name = {
-            MODALITIES[0].name: image_input,
-            MODALITIES[1].name: video_input,
-        }
-
-        def features_for(
-            spec: ModalitySpec, tail_starts: list[int], merge: int
-        ) -> torch.Tensor | None:
-            mm_input = by_name[spec.name]
-            if mm_input is None:
-                return None
-            return self._encode_tail_feats(
-                pixel_values=mm_input[spec.pixel_key],
-                grid_thw=mm_input[spec.grid_key],
-                tail_starts=tail_starts,
-                merge=merge,
-            )
-
-        return TailFeatureProvider(features_for=features_for)
-
-    def _make_cache_tail_provider(
-        self, cached_mm_outputs: list[dict]
-    ) -> TailFeatureProvider:
-        """Tail provider that reads the producer's encoder cache (EC path)."""
-
-        def features_for(
-            spec: ModalitySpec, tail_starts: list[int], merge: int
-        ) -> torch.Tensor | None:
-            caches = [c for c in cached_mm_outputs if spec.embeds_key in c]
-            if not caches:
-                return None
-            feats = torch.cat(
-                [c[spec.embeds_key].to(self.dtype) for c in caches], dim=0
-            )
-            grid_thw = torch.cat(
-                [c[spec.grid_key].to(torch.int64) for c in caches], dim=0
-            )
-            counts = self._mm_feature_counts(grid_thw, merge).tolist()
-            assert len(counts) == len(tail_starts), (
-                f"kept-item count mismatch: {len(counts)} grids vs "
-                f"{len(tail_starts)} tail starts"
-            )
-            return self._slice_to_tail(feats, counts, tail_starts)
-
-        return TailFeatureProvider(features_for=features_for)
-
-    def _scatter_tail_mm(
-        self, model_input: ModelInputForRBLN, provider: TailFeatureProvider
-    ) -> torch.Tensor:
-        """Scatter each kept item's uncached-tail features into the tail embeds,
-        pulling full-item features from ``provider`` (vision encoder or encoder
-        cache), and return the tail ``inputs_embeds``.
+    def _build_partial_mm_embeds(
+        self, partial_prefix: Any, multimodal_embeddings: Any
+    ) -> dict:
+        """Slice each modality's whole-prompt features down to the uncached
+        tail (the encoder already ran over full items). Qwen3-VL overrides to
+        also slice its deepstack side outputs.
         """
-        partial = model_input.partial_prefix
-        assert partial is not None
-        tail_ids = model_input.input_tokens
-        inputs_embeds = self.model.embed_tokens(tail_ids).to(
+        if not isinstance(multimodal_embeddings, dict) or not multimodal_embeddings:
+            return {}
+        mm = multimodal_embeddings
+        tail_starts = partial_prefix.mm_embed_tail_starts or {}
+        merge = self.model.config.vision_config.spatial_merge_size
+        sliced: dict = {}
+        for spec in MODALITIES:
+            if spec.embeds_key not in mm:
+                continue
+            counts = self._mm_feature_counts(mm[spec.grid_key], merge).tolist()
+            starts = tail_starts.get(spec.name, [])
+            assert len(counts) == len(starts), (
+                f"kept-item count mismatch: {len(counts)} grids vs "
+                f"{len(starts)} tail starts"
+            )
+            sliced[spec.embeds_key] = self._slice_to_tail(
+                mm[spec.embeds_key], counts, starts
+            )
+        return sliced
+
+    def embed_input_ids(
+        self,
+        input_ids: torch.Tensor,
+        multimodal_embeddings: Any = None,
+        *,
+        is_multimodal: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Embed the text tokens, then scatter each modality's features over
+        its placeholder positions.
+        """
+        inputs_embeds = self.model.embed_tokens(input_ids).to(
             self.model.rbln_config.dtype
         )
-        tail_starts = partial.mm_embed_tail_starts or {}
-
+        if not isinstance(multimodal_embeddings, dict) or not multimodal_embeddings:
+            return inputs_embeds
         config = self.model.config
-        merge = config.vision_config.spatial_merge_size
         for spec in MODALITIES:
-            tail_feats = provider.features_for(
-                spec, tail_starts.get(spec.name, []), merge
-            )
-            if tail_feats is None:
+            embeds = multimodal_embeddings.get(spec.embeds_key)
+            if embeds is None:
                 continue
-            mask = tail_ids == getattr(config, spec.token_attr)
-            inputs_embeds[mask] = tail_feats.to(inputs_embeds.dtype)
+            mask = input_ids == getattr(config, spec.token_attr)
+            inputs_embeds[mask] = embeds.to(inputs_embeds.dtype)
         return inputs_embeds
 
     @staticmethod
@@ -513,26 +368,6 @@ class RBLNOptimumQwenVLForConditionalGeneration(
             parts.append(feats[offset : offset + count][tail_start:])
             offset += count
         return torch.cat(parts, dim=0)
-
-    def _encode_tail_feats(
-        self,
-        *,
-        pixel_values: torch.Tensor,
-        grid_thw: torch.Tensor,
-        tail_starts: list[int],
-        merge: int,
-    ) -> torch.Tensor:
-        """Run the vision encoder on whole items, then slice each to its
-        uncached tail. Returns the tail features. (Qwen3-VL uses its own
-        ``_encode_tail_feats_and_deepstack`` to also produce deepstack.)
-        """
-        feats = self.model.visual(pixel_values, grid_thw=grid_thw)
-        counts = self._mm_feature_counts(grid_thw, merge).tolist()
-        assert len(counts) == len(tail_starts), (
-            f"kept-item count mismatch: {len(counts)} grids vs "
-            f"{len(tail_starts)} tail starts"
-        )
-        return self._slice_to_tail(feats, counts, tail_starts)
 
     def compute_decode_position_embed(
         self,
@@ -658,14 +493,14 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         return None
 
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings | dict:
-        """Encoder-cache (EC) producer step: encode the vision inputs into the
-        cacheable unit that the consumer later merges back.
+        """Encode the vision inputs into the whole-prompt cacheable unit (per
+        modality: features + grid, plus Qwen3-VL deepstack).
 
-        Used ONLY on the EC producer path (``_run_encoder_and_save``), which is
-        gated to Qwen3-VL (``ec_enabled_model``). The normal prefill path does
-        not call this: it builds inputs via ``preprocess_prefill`` (full) or
-        ``_scatter_tail_mm`` (partial hit). So for Qwen2/2.5-VL, or Qwen3-VL
-        without EC, this method is unreachable.
+        The single non-EC encode entry point: the EC producer
+        (``_run_encoder_and_save``, which caches the result) and both non-EC
+        prefill builders call it, then scatter (full) or tail-slice + scatter
+        (partial). EC-consumer prefill sources the same representation from the
+        cache via ``_cache_to_mm`` instead.
         """
         image_input = self._parse_and_validate_image_input(**kwargs)
         video_input = self._parse_and_validate_video_input(**kwargs)
@@ -689,15 +524,14 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         mrope_position_deltas: dict[str, float] | None = None,
         model_input: ModelInputForRBLN | None = None,
     ) -> dict:
+        """Build prefill_decoder kwargs from cached encoder outputs (EC
+        consumer). Same flow as the non-EC prefill; the whole-prompt features
+        come from the encoder cache (``_cache_to_mm``) instead of the vision
+        encoder. A partial prefix-cache hit additionally tail-slices via
+        ``_build_partial_prefill_inputs_from_cache``.
         """
-        Build prefill_decoder kwargs from cached encoder outputs (EC consumer).
-
-        On a partial prefix-cache hit (``model_input.partial_prefix`` set) the
-        cached embeds are tail-sliced and MRoPE is recomputed over the full
-        prompt, mirroring the non-EC partial prefill path. Otherwise the whole
-        prompt is rebuilt from the cached embeds.
-        """
-        if model_input is not None and model_input.partial_prefix is not None:
+        assert model_input is not None
+        if model_input.partial_prefix is not None:
             return self._build_partial_prefill_inputs_from_cache(
                 model_input,
                 cached_mm_outputs,
@@ -706,72 +540,35 @@ class RBLNOptimumQwenVLForConditionalGeneration(
                 mrope_position_deltas=mrope_position_deltas,
             )
 
-        image_input, video_input = self._cache_to_embedding_inputs(cached_mm_outputs)
-        attention_mask = torch.ones_like(input_ids)
-        prefill_params = self.preprocess_prefill(
-            input_ids, attention_mask, image_input, video_input
-        )
-        self._record_cache_rope_deltas(
-            prefill_params, running_requests_ids, mrope_position_deltas
-        )
-        return prefill_params
-
-    def _cache_to_embedding_inputs(
-        self, cached_mm_outputs: list[dict]
-    ) -> tuple[Any | None, Any | None]:
-        """Rebuild the whole-prompt image/video embedding inputs from the
-        producer's cached encoder outputs (EC full-prefill path)."""
-        model_dtype = self.dtype
-        image_caches = [c for c in cached_mm_outputs if "image_embeds" in c]
-        video_caches = [c for c in cached_mm_outputs if "video_embeds" in c]
-
-        image_input = None
-        video_input = None
-
-        if image_caches:
-            image_embeds = torch.cat(
-                [c["image_embeds"].to(model_dtype) for c in image_caches], dim=0
-            )
-            image_grid_thw = torch.cat(
-                [c["image_grid_thw"].to(torch.int64) for c in image_caches], dim=0
-            )
-            image_input = self._create_image_embedding_inputs(
-                image_embeds=image_embeds, image_grid_thw=image_grid_thw
-            )
-
-        if video_caches:
-            video_embeds = torch.cat(
-                [c["video_embeds"].to(model_dtype) for c in video_caches], dim=0
-            )
-            video_grid_thw = torch.cat(
-                [c["video_grid_thw"].to(torch.int64) for c in video_caches], dim=0
-            )
-            video_input = self._create_video_embedding_inputs(
-                video_embeds=video_embeds, video_grid_thw=video_grid_thw
-            )
-            # Qwen2.5-VL: second_per_grid_ts is per-video metadata; carry the
-            # first feature's value as a best-effort for mixed batches.
-            if "second_per_grid_ts" in video_caches[0]:
-                video_input["second_per_grid_ts"] = video_caches[0][
-                    "second_per_grid_ts"
-                ]
-
-        return image_input, video_input
-
-    @staticmethod
-    def _record_cache_rope_deltas(
-        prefill_params: dict,
-        running_requests_ids: list[str] | None,
-        mrope_position_deltas: dict[str, float] | None,
-    ) -> None:
-        """Pop ``rope_deltas`` off the prefill params and record it for decode."""
-        rope_deltas = prefill_params.pop("rope_deltas", None)
-        if (
-            rope_deltas is not None
-            and running_requests_ids
-            and mrope_position_deltas is not None
-        ):
+        mm = self._cache_to_mm(cached_mm_outputs)
+        inputs_embeds = self.embed_input_ids(input_ids, mm)
+        position_embed, rope_deltas = self._build_prefill_position_embed(model_input)
+        if running_requests_ids and mrope_position_deltas is not None:
             mrope_position_deltas[running_requests_ids[0]] = rope_deltas.item()
+        return {
+            "inputs_embeds": inputs_embeds,
+            "position_embed": position_embed,
+            "cache_position": cache_position,
+        }
+
+    def _cache_to_mm(self, cached_mm_outputs: list[dict]) -> dict:
+        """Merge the producer's per-item cached encoder outputs into the same
+        whole-prompt representation ``embed_multimodal`` produces (per-modality
+        features concatenated across items). Qwen3-VL overrides to also carry
+        the cached deepstack.
+        """
+        mm: dict = {}
+        for spec in MODALITIES:
+            caches = [c for c in cached_mm_outputs if spec.embeds_key in c]
+            if not caches:
+                continue
+            mm[spec.embeds_key] = torch.cat(
+                [c[spec.embeds_key].to(self.dtype) for c in caches], dim=0
+            )
+            mm[spec.grid_key] = torch.cat(
+                [c[spec.grid_key].to(torch.int64) for c in caches], dim=0
+            )
+        return mm
 
     def _build_partial_prefill_inputs_from_cache(
         self,
@@ -782,13 +579,14 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         running_requests_ids: list[str] | None,
         mrope_position_deltas: dict[str, float] | None,
     ) -> dict:
-        """EC-consumer prefill for a partial prefix-cache hit. Mirrors the
-        non-EC ``_build_partial_prefill_forward_inputs``: build the uncached
-        tail's embeds from the cached features and recompute MRoPE positions
-        over the full prompt, sliced to the tail.
+        """EC-consumer partial prefill. Same flow as the non-EC
+        ``_build_partial_prefill_forward_inputs``; the tail features come from
+        the encoder cache (``_cache_to_mm``) instead of the vision encoder.
         """
-        provider = self._make_cache_tail_provider(cached_mm_outputs)
-        inputs_embeds = self._scatter_tail_mm(model_input, provider)
+        assert model_input.partial_prefix is not None
+        mm = self._cache_to_mm(cached_mm_outputs)
+        mm = self._build_partial_mm_embeds(model_input.partial_prefix, mm)
+        inputs_embeds = self.embed_input_ids(model_input.input_tokens, mm)
         position_embed, rope_deltas = self._build_prefill_position_embed(model_input)
         if running_requests_ids and mrope_position_deltas is not None:
             mrope_position_deltas[running_requests_ids[0]] = rope_deltas.item()
