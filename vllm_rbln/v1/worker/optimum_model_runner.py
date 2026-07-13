@@ -561,131 +561,6 @@ class RBLNOptimumModelRunner(
         )
         return model_input, num_scheduled_tokens_np
 
-    def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
-        """
-        Generates the KVCacheSpec by parsing the kv cache format from each
-        Attention module in the static forward context.
-        Returns:
-            KVCacheSpec: A dictionary mapping layer names to their KV cache
-            format. Layers that do not need KV cache are not included.
-        """
-
-        # TODO It is temporary basic attention setting
-        head_size = self.model_config.get_head_size()
-        num_layers = self.model_config.get_num_layers(self.parallel_config)
-        num_kv_heads = self.model_config.get_num_kv_heads(self.parallel_config)
-
-        block_size = self.vllm_config.cache_config.block_size
-        kv_cache_spec: dict[str, KVCacheSpec] = {}
-        for layer_idx in range(num_layers):
-            kv_cache_spec[str(layer_idx)] = FullAttentionSpec(
-                block_size=block_size,
-                num_kv_heads=num_kv_heads,
-                head_size=head_size,
-                dtype=self.kv_cache_dtype,
-            )
-        return kv_cache_spec
-
-    def _iter_kept_mm_features(
-        self,
-        scheduler_output: "SchedulerOutput",
-        num_cached_tokens: int,
-    ) -> Iterator[Any]:
-        """Yield the mm features not entirely inside the prefix cache.
-
-        Shared filter for ``_extract_mm_kwargs`` (encoder batch) and
-        ``_mm_embed_tail_starts`` (tail slice starts) so they agree on kept
-        items and order. A fully-cached item is skipped (its KV is reused).
-        """
-        if not scheduler_output or not self.is_multimodal_raw_input_only_model:
-            return
-        for req in scheduler_output.scheduled_new_reqs:
-            for feature in req.mm_features:
-                if feature.data is None:
-                    continue
-                pos = feature.mm_position
-                if pos.offset + pos.length <= num_cached_tokens:
-                    continue
-                yield feature
-
-    def _extract_mm_kwargs(
-        self,
-        scheduler_output: "SchedulerOutput",
-        num_cached_tokens: int = 0,
-    ) -> BatchedTensorInputs:
-        mm_kwargs = [
-            (feature.modality, feature.data)
-            for feature in self._iter_kept_mm_features(
-                scheduler_output, num_cached_tokens
-            )
-        ]
-        # Input all modalities at once
-        mm_kwargs_combined: BatchedTensorInputs = {}
-        for _, _, mm_kwargs_batch in group_and_batch_mm_kwargs(
-            mm_kwargs,
-            device=self.device,
-            pin_memory=self.pin_memory,
-        ):
-            mm_kwargs_combined.update(mm_kwargs_batch)
-
-        return mm_kwargs_combined
-
-    def _mm_embed_tail_starts(
-        self,
-        scheduler_output: "SchedulerOutput",
-        num_cached_tokens: int,
-    ) -> dict[str, list[int]]:
-        """Per kept item, the first uncached feature index
-        ``max(0, num_cached_tokens - offset)`` -- features before it are in the
-        reused KV, features from it on are re-scattered into the tail. Same items
-        and order as ``_extract_mm_kwargs``.
-        """
-        tail_starts: dict[str, list[int]] = {}
-        for feature in self._iter_kept_mm_features(scheduler_output, num_cached_tokens):
-            pos = feature.mm_position
-            cached_tokens = max(0, num_cached_tokens - pos.offset)
-            # cached_tokens counts placeholder-block tokens, but the tail start is
-            # a feature index. When the block interleaves non-embedding tokens
-            # (idefics3 tile/global separators), is_embed marks the embedding
-            # positions, so the feature index is the True count up to the boundary.
-            if pos.is_embed is None:
-                start = cached_tokens
-            else:
-                start = int(pos.is_embed[:cached_tokens].sum())
-            tail_starts.setdefault(feature.modality, []).append(start)
-        return tail_starts
-
-    def _extract_prefill_mm_inputs(
-        self,
-        scheduler_output: "SchedulerOutput",
-        total_cached_length: int,
-        full_prompt_tokens: np.ndarray,
-    ) -> tuple[BatchedTensorInputs | None, PartialPrefixInfo | None]:
-        """Build the prefill multimodal inputs.
-
-        Returns ``(batched_mm_inputs, partial_prefix)``. ``batched_mm_inputs``
-        encodes the not-fully-cached items; ``partial_prefix`` is set only on a
-        partial hit (``total_cached_length > 0``); see ``PartialPrefixInfo``.
-        """
-        if not self.supports_mm_inputs:
-            return None, None
-        batched_mm_inputs = self._extract_mm_kwargs(
-            scheduler_output, num_cached_tokens=total_cached_length
-        )
-        if total_cached_length <= 0:
-            return batched_mm_inputs, None
-        partial_prefix = PartialPrefixInfo(
-            full_input_tokens=torch.tensor(full_prompt_tokens).unsqueeze(0),
-            num_cached_tokens=total_cached_length,
-            mrope_mm_kwargs=self._extract_mm_kwargs(
-                scheduler_output, num_cached_tokens=0
-            ),
-            mm_embed_tail_starts=self._mm_embed_tail_starts(
-                scheduler_output, total_cached_length
-            ),
-        )
-        return batched_mm_inputs, partial_prefix
-
     def _prepare_prefill(
         self,
         scheduler_output: "RBLNSchedulerOutput",
@@ -815,6 +690,136 @@ class RBLNOptimumModelRunner(
         block_tables = torch.stack(block_tables_list)
 
         return input_tokens, input_positions, block_tables, running_request_ids
+
+    def _extract_prefill_mm_inputs(
+        self,
+        scheduler_output: "SchedulerOutput",
+        total_cached_length: int,
+        full_prompt_tokens: np.ndarray,
+    ) -> tuple[BatchedTensorInputs | None, PartialPrefixInfo | None]:
+        """Build the prefill multimodal inputs.
+
+        Returns ``(batched_mm_inputs, partial_prefix)``. ``batched_mm_inputs``
+        encodes the not-fully-cached items; ``partial_prefix`` is set only on a
+        partial hit (``total_cached_length > 0``); see ``PartialPrefixInfo``.
+        """
+        if not self.supports_mm_inputs:
+            return None, None
+        batched_mm_inputs = self._extract_mm_kwargs(
+            scheduler_output, num_cached_tokens=total_cached_length
+        )
+        if total_cached_length <= 0:
+            return batched_mm_inputs, None
+        partial_prefix = PartialPrefixInfo(
+            full_input_tokens=torch.tensor(full_prompt_tokens).unsqueeze(0),
+            num_cached_tokens=total_cached_length,
+            mrope_mm_kwargs=self._extract_mm_kwargs(
+                scheduler_output, num_cached_tokens=0
+            ),
+            mm_embed_tail_starts=self._mm_embed_tail_starts(
+                scheduler_output, total_cached_length
+            ),
+        )
+        return batched_mm_inputs, partial_prefix
+
+    def _extract_mm_kwargs(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_cached_tokens: int = 0,
+    ) -> BatchedTensorInputs:
+        mm_kwargs = [
+            (feature.modality, feature.data)
+            for feature in self._iter_kept_mm_features(
+                scheduler_output, num_cached_tokens
+            )
+        ]
+        # Input all modalities at once
+        mm_kwargs_combined: BatchedTensorInputs = {}
+        for _, _, mm_kwargs_batch in group_and_batch_mm_kwargs(
+            mm_kwargs,
+            device=self.device,
+            pin_memory=self.pin_memory,
+        ):
+            mm_kwargs_combined.update(mm_kwargs_batch)
+
+        return mm_kwargs_combined
+
+    def _mm_embed_tail_starts(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_cached_tokens: int,
+    ) -> dict[str, list[int]]:
+        """For each kept item, where its uncached part begins.
+
+        When the prefix-cache boundary lands in the middle of an item, the
+        item's leading features are already cached (KV reused) and only the rest
+        need re-scattering into the uncached tail. This returns that split point
+        as a feature index per item, ``max(0, num_cached_tokens - offset)``.
+        Same items and order as ``_extract_mm_kwargs``.
+        """
+        tail_starts: dict[str, list[int]] = {}
+        for feature in self._iter_kept_mm_features(scheduler_output, num_cached_tokens):
+            pos = feature.mm_position
+            cached_tokens = max(0, num_cached_tokens - pos.offset)
+            # cached_tokens is a token count, but we need a feature index. They
+            # match 1:1 for most models, so the count is the index. Some models
+            # (e.g. idefics3) mix non-embedding tokens into the block (tile /
+            # global separators); there, is_embed flags the real feature
+            # positions, so count only those up to the boundary.
+            if pos.is_embed is None:
+                start = cached_tokens
+            else:
+                start = int(pos.is_embed[:cached_tokens].sum())
+            tail_starts.setdefault(feature.modality, []).append(start)
+        return tail_starts
+
+    def _iter_kept_mm_features(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_cached_tokens: int,
+    ) -> Iterator[Any]:
+        """Yield the multimodal items that still need work this step.
+
+        An item whose tokens are all already in the prefix cache is skipped
+        (its KV is reused, so it needs no re-encoding). ``_extract_mm_kwargs``
+        and ``_mm_embed_tail_starts`` both iterate through here, so they see the
+        same items in the same order.
+        """
+        if not scheduler_output or not self.is_multimodal_raw_input_only_model:
+            return
+        for req in scheduler_output.scheduled_new_reqs:
+            for feature in req.mm_features:
+                if feature.data is None:
+                    continue
+                pos = feature.mm_position
+                if pos.offset + pos.length <= num_cached_tokens:
+                    continue
+                yield feature
+
+    def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
+        """
+        Generates the KVCacheSpec by parsing the kv cache format from each
+        Attention module in the static forward context.
+        Returns:
+            KVCacheSpec: A dictionary mapping layer names to their KV cache
+            format. Layers that do not need KV cache are not included.
+        """
+
+        # TODO It is temporary basic attention setting
+        head_size = self.model_config.get_head_size()
+        num_layers = self.model_config.get_num_layers(self.parallel_config)
+        num_kv_heads = self.model_config.get_num_kv_heads(self.parallel_config)
+
+        block_size = self.vllm_config.cache_config.block_size
+        kv_cache_spec: dict[str, KVCacheSpec] = {}
+        for layer_idx in range(num_layers):
+            kv_cache_spec[str(layer_idx)] = FullAttentionSpec(
+                block_size=block_size,
+                num_kv_heads=num_kv_heads,
+                head_size=head_size,
+                dtype=self.kv_cache_dtype,
+            )
+        return kv_cache_spec
 
     def _update_states(self, scheduler_output: "RBLNSchedulerOutput") -> None:
         """Update the cached states and the persistent batch with the scheduler
