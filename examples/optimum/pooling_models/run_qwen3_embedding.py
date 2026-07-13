@@ -59,9 +59,9 @@ def main(
         )
     prompt_list = prompt_list[: num_input_prompt * 2]
 
-    outputs = llm.encode(prompt_list, pooling_task="embed")
+    outputs = llm.embed(prompt_list)
 
-    embeddings = torch.stack([o.outputs.data for o in outputs])
+    embeddings = torch.stack([torch.tensor(o.outputs.embedding) for o in outputs])
     scores = embeddings[:num_input_prompt] @ embeddings[num_input_prompt:].T
 
     print(f"scores: {scores.tolist()}")

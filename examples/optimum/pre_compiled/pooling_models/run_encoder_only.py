@@ -58,14 +58,14 @@ def main(
     p_prompt = get_input_prompts(p_prompt_txt)[:num_input_prompt]
 
     assert len(q_prompt) == len(p_prompt)
-    q_result = llm.encode(q_prompt, pooling_task="embed")
-    p_result = llm.encode(p_prompt, pooling_task="embed")
+    q_result = llm.embed(q_prompt)
+    p_result = llm.embed(p_prompt)
 
     scores = []
 
-    for idx, (q, p) in enumerate(zip(q_result, p_result)):
-        q_embedding = q.outputs.data
-        p_embedding = p.outputs.data
+    for q, p in zip(q_result, p_result):
+        q_embedding = q.outputs.embedding
+        p_embedding = p.outputs.embedding
 
         q_embedding = torch.nn.functional.normalize(q_embedding, p=2, dim=0)
         p_embedding = torch.nn.functional.normalize(p_embedding, p=2, dim=0)
