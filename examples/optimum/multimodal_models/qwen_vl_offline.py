@@ -195,7 +195,7 @@ def main(
     model: str = "Qwen/Qwen3-VL-2B-Instruct",
 ):
     # number of devices per local rank for main module
-    os.environ["VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK"] = "16"
+    os.environ["VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK"] = "8"
     llm = LLM(
         model=model,
         block_size=4096,
