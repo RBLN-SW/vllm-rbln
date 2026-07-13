@@ -58,10 +58,12 @@ def test_get_device_name_returns_npu_name(monkeypatch):
 
 def test_get_device_name_raises_when_npu_none(monkeypatch):
     # On a host without an NPU mounted rebel.get_npu_name() returns None; we
-    # should surface an actionable error pointing at RBLN_TARGET_SOC rather
+    # should surface an actionable error pointing at RBLN_FORCE_NPU_NAME rather
     # than a bare AssertionError.
     monkeypatch.setattr(rebel, "get_npu_name", lambda device_id=0: None)
-    with pytest.raises(RuntimeError, match="RBLN_TARGET_SOC"):
+    monkeypatch.delenv("RBLN_FORCE_NPU_NAME", raising=False)
+    monkeypatch.delenv("RBLN_TARGET_SOC", raising=False)
+    with pytest.raises(RuntimeError, match="RBLN_FORCE_NPU_NAME"):
         RblnPlatform.get_device_name()
 
 

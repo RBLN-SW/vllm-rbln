@@ -14,6 +14,7 @@
 import json
 import math
 import os
+from dataclasses import replace
 from typing import Any
 
 import torch
@@ -474,7 +475,8 @@ class RBLNOptimumMultimodalMixin(SupportsMultiModal):
     def build_prefill_forward_inputs(
         self,
         model_input: ModelInputForRBLN,
-    ) -> tuple[torch.Tensor, torch.Tensor | None, float | None]:
+        mrope_position_deltas: dict[str, float],
+    ) -> ModelInputForRBLN:
         multimodal_embeddings = self.embed_multimodal(
             **(model_input.multi_modal_kwargs or {})
         )
@@ -483,7 +485,7 @@ class RBLNOptimumMultimodalMixin(SupportsMultiModal):
             input_ids,
             multimodal_embeddings,
         )
-        return inputs_embeds, None, None
+        return replace(model_input, inputs_embeds=inputs_embeds)
 
     def compute_decode_position_embed(
         self,
