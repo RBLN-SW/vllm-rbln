@@ -64,8 +64,8 @@ def main(
     scores = []
 
     for q, p in zip(q_result, p_result):
-        q_embedding = q.outputs.embedding
-        p_embedding = p.outputs.embedding
+        q_embedding = torch.tensor(q.outputs.embedding)
+        p_embedding = torch.tensor(p.outputs.embedding)
 
         q_embedding = torch.nn.functional.normalize(q_embedding, p=2, dim=0)
         p_embedding = torch.nn.functional.normalize(p_embedding, p=2, dim=0)
