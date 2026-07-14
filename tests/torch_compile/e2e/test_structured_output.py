@@ -60,6 +60,7 @@ def sampling_kwargs(request: pytest.FixtureRequest) -> dict:
         "temperature": gen_cfg.temperature,
         "top_p": gen_cfg.top_p,
         "top_k": gen_cfg.top_k,
+        "max_tokens": 128,
     }
 
 
