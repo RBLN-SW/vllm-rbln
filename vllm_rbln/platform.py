@@ -103,17 +103,20 @@ class RblnPlatform(Platform):
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
-        # rebel.get_npu_name() returns None on a host without an NPU mounted
-        # (e.g. a CPU-only compile worker) and otherwise falls back to the
-        # RBLN_TARGET_SOC env var. When it is None we cannot determine a target
-        # SOC, so surface an actionable error instead of a bare AssertionError.
-        if not (device_name := rebel.get_npu_name()):
+        # No NPU mounted (e.g., CPU-only compile worker): fall back to the env var
+        # the compiler CI sets - RBLN_FORCE_NPU_NAME (RBLN_TARGET_SOC = legacy).
+        device_name = (
+            rebel.get_npu_name(device_id)
+            or os.environ.get("RBLN_FORCE_NPU_NAME")
+            or os.environ.get("RBLN_TARGET_SOC")
+        )
+        if not device_name:
             raise RuntimeError(
                 "Could not determine the RBLN NPU name "
                 f"(rebel.get_npu_name({device_id}) returned None). On a host "
                 "without an NPU mounted (e.g., a CPU-only compile worker running "
-                "with VLLM_RBLN_COMPILE_ONLY=1), set RBLN_TARGET_SOC to the "
-                "target SOC (e.g., RBLN-CA25) so compilation can target it."
+                "with VLLM_RBLN_COMPILE_ONLY=1), set RBLN_FORCE_NPU_NAME to the "
+                "target NPU (e.g., RBLN-CA25) so compilation can target it."
             )
         return device_name
 

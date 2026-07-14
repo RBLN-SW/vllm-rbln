@@ -34,8 +34,8 @@ torch.compile pipeline). Three things follow from that:
   (the optimum-rbln path) makes ``VLLM_RBLN_COMPILE_ONLY=1`` raise an error.
 * The compile cache must stay enabled (this is where the artifacts land), so
   ``VLLM_DISABLE_COMPILE_CACHE=1`` is rejected in this mode.
-* Without an NPU, ``rebel.get_npu_name()`` returns ``None`` and the target SOC
-  can no longer be auto-detected, so you must set ``RBLN_TARGET_SOC`` (e.g.
+* Without an NPU, ``rebel.get_npu_name()`` returns ``None`` and the target NPU
+  can no longer be auto-detected, so you must set ``RBLN_FORCE_NPU_NAME`` (e.g.
   ``RBLN-CA25``) to tell the compiler what to target.
 
 The compiled runtime lives on a dummy device, so generation is intentionally
@@ -43,8 +43,8 @@ skipped here -- the only useful output of this run is the populated cache.
 
 Usage
 -----
-    # Set the SOC you ultimately want to serve on, then run:
-    RBLN_TARGET_SOC=RBLN-CA25 python examples/cpu_only_compile.py \
+    # Set the NPU you ultimately want to serve on, then run:
+    RBLN_FORCE_NPU_NAME=RBLN-CA25 python examples/cpu_only_compile.py \
         --model Qwen/Qwen3-0.6B
 
 The artifacts are written under ``$VLLM_CACHE_ROOT/rbln`` (default
@@ -65,10 +65,10 @@ def parse_args():
     parser.add_argument("--block-size", type=int, default=1024)
     parser.add_argument("--enable-expert-parallel", action="store_true")
     parser.add_argument(
-        "--target-soc",
+        "--target-npu",
         type=str,
-        default=os.environ.get("RBLN_TARGET_SOC", "RBLN-CA25"),
-        help="Target RBLN SOC to compile for (sets RBLN_TARGET_SOC). Required "
+        default=os.environ.get("RBLN_FORCE_NPU_NAME", "RBLN-CA25"),
+        help="Target RBLN NPU to compile for (sets RBLN_FORCE_NPU_NAME). Required "
         "because no NPU is mounted to auto-detect it.",
     )
     return parser.parse_args()
@@ -84,7 +84,7 @@ def main():
     # compile-only only applies to the vLLM-native (torch.compile) path, not
     # the optimum-rbln path, so select it explicitly.
     os.environ["VLLM_RBLN_USE_VLLM_MODEL"] = "1"
-    os.environ["RBLN_TARGET_SOC"] = args.target_soc
+    os.environ["RBLN_FORCE_NPU_NAME"] = args.target_npu
     # The cache is where compiled artifacts are written; it must stay enabled.
     os.environ.setdefault("VLLM_DISABLE_COMPILE_CACHE", "0")
 
@@ -94,7 +94,7 @@ def main():
 
     cache_dir = os.path.join(vllm_envs.VLLM_CACHE_ROOT, "rbln")
     print(
-        f"[cpu-only-compile] target SOC={args.target_soc!r}, "
+        f"[cpu-only-compile] target NPU={args.target_npu!r}, "
         f"writing artifacts to {cache_dir!r}"
     )
 
