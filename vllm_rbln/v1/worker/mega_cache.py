@@ -58,16 +58,35 @@ def _rebel_major_minor(version: str | None = None) -> str:
 # compile_factors already drops LOCAL_RANK / ports but keeps VLLM_DP_RANK*.
 _PER_WORKER_ENV_DROP = frozenset({"VLLM_DP_RANK", "VLLM_DP_RANK_LOCAL"})
 
+# rbln vars that never change the compiled graph (runtime, scheduling, KV
+# transfer). COMPILE_ONLY must stay here so a CPU-compiled bundle hits on the
+# NPU serving host.
+_RUNTIME_ENV_DROP = frozenset(
+    {
+        "VLLM_RBLN_ENABLE_WARM_UP",
+        "VLLM_RBLN_METRICS",
+        "VLLM_RBLN_METRICS_FILE",
+        "VLLM_RBLN_NUMA",
+        "VLLM_RBLN_PROFILER",
+        "VLLM_RBLN_AUTO_PORT",
+        "VLLM_RBLN_SUB_BLOCK_CACHE",
+        "VLLM_RBLN_SORT_BATCH",
+        "VLLM_RBLN_DISABLE_OFFLOAD",
+        "VLLM_RBLN_NIXL_SWA_VIEW_OPT",
+        "VLLM_RBLN_COMPILE_ONLY",
+    }
+)
+
 
 def _compile_env_factors() -> str:
     """vLLM's worker-aligned compile env hash (rbln vars are merged into that
-    registry via rbln_envs; per-worker vars are dropped so all ranks share one
-    signature)."""
+    registry via rbln_envs; per-worker and runtime-only vars are dropped so all
+    ranks share one signature)."""
     import vllm.envs as vllm_envs
     from vllm.config.utils import hash_factors
 
     factors = vllm_envs.compile_factors()
-    for name in _PER_WORKER_ENV_DROP:
+    for name in _PER_WORKER_ENV_DROP | _RUNTIME_ENV_DROP:
         factors.pop(name, None)
     return hash_factors(factors)
 
