@@ -62,35 +62,14 @@ _PER_WORKER_ENV_DROP = frozenset({"VLLM_DP_RANK", "VLLM_DP_RANK_LOCAL"})
 def _compile_env_factors() -> str:
     """vLLM's worker-aligned compile env hash (rbln vars are merged into that
     registry via rbln_envs; per-worker vars are dropped so all ranks share one
-    signature). Fall back to the full registry on old vLLM."""
+    signature)."""
     import vllm.envs as vllm_envs
+    from vllm.config.utils import hash_factors
 
-    if hasattr(vllm_envs, "compile_factors"):
-        try:
-            from vllm.config.utils import hash_factors
-
-            factors = vllm_envs.compile_factors()
-            for name in _PER_WORKER_ENV_DROP:
-                factors.pop(name, None)
-            return hash_factors(factors)
-        except Exception as exc:  # pylint: disable=broad-exception-caught
-            logger.warning(
-                "mega-cache compile_factors failed, using env registry "
-                "fallback: %s",
-                exc,
-            )
-    from vllm_rbln import rbln_envs
-
-    parts = []
-    for name in sorted(rbln_envs.environment_variables):
-        if name in _PER_WORKER_ENV_DROP:
-            continue
-        try:
-            value = rbln_envs.environment_variables[name]()
-        except Exception:  # pylint: disable=broad-exception-caught
-            value = "<err>"
-        parts.append(f"{name}={value}")
-    return "|".join(parts)
+    factors = vllm_envs.compile_factors()
+    for name in _PER_WORKER_ENV_DROP:
+        factors.pop(name, None)
+    return hash_factors(factors)
 
 
 def _stable_compute_hash(vllm_config) -> str:
