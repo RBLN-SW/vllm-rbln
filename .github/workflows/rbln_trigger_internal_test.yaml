@@ -12,7 +12,7 @@ on:
         required: false
         type: string
       rebel_compiler_version:
-        description: "Version of rebel-compiler to use (optional)"
+        description: "(optional) override rebel-compiler — empty = version from uv.lock"
         required: false
         type: string
       optimum_rbln_version:
@@ -21,11 +21,6 @@ on:
         type: string
 
 jobs:
-  get-compiler-version:
-    if: ${{ !inputs.rebel_compiler_version }}
-    uses: ./.github/workflows/rbln_utils_get_compiler_version_ci.yaml
-    secrets: inherit
-
   build-vllm-rbln:
     name: Build vllm-rbln wheel
     runs-on: rbln-sw-k8s-general
@@ -63,21 +58,23 @@ jobs:
           retention-days: 7
 
   vllm-rbln-pytest:
-    needs: [get-compiler-version, build-vllm-rbln]
+    needs: [build-vllm-rbln]
     if: ${{ always() && !cancelled() && needs.build-vllm-rbln.result == 'success' }}
     uses: ./.github/workflows/rbln_vllm-rbln_pytest.yaml
     secrets: inherit
     with:
       ref: ${{ inputs.ref }}
-      rebel_compiler_version: ${{ inputs.rebel_compiler_version || needs.get-compiler-version.outputs.compiler_version }}
+      # empty = downstream workflow uses uv.lock pin; set only for manual dispatch override
+      rebel_compiler_version: ${{ inputs.rebel_compiler_version }}
       optimum_rbln_version: ${{ inputs.optimum_rbln_version }}
 
   vllm-rbln-optimum-ci:
-    needs: [get-compiler-version, build-vllm-rbln]
+    needs: [build-vllm-rbln]
     if: ${{ always() && !cancelled() && needs.build-vllm-rbln.result == 'success' }}
     uses: ./.github/workflows/rbln_optimum_ci.yaml
     secrets: inherit
     with:
       ref: ${{ inputs.ref }}
-      rebel_compiler_version: ${{ inputs.rebel_compiler_version || needs.get-compiler-version.outputs.compiler_version }}
+      # empty = downstream workflow uses uv.lock pin; set only for manual dispatch override
+      rebel_compiler_version: ${{ inputs.rebel_compiler_version }}
       optimum_rbln_version: ${{ inputs.optimum_rbln_version }}
