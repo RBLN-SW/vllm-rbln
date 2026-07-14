@@ -128,7 +128,7 @@ jobs:
       - name: Run gemma2 model (hybrid attention) (V1)
         run: >
           uv run --no-sync examples/optimum/decoder_models/basic_offline.py
-          --model_id ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/gemma-2-2b-8k_batch4
+          --model ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/gemma-2-2b-8k_batch4
 
       - name : Run text embedding model (V1)
         run: >
