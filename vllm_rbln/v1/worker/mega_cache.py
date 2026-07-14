@@ -109,9 +109,7 @@ def config_signature(vllm_config) -> str:
     cfg = _stable_compute_hash(vllm_config)
     env = _compile_env_factors()
     rebel_ver = _rebel_major_minor()
-    digest = hashlib.sha1(
-        "|".join([cfg, env, f"rebel={rebel_ver}"]).encode("utf-8")
-    )
+    digest = hashlib.sha1("|".join([cfg, env, f"rebel={rebel_ver}"]).encode("utf-8"))
     sig = digest.hexdigest()[:16]
     logger.info(
         "mega-cache config_signature=%s (cfg=%s env=%s rebel=%s)",
