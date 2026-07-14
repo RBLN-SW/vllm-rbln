@@ -2606,7 +2606,7 @@ wheels = [
 
 [[package]]
 name = "torch-rbln"
-version = "0.3.0rc1.dev2+gf44e18388"
+version = "0.3.0rc1.dev29+gf752794a5"
 source = { registry = "https://pypi.rebellions.in/simple/" }
 dependencies = [
     { name = "libcst", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
@@ -2617,7 +2617,7 @@ dependencies = [
     { name = "torch", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
 ]
 wheels = [
-    { url = "https://pypi.rebellions.in/api/package/torch-rbln/torch_rbln-0.3.0rc1.dev2+gf44e18388-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "sha256:308206c6db67005b6130ea73be6e5c24101a74afc1092b160b04ceff495bc505" },
+    { url = "https://pypi.rebellions.in/api/package/torch-rbln/torch_rbln-0.3.0rc1.dev29+gf752794a5-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "sha256:cf56bd015fbb915c14031b6fc17ea22ac1962566d7b7ede0e3ddb2ced5a9356b" },
 ]
 
 [[package]]
