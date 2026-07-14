@@ -271,8 +271,8 @@ environment_variables = {
     # When set, the rbln torch.compile backend compiles + caches each graph and
     # builds its runtime on a dummy device (no NPU required); the populated
     # cache is later reused by a real NPU host via cache-hit. The target SOC is
-    # taken from rebel.get_npu_name(), which falls back to RBLN_TARGET_SOC, so
-    # set RBLN_TARGET_SOC (e.g. RBLN-CA25) on a host without an NPU mounted.
+    # taken from rebel.get_npu_name(); on a host without an NPU mounted set
+    # RBLN_FORCE_NPU_NAME (e.g. RBLN-CA25) so the target can still be resolved.
     "VLLM_RBLN_COMPILE_ONLY": (
         lambda: (
             os.environ.get("VLLM_RBLN_COMPILE_ONLY", "False").lower() in ("true", "1")
