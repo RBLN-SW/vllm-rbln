@@ -73,8 +73,12 @@ def _compile_env_factors() -> str:
             for name in _PER_WORKER_ENV_DROP:
                 factors.pop(name, None)
             return hash_factors(factors)
-        except Exception:  # pylint: disable=broad-exception-caught
-            pass
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            logger.warning(
+                "mega-cache compile_factors failed, using env registry "
+                "fallback: %s",
+                exc,
+            )
     from vllm_rbln import rbln_envs
 
     parts = []
@@ -125,15 +129,17 @@ def config_signature(vllm_config) -> str:
     """
     cfg = _stable_compute_hash(vllm_config)
     env = _compile_env_factors()
-    rebel = _rebel_major_minor()
-    digest = hashlib.sha1("|".join([cfg, env, f"rebel={rebel}"]).encode("utf-8"))
+    rebel_ver = _rebel_major_minor()
+    digest = hashlib.sha1(
+        "|".join([cfg, env, f"rebel={rebel_ver}"]).encode("utf-8")
+    )
     sig = digest.hexdigest()[:16]
     logger.info(
         "mega-cache config_signature=%s (cfg=%s env=%s rebel=%s)",
         sig,
         cfg[:8],
         hashlib.sha1(env.encode("utf-8")).hexdigest()[:8],
-        rebel,
+        rebel_ver,
     )
     return sig
 
@@ -186,6 +192,7 @@ def save(model: str, sig: str) -> None:
         return
     from rebel.core import mega_cache as rbln_mega_cache
 
+    rbln_mega_cache.set_dir(cache_root())
     path = bundle_path(model, sig)
     try:
         rbln_mega_cache.flush_to_bundle()
