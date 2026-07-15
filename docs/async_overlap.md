@@ -129,10 +129,62 @@ kmd/umd experts). `=1` (inline-await) is clean because lockstep keeps the wait s
   So the abort is NOT the readiness barrier; it's the cross-rank **data exchange itself** stalling on a
   skewed peer, independent of the barrier.
 
-**Remaining viable directions (device-level RCCL/rbln only — no host gloo):** (a) bound cross-rank
-skew so the collective wait is always short (async-pipeline redesign: pre-queue/device-chain the next
-forward, or use the collectives themselves as device-level sync points as `=1` implicitly does); or
-(b) FW/SSW: make the collective tolerate bounded skew (watchdog/timeout).
+**ROOT CAUSE CONFIRMED (2026-07-15, full FW coredump decode via fw-expert) — it is a PAGE FAULT,
+not skew/hang/timeout.** The earlier "cross-rank skew / collective rendezvous timeout" framing was
+WRONG (refuted HIGH-confidence). The full 13,345-line fw.log (recovered from
+`/var/log/rebellions/rbln7.*.coredump/fw.log`, persisted by rbln_daemon before the devcoredump 5-min
+self-destruct) shows:
+- `hw_status 0x10007` = **`ERR_PAGE_FAULT`** (err_reason_cp; watchdog would be 0xb). Confirmed by
+  `ptw_get_pte: Page fault! entry invalid addr 6c9000000 hop 2 idx 48 entry 0` →
+  `hils_set_err_reason: err_code 0x10007`. `FAR_EL=0` ⇒ NPU address-translation-walker (PTW, for
+  DMA/compute engines) fault, not a CPU MMU trap.
+- The fault addr is **in-bounds of a validly-allocated buffer of the guilty ctx (40001)** (10 MiB into
+  a `bf3180` alloc); d-cache was invalidated and the PTE re-read — still invalid ⇒ not cache
+  staleness ⇒ a **page-table-population race**: the PTE for that buffer isn't committed/visible (or was
+  torn down) when the compute/DMA engine's PTW walks it.
+- `cp1_worker1/2/3 "suspended task"` is **fixed boilerplate on every abort** (cp1 = per-chiplet DNC
+  dispatch threads, NOT a collective processor) — zero root-cause signal. No RCCL/rendezvous strings,
+  no credit-exhaustion/dep-stall, and **no coredump on peer ranks** ⇒ not a cross-rank hang.
+
+**Mechanism:** under `defer` the forward + its MoE/EP `all_to_all` I/O buffers are dispatched
+non-blocking WITHOUT fencing the buffer's page-table mapping commit relative to execution, so the NPU
+PTW can walk an uncommitted/torn-down PTE → page fault → abort. `sync`/`=1` commit the mapping before
+execution (inline await), so they never hit it. This is why `-EIO` (HW error), not `-ETIMEDOUT`, and
+why the barrier/MKL/Nb fixes (all targeted timing) failed.
+
+**Precise mechanism (ExportMem / CachingAllocator concurrency, code-confirmed):** `rcclExportMem(ctx)`
+publishes the WHOLE context's device memory map to RCCL and is lazy via a **global atomic dirty flag**
+`MemoryChangeTracker` (`caching_allocator.h:27`) that the CachingAllocator sets on every Malloc/Free
+(`MarkMemoryChanged`); CCL ops export only when the flag is set (`ShouldExportMem`/`CheckAndReset`).
+This assumes SERIAL execution: `[alloc/free → mark] → [CCL → export → run]` on one thread. `defer`
+breaks it: the **main thread runs ahead and does the next step's CachingAllocator Malloc/Free —
+physically remapping/tearing down the device page table — concurrently with the worker executing the
+previous step's CCL, whose PTW walks that page table**. The main thread can invalidate a PTE the
+in-flight CCL is walking → page fault. The dirty-flag/export only guards the RCCL address-map publish,
+NOT the actual page-table mutation vs the in-flight command; and `register_pending_async`'s keepalive
+holds the Python tensors alive but does not fence the CachingAllocator's device-mapping mutation
+against the pending worker CCL. sync/`=1` never overlap (CCL completes before the main thread
+allocs/frees).
+
+**Pinpointed missing fence:** `VMemoryManager::EnsureSyncedOnPhysicalView(vaddr)`
+(`vmemory_manager.cc:561/807`) is the vmem→physical(device) commit fence — it establishes/commits the
+operand's physical view (device page-table mapping) before use. It IS called on the **`Rccl`-class
+collective path** (`rbln_rccl.cc:309` `GetSingleDeviceAddrFromVMem`, used by AllGather/Scatter/
+ReduceScatter), but is **NOT called on the compiled-graph `CCLRuntimeOp` path** (`ccl_runtime_op.cc`
+`ResolveSlotAddr` → raw librccl `rcclAllToAllX`) that the MoE dispatch actually uses. So the
+compiled-graph collective runs without the physical-view commit fence; under sync the mapping is
+committed by execution ordering, but under `defer` the main thread's concurrent vmem/CachingAllocator
+mutation leaves the operand's physical view stale/uncommitted → NPU PTW walks an invalid PTE → page
+fault. (Matches fw coredump: in-bounds addr, PTE invalid.)
+
+**Fix direction (device-level, rebel runtime):** commit the CCL operands' physical view before the
+compiled-graph collective executes — mirror the `Rccl`-class path's `EnsureSyncedOnPhysicalView` for
+the `CCLRuntimeOp` operands (or, more broadly, serialize CachingAllocator device page-table mutation
+against in-flight deferred commands so the mapping can't be torn down under an in-flight CCL). Open
+question for the runtime team: for compiled-graph DEVICE operands (already-bound rbln slots), is
+`EnsureSyncedOnPhysicalView` the correct commit primitive, or is a device-MMU page-table flush needed?
+(Full FW coredump: `/var/log/rebellions/rbln7.*.coredump/fw.log`; fault ctx=40001 addr=0x6c9000000
+hop=2 idx=48.)
 
 ## TODO 2 — remove the logprobs `force_sync`
 
