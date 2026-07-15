@@ -228,6 +228,40 @@ class PerformanceTracker:
         self.decode_metrics = StepMetrics()
         self.prefill_metrics_by_request_id = PrefillMetricsByRequestID()
         self.padded_decode_metrics = StepMetrics()
+        # True end-to-end decode metric: raw first-start -> last-end wall span over all
+        # real (token-producing) decode steps, plus step and token totals. This is keyed
+        # on the sample_tokens() path (once per real step), NOT on execute_model() (which
+        # can fire multiple times per step), and it includes the inter-step engine
+        # overhead that per-execute latencies miss (or, on the async path, overlap). It
+        # matches vLLM's reported end-to-end throughput. Only populated on the E2E tracker.
+        self.decode_wall_start: float | None = None
+        self.decode_wall_end: float = 0.0
+        self.decode_wall_tokens: int = 0
+        self.decode_wall_steps: int = 0
+
+    def record_decode_wall(
+        self, start_time: float, end_time: float, token_count: int
+    ) -> None:
+        """Extend the decode wall span, and step/token totals (see field docs)."""
+        if self.decode_wall_start is None:
+            self.decode_wall_start = start_time
+        self.decode_wall_end = end_time
+        self.decode_wall_tokens += token_count
+        self.decode_wall_steps += 1
+
+    def get_wallclock_decode_throughput(self) -> float:
+        """Total decode tokens / (last_end - first_start), in tokens/second."""
+        if self.decode_wall_start is None:
+            return 0.0
+        span = self.decode_wall_end - self.decode_wall_start
+        return self.decode_wall_tokens / span if span > 0 else 0.0
+
+    def get_wallclock_decode_latency(self) -> float:
+        """Wall-clock span / decode steps, in milliseconds (true per-step E2E)."""
+        if self.decode_wall_start is None or self.decode_wall_steps == 0:
+            return 0.0
+        span = self.decode_wall_end - self.decode_wall_start
+        return span / self.decode_wall_steps * 1000
 
     def check_dummy_request(self, request_ids: list[str] | None) -> bool:
         if request_ids:
@@ -330,6 +364,19 @@ class PerformanceTracker:
         else:
             logger.info("FINAL PERFORMANCE STATISTICS")
         logger.info("=" * 80)
+
+        # E2E tracker: wall-clock only (no per-execute records; see field docs).
+        if self.decode_wall_start is not None:
+            logger.info("DECODE (wall-clock, overlap-agnostic):")
+            logger.info("  Total decode steps: %d", self.decode_wall_steps)
+            logger.info("  Total decode tokens: %d", self.decode_wall_tokens)
+            logger.info("  Average latency: %.2f ms", self.get_wallclock_decode_latency())
+            logger.info(
+                "  Average throughput: %.2f tokens/sec",
+                self.get_wallclock_decode_throughput(),
+            )
+            logger.info("=" * 80)
+            return
 
         # Prefill stats
         self.prefill_metrics.show_stats("PREFILL")

@@ -781,6 +781,10 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         )
 
         self.performance_tracker: PerformanceTracker | None = None
+        # [EXECUTE]: execute_model()+sample_tokens() duration only (excludes the
+        # inter-step engine overhead — scheduler, detokenize, output handling).
+        # [E2E]: true step-to-step interval (includes that overhead) + decode wall-clock.
+        self.execute_performance_tracker: PerformanceTracker | None = None
         self.e2e_performance_tracker: PerformanceTracker | None = None
         self._pending_model_report: StepReport | None = None
         self.e2e_start_time: float = 0.0
@@ -796,6 +800,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     def _enable_performance_tracker(self):
         if envs.VLLM_RBLN_METRICS:
             self.performance_tracker = PerformanceTracker("MODEL+SAMPLER")
+            self.execute_performance_tracker = PerformanceTracker("EXECUTE")
             self.e2e_performance_tracker = PerformanceTracker("E2E")
 
     def _flush_pending_model_report(self):
@@ -4383,15 +4388,29 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             num_nans_in_logits=num_nans_in_logits,
         )
 
-        if self.e2e_performance_tracker is not None:
+        if (
+            self.execute_performance_tracker is not None
+            or self.e2e_performance_tracker is not None
+        ):
             self.e2e_end_time = time.perf_counter()
+        if self.execute_performance_tracker is not None:
+            # [EXECUTE]: execute_model()+sample_tokens() window only.
             collect_metrics(
-                self.e2e_performance_tracker,
+                self.execute_performance_tracker,
                 is_prefill_phase,
                 start_time=self.e2e_start_time,
                 end_time=self.e2e_end_time,
                 reports=[],
                 token_count=scheduler_output.total_num_scheduled_tokens,
+            )
+        if self.e2e_performance_tracker is not None and not is_prefill_phase:
+            # True E2E: extend the overlap-agnostic decode wall-clock aggregate. Keyed on
+            # this (token-producing) sample_tokens() call, so steps/tokens are counted
+            # once per real step (unlike execute_model(), which can fire multiple times).
+            self.e2e_performance_tracker.record_decode_wall(
+                self.e2e_start_time,
+                self.e2e_end_time,
+                scheduler_output.total_num_scheduled_tokens,
             )
 
         if not self.use_async_scheduling:
