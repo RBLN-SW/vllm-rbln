@@ -56,14 +56,31 @@ code=504 SYS_TASK_ABORTED "Wait job task aborted (code 3)" / "[stream] Drain fai
   surfaced on the main thread at sample_tokens -> drain_pending_async -> await_task(rid,0) -> 504
 ```
 
-**Working hypothesis (verify, then fix):** the overlap intentionally drops the tight per-step
-DP lockstep (forward runs async on the shared worker; `AsyncDynamoRuntime.run` submits `run_io`
-= BeginBatch…Run…EndBatch as one task and returns without awaiting). A cross-rank device
-collective in the MoE/EP forward then fails to rendezvous on one lagging rank → the device
-aborts that task (504) → its batch is left open → every later `run_io` on that handle cascades
-"BeginBatch already active" → the deferred drain surfaces the 504. Intermittent because it
-rides inter-rank timing jitter; logprobs (extra async graphs per step) likely widens the window.
-Sync can't hit it (each batch begins→ends→awaits on the main thread in lockstep).
+**Root cause — CONFIRMED by isolation (2026-07-15, full model, same config, one variable changed):**
+
+| config | overlap (defer) | cross-rank collective | result |
+|---|:---:|:---:|---|
+| sync DP4 | ✗ | ✓ | 3/3 clean |
+| async=1 DP4 (inline await) | ✗ | ✓ | 3/3 clean |
+| defer DP4 | ✓ | ✓ | **4/6 abort** (504→BeginBatch, rank2) |
+| defer DP1 | ✓ | ✗ | 0/3 abort (2 clean + 1 unrelated `SYS_ENODEV` init flake) |
+
+**The abort occurs iff (overlap AND cross-rank) are both present.** `async=1` (same async worker,
+run_io, and cross-rank collectives, but awaits each submit inline) is clean → the async worker /
+batch machinery itself is fine. `defer DP1` (full overlap, no cross-rank collective) is clean →
+it is not a local batch-lifecycle bug. So: the defer overlap drops the tight per-step DP lockstep
+(`AsyncDynamoRuntime.run` submits `run_io` non-blocking and returns without awaiting; drains late),
+ranks drift, and a **cross-rank device collective in the MoE/EP forward fails to rendezvous on a
+lagging rank → device aborts that task (504 SYS_TASK_ABORTED / "Wait job task aborted") → the
+aborted task leaves its batch open → later `run_io` on that handle cascade "BeginBatch already
+active" → the deferred drain (`await_task`) surfaces the 504.** Intermittent because it rides
+inter-rank timing jitter (logprobs' extra async graphs widen the window). Sync/async=1 keep every
+rank in per-step lockstep (each batch begins→ends→awaits before the next), so the collective always
+rendezvous.
+
+**Fix direction:** restore cross-rank alignment under the overlap without collapsing it — e.g. a
+per-step cross-rank barrier bounding how far ranks may drift before the shared-communicator
+collective, or align the deferred drain across ranks. Must keep the forward↔all_reduce overlap.
 
 **Runtime-architecture context (likely the same underlying weakness):** the RBLN async runtime
 is a **single-FIFO-worker + full-drain, single-buffered** model, not GPU's multi-stream +
@@ -77,8 +94,8 @@ after a task abort is a batch-lifecycle failure in exactly this shared-instance/
 model. The token-0 fix (rebel_compiler `44f3614427`) already had to bolt `WaitForDeviceCompletion()`
 after `Run()` for the same reason.
 
-**Goal:** find the real root cause (confirm/refute the above) and make async abort-free like sync.
-This blocks TODO 2.
+**Goal:** root cause is found (above); implement the cross-rank-alignment fix and make async
+abort-free like sync (target: full DP4 defer 10/10 clean). This blocks TODO 2.
 
 ## TODO 2 — remove the logprobs `force_sync`
 
