@@ -50,7 +50,7 @@ class RBLNFlashAttnMLABackend(MLACommonBackend):
 
     @staticmethod
     def get_name() -> str:
-        return "RBLN_FLASH_ATTN_MLA"
+        return "FLASH_ATTN_MLA"
 
     @staticmethod
     def get_builder_cls() -> type["RBLNFlashAttentionMetadataBuilder"]:

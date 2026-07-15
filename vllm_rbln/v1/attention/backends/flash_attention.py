@@ -66,7 +66,7 @@ logger = init_logger(__name__)
 class RBLNFlashAttentionBackend(AttentionBackend):
     @staticmethod
     def get_name() -> str:
-        return "RBLN_FLASH_ATTN"
+        return "FLASH_ATTN"
 
     @staticmethod
     def get_impl_cls() -> type["RBLNFlashAttentionImpl"]:
