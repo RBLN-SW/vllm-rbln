@@ -27,7 +27,6 @@ import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.sample.rbln_sampler import (
     build_compile_options,
-    resolve_compile_context,
 )
 
 logger = init_logger(__name__)
@@ -73,7 +72,6 @@ class RBLNRejectionSampler(RejectionSampler):
             "sampling (rejection_sample_method='synthetic'). Use the CPU "
             "rejection sampler for this mode."
         )
-        compile_context = resolve_compile_context(compile_context)
         options = build_compile_options(compile_context)
         self.compiled_rejection_sample = torch.compile(
             rbln_rejection_sample,
