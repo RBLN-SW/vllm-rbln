@@ -605,7 +605,7 @@ class TestPDDisaggregationScheduler:
         # A peer decode rank elected cross-block no-spec -> the cross-DP
         # OR-reduce forces this rank's scrub. The promoted decode must be
         # scrubbed like any decode: slide cleared AND query_len forced to 1.
-        scrub_scheduler_output_for_no_spec(out, scheduler.requests)
+        scrub_scheduler_output_for_no_spec(out)
         assert not getattr(out, "spec_decode_slide_distance", {}), (
             "promoted decode's slide must be cleared by the no-spec scrub"
         )

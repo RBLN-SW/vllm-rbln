@@ -1289,7 +1289,7 @@ class TestCrossBlockNoSpecRollback:
         assert sched_out.scheduled_spec_decode_tokens[rid] == [777]
 
         # The runner forces query_len=1 for the collective no-spec step.
-        scrub_scheduler_output_for_no_spec(sched_out, scheduler.requests)
+        scrub_scheduler_output_for_no_spec(sched_out)
         assert sched_out.num_scheduled_tokens[rid] == 1
 
         # The model emits a single (no-spec) token; the engine must roll the
@@ -1341,7 +1341,7 @@ class TestNoSpecScrubPrefill:
 
         # A peer decode rank elected no-spec -> this prefill rank is scrubbed.
         # scrub excludes prefill reqs (via is_prefill) from the clamp.
-        scrub_scheduler_output_for_no_spec(sched_out, scheduler.requests)
+        scrub_scheduler_output_for_no_spec(sched_out)
 
         assert sched_out.num_scheduled_tokens[rid] == chunk, (
             f"prefill query_len wrongly clamped to "
@@ -1378,7 +1378,7 @@ class TestNoSpecScrubPrefill:
 
         # A peer decode rank elected no-spec -> this chunked-prefill rank is
         # scrubbed. The intermediate chunk must NOT be clamped to 1.
-        scrub_scheduler_output_for_no_spec(sched2, scheduler.requests)
+        scrub_scheduler_output_for_no_spec(sched2)
         assert sched2.num_scheduled_tokens[rid] == chunk, (
             f"intermediate chunked-prefill query_len wrongly clamped to "
             f"{sched2.num_scheduled_tokens[rid]} (was {chunk}) by no-spec scrub"
@@ -1395,7 +1395,7 @@ class TestNoSpecScrubPrefill:
         rid = req.request_id
         assert sched_out.step_no_spec_required is True
         # decode req (num_output > 0) is NOT a prefill -> gets clamped.
-        scrub_scheduler_output_for_no_spec(sched_out, scheduler.requests)
+        scrub_scheduler_output_for_no_spec(sched_out)
         assert sched_out.num_scheduled_tokens[rid] == 1
 
 
