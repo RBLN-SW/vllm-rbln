@@ -1329,9 +1329,9 @@ class RBLNScheduler(Scheduler):
         # ranks under spec-decode + PP.
         #
         # No mixed batching makes the step uniform (all decodes, or a lone
-        # prefill), so one representative request decides it -- matching the
-        # runner's original is_prefills()[0] and avoiding an O(max_num_seqs)
-        # scan of the whole batch. The first scheduled id is a running-loop
+        # prefill), so one representative request decides it -- avoiding an
+        # O(max_num_seqs) scan of the whole batch. The first scheduled id is a
+        # running-loop
         # request when any is scheduled (running reqs are inserted first),
         # else the waiting-loop prefill; either is representative. Empty step
         # (no tokens) -> False (decode); the runner early-returns anyway.

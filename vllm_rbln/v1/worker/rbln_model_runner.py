@@ -170,7 +170,7 @@ logger = init_logger(__name__)
 
 
 def scrub_scheduler_output_for_no_spec(
-    scheduler_output: "SchedulerOutput",
+    scheduler_output: RBLNSchedulerOutput,
     requests: "Mapping[str, Any]",
 ) -> None:
     """Force every scheduled DECODE request to query_len=1 for a collective
@@ -239,15 +239,14 @@ def scrub_scheduler_output_for_no_spec(
         for req_id in scheduler_output.num_scheduled_tokens
         if _is_prefill(req_id)
     }
-    if isinstance(scheduler_output, RBLNSchedulerOutput):
-        # A slide entry only ever belongs to a scheduler-DECODE (it is written
-        # only for `not is_prefill` reqs), so drop it for every non-prefill req.
-        # A promoted remote-KV decode is now correctly a decode here, so its
-        # slide is cleared (fixing #390 A). Real prefills never carry a slide,
-        # so the map ends empty (asserted below).
-        for _rid in list(scheduler_output.spec_decode_slide_distance):
-            if _rid not in prefill_req_ids:
-                del scheduler_output.spec_decode_slide_distance[_rid]
+    # A slide entry only ever belongs to a scheduler-DECODE (it is written
+    # only for `not is_prefill` reqs), so drop it for every non-prefill req.
+    # A promoted remote-KV decode is now correctly a decode here, so its
+    # slide is cleared (fixing #390 A). Real prefills never carry a slide,
+    # so the map ends empty (asserted below).
+    for _rid in list(scheduler_output.spec_decode_slide_distance):
+        if _rid not in prefill_req_ids:
+            del scheduler_output.spec_decode_slide_distance[_rid]
     for req_id in list(scheduler_output.num_scheduled_tokens):
         # no-spec (query_len=1) is a DECODE concern. A PREFILL req must keep its
         # chunk query_len; clamping it to 1 discards the prefill's token and
@@ -271,10 +270,10 @@ def scrub_scheduler_output_for_no_spec(
         f"no-spec scrub left a decode query_len != 1: "
         f"{scheduler_output.num_scheduled_tokens}"
     )
-    assert not getattr(scheduler_output, "spec_decode_slide_distance", {}), (
+    assert not scheduler_output.spec_decode_slide_distance, (
         "no-spec scrub left a non-empty slide map, so a cross-block "
         "backfill can still occur: "
-        f"{getattr(scheduler_output, 'spec_decode_slide_distance', {})}"
+        f"{scheduler_output.spec_decode_slide_distance}"
     )
 
 
@@ -348,7 +347,7 @@ class DummyRunState(NamedTuple):
     # The (RBLN) scheduler output this dummy was built from. dummy_run replays
     # it through _set_step_phase so a stale prefill/decode phase from a prior
     # real step cannot leak into any is_prefill_phase() read on the idle rank.
-    scheduler_output: "SchedulerOutput"
+    scheduler_output: RBLNSchedulerOutput
     draft_attn_metadata: dict[int, dict[str, Any]] | None = None
 
 
@@ -1393,6 +1392,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             logits_indices, spec_decode_metadata
         ]
         """
+        # Narrow the type for the spec_decode_slide_distance read below.
+        assert isinstance(scheduler_output, RBLNSchedulerOutput)
         total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         assert total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs
@@ -1409,7 +1410,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # Reqs without slide stay at their scheduled length. The total
         # tensor count below (`total_query_tokens`) therefore equals
         # total_num_scheduled_tokens (logical advance) + sum(slide).
-        slide_distance_map = getattr(scheduler_output, "spec_decode_slide_distance", {})
+        slide_distance_map = scheduler_output.spec_decode_slide_distance
         if slide_distance_map:
             req_ids = self.input_batch.req_ids
             slide_arr = np.array(
@@ -2176,14 +2177,14 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self,
         scheduler_output: "SchedulerOutput",
     ) -> tuple[Any, Any | None, Any, Any, dict[Any, Any]]:
+        # Narrow the type for the spec_decode_slide_distance read below.
+        assert isinstance(scheduler_output, RBLNSchedulerOutput)
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         # Sliding window: `_prepare_inputs` prepends past tokens to decode
         # queries, inflating the flat layout beyond the scheduler's logical
         # advance. Extend `num_input_tokens` so the slice picks up the
         # past-token prefix that the runner wrote at the tail of the buffer.
-        slide_distance_map = (
-            getattr(scheduler_output, "spec_decode_slide_distance", {}) or {}
-        )
+        slide_distance_map = scheduler_output.spec_decode_slide_distance
         num_scheduled_tokens += sum(slide_distance_map.values())
 
         # TODO(RBLN): Support SP
@@ -2628,7 +2629,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         scheduled_spec_decode_tokens: dict[str, list[int]] | None = None,
         step_no_spec_required: bool = False,
         is_prefill: bool = False,
-    ) -> tuple[SchedulerOutput, SchedulerOutput]:
+    ) -> tuple[RBLNSchedulerOutput, RBLNSchedulerOutput]:
         # Always emit RBLNSchedulerOutput (never a plain SchedulerOutput) so the
         # runner uniformly receives the RBLN fields:
         #   * step_no_spec_required: on the warmup no-spec / query_len=1
@@ -2724,7 +2725,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
     def _prepare_dummy_inputs(
         self,
-        scheduler_output: SchedulerOutput,
+        scheduler_output: RBLNSchedulerOutput,
         input_batch: InputBatch,
     ) -> DummyRunState:
         total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
@@ -3448,10 +3449,10 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         self._handle_kv_connector_preemptions(scheduler_output)
 
-        # NOTE(RBLN): Record this step's prefill/decode classification from the
-        # scheduler-stamped output; is_prefill_phase() reads it (see
-        # _set_step_phase). Done before the empty-batch early return below so
-        # the phase is never stale for this step.
+        # Boundary guard: every step carries RBLNSchedulerOutput. Assert here
+        # (before the empty-batch early return) so the phase is stamped for this
+        # step and mypy narrows the type for the field reads below.
+        assert isinstance(scheduler_output, RBLNSchedulerOutput)
         self._set_step_phase(scheduler_output)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
@@ -3460,10 +3461,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
             # Process sub-block KV cache copy operations before the forward
             # pass so that partially cached blocks are populated.
-            if (
-                isinstance(scheduler_output, RBLNSchedulerOutput)
-                and scheduler_output.kv_cache_copy_ops
-            ):
+            if scheduler_output.kv_cache_copy_ops:
                 self._process_kv_cache_copy_ops(scheduler_output.kv_cache_copy_ops)
 
             if not num_scheduled_tokens:
@@ -3488,9 +3486,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # `_prepare_inputs` adds to decode queries. Downstream slicing
             # (`_preprocess`, `_get_slot_mappings`, `unpadded_to_padded`)
             # must see the post-sliding flat-token count.
-            _slide_total = sum(
-                getattr(scheduler_output, "spec_decode_slide_distance", {}).values()
-            )
+            _slide_total = sum(scheduler_output.spec_decode_slide_distance.values())
             num_tokens_unpadded = (
                 scheduler_output.total_num_scheduled_tokens + _slide_total
             )
@@ -3508,10 +3504,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # the no-drafts ranks into lookahead-allocated slots, which is
             # functionally safe (pad-position outputs are discarded by the
             # rejection sampler).
-            local_step_no_spec_required = (
-                isinstance(scheduler_output, RBLNSchedulerOutput)
-                and scheduler_output.step_no_spec_required
-            )
+            local_step_no_spec_required = scheduler_output.step_no_spec_required
             dp_size = self.vllm_config.parallel_config.data_parallel_size
             if dp_size > 1 and self.num_spec_tokens > 0:
                 dp_rank = self.vllm_config.parallel_config.data_parallel_rank
@@ -3618,9 +3611,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # scheduled + slide. `pad_speculative_draft_tokens` and the
             # remap below both rely on this length matching the size of
             # `input_ids`/`positions` written by `_prepare_inputs`.
-            _slide_distance_map = (
-                getattr(scheduler_output, "spec_decode_slide_distance", {}) or {}
-            )
+            _slide_distance_map = scheduler_output.spec_decode_slide_distance
             # Build the scheduling tensor on CPU and only `.to(device)` at
             # consumer boundaries — mirrors the non-spec path where the
             # eventual `logits_indices.to(self.device)` is the only place a
@@ -5673,29 +5664,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # self.transfer_event.synchronize()
         return pinned.tolist()
 
-    def is_prefills(self) -> np.ndarray:
-        # DEPRECATED: per-rank classification. No longer drives is_prefill_phase
-        # (that reads the scheduler stamp now); kept only for existing direct
-        # unit tests. Remove with the RBLNSchedulerOutput-unification cleanup.
-        return (
-            self.input_batch.num_computed_tokens_cpu
-            < self.input_batch.num_tokens_no_spec - 1
-        )
-
-    def _set_step_phase(self, scheduler_output: "SchedulerOutput") -> None:
-        """Record this step's prefill/decode phase from the scheduler stamp.
-
-        RBLNScheduler always emits RBLNSchedulerOutput, and the dummy builder
-        (`_make_dummy_scheduler_outputs`) does too, so every step reaching the
-        runner carries `is_prefill_step`. Assert (rather than default silently)
-        so any future path that feeds a plain SchedulerOutput fails loudly
-        instead of misclassifying the phase as decode.
-        """
-        assert isinstance(scheduler_output, RBLNSchedulerOutput), (
-            "RBLNModelRunner expects RBLNSchedulerOutput carrying is_prefill_step; "
-            f"got {type(scheduler_output).__name__}. The prefill/decode phase is "
-            "stamped by the scheduler and must be present on every step."
-        )
+    def _set_step_phase(self, scheduler_output: RBLNSchedulerOutput) -> None:
+        """Record this step's prefill/decode phase from the scheduler stamp."""
         self._is_prefill_step = scheduler_output.is_prefill_step
 
     def is_prefill_phase(self) -> bool:
