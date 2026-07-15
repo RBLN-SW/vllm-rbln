@@ -156,10 +156,15 @@ Two repos change. **rebel_compiler has C++ changes (needs a build)**; vllm-rbln 
 
 - **`vllm_rbln/torch_compile_backend.py`**:
   - `is_warmup_active()` — exposes the warmup flag (used to gate deferral off during warmup).
-  - `_maybe_disable_warmcache_for_async()` — under `RBLN_DYNAMO_ASYNC`, disables
-    `torch_rbln`'s warm-cache shim, which hardcodes a `PyRblnSyncRuntime*` layout and would
-    mis-cast the async handle and segfault. Disabling it routes execution back through
-    `AsyncDynamoRuntime.run`.
+  - `_assert_warmcache_async_safe()` — under `RBLN_DYNAMO_ASYNC`, verifies the installed
+    `torch_rbln` has the warm-cache type gate (`warm_cache._is_expected_runtime_handle`,
+    torch_rbln >= 0.3.0rc0) and raises otherwise. With the gate, `install_pending` refuses
+    to cache the `PyRblnAsyncRuntime` handle, so the warm-cache fast path (which hardcodes a
+    `PyRblnSyncRuntime*` layout) never fires on the async handle — the cache simply always
+    misses on the async path and falls back to `AsyncDynamoRuntime.run`. On an older
+    torch_rbln the fast path would mis-cast the async handle and segfault; the guard fails
+    fast instead. (Superseded `_maybe_disable_warmcache_for_async`, which bluntly disabled
+    the whole warm-cache before the type gate existed.)
 
 - **`vllm_rbln/v1/sample/rbln_sampler.py`**:
   - `RBLNSampler.forward(..., skip_int32_cast=False)` — when True, skips the final

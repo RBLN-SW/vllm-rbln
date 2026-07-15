@@ -80,37 +80,46 @@ def _find_call_chain(depth: int = _CALL_CHAIN_DEPTH) -> str:
     return " <- ".join(chain) if chain else "?"
 
 
-_warmcache_disabled_for_async: bool = False
+_warmcache_async_checked: bool = False
 
 
-def _maybe_disable_warmcache_for_async() -> None:
-    """When RBLN_DYNAMO_ASYNC is on, disable torch_rbln's warm-cache shim.
+def _assert_warmcache_async_safe() -> None:
+    """Fail fast if torch_rbln's warm-cache would segfault under RBLN_DYNAMO_ASYNC.
 
-    The shim (`try_warmcache_hit`) executes a compiled graph by extracting a raw
-    `PyRblnSyncRuntime*` from the runtime handle and calling its PrepareInputs/Run
-    directly (layout hardcoded to PyRblnSyncRuntime). Our AsyncDynamoRuntime holds a
-    PyRblnAsyncRuntime handle, so the shim mis-casts it and segfaults. Disabling the
-    shim routes execution back through AsyncDynamoRuntime.run (-> run_io, async).
+    torch_rbln's warm-cache fast path (`try_warmcache_hit`) executes a compiled graph
+    by extracting a raw `PyRblnSyncRuntime*` from the runtime handle and calling its
+    PrepareInputs/Run directly. Under RBLN_DYNAMO_ASYNC the handle is a
+    PyRblnAsyncRuntime, so a mis-cast would segfault.
+
+    torch_rbln >= 0.3.0rc0 gates this in `warm_cache.install_pending`: it refuses to
+    cache a handle that is not a `PyRblnSyncRuntime` (via `_is_expected_runtime_handle`),
+    so the async handle is never installed and the fast path can never fire on it. The
+    warm-cache is therefore safe to leave enabled -- it simply always misses on the
+    async path and falls back to AsyncDynamoRuntime.run. This guard verifies that gate
+    exists and raises (instead of segfaulting on-device) on an older torch_rbln.
     """
-    global _warmcache_disabled_for_async
-    if _warmcache_disabled_for_async or not os.environ.get("RBLN_DYNAMO_ASYNC"):
+    global _warmcache_async_checked
+    if _warmcache_async_checked or not os.environ.get("RBLN_DYNAMO_ASYNC"):
         return
-    _warmcache_disabled_for_async = True
     try:
         from torch_rbln._internal import warm_cache
-
-        warm_cache.set_enabled(False)
-        logger.warning(
-            "RBLN_DYNAMO_ASYNC set: disabled torch_rbln warm-cache shim (it hardcodes "
-            "PyRblnSyncRuntime and would mis-cast the async handle) so AsyncDynamoRuntime "
-            "actually runs the graphs."
+    except Exception:
+        _warmcache_async_checked = True  # no warm-cache shim -> nothing to guard
+        return
+    if not hasattr(warm_cache, "_is_expected_runtime_handle"):
+        raise RuntimeError(
+            "RBLN_DYNAMO_ASYNC requires a torch_rbln whose warm-cache type-gates the "
+            "runtime handle (>= 0.3.0rc0, providing "
+            "warm_cache._is_expected_runtime_handle). The installed torch_rbln lacks it: "
+            "its warm-cache fast path would mis-cast the async PyRblnAsyncRuntime handle "
+            "as PyRblnSyncRuntime and segfault. Upgrade torch_rbln or unset "
+            "RBLN_DYNAMO_ASYNC."
         )
-    except Exception as e:  # pragma: no cover - best effort
-        logger.warning("could not disable torch_rbln warm-cache: %s", e)
+    _warmcache_async_checked = True
 
 
 def logged_rbln_backend(graph_module: Any, inputs: list[Any], **kwargs: Any) -> Any:
-    _maybe_disable_warmcache_for_async()
+    _assert_warmcache_async_safe()
     in_warmup = _warmup_active
     log = logger.info if in_warmup else logger.warning
     phase = "warm-up" if in_warmup else "HOT PATH"
