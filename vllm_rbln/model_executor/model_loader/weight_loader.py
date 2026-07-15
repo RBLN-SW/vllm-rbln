@@ -458,11 +458,24 @@ def load_qwen2moe_weights(
 def load_deepseek_v2_weights(
     self, weights: Iterable[tuple[str, torch.Tensor]]
 ) -> set[str]:
-    stacked_params_mapping = [
+    stacked_params_mapping: list[tuple[str, str, str | int]] = [
         # (param_name, shard_name, shard_id)
         ("gate_up_proj", "gate_proj", 0),
         ("gate_up_proj", "up_proj", 1),
     ]
+    mla_params_mapping: list[tuple[str, str, str | int]] = [
+        ("fused_qkv_a_proj", "q_a_proj", 0),
+        ("fused_qkv_a_proj", "kv_a_proj_with_mqa", 1),
+    ]
+    mha_params_mapping: list[tuple[str, str, str | int]] = [
+        ("qkv_proj", "q_proj", "q"),
+        ("qkv_proj", "k_proj", "k"),
+        ("qkv_proj", "v_proj", "v"),
+    ]
+    if self.use_mha:
+        stacked_params_mapping.extend(mha_params_mapping)
+    else:
+        stacked_params_mapping.extend(mla_params_mapping)
 
     # Params for weights, fp8 weight scales, fp8 activation scales
     # (param_name, weight_name, expert_id, shard_id)
@@ -476,6 +489,8 @@ def load_deepseek_v2_weights(
     for name, loaded_weight in weights:
         """
         [RBLN] Skips loading of layers greater than `num_hidden_layers`.
+        `load_deepseek_v2_weights` is bound to `DeepseekV2ForCausalLM`,
+        so weight names are prefixed with `model.layers.X.*`.
         This must be modified to more graceful code in the future.
         """
         if name.startswith("model.layers"):
@@ -491,23 +506,24 @@ def load_deepseek_v2_weights(
             continue  # skip spec decode layers for main model
 
         for param_name, weight_name, shard_id in stacked_params_mapping:
-            # Skip non-stacked layers and experts (experts handled below).
             if weight_name not in name:
                 continue
-            # We have mlp.experts[0].gate_proj in the checkpoint.
-            # Since we handle the experts below in expert_params_mapping,
-            # we need to skip here BEFORE we update the name, otherwise
-            # name will be updated to mlp.experts[0].gate_up_proj, which
-            # will then be updated below in expert_params_mapping
-            # for mlp.experts[0].gate_gate_up_proj, which breaks load.
             if ("mlp.experts." in name) and name not in params_dict:
                 continue
-            name = name.replace(weight_name, param_name)
-            # Skip loading extra bias for GPTQ models.
+
+            name_mapped = name.replace(weight_name, param_name)
+
+            if (param_name == "fused_qkv_a_proj") and name_mapped not in params_dict:
+                continue
+            else:
+                name = name_mapped
             if name.endswith(".bias") and name not in params_dict:
                 continue
 
             if is_pp_missing_parameter(name, self):
+                continue
+
+            if name not in params_dict:
                 continue
 
             param = params_dict[name]
@@ -515,23 +531,47 @@ def load_deepseek_v2_weights(
             weight_loader(param, loaded_weight, shard_id)
             break
         else:
+            is_expert_weight = False
             for mapping in expert_params_mapping:
                 param_name, weight_name, expert_id, shard_id = mapping
                 if weight_name not in name:
                     continue
-                name = name.replace(weight_name, param_name)
+
+                # Anyway, this is an expert weight and should not be
+                # attempted to load as other weights later.
+                is_expert_weight = True
+
+                # Do not modify `name` since the loop may continue here;
+                # create a new variable instead.
+                name_mapped = name.replace(weight_name, param_name)
 
                 if is_pp_missing_parameter(name, self):
                     continue
 
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(
-                    param, loaded_weight, name, shard_id=shard_id, expert_id=expert_id
+                if name_mapped not in params_dict:
+                    continue
+
+                param = params_dict[name_mapped]
+                # Ask the loader to report success so experts with other
+                # available replicas are not skipped.
+                weight_loader = typing.cast(Callable[..., bool], param.weight_loader)
+                success = weight_loader(
+                    param,
+                    loaded_weight,
+                    name_mapped,
+                    shard_id=shard_id,
+                    expert_id=expert_id,
+                    return_success=True,
                 )
-                break
+                if success:
+                    name = name_mapped
+                    break
             else:
-                # Skip loading extra bias for GPTQ models.
+                if is_expert_weight:
+                    # This is an expert weight but not mapped to this rank;
+                    # skip it (do not fall through to the generic path).
+                    continue
+
                 if name.endswith(".bias") and name not in params_dict:
                     continue
 
@@ -541,6 +581,9 @@ def load_deepseek_v2_weights(
                     continue
 
                 if is_pp_missing_parameter(name, self):
+                    continue
+
+                if name not in params_dict:
                     continue
 
                 param = params_dict[name]

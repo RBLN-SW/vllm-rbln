@@ -90,10 +90,17 @@ class RblnPlatform(Platform):
         attn_selector_config: "AttentionSelectorConfig",
         num_heads: int | None = None,
     ) -> str:
-        if selected_backend and selected_backend != AttentionBackendEnum.CUSTOM:
-            logger.info("Cannot use %s backend on RBLN.", selected_backend)
-        if attn_selector_config.use_mla:
-            raise NotImplementedError("MLA is not supported on RBLN.")
+        if selected_backend is None:
+            selected_backend = (
+                AttentionBackendEnum.FLASH_ATTN_MLA
+                if attn_selector_config.use_mla
+                else AttentionBackendEnum.FLASH_ATTN
+            )
+        if selected_backend and selected_backend not in (
+            AttentionBackendEnum.FLASH_ATTN,
+            AttentionBackendEnum.FLASH_ATTN_MLA,
+        ):
+            raise ValueError(f"Cannot use {selected_backend} backend on RBLN.")
         if attn_selector_config.use_sparse:
             raise NotImplementedError("Sparse Attention is not supported on RBLN.")
 
@@ -191,13 +198,9 @@ class RblnPlatform(Platform):
                 "VLLM_USE_V2_MODEL_RUNNER is not supported for RBLN backend."
             )
 
-        attention_config = vllm_config.attention_config
         model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
         scheduler_config = vllm_config.scheduler_config
-
-        if attention_config.backend is None:
-            attention_config.backend = AttentionBackendEnum.CUSTOM
 
         if scheduler_config.async_scheduling:
             logger.warning(

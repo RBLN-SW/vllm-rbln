@@ -48,12 +48,7 @@ class RBLNW8A16BlockFp8LinearKernel(Fp8BlockScaledMMLinearKernel):
                 f"got ({block_n}, {block_k})."
             )
 
-        out_features, in_features = config.weight_shape
-        if out_features % block_n != 0:
-            return False, (
-                "RBLN block FP8 linear kernel requires output features to be divisible "
-                f"by block_n. got {out_features=}, {block_n=}"
-            )
+        _, in_features = config.weight_shape
 
         if in_features % block_k != 0:
             return False, (
@@ -88,12 +83,11 @@ class RBLNW8A16BlockFp8LinearKernel(Fp8BlockScaledMMLinearKernel):
         block_n, block_k = [int(v) for v in self.weight_group_shape]
         out_features, in_features = weight.shape
 
-        out_blocks = out_features // block_n
         in_blocks = in_features // block_k
 
-        weight = weight.view(out_blocks, block_n, in_blocks, block_k).to(dtype)
-        weight_scale = weight_scale.view(out_blocks, in_blocks).to(dtype)
+        weight_scale = weight_scale.repeat_interleave(block_n, dim=0)[:out_features, :]
+        weight = weight.view(out_features, in_blocks, block_k).to(dtype)
 
-        return (weight * weight_scale[:, None, :, None]).reshape(
+        return (weight * weight_scale[:, :, None].to(dtype)).view(
             out_features, in_features
         )

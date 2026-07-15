@@ -26,10 +26,12 @@ from vllm_rbln.patches.registry import (
 # ruff: noqa: F401
 from . import (
     attention,
+    deepseek_v2,
     fp8_moe_method,
     gpt_oss,
     gpt_oss_mxfp4_config,
     minimax_m2,
+    mla,
     models_utils,
     oot,
     qwen2_moe,

@@ -65,6 +65,10 @@ def _register_unpacked_wna16_linear_kernel() -> None:
 
 @add_registration(reason="Register RBLN OOT implementations.")
 def register_rbln_oot_implementations() -> None:
+    from vllm.model_executor.layers.mla import MultiHeadLatentAttentionWrapper
+    from vllm.model_executor.layers.rotary_embedding.deepseek_scaling_rope import (
+        DeepseekScalingRotaryEmbedding,
+    )
     from vllm.model_executor.layers.vocab_parallel_embedding import (
         ParallelLMHead,
         VocabParallelEmbedding,
@@ -75,6 +79,10 @@ def register_rbln_oot_implementations() -> None:
         RBLNUnquantizedFusedMoEMethod,
         UnquantizedFusedMoEMethod,
     )
+    from vllm_rbln.model_executor.layers.mla import RBLNMultiHeadLatentAttentionWrapper
+    from vllm_rbln.model_executor.layers.rotary_embedding.deepseek_scaling_rope import (
+        RBLNDeepseekScalingRotaryEmbedding,
+    )
     from vllm_rbln.model_executor.layers.vocab_parallel_embedding import (
         RBLNParallelLMHead,
         RBLNVocabParallelEmbedding,
@@ -84,5 +92,7 @@ def register_rbln_oot_implementations() -> None:
     _register_oot(UnquantizedFusedMoEMethod, RBLNUnquantizedFusedMoEMethod)
     _register_oot(VocabParallelEmbedding, RBLNVocabParallelEmbedding)
     _register_oot(ParallelLMHead, RBLNParallelLMHead)
+    _register_oot(MultiHeadLatentAttentionWrapper, RBLNMultiHeadLatentAttentionWrapper)
+    _register_oot(DeepseekScalingRotaryEmbedding, RBLNDeepseekScalingRotaryEmbedding)
     _register_fp8_block_kernel()
     _register_unpacked_wna16_linear_kernel()
