@@ -11,16 +11,6 @@ variable-length termination across DP ranks) are bit-exact to sync and determini
 batch=1 greedy is **bit-exact to sync + deterministic** (run-to-run), and tok128 decode
 throughput beats sync **rank-for-rank** (+5%..+49%). The token-0 fix (§3) preserves this.
 
-**batch>1 (2026-07-08): root-caused + bit-exact with `VLLM_RBLN_MOE_REDUCE_SCATTER=0`.** With the
-default `VLLM_RBLN_MOE_REDUCE_SCATTER=1`, batch>1 defer is nondeterministic vs sync (near-tie flips)
-— NOT a deferral bug: the MoE EP **reduce_scatter reduces cross-rank in data-arrival order**, and the
-async worker thread's wakeup jitter varies that order (sync stays deterministic via tight main-thread
-DP-barrier lockstep). Reproduces with `RBLN_DYNAMO_ASYNC=1` (no overlap) and is NOT fixed by
-`RBLN_RUNTIME_FORCE_SYNC=1` (per-rank op drain). With **`VLLM_RBLN_MOE_REDUCE_SCATTER=0`** the defer
-path is **16/16 bit-exact to sync + deterministic** on full gpt-oss-120b DP4 batch=4. Proper fix =
-deterministic (fixed rank-order) reduce_scatter in `librbln-ccl.so` (RBLN CCL team); until then use
-RS=0 for batch>1. See `async_overlap_TODO.md` TODO 1.
-
 The feature is gated behind `RBLN_DYNAMO_ASYNC=defer` (plus RBLN device sampler +
 async scheduling). With the gate off, behavior is identical to dev.
 

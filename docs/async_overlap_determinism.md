@@ -67,7 +67,7 @@ Evidence (batch=1 DP4 L18, `--repro-run` determinism):
 - **Sampler is faithful**: device argmax == host argmax at every step — a device-runtime
   interaction between the deferral and the interposed logprobs graphs, not wrong math.
 - **Refuted hypotheses** (each still flipped): MoE-combine padding (re-zeroing the pad via
-  `get_tokens_mask`), reduce_scatter-specific (RS=0 all_reduce flips too), the get_output
+  `get_tokens_mask`), reduce_scatter-specific, the get_output
   copy-thread fix (pre-existing), compute_logprobs-corrupts-argmax (sampler reorder,
   argmax-first), per-op `RBLN_RUNTIME_FORCE_SYNC`, and disabling the caching allocator
   (`RBLN_DISABLE_EAGER_CACHE_ALLOC`).
