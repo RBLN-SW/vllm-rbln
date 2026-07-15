@@ -34,6 +34,8 @@ repos:
 - repo: https://github.com/astral-sh/uv-pre-commit
   rev: 0.9.1
   hooks:
+    - id: uv-lock
+      args: ["--check"]
     - id: pip-compile
       args: [requirements/test.in, -o, requirements/test.txt]
       files: ^requirements/test\.(in|txt)$
