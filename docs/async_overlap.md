@@ -115,6 +115,25 @@ main/worker gloo thread-safety), keeping the forward async so all_reduce↔forwa
 **or in SSW/platform**: a graceful/longer cross-rank timeout for the on-device collective so
 intermittent MoE skew doesn't hard-abort + reset. This blocks TODO 2.
 
+**Pinpointed to the collective (2026-07-15):** the MoE dispatch is `rcclAllToAllX`
+(`ccl_runtime_op.cc:493`, flag `RBLN_CCL_ALLTOALLX_NB` default false = the barrier variant, which
+does an *initial cross-rank readiness barrier*). Under defer, ranks reach it host-jitter-skewed; the
+late-peer wait hits the FW device watchdog → abort (`-EIO`, EVENT-IRQ path, verified via dmesg +
+kmd/umd experts). `=1` (inline-await) is clean because lockstep keeps the wait short.
+
+**Ruled out as fixes (all verified on full DP4 defer):**
+- vllm-rbln **host barrier before the forward submit** — identical abort (CCL is mid-graph, not at
+  submit) + hurt perf. Reverted.
+- **`MKL_NUM_THREADS=1`** (reduce host jitter) — reduced frequency but STILL aborted (MK3/5). Not a fix.
+- **`RBLN_CCL_ALLTOALLX_NB=1`** (skip the readiness barrier) — STILL aborted (NBD2 `SYS_TASK_ABORTED`).
+  So the abort is NOT the readiness barrier; it's the cross-rank **data exchange itself** stalling on a
+  skewed peer, independent of the barrier.
+
+**Remaining viable directions (device-level RCCL/rbln only — no host gloo):** (a) bound cross-rank
+skew so the collective wait is always short (async-pipeline redesign: pre-queue/device-chain the next
+forward, or use the collectives themselves as device-level sync points as `=1` implicitly does); or
+(b) FW/SSW: make the collective tolerate bounded skew (watchdog/timeout).
+
 ## TODO 2 — remove the logprobs `force_sync`
 
 The deferred sampler is wrapped in `force_sync()` when logprobs are on
