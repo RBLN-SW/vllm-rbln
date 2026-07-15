@@ -94,8 +94,26 @@ after a task abort is a batch-lifecycle failure in exactly this shared-instance/
 model. The token-0 fix (rebel_compiler `44f3614427`) already had to bolt `WaitForDeviceCompletion()`
 after `Run()` for the same reason.
 
-**Goal:** root cause is found (above); implement the cross-rank-alignment fix and make async
-abort-free like sync (target: full DP4 defer 10/10 clean). This blocks TODO 2.
+**Deeper mechanism (2026-07-15, graph-trace verified):** the forward (compute + compute_logits)
+is **one fused async submission** — `dev_ops=37` under DP4+EP with the MoE **CCL op(s) as nodes
+in the MIDDLE of that single graph** (DP1: `dev_ops=1`, no CCL). So the CCL cannot be isolated at
+the submission level. MoE compute is data-dependent, so ranks reach the mid-graph CCL at slightly
+different times; under defer (forward left in flight + variable host work between forwards:
+deferred argmax, prep, all_reduce) that skew intermittently exceeds the FW watchdog → the CCL job
+is device-aborted. `=1` (inline-await each forward) stays clean because each forward's CCL acts as
+a natural cross-rank barrier and runahead is blocked.
+
+**A host barrier before the forward submit does NOT work** (verified: identical abort, and it hurt
+perf) — the CCL is mid-graph, so aligning the graph's *submit* doesn't align the *CCL node's*
+device execution.
+
+**Fix altitude (conclusion):** an overlap-preserving fix is NOT achievable from vllm-rbln/Python —
+the only Python levers are inline-await the forward (= sync, no overlap) or barrier the submit
+(proven not to align the mid-graph CCL). It must live in **rebel_compiler runtime**: a cross-rank
+alignment immediately before the `CCL_OP` node executes on the worker (dedicated process group for
+main/worker gloo thread-safety), keeping the forward async so all_reduce↔forward overlap survives;
+**or in SSW/platform**: a graceful/longer cross-rank timeout for the on-device collective so
+intermittent MoE skew doesn't hard-abort + reset. This blocks TODO 2.
 
 ## TODO 2 — remove the logprobs `force_sync`
 
