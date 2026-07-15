@@ -562,7 +562,9 @@ def test_pp_balance_decode_spreads_microbatch(monkeypatch):
         if balance:
             monkeypatch.setenv("VLLM_RBLN_PP_BALANCE_DECODE_BATCH", "1")
         else:
-            monkeypatch.delenv("VLLM_RBLN_PP_BALANCE_DECODE_BATCH", raising=False)
+            # Force the static cap explicitly: the default is now on under PP,
+            # so unsetting would still give the balanced (dynamic) behavior.
+            monkeypatch.setenv("VLLM_RBLN_PP_BALANCE_DECODE_BATCH", "0")
         # max_num_seqs=16, pp=2 -> static cap 8; n=6 active -> ceil(6/2)=3.
         scheduler = create_scheduler(
             max_num_seqs=16, pipeline_parallel_size=2, block_size=16

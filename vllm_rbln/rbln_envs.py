@@ -87,7 +87,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_USE_W8A16: bool = False
     # --- NIXL ---
     VLLM_RBLN_NIXL_SWA_VIEW_OPT: bool = False
-    VLLM_RBLN_PP_BALANCE_DECODE_BATCH: bool = False
+    VLLM_RBLN_PP_BALANCE_DECODE_BATCH: bool = True
 
 
 def get_num_devices_per_local_rank() -> int:
@@ -425,10 +425,12 @@ environment_variables = {
     # max_num_seqs // pp_size), spreading available decodes across the
     # pp_size in-flight microbatches instead of packing them into one. This
     # avoids PP-depth collapse (one stage left idle, ~2x decode latency) after
-    # a pipeline drain. No-op for pp_size == 1. Opt-in; default keeps the
-    # static max_num_seqs // pp_size cap.
+    # a pipeline drain. On by default under PP (the dynamic cap only ever caps
+    # lower than the static one, never overflows the bucket, and matches it at
+    # saturation); set False to force the static max_num_seqs // pp_size cap.
+    # No-op for pp_size == 1.
     "VLLM_RBLN_PP_BALANCE_DECODE_BATCH": lambda: (
-        os.environ.get("VLLM_RBLN_PP_BALANCE_DECODE_BATCH", "False").lower()
+        os.environ.get("VLLM_RBLN_PP_BALANCE_DECODE_BATCH", "True").lower()
         in ("true", "1")
     ),
 }

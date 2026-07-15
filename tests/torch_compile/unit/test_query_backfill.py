@@ -177,6 +177,15 @@ class TestSchedulerBackfillUnderPP:
     cap must not shrink an admitted req's spec query window.
     """
 
+    @pytest.fixture(autouse=True)
+    def _static_decode_cap(self, monkeypatch):
+        # These tests assert against the STATIC per-step decode cap
+        # (max_num_seqs // pp). Disable the dynamic PP-balancing spread (on by
+        # default), which would otherwise size the cap to ceil(demand / pp) and
+        # change which reqs are admitted -- orthogonal to the backfill decision
+        # under test here.
+        monkeypatch.setenv("VLLM_RBLN_PP_BALANCE_DECODE_BATCH", "0")
+
     @pytest.mark.parametrize("pp_size", [1, 2])
     def test_backfill_decision_invariant_under_pp(self, pp_size):
         """The per-req backfill decision (slide / trim / drafts) is identical
