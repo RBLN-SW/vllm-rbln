@@ -180,14 +180,23 @@ class RBLNOptimumModelRunner(
         # Sampler
         self.use_rbln_sampler = envs.VLLM_RBLN_SAMPLER
         if self.use_rbln_sampler:
+            assert not vllm_config.model_config.use_fp64_gumbel, (
+                "RBLNSampler does not support use_fp64_gumbel=True. "
+                "Set VLLM_RBLN_SAMPLER=0 to use the CPU sampler, which "
+                "supports fp64 Gumbel-noise sampling."
+            )
             logger.info("Using RBLN sampler: %s", self.use_rbln_sampler)
             self.pooled_tensors: dict[int, torch.Tensor] = {}
             sampler = RBLNSampler(
                 logprobs_mode=self.model_config.logprobs_mode,
+                use_fp64_gumbel=False,
             )
         else:
             logger.info("Using default vLLM sampler.")
-            sampler = Sampler(logprobs_mode=self.model_config.logprobs_mode)
+            sampler = Sampler(
+                logprobs_mode=self.model_config.logprobs_mode,
+                use_fp64_gumbel=vllm_config.model_config.use_fp64_gumbel,
+            )
         self.sampler = sampler
 
         # Attention groups are not supported.
@@ -210,7 +219,6 @@ class RBLNOptimumModelRunner(
             max_model_len=self.max_model_len,
             max_num_batched_tokens=self.max_num_tokens,
             device=self.device,
-            pin_memory=self.pin_memory,
             vocab_size=self.model_config.get_vocab_size(),
             block_sizes=[cache_config.block_size],
             kernel_block_sizes=[cache_config.block_size],  # FIXME: why do we need this?
