@@ -58,6 +58,8 @@ class RBLNEagleProposer(EagleProposer):
                 self.compile_context = runner.compile_context
             else:
                 self.compile_context = CompileContext(use_weight_sharing=True)
+        else:
+            self.compile_context = None
 
         if self.supports_mm_inputs:
             raise NotImplementedError("Multimodal inputs are not supported yet.")
@@ -768,6 +770,8 @@ class RBLNEagleProposer(EagleProposer):
         }
         if envs.VLLM_RBLN_USE_DEVICE_TENSOR:
             options["model_trace_method"] = "export"
+        else:
+            options["compile_context"] = self.compile_context
         if not envs.VLLM_DISABLE_COMPILE_CACHE:
             logger.info(
                 "Once the model is compiled for the first time, "
