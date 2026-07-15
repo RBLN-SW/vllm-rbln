@@ -1038,7 +1038,7 @@ class TestCrossBlockNoSpecRollback:
         assert sched_out.scheduled_spec_decode_tokens[rid] == [777]
 
         # The runner forces query_len=1 for the collective no-spec step.
-        scrub_scheduler_output_for_no_spec(sched_out)
+        scrub_scheduler_output_for_no_spec(sched_out, scheduler.requests)
         assert sched_out.num_scheduled_tokens[rid] == 1
 
         # The model emits a single (no-spec) token; the engine must roll the
@@ -1049,3 +1049,100 @@ class TestCrossBlockNoSpecRollback:
         # is rolled back. BUG (scheduled_spec_decode_tokens cleared in the
         # scrub): rollback is skipped and it stays at 1026.
         assert req.num_computed_tokens == _BLOCK_SIZE + 1  # 1025
+
+
+# ---------------------------------------------------------------------------
+# Issue 3: no-spec is a DECODE concern (cross-block backfill on a decoding
+# request). In DP/EP each rank runs prefill-only OR decode-only. When a decode
+# rank elects no-spec, the cross-DP OR-reduce forces EVERY rank to the no-spec
+# path -- including a PREFILL rank. The scrub then wrongly clamps that rank's
+# prefill query_len (its chunk) to 1, so the prefill's sampled token is later
+# discarded (seq_lens < num_tokens) and the request is lost. no-spec must apply
+# to decode requests only; a prefill's query_len must be left untouched.
+# ---------------------------------------------------------------------------
+
+
+class TestNoSpecScrubPrefill:
+    def test_prefill_query_len_intact_without_scrub(self):
+        """Baseline: a prefill req is scheduled with its full chunk (>1)."""
+        scheduler = _scheduler()
+        req = _request(512, "P")
+        scheduler.add_request(req)  # prefill phase (NOT advanced to decode)
+        sched_out = scheduler.schedule()
+        rid = req.request_id
+        assert sched_out.num_scheduled_tokens[rid] > 1
+
+    def test_no_spec_scrub_must_not_clamp_prefill(self):
+        """BUG repro: the no-spec scrub (fired by a peer decode rank's
+        cross-block fallback via the cross-DP OR-reduce) must NOT clamp a
+        PREFILL rank's query_len to 1.
+
+        BEFORE FIX: scrub sets num_scheduled_tokens[prefill]=1 -> this FAILS.
+        AFTER FIX: prefill query_len preserved -> PASSES.
+        """
+        scheduler = _scheduler()
+        req = _request(512, "P")
+        scheduler.add_request(req)  # prefill-only rank
+        sched_out = scheduler.schedule()
+        rid = req.request_id
+        chunk = sched_out.num_scheduled_tokens[rid]
+        assert chunk > 1, "precondition: prefill scheduled with a real chunk"
+
+        # A peer decode rank elected no-spec -> this prefill rank is scrubbed.
+        # scrub excludes prefill reqs (via is_prefill) from the clamp.
+        scrub_scheduler_output_for_no_spec(sched_out, scheduler.requests)
+
+        assert sched_out.num_scheduled_tokens[rid] == chunk, (
+            f"prefill query_len wrongly clamped to "
+            f"{sched_out.num_scheduled_tokens[rid]} (was {chunk}) by no-spec scrub"
+        )
+
+    def test_no_spec_scrub_must_not_clamp_intermediate_chunked_prefill(self):
+        """Intermediate chunked prefill: a CACHED req still processing its
+        prompt (num_output == 0, num_computed < num_prompt) must ALSO be
+        excluded from the no-spec scrub -- not just the first (new-req) chunk.
+        """
+        scheduler = create_scheduler(
+            block_size=_BLOCK_SIZE,
+            num_blocks=100,
+            max_num_seqs=10,
+            num_speculative_tokens=_NUM_SPEC_TOKENS,
+            long_prefill_token_threshold=256,  # force multi-chunk prefill
+        )
+        req = _request(1024, "C")  # 1024-token prompt -> 256-token chunks
+        scheduler.add_request(req)
+        rid = req.request_id
+
+        # chunk 1: NEW req prefill (no output committed -> still prefilling).
+        sched1 = scheduler.schedule()
+        assert sched1.num_scheduled_tokens[rid] == 256
+        scheduler.update_from_output(sched1, create_runner_output(sched1, None))
+
+        # chunk 2: now a CACHED req, still prefilling (num_output == 0).
+        sched2 = scheduler.schedule()
+        assert req.num_computed_tokens < req.num_prompt_tokens  # still prefilling
+        assert not sched2.scheduled_new_reqs  # exercises the cached-req path
+        chunk = sched2.num_scheduled_tokens[rid]
+        assert chunk > 1
+
+        # A peer decode rank elected no-spec -> this chunked-prefill rank is
+        # scrubbed. The intermediate chunk must NOT be clamped to 1.
+        scrub_scheduler_output_for_no_spec(sched2, scheduler.requests)
+        assert sched2.num_scheduled_tokens[rid] == chunk, (
+            f"intermediate chunked-prefill query_len wrongly clamped to "
+            f"{sched2.num_scheduled_tokens[rid]} (was {chunk}) by no-spec scrub"
+        )
+
+    def test_no_spec_scrub_still_clamps_decode(self):
+        """Guard the fix's scope: a DECODE req (num_output > 0) must still be
+        clamped to query_len=1 by the no-spec scrub."""
+        scheduler = _scheduler()
+        req = _request(_BLOCK_SIZE, "D")
+        advance_to_decode(scheduler, req)  # now decode
+        req.spec_token_ids = []  # cross-block no-spec election
+        sched_out = scheduler.schedule()
+        rid = req.request_id
+        assert sched_out.step_no_spec_required is True
+        # decode req (num_output > 0) is NOT a prefill -> gets clamped.
+        scrub_scheduler_output_for_no_spec(sched_out, scheduler.requests)
+        assert sched_out.num_scheduled_tokens[rid] == 1
