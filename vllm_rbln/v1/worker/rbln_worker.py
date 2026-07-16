@@ -316,9 +316,17 @@ class RBLNWorker(WorkerBase):
                 draft_parallel_config = self.parallel_config
 
             draft_quantization = getattr(draft_model_config, "quantization", None)
-            if draft_quantization is not None:
+            if (
+                draft_quantization is not None
+                and (method := getattr(speculative_config, "method", None)) != "mtp"
+            ):
+                # MTP draft shares the target checkpoint and inherits its
+                # quantization (e.g. fp8 for DeepSeek-V3),
+                # Eagle/Medusa draft are separately-trained models and
+                # quantized variants are not validated on RBLN yet.
                 raise ValueError(
-                    f"draft model quantization is not supported: {draft_quantization}"
+                    f"draft model quantization is not supported for "
+                    f"{method=}: {draft_quantization}"
                 )
 
             model_kernel_size = estimate_model_kernel_size(

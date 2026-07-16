@@ -1995,6 +1995,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         num_tokens = num_tokens_per_req * num_reqs
         assert num_tokens <= self.max_num_tokens
         assert num_reqs <= self.max_num_reqs
+        draft_num_tokens_padded = num_tokens_padded
 
         num_scheduled_tokens_list = [num_tokens_per_req] * num_reqs
         num_scheduled_tokens = np.array(num_scheduled_tokens_list, dtype=np.int32)
@@ -2082,6 +2083,16 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             **build_kv_cache_forward_context_kwargs(self.kv_cache_bases),
         ):
             _ = self.model_executable(**staged_model_input.as_kwargs())
+
+        if self.speculative_config and self.speculative_config.use_eagle():
+            assert isinstance(self.drafter, RBLNEagleProposer)
+            if is_prefill or num_tokens_per_req == 1 + self.num_spec_tokens:
+                self.drafter.dummy_run(
+                    num_reqs,
+                    num_tokens_per_req,
+                    is_prefill,
+                    num_padded_tokens=draft_num_tokens_padded,
+                )
 
         self.input_batch.num_tokens_no_spec[:num_reqs] = 0
 
@@ -2881,17 +2892,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 for size in self.bucketing_manager.batch_buckets:
                     self._dummy_sampler_run(size)
 
-            # 5. drafter
-            if self.speculative_config:
-                if self.speculative_config.method == "medusa":
-                    self.drafter.dummy_run()
-                elif self.speculative_config.use_eagle():
-                    # prefill
-                    self.drafter.dummy_run(1, self.max_num_tokens, True)
-
-                    # decode
-                    for num_req in self.bucketing_manager.decode_batch_buckets:
-                        self.drafter.dummy_run(num_req, 1, False)
+            # 5. specdec (medusa)
+            if self.speculative_config and self.speculative_config.method == "medusa":
+                self.drafter.dummy_run()
 
     def _process_kv_cache_copy_ops(
         self,

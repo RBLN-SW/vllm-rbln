@@ -29,7 +29,7 @@ from vllm_rbln.compilation import (
     build_process_group_dict,
     compile,
 )
-from vllm_rbln.forward_context import set_forward_context
+from vllm_rbln.forward_context import RBLNDPMetadata, set_forward_context
 from vllm_rbln.logger import init_logger
 from vllm_rbln.platform import USE_DEVICE_TENSOR
 from vllm_rbln.utils import pad
@@ -96,11 +96,8 @@ class RBLNEagleProposer(EagleProposer):
 
         # Build attention metadata
         num_reqs = self.runner.input_batch.num_reqs
-        self.runner.bucketing_manager.find_decode_batch_bucket(num_reqs)
-        num_reqs_padded = (
-            self.runner.bucketing_manager.find_decode_batch_bucket(num_reqs)
-            if not is_prefill
-            else num_reqs
+        num_reqs_padded, num_padded_tokens, num_tokens_across_dp = (
+            self._determine_draft_batch_padding(num_reqs, num_tokens, is_prefill)
         )
         per_layer_attn_metadata: dict[str, object] = {}
         for attn_group in self.draft_attn_groups:
@@ -130,7 +127,6 @@ class RBLNEagleProposer(EagleProposer):
         )
         inputs_embeds = None
 
-        num_padded_tokens, num_tokens_across_dp = None, None
         with set_forward_context(
             per_layer_attn_metadata,
             self.vllm_config,
@@ -192,8 +188,8 @@ class RBLNEagleProposer(EagleProposer):
             # common_attn_metadata._seq_lens_cpu = None
             # common_attn_metadata._num_computed_tokens_cpu = None
 
-        num_reqs_padded = self.runner.bucketing_manager.find_decode_batch_bucket(
-            num_reqs
+        num_reqs_padded, num_padded_tokens, num_tokens_across_dp = (
+            self._determine_draft_batch_padding(num_reqs, num_reqs, False)
         )
         for token_index in range(self.num_speculative_tokens - 1):
             # Update the inputs
@@ -227,11 +223,7 @@ class RBLNEagleProposer(EagleProposer):
                     per_layer_attn_metadata[layer_name] = attn_metadata
 
             input_ids, positions, hidden_states, _ = self._preprocess(
-                num_reqs,
-                num_reqs_padded,
-                num_reqs,
-                None,
-                False,
+                num_reqs, num_reqs_padded, num_reqs, None, False
             )
 
             # Run the model.
@@ -386,7 +378,11 @@ class RBLNEagleProposer(EagleProposer):
                 hidden_states=hidden_states,
                 inputs_embeds=inputs_embeds,
             )
-            last_hidden_states, hidden_states = ret_hidden_states
+            if not self.model_returns_tuple():
+                last_hidden_states = ret_hidden_states
+                hidden_states = last_hidden_states
+            else:
+                last_hidden_states, hidden_states = ret_hidden_states
 
             hidden_states = hidden_states.view(-1, self.hidden_size)
             last_hidden_states = last_hidden_states.view(-1, self.hidden_size)
@@ -454,15 +450,20 @@ class RBLNEagleProposer(EagleProposer):
         num_reqs: int,
         num_tokens_per_req: int,
         is_prefill: bool,
+        *,
+        num_padded_tokens: int | None = None,
     ) -> None:
-        if not is_prefill:
-            num_tokens_per_req += self.num_speculative_tokens
         num_tokens = num_tokens_per_req * num_reqs
         assert num_tokens <= self.max_num_tokens
+        override_padded = num_padded_tokens
 
         common_attn_metadata = self._build_dummy_attn_metadata(
             num_reqs, num_tokens_per_req
         )
+        num_reqs_padded, dp_padded, num_tokens_across_dp = (
+            self._determine_draft_batch_padding(num_reqs, num_tokens, is_prefill)
+        )
+        num_padded_tokens = override_padded or dp_padded
 
         per_layer_attn_metadata: dict[str, object] = {}
         for attn_group in self.draft_attn_groups:
@@ -470,7 +471,7 @@ class RBLNEagleProposer(EagleProposer):
                 common_attn_metadata=common_attn_metadata,
                 positions=self.positions[:num_tokens],
                 is_prefill=is_prefill,
-                batch_pad=num_reqs,
+                batch_pad=num_reqs_padded,
             )
             attach_kv_cache_bindings(
                 attn_metadata,
@@ -487,12 +488,15 @@ class RBLNEagleProposer(EagleProposer):
         )
         input_ids, positions, hidden_states, token_indices_to_sample_padded = (
             self._preprocess(
-                num_reqs, num_reqs, num_tokens, token_indices_to_sample, is_prefill
+                num_reqs,
+                num_reqs_padded,
+                num_tokens,
+                token_indices_to_sample,
+                is_prefill,
             )
         )
         inputs_embeds = None
 
-        num_padded_tokens, num_tokens_across_dp = None, None
         with set_forward_context(
             per_layer_attn_metadata,
             self.vllm_config,
@@ -523,9 +527,10 @@ class RBLNEagleProposer(EagleProposer):
             self.device
         )
 
-        num_reqs_padded = self.runner.bucketing_manager.find_decode_batch_bucket(
-            num_reqs
+        num_reqs_padded, dp_padded, num_tokens_across_dp = (
+            self._determine_draft_batch_padding(num_reqs, num_reqs, False)
         )
+        num_padded_tokens = override_padded or dp_padded
         per_layer_attn_metadata.clear()
         for attn_group in self.draft_attn_groups:
             attn_metadata = attn_group.get_metadata_builder().build(
@@ -544,28 +549,25 @@ class RBLNEagleProposer(EagleProposer):
                 per_layer_attn_metadata[layer_name] = attn_metadata
 
         input_ids, positions, hidden_states, _ = self._preprocess(
-            num_reqs,
-            num_reqs_padded,
-            num_reqs,
-            None,
-            False,
+            num_reqs, num_reqs_padded, num_reqs, None, False
         )
 
-        with set_forward_context(
-            per_layer_attn_metadata,
-            self.vllm_config,
-            num_tokens=num_reqs,
-            num_tokens_across_dp=num_tokens_across_dp,
-            num_padded_tokens=num_padded_tokens,
-            **build_kv_cache_forward_context_kwargs(self.runner.kv_cache_bases),
-        ):
-            _, _ = self.model_executable(
-                input_ids=input_ids,
-                positions=positions,
-                hidden_states=hidden_states,
-                inputs_embeds=inputs_embeds,
-                last_token_indices=None,
-            )
+        for _ in range(self.num_speculative_tokens - 1):
+            with set_forward_context(
+                per_layer_attn_metadata,
+                self.vllm_config,
+                num_tokens=num_reqs,
+                num_tokens_across_dp=num_tokens_across_dp,
+                num_padded_tokens=num_padded_tokens,
+                **build_kv_cache_forward_context_kwargs(self.runner.kv_cache_bases),
+            ):
+                _, _ = self.model_executable(
+                    input_ids=input_ids,
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    inputs_embeds=inputs_embeds,
+                    last_token_indices=None,
+                )
 
     def _preprocess(
         self,
@@ -576,8 +578,8 @@ class RBLNEagleProposer(EagleProposer):
         is_prefill: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         if is_prefill:
-            input_ids = self.input_ids.view(num_reqs_padded, -1)
-            positions = self.positions.view(num_reqs_padded, -1)
+            input_ids = self.input_ids.view(num_reqs, -1)
+            positions = self.positions.view(num_reqs, -1)
             target_hidden_states = self.hidden_states
         else:
             input_ids = self.input_ids[:num_input_tokens].view(num_reqs, -1)
@@ -604,3 +606,39 @@ class RBLNEagleProposer(EagleProposer):
             target_hidden_states,
             token_indices_to_sample_padded,
         )
+
+    def _determine_draft_batch_padding(
+        self,
+        num_reqs: int,
+        num_tokens: int,
+        is_prefill: bool,
+    ) -> tuple[int, int | None, torch.Tensor | None]:
+        num_reqs_padded = (
+            self.runner.bucketing_manager.find_decode_batch_bucket(num_reqs)
+            if not is_prefill
+            else num_reqs
+        )
+        dp_size = self.vllm_config.parallel_config.data_parallel_size
+        if dp_size == 1:
+            return num_reqs_padded, None, None
+
+        num_tokens_across_dp, num_reqs_across_dp = (
+            RBLNDPMetadata.num_tokens_and_reqs_across_dp(
+                num_tokens, num_reqs, dp_size, self.dp_rank, is_prefill
+            )
+        )
+        num_tokens_padded = self.max_num_tokens
+        if self.runner.specialized_moe_decode and not is_prefill:
+            if num_reqs_across_dp is None:
+                num_reqs_padded = self.runner.bucketing_manager.decode_batch_buckets[-1]
+            else:
+                num_reqs_padded = (
+                    self.runner.bucketing_manager.find_decode_batch_bucket(
+                        int(num_reqs_across_dp.max())
+                    )
+                )
+                max_tokens_per_req = int(
+                    (num_tokens_across_dp // num_reqs_across_dp).max()
+                )
+                num_tokens_padded = num_reqs_padded * max_tokens_per_req
+        return num_reqs_padded, num_tokens_padded, num_tokens_across_dp
