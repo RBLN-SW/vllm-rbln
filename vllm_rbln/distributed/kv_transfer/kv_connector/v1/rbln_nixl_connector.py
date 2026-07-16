@@ -241,6 +241,41 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
 
         self.use_host_buffer = self.kv_buffer_device == "cpu"
 
+        # Route NIXL transport through the RBLN backend when the nixl-rbln
+        # adapter is installed. Upstream's default backend ("UCX") cannot
+        # register RBLN host/device buffers, so `register_memory` must target
+        # "RBLN". Set nixl_backends here (after super().__init__ built the
+        # agent with the upstream default) rather than via the agent config:
+        # the agent config would eagerly create the RBLN backend with no
+        # customParams and fail with NIXL_ERR_BACKEND ("'listen_ip'
+        # customParam is required"). Instead the backend is created in
+        # register_kv_caches() through nixl_rbln.ensure_rbln_backend(), which
+        # supplies listen_ip="auto" + rbln_ctx_ptr.
+        try:
+            import nixl_rbln  # noqa: F401
+
+            self._use_rbln_nixl_backend = True
+        except ImportError:
+            self._use_rbln_nixl_backend = False
+
+        if self._use_rbln_nixl_backend:
+            self.nixl_backends = ["RBLN"]
+
+    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
+        """Create the RBLN NIXL backend before upstream registers memory.
+
+        Upstream's `register_memory(..., backends=["RBLN"])` (called by the
+        base `register_kv_caches`) requires the "RBLN" backend to already
+        exist on the agent. `nixl_rbln.ensure_rbln_backend` creates it
+        idempotently with the required listen_ip="auto" + rbln_ctx_ptr
+        customParams (the generic agent-config path omits these).
+        """
+        if self._use_rbln_nixl_backend:
+            import nixl_rbln
+
+            nixl_rbln.ensure_rbln_backend(self.nixl_wrapper, device_id=0)
+        super().register_kv_caches(kv_caches)
+
     def initialize_host_xfer_buffer(self, kv_caches: dict[str, torch.Tensor]) -> None:
         """
         Initialize transfer buffer in CPU mem for accelerators
