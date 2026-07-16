@@ -34,6 +34,7 @@ from . import (
     mla,
     models_utils,
     oot,
+    profiler,
     qwen2_moe,
     qwen3_moe,
     rotary_embedding,

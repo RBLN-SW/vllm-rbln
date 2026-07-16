@@ -57,7 +57,6 @@ if TYPE_CHECKING:
     VLLM_RBLN_AUTO_PORT: bool = False
     VLLM_RBLN_ENFORCE_MODEL_FP32: bool = False
     VLLM_RBLN_NUM_RAY_NODES: int = 1
-    VLLM_RBLN_PROFILER: bool = False
     # --- ATTENTION ---
     VLLM_RBLN_FLASH_CAUSAL_ATTN: bool = True
     VLLM_RBLN_BATCH_ATTN_OPT: bool = False
@@ -263,9 +262,6 @@ environment_variables = {
     # Number of Ray nodes
     "VLLM_RBLN_NUM_RAY_NODES": lambda: int(
         os.environ.get("VLLM_RBLN_NUM_RAY_NODES", 1)
-    ),
-    "VLLM_RBLN_PROFILER": (
-        lambda: os.environ.get("RBLN_PROFILER", "False").lower() in ("true", "1")
     ),
     # --- ATTENTION ---
     # Use flash attention for causal attention

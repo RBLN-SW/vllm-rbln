@@ -405,12 +405,6 @@ class RblnPlatform(Platform):
             or parallel_config.enable_expert_parallel
         )
         if use_model_parallel:
-            if envs.VLLM_RBLN_PROFILER:
-                raise ValueError(
-                    "RBLN_PROFILER is not supported when using vLLM model parallel "
-                    "(TP, DP, EP, or PP)."
-                )
-
             if (
                 parallel_config.data_parallel_size > 1
                 and scheduler_config.max_num_batched_tokens
