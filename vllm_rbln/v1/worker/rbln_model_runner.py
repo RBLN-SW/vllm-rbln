@@ -2109,12 +2109,16 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         def dummy_float_tensor(buffer: torch.Tensor, value: float | None):
             if value is None:
                 return None
-            return buffer[:num_reqs].fill_(float(value)).to(self.device)
+            return torch.full(
+                (num_reqs,), float(value), dtype=buffer.dtype, device=self.device
+            )
 
         def dummy_int_tensor(buffer: torch.Tensor, value: int | float | None):
             if value is None:
                 return None
-            return buffer[:num_reqs].fill_(int(value)).to(self.device)
+            return torch.full(
+                (num_reqs,), int(value), dtype=buffer.dtype, device=self.device
+            )
 
         for config in WARM_UP_CONFIGS:
             dummy_metadata = SamplingMetadata(
@@ -2921,7 +2925,7 @@ def _pad_rows(t: torch.Tensor | None, bucket: int) -> torch.Tensor | None:
     if t is None:
         return None
     if (n := t.shape[0]) >= bucket:
-        return t
+        return t.clone()
     pad = t[-1:].expand(bucket - n, *t.shape[1:])
     return torch.cat([t, pad], dim=0)
 
