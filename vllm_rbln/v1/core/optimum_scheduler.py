@@ -265,6 +265,9 @@ class RBLNOptimumScheduler(Scheduler):
         # In-flight requests still prefilling (prefill chunks + in-progress
         # async KV loads). Their remaining-block reservation gates async loads.
         self._inflight_prefills: set[Request] = set()
+        # Scheduler iteration counter. Drives the V2+PP+async decode-throttle
+        # cadence (`next_decode_eligible_step`).
+        self.current_step = 0
 
     def schedule(self, throttle_prefills: bool = False) -> RBLNSchedulerOutput:
         self.current_step += 1
