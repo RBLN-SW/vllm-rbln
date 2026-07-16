@@ -24,7 +24,7 @@ import pytest
 import torch
 from torch._dynamo.exc import BackendCompilerFailed
 from vllm.sequence import IntermediateTensors
-from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
+from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 # ---------------------------------------------------------------------------
@@ -1063,7 +1063,11 @@ class TestExecuteModel:
         pp.return_value.send_tensor_dict.assert_called_once()
         assert result is None
 
-    def test_kv_connector_finished(self):
+    def test_kv_connector_output_not_passed_through(self):
+        # A non-last PP rank returns None even when its KV-connector reports
+        # completion: that output is surfaced via the two-phase sample_tokens
+        # path (mirroring upstream), not through execute_model. The intermediate
+        # tensors are still sent to the next stage.
         worker = _create_worker()
         kv = MagicMock()
         kv.finished_sending = True
@@ -1079,25 +1083,8 @@ class TestExecuteModel:
             pp.return_value.is_last_rank = False
             result = worker.execute_model(self._make_scheduler_output())
 
-        assert result.kv_connector_output is kv
-
-    def test_kv_connector_not_finished(self):
-        worker = _create_worker()
-        kv = MagicMock()
-        kv.finished_sending = False
-        kv.finished_recving = False
-        it = IntermediateTensors({"h": torch.zeros(1)})
-        it.kv_connector_output = kv
-        worker.model_runner = MagicMock()
-        worker.model_runner.execute_model.return_value = it
-        worker.vllm_config.parallel_config.distributed_executor_backend = "ray"
-
-        with patch("vllm_rbln.v1.worker.rbln_worker.get_pp_group") as pp:
-            pp.return_value.is_first_rank = True
-            pp.return_value.is_last_rank = False
-            result = worker.execute_model(self._make_scheduler_output())
-
-        assert result is EMPTY_MODEL_RUNNER_OUTPUT
+        pp.return_value.send_tensor_dict.assert_called_once()
+        assert result is None
 
 
 # ===========================================================================

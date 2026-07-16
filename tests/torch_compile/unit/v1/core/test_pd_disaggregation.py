@@ -1159,6 +1159,7 @@ def _build_connector_worker(
 
     vllm_config = MagicMock()
     vllm_config.cache_config = CacheConfig(block_size=block_size)
+    vllm_config.parallel_config.pipeline_parallel_size = 1
     kv_cache_config = MagicMock()
     kv_cache_config.num_blocks = num_blocks
     if kv_cache_specs is not None:
@@ -1175,6 +1176,10 @@ def _build_connector_worker(
         self.kv_cache_config = kv_cache_config_
         self.kv_buffer_device = kv_buffer_device
         self._block_size = {}
+        # Real NixlConnectorWorker.register_kv_caches sets this; the host-bounce
+        # override reads it after super(). Default to the pre-register state so
+        # tests that mock super() don't hit AttributeError.
+        self.xfer_handshake_metadata = None
 
     modules_patch = (
         # Mask `nixl_rbln` from sys.modules so `import nixl_rbln` raises
@@ -1666,6 +1671,7 @@ class TestRblnNixlConnectorSchedulerHostBufferFlag:
         cfg.kv_transfer_config.kv_buffer_device = kv_buffer_device
         cfg.parallel_config = MagicMock()
         cfg.parallel_config.tensor_parallel_size = 1
+        cfg.parallel_config.pipeline_parallel_size = 1
         return cfg
 
     def _build(self, kv_buffer_device):

@@ -13,7 +13,6 @@
 # limitations under the License.
 """A RBLN worker class."""
 
-import copy
 import os
 import time
 from types import NoneType
@@ -52,7 +51,6 @@ from vllm.tasks import SupportedTask
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import (
-    EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
     DraftTokenIds,
     ModelRunnerOutput,
@@ -405,8 +403,18 @@ class RBLNWorker(WorkerBase):
         if (metadata := connector.get_handshake_metadata()) is None:
             return None
 
-        tp_rank = get_tp_group().rank_in_group
-        return {tp_rank: metadata}
+        # Key by a flat intra-engine global rank so pipeline-parallel stages
+        # don't collide when EngineCore merges the per-worker dicts
+        # (`content.update`) — with `{tp_rank: ...}` every PP stage shares the
+        # same tp_rank and all but one stage's metadata would be dropped.
+        # Layout is PP x TP, so global_rank = pp_rank * tp_size + tp_rank; for
+        # pp_size==1 this reduces to tp_rank, leaving non-PP behavior unchanged.
+        # The consumer enumerates the same scheme when fanning out its
+        # side-channel handshake.
+        tp_group = get_tp_group()
+        tp_rank = tp_group.rank_in_group
+        global_rank = get_pp_group().rank_in_group * tp_group.world_size + tp_rank
+        return {global_rank: metadata}
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return self.model_runner.get_kv_cache_spec()
@@ -592,21 +600,12 @@ class RBLNWorker(WorkerBase):
 
         # NOTE - DO NOT all_gather_group for RBLN pp
         get_pp_group().send_tensor_dict(output.tensors)
-        kv_connector_output = output.kv_connector_output
-        if not kv_connector_output:
-            return None
-
-        # In case of PP with kv transfer, we need to pass through the
-        # kv_connector_output
-        if (
-            not kv_connector_output.finished_sending
-            and not kv_connector_output.finished_recving
-        ):
-            return EMPTY_MODEL_RUNNER_OUTPUT
-
-        output = copy.copy(EMPTY_MODEL_RUNNER_OUTPUT)
-        output.kv_connector_output = kv_connector_output
-        return output
+        # Non-last PP rank: the intermediate tensors are sent above; its
+        # KV-connector output is surfaced in the two-phase sample_tokens path
+        # (mirroring upstream GPUModelRunner). The engine consumes this
+        # execute_model result only for error propagation, so return None like
+        # upstream gpu_worker -- passing the KV output through here is dead.
+        return None
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         return self.model_runner.take_draft_token_ids()
