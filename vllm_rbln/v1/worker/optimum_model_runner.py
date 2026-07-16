@@ -1098,7 +1098,6 @@ class RBLNOptimumModelRunner(
                 logger.debug("Sampling metadata: %s", metadata)
 
                 with torch.inference_mode():
-                    print("@@@ dtype", self.model_config.dtype)
                     empty_logits = torch.empty(
                         batch_size,
                         input_batch.vocab_size,
