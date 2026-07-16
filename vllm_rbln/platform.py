@@ -29,7 +29,6 @@ else:
 import rebel
 from torch._dynamo import register_backend
 from vllm.platforms import Platform, PlatformEnum
-from vllm.utils.torch_utils import _StreamPlaceholder
 
 import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
@@ -51,6 +50,17 @@ def bypass_backend(graph_module: torch.fx.GraphModule, example_inputs):
 
 
 register_backend(name="bypass", compiler_fn=bypass_backend)
+
+
+class _StreamPlaceholder:
+    # Local copy of vllm.utils.torch_utils._StreamPlaceholder. That module
+    # computes `PIN_MEMORY = is_pin_memory_available()` at import time (vLLM
+    # 0.24), which resolves the platform and imports this module while
+    # torch_utils is still initializing. Importing the symbol from there at top
+    # level therefore hits a partially initialized module (circular import), so
+    # we duck-type our own here (only `.synchronize()` is required).
+    def __init__(self):
+        self.synchronize = lambda: None
 
 
 class RblnPlatform(Platform):
