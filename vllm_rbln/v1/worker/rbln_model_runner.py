@@ -2342,13 +2342,30 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         return self.model.compute_logits(hidden_states)
 
     def _make_weights_contiguous(self) -> None:
-        # weight-free compile hard-errors on non-contiguous CPU weights.
+        """Force model weights contiguous before weight-free compile, which
+        hard-errors on non-contiguous CPU tensors.
+
+        torch.export lifts three kinds of stored tensors as graph inputs that
+        the compiler treats as weights: PARAMETER, BUFFER, and CONSTANT_TENSOR.
+        parameters()/buffers() cover the first two; plain tensor attributes on
+        submodules (e.g. MLA's ``self.W_UV = W_UV.transpose(0, 1)``) are lifted
+        as CONSTANT_TENSOR and are reached here via each module's ``__dict__``.
+
+        Limitation: only tensors held as direct module attributes are covered.
+        Tensors inside container attributes (``self.x = [t]``, ``{"k": t}``) or
+        on non-Module holder objects (``self.cfg.t``) are also lifted as
+        CONSTANT_TENSOR but are not reachable this way and are still missed.
+        """
         for p in self.model.parameters():
             if not p.is_contiguous():
                 p.set_(p.contiguous())
         for b in self.model.buffers():
             if not b.is_contiguous():
                 b.set_(b.contiguous())
+        for module in self.model.modules():
+            for name, value in list(module.__dict__.items()):
+                if isinstance(value, torch.Tensor) and not value.is_contiguous():
+                    setattr(module, name, value.contiguous())
 
     @torch.inference_mode()
     def warm_up_model(self) -> None:
