@@ -2344,7 +2344,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     def _make_weights_contiguous(self) -> None:
         """Force weights contiguous before weight-free compile, which hard-errors
         on non-contiguous CPU tensors. Covers parameters, buffers, and plain
-        tensor attributes (torch.export lifts the latter as CONSTANT_TENSOR)."""
+        tensor attributes."""
         for p in self.model.parameters():
             if not p.is_contiguous():
                 p.set_(p.contiguous())
