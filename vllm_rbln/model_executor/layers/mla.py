@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import torch
+from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 from vllm.model_executor.layers.mla import MultiHeadLatentAttentionWrapper
 
 
@@ -91,3 +92,17 @@ def __MLAAttentionWrapper_forward(
 
 
 MultiHeadLatentAttentionWrapper.forward = __MLAAttentionWrapper_forward
+_orig_mla_process_weights = MLAAttention.process_weights_after_loading
+
+
+def __MLAAttention_process_weights_after_loading(self, act_dtype: torch.dtype):
+    _orig_mla_process_weights(self, act_dtype)
+    if getattr(self, "W_UK_T", None) is not None:
+        self.W_UK_T = self.W_UK_T.contiguous()
+    if getattr(self, "W_UV", None) is not None:
+        self.W_UV = self.W_UV.contiguous()
+
+
+MLAAttention.process_weights_after_loading = (
+    __MLAAttention_process_weights_after_loading
+)
