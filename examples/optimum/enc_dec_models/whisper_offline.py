@@ -11,18 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import asyncio
-
 import fire
 from transformers import WhisperProcessor
-from vllm import AsyncEngineArgs, AsyncLLMEngine, SamplingParams
+from vllm import LLM, SamplingParams
 
 VALID_TASKS = {"transcribe", "translate"}
 
 
 def generate_prompts(
     batch_size: int,
-    model_id: str,
+    model: str,
     task: str,
     language: str,
 ):
@@ -36,7 +34,7 @@ def generate_prompts(
     )
     dataset = dataset.take(batch_size)
     messages = []
-    processor = WhisperProcessor.from_pretrained(model_id)
+    processor = WhisperProcessor.from_pretrained(model)
     forced_decoder_ids = processor.get_decoder_prompt_ids(
         language=language,
         task=task,
@@ -55,53 +53,9 @@ def generate_prompts(
     return messages
 
 
-async def generate(engine: AsyncLLMEngine, request_id, request):
-    results_generator = engine.generate(
-        request,
-        SamplingParams(
-            temperature=0,
-            ignore_eos=False,
-            skip_special_tokens=True,
-            max_tokens=448,
-        ),
-        str(request_id),
-    )
-
-    final_output = None
-    async for request_output in results_generator:
-        final_output = request_output
-    return final_output
-
-
-async def main(
-    inputs: list,
-    model_id: str,
-    max_num_seqs: int,
-):
-    engine_args = AsyncEngineArgs(
-        model=model_id,
-        limit_mm_per_prompt={"audio": 1},
-        max_num_seqs=max_num_seqs,
-    )
-
-    engine = AsyncLLMEngine.from_engine_args(engine_args)
-
-    futures = []
-    for request_id, request in enumerate(inputs):
-        futures.append(asyncio.create_task(generate(engine, request_id, request)))
-
-    results = await asyncio.gather(*futures)
-
-    for i, result in enumerate(results):
-        output = result.outputs[0].text
-        print(f"===================== Output {i} ==============================")
-        print(output)
-        print("===============================================================\n")
-
-
-def entry_point(
+def main(
     num_input_prompt: int = 1,
-    model_id: str = "openai/whisper-base",
+    model: str = "openai/whisper-base",
     max_num_seqs: int = 1,
     task: str = "transcribe",
     language: str = "en",
@@ -110,15 +64,29 @@ def entry_point(
         raise ValueError(
             f"Invalid task {task!r}. Whisper supports: {sorted(VALID_TASKS)}"
         )
-    inputs = generate_prompts(num_input_prompt, model_id, task, language)
-    asyncio.run(
-        main(
-            inputs=inputs,
-            model_id=model_id,
-            max_num_seqs=max_num_seqs,
-        )
+    inputs = generate_prompts(num_input_prompt, model, task, language)
+
+    llm = LLM(
+        model=model,
+        limit_mm_per_prompt={"audio": 1},
+        max_num_seqs=max_num_seqs,
     )
+
+    sampling_params = SamplingParams(
+        temperature=0,
+        ignore_eos=False,
+        skip_special_tokens=True,
+        max_tokens=448,
+    )
+
+    results = llm.generate(inputs, sampling_params)
+
+    for i, result in enumerate(results):
+        output = result.outputs[0].text
+        print(f"===================== Output {i} ==============================")
+        print(output)
+        print("===============================================================\n")
 
 
 if __name__ == "__main__":
-    fire.Fire(entry_point)
+    fire.Fire(main)
