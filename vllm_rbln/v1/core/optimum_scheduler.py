@@ -200,6 +200,7 @@ class RBLNOptimumScheduler(Scheduler):
         self.kv_cache_manager = RBLNKVCacheManager(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
+            scheduler_block_size=self.block_size,
             max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
             enable_caching=self.cache_config.enable_prefix_caching,
             use_eagle=False,
@@ -250,7 +251,7 @@ class RBLNOptimumScheduler(Scheduler):
         self.use_v2_model_runner = False
         self._pause_state: PauseState = PauseState.UNPAUSED
 
-    def schedule(self) -> RBLNSchedulerOutput:
+    def schedule(self, throttle_prefills: bool = False) -> RBLNSchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
