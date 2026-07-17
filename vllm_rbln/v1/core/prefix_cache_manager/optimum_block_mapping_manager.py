@@ -80,14 +80,30 @@ class BlockMappingManager:
     def _detach_inner_from_stale_outer(
         self, inner_block_id: int, new_outer_block_id: int
     ) -> None:
-        """
-        Lazy update. Broken premise: an inner block is reassigned only after its
-        outer block is evicted. vLLM 0.24.0 violates this — a freed inner block
-        can be reallocated to another request while its previous outer block is
-        still a live cache donor. If this inner block was mapped to a different
-        outer block, drop it from that block's inner list to keep the
-        forward/reverse indexes consistent (otherwise evicting the stale outer
-        block would clobber this live mapping).
+        """Detach an inner block from its previous outer block on reassignment.
+
+        Why this is needed:
+            The inner->outer mapping is dissolved only in `_evict_block`, which
+            `can_allocate` triggers only when free outer blocks are insufficient.
+
+            <= 0.22: inner blocks were also reused only under pool pressure
+                (freed blocks go to the TAIL of the vLLM free queue), so an
+                inner block was reassigned around the same time its outer block
+                was evicted — reconciling the index at eviction
+                (`remove_mapping`) was enough.
+            0.24.0: unhashed freed blocks go to the HEAD of the queue and are
+                reused first, so an inner block is reassigned even while free
+                blocks remain — `can_allocate` still finds enough and never
+                evicts, so the stale mapping is never dissolved. The index must
+                be reconciled here, at reassignment time, not only at eviction.
+
+        What it does:
+            On reassignment, drop this inner block from the previous outer
+            block's inner list so the forward (`_block_mappings`) and reverse
+            (`_inner_to_outer`) indexes stay consistent. Otherwise a later
+            eviction of the stale outer block would pop this inner id and
+            clobber the live mapping created here, making prefix cache-hit
+            lookups miss.
         """
         prev_outer_block_id = self._inner_to_outer.get(inner_block_id)
         if prev_outer_block_id is None or prev_outer_block_id == new_outer_block_id:
