@@ -1011,7 +1011,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # Compute the draft token ids.
         # draft_token_indices:      [  1,   2,   3, 105, 106, 208]
         draft_token_ids = self.input_ids[logits_indices]
-        draft_token_ids = draft_token_ids[target_logits_indices + 1]
+        draft_token_ids = draft_token_ids[target_logits_indices + 1].to(self.device)
 
         return SpecDecodeMetadata(
             draft_token_ids=draft_token_ids,
