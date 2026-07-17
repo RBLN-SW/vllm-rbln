@@ -18,7 +18,7 @@ from dataclasses import dataclass, field, replace
 
 import numpy as np
 
-import vllm_rbln.rbln_envs as envs
+from vllm_rbln import envs
 from vllm_rbln.logger import init_logger, make_file_handler
 
 logger = init_logger(__name__)
