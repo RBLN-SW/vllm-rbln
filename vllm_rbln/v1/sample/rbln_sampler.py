@@ -122,6 +122,15 @@ class RBLNSampler(VLLMSampler):
         compile_context: rebel.CompileContext | None = None,
     ):
         super().__init__()
+
+        compile_context = (
+            compile_context
+            or create_compile_context(
+                use_global_ctx=True,
+            )
+            if not USE_DEVICE_TENSOR
+            else None
+        )
         if logprobs_mode in ("raw_logprobs", "raw_logits"):
             self.topk_topp_sampler = RBLNTopKTopPSampler(
                 logprobs_mode=logprobs_mode, compile_context=compile_context
@@ -132,14 +141,6 @@ class RBLNSampler(VLLMSampler):
                 "Using native sampler instead."
             )
 
-        compile_context = (
-            compile_context
-            or create_compile_context(
-                use_global_ctx=True,
-            )
-            if not USE_DEVICE_TENSOR
-            else None
-        )
         self._compiled_greedy_sample = compile(
             rbln_greedy_sample,
             dynamic=False,
