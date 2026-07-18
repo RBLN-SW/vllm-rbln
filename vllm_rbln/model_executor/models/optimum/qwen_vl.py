@@ -348,6 +348,7 @@ class RBLNOptimumQwenVLForConditionalGeneration(
             self.model.decoder = self.model.decoders[padded_batch_size]
             input_ids = kwargs.pop("input_ids")
             inputs_embeds = self.model.embed_tokens(input_ids)
+            assert inputs_embeds.dtype == self.dtype
             logits = self.model.decoder(
                 inputs_embeds=inputs_embeds,
                 cache_position=cache_position,
@@ -457,6 +458,7 @@ class RBLNOptimumQwenVLForConditionalGeneration(
             deepstack_image_embeds = _concat_deepstack(
                 image_caches, "deepstack_image_embeds"
             )
+            assert deepstack_image_embeds.dtype == self.dtype
 
         if video_caches:
             video_embeds = torch.cat([c["video_embeds"] for c in video_caches], dim=0)
