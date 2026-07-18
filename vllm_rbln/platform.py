@@ -297,7 +297,6 @@ class RblnPlatform(Platform):
                 model_config.disable_cascade_attn = True
 
         else:
-            # # NOTE(eunji.lee):
             if forces_fp32_dtype(vllm_config.model_config):
                 model_config.dtype = torch.float32
 
