@@ -163,6 +163,7 @@ class RBLNOptimumPaliGemmaForConditionalGeneration(
         """
         max_seq_len = rbln_model_config.max_seq_len
         seq_range = torch.arange(max_seq_len).unsqueeze(0)  # (1, max_seq_len,)
-        attention_mask = (seq_range <= cache_position).to(rbln_model_config.torch_dtype)
+        attention_mask = seq_range <= cache_position
+        assert attention_mask.dtype == self.dtype
         position_ids = cache_position.clone()
         return attention_mask, position_ids
