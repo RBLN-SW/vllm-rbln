@@ -555,9 +555,8 @@ class RBLNOptimumMultimodalMixin(SupportsMultiModal):
             return inputs_embeds
 
         # Flatten per-item embeddings into (num_mm_tokens, hidden_size).
-        mm_embeds = torch.cat(list(multimodal_embeddings)).to(
-            inputs_embeds.device, inputs_embeds.dtype
-        )
+        mm_embeds = torch.cat(list(multimodal_embeddings))
+        assert mm_embeds.dtype == self.dtype
         scatter_mask = is_multimodal.unsqueeze(-1).expand_as(inputs_embeds)
         return inputs_embeds.masked_scatter(scatter_mask, mm_embeds)
 

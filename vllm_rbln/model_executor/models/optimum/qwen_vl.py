@@ -347,7 +347,7 @@ class RBLNOptimumQwenVLForConditionalGeneration(
             padded_batch_size = kwargs.pop("padded_batch_size", self.decoder_batch_size)
             self.model.decoder = self.model.decoders[padded_batch_size]
             input_ids = kwargs.pop("input_ids")
-            inputs_embeds = self.model.embed_tokens(input_ids).to(self.dtype)
+            inputs_embeds = self.model.embed_tokens(input_ids)
             logits = self.model.decoder(
                 inputs_embeds=inputs_embeds,
                 cache_position=cache_position,
@@ -427,8 +427,6 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         """
         Build prefill_decoder kwargs from cached encoder outputs (EC consumer).
         """
-        model_dtype = self.dtype
-
         image_caches = [c for c in cached_mm_outputs if "image_embeds" in c]
         video_caches = [c for c in cached_mm_outputs if "video_embeds" in c]
 
@@ -438,7 +436,7 @@ class RBLNOptimumQwenVLForConditionalGeneration(
                 return None
             num_layers = len(present[0][key])
             return [
-                torch.cat([c[key][layer].to(model_dtype) for c in present], dim=0)
+                torch.cat([c[key][layer] for c in present], dim=0)
                 for layer in range(num_layers)
             ]
 
@@ -448,9 +446,8 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         deepstack_video_embeds = None
 
         if image_caches:
-            image_embeds = torch.cat(
-                [c["image_embeds"].to(model_dtype) for c in image_caches], dim=0
-            )
+            image_embeds = torch.cat([c["image_embeds"] for c in image_caches], dim=0)
+            assert image_embeds.dtype == self.dtype
             image_grid_thw = torch.cat(
                 [c["image_grid_thw"].to(torch.int64) for c in image_caches], dim=0
             )
@@ -462,9 +459,8 @@ class RBLNOptimumQwenVLForConditionalGeneration(
             )
 
         if video_caches:
-            video_embeds = torch.cat(
-                [c["video_embeds"].to(model_dtype) for c in video_caches], dim=0
-            )
+            video_embeds = torch.cat([c["video_embeds"] for c in video_caches], dim=0)
+            assert video_embeds.dtype == self.dtype
             video_grid_thw = torch.cat(
                 [c["video_grid_thw"].to(torch.int64) for c in video_caches], dim=0
             )

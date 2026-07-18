@@ -33,7 +33,7 @@ from vllm.platforms import Platform, PlatformEnum
 from vllm_rbln import envs
 from vllm_rbln.logger import init_logger
 from vllm_rbln.utils.optimum.converter import sync_vllm_and_optimum
-from vllm_rbln.utils.optimum.predicates import is_qwen3_pooling
+from vllm_rbln.utils.optimum.predicates import is_qwen3_pooling, forces_fp32_dtype
 from vllm_rbln.utils.optimum.registry import (
     is_enc_dec_arch,
     is_multi_modal,
@@ -297,12 +297,9 @@ class RblnPlatform(Platform):
                 model_config.disable_cascade_attn = True
 
         else:
-            # NOTE(eunji.lee):
-            # It is for multimodal models
-            # to generate inputs as fp32, not bfloat16
-            # even though the model is compiled with bfloat16
-            model_config.dtype = torch.float
-            assert model_config.dtype == torch.float
+            # # NOTE(eunji.lee):
+            if forces_fp32_dtype(vllm_config.model_config):
+                model_config.dtype = torch.float32
 
             if parallel_config.worker_cls == "auto":
                 parallel_config.worker_cls = (
