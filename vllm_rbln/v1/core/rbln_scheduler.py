@@ -171,6 +171,7 @@ class RBLNSchedulerOutput(SchedulerOutput):
     # positions' logits are discarded; past KV gets idempotently
     # re-written. Empty / missing key => slide_distance is 0 (no slide).
     spec_decode_slide_distance: dict[str, int] = field(default_factory=dict)
+    request_trace_headers: dict[str, dict[str, str]] = field(default_factory=dict)
 
 
 def is_prefill(request: Request) -> bool:
@@ -1228,6 +1229,11 @@ class RBLNScheduler(Scheduler):
             new_block_ids_to_zero=new_block_ids_to_zero,
             step_no_spec_required=step_no_spec_required,
             spec_decode_slide_distance=spec_decode_slide_distance,
+            request_trace_headers={
+                req_id: dict(trace_headers)
+                for req_id in num_scheduled_tokens
+                if (trace_headers := self.requests[req_id].trace_headers) is not None
+            },
         )
 
         # Drain pending copy ops from the KV cache manager.

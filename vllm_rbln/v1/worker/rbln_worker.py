@@ -65,6 +65,7 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.utils import (
     finalize_kv_cache_registrations,
 )
 from vllm_rbln.logger import init_logger
+from vllm_rbln.tracing import batch_span_attributes, start_batch_span
 from vllm_rbln.v1.worker.rbln_model_runner import RBLNModelRunner
 from vllm_rbln.v1.worker.utils import (
     estimate_available_memory,
@@ -579,7 +580,22 @@ class RBLNWorker(WorkerBase):
                 get_pp_group().recv_tensor_dict()
             )
 
-        output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
+        span_attributes = batch_span_attributes(scheduler_output.num_scheduled_tokens)
+        span_attributes["vllm.worker_rank"] = self.rank
+        with start_batch_span(
+            "vllm.model_execute",
+            enabled=(
+                forward_pass
+                and self.vllm_config.observability_config.collect_model_execute_time
+            ),
+            request_trace_headers=getattr(
+                scheduler_output, "request_trace_headers", {}
+            ),
+            attributes=span_attributes,
+        ):
+            output = self.model_runner.execute_model(
+                scheduler_output, intermediate_tensors
+            )
         if isinstance(output, ModelRunnerOutput | NoneType):
             return output
 
