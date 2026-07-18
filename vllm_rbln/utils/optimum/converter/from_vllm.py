@@ -20,7 +20,11 @@ from vllm_rbln.utils.optimum.registry import (
     is_pooling_arch,
 )
 
-from .common import update_block_size, update_max_num_batched_tokens
+from .common import (
+    update_block_size,
+    update_max_num_batched_tokens,
+    update_prefill_chunk_size,
+)
 from .params import RBLNParams
 
 if TYPE_CHECKING:
@@ -82,7 +86,11 @@ def sync_from_vllm(vllm_config: VllmConfig) -> None:
             "  2) `kvcache_block_size` under "
             "`additional_config={'rbln_config': {...}}`.\n"
         )
-
+    update_prefill_chunk_size(
+        vllm_config,
+        prefill_chunk_size=params.prefill_chunk_size,
+        image_prefill_chunk_size=params.image_prefill_chunk_size,
+    )
     update_block_size(
         vllm_config,
         vllm_config.cache_config.block_size,

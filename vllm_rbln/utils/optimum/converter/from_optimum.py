@@ -21,7 +21,11 @@ from vllm_rbln.utils.optimum.block_size import (
     is_full_block_available,
 )
 
-from .common import update_block_size, update_max_num_batched_tokens
+from .common import (
+    update_block_size,
+    update_max_num_batched_tokens,
+    update_prefill_chunk_size,
+)
 from .params import RBLNParams
 
 if TYPE_CHECKING:
@@ -103,7 +107,9 @@ def sync_from_optimum(
         vllm_config.scheduler_config.max_num_seqs,
     )
     update_max_num_batched_tokens(vllm_config, params.max_seq_len)
-
+    update_prefill_chunk_size(
+        vllm_config, params.prefill_chunk_size, params.image_prefill_chunk_size
+    )
     # Set block_size in cache_config based on rbln_config.json
     # (also persists prefill_chunk_size / image-prefill buckets into
     # additional_config).
