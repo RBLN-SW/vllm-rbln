@@ -125,6 +125,7 @@ def _make_vllm_config(
         scheduler_config=_make_scheduler_config(),
         device_config=SimpleNamespace(device=torch.device("cpu"), device_type="cpu"),
         kv_transfer_config=None,
+        observability_config=SimpleNamespace(collect_model_execute_time=False),
         instance_id="test-instance",
     )
 
@@ -1008,6 +1009,8 @@ class TestExecuteModel:
     def _make_scheduler_output(self, total_tokens=10):
         so = MagicMock()
         so.total_num_scheduled_tokens = total_tokens
+        so.num_scheduled_tokens = {"req-0": total_tokens} if total_tokens else {}
+        so.request_trace_headers = {}
         return so
 
     def test_basic_forward(self):
@@ -1032,6 +1035,58 @@ class TestExecuteModel:
             result = worker.execute_model(self._make_scheduler_output(0))
 
         assert result is None
+
+    def test_detailed_trace_wraps_model_execute(self):
+        worker = _create_worker(rank=3)
+        worker.vllm_config.observability_config.collect_model_execute_time = True
+        worker.model_runner = MagicMock()
+        output = MagicMock(spec=ModelRunnerOutput)
+        events = []
+
+        def _record_execute(*_):
+            events.append("execute")
+            return output
+
+        worker.model_runner.execute_model.side_effect = _record_execute
+        scheduler_output = self._make_scheduler_output(7)
+        scheduler_output.request_trace_headers = {
+            "req-0": {
+                "traceparent": (
+                    "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01"
+                )
+            }
+        }
+
+        class RecordingSpan:
+            def __enter__(self):
+                events.append("span-enter")
+
+            def __exit__(self, *_):
+                events.append("span-exit")
+
+        with (
+            patch("vllm_rbln.v1.worker.rbln_worker.get_pp_group") as pp,
+            patch(
+                "vllm_rbln.v1.worker.rbln_worker.start_batch_span",
+                return_value=RecordingSpan(),
+            ) as start_span,
+        ):
+            pp.return_value.is_first_rank = True
+            result = worker.execute_model(scheduler_output)
+
+        assert result is output
+        assert events == ["span-enter", "execute", "span-exit"]
+        start_span.assert_called_once_with(
+            "vllm.model_execute",
+            enabled=True,
+            request_trace_headers=scheduler_output.request_trace_headers,
+            attributes={
+                "vllm.request_ids": ["req-0"],
+                "vllm.num_requests": 1,
+                "vllm.num_scheduled_tokens": 7,
+                "vllm.worker_rank": 3,
+            },
+        )
 
     def test_not_first_rank_receives_tensors(self):
         worker = _create_worker()

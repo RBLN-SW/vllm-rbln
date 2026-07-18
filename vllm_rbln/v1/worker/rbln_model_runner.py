@@ -69,6 +69,7 @@ from vllm.v1.attention.backends.utils import (
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 
 from vllm_rbln.forward_context import set_forward_context
+from vllm_rbln.tracing import batch_span_attributes, start_batch_span
 from vllm_rbln.v1.core.rbln_scheduler import RBLNSchedulerOutput
 from vllm_rbln.v1.sample.rbln_sampler import resolve_compile_context
 
@@ -3729,7 +3730,23 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 LoRAInputs.set_sampler_indices_padded(sampler_indices_padded)
 
             model_start_time = time.perf_counter()
-            with capture_ctx as reports:
+            span_attributes = batch_span_attributes(
+                scheduler_output.num_scheduled_tokens
+            )
+            span_attributes["vllm.execution_phase"] = (
+                "prefill" if is_prefill_phase else "decode"
+            )
+            with (
+                capture_ctx as reports,
+                start_batch_span(
+                    "vllm.model_forward",
+                    enabled=self.observability_config.collect_model_forward_time,
+                    request_trace_headers=getattr(
+                        scheduler_output, "request_trace_headers", {}
+                    ),
+                    attributes=span_attributes,
+                ),
+            ):
                 model_output = self.model_executable(
                     input_ids=input_ids,
                     positions=positions,

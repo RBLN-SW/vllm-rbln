@@ -33,6 +33,7 @@ from vllm.utils.torch_utils import _StreamPlaceholder
 
 import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
+from vllm_rbln.tracing import configure_batch_span_link_limit
 from vllm_rbln.utils.optimum.predicates import is_qwen3_pooling
 from vllm_rbln.utils.optimum.registry import (
     is_enc_dec_arch,
@@ -340,6 +341,13 @@ class RblnPlatform(Platform):
             from vllm_rbln.utils.optimum.converter import sync_vllm_and_optimum
 
             sync_vllm_and_optimum(vllm_config)
+
+        observability_config = vllm_config.observability_config
+        if (
+            observability_config.collect_model_execute_time
+            or observability_config.collect_model_forward_time
+        ):
+            configure_batch_span_link_limit(scheduler_config.max_num_seqs)
 
         if (
             parallel_config.distributed_executor_backend is not None

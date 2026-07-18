@@ -57,6 +57,21 @@ def test_schedule():
     assert len(output.finished_req_ids) == 0
 
 
+def test_schedule_propagates_trace_headers():
+    scheduler = create_scheduler(max_num_seqs=1)
+    request = create_requests(num_requests=1)[0]
+    trace_headers = {
+        "traceparent": "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01"
+    }
+    request.trace_headers = trace_headers
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.request_trace_headers == {request.request_id: trace_headers}
+    assert output.request_trace_headers[request.request_id] is not trace_headers
+
+
 def test_schedule_chunked_prefill():
     scheduler = create_scheduler(max_num_batched_tokens=256)
     request = create_requests(num_requests=1, num_tokens=500)[0]
