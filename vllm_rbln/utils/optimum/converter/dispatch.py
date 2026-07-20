@@ -72,6 +72,7 @@ def _generate_model_path_name(
         "block_size": block_size,
         "max_model_len": max_model_len,
         "num_devices": num_devices,
+        "dtype": str(vllm_config.model_config.dtype),
     }
     if additional_config:
         config_dict["rbln_config"] = _strip_runtime_only_keys(additional_config)

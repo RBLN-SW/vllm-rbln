@@ -15,6 +15,7 @@
 from dataclasses import dataclass
 from typing import Any
 
+import torch
 from transformers import PretrainedConfig
 
 import optimum.rbln
@@ -72,6 +73,12 @@ class RBLNCompileSpec:
 
     model_cls: Any
     rbln_config: dict[str, Any]
+    # dtype to compile the HF model in. optimum-rbln derives the compiled
+    # ``rbln_config.dtype`` from the loaded model's dtype (it ignores any
+    # ``dtype`` placed in ``rbln_config``), so the caller must forward this as
+    # the top-level ``dtype`` kwarg to ``from_pretrained``. None lets
+    # optimum-rbln fall back to its own default.
+    dtype: torch.dtype | None = None
 
     @classmethod
     def for_architecture(
@@ -83,6 +90,7 @@ class RBLNCompileSpec:
         max_model_len: int,
         num_devices: int,
         prefill_chunk_size: int | None = None,
+        dtype: torch.dtype | None = None,
         rbln_overrides: dict[str, Any] | None = None,
     ) -> "RBLNCompileSpec":
         """Build a compile spec from vllm-rbln inputs, dispatched by architecture."""
@@ -131,6 +139,7 @@ class RBLNCompileSpec:
         # submodule's tensor_parallel_size from the number of devices assigned
         # to it (e.g. ``visual.device``); falls back to the merged default.
         _sync_submodule_tp_with_device(spec.rbln_config)
+        spec.dtype = dtype
         return spec
 
     @classmethod
