@@ -14,6 +14,7 @@
 
 import contextlib
 import itertools
+import json
 import os
 import time
 from collections import defaultdict
@@ -709,8 +710,15 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         )
 
         self.performance_tracker: PerformanceTracker | None = None
+        self.model_performance_tracker: PerformanceTracker | None = None
+        self.sampler_performance_tracker: PerformanceTracker | None = None
         self.e2e_performance_tracker: PerformanceTracker | None = None
         self._pending_model_report: StepReport | None = None
+        # Last model/sampler reports of the current step, kept for the per-step
+        # trace row (VLLM_RBLN_STEP_TRACE_FILE); cleared each execute_model.
+        self._last_model_report: StepReport | None = None
+        self._last_sampler_report: StepReport | None = None
+        self._step_trace_index: int = 0
         self.e2e_start_time: float = 0.0
         self.e2e_end_time: float = 0.0
 
@@ -730,12 +738,87 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     def _enable_performance_tracker(self):
         if envs.VLLM_RBLN_METRICS:
             self.performance_tracker = PerformanceTracker("MODEL+SAMPLER")
+            self.model_performance_tracker = PerformanceTracker("MODEL")
+            self.sampler_performance_tracker = PerformanceTracker("SAMPLER")
             self.e2e_performance_tracker = PerformanceTracker("E2E")
 
     def _flush_pending_model_report(self):
         if self.performance_tracker is not None and self._pending_model_report:
             self.performance_tracker.record(self._pending_model_report)
+            if self.model_performance_tracker is not None:
+                self.model_performance_tracker.record(self._pending_model_report)
             self._pending_model_report = None
+
+    def _write_step_trace(
+        self,
+        scheduler_output: "SchedulerOutput",
+        is_prefill_phase: bool,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> None:
+        """Append one JSONL row for this execute_model step (per-rank).
+
+        Emits batch size, per-req prompt/context/query lens, no_spec flag and
+        the prepare/forward/sample/e2e breakdown so a sweep can be sliced by
+        (batch, context, phase, no_spec) offline. Requires VLLM_RBLN_METRICS
+        for the model/sampler timings to be populated.
+        """
+        if not envs.VLLM_RBLN_STEP_TRACE_FILE:
+            return
+        fh = getattr(self, "_step_trace_fh", None)
+        if fh is None:
+            root, ext = os.path.splitext(envs.VLLM_RBLN_STEP_TRACE_FILE)
+            path = f"{root}.{os.getpid()}{ext or '.jsonl'}"
+            try:
+                fh = open(path, "a", buffering=1)  # line-buffered
+            except OSError as e:
+                logger.warning("Failed to open step trace file %s: %s", path, e)
+                self._step_trace_fh = False  # don't retry
+                return
+            self._step_trace_fh = fh
+        elif fh is False:
+            return
+
+        req_ids = list(self.input_batch.req_ids)
+        n = len(req_ids)
+        query_lens = [
+            int(scheduler_output.num_scheduled_tokens.get(r, 0)) for r in req_ids
+        ]
+        context_lens = [
+            int(self.input_batch.num_computed_tokens_cpu[i]) for i in range(n)
+        ]
+        prompt_lens = [int(self.input_batch.num_prompt_tokens[i]) for i in range(n)]
+        spec_enabled = self.num_spec_tokens > 0
+        no_spec = spec_enabled and all(q <= 1 for q in query_lens)
+
+        m = self._last_model_report
+        s = self._last_sampler_report
+
+        def _us(rep, attr):
+            return None if rep is None else getattr(rep, attr)
+
+        row = {
+            "idx": self._step_trace_index,
+            "rank": self.vllm_config.parallel_config.data_parallel_rank,
+            "phase": "prefill" if is_prefill_phase else "decode",
+            "num_reqs": n,
+            "token_count": int(scheduler_output.total_num_scheduled_tokens),
+            "spec_enabled": spec_enabled,
+            "spec_active": spec_decode_metadata is not None,
+            "no_spec": no_spec,
+            "prompt_lens": prompt_lens,
+            "context_lens": context_lens,
+            "query_lens": query_lens,
+            "e2e_ms": (time.perf_counter() - self.e2e_start_time) * 1000.0,
+            "model_ms": None if m is None else m.latency * 1000.0,
+            "sample_ms": None if s is None else s.latency * 1000.0,
+            "prepare_us": _us(m, "prepare_time"),
+            "model_device_us": _us(m, "device_time"),
+            "model_host_us": _us(m, "host_time"),
+            "model_ccl_us": _us(m, "ccl_time"),
+            "sample_device_us": _us(s, "device_time"),
+        }
+        self._step_trace_index += 1
+        fh.write(json.dumps(row) + "\n")
 
     def _get_positions(self, num_tokens: Any):
         if isinstance(num_tokens, int):
@@ -2338,6 +2421,14 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 else sampler_report
             )
             self.performance_tracker.record(combined)
+            # Also record model-forward and sample separately so the two can be
+            # broken out (combined merges them into one measurement).
+            if model_report is not None and self.model_performance_tracker:
+                self.model_performance_tracker.record(model_report)
+            if self.sampler_performance_tracker:
+                self.sampler_performance_tracker.record(sampler_report)
+            self._last_model_report = model_report
+            self._last_sampler_report = sampler_report
 
         return sampler_output
 
@@ -3134,6 +3225,11 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         """Entry point for a DP-idle rank's step (called by the worker)."""
         if self.serialize_pd_phases and self._pd_phase_vote(PD_PHASE_IDLE):
             # Mixed step: peers run two phase-pure forwards; join both.
+            logger.debug(
+                "PD serialize: mixed step, dp_rank=%d IDLE -> joining both "
+                "phases with dummy runs",
+                self.vllm_config.parallel_config.data_parallel_rank,
+            )
             self.dummy_run()
         self.dummy_run()
 
@@ -3417,6 +3513,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         num_padded_tokens: int | None = None,
     ) -> Union[ModelRunnerOutput, IntermediateTensors, None]:
         self.e2e_start_time = time.perf_counter()
+        self._last_model_report = None
+        self._last_sampler_report = None
         if self.execute_model_state is not None:
             raise RuntimeError(
                 "State error: sample_tokens() must be called "
@@ -3459,8 +3557,20 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     # Phase 1 is this rank's real prefill; the decode-phase
                     # dummy run fires at the end of sample_tokens(), after
                     # the real drafter propose (collective ordering).
+                    logger.debug(
+                        "PD serialize: mixed step, dp_rank=%d PREFILL -> "
+                        "real prefill now (phase 1), dummy decode deferred "
+                        "(phase 2)",
+                        self.vllm_config.parallel_config.data_parallel_rank,
+                    )
                     self._pd_phase2_pending = True
                 elif mixed:
+                    logger.debug(
+                        "PD serialize: mixed step, dp_rank=%d DECODE -> "
+                        "dummy join of prefill phase 1, real decode as "
+                        "phase 2",
+                        self.vllm_config.parallel_config.data_parallel_rank,
+                    )
                     # Join the peers' prefill phase with a dummy run, then
                     # fall through to run the real decode as phase 2. The
                     # phase-2 shape collective below then sees no prefill
@@ -3946,6 +4056,11 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 # Serialized mixed step, prefill rank: phase 1 (real prefill
                 # + propose) is done; join the peers' decode phase.
                 self._pd_phase2_pending = False
+                logger.debug(
+                    "PD serialize: dp_rank=%d PREFILL phase 1 done -> "
+                    "joining decode phase 2 with dummy run",
+                    self.vllm_config.parallel_config.data_parallel_rank,
+                )
                 self.dummy_run()
 
     def _sample_tokens_impl(
@@ -4116,6 +4231,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 reports=[],
                 token_count=scheduler_output.total_num_scheduled_tokens,
             )
+
+        self._write_step_trace(scheduler_output, is_prefill_phase, spec_decode_metadata)
 
         if not self.use_async_scheduling:
             return output

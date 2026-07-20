@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_ENABLE_WARM_UP: bool = True
     VLLM_RBLN_METRICS: bool = False
     VLLM_RBLN_METRICS_FILE: str = ""
+    VLLM_RBLN_STEP_TRACE_FILE: str = ""
     VLLM_RBLN_NUMA: bool = True
 
     # ====================================================================
@@ -242,6 +243,12 @@ environment_variables = {
     # The worker pid is appended before the extension to keep TP/DP workers
     # from clobbering each other. Empty disables file output.
     "VLLM_RBLN_METRICS_FILE": lambda: os.environ.get("VLLM_RBLN_METRICS_FILE", ""),
+    # Write one JSONL row per execute_model step (per-rank, worker pid appended)
+    # with phase, batch size, per-req prompt/context/query lens, no_spec flag and
+    # the prepare/forward/sample/e2e timing breakdown. Empty disables tracing.
+    "VLLM_RBLN_STEP_TRACE_FILE": lambda: os.environ.get(
+        "VLLM_RBLN_STEP_TRACE_FILE", ""
+    ),
     # Enable NUMA-based CPU affinity binding for OpenMP threads
     "VLLM_RBLN_NUMA": (
         lambda: os.environ.get("VLLM_RBLN_NUMA", "True").lower() in ("true", "1")
