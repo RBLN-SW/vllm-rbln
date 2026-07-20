@@ -39,3 +39,8 @@ def skip_sync_vllm_and_optimum():
         return_value=None,
     ):
         yield
+
+
+@pytest.fixture(autouse=True)
+def set_npu_env_var(monkeypatch):
+    monkeypatch.setenv("RBLN_FORCE_NPU_NAME", "RBLN-CA25")
