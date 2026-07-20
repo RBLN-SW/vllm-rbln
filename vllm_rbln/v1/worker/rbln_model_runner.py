@@ -2342,13 +2342,19 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         return self.model.compute_logits(hidden_states)
 
     def _make_weights_contiguous(self) -> None:
-        # weight-free compile hard-errors on non-contiguous CPU weights.
+        """Force weights contiguous before weight-free compile, which hard-errors
+        on non-contiguous CPU tensors. Covers parameters, buffers, and plain
+        tensor attributes."""
         for p in self.model.parameters():
             if not p.is_contiguous():
                 p.set_(p.contiguous())
         for b in self.model.buffers():
             if not b.is_contiguous():
                 b.set_(b.contiguous())
+        for module in self.model.modules():
+            for name, value in list(module.__dict__.items()):
+                if isinstance(value, torch.Tensor) and not value.is_contiguous():
+                    setattr(module, name, value.contiguous())
 
     @torch.inference_mode()
     def warm_up_model(self) -> None:
