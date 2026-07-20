@@ -13,9 +13,9 @@
 # limitations under the License.
 import inspect
 
+import optimum.rbln
 import pytest
 
-import optimum.rbln
 from vllm_rbln.utils.optimum.registry import _RBLN_SUPPORTED_MODELS
 
 
@@ -30,6 +30,4 @@ def test_registered_class_exists_in_optimum(arch: str, model_cls_name: str):
         f"{arch} maps to '{model_cls_name}', which is not exported by "
         f"optimum.rbln {optimum.rbln.__version__}. The registry entry is stale."
     )
-    assert inspect.isclass(model_cls), (
-        f"optimum.rbln.{model_cls_name} is not a class."
-    )
+    assert inspect.isclass(model_cls), f"optimum.rbln.{model_cls_name} is not a class."
