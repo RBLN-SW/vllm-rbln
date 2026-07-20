@@ -2831,8 +2831,19 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self.kv_cache_view_infos = kv_cache_view_infos
 
     def _make_weights_contiguous(self) -> None:
-        # weight-free compile hard-errors on non-contiguous CPU weights.
-        for t in itertools.chain(self.model.parameters(), self.model.buffers()):
+        """Force weights contiguous before weight-free compile, which hard-errors
+        on non-contiguous CPU tensors. Covers parameters, buffers, and plain
+        tensor attributes."""
+
+        def plain_attr_tensors():
+            for module in self.model.modules():
+                for value in module.__dict__.values():
+                    if isinstance(value, torch.Tensor):
+                        yield value
+
+        for t in itertools.chain(
+            self.model.parameters(), self.model.buffers(), plain_attr_tensors()
+        ):
             if not t.is_contiguous():
                 t.data = t.data.contiguous()
 
