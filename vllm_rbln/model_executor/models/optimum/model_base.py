@@ -244,9 +244,6 @@ class RBLNOptimumModelBase(nn.Module):
                 spec.model_cls.__name__,
                 json.dumps(spec.rbln_config, indent=2, default=str),
             )
-            # optimum-rbln sets the compiled dtype from the loaded HF model's
-            # dtype, so forward spec.dtype as the top-level `dtype` kwarg to
-            # pin the artefact to vLLM's resolved dtype.
             model = spec.model_cls.from_pretrained(
                 self.model_config.model,
                 rbln_config=spec.rbln_config,
