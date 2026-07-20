@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from typing import TYPE_CHECKING, Any
-
+import torch
 from vllm_rbln import envs
 from vllm_rbln.logger import init_logger
 from vllm_rbln.utils.optimum.block_size import (
@@ -113,6 +113,18 @@ def sync_from_optimum(
         params.prefill_chunk_size,
         params.image_prefill_chunk_size,
     )
+    # The compiled model is the source of truth for dtype: vLLM must feed
+    # inputs in exactly the dtype the artefact was compiled with.
+    if params.dtype is not None:
+        compiled_dtype = getattr(torch, params.dtype)
+        if vllm_config.model_config.dtype != compiled_dtype:
+            logger.info(
+                "Updating model_config.dtype from %s to %s based on rbln_config.json",
+                vllm_config.model_config.dtype,
+                compiled_dtype,
+            )
+            vllm_config.model_config.dtype = compiled_dtype
+
     # Set num_blocks in cache_config based on rbln_config.json
     update_num_blocks(vllm_config, params.num_blocks)
     # Sync num_devices in envs with optimum pre-compiled model

@@ -233,6 +233,9 @@ class RBLNOptimumModelBase(nn.Module):
                 prefill_chunk_size=self.vllm_config.additional_config.get(
                     "prefill_chunk_size"
                 ),
+                # Compile in vLLM's resolved dtype so the artefact matches the
+                # dtype vLLM feeds at runtime (see RBLNCompileSpec.dtype).
+                dtype=self.model_config.dtype,
                 rbln_overrides=rbln_overrides,
             )
             logger.info(
@@ -241,8 +244,14 @@ class RBLNOptimumModelBase(nn.Module):
                 spec.model_cls.__name__,
                 json.dumps(spec.rbln_config, indent=2, default=str),
             )
+            # optimum-rbln sets the compiled dtype from the loaded HF model's
+            # dtype, so forward spec.dtype as the top-level `dtype` kwarg to
+            # pin the artefact to vLLM's resolved dtype.
             model = spec.model_cls.from_pretrained(
-                self.model_config.model, rbln_config=spec.rbln_config, config=hf_config
+                self.model_config.model,
+                rbln_config=spec.rbln_config,
+                config=hf_config,
+                dtype=spec.dtype,
             )
             model.save_pretrained(cached_model_path)  # type: ignore[attr-defined]
             self.vllm_config.model_config.model = cached_model_path
