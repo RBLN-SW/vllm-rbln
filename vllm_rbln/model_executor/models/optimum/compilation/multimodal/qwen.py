@@ -51,3 +51,39 @@ def get_param_qwen2_vl(
 get_param_qwen2_5_vl = get_param_qwen2_vl
 get_param_qwen3_vl = get_param_qwen2_vl
 get_param_qwen3_vl_moe = get_param_qwen2_vl
+
+
+def get_param_qwen3_5(
+    batch_size: int,
+    max_model_len: int,
+    block_size: int,
+    num_devices: int,
+    prefill_chunk_size: int | None = None,
+) -> dict:
+    # Qwen3.5 is a HYBRID decoder (GatedDeltaNet linear_attention + gated
+    # full_attention). optimum-rbln derives ``linear_attention_layers`` from the HF
+    # ``layer_types`` during compilation, so nothing extra is needed here.
+    #
+    # FLASH IS FORCED (not conditional on block_size like the Qwen-VL builders): a
+    # partial last prefill window attending across prior KV blocks is mis-lowered by
+    # the EAGER attention op (prefill logit pearson ~0.99; the argmax can flip),
+    # whereas flash computes it correctly (~0.9999). The GatedDeltaNet/linear path is
+    # accurate under both, so flash is the safe default for the hybrid backbone.
+    # See ``qwen3_5_runtime_utils.RBLNQwen3_5RuntimeModel`` (the "NOTE — multi-window
+    # prefill needs FLASH attention" block).
+    param = {
+        "visual": {
+            "max_seq_len": 6400,
+        },
+        "num_devices": num_devices,
+        "max_seq_len": max_model_len,
+        "batch_size": batch_size,
+        "use_inputs_embeds": True,
+        "attn_impl": "flash_attn",
+        "kvcache_partition_len": block_size,
+    }
+    # Pin prefill_chunk_size so the compiled model stays in sync with the value used
+    # for KV-cache block padding.
+    if prefill_chunk_size is not None:
+        param["prefill_chunk_size"] = prefill_chunk_size
+    return param

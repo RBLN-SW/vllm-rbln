@@ -35,6 +35,7 @@ from .idefics3 import RBLNOptimumIdefics3ForConditionalGeneration  # noqa: F401
 from .llava import RBLNOptimumLlavaForConditionalGeneration  # noqa: F401
 from .llava_next import RBLNOptimumLlavaNextForConditionalGeneration  # noqa: F401
 from .paligemma import RBLNOptimumPaliGemmaForConditionalGeneration  # noqa: F401
+from .qwen3_5 import RBLNOptimumQwen3_5ForConditionalGeneration  # noqa: F401
 from .qwen_vl import (  # noqa: F401
     RBLNOptimumQwen2_5_VLForConditionalGeneration,
     RBLNOptimumQwen2VLForConditionalGeneration,
