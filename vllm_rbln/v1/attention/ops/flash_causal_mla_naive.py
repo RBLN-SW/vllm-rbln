@@ -21,57 +21,6 @@ import torch
 from vllm_rbln import envs
 
 
-def _fake_mla_output(q: torch.Tensor, kv_c_normed: torch.Tensor) -> torch.Tensor:
-    """Return shape: [batch, num_heads, seq_len, kv_lora_rank]."""
-    b, num_heads, seq_len, _ = q.shape
-    kv_lora_rank = kv_c_normed.shape[-1]
-    return torch.empty(
-        (b, num_heads, seq_len, kv_lora_rank), device=q.device, dtype=q.dtype
-    )
-
-
-@torch.library.custom_op(
-    "rbln_custom_ops::paged_flash_causal_mla_naive_prefill",
-    mutates_args=["kv_cache"],
-)
-def paged_flash_causal_mla_naive_prefill_impl(
-    q: torch.Tensor,
-    kv_c_normed: torch.Tensor,
-    k_pe: torch.Tensor,
-    kv_cache: torch.Tensor,
-    seq_idx: torch.Tensor,
-    block_tables: torch.Tensor,
-    scale: torch.Tensor,
-) -> torch.Tensor:
-    return _fake_mla_output(q, kv_c_normed)
-
-
-@torch.library.register_fake("rbln_custom_ops::paged_flash_causal_mla_naive_prefill")
-def _(q, kv_c_normed, k_pe, kv_cache, seq_idx, block_tables, scale):
-    return _fake_mla_output(q, kv_c_normed)
-
-
-@torch.library.custom_op(
-    "rbln_custom_ops::paged_flash_causal_mla_naive_decode",
-    mutates_args=["kv_cache"],
-)
-def paged_flash_causal_mla_naive_decode_impl(
-    q: torch.Tensor,
-    kv_c_normed: torch.Tensor,
-    k_pe: torch.Tensor,
-    kv_cache: torch.Tensor,
-    seq_idx: torch.Tensor,
-    block_tables: torch.Tensor,
-    scale: torch.Tensor,
-) -> torch.Tensor:
-    return _fake_mla_output(q, kv_c_normed)
-
-
-@torch.library.register_fake("rbln_custom_ops::paged_flash_causal_mla_naive_decode")
-def _(q, kv_c_normed, k_pe, kv_cache, seq_idx, block_tables, scale):
-    return _fake_mla_output(q, kv_c_normed)
-
-
 def paged_flash_causal_mla_naive_prefill(
     q: torch.Tensor,
     kv_c_normed: torch.Tensor,
