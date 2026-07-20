@@ -347,11 +347,7 @@ class RBLNOptimumQwenVLForConditionalGeneration(
             padded_batch_size = kwargs.pop("padded_batch_size", self.decoder_batch_size)
             self.model.decoder = self.model.decoders[padded_batch_size]
             input_ids = kwargs.pop("input_ids")
-            inputs_embeds = self.model.embed_tokens(input_ids)
-            assert inputs_embeds.dtype == self.dtype, (
-                f"inputs_embeds dtype mismatch: "
-                f"expected {self.dtype}, got {inputs_embeds.dtype}"
-            )
+            inputs_embeds = self.model.embed_tokens(input_ids).to(self.dtype)
             logits = self.model.decoder(
                 inputs_embeds=inputs_embeds,
                 cache_position=cache_position,
