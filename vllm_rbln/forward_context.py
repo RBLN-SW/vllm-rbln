@@ -159,7 +159,6 @@ class RBLNDPMetadata(DPMetadata):
 def set_forward_context(
     attn_metadata: Any,
     vllm_config: VllmConfig,
-    virtual_engine: int = 0,
     num_tokens: int | None = None,
     num_tokens_across_dp: torch.Tensor | None = None,
     num_padded_tokens: int | None = None,

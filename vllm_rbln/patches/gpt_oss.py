@@ -25,9 +25,9 @@ from vllm_rbln.patches import register_patch
 @register_patch(
     target="vllm.model_executor.models.gpt_oss.MLPBlock.forward",
     reason=(
-        "Adapt GPT-OSS MLPBlock.forward to the RBLN FusedMoE interface: pass ",
+        "Adapt GPT-OSS MLPBlock.forward to the RBLN FusedMoE interface: pass "
         "the rounter callable instead of precomputed router logits so routing "
-        "runs after RBLN DP multicast, then explicitly all-reduce TP outputs.",
+        "runs after RBLN DP multicast, then explicitly all-reduce TP outputs."
     ),
 )
 def patched_gptoss_mlp_forward(
