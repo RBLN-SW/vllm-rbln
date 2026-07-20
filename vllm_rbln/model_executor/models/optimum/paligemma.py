@@ -163,7 +163,9 @@ class RBLNOptimumPaliGemmaForConditionalGeneration(
         """
         max_seq_len = rbln_model_config.max_seq_len
         seq_range = torch.arange(max_seq_len).unsqueeze(0)  # (1, max_seq_len,)
-        attention_mask = seq_range <= cache_position
-        assert attention_mask.dtype == self.dtype
+        # FIXME: attention_mask is meant to be a bool tensor, but optimum-rbln
+        # currently expects it as a float tensor, so we cast it here as a
+        # temporary workaround. Revert to a bool tensor once optimum-rbln is fixed.
+        attention_mask = (seq_range <= cache_position).to(self.dtype)
         position_ids = cache_position.clone()
         return attention_mask, position_ids
