@@ -1,4 +1,4 @@
-# Copyright 2025 Rebellions Inc. All rights reserved.
+# Copyright 2026 Rebellions Inc. All rights reserved.
 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,15 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-"""Guard that every model in the RBLN registry maps to a real optimum-rbln class.
-
-optimum-rbln can rename, add, or drop model classes across releases. These
-tests fail loudly when a registered ``RBLN...`` class name no longer resolves,
-so an incompatible optimum-rbln bump is caught at test time rather than at the
-first ``getattr(optimum.rbln, ...)`` during model load.
-"""
-
 import inspect
 
 import pytest
