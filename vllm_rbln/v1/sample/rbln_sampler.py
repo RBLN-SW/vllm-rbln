@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from typing import Any
+
 import rebel
 import torch
 import torch.nn as nn
@@ -367,7 +369,7 @@ class RBLNSampler(VLLMSampler):
         return LogprobsTensors(indices, logprobs, token_ranks)
 
 
-WARM_UP_CONFIGS = [
+WARM_UP_CONFIGS: list[dict[str, Any]] = [
     {
         "name": "no_penalty_greedy",
         "no_penalties": True,
