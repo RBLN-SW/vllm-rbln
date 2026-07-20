@@ -164,6 +164,12 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# Per-rank phase codes for the serialize_pd_phases pre-vote collective
+# (see RBLNModelRunner._pd_phase_vote).
+PD_PHASE_IDLE = 0
+PD_PHASE_DECODE = 1
+PD_PHASE_PREFILL = 2
+
 
 def scrub_scheduler_output_for_no_spec(
     scheduler_output: "SchedulerOutput",
@@ -345,6 +351,10 @@ class DummyRunState(NamedTuple):
 
 
 class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
+    # Class-level default so sample_tokens() is safe even on instances built
+    # without __init__ (tests); real value is set per-step in execute_model.
+    _pd_phase2_pending = False
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -709,6 +719,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.specialized_moe_decode = (
             parallel_config.data_parallel_size > 1
             and envs.VLLM_RBLN_SPECIALIZE_MOE_DECODE
+        )
+
+        # VLLM_RBLN_MOE_PD_MIX=0: serialize cross-DP mixed prefill/decode
+        # steps into two phase-pure forwards (see _pd_phase_vote).
+        self.serialize_pd_phases = (
+            parallel_config.data_parallel_size > 1 and not envs.VLLM_RBLN_MOE_PD_MIX
         )
 
     def _enable_performance_tracker(self):
@@ -3099,6 +3115,28 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 batch_bucket_size=batch_bucket_size,
             )
 
+    def _pd_phase_vote(self, local_phase: int) -> bool:
+        """Cross-DP pre-vote run once per step by EVERY rank (busy or idle)
+        when serialize_pd_phases is on. Returns True when this step is mixed
+        (some rank prefills while another decodes), i.e. it must be
+        serialized into a prefill phase and a decode phase.
+        """
+        votes = RBLNDPMetadata.num_tokens_across_dp(
+            local_phase,
+            self.vllm_config.parallel_config.data_parallel_size,
+            self.vllm_config.parallel_config.data_parallel_rank,
+        )
+        return bool((votes == PD_PHASE_PREFILL).any()) and bool(
+            (votes == PD_PHASE_DECODE).any()
+        )
+
+    def execute_dummy_batch(self) -> None:
+        """Entry point for a DP-idle rank's step (called by the worker)."""
+        if self.serialize_pd_phases and self._pd_phase_vote(PD_PHASE_IDLE):
+            # Mixed step: peers run two phase-pure forwards; join both.
+            self.dummy_run()
+        self.dummy_run()
+
     def _bookkeeping_sync(
         self,
         scheduler_output: "SchedulerOutput",
@@ -3411,6 +3449,24 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     "prompt tokens, tokens, please disable it when the requests"
                     " need prompt logprobs"
                 )
+
+            if self.serialize_pd_phases:
+                local_prefill = self.is_prefill_phase()
+                mixed = self._pd_phase_vote(
+                    PD_PHASE_PREFILL if local_prefill else PD_PHASE_DECODE
+                )
+                if mixed and local_prefill:
+                    # Phase 1 is this rank's real prefill; the decode-phase
+                    # dummy run fires at the end of sample_tokens(), after
+                    # the real drafter propose (collective ordering).
+                    self._pd_phase2_pending = True
+                elif mixed:
+                    # Join the peers' prefill phase with a dummy run, then
+                    # fall through to run the real decode as phase 2. The
+                    # phase-2 shape collective below then sees no prefill
+                    # rank (prefill peers vote idle via their own dummy
+                    # run), so decode takes the specialized unmixed path.
+                    self.dummy_run()
 
             num_reqs = self.input_batch.num_reqs
             req_ids = self.input_batch.req_ids
@@ -3881,6 +3937,18 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
     @torch.inference_mode()
     def sample_tokens(
+        self, grammar_output: "GrammarOutput | None"
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
+        try:
+            return self._sample_tokens_impl(grammar_output)
+        finally:
+            if self._pd_phase2_pending:
+                # Serialized mixed step, prefill rank: phase 1 (real prefill
+                # + propose) is done; join the peers' decode phase.
+                self._pd_phase2_pending = False
+                self.dummy_run()
+
+    def _sample_tokens_impl(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
         if self.execute_model_state is None:

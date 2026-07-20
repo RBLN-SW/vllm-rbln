@@ -69,6 +69,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_LOGITS_ALL_GATHER: bool = True
     # --- DATA PARALLEL ---
     VLLM_RBLN_DP_IMPL: str = "padded_decode"
+    VLLM_RBLN_MOE_PD_MIX: bool = True
     # --- MOE ---
     VLLM_RBLN_SPECIALIZE_MOE_DECODE: bool = True
     VLLM_RBLN_USE_MOE_TOKENS_MASK: bool = True
@@ -271,8 +272,8 @@ environment_variables = {
     # When set, the rbln torch.compile backend compiles + caches each graph and
     # builds its runtime on a dummy device (no NPU required); the populated
     # cache is later reused by a real NPU host via cache-hit. The target SOC is
-    # taken from rebel.get_npu_name(), which falls back to RBLN_TARGET_SOC, so
-    # set RBLN_TARGET_SOC (e.g. RBLN-CA25) on a host without an NPU mounted.
+    # taken from rebel.get_npu_name(); on a host without an NPU mounted set
+    # RBLN_FORCE_NPU_NAME (e.g. RBLN-CA25) so the target can still be resolved.
     "VLLM_RBLN_COMPILE_ONLY": (
         lambda: (
             os.environ.get("VLLM_RBLN_COMPILE_ONLY", "False").lower() in ("true", "1")
@@ -354,6 +355,17 @@ environment_variables = {
     # --- DATA PARALLEL ---
     # DP implementation, see choices in get_dp_impl
     "VLLM_RBLN_DP_IMPL": get_dp_impl,
+    # If true (default), a DP step may mix prefill on one rank with padded
+    # decode on the others, so MoE kernels see prefill and decode tokens in
+    # the same forward. If false, such mixed steps are serialized into two
+    # phase-pure forwards: prefill runs first (decode ranks join collectives
+    # via a dummy run), then decode runs on the specialized decode path
+    # (prefill ranks join via a dummy run).
+    "VLLM_RBLN_MOE_PD_MIX": (
+        lambda: (
+            os.environ.get("VLLM_RBLN_MOE_PD_MIX", "True").lower() in ("true", "1")
+        )
+    ),
     # --- MOE ---
     # If true, it specializes the cases where all instances are at decode stage
     "VLLM_RBLN_SPECIALIZE_MOE_DECODE": (

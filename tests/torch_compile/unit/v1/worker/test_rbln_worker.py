@@ -1211,7 +1211,7 @@ class TestMisc:
         worker = _create_worker()
         worker.model_runner = MagicMock()
         worker.execute_dummy_batch()
-        worker.model_runner.dummy_run.assert_called_once()
+        worker.model_runner.execute_dummy_batch.assert_called_once()
 
     def test_take_draft_token_ids(self):
         worker = _create_worker()
