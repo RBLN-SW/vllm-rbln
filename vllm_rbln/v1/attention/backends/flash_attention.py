@@ -1072,6 +1072,7 @@ class RBLNFlashAttentionMetadataBuilder(
 
         self._swa_cache_seq_lens_buf: torch.Tensor | None = None
         self._swa_cache_offsets_buf: torch.Tensor | None = None
+        self._swa_attn_masks_buf: torch.Tensor | None = None
 
     def _to_device_inplace(
         self, cpu_tensor: torch.Tensor, attr_name: str
@@ -1244,7 +1245,9 @@ class RBLNFlashAttentionMetadataBuilder(
             local_block_tables=local_block_tables.to(self.device)
             if local_block_tables is not None
             else None,
-            swa_attn_masks=swa_attn_masks.to(self.device)
+            swa_attn_masks=self._to_device_inplace(
+                swa_attn_masks, "_swa_attn_masks_buf"
+            )
             if swa_attn_masks is not None
             else None,
         )

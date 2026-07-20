@@ -42,7 +42,7 @@ def main(model_id: str):
 
 
 def entry_point(
-    model_id: str = "./bge-m3-1k-batch4",
+    model_id: str = "BAAI/bge-m3",
 ):
     main(model_id=model_id)
 

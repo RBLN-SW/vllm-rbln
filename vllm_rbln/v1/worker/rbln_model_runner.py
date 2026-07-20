@@ -17,7 +17,7 @@ import itertools
 import os
 import time
 from collections import defaultdict
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from copy import copy, deepcopy
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Union, cast
@@ -165,13 +165,34 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def scrub_scheduler_output_for_no_spec(scheduler_output: "SchedulerOutput") -> None:
-    """Force every scheduled request to query_len=1 for a collective no-spec step.
+def scrub_scheduler_output_for_no_spec(
+    scheduler_output: "SchedulerOutput",
+    requests: "Mapping[str, Any]",
+) -> None:
+    """Force every scheduled DECODE request to query_len=1 for a collective
+    no-spec step.
 
     Some rank elected no-spec this step (a cross-block backfill that can't reach
     a full speculative window), so via the cross-DP OR-reduce EVERY rank must
     drop to ``query_len=1`` and ``_prepare_inputs`` must build a uniform
     no-spec graph.
+
+    PREFILL reqs are EXCLUDED from the clamp: no-spec is a decode-only concern
+    (cross-block backfill on a decoding request). In DP/EP a rank may be running
+    chunked prefill while a *peer* decode rank trips the OR-reduce. Clamping the
+    prefill's chunk query_len to 1 would make its sampled token look like a
+    partial-prefill token (seq_lens < num_tokens), get it discarded, and lose the
+    request. A prefill keeps its full chunk length; the cross-DP query-length
+    axis is reconciled to the prefill shape by ``get_dp_padding`` (any_prefill ->
+    prefill-sized). Prefill reqs are identified by the scheduler's own
+    ``is_prefill`` definition -- ``num_computed_tokens < num_tokens - 1`` -- NOT
+    by ``num_output_tokens == 0``. The latter misclassifies a prefill/decode
+    disaggregation request that received its prompt KV from the producer and was
+    promoted to a decode (``num_computed == num_tokens - 1``, a scheduler-DECODE
+    that may carry a slide, yet no output token yet) as a prefill, leaving its
+    slide uncleared and its query_len unclamped (#390 A). A genuine multi-token
+    prefill chunk always has ``num_computed <= num_tokens - 2``, so it is never
+    misclassified.
 
     We zero any in-block slide and force ``num_scheduled_tokens`` to 1, but we
     must NOT clear ``scheduled_spec_decode_tokens``: the engine's
@@ -183,20 +204,68 @@ def scrub_scheduler_output_for_no_spec(scheduler_output: "SchedulerOutput") -> N
     take the no-spec path explicitly via ``spec_decode_max_query_len=1`` rather
     than by inspecting this dict.
     """
+    # Identify prefill reqs via the scheduler's is_prefill (num_computed <
+    # num_tokens - 1), evaluated from scheduler_output's authoritative pre-step
+    # counts (num_computed / num_output) plus the static prompt length from
+    # `requests`. Reading num_computed from scheduler_output (not the mutable req
+    # state) keeps this correct regardless of any optimistic num_computed advance.
+    _cached = scheduler_output.scheduled_cached_reqs
+    _cached_num_computed = dict(zip(_cached.req_ids, _cached.num_computed_tokens))
+    _cached_num_output = dict(zip(_cached.req_ids, _cached.num_output_tokens))
+    _new_num_computed = {
+        r.req_id: r.num_computed_tokens for r in scheduler_output.scheduled_new_reqs
+    }
+
+    def _is_prefill(req_id: str) -> bool:
+        state = requests.get(req_id)
+        if state is None:
+            return False
+        num_prompt = len(state.prompt_token_ids)
+        if req_id in _new_num_computed:
+            num_computed = _new_num_computed[req_id]
+            num_output = 0
+        else:
+            num_computed = _cached_num_computed.get(req_id, 0)
+            num_output = _cached_num_output.get(req_id, 0)
+        # num_tokens = prompt + committed output (excludes spec drafts).
+        return num_computed < (num_prompt + num_output) - 1
+
+    prefill_req_ids = {
+        req_id
+        for req_id in scheduler_output.num_scheduled_tokens
+        if _is_prefill(req_id)
+    }
     if isinstance(scheduler_output, RBLNSchedulerOutput):
-        scheduler_output.spec_decode_slide_distance.clear()
+        # A slide entry only ever belongs to a scheduler-DECODE (it is written
+        # only for `not is_prefill` reqs), so drop it for every non-prefill req.
+        # A promoted remote-KV decode is now correctly a decode here, so its
+        # slide is cleared (fixing #390 A). Real prefills never carry a slide,
+        # so the map ends empty (asserted below).
+        for _rid in list(scheduler_output.spec_decode_slide_distance):
+            if _rid not in prefill_req_ids:
+                del scheduler_output.spec_decode_slide_distance[_rid]
     for req_id in list(scheduler_output.num_scheduled_tokens):
+        # no-spec (query_len=1) is a DECODE concern. A PREFILL req must keep its
+        # chunk query_len; clamping it to 1 discards the prefill's token and
+        # loses the request.
+        if req_id in prefill_req_ids:
+            continue
         scheduler_output.num_scheduled_tokens[req_id] = 1
     scheduler_output.total_num_scheduled_tokens = sum(
         scheduler_output.num_scheduled_tokens.values()
     )
 
-    # Verify the no-spec scrub actually eliminated every cross-block condition:
-    # with all slides cleared and every query_len forced to 1, a backfill window
-    # can no longer span two KV blocks. If this fails the scrub is incomplete and
-    # the downstream decode would still cross a block boundary.
-    assert all(v == 1 for v in scheduler_output.num_scheduled_tokens.values()), (
-        f"no-spec scrub left a query_len != 1: {scheduler_output.num_scheduled_tokens}"
+    # Verify the no-spec scrub eliminated every cross-block condition for the
+    # DECODE reqs: with their slides cleared and query_len forced to 1, a
+    # backfill window can no longer span two KV blocks. Prefill reqs are
+    # intentionally left at their chunk length.
+    assert all(
+        v == 1
+        for rid, v in scheduler_output.num_scheduled_tokens.items()
+        if rid not in prefill_req_ids
+    ), (
+        f"no-spec scrub left a decode query_len != 1: "
+        f"{scheduler_output.num_scheduled_tokens}"
     )
     assert not getattr(scheduler_output, "spec_decode_slide_distance", {}), (
         "no-spec scrub left a non-empty slide map, so a cross-block "
@@ -2281,13 +2350,19 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         return self.model.compute_logits(hidden_states)
 
     def _make_weights_contiguous(self) -> None:
-        # weight-free compile hard-errors on non-contiguous CPU weights.
+        """Force weights contiguous before weight-free compile, which hard-errors
+        on non-contiguous CPU tensors. Covers parameters, buffers, and plain
+        tensor attributes."""
         for p in self.model.parameters():
             if not p.is_contiguous():
                 p.set_(p.contiguous())
         for b in self.model.buffers():
             if not b.is_contiguous():
                 b.set_(b.contiguous())
+        for module in self.model.modules():
+            for name, value in list(module.__dict__.items()):
+                if isinstance(value, torch.Tensor) and not value.is_contiguous():
+                    setattr(module, name, value.contiguous())
 
     @torch.inference_mode()
     def warm_up_model(self) -> None:
@@ -3417,7 +3492,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # graph across DP. Runs whenever the global flag is set, even if
             # this rank had no drafts/slide locally (a peer tripped it).
             if step_no_spec_required:
-                scrub_scheduler_output_for_no_spec(scheduler_output)
+                scrub_scheduler_output_for_no_spec(scheduler_output, self.requests)
                 tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
                 num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
                 num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
