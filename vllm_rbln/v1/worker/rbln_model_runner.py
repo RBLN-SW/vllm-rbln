@@ -718,6 +718,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # trace row (VLLM_RBLN_STEP_TRACE_FILE); cleared each execute_model.
         self._last_model_report: StepReport | None = None
         self._last_sampler_report: StepReport | None = None
+        self._last_prepare_ms: float | None = None
         self._step_trace_index: int = 0
         self.e2e_start_time: float = 0.0
         self.e2e_end_time: float = 0.0
@@ -798,6 +799,14 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         def _us(rep, attr):
             return None if rep is None else getattr(rep, attr)
 
+        e2e_ms = (time.perf_counter() - self.e2e_start_time) * 1000.0
+        prepare_ms = self._last_prepare_ms
+        model_ms = None if m is None else m.latency * 1000.0
+        sample_ms = None if s is None else s.latency * 1000.0
+        # Residual = e2e - (prepare + model + sample): Postprocess + Draft +
+        # Bookkeep host work not otherwise attributed.
+        rest_ms = e2e_ms - sum(v or 0.0 for v in (prepare_ms, model_ms, sample_ms))
+
         row = {
             "idx": self._step_trace_index,
             "rank": self.vllm_config.parallel_config.data_parallel_rank,
@@ -810,9 +819,11 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             "prompt_lens": prompt_lens,
             "context_lens": context_lens,
             "query_lens": query_lens,
-            "e2e_ms": (time.perf_counter() - self.e2e_start_time) * 1000.0,
-            "model_ms": None if m is None else m.latency * 1000.0,
-            "sample_ms": None if s is None else s.latency * 1000.0,
+            "e2e_ms": e2e_ms,
+            "prepare_ms": prepare_ms,
+            "model_ms": model_ms,
+            "sample_ms": sample_ms,
+            "rest_ms": rest_ms,
             "prepare_us": _us(m, "prepare_time"),
             "model_device_us": _us(m, "device_time"),
             "model_host_us": _us(m, "host_time"),
@@ -3521,6 +3532,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.e2e_start_time = time.perf_counter()
         self._last_model_report = None
         self._last_sampler_report = None
+        self._last_prepare_ms = None
         if self.execute_model_state is not None:
             raise RuntimeError(
                 "State error: sample_tokens() must be called "
@@ -3901,6 +3913,10 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 LoRAInputs.set_sampler_indices_padded(sampler_indices_padded)
 
             model_start_time = time.perf_counter()
+            # Host prep before the forward (Preprocess/_update_states +
+            # _prepare_inputs), so the trace can attribute the e2e gap instead
+            # of leaving it implicit.
+            self._last_prepare_ms = (model_start_time - self.e2e_start_time) * 1000.0
             with capture_ctx as reports:
                 model_output = self.model_executable(
                     input_ids=input_ids,
