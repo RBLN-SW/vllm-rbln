@@ -73,11 +73,6 @@ class RBLNCompileSpec:
 
     model_cls: Any
     rbln_config: dict[str, Any]
-    # dtype to compile the HF model in. optimum-rbln derives the compiled
-    # ``rbln_config.dtype`` from the loaded model's dtype (it ignores any
-    # ``dtype`` placed in ``rbln_config``), so the caller must forward this as
-    # the top-level ``dtype`` kwarg to ``from_pretrained``. None lets
-    # optimum-rbln fall back to its own default.
     dtype: torch.dtype | None = None
 
     @classmethod
