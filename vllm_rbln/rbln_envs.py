@@ -69,6 +69,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_LOGITS_ALL_GATHER: bool = True
     # --- DATA PARALLEL ---
     VLLM_RBLN_DP_IMPL: str = "padded_decode"
+    VLLM_RBLN_MOE_PD_MIX: bool = True
     # --- MOE ---
     VLLM_RBLN_SPECIALIZE_MOE_DECODE: bool = True
     VLLM_RBLN_USE_MOE_TOKENS_MASK: bool = True
@@ -354,6 +355,17 @@ environment_variables = {
     # --- DATA PARALLEL ---
     # DP implementation, see choices in get_dp_impl
     "VLLM_RBLN_DP_IMPL": get_dp_impl,
+    # If true (default), a DP step may mix prefill on one rank with padded
+    # decode on the others, so MoE kernels see prefill and decode tokens in
+    # the same forward. If false, such mixed steps are serialized into two
+    # phase-pure forwards: prefill runs first (decode ranks join collectives
+    # via a dummy run), then decode runs on the specialized decode path
+    # (prefill ranks join via a dummy run).
+    "VLLM_RBLN_MOE_PD_MIX": (
+        lambda: (
+            os.environ.get("VLLM_RBLN_MOE_PD_MIX", "True").lower() in ("true", "1")
+        )
+    ),
     # --- MOE ---
     # If true, it specializes the cases where all instances are at decode stage
     "VLLM_RBLN_SPECIALIZE_MOE_DECODE": (
