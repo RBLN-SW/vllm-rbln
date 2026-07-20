@@ -143,14 +143,8 @@ class RBLNEagleProposer(EagleProposer):
                 last_token_indices=token_indices_to_sample_padded,
             )
 
-        # NOTE(RBLN): Don't early-return here; the draft loop runs a per-iter
-        # DP/EP collective and skipping it on one rank deadlocks.
-        intermediate_chunked_prefill = self.runner.is_intermediate_chunked_prefill
-
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1:
-            if intermediate_chunked_prefill:
-                return torch.zeros(num_reqs, 1, device=self.device, dtype=torch.int64)
             draft_tokens_ids = logits[:num_reqs].argmax(dim=-1)
             return draft_tokens_ids.view(-1, 1)
 
@@ -245,8 +239,6 @@ class RBLNEagleProposer(EagleProposer):
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
-        if intermediate_chunked_prefill:
-            return torch.zeros_like(draft_token_ids)
         return draft_token_ids
 
     def set_inputs_first_pass(
