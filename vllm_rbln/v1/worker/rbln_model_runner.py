@@ -743,11 +743,13 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self.e2e_performance_tracker = PerformanceTracker("E2E")
 
     def _flush_pending_model_report(self):
-        if self.performance_tracker is not None and self._pending_model_report:
+        if self._pending_model_report is None:
+            return
+        if self.performance_tracker is not None:
             self.performance_tracker.record(self._pending_model_report)
             if self.model_performance_tracker is not None:
                 self.model_performance_tracker.record(self._pending_model_report)
-            self._pending_model_report = None
+        self._pending_model_report = None
 
     def _write_step_trace(
         self,
@@ -2406,7 +2408,10 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 self._update_states_after_model_execute(
                     sampler_output.sampled_token_ids
                 )
-        if envs.VLLM_RBLN_METRICS and self.performance_tracker is not None:
+        # Build reports whenever metrics OR the step trace is on; recording into
+        # the trackers only happens when they exist (metrics), but the trace
+        # needs the model/sampler timings stashed regardless.
+        if envs.VLLM_RBLN_METRICS or envs.VLLM_RBLN_STEP_TRACE_FILE:
             sampler_report = StepReport.from_reports(
                 sampler_start_time,
                 time.perf_counter(),
@@ -2415,18 +2420,19 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             )
             model_report = self._pending_model_report
             self._pending_model_report = None
-            combined = (
-                model_report.merged_with(sampler_report)
-                if model_report is not None
-                else sampler_report
-            )
-            self.performance_tracker.record(combined)
-            # Also record model-forward and sample separately so the two can be
-            # broken out (combined merges them into one measurement).
-            if model_report is not None and self.model_performance_tracker:
-                self.model_performance_tracker.record(model_report)
-            if self.sampler_performance_tracker:
-                self.sampler_performance_tracker.record(sampler_report)
+            if self.performance_tracker is not None:
+                combined = (
+                    model_report.merged_with(sampler_report)
+                    if model_report is not None
+                    else sampler_report
+                )
+                self.performance_tracker.record(combined)
+                # Also record model-forward and sample separately so the two can
+                # be broken out (combined merges them into one measurement).
+                if model_report is not None and self.model_performance_tracker:
+                    self.model_performance_tracker.record(model_report)
+                if self.sampler_performance_tracker:
+                    self.sampler_performance_tracker.record(sampler_report)
             self._last_model_report = model_report
             self._last_sampler_report = sampler_report
 
@@ -3904,7 +3910,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     inputs_embeds=inputs_embeds,
                     **model_kwargs,
                 )
-            if self.performance_tracker is not None:
+            if self.performance_tracker is not None or envs.VLLM_RBLN_STEP_TRACE_FILE:
                 # Stash model timing; combined with sampler timing in _sample().
                 padded_decode = (
                     not is_prefill_phase
