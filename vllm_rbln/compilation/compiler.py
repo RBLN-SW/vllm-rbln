@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 from collections.abc import Callable
 from typing import Any, TypeVar, cast
 
@@ -106,7 +105,8 @@ def compile(
     set_option("use_global_ctx", use_global_ctx)
     set_option("global_device_id", global_device_id)
     # if not envs.VLLM_DISABLE_COMPILE_CACHE:
-    #     set_option("cache_dir", cache_dir or os.path.join(envs.VLLM_CACHE_ROOT, "rbln"))
+    #     set_option("cache_dir",
+    # cache_dir or os.path.join(envs.VLLM_CACHE_ROOT, "rbln"))
 
     return cast(
         CompiledTarget,
