@@ -233,8 +233,6 @@ class RBLNOptimumModelBase(nn.Module):
                 prefill_chunk_size=self.vllm_config.additional_config.get(
                     "prefill_chunk_size"
                 ),
-                # Compile in vLLM's resolved dtype so the artefact matches the
-                # dtype vLLM feeds at runtime (see RBLNCompileSpec.dtype).
                 dtype=self.model_config.dtype,
                 rbln_overrides=rbln_overrides,
             )
