@@ -31,6 +31,7 @@ from . import (
     gpt_oss,
     gpt_oss_mxfp4_config,
     minimax_m2,
+    minimax_m2_mtp,
     mla,
     models_utils,
     oot,
