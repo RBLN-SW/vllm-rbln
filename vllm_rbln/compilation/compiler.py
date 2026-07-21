@@ -107,6 +107,7 @@ def compile(
     set_option("global_device_id", global_device_id)
     if not envs.VLLM_DISABLE_COMPILE_CACHE:
         set_option("cache_dir", cache_dir or os.path.join(envs.VLLM_CACHE_ROOT, "rbln"))
+        set_option("mega_cache_only", True)
 
     return cast(
         CompiledTarget,
