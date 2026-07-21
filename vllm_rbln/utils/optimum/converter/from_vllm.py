@@ -21,9 +21,11 @@ from vllm_rbln.utils.optimum.registry import (
 )
 
 from .common import (
+    get_user_max_num_batched_tokens,
+    is_chunked_prefill_arch,
+    store_image_prefill_chunk_size,
     update_block_size,
     update_max_num_batched_tokens,
-    update_prefill_chunk_size,
 )
 from .params import RBLNParams
 
@@ -86,11 +88,26 @@ def sync_from_vllm(vllm_config: VllmConfig) -> None:
             "  2) `kvcache_block_size` under "
             "`additional_config={'rbln_config': {...}}`.\n"
         )
-    update_prefill_chunk_size(
-        vllm_config,
-        prefill_chunk_size=params.prefill_chunk_size,
-        image_prefill_chunk_size=params.image_prefill_chunk_size,
-    )
+    # In the compile path an explicit max_num_batched_tokens is the user's
+    # prefill chunk size. Fold it into params so block sizing, the compile pin,
+    # and max_num_batched_tokens all agree on one value. Enc-dec/pooling models
+    # don't chunk prefill, so the value there is a full-prefill budget, not a
+    # chunk size — leave params untouched for them.
+    user_mnbt = get_user_max_num_batched_tokens(vllm_config)
+    if user_mnbt is not None and is_chunked_prefill_arch(
+        vllm_config.model_config.hf_config
+    ):
+        override_pcs = rbln_overrides.get("prefill_chunk_size")
+        if override_pcs is not None and override_pcs != user_mnbt:
+            raise ValueError(
+                f"Conflicting prefill chunk size: max_num_batched_tokens "
+                f"({user_mnbt}) != rbln_config['prefill_chunk_size'] "
+                f"({override_pcs}). Set only one."
+            )
+        params.prefill_chunk_size = user_mnbt
+
+    # Persist the image-prefill buckets (gemma3/gemma4) into additional_config.
+    store_image_prefill_chunk_size(vllm_config, params.image_prefill_chunk_size)
     update_block_size(
         vllm_config,
         vllm_config.cache_config.block_size,
@@ -98,13 +115,14 @@ def sync_from_vllm(vllm_config: VllmConfig) -> None:
         image_prefill_chunk_size=params.image_prefill_chunk_size,
     )
 
-    # max_num_batched_tokens must fit both a full-length prefill and a full
-    # batch dispatch; update_max_num_batched_tokens layers the enc-dec
-    # max_source_positions constraint on top.
-    vllm_config.scheduler_config.max_num_batched_tokens = max(
-        vllm_config.model_config.max_model_len,
-        vllm_config.scheduler_config.max_num_seqs,
+    # Set max_num_batched_tokens: the prefill chunk size for decoder/multimodal
+    # models, or a full-prefill-plus-batch budget for enc-dec/pooling models.
+    print(
+        "@@@ before prefill_chunk_size",
+        vllm_config.scheduler_config.max_num_batched_tokens,
     )
-    update_max_num_batched_tokens(
-        vllm_config, vllm_config.scheduler_config.max_num_batched_tokens
+    update_max_num_batched_tokens(vllm_config, params)
+    print(
+        "@@@ after prefill_chunk_size",
+        vllm_config.scheduler_config.max_num_batched_tokens,
     )

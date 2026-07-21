@@ -17,14 +17,22 @@ from typing import TYPE_CHECKING
 from vllm_rbln.logger import init_logger
 from vllm_rbln.utils.optimum.registry import (
     is_enc_dec_arch,
+    is_pooling_arch,
 )
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+
+    from .params import RBLNParams
 else:
     VllmConfig = None
 
 logger = init_logger(__name__)
+
+# additional_config key holding the user's explicit max_num_batched_tokens
+# (``None`` if unset), stashed by the platform before vLLM defaults the value.
+# In the RBLN optimum path an explicit value is the prefill chunk size.
+USER_MAX_NUM_BATCHED_TOKENS_KEY = "user_max_num_batched_tokens"
 
 
 def _apply_prefix_caching_block_size(
@@ -101,59 +109,86 @@ def update_block_size(
             vllm_config.cache_config.block_size = kvcache_block_size
 
 
-def update_max_num_batched_tokens(vllm_config: VllmConfig, max_model_len: int) -> None:
-    """
-    Update the max_num_batched_tokens in the vLLM configuration based on the model's
-    maximum length and architecture.
+def is_chunked_prefill_arch(hf_config) -> bool:
+    """Whether ``max_num_batched_tokens`` is the prefill chunk size for this model.
 
-    For encoder-decoder multimodal models (e.g. Whisper), max_num_batched_tokens
-    must be at least max_source_positions so that vllm's MultiModalBudget
-    validation passes (it requires max_tokens_per_mm_item <= max_num_batched_tokens
-    when chunked MM input is disabled).
+    True for decoder and (non-enc-dec) multimodal models: they chunk prefill at
+    ``max_num_batched_tokens`` granularity. Encoder-decoder and pooling models
+    don't chunk prefill, so the value there is a full-prefill budget instead.
     """
-    target_max_num_batched_tokens = max_model_len
+    return not (is_enc_dec_arch(hf_config) or is_pooling_arch(hf_config))
+
+
+def get_user_max_num_batched_tokens(vllm_config: VllmConfig) -> int | None:
+    """Return the user's explicit ``max_num_batched_tokens`` (``None`` if unset).
+
+    Stashed by ``RblnPlatform._capture_user_max_num_batched_tokens`` before vLLM
+    fills in its default.
+    """
+    if vllm_config.additional_config is None:
+        return None
+    return vllm_config.additional_config.get(USER_MAX_NUM_BATCHED_TOKENS_KEY)
+
+
+def update_max_num_batched_tokens(
+    vllm_config: VllmConfig, params: "RBLNParams"
+) -> None:
+    """Set ``scheduler_config.max_num_batched_tokens`` from the RBLN config.
+
+    For decoder and (non-enc-dec) multimodal models this is the prefill chunk
+    size: the scheduler chunks prefill at this granularity and the same value is
+    read back off ``max_num_batched_tokens`` to size RBLNKVCacheManager's
+    gemma3/gemma4 block padding and to pin the compiled artefact. vllm-rbln no
+    longer carries a separate ``prefill_chunk_size`` in ``additional_config``.
+
+    Encoder-decoder and pooling models don't chunk prefill, so the budget must
+    fit a full-length prefill plus a full batch dispatch. Encoder-decoder models
+    (e.g. Whisper) additionally need at least ``max_source_positions`` so vllm's
+    MultiModalBudget validation passes (it requires ``max_tokens_per_mm_item <=
+    max_num_batched_tokens`` when chunked MM input is disabled).
+    """
     hf_config = vllm_config.model_config.hf_config
+    max_model_len = vllm_config.model_config.max_model_len
+    max_num_seqs = vllm_config.scheduler_config.max_num_seqs
 
-    if not is_enc_dec_arch(hf_config):
-        return
-
-    max_source_positions = getattr(hf_config, "max_source_positions", 0)
-    if max_source_positions > target_max_num_batched_tokens:
-        target_max_num_batched_tokens = max_source_positions
-        logger.info(
-            "Encoder-decoder model detected: setting max_num_batched_tokens "
-            "to %d (max_source_positions) instead of %d (max_model_len)",
-            max_source_positions,
-            max_model_len,
+    if is_enc_dec_arch(hf_config):
+        max_source_positions = getattr(hf_config, "max_source_positions", 0)
+        target = max(max_model_len, max_num_seqs, max_source_positions)
+    elif is_pooling_arch(hf_config):
+        target = max(max_model_len, max_num_seqs)
+    else:
+        # decoder / multimodal: max_num_batched_tokens is the prefill chunk size.
+        # A decode step schedules one token per running sequence, so the budget
+        # must cover a full batch; a smaller chunk would throttle decode.
+        target = params.prefill_chunk_size
+        assert target >= max_num_seqs, (
+            f"prefill_chunk_size ({target}) must be >= max_num_seqs "
+            f"({max_num_seqs}); a smaller prefill chunk would throttle the "
+            "decode batch. Recompile with a larger prefill_chunk_size or lower "
+            "max_num_seqs."
         )
 
     cur = vllm_config.scheduler_config.max_num_batched_tokens
-    if cur != target_max_num_batched_tokens:
+    if cur != target:
         logger.info(
             "Updating scheduler_config.max_num_batched_tokens "
             "from %s to %d based on rbln_config.json",
             cur,
-            target_max_num_batched_tokens,
+            target,
         )
-        vllm_config.scheduler_config.max_num_batched_tokens = (
-            target_max_num_batched_tokens
-        )
+        vllm_config.scheduler_config.max_num_batched_tokens = target
 
 
-def update_prefill_chunk_size(
+def store_image_prefill_chunk_size(
     vllm_config: VllmConfig,
-    prefill_chunk_size: int,
     image_prefill_chunk_size: list[int] | None,
-):
-    # Persist prefill_chunk_size so the scheduler can size the chunked-prefill
-    # block padding for gemma3/gemma4 (RBLNKVCacheManager.allocate_slots). Both
-    # load paths (from_optimum / from_vllm) funnel through here.
+) -> None:
+    # Image-prefill buckets (gemma4 multi-bucket / gemma3 single) can't be folded
+    # into the scalar max_num_batched_tokens, so they stay in additional_config.
+    # RBLNKVCacheManager reads them to size the per-image chunk in the
+    # chunked-prefill block padding. Both load paths funnel through here.
+    if image_prefill_chunk_size is None:
+        return
     if vllm_config.additional_config is None:
         vllm_config.additional_config = {}
-    vllm_config.additional_config["prefill_chunk_size"] = prefill_chunk_size
-    # Image-prefill buckets (gemma4 multi-bucket / gemma3 single); used to size
-    # the per-image chunk in the chunked-prefill block padding.
-    if image_prefill_chunk_size is not None:
-        vllm_config.additional_config["image_prefill_chunk_size"] = (
-            image_prefill_chunk_size
-        )
+    vllm_config.additional_config["image_prefill_chunk_size"] = image_prefill_chunk_size

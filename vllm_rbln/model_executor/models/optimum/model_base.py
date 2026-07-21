@@ -216,23 +216,29 @@ class RBLNOptimumModelBase(nn.Module):
                     rbln_config=rbln_overrides,
                 )
                 self.vllm_config.model_config.model = valid_path
+            print(
+                "@@@ prefill_chunk_size",
+                self.vllm_config.scheduler_config.max_num_batched_tokens,
+            )
         else:
             assert not self._is_ec_producer_only(), (
                 "Disaggregated Encoder is only supported for pre-compiled model."
             )
             # cache miss: compile the model and save it to the cache for reuse.
+            print(
+                "@@@ prefill_chunk_size",
+                self.vllm_config.scheduler_config.max_num_batched_tokens,
+            )
             spec = RBLNCompileSpec.for_architecture(
                 hf_config,
                 batch_size=self.scheduler_config.max_num_seqs,
                 block_size=get_attn_block_size(self.vllm_config),
                 max_model_len=self.model_config.max_model_len,
                 num_devices=envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
-                # Resolved during sync (from_optimum/from_vllm); pin it at compile
-                # time so the compiled model matches the value used for KV-cache
-                # block padding.
-                prefill_chunk_size=self.vllm_config.additional_config.get(
-                    "prefill_chunk_size"
-                ),
+                # Resolved during sync (from_optimum/from_vllm) into
+                # max_num_batched_tokens; pin it at compile time so the compiled
+                # model matches the value used for KV-cache block padding.
+                prefill_chunk_size=self.vllm_config.scheduler_config.max_num_batched_tokens,
                 rbln_overrides=rbln_overrides,
             )
             logger.info(

@@ -33,6 +33,9 @@ from vllm.platforms import Platform, PlatformEnum
 from vllm_rbln import envs
 from vllm_rbln.logger import init_logger
 from vllm_rbln.utils.optimum.converter import sync_vllm_and_optimum
+from vllm_rbln.utils.optimum.converter.common import (
+    USER_MAX_NUM_BATCHED_TOKENS_KEY,
+)
 from vllm_rbln.utils.optimum.predicates import is_qwen3_pooling
 from vllm_rbln.utils.optimum.registry import (
     is_enc_dec_arch,
@@ -174,11 +177,56 @@ class RblnPlatform(Platform):
         EngineArgs._rbln_max_num_seqs_patched = True
 
     @classmethod
+    def _capture_user_max_num_batched_tokens(cls) -> None:
+        """Stash the user's raw max_num_batched_tokens so the converter can read it.
+
+        In the RBLN optimum path an explicit max_num_batched_tokens IS the
+        prefill chunk size, so ``sync_from_vllm`` needs to know whether the user
+        set it. By the time that runs it can no longer tell, because vLLM has
+        already overwritten the value:
+
+          1. The user passes ``max_num_batched_tokens`` (an int) or leaves it
+             ``None``.
+          2. ``_set_default_max_num_seqs_and_batched_tokens_args`` replaces a
+             ``None`` with a throughput default and, since chunked prefill is
+             off on RBLN, floors it up to ``max_model_len``.
+          3. ``VllmConfig.__post_init__`` calls ``check_and_update_config`` ->
+             ``sync_from_vllm``, which now sees a concrete number with no trace
+             of whether it came from the user or from step 2.
+
+        This wrapper runs at the start of step 2, before the overwrite, and
+        records the raw value (``None`` if unset) into ``additional_config``,
+        which flows unchanged into ``VllmConfig``. ``sync_from_vllm`` then reads
+        it via ``get_user_max_num_batched_tokens``.
+        """
+        from vllm.engine.arg_utils import EngineArgs
+
+        if getattr(EngineArgs, "_rbln_user_mnbt_patched", False):
+            return
+
+        orig_set_defaults = EngineArgs._set_default_max_num_seqs_and_batched_tokens_args
+
+        def _set_default_max_num_seqs_and_batched_tokens_args(self, *args, **kwargs):
+            # Runs before the value is resolved from None to its default.
+            if self.additional_config is None:
+                self.additional_config = {}
+            self.additional_config[USER_MAX_NUM_BATCHED_TOKENS_KEY] = (
+                self.max_num_batched_tokens
+            )
+            return orig_set_defaults(self, *args, **kwargs)
+
+        EngineArgs._set_default_max_num_seqs_and_batched_tokens_args = (
+            _set_default_max_num_seqs_and_batched_tokens_args
+        )
+        EngineArgs._rbln_user_mnbt_patched = True
+
+    @classmethod
     def pre_register_and_update(
         cls, parser: "FlexibleArgumentParser | None" = None
     ) -> None:
         # Runs before max_num_seqs is resolved from None to its default.
         cls._override_default_max_num_seqs()
+        cls._capture_user_max_num_batched_tokens()
 
         if parser is None:
             return
