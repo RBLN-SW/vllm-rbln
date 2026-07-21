@@ -101,14 +101,6 @@ class RBLNTopKTopPSampler(nn.Module):
             "RBLN Sampling does not support returning logits/logprobs"
         )
 
-        compile_context = (
-            compile_context
-            or create_compile_context(
-                use_global_ctx=True,
-            )
-            if not USE_DEVICE_TENSOR
-            else None
-        )
         self._compiled_rbln_topk_topp_sampler = compile_sampler(
             rbln_top_k_top_p_sample, compile_context
         )
