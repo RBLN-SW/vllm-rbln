@@ -4456,19 +4456,15 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # same worker WITHOUT the deferral) is deterministic with logprobs on.
             # See docs/async_overlap_batch1_rootcause.md.
             #
-            # Fix: run the deferred sampler under force_sync so its worker submissions
-            # complete inline before the main thread proceeds, removing the concurrency.
-            # This makes only the (small) sampler synchronous — the forward<->all_reduce
-            # overlap already happened in the prior step and was drained before this runs,
-            # so the overlap and the device sampler are preserved.
-            #
-            # NOTE(batch>1 determinism): the earlier "no logprobs -> already deterministic
-            # -> skip force_sync" carve-out was verified only at batch=1. At batch>1 the
-            # deferred argmax over multiple batch rows is itself submitted non-blocking to
-            # the FIFO worker, and the main thread races ahead before it drains — corrupting
-            # near-tie tokens run-to-run even with logprobs OFF (sync is deterministic; async
-            # batch>1 flips run-to-run). So force_sync the deferred sampler UNCONDITIONALLY.
-            _fs_sampler = _dsm is not None
+            # Fix: when logprobs are requested, run the deferred sampler under
+            # force_sync so its worker submissions complete inline before the main
+            # thread proceeds, removing the concurrency (verified: batch=1 defer +
+            # logprobs becomes deterministic). This makes only the (small) sampler
+            # synchronous — the forward<->all_reduce overlap already happened in the
+            # prior step and was drained before this runs, so the overlap and the
+            # device sampler are preserved. With no logprobs there are no extra graphs
+            # and the path is already deterministic, so skip force_sync (no cost).
+            _fs_sampler = _dsm is not None and _dsm.max_num_logprobs is not None
 
             # skip_int32_cast=True: the argmax runs async, so casting its output to
             # int32 inside the sampler (before the submission is awaited) reads an
