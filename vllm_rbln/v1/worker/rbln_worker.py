@@ -594,13 +594,21 @@ class RBLNWorker(WorkerBase):
         return
 
     def shutdown(self) -> None:
+        # Dump the final performance stats FIRST, before any teardown. EngineCore
+        # is shut down with a zero-second grace period, so this method runs inside
+        # a window where the worker process may be reaped at any moment.
+        # print_stats() only reads already-collected host-side counters (no device
+        # / KV / model access), so it is safe to run before the teardown steps
+        # below. Running blocking teardown such as ensure_kv_transfer_shutdown()
+        # ahead of it consumed the whole grace window and truncated (or fully
+        # dropped, for P/D engines) the dump.
+        self.model_runner.performance_ctx.print_stats()
+
         # has_kv_transfer_group can be None during interpreter shutdown.
         if ensure_kv_transfer_shutdown is not None:
             ensure_kv_transfer_shutdown()
         if self.profiler is not None:
             self.profiler.shutdown()
-
-        self.model_runner.performance_ctx.print_stats()
 
     def _ensure_rbln_host_threads_before_compile(self) -> None:
         """Set OpenMP / torch / numba threads before ``warm_up_model()`` without
