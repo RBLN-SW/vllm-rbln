@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from collections.abc import Callable
 from typing import Any
 
 import rebel
@@ -59,6 +60,34 @@ def rbln_greedy_sample(logits: torch.Tensor) -> torch.Tensor:
     return torch.ops.rbln.argmax(logits)
 
 
+def compile_sampler(
+    op: Callable[..., torch.Tensor],
+    compile_context: rebel.CompileContext | None,
+) -> Callable[..., torch.Tensor]:
+    compile_context = (
+        compile_context
+        or create_compile_context(
+            use_global_ctx=True,
+        )
+        if not USE_DEVICE_TENSOR
+        else None
+    )
+    return compile(
+        op,
+        dynamic=False,
+        fullgraph=True,
+        compile_context=compile_context,
+        num_devices=1 if USE_DEVICE_TENSOR or HAS_TORCH_RBLN else None,
+        model_trace_method="export" if USE_DEVICE_TENSOR else "",
+        mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
+        use_global_ctx=True if HAS_TORCH_RBLN and not USE_DEVICE_TENSOR else None,
+        global_device_id=0 if HAS_TORCH_RBLN and not USE_DEVICE_TENSOR else None,
+        # FIXME: Currently, sampler ops do not support caching.
+        # Reusing seed buffer is not supported when the compiled sampler is loaded.
+        use_cache=False,
+    )
+
+
 class RBLNTopKTopPSampler(nn.Module):
     def __init__(
         self,
@@ -74,24 +103,8 @@ class RBLNTopKTopPSampler(nn.Module):
             "RBLN Sampling does not support returning logits/logprobs"
         )
 
-        compile_context = (
-            compile_context
-            or create_compile_context(
-                use_global_ctx=True,
-            )
-            if not USE_DEVICE_TENSOR
-            else None
-        )
-        self._compiled_rbln_topk_topp_sampler = compile(
-            rbln_top_k_top_p_sample,
-            dynamic=False,
-            fullgraph=True,
-            compile_context=compile_context,
-            num_devices=1 if USE_DEVICE_TENSOR or HAS_TORCH_RBLN else None,
-            model_trace_method="export" if USE_DEVICE_TENSOR else "",
-            mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
-            use_global_ctx=True if HAS_TORCH_RBLN and not USE_DEVICE_TENSOR else None,
-            global_device_id=0 if HAS_TORCH_RBLN and not USE_DEVICE_TENSOR else None,
+        self._compiled_rbln_topk_topp_sampler = compile_sampler(
+            rbln_top_k_top_p_sample, compile_context
         )
 
     @torch.compiler.disable
@@ -144,13 +157,8 @@ class RBLNSampler(VLLMSampler):
                 "Using native sampler instead."
             )
 
-        self._compiled_greedy_sample = compile(
-            rbln_greedy_sample,
-            dynamic=False,
-            fullgraph=True,
-            compile_context=compile_context,
-            num_devices=1 if USE_DEVICE_TENSOR or HAS_TORCH_RBLN else None,
-            mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
+        self._compiled_greedy_sample = compile_sampler(
+            rbln_greedy_sample, compile_context
         )
 
     @torch.compiler.disable

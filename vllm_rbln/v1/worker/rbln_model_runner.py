@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import dataclasses
-import itertools
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
 from contextlib import nullcontext
@@ -1739,7 +1738,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             self.model = model_loader.load_model(
                 vllm_config=self.vllm_config, model_config=self.model_config
             )
-        self._make_weights_contiguous()
+
         if hasattr(self.model, "logits_processor"):
             self.logits_processor = self.model.logits_processor
         elif self.model_config.is_multimodal_model and hasattr(
@@ -1769,6 +1768,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 aux_layers = self.model.get_eagle3_default_aux_hidden_state_layers()
 
             self.model.set_aux_hidden_state_layers(aux_layers)
+
+        self._make_weights_contiguous()
 
         # NOTE(RBLN): This wrapper is designed to be compiled by torch.compile.
         # It handles the forward pass of the underlying model and computes
@@ -2833,19 +2834,25 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
     def _make_weights_contiguous(self) -> None:
         """Force weights contiguous before weight-free compile, which hard-errors
         on non-contiguous CPU tensors. Covers parameters, buffers, and plain
-        tensor attributes."""
+        tensor attributes of the main model and, when present, the spec-decode
+        drafter model."""
 
-        def plain_attr_tensors():
-            for module in self.model.modules():
+        def model_tensors(model: torch.nn.Module):
+            yield from model.parameters()
+            yield from model.buffers()
+            for module in model.modules():
                 for value in module.__dict__.values():
                     if isinstance(value, torch.Tensor):
                         yield value
 
-        for t in itertools.chain(
-            self.model.parameters(), self.model.buffers(), plain_attr_tensors()
-        ):
-            if not t.is_contiguous():
-                t.data = t.data.contiguous()
+        models = [self.model]
+        if isinstance(getattr(self, "drafter", None), RBLNEagleProposer):
+            models.append(self.drafter.model)
+
+        for model in models:
+            for t in model_tensors(model):
+                if not t.is_contiguous():
+                    t.data = t.data.contiguous()
 
     def warmup_model(self) -> None:
         # NOTE(RBLN): Warm-up must not route through execute_model() while a
