@@ -708,7 +708,6 @@ http = [
 ]
 
 [[package]]
-<<<<<<< HEAD
 name = "gguf"
 version = "0.19.0"
 source = { registry = "https://pypi.rebellions.in/simple/" }
@@ -726,8 +725,6 @@ wheels = [
 ]
 
 [[package]]
-=======
->>>>>>> 00570cc9 (chore(deps): bump vllm to 0.24.0+cpu and update packaging references)
 name = "googleapis-common-protos"
 version = "1.75.0"
 source = { registry = "https://pypi.rebellions.in/simple/" }
