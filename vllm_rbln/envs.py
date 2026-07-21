@@ -77,6 +77,22 @@ if TYPE_CHECKING:
     VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS: list[int] = []
     # --- KV CONNECTOR ---
     VLLM_RBLN_NIXL_SWA_VIEW_OPT: bool = False
+    # --- QUANTIZATION ---
+    VLLM_RBLN_USE_W8A16: bool = False
+
+
+def get_use_w8a16() -> bool:
+    value = os.environ.get("VLLM_RBLN_USE_W8A16")
+    if value is not None:
+        return value.lower() in ("true", "1")
+
+    from vllm.platforms import current_platform
+
+    try:
+        device_name = current_platform.get_device_name()
+    except Exception:
+        device_name = ""
+    return "cr03" in device_name.lower()
 
 
 def get_num_devices_per_local_rank() -> int:

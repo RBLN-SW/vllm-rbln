@@ -91,3 +91,51 @@ class RBLNW8A16BlockFp8LinearKernel(Fp8BlockScaledMMLinearKernel):
         return (weight * weight_scale[:, :, None].to(dtype)).view(
             out_features, in_features
         )
+
+
+class RBLNW8A8BlockFp8LinearKernel(RBLNW8A16BlockFp8LinearKernel):
+    """W8A8 block FP8 linear for RBLN."""
+
+    FP8_DTYPE = torch.float8_e4m3fn
+
+    def apply_block_scaled_mm(
+        self,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        As: torch.Tensor,
+        Bs: torch.Tensor,
+    ) -> torch.Tensor:
+        # activation_scheme is dynamic for block quant, so the incoming
+        # activation scale (As) is unused; it is recomputed per group here.
+        del As
+        _block_n, block_k = [int(v) for v in self.weight_group_shape]
+
+        # 1) activation: dynamic per-(1, block_k) fp8 quant along K, then
+        #    dequantize by expanding each K-block scale over block_k cols.
+        x_q, x_scale = self._per_token_group_quant_fp8(A, block_k)
+        x_deq = x_q.to(A.dtype) * x_scale.repeat_interleave(block_k, dim=-1).to(A.dtype)
+
+        # 2) weight dequant (identical to the W8A16 path).
+        weight = self._dequantize_block_fp8_weight(
+            weight=B,
+            weight_scale=Bs,
+            dtype=A.dtype,
+        )
+        return torch.nn.functional.linear(x_deq, weight)
+
+    @classmethod
+    def _per_token_group_quant_fp8(
+        cls,
+        x: torch.Tensor,
+        group_size: int,
+        eps: float = 1e-10,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        finfo = torch.finfo(cls.FP8_DTYPE)
+        orig_shape = x.shape
+        x_g = x.reshape(-1, group_size).to(torch.float32)
+        amax = x_g.abs().amax(dim=-1, keepdim=True).clamp_min(eps)
+        scale = amax / finfo.max
+        x_q = (x_g / scale).clamp(finfo.min, finfo.max).to(cls.FP8_DTYPE)
+        x_q = x_q.reshape(orig_shape)
+        scale = scale.reshape(*orig_shape[:-1], orig_shape[-1] // group_size)
+        return x_q, scale
