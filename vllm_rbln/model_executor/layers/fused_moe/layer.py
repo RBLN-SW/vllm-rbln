@@ -515,8 +515,7 @@ class RBLNFusedMoE(FusedMoE):
                 hidden_shape_dp = (-1, 1, H_dim)
                 all_hidden_states = final_hidden_states.reshape(hidden_shape_dp)
                 assert (
-                    all_hidden_states.shape[0] % self.moe_parallel_config.dp_size
-                    == 0
+                    all_hidden_states.shape[0] % self.moe_parallel_config.dp_size == 0
                 )
 
                 final_hidden_states = get_dp_group().reduce_scatter(
