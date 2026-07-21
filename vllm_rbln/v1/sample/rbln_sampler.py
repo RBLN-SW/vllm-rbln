@@ -213,6 +213,7 @@ class RBLNSampler(VLLMSampler):
         )
         return random_sampled, processed_logprobs
 
+    @torch.compiler.disable
     def apply_penalties(
         self,
         logits: torch.Tensor,
