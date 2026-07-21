@@ -1,0 +1,31 @@
+# Perf-timing instrumentation for vllm-executor's parity_runner._run_llm.
+# Env-gated (RBLN_PERF_TIMING=1); no effect otherwise. Apply from the
+# vllm-executor repo root:
+#     git apply docs/.../parity_runner_perf_timing.patch
+# If line numbers have drifted and git apply fails, just replace the body of
+# _run_llm() by hand with the "+"-side version below (add the timing around the
+# existing generate/chat call).
+--- a/src/vllm_rbln_exec/parity_runner.py
++++ b/src/vllm_rbln_exec/parity_runner.py
+@@ def _run_llm(llm, prompts, sampling_params, tokenizer, use_chat):
+ def _run_llm(llm, prompts, sampling_params, tokenizer, use_chat):
++    _perf = os.environ.get("RBLN_PERF_TIMING") == "1"
++    _t0 = time.perf_counter() if _perf else 0.0
+     if use_chat:
+         outputs = llm.chat(prompts, sampling_params=sampling_params, chat_template_kwargs={"date_string": FIXED_DATE})
+         _backfill_chat_prompts(outputs, prompts, llm.model_config, tokenizer)
+     else:
+         outputs = llm.generate(prompts, sampling_params)
++    if _perf:
++        # total_output_tokens / generate wall-clock, per generate call. call=1 is
++        # cold (may include compilation); call>=2 are warm. pid = DP-rank process.
++        _dt = time.perf_counter() - _t0
++        _run_llm._call = getattr(_run_llm, "_call", 0) + 1
++        _ntok = sum(len(o.outputs[0].token_ids) for o in outputs)
++        print(
++            f"PERF_GEN pid={os.getpid()} call={_run_llm._call} wall_s={_dt:.4f} "
++            f"n_prompts={len(outputs)} out_tokens={_ntok} "
++            f"tok_s={(_ntok / _dt if _dt > 0 else 0.0):.2f}",
++            flush=True,
++        )
+     return outputs
