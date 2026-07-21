@@ -187,6 +187,14 @@ class RBLNScheduler(Scheduler):
     ) -> None:
         super().__init__(*args, **kwargs)
 
+        # Cold-start determinism gate. Only RBLNAsyncScheduler drives it (via
+        # _det_quiesced / the schedule() override); for sync scheduling _det_hold
+        # stays False and this is inert. See RBLNAsyncScheduler for the rationale.
+        self._det_warm = False
+        self._det_last_n = -1
+        self._det_stable = 0
+        self._det_hold = False
+
         # Replace the upstream KVCacheManager with RBLNKVCacheManager
         # when sub-block prefix caching is enabled.
         # Sub-block size equals the prefill chunk size (max_num_batched_tokens)
@@ -317,8 +325,9 @@ class RBLNScheduler(Scheduler):
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
         token_budget = self.max_num_scheduled_tokens
-        if self._pause_state == PauseState.PAUSED_ALL:
-            # Do not schedule any requests when paused.
+        if self._pause_state == PauseState.PAUSED_ALL or self._det_hold:
+            # Do not schedule any requests when paused, or while the async
+            # determinism gate is holding the first step (see _det_hold).
             token_budget = 0
 
         # Encoder-related.
@@ -1366,4 +1375,52 @@ class RBLNAsyncScheduler(RBLNScheduler, AsyncScheduler):
     not by bit-comparing the whole batch's token stream. For strict run-to-run
     bit-reproducibility use sync scheduling (or ensure the full request set is
     ingested before the first step).
+
+    This class closes that gap in-scheduler (no upstream vLLM changes): the
+    schedule() override below holds the first step until request ingestion has
+    quiesced, making the cold-start DP batch composition deterministic while
+    keeping decode overlap once warm.
     """
+
+    def _det_quiesced(self) -> bool:
+        """Cold-start determinism gate.
+
+        Returns True once the initially-queued request set has stopped growing,
+        so the first-step DP batch composition is fixed run-to-run. Until then
+        returns False -- the caller then schedules nothing this step
+        (token_budget=0) and this method sleeps briefly, letting the EngineCore
+        loop drain more requests from its input queue (filled by a separate
+        socket thread) before the next call. Re-arms whenever the engine goes
+        idle, so every cold start is covered. Cost is a one-time ~30ms wait per
+        cold start; no steady-state cost. See the class docstring.
+        """
+        if not self.waiting and not self.running:
+            # Engine idle: nothing to hold for; re-arm for the next cold start.
+            self._det_warm = False
+            self._det_last_n = -1
+            self._det_stable = 0
+            return True
+        if self._det_warm or self.running:
+            # Already warmed, or a batch is already stepping -- don't stall it.
+            self._det_warm = True
+            return True
+        # Cold start with pending prefills only: wait for ingestion to settle.
+        n = len(self.waiting)
+        if n != self._det_last_n:
+            self._det_last_n = n
+            self._det_stable = 0
+        else:
+            self._det_stable += 1
+        if self._det_stable >= 3:
+            self._det_warm = True
+            return True
+        time.sleep(0.01)
+        return False
+
+    def schedule(self) -> RBLNSchedulerOutput:
+        # Hold the first step until request ingestion quiesces so the DP batch
+        # composition is deterministic run-to-run (see class docstring). Always
+        # on for async scheduling; sync gets determinism for free via its
+        # blocking first prefill and never sets _det_hold.
+        self._det_hold = not self._det_quiesced()
+        return super().schedule()
