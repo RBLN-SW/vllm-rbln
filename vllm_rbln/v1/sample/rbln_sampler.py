@@ -26,7 +26,7 @@ from vllm.v1.sample.sampler import Sampler as VLLMSampler
 import vllm_rbln.envs as envs
 from vllm_rbln.compilation import compile, create_compile_context
 from vllm_rbln.logger import init_logger
-from vllm_rbln.platform import USE_DEVICE_TENSOR
+from vllm_rbln.platform import HAS_TORCH_RBLN, USE_DEVICE_TENSOR
 from vllm_rbln.v1.sample.ops.logprobs import batched_count_greater_than
 from vllm_rbln.v1.sample.ops.penalties import (
     apply_all_penalties as rbln_apply_all_penalties,
@@ -77,11 +77,11 @@ def compile_sampler(
         dynamic=False,
         fullgraph=True,
         compile_context=compile_context,
-        num_devices=1,
+        num_devices=1 if USE_DEVICE_TENSOR or HAS_TORCH_RBLN else None,
         model_trace_method="export" if USE_DEVICE_TENSOR else "",
         mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
-        use_global_ctx=None if USE_DEVICE_TENSOR else True,
-        global_device_id=None if USE_DEVICE_TENSOR else 0,
+        use_global_ctx=True if HAS_TORCH_RBLN and not USE_DEVICE_TENSOR else None,
+        global_device_id=0 if HAS_TORCH_RBLN and not USE_DEVICE_TENSOR else None,
         use_cache=False,
     )
 
