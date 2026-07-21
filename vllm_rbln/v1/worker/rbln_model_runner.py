@@ -1739,7 +1739,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             self.model = model_loader.load_model(
                 vllm_config=self.vllm_config, model_config=self.model_config
             )
-        self._make_weights_contiguous()
+
         if hasattr(self.model, "logits_processor"):
             self.logits_processor = self.model.logits_processor
         elif self.model_config.is_multimodal_model and hasattr(
@@ -1769,6 +1769,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 aux_layers = self.model.get_eagle3_default_aux_hidden_state_layers()
 
             self.model.set_aux_hidden_state_layers(aux_layers)
+
+        self._make_weights_contiguous()
 
         # NOTE(RBLN): This wrapper is designed to be compiled by torch.compile.
         # It handles the forward pass of the underlying model and computes
