@@ -111,10 +111,18 @@ class RBLNOptimumScheduler(Scheduler):
 
         # Scheduling constraints.
         self.max_num_running_reqs = self.scheduler_config.max_num_seqs
+        # Per-step token budget. Not max_num_batched_tokens: the optimum path
+        # repurposes that as the compiled prefill chunk size, and the runner
+        # prefills the whole prompt in one step (chunking is internal to the
+        # compiled binary). The budget must therefore fit a full-length prefill
+        # or a full decode batch.
         self.max_num_scheduled_tokens = (
             self.scheduler_config.max_num_scheduled_tokens
             if self.scheduler_config.max_num_scheduled_tokens
-            else self.scheduler_config.max_num_batched_tokens
+            else max(
+                vllm_config.model_config.max_model_len,
+                self.scheduler_config.max_num_seqs,
+            )
         )
         self.max_model_len = vllm_config.model_config.max_model_len
         self.enable_kv_cache_events = (
@@ -202,7 +210,10 @@ class RBLNOptimumScheduler(Scheduler):
         self.kv_cache_manager = RBLNKVCacheManager(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
-            max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
+            # The SWA/chunked-local admission cap, which must match the actual
+            # per-step budget, not max_num_batched_tokens (the compiled chunk
+            # size). See max_num_scheduled_tokens above.
+            max_num_batched_tokens=self.max_num_scheduled_tokens,
             enable_caching=self.cache_config.enable_prefix_caching,
             use_eagle=False,
             log_stats=self.log_stats,
