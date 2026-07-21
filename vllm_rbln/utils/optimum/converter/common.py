@@ -153,16 +153,11 @@ def update_max_num_batched_tokens(
     elif is_pooling_arch(hf_config):
         target = max(max_model_len, max_num_seqs)
     else:
-        # decoder / multimodal: max_num_batched_tokens is the prefill chunk size.
-        # A decode step schedules one token per running sequence, so the budget
-        # must cover a full batch; a smaller chunk would throttle decode.
+        # decoder / multimodal: max_num_batched_tokens carries the compiled
+        # prefill chunk size. It does not bound the decode batch — the
+        # scheduler's per-step budget (max_num_scheduled_tokens) is decoupled
+        # from max_num_batched_tokens — so it may be smaller than max_num_seqs.
         target = params.prefill_chunk_size
-        assert target >= max_num_seqs, (
-            f"prefill_chunk_size ({target}) must be >= max_num_seqs "
-            f"({max_num_seqs}); a smaller prefill chunk would throttle the "
-            "decode batch. Recompile with a larger prefill_chunk_size or lower "
-            "max_num_seqs."
-        )
 
     cur = vllm_config.scheduler_config.max_num_batched_tokens
     if cur != target:
