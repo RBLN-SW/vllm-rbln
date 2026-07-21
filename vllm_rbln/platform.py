@@ -455,9 +455,12 @@ class RblnPlatform(Platform):
             if hasattr(hf_config, "get_text_config")
             else hf_config
         )
-        if getattr(config, "sliding_window", None) is not None and getattr(
-            config, "use_sliding_window", True
-        ):
+        # use_sliding_window is a Qwen2-only opt-out flag; models without it
+        # (Gemma/Mistral) are judged by sliding_window/layer_types, so default
+        # to True (no opt-out) to avoid short-circuiting their detection.
+        if not getattr(config, "use_sliding_window", True):
+            return False
+        if getattr(config, "sliding_window", None) is not None:
             return True
         layer_types = getattr(config, "layer_types", None) or []
         return any("sliding" in str(layer_type).lower() for layer_type in layer_types)
