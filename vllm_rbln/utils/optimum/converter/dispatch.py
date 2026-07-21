@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 from vllm_rbln import envs
 from vllm_rbln.logger import init_logger
 
+from .common import get_user_max_num_batched_tokens
 from .from_optimum import sync_from_optimum
 from .from_vllm import sync_from_vllm
 from .params import load_compiled_rbln_config
@@ -63,6 +64,12 @@ def _generate_model_path_name(
     max_model_len = vllm_config.model_config.max_model_len
     num_devices = envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK
     additional_config = vllm_config.additional_config.get("rbln_config", None)
+    # The user's explicit max_num_batched_tokens becomes the compiled prefill
+    # chunk size (folded in by sync_from_vllm, which runs after this). Include
+    # the raw value so runs that would compile different binaries don't collide
+    # on the same cache key. `scheduler_config.max_num_batched_tokens` is still
+    # the vLLM default here, so read the raw user value instead.
+    user_max_num_batched_tokens = get_user_max_num_batched_tokens(vllm_config)
 
     # FIXME: To avoid cache collisions, the cache key should also include
     # the versions of the compiler and optimum-rbln.
@@ -72,6 +79,7 @@ def _generate_model_path_name(
         "block_size": block_size,
         "max_model_len": max_model_len,
         "num_devices": num_devices,
+        "max_num_batched_tokens": user_max_num_batched_tokens,
     }
     if additional_config:
         config_dict["rbln_config"] = _strip_runtime_only_keys(additional_config)

@@ -22,8 +22,7 @@ from vllm_rbln.utils.optimum.block_size import (
 )
 
 from .common import (
-    get_user_max_num_batched_tokens,
-    is_chunked_prefill_arch,
+    apply_user_prefill_chunk_size,
     store_image_prefill_chunk_size,
     update_block_size,
     update_max_num_batched_tokens,
@@ -102,33 +101,12 @@ def sync_from_optimum(
         )
         vllm_config.model_config.max_model_len = params.max_seq_len
 
-    # The compiled artefact is the source of truth for the prefill chunk size.
-    # If the user also passed max_num_batched_tokens (a decoder/multimodal chunk
-    # size) and it disagrees with the compiled value, fail loudly rather than
-    # silently running with a config that mismatches the binary.
-    user_mnbt = get_user_max_num_batched_tokens(vllm_config)
-    if (
-        user_mnbt is not None
-        and is_chunked_prefill_arch(vllm_config.model_config.hf_config)
-        and user_mnbt != params.prefill_chunk_size
-    ):
-        raise ValueError(
-            f"max_num_batched_tokens ({user_mnbt}) conflicts with the compiled "
-            f"prefill_chunk_size ({params.prefill_chunk_size}) in "
-            "rbln_config.json. Omit max_num_batched_tokens or recompile the "
-            "model with a matching prefill chunk size."
-        )
+    # The compiled artefact fixes the prefill chunk size; a differing
+    # max_num_batched_tokens from the user is an error.
+    apply_user_prefill_chunk_size(vllm_config, params, precompiled=True)
     # Set max_num_batched_tokens: the prefill chunk size for decoder/multimodal
     # models, or a full-prefill-plus-batch budget for enc-dec/pooling models.
-    print(
-        "@@@ before prefill_chunk_size",
-        vllm_config.scheduler_config.max_num_batched_tokens,
-    )
     update_max_num_batched_tokens(vllm_config, params)
-    print(
-        "@@@ after prefill_chunk_size",
-        vllm_config.scheduler_config.max_num_batched_tokens,
-    )
     # Persist the image-prefill buckets (gemma3/gemma4) into additional_config.
     store_image_prefill_chunk_size(vllm_config, params.image_prefill_chunk_size)
     # Set block_size in cache_config based on rbln_config.json.

@@ -18,6 +18,7 @@ import pytest
 
 from vllm_rbln.utils.optimum.converter.common import (
     USER_MAX_NUM_BATCHED_TOKENS_KEY,
+    apply_user_prefill_chunk_size,
     get_user_max_num_batched_tokens,
     is_chunked_prefill_arch,
     store_image_prefill_chunk_size,
@@ -115,6 +116,61 @@ class TestUpdateMaxNumBatchedTokens:
         params = RBLNParams(prefill_chunk_size=128)
         update_max_num_batched_tokens(cfg, params)
         assert cfg.scheduler_config.max_num_batched_tokens == 1500
+
+
+class TestApplyUserPrefillChunkSize:
+    def test_noop_for_pooling(self):
+        cfg = _vllm_config(
+            arch=POOLING_ARCH,
+            additional_config={USER_MAX_NUM_BATCHED_TOKENS_KEY: 512},
+        )
+        params = RBLNParams(prefill_chunk_size=128)
+        apply_user_prefill_chunk_size(cfg, params, precompiled=False)
+        assert params.prefill_chunk_size == 128
+
+    def test_noop_when_user_unset(self):
+        cfg = _vllm_config(arch=DECODER_ARCH, additional_config={})
+        params = RBLNParams(prefill_chunk_size=128)
+        apply_user_prefill_chunk_size(cfg, params, precompiled=False)
+        assert params.prefill_chunk_size == 128
+
+    def test_compile_path_folds_user_value(self):
+        cfg = _vllm_config(
+            arch=DECODER_ARCH,
+            additional_config={USER_MAX_NUM_BATCHED_TOKENS_KEY: 512},
+        )
+        params = RBLNParams(prefill_chunk_size=128)
+        apply_user_prefill_chunk_size(cfg, params, precompiled=False)
+        assert params.prefill_chunk_size == 512
+
+    def test_compile_path_conflict_with_rbln_override(self):
+        cfg = _vllm_config(
+            arch=DECODER_ARCH,
+            additional_config={USER_MAX_NUM_BATCHED_TOKENS_KEY: 512},
+        )
+        params = RBLNParams(prefill_chunk_size=256)
+        with pytest.raises(ValueError, match="Conflicting prefill chunk size"):
+            apply_user_prefill_chunk_size(
+                cfg, params, precompiled=False, override_prefill_chunk_size=256
+            )
+
+    def test_precompiled_conflict_raises(self):
+        cfg = _vllm_config(
+            arch=DECODER_ARCH,
+            additional_config={USER_MAX_NUM_BATCHED_TOKENS_KEY: 512},
+        )
+        params = RBLNParams(prefill_chunk_size=128)
+        with pytest.raises(ValueError, match="conflicts with the compiled"):
+            apply_user_prefill_chunk_size(cfg, params, precompiled=True)
+
+    def test_precompiled_match_ok(self):
+        cfg = _vllm_config(
+            arch=DECODER_ARCH,
+            additional_config={USER_MAX_NUM_BATCHED_TOKENS_KEY: 128},
+        )
+        params = RBLNParams(prefill_chunk_size=128)
+        apply_user_prefill_chunk_size(cfg, params, precompiled=True)
+        assert params.prefill_chunk_size == 128
 
 
 class TestStoreImagePrefillChunkSize:
