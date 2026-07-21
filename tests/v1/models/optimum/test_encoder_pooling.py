@@ -57,8 +57,6 @@ from vllm_rbln.utils.optimum.predicates import is_qwen3_pooling
 ENCODER_MODELS = [
     # arch: BertModel
     ("sentence-transformers/all-MiniLM-L6-v2", "CLS", DispatchPooler),
-    # arch: RobertaModel
-    ("sentence-transformers/nli-roberta-base-v2", "CLS", DispatchPooler),
     # arch: XLMRobertaModel
     ("intfloat/multilingual-e5-base", "CLS", DispatchPooler),
     # arch: RobertaForSequenceClassification

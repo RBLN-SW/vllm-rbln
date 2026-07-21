@@ -82,13 +82,11 @@ _RBLN_MULTIMODAL_MODELS = {
 }
 
 _RBLN_EMBEDDING_MODELS = {
-    "T5EncoderModel": ("t5_encoder", "RBLNT5EncoderModel"),
     "BertModel": ("bert_model", "RBLNBertModel"),
     "RobertaForSequenceClassification": (
         "roberta_classification",
         "RBLNRobertaForSequenceClassification",
     ),
-    "RobertaModel": ("roberta", "RBLNRobertaModel"),
     "XLMRobertaForSequenceClassification": (
         "xlm_roberta_classification",
         "RBLNXLMRobertaForSequenceClassification",
