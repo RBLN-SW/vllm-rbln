@@ -38,7 +38,7 @@ from vllm_rbln.utils.optimum.block_size import get_attn_block_size
 from vllm_rbln.utils.optimum.bucket import select_bucket_size
 from vllm_rbln.utils.optimum.registry import get_rbln_model_info
 
-from .base import ModelInputForRBLN
+from .base import ModelInputForRBLN, PartialPrefixInfo
 from .compilation import RBLNCompileSpec
 
 logger = init_logger(__name__)
@@ -409,31 +409,37 @@ class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
         }
         return kwargs
 
-    def _copy_cached_kv_blocks(
+    def get_prefill_decoder(self) -> runtime_utils.RBLNRuntimeModel:
+        return self.model.prefill_decoder
+
+    def copy_cached_kv_blocks(
         self,
-        prefill_decoder: runtime_utils.RBLNRuntimeModel,
         cached_block_tables: list[int],
         cached_lengths: list[int],
         block_tables: torch.Tensor,
-    ):
-        """Copy cached KV blocks from source to destination blocks.
+    ) -> None:
+        """Copy prefix-cached KV blocks into this request's destination blocks.
+
+        The model runner calls this before the prefill forward so the copy
+        stays an orchestration concern and the model forward remains a pure
+        forward pass.
 
         Args:
-            cached_block_tables: List of source block IDs to copy from
-            cached_lengths: List of cached lengths for each block
-            block_tables: Tensor containing destination block IDs
+            cached_block_tables: Source block IDs to copy from.
+            cached_lengths: Cached length for each source block.
+            block_tables: Tensor whose first row holds the destination block IDs.
         """
         if not cached_block_tables:
             return
 
         if len(cached_block_tables) != len(cached_lengths):
             raise ValueError(
-                "Mismatch between cached_block_tables length (%s) "
-                "and cached_lengths length (%s)",
-                len(cached_block_tables),
-                len(cached_lengths),
+                "Mismatch between cached_block_tables length "
+                f"({len(cached_block_tables)}) and cached_lengths length "
+                f"({len(cached_lengths)})"
             )
 
+        prefill_decoder = self.get_prefill_decoder()
         # Convert to list once for efficiency
         dst_blocks = block_tables[0].tolist()
 
@@ -451,11 +457,8 @@ class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
                 )
             except Exception as e:
                 error_msg = (
-                    "Failed to copy KV cache from block %d to block %d at index %d: %s",
-                    src_block,
-                    dst_block,
-                    block_idx,
-                    e,
+                    f"Failed to copy KV cache from block {src_block} to block "
+                    f"{dst_block} at index {block_idx}: {e}"
                 )
                 logger.error(error_msg)
                 raise RuntimeError(error_msg) from e
@@ -472,7 +475,30 @@ class RBLNOptimumMultimodalMixin(SupportsMultiModal):
     Shared multimodal interface for optimum models.
     """
 
+    def get_prefill_decoder(self) -> runtime_utils.RBLNRuntimeModel:
+        return self.model.language_model.prefill_decoder
+
     def build_prefill_forward_inputs(
+        self,
+        model_input: ModelInputForRBLN,
+        mrope_position_deltas: dict[str, float],
+    ) -> ModelInputForRBLN:
+        """Dispatch full vs partial prefix-cache prefill. Shared by every MM
+        model; subclasses override the ``_build_*_prefill_forward_inputs``
+        builders, not this dispatch.
+
+        ``mrope_position_deltas`` is unused in the base builders but forwarded
+        so MRoPE overrides (e.g. Qwen-VL) can record per-request rope deltas.
+        """
+        if model_input.partial_prefix is not None:
+            return self._build_partial_prefill_forward_inputs(
+                model_input, mrope_position_deltas
+            )
+        return self._build_full_prefill_forward_inputs(
+            model_input, mrope_position_deltas
+        )
+
+    def _build_full_prefill_forward_inputs(
         self,
         model_input: ModelInputForRBLN,
         mrope_position_deltas: dict[str, float],
@@ -481,18 +507,32 @@ class RBLNOptimumMultimodalMixin(SupportsMultiModal):
             **(model_input.multi_modal_kwargs or {})
         )
         input_ids = model_input.input_tokens.to(torch.int64)
-        inputs_embeds = self.embed_input_ids(
-            input_ids,
-            multimodal_embeddings,
+        inputs_embeds = self.embed_input_ids(input_ids, multimodal_embeddings)
+        return replace(model_input, inputs_embeds=inputs_embeds)
+
+    def _build_partial_prefill_forward_inputs(
+        self,
+        model_input: ModelInputForRBLN,
+        mrope_position_deltas: dict[str, float],
+    ) -> ModelInputForRBLN:
+        assert model_input.partial_prefix is not None
+        multimodal_embeddings = self.embed_multimodal(
+            **(model_input.multi_modal_kwargs or {})
         )
+        multimodal_embeddings = self._build_partial_mm_embeds(
+            model_input.partial_prefix, multimodal_embeddings
+        )
+        input_ids = model_input.input_tokens.to(torch.int64)
+        inputs_embeds = self.embed_input_ids(input_ids, multimodal_embeddings)
         return replace(model_input, inputs_embeds=inputs_embeds)
 
     def compute_decode_position_embed(
         self,
         model_input: ModelInputForRBLN,
+        # Unused in the base (no decode-time position embed); MRoPE models
+        # (e.g. Qwen-VL) override this and consume the recorded rope deltas.
         mrope_position_deltas: dict[str, float],
     ) -> torch.Tensor | None:
-        # MRoPE models (e.g. Qwen-VL) override this
         return None
 
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings | dict:
@@ -500,13 +540,6 @@ class RBLNOptimumMultimodalMixin(SupportsMultiModal):
         # the image input and return per-image token embeddings. Models with a
         # richer cacheable unit (e.g. Qwen-VL, which also handles video) override
         # this.
-        #
-        # NOTE: Upstream vLLM's MultiModalEmbeddings is only
-        # list[Tensor] | Tensor | tuple[Tensor, ...] and does not admit a dict.
-        # Models whose cacheable unit is richer than per-item embeddings (e.g.
-        # Qwen-VL: image/video embeds + grid_thw + optional deepstack) return
-        # that unit as a dict, so vLLM-RBLN widens the contract to also allow
-        # dict instead of forcing it into a positional tuple.
         image_input = self._parse_and_validate_image_input(**kwargs)
         if image_input is None:
             return []
@@ -536,6 +569,20 @@ class RBLNOptimumMultimodalMixin(SupportsMultiModal):
         # override this to PAD-mask the placeholder positions first.
         return self.model.get_input_embeddings()(input_ids)
 
+    def _assert_mm_tokens_match(
+        self, num_placeholders: int, num_embed_tokens: int
+    ) -> None:
+        """
+        Guard that the multimodal placeholder count equals the embed-token count.
+        """
+        if num_placeholders != num_embed_tokens:
+            raise ValueError(
+                "Multimodal placeholder/embedding count mismatch: "
+                f"{num_placeholders} placeholder positions but {num_embed_tokens} "
+                "embed tokens. A prefix-cache boundary likely split a multimodal "
+                "item; the cached prefix must not fall inside its placeholder range."
+            )
+
     def embed_input_ids(
         self,
         input_ids: torch.Tensor,
@@ -558,6 +605,7 @@ class RBLNOptimumMultimodalMixin(SupportsMultiModal):
         mm_embeds = torch.cat(list(multimodal_embeddings)).to(
             inputs_embeds.device, inputs_embeds.dtype
         )
+        self._assert_mm_tokens_match(int(is_multimodal.sum()), mm_embeds.shape[0])
         scatter_mask = is_multimodal.unsqueeze(-1).expand_as(inputs_embeds)
         return inputs_embeds.masked_scatter(scatter_mask, mm_embeds)
 
@@ -578,3 +626,35 @@ class RBLNOptimumMultimodalMixin(SupportsMultiModal):
         mm_embeds = [t for out in cached_mm_outputs for t in out]
         inputs_embeds = self.embed_input_ids(input_ids, mm_embeds)
         return {"inputs_embeds": inputs_embeds, "cache_position": cache_position}
+
+    def _build_partial_mm_embeds(
+        self,
+        partial_prefix: PartialPrefixInfo,
+        multimodal_embeddings: MultiModalEmbeddings,
+    ) -> MultiModalEmbeddings:
+        tail_starts_by_modality = partial_prefix.mm_embed_tail_starts or {}
+        # Base MM models are single-modality (image); flatten to one start list
+        # kept-item order, matching the flat per-item embeddings list.
+        if len(tail_starts_by_modality) > 1:
+            raise NotImplementedError(
+                "Partial prefix tail slicing across multiple modalities needs a "
+                "model-specific _build_partial_mm_embeds override."
+            )
+        tail_starts = next(iter(tail_starts_by_modality.values()), [])
+
+        if not isinstance(multimodal_embeddings, (list, tuple)):
+            raise NotImplementedError(
+                "Base partial prefix slicing expects per-item embeddings "
+                f"(list/tuple), got {type(multimodal_embeddings).__name__}; "
+                "override _build_partial_mm_embeds for this representation."
+            )
+        if len(tail_starts) != len(multimodal_embeddings):
+            raise ValueError(
+                f"kept-item count mismatch: {len(multimodal_embeddings)} "
+                f"embeddings vs {len(tail_starts)} tail starts"
+            )
+
+        sliced = [
+            embeds[start:] for embeds, start in zip(multimodal_embeddings, tail_starts)
+        ]
+        return type(multimodal_embeddings)(sliced)
