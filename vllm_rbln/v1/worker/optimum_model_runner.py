@@ -1007,6 +1007,9 @@ class RBLNOptimumModelRunner(
         pass
 
     def dummy_sampler_run(self):
+        if self.is_pooling_model:
+            logger.info("Skip dummy sampler run for pooling model.")
+            return
         if not self.use_rbln_sampler:
             logger.info(
                 "Skip dummy sampler run since it is only used in RBLN_SAMPLER=1"
@@ -1099,7 +1102,9 @@ class RBLNOptimumModelRunner(
 
                 with torch.inference_mode():
                     empty_logits = torch.empty(
-                        batch_size, input_batch.vocab_size, dtype=torch.float32
+                        batch_size,
+                        input_batch.vocab_size,
+                        dtype=self.model.dtype,
                     )
                     _ = self.sampler(logits=empty_logits, sampling_metadata=metadata)
 
