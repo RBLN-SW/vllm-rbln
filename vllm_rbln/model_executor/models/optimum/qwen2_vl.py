@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -68,14 +67,6 @@ MODALITIES: tuple[ModalitySpec, ModalitySpec] = (
         "video_token_id",
     ),
 )
-
-
-def iter_modalities(
-    image_input: Any, video_input: Any
-) -> Iterator[tuple[ModalitySpec, Any]]:
-    """Pair each modality spec with its parsed input (image first, video next)."""
-    yield MODALITIES[0], image_input
-    yield MODALITIES[1], video_input
 
 
 class RBLNOptimumQwenVLForConditionalGeneration(
@@ -476,7 +467,7 @@ class RBLNOptimumQwenVLForConditionalGeneration(
             "input_ids": input_ids,
             "attention_mask": attention_mask,
         }
-        for spec, mm_input in iter_modalities(image_input, video_input):
+        for spec, mm_input in zip(MODALITIES, (image_input, video_input)):
             preprocess_args[spec.pixel_key] = None
             preprocess_args[spec.grid_key] = (
                 mm_input[spec.grid_key] if mm_input is not None else None
