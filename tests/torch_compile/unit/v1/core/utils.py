@@ -58,7 +58,7 @@ from vllm.v1.request import Request
 from vllm.v1.structured_output import StructuredOutputManager
 
 # NOTE(RBLN): we will test RBLNScheduler
-from vllm_rbln.v1.core.rbln_scheduler import RBLNScheduler
+from vllm_rbln.v1.core.rbln_scheduler import RBLNAsyncScheduler, RBLNScheduler
 
 EOS_TOKEN_ID = 50256
 
@@ -184,9 +184,6 @@ def create_scheduler(
       {class}`Scheduler` instance
     """
 
-    # TODO(RBLN): support async scheduling
-    assert not async_scheduling
-
     model_config = ModelConfig(
         model=model,
         trust_remote_code=True,
@@ -266,8 +263,7 @@ def create_scheduler(
         ],
     )
     cache_config.num_gpu_blocks = num_blocks
-    # scheduler_cls = RBLNAsyncScheduler if async_scheduling else RBLNScheduler
-    scheduler_cls = RBLNScheduler
+    scheduler_cls = RBLNAsyncScheduler if async_scheduling else RBLNScheduler
     return scheduler_cls(
         vllm_config=vllm_config,
         kv_cache_config=kv_cache_config,
