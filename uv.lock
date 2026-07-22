@@ -2119,7 +2119,7 @@ wheels = [
 
 [[package]]
 name = "rebel-compiler"
-version = "0.11.1.dev656+g4ffab929"
+version = "0.11.1.dev304+g6948edb6.prod"
 source = { registry = "https://pypi.rebellions.in/simple/" }
 dependencies = [
     { name = "attrs" },
@@ -2141,7 +2141,10 @@ dependencies = [
     { name = "typing-extensions" },
 ]
 wheels = [
-    { url = "https://pypi.rebellions.in/api/package/rebel-compiler/rebel_compiler-0.11.1.dev656+g4ffab929-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "sha256:8ac30e63a250f82dd1d7dddc800010b00db53d9a0954d251ae2b2332c8179ede" },
+    { url = "https://pypi.rebellions.in/api/package/rebel-compiler/rebel_compiler-0.11.1.dev304+g6948edb6.prod-cp310-cp310-manylinux_2_34_x86_64.whl", hash = "sha256:3ddf2a4a394c10ba542b55b40e2f54f1cb12091770dd5ad361b92218803ca2f5" },
+    { url = "https://pypi.rebellions.in/api/package/rebel-compiler/rebel_compiler-0.11.1.dev304+g6948edb6.prod-cp311-cp311-manylinux_2_34_x86_64.whl", hash = "sha256:7307d413e6647254e6ea545de06e1f0f94d32c1071dbe43d59d7b4156a43b9a2" },
+    { url = "https://pypi.rebellions.in/api/package/rebel-compiler/rebel_compiler-0.11.1.dev304+g6948edb6.prod-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "sha256:80108e70c232f6645b442d9c5e30c0d02a23179a2361b33baea7c812780d9951" },
+    { url = "https://pypi.rebellions.in/api/package/rebel-compiler/rebel_compiler-0.11.1.dev304+g6948edb6.prod-cp313-cp313-manylinux_2_34_x86_64.whl", hash = "sha256:a64cd1c5b4088ab3b71500305c8788b705f5e869054518d2aa2b00fc69a4506c" },
 ]
 
 [[package]]
