@@ -80,6 +80,7 @@ if TYPE_CHECKING:
     # --- QUANTIZATION ---
     VLLM_RBLN_USE_W8A16: bool = False
 
+_W8A8_CAPABLE_NPUS = frozenset({"RBLN-CR13", "RBLN-CR23"})
 
 _USE_W8A16: bool | None = None
 
@@ -103,7 +104,7 @@ def get_use_w8a16() -> bool:
     if not device_name:
         return True
 
-    _USE_W8A16 = "cr03" in device_name.lower()
+    _USE_W8A16 = device_name.strip().upper() not in _W8A8_CAPABLE_NPUS
 
     return _USE_W8A16
 

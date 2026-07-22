@@ -133,7 +133,6 @@ class RBLNW8A8BlockFp8LinearKernel(RBLNW8A16BlockFp8LinearKernel):
         bias: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
-
         params = self._get_layer_params(layer)
         weight = params.weight
         weight_scale = (
