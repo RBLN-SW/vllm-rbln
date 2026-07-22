@@ -202,7 +202,7 @@ jobs:
               uv run --no-sync pytest tests/optimum_compile -vv --durations 0
               ;;
             "packaging")
-              uv run --no-sync pytest tests/test_intel_openmp_stub.py -vv --durations 0
+              uv run --no-sync pytest tests/packaging -vv --durations 0
               ;;
           esac
 
