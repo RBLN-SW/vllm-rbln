@@ -18,7 +18,6 @@ import time
 from collections import defaultdict
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import TypeVar
 
 import numpy as np
@@ -89,6 +88,31 @@ class Metrics:
         return stats
 
 
+@dataclass
+class _Sample:
+    """One span's timing, summable across model+sampler within a step."""
+
+    latency: float
+    host: int | None = None
+    device: int | None = None
+    ccl: int | None = None
+    prepare: int | None = None
+    phase: bool | None = None  # True=prefill, False=decode (set by the model span)
+
+    def merged(self, other: "_Sample") -> "_Sample":
+        def _add(a: int | None, b: int | None) -> int | None:
+            return None if a is None and b is None else (a or 0) + (b or 0)
+
+        return _Sample(
+            latency=self.latency + other.latency,
+            host=_add(self.host, other.host),
+            device=_add(self.device, other.device),
+            ccl=_add(self.ccl, other.ccl),
+            prepare=_add(self.prepare, other.prepare),
+            phase=self.phase,  # keep the model step's phase
+        )
+
+
 try:
     import rebel  # type: ignore
 
@@ -98,10 +122,14 @@ except ImportError:
 
 
 class _TimingSpan:
-    __slots__ = ("_metrics", "_reports", "_start", "_capture_ctx")
+    __slots__ = ("_ctx", "_phase", "_is_sampler", "_reports", "_start", "_capture_ctx")
 
-    def __init__(self, metrics: Metrics) -> None:
-        self._metrics = metrics
+    def __init__(
+        self, ctx: "_PerformanceContext", phase: bool | None, is_sampler: bool
+    ) -> None:
+        self._ctx = ctx
+        self._phase = phase
+        self._is_sampler = is_sampler
         self._reports: list[dict] | None = None
         self._start = 0.0
 
@@ -121,7 +149,9 @@ class _TimingSpan:
         latency = time.perf_counter() - self._start
         self._capture_ctx.__exit__(*args)
         host, device, ccl, prepare = _parse_reports(self._reports)
-        self._metrics.record(latency, host, device, ccl, prepare)
+        self._ctx._submit(
+            _Sample(latency, host, device, ccl, prepare, self._phase), self._is_sampler
+        )
         return False
 
 
@@ -135,42 +165,46 @@ class _NoopSpan:
         return False
 
 
-class ProfileSection(Enum):
-    MODEL = ("model", True)  # tracked separately per phase (prefill / decode)
-    SAMPLER = ("sampler", False)  # phase-agnostic; recorded into a single bucket
-
-    def __init__(self, label: str, split_phase: bool) -> None:
-        self.label = label
-        self.split_phase = split_phase
-
-
 class _PerformanceContext:
     def __init__(self, name: str | None = None) -> None:
         self.name = name
         self.rank_tag = _rank_tag()
-        self._metrics: dict[tuple[ProfileSection, bool | None], Metrics] = defaultdict(
-            Metrics
+        self._metrics: dict[bool, Metrics] = defaultdict(Metrics)
+        self._pending: _Sample | None = None
+
+    def profile_model(self, is_prefill: bool) -> _TimingSpan:
+        # A prior model step with no sampler (intermediate chunked prefill,
+        # non-last PP rank) leaves a pending report; record it model-only here.
+        self._flush_pending()
+        return _TimingSpan(self, phase=is_prefill, is_sampler=False)
+
+    def profile_sampler(self) -> _TimingSpan:
+        return _TimingSpan(self, phase=None, is_sampler=True)
+
+    def _submit(self, sample: _Sample, is_sampler: bool) -> None:
+        if not is_sampler:
+            self._pending = sample  # model: stash, wait for the sampler
+            return
+        if self._pending is None:
+            return  # sampler with no preceding model step; ignore
+        self._record(self._pending.merged(sample))
+        self._pending = None
+
+    def _flush_pending(self) -> None:
+        if self._pending is not None:
+            self._record(self._pending)
+            self._pending = None
+
+    def _record(self, s: _Sample) -> None:
+        self._metrics[bool(s.phase)].record(
+            s.latency, s.host, s.device, s.ccl, s.prepare
         )
 
-    def profile(
-        self,
-        is_prefill: bool = False,
-        section: ProfileSection = ProfileSection.MODEL,
-    ) -> _TimingSpan:
-        phase = is_prefill if section.split_phase else None
-        return _TimingSpan(self._metrics[(section, phase)])
-
     def print_stats(self) -> None:
-        def _label(section: ProfileSection, phase: bool | None) -> str:
-            if phase is None:
-                return section.label.upper()
-            return f"{section.label.upper()} {'PREFILL' if phase else 'DECODE'}"
-
+        self._flush_pending()  # record the final step if it had no sampler
         sections = {
-            _label(s, p): m
-            for (s, p), m in sorted(
-                self._metrics.items(), key=lambda x: (x[0][0].value, not x[0][1])
-            )
+            ("PREFILL + SAMPLE" if phase else "DECODE + SAMPLE"): m
+            for phase, m in sorted(self._metrics.items(), key=lambda x: not x[0])
         }
         name = f"{self.name} | {self.rank_tag}" if self.rank_tag else self.name
         _report_metrics(name, sections)
@@ -181,7 +215,10 @@ class _NoopPerformanceContext:
     def __init__(self, name: str | None = None) -> None:
         pass
 
-    def profile(self, *args, **kwargs) -> _NoopSpan:
+    def profile_model(self, *args, **kwargs) -> _NoopSpan:
+        return _NoopSpan()
+
+    def profile_sampler(self, *args, **kwargs) -> _NoopSpan:
         return _NoopSpan()
 
     def print_stats(self) -> None:

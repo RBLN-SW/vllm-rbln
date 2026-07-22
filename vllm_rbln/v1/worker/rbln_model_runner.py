@@ -126,7 +126,7 @@ from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
 from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
 from vllm_rbln.v1.worker.input_stager import InputLayout, InputStager, StagedModelInputs
-from vllm_rbln.v1.worker.metrics_v2 import PerformanceContext, ProfileSection
+from vllm_rbln.v1.worker.metrics_v2 import PerformanceContext
 from vllm_rbln.v1.worker.utils import (
     get_kv_cache_names,
     prepare_kernel_block_sizes,
@@ -1207,7 +1207,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
-        with self.performance_ctx.profile(section=ProfileSection.SAMPLER):
+        with self.performance_ctx.profile_sampler():
             if spec_decode_metadata is None:
                 bucket = logits.shape[0]
                 num_reqs = self.input_batch.num_reqs
@@ -1431,12 +1431,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 num_padded_tokens=num_tokens_padded,
                 **build_kv_cache_forward_context_kwargs(self.kv_cache_bases),
             ),
-            self.performance_ctx.profile(self.is_prefill, section=ProfileSection.MODEL),
             record_function_or_nullcontext("rbln_model_runner: forward"),
             self.maybe_get_kv_connector_output(
                 scheduler_output,
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
+            self.performance_ctx.profile_model(self.is_prefill),
         ):
             model_output = self.model_executable(
                 **staged_model_inputs.as_kwargs(),
