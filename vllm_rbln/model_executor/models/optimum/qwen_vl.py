@@ -665,11 +665,7 @@ class RBLNOptimumQwen3_5ForConditionalGeneration(
     """
 
     def _build_prefill_params(self, preprocess_outputs: tuple) -> dict:
-        # Qwen3.5 has NO deepstack, so optimum-rbln's ``_preprocess_prefill`` returns
-        # the 3-tuple ``(inputs_embeds, position_embed, rope_deltas)`` — not Qwen3-VL's
-        # 5-tuple. Undo Qwen3-VL's deepstack override (which would IndexError on
-        # ``preprocess_outputs[4]`` and feed ``visual_pos_mask``/``deepstack_embeds``
-        # kwargs that the Qwen3.5 runtime does not accept).
+        # Qwen3.5 has NO deepstack
         return {
             "inputs_embeds": preprocess_outputs[0],
             "position_embed": preprocess_outputs[1],
@@ -677,7 +673,5 @@ class RBLNOptimumQwen3_5ForConditionalGeneration(
         }
 
     def _image_token_id(self) -> int:
-        # Qwen3.5's HF config names the placeholder ``image_token_id`` (top-level),
-        # not ``image_token_index`` as the mixin default assumes. Only reached on the
-        # EC-producer path (not enabled for Qwen3.5 today), but kept correct.
+        # Qwen3.5's HF config names the placeholder ``image_token_id``
         return self.model.config.image_token_id
