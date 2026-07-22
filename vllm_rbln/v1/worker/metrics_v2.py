@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 import time
 from collections import defaultdict
@@ -19,6 +20,8 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TypeVar
+
+import numpy as np
 
 from vllm_rbln import envs
 from vllm_rbln.logger import init_logger
@@ -30,7 +33,6 @@ T = TypeVar("T", int, float)
 @dataclass
 class Metrics:
     latencies: list[float] = field(default_factory=list)
-    token_counts: list[int] = field(default_factory=list)
     host_times: list[int] = field(default_factory=list)
     device_times: list[int] = field(default_factory=list)
     ccl_times: list[int] = field(default_factory=list)
@@ -39,14 +41,12 @@ class Metrics:
     def record(
         self,
         latency: float,
-        token_count: int,
         host_time: int | None = None,
         device_time: int | None = None,
         ccl_time: int | None = None,
         prepare_time: int | None = None,
     ) -> None:
         self.latencies.append(latency)
-        self.token_counts.append(token_count)
         if host_time is not None:
             self.host_times.append(host_time)
         if device_time is not None:
@@ -60,40 +60,33 @@ class Metrics:
     def call_count(self) -> int:
         return len(self.latencies)
 
-    def _drop_outlier(self, values: list[T]) -> list[T]:
-        if len(values) <= 1:
-            return values
-        mean = sum(values) / len(values)
-        worst = max(range(len(values)), key=lambda i: abs(values[i] - mean))
-        return [v for i, v in enumerate(values) if i != worst]
+    def mean_latency_ms(self) -> float:
+        return _mean(self.latencies) * 1000
 
-    def _avg(self, values: list[T], drop_outlier: bool = True) -> float:
-        if drop_outlier:
-            values = self._drop_outlier(values)
-        return sum(values) / len(values) if values else 0.0
+    def latency_percentiles_ms(
+        self, percentiles: tuple[float, ...] = (50.0, 90.0, 99.0)
+    ) -> dict[str, float]:
+        if not self.latencies:
+            return {}
+        arr = np.asarray(self.latencies, dtype=float) * 1000.0
+        return {f"p{p:g}": float(np.percentile(arr, p)) for p in percentiles}
 
-    def avg_latency_ms(self, drop_outlier: bool = True) -> float:
-        return self._avg(self.latencies, drop_outlier) * 1000
-
-    def avg_throughput(self, drop_outlier: bool = True) -> float:
-        lats = self._drop_outlier(self.latencies) if drop_outlier else self.latencies
-        toks = (
-            self._drop_outlier(self.token_counts) if drop_outlier else self.token_counts
+    def to_dict(self) -> dict:
+        stats: dict = {
+            "call_count": self.call_count,
+            "mean_latency_ms": self.mean_latency_ms(),
+            "latency_percentiles_ms": self.latency_percentiles_ms(),
+        }
+        timings = (
+            ("mean_host_time_us", self.host_times),
+            ("mean_device_time_us", self.device_times),
+            ("mean_ccl_time_us", self.ccl_times),
+            ("mean_prepare_time_us", self.prepare_times),
         )
-        t = sum(lats)
-        return sum(toks) / t if t > 0 else 0.0
-
-    def avg_host_time_us(self, drop_outlier: bool = True) -> float:
-        return self._avg(self.host_times, drop_outlier)
-
-    def avg_device_time_us(self, drop_outlier: bool = True) -> float:
-        return self._avg(self.device_times, drop_outlier)
-
-    def avg_ccl_time_us(self, drop_outlier: bool = True) -> float:
-        return self._avg(self.ccl_times, drop_outlier)
-
-    def avg_prepare_time_us(self, drop_outlier: bool = True) -> float:
-        return self._avg(self.prepare_times, drop_outlier)
+        for key, values in timings:
+            if values:
+                stats[key] = _mean(values)
+        return stats
 
 
 try:
@@ -105,11 +98,10 @@ except ImportError:
 
 
 class _TimingSpan:
-    __slots__ = ("_metrics", "_token_count", "_reports", "_start", "_capture_ctx")
+    __slots__ = ("_metrics", "_reports", "_start", "_capture_ctx")
 
-    def __init__(self, metrics: Metrics, token_count: int) -> None:
+    def __init__(self, metrics: Metrics) -> None:
         self._metrics = metrics
-        self._token_count = token_count
         self._reports: list[dict] | None = None
         self._start = 0.0
 
@@ -129,7 +121,7 @@ class _TimingSpan:
         latency = time.perf_counter() - self._start
         self._capture_ctx.__exit__(*args)
         host, device, ccl, prepare = _parse_reports(self._reports)
-        self._metrics.record(latency, self._token_count, host, device, ccl, prepare)
+        self._metrics.record(latency, host, device, ccl, prepare)
         return False
 
 
@@ -155,6 +147,7 @@ class ProfileSection(Enum):
 class _PerformanceContext:
     def __init__(self, name: str | None = None) -> None:
         self.name = name
+        self.rank_tag = _rank_tag()
         self._metrics: dict[tuple[ProfileSection, bool | None], Metrics] = defaultdict(
             Metrics
         )
@@ -163,10 +156,9 @@ class _PerformanceContext:
         self,
         is_prefill: bool = False,
         section: ProfileSection = ProfileSection.MODEL,
-        token_count: int = 0,
     ) -> _TimingSpan:
         phase = is_prefill if section.split_phase else None
-        return _TimingSpan(self._metrics[(section, phase)], token_count)
+        return _TimingSpan(self._metrics[(section, phase)])
 
     def print_stats(self) -> None:
         def _label(section: ProfileSection, phase: bool | None) -> str:
@@ -180,7 +172,9 @@ class _PerformanceContext:
                 self._metrics.items(), key=lambda x: (x[0][0].value, not x[0][1])
             )
         }
-        _report_metrics(self.name, sections)
+        name = f"{self.name} | {self.rank_tag}" if self.rank_tag else self.name
+        _report_metrics(name, sections)
+        _write_metrics_json(self.name, self.rank_tag, sections)
 
 
 class _NoopPerformanceContext:
@@ -194,23 +188,56 @@ class _NoopPerformanceContext:
         pass
 
 
-def _metrics_file_path() -> str | None:
-    if not envs.VLLM_RBLN_METRICS_FILE:
-        return None
-
-    root, ext = os.path.splitext(envs.VLLM_RBLN_METRICS_FILE)
-    return f"{root}.{os.getpid()}{ext}"
-
-
-def _write_metrics_file(lines: list[str]) -> None:
-    if (path := _metrics_file_path()) is None:
-        return
+def _rank_tag() -> str:
+    """Rank tag including only parallelism axes with degree > 1; '' if none."""
+    parts = []
     try:
-        with open(path, "a", encoding="utf-8") as f:
-            f.write("\n".join(lines))
-            f.write("\n")
+        from vllm.distributed import get_pp_group, get_tp_group
+
+        tp = get_tp_group()
+        if tp.world_size > 1:
+            parts.append(f"TP{tp.rank_in_group}")
+        pp = get_pp_group()
+        if pp.world_size > 1:
+            parts.append(f"PP{pp.rank_in_group}")
+    except Exception:
+        return ""
+    try:
+        from vllm.distributed import get_dp_group
+
+        dp = get_dp_group()
+        if dp.world_size > 1:
+            parts.append(f"DP{dp.rank_in_group}")
+    except Exception:
+        pass  # DP group may not be initialized
+    return " ".join(parts)
+
+
+def _write_metrics_json(
+    name: str | None, rank_tag: str, sections: dict[str, Metrics]
+) -> None:
+    if not envs.VLLM_RBLN_METRICS_DIR:
+        return
+
+    suffix = rank_tag.replace(" ", "_").lower()
+    filename = f"metrics_{suffix}.json" if suffix else "metrics.json"
+    path = os.path.join(envs.VLLM_RBLN_METRICS_DIR, filename)
+    payload = {
+        "name": name,
+        "rank": rank_tag,
+        "sections": {label: m.to_dict() for label, m in sections.items()},
+    }
+
+    try:
+        os.makedirs(envs.VLLM_RBLN_METRICS_DIR, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
     except OSError as e:
-        logger.warning("Failed to write metrics to file %s: %s", path, e)
+        logger.warning("Failed to write metrics JSON to %s: %s", path, e)
+
+
+def _mean(values: list[T]) -> float:
+    return sum(values) / len(values) if values else 0.0
 
 
 def _render_metrics(label: str, m: Metrics) -> list[str]:
@@ -219,50 +246,47 @@ def _render_metrics(label: str, m: Metrics) -> list[str]:
 
     lines = [
         f"{label} METRICS:",
-        f"  Total call counts  : {m.call_count}",
-        f"  Average latency    : {m.avg_latency_ms():.2f} ms",
+        f"  {'Total call counts':<25}: {m.call_count}",
+        f"  {'Mean latency (ms)':<25}: {m.mean_latency_ms():.2f}",
     ]
-    if sum(m.token_counts) > 0:
-        lines.extend(
-            [
-                f"  Total tokens       : {sum(m.token_counts)}",
-                f"  Avg throughput     : {m.avg_throughput():.2f} tok/s",
-            ]
-        )
-    if m.host_times:
-        lines.append(f"  Avg host time     : {m.avg_host_time_us():.2f} us")
-    if m.device_times:
-        lines.append(f"  Avg device time   : {m.avg_device_time_us():.2f} us")
-    if m.ccl_times:
-        lines.append(f"  Avg ccl time      : {m.avg_ccl_time_us():.2f} us")
-    if m.prepare_times:
-        lines.append(f"  Avg prepare time  : {m.avg_prepare_time_us():.2f} us")
+
+    pct = m.latency_percentiles_ms()
+    for key, value in pct.items():
+        stat = "Median" if key == "p50" else key.upper()
+        metric_label = f"{stat} latency (ms)"
+        lines.append(f"  {metric_label:<25}: {value:.2f}")
+
+    runtime_timings = [
+        ("Mean host time (us)", m.host_times),
+        ("Mean device time (us)", m.device_times),
+        ("Mean ccl time (us)", m.ccl_times),
+        ("Mean prepare time (us)", m.prepare_times),
+    ]
+    for runtime_label, values in runtime_timings:
+        if values:
+            lines.append(f"  {runtime_label:<25}: {_mean(values):.2f}")
 
     return lines
 
 
 def _render_metrics_report(name: str | None, sections: dict[str, Metrics]) -> list[str]:
     lines = [
-        "=" * 40,
+        "=" * 50,
         f"PERFORMANCE STATISTICS{f' [{name}]' if name else ''}",
-        "=" * 40,
+        "=" * 50,
     ]
 
     for label, metrics in sections.items():
         lines.extend(_render_metrics(label, metrics))
-        lines.append("-" * 40)
+        lines.append("-" * 50)
 
-    lines.append("=" * 40)
+    lines.append("=" * 50)
     return lines
 
 
 def _report_metrics(name: str | None, sections: dict[str, Metrics]) -> None:
     lines = _render_metrics_report(name, sections)
-
-    for line in lines:
-        logger.info("%s", line)
-
-    _write_metrics_file(lines)
+    logger.info("%s", "\n".join(lines))
 
 
 def _parse_reports(

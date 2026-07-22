@@ -1207,10 +1207,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
-        with self.performance_ctx.profile(
-            section=ProfileSection.SAMPLER,
-            token_count=logits.shape[0],
-        ):
+        with self.performance_ctx.profile(section=ProfileSection.SAMPLER):
             if spec_decode_metadata is None:
                 bucket = logits.shape[0]
                 num_reqs = self.input_batch.num_reqs
@@ -1434,11 +1431,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 num_padded_tokens=num_tokens_padded,
                 **build_kv_cache_forward_context_kwargs(self.kv_cache_bases),
             ),
-            self.performance_ctx.profile(
-                self.is_prefill,
-                section=ProfileSection.MODEL,
-                token_count=num_scheduled_tokens,
-            ),
+            self.performance_ctx.profile(self.is_prefill, section=ProfileSection.MODEL),
             record_function_or_nullcontext("rbln_model_runner: forward"),
             self.maybe_get_kv_connector_output(
                 scheduler_output,
