@@ -93,11 +93,13 @@ class TestUpdateMaxNumBatchedTokens:
         update_max_num_batched_tokens(cfg, params)
         assert cfg.scheduler_config.max_num_batched_tokens == 256
 
-    def test_decoder_asserts_chunk_covers_batch(self):
+    def test_decoder_chunk_smaller_than_batch_ok(self):
+        # The scheduler's per-step budget is decoupled from max_num_batched_tokens,
+        # so a prefill chunk smaller than max_num_seqs no longer throttles decode.
         cfg = _vllm_config(arch=DECODER_ARCH, max_num_seqs=512)
         params = RBLNParams(prefill_chunk_size=128)
-        with pytest.raises(AssertionError):
-            update_max_num_batched_tokens(cfg, params)
+        update_max_num_batched_tokens(cfg, params)
+        assert cfg.scheduler_config.max_num_batched_tokens == 128
 
     def test_pooling_uses_full_prefill_budget(self):
         cfg = _vllm_config(arch=POOLING_ARCH, max_model_len=8192, max_num_seqs=4)
