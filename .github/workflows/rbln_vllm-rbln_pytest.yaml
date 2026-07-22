@@ -77,6 +77,10 @@ jobs:
               name : "optimum_compile",
               runner : "rbln-sw-k8s-general"
             },
+            {
+              name : "packaging",
+              runner : "rbln-sw-k8s-general"
+            },
           ]
     steps:
       - name: Checkout the vllm-rbln repository
@@ -119,6 +123,11 @@ jobs:
               ;;
             "optimum_compile")
               if [[ "$COMMIT_MESSAGE" == *"[skip optimum_compile]"* ]]; then
+                SKIP=true
+              fi
+              ;;
+            "packaging")
+              if [[ "$COMMIT_MESSAGE" == *"[skip packaging]"* ]]; then
                 SKIP=true
               fi
               ;;
@@ -191,6 +200,9 @@ jobs:
               ;;
             "optimum_compile")
               uv run --no-sync pytest tests/optimum_compile -vv --durations 0
+              ;;
+            "packaging")
+              uv run --no-sync pytest tests/packaging -vv --durations 0
               ;;
           esac
 

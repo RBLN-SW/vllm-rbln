@@ -46,6 +46,7 @@ dependencies = [
     "torchcodec",
     "torch-rbln~=0.3.0rc2; platform_machine == 'x86_64'",
     "optimum-rbln>=0.11.1a4",
+    "intel-openmp @ https://raw.githubusercontent.com/RBLN-SW/vllm-rbln/dev/vendor/intel_openmp-2024.2.1+rbln.stub-py3-none-any.whl",
 ]
 
 [project.optional-dependencies]
@@ -174,6 +175,7 @@ torch = { index = "pytorch-cpu" }
 torchvision = { index = "pytorch-cpu" }
 torchaudio = { index = "pytorch-cpu" }
 torchcodec = { index = "pytorch-cpu" }
+intel-openmp = { path = "vendor/intel_openmp-2024.2.1+rbln.stub-py3-none-any.whl" }
 
 [tool.typos.default]
 binary = false
