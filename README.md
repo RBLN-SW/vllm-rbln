@@ -27,34 +27,16 @@ Built on top of [vLLM’s Plugin System](https://docs.vllm.ai/en/latest/design/p
 
 You can install this project using `pip` or from source.
 
-Install commands below use [`requirements-cpu.txt`](./requirements-cpu.txt) —
-a pinned dep list exported from `uv.lock` — with `pip install --no-deps` so
-pip skips transitive resolution and installs exactly the set `uv sync`
-would. This is what excludes `intel-openmp`: the file is generated with
-`--no-emit-project` from a lock that has `intel-openmp` overridden away
-(see [`pyproject.toml`](./pyproject.toml) `[tool.uv].override-dependencies`),
-and `--no-deps` prevents pip from re-adding it from `vllm==0.22.0+cpu`'s
-`Requires-Dist`. Plain `pip install vllm-rbln` (without the two flags below)
-would pull `intel-openmp` — Intel proprietary, unused on RBLN NPU.
-
 #### Install via PyPI
 
 ##### Using uv
 ```bash
-uv pip install --no-deps \
-  -r https://raw.githubusercontent.com/RBLN-SW/vllm-rbln/main/requirements-cpu.txt \
-  vllm-rbln \
-  --extra-index-url https://wheels.vllm.ai/0.22.0/cpu \
-  --extra-index-url https://download.pytorch.org/whl/cpu
+uv pip install vllm-rbln --extra-index-url https://wheels.vllm.ai/0.22.0/cpu --torch-backend cpu
 ```
 
 ##### Using pip
 ```bash
-pip install --no-deps \
-  -r https://raw.githubusercontent.com/RBLN-SW/vllm-rbln/main/requirements-cpu.txt \
-  vllm-rbln \
-  --extra-index-url https://wheels.vllm.ai/0.22.0/cpu \
-  --extra-index-url https://download.pytorch.org/whl/cpu
+pip install vllm-rbln --extra-index-url https://wheels.vllm.ai/0.22.0/cpu --extra-index-url https://download.pytorch.org/whl/cpu
 ```
 
 #### Or from source
@@ -63,17 +45,25 @@ pip install --no-deps \
 ```bash
 git clone https://github.com/rbln-sw/vllm-rbln.git
 cd vllm-rbln
-uv pip install --no-deps -r requirements-cpu.txt -e .
+uv pip install -e .
 ```
 
 ##### Using pip
 ```bash
 git clone https://github.com/rbln-sw/vllm-rbln.git
 cd vllm-rbln
-pip install --no-deps -r requirements-cpu.txt -e . \
-  --extra-index-url https://wheels.vllm.ai/0.22.0/cpu \
-  --extra-index-url https://download.pytorch.org/whl/cpu
+pip install -e . --extra-index-url https://wheels.vllm.ai/0.22.0/cpu --extra-index-url https://download.pytorch.org/whl/cpu
 ```
+
+> **Note**: All `pip` / `uv pip` install paths above pull `intel-openmp`
+> transitively from the `vllm==0.22.0+cpu` wheel (its CPU-backend MKL/OpenMP
+> path). On RBLN NPU it is unused (Intel proprietary, EULA); remove it
+> after install:
+> ```bash
+> pip uninstall -y intel-openmp
+> ```
+> The `uv sync` dev workflow (see [DEVELOPMENT.md](./DEVELOPMENT.md))
+> already excludes it via `[tool.uv].override-dependencies`.
 
 ### 🛠️ Development setup
 
