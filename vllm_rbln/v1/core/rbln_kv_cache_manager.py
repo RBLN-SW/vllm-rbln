@@ -522,6 +522,7 @@ class RBLNKVCacheManager(KVCacheManager):
         num_external_computed_tokens: int = 0,
         delay_cache_blocks: bool = False,
         num_encoder_tokens: int = 0,
+        has_scheduled_reqs: bool = True,
     ) -> KVCacheBlocks | None:
         result = super().allocate_slots(
             request,
@@ -532,6 +533,7 @@ class RBLNKVCacheManager(KVCacheManager):
             num_external_computed_tokens,
             delay_cache_blocks,
             num_encoder_tokens,
+            has_scheduled_reqs=has_scheduled_reqs,
         )
 
         if result is not None and not delay_cache_blocks:

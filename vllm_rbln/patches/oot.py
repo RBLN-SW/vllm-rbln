@@ -71,7 +71,7 @@ def register_rbln_oot_implementations() -> None:
         VocabParallelEmbedding,
     )
 
-    from vllm_rbln.model_executor.layers.fused_moe.layer import FusedMoE, RBLNFusedMoE
+    # from vllm_rbln.model_executor.layers.fused_moe.layer import FusedMoE, RBLNFusedMoE
     from vllm_rbln.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
         RBLNUnquantizedFusedMoEMethod,
         UnquantizedFusedMoEMethod,
@@ -85,7 +85,7 @@ def register_rbln_oot_implementations() -> None:
         RBLNVocabParallelEmbedding,
     )
 
-    _register_oot(FusedMoE, RBLNFusedMoE)
+    # _register_oot(FusedMoE, RBLNFusedMoE)
     _register_oot(UnquantizedFusedMoEMethod, RBLNUnquantizedFusedMoEMethod)
     _register_oot(VocabParallelEmbedding, RBLNVocabParallelEmbedding)
     _register_oot(ParallelLMHead, RBLNParallelLMHead)
