@@ -46,10 +46,6 @@ dependencies = [
     "torchcodec",
     "torch-rbln~=0.3.0rc2; platform_machine == 'x86_64'",
     "optimum-rbln>=0.11.1a2",
-    # vllm-cpu declares intel-openmp (Intel proprietary, unused on RBLN NPU) as
-    # a transitive dependency. Point pip / uv at an empty stub so no proprietary
-    # binary is downloaded on any install path. PEP 440 local version identifier
-    # `+rbln.stub` keeps it distinguishable in `pip list`.
     "intel-openmp @ https://raw.githubusercontent.com/RBLN-SW/vllm-rbln/dev/vendor/intel_openmp-2024.2.1+rbln.stub-py3-none-any.whl",
 ]
 
@@ -179,9 +175,6 @@ torch = { index = "pytorch-cpu" }
 torchvision = { index = "pytorch-cpu" }
 torchaudio = { index = "pytorch-cpu" }
 torchcodec = { index = "pytorch-cpu" }
-# Dev-time override: resolve intel-openmp from the vendored stub so `uv lock`
-# does not hit raw.githubusercontent.com. Published wheel metadata still ships
-# the URL from [project].dependencies for pip / uv pip consumers.
 intel-openmp = { path = "vendor/intel_openmp-2024.2.1+rbln.stub-py3-none-any.whl" }
 
 [tool.typos.default]
