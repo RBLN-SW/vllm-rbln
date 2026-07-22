@@ -33,13 +33,25 @@ jobs:
       - name: Update Optimum Version in uv
         id: uv-update-optimum-rbln
         run: |
+          set -euo pipefail
           VERSION="${{ inputs.optimum-version }}"
           VERSION="${VERSION#v}"
+
+          # 1) Bump ONLY the optimum-rbln constraint in pyproject.toml.
+          sed -i -E "s|\"optimum-rbln[^\"]*\"|\"optimum-rbln>=${VERSION}\"|" pyproject.toml
+          grep -q "\"optimum-rbln>=${VERSION}\"" pyproject.toml \
+            || { echo "::error::failed to patch optimum-rbln in pyproject.toml"; exit 1; }
+          echo "pyproject.toml -> optimum-rbln>=${VERSION}"
+
+          # 2) Refresh uv.lock for ONLY optimum-rbln (targeted upgrade). Everything
+          #    else — notably rebel-compiler (runtime extra) — stays at its locked
+          #    version, so we skip the full re-resolve that made `uv add` fail on the
+          #    missing rebel-compiler cp313 wheel for Python 3.13.
           for i in {1..6}; do
-            uv add "optimum-rbln>=${VERSION}" --no-cache && exit 0
+            uv lock --upgrade-package "optimum-rbln==${VERSION}" --no-cache && exit 0
             sleep 10
           done
-          echo "All retries with --cache-dir failed."
+          echo "::error::uv lock failed after retries"
           exit 1
 
       - name: Create PR for updated files
@@ -50,6 +62,7 @@ jobs:
           token: ${{ secrets.GIT_PAT }}
           add-paths: |
             pyproject.toml
+            uv.lock
           commit-message: "other: update optimum-rbln to ${{ inputs.optimum-version }}"
           title: "other: auto-update optimum-rbln to ${{ inputs.optimum-version }}"
           body: "Updated optimum-rbln to ${{ inputs.optimum-version }}."
