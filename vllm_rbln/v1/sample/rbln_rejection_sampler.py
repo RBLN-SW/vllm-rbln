@@ -314,6 +314,7 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
             fullgraph=True,
             compile_context=compile_context,
             num_devices=1 if USE_DEVICE_TENSOR or HAS_TORCH_RBLN else None,
+            model_trace_method="export" if USE_DEVICE_TENSOR else "",
             mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
             use_global_ctx=True if HAS_TORCH_RBLN and not USE_DEVICE_TENSOR else None,
             global_device_id=0 if HAS_TORCH_RBLN and not USE_DEVICE_TENSOR else None,
@@ -340,15 +341,12 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         batch_size = len(num_draft_tokens)
         num_tokens = draft_token_ids.shape[0]
         vocab_size = target_probs.shape[-1]
-        # NOTE(eunji.lee):
-        # Currently, rejection sampler only available in cpu input tensor
-        if envs.VLLM_RBLN_USE_DEVICE_TENSOR == 1:
-            logger.warning_once(
-                "VLLM_RBLN_USE_DEVICE_TENSOR is enabled, but the RBLN rejection "
-                "sampler only supports CPU input tensors. Forcing rejection sampler "
-                "inputs to CPU."
-            )
         cpu_device = "cpu"
+        op_device = (
+            target_probs.device if USE_DEVICE_TENSOR else torch.device(cpu_device)
+        )
+        draft_token_ids = draft_token_ids.to(cpu_device)
+        target_probs = target_probs.to(cpu_device)
         # NOTE(RBLN): The NPU `rbln::rejection_sample` primitive does not
         # handle the -1 placeholder draft id (used for grammar-invalid spec
         # tokens when structured output is combined with speculative decoding;
@@ -422,12 +420,10 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
             draft_per_batch[i, :n] = draft_token_ids[src_offset : src_offset + n]
             src_offset += n
 
-        # FIXME required for device tensor?
-        # cu_num_draft_tokens = cu_num_draft_tokens.to(device=cpu_device)
         if sampling_metadata.top_k is not None:
-            sampling_metadata.top_k = sampling_metadata.top_k.to(device=cpu_device)
+            sampling_metadata.top_k = sampling_metadata.top_k.to(device=op_device)
         if sampling_metadata.top_p is not None:
-            sampling_metadata.top_p = sampling_metadata.top_p.to(device=cpu_device)
+            sampling_metadata.top_p = sampling_metadata.top_p.to(device=op_device)
 
         # ------------------------------------------------------------------
         # 2) Call the NPU primitive.
@@ -436,9 +432,9 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         #   num_accepted       : (B,)   int — per-batch number of accepted draft
         #                                     tokens (in [0, num_draft_tokens[i]]).
         # ------------------------------------------------------------------
-        reshaped_draft_token_ids = reshaped_draft_token_ids.to(cpu_device)
-        reshaped_target_probs = reshaped_target_probs.to(cpu_device)
-        cu_num_draft_tokens = cu_num_draft_tokens.to(cpu_device)
+        reshaped_draft_token_ids = reshaped_draft_token_ids.to(op_device)
+        reshaped_target_probs = reshaped_target_probs.to(op_device)
+        cu_num_draft_tokens = cu_num_draft_tokens.to(op_device)
         recovered_token_ids, num_accepted = self._compiled_rejection_sample(
             reshaped_draft_token_ids,
             reshaped_target_probs,
@@ -511,8 +507,7 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         ] = bonus[all_accepted_active]
         # 4b) Inactive rows (no drafts): only the bonus token at col 0.
         output_token_ids[~active_mask, 0] = bonus[~active_mask]
-        # FIXME For now, to be consistent with the cpu sampler..
-        result = output_token_ids.to(torch.int32)
+        result = output_token_ids.to(device=op_device, dtype=torch.int32)
         return result
 
     def apply_sampling_constraints(
