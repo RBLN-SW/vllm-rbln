@@ -646,45 +646,35 @@ class RBLNOptimumQwen3VLMoeForConditionalGeneration(
 
 
 class RBLNOptimumQwen3_5ForConditionalGeneration(
-    RBLNOptimumQwen2_5_VLForConditionalGeneration
+    RBLNOptimumQwen3VLForConditionalGeneration
 ):
     """
     Vision-language Qwen3.5 for RBLN.
 
-    Qwen3.5 is essentially "Qwen3-VL without deepstack": a Qwen3-VL-style vision
-    encoder feeds a HYBRID text backbone (GatedDeltaNet ``linear_attention`` layers
-    + gated ``full_attention`` layers). Because there is no deepstack, optimum-rbln's
-    ``_preprocess_prefill`` returns the base 3-tuple
-    ``(inputs_embeds, position_embed, rope_deltas)``, so this class inherits the base
-    ``_build_prefill_params`` from Qwen2.5-VL rather than the 5-tuple (deepstack +
-    visual_pos_mask) override in ``RBLNOptimumQwen3VLForConditionalGeneration``.
+    Qwen3.5 IS Qwen3-VL minus deepstack: the same Qwen3-VL-style vision tower, mRoPE,
+    and video handling (no ``second_per_grid_ts``), but with a HYBRID text backbone
+    (GatedDeltaNet ``linear_attention`` layers + gated ``full_attention`` layers). So
+    it inherits ``_add_model_specific_args`` and ``_create_video_pixel_inputs`` from
+    Qwen3-VL unchanged; the ONLY structural difference is deepstack, handled below.
 
     The ``linear_attention`` layers' ``conv_state``/``recurrent_state`` caches and the
     0/1 control masks (``conv_state_mask``/``recurrent_state_mask``/``valid_mask``) are
     handled entirely inside optimum-rbln's ``RBLNQwen3_5RuntimeModel``; this wrapper
-    passes only the standard prefill/decode kwargs, exactly like the other Qwen-VL
-    wrappers. ``full_attention`` layers keep the on-device paged KV cache.
+    passes only the standard prefill/decode kwargs. ``full_attention`` layers keep the
+    on-device paged KV cache.
     """
 
-    def _add_model_specific_args(self, preprocess_args: dict, video_input: Any):
-        # Qwen3.5 (like Qwen3-VL) has no ``second_per_grid_ts``; its ``get_rope_index``
-        # separates videos by timestamps instead, so nothing extra is added here.
-        pass
-
-    def _create_video_pixel_inputs(
-        self,
-        pixel_values_videos: torch.Tensor,
-        video_grid_thw: torch.Tensor,
-        second_per_grid_ts=None,
-    ):
-        # Mirrors Qwen3-VL: build the Qwen2.5-VL video-pixel carrier WITHOUT requiring
-        # ``second_per_grid_ts`` (Qwen2.5-VL's own override raises when it is None).
-        return Qwen2_5_VLVideoPixelInputs(
-            type="pixel_values_videos",
-            pixel_values_videos=pixel_values_videos,
-            video_grid_thw=video_grid_thw,
-            second_per_grid_ts=second_per_grid_ts,
-        )
+    def _build_prefill_params(self, preprocess_outputs: tuple) -> dict:
+        # Qwen3.5 has NO deepstack, so optimum-rbln's ``_preprocess_prefill`` returns
+        # the 3-tuple ``(inputs_embeds, position_embed, rope_deltas)`` — not Qwen3-VL's
+        # 5-tuple. Undo Qwen3-VL's deepstack override (which would IndexError on
+        # ``preprocess_outputs[4]`` and feed ``visual_pos_mask``/``deepstack_embeds``
+        # kwargs that the Qwen3.5 runtime does not accept).
+        return {
+            "inputs_embeds": preprocess_outputs[0],
+            "position_embed": preprocess_outputs[1],
+            "rope_deltas": preprocess_outputs[2],
+        }
 
     def _image_token_id(self) -> int:
         # Qwen3.5's HF config names the placeholder ``image_token_id`` (top-level),
