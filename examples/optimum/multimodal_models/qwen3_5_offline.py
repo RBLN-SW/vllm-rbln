@@ -46,9 +46,9 @@ from vllm import LLM, SamplingParams
 # If the video is too long
 # set `VLLM_ENGINE_ITERATION_TIMEOUT_S` to a higher timeout value.
 VIDEO_URLS = [
-    "https://duguang-labelling.oss-cn-shanghai.aliyuncs.com/qiansun/video_ocr/videos/50221078283.mp4",
+    # "https://duguang-labelling.oss-cn-shanghai.aliyuncs.com/qiansun/video_ocr/videos/50221078283.mp4",
     "https://cdn.pixabay.com/video/2022/04/18/114413-701051082_large.mp4",
-    "https://videos.pexels.com/video-files/855282/855282-hd_1280_720_25fps.mp4",
+    # "https://videos.pexels.com/video-files/855282/855282-hd_1280_720_25fps.mp4",
 ]
 
 
@@ -163,11 +163,12 @@ def main(
     # A native Qwen3.5 VL checkpoint (HF id or a local path). Qwen3.5 is supported
     # natively by transformers (no trust_remote_code needed). You can also pass a
     # pre-compiled artifact directory to skip compilation.
-    model: str = "Qwen/Qwen3.5-4B-Instruct",
+    model: str = "Qwen/Qwen3.5-0.8B",
+    # modality: str = "video",  # "image" | "video"
     modality: str = "image",  # "image" | "video"
 ):
     # number of devices per local rank for main module
-    os.environ["VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK"] = "16"
+    os.environ["VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK"] = "1"
     llm = LLM(
         model=model,
         # >= 4096 is required for the forced flash-attention path (Qwen3.5 hybrid).
@@ -176,7 +177,7 @@ def main(
         max_num_seqs=1,
         additional_config={
             "rbln_config": {
-                "device": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+                "device": [16],
                 "visual": {
                     "device": [16],
                 },

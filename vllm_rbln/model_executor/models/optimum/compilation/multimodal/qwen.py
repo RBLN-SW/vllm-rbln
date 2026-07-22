@@ -66,7 +66,9 @@ def get_param_qwen3_5(
     # (gdn_chunk_size) during compilation, so gdn_chunk_size is needed here.
     #
     # FLASH IS FORCED (not conditional on block_size like the Qwen-VL builders)
-    param = get_param_qwen2_vl(batch_size, max_model_len, block_size, num_devices, prefill_chunk_size)
+    param = get_param_qwen2_vl(
+        batch_size, max_model_len, block_size, num_devices, prefill_chunk_size
+    )
     param["attn_impl"] = "flash_attn"
     if gdn_chunk_size is not None:
         param["gdn_chunk_size"] = gdn_chunk_size
