@@ -36,6 +36,18 @@ repos:
   hooks:
     - id: uv-lock
       args: ["--check"]
+    - id: uv-export
+      # Keep requirements-cpu.txt in sync with uv.lock so the pip-native install
+      # path (see README) resolves the same set as `uv sync` — notably without
+      # intel-openmp (excluded via [tool.uv].override-dependencies).
+      args:
+        - --frozen
+        - --no-hashes
+        - --no-emit-project
+        - --output-file
+        - requirements-cpu.txt
+      files: ^(uv\.lock|pyproject\.toml|requirements-cpu\.txt)$
+      pass_filenames: false
     - id: pip-compile
       args: [requirements/test.in, -o, requirements/test.txt]
       files: ^requirements/test\.(in|txt)$
