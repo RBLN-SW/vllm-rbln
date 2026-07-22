@@ -145,7 +145,7 @@ class _NoopSpan:
 
 class ProfileSection(Enum):
     MODEL = ("model", True)  # tracked separately per phase (prefill / decode)
-    SAMPLER = ("sampler", False)  # phase-agnostic; recorded into a single bucket
+    SAMPLER = ("sampler", True)  # tracked separately per phase (prefill / decode)
 
     def __init__(self, label: str, split_phase: bool) -> None:
         self.label = label

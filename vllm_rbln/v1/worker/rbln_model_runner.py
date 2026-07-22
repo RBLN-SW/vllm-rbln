@@ -1208,6 +1208,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
         with self.performance_ctx.profile(
+            self.is_prefill,
             section=ProfileSection.SAMPLER,
             token_count=logits.shape[0],
         ):
