@@ -43,10 +43,7 @@ jobs:
             || { echo "::error::failed to patch optimum-rbln in pyproject.toml"; exit 1; }
           echo "pyproject.toml -> optimum-rbln>=${VERSION}"
 
-          # 2) Refresh uv.lock for ONLY optimum-rbln (targeted upgrade). Everything
-          #    else — notably rebel-compiler (runtime extra) — stays at its locked
-          #    version, so we skip the full re-resolve that made `uv add` fail on the
-          #    missing rebel-compiler cp313 wheel for Python 3.13.
+          # 2) Refresh uv.lock for ONLY optimum-rbln (targeted upgrade).
           for i in {1..6}; do
             uv lock --upgrade-package "optimum-rbln==${VERSION}" --no-cache && exit 0
             sleep 10
