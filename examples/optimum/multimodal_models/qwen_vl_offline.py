@@ -194,7 +194,7 @@ def main(
     # NOTE: This example supports Qwen2-VL, Qwen2.5-VL, Qwen3-VL, and Qwen3.5.
     # For Qwen3.5 (hybrid GatedDeltaNet backbone), flash attention is forced at
     # compile time, so keep block_size / max_model_len >= 4096 (already the case
-    # below). Pass a Qwen3.5 checkpoint via `--model`.
+    # below).
     model: str = "Qwen/Qwen3-VL-2B-Instruct",
 ):
     # number of devices per local rank for main module
