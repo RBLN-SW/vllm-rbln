@@ -146,11 +146,15 @@ class _TimingSpan:
     def __exit__(self, *args):
         # Record time before closing capture_ctx to exclude any internal
         # synchronization overhead inside rebel from the measured latency.
-        latency = time.perf_counter() - self._start
+        end = time.perf_counter()
+        latency = end - self._start
         self._capture_ctx.__exit__(*args)
         host, device, ccl, prepare = _parse_reports(self._reports)
         self._ctx._submit(
-            _Sample(latency, host, device, ccl, prepare, self._phase), self._is_sampler
+            _Sample(latency, host, device, ccl, prepare, self._phase),
+            self._is_sampler,
+            self._start,
+            end,
         )
         return False
 
@@ -171,6 +175,8 @@ class _PerformanceContext:
         self.rank_tag = _rank_tag()
         self._metrics: dict[bool, Metrics] = defaultdict(Metrics)
         self._pending: _Sample | None = None
+        self._e2e_start: float | None = None
+        self._e2e: dict[bool, Metrics] = defaultdict(Metrics)
 
     def profile_model(self, is_prefill: bool) -> _TimingSpan:
         # A prior model step with no sampler (intermediate chunked prefill,
@@ -181,19 +187,26 @@ class _PerformanceContext:
     def profile_sampler(self) -> _TimingSpan:
         return _TimingSpan(self, phase=None, is_sampler=True)
 
-    def _submit(self, sample: _Sample, is_sampler: bool) -> None:
+    def _submit(
+        self, sample: _Sample, is_sampler: bool, start: float, end: float
+    ) -> None:
         if not is_sampler:
             self._pending = sample  # model: stash, wait for the sampler
+            self._e2e_start = start
             return
         if self._pending is None:
             return  # sampler with no preceding model step; ignore
         self._record(self._pending.merged(sample))
+        if self._e2e_start is not None:
+            self._e2e[bool(self._pending.phase)].record(end - self._e2e_start)
         self._pending = None
+        self._e2e_start = None
 
     def _flush_pending(self) -> None:
         if self._pending is not None:
             self._record(self._pending)
             self._pending = None
+        self._e2e_start = None
 
     def _record(self, s: _Sample) -> None:
         self._metrics[bool(s.phase)].record(
@@ -202,10 +215,11 @@ class _PerformanceContext:
 
     def print_stats(self) -> None:
         self._flush_pending()  # record the final step if it had no sampler
-        sections = {
-            ("PREFILL + SAMPLE" if phase else "DECODE + SAMPLE"): m
-            for phase, m in sorted(self._metrics.items(), key=lambda x: not x[0])
-        }
+        sections: dict[str, Metrics] = {}
+        for phase, m in sorted(self._metrics.items(), key=lambda x: not x[0]):
+            sections["PREFILL + SAMPLE" if phase else "DECODE + SAMPLE"] = m
+        for phase, m in sorted(self._e2e.items(), key=lambda x: not x[0]):
+            sections["PREFILL E2E" if phase else "DECODE E2E"] = m
         name = f"{self.name} | {self.rank_tag}" if self.rank_tag else self.name
         _report_metrics(name, sections)
         _write_metrics_json(self.name, self.rank_tag, sections)
