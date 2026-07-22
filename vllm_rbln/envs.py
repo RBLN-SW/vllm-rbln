@@ -80,19 +80,31 @@ if TYPE_CHECKING:
     # --- QUANTIZATION ---
     VLLM_RBLN_USE_W8A16: bool = False
 
+_W8A8_CAPABLE_NPUS = frozenset({"RBLN-CR13", "RBLN-CR23"})
+
+_USE_W8A16: bool | None = None
+
 
 def get_use_w8a16() -> bool:
     value = os.environ.get("VLLM_RBLN_USE_W8A16")
     if value is not None:
         return value.lower() in ("true", "1")
 
+    global _USE_W8A16
+    if _USE_W8A16 is not None:
+        return _USE_W8A16
+
     from vllm.platforms import current_platform
 
     try:
-        device_name = current_platform.get_device_name()
+        device_name = current_platform.get_device_name() or ""
     except Exception:
         device_name = ""
-    return "cr03" in device_name.lower()
+
+    _USE_W8A16 = (
+        not device_name or device_name.strip().upper() not in _W8A8_CAPABLE_NPUS
+    )
+    return _USE_W8A16
 
 
 def get_num_devices_per_local_rank() -> int:
@@ -364,6 +376,8 @@ environment_variables = {
             in ("true", "1")
         )
     ),
+    # --- QUANTIZATION ---
+    "VLLM_RBLN_USE_W8A16": get_use_w8a16,
 }
 
 

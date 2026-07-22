@@ -481,9 +481,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             :, scale_intermediate_size:, :
         ]
 
-        from vllm_rbln.envs import get_use_w8a16
+        from vllm_rbln import envs
 
-        if not get_use_w8a16():
+        if not envs.VLLM_RBLN_USE_W8A16:
             # W8A8: dynamically quantize hidden_states to fp8 per (1, block_k)
             # group along K and hand both the fp8 tensor and the per-(token,
             # K-block) scale to the W8A8 MoE custom op.
