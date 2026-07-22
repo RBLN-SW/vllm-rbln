@@ -346,6 +346,7 @@ jobs:
         if: steps.should_skip.outputs.skip != 'true'
         env:
           REBEL_VLLM_PRE_COMPILED_DIR: ${{ secrets.VLLM_PRE_COMPILED_DIR }}
+          RBLN_DUMMY_DEVICE: 1
 
         run: |
           case "${{ matrix.test_type.name }}" in
