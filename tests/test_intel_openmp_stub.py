@@ -16,46 +16,64 @@
 from __future__ import annotations
 
 import importlib.metadata
+import re
 import zipfile
 from pathlib import Path
 
-STUB_WHEEL = (
-    Path(__file__).resolve().parents[1]
-    / "vendor"
-    / "intel_openmp-2024.2.1+rbln.stub-py3-none-any.whl"
-)
-STUB_VERSION = "2024.2.1+rbln.stub"
-DIST_INFO_PREFIX = "intel_openmp-2024.2.1+rbln.stub.dist-info/"
+import pytest
 
 
-def test_stub_wheel_present() -> None:
-    assert STUB_WHEEL.is_file(), STUB_WHEEL
+@pytest.fixture(scope="module")
+def repo_root() -> Path:
+    return Path(__file__).resolve().parents[1]
 
 
-def test_stub_wheel_carries_only_dist_info() -> None:
-    with zipfile.ZipFile(STUB_WHEEL) as z:
-        names = z.namelist()
-    runtime = [n for n in names if not n.startswith(DIST_INFO_PREFIX)]
+@pytest.fixture(scope="module")
+def stub_wheel(repo_root: Path) -> Path:
+    matches = list((repo_root / "vendor").glob("intel_openmp-*+rbln.stub-*.whl"))
+    assert len(matches) == 1, matches
+    return matches[0]
+
+
+@pytest.fixture(scope="module")
+def stub_version(stub_wheel: Path) -> str:
+    match = re.match(r"intel_openmp-(.+?)-py3-none-any\.whl$", stub_wheel.name)
+    assert match, stub_wheel.name
+    return match.group(1)
+
+
+def test_stub_wheel_present(stub_wheel: Path) -> None:
+    assert stub_wheel.is_file()
+
+
+def test_stub_wheel_carries_only_dist_info(stub_wheel: Path, stub_version: str) -> None:
+    dist_info_prefix = f"intel_openmp-{stub_version}.dist-info/"
+    with zipfile.ZipFile(stub_wheel) as z:
+        runtime = [n for n in z.namelist() if not n.startswith(dist_info_prefix)]
     assert not runtime, runtime
 
 
-def test_stub_wheel_declares_expected_version() -> None:
-    with zipfile.ZipFile(STUB_WHEEL) as z:
-        metadata = z.read(f"{DIST_INFO_PREFIX}METADATA").decode()
-    assert f"Version: {STUB_VERSION}" in metadata, metadata
+def test_stub_wheel_declares_expected_version(
+    stub_wheel: Path, stub_version: str
+) -> None:
+    with zipfile.ZipFile(stub_wheel) as z:
+        metadata = z.read(f"intel_openmp-{stub_version}.dist-info/METADATA").decode()
+    assert f"Version: {stub_version}" in metadata
 
 
-def test_uv_lock_pins_stub() -> None:
-    lock = (Path(__file__).resolve().parents[1] / "uv.lock").read_text(encoding="utf-8")
+def test_uv_lock_pins_stub(
+    repo_root: Path, stub_wheel: Path, stub_version: str
+) -> None:
+    lock = (repo_root / "uv.lock").read_text(encoding="utf-8")
     assert 'name = "intel-openmp"' in lock
-    assert f'version = "{STUB_VERSION}"' in lock
-    assert 'path = "vendor/intel_openmp-2024.2.1+rbln.stub-py3-none-any.whl"' in lock
+    assert f'version = "{stub_version}"' in lock
+    assert f'path = "vendor/{stub_wheel.name}"' in lock
 
 
-def test_installed_intel_openmp_is_stub() -> None:
+def test_installed_intel_openmp_is_stub(stub_version: str) -> None:
     dist = importlib.metadata.distribution("intel-openmp")
-    assert dist.version == STUB_VERSION, (
-        f"env has intel-openmp {dist.version}; expected {STUB_VERSION}. "
+    assert dist.version == stub_version, (
+        f"env has intel-openmp {dist.version}; expected {stub_version}. "
         "Run `uv sync --locked` to pick up the vendored stub."
     )
     files = list(dist.files or [])
