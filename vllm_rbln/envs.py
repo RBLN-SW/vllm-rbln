@@ -101,11 +101,9 @@ def get_use_w8a16() -> bool:
     except Exception:
         device_name = ""
 
-    if not device_name:
-        return True
-
-    _USE_W8A16 = device_name.strip().upper() not in _W8A8_CAPABLE_NPUS
-
+    _USE_W8A16 = (
+        not device_name or device_name.strip().upper() not in _W8A8_CAPABLE_NPUS
+    )
     return _USE_W8A16
 
 
