@@ -126,26 +126,36 @@ class RBLNW8A8BlockFp8LinearKernel(RBLNW8A16BlockFp8LinearKernel):
             return False, "RBLN W8A8 block fp8 kernel applies only on W8A8 devices."
         return True, None
 
-    def apply_block_scaled_mm(
+    def apply_weights(
         self,
-        A: torch.Tensor,
-        B: torch.Tensor,
-        As: torch.Tensor,
-        Bs: torch.Tensor,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        **kwargs,
     ) -> torch.Tensor:
-        del As
+
+        params = self._get_layer_params(layer)
+        weight = params.weight
+        weight_scale = (
+            params.weight_scale
+            if params.weight_scale_inv is None
+            else params.weight_scale_inv
+        )
         _block_n, block_k = [int(v) for v in self.weight_group_shape]
 
-        a_3d = A.reshape(1, *A.shape)
-        x_q, x_scale = self._per_token_group_quant_fp8(a_3d, block_k)
-        x_deq = x_q.to(A.dtype) * x_scale.repeat_interleave(block_k, dim=-1).to(A.dtype)
+        x_q, x_scale = self._per_token_group_quant_fp8(x, block_k)
+        x_deq = x_q.to(x.dtype) * x_scale.repeat_interleave(block_k, dim=-1).to(x.dtype)
 
-        weight = self._dequantize_block_fp8_weight(
-            weight=B,
-            weight_scale=Bs,
-            dtype=A.dtype,
+        w = self._dequantize_block_fp8_weight(
+            weight=weight,
+            weight_scale=weight_scale,
+            dtype=x.dtype,
         )
-        return torch.nn.functional.linear(x_deq.reshape(-1, x_deq.shape[-1]), weight)
+
+        out = torch.nn.functional.linear(x_deq.reshape(-1, x_deq.shape[-1]), w)
+        if bias is not None:
+            out = out + bias
+        return out.to(self.config.out_dtype).view(*x.shape[:-1], weight.shape[0])
 
     @classmethod
     def _per_token_group_quant_fp8(
