@@ -241,26 +241,30 @@ class _NoopPerformanceContext:
 
 def _rank_tag() -> str:
     """Rank tag including only parallelism axes with degree > 1; '' if none."""
-    parts = []
-    try:
-        from vllm.distributed import get_pp_group, get_tp_group
 
-        tp = get_tp_group()
-        if tp.world_size > 1:
-            parts.append(f"TP{tp.rank_in_group}")
-        pp = get_pp_group()
-        if pp.world_size > 1:
-            parts.append(f"PP{pp.rank_in_group}")
-    except Exception:
+    def get_rank_info(group_name: str, get_group_func) -> str:
+        try:
+            group = get_group_func()
+            if group.world_size > 1:
+                return f"{group_name}{group.rank_in_group}"
+        except Exception:
+            return ""
         return ""
-    try:
-        from vllm.distributed import get_dp_group
 
-        dp = get_dp_group()
-        if dp.world_size > 1:
-            parts.append(f"DP{dp.rank_in_group}")
-    except Exception:
-        pass  # DP group may not be initialized
+    parts = []
+
+    from vllm.distributed import get_dp_group, get_ep_group, get_pp_group, get_tp_group
+
+    for group_name, get_group_func in [
+        ("TP", get_tp_group),
+        ("PP", get_pp_group),
+        ("DP", get_dp_group),
+        ("EP", get_ep_group),
+    ]:
+        rank_info = get_rank_info(group_name, get_group_func)
+        if rank_info:
+            parts.append(rank_info)
+
     return " ".join(parts)
 
 
