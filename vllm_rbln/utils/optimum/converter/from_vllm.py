@@ -87,10 +87,7 @@ def sync_from_vllm(vllm_config: VllmConfig) -> None:
             "  2) `kvcache_block_size` under "
             "`additional_config={'rbln_config': {...}}`.\n"
         )
-    # On the compile path an explicit max_num_batched_tokens is the user's
-    # prefill chunk size, taking precedence over the rbln_config default; folding
-    # it into params keeps block sizing, the compile pin, and max_num_batched_tokens
-    # in agreement. No-op for enc-dec/pooling models, which don't chunk prefill.
+
     apply_user_prefill_chunk_size(
         vllm_config,
         params,

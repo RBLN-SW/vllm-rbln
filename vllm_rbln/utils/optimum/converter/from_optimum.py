@@ -101,8 +101,6 @@ def sync_from_optimum(
         )
         vllm_config.model_config.max_model_len = params.max_seq_len
 
-    # The compiled artefact fixes the prefill chunk size; a differing
-    # max_num_batched_tokens from the user is an error.
     apply_user_prefill_chunk_size(vllm_config, params, precompiled=True)
     # Set max_num_batched_tokens: the prefill chunk size for decoder/multimodal
     # models, or a full-prefill-plus-batch budget for enc-dec/pooling models.

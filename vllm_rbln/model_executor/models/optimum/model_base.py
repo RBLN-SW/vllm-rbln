@@ -216,19 +216,11 @@ class RBLNOptimumModelBase(nn.Module):
                     rbln_config=rbln_overrides,
                 )
                 self.vllm_config.model_config.model = valid_path
-            print(
-                "@@@ prefill_chunk_size",
-                self.vllm_config.scheduler_config.max_num_batched_tokens,
-            )
         else:
             assert not self._is_ec_producer_only(), (
                 "Disaggregated Encoder is only supported for pre-compiled model."
             )
             # cache miss: compile the model and save it to the cache for reuse.
-            print(
-                "@@@ prefill_chunk_size",
-                self.vllm_config.scheduler_config.max_num_batched_tokens,
-            )
             spec = RBLNCompileSpec.for_architecture(
                 hf_config,
                 batch_size=self.scheduler_config.max_num_seqs,
