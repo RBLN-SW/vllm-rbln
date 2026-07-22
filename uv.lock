@@ -1549,8 +1549,8 @@ wheels = [
 
 [[package]]
 name = "optimum-rbln"
-version = "0.11.1a2"
-source = { registry = "https://pypi.rebellions.in/simple/" }
+version = "0.11.1a4"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "accelerate", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "diffusers", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
@@ -1562,8 +1562,9 @@ dependencies = [
     { name = "torchvision", marker = "platform_machine == 'x86_64' and platform_python_implementation == 'CPython' and sys_platform == 'linux'" },
     { name = "transformers", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
 ]
+sdist = { url = "https://files.pythonhosted.org/packages/3d/81/4131c901e1876dec3dfde4f857b4bf2e24ebed67a1eaaa49f09f2ca9813e/optimum_rbln-0.11.1a4.tar.gz", hash = "sha256:598dd799f22c8d32feee142b8b72d15e9ff0dfd8a5150a3683fd9540f309f51d", size = 546024, upload-time = "2026-07-22T07:36:02.716Z" }
 wheels = [
-    { url = "https://pypi.rebellions.in/api/package/optimum-rbln/optimum_rbln-0.11.1a2-py3-none-any.whl", hash = "sha256:80e47351afb8831bd07d2057cbf4c6205bac2a04706e3c17936fe6065e54c9e4" },
+    { url = "https://files.pythonhosted.org/packages/b9/ed/2fd17447207a568a9a6260f0318de299baf1a620f2d62bc656dab28faf9b/optimum_rbln-0.11.1a4-py3-none-any.whl", hash = "sha256:18badb7e65a5606d60ed361128385b85c30857833d6d35a663ff721ce55610ab", size = 626193, upload-time = "2026-07-22T07:36:00.904Z" },
 ]
 
 [[package]]
@@ -2946,7 +2947,7 @@ requires-dist = [
     { name = "fire", marker = "extra == 'dev'" },
     { name = "huggingface-hub", marker = "extra == 'dev'" },
     { name = "intel-openmp", path = "vendor/intel_openmp-2024.2.1+rbln.stub-py3-none-any.whl" },
-    { name = "optimum-rbln", specifier = ">=0.11.1a2" },
+    { name = "optimum-rbln", specifier = ">=0.11.1a4" },
     { name = "packaging", marker = "extra == 'dev'" },
     { name = "pynvml", marker = "extra == 'dev'" },
     { name = "pytest", marker = "extra == 'test'" },
