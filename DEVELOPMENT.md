@@ -3,6 +3,7 @@
 Requirements:
 - Linux x86_64 with access to the internal network (Nexus / internal PyPI)
 - Python **3.12** for this dev workflow (`rebel-compiler` nightly wheels are currently cp312-only; the package itself targets 3.10-3.13)
+- uv **>= 0.11.25** (`uv self update`) — enforced via `required-version` in `pyproject.toml`. Older uv writes `uv.lock` in a different serialization (repeats the `tool.uv.environments` marker on every dependency), so re-locking with it produces a ~900-line noise diff.
 
 Internal indexes require your **LDAP account** credentials (set once, e.g. in your shell profile):
 
