@@ -145,6 +145,11 @@ environments = [
 # Exact reproduction is uv.lock's job — installs without the lock are out of contract.
 index-strategy = "unsafe-best-match"
 prerelease = "if-necessary-or-explicit"   # pin uv's default explicitly — prereleases only for packages with a marker (or prerelease-only packages)
+# Drop intel-openmp (proprietary, transitive from vllm-cpu). Impossible
+# marker makes uv skip it without failing resolution.
+override-dependencies = [
+    "intel-openmp; sys_platform == 'never'",
+]
 
 [[tool.uv.index]]
 name = "vllm-cpu"
