@@ -19,6 +19,7 @@ def get_param_exaone4_5(
     max_model_len: int,
     block_size: int,
     num_devices: int,
+    memory_budget: float,
     prefill_chunk_size: int | None = None,
 ) -> dict:
     param = {
@@ -31,6 +32,7 @@ def get_param_exaone4_5(
         "max_seq_len": max_model_len,
         "batch_size": batch_size,
         "use_inputs_embeds": True,
+        "memory_budget": memory_budget,
     }
     if block_size != max_model_len:
         attn_impl = "flash_attn" if block_size != max_model_len else "eager"
