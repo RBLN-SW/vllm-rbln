@@ -1,0 +1,138 @@
+# 🛠️ Development setup (uv)
+
+Requirements:
+- Linux x86_64 with access to the internal network (Nexus / internal PyPI)
+- Python **3.12** for this dev workflow (`rebel-compiler` nightly wheels are currently cp312-only; the package itself targets 3.10-3.13)
+
+Internal indexes require your **LDAP account** credentials (set once, e.g. in your shell profile):
+
+```bash
+export UV_INDEX_RBLN_NEXUS_NIGHTLY_USERNAME=<ldap-username>
+export UV_INDEX_RBLN_NEXUS_NIGHTLY_PASSWORD=<ldap-password>
+export UV_INDEX_REBELLIONS_USERNAME=<ldap-username>
+export UV_INDEX_REBELLIONS_PASSWORD=<ldap-password>
+```
+
+> `rbln-release` (pypi.rbln.ai) uses a separate account system; credentials for it are only needed if the lock ever resolves packages from that index.
+
+Then install the locked, team-identical environment with a single command:
+
+```bash
+uv sync --extra runtime
+```
+
+> `rebel-compiler` is separated into the `runtime` extra — it is required for NPU execution but excluded from the base dependency set. `--extra runtime` installs it alongside the rest of the locked environment.
+
+## pyproject.toml vs uv.lock — what to edit when
+
+| File | Role | Edit by hand? |
+|---|---|---|
+| `pyproject.toml` | Declares dependency **ranges** (what we're compatible with). Ships in the wheel as `Requires-Dist`. | Yes |
+| `uv.lock` | Pins the **exact** versions + hashes of the full graph (what dev/CI actually installs). Never shipped. | **No** — only via `uv` commands |
+
+Common tasks:
+
+```bash
+# Add / remove / change a dependency range:
+#   edit pyproject.toml, then refresh the lock and commit BOTH files
+uv lock
+
+# Bump one package to the latest version allowed by pyproject (lock-only change):
+uv lock --upgrade-package rebel-compiler
+
+# Reproduce the CI-identical environment (never resolves, only installs the lock):
+uv sync --extra runtime
+```
+
+Rules of thumb:
+- If you edited `pyproject.toml`, always run `uv lock` and commit `uv.lock` in the same PR — pre-commit rejects drift between the two.
+- CI installs with `uv sync --locked`, which fails if `uv.lock` doesn't match `pyproject.toml`.
+- Never edit `uv.lock` by hand.
+
+### rebel-compiler version policy
+
+**Who updates:** whoever needs it (need-driven). The team merging a feature
+that requires a newer compiler includes the bump in that PR, as a separate
+commit (easy to revert), e.g. `chore(deps): bump rebel-compiler to 0.11.1.devXXX`.
+
+**Version eligibility:**
+- Only builds that **passed the compiler nightly CI** may be pinned in
+  `uv.lock` or referenced in `pyproject.toml`. Builds from compiler feature
+  branches are for local/CI experiments only — never commit them to the lock.
+- On `main`, only **official release versions** are pinned. Dev builds
+  (`*.devNNN`) are allowed on `dev` only; they are replaced with a release
+  version when merging/releasing to `main`.
+
+**Lock update vs dependency update — decide separately:**
+- **`uv.lock` only** — the new build's features/bugfixes are needed, but the
+  code still works with older compiler versions in the allowed range
+  (e.g. `dev304` → `dev350`): `uv lock --upgrade-package rebel-compiler`.
+- **`pyproject.toml` + `uv.lock` together** — the code is no longer
+  compatible with older compiler versions, i.e. it depends on something that
+  does not exist below a certain compiler version (e.g. a new custom op that
+  only exists from `0.11.2.dev0`): raise the lower bound in `pyproject.toml`
+  (`~=0.11.1.dev0` → `~=0.11.2.dev0`) and regenerate `uv.lock` in the same
+  PR. Bumping only the lock leaves the declared range permitting older
+  versions that no longer work — other environments can still resolve a
+  broken combination.
+- Version-line change (`0.11.x` → `0.12.x`) is a release-level decision:
+  always `pyproject.toml` + `uv.lock`, with API/compatibility review.
+
+**Testing a specific build without touching the lock:** use the
+`rebel_compiler_version` input of the CI workflow — it installs that version
+as an override and leaves `uv.lock` unchanged.
+
+To bump `rebel-compiler` to the latest nightly (do not edit `pyproject.toml`):
+
+```bash
+uv lock --upgrade-package rebel-compiler
+# or pin a specific version:
+uv lock --upgrade-package rebel-compiler==0.11.1.dev200
+# commit the updated uv.lock
+```
+
+Available versions can be checked by browsing the index directly
+(e.g. <https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/rebel-compiler/>,
+LDAP login required), or:
+
+```bash
+curl -s -u "$UV_INDEX_RBLN_NEXUS_NIGHTLY_USERNAME:$UV_INDEX_RBLN_NEXUS_NIGHTLY_PASSWORD" \
+  https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/rebel-compiler/ \
+  | grep -oE 'rebel_compiler-[0-9][A-Za-z0-9.+]*' | sort -uV | tail -10
+```
+
+## External contributors (no Rebellions internal network)
+
+`uv.lock` pins packages to Rebellions-internal indexes, so `uv sync` only works
+inside the internal network. Internal nightly builds of `rebel-compiler` are
+not published externally. External contributors instead:
+
+1. Request an **external LDAP account** via the
+   [Request RBLN SDK/Portal Access](https://rebellions.ai/request-form-rbln-sdk/).
+2. Install `rebel-compiler` with that account, following the
+   [official guide](https://docs.rbln.ai/latest/getting_started/installation_guide.html).
+3. Install `vllm-rbln` on top — everything else resolves from public indexes:
+
+```bash
+# 1. Create a venv and install rebel-compiler with your external LDAP account
+#    (per the official guide above):
+uv venv --python 3.12
+source .venv/bin/activate
+# ... install rebel-compiler into this venv per the official instructions ...
+
+# 2. Install vllm-rbln (rebel-compiler is an optional 'runtime' extra,
+#    so your separately installed copy is left untouched):
+uv pip install -e ".[test]"
+```
+
+`rebel-compiler` is an optional `runtime` extra and is not pulled in by the
+base `test` install, so the resolver never conflicts with your separately
+installed copy. Everything else resolves from public indexes (PyPI,
+`wheels.vllm.ai`, `download.pytorch.org`); internal indexes are skipped
+automatically.
+
+> Note: this environment is **not** what CI reproduces. CI always builds from
+> the committed `uv.lock` (internal nightly `rebel-compiler` included), so unless
+> `uv.lock` is updated, your PR is tested against the existing lock — not against
+> the environment you built above. With a released SDK version some recent
+> features may not work locally — CI is the source of truth for compatibility.
