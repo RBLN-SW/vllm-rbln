@@ -25,11 +25,9 @@ from vllm_rbln.platform import USE_DEVICE_TENSOR
         "DeepSeekMultiTokenPredictorLayer.forward"
     ),
     reason=(
-        "Drop the position-0 embedding mask (deepseek_mtp.py:109) in the MTP "
-        "drafter: the RBLN compiler rejects its position-conditional select with "
-        "[UNEXPECTED_GRAPH] under device tensor. Spec-decode verifies drafts, so "
-        "this only affects draft acceptance rate, not correctness. Gated on "
-        "USE_DEVICE_TENSOR."
+        "Drop the position-0 embedding mask in the MTP drafter: "
+        "the RBLN compiler rejects its position-conditional select with "
+        "[UNEXPECTED_GRAPH] under device tensor."
     ),
     condition=lambda: USE_DEVICE_TENSOR,
 )
