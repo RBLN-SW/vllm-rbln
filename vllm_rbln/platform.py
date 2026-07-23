@@ -36,7 +36,6 @@ from vllm_rbln.utils.optimum.converter import sync_vllm_and_optimum
 from vllm_rbln.utils.optimum.predicates import is_qwen3_pooling
 from vllm_rbln.utils.optimum.registry import (
     is_enc_dec_arch,
-    is_multi_modal,
     is_pooling_arch,
 )
 
@@ -444,17 +443,45 @@ class RblnPlatform(Platform):
         )
         vllm_config.cache_config.enable_prefix_caching = False
 
+    @staticmethod
+    def _uses_sliding_window(hf_config) -> bool:
+        """Whether any layer uses sliding-window attention. Reads the text
+        sub-config (multimodal composites nest it), honors a
+        ``use_sliding_window=False`` opt-out, and treats a sliding ``layer_types``
+        entry as sliding. Errs toward True (disabling prefix caching is safe).
+        """
+        config = (
+            hf_config.get_text_config()
+            if hasattr(hf_config, "get_text_config")
+            else hf_config
+        )
+        # use_sliding_window is a Qwen2-only opt-out flag; models without it
+        # (Gemma/Mistral) are judged by sliding_window/layer_types, so default
+        # to True (no opt-out) to avoid short-circuiting their detection.
+        if not getattr(config, "use_sliding_window", True):
+            return False
+        if getattr(config, "sliding_window", None) is not None:
+            return True
+        layer_types = getattr(config, "layer_types", None) or []
+        return any("sliding" in str(layer_type).lower() for layer_type in layer_types)
+
     @classmethod
     def disable_unsupported_prefix_caching(cls, vllm_config: VllmConfig) -> None:
         if not vllm_config.cache_config.enable_prefix_caching:
             return
+        # An EC producer runs only the (vision) encoder and never executes the
+        # LLM, so it holds no KV cache. Prefix caching there is a no-op and its
+        # KV-cache manager is only a placeholder, so disable it explicitly.
+        ec = getattr(vllm_config, "ec_transfer_config", None)
+        if ec is not None and ec.is_ec_producer and not ec.is_ec_consumer:
+            cls._disable_prefix_caching(vllm_config, "EC producer (encoder-only)")
+            return
 
         hf_config = vllm_config.model_config.hf_config
+        has_sliding_window = cls._uses_sliding_window(hf_config)
 
         if envs.VLLM_RBLN_USE_VLLM_MODEL:
-            if getattr(hf_config, "sliding_window", None) is not None and getattr(
-                hf_config, "use_sliding_window", True
-            ):
+            if has_sliding_window:
                 cls._disable_prefix_caching(vllm_config, "sliding window models")
 
         else:
@@ -464,13 +491,9 @@ class RblnPlatform(Platform):
                 cls._disable_prefix_caching(vllm_config, "Qwen3 pooling models")
             elif is_enc_dec_arch(hf_config):
                 cls._disable_prefix_caching(vllm_config, "encoder-decoder models")
-            elif is_multi_modal(hf_config):
-                cls._disable_prefix_caching(vllm_config, "multimodal models")
             elif is_pooling_arch(hf_config):
                 cls._disable_prefix_caching(vllm_config, "pooling models")
-            elif getattr(hf_config, "sliding_window", None) is not None and getattr(
-                hf_config, "use_sliding_window", True
-            ):
+            elif has_sliding_window:
                 cls._disable_prefix_caching(vllm_config, "sliding window models")
 
     @classmethod

@@ -51,6 +51,12 @@ class ECDisaggHelpersMixin:
             self, encoder_cache: dict[str, Any], mm_hash: str
         ) -> None: ...
 
+        def reuse_prefix_cached_kv(
+            self,
+            model_input: ModelInputForRBLN,
+            scheduler_output: "SchedulerOutput",
+        ) -> None: ...
+
     def _make_producer_output(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput:
@@ -119,9 +125,20 @@ class ECDisaggHelpersMixin:
         req = scheduler_output.scheduled_new_reqs[0]
         if not req.mm_features:
             raise RuntimeError("EC consumer: request has no mm_features.")
-
+        # On a partial prefix-cache hit, keep only the items not fully inside the
+        # cached prefix, matching the runner's _iter_kept_mm_features (and thus
+        # mm_embed_tail_starts). A fully-cached item's KV is reused and it has no
+        # placeholder in the uncached tail. num_cached == 0 keeps every item.
+        num_cached = (
+            model_input.partial_prefix.num_cached_tokens
+            if model_input.partial_prefix is not None
+            else 0
+        )
         cached_mm_outputs: list = []
         for feat in req.mm_features:
+            pos = feat.mm_position
+            if pos.offset + pos.length <= num_cached:
+                continue
             mm_hash = feat.identifier
             if mm_hash not in self.encoder_cache:
                 raise RuntimeError(
@@ -147,7 +164,13 @@ class ECDisaggHelpersMixin:
             cache_position=cache_position,
             running_requests_ids=model_input.running_requests_ids,
             mrope_position_deltas=self.mrope_position_deltas,
+            # Needed for partial prefix-cache hits: carries partial_prefix so the
+            # cached embeds are tail-sliced and MRoPE is recomputed over the full
+            # prompt (mirrors the non-EC partial prefill path).
+            model_input=model_input,
         )
+
+        self.reuse_prefix_cached_kv(model_input, scheduler_output)
 
         language_model = self.model.get_language_model()
         logits = language_model.prefill_decoder(
