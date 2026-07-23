@@ -569,11 +569,35 @@ class RBLNWorker(WorkerBase):
             )
             return
 
+        # rebel.kv_cache.max_num_blocks models each compiled KV allocation
+        # region as an affine function of num_blocks
+        # (base_bytes + bytes_per_block * n) plus a per-region device
+        # alignment, and returns the largest n whose aligned footprint fits the
+        # supplied per-(node, chiplet) budget. Imported lazily: this path only
+        # runs once the model is compiled, so rebel is guaranteed available.
+        from rebel.kv_cache import max_num_blocks
+
+        kv_cache_config = self.model_runner.kv_cache_config
+        old_num_blocks = kv_cache_config.num_blocks
+        if old_num_blocks <= 0:
+            logger.warning("Existing num_blocks <= 0; skipping reallocation.")
+            return
+
+        # The total KV memory budget that vllm originally reserved, derived from
+        # sum(kv_cache_tensors[i].size). This is vllm's manual estimate; treat it
+        # as the device memory available for the KV cache on each chiplet and let
+        # the compiled profile decide how many blocks actually fit.
+        total_kv_bytes = sum(t.size for t in kv_cache_config.kv_cache_tensors)
+        if total_kv_bytes <= 0:
+            logger.warning("Total KV bytes <= 0; skipping reallocation.")
+            return
+
         # All compiled artifacts share the same dynamic-KV layout (same
-        # mark_dynamic hint / same dynamic_shape_info JSON). Use the max
-        # per-block bytes across artifacts/chiplets as a safe upper bound.
+        # mark_dynamic hint / same dynamic_shape_info JSON). Ask each artifact's
+        # profile for the max num_blocks that fits vllm's KV budget and take the
+        # most constraining (min) across artifacts.
         # TODO(joonsoo): Verify whether this code works on multi-chiplet environment.
-        per_block_bytes = 0
+        new_num_blocks: int | None = None
         for runtime in runtime_holder:
             executor = getattr(runtime, "_executor", None)
             if executor is None:
@@ -587,61 +611,56 @@ class RBLNWorker(WorkerBase):
                     e,
                 )
                 return
-            for _chiplet_id, delta in profile.addition.device_memory_usage.items():
-                per_block_bytes = max(per_block_bytes, delta)
-            logger.warning(
-                "[Dynamic KV] compiled profile: base=%s addition=%s",
-                profile.base,
-                profile.addition,
-            )
 
-        if per_block_bytes <= 0:
+            # Treat vllm's KV budget as the memory available on every
+            # (node, chiplet) the compiled KV cache touches. max_num_blocks()
+            # subtracts each region's fixed base_bytes and honors the per-region
+            # alignment before maximizing the per-block count.
+            available_device_bytes: dict[int, dict[int, int]] = {}
+            for region in profile.device_regions:
+                available_device_bytes.setdefault(region.node_id, {})[
+                    region.chiplet_id
+                ] = total_kv_bytes
+
+            try:
+                fit = max_num_blocks(profile, available_device_bytes)
+            except ValueError:
+                # No per-block growth → this artifact was not compiled with a
+                # mark_dynamic'd KV dim, so num_blocks is not memory-bounded.
+                logger.warning(
+                    "[Dynamic KV] compiled profile has no per-block memory "
+                    "growth; skipping reallocation."
+                )
+                return
+
             logger.warning(
-                "[Dynamic KV] no dynamic KV slot in compiled artifacts; "
+                "[Dynamic KV] compiled profile: device_regions=%s "
+                "host_base_bytes=%s host_bytes_per_block=%s -> max_num_blocks=%d",
+                profile.device_regions,
+                profile.host_base_bytes,
+                profile.host_bytes_per_block,
+                fit,
+            )
+            new_num_blocks = fit if new_num_blocks is None else min(new_num_blocks, fit)
+
+        if not new_num_blocks or new_num_blocks <= 0:
+            logger.warning(
+                "[Dynamic KV] no fittable num_blocks from compiled artifacts; "
                 "skipping reallocation."
             )
             return
 
-        kv_cache_config = self.model_runner.kv_cache_config
-        old_num_blocks = kv_cache_config.num_blocks
-        if old_num_blocks <= 0:
-            logger.warning(
-                "Existing num_blocks <= 0; skipping reallocation."
-            )
-            return
-
-        # The total KV memory budget that vllm originally allocated, derived
-        # from sum(kv_cache_tensors[i].size). Recompute num_blocks using the
-        # compiled per-block bytes as ground truth.
-        total_kv_bytes = sum(t.size for t in kv_cache_config.kv_cache_tensors)
-        if total_kv_bytes <= 0:
-            logger.warning(
-                "Total KV bytes <= 0; skipping reallocation."
-            )
-            return
-
-        new_num_blocks = int(total_kv_bytes // per_block_bytes)
-
         logger.warning(
-            "[Dynamic KV] per_block_bytes(compiled)=%d, "
-            "total_kv_budget_bytes=%d, old_num_blocks=%d, "
-            "computed_num_bufs=%d",
-            per_block_bytes,
+            "[Dynamic KV] total_kv_budget_bytes=%d, old_num_blocks=%d, "
+            "computed_num_blocks=%d",
             total_kv_bytes,
             old_num_blocks,
             new_num_blocks,
         )
 
-        if new_num_blocks <= 0:
-            logger.warning(
-                "[Dynamic KV] computed_num_bufs=%d <= 0; "
-                "skipping reallocation.",
-                new_num_blocks,
-            )
-            return
         if new_num_blocks == old_num_blocks:
             logger.warning(
-                "[Dynamic KV] computed_num_bufs=%d == old_num_blocks; "
+                "[Dynamic KV] computed_num_blocks=%d == old_num_blocks; "
                 "no reallocation needed.",
                 new_num_blocks,
             )
