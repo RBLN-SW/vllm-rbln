@@ -142,10 +142,10 @@ required-version = ">=0.11.25"
 environments = [
     "sys_platform == 'linux' and platform_machine == 'x86_64'"
 ]
-# Register all three rbln indexes at once; the spec (prerelease marker/operator)
-# decides which version gets selected. Decision per RFC #738 §4.4: the cross-index
-# risk that third-party packages (not just rebel-compiler) may resolve from rbln
-# indexes was reviewed and accepted, to keep a fixed index config across dev/release.
+# pypi.rebellions.in is intentionally NOT registered: packages appear/disappear
+# there independently of dev/main, so a full lock refresh could pin versions that
+# must not be used. Install packages from it ad-hoc via --extra-index-url instead
+# (see DEVELOPMENT.md).
 # Exact reproduction is uv.lock's job — installs without the lock are out of contract.
 index-strategy = "unsafe-best-match"
 prerelease = "if-necessary-or-explicit"   # pin uv's default explicitly — prereleases only for packages with a marker (or prerelease-only packages)
@@ -163,10 +163,6 @@ explicit = true
 [[tool.uv.index]]
 name = "rbln-nexus-nightly"
 url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/"
-
-[[tool.uv.index]]
-name = "rebellions"
-url = "https://pypi.rebellions.in/simple/"
 
 [[tool.uv.index]]
 name = "rbln-release"
