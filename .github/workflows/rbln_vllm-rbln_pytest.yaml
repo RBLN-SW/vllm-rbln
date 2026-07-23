@@ -226,7 +226,7 @@ jobs:
             },
             {
               name : "sampler",
-              runner : "rbln-sw-k8s-ca22-1"
+              runner : "rbln-sw-k8s-ca22-8"
             },
             {
               name : "models",
@@ -356,9 +356,9 @@ jobs:
               uv run --no-sync pytest tests/entrypoints/llm -vv --durations 0
               ;;
             "sampler")
-              uv run --no-sync pytest -n auto -k "warm_up_true" tests/v1/worker/test_sampler.py -vv --durations 0
-              uv run --no-sync pytest -n auto -k "warm_up_false" tests/v1/worker/test_sampler.py -vv --durations 0
-              uv run --no-sync pytest -n auto -k "not warm_up_true and not warm_up_false" tests/v1/worker/test_sampler.py -vv --durations 0
+              uv run --no-sync pytest -n 8 -k "warm_up_true" tests/v1/worker/test_sampler.py -vv --durations 0
+              uv run --no-sync pytest -n 8 -k "warm_up_false" tests/v1/worker/test_sampler.py -vv --durations 0
+              uv run --no-sync pytest -n 8 -k "not warm_up_true and not warm_up_false" tests/v1/worker/test_sampler.py -vv --durations 0
               ;;
             "models")
               uv run --no-sync pytest tests/v1/models -vv --durations 0
