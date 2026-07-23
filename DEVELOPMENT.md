@@ -66,7 +66,15 @@ uv lock
 uv lock --upgrade-package optimum-rbln
 # or pin an exact version:
 uv lock --upgrade-package optimum-rbln==0.11.1a4
+
+# One-command alternative: update the range in pyproject.toml AND bump exactly
+# that package in the lock in a single step:
+uv add "optimum-rbln>=0.11.1a4" --upgrade-package optimum-rbln
 ```
+
+The `--upgrade-package` flag scopes the upgrade to the named package only —
+without it, resolution may also move other packages; with `--upgrade` (no
+package argument) it re-pins the **entire** graph.
 
 **Never run `uv lock --upgrade`** (full-graph refresh): it re-pins every package
 in the lock at once. Whole-graph refreshes need a dedicated PR and team review.
