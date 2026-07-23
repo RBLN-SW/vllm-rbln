@@ -86,16 +86,17 @@ class BlockMappingManager:
             The inner->outer mapping is dissolved only in `_evict_block`, which
             `can_allocate` triggers only when free outer blocks are insufficient.
 
-            <= 0.22: inner blocks were also reused only under pool pressure
-                (freed blocks go to the TAIL of the vLLM free queue), so an
-                inner block was reassigned around the same time its outer block
-                was evicted — reconciling the index at eviction
-                (`remove_mapping`) was enough.
-            0.24.0: unhashed freed blocks go to the HEAD of the queue and are
-                reused first, so an inner block is reassigned even while free
-                blocks remain — `can_allocate` still finds enough and never
-                evicts, so the stale mapping is never dissolved. The index must
-                be reconciled here, at reassignment time, not only at eviction.
+            <= 0.22: freed blocks (hashed or not) all went to the TAIL of
+                vLLM's free queue, so a block was only reused under pool
+                pressure. Inner-block reassignment therefore coincided with
+                outer-block eviction, and reconciling the index at eviction
+                time (`remove_mapping`) was sufficient.
+            0.24.0 (upstream #42656): unhashed freed blocks now go to the HEAD
+                of the queue and are reused first, even while free blocks
+                remain. `can_allocate` still finds enough and never evicts, so
+                the stale inner->outer mapping is never dissolved. The index
+                must be reconciled here, at reassignment time, not only at
+                eviction.
 
         What it does:
             On reassignment, drop this inner block from the previous outer
