@@ -2166,14 +2166,33 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     ) -> torch.Tensor:
         return self.model.compute_logits(hidden_states)
 
+    def _device_tensor_offload_enabled(self) -> bool:
+        """Whether to wrap device-tensor load / warm-up in ``torch.rbln.offload()``.
+
+        Offloading gives each device tensor a host-resident backing that is paged
+        to disk during warm-up. That is incompatible with dynamic KV cache
+        (VLLM_RBLN_USE_DYNAMIC_KV_CACHE): the KV cache is compiled with a
+        mark_dynamic'd num_blocks dim, so its slot carries an adaptive size. A
+        slot that keeps a host backing then gets an
+        adaptive_host_size stamped, which the runtime's apply_adaptive_size_buffers
+        rejects ("adaptive_host_size on an RblnSlot is not supported yet") because
+        the host side is eager-allocated at Init and cannot be resized at run time.
+        Disabling offload keeps the dynamic KV slot device-only so only its
+        device allocations are adaptively resized.
+        """
+        return (
+            envs.VLLM_RBLN_USE_DEVICE_TENSOR
+            and has_torch_rbln
+            and not envs.VLLM_RBLN_DISABLE_OFFLOAD
+            and not envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE
+        )
+
     @torch.inference_mode()
     def warm_up_model(self) -> None:
         set_warmup_active(True)
         offload_ctx = (
             torch.rbln.offload()
-            if envs.VLLM_RBLN_USE_DEVICE_TENSOR
-            and has_torch_rbln
-            and not envs.VLLM_RBLN_DISABLE_OFFLOAD
+            if self._device_tensor_offload_enabled()
             else nullcontext()
         )
         try:
@@ -4073,9 +4092,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         model_loader = get_model_loader(self.load_config)
         offload_ctx = (
             torch.rbln.offload()
-            if envs.VLLM_RBLN_USE_DEVICE_TENSOR
-            and has_torch_rbln
-            and not envs.VLLM_RBLN_DISABLE_OFFLOAD
+            if self._device_tensor_offload_enabled()
             else nullcontext()
         )
         with offload_ctx:
