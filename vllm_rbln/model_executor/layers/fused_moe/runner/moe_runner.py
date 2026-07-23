@@ -55,12 +55,6 @@ class RBLNMoERunner(MoERunner):
       ``VLLM_RBLN_DISPATCH_ALL2ALL``/``COMBINE_ALL2ALL`` are set, via the RBLN
       CCL all2all kernels (``send_mask`` registered in ``__init__``); partial
       expert outputs are combined with reduce-scatter or the all2all-combine path.
-
-    ``__init__`` re-exposes the old FusedMoE attributes from their new locations
-    (``moe_parallel_config``/``global_num_experts`` and routing params from
-    ``moe_config``/``router``) and precomputes ``expert_map_const`` (``.tolist()``
-    to avoid a Dynamo graph break when quant methods rebuild the int32 map inside
-    the traced forward).
     """
 
     def __init__(self, *args, **kwargs):
@@ -72,20 +66,8 @@ class RBLNMoERunner(MoERunner):
         self.moe_parallel_config = self.moe_config.moe_parallel_config
         self.global_num_experts = self.routed_experts.global_num_experts
 
-        # expert_map moved onto RoutedExperts' expert_map_manager.
-        expert_map = self.routed_experts.expert_map_manager.expert_map
-        self.expert_map_const = expert_map.tolist() if expert_map is not None else None
-
-        # --- #41184 remap: routing params now live on router / moe_config ---
+        # --- #41184 remap: top_k lives on moe_config ---
         self.top_k = self.moe_config.experts_per_token
-        self.renormalize = getattr(self.router, "renormalize", False)
-        self.scoring_func = getattr(self.router, "scoring_func", "softmax")
-        self.e_score_correction_bias = getattr(
-            self.router, "e_score_correction_bias", None
-        )
-        self.num_expert_group = getattr(self.router, "num_expert_group", None)
-        self.topk_group = getattr(self.router, "topk_group", None)
-        self.use_grouped_topk = self.num_expert_group is not None
 
         use_dispatch_all2all = envs.VLLM_RBLN_DISPATCH_ALL2ALL
         use_combine_all2all = envs.VLLM_RBLN_COMBINE_ALL2ALL
@@ -180,19 +162,24 @@ class RBLNMoERunner(MoERunner):
             # [E, R*max_pad] for dim=0 topk (select top_k experts per token)
             all_router_logits_t = all_router_logits.transpose(0, 1)  # [E, R*max_pad]
 
-            scoring_func = getattr(self, "scoring_func", "softmax")
-            e_score_correction_bias = getattr(self, "e_score_correction_bias", None)
-            use_grouped_topk = getattr(self, "use_grouped_topk", False)
+            scoring_func = getattr(self.router, "scoring_func", "softmax")
+            renormalize = getattr(self.router, "renormalize", False)
+            e_score_correction_bias = getattr(
+                self.router, "e_score_correction_bias", None
+            )
+            num_expert_group = getattr(self.router, "num_expert_group", None)
+            topk_group = getattr(self.router, "topk_group", None)
+            use_grouped_topk = num_expert_group is not None
 
             if scoring_func == "sigmoid":
                 if use_grouped_topk:
                     masked_routing_weights = _apply_grouped_topk_torch(
                         all_router_logits,
                         self.top_k,
-                        self.num_expert_group,
-                        self.topk_group,
+                        num_expert_group,
+                        topk_group,
                         scoring_func=scoring_func,
-                        renormalize=self.renormalize,
+                        renormalize=renormalize,
                         e_score_correction_bias=e_score_correction_bias,
                     )  # [E, R*max_pad]
                 else:
@@ -211,7 +198,7 @@ class RBLNMoERunner(MoERunner):
                     topk_weights = scores_t.gather(
                         0, selected_experts
                     )  # weights from original scores
-                    if self.renormalize:
+                    if renormalize:
                         topk_weights = topk_weights / topk_weights.sum(
                             dim=0, keepdim=True
                         ).clamp_min(1e-20)
@@ -224,14 +211,14 @@ class RBLNMoERunner(MoERunner):
                     masked_routing_weights = _apply_grouped_topk_torch(
                         all_router_logits,
                         self.top_k,
-                        self.num_expert_group,
-                        self.topk_group,
+                        num_expert_group,
+                        topk_group,
                         scoring_func=scoring_func,
-                        renormalize=self.renormalize,
+                        renormalize=renormalize,
                         e_score_correction_bias=e_score_correction_bias,
                     )  # [E, R*max_pad]
                 else:
-                    if self.renormalize:
+                    if renormalize:
                         # post_norm: topk first, then softmax on selected values
                         topk_weights, selected_experts = torch.topk(
                             all_router_logits_t, k=self.top_k, dim=0
@@ -252,17 +239,17 @@ class RBLNMoERunner(MoERunner):
                     masked_routing_weights = _apply_grouped_topk_torch(
                         all_router_logits,
                         self.top_k,
-                        self.num_expert_group,
-                        self.topk_group,
+                        num_expert_group,
+                        topk_group,
                         scoring_func=scoring_func,
-                        renormalize=self.renormalize,
+                        renormalize=renormalize,
                         e_score_correction_bias=e_score_correction_bias,
                     )  # [E, R*max_pad]
                 else:
                     topk_weights, selected_experts = torch.topk(
                         all_router_logits_t, k=self.top_k, dim=0
                     )
-                    if self.renormalize:
+                    if renormalize:
                         topk_weights = topk_weights / topk_weights.sum(
                             dim=0, keepdim=True
                         ).clamp_min(1e-20)
@@ -402,19 +389,22 @@ class RBLNMoERunner(MoERunner):
         router_logits_2d = router_logits.reshape(num_tokens, -1)
 
         # transpose to [E, t] for dim=0 topk (matching detach_topk branch)
-        scoring_func = getattr(self, "scoring_func", "softmax")
-        e_score_correction_bias = getattr(self, "e_score_correction_bias", None)
-        use_grouped_topk = getattr(self, "use_grouped_topk", False)
+        scoring_func = getattr(self.router, "scoring_func", "softmax")
+        renormalize = getattr(self.router, "renormalize", False)
+        e_score_correction_bias = getattr(self.router, "e_score_correction_bias", None)
+        num_expert_group = getattr(self.router, "num_expert_group", None)
+        topk_group = getattr(self.router, "topk_group", None)
+        use_grouped_topk = num_expert_group is not None
 
         if scoring_func == "sigmoid":
             if use_grouped_topk:
                 masked_routing_weights = _apply_grouped_topk_torch(
                     router_logits_2d,
                     self.top_k,
-                    self.num_expert_group,
-                    self.topk_group,
+                    num_expert_group,
+                    topk_group,
                     scoring_func=scoring_func,
-                    renormalize=self.renormalize,
+                    renormalize=renormalize,
                     e_score_correction_bias=e_score_correction_bias,
                 )  # [E, t]
             else:
@@ -431,7 +421,7 @@ class RBLNMoERunner(MoERunner):
                 topk_weights = scores_t.gather(
                     0, selected_experts
                 )  # weights from original scores
-                if self.renormalize:
+                if renormalize:
                     topk_weights = topk_weights / topk_weights.sum(
                         dim=0, keepdim=True
                     ).clamp_min(1e-20)
@@ -442,15 +432,15 @@ class RBLNMoERunner(MoERunner):
                 masked_routing_weights = _apply_grouped_topk_torch(
                     router_logits_2d,
                     self.top_k,
-                    self.num_expert_group,
-                    self.topk_group,
+                    num_expert_group,
+                    topk_group,
                     scoring_func=scoring_func,
-                    renormalize=self.renormalize,
+                    renormalize=renormalize,
                     e_score_correction_bias=e_score_correction_bias,
                 )  # [E, t]
             else:
                 router_logits_t = router_logits_2d.transpose(0, 1)  # [E, t]
-                if self.renormalize:
+                if renormalize:
                     # post_norm: topk first, then softmax on selected values
                     topk_weights, selected_experts = torch.topk(
                         router_logits_t, k=self.top_k, dim=0
@@ -469,10 +459,10 @@ class RBLNMoERunner(MoERunner):
                 masked_routing_weights = _apply_grouped_topk_torch(
                     router_logits_2d,
                     self.top_k,
-                    self.num_expert_group,
-                    self.topk_group,
+                    num_expert_group,
+                    topk_group,
                     scoring_func=scoring_func,
-                    renormalize=self.renormalize,
+                    renormalize=renormalize,
                     e_score_correction_bias=e_score_correction_bias,
                 )  # [E, t]
             else:
@@ -480,7 +470,7 @@ class RBLNMoERunner(MoERunner):
                 topk_weights, selected_experts = torch.topk(
                     router_logits_t, k=self.top_k, dim=0
                 )
-                if self.renormalize:
+                if renormalize:
                     topk_weights = topk_weights / topk_weights.sum(
                         dim=0, keepdim=True
                     ).clamp_min(1e-20)
