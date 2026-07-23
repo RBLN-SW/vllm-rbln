@@ -17,7 +17,10 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
-from vllm_rbln.model_executor.models.optimum.base import ModelInputForRBLN
+from vllm_rbln.model_executor.models.optimum.base import (
+    ModelInputForRBLN,
+    PartialPrefixInfo,
+)
 from vllm_rbln.utils.optimum.registry import (
     _RBLN_MULTIMODAL_MODELS,
     is_enc_dec_arch,
@@ -35,9 +38,11 @@ from .idefics3 import RBLNOptimumIdefics3ForConditionalGeneration  # noqa: F401
 from .llava import RBLNOptimumLlavaForConditionalGeneration  # noqa: F401
 from .llava_next import RBLNOptimumLlavaNextForConditionalGeneration  # noqa: F401
 from .paligemma import RBLNOptimumPaliGemmaForConditionalGeneration  # noqa: F401
-from .qwen_vl import (  # noqa: F401
+from .qwen2_vl import (  # noqa: F401
     RBLNOptimumQwen2_5_VLForConditionalGeneration,
     RBLNOptimumQwen2VLForConditionalGeneration,
+)
+from .qwen3_vl import (  # noqa: F401
     RBLNOptimumQwen3VLForConditionalGeneration,
     RBLNOptimumQwen3VLMoeForConditionalGeneration,
 )
@@ -56,10 +61,6 @@ def load_model(vllm_config: VllmConfig) -> nn.Module:
     model_config = vllm_config.model_config
     logger.info("Loading RBLN model from %s", model_config.model)
     if is_multi_modal(model_config.hf_config):
-        assert vllm_config.cache_config.enable_prefix_caching in (False, None), (
-            "Prefix caching is not supported with multimodal models. "
-            "Please set `enable_prefix_caching` to False."
-        )
         architectures = getattr(model_config.hf_config, "architectures", [])
         if architectures[0] in _RBLN_OPTIMUM_MULTIMODAL_MODELS:
             rbln_model_arch = _RBLN_OPTIMUM_MULTIMODAL_MODELS[architectures[0]]
@@ -104,4 +105,9 @@ def load_model(vllm_config: VllmConfig) -> nn.Module:
     return rbln_model.eval()
 
 
-__all__ = ["load_model", "ModelInputForRBLN", "RBLNOptimumForEncoderModel"]
+__all__ = [
+    "load_model",
+    "ModelInputForRBLN",
+    "PartialPrefixInfo",
+    "RBLNOptimumForEncoderModel",
+]
