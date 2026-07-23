@@ -75,8 +75,11 @@ def _generate_model_path_name(
         "num_devices": num_devices,
         "memory_budget": memory_budget,
     }
-    if additional_config:
-        config_dict["rbln_config"] = _strip_runtime_only_keys(additional_config)
+    stripped_config = (
+        _strip_runtime_only_keys(additional_config) if additional_config else {}
+    )
+    if stripped_config:
+        config_dict["rbln_config"] = stripped_config
 
     config_json = json.dumps(config_dict, sort_keys=True, default=str)
     config_hash = hashlib.sha256(config_json.encode()).hexdigest()[:16]
