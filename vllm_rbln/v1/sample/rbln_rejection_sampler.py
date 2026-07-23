@@ -420,10 +420,9 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
             draft_per_batch[i, :n] = draft_token_ids[src_offset : src_offset + n]
             src_offset += n
 
-        if sampling_metadata.top_k is not None:
-            sampling_metadata.top_k = sampling_metadata.top_k.to(device=op_device)
-        if sampling_metadata.top_p is not None:
-            sampling_metadata.top_p = sampling_metadata.top_p.to(device=op_device)
+        # NOTE(RBLN): `sampling_metadata.top_k`/`top_p` are already on the input
+        # batch's device (`self.device`), which is exactly `op_device` in every
+        # mode, so no device conversion is needed here before the op call.
 
         # ------------------------------------------------------------------
         # 2) Call the NPU primitive.
