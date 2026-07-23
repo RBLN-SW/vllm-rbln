@@ -643,3 +643,16 @@ class RBLNOptimumQwen3VLMoeForConditionalGeneration(
     """
 
     pass
+
+
+class RBLNOptimumQwen3_5ForConditionalGeneration(
+    RBLNOptimumQwen3VLForConditionalGeneration
+):
+    """
+    Qwen3.5 (architecture ``Qwen3_5ForConditionalGeneration``) is natively
+    multimodal. This wrapper assumes it shares the Qwen3-VL input structure and
+    inherits from RBLNOptimumQwen3VLForConditionalGeneration unchanged; if the
+    optimum-rbln implementation diverges, override the input-builder hooks here.
+    """
+
+    pass
