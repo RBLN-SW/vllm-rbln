@@ -284,9 +284,15 @@ def _write_metrics_json(
     }
 
     try:
+        payload_str = json.dumps(payload, indent=2)
+    except (TypeError, ValueError) as e:
+        logger.warning("Failed to serialize metrics JSON: %s", e)
+        return
+
+    try:
         os.makedirs(envs.VLLM_RBLN_METRICS_DIR, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2)
+            f.write(payload_str)
     except OSError as e:
         logger.warning("Failed to write metrics JSON to %s: %s", path, e)
 
