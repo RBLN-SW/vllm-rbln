@@ -74,6 +74,7 @@ class RBLNBlockPool(BlockPool):
         self.cached_block_hash_to_block: RBLNBlockHashToBlockMap = (
             RBLNBlockHashToBlockMap()
         )
+        self.cached_block_hashes_by_block: dict[int, set[BlockHashWithGroupId]] = {}
 
         # To represent a placeholder block with block_id=0.
         # The ref_cnt of null_block is not maintained, needs special care to
