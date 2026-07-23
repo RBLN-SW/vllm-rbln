@@ -21,10 +21,16 @@ def get_param_paligemma(
     max_model_len: int,
     block_size: int,
     num_devices: int,
+    memory_budget: float,
     prefill_chunk_size: int | None = None,
 ) -> dict:
     language_model_config = get_language_model_config(
-        batch_size, max_model_len, block_size, num_devices, prefill_chunk_size
+        batch_size,
+        max_model_len,
+        block_size,
+        num_devices,
+        memory_budget,
+        prefill_chunk_size,
     )
     # paligemma pins its own prefill_chunk_size; this overrides the resolved one.
     language_model_config["prefill_chunk_size"] = 8192
