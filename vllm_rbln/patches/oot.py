@@ -32,17 +32,14 @@ def _register_fp8_block_kernel() -> None:
     from vllm.platforms import PlatformEnum
 
     from vllm_rbln.model_executor.kernels.linear.block_fp8 import (
+        RBLNW8A8BlockFp8LinearKernel,
         RBLNW8A16BlockFp8LinearKernel,
     )
 
     block_kernels = linear._POSSIBLE_FP8_BLOCK_KERNELS.setdefault(PlatformEnum.OOT, [])
-    if RBLNW8A16BlockFp8LinearKernel not in block_kernels:
-        block_kernels.insert(0, RBLNW8A16BlockFp8LinearKernel)
-
-        logger.debug(
-            "Registered RBLN FP8 block linear kernel for OOT platform: %s",
-            RBLNW8A16BlockFp8LinearKernel.__name__,
-        )
+    for kernel_cls in (RBLNW8A16BlockFp8LinearKernel, RBLNW8A8BlockFp8LinearKernel):
+        if kernel_cls not in block_kernels:
+            block_kernels.insert(0, kernel_cls)
 
 
 def _register_unpacked_wna16_linear_kernel() -> None:

@@ -70,6 +70,7 @@ def _generate_model_path_name(
     # on the same cache key. `scheduler_config.max_num_batched_tokens` is still
     # the vLLM default here, so read the raw user value instead.
     user_max_num_batched_tokens = get_user_max_num_batched_tokens(vllm_config)
+    memory_budget = vllm_config.cache_config.gpu_memory_utilization
 
     # FIXME: To avoid cache collisions, the cache key should also include
     # the versions of the compiler and optimum-rbln.
@@ -80,6 +81,7 @@ def _generate_model_path_name(
         "max_model_len": max_model_len,
         "num_devices": num_devices,
         "max_num_batched_tokens": user_max_num_batched_tokens,
+        "memory_budget": memory_budget,
     }
     if additional_config:
         config_dict["rbln_config"] = _strip_runtime_only_keys(additional_config)
