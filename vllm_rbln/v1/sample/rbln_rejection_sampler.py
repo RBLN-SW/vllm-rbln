@@ -341,12 +341,6 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         batch_size = len(num_draft_tokens)
         num_tokens = draft_token_ids.shape[0]
         vocab_size = target_probs.shape[-1]
-        cpu_device = "cpu"
-        op_device = (
-            target_probs.device if USE_DEVICE_TENSOR else torch.device(cpu_device)
-        )
-        draft_token_ids = draft_token_ids.to(cpu_device)
-        target_probs = target_probs.to(cpu_device)
         # NOTE(RBLN): The NPU `rbln::rejection_sample` primitive does not
         # handle the -1 placeholder draft id (used for grammar-invalid spec
         # tokens when structured output is combined with speculative decoding;
@@ -365,18 +359,20 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         assert bonus_token_ids.is_contiguous()
         assert target_probs.shape == (num_tokens, vocab_size)
 
+        device = target_probs.device
+
         # Output buffer (batch space). Unwritten slots stay as PLACEHOLDER.
         output_token_ids = torch.full(
             (batch_size, max_spec_len + 1),
             PLACEHOLDER_TOKEN_ID,
             dtype=torch.int64,  # Consistent with SamplerOutput.sampled_token_ids.
-            device=cpu_device,
+            device=device,
         )
 
         # `active_mask` is in batch space: True for rows with any draft.
         active_mask = torch.tensor(
             [n > 0 for n in num_draft_tokens],
-            device=cpu_device,
+            device=device,
             dtype=torch.bool,
         )  # [batch_size]
 
@@ -392,13 +388,13 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         reshaped_draft_token_ids = torch.zeros(
             batch_size * max_spec_len,
             dtype=torch.int32,
-            device=cpu_device,
+            device=device,
         )
         reshaped_target_probs = torch.zeros(
             batch_size * max_spec_len,
             vocab_size,
             dtype=target_probs.dtype,
-            device=cpu_device,
+            device=device,
         )
         reshaped_draft_token_ids[:N] = draft_token_ids
         reshaped_target_probs[:N] = target_probs
@@ -411,7 +407,7 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
             (batch_size, max_spec_len),
             PLACEHOLDER_TOKEN_ID,
             dtype=torch.int64,
-            device=cpu_device,
+            device=device,
         )
         src_offset = 0
         for i, n in enumerate(num_draft_tokens):
@@ -420,9 +416,8 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
             draft_per_batch[i, :n] = draft_token_ids[src_offset : src_offset + n]
             src_offset += n
 
-        # NOTE(RBLN): `sampling_metadata.top_k`/`top_p` are already on the input
-        # batch's device (`self.device`), which is exactly `op_device` in every
-        # mode, so no device conversion is needed here before the op call.
+        # NOTE(RBLN): `sampling_metadata.top_k`/`top_p` already live on the input
+        # batch's device (== `device` here), so they feed the op as-is.
 
         # ------------------------------------------------------------------
         # 2) Call the NPU primitive.
@@ -431,9 +426,6 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         #   num_accepted       : (B,)   int — per-batch number of accepted draft
         #                                     tokens (in [0, num_draft_tokens[i]]).
         # ------------------------------------------------------------------
-        reshaped_draft_token_ids = reshaped_draft_token_ids.to(op_device)
-        reshaped_target_probs = reshaped_target_probs.to(op_device)
-        cu_num_draft_tokens = cu_num_draft_tokens.to(op_device)
         recovered_token_ids, num_accepted = self._compiled_rejection_sample(
             reshaped_draft_token_ids,
             reshaped_target_probs,
@@ -441,8 +433,6 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
             sampling_metadata.top_k,
             sampling_metadata.top_p,
         )
-        recovered_token_ids = recovered_token_ids.to(cpu_device)
-        num_accepted = num_accepted.to(cpu_device)
 
         # ------------------------------------------------------------------
         # 3) Compose per-position output for the first K columns:
@@ -453,14 +443,14 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         num_accepted_per_batch = num_accepted.reshape(batch_size)
         positions = torch.arange(
             max_spec_len,
-            device=cpu_device,
+            device=device,
         ).unsqueeze(0)  # (1, K)
         # NOTE: all-accept is per-row: a row accepted ALL of ITS OWN drafts
         # (num_draft_tokens[i], which may be < max_spec_len).
         num_draft_tokens_t = torch.tensor(
             num_draft_tokens,
             dtype=num_accepted_per_batch.dtype,
-            device=cpu_device,
+            device=device,
         )
         all_accepted_active = (
             num_accepted_per_batch == num_draft_tokens_t
@@ -492,22 +482,20 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         # [batch_size, 1] -> [batch_size]
         # NOTE: boolean-mask index_put below requires dtype match (it does NOT
         # cast like basic-slice assignment), so cast to output_token_ids dtype.
-        bonus = bonus_token_ids.squeeze(-1).to(
-            dtype=output_token_ids.dtype, device=cpu_device
-        )
+        bonus = bonus_token_ids.squeeze(-1).to(dtype=output_token_ids.dtype)
 
         # 4a) Fully-accepted active rows: emit the bonus token right after the
         # row's own last draft (column num_draft_tokens[i], == max_spec_len
         # only for full rows) — mirrors the upstream Triton kernel.
-        batch_idx = torch.arange(batch_size, device=cpu_device)
+        batch_idx = torch.arange(batch_size, device=device)
         output_token_ids[
             batch_idx[all_accepted_active],
             num_draft_tokens_t[all_accepted_active],
         ] = bonus[all_accepted_active]
         # 4b) Inactive rows (no drafts): only the bonus token at col 0.
         output_token_ids[~active_mask, 0] = bonus[~active_mask]
-        result = output_token_ids.to(device=op_device, dtype=torch.int32)
-        return result
+
+        return output_token_ids.to(torch.int32)
 
     def apply_sampling_constraints(
         self,
