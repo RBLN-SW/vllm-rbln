@@ -5,11 +5,12 @@ Requirements:
 - Python **3.12** for this dev workflow (`rebel-compiler` nightly wheels are currently cp312-only; the package itself targets 3.10-3.13)
 - uv **>= 0.11.25** (`uv self update`) — enforced via `required-version` in `pyproject.toml`. Older uv writes `uv.lock` in a different serialization (repeats the `tool.uv.environments` marker on every dependency), so re-locking with it produces a ~900-line noise diff.
 
-Internal indexes require your **LDAP account** credentials (set once, e.g. in your shell profile):
+The internal indexes require your **LDAP account** credentials (set once, e.g. in your shell profile):
 
 ```bash
 export UV_INDEX_RBLN_NEXUS_NIGHTLY_USERNAME=<ldap-username>
 export UV_INDEX_RBLN_NEXUS_NIGHTLY_PASSWORD=<ldap-password>
+# pypi.rebellions.in — explicit-only index, used solely for rebel-compiler:
 export UV_INDEX_REBELLIONS_USERNAME=<ldap-username>
 export UV_INDEX_REBELLIONS_PASSWORD=<ldap-password>
 ```
@@ -49,6 +50,40 @@ Rules of thumb:
 - If you edited `pyproject.toml`, always run `uv lock` and commit `uv.lock` in the same PR — pre-commit rejects drift between the two.
 - CI installs with `uv sync --locked`, which fails if `uv.lock` doesn't match `pyproject.toml`.
 - Never edit `uv.lock` by hand.
+
+### Bumping a dependency
+
+Pick the variant that matches what you are changing — all of them keep every
+other package's pin untouched:
+
+```bash
+# Raise a range in pyproject.toml (e.g. optimum-rbln>=0.11.1a2 -> >=0.11.1a4):
+#   edit pyproject.toml, then re-lock. Plain `uv lock` only re-resolves what the
+#   edit invalidated; everything else keeps its pin.
+uv lock
+
+# Bump one package within its existing pyproject range (lock-only change):
+uv lock --upgrade-package optimum-rbln
+# or pin an exact version:
+uv lock --upgrade-package optimum-rbln==0.11.1a4
+```
+
+**Never run `uv lock --upgrade`** (full-graph refresh): it re-pins every package
+in the lock at once. Whole-graph refreshes need a dedicated PR and team review.
+
+### Installing a package from pypi.rebellions.in (ad-hoc, local only)
+
+`pypi.rebellions.in` is registered **explicit-only** in `pyproject.toml`:
+packages appear and disappear there independently of dev/main, so a lock refresh
+could pin versions that must not be used. Only `rebel-compiler` (pinned to it via
+`tool.uv.sources`) may resolve from it — no other package ever does. If you need
+another package that only exists there, install it into your venv ad-hoc — this
+never touches `uv.lock`:
+
+```bash
+uv pip install <package>==<version> \
+  --extra-index-url "https://<ldap-username>:<ldap-password>@pypi.rebellions.in/simple/"
+```
 
 ### rebel-compiler version policy
 
