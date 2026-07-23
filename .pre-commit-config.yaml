@@ -32,7 +32,7 @@ repos:
 #     exclude: '.*\.inc\.md'
 #     stages: [manual] # Only run in CI
 - repo: https://github.com/astral-sh/uv-pre-commit
-  rev: 0.9.1
+  rev: 0.11.31  # keep >= tool.uv.required-version in pyproject.toml
   hooks:
     - id: uv-lock
       args: ["--check"]
