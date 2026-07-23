@@ -346,16 +346,20 @@ class RBLNOptimumQwen3VLMoeForConditionalGeneration(
 
 
 class RBLNOptimumQwen3_5ForConditionalGeneration(
-    RBLNOptimumQwen3VLForConditionalGeneration
+    RBLNOptimumQwen2_5_VLForConditionalGeneration
 ):
     """
     Vision-language Qwen3.5 for RBLN.
 
-    Qwen3.5 IS Qwen3-VL minus deepstack: the same Qwen3-VL-style vision tower, mRoPE,
-    and video handling (no ``second_per_grid_ts``), but with a HYBRID text backbone
-    (GatedDeltaNet ``linear_attention`` layers + gated ``full_attention`` layers). So
-    it inherits ``_add_model_specific_args`` and ``_create_video_pixel_inputs`` from
-    Qwen3-VL unchanged; the ONLY structural difference is deepstack, handled below.
+    Qwen3.5 is "Qwen3-VL WITHOUT deepstack": a Qwen3-VL-style vision tower + mRoPE, but
+    a HYBRID text backbone (GatedDeltaNet ``linear_attention`` layers + gated
+    ``full_attention``). Its vision encoder returns ONLY the merged image embeds (a
+    single tensor, no deepstack tuple), so it inherits the non-deepstack multimodal /
+    prefill path from Qwen2.5-VL rather than the Qwen3-VL wrapper — whose
+    ``_process_image_input`` unpacks a ``(image_embeds, deepstack)`` 2-tuple and whose
+    prefill build packs deepstack, both of which break on Qwen3.5's single-tensor
+    visual output. The only thing Qwen3.5 changes vs Qwen2.5-VL is that it has no
+    ``second_per_grid_ts`` and names its placeholder ``image_token_id``.
 
     The ``linear_attention`` layers' ``conv_state``/``recurrent_state`` caches and the
     0/1 control masks (``conv_state_mask``/``recurrent_state_mask``/``valid_mask``) are
@@ -364,14 +368,28 @@ class RBLNOptimumQwen3_5ForConditionalGeneration(
     on-device paged KV cache.
     """
 
-    def _build_prefill_params(self, preprocess_outputs: tuple) -> dict:
-        # Qwen3.5 has NO deepstack
-        return {
-            "inputs_embeds": preprocess_outputs[0],
-            "position_embed": preprocess_outputs[1],
-            "rope_deltas": preprocess_outputs[2],
-        }
+    def _add_model_specific_args(self, preprocess_args: dict, video_input: Any):
+        # Qwen3.5 (like Qwen3-VL) has no ``second_per_grid_ts``; its ``get_rope_index``
+        # separates videos by timestamps instead.
+        pass
+
+    def _create_video_pixel_inputs(
+        self,
+        pixel_values_videos: torch.Tensor,
+        video_grid_thw: torch.Tensor,
+        second_per_grid_ts: torch.Tensor | None = None,
+    ):
+        # Qwen2.5-VL's version raises when ``second_per_grid_ts`` is None; Qwen3.5 never
+        # has it, so build the carrier without requiring it (mirrors Qwen3-VL).
+        return Qwen2_5_VLVideoPixelInputs(
+            type="pixel_values_videos",
+            pixel_values_videos=pixel_values_videos,
+            video_grid_thw=video_grid_thw,
+            second_per_grid_ts=second_per_grid_ts,
+        )
 
     def _image_token_id(self) -> int:
-        # Qwen3.5's HF config names the placeholder ``image_token_id``
+        # Qwen3.5's HF config names the placeholder ``image_token_id`` (top-level), not
+        # ``image_token_index`` as the mixin default assumes. Used by the prefill path's
+        # embed_input_ids() image-token scatter, so this must be correct.
         return self.model.config.image_token_id
