@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import vllm.envs as envs
 from vllm.v1.core.kv_cache_coordinator import UnitaryKVCacheCoordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.single_type_kv_cache_manager import get_manager_for_kv_cache_spec
@@ -35,6 +36,7 @@ class RBLNKVCacheCoordinator(UnitaryKVCacheCoordinator):
         enable_kv_cache_events: bool,
         dcp_world_size: int,
         pcp_world_size: int,
+        scheduler_block_size: int,
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
         is_encoder_decoder: bool = False,
@@ -42,6 +44,12 @@ class RBLNKVCacheCoordinator(UnitaryKVCacheCoordinator):
         self.kv_cache_config = kv_cache_config
         self.max_model_len = max_model_len
         self.enable_caching = enable_caching
+        self.scheduler_block_size = scheduler_block_size
+        assert envs.VLLM_PREFIX_CACHE_RETENTION_INTERVAL is None, (
+            "VLLM_PREFIX_CACHE_RETENTION_INTERVAL is not supported on the RBLN "
+            "optimum path. Leave it unset."
+        )
+        self.retention_interval = None
 
         self.block_pool = RBLNBlockPool(
             kv_cache_config.num_blocks,
@@ -67,6 +75,7 @@ class RBLNKVCacheCoordinator(UnitaryKVCacheCoordinator):
                 block_pool=self.block_pool,
                 enable_caching=enable_caching,
                 kv_cache_group_id=i,
+                scheduler_block_size=scheduler_block_size,
                 dcp_world_size=dcp_world_size,
                 pcp_world_size=pcp_world_size,
             )
