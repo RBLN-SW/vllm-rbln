@@ -744,8 +744,7 @@ class RBLNKVCacheManager(KVCacheManager):
                     ),
                     gid,
                 )
-                assert blk.block_hash is None
-                blk.block_hash = synthetic_hash
+                blk.set_block_hash(synthetic_hash, num_tokens=num_computed_tokens)
                 self.block_pool.cached_block_hash_to_block.insert(synthetic_hash, blk)
 
     def _on_block_evicted(self, block_id: int) -> None:

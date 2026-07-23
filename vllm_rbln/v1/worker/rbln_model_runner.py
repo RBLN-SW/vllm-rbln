@@ -1624,6 +1624,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             assert isinstance(sampled_token_ids, list)
             assert isinstance(self.drafter, NgramProposer)
             draft_token_ids = self.drafter.propose(
+                self.num_spec_tokens,
                 sampled_token_ids,
                 self.input_batch.num_tokens_no_spec,
                 self.input_batch.token_ids_cpu,

@@ -17,12 +17,12 @@ from torch.nn.parameter import Parameter
 from vllm import _custom_ops as ops
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.fused_moe import (
-    FusedMoE,
     FusedMoEMethodBase,
     FusedMoeWeightScaleSupported,
     modular_kernel,
 )
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     all_close_1d,
@@ -341,7 +341,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.rocm_aiter_moe_enabled = False
 
     def process_weights_after_loading(self, layer):
-        assert isinstance(layer, FusedMoE)
+        assert isinstance(layer, RoutedExperts)
         # Lazy import to avoid importing triton too early.
 
         # TODO (rob): refactor block quant into separate class.
@@ -451,7 +451,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
     def apply(
         self,
-        layer: FusedMoE,
+        layer: RoutedExperts,
         x: torch.Tensor,
         router_logits: torch.Tensor,
         **kwargs: object,
