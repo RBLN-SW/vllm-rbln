@@ -148,7 +148,10 @@ class RBLNEagleProposer(EagleProposer):
             draft_tokens_ids = logits[:num_reqs].argmax(dim=-1)
             return draft_tokens_ids.view(-1, 1)
 
-        positions = target_positions[token_indices_to_sample_padded]
+        assert token_indices_to_sample_padded is not None
+        positions = target_positions[
+            token_indices_to_sample_padded.to(target_positions.device)
+        ]
 
         draft_token_ids = logits[:num_reqs].argmax(dim=-1)
 
@@ -168,7 +171,7 @@ class RBLNEagleProposer(EagleProposer):
         common_attn_metadata.num_actual_tokens = num_reqs
         common_attn_metadata.max_query_len = 1
         common_attn_metadata.query_start_loc = self.arange[: num_reqs + 1]
-        common_attn_metadata.query_start_loc_cpu = common_attn_metadata.query_start_loc
+        common_attn_metadata.query_start_loc_cpu = self.arange[: num_reqs + 1].cpu()
 
         # In padded drafter batch, we need to adjust the sequence lengths
         # to remove the "padding" (i.e. rejected tokens).
