@@ -29,7 +29,7 @@ def _vllm_config(user_max_num_batched_tokens=None):
             model="meta-llama/Llama-3.1-8B", max_model_len=8192
         ),
         scheduler_config=SimpleNamespace(max_num_seqs=4),
-        cache_config=SimpleNamespace(block_size=8192),
+        cache_config=SimpleNamespace(block_size=8192, gpu_memory_utilization=0.9),
         additional_config=additional_config,
     )
 
