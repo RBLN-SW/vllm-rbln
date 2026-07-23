@@ -142,12 +142,10 @@ required-version = ">=0.11.25"
 environments = [
     "sys_platform == 'linux' and platform_machine == 'x86_64'"
 ]
-# pypi.rebellions.in is explicit-only: packages appear/disappear there
-# independently of dev/main, so a full lock refresh could pin versions that must
-# not be used. Only rebel-compiler (pinned via tool.uv.sources below — its fresh
-# nightlies are often not on nexus yet) may resolve from it; nothing else ever
-# does. For ad-hoc local installs from it, use --extra-index-url (see
-# DEVELOPMENT.md).
+# pypi.rebellions.in is intentionally NOT registered: packages appear/disappear
+# there independently of dev/main, so a full lock refresh could pin versions that
+# must not be used. Install packages from it ad-hoc via --extra-index-url instead
+# (see DEVELOPMENT.md).
 # Exact reproduction is uv.lock's job — installs without the lock are out of contract.
 index-strategy = "unsafe-best-match"
 prerelease = "if-necessary-or-explicit"   # pin uv's default explicitly — prereleases only for packages with a marker (or prerelease-only packages)
@@ -167,16 +165,10 @@ name = "rbln-nexus-nightly"
 url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/"
 
 [[tool.uv.index]]
-name = "rebellions"
-url = "https://pypi.rebellions.in/simple/"
-explicit = true
-
-[[tool.uv.index]]
 name = "rbln-release"
 url = "https://pypi.rbln.ai/simple/"
 
 [tool.uv.sources]
-rebel-compiler = { index = "rebellions" }
 vllm = { index = "vllm-cpu" }
 torch = { index = "pytorch-cpu" }
 torchvision = { index = "pytorch-cpu" }

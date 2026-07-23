@@ -1,18 +1,15 @@
 # 🛠️ Development setup (uv)
 
 Requirements:
-- Linux x86_64 with access to the internal network (Nexus / internal PyPI)
+- Linux x86_64 with access to the internal network (Nexus)
 - Python **3.12** for this dev workflow (`rebel-compiler` nightly wheels are currently cp312-only; the package itself targets 3.10-3.13)
 - uv **>= 0.11.25** (`uv self update`) — enforced via `required-version` in `pyproject.toml`. Older uv writes `uv.lock` in a different serialization (repeats the `tool.uv.environments` marker on every dependency), so re-locking with it produces a ~900-line noise diff.
 
-The internal indexes require your **LDAP account** credentials (set once, e.g. in your shell profile):
+The Nexus index requires your **LDAP account** credentials (set once, e.g. in your shell profile):
 
 ```bash
 export UV_INDEX_RBLN_NEXUS_NIGHTLY_USERNAME=<ldap-username>
 export UV_INDEX_RBLN_NEXUS_NIGHTLY_PASSWORD=<ldap-password>
-# pypi.rebellions.in — explicit-only index, used solely for rebel-compiler:
-export UV_INDEX_REBELLIONS_USERNAME=<ldap-username>
-export UV_INDEX_REBELLIONS_PASSWORD=<ldap-password>
 ```
 
 > `rbln-release` (pypi.rbln.ai) uses a separate account system; credentials for it are only needed if the lock ever resolves packages from that index.
@@ -81,12 +78,12 @@ in the lock at once. Whole-graph refreshes need a dedicated PR and team review.
 
 ### Installing a package from pypi.rebellions.in (ad-hoc, local only)
 
-`pypi.rebellions.in` is registered **explicit-only** in `pyproject.toml`:
-packages appear and disappear there independently of dev/main, so a lock refresh
-could pin versions that must not be used. Only `rebel-compiler` (pinned to it via
-`tool.uv.sources`) may resolve from it — no other package ever does. If you need
-another package that only exists there, install it into your venv ad-hoc — this
-never touches `uv.lock`:
+`pypi.rebellions.in` is deliberately **not** registered as an index in
+`pyproject.toml`: packages appear and disappear there independently of dev/main,
+so a lock refresh could pin versions that must not be used (only builds published
+to nexus may be pinned — see the rebel-compiler version policy below). If you need
+a package that only exists there, install it into your venv ad-hoc — this never
+touches `uv.lock`:
 
 ```bash
 uv pip install <package>==<version> \
