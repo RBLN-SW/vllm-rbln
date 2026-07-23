@@ -21,17 +21,27 @@ from vllm.model_executor.models.idefics3 import (
     Idefics3ImagePixelInputs,
     ImageInputs,
 )
-from vllm.model_executor.models.interfaces import SupportsMultiModal
 
 from .base import ModelInputForRBLN
-from .model_base import RBLNOptimumDecoderMixin, RBLNOptimumModelBase
+from .model_base import (
+    RBLNOptimumDecoderMixin,
+    RBLNOptimumModelBase,
+    RBLNOptimumMultimodalMixin,
+)
 
 logger = init_logger(__name__)
 
 
 class RBLNOptimumIdefics3ForConditionalGeneration(
-    RBLNOptimumModelBase, RBLNOptimumDecoderMixin, SupportsMultiModal
+    RBLNOptimumModelBase, RBLNOptimumMultimodalMixin, RBLNOptimumDecoderMixin
 ):
+    @classmethod
+    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
+        if modality.startswith("image"):
+            return "<image>"
+
+        raise ValueError("Only image modality is supported")
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -62,27 +72,16 @@ class RBLNOptimumIdefics3ForConditionalGeneration(
         )
 
         if is_prompt:
-            if model_input.multi_modal_kwargs:
-                image_input = self._parse_and_validate_image_input(
-                    **model_input.multi_modal_kwargs
-                )
-
-            # Only when image input is given
-            if image_input is not None:
-                pixel_values = image_input["pixel_values"].unsqueeze(0)
-                pixel_attention_mask = image_input["pixel_attention_mask"].unsqueeze(0)
-            else:
-                pixel_values = None
-                pixel_attention_mask = None
-
             block_tables = kwargs.pop("block_tables")
             input_ids = kwargs.pop("input_ids")
             cache_position = kwargs.pop("cache_position")
 
-            inputs_embeds = self.model._preprocess_prefill(
-                input_ids=input_ids,
-                pixel_values=pixel_values,
-                pixel_attention_mask=pixel_attention_mask,
+            multimodal_embeddings = self.embed_multimodal(
+                **(model_input.multi_modal_kwargs or {})
+            )
+            inputs_embeds = self.embed_input_ids(
+                input_ids,
+                multimodal_embeddings or None,
             )
             logits = self.model.text_model.prefill_decoder(
                 inputs_embeds=inputs_embeds,
@@ -98,6 +97,30 @@ class RBLNOptimumIdefics3ForConditionalGeneration(
         if not is_prompt:
             logits = logits[:request_nums]
         return logits
+
+    def get_language_model(self):
+        return self.model.text_model
+
+    def _process_image_input(self, image_input: ImageInputs) -> list[torch.Tensor]:
+        if image_input["type"] == "image_embeds":
+            return list(image_input["data"])
+
+        # Vision model + pixel-shuffle connector, compiled by optimum-rbln.
+        # get_image_features expects a leading batch dim
+        # (batch_size, num_images, num_channels, height, width).
+        pixel_values = image_input["pixel_values"].unsqueeze(0)
+        pixel_attention_mask = image_input["pixel_attention_mask"].unsqueeze(0)
+        image_features = self.model.get_image_features(
+            pixel_values=pixel_values,
+            pixel_attention_mask=pixel_attention_mask,
+        )
+        return list(image_features)
+
+    def _image_token_id(self) -> int:
+        # Idefics3Config exposes only `image_token_id` (no `image_token_index`
+        # attribute_map alias, unlike PaliGemma/Gemma3/LLaVA), so the mixin
+        # default would raise AttributeError here.
+        return self.model.config.image_token_id
 
     def _validate_pixel_values(self, data: torch.Tensor) -> torch.Tensor:
         h = w = self.model.config.vision_config.image_size

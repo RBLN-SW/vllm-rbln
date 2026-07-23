@@ -16,21 +16,31 @@ from typing import Any, Union
 import torch
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.model_executor.models.llava_next import (
     LlavaNextImageInputs,
     LlavaNextImagePixelInputs,
 )
 
 from .base import ModelInputForRBLN, version_error
-from .model_base import RBLNOptimumDecoderMixin, RBLNOptimumModelBase
+from .model_base import (
+    RBLNOptimumDecoderMixin,
+    RBLNOptimumModelBase,
+    RBLNOptimumMultimodalMixin,
+)
 
 logger = init_logger(__name__)
 
 
 class RBLNOptimumLlavaNextForConditionalGeneration(
-    RBLNOptimumModelBase, RBLNOptimumDecoderMixin, SupportsMultiModal
+    RBLNOptimumModelBase, RBLNOptimumMultimodalMixin, RBLNOptimumDecoderMixin
 ):
+    @classmethod
+    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
+        if modality.startswith("image"):
+            return "<image>"
+
+        raise ValueError("Only image modality is supported")
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -48,46 +58,18 @@ class RBLNOptimumLlavaNextForConditionalGeneration(
             num_blocks=self.kv_block_adapter._estimated_num_blocks(),
         )
 
-    def merge_multimodal_embeddings(
-        self,
-        input_ids: torch.Tensor,
-        inputs_embeds: torch.Tensor,
-        multimodal_embeddings: torch.Tensor,
-        placeholder_token_id: int,
-    ) -> torch.Tensor:
-        mask = input_ids == placeholder_token_id
-        num_expected_tokens = mask.sum().item()
-
-        if multimodal_embeddings.shape[0] != num_expected_tokens:
-            raise ValueError(
-                f"Attempted to assign {inputs_embeds[mask].shape}"
-                f" = {multimodal_embeddings.shape} "
-                f"multimodal tokens to {num_expected_tokens} placeholders"
-            )
-
-        inputs_embeds[mask] = multimodal_embeddings
-        return inputs_embeds
-
     def _forward(
         self,
         is_prefill: bool,
         block_tables: torch.Tensor,
         input_ids: torch.LongTensor = None,
-        pixel_values: torch.FloatTensor | None = None,
-        image_sizes: torch.LongTensor | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
         cache_position: Union[
             list[torch.Tensor], torch.Tensor
         ] = None,  # vllm keyword argument
         **kwargs,
     ):
         if is_prefill:
-            # NOTE inputs_embeds will be generated inside _preprocess_prefill
-            inputs_embeds = self.model._preprocess_prefill(
-                input_ids=input_ids,
-                pixel_values=pixel_values,
-                image_sizes=image_sizes,
-            )
-
             if self.model.language_model.prefill_decoder is None:
                 raise version_error
 
@@ -117,18 +99,6 @@ class RBLNOptimumLlavaNextForConditionalGeneration(
 
         request_nums = input_ids.shape[0]
 
-        if model_input.multi_modal_kwargs:
-            image_input = self._parse_and_validate_image_input(
-                **model_input.multi_modal_kwargs
-            )
-            if image_input is not None:
-                assert image_input["type"] == "pixel_values"
-                pixel_values = image_input["pixel_values"]
-                image_sizes = image_input["image_sizes"]
-        else:
-            pixel_values = None
-            image_sizes = None
-
         kwargs = self.preprocess_for_decoder(
             is_prompt, block_tables, input_ids, cache_position
         )
@@ -141,18 +111,55 @@ class RBLNOptimumLlavaNextForConditionalGeneration(
                 padded_batch_size
             ]
 
+        inputs_embeds = None
+        if is_prompt:
+            multimodal_embeddings = self.embed_multimodal(
+                **(model_input.multi_modal_kwargs or {})
+            )
+            inputs_embeds = self.embed_input_ids(
+                input_ids,
+                multimodal_embeddings or None,
+            )
+
         logits = self._forward(
             is_prefill=is_prompt,
             block_tables=block_tables,
             input_ids=input_ids,
-            pixel_values=pixel_values,
-            image_sizes=image_sizes,
+            inputs_embeds=inputs_embeds,
             cache_position=cache_position,
         )
 
         if not is_prompt:
             logits = logits[:request_nums]
         return logits
+
+    def get_language_model(self):
+        return self.model.language_model
+
+    def _process_image_input(
+        self, image_input: LlavaNextImageInputs
+    ) -> list[torch.Tensor]:
+        pixel_values = image_input["pixel_values"]
+        image_sizes = image_input["image_sizes"]
+        config = self.model.config
+
+        # Vision tower + multi-modal projector, compiled by optimum-rbln.
+        # Returns a tuple of per-image features split by num_patches.
+        image_features = self.model.get_image_features(
+            pixel_values,
+            image_sizes,
+            vision_feature_layer=config.vision_feature_layer,
+            vision_feature_select_strategy=config.vision_feature_select_strategy,
+        )
+        # spatial_unpad merge + image_newline insertion. Returns the flattened
+        # features for all images plus the per-image token counts.
+        image_features, feature_lens = self.model.pack_image_features(
+            image_features,
+            image_sizes,
+            vision_feature_select_strategy=config.vision_feature_select_strategy,
+            image_newline=self.model.image_newline,
+        )
+        return list(torch.split(image_features, feature_lens.tolist()))
 
     def _parse_and_validate_image_input(
         self, **kwargs: Any

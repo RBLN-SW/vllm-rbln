@@ -15,14 +15,14 @@
 import asyncio
 
 import fire
-from datasets import load_dataset
 from transformers import AutoTokenizer
 from vllm import AsyncEngineArgs, AsyncLLMEngine, SamplingParams
 
 
 def generate_prompts(batch_size: int):
+    from datasets import load_dataset
+
     images = []
-    texts = []
     dataset = (
         load_dataset("takara-ai/image_captions", split="train", streaming=True)
         .take(batch_size)
@@ -42,14 +42,14 @@ def generate_prompts(batch_size: int):
     ]
 
 
-async def generate(engine: AsyncLLMEngine, tokenizer, request_id, request):
+async def generate(engine: AsyncLLMEngine, eos_token_id, request_id, request):
     results_generator = engine.generate(
         request,
         SamplingParams(
             temperature=0,
             ignore_eos=False,
             skip_special_tokens=True,
-            stop_token_ids=[tokenizer.eos_token_id],
+            stop_token_ids=[eos_token_id],
             max_tokens=200,
         ),
         str(request_id),
@@ -62,19 +62,18 @@ async def generate(engine: AsyncLLMEngine, tokenizer, request_id, request):
 
 
 async def main(
-    num_input_prompt: int,
+    inputs: list,
     model_id: str,
+    eos_token_id: int,
 ):
     engine_args = AsyncEngineArgs(model=model_id)
 
     engine = AsyncLLMEngine.from_engine_args(engine_args)
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-    inputs = generate_prompts(num_input_prompt)
 
     futures = []
     for request_id, request in enumerate(inputs):
         futures.append(
-            asyncio.create_task(generate(engine, tokenizer, request_id, request))
+            asyncio.create_task(generate(engine, eos_token_id, request_id, request))
         )
 
     results = await asyncio.gather(*futures)
@@ -90,10 +89,13 @@ def entry_point(
     num_input_prompt: int = 10,
     model_id: str = "./paligemma2_b2",
 ):
+    inputs = generate_prompts(num_input_prompt)
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
     asyncio.run(
         main(
-            num_input_prompt=num_input_prompt,
+            inputs=inputs,
             model_id=model_id,
+            eos_token_id=tokenizer.eos_token_id,
         )
     )
 

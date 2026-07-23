@@ -78,6 +78,7 @@ class RBLNOptimumScheduler(Scheduler):
         kv_cache_config: KVCacheConfig,
         structured_output_manager: StructuredOutputManager,
         block_size: int,
+        hash_block_size: int | None = None,
         mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
         include_finished_set: bool = False,
         log_stats: bool = False,
@@ -136,6 +137,8 @@ class RBLNOptimumScheduler(Scheduler):
                 config=self.vllm_config, role=ECConnectorRole.SCHEDULER
             )
 
+        self._pending_free_mm_hashes: list[str] = []
+
         num_gpu_blocks = self.cache_config.num_gpu_blocks
         assert num_gpu_blocks is not None and num_gpu_blocks > 0
 
@@ -177,23 +180,52 @@ class RBLNOptimumScheduler(Scheduler):
             attn_block_size = self.vllm_config.additional_config["attn_block_size"]
         else:
             attn_block_size = None
+        # gemma3/gemma4: optimum-rbln's chunked prefill touches extra KV-cache
+        # slots beyond the prompt (partition-alignment + trailing chunk
+        # write-extent), so `allocate_slots` must reserve them. `prefill_chunk_size`
+        # is persisted into `additional_config` during `sync_vllm_and_optimum`.
+        archs = getattr(vllm_config.model_config.hf_config, "architectures", None) or []
+        needs_chunked_prefill_pad = any("Gemma3" in a or "Gemma4" in a for a in archs)
+        prefill_chunk_size = None
+        image_prefill_chunk_size = None
+        if needs_chunked_prefill_pad and vllm_config.additional_config is not None:
+            prefill_chunk_size = vllm_config.additional_config.get("prefill_chunk_size")
+            image_prefill_chunk_size = vllm_config.additional_config.get(
+                "image_prefill_chunk_size"
+            )
+
+        # Create the KV cache manager.
+        if hash_block_size is None:
+            hash_block_size = block_size
         self.kv_cache_manager = RBLNKVCacheManager(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
+            max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
             enable_caching=self.cache_config.enable_prefix_caching,
             use_eagle=False,
             log_stats=self.log_stats,
             enable_kv_cache_events=False,
             dcp_world_size=1,
             pcp_world_size=1,
-            hash_block_size=self.block_size,
+            hash_block_size=hash_block_size,
             metrics_collector=self.kv_metrics_collector,
             attn_block_size=attn_block_size,
             max_num_seqs=self.max_num_running_reqs,
+            is_encoder_decoder=self.is_encoder_decoder,
+            prefill_chunk_size=prefill_chunk_size,
+            image_prefill_chunk_size=image_prefill_chunk_size,
+            needs_chunked_prefill_pad=needs_chunked_prefill_pad,
         )
         self.perf_metrics: ModelMetrics | None = None
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
             self.perf_metrics = ModelMetrics(vllm_config)
+
+        # NOTE(vllm 0.22): inherited _update_after_schedule/update_from_output
+        # read this attribute. Always False on RBLN (no routed-experts return).
+        if vllm_config.model_config.enable_return_routed_experts:
+            raise NotImplementedError("enable_return_routed_experts is not supported.")
+
+        self.enable_return_routed_experts = False
         # Encoder-related.
         # It is not used in RBLN.
         # But for reuse original functions(e.g. free_request) in vLLM,
@@ -366,6 +398,15 @@ class RBLNOptimumScheduler(Scheduler):
                     # Update the block table to the return output.
                     self.update_block_table_dict(request, block_table_dict)
 
+                if request.prefill_stats is not None:
+                    num_local_cached_tokens = sum(cached_length)
+                    assert num_local_cached_tokens <= request.num_prompt_tokens
+                    request.prefill_stats.set(
+                        num_prompt_tokens=request.num_prompt_tokens,
+                        num_local_cached_tokens=num_local_cached_tokens,
+                        num_external_cached_tokens=0,
+                    )
+
                 # Request was already popped from self.waiting
                 # unless it was re-added above due to new_blocks being None.
                 request = request_queue.pop_request()
@@ -395,10 +436,6 @@ class RBLNOptimumScheduler(Scheduler):
                 # by prefix caching may cause incorrect computation
                 # of new_blocks during the decode phase.
                 request.num_computed_tokens = 0
-                # NOTE(fix): num_cached_tokens defaults to -1.
-                # It is used for logging and metrics.
-                if request.num_cached_tokens < 0:
-                    request.num_cached_tokens = request.num_computed_tokens
 
                 # EC Connector: track multimodal features that need remote
                 # loading or local encoding for this request.
@@ -534,7 +571,14 @@ class RBLNOptimumScheduler(Scheduler):
         self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
 
         # Calculate the dummy block index.
-        if self.cache_config.enable_prefix_caching:
+        if self.is_encoder_decoder:
+            # Whisper requires a dummy block as scratch space to pad the
+            # decoder's block table during the prefill step.
+            # The dummy block is pinned to the last block in the pool, which
+            # is removed from the free queue and never allocated to a real
+            # request.
+            dummy_block = self.kv_cache_manager.get_dummy_block()
+        elif self.cache_config.enable_prefix_caching:
             num_decode_reqs = len(scheduled_running_reqs)
             if num_decode_reqs > 0 and num_decode_reqs < self.max_num_running_reqs:
                 dummy_block = self.kv_cache_manager.get_dummy_block()
@@ -553,7 +597,7 @@ class RBLNOptimumScheduler(Scheduler):
             # It contains the request IDs that are finished in between
             # the previous and the current steps.
             finished_req_ids=self.finished_req_ids,
-            free_encoder_mm_hashes=[],
+            free_encoder_mm_hashes=self._pending_free_mm_hashes,
             new_block_ids_to_zero=None,  # It is used for Mamba models
             block_table_dict=block_table_dict,
             cached_block_table=cached_block_table,
@@ -579,7 +623,21 @@ class RBLNOptimumScheduler(Scheduler):
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
         # self._update_after_schedule(scheduler_output)
+
+        self._pending_free_mm_hashes = []
         return scheduler_output
+
+    def _free_request(self, request: Request, delay_free_blocks: bool = False):
+        # Capture mm hashes and notify the EC connector before super()
+        # tears the request down — base._free_blocks deletes self.requests[id]
+        # so we can't recover mm_features afterwards.
+        if request.mm_features:
+            if self.ec_connector is not None:
+                self.ec_connector.request_finished(request)
+            self._pending_free_mm_hashes.extend(
+                f.identifier for f in request.mm_features
+            )
+        return super()._free_request(request, delay_free_blocks=delay_free_blocks)
 
     def update_block_table_dict(
         self, request: Request, block_table_dict: dict[str, torch.Tensor]

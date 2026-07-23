@@ -34,12 +34,11 @@ from vllm.v1.core.kv_cache_utils import get_uniform_page_size
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheSpec
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
-from vllm.v1.worker.worker_base import WorkerBase
+from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
-from vllm_rbln.utils.optimum.cache_blocks import sync_num_blocks
-from vllm_rbln.utils.optimum.rbln_params import get_rbln_params
+from vllm_rbln.utils.optimum.converter import RBLNParams, update_num_blocks
 from vllm_rbln.v1.worker.optimum_model_runner import RBLNOptimumModelRunner
 from vllm_rbln.v1.worker.utils import set_omp_num_threads
 
@@ -193,11 +192,16 @@ class RBLNOptimumWorker(WorkerBase):
         # the number of blocks is not set in the vLLM config yet.
         # Therefore, we need to update it here.
         if not self.model_runner.vllm_config.cache_config.num_gpu_blocks:
-            num_blocks, _, _, _, _ = get_rbln_params(
-                self.model_runner.vllm_config, self.model_runner.model.rbln_model_config
+            params = RBLNParams.from_rbln_config(
+                self.model_runner.vllm_config,
+                self.model_runner.model.rbln_model_config,
             )
-            sync_num_blocks(self.model_runner.vllm_config, num_blocks)
-
+            assert params.num_blocks is not None, (
+                "num_blocks must be specified in rbln_config.json"
+            )
+            update_num_blocks(self.model_runner.vllm_config, params.num_blocks)
+        # num_gpu_blocks must be set after update_num_blocks is called.
+        num_gpu_blocks = adapter.get_available_num_blocks()
         validation_blocks = self.model_runner.vllm_config.cache_config.num_gpu_blocks
         # This will be removed after validation check
         assert num_gpu_blocks == validation_blocks, (
@@ -256,10 +260,16 @@ class RBLNOptimumWorker(WorkerBase):
                     self.profiler.key_averages().table(sort_by="self_cuda_time_total")
                 )
 
-    def load_model(self):
+    def load_model(self, *, load_dummy_weights: bool = False):
         self.model_runner.load_model()
 
-    def compile_or_warm_up_model(self) -> None:
+    def compile_or_warm_up_model(self) -> CompilationTimes:
+        # NOTE(vllm 0.22): the executor unconditionally accesses
+        # `.language_model` / `.encoder` on the returned value, so we must
+        # return a CompilationTimes instead of None.
+        # FIXME include auto compile time
+        compilation_times = CompilationTimes(language_model=0.0, encoder=0.0)
+
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
@@ -267,16 +277,17 @@ class RBLNOptimumWorker(WorkerBase):
         # EC producer has no decoder — skip warmup entirely.
         if self.model_runner.is_ec_producer_only:
             logger.info("EC producer: skipping warmup (no decoder).")
-            return
+            return compilation_times
 
         if not envs.VLLM_RBLN_ENABLE_WARM_UP:
             logger.info(
                 "Warm up is disabled. Set VLLM_RBLN_ENABLE_WARM_UP=1 to enable warm up."
             )
-            return
+            return compilation_times
 
         logger.info("Running dummy warm up.")
         self.model_runner.dummy_sampler_run()
+        return compilation_times
 
     def get_model(self) -> nn.Module:
         return self.model_runner.get_model()

@@ -16,81 +16,90 @@
 
 from __future__ import annotations
 
-import gc
+import pytest
+from vllm import SamplingParams
 
-from vllm import LLM, SamplingParams
-
+from ...utils import managed_llm
 from .utils import (
     DEFAULT_MEDUSA_MODEL_ID,
     DEFAULT_MODEL_ID,
+    assert_spec_matches_base_within_noise,
     ensure_converted_medusa_adapter,
+    make_batch_prompts,
 )
 
-PROMPTS = [
-    "The capital of France is",
-]
+# Batch sizes to exercise: batch=1 covers the single-sequence path, while
+# batch=8/16 exercises the wider verify-kernel shapes where bf16 rounding can
+# differ from the base path.
+BATCH_SIZES = [1, 8, 16]
 
 
-def _build_base_llm() -> LLM:
-    return LLM(
-        model=DEFAULT_MODEL_ID,
-        max_model_len=2048,
-        block_size=1024,
-        enable_chunked_prefill=True,
-        max_num_batched_tokens=256,
-        max_num_seqs=1,
-        disable_log_stats=False,
-        tensor_parallel_size=1,
-    )
+def _base_llm_kwargs(max_num_seqs: int) -> dict:
+    return {
+        "model": DEFAULT_MODEL_ID,
+        "max_model_len": 2048,
+        "block_size": 1024,
+        "enable_chunked_prefill": True,
+        "max_num_batched_tokens": 256,
+        "max_num_seqs": max_num_seqs,
+        "disable_log_stats": False,
+        "tensor_parallel_size": 1,
+    }
 
 
-def _build_medusa_llm() -> LLM:
+def _medusa_llm_kwargs(max_num_seqs: int) -> dict:
     medusa_model_id, num_speculative_tokens = ensure_converted_medusa_adapter(
         medusa_model_id=DEFAULT_MEDUSA_MODEL_ID,
         base_model_id=DEFAULT_MODEL_ID,
     )
-    return LLM(
-        model=DEFAULT_MODEL_ID,
-        max_model_len=2048,
-        block_size=1024,
-        enable_chunked_prefill=True,
-        max_num_batched_tokens=256,
-        max_num_seqs=1,
-        speculative_config={
+    return {
+        "model": DEFAULT_MODEL_ID,
+        "max_model_len": 2048,
+        "block_size": 1024,
+        "enable_chunked_prefill": True,
+        "max_num_batched_tokens": 256,
+        "max_num_seqs": max_num_seqs,
+        "speculative_config": {
             "method": "medusa",
             "model": medusa_model_id,
             "num_speculative_tokens": num_speculative_tokens,
         },
-        disable_log_stats=False,
-        tensor_parallel_size=1,
-    )
+        "disable_log_stats": False,
+        "tensor_parallel_size": 1,
+    }
 
 
-def test_medusa_matches_base_generation() -> None:
+@pytest.mark.parametrize("batch_size", BATCH_SIZES)
+def test_medusa_matches_base_generation(
+    monkeypatch: pytest.MonkeyPatch, batch_size: int
+) -> None:
     sampling_params = SamplingParams(
         temperature=0.0,
         top_p=1.0,
         max_tokens=8,
         ignore_eos=True,
     )
+    prompts = make_batch_prompts(batch_size)
 
-    base_llm = _build_base_llm()
-    base_outputs = base_llm.generate(PROMPTS, sampling_params=sampling_params)
-    # Release the baseline engine before compiling the Medusa variant.
-    del base_llm
-    gc.collect()
+    # Generate with Medusa speculative decoding first, then teacher-force the
+    # resulting tokens through the base model and check, at every position,
+    # that each spec token is the base model's greedy choice (up to bf16
+    # near-tie flips). Only one engine is alive at a time to bound memory:
+    # managed_llm shuts the medusa engine down deterministically before the
+    # base engine is built.
+    with managed_llm(
+        monkeypatch, **_medusa_llm_kwargs(max_num_seqs=batch_size)
+    ) as medusa_llm:
+        spec_reqs = medusa_llm.generate(prompts, sampling_params=sampling_params)
+        captured = [
+            (list(req.prompt_token_ids), list(req.outputs[0].token_ids))
+            for req in spec_reqs
+        ]
 
-    medusa_llm = _build_medusa_llm()
-    medusa_outputs = medusa_llm.generate(PROMPTS, sampling_params=sampling_params)
-
-    assert len(base_outputs) == len(medusa_outputs)
-
-    for base_output, medusa_output in zip(base_outputs, medusa_outputs, strict=True):
-        assert base_output.prompt == medusa_output.prompt
-        assert len(base_output.outputs) == len(medusa_output.outputs) == 1
-        assert (
-            base_output.outputs[0].finish_reason
-            == medusa_output.outputs[0].finish_reason
-        )
-        assert base_output.outputs[0].text == medusa_output.outputs[0].text
-        assert base_output.outputs[0].token_ids == medusa_output.outputs[0].token_ids
+    with managed_llm(
+        monkeypatch, **_base_llm_kwargs(max_num_seqs=batch_size)
+    ) as base_llm:
+        for seq_idx, (prompt_token_ids, spec_token_ids) in enumerate(captured):
+            assert_spec_matches_base_within_noise(
+                base_llm, prompt_token_ids, spec_token_ids, seq_idx=seq_idx
+            )

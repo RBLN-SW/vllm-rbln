@@ -13,16 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any
 
-import optimum.rbln
-from optimum.rbln import (
-    RBLNAutoModelForCausalLM,
-    RBLNAutoModelForSpeechSeq2Seq,
-)
 from transformers import PretrainedConfig
-
-from .multimodal import compile_multimodal
 
 # modified/customized models for RBLN
 _RBLN_GENERATION_MODELS: dict[str, tuple[str, str]] = {
@@ -71,12 +63,17 @@ _RBLN_MULTIMODAL_MODELS = {
         "qwen3_vl_moe",
         "RBLNQwen3VLMoeForConditionalGeneration",
     ),
+    "Exaone4_5_ForConditionalGeneration": (
+        "exaone4_5",
+        "RBLNExaone4_5_ForConditionalGeneration",
+    ),
     "Idefics3ForConditionalGeneration": (
         "idefics3",
         "RBLNIdefics3ForConditionalGeneration",
     ),
     "Blip2ForConditionalGeneration": ("blip2", "RBLNBlip2ForConditionalGeneration"),
     "Gemma3ForConditionalGeneration": ("gemma3", "RBLNGemma3ForConditionalGeneration"),
+    "Gemma4ForConditionalGeneration": ("gemma4", "RBLNGemma4ForConditionalGeneration"),
     "LlavaForConditionalGeneration": ("llava", "RBLNLlavaForConditionalGeneration"),
     "PaliGemmaForConditionalGeneration": (
         "paligemma",
@@ -133,8 +130,22 @@ def is_arch_supported(
     )
 
 
+def validate_arch_supported(config: PretrainedConfig) -> None:
+    """Validate the model's architecture is known to upstream vLLM."""
+    architectures = getattr(config, "architectures", [])
+    import vllm.model_executor.models as me_models
+
+    supported_archs = me_models.ModelRegistry.get_supported_archs()
+    if not any(arch in supported_archs for arch in architectures):
+        raise ValueError(
+            f"Model architectures {architectures} are not supported on upstream "
+            f"vLLM for now. Supported architectures: {supported_archs}"
+        )
+
+
 def get_rbln_model_info(config: PretrainedConfig) -> tuple[str, str]:
     architectures = getattr(config, "architectures", [])
+
     for arch in architectures:
         if arch in _RBLN_SUPPORTED_MODELS:
             model_name, model_cls_name = _RBLN_SUPPORTED_MODELS[arch]
@@ -145,81 +156,3 @@ def get_rbln_model_info(config: PretrainedConfig) -> tuple[str, str]:
         f"for now. Supported architectures: "
         f"{list(_RBLN_SUPPORTED_MODELS.keys())}"
     )
-
-
-def compile_model(
-    hf_model_name: str,
-    config: PretrainedConfig,
-    batch_size: int,
-    block_size: int,
-    max_model_len: int,
-    tp_size: int,
-    model_path: str,
-    additional_config: dict[str, Any] | None = None,
-) -> Any:
-    architectures = getattr(config, "architectures", [])
-    model_name, model_cls_name = get_rbln_model_info(
-        config
-    )  # check if the model is supported and get model info
-    default_param: dict[str, Any] = {
-        "rbln_tensor_parallel_size": tp_size,
-    }
-    if additional_config:
-        default_param.update(additional_config)
-    if is_generation_arch(config):
-        default_param["rbln_batch_size"] = batch_size
-        default_param["rbln_max_seq_len"] = max_model_len
-        if block_size != max_model_len:
-            attn_impl = "flash_attn" if block_size != max_model_len else "eager"
-            default_param["rbln_kvcache_partition_len"] = block_size
-            default_param["rbln_attn_impl"] = attn_impl
-
-        model = RBLNAutoModelForCausalLM.from_pretrained(
-            hf_model_name,
-            **default_param,
-        )
-    elif is_pooling_arch(config):
-        model_cls_name = _RBLN_SUPPORTED_MODELS[architectures[0]][1]
-        model_cls = getattr(optimum.rbln, model_cls_name)
-        assert model_cls is not None
-        default_param["rbln_batch_size"] = batch_size
-        default_param["rbln_max_seq_len"] = max_model_len
-        # FIXME: We need a more generalized logic to specify block sizes
-        # as the number of supported models continues to grow.
-        if architectures[0] == "Qwen3Model" and block_size != max_model_len:
-            attn_impl = "flash_attn" if block_size != max_model_len else "eager"
-            default_param["rbln_kvcache_partition_len"] = block_size
-            default_param["rbln_attn_impl"] = attn_impl
-        model = model_cls.from_pretrained(hf_model_name, **default_param)
-    elif is_multi_modal(config):
-        model = compile_multimodal(
-            model_name=hf_model_name,
-            architecture=architectures[0],
-            model_alias=model_name,
-            batch_size=batch_size,
-            max_model_len=max_model_len,
-            block_size=block_size,
-            tp_size=tp_size,
-        )
-    elif is_enc_dec_arch(config):
-        assert architectures[0] == "WhisperForConditionalGeneration"
-        # Whisper model does not require max_model_len and block_size
-        assert block_size == max_model_len, (
-            "block_size must be equal to max_model_len for Whisper models."
-        )  # noqa: E501
-        assert max_model_len == config.max_length, (
-            f"max_model_len ({max_model_len}) must match the Whisper model's "
-            f"max_length ({config.max_length}) from the HuggingFace config."
-        )
-        default_param["rbln_batch_size"] = batch_size
-        model = RBLNAutoModelForSpeechSeq2Seq.from_pretrained(
-            hf_model_name,
-            rbln_token_timestamps=False,
-            **default_param,
-        )
-    else:
-        raise NotImplementedError(
-            f"Compilation is not implemented for architecture {architectures[0]}"
-        )
-    model.save_pretrained(model_path)
-    return model

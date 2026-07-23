@@ -60,7 +60,6 @@ jobs:
         shell: bash
     env:
       NUM_INPUT_PROMPT: 1
-      RBLN_VERBOSE: 6
       VLLM_LOGGING_LEVEL: DEBUG
     steps:
       - name: Install uv CLI
@@ -75,7 +74,7 @@ jobs:
           apt-get install -y build-essential
           export CXX=$(which g++)
           uv pip uninstall --system rebel-compiler
-          VERSION=${{ inputs.rebel_compiler_version || needs.get-compiler-version.outputs.compiler_version }}
+          VERSION="${{ inputs.rebel_compiler_version || needs.get-compiler-version.outputs.compiler_version }}"
           uv pip install --system --extra-index-url ${{ secrets.DEV_PKG_URL }} rebel-compiler==${VERSION}
 
       - name: Checkout current repository
@@ -163,7 +162,6 @@ jobs:
         shell: bash
     env:
       NUM_INPUT_PROMPT: 1
-      RBLN_VERBOSE: 6
       VLLM_LOGGING_LEVEL: DEBUG
     steps:
       - name: Install uv CLI
@@ -291,7 +289,6 @@ jobs:
         shell: bash
     env:
       NUM_INPUT_PROMPT: 1
-      RBLN_VERBOSE: 6
       VLLM_LOGGING_LEVEL: DEBUG
     steps:
       - name: Install uv CLI

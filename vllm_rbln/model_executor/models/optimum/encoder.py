@@ -15,10 +15,13 @@
 from typing import Union
 
 import torch
-from vllm.config import VllmConfig
+from vllm.config import ModelConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.pooler import DispatchPooler, Pooler
-from vllm.model_executor.layers.pooler.activations import PoolerNormalize
+from vllm.model_executor.layers.pooler.activations import (
+    PoolerNormalize,
+    resolve_classifier_act_fn,
+)
 from vllm.model_executor.layers.pooler.seqwise import (
     EmbeddingPoolerHead,
     SequencePooler,
@@ -35,27 +38,45 @@ from .model_base import RBLNOptimumModelBase
 
 logger = init_logger(__name__)
 
+# Decoder-based pooling architectures that must NOT be forced to CLS pooling.
+# Qwen3 embedding/reranker (HF arch ``Qwen3ForCausalLM``) is remapped to
+# ``Qwen3Model`` by the model runner and uses LAST-token pooling, like any
+# decoder-based embedder — CLS (token 0) would be wrong for a causal model.
+_DECODER_POOLING_ARCHS = {"Qwen3Model"}
+
 
 class RBLNClassifierPooler(Pooler):
     """
-    A pooler for RBLN models that simply wraps pre-processed
-    hidden states into vLLM's PoolerOutput format.
+    Pooler for RBLN classify/score models.
+
+    The RBLN model already returns pooled classifier logits on-device, so no
+    pooling step is needed here. We only apply the classification activation
+    (sigmoid/softmax, resolved from the HF config exactly as vLLM's
+    ClassifierPoolerHead does) gated by PoolingParams.use_activation, so that
+    `.score()`/`.classify()` outputs match vLLM upstream semantics instead of
+    leaking raw logits.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, model_config: ModelConfig) -> None:
         super().__init__()
+        self.activation = resolve_classifier_act_fn(model_config)
 
     def get_supported_tasks(self) -> set[PoolingTask]:
-        return {"classify", "score"}
+        return {"classify"}
 
     def forward(
         self,
         hidden_states: Union[torch.Tensor, list[torch.Tensor]],
         pooling_metadata: PoolingMetadata,
     ) -> PoolerOutput:
-        # RBLN models return already pooled/processed states for classification
-        # No additional pooling needed - just format for vllm compatibility
-        return hidden_states
+        # hidden_states are already-pooled classifier logits from the RBLN model.
+        flags = [p.use_activation for p in pooling_metadata.pooling_params]
+        if len(set(flags)) == 1:
+            return self.activation(hidden_states) if flags[0] else hidden_states
+        return [
+            self.activation(logits) if f else logits
+            for logits, f in zip(hidden_states, flags)
+        ]
 
 
 class RBLNOptimumForEncoderModel(RBLNOptimumModelBase, VllmModelForPooling):
@@ -69,24 +90,27 @@ class RBLNOptimumForEncoderModel(RBLNOptimumModelBase, VllmModelForPooling):
     ) -> None:
         super().__init__(vllm_config=vllm_config)
         pooler_config = vllm_config.model_config.pooler_config
-        # NOTE:
-        # In vLLM, the default pooling type is set to LAST token pooling,
-        # which is suitable for decoder or encoder-decoder models.
-        # However, for encoder-only models (e.g., BERT),
-        # CLS token pooling is more appropriate.
-        # Therefore, we override the pooling type to CLS here.
-        pooler_config.pooling_type = "CLS"
-        # NOTE: Setting pooling_type after PoolerConfig init doesn't update
-        # seq_pooling_type (already set to model default, e.g. "MEAN" for T5).
-        # Set it directly to ensure CLS pooling is used.
-        pooler_config.seq_pooling_type = "CLS"
         assert pooler_config is not None
+        # Encoder-only models (e.g. BERT/RoBERTa) use CLS-token pooling, so we
+        # override vLLM's resolved sequence pooling type to CLS. Decoder-based
+        # pooling models (e.g. Qwen3 embedding) must keep their LAST-token
+        # pooling — see _DECODER_POOLING_ARCHS.
+        if not self.is_decoder_pooling_arch():
+            pooler_config.seq_pooling_type = "CLS"
+        # https://github.com/vllm-project/vllm/blob/v0.22.0/docs/models/pooling_models/scoring.md
+        # vLLM groups score()-capable models into three "score types"
+        # (docs/models/pooling_models, score_types.svg). Which pooler we build
+        # below depends on which one this model is:
+        #   score type        task         score computation       example
+        #   ----------------  -----------  ----------------------  ------------
+        #   cross-encoder     classify     joint -> classifier     bge-reranker
+        #   bi-encoder        embed        cosine of 2 embeddings  bge-m3
+        #   late-interaction  token_embed  token-wise MaxSim            -
+        # Cross-encoders (classify, num_labels=1) use the classifier head/
+        # activation (RBLNClassifierPooler); others use the embed/token_embed pooler.
         if self.is_classification_arch():
-            self.pooler = RBLNClassifierPooler()
+            self.pooler = RBLNClassifierPooler(vllm_config.model_config)
         else:
-            # https://github.com/vllm-project/vllm/blob/72506c98349d6bcd32b4e33eec7b5513453c1502/docs/models/pooling_models.md?plain=1#L312
-            # encode task is split into `token_embed` and `token_classify` tasks
-            #
             # Build the "embed" pooler without sentence-transformers projection.
             # vllm's pooler_for_embed() loads the ST Dense layer via
             # _load_st_projector, but RBLN encoder models produce raw hidden
@@ -114,6 +138,14 @@ class RBLNOptimumForEncoderModel(RBLNOptimumModelBase, VllmModelForPooling):
             [],
         )
         return len(architectures) > 0 and "Classification" in architectures[0]
+
+    def is_decoder_pooling_arch(self):
+        architectures = getattr(
+            self.model_config.hf_config,
+            "architectures",
+            [],
+        )
+        return len(architectures) > 0 and architectures[0] in _DECODER_POOLING_ARCHS
 
     def preprocess(
         self,

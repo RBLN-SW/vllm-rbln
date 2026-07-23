@@ -4,7 +4,7 @@ on:
   pull_request:
     branches:
       - dev
-      - dev-0.18
+      - dev-0.22.0
 
 jobs:
   check-skip-ci:

@@ -55,6 +55,7 @@ class RBLNBlockPool(BlockPool):
         hash_block_size: int,
         enable_kv_cache_events: bool = False,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        is_encoder_decoder: bool = False,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
@@ -79,6 +80,19 @@ class RBLNBlockPool(BlockPool):
         # avoid freeing it.
         self.null_block = self.free_block_queue.popleft()
         self.null_block.is_null = True
+
+        # Encoder-decoder models (e.g. Whisper) need a scratch block that the
+        # decoder runtime can write into for padded slots. Reserve the last
+        # block by removing it from the free queue so it is never handed out
+        # to a real request.
+        self.dummy_block: KVCacheBlock | None = None
+        if is_encoder_decoder:
+            assert num_gpu_blocks >= 2, (
+                "Encoder-decoder models require at least 2 blocks "
+                "(1 null block + 1 dummy block)."
+            )
+            self.dummy_block = self.blocks[num_gpu_blocks - 1]
+            self.free_block_queue.remove(self.dummy_block)
 
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue: list[KVCacheEvent] = []

@@ -302,6 +302,7 @@ def _create_connector_scheduler():
     sched._reqs_in_batch = set()
     sched._reqs_not_processed = set()
     sched._block_ids_need_save = {}
+    sched._kv_lease_duration = 30
 
     return sched
 

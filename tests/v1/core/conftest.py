@@ -18,6 +18,11 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def skip_prepare_compile():
-    with patch("vllm_rbln.utils.optimum.configuration.prepare_vllm_for_compile"):
+def skip_sync_vllm_and_optimum():
+    # Force `compiled_rbln_config = None` so sync_vllm_and_optimum() takes the
+    # sync_from_vllm() path instead of resolving a real compiled config.
+    with patch(
+        "vllm_rbln.utils.optimum.converter.dispatch._resolve_rbln_config",
+        return_value=None,
+    ):
         yield
