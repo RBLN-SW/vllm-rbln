@@ -96,6 +96,28 @@ def sync_from_optimum(
         )
         vllm_config.model_config.max_model_len = params.max_seq_len
 
+        # Hybrid Mamba models (e.g. Qwen3.5) disable prefix caching by default
+        # (still experimental as of vLLM v0.22.0), which makes vLLM auto-set
+        # mamba_block_size to max_model_len. Shrinking max_model_len here leaves
+        # that value stale, so validate_mamba_block_size later rejects the
+        # mismatch. Realign it, unless the user set it explicitly.
+        #
+        # max_model_len is the correct target only while prefix caching is off;
+        # with it on, vLLM aligns mamba_block_size to block_size instead. Assert
+        # the assumption so a future vLLM that enables prefix caching for hybrid
+        # models fails loudly here rather than silently miscomputing block size.
+        cache_config = vllm_config.cache_config
+        if (
+            not cache_config.user_specified_mamba_block_size
+            and cache_config.mamba_block_size is not None
+        ):
+            assert not cache_config.enable_prefix_caching, (
+                "mamba_block_size realignment assumes prefix caching is disabled "
+                "(the vLLM v0.22.0 default for hybrid Mamba models), where "
+                "mamba_block_size == max_model_len."
+            )
+            cache_config.mamba_block_size = params.max_seq_len
+
     # In case of encoder-decoder models,
     # update max_num_seqs in encoder_scheduler_config as well
     vllm_config.scheduler_config.max_num_batched_tokens = max(
