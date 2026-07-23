@@ -55,7 +55,7 @@ def create_scheduler(
     block_size: int = 16,
     max_model_len: int | None = None,
     async_scheduling: bool = False,
-    outer_block_size: int = 0,
+    outer_block_size: int = 16,
     enable_prefix_caching: bool = False,
 ) -> RBLNOptimumScheduler:
     """Create RBLNOptimumscheduler under test.

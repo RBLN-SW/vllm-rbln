@@ -22,6 +22,8 @@ from vllm.v1.core.single_type_kv_cache_manager import SingleTypeKVCacheManager
 from vllm.v1.kv_cache_interface import SlidingWindowSpec
 from vllm.v1.request import Request
 
+from vllm_rbln import envs
+
 
 @dataclass(frozen=True)
 class RBLNSlidingWindowSpec(SlidingWindowSpec):
@@ -130,8 +132,12 @@ class RBLNSlidingWindowManager(SingleTypeKVCacheManager):
         return 0
 
 
-single_type_kv_cache_manager.spec_manager_map.update(
-    {
-        RBLNSlidingWindowSpec: RBLNSlidingWindowManager,
-    }
-)
+if envs.VLLM_RBLN_USE_VLLM_MODEL:
+    # Register the RBLN sliding-window spec and manager with vLLM's
+    # single_type_kv_cache_manager. This allows the RBLN kernel to be used
+    # in vLLM's KV cache management system.
+    single_type_kv_cache_manager.spec_manager_map.update(
+        {
+            RBLNSlidingWindowSpec: RBLNSlidingWindowManager,
+        }
+    )
