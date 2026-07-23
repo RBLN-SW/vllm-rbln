@@ -24,9 +24,9 @@ from vllm import LLM, SamplingParams
 # If the video is too long
 # set `VLLM_ENGINE_ITERATION_TIMEOUT_S` to a higher timeout value.
 VIDEO_URLS = [
-    "https://duguang-labelling.oss-cn-shanghai.aliyuncs.com/qiansun/video_ocr/videos/50221078283.mp4",
+    # "https://duguang-labelling.oss-cn-shanghai.aliyuncs.com/qiansun/video_ocr/videos/50221078283.mp4",
     "https://cdn.pixabay.com/video/2022/04/18/114413-701051082_large.mp4",
-    "https://videos.pexels.com/video-files/855282/855282-hd_1280_720_25fps.mp4",
+    # "https://videos.pexels.com/video-files/855282/855282-hd_1280_720_25fps.mp4",
 ]
 
 
@@ -75,7 +75,11 @@ def generate_prompts_video(batch_size: int, model: str):
             },
             "mm_processor_kwargs": {
                 "min_pixels": 1024 * 14 * 14,
-                "max_pixels": 5120 * 14 * 14,
+                # Qwen3.5's precompiled vision encoder here supports max_seq_len
+                # [2048] patches; keep max_pixels <= 2048*patch^2 (patch=16 =>
+                # 524288). 1792*16*16 = 458752 leaves margin. Raise this (or
+                # recompile the visual with a larger max_seq_len) for other models.
+                "max_pixels": 1792 * 16 * 16,
                 **video_kwargs,
             },
         }
@@ -131,9 +135,14 @@ def generate_prompts_image(batch_size: int, model: str):
         {
             "prompt": text,
             "multi_modal_data": {"image": image_inputs},
+            # "mm_processor_kwargs": {
+            #     "min_pixels": 1024 * 14 * 14,
+            #     "max_pixels": 5120 * 14 * 14,
+            #     "padding": True,
+            # },
             "mm_processor_kwargs": {
-                "min_pixels": 1024 * 14 * 14,
-                "max_pixels": 5120 * 14 * 14,
+                "min_pixels": 256 * 256,   # 65536
+                "max_pixels": 458752,  # <=524288 => <=2048 vision patches (patch16)
                 "padding": True,
             },
         }
@@ -182,7 +191,11 @@ def generate_prompts_wo_processing(batch_size: int, model: str):
             "multi_modal_data": {"image": image},
             "mm_processor_kwargs": {
                 "min_pixels": 1024 * 14 * 14,
-                "max_pixels": 5120 * 14 * 14,
+                # Qwen3.5's precompiled vision encoder here supports max_seq_len
+                # [2048] patches; keep max_pixels <= 2048*patch^2 (patch=16 =>
+                # 524288). 1792*16*16 = 458752 leaves margin. Raise this (or
+                # recompile the visual with a larger max_seq_len) for other models.
+                "max_pixels": 1792 * 16 * 16,
             },
         }
         for text, image in zip(texts, images)
@@ -194,11 +207,17 @@ def main(
     # NOTE: This example supports Qwen2-VL, Qwen2.5-VL, Qwen3-VL, and Qwen3.5.
     # For Qwen3.5 (hybrid GatedDeltaNet backbone), flash attention is forced at
     # compile time, so keep block_size / max_model_len >= 4096 (already the case
+<<<<<<< Updated upstream
     # below).
     model: str = "Qwen/Qwen3-VL-2B-Instruct",
+=======
+    # below). Pass a Qwen3.5 checkpoint via `--model`.
+    model: str = "Qwen/Qwen3.5-0.8B",
+>>>>>>> Stashed changes
 ):
     # number of devices per local rank for main module
-    os.environ["VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK"] = "16"
+    os.environ["VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK"] = "1"
+    model = "/home/seinpark/optimum-rbln/examples/image-to-text/qwen35_rbln_model_24layers"
     llm = LLM(
         model=model,
         block_size=4096,
@@ -206,7 +225,7 @@ def main(
         max_num_seqs=1,
         additional_config={
             "rbln_config": {
-                "device": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+                "device": [15],
                 "visual": {
                     "device": [16],
                 },
@@ -214,7 +233,7 @@ def main(
         },
     )
     tokenizer = AutoTokenizer.from_pretrained(model)
-    inputs = generate_prompts_image(num_input_prompt, model)
+    inputs = generate_prompts_image(num_input_prompt, "Qwen/Qwen3.5-0.8B")
     # inputs = generate_prompts_video(num_input_prompt, model)
     # inputs = generate_prompts_wo_processing(num_input_prompt, model)
 
