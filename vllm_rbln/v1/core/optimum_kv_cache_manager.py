@@ -341,15 +341,11 @@ class RBLNKVCacheManager(KVCacheManager):
         num_new_computed_tokens: int,
     ) -> tuple[list[int], list[int]]:
         cached_blocks = new_computed_blocks.get_block_ids()[0]
-        cached_block_table, cached_length = (
-            self.prefix_cache_manager.get_matched_outer_blocks(
-                request.request_id,
-                cached_blocks,
-                num_new_computed_tokens,
-            )
+        return self.prefix_cache_manager.get_matched_outer_blocks(
+            request.request_id,
+            cached_blocks,
+            num_new_computed_tokens,
         )
-
-        return cached_block_table, cached_length
 
     def get_block_table(self, request_id: str) -> torch.Tensor:
         return self.prefix_cache_manager.get_blocks(request_id)
