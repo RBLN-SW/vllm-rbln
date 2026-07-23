@@ -134,6 +134,7 @@ class RBLNSampler(VLLMSampler):
     def __init__(
         self,
         logprobs_mode: LogprobsMode = "raw_logprobs",
+        use_fp64_gumbel: bool = False,
         compile_context: rebel.CompileContext | None = None,
     ):
         super().__init__()
