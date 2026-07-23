@@ -1549,8 +1549,8 @@ wheels = [
 
 [[package]]
 name = "optimum-rbln"
-version = "0.11.1a2"
-source = { registry = "https://pypi.rebellions.in/simple/" }
+version = "0.11.1a4"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "accelerate", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "diffusers", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
@@ -1562,8 +1562,9 @@ dependencies = [
     { name = "torchvision", marker = "platform_machine == 'x86_64' and platform_python_implementation == 'CPython' and sys_platform == 'linux'" },
     { name = "transformers", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
 ]
+sdist = { url = "https://files.pythonhosted.org/packages/3d/81/4131c901e1876dec3dfde4f857b4bf2e24ebed67a1eaaa49f09f2ca9813e/optimum_rbln-0.11.1a4.tar.gz", hash = "sha256:598dd799f22c8d32feee142b8b72d15e9ff0dfd8a5150a3683fd9540f309f51d", size = 546024, upload-time = "2026-07-22T07:36:02.716Z" }
 wheels = [
-    { url = "https://pypi.rebellions.in/api/package/optimum-rbln/optimum_rbln-0.11.1a2-py3-none-any.whl", hash = "sha256:80e47351afb8831bd07d2057cbf4c6205bac2a04706e3c17936fe6065e54c9e4" },
+    { url = "https://files.pythonhosted.org/packages/b9/ed/2fd17447207a568a9a6260f0318de299baf1a620f2d62bc656dab28faf9b/optimum_rbln-0.11.1a4-py3-none-any.whl", hash = "sha256:18badb7e65a5606d60ed361128385b85c30857833d6d35a663ff721ce55610ab", size = 626193, upload-time = "2026-07-22T07:36:00.904Z" },
 ]
 
 [[package]]
@@ -2602,7 +2603,7 @@ wheels = [
 
 [[package]]
 name = "torch-rbln"
-version = "0.3.0rc3.dev3+g8231415da"
+version = "0.3.0rc3"
 source = { registry = "https://pypi.rebellions.in/simple/" }
 dependencies = [
     { name = "libcst", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
@@ -2613,7 +2614,10 @@ dependencies = [
     { name = "torch", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
 ]
 wheels = [
-    { url = "https://pypi.rebellions.in/api/package/torch-rbln/torch_rbln-0.3.0rc3.dev3+g8231415da-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "sha256:7bc01767ca7b427843750c773402fcc60420b774b7286693e8db514fcef587b9" },
+    { url = "https://pypi.rebellions.in/api/package/torch-rbln/torch_rbln-0.3.0rc3-cp310-cp310-manylinux_2_34_x86_64.whl", hash = "sha256:12f15d8d9b914671086e8146c278675c0338186e2c97aa7233bfb7bfbf8076ab" },
+    { url = "https://pypi.rebellions.in/api/package/torch-rbln/torch_rbln-0.3.0rc3-cp311-cp311-manylinux_2_34_x86_64.whl", hash = "sha256:ab2599d8d77aecaa37a635c4d56c9f841879d43484ba7987f7797321254faa0e" },
+    { url = "https://pypi.rebellions.in/api/package/torch-rbln/torch_rbln-0.3.0rc3-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "sha256:ddabed2f1e716f547afd2d9af54381fa797ef76cb108b11e4051162de66fea98" },
+    { url = "https://pypi.rebellions.in/api/package/torch-rbln/torch_rbln-0.3.0rc3-cp313-cp313-manylinux_2_34_x86_64.whl", hash = "sha256:6e9138d300ae06bdb50ad83ba38405c56c0e570e4426a75c503bbcfeb17ea7c7" },
 ]
 
 [[package]]
@@ -2941,7 +2945,7 @@ requires-dist = [
     { name = "fastapi", extras = ["standard"], specifier = "<0.137" },
     { name = "fire", marker = "extra == 'dev'" },
     { name = "huggingface-hub", marker = "extra == 'dev'" },
-    { name = "optimum-rbln", specifier = ">=0.11.1a2" },
+    { name = "optimum-rbln", specifier = ">=0.11.1a4" },
     { name = "packaging", marker = "extra == 'dev'" },
     { name = "pynvml", marker = "extra == 'dev'" },
     { name = "pytest", marker = "extra == 'test'" },
@@ -2957,7 +2961,7 @@ requires-dist = [
     { name = "setuptools-scm", marker = "extra == 'build'" },
     { name = "simphile", marker = "extra == 'dev'" },
     { name = "torch", index = "https://download.pytorch.org/whl/cpu" },
-    { name = "torch-rbln", marker = "platform_machine == 'x86_64'", specifier = "~=0.3.0rc2" },
+    { name = "torch-rbln", marker = "platform_machine == 'x86_64'", specifier = "~=0.3.0rc3" },
     { name = "torchaudio", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torchcodec", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torchvision", index = "https://download.pytorch.org/whl/cpu" },

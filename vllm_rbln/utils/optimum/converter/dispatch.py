@@ -63,6 +63,7 @@ def _generate_model_path_name(
     max_model_len = vllm_config.model_config.max_model_len
     num_devices = envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK
     additional_config = vllm_config.additional_config.get("rbln_config", None)
+    memory_budget = vllm_config.cache_config.gpu_memory_utilization
 
     # FIXME: To avoid cache collisions, the cache key should also include
     # the versions of the compiler and optimum-rbln.
@@ -72,6 +73,7 @@ def _generate_model_path_name(
         "block_size": block_size,
         "max_model_len": max_model_len,
         "num_devices": num_devices,
+        "memory_budget": memory_budget,
     }
     if additional_config:
         config_dict["rbln_config"] = _strip_runtime_only_keys(additional_config)

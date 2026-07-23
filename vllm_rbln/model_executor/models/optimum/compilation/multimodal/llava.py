@@ -21,12 +21,18 @@ def get_param_llava(
     max_model_len: int,
     block_size: int,
     num_devices: int,
+    memory_budget: float,
     prefill_chunk_size: int | None = None,
 ) -> dict:
     param = {
         "vision_tower": {"output_hidden_states": True},
         "language_model": get_language_model_config(
-            batch_size, max_model_len, block_size, num_devices, prefill_chunk_size
+            batch_size,
+            max_model_len,
+            block_size,
+            num_devices,
+            memory_budget,
+            prefill_chunk_size,
         ),
     }
     return param
