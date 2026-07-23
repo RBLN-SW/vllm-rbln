@@ -227,6 +227,7 @@ class RBLNOptimumModelBase(nn.Module):
                 block_size=get_attn_block_size(self.vllm_config),
                 max_model_len=self.model_config.max_model_len,
                 num_devices=envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
+                memory_budget=self.vllm_config.cache_config.gpu_memory_utilization,
                 # Resolved during sync (from_optimum/from_vllm); pin it at compile
                 # time so the compiled model matches the value used for KV-cache
                 # block padding.

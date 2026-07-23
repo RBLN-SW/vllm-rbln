@@ -3,6 +3,7 @@
 Requirements:
 - Linux x86_64 with access to the internal network (Nexus / internal PyPI)
 - Python **3.12** for this dev workflow (`rebel-compiler` nightly wheels are currently cp312-only; the package itself targets 3.10-3.13)
+- uv **>= 0.11.25** (`uv self update`) — enforced via `required-version` in `pyproject.toml`. Older uv writes `uv.lock` in a different serialization (repeats the `tool.uv.environments` marker on every dependency), so re-locking with it produces a ~900-line noise diff.
 
 Internal indexes require your **LDAP account** credentials (set once, e.g. in your shell profile):
 
@@ -48,6 +49,39 @@ Rules of thumb:
 - If you edited `pyproject.toml`, always run `uv lock` and commit `uv.lock` in the same PR — pre-commit rejects drift between the two.
 - CI installs with `uv sync --locked`, which fails if `uv.lock` doesn't match `pyproject.toml`.
 - Never edit `uv.lock` by hand.
+
+### rebel-compiler version policy
+
+**Who updates:** whoever needs it (need-driven). The team merging a feature
+that requires a newer compiler includes the bump in that PR, as a separate
+commit (easy to revert), e.g. `chore(deps): bump rebel-compiler to 0.11.1.devXXX`.
+
+**Version eligibility:**
+- Only builds that **passed the compiler nightly CI** may be pinned in
+  `uv.lock` or referenced in `pyproject.toml`. Builds from compiler feature
+  branches are for local/CI experiments only — never commit them to the lock.
+- On `main`, only **official release versions** are pinned. Dev builds
+  (`*.devNNN`) are allowed on `dev` only; they are replaced with a release
+  version when merging/releasing to `main`.
+
+**Lock update vs dependency update — decide separately:**
+- **`uv.lock` only** — the new build's features/bugfixes are needed, but the
+  code still works with older compiler versions in the allowed range
+  (e.g. `dev304` → `dev350`): `uv lock --upgrade-package rebel-compiler`.
+- **`pyproject.toml` + `uv.lock` together** — the code is no longer
+  compatible with older compiler versions, i.e. it depends on something that
+  does not exist below a certain compiler version (e.g. a new custom op that
+  only exists from `0.11.2.dev0`): raise the lower bound in `pyproject.toml`
+  (`~=0.11.1.dev0` → `~=0.11.2.dev0`) and regenerate `uv.lock` in the same
+  PR. Bumping only the lock leaves the declared range permitting older
+  versions that no longer work — other environments can still resolve a
+  broken combination.
+- Version-line change (`0.11.x` → `0.12.x`) is a release-level decision:
+  always `pyproject.toml` + `uv.lock`, with API/compatibility review.
+
+**Testing a specific build without touching the lock:** use the
+`rebel_compiler_version` input of the CI workflow — it installs that version
+as an override and leaves `uv.lock` unchanged.
 
 To bump `rebel-compiler` to the latest nightly (do not edit `pyproject.toml`):
 
