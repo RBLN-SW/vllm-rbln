@@ -81,3 +81,12 @@ def get_param_qwen3_5(
     if gdn_chunk_size is not None:
         param["gdn_chunk_size"] = gdn_chunk_size
     return param
+
+def get_overridable() -> frozenset[str]:
+    """Submodules whose fields a user may override (see ``_find_conflicts``).
+
+    The ``visual`` (vision encoder) submodule is compile-only — vllm never reads
+    it back to size the runtime — so any of its fields may be overridden without
+    desyncing vllm and the compiled model.
+    """
+    return frozenset({"visual"})
