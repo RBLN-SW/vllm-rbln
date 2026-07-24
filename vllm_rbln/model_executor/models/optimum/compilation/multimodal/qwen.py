@@ -60,6 +60,7 @@ def get_param_qwen3_5(
     max_model_len: int,
     block_size: int,
     num_devices: int,
+    memory_budget: float,
     prefill_chunk_size: int | None = None,
     gdn_chunk_size: int | None = None,
 ) -> dict:
@@ -69,7 +70,12 @@ def get_param_qwen3_5(
     #
     # FLASH IS FORCED (not conditional on block_size like the Qwen-VL builders)
     param = get_param_qwen2_vl(
-        batch_size, max_model_len, block_size, num_devices, prefill_chunk_size
+        batch_size,
+        max_model_len,
+        block_size,
+        num_devices,
+        memory_budget,
+        prefill_chunk_size,
     )
     param["attn_impl"] = "flash_attn"
     if gdn_chunk_size is not None:
