@@ -72,9 +72,7 @@ def _find_conflicts(
             continue
         existing = base[key]
         if isinstance(value, dict) and isinstance(existing, dict):
-            conflicts.extend(
-                _find_conflicts(existing, value, overridable, f"{path}.")
-            )
+            conflicts.extend(_find_conflicts(existing, value, overridable, f"{path}."))
         elif existing != value:
             conflicts.append(f"{path} (compiled={existing!r}, override={value!r})")
     return conflicts
