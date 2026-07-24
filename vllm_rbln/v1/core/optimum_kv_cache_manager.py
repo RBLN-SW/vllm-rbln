@@ -63,13 +63,13 @@ class RBLNKVCacheManager(KVCacheManager):
         # potential configs we could expose in the future.
         self.prefix_cache_stats = PrefixCacheStats() if log_stats else None
         # NOTE(eunji.lee):
-        # max_num_batched_tokens may exceed max_model_len. It only feeds the
-        # recycling-aware admission cap for SWA / chunked-local specs, and even
-        # there it is clamped by max_model_len. Full/cross-attention block
-        # allocation (e.g. Whisper) sizes purely off the request's own tokens.
-        assert max_num_batched_tokens is not None, (
-            "max_num_batched_tokens must be set in `sync_vllm_and_optimum`."
-        )
+        # This is the scheduler's per-step token budget, not
+        # scheduler_config.max_num_batched_tokens (which on the optimum path is
+        # the compiled prefill chunk size). It only feeds the recycling-aware
+        # admission cap for SWA / chunked-local specs, clamped there by
+        # max_model_len; full/cross-attention block allocation (e.g. Whisper)
+        # sizes purely off the request's own tokens.
+        assert max_num_batched_tokens is not None, "max_num_batched_tokens must be set."
         self.coordinator = RBLNKVCacheCoordinator(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,

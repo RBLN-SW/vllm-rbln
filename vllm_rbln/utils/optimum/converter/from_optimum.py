@@ -21,7 +21,12 @@ from vllm_rbln.utils.optimum.block_size import (
     is_full_block_available,
 )
 
-from .common import update_block_size, update_max_num_batched_tokens
+from .common import (
+    apply_user_prefill_chunk_size,
+    store_image_prefill_chunk_size,
+    update_block_size,
+    update_max_num_batched_tokens,
+)
 from .params import RBLNParams
 
 if TYPE_CHECKING:
@@ -96,17 +101,13 @@ def sync_from_optimum(
         )
         vllm_config.model_config.max_model_len = params.max_seq_len
 
-    # In case of encoder-decoder models,
-    # update max_num_seqs in encoder_scheduler_config as well
-    vllm_config.scheduler_config.max_num_batched_tokens = max(
-        vllm_config.model_config.max_model_len,
-        vllm_config.scheduler_config.max_num_seqs,
-    )
-    update_max_num_batched_tokens(vllm_config, params.max_seq_len)
-
-    # Set block_size in cache_config based on rbln_config.json
-    # (also persists prefill_chunk_size / image-prefill buckets into
-    # additional_config).
+    apply_user_prefill_chunk_size(vllm_config, params, precompiled=True)
+    # Set max_num_batched_tokens: the prefill chunk size for decoder/multimodal
+    # models, or a full-prefill-plus-batch budget for enc-dec/pooling models.
+    update_max_num_batched_tokens(vllm_config, params)
+    # Persist the image-prefill buckets (gemma3/gemma4) into additional_config.
+    store_image_prefill_chunk_size(vllm_config, params.image_prefill_chunk_size)
+    # Set block_size in cache_config based on rbln_config.json.
     update_block_size(
         vllm_config,
         params.kvcache_block_size,
