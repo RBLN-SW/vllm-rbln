@@ -148,6 +148,7 @@ from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
 from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
 from vllm_rbln.v1.worker.metrics import (
+    ITLBreakdownTracker,
     PerformanceTracker,
     StepReport,
     collect_metrics,
@@ -724,6 +725,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         self.performance_tracker: PerformanceTracker | None = None
         self.e2e_performance_tracker: PerformanceTracker | None = None
+        self.itl_breakdown_tracker: ITLBreakdownTracker | None = None
+        # Cross-DP "any rank is prefilling" flag and per-rank token counts for
+        # the in-flight step, set during _prepare_inputs / get_dp_padding and
+        # consumed by the ITL breakdown commit in sample_tokens.
+        self._dp_any_prefill: bool = False
+        self._itl_token_counts: list[int] | None = None
         self._pending_model_report: StepReport | None = None
         self.e2e_start_time: float = 0.0
         self.e2e_end_time: float = 0.0
@@ -739,11 +746,31 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         if envs.VLLM_RBLN_METRICS:
             self.performance_tracker = PerformanceTracker("MODEL+SAMPLER")
             self.e2e_performance_tracker = PerformanceTracker("E2E")
+            self.itl_breakdown_tracker = ITLBreakdownTracker("ITL")
 
     def _flush_pending_model_report(self):
         if self.performance_tracker is not None and self._pending_model_report:
             self.performance_tracker.record(self._pending_model_report)
             self._pending_model_report = None
+
+    @contextlib.contextmanager
+    def _itl_phase(self, name: str):
+        """Time the wrapped block into ITL breakdown phase ``name``.
+
+        A no-op when the ITL tracker is disabled. Runs alongside the existing
+        ``record_function_or_nullcontext`` profiler markers; the phase span
+        accumulates across ``execute_model`` + ``sample_tokens`` until the step
+        is committed at the E2E recording point.
+        """
+        tracker = self.itl_breakdown_tracker
+        if tracker is None:
+            yield
+            return
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            tracker.add_phase(name, time.perf_counter() - start)
 
     def _get_positions(self, num_tokens: Any):
         if isinstance(num_tokens, int):
@@ -2028,6 +2055,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             assert num_padded_tokens is None, (
                 "num_padded_tokens should not be applied for non-DP case"
             )
+            # Single rank: "any prefill" collapses to this rank's own phase.
+            self._dp_any_prefill = is_prefill
             return batch_bucket_size, num_padded_tokens, None, None
 
         if num_padded_tokens is not None:
@@ -2044,6 +2073,9 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             num_tokens_across_dp_cpu = RBLNDPMetadata.num_tokens_across_dp(
                 num_tokens, dp_size, dp_rank
             )
+            # This path is decode-only (asserted above) and does not gather the
+            # per-rank prefill flag; treat it as an all-decode step.
+            self._dp_any_prefill = False
             return (
                 batch_bucket_size,
                 num_padded_tokens,
@@ -2059,6 +2091,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         max_tokens_per_req_across_dp: int | None = None
         any_prefill = num_reqs_across_dp_cpu is None
+        self._dp_any_prefill = any_prefill
         num_padded_tokens = self.max_num_batched_tokens
 
         if self.specialized_moe_decode:
@@ -3403,6 +3436,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         num_padded_tokens: int | None = None,
     ) -> Union[ModelRunnerOutput, IntermediateTensors, None]:
         self.e2e_start_time = time.perf_counter()
+        if self.itl_breakdown_tracker is not None:
+            self.itl_breakdown_tracker.reset_step()
         if self.execute_model_state is not None:
             raise RuntimeError(
                 "State error: sample_tokens() must be called "
@@ -3412,7 +3447,10 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self._handle_kv_connector_preemptions(scheduler_output)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
-        with record_function_or_nullcontext("Preprocess"):
+        with (
+            record_function_or_nullcontext("Preprocess"),
+            self._itl_phase("prepare_input"),
+        ):
             self._update_states(scheduler_output)
 
             # Process sub-block KV cache copy operations before the forward
@@ -3528,6 +3566,16 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 num_padded_tokens,
                 spec_decode_max_query_len=spec_decode_max_query_len,
             )
+
+            if self.itl_breakdown_tracker is not None:
+                # Per-DP-rank token workload for this step. num_tokens_across_dp
+                # is the all-reduced vector (size dp_size); collapse to the local
+                # count when DP is off.
+                self._itl_token_counts = (
+                    num_tokens_across_dp.tolist()
+                    if num_tokens_across_dp is not None
+                    else [num_scheduled_tokens]
+                )
 
             slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
                 num_tokens_padded=num_tokens_unpadded,
@@ -3668,6 +3716,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 additional_kwargs=self._get_kv_cache_forward_context_kwargs(),
             ),
             record_function_or_nullcontext("Forward"),
+            self._itl_phase("model_forward"),
             self.maybe_get_kv_connector_output(
                 scheduler_output,
                 defer_finalize=defer_kv_connector_finalize,
@@ -3773,7 +3822,10 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     request_ids=self.input_batch.req_ids,
                 )
 
-        with record_function_or_nullcontext("Postprocess"):
+        with (
+            record_function_or_nullcontext("Postprocess"),
+            self._itl_phase("postprocess"),
+        ):
             if self.use_aux_hidden_state_outputs:
                 hidden_states, aux_hidden_states, logits = model_output  # type: ignore[misc]
             else:
@@ -3944,7 +3996,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             )
             logits = logits.to(original_dtype)
 
-        with record_function_or_nullcontext("Sample"):
+        with record_function_or_nullcontext("Sample"), self._itl_phase("sampler"):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
         is_intermediate_prefill = (
@@ -3953,7 +4005,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
-            with record_function_or_nullcontext("Draft"):
+            with record_function_or_nullcontext("Draft"), self._itl_phase("draft"):
                 self._draft_token_ids = self.propose_draft_token_ids(
                     scheduler_output,
                     sampled_token_ids,
@@ -3995,7 +4047,10 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 # inputs, and does not need to wait for bookkeeping to finish.
                 propose_draft_token_ids(sampled_token_ids)
 
-        with record_function_or_nullcontext("Bookkeep"):
+        with (
+            record_function_or_nullcontext("Bookkeep"),
+            self._itl_phase("update_state"),
+        ):
             # NOTE:
             # is_prefill is changed after bookkeeping
             # so we need to get it before bookkeeping,
@@ -4065,6 +4120,19 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 end_time=self.e2e_end_time,
                 reports=[],
                 token_count=scheduler_output.total_num_scheduled_tokens,
+            )
+
+        if self.itl_breakdown_tracker is not None:
+            # Reconcile the phase breakdown against the same E2E span the tracker
+            # above records, so "others" captures every unmeasured segment
+            # (kv-connector finalize, spec-decode remap, grammar, ...).
+            # all_decode: this rank decodes AND no DP peer is prefilling, so the
+            # step ran at decode (not padded prefill) cadence.
+            self.itl_breakdown_tracker.commit(
+                total_s=time.perf_counter() - self.e2e_start_time,
+                is_prefill=is_prefill_phase,
+                all_decode=not is_prefill_phase and not self._dp_any_prefill,
+                token_counts=self._itl_token_counts,
             )
 
         if not self.use_async_scheduling:

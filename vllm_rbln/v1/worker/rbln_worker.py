@@ -648,17 +648,27 @@ class RBLNWorker(WorkerBase):
 
     def shutdown(self) -> None:
         logger.info("v1 rbln_worker shutdown called")
+
+        # Emit metrics FIRST. On interrupt vLLM converts SIGINT/SIGTERM into a
+        # SystemExit, so this runs via worker_main's `finally` block -- but a
+        # later teardown step that throws or hangs would otherwise lose the
+        # collected data, so dump before touching kv-transfer / profiler.
+        if envs.VLLM_RBLN_METRICS:
+            try:
+                if self.model_runner.performance_tracker:
+                    self.model_runner.performance_tracker.print_final_stats()
+                if self.model_runner.e2e_performance_tracker:
+                    self.model_runner.e2e_performance_tracker.print_final_stats()
+                if self.model_runner.itl_breakdown_tracker:
+                    self.model_runner.itl_breakdown_tracker.print_final_stats()
+            except Exception:
+                logger.exception("Failed to emit final RBLN metrics")
+
         # has_kv_transfer_group can be None during interpreter shutdown.
         if ensure_kv_transfer_shutdown is not None:
             ensure_kv_transfer_shutdown()
         if self.profiler is not None:
             self.profiler.shutdown()
-
-        if envs.VLLM_RBLN_METRICS:
-            if self.model_runner.performance_tracker:
-                self.model_runner.performance_tracker.print_final_stats()
-            if self.model_runner.e2e_performance_tracker:
-                self.model_runner.e2e_performance_tracker.print_final_stats()
 
 
 def init_worker_distributed_environment(

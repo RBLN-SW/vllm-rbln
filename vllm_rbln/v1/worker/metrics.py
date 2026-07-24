@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 from collections import defaultdict
 from dataclasses import dataclass, field, replace
@@ -342,6 +343,230 @@ class PerformanceTracker:
         # Padded decode stats
         self.padded_decode_metrics.show_stats("PADDED DECODE")
         logger.info("=" * 80)
+
+
+# ITL breakdown phases, in chronological report order. "others" is not measured
+# directly; it is the remainder (total step latency minus the sum of the
+# measured phases) so the breakdown always sums back to the observed ITL.
+ITL_MEASURED_PHASES = (
+    "prepare_input",
+    "model_forward",
+    "postprocess",
+    "sampler",
+    "draft",
+    "update_state",
+)
+ITL_PHASES = (*ITL_MEASURED_PHASES, "others")
+
+# Step kinds. In DP+EP a rank steps in lockstep with its peers, so a local
+# decode that coincides with any peer still in prefill (decode_mixed) is padded
+# up to the prefill cadence and has a very different ITL from a step where every
+# rank decodes (decode_all, the steady state). Prefill is keyed by this rank's
+# own phase. For dp_size==1 every decode falls in decode_all.
+ITL_KIND_PREFILL = "prefill"
+ITL_KIND_DECODE_ALL = "decode_all"
+ITL_KIND_DECODE_MIXED = "decode_mixed"
+ITL_STEP_KINDS = (ITL_KIND_PREFILL, ITL_KIND_DECODE_ALL, ITL_KIND_DECODE_MIXED)
+
+
+class ITLBreakdownTracker:
+    """Breaks inter-token latency (ITL) down into execution phases.
+
+    One scheduler step spans ``execute_model()`` + ``sample_tokens()``. Phase
+    durations are accumulated into ``_current`` across both calls (via the
+    runner's ``_itl_phase`` context manager) and committed to a per-step-kind
+    aggregate by ``commit()`` at the end of the step. ``commit()`` derives the
+    ``others`` phase as ``total - sum(measured)`` so no time is silently dropped,
+    classifies the step (prefill / decode_all / decode_mixed), and accumulates
+    the per-DP-rank token counts. A step that aborts before ``commit()`` (empty
+    batch, chunked-prefill intermediate, PP mid-stage) is discarded by the next
+    ``reset_step()``.
+    """
+
+    def __init__(self, name: str | None = None):
+        self.name = name
+        # step kind -> phase -> list of per-step latencies in milliseconds.
+        self.latencies: dict[str, dict[str, list[float]]] = {
+            kind: defaultdict(list) for kind in ITL_STEP_KINDS
+        }
+        # step kind -> per-DP-rank cumulative token totals (len == dp_size).
+        self.token_totals: dict[str, list[int]] = {}
+        # step kind -> number of steps contributing to token_totals.
+        self.token_steps: dict[str, int] = defaultdict(int)
+        # phase -> accumulated seconds for the in-flight step.
+        self._current: dict[str, float] = defaultdict(float)
+
+    def reset_step(self) -> None:
+        """Drop any partially-measured step and start a fresh one."""
+        self._current.clear()
+
+    def add_phase(self, name: str, duration_s: float) -> None:
+        """Accumulate ``duration_s`` seconds into phase ``name`` for this step.
+
+        Additive so a phase entered more than once per step (or split across the
+        two calls) sums into a single figure.
+        """
+        self._current[name] += duration_s
+
+    @staticmethod
+    def classify(is_prefill: bool, all_decode: bool) -> str:
+        if is_prefill:
+            return ITL_KIND_PREFILL
+        return ITL_KIND_DECODE_ALL if all_decode else ITL_KIND_DECODE_MIXED
+
+    def commit(
+        self,
+        *,
+        total_s: float,
+        is_prefill: bool,
+        all_decode: bool,
+        token_counts: list[int] | None,
+    ) -> None:
+        """Commit the in-flight step's phase breakdown, then reset.
+
+        ``total_s`` is the full step (ITL) latency; ``others`` is the remainder
+        after the measured phases so the breakdown reconciles to it exactly.
+        ``all_decode`` is the cross-DP "no rank is prefilling" flag and
+        ``token_counts`` the per-DP-rank token workload for this step.
+        """
+        kind = self.classify(is_prefill, all_decode)
+        measured = sum(self._current.get(p, 0.0) for p in ITL_MEASURED_PHASES)
+        target = self.latencies[kind]
+        for phase in ITL_MEASURED_PHASES:
+            target[phase].append(self._current.get(phase, 0.0) * 1000.0)
+        target["others"].append(max(0.0, total_s - measured) * 1000.0)
+
+        if token_counts:
+            totals = self.token_totals.get(kind)
+            if totals is None or len(totals) != len(token_counts):
+                totals = [0] * len(token_counts)
+                self.token_totals[kind] = totals
+            for i, count in enumerate(token_counts):
+                totals[i] += int(count)
+            self.token_steps[kind] += 1
+
+        self.reset_step()
+
+    @staticmethod
+    def _avg(values: list[float]) -> float:
+        return sum(values) / len(values) if values else 0.0
+
+    def _show_stats(self, stat_type: str, kind: str) -> None:
+        data = self.latencies[kind]
+        counts = len(data.get(ITL_PHASES[0], []))
+        if counts == 0:
+            logger.info("%s ITL BREAKDOWN: No data recorded", stat_type)
+            return
+        total = sum(self._avg(data.get(p, [])) for p in ITL_PHASES)
+        logger.info("%s ITL BREAKDOWN:", stat_type)
+        logger.info("  Total steps: %d", counts)
+        logger.info("  Average ITL: %.3f ms", total)
+        for phase in ITL_PHASES:
+            avg = self._avg(data.get(phase, []))
+            pct = (avg / total * 100.0) if total > 0 else 0.0
+            logger.info("  %-14s %8.3f ms (%5.1f%%)", phase, avg, pct)
+        totals = self.token_totals.get(kind)
+        steps = self.token_steps.get(kind, 0)
+        if totals and steps > 0:
+            per_rank = [t / steps for t in totals]
+            logger.info(
+                "  Avg tokens/step per DP rank: [%s] (total %.1f)",
+                ", ".join(f"r{i}={v:.1f}" for i, v in enumerate(per_rank)),
+                sum(per_rank),
+            )
+
+    def _kind_to_dict(self, kind: str, include_raw: bool) -> dict:
+        data = self.latencies[kind]
+        count = len(data.get(ITL_PHASES[0], []))
+        phase_avgs = {p: self._avg(data.get(p, [])) for p in ITL_PHASES}
+        total = sum(phase_avgs.values())
+        phases: dict[str, dict] = {}
+        for phase in ITL_PHASES:
+            avg = phase_avgs[phase]
+            entry = {
+                "avg_ms": avg,
+                "pct": (avg / total * 100.0) if total > 0 else 0.0,
+            }
+            if include_raw:
+                entry["samples_ms"] = list(data.get(phase, []))
+            phases[phase] = entry
+
+        tokens: dict | None = None
+        totals = self.token_totals.get(kind)
+        steps = self.token_steps.get(kind, 0)
+        if totals and steps > 0:
+            per_rank = [t / steps for t in totals]
+            tokens = {
+                "steps": steps,
+                "avg_per_rank": per_rank,
+                "avg_total": sum(per_rank),
+                "cumulative_per_rank": list(totals),
+            }
+
+        return {
+            "count": count,
+            "avg_itl_ms": total,
+            "phases": phases,
+            "tokens": tokens,
+        }
+
+    def to_dict(self, include_raw: bool = True) -> dict:
+        """Serialize the collected ITL breakdown to a plain dict.
+
+        ``include_raw`` keeps the per-step latency samples (``samples_ms``);
+        set False for just the aggregates.
+        """
+        return {
+            "name": self.name,
+            "pid": os.getpid(),
+            "phases_order": list(ITL_PHASES),
+            "steps": {
+                kind: self._kind_to_dict(kind, include_raw)
+                for kind in ITL_STEP_KINDS
+            },
+        }
+
+    def to_json(self, include_raw: bool = True, indent: int | None = 2) -> str:
+        """Return the collected ITL breakdown as a JSON string."""
+        return json.dumps(self.to_dict(include_raw=include_raw), indent=indent)
+
+    def dump_json(self, path: str | None = None, include_raw: bool = True) -> str | None:
+        """Write the ITL breakdown JSON to ``path`` (or VLLM_RBLN_METRICS_JSON_FILE).
+
+        The worker pid is appended before the extension so concurrent TP/DP
+        workers do not clobber one another. Returns the written path, or None
+        when no path is configured or the write fails.
+        """
+        target = path or envs.VLLM_RBLN_METRICS_JSON_FILE
+        if not target:
+            return None
+        root, ext = os.path.splitext(target)
+        out_path = f"{root}.{os.getpid()}{ext or '.json'}"
+        try:
+            with open(out_path, "w") as f:
+                f.write(self.to_json(include_raw=include_raw))
+        except OSError as e:
+            logger.warning("Failed to write ITL metrics JSON %s: %s", out_path, e)
+            return None
+        logger.info("Wrote ITL breakdown JSON to %s", out_path)
+        return out_path
+
+    def print_final_stats(self) -> None:
+        _attach_metrics_file_handler()
+        logger.info("=" * 80)
+        if self.name:
+            logger.info("FINAL ITL BREAKDOWN STATISTICS [%s]", self.name)
+        else:
+            logger.info("FINAL ITL BREAKDOWN STATISTICS")
+        logger.info("=" * 80)
+        self._show_stats("PREFILL", ITL_KIND_PREFILL)
+        logger.info("-" * 40)
+        self._show_stats("DECODE (all ranks decoding)", ITL_KIND_DECODE_ALL)
+        logger.info("-" * 40)
+        self._show_stats("DECODE (mixed: peer prefilling)", ITL_KIND_DECODE_MIXED)
+        logger.info("=" * 80)
+        # Also emit the machine-readable JSON when a target file is configured.
+        self.dump_json()
 
 
 @dataclass
