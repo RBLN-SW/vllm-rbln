@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_ENABLE_WARM_UP: bool = True
     VLLM_RBLN_METRICS: bool = False
     VLLM_RBLN_METRICS_FILE: str = ""
+    VLLM_RBLN_METRICS_DIR: str = ""
     VLLM_RBLN_NUMA: bool = True
 
     # ====================================================================
@@ -223,6 +224,8 @@ environment_variables = {
     # The worker pid is appended before the extension to keep TP/DP workers
     # from clobbering each other. Empty disables file output.
     "VLLM_RBLN_METRICS_FILE": lambda: os.environ.get("VLLM_RBLN_METRICS_FILE", ""),
+    # Directory for per-worker JSON performance reports (empty disables).
+    "VLLM_RBLN_METRICS_DIR": lambda: os.environ.get("VLLM_RBLN_METRICS_DIR", ""),
     # Enable NUMA-based CPU affinity binding for OpenMP threads
     "VLLM_RBLN_NUMA": (
         lambda: os.environ.get("VLLM_RBLN_NUMA", "True").lower() in ("true", "1")
