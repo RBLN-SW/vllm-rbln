@@ -85,6 +85,11 @@ def _generate_model_path_name(
     config_hash = hashlib.sha256(config_json.encode()).hexdigest()[:16]
 
     sanitized_name = model_name.replace("/", "_").replace(":", "_")
+    # DEBUG: dump the exact hash inputs so a compile and a later rbln-run can be
+    # diffed to find why they resolve to different compiled_models/<hash> paths.
+    logger.info(
+        "[compile-cache-key] %s_%s <- %s", sanitized_name, config_hash, config_json
+    )
     return f"{sanitized_name}_{config_hash}"
 
 
