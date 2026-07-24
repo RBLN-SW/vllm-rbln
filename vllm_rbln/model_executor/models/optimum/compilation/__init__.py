@@ -124,7 +124,6 @@ class RBLNCompileSpec:
                 block_size,
                 max_model_len,
                 num_devices,
-                memory_budget,
             )
         elif is_multi_modal(config):
             spec = cls._for_multimodal(
@@ -203,17 +202,17 @@ class RBLNCompileSpec:
         block_size: int,
         max_model_len: int,
         num_devices: int,
-        memory_budget: float,
     ) -> "RBLNCompileSpec":
         _, model_cls_name = get_rbln_model_info(config)
         model_cls = getattr(optimum.rbln, model_cls_name)
         assert model_cls is not None
 
+        # NOTE: memory_budget is a decoder-only knob. Pooling/encoder RBLN
+        # configs reject it ("Unexpected arguments"), so it is omitted here.
         rbln_config: dict[str, Any] = {
             "num_devices": num_devices,
             "batch_size": batch_size,
             "max_seq_len": max_model_len,
-            "memory_budget": memory_budget,
         }
         # FIXME: We need a more generalized logic to specify block sizes
         # as the number of supported models continues to grow.
