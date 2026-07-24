@@ -1,0 +1,4 @@
+# CUDA prefill environment. Keep this aligned with pyproject.toml's vLLM version.
+vllm==0.18.0
+nixl==1.1.0
+nixl-cu12==1.1.0

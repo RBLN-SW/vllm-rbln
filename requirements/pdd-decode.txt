@@ -1,0 +1,5 @@
+# Packages needed by both sides of the NIXL transfer. The editable project
+# installation performed by scripts/setup_pdd_envs.sh supplies vLLM-RBLN,
+# optimum-rbln, rebel-compiler, and CPU vLLM.
+nixl==1.1.0
+nixl-cu12==1.1.0

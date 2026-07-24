@@ -37,7 +37,7 @@ WORK_REPO = Path(
     os.environ.get("PDD_VLLM_RBLN_REPO", SCRIPT_DIR)
 ).expanduser().resolve()
 VENV_ROOT = Path(
-    os.environ.get("PDD_VENV_ROOT", Path.home() / ".venvs")
+    os.environ.get("PDD_VENV_ROOT", SCRIPT_DIR / ".venvs")
 ).expanduser().resolve()
 
 CUDA_PREFILL_VENV = Path(
@@ -50,6 +50,7 @@ RBLN_DECODE_VENV = Path(
 CUDA_VLLM_BIN = CUDA_PREFILL_VENV / "bin" / "vllm"
 RBLN_VLLM_BIN = RBLN_DECODE_VENV / "bin" / "vllm"
 RBLN_PYTHON_BIN = RBLN_DECODE_VENV / "bin" / "python3"
+SETUP_SCRIPT = SCRIPT_DIR / "scripts" / "setup_pdd_envs.sh"
 
 PROXY_SCRIPT = (
     WORK_REPO
@@ -78,7 +79,7 @@ MAX_NUM_SEQS = 1
 TENSOR_PARALLEL_SIZE = 1
 PREFILL_GPU_MEMORY_UTILIZATION = "0.20"
 
-DEFAULT_PROMPT = "What is 2 + 10 ?"
+DEFAULT_PROMPT = "Capital of South Korea is"
 DEFAULT_MAX_TOKENS = 8
 DEFAULT_TEMPERATURE = 0.0
 
@@ -628,6 +629,42 @@ def _validate_config() -> None:
         )
 
 
+def _environments_are_ready() -> bool:
+    return all(
+        path.is_file() and os.access(path, os.X_OK)
+        for path in (CUDA_VLLM_BIN, RBLN_VLLM_BIN, RBLN_PYTHON_BIN)
+    )
+
+
+def _setup_environments() -> None:
+    if _environments_are_ready():
+        return
+    if os.environ.get("PDD_AUTO_SETUP", "1").lower() in {"0", "false", "no"}:
+        raise RuntimeError(
+            "P/D virtual environments are missing and automatic setup is disabled. "
+            f"Run {SETUP_SCRIPT} manually."
+        )
+    if not SETUP_SCRIPT.is_file():
+        raise FileNotFoundError(f"Environment setup script not found: {SETUP_SCRIPT}")
+
+    print("[setup] P/D virtual environments are missing.")
+    print("[setup] Creating them now; the first run can take several minutes.")
+    setup_env = os.environ.copy()
+    setup_env.update(
+        {
+            "PDD_VLLM_RBLN_REPO": str(WORK_REPO),
+            "PDD_PREFILL_VENV": str(CUDA_PREFILL_VENV),
+            "PDD_DECODE_VENV": str(RBLN_DECODE_VENV),
+        }
+    )
+    subprocess.run(
+        ["bash", str(SETUP_SCRIPT)],
+        cwd=str(SCRIPT_DIR),
+        env=setup_env,
+        check=True,
+    )
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Start prefill/decode/proxy servers and run one completion.",
@@ -688,6 +725,11 @@ def _parse_args() -> argparse.Namespace:
         "--no-cleanup-stale",
         action="store_true",
         help="Do not terminate stale vLLM/proxy processes occupying managed ports.",
+    )
+    parser.add_argument(
+        "--no-setup",
+        action="store_true",
+        help="Do not automatically create missing P/D virtual environments.",
     )
     return parser.parse_args()
 
@@ -817,6 +859,9 @@ def main() -> int:
     completion_url = f"http://{HOST}:{PROXY_PORT}/v1/completions"
 
     try:
+        if args.no_setup:
+            os.environ["PDD_AUTO_SETUP"] = "0"
+        _setup_environments()
         _validate_config()
 
         prefill_model = args.prefill_model or args.model
