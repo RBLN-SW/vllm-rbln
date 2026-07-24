@@ -22,7 +22,7 @@ from vllm_rbln.patches import register_patch
 @register_patch(
     target="vllm.model_executor.models.qwen2_moe.Qwen2MoeSparseMoeBlock.forward",
     reason=(
-        "To remove the unnecessary reshape and use the RBLN FusedMoE router-callable "
+        "To remove the unnecessary reshape and use the RBLNMoERunner router-callable "
         "interface. (PR#367)"
     ),
 )
