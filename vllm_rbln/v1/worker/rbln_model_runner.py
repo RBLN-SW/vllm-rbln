@@ -2782,12 +2782,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 self.kv_cache_view_infos,
             )
 
-    def _reconcile_cross_dp_no_spec(self, scheduler_output: object) -> None:
+    def _reconcile_cross_dp_no_spec(
+        self, scheduler_output: RBLNSchedulerOutput
+    ) -> None:
         """Force rank to no-spec (qlen=1) if ANY DP rank elected no-spec."""
         # DP 1 or no spec dec
         if self.parallel_config.data_parallel_size <= 1 or self.num_spec_tokens <= 0:
             return
-        local_no_spec = getattr(scheduler_output, "step_no_spec_required", False)
+        local_no_spec = scheduler_output.step_no_spec_required
         # > 1, some rank no-spec
         reduced = bool(
             RBLNDPMetadata.num_tokens_across_dp(
