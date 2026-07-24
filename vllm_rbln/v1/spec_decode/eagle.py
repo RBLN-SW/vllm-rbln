@@ -322,7 +322,7 @@ class RBLNEagleProposer(EagleProposer):
         token_indices_to_sample, num_rejected_tokens = eagle_prepare_inputs_padded(
             spec_decode_metadata.cu_num_draft_tokens,
             valid_sampled_tokens_count,
-            common_attn_metadata.query_start_loc,
+            common_attn_metadata.query_start_loc_cpu,
         )
 
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
