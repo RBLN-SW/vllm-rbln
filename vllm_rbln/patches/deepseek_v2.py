@@ -23,7 +23,7 @@ from vllm_rbln.patches import register_patch
     target="vllm.model_executor.models.deepseek_v2.DeepseekV2MoE.forward",
     reason=(
         "Replace DeepseekV2MoE.forward with an RBLN-friendly form: call the "
-        "RBLN FusedMoE with a `router` callback and keep 3-D tensors (no "
+        "RBLNMoERunner with a `router` callback and keep 3-D tensors (no "
         "reshape)."
     ),
 )

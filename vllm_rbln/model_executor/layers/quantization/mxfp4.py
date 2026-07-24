@@ -14,7 +14,6 @@
 
 import torch
 from vllm.model_executor.layers.fused_moe import (
-    FusedMoE,
     FusedMoEConfig,
     FusedMoEMethodBase,
     FusedMoEParallelConfig,
@@ -132,7 +131,7 @@ class RBLNGptOssMxfp4MoEMethod(GptOssMxfp4MoEMethod):
     @property
     def is_monolithic(self) -> bool:
         # Prevent vLLM from trying to initialize modular-kernel plumbing.
-        # RBLN FusedMoE.forward calls apply() directly.
+        # RBLNMoERunner.forward calls apply() directly.
         return True
 
     @property
@@ -189,7 +188,7 @@ class RBLNGptOssMxfp4MoEMethod(GptOssMxfp4MoEMethod):
 
     def apply(
         self,
-        layer: FusedMoE,
+        layer: RoutedExperts,
         x: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor:
