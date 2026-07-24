@@ -57,6 +57,15 @@ class RBLNRejectionSampler(RejectionSampler):
     ):
         super().__init__(sampler, spec_config, device)
 
+        # NOTE(RBLN): Config-fixed spec length. The compiled rejection-sample op
+        # is dynamic=False, so padding its inputs to the per-step actual
+        # `metadata.max_spec_len` (which varies 1..num_spec under variable-length
+        # methods like ngram) forces a recompile per distinct value. Padding
+        # to this fixed length instead keeps the op shape static.
+        num_spec_tokens = (
+            spec_config.num_speculative_tokens if spec_config is not None else 0
+        )
+
         if envs.VLLM_RBLN_SAMPLER:
             assert not self.synthetic_mode, (
                 "RBLNRejectionSampler does not support synthetic rejection "
@@ -64,7 +73,7 @@ class RBLNRejectionSampler(RejectionSampler):
                 "`VLLM_RBLN_SAMPLER=0` for this mode."
             )
         self.impl = (
-            RBLNRejectionSamplerImpl(compile_context)
+            RBLNRejectionSamplerImpl(compile_context, num_spec_tokens)
             if envs.VLLM_RBLN_SAMPLER
             else TorchRejectionSamplerImpl()
         )
@@ -299,8 +308,13 @@ class TorchRejectionSamplerImpl(RejectionSamplerImpl):
 class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
     max_spec_len = 32
 
-    def __init__(self, compile_context: "CompileContext | None" = None):
+    def __init__(
+        self,
+        compile_context: "CompileContext | None" = None,
+        num_spec_tokens: int = 0,
+    ):
         super().__init__()
+        self.num_spec_tokens = num_spec_tokens or self.max_spec_len
 
         compile_context = (
             compile_context or create_compile_context(use_global_ctx=True)
@@ -337,6 +351,11 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         assert draft_probs is None or draft_probs.ndim == 2
         assert cu_num_draft_tokens.ndim == 1
         assert target_probs.ndim == 2
+
+        # NOTE(RBLN): Ignore the per-step actual `max_spec_len` and pad the op
+        # inputs to the config-fixed length.
+        assert max_spec_len <= self.num_spec_tokens
+        max_spec_len = self.num_spec_tokens
 
         batch_size = len(num_draft_tokens)
         num_tokens = draft_token_ids.shape[0]
