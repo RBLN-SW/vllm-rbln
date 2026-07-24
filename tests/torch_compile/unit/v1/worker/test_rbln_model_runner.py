@@ -88,6 +88,7 @@ def get_vllm_config(
     max_num_batched_tokens: int = 128,
     max_model_len: int = 4096,
     block_size: int = BLOCK_SIZE,
+    pipeline_parallel_size: int = 1,
 ) -> VllmConfig:
     model_config = ModelConfig(
         model="meta-llama/Llama-3.2-1B-Instruct",
@@ -106,7 +107,9 @@ def get_vllm_config(
         cache_dtype="auto",
         enable_prefix_caching=True,
     )
-    parallel_config = ParallelConfig()
+    parallel_config = ParallelConfig(
+        pipeline_parallel_size=pipeline_parallel_size,
+    )
 
     return VllmConfig(
         model_config=model_config,
@@ -149,6 +152,59 @@ def rbln_model_runner():
         runner = RBLNModelRunner(vllm_config, DEVICE_TYPE)
         initialize_kv_cache(runner)
         yield runner
+
+
+def _build_runner_for_bucketing(*, max_num_seqs, pipeline_parallel_size):
+    """Construct a runner far enough to expose ``bucketing_manager``.
+
+    With no ``speculative_config`` the runner's ``__init__`` touches no
+    distributed group (the only such access is guarded by
+    ``speculative_config``), so a ``pp > 1`` runner can be built in-process
+    without a real multi-rank setup. ``initialize_kv_cache`` is intentionally
+    skipped -- the decode bucketing is fixed in ``__init__``.
+    """
+    vllm_config = get_vllm_config(
+        max_num_seqs=max_num_seqs,
+        pipeline_parallel_size=pipeline_parallel_size,
+    )
+    with set_current_vllm_config(vllm_config):
+        model_config = vllm_config.model_config
+        num_heads = model_config.get_num_kv_heads(vllm_config.parallel_config)
+        head_size = model_config.get_head_size()
+        vllm_config.compilation_config.static_forward_context["layer.0"] = Attention(
+            num_heads,
+            head_size,
+            scale=0.1,
+            prefix="layer.0",
+        )
+        return RBLNModelRunner(vllm_config, DEVICE_TYPE)
+
+
+@pytest.mark.parametrize(
+    ("max_num_seqs", "pp_size"),
+    [
+        (4, 1),  # non-PP: compiled decode batch == max_num_seqs
+        (4, 2),  # PP=2: compiled decode batch == max_num_seqs // pp_size == 2
+        (2, 2),  # regression: max_num_seqs=2, pp=2 -> per-stage 1 (was 2)
+    ],
+)
+def test_decode_bucketing_uses_per_pp_stage_batch(max_num_seqs, pp_size):
+    """The compiled decode bucket must be the per-PP-stage batch
+    (``max_num_seqs // pp_size``) -- the single source of truth shared with the
+    scheduler's decode admission cap -- not the raw ``max_num_seqs``.
+
+    Regression: the refactor wired the runner's bucketing to the raw
+    ``max_num_seqs``, so PP compiled an oversized decode graph (e.g. [2] instead
+    of [1] at ``max_num_seqs=2, pp=2``) while the scheduler still capped decode
+    admission at 1.
+    """
+    runner = _build_runner_for_bucketing(
+        max_num_seqs=max_num_seqs, pipeline_parallel_size=pp_size
+    )
+    # Largest compiled bucket is the per-PP-stage decode batch.
+    assert max(runner.bucketing_manager.decode_batch_buckets) == (
+        max_num_seqs // pp_size
+    )
 
 
 @pytest.fixture
@@ -247,6 +303,9 @@ def _schedule_new_request(
         num_common_prefix_blocks=[],
         finished_req_ids=set(),
         free_encoder_mm_hashes=[],
+        # New requests are always prefilled: stamp the step phase the runner's
+        # is_prefill_phase() reads (execute_model consumes this directly).
+        is_prefill_step=True,
     )
 
 
@@ -1331,10 +1390,11 @@ def test_prepare_inputs_num_spec_tokens_without_scheduled_drafts_uses_logical_le
     # tokens. This can happen for zero-draft ngram/suffix steps or boundary cases.
     monkeypatch.setattr(rbln_model_runner, "num_spec_tokens", 2)
 
-    # Force decode state. is_prefill must be False.
+    # Force decode state.
     ib.num_computed_tokens_cpu[0] = 3
     ib.num_tokens_no_spec[0] = 3
-    assert rbln_model_runner.is_prefill is False
+    rbln_model_runner._is_prefill_step = False
+    assert rbln_model_runner.is_prefill_phase() is False
 
     scheduler_output = RBLNSchedulerOutput(
         scheduled_new_reqs=[],
@@ -1442,31 +1502,22 @@ def test_prepare_kv_sharing_fast_prefill_pads_with_last_index(rbln_model_runner)
     assert result.tolist() == [0, 2, 5]
 
 
-def test_is_prefill_boundary_properties(rbln_model_runner):
-    """is_prefill: num_computed < num_tokens_no_spec - 1 (boundary at ==);
-    is_intermediate_chunked_prefill = is_prefill AND discard_mask[0];
+def test_is_intermediate_chunked_prefill_and_logits_flags(rbln_model_runner):
+    """is_intermediate_chunked_prefill = is_prefill_phase() AND discard_mask[0];
     use_wrapped_compute_logits = not pooling."""
-    ib = rbln_model_runner.input_batch
 
-    def set_state(computed, nts, discard):
-        ib.num_computed_tokens_cpu[0] = computed
-        ib.num_tokens_no_spec[0] = nts
+    def set_state(is_prefill, discard):
+        # is_intermediate_chunked_prefill reads the scheduler-stamped phase
+        # (is_prefill_phase() == _is_prefill_step).
+        rbln_model_runner._is_prefill_step = is_prefill
         rbln_model_runner.discard_request_mask[0] = discard
 
-    # is_prefill: strictly less than nts - 1.
-    set_state(1, 5, False)
-    assert rbln_model_runner.is_prefill is True  # 1 < 4
-    set_state(4, 5, False)
-    assert rbln_model_runner.is_prefill is False  # 4 < 4 -> boundary == decode
-    set_state(5, 5, False)
-    assert rbln_model_runner.is_prefill is False  # past boundary
-
-    # is_intermediate_chunked_prefill = is_prefill AND discard_mask[0].
-    set_state(1, 5, True)  # prefill + discarded chunk
+    # is_intermediate_chunked_prefill = is_prefill_phase() AND discard_mask[0].
+    set_state(True, True)  # prefill + discarded chunk
     assert rbln_model_runner.is_intermediate_chunked_prefill is True
-    set_state(1, 5, False)  # prefill, last chunk kept
+    set_state(True, False)  # prefill, last chunk kept
     assert rbln_model_runner.is_intermediate_chunked_prefill is False
-    set_state(4, 5, True)  # NOT prefill -> False regardless
+    set_state(False, True)  # NOT prefill -> False regardless
     assert rbln_model_runner.is_intermediate_chunked_prefill is False
 
     # Generation model (fixture) is not a pooling model.
@@ -1488,6 +1539,8 @@ def test_sample_skips_sampler_for_intermediate_chunked_prefill(
     # Make is_prefill True:
     ib.num_computed_tokens_cpu[0] = 1
     ib.num_tokens_no_spec[0] = 5
+    # is_intermediate_chunked_prefill reads the scheduler-stamped phase.
+    rbln_model_runner._is_prefill_step = True
 
     # Make is_intermediate_chunked_prefill True:
     rbln_model_runner.discard_request_mask[0] = True
@@ -2330,7 +2383,7 @@ def test_execute_model_prefill_passes_token_indices_and_stores_execute_state(
     assert output is None
 
     # Prefill runs the real input preparation path.
-    assert rbln_model_runner.is_prefill is True
+    assert rbln_model_runner.is_prefill_phase() is True
     assert attn_metadata_calls["num_tokens"] == 3
     assert attn_metadata_calls["num_reqs"] == 1
     assert attn_metadata_calls["max_query_len"] == 3
@@ -2362,8 +2415,8 @@ def test_execute_model_prefill_passes_token_indices_and_stores_execute_state(
 def test_execute_model_decode_slices_logits_by_logits_indices(
     rbln_model_runner, dist_init, monkeypatch
 ):
-    """Decode execution should store only logits selected by runner-owned
-    logits_indices before sampling."""
+    """Plain decode execution stores the full bucket-padded logits (no
+    pre-slicing); logits_indices pre-slicing applies only to spec decode."""
     req_ids = ("req_0", "req_1")
     rbln_model_runner._update_states(
         _schedule_new_request(
@@ -2387,7 +2440,7 @@ def test_execute_model_decode_slices_logits_by_logits_indices(
     ib.num_tokens_no_spec[:2] = [4, 4]
     rbln_model_runner.requests["req_0"].output_token_ids = [101]
     rbln_model_runner.requests["req_1"].output_token_ids = [202]
-    assert rbln_model_runner.is_prefill is False
+    assert rbln_model_runner.is_prefill_phase() is False
 
     scheduler_output = RBLNSchedulerOutput(
         scheduled_new_reqs=[],
@@ -2407,6 +2460,7 @@ def test_execute_model_decode_slices_logits_by_logits_indices(
         num_common_prefix_blocks=[],
         finished_req_ids=set(),
         free_encoder_mm_hashes=[],
+        is_prefill_step=False,
     )
 
     attn_metadata_calls: dict[str, Any] = {}
@@ -2446,7 +2500,7 @@ def test_execute_model_decode_slices_logits_by_logits_indices(
     output = rbln_model_runner.execute_model(scheduler_output)
 
     assert output is None
-    assert rbln_model_runner.is_prefill is False
+    assert rbln_model_runner.is_prefill_phase() is False
 
     # Decode path uses one query token per request and does not pass token_indices
     # to wrapped compute_logits.
@@ -2471,12 +2525,12 @@ def test_execute_model_decode_slices_logits_by_logits_indices(
     assert state.sample_hidden_states is hidden_states
     assert state.aux_hidden_states is None
 
-    # Critical contract: padded logits are sliced by logits_indices before
-    # sample_tokens() sees them.
-    output_logits = state.logits[attn_metadata_calls["logits_indices"]]
-    expected_logits = logits[attn_metadata_calls["logits_indices"]]
-    assert torch.equal(output_logits, expected_logits)
-    assert output_logits.shape == (2, vocab_size)
+    # Since the bucket-pad-sampler change (c040dcee), plain decode keeps the
+    # full bucket-padded logits; execute_model pre-slices by logits_indices only
+    # for spec decode (spec_decode_metadata is not None). The bucket-padded
+    # sampler consumes the padded rows downstream.
+    assert state.logits is logits
+    assert state.logits.shape == (padded_reqs, vocab_size)
 
 
 def test_execute_model_spec_decode_stores_spec_metadata_and_common_attention_metadata(
@@ -2505,7 +2559,7 @@ def test_execute_model_spec_decode_stores_spec_metadata_and_common_attention_met
     ib.num_computed_tokens_cpu[0] = 3
     ib.num_tokens_no_spec[0] = 4
     rbln_model_runner.requests[req_id].output_token_ids = [101]
-    assert rbln_model_runner.is_prefill is False
+    assert rbln_model_runner.is_prefill_phase() is False
 
     monkeypatch.setattr(rbln_model_runner, "num_spec_tokens", 2)
 
@@ -2527,6 +2581,7 @@ def test_execute_model_spec_decode_stores_spec_metadata_and_common_attention_met
         num_common_prefix_blocks=[],
         finished_req_ids=set(),
         free_encoder_mm_hashes=[],
+        is_prefill_step=False,
     )
 
     common_attn_metadata = SimpleNamespace(max_seq_len=6)
@@ -2566,7 +2621,7 @@ def test_execute_model_spec_decode_stores_spec_metadata_and_common_attention_met
     output = rbln_model_runner.execute_model(scheduler_output)
 
     assert output is None
-    assert rbln_model_runner.is_prefill is False
+    assert rbln_model_runner.is_prefill_phase() is False
 
     assert attn_metadata_calls["num_tokens"] == 3
     assert attn_metadata_calls["num_reqs"] == 1
@@ -3065,8 +3120,6 @@ def test_take_draft_token_ids_returns_current_req_ids_and_draft_ids(
 def test_determine_batch_padding_decode_uses_bucket(rbln_model_runner, monkeypatch):
     """Prefill keeps the unpadded request count; decode uses the bucketing
     manager. With data_parallel_size == 1, token padding metadata stays None."""
-    ib = rbln_model_runner.input_batch
-
     fake_bucketing_manager = FakeBucketingManager(default=4)
     monkeypatch.setattr(
         rbln_model_runner,
@@ -3076,11 +3129,10 @@ def test_determine_batch_padding_decode_uses_bucket(rbln_model_runner, monkeypat
 
     assert rbln_model_runner.parallel_config.data_parallel_size == 1
 
-    # Prefill path:
-    # is_prefill == num_computed_tokens < num_tokens_no_spec - 1
-    ib.num_computed_tokens_cpu[0] = 0
-    ib.num_tokens_no_spec[0] = 8
-    assert rbln_model_runner.is_prefill is True
+    # Prefill path: _determine_batch_padding selects the graph via the
+    # scheduler-stamped phase.
+    rbln_model_runner._is_prefill_step = True
+    assert rbln_model_runner.is_prefill_phase() is True
 
     num_reqs_padded, num_tokens_padded, num_tokens_across_dp = (
         rbln_model_runner._determine_batch_padding(
@@ -3094,11 +3146,9 @@ def test_determine_batch_padding_decode_uses_bucket(rbln_model_runner, monkeypat
     assert num_tokens_across_dp is None
     assert fake_bucketing_manager.calls == []
 
-    # Decode path:
-    # boundary condition for decode: computed == num_tokens_no_spec - 1
-    ib.num_computed_tokens_cpu[0] = 7
-    ib.num_tokens_no_spec[0] = 8
-    assert rbln_model_runner.is_prefill is False
+    # Decode path: select the decode graph via the scheduler-stamped phase.
+    rbln_model_runner._is_prefill_step = False
+    assert rbln_model_runner.is_prefill_phase() is False
 
     num_reqs_padded, num_tokens_padded, num_tokens_across_dp = (
         rbln_model_runner._determine_batch_padding(
@@ -3118,12 +3168,9 @@ def test_determine_batch_padding_data_parallel_prefill_uses_max_num_tokens(
 ):
     """Data-parallel prefill should use max_num_tokens padding and return
     cross-rank token counts."""
-    ib = rbln_model_runner.input_batch
-
-    # Force prefill.
-    ib.num_computed_tokens_cpu[0] = 0
-    ib.num_tokens_no_spec[0] = 8
-    assert rbln_model_runner.is_prefill is True
+    # Force prefill via the scheduler-stamped phase.
+    rbln_model_runner._is_prefill_step = True
+    assert rbln_model_runner.is_prefill_phase() is True
 
     monkeypatch.setattr(
         rbln_model_runner.parallel_config,
@@ -3199,12 +3246,9 @@ def test_determine_batch_padding_specialized_moe_decode_uses_decode_bucket(
 ):
     """Specialized MoE decode should bucket by request count and pad by the
     request bucket times the per-request query length."""
-    ib = rbln_model_runner.input_batch
-
-    # Force decode.
-    ib.num_computed_tokens_cpu[0] = 7
-    ib.num_tokens_no_spec[0] = 8
-    assert rbln_model_runner.is_prefill is False
+    # Force decode via the scheduler-stamped phase.
+    rbln_model_runner._is_prefill_step = False
+    assert rbln_model_runner.is_prefill_phase() is False
 
     monkeypatch.setattr(
         rbln_model_runner.parallel_config,
