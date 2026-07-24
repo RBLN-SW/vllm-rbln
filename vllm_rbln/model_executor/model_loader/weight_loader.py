@@ -27,6 +27,7 @@ from vllm.model_executor.layers.fused_moe.config import FusedMoEParallelConfig
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
+    remap_moe_expert_weights,
 )
 from vllm.model_executor.models import (
     deepseek_v2,
@@ -229,19 +230,6 @@ def load_qwen3moe_weights(
                 continue
         #######
 
-        if self.quant_config is not None and (
-            scale_name := self.quant_config.get_cache_scale(name)
-        ):
-            # Loading kv cache quantization scales
-            param = params_dict[scale_name]
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            assert loaded_weight.numel() == 1, (
-                f"KV scale numel {loaded_weight.numel()} != 1"
-            )
-            loaded_weight = loaded_weight.squeeze()
-            weight_loader(param, loaded_weight)
-            loaded_params.add(scale_name)
-            continue
         if "scale" in name or "zero_point" in name:
             name = maybe_remap_kv_scale_name(name, params_dict)
             if name is None:
@@ -806,7 +794,7 @@ def load_gptoss_mxfp4_weights(
     tp_rank_start = tp_rank * per_rank_intermediate_size
     tp_rank_end = min((tp_rank + 1) * per_rank_intermediate_size, intermediate_size)
 
-    for name, weight in weights:
+    for name, weight in remap_moe_expert_weights(weights, params_dict):
         if name.startswith("layers"):
             layer_idx = int(name.split(".")[1])
             if layer_idx >= self.config.num_hidden_layers:
