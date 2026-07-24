@@ -68,6 +68,7 @@ if TYPE_CHECKING:
     # --- MOE ---
     VLLM_RBLN_SPECIALIZE_MOE_DECODE: bool = True
     VLLM_RBLN_USE_MOE_TOKENS_MASK: bool = True
+    VLLM_RBLN_PP_BALANCE_DECODE_BATCH: bool = True
     VLLM_RBLN_DISPATCH_ALL2ALL: bool = False
     VLLM_RBLN_COMBINE_ALL2ALL: bool = False
     # --- DECODE BATCH BUCKET ---
@@ -215,6 +216,15 @@ environment_variables = {
     "VLLM_RBLN_ENABLE_WARM_UP": (
         lambda: (
             os.environ.get("VLLM_RBLN_ENABLE_WARM_UP", "True").lower() in ("true", "1")
+        )
+    ),
+    # Under pipeline parallelism, distribute the per-step decode batch across
+    # PP stages (dynamic soft cap ~ceil(demand/pp_size)) so microbatches do not
+    # collapse to depth-1. No-op when pipeline_parallel_size == 1.
+    "VLLM_RBLN_PP_BALANCE_DECODE_BATCH": (
+        lambda: (
+            os.environ.get("VLLM_RBLN_PP_BALANCE_DECODE_BATCH", "True").lower()
+            in ("true", "1")
         )
     ),
     "VLLM_RBLN_METRICS": (
