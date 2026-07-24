@@ -123,6 +123,10 @@ def make_fake_runner(
         kv_cache_view_infos=[],
         compile_context=object(),
         is_prefill=is_prefill,
+        # eagle.propose reads the scheduler-stamped phase via the method
+        # is_prefill_phase() (feat(pp) replaced the per-rank is_prefill property),
+        # so the fake must expose it as a callable, not just the bool attribute.
+        is_prefill_phase=lambda: is_prefill,
         is_intermediate_chunked_prefill=is_intermediate_chunked_prefill,
         # _build_dummy_attn_metadata only consumes the cumsum (arange ignored).
         _get_cumsum_and_arange=lambda num_tokens, cumsum_dtype=None: (
