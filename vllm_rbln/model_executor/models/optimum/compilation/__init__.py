@@ -243,6 +243,16 @@ class RBLNCompileSpec:
             )
         model_cls = getattr(optimum.rbln, model_cls_name)
         assert model_cls is not None
+        # gemma3 forces image_prefill_chunk_size == mm_tokens_per_image and then
+        # requires text prefill_chunk_size == image_prefill_chunk_size, else it
+        # raises "Not implemented for different prefill chunk sizes ...". So the
+        # text chunk is dictated by the model; pin it to mm_tokens_per_image
+        # rather than the vllm-derived default. (gemma4 buckets image prefill
+        # independently, so it is unaffected.)
+        if model_name == "gemma3":
+            prefill_chunk_size = getattr(
+                config, "mm_tokens_per_image", prefill_chunk_size
+            )
         # Pass the resolved prefill_chunk_size so each compile_fn pins it on the
         # compiled model, keeping it in sync with the KV-cache block padding.
         rbln_config = compile_fn(
