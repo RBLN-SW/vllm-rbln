@@ -16,11 +16,13 @@
 import copy
 import os
 import time
+from pathlib import Path
 from types import NoneType
 from typing import TYPE_CHECKING
 
 import numba
 import torch
+from rebel.profiler import profile as rbln_profile
 
 try:
     import torch.rbln
@@ -108,6 +110,65 @@ class RBLNWorker(WorkerBase):
         self._rbln_cpu_affinity_applied = False
 
         profiler_config = vllm_config.profiler_config
+        rbln_profiler_enabled = os.environ.get("RBLN_PROFILER") == "1"
+        rbln_profiler_output_dir = envs.VLLM_RBLN_DEVICE_PROFILER_DIR
+        profiler_mode = getattr(profiler_config, "profiler", None)
+
+        if profiler_config.torch_profiler_dir and rbln_profiler_enabled:
+            raise ValueError(
+                "Torch profiler and RBLN device profiler cannot be enabled "
+                "simultaneously."
+            )
+        if rbln_profiler_output_dir is not None and not rbln_profiler_enabled:
+            raise ValueError(
+                "VLLM_RBLN_DEVICE_PROFILER_DIR requires RBLN_PROFILER=1."
+            )
+        if (
+            rbln_profiler_output_dir is not None
+            and rbln_profiler_enabled
+            and profiler_mode != "cuda"
+        ):
+            raise ValueError(
+                "RBLN device profiling requires profiler=cuda to expose "
+                "vLLM's /start_profile and /stop_profile API routes. "
+                "RBLNWorker dispatches those routes only to the RBLN "
+                "device profiler."
+            )
+
+        self._rbln_profiler_output_dir = (
+            Path(rbln_profiler_output_dir)
+            if rbln_profiler_output_dir is not None
+            else None
+        )
+        if (
+            self._rbln_profiler_output_dir is not None
+            and not self._rbln_profiler_output_dir.is_absolute()
+        ):
+            raise ValueError(
+                "VLLM_RBLN_DEVICE_PROFILER_DIR must be an absolute path."
+            )
+        if self._rbln_profiler_output_dir is not None:
+            model_parallel_enabled = (
+                getattr(self.parallel_config, "tensor_parallel_size", 1) > 1
+                or getattr(self.parallel_config, "pipeline_parallel_size", 1) > 1
+                or getattr(self.parallel_config, "data_parallel_size", 1) > 1
+                or bool(
+                    getattr(
+                        self.parallel_config,
+                        "enable_expert_parallel",
+                        False,
+                    )
+                )
+            )
+            if model_parallel_enabled:
+                raise ValueError(
+                    "RBLN device profiling supports exactly one worker; "
+                    "shared multi-worker output directories are not supported."
+                )
+        self._rbln_profiler_context = None
+        self._rbln_profiler_active = False
+        self._rbln_profiler_finished = False
+
         # Set up profiler if profiling is enabled
         if profiler_config.torch_profiler_dir:
             logger.info(
@@ -514,7 +575,65 @@ class RBLNWorker(WorkerBase):
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         return self.model_runner.take_draft_token_ids()
 
+    def _start_rbln_device_profiler(self) -> None:
+        output_dir = self._rbln_profiler_output_dir
+        if output_dir is None:
+            raise RuntimeError("RBLN device profiler is not enabled.")
+        if self._rbln_profiler_active:
+            logger.info("RBLN device profiler is already active.")
+            return
+        if self._rbln_profiler_finished:
+            raise RuntimeError(
+                "RBLN device profiler capture has already completed for this worker."
+            )
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        if any(output_dir.iterdir()):
+            raise RuntimeError(
+                "RBLN device profiler output directory must be empty: "
+                f"{output_dir}"
+            )
+
+        context = rbln_profile(output_dir=str(output_dir))
+        try:
+            context.__enter__()
+        except Exception:
+            self._rbln_profiler_finished = True
+            raise
+        self._rbln_profiler_context = context
+        self._rbln_profiler_active = True
+        logger.info("RBLN device profiler started: %s", output_dir)
+
+    def _stop_rbln_device_profiler(self) -> None:
+        if not self._rbln_profiler_active:
+            logger.info("RBLN device profiler is not active.")
+            return
+
+        context = self._rbln_profiler_context
+        if context is None:
+            self._rbln_profiler_active = False
+            self._rbln_profiler_finished = True
+            raise RuntimeError("RBLN device profiler context is missing.")
+
+        try:
+            context.__exit__(None, None, None)
+        finally:
+            self._rbln_profiler_context = None
+            self._rbln_profiler_active = False
+            self._rbln_profiler_finished = True
+        logger.info("RBLN device profiler stopped.")
+
     def profile(self, is_start: bool = True, profile_prefix: str | None = None):
+        if self._rbln_profiler_output_dir is not None:
+            # vLLM's public profile routes are gated by its profiler mode.
+            # For this worker, the validated `cuda` route gate is dispatched
+            # exclusively to the public RBLN profiler context below.
+            if is_start:
+                self._start_rbln_device_profiler()
+            else:
+                self._stop_rbln_device_profiler()
+            return
+
         if self.profiler is None:
             raise RuntimeError("Profiler is not enabled.")
         if is_start:
@@ -551,6 +670,13 @@ class RBLNWorker(WorkerBase):
 
     def shutdown(self) -> None:
         logger.info("v1 rbln_worker shutdown called")
+        if self._rbln_profiler_active:
+            try:
+                self._stop_rbln_device_profiler()
+            except Exception:
+                logger.exception(
+                    "Failed to stop the RBLN device profiler during shutdown."
+                )
         # has_kv_transfer_group can be None during interpreter shutdown.
         if ensure_kv_transfer_shutdown is not None:
             ensure_kv_transfer_shutdown()

@@ -32,8 +32,9 @@ from vllm.v1.worker.worker_base import WorkerBase
 # ---------------------------------------------------------------------------
 
 
-def _make_profiler_config(trace_dir=None):
+def _make_profiler_config(trace_dir=None, profiler=None):
     return SimpleNamespace(
+        profiler=profiler,
         torch_profiler_dir=trace_dir,
         torch_profiler_record_shapes=False,
         torch_profiler_with_memory=False,
@@ -100,6 +101,7 @@ def _make_scheduler_config(max_num_batched_tokens=256, max_num_seqs=32):
 
 def _make_vllm_config(
     profiler_trace_dir=None,
+    profiler=None,
     trust_remote_code=False,
     quantization=None,
     enforce_eager=False,
@@ -109,7 +111,10 @@ def _make_vllm_config(
     world_size_across_dp=1,
 ):
     return SimpleNamespace(
-        profiler_config=_make_profiler_config(profiler_trace_dir),
+        profiler_config=_make_profiler_config(
+            profiler_trace_dir,
+            profiler,
+        ),
         parallel_config=_make_parallel_config(
             world_size=world_size,
             data_parallel_size=data_parallel_size,
@@ -138,6 +143,8 @@ def env_cleanup():
         "RBLN_NPUS_PER_DEVICE",
         "RCCL_PORT_GEN",
         "RBLN_NUM_THREADS",
+        "RBLN_PROFILER",
+        "VLLM_RBLN_DEVICE_PROFILER_DIR",
     ]
     saved = {k: os.environ.pop(k, None) for k in keys}
     yield
@@ -431,6 +438,10 @@ class TestRBLNWorkerInit:
     def test_basic_init(self):
         worker = _create_worker()
         assert worker.profiler is None
+        assert worker._rbln_profiler_output_dir is None
+        assert worker._rbln_profiler_context is None
+        assert worker._rbln_profiler_active is False
+        assert worker._rbln_profiler_finished is False
         assert worker.parallel_config.disable_custom_all_reduce is True
         assert worker._sleep_saved_buffers == {}
 
@@ -442,6 +453,90 @@ class TestRBLNWorkerInit:
         ):
             worker = _create_worker(vllm_config=cfg)
         assert worker.profiler is not None
+
+    def test_rbln_profiler_requires_vendor_activation(self, monkeypatch, tmp_path):
+        monkeypatch.setenv(
+            "VLLM_RBLN_DEVICE_PROFILER_DIR", str(tmp_path / "rbln-profile")
+        )
+
+        with pytest.raises(ValueError, match="requires RBLN_PROFILER=1"):
+            _create_worker()
+
+    def test_rbln_profiler_requires_exact_vendor_activation(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("RBLN_PROFILER", "true")
+        monkeypatch.setenv(
+            "VLLM_RBLN_DEVICE_PROFILER_DIR", str(tmp_path / "rbln-profile")
+        )
+
+        with pytest.raises(ValueError, match="requires RBLN_PROFILER=1"):
+            _create_worker()
+
+    def test_rbln_profiler_requires_absolute_output_dir(self, monkeypatch):
+        monkeypatch.setenv("RBLN_PROFILER", "1")
+        monkeypatch.setenv(
+            "VLLM_RBLN_DEVICE_PROFILER_DIR", "relative/rbln-profile"
+        )
+
+        with pytest.raises(ValueError, match="must be an absolute path"):
+            _create_worker(
+                vllm_config=_make_vllm_config(profiler="cuda")
+            )
+
+    def test_rbln_profiler_requires_public_api_route_gate(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("RBLN_PROFILER", "1")
+        monkeypatch.setenv(
+            "VLLM_RBLN_DEVICE_PROFILER_DIR",
+            str(tmp_path / "rbln-profile"),
+        )
+
+        with pytest.raises(ValueError, match="profiler=cuda"):
+            _create_worker()
+
+    @pytest.mark.parametrize(
+        "parallel_field",
+        (
+            "tensor_parallel_size",
+            "pipeline_parallel_size",
+            "data_parallel_size",
+            "enable_expert_parallel",
+        ),
+    )
+    def test_rbln_profiler_rejects_multi_worker_output_collision(
+        self, monkeypatch, tmp_path, parallel_field
+    ):
+        monkeypatch.setenv("RBLN_PROFILER", "1")
+        monkeypatch.setenv(
+            "VLLM_RBLN_DEVICE_PROFILER_DIR",
+            str(tmp_path / "rbln-profile"),
+        )
+        cfg = _make_vllm_config(profiler="cuda")
+        setattr(
+            cfg.parallel_config,
+            parallel_field,
+            True if parallel_field == "enable_expert_parallel" else 2,
+        )
+
+        with pytest.raises(ValueError, match="exactly one worker"):
+            _create_worker(vllm_config=cfg)
+
+    def test_torch_and_rbln_profilers_are_mutually_exclusive(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("RBLN_PROFILER", "1")
+        monkeypatch.setenv(
+            "VLLM_RBLN_DEVICE_PROFILER_DIR", str(tmp_path / "rbln-profile")
+        )
+        cfg = _make_vllm_config(
+            profiler_trace_dir="/tmp/test_trace",
+            profiler="torch",
+        )
+
+        with pytest.raises(ValueError, match="cannot be enabled simultaneously"):
+            _create_worker(vllm_config=cfg)
 
     def test_local_world_size(self):
         cfg = _make_vllm_config(world_size=4)
@@ -1089,6 +1184,73 @@ class TestProfile:
         worker.profiler.stop.assert_called_once()
         worker.profiler.profiler.key_averages.assert_not_called()
 
+    def test_rbln_start_stop_is_idempotent(self, monkeypatch, tmp_path):
+        output_dir = tmp_path / "rbln-profile"
+        monkeypatch.setenv("RBLN_PROFILER", "1")
+        monkeypatch.setenv("VLLM_RBLN_DEVICE_PROFILER_DIR", str(output_dir))
+        worker = _create_worker(
+            vllm_config=_make_vllm_config(profiler="cuda")
+        )
+        context = MagicMock()
+
+        with patch(
+            "vllm_rbln.v1.worker.rbln_worker.rbln_profile",
+            return_value=context,
+        ) as factory:
+            worker.profile(is_start=True)
+            worker.profile(is_start=True)
+
+        factory.assert_called_once_with(output_dir=str(output_dir))
+        context.__enter__.assert_called_once_with()
+        assert output_dir.is_dir()
+        assert worker._rbln_profiler_active is True
+
+        worker.profile(is_start=False)
+        worker.profile(is_start=False)
+
+        context.__exit__.assert_called_once_with(None, None, None)
+        assert worker._rbln_profiler_context is None
+        assert worker._rbln_profiler_active is False
+        assert worker._rbln_profiler_finished is True
+
+    def test_rbln_capture_cannot_restart_after_stop(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("RBLN_PROFILER", "1")
+        monkeypatch.setenv(
+            "VLLM_RBLN_DEVICE_PROFILER_DIR", str(tmp_path / "rbln-profile")
+        )
+        worker = _create_worker(
+            vllm_config=_make_vllm_config(profiler="cuda")
+        )
+
+        with patch(
+            "vllm_rbln.v1.worker.rbln_worker.rbln_profile",
+            return_value=MagicMock(),
+        ):
+            worker.profile(is_start=True)
+            worker.profile(is_start=False)
+            with pytest.raises(RuntimeError, match="already completed"):
+                worker.profile(is_start=True)
+
+    def test_rbln_start_rejects_nonempty_output_dir(self, monkeypatch, tmp_path):
+        output_dir = tmp_path / "rbln-profile"
+        output_dir.mkdir()
+        (output_dir / "stale.pb").write_bytes(b"stale")
+        monkeypatch.setenv("RBLN_PROFILER", "1")
+        monkeypatch.setenv("VLLM_RBLN_DEVICE_PROFILER_DIR", str(output_dir))
+        worker = _create_worker(
+            vllm_config=_make_vllm_config(profiler="cuda")
+        )
+
+        with (
+            patch(
+                "vllm_rbln.v1.worker.rbln_worker.rbln_profile"
+            ) as factory,
+            pytest.raises(RuntimeError, match="must be empty"),
+        ):
+            worker.profile(is_start=True)
+
+        factory.assert_not_called()
+
 
 # ===========================================================================
 # Tests: LoRA methods
@@ -1196,6 +1358,75 @@ class TestShutdown:
         worker.model_runner.e2e_performance_tracker = None
         with patch("vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_METRICS", True):
             worker.shutdown()
+
+    def test_stops_active_rbln_profiler_once(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("RBLN_PROFILER", "1")
+        monkeypatch.setenv(
+            "VLLM_RBLN_DEVICE_PROFILER_DIR", str(tmp_path / "rbln-profile")
+        )
+        worker = _create_worker(
+            vllm_config=_make_vllm_config(profiler="cuda")
+        )
+        worker.model_runner = MagicMock()
+        context = MagicMock()
+
+        with (
+            patch(
+                "vllm_rbln.v1.worker.rbln_worker.rbln_profile",
+                return_value=context,
+            ),
+            patch(
+                "vllm_rbln.v1.worker.rbln_worker.ensure_kv_transfer_shutdown"
+            ) as kv_shutdown,
+            patch(
+                "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_METRICS",
+                False,
+            ),
+        ):
+            worker.profile(is_start=True)
+            worker.shutdown()
+            worker.shutdown()
+
+        context.__exit__.assert_called_once_with(None, None, None)
+        assert kv_shutdown.call_count == 2
+        assert worker._rbln_profiler_active is False
+        assert worker._rbln_profiler_finished is True
+
+    def test_shutdown_continues_when_rbln_profiler_stop_fails(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("RBLN_PROFILER", "1")
+        monkeypatch.setenv(
+            "VLLM_RBLN_DEVICE_PROFILER_DIR", str(tmp_path / "rbln-profile")
+        )
+        worker = _create_worker(
+            vllm_config=_make_vllm_config(profiler="cuda")
+        )
+        worker.model_runner = MagicMock()
+        context = MagicMock()
+        context.__exit__.side_effect = RuntimeError("profiler stop failed")
+
+        with (
+            patch(
+                "vllm_rbln.v1.worker.rbln_worker.rbln_profile",
+                return_value=context,
+            ),
+            patch(
+                "vllm_rbln.v1.worker.rbln_worker.ensure_kv_transfer_shutdown"
+            ) as kv_shutdown,
+            patch(
+                "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_METRICS",
+                False,
+            ),
+        ):
+            worker.profile(is_start=True)
+            worker.shutdown()
+
+        context.__exit__.assert_called_once_with(None, None, None)
+        kv_shutdown.assert_called_once_with()
+        assert worker._rbln_profiler_context is None
+        assert worker._rbln_profiler_active is False
+        assert worker._rbln_profiler_finished is True
 
 
 # ===========================================================================
