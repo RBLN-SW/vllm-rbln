@@ -150,6 +150,29 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _get_warmup_prompt_tokens(
+    requested_prompt_tokens: int,
+    max_model_len: int,
+    warmup_sample_tokens: int,
+) -> int:
+    """Reserve model-length capacity for tokens sampled during warm-up."""
+    if requested_prompt_tokens < 1:
+        raise ValueError("Warm-up prompt length must be at least 1 token.")
+    if max_model_len < 1:
+        raise ValueError("max_model_len must be at least 1 token.")
+    if warmup_sample_tokens < 0:
+        raise ValueError("Warm-up sample token count cannot be negative.")
+
+    max_prompt_tokens = max_model_len - warmup_sample_tokens
+    if max_prompt_tokens < 1:
+        raise ValueError(
+            "Warm-up sampling requires at least one prompt token within "
+            f"max_model_len={max_model_len}, but reserves "
+            f"{warmup_sample_tokens} sampled token(s)."
+        )
+    return min(requested_prompt_tokens, max_prompt_tokens)
+
+
 # Wrapper for ModelRunnerOutput to support overlapped execution.
 class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
     def __init__(
@@ -1888,6 +1911,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self.scheduler_config.max_num_batched_tokens
             if self.scheduler_config.enable_chunked_prefill
             else self.model_config.max_model_len
+        )
+        warmup_sample_tokens = 0 if self.is_pooling_model else 1
+        prefill_seq_len = _get_warmup_prompt_tokens(
+            prefill_seq_len,
+            self.model_config.max_model_len,
+            warmup_sample_tokens,
         )
         dummy_prefill_requests: list[NewRequestData] = []
         dummy_prefill_num_scheduled_tokens: dict[str, int] = {}
