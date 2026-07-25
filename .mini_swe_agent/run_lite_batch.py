@@ -144,7 +144,15 @@ def solve(inst: dict, args, base_url: str, mlctx=None, evc: SandboxClient | None
                 "agent": {"step_limit": args.step_limit},
                 "model": {
                     "model_name": args.model,
-                    "model_kwargs": {"temperature": 0.0, "timeout": 300, "max_tokens": 2048},
+                    # 샘플링 파라미터는 env 로 주입(기본값 = 기존 greedy temp=0).
+                    # top_k 는 OpenAI 표준이 아니라 extra_body 로 vLLM 에 전달.
+                    "model_kwargs": {
+                        "temperature": float(os.getenv("GEN_TEMPERATURE", "0.0")),
+                        "timeout": 300,
+                        "max_tokens": 2048,
+                        **({"top_p": float(os.environ["GEN_TOP_P"])} if os.getenv("GEN_TOP_P") else {}),
+                        **({"extra_body": {"top_k": int(os.environ["GEN_TOP_K"])}} if os.getenv("GEN_TOP_K") else {}),
+                    },
                     # MiniMax 등은 litellm 가격맵에 없어 비용계산이 실패 → 에러 무시(비용 0 처리).
                     "cost_tracking": "ignore_errors",
                 },

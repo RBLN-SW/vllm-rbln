@@ -26,9 +26,10 @@ export RBLN_LOCAL_IP=127.0.0.1
 export GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.8}"
 
 SPEC="${SPEC:-on}"
+NUM_SPEC="${NUM_SPEC:-3}"   # num_speculative_tokens (기본 3)
 SPEC_ARGS=()
 if [ "$SPEC" = "on" ]; then
-  SPEC_ARGS=(--speculative-config '{"method":"ngram","num_speculative_tokens":3,"prompt_lookup_max":5,"prompt_lookup_min":2}')
+  SPEC_ARGS=(--speculative-config "{\"method\":\"ngram\",\"num_speculative_tokens\":${NUM_SPEC},\"prompt_lookup_max\":5,\"prompt_lookup_min\":2}")
 fi
 
 # Name the ITL metrics JSON after the run's knobs (max-num-seqs / spec / sampler)
@@ -56,5 +57,6 @@ exec vllm serve MiniMaxAI/MiniMax-M2.5 \
   --enable-auto-tool-choice \
   --tool-call-parser minimax_m2 \
   --reasoning-parser minimax_m2 \
+  --shutdown-timeout "${SHUTDOWN_TIMEOUT_VLLM:-60}" \
   "${SPEC_ARGS[@]}" \
   --data-parallel-size 4

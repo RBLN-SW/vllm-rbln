@@ -731,6 +731,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # consumed by the ITL breakdown commit in sample_tokens.
         self._dp_any_prefill: bool = False
         self._itl_token_counts: list[int] | None = None
+        self._itl_ctxlen_mean: float | None = None
+        self._itl_ctxlen_max: int | None = None
         self._pending_model_report: StepReport | None = None
         self.e2e_start_time: float = 0.0
         self.e2e_end_time: float = 0.0
@@ -3576,6 +3578,17 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     if num_tokens_across_dp is not None
                     else [num_scheduled_tokens]
                 )
+                # Per-step context (KV) length over the active batch. seq_lens was
+                # just populated by _prepare_inputs (num_computed + scheduled), so
+                # this is each request's current sequence position this step.
+                _nr = self.input_batch.num_reqs
+                if _nr > 0:
+                    _sl = self.seq_lens.np[:_nr]
+                    self._itl_ctxlen_mean = float(_sl.mean())
+                    self._itl_ctxlen_max = int(_sl.max())
+                else:
+                    self._itl_ctxlen_mean = None
+                    self._itl_ctxlen_max = None
 
             slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
                 num_tokens_padded=num_tokens_unpadded,
@@ -4133,6 +4146,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 is_prefill=is_prefill_phase,
                 all_decode=not is_prefill_phase and not self._dp_any_prefill,
                 token_counts=self._itl_token_counts,
+                ctxlen_mean=self._itl_ctxlen_mean,
+                ctxlen_max=self._itl_ctxlen_max,
             )
 
         if not self.use_async_scheduling:

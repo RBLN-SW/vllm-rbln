@@ -393,6 +393,12 @@ class ITLBreakdownTracker:
         self.token_totals: dict[str, list[int]] = {}
         # step kind -> number of steps contributing to token_totals.
         self.token_steps: dict[str, int] = defaultdict(int)
+        # step kind -> per-step context length (mean / max seq_len over the
+        # active batch). Recorded raw (one value per step, index-aligned with the
+        # per-phase latency samples) so ITL can be plotted against context length
+        # rather than blindly averaged over an uncontrolled length distribution.
+        self.ctxlen_mean: dict[str, list[float]] = {k: [] for k in ITL_STEP_KINDS}
+        self.ctxlen_max: dict[str, list[int]] = {k: [] for k in ITL_STEP_KINDS}
         # phase -> accumulated seconds for the in-flight step.
         self._current: dict[str, float] = defaultdict(float)
 
@@ -421,6 +427,8 @@ class ITLBreakdownTracker:
         is_prefill: bool,
         all_decode: bool,
         token_counts: list[int] | None,
+        ctxlen_mean: float | None = None,
+        ctxlen_max: int | None = None,
     ) -> None:
         """Commit the in-flight step's phase breakdown, then reset.
 
@@ -428,6 +436,9 @@ class ITLBreakdownTracker:
         after the measured phases so the breakdown reconciles to it exactly.
         ``all_decode`` is the cross-DP "no rank is prefilling" flag and
         ``token_counts`` the per-DP-rank token workload for this step.
+        ``ctxlen_mean`` / ``ctxlen_max`` are the mean / max context (KV) length
+        over the step's active batch, recorded per step so ITL is comparable at
+        matched context length.
         """
         kind = self.classify(is_prefill, all_decode)
         measured = sum(self._current.get(p, 0.0) for p in ITL_MEASURED_PHASES)
@@ -435,6 +446,10 @@ class ITLBreakdownTracker:
         for phase in ITL_MEASURED_PHASES:
             target[phase].append(self._current.get(phase, 0.0) * 1000.0)
         target["others"].append(max(0.0, total_s - measured) * 1000.0)
+
+        if ctxlen_mean is not None:
+            self.ctxlen_mean[kind].append(round(ctxlen_mean, 1))
+            self.ctxlen_max[kind].append(int(ctxlen_max if ctxlen_max is not None else ctxlen_mean))
 
         if token_counts:
             totals = self.token_totals.get(kind)
@@ -474,6 +489,12 @@ class ITLBreakdownTracker:
                 ", ".join(f"r{i}={v:.1f}" for i, v in enumerate(per_rank)),
                 sum(per_rank),
             )
+        cl = self.ctxlen_mean.get(kind, [])
+        if cl:
+            logger.info(
+                "  Context length (mean seq_len): avg %.0f, range %.0f–%.0f over %d steps",
+                self._avg(cl), min(cl), max(cl), len(cl),
+            )
 
     def _kind_to_dict(self, kind: str, include_raw: bool) -> dict:
         data = self.latencies[kind]
@@ -503,11 +524,27 @@ class ITLBreakdownTracker:
                 "cumulative_per_rank": list(totals),
             }
 
+        cl = self.ctxlen_mean.get(kind, [])
+        clx = self.ctxlen_max.get(kind, [])
+        context: dict | None = None
+        if cl:
+            context = {
+                "avg_mean": self._avg(cl),
+                "min": min(cl),
+                "max": max(cl),
+            }
+            if include_raw:
+                # Per-step raw values (index-aligned with phases[*].samples_ms),
+                # so ITL can be plotted/regressed against context length.
+                context["per_step_mean"] = list(cl)
+                context["per_step_max"] = list(clx)
+
         return {
             "count": count,
             "avg_itl_ms": total,
             "phases": phases,
             "tokens": tokens,
+            "context_length": context,
         }
 
     def to_dict(self, include_raw: bool = True) -> dict:

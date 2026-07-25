@@ -185,3 +185,10 @@ cache_dir/
 rsd_cache_dir/
 docs/query_backfill.md
 docs/cross_dp_spec_decode.md
+
+# ITL breakdown experiment outputs (large, regenerable)
+/itl-sweep-results/
+/itl-sweep-results-spec1/
+/itl-ctx-results/
+/preds.json
+/trajectories/
