@@ -39,7 +39,16 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl_connector import (
 )
 from vllm.v1.core.sched.output import SchedulerOutput
 
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.nixl_read_diagnostic import (
+    DiagnosticContext,
+    NixlReadDiagnostic,
+    safe_status_fields,
+)
 from vllm_rbln.logger import init_logger
+from vllm_rbln.runtime_markers import (
+    correlation_id_from_request_id,
+    get_runtime_marker_sink,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -315,6 +324,15 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
     ) -> None:
         super().__init__(vllm_config, engine_id, kv_cache_config)
 
+        self._phase4b_diagnostic = NixlReadDiagnostic(logger)
+        self._runtime_marker_sink = get_runtime_marker_sink()
+        self._phase4b_diagnostic_contexts: dict[str, DiagnosticContext] = {}
+        self._phase4b_remote_descriptor_meta: dict[
+            tuple[str, int], tuple[tuple[int, int], ...]
+        ] = {}
+        self._runtime_transfer_start_ns: dict[str, int] = {}
+        self._runtime_transfer_fields: dict[str, dict[str, int]] = {}
+        self._runtime_transfer_poll_counts: dict[str, int] = {}
         self.use_host_buffer = self.kv_buffer_device == "cpu"
         self.kv_transfer_config = vllm_config.kv_transfer_config
         assert self.kv_transfer_config is not None
@@ -414,6 +432,16 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
                 return get_xfer_descs(blocks_data, memory_type)
             if not remote_call_done:
                 remote_call_done = True
+                if (
+                    self._phase4b_diagnostic.enabled
+                    or self._runtime_marker_sink.enabled
+                ):
+                    self._phase4b_remote_descriptor_meta[
+                        (nixl_agent_meta.engine_id, remote_tp_rank)
+                    ] = tuple(
+                        (int(descriptor[1]), int(descriptor[2]))
+                        for descriptor in blocks_data
+                    )
                 return get_xfer_descs(blocks_data, remote_memory_type)
             return get_xfer_descs(blocks_data, memory_type)
 
@@ -456,6 +484,19 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
     def sync_recved_kv_to_device(self, req_id, meta):
         if self.external_kv_format == _EXTERNAL_KV_FORMAT_RUNTIME_PRIVATE:
             block_ids = meta.local_physical_block_ids
+            runtime_markers = self._runtime_marker_sink
+            runtime_markers.emit(
+                "kv_transform_start",
+                req_id,
+                phase="kv_transform",
+                source="RblnNixlConnectorWorker.sync_recved_kv_to_device",
+                process_role="npu_engine",
+                correlation_id=correlation_id_from_request_id(req_id),
+                attributes={
+                    "kv.local_block_count": len(block_ids),
+                    "kv.transform_kind": "host_visible_hnd_to_runtime_private",
+                },
+            )
             for layer_name, kv_cache in self.host_xfer_buffers.items():
                 block_slice = (
                     slice(None),
@@ -472,8 +513,524 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
                     kv_cache[block_slice],
                     self.external_kv_source_dtype,
                 )
+            runtime_markers.emit(
+                "kv_transform_end",
+                req_id,
+                phase="kv_transform",
+                source="RblnNixlConnectorWorker.sync_recved_kv_to_device",
+                process_role="npu_engine",
+                correlation_id=correlation_id_from_request_id(req_id),
+                attributes={
+                    "kv.local_block_count": len(block_ids),
+                    "kv.transform_kind": "host_visible_hnd_to_runtime_private",
+                },
+            )
 
         super().sync_recved_kv_to_device(req_id, meta)
+
+    @staticmethod
+    def _phase4b_flatten_block_ids(block_ids: BlockIds) -> list[int]:
+        return [int(block_id) for group in block_ids for block_id in group]
+
+    def _phase4b_build_diagnostic_context(
+        self,
+        *,
+        local_block_ids: BlockIds,
+        remote_block_ids: BlockIds,
+        dst_engine_id: str,
+        request_id: str,
+        remote_rank: int,
+    ) -> tuple[DiagnosticContext, dict[str, Any]]:
+        block_size_ratio = self.kv_topo.block_size_ratio_from_engine_id(dst_engine_id)
+        local_desc_ids = self._get_block_descs_ids(
+            self.engine_id,
+            local_block_ids,
+            block_size_ratio=block_size_ratio,
+        )
+        remote_desc_ids = self._get_block_descs_ids(
+            dst_engine_id,
+            remote_block_ids,
+        )
+
+        local_lengths = [
+            int(self.src_blocks_data[int(desc_id)][1]) for desc_id in local_desc_ids
+        ]
+        remote_meta = self._phase4b_remote_descriptor_meta.get(
+            (dst_engine_id, remote_rank), ()
+        )
+        remote_meta_available = bool(remote_meta) and all(
+            int(desc_id) < len(remote_meta) for desc_id in remote_desc_ids
+        )
+        remote_lengths = (
+            [int(remote_meta[int(desc_id)][0]) for desc_id in remote_desc_ids]
+            if remote_meta_available
+            else []
+        )
+        local_num_blocks = int(
+            self.dst_num_blocks[self.engine_id] * block_size_ratio
+        )
+        remote_num_blocks = int(self.dst_num_blocks[dst_engine_id])
+        local_offsets = [
+            int(desc_id) % local_num_blocks * length
+            for desc_id, length in zip(local_desc_ids, local_lengths)
+        ]
+        remote_offsets = [
+            int(desc_id) % remote_num_blocks * length
+            for desc_id, length in zip(remote_desc_ids, remote_lengths)
+        ]
+        local_total_bytes = sum(local_lengths)
+        remote_total_bytes = sum(remote_lengths)
+        context = DiagnosticContext(
+            request_id=request_id,
+            remote_engine_id=dst_engine_id,
+            logical_block_count=sum(len(group) for group in local_block_ids),
+            descriptor_count=len(local_desc_ids),
+            total_bytes=local_total_bytes,
+        )
+        return context, {
+            "operation": "READ",
+            "local_descriptor_count": len(local_desc_ids),
+            "remote_descriptor_count": len(remote_desc_ids),
+            "local_total_bytes": local_total_bytes,
+            "remote_total_bytes": (
+                remote_total_bytes if remote_meta_available else None
+            ),
+            "remote_descriptor_meta_available": remote_meta_available,
+            "local_block_ids": self._phase4b_flatten_block_ids(local_block_ids),
+            "remote_block_ids": self._phase4b_flatten_block_ids(remote_block_ids),
+            "local_relative_offset_min": min(local_offsets, default=None),
+            "local_relative_offset_max": max(local_offsets, default=None),
+            "remote_relative_offset_min": min(remote_offsets, default=None),
+            "remote_relative_offset_max": max(remote_offsets, default=None),
+            "remote_rank": remote_rank,
+            "block_size_ratio": block_size_ratio,
+        }
+
+    def _read_blocks(
+        self,
+        local_block_ids: BlockIds,
+        remote_block_ids: BlockIds,
+        dst_engine_id: str,
+        request_id: str,
+        remote_request_id: str,
+        remote_rank: int,
+        local_xfer_side_handle: int,
+        remote_xfer_side_handle: int,
+    ):
+        diagnostic = self._phase4b_diagnostic
+        runtime_markers = self._runtime_marker_sink
+        diagnostic_enabled = diagnostic.enabled_for(request_id)
+        runtime_enabled = runtime_markers.enabled_for(request_id)
+        transfer = self.nixl_wrapper.transfer
+        context = DiagnosticContext(
+            request_id=request_id,
+            remote_engine_id=dst_engine_id,
+            logical_block_count=sum(len(group) for group in local_block_ids),
+        )
+        transfer_fields: dict[str, Any] = {
+            "operation": "READ",
+            "local_block_ids": self._phase4b_flatten_block_ids(local_block_ids),
+            "remote_block_ids": self._phase4b_flatten_block_ids(remote_block_ids),
+        }
+        if diagnostic_enabled or runtime_enabled:
+            try:
+                context, transfer_fields = self._phase4b_build_diagnostic_context(
+                    local_block_ids=local_block_ids,
+                    remote_block_ids=remote_block_ids,
+                    dst_engine_id=dst_engine_id,
+                    request_id=request_id,
+                    remote_rank=remote_rank,
+                )
+            except Exception as exception:
+                if diagnostic_enabled:
+                    diagnostic.emit(
+                        "diagnostic_context_exception",
+                        context,
+                        status="exception",
+                        exception=exception,
+                        **transfer_fields,
+                    )
+
+        runtime_transfer_fields = {
+            "kv.logical_block_count": context.logical_block_count,
+            "kv.descriptor_count": context.descriptor_count,
+            "kv.transfer_bytes": context.total_bytes,
+            "kv.remote_block_count": sum(len(group) for group in remote_block_ids),
+            "kv.operation": "READ",
+        }
+
+        def emit_runtime_transfer_start() -> None:
+            self._runtime_transfer_start_ns.setdefault(
+                request_id, time.monotonic_ns()
+            )
+            self._runtime_transfer_fields[request_id] = {
+                "kv.logical_block_count": context.logical_block_count,
+                "kv.descriptor_count": context.descriptor_count,
+                "kv.transfer_bytes": context.total_bytes,
+            }
+            self._runtime_transfer_poll_counts.setdefault(request_id, 0)
+            runtime_markers.emit(
+                "kv_transfer_start",
+                request_id,
+                phase="kv_transfer",
+                source="RblnNixlConnectorWorker._read_blocks.transfer",
+                process_role="npu_engine",
+                correlation_id=correlation_id_from_request_id(request_id),
+                remote_request_id_suffix=str(remote_request_id)[-64:],
+                transfer_id=f"{correlation_id_from_request_id(request_id)}-read",
+                attributes=runtime_transfer_fields,
+            )
+
+        if not diagnostic_enabled:
+            if not runtime_enabled:
+                return super()._read_blocks(
+                    local_block_ids,
+                    remote_block_ids,
+                    dst_engine_id,
+                    request_id,
+                    remote_request_id,
+                    remote_rank,
+                    local_xfer_side_handle,
+                    remote_xfer_side_handle,
+                )
+
+            def runtime_transfer(handle):
+                emit_runtime_transfer_start()
+                try:
+                    return transfer(handle)
+                except Exception:
+                    self._runtime_transfer_start_ns.pop(request_id, None)
+                    self._runtime_transfer_fields.pop(request_id, None)
+                    self._runtime_transfer_poll_counts.pop(request_id, None)
+                    raise
+
+            self.nixl_wrapper.transfer = runtime_transfer
+            try:
+                return super()._read_blocks(
+                    local_block_ids,
+                    remote_block_ids,
+                    dst_engine_id,
+                    request_id,
+                    remote_request_id,
+                    remote_rank,
+                    local_xfer_side_handle,
+                    remote_xfer_side_handle,
+                )
+            finally:
+                self.nixl_wrapper.transfer = transfer
+
+        self._phase4b_diagnostic_contexts[request_id] = context
+        diagnostic.start_watchdog(context)
+        container_size_before = len(self._recving_transfers.get(request_id, ()))
+        make_prepped_xfer = self.nixl_wrapper.make_prepped_xfer
+
+        def diagnostic_make_prepped_xfer(*args, **kwargs):
+            start_ns = diagnostic.now_ns()
+            diagnostic.emit(
+                "make_prepped_xfer_enter",
+                context,
+                status="enter",
+                **transfer_fields,
+            )
+            try:
+                handle = make_prepped_xfer(*args, **kwargs)
+            except Exception as exception:
+                self._runtime_transfer_start_ns.pop(request_id, None)
+                self._runtime_transfer_fields.pop(request_id, None)
+                self._runtime_transfer_poll_counts.pop(request_id, None)
+                diagnostic.emit(
+                    "make_prepped_xfer_exception",
+                    context,
+                    elapsed_ns=diagnostic.now_ns() - start_ns,
+                    status="exception",
+                    exception=exception,
+                    **transfer_fields,
+                )
+                raise
+            diagnostic.emit(
+                "make_prepped_xfer_return",
+                context,
+                elapsed_ns=diagnostic.now_ns() - start_ns,
+                status="returned",
+                handle_type=type(handle).__name__,
+                handle_is_null=handle is None,
+                handle_token=diagnostic.assign_handle_token(handle),
+                **transfer_fields,
+            )
+            return handle
+
+        def diagnostic_transfer(handle):
+            start_ns = diagnostic.now_ns()
+            handle_token = diagnostic.assign_handle_token(handle)
+            diagnostic.emit(
+                "transfer_enter",
+                context,
+                status="enter",
+                prepared_handle_type=type(handle).__name__,
+                handle_token=handle_token,
+                **transfer_fields,
+            )
+            try:
+                emit_runtime_transfer_start()
+                result = transfer(handle)
+            except Exception as exception:
+                self._runtime_transfer_start_ns.pop(request_id, None)
+                self._runtime_transfer_fields.pop(request_id, None)
+                self._runtime_transfer_poll_counts.pop(request_id, None)
+                diagnostic.emit(
+                    "transfer_exception",
+                    context,
+                    elapsed_ns=diagnostic.now_ns() - start_ns,
+                    status="exception",
+                    exception=exception,
+                    prepared_handle_type=type(handle).__name__,
+                    handle_token=handle_token,
+                    **transfer_fields,
+                )
+                raise
+            return_ns = diagnostic.now_ns()
+            diagnostic.note_transfer_return(request_id, return_ns)
+            diagnostic.emit(
+                "transfer_return",
+                context,
+                elapsed_ns=return_ns - start_ns,
+                status="returned",
+                prepared_handle_type=type(handle).__name__,
+                handle_token=handle_token,
+                **safe_status_fields(result),
+                **transfer_fields,
+            )
+            return result
+
+        self.nixl_wrapper.make_prepped_xfer = diagnostic_make_prepped_xfer
+        self.nixl_wrapper.transfer = diagnostic_transfer
+        call_returned = False
+        try:
+            result = super()._read_blocks(
+                local_block_ids,
+                remote_block_ids,
+                dst_engine_id,
+                request_id,
+                remote_request_id,
+                remote_rank,
+                local_xfer_side_handle,
+                remote_xfer_side_handle,
+            )
+            call_returned = True
+        finally:
+            self.nixl_wrapper.make_prepped_xfer = make_prepped_xfer
+            self.nixl_wrapper.transfer = transfer
+
+            container_size_after = len(self._recving_transfers.get(request_id, ()))
+            appended = container_size_after > container_size_before
+            diagnostic.emit(
+                "handle_append",
+                context,
+                status="appended" if appended else "not_appended",
+                container_size_before=container_size_before,
+                container_size_after=container_size_after,
+                handle_appended=appended,
+                read_call_returned=call_returned,
+                **transfer_fields,
+            )
+            if not appended or not call_returned:
+                diagnostic.cancel_watchdog(request_id)
+        return result
+
+    def _pop_done_transfers(
+        self, transfers: dict[str, list[int]]
+    ) -> set[str]:
+        diagnostic = self._phase4b_diagnostic
+        runtime_markers = self._runtime_marker_sink
+        runtime_enabled_requests = {
+            request_id
+            for request_id in transfers
+            if runtime_markers.enabled_for(request_id)
+        }
+        enabled_requests = {
+            request_id
+            for request_id in transfers
+            if diagnostic.enabled_for(request_id)
+        }
+
+        def emit_runtime_transfer_end(done_requests: set[str]) -> None:
+            for request_id in done_requests & runtime_enabled_requests:
+                end_ns = time.monotonic_ns()
+                start_ns = self._runtime_transfer_start_ns.pop(
+                    request_id, None
+                )
+                transfer_fields = self._runtime_transfer_fields.pop(
+                    request_id, {}
+                )
+                poll_count = self._runtime_transfer_poll_counts.pop(
+                    request_id, 0
+                )
+                if start_ns is None:
+                    continue
+                runtime_markers.emit(
+                    "kv_transfer_end",
+                    request_id,
+                    phase="kv_transfer",
+                    source="RblnNixlConnectorWorker._pop_done_transfers",
+                    process_role="npu_engine",
+                    correlation_id=correlation_id_from_request_id(request_id),
+                    transfer_id=(
+                        f"{correlation_id_from_request_id(request_id)}-read"
+                    ),
+                    attributes={
+                        **transfer_fields,
+                        "kv.poll_count": poll_count,
+                        "kv.duration_ns": max(0, end_ns - start_ns),
+                        "kv.transfer_status": "DONE",
+                    },
+                )
+
+        handle_requests = {
+            id(handle): request_id
+            for request_id, handles in transfers.items()
+            if request_id in enabled_requests or request_id in runtime_enabled_requests
+            for handle in handles
+        }
+        check_xfer_state = self.nixl_wrapper.check_xfer_state
+
+        if not enabled_requests:
+            if not runtime_enabled_requests:
+                return super()._pop_done_transfers(transfers)
+
+            def runtime_check_xfer_state(handle):
+                request_id = handle_requests.get(id(handle))
+                if request_id is not None:
+                    self._runtime_transfer_poll_counts[request_id] = (
+                        self._runtime_transfer_poll_counts.get(request_id, 0) + 1
+                    )
+                return check_xfer_state(handle)
+
+            self.nixl_wrapper.check_xfer_state = runtime_check_xfer_state
+            try:
+                done_requests = super()._pop_done_transfers(transfers)
+            finally:
+                self.nixl_wrapper.check_xfer_state = check_xfer_state
+            emit_runtime_transfer_end(done_requests)
+            return done_requests
+
+        get_xfer_telemetry = self.nixl_wrapper.get_xfer_telemetry
+        release_xfer_handle = self.nixl_wrapper.release_xfer_handle
+
+        def context_for(handle) -> tuple[str | None, DiagnosticContext | None]:
+            request_id = handle_requests.get(id(handle))
+            return request_id, self._phase4b_diagnostic_contexts.get(request_id or "")
+
+        def diagnostic_check_xfer_state(handle):
+            request_id, context = context_for(handle)
+            if (
+                request_id is not None
+                and request_id in runtime_enabled_requests
+            ):
+                self._runtime_transfer_poll_counts[request_id] = (
+                    self._runtime_transfer_poll_counts.get(request_id, 0) + 1
+                )
+            if request_id is None or context is None:
+                return check_xfer_state(handle)
+            token = diagnostic.begin_poll(context, handle_present=True)
+            try:
+                status = check_xfer_state(handle)
+            except Exception as exception:
+                diagnostic.fail_poll(
+                    context,
+                    token,
+                    exception,
+                    handle_present=True,
+                )
+                raise
+            diagnostic.finish_poll(
+                context,
+                token,
+                status,
+                handle_present=True,
+            )
+            if status == "DONE":
+                diagnostic.emit(
+                    "done_observed",
+                    context,
+                    status="DONE",
+                    poll_sequence=token.sequence,
+                    handle_token=diagnostic.handle_token(handle),
+                )
+            return status
+
+        def diagnostic_get_xfer_telemetry(handle):
+            request_id, context = context_for(handle)
+            if request_id is None or context is None:
+                return get_xfer_telemetry(handle)
+            start_ns = diagnostic.now_ns()
+            diagnostic.emit(
+                "telemetry_enter",
+                context,
+                status="enter",
+                handle_token=diagnostic.handle_token(handle),
+            )
+            result = get_xfer_telemetry(handle)
+            diagnostic.emit(
+                "telemetry_return",
+                context,
+                elapsed_ns=diagnostic.now_ns() - start_ns,
+                status="returned",
+                handle_token=diagnostic.handle_token(handle),
+            )
+            return result
+
+        def diagnostic_release_xfer_handle(handle):
+            request_id, context = context_for(handle)
+            if request_id is None or context is None:
+                return release_xfer_handle(handle)
+            start_ns = diagnostic.now_ns()
+            diagnostic.emit(
+                "handle_release_enter",
+                context,
+                status="enter",
+                handle_token=diagnostic.handle_token(handle),
+            )
+            result = release_xfer_handle(handle)
+            diagnostic.emit(
+                "handle_release_return",
+                context,
+                elapsed_ns=diagnostic.now_ns() - start_ns,
+                status="returned",
+                handle_token=diagnostic.handle_token(handle),
+            )
+            diagnostic.forget_handle(handle)
+            return result
+
+        self.nixl_wrapper.check_xfer_state = diagnostic_check_xfer_state
+        self.nixl_wrapper.get_xfer_telemetry = diagnostic_get_xfer_telemetry
+        self.nixl_wrapper.release_xfer_handle = diagnostic_release_xfer_handle
+        try:
+            done_requests = super()._pop_done_transfers(transfers)
+        finally:
+            self.nixl_wrapper.check_xfer_state = check_xfer_state
+            self.nixl_wrapper.get_xfer_telemetry = get_xfer_telemetry
+            self.nixl_wrapper.release_xfer_handle = release_xfer_handle
+
+        emit_runtime_transfer_end(done_requests)
+        for request_id in done_requests & enabled_requests:
+            context = self._phase4b_diagnostic_contexts.get(request_id)
+            if context is None:
+                continue
+            diagnostic.emit(
+                "handle_container_remove",
+                context,
+                status="removed",
+                container_present=request_id in transfers,
+                poll_count=diagnostic.poll_count(request_id),
+            )
+            diagnostic.emit(
+                "finished_recving_add",
+                context,
+                status="added",
+                poll_count=diagnostic.poll_count(request_id),
+            )
+            diagnostic.cancel_watchdog(request_id)
+        return done_requests
 
     def get_finished(self) -> tuple[set[str], set[str]]:
         failed_recv_reqs = set(self._failed_recv_reqs)
@@ -484,4 +1041,17 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
         done_sending, done_recving = super().get_finished()
         if failed_recv_reqs:
             done_recving = (done_recving or set()) | failed_recv_reqs
+        for req_id in done_recving or ():
+            self._runtime_transfer_start_ns.pop(req_id, None)
+            self._runtime_transfer_fields.pop(req_id, None)
+            self._runtime_transfer_poll_counts.pop(req_id, None)
+            context = self._phase4b_diagnostic_contexts.get(req_id)
+            if context is not None:
+                self._phase4b_diagnostic.emit(
+                    "finished_recving_return",
+                    context,
+                    status="returned",
+                )
+                self._phase4b_diagnostic.finish_request(req_id)
+                self._phase4b_diagnostic_contexts.pop(req_id, None)
         return done_sending, done_recving

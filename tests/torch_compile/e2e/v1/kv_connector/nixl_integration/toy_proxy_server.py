@@ -16,6 +16,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import argparse
+import hashlib
 import itertools
 import logging
 import os
@@ -26,8 +27,11 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 
+from vllm_rbln.runtime_markers import get_runtime_marker_sink
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
+runtime_markers = get_runtime_marker_sink()
 
 
 @asynccontextmanager
@@ -86,14 +90,19 @@ async def lifespan(app: FastAPI):
         f"and {len(app.state.decode_clients)} decode clients."
     )
 
-    yield
+    try:
+        yield
+    finally:
+        try:
+            # Shutdown: Close all clients.
+            for client_info in app.state.prefill_clients:
+                await client_info["client"].aclose()
 
-    # Shutdown: Close all clients
-    for client_info in app.state.prefill_clients:
-        await client_info["client"].aclose()
-
-    for client_info in app.state.decode_clients:
-        await client_info["client"].aclose()
+            for client_info in app.state.decode_clients:
+                await client_info["client"].aclose()
+        finally:
+            # Preserve marker-write statistics even if client cleanup fails.
+            runtime_markers.finalize()
 
 
 # Update FastAPI app initialization to use lifespan
@@ -227,21 +236,89 @@ async def _handle_completions(api: str, request: Request):
     try:
         req_data = await request.json()
         request_id = str(uuid.uuid4())
+        client_request_id = request.headers.get("x-request-id", "")
+        client_request_id_hash = (
+            hashlib.sha256(client_request_id.encode("utf-8")).hexdigest()[:16]
+            if client_request_id
+            else None
+        )
+        runtime_markers.emit(
+            "request_received",
+            request_id,
+            phase="request",
+            source="toy_proxy.wrapper",
+            process_role="proxy",
+            correlation_id=request_id,
+            attributes={
+                "request.api": api,
+                "proxy.client_request_id_hash": client_request_id_hash,
+            },
+        )
 
         # Get the next prefill client in round-robin fashion
         prefill_client_info = get_next_client(request.app, "prefill")
 
         # Send request to prefill service
+        runtime_markers.emit(
+            "prefill_start",
+            request_id,
+            phase="prefill",
+            source="toy_proxy.prefill_wrapper",
+            process_role="proxy",
+            correlation_id=request_id,
+            attributes={"prefill.client_index": prefill_client_info["id"]},
+        )
         response = await send_request_to_service(
             prefill_client_info, api, req_data, request_id
         )
+        runtime_markers.emit(
+            "prefill_end",
+            request_id,
+            phase="prefill",
+            source="toy_proxy.prefill_wrapper",
+            process_role="proxy",
+            correlation_id=request_id,
+            attributes={
+                "prefill.client_index": prefill_client_info["id"],
+                "http.status_code": response.status_code,
+            },
+        )
 
         # Extract the needed fields
+        runtime_markers.emit(
+            "kv_export_start",
+            request_id,
+            phase="kv_export",
+            source="toy_proxy.kv_metadata",
+            process_role="proxy",
+            correlation_id=request_id,
+            attributes={},
+        )
         response_json = response.json()
         await response.aclose()  # CRITICAL: Release connection back to pool
         kv_transfer_params = response_json.get("kv_transfer_params", {})
         if kv_transfer_params:
             req_data["kv_transfer_params"] = kv_transfer_params
+        remote_block_ids = kv_transfer_params.get("remote_block_ids") or ()
+        block_count = sum(
+            len(group) if isinstance(group, (list, tuple)) else 1
+            for group in remote_block_ids
+        )
+        runtime_markers.emit(
+            "kv_export_end",
+            request_id,
+            phase="kv_export",
+            source="toy_proxy.kv_metadata",
+            process_role="proxy",
+            correlation_id=request_id,
+            remote_request_id_suffix=str(
+                kv_transfer_params.get("remote_request_id", "")
+            )[-64:],
+            attributes={
+                "kv.metadata_present": bool(kv_transfer_params),
+                "kv.remote_block_count": block_count,
+            },
+        )
 
         # Get the next decode client in round-robin fashion
         decode_client_info = get_next_client(request.app, "decode")
@@ -254,6 +331,15 @@ async def _handle_completions(api: str, request: Request):
                 decode_client_info, api, req_data, request_id=request_id
             ):
                 yield chunk
+            runtime_markers.emit(
+                "response_done",
+                request_id,
+                phase="response",
+                source="toy_proxy.response_stream",
+                process_role="proxy",
+                correlation_id=request_id,
+                attributes={"response.stream_exhausted": True},
+            )
 
         return StreamingResponse(generate_stream(), media_type="application/json")
 

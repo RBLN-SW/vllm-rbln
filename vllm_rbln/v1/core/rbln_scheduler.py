@@ -31,7 +31,15 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.utils import record_function_or_nullcontext
 
 import vllm_rbln.rbln_envs as envs
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.nixl_read_diagnostic import (
+    DiagnosticContext,
+    NixlReadDiagnostic,
+)
 from vllm_rbln.logger import init_logger
+from vllm_rbln.runtime_markers import (
+    correlation_id_from_request_id,
+    get_runtime_marker_sink,
+)
 from vllm_rbln.v1.core.rbln_kv_cache_manager import (
     KVCacheCopyOp,
     RBLNKVCacheManager,
@@ -61,6 +69,8 @@ class RBLNScheduler(Scheduler):
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
+        self._phase4b_diagnostic = NixlReadDiagnostic(logger)
+        self._runtime_marker_sink = get_runtime_marker_sink()
 
         # Replace the upstream KVCacheManager with RBLNKVCacheManager
         # when sub-block prefix caching is enabled.
@@ -97,6 +107,71 @@ class RBLNScheduler(Scheduler):
                 self.block_size,
                 sub_block_size,
             )
+
+    def _update_from_kv_xfer_finished(self, kv_connector_output):
+        finished_recving = tuple(kv_connector_output.finished_recving or ())
+        for request_id in finished_recving:
+            if not self._phase4b_diagnostic.enabled_for(request_id):
+                continue
+            request = self.requests.get(request_id)
+            self._phase4b_diagnostic.emit(
+                "finished_recving_scheduler_input",
+                DiagnosticContext(request_id=request_id),
+                status="received",
+                request_status_before=request.status.name if request else None,
+            )
+
+        result = super()._update_from_kv_xfer_finished(kv_connector_output)
+
+        for request_id in finished_recving:
+            if not self._phase4b_diagnostic.enabled_for(request_id):
+                continue
+            request = self.requests.get(request_id)
+            self._phase4b_diagnostic.emit(
+                "finished_recving_scheduler_add",
+                DiagnosticContext(request_id=request_id),
+                status="added"
+                if request_id in self.finished_recving_kv_req_ids
+                else "not_added",
+                request_status_after=request.status.name if request else None,
+            )
+        return result
+
+    def _try_promote_blocked_waiting_request(self, request: Request) -> bool:
+        status_before = request.status
+        result = super()._try_promote_blocked_waiting_request(request)
+        if (
+            status_before == RequestStatus.WAITING_FOR_REMOTE_KVS
+            and self._phase4b_diagnostic.enabled_for(request.request_id)
+            and self._phase4b_diagnostic.should_emit_state(
+                request.request_id,
+                "scheduler_transition",
+                "promoted" if result else request.status.name,
+                force=result,
+            )
+        ):
+            self._phase4b_diagnostic.emit(
+                "scheduler_transition",
+                DiagnosticContext(request_id=request.request_id),
+                status="promoted" if result else "blocked",
+                request_status_before=status_before.name,
+                request_status_after=request.status.name,
+                promoted=result,
+            )
+        if status_before == RequestStatus.WAITING_FOR_REMOTE_KVS and result:
+            self._runtime_marker_sink.emit(
+                "decode_loop_start",
+                request.request_id,
+                phase="decode",
+                source="RBLNScheduler._try_promote_blocked_waiting_request",
+                process_role="npu_engine",
+                correlation_id=correlation_id_from_request_id(request.request_id),
+                attributes={
+                    "scheduler.status_before": status_before.name,
+                    "scheduler.status_after": request.status.name,
+                },
+            )
+        return result
 
     def schedule(self) -> RBLNSchedulerOutput:
         # Copied from vllm.v1.core.sched.Scheduler.schedule: https://github.com/vllm-project/vllm/blob/v0.18.0/vllm/v1/core/sched/scheduler.py#L338-L927
@@ -908,6 +983,24 @@ class RBLNScheduler(Scheduler):
     ) -> dict[int, EngineCoreOutputs]:
         assert isinstance(scheduler_output, RBLNSchedulerOutput)
         result = super().update_from_output(scheduler_output, model_runner_output)
+
+        for engine_outputs in result.values():
+            for output in engine_outputs.outputs:
+                if output.finish_reason is None:
+                    continue
+                self._runtime_marker_sink.emit(
+                    "decode_loop_end",
+                    output.request_id,
+                    phase="decode",
+                    source="RBLNScheduler.update_from_output",
+                    process_role="npu_engine",
+                    correlation_id=correlation_id_from_request_id(
+                        output.request_id
+                    ),
+                    attributes={
+                        "scheduler.finish_reason": str(output.finish_reason),
+                    },
+                )
 
         if isinstance(self.kv_cache_manager, RBLNKVCacheManager):
             # Now that execute_model has written KV data and
