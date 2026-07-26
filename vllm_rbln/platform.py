@@ -51,9 +51,7 @@ try:
 except ImportError:
     HAS_TORCH_RBLN = False
 
-USE_DEVICE_TENSOR: bool = (
-    envs.VLLM_RBLN_USE_VLLM_MODEL and envs.VLLM_RBLN_USE_DEVICE_TENSOR
-)
+VLLM_RBLN_USE_VLLM_MODEL: bool = envs.VLLM_RBLN_USE_VLLM_MODEL
 # RBLN default for an unset max_num_seqs (upstream vLLM defaults to 256).
 RBLN_DEFAULT_MAX_NUM_SEQS = 1
 
@@ -65,6 +63,14 @@ def bypass_backend(graph_module: torch.fx.GraphModule, example_inputs):
 register_backend(name="bypass", compiler_fn=bypass_backend)
 
 
+def _derive_platform_attrs(use_vllm_model: bool) -> dict:
+    return {
+        "device_name": "rbln" if use_vllm_model else "cpu",
+        "device_type": "rbln" if use_vllm_model else "cpu",
+        "dist_backend": "rbln-ccl" if use_vllm_model else "",
+    }
+
+
 class RblnPlatform(Platform):
     _enum = PlatformEnum.OOT
 
@@ -73,9 +79,11 @@ class RblnPlatform(Platform):
     # VLLM_WORKER_MULTIPROC_METHOD=spawn (which re-import this module fresh)
     # observe identical values to the parent without any extra plumbing.
     plugin_name: str = "rbln"
-    device_name: str = "rbln" if USE_DEVICE_TENSOR else "cpu"
-    device_type: str = "rbln" if USE_DEVICE_TENSOR else "cpu"
-    dist_backend: str = "rbln-ccl" if USE_DEVICE_TENSOR else ""
+    _frozen_attrs = _derive_platform_attrs(VLLM_RBLN_USE_VLLM_MODEL)
+    device_name: str = _frozen_attrs["device_name"]
+    device_type: str = _frozen_attrs["device_type"]
+    dist_backend: str = _frozen_attrs["dist_backend"]
+    del _frozen_attrs
     dispatch_key: str = "CPU"
     ray_device_key: str = "RBLN"
     device_control_env_var: str = "RBLN_DEVICES"
@@ -240,6 +248,7 @@ class RblnPlatform(Platform):
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
+        cls._guard_import_time_envs()
         if envs.VLLM_USE_V2_MODEL_RUNNER:
             raise ValueError(
                 "VLLM_USE_V2_MODEL_RUNNER is not supported for RBLN backend."
@@ -299,14 +308,6 @@ class RblnPlatform(Platform):
 
             # FIXME(jiwoo.park) This is a temporary workaround.
             if model_config.enforce_eager:
-                if not USE_DEVICE_TENSOR:
-                    raise ValueError(
-                        "enforce_eager=True requires VLLM_RBLN_USE_DEVICE_TENSOR=1. "
-                        "Eager mode bypasses torch.compile, so ops must dispatch "
-                        "to a real device='rbln' rather than the compile-backend "
-                        "fake-CPU tensors used by the default vLLM model path."
-                    )
-
                 hf_config = vllm_config.model_config.hf_config
                 assert not hasattr(hf_config, "sliding_window") or not getattr(
                     hf_config, "use_sliding_window", True
@@ -558,13 +559,12 @@ class RblnPlatform(Platform):
 
     @classmethod
     def get_nixl_supported_devices(cls) -> dict[str, tuple[str, ...]]:
-        # kv_buffer_device "cpu" is the host-bounce path; "rbln" is the D2D
+        # kv_buffer_device "rbln" is the D2D path; "cpu" is the host-bounce
         # path (upstream NixlConnectorWorker.__init__ rejects kv_buffer_device
-        # values not listed here). Listed under both device_types because
-        # device_type is "rbln" only when VLLM_RBLN_USE_DEVICE_TENSOR and
-        # VLLM_RBLN_USE_VLLM_MODEL are both set.
+        # values not listed here). Only device_type "rbln" is listed: the NIXL
+        # connector requires VLLM_RBLN_USE_VLLM_MODEL, which is also what makes
+        # device_type "rbln".
         return {
-            "cpu": ("cpu", "rbln"),
             "rbln": ("rbln", "cpu"),
         }
 
@@ -590,3 +590,20 @@ class RblnPlatform(Platform):
             additional_kwargs["kv_cache_bases"] = kwargs["kv_cache_bases"]
 
         return additional_kwargs
+
+    @classmethod
+    def _guard_import_time_envs(cls) -> None:
+        expected = _derive_platform_attrs(envs.VLLM_RBLN_USE_VLLM_MODEL)
+        actual = {name: getattr(cls, name) for name in expected}
+        if expected != actual:
+            details = ", ".join(
+                f"{name}: frozen={actual[name]!r} but current env implies "
+                f"{expected[name]!r}"
+                for name in expected
+                if actual[name] != expected[name]
+            )
+            raise RuntimeError(
+                f"RBLN platform attributes do not match the current env ({details}). "
+                "VLLM_RBLN_USE_VLLM_MODEL is read only once, at `import vllm`. "
+                "Please set it before importing vllm."
+            )
