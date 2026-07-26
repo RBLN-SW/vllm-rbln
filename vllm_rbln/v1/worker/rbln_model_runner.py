@@ -3729,12 +3729,14 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 additional_kwargs=self._get_kv_cache_forward_context_kwargs(),
             ),
             record_function_or_nullcontext("Forward"),
-            self._itl_phase("model_forward"),
             self.maybe_get_kv_connector_output(
                 scheduler_output,
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
+            # Split the Forward block: input reshape/pad/H2D/LoRA prep
+            # (reshape_h2d) vs the pure model_executable call (model_forward).
+            _fwd_prep_t0 = time.perf_counter()
             self._attach_kv_cache_bindings(attn_metadata)
 
             # FIXME(jiwoo.park) This is a temporary workaround;
@@ -3818,6 +3820,16 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     inputs_embeds=inputs_embeds,
                     **model_kwargs,
                 )
+            model_end_time = time.perf_counter()
+            if self.itl_breakdown_tracker is not None:
+                # reshape_h2d = block-enter .. model call (reshape/pad/H2D/LoRA);
+                # model_forward = the pure model_executable call.
+                self.itl_breakdown_tracker.add_phase(
+                    "reshape_h2d", model_start_time - _fwd_prep_t0
+                )
+                self.itl_breakdown_tracker.add_phase(
+                    "model_forward", model_end_time - model_start_time
+                )
             if self.performance_tracker is not None:
                 # Stash model timing; combined with sampler timing in _sample().
                 padded_decode = (
@@ -3827,7 +3839,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 )
                 self._pending_model_report = StepReport.from_reports(
                     model_start_time,
-                    time.perf_counter(),
+                    model_end_time,
                     reports,
                     token_count=num_scheduled_tokens,
                     is_prefill=is_prefill_phase,

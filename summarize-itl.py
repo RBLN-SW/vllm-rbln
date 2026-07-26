@@ -15,6 +15,7 @@ import sys
 
 PHASES = [
     "prepare_input",
+    "reshape_h2d",
     "model_forward",
     "postprocess",
     "sampler",

@@ -350,6 +350,7 @@ class PerformanceTracker:
 # measured phases) so the breakdown always sums back to the observed ITL.
 ITL_MEASURED_PHASES = (
     "prepare_input",
+    "reshape_h2d",
     "model_forward",
     "postprocess",
     "sampler",
