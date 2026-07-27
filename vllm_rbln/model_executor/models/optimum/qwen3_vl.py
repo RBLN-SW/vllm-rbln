@@ -15,6 +15,7 @@ from dataclasses import replace
 from typing import Any
 
 import torch
+from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.qwen2_5_vl import (
     Qwen2_5_VLVideoPixelInputs,
@@ -24,6 +25,53 @@ from .base import ModelInputForRBLN
 from .qwen2_vl import MODALITIES, RBLNOptimumQwen2_5_VLForConditionalGeneration
 
 logger = init_logger(__name__)
+
+
+class RBLNMambaStateIndexAllocator:
+    """Assigns each request a stable ``batch_idx`` into the linear-attention
+    (GatedDeltaNet) conv/recurrent state cache, for its whole lifetime.
+
+    That cache is a fixed ``[max_num_seqs]`` on-device tensor owned by
+    optimum-rbln and indexed by batch ROW: prefill writes one row (``batch_idx``)
+    and decode reads/writes every row. vLLM's ``req_id_to_index`` cannot be used
+    as that row because ``InputBatch.condense()`` reassigns it when requests
+    finish, whereas the recurrent state lives at a fixed address. So we pin our
+    own ``batch_idx`` per request (allocate on prefill, free on finish). This
+    mirrors vLLM's mamba ``state_indices`` but only allocates the index — the
+    cache itself is owned by optimum-rbln.
+    """
+
+    def __init__(self, max_batch_size: int) -> None:
+        self._max_batch_size = max_batch_size
+        # Free rows of the [max_num_seqs] state cache, kept sorted (lowest first).
+        self._free: list[int] = list(range(max_batch_size))
+        # req_id -> its pinned batch_idx (row) for the request's lifetime.
+        self._batch_idx_of: dict[str, int] = {}
+
+    def allocate(self, req_id: str) -> int:
+        """``batch_idx`` for ``req_id``, taking the lowest free row on first use."""
+        if req_id not in self._batch_idx_of:
+            if not self._free:
+                # vLLM caps concurrent requests at max_num_seqs, so this should
+                # be unreachable; fail loud rather than pop an empty list.
+                raise RuntimeError(
+                    f"No free linear-attention batch index for request "
+                    f"{req_id!r}: all {self._max_batch_size} rows are in use."
+                )
+            self._batch_idx_of[req_id] = self._free.pop(0)
+        return self._batch_idx_of[req_id]
+
+    def indices(self, req_ids: list[str]) -> list[int]:
+        """``batch_idx`` of each already-allocated request, in the given order."""
+        return [self._batch_idx_of[req_id] for req_id in req_ids]
+
+    def free(self, req_ids: list[str]) -> None:
+        """Return finished requests' batch indices to the pool."""
+        for req_id in req_ids:
+            batch_idx = self._batch_idx_of.pop(req_id, None)
+            if batch_idx is not None:
+                self._free.append(batch_idx)
+        self._free.sort()
 
 
 class RBLNOptimumQwen3VLForConditionalGeneration(
@@ -368,6 +416,13 @@ class RBLNOptimumQwen3_5ForConditionalGeneration(
     on-device paged KV cache.
     """
 
+    def __init__(self, vllm_config: VllmConfig) -> None:
+        super().__init__(vllm_config=vllm_config)
+        # Per-request slot into the [max_num_seqs] conv/recurrent state cache.
+        self._state_index_allocator = RBLNMambaStateIndexAllocator(
+            self.scheduler_config.max_num_seqs
+        )
+
     def _add_model_specific_args(self, preprocess_args: dict, video_input: Any):
         # Qwen3.5 (like Qwen3-VL) has no ``second_per_grid_ts``; its ``get_rope_index``
         # separates videos by timestamps instead.
@@ -379,8 +434,6 @@ class RBLNOptimumQwen3_5ForConditionalGeneration(
         video_grid_thw: torch.Tensor,
         second_per_grid_ts: torch.Tensor | None = None,
     ):
-        # Qwen2.5-VL's version raises when ``second_per_grid_ts`` is None; Qwen3.5 never
-        # has it, so build the carrier without requiring it (mirrors Qwen3-VL).
         return Qwen2_5_VLVideoPixelInputs(
             type="pixel_values_videos",
             pixel_values_videos=pixel_values_videos,
@@ -394,52 +447,84 @@ class RBLNOptimumQwen3_5ForConditionalGeneration(
         # embed_input_ids() image-token scatter, so this must be correct.
         return self.model.config.image_token_id
 
+    def compute_decode_position_embed(
+        self, model_input: ModelInputForRBLN, mrope_position_deltas: dict[str, float]
+    ) -> torch.Tensor:
+        # The base builds ``[2, max_num_seqs, ...]`` with the running requests at
+        # rows ``[0, n)``. Re-place each at its stable ``batch_idx`` row so the whole
+        # decode batch (position_embed / inputs_embeds / block_tables) is laid out
+        # by batch index, matching the ``[max_num_seqs]`` recurrent-state cache the
+        # graph indexes by row. (``forward`` lays out ids/embeds the same way.)
+        position_embed = super().compute_decode_position_embed(
+            model_input, mrope_position_deltas
+        )
+        batch_indices = torch.tensor(
+            self._state_index_allocator.indices(model_input.running_requests_ids)
+        )
+        out = torch.zeros_like(position_embed)
+        out[:, batch_indices] = position_embed[:, : batch_indices.shape[0]]
+        return out
+
     def forward(self, model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
-        """Qwen3.5 prefill must feed ``batch_idx`` (the base Qwen-VL forward does not).
+        """Qwen3.5 must place each request at its linear-attention ``batch_idx`` row.
 
-        The GatedDeltaNet ``linear_attention`` conv/recurrent state is a max-batch
-        static DRAM cache; ``batch_idx`` selects which slot this prefilled request
-        writes so decode reads the same slot. optimum-rbln declares ``batch_idx`` as a
-        REQUIRED prefill graph input (``get_input_info``), so omitting it raises
-        ``KeyError: 'batch_idx'`` in ``RBLNQwen3_5RuntimeModel._run``.
-
-        NOTE: this assumes the request maps to cache slot 0, which holds for
-        ``max_num_seqs == 1``. Multi-request continuous batching needs a per-request
-        slot assignment threaded from the model runner (TODO).
+        The GatedDeltaNet ``linear_attention`` conv/recurrent state is a fixed
+        ``[max_num_seqs]`` on-device cache indexed by batch row. ``prefill`` writes
+        one row (``batch_idx``, a REQUIRED prefill graph input — omitting it raises
+        ``KeyError: 'batch_idx'`` in ``RBLNQwen3_5RuntimeModel._run``); ``decode``
+        reads/writes every row. So each request is pinned to a stable ``batch_idx``
+        (``RBLNMambaStateIndexAllocator``): prefill passes its ``batch_idx`` and
+        decode lays the batch out with the request at ``row == batch_idx`` (padding
+        the empty rows), then gathers logits back to running order.
         """
+        # Reclaim batch indices from requests that finished since the last step.
+        self._state_index_allocator.free(model_input.finished_requests_ids)
+
         input_ids = model_input.input_tokens
         cache_position = model_input.input_positions
         block_tables = model_input.block_tables
-        request_nums = input_ids.shape[0]
-        is_prompt = model_input.is_prompt
 
-        kwargs = self.preprocess_for_decoder(
-            is_prompt, block_tables, input_ids, cache_position
-        )
-        cache_position = kwargs.pop("cache_position")
-        block_tables = kwargs.pop("block_tables")
-
-        if is_prompt:
+        if model_input.is_prompt:
+            # Prefill is always a single request (the runner forbids batching it).
+            batch_idx = self._state_index_allocator.allocate(
+                model_input.running_requests_ids[0]
+            )
+            kw = self.preprocess_for_decoder(
+                True, block_tables, input_ids, cache_position
+            )
             prefill_kwargs = {
                 "inputs_embeds": model_input.inputs_embeds,
                 "position_embed": model_input.position_embed,
-                "block_tables": block_tables,
-                "cache_position": cache_position,
-                # linear-attention cache slot (single-slot assumption; see NOTE).
-                "batch_idx": 0,
+                "block_tables": kw.pop("block_tables"),
+                "cache_position": kw.pop("cache_position"),
+                "batch_idx": batch_idx,
             }
-            logits = self.model.prefill_decoder(**prefill_kwargs).logits
-        else:
-            padded_batch_size = kwargs.pop("padded_batch_size", self.decoder_batch_size)
-            self.model.decoder = self.model.decoders[padded_batch_size]
-            input_ids = kwargs.pop("input_ids")
-            inputs_embeds = self.model.embed_tokens(input_ids).to(self.dtype)
-            logits = self.model.decoder(
-                inputs_embeds=inputs_embeds,
-                cache_position=cache_position,
-                position_embed=model_input.position_embed,
-                block_tables=block_tables,
-            ).logits
-        if not is_prompt:
-            logits = logits[:request_nums]
-        return logits
+            return self.model.prefill_decoder(**prefill_kwargs).logits
+
+        # Decode: lay the max_num_seqs-wide batch out by batch index (row ==
+        # batch_idx) so the per-row recurrent-state cache aligns with what each
+        # request's prefill wrote. ``input_block_ids`` scatters
+        # ids/cache_position/block_tables to those rows; position_embed is already
+        # laid out the same way (see ``compute_decode_position_embed``).
+        batch_indices = torch.tensor(
+            self._state_index_allocator.indices(model_input.running_requests_ids)
+        )
+        kw = self.preprocess_for_decoder(
+            False,
+            block_tables,
+            input_ids,
+            cache_position,
+            input_block_ids=batch_indices,
+        )
+        input_ids = kw.pop("input_ids")
+        inputs_embeds = self.model.embed_tokens(input_ids).to(self.dtype)
+        self.model.decoder = self.model.decoders[self.decoder_batch_size]
+        logits = self.model.decoder(
+            inputs_embeds=inputs_embeds,
+            cache_position=kw.pop("cache_position"),
+            position_embed=model_input.position_embed,
+            block_tables=kw.pop("block_tables"),
+        ).logits
+        # Gather each running request's logits from its ``batch_idx`` row, back to
+        # running order (vLLM maps logits to requests by that order).
+        return logits[batch_indices]
