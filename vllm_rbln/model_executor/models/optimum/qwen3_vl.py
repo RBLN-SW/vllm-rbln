@@ -393,3 +393,53 @@ class RBLNOptimumQwen3_5ForConditionalGeneration(
         # ``image_token_index`` as the mixin default assumes. Used by the prefill path's
         # embed_input_ids() image-token scatter, so this must be correct.
         return self.model.config.image_token_id
+
+    def forward(self, model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
+        """Qwen3.5 prefill must feed ``batch_idx`` (the base Qwen-VL forward does not).
+
+        The GatedDeltaNet ``linear_attention`` conv/recurrent state is a max-batch
+        static DRAM cache; ``batch_idx`` selects which slot this prefilled request
+        writes so decode reads the same slot. optimum-rbln declares ``batch_idx`` as a
+        REQUIRED prefill graph input (``get_input_info``), so omitting it raises
+        ``KeyError: 'batch_idx'`` in ``RBLNQwen3_5RuntimeModel._run``.
+
+        NOTE: this assumes the request maps to cache slot 0, which holds for
+        ``max_num_seqs == 1``. Multi-request continuous batching needs a per-request
+        slot assignment threaded from the model runner (TODO).
+        """
+        input_ids = model_input.input_tokens
+        cache_position = model_input.input_positions
+        block_tables = model_input.block_tables
+        request_nums = input_ids.shape[0]
+        is_prompt = model_input.is_prompt
+
+        kwargs = self.preprocess_for_decoder(
+            is_prompt, block_tables, input_ids, cache_position
+        )
+        cache_position = kwargs.pop("cache_position")
+        block_tables = kwargs.pop("block_tables")
+
+        if is_prompt:
+            prefill_kwargs = {
+                "inputs_embeds": model_input.inputs_embeds,
+                "position_embed": model_input.position_embed,
+                "block_tables": block_tables,
+                "cache_position": cache_position,
+                # linear-attention cache slot (single-slot assumption; see NOTE).
+                "batch_idx": 0,
+            }
+            logits = self.model.prefill_decoder(**prefill_kwargs).logits
+        else:
+            padded_batch_size = kwargs.pop("padded_batch_size", self.decoder_batch_size)
+            self.model.decoder = self.model.decoders[padded_batch_size]
+            input_ids = kwargs.pop("input_ids")
+            inputs_embeds = self.model.embed_tokens(input_ids).to(self.dtype)
+            logits = self.model.decoder(
+                inputs_embeds=inputs_embeds,
+                cache_position=cache_position,
+                position_embed=model_input.position_embed,
+                block_tables=block_tables,
+            ).logits
+        if not is_prompt:
+            logits = logits[:request_nums]
+        return logits
