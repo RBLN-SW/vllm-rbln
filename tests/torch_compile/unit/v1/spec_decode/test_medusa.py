@@ -56,7 +56,6 @@ def make_proposer_stub(
     hidden_size: int = 4,
     dtype: torch.dtype = torch.float32,
     enforce_eager: bool = True,
-    compile_context: object | None = None,
 ) -> RBLNMedusaProposer:
     """Build a proposer without running the heavy base __init__.
 
@@ -71,7 +70,6 @@ def make_proposer_stub(
     stub.hidden_states = torch.zeros(
         max_num_seqs, hidden_size, device=DEVICE, dtype=dtype
     )
-    stub.compile_context = object() if compile_context is None else compile_context
     stub.vllm_config = make_vllm_config(
         max_num_seqs=max_num_seqs, enforce_eager=enforce_eager
     )
@@ -103,9 +101,6 @@ def patch_base_init(
 # Verifies __init__ preallocates a persistent buffer padded to max_num_seqs.
 def test_init_preallocates_padded_hidden_states(monkeypatch):
     patch_base_init(monkeypatch, hidden_size=6, dtype=torch.float16)
-    monkeypatch.setattr(
-        medusa_module, "create_compile_context", Mock(return_value=object())
-    )
     vllm_config = make_vllm_config(max_num_seqs=4)
 
     proposer = RBLNMedusaProposer(vllm_config, DEVICE)
@@ -114,32 +109,6 @@ def test_init_preallocates_padded_hidden_states(monkeypatch):
     assert proposer.hidden_states.dtype == torch.float16
     assert proposer.hidden_states.device == DEVICE
     assert torch.count_nonzero(proposer.hidden_states) == 0
-
-
-# Verifies an injected compile context is used verbatim and no new one is made.
-def test_init_uses_injected_compile_context(monkeypatch):
-    patch_base_init(monkeypatch, hidden_size=4, dtype=torch.float32)
-    create_compile_context = Mock()
-    monkeypatch.setattr(medusa_module, "create_compile_context", create_compile_context)
-    injected = object()
-
-    proposer = RBLNMedusaProposer(make_vllm_config(), DEVICE, compile_context=injected)
-
-    assert proposer.compile_context is injected
-    create_compile_context.assert_not_called()
-
-
-# Verifies __init__ builds a weight-sharing compile context when none is given.
-def test_init_creates_compile_context_when_not_provided(monkeypatch):
-    patch_base_init(monkeypatch, hidden_size=4, dtype=torch.float32)
-    sentinel = object()
-    create_compile_context = Mock(return_value=sentinel)
-    monkeypatch.setattr(medusa_module, "create_compile_context", create_compile_context)
-
-    proposer = RBLNMedusaProposer(make_vllm_config(), DEVICE)
-
-    create_compile_context.assert_called_once_with(use_weight_sharing=True)
-    assert proposer.compile_context is sentinel
 
 
 # ---------------------------------------------------------------------------
@@ -214,7 +183,6 @@ def test_load_model_compiles_wrapper(monkeypatch, strict):
     assert fake.model_executable is compiled_sentinel
     assert captured["dynamic"] is False
     assert captured["fullgraph"] is True
-    assert captured["compile_context"] is fake.compile_context
     assert captured["tensor_parallel_size"] == 8
     assert captured["process_group_dict"] is process_group_sentinel
     assert captured["guard_filter_fn"] is torch.compiler.keep_tensor_guards_unsafe

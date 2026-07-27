@@ -24,12 +24,10 @@ from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
 from vllm_rbln import envs
-from vllm_rbln.compilation import compile, create_compile_context
+from vllm_rbln.compilation import compile
 from vllm_rbln.logger import init_logger
-from vllm_rbln.platform import HAS_TORCH_RBLN, USE_DEVICE_TENSOR
 
 if TYPE_CHECKING:
-    from rebel import CompileContext
     from vllm.config import SpeculativeConfig
 
 
@@ -51,7 +49,6 @@ class RBLNRejectionSampler(RejectionSampler):
     def __init__(
         self,
         sampler: Sampler,
-        compile_context: "CompileContext | None" = None,
         spec_config: "SpeculativeConfig | None" = None,
         device: torch.device | None = None,
     ):
@@ -64,7 +61,7 @@ class RBLNRejectionSampler(RejectionSampler):
                 "`VLLM_RBLN_SAMPLER=0` for this mode."
             )
         self.impl = (
-            RBLNRejectionSamplerImpl(compile_context)
+            RBLNRejectionSamplerImpl()
             if envs.VLLM_RBLN_SAMPLER
             else TorchRejectionSamplerImpl()
         )
@@ -299,24 +296,17 @@ class TorchRejectionSamplerImpl(RejectionSamplerImpl):
 class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
     max_spec_len = 32
 
-    def __init__(self, compile_context: "CompileContext | None" = None):
+    def __init__(self):
         super().__init__()
-
-        compile_context = (
-            compile_context or create_compile_context(use_global_ctx=True)
-            if not USE_DEVICE_TENSOR
-            else None
-        )
-
         self._compiled_rejection_sample = compile(
             rbln_rejection_sample,
             dynamic=False,
             fullgraph=True,
-            compile_context=compile_context,
-            num_devices=1 if USE_DEVICE_TENSOR or HAS_TORCH_RBLN else None,
+            num_devices=1,
             mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
-            use_global_ctx=True if HAS_TORCH_RBLN and not USE_DEVICE_TENSOR else None,
-            global_device_id=0 if HAS_TORCH_RBLN and not USE_DEVICE_TENSOR else None,
+            # FIXME: Currently, sampler ops do not support caching.
+            # Reusing seed buffer is not supported when the compiled sampler is loaded.
+            use_cache=False,
         )
 
     def rejection_sample(
