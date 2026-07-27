@@ -130,7 +130,63 @@ def estimate_model_kernel_size(
     return layer_nbytes + lm_heads_nbytes
 
 
-# NOTE: This function comes from optimum-rbln. Keep in sync.
+def _device_dram_profile() -> tuple[int, int, int]:
+    """Per-rank device DRAM facts: (usable bytes, rsd_size, default bits/param).
+
+    Extracted from `estimate_available_memory` so the DRAM constants have a
+    single home; `device_dram_bytes` needs the same numbers and they must not be
+    allowed to drift apart.
+    """
+    device_name = current_platform.get_device_name().lower()
+    assert "rbln" in device_name
+    if "ca" in device_name:
+        # ATOM - RBLN-CA[xxx]
+        # ATOM DRAM - 16GB (single chip)
+        ATOM_DRAM_NBYTES = 16 * 2**30
+        ATOM_SYS_DRAM_NBYTES = 288 * 2**20
+        # consider RSD size for ATOM
+        rsd_size = envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK
+        available_dram_bytes = rsd_size * (ATOM_DRAM_NBYTES - ATOM_SYS_DRAM_NBYTES)
+        # ATOM - basic data type fp16
+        default_bits_per_param = 16
+    elif "cr" in device_name:
+        assert envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK == 1
+        # REBEL - RBLN-CR[xxx]
+        # REBEL DRAM - 144GB (quad chips, chiplet) - system(4G) = 140GB
+        REBEL_DRAM_NBYTES = 144 * 2**30
+        REBEL_SYS_DRAM_NBYTES = 4 * 2**30
+        REBEL_DRAM_NBYTES -= REBEL_SYS_DRAM_NBYTES
+        REBEL_CHIPLET_SIZE = 4
+        # single device == Quad chiplet
+        rsd_size = REBEL_CHIPLET_SIZE
+        available_dram_bytes = REBEL_DRAM_NBYTES
+        # FIXME(RBLN) - basic data type fp8 for REBEL, for now fp16
+        default_bits_per_param = 16
+    else:
+        raise ValueError(
+            "invalid RBLN architecture, candidates = [ATOM(ca), REBEL(cr)]"
+        )
+
+    return available_dram_bytes, rsd_size, default_bits_per_param
+
+
+def device_dram_bytes(gpu_memory_utilization: float = 1.0) -> int:
+    """Total device DRAM this rank may use, scaled by `gpu_memory_utilization`.
+
+    This is the *whole* budget: model weights, runtime buffers and the KV cache
+    all come out of it. `estimate_available_memory` starts from this number and
+    subtracts its own estimate of the non-KV parts, so its return value is a
+    KV-only figure. Callers handing a budget to something that does its own
+    subtraction -- `rebel.kv_cache.max_num_blocks` deducts each compiled region's
+    real `base_bytes`, weights included -- want this raw number instead, or the
+    non-KV footprint is charged twice.
+    """
+    available_dram_bytes, _, _ = _device_dram_profile()
+    return int(available_dram_bytes * gpu_memory_utilization)
+
+
+# NOTE: This function comes from optimum-rbln. Keep in sync. (The device-DRAM
+# branch it opened with now lives in `_device_dram_profile`.)
 def estimate_available_memory(
     model_config: ModelConfig,
     parallel_config: ParallelConfig,
@@ -175,34 +231,7 @@ def estimate_available_memory(
     num_key_value_heads = model_config.get_num_kv_heads(parallel_config)
 
     device_name = current_platform.get_device_name().lower()
-    assert "rbln" in device_name
-    if "ca" in device_name:
-        # ATOM - RBLN-CA[xxx]
-        # ATOM DRAM - 16GB (single chip)
-        ATOM_DRAM_NBYTES = 16 * 2**30
-        ATOM_SYS_DRAM_NBYTES = 288 * 2**20
-        # consider RSD size for ATOM
-        rsd_size = envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK
-        available_dram_bytes = rsd_size * (ATOM_DRAM_NBYTES - ATOM_SYS_DRAM_NBYTES)
-        # ATOM - basic data type fp16
-        default_bits_per_param = 16
-    elif "cr" in device_name:
-        assert envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK == 1
-        # REBEL - RBLN-CR[xxx]
-        # REBEL DRAM - 144GB (quad chips, chiplet) - system(4G) = 140GB
-        REBEL_DRAM_NBYTES = 144 * 2**30
-        REBEL_SYS_DRAM_NBYTES = 4 * 2**30
-        REBEL_DRAM_NBYTES -= REBEL_SYS_DRAM_NBYTES
-        REBEL_CHIPLET_SIZE = 4
-        # single device == Quad chiplet
-        rsd_size = REBEL_CHIPLET_SIZE
-        available_dram_bytes = REBEL_DRAM_NBYTES
-        # FIXME(RBLN) - basic data type fp8 for REBEL, for now fp16
-        default_bits_per_param = 16
-    else:
-        raise ValueError(
-            "invalid RBLN architecture, candidates = [ATOM(ca), REBEL(cr)]"
-        )
+    available_dram_bytes, rsd_size, default_bits_per_param = _device_dram_profile()
 
     num_runtimes = num_runtimes * rsd_size
     available_dram_bytes = int(available_dram_bytes * gpu_memory_utilization)

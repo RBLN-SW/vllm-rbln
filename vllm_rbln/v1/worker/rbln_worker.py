@@ -64,6 +64,7 @@ import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.worker.rbln_model_runner import RBLNModelRunner
 from vllm_rbln.v1.worker.utils import (
+    device_dram_bytes,
     estimate_available_memory,
     estimate_model_kernel_size,
     get_rbln_planned_affinity_cpu_count,
@@ -583,20 +584,30 @@ class RBLNWorker(WorkerBase):
             logger.warning("Existing num_blocks <= 0; skipping reallocation.")
             return
 
-        # The total KV memory budget that vllm originally reserved, derived from
-        # sum(kv_cache_tensors[i].size). This is vllm's manual estimate; treat it
-        # as the device memory available for the KV cache on each chiplet and let
-        # the compiled profile decide how many blocks actually fit.
-        total_kv_bytes = sum(t.size for t in kv_cache_config.kv_cache_tensors)
-        if total_kv_bytes <= 0:
-            logger.warning("Total KV bytes <= 0; skipping reallocation.")
+        # The budget must be the *whole* device DRAM, not vllm's KV-only estimate.
+        # The compiled profile covers everything the artifact allocates -- weights,
+        # constants, command streams -- and max_num_blocks subtracts those
+        # base_bytes itself. Feeding it vllm's estimate (which already had the
+        # weights and per-runtime buffers taken out) charged the same static
+        # footprint twice and shrank num_blocks well below what the device holds.
+        total_device_bytes = device_dram_bytes(
+            self.cache_config.gpu_memory_utilization
+        )
+        if total_device_bytes <= 0:
+            logger.warning("Device DRAM budget <= 0; skipping reallocation.")
             return
 
         # All compiled artifacts share the same dynamic-KV layout (same
         # mark_dynamic hint / same dynamic_shape_info JSON). Ask each artifact's
-        # profile for the max num_blocks that fits vllm's KV budget and take the
-        # most constraining (min) across artifacts.
+        # profile for the max num_blocks that fits the device and take the most
+        # constraining (min) across artifacts. min() is right for what the
+        # artifacts share (the KV tensors and the weights they all point at), but
+        # it does not add up the private regions each artifact holds on its own
+        # (command streams, IO buffers -- ~0.1 GiB apiece here). The profile does
+        # not expose region identity, so they cannot be de-duplicated; the
+        # gpu_memory_utilization headroom absorbs them for now.
         # TODO(joonsoo): Verify whether this code works on multi-chiplet environment.
+        # TODO(joonsoo): Account for per-artifact private regions across runtimes.
         new_num_blocks: int | None = None
         for runtime in runtime_holder:
             executor = getattr(runtime, "_executor", None)
@@ -612,14 +623,14 @@ class RBLNWorker(WorkerBase):
                 )
                 return
 
-            # `total_kv_bytes` is vllm's *device-wide* KV budget. A device's
+            # `total_device_bytes` covers every device this rank owns. A device's
             # chiplets share one DRAM pool, so budget per node (chiplet-agnostic):
             # max_num_blocks(per_node_budget=True) pools every chiplet's regions
-            # on a node against a single per-node budget. Split vllm's estimate
+            # on a node against a single per-node budget. Split the DRAM budget
             # evenly across the nodes the profile uses (one node in the common
             # single-device case, so each node gets the full budget).
             node_ids = {r.node_id for r in profile.device_regions}
-            per_node_bytes = total_kv_bytes // max(1, len(node_ids))
+            per_node_bytes = total_device_bytes // max(1, len(node_ids))
             available_device_bytes: dict[int, int] = {
                 node_id: per_node_bytes for node_id in node_ids
             }
@@ -655,9 +666,9 @@ class RBLNWorker(WorkerBase):
             return
 
         logger.warning(
-            "[Dynamic KV] total_kv_budget_bytes=%d, old_num_blocks=%d, "
+            "[Dynamic KV] device_budget_bytes=%d, old_num_blocks=%d, "
             "computed_num_blocks=%d",
-            total_kv_bytes,
+            total_device_bytes,
             old_num_blocks,
             new_num_blocks,
         )
