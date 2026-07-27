@@ -21,11 +21,85 @@ from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_moe import FusedMoE
 
 from vllm_rbln import envs
+from vllm_rbln.custom_ops import custom_op, register_fake
 from vllm_rbln.logger import init_logger
 from vllm_rbln.model_executor.layers.fused_moe import all2all
 from vllm_rbln.model_executor.layers.fused_moe.utils import get_tokens_mask
 
 logger = init_logger(__name__)
+
+
+@custom_op(
+    "rbln_custom_ops::custom_moe_glu",
+    mutates_args=(),
+)
+def custom_moe_glu(
+    hidden_states: torch.Tensor,
+    gate_proj_weight: torch.Tensor,
+    up_proj_weight: torch.Tensor,
+    down_proj_weight: torch.Tensor,
+    masked_routing_weight: torch.Tensor,
+    hidden_act: str,
+    expert_map: torch.Tensor | None = None,
+    gate_proj_bias: torch.Tensor | None = None,
+    up_proj_bias: torch.Tensor | None = None,
+    down_proj_bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """
+    Customized MoE GLU operation (optimized kernel version).
+
+    Expected tensor shapes:
+    - hidden_states: [batch * seq_len, hidden_size]
+    - gate_proj_weight: [num_experts, intermediate_size, hidden_size]
+    - up_proj_weight: [num_experts, intermediate_size, hidden_size]
+    - down_proj_weight: [num_experts, hidden_size, intermediate_size]
+    - masked_routing_weight: [num_experts, batch * seq_len]
+      (token dim may be padded to 64-align)
+    - hidden_act: gate activation name ("silu"/"swish" or "gelu*")
+
+    Returns:
+        torch.Tensor: [batch * seq_len, hidden_size]
+    """
+    assert hidden_states.dtype == masked_routing_weight.dtype, (
+        "hidden_states and masked_routing_weight must have the same dtype"
+    )
+
+    act = hidden_act.lower()
+    if act in ("silu", "swish"):
+        act_fn = torch.nn.functional.silu
+    elif "gelu" in act:
+        act_fn = torch.nn.functional.gelu
+    else:
+        raise ValueError(f"Unsupported hidden_act={hidden_act!r}")
+
+    num_tokens = hidden_states.shape[0]
+    out = torch.zeros_like(hidden_states)
+    expert_cnt = gate_proj_weight.shape[0]
+    # routing weight token dim may be padded to 64-align; slice to actual num_tokens
+    routing_t = masked_routing_weight.transpose(0, 1)[:num_tokens, :]  # [num_tokens, E]
+    for i in range(expert_cnt):
+        gate = torch.nn.functional.linear(hidden_states, gate_proj_weight[i])
+        up = torch.nn.functional.linear(hidden_states, up_proj_weight[i])
+        mul = act_fn(gate) * up
+        down = torch.nn.functional.linear(mul, down_proj_weight[i])
+        out += down * routing_t[:, i : i + 1]
+    return out
+
+
+@register_fake("rbln_custom_ops::custom_moe_glu")
+def custom_moe_glu_fake(
+    hidden_states: torch.Tensor,
+    gate_proj_weight: torch.Tensor,
+    up_proj_weight: torch.Tensor,
+    down_proj_weight: torch.Tensor,
+    masked_routing_weight: torch.Tensor,
+    hidden_act: str,
+    expert_map: torch.Tensor | None = None,
+    gate_proj_bias: torch.Tensor | None = None,
+    up_proj_bias: torch.Tensor | None = None,
+    down_proj_bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
 
 
 def _apply_grouped_topk_torch(

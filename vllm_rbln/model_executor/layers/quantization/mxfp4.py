@@ -28,9 +28,79 @@ from vllm.model_executor.layers.quantization.mxfp4 import (
     Mxfp4MoeBackend,
 )
 
+from vllm_rbln.custom_ops import custom_op, register_fake
 from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+@custom_op(
+    "rbln_custom_ops::custom_moe_glu_mxfp4",
+    mutates_args=(),
+)
+def custom_moe_glu_mxfp4(
+    hidden_states: torch.Tensor,
+    gate_proj_blocks: torch.Tensor,
+    gate_proj_scales: torch.Tensor,
+    gate_proj_bias: torch.Tensor,
+    up_proj_blocks: torch.Tensor,
+    up_proj_scales: torch.Tensor,
+    up_proj_bias: torch.Tensor,
+    down_proj_blocks: torch.Tensor,
+    down_proj_scales: torch.Tensor,
+    down_proj_bias: torch.Tensor,
+    masked_routing_weight: torch.Tensor,
+    alpha: torch.Tensor,
+    limit: torch.Tensor,
+    expert_map: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """
+    MoE GLU operation for GPT-OSS with mxfp4 quantization and swigluoai activation.
+
+    Expected tensor shapes:
+    - hidden_states: [num_tokens, hidden_size]
+    - gate_proj_blocks: uint8 [num_experts, intermediate_size, hidden_size // 2]
+    - gate_proj_scales: [num_experts, intermediate_size, hidden_size // 32]
+    - gate_proj_bias: [num_experts, intermediate_size]
+    - up_proj_blocks: uint8 [num_experts, intermediate_size, hidden_size // 2]
+    - up_proj_scales: [num_experts, intermediate_size, hidden_size // 32]
+    - up_proj_bias: [num_experts, intermediate_size]
+    - down_proj_blocks: uint8 [num_experts, hidden_size, intermediate_size // 2]
+    - down_proj_scales: [num_experts, hidden_size, intermediate_size // 32]
+    - down_proj_bias: [num_experts, hidden_size]
+    - masked_routing_weight: [num_experts, num_tokens]
+      Pre-scored routing weights (top-k + softmax already applied by the caller);
+      the kernel does NOT route internally. (token dim may be padded to 64-align)
+    - alpha: [], constant
+    - limit: [], constant
+    - expert_map: [num_experts],
+      Mapping from global expert index to local expert index (in num_experts).
+      Contains -1 for experts not assigned to the current rank.
+
+    Returns:
+        torch.Tensor: [num_tokens, hidden_size]
+    """
+    return torch.empty_like(hidden_states)
+
+
+@register_fake("rbln_custom_ops::custom_moe_glu_mxfp4")
+def custom_moe_glu_mxfp4_fake(
+    hidden_states: torch.Tensor,
+    gate_proj_blocks: torch.Tensor,
+    gate_proj_scales: torch.Tensor,
+    gate_proj_bias: torch.Tensor,
+    up_proj_blocks: torch.Tensor,
+    up_proj_scales: torch.Tensor,
+    up_proj_bias: torch.Tensor,
+    down_proj_blocks: torch.Tensor,
+    down_proj_scales: torch.Tensor,
+    down_proj_bias: torch.Tensor,
+    masked_routing_weight: torch.Tensor,
+    alpha: torch.Tensor,
+    limit: torch.Tensor,
+    expert_map: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
 
 
 class RBLNGptOssMxfp4Config(GptOssMxfp4Config):
