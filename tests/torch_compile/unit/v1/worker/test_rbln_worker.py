@@ -801,7 +801,11 @@ class TestDetermineAvailableMemory:
         assert kernel_est.call_args_list[0].kwargs["n_model_bytes"] == 300
         assert kernel_est.call_args_list[1].kwargs["n_model_bytes"] == 80
         assert est.call_args.kwargs["kernel_size"] == 520
-        assert est.call_args.kwargs["num_runtimes"] == 4
+        # Spec on (worker.speculative_config set) -> num_decode_query_lens == 2.
+        # target = 1 prefill + bucket_count(1) * 2 query lens = 3; draft = 1
+        # prefill + bucket_count(1) = 2 (draft compiles only at num_spec+1, no
+        # x2). Total 5.
+        assert est.call_args.kwargs["num_runtimes"] == 5
         assert "n_model_bytes" not in est.call_args.kwargs
 
     @pytest.mark.parametrize("quantization", ["fp8", "mxfp4", "compressed-tensors"])
