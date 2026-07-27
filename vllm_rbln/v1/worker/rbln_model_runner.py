@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import dataclasses
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
@@ -1466,7 +1467,23 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             sample_hidden_states = hidden_states
             assert self.use_wrapped_compute_logits
             if not self.is_prefill and spec_decode_metadata is not None:
-                logits = logits[logits_indices]
+                # This one line is 35% of a spec-decode step. Phase profiling
+                # (VLLM_CUSTOM_SCOPES_FOR_PROFILING=1) puts "postprocess" at
+                # 31.96 ms/step out of 90.9 ms, and postprocess contains
+                # essentially nothing else; the op table shows why:
+                #     aten::index          4.03 ms per call
+                #     aten::index_select   0.011 ms per call
+                # `logits` here is [num_tokens, 200064], so advanced indexing
+                # goes down a general gather path while a plain row selection
+                # has a native v2v kernel. `logits_indices` is 1-D and selects
+                # rows, so index_select is exactly equivalent.
+                #
+                # Guarded on 1-D + matching device: if either assumption ever
+                # stops holding, fall back rather than change semantics.
+                if logits_indices.dim() == 1 and logits_indices.device == logits.device:
+                    logits = logits.index_select(0, logits_indices)
+                else:
+                    logits = logits[logits_indices]
 
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
@@ -1547,7 +1564,35 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             # TODO(RBLN): supports mtp and extract hidden states
             if spec_config.use_eagle():
                 if input_fits_in_drafter:
-                    propose_draft_token_ids(sampler_output.sampled_token_ids)
+                    # [EXPLAIN] torch_rbln's explain() accounts for the overhead
+                    # that does not show up in a torch profile: host bounces with
+                    # byte counts, per-op CPU fallbacks, recompiles, and (with
+                    # with_stack) the Python call site of each. It also names a
+                    # remedy per cause. The drafter step is where our measured
+                    # cost sits, so the region is scoped to exactly that.
+                    #
+                    # Off unless RBLN_EXPLAIN is set, because with_stack captures
+                    # call sites and that is not free. Reports every
+                    # RBLN_EXPLAIN_EVERY drafter calls so a serving run yields
+                    # several samples instead of one.
+                    _ex_n = os.environ.get("RBLN_EXPLAIN")
+                    if _ex_n:
+                        from torch_rbln.profiler import explain as _rbln_explain
+
+                        self._explain_calls = getattr(self, "_explain_calls", 0) + 1
+                        with _rbln_explain(with_stack=True) as _ex:
+                            propose_draft_token_ids(
+                                sampler_output.sampled_token_ids
+                            )
+                        _every = int(os.environ.get("RBLN_EXPLAIN_EVERY", "20"))
+                        if self._explain_calls % _every == 0:
+                            logger.info(
+                                "[EXPLAIN] drafter call #%d\n%s",
+                                self._explain_calls,
+                                _ex.report(),
+                            )
+                    else:
+                        propose_draft_token_ids(sampler_output.sampled_token_ids)
             else:
                 propose_drafts_after_bookkeeping = input_fits_in_drafter
 

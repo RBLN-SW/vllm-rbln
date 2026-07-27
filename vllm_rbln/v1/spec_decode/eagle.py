@@ -22,6 +22,7 @@ from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 import vllm_rbln.envs as envs
@@ -256,6 +257,8 @@ class RBLNEagleProposer(EagleProposer):
 
             # Rebuild attention metadata
             per_layer_attn_metadata.clear()
+            _attn_scope = record_function_or_nullcontext("drafter: attn_meta")
+            _attn_scope.__enter__()
             for attn_group in self.draft_attn_groups:
                 attn_metadata = attn_group.get_metadata_builder().build(
                     common_attn_metadata=common_attn_metadata,
@@ -277,7 +280,9 @@ class RBLNEagleProposer(EagleProposer):
             )
 
             # Run the model.
-            with set_forward_context(
+            _attn_scope.__exit__(None, None, None)
+
+            with record_function_or_nullcontext("drafter: forward"), set_forward_context(
                 per_layer_attn_metadata,
                 self.vllm_config,
                 num_tokens=num_reqs,

@@ -24,7 +24,11 @@ from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
 from vllm_rbln import envs
-from vllm_rbln.compilation import compile, create_compile_context
+from vllm_rbln.compilation import (
+    build_process_group_dict,
+    compile,
+    create_compile_context,
+)
 from vllm_rbln.logger import init_logger
 from vllm_rbln.platform import HAS_TORCH_RBLN, USE_DEVICE_TENSOR
 
@@ -302,11 +306,22 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
     def __init__(self, compile_context: "CompileContext | None" = None):
         super().__init__()
 
-        compile_context = (
-            compile_context or create_compile_context(use_global_ctx=True)
-            if not USE_DEVICE_TENSOR
-            else None
-        )
+        # Under USE_DEVICE_TENSOR the original code DISCARDED the context the
+        # model runner had just handed us (`... if not USE_DEVICE_TENSOR else
+        # None`) and passed no `model_trace_method` either, so this compile had
+        # nothing telling it which device to bind to and failed with
+        # `code=512 SYS_ENODEV: No such device` the first time a request
+        # actually reached the sampler.
+        #
+        # The target model's own compile (rbln_model_runner.py) passes the
+        # context unconditionally and sets model_trace_method="export" in
+        # device-tensor mode. Mirror that: the sampler graph joins the same
+        # context as the target and the drafter, which is also what makes them
+        # share one const-buffer pool coherently.
+        if not USE_DEVICE_TENSOR:
+            compile_context = compile_context or create_compile_context(
+                use_global_ctx=True
+            )
 
         self._compiled_rejection_sample = compile(
             rbln_rejection_sample,
@@ -314,6 +329,15 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
             fullgraph=True,
             compile_context=compile_context,
             num_devices=1 if USE_DEVICE_TENSOR or HAS_TORCH_RBLN else None,
+            model_trace_method="export" if USE_DEVICE_TENSOR else "",
+            # Match the drafter's compile exactly (eagle.py:454), which is the
+            # closest thing that demonstrably works on this stack. It passes a
+            # process group dict; the sampler did not, and the sampler is the
+            # one failing with `code=512 SYS_ENODEV: No such device` when the
+            # first request reaches it. Hypothesis, not a diagnosis -- the test
+            # is simply whether this compile stops failing.
+            process_group_dict=build_process_group_dict(),
+            guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
             mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
             use_global_ctx=True if HAS_TORCH_RBLN and not USE_DEVICE_TENSOR else None,
             global_device_id=0 if HAS_TORCH_RBLN and not USE_DEVICE_TENSOR else None,
