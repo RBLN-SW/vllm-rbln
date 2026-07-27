@@ -451,34 +451,12 @@ class TestProcessKvCacheCopyOps:
 
         op = KVCacheCopyOp(group_id=0, src_block_id=0, dst_block_id=1, num_tokens=2)
         with patch("vllm_rbln.v1.worker.rbln_model_runner.envs") as mock_envs:
-            mock_envs.VLLM_RBLN_USE_DEVICE_TENSOR = True
             mock_envs.VLLM_RBLN_COMPILE_MODEL = True
 
             runner._process_kv_cache_copy_ops([op])
 
         assert torch.equal(kv_cache[:, 1, :, :, :2, :], kv_cache[:, 0, :, :, :2, :])
         assert torch.all(kv_cache[:, 1, :, :, 2:, :] == 0)
-
-    def test_compiled_non_device_tensor_uses_runtime_copy(self):
-        # It's tricky to test the actual copy, so we only check that the
-        # runtime method is called with correct args.
-        runner = _make_runner_stub()
-        runner.model_config = MagicMock(enforce_eager=False)
-        runtime = MagicMock()
-        runner.runtime_holder = [runtime]
-        kv_cache = torch.zeros((2, 3, 1, 1, 4, 1), dtype=torch.int64)
-        kv_cache[:, 0, :, :, :2, :] = 7
-        runner.kv_caches = [kv_cache]
-        self._bind(runner)
-
-        op = KVCacheCopyOp(group_id=0, src_block_id=0, dst_block_id=1, num_tokens=2)
-        with patch("vllm_rbln.v1.worker.rbln_model_runner.envs") as mock_envs:
-            mock_envs.VLLM_RBLN_USE_DEVICE_TENSOR = False
-            mock_envs.VLLM_RBLN_COMPILE_MODEL = True
-
-            runner._process_kv_cache_copy_ops([op])
-
-        runtime._copy_kv_cache.assert_called_once_with(0, 1, 2)
 
 
 # ============================================================

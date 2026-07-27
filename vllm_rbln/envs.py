@@ -248,8 +248,8 @@ environment_variables = {
             os.environ.get("VLLM_RBLN_COMPILE_ONLY", "False").lower() in ("true", "1")
         )
     ),
-    # Disable RBLN file offloading during model load / warm-up even when
-    # VLLM_RBLN_USE_DEVICE_TENSOR is set. Kill-switch for the offload path;
+    # Disable RBLN file offloading during model load / warm-up.
+    # Kill-switch for the offload path;
     # weight host backings stay resident instead of being paged to disk.
     "VLLM_RBLN_DISABLE_OFFLOAD": (
         lambda: (

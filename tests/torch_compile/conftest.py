@@ -14,6 +14,14 @@
 
 import os
 
+# Must be set before the vllm imports below. RblnPlatform freezes
+# device_name/device_type/dist_backend from VLLM_RBLN_USE_VLLM_MODEL when
+# vllm_rbln.platform is imported (during `import vllm`), and
+# check_and_update_config raises if they later disagree with the env. Setting
+# it here keeps the frozen attributes consistent with the value the whole test
+# tree runs under.
+os.environ["VLLM_RBLN_USE_VLLM_MODEL"] = "1"
+
 import pytest
 from vllm.config import (
     CacheConfig,

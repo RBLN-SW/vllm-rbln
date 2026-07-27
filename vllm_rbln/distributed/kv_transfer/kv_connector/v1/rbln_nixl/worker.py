@@ -25,9 +25,6 @@ from vllm.distributed.kv_transfer.kv_connector.utils import (
     EngineTransferInfo,
     TransferTopology,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.base import (
-    CopyBlocksOp,
-)
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
     NixlAgentMetadata,
     NixlConnectorWorker,
@@ -102,10 +99,6 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
                 "RblnNixlConnectorWorker: nixl-rbln not available — "
                 "using upstream NIXL (UCX) on the host-bounce path."
             )
-
-        # `RblnPlatform.device_type = "cpu"` makes upstream skip the host
-        # buffer; restore it — NIXL cannot register RBLN device memory.
-        self.use_host_buffer = self.kv_buffer_device == "cpu"
 
         self._pending_kv_caches: dict[str, torch.Tensor] | None = None
 
@@ -228,18 +221,6 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
 
         self.host_xfer_buffers = xfer_buffers
 
-    def set_host_xfer_buffer_ops(self, copy_operation: CopyBlocksOp):
-        """Assign copy (d2h, h2d) operations when host buffer is used.
-
-        Overrides upstream only to drop its `device_type == "cpu"` early
-        return: RblnPlatform reports `device_type == "cpu"` yet still needs
-        the host-buffer copies wired up on the host-bounce path.
-        """
-        if self.kv_buffer_device != "cpu":
-            return
-        assert self.use_host_buffer
-        self.copy_blocks = copy_operation
-
     def _register_kv_caches_impl(self, kv_caches: dict[str, torch.Tensor]) -> None:
         """Direct variant of NixlConnectorWorker.register_kv_caches:
         build the upstream topology, hand the logical K/V regions to
@@ -271,7 +252,7 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
         device_id = sample_kv_cache.get_device()
         assert device_id >= 0, (
             "RblnNixlConnectorWorker (D2D): KV cache is not an 'rbln' "
-            "device tensor (is VLLM_RBLN_USE_DEVICE_TENSOR=1 set?)."
+            "device tensor (is VLLM_RBLN_USE_VLLM_MODEL=1 set?)."
         )
 
         # Direct path never stages through a host buffer.

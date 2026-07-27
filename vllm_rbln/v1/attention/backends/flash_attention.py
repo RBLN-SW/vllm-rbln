@@ -174,13 +174,13 @@ class RBLNFlashAttentionMetadataBuilder(
         is_prefill: bool,
     ) -> RBLNFlashAttentionMetadata:
         num_reqs = common_attn_metadata.num_reqs
-        query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
-        seq_lens = common_attn_metadata._seq_lens_cpu
-        block_tables_tensor = common_attn_metadata.block_table_tensor
+        query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu.to(self.device)
+        seq_lens = common_attn_metadata._seq_lens_cpu.to(self.device)
+        block_tables_tensor = common_attn_metadata.block_table_tensor.to(self.device)
 
         query_seq_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
         num_computed_tokens = seq_lens - query_seq_lens_cpu
-        seq_idx = positions[query_start_loc_cpu[:num_reqs]].view(-1, 1)
+        seq_idx = positions[query_start_loc_cpu[:num_reqs]].view(-1, 1).to(self.device)
         max_seq_len = self.model_config.max_model_len
 
         attn_masks = None
@@ -241,30 +241,36 @@ class RBLNFlashAttentionMetadataBuilder(
                 cache_offsets = rbln_utils.pad(cache_offsets, 0, batch_pad)
                 # Generate sliding window attention mask for decode
                 # mask[b, s] = 1.0 if s <= cache_seq_lens[b] else 0.0
-                positions = torch.arange(sliding_window)[None, :]
+                positions = torch.arange(sliding_window, device=self.device)[None, :]
                 swa_attn_masks = torch.where(positions - cache_seq_lens > 0, 0.0, 1.0)[
                     :, None, None, :
                 ]
 
             local_block_tables = block_tables_tensor[..., :1]
 
+        assert seq_idx.device.type == self.device.type, (
+            f"seq_idx device type {seq_idx.device.type} does not match "
+            f"expected device type {self.device.type}"
+        )
+        assert block_tables_tensor.device.type == self.device.type
+        assert attn_masks is None or attn_masks.device.type == self.device.type
+        assert cache_seq_lens is None or cache_seq_lens.device.type == self.device.type
+        assert cache_offsets is None or cache_offsets.device.type == self.device.type
+        assert swa_attn_masks is None or swa_attn_masks.device.type == self.device.type
+        assert (
+            local_block_tables is None
+            or local_block_tables.device.type == self.device.type
+        )
+
         attn_metadata = RBLNFlashAttentionMetadata(
-            seq_lens=seq_idx.to(self.device),
-            block_tables=block_tables_tensor.to(self.device),
+            seq_lens=seq_idx,
+            block_tables=block_tables_tensor,
             is_prefill=is_prefill,
             attn_masks=attn_masks,
-            cache_seq_lens=cache_seq_lens.to(self.device)
-            if cache_seq_lens is not None
-            else None,
-            cache_offsets=cache_offsets.to(self.device)
-            if cache_offsets is not None
-            else None,
-            local_block_tables=local_block_tables.to(self.device)
-            if local_block_tables is not None
-            else None,
-            swa_attn_masks=swa_attn_masks.to(self.device)
-            if swa_attn_masks is not None
-            else None,
+            cache_seq_lens=cache_seq_lens,
+            cache_offsets=cache_offsets,
+            local_block_tables=local_block_tables,
+            swa_attn_masks=swa_attn_masks,
         )
 
         return attn_metadata
