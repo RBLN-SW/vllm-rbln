@@ -140,7 +140,7 @@ class RBLNEagleProposer(EagleProposer):
                 positions=positions,
                 hidden_states=hidden_states,
                 inputs_embeds=inputs_embeds,
-                last_token_indices=token_indices_to_sample_padded,
+                token_indices_to_sample=token_indices_to_sample_padded,
             )
 
         # Early exit if there is only one draft token to be generated.
@@ -235,7 +235,7 @@ class RBLNEagleProposer(EagleProposer):
                     positions=positions,
                     hidden_states=hidden_states,
                     inputs_embeds=inputs_embeds,
-                    last_token_indices=None,
+                    token_indices_to_sample=None,
                 )
             draft_token_ids = logits[:num_reqs].argmax(dim=-1)
             draft_token_ids_list.append(draft_token_ids)
@@ -364,7 +364,7 @@ class RBLNEagleProposer(EagleProposer):
             input_ids: torch.Tensor,
             positions: torch.Tensor,
             hidden_states: torch.Tensor,
-            last_token_indices: torch.Tensor | None = None,
+            token_indices_to_sample: torch.Tensor | None = None,
             inputs_embeds: torch.Tensor | None = None,
         ):
             ret_hidden_states = self.model(
@@ -380,12 +380,12 @@ class RBLNEagleProposer(EagleProposer):
                 last_hidden_states, hidden_states = ret_hidden_states
 
             hidden_states = hidden_states.view(-1, self.hidden_size)
-            last_hidden_states = last_hidden_states.view(-1, self.hidden_size)
-            sample_hidden_states = (
-                last_hidden_states[last_token_indices]
-                if last_token_indices is not None
-                else last_hidden_states
-            )
+            sample_hidden_states = last_hidden_states.view(-1, self.hidden_size)
+
+            if token_indices_to_sample is not None:
+                hidden_states = hidden_states[token_indices_to_sample]
+                sample_hidden_states = sample_hidden_states[token_indices_to_sample]
+
             logits = self.model.compute_logits(sample_hidden_states)
 
             return hidden_states, logits
@@ -505,7 +505,7 @@ class RBLNEagleProposer(EagleProposer):
                 positions=positions,
                 hidden_states=hidden_states,
                 inputs_embeds=inputs_embeds,
-                last_token_indices=token_indices_to_sample_padded,
+                token_indices_to_sample=token_indices_to_sample_padded,
             )
 
         if self.num_speculative_tokens == 1:
@@ -561,7 +561,7 @@ class RBLNEagleProposer(EagleProposer):
                     positions=positions,
                     hidden_states=hidden_states,
                     inputs_embeds=inputs_embeds,
-                    last_token_indices=None,
+                    token_indices_to_sample=None,
                 )
 
     def _preprocess(
