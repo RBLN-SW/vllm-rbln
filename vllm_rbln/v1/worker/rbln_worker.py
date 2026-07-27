@@ -612,18 +612,22 @@ class RBLNWorker(WorkerBase):
                 )
                 return
 
-            # Treat vllm's KV budget as the memory available on every
-            # (node, chiplet) the compiled KV cache touches. max_num_blocks()
-            # subtracts each region's fixed base_bytes and honors the per-region
-            # alignment before maximizing the per-block count.
-            available_device_bytes: dict[int, dict[int, int]] = {}
-            for region in profile.device_regions:
-                available_device_bytes.setdefault(region.node_id, {})[
-                    region.chiplet_id
-                ] = total_kv_bytes
+            # `total_kv_bytes` is vllm's *device-wide* KV budget. A device's
+            # chiplets share one DRAM pool, so budget per node (chiplet-agnostic):
+            # max_num_blocks(per_node_budget=True) pools every chiplet's regions
+            # on a node against a single per-node budget. Split vllm's estimate
+            # evenly across the nodes the profile uses (one node in the common
+            # single-device case, so each node gets the full budget).
+            node_ids = {r.node_id for r in profile.device_regions}
+            per_node_bytes = total_kv_bytes // max(1, len(node_ids))
+            available_device_bytes: dict[int, int] = {
+                node_id: per_node_bytes for node_id in node_ids
+            }
 
             try:
-                fit = max_num_blocks(profile, available_device_bytes)
+                fit = max_num_blocks(
+                    profile, available_device_bytes, per_node_budget=True
+                )
             except ValueError:
                 # No per-block growth → this artifact was not compiled with a
                 # mark_dynamic'd KV dim, so num_blocks is not memory-bounded.
@@ -669,15 +673,22 @@ class RBLNWorker(WorkerBase):
         self._reallocate_kv_cache(new_num_blocks)
 
     def _reallocate_kv_cache(self, new_num_blocks: int) -> None:
-        """Re-initialize the model_runner's KV cache with `new_num_blocks`.
+        """Re-allocate the model_runner's KV cache tensors with `new_num_blocks`.
 
-        Existing KV tensors are replaced; `mark_dynamic` is re-applied by
-        `RBLNModelRunner.initialize_kv_cache_tensors`. No torch.compile
-        recompile occurs because the affected dim is mark_dynamic'd, and
-        the rbln runtime's `apply_adaptive_size_buffers` picks up the new
-        shape on the next forward call.
+        Only the KV-cache *tensors* are rebuilt: num_blocks changes their byte
+        size, and `mark_dynamic` is re-applied by
+        `RBLNModelRunner.initialize_kv_cache_tensors`. No torch.compile recompile
+        occurs because the affected dim is mark_dynamic'd, and the rbln runtime's
+        `apply_adaptive_size_buffers` picks up the new shape on the next forward.
+
+        We deliberately do NOT call the full `initialize_kv_cache()` again: the
+        attention backends, metadata builders and input batch depend on
+        block_size / max_model_len, not on the total num_blocks, and are already
+        initialized. Re-running them trips
+        `initialize_attn_backend`'s `assert len(self.attn_groups) == 0`.
         """
-        old_cfg = self.model_runner.kv_cache_config
+        mr = self.model_runner
+        old_cfg = mr.kv_cache_config
         old_num_blocks = old_cfg.num_blocks
 
         new_cfg = copy.deepcopy(old_cfg)
@@ -695,7 +706,20 @@ class RBLNWorker(WorkerBase):
             old_num_blocks,
             new_num_blocks,
         )
-        self.model_runner.initialize_kv_cache(new_cfg)
+        mr.kv_cache_config = new_cfg
+        # bind_kv_cache() asserts the runner's kv_caches list starts empty, so
+        # clear the bindings from the initial allocation before re-binding.
+        mr.kv_caches = []
+        mr.initialize_kv_cache_tensors(new_cfg, mr.kernel_block_sizes)
+
+        # The warm-up run already latched each rbln runtime's adaptive buffer
+        # sizes at the pre-reallocation num_blocks. Clear that latch so the next
+        # forward re-applies apply_adaptive_size_buffers at the new num_blocks
+        # (which also rewrites + refreshes the per-input device_config).
+        for runtime in getattr(mr, "runtime_holder", None) or []:
+            reset = getattr(runtime, "reset_adaptive_buffers", None)
+            if reset is not None:
+                reset()
 
     def get_model(self) -> nn.Module:
         return self.model_runner.get_model()
