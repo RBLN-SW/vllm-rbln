@@ -153,6 +153,28 @@ class RBLNEagleProposer(EagleProposer):
             token_indices_to_sample_padded.to(target_positions.device)
         ]
 
+        # Upstream gathers the fed-back hidden states to the sampled positions
+        # immediately after the `positions` gather above (llm_base_proposer.py:
+        # `hidden_states = hidden_states[token_indices_to_sample]`). This
+        # override kept the `positions` line and dropped this one.
+        #
+        # `model_wrapper` returns `hidden_states` UNGATHERED -- only
+        # `sample_hidden_states` is indexed by `last_token_indices`, and that
+        # goes to `compute_logits`. So this tensor is (num_reqs * (1 +
+        # num_spec), hidden_size) on the first pass, while the loop below feeds
+        # it back through `self.hidden_states[:num_reqs]`. Without the gather
+        # each request reads the leading request's rows instead of its own last
+        # token.
+        #
+        # It never crashes: `input_ids` stays per-request correct, so the
+        # drafter emits plausible tokens conditioned on the wrong hidden state.
+        # That is the step in per-position conditional acceptance -- 63% on the
+        # first draft, which uses the target's hidden states, then 36% flat once
+        # the drafter's own output is fed back.
+        hidden_states = hidden_states[
+            token_indices_to_sample_padded.to(hidden_states.device)
+        ]
+
         draft_token_ids = logits[:num_reqs].argmax(dim=-1)
 
         if self.allowed_attn_types is not None and not isinstance(
@@ -179,9 +201,14 @@ class RBLNEagleProposer(EagleProposer):
         # (i.e., not the first proposal).
         if self.num_speculative_tokens > 1 and num_rejected_tokens is not None:
             common_attn_metadata.seq_lens -= num_rejected_tokens
-            # Invalidate the CPU-side shadows to avoid H<>D sync.
-            # common_attn_metadata._seq_lens_cpu = None
-            # common_attn_metadata._num_computed_tokens_cpu = None
+            # Same reasoning as in the step loop below: the flash-attention
+            # builder reads the HOST shadow, not `seq_lens`, so mirror the
+            # adjustment there. Invalidating it instead (the commented-out lines
+            # this replaces) would force a D2H sync every step; applying the
+            # same arithmetic on the host is free.
+            _slc0 = common_attn_metadata._seq_lens_cpu
+            if _slc0 is not None:
+                _slc0 -= num_rejected_tokens.to(_slc0.device, _slc0.dtype)
 
         num_reqs_padded, num_padded_tokens, num_tokens_across_dp = (
             self._determine_draft_batch_padding(num_reqs, num_reqs, False)
@@ -198,6 +225,20 @@ class RBLNEagleProposer(EagleProposer):
             exceeds_max_model_len = positions[:num_reqs] >= self.max_model_len
             common_attn_metadata.seq_lens += 1
             common_attn_metadata.seq_lens.masked_fill_(exceeds_max_model_len, 1)
+            # Keep the HOST shadow in step with the device tensor. The
+            # flash-attention builder reads `_seq_lens_cpu`, not `seq_lens`
+            # (`num_computed_tokens = seq_lens - query_seq_lens_cpu`), so a
+            # shadow that is never updated leaves every step after the first
+            # attending with a stale sequence length. That does not crash -- it
+            # silently degrades the drafts, i.e. exactly the acceptance rate
+            # this path exists to produce.
+            #
+            # Mirror the device op exactly: unsliced, same mask.
+            # `exceeds_max_model_len` derives from `positions`, a host tensor.
+            _slc = common_attn_metadata._seq_lens_cpu
+            if _slc is not None:
+                _slc += 1
+                _slc.masked_fill_(exceeds_max_model_len.to(_slc.device), 1)
 
             # Rebuild attention metadata
             per_layer_attn_metadata.clear()
