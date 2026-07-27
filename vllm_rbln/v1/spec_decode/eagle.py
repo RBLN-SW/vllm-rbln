@@ -22,6 +22,7 @@ from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 import vllm_rbln.envs as envs
@@ -171,9 +172,16 @@ class RBLNEagleProposer(EagleProposer):
         # That is the step in per-position conditional acceptance -- 63% on the
         # first draft, which uses the target's hidden states, then 36% flat once
         # the drafter's own output is fed back.
-        hidden_states = hidden_states[
-            token_indices_to_sample_padded.to(hidden_states.device)
-        ]
+        # index_select rather than advanced indexing: this is a 1-D row
+        # selection, so the two are equivalent, but only index_select takes the
+        # backend's native path (measured 0.011 ms vs 4.03 ms per call for
+        # aten::index). Adding the gather as advanced indexing cost ~100 ms per
+        # step -- far more than the op itself -- which points at a host fallback
+        # draining the async dispatch queue mid-step rather than at the indexing
+        # arithmetic.
+        hidden_states = hidden_states.index_select(
+            0, token_indices_to_sample_padded.to(hidden_states.device)
+        )
 
         draft_token_ids = logits[:num_reqs].argmax(dim=-1)
 
@@ -240,6 +248,22 @@ class RBLNEagleProposer(EagleProposer):
                 _slc += 1
                 _slc.masked_fill_(exceeds_max_model_len.to(_slc.device), 1)
 
+            # Split the drafter iteration into host metadata build vs device
+            # forward. The enclosing "rbln_model_runner: draft" phase is by far
+            # the most expensive part of a spec-decode step here, and the two
+            # candidates -- host attention metadata construction and the device
+            # forward -- need very different fixes, so the aggregate number is
+            # not actionable on its own.
+            #
+            # Read these only under RBLN_RUNTIME_FORCE_SYNC=1. With the default
+            # async dispatch, device time lands in whichever scope happens to
+            # block, which is how an earlier profile blamed `postprocess` (one
+            # line of indexing) for 32 ms.
+            #
+            # Both are no-ops unless VLLM_CUSTOM_SCOPES_FOR_PROFILING=1.
+            _attn_scope = record_function_or_nullcontext("drafter: attn_meta")
+            _attn_scope.__enter__()
+
             # Rebuild attention metadata
             per_layer_attn_metadata.clear()
             for attn_group in self.draft_attn_groups:
@@ -263,7 +287,11 @@ class RBLNEagleProposer(EagleProposer):
             )
 
             # Run the model.
-            with set_forward_context(
+            _attn_scope.__exit__(None, None, None)
+
+            with record_function_or_nullcontext(
+                "drafter: forward"
+            ), set_forward_context(
                 per_layer_attn_metadata,
                 self.vllm_config,
                 num_tokens=num_reqs,
