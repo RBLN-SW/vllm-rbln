@@ -164,6 +164,11 @@ class RBLNEagleProposer(EagleProposer):
             draft_tokens_ids = logits[:num_reqs].argmax(dim=-1)
             return draft_tokens_ids.view(-1, 1)
 
+        # Gathers plus the first argmax. Grouped so the `draft` remainder can be
+        # attributed: argmax.out is a registered host fallback and measures
+        # 0.195 ms per call standalone, essentially all of it the crossing.
+        _post = record_function_or_nullcontext("drafter/first: sample")
+        _post.__enter__()
         assert token_indices_to_sample_padded is not None
         positions = target_positions[
             token_indices_to_sample_padded.to(target_positions.device)
@@ -175,12 +180,12 @@ class RBLNEagleProposer(EagleProposer):
         # override kept the `positions` line and dropped this one.
         #
         # `model_wrapper` returns `hidden_states` UNGATHERED -- only
-        # `sample_hidden_states` is indexed by `last_token_indices`, and that
-        # goes to `compute_logits`. So this tensor is (num_reqs * (1 +
-        # num_spec), hidden_size) on the first pass, while the loop below feeds
-        # it back through `self.hidden_states[:num_reqs]`. Without the gather
-        # each request reads the leading request's rows instead of its own last
-        # token.
+        # `sample_hidden_states` is indexed by `token_indices_to_sample`, and
+        # that goes to `compute_logits`. So this tensor is
+        # (num_reqs * (1 + num_spec), hidden_size) on the first pass, while the
+        # loop below feeds it back through `self.hidden_states[:num_reqs]`.
+        # Without the gather each request reads the leading request's rows
+        # instead of its own last token.
         #
         # It never crashes: `input_ids` stays per-request correct, so the
         # drafter emits plausible tokens conditioned on the wrong hidden state.
@@ -210,6 +215,8 @@ class RBLNEagleProposer(EagleProposer):
                 f"{self.allowed_attn_types}"
             )
 
+        _post.__exit__(None, None, None)
+
         # Generate the remaining draft tokens.
         draft_token_ids_list = [draft_token_ids]
 
@@ -237,6 +244,8 @@ class RBLNEagleProposer(EagleProposer):
             self._determine_draft_batch_padding(num_reqs, num_reqs, False)
         )
         for token_index in range(self.num_speculative_tokens - 1):
+            _upd = record_function_or_nullcontext("drafter: loop_update")
+            _upd.__enter__()
             # Update the inputs
             # cast to int32 is crucial when eagle model is compiled.
             # tensor.argmax returns int64 by default.
@@ -262,6 +271,8 @@ class RBLNEagleProposer(EagleProposer):
             if _slc is not None:
                 _slc += 1
                 _slc.masked_fill_(exceeds_max_model_len.to(_slc.device), 1)
+
+            _upd.__exit__(None, None, None)
 
             # Split the drafter iteration into host metadata build vs device
             # forward. The enclosing "rbln_model_runner: draft" phase is by far
