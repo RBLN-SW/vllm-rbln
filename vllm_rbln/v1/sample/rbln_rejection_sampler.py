@@ -565,6 +565,22 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         return logits
 
 
+
+def _rbln_clamp_draft_ids(d_ids, vocab_size):
+    """Clamp draft ids into [0, vocab_size-1].
+
+    Padded/invalid ids are -1 (vllm PR #46533) and the existing code clamps
+    that lower bound. Nothing bounds the top, so a draft id >= vocab_size --
+    e.g. warm-up dummy garbage -- indexes past the end of the vocab axis and
+    the host scatter_elements/gather kernels touch memory outside the buffer
+    (fsw-inference#430: segfault in TVMBackendParallelLaunch during warm-up).
+    """
+    import os
+    if os.environ.get("RBLN_DIDS_CLAMP_MAX") == "1":
+        return d_ids.clamp(0, vocab_size - 1)
+    return d_ids.clamp_min(0)
+
+
 def rbln_rejection_sample(
     draft_token_ids: torch.Tensor,
     target_probs: torch.Tensor,
@@ -900,7 +916,7 @@ def torch_rejection_random_sample_kernel(
             rate = synthetic_conditional_rates[:n].to(device=u.device, dtype=u.dtype)
             accept = u < rate
         else:
-            safe_ids = d_ids.clamp_min(0)
+            safe_ids = _rbln_clamp_draft_ids(d_ids, target_probs.shape[1])
             t_prob = (
                 target_probs[s:e]
                 .gather(1, safe_ids.unsqueeze(1))
@@ -998,7 +1014,11 @@ def torch_sample_recovered_tokens_kernel(
             # NOTE(RBLN): clamp padded/invalid (-1) draft ids so scatter_ does
             # not index out of bounds (vllm PR #46533). The recovered token is
             # still sampled from the target distribution for those positions.
-            prob.scatter_(1, d_ids.clamp_min(0).unsqueeze(1), 0.0)
+            prob.scatter_(
+                1,
+                _rbln_clamp_draft_ids(d_ids, prob.shape[1]).unsqueeze(1),
+                0.0,
+            )
         else:
             prob = torch.maximum(
                 target_probs[s:e].to(torch.float32)

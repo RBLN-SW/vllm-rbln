@@ -148,7 +148,24 @@ class RBLNEagleProposer(EagleProposer):
             draft_tokens_ids = logits[:num_reqs].argmax(dim=-1)
             return draft_tokens_ids.view(-1, 1)
 
-        positions = target_positions[token_indices_to_sample_padded]
+        # `target_positions` is a slice of the runner's persistent `self.positions`
+        # buffer, which is allocated without a device and therefore lives on the
+        # host (rbln_model_runner.py: `torch.zeros(self.max_num_tokens,
+        # dtype=torch.int64)`). `token_indices_to_sample_padded` descends from
+        # `valid_sampled_tokens_count`, and upstream builds it on THAT tensor's
+        # device (llm_base_proposer.py: `device = valid_sampled_tokens_count.device`),
+        # which here is the RBLN device. Indexing a host tensor with device
+        # indices raises "indices should be either on cpu or on the same device
+        # as the indexed tensor".
+        #
+        # On CUDA both operands land on the same device, so this only shows up on
+        # a backend that keeps `positions` on the host -- which is why dev has
+        # never hit it: eagle3 has not previously reached inference here.
+        # Move the index rather than the data: the index is (num_reqs,) while
+        # positions is (num_tokens,).
+        positions = target_positions[
+            token_indices_to_sample_padded.to(target_positions.device)
+        ]
 
         draft_token_ids = logits[:num_reqs].argmax(dim=-1)
 
@@ -168,7 +185,24 @@ class RBLNEagleProposer(EagleProposer):
         common_attn_metadata.num_actual_tokens = num_reqs
         common_attn_metadata.max_query_len = 1
         common_attn_metadata.query_start_loc = self.arange[: num_reqs + 1]
-        common_attn_metadata.query_start_loc_cpu = common_attn_metadata.query_start_loc
+        # `query_start_loc_cpu` is a HOST shadow by contract, not just by name:
+        # the flash-attention builder subtracts it from `_seq_lens_cpu` and uses
+        # it to index host tensors (flash_attention.py: `num_computed_tokens =
+        # seq_lens - query_seq_lens_cpu`). `self.arange` lives on the RBLN
+        # device, so aliasing the shadow to it makes that subtraction mix
+        # rbln:0 with cpu and raises "Expected all tensors to be on the same
+        # device". On CUDA the shadow and the device tensor agree, which is why
+        # this only surfaces on a backend that keeps seq_lens on the host.
+        #
+        # Build the shadow on the host rather than copying the device tensor
+        # back: the drafter runs one token per request here (max_query_len = 1),
+        # so the value is exactly arange(num_reqs + 1) and a D2H sync every
+        # step would be pure cost.
+        common_attn_metadata.query_start_loc_cpu = torch.arange(
+            num_reqs + 1,
+            dtype=common_attn_metadata.query_start_loc.dtype,
+            device="cpu",
+        )
 
         # In padded drafter batch, we need to adjust the sequence lengths
         # to remove the "padding" (i.e. rejected tokens).
@@ -176,9 +210,13 @@ class RBLNEagleProposer(EagleProposer):
         # (i.e., not the first proposal).
         if self.num_speculative_tokens > 1 and num_rejected_tokens is not None:
             common_attn_metadata.seq_lens -= num_rejected_tokens
-            # Invalidate the CPU-side shadows to avoid H<>D sync.
-            # common_attn_metadata._seq_lens_cpu = None
-            # common_attn_metadata._num_computed_tokens_cpu = None
+            # Same reasoning as in the step loop below: the builder reads the
+            # host shadow, so mirror the adjustment there instead of
+            # invalidating it (invalidation costs a D2H sync, which is why the
+            # original lines were commented out and the shadow left stale).
+            _slc0 = common_attn_metadata._seq_lens_cpu
+            if _slc0 is not None:
+                _slc0 -= num_rejected_tokens.to(_slc0.device, _slc0.dtype)
 
         num_reqs_padded, num_padded_tokens, num_tokens_across_dp = (
             self._determine_draft_batch_padding(num_reqs, num_reqs, False)
@@ -195,6 +233,26 @@ class RBLNEagleProposer(EagleProposer):
             exceeds_max_model_len = positions[:num_reqs] >= self.max_model_len
             common_attn_metadata.seq_lens += 1
             common_attn_metadata.seq_lens.masked_fill_(exceeds_max_model_len, 1)
+            # Keep the HOST shadow in step with the device tensor. The
+            # flash-attention builder reads `_seq_lens_cpu`, not `seq_lens`
+            # (`num_computed_tokens = seq_lens - query_seq_lens_cpu`), so a
+            # shadow that is never updated leaves every step after the first
+            # attending with a stale sequence length. That does not crash --
+            # it silently degrades the drafts, i.e. exactly the acceptance rate
+            # this path exists to produce.
+            #
+            # Applying the same arithmetic on the host is why `_seq_lens_cpu`
+            # is updated here rather than invalidated: invalidation would force
+            # a D2H sync every step (the reason the lines below were commented
+            # out), while `+1` and the same mask are free. `exceeds_max_model_len`
+            # is derived from `positions`, which is a host tensor here.
+            # Mirror the device op exactly -- unsliced, same mask. Slicing only
+            # the host side would silently diverge from `seq_lens` the moment
+            # the two tensors are not the same length.
+            _slc = common_attn_metadata._seq_lens_cpu
+            if _slc is not None:
+                _slc += 1
+                _slc.masked_fill_(exceeds_max_model_len.to(_slc.device), 1)
 
             # Rebuild attention metadata
             per_layer_attn_metadata.clear()
@@ -378,6 +436,13 @@ class RBLNEagleProposer(EagleProposer):
 
             hidden_states = hidden_states.view(-1, self.hidden_size)
             last_hidden_states = last_hidden_states.view(-1, self.hidden_size)
+            # NOTE: index_select is much cheaper than advanced indexing in
+            # eager mode (0.011 ms vs 4.03 ms per call), but this site lives
+            # INSIDE the drafter's torch.compile'd wrapper, and putting it in
+            # the traced graph aborts the compiler:
+            #   llvm::ArrayRef<T>::front() assertion, empty ArrayRef
+            # So the substitution is applied only at the eager site in
+            # rbln_model_runner's postprocess, and this one stays as-is.
             sample_hidden_states = (
                 last_hidden_states[last_token_indices]
                 if last_token_indices is not None

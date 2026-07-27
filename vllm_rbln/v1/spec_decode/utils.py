@@ -87,8 +87,20 @@ def eagle_prepare_inputs_padded(
         num_draft_tokens + 1 - valid_sampled_tokens_count,
         torch.zeros_like(valid_sampled_tokens_count),
     ).to(torch.int32)
-    token_indices_to_sample = (query_start_loc[1:] - 1 - num_rejected_tokens_gpu).to(
-        torch.int32
-    )
+    # `num_rejected_tokens_gpu` follows `cu_num_draft_tokens` /
+    # `valid_sampled_tokens_count`, which live on the accelerator, while
+    # `query_start_loc` comes from the runner's CpuGpuBuffer and reaches us on
+    # the host. Subtracting them directly raises "Expected all tensors to be on
+    # the same device". On CUDA both operands are already on the same device,
+    # so this only bites a backend that keeps query_start_loc on the host.
+    #
+    # Align onto the accelerator rather than the host: upstream builds
+    # `token_indices_to_sample` on `valid_sampled_tokens_count.device`
+    # (llm_base_proposer.py), and callers expect that placement.
+    token_indices_to_sample = (
+        query_start_loc[1:].to(num_rejected_tokens_gpu.device)
+        - 1
+        - num_rejected_tokens_gpu
+    ).to(torch.int32)
 
     return token_indices_to_sample, num_rejected_tokens_gpu
