@@ -415,7 +415,19 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
             dtype=target_probs.dtype,
             device=device,
         )
-        reshaped_draft_token_ids[:N] = draft_token_ids
+        # NOTE(RBLN): clamp the UPPER bound before handing ids to the NPU
+        # primitive. The assert above only rejects the -1 placeholder. An
+        # EAGLE3 drafter samples over `draft_vocab_size` (32000 for
+        # MiniMax-M2.5-Eagle3) and maps back through `d2t`; an unmapped id
+        # lands past the target vocab, and the primitive then indexes
+        # `target_probs` out of bounds and the device aborts the task:
+        #
+        #     RuntimeError: (System) code=504 SYS_TASK_ABORTED
+        #
+        # ngram never hits this -- its draft ids are copied from the prompt, so
+        # they are target-vocab ids by construction. Same defect as the one
+        # already fixed on the torch path (rebellions-sw/fsw-inference#430).
+        reshaped_draft_token_ids[:N] = draft_token_ids.clamp(0, vocab_size - 1)
         reshaped_target_probs[:N] = target_probs
 
         # Per-batch padded view of drafts for the scatter in section 3a. NPU's
