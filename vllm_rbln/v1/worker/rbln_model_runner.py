@@ -652,9 +652,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     scheduled_spec_tokens,
                     req_id,
                 )
-                num_new_tokens = (
-                    num_computed_tokens + base_out - req_state.num_tokens
-                )
+                num_new_tokens = num_computed_tokens + base_out - req_state.num_tokens
                 if num_new_tokens == 1:
                     # Avoid slicing list in most common case.
                     req_state.output_token_ids.append(new_token_ids[-1])
@@ -2903,13 +2901,32 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 # bucket so only ONE padded-decode graph is ever needed.
                 num_reqs_padded = self.bucketing_manager.decode_batch_buckets[-1]
             else:
-                num_reqs_padded = self.bucketing_manager.find_decode_batch_bucket(
-                    int(torch.max(num_reqs_across_dp).item())
-                )
-                assert num_reqs_padded is not None
                 assert torch.all(num_tokens_across_dp % num_reqs_across_dp == 0)
                 tokens_per_req_across_dp = num_tokens_across_dp // num_reqs_across_dp
                 max_tokens_per_req = int(torch.max(tokens_per_req_across_dp).item())
+                min_tokens_per_req = int(torch.min(tokens_per_req_across_dp).item())
+                if min_tokens_per_req != max_tokens_per_req:
+                    # DP qlen-ASYMMETRIC step: the ranks disagree on query length
+                    # -- a peer runs multi-token (spec) decode (query_len =
+                    # num_speculative_tokens + 1) while this rank is qlen=1. This
+                    # is the fall-back case: warm-up compiles the spec-asymmetric
+                    # padding ONLY for the top bucket (top_bucket, *, top_bucket *
+                    # spec_qlen) to keep the decode-graph count minimal, so route
+                    # up to it here (same policy as the any_prefill branch above).
+                    #
+                    # A qlen-SYMMETRIC step -- all ranks the same query length,
+                    # whether 1 or the spec length -- instead falls through to the
+                    # per-bucket branch below and runs on its own optimally-sized
+                    # decode graph (compiled per bucket by the warm-up loop). Only
+                    # gating on max_tokens_per_req > 1 here would wrongly route
+                    # symmetric spec to the top bucket, running it oversized and
+                    # orphaning the per-bucket spec graphs.
+                    num_reqs_padded = self.bucketing_manager.decode_batch_buckets[-1]
+                else:
+                    num_reqs_padded = self.bucketing_manager.find_decode_batch_bucket(
+                        int(torch.max(num_reqs_across_dp).item())
+                    )
+                assert num_reqs_padded is not None
                 num_tokens_padded = num_reqs_padded * max_tokens_per_req
 
         return num_reqs_padded, num_tokens_padded, num_tokens_across_dp

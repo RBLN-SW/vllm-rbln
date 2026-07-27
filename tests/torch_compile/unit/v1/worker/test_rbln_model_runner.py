@@ -438,11 +438,26 @@ class FakeSpecConfig:
 
 
 class FakeBucketingManager:
-    def __init__(self, *, buckets=None, default=None, fail_message: str | None = None):
+    def __init__(
+        self,
+        *,
+        buckets=None,
+        default=None,
+        fail_message: str | None = None,
+        decode_batch_buckets=None,
+    ):
         self.buckets = buckets or {}
         self.default = default
         self.fail_message = fail_message
         self.calls: list[Any] = []
+        # Mirror the real RBLNBucketingManager attribute (the sorted decode
+        # batch bucket sizes). Defaults to the distinct find_decode_batch_bucket
+        # targets when not given explicitly.
+        self.decode_batch_buckets = (
+            decode_batch_buckets
+            if decode_batch_buckets is not None
+            else sorted(set(self.buckets.values()))
+        )
 
     def find_decode_batch_bucket(self, batch_size):
         if self.fail_message is not None:
@@ -3244,8 +3259,11 @@ def test_determine_batch_padding_data_parallel_prefill_uses_max_num_tokens(
 def test_determine_batch_padding_specialized_moe_decode_uses_decode_bucket(
     rbln_model_runner, monkeypatch
 ):
-    """Specialized MoE decode should bucket by request count and pad by the
-    request bucket times the per-request query length."""
+    """Specialized MoE decode on a qlen-SYMMETRIC step (all DP ranks share the
+    same query length -- here every rank runs qlen 4) buckets by the cross-DP
+    max request count and pads by that bucket times the per-request query
+    length. It does NOT fall back to the top bucket -- that is reserved for
+    qlen-asymmetric steps (see the qlen_asymmetric test below)."""
     # Force decode via the scheduler-stamped phase.
     rbln_model_runner._is_prefill_step = False
     assert rbln_model_runner.is_prefill_phase() is False
@@ -3322,9 +3340,13 @@ def test_determine_batch_padding_specialized_moe_decode_uses_decode_bucket(
     ]
 
     # First call: initial decode padding for this rank's unpadded request count.
-    # Second call: specialized MoE decode repads using cross-DP max request count.
+    # Second call: qlen-symmetric specialized MoE decode repads using the
+    # cross-DP max request count (per-bucket, find_decode_batch_bucket(5) == 8),
+    # NOT the top bucket.
     assert fake_bucketing_manager.calls == [3, 5]
 
+    # num_reqs_padded == decode_batch_buckets[-1]; padded tokens == that bucket
+    # times the per-request query length (max_tokens_per_req == 4).
     assert num_reqs_padded == 8
     assert num_tokens_padded == 32
 
@@ -3332,6 +3354,109 @@ def test_determine_batch_padding_specialized_moe_decode_uses_decode_bucket(
     assert num_tokens_across_dp.dtype == torch.int32
     assert num_tokens_across_dp.device.type == "cpu"
     assert num_tokens_across_dp.tolist() == [12, 20]
+
+
+def test_determine_batch_padding_specialized_moe_qlen_asymmetric_top_bucket(
+    rbln_model_runner, monkeypatch
+):
+    """Specialized MoE decode on a qlen-ASYMMETRIC step -- a peer runs a
+    multi-token (spec) query while this rank is qlen=1, so the per-rank query
+    lengths disagree (min != max) -- falls back to the TOP decode bucket and
+    pads by that bucket times the max per-request query length. Warm-up only
+    compiles the spec-asymmetric padding for the top bucket, so there is no
+    per-bucket re-bucketing here (no second find_decode_batch_bucket call)."""
+    # Force decode via the scheduler-stamped phase.
+    rbln_model_runner._is_prefill_step = False
+    assert rbln_model_runner.is_prefill_phase() is False
+
+    monkeypatch.setattr(
+        rbln_model_runner.parallel_config,
+        "data_parallel_size",
+        2,
+    )
+    monkeypatch.setattr(
+        rbln_model_runner.parallel_config,
+        "data_parallel_rank",
+        0,
+    )
+    monkeypatch.setattr(
+        rbln_model_runner,
+        "specialized_moe_decode",
+        True,
+        raising=False,
+    )
+
+    calls = []
+
+    def fake_num_tokens_and_reqs_across_dp(
+        num_tokens,
+        num_reqs,
+        dp_size,
+        dp_rank,
+        is_prefill,
+    ):
+        calls.append(
+            {
+                "num_tokens": num_tokens,
+                "num_reqs": num_reqs,
+                "dp_size": dp_size,
+                "dp_rank": dp_rank,
+                "is_prefill": is_prefill,
+            }
+        )
+        # This rank: 3 requests x qlen 1 (== 3 tokens). A peer: 5 requests x
+        # qlen 4 (spec, == 20 tokens). tokens_per_req = [1, 4] -> qlen-asymmetric.
+        return torch.tensor([3, 20], dtype=torch.int32), torch.tensor(
+            [3, 5], dtype=torch.int32
+        )
+
+    monkeypatch.setattr(
+        rbln_model_runner_module.RBLNDPMetadata,
+        "num_tokens_and_reqs_across_dp",
+        staticmethod(fake_num_tokens_and_reqs_across_dp),
+    )
+
+    fake_bucketing_manager = FakeBucketingManager(
+        buckets={3: 4}, decode_batch_buckets=[4, 8]
+    )
+    monkeypatch.setattr(
+        rbln_model_runner,
+        "bucketing_manager",
+        fake_bucketing_manager,
+    )
+
+    num_reqs_padded, num_tokens_padded, num_tokens_across_dp = (
+        rbln_model_runner._determine_batch_padding(
+            num_reqs_unpadded=3,
+            num_tokens_unpadded=3,
+        )
+    )
+
+    assert calls == [
+        {
+            "num_tokens": 3,
+            "num_reqs": 3,
+            "dp_size": 2,
+            "dp_rank": 0,
+            "is_prefill": False,
+        }
+    ]
+
+    # Only the initial decode padding calls find_decode_batch_bucket (this rank's
+    # unpadded request count). The qlen-asymmetric spec step then routes to the
+    # top decode bucket (decode_batch_buckets[-1] == 8) instead of re-bucketing
+    # by request count, so there is no second find_decode_batch_bucket call.
+    assert fake_bucketing_manager.calls == [3]
+
+    # num_reqs_padded == decode_batch_buckets[-1]; padded tokens == that bucket
+    # times the max per-request query length (max_tokens_per_req == 4).
+    assert num_reqs_padded == 8
+    assert num_tokens_padded == 32
+
+    assert isinstance(num_tokens_across_dp, torch.Tensor)
+    assert num_tokens_across_dp.dtype == torch.int32
+    assert num_tokens_across_dp.device.type == "cpu"
+    assert num_tokens_across_dp.tolist() == [3, 20]
 
 
 def test_may_reinitialize_input_batch_rebuilds_on_kernel_block_size_change(
