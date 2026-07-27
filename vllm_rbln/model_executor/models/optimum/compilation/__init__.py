@@ -207,8 +207,6 @@ class RBLNCompileSpec:
         model_cls = getattr(optimum.rbln, model_cls_name)
         assert model_cls is not None
 
-        # NOTE: memory_budget is a decoder-only knob. Pooling/encoder RBLN
-        # configs reject it ("Unexpected arguments"), so it is omitted here.
         rbln_config: dict[str, Any] = {
             "num_devices": num_devices,
             "batch_size": batch_size,
