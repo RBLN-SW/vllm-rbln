@@ -1375,6 +1375,22 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
             num_reqs = self.input_batch.num_reqs
             req_ids = self.input_batch.req_ids
+
+            # NOTE(RBLN): Cross-DP no-spec reconciliation (must run before
+            # _prepare_inputs / _determine_batch_padding). A variable-length
+            # proposer (ngram/suffix) can hit a cross-block decode step where
+            # full-spec backfill is impossible; the scheduler then forces that
+            # rank to qlen=1 (step_no_spec_required). Under DP+EP the MoE
+            # all-to-all needs every rank's decode query shape identical, so
+            # OR-reduce the flag across DP: if ANY rank elected no-spec, EVERY
+            # rank drops to no-spec. A rank that did not locally elect it scrubs
+            # its worker-local scheduler_output to qlen=1 here. Idle DP peers
+            # participate in the same collective via execute_dummy_batch.
+            # Engine-side num_computed accounting is untouched: the forced rank
+            # returns a single token that upstream update_from_output reads as
+            # all-drafts-rejected.
+            self._reconcile_cross_dp_no_spec(scheduler_output)
+
             tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
             num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
 
@@ -2787,6 +2803,47 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 self.kv_cache_bases,
                 self.kv_cache_view_infos,
             )
+
+    def _reconcile_cross_dp_no_spec(
+        self, scheduler_output: RBLNSchedulerOutput
+    ) -> None:
+        """Force rank to no-spec (qlen=1) if ANY DP rank elected no-spec."""
+        # DP 1 or no spec dec
+        if self.parallel_config.data_parallel_size <= 1 or self.num_spec_tokens <= 0:
+            return
+        local_no_spec = scheduler_output.step_no_spec_required
+        # > 1, some rank no-spec
+        reduced = bool(
+            RBLNDPMetadata.num_tokens_across_dp(
+                1 if local_no_spec else 0,
+                self.parallel_config.data_parallel_size,
+                self.parallel_config.data_parallel_rank,
+            )
+            .sum()
+            .item()
+        )
+        if not reduced or local_no_spec or self.is_prefill:
+            return
+        for req_id in list(scheduler_output.scheduled_spec_decode_tokens.keys()):
+            scheduler_output.num_scheduled_tokens[req_id] = 1
+        scheduler_output.scheduled_spec_decode_tokens = {}
+        scheduler_output.total_num_scheduled_tokens = sum(
+            scheduler_output.num_scheduled_tokens.values()
+        )
+
+    def _dp_idle_no_spec_reduce(self) -> bool:
+        """Idle-rank participation in the cross-DP no-spec OR-reduce"""
+        if self.parallel_config.data_parallel_size <= 1 or self.num_spec_tokens <= 0:
+            return False
+        return bool(
+            RBLNDPMetadata.num_tokens_across_dp(
+                0,
+                self.parallel_config.data_parallel_size,
+                self.parallel_config.data_parallel_rank,
+            )
+            .sum()
+            .item()
+        )
 
     def _determine_batch_padding(
         self,
