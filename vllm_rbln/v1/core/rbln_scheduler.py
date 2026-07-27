@@ -48,6 +48,10 @@ class RBLNSchedulerOutput(SchedulerOutput):
     prefix caching."""
 
     kv_cache_copy_ops: list[KVCacheCopyOp] = field(default_factory=list)
+    # NOTE(RBLN): Set True when at least one finally-scheduled decode request
+    # cannot reach full spec (num_spec+1) via in-block query backfill, so this
+    # rank forced its decode batch to qlen=1 (no-spec).
+    step_no_spec_required: bool = False
 
 
 def is_prefill(request: Request) -> bool:
@@ -832,7 +836,10 @@ class RBLNScheduler(Scheduler):
             req.request_id
             for req in itertools.chain(scheduled_new_reqs, scheduled_resumed_reqs)
         }
-        if unsafe_backfill_req_ids & scheduled_running_req_ids:
+        step_no_spec_required = bool(
+            unsafe_backfill_req_ids & scheduled_running_req_ids
+        )
+        if step_no_spec_required:
             for req in scheduled_running_reqs:
                 req_id = req.request_id
 
@@ -935,6 +942,7 @@ class RBLNScheduler(Scheduler):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
+            step_no_spec_required=step_no_spec_required,
         )
 
         # Drain pending copy ops from the KV cache manager.
