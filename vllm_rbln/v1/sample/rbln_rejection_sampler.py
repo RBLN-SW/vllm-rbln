@@ -900,7 +900,13 @@ def torch_rejection_random_sample_kernel(
             rate = synthetic_conditional_rates[:n].to(device=u.device, dtype=u.dtype)
             accept = u < rate
         else:
-            safe_ids = d_ids.clamp_min(0)
+            # NOTE(RBLN): clamp the UPPER bound too, not just -1 padding. An
+            # EAGLE3 drafter samples over `draft_vocab_size` and maps back
+            # through `d2t`; a stale or unmapped id can land at or past the
+            # target's vocab. On this backend the gather below then reads past
+            # the row and segfaults in the host scatter/gather kernel rather
+            # than raising (rebellions-sw/fsw-inference#430).
+            safe_ids = d_ids.clamp(0, target_probs.shape[-1] - 1)
             t_prob = (
                 target_probs[s:e]
                 .gather(1, safe_ids.unsqueeze(1))
@@ -998,7 +1004,8 @@ def torch_sample_recovered_tokens_kernel(
             # NOTE(RBLN): clamp padded/invalid (-1) draft ids so scatter_ does
             # not index out of bounds (vllm PR #46533). The recovered token is
             # still sampled from the target distribution for those positions.
-            prob.scatter_(1, d_ids.clamp_min(0).unsqueeze(1), 0.0)
+            # Upper bound as well -- same reason as the gather site above.
+            prob.scatter_(1, d_ids.clamp(0, prob.shape[-1] - 1).unsqueeze(1), 0.0)
         else:
             prob = torch.maximum(
                 target_probs[s:e].to(torch.float32)
