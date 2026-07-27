@@ -1847,10 +1847,21 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             return None
 
         hf_config = self.speculative_config.draft_model_config.hf_config
-        if not hasattr(hf_config, "eagle_aux_hidden_state_layer_ids"):
-            return None
+        layer_ids = getattr(hf_config, "eagle_aux_hidden_state_layer_ids", None)
+        if layer_ids is None:
+            # Some EAGLE3 checkpoints nest the layer ids under `eagle_config`
+            # instead of exposing them at the top level -- MiniMax-M2.5-Eagle3
+            # does. Reading only the top-level attribute silently falls back to
+            # the proposer's default triple, so the target emits aux hidden
+            # states from layers the drafter was not trained on.
+            eagle_config = getattr(hf_config, "eagle_config", None)
+            if isinstance(eagle_config, dict):
+                layer_ids = eagle_config.get("eagle_aux_hidden_state_layer_ids")
+            elif eagle_config is not None:
+                layer_ids = getattr(
+                    eagle_config, "eagle_aux_hidden_state_layer_ids", None
+                )
 
-        layer_ids = hf_config.eagle_aux_hidden_state_layer_ids
         if layer_ids and isinstance(layer_ids, (list, tuple)):
             return tuple(layer_ids)
 
