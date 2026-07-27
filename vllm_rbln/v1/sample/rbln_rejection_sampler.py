@@ -600,7 +600,12 @@ def _rbln_clamp_draft_ids(d_ids, vocab_size):
     (fsw-inference#430: segfault in TVMBackendParallelLaunch during warm-up).
     """
     import os
-    if os.environ.get("RBLN_DIDS_CLAMP_MAX") == "1":
+
+    # Default ON. For an in-range id the two clamps are identical, so this only
+    # ever changes behaviour for an id that would have indexed out of bounds --
+    # there is no correctness cost to enabling it. Set RBLN_DIDS_CLAMP_MAX=0 to
+    # get dev's lower-bound-only behaviour back for an A/B.
+    if os.environ.get("RBLN_DIDS_CLAMP_MAX", "1") == "1":
         return d_ids.clamp(0, vocab_size - 1)
     return d_ids.clamp_min(0)
 
