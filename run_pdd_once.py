@@ -76,8 +76,11 @@ DECODE_NIXL_SIDE_CHANNEL_PORT = 5659
 BLOCK_SIZE = 4096
 MAX_MODEL_LEN = 4096
 MAX_NUM_SEQS = 1
-TENSOR_PARALLEL_SIZE = 1
+DEFAULT_MAX_NUM_BATCHED_TOKENS = 128
+PREFILL_TENSOR_PARALLEL_SIZE = 1
+DEFAULT_DECODE_TENSOR_PARALLEL_SIZE = 1
 PREFILL_GPU_MEMORY_UTILIZATION = "0.20"
+DEFAULT_DECODE_GPU_MEMORY_UTILIZATION = 0.2
 
 DEFAULT_PROMPT = "Capital of South Korea is"
 DEFAULT_MAX_TOKENS = 8
@@ -444,47 +447,75 @@ def post_completion(url: str, payload: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError(f"Completion response was not JSON:\n{raw}") from exc
 
 
+def _process_group_exists(process_group_id: int) -> bool:
+    try:
+        os.killpg(process_group_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def terminate_processes(processes: list[subprocess.Popen[str]]) -> None:
     """Terminate all started subprocesses, including their process groups."""
     global SHUTTING_DOWN
     SHUTTING_DOWN = True
 
-    live_processes = [process for process in processes if process.poll() is None]
-    if not live_processes:
+    if not processes:
         return
 
     print("[stop] terminating subprocesses...")
 
-    for process in reversed(live_processes):
+    # start_process() launches every top-level process in a new session, so its
+    # PID is also its process-group ID. Keep all group IDs even if a top-level
+    # process has already exited: vLLM TP workers can briefly outlive the API
+    # server and would otherwise be orphaned.
+    process_groups = [(process, process.pid) for process in processes]
+
+    for process, process_group_id in reversed(process_groups):
         info = PROCESS_INFO.get(process.pid)
         name = info.name if info else f"pid {process.pid}"
         print(f"[stop] SIGTERM -> {name}")
         try:
-            os.killpg(process.pid, signal.SIGTERM)
+            os.killpg(process_group_id, signal.SIGTERM)
         except ProcessLookupError:
             pass
         except Exception:
-            process.terminate()
+            if process.poll() is None:
+                process.terminate()
 
     deadline = time.monotonic() + TERMINATE_TIMEOUT_SEC
     while time.monotonic() < deadline:
-        if all(process.poll() is not None for process in live_processes):
+        # Reap top-level children while waiting, but use the process groups as
+        # the source of truth because TP workers may outlive their API server.
+        for process in processes:
+            process.poll()
+        if not any(
+            _process_group_exists(process_group_id)
+            for _, process_group_id in process_groups
+        ):
             break
         time.sleep(0.5)
 
-    still_live = [process for process in live_processes if process.poll() is None]
-    for process in reversed(still_live):
+    # A vLLM API server can exit before its multiprocessing workers. Signal
+    # every original group, not only groups whose leader is still alive.
+    for process, process_group_id in reversed(process_groups):
         info = PROCESS_INFO.get(process.pid)
         name = info.name if info else f"pid {process.pid}"
-        print(f"[stop] SIGKILL -> {name}")
+        if not _process_group_exists(process_group_id):
+            continue
+
+        print(f"[stop] SIGKILL -> remaining {name} process group")
         try:
-            os.killpg(process.pid, signal.SIGKILL)
+            os.killpg(process_group_id, signal.SIGKILL)
         except ProcessLookupError:
             pass
         except Exception:
-            process.kill()
+            if process.poll() is None:
+                process.kill()
 
-    for process in live_processes:
+    for process in processes:
         try:
             process.wait(timeout=5)
         except Exception:
@@ -503,6 +534,7 @@ def _build_prefill_cmd(
     block_size: int,
     max_model_len: int | None,
     max_num_seqs: int | None,
+    max_num_batched_tokens: int | None,
 ) -> list[str]:
     kv_config = {
         "kv_connector": "NixlConnector",
@@ -524,7 +556,7 @@ def _build_prefill_cmd(
         "--gpu-memory-utilization",
         PREFILL_GPU_MEMORY_UTILIZATION,
         "--tensor-parallel-size",
-        str(TENSOR_PARALLEL_SIZE),
+        str(PREFILL_TENSOR_PARALLEL_SIZE),
         "--served-model-name",
         served_model_name,
         "--kv-transfer-config",
@@ -534,6 +566,8 @@ def _build_prefill_cmd(
         cmd.extend(["--max-model-len", str(max_model_len)])
     if max_num_seqs is not None:
         cmd.extend(["--max-num-seqs", str(max_num_seqs)])
+    if max_num_batched_tokens is not None:
+        cmd.extend(["--max-num-batched-tokens", str(max_num_batched_tokens)])
     return cmd
 
 
@@ -543,6 +577,9 @@ def _build_decode_cmd(
     block_size: int,
     max_model_len: int | None,
     max_num_seqs: int | None,
+    max_num_batched_tokens: int | None,
+    tensor_parallel_size: int,
+    gpu_memory_utilization: float,
 ) -> list[str]:
     kv_config = {
         "kv_connector": DECODE_KV_CONNECTOR_NAME,
@@ -566,7 +603,9 @@ def _build_decode_cmd(
         "--block-size",
         str(block_size),
         "--tensor-parallel-size",
-        str(TENSOR_PARALLEL_SIZE),
+        str(tensor_parallel_size),
+        "--gpu-memory-utilization",
+        str(gpu_memory_utilization),
         "--served-model-name",
         served_model_name,
         "--kv-transfer-config",
@@ -576,6 +615,8 @@ def _build_decode_cmd(
         cmd.extend(["--max-model-len", str(max_model_len)])
     if max_num_seqs is not None:
         cmd.extend(["--max-num-seqs", str(max_num_seqs)])
+    if max_num_batched_tokens is not None:
+        cmd.extend(["--max-num-batched-tokens", str(max_num_batched_tokens)])
     return cmd
 
 
@@ -691,6 +732,45 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--decode-max-model-len", type=int, default=MAX_MODEL_LEN)
     parser.add_argument("--prefill-max-num-seqs", type=int, default=MAX_NUM_SEQS)
     parser.add_argument("--decode-max-num-seqs", type=int, default=MAX_NUM_SEQS)
+    parser.add_argument(
+        "--prefill-max-num-batched-tokens",
+        type=int,
+        default=DEFAULT_MAX_NUM_BATCHED_TOKENS,
+        help="Maximum batched tokens for CUDA prefill scheduling.",
+    )
+    parser.add_argument(
+        "--decode-max-num-batched-tokens",
+        type=int,
+        default=DEFAULT_MAX_NUM_BATCHED_TOKENS,
+        help=(
+            "Maximum batched tokens for RBLN decode scheduling and warm-up. "
+            "Keeping this bounded avoids compiling an unnecessarily large "
+            "prefill graph on every TP worker."
+        ),
+    )
+    parser.add_argument(
+        "--decode-tensor-parallel-size",
+        type=int,
+        default=DEFAULT_DECODE_TENSOR_PARALLEL_SIZE,
+        help=(
+            "Number of NPUs used by the decode server. When --rbln-devices is "
+            "omitted, devices 0 through N-1 are selected."
+        ),
+    )
+    parser.add_argument(
+        "--rbln-devices",
+        default=None,
+        help=(
+            "Comma-separated physical NPU IDs for decode, for example 0,1,2,3. "
+            "The number of IDs must equal --decode-tensor-parallel-size."
+        ),
+    )
+    parser.add_argument(
+        "--decode-gpu-memory-utilization",
+        type=float,
+        default=DEFAULT_DECODE_GPU_MEMORY_UTILIZATION,
+        help="Fraction of each decode NPU's memory available to vLLM.",
+    )
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
     parser.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE)
@@ -732,6 +812,37 @@ def _parse_args() -> argparse.Namespace:
         help="Do not automatically create missing P/D virtual environments.",
     )
     return parser.parse_args()
+
+
+def _resolve_rbln_devices(
+    tensor_parallel_size: int,
+    configured_devices: str | None,
+) -> str:
+    if tensor_parallel_size < 1:
+        raise ValueError("--decode-tensor-parallel-size must be at least 1")
+
+    if configured_devices is None:
+        return ",".join(str(device_id) for device_id in range(tensor_parallel_size))
+
+    device_values = configured_devices.split(",")
+    if any(not value.strip() for value in device_values):
+        raise ValueError("--rbln-devices must be a comma-separated list of NPU IDs")
+
+    try:
+        device_ids = [int(value) for value in device_values]
+    except ValueError as exc:
+        raise ValueError("--rbln-devices must contain only integer NPU IDs") from exc
+
+    if any(device_id < 0 for device_id in device_ids):
+        raise ValueError("--rbln-devices cannot contain negative NPU IDs")
+    if len(set(device_ids)) != len(device_ids):
+        raise ValueError("--rbln-devices cannot contain duplicate NPU IDs")
+    if len(device_ids) != tensor_parallel_size:
+        raise ValueError(
+            "--rbln-devices must contain exactly "
+            f"{tensor_parallel_size} IDs for decode TP={tensor_parallel_size}"
+        )
+    return ",".join(str(device_id) for device_id in device_ids)
 
 
 def _extract_completion_text(response_json: dict[str, Any]) -> str | None:
@@ -798,6 +909,11 @@ def _print_resolved_config(
     decode_max_model_len: int | None,
     prefill_max_num_seqs: int | None,
     decode_max_num_seqs: int | None,
+    prefill_max_num_batched_tokens: int | None,
+    decode_max_num_batched_tokens: int | None,
+    decode_tensor_parallel_size: int,
+    rbln_devices: str,
+    decode_gpu_memory_utilization: float,
     log_dir: Path,
 ) -> None:
     print(f"[config] prefill model: {prefill_model}")
@@ -809,6 +925,22 @@ def _print_resolved_config(
     print(f"[config] decode max model len:  {decode_max_model_len}")
     print(f"[config] prefill max num seqs: {prefill_max_num_seqs}")
     print(f"[config] decode max num seqs:  {decode_max_num_seqs}")
+    print(
+        "[config] prefill max num batched tokens: "
+        f"{prefill_max_num_batched_tokens}"
+    )
+    print(
+        "[config] decode max num batched tokens:  "
+        f"{decode_max_num_batched_tokens}"
+    )
+    print(
+        f"[config] decode tensor parallel size: {decode_tensor_parallel_size}"
+    )
+    print(f"[config] decode RBLN devices: {rbln_devices}")
+    print(
+        "[config] decode GPU memory utilization: "
+        f"{decode_gpu_memory_utilization}"
+    )
     print(f"[config] repo:  {WORK_REPO}")
     print(f"[config] proxy: {PROXY_SCRIPT}")
     print(f"[config] logs:  {log_dir}")
@@ -823,6 +955,7 @@ def _print_resolved_config(
                 prefill_block_size,
                 prefill_max_model_len,
                 prefill_max_num_seqs,
+                prefill_max_num_batched_tokens,
             )
         )
     )
@@ -836,6 +969,9 @@ def _print_resolved_config(
                 decode_block_size,
                 decode_max_model_len,
                 decode_max_num_seqs,
+                decode_max_num_batched_tokens,
+                decode_tensor_parallel_size,
+                decode_gpu_memory_utilization,
             )
         )
     )
@@ -867,6 +1003,16 @@ def main() -> int:
         prefill_model = args.prefill_model or args.model
         decode_model = args.decode_model or args.model
         served_model_name = args.served_model_name or args.model
+        rbln_devices = _resolve_rbln_devices(
+            args.decode_tensor_parallel_size,
+            args.rbln_devices,
+        )
+        if not 0 < args.decode_gpu_memory_utilization <= 1:
+            raise ValueError("--decode-gpu-memory-utilization must be in (0, 1]")
+        if args.prefill_max_num_batched_tokens < 1:
+            raise ValueError("--prefill-max-num-batched-tokens must be at least 1")
+        if args.decode_max_num_batched_tokens < 1:
+            raise ValueError("--decode-max-num-batched-tokens must be at least 1")
 
         _print_resolved_config(
             prefill_model,
@@ -878,6 +1024,11 @@ def main() -> int:
             args.decode_max_model_len,
             args.prefill_max_num_seqs,
             args.decode_max_num_seqs,
+            args.prefill_max_num_batched_tokens,
+            args.decode_max_num_batched_tokens,
+            args.decode_tensor_parallel_size,
+            rbln_devices,
+            args.decode_gpu_memory_utilization,
             log_dir,
         )
         if args.check_config:
@@ -896,11 +1047,15 @@ def main() -> int:
         decode_env = {
             "VLLM_RBLN_USE_VLLM_MODEL": "1",
             "VLLM_RBLN_COMPILE_MODEL": "1",
-            "RBLN_DEVICES": "0",
+            "RBLN_DEVICES": rbln_devices,
             "VLLM_KV_CACHE_LAYOUT": "HND",
             "UCX_NET_DEVICES": "all",
             "VLLM_NIXL_SIDE_CHANNEL_PORT": str(DECODE_NIXL_SIDE_CHANNEL_PORT),
         }
+        if args.decode_tensor_parallel_size > 1:
+            # RBLN-CCL requires both addresses even for single-node TP.
+            decode_env["RBLN_ROOT_IP"] = HOST
+            decode_env["RBLN_LOCAL_IP"] = HOST
         proxy_env = {}
 
         processes.append(
@@ -912,6 +1067,7 @@ def main() -> int:
                     args.prefill_block_size,
                     args.prefill_max_model_len,
                     args.prefill_max_num_seqs,
+                    args.prefill_max_num_batched_tokens,
                 ),
                 prefill_env,
                 RUN_CWD,
@@ -927,6 +1083,9 @@ def main() -> int:
                     args.decode_block_size,
                     args.decode_max_model_len,
                     args.decode_max_num_seqs,
+                    args.decode_max_num_batched_tokens,
+                    args.decode_tensor_parallel_size,
+                    args.decode_gpu_memory_utilization,
                 ),
                 decode_env,
                 RUN_CWD,
