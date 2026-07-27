@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections import defaultdict
 from typing import TYPE_CHECKING, Any
 
 import msgspec
 import numpy as np
 import rebel
 import torch
+import zmq
 from rebel.kv_cache import aligned_tensor
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.utils import (
@@ -33,12 +35,17 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
     NixlConnectorWorker,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+    GET_META_MSG,
     NixlHandshakePayload,
     compute_nixl_compatibility_hash,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
     compute_tp_mapping,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import zmq_ctx
+from vllm.distributed.parallel_state import get_pp_group
+from vllm.platforms import current_platform
+from vllm.utils.network_utils import make_zmq_path
 from vllm.v1.kv_cache_interface import (
     MambaSpec,
     SlidingWindowSpec,
@@ -46,9 +53,14 @@ from vllm.v1.kv_cache_interface import (
 )
 
 import vllm_rbln.envs as envs
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
+    RblnNixlAgentMetadata,
+    rbln_pp_compat_hash,
+)
 from vllm_rbln.logger import init_logger
 
 if TYPE_CHECKING:
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import ReqMeta
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
 logger = init_logger(__name__)
@@ -67,6 +79,9 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
     layer (kernel granularity), whose `cache.shape[0]` mismatches
     `num_blocks`. Non-disagg serving is unaffected.
     """
+
+    compat_hash: str | None
+    xfer_handshake_metadata: NixlHandshakePayload | None
 
     def __init__(
         self, vllm_config: VllmConfig, engine_id: str, kv_cache_config: "KVCacheConfig"
@@ -108,6 +123,27 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
         self.use_host_buffer = self.kv_buffer_device == "cpu"
 
         self._pending_kv_caches: dict[str, torch.Tensor] | None = None
+
+        # --- Pipeline-parallel (PP) P/D state (empty / inert for pp_size == 1) ---
+        # Per remote producer shard, the ordered KV-cache layer names it owns,
+        # keyed by engine_id -> global_rank (= pp_rank * tp_size + tp_rank,
+        # == pp_rank when tensor parallelism is off).
+        self._remote_shard_layer_names: defaultdict[str, dict[int, tuple[str, ...]]] = (
+            defaultdict(dict)
+        )
+        # engine_id -> producer pp_size (discovered at handshake).
+        self._remote_pp_size: dict[str, int] = {}
+        # engine_id -> the producer stages (flat global ranks) whose layers this
+        # rank owns; drives _read_blocks_for_req.
+        self._overlapping_ranks: defaultdict[str, list[int]] = defaultdict(list)
+        # Per producer shard, a local xfer dlist scoped to that shard's local
+        # region subset, keyed by (engine_id, global_rank, block_size); and the
+        # shard's per-region KV-group ids, keyed by (engine_id, global_rank).
+        self.src_xfer_handles_by_remote: dict[tuple[str, int, int], int] = {}
+        self._shard_region_group_ids: dict[tuple[str, int], tuple[int, ...]] = {}
+        # Ordered local KV-cache layer names (one per layer), captured at
+        # register_kv_caches.
+        self.local_seen_layer_names: list[str] = []
 
         # Pin to logical values. Upstream would otherwise multiply by the
         # attention backend's kernel ratio, which doesn't reflect per-spec
@@ -168,6 +204,10 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
         fall straight through to upstream's UCX-backed registration —
         the host xfer buffers are plain DRAM in either case.
         """
+        # Capture the ordered local layer names before any deferral so the PP
+        # metadata publish (and the consumer-side name->region matching) can
+        # use them; the D2D path re-uses these at finalize time.
+        self.local_seen_layer_names = list(kv_caches.keys())
         if self.kv_buffer_device == "rbln":
             self._pending_kv_caches = kv_caches
             logger.info(
@@ -181,6 +221,13 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
 
             nixl_rbln.ensure_rbln_backend(self.nixl_wrapper, device_id=0)
         super().register_kv_caches(kv_caches)
+        # Re-wrap the base-published handshake metadata with this stage's PP
+        # identity + owned layer names (no-op degrade for pp_size == 1).
+        if self.xfer_handshake_metadata is not None:
+            base_agent_metadata = msgspec.msgpack.Decoder(NixlAgentMetadata).decode(
+                self.xfer_handshake_metadata.agent_metadata_bytes
+            )
+            self._publish_pp_handshake_metadata(base_agent_metadata, kv_caches.keys())
 
     def finalize_kv_cache_registration(self) -> None:
         """Run the deferred D2D registration. No-op on host-bounce and
@@ -402,11 +449,10 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
                 self._physical_blocks_per_logical_kv_block
             ),
         )
-        assert self.compat_hash is not None
-        encoder = msgspec.msgpack.Encoder()
-        self.xfer_handshake_metadata = NixlHandshakePayload(
-            compatibility_hash=self.compat_hash,
-            agent_metadata_bytes=encoder.encode(agent_metadata),
+        # Publish the handshake metadata wrapped with this stage's PP identity
+        # and owned layer names (degrades to no-PP for pp_size == 1).
+        self._publish_pp_handshake_metadata(
+            agent_metadata, self.device_kv_caches.keys()
         )
 
     # ------------------------------------------------------------------
@@ -446,10 +492,20 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
     def register_local_xfer_handler(
         self,
         block_size: int,
+        *,
+        registered_layer_names: tuple[str, ...] | list[str] | None = None,
     ) -> tuple[int, list[tuple[int, int, int]]]:
         if self._sw_ratio is None:
-            # No SWA view opt: upstream's Full-only desc layout applies.
-            return super().register_local_xfer_handler(block_size)
+            if registered_layer_names is None:
+                # No SWA view opt, no PP shard: upstream's Full-only layout.
+                return super().register_local_xfer_handler(block_size)
+            # PP shard — register only this producer stage's local regions.
+            return self._register_shard_local_xfer_handler(
+                block_size, registered_layer_names
+            )
+        assert registered_layer_names is None, (
+            "RBLN NIXL: SWA view-opt is not supported with pipeline parallelism"
+        )
         assert self.transfer_topo is not None
         assert not self.transfer_topo.is_kv_layout_blocks_first, (
             "RBLN NIXL connector only supports FA layout (K and V in "
@@ -663,3 +719,414 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
             group_arr = np.asarray(group)[None, :]
             all_descs.append((region_ids * num_blocks + group_arr + offset).flatten())
         return np.concatenate(all_descs) if all_descs else np.empty(0, dtype=int)
+
+    # ------------------------------------------------------------------
+    # Pipeline-parallel (PP) P/D over NIXL
+    # ------------------------------------------------------------------
+    #
+    # Under sync-scheduling PP the producer runs pipeline_parallel_size
+    # stages, each owning a contiguous band of layers. Every stage
+    # advertises its (pp_rank, tp_rank) shard and the KV-cache layer names
+    # it registered; the consumer matches each shard to its own local KV
+    # regions BY NAME (the owned layer range is derived locally on each
+    # side, never sent over the wire) and reads each overlapping shard with
+    # a shard-scoped local/remote descriptor pair. All of this collapses to
+    # the upstream single-stage path for pp_size == 1.
+
+    def _check_pp_constraints(self) -> None:
+        if self.vllm_config.parallel_config.pipeline_parallel_size <= 1:
+            return
+        assert self.transfer_topo is not None
+        if self.transfer_topo.cross_layers_blocks:
+            raise RuntimeError(
+                "RBLN NIXL: cross-layer-blocks mode is not supported with "
+                "pipeline_parallel_size > 1."
+            )
+        if self._has_mamba:
+            raise RuntimeError(
+                "RBLN NIXL: hybrid (Mamba/SSM) models are not supported with "
+                "pipeline_parallel_size > 1 over NIXL P/D."
+            )
+        if self._sw_ratio is not None:
+            raise RuntimeError(
+                "RBLN NIXL: sliding-window view-opt (VLLM_RBLN_NIXL_SWA_VIEW_OPT) "
+                "is not supported with pipeline_parallel_size > 1."
+            )
+
+    def _publish_pp_handshake_metadata(
+        self, base_meta: NixlAgentMetadata, registered_layer_names
+    ) -> None:
+        self._check_pp_constraints()
+        pp_size = self.vllm_config.parallel_config.pipeline_parallel_size
+        pp_rank = get_pp_group().rank_in_group if pp_size > 1 else 0
+        pp_meta = RblnNixlAgentMetadata(
+            engine_id=base_meta.engine_id,
+            agent_metadata=base_meta.agent_metadata,
+            device_id=base_meta.device_id,
+            kv_caches_base_addr=base_meta.kv_caches_base_addr,
+            num_blocks=base_meta.num_blocks,
+            block_lens=base_meta.block_lens,
+            kv_cache_layout=base_meta.kv_cache_layout,
+            block_size=base_meta.block_size,
+            ssm_sizes=base_meta.ssm_sizes,
+            attn_backend_name=base_meta.attn_backend_name,
+            physical_blocks_per_logical_kv_block=(
+                base_meta.physical_blocks_per_logical_kv_block
+            ),
+            pp_rank=pp_rank,
+            pp_size=pp_size,
+            registered_layer_names=list(registered_layer_names),
+        )
+        base_hash = self.compat_hash
+        assert base_hash is not None
+        self.compat_hash = rbln_pp_compat_hash(base_hash)
+        self.xfer_handshake_metadata = NixlHandshakePayload(
+            compatibility_hash=self.compat_hash,
+            agent_metadata_bytes=msgspec.msgpack.Encoder().encode(pp_meta),
+        )
+
+    def _query_agent_meta(
+        self, sock: "zmq.Socket", remote_rank: int, expected_engine_id: str
+    ) -> RblnNixlAgentMetadata:
+        sock.send(msgspec.msgpack.encode((GET_META_MSG, remote_rank)))
+        handshake_payload = msgspec.msgpack.Decoder(NixlHandshakePayload).decode(
+            sock.recv()
+        )
+        assert self.compat_hash is not None
+        if (
+            self.enforce_compat_hash
+            and handshake_payload.compatibility_hash != self.compat_hash
+        ):
+            raise RuntimeError(
+                "NIXL compatibility hash mismatch "
+                f"(local={self.compat_hash}, "
+                f"remote={handshake_payload.compatibility_hash}). Prefill and "
+                "decode instances have incompatible configurations."
+            )
+        metadata = msgspec.msgpack.Decoder(RblnNixlAgentMetadata).decode(
+            handshake_payload.agent_metadata_bytes
+        )
+        if metadata.engine_id != expected_engine_id:
+            raise RuntimeError(
+                "Remote NIXL agent engine ID mismatch. "
+                f"Expected {expected_engine_id}, received {metadata.engine_id}."
+            )
+        return metadata
+
+    def _nixl_handshake(
+        self,
+        host: str,
+        port: int,
+        remote_tp_size: int,
+        expected_engine_id: str,
+    ) -> dict[int, str]:
+        # Background thread needs a device context (see base _nixl_handshake).
+        if not self.use_host_buffer:
+            current_platform.set_device(self.device_id)
+
+        assert self.transfer_topo is not None
+        p_remote_tp_ranks = self.transfer_topo.handshake_target_ranks(remote_tp_size)
+        path = make_zmq_path("tcp", host, port)
+        remote_rank_to_agent_name: dict[int, str] = {}
+
+        with zmq_ctx(zmq.REQ, path) as sock:
+            sock.setsockopt(zmq.RCVTIMEO, 5000)  # ms; avoid hang on dead server
+
+            # Bootstrap: the first shard (pp_rank 0) advertises pp_size.
+            first_rank = p_remote_tp_ranks[0]
+            metas = {
+                first_rank: self._query_agent_meta(sock, first_rank, expected_engine_id)
+            }
+            pp_size = metas[first_rank].pp_size
+
+            if pp_size > 1:
+                if self._sw_ratio is not None:
+                    raise RuntimeError(
+                        "RBLN NIXL: sliding-window attention combined with "
+                        "pipeline-parallel P/D is not supported."
+                    )
+                if remote_tp_size > 1:
+                    raise RuntimeError(
+                        "RBLN NIXL: tensor parallelism (remote_tp_size>1) "
+                        "combined with pipeline-parallel P/D is not supported."
+                    )
+
+            for pp_rank in range(pp_size):
+                for remote_tp_rank in p_remote_tp_ranks:
+                    global_rank = pp_rank * remote_tp_size + remote_tp_rank
+                    if global_rank in metas:
+                        metadata = metas[global_rank]
+                    else:
+                        metadata = self._query_agent_meta(
+                            sock, global_rank, expected_engine_id
+                        )
+                    names = tuple(metadata.registered_layer_names)
+                    self._remote_shard_layer_names[expected_engine_id][global_rank] = (
+                        names
+                    )
+                    if pp_size == 1:
+                        # No pipeline parallelism: single-stage registration,
+                        # exactly as the non-PP path (read path also delegates to
+                        # base for pp_size == 1).
+                        remote_rank_to_agent_name[global_rank] = self.add_remote_agent(
+                            metadata, global_rank, remote_tp_size
+                        )
+                        continue
+
+                    # PP: only build/register producer stages whose layers this
+                    # rank actually owns. base.add_remote_agent -> _build_fa_remote
+                    # indexes the *local* block_len_per_layer by the *remote*
+                    # region position, so it is only safe when n_remote <= n_local.
+                    # Overlapping stages satisfy that (symmetric same-stage: equal;
+                    # asymmetric fan-in: remote is a sub-band of this larger band);
+                    # a non-overlapping peer stage may be larger under an uneven
+                    # split (e.g. 62 layers / 4 = 16/16/15/15) and would index out
+                    # of range -- and this rank never reads it -- so skip it.
+                    indices = self._local_region_indices_for_layer_names(names)
+                    if 0 < len(indices) < len(names):
+                        raise RuntimeError(
+                            f"RBLN NIXL PP: producer stage {global_rank} "
+                            f"({len(names)} layers) partially overlaps this "
+                            f"decode rank's band ({len(indices)} owned). "
+                            "The prefill pipeline-parallel size must be >= "
+                            "the decode pipeline-parallel size and an integer "
+                            "multiple of it."
+                        )
+                    if not indices:
+                        continue
+                    remote_rank_to_agent_name[global_rank] = self.add_remote_agent(
+                        metadata, global_rank, remote_tp_size
+                    )
+                    self._register_shard_read_state(
+                        expected_engine_id,
+                        global_rank,
+                        metadata.block_size,
+                        names,
+                    )
+                    self._overlapping_ranks[expected_engine_id].append(global_rank)
+        self._remote_pp_size[expected_engine_id] = pp_size
+        return remote_rank_to_agent_name
+
+    def _register_shard_read_state(
+        self,
+        engine_id: str,
+        global_rank: int,
+        block_size: int,
+        registered_layer_names: tuple[str, ...],
+    ) -> None:
+        handle, _ = self.register_local_xfer_handler(
+            block_size, registered_layer_names=registered_layer_names
+        )
+        self.src_xfer_handles_by_remote[(engine_id, global_rank, block_size)] = handle
+        assert len(self.kv_cache_config.kv_cache_groups) == 1, (
+            "RBLN NIXL PP currently supports a single KV-cache group"
+        )
+        region_ids = self._shard_local_region_ids(registered_layer_names)
+        self._shard_region_group_ids[(engine_id, global_rank)] = tuple(
+            0 for _ in region_ids
+        )
+
+    def _local_region_indices_for_layer_names(
+        self, registered_layer_names: tuple[str, ...] | list[str]
+    ) -> list[int]:
+        positions_by_name: dict[str, list[int]] = defaultdict(list)
+        for local_idx, layer_name in enumerate(self.local_seen_layer_names):
+            positions_by_name[layer_name].append(local_idx)
+
+        occurrences_by_name: dict[str, int] = defaultdict(int)
+        local_indices: list[int] = []
+        for layer_name in registered_layer_names:
+            occurrence = occurrences_by_name[layer_name]
+            occurrences_by_name[layer_name] += 1
+            matches = positions_by_name.get(layer_name, [])
+            if occurrence >= len(matches):
+                continue
+            local_indices.append(matches[occurrence])
+        return local_indices
+
+    def _regions_per_layer(self) -> int:
+        num_layers = len(self.local_seen_layer_names)
+        assert num_layers > 0 and self.num_regions % num_layers == 0, (
+            f"num_regions={self.num_regions} not divisible by num_layers={num_layers}"
+        )
+        return self.num_regions // num_layers
+
+    def _shard_local_region_ids(
+        self, registered_layer_names: tuple[str, ...] | list[str]
+    ) -> list[int]:
+        rpl = self._regions_per_layer()
+        layer_indices = self._local_region_indices_for_layer_names(
+            registered_layer_names
+        )
+        return [layer_idx * rpl + k for layer_idx in layer_indices for k in range(rpl)]
+
+    def _register_shard_local_xfer_handler(
+        self, block_size: int, registered_layer_names: tuple[str, ...] | list[str]
+    ) -> tuple[int, list[tuple[int, int, int]]]:
+        assert self.transfer_topo is not None
+        assert not self.transfer_topo.is_kv_layout_blocks_first, (
+            "RBLN NIXL connector only supports FA layout (K and V in separate "
+            "regions), not FlashInfer."
+        )
+        assert not self._has_mamba, "RBLN NIXL connector does not support Mamba."
+
+        block_size_ratio = self.block_size // block_size
+        num_blocks = self.num_blocks * block_size_ratio
+        all_base_addrs = self.kv_caches_base_addr[self.engine_id][self.tp_rank]
+        region_ids = self._shard_local_region_ids(registered_layer_names)
+
+        blocks_data: list[tuple[int, int, int]] = []
+        for region_id in region_ids:
+            base_addr = all_base_addrs[region_id]
+            kv_block_len = (
+                self.get_backend_aware_kv_block_len(
+                    layer_idx=region_id, first_split=True, mamba_view=False
+                )
+                // block_size_ratio
+            )
+            stride = self.block_len_per_layer[region_id] // block_size_ratio
+            for block_id in range(num_blocks):
+                blocks_data.append(
+                    (base_addr + block_id * stride, kv_block_len, self.device_id)
+                )
+
+        descs = self.nixl_wrapper.get_xfer_descs(blocks_data, self.nixl_memory_type)
+        return (
+            self.nixl_wrapper.prep_xfer_dlist("NIXL_INIT_AGENT", descs),
+            blocks_data,
+        )
+
+    def _get_block_descs_ids_for_shard(
+        self,
+        engine_id: str,
+        global_rank: int,
+        num_blocks: int,
+        block_ids: BlockIds,
+    ) -> np.ndarray:
+        region_group_ids = self._shard_region_group_ids[(engine_id, global_rank)]
+        desc_ids: list[np.ndarray] = []
+        for region_id, group_id in enumerate(region_group_ids):
+            group_arr = np.asarray(block_ids[group_id], dtype=np.int64)
+            if group_arr.size == 0:
+                continue
+            desc_ids.append(region_id * num_blocks + group_arr)
+        if not desc_ids:
+            return np.empty(0, dtype=np.int64)
+        return np.concatenate(desc_ids)
+
+    def _validate_remote_agent_handshake(
+        self, nixl_agent_meta: NixlAgentMetadata, remote_tp_size: int
+    ) -> None:
+        if getattr(nixl_agent_meta, "pp_size", 1) <= 1:
+            super()._validate_remote_agent_handshake(nixl_agent_meta, remote_tp_size)
+            return
+
+        assert self.transfer_topo is not None
+        remote_engine_id = nixl_agent_meta.engine_id
+        remote_info = self.transfer_topo.get_engine_info(remote_engine_id)
+        assert remote_info.remote_tp_size == remote_tp_size == 1, (
+            "PP over NIXL P/D requires TP=1 on both sides."
+        )
+        assert self.transfer_topo.block_size_ratio(nixl_agent_meta.block_size) == 1, (
+            "PP over NIXL P/D requires equal P/D block sizes."
+        )
+        assert self.dst_num_blocks[remote_engine_id] == nixl_agent_meta.num_blocks
+        rpl = self._regions_per_layer()
+        n_remote = len(nixl_agent_meta.kv_caches_base_addr)
+        assert (
+            n_remote > 0
+            and n_remote % rpl == 0
+            and n_remote <= len(self.block_len_per_layer)
+        ), (
+            f"PP shard advertised {n_remote} KV regions, not a valid "
+            f"sub-multiple of this consumer's {len(self.block_len_per_layer)} "
+            f"regions (regions/layer={rpl})."
+        )
+
+    def _read_blocks_for_req(self, req_id: str, meta: "ReqMeta") -> None:
+        assert meta.remote is not None and self.transfer_topo is not None
+        engine_id = meta.remote.engine_id
+        pp_size = self._remote_pp_size.get(engine_id, 1)
+        if pp_size == 1:
+            return super()._read_blocks_for_req(req_id, meta)
+
+        remote_info = self.transfer_topo.get_engine_info(engine_id)
+        assert self.transfer_topo.tp_ratio(remote_info.remote_tp_size) == 1, (
+            "RBLN NIXL PP read path supports TP=1 only"
+        )
+        assert (
+            self.transfer_topo.block_size_ratio(remote_info.remote_block_size) == 1
+        ), "RBLN NIXL PP read path requires equal P/D block sizes"
+        remote_block_size = remote_info.remote_block_size
+
+        meta.remote.block_ids = self._logical_to_remote_kernel_block_ids(
+            meta.remote.block_ids, remote_info.remote_physical_blocks_per_logical
+        )
+        remote_block_ids = meta.remote.block_ids
+        local_block_ids = meta.local_physical_block_ids
+        notif_id = f"{meta.remote.request_id}:{self.world_size}".encode()
+        prefix_hit = len(local_block_ids) == 0
+        n_prompt_blocks = sum(len(g) for g in remote_block_ids)
+
+        if not prefix_hit:
+            local_block_ids, remote_block_ids = self._apply_prefix_caching(
+                local_block_ids,
+                remote_block_ids,
+                remote_info.remote_physical_blocks_per_logical,
+            )
+
+        n_read_blocks = sum(len(g) for g in local_block_ids)
+        logger.info(
+            "PP read req %s: pp_size=%d prompt_blocks=%d read_blocks=%d "
+            "prefix_skipped=%d%s",
+            req_id,
+            pp_size,
+            n_prompt_blocks,
+            n_read_blocks,
+            n_prompt_blocks - n_read_blocks,
+            " (full prefix hit, notif only)" if prefix_hit else "",
+        )
+
+        for global_rank in self._overlapping_ranks[engine_id]:
+            if prefix_hit:
+                agent_name = self._remote_agents[engine_id][global_rank]
+                self.nixl_wrapper.send_notif(agent_name, notif_msg=notif_id)
+                continue
+
+            remote_descs = self._get_block_descs_ids_for_shard(
+                engine_id,
+                global_rank,
+                self.dst_num_blocks[engine_id],
+                remote_block_ids,
+            )
+            local_descs = self._get_block_descs_ids_for_shard(
+                engine_id, global_rank, self.num_blocks, local_block_ids
+            )
+            assert len(local_descs) == len(remote_descs)
+            local_handle = self.src_xfer_handles_by_remote[
+                (engine_id, global_rank, remote_block_size)
+            ]
+            remote_handle = self.dst_xfer_side_handles[engine_id][global_rank]
+
+            handle = None
+            try:
+                handle = self.nixl_wrapper.make_prepped_xfer(
+                    "READ",
+                    local_handle,
+                    local_descs,
+                    remote_handle,
+                    remote_descs,
+                    notif_msg=notif_id,
+                )
+                self.nixl_wrapper.transfer(handle)
+                self._recving_transfers[req_id].append(handle)
+            except Exception as e:
+                self._log_failure(
+                    failure_type="transfer_setup_failed",
+                    req_id=req_id,
+                    msg="Marking blocks as invalid",
+                    error=e,
+                    dst_engine_id=engine_id,
+                    remote_pp_rank=global_rank,
+                )
+                self._handle_failed_transfer(req_id, handle)
