@@ -106,7 +106,7 @@ def sync_from_optimum(
     # models, or a full-prefill-plus-batch budget for enc-dec/pooling models.
     update_max_num_batched_tokens(vllm_config, params)
     update_mamba_block_size(vllm_config, params)
-    
+
     # Persist the image-prefill buckets (gemma3/gemma4) into additional_config.
     store_image_prefill_chunk_size(vllm_config, params.image_prefill_chunk_size)
     # Set block_size in cache_config based on rbln_config.json.
@@ -154,11 +154,14 @@ def update_num_blocks(vllm_config: VllmConfig, num_blocks: int) -> None:
         vllm_config.cache_config.num_gpu_blocks_override = adjusted_num_blocks
     vllm_config.additional_config["num_blocks_synced"] = True
 
+
 def update_mamba_block_size(vllm_config: VllmConfig, params: "RBLNParams") -> None:
     vllm_config.model_config.max_model_len = params.max_seq_len
     cache_config = vllm_config.cache_config
-    if (not cache_config.user_specified_mamba_block_size
-            and cache_config.mamba_block_size is not None):
+    if (
+        not cache_config.user_specified_mamba_block_size
+        and cache_config.mamba_block_size is not None
+    ):
         assert not cache_config.enable_prefix_caching, (
             "mamba_block_size can only be synced to max_model_len while "
             "prefix caching is disabled, but prefix caching is enabled. "
