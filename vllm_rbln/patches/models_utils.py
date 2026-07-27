@@ -50,8 +50,29 @@ def rbln_extract_layer_index(layer_name: str, num_attn_module: int = 1) -> int:
             continue
     assert int_vals, f"layer name {layer_name} has no integer layer index"
     base = int_vals[0]
-    sub = int_vals[1] if len(int_vals) >= 2 else int("indexer" in layer_name)
+    # Sub-index within a decoder layer's KV-cache modules:
+    #   0 = MLA self-attention
+    #   1 = DSA lightning-indexer (value) key cache  ("indexer" in name)
+    #   2 = fp8 indexer companion scale cache        ("scale" in name)
+    if len(int_vals) >= 2:
+        sub = int_vals[1]
+    elif "scale" in layer_name:
+        sub = 2
+    elif "indexer" in layer_name:
+        sub = 1
+    else:
+        sub = 0
     return base * num_attn_module + sub
+
+
+def _dsa_indexer_cache_is_fp8() -> bool:
+    from vllm.config import get_current_vllm_config
+
+    try:
+        cache_dtype = get_current_vllm_config().cache_config.cache_dtype
+    except Exception:
+        return False
+    return bool(cache_dtype) and cache_dtype.startswith("fp8")
 
 
 def rbln_num_attn_module(model_config) -> int:
@@ -60,9 +81,10 @@ def rbln_num_attn_module(model_config) -> int:
         return 2
     text_config = getattr(model_config, "hf_text_config", hf_config)
     # TODO(kblee): check general?
-    # DeepSeek-V3.2 (``index_topk`` in the text config)
+    # DeepSeek-V3.2 (``index_topk`` in the text config): each decoder layer has
+    # MLA + the lightning-indexer key cache, sclae (3 modules).
     if hasattr(text_config, "index_topk") or hasattr(hf_config, "index_topk"):
-        return 2
+        return 3 if _dsa_indexer_cache_is_fp8() else 2
     return 1
 
 
