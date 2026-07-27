@@ -82,6 +82,7 @@ def get_param_qwen3_5(
         param["gdn_chunk_size"] = gdn_chunk_size
     return param
 
+
 def get_overridable() -> frozenset[str]:
     """Submodules whose fields a user may override (see ``_find_conflicts``).
 
