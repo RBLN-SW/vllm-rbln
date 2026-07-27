@@ -45,7 +45,7 @@ class RBLNFlashAttnMLABackend(MLACommonBackend):
     """MLA backend for RBLN."""
 
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
-    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = ["auto"]
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = ["auto", "fp8", "fp8_e4m3"]
     accept_output_buffer: bool = False
 
     @staticmethod
@@ -132,9 +132,12 @@ class RBLNFlashAttnMLAImpl(MLAAttentionImpl[RBLNFlashAttentionMetadata]):
             raise NotImplementedError(
                 "Only decoder self-attention is implemented for FlashAttnMLAImpl"
             )
-        if is_quantized_kv_cache(self.kv_cache_dtype):
+
+        if is_quantized_kv_cache(
+            self.kv_cache_dtype
+        ) and not self.kv_cache_dtype.startswith("fp8"):
             raise NotImplementedError(
-                "FlashAttnMLA with FP8 KV cache not yet supported"
+                f"FlashAttnMLA does not support kv_cache_dtype={self.kv_cache_dtype!r}"
             )
         if kv_sharing_target_layer_name is not None:
             raise NotImplementedError("KV sharing is not supported in RBLN.")
