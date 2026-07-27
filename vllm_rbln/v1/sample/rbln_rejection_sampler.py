@@ -459,18 +459,23 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         #      j == num_accepted[i] (active) -> NPU-recovered token from target
         #      j > num_accepted[i]          -> PLACEHOLDER (left untouched)
         # ------------------------------------------------------------------
-        num_accepted_per_batch = num_accepted.reshape(batch_size)
+        # NOTE(RBLN): Compiler-workaround guard on the device op's num_accepted.
+        # Some rebel-compiler builds return a garbage num_accepted
+        num_draft_tokens_t = torch.tensor(
+            num_draft_tokens,
+            dtype=num_accepted.dtype,
+            device=device,
+        )
+        num_accepted_per_batch = num_accepted.reshape(batch_size).clamp(min=0)
+        num_accepted_per_batch = torch.minimum(
+            num_accepted_per_batch, num_draft_tokens_t
+        )
         positions = torch.arange(
             max_spec_len,
             device=device,
         ).unsqueeze(0)  # (1, K)
         # NOTE: all-accept is per-row: a row accepted ALL of ITS OWN drafts
         # (num_draft_tokens[i], which may be < max_spec_len).
-        num_draft_tokens_t = torch.tensor(
-            num_draft_tokens,
-            dtype=num_accepted_per_batch.dtype,
-            device=device,
-        )
         all_accepted_active = (
             num_accepted_per_batch == num_draft_tokens_t
         ) & active_mask
