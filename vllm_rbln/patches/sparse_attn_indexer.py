@@ -43,7 +43,9 @@ def rbln_indexer_cache_init(self, *args, **kwargs) -> None:
 
     vllm_config = get_current_vllm_config()
     self.head_dim = vllm_config.model_config.hf_text_config.index_head_dim
-    self.dtype = torch.bfloat16
+    cache_dtype = vllm_config.cache_config.cache_dtype
+    self.is_fp8_cache = bool(cache_dtype) and cache_dtype.startswith("fp8")
+    self.dtype = torch.float8_e4m3fn if self.is_fp8_cache else torch.bfloat16
 
     model_config = vllm_config.model_config
     num_attn_module = rbln_num_attn_module(model_config)
