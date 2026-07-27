@@ -1663,15 +1663,23 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             assert isinstance(self.drafter, RBLNEagleProposer)
             assert isinstance(sampled_token_ids, torch.Tensor)
 
-            next_token_ids, valid_sampled_tokens_count = (
-                self.drafter.prepare_next_token_ids_padded(
-                    common_attn_metadata,
-                    sampled_token_ids,
-                    self.requests,
-                    self.input_batch,
-                    self.discard_request_mask,
+            # The "draft" phase covers more than propose(): these two helpers
+            # run first and were unmeasured. After compiling the aux projection
+            # the phase is 25.1 ms/step, of which the scopes inside propose()
+            # account for 15.6 -- the 9.5 ms remainder is here and in the
+            # post-forward block. prepare_next_token_ids_padded in particular
+            # holds nine of the eleven integer ops that fall back to the host
+            # (`why: dtype-not-fp16`), each one a device round-trip.
+            with record_function_or_nullcontext("drafter/pre: next_token_ids"):
+                next_token_ids, valid_sampled_tokens_count = (
+                    self.drafter.prepare_next_token_ids_padded(
+                        common_attn_metadata,
+                        sampled_token_ids,
+                        self.requests,
+                        self.input_batch,
+                        self.discard_request_mask,
+                    )
                 )
-            )
 
             target_hidden_states = hidden_states
             num_rejected_tokens: torch.Tensor | None = None
@@ -1688,15 +1696,16 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 else:
                     target_hidden_states = hidden_states[:num_scheduled_tokens]
             else:
-                (
-                    common_attn_metadata,
-                    token_indices_to_sample,
-                    num_rejected_tokens,
-                ) = self.drafter.prepare_inputs_padded(
-                    common_attn_metadata,
-                    spec_decode_metadata,
-                    valid_sampled_tokens_count,
-                )
+                with record_function_or_nullcontext("drafter/pre: inputs_padded"):
+                    (
+                        common_attn_metadata,
+                        token_indices_to_sample,
+                        num_rejected_tokens,
+                    ) = self.drafter.prepare_inputs_padded(
+                        common_attn_metadata,
+                        spec_decode_metadata,
+                        valid_sampled_tokens_count,
+                    )
                 total_num_tokens = common_attn_metadata.num_actual_tokens
                 target_token_ids = self.input_ids[:total_num_tokens]
                 target_positions = self.positions[:total_num_tokens]
