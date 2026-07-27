@@ -13,7 +13,6 @@
 # limitations under the License.
 """A RBLN worker class."""
 
-import copy
 import os
 import time
 from types import NoneType
@@ -52,7 +51,6 @@ from vllm.tracing import instrument
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import (
-    EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
     DraftTokenIds,
     ModelRunnerOutput,
@@ -376,8 +374,18 @@ class RBLNWorker(WorkerBase):
         if (metadata := connector.get_handshake_metadata()) is None:
             return None
 
-        tp_rank = get_tp_group().rank_in_group
-        return {tp_rank: metadata}
+        # Key by the flat global rank (pp_rank * tp_size + tp_rank), NOT tp_rank
+        # alone: under pipeline parallelism every PP stage has tp_rank 0, so a
+        # tp_rank key would collide across stages and the scheduler-side
+        # handshake listener would serve only one shard's metadata (the others
+        # KeyError). This mirrors the consumer's global_rank keying in
+        # RblnNixlConnectorWorker._nixl_handshake. Reduces to tp_rank for
+        # pp_size == 1 (pp_rank 0).
+        tp_group = get_tp_group()
+        global_rank = (
+            get_pp_group().rank_in_group * tp_group.world_size + tp_group.rank_in_group
+        )
+        return {global_rank: metadata}
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return self.model_runner.get_kv_cache_spec()
@@ -501,21 +509,12 @@ class RBLNWorker(WorkerBase):
         # NOTE(RBLN): DO NOT all_gather_group for RBLN pp
         get_pp_group().send_tensor_dict(output.tensors)
 
-        # For PP with a KV connector, surface the connector output the
-        # model runner attached to the intermediate tensors so finished
-        # send/recv notifications still propagate from non-last ranks.
-        kv_connector_output = output.kv_connector_output
-        if not kv_connector_output:
-            return None
-        if (
-            not kv_connector_output.finished_sending
-            and not kv_connector_output.finished_recving
-        ):
-            return EMPTY_MODEL_RUNNER_OUTPUT
-
-        empty_output = copy.copy(EMPTY_MODEL_RUNNER_OUTPUT)
-        empty_output.kv_connector_output = kv_connector_output
-        return empty_output
+        # Non-last PP rank: the model runner already surfaces this rank's
+        # KV-connector output through the two-phase sample_tokens() path
+        # (mirroring the upstream model runner). The engine consumes this
+        # execute_model result only for error propagation, so return None
+        # rather than emitting the same finished send/recv notifications here.
+        return None
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         return self.model_runner.take_draft_token_ids()

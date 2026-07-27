@@ -669,6 +669,9 @@ def _build_connector_worker(
 
     vllm_config = MagicMock()
     vllm_config.cache_config = CacheConfig(block_size=block_size)
+    # _check_pp_constraints compares pipeline_parallel_size <= 1; give it a real
+    # int (MagicMock would raise TypeError). 1 == the non-PP default these tests assume.
+    vllm_config.parallel_config.pipeline_parallel_size = 1
     kv_cache_config = MagicMock()
     kv_cache_config.num_blocks = num_blocks
     if kv_cache_specs is not None:
@@ -685,6 +688,9 @@ def _build_connector_worker(
         self.kv_cache_config = kv_cache_config_
         self.kv_buffer_device = kv_buffer_device
         self._block_size = {}
+        # The real NixlConnectorWorker.__init__ sets this to None; register_kv_caches
+        # reads it after super().register_kv_caches(). Stub it so the harness matches.
+        self.xfer_handshake_metadata = None
 
     modules_patch = (
         # Mask `nixl_rbln` from sys.modules so `import nixl_rbln` raises
