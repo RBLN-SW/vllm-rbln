@@ -353,38 +353,23 @@ class RBLNOptimumQwen3_5ForConditionalGeneration(
     """
     Vision-language Qwen3.5 for RBLN.
 
-    Qwen3.5 is "Qwen3-VL WITHOUT deepstack": a Qwen3-VL-style vision tower + mRoPE, but
-    a HYBRID text backbone (GatedDeltaNet ``linear_attention`` layers + gated
-    ``full_attention``). Its vision encoder returns ONLY the merged image embeds (a
-    single tensor, no deepstack tuple), so it inherits the non-deepstack multimodal /
-    prefill path from Qwen2.5-VL rather than the Qwen3-VL wrapper — whose
-    ``_process_image_input`` unpacks a ``(image_embeds, deepstack)`` 2-tuple and whose
-    prefill build packs deepstack, both of which break on Qwen3.5's single-tensor
-    visual output. The only thing Qwen3.5 changes vs Qwen2.5-VL is that it has no
-    ``second_per_grid_ts`` and names its placeholder ``image_token_id``.
-
-    The ``linear_attention`` layers' ``conv_state``/``recurrent_state`` caches and the
-    0/1 control masks (``conv_state_mask``/``recurrent_state_mask``/``valid_mask``) are
-    handled entirely inside optimum-rbln's ``RBLNQwen3_5RuntimeModel``; this wrapper
-    passes only the standard prefill/decode kwargs. ``full_attention`` layers keep the
-    on-device paged KV cache.
+    Qwen3.5 is a hybrid text backbone (GatedDeltaNet linear_attention layers + gated
+    full_attention layers). Its vision encoder returns the merged image embeddings (a
+    single tensor). It inherits the multimodal prefill path from Qwen2.5-VL.
     """
 
     def __init__(self, vllm_config: VllmConfig) -> None:
         super().__init__(vllm_config=vllm_config)
-        # Per-request slot (``batch_idx``) into the [max_num_seqs] conv/recurrent
-        # state cache. Exposed as ``attention_manager`` so the model runner reclaims
-        # a finished request's slot via ``attention_manager.pop(req_id)`` — finished
-        # requests are handled at the runner level (``scheduler_output``), not from
-        # ``model_input.finished_requests_ids``.
+        # Per-request slot (batch_idx) into the [max_num_seqs] conv/recurrent state cache.
         self.attention_manager: AttentionManager = AttentionManager(
             LinearAttentionStrategy()
         )
 
     def _decode_batch_indices(self, model_input: ModelInputForRBLN) -> torch.Tensor:
-        """The state-cache row (``batch_idx``) of each running request, in running
-        order — used to place decode inputs at ``row == batch_idx`` and gather
-        logits back. ``LinearAttentionStrategy.preprocess`` does the row sorting.
+        """The state-cache row (batch_idx) of each running request, in running
+        order, as a tensor. This is only the index: the actual row placement is
+        done by the scatter (input_block_ids in forward / compute_decode_position_embed) 
+        and undone by the logits gather (batch_indices in forward).
         """
         running = model_input.running_requests_ids
         table_ids = self.attention_manager.get(
@@ -398,8 +383,6 @@ class RBLNOptimumQwen3_5ForConditionalGeneration(
         )
 
     def _add_model_specific_args(self, preprocess_args: dict, video_input: Any):
-        # Qwen3.5 (like Qwen3-VL) has no ``second_per_grid_ts``; its ``get_rope_index``
-        # separates videos by timestamps instead.
         pass
 
     def _create_video_pixel_inputs(
@@ -416,19 +399,18 @@ class RBLNOptimumQwen3_5ForConditionalGeneration(
         )
 
     def _image_token_id(self) -> int:
-        # Qwen3.5's HF config names the placeholder ``image_token_id`` (top-level), not
-        # ``image_token_index`` as the mixin default assumes. Used by the prefill path's
-        # embed_input_ids() image-token scatter, so this must be correct.
+        # Qwen3.5's HF config names the placeholder image_token_id (top-level), not
+        # image_token_index as the mixin default assumes.
         return self.model.config.image_token_id
 
     def compute_decode_position_embed(
         self, model_input: ModelInputForRBLN, mrope_position_deltas: dict[str, float]
     ) -> torch.Tensor:
-        # The base builds ``[2, max_num_seqs, ...]`` with the running requests at
-        # rows ``[0, n)``. Re-place each at its stable ``batch_idx`` row so the whole
+        # The base builds [2, max_num_seqs, ...] with the running requests at
+        # rows [0, n). Re-place each at its stable batch_idx row so the whole
         # decode batch (position_embed / inputs_embeds / block_tables) is laid out
-        # by batch index, matching the ``[max_num_seqs]`` recurrent-state cache the
-        # graph indexes by row. (``forward`` lays out ids/embeds the same way.)
+        # by batch index, matching the [max_num_seqs] recurrent-state cache the
+        # graph indexes by row. forward lays out ids/embeds the same way.
         position_embed = super().compute_decode_position_embed(
             model_input, mrope_position_deltas
         )
@@ -438,26 +420,20 @@ class RBLNOptimumQwen3_5ForConditionalGeneration(
         return out
 
     def forward(self, model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
-        """Qwen3.5 must place each request at its linear-attention ``batch_idx`` row.
+        """Qwen3.5 must place each request at its linear-attention batch_idx row.
 
-        The GatedDeltaNet ``linear_attention`` conv/recurrent state is a fixed
-        ``[max_num_seqs]`` on-device cache indexed by batch row. ``prefill`` writes
-        one row (``batch_idx``, a REQUIRED prefill graph input — omitting it raises
-        ``KeyError: 'batch_idx'`` in ``RBLNQwen3_5RuntimeModel._run``); ``decode``
-        reads/writes every row. So each request is pinned to a stable ``batch_idx``
-        (``attention_manager`` / ``LinearAttentionStrategy``): prefill passes its
-        ``batch_idx`` and decode lays the batch out with the request at
-        ``row == batch_idx`` (padding the empty rows), then gathers logits back to
-        running order. Finished requests are freed by the model runner via
-        ``attention_manager.pop`` — not here.
+        The GatedDeltaNet linear_attention conv/recurrent state is a fixed
+        [max_num_seqs] on-device cache indexed by batch row. prefill writes
+        one row; decode reads/writes every row. So each request is pinned 
+        to a stable batch_idx. prefill passes its batch_idx and decode lays
+        the batch out with the request at row == batch_idx, then gathers 
+        logits back to running order. 
         """
         input_ids = model_input.input_tokens
         cache_position = model_input.input_positions
         block_tables = model_input.block_tables
 
         if model_input.is_prompt:
-            # Prefill is always a single request (the runner forbids batching it):
-            # take the lowest free row and pin it to this request.
             req_id = model_input.running_requests_ids[0]
             batch_idx = self.attention_manager.get(
                 True, self.decoder_batch_size, [req_id], []
@@ -475,11 +451,6 @@ class RBLNOptimumQwen3_5ForConditionalGeneration(
             }
             return self.model.prefill_decoder(**prefill_kwargs).logits
 
-        # Decode: lay the max_num_seqs-wide batch out by batch index (row ==
-        # batch_idx) so the per-row recurrent-state cache aligns with what each
-        # request's prefill wrote. ``input_block_ids`` scatters
-        # ids/cache_position/block_tables to those rows; position_embed is already
-        # laid out the same way (see ``compute_decode_position_embed``).
         batch_indices = self._decode_batch_indices(model_input)
         kw = self.preprocess_for_decoder(
             False,
@@ -497,6 +468,4 @@ class RBLNOptimumQwen3_5ForConditionalGeneration(
             position_embed=model_input.position_embed,
             block_tables=kw.pop("block_tables"),
         ).logits
-        # Gather each running request's logits from its ``batch_idx`` row, back to
-        # running order (vLLM maps logits to requests by that order).
         return logits[batch_indices]

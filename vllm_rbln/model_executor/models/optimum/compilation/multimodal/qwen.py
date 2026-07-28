@@ -64,11 +64,9 @@ def get_param_qwen3_5(
     prefill_chunk_size: int | None = None,
     gdn_chunk_size: int | None = None,
 ) -> dict:
-    # Qwen3.5 is a HYBRID decoder (GatedDeltaNet linear_attention + gated
-    # full_attention). ``linear_attention_layers`` using gated_delta_net
-    # (gdn_chunk_size) during compilation, so gdn_chunk_size is needed here.
-    #
-    # FLASH IS FORCED (not conditional on block_size like the Qwen-VL builders)
+    # ``linear_attention_layers`` using gated_delta_net (gdn_chunk_size) 
+    # during compilation, so gdn_chunk_size is needed here.
+    # FLASH is forced
     param = get_param_qwen2_vl(
         batch_size,
         max_model_len,
