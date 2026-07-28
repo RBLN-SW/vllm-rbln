@@ -61,6 +61,9 @@ jobs:
     env:
       NUM_INPUT_PROMPT: 1
       VLLM_LOGGING_LEVEL: DEBUG
+      # Authenticate HF Hub requests so rate limits apply per-account
+      # instead of per-IP (self-hosted runners share one egress IP).
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
     steps:
       - name: Install uv CLI
         run: |
@@ -83,6 +86,15 @@ jobs:
       - name: Fix git ownership
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Cache HuggingFace Hub
+        uses: actions/cache@v4
+        with:
+          path: /root/.cache/huggingface
+          key: hf-hub-${{ github.job }}-${{ github.run_id }}
+          restore-keys: |
+            hf-hub-${{ github.job }}-
+            hf-hub-
 
       - name: Create test environment via uv sync
         uses: nick-fields/retry@v3
@@ -152,6 +164,9 @@ jobs:
     env:
       NUM_INPUT_PROMPT: 1
       VLLM_LOGGING_LEVEL: DEBUG
+      # Authenticate HF Hub requests so rate limits apply per-account
+      # instead of per-IP (self-hosted runners share one egress IP).
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
     steps:
       - name: Install uv CLI
         run: |
@@ -174,6 +189,15 @@ jobs:
       - name: Fix git ownership
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Cache HuggingFace Hub
+        uses: actions/cache@v4
+        with:
+          path: /root/.cache/huggingface
+          key: hf-hub-${{ github.job }}-${{ github.run_id }}
+          restore-keys: |
+            hf-hub-${{ github.job }}-
+            hf-hub-
 
       - name: Create test environment via uv sync
         uses: nick-fields/retry@v3
@@ -268,6 +292,9 @@ jobs:
     env:
       NUM_INPUT_PROMPT: 1
       VLLM_LOGGING_LEVEL: DEBUG
+      # Authenticate HF Hub requests so rate limits apply per-account
+      # instead of per-IP (self-hosted runners share one egress IP).
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
     steps:
       - name: Install uv CLI
         run: |
@@ -290,6 +317,15 @@ jobs:
       - name: Fix git ownership
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Cache HuggingFace Hub
+        uses: actions/cache@v4
+        with:
+          path: /root/.cache/huggingface
+          key: hf-hub-${{ github.job }}-${{ github.run_id }}
+          restore-keys: |
+            hf-hub-${{ github.job }}-
+            hf-hub-
 
       - name: Create test environment via uv sync
         uses: nick-fields/retry@v3

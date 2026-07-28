@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_ENABLE_WARM_UP: bool = True
     VLLM_RBLN_METRICS: bool = False
     VLLM_RBLN_METRICS_FILE: str = ""
+    VLLM_RBLN_METRICS_DIR: str = ""
     VLLM_RBLN_NUMA: bool = True
 
     # ====================================================================
@@ -50,7 +51,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_COMPILE_MODEL: bool = True
     VLLM_RBLN_COMPILE_STRICT_MODE: bool = False
     VLLM_RBLN_COMPILE_ONLY: bool = False
-    VLLM_RBLN_USE_DEVICE_TENSOR: bool = False
+    VLLM_RBLN_USE_DEVICE_TENSOR: bool = True
     VLLM_RBLN_DISABLE_OFFLOAD: bool = False
     # Default follows VLLM_RBLN_USE_DEVICE_TENSOR (see use_auto_port), so it is
     # False unless device-tensor mode is enabled.
@@ -77,6 +78,34 @@ if TYPE_CHECKING:
     VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS: list[int] = []
     # --- KV CONNECTOR ---
     VLLM_RBLN_NIXL_SWA_VIEW_OPT: bool = False
+    # --- QUANTIZATION ---
+    VLLM_RBLN_USE_W8A16: bool = False
+
+_W8A8_CAPABLE_NPUS = frozenset({"RBLN-CR13", "RBLN-CR23"})
+
+_USE_W8A16: bool | None = None
+
+
+def get_use_w8a16() -> bool:
+    value = os.environ.get("VLLM_RBLN_USE_W8A16")
+    if value is not None:
+        return value.lower() in ("true", "1")
+
+    global _USE_W8A16
+    if _USE_W8A16 is not None:
+        return _USE_W8A16
+
+    from vllm.platforms import current_platform
+
+    try:
+        device_name = current_platform.get_device_name() or ""
+    except Exception:
+        device_name = ""
+
+    _USE_W8A16 = (
+        not device_name or device_name.strip().upper() not in _W8A8_CAPABLE_NPUS
+    )
+    return _USE_W8A16
 
 
 def get_num_devices_per_local_rank() -> int:
@@ -154,7 +183,7 @@ def use_auto_port() -> bool:
         return raw.lower() in ("true", "1")
     # Default follows device-tensor mode: auto port is on when
     # VLLM_RBLN_USE_DEVICE_TENSOR is enabled.
-    return os.environ.get("VLLM_RBLN_USE_DEVICE_TENSOR", "False").lower() in (
+    return os.environ.get("VLLM_RBLN_USE_DEVICE_TENSOR", "True").lower() in (
         "true",
         "1",
     )
@@ -195,6 +224,8 @@ environment_variables = {
     # The worker pid is appended before the extension to keep TP/DP workers
     # from clobbering each other. Empty disables file output.
     "VLLM_RBLN_METRICS_FILE": lambda: os.environ.get("VLLM_RBLN_METRICS_FILE", ""),
+    # Directory for per-worker JSON performance reports (empty disables).
+    "VLLM_RBLN_METRICS_DIR": lambda: os.environ.get("VLLM_RBLN_METRICS_DIR", ""),
     # Enable NUMA-based CPU affinity binding for OpenMP threads
     "VLLM_RBLN_NUMA": (
         lambda: os.environ.get("VLLM_RBLN_NUMA", "True").lower() in ("true", "1")
@@ -348,6 +379,8 @@ environment_variables = {
             in ("true", "1")
         )
     ),
+    # --- QUANTIZATION ---
+    "VLLM_RBLN_USE_W8A16": get_use_w8a16,
 }
 
 

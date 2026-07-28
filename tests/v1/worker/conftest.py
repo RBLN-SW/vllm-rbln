@@ -31,6 +31,13 @@ def fresh_inductor_cache_per_test(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def pin_npu_per_worker(monkeypatch):
+    worker = os.environ.get("PYTEST_XDIST_WORKER", "gw0")
+    idx = int(worker[2:]) if worker[2:].isdigit() else 0
+    monkeypatch.setenv("RBLN_DEVICES", str(idx))
+
+
+@pytest.fixture(autouse=True)
 def skip_sync_vllm_and_optimum():
     # Force `compiled_rbln_config = None` so sync_vllm_and_optimum() takes the
     # sync_from_vllm() path instead of resolving a real compiled config.
@@ -39,3 +46,8 @@ def skip_sync_vllm_and_optimum():
         return_value=None,
     ):
         yield
+
+
+@pytest.fixture(autouse=True)
+def set_npu_env_var(monkeypatch):
+    monkeypatch.setenv("RBLN_FORCE_NPU_NAME", "RBLN-CA25")

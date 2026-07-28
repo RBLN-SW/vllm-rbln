@@ -165,6 +165,9 @@ class CacheSearchManager:
                     cached_blocks[: self._calculate_cached_inner_blocks(length)]
                     for length in best_match.cached_lengths
                 ]
+                num_total_cached_ibs = sum(
+                    len(_real_cached_ibs) for _real_cached_ibs in real_cached_ibs
+                )
                 # TODO specify the hit ratio?
                 logger.debug(
                     "[PFX] [CACHE-HIT] REQUEST=%s | "
@@ -173,7 +176,7 @@ class CacheSearchManager:
                     request_id,
                     len(best_match.cached_outer_blocks),
                     best_match.cached_outer_blocks,
-                    len(real_cached_ibs),
+                    num_total_cached_ibs,
                     real_cached_ibs,
                 )
 
