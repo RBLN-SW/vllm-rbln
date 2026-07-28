@@ -140,7 +140,7 @@ class RBLNEagleProposer(EagleProposer):
                 positions=positions,
                 hidden_states=hidden_states,
                 inputs_embeds=inputs_embeds,
-                last_token_indices=token_indices_to_sample_padded,
+                token_indices_to_sample=token_indices_to_sample_padded,
             )
 
         # Early exit if there is only one draft token to be generated.
@@ -148,7 +148,10 @@ class RBLNEagleProposer(EagleProposer):
             draft_tokens_ids = logits[:num_reqs].argmax(dim=-1)
             return draft_tokens_ids.view(-1, 1)
 
-        positions = target_positions[token_indices_to_sample_padded]
+        assert token_indices_to_sample_padded is not None
+        positions = target_positions[
+            token_indices_to_sample_padded.to(target_positions.device)
+        ]
 
         draft_token_ids = logits[:num_reqs].argmax(dim=-1)
 
@@ -168,7 +171,7 @@ class RBLNEagleProposer(EagleProposer):
         common_attn_metadata.num_actual_tokens = num_reqs
         common_attn_metadata.max_query_len = 1
         common_attn_metadata.query_start_loc = self.arange[: num_reqs + 1]
-        common_attn_metadata.query_start_loc_cpu = common_attn_metadata.query_start_loc
+        common_attn_metadata.query_start_loc_cpu = self.arange[: num_reqs + 1].cpu()
 
         # In padded drafter batch, we need to adjust the sequence lengths
         # to remove the "padding" (i.e. rejected tokens).
@@ -232,7 +235,7 @@ class RBLNEagleProposer(EagleProposer):
                     positions=positions,
                     hidden_states=hidden_states,
                     inputs_embeds=inputs_embeds,
-                    last_token_indices=None,
+                    token_indices_to_sample=None,
                 )
             draft_token_ids = logits[:num_reqs].argmax(dim=-1)
             draft_token_ids_list.append(draft_token_ids)
@@ -319,7 +322,7 @@ class RBLNEagleProposer(EagleProposer):
         token_indices_to_sample, num_rejected_tokens = eagle_prepare_inputs_padded(
             spec_decode_metadata.cu_num_draft_tokens,
             valid_sampled_tokens_count,
-            common_attn_metadata.query_start_loc,
+            common_attn_metadata.query_start_loc_cpu,
         )
 
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
@@ -361,7 +364,7 @@ class RBLNEagleProposer(EagleProposer):
             input_ids: torch.Tensor,
             positions: torch.Tensor,
             hidden_states: torch.Tensor,
-            last_token_indices: torch.Tensor | None = None,
+            token_indices_to_sample: torch.Tensor | None = None,
             inputs_embeds: torch.Tensor | None = None,
         ):
             ret_hidden_states = self.model(
@@ -377,12 +380,12 @@ class RBLNEagleProposer(EagleProposer):
                 last_hidden_states, hidden_states = ret_hidden_states
 
             hidden_states = hidden_states.view(-1, self.hidden_size)
-            last_hidden_states = last_hidden_states.view(-1, self.hidden_size)
-            sample_hidden_states = (
-                last_hidden_states[last_token_indices]
-                if last_token_indices is not None
-                else last_hidden_states
-            )
+            sample_hidden_states = last_hidden_states.view(-1, self.hidden_size)
+
+            if token_indices_to_sample is not None:
+                hidden_states = hidden_states[token_indices_to_sample]
+                sample_hidden_states = sample_hidden_states[token_indices_to_sample]
+
             logits = self.model.compute_logits(sample_hidden_states)
 
             return hidden_states, logits
@@ -502,7 +505,7 @@ class RBLNEagleProposer(EagleProposer):
                 positions=positions,
                 hidden_states=hidden_states,
                 inputs_embeds=inputs_embeds,
-                last_token_indices=token_indices_to_sample_padded,
+                token_indices_to_sample=token_indices_to_sample_padded,
             )
 
         if self.num_speculative_tokens == 1:
@@ -558,7 +561,7 @@ class RBLNEagleProposer(EagleProposer):
                     positions=positions,
                     hidden_states=hidden_states,
                     inputs_embeds=inputs_embeds,
-                    last_token_indices=None,
+                    token_indices_to_sample=None,
                 )
 
     def _preprocess(
