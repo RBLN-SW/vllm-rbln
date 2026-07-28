@@ -68,6 +68,7 @@ have no DeepSeek-family EAGLE3 head to verify against.
 import logging
 
 import torch
+from vllm.config import VllmConfig
 from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 
 from vllm_rbln.logger import init_logger
@@ -94,8 +95,25 @@ _WHY = (
     target=f"{_TARGET}.__init__",
     reason=f"Register the scatter index as a named buffer: {_WHY}.",
 )
-def patched_eagle3_llama_init(self, *args, **kwargs) -> None:
-    _orig_init(self, *args, **kwargs)
+def patched_eagle3_llama_init(
+    self, *, vllm_config: VllmConfig, prefix: str = ""
+) -> None:
+    # The parameter NAMES have to survive the patch. `initialize_model`
+    # (vllm/model_executor/model_loader/utils.py) picks the construction path by
+    # inspecting them:
+    #
+    #     all_params = [p.name for p in inspect.signature(cls.__init__).parameters]
+    #     if "vllm_config" in all_params and "prefix" in all_params:  # new style
+    #
+    # A `(self, *args, **kwargs)` replacement erases both, so the loader falls
+    # through to the old-style branch, finds nothing to pass, and calls
+    # `model_class()` with no arguments -- every EAGLE3 load then fails with
+    # "missing 1 required keyword-only argument: 'vllm_config'".
+    #
+    # The other `__init__` patches here (attention, mla) are safe with
+    # *args/**kwargs: their classes are constructed directly by model code rather
+    # than resolved through `initialize_model`. Model classes are not.
+    _orig_init(self, vllm_config=vllm_config, prefix=prefix)
     # arange == identity mapping: in range even if never filled.
     self.register_buffer(
         "target_ids",
