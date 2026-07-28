@@ -39,6 +39,7 @@ from vllm_rbln.v1.attention.kv_cache_bindings import (
     build_kv_cache_forward_context_kwargs,
 )
 from vllm_rbln.v1.spec_decode.utils import (
+    NARROW_LOGITS,
     eagle_prepare_inputs_padded,
     eagle_prepare_next_token_padded,
 )
@@ -64,6 +65,19 @@ class RBLNEagleProposer(EagleProposer):
         self.runner = runner
         # Set in load_model when eagle3 + compilation are both on.
         self._compiled_combine = None
+
+    def _draft_ids(self, logits: torch.Tensor) -> torch.Tensor:
+        """드래프터 로짓에서 다음 토큰 id 를 뽑는다.
+
+        `NARROW_LOGITS` 면 로짓이 draft 어휘(32k) 폭이라 argmax 결과도 draft id 다.
+        `target_ids` 가 `arange + d2t` 이므로 그것으로 한 번 당기면 target id 가 된다.
+        advanced indexing 대신 `index_select` 를 쓰는 이유는 이 파일의 다른 gather 와
+        같다 -- 1-D 행 선택에서 둘은 같지만 index_select 만 백엔드 네이티브 경로를 탄다.
+        """
+        ids = logits.argmax(dim=-1)
+        if NARROW_LOGITS:
+            ids = self.model.target_ids.index_select(0, ids)
+        return ids
 
     def propose(
         self,
@@ -161,7 +175,7 @@ class RBLNEagleProposer(EagleProposer):
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1:
-            draft_tokens_ids = logits[:num_reqs].argmax(dim=-1)
+            draft_tokens_ids = self._draft_ids(logits[:num_reqs])
             return draft_tokens_ids.view(-1, 1)
 
         # Gathers plus the first argmax. Grouped so the `draft` remainder can be
@@ -183,7 +197,7 @@ class RBLNEagleProposer(EagleProposer):
         # raises "index out of bounds for dimension 0 with size 1" on the first
         # decode.
 
-        draft_token_ids = logits[:num_reqs].argmax(dim=-1)
+        draft_token_ids = self._draft_ids(logits[:num_reqs])
 
         if self.allowed_attn_types is not None and not isinstance(
             attn_metadata, self.allowed_attn_types
@@ -313,7 +327,7 @@ class RBLNEagleProposer(EagleProposer):
                     inputs_embeds=inputs_embeds,
                     token_indices_to_sample=None,
                 )
-            draft_token_ids = logits[:num_reqs].argmax(dim=-1)
+            draft_token_ids = self._draft_ids(logits[:num_reqs])
             draft_token_ids_list.append(draft_token_ids)
 
         # [batch_size, num_speculative_tokens]

@@ -12,7 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+
 import torch
+
+# 드래프터 로짓을 draft 어휘(32k) 폭으로 두고, 승자 하나만 target id 로 옮긴다.
+# 끄면 upstream 대로 매 호출 target 어휘(200k) 폭 텐서를 만들고 scatter 한다.
+# patches/llama_eagle3.py(생성 쪽)와 v1/spec_decode/eagle.py(소비 쪽)가 함께 읽는다.
+NARROW_LOGITS = os.getenv("VLLM_RBLN_EAGLE3_NARROW_LOGITS", "0") == "1"
 
 
 def eagle_prepare_next_token_padded(
