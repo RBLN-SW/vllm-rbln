@@ -360,7 +360,7 @@ class RBLNOptimumQwen3_5ForConditionalGeneration(
 
     def __init__(self, vllm_config: VllmConfig) -> None:
         super().__init__(vllm_config=vllm_config)
-        # Per-request slot (batch_idx) into the [max_num_seqs] conv/recurrent state cache.
+        # Per-request (batch_idx) into the [max_num_seqs] conv/recurrent state cache.
         self.attention_manager: AttentionManager = AttentionManager(
             LinearAttentionStrategy()
         )
@@ -368,7 +368,7 @@ class RBLNOptimumQwen3_5ForConditionalGeneration(
     def _decode_batch_indices(self, model_input: ModelInputForRBLN) -> torch.Tensor:
         """The state-cache row (batch_idx) of each running request, in running
         order, as a tensor. This is only the index: the actual row placement is
-        done by the scatter (input_block_ids in forward / compute_decode_position_embed) 
+        done by the scatter (input_block_ids in forward / compute_decode_position_embed)
         and undone by the logits gather (batch_indices in forward).
         """
         running = model_input.running_requests_ids
@@ -424,10 +424,10 @@ class RBLNOptimumQwen3_5ForConditionalGeneration(
 
         The GatedDeltaNet linear_attention conv/recurrent state is a fixed
         [max_num_seqs] on-device cache indexed by batch row. prefill writes
-        one row; decode reads/writes every row. So each request is pinned 
+        one row; decode reads/writes every row. So each request is pinned
         to a stable batch_idx. prefill passes its batch_idx and decode lays
-        the batch out with the request at row == batch_idx, then gathers 
-        logits back to running order. 
+        the batch out with the request at row == batch_idx, then gathers
+        logits back to running order.
         """
         input_ids = model_input.input_tokens
         cache_position = model_input.input_positions

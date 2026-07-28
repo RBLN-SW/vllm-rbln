@@ -64,7 +64,7 @@ def get_param_qwen3_5(
     prefill_chunk_size: int | None = None,
     gdn_chunk_size: int | None = None,
 ) -> dict:
-    # ``linear_attention_layers`` using gated_delta_net (gdn_chunk_size) 
+    # ``linear_attention_layers`` using gated_delta_net (gdn_chunk_size)
     # during compilation, so gdn_chunk_size is needed here.
     # FLASH is forced
     param = get_param_qwen2_vl(
