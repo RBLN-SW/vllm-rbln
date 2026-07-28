@@ -72,145 +72,100 @@ class TestStepMetricsAddMeasurement:
         assert m.token_counts == [0]
 
 
-class TestOutlierRemoval:
-    """Test _without_outlier edge cases."""
+class TestLatencyPercentiles:
+    """get_latency_percentiles reports the distribution (no data-point removal)."""
 
-    def test_empty_list(self):
-        m = StepMetrics()
-        assert m._without_outlier([]) == []
+    def test_empty(self):
+        assert StepMetrics().get_latency_percentiles() == {}
 
-    def test_single_element(self):
+    def test_keys_and_max(self):
         m = StepMetrics()
-        assert m._without_outlier([42.0]) == [42.0]
-        assert m._without_outlier([42]) == [42]
+        for lat in [0.010, 0.020, 0.030, 0.040]:
+            m.add_measurement(lat, 1)
+        pct = m.get_latency_percentiles()
+        assert set(pct) == {"p50", "p90", "p99", "max"}
+        assert pct["max"] == pytest.approx(40.0)  # 0.040 s -> ms
 
-    def test_two_elements_removes_farthest_from_mean(self):
-        """With [1.0, 100.0], mean=50.5. Both deviate 49.5 — first max wins."""
+    def test_spike_shows_in_tail_not_p50(self):
+        """A one-off spike inflates max/p99 but leaves p50 (median) robust."""
         m = StepMetrics()
-        result = m._without_outlier([1.0, 100.0])
-        # index(max(deviations)) returns 0 when deviations are equal
-        assert len(result) == 1
-        assert result == [100.0]
+        for lat in [0.010, 0.010, 0.010, 0.010, 5.0]:  # 5 s spike
+            m.add_measurement(lat, 1)
+        pct = m.get_latency_percentiles()
+        assert pct["p50"] == pytest.approx(10.0, abs=1.0)  # ~10 ms, spike-robust
+        assert pct["max"] == pytest.approx(5000.0)
 
-    def test_obvious_outlier_removed(self):
+    def test_custom_percentiles(self):
         m = StepMetrics()
-        values = [10.0, 10.1, 9.9, 10.0, 500.0]
-        result = m._without_outlier(values)
-        assert 500.0 not in result
-        assert len(result) == 4
-
-    def test_all_identical_values(self):
-        """All deviations are 0 — removes first element (index 0)."""
-        m = StepMetrics()
-        result = m._without_outlier([5.0, 5.0, 5.0])
-        assert len(result) == 2
-        assert all(v == 5.0 for v in result)
-
-    def test_negative_values(self):
-        m = StepMetrics()
-        result = m._without_outlier([-100.0, 1.0, 2.0, 3.0])
-        assert -100.0 not in result
-        assert len(result) == 3
-
-    def test_outlier_removal_int(self):
-        m = StepMetrics()
-        result = m._without_outlier([10, 11, 9, 10, 999])
-        assert 999 not in result
-        assert len(result) == 4
+        for lat in [0.01, 0.02, 0.03]:
+            m.add_measurement(lat, 1)
+        pct = m.get_latency_percentiles(percentiles=(25.0, 75.0))
+        assert set(pct) == {"p25", "p75", "max"}
 
 
 class TestStepMetricsAverages:
-    """Test average computations including edge cases and outlier flag."""
+    """Averages are plain means (no outlier removal); throughput is sum-based."""
 
     def test_avg_latency_empty(self):
-        m = StepMetrics()
-        assert m.get_avg_latency() == 0.0
-        assert m.get_avg_latency(ignore_outlier=False) == 0.0
+        assert StepMetrics().get_avg_latency() == 0.0
 
     def test_avg_latency_converts_to_ms(self):
         m = StepMetrics()
         m.add_measurement(1.0, 10)  # 1 second
-        # single value, outlier removal returns as-is
         assert m.get_avg_latency() == 1000.0
 
-    def test_avg_latency_with_outlier(self):
+    def test_avg_latency_is_plain_mean(self):
+        """No outlier removal: a spike is included in the mean (use p50 instead)."""
         m = StepMetrics()
         for lat in [0.01, 0.01, 0.01, 0.01, 5.0]:
             m.add_measurement(lat, 1)
-        avg_with = m.get_avg_latency(ignore_outlier=True)
-        avg_without = m.get_avg_latency(ignore_outlier=False)
-        # Removing the 5.0 outlier should give much lower average
-        assert avg_with < avg_without
-        assert avg_with == pytest.approx(10.0, abs=1.0)  # ~0.01s * 1000
+        # mean = (0.04 + 5.0) / 5 = 1.008 s -> 1008 ms
+        assert m.get_avg_latency() == pytest.approx(1008.0, abs=1.0)
 
     def test_avg_throughput_empty(self):
-        m = StepMetrics()
-        assert m.get_avg_throughput() == 0.0
+        assert StepMetrics().get_avg_throughput() == 0.0
 
-    def test_avg_throughput_basic(self):
+    def test_avg_throughput_sum_based(self):
         m = StepMetrics()
         m.add_measurement(1.0, 100)
         m.add_measurement(1.0, 100)
-        # total_tokens=200, total_time=2.0 (single element no outlier removal effective)
-        # Actually 2 elements: outlier removal removes one. So tokens=100, time=1.0
-        throughput = m.get_avg_throughput(ignore_outlier=True)
-        assert throughput == pytest.approx(100.0)
+        # 200 tokens / 2.0 s = 100 tok/s
+        assert m.get_avg_throughput() == pytest.approx(100.0)
 
-    def test_avg_throughput_no_outlier_flag(self):
+    def test_avg_throughput_bimodal_is_stable(self):
+        """Sum-based throughput is unaffected by a bimodal per-step split."""
         m = StepMetrics()
-        m.add_measurement(1.0, 100)
-        m.add_measurement(1.0, 100)
-        throughput = m.get_avg_throughput(ignore_outlier=False)
-        assert throughput == pytest.approx(100.0)
+        m.add_measurement(0.1, 500)  # fast step
+        m.add_measurement(1.9, 500)  # slow step
+        # 1000 tokens / 2.0 s = 500 tok/s regardless of the split
+        assert m.get_avg_throughput() == pytest.approx(500.0)
 
     def test_avg_throughput_zero_latency(self):
-        """If all latencies are 0, total_time=0 → returns 0.0."""
+        """If all latencies are 0, total_time=0 -> returns 0.0."""
         m = StepMetrics()
         m.add_measurement(0.0, 10)
         m.add_measurement(0.0, 10)
         assert m.get_avg_throughput() == 0.0
 
-    def test_avg_throughput_independent_outlier_removal(self):
-        """Outlier removal on latencies and token_counts is independent.
-
-        This means different indices may be removed from each list.
-        Verify the computation still works and doesn't crash.
-        """
-        m = StepMetrics()
-        # latency outlier at index 2, token_count outlier at index 0
-        m.add_measurement(1.0, 9999)
-        m.add_measurement(1.0, 10)
-        m.add_measurement(100.0, 10)
-        throughput = m.get_avg_throughput(ignore_outlier=True)
-        # latencies after removal: [1.0, 1.0], tokens after removal: [10, 10]
-        # throughput = 20 / 2.0 = 10.0
-        assert throughput == pytest.approx(10.0)
-
-    def test_avg_throughput_mismatched_empty_tokens(self):
-        """Latencies present but no token_counts → still returns 0.0."""
+    def test_avg_throughput_no_tokens(self):
+        """Latencies present but no tokens -> 0.0."""
         m = StepMetrics()
         m.latencies = [1.0]
-        # token_counts is empty
         assert m.get_avg_throughput() == 0.0
 
     def test_avg_host_time_empty(self):
-        m = StepMetrics()
-        assert m.get_avg_host_time() == 0.0
+        assert StepMetrics().get_avg_host_time() == 0.0
 
-    def test_avg_device_time(self):
+    def test_avg_device_time_is_mean(self):
         m = StepMetrics()
         m.add_measurement(1.0, 1, device_time=100)
         m.add_measurement(1.0, 1, device_time=200)
-        # With outlier removal: one removed, single value remains
-        assert m.get_avg_device_time(ignore_outlier=True) in (100.0, 200.0)
-        assert m.get_avg_device_time(ignore_outlier=False) == 150.0
+        assert m.get_avg_device_time() == 150.0
 
-    def test_avg_ccl_time(self):
+    def test_avg_ccl_time_is_mean(self):
         m = StepMetrics()
-        m.add_measurement(1.0, 1, ccl_time=300)
-        m.add_measurement(1.0, 1, ccl_time=300)
-        m.add_measurement(1.0, 1, ccl_time=300)
-        # All same, outlier removal removes one, avg still 300
+        for _ in range(3):
+            m.add_measurement(1.0, 1, ccl_time=300)
         assert m.get_avg_ccl_time() == 300.0
 
     def test_get_call_counts(self):
@@ -274,6 +229,14 @@ class TestPrefillMetricsByRequestID:
         latencies = pm.get_avg_latency_per_request()
         # Single measurement: avg = 0.5 * 1000 = 500ms
         assert latencies["req-1"] == pytest.approx(500.0)
+
+    def test_total_latency_per_request_sums_chunks(self):
+        """Per-request total = sum of the request's chunk latencies (ms)."""
+        pm = PrefillMetricsByRequestID()
+        pm.add_measurement("req-1", 0.5, 30)  # chunk 1
+        pm.add_measurement("req-1", 0.3, 20)  # chunk 2
+        totals = pm.get_total_latency_per_request()
+        assert totals["req-1"] == pytest.approx(800.0)  # (0.5 + 0.3) * 1000
 
     def test_timing_fields_forwarded(self):
         """Ensure host/device/ccl times are forwarded to inner StepMetrics."""

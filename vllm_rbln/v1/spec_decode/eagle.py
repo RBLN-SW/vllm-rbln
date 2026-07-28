@@ -50,10 +50,16 @@ class RBLNEagleProposer(EagleProposer):
         super().__init__(vllm_config, device, runner)
 
         self.runner = runner
-        if runner is not None and getattr(runner, "compile_context", None) is not None:
-            self.compile_context = runner.compile_context
+        if not envs.VLLM_RBLN_USE_DEVICE_TENSOR:
+            if (
+                runner is not None
+                and getattr(runner, "compile_context", None) is not None
+            ):
+                self.compile_context = runner.compile_context
+            else:
+                self.compile_context = CompileContext(use_weight_sharing=True)
         else:
-            self.compile_context = CompileContext(use_weight_sharing=True)
+            self.compile_context = None
 
         if self.supports_mm_inputs:
             raise NotImplementedError("Multimodal inputs are not supported yet.")
@@ -421,7 +427,7 @@ class RBLNEagleProposer(EagleProposer):
 
         padded_q_len = self.num_speculative_tokens + 1
         flat_tokens = batch_bucket_size * padded_q_len
-        device = self.input_ids.device
+        device = self.device
 
         input_ids = torch.zeros(
             (batch_bucket_size, padded_q_len),
@@ -757,14 +763,15 @@ class RBLNEagleProposer(EagleProposer):
         process_group_dict[DP.cpu_group.group_name] = DP.ranks
 
         options = {
-            "compile_context": self.compile_context,
-            "tensor_parallel_size": envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
+            "num_devices": envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
             "process_group_dict": process_group_dict,
             "guard_filter_fn": torch.compiler.keep_tensor_guards_unsafe,
             "mode": "strict",
         }
         if envs.VLLM_RBLN_USE_DEVICE_TENSOR:
             options["model_trace_method"] = "export"
+        else:
+            options["compile_context"] = self.compile_context
         if not envs.VLLM_DISABLE_COMPILE_CACHE:
             logger.info(
                 "Once the model is compiled for the first time, "
