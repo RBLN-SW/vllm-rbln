@@ -126,7 +126,7 @@ from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
 from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
 from vllm_rbln.v1.worker.input_stager import InputLayout, InputStager, StagedModelInputs
-from vllm_rbln.v1.worker.metrics_v2 import PerformanceContext, ProfileSection
+from vllm_rbln.v1.worker.metrics_v2 import PerformanceContext
 from vllm_rbln.v1.worker.utils import (
     get_kv_cache_names,
     prepare_kernel_block_sizes,
@@ -1207,10 +1207,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
-        with self.performance_ctx.profile(
-            section=ProfileSection.SAMPLER,
-            token_count=logits.shape[0],
-        ):
+        with self.performance_ctx.profile_sampler():
             if spec_decode_metadata is None:
                 bucket = logits.shape[0]
                 num_reqs = self.input_batch.num_reqs
@@ -1434,16 +1431,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 num_padded_tokens=num_tokens_padded,
                 **build_kv_cache_forward_context_kwargs(self.kv_cache_bases),
             ),
-            self.performance_ctx.profile(
-                self.is_prefill,
-                section=ProfileSection.MODEL,
-                token_count=num_scheduled_tokens,
-            ),
             record_function_or_nullcontext("rbln_model_runner: forward"),
             self.maybe_get_kv_connector_output(
                 scheduler_output,
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
+            self.performance_ctx.profile_model(self.is_prefill),
         ):
             model_output = self.model_executable(
                 **staged_model_inputs.as_kwargs(),
@@ -1849,15 +1842,35 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             )
 
     def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:
-        """Extract Eagle3 auxiliary layer indices from speculative config."""
+        """Extract Eagle3 auxiliary layer indices from speculative config.
+
+        These indices specify which hidden states from the base model should
+        be used as auxiliary inputs for the Eagle3 drafter model during
+        speculative decoding.
+
+        Returns:
+            Tuple of layer indices if found in draft model config,
+            None otherwise.
+        """
         if not (self.speculative_config and self.speculative_config.draft_model_config):
             return None
 
         hf_config = self.speculative_config.draft_model_config.hf_config
-        if not hasattr(hf_config, "eagle_aux_hidden_state_layer_ids"):
-            return None
 
-        layer_ids = hf_config.eagle_aux_hidden_state_layer_ids
+        layer_ids = getattr(hf_config, "eagle_aux_hidden_state_layer_ids", None)
+        if not layer_ids:
+            dflash_config = getattr(hf_config, "dflash_config", None)
+            eagle_config = getattr(hf_config, "eagle_config", None)
+
+            if dflash_config and isinstance(dflash_config, dict):
+                # Add 1 to convert DFlash's aux layer id semantics
+                layer_ids = [
+                    i + 1 for i in (dflash_config.get("target_layer_ids") or [])
+                ]
+
+            if eagle_config and isinstance(eagle_config, dict):
+                layer_ids = eagle_config.get("eagle_aux_hidden_state_layer_ids")
+
         if layer_ids and isinstance(layer_ids, (list, tuple)):
             return tuple(layer_ids)
 

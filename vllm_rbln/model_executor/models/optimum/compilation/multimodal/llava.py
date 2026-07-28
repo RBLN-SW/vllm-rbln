@@ -39,3 +39,14 @@ def get_param_llava(
 
 
 get_param_llava_next = get_param_llava
+
+
+def get_overridable() -> frozenset[str]:
+    """Submodules whose fields a user may override (see ``_find_conflicts``).
+
+    ``vision_tower`` is the vision encoder — compile-only, never read back by
+    vllm — so its fields are overridable. ``language_model`` is intentionally
+    NOT listed: vllm derives its batch_size / max_seq_len / block_size from that
+    submodule (see params.py), so those must stay protected.
+    """
+    return frozenset({"vision_tower"})
