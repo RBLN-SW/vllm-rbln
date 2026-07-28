@@ -63,13 +63,13 @@ class RBLNKVCacheManager(KVCacheManager):
         # potential configs we could expose in the future.
         self.prefix_cache_stats = PrefixCacheStats() if log_stats else None
         # NOTE(eunji.lee):
-        # max_num_batched_tokens may exceed max_model_len. It only feeds the
-        # recycling-aware admission cap for SWA / chunked-local specs, and even
-        # there it is clamped by max_model_len. Full/cross-attention block
-        # allocation (e.g. Whisper) sizes purely off the request's own tokens.
-        assert max_num_batched_tokens is not None, (
-            "max_num_batched_tokens must be set in `sync_vllm_and_optimum`."
-        )
+        # This is the scheduler's per-step token budget, not
+        # scheduler_config.max_num_batched_tokens (which on the optimum path is
+        # the compiled prefill chunk size). It only feeds the recycling-aware
+        # admission cap for SWA / chunked-local specs, clamped there by
+        # max_model_len; full/cross-attention block allocation (e.g. Whisper)
+        # sizes purely off the request's own tokens.
+        assert max_num_batched_tokens is not None, "max_num_batched_tokens must be set."
         self.coordinator = RBLNKVCacheCoordinator(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
@@ -335,15 +335,11 @@ class RBLNKVCacheManager(KVCacheManager):
         num_new_computed_tokens: int,
     ) -> tuple[list[int], list[int]]:
         cached_blocks = new_computed_blocks.get_block_ids()[0]
-        cached_block_table, cached_length = (
-            self.prefix_cache_manager.get_matched_outer_blocks(
-                request.request_id,
-                cached_blocks,
-                num_new_computed_tokens,
-            )
+        return self.prefix_cache_manager.get_matched_outer_blocks(
+            request.request_id,
+            cached_blocks,
+            num_new_computed_tokens,
         )
-
-        return cached_block_table, cached_length
 
     def get_block_table(self, request_id: str) -> torch.Tensor:
         return self.prefix_cache_manager.get_blocks(request_id)

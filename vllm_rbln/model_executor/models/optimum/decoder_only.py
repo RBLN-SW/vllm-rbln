@@ -60,13 +60,6 @@ class RBLNOptimumForCausalLM(
         if is_prompt:
             if self.model.prefill_decoder is None:
                 raise version_error
-            if model_input.cached_block_tables:
-                self._copy_cached_kv_blocks(
-                    self.model.prefill_decoder,
-                    model_input.cached_block_tables,
-                    model_input.cached_lengths,
-                    block_tables,
-                )
             return self.model.prefill_decoder(**kwargs).logits
         else:
             self.model.decoder = self.model.decoders[padded_batch_size]

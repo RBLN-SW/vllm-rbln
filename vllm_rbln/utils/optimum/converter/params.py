@@ -146,12 +146,15 @@ class RBLNParams:
     @classmethod
     def _parse_decoder(cls, cfg: RblnConfigLike) -> "RBLNParams":
         kvcache_block_size = _resolve_kvcache_block_size(cfg, arch="decoder")
+        default_prefill_chunk_size = _resolve_default_prefill_chunk_size()
         return cls(
             num_blocks=_cfg_get(cfg, "kvcache_num_blocks"),
             batch_size=_cfg_get(cfg, "batch_size"),
             max_seq_len=_cfg_get(cfg, "max_seq_len"),
             kvcache_block_size=kvcache_block_size,
-            prefill_chunk_size=_cfg_get(cfg, "prefill_chunk_size", 128),
+            prefill_chunk_size=_cfg_get(
+                cfg, "prefill_chunk_size", default_prefill_chunk_size
+            ),
         )
 
     @classmethod
@@ -160,6 +163,7 @@ class RBLNParams:
         batch_size = _cfg_get(cfg, "batch_size")
         max_seq_len = _cfg_get(cfg, "max_seq_len")
         num_blocks = _cfg_get(cfg, "kvcache_num_blocks")
+        default_prefill_chunk_size = _resolve_default_prefill_chunk_size()
         # Fall back to a known submodule when the main module does not expose
         # these fields (e.g. language_model / text_model for some VLMs).
         if kvcache_block_size is None:
@@ -187,7 +191,9 @@ class RBLNParams:
                 break
         prefill_chunk_size = _cfg_get(lm_cfg, "prefill_chunk_size")
         if prefill_chunk_size is None:
-            prefill_chunk_size = _cfg_get(cfg, "prefill_chunk_size", 128)
+            prefill_chunk_size = _cfg_get(
+                cfg, "prefill_chunk_size", default_prefill_chunk_size
+            )
         image_prefill_chunk_size = _resolve_image_prefill_chunk_size(lm_cfg)
         if image_prefill_chunk_size is None:
             image_prefill_chunk_size = _resolve_image_prefill_chunk_size(cfg)
@@ -274,3 +280,22 @@ def _resolve_kvcache_block_size(cfg: RblnConfigLike, *, arch: str) -> int | None
         "Please check the values in rbln_config.json"
     )
     return kvcache_block_size
+
+
+_PREFILL_CHUNK_SIZE_BY_FAMILY = {
+    "ca": 128,  # ATOM
+    "cr": 512,  # REBEL
+}
+
+
+def _resolve_default_prefill_chunk_size() -> int:
+    from vllm_rbln.platform import RblnPlatform
+
+    device_name = RblnPlatform.get_device_name().lower()
+    for family, chunk_size in _PREFILL_CHUNK_SIZE_BY_FAMILY.items():
+        if family in device_name:
+            return chunk_size
+    raise RuntimeError(
+        f"Unknown NPU device {device_name!r}; "
+        "expected an ATOM (ca) or REBEL (cr) device."
+    )
