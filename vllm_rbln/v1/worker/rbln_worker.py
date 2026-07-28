@@ -50,6 +50,7 @@ from vllm.profiler.wrapper import TorchProfilerWrapper
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.utils.torch_utils import set_random_seed
+from vllm.v1.core.kv_cache_utils import get_uniform_page_size
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
@@ -210,8 +211,44 @@ class RBLNWorker(WorkerBase):
         with set_current_vllm_config(self.vllm_config):
             self.model_runner.load_model()
 
+    def _pinned_kv_cache_memory(self) -> int | None:
+        """Bytes for a fixed `VLLM_RBLN_KV_CACHE_NUM_BLOCKS` KV cache.
+
+        vllm turns the value returned by `determine_available_memory()` back
+        into blocks with `available_memory // page_size // num_layers`
+        (`vllm.v1.core.kv_cache_utils.get_num_blocks`), so reporting exactly
+        that product pins num_blocks to the requested value regardless of how
+        much device memory is actually free. Returns None when the env var is
+        unset (0), i.e. keep the memory-based estimate.
+        """
+        pinned_num_blocks = envs.VLLM_RBLN_KV_CACHE_NUM_BLOCKS
+        if pinned_num_blocks <= 0:
+            return None
+
+        kv_cache_spec = self.model_runner.get_kv_cache_spec()
+        if not kv_cache_spec:
+            return None
+        num_layers = len(kv_cache_spec)
+        page_size = get_uniform_page_size(kv_cache_spec.values())
+        pinned_bytes = pinned_num_blocks * page_size * num_layers
+        logger.info(
+            "VLLM_RBLN_KV_CACHE_NUM_BLOCKS=%d: pinning KV cache to %d blocks "
+            "(%d layers x %d B/page = %.2f GiB) instead of the profiled "
+            "memory estimate.",
+            pinned_num_blocks,
+            pinned_num_blocks,
+            num_layers,
+            page_size,
+            pinned_bytes / 1024**3,
+        )
+        return pinned_bytes
+
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
+        pinned_memory = self._pinned_kv_cache_memory()
+        if pinned_memory is not None:
+            return pinned_memory
+
         params_dict = dict(self.model_runner.model.named_parameters())
         device_name = current_platform.get_device_name().lower()
         assert "rbln" in device_name
@@ -560,6 +597,21 @@ class RBLNWorker(WorkerBase):
         exists in `model_runner.runtime_holder`.
         """
         if not envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
+            return
+
+        pinned_by = None
+        if envs.VLLM_RBLN_KV_CACHE_NUM_BLOCKS > 0:
+            pinned_by = "VLLM_RBLN_KV_CACHE_NUM_BLOCKS"
+        elif self.cache_config.num_gpu_blocks_override is not None:
+            pinned_by = "--num-gpu-blocks-override"
+        if pinned_by is not None:
+            # num_blocks was pinned by the user, so the KV cache is already
+            # allocated (and compiled) at exactly that size. Growing it here
+            # would defeat the pin.
+            logger.warning(
+                "[Dynamic KV] num_blocks pinned by %s; skipping reallocation.",
+                pinned_by,
+            )
             return
 
         runtime_holder = getattr(self.model_runner, "runtime_holder", None)

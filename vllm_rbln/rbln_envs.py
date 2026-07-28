@@ -55,6 +55,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_SUB_BLOCK_CACHE: bool = True
     VLLM_RBLN_USE_DEVICE_TENSOR: bool = False
     VLLM_RBLN_USE_DYNAMIC_KV_CACHE: bool = False
+    VLLM_RBLN_KV_CACHE_NUM_BLOCKS: int = 0
     VLLM_RBLN_DISABLE_OFFLOAD: bool = False
     VLLM_RBLN_COMPILE_ONLY: bool = False
 
@@ -335,6 +336,18 @@ environment_variables = {
             os.environ.get("VLLM_RBLN_USE_DYNAMIC_KV_CACHE", "False").lower()
             in ("true", "1")
         )
+    ),
+    # Pin the KV cache to a fixed number of blocks instead of deriving it
+    # from the profiled device memory. 0 (default) keeps the memory-based
+    # estimate. When set, RBLNWorker.determine_available_memory() reports
+    # exactly this many blocks' worth of bytes, so vllm allocates the KV
+    # cache with this num_blocks, the mark_dynamic'd KV dim is traced with
+    # this hint, and the post-warm-up dynamic-KV reallocation is skipped.
+    # Debug / bring-up knob: keeps compile-time KV buffers small. Note that
+    # vllm still requires the pinned blocks to hold one max_model_len
+    # request, so lower --max-model-len accordingly.
+    "VLLM_RBLN_KV_CACHE_NUM_BLOCKS": lambda: int(
+        os.environ.get("VLLM_RBLN_KV_CACHE_NUM_BLOCKS", 0)
     ),
     # Disable RBLN file offloading during model load / warm-up even when
     # VLLM_RBLN_USE_DEVICE_TENSOR is set. Kill-switch for the offload path;
