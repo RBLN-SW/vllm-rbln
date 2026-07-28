@@ -22,56 +22,10 @@ from vllm.model_executor.models.qwen2_5_vl import (
 )
 
 from .base import ModelInputForRBLN
+from .optimum_attention import AttentionManager, LinearAttentionStrategy
 from .qwen2_vl import MODALITIES, RBLNOptimumQwen2_5_VLForConditionalGeneration
 
 logger = init_logger(__name__)
-
-
-class RBLNMambaStateIndexAllocator:
-    """Assigns each request a stable ``batch_idx`` into the linear-attention
-    (GatedDeltaNet) conv/recurrent state cache, for its whole lifetime.
-
-    That cache is a fixed ``[max_num_seqs]`` on-device tensor owned by
-    optimum-rbln and indexed by batch ROW: prefill writes one row (``batch_idx``)
-    and decode reads/writes every row. vLLM's ``req_id_to_index`` cannot be used
-    as that row because ``InputBatch.condense()`` reassigns it when requests
-    finish, whereas the recurrent state lives at a fixed address. So we pin our
-    own ``batch_idx`` per request (allocate on prefill, free on finish). This
-    mirrors vLLM's mamba ``state_indices`` but only allocates the index — the
-    cache itself is owned by optimum-rbln.
-    """
-
-    def __init__(self, max_batch_size: int) -> None:
-        self._max_batch_size = max_batch_size
-        # Free rows of the [max_num_seqs] state cache, kept sorted (lowest first).
-        self._free: list[int] = list(range(max_batch_size))
-        # req_id -> its pinned batch_idx (row) for the request's lifetime.
-        self._batch_idx_of: dict[str, int] = {}
-
-    def allocate(self, req_id: str) -> int:
-        """``batch_idx`` for ``req_id``, taking the lowest free row on first use."""
-        if req_id not in self._batch_idx_of:
-            if not self._free:
-                # vLLM caps concurrent requests at max_num_seqs, so this should
-                # be unreachable; fail loud rather than pop an empty list.
-                raise RuntimeError(
-                    f"No free linear-attention batch index for request "
-                    f"{req_id!r}: all {self._max_batch_size} rows are in use."
-                )
-            self._batch_idx_of[req_id] = self._free.pop(0)
-        return self._batch_idx_of[req_id]
-
-    def indices(self, req_ids: list[str]) -> list[int]:
-        """``batch_idx`` of each already-allocated request, in the given order."""
-        return [self._batch_idx_of[req_id] for req_id in req_ids]
-
-    def free(self, req_ids: list[str]) -> None:
-        """Return finished requests' batch indices to the pool."""
-        for req_id in req_ids:
-            batch_idx = self._batch_idx_of.pop(req_id, None)
-            if batch_idx is not None:
-                self._free.append(batch_idx)
-        self._free.sort()
 
 
 class RBLNOptimumQwen3VLForConditionalGeneration(
@@ -418,9 +372,29 @@ class RBLNOptimumQwen3_5ForConditionalGeneration(
 
     def __init__(self, vllm_config: VllmConfig) -> None:
         super().__init__(vllm_config=vllm_config)
-        # Per-request slot into the [max_num_seqs] conv/recurrent state cache.
-        self._state_index_allocator = RBLNMambaStateIndexAllocator(
-            self.scheduler_config.max_num_seqs
+        # Per-request slot (``batch_idx``) into the [max_num_seqs] conv/recurrent
+        # state cache. Exposed as ``attention_manager`` so the model runner reclaims
+        # a finished request's slot via ``attention_manager.pop(req_id)`` — finished
+        # requests are handled at the runner level (``scheduler_output``), not from
+        # ``model_input.finished_requests_ids``.
+        self.attention_manager: AttentionManager = AttentionManager(
+            LinearAttentionStrategy()
+        )
+
+    def _decode_batch_indices(self, model_input: ModelInputForRBLN) -> torch.Tensor:
+        """The state-cache row (``batch_idx``) of each running request, in running
+        order — used to place decode inputs at ``row == batch_idx`` and gather
+        logits back. ``LinearAttentionStrategy.preprocess`` does the row sorting.
+        """
+        running = model_input.running_requests_ids
+        table_ids = self.attention_manager.get(
+            False, self.decoder_batch_size, running, []
+        )
+        return self.attention_manager.preprocess(
+            table_ids,
+            model_input.input_positions,
+            len(running),
+            self.decoder_batch_size,
         )
 
     def _add_model_specific_args(self, preprocess_args: dict, video_input: Any):
@@ -458,9 +432,7 @@ class RBLNOptimumQwen3_5ForConditionalGeneration(
         position_embed = super().compute_decode_position_embed(
             model_input, mrope_position_deltas
         )
-        batch_indices = torch.tensor(
-            self._state_index_allocator.indices(model_input.running_requests_ids)
-        )
+        batch_indices = self._decode_batch_indices(model_input)
         out = torch.zeros_like(position_embed)
         out[:, batch_indices] = position_embed[:, : batch_indices.shape[0]]
         return out
@@ -473,22 +445,24 @@ class RBLNOptimumQwen3_5ForConditionalGeneration(
         one row (``batch_idx``, a REQUIRED prefill graph input — omitting it raises
         ``KeyError: 'batch_idx'`` in ``RBLNQwen3_5RuntimeModel._run``); ``decode``
         reads/writes every row. So each request is pinned to a stable ``batch_idx``
-        (``RBLNMambaStateIndexAllocator``): prefill passes its ``batch_idx`` and
-        decode lays the batch out with the request at ``row == batch_idx`` (padding
-        the empty rows), then gathers logits back to running order.
+        (``attention_manager`` / ``LinearAttentionStrategy``): prefill passes its
+        ``batch_idx`` and decode lays the batch out with the request at
+        ``row == batch_idx`` (padding the empty rows), then gathers logits back to
+        running order. Finished requests are freed by the model runner via
+        ``attention_manager.pop`` — not here.
         """
-        # Reclaim batch indices from requests that finished since the last step.
-        self._state_index_allocator.free(model_input.finished_requests_ids)
-
         input_ids = model_input.input_tokens
         cache_position = model_input.input_positions
         block_tables = model_input.block_tables
 
         if model_input.is_prompt:
-            # Prefill is always a single request (the runner forbids batching it).
-            batch_idx = self._state_index_allocator.allocate(
-                model_input.running_requests_ids[0]
-            )
+            # Prefill is always a single request (the runner forbids batching it):
+            # take the lowest free row and pin it to this request.
+            req_id = model_input.running_requests_ids[0]
+            batch_idx = self.attention_manager.get(
+                True, self.decoder_batch_size, [req_id], []
+            )[0]
+            self.attention_manager.add(req_id, batch_idx)
             kw = self.preprocess_for_decoder(
                 True, block_tables, input_ids, cache_position
             )
@@ -506,9 +480,7 @@ class RBLNOptimumQwen3_5ForConditionalGeneration(
         # request's prefill wrote. ``input_block_ids`` scatters
         # ids/cache_position/block_tables to those rows; position_embed is already
         # laid out the same way (see ``compute_decode_position_embed``).
-        batch_indices = torch.tensor(
-            self._state_index_allocator.indices(model_input.running_requests_ids)
-        )
+        batch_indices = self._decode_batch_indices(model_input)
         kw = self.preprocess_for_decoder(
             False,
             block_tables,

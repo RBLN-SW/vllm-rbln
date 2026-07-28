@@ -223,6 +223,35 @@ class InnerAttentionStrategy(AttentionStrategy[InnerAttentionEntry, InnerR1, Inn
         )
 
 
+class LinearAttentionStrategy(InnerAttentionStrategy):
+    """Per-request slot strategy for GatedDeltaNet ``linear_attention`` state.
+
+    Reuses ``InnerAttentionStrategy``'s slot allocation (``add``/``get``/``pop``):
+    the slot IS the ``batch_idx`` = the row of the ``[max_num_seqs]`` conv/recurrent
+    state cache. Unlike sliding-window (whose slot is a graph GATHER input), the
+    linear-attention state is indexed by batch ROW, so decode must physically place
+    each request at ``row == batch_idx``. ``preprocess`` returns those row indices
+    (via ``decode_row_indices``); the caller scatters decode inputs to them and
+    gathers logits back to running order.
+    """
+
+    def preprocess(  # type: ignore[override]
+        self,
+        local_block_table_ids: list[int],
+        cache_positions: torch.Tensor,
+        request_nums: int,
+        decoder_batch_size: int,
+        **kwargs,
+    ) -> torch.Tensor:
+        return self.decode_row_indices(local_block_table_ids)
+
+    @staticmethod
+    def decode_row_indices(local_block_table_ids: list[int]) -> torch.Tensor:
+        """State-cache rows (``batch_idx``) of the running requests, in order —
+        used to scatter decode inputs to their rows and gather logits back."""
+        return torch.tensor(local_block_table_ids)
+
+
 HybridR1 = tuple[list[int], list[int], list[torch.Tensor]]
 HybridR2 = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
 
