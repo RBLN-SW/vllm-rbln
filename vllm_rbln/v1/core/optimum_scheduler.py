@@ -272,6 +272,12 @@ class RBLNOptimumScheduler(Scheduler):
             else EncoderCacheManager(cache_size=encoder_cache_size)
         )
 
+        # Speculative decoding is not supported on the optimum path
+        self.use_eagle = False
+        self.num_spec_tokens = 0
+        self.num_lookahead_tokens = 0
+        self.dynamic_sd_lookup: list[int] | None = None
+
         self.use_pp = False
         self.use_v2_model_runner = False
         self._pause_state: PauseState = PauseState.UNPAUSED
