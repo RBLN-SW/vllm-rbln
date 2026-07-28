@@ -36,7 +36,7 @@ from vllm_rbln.utils.optimum.converter import sync_vllm_and_optimum
 from vllm_rbln.utils.optimum.converter.common import (
     USER_MAX_NUM_BATCHED_TOKENS_KEY,
 )
-from vllm_rbln.utils.optimum.predicates import is_qwen3_pooling, forces_fp32_dtype
+from vllm_rbln.utils.optimum.predicates import forces_fp32_dtype, is_qwen3_pooling
 from vllm_rbln.utils.optimum.registry import (
     is_enc_dec_arch,
     is_pooling_arch,
