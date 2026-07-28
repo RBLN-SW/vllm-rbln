@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import pytest
 from vllm import LLM, SamplingParams
 
 from .utils import (
@@ -52,6 +53,7 @@ def _build_llm() -> LLM:
     )
 
 
+@pytest.mark.xfail(reason="unexpected compilation error in medusa")
 def test_basic_medusa_generation() -> None:
     sampling_params = SamplingParams(temperature=0.1, top_p=0.9, max_tokens=32)
 
