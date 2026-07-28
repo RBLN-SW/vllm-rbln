@@ -42,40 +42,6 @@ def _prefill(strategy: LinearAttentionStrategy, req: str, bs: int = 4) -> int:
     return batch_idx
 
 
-class TestStrategyAllocation:
-    def test_prefill_takes_lowest_free_row(self):
-        s = LinearAttentionStrategy()
-        assert _prefill(s, "a") == 0
-        assert _prefill(s, "b") == 1
-        assert _prefill(s, "c") == 2
-
-    def test_decode_get_returns_recorded_rows_in_running_order(self):
-        # decode looks up each running request's pinned row, in the given order
-        # (this order drives the row scatter + the logits gather).
-        s = LinearAttentionStrategy()
-        for r in ("a", "b", "c"):
-            _prefill(s, r)  # 0, 1, 2
-        assert s.get(False, 4, ["c", "a", "b"], []) == [2, 0, 1]
-        assert s.get(False, 4, ["b", "c", "a"], []) == [1, 2, 0]
-
-
-class TestFreeAndReuse:
-    def test_pop_frees_row_and_is_reused(self):
-        s = LinearAttentionStrategy()
-        _prefill(s, "a")  # 0
-        _prefill(s, "b")  # 1
-        s.pop("a")  # runner frees a finished request
-        assert _prefill(s, "c") == 0  # lowest free row reused
-
-    def test_reuses_lowest_free_row(self):
-        s = LinearAttentionStrategy()
-        for r in ("a", "b", "c"):
-            _prefill(s, r)  # 0, 1, 2
-        s.pop("b")  # frees 1
-        assert _prefill(s, "d") == 1  # 1 < the never-used 3
-        assert _prefill(s, "e") == 3
-
-
 class TestEdgeCases:
     def test_pop_unknown_request_is_noop(self):
         # The runner may pop ids this strategy never recorded; must not corrupt.
@@ -102,23 +68,18 @@ class TestEdgeCases:
             s.get(False, 4, ["a", "ghost"], [])
 
 
-class TestSorting:
-    """``preprocess`` -> ``decode_row_indices`` turns the per-request rows into the
-    tensor used to scatter decode inputs / gather logits.
+class TestPreprocess:
+    """``LinearAttentionStrategy.preprocess`` turns the per-request rows (looked up
+    in running order by ``get``) into the index tensor used to scatter decode
+    inputs and gather logits back. Unlike the base strategy it does NOT pad to
+    ``decoder_batch_size`` -- the scatter/gather in the wrapper place the rows.
     """
 
-    def test_decode_row_indices_returns_running_order_rows(self):
+    def test_preprocess_returns_running_order_rows(self):
         s = LinearAttentionStrategy()
         _prefill(s, "a")  # 0
         _prefill(s, "b")  # 1
-        rows = s.decode_row_indices(s.get(False, 4, ["b", "a"], []))
-        assert torch.equal(rows, torch.tensor([1, 0]))
-
-    def test_preprocess_delegates_to_decode_row_indices(self):
-        s = LinearAttentionStrategy()
-        _prefill(s, "a")  # 0
-        _prefill(s, "b")  # 1
-        table_ids = s.get(False, 4, ["b", "a"], [])
+        table_ids = s.get(False, 4, ["b", "a"], [])  # running order [b, a] -> [1, 0]
         # cache_positions / request_nums / decoder_batch_size are ignored here.
         out = s.preprocess(table_ids, torch.zeros(2), 2, 4)
         assert torch.equal(out, torch.tensor([1, 0]))
@@ -264,3 +225,73 @@ class TestDecodeLayoutWiring:
 
         assert passed["batch_idx"] == 1  # lowest free row (0 taken by A)
         assert obj.attention_manager.get(False, 2, ["B"], []) == [1]  # recorded
+
+    def test_forward_lifecycle_reuses_freed_row_then_decodes_in_order(self):
+        # Full churn through the REAL forward, max_num_seqs=3:
+        #   1. A, B prefill        -> rows 0, 1 (row 2 never used yet)
+        #   2. B finishes first    -> runner pops it, freeing row 1
+        #   3. C prefills          -> MUST reuse the freed row 1, NOT the
+        #                             never-used row 2 (min-free, not a counter)
+        #   4. decode [C, A]       -> C meets its reused row 1, A meets row 0,
+        #                             row 2 is dummy, logits gathered to running order
+        obj = self._bare_qwen3_5(max_batch_size=3)
+
+        prefilled = {}
+
+        def fake_prefill(**kw):
+            prefilled["batch_idx"] = kw["batch_idx"]
+            return types.SimpleNamespace(logits=torch.zeros(1, 1))
+
+        recorded = {}
+
+        def fake_decoder(**kw):
+            recorded.update(kw)
+            return types.SimpleNamespace(logits=kw["inputs_embeds"][:, 0, :])
+
+        obj.model = types.SimpleNamespace(
+            prefill_decoder=fake_prefill,
+            embed_tokens=lambda ids: ids.to(torch.float32).unsqueeze(-1),
+            decoders={3: fake_decoder},
+            rbln_config=types.SimpleNamespace(dtype=torch.float32),
+        )
+
+        def _prefill_req(req_id: str, token: int) -> int:
+            obj.forward(
+                types.SimpleNamespace(
+                    is_prompt=True,
+                    running_requests_ids=[req_id],
+                    input_tokens=torch.tensor([[token]]),
+                    input_positions=torch.tensor([[0]]),
+                    block_tables=torch.tensor([[10]], dtype=torch.int16),
+                    inputs_embeds=torch.zeros(1, 1, 1),
+                    position_embed=torch.zeros(2, 1, 1, 1, 1),
+                )
+            )
+            return prefilled["batch_idx"]
+
+        # 1-2-3: A->0, B->1, pop B, C reuses freed row 1 (not the unused row 2).
+        assert _prefill_req("A", 200) == 0
+        assert _prefill_req("B", 201) == 1
+        obj.attention_manager.pop("B")  # runner frees B on finish
+        assert _prefill_req("C", 202) == 1
+
+        # 4: decode running order [C, A] -> rows [1, 0]; row 2 stays dummy.
+        model_input = types.SimpleNamespace(
+            is_prompt=False,
+            running_requests_ids=["C", "A"],  # reversed vs their row order
+            input_tokens=torch.tensor([[202], [200]]),  # C=202, A=200
+            input_positions=torch.tensor([[3], [7]]),
+            block_tables=torch.tensor([[11], [10]], dtype=torch.int16),
+            position_embed=torch.zeros(2, 3, 1, 1, 1),
+        )
+        logits = obj.forward(model_input)
+
+        # Physical batch laid out BY ROW (width == max_num_seqs == 3).
+        assert recorded["inputs_embeds"].shape[0] == 3
+        assert recorded["inputs_embeds"][0, 0, 0] == 200  # A on row 0
+        assert recorded["inputs_embeds"][1, 0, 0] == 202  # C on its reused row 1
+        assert recorded["inputs_embeds"][2, 0, 0] == 0  # unused row -> dummy
+        # ...and logits come back in RUNNING order [C, A] -> [202, 200].
+        assert logits.shape[0] == 2
+        assert logits[0, 0] == 202
+        assert logits[1, 0] == 200
