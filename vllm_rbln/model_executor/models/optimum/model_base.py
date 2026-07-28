@@ -245,7 +245,7 @@ class RBLNOptimumModelBase(nn.Module):
                 self.model_config.model,
                 rbln_config=spec.rbln_config,
                 config=hf_config,
-                dtype=spec.dtype,
+                dtype=self.model_config.dtype,
             )
             model.save_pretrained(cached_model_path)  # type: ignore[attr-defined]
             self.vllm_config.model_config.model = cached_model_path
