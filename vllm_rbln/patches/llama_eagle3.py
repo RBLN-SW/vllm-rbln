@@ -73,6 +73,7 @@ from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 
 from vllm_rbln.logger import init_logger
 from vllm_rbln.patches import register_patch
+from vllm_rbln.v1.spec_decode.utils import NARROW_LOGITS
 
 logger = init_logger(__name__)
 
@@ -163,6 +164,17 @@ def patched_eagle3_llama_compute_logits(
             "Expected logits to have shape "
             f"(*, {self.config.vocab_size}), but got {logits.shape}"
         )
+        return logits
+
+    if NARROW_LOGITS:
+        # No expansion. The drafter only needs an argmax over its own
+        # vocabulary; mapping that single winner to a target id is done by the
+        # caller (eagle.py) through `target_ids`.
+        #
+        # The expansion is expensive: every call fills a (batch, 200064) tensor
+        # with -inf and scatters (batch, 32000) into it, and that scatter is a
+        # host op. The argmax that follows then walks 200064 columns. All the
+        # information needed is already in the 32000-wide tensor.
         return logits
 
     # NOTE(RBLN): upstream computes the index here as

@@ -12,7 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+
 import torch
+
+# Keep the drafter's logits at draft-vocabulary width (32k) and map only the
+# winner to a target id. Off, the drafter builds a target-vocabulary (200k)
+# tensor and scatters into it on every call, as upstream does.
+# Read by both the producer (patches/llama_eagle3.py) and the consumer
+# (v1/spec_decode/eagle.py).
+NARROW_LOGITS = os.getenv("VLLM_RBLN_EAGLE3_NARROW_LOGITS", "0") == "1"
 
 
 def eagle_prepare_next_token_padded(

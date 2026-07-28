@@ -39,6 +39,7 @@ from vllm_rbln.v1.attention.kv_cache_bindings import (
     build_kv_cache_forward_context_kwargs,
 )
 from vllm_rbln.v1.spec_decode.utils import (
+    NARROW_LOGITS,
     eagle_prepare_inputs_padded,
     eagle_prepare_next_token_padded,
 )
@@ -64,6 +65,21 @@ class RBLNEagleProposer(EagleProposer):
         self.runner = runner
         # Set in load_model when eagle3 + compilation are both on.
         self._compiled_combine = None
+
+    def _draft_ids(self, logits: torch.Tensor) -> torch.Tensor:
+        """Pick the next token id from the drafter's logits.
+
+        Under `NARROW_LOGITS` the logits are draft-vocabulary wide (32k), so the
+        argmax is a draft id. `target_ids` is `arange + d2t`, i.e. exactly the
+        draft->target table, so one gather turns it into a target id.
+        `index_select` rather than advanced indexing for the same reason as the
+        other gathers in this file -- they are equivalent for a 1-D row
+        selection, but only `index_select` takes the backend's native path.
+        """
+        ids = logits.argmax(dim=-1)
+        if NARROW_LOGITS:
+            ids = self.model.target_ids.index_select(0, ids)
+        return ids
 
     def propose(
         self,
@@ -161,7 +177,7 @@ class RBLNEagleProposer(EagleProposer):
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1:
-            draft_tokens_ids = logits[:num_reqs].argmax(dim=-1)
+            draft_tokens_ids = self._draft_ids(logits[:num_reqs])
             return draft_tokens_ids.view(-1, 1)
 
         # Gathers plus the first argmax. Grouped so the `draft` remainder can be
@@ -183,7 +199,7 @@ class RBLNEagleProposer(EagleProposer):
         # raises "index out of bounds for dimension 0 with size 1" on the first
         # decode.
 
-        draft_token_ids = logits[:num_reqs].argmax(dim=-1)
+        draft_token_ids = self._draft_ids(logits[:num_reqs])
 
         if self.allowed_attn_types is not None and not isinstance(
             attn_metadata, self.allowed_attn_types
@@ -313,7 +329,7 @@ class RBLNEagleProposer(EagleProposer):
                     inputs_embeds=inputs_embeds,
                     token_indices_to_sample=None,
                 )
-            draft_token_ids = logits[:num_reqs].argmax(dim=-1)
+            draft_token_ids = self._draft_ids(logits[:num_reqs])
             draft_token_ids_list.append(draft_token_ids)
 
         # [batch_size, num_speculative_tokens]
