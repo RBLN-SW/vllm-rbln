@@ -55,7 +55,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_SUB_BLOCK_CACHE: bool = True
     VLLM_RBLN_USE_DEVICE_TENSOR: bool = False
     VLLM_RBLN_USE_DYNAMIC_KV_CACHE: bool = False
-    VLLM_RBLN_KV_CACHE_NUM_BLOCKS: int = 0
+    VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS: int = 0
     VLLM_RBLN_DISABLE_OFFLOAD: bool = False
     VLLM_RBLN_COMPILE_ONLY: bool = False
 
@@ -337,17 +337,18 @@ environment_variables = {
             in ("true", "1")
         )
     ),
-    # Pin the KV cache to a fixed number of blocks instead of deriving it
-    # from the profiled device memory. 0 (default) keeps the memory-based
-    # estimate. When set, RBLNWorker.determine_available_memory() reports
-    # exactly this many blocks' worth of bytes, so vllm allocates the KV
-    # cache with this num_blocks, the mark_dynamic'd KV dim is traced with
-    # this hint, and the post-warm-up dynamic-KV reallocation is skipped.
-    # Debug / bring-up knob: keeps compile-time KV buffers small. Note that
-    # vllm still requires the pinned blocks to hold one max_model_len
-    # request, so lower --max-model-len accordingly.
-    "VLLM_RBLN_KV_CACHE_NUM_BLOCKS": lambda: int(
-        os.environ.get("VLLM_RBLN_KV_CACHE_NUM_BLOCKS", 0)
+    # Number of KV blocks the model is *compiled* with. 0 (default) compiles
+    # with the full cache. When set, RBLNWorker allocates a KV cache of this
+    # many blocks for warm-up only, so the mark_dynamic'd num_blocks dim is
+    # traced with this hint and the compiled artifact's device buffers start
+    # small; the cache is resized right after warm-up (to the device maximum
+    # from rebel.kv_cache.max_num_blocks when VLLM_RBLN_USE_DYNAMIC_KV_CACHE is
+    # on, otherwise back to what vllm sized). Nothing the scheduler sees
+    # changes: determine_available_memory() still decides the block count vllm
+    # plans with. Replaces the compiler-side RBLN_DYNAMIC_HINT_CAP env var --
+    # the compiler no longer needs to know about any of this.
+    "VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS": lambda: int(
+        os.environ.get("VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS", 0)
     ),
     # Disable RBLN file offloading during model load / warm-up even when
     # VLLM_RBLN_USE_DEVICE_TENSOR is set. Kill-switch for the offload path;

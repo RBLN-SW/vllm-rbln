@@ -50,7 +50,6 @@ from vllm.profiler.wrapper import TorchProfilerWrapper
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.utils.torch_utils import set_random_seed
-from vllm.v1.core.kv_cache_utils import get_uniform_page_size
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
@@ -109,6 +108,9 @@ class RBLNWorker(WorkerBase):
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
         self._rbln_host_threads_before_compile_ready = False
         self._rbln_cpu_affinity_applied = False
+        # num_blocks vllm sized the KV cache with, stashed while the cache is
+        # temporarily shrunk for compilation. None when no shrink is pending.
+        self._kv_blocks_after_compile: int | None = None
 
         profiler_config = vllm_config.profiler_config
         # Set up profiler if profiling is enabled
@@ -211,44 +213,8 @@ class RBLNWorker(WorkerBase):
         with set_current_vllm_config(self.vllm_config):
             self.model_runner.load_model()
 
-    def _pinned_kv_cache_memory(self) -> int | None:
-        """Bytes for a fixed `VLLM_RBLN_KV_CACHE_NUM_BLOCKS` KV cache.
-
-        vllm turns the value returned by `determine_available_memory()` back
-        into blocks with `available_memory // page_size // num_layers`
-        (`vllm.v1.core.kv_cache_utils.get_num_blocks`), so reporting exactly
-        that product pins num_blocks to the requested value regardless of how
-        much device memory is actually free. Returns None when the env var is
-        unset (0), i.e. keep the memory-based estimate.
-        """
-        pinned_num_blocks = envs.VLLM_RBLN_KV_CACHE_NUM_BLOCKS
-        if pinned_num_blocks <= 0:
-            return None
-
-        kv_cache_spec = self.model_runner.get_kv_cache_spec()
-        if not kv_cache_spec:
-            return None
-        num_layers = len(kv_cache_spec)
-        page_size = get_uniform_page_size(kv_cache_spec.values())
-        pinned_bytes = pinned_num_blocks * page_size * num_layers
-        logger.info(
-            "VLLM_RBLN_KV_CACHE_NUM_BLOCKS=%d: pinning KV cache to %d blocks "
-            "(%d layers x %d B/page = %.2f GiB) instead of the profiled "
-            "memory estimate.",
-            pinned_num_blocks,
-            pinned_num_blocks,
-            num_layers,
-            page_size,
-            pinned_bytes / 1024**3,
-        )
-        return pinned_bytes
-
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
-        pinned_memory = self._pinned_kv_cache_memory()
-        if pinned_memory is not None:
-            return pinned_memory
-
         params_dict = dict(self.model_runner.model.named_parameters())
         device_name = current_platform.get_device_name().lower()
         assert "rbln" in device_name
@@ -460,7 +426,59 @@ class RBLNWorker(WorkerBase):
         # related to kv cache connector (e.g. kv cache sharing layers).
         ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
 
-        self.model_runner.initialize_kv_cache(kv_cache_config)
+        self.model_runner.initialize_kv_cache(
+            self._maybe_shrink_kv_cache_for_compile(kv_cache_config)
+        )
+
+    def _maybe_shrink_kv_cache_for_compile(
+        self, kv_cache_config: KVCacheConfig
+    ) -> KVCacheConfig:
+        """Return a `VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS`-sized copy of the
+        config, or `kv_cache_config` unchanged when the env var is unset.
+
+        The KV cache allocated here is the one `warm_up_model()` traces, so its
+        num_blocks becomes the trace-time hint of the `mark_dynamic`'d dim and
+        sizes the compiled artifact's device buffers. Allocating the real cache
+        (thousands of blocks, from `determine_available_memory()`) makes those
+        buffers huge for no reason: the dim is dynamic, so the runtime resizes
+        them anyway. Compile against a small cache instead and put the real one
+        back afterwards -- `_maybe_recompute_kv_blocks_from_compiled_profile()`
+        grows it to the device maximum, or
+        `_maybe_restore_kv_blocks_after_compile()` restores vllm's own number.
+
+        Warm-up is safe at this size: every dummy request points at block id 0
+        (`_add_dummy_requests`), so nothing indexes past the shrunk cache.
+        """
+        compile_num_blocks = envs.VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS
+        if compile_num_blocks <= 0:
+            return kv_cache_config
+        if compile_num_blocks >= kv_cache_config.num_blocks:
+            logger.warning(
+                "VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS=%d is not below the %d "
+                "blocks vllm sized the KV cache with; compiling as-is.",
+                compile_num_blocks,
+                kv_cache_config.num_blocks,
+            )
+            return kv_cache_config
+
+        shrunk = copy.deepcopy(kv_cache_config)
+        shrunk.num_blocks = compile_num_blocks
+        # Each kv_cache_tensor's size is num_blocks * group.page_size_bytes;
+        # scale proportionally, mirroring `_reallocate_kv_cache`.
+        for kv_tensor in shrunk.kv_cache_tensors:
+            kv_tensor.size = (
+                kv_tensor.size * compile_num_blocks
+            ) // kv_cache_config.num_blocks
+
+        self._kv_blocks_after_compile = kv_cache_config.num_blocks
+        logger.info(
+            "Compiling with a %d-block KV cache instead of %d "
+            "(VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS); the cache is resized "
+            "after warm-up.",
+            compile_num_blocks,
+            kv_cache_config.num_blocks,
+        )
+        return shrunk
 
     def _ensure_rbln_host_threads_before_compile(self) -> None:
         """Set OpenMP / torch / numba threads before ``warm_up_model()`` without
@@ -580,12 +598,36 @@ class RBLNWorker(WorkerBase):
         # off or the model was not compiled with a mark_dynamic'd KV.
         self._maybe_recompute_kv_blocks_from_compiled_profile()
 
+        # If the cache was shrunk just for the compile and nothing above
+        # resized it, put back the num_blocks vllm sized it with.
+        self._maybe_restore_kv_blocks_after_compile()
+
         # After warm-up: apply CPU affinity only (threads already set pre-compile).
         self._ensure_rbln_cpu_affinity_after_warmup()
         self.model_runner._enable_performance_tracker()
 
         # TODO(RBLN): support encoder's compilation time
         return CompilationTimes(language_model=time.perf_counter() - st, encoder=0.0)
+
+    def _maybe_restore_kv_blocks_after_compile(self) -> None:
+        """Undo `_maybe_shrink_kv_cache_for_compile()`.
+
+        No-op unless the KV cache was shrunk for the compile and still sits at
+        that size -- `_reallocate_kv_cache()` clears the stashed target, so a
+        dynamic-KV resize that already ran is never overwritten here.
+        """
+        target_num_blocks = self._kv_blocks_after_compile
+        if target_num_blocks is None:
+            return
+        self._kv_blocks_after_compile = None
+
+        logger.info(
+            "Restoring the KV cache to the %d blocks vllm sized it with "
+            "(compiled with %d).",
+            target_num_blocks,
+            self.model_runner.kv_cache_config.num_blocks,
+        )
+        self._reallocate_kv_cache(target_num_blocks)
 
     def _maybe_recompute_kv_blocks_from_compiled_profile(self) -> None:
         """If VLLM_RBLN_USE_DYNAMIC_KV_CACHE is enabled, query each
@@ -597,21 +639,6 @@ class RBLNWorker(WorkerBase):
         exists in `model_runner.runtime_holder`.
         """
         if not envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
-            return
-
-        pinned_by = None
-        if envs.VLLM_RBLN_KV_CACHE_NUM_BLOCKS > 0:
-            pinned_by = "VLLM_RBLN_KV_CACHE_NUM_BLOCKS"
-        elif self.cache_config.num_gpu_blocks_override is not None:
-            pinned_by = "--num-gpu-blocks-override"
-        if pinned_by is not None:
-            # num_blocks was pinned by the user, so the KV cache is already
-            # allocated (and compiled) at exactly that size. Growing it here
-            # would defeat the pin.
-            logger.warning(
-                "[Dynamic KV] num_blocks pinned by %s; skipping reallocation.",
-                pinned_by,
-            )
             return
 
         runtime_holder = getattr(self.model_runner, "runtime_holder", None)
@@ -725,12 +752,28 @@ class RBLNWorker(WorkerBase):
             new_num_blocks,
         )
 
+        # The scheduler's block pool was built from what
+        # `determine_available_memory()` reported, before the cache was shrunk
+        # for the compile; it never learns about this reallocation. Extra blocks
+        # are simply left unused, but a smaller cache means the scheduler can
+        # hand out block ids that no longer exist.
+        scheduler_num_blocks = self._kv_blocks_after_compile or old_num_blocks
+        if new_num_blocks < scheduler_num_blocks:
+            logger.warning(
+                "[Dynamic KV] computed_num_blocks=%d is BELOW the %d blocks the "
+                "scheduler was sized with; it may reference blocks the cache "
+                "does not have.",
+                new_num_blocks,
+                scheduler_num_blocks,
+            )
+
         if new_num_blocks == old_num_blocks:
             logger.warning(
                 "[Dynamic KV] computed_num_blocks=%d == old_num_blocks; "
                 "no reallocation needed.",
                 new_num_blocks,
             )
+            self._kv_blocks_after_compile = None
             return
 
         self._reallocate_kv_cache(new_num_blocks)
@@ -753,6 +796,8 @@ class RBLNWorker(WorkerBase):
         mr = self.model_runner
         old_cfg = mr.kv_cache_config
         old_num_blocks = old_cfg.num_blocks
+        # This resize supersedes any pending compile-shrink restore.
+        self._kv_blocks_after_compile = None
 
         new_cfg = copy.deepcopy(old_cfg)
         new_cfg.num_blocks = new_num_blocks
