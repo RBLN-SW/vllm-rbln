@@ -174,34 +174,14 @@ class RBLNEagleProposer(EagleProposer):
             token_indices_to_sample_padded.to(target_positions.device)
         ]
 
-        # Upstream gathers the fed-back hidden states to the sampled positions
-        # immediately after the `positions` gather above (llm_base_proposer.py:
-        # `hidden_states = hidden_states[token_indices_to_sample]`). This
-        # override kept the `positions` line and dropped this one.
-        #
-        # `model_wrapper` returns `hidden_states` UNGATHERED -- only
-        # `sample_hidden_states` is indexed by `token_indices_to_sample`, and
-        # that goes to `compute_logits`. So this tensor is
-        # (num_reqs * (1 + num_spec), hidden_size) on the first pass, while the
-        # loop below feeds it back through `self.hidden_states[:num_reqs]`.
-        # Without the gather each request reads the leading request's rows
-        # instead of its own last token.
-        #
-        # It never crashes: `input_ids` stays per-request correct, so the
-        # drafter emits plausible tokens conditioned on the wrong hidden state.
-        # That is the step in per-position conditional acceptance -- 63% on the
-        # first draft, which uses the target's hidden states, then 36% flat once
-        # the drafter's own output is fed back.
-        # index_select rather than advanced indexing: this is a 1-D row
-        # selection, so the two are equivalent, but only index_select takes the
-        # backend's native path (measured 0.011 ms vs 4.03 ms per call for
-        # aten::index). Adding the gather as advanced indexing cost ~100 ms per
-        # step -- far more than the op itself -- which points at a host fallback
-        # draining the async dispatch queue mid-step rather than at the indexing
-        # arithmetic.
-        hidden_states = hidden_states.index_select(
-            0, token_indices_to_sample_padded.to(hidden_states.device)
-        )
+        # No gather of `hidden_states` here: `model_wrapper` already applies
+        # `token_indices_to_sample` to it (see load_model). This override used to
+        # gather again, which was correct against the pre-#821 wrapper -- that one
+        # indexed only `sample_hidden_states` -- but #821 moved the fed-back
+        # tensor's gather inside, so a second one indexes an already
+        # (num_reqs_padded, hidden_size) tensor with token-space indices and
+        # raises "index out of bounds for dimension 0 with size 1" on the first
+        # decode.
 
         draft_token_ids = logits[:num_reqs].argmax(dim=-1)
 
