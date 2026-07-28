@@ -156,7 +156,6 @@ def update_num_blocks(vllm_config: VllmConfig, num_blocks: int) -> None:
 
 
 def update_mamba_block_size(vllm_config: VllmConfig, params: "RBLNParams") -> None:
-    vllm_config.model_config.max_model_len = params.max_seq_len
     cache_config = vllm_config.cache_config
     if (
         not cache_config.user_specified_mamba_block_size
