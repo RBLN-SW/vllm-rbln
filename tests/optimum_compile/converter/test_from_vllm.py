@@ -32,9 +32,6 @@ def _vllm_config(rbln_config: dict) -> SimpleNamespace:
 
 class TestDtypeOverrideRejected:
     def test_raises_and_points_at_vllm_dtype(self):
-        # On the compile path dtype is vLLM's own argument: optimum-rbln takes
-        # it as a load argument and ignores the rbln_config field, so honouring
-        # it here would mean silently ranking two knobs that mean the same thing.
         cfg = _vllm_config({"batch_size": 4, "dtype": "bfloat16"})
         with pytest.raises(ValueError, match="`dtype` cannot be set"):
             sync_from_vllm(cfg)
