@@ -1597,6 +1597,24 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         req_ids = self.input_batch.req_ids.copy()
         if not self.num_spec_tokens or not req_ids:
             return None
+        if self._draft_token_ids is None:
+            # No drafter ran this step. `execute_model` starts every step with
+            # `_draft_token_ids = None` and only fills it when the input fits:
+            #
+            #     max_seq_len + num_spec <= effective_drafter_max_model_len
+            #
+            # A sequence that reaches the end of the context window breaks that
+            # condition and the drafter is skipped for the step. Wrapping the
+            # None in a DraftTokenIds gets past the core guard --
+            # `if draft_token_ids is not None` only checks the wrapper -- and
+            # kills the engine inside update_draft_token_ids:
+            #
+            #     TypeError: 'NoneType' object is not iterable
+            #
+            # Return per-request empty lists so the step's drafts are cleared
+            # explicitly. Returning None skips the update instead, leaving the
+            # previous step's drafts to be verified at the wrong position.
+            return DraftTokenIds(req_ids, [[] for _ in req_ids])
         draft_token_ids = (
             self._draft_token_ids.tolist()
             if isinstance(self._draft_token_ids, torch.Tensor)
