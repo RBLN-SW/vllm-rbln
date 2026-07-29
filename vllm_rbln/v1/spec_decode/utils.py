@@ -82,13 +82,13 @@ def eagle_prepare_inputs_padded(
     )
 
     has_draft = num_draft_tokens > 0
-    num_rejected_tokens_gpu = torch.where(
+    num_rejected_tokens = torch.where(
         has_draft,
         num_draft_tokens + 1 - valid_sampled_tokens_count,
         torch.zeros_like(valid_sampled_tokens_count),
     ).to(torch.int32)
-    token_indices_to_sample = (query_start_loc[1:] - 1 - num_rejected_tokens_gpu).to(
+    token_indices_to_sample = (query_start_loc[1:] - 1 - num_rejected_tokens).to(
         torch.int32
     )
 
-    return token_indices_to_sample, num_rejected_tokens_gpu
+    return token_indices_to_sample, num_rejected_tokens
