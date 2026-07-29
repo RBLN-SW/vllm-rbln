@@ -54,7 +54,9 @@ def main(
         runner="pooling",
         block_size=4096,
         max_model_len=max_seq_len,
-        # Load the original reranker for score():
+        # This is how upstream vLLM loads the original reranker. We keep the
+        # same three keys, so the same code runs on either backend:
+        # https://github.com/vllm-project/vllm/blob/v0.22.0/examples/pooling/score/qwen3_reranker_offline.py
         # - the architecture override is how vLLM picks convert=classify,
         # - the two label tokens name the logits the score is read from,
         #   false first,
