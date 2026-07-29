@@ -1597,6 +1597,23 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         req_ids = self.input_batch.req_ids.copy()
         if not self.num_spec_tokens or not req_ids:
             return None
+        if self._draft_token_ids is None:
+            # 이번 스텝에 드래프터를 돌리지 않았다. `execute_model` 이 매 스텝
+            # `_draft_token_ids = None` 으로 시작하고, 입력이 드래프터 최대 길이에
+            # 들어갈 때만 채운다:
+            #
+            #     max_seq_len + num_spec <= effective_drafter_max_model_len
+            #
+            # 요청이 문맥 창을 꽉 채우면 이 조건이 깨져 드래프터가 통째로 건너뛰어진다.
+            # 그대로 `DraftTokenIds(req_ids, None)` 을 넘기면 core 의 가드
+            # (`if draft_token_ids is not None`)는 껍데기만 보고 통과시키고,
+            # `update_draft_token_ids` 안에서 `zip(req_ids, None)` 으로 엔진이 죽는다:
+            #
+            #     TypeError: 'NoneType' object is not iterable
+            #
+            # 빈 목록을 넘겨 이번 스텝의 draft 를 명시적으로 비운다. None 을 반환해
+            # 갱신을 건너뛰면 직전 스텝의 draft 가 남아 다음 스텝에서 검증된다.
+            return DraftTokenIds(req_ids, [[] for _ in req_ids])
         draft_token_ids = (
             self._draft_token_ids.tolist()
             if isinstance(self._draft_token_ids, torch.Tensor)
