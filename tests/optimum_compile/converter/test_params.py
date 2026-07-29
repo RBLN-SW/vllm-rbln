@@ -307,8 +307,6 @@ class TestResolveNumDevices:
 
 
 class TestFromRblnConfigDtype:
-    # `additional_config["rbln_config"]` has the same shape as the compiled
-    # `rbln_config.json`, so dtype is parsed identically on both sync paths.
     def _vllm_config(self):
         return SimpleNamespace(
             model_config=SimpleNamespace(
