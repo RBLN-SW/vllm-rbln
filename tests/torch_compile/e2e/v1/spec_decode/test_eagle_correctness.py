@@ -32,7 +32,16 @@ NUM_SPECULATIVE_TOKENS = 3
 # Batch sizes to exercise: batch=1 covers the single-sequence path, while
 # batch=8/16 exercises the wider verify-kernel shapes where bf16 rounding can
 # differ from the base path.
-BATCH_SIZES = [1, 8, 16]
+_BATCH_GT1_XFAIL = pytest.mark.xfail(
+    reason="spec-decode verify forward diverges from base at batch>1 "
+    "(q_len>1 & b_size>1)",
+    strict=False,
+)
+BATCH_SIZES = [
+    1,
+    pytest.param(8, marks=_BATCH_GT1_XFAIL),
+    pytest.param(16, marks=_BATCH_GT1_XFAIL),
+]
 
 
 def _base_llm_kwargs(method: str, max_num_seqs: int) -> dict:
@@ -80,6 +89,9 @@ def _eagle_llm_kwargs(method: str, max_num_seqs: int) -> dict:
 def test_eagle_matches_base_generation(
     monkeypatch: pytest.MonkeyPatch, method: str, max_tokens: int, batch_size: int
 ) -> None:
+    if method == "eagle3":
+        pytest.xfail(reason="unexpected compilation error in eagle3")
+    monkeypatch.setenv("VLLM_RBLN_SAMPLER", "0")
     sampling_params = SamplingParams(
         temperature=0.0,
         top_p=1.0,

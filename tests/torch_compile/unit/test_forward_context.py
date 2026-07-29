@@ -16,6 +16,9 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
+from vllm.forward_context import get_forward_context
+
+from vllm_rbln.forward_context import set_forward_context
 
 
 @pytest.fixture
@@ -30,9 +33,6 @@ def attn_metadata_mock():
 
 
 def test_forward_context(vllm_config, attn_metadata_mock: MagicMock):
-    # forward_context
-    from vllm.forward_context import get_forward_context, set_forward_context
-
     with set_forward_context(
         attn_metadata_mock,
         vllm_config,
