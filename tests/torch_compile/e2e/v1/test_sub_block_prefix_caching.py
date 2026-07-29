@@ -79,7 +79,6 @@ def test_sub_block_prefix_cache_matches_baseline(
     from vllm_rbln.platform import RblnPlatform
 
     dev = "rbln" if use_device_tensor else "cpu"
-    monkeypatch.setattr(RblnPlatform, "_USE_DEVICE_TENSOR", use_device_tensor)
     monkeypatch.setattr(RblnPlatform, "device_type", dev)
     monkeypatch.setattr(RblnPlatform, "device_name", dev)
     monkeypatch.setattr(
