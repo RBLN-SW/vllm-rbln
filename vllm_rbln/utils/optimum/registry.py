@@ -93,6 +93,11 @@ _RBLN_EMBEDDING_MODELS = {
     ),
     "XLMRobertaModel": ("xlm_roberta", "RBLNXLMRobertaModel"),
     "Qwen3Model": ("qwen3", "RBLNQwen3Model"),
+    # Qwen3-Reranker routed through vLLM's score API. It reuses the plain Qwen3
+    # backbone: the 2-way-softmax classifier is a single vector applied on the
+    # host, so there is nothing extra to compile. See
+    # vllm_rbln/model_executor/models/optimum/seq_cls_head.py.
+    "Qwen3ForSequenceClassification": ("qwen3", "RBLNQwen3Model"),
 }
 
 _RBLN_SUPPORTED_MODELS = {

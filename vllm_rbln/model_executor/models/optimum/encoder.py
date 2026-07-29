@@ -15,14 +15,17 @@
 from typing import Union
 
 import torch
+from torch import nn
 from vllm.config import ModelConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.pooler import DispatchPooler, Pooler
 from vllm.model_executor.layers.pooler.activations import (
+    PoolerClassify,
     PoolerNormalize,
     resolve_classifier_act_fn,
 )
 from vllm.model_executor.layers.pooler.seqwise import (
+    ClassifierPoolerHead,
     EmbeddingPoolerHead,
     SequencePooler,
     get_seq_pooling_method,
@@ -33,8 +36,11 @@ from vllm.tasks import PoolingTask
 from vllm.v1.outputs import PoolerOutput
 from vllm.v1.pool.metadata import PoolingMetadata
 
+from vllm_rbln.utils.optimum.predicates import is_qwen3_reranker
+
 from .base import ModelInputForRBLN
 from .model_base import RBLNOptimumModelBase
+from .seq_cls_head import load_2_way_softmax_score_weight
 
 logger = init_logger(__name__)
 
@@ -79,6 +85,36 @@ class RBLNClassifierPooler(Pooler):
         ]
 
 
+class RBLNQwen3RerankerPooler(SequencePooler):
+    """Pooler for the original Qwen3-Reranker driven through ``score()``.
+
+    The reranker answers "yes"/"no" at the end of the prompt, so the relevant
+    hidden state is the last token's -- hence LAST pooling, never CLS. The
+    classifier behind it is a single vector read from the checkpoint; see
+    :mod:`vllm_rbln.model_executor.models.optimum.seq_cls_head` for why the
+    2-way softmax collapses that far.
+    """
+
+    def __init__(self, model_config: ModelConfig) -> None:
+        weight = load_2_way_softmax_score_weight(model_config)
+        num_labels, hidden_size = weight.shape
+        classifier = nn.Linear(hidden_size, num_labels, bias=False, dtype=weight.dtype)
+        with torch.no_grad():
+            classifier.weight.copy_(weight)
+
+        super().__init__(
+            pooling=get_seq_pooling_method("LAST"),
+            head=ClassifierPoolerHead(
+                classifier=classifier,
+                head_dtype=weight.dtype,
+                # PoolerClassify infers num_labels from the logits, which are
+                # [batch, 1] here, so it applies sigmoid -- the 2-way softmax --
+                # regardless of what the HF config declares.
+                activation=PoolerClassify(),
+            ),
+        )
+
+
 class RBLNOptimumForEncoderModel(RBLNOptimumModelBase, VllmModelForPooling):
     PAD_TOKEN_ID = 0
     is_pooling_model = True
@@ -108,7 +144,14 @@ class RBLNOptimumForEncoderModel(RBLNOptimumModelBase, VllmModelForPooling):
         #   late-interaction  token_embed  token-wise MaxSim            -
         # Cross-encoders (classify, num_labels=1) use the classifier head/
         # activation (RBLNClassifierPooler); others use the embed/token_embed pooler.
-        if self.is_classification_arch():
+        if is_qwen3_reranker(vllm_config.model_config):
+            # Qwen3-Reranker: the arch was remapped to Qwen3Model by the model
+            # runner, so the compiled backbone returns hidden states and the
+            # classifier is applied here rather than on-device. Pin the pooling
+            # type so the config states what the pooler actually does.
+            pooler_config.seq_pooling_type = "LAST"
+            self.pooler = RBLNQwen3RerankerPooler(vllm_config.model_config)
+        elif self.is_classification_arch():
             self.pooler = RBLNClassifierPooler(vllm_config.model_config)
         else:
             # Build the "embed" pooler without sentence-transformers projection.

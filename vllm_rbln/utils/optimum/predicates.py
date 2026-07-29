@@ -20,6 +20,7 @@ Kept out of :mod:`registry` so that registry stays free of ``vllm`` imports
 triggers circular imports).
 """
 
+from collections.abc import Sized
 from typing import TYPE_CHECKING
 
 from vllm_rbln.utils.optimum.registry import get_rbln_model_info
@@ -35,6 +36,33 @@ def is_qwen3_pooling(model_config: "ModelConfig") -> bool:
         model_cls_name == "RBLNQwen3ForCausalLM"
         and model_config.runner_type == "pooling"
     )
+
+
+def is_qwen3_reranker(model_config: "ModelConfig") -> bool:
+    """Return True for the original Qwen3-Reranker loaded for ``score()``.
+
+    Keyed on ``classifier_from_token`` rather than the architecture name, so the
+    predicate still holds after the model runner has remapped the HF arch to
+    ``Qwen3Model`` for optimum-rbln. A checkpoint already converted offline to
+    sequence classification carries a real ``score`` layer and no
+    ``classifier_from_token``, so it does not match here.
+    """
+    if model_config.runner_type != "pooling":
+        return False
+
+    hf_config = model_config.hf_config
+    text_config = hf_config.get_text_config()
+    if not getattr(hf_config, "is_original_qwen3_reranker", False):
+        return False
+
+    tokens: Sized | None = getattr(
+        hf_config,
+        "classifier_from_token",
+        getattr(text_config, "classifier_from_token", None),
+    )
+    if tokens is None:
+        return False
+    return len(tokens) == 2
 
 
 def forces_fp32_dtype(model_config: "ModelConfig") -> bool:

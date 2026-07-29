@@ -82,7 +82,7 @@ from vllm_rbln.model_executor.models.optimum.model_base import (
     RBLNOptimumMultimodalMixin,
 )
 from vllm_rbln.utils.optimum.bucket import select_bucket_size
-from vllm_rbln.utils.optimum.predicates import is_qwen3_pooling
+from vllm_rbln.utils.optimum.predicates import is_qwen3_pooling, is_qwen3_reranker
 from vllm_rbln.utils.optimum.registry import (
     get_rbln_model_info,
     validate_arch_supported,
@@ -126,10 +126,15 @@ class RBLNOptimumModelRunner(
         validate_arch_supported(vllm_config.model_config)
         _, model_cls_name = get_rbln_model_info(vllm_config.model_config)
 
-        if is_qwen3_pooling(vllm_config.model_config):
+        if is_qwen3_pooling(vllm_config.model_config) or is_qwen3_reranker(
+            vllm_config.model_config
+        ):
             # NOTE The architecture of Qwen3-Embedding model in huggingface
             # is `Qwen3ForCausalLM`. But it have to be mapped to `Qwen3Model`
             # for optimum-rbln.
+            # Qwen3-Reranker (arch overridden to Qwen3ForSequenceClassification)
+            # is remapped here too: it is scored from the very same backbone,
+            # with the classifier applied host-side by RBLNQwen3RerankerPooler.
             vllm_config.model_config.hf_config.__dict__["architectures"] = [
                 "Qwen3Model"
             ]
