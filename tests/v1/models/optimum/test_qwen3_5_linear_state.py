@@ -15,9 +15,8 @@
 
 Qwen3.5's GatedDeltaNet ``linear_attention`` state is a fixed ``[max_num_seqs]``
 on-device cache indexed by batch ROW. Each request is pinned to a stable
-``local_table_id`` for its lifetime (``LinearAttentionStrategy`` via
-``AttentionManager``): prefill writes that row (passing it to the graph's
-``batch_idx`` input), decode places the request at ``row == local_table_id`` and
+``batch_idx`` for its lifetime (``LinearAttentionStrategy`` via ``AttentionManager``):
+prefill writes that row, decode places the request at ``row == batch_idx`` and
 gathers logits back to running order. Finished requests are freed by the model
 runner via ``attention_manager.pop`` (not from ``model_input``). No hardware needed.
 """
@@ -38,9 +37,9 @@ from vllm_rbln.model_executor.models.optimum.qwen3_vl import (
 
 def _prefill(strategy: LinearAttentionStrategy, req: str, bs: int = 4) -> int:
     """Mirror the wrapper's prefill: take the lowest free row and record it."""
-    local_table_id = strategy.get(True, bs, [req], [])[0]
-    strategy.add(req, local_table_id)
-    return local_table_id
+    batch_idx = strategy.get(True, bs, [req], [])[0]
+    strategy.add(req, batch_idx)
+    return batch_idx
 
 
 class TestEdgeCases:
@@ -88,10 +87,10 @@ class TestPreprocess:
 
 class TestDecodeLayoutWiring:
     """Exercise the REAL wrapper code (only the model mocked): decode must place
-    each running request at its ``local_table_id`` row so it meets its OWN
-    recurrent state row, regardless of the running order vLLM hands us. The state
-    cache in DRAM is fixed; the INPUT is rearranged to match it, then logits are
-    gathered back to running order.
+    each running request at its ``batch_idx`` row so it meets its OWN recurrent
+    state row, regardless of the running order vLLM hands us. The state cache in
+    DRAM is fixed; the INPUT is rearranged to match it, then logits are gathered
+    back to running order.
     """
 
     @staticmethod
@@ -106,17 +105,17 @@ class TestDecodeLayoutWiring:
         obj.attention_manager = AttentionManager(LinearAttentionStrategy())
         return obj
 
-    def test_pad_decoder_items_scatters_to_local_table_id_rows(self):
+    def test_pad_decoder_items_scatters_to_batch_idx_rows(self):
         # Running order [B, A]; B's row is 1, A's row is 0. The real
         # pad_decoder_items must land B (running idx 0) on row 1 and A on row 0.
         obj = self._bare_qwen3_5(max_batch_size=4)
         input_ids = torch.tensor([[201], [200]])  # running order: B=201, A=200
         positions = torch.tensor([[5], [7]])
         block_tables = torch.tensor([[10], [11]], dtype=torch.int16)
-        local_table_ids = torch.tensor([1, 0])  # rows of [B, A]
+        batch_indices = torch.tensor([1, 0])  # rows of [B, A]
 
         padded_ids, padded_pos, padded_bt = obj.pad_decoder_items(
-            input_ids, positions, block_tables, input_block_ids=local_table_ids
+            input_ids, positions, block_tables, input_block_ids=batch_indices
         )
 
         assert padded_ids[1, 0] == 201 and padded_ids[0, 0] == 200  # B->1, A->0
