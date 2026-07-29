@@ -146,8 +146,7 @@ class RBLNOptimumQwen3RerankerModel(RBLNOptimumModelBase, VllmModelForPooling):
         max_seq_len = self.rbln_model_config.max_seq_len
         if width > max_seq_len:
             raise ValueError(
-                f"Input length ({width}) exceeds the compiled maximum "
-                f"({max_seq_len})."
+                f"Input length ({width}) exceeds the compiled maximum ({max_seq_len})."
             )
 
         # positions run 0..n-1 per request, so the largest one sits at index n-1.

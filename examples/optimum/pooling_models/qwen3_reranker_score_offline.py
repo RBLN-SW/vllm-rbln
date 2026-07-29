@@ -15,10 +15,12 @@
 """Score Qwen3-Reranker through the native `score()` API.
 
 `qwen3_reranker_offline.py` drives the same model as a generative LM and reads
-the "yes"/"no" logprobs back. This example instead loads it as a sequence
-classification model, which is what vLLM recommends: the score comes straight
-out of the pooler, so there is no vocabulary-wide softmax and no top-k logprob
-window that a confidently-irrelevant document can fall outside of.
+the "yes"/"no" logprobs back, which holds up only while both labels stay inside
+the requested top-k window. A confidently irrelevant document pushes "yes" out
+of it, and the score silently bottoms out at the fallback value.
+
+Loading it for `score()` reads the two logits directly instead, so the window
+never enters into it and the score arrives ready to use from the pooler.
 """
 
 import fire
@@ -52,11 +54,11 @@ def main(
         runner="pooling",
         block_size=4096,
         max_model_len=max_seq_len,
-        # Load the original reranker as a sequence classification model:
-        # - route to Qwen3ForSequenceClassification instead of Qwen3ForCausalLM,
-        # - name the two label tokens, false first,
-        # - and mark it as the original (unconverted) reranker, which selects the
-        #   2-way-softmax classifier built from those two lm_head rows.
+        # Load the original reranker for score():
+        # - the architecture override is how vLLM picks convert=classify,
+        # - the two label tokens name the logits the score is read from,
+        #   false first,
+        # - and the flag marks this as the original, unconverted checkpoint.
         hf_overrides={
             "architectures": ["Qwen3ForSequenceClassification"],
             "classifier_from_token": ["no", "yes"],
