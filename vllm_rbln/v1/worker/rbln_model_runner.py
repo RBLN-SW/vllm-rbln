@@ -1511,12 +1511,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         if grammar_output is not None:
             # NOTE(RBLN): `xgr.apply_token_bitmask_inplace` requires logits
             # to be float32 dtype for CPU tensors
-            origin_dtype = logits.dtype
-            logits = logits.to(torch.float32)
+            origin_dtype, origin_device = logits.dtype, logits.device
+            logits = logits.to(torch.float32).to("cpu")
             apply_grammar_bitmask(
                 scheduler_output, grammar_output, self.input_batch, logits
             )
-            logits = logits.to(origin_dtype)
+            logits = logits.to(origin_dtype).to(origin_device)
 
         with record_function_or_nullcontext("rbln_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
