@@ -62,11 +62,9 @@ def get_param_qwen3_5(
     num_devices: int,
     memory_budget: float,
     prefill_chunk_size: int | None = None,
-    gdn_chunk_size: int | None = None,
 ) -> dict:
-    # ``linear_attention_layers`` using gated_delta_net (gdn_chunk_size)
-    # during compilation, so gdn_chunk_size is needed here.
-    # FLASH is forced
+    # Qwen3.5's linear_attention layers use gated_delta_net; the full_attention
+    # layers require flash attention, so force it here.
     param = get_param_qwen2_vl(
         batch_size,
         max_model_len,
@@ -76,8 +74,6 @@ def get_param_qwen3_5(
         prefill_chunk_size,
     )
     param["attn_impl"] = "flash_attn"
-    if gdn_chunk_size is not None:
-        param["gdn_chunk_size"] = gdn_chunk_size
     return param
 
 
