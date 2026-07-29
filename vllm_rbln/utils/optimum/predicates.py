@@ -29,12 +29,18 @@ if TYPE_CHECKING:
     from vllm.config import ModelConfig
 
 
-def is_qwen3_pooling(model_config: "ModelConfig") -> bool:
-    """Return True if the model is the Qwen3 backbone used as a pooler."""
+def is_qwen3_embedding(model_config: "ModelConfig") -> bool:
+    """Return True if the model is the Qwen3 backbone used as an embedder.
+
+    Qwen3-Reranker also loads ``RBLNQwen3ForCausalLM`` under a pooling runner,
+    but it is scored from the generation graph rather than pooled hidden states,
+    so it is excluded here — see :func:`is_qwen3_reranker`.
+    """
     _, model_cls_name = get_rbln_model_info(model_config)
     return (
         model_cls_name == "RBLNQwen3ForCausalLM"
         and model_config.runner_type == "pooling"
+        and not is_qwen3_reranker(model_config)
     )
 
 

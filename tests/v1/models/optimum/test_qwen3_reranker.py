@@ -44,7 +44,7 @@ from vllm_rbln.model_executor.models.optimum.qwen3_reranker import (
     resolve_label_token_ids,
 )
 from vllm_rbln.utils.optimum.converter.common import is_chunked_prefill_arch
-from vllm_rbln.utils.optimum.predicates import is_qwen3_reranker
+from vllm_rbln.utils.optimum.predicates import is_qwen3_embedding, is_qwen3_reranker
 from vllm_rbln.utils.optimum.registry import (
     get_rbln_model_info,
     is_generation_arch,
@@ -110,6 +110,31 @@ def test_predicate_survives_arch_remap():
 
 def test_label_token_ids():
     assert resolve_label_token_ids(_model_config()) == (NO_ID, YES_ID)
+
+
+def test_not_confused_with_qwen3_embedding():
+    """Both load RBLNQwen3ForCausalLM under a pooling runner, but differ.
+
+    The embedder pools hidden states; the reranker reads vocabulary logits. If
+    `is_qwen3_embedding` also matched, the reranker would be remapped to
+    Qwen3Model and lose lm_head.
+    """
+    model_config = _model_config()
+
+    assert is_qwen3_reranker(model_config)
+    assert not is_qwen3_embedding(model_config)
+
+    embedder = ModelConfig(
+        model="Qwen/Qwen3-Embedding-0.6B", dtype=torch.float32, seed=42
+    )
+    assert is_qwen3_embedding(embedder)
+    assert not is_qwen3_reranker(embedder)
+
+
+def test_prefix_caching_is_disabled():
+    """It is served by a pooling runner, which cannot use prefix caching."""
+    model = _build_reranker()
+    assert model.vllm_config.cache_config.enable_prefix_caching in (False, None)
 
 
 def test_registered_as_a_generation_arch():

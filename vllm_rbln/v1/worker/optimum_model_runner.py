@@ -82,7 +82,7 @@ from vllm_rbln.model_executor.models.optimum.model_base import (
     RBLNOptimumMultimodalMixin,
 )
 from vllm_rbln.utils.optimum.bucket import select_bucket_size
-from vllm_rbln.utils.optimum.predicates import is_qwen3_pooling, is_qwen3_reranker
+from vllm_rbln.utils.optimum.predicates import is_qwen3_embedding, is_qwen3_reranker
 from vllm_rbln.utils.optimum.registry import (
     get_rbln_model_info,
     validate_arch_supported,
@@ -127,16 +127,13 @@ class RBLNOptimumModelRunner(
         _, model_cls_name = get_rbln_model_info(vllm_config.model_config)
 
         if is_qwen3_reranker(vllm_config.model_config):
-            # Qwen3-Reranker arrives as `Qwen3ForSequenceClassification` (vLLM's
-            # spelling for the seq-cls conversion), but it is scored off two
-            # vocabulary logits, so it needs the generation graph -- the same one
-            # `Qwen3ForCausalLM` compiles. Remapping here makes the compile spec
-            # and optimum-rbln class identical to the generative path, so both
-            # share a single compiled artifact.
+            # The reranker's score comes from two vocabulary logits, so it needs
+            # lm_head in the graph -- `Qwen3ForCausalLM` is the arch that compiles
+            # one. `Qwen3Model` would leave only hidden states.
             vllm_config.model_config.hf_config.__dict__["architectures"] = [
                 "Qwen3ForCausalLM"
             ]
-        elif is_qwen3_pooling(vllm_config.model_config):
+        elif is_qwen3_embedding(vllm_config.model_config):
             # NOTE The architecture of Qwen3-Embedding model in huggingface
             # is `Qwen3ForCausalLM`. But it have to be mapped to `Qwen3Model`
             # for optimum-rbln.
