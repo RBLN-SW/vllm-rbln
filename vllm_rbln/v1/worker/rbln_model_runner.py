@@ -1500,12 +1500,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         if grammar_output is not None:
             # NOTE(RBLN): `xgr.apply_token_bitmask_inplace` requires logits
             # to be float32 dtype for CPU tensors
-            origin_dtype = logits.dtype
-            logits = logits.to(torch.float32)
+            origin_dtype, origin_device = logits.dtype, logits.device
+            logits = logits.to(torch.float32).to("cpu")
             apply_grammar_bitmask(
                 scheduler_output, grammar_output, self.input_batch, logits
             )
-            logits = logits.to(origin_dtype)
+            logits = logits.to(origin_dtype).to(origin_device)
 
         with record_function_or_nullcontext("rbln_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
@@ -1827,15 +1827,35 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             )
 
     def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:
-        """Extract Eagle3 auxiliary layer indices from speculative config."""
+        """Extract Eagle3 auxiliary layer indices from speculative config.
+
+        These indices specify which hidden states from the base model should
+        be used as auxiliary inputs for the Eagle3 drafter model during
+        speculative decoding.
+
+        Returns:
+            Tuple of layer indices if found in draft model config,
+            None otherwise.
+        """
         if not (self.speculative_config and self.speculative_config.draft_model_config):
             return None
 
         hf_config = self.speculative_config.draft_model_config.hf_config
-        if not hasattr(hf_config, "eagle_aux_hidden_state_layer_ids"):
-            return None
 
-        layer_ids = hf_config.eagle_aux_hidden_state_layer_ids
+        layer_ids = getattr(hf_config, "eagle_aux_hidden_state_layer_ids", None)
+        if not layer_ids:
+            dflash_config = getattr(hf_config, "dflash_config", None)
+            eagle_config = getattr(hf_config, "eagle_config", None)
+
+            if dflash_config and isinstance(dflash_config, dict):
+                # Add 1 to convert DFlash's aux layer id semantics
+                layer_ids = [
+                    i + 1 for i in (dflash_config.get("target_layer_ids") or [])
+                ]
+
+            if eagle_config and isinstance(eagle_config, dict):
+                layer_ids = eagle_config.get("eagle_aux_hidden_state_layer_ids")
+
         if layer_ids and isinstance(layer_ids, (list, tuple)):
             return tuple(layer_ids)
 

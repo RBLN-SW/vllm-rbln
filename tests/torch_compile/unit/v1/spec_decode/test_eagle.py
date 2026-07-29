@@ -186,7 +186,8 @@ def make_eagle_stub(
     )
     stub.arange = torch.arange(max_num_tokens + 1, dtype=torch.int32, device=DEVICE)
     stub.vllm_config = SimpleNamespace(
-        speculative_config=SimpleNamespace(enforce_eager=enforce_eager)
+        speculative_config=SimpleNamespace(enforce_eager=enforce_eager),
+        parallel_config=SimpleNamespace(data_parallel_size=1),
     )
     stub.runner = (
         runner if runner is not None else SimpleNamespace(compile_context=object())
@@ -490,7 +491,7 @@ def test_load_model_compiles_wrapper(monkeypatch, strict):
     assert captured["dynamic"] is False
     assert captured["fullgraph"] is True
     assert captured["compile_context"] is runner.compile_context
-    assert captured["tensor_parallel_size"] == 8
+    assert captured["num_devices"] == 8
     assert captured["process_group_dict"] is process_group_sentinel
     assert captured["guard_filter_fn"] is torch.compiler.keep_tensor_guards_unsafe
     assert captured["mode"] == ("strict" if strict else "")
@@ -514,11 +515,14 @@ def test_load_model_wrapper_composition(monkeypatch, with_indices):
         input_ids=torch.zeros((2, 3), dtype=torch.int32),
         positions=torch.zeros((2, 3), dtype=torch.int64),
         hidden_states=hidden,
-        last_token_indices=indices,
+        token_indices_to_sample=indices,
     )
 
     # Returned hidden stream is the second forward output, flattened to [-1, H].
-    torch.testing.assert_close(out_hidden, (hidden + 2000).view(-1, 4))
+    expected_hidden = (hidden + 2000).view(-1, 4)
+    if with_indices:
+        expected_hidden = expected_hidden.index_select(0, indices)
+    torch.testing.assert_close(out_hidden, expected_hidden)
 
     last_hidden_flat = (hidden + 1000).view(-1, 4)
     expected_sample = last_hidden_flat[indices] if with_indices else last_hidden_flat
@@ -658,7 +662,7 @@ def test_propose_returns_zeros_for_intermediate_chunked_prefill():
     )
 
     def model_executable(
-        *, input_ids, positions, hidden_states, inputs_embeds, last_token_indices
+        *, input_ids, positions, hidden_states, inputs_embeds, token_indices_to_sample
     ):
         return hidden_states.view(-1, stub.hidden_size), torch.zeros((2, 3))
 
@@ -678,7 +682,7 @@ def test_propose_returns_zeros_for_intermediate_chunked_prefill():
         common_attn_metadata=cad,
     )
 
-    assert len(builder.calls) == 1
+    assert len(builder.calls) == 2
     assert output.shape == (2, 2)
     torch.testing.assert_close(output, torch.zeros((2, 2), dtype=torch.int64))
 
@@ -692,10 +696,10 @@ def test_propose_single_step_decode_returns_argmax():
     captured: dict[str, object] = {}
 
     def model_executable(
-        *, input_ids, positions, hidden_states, inputs_embeds, last_token_indices
+        *, input_ids, positions, hidden_states, inputs_embeds, token_indices_to_sample
     ):
         captured["input_shape"] = input_ids.shape
-        captured["last_token_indices"] = last_token_indices
+        captured["token_indices_to_sample"] = token_indices_to_sample
         logits = torch.tensor(
             [[0.0, 5.0, 1.0], [0.0, 1.0, 7.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
         )
@@ -720,7 +724,8 @@ def test_propose_single_step_decode_returns_argmax():
     # decode: [2, 2] reshaped then padded up to the bucket batch of 4
     assert captured["input_shape"] == (4, 2)
     torch.testing.assert_close(
-        captured["last_token_indices"], torch.tensor([1, 3, 0, 0], dtype=torch.int32)
+        captured["token_indices_to_sample"],
+        torch.tensor([1, 3, 0, 0], dtype=torch.int32),
     )
     assert builder.calls[0]["is_prefill"] is False
     assert builder.calls[0]["batch_pad"] == 4
@@ -763,13 +768,15 @@ def test_propose_multistep_decode_feeds_previous_draft_and_stacks_tokens():
         positions,
         hidden_states,
         inputs_embeds,
-        last_token_indices,
+        token_indices_to_sample,
     ):
         calls.append(
             {
                 "input_ids": input_ids.clone(),
-                "last_token_indices": (
-                    None if last_token_indices is None else last_token_indices.clone()
+                "token_indices_to_sample": (
+                    None
+                    if token_indices_to_sample is None
+                    else token_indices_to_sample.clone()
                 ),
             }
         )
@@ -801,9 +808,10 @@ def test_propose_multistep_decode_feeds_previous_draft_and_stacks_tokens():
     assert builder.calls[0]["batch_pad"] == 4
     assert builder.calls[1]["batch_pad"] == 4
     torch.testing.assert_close(
-        calls[0]["last_token_indices"], torch.tensor([1, 3, 0, 0], dtype=torch.int32)
+        calls[0]["token_indices_to_sample"],
+        torch.tensor([1, 3, 0, 0], dtype=torch.int32),
     )
-    assert calls[1]["last_token_indices"] is None
+    assert calls[1]["token_indices_to_sample"] is None
     second_input_ids = cast(torch.Tensor, calls[1]["input_ids"])
     torch.testing.assert_close(
         second_input_ids[:2, 0], torch.tensor([1, 3], dtype=torch.int32)
@@ -829,7 +837,7 @@ def test_propose_multistep_rejects_unsupported_attention_metadata_type():
         positions,
         hidden_states,
         inputs_embeds,
-        last_token_indices,
+        token_indices_to_sample,
     ):
         logits = torch.tensor(
             [
