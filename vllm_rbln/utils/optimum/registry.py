@@ -135,15 +135,40 @@ def is_arch_supported(
 
 def validate_arch_supported(config: PretrainedConfig) -> None:
     """Validate the model's architecture is known to upstream vLLM."""
-    architectures = getattr(config, "architectures", [])
     import vllm.model_executor.models as me_models
+    from vllm.config.model import (
+        iter_architecture_defaults,
+        try_match_architecture_defaults,
+    )
 
+    architectures = getattr(config, "architectures", [])
     supported_archs = me_models.ModelRegistry.get_supported_archs()
-    if not any(arch in supported_archs for arch in architectures):
-        raise ValueError(
-            f"Model architectures {architectures} are not supported on upstream "
-            f"vLLM for now. Supported architectures: {supported_archs}"
+
+    for arch in architectures:
+        if arch in supported_archs:
+            return
+        # Not every architecture vLLM accepts is registered: an unregistered
+        # ``XForSequenceClassification`` is derived from ``XForCausalLM`` plus the
+        # `classify` conversion (ModelRegistry._normalize_arch). Qwen3-Reranker
+        # loads exactly that way, so mirror the rule instead of rejecting it.
+        match = try_match_architecture_defaults(
+            arch,
+            runner_type=getattr(config, "runner_type", None),
+            convert_type=getattr(config, "convert_type", None),
         )
+        if match is None:
+            continue
+        suffix, _ = match
+        if any(
+            arch.replace(suffix, repl_suffix) in supported_archs
+            for repl_suffix, _ in iter_architecture_defaults()
+        ):
+            return
+
+    raise ValueError(
+        f"Model architectures {architectures} are not supported on upstream "
+        f"vLLM for now. Supported architectures: {supported_archs}"
+    )
 
 
 def get_rbln_model_info(config: PretrainedConfig) -> tuple[str, str]:
