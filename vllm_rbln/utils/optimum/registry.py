@@ -33,6 +33,14 @@ _RBLN_GENERATION_MODELS: dict[str, tuple[str, str]] = {
     "OPTForCausalLM": ("opt", "RBLNOPTForCausalLM"),
     "Qwen3ForCausalLM": ("qwen3", "RBLNQwen3ForCausalLM"),
     "GptOssForCausalLM": ("gpt-oss", "RBLNGptOssForCausalLM"),
+    # Qwen3-Reranker routed through vLLM's score API. It is served by `score()`
+    # but it is *not* an encoder-style pooling model: the relevance score is read
+    # off two vocabulary logits, so it runs the generation graph and belongs here.
+    # Being a generation arch is what gives it chunked prefill -- a pooling arch
+    # would get a full-prefill `max_num_batched_tokens`, i.e. a compiled
+    # prefill_chunk_size equal to max_model_len, which the decoder graph cannot
+    # be built with. See vllm_rbln/model_executor/models/optimum/qwen3_reranker.py
+    "Qwen3ForSequenceClassification": ("qwen3", "RBLNQwen3ForCausalLM"),
 }
 
 _RBLN_ENCODER_DECODER_MODELS: dict[str, tuple[str, str]] = {
@@ -93,12 +101,6 @@ _RBLN_EMBEDDING_MODELS = {
     ),
     "XLMRobertaModel": ("xlm_roberta", "RBLNXLMRobertaModel"),
     "Qwen3Model": ("qwen3", "RBLNQwen3Model"),
-    # Qwen3-Reranker routed through vLLM's score API. Unlike the embedding
-    # models it wants the *generation* graph, lm_head included, because the score
-    # is read off two vocabulary logits -- so one compiled artifact serves both
-    # this and the generative entry point. See
-    # vllm_rbln/model_executor/models/optimum/qwen3_reranker.py.
-    "Qwen3ForSequenceClassification": ("qwen3", "RBLNQwen3ForCausalLM"),
 }
 
 _RBLN_SUPPORTED_MODELS = {

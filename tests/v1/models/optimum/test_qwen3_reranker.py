@@ -43,7 +43,13 @@ from vllm_rbln.model_executor.models.optimum.qwen3_reranker import (
     RBLNQwen3RerankerPooler,
     resolve_label_token_ids,
 )
+from vllm_rbln.utils.optimum.converter.common import is_chunked_prefill_arch
 from vllm_rbln.utils.optimum.predicates import is_qwen3_reranker
+from vllm_rbln.utils.optimum.registry import (
+    get_rbln_model_info,
+    is_generation_arch,
+    is_pooling_arch,
+)
 
 MODEL_ID = "Qwen/Qwen3-Reranker-0.6B"
 # Exactly what examples/optimum/pooling_models/qwen3_reranker_score_offline.py passes.
@@ -104,6 +110,21 @@ def test_predicate_survives_arch_remap():
 
 def test_label_token_ids():
     assert resolve_label_token_ids(_model_config()) == (NO_ID, YES_ID)
+
+
+def test_registered_as_a_generation_arch():
+    """It is served by score(), but it runs the generation graph.
+
+    Classifying it as a pooling arch makes `max_num_batched_tokens` a
+    full-prefill budget, i.e. a compiled prefill_chunk_size equal to
+    max_model_len, and the decoder graph cannot be built that way.
+    """
+    hf_config = _model_config().hf_config
+
+    assert is_generation_arch(hf_config)
+    assert not is_pooling_arch(hf_config)
+    assert is_chunked_prefill_arch(hf_config)
+    assert get_rbln_model_info(hf_config) == ("qwen3", "RBLNQwen3ForCausalLM")
 
 
 def _bare_config(tokens):
