@@ -37,18 +37,12 @@ jobs:
           VERSION="${{ inputs.optimum-version }}"
           VERSION="${VERSION#v}"
 
-          # 1) Bump ONLY the optimum-rbln constraint in pyproject.toml.
-          sed -i -E "s|\"optimum-rbln[^\"]*\"|\"optimum-rbln>=${VERSION}\"|" pyproject.toml
-          grep -q "\"optimum-rbln>=${VERSION}\"" pyproject.toml \
-            || { echo "::error::failed to patch optimum-rbln in pyproject.toml"; exit 1; }
-          echo "pyproject.toml -> optimum-rbln>=${VERSION}"
-
-          # 2) Refresh uv.lock for ONLY optimum-rbln (targeted upgrade).
+          # Bump optimum-rbln in pyproject.toml and refresh uv.lock in one step.
           for i in {1..6}; do
-            uv lock --upgrade-package "optimum-rbln==${VERSION}" --no-cache && exit 0
+            uv add "optimum-rbln>=${VERSION}" --upgrade-package optimum-rbln && exit 0
             sleep 10
           done
-          echo "::error::uv lock failed after retries"
+          echo "::error::uv add failed after retries"
           exit 1
 
       - name: Create PR for updated files
