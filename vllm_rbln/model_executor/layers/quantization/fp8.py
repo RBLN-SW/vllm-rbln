@@ -37,6 +37,11 @@ from vllm_rbln.logger import init_logger
 logger = init_logger(__name__)
 
 
+# NOTE: `masked_routing_weights` (plural) is the name in the released
+# rebel-compiler. The compiler renames it to the singular `masked_routing_weight`
+# in rebellions-sw/rebel_compiler#12049; rename this copy to match when the pin
+# moves to that build. Until then vllm_rbln.custom_ops logs a signature-drift
+# warning for this op at import time.
 @custom_op(
     "rbln_custom_ops::custom_moe_glu_group_dequantize",
     mutates_args=(),
@@ -49,7 +54,7 @@ def custom_moe_glu_group_dequantize(
     up_proj_scale: torch.Tensor,
     down_proj_weight: torch.Tensor,
     down_proj_scale: torch.Tensor,
-    masked_routing_weight: torch.Tensor,
+    masked_routing_weights: torch.Tensor,
     group_size: torch.Tensor,
     hidden_act: str,
     gate_proj_bias: torch.Tensor | None = None,
@@ -69,7 +74,7 @@ def custom_moe_glu_group_dequantize(
     - up_proj_scale: [num_experts, intermediate_size, hidden_size // 128]
     - down_proj_weight: [num_experts, intermediate_size, hidden_size]
     - down_proj_scale: [num_experts, hidden_size, intermediate_size // 128]
-    - masked_routing_weight: [num_experts, num_tokens]
+    - masked_routing_weights: [num_experts, num_tokens]
       (token dim may be padded to 64-align)
     - group_size: group size for weight scale
     - hidden_act: gate activation name ("silu"/"swish" or "gelu*")
@@ -133,8 +138,8 @@ def custom_moe_glu_group_dequantize(
     else:
         raise ValueError(f"Unsupported hidden_act={hidden_act!r}")
 
-    # masked_routing_weight: [E, T_padded]
-    routing_t = masked_routing_weight[:, :num_tokens]
+    # masked_routing_weights: [E, T_padded]
+    routing_t = masked_routing_weights[:, :num_tokens]
 
     final_hidden_states = torch.zeros(num_tokens, hidden_size, dtype=dtype)
 
@@ -180,7 +185,7 @@ def custom_moe_glu_group_dequantize_fake(
     up_proj_scale: torch.Tensor,
     down_proj_weight: torch.Tensor,
     down_proj_scale: torch.Tensor,
-    masked_routing_weight: torch.Tensor,
+    masked_routing_weights: torch.Tensor,
     group_size: torch.Tensor,
     hidden_act: str,
     gate_proj_bias: torch.Tensor | None = None,

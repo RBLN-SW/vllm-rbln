@@ -28,17 +28,16 @@ FROM_COMPILER: set[str] = set()
 #: Ops this package had to define because the compiler does not provide them.
 FALLBACK: set[str] = set()
 
-#: Schema of this package's copy of each op, whether or not it was used. Lets a
-#: test compare against what the compiler registered without duplicating the
-#: signatures.
+#: Schema of this package's copy of each op, whether or not it was used. This is
+#: what the drift warning compares against the compiler's registration.
 LOCAL_SCHEMAS: dict[str, str] = {}
 
 
 def fallback_ops() -> frozenset[str]:
     """Ops vllm-rbln registered itself, because rebel-compiler lacks them.
 
-    Empty on a supported compiler. Tests assert that, so the fallback cannot
-    quietly become the path everything runs on.
+    Empty once the minimum supported compiler registers all of them, which is
+    when the copies in this package can go.
     """
     return frozenset(FALLBACK)
 
