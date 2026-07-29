@@ -120,11 +120,12 @@ class RBLNOptimumModelRunner(
     input_batch: RBLNInputBatch
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
-        # Validate against upstream vLLM's registry BEFORE the Qwen3 arch remap
-        # below — the remapped name (Qwen3Model) is not in upstream vLLM, but the
-        # original HF arch (Qwen3ForCausalLM) is.
+        # Validate before the remap below: it rewrites the architecture to
+        # whatever optimum-rbln compiles, and those names are internal to
+        # optimum-rbln, so checking afterwards would reject models upstream vLLM
+        # supports. The two calls cover the upstream and the RBLN registry.
         validate_arch_supported(vllm_config.model_config)
-        _, model_cls_name = get_rbln_model_info(vllm_config.model_config)
+        get_rbln_model_info(vllm_config.model_config)
 
         if is_qwen3_reranker(vllm_config.model_config):
             # Callers pass `Qwen3ForSequenceClassification`, which is how vLLM
