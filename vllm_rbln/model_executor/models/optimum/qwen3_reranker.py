@@ -130,31 +130,48 @@ class RBLNOptimumQwen3RerankerModel(RBLNOptimumModelBase, VllmModelForPooling):
             self.false_id,
         )
 
-    def preprocess(self, input_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        num_requests, seq_len = input_ids.shape
+    def preprocess(
+        self, input_ids: torch.Tensor, positions: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Re-pad each request to the left, which the generation graph requires.
+
+        Requests arrive right padded to a common width, their real lengths
+        recoverable from ``positions``. The generation graph keeps a KV cache, so
+        optimum-rbln rejects a right-padded mask.
+
+        The batch is left as-is: padding it out to the compiled batch size would
+        hand the model all-zero masks for the unused slots, which it refuses.
+        """
+        num_requests, width = input_ids.shape
         max_seq_len = self.rbln_model_config.max_seq_len
-        if seq_len > max_seq_len:
+        if width > max_seq_len:
             raise ValueError(
-                f"Input length ({seq_len}) exceeds the compiled maximum "
+                f"Input length ({width}) exceeds the compiled maximum "
                 f"({max_seq_len})."
             )
 
-        padded_ids = input_ids.new_zeros((self.batch_size, max_seq_len))
-        mask = torch.zeros(self.batch_size, max_seq_len, dtype=torch.long)
-        padded_ids[:num_requests, max_seq_len - seq_len :] = input_ids
-        mask[:num_requests, max_seq_len - seq_len :] = 1
+        # positions run 0..n-1 per request, so the largest one sits at index n-1.
+        lengths = torch.max(positions, dim=1).indices + 1
+
+        padded_ids = input_ids.new_zeros((num_requests, width))
+        mask = torch.zeros(num_requests, width, dtype=torch.long)
+        for idx, length in enumerate(lengths.tolist()):
+            padded_ids[idx, width - length :] = input_ids[idx, :length]
+            mask[idx, width - length :] = 1
         return padded_ids, mask
 
     def forward(self, model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
         num_requests = model_input.input_tokens.shape[0]
-        input_ids, attention_mask = self.preprocess(model_input.input_tokens)
+        input_ids, attention_mask = self.preprocess(
+            model_input.input_tokens, model_input.input_positions
+        )
 
         outputs = self.model.forward(
             input_ids=input_ids, attention_mask=attention_mask, return_dict=True
         )
         # [batch, 1, vocab_size] -- the final position only, which is where the
         # "yes"/"no" answer would have been sampled.
-        logits = outputs.logits[:num_requests].reshape(num_requests, -1)
+        logits = outputs.logits.reshape(num_requests, -1)
 
         # sigmoid(logit_yes - logit_no) == p_yes / (p_yes + p_no), so reduce to
         # one logit here and let the pooler apply the activation.

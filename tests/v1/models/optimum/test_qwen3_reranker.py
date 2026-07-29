@@ -200,24 +200,31 @@ def test_builds_reranker_pooler():
 
 def test_inputs_are_left_padded():
     """The generation graph rejects right-padded masks outright."""
-    model = _build_reranker(max_seq_len=8, batch_size=2)
-    input_ids = torch.arange(1, 4, dtype=torch.long).unsqueeze(0)  # one request, 3 ids
+    model = _build_reranker(max_seq_len=8, batch_size=4)
+    # Two requests of different lengths, right padded to a common width, the way
+    # the runner hands them over.
+    input_ids = torch.tensor([[1, 2, 3, 0, 0], [4, 5, 0, 0, 0]])
+    positions = torch.tensor([[0, 1, 2, 0, 0], [0, 1, 0, 0, 0]])
 
-    padded_ids, mask = model.preprocess(input_ids)
+    padded_ids, mask = model.preprocess(input_ids, positions)
 
-    assert padded_ids.shape == (2, 8)
-    assert mask.shape == (2, 8)
-    # Real tokens sit at the end, padding at the front.
-    assert padded_ids[0].tolist() == [0, 0, 0, 0, 0, 1, 2, 3]
-    assert mask[0].tolist() == [0, 0, 0, 0, 0, 1, 1, 1]
-    # The unused batch slot stays fully masked.
-    assert mask[1].sum() == 0
+    # The batch is NOT padded out to the compiled size: an all-zero mask for an
+    # unused slot makes optimum-rbln raise.
+    assert padded_ids.shape == (2, 5)
+    assert mask.shape == (2, 5)
+    # Each request keeps its own length, moved to the right.
+    assert padded_ids[0].tolist() == [0, 0, 1, 2, 3]
+    assert mask[0].tolist() == [0, 0, 1, 1, 1]
+    assert padded_ids[1].tolist() == [0, 0, 0, 4, 5]
+    assert mask[1].tolist() == [0, 0, 0, 1, 1]
 
 
 def test_rejects_overlong_input():
     model = _build_reranker(max_seq_len=4)
     with pytest.raises(ValueError, match="exceeds the compiled maximum"):
-        model.preprocess(torch.zeros(1, 5, dtype=torch.long))
+        model.preprocess(
+            torch.zeros(1, 5, dtype=torch.long), torch.arange(5).unsqueeze(0)
+        )
 
 
 def test_forward_reduces_to_2_way_softmax():
@@ -232,7 +239,8 @@ def test_forward_reduces_to_2_way_softmax():
 
     num_requests = 2
     model_input = SimpleNamespace(
-        input_tokens=torch.zeros(num_requests, 5, dtype=torch.long)
+        input_tokens=torch.zeros(num_requests, 5, dtype=torch.long),
+        input_positions=torch.arange(5).repeat(num_requests, 1),
     )
     out = model.forward(model_input)
 
