@@ -360,16 +360,17 @@ class RBLNOptimumQwen3_5ForConditionalGeneration(
 
     def __init__(self, vllm_config: VllmConfig) -> None:
         super().__init__(vllm_config=vllm_config)
-        # Per-request (batch_idx) into the [max_num_seqs] conv/recurrent state cache.
+        # Per-request local_table_id into the [max_num_seqs] conv/recurrent state.
         self.attention_manager: AttentionManager = AttentionManager(
             LinearAttentionStrategy()
         )
 
-    def _decode_batch_indices(self, model_input: ModelInputForRBLN) -> torch.Tensor:
-        """The state-cache row (batch_idx) of each running request, in running
-        order, as a tensor. This is only the index: the actual row placement is
-        done by the scatter (input_block_ids in forward / compute_decode_position_embed)
-        and undone by the logits gather (batch_indices in forward).
+    def _decode_local_table_ids(self, model_input: ModelInputForRBLN) -> torch.Tensor:
+        """The state-cache row (local_table_id) of each running request, in
+        running order, as a tensor. This is only the index: the actual row
+        placement is done by the scatter (input_block_ids in forward /
+        compute_decode_position_embed) and undone by the logits gather
+        (local_table_ids in forward).
         """
         running = model_input.running_requests_ids
         table_ids = self.attention_manager.get(
@@ -407,27 +408,27 @@ class RBLNOptimumQwen3_5ForConditionalGeneration(
         self, model_input: ModelInputForRBLN, mrope_position_deltas: dict[str, float]
     ) -> torch.Tensor:
         # The base builds [2, max_num_seqs, ...] with the running requests at
-        # rows [0, n). Re-place each at its stable batch_idx row so the whole
+        # rows [0, n). Re-place each at its stable local_table_id row so the whole
         # decode batch (position_embed / inputs_embeds / block_tables) is laid out
-        # by batch index, matching the [max_num_seqs] recurrent-state cache the
+        # by state-cache row, matching the [max_num_seqs] recurrent-state cache the
         # graph indexes by row. forward lays out ids/embeds the same way.
         position_embed = super().compute_decode_position_embed(
             model_input, mrope_position_deltas
         )
-        batch_indices = self._decode_batch_indices(model_input)
+        local_table_ids = self._decode_local_table_ids(model_input)
         out = torch.zeros_like(position_embed)
-        out[:, batch_indices] = position_embed[:, : batch_indices.shape[0]]
+        out[:, local_table_ids] = position_embed[:, : local_table_ids.shape[0]]
         return out
 
     def forward(self, model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
-        """Qwen3.5 must place each request at its linear-attention batch_idx row.
+        """Qwen3.5 must place each request at its linear-attention state row.
 
         The GatedDeltaNet linear_attention conv/recurrent state is a fixed
         [max_num_seqs] on-device cache indexed by batch row. prefill writes
-        one row; decode reads/writes every row. So each request is pinned
-        to a stable batch_idx. prefill passes its batch_idx and decode lays
-        the batch out with the request at row == batch_idx, then gathers
-        logits back to running order.
+        one row; decode reads/writes every row. So each request is pinned to a
+        stable local_table_id. prefill passes that row to the graph's batch_idx
+        input; decode lays the batch out with the request at row ==
+        local_table_id, then gathers logits back to running order.
         """
         input_ids = model_input.input_tokens
         cache_position = model_input.input_positions
@@ -435,10 +436,10 @@ class RBLNOptimumQwen3_5ForConditionalGeneration(
 
         if model_input.is_prompt:
             req_id = model_input.running_requests_ids[0]
-            batch_idx = self.attention_manager.get(
+            local_table_id = self.attention_manager.get(
                 True, self.decoder_batch_size, [req_id], []
             )[0]
-            self.attention_manager.add(req_id, batch_idx)
+            self.attention_manager.add(req_id, local_table_id)
             kw = self.preprocess_for_decoder(
                 True, block_tables, input_ids, cache_position
             )
@@ -447,17 +448,19 @@ class RBLNOptimumQwen3_5ForConditionalGeneration(
                 "position_embed": model_input.position_embed,
                 "block_tables": kw.pop("block_tables"),
                 "cache_position": kw.pop("cache_position"),
-                "batch_idx": batch_idx,
+                # "batch_idx" is optimum-rbln's prefill-graph input name for the
+                # [max_num_seqs] state-cache row this request writes.
+                "batch_idx": local_table_id,
             }
             return self.model.prefill_decoder(**prefill_kwargs).logits
 
-        batch_indices = self._decode_batch_indices(model_input)
+        local_table_ids = self._decode_local_table_ids(model_input)
         kw = self.preprocess_for_decoder(
             False,
             block_tables,
             input_ids,
             cache_position,
-            input_block_ids=batch_indices,
+            input_block_ids=local_table_ids,
         )
         input_ids = kw.pop("input_ids")
         inputs_embeds = self.model.embed_tokens(input_ids).to(self.dtype)
@@ -468,4 +471,4 @@ class RBLNOptimumQwen3_5ForConditionalGeneration(
             position_embed=model_input.position_embed,
             block_tables=kw.pop("block_tables"),
         ).logits
-        return logits[batch_indices]
+        return logits[local_table_ids]
