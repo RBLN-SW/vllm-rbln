@@ -1723,14 +1723,15 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                         spec_decode_metadata,
                         valid_sampled_tokens_count,
                     )
-                total_num_tokens = common_attn_metadata.num_actual_tokens
-                target_token_ids = self.input_ids[:total_num_tokens]
-                target_positions = self.positions[:total_num_tokens]
-                if self.use_aux_hidden_state_outputs:
-                    assert aux_hidden_states is not None
-                    target_hidden_states = torch.cat(
-                        [h.view(-1, h.shape[-1]) for h in aux_hidden_states], dim=-1
-                    )
+                with record_function_or_nullcontext("drafter/pre: aux_cat"):
+                    total_num_tokens = common_attn_metadata.num_actual_tokens
+                    target_token_ids = self.input_ids[:total_num_tokens]
+                    target_positions = self.positions[:total_num_tokens]
+                    if self.use_aux_hidden_state_outputs:
+                        assert aux_hidden_states is not None
+                        target_hidden_states = torch.cat(
+                            [h.view(-1, h.shape[-1]) for h in aux_hidden_states], dim=-1
+                        )
 
             draft_token_ids = self.drafter.propose(
                 target_token_ids=target_token_ids,

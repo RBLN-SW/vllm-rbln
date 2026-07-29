@@ -223,6 +223,8 @@ class RBLNEagleProposer(EagleProposer):
         # to remove the "padding" (i.e. rejected tokens).
         # Only apply this adjustment when we have rejected tokens
         # (i.e., not the first proposal).
+        _adj = record_function_or_nullcontext("drafter/first: rejected_adjust")
+        _adj.__enter__()
         if self.num_speculative_tokens > 1 and num_rejected_tokens is not None:
             common_attn_metadata.seq_lens -= num_rejected_tokens
             # Same reasoning as in the step loop below: the flash-attention
@@ -234,9 +236,12 @@ class RBLNEagleProposer(EagleProposer):
             if _slc0 is not None:
                 _slc0 -= num_rejected_tokens.to(_slc0.device, _slc0.dtype)
 
-        num_reqs_padded, num_padded_tokens, num_tokens_across_dp = (
-            self._determine_draft_batch_padding(num_reqs, num_reqs, False)
-        )
+        _adj.__exit__(None, None, None)
+
+        with record_function_or_nullcontext("drafter/first: batch_padding"):
+            num_reqs_padded, num_padded_tokens, num_tokens_across_dp = (
+                self._determine_draft_batch_padding(num_reqs, num_reqs, False)
+            )
         for token_index in range(self.num_speculative_tokens - 1):
             _upd = record_function_or_nullcontext("drafter: loop_update")
             _upd.__enter__()
@@ -327,11 +332,13 @@ class RBLNEagleProposer(EagleProposer):
                     inputs_embeds=inputs_embeds,
                     token_indices_to_sample=None,
                 )
-            draft_token_ids = self._draft_ids(logits[:num_reqs])
-            draft_token_ids_list.append(draft_token_ids)
+            with record_function_or_nullcontext("drafter: sample"):
+                draft_token_ids = self._draft_ids(logits[:num_reqs])
+                draft_token_ids_list.append(draft_token_ids)
 
-        # [batch_size, num_speculative_tokens]
-        draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
+        with record_function_or_nullcontext("drafter: stack"):
+            # [batch_size, num_speculative_tokens]
+            draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
         return draft_token_ids
 
     def set_inputs_first_pass(
