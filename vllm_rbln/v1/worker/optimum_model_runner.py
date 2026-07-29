@@ -136,7 +136,7 @@ class RBLNOptimumModelRunner(
                 "Qwen3ForCausalLM"
             ]
         elif is_qwen3_embedding(vllm_config.model_config):
-            # NOTE The architecture of Qwen3-Embedding model in huggingface
+            # The architecture of Qwen3-Embedding model in huggingface
             # is `Qwen3ForCausalLM`. But it have to be mapped to `Qwen3Model`
             # for optimum-rbln.
             vllm_config.model_config.hf_config.__dict__["architectures"] = [

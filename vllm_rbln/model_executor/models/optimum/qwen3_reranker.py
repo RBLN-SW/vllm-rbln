@@ -131,12 +131,6 @@ class RBLNOptimumQwen3RerankerModel(RBLNOptimumModelBase, VllmModelForPooling):
         )
 
     def preprocess(self, input_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Left pad each request up to the compiled batch and sequence length.
-
-        The generation graph keeps a KV cache, so optimum-rbln requires the
-        attention mask to be left padded; the encoder path's right padding would
-        be rejected outright.
-        """
         num_requests, seq_len = input_ids.shape
         max_seq_len = self.rbln_model_config.max_seq_len
         if seq_len > max_seq_len:
@@ -155,11 +149,12 @@ class RBLNOptimumQwen3RerankerModel(RBLNOptimumModelBase, VllmModelForPooling):
         num_requests = model_input.input_tokens.shape[0]
         input_ids, attention_mask = self.preprocess(model_input.input_tokens)
 
-        outputs = self.model.forward(input_ids=input_ids, attention_mask=attention_mask)
+        outputs = self.model.forward(
+            input_ids=input_ids, attention_mask=attention_mask, return_dict=True
+        )
         # [batch, 1, vocab_size] -- the final position only, which is where the
         # "yes"/"no" answer would have been sampled.
-        logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
-        logits = logits[:num_requests].reshape(num_requests, -1)
+        logits = outputs.logits[:num_requests].reshape(num_requests, -1)
 
         # sigmoid(logit_yes - logit_no) == p_yes / (p_yes + p_no), so reduce to
         # one logit here and let the pooler apply the activation.
