@@ -41,6 +41,11 @@ def _register_fp8_block_kernel() -> None:
         if kernel_cls not in block_kernels:
             block_kernels.insert(0, kernel_cls)
 
+            logger.debug(
+                "Registered RBLN block fp8 linear kernel for OOT platform: %s",
+                kernel_cls.__name__,
+            )
+
 
 def _register_unpacked_wna16_linear_kernel() -> None:
     from vllm.model_executor.kernels import linear
@@ -57,6 +62,22 @@ def _register_unpacked_wna16_linear_kernel() -> None:
         logger.debug(
             "Registered RBLN unpacked wna16 linear kernel for OOT platform: %s",
             RBLNUnpackedwNa16LinearKernel.__name__,
+        )
+
+
+def _register_wfp8a16_linear_kernel() -> None:
+    from vllm.model_executor.kernels import linear
+    from vllm.platforms import PlatformEnum
+    from vllm_rbln.model_executor.kernels.linear.w8a16_fp8 import (
+        RBLNW8A16Fp8LinearKernel,
+    )
+    kernels = linear._POSSIBLE_WFP8A16_KERNELS.setdefault(PlatformEnum.OOT, [])
+    if RBLNW8A16Fp8LinearKernel not in kernels:
+        kernels.insert(0, RBLNW8A16Fp8LinearKernel)
+
+        logger.debug(
+            "Registered RBLN w8a16 fp8 linear kernel for OOT platform: %s",
+            RBLNW8A16Fp8LinearKernel.__name__,
         )
 
 
@@ -93,3 +114,4 @@ def register_rbln_oot_implementations() -> None:
     _register_oot(DeepseekScalingRotaryEmbedding, RBLNDeepseekScalingRotaryEmbedding)
     _register_fp8_block_kernel()
     _register_unpacked_wna16_linear_kernel()
+    _register_wfp8a16_linear_kernel()
