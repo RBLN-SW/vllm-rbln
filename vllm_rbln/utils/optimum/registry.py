@@ -93,11 +93,12 @@ _RBLN_EMBEDDING_MODELS = {
     ),
     "XLMRobertaModel": ("xlm_roberta", "RBLNXLMRobertaModel"),
     "Qwen3Model": ("qwen3", "RBLNQwen3Model"),
-    # Qwen3-Reranker routed through vLLM's score API. It reuses the plain Qwen3
-    # backbone: the 2-way-softmax classifier is a single vector applied on the
-    # host, so there is nothing extra to compile. See
-    # vllm_rbln/model_executor/models/optimum/seq_cls_head.py.
-    "Qwen3ForSequenceClassification": ("qwen3", "RBLNQwen3Model"),
+    # Qwen3-Reranker routed through vLLM's score API. Unlike the embedding
+    # models it wants the *generation* graph, lm_head included, because the score
+    # is read off two vocabulary logits -- so one compiled artifact serves both
+    # this and the generative entry point. See
+    # vllm_rbln/model_executor/models/optimum/qwen3_reranker.py.
+    "Qwen3ForSequenceClassification": ("qwen3", "RBLNQwen3ForCausalLM"),
 }
 
 _RBLN_SUPPORTED_MODELS = {

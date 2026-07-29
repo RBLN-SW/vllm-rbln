@@ -126,15 +126,20 @@ class RBLNOptimumModelRunner(
         validate_arch_supported(vllm_config.model_config)
         _, model_cls_name = get_rbln_model_info(vllm_config.model_config)
 
-        if is_qwen3_pooling(vllm_config.model_config) or is_qwen3_reranker(
-            vllm_config.model_config
-        ):
+        if is_qwen3_reranker(vllm_config.model_config):
+            # Qwen3-Reranker arrives as `Qwen3ForSequenceClassification` (vLLM's
+            # spelling for the seq-cls conversion), but it is scored off two
+            # vocabulary logits, so it needs the generation graph -- the same one
+            # `Qwen3ForCausalLM` compiles. Remapping here makes the compile spec
+            # and optimum-rbln class identical to the generative path, so both
+            # share a single compiled artifact.
+            vllm_config.model_config.hf_config.__dict__["architectures"] = [
+                "Qwen3ForCausalLM"
+            ]
+        elif is_qwen3_pooling(vllm_config.model_config):
             # NOTE The architecture of Qwen3-Embedding model in huggingface
             # is `Qwen3ForCausalLM`. But it have to be mapped to `Qwen3Model`
             # for optimum-rbln.
-            # Qwen3-Reranker (arch overridden to Qwen3ForSequenceClassification)
-            # is remapped here too: it is scored from the very same backbone,
-            # with the classifier applied host-side by RBLNQwen3RerankerPooler.
             vllm_config.model_config.hf_config.__dict__["architectures"] = [
                 "Qwen3Model"
             ]
