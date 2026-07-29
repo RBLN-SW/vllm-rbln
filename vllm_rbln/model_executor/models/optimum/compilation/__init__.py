@@ -15,7 +15,6 @@
 from dataclasses import dataclass
 from typing import Any
 
-import torch
 from transformers import PretrainedConfig
 
 import optimum.rbln
@@ -103,7 +102,6 @@ class RBLNCompileSpec:
 
     model_cls: Any
     rbln_config: dict[str, Any]
-    dtype: torch.dtype | None = None
     # Submodules/paths the user may override despite the builder setting a default
     # (compile-only knobs vllm never reads back). Declared per-model by the
     # model's ``get_overridable``; consulted by ``_find_conflicts``.
@@ -120,7 +118,6 @@ class RBLNCompileSpec:
         num_devices: int,
         memory_budget: float,
         prefill_chunk_size: int | None = None,
-        dtype: torch.dtype | None = None,
         rbln_overrides: dict[str, Any] | None = None,
     ) -> "RBLNCompileSpec":
         """Build a compile spec from vllm-rbln inputs, dispatched by architecture."""
@@ -187,7 +184,6 @@ class RBLNCompileSpec:
         # submodule's tensor_parallel_size from the number of devices assigned
         # to it (e.g. ``visual.device``); falls back to the merged default.
         _sync_submodule_tp_with_device(spec.rbln_config)
-        spec.dtype = dtype
         return spec
 
     @classmethod
