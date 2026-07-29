@@ -127,9 +127,10 @@ class RBLNOptimumModelRunner(
         _, model_cls_name = get_rbln_model_info(vllm_config.model_config)
 
         if is_qwen3_reranker(vllm_config.model_config):
-            # The reranker's score comes from two vocabulary logits, so it needs
-            # lm_head in the graph -- `Qwen3ForCausalLM` is the arch that compiles
-            # one. `Qwen3Model` would leave only hidden states.
+            # Callers pass `Qwen3ForSequenceClassification`, which is how vLLM
+            # selects convert=classify; optimum-rbln has no such class. Map it
+            # back to `Qwen3ForCausalLM`: the score comes from two vocabulary
+            # logits, so the graph needs lm_head, which `Qwen3Model` would drop.
             vllm_config.model_config.hf_config.__dict__["architectures"] = [
                 "Qwen3ForCausalLM"
             ]
