@@ -55,8 +55,6 @@ class TestGenerateModelPathName:
         ) == _generate_model_path_name(_vllm_config(512))
 
     def test_dtype_changes_hash(self):
-        # The compiled binary is dtype-specific, so two runs that differ only
-        # in dtype must not share a cache key.
         name_bf16 = _generate_model_path_name(_vllm_config(dtype=torch.bfloat16))
         name_fp32 = _generate_model_path_name(_vllm_config(dtype=torch.float32))
         assert name_bf16 != name_fp32
