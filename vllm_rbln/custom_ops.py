@@ -12,49 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Who owns the `rbln_custom_ops::*` torch custom ops.
-
-rebel-compiler is the single source of truth: it registers these ops on
-`import rebel`, and it is the component that lowers them, so its schema is the
-one that matters. vllm-rbln still carries a copy of each definition, used only
-when the installed compiler predates the move. Registering through
-`custom_op` / `register_fake` here instead of `torch.library` picks the
-compiler's registration whenever there is one.
-
-Without this indirection the outcome would depend on import order and be
-silent: `torch.library.custom_op` does not reject a duplicate, it replaces the
-schema and the implementation. vllm-rbln's modules load after `platform.py`
-does `import rebel`, so a plain decorator would quietly shadow the compiler's
-definition with this package's copy.
-
-The fallback is a transition device, not the end state. `fallback_ops()`
-reports which ops it had to supply; once the minimum supported rebel-compiler
-registers all of them, that set is empty everywhere and the definitions in
-this package can go.
-"""
-
 from collections.abc import Callable
 from typing import Any
 
+import rebel  # noqa: F401
 import torch
 
 from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)
-
-try:
-    # Import for the side effect: a new enough rebel-compiler registers the ops
-    # here, before any of our definitions run. Doing it at this point rather
-    # than relying on platform.py keeps the precedence independent of which
-    # module happens to load first.
-    import rebel  # noqa: F401
-
-    _COMPILER_AVAILABLE = True
-except ImportError:
-    _COMPILER_AVAILABLE = False
-    logger.debug(
-        "rebel-compiler is not installed; vllm-rbln defines the rbln custom ops itself."
-    )
 
 #: Ops taken from rebel-compiler.
 FROM_COMPILER: set[str] = set()
