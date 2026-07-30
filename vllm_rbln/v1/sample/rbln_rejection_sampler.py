@@ -654,6 +654,7 @@ def torch_rejection_sample(
             is_greedy,
             batch_size,
             device,
+            target_probs.shape[-1],
             uniform_probs=uniform_probs,
             synthetic_conditional_rates=synthetic_conditional_rates,
             synthetic_mode=synthetic_mode,
@@ -786,6 +787,7 @@ def torch_rejection_greedy_sample_kernel(
     is_greedy: torch.Tensor | None,
     batch_size: int,
     device: torch.device,
+    vocab_size: int,
     uniform_probs: torch.Tensor | None = None,
     synthetic_conditional_rates: torch.Tensor | None = None,
     synthetic_mode: bool = False,
@@ -822,10 +824,14 @@ def torch_rejection_greedy_sample_kernel(
             assert synthetic_conditional_rates is not None
             u = uniform_probs[s:e]
             rate = synthetic_conditional_rates[:n].to(device=u.device, dtype=u.dtype)
-            # NOTE(RBLN): -1 marks padded/invalid draft ids that must be
-            # rejected (vllm PR #46533); without this the synthetic path could
-            # accept the placeholder and emit -1 as a real token.
-            accepted = (u < rate) & (d >= 0)
+            # NOTE(RBLN): reject draft ids that are not real tokens before
+            # the synthetic rate can accept them. This branch emits `d`
+            # verbatim below, so an id outside [0, vocab) would leave the
+            # sampler as an output token -- -1 padding (vllm PR #46533) at the
+            # bottom, and at the top an EAGLE3 id that `d2t` failed to map.
+            # The non-synthetic branch below needs no such check: it only ever
+            # emits `target_argmax`, which is in range by construction.
+            accepted = (u < rate) & (d >= 0) & (d < vocab_size)
             rej = ~accepted
             if rej.any():
                 k = int(rej.to(torch.int64).argmax().item())
