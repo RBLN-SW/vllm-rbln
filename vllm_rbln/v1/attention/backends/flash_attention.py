@@ -174,12 +174,15 @@ class RBLNFlashAttentionMetadataBuilder(
         is_prefill: bool,
     ) -> RBLNFlashAttentionMetadata:
         num_reqs = common_attn_metadata.num_reqs
-        query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
-        seq_lens = common_attn_metadata._seq_lens_cpu
+        # NOTE(RBLN): vllm-rbln keeps attention metadata on the host and copies
+        # to the device only when constructing RBLNFlashAttentionMetadata below.
+        # See RBLNModelRunner._build_attention_metadata.
+        query_start_loc_cpu = common_attn_metadata.query_start_loc
+        seq_lens_cpu = common_attn_metadata.seq_lens
         block_tables_tensor = common_attn_metadata.block_table_tensor
 
         query_seq_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
-        num_computed_tokens = seq_lens - query_seq_lens_cpu
+        num_computed_tokens = seq_lens_cpu - query_seq_lens_cpu
         seq_idx = positions[query_start_loc_cpu[:num_reqs]].view(-1, 1)
         max_seq_len = self.model_config.max_model_len
 
@@ -221,7 +224,7 @@ class RBLNFlashAttentionMetadataBuilder(
                     max_seq_len,
                     dtype=torch.float16 if self.enforce_eager else torch.float32,
                 )
-                for batch_index, batch_step in enumerate(seq_lens):
+                for batch_index, batch_step in enumerate(seq_lens_cpu):
                     decode_attention_mask[batch_index, :, :, :, : batch_step + 1] = 1
                 attn_masks = decode_attention_mask
                 attn_masks = attn_masks.to(self.device)
@@ -232,7 +235,7 @@ class RBLNFlashAttentionMetadataBuilder(
         swa_attn_masks = None
         if sliding_window := getattr(self.kv_cache_spec, "sliding_window", None):
             num_computed_tokens = num_computed_tokens[:num_reqs].view(-1, 1)
-            seq_lens = seq_lens[:num_reqs].view(-1, 1)
+            seq_lens = seq_lens_cpu[:num_reqs].view(-1, 1)
             query_lens = seq_lens - num_computed_tokens
             cache_seq_lens = torch.clamp(num_computed_tokens, max=sliding_window)
             cache_offsets = cache_seq_lens + query_lens

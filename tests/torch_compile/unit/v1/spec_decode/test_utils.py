@@ -88,8 +88,6 @@ def test_prepare_inputs_padded_matches_upstream_tuple_contract():
         query_start_loc=query_start_loc,
         query_start_loc_cpu=query_start_loc_cpu,
         seq_lens=seq_lens,
-        _seq_lens_cpu=seq_lens.cpu(),
-        _num_computed_tokens_cpu=torch.tensor([7, 7, 11, 9], dtype=torch.int32),
         num_reqs=4,
         num_actual_tokens=query_start_loc_cpu[-1].item(),
         max_query_len=4,
