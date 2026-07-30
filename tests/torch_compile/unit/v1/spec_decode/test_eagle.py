@@ -174,6 +174,11 @@ def make_eagle_stub(
     """
     stub = object.__new__(RBLNEagleProposer)
     stub.device = DEVICE
+    # `__init__` sets this; the stub skips `__init__`, so mirror it here rather
+    # than making the production path tolerate a missing attribute. None keeps
+    # `_combine_hidden_states` on its eager branch, which is what these tests
+    # exercise.
+    stub._compiled_combine = None
     stub.hidden_size = hidden_size
     stub.method = method
     stub.max_num_tokens = max_num_tokens
