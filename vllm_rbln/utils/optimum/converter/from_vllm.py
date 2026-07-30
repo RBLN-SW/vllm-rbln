@@ -47,6 +47,14 @@ def sync_from_vllm(vllm_config: VllmConfig) -> None:
     rbln_overrides = vllm_config.additional_config.get("rbln_config", {})
     params = RBLNParams.from_rbln_config(vllm_config, rbln_overrides)
 
+    if params.dtype is not None:
+        raise ValueError(
+            "`dtype` cannot be set in `additional_config`'s `rbln_config`. "
+            "optimum-rbln takes the compile dtype as a load argument, not as "
+            "an rbln_config field. Use vLLM's `dtype` argument instead "
+            "(e.g. `LLM(dtype=...)` or `--dtype`)."
+        )
+
     if params.batch_size is not None:
         logger.info(
             "Setting max_num_seqs to %d based on rbln_config in additional_config",

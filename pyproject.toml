@@ -45,7 +45,7 @@ dependencies = [
     "torchaudio",
     "torchcodec",
     "torch-rbln~=0.3.0rc3 ; platform_machine == 'x86_64'",
-    "optimum-rbln>=0.11.1a4",
+    "optimum-rbln>=0.11.1a6",
 ]
 
 [project.optional-dependencies]

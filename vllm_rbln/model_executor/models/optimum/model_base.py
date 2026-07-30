@@ -241,7 +241,10 @@ class RBLNOptimumModelBase(nn.Module):
                 json.dumps(spec.rbln_config, indent=2, default=str),
             )
             model = spec.model_cls.from_pretrained(
-                self.model_config.model, rbln_config=spec.rbln_config, config=hf_config
+                self.model_config.model,
+                rbln_config=spec.rbln_config,
+                config=hf_config,
+                dtype=self.model_config.dtype,
             )
             model.save_pretrained(cached_model_path)  # type: ignore[attr-defined]
             self.vllm_config.model_config.model = cached_model_path
@@ -601,9 +604,7 @@ class RBLNOptimumMultimodalMixin(SupportsMultiModal):
             return inputs_embeds
 
         # Flatten per-item embeddings into (num_mm_tokens, hidden_size).
-        mm_embeds = torch.cat(list(multimodal_embeddings)).to(
-            inputs_embeds.device, inputs_embeds.dtype
-        )
+        mm_embeds = torch.cat(list(multimodal_embeddings))
         self._assert_mm_tokens_match(int(is_multimodal.sum()), mm_embeds.shape[0])
         scatter_mask = is_multimodal.unsqueeze(-1).expand_as(inputs_embeds)
         return inputs_embeds.masked_scatter(scatter_mask, mm_embeds)
