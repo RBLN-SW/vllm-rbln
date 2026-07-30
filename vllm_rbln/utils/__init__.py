@@ -12,9 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import Union
 
 import torch
+
+# Build the padded tensor directly instead of concatenating a pad block onto it.
+#
+# `torch.cat` on an RBLN device tensor -- and with
+# VLLM_RBLN_USE_DEVICE_TENSOR=1 the drafter's hidden-state buffer is one -- costs
+# far more than the bytes involved. On the step-200 trace of Qwen3-1.7B + eagle3
+# (DP4, num_spec 3) `aten::cat` totals 1.12 ms/step, and inside a 0.46 ms
+# `aten::cat` the only children are `narrow`/`slice`/`empty` adding up to 8 us:
+# the remaining 0.45 ms is work the profiler never sees. It is the backend
+# handling a device tensor, not a memcpy.
+#
+# `empty` + `copy_` + `fill_` writes the same values with one allocation instead
+# of two, and one pass over the payload instead of two -- `cat` copies both
+# operands, this copies only `x` and fills the tail. It also keeps the result a
+# non-view, which the branch below exists to guarantee. Measured 1.12 -> 0.89
+# ms/step, consistent across all four DP workers.
+#
+# Only `dim == 0` is rewritten; that is what the callers here use.
+_PAD_NO_CAT = os.getenv("VLLM_RBLN_PAD_NO_CAT", "1") == "1"
 
 
 def pad(
@@ -26,6 +46,14 @@ def pad(
         # NOTE: dynamo distinguishes views and non-views for inputs,
         # so ensure that the output is always a non-view.
         return x if x._base is None else x.clone()
+
+    if _PAD_NO_CAT and dim == 0:
+        out = torch.empty(
+            (target_len,) + tuple(x.shape[1:]), dtype=x.dtype, device=x.device
+        )
+        out[:current].copy_(x)
+        out[current:].fill_(pad_value)
+        return out
 
     pad_shape = list(x.shape)
     pad_shape[dim] = target_len - current
