@@ -2949,7 +2949,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     src = op.src_block_id
                     dst = op.dst_block_id
                     nt = op.num_tokens
-                    kv_cache[:, dst, :, :, :nt, :] = kv_cache[:, src, :, :, :nt, :]
+                    if self.model_config.use_mla:
+                        kv_cache[dst, :nt, :] = kv_cache[src, :nt, :]
+                    else:
+                        kv_cache[:, dst, :, :, :nt, :] = kv_cache[:, src, :, :, :nt, :]
 
 
 def _pad_rows(t: torch.Tensor | None, bucket: int) -> torch.Tensor | None:
