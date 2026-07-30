@@ -12,17 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Score Qwen3-Reranker through the native `score()` API.
-
-`qwen3_reranker_generate_offline.py` drives the same model as a generative LM and reads
-the "yes"/"no" logprobs back, which holds up only while both labels stay inside
-the requested top-k window. A confidently irrelevant document pushes "yes" out
-of it, and the score silently bottoms out at the fallback value.
-
-Loading it for `score()` reads the two logits directly instead, so the window
-never enters into it and the score arrives ready to use from the pooler.
-"""
-
 import fire
 from transformers import AutoTokenizer
 from vllm import LLM

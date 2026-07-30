@@ -42,6 +42,7 @@ def get_input_prompts(tokenizer) -> list[str]:
     queries = [
         "What is the capital of China?",
         "Explain gravity",
+        "What is the capital of China?",
     ]
     documents = [
         "The capital of China is Beijing.",
@@ -50,6 +51,8 @@ def get_input_prompts(tokenizer) -> list[str]:
             "It gives weight to physical objects and "
             "is responsible for the movement of planets around the sun."
         ),
+        # Deliberately irrelevant, to show the scores separate.
+        "Gravity gives weight to physical objects.",
     ]
 
     pairs = list(zip(queries, documents))
@@ -74,7 +77,7 @@ def compute_logits(outputs, true_token, false_token):
 
 def main(
     max_seq_len: int = 32768,
-    num_input_prompt: int = 2,
+    num_input_prompt: int = 3,
     model: str = "Qwen/Qwen3-Reranker-0.6B",
 ):
     tokenizer = AutoTokenizer.from_pretrained(model)

@@ -173,6 +173,8 @@ class RBLNOptimumQwen3RerankerModel(RBLNOptimumModelBase, VllmModelForPooling):
         logits = outputs.logits.reshape(num_requests, -1)
 
         # sigmoid(logit_yes - logit_no) == p_yes / (p_yes + p_no), so reduce to
-        # one logit here and let the pooler apply the activation.
+        # one logit here and let the pooler apply the activation. Hand it over in
+        # head_dtype -- fp32 for pooling models -- because sigmoid in bfloat16
+        # cannot represent a score like 0.9995 and rounds it to 1.0.
         score_logits = logits[:, self.true_id] - logits[:, self.false_id]
-        return score_logits.unsqueeze(-1).float()
+        return score_logits.unsqueeze(-1).to(self.model_config.head_dtype)
