@@ -2944,6 +2944,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
             # 5. specdec (medusa)
             if self.speculative_config and self.speculative_config.method == "medusa":
+                # Narrow like every other drafter branch in this file: only
+                # RBLNMedusaProposer.dummy_run takes no arguments, and without
+                # the assert the union resolves to the eagle proposer, whose
+                # dummy_run requires three.
+                assert isinstance(self.drafter, RBLNMedusaProposer)
                 self.drafter.dummy_run()
 
     def _process_kv_cache_copy_ops(
