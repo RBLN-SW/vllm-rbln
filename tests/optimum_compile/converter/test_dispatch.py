@@ -14,19 +14,21 @@
 
 from types import SimpleNamespace
 
+import torch
+
 from vllm_rbln.utils.optimum.converter.common import (
     USER_MAX_NUM_BATCHED_TOKENS_KEY,
 )
 from vllm_rbln.utils.optimum.converter.dispatch import _generate_model_path_name
 
 
-def _vllm_config(user_max_num_batched_tokens=None):
+def _vllm_config(user_max_num_batched_tokens=None, dtype=torch.bfloat16):
     additional_config = {}
     if user_max_num_batched_tokens is not None:
         additional_config[USER_MAX_NUM_BATCHED_TOKENS_KEY] = user_max_num_batched_tokens
     return SimpleNamespace(
         model_config=SimpleNamespace(
-            model="meta-llama/Llama-3.1-8B", max_model_len=8192
+            model="meta-llama/Llama-3.1-8B", max_model_len=8192, dtype=dtype
         ),
         scheduler_config=SimpleNamespace(max_num_seqs=4),
         cache_config=SimpleNamespace(block_size=8192, gpu_memory_utilization=0.9),
@@ -51,3 +53,8 @@ class TestGenerateModelPathName:
         assert _generate_model_path_name(
             _vllm_config(512)
         ) == _generate_model_path_name(_vllm_config(512))
+
+    def test_dtype_changes_hash(self):
+        name_bf16 = _generate_model_path_name(_vllm_config(dtype=torch.bfloat16))
+        name_fp32 = _generate_model_path_name(_vllm_config(dtype=torch.float32))
+        assert name_bf16 != name_fp32

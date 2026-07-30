@@ -223,6 +223,18 @@ class InnerAttentionStrategy(AttentionStrategy[InnerAttentionEntry, InnerR1, Inn
         )
 
 
+class LinearAttentionStrategy(InnerAttentionStrategy):
+    def preprocess(  # type: ignore[override]
+        self,
+        local_block_table_ids: list[int],
+        cache_positions: torch.Tensor,
+        request_nums: int,
+        decoder_batch_size: int,
+        **kwargs,
+    ) -> torch.Tensor:
+        return torch.tensor(local_block_table_ids)
+
+
 HybridR1 = tuple[list[int], list[int], list[torch.Tensor]]
 HybridR2 = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
 
@@ -259,7 +271,9 @@ class HybridAttentionImageStrategy(
         assert input_ids is not None
 
         if is_prompt:
-            attention_mask = (input_ids != self.pad_token_id).to(torch.int64).squeeze(0)
+            # Not an input of the compiled graph: optimum-rbln only uses this
+            # mask to drop padding from the prefill inputs.
+            attention_mask = (input_ids != self.pad_token_id).squeeze(0)
         else:
             get_extra_values_fn = lambda entry: (
                 entry.pad_len,

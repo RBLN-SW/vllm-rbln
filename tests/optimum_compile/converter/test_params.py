@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+from types import SimpleNamespace
+
 import pytest
 
 from vllm_rbln.utils.optimum.converter.params import (
@@ -302,3 +304,22 @@ class TestResolveNumDevices:
     def test_falls_back_to_top_level_when_submodule_lacks_num_devices(self):
         cfg = {"num_devices": 4, "language_model": {"batch_size": 2}}
         assert _resolve_num_devices(cfg) == 4
+
+
+class TestFromRblnConfigDtype:
+    def _vllm_config(self):
+        return SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"])
+            )
+        )
+
+    def test_reads_dtype(self):
+        cfg = {"batch_size": 4, "max_seq_len": 8192, "dtype": "bfloat16"}
+        params = RBLNParams.from_rbln_config(self._vllm_config(), cfg)
+        assert params.dtype == "bfloat16"
+
+    def test_none_when_absent(self):
+        cfg = {"batch_size": 4, "max_seq_len": 8192}
+        params = RBLNParams.from_rbln_config(self._vllm_config(), cfg)
+        assert params.dtype is None
