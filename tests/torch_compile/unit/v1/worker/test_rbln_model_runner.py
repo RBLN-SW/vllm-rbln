@@ -3149,7 +3149,7 @@ def test_determine_batch_padding_decode_uses_bucket(rbln_model_runner, monkeypat
     rbln_model_runner._is_prefill_step = True
     assert rbln_model_runner.is_prefill_phase() is True
 
-    num_reqs_padded, num_tokens_padded, num_tokens_across_dp = (
+    num_reqs_padded, num_tokens_padded, num_tokens_across_dp, _ = (
         rbln_model_runner._determine_batch_padding(
             num_reqs_unpadded=3,
             num_tokens_unpadded=8,
@@ -3165,7 +3165,7 @@ def test_determine_batch_padding_decode_uses_bucket(rbln_model_runner, monkeypat
     rbln_model_runner._is_prefill_step = False
     assert rbln_model_runner.is_prefill_phase() is False
 
-    num_reqs_padded, num_tokens_padded, num_tokens_across_dp = (
+    num_reqs_padded, num_tokens_padded, num_tokens_across_dp, _ = (
         rbln_model_runner._determine_batch_padding(
             num_reqs_unpadded=3,
             num_tokens_unpadded=3,
@@ -3206,6 +3206,7 @@ def test_determine_batch_padding_data_parallel_prefill_uses_max_num_tokens(
         dp_size,
         dp_rank,
         is_prefill,
+        is_idle=False,
     ):
         calls.append(
             {
@@ -3216,7 +3217,11 @@ def test_determine_batch_padding_data_parallel_prefill_uses_max_num_tokens(
                 "is_prefill": is_prefill,
             }
         )
-        return torch.tensor([64, 96], dtype=torch.int32), None
+        return (
+            torch.tensor([64, 96], dtype=torch.int32),
+            None,
+            torch.tensor([0, 0], dtype=torch.int32),  # no dummy ranks
+        )
 
     monkeypatch.setattr(
         rbln_model_runner_module.RBLNDPMetadata,
@@ -3230,7 +3235,7 @@ def test_determine_batch_padding_data_parallel_prefill_uses_max_num_tokens(
         FakeBucketingManager(fail_message="decode bucket must not be used for prefill"),
     )
 
-    num_reqs_padded, num_tokens_padded, num_tokens_across_dp = (
+    num_reqs_padded, num_tokens_padded, num_tokens_across_dp, _ = (
         rbln_model_runner._determine_batch_padding(
             num_reqs_unpadded=3,
             num_tokens_unpadded=64,
@@ -3293,6 +3298,7 @@ def test_determine_batch_padding_specialized_moe_decode_uses_decode_bucket(
         dp_size,
         dp_rank,
         is_prefill,
+        is_idle=False,
     ):
         calls.append(
             {
@@ -3305,8 +3311,10 @@ def test_determine_batch_padding_specialized_moe_decode_uses_decode_bucket(
         )
         # Simulate this rank having 3 requests with 4 query tokens each, while
         # another rank requires bucket selection for max request count == 5.
-        return torch.tensor([12, 20], dtype=torch.int32), torch.tensor(
-            [3, 5], dtype=torch.int32
+        return (
+            torch.tensor([12, 20], dtype=torch.int32),
+            torch.tensor([3, 5], dtype=torch.int32),
+            torch.tensor([0, 0], dtype=torch.int32),  # no dummy ranks
         )
 
     monkeypatch.setattr(
@@ -3322,7 +3330,7 @@ def test_determine_batch_padding_specialized_moe_decode_uses_decode_bucket(
         fake_bucketing_manager,
     )
 
-    num_reqs_padded, num_tokens_padded, num_tokens_across_dp = (
+    num_reqs_padded, num_tokens_padded, num_tokens_across_dp, _ = (
         rbln_model_runner._determine_batch_padding(
             num_reqs_unpadded=3,
             num_tokens_unpadded=12,
@@ -3394,6 +3402,7 @@ def test_determine_batch_padding_specialized_moe_qlen_asymmetric_top_bucket(
         dp_size,
         dp_rank,
         is_prefill,
+        is_idle=False,
     ):
         calls.append(
             {
@@ -3406,8 +3415,10 @@ def test_determine_batch_padding_specialized_moe_qlen_asymmetric_top_bucket(
         )
         # This rank: 3 requests x qlen 1 (== 3 tokens). A peer: 5 requests x
         # qlen 4 (spec, == 20 tokens). tokens_per_req = [1, 4] -> qlen-asymmetric.
-        return torch.tensor([3, 20], dtype=torch.int32), torch.tensor(
-            [3, 5], dtype=torch.int32
+        return (
+            torch.tensor([3, 20], dtype=torch.int32),
+            torch.tensor([3, 5], dtype=torch.int32),
+            torch.tensor([0, 0], dtype=torch.int32),  # no dummy ranks
         )
 
     monkeypatch.setattr(
@@ -3425,12 +3436,17 @@ def test_determine_batch_padding_specialized_moe_qlen_asymmetric_top_bucket(
         fake_bucketing_manager,
     )
 
-    num_reqs_padded, num_tokens_padded, num_tokens_across_dp = (
+    num_reqs_padded, num_tokens_padded, num_tokens_across_dp, eff_qlen = (
         rbln_model_runner._determine_batch_padding(
             num_reqs_unpadded=3,
             num_tokens_unpadded=3,
         )
     )
+
+    # Here the token count is a padding target, not request-count x length, so an
+    # idle rank adopts query length 1 (the smallest prepared graph) rather than
+    # the longer speculative length.
+    assert eff_qlen == 1
 
     assert calls == [
         {
@@ -3457,6 +3473,212 @@ def test_determine_batch_padding_specialized_moe_qlen_asymmetric_top_bucket(
     assert num_tokens_across_dp.dtype == torch.int32
     assert num_tokens_across_dp.device.type == "cpu"
     assert num_tokens_across_dp.tolist() == [3, 20]
+
+
+def test_determine_batch_padding_dummy_excluded_from_decision(
+    rbln_model_runner, monkeypatch
+):
+    """A DP-idle dummy rank is EXCLUDED from the cross-DP shape decision: a busy
+    peer running symmetric spec (qlen 4) still routes to its per-bucket decode
+    graph, not the top-bucket fall-back, even though this (dummy) rank presents
+    qlen 1. Without the exclusion the qlen-asymmetry (1 vs 4) would wrongly force
+    the top bucket."""
+    rbln_model_runner._is_prefill_step = False
+    assert rbln_model_runner.is_prefill_phase() is False
+
+    monkeypatch.setattr(rbln_model_runner.parallel_config, "data_parallel_size", 2)
+    monkeypatch.setattr(rbln_model_runner.parallel_config, "data_parallel_rank", 0)
+    monkeypatch.setattr(
+        rbln_model_runner, "specialized_moe_decode", True, raising=False
+    )
+
+    def fake_across_dp(
+        num_tokens, num_reqs, dp_size, dp_rank, is_prefill, is_idle=False
+    ):
+        # rank0 = this dummy rank (qlen 1), rank1 = busy spec peer (qlen 4).
+        return (
+            torch.tensor([1, 4], dtype=torch.int32),
+            torch.tensor([1, 1], dtype=torch.int32),
+            torch.tensor([1, 0], dtype=torch.int32),
+        )
+
+    monkeypatch.setattr(
+        rbln_model_runner_module.RBLNDPMetadata,
+        "num_tokens_and_reqs_across_dp",
+        staticmethod(fake_across_dp),
+    )
+    monkeypatch.setattr(
+        rbln_model_runner,
+        "bucketing_manager",
+        FakeBucketingManager(buckets={1: 4}, decode_batch_buckets=[4, 8]),
+    )
+
+    num_reqs_padded, num_tokens_padded, _, eff_qlen = (
+        rbln_model_runner._determine_batch_padding(
+            num_reqs_unpadded=1, num_tokens_unpadded=1, is_idle=True
+        )
+    )
+
+    # Decided from the non-dummy peer only (symmetric qlen 4) -> per-bucket
+    # find_decode_batch_bucket(1) == 4, NOT the top bucket (8).
+    assert num_reqs_padded == 4
+    assert num_tokens_padded == 16  # 4 (bucket) * 4 (peer qlen)
+    # The peers agree on query length, so the idle rank just follows them: no
+    # explicit query length is pinned (it is derived from the token count).
+    assert eff_qlen is None
+
+
+def test_determine_batch_padding_all_dummy_uses_minimal_bucket(
+    rbln_model_runner, monkeypatch
+):
+    """When every DP rank is a dummy (lockstep wind-down / re-sync) there is no
+    real work to size to -> fall back to the smallest compiled decode graph
+    (decode_batch_buckets[0], qlen 1)."""
+    rbln_model_runner._is_prefill_step = False
+    assert rbln_model_runner.is_prefill_phase() is False
+
+    monkeypatch.setattr(rbln_model_runner.parallel_config, "data_parallel_size", 2)
+    monkeypatch.setattr(rbln_model_runner.parallel_config, "data_parallel_rank", 0)
+    monkeypatch.setattr(
+        rbln_model_runner, "specialized_moe_decode", True, raising=False
+    )
+
+    def fake_across_dp(
+        num_tokens, num_reqs, dp_size, dp_rank, is_prefill, is_idle=False
+    ):
+        return (
+            torch.tensor([1, 1], dtype=torch.int32),
+            torch.tensor([1, 1], dtype=torch.int32),
+            torch.tensor([1, 1], dtype=torch.int32),  # all dummy
+        )
+
+    monkeypatch.setattr(
+        rbln_model_runner_module.RBLNDPMetadata,
+        "num_tokens_and_reqs_across_dp",
+        staticmethod(fake_across_dp),
+    )
+    monkeypatch.setattr(
+        rbln_model_runner,
+        "bucketing_manager",
+        FakeBucketingManager(buckets={1: 4}, decode_batch_buckets=[4, 8]),
+    )
+
+    num_reqs_padded, num_tokens_padded, _, eff_qlen = (
+        rbln_model_runner._determine_batch_padding(
+            num_reqs_unpadded=1, num_tokens_unpadded=1, is_idle=True
+        )
+    )
+
+    # decode_batch_buckets[0] == 4 (smallest), qlen 1.
+    assert num_reqs_padded == 4
+    assert num_tokens_padded == 4
+    # all-idle sets num_tokens_padded = num_reqs_padded (a padding target), so
+    # eff_qlen keeps the default 1 -> the idle rank runs the smallest decode
+    # graph (qlen 1). (Only the per-bucket route resets eff_qlen to None.)
+    assert eff_qlen == 1
+
+
+def test_determine_batch_padding_dummy_any_prefill_uses_qlen_1(
+    rbln_model_runner, monkeypatch
+):
+    """When a peer is reading a prompt, an idle rank cannot see any peer query
+    length, so it adopts query length 1 (eff_qlen == 1): it runs the smallest
+    prepared graph at the largest request count and lets the padding target ride
+    along on its own, instead of an oversized length from dividing the padding
+    target by the request count."""
+    rbln_model_runner._is_prefill_step = False
+    assert rbln_model_runner.is_prefill_phase() is False
+
+    monkeypatch.setattr(rbln_model_runner.parallel_config, "data_parallel_size", 2)
+    monkeypatch.setattr(rbln_model_runner.parallel_config, "data_parallel_rank", 0)
+    monkeypatch.setattr(
+        rbln_model_runner, "specialized_moe_decode", True, raising=False
+    )
+
+    def fake_across_dp(
+        num_tokens, num_reqs, dp_size, dp_rank, is_prefill, is_idle=False
+    ):
+        # rank0 = this idle rank; rank1 = a busy peer reading a prompt, which
+        # makes the shared request count come back as None.
+        return (
+            torch.tensor([1, 64], dtype=torch.int32),
+            None,
+            torch.tensor([1, 0], dtype=torch.int32),
+        )
+
+    monkeypatch.setattr(
+        rbln_model_runner_module.RBLNDPMetadata,
+        "num_tokens_and_reqs_across_dp",
+        staticmethod(fake_across_dp),
+    )
+    monkeypatch.setattr(
+        rbln_model_runner,
+        "bucketing_manager",
+        FakeBucketingManager(buckets={1: 4}, decode_batch_buckets=[4, 8]),
+    )
+
+    num_reqs_padded, num_tokens_padded, _, eff_qlen = (
+        rbln_model_runner._determine_batch_padding(
+            num_reqs_unpadded=1, num_tokens_unpadded=1, is_idle=True
+        )
+    )
+
+    # Largest request count, padded to the max token budget, query length 1.
+    assert num_reqs_padded == 8
+    assert num_tokens_padded == rbln_model_runner.max_num_tokens
+    assert eff_qlen == 1
+
+
+def test_determine_batch_padding_non_specialized_dp_idle_uses_qlen_1(
+    rbln_model_runner, monkeypatch
+):
+    """With specialized-MoE decode OFF (VLLM_RBLN_SPECIALIZE_MOE_DECODE=0) but
+    DP>1, the shape-decision block is skipped entirely, so num_tokens_padded
+    stays max_num_tokens (a padding target, NOT request-count x length). eff_qlen
+    must still default to 1 so an idle rank runs the minimal qlen=1 decode — not
+    max_num_tokens // num_reqs_padded, which would stage a never-warmed query
+    length and hot-path recompile on the idle rank."""
+    rbln_model_runner._is_prefill_step = False
+    assert rbln_model_runner.is_prefill_phase() is False
+
+    monkeypatch.setattr(rbln_model_runner.parallel_config, "data_parallel_size", 2)
+    monkeypatch.setattr(rbln_model_runner.parallel_config, "data_parallel_rank", 0)
+    monkeypatch.setattr(
+        rbln_model_runner, "specialized_moe_decode", False, raising=False
+    )
+
+    def fake_across_dp(
+        num_tokens, num_reqs, dp_size, dp_rank, is_prefill, is_idle=False
+    ):
+        # Values are irrelevant: the specialized block that reads them is skipped.
+        return (
+            torch.tensor([1, 1], dtype=torch.int32),
+            torch.tensor([1, 1], dtype=torch.int32),
+            torch.tensor([1, 0], dtype=torch.int32),
+        )
+
+    monkeypatch.setattr(
+        rbln_model_runner_module.RBLNDPMetadata,
+        "num_tokens_and_reqs_across_dp",
+        staticmethod(fake_across_dp),
+    )
+    monkeypatch.setattr(
+        rbln_model_runner,
+        "bucketing_manager",
+        FakeBucketingManager(buckets={1: 4}, decode_batch_buckets=[4, 8]),
+    )
+
+    num_reqs_padded, num_tokens_padded, _, eff_qlen = (
+        rbln_model_runner._determine_batch_padding(
+            num_reqs_unpadded=1, num_tokens_unpadded=1, is_idle=True
+        )
+    )
+
+    # num_tokens_padded is the untouched padding target (max_num_tokens), and
+    # eff_qlen stays 1 so the idle rank keeps qlen=1 (not max_num_tokens // 4).
+    assert num_reqs_padded == 4  # find_decode_batch_bucket(1)
+    assert num_tokens_padded == rbln_model_runner.max_num_tokens
+    assert eff_qlen == 1
 
 
 def test_may_reinitialize_input_batch_rebuilds_on_kernel_block_size_change(

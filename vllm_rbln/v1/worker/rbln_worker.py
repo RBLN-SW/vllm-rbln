@@ -589,9 +589,13 @@ class RBLNWorker(WorkerBase):
             self.profiler.stop()
 
     def execute_dummy_batch(self) -> None:
-        bucket_size = self.model_runner.bucketing_manager.find_decode_batch_bucket(1)
-        query_len = 1 + self.model_runner.num_spec_tokens
-        self.model_runner._dummy_run(bucket_size, query_len, is_prefill=False)
+        # Serving-time DP-idle step: this rank has no real work. Run a non-warmup
+        # dummy (warmup=False) so it contributes a minimal (num_reqs=1, qlen=1)
+        # entry to the cross-DP collective, is EXCLUDED from the shape decision,
+        # then adopts the busy-decided shape and runs the same compiled decode
+        # graph the busy ranks run -- so an idle rank never drags the collective
+        # into a fall-back route nor lands on an uncompiled shape.
+        self.model_runner._dummy_run(1, 1, is_prefill=False, warmup=False)
 
     # def add_lora(self, lora_request: LoRARequest) -> bool:
     #     return self.model_runner.add_lora(lora_request)
