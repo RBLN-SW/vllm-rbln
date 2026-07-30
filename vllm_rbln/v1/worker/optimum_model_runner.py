@@ -83,10 +83,7 @@ from vllm_rbln.model_executor.models.optimum.model_base import (
 )
 from vllm_rbln.utils.optimum.bucket import select_bucket_size
 from vllm_rbln.utils.optimum.predicates import is_qwen3_embedding, is_qwen3_reranker
-from vllm_rbln.utils.optimum.registry import (
-    get_rbln_model_info,
-    validate_arch_supported,
-)
+from vllm_rbln.utils.optimum.registry import get_rbln_model_info
 from vllm_rbln.v1.core.optimum_scheduler import RBLNSchedulerOutput
 from vllm_rbln.v1.sample import WARM_UP_CONFIGS, RBLNSampler
 from vllm_rbln.v1.worker.ec_disagg_helpers import ECDisaggHelpersMixin
@@ -120,11 +117,10 @@ class RBLNOptimumModelRunner(
     input_batch: RBLNInputBatch
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
-        # Validate before the remap below: it rewrites the architecture to
-        # whatever optimum-rbln compiles, and those names are internal to
-        # optimum-rbln, so checking afterwards would reject models upstream vLLM
-        # supports. The two calls cover the upstream and the RBLN registry.
-        validate_arch_supported(vllm_config.model_config)
+        # Raises if the architecture has no optimum-rbln counterpart. Must run
+        # before the remap below, which rewrites it to an optimum-rbln-internal
+        # name. vLLM has already rejected anything it cannot resolve itself, so
+        # this only has to cover the RBLN side.
         get_rbln_model_info(vllm_config.model_config)
 
         if is_qwen3_reranker(vllm_config.model_config):
