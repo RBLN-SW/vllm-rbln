@@ -335,7 +335,8 @@ class RBLNSampler(VLLMSampler):
                 raw_logprobs, num_logprobs, token_ids=sampled
             )
 
-        # Asking for both is not ambiguous: the explicit ids win, as upstream.
+        # If we have both num_logprobs and logprob_token_ids, prefer
+        # logprob_token_ids as it's more specific
         if logprob_token_ids_tensors is not None and num_logprobs is not None:
             logprobs_tensors = logprob_token_ids_tensors
 
