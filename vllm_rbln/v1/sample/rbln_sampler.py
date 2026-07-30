@@ -315,9 +315,6 @@ class RBLNSampler(VLLMSampler):
         # return int32 (while PyTorch argmax and topk return int64).
         sampled = sampled.long()
 
-        # Logprobs for an explicit set of token ids, used by the scoring APIs.
-        # Unlike the top-k window below, this finds the tokens whatever their
-        # rank, so a label token the model finds very unlikely is still returned.
         logprob_token_ids_tensors = None
         if sampling_metadata.logprob_token_ids:
             assert raw_logprobs is not None
