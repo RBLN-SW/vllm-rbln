@@ -109,6 +109,7 @@ from vllm_rbln.compilation import (
 from vllm_rbln.forward_context import RBLNDPMetadata, set_forward_context
 from vllm_rbln.logger import init_logger
 from vllm_rbln.platform import HAS_TORCH_RBLN, USE_DEVICE_TENSOR
+from vllm_rbln.utils import cat_last_dim
 from vllm_rbln.v1.attention.backends.flash_attention import (
     RBLNFlashAttentionMetadataBuilder,
 )
@@ -1731,8 +1732,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     target_positions = self.positions[:total_num_tokens]
                     if self.use_aux_hidden_state_outputs:
                         assert aux_hidden_states is not None
-                        target_hidden_states = torch.cat(
-                            [h.view(-1, h.shape[-1]) for h in aux_hidden_states], dim=-1
+                        target_hidden_states = cat_last_dim(
+                            [h.view(-1, h.shape[-1]) for h in aux_hidden_states]
                         )
 
             draft_token_ids = self.drafter.propose(

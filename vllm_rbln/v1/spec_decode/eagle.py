@@ -33,6 +33,10 @@ from vllm_rbln.compilation import (
 )
 from vllm_rbln.forward_context import RBLNDPMetadata, set_forward_context
 from vllm_rbln.logger import init_logger
+from vllm_rbln.patches.attention import (
+    reset_draft_unroll_index,
+    set_draft_unroll_index,
+)
 from vllm_rbln.platform import USE_DEVICE_TENSOR
 from vllm_rbln.utils import pad
 from vllm_rbln.v1.attention.kv_cache_bindings import (
@@ -40,9 +44,11 @@ from vllm_rbln.v1.attention.kv_cache_bindings import (
     build_kv_cache_forward_context_kwargs,
 )
 from vllm_rbln.v1.spec_decode.utils import (
+    DRAFT_ID_LOG_STEPS,
     FUSE_FIRST_FORWARD,
     NARROW_LOGITS,
     SKIP_DP_RENDEZVOUS,
+    UNROLL_DRAFTER,
     eagle_prepare_inputs_padded,
     eagle_prepare_next_token_padded,
 )
@@ -87,6 +93,32 @@ class RBLNEagleProposer(EagleProposer):
         self.runner = runner
         # Set in load_model when eagle3 + compilation are both on.
         self._compiled_combine = None
+        self._compiled_unrolled = None
+        self._draft_id_logged = 0
+
+    def _fold_combine(self) -> bool:
+        """Whether the aux-state projection runs inside the drafter's graph.
+
+        Both the decode and the prefill drafter graphs take a fixed-shape
+        `hidden_states`, so the projection can be folded into either without
+        adding a shape variant: decode pads to the batch bucket, prefill takes
+        the whole buffer. That leaves the projection's weight device-resident
+        instead of materialised on every eager call.
+        """
+        return FUSE_FIRST_FORWARD and self.method == "eagle3"
+
+    def _aux_width(self) -> int:
+        """Width the folded projection expects at its input.
+
+        `combine_hidden_states` takes `num_aux_hidden_states` states concatenated
+        on the last dim, so the drafter graphs see that width rather than
+        `hidden_size` once the projection is folded in. The warmup has to build
+        its dummy inputs at the same width, otherwise it compiles the narrow
+        shape and serving triggers a runtime recompile -- which surfaces as
+        `code=201 INIT_INTERNAL (Seed address mismatch)` rather than as anything
+        that names the shape.
+        """
+        return self.hidden_size * getattr(self.model.model, "num_aux_hidden_states", 3)
 
     def _draft_ids(self, out: torch.Tensor, num_reqs: int) -> torch.Tensor:
         """Token ids for this drafter step.
@@ -133,15 +165,7 @@ class RBLNEagleProposer(EagleProposer):
         # per step while the two loop iterations accounted for only 6.4 ms.
         # These scopes split the remainder. All are no-ops unless
         # VLLM_CUSTOM_SCOPES_FOR_PROFILING=1.
-        # Decode only. Prefill token counts are unbounded, which is why
-        # `_combine_hidden_states` keeps that path eager; folding it into the
-        # graph would mean one compile per prefill shape, and the padded
-        # first-pass tensor below assumes the decode `[B, L, H]` layout.
-        fold = (
-            FUSE_FIRST_FORWARD
-            and self.method == "eagle3"
-            and not self.runner.is_prefill
-        )
+        fold = self._fold_combine()
         if self.method == "eagle3":
             assert isinstance(
                 self.model, (Eagle3LlamaForCausalLM, Eagle3DeepseekV2ForCausalLM)
@@ -201,15 +225,28 @@ class RBLNEagleProposer(EagleProposer):
                 )
             )
             if fold:
-                # The projection now happens inside the graph, so hand it the
-                # wide aux states rather than the (narrow) drafter buffer.
-                # Same slice and pad as the non-folded path takes via
-                # `set_inputs_first_pass` + `_preprocess`.
+                # The projection happens inside the graph now, so hand it the
+                # wide aux states rather than the (narrow) drafter buffer. Both
+                # branches reproduce exactly what `_preprocess` would have
+                # produced from the buffer, at num_aux * target_hidden width.
                 w = target_hidden_states.shape[-1]
-                wide = target_hidden_states.reshape(-1, w)[:num_tokens].view(
-                    num_reqs, -1, w
-                )
-                hidden_states = pad(wide, 0, num_reqs_padded)
+                flat = target_hidden_states.reshape(-1, w)
+                if is_prefill:
+                    # `_preprocess` hands the whole buffer to the prefill graph
+                    # rather than a slice, which is what keeps that graph's shape
+                    # constant across chunk sizes. Pad to the same row count so
+                    # the folded projection inherits that property -- the
+                    # docstring on `_combine_hidden_states` calls prefill token
+                    # counts unbounded, but they are bounded by
+                    # max_num_batched_tokens and `pad` short-circuits on the full
+                    # chunks that dominate.
+                    hidden_states = pad(flat, 0, self.hidden_states.shape[0]).view(
+                        num_reqs, -1, w
+                    )
+                else:
+                    hidden_states = pad(
+                        flat[:num_tokens].view(num_reqs, -1, w), 0, num_reqs_padded
+                    )
         inputs_embeds = None
 
         with (
@@ -397,6 +434,13 @@ class RBLNEagleProposer(EagleProposer):
         with record_function_or_nullcontext("drafter: stack"):
             # [batch_size, num_speculative_tokens]
             draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
+        if DRAFT_ID_LOG_STEPS and self._draft_id_logged < DRAFT_ID_LOG_STEPS:
+            self._draft_id_logged += 1
+            logger.info(
+                "DRAFT_IDS step=%d %s",
+                self._draft_id_logged,
+                draft_token_ids.reshape(-1).tolist(),
+            )
         return draft_token_ids
 
     def set_inputs_first_pass(
@@ -423,7 +467,7 @@ class RBLNEagleProposer(EagleProposer):
 
         self._set_positions(num_tokens, target_positions)
 
-        if not (FUSE_FIRST_FORWARD and not self.runner.is_prefill):
+        if not self._fold_combine():
             self.hidden_states[:num_tokens] = target_hidden_states.view(
                 -1, self.hidden_size
             )[:num_tokens]
@@ -574,6 +618,41 @@ class RBLNEagleProposer(EagleProposer):
 
             return hidden_states, logits
 
+        def unrolled_wrapper(
+            input_ids: torch.Tensor,
+            positions: torch.Tensor,
+            hidden_states: torch.Tensor,
+            token_indices_to_sample: torch.Tensor | None = None,
+        ):
+            """The drafter's whole chain in one region.
+
+            The caller puts a list of per-iteration metadata dicts in the forward
+            context; `set_draft_unroll_index` below picks which one each unrolled
+            copy reads. The index is a Python int read during tracing, so it bakes
+            a constant per copy and nothing survives into the graph.
+
+            Iterations chain through graph values rather than through
+            `self.input_ids` / `positions` / `hidden_states`, so those buffers are
+            not written here. Nothing downstream reads them for this step -- the
+            next step's `set_inputs_first_pass` overwrites them.
+            """
+            reset_draft_unroll_index()
+            h, ids = model_wrapper(
+                input_ids, positions, hidden_states, token_indices_to_sample
+            )
+            flat = ids.reshape(-1)
+            out = [flat]
+            pos = positions.reshape(-1)[: flat.shape[0]]
+            for step in range(1, self.num_speculative_tokens):
+                set_draft_unroll_index(step)
+                pos = pos + 1
+                h, ids = model_wrapper(
+                    out[-1].reshape(-1, 1), pos.reshape(-1, 1), h
+                )
+                out.append(ids.reshape(-1))
+            reset_draft_unroll_index()
+            return torch.stack(out, dim=1)
+
         if (
             self.vllm_config.speculative_config.enforce_eager
             or not envs.VLLM_RBLN_COMPILE_MODEL
@@ -595,6 +674,18 @@ class RBLNEagleProposer(EagleProposer):
             # `model_wrapper` (propose() calls it before the drafter's own
             # inputs exist). See `_combine_hidden_states` for why it matters:
             # eager it is the largest non-forward item in the step.
+            if UNROLL_DRAFTER and self.method == "eagle3":
+                self._compiled_unrolled = compile(
+                    unrolled_wrapper,
+                    dynamic=False,
+                    fullgraph=True,
+                    compile_context=self.runner.compile_context,
+                    num_devices=envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
+                    model_trace_method="export" if USE_DEVICE_TENSOR else "",
+                    process_group_dict=build_process_group_dict(),
+                    guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
+                    mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
+                )
             if self.method == "eagle3":
                 self._compiled_combine = compile(
                     self.model.combine_hidden_states,
@@ -724,6 +815,16 @@ class RBLNEagleProposer(EagleProposer):
                 is_prefill,
             )
         )
+        if self._fold_combine():
+            # Compile the shape serving will actually hand in. `propose` replaces
+            # the narrow buffer view with the wide aux states when the projection
+            # is folded, so the warmup has to do the same or the first real step
+            # recompiles.
+            hidden_states = torch.zeros(
+                (*input_ids.shape, self._aux_width()),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
         inputs_embeds = None
 
         with set_forward_context(

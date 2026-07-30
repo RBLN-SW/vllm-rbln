@@ -42,6 +42,57 @@ SKIP_DP_RENDEZVOUS = os.getenv("VLLM_RBLN_EAGLE3_SKIP_DP_RENDEZVOUS", "0") == "1
 # costs 1.0-1.5 ms per graph, which is mostly launch rather than compute.
 FUSE_FIRST_FORWARD = os.getenv("VLLM_RBLN_EAGLE3_FUSE_FIRST_FORWARD", "0") == "1"
 
+# Run `eagle_prepare_next_token_padded` on the host instead of letting each of
+# its integer ops fall back there one at a time.
+#
+# The tensors are (batch, num_spec + 1) -- 1x4 at max_num_seqs 1 -- but the
+# eleven integer ops on them have no fp16 device path, so nine of them fall back
+# to the host implementation and each one is its own device round trip. Copying
+# the three inputs across once, doing the same arithmetic in the same order, and
+# copying the two results back is 2 transfers instead of 9 round trips. Measured
+# 0.55 ms/step in the `drafter/pre: next_token_ids` scope.
+HOST_NEXT_TOKEN = os.getenv("VLLM_RBLN_EAGLE3_HOST_NEXT_TOKEN", "0") == "1"
+
+# Log the drafter's proposed ids for the first N steps, so that a change claimed
+# to be an equivalence can be checked against a baseline run rather than against
+# acceptance statistics.
+#
+# Acceptance is a poor gate for this. A mis-indexed per-iteration input makes the
+# drafter attend with the wrong sequence length, which does not crash and does
+# not collapse acceptance -- it degrades it by a few percent, which is inside the
+# arm-to-arm spread. Diffing the ids themselves is exact: with temperature 0 and
+# the same cache state the sequence is deterministic, so any single differing id
+# means the transform is not an equivalence.
+DRAFT_ID_LOG_STEPS = int(os.getenv("VLLM_RBLN_EAGLE3_DRAFT_ID_LOG_STEPS", "0"))
+
+# Run the drafter's chain as one compiled graph instead of three.
+#
+# A decode step launches four graphs today: the target's verify forward, the
+# drafter's first pass (qlen num_spec+1, aux projection folded in), and the
+# drafter's loop forward twice (qlen 1). The three drafter graphs exist because
+# `dynamic=False` compiles per input shape and the iterations chain through
+# host-visible buffers with a metadata rebuild in between.
+#
+# Only `seq_lens` differs between iterations. `block_tables` is loop-invariant
+# because `num_lookahead_tokens = num_spec` pre-allocates the draft positions;
+# `attn_masks` is None under VLLM_RBLN_FLASH_CAUSAL_ATTN; the sliding-window
+# fields are None (the EAGLE3 head has no window); and the KV write derives its
+# slot from `seq_lens` inside the attention kernel, so there is no slot mapping to
+# thread through.
+#
+# The metadata reaches attention through the forward context rather than as an
+# argument, so the unroll hands `set_forward_context` a LIST of per-iteration
+# dicts and advances `patches.attention.set_draft_unroll_index` before each
+# in-graph call. Upstream already defines that list shape for speculative
+# decoding (it reads `[0]`), and the getter is one we own, so nothing in vLLM
+# changes.
+#
+# Verify with `equiv_check.sh`, never with acceptance: a mis-indexed `seq_lens`
+# makes iterations 2 and 3 attend without seeing the tokens iteration 1 wrote,
+# which neither crashes nor collapses acceptance -- it costs a few percent, which
+# is inside the arm-to-arm spread.
+UNROLL_DRAFTER = os.getenv("VLLM_RBLN_EAGLE3_UNROLL_DRAFTER", "0") == "1"
+
 
 
 def eagle_prepare_next_token_padded(
@@ -59,6 +110,16 @@ def eagle_prepare_next_token_padded(
     This is the "last accepted token" from the sampled tokens, or the backup token if no
     tokens were accepted or if the request is marked as discarded.
     """
+    if HOST_NEXT_TOKEN and sampled_token_ids.device.type != "cpu":
+        dev = sampled_token_ids.device
+        nti, vc = eagle_prepare_next_token_padded(
+            sampled_token_ids.cpu(),
+            discard_request_mask.cpu(),
+            backup_next_token_ids.cpu(),
+            vocab_size,
+        )
+        return nti.to(dev), vc.to(dev)
+
     _, num_tokens = sampled_token_ids.shape
 
     is_valid = (sampled_token_ids != -1) & (sampled_token_ids < vocab_size)

@@ -83,6 +83,31 @@ def _resolve_kv_cache(
     return attn_metadata.kv_caches[layer_index]
 
 
+# Which entry of a list-valued `forward_context.attn_metadata` the attention
+# getter should read. 0 keeps upstream's behaviour, where [0] is the base-model
+# metadata dict; the EAGLE3 drafter's unrolled graph advances it per iteration.
+#
+# A plain int rather than a tensor on purpose: it is read during tracing, so each
+# unrolled copy bakes its own constant index and no state survives into the
+# compiled graph. Reset by `reset_draft_unroll_index` at the start of every
+# unrolled call so a partial trace cannot leave it advanced.
+_DRAFT_UNROLL_INDEX = 0
+
+
+def draft_unroll_index() -> int:
+    return _DRAFT_UNROLL_INDEX
+
+
+def set_draft_unroll_index(i: int) -> None:
+    global _DRAFT_UNROLL_INDEX
+    _DRAFT_UNROLL_INDEX = i
+
+
+def reset_draft_unroll_index() -> None:
+    global _DRAFT_UNROLL_INDEX
+    _DRAFT_UNROLL_INDEX = 0
+
+
 @register_patch(
     target="vllm.model_executor.layers.attention.attention.get_attention_context",
     reason=(
@@ -130,7 +155,16 @@ def patched_get_attention_context(
     elif isinstance(attn_metadata_raw, list):
         # list[dict[str, AttentionMetadata]]: used in speculative decoding
         # where [0] is the base-model (non-speculative) metadata dict.
-        attn_metadata = attn_metadata_raw[0][layer_name]
+        #
+        # The EAGLE3 drafter's unrolled graph reuses this list to hand each
+        # unrolled iteration its own metadata. Only `seq_lens` differs between
+        # them -- `block_tables` is loop-invariant because `num_lookahead_tokens`
+        # pre-allocates the draft positions, the masks are None under
+        # VLLM_RBLN_FLASH_CAUSAL_ATTN, and the KV write derives its slot from
+        # `seq_lens` inside the kernel. `draft_unroll_index` is a plain Python int
+        # that the unroll body sets before each in-graph call, so tracing bakes a
+        # different constant into each copy rather than sharing one tensor.
+        attn_metadata = attn_metadata_raw[draft_unroll_index()][layer_name]
     else:
         attn_metadata = attn_metadata_raw
     attn_layer: Attention | MLAAttention = forward_context.no_compile_layers[layer_name]
