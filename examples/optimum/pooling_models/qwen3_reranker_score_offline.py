@@ -14,7 +14,7 @@
 
 """Score Qwen3-Reranker through the native `score()` API.
 
-`qwen3_reranker_offline.py` drives the same model as a generative LM and reads
+`qwen3_reranker_generate_offline.py` drives the same model as a generative LM and reads
 the "yes"/"no" logprobs back, which holds up only while both labels stay inside
 the requested top-k window. A confidently irrelevant document pushes "yes" out
 of it, and the score silently bottoms out at the fallback value.

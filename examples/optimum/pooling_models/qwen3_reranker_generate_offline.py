@@ -93,7 +93,7 @@ def main(
     sampling_params = SamplingParams(
         temperature=0,
         max_tokens=1,
-        logprobs=20,
+        logprob_token_ids=[true_token, false_token],
         allowed_token_ids=[true_token, false_token],
     )
 
