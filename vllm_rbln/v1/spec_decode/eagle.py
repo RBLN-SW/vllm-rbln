@@ -260,7 +260,7 @@ class RBLNEagleProposer(EagleProposer):
             )
 
         if token_indices_to_sample is None:
-            token_indices_to_sample = cad.query_start_loc[1:] - 1
+            token_indices_to_sample = (cad.query_start_loc[1:] - 1).to(self.device)
 
         num_tokens = target_token_ids.shape[0]
         self.input_ids[: num_tokens - 1] = target_token_ids[1:]
