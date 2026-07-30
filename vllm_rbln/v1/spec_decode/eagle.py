@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -48,6 +49,25 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# Pick the drafter's token inside the compiled graph instead of on the host.
+#
+# `torch.ops.rbln.argmax` lowers to contrib_top_k_top_p_sample(k=1, p=0) and runs
+# on the device, but only when it is traced into a compiled region -- calling it
+# eagerly lands on the host implementation. The target sampler already does it
+# this way, via compile_sampler(rbln_greedy_sample).
+#
+# Measured on Qwen3-1.7B + AngelSlim/Qwen3-1.7B_eagle3, DP4, num_spec 3, paired
+# A/B over two server instances, no profiler attached:
+#
+#   concurrency 1   22.72 -> 18.93 ms/step   (-3.79, -16.7%)   TPOT 11.57 -> 9.64
+#   concurrency 4   24.61 -> 21.51 ms/step   (-3.10, -12.6%)
+#   concurrency 8   41.04 -> 36.68 ms/step   (-4.36, -10.6%)
+#
+# Acceptance (0.3212 / 0.3432) and tokens-per-step (1.9635 / 2.0297) are
+# bit-identical between arms, as they must be: this only moves where the
+# reduction runs.
+_DEVICE_ARGMAX = os.getenv("VLLM_RBLN_DRAFT_DEVICE_ARGMAX", "1") == "1"
+
 
 class RBLNEagleProposer(EagleProposer):
     def __init__(
@@ -64,6 +84,17 @@ class RBLNEagleProposer(EagleProposer):
         self.runner = runner
         # Set in load_model when eagle3 + compilation are both on.
         self._compiled_combine = None
+
+    def _draft_ids(self, out: torch.Tensor, num_reqs: int) -> torch.Tensor:
+        """Token ids for this drafter step.
+
+        With the device path on, `model_wrapper` already reduced inside the
+        graph, so `out` is the ids. Off, `out` is the logits and the reduction
+        happens here, on the host.
+        """
+        if _DEVICE_ARGMAX:
+            return out[:num_reqs]
+        return out[:num_reqs].argmax(dim=-1)
 
     def propose(
         self,
@@ -161,7 +192,7 @@ class RBLNEagleProposer(EagleProposer):
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1:
-            draft_tokens_ids = logits[:num_reqs].argmax(dim=-1)
+            draft_tokens_ids = self._draft_ids(logits, num_reqs)
             return draft_tokens_ids.view(-1, 1)
 
         # Gathers plus the first argmax. Grouped so the `draft` remainder can be
@@ -183,7 +214,7 @@ class RBLNEagleProposer(EagleProposer):
         # raises "index out of bounds for dimension 0 with size 1" on the first
         # decode.
 
-        draft_token_ids = logits[:num_reqs].argmax(dim=-1)
+        draft_token_ids = self._draft_ids(logits, num_reqs)
 
         if self.allowed_attn_types is not None and not isinstance(
             attn_metadata, self.allowed_attn_types
@@ -313,7 +344,7 @@ class RBLNEagleProposer(EagleProposer):
                     inputs_embeds=inputs_embeds,
                     token_indices_to_sample=None,
                 )
-            draft_token_ids = logits[:num_reqs].argmax(dim=-1)
+            draft_token_ids = self._draft_ids(logits, num_reqs)
             draft_token_ids_list.append(draft_token_ids)
 
         # [batch_size, num_speculative_tokens]
@@ -463,6 +494,10 @@ class RBLNEagleProposer(EagleProposer):
                 sample_hidden_states = sample_hidden_states[token_indices_to_sample]
 
             logits = self.model.compute_logits(sample_hidden_states)
+
+            if _DEVICE_ARGMAX:
+                # Traced into this region, so the reduction is a device op.
+                return hidden_states, torch.ops.rbln.argmax(logits)
 
             return hidden_states, logits
 
