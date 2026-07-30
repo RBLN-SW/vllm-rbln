@@ -1598,22 +1598,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         if not self.num_spec_tokens or not req_ids:
             return None
         if self._draft_token_ids is None:
-            # No drafter ran this step. `execute_model` starts every step with
-            # `_draft_token_ids = None` and only fills it when the input fits:
-            #
-            #     max_seq_len + num_spec <= effective_drafter_max_model_len
-            #
-            # A sequence that reaches the end of the context window breaks that
-            # condition and the drafter is skipped for the step. Wrapping the
-            # None in a DraftTokenIds gets past the core guard --
-            # `if draft_token_ids is not None` only checks the wrapper -- and
-            # kills the engine inside update_draft_token_ids:
-            #
-            #     TypeError: 'NoneType' object is not iterable
-            #
-            # Return per-request empty lists so the step's drafts are cleared
-            # explicitly. Returning None skips the update instead, leaving the
-            # previous step's drafts to be verified at the wrong position.
+            # No drafter ran this step -- `execute_model` skips it when
+            # `max_seq_len + num_spec > effective_drafter_max_model_len`.
+            # Wrapping the None gets past the core's `is not None` guard and
+            # kills the engine with "'NoneType' object is not iterable"; empty
+            # lists clear this step's drafts explicitly, whereas returning None
+            # would leave the previous step's drafts to be verified at the
+            # wrong position.
             return DraftTokenIds(req_ids, [[] for _ in req_ids])
         draft_token_ids = (
             self._draft_token_ids.tolist()
@@ -1682,12 +1673,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             assert isinstance(sampled_token_ids, torch.Tensor)
 
             # The "draft" phase covers more than propose(): these two helpers
-            # run first and were unmeasured. After compiling the aux projection
-            # the phase is 25.1 ms/step, of which the scopes inside propose()
-            # account for 15.6 -- the 9.5 ms remainder is here and in the
-            # post-forward block. prepare_next_token_ids_padded in particular
-            # holds nine of the eleven integer ops that fall back to the host
-            # (`why: dtype-not-fp16`), each one a device round-trip.
+            # run first. prepare_next_token_ids_padded holds nine of the eleven
+            # integer ops that fall back to the host (`why: dtype-not-fp16`),
+            # each one a device round-trip.
             with record_function_or_nullcontext("drafter/pre: next_token_ids"):
                 next_token_ids, valid_sampled_tokens_count = (
                     self.drafter.prepare_next_token_ids_padded(
