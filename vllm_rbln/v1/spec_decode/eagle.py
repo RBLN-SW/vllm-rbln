@@ -82,9 +82,25 @@ class RBLNEagleProposer(EagleProposer):
 
         `_seq_lens_cpu` is upstream-private; `propose()` reaches it only through
         here.
+
+        On this backend the two usually ALIAS. `rbln_model_runner` builds the
+        metadata as
+
+            seq_lens=self.seq_lens[:num_reqs],
+            _seq_lens_cpu=self.seq_lens[:num_reqs],
+
+        i.e. two slices of one CPU tensor, so the op on `seq_lens` has already
+        updated the shadow and mirroring it again applies the delta twice --
+        rejected tokens subtracted twice, each draft iteration advancing by 2.
+        `_build_dummy_attn_metadata` in this file does NOT alias (`.to(device)`
+        copies), so the check is made at run time rather than assumed either
+        way.
         """
         shadow = cad._seq_lens_cpu
         if shadow is None:
+            return
+        seq_lens = cad.seq_lens
+        if shadow.data_ptr() == seq_lens.data_ptr() and shadow.shape == seq_lens.shape:
             return
         if isinstance(delta, torch.Tensor):
             delta = delta.to(shadow.device, shadow.dtype)
@@ -540,6 +556,41 @@ class RBLNEagleProposer(EagleProposer):
         )
 
     @torch.inference_mode()
+    def _warmup_combine(self, num_reqs_padded: int, is_prefill: bool) -> None:
+        """Materialise the aux-projection graph for this decode bucket.
+
+        `dummy_run` walks every decode bucket at startup, but it does not go
+        through `_combine_hidden_states`, so without this the graph compiles on
+        the first REAL request of each bucket and that request pays for it.
+
+        Calls the compiled callable directly rather than `_combine_hidden_states`:
+        that method sizes the bucket from `self.runner.input_batch.num_reqs`,
+        which is not meaningful during warm-up.
+
+        Best effort -- warm-up must not be able to break start-up, and the only
+        cost of failing here is the lazy compile we were trying to avoid.
+        """
+        if is_prefill or self._compiled_combine is None:
+            return
+        inner = getattr(self.model, "model", None)
+        fc_in = getattr(inner, "fc_input_size", None)
+        if fc_in is None or not getattr(inner, "use_aux_hidden_state", False):
+            return
+        padded = num_reqs_padded * (1 + self.num_speculative_tokens)
+        fc = getattr(inner, "fc", None)
+        dtype = getattr(getattr(fc, "weight", None), "dtype", self.hidden_states.dtype)
+        try:
+            self._compiled_combine(
+                torch.zeros((padded, fc_in), dtype=dtype, device=self.device)
+            )
+        except Exception:
+            logger.warning(
+                "EAGLE3 aux-projection warm-up failed for bucket %d; it will "
+                "compile on the first request of this shape",
+                num_reqs_padded,
+                exc_info=True,
+            )
+
     def dummy_run(
         self,
         num_reqs: int,
@@ -559,6 +610,8 @@ class RBLNEagleProposer(EagleProposer):
             self._determine_draft_batch_padding(num_reqs, num_tokens, is_prefill)
         )
         num_padded_tokens = override_padded or dp_padded
+
+        self._warmup_combine(num_reqs_padded, is_prefill)
 
         per_layer_attn_metadata: dict[str, object] = {}
         for attn_group in self.draft_attn_groups:
