@@ -18,6 +18,7 @@ from vllm_rbln.logger import init_logger
 from vllm_rbln.patches import register_patch
 from vllm_rbln.patches.attention import _resolve_kv_cache
 from vllm_rbln.patches.models_utils import (
+    dsa_indexer_cache_is_fp8,
     rbln_extract_layer_index,
     rbln_num_attn_module,
 )
@@ -44,8 +45,9 @@ def rbln_indexer_cache_init(self, *args, **kwargs) -> None:
 
     vllm_config = get_current_vllm_config()
     self.head_dim = vllm_config.model_config.hf_text_config.index_head_dim
-    cache_dtype = vllm_config.cache_config.cache_dtype
-    self.is_fp8_cache = bool(cache_dtype) and cache_dtype.startswith("fp8")
+    # NOT keyed off cache_config.cache_dtype: --kv-cache-dtype fp8 applies to the
+    # MLA latent cache only. See dsa_indexer_cache_is_fp8().
+    self.is_fp8_cache = dsa_indexer_cache_is_fp8()
     self.dtype = torch.float8_e4m3fn if self.is_fp8_cache else torch.bfloat16
 
     model_config = vllm_config.model_config

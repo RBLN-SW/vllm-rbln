@@ -65,14 +65,20 @@ def rbln_extract_layer_index(layer_name: str, num_attn_module: int = 1) -> int:
     return base * num_attn_module + sub
 
 
-def _dsa_indexer_cache_is_fp8() -> bool:
-    from vllm.config import get_current_vllm_config
+def dsa_indexer_cache_is_fp8() -> bool:
+    """Whether the DSA lightning-indexer keeps its key cache in fp8.
 
-    try:
-        cache_dtype = get_current_vllm_config().cache_config.cache_dtype
-    except Exception:
-        return False
-    return bool(cache_dtype) and cache_dtype.startswith("fp8")
+    Deliberately NOT derived from ``--kv-cache-dtype``: under ``fp8`` only the
+    MLA latent cache goes fp8. The indexer stays bf16 with no companion scale
+    cache, which is also how the compiler picks the kv16 indexer kernel (it
+    keys off the scale operand being absent).
+
+    The fp8 indexer kernel hands the matmul an fp8 weight plus a separate scale
+    tensor, which needs a ``scale`` operand on
+    ``rtosa.in_memory_dynamic_matmul`` that does not exist yet. Restore the
+    ``cache_dtype.startswith("fp8")`` check once that op-enable lands.
+    """
+    return False
 
 
 def rbln_num_attn_module(model_config) -> int:
@@ -84,7 +90,7 @@ def rbln_num_attn_module(model_config) -> int:
     # DeepSeek-V3.2 (``index_topk`` in the text config): each decoder layer has
     # MLA + the lightning-indexer key cache, sclae (3 modules).
     if hasattr(text_config, "index_topk") or hasattr(hf_config, "index_topk"):
-        return 3 if _dsa_indexer_cache_is_fp8() else 2
+        return 3 if dsa_indexer_cache_is_fp8() else 2
     return 1
 
 
