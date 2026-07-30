@@ -40,7 +40,9 @@ from vllm_rbln.v1.attention.kv_cache_bindings import (
     build_kv_cache_forward_context_kwargs,
 )
 from vllm_rbln.v1.spec_decode.utils import (
+    FUSE_FIRST_FORWARD,
     NARROW_LOGITS,
+    SKIP_DP_RENDEZVOUS,
     eagle_prepare_inputs_padded,
     eagle_prepare_next_token_padded,
 )
@@ -104,7 +106,11 @@ class RBLNEagleProposer(EagleProposer):
         other gathers here -- equivalent for a 1-D row selection, but only
         `index_select` takes the backend's native path.
         """
-        ids = out[:num_reqs] if _DEVICE_ARGMAX else out[:num_reqs].argmax(dim=-1)
+        if _DEVICE_ARGMAX:
+            # `model_wrapper` already reduced and, under NARROW_LOGITS, already
+            # mapped draft->target inside the region. Nothing left to do here.
+            return out[:num_reqs]
+        ids = out[:num_reqs].argmax(dim=-1)
         if NARROW_LOGITS:
             ids = self.model.target_ids.index_select(0, ids)
         return ids
@@ -127,13 +133,25 @@ class RBLNEagleProposer(EagleProposer):
         # per step while the two loop iterations accounted for only 6.4 ms.
         # These scopes split the remainder. All are no-ops unless
         # VLLM_CUSTOM_SCOPES_FOR_PROFILING=1.
+        # Decode only. Prefill token counts are unbounded, which is why
+        # `_combine_hidden_states` keeps that path eager; folding it into the
+        # graph would mean one compile per prefill shape, and the padded
+        # first-pass tensor below assumes the decode `[B, L, H]` layout.
+        fold = (
+            FUSE_FIRST_FORWARD
+            and self.method == "eagle3"
+            and not self.runner.is_prefill
+        )
         if self.method == "eagle3":
             assert isinstance(
                 self.model, (Eagle3LlamaForCausalLM, Eagle3DeepseekV2ForCausalLM)
             )
-            with record_function_or_nullcontext("drafter/first: combine"):
-                target_hidden_states = self._combine_hidden_states(target_hidden_states)
-            assert target_hidden_states.shape[-1] == self.hidden_size
+            if not fold:
+                with record_function_or_nullcontext("drafter/first: combine"):
+                    target_hidden_states = self._combine_hidden_states(
+                        target_hidden_states
+                    )
+                assert target_hidden_states.shape[-1] == self.hidden_size
 
         with record_function_or_nullcontext("drafter/first: set_inputs"):
             num_tokens, token_indices_to_sample = self.set_inputs_first_pass(
@@ -182,6 +200,16 @@ class RBLNEagleProposer(EagleProposer):
                     is_prefill,
                 )
             )
+            if fold:
+                # The projection now happens inside the graph, so hand it the
+                # wide aux states rather than the (narrow) drafter buffer.
+                # Same slice and pad as the non-folded path takes via
+                # `set_inputs_first_pass` + `_preprocess`.
+                w = target_hidden_states.shape[-1]
+                wide = target_hidden_states.reshape(-1, w)[:num_tokens].view(
+                    num_reqs, -1, w
+                )
+                hidden_states = pad(wide, 0, num_reqs_padded)
         inputs_embeds = None
 
         with (
@@ -395,9 +423,14 @@ class RBLNEagleProposer(EagleProposer):
 
         self._set_positions(num_tokens, target_positions)
 
-        self.hidden_states[:num_tokens] = target_hidden_states.view(
-            -1, self.hidden_size
-        )[:num_tokens]
+        if not (FUSE_FIRST_FORWARD and not self.runner.is_prefill):
+            self.hidden_states[:num_tokens] = target_hidden_states.view(
+                -1, self.hidden_size
+            )[:num_tokens]
+        # With FUSE_FIRST_FORWARD the aux states are still at
+        # num_aux * target_hidden width, so they do not fit this buffer and the
+        # caller pads the tensor it already holds instead. Nothing is dropped:
+        # `propose` overrides the hidden_states that `_preprocess` returns.
 
         return num_tokens, token_indices_to_sample
 
@@ -486,6 +519,7 @@ class RBLNEagleProposer(EagleProposer):
 
     def load_model(self, target_model: nn.Module) -> None:
         super().load_model(target_model)
+        self._probe_dp_rendezvous_need()
 
         def model_wrapper(
             input_ids: torch.Tensor,
@@ -494,6 +528,13 @@ class RBLNEagleProposer(EagleProposer):
             token_indices_to_sample: torch.Tensor | None = None,
             inputs_embeds: torch.Tensor | None = None,
         ):
+            if FUSE_FIRST_FORWARD and hidden_states.shape[-1] != self.hidden_size:
+                # Region 3/0 folded in: `hidden_states` arrived at
+                # num_aux * target_hidden width, so project it here instead of in
+                # its own compiled graph. Loop iterations feed the drafter's own
+                # output, which is already hidden_size wide, so the width check
+                # picks the first pass without a second graph variant.
+                hidden_states = self.model.combine_hidden_states(hidden_states)
             ret_hidden_states = self.model(
                 input_ids=input_ids,
                 positions=positions,
@@ -517,7 +558,19 @@ class RBLNEagleProposer(EagleProposer):
 
             if _DEVICE_ARGMAX:
                 # Traced into this region, so the reduction is a device op.
-                return hidden_states, torch.ops.rbln.argmax(logits)
+                ids = torch.ops.rbln.argmax(logits)
+                if NARROW_LOGITS:
+                    # The draft->target map has to be inside the region too.
+                    # Left on the host it both costs a gather and forces the
+                    # result back to `target_ids`' int64, which would undo the
+                    # int32 cast below and put the `.int()` in `loop_update`
+                    # back on the critical path.
+                    ids = self.model.target_ids.index_select(0, ids.reshape(-1))
+                # int32 here rather than on the host: the op yields i64 and the
+                # caller needs i32 for the compiled drafter's input_ids, so the
+                # cast belongs inside the region. `.int()` in `loop_update` then
+                # becomes a no-op instead of a device round trip.
+                return hidden_states, ids.to(torch.int32)
 
             return hidden_states, logits
 
@@ -783,6 +836,65 @@ class RBLNEagleProposer(EagleProposer):
             token_indices_to_sample_padded,
         )
 
+    # Conservative defaults: an instance that never ran the probe keeps the
+    # collective.
+    _draft_has_moe: bool = True
+    _single_decode_bucket: bool = False
+
+    def _probe_dp_rendezvous_need(self) -> None:
+        """Decide whether the drafter's DP shape rendezvous can be skipped.
+
+        The drafter calls `num_tokens_and_reqs_across_dp` twice per step. Each
+        call is a CPU all_reduce that every DP rank must reach before any can
+        proceed, so its cost is rank skew rather than collective bandwidth.
+        Measured on MiniMax-M2.5 with DP4+EP, `max_num_seqs 1`: 1.5 ms/step on
+        decode-only steps, 13.8 ms/step on steps where this rank prefills.
+
+        Three values come out of the collective:
+
+          num_tokens_across_dp, num_padded_tokens
+              Reach the compiled model only through the forward context's
+              `RBLNDPMetadata`, which is read exclusively by
+              `model_executor/layers/fused_moe`. A draft model with no
+              `RBLNFusedMoE` module cannot observe either value.
+          num_reqs_padded
+              Real: it sets the attention metadata's `batch_pad` and the input
+              padding width. But on a prefill step it is fixed to `num_reqs`
+              before the collective runs, and on a decode step it is
+              `find_decode_batch_bucket(max num_reqs across ranks)`, which is
+              constant when only one decode bucket exists.
+
+        So the skip is sound exactly when the draft model carries no MoE layer
+        and either this is a prefill step or there is a single decode bucket.
+        Both are verified here rather than assumed -- a draft model that does
+        carry MoE layers keeps the collective, and so does a configuration with
+        more than one decode bucket.
+        """
+        from vllm_rbln.model_executor.layers.fused_moe.layer import RBLNFusedMoE
+
+        moe_layers = [
+            name
+            for name, mod in self.model.named_modules()
+            if isinstance(mod, RBLNFusedMoE)
+        ]
+        self._draft_has_moe = bool(moe_layers)
+        buckets = self.runner.bucketing_manager.decode_batch_buckets
+        self._single_decode_bucket = len(buckets) == 1
+        logger.info(
+            "EAGLE3 drafter DP rendezvous: requested=%s draft_moe_layers=%d "
+            "decode_buckets=%s -> skip on decode=%s, on prefill=%s",
+            SKIP_DP_RENDEZVOUS,
+            len(moe_layers),
+            buckets,
+            self._skip_dp_rendezvous(False),
+            self._skip_dp_rendezvous(True),
+        )
+
+    def _skip_dp_rendezvous(self, is_prefill: bool) -> bool:
+        if not SKIP_DP_RENDEZVOUS or self._draft_has_moe:
+            return False
+        return is_prefill or self._single_decode_bucket
+
     def _determine_draft_batch_padding(
         self,
         num_reqs: int,
@@ -797,6 +909,14 @@ class RBLNEagleProposer(EagleProposer):
         dp_size = self.vllm_config.parallel_config.data_parallel_size
         if dp_size == 1:
             return num_reqs_padded, None, None
+
+        if self._skip_dp_rendezvous(is_prefill):
+            # Same values, no collective. See `_probe_dp_rendezvous_need`.
+            return (
+                num_reqs_padded,
+                self.max_num_tokens,
+                torch.full((dp_size,), num_tokens, dtype=torch.int32),
+            )
 
         num_tokens_across_dp, num_reqs_across_dp = (
             RBLNDPMetadata.num_tokens_and_reqs_across_dp(

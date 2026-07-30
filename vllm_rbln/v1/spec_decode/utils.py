@@ -16,10 +16,32 @@ import os
 
 import torch
 
-# 드래프터 로짓을 draft 어휘(32k) 폭으로 두고, 승자 하나만 target id 로 옮긴다.
-# 끄면 upstream 대로 매 호출 target 어휘(200k) 폭 텐서를 만들고 scatter 한다.
-# patches/llama_eagle3.py(생성 쪽)와 v1/spec_decode/eagle.py(소비 쪽)가 함께 읽는다.
+# Leave the drafter's logits at draft-vocabulary width (32k) and map only the
+# winning id back to the target vocabulary. With this off, every call builds a
+# target-vocabulary (200k) tensor and scatters into it, as upstream does.
+# Read by both the producer (patches/llama_eagle3.py) and the consumer
+# (v1/spec_decode/eagle.py); they must agree.
 NARROW_LOGITS = os.getenv("VLLM_RBLN_EAGLE3_NARROW_LOGITS", "0") == "1"
+
+# Skip the drafter's DP shape rendezvous when its result provably cannot change
+# the drafter's execution. See `EagleProposer._probe_dp_rendezvous_need` for the
+# argument and for the two preconditions that are checked at load time.
+SKIP_DP_RENDEZVOUS = os.getenv("VLLM_RBLN_EAGLE3_SKIP_DP_RENDEZVOUS", "0") == "1"
+
+# Fold the aux-state projection into the first drafter forward, and keep the
+# drafter's chosen id at int32 inside the compiled region.
+#
+# Both are named as "not included, still unverified end to end" in
+# 3dd29cc3 (perf/eagle3-device-argmax-and-pad): "an int32 device path that
+# avoids the converter's trailing i64 cast, and folding the aux-state
+# projection into the first drafter forward. Both look right on the dumped
+# MLIR but the paired step-time numbers are not in yet."
+#
+# The projection is its own compiled graph today (region 3/0, 1.17 ms/step
+# measured), so folding it removes one graph launch. A 1-layer 212M drafter
+# costs 1.0-1.5 ms per graph, which is mostly launch rather than compute.
+FUSE_FIRST_FORWARD = os.getenv("VLLM_RBLN_EAGLE3_FUSE_FIRST_FORWARD", "0") == "1"
+
 
 
 def eagle_prepare_next_token_padded(

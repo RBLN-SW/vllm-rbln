@@ -167,12 +167,15 @@ def patched_eagle3_llama_compute_logits(
         return logits
 
     if NARROW_LOGITS:
-        # 확장하지 않는다. 드래프터는 자기 어휘에서 argmax 만 하면 되고, 그 하나를
-        # target id 로 옮기는 일은 호출부(eagle.py)가 `target_ids` 로 한다.
+        # Leave the logits at draft-vocabulary width. The drafter only needs an
+        # argmax over its own vocabulary; mapping that single winner to a target
+        # id is done by the caller (eagle.py) through `target_ids`.
         #
-        # 확장이 비싼 이유: 매 호출 (batch, 200064) 텐서를 -inf 로 채우고 (batch, 32000)
-        # 을 scatter 하는데, 이 scatter 가 호스트 op 다. 뒤이은 argmax 도 200064 폭을
-        # 훑는다. 실제로 필요한 정보는 32000 폭 안에 전부 있다.
+        # The expansion below is expensive because every call fills a
+        # (batch, 200064) tensor with -inf and scatters (batch, 32000) into it,
+        # and that scatter is a host op. The following argmax then sweeps the
+        # full 200064 width. All the information needed is already inside the
+        # 32000-wide slice.
         return logits
 
     # NOTE(RBLN): upstream computes the index here as
