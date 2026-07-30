@@ -287,8 +287,6 @@ class RBLNSampler(VLLMSampler):
         # is used for sampling (after penalties and temperature scaling).
         num_logprobs = sampling_metadata.max_num_logprobs
         raw_logprobs: torch.Tensor | None = None
-        # `logprob_token_ids` asks for specific tokens regardless of rank, so it
-        # needs the raw logprobs even when no top-k window was requested.
         if num_logprobs is not None or sampling_metadata.logprob_token_ids:
             if logprobs_mode == "raw_logprobs":
                 raw_logprobs = self.compute_logprobs(logits)
