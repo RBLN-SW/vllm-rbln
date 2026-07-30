@@ -132,7 +132,7 @@ jobs:
 
       - name : Run Qwen3-reranker (V1)
         run: >
-          uv run --no-sync python3 examples/optimum/pooling_models/qwen3_reranker_generate_offline.py
+          uv run --no-sync python3 examples/optimum/pooling_models/qwen3_reranker_offline.py
           --max_seq_len 32768
           --num_input_prompt $((2 * ${{ env.NUM_INPUT_PROMPT }}))
           --model ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/qwen3-reranker-0_6b-40k_kv4k_batch2
