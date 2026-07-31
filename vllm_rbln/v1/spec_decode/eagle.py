@@ -620,7 +620,11 @@ class RBLNEagleProposer(EagleProposer):
         if dp_size == 1:
             return num_reqs_padded, None, None
 
-        num_tokens_across_dp, num_reqs_across_dp = (
+        # NOTE(RBLN): the DP-idle-dummy exclusion implemented in the main runner's
+        # _determine_batch_padding is not yet mirrored on the draft-model side, so
+        # the 3rd return (per-rank idle mask) is ignored here. Follow-up for
+        # full DP-idle-dummy correctness under EAGLE speculative decode.
+        num_tokens_across_dp, num_reqs_across_dp, _ = (
             RBLNDPMetadata.num_tokens_and_reqs_across_dp(
                 num_tokens, num_reqs, dp_size, self.dp_rank, is_prefill
             )

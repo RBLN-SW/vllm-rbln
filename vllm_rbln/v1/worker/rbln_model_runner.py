@@ -1445,7 +1445,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 num_scheduled_tokens_np,
             )
 
-            num_reqs_padded, num_tokens_padded, num_tokens_across_dp = (
+            num_reqs_padded, num_tokens_padded, num_tokens_across_dp, _ = (
                 self._determine_batch_padding(num_reqs, num_query_tokens)
             )
 
@@ -2058,6 +2058,27 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         except IndexError:
             return {}
 
+    def _stage_dummy_seq_lens(
+        self, num_reqs: int, num_tokens_per_req: int, is_prefill: bool
+    ) -> tuple[np.ndarray, int]:
+        """Set seq_lens / num_tokens_no_spec for a dummy batch of this shape and
+        return (num_scheduled_tokens, num_tokens_unpadded). Shared by the initial
+        prep and the DP-idle adopt path so both size the dummy identically.
+
+        num_tokens_no_spec is the per-request no-spec logical length consumed
+        downstream (query backfill, spec metadata); for decode it stays 1 so a
+        multi-token speculative-decode query is still sized as decode.
+        """
+        num_scheduled_tokens = np.array([num_tokens_per_req] * num_reqs, dtype=np.int32)
+        seq_lens_np = self.seq_lens.numpy()
+        seq_lens_np[:num_reqs] = num_scheduled_tokens
+        seq_lens_np[num_reqs:] = 0
+        if is_prefill:
+            self.input_batch.num_tokens_no_spec[:num_reqs] = num_scheduled_tokens
+        else:
+            self.input_batch.num_tokens_no_spec[:num_reqs] = 1
+        return num_scheduled_tokens, int(num_scheduled_tokens.sum())
+
     @torch.inference_mode()
     def _dummy_run(
         self,
@@ -2066,31 +2087,30 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         is_prefill: bool,
         *,
         num_tokens_padded: int | None = None,
+        warmup: bool = True,
     ) -> None:
         """
         Run a dummy forward pass to warm up for the model.
+
+        ``warmup=True`` (default) is the compile-time path. ``warmup=False``
+        marks the serving-time DP-idle dummy step (``execute_dummy_batch``):
+        this rank has no real work and must not drive the cross-DP shape
+        decision. It contributes a minimal (num_reqs=1) entry to the collective
+        all-reduce (excluded from the decision in ``_determine_batch_padding``
+        via ``is_idle``) and then ADOPTS the busy-decided shape below, running
+        the same compiled decode graph the busy ranks run.
         """
+        # The serving-time DP-idle dummy is the only non-warmup use of this
+        # method; downstream shape logic keys on this idle flag.
+        is_idle = not warmup
         num_tokens = num_tokens_per_req * num_reqs
         assert num_tokens <= self.max_num_tokens
         assert num_reqs <= self.max_num_reqs
         draft_num_tokens_padded = num_tokens_padded
 
-        num_scheduled_tokens_list = [num_tokens_per_req] * num_reqs
-        num_scheduled_tokens = np.array(num_scheduled_tokens_list, dtype=np.int32)
-        num_tokens_unpadded = int(num_scheduled_tokens.sum())
-
-        seq_lens_np = self.seq_lens.numpy()
-        seq_lens_np[:num_reqs] = num_scheduled_tokens
-        seq_lens_np[num_reqs:] = 0
-
-        # NOTE(RBLN): num_tokens_no_spec is the per-request no-spec logical
-        # length consumed downstream (query backfill, spec metadata). For decode
-        # warmup keep it at 1 so a multi-token speculative decode query is sized
-        # as decode. The step phase itself is stamped below via _is_prefill_step.
-        if is_prefill:
-            self.input_batch.num_tokens_no_spec[:num_reqs] = num_scheduled_tokens
-        else:
-            self.input_batch.num_tokens_no_spec[:num_reqs] = 1
+        num_scheduled_tokens, num_tokens_unpadded = self._stage_dummy_seq_lens(
+            num_reqs, num_tokens_per_req, is_prefill
+        )
 
         # Stamp the phase from this dummy's own classification so the graph/phase
         # selection helpers below (_determine_batch_padding,
@@ -2100,10 +2120,34 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # step cannot leak into any is_prefill_phase() read while the dummy runs.
         self._is_prefill_step = is_prefill
 
-        num_reqs_padded, _num_tokens_padded, num_tokens_across_dp = (
-            self._determine_batch_padding(num_reqs, num_tokens_unpadded)
+        num_reqs_padded, _num_tokens_padded, num_tokens_across_dp, eff_qlen = (
+            self._determine_batch_padding(num_reqs, num_tokens_unpadded, is_idle)
         )
         num_tokens_padded = num_tokens_padded or _num_tokens_padded
+
+        if is_idle and num_tokens_padded is not None:
+            # Adopt the shape the busy ranks settled on and stage the whole dummy
+            # batch at it (num_reqs == num_reqs_padded, no split), so this rank
+            # runs the same graph they run.
+            #
+            # num_tokens_per_req is this rank's query length. eff_qlen (from
+            # _determine_batch_padding) is 1 on every route whose num_tokens_padded
+            # is a padding target rather than num_reqs_padded * qlen, so the idle
+            # runs the minimal qlen=1 decode and lets num_tokens_padded carry the
+            # padding; it is None only on the per-bucket route, where the qlen is
+            # instead derived from num_tokens_padded / num_reqs_padded (the busy
+            # ranks' symmetric query length).
+            num_reqs = num_reqs_padded
+            num_tokens_per_req = (
+                eff_qlen
+                if eff_qlen is not None
+                else num_tokens_padded // num_reqs_padded
+            )
+            draft_num_tokens_padded = num_tokens_padded
+            num_scheduled_tokens, num_tokens_unpadded = self._stage_dummy_seq_lens(
+                num_reqs, num_tokens_per_req, is_prefill
+            )
+            num_tokens = num_tokens_unpadded
 
         cum_num_tokens, _ = self._get_cumsum_and_arange(num_scheduled_tokens)
         query_start_loc_np = self.query_start_loc.np
@@ -2875,7 +2919,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self,
         num_reqs_unpadded: int,
         num_tokens_unpadded: int,
-    ) -> tuple[int, int | None, torch.Tensor | None]:
+        is_idle: bool = False,
+    ) -> tuple[int, int | None, torch.Tensor | None, int | None]:
         is_prefill_phase = self.is_prefill_phase()
         num_reqs_padded = (
             self.bucketing_manager.find_decode_batch_bucket(num_reqs_unpadded)
@@ -2883,34 +2928,105 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             else num_reqs_unpadded
         )
         if self.parallel_config.data_parallel_size == 1:
-            return num_reqs_padded, None, None
+            return num_reqs_padded, None, None, None
 
-        num_tokens_across_dp, num_reqs_across_dp = (
+        num_tokens_across_dp, num_reqs_across_dp, idle_across_dp = (
             RBLNDPMetadata.num_tokens_and_reqs_across_dp(
                 num_tokens_unpadded,
                 num_reqs_unpadded,
                 self.parallel_config.data_parallel_size,
                 self.parallel_config.data_parallel_rank,
                 is_prefill_phase,
+                is_idle,
             )
         )
         num_tokens_padded = self.max_num_tokens
+        # Per-request query length the idle dummy should adopt (used only there).
+        # Default 1: the idle rank runs the minimal qlen=1 decode and lets
+        # num_tokens_padded carry any padding on its own. This is correct on every
+        # route whose num_tokens_padded is a padding target rather than
+        # num_reqs_padded * qlen -- any_prefill, qlen-asymmetric, all-idle, AND the
+        # non-specialized-MoE DP path that skips the block below (num_tokens_padded
+        # stays max_num_tokens there). Only the per-bucket route resets this to
+        # None so the qlen is DERIVED from that product (the busy ranks' symmetric
+        # query length). Dividing max_num_tokens // num_reqs_padded instead would
+        # stage a never-warmed query length and hot-path recompile on the idle rank.
+        eff_qlen: int | None = 1
         if self.specialized_moe_decode:
             if num_reqs_across_dp is None:
                 # any_prefill (PD disaggregation): route padded-decode to the max
                 # bucket so only ONE padded-decode graph is ever needed.
                 num_reqs_padded = self.bucketing_manager.decode_batch_buckets[-1]
+                # num_tokens_padded stays max_num_tokens (a padding target); an idle
+                # rank keeps the default qlen=1 -- it cannot see any peer's query
+                # length (a peer is reading a prompt) -- and runs the smallest
+                # prepared graph.
             else:
-                num_reqs_padded = self.bucketing_manager.find_decode_batch_bucket(
-                    int(torch.max(num_reqs_across_dp).item())
-                )
-                assert num_reqs_padded is not None
-                assert torch.all(num_tokens_across_dp % num_reqs_across_dp == 0)
-                tokens_per_req_across_dp = num_tokens_across_dp // num_reqs_across_dp
-                max_tokens_per_req = int(torch.max(tokens_per_req_across_dp).item())
-                num_tokens_padded = num_reqs_padded * max_tokens_per_req
+                # A DP-idle dummy step (execute_dummy_batch) has no real work, so
+                # it must NOT drive the shape decision -- its fixed (bucket, qlen)
+                # could otherwise drag an optimal collective into a fall-back route
+                # (e.g. an idle rank claiming a spec qlen forces qlen-asymmetry when
+                # the busy ranks are plain qlen=1). Decide the shape from the busy
+                # (non-idle) ranks only; the idle rank then adopts it.
+                busy = idle_across_dp == 0
+                if not bool(busy.any().item()):
+                    # All ranks idle (DP lockstep wind-down / re-sync): no real
+                    # work anywhere -> cheapest compiled decode graph (smallest
+                    # bucket, qlen=1). Deterministic + identical on every rank;
+                    # output discarded.
+                    num_reqs_padded = self.bucketing_manager.decode_batch_buckets[0]
+                    num_tokens_padded = num_reqs_padded
+                else:
+                    assert torch.all(
+                        (num_tokens_across_dp % num_reqs_across_dp)[busy] == 0
+                    )
+                    tokens_per_req_across_dp = (
+                        num_tokens_across_dp // num_reqs_across_dp
+                    )
+                    busy_tokens_per_req = tokens_per_req_across_dp[busy]
+                    max_tokens_per_req = int(torch.max(busy_tokens_per_req).item())
+                    min_tokens_per_req = int(torch.min(busy_tokens_per_req).item())
+                    if min_tokens_per_req != max_tokens_per_req:
+                        # DP qlen-ASYMMETRIC step (among the busy ranks): the ranks
+                        # disagree on query length -- a peer runs multi-token (spec)
+                        # decode (query_len = num_speculative_tokens + 1) while
+                        # another is qlen=1. Fall-back: warm-up compiles the
+                        # spec-asymmetric padding ONLY for the top bucket
+                        # (top_bucket, *, top_bucket * spec_qlen) to keep the
+                        # decode-graph count minimal, so route up to it here (same
+                        # policy as the any_prefill branch above).
+                        #
+                        # A qlen-SYMMETRIC step -- all busy ranks the same query
+                        # length, whether 1 or the spec length -- instead falls
+                        # through to the per-bucket branch below and runs on its
+                        # own optimally-sized decode graph. Only gating on
+                        # max_tokens_per_req > 1 would wrongly route symmetric spec
+                        # to the top bucket, running it oversized and orphaning the
+                        # per-bucket spec graphs.
+                        num_reqs_padded = self.bucketing_manager.decode_batch_buckets[
+                            -1
+                        ]
+                        # num_tokens_padded below (top_bucket * max_tokens_per_req)
+                        # is a padding target here, so an idle rank keeps the
+                        # default qlen=1: it follows the single-token busy ranks,
+                        # not the longer speculative ones.
+                    else:
+                        busy_num_reqs = num_reqs_across_dp[busy]
+                        num_reqs_padded = (
+                            self.bucketing_manager.find_decode_batch_bucket(
+                                int(torch.max(busy_num_reqs).item())
+                            )
+                        )
+                        # per-bucket: num_tokens_padded below == num_reqs_padded *
+                        # max_tokens_per_req, so DERIVE qlen from that product (the
+                        # busy ranks' symmetric query length -- 1, or the spec
+                        # length). This is the ONLY route that overrides the qlen=1
+                        # default.
+                        eff_qlen = None
+                    assert num_reqs_padded is not None
+                    num_tokens_padded = num_reqs_padded * max_tokens_per_req
 
-        return num_reqs_padded, num_tokens_padded, num_tokens_across_dp
+        return num_reqs_padded, num_tokens_padded, num_tokens_across_dp, eff_qlen
 
     def _update_kv_cache_base_bindings(
         self,

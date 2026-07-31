@@ -198,7 +198,23 @@ class RBLNWorker(WorkerBase):
             self.model_runner.bucketing_manager.decode_batch_buckets_count
         )
 
-        num_runtimes = 1 + decode_batch_buckets_count + specialized_moe_decode
+        # NOTE(RBLN): warm-up compiles one decode graph -- hence one runtime,
+        # each reserving a fixed command-stream buffer in
+        # estimate_available_memory -- per (decode bucket, query length). Without
+        # spec there is a single decode query length (1); spec decode compiles a
+        # second (num_spec + 1) for every bucket, and the specialized-MoE-decode
+        # fallback repeats those query lengths (plus one extra DP-asymmetric spec
+        # dummy). Count all of them so the KV-block estimate does not over-reserve
+        # DRAM and OOM at runtime. num_decode_query_lens mirrors warmup_model's
+        # query_lens exactly. Non-spec (== 1) is unchanged from the old
+        # 1 + buckets + specialized formula.
+        spec_enabled = getattr(self, "speculative_config", None) is not None
+        num_decode_query_lens = 2 if spec_enabled else 1
+        num_runtimes = 1 + decode_batch_buckets_count * num_decode_query_lens
+        if specialized_moe_decode:
+            num_runtimes += num_decode_query_lens
+            if spec_enabled:
+                num_runtimes += 1
 
         ratio: float = 1.0
         if self.model_config.quantization is not None:
@@ -572,9 +588,13 @@ class RBLNWorker(WorkerBase):
             self.profiler.stop()
 
     def execute_dummy_batch(self) -> None:
-        bucket_size = self.model_runner.bucketing_manager.find_decode_batch_bucket(1)
-        query_len = 1 + self.model_runner.num_spec_tokens
-        self.model_runner._dummy_run(bucket_size, query_len, is_prefill=False)
+        # Serving-time DP-idle step: this rank has no real work. Run a non-warmup
+        # dummy (warmup=False) so it contributes a minimal (num_reqs=1, qlen=1)
+        # entry to the cross-DP collective, is EXCLUDED from the shape decision,
+        # then adopts the busy-decided shape and runs the same compiled decode
+        # graph the busy ranks run -- so an idle rank never drags the collective
+        # into a fall-back route nor lands on an uncompiled shape.
+        self.model_runner._dummy_run(1, 1, is_prefill=False, warmup=False)
 
     # def add_lora(self, lora_request: LoRARequest) -> bool:
     #     return self.model_runner.add_lora(lora_request)
