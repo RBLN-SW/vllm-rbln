@@ -163,9 +163,6 @@ class RBLNOptimumPaliGemmaForConditionalGeneration(
         """
         max_seq_len = rbln_model_config.max_seq_len
         seq_range = torch.arange(max_seq_len).unsqueeze(0)  # (1, max_seq_len,)
-        # We feed the runtime directly, so the mask must already be in the form
-        # optimum-rbln passes to the attention op -- it is used in the
-        # computation itself, hence the cast to the model's compute dtype.
-        attention_mask = (seq_range <= cache_position).to(self.dtype)
+        attention_mask = (seq_range <= cache_position).to(rbln_model_config.torch_dtype)
         position_ids = cache_position.clone()
         return attention_mask, position_ids
