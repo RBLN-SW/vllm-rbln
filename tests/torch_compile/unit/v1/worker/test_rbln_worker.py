@@ -18,7 +18,7 @@ device env initialization, and behavior tests."""
 import inspect
 import os
 import sys
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1329,23 +1329,30 @@ class TestDynamicKvCompilerSupport:
 
         return RBLNWorker._assert_dynamic_kv_compiler_support
 
-    @staticmethod
-    def _modules(*, kv_cache: bool, reset_adaptive: bool):
-        """A fake `rebel` package with the two symbols independently present."""
-        mods = {}
-        if kv_cache:
-            kv = ModuleType("rebel.kv_cache")
-            kv.max_num_blocks = lambda *a, **k: 0
-            mods["rebel.kv_cache"] = kv
-        runtime = ModuleType("rebel.sync_runtime")
-
-        class DynamoRuntime:
+    class _RuntimeWithReset:
+        def reset_adaptive_buffers(self) -> None:
             pass
 
-        if reset_adaptive:
-            DynamoRuntime.reset_adaptive_buffers = lambda self: None
-        runtime.DynamoRuntime = DynamoRuntime
-        mods["rebel.sync_runtime"] = runtime
+    class _RuntimeWithoutReset:
+        pass
+
+    @classmethod
+    def _modules(cls, *, kv_cache: bool, reset_adaptive: bool) -> dict:
+        """A fake `rebel` package with the two symbols independently present.
+
+        `SimpleNamespace` stands in for the modules: `sys.modules` entries only
+        need to answer `getattr`, and building them declaratively keeps the fakes
+        readable. `rebel` itself is stubbed so the lookup never reaches a real
+        installation.
+        """
+        mods: dict = {"rebel": SimpleNamespace()}
+        if kv_cache:
+            mods["rebel.kv_cache"] = SimpleNamespace(max_num_blocks=lambda *a, **k: 0)
+        mods["rebel.sync_runtime"] = SimpleNamespace(
+            DynamoRuntime=(
+                cls._RuntimeWithReset if reset_adaptive else cls._RuntimeWithoutReset
+            )
+        )
         return mods
 
     def test_passes_when_both_symbols_exist(self):
