@@ -1382,7 +1382,7 @@ def test_prepare_inputs_pads_query_start_loc_and_seq_lens(rbln_model_runner, dis
     ib.num_computed_tokens_cpu[:2] = [3, 3]
 
     # Poison the tail with stale values to prove they get overwritten.
-    rbln_model_runner.query_start_loc.cpu.fill_(999)
+    rbln_model_runner.query_start_loc.fill_(999)
     rbln_model_runner.seq_lens.fill_(999)
 
     sched = RBLNSchedulerOutput(
@@ -1399,7 +1399,7 @@ def test_prepare_inputs_pads_query_start_loc_and_seq_lens(rbln_model_runner, dis
 
     rbln_model_runner._prepare_inputs(sched, np.array([1, 1], dtype=np.int32))
 
-    qsl = rbln_model_runner.query_start_loc.cpu
+    qsl = rbln_model_runner.query_start_loc
     sl = rbln_model_runner.seq_lens
 
     # Real part: [0, cu...] = [0, 1, 2]; seq_lens = computed + scheduled = [4, 4].
@@ -1976,7 +1976,7 @@ def test_get_prompt_logprobs_dict_chunked_and_final(
     monkeypatch.setattr(rbln_model_runner, "model", FakeModel(), raising=False)
     monkeypatch.setattr(rbln_model_runner, "sampler", FakeSampler())
 
-    rbln_model_runner.query_start_loc.cpu[0] = 0
+    rbln_model_runner.query_start_loc[0] = 0
 
     # First chunk: create and keep in-progress prompt logprobs.
     req_state.num_computed_tokens = 0
@@ -3505,11 +3505,10 @@ def test_build_attention_metadata_returns_per_layer_metadata_and_attaches_kv_bin
     ib.num_computed_tokens_cpu[:2] = [3, 3]
     ib.num_tokens_no_spec[:2] = [4, 4]
 
-    rbln_model_runner.query_start_loc.cpu[:3] = torch.tensor(
+    rbln_model_runner.query_start_loc[:3] = torch.tensor(
         [0, 1, 2],
-        dtype=rbln_model_runner.query_start_loc.cpu.dtype,
+        dtype=rbln_model_runner.query_start_loc.dtype,
     )
-    rbln_model_runner.query_start_loc.copy_to_gpu()
     rbln_model_runner.seq_lens[:2] = torch.tensor(
         [4, 4],
         dtype=rbln_model_runner.seq_lens.dtype,
