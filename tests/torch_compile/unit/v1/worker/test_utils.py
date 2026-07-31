@@ -593,6 +593,34 @@ class TestReplicationFactorIsGated:
         assert got / 2**30 == pytest.approx(118.0, abs=1e-3)
         assert any("different dram_total" in m for m in caplog.messages)
 
+    @patch("vllm_rbln.v1.worker.utils.current_platform")
+    @patch("vllm_rbln.v1.worker.utils.envs")
+    @pytest.mark.parametrize(
+        "sysfs_total",
+        [
+            None,  # no sysfs at all -> literal
+            150_323_855_360,  # 140.0 GiB, what current drivers report
+            144 * 2**30,  # raw capacity, i.e. system region NOT subtracted
+            154_000_000_000,  # anything larger
+        ],
+    )
+    def test_sysfs_capacity_never_raises_the_estimate(
+        self, mock_envs, mock_platform, sysfs_total
+    ):
+        """Sourcing the capacity from sysfs must not grow the default path.
+
+        This is NOT behind VLLM_RBLN_USE_DYNAMIC_KV_CACHE, so a driver that
+        reported raw capacity would hand every model a larger KV cache than dev.
+        The literal already subtracts the 4 GiB system region; sysfs is clamped
+        to it so it can only ever report less.
+        """
+        with patch(
+            "vllm_rbln.v1.worker.utils.read_rbln_card_dram_total_bytes",
+            return_value=sysfs_total,
+        ):
+            got = self._measure(mock_envs, mock_platform, 8, False)
+        assert got / 2**30 == pytest.approx(118.0, abs=1e-3)
+
 
 # ---------------------------------------------------------------------------
 # sysfs DRAM readers
@@ -706,14 +734,25 @@ class TestRblnSysfsReaders:
             assert read_rbln_card_dram_used_bytes() == 0
 
     def test_dram_total_reads_uniform_capacity(self, tmp_path):
+        # RBLN_DEV_DIR must be patched too: both readers resolve RBLN_DEVICES
+        # against the device nodes actually present, so leaving /dev alone makes
+        # the result depend on the host's card numbering. On a container exposing
+        # /dev/rbln4..7 "0,1" resolves to cards 4 and 5, which this fake sysfs
+        # does not have, and the assertions below read 0.
+        sysfs = tmp_path / "sysfs"
+        sysfs.mkdir()
+        dev = tmp_path / "dev"
+        dev.mkdir()
         for index in (0, 1):
-            card = tmp_path / f"rbln{index}"
+            card = sysfs / f"rbln{index}"
             card.mkdir()
             (card / "dram_total").write_text("150323855360\n")
             (card / "dram_used").write_text(f"{index * 1024}\n")
+            (dev / f"rbln{index}").touch()
         with (
             patch.dict(os.environ, {"RBLN_DEVICES": "0,1"}),
-            patch("vllm_rbln.v1.worker.utils.RBLN_SYSFS_CLASS_DIR", str(tmp_path)),
+            patch("vllm_rbln.v1.worker.utils.RBLN_DEV_DIR", str(dev)),
+            patch("vllm_rbln.v1.worker.utils.RBLN_SYSFS_CLASS_DIR", str(sysfs)),
         ):
             total = read_rbln_card_dram_total_bytes()
             assert total == 150_323_855_360
@@ -725,16 +764,53 @@ class TestRblnSysfsReaders:
             assert read_rbln_card_dram_used_bytes() == 1024
 
     def test_heterogeneous_capacity_is_rejected(self, tmp_path):
+        sysfs = tmp_path / "sysfs"
+        sysfs.mkdir()
+        dev = tmp_path / "dev"
+        dev.mkdir()
         for index, size in ((0, 150323855360), (1, 75161927680)):
-            card = tmp_path / f"rbln{index}"
+            card = sysfs / f"rbln{index}"
             card.mkdir()
             (card / "dram_total").write_text(f"{size}\n")
+            (dev / f"rbln{index}").touch()
         with (
             patch.dict(os.environ, {"RBLN_DEVICES": "0,1"}),
-            patch("vllm_rbln.v1.worker.utils.RBLN_SYSFS_CLASS_DIR", str(tmp_path)),
+            patch("vllm_rbln.v1.worker.utils.RBLN_DEV_DIR", str(dev)),
+            patch("vllm_rbln.v1.worker.utils.RBLN_SYSFS_CLASS_DIR", str(sysfs)),
             pytest.raises(RuntimeError, match="different dram_total"),
         ):
             read_rbln_card_dram_total_bytes()
+
+    def test_dram_total_ignores_cards_we_do_not_own(self, tmp_path):
+        """Capacity must come from our own cards, like `dram_used`.
+
+        A container holding /dev/rbln4..7 with RBLN_DEVICES=0,1 owns physical
+        cards 4 and 5. Reading the raw entry instead would report card 0's
+        capacity -- somebody else's card, and a different SKU here.
+        """
+        sysfs = tmp_path / "sysfs"
+        sysfs.mkdir()
+        dev = tmp_path / "dev"
+        dev.mkdir()
+        for index in (4, 5, 6, 7):
+            card = sysfs / f"rbln{index}"
+            card.mkdir()
+            (card / "dram_total").write_text("150323855360\n")
+            (dev / f"rbln{index}").touch()
+        # Cards we do NOT own, deliberately a different capacity.
+        for index in (0, 1):
+            card = sysfs / f"rbln{index}"
+            card.mkdir()
+            (card / "dram_total").write_text("75161927680\n")
+
+        with (
+            patch.dict(os.environ, {"RBLN_DEVICES": "0,1"}),
+            patch("vllm_rbln.v1.worker.utils.RBLN_DEV_DIR", str(dev)),
+            patch("vllm_rbln.v1.worker.utils.RBLN_SYSFS_CLASS_DIR", str(sysfs)),
+        ):
+            # Ours (4, 5), not the raw entries (0, 1). Reading the raw entries
+            # would return 75161927680 instead.
+            assert read_rbln_card_dram_total_bytes() == 150_323_855_360
 
 
 # ---------------------------------------------------------------------------
