@@ -795,12 +795,22 @@ class RBLNWorker(WorkerBase):
     def _dynamic_kv_chiplet_budget(self, num_chiplets: int) -> int:
         """Per-chiplet byte budget for `max_num_blocks`.
 
-        `floor(dram_total / num_chiplets * gpu_memory_utilization)` minus other
-        tenants' usage. Deliberately *capacity*-derived, not a measured free
-        figure: by the time the profile is queried this artifact's own base
-        allocations are already resident, and `max_num_blocks` subtracts those
-        `base_bytes` from the budget itself -- handing it a measured free value
-        would charge the base twice.
+        `floor(dram_total / num_chiplets * gpu_memory_utilization)` minus the
+        unprofiled reserve minus other tenants' usage. Deliberately
+        *capacity*-derived, not a measured free figure: by the time the profile is
+        queried this artifact's own base allocations are already resident, and
+        `max_num_blocks` subtracts those `base_bytes` from the budget itself --
+        handing it a measured free value would charge the base twice.
+
+        The reserve exists because the profile is not a complete inventory: on the
+        measured Qwen runs chiplet 0 holds two 20,971,520 B `kEager` buffers and
+        25,536 B of per-compile_id command-stream pools that match no profile
+        region -- 41,968,576 B that `max_num_blocks` cannot see and would
+        otherwise spend on blocks. They also appear in the static dev baseline, so
+        they are not an artifact of this path. See
+        `VLLM_RBLN_DYNAMIC_KV_UNPROFILED_RESERVE_BYTES` in `envs.py` for the
+        sizing and for why it is sized from those items rather than from the net
+        measured shortfall.
 
         Note the docstring on `rebel.kv_cache.max_num_blocks` says "total free
         device memory"; read as "the whole budget the model must fit in,
@@ -815,16 +825,26 @@ class RBLNWorker(WorkerBase):
             )
         capacity_per_chiplet = dram_total // num_chiplets
         gmu = self.cache_config.gpu_memory_utilization
-        raw_budget = int(capacity_per_chiplet * gmu)
+        reserve = envs.VLLM_RBLN_DYNAMIC_KV_UNPROFILED_RESERVE_BYTES
+        if reserve < 0:
+            raise RuntimeError(
+                "VLLM_RBLN_DYNAMIC_KV_UNPROFILED_RESERVE_BYTES must not be "
+                f"negative (got {reserve}); a negative reserve would hand the KV "
+                "cache more memory than gpu_memory_utilization allows."
+            )
+        gmu_budget = int(capacity_per_chiplet * gmu)
+        raw_budget = gmu_budget - reserve
         budget = raw_budget - self._foreign_dram_used_bytes
         logger.info(
             "[Dynamic KV] per-chiplet budget: dram_total=%d chiplets=%d "
-            "capacity=%d gpu_memory_utilization=%.3f raw=%d foreign_used=%d "
-            "adjusted=%d",
+            "capacity=%d gpu_memory_utilization=%.3f gmu_budget=%d "
+            "unprofiled_reserve=%d raw=%d foreign_used=%d adjusted=%d",
             dram_total,
             num_chiplets,
             capacity_per_chiplet,
             gmu,
+            gmu_budget,
+            reserve,
             raw_budget,
             self._foreign_dram_used_bytes,
             budget,
@@ -832,8 +852,8 @@ class RBLNWorker(WorkerBase):
         if budget <= 0:
             raise RuntimeError(
                 f"per-chiplet KV budget is non-positive ({budget} bytes) after "
-                f"subtracting {self._foreign_dram_used_bytes} bytes of foreign "
-                "device usage."
+                f"subtracting {reserve} bytes of unprofiled reserve and "
+                f"{self._foreign_dram_used_bytes} bytes of foreign device usage."
             )
         return budget
 

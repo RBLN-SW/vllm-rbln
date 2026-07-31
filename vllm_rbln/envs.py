@@ -61,6 +61,7 @@ if TYPE_CHECKING:
     # --- DYNAMIC KV CACHE ---
     VLLM_RBLN_USE_DYNAMIC_KV_CACHE: bool = False
     VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS: int = 0
+    VLLM_RBLN_DYNAMIC_KV_UNPROFILED_RESERVE_BYTES: int = 48 * 1024 * 1024
     # --- ATTENTION ---
     VLLM_RBLN_FLASH_CAUSAL_ATTN: bool = True
     VLLM_RBLN_BATCH_ATTN_OPT: bool = False
@@ -319,6 +320,31 @@ environment_variables = {
     # keep serving from the shrunk cache.
     "VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS": lambda: int(
         os.environ.get("VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS", 0)
+    ),
+    # Bytes held back from every chiplet's dynamic-KV budget for device memory
+    # that `kv_cache_memory_profile()` does not describe.
+    #
+    # The profile is not a complete inventory of the artifact's device memory. On
+    # the measured Qwen runs chiplet 0 holds two 20,971,520 B `kEager` buffers
+    # (`id=13` and `id=353`) plus 25,536 B of per-compile_id command-stream pools
+    # that match no profile region at all -- 41,968,576 B; chiplets 1-3 hold one
+    # such buffer each. Both appear with the same id and size in the *static* dev
+    # baseline (one at the identical address), so they are not something this path
+    # introduces -- they are simply memory the profile does not describe, which
+    # `max_num_blocks` would otherwise hand to KV blocks.
+    #
+    # On Qwen the shortfall is partly masked because the profile also over-claims
+    # small regions (a 4,096 B region is charged a full 2 MiB of alignment), but
+    # that offset is model-dependent and must not be relied on -- hence the sizing
+    # from the *items* (41,968,576 B, rounded up to 48 MiB) rather than from the
+    # net measured residual of ~11-17 MB. Verified against both configs measured
+    # on device: with 48 MiB the answer is unchanged (1548 blocks at block_size
+    # 1024, 157 at 8192); 64 MiB would already cost 4 blocks at 1024. Set to 0 to
+    # disable.
+    "VLLM_RBLN_DYNAMIC_KV_UNPROFILED_RESERVE_BYTES": lambda: int(
+        os.environ.get(
+            "VLLM_RBLN_DYNAMIC_KV_UNPROFILED_RESERVE_BYTES", 48 * 1024 * 1024
+        )
     ),
     # --- ATTENTION ---
     # Use flash attention for causal attention
