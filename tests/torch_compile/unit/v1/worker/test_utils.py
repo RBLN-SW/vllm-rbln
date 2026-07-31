@@ -467,11 +467,14 @@ class TestReplicationFactorIsGated:
     The exact factor is larger than the released `max(1, rsd_size // kvh)`
     whenever kvh is neither a divisor nor a multiple of rsd_size, so switching to
     it unconditionally would silently hand those models a smaller KV cache
-    (measured on RBLN-CR100, kernel 6 GiB, gmu 0.9: kvh=5 118.00 -> 73.75 GiB,
+    (measured on RBLN-CR03, kernel 6 GiB, gmu 0.9: kvh=5 118.00 -> 73.75 GiB,
     kvh=10 -> 98.33, kvh=3/6/9 -> 88.50). No such head count has been checked
     against hardware, so the released number stays unless the dynamic-KV path --
     which re-derives the block count from the compiled artifact and validates it
     per chiplet -- is switched on.
+
+    Every figure here is measured with the card DRAM capacity pinned by
+    `_measure`; see its docstring for why that is necessary.
     """
 
     KERNEL = 6 * 2**30
@@ -486,16 +489,51 @@ class TestReplicationFactorIsGated:
     }
     AGREE = (1, 2, 4, 8, 12, 16)
 
-    def _measure(self, mock_envs, mock_platform, num_kv_heads, dynamic_kv):
-        mock_platform.get_device_name.return_value = "RBLN-CR100"
+    def _measure(
+        self,
+        mock_envs,
+        mock_platform,
+        num_kv_heads,
+        dynamic_kv,
+        sysfs_total=REBEL_DRAM_NBYTES,
+        sysfs_error=None,
+    ):
+        """Measure with the card DRAM capacity pinned, not read off the host.
+
+        The RBLN-CR branch of `estimate_available_memory` sources the capacity
+        from `read_rbln_card_dram_total_bytes()`. `get_device_name` is mocked to
+        a CR part below, but the capacity would still come from whatever card the
+        machine running the tests has -- and the CI fleet is ATOM
+        (`rbln-sw-k8s-ca22-*`), where that is a ~15.7 GiB card, so every figure
+        in this class came out about 9x too small. Pin it to the built-in
+        constant, which is also exactly what a uniform RBLN-CR host reports.
+
+        Args:
+            sysfs_total: what the reader should report. None means sysfs is
+                unavailable, i.e. fall back to the built-in constant.
+            sysfs_error: when given, the reader raises this instead of returning.
+                A caller cannot patch the reader itself -- this method's own
+                patch would override it.
+        """
+        mock_platform.get_device_name.return_value = "RBLN-CR03"
         mock_envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK = 1
         mock_envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE = dynamic_kv
-        return estimate_available_memory(
-            _make_model_config(num_kv_heads=num_kv_heads),
-            _make_parallel_config(tp_size=1),
-            kernel_size=self.KERNEL,
-            gpu_memory_utilization=0.9,
-        )
+
+        def read_card_dram_total_bytes() -> int | None:
+            if sysfs_error is not None:
+                raise sysfs_error
+            return sysfs_total
+
+        with patch(
+            "vllm_rbln.v1.worker.utils.read_rbln_card_dram_total_bytes",
+            read_card_dram_total_bytes,
+        ):
+            return estimate_available_memory(
+                _make_model_config(num_kv_heads=num_kv_heads),
+                _make_parallel_config(tp_size=1),
+                kernel_size=self.KERNEL,
+                gpu_memory_utilization=0.9,
+            )
 
     @patch("vllm_rbln.v1.worker.utils.current_platform")
     @patch("vllm_rbln.v1.worker.utils.envs")
@@ -580,16 +618,16 @@ class TestReplicationFactorIsGated:
         a literal, so it falls back instead of turning a mixed host into a
         start-up failure.
         """
-        with (
-            patch(
-                "vllm_rbln.v1.worker.utils.read_rbln_card_dram_total_bytes",
-                side_effect=RuntimeError(
+        with caplog.at_level("WARNING"):
+            got = self._measure(
+                mock_envs,
+                mock_platform,
+                8,
+                False,
+                sysfs_error=RuntimeError(
                     "visible RBLN cards report different dram_total"
                 ),
-            ),
-            caplog.at_level("WARNING"),
-        ):
-            got = self._measure(mock_envs, mock_platform, 8, False)
+            )
         # 144 GiB - 4 GiB, the literal, == what sysfs reports on a uniform host.
         assert got / 2**30 == pytest.approx(118.0, abs=1e-3)
         assert any("different dram_total" in m for m in caplog.messages)
@@ -613,11 +651,7 @@ class TestReplicationFactorIsGated:
         raw capacity would hand every model a larger KV cache than dev. The
         reader clamps, so nothing above the ceiling can reach here.
         """
-        with patch(
-            "vllm_rbln.v1.worker.utils.read_rbln_card_dram_total_bytes",
-            return_value=sysfs_total,
-        ):
-            got = self._measure(mock_envs, mock_platform, 8, False)
+        got = self._measure(mock_envs, mock_platform, 8, False, sysfs_total=sysfs_total)
         assert got / 2**30 == pytest.approx(118.0, abs=1e-3)
 
     @patch("vllm_rbln.v1.worker.utils.current_platform")
@@ -629,11 +663,13 @@ class TestReplicationFactorIsGated:
         test in this class green -- and reporting *less* is the whole reason to
         read the device in the first place.
         """
-        with patch(
-            "vllm_rbln.v1.worker.utils.read_rbln_card_dram_total_bytes",
-            return_value=REBEL_DRAM_NBYTES - 4 * 2**30,
-        ):
-            got = self._measure(mock_envs, mock_platform, 8, False)
+        got = self._measure(
+            mock_envs,
+            mock_platform,
+            8,
+            False,
+            sysfs_total=REBEL_DRAM_NBYTES - 4 * 2**30,
+        )
         assert got / 2**30 == pytest.approx(118.0 - 4 * 0.9, abs=1e-3)
 
 
