@@ -96,64 +96,21 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 
 
-def _rbln_memory_reserved_or_none(index: int) -> int | None:
-    """`torch.rbln.memory_reserved(index)`, or None when it cannot be read.
-
-    `CachingAllocator::GetMemoryStats` RT_CHECKs `node_id <
-    device_allocators_.size()` and that vector is *lazily* sized on the first
-    allocation per node, so querying a device this process never allocated on
-    raises rather than returning 0. That must not be allowed to skip the
-    `empty_cache()` call it is only there to measure.
-    """
-    try:
-        return torch.rbln.memory_reserved(index)
-    except Exception as exc:  # pylint: disable=broad-exception-caught
-        logger.debug("torch.rbln.memory_reserved(%d) unavailable: %s", index, exc)
-        return None
-
-
-def empty_rbln_device_caches() -> list[dict[str, int | None]]:
+def empty_rbln_device_caches() -> bool:
     """Return every *free* block the rbln caching allocator holds to the driver.
 
-    `torch.rbln.empty_cache()` reaches `CachingAllocator::EmptyCache`, which
-    calls `ReleaseCachedBlocks()` on each per-(node, chiplet) allocator; that in
-    turn calls `FreeDeviceByPointer` for every unsplit block sitting in a pool.
-    Without it a freed tensor's block stays reserved: the allocator only frees
-    cached blocks on its own as a *retry* after an allocation fails
-    (`caching_allocator.cc:74`), so the bytes keep counting against the chiplet
-    in sysfs `dram_used` even though nothing references them.
-
-    Two limits of the mechanism, both of which show up as a short `bytes_freed`
-    rather than as an error:
-
-    * `ReleaseBlocks` only frees blocks with neither a `prev_` nor a `next_`,
-      i.e. blocks that were never split. A KV cache allocation is a whole
-      large-pool block, but a *split* remainder would stay reserved.
-    * `rbln_empty_cache` returns early when the device has no live context, so
-      it is a no-op for a device this process never allocated on.
-
-    It also clears torch-rbln's warm-runtime cache, which is a deliberate part
-    of the contract rather than a side effect: `torch_rbln/memory.py` documents
-    that the cache holds strong refs to `DynamoRuntime` instances and the rbln
-    buffers behind them, so leaving it populated would keep the very bytes this
-    call exists to return. That cache keys *shim ops* (the generated
-    `<op>_rbln` wrappers), not the model graph this worker compiled through
-    `vllm_rbln.compilation.compile()`; its entries are re-installed on the next
-    dispatch, so the cost is a cold first dispatch and not a recompile.
-
-    Returns:
-        One record per visible device, with the allocator's reserved bytes
-        either side of the call (None where the allocator could not be queried)
-        and whether the release itself succeeded. `[]` when torch-rbln is absent
-        or reports no device. Never raises: this runs during start-up and a
-        failure to shrink a cache must not stop the server from coming up.
+    Without this a freed tensor's block stays reserved -- the allocator only
+    releases cached blocks as a *retry* after an allocation fails -- so the bytes
+    keep counting against the chiplet in sysfs `dram_used`. Only blocks that were
+    never split are freed, and it is a no-op for a device this process never
+    allocated on. Never raises: this runs during start-up.
     """
     if not has_torch_rbln:
-        return []
+        return False
     try:
         # is_available() raises on a malformed RBLN_* config, hence the guard.
         if not torch.rbln.is_available():
-            return []
+            return False
         device_count = torch.rbln.device_count()
     except Exception as exc:  # pylint: disable=broad-exception-caught
         logger.warning(
@@ -162,16 +119,12 @@ def empty_rbln_device_caches() -> list[dict[str, int | None]]:
             "caching allocator and keeps counting against the chiplet budget.",
             exc,
         )
-        return []
+        return False
 
-    records: list[dict[str, int | None]] = []
     for index in range(device_count):
-        reserved_before = _rbln_memory_reserved_or_none(index)
-        released = True
         try:
             torch.rbln.empty_cache(index)
         except Exception as exc:  # pylint: disable=broad-exception-caught
-            released = False
             logger.warning(
                 "torch.rbln.empty_cache(%d) failed: %s. Freed KV blocks stay "
                 "reserved by the caching allocator and keep counting against "
@@ -179,22 +132,7 @@ def empty_rbln_device_caches() -> list[dict[str, int | None]]:
                 index,
                 exc,
             )
-        reserved_after = _rbln_memory_reserved_or_none(index)
-        bytes_freed = (
-            reserved_before - reserved_after
-            if reserved_before is not None and reserved_after is not None
-            else None
-        )
-        records.append(
-            {
-                "device": index,
-                "released": released,
-                "reserved_before": reserved_before,
-                "reserved_after": reserved_after,
-                "bytes_freed": bytes_freed,
-            }
-        )
-    return records
+    return device_count > 0
 
 
 class RBLNWorker(WorkerBase):
@@ -717,7 +655,8 @@ class RBLNWorker(WorkerBase):
                 "to dispatch to paged_flash_causal_attention_naive_{prefill,"
                 "decode}, i.e. sliding_window is None, is_causal is True and "
                 "is_normal is False (is_normal becomes True when block_size == "
-                "max_model_len). Offending layers: " + ", ".join(offenders[:8])
+                "max_model_len). Offending layers: "
+                + ", ".join(offenders[:8])
                 + (f" (+{len(offenders) - 8} more)" if len(offenders) > 8 else "")
             )
 
@@ -795,26 +734,11 @@ class RBLNWorker(WorkerBase):
     def _dynamic_kv_chiplet_budget(self, num_chiplets: int) -> int:
         """Per-chiplet byte budget for `max_num_blocks`.
 
-        `floor(dram_total / num_chiplets * gpu_memory_utilization)` minus the
-        unprofiled reserve minus other tenants' usage. Deliberately
-        *capacity*-derived, not a measured free figure: by the time the profile is
-        queried this artifact's own base allocations are already resident, and
-        `max_num_blocks` subtracts those `base_bytes` from the budget itself --
-        handing it a measured free value would charge the base twice.
-
-        The reserve exists because the profile is not a complete inventory: on the
-        measured Qwen runs chiplet 0 holds two 20,971,520 B `kEager` buffers and
-        25,536 B of per-compile_id command-stream pools that match no profile
-        region -- 41,968,576 B that `max_num_blocks` cannot see and would
-        otherwise spend on blocks. They also appear in the static dev baseline, so
-        they are not an artifact of this path. See
-        `VLLM_RBLN_DYNAMIC_KV_UNPROFILED_RESERVE_BYTES` in `envs.py` for the
-        sizing and for why it is sized from those items rather than from the net
-        measured shortfall.
-
-        Note the docstring on `rebel.kv_cache.max_num_blocks` says "total free
-        device memory"; read as "the whole budget the model must fit in,
-        base_bytes included", which is what this returns.
+        `floor(dram_total / num_chiplets * gmu)` minus the unprofiled reserve
+        minus other tenants' usage. Deliberately *capacity*-derived rather than a
+        measured free figure: `max_num_blocks` subtracts the profile's
+        `base_bytes` itself, and those are already resident by now, so a measured
+        free value would charge the base twice.
         """
         dram_total = read_rbln_card_dram_total_bytes()
         if dram_total is None:
@@ -834,11 +758,18 @@ class RBLNWorker(WorkerBase):
             )
         gmu_budget = int(capacity_per_chiplet * gmu)
         raw_budget = gmu_budget - reserve
-        budget = raw_budget - self._foreign_dram_used_bytes
+        # Card-scope figure against a per-chiplet budget, so it must be scaled.
+        # Charging the whole card total to every chiplet drove the budget negative
+        # and aborted start-up on a configuration that serves fine once scaled.
+        # An even spread is an assumption, but the same one `capacity_per_chiplet`
+        # above already makes.
+        foreign_per_chiplet = self._foreign_dram_used_bytes // num_chiplets
+        budget = raw_budget - foreign_per_chiplet
         logger.info(
             "[Dynamic KV] per-chiplet budget: dram_total=%d chiplets=%d "
             "capacity=%d gpu_memory_utilization=%.3f gmu_budget=%d "
-            "unprofiled_reserve=%d raw=%d foreign_used=%d adjusted=%d",
+            "unprofiled_reserve=%d raw=%d foreign_used=%d "
+            "foreign_per_chiplet=%d adjusted=%d",
             dram_total,
             num_chiplets,
             capacity_per_chiplet,
@@ -847,13 +778,16 @@ class RBLNWorker(WorkerBase):
             reserve,
             raw_budget,
             self._foreign_dram_used_bytes,
+            foreign_per_chiplet,
             budget,
         )
         if budget <= 0:
             raise RuntimeError(
                 f"per-chiplet KV budget is non-positive ({budget} bytes) after "
                 f"subtracting {reserve} bytes of unprofiled reserve and "
-                f"{self._foreign_dram_used_bytes} bytes of foreign device usage."
+                f"{foreign_per_chiplet} bytes of foreign device usage "
+                f"({self._foreign_dram_used_bytes} bytes across "
+                f"{num_chiplets} chiplets)."
             )
         return budget
 
@@ -991,8 +925,7 @@ class RBLNWorker(WorkerBase):
 
         base_usage = per_chiplet_usage(merged, 0)
         logger.info(
-            "[Dynamic KV] merged profile predicts base bytes per (node, "
-            "chiplet): %s",
+            "[Dynamic KV] merged profile predicts base bytes per (node, chiplet): %s",
             {k: v for k, v in sorted(base_usage.items())},
         )
         if num_blocks <= 0:
@@ -1051,11 +984,9 @@ class RBLNWorker(WorkerBase):
 
         current = self.model_runner.kv_cache_config.num_blocks
         if target == current:
-            # The adaptive-size latch already describes reality, so no reset is
-            # needed either.
+            # The latch already describes reality, so no reset is needed either.
             logger.info(
-                "[Dynamic KV] KV cache already holds %d blocks; nothing to "
-                "reallocate.",
+                "[Dynamic KV] KV cache already holds %d blocks; nothing to reallocate.",
                 target,
             )
             self._dynamic_kv_profiled_runtime_ids = set()
@@ -1087,45 +1018,22 @@ class RBLNWorker(WorkerBase):
                 names.append(layer_name)
         return names
 
-    def _release_kv_cache_tensors(self, old_cfg: KVCacheConfig) -> int:
+    def _release_kv_cache_tensors(self, old_cfg: KVCacheConfig) -> None:
         """Drop every reference to the outgoing KV cache and free its device DRAM.
 
-        Called *before* the replacement is allocated, which matters twice over:
-
-        1. **The leak.** `initialize_kv_cache_tensors` rebinds the runner list
-           and the forward context, so without this the old tensors stay alive
-           until the new ones exist and are then dropped with nothing left to
-           free them: the caching allocator keeps the block reserved (it only
-           releases cached blocks as an allocation *retry*), so the driver still
-           counts the bytes. Measured on a Qwen2.5-3B TP1 card: exactly
-           4.500 GiB unreturned per card = 1.125 GiB per chiplet =
-           `VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS` x the merged profile's
-           per-chiplet `bytes_per_block` x 4 chiplets (64 x 18 MiB and
-           8 x 144 MiB both land on the same figure). That is the dominant term
-           in the run's `gpu_memory_utilization` overshoot, and it is *not*
-           covered by the budget: `_dynamic_kv_chiplet_budget` is
-           capacity-derived and `_foreign_dram_used_bytes` is sampled in
-           `__init__`, before this process allocates anything.
-        2. **The transient peak.** Releasing first means the peak is
-           `base + max(old, new)` instead of `base + old + new`. At
-           gpu_memory_utilization 0.9 the sum still fits under the physical
-           ceiling, so this is headroom rather than a fix -- but the sum is what
-           would OOM first as gpu_memory_utilization approaches 1.
-
-        Returns:
-            Bytes the allocator handed back to the driver, summed over the
-            devices that could report it. 0 when nothing could be measured,
-            which is not by itself evidence that nothing was freed.
+        Called *before* the replacement is allocated. `initialize_kv_cache_tensors`
+        rebinds the runner list and the forward context, so otherwise the old
+        tensors outlive the free and the allocator keeps their blocks reserved --
+        measured at 4.5 GiB per card, the dominant term in that run's
+        `gpu_memory_utilization` overshoot. Releasing first also caps the peak at
+        `base + max(old, new)` rather than `base + old + new`.
         """
         mr = self.model_runner
 
-        # Whether the outgoing cache was device-resident at all decides whether
-        # the byte accounting below means anything: with
-        # VLLM_RBLN_USE_DEVICE_TENSOR off `_allocate_kv_cache_tensors` puts the
-        # KV tensors on `meta` and the device-side buffers belong to the rbln
-        # runtime, which only releases them when `apply_adaptive_size_buffers`
-        # runs on the next forward. Read from the tensors rather than
-        # re-deriving the env condition, and before they are dropped.
+        # Whether the outgoing cache was device-resident decides whether the
+        # accounting below means anything: with VLLM_RBLN_USE_DEVICE_TENSOR off
+        # the KV tensors live on `meta` and the device buffers belong to the rbln
+        # runtime. Read from the tensors, not from the env, and before they go.
         kv_device_types = sorted(
             {
                 getattr(getattr(kv_cache, "device", None), "type", None) or "unknown"
@@ -1163,63 +1071,27 @@ class RBLNWorker(WorkerBase):
             layer.kv_cache = None
             unbound += 1
 
-        # (3) Every per-layer tensor is a view, and a view keeps its base alive,
-        # so the storage only dies with the last one. A reference cycle anywhere
-        # in that graph would defer the free to the next collection -- by which
-        # time the replacement has already been allocated and the point is lost.
+        # (3) Every per-layer tensor is a view and a view keeps its base alive,
+        # so the storage only dies with the last one. A reference cycle would
+        # defer the free past the replacement's allocation, losing the point.
         gc.collect()
 
-        records = empty_rbln_device_caches()
-        measured = [r for r in records if r["bytes_freed"] is not None]
-        bytes_freed = sum(int(r["bytes_freed"] or 0) for r in measured)
+        released = empty_rbln_device_caches()
         logical_bytes = sum(t.size for t in old_cfg.kv_cache_tensors)
-        # `released_kv_bytes=` / `outgoing_kv_logical_bytes=` are field names a
-        # log reader keys on: this is the only in-process channel that says
-        # whether the pre-resize cache came back, and sysfs cannot attribute its
-        # per-card figure to this event.
+        # Whether those bytes came back is not observable in-process -- the
+        # allocator's reserved-bytes counter does not track them. Confirm from
+        # the card's sysfs `dram_used` across the resize instead.
         logger.info(
             "[Dynamic KV] released the outgoing %d-block KV cache: "
-            "outgoing_kv_logical_bytes=%d released_kv_bytes=%d "
-            "unbound_layers=%d kv_device_types=%s per_device=%s",
+            "outgoing_kv_logical_bytes=%d unbound_layers=%d kv_device_types=%s "
+            "allocator_cache_emptied=%s device_resident=%s",
             old_cfg.num_blocks,
             logical_bytes,
-            bytes_freed,
             unbound,
             kv_device_types,
-            records,
+            released,
+            was_device_resident,
         )
-        if not records or not was_device_resident:
-            # Either no torch-rbln at all, or the KV tensors never held device
-            # DRAM in the first place. Nothing was owed, so silence is correct.
-            return bytes_freed
-        if not measured:
-            logger.warning(
-                "[Dynamic KV] the rbln allocator could not report reserved bytes "
-                "on any device, so whether the outgoing %d-block KV cache "
-                "(%d logical bytes) came back is unknown. If the run's "
-                "per-chiplet usage exceeds the predicted usage by "
-                "num_blocks x bytes_per_block, it did not.",
-                old_cfg.num_blocks,
-                logical_bytes,
-            )
-            return 0
-        if bytes_freed < logical_bytes:
-            # Not merely a missed optimisation: the shortfall is charged against
-            # a per-chiplet budget that never accounted for it, so the run will
-            # overshoot gpu_memory_utilization by that much.
-            logger.error(
-                "[Dynamic KV] only %d of the outgoing KV cache's %d logical "
-                "bytes were returned to the driver (shortfall %d). Something "
-                "still references the old tensors, or their blocks were split "
-                "and `ReleaseBlocks` skips split blocks. The chiplet budget "
-                "does not account for these bytes, so this run will exceed "
-                "gpu_memory_utilization by the shortfall. Per device: %s",
-                bytes_freed,
-                logical_bytes,
-                logical_bytes - bytes_freed,
-                records,
-            )
-        return bytes_freed
 
     def _reallocate_kv_cache(self, new_num_blocks: int) -> None:
         """Rebuild only the KV cache *tensors* at `new_num_blocks`.

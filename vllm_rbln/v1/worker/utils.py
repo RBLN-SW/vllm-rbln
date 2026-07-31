@@ -49,14 +49,15 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 RBLN_SYSFS_CLASS_DIR = "/sys/class/rebellions"
+# sysfs lists every card on the host; /dev lists only the ones this process was
+# given. That difference is why get_rbln_owned_card_indices exists.
+RBLN_DEV_DIR = "/dev"
 
 
 def get_rbln_visible_card_indices() -> list[int]:
     """Card indices this process may use, from `RBLN_DEVICES`.
 
-    `RblnPlatform.device_control_env_var` is `RBLN_DEVICES`, so vLLM narrows the
-    visible cards through it. When it is unset or empty every card the driver
-    exposes under /sys/class/rebellions is considered visible.
+    Unset or empty means every card under /sys/class/rebellions.
     """
     raw = os.environ.get("RBLN_DEVICES", "")
     if raw.strip():
@@ -70,6 +71,52 @@ def get_rbln_visible_card_indices() -> list[int]:
         if name.startswith("rbln") and name[4:].isdigit():
             found.append(int(name[4:]))
     return sorted(found)
+
+
+def _rbln_present_card_indices() -> list[int]:
+    """Physical card indices this process can open, from /dev/rbln*.
+
+    Device nodes keep their host numbering, so /dev is the only place that says
+    which cards are ours. [] means callers should fall back rather than guess.
+    """
+    try:
+        names = os.listdir(RBLN_DEV_DIR)
+    except OSError:
+        return []
+    return sorted(
+        int(name[4:])
+        for name in names
+        if name.startswith("rbln") and name[4:].isdigit()
+    )
+
+
+def get_rbln_owned_card_indices() -> list[int]:
+    """sysfs card indices this process owns, with `RBLN_DEVICES` resolved.
+
+    `RBLN_DEVICES` indexes the devices the *container* exposes, not the sysfs
+    card numbering; the two only coincide when the container holds card 0 upward.
+    So entry `i` selects the `i`-th present device, and reading the entry as a
+    sysfs name would charge a card belonging to somebody else. A physical name is
+    accepted too, so nothing is dropped on a container that does hold card 0.
+    """
+    present = _rbln_present_card_indices()
+    if not present:
+        # No device nodes (unit tests, host without the driver): nothing better
+        # is knowable, so keep the previous behaviour exactly.
+        return get_rbln_visible_card_indices()
+    raw = os.environ.get("RBLN_DEVICES", "")
+    if not raw.strip():
+        return present
+    owned: list[int] = []
+    for token in raw.replace(",", " ").split():
+        if not token.strip():
+            continue
+        index = int(token)
+        if 0 <= index < len(present):
+            owned.append(present[index])
+        elif index in present:
+            owned.append(index)
+    return sorted(set(owned)) or present
 
 
 def _read_card_attr_int(card_index: int, attr: str) -> int | None:
@@ -105,15 +152,20 @@ def read_rbln_card_dram_total_bytes() -> int | None:
 
 
 def read_rbln_card_dram_used_bytes() -> int:
-    """Largest `dram_used` across the visible cards (0 when sysfs is absent).
+    """Largest `dram_used` across the cards we own (0 when sysfs is absent).
 
-    Read before this process allocates anything, this is the memory other
-    tenants hold. sysfs only exposes usage per card, never per chiplet, so the
-    caller has to charge the whole amount against every chiplet.
+    Sampled before this process allocates anything, so it is what other tenants
+    hold. Cards we do not own are deliberately excluded: indexing sysfs by raw
+    `RBLN_DEVICES` charged a neighbour's workload to this worker, which cut a
+    measured run from 1024 KV blocks to 308 and, with a larger neighbour, drove
+    the per-chiplet budget negative.
+
+    Card-scope: sysfs exposes no per-chiplet breakdown, so the caller must scale
+    it to one chiplet before subtracting it from a per-chiplet budget.
     """
     used = [
         value
-        for card_index in get_rbln_visible_card_indices()
+        for card_index in get_rbln_owned_card_indices()
         if (value := _read_card_attr_int(card_index, "dram_used")) is not None
     ]
     return max(used, default=0)
@@ -131,9 +183,7 @@ def chiplet_replication_factor(num_key_value_heads: int, rsd_size: int) -> float
     """
     if num_key_value_heads <= 0 or rsd_size <= 0:
         return 1.0
-    return (
-        rsd_size * math.ceil(num_key_value_heads / rsd_size) / num_key_value_heads
-    )
+    return rsd_size * math.ceil(num_key_value_heads / rsd_size) / num_key_value_heads
 
 
 def divide_by_chiplet_replication(
@@ -362,25 +412,17 @@ def estimate_available_memory(
         buffer = buffer_per_runtime_per_core * num_runtimes
     available_dram_bytes -= buffer
 
-    # The KV cache is sharded over the rsd_size chiplets by KV head, so a
-    # num_key_value_heads that is not a multiple of rsd_size makes each chiplet
-    # round its head count up and the cache is physically replicated
-    # `rsd_size * ceil(kvh / rsd_size) / kvh` times, which is what
-    # `divide_by_chiplet_replication` divides by. The released expression
-    # `max(1, rsd_size // kvh)` agrees whenever kvh divides *or* is a multiple of
-    # rsd_size (kvh in {1, 2, 4, 8, 12, ...} at rsd_size 4 -- including both
-    # configurations measured on RBLN-CR: Qwen kvh=2 and MiniMax per-rank kvh=2,
-    # where both give exactly 2) and is optimistic otherwise (kvh in {3, 5, 6, 7,
-    # 9, 10, ...}).
+    # The released expression `max(1, rsd_size // kvh)` agrees with the exact
+    # replication factor whenever kvh divides or is a multiple of rsd_size, and
+    # is optimistic otherwise (kvh in {3, 5, 6, 7, 9, 10, ...} at rsd_size 4).
     #
-    # This is the *static* sizing path taken by every model, and the exact factor
-    # has never been checked against hardware for a kvh where the two disagree.
-    # It therefore only takes effect together with the dynamic-KV path, which
-    # sizes the cache from the compiled artifact anyway and re-validates the
-    # result against a per-chiplet budget; with the flag off the released value
-    # is kept byte-for-byte and the discrepancy is only reported. Note the exact
-    # factor is always >= the released one, so the flag can only ever *reduce*
-    # the estimate -- never grow it into an OOM.
+    # This is the *static* path every model takes and the exact factor has never
+    # been checked against hardware for a kvh where the two disagree, so it only
+    # applies together with dynamic KV -- which re-derives the size from the
+    # compiled artifact and re-validates it per chiplet. With the flag off the
+    # released value is kept byte-for-byte and the gap is only reported. The
+    # exact factor is always >= the released one, so the flag can only reduce the
+    # estimate, never grow it into an OOM.
     rsd_replicas = max(1, rsd_size // num_key_value_heads)
     released_dram_bytes = available_dram_bytes // rsd_replicas
     exact_dram_bytes = divide_by_chiplet_replication(
@@ -420,9 +462,7 @@ def estimate_available_memory(
                 *args,
             )
     available_dram_bytes = (
-        exact_dram_bytes
-        if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE
-        else released_dram_bytes
+        exact_dram_bytes if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE else released_dram_bytes
     )
 
     check_oom(available_dram_bytes)
