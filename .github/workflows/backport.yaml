@@ -35,3 +35,11 @@ jobs:
           label_pattern: '^backport ([^ ]+)$'
           copy_labels_pattern: '.*'
           conflict_resolution: draft_commit_conflicts
+          # The default title is prefixed with "[Backport <branch>]", which fails
+          # the conventional-commit check in pr_title_check.yaml. Keep the original
+          # title so the check passes and the squashed commit on the release branch
+          # reads the same as it does on dev.
+          pull_title: '${pull_title}'
+          pull_description: |-
+            # Description
+            Backport of #${pull_number} to `${target_branch}`, originally by @${pull_author}.
