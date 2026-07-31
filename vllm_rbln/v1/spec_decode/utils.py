@@ -93,6 +93,29 @@ DRAFT_ID_LOG_STEPS = int(os.getenv("VLLM_RBLN_EAGLE3_DRAFT_ID_LOG_STEPS", "0"))
 # is inside the arm-to-arm spread.
 UNROLL_DRAFTER = os.getenv("VLLM_RBLN_EAGLE3_UNROLL_DRAFTER", "0") == "1"
 
+# Reproduce the pre-fix warmup, where `dummy_run` compiled the narrow input while
+# serving handed the folded wide one, forcing a runtime recompile.
+#
+# For measurement only. That state works exactly once per fresh cache -- the
+# second start fails with `code=201 INIT_INTERNAL (Seed address mismatch)` -- so
+# it is not a shippable configuration. It exists because the fix is not provably
+# performance-neutral: it changes which graphs the cache holds (the buggy path
+# leaves an unused narrow graph behind), and the device memory layout that
+# follows moves even graphs that were not touched. Measured `graph 1/1`, whose
+# code and inputs are identical either way, differs by 0.32 ms/step between the
+# two. Comparing them needs both.
+WARMUP_SKIP_FOLD = os.getenv("VLLM_RBLN_EAGLE3_WARMUP_SKIP_FOLD", "0") == "1"
+
+# Whether FUSE_FIRST_FORWARD also folds the projection on prefill steps.
+#
+# Decode and prefill are separable: the decode graph pads to the batch bucket
+# while the prefill graph takes the whole buffer, so each can fold independently.
+# Splitting them is what isolates the prefill half, whose only evidence so far is
+# `d/first: combine` going 46.58 -> 0.00 in region 0/0 -- a number from one region
+# that says nothing about what it costs elsewhere. `aux_cat` looked the same way
+# and turned out to be a regression.
+FUSE_PREFILL = os.getenv("VLLM_RBLN_EAGLE3_FUSE_PREFILL", "1") == "1"
+
 
 
 def eagle_prepare_next_token_padded(

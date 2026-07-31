@@ -46,9 +46,11 @@ from vllm_rbln.v1.attention.kv_cache_bindings import (
 from vllm_rbln.v1.spec_decode.utils import (
     DRAFT_ID_LOG_STEPS,
     FUSE_FIRST_FORWARD,
+    FUSE_PREFILL,
     NARROW_LOGITS,
     SKIP_DP_RENDEZVOUS,
     UNROLL_DRAFTER,
+    WARMUP_SKIP_FOLD,
     eagle_prepare_inputs_padded,
     eagle_prepare_next_token_padded,
 )
@@ -96,7 +98,7 @@ class RBLNEagleProposer(EagleProposer):
         self._compiled_unrolled = None
         self._draft_id_logged = 0
 
-    def _fold_combine(self) -> bool:
+    def _fold_combine(self, is_prefill: bool | None = None) -> bool:
         """Whether the aux-state projection runs inside the drafter's graph.
 
         Both the decode and the prefill drafter graphs take a fixed-shape
@@ -104,8 +106,19 @@ class RBLNEagleProposer(EagleProposer):
         adding a shape variant: decode pads to the batch bucket, prefill takes
         the whole buffer. That leaves the projection's weight device-resident
         instead of materialised on every eager call.
+
+        `is_prefill` must be passed wherever the caller already knows it.
+        `dummy_run` compiles prefill and decode shapes in the same pass while
+        `runner.is_prefill` does not move between them, so reading the runner
+        there folds the prefill graph as well and the first real prefill step
+        recompiles -- the exact failure this fold was added to remove, moved to
+        the other path.
         """
-        return FUSE_FIRST_FORWARD and self.method == "eagle3"
+        if not (FUSE_FIRST_FORWARD and self.method == "eagle3"):
+            return False
+        if is_prefill is None:
+            is_prefill = self.runner.is_prefill
+        return FUSE_PREFILL or not is_prefill
 
     def _aux_width(self) -> int:
         """Width the folded projection expects at its input.
@@ -146,6 +159,149 @@ class RBLNEagleProposer(EagleProposer):
         if NARROW_LOGITS:
             ids = self.model.target_ids.index_select(0, ids)
         return ids
+
+
+    def _build_loop_metadata(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        positions: torch.Tensor,
+        num_reqs: int,
+        num_reqs_padded: int,
+    ) -> tuple[dict[str, object], torch.Tensor]:
+        """Advance one drafter iteration on the host and build its metadata.
+
+        Mirrors the `loop_update` + `attn_meta` pair in `propose`, minus the
+        buffer writes: the unrolled graph chains through graph values, so
+        `self.input_ids` / `positions` / `hidden_states` are not used between
+        iterations.
+
+        The `_seq_lens_cpu` shadow has to move with the device tensor. The
+        flash-attention builder reads the shadow, not `seq_lens`, so leaving it
+        stale makes every iteration after the first attend at the wrong length --
+        which does not crash and does not collapse acceptance.
+        """
+        positions = positions.view(-1) + 1
+        exceeds = positions[:num_reqs] >= self.max_model_len
+        common_attn_metadata.seq_lens += 1
+        common_attn_metadata.seq_lens.masked_fill_(exceeds, 1)
+        _slc = common_attn_metadata._seq_lens_cpu
+        if _slc is not None:
+            _slc += 1
+            _slc.masked_fill_(exceeds.to(_slc.device), 1)
+
+        per_layer: dict[str, object] = {}
+        for attn_group in self.draft_attn_groups:
+            am = attn_group.get_metadata_builder().build(
+                common_attn_metadata=common_attn_metadata,
+                positions=positions,
+                is_prefill=False,
+                batch_pad=num_reqs_padded,
+            )
+            attach_kv_cache_bindings(
+                am,
+                self.runner.kv_caches,
+                self.runner.kv_cache_bases,
+                self.runner.kv_cache_view_infos,
+            )
+            for layer_name in attn_group.layer_names:
+                per_layer[layer_name] = am
+        return per_layer, positions
+
+
+    def _propose_unrolled(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        per_layer_attn_metadata: dict[str, object],
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        token_indices_to_sample_padded: torch.Tensor | None,
+        target_positions: torch.Tensor,
+        num_reqs: int,
+        num_tokens: int,
+        num_reqs_padded: int,
+        num_padded_tokens: int | None,
+        num_tokens_across_dp: torch.Tensor | None,
+        num_rejected_tokens: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """The drafter's whole chain in one compiled call.
+
+        Replaces the first forward plus the `num_spec - 1` loop iterations, which
+        are three graphs today (`1/3`, `1/1` twice) with host work between them.
+
+        Everything the iterations need that differs is `seq_lens`, so this builds
+        one metadata dict per iteration on the host -- the builder reads the
+        `_seq_lens_cpu` shadow, which cannot move into the graph -- and hands the
+        list to `set_forward_context`. `patched_get_attention_context` indexes it
+        by `draft_unroll_index`, which the unrolled body advances; each copy is
+        traced with a constant index, so the three iterations read three different
+        tensors even though attention takes its metadata from the forward context
+        rather than as an argument.
+
+        `block_tables` is loop-invariant: `num_lookahead_tokens = num_spec` is
+        passed to `allocate_slots`, so the slots for every draft position exist
+        before the loop starts. The masks are None under
+        VLLM_RBLN_FLASH_CAUSAL_ATTN and the sliding-window fields are None, and
+        the KV write derives its slot from `seq_lens` inside the kernel.
+
+        Verify with `equiv_check.sh`, not with acceptance.
+        """
+        metas = [per_layer_attn_metadata]
+
+        # The loop iterations see a one-token query, and the rejected-token
+        # adjustment lands before the first of them. Same order as `propose`.
+        common_attn_metadata.num_actual_tokens = num_reqs
+        common_attn_metadata.max_query_len = 1
+        common_attn_metadata.query_start_loc = self.arange[: num_reqs + 1]
+        common_attn_metadata.query_start_loc_cpu = self.arange[: num_reqs + 1].cpu()
+        if num_rejected_tokens is not None:
+            common_attn_metadata.seq_lens -= num_rejected_tokens
+            _slc0 = common_attn_metadata._seq_lens_cpu
+            if _slc0 is not None:
+                _slc0 -= num_rejected_tokens.to(_slc0.device, _slc0.dtype)
+
+        with record_function_or_nullcontext("drafter/unroll: batch_padding"):
+            num_reqs_padded, num_padded_tokens, num_tokens_across_dp = (
+                self._determine_draft_batch_padding(num_reqs, num_reqs, False)
+            )
+
+        assert token_indices_to_sample_padded is not None
+        loop_positions = target_positions[
+            token_indices_to_sample_padded.to(target_positions.device)
+        ]
+        with record_function_or_nullcontext("drafter/unroll: attn_meta"):
+            for _ in range(self.num_speculative_tokens - 1):
+                meta, loop_positions = self._build_loop_metadata(
+                    common_attn_metadata, loop_positions, num_reqs, num_reqs_padded
+                )
+                metas.append(meta)
+
+        with (
+            record_function_or_nullcontext("drafter/unroll: forward"),
+            set_forward_context(
+                metas,
+                self.vllm_config,
+                num_tokens=num_tokens,
+                num_tokens_across_dp=num_tokens_across_dp,
+                num_padded_tokens=num_padded_tokens,
+                **build_kv_cache_forward_context_kwargs(self.runner.kv_cache_bases),
+            ),
+        ):
+            draft_token_ids = self._compiled_unrolled(
+                input_ids,
+                positions,
+                hidden_states,
+                token_indices_to_sample_padded,
+            )
+
+        if DRAFT_ID_LOG_STEPS and self._draft_id_logged < DRAFT_ID_LOG_STEPS:
+            self._draft_id_logged += 1
+            logger.info(
+                "DRAFT_IDS step=%d %s",
+                self._draft_id_logged,
+                draft_token_ids.reshape(-1).tolist(),
+            )
+        return draft_token_ids
 
     def propose(
         self,
@@ -248,6 +404,28 @@ class RBLNEagleProposer(EagleProposer):
                         flat[:num_tokens].view(num_reqs, -1, w), 0, num_reqs_padded
                     )
         inputs_embeds = None
+
+        if (
+            UNROLL_DRAFTER
+            and self._compiled_unrolled is not None
+            and not is_prefill
+            and self.num_speculative_tokens > 1
+        ):
+            return self._propose_unrolled(
+                common_attn_metadata=common_attn_metadata,
+                per_layer_attn_metadata=per_layer_attn_metadata,
+                input_ids=input_ids,
+                positions=positions,
+                hidden_states=hidden_states,
+                token_indices_to_sample_padded=token_indices_to_sample_padded,
+                target_positions=target_positions,
+                num_reqs=num_reqs,
+                num_tokens=num_tokens,
+                num_reqs_padded=num_reqs_padded,
+                num_padded_tokens=num_padded_tokens,
+                num_tokens_across_dp=num_tokens_across_dp,
+                num_rejected_tokens=num_rejected_tokens,
+            )
 
         with (
             record_function_or_nullcontext("drafter/first: forward"),
@@ -646,8 +824,15 @@ class RBLNEagleProposer(EagleProposer):
             for step in range(1, self.num_speculative_tokens):
                 set_draft_unroll_index(step)
                 pos = pos + 1
+                # `model_wrapper` returns hidden states as (num_tokens, hidden),
+                # but the model expects the `[B, L, H]` layout `_preprocess`
+                # produces. The loop iterations feed one token per request, so
+                # that is (num_reqs, 1, hidden).
+                nxt = out[-1].reshape(-1, 1)
                 h, ids = model_wrapper(
-                    out[-1].reshape(-1, 1), pos.reshape(-1, 1), h
+                    nxt,
+                    pos.reshape(-1, 1),
+                    h.reshape(nxt.shape[0], -1, self.hidden_size),
                 )
                 out.append(ids.reshape(-1))
             reset_draft_unroll_index()
@@ -815,7 +1000,7 @@ class RBLNEagleProposer(EagleProposer):
                 is_prefill,
             )
         )
-        if self._fold_combine():
+        if self._fold_combine(is_prefill) and not WARMUP_SKIP_FOLD:
             # Compile the shape serving will actually hand in. `propose` replaces
             # the narrow buffer view with the wide aux states when the projection
             # is folded, so the warmup has to do the same or the first real step
