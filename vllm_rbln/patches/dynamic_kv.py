@@ -29,6 +29,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 import vllm
+from vllm.utils.math_utils import cdiv
 from vllm.v1.engine.core import EngineCore
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
@@ -214,8 +215,37 @@ def patched_initialize_kv_caches(
         old_num_blocks,
         num_blocks,
     )
+    assert_kv_cache_fits_one_request(vllm_config, kv_cache_config)
     _log_gpu_kv_cache_size(vllm_config, kv_cache_config)
     return kv_cache_config
+
+
+def assert_kv_cache_fits_one_request(
+    vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
+) -> None:
+    """Fail loudly when the resized pool cannot hold a single max-length request.
+
+    Upstream's `check_enough_kv_cache_memory` runs inside `get_kv_cache_configs`,
+    i.e. against the *pre-compile estimate*. Nothing re-checks the number this
+    path substitutes, so a profile that returns fewer blocks than one request
+    needs would leave a server that starts and then rejects every request --
+    where dev dies at start-up with an actionable message. Restore that
+    behaviour.
+    """
+    block_size = vllm_config.cache_config.block_size
+    max_model_len = vllm_config.model_config.max_model_len
+    if not block_size or not max_model_len:
+        return
+    needed = cdiv(max_model_len, block_size)
+    if kv_cache_config.num_blocks >= needed:
+        return
+    raise ValueError(
+        f"The KV cache sized from the compiled profile holds "
+        f"{kv_cache_config.num_blocks} blocks, but a single request of "
+        f"max_model_len={max_model_len} needs {needed} at block_size="
+        f"{block_size}. Reduce max_model_len, raise gpu_memory_utilization, or "
+        f"give the model more devices."
+    )
 
 
 def _log_gpu_kv_cache_size(
