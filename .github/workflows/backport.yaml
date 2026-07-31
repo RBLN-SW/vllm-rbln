@@ -1,7 +1,10 @@
 name: Backport merged pull request
 
 on:
-  pull_request_target:
+  # TEMP: production must use pull_request_target on the default branch.
+  # pull_request runs from the base branch, which is what lets this be tested
+  # on a throwaway branch without touching main.
+  pull_request:
     types: [closed]
 
 permissions:
