@@ -587,6 +587,41 @@ class RBLNWorker(WorkerBase):
                 "the new block count."
             )
 
+        self._assert_dynamic_kv_compiler_support()
+
+    def _assert_dynamic_kv_compiler_support(self) -> None:
+        """Guard: the installed rebel-compiler must carry the #10678 API.
+
+        `rebel.kv_cache.max_num_blocks` and `DynamoRuntime.reset_adaptive_buffers`
+        both arrived in the same commit. Both are reached only *after* the model
+        has compiled and warmed up, so on an older compiler the run pays the full
+        compile and then dies on a bare ImportError / AttributeError. Probe them
+        up front instead, before anything is compiled.
+        """
+        try:
+            from rebel.kv_cache import max_num_blocks  # noqa: F401
+        except ImportError as exc:
+            raise RuntimeError(
+                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE requires a rebel-compiler that "
+                "provides rebel.kv_cache.max_num_blocks (rebel_compiler #10678). "
+                f"The installed one does not: {exc}"
+            ) from exc
+
+        try:
+            from rebel.sync_runtime import DynamoRuntime
+        except ImportError:
+            # The class moved or is not importable here; the per-runtime type
+            # check in _assert_dynamo_runtimes still covers the real objects.
+            return
+        # Defined on BaseRuntime, which DynamoRuntime inherits from.
+        if not hasattr(DynamoRuntime, "reset_adaptive_buffers"):
+            raise RuntimeError(
+                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE requires a rebel-compiler whose "
+                "DynamoRuntime provides reset_adaptive_buffers() "
+                "(rebel_compiler #10678); without it the KV cache cannot be "
+                "resized after warm-up."
+            )
+
     def _assert_dynamic_kv_transfer_absent(self) -> None:
         """Guard: a KV connector and dynamic KV cannot be combined.
 
