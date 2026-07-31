@@ -459,6 +459,134 @@ class TestChipletReplicationFactor:
 
 
 # ---------------------------------------------------------------------------
+# who gets the exact replication factor
+# ---------------------------------------------------------------------------
+class TestReplicationFactorIsGated:
+    """`estimate_available_memory` is the sizing path EVERY model takes.
+
+    The exact factor is larger than the released `max(1, rsd_size // kvh)`
+    whenever kvh is neither a divisor nor a multiple of rsd_size, so switching to
+    it unconditionally would silently hand those models a smaller KV cache
+    (measured on RBLN-CR100, kernel 6 GiB, gmu 0.9: kvh=5 118.00 -> 73.75 GiB,
+    kvh=10 -> 98.33, kvh=3/6/9 -> 88.50). No such head count has been checked
+    against hardware, so the released number stays unless the dynamic-KV path --
+    which re-derives the block count from the compiled artifact and validates it
+    per chiplet -- is switched on.
+    """
+
+    KERNEL = 6 * 2**30
+    # kvh where the two formulas disagree -> (released GiB, exact GiB)
+    DISAGREE = {3: (118.0, 88.5), 5: (118.0, 73.75), 6: (118.0, 88.5),
+                7: (118.0, 103.25), 9: (118.0, 88.5), 10: (118.0, 98.3333)}
+    AGREE = (1, 2, 4, 8, 12, 16)
+
+    def _measure(self, mock_envs, mock_platform, num_kv_heads, dynamic_kv):
+        mock_platform.get_device_name.return_value = "RBLN-CR100"
+        mock_envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK = 1
+        mock_envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE = dynamic_kv
+        return estimate_available_memory(
+            _make_model_config(num_kv_heads=num_kv_heads),
+            _make_parallel_config(tp_size=1),
+            kernel_size=self.KERNEL,
+            gpu_memory_utilization=0.9,
+        )
+
+    @patch("vllm_rbln.v1.worker.utils.current_platform")
+    @patch("vllm_rbln.v1.worker.utils.envs")
+    @pytest.mark.parametrize("num_kv_heads", sorted(DISAGREE))
+    def test_default_path_keeps_the_released_number(
+        self, mock_envs, mock_platform, num_kv_heads
+    ):
+        got = self._measure(mock_envs, mock_platform, num_kv_heads, False)
+        released, exact = self.DISAGREE[num_kv_heads]
+        assert got / 2**30 == pytest.approx(released, abs=1e-3)
+        # ... and is emphatically NOT the exact one.
+        assert got / 2**30 != pytest.approx(exact, abs=1e-3)
+
+    @patch("vllm_rbln.v1.worker.utils.current_platform")
+    @patch("vllm_rbln.v1.worker.utils.envs")
+    @pytest.mark.parametrize("num_kv_heads", sorted(DISAGREE))
+    def test_flag_applies_the_exact_factor(
+        self, mock_envs, mock_platform, num_kv_heads
+    ):
+        got = self._measure(mock_envs, mock_platform, num_kv_heads, True)
+        _released, exact = self.DISAGREE[num_kv_heads]
+        assert got / 2**30 == pytest.approx(exact, abs=1e-3)
+
+    @patch("vllm_rbln.v1.worker.utils.current_platform")
+    @patch("vllm_rbln.v1.worker.utils.envs")
+    @pytest.mark.parametrize("num_kv_heads", AGREE)
+    def test_flag_changes_nothing_where_the_formulas_agree(
+        self, mock_envs, mock_platform, num_kv_heads
+    ):
+        """Includes both measured configurations: Qwen and MiniMax are kvh=2."""
+        off = self._measure(mock_envs, mock_platform, num_kv_heads, False)
+        on = self._measure(mock_envs, mock_platform, num_kv_heads, True)
+        assert off == on
+
+    @patch("vllm_rbln.v1.worker.utils.current_platform")
+    @patch("vllm_rbln.v1.worker.utils.envs")
+    def test_the_released_number_is_never_the_smaller_one(
+        self, mock_envs, mock_platform
+    ):
+        """The flag can only shrink the estimate, so it cannot introduce an OOM."""
+        for num_kv_heads in sorted(self.DISAGREE) + list(self.AGREE):
+            off = self._measure(mock_envs, mock_platform, num_kv_heads, False)
+            on = self._measure(mock_envs, mock_platform, num_kv_heads, True)
+            assert on <= off, num_kv_heads
+
+    @patch("vllm_rbln.v1.worker.utils.current_platform")
+    @patch("vllm_rbln.v1.worker.utils.envs")
+    def test_disagreement_is_reported_not_silent(
+        self, mock_envs, mock_platform, caplog
+    ):
+        with caplog.at_level("WARNING"):
+            self._measure(mock_envs, mock_platform, 5, False)
+        warnings = [
+            r.getMessage()
+            for r in caplog.records
+            if r.levelname == "WARNING" and "KV cache replication" in r.getMessage()
+        ]
+        assert len(warnings) == 1
+        assert "num_key_value_heads=5" in warnings[0]
+        assert "118.000 GiB released" in warnings[0]
+        assert "73.750 GiB exact" in warnings[0]
+
+    @patch("vllm_rbln.v1.worker.utils.current_platform")
+    @patch("vllm_rbln.v1.worker.utils.envs")
+    def test_no_warning_when_the_formulas_agree(
+        self, mock_envs, mock_platform, caplog
+    ):
+        with caplog.at_level("WARNING"):
+            self._measure(mock_envs, mock_platform, 2, False)
+        assert not [
+            r for r in caplog.records if "KV cache replication" in r.getMessage()
+        ]
+
+    @patch("vllm_rbln.v1.worker.utils.current_platform")
+    @patch("vllm_rbln.v1.worker.utils.envs")
+    def test_heterogeneous_cards_do_not_break_the_static_path(
+        self, mock_envs, mock_platform, caplog
+    ):
+        """The per-chiplet reader refuses to answer; this path must not die.
+
+        `read_rbln_card_dram_total_bytes` raises when the visible cards report
+        different capacities, because a single per-chiplet budget would be
+        meaningless. This estimate only wants one card's capacity and used to read
+        a literal, so it falls back instead of turning a mixed host into a
+        start-up failure.
+        """
+        with patch(
+            "vllm_rbln.v1.worker.utils.read_rbln_card_dram_total_bytes",
+            side_effect=RuntimeError("visible RBLN cards report different dram_total"),
+        ), caplog.at_level("WARNING"):
+            got = self._measure(mock_envs, mock_platform, 8, False)
+        # 144 GiB - 4 GiB, the literal, == what sysfs reports on a uniform host.
+        assert got / 2**30 == pytest.approx(118.0, abs=1e-3)
+        assert any("different dram_total" in m for m in caplog.messages)
+
+
+# ---------------------------------------------------------------------------
 # sysfs DRAM readers
 # ---------------------------------------------------------------------------
 class TestRblnSysfsReaders:

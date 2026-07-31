@@ -279,13 +279,24 @@ def estimate_available_memory(
         REBEL_CHIPLET_SIZE = 4
         # single device == Quad chiplet
         rsd_size = REBEL_CHIPLET_SIZE
-        # Prefer the driver's own figure over the literal above. On the current
-        # RBLN-CR hosts sysfs dram_total is 150,323,855,360 B = exactly 140.0
-        # GiB, i.e. the literal's value, so this changes no number today -- it
-        # only makes the capacity come from the device instead of a constant.
-        # sysfs is absent on NPU-less hosts (CI / cross-compile), hence the
-        # fallback.
-        sysfs_dram_total = read_rbln_card_dram_total_bytes()
+        # Prefer the driver's figure over the literal above. It reports the same
+        # value on current RBLN-CR hosts, so no number changes today -- the
+        # capacity just comes from the device. sysfs is absent on NPU-less hosts
+        # (CI / cross-compile), hence the fallback.
+        try:
+            sysfs_dram_total = read_rbln_card_dram_total_bytes()
+        except RuntimeError as exc:
+            # The reader refuses on heterogeneous cards because a *per-chiplet*
+            # budget would be meaningless, but this estimate only wants one
+            # card's capacity. Raising here would be a new failure mode on the
+            # default path, so fall back to the literal and say so.
+            logger.warning(
+                "%s; falling back to the built-in %d byte DRAM capacity for the "
+                "static KV cache estimate.",
+                exc,
+                REBEL_DRAM_NBYTES,
+            )
+            sysfs_dram_total = None
         if sysfs_dram_total is None:
             logger.debug(
                 "sysfs %s is unavailable; falling back to the built-in %d byte "
@@ -354,12 +365,64 @@ def estimate_available_memory(
     # The KV cache is sharded over the rsd_size chiplets by KV head, so a
     # num_key_value_heads that is not a multiple of rsd_size makes each chiplet
     # round its head count up and the cache is physically replicated
-    # `rsd_size * ceil(kvh / rsd_size) / kvh` times. This replaces
-    # `max(1, rsd_size // num_key_value_heads)`, which happens to agree whenever
-    # kvh divides rsd_size (kvh in {1, 2, 4} at rsd_size 4 -- including the
-    # RBLN-CR Qwen case, where both give exactly 2) and is wrong otherwise.
-    available_dram_bytes = divide_by_chiplet_replication(
+    # `rsd_size * ceil(kvh / rsd_size) / kvh` times, which is what
+    # `divide_by_chiplet_replication` divides by. The released expression
+    # `max(1, rsd_size // kvh)` agrees whenever kvh divides *or* is a multiple of
+    # rsd_size (kvh in {1, 2, 4, 8, 12, ...} at rsd_size 4 -- including both
+    # configurations measured on RBLN-CR: Qwen kvh=2 and MiniMax per-rank kvh=2,
+    # where both give exactly 2) and is optimistic otherwise (kvh in {3, 5, 6, 7,
+    # 9, 10, ...}).
+    #
+    # This is the *static* sizing path taken by every model, and the exact factor
+    # has never been checked against hardware for a kvh where the two disagree.
+    # It therefore only takes effect together with the dynamic-KV path, which
+    # sizes the cache from the compiled artifact anyway and re-validates the
+    # result against a per-chiplet budget; with the flag off the released value
+    # is kept byte-for-byte and the discrepancy is only reported. Note the exact
+    # factor is always >= the released one, so the flag can only ever *reduce*
+    # the estimate -- never grow it into an OOM.
+    rsd_replicas = max(1, rsd_size // num_key_value_heads)
+    released_dram_bytes = available_dram_bytes // rsd_replicas
+    exact_dram_bytes = divide_by_chiplet_replication(
         available_dram_bytes, num_key_value_heads, rsd_size
+    )
+    if released_dram_bytes != exact_dram_bytes:
+        args = (
+            num_key_value_heads,
+            rsd_size,
+            chiplet_replication_factor(num_key_value_heads, rsd_size),
+            math.ceil(num_key_value_heads / rsd_size),
+            rsd_replicas,
+            released_dram_bytes / 2**30,
+            exact_dram_bytes / 2**30,
+        )
+        if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
+            logger.info(
+                "KV cache replication: num_key_value_heads=%d over %d chiplets "
+                "is physically replicated %.4gx (each chiplet rounds up to %d "
+                "heads), but the released estimate divides the DRAM budget by "
+                "%d: %.3f GiB released vs %.3f GiB exact. Using the exact "
+                "figure (VLLM_RBLN_USE_DYNAMIC_KV_CACHE=1); the compiled "
+                "artifact re-derives the block count per chiplet anyway.",
+                *args,
+            )
+        else:
+            logger.warning(
+                "KV cache replication: num_key_value_heads=%d over %d chiplets "
+                "is physically replicated %.4gx (each chiplet rounds up to %d "
+                "heads), but the released estimate divides the DRAM budget by "
+                "%d: %.3f GiB released vs %.3f GiB exact. Keeping the larger, "
+                "released figure: the exact factor has not been checked against "
+                "hardware for this head count. Set "
+                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE=1 to size the KV cache from the "
+                "compiled artifact, which applies the exact factor and validates "
+                "the result per chiplet.",
+                *args,
+            )
+    available_dram_bytes = (
+        exact_dram_bytes
+        if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE
+        else released_dram_bytes
     )
 
     check_oom(available_dram_bytes)

@@ -71,8 +71,10 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.utils import (
 )
 from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.worker.kv_profile import (
+    MERGED_PROFILE_LOG_KEY,
     assert_budget_covers_profile,
     build_per_chiplet_budget,
+    format_profile_for_log,
     merge_kv_cache_memory_profiles,
     per_chiplet_usage,
 )
@@ -789,6 +791,22 @@ class RBLNWorker(WorkerBase):
                 continue
             profiles.append(profile)
             profiled_ids.add(id(runtime))
+            # The full profile, verbatim, one line per artifact: the only record
+            # of base_bytes / bytes_per_block / alignment, since neither sysfs nor
+            # the runtime's allocation log exposes the per-block cost. Without it
+            # a finished run cannot be re-analysed offline. The identity fields go
+            # after the region list so a reader that splits at `device_regions=[`
+            # can still say which artifact the regions came from.
+            logger.info(
+                "[Dynamic KV] compiled profile: %s rank=%d profile_index=%d "
+                "runtime=%s#%d num_regions=%d",
+                format_profile_for_log(profile),
+                self.rank,
+                len(profiles) - 1,
+                type(runtime).__name__,
+                len(profiles) - 1,
+                len(profile.device_regions),
+            )
 
         if not profiles:
             logger.error(
@@ -800,6 +818,20 @@ class RBLNWorker(WorkerBase):
             return None
 
         merged = merge_kv_cache_memory_profiles(profiles)
+        # `merged_regions=`, not `device_regions=`: a reader scanning for the
+        # latter would otherwise pick the merge up as one more source profile.
+        logger.info(
+            "[Dynamic KV] merged profile: %s rank=%d num_source_profiles=%d "
+            "dedup=%s num_regions=%d shared_base=%d private_base=%d growth=%d",
+            format_profile_for_log(merged, MERGED_PROFILE_LOG_KEY),
+            self.rank,
+            merged.num_source_profiles,
+            merged.dedup_strategy,
+            len(merged.device_regions),
+            merged.num_shared_base_regions,
+            merged.num_private_base_regions,
+            merged.num_growth_regions,
+        )
         num_nodes, num_chiplets = self._dynamic_kv_device_topology(runtimes)
         budget_per_chiplet = self._dynamic_kv_chiplet_budget(num_chiplets)
         budget = build_per_chiplet_budget(num_nodes, num_chiplets, budget_per_chiplet)
@@ -839,9 +871,12 @@ class RBLNWorker(WorkerBase):
             return None
 
         fit_usage = per_chiplet_usage(merged, num_blocks)
+        # Field names, not prose: a log reader keys on `computed_num_blocks` /
+        # `chiplet_budget_bytes` to recover the answer and its budget.
         logger.info(
-            "[Dynamic KV] rank %d: num_blocks=%d budget_per_chiplet=%d "
-            "predicted usage per (node, chiplet)=%s total=%d",
+            "[Dynamic KV] rank %d: computed_num_blocks=%d "
+            "chiplet_budget_bytes=%d predicted usage per (node, chiplet)=%s "
+            "total=%d",
             self.rank,
             num_blocks,
             budget_per_chiplet,
@@ -893,8 +928,8 @@ class RBLNWorker(WorkerBase):
 
         if n is None:
             logger.warning(
-                "[Dynamic KV] restoring the KV cache to the %d blocks vllm "
-                "sized it with (compiled with %d).",
+                "[Dynamic KV] restoring KV cache to the %d blocks vllm sized it "
+                "with (compiled with %d).",
                 target,
                 current,
             )

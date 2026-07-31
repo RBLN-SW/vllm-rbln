@@ -154,8 +154,10 @@ def patched_initialize_kv_caches(
         "compute_dynamic_kv_num_blocks"
     )
     num_blocks = resolve_rank_num_blocks(num_blocks_per_rank)
+    # Name both rpcs: the counts alone do not say which side produced them.
     logger.info(
-        "dynamic KV cache: per-rank block counts %s -> %s",
+        "dynamic KV cache: compute_dynamic_kv_num_blocks returned %s per rank -> "
+        "apply_dynamic_kv_num_blocks(%s)",
         num_blocks_per_rank,
         num_blocks,
     )
@@ -192,9 +194,11 @@ def _log_gpu_kv_cache_size(
 ) -> None:
     """Re-announce the KV cache size after the resize.
 
-    The original line is emitted inside `get_kv_cache_configs`, i.e. before
-    warm-up, so it reports the pre-resize number and `logger.info_once` will not
-    print it a second time.
+    Upstream emits its line before warm-up, so it reports the pre-resize number
+    and `info_once` will not print it again. Both lines keep upstream's exact
+    wording and token count so that whatever reads the first announcement --
+    logs, dashboards -- reads the corrected one the same way and sees the last
+    value win.
     """
     try:
         from vllm.v1.core.kv_cache_utils import (
@@ -206,11 +210,14 @@ def _log_gpu_kv_cache_size(
             vllm_config, kv_cache_config
         )
         logger.info(
-            "GPU KV cache size (after dynamic KV resize): %s tokens "
-            "(num_blocks=%d, maximum concurrency for %s tokens per request: "
-            "%.2fx)",
+            "GPU KV cache size: %s tokens (num_blocks=%d, after the dynamic KV "
+            "resize)",
             f"{int(max_concurrency * max_model_len):,}",
             kv_cache_config.num_blocks,
+        )
+        logger.info(
+            "Maximum concurrency for %s tokens per request: %.2fx (after the "
+            "dynamic KV resize)",
             f"{max_model_len:,}",
             max_concurrency,
         )
