@@ -196,6 +196,7 @@ class RBLNFlashAttnMLAImpl(MLAAttentionImpl[RBLNFlashAttentionMetadata]):
         output: torch.Tensor | None = None,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
+        topk_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass.
 
@@ -220,6 +221,18 @@ class RBLNFlashAttnMLAImpl(MLAAttentionImpl[RBLNFlashAttentionMetadata]):
         q = torch.cat(
             [decode_ql_nope, decode_q_pe], dim=-1
         )  # [B, H, S, lora_rank+rope]
+
+        if topk_indices is not None:
+            attn_output = torch.ops.rbln_custom_ops.sparse_attn_deepseek_mla(
+                q,
+                kv_c_normed,
+                k_pe,
+                kv_cache,
+                attn_metadata.seq_lens,
+                attn_metadata.block_tables,
+                topk_indices,
+            )
+            return self._v_up_proj(attn_output, layer.W_UV)
 
         # Dispatch to custom kernel
         if attn_metadata.is_prefill:

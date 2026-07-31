@@ -1,0 +1,40 @@
+Frozen third-party sources: A.X K2 (model_type "axk2")
+======================================================
+
+_skt_model.py   <-  vllm/model_executor/models/axk2.py
+_skt_config.py  <-  vllm/transformers_utils/configs/axk2.py
+
+Source    : https://github.com/SKT-AI/vllm
+Revision  : 57c7f3255895f3964d1f996edbcd5f988e0a787d   (branch axk2-v0.23.0)
+Fetched   : 2026-07-30
+Based on  : upstream vLLM v0.23.0
+License   : Apache-2.0 (same as vLLM and vllm-rbln)
+Model card: https://huggingface.co/skt/A.X-K2
+
+sha256:
+  _skt_model.py   2cf42d9f108bbfa5ae7fdb606e98fa7d99157c15fb273fa41205ef1d80ab9843
+  _skt_config.py  13383a63ac0983b89adb477f00e3e4082bda326a53fa16ace977bd35af54d4e4
+
+
+DO NOT EDIT _skt_*.py
+---------------------
+These are byte-identical copies. Keeping them frozen is the whole point of this
+layout: everything that has to change as upstream vLLM moves lives in our own
+`model.py` / `__init__.py`, so a vLLM bump only touches vllm-rbln code, and when
+SKT rebases their fork we can drop the new files in and delete the shims that are
+no longer needed -- no three-way merge.
+
+`ruff` is configured to skip `_skt_*.py` (see pyproject.toml). `ruff check --fix`
+rewrote 12 places in _skt_model.py once; the exclude exists so tooling cannot
+break the freeze again.
+
+If a vLLM bump breaks these files, fix it in `model.py` (shim the upstream API
+back into the shape the frozen file expects, or override the offending method).
+Only give up and absorb the file into vllm-rbln proper when the adapter is
+overriding more than ~3 axk2 methods or the shims exceed a few hundred lines --
+at that point freezing costs more than owning.
+
+The axk2 architecture is not in upstream vLLM yet; SKT's model card states
+upstreaming is "in preparation". Everything under this directory is marked
+REMOVE-WHEN-UPSTREAM: once a vLLM release ships axk2, `register_model()`
+self-disables and this whole directory can be deleted.

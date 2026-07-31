@@ -26,6 +26,7 @@ from vllm_rbln.patches.registry import (
 # ruff: noqa: F401
 from . import (
     attention,
+    axk2,
     deepseek_mtp,
     deepseek_v2,
     fp8_moe_method,
@@ -39,6 +40,7 @@ from . import (
     qwen2_moe,
     qwen3_moe,
     rotary_embedding,
+    sparse_attn_indexer,
 )
 
 __all__ = (

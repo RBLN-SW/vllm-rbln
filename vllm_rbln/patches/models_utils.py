@@ -23,8 +23,47 @@ from vllm.model_executor.models.utils import (
     logger,
     maybe_prefix,
 )
+from vllm.model_executor.models.utils import (
+    extract_layer_index as _upstream_extract_layer_index,
+)
 
 from vllm_rbln.patches import register_patch
+
+
+@register_patch(
+    target="vllm.model_executor.models.utils.extract_layer_index",
+    reason=(
+        "DeepSeek-V3.2 sparse attention adds another KV-cache module "
+        "(the lightning indexer) per decoder layer. "
+    ),
+    apply_immediately=True,
+)
+def rbln_extract_layer_index(layer_name: str, num_attn_module: int = 1) -> int:
+    if num_attn_module <= 1 or "attn" not in layer_name:
+        return _upstream_extract_layer_index(layer_name, num_attn_module)
+
+    int_vals: list[int] = []
+    for subname in layer_name.split("."):
+        try:
+            int_vals.append(int(subname))
+        except ValueError:
+            continue
+    assert int_vals, f"layer name {layer_name} has no integer layer index"
+    base = int_vals[0]
+    sub = int_vals[1] if len(int_vals) >= 2 else int("indexer" in layer_name)
+    return base * num_attn_module + sub
+
+
+def rbln_num_attn_module(model_config) -> int:
+    hf_config = model_config.hf_config
+    if getattr(hf_config, "model_type", None) == "longcat_flash":
+        return 2
+    text_config = getattr(model_config, "hf_text_config", hf_config)
+    # TODO(kblee): check general?
+    # DeepSeek-V3.2 (``index_topk`` in the text config)
+    if hasattr(text_config, "index_topk") or hasattr(hf_config, "index_topk"):
+        return 2
+    return 1
 
 
 # NOTE(RBLN): Introduced in https://github.com/RBLN-SW/vllm-rbln/pull/81

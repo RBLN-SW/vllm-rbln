@@ -93,6 +93,13 @@ where = ["."]
 exclude = ["benchmarks", "csrc", "docs", "examples", "tests*"]
 namespaces = false
 
+# FIXME(kblee): remove when axk2 support in upstream
+# `_skt_*.py` are byte-identical copies of SKT-AI/vllm's axk2 sources (see
+# vllm_rbln/patches/axk2/ORIGIN).
+[tool.ruff]
+extend-exclude = ["vllm_rbln/patches/axk2/_skt_*.py"]
+force-exclude = true
+
 [tool.ruff.lint]
 select = [
     # pycodestyle
