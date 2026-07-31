@@ -48,6 +48,106 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+RBLN_SYSFS_CLASS_DIR = "/sys/class/rebellions"
+
+
+def get_rbln_visible_card_indices() -> list[int]:
+    """Card indices this process may use, from `RBLN_DEVICES`.
+
+    `RblnPlatform.device_control_env_var` is `RBLN_DEVICES`, so vLLM narrows the
+    visible cards through it. When it is unset or empty every card the driver
+    exposes under /sys/class/rebellions is considered visible.
+    """
+    raw = os.environ.get("RBLN_DEVICES", "")
+    if raw.strip():
+        return sorted(
+            {int(token) for token in raw.replace(",", " ").split() if token.strip()}
+        )
+    if not os.path.isdir(RBLN_SYSFS_CLASS_DIR):
+        return []
+    found: list[int] = []
+    for name in os.listdir(RBLN_SYSFS_CLASS_DIR):
+        if name.startswith("rbln") and name[4:].isdigit():
+            found.append(int(name[4:]))
+    return sorted(found)
+
+
+def _read_card_attr_int(card_index: int, attr: str) -> int | None:
+    path = os.path.join(RBLN_SYSFS_CLASS_DIR, f"rbln{card_index}", attr)
+    try:
+        with open(path) as handle:
+            return int(handle.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def read_rbln_card_dram_total_bytes() -> int | None:
+    """Per-card DRAM capacity in bytes, or None when sysfs is unavailable.
+
+    A heterogeneous set is rejected rather than averaged: it would make a single
+    per-chiplet budget meaningless. On RBLN-CR the driver reports the same figure
+    the previous literal encoded, now sourced from the device.
+    """
+    values: dict[int, int] = {}
+    for card_index in get_rbln_visible_card_indices():
+        value = _read_card_attr_int(card_index, "dram_total")
+        if value is not None and value > 0:
+            values[card_index] = value
+    if not values:
+        return None
+    distinct = set(values.values())
+    if len(distinct) != 1:
+        raise RuntimeError(
+            "visible RBLN cards report different dram_total values "
+            f"({values}); a single per-chiplet DRAM budget cannot be derived."
+        )
+    return next(iter(distinct))
+
+
+def read_rbln_card_dram_used_bytes() -> int:
+    """Largest `dram_used` across the visible cards (0 when sysfs is absent).
+
+    Read before this process allocates anything, this is the memory other
+    tenants hold. sysfs only exposes usage per card, never per chiplet, so the
+    caller has to charge the whole amount against every chiplet.
+    """
+    used = [
+        value
+        for card_index in get_rbln_visible_card_indices()
+        if (value := _read_card_attr_int(card_index, "dram_used")) is not None
+    ]
+    return max(used, default=0)
+
+
+def chiplet_replication_factor(num_key_value_heads: int, rsd_size: int) -> float:
+    """How many times the KV cache is physically replicated across chiplets.
+
+    Each chiplet rounds up to `ceil(kvh / rsd_size)` KV heads, so the `rsd_size`
+    chiplets store `rsd_size * ceil(kvh / rsd_size)` heads where the logical
+    cache has `kvh` -- the ratio. It is > 1 exactly when `kvh` is not a multiple
+    of `rsd_size`.
+
+    Examples (rsd_size = 4): kvh=2 -> 2.0, kvh=4 -> 1.0, kvh=10 -> 1.2.
+    """
+    if num_key_value_heads <= 0 or rsd_size <= 0:
+        return 1.0
+    return (
+        rsd_size * math.ceil(num_key_value_heads / rsd_size) / num_key_value_heads
+    )
+
+
+def divide_by_chiplet_replication(
+    nbytes: int, num_key_value_heads: int, rsd_size: int
+) -> int:
+    """`nbytes // chiplet_replication_factor(...)` in exact integer arithmetic."""
+    if num_key_value_heads <= 0 or rsd_size <= 0:
+        return nbytes
+    return (
+        nbytes
+        * num_key_value_heads
+        // (rsd_size * math.ceil(num_key_value_heads / rsd_size))
+    )
+
 
 def estimate_model_kernel_size(
     model_config: ModelConfig,
@@ -179,7 +279,23 @@ def estimate_available_memory(
         REBEL_CHIPLET_SIZE = 4
         # single device == Quad chiplet
         rsd_size = REBEL_CHIPLET_SIZE
-        available_dram_bytes = REBEL_DRAM_NBYTES
+        # Prefer the driver's own figure over the literal above. On the current
+        # RBLN-CR hosts sysfs dram_total is 150,323,855,360 B = exactly 140.0
+        # GiB, i.e. the literal's value, so this changes no number today -- it
+        # only makes the capacity come from the device instead of a constant.
+        # sysfs is absent on NPU-less hosts (CI / cross-compile), hence the
+        # fallback.
+        sysfs_dram_total = read_rbln_card_dram_total_bytes()
+        if sysfs_dram_total is None:
+            logger.debug(
+                "sysfs %s is unavailable; falling back to the built-in %d byte "
+                "DRAM capacity.",
+                RBLN_SYSFS_CLASS_DIR,
+                REBEL_DRAM_NBYTES,
+            )
+            available_dram_bytes = REBEL_DRAM_NBYTES
+        else:
+            available_dram_bytes = sysfs_dram_total
         # FIXME(RBLN) - basic data type fp8 for REBEL, for now fp16
         default_bits_per_param = 16
     else:
@@ -235,8 +351,16 @@ def estimate_available_memory(
         buffer = buffer_per_runtime_per_core * num_runtimes
     available_dram_bytes -= buffer
 
-    rsd_replicas = max(1, rsd_size // num_key_value_heads)
-    available_dram_bytes = available_dram_bytes // rsd_replicas
+    # The KV cache is sharded over the rsd_size chiplets by KV head, so a
+    # num_key_value_heads that is not a multiple of rsd_size makes each chiplet
+    # round its head count up and the cache is physically replicated
+    # `rsd_size * ceil(kvh / rsd_size) / kvh` times. This replaces
+    # `max(1, rsd_size // num_key_value_heads)`, which happens to agree whenever
+    # kvh divides rsd_size (kvh in {1, 2, 4} at rsd_size 4 -- including the
+    # RBLN-CR Qwen case, where both give exactly 2) and is wrong otherwise.
+    available_dram_bytes = divide_by_chiplet_replication(
+        available_dram_bytes, num_key_value_heads, rsd_size
+    )
 
     check_oom(available_dram_bytes)
 

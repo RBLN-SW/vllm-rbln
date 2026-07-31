@@ -58,6 +58,9 @@ if TYPE_CHECKING:
     VLLM_RBLN_AUTO_PORT: bool = True
     VLLM_RBLN_ENFORCE_MODEL_FP32: bool = False
     VLLM_RBLN_NUM_RAY_NODES: int = 1
+    # --- DYNAMIC KV CACHE ---
+    VLLM_RBLN_USE_DYNAMIC_KV_CACHE: bool = False
+    VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS: int = 0
     # --- ATTENTION ---
     VLLM_RBLN_FLASH_CAUSAL_ATTN: bool = True
     VLLM_RBLN_BATCH_ATTN_OPT: bool = False
@@ -294,6 +297,28 @@ environment_variables = {
     # Number of Ray nodes
     "VLLM_RBLN_NUM_RAY_NODES": lambda: int(
         os.environ.get("VLLM_RBLN_NUM_RAY_NODES", 1)
+    ),
+    # --- DYNAMIC KV CACHE ---
+    # Mark the KV cache num_blocks dimension dynamic at compile time and, after
+    # warm-up, ask each compiled artifact's kv_cache_memory_profile() how many
+    # blocks actually fit the device; the KV tensors are then reallocated at that
+    # size and the scheduler is told the new number. Requires the torch.compile
+    # path (VLLM_RBLN_USE_VLLM_MODEL=1): only rebel's DynamoRuntime applies
+    # adaptive buffer sizes, the other runtimes ignore them silently.
+    "VLLM_RBLN_USE_DYNAMIC_KV_CACHE": (
+        lambda: (
+            os.environ.get("VLLM_RBLN_USE_DYNAMIC_KV_CACHE", "False").lower()
+            in ("true", "1")
+        )
+    ),
+    # Compile against a deliberately small KV cache (this many blocks) instead of
+    # the one vLLM's pre-compile estimate sized. The traced num_blocks only sets
+    # the hint of the mark_dynamic'd dim, so the artifact's buffers do not need
+    # to be built at the full size. 0 disables the shrink; it is only honored
+    # together with VLLM_RBLN_USE_DYNAMIC_KV_CACHE, otherwise the server would
+    # keep serving from the shrunk cache.
+    "VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS": lambda: int(
+        os.environ.get("VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS", 0)
     ),
     # --- ATTENTION ---
     # Use flash attention for causal attention

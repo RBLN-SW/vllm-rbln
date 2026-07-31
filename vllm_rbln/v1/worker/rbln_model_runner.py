@@ -2473,6 +2473,20 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                         .view(kv_cache_shape)
                     )
                     kv_caches[layer_name] = typed_base.permute(*inv_order)
+                    if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
+                        # Tell the rbln compiler the KV num_blocks dim may change
+                        # after the trace, so the artifact carries a dynamic-shape
+                        # variable there and its buffers can be re-sized once the
+                        # real block count is known (see
+                        # RBLNWorker.compute_dynamic_kv_num_blocks). Exactly one
+                        # dim is marked: the compiler assumes every dynamic
+                        # variable in a graph takes the same value, and its
+                        # validator requires the marked input to be consumed by a
+                        # single paged_flash_causal_attention_naive_* call.
+                        # Without this line every other piece of the dynamic-KV
+                        # path degrades into a no-op (the profile would report no
+                        # per-block growth at all).
+                        torch._dynamo.mark_dynamic(kv_caches[layer_name], 1)
                     kv_cache_base_tensors[layer_name] = typed_base
                     kv_cache_view_infos[layer_name] = KVCacheViewInfo(
                         view_shape=kv_cache_shape,

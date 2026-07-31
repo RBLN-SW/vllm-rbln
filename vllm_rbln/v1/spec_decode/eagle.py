@@ -399,6 +399,13 @@ class RBLNEagleProposer(EagleProposer):
                 process_group_dict=build_process_group_dict(),
                 guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
                 mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
+                # The drafter consumes the runner's KV cache
+                # (`self.runner.kv_cache_bases`), so its runtimes have to end up
+                # in the same holder. Otherwise the dynamic-KV path would neither
+                # count the drafter's private device regions when solving for
+                # num_blocks (optimistic answer) nor clear its adaptive-size
+                # latch after the resize (its first forward would then raise).
+                runtime_holder=self.runner.runtime_holder,
             )
 
     def _build_dummy_attn_metadata(

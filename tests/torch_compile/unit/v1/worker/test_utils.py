@@ -27,9 +27,14 @@ from vllm.platforms import CpuArchEnum
 from vllm.utils.cpu_resource_utils import LogicalCPUInfo
 
 from vllm_rbln.v1.worker.utils import (
+    chiplet_replication_factor,
+    divide_by_chiplet_replication,
     estimate_available_memory,
     estimate_model_kernel_size,
     get_autobind_cpu_ids,
+    get_rbln_visible_card_indices,
+    read_rbln_card_dram_total_bytes,
+    read_rbln_card_dram_used_bytes,
     set_cpu_affinity,
     set_omp_num_threads,
 )
@@ -385,6 +390,127 @@ class TestEstimateAvailableMemory:
         )
         # Fewer kv_heads → more replicas → less memory per replica
         assert mem_few < mem_many
+
+
+# ---------------------------------------------------------------------------
+# chiplet replication factor
+# ---------------------------------------------------------------------------
+class TestChipletReplicationFactor:
+    """Pin the KV-cache chiplet replication factor to exact values.
+
+    Each chiplet stores ceil(kvh / rsd_size) KV heads, so the rsd_size chiplets
+    together hold rsd_size * ceil(kvh / rsd_size) heads where the logical cache
+    has kvh. The ratio is what the DRAM budget must be divided by.
+
+    This one expression replaces two partial ones that must not be stacked:
+    `rsd_size // kvh` (right only when kvh divides rsd_size) and
+    `rsd_size * ceil(kvh/rsd_size) / kvh` applied as a *correction* on top of it
+    (which halves the budget a second time for kvh < rsd_size -- the 844-block
+    state).
+    """
+
+    @pytest.mark.parametrize(
+        ("num_kv_heads", "rsd_size", "expected"),
+        [
+            (2, 4, 2.0),
+            (10, 4, 1.2),
+            (8, 4, 1.0),
+            (4, 4, 1.0),
+            (1, 4, 4.0),
+            (3, 4, 4 / 3),
+            (2, 1, 1.0),
+        ],
+    )
+    def test_factor_values(self, num_kv_heads, rsd_size, expected):
+        assert chiplet_replication_factor(num_kv_heads, rsd_size) == pytest.approx(
+            expected
+        )
+
+    @pytest.mark.parametrize(
+        ("num_kv_heads", "rsd_size"),
+        [(2, 4), (10, 4), (8, 4), (4, 4), (1, 4), (3, 4), (7, 4), (2, 1)],
+    )
+    def test_division_is_exact_integer_floor(self, num_kv_heads, rsd_size):
+        nbytes = 127_538_298_880  # the real post-kernel/buffer budget
+        expected = int(
+            nbytes // chiplet_replication_factor(num_kv_heads, rsd_size)
+        )
+        got = divide_by_chiplet_replication(nbytes, num_kv_heads, rsd_size)
+        assert got == expected
+
+    def test_qwen_case_reproduces_the_measured_budget(self):
+        """RBLN-CR Qwen: kvh=2, rsd_size=4 → factor 2 → 59.3896 GiB.
+
+        Matches the `available_memory_estimate = 59.39 GiB` line and the 1689
+        blocks derived from it on dev.
+        """
+        nbytes = 127_538_298_880
+        got = divide_by_chiplet_replication(nbytes, 2, 4)
+        assert got == 63_769_149_440
+        assert got / 2**30 == pytest.approx(59.3896, abs=1e-4)
+        # vLLM turns bytes into blocks with page_size_bytes = 36 MiB.
+        assert got // 37_748_736 == 1689
+
+    def test_degenerate_inputs_are_a_no_op(self):
+        assert chiplet_replication_factor(0, 4) == 1.0
+        assert chiplet_replication_factor(2, 0) == 1.0
+        assert divide_by_chiplet_replication(100, 0, 4) == 100
+        assert divide_by_chiplet_replication(100, 2, 0) == 100
+
+
+# ---------------------------------------------------------------------------
+# sysfs DRAM readers
+# ---------------------------------------------------------------------------
+class TestRblnSysfsReaders:
+    def test_visible_indices_from_env(self):
+        with patch.dict(os.environ, {"RBLN_DEVICES": "2,0,1"}):
+            assert get_rbln_visible_card_indices() == [0, 1, 2]
+
+    def test_visible_indices_fall_back_to_sysfs_listing(self, tmp_path):
+        for index in (0, 3, 1):
+            (tmp_path / f"rbln{index}").mkdir()
+        (tmp_path / "rsd0").mkdir()
+        with patch.dict(os.environ, {"RBLN_DEVICES": ""}), patch(
+            "vllm_rbln.v1.worker.utils.RBLN_SYSFS_CLASS_DIR", str(tmp_path)
+        ):
+            assert get_rbln_visible_card_indices() == [0, 1, 3]
+
+    def test_dram_total_is_none_without_sysfs(self, tmp_path):
+        with patch.dict(os.environ, {"RBLN_DEVICES": ""}), patch(
+            "vllm_rbln.v1.worker.utils.RBLN_SYSFS_CLASS_DIR",
+            str(tmp_path / "missing"),
+        ):
+            assert read_rbln_card_dram_total_bytes() is None
+            assert read_rbln_card_dram_used_bytes() == 0
+
+    def test_dram_total_reads_uniform_capacity(self, tmp_path):
+        for index in (0, 1):
+            card = tmp_path / f"rbln{index}"
+            card.mkdir()
+            (card / "dram_total").write_text("150323855360\n")
+            (card / "dram_used").write_text(f"{index * 1024}\n")
+        with patch.dict(os.environ, {"RBLN_DEVICES": "0,1"}), patch(
+            "vllm_rbln.v1.worker.utils.RBLN_SYSFS_CLASS_DIR", str(tmp_path)
+        ):
+            total = read_rbln_card_dram_total_bytes()
+            assert total == 150_323_855_360
+            # 140.0 GiB exactly, i.e. the value the old literal encoded; / 4
+            # chiplets = the 35.0 GiB per-chiplet capacity.
+            assert total / 2**30 == 140.0
+            assert total // 4 == 35 * 2**30
+            # dram_used is reported per card; take the worst case.
+            assert read_rbln_card_dram_used_bytes() == 1024
+
+    def test_heterogeneous_capacity_is_rejected(self, tmp_path):
+        for index, size in ((0, 150323855360), (1, 75161927680)):
+            card = tmp_path / f"rbln{index}"
+            card.mkdir()
+            (card / "dram_total").write_text(f"{size}\n")
+        with patch.dict(os.environ, {"RBLN_DEVICES": "0,1"}), patch(
+            "vllm_rbln.v1.worker.utils.RBLN_SYSFS_CLASS_DIR", str(tmp_path)
+        ):
+            with pytest.raises(RuntimeError, match="different dram_total"):
+                read_rbln_card_dram_total_bytes()
 
 
 # ---------------------------------------------------------------------------

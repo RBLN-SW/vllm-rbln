@@ -76,3 +76,28 @@ def test_rbln_envs():
         f"Expected VLLM_RBLN_AUTO_PORT to be True, \
         got {envs.VLLM_RBLN_AUTO_PORT}"
     )
+
+
+def test_dynamic_kv_cache_envs_default_off():
+    """The dynamic KV cache path must be opt-in.
+
+    Both variables are read before / during the compile, so a non-False default
+    would change the compiled artifact for every existing deployment.
+    """
+    assert "VLLM_RBLN_USE_DYNAMIC_KV_CACHE" in envs.environment_variables
+    assert "VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS" in envs.environment_variables
+    assert not envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE, (
+        f"Expected VLLM_RBLN_USE_DYNAMIC_KV_CACHE to be False, \
+        got {envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE}"
+    )
+    assert envs.VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS == 0, (
+        f"Expected VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS to be 0 (disabled), \
+        got {envs.VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS}"
+    )
+
+
+def test_dynamic_kv_cache_envs_are_read_from_os_environ(monkeypatch):
+    monkeypatch.setenv("VLLM_RBLN_USE_DYNAMIC_KV_CACHE", "1")
+    monkeypatch.setenv("VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS", "64")
+    assert envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE is True
+    assert envs.VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS == 64
