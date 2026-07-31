@@ -1,0 +1,35 @@
+name: Backport merged pull request
+
+on:
+  # pull_request_target only triggers from the workflow file on the repository's
+  # default branch (main), regardless of the pull request's base branch. This
+  # file therefore has no effect until it is synced from dev to main.
+  pull_request_target:
+    types: [closed]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  backport:
+    name: Backport pull request
+    runs-on: rbln-sw-k8s-general
+    if: >
+      github.event.pull_request.merged &&
+      contains(toJSON(github.event.pull_request.labels.*.name), '"backport ')
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Create backport pull requests
+        uses: korthout/backport-action@v4
+        with:
+          # The default GITHUB_TOKEN cannot open pull requests here: the
+          # repository has "Allow GitHub Actions to create and approve pull
+          # requests" disabled. Pull requests it opened would also not trigger
+          # CI. Use the PAT the other workflows already use.
+          github_token: ${{ secrets.GIT_PAT }}
+          label_pattern: '^backport ([^ ]+)$'
+          copy_labels_pattern: '.*'
+          conflict_resolution: draft_commit_conflicts
