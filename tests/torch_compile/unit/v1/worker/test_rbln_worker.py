@@ -17,7 +17,8 @@ device env initialization, and behavior tests."""
 
 import inspect
 import os
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1308,3 +1309,87 @@ class TestInitWorkerDistributed:
             )
 
         mock_car.assert_called_once_with(False)
+
+
+# ---------------------------------------------------------------------------
+# Dynamic KV: compiler capability probe
+# ---------------------------------------------------------------------------
+class TestDynamicKvCompilerSupport:
+    """`_assert_dynamic_kv_compiler_support` must fire *before* the compile.
+
+    `rebel.kv_cache.max_num_blocks` and `DynamoRuntime.reset_adaptive_buffers`
+    both arrived in rebel_compiler #10678 and are only reached after warm-up, so
+    without this probe an older compiler pays the whole compile and then dies on
+    a bare ImportError.
+    """
+
+    @staticmethod
+    def _probe():
+        from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
+
+        return RBLNWorker._assert_dynamic_kv_compiler_support
+
+    @staticmethod
+    def _modules(*, kv_cache: bool, reset_adaptive: bool):
+        """A fake `rebel` package with the two symbols independently present."""
+        mods = {}
+        if kv_cache:
+            kv = ModuleType("rebel.kv_cache")
+            kv.max_num_blocks = lambda *a, **k: 0
+            mods["rebel.kv_cache"] = kv
+        runtime = ModuleType("rebel.sync_runtime")
+
+        class DynamoRuntime:
+            pass
+
+        if reset_adaptive:
+            DynamoRuntime.reset_adaptive_buffers = lambda self: None
+        runtime.DynamoRuntime = DynamoRuntime
+        mods["rebel.sync_runtime"] = runtime
+        return mods
+
+    def test_passes_when_both_symbols_exist(self):
+        mods = self._modules(kv_cache=True, reset_adaptive=True)
+        with patch.dict(sys.modules, mods):
+            self._probe()(MagicMock())
+
+    def test_rejects_a_compiler_without_max_num_blocks(self):
+        mods = self._modules(kv_cache=False, reset_adaptive=True)
+        # Block the real module too, so an installed compiler cannot mask this.
+        mods["rebel.kv_cache"] = None
+        with (
+            patch.dict(sys.modules, mods),
+            pytest.raises(RuntimeError, match="max_num_blocks"),
+        ):
+            self._probe()(MagicMock())
+
+    def test_rejects_a_runtime_without_reset_adaptive_buffers(self):
+        mods = self._modules(kv_cache=True, reset_adaptive=False)
+        with (
+            patch.dict(sys.modules, mods),
+            pytest.raises(RuntimeError, match="reset_adaptive_buffers"),
+        ):
+            self._probe()(MagicMock())
+
+    def test_a_missing_runtime_module_is_not_fatal(self):
+        """`_assert_dynamo_runtimes` still checks the real objects later."""
+        mods = self._modules(kv_cache=True, reset_adaptive=True)
+        mods["rebel.sync_runtime"] = None
+        with patch.dict(sys.modules, mods):
+            self._probe()(MagicMock())
+
+    def test_runs_before_the_other_dynamic_kv_guards(self):
+        """Ordering is the point: it must precede anything that compiles.
+
+        `initialize_from_config` calls it first, ahead of the scheduler-handoff
+        and KV-connector guards, and the executor runs `initialize_from_config`
+        on every rank before any rank's `compile_or_warm_up_model`.
+        """
+        source = inspect.getsource(
+            __import__(
+                "vllm_rbln.v1.worker.rbln_worker", fromlist=["RBLNWorker"]
+            ).RBLNWorker.initialize_from_config
+        )
+        probe = source.index("_assert_dynamic_kv_compiler_support")
+        handoff = source.index("_assert_dynamic_kv_scheduler_handoff_installed")
+        assert probe < handoff

@@ -27,6 +27,7 @@ from vllm.platforms import CpuArchEnum
 from vllm.utils.cpu_resource_utils import LogicalCPUInfo
 
 from vllm_rbln.v1.worker.utils import (
+    REBEL_DRAM_NBYTES,
     chiplet_replication_factor,
     divide_by_chiplet_replication,
     estimate_available_memory,
@@ -598,10 +599,9 @@ class TestReplicationFactorIsGated:
     @pytest.mark.parametrize(
         "sysfs_total",
         [
-            None,  # no sysfs at all -> literal
+            None,  # no sysfs at all -> the constant
             150_323_855_360,  # 140.0 GiB, what current drivers report
-            144 * 2**30,  # raw capacity, i.e. system region NOT subtracted
-            154_000_000_000,  # anything larger
+            REBEL_DRAM_NBYTES,  # exactly the ceiling
         ],
     )
     def test_sysfs_capacity_never_raises_the_estimate(
@@ -609,10 +609,9 @@ class TestReplicationFactorIsGated:
     ):
         """Sourcing the capacity from sysfs must not grow the default path.
 
-        This is NOT behind VLLM_RBLN_USE_DYNAMIC_KV_CACHE, so a driver that
-        reported raw capacity would hand every model a larger KV cache than dev.
-        The literal already subtracts the 4 GiB system region; sysfs is clamped
-        to it so it can only ever report less.
+        This is NOT behind VLLM_RBLN_USE_DYNAMIC_KV_CACHE, so a driver reporting
+        raw capacity would hand every model a larger KV cache than dev. The
+        reader clamps, so nothing above the ceiling can reach here.
         """
         with patch(
             "vllm_rbln.v1.worker.utils.read_rbln_card_dram_total_bytes",
@@ -620,6 +619,22 @@ class TestReplicationFactorIsGated:
         ):
             got = self._measure(mock_envs, mock_platform, 8, False)
         assert got / 2**30 == pytest.approx(118.0, abs=1e-3)
+
+    @patch("vllm_rbln.v1.worker.utils.current_platform")
+    @patch("vllm_rbln.v1.worker.utils.envs")
+    def test_a_smaller_card_does_lower_the_estimate(self, mock_envs, mock_platform):
+        """The clamp is one-directional: less DRAM must still shrink the estimate.
+
+        Without this, reverting to "just use the constant" would keep every other
+        test in this class green -- and reporting *less* is the whole reason to
+        read the device in the first place.
+        """
+        with patch(
+            "vllm_rbln.v1.worker.utils.read_rbln_card_dram_total_bytes",
+            return_value=REBEL_DRAM_NBYTES - 4 * 2**30,
+        ):
+            got = self._measure(mock_envs, mock_platform, 8, False)
+        assert got / 2**30 == pytest.approx(118.0 - 4 * 0.9, abs=1e-3)
 
 
 # ---------------------------------------------------------------------------
@@ -811,6 +826,39 @@ class TestRblnSysfsReaders:
             # Ours (4, 5), not the raw entries (0, 1). Reading the raw entries
             # would return 75161927680 instead.
             assert read_rbln_card_dram_total_bytes() == 150_323_855_360
+
+    @pytest.mark.parametrize(
+        ("reported", "expected"),
+        [
+            (150_323_855_360, 150_323_855_360),  # today's driver, unchanged
+            (REBEL_DRAM_NBYTES, REBEL_DRAM_NBYTES),  # exactly the ceiling
+            (144 * 2**30, REBEL_DRAM_NBYTES),  # raw capacity -> clamped
+            (200 * 2**30, REBEL_DRAM_NBYTES),  # anything larger -> clamped
+            (100 * 2**30, 100 * 2**30),  # a smaller card passes through
+        ],
+    )
+    def test_dram_total_is_clamped_in_the_reader(self, tmp_path, reported, expected):
+        """The clamp belongs to the reader, not to one call site.
+
+        Both callers size real allocations from this number: the static estimate
+        every model takes, and the per-chiplet dynamic-KV budget that feeds
+        `max_num_blocks`. A clamp applied at only one of them leaves the other
+        over-committing the device.
+        """
+        sysfs = tmp_path / "sysfs"
+        sysfs.mkdir()
+        dev = tmp_path / "dev"
+        dev.mkdir()
+        card = sysfs / "rbln0"
+        card.mkdir()
+        (card / "dram_total").write_text(f"{reported}\n")
+        (dev / "rbln0").touch()
+        with (
+            patch.dict(os.environ, {"RBLN_DEVICES": "0"}),
+            patch("vllm_rbln.v1.worker.utils.RBLN_DEV_DIR", str(dev)),
+            patch("vllm_rbln.v1.worker.utils.RBLN_SYSFS_CLASS_DIR", str(sysfs)),
+        ):
+            assert read_rbln_card_dram_total_bytes() == expected
 
 
 # ---------------------------------------------------------------------------

@@ -53,11 +53,21 @@ RBLN_SYSFS_CLASS_DIR = "/sys/class/rebellions"
 # given. That difference is why get_rbln_owned_card_indices exists.
 RBLN_DEV_DIR = "/dev"
 
+# Usable DRAM on one REBEL card: 144 GiB of quad-chiplet DRAM minus the 4 GiB
+# system region. This is the ceiling `read_rbln_card_dram_total_bytes` clamps to
+# -- see its docstring for why the clamp lives in the reader.
+REBEL_DRAM_NBYTES = 144 * 2**30 - 4 * 2**30
+
 
 def get_rbln_visible_card_indices() -> list[int]:
     """Card indices this process may use, from `RBLN_DEVICES`.
 
     Unset or empty means every card under /sys/class/rebellions.
+
+    Prefer `get_rbln_owned_card_indices`: this one takes each `RBLN_DEVICES`
+    entry as a sysfs card name, which is only right when the container happens
+    to hold card 0 upward. It remains as the fallback for hosts with no device
+    nodes at all.
     """
     raw = os.environ.get("RBLN_DEVICES", "")
     if raw.strip():
@@ -141,6 +151,20 @@ def read_rbln_card_dram_total_bytes() -> int | None:
     container -- harmless while every card is the same SKU, but it would raise on
     a heterogeneous host and go stale the moment sysfs starts exposing only the
     cards a container owns.
+
+    The result is clamped to `REBEL_DRAM_NBYTES`, which already has the 4 GiB
+    system region subtracted; nothing documents that sysfs does the same. The
+    clamp lives here rather than at a call site because both callers size real
+    allocations from this number -- the static estimate every model takes, and
+    the per-chiplet dynamic-KV budget that feeds `max_num_blocks` -- and a
+    clamp applied to only one of them is the failure this reader is meant to
+    prevent. Current drivers report exactly `REBEL_DRAM_NBYTES`, so nothing
+    moves today.
+
+    The trade-off is that a future SKU with genuinely more DRAM is silently
+    capped at the current figure (with a warning). That is deliberate: reporting
+    too much memory over-commits the device, while reporting too little only
+    leaves capacity unused. Raise the constant when such a card exists.
     """
     values: dict[int, int] = {}
     for card_index in get_rbln_owned_card_indices():
@@ -155,7 +179,19 @@ def read_rbln_card_dram_total_bytes() -> int | None:
             "visible RBLN cards report different dram_total values "
             f"({values}); a single per-chiplet DRAM budget cannot be derived."
         )
-    return next(iter(distinct))
+    dram_total = next(iter(distinct))
+    if dram_total > REBEL_DRAM_NBYTES:
+        logger.warning(
+            "sysfs reports %d bytes of card DRAM, more than the %d this build "
+            "assumes usable; clamping. Either the driver is reporting raw "
+            "capacity without the system region, or this is a larger card than "
+            "REBEL_DRAM_NBYTES describes -- in the second case raise the "
+            "constant, because the clamp is leaving memory unused.",
+            dram_total,
+            REBEL_DRAM_NBYTES,
+        )
+        return REBEL_DRAM_NBYTES
+    return dram_total
 
 
 def read_rbln_card_dram_used_bytes() -> int:
@@ -329,23 +365,13 @@ def estimate_available_memory(
     elif "cr" in device_name:
         assert envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK == 1
         # REBEL - RBLN-CR[xxx]
-        # REBEL DRAM - 144GB (quad chips, chiplet) - system(4G) = 140GB
-        REBEL_DRAM_NBYTES = 144 * 2**30
-        REBEL_SYS_DRAM_NBYTES = 4 * 2**30
-        REBEL_DRAM_NBYTES -= REBEL_SYS_DRAM_NBYTES
         REBEL_CHIPLET_SIZE = 4
         # single device == Quad chiplet
         rsd_size = REBEL_CHIPLET_SIZE
-        # Prefer the driver's figure over the literal above, but never let it
-        # *raise* the estimate: the literal already subtracts the 4 GiB system
-        # region and nothing documents that sysfs does the same. A driver that
-        # reported the raw 144 GiB capacity would hand every model -- this path is
-        # not behind the dynamic-KV flag -- about 51 more blocks than dev. Clamped
-        # to the literal, sysfs can only ever report *less*, so the change is
-        # safe in the one direction that matters. It reports exactly the
-        # literal's value on current RBLN-CR hosts, so no number moves today.
-        # sysfs is absent on NPU-less hosts (CI / cross-compile), hence the
-        # fallback.
+        # Prefer the driver's figure over the module constant. The reader clamps
+        # to REBEL_DRAM_NBYTES, so it can only ever report *less* and this path
+        # -- which is not behind the dynamic-KV flag -- cannot grow. sysfs is
+        # absent on NPU-less hosts (CI / cross-compile), hence the fallback.
         try:
             sysfs_dram_total = read_rbln_card_dram_total_bytes()
         except RuntimeError as exc:
@@ -369,16 +395,7 @@ def estimate_available_memory(
             )
             available_dram_bytes = REBEL_DRAM_NBYTES
         else:
-            available_dram_bytes = min(sysfs_dram_total, REBEL_DRAM_NBYTES)
-            if sysfs_dram_total > REBEL_DRAM_NBYTES:
-                logger.warning(
-                    "sysfs reports %d bytes of card DRAM, more than the built-in "
-                    "%d; clamping to the built-in figure. The driver is probably "
-                    "reporting raw capacity without the system region, which the "
-                    "built-in value already subtracts.",
-                    sysfs_dram_total,
-                    REBEL_DRAM_NBYTES,
-                )
+            available_dram_bytes = sysfs_dram_total
         # FIXME(RBLN) - basic data type fp8 for REBEL, for now fp16
         default_bits_per_param = 16
     else:

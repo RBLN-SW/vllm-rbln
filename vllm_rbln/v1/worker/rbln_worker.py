@@ -472,6 +472,7 @@ class RBLNWorker(WorkerBase):
 
         dynamic_kv = envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE
         if dynamic_kv:
+            self._assert_dynamic_kv_compiler_support()
             self._assert_dynamic_kv_scheduler_handoff_installed()
             self._assert_dynamic_kv_transfer_absent()
 
@@ -586,8 +587,6 @@ class RBLNWorker(WorkerBase):
                 "nothing would query the compiled profile or tell the scheduler "
                 "the new block count."
             )
-
-        self._assert_dynamic_kv_compiler_support()
 
     def _assert_dynamic_kv_compiler_support(self) -> None:
         """Guard: the installed rebel-compiler must carry the #10678 API.
