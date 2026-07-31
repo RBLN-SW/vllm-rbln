@@ -1,10 +1,11 @@
 name: Backport merged pull request
 
 on:
-  # pull_request_target only triggers from the workflow file on the repository's
-  # default branch (main), regardless of the pull request's base branch. This
-  # file therefore has no effect until it is synced from dev to main.
-  pull_request_target:
+  # pull_request reads this file from the pull request's merge commit, so it takes
+  # effect on dev without waiting for a dev -> main sync. pull_request_target would
+  # also cover forks, but it only triggers from the default branch, and backports
+  # here are limited to maintainer pull requests opened from in-repo branches.
+  pull_request:
     types: [closed]
 
 permissions:
@@ -17,6 +18,7 @@ jobs:
     runs-on: rbln-sw-k8s-general
     if: >
       github.event.pull_request.merged &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
       contains(toJSON(github.event.pull_request.labels.*.name), '"backport ')
     steps:
       - uses: actions/checkout@v4
