@@ -111,7 +111,7 @@ def rescale_kv_cache_config(kv_cache_config: KVCacheConfig, num_blocks: int) -> 
     condition=_dynamic_kv_enabled,
 )
 def patched_initialize_kv_caches(
-    self: EngineCore, vllm_config: "VllmConfig"
+    self: EngineCore, vllm_config: VllmConfig
 ) -> KVCacheConfig:
     kv_cache_config = engine_core_original_initialize_kv_caches(self, vllm_config)
 
@@ -138,16 +138,47 @@ def patched_initialize_kv_caches(
             "RBLN dynamic-KV scheduler hand-off must be revisited."
         )
 
-    # An explicit override is the user pinning the block count; the workers make
-    # the same check, so nothing was resized either.
+    # An explicit override is the user pinning the block count, so no profile is
+    # queried and the pinned number survives. The worker gates on it twice too
+    # (`compute_dynamic_kv_num_blocks` returns None and
+    # `_maybe_shrink_kv_cache_for_compile` refuses the shrink), so by the time
+    # this returns nothing has been resized on either side.
     override = vllm_config.cache_config.num_gpu_blocks_override
     if override is not None:
-        logger.info(
-            "dynamic KV cache: --num-gpu-blocks-override=%d is set; leaving the "
-            "scheduler block pool at %d blocks.",
+        # WARNING, not INFO: two features that each size the KV cache are on at
+        # once and one is being ignored. This combination used to break the
+        # server outright -- the scheduler handed out block ids the shrunk cache
+        # did not have -- so it must never pass silently even now that the shrink
+        # is refused.
+        logger.warning(
+            "dynamic KV cache: VLLM_RBLN_USE_DYNAMIC_KV_CACHE and "
+            "--num-gpu-blocks-override=%d are both set. The override wins: no "
+            "compiled profile is queried, no resize happens and the scheduler "
+            "block pool stays at %d blocks. Unset the override to let the "
+            "compiled profile size the cache.",
             override,
             kv_cache_config.num_blocks,
         )
+        # Consistency check, not a fix: the fix is the worker refusing the
+        # shrink. Under TP>1 the workers are separate processes, so the engine
+        # cannot rule out by inspection that the two gates disagreed. Repair and
+        # report rather than fail on the first request.
+        restored = self.model_executor.collective_rpc(
+            "apply_dynamic_kv_num_blocks", args=(None,)
+        )
+        if any(n is not None for n in restored):
+            logger.warning(
+                "dynamic KV cache: internal inconsistency -- a rank shrank its "
+                "KV cache for the compile even though "
+                "--num-gpu-blocks-override=%d should have prevented it. The "
+                "cache has been restored (per rank: %s) and the scheduler block "
+                "pool stays at %d blocks, but "
+                "RBLNWorker._maybe_shrink_kv_cache_for_compile and this branch "
+                "have drifted apart and should be re-read together.",
+                override,
+                restored,
+                kv_cache_config.num_blocks,
+            )
         return kv_cache_config
 
     num_blocks_per_rank = self.model_executor.collective_rpc(
@@ -165,9 +196,7 @@ def patched_initialize_kv_caches(
     if num_blocks is None:
         # Nothing usable. Tell the workers so they put back the block count
         # vLLM sized the cache with before the compile-time shrink.
-        self.model_executor.collective_rpc(
-            "apply_dynamic_kv_num_blocks", args=(None,)
-        )
+        self.model_executor.collective_rpc("apply_dynamic_kv_num_blocks", args=(None,))
         return kv_cache_config
 
     self.model_executor.collective_rpc(
@@ -190,7 +219,7 @@ def patched_initialize_kv_caches(
 
 
 def _log_gpu_kv_cache_size(
-    vllm_config: "VllmConfig", kv_cache_config: KVCacheConfig
+    vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
 ) -> None:
     """Re-announce the KV cache size after the resize.
 
@@ -210,8 +239,7 @@ def _log_gpu_kv_cache_size(
             vllm_config, kv_cache_config
         )
         logger.info(
-            "GPU KV cache size: %s tokens (num_blocks=%d, after the dynamic KV "
-            "resize)",
+            "GPU KV cache size: %s tokens (num_blocks=%d, after the dynamic KV resize)",
             f"{int(max_concurrency * max_model_len):,}",
             kv_cache_config.num_blocks,
         )
