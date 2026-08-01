@@ -40,6 +40,27 @@ SKIP_DP_RENDEZVOUS = os.getenv("VLLM_RBLN_EAGLE3_SKIP_DP_RENDEZVOUS", "0") == "1
 # The projection is its own compiled graph today (region 3/0, 1.17 ms/step
 # measured), so folding it removes one graph launch. A 1-layer 212M drafter
 # costs 1.0-1.5 ms per graph, which is mostly launch rather than compute.
+# Default off: measured a regression in both regimes on MiniMax-M2.5 DP4+EP.
+#
+# A fixed-prompt low-variance bench (prefix hits ~73%, so almost pure decode)
+# resolves 0.03 ms across server instances and 0.15-0.26 ms across runs, which is
+# 20-100x tighter than the SWE-bench agent harness (3.2-6.3 ms). Against that:
+#
+#   pure decode          FUSE on is +0.33 ms TPOT
+#   prefill every round  FUSE on is +0.70 ms TPOT  (matched 0%-cache pair: +1.01)
+#
+# Folding the aux projection into the drafter's first forward was supposed to pay
+# for itself on prefill, and it does not -- it is worse there than in decode. The
+# same bench puts the other three flags at DEVICE_ARGMAX -3.94, NARROW_LOGITS
+# -1.38, SKIP_DP_RENDEZVOUS -0.87, so this is the only one that does not earn its
+# place.
+#
+# The code stays because the measurement covers one model and one topology, and
+# because `FUSE_PREFILL` splits the two halves for anyone re-measuring. But it is
+# also where `_fold_combine`, `_aux_width`, the warmup/serving shape match and two
+# preflight checks come from, and three arm failures traced back to it
+# (`code=201` runtime recompile, a `dummy_run` prefill mismatch, a cold-cache
+# widen). Removing it outright is worth considering.
 FUSE_FIRST_FORWARD = os.getenv("VLLM_RBLN_EAGLE3_FUSE_FIRST_FORWARD", "0") == "1"
 
 # Run `eagle_prepare_next_token_padded` on the host instead of letting each of
@@ -92,6 +113,23 @@ DRAFT_ID_LOG_STEPS = int(os.getenv("VLLM_RBLN_EAGLE3_DRAFT_ID_LOG_STEPS", "0"))
 # which neither crashes nor collapses acceptance -- it costs a few percent, which
 # is inside the arm-to-arm spread.
 UNROLL_DRAFTER = os.getenv("VLLM_RBLN_EAGLE3_UNROLL_DRAFTER", "0") == "1"
+
+# Log the first N prefill steps' request/token shape.
+#
+# `_preprocess`'s prefill branch reshapes the whole buffer with
+# `view(num_reqs, -1)`, which assumes every request in the step carries the SAME
+# number of tokens. At `max_num_batched_tokens=512` the scheduler generally
+# spends the whole budget on one request's chunk, so `num_reqs == 1` and the
+# assumption holds by accident. Raising the budget to 2048 lets several requests
+# share a prefill step with unequal chunk lengths, and then the reshape mixes
+# tokens across request boundaries.
+#
+# That is a hypothesis, and this exists to test it before any fix: a prefill step
+# with `num_reqs > 1` and `num_input_tokens % num_reqs != 0` proves the uniform
+# view wrong. Measured symptom it would explain -- mnbt 2048 + EAGLE3 produces
+# RepeatedFormatError on 26/26 SWE-bench instances (0/26 at mnbt 512, and 0/26
+# with spec-decode off at mnbt 2048) with accepted/draft at 0.097.
+PREFILL_SHAPE_LOG = int(os.getenv("VLLM_RBLN_EAGLE3_PREFILL_SHAPE_LOG", "0"))
 
 # Reproduce the pre-fix warmup, where `dummy_run` compiled the narrow input while
 # serving handed the folded wide one, forcing a runtime recompile.

@@ -45,6 +45,7 @@ from vllm_rbln.v1.attention.kv_cache_bindings import (
 )
 from vllm_rbln.v1.spec_decode.utils import (
     DRAFT_ID_LOG_STEPS,
+    PREFILL_SHAPE_LOG,
     FUSE_FIRST_FORWARD,
     FUSE_PREFILL,
     NARROW_LOGITS,
@@ -97,6 +98,7 @@ class RBLNEagleProposer(EagleProposer):
         self._compiled_combine = None
         self._compiled_unrolled = None
         self._draft_id_logged = 0
+        self._prefill_shape_logged = 0
 
     def _fold_combine(self, is_prefill: bool | None = None) -> bool:
         """Whether the aux-state projection runs inside the drafter's graph.
@@ -1092,6 +1094,20 @@ class RBLNEagleProposer(EagleProposer):
         token_indices_to_sample: torch.Tensor | None,
         is_prefill: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        if PREFILL_SHAPE_LOG and is_prefill and self._prefill_shape_logged < PREFILL_SHAPE_LOG:
+            self._prefill_shape_logged += 1
+            ragged = num_reqs > 1 and num_input_tokens % num_reqs != 0
+            logger.info(
+                "PREFILL_SHAPE n=%d num_reqs=%d num_input_tokens=%d "
+                "buffer_rows=%d ragged=%s%s",
+                self._prefill_shape_logged,
+                num_reqs,
+                num_input_tokens,
+                self.hidden_states.shape[0],
+                ragged,
+                "  <- view(num_reqs, -1) is wrong here" if ragged else "",
+            )
+
         if is_prefill:
             input_ids = self.input_ids.view(num_reqs, -1)
             positions = self.positions.view(num_reqs, -1)
