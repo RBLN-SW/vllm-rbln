@@ -991,7 +991,6 @@ def _real_input_batch(
         max_model_len=max_model_len,
         max_num_batched_tokens=512,
         device=torch.device("cpu"),
-        pin_memory=False,
         vocab_size=vocab_size,
         block_sizes=[block_size],
         kernel_block_sizes=[block_size],
