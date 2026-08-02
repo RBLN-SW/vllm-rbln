@@ -27,7 +27,10 @@ from vllm_rbln import envs
 from vllm_rbln.compilation import compile, create_compile_context
 from vllm_rbln.logger import init_logger
 from vllm_rbln.platform import HAS_TORCH_RBLN, USE_DEVICE_TENSOR
-from vllm_rbln.v1.spec_decode.utils import SKIP_GREEDY_SOFTMAX
+from vllm_rbln.v1.spec_decode.utils import (
+    INDEX_SELECT_GATHER,
+    SKIP_GREEDY_SOFTMAX,
+)
 
 if TYPE_CHECKING:
     from rebel import CompileContext
@@ -111,7 +114,11 @@ class RBLNRejectionSampler(RejectionSampler):
         # logits tensor. This means any in-place operations on bonus_logits
         # won't affect the original logits tensor.
         assert logits is not None
-        bonus_logits = logits[bonus_logits_indices]
+        bonus_logits = (
+            logits.index_select(0, bonus_logits_indices)
+            if INDEX_SELECT_GATHER
+            else logits[bonus_logits_indices]
+        )
         bonus_sampler_output = self.sampler(
             logits=bonus_logits,
             sampling_metadata=replace(
@@ -130,7 +137,11 @@ class RBLNRejectionSampler(RejectionSampler):
         # Just like `bonus_logits`, `target_logits` is a new tensor with
         # separate storage from the original `logits` tensor. Therefore,
         # it is safe to update `target_logits` in place.
-        raw_target_logits = logits[target_logits_indices]
+        raw_target_logits = (
+            logits.index_select(0, target_logits_indices)
+            if INDEX_SELECT_GATHER
+            else logits[target_logits_indices]
+        )
         # Use float32 for the target_logits.
         raw_target_logits = raw_target_logits.to(torch.float32)
         target_logits = self.apply_logits_processors(

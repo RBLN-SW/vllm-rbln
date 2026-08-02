@@ -150,6 +150,38 @@ PREFILL_SHAPE_LOG = int(os.getenv("VLLM_RBLN_EAGLE3_PREFILL_SHAPE_LOG", "0"))
 # `raw_target_logits`, never `target_probs`.
 SKIP_GREEDY_SOFTMAX = os.getenv("VLLM_RBLN_SKIP_GREEDY_SOFTMAX", "1") == "1"
 
+# Use `index_select` instead of advanced indexing for the remaining 1-D row
+# gathers.
+#
+# `_draft_ids` already records the reason: the two are equivalent for a 1-D row
+# selection, but only `index_select` takes the backend's native path. The same
+# pattern is still left at the two `logits[...]` gathers in the rejection sampler
+# -- each pulls rows out of a [num_tokens, vocab_size] tensor, 200064 wide on
+# MiniMax-M2.5, twice per decode step -- and at the pair inside the drafter's
+# compiled region.
+#
+# Both indices are 1-D int32 (`torch.zeros(batch_size, dtype=torch.int32)` in
+# vLLM's SpecDecodeMetadata), which is exactly what `index_select` wants, and it
+# returns a tensor with its own storage, so the in-place update of
+# `target_logits` further down stays safe.
+#
+# Measured: no gain. 50.84 vs a 50.97 baseline, where two runs of that unchanged
+# baseline sit 0.22 apart -- the difference is smaller than the noise, so there is
+# nothing here.
+#
+# The estimate that motivated this came from `_draft_ids`, whose docstring is
+# about a gather INSIDE the drafter's compiled region. These two are in the
+# rejection sampler, which runs eager, so "only `index_select` takes the
+# backend's native path" does not transfer -- an argument was carried across
+# contexts where it does not hold.
+#
+# Kept behind a default-off flag rather than reverted: the change is a correct
+# equivalence and costs nothing to re-measure on a backend where the eager path
+# does differ. The matching change inside the drafter region was reverted
+# outright because `token_indices_to_sample` is on CPU there and `index_select`
+# would force a per-step host-to-device copy.
+INDEX_SELECT_GATHER = os.getenv("VLLM_RBLN_INDEX_SELECT_GATHER", "0") == "1"
+
 # Reproduce the pre-fix warmup, where `dummy_run` compiled the narrow input while
 # serving handed the folded wide one, forcing a runtime recompile.
 #

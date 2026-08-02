@@ -775,6 +775,18 @@ class RBLNEagleProposer(EagleProposer):
             sample_hidden_states = last_hidden_states.view(-1, self.hidden_size)
 
             if token_indices_to_sample is not None:
+                # Advanced indexing rather than `index_select` here, unlike the
+                # rejection sampler's two gathers. `token_indices_to_sample`
+                # arrives on CPU while `hidden_states` is on rbln:0, and
+                # `index_select` requires both on one device -- dynamo fails the
+                # trace with "Unhandled FakeTensor Device Propagation for
+                # aten.index_select.default, found two different devices". A
+                # `.to(device)` would fix the trace and add a host-to-device copy
+                # every step, which is the opposite of the point. Advanced
+                # indexing tolerates the CPU index, and this tensor is
+                # hidden_size wide (3072) rather than vocabulary wide, so the
+                # native-path argument that motivates the sampler-side change
+                # carries much less here.
                 hidden_states = hidden_states[token_indices_to_sample]
                 sample_hidden_states = sample_hidden_states[token_indices_to_sample]
 
