@@ -108,6 +108,25 @@ DRAFT_ID_LOG_STEPS = int(os.getenv("VLLM_RBLN_EAGLE3_DRAFT_ID_LOG_STEPS", "0"))
 # decoding (it reads `[0]`), and the getter is one we own, so nothing in vLLM
 # changes.
 #
+# MEASURED (MiniMax-M2.5 DP4+EP, max_num_seqs 1):
+#   -2.69 ms TPOT, 48.26 against a 50.95 baseline whose four runs have sd 0.12.
+#   Equivalence is verified, not assumed: 24/24 draft token ids identical to the
+#   non-unrolled path at temperature 0, and accepted/draft identical to four
+#   decimals (1.3095).
+#
+# Default stays OFF because of what it costs. The unrolled graph holds more
+# intermediate buffers: at gpu_memory_utilization 0.6 the server fails to start
+# ("Not enough memory for 90 blocks of KV cache"), and at 0.55 the KV cache is
+# 63,488 tokens against 92,160 for the rolled graph -- about 31% less. That trade
+# is worth taking at low concurrency and probably is not at max_num_seqs 4+,
+# where several sequences compete for the same cache.
+#
+# Requires FUSE_FIRST_FORWARD off. With it on the unroll produces accepted/draft
+# of exactly 0: `model_wrapper` branches on `hidden_states.shape[-1]` to decide
+# whether to fold the aux projection, and inside one unrolled graph the first
+# copy takes a wide input while copies 2 and 3 do not. FUSE is a regression on
+# its own (+0.33 ms), so off is the configuration to use anyway.
+#
 # Verify with `equiv_check.sh`, never with acceptance: a mis-indexed `seq_lens`
 # makes iterations 2 and 3 attend without seeing the tokens iteration 1 wrote,
 # which neither crashes nor collapses acceptance -- it costs a few percent, which
