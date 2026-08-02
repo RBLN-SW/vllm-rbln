@@ -131,6 +131,25 @@ UNROLL_DRAFTER = os.getenv("VLLM_RBLN_EAGLE3_UNROLL_DRAFTER", "0") == "1"
 # with spec-decode off at mnbt 2048) with accepted/draft at 0.097.
 PREFILL_SHAPE_LOG = int(os.getenv("VLLM_RBLN_EAGLE3_PREFILL_SHAPE_LOG", "0"))
 
+# Skip the target softmax on the all-greedy rejection path.
+#
+# `rejection_sample` takes `target_probs.argmax(dim=-1)` and, when every request
+# is greedy, returns before the recovered-token and random branches that actually
+# read the distribution. `argmax(softmax(x)) == argmax(x)`, so the float32 softmax
+# over [num_tokens, vocab_size] -- 200064 wide on MiniMax-M2.5 -- is computed and
+# thrown away every decode step.
+#
+# Measured -1.34 ms TPOT on MiniMax-M2.5 DP4+EP (50.86 vs 52.20 with everything
+# else fixed). The fixed-prompt bench puts two instances of the same config
+# 0.01 ms apart, so that is about 9 sigma. Default on.
+#
+# Equivalence is exact rather than empirical: softmax is monotonic, so
+# `argmax(softmax(x)) == argmax(x)`, and nothing else in the all-greedy path
+# reads the distribution -- `sample_recovered_tokens` and the random branch sit
+# after the early return, and the logprobs path reads `target_logits` /
+# `raw_target_logits`, never `target_probs`.
+SKIP_GREEDY_SOFTMAX = os.getenv("VLLM_RBLN_SKIP_GREEDY_SOFTMAX", "1") == "1"
+
 # Reproduce the pre-fix warmup, where `dummy_run` compiled the narrow input while
 # serving handed the folded wide one, forcing a runtime recompile.
 #

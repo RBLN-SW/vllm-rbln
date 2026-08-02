@@ -27,6 +27,7 @@ from vllm_rbln import envs
 from vllm_rbln.compilation import compile, create_compile_context
 from vllm_rbln.logger import init_logger
 from vllm_rbln.platform import HAS_TORCH_RBLN, USE_DEVICE_TENSOR
+from vllm_rbln.v1.spec_decode.utils import SKIP_GREEDY_SOFTMAX
 
 if TYPE_CHECKING:
     from rebel import CompileContext
@@ -144,7 +145,20 @@ class RBLNRejectionSampler(RejectionSampler):
             sampling_metadata,
         )
         # Compute probability distribution from target logits.
-        target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
+        if SKIP_GREEDY_SOFTMAX and sampling_metadata.all_greedy:
+            # `argmax(softmax(x)) == argmax(x)`, and the all-greedy path takes the
+            # argmax and returns before anything else reads `target_probs` (the
+            # recovered-token and random branches sit after that early return).
+            # So the float32 softmax over [num_tokens, vocab_size] -- 200064 wide
+            # on MiniMax-M2.5 -- produces a tensor whose only use is an argmax
+            # that the logits already answer.
+            #
+            # Not gated on `synthetic_mode`: that path changes which tokens the
+            # greedy kernel accepts via `uniform_probs`, but it still consumes
+            # `target_argmax`, not the distribution.
+            target_probs = target_logits
+        else:
+            target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
 
         output_token_ids = self.impl.rejection_sample(
             metadata.draft_token_ids,
