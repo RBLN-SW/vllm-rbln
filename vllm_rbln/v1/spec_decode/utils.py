@@ -60,10 +60,9 @@ SKIP_DP_RENDEZVOUS = os.getenv("VLLM_RBLN_EAGLE3_SKIP_DP_RENDEZVOUS", "0") == "1
 # measurement. An earlier commit here read "+0.33 ms regression, default off" on
 # exactly that basis.
 #
-# Note for the drafter unroll: it requires this OFF (with it on, the unroll's
-# copies disagree on the aux-fold branch and acceptance collapses to zero). At
-# max_num_seqs 4 that makes the two mutually exclusive, and this one is worth
-# more.
+# The drafter unroll requires this OFF, and two attempts to lift that did not
+# work -- see UNROLL_DRAFTER below. At max_num_seqs 4 the two are mutually
+# exclusive and this one is worth more (+18.2% versus the unroll's -5.8%).
 FUSE_FIRST_FORWARD = os.getenv("VLLM_RBLN_EAGLE3_FUSE_FIRST_FORWARD", "1") == "1"
 
 # Run `eagle_prepare_next_token_padded` on the host instead of letting each of
@@ -124,11 +123,29 @@ DRAFT_ID_LOG_STEPS = int(os.getenv("VLLM_RBLN_EAGLE3_DRAFT_ID_LOG_STEPS", "0"))
 # is worth taking at low concurrency and probably is not at max_num_seqs 4+,
 # where several sequences compete for the same cache.
 #
-# Requires FUSE_FIRST_FORWARD off. With it on the unroll produces accepted/draft
-# of exactly 0: `model_wrapper` branches on `hidden_states.shape[-1]` to decide
-# whether to fold the aux projection, and inside one unrolled graph the first
-# copy takes a wide input while copies 2 and 3 do not. FUSE is a regression on
-# its own (+0.33 ms), so off is the configuration to use anyway.
+# Requires FUSE_FIRST_FORWARD off, and that is what limits it. Two attempts to
+# make them coexist both failed, differently:
+#
+#   1. As written, `model_wrapper` branches on `hidden_states.shape[-1]` to decide
+#      whether to fold the aux projection. Inside one unrolled region only the
+#      first copy is handed a wide tensor, so the copies trace different bodies
+#      and accepted/draft comes out exactly 0.
+#   2. Hoisting the fold above the first `model_wrapper` call -- so every copy
+#      sees a hidden_size-wide input and the branch is uniformly false -- changes
+#      the failure rather than removing it. The engine now dies during the
+#      request with a DP collective mismatch: one rank sits in
+#      `execute_dummy_batch` -> `_determine_batch_padding` -> `all_reduce` while
+#      another is in `num_tokens_across_dp`, and gloo reports the peer closing.
+#      `UNROLL_DRAFTER=1` with `FUSE_FIRST_FORWARD=0` does not do this, so it is
+#      specific to the combination.
+#
+# The hoist is kept: it is a no-op when FUSE is off (the width test is already
+# false) and it is the clearer structure. It is not a fix.
+#
+# Consequence: at max_num_seqs 4, where the fold is worth +18.2% wall, the unroll
+# cannot be used. Measured there anyway, with the fold off: the unroll gives
+# -5.8% (38.8 -> 36.6 min) but the fold's absence costs more, so the combination
+# lands 14.7% behind the deployment config. It stays useful at max_num_seqs 1.
 #
 # Verify with `equiv_check.sh`, never with acceptance: a mis-indexed `seq_lens`
 # makes iterations 2 and 3 attend without seeing the tokens iteration 1 wrote,

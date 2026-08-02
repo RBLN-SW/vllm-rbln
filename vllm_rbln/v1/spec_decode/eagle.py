@@ -829,6 +829,17 @@ class RBLNEagleProposer(EagleProposer):
             next step's `set_inputs_first_pass` overwrites them.
             """
             reset_draft_unroll_index()
+            # Fold the aux projection here rather than letting `model_wrapper` do
+            # it. That wrapper decides by width -- `hidden_states.shape[-1] !=
+            # self.hidden_size` -- and inside one unrolled region only the first
+            # copy is handed a wide tensor, so the three copies traced different
+            # bodies and acceptance collapsed to exactly zero. Folding once up
+            # front hands every copy a hidden_size-wide input, so the width test
+            # is uniformly false and the three copies agree.
+            #
+            # Same computation, same place in the graph; only the branch moves.
+            if FUSE_FIRST_FORWARD and hidden_states.shape[-1] != self.hidden_size:
+                hidden_states = self.model.combine_hidden_states(hidden_states)
             h, ids = model_wrapper(
                 input_ids, positions, hidden_states, token_indices_to_sample
             )
