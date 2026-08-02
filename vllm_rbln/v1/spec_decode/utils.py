@@ -40,28 +40,31 @@ SKIP_DP_RENDEZVOUS = os.getenv("VLLM_RBLN_EAGLE3_SKIP_DP_RENDEZVOUS", "0") == "1
 # The projection is its own compiled graph today (region 3/0, 1.17 ms/step
 # measured), so folding it removes one graph launch. A 1-layer 212M drafter
 # costs 1.0-1.5 ms per graph, which is mostly launch rather than compute.
-# Default off: measured a regression in both regimes on MiniMax-M2.5 DP4+EP.
+# Operating-point dependent -- the sign flips with max_num_seqs. Default ON,
+# matching the reference config's `--max-num-seqs 4`.
 #
-# A fixed-prompt low-variance bench (prefix hits ~73%, so almost pure decode)
-# resolves 0.03 ms across server instances and 0.15-0.26 ms across runs, which is
-# 20-100x tighter than the SWE-bench agent harness (3.2-6.3 ms). Against that:
+# MiniMax-M2.5 DP4+EP, agent workload, wall-clock (the only metric that
+# reproduces at this operating point: 1.8% across two runs of one config, versus
+# 6.6% for TPOT and 9.8% for throughput):
 #
-#   pure decode          FUSE on is +0.33 ms TPOT
-#   prefill every round  FUSE on is +0.70 ms TPOT  (matched 0%-cache pair: +1.01)
+#   max_num_seqs 4    FUSE off costs +18.2%   32.9 min -> 38.8 min
 #
-# Folding the aux projection into the drafter's first forward was supposed to pay
-# for itself on prefill, and it does not -- it is worse there than in decode. The
-# same bench puts the other three flags at DEVICE_ARGMAX -3.94, NARROW_LOGITS
-# -1.38, SKIP_DP_RENDEZVOUS -0.87, so this is the only one that does not earn its
-# place.
+# A fixed-prompt bench at max_num_seqs 1 says the opposite -- FUSE on is +0.33 ms
+# TPOT in pure decode and +0.70 ms with prefill forced every round. That bench
+# resolves 0.03 ms and is right about what it measures; it just cannot see this.
+# At max_num_seqs 4 prefill is 63% of steps and one step carries several
+# requests, which no mode of the fixed-prompt bench reproduces.
 #
-# The code stays because the measurement covers one model and one topology, and
-# because `FUSE_PREFILL` splits the two halves for anyone re-measuring. But it is
-# also where `_fold_combine`, `_aux_width`, the warmup/serving shape match and two
-# preflight checks come from, and three arm failures traced back to it
-# (`code=201` runtime recompile, a `dummy_run` prefill mismatch, a cold-cache
-# widen). Removing it outright is worth considering.
-FUSE_FIRST_FORWARD = os.getenv("VLLM_RBLN_EAGLE3_FUSE_FIRST_FORWARD", "0") == "1"
+# So: keep it on for deployment (max_num_seqs 4+), turn it off only for
+# single-sequence work, and do not re-derive the sign from a decode-only
+# measurement. An earlier commit here read "+0.33 ms regression, default off" on
+# exactly that basis.
+#
+# Note for the drafter unroll: it requires this OFF (with it on, the unroll's
+# copies disagree on the aux-fold branch and acceptance collapses to zero). At
+# max_num_seqs 4 that makes the two mutually exclusive, and this one is worth
+# more.
+FUSE_FIRST_FORWARD = os.getenv("VLLM_RBLN_EAGLE3_FUSE_FIRST_FORWARD", "1") == "1"
 
 # Run `eagle_prepare_next_token_padded` on the host instead of letting each of
 # its integer ops fall back there one at a time.
