@@ -62,6 +62,7 @@ class RBLNEagleProposer(EagleProposer):
 
         self.runner = runner
         self.arange_cpu = torch.arange(self.arange.shape[0], dtype=torch.int32)
+        self.draft_id_to_target_id: torch.Tensor | None = None
 
     def propose(
         self,
@@ -146,7 +147,9 @@ class RBLNEagleProposer(EagleProposer):
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1:
-            draft_tokens_ids = logits[:num_reqs].argmax(dim=-1)
+            draft_tokens_ids = self._to_target_token_ids(
+                logits[:num_reqs].argmax(dim=-1)
+            )
             return draft_tokens_ids.view(-1, 1)
 
         assert token_indices_to_sample_padded is not None
@@ -154,7 +157,7 @@ class RBLNEagleProposer(EagleProposer):
             token_indices_to_sample_padded.to(target_positions.device)
         ]
 
-        draft_token_ids = logits[:num_reqs].argmax(dim=-1)
+        draft_token_ids = self._to_target_token_ids(logits[:num_reqs].argmax(dim=-1))
 
         if self.allowed_attn_types is not None and not isinstance(
             attn_metadata, self.allowed_attn_types
@@ -186,7 +189,7 @@ class RBLNEagleProposer(EagleProposer):
         num_reqs_padded, num_padded_tokens, num_tokens_across_dp = (
             self._determine_draft_batch_padding(num_reqs, num_reqs, False)
         )
-        for token_index in range(self.num_speculative_tokens - 1):
+        for _ in range(self.num_speculative_tokens - 1):
             # Update the inputs
             # cast to int32 is crucial when eagle model is compiled.
             # tensor.argmax returns int64 by default.
@@ -237,12 +240,20 @@ class RBLNEagleProposer(EagleProposer):
                     inputs_embeds=inputs_embeds,
                     token_indices_to_sample=None,
                 )
-            draft_token_ids = logits[:num_reqs].argmax(dim=-1)
+            draft_token_ids = self._to_target_token_ids(
+                logits[:num_reqs].argmax(dim=-1)
+            )
             draft_token_ids_list.append(draft_token_ids)
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
         return draft_token_ids
+
+    def _to_target_token_ids(self, draft_token_ids: torch.Tensor) -> torch.Tensor:
+        d2t = self.draft_id_to_target_id
+        if d2t is None:
+            return draft_token_ids
+        return draft_token_ids + d2t[draft_token_ids]
 
     def set_inputs_first_pass(
         self,
@@ -353,6 +364,8 @@ class RBLNEagleProposer(EagleProposer):
     def load_model(self, target_model: nn.Module) -> None:
         super().load_model(target_model)
 
+        self.draft_id_to_target_id = getattr(self.model, "draft_id_to_target_id", None)
+
         def model_wrapper(
             input_ids: torch.Tensor,
             positions: torch.Tensor,
@@ -379,7 +392,20 @@ class RBLNEagleProposer(EagleProposer):
                 hidden_states = hidden_states[token_indices_to_sample]
                 sample_hidden_states = sample_hidden_states[token_indices_to_sample]
 
-            logits = self.model.compute_logits(sample_hidden_states)
+            if self.draft_id_to_target_id is not None:
+                # NOTE(RBLN): An EAGLE3 draft head predicts a reduced draft
+                # vocabulary and carries a draft->target id mapping
+                # (`draft_id_to_target_id`). Upstream's `compute_logits` then
+                # materializes a full-target-vocab tensor filled with `-inf`
+                # and scatters the draft logits into it,
+                # which results in a segfault or cpu fallback on RBLN.
+                # Keep the graph in draft-vocab space and map the winning id
+                # after the argmax instead (`_to_target_token_ids`).
+                logits = self.model.logits_processor(
+                    self.model.lm_head, sample_hidden_states
+                )
+            else:
+                logits = self.model.compute_logits(sample_hidden_states)
 
             return hidden_states, logits
 

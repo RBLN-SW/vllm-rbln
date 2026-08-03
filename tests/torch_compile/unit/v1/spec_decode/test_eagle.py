@@ -203,6 +203,9 @@ def make_eagle_stub(
         runner if runner is not None else SimpleNamespace(compile_context=object())
     )
     stub.allowed_attn_types = None
+    # Populated from the draft model in load_model; None means the draft head
+    # shares the target vocabulary, so propose() maps no ids.
+    stub.draft_id_to_target_id = None
     return stub
 
 
