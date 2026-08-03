@@ -326,6 +326,13 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         self.head_size = head_size
         self.scale = torch.tensor(scale, device=self.device)
         self.num_kv_heads = num_kv_heads
+        # Static per-tensor quantization scales for the fp8 KV cache. No
+        # calibration exists yet, so we feed a constant 1.0; the compiled
+        # custom op routes on the KV cache dtype. Switch these to
+        # layer._k_scale / layer._v_scale once static calibration lands.
+        # TODO(RBLN): support per-head scales (length == num_kv_heads).
+        self.k_quantize_scale = torch.tensor([1.0], device=self.device)
+        self.v_quantize_scale = torch.tensor([1.0], device=self.device)
         if alibi_slopes is not None:
             alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.float32)
         self.alibi_slopes = alibi_slopes
@@ -533,6 +540,8 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         attn_metadata.seq_lens,
                         attn_metadata.block_tables,
                         self.sinks,
+                        self.k_quantize_scale,
+                        self.v_quantize_scale,
                     )
                 else:
                     attn_output = flash_causal_attention_naive_decode(
@@ -544,6 +553,8 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         attn_metadata.seq_lens,
                         attn_metadata.block_tables,
                         self.sinks,
+                        self.k_quantize_scale,
+                        self.v_quantize_scale,
                     )
         else:
             if self.is_normal:

@@ -32,6 +32,8 @@ def flash_causal_attention_naive_prefill_impl(
     block_tables: torch.Tensor,
     slot_mapping: torch.Tensor,
     sinks: torch.Tensor | None = None,
+    k_quantize_scale: torch.Tensor | None = None,
+    v_quantize_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Expected tensor shapes:
@@ -48,6 +50,10 @@ def flash_causal_attention_naive_prefill_impl(
     - block_tables: [num_partitions,] for prefill,
                     [batch, num_partitions] for decode
     - sinks: [n_heads, sink_len] (optional)
+    - k_quantize_scale/v_quantize_scale: per-tensor (len 1) or per-head
+      (len n_heads) fp32 static quantization scales for the fp8 KV cache
+      (optional; None means 1.0). Consumed by the compiled RBLN custom op
+      which routes on the KV cache dtype; unused by this eager reference.
 
     Returns:
         Tensor: attn_output: [batch, n_kv_heads, n_groups, seq_len, head_dim]
@@ -208,6 +214,8 @@ def _(
     block_tables: torch.Tensor,
     slot_mapping: torch.Tensor,
     sinks: torch.Tensor | None = None,
+    k_quantize_scale: torch.Tensor | None = None,
+    v_quantize_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(q)
 
@@ -225,6 +233,8 @@ def flash_causal_attention_naive_decode_impl(
     block_tables: torch.Tensor,
     slot_mapping: torch.Tensor,
     sinks: torch.Tensor | None = None,
+    k_quantize_scale: torch.Tensor | None = None,
+    v_quantize_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if envs.VLLM_RBLN_COMPILE_MODEL:
         return torch.empty_like(q)
@@ -369,6 +379,8 @@ def _(
     block_tables: torch.Tensor,
     slot_mapping: torch.Tensor,
     sinks: torch.Tensor | None = None,
+    k_quantize_scale: torch.Tensor | None = None,
+    v_quantize_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(q)
 
@@ -382,6 +394,8 @@ def flash_causal_attention_naive_prefill(
     seq_idx: torch.Tensor,
     block_tables: torch.Tensor,
     sinks: torch.Tensor | None = None,
+    k_quantize_scale: torch.Tensor | None = None,
+    v_quantize_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if envs.VLLM_RBLN_COMPILE_MODEL:
         if envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
@@ -406,6 +420,8 @@ def flash_causal_attention_naive_prefill(
                 block_tables,
                 scale,  # dummy,
                 sinks,
+                k_quantize_scale,
+                v_quantize_scale,
             )
 
     raise NotImplementedError
@@ -420,6 +436,8 @@ def flash_causal_attention_naive_decode(
     seq_idx: torch.Tensor,
     block_tables: torch.Tensor,
     sinks: torch.Tensor | None = None,
+    k_quantize_scale: torch.Tensor | None = None,
+    v_quantize_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if envs.VLLM_RBLN_COMPILE_MODEL:
         if envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
@@ -444,6 +462,8 @@ def flash_causal_attention_naive_decode(
                 block_tables,
                 scale,  # dummy,
                 sinks,
+                k_quantize_scale,
+                v_quantize_scale,
             )
 
     raise NotImplementedError
