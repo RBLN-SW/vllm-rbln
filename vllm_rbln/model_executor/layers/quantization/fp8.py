@@ -31,12 +31,18 @@ from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 
+from vllm_rbln.custom_ops import custom_op, register_fake
 from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)
 
 
-@torch.library.custom_op(
+# NOTE: `masked_routing_weights` (plural) is the name in the released
+# rebel-compiler. The compiler renames it to the singular `masked_routing_weight`
+# in rebellions-sw/rebel_compiler#12049; rename this copy to match when the pin
+# moves to that build. Until then vllm_rbln.custom_ops logs a signature-drift
+# warning for this op at import time.
+@custom_op(
     "rbln_custom_ops::custom_moe_glu_group_dequantize",
     mutates_args=(),
 )
@@ -170,7 +176,7 @@ def custom_moe_glu_group_dequantize(
     return final_hidden_states
 
 
-@custom_moe_glu_group_dequantize.register_fake
+@register_fake("rbln_custom_ops::custom_moe_glu_group_dequantize")
 def custom_moe_glu_group_dequantize_fake(
     hidden_states: torch.Tensor,
     gate_proj_weight: torch.Tensor,

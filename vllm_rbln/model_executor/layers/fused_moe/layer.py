@@ -21,6 +21,7 @@ from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_moe import FusedMoE
 
 from vllm_rbln import envs
+from vllm_rbln.custom_ops import custom_op, register_fake
 from vllm_rbln.logger import init_logger
 from vllm_rbln.model_executor.layers.fused_moe import all2all
 from vllm_rbln.model_executor.layers.fused_moe.utils import get_tokens_mask
@@ -28,7 +29,7 @@ from vllm_rbln.model_executor.layers.fused_moe.utils import get_tokens_mask
 logger = init_logger(__name__)
 
 
-@torch.library.custom_op(
+@custom_op(
     "rbln_custom_ops::custom_moe_glu",
     mutates_args=(),
 )
@@ -85,7 +86,7 @@ def custom_moe_glu(
     return out
 
 
-@custom_moe_glu.register_fake
+@register_fake("rbln_custom_ops::custom_moe_glu")
 def custom_moe_glu_fake(
     hidden_states: torch.Tensor,
     gate_proj_weight: torch.Tensor,
