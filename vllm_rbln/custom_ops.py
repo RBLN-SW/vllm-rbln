@@ -25,21 +25,9 @@ logger = init_logger(__name__)
 #: Ops taken from rebel-compiler.
 FROM_COMPILER: set[str] = set()
 
-#: Ops this package had to define because the compiler does not provide them.
-FALLBACK: set[str] = set()
-
 #: Schema of this package's copy of each op, whether or not it was used. This is
 #: what the drift warning compares against the compiler's registration.
 LOCAL_SCHEMAS: dict[str, str] = {}
-
-
-def fallback_ops() -> frozenset[str]:
-    """Ops vllm-rbln registered itself, because rebel-compiler lacks them.
-
-    Empty once the minimum supported compiler registers all of them, which is
-    when the copies in this package can go.
-    """
-    return frozenset(FALLBACK)
 
 
 def custom_op(name: str, **kwargs: Any) -> Callable[[Callable], Any]:
@@ -57,8 +45,7 @@ def custom_op(name: str, **kwargs: Any) -> Callable[[Callable], Any]:
             _warn_on_schema_drift(name)
             return existing
 
-        FALLBACK.add(name)
-        logger.debug(
+        logger.info(
             "%s is not provided by the installed rebel-compiler; "
             "falling back to the definition in vllm-rbln.",
             name,
