@@ -62,6 +62,7 @@ class RBLNEagleProposer(EagleProposer):
             raise NotImplementedError
 
         self.runner = runner
+        self.arange_cpu = torch.arange(self.arange.shape[0], dtype=torch.int32)
         # Set in load_model when eagle3 + compilation are both on.
         self._compiled_combine = None
 
@@ -107,7 +108,6 @@ class RBLNEagleProposer(EagleProposer):
         shadow += delta
         if clamp_mask is not None:
             shadow.masked_fill_(clamp_mask.to(shadow.device), 1)
-        self.arange_cpu = torch.arange(self.arange.shape[0], dtype=torch.int32)
 
     def propose(
         self,
