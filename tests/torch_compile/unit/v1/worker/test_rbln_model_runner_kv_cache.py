@@ -85,9 +85,18 @@ class TestAllocateKvCacheTensors:
         assert result["layer_0"].shape == (1024,)
         assert result["layer_0"].dtype == torch.int8
 
-    def test_meta_device_when_compile(self):
-        """When VLLM_RBLN_USE_CUSTOM_KERNEL=False and COMPILE_MODEL=True,
-        tensors are on meta device."""
+    @pytest.mark.parametrize(
+        ("use_device_tensor", "expected_device_type"),
+        [
+            # Without device tensors the KV cache is a placeholder the compiled
+            # runtime allocates for; with them it lives on the runner's device.
+            (False, "meta"),
+            (True, "cpu"),  # _make_runner_stub pins runner.device to cpu
+        ],
+    )
+    def test_device_when_compile(self, use_device_tensor, expected_device_type):
+        """With VLLM_RBLN_USE_CUSTOM_KERNEL=False and COMPILE_MODEL=True, the
+        allocation device is selected by USE_DEVICE_TENSOR."""
         runner = _make_runner_stub()
         runner.runner_only_attn_layers = set()
         self._bind(runner)
@@ -100,13 +109,21 @@ class TestAllocateKvCacheTensors:
         kv_cache_config.kv_cache_tensors = [kv_tensor]
         kv_cache_config.kv_cache_groups = [MagicMock(layer_names=["layer_0"])]
 
-        with patch("vllm_rbln.v1.worker.rbln_model_runner.envs") as mock_envs:
+        # USE_DEVICE_TENSOR is a module-level constant frozen at import time, so
+        # patching `envs` alone does not reach it.
+        with (
+            patch("vllm_rbln.v1.worker.rbln_model_runner.envs") as mock_envs,
+            patch(
+                "vllm_rbln.v1.worker.rbln_model_runner.USE_DEVICE_TENSOR",
+                use_device_tensor,
+            ),
+        ):
             mock_envs.VLLM_RBLN_USE_CUSTOM_KERNEL = False
             mock_envs.VLLM_RBLN_COMPILE_MODEL = True
 
             result = runner._allocate_kv_cache_tensors(kv_cache_config)
 
-        assert result["layer_0"].device.type == "meta"
+        assert result["layer_0"].device.type == expected_device_type
 
     def test_multiple_kv_cache_tensors(self):
         """Multiple KV cache tensor configs for different layer groups."""
