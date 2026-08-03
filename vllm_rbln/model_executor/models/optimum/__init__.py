@@ -43,6 +43,7 @@ from .qwen2_vl import (  # noqa: F401
     RBLNOptimumQwen2VLForConditionalGeneration,
 )
 from .qwen3_vl import (  # noqa: F401
+    RBLNOptimumQwen3_5ForConditionalGeneration,
     RBLNOptimumQwen3VLForConditionalGeneration,
     RBLNOptimumQwen3VLMoeForConditionalGeneration,
 )

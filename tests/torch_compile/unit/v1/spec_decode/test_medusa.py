@@ -138,7 +138,9 @@ def test_init_creates_compile_context_when_not_provided(monkeypatch):
 
     proposer = RBLNMedusaProposer(make_vllm_config(), DEVICE)
 
-    create_compile_context.assert_called_once_with(use_weight_sharing=True)
+    create_compile_context.assert_called_once_with(
+        use_weight_sharing=True, use_global_ctx=True
+    )
     assert proposer.compile_context is sentinel
 
 
@@ -215,7 +217,7 @@ def test_load_model_compiles_wrapper(monkeypatch, strict):
     assert captured["dynamic"] is False
     assert captured["fullgraph"] is True
     assert captured["compile_context"] is fake.compile_context
-    assert captured["tensor_parallel_size"] == 8
+    assert captured["num_devices"] == 8
     assert captured["process_group_dict"] is process_group_sentinel
     assert captured["guard_filter_fn"] is torch.compiler.keep_tensor_guards_unsafe
     assert captured["mode"] == ("strict" if strict else "")
