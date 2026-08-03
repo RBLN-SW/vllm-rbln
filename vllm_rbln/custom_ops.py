@@ -15,6 +15,7 @@
 from collections.abc import Callable
 from typing import Any
 
+# Required, and must come first: the decorators below check what it registers.
 import rebel  # noqa: F401
 import torch
 
@@ -22,8 +23,8 @@ from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)
 
-#: Ops already registered when this package's copy ran, so the existing
-#: definition -- rebel-compiler's -- is the one in use.
+#: Ops already registered when this package's copy ran, so that existing
+#: definition is the one in use.
 ALREADY_DEFINED: set[str] = set()
 
 #: Schema this package declares for each op, whether or not its copy was used.
@@ -32,7 +33,7 @@ DECLARED_SCHEMAS: dict[str, str] = {}
 
 
 def custom_op(name: str, **kwargs: Any) -> Callable[[Callable], Any]:
-    """Define `name` unless rebel-compiler already did. Drop-in for
+    """Define `name` unless it is already defined. Drop-in for
     torch.library.custom_op."""
 
     def decorator(fn: Callable) -> Any:
@@ -47,8 +48,7 @@ def custom_op(name: str, **kwargs: Any) -> Callable[[Callable], Any]:
             return existing
 
         logger.info(
-            "%s is not provided by the installed rebel-compiler; "
-            "falling back to the definition in vllm-rbln.",
+            "%s is not registered yet; falling back to the definition in vllm-rbln.",
             name,
         )
         return torch.library.custom_op(name, **kwargs)(fn)
@@ -57,10 +57,10 @@ def custom_op(name: str, **kwargs: Any) -> Callable[[Callable], Any]:
 
 
 def register_fake(name: str, **kwargs: Any) -> Callable[[Callable], Callable]:
-    """Register a fake kernel for `name`, unless the compiler owns the op.
+    """Register a fake kernel for `name`, unless the op is already defined.
 
-    The compiler's fake goes with the compiler's schema; overriding one and not
-    the other is how the two copies would drift apart unnoticed.
+    An existing op's fake goes with its schema; overriding one and not the other
+    is how the two copies would drift apart unnoticed.
     """
 
     def decorator(fn: Callable) -> Callable:
@@ -87,15 +87,15 @@ def _lookup(qualname: str) -> Any | None:
 
 
 def _warn_on_schema_drift(qualname: str) -> None:
-    """Report a fallback copy that no longer matches what the compiler lowers."""
+    """Report a copy in this package that no longer matches the registered op."""
     ours = DECLARED_SCHEMAS.get(qualname)
     theirs = _existing_schema(qualname)
     if ours is None or theirs is None or ours == theirs:
         return
     logger.warning(
-        "%s has a different signature in vllm-rbln than in the installed "
-        "rebel-compiler. The compiler's definition is used; the copy in this "
-        "package is stale.\n  rebel-compiler: %s\n  vllm-rbln:      %s",
+        "%s is already registered with a different signature than the copy in "
+        "vllm-rbln. The registered definition is used; the copy in this package "
+        "is stale.\n  registered: %s\n  vllm-rbln:  %s",
         qualname,
         theirs,
         ours,
