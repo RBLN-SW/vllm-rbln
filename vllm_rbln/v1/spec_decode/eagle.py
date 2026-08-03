@@ -175,15 +175,13 @@ class RBLNEagleProposer(EagleProposer):
         )
         inputs_embeds = None
 
-        with (
-            set_forward_context(
-                per_layer_attn_metadata,
-                self.vllm_config,
-                num_tokens=num_tokens,
-                num_tokens_across_dp=num_tokens_across_dp,
-                num_padded_tokens=num_padded_tokens,
-                **build_kv_cache_forward_context_kwargs(self.runner.kv_cache_bases),
-            ),
+        with set_forward_context(
+            per_layer_attn_metadata,
+            self.vllm_config,
+            num_tokens=num_tokens,
+            num_tokens_across_dp=num_tokens_across_dp,
+            num_padded_tokens=num_padded_tokens,
+            **build_kv_cache_forward_context_kwargs(self.runner.kv_cache_bases),
         ):
             hidden_states, logits = self.model_executable(
                 input_ids=input_ids,
@@ -276,15 +274,13 @@ class RBLNEagleProposer(EagleProposer):
             )
 
             # Run the model.
-            with (
-                set_forward_context(
-                    per_layer_attn_metadata,
-                    self.vllm_config,
-                    num_tokens=num_reqs,
-                    num_tokens_across_dp=num_tokens_across_dp,
-                    num_padded_tokens=num_padded_tokens,
-                    **build_kv_cache_forward_context_kwargs(self.runner.kv_cache_bases),
-                ),
+            with set_forward_context(
+                per_layer_attn_metadata,
+                self.vllm_config,
+                num_tokens=num_reqs,
+                num_tokens_across_dp=num_tokens_across_dp,
+                num_padded_tokens=num_padded_tokens,
+                **build_kv_cache_forward_context_kwargs(self.runner.kv_cache_bases),
             ):
                 hidden_states, logits = self.model_executable(
                     input_ids=input_ids,
