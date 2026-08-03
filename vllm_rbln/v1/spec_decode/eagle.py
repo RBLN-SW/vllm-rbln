@@ -22,7 +22,6 @@ from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
-from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 import vllm_rbln.envs as envs
@@ -128,61 +127,55 @@ class RBLNEagleProposer(EagleProposer):
             assert isinstance(
                 self.model, (Eagle3LlamaForCausalLM, Eagle3DeepseekV2ForCausalLM)
             )
-            with record_function_or_nullcontext("drafter/first: combine"):
-                target_hidden_states = self._combine_hidden_states(target_hidden_states)
+            target_hidden_states = self._combine_hidden_states(target_hidden_states)
             assert target_hidden_states.shape[-1] == self.hidden_size
 
-        with record_function_or_nullcontext("drafter/first: set_inputs"):
-            num_tokens, token_indices_to_sample = self.set_inputs_first_pass(
-                target_token_ids=target_token_ids,
-                next_token_ids=next_token_ids,
-                target_positions=target_positions,
-                target_hidden_states=target_hidden_states,
-                token_indices_to_sample=token_indices_to_sample,
-                cad=common_attn_metadata,
-            )
+        num_tokens, token_indices_to_sample = self.set_inputs_first_pass(
+            target_token_ids=target_token_ids,
+            next_token_ids=next_token_ids,
+            target_positions=target_positions,
+            target_hidden_states=target_hidden_states,
+            token_indices_to_sample=token_indices_to_sample,
+            cad=common_attn_metadata,
+        )
 
         assert self.runner is not None
         is_prefill = self.runner.is_prefill
 
         # Build attention metadata
         num_reqs = self.runner.input_batch.num_reqs
-        with record_function_or_nullcontext("drafter/first: dp_padding"):
-            num_reqs_padded, num_padded_tokens, num_tokens_across_dp = (
-                self._determine_draft_batch_padding(num_reqs, num_tokens, is_prefill)
-            )
+        num_reqs_padded, num_padded_tokens, num_tokens_across_dp = (
+            self._determine_draft_batch_padding(num_reqs, num_tokens, is_prefill)
+        )
         per_layer_attn_metadata: dict[str, object] = {}
-        with record_function_or_nullcontext("drafter/first: attn_meta"):
-            for attn_group in self.draft_attn_groups:
-                attn_metadata = attn_group.get_metadata_builder().build(
-                    common_attn_metadata=common_attn_metadata,
-                    positions=target_positions,
-                    is_prefill=is_prefill,
-                    batch_pad=num_reqs_padded,
-                )
-                attach_kv_cache_bindings(
-                    attn_metadata,
-                    self.runner.kv_caches,
-                    self.runner.kv_cache_bases,
-                    self.runner.kv_cache_view_infos,
-                )
-                for layer_name in attn_group.layer_names:
-                    per_layer_attn_metadata[layer_name] = attn_metadata
-
-        with record_function_or_nullcontext("drafter/first: preprocess"):
-            input_ids, positions, hidden_states, token_indices_to_sample_padded = (
-                self._preprocess(
-                    num_reqs,
-                    num_reqs_padded,
-                    num_tokens,
-                    token_indices_to_sample,
-                    is_prefill,
-                )
+        for attn_group in self.draft_attn_groups:
+            attn_metadata = attn_group.get_metadata_builder().build(
+                common_attn_metadata=common_attn_metadata,
+                positions=target_positions,
+                is_prefill=is_prefill,
+                batch_pad=num_reqs_padded,
             )
+            attach_kv_cache_bindings(
+                attn_metadata,
+                self.runner.kv_caches,
+                self.runner.kv_cache_bases,
+                self.runner.kv_cache_view_infos,
+            )
+            for layer_name in attn_group.layer_names:
+                per_layer_attn_metadata[layer_name] = attn_metadata
+
+        input_ids, positions, hidden_states, token_indices_to_sample_padded = (
+            self._preprocess(
+                num_reqs,
+                num_reqs_padded,
+                num_tokens,
+                token_indices_to_sample,
+                is_prefill,
+            )
+        )
         inputs_embeds = None
 
         with (
-            record_function_or_nullcontext("drafter/first: forward"),
             set_forward_context(
                 per_layer_attn_metadata,
                 self.vllm_config,
@@ -205,27 +198,26 @@ class RBLNEagleProposer(EagleProposer):
             draft_tokens_ids = logits[:num_reqs].argmax(dim=-1)
             return draft_tokens_ids.view(-1, 1)
 
-        with record_function_or_nullcontext("drafter/first: sample"):
-            assert token_indices_to_sample_padded is not None
-            positions = target_positions[
-                token_indices_to_sample_padded.to(target_positions.device)
-            ]
+        assert token_indices_to_sample_padded is not None
+        positions = target_positions[
+            token_indices_to_sample_padded.to(target_positions.device)
+        ]
 
-            # `hidden_states` is deliberately not gathered here -- #821 moved
-            # that gather inside `model_wrapper`. Doing it again would index an
-            # already (num_reqs_padded, hidden_size) tensor with token-space
-            # indices and raise on the first decode.
-            draft_token_ids = logits[:num_reqs].argmax(dim=-1)
+        # `hidden_states` is deliberately not gathered here -- #821 moved
+        # that gather inside `model_wrapper`. Doing it again would index an
+        # already (num_reqs_padded, hidden_size) tensor with token-space
+        # indices and raise on the first decode.
+        draft_token_ids = logits[:num_reqs].argmax(dim=-1)
 
-            if self.allowed_attn_types is not None and not isinstance(
-                attn_metadata, self.allowed_attn_types
-            ):
-                raise ValueError(
-                    f"Unsupported attention metadata type for speculative "
-                    "decoding with num_speculative_tokens > 1: "
-                    f"{type(attn_metadata)}. Supported types are: "
-                    f"{self.allowed_attn_types}"
-                )
+        if self.allowed_attn_types is not None and not isinstance(
+            attn_metadata, self.allowed_attn_types
+        ):
+            raise ValueError(
+                f"Unsupported attention metadata type for speculative "
+                "decoding with num_speculative_tokens > 1: "
+                f"{type(attn_metadata)}. Supported types are: "
+                f"{self.allowed_attn_types}"
+            )
 
         # Generate the remaining draft tokens.
         draft_token_ids_list = [draft_token_ids]
@@ -249,49 +241,42 @@ class RBLNEagleProposer(EagleProposer):
             self._determine_draft_batch_padding(num_reqs, num_reqs, False)
         )
         for token_index in range(self.num_speculative_tokens - 1):
-            with record_function_or_nullcontext("drafter: loop_update"):
-                # Update the inputs
-                # cast to int32 is crucial when eagle model is compiled.
-                # tensor.argmax returns int64 by default.
-                self.input_ids[:num_reqs] = draft_token_ids_list[-1].int()
-                positions = positions.view(-1) + 1
-                self.positions[:num_reqs] = positions[:num_reqs]
-                self.hidden_states[: hidden_states.shape[0]] = hidden_states
+            self.input_ids[:num_reqs] = draft_token_ids_list[-1].int()
+            positions = positions.view(-1) + 1
+            self.positions[:num_reqs] = positions[:num_reqs]
+            self.hidden_states[: hidden_states.shape[0]] = hidden_states
 
-                exceeds_max_model_len = positions[:num_reqs] >= self.max_model_len
-                common_attn_metadata.seq_lens += 1
-                common_attn_metadata.seq_lens.masked_fill_(exceeds_max_model_len, 1)
-                # Mirror the device op exactly: unsliced, same mask.
-                self._mirror_seq_lens_to_host(
-                    common_attn_metadata, 1, exceeds_max_model_len
+            exceeds_max_model_len = positions[:num_reqs] >= self.max_model_len
+            common_attn_metadata.seq_lens += 1
+            common_attn_metadata.seq_lens.masked_fill_(exceeds_max_model_len, 1)
+            # Mirror the device op exactly: unsliced, same mask.
+            self._mirror_seq_lens_to_host(
+                common_attn_metadata, 1, exceeds_max_model_len
+            )
+
+            per_layer_attn_metadata.clear()
+            for attn_group in self.draft_attn_groups:
+                attn_metadata = attn_group.get_metadata_builder().build(
+                    common_attn_metadata=common_attn_metadata,
+                    positions=positions,
+                    is_prefill=False,
+                    batch_pad=num_reqs_padded,
                 )
-
-            with record_function_or_nullcontext("drafter: attn_meta"):
-                # Rebuild attention metadata
-                per_layer_attn_metadata.clear()
-                for attn_group in self.draft_attn_groups:
-                    attn_metadata = attn_group.get_metadata_builder().build(
-                        common_attn_metadata=common_attn_metadata,
-                        positions=positions,
-                        is_prefill=False,
-                        batch_pad=num_reqs_padded,
-                    )
-                    attach_kv_cache_bindings(
-                        attn_metadata,
-                        self.runner.kv_caches,
-                        self.runner.kv_cache_bases,
-                        self.runner.kv_cache_view_infos,
-                    )
-                    for layer_name in attn_group.layer_names:
-                        per_layer_attn_metadata[layer_name] = attn_metadata
-
-                input_ids, positions, hidden_states, _ = self._preprocess(
-                    num_reqs, num_reqs_padded, num_reqs, None, False
+                attach_kv_cache_bindings(
+                    attn_metadata,
+                    self.runner.kv_caches,
+                    self.runner.kv_cache_bases,
+                    self.runner.kv_cache_view_infos,
                 )
+                for layer_name in attn_group.layer_names:
+                    per_layer_attn_metadata[layer_name] = attn_metadata
+
+            input_ids, positions, hidden_states, _ = self._preprocess(
+                num_reqs, num_reqs_padded, num_reqs, None, False
+            )
 
             # Run the model.
             with (
-                record_function_or_nullcontext("drafter: forward"),
                 set_forward_context(
                     per_layer_attn_metadata,
                     self.vllm_config,
