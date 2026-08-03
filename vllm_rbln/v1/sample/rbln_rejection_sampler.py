@@ -525,7 +525,7 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
 
         This function applies temperature scaling to the logits,
         as well as top-k and top-p. For greedy decoding, it returns
-        the original logits.
+        logits collapsed onto the argmax.
 
         Args:
             logits: Input logits tensor to be processed.
@@ -534,16 +534,16 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
                 temperature and whether greedy sampling is used.
 
         Returns:
-            torch.Tensor: Processed logits if non-greedy sampling is used,
-            otherwise returns the original logits.
+            torch.Tensor: Processed logits -- the caller
+            softmaxes the result to build `target_probs`.
         """
         assert logits.ndim == 2
         assert cu_num_draft_tokens.ndim == 1
         if sampling_metadata.all_greedy:
-            # Make One-hot target distribution for the rejection sampler.
+            # -inf except at the argmax, so the caller's softmax yields an exact
+            # one-hot.
             _, max_idx = logits.max(dim=-1, keepdim=True)
-            logits = torch.zeros_like(logits).scatter_(-1, max_idx, 1.0)
-            return logits
+            return torch.full_like(logits, float("-inf")).scatter_(-1, max_idx, 0.0)
 
         num_tokens = logits.shape[0]
         # NOTE(eunji.lee):
