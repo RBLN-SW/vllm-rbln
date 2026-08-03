@@ -326,13 +326,6 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         self.head_size = head_size
         self.scale = torch.tensor(scale, device=self.device)
         self.num_kv_heads = num_kv_heads
-        # Static per-tensor quantization scales for the fp8 KV cache. No
-        # calibration exists yet, so we feed a constant 1.0; the compiled
-        # custom op routes on the KV cache dtype. Switch these to
-        # layer._k_scale / layer._v_scale once static calibration lands.
-        # TODO(RBLN): support per-head scales (length == num_kv_heads).
-        self.k_quantize_scale = torch.tensor([1.0], device=self.device)
-        self.v_quantize_scale = torch.tensor([1.0], device=self.device)
         if alibi_slopes is not None:
             alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.float32)
         self.alibi_slopes = alibi_slopes
@@ -377,6 +370,45 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         self.is_normal = (self.block_size == self.max_model_len) and (
             self.sinks is None
         )
+
+    def _kv_quantize_scales(
+        self, layer: torch.nn.Module
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the static fp8 KV-cache scales for this layer.
+
+        vLLM's ``Attention.__init__`` unconditionally registers the
+        ``_k_scale``/``_v_scale`` buffers (via ``set_default_quant_scales``) and
+        fills them during ``process_weights_after_loading``. Their shape encodes
+        the quantization granularity:
+
+        * scalar ``()`` or ``[1]`` -> per-tensor: a single scale for the whole
+          KV tensor (the 1.0 default, or a compressed-tensors per-tensor scheme).
+        * ``[num_kv_heads]`` -> per-head: compressed-tensors ``attn_head``
+          strategy stores one scale per (TP-local) KV head
+          (``_k_scale = layer.k_scale`` of shape ``torch.ones(num_kv_heads)``).
+
+        We flatten to the ``[1]`` (per-tensor) / ``[num_kv_heads]`` (per-head)
+        layout the compiled RBLN custom op expects; the op routes on the KV
+        cache dtype and the scale length. Weights are fully loaded by the time
+        ``forward`` runs, so the values are final here. The per-head head order
+        matches q/k/v (both are the TP-local ``n_kv_heads`` axis).
+        """
+        return (
+            self._normalize_kv_scale(layer._k_scale),
+            self._normalize_kv_scale(layer._v_scale),
+        )
+
+    def _normalize_kv_scale(self, scale: torch.Tensor) -> torch.Tensor:
+        """Flatten a KV scale buffer to [1] (per-tensor) or [num_kv_heads]."""
+        scale = scale.reshape(-1).to(device=self.device, dtype=torch.float32)
+        numel = scale.numel()
+        if numel not in (1, self.num_kv_heads):
+            raise ValueError(
+                "RBLNFlashAttention expects a per-tensor (len 1) or per-head "
+                f"(len num_kv_heads={self.num_kv_heads}) fp8 KV scale, "
+                f"got length {numel}."
+            )
+        return scale
 
     def forward(
         self,
@@ -530,6 +562,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                 #   original sequence index
                 # * otherwise         - seq_lens[B, P] == seq_lens_tensor,
                 #   dynamic size for each partition
+                k_quantize_scale, v_quantize_scale = self._kv_quantize_scales(layer)
                 if attn_metadata.is_prefill:
                     attn_output = flash_causal_attention_naive_prefill(
                         query,
@@ -540,8 +573,8 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         attn_metadata.seq_lens,
                         attn_metadata.block_tables,
                         self.sinks,
-                        self.k_quantize_scale,
-                        self.v_quantize_scale,
+                        k_quantize_scale,
+                        v_quantize_scale,
                     )
                 else:
                     attn_output = flash_causal_attention_naive_decode(
@@ -553,8 +586,8 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         attn_metadata.seq_lens,
                         attn_metadata.block_tables,
                         self.sinks,
-                        self.k_quantize_scale,
-                        self.v_quantize_scale,
+                        k_quantize_scale,
+                        v_quantize_scale,
                     )
         else:
             if self.is_normal:

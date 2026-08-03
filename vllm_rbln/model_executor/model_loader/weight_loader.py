@@ -695,6 +695,19 @@ def load_minimax_m2_weights(
         if spec_layer is not None:
             continue  # skip spec decode layers for main model
 
+        # Remap fp8 KV-cache scales (k/v/q_scale, zero_point) BEFORE the qkv
+        # stacked mapping. Otherwise a split-format checkpoint name like
+        # `self_attn.k_proj.k_scale` (ModelOpt-style) would be rewritten to
+        # `self_attn.qkv_proj.k_scale` by the "k_proj"->"qkv_proj" rule and
+        # crash, and compressed-tensors `attn_head` per-head scales
+        # (`self_attn.k_scale` of shape [num_kv_heads]) would only resolve to
+        # the `self_attn.attn.k_scale` parameter here. maybe_remap_kv_scale_name
+        # leaves non-kv scales (e.g. expert weight/input scales) untouched.
+        if "scale" in name or "zero_point" in name:
+            name = maybe_remap_kv_scale_name(name, params_dict)
+            if name is None:
+                continue
+
         for param_name, weight_name, shard_id in stacked_params_mapping:
             # Skip non-stacked layers and experts (experts handled below).
             if weight_name not in name:
