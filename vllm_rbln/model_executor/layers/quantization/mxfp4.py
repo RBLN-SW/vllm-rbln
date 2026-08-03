@@ -27,12 +27,13 @@ from vllm.model_executor.layers.quantization.mxfp4 import (
     Mxfp4MoeBackend,
 )
 
+from vllm_rbln.custom_ops import custom_op, register_fake
 from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)
 
 
-@torch.library.custom_op(
+@custom_op(
     "rbln_custom_ops::custom_moe_glu_mxfp4",
     mutates_args=(),
 )
@@ -47,7 +48,7 @@ def custom_moe_glu_mxfp4(
     down_proj_blocks: torch.Tensor,
     down_proj_scales: torch.Tensor,
     down_proj_bias: torch.Tensor,
-    masked_routing_weights: torch.Tensor,
+    masked_routing_weight: torch.Tensor,
     alpha: torch.Tensor,
     limit: torch.Tensor,
     expert_map: torch.Tensor | None = None,
@@ -66,7 +67,7 @@ def custom_moe_glu_mxfp4(
     - down_proj_blocks: uint8 [num_experts, hidden_size, intermediate_size // 2]
     - down_proj_scales: [num_experts, hidden_size, intermediate_size // 32]
     - down_proj_bias: [num_experts, hidden_size]
-    - masked_routing_weights: [num_experts, num_tokens]
+    - masked_routing_weight: [num_experts, num_tokens]
       Pre-scored routing weights (top-k + softmax already applied by the caller);
       the kernel does NOT route internally. (token dim may be padded to 64-align)
     - alpha: [], constant
@@ -81,7 +82,7 @@ def custom_moe_glu_mxfp4(
     return torch.empty_like(hidden_states)
 
 
-@custom_moe_glu_mxfp4.register_fake
+@register_fake("rbln_custom_ops::custom_moe_glu_mxfp4")
 def custom_moe_glu_mxfp4_fake(
     hidden_states: torch.Tensor,
     gate_proj_blocks: torch.Tensor,
@@ -93,7 +94,7 @@ def custom_moe_glu_mxfp4_fake(
     down_proj_blocks: torch.Tensor,
     down_proj_scales: torch.Tensor,
     down_proj_bias: torch.Tensor,
-    masked_routing_weights: torch.Tensor,
+    masked_routing_weight: torch.Tensor,
     alpha: torch.Tensor,
     limit: torch.Tensor,
     expert_map: torch.Tensor | None = None,

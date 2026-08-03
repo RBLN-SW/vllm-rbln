@@ -15,11 +15,12 @@
 import torch
 
 from vllm_rbln import envs
+from vllm_rbln.custom_ops import custom_op, register_fake
 
 from . import triton_flash_causal_attention  # noqa: F401
 
 
-@torch.library.custom_op(
+@custom_op(
     "rbln_custom_ops::flash_causal_attention_naive_prefill", mutates_args=["kv_cache"]
 )
 def flash_causal_attention_naive_prefill_impl(
@@ -203,7 +204,7 @@ def flash_causal_attention_naive_prefill_impl(
     return attn_output
 
 
-@torch.library.register_fake("rbln_custom_ops::flash_causal_attention_naive_prefill")
+@register_fake("rbln_custom_ops::flash_causal_attention_naive_prefill")
 def _(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -220,7 +221,7 @@ def _(
     return torch.empty_like(q)
 
 
-@torch.library.custom_op(
+@custom_op(
     "rbln_custom_ops::flash_causal_attention_naive_decode", mutates_args=["kv_cache"]
 )
 def flash_causal_attention_naive_decode_impl(
@@ -368,7 +369,7 @@ def flash_causal_attention_naive_decode_impl(
     return torch.cat(outputs, dim=0)
 
 
-@torch.library.register_fake("rbln_custom_ops::flash_causal_attention_naive_decode")
+@register_fake("rbln_custom_ops::flash_causal_attention_naive_decode")
 def _(
     q: torch.Tensor,
     k: torch.Tensor,

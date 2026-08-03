@@ -16,8 +16,10 @@ import torch
 from vllm.model_executor.layers.fused_moe import UnquantizedFusedMoEMethod
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 
+from vllm_rbln.custom_ops import custom_op, register_fake
 
-@torch.library.custom_op(
+
+@custom_op(
     "rbln_custom_ops::custom_moe_glu",
     mutates_args=(),
 )
@@ -74,7 +76,7 @@ def custom_moe_glu(
     return out
 
 
-@custom_moe_glu.register_fake
+@register_fake("rbln_custom_ops::custom_moe_glu")
 def custom_moe_glu_fake(
     hidden_states: torch.Tensor,
     gate_proj_weight: torch.Tensor,
