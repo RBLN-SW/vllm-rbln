@@ -51,9 +51,12 @@ try:
 except ImportError:
     HAS_TORCH_RBLN = False
 
-USE_DEVICE_TENSOR: bool = (
-    envs.VLLM_RBLN_USE_VLLM_MODEL and envs.VLLM_RBLN_USE_DEVICE_TENSOR
-)
+
+def _use_device_tensor() -> bool:
+    return envs.VLLM_RBLN_USE_VLLM_MODEL and envs.VLLM_RBLN_USE_DEVICE_TENSOR
+
+
+USE_DEVICE_TENSOR: bool = _use_device_tensor()
 # RBLN default for an unset max_num_seqs (upstream vLLM defaults to 256).
 RBLN_DEFAULT_MAX_NUM_SEQS = 1
 
@@ -65,6 +68,14 @@ def bypass_backend(graph_module: torch.fx.GraphModule, example_inputs):
 register_backend(name="bypass", compiler_fn=bypass_backend)
 
 
+def _derive_platform_attrs(use_device_tensor: bool) -> dict:
+    return {
+        "device_name": "rbln" if use_device_tensor else "cpu",
+        "device_type": "rbln" if use_device_tensor else "cpu",
+        "dist_backend": "rbln-ccl" if use_device_tensor else "",
+    }
+
+
 class RblnPlatform(Platform):
     _enum = PlatformEnum.OOT
 
@@ -73,9 +84,10 @@ class RblnPlatform(Platform):
     # VLLM_WORKER_MULTIPROC_METHOD=spawn (which re-import this module fresh)
     # observe identical values to the parent without any extra plumbing.
     plugin_name: str = "rbln"
-    device_name: str = "rbln" if USE_DEVICE_TENSOR else "cpu"
-    device_type: str = "rbln" if USE_DEVICE_TENSOR else "cpu"
-    dist_backend: str = "rbln-ccl" if USE_DEVICE_TENSOR else ""
+    _frozen_attrs = _derive_platform_attrs(USE_DEVICE_TENSOR)
+    device_name: str = _frozen_attrs["device_name"]
+    device_type: str = _frozen_attrs["device_type"]
+    dist_backend: str = _frozen_attrs["dist_backend"]
     dispatch_key: str = "CPU"
     ray_device_key: str = "RBLN"
     device_control_env_var: str = "RBLN_DEVICES"
@@ -244,7 +256,7 @@ class RblnPlatform(Platform):
             raise ValueError(
                 "VLLM_USE_V2_MODEL_RUNNER is not supported for RBLN backend."
             )
-
+        cls._guard_import_time_envs()
         model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
         scheduler_config = vllm_config.scheduler_config
@@ -605,3 +617,21 @@ class RblnPlatform(Platform):
             additional_kwargs["kv_cache_bases"] = kwargs["kv_cache_bases"]
 
         return additional_kwargs
+
+    @classmethod
+    def _guard_import_time_envs(cls) -> None:
+        expected = _derive_platform_attrs(_use_device_tensor())
+        actual = {name: getattr(cls, name) for name in expected}
+        if expected != actual:
+            details = ", ".join(
+                f"{name}: frozen={actual[name]!r} but current env implies "
+                f"{expected[name]!r}"
+                for name in expected
+                if actual[name] != expected[name]
+            )
+            raise RuntimeError(
+                f"RBLN platform attributes do not match the current env ({details}). "
+                "They are derived from VLLM_RBLN_USE_VLLM_MODEL and "
+                "VLLM_RBLN_USE_DEVICE_TENSOR, which are read only once, at "
+                "`import vllm`. Please set them before importing vllm."
+            )
