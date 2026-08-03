@@ -132,12 +132,18 @@ DRAFT_ID_LOG_STEPS = int(os.getenv("VLLM_RBLN_EAGLE3_DRAFT_ID_LOG_STEPS", "0"))
 #      and accepted/draft comes out exactly 0.
 #   2. Hoisting the fold above the first `model_wrapper` call -- so every copy
 #      sees a hidden_size-wide input and the branch is uniformly false -- changes
-#      the failure rather than removing it. The engine now dies during the
-#      request with a DP collective mismatch: one rank sits in
-#      `execute_dummy_batch` -> `_determine_batch_padding` -> `all_reduce` while
-#      another is in `num_tokens_across_dp`, and gloo reports the peer closing.
-#      `UNROLL_DRAFTER=1` with `FUSE_FIRST_FORWARD=0` does not do this, so it is
-#      specific to the combination.
+#      the failure rather than removing it. The engine dies during the request
+#      with a DP collective mismatch: one rank in `execute_dummy_batch` ->
+#      `_determine_batch_padding` -> `all_reduce`, another in
+#      `num_tokens_across_dp`, gloo reporting the peer closed.
+#   3. That looked like the drafter's skipped shape rendezvous desynchronising
+#      the ranks, so the pair was run again with `SKIP_DP_RENDEZVOUS=0`. It does
+#      not help: accepted/draft is back to 0. The rendezvous was not the cause.
+#
+# `UNROLL_DRAFTER=1` with `FUSE_FIRST_FORWARD=0` works and is exact, so all three
+# failures belong to the combination, not to the unroll. Three attempts, three
+# different mechanisms, root cause not identified. Treating the unroll as
+# max_num_seqs 1 only.
 #
 # The hoist is kept: it is a no-op when FUSE is off (the width test is already
 # false) and it is the clearer structure. It is not a fix.
