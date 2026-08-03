@@ -160,6 +160,8 @@ class RBLNWorker(WorkerBase):
         self._rbln_cpu_affinity_applied = False
 
         # --- dynamic KV cache (VLLM_RBLN_USE_DYNAMIC_KV_CACHE) ---
+        if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
+            self._assert_dynamic_kv_model_supported()
         # num_blocks vLLM sized the cache with, stashed while it is shrunk for
         # the compile. None when no shrink is pending.
         self._kv_blocks_before_shrink: int | None = None
@@ -637,6 +639,44 @@ class RBLNWorker(WorkerBase):
                 "invalidates them."
             )
 
+    def _assert_dynamic_kv_model_supported(self) -> None:
+        """Guard: reject the two shapes the dynamic path sizes wrongly.
+
+        Checked in `__init__` rather than beside the other dynamic-KV guards in
+        `initialize_from_config`, because vLLM loads the model before it
+        initialises the cache -- and for spec decode that load compiles the
+        drafter (`RBLNEagleProposer.load_model`). A guard down there would
+        arrive after the compile it exists to prevent.
+        """
+        if self.model_config.use_mla:
+            raise RuntimeError(
+                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE does not support MLA models. "
+                "The compiler's dynamic-input validator only admits "
+                "paged_flash_causal_attention_naive_{prefill,decode} and MLA "
+                "dispatches paged_flash_causal_mla_naive_*, so the marked KV "
+                "input never reaches an allowed op. Two things would also be "
+                "wrong if it did: `_assert_dynamic_kv_cache_layout` enumerates "
+                "`Attention` layers and MLAAttention is not one, so it would "
+                "pass without checking anything, and dim 1 of MLA's "
+                "(num_blocks, block_size, head_size) is block_size, not "
+                "num_blocks, so the mark would land on the wrong axis. Run "
+                "with the flag off, or with VLLM_MLA_DISABLE=1."
+            )
+
+        if self.vllm_config.speculative_config is not None:
+            raise RuntimeError(
+                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE does not support speculative "
+                "decoding. The drafter's runtimes share the runner's "
+                "runtime_holder, so its compiled profile is merged next to the "
+                "target's, and the merge keys regions on (node, chiplet, "
+                "base_bytes, bytes_per_block). That key cannot tell an artifact "
+                "re-reporting a KV tensor it shares from one owning a separate "
+                "tensor of the same size, so the joint per-block cost comes out "
+                "either too low -- a cache that does not fit -- or several times "
+                "too high. Attributing regions per artifact is the fix; until "
+                "then the combination is refused rather than mis-sized."
+            )
+
     def _assert_dynamic_kv_cache_layout(self) -> None:
         """Guard: the KV layout must satisfy the compiler's dynamic-input rules.
 
@@ -764,6 +804,79 @@ class RBLNWorker(WorkerBase):
             "no rbln runtime reported a per-chiplet allocation shape; cannot "
             "determine the (node, chiplet) grid the KV budget must cover."
         )
+
+    def _charge_retained_compile_kv_cache(
+        self,
+        budget: dict[int, dict[int, int]],
+        merged: Any,
+    ) -> dict[int, dict[int, int]]:
+        """Charge the compile-time KV cache that TP>=2 does not give back.
+
+        `_dynamic_kv_chiplet_budget` is derived from *capacity*, and
+        `max_num_blocks` subtracts only the profile's `base_bytes`. The
+        `VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS` cache is per-block growth rather
+        than base, so it is in neither: the budget assumes
+        `_release_kv_cache_tensors` handed it back before the replacement is
+        allocated. On TP=1 it does. On TP>=2 it does not, and that method cannot
+        confirm the free from inside the process, so the resident bytes are
+        charged here instead of being spent twice.
+
+        Measured on MiniMax TP4+EP at N=8: the binding chiplet landed at 1.015x
+        of its budget, and 8 blocks x 62 MiB = 0.484 GiB accounts for
+        essentially all of the 0.4738 GiB overshoot. The same run reports the
+        outgoing cache as still resident on all four cards, while PP4 (TP=1)
+        reports it returned on all four -- hence the TP condition rather than an
+        unconditional charge, which would cost TP=1 blocks it does get back.
+        """
+        compile_num_blocks = envs.VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS
+        tp_size = self.parallel_config.tensor_parallel_size
+        if compile_num_blocks <= 0 or tp_size <= 1:
+            return budget
+
+        # Difference of two aligned usages rather than num_blocks *
+        # bytes_per_block: alignment is applied per region, so this is the same
+        # accounting `max_num_blocks` will do with what is left.
+        at_compile = per_chiplet_usage(merged, compile_num_blocks)
+        at_zero = per_chiplet_usage(merged, 0)
+
+        charged = dict(budget)
+        retained_by_unit: dict[tuple[int, int], int] = {}
+        for unit, used in at_compile.items():
+            retained = used - at_zero.get(unit, 0)
+            if retained <= 0:
+                continue
+            node_id, chiplet_id = unit
+            charged[node_id] = dict(charged[node_id])
+            charged[node_id][chiplet_id] -= retained
+            retained_by_unit[unit] = retained
+
+        logger.warning(
+            "[Dynamic KV] tensor_parallel_size=%d does not return the "
+            "%d-block compile-time KV cache, so its bytes are charged against "
+            "the budget: %s. Expect a lower block count than TP=1 on the same "
+            "profile; a smaller VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS costs "
+            "less.",
+            tp_size,
+            compile_num_blocks,
+            {f"{n}:{c}": v for (n, c), v in sorted(retained_by_unit.items())},
+        )
+
+        exhausted = {
+            f"{node_id}:{chiplet_id}": remaining
+            for node_id, chiplets in charged.items()
+            for chiplet_id, remaining in chiplets.items()
+            if remaining <= 0
+        }
+        if exhausted:
+            raise RuntimeError(
+                "the retained compile-time KV cache leaves no budget on "
+                f"{exhausted}. VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS="
+                f"{compile_num_blocks} is too large for "
+                f"tensor_parallel_size={tp_size}, which does not free it; try a "
+                "smaller value (8 is enough -- warm-up points every dummy "
+                "request at block 0)."
+            )
+        return charged
 
     def _dynamic_kv_chiplet_budget(self, num_chiplets: int) -> int:
         """Per-chiplet byte budget for `max_num_blocks`.
@@ -939,6 +1052,7 @@ class RBLNWorker(WorkerBase):
         budget_per_chiplet = self._dynamic_kv_chiplet_budget(num_chiplets)
         budget = build_per_chiplet_budget(num_nodes, num_chiplets, budget_per_chiplet)
         assert_budget_covers_profile(merged, budget)
+        budget = self._charge_retained_compile_kv_cache(budget, merged)
 
         # `rebel/__init__.py` does not import `rebel.kv_cache`, so this exact
         # import form is the only reliable one. Lazy: only needed once a compiled

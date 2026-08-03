@@ -76,12 +76,14 @@ def _make_model_config(
     seed=42,
     quantization=None,
     enforce_eager=False,
+    use_mla=False,
 ):
     return SimpleNamespace(
         trust_remote_code=trust_remote_code,
         seed=seed,
         quantization=quantization,
         enforce_eager=enforce_eager,
+        use_mla=use_mla,
     )
 
 
@@ -109,6 +111,8 @@ def _make_vllm_config(
     data_parallel_rank=0,
     world_size=1,
     world_size_across_dp=1,
+    use_mla=False,
+    speculative_config=None,
 ):
     return SimpleNamespace(
         profiler_config=_make_profiler_config(profiler_trace_dir),
@@ -122,7 +126,9 @@ def _make_vllm_config(
             trust_remote_code=trust_remote_code,
             quantization=quantization,
             enforce_eager=enforce_eager,
+            use_mla=use_mla,
         ),
+        speculative_config=speculative_config,
         cache_config=_make_cache_config(),
         scheduler_config=_make_scheduler_config(),
         device_config=SimpleNamespace(device=torch.device("cpu"), device_type="cpu"),
@@ -1400,3 +1406,145 @@ class TestDynamicKvCompilerSupport:
         probe = source.index("_assert_dynamic_kv_compiler_support")
         handoff = source.index("_assert_dynamic_kv_scheduler_handoff_installed")
         assert probe < handoff
+
+
+# ---------------------------------------------------------------------------
+# Dynamic KV: model / feature shapes the path cannot size
+# ---------------------------------------------------------------------------
+class TestDynamicKvModelSupport:
+    """`_assert_dynamic_kv_model_supported` must fire at construction.
+
+    Both rejections have to land before the model loads, because for spec decode
+    that load compiles the drafter. `__init__` is the only hook that precedes it.
+    """
+
+    @staticmethod
+    def _guard():
+        from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
+
+        return RBLNWorker._assert_dynamic_kv_model_supported
+
+    @staticmethod
+    def _fake_self(use_mla=False, speculative_config=None):
+        return SimpleNamespace(
+            model_config=SimpleNamespace(use_mla=use_mla),
+            vllm_config=SimpleNamespace(speculative_config=speculative_config),
+        )
+
+    def test_plain_model_passes(self):
+        self._guard()(self._fake_self())
+
+    def test_mla_is_rejected(self):
+        with pytest.raises(RuntimeError, match="does not support MLA"):
+            self._guard()(self._fake_self(use_mla=True))
+
+    def test_speculative_decoding_is_rejected(self):
+        with pytest.raises(RuntimeError, match="does not support speculative"):
+            self._guard()(self._fake_self(speculative_config=SimpleNamespace()))
+
+    def test_fires_from_init_when_the_flag_is_on(self):
+        with (
+            patch(
+                "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE",
+                True,
+            ),
+            pytest.raises(RuntimeError, match="does not support MLA"),
+        ):
+            _create_worker(vllm_config=_make_vllm_config(use_mla=True))
+
+    def test_flag_off_rejects_nothing(self):
+        cfg = _make_vllm_config(use_mla=True, speculative_config=SimpleNamespace())
+        with patch(
+            "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE",
+            False,
+        ):
+            assert _create_worker(vllm_config=cfg) is not None
+
+
+# ---------------------------------------------------------------------------
+# Dynamic KV: the compile-time cache TP>=2 does not return
+# ---------------------------------------------------------------------------
+class TestRetainedCompileKvCacheCharge:
+    """`_charge_retained_compile_kv_cache` keeps the budget from being spent
+    twice on TP>=2, where `_release_kv_cache_tensors` does not get the
+    compile-time cache back and cannot tell that it did not.
+    """
+
+    BUDGET_PER_CHIPLET = 33_772_535_808
+
+    @staticmethod
+    def _profile(regions):
+        from vllm_rbln.v1.worker.kv_profile import (
+            MergedKvCacheMemoryProfile,
+            MergedMemoryRegion,
+        )
+
+        return MergedKvCacheMemoryProfile(
+            device_regions=[MergedMemoryRegion(*r) for r in regions]
+        )
+
+    @classmethod
+    def _budget(cls, num_chiplets=4):
+        return {0: {c: cls.BUDGET_PER_CHIPLET for c in range(num_chiplets)}}
+
+    @staticmethod
+    def _charge(fake_self_tp, compile_num_blocks, budget, merged):
+        from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
+
+        worker = SimpleNamespace(
+            parallel_config=SimpleNamespace(tensor_parallel_size=fake_self_tp)
+        )
+        with patch(
+            "vllm_rbln.v1.worker.rbln_worker.envs."
+            "VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS",
+            compile_num_blocks,
+        ):
+            return RBLNWorker._charge_retained_compile_kv_cache(worker, budget, merged)
+
+    # (node_id, chiplet_id, base_bytes, bytes_per_block, alignment)
+    MINIMAX_TP4EP = [(0, 0, 0, 65_011_712, 1)]
+
+    def test_tp1_is_not_charged_because_the_cache_comes_back(self):
+        budget = self._budget()
+        out = self._charge(1, 8, budget, self._profile(self.MINIMAX_TP4EP))
+        assert out == budget
+
+    def test_tp4_is_charged_on_the_chiplet_that_holds_the_growth(self):
+        out = self._charge(4, 8, self._budget(), self._profile(self.MINIMAX_TP4EP))
+
+        # The MiniMax TP4+EP profile puts every growth region on chiplet 0, so
+        # only chiplet 0 loses the 8 x 62 MiB the outgoing cache still holds.
+        assert out[0][0] == self.BUDGET_PER_CHIPLET - 8 * 65_011_712
+        for chiplet_id in (1, 2, 3):
+            assert out[0][chiplet_id] == self.BUDGET_PER_CHIPLET
+
+    def test_no_shrink_means_nothing_is_resident_to_charge(self):
+        budget = self._budget()
+        out = self._charge(4, 0, budget, self._profile(self.MINIMAX_TP4EP))
+        assert out == budget
+
+    def test_a_base_only_profile_is_not_charged(self):
+        budget = self._budget()
+        out = self._charge(4, 8, budget, self._profile([(0, 0, 1 << 30, 0, 1)]))
+        assert out == budget
+
+    def test_alignment_is_accounted_per_region(self):
+        # align_up(10059840 + 8*3000000) - align_up(10059840) at 2 MiB
+        # = 35651584 - 10485760, which is 1165824 more than 8 * 3000000.
+        out = self._charge(
+            4,
+            8,
+            self._budget(),
+            self._profile([(0, 0, 10_059_840, 3_000_000, 1 << 21)]),
+        )
+        assert out[0][0] == self.BUDGET_PER_CHIPLET - 25_165_824
+
+    def test_a_budget_the_retained_cache_exhausts_is_refused(self):
+        huge = [(0, 0, 0, self.BUDGET_PER_CHIPLET // 4, 1)]
+        with pytest.raises(RuntimeError, match="leaves no budget"):
+            self._charge(4, 8, self._budget(), self._profile(huge))
+
+    def test_the_caller_s_budget_is_not_mutated(self):
+        budget = self._budget()
+        self._charge(4, 8, budget, self._profile(self.MINIMAX_TP4EP))
+        assert budget[0][0] == self.BUDGET_PER_CHIPLET
