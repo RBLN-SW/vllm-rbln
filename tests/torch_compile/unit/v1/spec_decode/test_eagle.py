@@ -144,8 +144,6 @@ def make_common_attn_metadata(
         query_start_loc=query_start_loc,
         query_start_loc_cpu=query_start_loc.cpu(),
         seq_lens=seq_lens,
-        _seq_lens_cpu=seq_lens.cpu(),
-        _num_computed_tokens_cpu=torch.zeros_like(seq_lens),
         num_reqs=seq_lens.shape[0],
         num_actual_tokens=total_num_tokens,
         max_query_len=int((query_start_loc[1:] - query_start_loc[:-1]).max().item()),
@@ -190,6 +188,7 @@ def make_eagle_stub(
         max_num_tokens, hidden_size, dtype=torch.float32, device=DEVICE
     )
     stub.arange = torch.arange(max_num_tokens + 1, dtype=torch.int32, device=DEVICE)
+    stub.arange_cpu = torch.arange(max_num_tokens + 1, dtype=torch.int32)
     stub.vllm_config = SimpleNamespace(
         speculative_config=SimpleNamespace(enforce_eager=enforce_eager),
         parallel_config=SimpleNamespace(data_parallel_size=1),
@@ -423,6 +422,7 @@ def test_init_rejects_multimodal_inputs(monkeypatch):
 def test_init_stores_runner(monkeypatch):
     def fake_super_init(self, vllm_config, device, runner):
         self.supports_mm_inputs = False
+        self.arange = torch.arange(4, dtype=torch.int32, device=DEVICE)
 
     monkeypatch.setattr(EagleProposer, "__init__", fake_super_init)
     runner = object()
