@@ -48,22 +48,31 @@ def _deep_merge(base: dict, overrides: dict) -> None:
             base[key] = value
 
 
-def _find_conflicts(base: dict, overrides: dict, _prefix: str = "") -> list[str]:
+def _find_conflicts(
+    base: dict,
+    overrides: dict,
+    overridable: frozenset[str] = frozenset(),
+    _prefix: str = "",
+) -> list[str]:
     """Return dotted paths where ``overrides`` would overwrite an existing
     value in ``base`` with a different one.
 
     Mirrors ``_deep_merge``'s traversal: nested dicts recurse, leaves compare
     by value. A key present only in ``overrides`` is not a conflict (the user
-    is adding a new knob, not clobbering a derived field).
+    is adding a new knob, not clobbering a derived field). A path in
+    ``overridable`` is skipped along with everything under it — the model
+    declared that submodule user-overridable via its ``get_overridable``.
     """
     conflicts: list[str] = []
     for key, value in overrides.items():
+        path = f"{_prefix}{key}"
+        if path in overridable:
+            continue
         if key not in base:
             continue
-        path = f"{_prefix}{key}"
         existing = base[key]
         if isinstance(value, dict) and isinstance(existing, dict):
-            conflicts.extend(_find_conflicts(existing, value, f"{path}."))
+            conflicts.extend(_find_conflicts(existing, value, overridable, f"{path}."))
         elif existing != value:
             conflicts.append(f"{path} (compiled={existing!r}, override={value!r})")
     return conflicts
@@ -93,6 +102,10 @@ class RBLNCompileSpec:
 
     model_cls: Any
     rbln_config: dict[str, Any]
+    # Submodules/paths the user may override despite the builder setting a default
+    # (compile-only knobs vllm never reads back). Declared per-model by the
+    # model's ``get_overridable``; consulted by ``_find_conflicts``.
+    overridable: frozenset[str] = frozenset()
 
     @classmethod
     def for_architecture(
@@ -124,7 +137,6 @@ class RBLNCompileSpec:
                 block_size,
                 max_model_len,
                 num_devices,
-                memory_budget,
             )
         elif is_multi_modal(config):
             spec = cls._for_multimodal(
@@ -153,9 +165,13 @@ class RBLNCompileSpec:
         # rbln_overrides must not overwrite fields vllm derives from its own
         # config (batch_size, max_seq_len, memory_budget, ...); a silent
         # mismatch would compile a model that disagrees with the runtime. Adding
-        # a new key not set by the builder is allowed.
+        # a new key not set by the builder is allowed, as is overwriting anything
+        # under a per-model overridable submodule (``spec.overridable``, e.g. a
+        # vision encoder's ``visual`` — knobs vllm never reads back).
         if rbln_overrides:
-            conflicts = _find_conflicts(spec.rbln_config, rbln_overrides)
+            conflicts = _find_conflicts(
+                spec.rbln_config, rbln_overrides, overridable=spec.overridable
+            )
             if conflicts:
                 raise ValueError(
                     "rbln_overrides conflict with vllm-derived compile config: "
@@ -203,7 +219,6 @@ class RBLNCompileSpec:
         block_size: int,
         max_model_len: int,
         num_devices: int,
-        memory_budget: float,
     ) -> "RBLNCompileSpec":
         _, model_cls_name = get_rbln_model_info(config)
         model_cls = getattr(optimum.rbln, model_cls_name)
@@ -213,7 +228,6 @@ class RBLNCompileSpec:
             "num_devices": num_devices,
             "batch_size": batch_size,
             "max_seq_len": max_model_len,
-            "memory_budget": memory_budget,
         }
         # FIXME: We need a more generalized logic to specify block sizes
         # as the number of supported models continues to grow.
@@ -253,7 +267,16 @@ class RBLNCompileSpec:
             memory_budget,
             prefill_chunk_size,
         )
-        return cls(model_cls=model_cls, rbln_config=rbln_config)
+        # A model may declare submodules the user can freely override via a
+        # ``get_overridable()`` defined in its builder module (e.g. qwen exposes
+        # ``visual``); forward that set so the conflict check lets them win.
+        get_overridable = compile_fn.__globals__.get("get_overridable")
+        overridable = get_overridable() if get_overridable else frozenset()
+        return cls(
+            model_cls=model_cls,
+            rbln_config=rbln_config,
+            overridable=overridable,
+        )
 
     @classmethod
     def _for_enc_dec(

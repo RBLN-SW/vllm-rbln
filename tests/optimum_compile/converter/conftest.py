@@ -1,4 +1,4 @@
-# Copyright 2025 Rebellions Inc. All rights reserved.
+# Copyright 2026 Rebellions Inc. All rights reserved.
 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,12 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import pytest
 
-from vllm_rbln.logger import init_logger
 
-
-def test_logger():
-    logger = init_logger(__name__)
-    assert logger.name.strip().startswith("vllm"), (
-        f"Expected logger name to start with 'vllm', got {logger.name}"
-    )
+@pytest.fixture(autouse=True)
+def set_npu_env_var(monkeypatch):
+    monkeypatch.setenv("RBLN_FORCE_NPU_NAME", "RBLN-CA25")

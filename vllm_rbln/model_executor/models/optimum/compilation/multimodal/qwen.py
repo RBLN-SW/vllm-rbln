@@ -53,3 +53,35 @@ def get_param_qwen2_vl(
 get_param_qwen2_5_vl = get_param_qwen2_vl
 get_param_qwen3_vl = get_param_qwen2_vl
 get_param_qwen3_vl_moe = get_param_qwen2_vl
+
+
+def get_param_qwen3_5(
+    batch_size: int,
+    max_model_len: int,
+    block_size: int,
+    num_devices: int,
+    memory_budget: float,
+    prefill_chunk_size: int | None = None,
+) -> dict:
+    # Qwen3.5's linear_attention layers use gated_delta_net; the full_attention
+    # layers require flash attention, so force it here.
+    param = get_param_qwen2_vl(
+        batch_size,
+        max_model_len,
+        block_size,
+        num_devices,
+        memory_budget,
+        prefill_chunk_size,
+    )
+    param["attn_impl"] = "flash_attn"
+    return param
+
+
+def get_overridable() -> frozenset[str]:
+    """Submodules whose fields a user may override (see ``_find_conflicts``).
+
+    The ``visual`` (vision encoder) submodule is compile-only — vllm never reads
+    it back to size the runtime — so any of its fields may be overridden without
+    desyncing vllm and the compiled model.
+    """
+    return frozenset({"visual"})

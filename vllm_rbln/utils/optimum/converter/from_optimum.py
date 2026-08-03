@@ -21,7 +21,12 @@ from vllm_rbln.utils.optimum.block_size import (
     is_full_block_available,
 )
 
-from .common import update_block_size, update_max_num_batched_tokens
+from .common import (
+    apply_user_prefill_chunk_size,
+    store_image_prefill_chunk_size,
+    update_block_size,
+    update_max_num_batched_tokens,
+)
 from .params import RBLNParams
 
 if TYPE_CHECKING:
@@ -96,17 +101,15 @@ def sync_from_optimum(
         )
         vllm_config.model_config.max_model_len = params.max_seq_len
 
-    # In case of encoder-decoder models,
-    # update max_num_seqs in encoder_scheduler_config as well
-    vllm_config.scheduler_config.max_num_batched_tokens = max(
-        vllm_config.model_config.max_model_len,
-        vllm_config.scheduler_config.max_num_seqs,
-    )
-    update_max_num_batched_tokens(vllm_config, params.max_seq_len)
+    apply_user_prefill_chunk_size(vllm_config, params, precompiled=True)
+    # Set max_num_batched_tokens: the prefill chunk size for decoder/multimodal
+    # models, or a full-prefill-plus-batch budget for enc-dec/pooling models.
+    update_max_num_batched_tokens(vllm_config, params)
+    update_mamba_block_size(vllm_config, params)
 
-    # Set block_size in cache_config based on rbln_config.json
-    # (also persists prefill_chunk_size / image-prefill buckets into
-    # additional_config).
+    # Persist the image-prefill buckets (gemma3/gemma4) into additional_config.
+    store_image_prefill_chunk_size(vllm_config, params.image_prefill_chunk_size)
+    # Set block_size in cache_config based on rbln_config.json.
     update_block_size(
         vllm_config,
         params.kvcache_block_size,
@@ -150,3 +153,17 @@ def update_num_blocks(vllm_config: VllmConfig, num_blocks: int) -> None:
     if vllm_config.cache_config.num_gpu_blocks_override is not None:
         vllm_config.cache_config.num_gpu_blocks_override = adjusted_num_blocks
     vllm_config.additional_config["num_blocks_synced"] = True
+
+
+def update_mamba_block_size(vllm_config: VllmConfig, params: "RBLNParams") -> None:
+    cache_config = vllm_config.cache_config
+    if (
+        not cache_config.user_specified_mamba_block_size
+        and cache_config.mamba_block_size is not None
+    ):
+        assert not cache_config.enable_prefix_caching, (
+            "mamba_block_size can only be synced to max_model_len while "
+            "prefix caching is disabled, but prefix caching is enabled. "
+            "RBLN does not support prefix caching for mamba/hybrid models."
+        )
+        cache_config.mamba_block_size = params.max_seq_len

@@ -61,6 +61,7 @@ class RBLNEagleProposer(EagleProposer):
             raise NotImplementedError
 
         self.runner = runner
+        self.arange_cpu = torch.arange(self.arange.shape[0], dtype=torch.int32)
 
     def propose(
         self,
@@ -140,7 +141,7 @@ class RBLNEagleProposer(EagleProposer):
                 positions=positions,
                 hidden_states=hidden_states,
                 inputs_embeds=inputs_embeds,
-                last_token_indices=token_indices_to_sample_padded,
+                token_indices_to_sample=token_indices_to_sample_padded,
             )
 
         # Early exit if there is only one draft token to be generated.
@@ -148,7 +149,10 @@ class RBLNEagleProposer(EagleProposer):
             draft_tokens_ids = logits[:num_reqs].argmax(dim=-1)
             return draft_tokens_ids.view(-1, 1)
 
-        positions = target_positions[token_indices_to_sample_padded]
+        assert token_indices_to_sample_padded is not None
+        positions = target_positions[
+            token_indices_to_sample_padded.to(target_positions.device)
+        ]
 
         draft_token_ids = logits[:num_reqs].argmax(dim=-1)
 
@@ -165,10 +169,12 @@ class RBLNEagleProposer(EagleProposer):
         # Generate the remaining draft tokens.
         draft_token_ids_list = [draft_token_ids]
 
+        # it mutates seq_lens in place; detach from the runner's persistent buffer.
+        common_attn_metadata.seq_lens = common_attn_metadata.seq_lens.clone()
         common_attn_metadata.num_actual_tokens = num_reqs
         common_attn_metadata.max_query_len = 1
-        common_attn_metadata.query_start_loc = self.arange[: num_reqs + 1]
-        common_attn_metadata.query_start_loc_cpu = common_attn_metadata.query_start_loc
+        common_attn_metadata.query_start_loc = self.arange_cpu[: num_reqs + 1]
+        common_attn_metadata.query_start_loc_cpu = self.arange_cpu[: num_reqs + 1]
 
         # In padded drafter batch, we need to adjust the sequence lengths
         # to remove the "padding" (i.e. rejected tokens).
@@ -176,9 +182,6 @@ class RBLNEagleProposer(EagleProposer):
         # (i.e., not the first proposal).
         if self.num_speculative_tokens > 1 and num_rejected_tokens is not None:
             common_attn_metadata.seq_lens -= num_rejected_tokens
-            # Invalidate the CPU-side shadows to avoid H<>D sync.
-            # common_attn_metadata._seq_lens_cpu = None
-            # common_attn_metadata._num_computed_tokens_cpu = None
 
         num_reqs_padded, num_padded_tokens, num_tokens_across_dp = (
             self._determine_draft_batch_padding(num_reqs, num_reqs, False)
@@ -232,7 +235,7 @@ class RBLNEagleProposer(EagleProposer):
                     positions=positions,
                     hidden_states=hidden_states,
                     inputs_embeds=inputs_embeds,
-                    last_token_indices=None,
+                    token_indices_to_sample=None,
                 )
             draft_token_ids = logits[:num_reqs].argmax(dim=-1)
             draft_token_ids_list.append(draft_token_ids)
@@ -257,7 +260,7 @@ class RBLNEagleProposer(EagleProposer):
             )
 
         if token_indices_to_sample is None:
-            token_indices_to_sample = cad.query_start_loc[1:] - 1
+            token_indices_to_sample = (cad.query_start_loc[1:] - 1).to(self.device)
 
         num_tokens = target_token_ids.shape[0]
         self.input_ids[: num_tokens - 1] = target_token_ids[1:]
@@ -322,26 +325,19 @@ class RBLNEagleProposer(EagleProposer):
             common_attn_metadata.query_start_loc,
         )
 
-        query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
-        seq_lens_cpu = (
-            common_attn_metadata._seq_lens_cpu
-            if common_attn_metadata._seq_lens_cpu is not None
-            else common_attn_metadata.seq_lens.cpu()
-        )
-        new_query_len_per_req = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
-
-        total_num_tokens = query_start_loc_cpu[-1].item()
+        query_start_loc = common_attn_metadata.query_start_loc
+        seq_lens = common_attn_metadata.seq_lens
+        new_query_len_per_req = query_start_loc[1:] - query_start_loc[:-1]
+        total_num_tokens = query_start_loc[-1].item()
 
         spec_common_attn_metadata = CommonAttentionMetadata(
-            query_start_loc=common_attn_metadata.query_start_loc,
-            seq_lens=common_attn_metadata.seq_lens,
-            query_start_loc_cpu=query_start_loc_cpu,
-            _seq_lens_cpu=common_attn_metadata._seq_lens_cpu,
-            _num_computed_tokens_cpu=common_attn_metadata._num_computed_tokens_cpu,
+            query_start_loc=query_start_loc,
+            seq_lens=seq_lens,
+            query_start_loc_cpu=query_start_loc,
             num_reqs=common_attn_metadata.num_reqs,
             num_actual_tokens=total_num_tokens,
             max_query_len=new_query_len_per_req.max().item(),
-            max_seq_len=seq_lens_cpu.max().item(),
+            max_seq_len=seq_lens.max().item(),
             block_table_tensor=common_attn_metadata.block_table_tensor,
             slot_mapping=torch.tensor(0),  # dummy,
             causal=True,
@@ -361,7 +357,7 @@ class RBLNEagleProposer(EagleProposer):
             input_ids: torch.Tensor,
             positions: torch.Tensor,
             hidden_states: torch.Tensor,
-            last_token_indices: torch.Tensor | None = None,
+            token_indices_to_sample: torch.Tensor | None = None,
             inputs_embeds: torch.Tensor | None = None,
         ):
             ret_hidden_states = self.model(
@@ -377,12 +373,12 @@ class RBLNEagleProposer(EagleProposer):
                 last_hidden_states, hidden_states = ret_hidden_states
 
             hidden_states = hidden_states.view(-1, self.hidden_size)
-            last_hidden_states = last_hidden_states.view(-1, self.hidden_size)
-            sample_hidden_states = (
-                last_hidden_states[last_token_indices]
-                if last_token_indices is not None
-                else last_hidden_states
-            )
+            sample_hidden_states = last_hidden_states.view(-1, self.hidden_size)
+
+            if token_indices_to_sample is not None:
+                hidden_states = hidden_states[token_indices_to_sample]
+                sample_hidden_states = sample_hidden_states[token_indices_to_sample]
+
             logits = self.model.compute_logits(sample_hidden_states)
 
             return hidden_states, logits
@@ -421,10 +417,9 @@ class RBLNEagleProposer(EagleProposer):
         query_start_loc[1 : num_reqs + 1] = torch.from_numpy(cum_num_tokens)
 
         return CommonAttentionMetadata(
-            query_start_loc=query_start_loc.to(self.device),
+            query_start_loc=query_start_loc,
             query_start_loc_cpu=query_start_loc,
-            seq_lens=seq_lens.to(self.device),
-            _seq_lens_cpu=seq_lens,
+            seq_lens=seq_lens,
             num_reqs=num_reqs,
             num_actual_tokens=num_tokens,
             max_query_len=num_tokens_per_req,
@@ -502,7 +497,7 @@ class RBLNEagleProposer(EagleProposer):
                 positions=positions,
                 hidden_states=hidden_states,
                 inputs_embeds=inputs_embeds,
-                last_token_indices=token_indices_to_sample_padded,
+                token_indices_to_sample=token_indices_to_sample_padded,
             )
 
         if self.num_speculative_tokens == 1:
@@ -510,14 +505,9 @@ class RBLNEagleProposer(EagleProposer):
 
         common_attn_metadata.num_actual_tokens = num_reqs
         common_attn_metadata.max_query_len = 1
-        common_attn_metadata.query_start_loc = self.arange[: num_reqs + 1]
-        common_attn_metadata.query_start_loc_cpu = (
-            common_attn_metadata.query_start_loc.cpu()
-        )
-        common_attn_metadata._seq_lens_cpu += 1
-        common_attn_metadata.seq_lens = common_attn_metadata._seq_lens_cpu.to(
-            self.device
-        )
+        common_attn_metadata.query_start_loc = self.arange_cpu[: num_reqs + 1]
+        common_attn_metadata.query_start_loc_cpu = self.arange_cpu[: num_reqs + 1]
+        common_attn_metadata.seq_lens += 1
 
         num_reqs_padded, dp_padded, num_tokens_across_dp = (
             self._determine_draft_batch_padding(num_reqs, num_reqs, False)
@@ -558,7 +548,7 @@ class RBLNEagleProposer(EagleProposer):
                     positions=positions,
                     hidden_states=hidden_states,
                     inputs_embeds=inputs_embeds,
-                    last_token_indices=None,
+                    token_indices_to_sample=None,
                 )
 
     def _preprocess(
