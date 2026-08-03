@@ -144,7 +144,7 @@ jobs:
 
       - name : Run text embedding model (V1)
         run: >
-          uv run --no-sync python3 tests/optimum/optimum_accuracy/pooling_models/encoder_only_offline.py
+          uv run --no-sync python3 tests/optimum/optimum_correctness/pooling_models/encoder_only_offline.py
           --num_input_prompt ${{ env.NUM_INPUT_PROMPT }}
           --model ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/bge-m3-1k-batch4
           --q_prompt_txt ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/prompts/q_prompts.txt
@@ -229,7 +229,7 @@ jobs:
 
       - name: Run decoder-only test (eager attn) (V1)
         run: >
-          uv run --no-sync python3 tests/optimum/optimum_accuracy/decoder_models/llama_offline.py
+          uv run --no-sync python3 tests/optimum/optimum_correctness/decoder_models/llama_offline.py
           --num_input_prompt ${{ env.NUM_INPUT_PROMPT }}
           --model ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/llama2-7b_batch2
           --prompt_txt ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/prompts/copy_prompts.txt
@@ -237,7 +237,7 @@ jobs:
 
       - name: Run decoder-only test (Flash-attention mode) (V1)
         run: >
-          uv run --no-sync python3 tests/optimum/optimum_accuracy/decoder_models/llama_offline.py
+          uv run --no-sync python3 tests/optimum/optimum_correctness/decoder_models/llama_offline.py
           --num_input_prompt ${{ env.NUM_INPUT_PROMPT }}
           --model ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/llama3_2-3b-128k_kv16k_batch4
           --prompt_txt ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/prompts/copy_prompts.txt
@@ -257,25 +257,25 @@ jobs:
 
       - name : Run Idefics3 (Eager mode) (V1)
         run: >
-          uv run --no-sync python3 tests/optimum/optimum_accuracy/multimodal_models/idefics3_offline.py
+          uv run --no-sync python3 tests/optimum/optimum_correctness/multimodal_models/idefics3_offline.py
           --num_input_prompt ${{ env.NUM_INPUT_PROMPT }}
           --model ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/idefics3-8b-llama3-32k-b4
 
       - name : Run Idefics3 (Flash-attention mode) (V1)
         run: >
-          uv run --no-sync python3 tests/optimum/optimum_accuracy/multimodal_models/idefics3_offline.py
+          uv run --no-sync python3 tests/optimum/optimum_correctness/multimodal_models/idefics3_offline.py
           --num_input_prompt ${{ env.NUM_INPUT_PROMPT }}
           --model ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/idefics3-8b-llama3-32k-b4-kv16k
 
       - name : Run Blip2 (V1)
         run: >
-          uv run --no-sync python3 tests/optimum/optimum_accuracy/multimodal_models/blip2_offline.py
+          uv run --no-sync python3 tests/optimum/optimum_correctness/multimodal_models/blip2_offline.py
           --num_input_prompt ${{ env.NUM_INPUT_PROMPT }}
           --model ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/blip2-opt-2.7b-2k-b4
 
       - name : Run PaliGemma (Eager mode) (V1)
         run: >
-          uv run --no-sync python3 tests/optimum/optimum_accuracy/multimodal_models/paligemma_offline.py
+          uv run --no-sync python3 tests/optimum/optimum_correctness/multimodal_models/paligemma_offline.py
           --num_input_prompt ${{ env.NUM_INPUT_PROMPT }}
           --model ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/paligemma-3b-8k-b4
 
@@ -357,7 +357,7 @@ jobs:
 
       - name : Run Qwen2.5_VL (V1)
         run: >
-          uv run --no-sync python3 tests/optimum/optimum_accuracy/multimodal_models/qwen_vl_offline.py
+          uv run --no-sync python3 tests/optimum/optimum_correctness/multimodal_models/qwen_vl_offline.py
           --num_input_prompt ${{ env.NUM_INPUT_PROMPT }}
           --model ${{ env.REBEL_VLLM_PRE_COMPILED_DIR }}/qwen2_5-vl-7b-32k-b4-kv16k
 
