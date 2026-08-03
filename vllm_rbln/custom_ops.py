@@ -22,12 +22,13 @@ from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)
 
-#: Ops taken from rebel-compiler.
-FROM_COMPILER: set[str] = set()
+#: Ops already registered when this package's copy ran, so the existing
+#: definition -- rebel-compiler's -- is the one in use.
+ALREADY_DEFINED: set[str] = set()
 
-#: Schema of this package's copy of each op, whether or not it was used. This is
-#: what the drift warning compares against the compiler's registration.
-LOCAL_SCHEMAS: dict[str, str] = {}
+#: Schema this package declares for each op, whether or not its copy was used.
+#: This is what the drift warning compares against the existing registration.
+DECLARED_SCHEMAS: dict[str, str] = {}
 
 
 def custom_op(name: str, **kwargs: Any) -> Callable[[Callable], Any]:
@@ -35,13 +36,13 @@ def custom_op(name: str, **kwargs: Any) -> Callable[[Callable], Any]:
     torch.library.custom_op."""
 
     def decorator(fn: Callable) -> Any:
-        local_schema = _infer_schema(fn, kwargs)
-        if local_schema is not None:
-            LOCAL_SCHEMAS[name] = local_schema
+        declared_schema = _infer_schema(fn, kwargs)
+        if declared_schema is not None:
+            DECLARED_SCHEMAS[name] = declared_schema
 
         existing = _lookup(name)
         if existing is not None:
-            FROM_COMPILER.add(name)
+            ALREADY_DEFINED.add(name)
             _warn_on_schema_drift(name)
             return existing
 
@@ -63,7 +64,7 @@ def register_fake(name: str, **kwargs: Any) -> Callable[[Callable], Callable]:
     """
 
     def decorator(fn: Callable) -> Callable:
-        if name in FROM_COMPILER:
+        if name in ALREADY_DEFINED:
             return fn
         torch.library.register_fake(name, **kwargs)(fn)
         return fn
@@ -87,7 +88,7 @@ def _lookup(qualname: str) -> Any | None:
 
 def _warn_on_schema_drift(qualname: str) -> None:
     """Report a fallback copy that no longer matches what the compiler lowers."""
-    ours = LOCAL_SCHEMAS.get(qualname)
+    ours = DECLARED_SCHEMAS.get(qualname)
     theirs = _existing_schema(qualname)
     if ours is None or theirs is None or ours == theirs:
         return
