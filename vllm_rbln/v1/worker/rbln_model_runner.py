@@ -41,7 +41,7 @@ from vllm.model_executor.models.interfaces_base import (
     is_pooling_model,
     is_text_generation_model,
 )
-from vllm.sampling_params import SamplingParams, SamplingType
+from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.tracing import instrument
@@ -56,7 +56,6 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.utils import create_fast_prefill_custom_backend
 from vllm.v1.core.sched.output import (
-    CachedRequestData,
     GrammarOutput,
     NewRequestData,
 )
@@ -2892,124 +2891,70 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 if not t.is_contiguous():
                     t.data = t.data.contiguous()
 
-    def _add_dummy_requests(
-        self,
-        requests: list[NewRequestData],
-        num_scheduled_tokens: dict[str, int],
-        total_tokens: int,
-        num_computed_tokens: int,
-        num_kv_cache_groups: int,
-        sampling_params: SamplingParams | None = None,
-        pooling_params=None,
-        extra_blocks: int = 0,
-    ) -> None:
-        """Append one dummy request (all blocks mapped to the null block) so it
-        can be driven through the real execute path during warmup."""
-        num_blocks = cdiv(total_tokens, self.cache_config.block_size) + extra_blocks
-        prompt_token_ids = list(range(total_tokens))
-        null_block_id = 0
-
-        req = NewRequestData(
-            req_id=f"dummy_request_{len(requests)}",
-            prompt_token_ids=prompt_token_ids,
-            mm_features=[],
-            sampling_params=sampling_params,
-            pooling_params=pooling_params,
-            block_ids=([null_block_id] * num_blocks,) * num_kv_cache_groups,
-            num_computed_tokens=num_computed_tokens,
-            lora_request=None,
-        )
-        requests.append(req)
-        num_scheduled_tokens[req.req_id] = (
-            1
-            if total_tokens - num_computed_tokens == 0
-            else total_tokens - num_computed_tokens
-        )
-
-    def _make_dummy_scheduler_outputs(
-        self,
-        requests: list[NewRequestData],
-        num_scheduled_tokens: dict[str, int],
-        num_kv_cache_groups: int,
-        scheduled_spec_decode_tokens: dict[str, list[int]] | None = None,
-    ) -> tuple[RBLNSchedulerOutput, RBLNSchedulerOutput]:
-        """Build (exec, cleanup) scheduler outputs for a dummy warmup step."""
-        sched_output = RBLNSchedulerOutput(
-            scheduled_new_reqs=requests,
-            scheduled_cached_reqs=CachedRequestData.make_empty(),
-            num_scheduled_tokens=num_scheduled_tokens,
-            total_num_scheduled_tokens=sum(num_scheduled_tokens.values()),
-            scheduled_spec_decode_tokens=scheduled_spec_decode_tokens or {},
-            scheduled_encoder_inputs={},
-            num_common_prefix_blocks=[0] * num_kv_cache_groups,
-            finished_req_ids=set(),
-            free_encoder_mm_hashes=[],
-            kv_connector_metadata=None,
-        )
-        cleanup_sched_output = RBLNSchedulerOutput(
-            scheduled_new_reqs=[],
-            scheduled_cached_reqs=CachedRequestData.make_empty(),
-            num_scheduled_tokens={},
-            total_num_scheduled_tokens=0,
-            scheduled_spec_decode_tokens={},
-            scheduled_encoder_inputs={},
-            num_common_prefix_blocks=[1] * num_kv_cache_groups,
-            finished_req_ids={req.req_id for req in requests},
-            free_encoder_mm_hashes=[],
-            kv_connector_metadata=None,
-        )
-        return sched_output, cleanup_sched_output
-
-    def _execute_dummy_requests(
-        self,
-        sched_output: RBLNSchedulerOutput,
-        cleanup_sched_output: RBLNSchedulerOutput,
-    ) -> None:
-        if self.execute_model(sched_output) is None:
-            self.sample_tokens(None)
-        if self.execute_model(cleanup_sched_output) is None:
-            self.sample_tokens(None)
-
+    @torch.inference_mode()
     def _warmup_sampler_decode_batches(self) -> None:
-        """Warm the sampler / rejection-sample op at every decode batch size"""
-        # execute_model needs KV-connector metadata that only the scheduler can
-        # build when a KV transfer group exists
+        """Warm the device rejection-sample op at every decode batch size."""
         if (
             self.speculative_config is None
             or self.num_spec_tokens <= 0
             or self.is_pooling_model
-            or has_kv_transfer_group()
+            or not envs.VLLM_RBLN_SAMPLER
         ):
             return
 
-        num_kv_cache_groups = len(self.kv_cache_config.kv_cache_groups)
+        num_spec = self.num_spec_tokens
+        vocab_size = self.model_config.get_vocab_size()
         max_decode_batch = self.bucketing_manager.decode_batch_buckets[-1]
-        sampler_query_len = self.num_spec_tokens + 1
-        dummy_requests: list[NewRequestData] = []
-        num_scheduled_tokens: dict[str, int] = {}
-        for decode_batch in range(1, max_decode_batch + 1):
-            self._add_dummy_requests(
-                requests=dummy_requests,
-                num_scheduled_tokens=num_scheduled_tokens,
-                total_tokens=1,
-                num_computed_tokens=1,
-                num_kv_cache_groups=num_kv_cache_groups,
-                sampling_params=SamplingParams(temperature=0.0),
-            )
-            for req_id in num_scheduled_tokens:
-                num_scheduled_tokens[req_id] = sampler_query_len
 
-            spec_tokens = {
-                req.req_id: [0] * (sampler_query_len - 1) for req in dummy_requests
-            }
-            so, cso = self._make_dummy_scheduler_outputs(
-                dummy_requests,
-                num_scheduled_tokens,
-                num_kv_cache_groups,
-                scheduled_spec_decode_tokens=spec_tokens,
+        for batch_size in range(1, max_decode_batch + 1):
+            num_tokens = batch_size * num_spec
+            num_draft_tokens = [num_spec] * batch_size
+            draft_token_ids = torch.zeros(
+                num_tokens, dtype=torch.int32, device=self.device
             )
-            logger.info("Warm-up: sampler/rejection (decode_batch=%d)", decode_batch)
-            self._execute_dummy_requests(so, cso)
+            target_probs = torch.zeros(
+                num_tokens, vocab_size, dtype=torch.float32, device=self.device
+            )
+            cu_num_draft_tokens = torch.arange(
+                num_spec,
+                num_tokens + 1,
+                num_spec,
+                dtype=torch.int32,
+                device="cpu",
+            )
+            bonus_token_ids = torch.zeros(
+                batch_size, 1, dtype=torch.int64, device=self.device
+            )
+            dummy_sampling_metadata = SamplingMetadata(
+                temperature=None,
+                all_greedy=True,
+                all_random=False,
+                top_p=None,
+                top_k=None,
+                generators={},
+                max_num_logprobs=None,
+                no_penalties=True,
+                prompt_token_ids=None,
+                frequency_penalties=None,
+                presence_penalties=None,
+                repetition_penalties=None,
+                output_token_ids=[],
+                allowed_token_ids_mask=None,
+                bad_words_token_ids={},
+                logitsprocs=LogitsProcessors(),
+                spec_token_ids=[[] for _ in range(batch_size)],
+            )
+            logger.info("Warm-up: rejection sampler (decode_batch=%d)", batch_size)
+            self.rejection_sampler.impl.rejection_sample(
+                draft_token_ids,
+                num_draft_tokens,
+                num_spec,
+                cu_num_draft_tokens,
+                None,
+                target_probs,
+                bonus_token_ids,
+                dummy_sampling_metadata,
+            )
 
     def warmup_model(self) -> None:
         # NOTE(RBLN): Warm-up must not route through execute_model() while a
