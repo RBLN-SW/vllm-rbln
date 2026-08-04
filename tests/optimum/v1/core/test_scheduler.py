@@ -115,8 +115,20 @@ def test_schedule_multi_seq():
     "exp_new_req0_blocks, exp_cached0_new, "
     "exp_new_req1_blocks, exp_cached1_new, ",
     [
-        pytest.param(2, 16, 64, 7, 32, [1, 2], [3], [4, 5], [6], id="kv16-len32-blk7"),
-        pytest.param(3, 16, 64, 5, 32, [1, 2], [3], [4, 3], [2], id="kv16-len32-blk5"),
+        # Scenario (block_size=16, 32-token prompt -> 2 full prefill blocks +
+        # 1 block on the first decode; block 0 is the null block so ids start
+        # at 1; prefix caching off -> blocks stay unhashed):
+        #   req0 prefill -> [1, 2], decode -> [3]; req0 finishes and frees
+        #   [1, 2, 3]. vLLM 0.24 returns freed *unhashed* blocks to the HEAD of
+        #   the free queue in reverse-free order (prepend_n([3, 2, 1])), so they
+        #   are reused FIRST -> req1 prefill pops [3, 2], decode pops [1].
+        #   (<=0.22 appended freed blocks to the tail -> reused last, so this
+        #    case gave [4, 5]/[6].)
+        pytest.param(2, 16, 64, 7, 32, [1, 2], [3], [3, 2], [1], id="kv16-len32-blk7"),
+        # Same request sequence with a tighter pool (4 usable blocks). Because
+        # 0.24 reuses freed blocks first, the outcome no longer depends on pool
+        # size and matches blk7. (<=0.22 gave [4, 3]/[2] here.)
+        pytest.param(3, 16, 64, 5, 32, [1, 2], [3], [3, 2], [1], id="kv16-len32-blk5"),
     ],
 )
 def test_schedule_alloc_block_policy(

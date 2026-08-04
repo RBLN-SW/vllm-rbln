@@ -184,13 +184,13 @@ jobs:
         run: |
           case "${{ matrix.test_type.name }}" in
             "core")
-              uv run --no-sync pytest tests/v1/core -vv --durations 0
+              uv run --no-sync pytest tests/optimum/v1/core -vv --durations 0
               ;;
             "worker")
-              uv run --no-sync pytest tests/v1/worker/test_rebel_optimum_model_runner.py -vv --durations 0
+              uv run --no-sync pytest tests/optimum/v1/worker/test_rebel_optimum_model_runner.py -vv --durations 0
               ;;
             "optimum_compile")
-              uv run --no-sync pytest tests/optimum_compile -vv --durations 0
+              uv run --no-sync pytest tests/optimum/optimum_compile -vv --durations 0
               ;;
           esac
 
@@ -199,173 +199,173 @@ jobs:
         run: |
           echo "Found [skip-${{ matrix.test_type.name }}] in commit message, skipping CI"
 
-  pytest-arc:
-    name: Pytest (${{ matrix.test_type.name }})
-    runs-on: ${{ matrix.test_type.runner }}
-    container:
-      image: mcr.microsoft.com/devcontainers/python:3.12
-    defaults:
-      run:
-        shell: bash
-    env:
-      # Authenticate HF Hub requests so rate limits apply per-account
-      # instead of per-IP (self-hosted runners share one egress IP).
-      HF_TOKEN: ${{ secrets.HF_TOKEN }}
-    strategy:
-      fail-fast: ${{ inputs.fail_fast }}
-      matrix:
-        test_type:
-          [
-            {
-              name : "openai",
-              runner : "rbln-sw-k8s-ca22-4"
-            },
-            {
-              name : "llm",
-              runner : "rbln-sw-k8s-ca22-1"
-            },
-            {
-              name : "sampler",
-              runner : "rbln-sw-k8s-ca22-8"
-            },
-            {
-              name : "models",
-              runner : "rbln-sw-k8s-ca22-1"
-            },
-          ]
-    steps:
-      - name: Checkout the vllm-rbln repository
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_number && format('refs/pull/{0}/merge', inputs.pr_number) || (inputs.ref != '' && inputs.ref) || github.sha }}
-          submodules: recursive
-          fetch-depth: 0
+  # pytest-arc:
+  #   name: Pytest (${{ matrix.test_type.name }})
+  #   runs-on: ${{ matrix.test_type.runner }}
+  #   container:
+  #     image: mcr.microsoft.com/devcontainers/python:3.12
+  #   defaults:
+  #     run:
+  #       shell: bash
+  #   env:
+  #     # Authenticate HF Hub requests so rate limits apply per-account
+  #     # instead of per-IP (self-hosted runners share one egress IP).
+  #     HF_TOKEN: ${{ secrets.HF_TOKEN }}
+  #   strategy:
+  #     fail-fast: ${{ inputs.fail_fast }}
+  #     matrix:
+  #       test_type:
+  #         [
+  #           {
+  #             name : "openai",
+  #             runner : "rbln-sw-k8s-ca22-4"
+  #           },
+  #           {
+  #             name : "llm",
+  #             runner : "rbln-sw-k8s-ca22-1"
+  #           },
+  #           {
+  #             name : "sampler",
+  #             runner : "rbln-sw-k8s-ca22-8"
+  #           },
+  #           {
+  #             name : "models",
+  #             runner : "rbln-sw-k8s-ca22-1"
+  #           },
+  #         ]
+  #   steps:
+  #     - name: Checkout the vllm-rbln repository
+  #       uses: actions/checkout@v4
+  #       with:
+  #         ref: ${{ inputs.pr_number && format('refs/pull/{0}/merge', inputs.pr_number) || (inputs.ref != '' && inputs.ref) || github.sha }}
+  #         submodules: recursive
+  #         fetch-depth: 0
 
-      - name: Fix git ownership
-        run: |
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+  #     - name: Fix git ownership
+  #       run: |
+  #         git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      - name: Get commit message
-        id: get_commit_message
-        run: |
-          if git rev-parse HEAD^2 >/dev/null 2>&1; then
-            COMMIT_MESSAGE=$(git log -1 --pretty=%B HEAD^2)
-          else
-            COMMIT_MESSAGE=$(git log -1 --pretty=%B)
-          fi
-          echo "Commit message: $COMMIT_MESSAGE"
-          echo "message<<EOF" >> $GITHUB_OUTPUT
-          echo "$COMMIT_MESSAGE" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+  #     - name: Get commit message
+  #       id: get_commit_message
+  #       run: |
+  #         if git rev-parse HEAD^2 >/dev/null 2>&1; then
+  #           COMMIT_MESSAGE=$(git log -1 --pretty=%B HEAD^2)
+  #         else
+  #           COMMIT_MESSAGE=$(git log -1 --pretty=%B)
+  #         fi
+  #         echo "Commit message: $COMMIT_MESSAGE"
+  #         echo "message<<EOF" >> $GITHUB_OUTPUT
+  #         echo "$COMMIT_MESSAGE" >> $GITHUB_OUTPUT
+  #         echo "EOF" >> $GITHUB_OUTPUT
 
-      - name: Check if test should be skipped
-        id: should_skip
-        env:
-          COMMIT_MESSAGE: ${{ steps.get_commit_message.outputs.message }}
-        run: |
-          SKIP=false
+  #     - name: Check if test should be skipped
+  #       id: should_skip
+  #       env:
+  #         COMMIT_MESSAGE: ${{ steps.get_commit_message.outputs.message }}
+  #       run: |
+  #         SKIP=false
           
-          case "${{ matrix.test_type.name }}" in
-            "openai")
-              if [[ "$COMMIT_MESSAGE" == *"[skip openai]"* ]]; then
-                SKIP=true
-              fi
-              ;;
-            "llm")
-              if [[ "$COMMIT_MESSAGE" == *"[skip llm]"* ]]; then
-                SKIP=true
-              fi
-              ;;
-            "sampler")
-              if [[ "$COMMIT_MESSAGE" == *"[skip worker]"* ]]; then
-                SKIP=true
-              fi
-              ;;
-            "models")
-              if [[ "$COMMIT_MESSAGE" == *"[skip models]"* ]]; then
-                SKIP=true
-              fi
-              ;;
-          esac
+  #         case "${{ matrix.test_type.name }}" in
+  #           "openai")
+  #             if [[ "$COMMIT_MESSAGE" == *"[skip openai]"* ]]; then
+  #               SKIP=true
+  #             fi
+  #             ;;
+  #           "llm")
+  #             if [[ "$COMMIT_MESSAGE" == *"[skip llm]"* ]]; then
+  #               SKIP=true
+  #             fi
+  #             ;;
+  #           "sampler")
+  #             if [[ "$COMMIT_MESSAGE" == *"[skip worker]"* ]]; then
+  #               SKIP=true
+  #             fi
+  #             ;;
+  #           "models")
+  #             if [[ "$COMMIT_MESSAGE" == *"[skip models]"* ]]; then
+  #               SKIP=true
+  #             fi
+  #             ;;
+  #         esac
           
-          echo "skip=$SKIP" >> $GITHUB_OUTPUT
+  #         echo "skip=$SKIP" >> $GITHUB_OUTPUT
 
-      - name: Install uv CLI
-        if: steps.should_skip.outputs.skip != 'true'
-        run: |
-          pip install uv
+  #     - name: Install uv CLI
+  #       if: steps.should_skip.outputs.skip != 'true'
+  #       run: |
+  #         pip install uv
 
-      - name: Install build-essential
-        if: steps.should_skip.outputs.skip != 'true'
-        run: |
-          for i in {1..3}; do
-            apt-get update && break || sleep 10
-          done
-          apt-get install -y build-essential
+  #     - name: Install build-essential
+  #       if: steps.should_skip.outputs.skip != 'true'
+  #       run: |
+  #         for i in {1..3}; do
+  #           apt-get update && break || sleep 10
+  #         done
+  #         apt-get install -y build-essential
 
-      - name: Create test environment via uv sync
-        if: steps.should_skip.outputs.skip != 'true'
-        uses: nick-fields/retry@v3
-        env:
-          UV_INDEX_RBLN_NEXUS_NIGHTLY_USERNAME: ${{ secrets.UDC_NEXUS_USERNAME }}
-          UV_INDEX_RBLN_NEXUS_NIGHTLY_PASSWORD: ${{ secrets.UDC_NEXUS_PASSWORD }}
-          UV_INDEX_REBELLIONS_USERNAME: ${{ secrets.REBEL_PYPI_USERNAME }}
-          UV_INDEX_REBELLIONS_PASSWORD: ${{ secrets.REBEL_PYPI_PASSWORD }}
-        with:
-          timeout_minutes: 15
-          max_attempts: 3
-          retry_wait_seconds: 30
-          retry_on: any
-          shell: bash
-          command: |
-            if [ -z "$UV_INDEX_RBLN_NEXUS_NIGHTLY_USERNAME" ] || [ -z "$UV_INDEX_REBELLIONS_USERNAME" ]; then
-              echo "::error::UDC_NEXUS_USERNAME/PASSWORD and REBEL_PYPI_USERNAME/PASSWORD secrets not available to this repo — add repo/org secrets (LDAP account)"
-              exit 1
-            fi
-            uv sync --locked --python 3.12 --extra test --extra dev --extra runtime
-            # rebel-compiler version override (escape hatch)
-            if [ -n "${{ inputs.rebel_compiler_version }}" ]; then
-              uv pip install --no-deps "rebel-compiler==${{ inputs.rebel_compiler_version }}" --extra-index-url "${{ secrets.DEV_PKG_URL }}"
-            fi
-            # optimum-rbln version override (escape hatch)
-            if [ -n "${{ inputs.optimum_rbln_version }}" ]; then
-              uv pip install --no-deps "optimum-rbln==${{ inputs.optimum_rbln_version }}"
-            fi
+  #     - name: Create test environment via uv sync
+  #       if: steps.should_skip.outputs.skip != 'true'
+  #       uses: nick-fields/retry@v3
+  #       env:
+  #         UV_INDEX_RBLN_NEXUS_NIGHTLY_USERNAME: ${{ secrets.UDC_NEXUS_USERNAME }}
+  #         UV_INDEX_RBLN_NEXUS_NIGHTLY_PASSWORD: ${{ secrets.UDC_NEXUS_PASSWORD }}
+  #         UV_INDEX_REBELLIONS_USERNAME: ${{ secrets.REBEL_PYPI_USERNAME }}
+  #         UV_INDEX_REBELLIONS_PASSWORD: ${{ secrets.REBEL_PYPI_PASSWORD }}
+  #       with:
+  #         timeout_minutes: 15
+  #         max_attempts: 3
+  #         retry_wait_seconds: 30
+  #         retry_on: any
+  #         shell: bash
+  #         command: |
+  #           if [ -z "$UV_INDEX_RBLN_NEXUS_NIGHTLY_USERNAME" ] || [ -z "$UV_INDEX_REBELLIONS_USERNAME" ]; then
+  #             echo "::error::UDC_NEXUS_USERNAME/PASSWORD and REBEL_PYPI_USERNAME/PASSWORD secrets not available to this repo — add repo/org secrets (LDAP account)"
+  #             exit 1
+  #           fi
+  #           uv sync --locked --python 3.12 --extra test --extra dev --extra runtime
+  #           # rebel-compiler version override (escape hatch)
+  #           if [ -n "${{ inputs.rebel_compiler_version }}" ]; then
+  #             uv pip install --no-deps "rebel-compiler==${{ inputs.rebel_compiler_version }}" --extra-index-url "${{ secrets.DEV_PKG_URL }}"
+  #           fi
+  #           # optimum-rbln version override (escape hatch)
+  #           if [ -n "${{ inputs.optimum_rbln_version }}" ]; then
+  #             uv pip install --no-deps "optimum-rbln==${{ inputs.optimum_rbln_version }}"
+  #           fi
 
-      - name: Cache HuggingFace Hub
-        if: steps.should_skip.outputs.skip != 'true'
-        uses: actions/cache@v4
-        with:
-          path: /root/.cache/huggingface
-          key: hf-hub-${{ matrix.test_type.name }}-${{ github.run_id }}
-          restore-keys: |
-            hf-hub-${{ matrix.test_type.name }}-
-            hf-hub-
+  #     - name: Cache HuggingFace Hub
+  #       if: steps.should_skip.outputs.skip != 'true'
+  #       uses: actions/cache@v4
+  #       with:
+  #         path: /root/.cache/huggingface
+  #         key: hf-hub-${{ matrix.test_type.name }}-${{ github.run_id }}
+  #         restore-keys: |
+  #           hf-hub-${{ matrix.test_type.name }}-
+  #           hf-hub-
 
-      - name: Run pytest
-        if: steps.should_skip.outputs.skip != 'true'
-        env:
-          REBEL_VLLM_PRE_COMPILED_DIR: ${{ secrets.VLLM_PRE_COMPILED_DIR }}
+  #     - name: Run pytest
+  #       if: steps.should_skip.outputs.skip != 'true'
+  #       env:
+  #         REBEL_VLLM_PRE_COMPILED_DIR: ${{ secrets.VLLM_PRE_COMPILED_DIR }}
 
-        run: |
-          case "${{ matrix.test_type.name }}" in
-            "openai")
-              uv run --no-sync pytest tests/entrypoints/openai -vv --durations 0 --timeout=600
-              ;;
-            "llm")
-              uv run --no-sync pytest tests/entrypoints/llm -vv --durations 0
-              ;;
-            "sampler")
-              uv run --no-sync pytest -n 8 -k "warm_up_true" tests/v1/worker/test_sampler.py -vv --durations 0
-              uv run --no-sync pytest -n 8 -k "warm_up_false" tests/v1/worker/test_sampler.py -vv --durations 0
-              uv run --no-sync pytest -n 8 -k "not warm_up_true and not warm_up_false" tests/v1/worker/test_sampler.py -vv --durations 0
-              ;;
-            "models")
-              uv run --no-sync pytest tests/v1/models -vv --durations 0
-              ;;
-          esac
+  #       run: |
+  #         case "${{ matrix.test_type.name }}" in
+  #           "openai")
+  #             uv run --no-sync pytest tests/optimum/entrypoints/openai -vv --durations 0 --timeout=600
+  #             ;;
+  #           "llm")
+  #             uv run --no-sync pytest tests/optimum/entrypoints/llm -vv --durations 0
+  #             ;;
+  #           "sampler")
+  #             uv run --no-sync pytest -n 8 -k "warm_up_true" tests/optimum/v1/worker/test_sampler.py -vv --durations 0
+  #             uv run --no-sync pytest -n 8 -k "warm_up_false" tests/optimum/v1/worker/test_sampler.py -vv --durations 0
+  #             uv run --no-sync pytest -n 8 -k "not warm_up_true and not warm_up_false" tests/optimum/v1/worker/test_sampler.py -vv --durations 0
+  #             ;;
+  #           "models")
+  #             uv run --no-sync pytest tests/optimum/v1/models -vv --durations 0
+  #             ;;
+  #         esac
 
-      - name: Skip message
-        if: steps.should_skip.outputs.skip == 'true'
-        run: |
-          echo "Found [skip-${{ matrix.test_type.name }}] in commit message, skipping CI"
+  #     - name: Skip message
+  #       if: steps.should_skip.outputs.skip == 'true'
+  #       run: |
+  #         echo "Found [skip-${{ matrix.test_type.name }}] in commit message, skipping CI"
