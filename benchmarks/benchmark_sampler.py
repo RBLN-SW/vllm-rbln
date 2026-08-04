@@ -13,18 +13,19 @@
 # limitations under the License.
 
 import argparse
-import contextlib
-import time
 
 import numpy as np
-import rebel
 import torch
 from vllm.utils.torch_utils import make_tensor_with_pad
 from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
 
 from vllm_rbln.v1.sample import WARM_UP_CONFIGS, RBLNSampler
-from vllm_rbln.v1.worker.metrics import PerformanceTracker, collect_metrics
+
+# Import the implementation directly instead of the VLLM_RBLN_METRICS-gated
+# `PerformanceContext` alias: measuring is the whole point of this script, so it
+# must not degrade to the no-op context when the env var is unset.
+from vllm_rbln.v1.worker.metrics_v2 import _PerformanceContext
 
 MAX_NUM_PROMPT_TOKENS = 64
 
@@ -129,9 +130,9 @@ def run_benchmark(
     benchmark_iters: int,
 ):
     torch._dynamo.config.recompile_limit = len(WARM_UP_CONFIGS)
-    sampler = RBLNSampler(seed=42)
+    sampler = RBLNSampler()
     sampler = torch.compile(sampler, dynamic=False, fullgraph=False)
-    sampler_performance_tracker = PerformanceTracker("SAMPLER")
+    performance_ctx = _PerformanceContext("SAMPLER")
 
     logits = _create_logits(batch_size, vocab_size)
 
@@ -158,23 +159,14 @@ def run_benchmark(
         device=logits.device,
     )
 
+    # The span handles timing and rebel report capture internally. `profile_model`
+    # rather than `profile_sampler` because the context only records a sampler span
+    # that follows a model span, and this benchmark runs the sampler standalone; the
+    # stats are therefore reported under the "DECODE + SAMPLE" label.
     for _ in range(benchmark_iters):
-        if hasattr(rebel, "capture_reports"):
-            capture_ctx = rebel.capture_reports()
-        else:
-            capture_ctx = contextlib.nullcontext()
-        start_time = time.perf_counter()
-        with capture_ctx as model_reports:
+        with performance_ctx.profile_model(is_prefill=False):
             sampler(logits, sampling_metadata)
-        collect_metrics(
-            sampler_performance_tracker,
-            is_prefill=False,
-            start_time=start_time,
-            end_time=time.perf_counter(),
-            reports=model_reports,
-            token_count=0,
-        )
-    sampler_performance_tracker.print_final_stats()
+    performance_ctx.print_stats()
 
 
 def main():
