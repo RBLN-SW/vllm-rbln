@@ -540,7 +540,7 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         assert logits.ndim == 2
         assert cu_num_draft_tokens.ndim == 1
         if sampling_metadata.all_greedy:
-            return make_one_hot_logits(logits)
+            return logits_for_one_hot_probs(logits)
 
         num_tokens = logits.shape[0]
         # NOTE(eunji.lee):
@@ -569,13 +569,13 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         ).nonzero(as_tuple=True)[0]
         if greedy_rows.numel() > 0:
             greedy_rows = greedy_rows.to(logits.device)
-            logits[greedy_rows] = make_one_hot_logits(logits[greedy_rows])
+            logits[greedy_rows] = logits_for_one_hot_probs(logits[greedy_rows])
 
         # NOTE(eunji.lee): top_k & top_p are applied together during rejection sampling.
         return logits
 
 
-def make_one_hot_logits(logits: torch.Tensor) -> torch.Tensor:
+def logits_for_one_hot_probs(logits: torch.Tensor) -> torch.Tensor:
     """Return -inf except 0.0 at the argmax, so that softmax gives an exact
     one-hot."""
     _, max_idx = logits.max(dim=-1, keepdim=True)
