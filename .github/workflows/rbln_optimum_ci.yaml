@@ -70,9 +70,6 @@ jobs:
       NUM_INPUT_PROMPT: 1
       VLLM_LOGGING_LEVEL: DEBUG
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
-      HF_HOME: ${{ secrets.HF_HOME }}
-      HF_HUB_OFFLINE: "1"
-      TRANSFORMERS_OFFLINE: "1"
     steps:
       - name: Install uv CLI
         run: |
@@ -95,6 +92,15 @@ jobs:
       - name: Fix git ownership
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Cache HuggingFace Hub
+        uses: actions/cache@v4
+        with:
+          path: /root/.cache/huggingface
+          key: hf-hub-${{ github.job }}-${{ github.run_id }}
+          restore-keys: |
+            hf-hub-${{ github.job }}-
+            hf-hub-
 
       - name: Create test environment via uv sync
         uses: nick-fields/retry@v3
@@ -144,9 +150,6 @@ jobs:
       NUM_INPUT_PROMPT: 1
       VLLM_LOGGING_LEVEL: DEBUG
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
-      HF_HOME: ${{ secrets.HF_HOME }}
-      HF_HUB_OFFLINE: "1"
-      TRANSFORMERS_OFFLINE: "1"
     steps:
       - name: Install uv CLI
         run: |
@@ -169,6 +172,15 @@ jobs:
       - name: Fix git ownership
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Cache HuggingFace Hub
+        uses: actions/cache@v4
+        with:
+          path: /root/.cache/huggingface
+          key: hf-hub-${{ github.job }}-${{ github.run_id }}
+          restore-keys: |
+            hf-hub-${{ github.job }}-
+            hf-hub-
 
       - name: Create test environment via uv sync
         uses: nick-fields/retry@v3
@@ -220,9 +232,6 @@ jobs:
       NUM_INPUT_PROMPT: 1
       VLLM_LOGGING_LEVEL: DEBUG
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
-      HF_HOME: ${{ secrets.HF_HOME }}
-      HF_HUB_OFFLINE: "1"
-      TRANSFORMERS_OFFLINE: "1"
     steps:
       - name: Install uv CLI
         run: |
@@ -245,6 +254,15 @@ jobs:
       - name: Fix git ownership
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Cache HuggingFace Hub
+        uses: actions/cache@v4
+        with:
+          path: /root/.cache/huggingface
+          key: hf-hub-${{ github.job }}-${{ github.run_id }}
+          restore-keys: |
+            hf-hub-${{ github.job }}-
+            hf-hub-
 
       - name: Create test environment via uv sync
         uses: nick-fields/retry@v3

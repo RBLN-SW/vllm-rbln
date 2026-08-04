@@ -57,10 +57,9 @@ jobs:
     name: Pytest (${{ matrix.test_type.name }})
     runs-on: ${{ matrix.test_type.runner }}
     env:
+      # Authenticate HF Hub requests so rate limits apply per-account
+      # instead of per-IP (self-hosted runners share one egress IP).
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
-      HF_HOME: ${{ secrets.HF_HOME }}
-      HF_HUB_OFFLINE: "1"
-      TRANSFORMERS_OFFLINE: "1"
     strategy:
       fail-fast: ${{ inputs.fail_fast }}
       matrix:
@@ -167,6 +166,16 @@ jobs:
             uv pip install --no-deps "optimum-rbln==${{ inputs.optimum_rbln_version }}"
           fi
 
+      - name: Cache HuggingFace Hub
+        if: steps.should_skip.outputs.skip != 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-hub-${{ matrix.test_type.name }}-${{ github.run_id }}
+          restore-keys: |
+            hf-hub-${{ matrix.test_type.name }}-
+            hf-hub-
+
       - name: Run pytest
         if: steps.should_skip.outputs.skip != 'true'
         env:
@@ -199,10 +208,9 @@ jobs:
       run:
         shell: bash
     env:
+      # Authenticate HF Hub requests so rate limits apply per-account
+      # instead of per-IP (self-hosted runners share one egress IP).
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
-      HF_HOME: ${{ secrets.HF_HOME }}
-      HF_HUB_OFFLINE: "1"
-      TRANSFORMERS_OFFLINE: "1"
     strategy:
       fail-fast: ${{ inputs.fail_fast }}
       matrix:
@@ -323,6 +331,16 @@ jobs:
             if [ -n "${{ inputs.optimum_rbln_version }}" ]; then
               uv pip install --no-deps "optimum-rbln==${{ inputs.optimum_rbln_version }}"
             fi
+
+      - name: Cache HuggingFace Hub
+        if: steps.should_skip.outputs.skip != 'true'
+        uses: actions/cache@v4
+        with:
+          path: /root/.cache/huggingface
+          key: hf-hub-${{ matrix.test_type.name }}-${{ github.run_id }}
+          restore-keys: |
+            hf-hub-${{ matrix.test_type.name }}-
+            hf-hub-
 
       - name: Run pytest
         if: steps.should_skip.outputs.skip != 'true'
