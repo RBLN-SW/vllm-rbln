@@ -188,9 +188,11 @@ def get_decode_batch_bucket_manual_buckets() -> list[int]:
 def is_set(name: str) -> bool:
     """Whether `name` is present in the environment, whatever its value.
 
-    Lets a caller tell "the operator chose this" from "this is the default",
-    which a getter's return value alone cannot express once the default is
-    non-zero.
+    Presence only, matching vLLM's helper of the same name. Do **not** use this to
+    decide whether the operator chose a value: a blank `NAME=` is present, and a
+    getter that treats blank as unset will disagree with it. For that question ask
+    the helper that shares the getter's own rule -- see
+    `compile_kv_cache_num_blocks_is_explicit`.
     """
     return name in os.environ
 

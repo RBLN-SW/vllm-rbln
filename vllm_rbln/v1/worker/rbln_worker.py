@@ -489,6 +489,23 @@ class RBLNWorker(WorkerBase):
     # Dynamic KV cache (VLLM_RBLN_USE_DYNAMIC_KV_CACHE)
     # ------------------------------------------------------------------
 
+    def _compile_and_warmup_skip_reason(self) -> str | None:
+        """Why `compile_or_warm_up_model` will skip the compile and warm-up, if it will.
+
+        The dynamic-KV path is built on what warm-up produces -- compiled
+        artifacts and their memory profiles -- so it has nothing to work with when
+        this returns a reason. One place decides *and* names it: two copies of the
+        condition would eventually disagree, and a caller that re-derived the
+        reason for its log would be a second copy.
+        """
+        if self.model_config.enforce_eager:
+            return "enforce_eager is set"
+        if not envs.VLLM_RBLN_COMPILE_MODEL:
+            return "VLLM_RBLN_COMPILE_MODEL is off"
+        if not envs.VLLM_RBLN_ENABLE_WARM_UP:
+            return "VLLM_RBLN_ENABLE_WARM_UP is off"
+        return None
+
     def _maybe_shrink_kv_cache_for_compile(
         self, kv_cache_config: KVCacheConfig
     ) -> KVCacheConfig:
@@ -522,9 +539,11 @@ class RBLNWorker(WorkerBase):
             else "derived default; VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS is unset"
         )
         if not envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
-            # Only worth saying when the operator set it: with the flag off the
-            # derived value is not a choice anybody made.
-            if explicit:
+            # Only worth saying when the operator set a value that would have
+            # done something: with the flag off the derived value is not a choice
+            # anybody made, and an explicit 0 asks for no shrink, which is what
+            # happens here anyway -- nothing is being ignored.
+            if explicit and compile_num_blocks > 0:
                 logger.warning(
                     "VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS=%d is ignored because "
                     "VLLM_RBLN_USE_DYNAMIC_KV_CACHE is off; without the dynamic "
@@ -532,6 +551,27 @@ class RBLNWorker(WorkerBase):
                     "compile.",
                     compile_num_blocks,
                 )
+            return kv_cache_config
+        skip_reason = self._compile_and_warmup_skip_reason()
+        if skip_reason is not None:
+            # Nothing will compile, so no artifact carries a memory profile and
+            # the resize cannot run. Shrinking anyway is worse than doing
+            # nothing: the latch would be set, `compute_dynamic_kv_num_blocks`
+            # would find no runtimes and return None, and the restore path would
+            # reallocate and then trip its own assertion that at least one
+            # runtime had its adaptive-buffer latch cleared -- a start-up
+            # AssertionError whose message names none of this. Skip the shrink
+            # and say why; the run serves the pre-compile estimate, exactly as it
+            # does with the feature off.
+            logger.warning(
+                "[Dynamic KV] VLLM_RBLN_USE_DYNAMIC_KV_CACHE is set but "
+                "compile/warm-up is skipped (%s), so no artifact reports a KV "
+                "memory profile and the cache cannot be resized. The KV cache "
+                "stays at the %d blocks the pre-compile estimate produced and "
+                "this feature does nothing for this run.",
+                skip_reason,
+                kv_cache_config.num_blocks,
+            )
             return kv_cache_config
         if compile_num_blocks <= 0:
             logger.warning(
@@ -927,15 +967,31 @@ class RBLNWorker(WorkerBase):
             charged[node_id][chiplet_id] -= retained
             retained_by_unit[unit] = retained
 
+        # The advice has to match who chose the block count. Recommending a
+        # smaller value to an operator who set nothing points at a debug-only
+        # variable they have no reason to touch -- and following it would take
+        # them below the measured default, where the value also becomes explicit
+        # and the cannot-shrink branch stops refusing.
+        explicit = envs.compile_kv_cache_num_blocks_is_explicit()
+        if explicit and resident_blocks > envs.DEFAULT_COMPILE_KV_CACHE_NUM_BLOCKS:
+            advice = (
+                "a smaller VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS costs less "
+                f"({envs.DEFAULT_COMPILE_KV_CACHE_NUM_BLOCKS} is enough)"
+            )
+        else:
+            advice = (
+                "this is the smallest measured hint, so the block count is the "
+                "price of running this parallelism rather than something to tune"
+            )
         logger.warning(
             "[Dynamic KV] tensor_parallel_size=%d does not return the "
             "%d-block compile-time KV cache, so its bytes are charged against "
             "the budget: %s. Expect a lower block count than TP=1 on the same "
-            "profile; a smaller VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS costs "
-            "less.",
+            "profile; %s.",
             tp_size,
             resident_blocks,
             {f"{n}:{c}": v for (n, c), v in sorted(retained_by_unit.items())},
+            advice,
         )
 
         exhausted = {
@@ -949,24 +1005,27 @@ class RBLNWorker(WorkerBase):
             # the derived default there is nothing to lower -- documented values
             # below it are unmeasured -- so the levers are the ones that set the
             # budget instead.
+            # Name the block count by who chose it, not by how big it is: an
+            # operator who set 2 explicitly must not be told the cache "is already
+            # at the derived 2 blocks" and sent to investigate the wrong knob.
             default_blocks = envs.DEFAULT_COMPILE_KV_CACHE_NUM_BLOCKS
-            if (
-                envs.compile_kv_cache_num_blocks_is_explicit()
-                and resident_blocks > default_blocks
-            ):
+            origin = (
+                f"VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS={resident_blocks}"
+                if explicit
+                else f"the derived default of {resident_blocks} blocks"
+            )
+            if explicit and resident_blocks > default_blocks:
                 remedy = (
-                    "lower VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS "
-                    f"({default_blocks} is enough -- warm-up points every dummy "
-                    "request at block 0)"
+                    f"lower {origin} ({default_blocks} is enough -- warm-up "
+                    "points every dummy request at block 0)"
                 )
             else:
                 remedy = (
-                    f"the cache is already at the derived {resident_blocks} "
-                    "blocks and values below it are unmeasured, so raise the "
-                    "budget instead: --gpu-memory-utilization, a smaller "
-                    "--block-size (the retained bytes scale with the page size), "
-                    "VLLM_RBLN_DYNAMIC_KV_UNPROFILED_RESERVE_BYTES, or another "
-                    "process holding memory on the same cards"
+                    f"{origin} is already at or below the smallest measured hint, "
+                    "so raise the budget instead: --gpu-memory-utilization, a "
+                    "smaller --block-size (the retained bytes scale with the page "
+                    "size), VLLM_RBLN_DYNAMIC_KV_UNPROFILED_RESERVE_BYTES, or "
+                    "another process holding memory on the same cards"
                 )
             raise RuntimeError(
                 "the retained compile-time KV cache leaves no budget on "
@@ -1428,12 +1487,8 @@ class RBLNWorker(WorkerBase):
         self._ensure_rbln_host_threads_before_compile()
 
         try:
-            if (
-                self.model_config.enforce_eager
-                or not envs.VLLM_RBLN_COMPILE_MODEL
-                or not envs.VLLM_RBLN_ENABLE_WARM_UP
-            ):
-                logger.info("Skipping compile_or_warm_up_model.")
+            if (skip := self._compile_and_warmup_skip_reason()) is not None:
+                logger.info("Skipping compile_or_warm_up_model (%s).", skip)
             else:
                 self.model_runner.warmup_model()
 

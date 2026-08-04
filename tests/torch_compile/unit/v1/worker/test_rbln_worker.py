@@ -1575,7 +1575,9 @@ class TestMaybeShrinkKvCacheForCompile:
         )
 
     @staticmethod
-    def _shrink(config, *, dynamic=True, value=None, override=None):
+    def _shrink(
+        config, *, dynamic=True, value=None, override=None, warmup_skipped=False
+    ):
         """Drive the method with the two env readings injected.
 
         The values are patched as module attributes rather than through
@@ -1597,6 +1599,11 @@ class TestMaybeShrinkKvCacheForCompile:
         worker = SimpleNamespace(
             cache_config=SimpleNamespace(num_gpu_blocks_override=override),
             _kv_blocks_before_shrink=None,
+            # The real predicate reads model_config and two env vars; the shrink
+            # only asks whether warm-up will run.
+            _compile_and_warmup_skip_reason=lambda: (
+                "enforce_eager is set" if warmup_skipped else None
+            ),
         )
         with (
             patch(
@@ -1718,12 +1725,112 @@ class TestMaybeShrinkKvCacheForCompile:
         worker = SimpleNamespace(
             cache_config=SimpleNamespace(num_gpu_blocks_override=None),
             _kv_blocks_before_shrink=None,
+            _compile_and_warmup_skip_reason=lambda: None,
+        )
+        with (
+            patch(
+                "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE",
+                True,
+            ),
+            pytest.raises(RuntimeError, match="nothing to shrink"),
+        ):
+            RBLNWorker._maybe_shrink_kv_cache_for_compile(
+                worker, self._config(num_blocks=4)
+            )
+
+    def test_no_warmup_means_no_shrink(self, caplog):
+        """Skipping compile/warm-up has to skip the shrink too.
+
+        Nothing compiles, so no artifact reports a memory profile and the resize
+        cannot run. Shrinking anyway sets the latch, the profile query then finds
+        no runtimes, and the restore path reallocates and trips its own assertion
+        that some runtime had its adaptive-buffer latch cleared -- a start-up
+        AssertionError naming none of the actual cause. Serving the estimate is
+        what the feature-off path does, so do that and say why.
+        """
+        config = self._config()
+        with caplog.at_level("WARNING"):
+            worker, out = self._shrink(config, warmup_skipped=True)
+
+        assert out is config
+        assert worker._kv_blocks_before_shrink is None
+        assert "compile/warm-up is skipped" in caplog.text
+        # The operator needs to know the feature did nothing, not just that a
+        # step was skipped.
+        assert "does nothing for this run" in caplog.text
+
+    def test_flag_off_with_an_explicit_zero_is_silent(self, caplog):
+        """0 asks for no shrink, and with the flag off there is no shrink.
+
+        Nothing is being ignored, so the "is ignored" warning would be false --
+        and a launcher that kept `=0` from a static A/B comparison would carry it
+        into every unrelated static deployment.
+        """
+        with caplog.at_level("WARNING"):
+            worker, out = self._shrink(self._config(), dynamic=False, value=0)
+
+        assert worker._kv_blocks_before_shrink is None
+        assert caplog.text == ""
+
+
+class TestChargeRemedyWording:
+    """The charge's advice has to name whoever chose the block count.
+
+    Both messages in `_charge_retained_compile_kv_cache` used to recommend
+    lowering `VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS` unconditionally. Under a
+    derived default that points an operator at a debug-only variable they never
+    set, and following it goes below the smallest measured hint — where the value
+    also becomes explicit, so the cannot-shrink branch stops refusing.
+    """
+
+    BUDGET = 33_772_535_808
+
+    @staticmethod
+    def _charge(*, blocks, explicit, bytes_per_block, tp=4):
+        from vllm_rbln.v1.worker.kv_profile import (
+            MergedKvCacheMemoryProfile,
+            MergedMemoryRegion,
+        )
+        from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
+
+        merged = MergedKvCacheMemoryProfile(
+            device_regions=[MergedMemoryRegion(0, 0, 0, bytes_per_block, 1)]
+        )
+        worker = SimpleNamespace(
+            parallel_config=SimpleNamespace(tensor_parallel_size=tp),
+            model_runner=SimpleNamespace(
+                kv_cache_config=SimpleNamespace(num_blocks=blocks)
+            ),
         )
         with patch(
-            "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE",
-            True,
+            "vllm_rbln.v1.worker.rbln_worker.envs."
+            "compile_kv_cache_num_blocks_is_explicit",
+            lambda: explicit,
         ):
-            with pytest.raises(RuntimeError, match="nothing to shrink"):
-                RBLNWorker._maybe_shrink_kv_cache_for_compile(
-                    worker, self._config(num_blocks=4)
-                )
+            return RBLNWorker._charge_retained_compile_kv_cache(
+                worker, {0: {0: TestChargeRemedyWording.BUDGET}}, merged
+            )
+
+    def test_the_derived_default_is_not_told_to_lower_the_variable(self, caplog):
+        with caplog.at_level("WARNING"):
+            self._charge(blocks=8, explicit=False, bytes_per_block=65_011_712)
+        assert "a smaller VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS" not in caplog.text
+        assert "price of running this parallelism" in caplog.text
+
+    def test_an_explicit_large_value_is_told_to_lower_it(self, caplog):
+        with caplog.at_level("WARNING"):
+            self._charge(blocks=64, explicit=True, bytes_per_block=65_011_712)
+        assert "a smaller VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS" in caplog.text
+
+    def test_an_explicit_small_value_is_not_called_derived(self):
+        # Exhausts the budget so the RuntimeError path decides the wording.
+        with pytest.raises(RuntimeError) as exc:
+            self._charge(blocks=2, explicit=True, bytes_per_block=self.BUDGET // 2)
+        assert "VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS=2" in str(exc.value)
+        assert "derived" not in str(exc.value)
+
+    def test_a_derived_value_that_exhausts_the_budget_says_derived(self):
+        with pytest.raises(RuntimeError) as exc:
+            self._charge(blocks=8, explicit=False, bytes_per_block=self.BUDGET // 4)
+        assert "the derived default of 8 blocks" in str(exc.value)
+        assert "gpu-memory-utilization" in str(exc.value)

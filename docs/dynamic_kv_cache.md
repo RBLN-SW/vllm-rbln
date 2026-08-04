@@ -82,8 +82,17 @@ override. Raise the estimate (`--gpu-memory-utilization`, a smaller
 
 Values **below 8** are unmeasured. `2` is the smallest that is expected to keep
 the dimension dynamic; `1` risks dynamo specializing a size-1 dimension, which
-produces a static artifact — the profile query then finds no dynamic-shape
-variable and the run silently falls back to the estimate.
+produces a static artifact. The profile query then finds no dynamic-shape variable
+and the run falls back to the estimate — loudly: a warning per runtime naming the
+static artifact, an error that no profile could be collected, and a third warning
+when the cache is restored to the estimate.
+
+**Compile and warm-up are skipped** (`--enforce-eager`,
+`VLLM_RBLN_COMPILE_MODEL=0`, `VLLM_RBLN_ENABLE_WARM_UP=0`). Nothing compiles, so no
+artifact reports a memory profile and there is nothing to resize from. The shrink is
+skipped with a warning naming which switch did it, and the run serves the
+pre-compile estimate exactly as it does with the feature off. This is the one case
+where the derived default cannot work at all rather than working differently.
 
 **You want the pre-compile estimate on purpose** (comparing against the static
 path, measuring without the resize): set
