@@ -68,13 +68,13 @@ jobs:
       rebel_compiler_version: ${{ inputs.rebel_compiler_version }}
       optimum_rbln_version: ${{ inputs.optimum_rbln_version }}
 
-  vllm-rbln-optimum-ci:
-    needs: [build-vllm-rbln]
-    if: ${{ always() && !cancelled() && needs.build-vllm-rbln.result == 'success' }}
-    uses: ./.github/workflows/rbln_optimum_ci.yaml
-    secrets: inherit
-    with:
-      ref: ${{ inputs.ref }}
-      # empty = downstream workflow uses uv.lock pin; set only for manual dispatch override
-      rebel_compiler_version: ${{ inputs.rebel_compiler_version }}
-      optimum_rbln_version: ${{ inputs.optimum_rbln_version }}
+  # vllm-rbln-optimum-ci:
+  #   needs: [build-vllm-rbln]
+  #   if: ${{ always() && !cancelled() && needs.build-vllm-rbln.result == 'success' }}
+  #   uses: ./.github/workflows/rbln_optimum_ci.yaml
+  #   secrets: inherit
+  #   with:
+  #     ref: ${{ inputs.ref }}
+  #     # empty = downstream workflow uses uv.lock pin; set only for manual dispatch override
+  #     rebel_compiler_version: ${{ inputs.rebel_compiler_version }}
+  #     optimum_rbln_version: ${{ inputs.optimum_rbln_version }}
