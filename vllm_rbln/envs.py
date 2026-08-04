@@ -60,7 +60,11 @@ if TYPE_CHECKING:
     VLLM_RBLN_NUM_RAY_NODES: int = 1
     # --- DYNAMIC KV CACHE ---
     VLLM_RBLN_USE_DYNAMIC_KV_CACHE: bool = False
-    VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS: int = 0
+    # Debug-only override of the derived compile-time hint (see
+    # compile_kv_cache_num_blocks); 0 opts out of the shrink and the resize.
+    # Kept a literal because this block is only read by type checkers; the value
+    # in force is DEFAULT_COMPILE_KV_CACHE_NUM_BLOCKS below.
+    VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS: int = 8
     VLLM_RBLN_DYNAMIC_KV_UNPROFILED_RESERVE_BYTES: int = 48 * 1024 * 1024
     # --- ATTENTION ---
     VLLM_RBLN_FLASH_CAUSAL_ATTN: bool = True
@@ -179,6 +183,51 @@ def get_decode_batch_bucket_manual_buckets() -> list[int]:
             f"Invalid VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS: "
             f"{manual_buckets}, {e}"
         ) from e
+
+
+def is_set(name: str) -> bool:
+    """Whether `name` is present in the environment, whatever its value.
+
+    Lets a caller tell "the operator chose this" from "this is the default",
+    which a getter's return value alone cannot express once the default is
+    non-zero.
+    """
+    return name in os.environ
+
+
+# The compile-time KV block count used when the operator sets nothing. The
+# traced `num_blocks` only supplies the hint of the mark_dynamic'd dim, and
+# warm-up points every dummy request at block 0, so a small cache is enough;
+# 8 is the value the measured dynamic-KV runs used.
+DEFAULT_COMPILE_KV_CACHE_NUM_BLOCKS = 8
+
+
+def compile_kv_cache_num_blocks() -> int:
+    """Blocks the KV cache is compiled against, under the dynamic-KV path.
+
+    Unset means `DEFAULT_COMPILE_KV_CACHE_NUM_BLOCKS`, so the feature needs one
+    public switch (VLLM_RBLN_USE_DYNAMIC_KV_CACHE) rather than two variables that
+    must agree. An explicit value is a debug override; an explicit 0 opts out of
+    the shrink, and therefore out of the resize.
+
+    Deliberately *not* derived from VLLM_RBLN_USE_DYNAMIC_KV_CACHE.
+    `use_auto_port` below shows the cost of that shape: it re-spells the sibling
+    variable's default ("True") in a second place, so the two have to be kept in
+    step by hand. Here that line would be the one missed the day the dynamic flag
+    becomes default-on -- and missing it restores exactly the half-enabled state
+    this default exists to remove. The flag is checked where the shrink is
+    decided instead.
+
+    Never raises on an unset or blank value: vLLM's `enable_envs_cache` evaluates
+    every registered getter once, RBLN's included (see the `vllm_envs.update`
+    call at the end of this module), so a getter that raises would break
+    deployments that never touch this feature. A non-numeric value still raises,
+    as it did before.
+    """
+    raw = os.environ.get("VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS")
+    if raw is None or not raw.strip():
+        return DEFAULT_COMPILE_KV_CACHE_NUM_BLOCKS
+    return int(raw)
 
 
 def use_auto_port() -> bool:
@@ -310,14 +359,16 @@ environment_variables = {
             in ("true", "1")
         )
     ),
-    # Compile against a deliberately small KV cache of this many blocks: the
-    # traced num_blocks only sets the hint of the mark_dynamic'd dim, so the
-    # artifact's buffers need not be built at the full size. 0 disables the
-    # shrink, and it is only honored together with VLLM_RBLN_USE_DYNAMIC_KV_CACHE
-    # -- otherwise nothing would restore the full cache after the compile.
-    "VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS": lambda: int(
-        os.environ.get("VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS", 0)
-    ),
+    # Debug-only override of the compile-time block count derived above; unset is
+    # DEFAULT_COMPILE_KV_CACHE_NUM_BLOCKS. Smaller is cheaper: on TP=1 the cache
+    # is returned and costs nothing, on TP>=2 it is not, so the final block count
+    # loses exactly this many blocks (measured: MiniMax TP4+EP, 62 MiB per block
+    # per chiplet -- 64 blocks there is 4 runs out of 4 dead on the first
+    # request). Values at or above what vllm sized the cache with cancel the
+    # shrink, which also cancels the resize; 0 opts out of both on purpose.
+    # Below 8 is unmeasured, and 1 risks dynamo specializing a size-1 dim into a
+    # static artifact.
+    "VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS": compile_kv_cache_num_blocks,
     # Bytes held back from every chiplet's dynamic-KV budget for device memory
     # `kv_cache_memory_profile()` does not describe: the profile is not a
     # complete inventory, so eager buffers and command-stream pools that match no
