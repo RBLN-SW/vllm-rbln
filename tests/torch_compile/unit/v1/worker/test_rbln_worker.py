@@ -1609,8 +1609,9 @@ class TestMaybeShrinkKvCacheForCompile:
                 effective,
             ),
             patch(
-                "vllm_rbln.v1.worker.rbln_worker.envs.is_set",
-                lambda name: explicit,
+                "vllm_rbln.v1.worker.rbln_worker.envs."
+                "compile_kv_cache_num_blocks_is_explicit",
+                lambda: explicit,
             ),
         ):
             out = RBLNWorker._maybe_shrink_kv_cache_for_compile(worker, config)
@@ -1644,7 +1645,10 @@ class TestMaybeShrinkKvCacheForCompile:
 
         assert out.num_blocks == 16
         assert worker._kv_blocks_before_shrink == self.ESTIMATED_BLOCKS
-        assert "override" in caplog.text
+        # Names the variable the operator actually set, so the log says where 16
+        # came from rather than just that it was not the default.
+        assert "VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS" in caplog.text
+        assert "derived default" not in caplog.text
 
     def test_explicit_zero_opts_out_and_says_so(self, caplog):
         config = self._config()
@@ -1698,3 +1702,28 @@ class TestMaybeShrinkKvCacheForCompile:
         assert out is config
         assert worker._kv_blocks_before_shrink is None
         assert "compiling as-is" in caplog.text
+
+    def test_a_blank_env_value_still_refuses(self, monkeypatch):
+        """`VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS=` must not read as a choice.
+
+        Driven through the real environment rather than the injected helper,
+        because the bug this guards against lived in the disagreement between the
+        value (blank -> derived default) and the provenance (blank -> present).
+        Reading presence there would take the warn-only branch and serve the
+        pre-compile estimate with nobody having asked for it.
+        """
+        from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
+
+        monkeypatch.setenv("VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS", "")
+        worker = SimpleNamespace(
+            cache_config=SimpleNamespace(num_gpu_blocks_override=None),
+            _kv_blocks_before_shrink=None,
+        )
+        with patch(
+            "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE",
+            True,
+        ):
+            with pytest.raises(RuntimeError, match="nothing to shrink"):
+                RBLNWorker._maybe_shrink_kv_cache_for_compile(
+                    worker, self._config(num_blocks=4)
+                )

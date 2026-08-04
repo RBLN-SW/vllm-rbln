@@ -515,8 +515,12 @@ class RBLNWorker(WorkerBase):
         the shrunk cache does not have.
         """
         compile_num_blocks = envs.VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS
-        explicit = envs.is_set("VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS")
-        provenance = "override" if explicit else "derived default"
+        explicit = envs.compile_kv_cache_num_blocks_is_explicit()
+        provenance = (
+            "VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS"
+            if explicit
+            else "derived default; VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS is unset"
+        )
         if not envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
             # Only worth saying when the operator set it: with the flag off the
             # derived value is not a choice anybody made.
@@ -547,13 +551,14 @@ class RBLNWorker(WorkerBase):
         override = self.cache_config.num_gpu_blocks_override
         if override is not None:
             logger.warning(
-                "VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS=%d is ignored because "
-                "--num-gpu-blocks-override=%d pins the block count: the dynamic "
-                "KV path then computes no new size, so nothing would restore "
-                "the full cache after the compile and the server would serve "
-                "from the %d-block compile cache while the scheduler hands out "
-                "block ids for %d. Compiling at the pinned size instead.",
+                "[Dynamic KV] the %d-block compile-time KV cache (%s) is ignored "
+                "because --num-gpu-blocks-override=%d pins the block count: the "
+                "dynamic KV path then computes no new size, so nothing would "
+                "restore the full cache after the compile and the server would "
+                "serve from the %d-block compile cache while the scheduler hands "
+                "out block ids for %d. Compiling at the pinned size instead.",
                 compile_num_blocks,
+                provenance,
                 override,
                 compile_num_blocks,
                 kv_cache_config.num_blocks,
@@ -585,10 +590,10 @@ class RBLNWorker(WorkerBase):
                     "without this feature."
                 )
             logger.warning(
-                "VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS=%d is not below the %d "
-                "blocks vllm sized the KV cache with; compiling as-is. No "
-                "profile will be queried and the block count stays at the "
-                "pre-compile estimate.",
+                "[Dynamic KV] VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS=%d is not "
+                "below the %d blocks vllm sized the KV cache with; compiling "
+                "as-is. No profile will be queried and the block count stays at "
+                "the pre-compile estimate.",
                 compile_num_blocks,
                 kv_cache_config.num_blocks,
             )
@@ -940,13 +945,34 @@ class RBLNWorker(WorkerBase):
             if remaining <= 0
         }
         if exhausted:
+            # Which remedy is honest depends on who chose the block count. With
+            # the derived default there is nothing to lower -- documented values
+            # below it are unmeasured -- so the levers are the ones that set the
+            # budget instead.
+            default_blocks = envs.DEFAULT_COMPILE_KV_CACHE_NUM_BLOCKS
+            if (
+                envs.compile_kv_cache_num_blocks_is_explicit()
+                and resident_blocks > default_blocks
+            ):
+                remedy = (
+                    "lower VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS "
+                    f"({default_blocks} is enough -- warm-up points every dummy "
+                    "request at block 0)"
+                )
+            else:
+                remedy = (
+                    f"the cache is already at the derived {resident_blocks} "
+                    "blocks and values below it are unmeasured, so raise the "
+                    "budget instead: --gpu-memory-utilization, a smaller "
+                    "--block-size (the retained bytes scale with the page size), "
+                    "VLLM_RBLN_DYNAMIC_KV_UNPROFILED_RESERVE_BYTES, or another "
+                    "process holding memory on the same cards"
+                )
             raise RuntimeError(
                 "the retained compile-time KV cache leaves no budget on "
                 f"{exhausted}. The {resident_blocks}-block cache compiled for "
                 f"tensor_parallel_size={tp_size} is too large for it to be "
-                "charged, and this parallelism does not free it; lower "
-                "VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS (8 is enough -- warm-up "
-                "points every dummy request at block 0)."
+                f"charged, and this parallelism does not free it; {remedy}."
             )
         return charged
 
@@ -1445,8 +1471,13 @@ class RBLNWorker(WorkerBase):
                     # would cancel the shrink rather than shrink anything.
                     raise RuntimeError(
                         f"Not enough memory to compile against the {blocks}-block "
-                        "compile-time KV cache "
-                        "(VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS); vllm sized the "
+                        "compile-time KV cache ("
+                        + (
+                            "VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS"
+                            if envs.compile_kv_cache_num_blocks_is_explicit()
+                            else "derived default"
+                        )
+                        + "); vllm sized the "
                         f"cache with {self._kv_blocks_before_shrink} blocks, and "
                         "it is the resize after warm-up that would have applied "
                         "the real count. At this size the KV cache is not what "

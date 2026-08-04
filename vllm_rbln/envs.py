@@ -224,10 +224,38 @@ def compile_kv_cache_num_blocks() -> int:
     deployments that never touch this feature. A non-numeric value still raises,
     as it did before.
     """
-    raw = os.environ.get("VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS")
-    if raw is None or not raw.strip():
+    raw = _raw_compile_kv_cache_num_blocks()
+    if raw is None:
         return DEFAULT_COMPILE_KV_CACHE_NUM_BLOCKS
     return int(raw)
+
+
+def _raw_compile_kv_cache_num_blocks() -> str | None:
+    """The operator's value, or None when there is effectively none.
+
+    Blank counts as absent. A shell or compose file that exports the variable
+    empty (`VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS=`, `value: ""`, or
+    `export VAR=$UNSET`) leaves an empty string in the environment, and treating
+    that as a choice would mean honouring a number nobody picked.
+    """
+    raw = os.environ.get("VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS")
+    return raw if raw is not None and raw.strip() else None
+
+
+def compile_kv_cache_num_blocks_is_explicit() -> bool:
+    """Whether the block count above came from the operator or from the default.
+
+    Deliberately not `is_set(...)`: that answers *presence*, and presence and
+    usability part company on a blank value -- which is the one case where the
+    two must not disagree. The value is the derived default there, so a caller
+    that read presence would attribute a number nobody chose to the operator and
+    then honour it: `_maybe_shrink_kv_cache_for_compile` refuses a *derived* hint
+    that cannot shrink and only warns about an *explicit* one, so getting this
+    backwards turns the refusal back into the silent fallback it exists to
+    prevent. Asking the same helper the getter asks keeps the value and its
+    provenance from disagreeing. An explicit `0` is still a choice.
+    """
+    return _raw_compile_kv_cache_num_blocks() is not None
 
 
 def use_auto_port() -> bool:

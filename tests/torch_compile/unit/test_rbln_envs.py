@@ -136,7 +136,7 @@ def test_explicit_zero_survives_as_an_opt_out(monkeypatch):
     """0 has to stay distinguishable from unset, or the escape hatch is gone."""
     monkeypatch.setenv("VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS", "0")
     assert envs.VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS == 0
-    assert envs.is_set("VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS")
+    assert envs.compile_kv_cache_num_blocks_is_explicit()
 
 
 def test_is_set_reports_presence_not_truthiness(monkeypatch):
@@ -144,6 +144,28 @@ def test_is_set_reports_presence_not_truthiness(monkeypatch):
     assert not envs.is_set("VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS")
     monkeypatch.setenv("VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS", "")
     assert envs.is_set("VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS")
+
+
+def test_provenance_and_value_agree_on_a_blank_value(monkeypatch):
+    """A blank value must not read as a choice the operator made.
+
+    The two answers part company only here, and this is the one place they must
+    not: the worker refuses a *derived* hint that cannot shrink and merely warns
+    about an *explicit* one, so calling blank "explicit" would turn that refusal
+    back into the silent fallback to the pre-compile estimate. `is_set` still
+    reports presence -- that is what its name says -- which is why the worker
+    asks this instead.
+    """
+    for raw in ("", "   "):
+        monkeypatch.setenv("VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS", raw)
+        assert envs.VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS == 8
+        assert not envs.compile_kv_cache_num_blocks_is_explicit()
+        assert envs.is_set("VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS")
+
+    monkeypatch.delenv("VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS", raising=False)
+    assert not envs.compile_kv_cache_num_blocks_is_explicit()
+    monkeypatch.setenv("VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS", "16")
+    assert envs.compile_kv_cache_num_blocks_is_explicit()
 
 
 def test_dynamic_kv_cache_envs_are_read_from_os_environ(monkeypatch):
