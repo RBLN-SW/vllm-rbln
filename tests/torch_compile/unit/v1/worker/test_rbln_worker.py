@@ -1575,25 +1575,44 @@ class TestMaybeShrinkKvCacheForCompile:
         )
 
     @staticmethod
-    def _shrink(config, *, dynamic=True, env=None, override=None):
+    def _shrink(config, *, dynamic=True, value=None, override=None):
+        """Drive the method with the two env readings injected.
+
+        The values are patched as module attributes rather than through
+        `os.environ`, because by the time this file runs `vllm_rbln.envs` may no
+        longer be consulting the environment at all: `monkeypatch.setattr` on a
+        module whose values come from `__getattr__` restores by `setattr`, so any
+        earlier test that took that route (test_eagle.py does, for this very
+        variable) leaves a real attribute shadowing the getter for the rest of the
+        session. The getter itself -- unset means the derived default, blank is
+        not a crash, 0 survives as an opt-out -- is covered in test_rbln_envs.py.
+
+        `value=None` means the operator set nothing, i.e. the derived default.
+        """
+        import vllm_rbln.envs as envs
         from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
 
+        explicit = value is not None
+        effective = envs.DEFAULT_COMPILE_KV_CACHE_NUM_BLOCKS if not explicit else value
         worker = SimpleNamespace(
             cache_config=SimpleNamespace(num_gpu_blocks_override=override),
             _kv_blocks_before_shrink=None,
         )
-        environ = {}
-        if dynamic:
-            environ["VLLM_RBLN_USE_DYNAMIC_KV_CACHE"] = "1"
-        if env is not None:
-            environ["VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS"] = env
-        with patch.dict(os.environ, environ, clear=False):
-            for name in (
-                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE",
+        with (
+            patch(
+                "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE",
+                dynamic,
+            ),
+            patch(
+                "vllm_rbln.v1.worker.rbln_worker.envs."
                 "VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS",
-            ):
-                if name not in environ:
-                    os.environ.pop(name, None)
+                effective,
+            ),
+            patch(
+                "vllm_rbln.v1.worker.rbln_worker.envs.is_set",
+                lambda name: explicit,
+            ),
+        ):
             out = RBLNWorker._maybe_shrink_kv_cache_for_compile(worker, config)
         return worker, out
 
@@ -1621,7 +1640,7 @@ class TestMaybeShrinkKvCacheForCompile:
 
     def test_an_explicit_value_is_reported_as_an_override(self, caplog):
         with caplog.at_level("INFO"):
-            worker, out = self._shrink(self._config(), env="16")
+            worker, out = self._shrink(self._config(), value=16)
 
         assert out.num_blocks == 16
         assert worker._kv_blocks_before_shrink == self.ESTIMATED_BLOCKS
@@ -1630,7 +1649,7 @@ class TestMaybeShrinkKvCacheForCompile:
     def test_explicit_zero_opts_out_and_says_so(self, caplog):
         config = self._config()
         with caplog.at_level("WARNING"):
-            worker, out = self._shrink(config, env="0")
+            worker, out = self._shrink(config, value=0)
 
         assert out is config
         assert worker._kv_blocks_before_shrink is None
@@ -1641,7 +1660,7 @@ class TestMaybeShrinkKvCacheForCompile:
 
     def test_a_negative_value_is_treated_as_an_opt_out(self):
         config = self._config()
-        worker, out = self._shrink(config, env="-1")
+        worker, out = self._shrink(config, value=-1)
         assert out is config
         assert worker._kv_blocks_before_shrink is None
 
@@ -1652,7 +1671,7 @@ class TestMaybeShrinkKvCacheForCompile:
         assert caplog.text == ""
 
         with caplog.at_level("WARNING"):
-            self._shrink(self._config(), dynamic=False, env="8")
+            self._shrink(self._config(), dynamic=False, value=8)
         assert "is ignored because" in caplog.text
 
     def test_a_pinned_block_count_cancels_the_shrink(self, caplog):
@@ -1674,7 +1693,7 @@ class TestMaybeShrinkKvCacheForCompile:
     def test_an_explicit_hint_that_cannot_shrink_still_warns(self, caplog):
         config = self._config(num_blocks=4)
         with caplog.at_level("WARNING"):
-            worker, out = self._shrink(config, env="64")
+            worker, out = self._shrink(config, value=64)
 
         assert out is config
         assert worker._kv_blocks_before_shrink is None
