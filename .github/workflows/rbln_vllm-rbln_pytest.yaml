@@ -60,6 +60,9 @@ jobs:
       # Authenticate HF Hub requests so rate limits apply per-account
       # instead of per-IP (self-hosted runners share one egress IP).
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      # Shared HF cache mount so models are downloaded once across runners
+      # (inherited by the vllm serve subprocesses RemoteOpenAIServer spawns).
+      HF_HOME: ${{ secrets.HF_HOME }}
     strategy:
       fail-fast: ${{ inputs.fail_fast }}
       matrix:
@@ -166,16 +169,6 @@ jobs:
             uv pip install --no-deps "optimum-rbln==${{ inputs.optimum_rbln_version }}"
           fi
 
-      - name: Cache HuggingFace Hub
-        if: steps.should_skip.outputs.skip != 'true'
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/huggingface
-          key: hf-hub-${{ matrix.test_type.name }}-${{ github.run_id }}
-          restore-keys: |
-            hf-hub-${{ matrix.test_type.name }}-
-            hf-hub-
-
       - name: Run pytest
         if: steps.should_skip.outputs.skip != 'true'
         env:
@@ -211,6 +204,9 @@ jobs:
       # Authenticate HF Hub requests so rate limits apply per-account
       # instead of per-IP (self-hosted runners share one egress IP).
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      # Shared HF cache mount so models are downloaded once across runners
+      # (inherited by the vllm serve subprocesses RemoteOpenAIServer spawns).
+      HF_HOME: ${{ secrets.HF_HOME }}
     strategy:
       fail-fast: ${{ inputs.fail_fast }}
       matrix:
@@ -331,16 +327,6 @@ jobs:
             if [ -n "${{ inputs.optimum_rbln_version }}" ]; then
               uv pip install --no-deps "optimum-rbln==${{ inputs.optimum_rbln_version }}"
             fi
-
-      - name: Cache HuggingFace Hub
-        if: steps.should_skip.outputs.skip != 'true'
-        uses: actions/cache@v4
-        with:
-          path: /root/.cache/huggingface
-          key: hf-hub-${{ matrix.test_type.name }}-${{ github.run_id }}
-          restore-keys: |
-            hf-hub-${{ matrix.test_type.name }}-
-            hf-hub-
 
       - name: Run pytest
         if: steps.should_skip.outputs.skip != 'true'
