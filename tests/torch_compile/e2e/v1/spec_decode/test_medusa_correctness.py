@@ -69,7 +69,6 @@ def _medusa_llm_kwargs(max_num_seqs: int) -> dict:
     }
 
 
-@pytest.mark.xfail(reason="unexpected compilation error in medusa")
 @pytest.mark.parametrize("batch_size", BATCH_SIZES)
 def test_medusa_matches_base_generation(
     monkeypatch: pytest.MonkeyPatch, batch_size: int

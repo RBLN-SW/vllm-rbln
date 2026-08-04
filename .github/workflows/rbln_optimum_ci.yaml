@@ -70,6 +70,7 @@ jobs:
       NUM_INPUT_PROMPT: 1
       VLLM_LOGGING_LEVEL: DEBUG
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      VLLM_RBLN_SAMPLER: 0
     steps:
       - name: Install uv CLI
         run: |
@@ -150,6 +151,7 @@ jobs:
       NUM_INPUT_PROMPT: 1
       VLLM_LOGGING_LEVEL: DEBUG
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      VLLM_RBLN_SAMPLER: 0
     steps:
       - name: Install uv CLI
         run: |
@@ -211,8 +213,6 @@ jobs:
             fi
 
       - name: Run optimum smoke tests (RSD 4)
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: >
           uv run --no-sync pytest tests/optimum/optimum_compile/smoke/test_rsd4.py
           -v --durations 0
@@ -293,8 +293,6 @@ jobs:
             fi
 
       - name: Run optimum smoke tests (RSD 8)
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: >
           uv run --no-sync pytest tests/optimum/optimum_compile/smoke/test_rsd8.py
           -v --durations 0
