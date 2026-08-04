@@ -218,7 +218,7 @@ jobs:
           [
             {
               name : "openai",
-              runner : "rbln-sw-k8s-ca22-4"
+              runner : "rbln-sw-k8s-ca22-1"
             },
             {
               name : "llm",
