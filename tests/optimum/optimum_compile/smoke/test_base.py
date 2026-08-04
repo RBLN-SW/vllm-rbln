@@ -116,6 +116,7 @@ class SmokeBase:
 
         @classmethod
         def setUpClass(cls) -> None:
+            # Compile once per class (the LLM(...) call is the compile step).
             if _NPU_NAME is None:
                 raise unittest.SkipTest("requires a real RBLN NPU")
             assert cls.MODEL_ID, f"{cls.__name__}: MODEL_ID required"
@@ -143,7 +144,7 @@ class DecoderSmoke:
         ]
         MAX_TOKENS = 20
 
-        def test_smoke(self) -> None:
+        def test_generate(self) -> None:
             outputs = self.llm.generate(
                 self.PROMPTS,
                 SamplingParams(temperature=0, max_tokens=self.MAX_TOKENS),
@@ -235,7 +236,7 @@ class MultimodalSmoke:
                 request["mm_processor_kwargs"] = self.MM_PROCESSOR_KWARGS
             return [request]
 
-        def test_smoke(self) -> None:
+        def test_generate(self) -> None:
             outputs = self.llm.generate(
                 self.get_inputs(),
                 SamplingParams(temperature=0, max_tokens=self.MAX_TOKENS),
