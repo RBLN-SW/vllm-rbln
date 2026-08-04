@@ -86,6 +86,7 @@ class RBLNScheduler(Scheduler):
             self.kv_cache_manager = RBLNKVCacheManager(
                 kv_cache_config=self.kv_cache_config,
                 max_model_len=self.max_model_len,
+                scheduler_block_size=self.block_size,
                 hash_block_size=self.block_size,
                 sub_block_size=sub_block_size,
                 hash_fn=hash_fn,
@@ -95,6 +96,7 @@ class RBLNScheduler(Scheduler):
                 dcp_world_size=self.dcp_world_size,
                 pcp_world_size=self.pcp_world_size,
                 metrics_collector=self.kv_metrics_collector,
+                watermark=self.scheduler_config.watermark,
             )
 
             logger.info(
@@ -151,15 +153,7 @@ class RBLNScheduler(Scheduler):
                     pending_delta + req_to_new_blocks[req.request_id]
                 )
 
-    def schedule(self) -> RBLNSchedulerOutput:
-        # Copied from vllm.v1.core.sched.Scheduler.schedule: https://github.com/vllm-project/vllm/blob/v0.18.0/vllm/v1/core/sched/scheduler.py#L338-L927
-        # The only differences are:
-        # - Disable mixed batching
-        # - Limit prefill batch size to 1
-        # - Limit decode batch size to (max_num_seqs // pipeline_parallel_size)
-        # - Do not schedule spec tokens when they are across block boundaries
-        # Search for NOTE(RBLN) for details
-
+    def schedule(self, throttle_prefills: bool = False) -> RBLNSchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -658,6 +652,7 @@ class RBLNScheduler(Scheduler):
                     # NOTE(RBLN): Cache blocks only after scheduling is finalized.
                     delay_cache_blocks=True,
                     num_encoder_tokens=num_encoder_tokens,
+                    has_scheduled_reqs=bool(self.running),
                 )
 
                 if new_blocks is None:

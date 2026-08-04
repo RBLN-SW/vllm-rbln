@@ -118,16 +118,15 @@ def get_vllm_config(
 
 @contextmanager
 def ensure_current_vllm_config():
-    from vllm.config import (
-        VllmConfig,
-        get_current_vllm_config_or_none,
-        set_current_vllm_config,
-    )
+    from vllm.config import get_current_vllm_config_or_none, set_current_vllm_config
 
     if get_current_vllm_config_or_none() is not None:
         yield
     else:
-        with set_current_vllm_config(VllmConfig()):
+        # NOTE(RBLN): a bare `VllmConfig()` cannot be used here — it has
+        # `model_config=None`, and `RblnPlatform.check_and_update_config`
+        # dereferences `model_config.dtype` unconditionally.
+        with set_current_vllm_config(get_vllm_config()):
             yield
 
 
@@ -151,8 +150,15 @@ def rbln_model_runner():
         yield runner
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def dist_init():
+    # NOTE(RBLN): module-scoped on purpose. `current_platform.dist_backend` is
+    # "rbln-ccl", and ProcessGroupRBLN can only be created ONCE per process:
+    # after `destroy_process_group()` a second `init_process_group` raises
+    # "Default group must be initialized here" (torch_rbln/lib/libc10d_rbln.so).
+    # A function-scoped fixture (init + destroy per test) therefore fails from
+    # the second test onwards; it only ever worked because the platform used to
+    # resolve to cpu, where `dist_backend` is "" and torch falls back to gloo.
     fd, temp_file = tempfile.mkstemp()
     os.close(fd)
 
@@ -991,7 +997,6 @@ def _real_input_batch(
         max_model_len=max_model_len,
         max_num_batched_tokens=512,
         device=torch.device("cpu"),
-        pin_memory=False,
         vocab_size=vocab_size,
         block_sizes=[block_size],
         kernel_block_sizes=[block_size],
