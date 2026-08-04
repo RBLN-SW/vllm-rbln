@@ -827,16 +827,32 @@ class RBLNWorker(WorkerBase):
         outgoing cache as still resident on all four cards, while PP4 (TP=1)
         reports it returned on all four -- hence the TP condition rather than an
         unconditional charge, which would cost TP=1 blocks it does get back.
+
+        The charged size comes from the cache that is actually resident:
+        `model_runner.kv_cache_config` is the (deep-copied) config the runner
+        allocated from, so it is the shrink that really happened rather than a
+        second reading of the env var. Today the two agree -- the caller returns
+        early unless the shrink applied -- and reading the allocation is what
+        keeps them from drifting, because a charge that does not match what is
+        resident is a silent budget overrun in whichever direction it is wrong.
+
+        Known gap: the condition is `tensor_parallel_size > 1`, but DP4+EP runs
+        with `tensor_parallel_size=1` and sysfs bracketed the outgoing cache as
+        still resident on all four cards (1.0138x per chiplet), so that shape is
+        not charged. The measurements cannot say which of TP/DP/EP decides the
+        free -- both cases that do return it, PP4 and Qwen TP1, are TP=1 -- so
+        the predicate stays as measured and the hole is documented instead of
+        guessed at.
         """
-        compile_num_blocks = envs.VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS
+        resident_blocks = self.model_runner.kv_cache_config.num_blocks
         tp_size = self.parallel_config.tensor_parallel_size
-        if compile_num_blocks <= 0 or tp_size <= 1:
+        if resident_blocks <= 0 or tp_size <= 1:
             return budget
 
         # Difference of two aligned usages rather than num_blocks *
         # bytes_per_block: alignment is applied per region, so this is the same
         # accounting `max_num_blocks` will do with what is left.
-        at_compile = per_chiplet_usage(merged, compile_num_blocks)
+        at_compile = per_chiplet_usage(merged, resident_blocks)
         at_zero = per_chiplet_usage(merged, 0)
 
         charged = dict(budget)
@@ -857,7 +873,7 @@ class RBLNWorker(WorkerBase):
             "profile; a smaller VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS costs "
             "less.",
             tp_size,
-            compile_num_blocks,
+            resident_blocks,
             {f"{n}:{c}": v for (n, c), v in sorted(retained_by_unit.items())},
         )
 
@@ -870,11 +886,11 @@ class RBLNWorker(WorkerBase):
         if exhausted:
             raise RuntimeError(
                 "the retained compile-time KV cache leaves no budget on "
-                f"{exhausted}. VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS="
-                f"{compile_num_blocks} is too large for "
-                f"tensor_parallel_size={tp_size}, which does not free it; try a "
-                "smaller value (8 is enough -- warm-up points every dummy "
-                "request at block 0)."
+                f"{exhausted}. The {resident_blocks}-block cache compiled for "
+                f"tensor_parallel_size={tp_size} is too large for it to be "
+                "charged, and this parallelism does not free it; lower "
+                "VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS (8 is enough -- warm-up "
+                "points every dummy request at block 0)."
             )
         return charged
 

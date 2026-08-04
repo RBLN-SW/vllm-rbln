@@ -1488,18 +1488,18 @@ class TestRetainedCompileKvCacheCharge:
         return {0: {c: cls.BUDGET_PER_CHIPLET for c in range(num_chiplets)}}
 
     @staticmethod
-    def _charge(fake_self_tp, compile_num_blocks, budget, merged):
+    def _charge(fake_self_tp, resident_blocks, budget, merged):
         from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
 
+        # The charge reads the block count the runner actually allocated, not
+        # the env var: see `_charge_retained_compile_kv_cache`.
         worker = SimpleNamespace(
-            parallel_config=SimpleNamespace(tensor_parallel_size=fake_self_tp)
+            parallel_config=SimpleNamespace(tensor_parallel_size=fake_self_tp),
+            model_runner=SimpleNamespace(
+                kv_cache_config=SimpleNamespace(num_blocks=resident_blocks)
+            ),
         )
-        with patch(
-            "vllm_rbln.v1.worker.rbln_worker.envs."
-            "VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS",
-            compile_num_blocks,
-        ):
-            return RBLNWorker._charge_retained_compile_kv_cache(worker, budget, merged)
+        return RBLNWorker._charge_retained_compile_kv_cache(worker, budget, merged)
 
     # (node_id, chiplet_id, base_bytes, bytes_per_block, alignment)
     MINIMAX_TP4EP = [(0, 0, 0, 65_011_712, 1)]
@@ -1518,7 +1518,7 @@ class TestRetainedCompileKvCacheCharge:
         for chiplet_id in (1, 2, 3):
             assert out[0][chiplet_id] == self.BUDGET_PER_CHIPLET
 
-    def test_no_shrink_means_nothing_is_resident_to_charge(self):
+    def test_an_empty_cache_has_nothing_resident_to_charge(self):
         budget = self._budget()
         out = self._charge(4, 0, budget, self._profile(self.MINIMAX_TP4EP))
         assert out == budget
