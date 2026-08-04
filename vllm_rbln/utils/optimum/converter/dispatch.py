@@ -80,6 +80,7 @@ def _generate_model_path_name(
         "block_size": block_size,
         "max_model_len": max_model_len,
         "num_devices": num_devices,
+        "dtype": str(vllm_config.model_config.dtype),
         "max_num_batched_tokens": user_max_num_batched_tokens,
         "memory_budget": memory_budget,
     }

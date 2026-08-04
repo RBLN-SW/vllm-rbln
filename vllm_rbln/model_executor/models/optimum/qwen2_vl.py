@@ -355,9 +355,7 @@ class RBLNOptimumQwenVLForConditionalGeneration(
             caches = [c for c in cached_mm_outputs if spec.embeds_key in c]
             if not caches:
                 continue
-            mm[spec.embeds_key] = torch.cat(
-                [c[spec.embeds_key].to(self.dtype) for c in caches], dim=0
-            )
+            mm[spec.embeds_key] = torch.cat([c[spec.embeds_key] for c in caches], dim=0)
             mm[spec.grid_key] = torch.cat(
                 [c[spec.grid_key].to(torch.int64) for c in caches], dim=0
             )
