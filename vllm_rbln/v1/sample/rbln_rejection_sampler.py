@@ -541,15 +541,9 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         assert logits.ndim == 2
         assert cu_num_draft_tokens.ndim == 1
         if sampling_metadata.all_greedy:
-            # Sharpen the logits to a near one-hot so the (unfiltered) sampler op
-            # lands on the argmax. All rows are greedy (temp==0); dividing by a
-            # tiny eps amplifies the logit gaps, and the subsequent softmax then
-            # concentrates ~all probability mass on the argmax.
-            # NOTE: a literal scatter one-hot (value 1.0) is NOT usable here --
-            # softmax over the large vocab flattens it to near-uniform (peak only
-            # ~e/vocab), so the sampler would miss the argmax. eps-divide keeps it
-            # sharp because it scales the real logit gaps, not a fixed 1.0.
-            logits.div_(GREEDY_EPS)
+            # Make One-hot target distribution for the rejection sampler.
+            _, max_idx = logits.max(dim=-1, keepdim=True)
+            logits = torch.zeros_like(logits).scatter_(-1, max_idx, 1.0)
             return logits
 
         num_tokens = logits.shape[0]
