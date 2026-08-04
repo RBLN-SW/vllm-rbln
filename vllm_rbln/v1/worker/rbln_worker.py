@@ -508,6 +508,19 @@ class RBLNWorker(WorkerBase):
         """
         compile_num_blocks = envs.VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS
         if compile_num_blocks <= 0:
+            if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
+                logger.warning(
+                    "[Dynamic KV] VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS=%d "
+                    "skips the compile-time shrink. The resize is gated on the "
+                    "shrink, so no compiled profile is queried and the KV cache "
+                    "keeps the %d blocks the pre-compile estimate produced -- "
+                    "the sizing this feature exists to replace. mark_dynamic is "
+                    "still applied and still logged per layer, so that log line "
+                    "is not evidence that the block count came from the device. "
+                    "Set VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS=8 to enable it.",
+                    compile_num_blocks,
+                    kv_cache_config.num_blocks,
+                )
             return kv_cache_config
         if not envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
             logger.warning(
@@ -1373,11 +1386,31 @@ class RBLNWorker(WorkerBase):
                 )
 
             if is_rbln_oom_error(e.inner_exception):
+                blocks = self.model_runner.kv_cache_config.num_blocks
+                if self._kv_blocks_before_shrink is not None:
+                    # The number in hand is the deliberately small compile-time
+                    # cache, not what the server will run on, so the stock advice
+                    # ("reduce the number of blocks") points at the one thing
+                    # that is already minimal -- and --num-gpu-blocks-override
+                    # would cancel the shrink rather than shrink anything.
+                    raise RuntimeError(
+                        f"Not enough memory to compile against the {blocks}-block "
+                        "compile-time KV cache "
+                        "(VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS); vllm sized the "
+                        f"cache with {self._kv_blocks_before_shrink} blocks, and "
+                        "it is the resize after warm-up that would have applied "
+                        "the real count. At this size the KV cache is not what "
+                        "exhausted the device, so lowering the block count will "
+                        "not help: reduce --max-num-batched-tokens (the runtime "
+                        "arena scales with it), --max-model-len or "
+                        "--max-num-seqs, raise --tensor-parallel-size to split "
+                        "the weights, or check whether another process holds "
+                        "memory on the same cards."
+                    ) from e
                 raise RuntimeError(
-                    "Not enough memory for "
-                    f"{self.model_runner.kv_cache_config.num_blocks} "
-                    "blocks of KV cache. Try reducing the number of blocks "
-                    "by setting --num-gpu-blocks-override."
+                    f"Not enough memory for {blocks} blocks of KV cache. "
+                    "Try reducing the number of blocks by setting "
+                    "--num-gpu-blocks-override."
                 ) from e
             raise
         finally:
