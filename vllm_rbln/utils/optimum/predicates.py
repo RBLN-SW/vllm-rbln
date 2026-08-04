@@ -69,11 +69,3 @@ def is_qwen3_reranker(model_config: "ModelConfig") -> bool:
     if tokens is None:
         return False
     return len(tokens) == 2
-
-
-def forces_fp32_dtype(model_config: "ModelConfig") -> bool:
-    import optimum.rbln
-
-    _, model_cls_name = get_rbln_model_info(model_config)
-    model_cls = getattr(optimum.rbln, model_cls_name)
-    return not getattr(model_cls, "_supports_non_fp32", False)

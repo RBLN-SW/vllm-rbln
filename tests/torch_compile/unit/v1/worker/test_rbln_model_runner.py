@@ -118,16 +118,15 @@ def get_vllm_config(
 
 @contextmanager
 def ensure_current_vllm_config():
-    from vllm.config import (
-        VllmConfig,
-        get_current_vllm_config_or_none,
-        set_current_vllm_config,
-    )
+    from vllm.config import get_current_vllm_config_or_none, set_current_vllm_config
 
     if get_current_vllm_config_or_none() is not None:
         yield
     else:
-        with set_current_vllm_config(VllmConfig()):
+        # NOTE(RBLN): a bare `VllmConfig()` cannot be used here — it has
+        # `model_config=None`, and `RblnPlatform.check_and_update_config`
+        # dereferences `model_config.dtype` unconditionally.
+        with set_current_vllm_config(get_vllm_config()):
             yield
 
 
@@ -151,8 +150,15 @@ def rbln_model_runner():
         yield runner
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def dist_init():
+    # NOTE(RBLN): module-scoped on purpose. `current_platform.dist_backend` is
+    # "rbln-ccl", and ProcessGroupRBLN can only be created ONCE per process:
+    # after `destroy_process_group()` a second `init_process_group` raises
+    # "Default group must be initialized here" (torch_rbln/lib/libc10d_rbln.so).
+    # A function-scoped fixture (init + destroy per test) therefore fails from
+    # the second test onwards; it only ever worked because the platform used to
+    # resolve to cpu, where `dist_backend` is "" and torch falls back to gloo.
     fd, temp_file = tempfile.mkstemp()
     os.close(fd)
 
@@ -991,7 +997,6 @@ def _real_input_batch(
         max_model_len=max_model_len,
         max_num_batched_tokens=512,
         device=torch.device("cpu"),
-        pin_memory=False,
         vocab_size=vocab_size,
         block_sizes=[block_size],
         kernel_block_sizes=[block_size],
@@ -1382,7 +1387,7 @@ def test_prepare_inputs_pads_query_start_loc_and_seq_lens(rbln_model_runner, dis
     ib.num_computed_tokens_cpu[:2] = [3, 3]
 
     # Poison the tail with stale values to prove they get overwritten.
-    rbln_model_runner.query_start_loc.cpu.fill_(999)
+    rbln_model_runner.query_start_loc.fill_(999)
     rbln_model_runner.seq_lens.fill_(999)
 
     sched = RBLNSchedulerOutput(
@@ -1399,7 +1404,7 @@ def test_prepare_inputs_pads_query_start_loc_and_seq_lens(rbln_model_runner, dis
 
     rbln_model_runner._prepare_inputs(sched, np.array([1, 1], dtype=np.int32))
 
-    qsl = rbln_model_runner.query_start_loc.cpu
+    qsl = rbln_model_runner.query_start_loc
     sl = rbln_model_runner.seq_lens
 
     # Real part: [0, cu...] = [0, 1, 2]; seq_lens = computed + scheduled = [4, 4].
@@ -1976,7 +1981,7 @@ def test_get_prompt_logprobs_dict_chunked_and_final(
     monkeypatch.setattr(rbln_model_runner, "model", FakeModel(), raising=False)
     monkeypatch.setattr(rbln_model_runner, "sampler", FakeSampler())
 
-    rbln_model_runner.query_start_loc.cpu[0] = 0
+    rbln_model_runner.query_start_loc[0] = 0
 
     # First chunk: create and keep in-progress prompt logprobs.
     req_state.num_computed_tokens = 0
@@ -3505,11 +3510,10 @@ def test_build_attention_metadata_returns_per_layer_metadata_and_attaches_kv_bin
     ib.num_computed_tokens_cpu[:2] = [3, 3]
     ib.num_tokens_no_spec[:2] = [4, 4]
 
-    rbln_model_runner.query_start_loc.cpu[:3] = torch.tensor(
+    rbln_model_runner.query_start_loc[:3] = torch.tensor(
         [0, 1, 2],
-        dtype=rbln_model_runner.query_start_loc.cpu.dtype,
+        dtype=rbln_model_runner.query_start_loc.dtype,
     )
-    rbln_model_runner.query_start_loc.copy_to_gpu()
     rbln_model_runner.seq_lens[:2] = torch.tensor(
         [4, 4],
         dtype=rbln_model_runner.seq_lens.dtype,
