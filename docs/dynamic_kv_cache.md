@@ -52,15 +52,22 @@ The cost of the hint is asymmetric:
   observe the free from inside, so those bytes are charged against the
   per-chiplet budget. The final block count loses exactly the hint. Measured on
   MiniMax TP4+EP: 62 MiB per block per chiplet, i.e. 8 blocks = 0.484 GiB and a
-  final count of 276 instead of 284 — but the binding chiplet comes in under
-  budget instead of at 1.015x of it, which is the point.
+  final count of **276** where the same configuration shipped 284 before the
+  charge existed — and the binding chiplet comes in at 0.9997x of budget instead
+  of 1.015x of it, which is the point.
 
-Larger values are worse than linearly bad in practice: on the same
-configuration, `VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS=64` is 4 runs out of 4 that
-start the server and then die with `SYS_EBUSY: Lack of device memory` on the
-first request. If a value that large is now charged rather than overrunning, the
-run fails at start-up with `the retained compile-time KV cache leaves no budget
-on ...`.
+The linearity is exact, and it is what makes a large value survivable. On the same
+MiniMax TP4+EP configuration, `VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS=64` serves at
+220 blocks where the derived 8 gives 276: `276 - 220 = 56 = 64 - 8`, one block of
+service lost per block of hint. Before the retained cache was charged, that same
+value was 4 runs out of 4 where the server started and the *first request* died
+with `SYS_EBUSY: Lack of device memory` — so the charge turns an over-large hint
+from a runtime failure into a predictable price.
+
+A hint large enough to drive a chiplet's budget to zero is refused at start-up
+with `the retained compile-time KV cache leaves no budget on ...`. That path has
+not been observed on hardware; 64 blocks on the configuration above does not come
+close to it.
 
 ## When the derived value is wrong
 
@@ -115,5 +122,18 @@ Known gaps, measured and not yet fixed:
   that do return it, PP4 and Qwen TP1, are also TP=1 — so the predicate is left
   as measured rather than guessed at.
 - **The block count is not perfectly deterministic.** On Qwen at
-  `--gpu-memory-utilization 0.9`, 1 run in 3 retained an extra 1490 MiB arena per
-  chiplet and landed at 1.043x of the requested budget.
+  `--gpu-memory-utilization 0.9`, 1 run in 3 measured an extra 1490 MiB per chiplet
+  and landed at 1.043x of the requested budget. Whether that is a retained arena or
+  the measurement artifact below is not settled.
+
+## Measuring per-chiplet residency
+
+The figures above come from summing the runtime's allocation log lines per
+`(buffer id, address)`. Frees are not logged, so the sum is an upper bound, and on
+a card other tenants are churning it overstates: the outgoing compile-time cache
+stops landing at addresses the replacement reuses, so it is counted twice.
+Measured, that inflation is exactly the cache's own size — 1152 MiB on Qwen
+(8 blocks x 36 growth regions x 4 MiB), which moved one configuration's binding
+chiplet from 31.41 GiB to 32.53 GiB with no change in code, block count or
+compiler. **Take per-chiplet figures on idle cards**, and treat a residency
+argument on a shared card as an upper bound rather than a measurement.
