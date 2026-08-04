@@ -612,7 +612,7 @@ class RBLNWorker(WorkerBase):
 
         self._kv_blocks_before_shrink = kv_cache_config.num_blocks
         logger.info(
-            "[Dynamic KV] compiling with a %d-block KV cache instead of %d "
+            "[Dynamic KV] compiling with %d KV blocks instead of %d "
             "(%s); the cache is resized after warm-up from the compiled "
             "profile. On tensor_parallel_size>=2 these %d blocks are not "
             "returned and are charged against the per-chiplet budget.",
