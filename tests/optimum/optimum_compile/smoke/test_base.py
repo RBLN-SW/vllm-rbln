@@ -110,6 +110,9 @@ class SmokeBase:
         NUM_DEVICES = 1  # -> VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK
         LLM_KWARGS: dict = {}  # block_size / max_model_len / max_num_seqs / runner ...
         # -------------------------------------------------------------------
+        # Populated in setUpClass (declared here so mypy sees them).
+        llm: Any = None
+        model_path: str = ""
 
         @classmethod
         def setUpClass(cls) -> None:
