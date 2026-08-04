@@ -57,12 +57,10 @@ jobs:
     name: Pytest (${{ matrix.test_type.name }})
     runs-on: ${{ matrix.test_type.runner }}
     env:
-      # Authenticate HF Hub requests so rate limits apply per-account
-      # instead of per-IP (self-hosted runners share one egress IP).
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
-      # Shared HF cache mount so models are downloaded once across runners
-      # (inherited by the vllm serve subprocesses RemoteOpenAIServer spawns).
       HF_HOME: ${{ secrets.HF_HOME }}
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
     strategy:
       fail-fast: ${{ inputs.fail_fast }}
       matrix:
@@ -201,12 +199,10 @@ jobs:
       run:
         shell: bash
     env:
-      # Authenticate HF Hub requests so rate limits apply per-account
-      # instead of per-IP (self-hosted runners share one egress IP).
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
-      # Shared HF cache mount so models are downloaded once across runners
-      # (inherited by the vllm serve subprocesses RemoteOpenAIServer spawns).
       HF_HOME: ${{ secrets.HF_HOME }}
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
     strategy:
       fail-fast: ${{ inputs.fail_fast }}
       matrix:
