@@ -190,7 +190,7 @@ jobs:
               uv run --no-sync pytest tests/optimum/v1/worker/test_rebel_optimum_model_runner.py -vv --durations 0
               ;;
             "optimum_compile")
-              uv run --no-sync pytest tests/optimum_compile/converter -vv --durations 0
+              uv run --no-sync pytest tests/optimum/optimum_compile/converter -vv --durations 0
               ;;
           esac
 

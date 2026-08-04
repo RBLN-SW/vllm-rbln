@@ -72,6 +72,7 @@ _ASSET_IMAGE = os.path.join(
     "..",
     "..",
     "..",
+    "..",
     "assets",
     "vllm-rbln-white.png",
 )

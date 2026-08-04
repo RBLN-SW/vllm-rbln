@@ -132,7 +132,7 @@ jobs:
 
       - name: Run optimum smoke tests (RSD 1)
         run: >
-          uv run --no-sync pytest tests/optimum_compile/smoke/test_rsd1.py
+          uv run --no-sync pytest tests/optimum/optimum_compile/smoke/test_rsd1.py
           -v --durations 0
 
   # ===========================================================================
@@ -214,7 +214,7 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: >
-          uv run --no-sync pytest tests/optimum_compile/smoke/test_rsd4.py
+          uv run --no-sync pytest tests/optimum/optimum_compile/smoke/test_rsd4.py
           -v --durations 0
 
   # ===========================================================================
@@ -296,5 +296,5 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: >
-          uv run --no-sync pytest tests/optimum_compile/smoke/test_rsd8.py
+          uv run --no-sync pytest tests/optimum/optimum_compile/smoke/test_rsd8.py
           -v --durations 0
