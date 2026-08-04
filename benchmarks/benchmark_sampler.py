@@ -131,7 +131,6 @@ def run_benchmark(
 ):
     torch._dynamo.config.recompile_limit = len(WARM_UP_CONFIGS)
     sampler = RBLNSampler()
-    sampler = torch.compile(sampler, dynamic=False, fullgraph=False)
     performance_ctx = _PerformanceContext("SAMPLER")
 
     logits = _create_logits(batch_size, vocab_size)
