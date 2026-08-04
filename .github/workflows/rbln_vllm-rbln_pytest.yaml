@@ -184,13 +184,13 @@ jobs:
         run: |
           case "${{ matrix.test_type.name }}" in
             "core")
-              uv run --no-sync pytest tests/v1/core -vv --durations 0
+              uv run --no-sync pytest tests/optimum/v1/core -vv --durations 0
               ;;
             "worker")
-              uv run --no-sync pytest tests/v1/worker/test_rebel_optimum_model_runner.py -vv --durations 0
+              uv run --no-sync pytest tests/optimum/v1/worker/test_rebel_optimum_model_runner.py -vv --durations 0
               ;;
             "optimum_compile")
-              uv run --no-sync pytest tests/optimum_compile -vv --durations 0
+              uv run --no-sync pytest tests/optimum/optimum_compile -vv --durations 0
               ;;
           esac
 
@@ -350,18 +350,18 @@ jobs:
         run: |
           case "${{ matrix.test_type.name }}" in
             "openai")
-              uv run --no-sync pytest tests/entrypoints/openai -vv --durations 0 --timeout=600
+              uv run --no-sync pytest tests/optimum/entrypoints/openai -vv --durations 0 --timeout=600
               ;;
             "llm")
-              uv run --no-sync pytest tests/entrypoints/llm -vv --durations 0
+              uv run --no-sync pytest tests/optimum/entrypoints/llm -vv --durations 0
               ;;
             "sampler")
-              uv run --no-sync pytest -n 8 -k "warm_up_true" tests/v1/worker/test_sampler.py -vv --durations 0
-              uv run --no-sync pytest -n 8 -k "warm_up_false" tests/v1/worker/test_sampler.py -vv --durations 0
-              uv run --no-sync pytest -n 8 -k "not warm_up_true and not warm_up_false" tests/v1/worker/test_sampler.py -vv --durations 0
+              uv run --no-sync pytest -n 8 -k "warm_up_true" tests/optimum/v1/worker/test_sampler.py -vv --durations 0
+              uv run --no-sync pytest -n 8 -k "warm_up_false" tests/optimum/v1/worker/test_sampler.py -vv --durations 0
+              uv run --no-sync pytest -n 8 -k "not warm_up_true and not warm_up_false" tests/optimum/v1/worker/test_sampler.py -vv --durations 0
               ;;
             "models")
-              uv run --no-sync pytest tests/v1/models -vv --durations 0
+              uv run --no-sync pytest tests/optimum/v1/models -vv --durations 0
               ;;
           esac
 
