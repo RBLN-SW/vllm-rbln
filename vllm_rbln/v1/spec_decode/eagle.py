@@ -62,8 +62,6 @@ class RBLNEagleProposer(EagleProposer):
 
         self.runner = runner
         self.arange_cpu = torch.arange(self.arange.shape[0], dtype=torch.int32)
-        # Set in load_model when eagle3 + compilation are both on.
-        self._compiled_combine = None
 
     @staticmethod
     def _mirror_seq_lens_to_host(
@@ -127,7 +125,12 @@ class RBLNEagleProposer(EagleProposer):
             assert isinstance(
                 self.model, (Eagle3LlamaForCausalLM, Eagle3DeepseekV2ForCausalLM)
             )
-            target_hidden_states = self._combine_hidden_states(target_hidden_states)
+            # Eager on purpose, and only fast with TORCH_RBLN_DEPLOY=ON: the
+            # non-deploy NaN/Inf scan walks this 56.6 MB weight on every call.
+            # See the commit message for the numbers.
+            target_hidden_states = self.model.combine_hidden_states(
+                target_hidden_states
+            )
             assert target_hidden_states.shape[-1] == self.hidden_size
 
         num_tokens, token_indices_to_sample = self.set_inputs_first_pass(
@@ -452,54 +455,6 @@ class RBLNEagleProposer(EagleProposer):
                 guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
                 mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
             )
-            # Separate graph for the aux-state projection, which runs outside
-            # `model_wrapper` (propose() calls it before the drafter's own
-            # inputs exist). See `_combine_hidden_states` for why it matters:
-            # eager it is the largest non-forward item in the step.
-            if self.method == "eagle3":
-                self._compiled_combine = compile(
-                    self.model.combine_hidden_states,
-                    dynamic=False,
-                    compile_context=self.runner.compile_context,
-                    num_devices=envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
-                    model_trace_method="export" if USE_DEVICE_TENSOR else "",
-                    process_group_dict=build_process_group_dict(),
-                    guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
-                    mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
-                )
-
-    def _combine_hidden_states(
-        self, target_hidden_states: torch.Tensor
-    ) -> torch.Tensor:
-        """EAGLE3's aux-state projection, compiled when the shape is a bucket.
-
-        Eager, this single `Linear(num_aux * target_hidden -> hidden)` was the
-        largest non-forward item in a step (19.6 ms/step under
-        RBLN_RUNTIME_FORCE_SYNC=1). It is not compute: standalone it costs the
-        same for 4 and for 16 tokens and scales with the WEIGHT size (56.6 MB
-        -> 7.5 ms, 18.9 MB -> 2.5 ms, ~7.5 GB/s both), i.e. the weight is
-        materialised on every call. Compiled, it stays device-resident.
-
-        Decode has a single shape once the token count is padded to the batch
-        bucket, so the graph compiles once. Prefill token counts are unbounded;
-        those stay eager rather than risk one recompile per shape.
-        """
-        combine = self._compiled_combine
-        if combine is None or self.runner.is_prefill:
-            return self.model.combine_hidden_states(target_hidden_states)
-
-        num_tokens = target_hidden_states.shape[0]
-        num_reqs_padded = self.runner.bucketing_manager.find_decode_batch_bucket(
-            self.runner.input_batch.num_reqs
-        )
-        padded = num_reqs_padded * (1 + self.num_speculative_tokens)
-        if num_tokens > padded:
-            # Shape outside the bucket we compiled for -- do not trigger a
-            # recompile just to save a few ms.
-            return self.model.combine_hidden_states(target_hidden_states)
-
-        out = combine(pad(target_hidden_states, 0, padded))
-        return out[:num_tokens] if num_tokens < padded else out
 
     def _build_dummy_attn_metadata(
         self,
@@ -531,42 +486,6 @@ class RBLNEagleProposer(EagleProposer):
             causal=True,
         )
 
-    @torch.inference_mode()
-    def _warmup_combine(self, num_reqs_padded: int, is_prefill: bool) -> None:
-        """Materialise the aux-projection graph for this decode bucket.
-
-        `dummy_run` walks every decode bucket at startup, but it does not go
-        through `_combine_hidden_states`, so without this the graph compiles on
-        the first REAL request of each bucket and that request pays for it.
-
-        Calls the compiled callable directly rather than `_combine_hidden_states`:
-        that method sizes the bucket from `self.runner.input_batch.num_reqs`,
-        which is not meaningful during warm-up.
-
-        Best effort -- warm-up must not be able to break start-up, and the only
-        cost of failing here is the lazy compile we were trying to avoid.
-        """
-        if is_prefill or self._compiled_combine is None:
-            return
-        inner = getattr(self.model, "model", None)
-        fc_in = getattr(inner, "fc_input_size", None)
-        if fc_in is None or not getattr(inner, "use_aux_hidden_state", False):
-            return
-        padded = num_reqs_padded * (1 + self.num_speculative_tokens)
-        fc = getattr(inner, "fc", None)
-        dtype = getattr(getattr(fc, "weight", None), "dtype", self.hidden_states.dtype)
-        try:
-            self._compiled_combine(
-                torch.zeros((padded, fc_in), dtype=dtype, device=self.device)
-            )
-        except Exception:
-            logger.warning(
-                "EAGLE3 aux-projection warm-up failed for bucket %d; it will "
-                "compile on the first request of this shape",
-                num_reqs_padded,
-                exc_info=True,
-            )
-
     def dummy_run(
         self,
         num_reqs: int,
@@ -586,8 +505,6 @@ class RBLNEagleProposer(EagleProposer):
             self._determine_draft_batch_padding(num_reqs, num_tokens, is_prefill)
         )
         num_padded_tokens = override_padded or dp_padded
-
-        self._warmup_combine(num_reqs_padded, is_prefill)
 
         per_layer_attn_metadata: dict[str, object] = {}
         for attn_group in self.draft_attn_groups:
