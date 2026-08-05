@@ -22,16 +22,29 @@ instead of the waterfall that every other layer of the stack renders as nested
 spans (gateway → sidecar → vLLM).
 
 This patch keeps every upstream attribute and additionally emits the three
-phases as child spans:
+phases as child spans, laid end-to-end from the request's wall-clock arrival:
 
-    llm_request (SERVER)   [arrival_time      → iteration_timestamp]
-    ├─ queue               [queued_ts         → scheduled_ts]
-    ├─ prefill             [scheduled_ts      → first_token_ts]
-    └─ decode              [first_token_ts    → last_token_ts]
+    llm_request (SERVER)   [arrival_time → iteration_timestamp]
+    ├─ queue               (scheduled_ts - queued_ts)
+    ├─ prefill             (first_token_ts - scheduled_ts)
+    └─ decode              (last_token_ts - first_token_ts)
 
-No new accounting is introduced — ``RequestStateStats`` already carries the
-absolute timestamps for every boundary, and upstream computes the same
-durations from them one line above. We only draw what is already measured.
+No new accounting is introduced — ``RequestStateStats`` already carries every
+boundary and upstream computes the same durations from them one line above. We
+only draw what is already measured.
+
+## The two clocks
+
+``arrival_time`` is wall-clock; ``queued_ts`` / ``scheduled_ts`` /
+``first_token_ts`` / ``last_token_ts`` are **monotonic** (engine core). Upstream
+only ever subtracts the monotonic ones, which is valid. Passing one to a span as
+an absolute start time is *not* — the span would land at monotonic-origin time,
+decades from the request. So phase *durations* come from the monotonic fields
+and their *position* is laid out from the single wall-clock anchor.
+
+A consequence: the frontend→engine handoff (``arrival_time`` → ``queued_ts``)
+cannot be sized across the clock split, so it is absorbed into the start of the
+first phase rather than drawn as a gap we cannot measure.
 
 ## Why the whole method is replaced
 
@@ -73,8 +86,15 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-#: Child spans are drawn from these boundaries. ``(name, start_attr, end_attr)``
-#: where the attrs are absolute epoch seconds on ``RequestStateStats``.
+#: Phase boundaries as ``(name, start_attr, end_attr)`` on ``RequestStateStats``.
+#:
+#: ⚠️ These four fields are **monotonic** (engine core clock), while
+#: ``arrival_time`` is wall-clock — the dataclass says so explicitly and
+#: ``queued_ts`` is filled from ``time.monotonic()`` events. Upstream only ever
+#: subtracts them, which is valid across the two clocks; handing a monotonic
+#: value to a span as an absolute timestamp is not (it would place the span
+#: decades away from the request). So the durations are taken from these fields
+#: and the *position* comes from the one wall-clock anchor we have.
 _PHASES: tuple[tuple[str, str, str], ...] = (
     ("queue", "queued_ts", "scheduled_ts"),
     ("prefill", "scheduled_ts", "first_token_ts"),
@@ -84,6 +104,30 @@ _PHASES: tuple[tuple[str, str, str], ...] = (
 
 def _to_ns(seconds: float) -> int:
     return int(seconds * 1e9)
+
+
+def _served_model_name() -> str | None:
+    """Served model name, or ``None`` when it cannot be determined.
+
+    ``served_model_name`` is what the client asked for and may be a list when
+    several aliases are served; the first entry is the canonical one. Falls back
+    to the model path.
+    """
+    try:
+        from vllm.config import get_current_vllm_config_or_none
+
+        config = get_current_vllm_config_or_none()
+    except Exception:  # noqa: BLE001 - never let attribute lookup break tracing
+        return None
+    if config is None:
+        return None
+    model_config = getattr(config, "model_config", None)
+    if model_config is None:
+        return None
+    served = getattr(model_config, "served_model_name", None)
+    if isinstance(served, list):
+        served = served[0] if served else None
+    return served or getattr(model_config, "model", None)
 
 
 @register_patch(
@@ -146,6 +190,20 @@ def patched_do_tracing(
         attributes[SpanAttributes.GEN_AI_REQUEST_TEMPERATURE] = req_state.temperature
     if req_state.n:
         attributes[SpanAttributes.GEN_AI_REQUEST_N] = req_state.n
+    # n>1 요청은 자식으로 갈라지므로 "실제 몇 개가 생성됐나" 는 요청 n 과 다를 수
+    # 있다. parent 가 있을 때만 그 수를 싣는다 — 없으면 sequence 는 1개다.
+    parent_req = req_state.parent_req
+    if parent_req is not None:
+        child_requests = getattr(parent_req, "child_requests", None)
+        if child_requests is not None:
+            attributes[SpanAttributes.GEN_AI_USAGE_NUM_SEQUENCES] = len(child_requests)
+
+    # OutputProcessor 는 vllm_config 를 들고 있지 않다. `_or_none` 변형을 쓰는 이유는
+    # config context 밖에서 호출되면 예외가 아니라 None 이 와야 하기 때문이다 —
+    # 모델명을 못 얻는 것이 trace 를 잃을 이유는 아니다.
+    model_name = _served_model_name()
+    if model_name:
+        attributes[SpanAttributes.GEN_AI_RESPONSE_MODEL] = model_name
 
     request_span = _start_request_span(
         start_time=arrival_time_ns,
@@ -165,7 +223,7 @@ def patched_do_tracing(
         return
 
     try:
-        _emit_phase_spans(request_span, metrics)
+        _emit_phase_spans(request_span, metrics, arrival_time_ns)
     finally:
         request_span.end(end_time=_to_ns(iteration_stats.iteration_timestamp))
 
@@ -197,12 +255,21 @@ def _start_request_span(
     return span
 
 
-def _emit_phase_spans(request_span: Any, metrics: Any) -> None:
+def _emit_phase_spans(request_span: Any, metrics: Any, anchor_ns: int) -> None:
     """Draw queue/prefill/decode under ``request_span``.
 
-    A phase whose boundaries are missing or non-advancing is skipped rather
-    than drawn as a zero/negative-width span — a request that finished during
-    prefill has no decode phase, and inventing one would misreport it.
+    ``anchor_ns`` is the wall-clock start of the request. Phase *durations* come
+    from the monotonic engine-core timestamps (differences are valid across the
+    clock split) and are laid end-to-end from the anchor, so the children sit
+    inside the parent instead of at a monotonic-clock absolute time.
+
+    The frontend→engine handoff (arrival_time → queued_ts) is not measurable
+    across the two clocks, so it is absorbed into the start of the first phase
+    rather than reported as a gap we cannot size.
+
+    A phase whose boundaries are missing or non-advancing is skipped rather than
+    drawn as a zero/negative-width span — a request that finished during prefill
+    has no decode phase, and inventing one would misreport it.
     """
     try:
         from opentelemetry import trace as otel_trace
@@ -211,14 +278,17 @@ def _emit_phase_spans(request_span: Any, metrics: Any) -> None:
     except ImportError:  # pragma: no cover - guarded by _start_request_span
         return
 
+    cursor_ns = anchor_ns
     for name, start_attr, end_attr in _PHASES:
         start = getattr(metrics, start_attr, None)
         end = getattr(metrics, end_attr, None)
         if start is None or end is None or end <= start:
             continue
+        duration_ns = _to_ns(end - start)
         instrument_manual(
             span_name=name,
-            start_time=_to_ns(start),
-            end_time=_to_ns(end),
+            start_time=cursor_ns,
+            end_time=cursor_ns + duration_ns,
             context=parent_context,
         )
+        cursor_ns += duration_ns
