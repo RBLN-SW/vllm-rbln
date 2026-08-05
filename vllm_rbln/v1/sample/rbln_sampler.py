@@ -378,6 +378,9 @@ class RBLNSampler(VLLMSampler):
         return LogprobsTensors(indices, logprobs, token_ranks)
 
 
+# NOTE: `max_num_logprobs` is honored only by benchmarks/benchmark_sampler.py.
+# Both model runners build their dummy metadata with `max_num_logprobs=None`,
+# so warm-up never compiles the logprobs path.
 WARM_UP_CONFIGS: list[dict[str, Any]] = [
     {
         "name": "no_penalty_greedy",
@@ -385,6 +388,24 @@ WARM_UP_CONFIGS: list[dict[str, Any]] = [
         "all_greedy": True,
         "all_random": False,
         "temperature": 0.0,
+    },
+    {
+        "name": "no_penalty_greedy_logprobs",
+        "no_penalties": True,
+        "all_greedy": True,
+        "all_random": False,
+        "temperature": 0.0,
+        "max_num_logprobs": 5,
+    },
+    {
+        # Mixed batch: greedy requests ride the random path with a small
+        # temperature, so `apply_temperature` also runs its `torch.where` clamp.
+        # The all-random counterpart is `no_penalty_random`.
+        "name": "no_penalty_temperature_only",
+        "no_penalties": True,
+        "all_greedy": False,
+        "all_random": False,
+        "temperature": 0.5,
     },
     {
         "name": "no_penalty_random",

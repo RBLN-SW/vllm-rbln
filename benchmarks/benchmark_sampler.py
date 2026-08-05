@@ -103,7 +103,7 @@ def _create_sampling_metadata_from_config(
         top_p=top_p,
         top_k=top_k,
         generators={},
-        max_num_logprobs=None,
+        max_num_logprobs=config.get("max_num_logprobs"),
         prompt_token_ids=prompt_tokens_tensor,
         output_token_ids=output_token_ids,
         spec_token_ids=[[] for _ in range(batch_size)],
