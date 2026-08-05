@@ -1,171 +1,53 @@
-# vllm-rbln PR CI on Obedients (Buildkite).
+# vllm-rbln PR pre-test gate (Obedients / Buildkite).
 #
-# Triggered from GitHub Actions (the rbln_trigger_* chain POSTs a build to the
-# Obedients create-build API on every PR) and replaces the GHA self-hosted
-# pytest jobs. On Obedients the shared HF cache mount
-# (/mnt/shared_data/.cache/huggingface) is writable and the devtools container
-# is provided, so none of the GHA HF_HOME permission / offline workarounds are
-# needed -- cf. rebel_compiler .buildkite/pipelines/vllm-ci-v2.
+# The Obedients bootstrap step uploads THIS file. It runs the two cheap gates --
+# the team-member policy check and pre-commit lint -- in parallel, and only if
+# BOTH pass does it upload the heavy test pipeline (run-pytest.yml). So the NPU /
+# pytest steps never start for an untrusted author or a lint failure.
 #
-# Each step builds its own uv env at job start (uv sync from the lock); the uv
-# download cache is carried across jobs by the shared /mnt/uv_cache mount.
-#
-# NPU reservation uses the top-level `npu:` key (an Obedients extension), NOT a
-# queue named "npu". Counts mirror the old GHA runner classes
-# (ca22-1/4/8 -> 1/4/8). CPU-only suites run on the `udc` queue with no NPU.
-notify:
-  - github_commit_status:
-      context: "[OB] vllm-rbln PR CI"
-
+# (Forked-PR builds are disabled on this pipeline, so uploading repo-defined
+# steps is safe -- same-repo PRs are trusted. That setting is the real fork
+# boundary; the team-member step is a policy narrowing to the sw/fsw teams.)
 env:
   UV_CACHE_DIR: "/mnt/uv_cache"
   UV_LINK_MODE: "symlink"
   UV_INDEX_STRATEGY: "unsafe-best-match"
-  HF_HOME: "/mnt/shared_data/.cache/huggingface"
-  NUM_INPUT_PROMPT: "1"
-  VLLM_LOGGING_LEVEL: "DEBUG"
 
-# LHS = env var exposed to the job; RHS = Obedients vault secret name (mirrors
-# the GHA repo-secret names our `uv sync` reads).
-_secrets: &secrets
+# uv index creds for the pre-commit env (LHS = job env var, RHS = OB vault name).
+_uv_secrets: &uv_secrets
   UV_INDEX_RBLN_NEXUS_NIGHTLY_USERNAME: MGMT_NEXUS_USERNAME
   UV_INDEX_RBLN_NEXUS_NIGHTLY_PASSWORD: MGMT_NEXUS_PASSWORD
   UV_INDEX_REBELLIONS_USERNAME: REBEL_SW_DEV_USERNAME
   UV_INDEX_REBELLIONS_PASSWORD: REBEL_SW_DEV_PASSWORD
-  HF_TOKEN: HF_TOKEN
-
-# One `uv sync` per job. --no-sync on the pytest calls so uv never re-syncs and
-# prunes the env. Literal .venv is created here and reused by the later lines.
-_sync: &sync "uv sync --locked --python 3.12 --extra test --extra dev --extra runtime"
 
 steps:
-  # ===========================================================================
-  # CPU suites (no NPU) -> udc queue.
-  # ===========================================================================
-  - label: ":pytest: core"
+  - label: ":closed_lock_with_key: team-member gate"
     image: "${DEVTOOLS_DOCKER_IMAGE}"
-    resources: &cpu-only-resources
+    resources: &light-cpu
       cpu:
-        requests: "4"
-        limits: "4"
+        requests: "2"
+        limits: "2"
       memory:
-        requests: "32Gi"
-        limits: "32Gi"
-    secrets: *secrets
+        requests: "8Gi"
+        limits: "8Gi"
+    secrets:
+      - GIT_PAT
     command:
-      - *sync
-      - "uv run --no-sync pytest tests/optimum/v1/core -vv --durations 0"
+      - "bash .buildkite/scripts/gate-team-member.sh"
 
-  - label: ":pytest: worker"
-    image: "${DEVTOOLS_DOCKER_IMAGE}"
-    resources: *cpu-only-resources
-    secrets: *secrets
-    command:
-      - *sync
-      - "uv run --no-sync pytest tests/optimum/v1/worker/test_rebel_optimum_model_runner.py -vv --durations 0"
-
-  - label: ":pytest: optimum_compile (converter)"
-    image: "${DEVTOOLS_DOCKER_IMAGE}"
-    resources: *cpu-only-resources
-    secrets: *secrets
-    command:
-      - *sync
-      - "uv run --no-sync pytest tests/optimum/optimum_compile/converter -vv --durations 0"
-
-  # Lint/format gate (moved off GHA check-code-quality). No project `uv sync`:
-  # pre-commit hooks install their own envs. Mirrors pre-commit.yml's
-  # `--all-files --hook-stage manual`.
   - label: ":lint: pre-commit"
     image: "${DEVTOOLS_DOCKER_IMAGE}"
-    resources: *cpu-only-resources
-    secrets: *secrets
+    resources: *light-cpu
+    secrets: *uv_secrets
     command:
       - "uv tool run pre-commit run --all-files --hook-stage manual --show-diff-on-failure"
 
-  # ===========================================================================
-  # NPU suites -> k8s queue (inherited) + npu reservation.
-  # ===========================================================================
-  - label: ":pytest: openai"
-    image: "${DEVTOOLS_DOCKER_IMAGE}"
-    resources:
-      npu:
-        count: 1
-        product: ["RBLN-CA22", "RBLN-CA25"]
-    secrets: *secrets
-    command:
-      - *sync
-      - "uv run --no-sync pytest tests/optimum/entrypoints/openai -vv --durations 0 --timeout=600"
+  # Both gates must pass before the heavy test pipeline is even uploaded.
+  - wait: ~
 
-  - label: ":pytest: llm"
-    image: "${DEVTOOLS_DOCKER_IMAGE}"
-    resources:
-      npu:
-        count: 1
-        product: ["RBLN-CA22", "RBLN-CA25"]
-    secrets: *secrets
-    command:
-      - *sync
-      - "uv run --no-sync pytest tests/optimum/entrypoints/llm -vv --durations 0"
-
-  - label: ":pytest: models"
-    image: "${DEVTOOLS_DOCKER_IMAGE}"
-    resources:
-      npu:
-        count: 1
-        product: ["RBLN-CA22", "RBLN-CA25"]
-    secrets: *secrets
-    command:
-      - *sync
-      - "uv run --no-sync pytest tests/optimum/v1/models -vv --durations 0"
-
-  - label: ":pytest: sampler"
-    image: "${DEVTOOLS_DOCKER_IMAGE}"
-    resources:
-      npu:
-        count: 8
-        product: ["RBLN-CA22", "RBLN-CA25"]
-    secrets: *secrets
-    command:
-      - *sync
-      - 'uv run --no-sync pytest -n 8 -k "warm_up_true" tests/optimum/v1/worker/test_sampler.py -vv --durations 0'
-      - 'uv run --no-sync pytest -n 8 -k "warm_up_false" tests/optimum/v1/worker/test_sampler.py -vv --durations 0'
-      - 'uv run --no-sync pytest -n 8 -k "not warm_up_true and not warm_up_false" tests/optimum/v1/worker/test_sampler.py -vv --durations 0'
-
-  # ===========================================================================
-  # Optimum smoke suites -> NPU by RSD class (self-compiling; VLLM_RBLN_SAMPLER=0).
-  # ===========================================================================
-  - label: ":pytest: vllm-rbln compile smoke rsd-1"
-    image: "${DEVTOOLS_DOCKER_IMAGE}"
-    resources:
-      npu:
-        count: 1
-        product: ["RBLN-CA22", "RBLN-CA25"]
-    env: { VLLM_RBLN_SAMPLER: "0" }
-    secrets: *secrets
-    command:
-      - *sync
-      - "uv run --no-sync pytest tests/optimum/optimum_compile/smoke/test_rsd1.py -v --durations 0"
-
-  - label: ":pytest: vllm-rbln compile smoke rsd-4"
-    image: "${DEVTOOLS_DOCKER_IMAGE}"
-    resources:
-      npu:
-        count: 4
-        product: ["RBLN-CA22", "RBLN-CA25"]
-    env: { VLLM_RBLN_SAMPLER: "0" }
-    secrets: *secrets
-    command:
-      - *sync
-      - "uv run --no-sync pytest tests/optimum/optimum_compile/smoke/test_rsd4.py -v --durations 0"
-
-  - label: ":pytest: vllm-rbln compile smoke rsd-8"
-    image: "${DEVTOOLS_DOCKER_IMAGE}"
-    resources:
-      npu:
-        count: 8
-        product: ["RBLN-CA22", "RBLN-CA25"]
-    env: { VLLM_RBLN_SAMPLER: "0" }
-    secrets: *secrets
-    command:
-      - *sync
-      - "uv run --no-sync pytest tests/optimum/optimum_compile/smoke/test_rsd8.py -v --durations 0"
+  - label: ":pipeline: vllm-rbln PR CI"
+    command: "buildkite-agent pipeline upload .buildkite/pipelines/pr/run-pytest.yml"
+    plugins:
+      - sparse-checkout#v1.6.0:
+          paths:
+            - .buildkite
