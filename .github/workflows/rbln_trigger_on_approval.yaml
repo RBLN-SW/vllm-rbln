@@ -5,9 +5,6 @@ on:
     types: [submitted]
 
 jobs:
-  # Lightweight packaging check: build the wheel only when a review APPROVES a
-  # PR into dev. The real tests run on Obedients (triggered on push); this just
-  # fails fast if packaging is broken. Not consumed anywhere, so not uploaded.
   build-vllm-rbln-wheel:
     name: Build vllm-rbln wheel (packaging check)
     if: ${{ github.event.review.state == 'approved' && github.event.pull_request.base.ref == 'dev' }}
