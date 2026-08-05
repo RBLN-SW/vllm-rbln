@@ -74,16 +74,24 @@ _RUNTIME_ENV_DROP = frozenset(
         "VLLM_RBLN_DISABLE_OFFLOAD",
         "VLLM_RBLN_NIXL_SWA_VIEW_OPT",
         "VLLM_RBLN_COMPILE_ONLY",
+        # Sampler graphs are compiled with use_cache=False (#798), so they never
+        # enter the bundle and this flag cannot change its contents. Model graphs
+        # compile before the sampler in warmup, so their keys are unaffected too.
+        "VLLM_RBLN_SAMPLER",
     }
 )
 
 
 def _compile_env_factors() -> str:
     """vLLM's worker-aligned compile env hash (rbln vars are merged into that
-    registry via rbln_envs; per-worker and runtime-only vars are dropped so all
-    ranks share one signature)."""
+    registry by importing vllm_rbln.envs; per-worker and runtime-only vars are
+    dropped so all ranks share one signature)."""
     import vllm.envs as vllm_envs
     from vllm.config.utils import hash_factors
+
+    # Import for the side effect: vllm_rbln.envs merges VLLM_RBLN_* into vLLM's
+    # environment_variables registry, which is what compile_factors() walks.
+    import vllm_rbln.envs  # noqa: F401
 
     factors = vllm_envs.compile_factors()
     for name in _PER_WORKER_ENV_DROP | _RUNTIME_ENV_DROP:

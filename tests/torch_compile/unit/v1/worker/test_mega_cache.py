@@ -175,13 +175,24 @@ class TestCompileEnvFactors:
         assert d0 == d7
 
     def test_compile_relevant_env_invalidates(self, monkeypatch):
-        import vllm_rbln.rbln_envs  # noqa: F401  (merges rbln vars into vLLM registry)
+        import vllm_rbln.envs  # noqa: F401  (merges rbln vars into vLLM registry)
 
         monkeypatch.setenv("VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY", "exponential")
         a = mega_cache._compile_env_factors()
         monkeypatch.setenv("VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY", "linear")
         b = mega_cache._compile_env_factors()
         assert a != b
+
+    def test_sampler_flag_invariant(self, monkeypatch):
+        # Sampler graphs are compiled with use_cache=False, so they never enter
+        # the bundle — toggling the flag must not discard a valid model bundle.
+        import vllm_rbln.envs  # noqa: F401
+
+        monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1")
+        on = mega_cache._compile_env_factors()
+        monkeypatch.setenv("VLLM_RBLN_SAMPLER", "0")
+        off = mega_cache._compile_env_factors()
+        assert on == off
 
 
 class TestConfigSignatureRealEnv:
@@ -199,7 +210,7 @@ class TestConfigSignatureRealEnv:
         assert s0 == s7
 
     def test_decode_bucket_strategy_invalidates(self, monkeypatch):
-        import vllm_rbln.rbln_envs  # noqa: F401
+        import vllm_rbln.envs  # noqa: F401
 
         monkeypatch.setattr(mega_cache, "_rebel_major_minor", lambda: "0.11")
         monkeypatch.setenv("VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY", "exponential")
@@ -209,7 +220,7 @@ class TestConfigSignatureRealEnv:
         assert exp != lin
 
     def test_same_strategy_same_signature(self, monkeypatch):
-        import vllm_rbln.rbln_envs  # noqa: F401
+        import vllm_rbln.envs  # noqa: F401
 
         monkeypatch.setattr(mega_cache, "_rebel_major_minor", lambda: "0.11")
         monkeypatch.setenv("VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY", "linear")
@@ -218,7 +229,7 @@ class TestConfigSignatureRealEnv:
         assert a == b
 
     def test_manual_buckets_invalidates(self, monkeypatch):
-        import vllm_rbln.rbln_envs  # noqa: F401
+        import vllm_rbln.envs  # noqa: F401
 
         monkeypatch.setattr(mega_cache, "_rebel_major_minor", lambda: "0.11")
         monkeypatch.setenv("VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY", "manual")
