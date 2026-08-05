@@ -47,6 +47,7 @@ from vllm.v1.kv_cache_interface import (
 
 import vllm_rbln.envs as envs
 from vllm_rbln.logger import init_logger
+from vllm_rbln.utils.tracing import traced_remote_fetch
 
 if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -663,3 +664,11 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
             group_arr = np.asarray(group)[None, :]
             all_descs.append((region_ids * num_blocks + group_arr + offset).flatten())
         return np.concatenate(all_descs) if all_descs else np.empty(0, dtype=int)
+
+    # ── tracing ────────────────────────────────────────────────────────────
+    # start_load_kv issues the reads for every request scheduled in the step, so
+    # the step-level nixl.kv_transfer span cannot say which request's transfer
+    # was slow. This thin override exists only to name the per-request read.
+    @traced_remote_fetch
+    def _read_blocks_for_req(self, req_id: str, meta) -> None:
+        return super()._read_blocks_for_req(req_id, meta)

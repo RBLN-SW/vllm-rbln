@@ -44,10 +44,11 @@ from vllm.model_executor.models.interfaces_base import (
 from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
-from vllm.tracing import instrument
+from vllm.tracing import SpanAttributes, instrument
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.utils.math_utils import cdiv
-from vllm.utils.torch_utils import PIN_MEMORY, kv_cache_dtype_str_to_dtype
+from vllm.utils.platform_utils import is_pin_memory_available
+from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionMetadata,
@@ -84,7 +85,7 @@ from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
-from vllm.v1.utils import record_function_or_nullcontext
+from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.kv_connector_model_runner_mixin import (
     KVConnectorModelRunnerMixin,
@@ -108,6 +109,7 @@ from vllm_rbln.compilation import (
 from vllm_rbln.forward_context import RBLNDPMetadata, set_forward_context
 from vllm_rbln.logger import init_logger
 from vllm_rbln.platform import HAS_TORCH_RBLN, USE_DEVICE_TENSOR
+from vllm_rbln.utils.tracing import instrument_with_latency, traced_callable
 from vllm_rbln.v1.attention.backends.flash_attention import (
     RBLNFlashAttentionMetadataBuilder,
 )
@@ -120,6 +122,11 @@ from vllm_rbln.v1.attention.kv_cache_bindings import (
 )
 from vllm_rbln.v1.core.rbln_kv_cache_manager import KVCacheCopyOp
 from vllm_rbln.v1.core.rbln_scheduler import RBLNSchedulerOutput
+from vllm_rbln.v1.core.utils import (
+    decode_batch_size,
+    num_base_tokens,
+    resolve_propagated_token_write,
+)
 from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
@@ -210,6 +217,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self.parallel_config = vllm_config.parallel_config
         self.scheduler_config = vllm_config.scheduler_config
         self.speculative_config = vllm_config.speculative_config
+
+        # Step-level prefill/decode phase, stamped from RBLNSchedulerOutput at
+        # the top of execute_model (see is_prefill_phase()). Scheduler-authored
+        # so it is identical across PP ranks.
+        self._is_prefill_step: bool = False
         # self.observability_config = vllm_config.observability_config
 
         model_config = self.model_config
@@ -217,6 +229,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         scheduler_config = self.scheduler_config
         parallel_config = self.parallel_config
         self.device = device
+        self.pin_memory = is_pin_memory_available()
         self.dtype = model_config.dtype
 
         self.kv_cache_dtype = kv_cache_dtype_str_to_dtype(
@@ -336,6 +349,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             max_model_len=self.max_model_len,
             max_num_batched_tokens=self.max_num_tokens,
             device=self.device,
+            pin_memory=self.pin_memory,
             vocab_size=model_config.get_vocab_size(),
             block_sizes=[cache_config.block_size],
             kernel_block_sizes=[cache_config.block_size],
@@ -343,7 +357,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             logitsprocs=build_logitsprocs(
                 self.vllm_config,
                 self.device,
-                PIN_MEMORY,
+                self.pin_memory,
                 self.is_pooling_model,
                 custom_logitsprocs,
             ),
@@ -355,10 +369,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # Persistent buffers
         self.input_ids = torch.zeros(self.max_num_tokens, dtype=torch.int32)
         self.positions = torch.zeros(self.max_num_tokens, dtype=torch.int64)
-        self.query_start_loc = torch.zeros(self.max_num_reqs + 1, dtype=torch.int32)
-        self.query_start_loc_np = self.query_start_loc.numpy()
+        self.query_start_loc = self._make_buffer(
+            self.max_num_reqs + 1, dtype=torch.int32
+        )
         self.seq_lens = torch.zeros(self.max_num_tokens, dtype=torch.int32)
-        self.seq_lens_np = self.seq_lens.numpy()
         self.discard_request_mask = torch.zeros(self.max_num_reqs, dtype=torch.bool)
         self.input_stager = InputStager(self.device)
 
@@ -399,10 +413,15 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # (and across the PP / pooling / empty-batch paths).
         self.kv_connector_output: KVConnectorOutput | None = None
 
-        # NOTE(RBLN): Initialize bucketing manager
+        # NOTE(RBLN): Initialize bucketing manager. RBLN compiles a fixed
+        # decode-batch shape, so it buckets to the per-PP-stage decode batch
+        # (max_num_seqs // pp_size) -- the single source of truth shared with
+        # the scheduler's decode admission cap -- not the raw max_num_seqs.
         self.bucketing_manager = get_bucketing_manager(
             envs.VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY,
-            max_batch_size=self.max_num_reqs,
+            max_batch_size=decode_batch_size(
+                self.max_num_reqs, self.parallel_config.pipeline_parallel_size
+            ),
             min_batch_size=envs.VLLM_RBLN_DECODE_BATCH_BUCKET_MIN,
             step=envs.VLLM_RBLN_DECODE_BATCH_BUCKET_STEP,
             limit=envs.VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT,
@@ -428,6 +447,17 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
     def _get_positions(self, num_tokens: Any):
         assert not isinstance(num_tokens, int)
         return self.positions[:num_tokens]
+
+    def _make_buffer(
+        self, *size: int | torch.SymInt, dtype: torch.dtype, numpy: bool = True
+    ) -> CpuGpuBuffer:
+        return CpuGpuBuffer(
+            *size,
+            dtype=dtype,
+            device=self.device,
+            pin_memory=self.pin_memory,
+            with_numpy=numpy,
+        )
 
     def _init_model_kwargs(self):
         model_kwargs = dict[str, Any]()
@@ -611,9 +641,19 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 new_token_ids = req_data.new_token_ids[i]
                 # Add the sampled token(s) from the previous step (if any).
                 # This doesn't include "unverified" tokens like spec tokens.
-                num_new_tokens = (
-                    num_computed_tokens + len(new_token_ids) - req_state.num_tokens
+                # NOTE(RBLN): new_token_ids is extended backward by num_spec
+                # (multi-accept propagation) and ends at committed_tip =
+                # num_computed + base. The number of NEW output tokens is the
+                # committed delta, computed from base (not len(new_token_ids),
+                # which now includes the backward-extended catch-up window).
+                # new_token_ids[-num_new:] still takes the newest tokens because
+                # the payload ends at committed_tip.
+                base_out = num_base_tokens(
+                    scheduler_output.num_scheduled_tokens,
+                    scheduled_spec_tokens,
+                    req_id,
                 )
+                num_new_tokens = num_computed_tokens + base_out - req_state.num_tokens
                 if num_new_tokens == 1:
                     # Avoid slicing list in most common case.
                     req_state.output_token_ids.append(new_token_ids[-1])
@@ -658,13 +698,32 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             # For the last rank, we don't need to update the token_ids_cpu
             # because the sampled tokens are already cached.
             if not is_last_rank:
-                # Add new_token_ids to token_ids_cpu.
-                start_token_index = num_computed_tokens
-                end_token_index = num_computed_tokens + len(new_token_ids)
-                self.input_batch.token_ids_cpu[
-                    req_index, start_token_index:end_token_index
-                ] = new_token_ids
-                self.input_batch.num_tokens_no_spec[req_index] = end_token_index
+                # NOTE(RBLN): bring this rank's recorded-token cursor
+                # (num_tokens_no_spec) up to committed_tip = num_computed + base
+                # by writing the scheduler-propagated tokens at their ABSOLUTE
+                # position. The payload is extended backward by num_spec so it
+                # spans a prior verify's multi-accept lag; the write idempotently
+                # overwrites any mis-speculated draft slots. See
+                # resolve_propagated_token_write.
+                base = num_base_tokens(
+                    scheduler_output.num_scheduled_tokens,
+                    scheduled_spec_tokens,
+                    req_id,
+                )
+                start_token_index = self.input_batch.num_tokens_no_spec[req_index]
+                write = resolve_propagated_token_write(
+                    start_token_index, num_computed_tokens, base, new_token_ids
+                )
+                if write is not None:
+                    committed_tip, tokens = write
+                    if tokens:
+                        self.input_batch.token_ids_cpu[
+                            req_index, start_token_index:committed_tip
+                        ] = tokens
+                    self.input_batch.is_token_ids[
+                        req_index, start_token_index:committed_tip
+                    ] = True
+                    self.input_batch.num_tokens_no_spec[req_index] = committed_tip
 
             # Add spec_token_ids to token_ids_cpu.
             self.input_batch.update_req_spec_token_ids(req_state, scheduled_spec_tokens)
@@ -744,7 +803,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # ngram/suffix steps clear scheduled_spec_decode_tokens and run with
         # the logical query length, usually qlen=1.
         use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
-        if use_spec_decode and self.num_spec_tokens > 0 and not self.is_prefill:
+        if use_spec_decode and self.num_spec_tokens > 0 and not self.is_prefill_phase():
             target_query_len = self.num_spec_tokens + 1
             query_lengths = np.full(num_reqs, target_query_len, dtype=np.int32)
             backfill = query_lengths - logical_num_tokens
@@ -796,14 +855,17 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         )
 
         # Prepare the attention metadata.
-        self.query_start_loc_np[0] = 0
-        self.query_start_loc_np[1 : num_reqs + 1] = cu_num_tokens
-        self.query_start_loc_np[num_reqs + 1 :].fill(cu_num_tokens[-1])
+        query_start_loc_np = self.query_start_loc.np
+        query_start_loc_np[0] = 0
+        query_start_loc_np[1 : num_reqs + 1] = cu_num_tokens
+        query_start_loc_np[num_reqs + 1 :].fill(cu_num_tokens[-1])
+        self.query_start_loc.copy_to_gpu()
 
-        self.seq_lens_np[:num_reqs] = (
+        seq_lens_np = self.seq_lens.numpy()
+        seq_lens_np[:num_reqs] = (
             self.input_batch.num_computed_tokens_cpu[:num_reqs] + logical_num_tokens
         )
-        self.seq_lens_np[num_reqs:].fill(0)
+        seq_lens_np[num_reqs:].fill(0)
 
         num_tokens = [self.requests[r].num_tokens for r in self.input_batch.req_ids]
         num_tokens_np = np.array(num_tokens, dtype=np.int32)
@@ -811,7 +873,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # Record which requests should not be sampled,
         # so that we could clear the sampled tokens before returningj
         discard_request_mask_np = self.discard_request_mask.numpy()
-        discard_request_mask_np[:num_reqs] = self.seq_lens_np[:num_reqs] < num_tokens_np
+        discard_request_mask_np[:num_reqs] = seq_lens_np[:num_reqs] < num_tokens_np
 
         if not use_spec_decode:
             # NOTE(woosuk): Due to chunked prefills, the batch may contain
@@ -819,7 +881,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             # from these partial requests, we do so for simplicity.
             # We will ignore the sampled tokens from the partial requests.
             # TODO: Support prompt logprobs.
-            logits_indices = self.query_start_loc[1 : num_reqs + 1] - 1
+            logits_indices = self.query_start_loc.cpu[1 : num_reqs + 1] - 1
             spec_decode_metadata = None
         else:
             # Get the number of draft tokens for each request.
@@ -882,9 +944,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             return blk_table_tensor
 
         cm_base = CommonAttentionMetadata(
-            query_start_loc=self.query_start_loc[: num_reqs + 1],
-            query_start_loc_cpu=self.query_start_loc[: num_reqs + 1],
+            query_start_loc=self.query_start_loc.gpu[: num_reqs + 1],
+            query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs + 1],
             seq_lens=self.seq_lens[:num_reqs],
+            _seq_lens_cpu=self.seq_lens[:num_reqs],
             num_reqs=num_reqs,
             num_actual_tokens=num_tokens,
             max_query_len=max_query_len,
@@ -910,8 +973,15 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 cm.block_table_tensor = _get_block_table(kv_cache_gid)
 
             if self.speculative_config and spec_decode_common_attn_metadata is None:
-                if isinstance(self.drafter, RBLNEagleProposer):
-                    if self.drafter.kv_cache_gid == kv_cache_gid:
+                # NOTE(RBLN): the drafter lives only on the last PP rank, so
+                # use getattr (like the warmup/load-model paths) -- this runs on
+                # every rank under spec-decode + PP. Non-last ranks (drafter
+                # absent -> None) take the else branch; the resulting
+                # spec_decode_common_attn_metadata is unused there (only the
+                # last rank drafts).
+                drafter = getattr(self, "drafter", None)
+                if isinstance(drafter, RBLNEagleProposer):
+                    if drafter.kv_cache_gid == kv_cache_gid:
                         spec_decode_common_attn_metadata = cm
                 else:
                     spec_decode_common_attn_metadata = cm
@@ -924,7 +994,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 attn_metadata_i = builder.build(
                     common_attn_metadata=cm,
                     positions=self.positions,
-                    is_prefill=self.is_prefill,
+                    is_prefill=self.is_prefill_phase(),
                     batch_pad=num_reqs_padded,
                 )
 
@@ -1143,12 +1213,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         else:
             assert intermediate_tensors is not None
 
+        is_prefill_phase = self.is_prefill_phase()
         layout = InputLayout(
             num_reqs=num_reqs,
-            num_reqs_padded=num_reqs if self.is_prefill else num_reqs_padded,
+            num_reqs_padded=num_reqs if is_prefill_phase else num_reqs_padded,
             query_len=input_ids.shape[1],
             query_len_padded=self.max_num_tokens
-            if self.is_prefill
+            if is_prefill_phase
             else input_ids.shape[1],
         )
         staged_model_inputs = self.input_stager.stage(
@@ -1157,7 +1228,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
             token_indices=logits_indices
-            if self.is_prefill and self.use_wrapped_compute_logits
+            if is_prefill_phase and self.use_wrapped_compute_logits
             else None,
             layout=layout,
         )
@@ -1314,6 +1385,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         )
 
     @torch.inference_mode()
+    @instrument_with_latency(
+        span_name="model_execute",
+        attribute=SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_EXECUTE,
+    )
     def execute_model(
         self,
         scheduler_output: RBLNSchedulerOutput,
@@ -1329,6 +1404,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             kv_connector_metadata = scheduler_output.kv_connector_metadata
             assert kv_connector_metadata is not None
             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
+
+        # Stamp this step's prefill/decode phase from the scheduler before any
+        # is_prefill_phase() read or early return, so all PP ranks agree on the
+        # graph they select this step.
+        self._set_step_phase(scheduler_output)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
 
@@ -1370,7 +1450,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 num_scheduled_tokens_np,
             )
 
-            num_reqs_padded, num_tokens_padded, num_tokens_across_dp = (
+            num_reqs_padded, num_tokens_padded, num_tokens_across_dp, _ = (
                 self._determine_batch_padding(num_reqs, num_query_tokens)
             )
 
@@ -1403,7 +1483,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after the draft model runs
         # in sample_tokens(), so the draft model can also save its KV cache.
-        defer_kv_connector_finalize = self.speculative_config is not None
+        # NOTE(RBLN): gate on the last PP rank -- the deferred finalize runs in
+        # the sample path, which only the last rank reaches, so deferring on
+        # non-last ranks would drop their KV save entirely (every PP rank must
+        # finalize its own layers' KV). Only the last rank drafts, so only it
+        # needs to defer; non-last ranks finalize in-context like non-spec.
+        defer_kv_connector_finalize = (
+            self.speculative_config is not None and get_pp_group().is_last_rank
+        )
         with (
             set_forward_context(
                 attn_metadata,
@@ -1418,7 +1505,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 scheduler_output,
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
-            self.performance_ctx.profile_model(self.is_prefill),
+            self.performance_ctx.profile_model(self.is_prefill_phase()),
         ):
             model_output = self.model_executable(
                 **staged_model_inputs.as_kwargs(),
@@ -1447,7 +1534,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
             sample_hidden_states = hidden_states
             assert self.use_wrapped_compute_logits
-            if not self.is_prefill and spec_decode_metadata is not None:
+            if not self.is_prefill_phase() and spec_decode_metadata is not None:
                 logits = logits[logits_indices]
 
         self.execute_model_state = ExecuteModelState(
@@ -1602,7 +1689,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             assert isinstance(sampled_token_ids, list)
             assert isinstance(self.drafter, NgramProposer)
             draft_token_ids = self.drafter.propose(
-                self.num_spec_tokens,
                 sampled_token_ids,
                 self.input_batch.num_tokens_no_spec,
                 self.input_batch.token_ids_cpu,
@@ -1824,6 +1910,17 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
             )
 
+        # forward 는 method 가 아니라 compile 산출물(인스턴스 속성)이라 데코레이터를
+        # 달 자리가 없다. 여기서 한 번 감싸 gen_ai.latency.time_in_model_forward 를
+        # 채운다 — traced_callable 은 이미 감싼 것을 그대로 돌려주므로 warmup 재진입
+        # 으로 wrapper 가 중첩되지 않는다.
+        if self.model_executable is not None:
+            self.model_executable = traced_callable(
+                self.model_executable,
+                span_name="model_forward",
+                attribute=SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_FORWARD,
+            )
+
     def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:
         """Extract Eagle3 auxiliary layer indices from speculative config.
 
@@ -1923,7 +2020,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             # If this is a partial request (i.e. chunked prefill),
             # then there is prompt logprob generated for each index.
             req_idx = self.input_batch.req_id_to_index[req_id]
-            offset = self.query_start_loc[req_idx].item()
+            offset = self.query_start_loc.cpu[req_idx].item()
             prompt_hidden_states = hidden_states[offset : offset + num_logits]
             logits = self.model.compute_logits(prompt_hidden_states)
 
@@ -1977,6 +2074,27 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         except IndexError:
             return {}
 
+    def _stage_dummy_seq_lens(
+        self, num_reqs: int, num_tokens_per_req: int, is_prefill: bool
+    ) -> tuple[np.ndarray, int]:
+        """Set seq_lens / num_tokens_no_spec for a dummy batch of this shape and
+        return (num_scheduled_tokens, num_tokens_unpadded). Shared by the initial
+        prep and the DP-idle adopt path so both size the dummy identically.
+
+        num_tokens_no_spec is the per-request no-spec logical length consumed
+        downstream (query backfill, spec metadata); for decode it stays 1 so a
+        multi-token speculative-decode query is still sized as decode.
+        """
+        num_scheduled_tokens = np.array([num_tokens_per_req] * num_reqs, dtype=np.int32)
+        seq_lens_np = self.seq_lens.numpy()
+        seq_lens_np[:num_reqs] = num_scheduled_tokens
+        seq_lens_np[num_reqs:] = 0
+        if is_prefill:
+            self.input_batch.num_tokens_no_spec[:num_reqs] = num_scheduled_tokens
+        else:
+            self.input_batch.num_tokens_no_spec[:num_reqs] = 1
+        return num_scheduled_tokens, int(num_scheduled_tokens.sum())
+
     @torch.inference_mode()
     def _dummy_run(
         self,
@@ -1985,39 +2103,71 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         is_prefill: bool,
         *,
         num_tokens_padded: int | None = None,
+        warmup: bool = True,
     ) -> None:
         """
         Run a dummy forward pass to warm up for the model.
+
+        ``warmup=True`` (default) is the compile-time path. ``warmup=False``
+        marks the serving-time DP-idle dummy step (``execute_dummy_batch``):
+        this rank has no real work and must not drive the cross-DP shape
+        decision. It contributes a minimal (num_reqs=1) entry to the collective
+        all-reduce (excluded from the decision in ``_determine_batch_padding``
+        via ``is_idle``) and then ADOPTS the busy-decided shape below, running
+        the same compiled decode graph the busy ranks run.
         """
+        # The serving-time DP-idle dummy is the only non-warmup use of this
+        # method; downstream shape logic keys on this idle flag.
+        is_idle = not warmup
         num_tokens = num_tokens_per_req * num_reqs
         assert num_tokens <= self.max_num_tokens
         assert num_reqs <= self.max_num_reqs
         draft_num_tokens_padded = num_tokens_padded
 
-        num_scheduled_tokens_list = [num_tokens_per_req] * num_reqs
-        num_scheduled_tokens = np.array(num_scheduled_tokens_list, dtype=np.int32)
-        num_tokens_unpadded = int(num_scheduled_tokens.sum())
+        num_scheduled_tokens, num_tokens_unpadded = self._stage_dummy_seq_lens(
+            num_reqs, num_tokens_per_req, is_prefill
+        )
 
-        self.seq_lens_np[:num_reqs] = num_scheduled_tokens
-        self.seq_lens_np[num_reqs:] = 0
+        # Stamp the phase from this dummy's own classification so the graph/phase
+        # selection helpers below (_determine_batch_padding,
+        # _build_attention_metadata) read is_prefill_phase() consistently. This
+        # bypasses execute_model's scheduler stamp and also guards the DP-idle
+        # path (rbln_worker.execute_dummy_batch): a stale value from a prior real
+        # step cannot leak into any is_prefill_phase() read while the dummy runs.
+        self._is_prefill_step = is_prefill
 
-        # NOTE(RBLN): self.is_prefill is derived from num_tokens_no_spec.
-        # For decode warmup, keep it at 1 so multi-token speculative decode
-        # query lengths are not misclassified as prefill.
-        if is_prefill:
-            self.input_batch.num_tokens_no_spec[:num_reqs] = num_scheduled_tokens
-        else:
-            self.input_batch.num_tokens_no_spec[:num_reqs] = 1
-
-        num_reqs_padded, _num_tokens_padded, num_tokens_across_dp = (
-            self._determine_batch_padding(num_reqs, num_tokens_unpadded)
+        num_reqs_padded, _num_tokens_padded, num_tokens_across_dp, eff_qlen = (
+            self._determine_batch_padding(num_reqs, num_tokens_unpadded, is_idle)
         )
         num_tokens_padded = num_tokens_padded or _num_tokens_padded
 
-        cu_num_tokens, _ = self._get_cumsum_and_arange(num_scheduled_tokens)
-        self.query_start_loc_np[0] = 0
-        self.query_start_loc_np[1 : num_reqs + 1] = cu_num_tokens
-        self.query_start_loc_np[num_reqs + 1 :].fill(cu_num_tokens[-1])
+        if is_idle and num_tokens_padded is not None:
+            # Adopt the shape the busy ranks settled on and stage the whole dummy
+            # batch at it (num_reqs == num_reqs_padded, no split), so this rank
+            # runs the same graph they run.
+            #
+            # num_tokens_per_req is this rank's query length. eff_qlen (from
+            # _determine_batch_padding) is 1 on every route whose num_tokens_padded
+            # is a padding target rather than num_reqs_padded * qlen, so the idle
+            # runs the minimal qlen=1 decode and lets num_tokens_padded carry the
+            # padding; it is None only on the per-bucket route, where the qlen is
+            # instead derived from num_tokens_padded / num_reqs_padded (the busy
+            # ranks' symmetric query length).
+            num_reqs = num_reqs_padded
+            num_tokens_per_req = (
+                eff_qlen
+                if eff_qlen is not None
+                else num_tokens_padded // num_reqs_padded
+            )
+            draft_num_tokens_padded = num_tokens_padded
+            num_scheduled_tokens, num_tokens_unpadded = self._stage_dummy_seq_lens(
+                num_reqs, num_tokens_per_req, is_prefill
+            )
+            num_tokens = num_tokens_unpadded
+
+        cum_num_tokens, _ = self._get_cumsum_and_arange(num_scheduled_tokens)
+        query_start_loc_np = self.query_start_loc.np
+        query_start_loc_np[1 : num_reqs + 1] = cum_num_tokens
 
         attn_metadata, _ = self._build_attention_metadata(
             num_tokens=num_tokens_unpadded,
@@ -2049,9 +2199,15 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 dtype=self.model_config.dtype,
                 device=self.device,
             )
+            # The empty tensor holds num_tokens_unpadded (= num_reqs *
+            # num_tokens_per_req) rows, so the view must reshape by num_reqs to
+            # keep the trailing hidden dimension intact. Using the DP-padded
+            # count here would over-count the leading dims and split the hidden
+            # size (num_reqs_padded > num_reqs whenever a peer forces padding),
+            # matching input_ids / InputLayout which also stage by num_reqs.
             intermediate_tensors = IntermediateTensors(
                 {
-                    k: v.view(num_reqs_padded, num_tokens_per_req, -1)
+                    k: v.view(num_reqs, num_tokens_per_req, -1)
                     for k, v in intermediate_tensors.items()
                 }
             )
@@ -2291,6 +2447,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 max_model_len=max_model_len,
                 max_num_batched_tokens=self.max_num_tokens,
                 device=self.device,
+                pin_memory=self.pin_memory,
                 vocab_size=self.model_config.get_vocab_size(),
                 block_sizes=block_sizes,
                 kernel_block_sizes=kernel_block_sizes,
@@ -2734,15 +2891,28 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
     # Only RBLN-Specific Methods
     ####################################################################################################
 
-    @property
-    def is_prefill(self) -> bool:
-        num_computed_tokens = self.input_batch.num_computed_tokens_cpu[0]
-        num_tokens_no_spec = self.input_batch.num_tokens_no_spec[0]
-        return bool(num_computed_tokens < (num_tokens_no_spec - 1))
+    def _set_step_phase(self, scheduler_output: "RBLNSchedulerOutput") -> None:
+        """Record this step's prefill/decode phase from the scheduler stamp."""
+        self._is_prefill_step = scheduler_output.is_prefill_step
+
+    def is_prefill_phase(self) -> bool:
+        """The step's prefill/decode classification, stamped by the scheduler
+        (RBLNSchedulerOutput.is_prefill_step) and stashed at the top of
+        execute_model.
+
+        The single source of truth for all graph/phase selection in the runner.
+        A runner-side re-derivation from num_tokens_no_spec would diverge across
+        PP ranks under spec-decode -- it is updated on the sampling path on the
+        last PP rank but on the scheduler-output path on the others -- so the
+        rank-consistent scheduler value is used instead. On the dummy path
+        (_dummy_run, incl. the DP-idle execute_dummy_batch), _is_prefill_step is
+        stamped from the dummy's own phase instead of a scheduler output.
+        """
+        return self._is_prefill_step
 
     @property
     def is_intermediate_chunked_prefill(self) -> bool:
-        return self.is_prefill and bool(self.discard_request_mask[0])
+        return self.is_prefill_phase() and bool(self.discard_request_mask[0])
 
     @property
     def use_wrapped_compute_logits(self) -> bool:
@@ -2765,41 +2935,114 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self,
         num_reqs_unpadded: int,
         num_tokens_unpadded: int,
-    ) -> tuple[int, int | None, torch.Tensor | None]:
+        is_idle: bool = False,
+    ) -> tuple[int, int | None, torch.Tensor | None, int | None]:
+        is_prefill_phase = self.is_prefill_phase()
         num_reqs_padded = (
             self.bucketing_manager.find_decode_batch_bucket(num_reqs_unpadded)
-            if not self.is_prefill
+            if not is_prefill_phase
             else num_reqs_unpadded
         )
         if self.parallel_config.data_parallel_size == 1:
-            return num_reqs_padded, None, None
+            return num_reqs_padded, None, None, None
 
-        num_tokens_across_dp, num_reqs_across_dp = (
+        num_tokens_across_dp, num_reqs_across_dp, idle_across_dp = (
             RBLNDPMetadata.num_tokens_and_reqs_across_dp(
                 num_tokens_unpadded,
                 num_reqs_unpadded,
                 self.parallel_config.data_parallel_size,
                 self.parallel_config.data_parallel_rank,
-                self.is_prefill,
+                is_prefill_phase,
+                is_idle,
             )
         )
         num_tokens_padded = self.max_num_tokens
+        # Per-request query length the idle dummy should adopt (used only there).
+        # Default 1: the idle rank runs the minimal qlen=1 decode and lets
+        # num_tokens_padded carry any padding on its own. This is correct on every
+        # route whose num_tokens_padded is a padding target rather than
+        # num_reqs_padded * qlen -- any_prefill, qlen-asymmetric, all-idle, AND the
+        # non-specialized-MoE DP path that skips the block below (num_tokens_padded
+        # stays max_num_tokens there). Only the per-bucket route resets this to
+        # None so the qlen is DERIVED from that product (the busy ranks' symmetric
+        # query length). Dividing max_num_tokens // num_reqs_padded instead would
+        # stage a never-warmed query length and hot-path recompile on the idle rank.
+        eff_qlen: int | None = 1
         if self.specialized_moe_decode:
             if num_reqs_across_dp is None:
                 # any_prefill (PD disaggregation): route padded-decode to the max
                 # bucket so only ONE padded-decode graph is ever needed.
                 num_reqs_padded = self.bucketing_manager.decode_batch_buckets[-1]
+                # num_tokens_padded stays max_num_tokens (a padding target); an idle
+                # rank keeps the default qlen=1 -- it cannot see any peer's query
+                # length (a peer is reading a prompt) -- and runs the smallest
+                # prepared graph.
             else:
-                num_reqs_padded = self.bucketing_manager.find_decode_batch_bucket(
-                    int(torch.max(num_reqs_across_dp).item())
-                )
-                assert num_reqs_padded is not None
-                assert torch.all(num_tokens_across_dp % num_reqs_across_dp == 0)
-                tokens_per_req_across_dp = num_tokens_across_dp // num_reqs_across_dp
-                max_tokens_per_req = int(torch.max(tokens_per_req_across_dp).item())
-                num_tokens_padded = num_reqs_padded * max_tokens_per_req
+                # A DP-idle dummy step (execute_dummy_batch) has no real work, so
+                # it must NOT drive the shape decision -- its fixed (bucket, qlen)
+                # could otherwise drag an optimal collective into a fall-back route
+                # (e.g. an idle rank claiming a spec qlen forces qlen-asymmetry when
+                # the busy ranks are plain qlen=1). Decide the shape from the busy
+                # (non-idle) ranks only; the idle rank then adopts it.
+                busy = idle_across_dp == 0
+                if not bool(busy.any().item()):
+                    # All ranks idle (DP lockstep wind-down / re-sync): no real
+                    # work anywhere -> cheapest compiled decode graph (smallest
+                    # bucket, qlen=1). Deterministic + identical on every rank;
+                    # output discarded.
+                    num_reqs_padded = self.bucketing_manager.decode_batch_buckets[0]
+                    num_tokens_padded = num_reqs_padded
+                else:
+                    assert torch.all(
+                        (num_tokens_across_dp % num_reqs_across_dp)[busy] == 0
+                    )
+                    tokens_per_req_across_dp = (
+                        num_tokens_across_dp // num_reqs_across_dp
+                    )
+                    busy_tokens_per_req = tokens_per_req_across_dp[busy]
+                    max_tokens_per_req = int(torch.max(busy_tokens_per_req).item())
+                    min_tokens_per_req = int(torch.min(busy_tokens_per_req).item())
+                    if min_tokens_per_req != max_tokens_per_req:
+                        # DP qlen-ASYMMETRIC step (among the busy ranks): the ranks
+                        # disagree on query length -- a peer runs multi-token (spec)
+                        # decode (query_len = num_speculative_tokens + 1) while
+                        # another is qlen=1. Fall-back: warm-up compiles the
+                        # spec-asymmetric padding ONLY for the top bucket
+                        # (top_bucket, *, top_bucket * spec_qlen) to keep the
+                        # decode-graph count minimal, so route up to it here (same
+                        # policy as the any_prefill branch above).
+                        #
+                        # A qlen-SYMMETRIC step -- all busy ranks the same query
+                        # length, whether 1 or the spec length -- instead falls
+                        # through to the per-bucket branch below and runs on its
+                        # own optimally-sized decode graph. Only gating on
+                        # max_tokens_per_req > 1 would wrongly route symmetric spec
+                        # to the top bucket, running it oversized and orphaning the
+                        # per-bucket spec graphs.
+                        num_reqs_padded = self.bucketing_manager.decode_batch_buckets[
+                            -1
+                        ]
+                        # num_tokens_padded below (top_bucket * max_tokens_per_req)
+                        # is a padding target here, so an idle rank keeps the
+                        # default qlen=1: it follows the single-token busy ranks,
+                        # not the longer speculative ones.
+                    else:
+                        busy_num_reqs = num_reqs_across_dp[busy]
+                        num_reqs_padded = (
+                            self.bucketing_manager.find_decode_batch_bucket(
+                                int(torch.max(busy_num_reqs).item())
+                            )
+                        )
+                        # per-bucket: num_tokens_padded below == num_reqs_padded *
+                        # max_tokens_per_req, so DERIVE qlen from that product (the
+                        # busy ranks' symmetric query length -- 1, or the spec
+                        # length). This is the ONLY route that overrides the qlen=1
+                        # default.
+                        eff_qlen = None
+                    assert num_reqs_padded is not None
+                    num_tokens_padded = num_reqs_padded * max_tokens_per_req
 
-        return num_reqs_padded, num_tokens_padded, num_tokens_across_dp
+        return num_reqs_padded, num_tokens_padded, num_tokens_across_dp, eff_qlen
 
     def _update_kv_cache_base_bindings(
         self,

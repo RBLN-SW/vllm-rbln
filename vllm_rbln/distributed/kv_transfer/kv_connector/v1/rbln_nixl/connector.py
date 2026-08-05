@@ -25,6 +25,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
     NixlConnector,
 )
+from vllm.tracing import instrument
 
 import vllm_rbln.envs as envs
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.scheduler import (
@@ -39,6 +40,7 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.utils import (
 from vllm_rbln.logger import init_logger
 
 if TYPE_CHECKING:
+    from vllm.forward_context import ForwardContext
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
 logger = init_logger(__name__)
@@ -89,6 +91,23 @@ class RblnNixlConnector(NixlConnector, SupportsKVCacheRegistrationFinalize):
             self.connector_worker = RblnNixlConnectorWorker(
                 vllm_config, self.engine_id, kv_cache_config
             )
+
+    # ── tracing ────────────────────────────────────────────────────────────
+    # The prefill->decode KV hop is the only step in a PD-disaggregated trace
+    # with no span, so downstream analysis can only report it as an unexplained
+    # gap between the prefill and decode spans. These overrides name the hop.
+    #
+    # start_load_kv is called once per engine step and issues the reads for every
+    # request scheduled to receive KV in that step, so this is a step-level span;
+    # the per-request child lives in RblnNixlConnectorWorker._read_blocks_for_req.
+
+    @instrument(span_name="nixl.kv_transfer")
+    def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
+        return super().start_load_kv(forward_context, **kwargs)
+
+    @instrument(span_name="nixl.save_to_host")
+    def wait_for_save(self):
+        return super().wait_for_save()
 
     def finalize_kv_cache_registration(self) -> None:
         """Run the worker's deferred NIXL registration after warm-up

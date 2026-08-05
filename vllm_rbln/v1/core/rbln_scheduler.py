@@ -19,6 +19,7 @@ from typing import Any
 
 from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
+from vllm.tracing import SpanAttributes
 from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_utils import init_none_hash
@@ -33,6 +34,7 @@ from vllm.v1.utils import record_function_or_nullcontext
 
 import vllm_rbln.envs as envs
 from vllm_rbln.logger import init_logger
+from vllm_rbln.utils.tracing import instrument_with_latency
 from vllm_rbln.v1.core.rbln_kv_cache_manager import (
     KVCacheCopyOp,
     RBLNKVCacheManager,
@@ -149,6 +151,10 @@ class RBLNScheduler(Scheduler):
                     pending_delta + req_to_new_blocks[req.request_id]
                 )
 
+    @instrument_with_latency(
+        span_name="schedule",
+        attribute=SpanAttributes.GEN_AI_LATENCY_TIME_IN_SCHEDULER,
+    )
     def schedule(self, throttle_prefills: bool = False) -> RBLNSchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
