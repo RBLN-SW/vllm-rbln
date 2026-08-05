@@ -35,7 +35,7 @@ steps:
     command:
       - "bash .buildkite/scripts/gate-team-member.sh"
 
-  - label: ":lint: pre-commit"
+  - label: ":mag: pre-commit"
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     resources: *light-cpu
     secrets: *uv_secrets
@@ -45,7 +45,7 @@ steps:
   # Both gates must pass before the heavy test pipeline is even uploaded.
   - wait: ~
 
-  - label: ":pipeline: vllm-rbln PR CI"
+  - label: ":pipeline: vllm-rbln pytest"
     command: "buildkite-agent pipeline upload .buildkite/pipelines/pr/run-pytest.yml"
     plugins:
       - sparse-checkout#v1.6.0:
