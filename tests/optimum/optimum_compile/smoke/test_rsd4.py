@@ -69,7 +69,10 @@ class TestBlip2(MultimodalSmoke.Test):
 
 class TestPaligemma(MultimodalSmoke.Test):
     MODEL_ID = "google/paligemma2-3b-pt-224"
-    HF_OVERRIDES = {"text_config.num_hidden_layers": 1}
+    HF_OVERRIDES = {
+        "text_config.num_hidden_layers": 1,
+        "vision_config.num_hidden_layers": 1,
+    }
     NUM_DEVICES = 1
     LLM_KWARGS = {"block_size": 4096, "max_model_len": 4096, "max_num_seqs": 1}
     USE_CHAT_TEMPLATE = False
