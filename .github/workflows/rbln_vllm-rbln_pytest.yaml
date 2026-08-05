@@ -57,8 +57,6 @@ jobs:
     name: Pytest (${{ matrix.test_type.name }})
     runs-on: ${{ matrix.test_type.runner }}
     env:
-      # Authenticate HF Hub requests so rate limits apply per-account
-      # instead of per-IP (self-hosted runners share one egress IP).
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
     strategy:
       fail-fast: ${{ inputs.fail_fast }}
@@ -208,9 +206,8 @@ jobs:
       run:
         shell: bash
     env:
-      # Authenticate HF Hub requests so rate limits apply per-account
-      # instead of per-IP (self-hosted runners share one egress IP).
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      # HF_HOME: ${{ secrets.HF_HOME }}
     strategy:
       fail-fast: ${{ inputs.fail_fast }}
       matrix:

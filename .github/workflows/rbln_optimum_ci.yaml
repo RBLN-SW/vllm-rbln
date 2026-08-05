@@ -70,6 +70,7 @@ jobs:
       NUM_INPUT_PROMPT: 1
       VLLM_LOGGING_LEVEL: DEBUG
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      # HF_HOME: ${{ secrets.HF_HOME }}
       VLLM_RBLN_SAMPLER: 0
     steps:
       - name: Install uv CLI
@@ -151,6 +152,7 @@ jobs:
       NUM_INPUT_PROMPT: 1
       VLLM_LOGGING_LEVEL: DEBUG
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      # HF_HOME: ${{ secrets.HF_HOME }}
       VLLM_RBLN_SAMPLER: 0
     steps:
       - name: Install uv CLI
@@ -232,6 +234,7 @@ jobs:
       NUM_INPUT_PROMPT: 1
       VLLM_LOGGING_LEVEL: DEBUG
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      # HF_HOME: ${{ secrets.HF_HOME }}
     steps:
       - name: Install uv CLI
         run: |
