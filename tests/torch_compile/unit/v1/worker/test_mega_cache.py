@@ -14,6 +14,8 @@
 """Unit tests for mega-cache bundle keying (config signature + path)."""
 
 import dataclasses
+import os
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -307,3 +309,307 @@ class TestConfigSignatureRealEnv:
         monkeypatch.setenv("VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS", "1,2,4,8")
         s2 = mega_cache.config_signature(self._cfg())
         assert s1 != s2
+
+
+class TestBundlePathEdges:
+    def test_respects_cache_root(self, monkeypatch):
+        import vllm.envs as vllm_envs
+
+        monkeypatch.setattr(vllm_envs, "VLLM_CACHE_ROOT", "/tmp/some-cache-root")
+        path = mega_cache.bundle_path("m", "sig")
+        assert path.startswith("/tmp/some-cache-root/rbln/")
+
+    def test_cache_root_helper_matches_prefix(self, monkeypatch):
+        import vllm.envs as vllm_envs
+
+        monkeypatch.setattr(vllm_envs, "VLLM_CACHE_ROOT", "/tmp/other-root")
+        assert mega_cache.cache_root() == "/tmp/other-root/rbln"
+        assert mega_cache.bundle_path("m", "s").startswith(mega_cache.cache_root())
+
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "meta-llama/Llama-3.1-8B-Instruct",
+            "/abs/path/to/local model",
+            "../../escape",
+            "weird:name*with?chars",
+            "한글모델",
+        ],
+        ids=["hf-repo", "local-space", "traversal", "shell-chars", "non-ascii"],
+    )
+    def test_model_component_is_a_single_safe_segment(self, monkeypatch, model):
+        monkeypatch.delenv("LOCAL_RANK", raising=False)
+        path = mega_cache.bundle_path(model, "sig")
+        # <root>/rbln/<model-seg>/<sig>/rank0/mega_cache.bin
+        model_seg = path.split(os.sep)[-4]
+        # One component that cannot climb out of the cache root: separators are
+        # substituted, and the segment is never bare "." or "..".
+        assert model_seg not in (".", "..")
+        assert re.fullmatch(r"[A-Za-z0-9._-]+", model_seg), model_seg
+        root = os.path.join(mega_cache.cache_root(), "")
+        assert os.path.abspath(path).startswith(os.path.abspath(root))
+
+    def test_same_sanitized_name_still_separates(self, monkeypatch):
+        # Both sanitize to the same safe name; the sha1 suffix must keep them apart.
+        monkeypatch.delenv("LOCAL_RANK", raising=False)
+        a = mega_cache.bundle_path("org/model", "sig")
+        b = mega_cache.bundle_path("org:model", "sig")
+        assert a != b
+
+    @pytest.mark.parametrize("model", ["", "///", "***"])
+    def test_degenerate_model_names(self, monkeypatch, model):
+        monkeypatch.delenv("LOCAL_RANK", raising=False)
+        path = mega_cache.bundle_path(model, "sig")
+        assert path.endswith(os.path.join("sig", "rank0", "mega_cache.bin"))
+
+    def test_default_rank_is_zero(self, monkeypatch):
+        monkeypatch.delenv("LOCAL_RANK", raising=False)
+        assert "rank0" in mega_cache.bundle_path("m", "sig")
+
+    def test_ranks_do_not_share_a_file(self, monkeypatch):
+        paths = set()
+        for rank in ("0", "1", "7"):
+            monkeypatch.setenv("LOCAL_RANK", rank)
+            paths.add(mega_cache.bundle_path("m", "sig"))
+        assert len(paths) == 3
+
+
+@pytest.fixture
+def bundle_env(tmp_path, monkeypatch):
+    """Redirect the bundle under tmp_path and stub the torch/rebel boundaries.
+
+    Returns a namespace whose `saved`/`loaded` record what crossed each boundary,
+    so the tests assert on the persisted bundle rather than on real compilation.
+    """
+    import sys
+
+    import vllm.envs as vllm_envs
+    from rebel.core import mega_cache as rbln_mega_cache
+
+    monkeypatch.setattr(vllm_envs, "VLLM_CACHE_ROOT", str(tmp_path))
+    monkeypatch.setattr(vllm_envs, "VLLM_DISABLE_COMPILE_CACHE", False)
+    monkeypatch.delenv("LOCAL_RANK", raising=False)
+
+    state = SimpleNamespace(
+        artifact=b"bundle-bytes",
+        save_result=None,  # set below; None means "torch returned nothing"
+        loaded=[],
+        set_dirs=[],
+        flushed=0,
+        save_raises=None,
+    )
+    state.save_result = (state.artifact, object())
+
+    def fake_save():
+        if state.save_raises is not None:
+            raise state.save_raises
+        return state.save_result
+
+    monkeypatch.setattr(rbln_mega_cache, "set_dir", state.set_dirs.append)
+
+    def fake_flush():
+        state.flushed += 1
+
+    monkeypatch.setattr(rbln_mega_cache, "flush_to_bundle", fake_flush)
+    monkeypatch.setattr(
+        sys.modules["torch"].compiler, "save_cache_artifacts", fake_save
+    )
+    monkeypatch.setattr(
+        sys.modules["torch"].compiler,
+        "load_cache_artifacts",
+        state.loaded.append,
+    )
+    state.path = mega_cache.bundle_path("m", "sig")
+    return state
+
+
+class TestSaveLoadRoundTrip:
+    def test_round_trip(self, bundle_env):
+        mega_cache.save("m", "sig")
+        assert os.path.isfile(bundle_env.path)
+        with open(bundle_env.path, "rb") as f:
+            assert f.read() == bundle_env.artifact
+
+        mega_cache.load("m", "sig")
+        assert bundle_env.loaded == [bundle_env.artifact]
+
+    def test_save_flushes_staged_blobs_first(self, bundle_env):
+        # Disk-staged .rbln blobs only enter the bundle via flush_to_bundle().
+        mega_cache.save("m", "sig")
+        assert bundle_env.flushed == 1
+
+    def test_both_point_rebel_at_cache_root(self, bundle_env):
+        mega_cache.save("m", "sig")
+        mega_cache.load("m", "sig")
+        assert bundle_env.set_dirs == [mega_cache.cache_root()] * 2
+
+    def test_save_leaves_no_tmp_file(self, bundle_env):
+        mega_cache.save("m", "sig")
+        leftovers = [
+            os.path.join(root, name)
+            for root, _, files in os.walk(os.path.dirname(bundle_env.path))
+            for name in files
+            if name.endswith(".tmp")
+        ]
+        assert not leftovers
+
+    def test_load_miss_is_silent(self, bundle_env):
+        mega_cache.load("m", "sig")  # nothing saved yet
+        assert bundle_env.loaded == []
+
+    def test_signature_miss_does_not_read_other_bundle(self, bundle_env):
+        mega_cache.save("m", "sig")
+        mega_cache.load("m", "other-sig")
+        assert bundle_env.loaded == []
+
+    def test_rank_miss_does_not_read_other_rank(self, bundle_env, monkeypatch):
+        mega_cache.save("m", "sig")
+        monkeypatch.setenv("LOCAL_RANK", "1")
+        mega_cache.load("m", "sig")
+        assert bundle_env.loaded == []
+
+    def test_save_writes_nothing_when_torch_returns_none(self, bundle_env):
+        bundle_env.save_result = None
+        mega_cache.save("m", "sig")
+        assert not os.path.exists(bundle_env.path)
+
+    def test_save_failure_leaves_no_bundle(self, bundle_env):
+        bundle_env.save_raises = RuntimeError("boom")
+        mega_cache.save("m", "sig")  # must not propagate
+        assert not os.path.exists(bundle_env.path)
+
+    def test_save_failure_keeps_previous_bundle(self, bundle_env):
+        mega_cache.save("m", "sig")
+        bundle_env.save_raises = RuntimeError("boom")
+        mega_cache.save("m", "sig")
+        with open(bundle_env.path, "rb") as f:
+            assert f.read() == bundle_env.artifact
+
+    def test_corrupt_bundle_does_not_raise(self, bundle_env, monkeypatch):
+        import sys
+
+        os.makedirs(os.path.dirname(bundle_env.path), exist_ok=True)
+        with open(bundle_env.path, "wb") as f:
+            f.write(b"garbage")
+
+        def boom(_):
+            raise RuntimeError("bad bundle")
+
+        monkeypatch.setattr(sys.modules["torch"].compiler, "load_cache_artifacts", boom)
+        mega_cache.load("m", "sig")  # warns, must not propagate
+
+    def test_resave_replaces_in_place(self, bundle_env):
+        mega_cache.save("m", "sig")
+        bundle_env.artifact = b"second-bundle"
+        bundle_env.save_result = (bundle_env.artifact, object())
+        mega_cache.save("m", "sig")
+        with open(bundle_env.path, "rb") as f:
+            assert f.read() == b"second-bundle"
+
+    def test_disabled_compile_cache_is_a_no_op(self, bundle_env, monkeypatch):
+        import vllm.envs as vllm_envs
+
+        monkeypatch.setattr(vllm_envs, "VLLM_DISABLE_COMPILE_CACHE", True)
+        mega_cache.save("m", "sig")
+        assert not os.path.exists(bundle_env.path)
+        mega_cache.load("m", "sig")
+        assert bundle_env.loaded == []
+        assert bundle_env.set_dirs == []
+
+
+def _real_vllm_config(**overrides):
+    from vllm.config import (
+        CacheConfig,
+        ModelConfig,
+        ParallelConfig,
+        SchedulerConfig,
+        VllmConfig,
+    )
+
+    return VllmConfig(
+        model_config=ModelConfig(
+            model=overrides.get("model", "facebook/opt-125m"),
+            dtype=overrides.get("dtype", "float16"),
+            max_model_len=overrides.get("max_model_len", 2048),
+        ),
+        cache_config=CacheConfig(
+            block_size=overrides.get("block_size", 1024),
+            gpu_memory_utilization=0.9,
+            cache_dtype="auto",
+        ),
+        scheduler_config=SchedulerConfig.default_factory(),
+        parallel_config=ParallelConfig(
+            data_parallel_size=overrides.get("data_parallel_size", 2),
+            tensor_parallel_size=overrides.get("tensor_parallel_size", 1),
+        ),
+    )
+
+
+class TestConfigSignatureRealVllmConfig:
+    """Against a real VllmConfig, not a SimpleNamespace stand-in."""
+
+    def test_launch_stable(self):
+        # Two independently built identical configs must key one bundle.
+        assert mega_cache.config_signature(
+            _real_vllm_config()
+        ) == mega_cache.config_signature(_real_vllm_config())
+
+    def test_real_coord_store_port_ignored(self):
+        # The field that made the signature move every launch.
+        cfg = _real_vllm_config()
+        object.__setattr__(cfg.parallel_config, "_coord_store_port", 38735)
+        a = mega_cache.config_signature(cfg)
+        object.__setattr__(cfg.parallel_config, "_coord_store_port", 41200)
+        assert mega_cache.config_signature(cfg) == a
+
+    def test_every_real_port_field_is_swept(self):
+        cfg = _real_vllm_config()
+        port_fields = [
+            f.name
+            for f in dataclasses.fields(cfg.parallel_config)
+            if "port" in f.name.lower()
+        ]
+        # Guard against the sweep silently becoming a no-op upstream.
+        assert port_fields
+        base = mega_cache.config_signature(cfg)
+        for name in port_fields:
+            original = getattr(cfg.parallel_config, name)
+            probe = [50001, 50002] if isinstance(original, list) else 50000
+            object.__setattr__(cfg.parallel_config, name, probe)
+            assert mega_cache.config_signature(cfg) == base, name
+            object.__setattr__(cfg.parallel_config, name, original)
+
+    def test_real_port_fields_restored(self):
+        cfg = _real_vllm_config()
+        object.__setattr__(cfg.parallel_config, "_coord_store_port", 38735)
+        before = {
+            f.name: getattr(cfg.parallel_config, f.name)
+            for f in dataclasses.fields(cfg.parallel_config)
+            if "port" in f.name.lower()
+        }
+        mega_cache.config_signature(cfg)
+        after = {name: getattr(cfg.parallel_config, name) for name in before}
+        assert after == before
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"block_size": 512},
+            {"tensor_parallel_size": 4},
+            {"max_model_len": 1024},
+            {"dtype": "bfloat16"},
+        ],
+        ids=["block_size", "tp", "max_model_len", "dtype"],
+    )
+    def test_graph_relevant_config_invalidates(self, overrides):
+        base = mega_cache.config_signature(_real_vllm_config())
+        assert mega_cache.config_signature(_real_vllm_config(**overrides)) != base
+
+    def test_signature_shape(self):
+        sig = mega_cache.config_signature(_real_vllm_config())
+        assert re.fullmatch(r"[0-9a-f]{16}", sig)
+
+    def test_signature_is_a_single_path_segment(self):
+        # It becomes a directory name in bundle_path().
+        sig = mega_cache.config_signature(_real_vllm_config())
+        assert os.sep not in sig
