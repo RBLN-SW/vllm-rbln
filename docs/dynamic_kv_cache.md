@@ -13,7 +13,9 @@ No recompilation happens: the affected dimension is `mark_dynamic`'d.
 > Requires `VLLM_RBLN_USE_VLLM_MODEL=1` (only `DynamoRuntime` applies adaptive
 > buffer sizes) and a `rebel-compiler` carrying `rebel_compiler#10678`
 > (`rebel.kv_cache.max_num_blocks`, `DynamoRuntime.reset_adaptive_buffers`).
-> Both are checked at start-up, before anything is compiled.
+> Both are checked at start-up, before anything is compiled -- the flag pair in
+> `RblnPlatform.check_and_update_config`, the compiler API in
+> `_assert_dynamic_kv_compiler_support`.
 
 ## Enabling
 

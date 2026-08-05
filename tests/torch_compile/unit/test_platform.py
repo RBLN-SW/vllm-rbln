@@ -97,3 +97,48 @@ def test_get_attn_backend_cls():
         f"Expected 'vllm_rbln.attention.backends.flash_attention.\
         RBLNFlashAttentionBackend', got {attn_backend_cls}"
     )
+
+
+# ---------------------------------------------------------------------------
+# check_and_update_config: VLLM_RBLN_USE_DYNAMIC_KV_CACHE needs the vLLM-native
+# path. The check has to sit outside the VLLM_RBLN_USE_VLLM_MODEL branch --
+# `validate_and_setup_prerequisite` only runs inside it, so a guard placed there
+# cannot see the optimum-rbln path this refuses.
+# ---------------------------------------------------------------------------
+def _thin_config():
+    from types import SimpleNamespace
+
+    # Enough to reach the flag check and no further; the method needs a real
+    # VllmConfig to finish either branch.
+    return SimpleNamespace(
+        model_config=SimpleNamespace(),
+        parallel_config=SimpleNamespace(),
+        scheduler_config=SimpleNamespace(async_scheduling=False),
+    )
+
+
+def test_dynamic_kv_without_the_vllm_model_path_is_refused(monkeypatch):
+    import pytest
+
+    from vllm_rbln.platform import RblnPlatform
+
+    monkeypatch.setenv("VLLM_RBLN_USE_DYNAMIC_KV_CACHE", "1")
+    monkeypatch.delenv("VLLM_RBLN_USE_VLLM_MODEL", raising=False)
+    with pytest.raises(ValueError, match="VLLM_RBLN_USE_VLLM_MODEL=1"):
+        RblnPlatform.check_and_update_config(_thin_config())
+
+
+def test_the_dynamic_kv_flag_check_does_not_overreach(monkeypatch):
+    import pytest
+
+    from vllm_rbln.platform import RblnPlatform
+
+    # Both valid pairings must get past this check. The thin config cannot carry
+    # either branch to the end, so assert only that this guard is not what
+    # stopped it.
+    for dynamic_kv, use_vllm_model in (("0", "0"), ("1", "1")):
+        monkeypatch.setenv("VLLM_RBLN_USE_DYNAMIC_KV_CACHE", dynamic_kv)
+        monkeypatch.setenv("VLLM_RBLN_USE_VLLM_MODEL", use_vllm_model)
+        with pytest.raises(Exception) as excinfo:
+            RblnPlatform.check_and_update_config(_thin_config())
+        assert "VLLM_RBLN_USE_DYNAMIC_KV_CACHE" not in str(excinfo.value)
