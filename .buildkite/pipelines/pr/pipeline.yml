@@ -72,6 +72,16 @@ steps:
       - *sync
       - "uv run --no-sync pytest tests/optimum/optimum_compile/converter -vv --durations 0"
 
+  # Lint/format gate (moved off GHA check-code-quality). No project `uv sync`:
+  # pre-commit hooks install their own envs. Mirrors pre-commit.yml's
+  # `--all-files --hook-stage manual`.
+  - label: ":lint: pre-commit"
+    image: "${DEVTOOLS_DOCKER_IMAGE}"
+    resources: *cpu-only-resources
+    secrets: *secrets
+    command:
+      - "uv tool run pre-commit run --all-files --hook-stage manual --show-diff-on-failure"
+
   # ===========================================================================
   # NPU suites -> k8s queue (inherited) + npu reservation.
   # ===========================================================================
