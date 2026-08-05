@@ -22,69 +22,26 @@ on:
 
 jobs:
   build-vllm-rbln:
-    name: Build vllm-rbln wheel
+    name: Build vllm-rbln wheel (packaging check)
     runs-on: rbln-sw-k8s-general
-    outputs:
-      wheel_filename: ${{ steps.get_wheel_filename.outputs.WHEEL_FILENAME }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref != '' && inputs.ref || github.sha }}
-          fetch-depth: 0
+          fetch-depth: 0 # setuptools_scm needs tags to compute the version
 
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Install build dependencies and build vllm-rbln wheel
+      - name: Build wheel (fails if packaging is broken)
+        # `python -m build` installs the [build-system].requires (setuptools_scm
+        # etc.) into an isolated env, so only `build` itself is needed here.
         run: |
-          python -m pip install build setuptools_scm
+          python -m pip install build
           python -m build --wheel
-
-      - name: Get wheel filename
-        id: get_wheel_filename
-        run: |
-          WHEEL_FILENAME=$(ls dist/vllm_rbln-*.whl | xargs basename)
-          echo "Found wheel file: ${WHEEL_FILENAME}"
-          echo "WHEEL_FILENAME=${WHEEL_FILENAME}" >> $GITHUB_OUTPUT
-      
-      - name: Upload wheel artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: vllm-wheel
-          path: dist/
-          retention-days: 7
-
-  vllm-rbln-pytest:
-    name: Trigger Obedients vllm-rbln PR CI
-    needs: [build-vllm-rbln]
-    if: ${{ always() && !cancelled() && needs.build-vllm-rbln.result == 'success' }}
-    runs-on: rbln-sw-k8s-general
-    steps:
-      # Replaces the GHA self-hosted pytest jobs: POST an Obedients (Buildkite)
-      # build that runs .buildkite/pipeline.yml on the OB agents (devtools
-      # container + writable shared HF cache). Buildkite checks out `commit` on
-      # `branch`, so the build runs the PR's code.
-      - name: Trigger Obedients build
-        env:
-          OBEDIENTS_API_TOKEN: ${{ secrets.OBEDIENTS_API_TOKEN }}
-          OBEDIENTS_API_URL: ${{ secrets.OBEDIENTS_API_URL }}
-          SHA: ${{ github.event.pull_request.head.sha || inputs.ref || github.sha }}
-          REF: ${{ github.head_ref || inputs.ref || github.ref_name }}
-          PR: ${{ github.event.pull_request.number || inputs.pr_number }}
-        run: |
-          set -euo pipefail
-          command -v jq >/dev/null 2>&1 || (sudo apt-get update && sudo apt-get install -y jq curl)
-          curl -fsS --retry 5 --retry-max-time 120 -X POST \
-            "${OBEDIENTS_API_URL}/v2/organizations/main/pipelines/vllm-rbln-pr-ci-optimum/builds" \
-            -H "Authorization: Bearer ${OBEDIENTS_API_TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d "$(jq -n --arg sha "$SHA" --arg ref "$REF" --arg pr "$PR" \
-              '{commit: $sha, branch: $ref,
-                message: ("vllm-rbln PR #" + $pr + " CI"),
-                env: {VLLM_RBLN_REF: $ref}}')"
 
   # vllm-rbln-optimum-ci:
   #   needs: [build-vllm-rbln]
