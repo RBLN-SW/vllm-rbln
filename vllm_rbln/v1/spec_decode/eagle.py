@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -23,6 +24,7 @@ from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 import vllm_rbln.envs as envs
@@ -44,10 +46,10 @@ from vllm_rbln.v1.attention.kv_cache_bindings import (
 )
 from vllm_rbln.v1.spec_decode.utils import (
     DRAFT_ID_LOG_STEPS,
-    PREFILL_SHAPE_LOG,
     FUSE_FIRST_FORWARD,
     FUSE_PREFILL,
     NARROW_LOGITS,
+    PREFILL_SHAPE_LOG,
     SKIP_DP_RENDEZVOUS,
     UNROLL_DRAFTER,
     WARMUP_SKIP_FOLD,
@@ -94,8 +96,10 @@ class RBLNEagleProposer(EagleProposer):
 
         self.runner = runner
         self.arange_cpu = torch.arange(self.arange.shape[0], dtype=torch.int32)
-        # Set in load_model when eagle3 + compilation are both on.
-        self._compiled_unrolled = None
+        # Set in load_model when eagle3 + compilation are both on.  Annotated
+        # because mypy otherwise infers `None` from the initialiser and rejects
+        # the call in `_propose_unrolled`.
+        self._compiled_unrolled: Callable[..., torch.Tensor] | None = None
         self._draft_id_logged = 0
         self._prefill_shape_logged = 0
 
@@ -204,7 +208,6 @@ class RBLNEagleProposer(EagleProposer):
             ids = self.model.target_ids.index_select(0, ids)
         return ids
 
-
     def _build_loop_metadata(
         self,
         common_attn_metadata: CommonAttentionMetadata,
@@ -250,7 +253,6 @@ class RBLNEagleProposer(EagleProposer):
             for layer_name in attn_group.layer_names:
                 per_layer[layer_name] = am
         return per_layer, positions
-
 
     def _propose_unrolled(
         self,
@@ -331,7 +333,11 @@ class RBLNEagleProposer(EagleProposer):
                 **build_kv_cache_forward_context_kwargs(self.runner.kv_cache_bases),
             ),
         ):
-            draft_token_ids = self._compiled_unrolled(
+            # `propose` guards this, but the narrowing does not cross the call
+            # boundary, so bind it locally (same pattern as 3e348e1f).
+            unrolled = self._compiled_unrolled
+            assert unrolled is not None
+            draft_token_ids = unrolled(
                 input_ids,
                 positions,
                 hidden_states,
@@ -504,16 +510,17 @@ class RBLNEagleProposer(EagleProposer):
             draft_tokens_ids = self._draft_ids(logits, num_reqs)
             return draft_tokens_ids.view(-1, 1)
 
-        assert token_indices_to_sample_padded is not None
-        positions = target_positions[
-            token_indices_to_sample_padded.to(target_positions.device)
-        ]
+        with record_function_or_nullcontext("drafter/first: sample"):
+            assert token_indices_to_sample_padded is not None
+            positions = target_positions[
+                token_indices_to_sample_padded.to(target_positions.device)
+            ]
 
-        # `hidden_states` is deliberately not gathered here -- #821 moved
-        # that gather inside `model_wrapper`. Doing it again would index an
-        # already (num_reqs_padded, hidden_size) tensor with token-space
-        # indices and raise on the first decode.
-        draft_token_ids = self._draft_ids(logits, num_reqs)
+            # `hidden_states` is deliberately not gathered here -- #821 moved
+            # that gather inside `model_wrapper`. Doing it again would index an
+            # already (num_reqs_padded, hidden_size) tensor with token-space
+            # indices and raise on the first decode.
+            draft_token_ids = self._draft_ids(logits, num_reqs)
 
         if self.allowed_attn_types is not None and not isinstance(
             attn_metadata, self.allowed_attn_types
@@ -552,48 +559,53 @@ class RBLNEagleProposer(EagleProposer):
                 self._determine_draft_batch_padding(num_reqs, num_reqs, False)
             )
         for token_index in range(self.num_speculative_tokens - 1):
-            self.input_ids[:num_reqs] = draft_token_ids_list[-1].int()
-            positions = positions.view(-1) + 1
-            self.positions[:num_reqs] = positions[:num_reqs]
-            self.hidden_states[: hidden_states.shape[0]] = hidden_states
+            with record_function_or_nullcontext("drafter: loop_update"):
+                self.input_ids[:num_reqs] = draft_token_ids_list[-1].int()
+                positions = positions.view(-1) + 1
+                self.positions[:num_reqs] = positions[:num_reqs]
+                self.hidden_states[: hidden_states.shape[0]] = hidden_states
 
-            exceeds_max_model_len = positions[:num_reqs] >= self.max_model_len
-            common_attn_metadata.seq_lens += 1
-            common_attn_metadata.seq_lens.masked_fill_(exceeds_max_model_len, 1)
-            # Mirror the device op exactly: unsliced, same mask.
-            self._mirror_seq_lens_to_host(
-                common_attn_metadata, 1, exceeds_max_model_len
-            )
+                exceeds_max_model_len = positions[:num_reqs] >= self.max_model_len
+                common_attn_metadata.seq_lens += 1
+                common_attn_metadata.seq_lens.masked_fill_(exceeds_max_model_len, 1)
+                # Mirror the device op exactly: unsliced, same mask.
+                self._mirror_seq_lens_to_host(
+                    common_attn_metadata, 1, exceeds_max_model_len
+                )
 
-            per_layer_attn_metadata.clear()
-            for attn_group in self.draft_attn_groups:
-                attn_metadata = attn_group.get_metadata_builder().build(
-                    common_attn_metadata=common_attn_metadata,
-                    positions=positions,
-                    is_prefill=False,
-                    batch_pad=num_reqs_padded,
-                )
-                attach_kv_cache_bindings(
-                    attn_metadata,
-                    self.runner.kv_caches,
-                    self.runner.kv_cache_bases,
-                    self.runner.kv_cache_view_infos,
-                )
-                for layer_name in attn_group.layer_names:
-                    per_layer_attn_metadata[layer_name] = attn_metadata
+            with record_function_or_nullcontext("drafter: attn_meta"):
+                per_layer_attn_metadata.clear()
+                for attn_group in self.draft_attn_groups:
+                    attn_metadata = attn_group.get_metadata_builder().build(
+                        common_attn_metadata=common_attn_metadata,
+                        positions=positions,
+                        is_prefill=False,
+                        batch_pad=num_reqs_padded,
+                    )
+                    attach_kv_cache_bindings(
+                        attn_metadata,
+                        self.runner.kv_caches,
+                        self.runner.kv_cache_bases,
+                        self.runner.kv_cache_view_infos,
+                    )
+                    for layer_name in attn_group.layer_names:
+                        per_layer_attn_metadata[layer_name] = attn_metadata
 
             input_ids, positions, hidden_states, _ = self._preprocess(
                 num_reqs, num_reqs_padded, num_reqs, None, False
             )
 
             # Run the model.
-            with set_forward_context(
-                per_layer_attn_metadata,
-                self.vllm_config,
-                num_tokens=num_reqs,
-                num_tokens_across_dp=num_tokens_across_dp,
-                num_padded_tokens=num_padded_tokens,
-                **build_kv_cache_forward_context_kwargs(self.runner.kv_cache_bases),
+            with (
+                record_function_or_nullcontext("drafter: forward"),
+                set_forward_context(
+                    per_layer_attn_metadata,
+                    self.vllm_config,
+                    num_tokens=num_reqs,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    num_padded_tokens=num_padded_tokens,
+                    **build_kv_cache_forward_context_kwargs(self.runner.kv_cache_bases),
+                ),
             ):
                 hidden_states, logits = self.model_executable(
                     input_ids=input_ids,
@@ -1048,7 +1060,11 @@ class RBLNEagleProposer(EagleProposer):
         token_indices_to_sample: torch.Tensor | None,
         is_prefill: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        if PREFILL_SHAPE_LOG and is_prefill and self._prefill_shape_logged < PREFILL_SHAPE_LOG:
+        if (
+            PREFILL_SHAPE_LOG
+            and is_prefill
+            and self._prefill_shape_logged < PREFILL_SHAPE_LOG
+        ):
             self._prefill_shape_logged += 1
             ragged = num_reqs > 1 and num_input_tokens % num_reqs != 0
             logger.info(

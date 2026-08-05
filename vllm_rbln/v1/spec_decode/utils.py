@@ -251,7 +251,6 @@ WARMUP_SKIP_FOLD = os.getenv("VLLM_RBLN_EAGLE3_WARMUP_SKIP_FOLD", "0") == "1"
 FUSE_PREFILL = os.getenv("VLLM_RBLN_EAGLE3_FUSE_PREFILL", "1") == "1"
 
 
-
 def eagle_prepare_next_token_padded(
     # [bs, num_sampled_tokens_per_req]
     sampled_token_ids: torch.Tensor,

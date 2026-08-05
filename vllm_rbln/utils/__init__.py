@@ -61,9 +61,7 @@ def cat_last_dim(tensors: list[torch.Tensor]) -> torch.Tensor:
         return torch.cat(tensors, dim=-1)
     rows = tensors[0].shape[0]
     total = sum(t.shape[-1] for t in tensors)
-    out = torch.empty(
-        (rows, total), dtype=tensors[0].dtype, device=tensors[0].device
-    )
+    out = torch.empty((rows, total), dtype=tensors[0].dtype, device=tensors[0].device)
     off = 0
     for t in tensors:
         width = t.shape[-1]
