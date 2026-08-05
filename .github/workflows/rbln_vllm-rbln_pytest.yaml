@@ -207,7 +207,6 @@ jobs:
         shell: bash
     env:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
-      # HF_HOME: ${{ secrets.HF_HOME }}
     strategy:
       fail-fast: ${{ inputs.fail_fast }}
       matrix:
