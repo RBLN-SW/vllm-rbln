@@ -39,6 +39,8 @@ from . import (
     qwen2_moe,
     qwen3_moe,
     rotary_embedding,
+    tracing_nixl,
+    tracing_request_phases,
 )
 
 __all__ = (
