@@ -32,6 +32,7 @@ class RBLNKVCacheManager(KVCacheManager):
         self,
         kv_cache_config: KVCacheConfig,
         max_model_len: int,
+        scheduler_block_size: int,
         hash_block_size: int,
         max_num_batched_tokens: int | None = None,
         enable_caching: bool = True,
@@ -41,6 +42,7 @@ class RBLNKVCacheManager(KVCacheManager):
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        watermark: float = 0.0,
         attn_block_size: int | None = None,
         max_num_seqs: int = 1,
         is_encoder_decoder: bool = False,
@@ -58,18 +60,21 @@ class RBLNKVCacheManager(KVCacheManager):
         self.use_eagle = use_eagle
         self.log_stats = log_stats
         self.metrics_collector = metrics_collector
+        self.scheduler_block_size = scheduler_block_size
+        assert watermark == 0.0, "watermark is not supported on the RBLN optimum path"
+        self.watermark_blocks = 0
         # FIXME: make prefix cache stats conditional on log_stats. We still need
         # this comment because when the log stats is enabled there are still
         # potential configs we could expose in the future.
         self.prefix_cache_stats = PrefixCacheStats() if log_stats else None
         # NOTE(eunji.lee):
-        # max_num_batched_tokens may exceed max_model_len. It only feeds the
-        # recycling-aware admission cap for SWA / chunked-local specs, and even
-        # there it is clamped by max_model_len. Full/cross-attention block
-        # allocation (e.g. Whisper) sizes purely off the request's own tokens.
-        assert max_num_batched_tokens is not None, (
-            "max_num_batched_tokens must be set in `sync_vllm_and_optimum`."
-        )
+        # This is the scheduler's per-step token budget, not
+        # scheduler_config.max_num_batched_tokens (which on the optimum path is
+        # the compiled prefill chunk size). It only feeds the recycling-aware
+        # admission cap for SWA / chunked-local specs, clamped there by
+        # max_model_len; full/cross-attention block allocation (e.g. Whisper)
+        # sizes purely off the request's own tokens.
+        assert max_num_batched_tokens is not None, "max_num_batched_tokens must be set."
         self.coordinator = RBLNKVCacheCoordinator(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
@@ -79,6 +84,7 @@ class RBLNKVCacheManager(KVCacheManager):
             enable_kv_cache_events=enable_kv_cache_events,
             dcp_world_size=dcp_world_size,
             pcp_world_size=pcp_world_size,
+            scheduler_block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
             is_encoder_decoder=is_encoder_decoder,
@@ -335,15 +341,11 @@ class RBLNKVCacheManager(KVCacheManager):
         num_new_computed_tokens: int,
     ) -> tuple[list[int], list[int]]:
         cached_blocks = new_computed_blocks.get_block_ids()[0]
-        cached_block_table, cached_length = (
-            self.prefix_cache_manager.get_matched_outer_blocks(
-                request.request_id,
-                cached_blocks,
-                num_new_computed_tokens,
-            )
+        return self.prefix_cache_manager.get_matched_outer_blocks(
+            request.request_id,
+            cached_blocks,
+            num_new_computed_tokens,
         )
-
-        return cached_block_table, cached_length
 
     def get_block_table(self, request_id: str) -> torch.Tensor:
         return self.prefix_cache_manager.get_blocks(request_id)

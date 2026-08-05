@@ -63,6 +63,10 @@ _RBLN_MULTIMODAL_MODELS = {
         "qwen3_vl_moe",
         "RBLNQwen3VLMoeForConditionalGeneration",
     ),
+    "Qwen3_5ForConditionalGeneration": (
+        "qwen3_5",
+        "RBLNQwen3_5ForConditionalGeneration",
+    ),
     "Exaone4_5_ForConditionalGeneration": (
         "exaone4_5",
         "RBLNExaone4_5_ForConditionalGeneration",
@@ -82,13 +86,11 @@ _RBLN_MULTIMODAL_MODELS = {
 }
 
 _RBLN_EMBEDDING_MODELS = {
-    "T5EncoderModel": ("t5_encoder", "RBLNT5EncoderModel"),
     "BertModel": ("bert_model", "RBLNBertModel"),
     "RobertaForSequenceClassification": (
         "roberta_classification",
         "RBLNRobertaForSequenceClassification",
     ),
-    "RobertaModel": ("roberta", "RBLNRobertaModel"),
     "XLMRobertaForSequenceClassification": (
         "xlm_roberta_classification",
         "RBLNXLMRobertaForSequenceClassification",

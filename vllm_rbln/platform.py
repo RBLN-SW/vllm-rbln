@@ -28,19 +28,16 @@ else:
 
 import rebel
 from torch._dynamo import register_backend
+from vllm.logger import init_logger
 from vllm.platforms import Platform, PlatformEnum
 
+import vllm_rbln.logger  # noqa: F401
 from vllm_rbln import envs
-from vllm_rbln.logger import init_logger
-from vllm_rbln.utils.optimum.converter import sync_vllm_and_optimum
-from vllm_rbln.utils.optimum.predicates import is_qwen3_pooling
-from vllm_rbln.utils.optimum.registry import (
-    is_enc_dec_arch,
-    is_multi_modal,
-    is_pooling_arch,
-)
 
 logger = init_logger(__name__)
+# Earliest point at which `vllm.envs` is guaranteed to exist, and still before
+# any engine code reads a variable.
+envs.publish_to_vllm_envs()
 
 try:
     import torch.rbln  # noqa: F401
@@ -174,11 +171,60 @@ class RblnPlatform(Platform):
         EngineArgs._rbln_max_num_seqs_patched = True
 
     @classmethod
+    def _capture_user_max_num_batched_tokens(cls) -> None:
+        """Stash the user's raw max_num_batched_tokens so the converter can read it.
+
+        In the RBLN optimum path an explicit max_num_batched_tokens IS the
+        prefill chunk size, so ``sync_from_vllm`` needs to know whether the user
+        set it. By the time that runs it can no longer tell, because vLLM has
+        already overwritten the value:
+
+          1. The user passes ``max_num_batched_tokens`` (an int) or leaves it
+             ``None``.
+          2. ``_set_default_max_num_seqs_and_batched_tokens_args`` replaces a
+             ``None`` with a throughput default and, since chunked prefill is
+             off on RBLN, floors it up to ``max_model_len``.
+          3. ``VllmConfig.__post_init__`` calls ``check_and_update_config`` ->
+             ``sync_from_vllm``, which now sees a concrete number with no trace
+             of whether it came from the user or from step 2.
+
+        This wrapper runs at the start of step 2, before the overwrite, and
+        records the raw value (``None`` if unset) into ``additional_config``,
+        which flows unchanged into ``VllmConfig``. ``sync_from_vllm`` then reads
+        it via ``get_user_max_num_batched_tokens``.
+        """
+        from vllm.engine.arg_utils import EngineArgs
+
+        from vllm_rbln.utils.optimum.converter.common import (
+            USER_MAX_NUM_BATCHED_TOKENS_KEY,
+        )
+
+        if getattr(EngineArgs, "_rbln_user_mnbt_patched", False):
+            return
+
+        orig_set_defaults = EngineArgs._set_default_max_num_seqs_and_batched_tokens_args
+
+        def _set_default_max_num_seqs_and_batched_tokens_args(self, *args, **kwargs):
+            # Runs before the value is resolved from None to its default.
+            if self.additional_config is None:
+                self.additional_config = {}
+            self.additional_config[USER_MAX_NUM_BATCHED_TOKENS_KEY] = (
+                self.max_num_batched_tokens
+            )
+            return orig_set_defaults(self, *args, **kwargs)
+
+        EngineArgs._set_default_max_num_seqs_and_batched_tokens_args = (
+            _set_default_max_num_seqs_and_batched_tokens_args
+        )
+        EngineArgs._rbln_user_mnbt_patched = True
+
+    @classmethod
     def pre_register_and_update(
         cls, parser: "FlexibleArgumentParser | None" = None
     ) -> None:
         # Runs before max_num_seqs is resolved from None to its default.
         cls._override_default_max_num_seqs()
+        cls._capture_user_max_num_batched_tokens()
 
         if parser is None:
             return
@@ -193,6 +239,9 @@ class RblnPlatform(Platform):
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
+        from vllm_rbln.utils.optimum.converter import sync_vllm_and_optimum
+        from vllm_rbln.utils.optimum.registry import is_pooling_arch
+
         if envs.VLLM_USE_V2_MODEL_RUNNER:
             raise ValueError(
                 "VLLM_USE_V2_MODEL_RUNNER is not supported for RBLN backend."
@@ -354,6 +403,21 @@ class RblnPlatform(Platform):
             )
 
     @classmethod
+    def register_custom_kv_cache_specs(cls, vllm_config: "VllmConfig") -> None:
+        from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+
+        from vllm_rbln.v1.kv_cache import (
+            RBLNSlidingWindowManager,
+            RBLNSlidingWindowSpec,
+        )
+
+        KVCacheSpecRegistry.register(
+            RBLNSlidingWindowSpec,
+            RBLNSlidingWindowManager,
+            uniform_type_base_spec=RBLNSlidingWindowSpec,
+        )
+
+    @classmethod
     def is_pin_memory_available(cls):
         logger.warning("Pin memory is not supported on RBLN.")
         return False
@@ -444,17 +508,51 @@ class RblnPlatform(Platform):
         )
         vllm_config.cache_config.enable_prefix_caching = False
 
+    @staticmethod
+    def _uses_sliding_window(hf_config) -> bool:
+        """Whether any layer uses sliding-window attention. Reads the text
+        sub-config (multimodal composites nest it), honors a
+        ``use_sliding_window=False`` opt-out, and treats a sliding ``layer_types``
+        entry as sliding. Errs toward True (disabling prefix caching is safe).
+        """
+        config = (
+            hf_config.get_text_config()
+            if hasattr(hf_config, "get_text_config")
+            else hf_config
+        )
+        # use_sliding_window is a Qwen2-only opt-out flag; models without it
+        # (Gemma/Mistral) are judged by sliding_window/layer_types, so default
+        # to True (no opt-out) to avoid short-circuiting their detection.
+        if not getattr(config, "use_sliding_window", True):
+            return False
+        if getattr(config, "sliding_window", None) is not None:
+            return True
+        layer_types = getattr(config, "layer_types", None) or []
+        return any("sliding" in str(layer_type).lower() for layer_type in layer_types)
+
     @classmethod
     def disable_unsupported_prefix_caching(cls, vllm_config: VllmConfig) -> None:
+        from vllm_rbln.utils.optimum.predicates import is_qwen3_pooling
+        from vllm_rbln.utils.optimum.registry import (
+            is_enc_dec_arch,
+            is_pooling_arch,
+        )
+
         if not vllm_config.cache_config.enable_prefix_caching:
+            return
+        # An EC producer runs only the (vision) encoder and never executes the
+        # LLM, so it holds no KV cache. Prefix caching there is a no-op and its
+        # KV-cache manager is only a placeholder, so disable it explicitly.
+        ec = getattr(vllm_config, "ec_transfer_config", None)
+        if ec is not None and ec.is_ec_producer and not ec.is_ec_consumer:
+            cls._disable_prefix_caching(vllm_config, "EC producer (encoder-only)")
             return
 
         hf_config = vllm_config.model_config.hf_config
+        has_sliding_window = cls._uses_sliding_window(hf_config)
 
         if envs.VLLM_RBLN_USE_VLLM_MODEL:
-            if getattr(hf_config, "sliding_window", None) is not None and getattr(
-                hf_config, "use_sliding_window", True
-            ):
+            if has_sliding_window:
                 cls._disable_prefix_caching(vllm_config, "sliding window models")
 
         else:
@@ -464,13 +562,9 @@ class RblnPlatform(Platform):
                 cls._disable_prefix_caching(vllm_config, "Qwen3 pooling models")
             elif is_enc_dec_arch(hf_config):
                 cls._disable_prefix_caching(vllm_config, "encoder-decoder models")
-            elif is_multi_modal(hf_config):
-                cls._disable_prefix_caching(vllm_config, "multimodal models")
             elif is_pooling_arch(hf_config):
                 cls._disable_prefix_caching(vllm_config, "pooling models")
-            elif getattr(hf_config, "sliding_window", None) is not None and getattr(
-                hf_config, "use_sliding_window", True
-            ):
+            elif has_sliding_window:
                 cls._disable_prefix_caching(vllm_config, "sliding window models")
 
     @classmethod

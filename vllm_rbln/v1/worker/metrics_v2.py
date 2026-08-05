@@ -12,13 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 import time
 from collections import defaultdict
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import TypeVar
+
+import numpy as np
 
 from vllm_rbln import envs
 from vllm_rbln.logger import init_logger
@@ -30,7 +32,6 @@ T = TypeVar("T", int, float)
 @dataclass
 class Metrics:
     latencies: list[float] = field(default_factory=list)
-    token_counts: list[int] = field(default_factory=list)
     host_times: list[int] = field(default_factory=list)
     device_times: list[int] = field(default_factory=list)
     ccl_times: list[int] = field(default_factory=list)
@@ -39,14 +40,12 @@ class Metrics:
     def record(
         self,
         latency: float,
-        token_count: int,
         host_time: int | None = None,
         device_time: int | None = None,
         ccl_time: int | None = None,
         prepare_time: int | None = None,
     ) -> None:
         self.latencies.append(latency)
-        self.token_counts.append(token_count)
         if host_time is not None:
             self.host_times.append(host_time)
         if device_time is not None:
@@ -60,40 +59,58 @@ class Metrics:
     def call_count(self) -> int:
         return len(self.latencies)
 
-    def _drop_outlier(self, values: list[T]) -> list[T]:
-        if len(values) <= 1:
-            return values
-        mean = sum(values) / len(values)
-        worst = max(range(len(values)), key=lambda i: abs(values[i] - mean))
-        return [v for i, v in enumerate(values) if i != worst]
+    def mean_latency_ms(self) -> float:
+        return _mean(self.latencies) * 1000
 
-    def _avg(self, values: list[T], drop_outlier: bool = True) -> float:
-        if drop_outlier:
-            values = self._drop_outlier(values)
-        return sum(values) / len(values) if values else 0.0
+    def latency_percentiles_ms(
+        self, percentiles: tuple[float, ...] = (50.0, 90.0, 99.0)
+    ) -> dict[str, float]:
+        if not self.latencies:
+            return {}
+        arr = np.asarray(self.latencies, dtype=float) * 1000.0
+        return {f"p{p:g}": float(np.percentile(arr, p)) for p in percentiles}
 
-    def avg_latency_ms(self, drop_outlier: bool = True) -> float:
-        return self._avg(self.latencies, drop_outlier) * 1000
-
-    def avg_throughput(self, drop_outlier: bool = True) -> float:
-        lats = self._drop_outlier(self.latencies) if drop_outlier else self.latencies
-        toks = (
-            self._drop_outlier(self.token_counts) if drop_outlier else self.token_counts
+    def to_dict(self) -> dict:
+        stats: dict = {
+            "call_count": self.call_count,
+            "mean_latency_ms": self.mean_latency_ms(),
+            "latency_percentiles_ms": self.latency_percentiles_ms(),
+        }
+        timings = (
+            ("mean_host_time_us", self.host_times),
+            ("mean_device_time_us", self.device_times),
+            ("mean_ccl_time_us", self.ccl_times),
+            ("mean_prepare_time_us", self.prepare_times),
         )
-        t = sum(lats)
-        return sum(toks) / t if t > 0 else 0.0
+        for key, values in timings:
+            if values:
+                stats[key] = _mean(values)
+        return stats
 
-    def avg_host_time_us(self, drop_outlier: bool = True) -> float:
-        return self._avg(self.host_times, drop_outlier)
 
-    def avg_device_time_us(self, drop_outlier: bool = True) -> float:
-        return self._avg(self.device_times, drop_outlier)
+@dataclass
+class _Sample:
+    """One span's timing, summable across model+sampler within a step."""
 
-    def avg_ccl_time_us(self, drop_outlier: bool = True) -> float:
-        return self._avg(self.ccl_times, drop_outlier)
+    latency: float
+    host: int | None = None
+    device: int | None = None
+    ccl: int | None = None
+    prepare: int | None = None
+    phase: bool | None = None  # True=prefill, False=decode (set by the model span)
 
-    def avg_prepare_time_us(self, drop_outlier: bool = True) -> float:
-        return self._avg(self.prepare_times, drop_outlier)
+    def merged(self, other: "_Sample") -> "_Sample":
+        def _add(a: int | None, b: int | None) -> int | None:
+            return None if a is None and b is None else (a or 0) + (b or 0)
+
+        return _Sample(
+            latency=self.latency + other.latency,
+            host=_add(self.host, other.host),
+            device=_add(self.device, other.device),
+            ccl=_add(self.ccl, other.ccl),
+            prepare=_add(self.prepare, other.prepare),
+            phase=self.phase,  # keep the model step's phase
+        )
 
 
 try:
@@ -105,11 +122,14 @@ except ImportError:
 
 
 class _TimingSpan:
-    __slots__ = ("_metrics", "_token_count", "_reports", "_start", "_capture_ctx")
+    __slots__ = ("_ctx", "_phase", "_is_sampler", "_reports", "_start", "_capture_ctx")
 
-    def __init__(self, metrics: Metrics, token_count: int) -> None:
-        self._metrics = metrics
-        self._token_count = token_count
+    def __init__(
+        self, ctx: "_PerformanceContext", phase: bool | None, is_sampler: bool
+    ) -> None:
+        self._ctx = ctx
+        self._phase = phase
+        self._is_sampler = is_sampler
         self._reports: list[dict] | None = None
         self._start = 0.0
 
@@ -126,10 +146,16 @@ class _TimingSpan:
     def __exit__(self, *args):
         # Record time before closing capture_ctx to exclude any internal
         # synchronization overhead inside rebel from the measured latency.
-        latency = time.perf_counter() - self._start
+        end = time.perf_counter()
+        latency = end - self._start
         self._capture_ctx.__exit__(*args)
         host, device, ccl, prepare = _parse_reports(self._reports)
-        self._metrics.record(latency, self._token_count, host, device, ccl, prepare)
+        self._ctx._submit(
+            _Sample(latency, host, device, ccl, prepare, self._phase),
+            self._is_sampler,
+            self._start,
+            end,
+        )
         return False
 
 
@@ -143,74 +169,149 @@ class _NoopSpan:
         return False
 
 
-class ProfileSection(Enum):
-    MODEL = ("model", True)  # tracked separately per phase (prefill / decode)
-    SAMPLER = ("sampler", False)  # phase-agnostic; recorded into a single bucket
-
-    def __init__(self, label: str, split_phase: bool) -> None:
-        self.label = label
-        self.split_phase = split_phase
-
-
 class _PerformanceContext:
-    def __init__(self, name: str | None = None) -> None:
+    def __init__(self, name: str | None = None, runtimes: list | None = None) -> None:
         self.name = name
-        self._metrics: dict[tuple[ProfileSection, bool | None], Metrics] = defaultdict(
-            Metrics
+        self.rank_tag = _rank_tag()
+        self._metrics: dict[bool, Metrics] = defaultdict(Metrics)
+        self._pending: _Sample | None = None
+        self._e2e_start: float | None = None
+        self._e2e: dict[bool, Metrics] = defaultdict(Metrics)
+        self._runtimes = runtimes if runtimes is not None else []
+        self._backlog_drained = False
+
+    def profile_model(self, is_prefill: bool) -> _TimingSpan:
+        self._drain_report_backlog()
+        # A prior model step with no sampler (intermediate chunked prefill,
+        # non-last PP rank) leaves a pending report; record it model-only here.
+        self._flush_pending()
+        return _TimingSpan(self, phase=is_prefill, is_sampler=False)
+
+    def profile_sampler(self) -> _TimingSpan:
+        return _TimingSpan(self, phase=None, is_sampler=True)
+
+    def _submit(
+        self, sample: _Sample, is_sampler: bool, start: float, end: float
+    ) -> None:
+        if not is_sampler:
+            self._pending = sample  # model: stash, wait for the sampler
+            self._e2e_start = start
+            return
+        if self._pending is None:
+            return  # sampler with no preceding model step; ignore
+        self._record(self._pending.merged(sample))
+        if self._e2e_start is not None:
+            self._e2e[bool(self._pending.phase)].record(end - self._e2e_start)
+        self._pending = None
+        self._e2e_start = None
+
+    def _flush_pending(self) -> None:
+        if self._pending is not None:
+            self._record(self._pending)
+            self._pending = None
+        self._e2e_start = None
+
+    def _record(self, s: _Sample) -> None:
+        self._metrics[bool(s.phase)].record(
+            s.latency, s.host, s.device, s.ccl, s.prepare
         )
 
-    def profile(
-        self,
-        is_prefill: bool = False,
-        section: ProfileSection = ProfileSection.MODEL,
-        token_count: int = 0,
-    ) -> _TimingSpan:
-        phase = is_prefill if section.split_phase else None
-        return _TimingSpan(self._metrics[(section, phase)], token_count)
+    def _drain_report_backlog(self) -> None:
+        """Discard warmup reports left in the runtime FIFO before measuring."""
+        if self._backlog_drained:
+            return
+
+        self._backlog_drained = True
+        for runtime in self._runtimes:
+            if (flush := getattr(runtime, "flush_reports", None)) is not None:
+                flush()
 
     def print_stats(self) -> None:
-        def _label(section: ProfileSection, phase: bool | None) -> str:
-            if phase is None:
-                return section.label.upper()
-            return f"{section.label.upper()} {'PREFILL' if phase else 'DECODE'}"
-
-        sections = {
-            _label(s, p): m
-            for (s, p), m in sorted(
-                self._metrics.items(), key=lambda x: (x[0][0].value, not x[0][1])
-            )
-        }
-        _report_metrics(self.name, sections)
+        self._flush_pending()  # record the final step if it had no sampler
+        sections: dict[str, Metrics] = {}
+        for phase, m in sorted(self._metrics.items(), key=lambda x: not x[0]):
+            sections["PREFILL + SAMPLE" if phase else "DECODE + SAMPLE"] = m
+        for phase, m in sorted(self._e2e.items(), key=lambda x: not x[0]):
+            sections["PREFILL E2E" if phase else "DECODE E2E"] = m
+        name = f"{self.name} | {self.rank_tag}" if self.rank_tag else self.name
+        _report_metrics(name, sections)
+        _write_metrics_json(self.name, self.rank_tag, sections)
 
 
 class _NoopPerformanceContext:
-    def __init__(self, name: str | None = None) -> None:
+    def __init__(self, *args, **kwargs) -> None:
         pass
 
-    def profile(self, *args, **kwargs) -> _NoopSpan:
+    def profile_model(self, *args, **kwargs) -> _NoopSpan:
+        return _NoopSpan()
+
+    def profile_sampler(self, *args, **kwargs) -> _NoopSpan:
         return _NoopSpan()
 
     def print_stats(self) -> None:
         pass
 
 
-def _metrics_file_path() -> str | None:
-    if not envs.VLLM_RBLN_METRICS_FILE:
-        return None
+def _rank_tag() -> str:
+    """Rank tag including only parallelism axes with degree > 1; '' if none."""
 
-    root, ext = os.path.splitext(envs.VLLM_RBLN_METRICS_FILE)
-    return f"{root}.{os.getpid()}{ext}"
+    def get_rank_info(group_name: str, get_group_func) -> str:
+        try:
+            group = get_group_func()
+            if group.world_size > 1:
+                return f"{group_name}{group.rank_in_group}"
+        except Exception:
+            return ""
+        return ""
+
+    parts = []
+
+    from vllm.distributed import get_dp_group, get_ep_group, get_pp_group, get_tp_group
+
+    for group_name, get_group_func in [
+        ("TP", get_tp_group),
+        ("PP", get_pp_group),
+        ("DP", get_dp_group),
+        ("EP", get_ep_group),
+    ]:
+        rank_info = get_rank_info(group_name, get_group_func)
+        if rank_info:
+            parts.append(rank_info)
+
+    return " ".join(parts)
 
 
-def _write_metrics_file(lines: list[str]) -> None:
-    if (path := _metrics_file_path()) is None:
+def _write_metrics_json(
+    name: str | None, rank_tag: str, sections: dict[str, Metrics]
+) -> None:
+    if not envs.VLLM_RBLN_METRICS_DIR:
         return
+
+    suffix = rank_tag.replace(" ", "_").lower()
+    filename = f"metrics_{suffix}.json" if suffix else "metrics.json"
+    path = os.path.join(envs.VLLM_RBLN_METRICS_DIR, filename)
+    payload = {
+        "name": name,
+        "rank": rank_tag,
+        "sections": {label: m.to_dict() for label, m in sections.items()},
+    }
+
     try:
-        with open(path, "a", encoding="utf-8") as f:
-            f.write("\n".join(lines))
-            f.write("\n")
+        payload_str = json.dumps(payload, indent=2)
+    except (TypeError, ValueError) as e:
+        logger.warning("Failed to serialize metrics JSON: %s", e)
+        return
+
+    try:
+        os.makedirs(envs.VLLM_RBLN_METRICS_DIR, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(payload_str)
     except OSError as e:
-        logger.warning("Failed to write metrics to file %s: %s", path, e)
+        logger.warning("Failed to write metrics JSON to %s: %s", path, e)
+
+
+def _mean(values: list[T]) -> float:
+    return sum(values) / len(values) if values else 0.0
 
 
 def _render_metrics(label: str, m: Metrics) -> list[str]:
@@ -219,50 +320,47 @@ def _render_metrics(label: str, m: Metrics) -> list[str]:
 
     lines = [
         f"{label} METRICS:",
-        f"  Total call counts  : {m.call_count}",
-        f"  Average latency    : {m.avg_latency_ms():.2f} ms",
+        f"  {'Total call counts':<25}: {m.call_count}",
+        f"  {'Mean latency (ms)':<25}: {m.mean_latency_ms():.2f}",
     ]
-    if sum(m.token_counts) > 0:
-        lines.extend(
-            [
-                f"  Total tokens       : {sum(m.token_counts)}",
-                f"  Avg throughput     : {m.avg_throughput():.2f} tok/s",
-            ]
-        )
-    if m.host_times:
-        lines.append(f"  Avg host time     : {m.avg_host_time_us():.2f} us")
-    if m.device_times:
-        lines.append(f"  Avg device time   : {m.avg_device_time_us():.2f} us")
-    if m.ccl_times:
-        lines.append(f"  Avg ccl time      : {m.avg_ccl_time_us():.2f} us")
-    if m.prepare_times:
-        lines.append(f"  Avg prepare time  : {m.avg_prepare_time_us():.2f} us")
+
+    pct = m.latency_percentiles_ms()
+    for key, value in pct.items():
+        stat = "Median" if key == "p50" else key.upper()
+        metric_label = f"{stat} latency (ms)"
+        lines.append(f"  {metric_label:<25}: {value:.2f}")
+
+    runtime_timings = [
+        ("Mean host time (us)", m.host_times),
+        ("Mean device time (us)", m.device_times),
+        ("Mean ccl time (us)", m.ccl_times),
+        ("Mean prepare time (us)", m.prepare_times),
+    ]
+    for runtime_label, values in runtime_timings:
+        if values:
+            lines.append(f"  {runtime_label:<25}: {_mean(values):.2f}")
 
     return lines
 
 
 def _render_metrics_report(name: str | None, sections: dict[str, Metrics]) -> list[str]:
     lines = [
-        "=" * 40,
+        "=" * 50,
         f"PERFORMANCE STATISTICS{f' [{name}]' if name else ''}",
-        "=" * 40,
+        "=" * 50,
     ]
 
     for label, metrics in sections.items():
         lines.extend(_render_metrics(label, metrics))
-        lines.append("-" * 40)
+        lines.append("-" * 50)
 
-    lines.append("=" * 40)
+    lines.append("=" * 50)
     return lines
 
 
 def _report_metrics(name: str | None, sections: dict[str, Metrics]) -> None:
     lines = _render_metrics_report(name, sections)
-
-    for line in lines:
-        logger.info("%s", line)
-
-    _write_metrics_file(lines)
+    logger.info("%s", "\n".join(lines))
 
 
 def _parse_reports(

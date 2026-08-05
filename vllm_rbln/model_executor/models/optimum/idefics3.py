@@ -59,6 +59,9 @@ class RBLNOptimumIdefics3ForConditionalGeneration(
             num_blocks=self.kv_block_adapter._estimated_num_blocks(),
         )
 
+    def get_prefill_decoder(self):
+        return self.model.text_model.prefill_decoder
+
     def forward(self, model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
         input_ids = model_input.input_tokens
         cache_position = model_input.input_positions
@@ -107,7 +110,11 @@ class RBLNOptimumIdefics3ForConditionalGeneration(
             pixel_values=pixel_values,
             pixel_attention_mask=pixel_attention_mask,
         )
-        return list(image_features)
+        # get_image_features returns per-patch features [total_patches, tokens,
+        # hidden]. Group them back per image so the cacheable unit is one image,
+        # matching the per-item tail slicing in the partial prefix-cache path.
+        num_patches = image_input["num_patches"]
+        return [e.flatten(0, 1) for e in image_features.split(num_patches.tolist())]
 
     def _image_token_id(self) -> int:
         # Idefics3Config exposes only `image_token_id` (no `image_token_index`

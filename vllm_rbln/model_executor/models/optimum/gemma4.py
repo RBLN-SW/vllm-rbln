@@ -41,12 +41,20 @@ class RBLNOptimumGemma4ForConditionalGeneration(
         assert image_input["type"] == "pixel_values"
         pixel_values = image_input["pixel_values"]
         pixel_position_ids = image_input["pixel_position_ids"]
-
+        # get_image_features returns one flat [total_soft_tokens, hidden] tensor
+        # (padding stripped by the pooler mask), so split it back per image as
+        # the base embed path and partial prefix-cache slicing expect.
+        # Upstream vLLM splits the same way:
+        # https://github.com/vllm-project/vllm/blob/v0.22.0/vllm/model_executor/models/gemma4_mm.py#L1348
         image_embeds = self.model.get_image_features(
             pixel_values=pixel_values, pixel_position_ids=pixel_position_ids
         )
-
-        return image_embeds
+        # The pooler averages each k**2 patch block into one soft token, so
+        # soft_tokens(i) = non_padding_patches(i) // k**2 (padding is (-1, -1)).
+        k2 = self.model.config.vision_config.pooling_kernel_size**2
+        valid_patches = (~(pixel_position_ids == -1).all(dim=-1)).sum(dim=-1)
+        valid_lens = (valid_patches // k2).tolist()
+        return list(torch.split(image_embeds, valid_lens))
 
     def _parse_and_validate_multimodal_inputs(
         self, **kwargs: object

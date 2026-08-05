@@ -32,17 +32,14 @@ def _register_fp8_block_kernel() -> None:
     from vllm.platforms import PlatformEnum
 
     from vllm_rbln.model_executor.kernels.linear.block_fp8 import (
+        RBLNW8A8BlockFp8LinearKernel,
         RBLNW8A16BlockFp8LinearKernel,
     )
 
     block_kernels = linear._POSSIBLE_FP8_BLOCK_KERNELS.setdefault(PlatformEnum.OOT, [])
-    if RBLNW8A16BlockFp8LinearKernel not in block_kernels:
-        block_kernels.insert(0, RBLNW8A16BlockFp8LinearKernel)
-
-        logger.debug(
-            "Registered RBLN FP8 block linear kernel for OOT platform: %s",
-            RBLNW8A16BlockFp8LinearKernel.__name__,
-        )
+    for kernel_cls in (RBLNW8A16BlockFp8LinearKernel, RBLNW8A8BlockFp8LinearKernel):
+        if kernel_cls not in block_kernels:
+            block_kernels.insert(0, kernel_cls)
 
 
 def _register_unpacked_wna16_linear_kernel() -> None:
@@ -65,30 +62,30 @@ def _register_unpacked_wna16_linear_kernel() -> None:
 
 @add_registration(reason="Register RBLN OOT implementations.")
 def register_rbln_oot_implementations() -> None:
-    from vllm.model_executor.layers.mla import MultiHeadLatentAttentionWrapper
-    from vllm.model_executor.layers.rotary_embedding.deepseek_scaling_rope import (
-        DeepseekScalingRotaryEmbedding,
+    from vllm_rbln.model_executor.layers.fused_moe.runner.moe_runner import (
+        MoERunner,
+        RBLNMoERunner,
     )
-    from vllm.model_executor.layers.vocab_parallel_embedding import (
-        ParallelLMHead,
-        VocabParallelEmbedding,
-    )
-
-    from vllm_rbln.model_executor.layers.fused_moe.layer import FusedMoE, RBLNFusedMoE
     from vllm_rbln.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
         RBLNUnquantizedFusedMoEMethod,
         UnquantizedFusedMoEMethod,
     )
-    from vllm_rbln.model_executor.layers.mla import RBLNMultiHeadLatentAttentionWrapper
+    from vllm_rbln.model_executor.layers.mla import (
+        MultiHeadLatentAttentionWrapper,
+        RBLNMultiHeadLatentAttentionWrapper,
+    )
     from vllm_rbln.model_executor.layers.rotary_embedding.deepseek_scaling_rope import (
+        DeepseekScalingRotaryEmbedding,
         RBLNDeepseekScalingRotaryEmbedding,
     )
     from vllm_rbln.model_executor.layers.vocab_parallel_embedding import (
+        ParallelLMHead,
         RBLNParallelLMHead,
         RBLNVocabParallelEmbedding,
+        VocabParallelEmbedding,
     )
 
-    _register_oot(FusedMoE, RBLNFusedMoE)
+    _register_oot(MoERunner, RBLNMoERunner)
     _register_oot(UnquantizedFusedMoEMethod, RBLNUnquantizedFusedMoEMethod)
     _register_oot(VocabParallelEmbedding, RBLNVocabParallelEmbedding)
     _register_oot(ParallelLMHead, RBLNParallelLMHead)

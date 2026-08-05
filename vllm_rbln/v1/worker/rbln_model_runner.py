@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import dataclasses
-import itertools
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
 from contextlib import nullcontext
@@ -48,8 +47,7 @@ from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.tracing import instrument
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.utils.math_utils import cdiv
-from vllm.utils.platform_utils import is_pin_memory_available
-from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+from vllm.utils.torch_utils import PIN_MEMORY, kv_cache_dtype_str_to_dtype
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionMetadata,
@@ -86,7 +84,7 @@ from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
-from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
+from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.kv_connector_model_runner_mixin import (
     KVConnectorModelRunnerMixin,
@@ -128,7 +126,7 @@ from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
 from vllm_rbln.v1.worker import mega_cache
 from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
 from vllm_rbln.v1.worker.input_stager import InputLayout, InputStager, StagedModelInputs
-from vllm_rbln.v1.worker.metrics_v2 import PerformanceContext, ProfileSection
+from vllm_rbln.v1.worker.metrics_v2 import PerformanceContext
 from vllm_rbln.v1.worker.utils import (
     get_kv_cache_names,
     prepare_kernel_block_sizes,
@@ -220,7 +218,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         scheduler_config = self.scheduler_config
         parallel_config = self.parallel_config
         self.device = device
-        self.pin_memory = is_pin_memory_available()
         self.dtype = model_config.dtype
 
         self.kv_cache_dtype = kv_cache_dtype_str_to_dtype(
@@ -340,7 +337,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             max_model_len=self.max_model_len,
             max_num_batched_tokens=self.max_num_tokens,
             device=self.device,
-            pin_memory=self.pin_memory,
             vocab_size=model_config.get_vocab_size(),
             block_sizes=[cache_config.block_size],
             kernel_block_sizes=[cache_config.block_size],
@@ -348,7 +344,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             logitsprocs=build_logitsprocs(
                 self.vllm_config,
                 self.device,
-                self.pin_memory,
+                PIN_MEMORY,
                 self.is_pooling_model,
                 custom_logitsprocs,
             ),
@@ -360,10 +356,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # Persistent buffers
         self.input_ids = torch.zeros(self.max_num_tokens, dtype=torch.int32)
         self.positions = torch.zeros(self.max_num_tokens, dtype=torch.int64)
-        self.query_start_loc = self._make_buffer(
-            self.max_num_reqs + 1, dtype=torch.int32
-        )
+        self.query_start_loc = torch.zeros(self.max_num_reqs + 1, dtype=torch.int32)
+        self.query_start_loc_np = self.query_start_loc.numpy()
         self.seq_lens = torch.zeros(self.max_num_tokens, dtype=torch.int32)
+        self.seq_lens_np = self.seq_lens.numpy()
         self.discard_request_mask = torch.zeros(self.max_num_reqs, dtype=torch.bool)
         self.input_stager = InputStager(self.device)
 
@@ -424,7 +420,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             and envs.VLLM_RBLN_SPECIALIZE_MOE_DECODE
         )
 
-        self.performance_ctx = PerformanceContext("runner")
+        self.performance_ctx = PerformanceContext("runner", self.runtime_holder)
 
         self.offload_context = nullcontext
         if HAS_TORCH_RBLN and USE_DEVICE_TENSOR and not envs.VLLM_RBLN_DISABLE_OFFLOAD:
@@ -433,17 +429,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
     def _get_positions(self, num_tokens: Any):
         assert not isinstance(num_tokens, int)
         return self.positions[:num_tokens]
-
-    def _make_buffer(
-        self, *size: int | torch.SymInt, dtype: torch.dtype, numpy: bool = True
-    ) -> CpuGpuBuffer:
-        return CpuGpuBuffer(
-            *size,
-            dtype=dtype,
-            device=self.device,
-            pin_memory=self.pin_memory,
-            with_numpy=numpy,
-        )
 
     def _init_model_kwargs(self):
         model_kwargs = dict[str, Any]()
@@ -812,17 +797,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         )
 
         # Prepare the attention metadata.
-        query_start_loc_np = self.query_start_loc.np
-        query_start_loc_np[0] = 0
-        query_start_loc_np[1 : num_reqs + 1] = cu_num_tokens
-        query_start_loc_np[num_reqs + 1 :].fill(cu_num_tokens[-1])
-        self.query_start_loc.copy_to_gpu()
+        self.query_start_loc_np[0] = 0
+        self.query_start_loc_np[1 : num_reqs + 1] = cu_num_tokens
+        self.query_start_loc_np[num_reqs + 1 :].fill(cu_num_tokens[-1])
 
-        seq_lens_np = self.seq_lens.numpy()
-        seq_lens_np[:num_reqs] = (
+        self.seq_lens_np[:num_reqs] = (
             self.input_batch.num_computed_tokens_cpu[:num_reqs] + logical_num_tokens
         )
-        seq_lens_np[num_reqs:].fill(0)
+        self.seq_lens_np[num_reqs:].fill(0)
 
         num_tokens = [self.requests[r].num_tokens for r in self.input_batch.req_ids]
         num_tokens_np = np.array(num_tokens, dtype=np.int32)
@@ -830,7 +812,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # Record which requests should not be sampled,
         # so that we could clear the sampled tokens before returningj
         discard_request_mask_np = self.discard_request_mask.numpy()
-        discard_request_mask_np[:num_reqs] = seq_lens_np[:num_reqs] < num_tokens_np
+        discard_request_mask_np[:num_reqs] = self.seq_lens_np[:num_reqs] < num_tokens_np
 
         if not use_spec_decode:
             # NOTE(woosuk): Due to chunked prefills, the batch may contain
@@ -838,7 +820,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             # from these partial requests, we do so for simplicity.
             # We will ignore the sampled tokens from the partial requests.
             # TODO: Support prompt logprobs.
-            logits_indices = self.query_start_loc.cpu[1 : num_reqs + 1] - 1
+            logits_indices = self.query_start_loc[1 : num_reqs + 1] - 1
             spec_decode_metadata = None
         else:
             # Get the number of draft tokens for each request.
@@ -901,10 +883,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             return blk_table_tensor
 
         cm_base = CommonAttentionMetadata(
-            query_start_loc=self.query_start_loc.gpu[: num_reqs + 1],
-            query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs + 1],
+            query_start_loc=self.query_start_loc[: num_reqs + 1],
+            query_start_loc_cpu=self.query_start_loc[: num_reqs + 1],
             seq_lens=self.seq_lens[:num_reqs],
-            _seq_lens_cpu=self.seq_lens[:num_reqs],
             num_reqs=num_reqs,
             num_actual_tokens=num_tokens,
             max_query_len=max_query_len,
@@ -1209,10 +1190,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
-        with self.performance_ctx.profile(
-            section=ProfileSection.SAMPLER,
-            token_count=logits.shape[0],
-        ):
+        with self.performance_ctx.profile_sampler():
             if spec_decode_metadata is None:
                 bucket = logits.shape[0]
                 num_reqs = self.input_batch.num_reqs
@@ -1436,16 +1414,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 num_padded_tokens=num_tokens_padded,
                 **build_kv_cache_forward_context_kwargs(self.kv_cache_bases),
             ),
-            self.performance_ctx.profile(
-                self.is_prefill,
-                section=ProfileSection.MODEL,
-                token_count=num_scheduled_tokens,
-            ),
             record_function_or_nullcontext("rbln_model_runner: forward"),
             self.maybe_get_kv_connector_output(
                 scheduler_output,
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
+            self.performance_ctx.profile_model(self.is_prefill),
         ):
             model_output = self.model_executable(
                 **staged_model_inputs.as_kwargs(),
@@ -1520,12 +1494,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         if grammar_output is not None:
             # NOTE(RBLN): `xgr.apply_token_bitmask_inplace` requires logits
             # to be float32 dtype for CPU tensors
-            origin_dtype = logits.dtype
-            logits = logits.to(torch.float32)
+            origin_dtype, origin_device = logits.dtype, logits.device
+            logits = logits.to(torch.float32).to("cpu")
             apply_grammar_bitmask(
                 scheduler_output, grammar_output, self.input_batch, logits
             )
-            logits = logits.to(origin_dtype)
+            logits = logits.to(origin_dtype).to(origin_device)
 
         with record_function_or_nullcontext("rbln_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
@@ -1629,6 +1603,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             assert isinstance(sampled_token_ids, list)
             assert isinstance(self.drafter, NgramProposer)
             draft_token_ids = self.drafter.propose(
+                self.num_spec_tokens,
                 sampled_token_ids,
                 self.input_batch.num_tokens_no_spec,
                 self.input_batch.token_ids_cpu,
@@ -1740,7 +1715,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             self.model = model_loader.load_model(
                 vllm_config=self.vllm_config, model_config=self.model_config
             )
-        self._make_weights_contiguous()
+
         if hasattr(self.model, "logits_processor"):
             self.logits_processor = self.model.logits_processor
         elif self.model_config.is_multimodal_model and hasattr(
@@ -1770,6 +1745,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 aux_layers = self.model.get_eagle3_default_aux_hidden_state_layers()
 
             self.model.set_aux_hidden_state_layers(aux_layers)
+
+        self._make_weights_contiguous()
 
         # NOTE(RBLN): This wrapper is designed to be compiled by torch.compile.
         # It handles the forward pass of the underlying model and computes
@@ -1849,15 +1826,35 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             )
 
     def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:
-        """Extract Eagle3 auxiliary layer indices from speculative config."""
+        """Extract Eagle3 auxiliary layer indices from speculative config.
+
+        These indices specify which hidden states from the base model should
+        be used as auxiliary inputs for the Eagle3 drafter model during
+        speculative decoding.
+
+        Returns:
+            Tuple of layer indices if found in draft model config,
+            None otherwise.
+        """
         if not (self.speculative_config and self.speculative_config.draft_model_config):
             return None
 
         hf_config = self.speculative_config.draft_model_config.hf_config
-        if not hasattr(hf_config, "eagle_aux_hidden_state_layer_ids"):
-            return None
 
-        layer_ids = hf_config.eagle_aux_hidden_state_layer_ids
+        layer_ids = getattr(hf_config, "eagle_aux_hidden_state_layer_ids", None)
+        if not layer_ids:
+            dflash_config = getattr(hf_config, "dflash_config", None)
+            eagle_config = getattr(hf_config, "eagle_config", None)
+
+            if dflash_config and isinstance(dflash_config, dict):
+                # Add 1 to convert DFlash's aux layer id semantics
+                layer_ids = [
+                    i + 1 for i in (dflash_config.get("target_layer_ids") or [])
+                ]
+
+            if eagle_config and isinstance(eagle_config, dict):
+                layer_ids = eagle_config.get("eagle_aux_hidden_state_layer_ids")
+
         if layer_ids and isinstance(layer_ids, (list, tuple)):
             return tuple(layer_ids)
 
@@ -1927,7 +1924,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             # If this is a partial request (i.e. chunked prefill),
             # then there is prompt logprob generated for each index.
             req_idx = self.input_batch.req_id_to_index[req_id]
-            offset = self.query_start_loc.cpu[req_idx].item()
+            offset = self.query_start_loc[req_idx].item()
             prompt_hidden_states = hidden_states[offset : offset + num_logits]
             logits = self.model.compute_logits(prompt_hidden_states)
 
@@ -2002,9 +1999,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         num_scheduled_tokens = np.array(num_scheduled_tokens_list, dtype=np.int32)
         num_tokens_unpadded = int(num_scheduled_tokens.sum())
 
-        seq_lens_np = self.seq_lens.numpy()
-        seq_lens_np[:num_reqs] = num_scheduled_tokens
-        seq_lens_np[num_reqs:] = 0
+        self.seq_lens_np[:num_reqs] = num_scheduled_tokens
+        self.seq_lens_np[num_reqs:] = 0
 
         # NOTE(RBLN): self.is_prefill is derived from num_tokens_no_spec.
         # For decode warmup, keep it at 1 so multi-token speculative decode
@@ -2019,9 +2015,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         )
         num_tokens_padded = num_tokens_padded or _num_tokens_padded
 
-        cum_num_tokens, _ = self._get_cumsum_and_arange(num_scheduled_tokens)
-        query_start_loc_np = self.query_start_loc.np
-        query_start_loc_np[1 : num_reqs + 1] = cum_num_tokens
+        cu_num_tokens, _ = self._get_cumsum_and_arange(num_scheduled_tokens)
+        self.query_start_loc_np[0] = 0
+        self.query_start_loc_np[1 : num_reqs + 1] = cu_num_tokens
+        self.query_start_loc_np[num_reqs + 1 :].fill(cu_num_tokens[-1])
 
         attn_metadata, _ = self._build_attention_metadata(
             num_tokens=num_tokens_unpadded,
@@ -2295,7 +2292,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 max_model_len=max_model_len,
                 max_num_batched_tokens=self.max_num_tokens,
                 device=self.device,
-                pin_memory=self.pin_memory,
                 vocab_size=self.model_config.get_vocab_size(),
                 block_sizes=block_sizes,
                 kernel_block_sizes=kernel_block_sizes,
@@ -2834,19 +2830,25 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
     def _make_weights_contiguous(self) -> None:
         """Force weights contiguous before weight-free compile, which hard-errors
         on non-contiguous CPU tensors. Covers parameters, buffers, and plain
-        tensor attributes."""
+        tensor attributes of the main model and, when present, the spec-decode
+        drafter model."""
 
-        def plain_attr_tensors():
-            for module in self.model.modules():
+        def model_tensors(model: torch.nn.Module):
+            yield from model.parameters()
+            yield from model.buffers()
+            for module in model.modules():
                 for value in module.__dict__.values():
                     if isinstance(value, torch.Tensor):
                         yield value
 
-        for t in itertools.chain(
-            self.model.parameters(), self.model.buffers(), plain_attr_tensors()
-        ):
-            if not t.is_contiguous():
-                t.data = t.data.contiguous()
+        models = [self.model]
+        if isinstance(getattr(self, "drafter", None), RBLNEagleProposer):
+            models.append(self.drafter.model)
+
+        for model in models:
+            for t in model_tensors(model):
+                if not t.is_contiguous():
+                    t.data = t.data.contiguous()
 
     def warmup_model(self) -> None:
         # NOTE(RBLN): Warm-up must not route through execute_model() while a
@@ -2934,7 +2936,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     src = op.src_block_id
                     dst = op.dst_block_id
                     nt = op.num_tokens
-                    kv_cache[:, dst, :, :, :nt, :] = kv_cache[:, src, :, :, :nt, :]
+                    if self.model_config.use_mla:
+                        kv_cache[dst, :nt, :] = kv_cache[src, :nt, :]
+                    else:
+                        kv_cache[:, dst, :, :, :nt, :] = kv_cache[:, src, :, :, :nt, :]
 
 
 def _pad_rows(t: torch.Tensor | None, bucket: int) -> torch.Tensor | None:

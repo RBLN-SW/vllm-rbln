@@ -17,12 +17,12 @@ from torch.nn.parameter import Parameter
 from vllm import _custom_ops as ops
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.fused_moe import (
-    FusedMoE,
     FusedMoEMethodBase,
     FusedMoeWeightScaleSupported,
     modular_kernel,
 )
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     all_close_1d,
@@ -31,12 +31,18 @@ from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 
+from vllm_rbln.custom_ops import custom_op, register_fake
 from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)
 
 
-@torch.library.custom_op(
+# NOTE: `masked_routing_weights` (plural) is the name in the released
+# rebel-compiler. The compiler renames it to the singular `masked_routing_weight`
+# in rebellions-sw/rebel_compiler#12049; rename this copy to match when the pin
+# moves to that build. Until then vllm_rbln.custom_ops logs a signature-drift
+# warning for this op at import time.
+@custom_op(
     "rbln_custom_ops::custom_moe_glu_group_dequantize",
     mutates_args=(),
 )
@@ -170,7 +176,7 @@ def custom_moe_glu_group_dequantize(
     return final_hidden_states
 
 
-@custom_moe_glu_group_dequantize.register_fake
+@register_fake("rbln_custom_ops::custom_moe_glu_group_dequantize")
 def custom_moe_glu_group_dequantize_fake(
     hidden_states: torch.Tensor,
     gate_proj_weight: torch.Tensor,
@@ -341,7 +347,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.rocm_aiter_moe_enabled = False
 
     def process_weights_after_loading(self, layer):
-        assert isinstance(layer, FusedMoE)
+        assert isinstance(layer, RoutedExperts)
         # Lazy import to avoid importing triton too early.
 
         # TODO (rob): refactor block quant into separate class.
@@ -451,7 +457,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
     def apply(
         self,
-        layer: FusedMoE,
+        layer: RoutedExperts,
         x: torch.Tensor,
         router_logits: torch.Tensor,
         **kwargs: object,
@@ -481,21 +487,63 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             :, scale_intermediate_size:, :
         ]
 
-        final_hidden_states = torch.ops.rbln_custom_ops.custom_moe_glu_group_dequantize(
-            hidden_states,
-            gate_proj_weight,
-            gate_proj_weight_scale,
-            up_proj_weight,
-            up_proj_weight_scale,
-            down_proj_weight,
-            down_proj_weight_scale,
-            masked_routing_weights,
-            torch.tensor(self.weight_block_size[1], dtype=torch.int32),
-            layer.activation.value,
-            None,  # gate_proj_bias
-            None,  # up_proj_bias
-            None,  # down_proj_bias
-            layer.expert_map,
-        )
+        from vllm_rbln import envs
+
+        if not envs.VLLM_RBLN_USE_W8A16:
+            # W8A8: dynamically quantize hidden_states to fp8 per (1, block_k)
+            # group along K and hand both the fp8 tensor and the per-(token,
+            # K-block) scale to the W8A8 MoE custom op.
+            fp8_dtype = torch.float8_e4m3fn
+            finfo = torch.finfo(fp8_dtype)
+            in_block_size = int(self.weight_block_size[1])
+            compute_dtype = hidden_states.dtype
+            hs_shape = hidden_states.shape
+            s_g = hidden_states.reshape(-1, in_block_size).to(torch.float32)
+            amax = s_g.abs().amax(dim=-1, keepdim=True).clamp_min(1e-10)
+            scale = amax / finfo.max
+            hs_q = (
+                (s_g / scale)
+                .clamp(finfo.min, finfo.max)
+                .to(fp8_dtype)
+                .reshape(hs_shape)
+            )
+            hs_scale = scale.reshape(hs_shape[0], hs_shape[1] // in_block_size)
+            final_hidden_states = torch.ops.rbln_custom_ops.custom_moe_glu_w8a8(
+                hs_q,
+                hs_scale,
+                gate_proj_weight,
+                gate_proj_weight_scale,
+                up_proj_weight,
+                up_proj_weight_scale,
+                down_proj_weight,
+                down_proj_weight_scale,
+                masked_routing_weights,
+                torch.tensor(self.weight_block_size[1], dtype=torch.int32),
+                layer.activation.value,
+                compute_dtype,
+                None,  # gate_proj_bias
+                None,  # up_proj_bias
+                None,  # down_proj_bias
+                layer.expert_map,
+            )
+        else:
+            final_hidden_states = (
+                torch.ops.rbln_custom_ops.custom_moe_glu_group_dequantize(
+                    hidden_states,
+                    gate_proj_weight,
+                    gate_proj_weight_scale,
+                    up_proj_weight,
+                    up_proj_weight_scale,
+                    down_proj_weight,
+                    down_proj_weight_scale,
+                    masked_routing_weights,
+                    torch.tensor(self.weight_block_size[1], dtype=torch.int32),
+                    layer.activation.value,
+                    None,  # gate_proj_bias
+                    None,  # up_proj_bias
+                    None,  # down_proj_bias
+                    layer.expert_map,
+                )
+            )
 
         return final_hidden_states.reshape(orig_shape)

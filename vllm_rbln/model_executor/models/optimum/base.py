@@ -11,10 +11,27 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import torch
 from vllm.multimodal.inputs import BatchedTensorInputs
+
+
+@dataclass(frozen=True)
+class PartialPrefixInfo:
+    """Inputs to rebuild the uncached tail of a partial prefix-cache hit
+    (boundary may end inside an image).
+
+    - ``full_input_tokens``: untrimmed prompt (MRoPE positions computed over it).
+    - ``num_cached_tokens``: cache boundary in tokens (= tail start).
+    - ``mrope_mm_kwargs``: every item's grid (incl. cached) for get_rope_index.
+    - ``mm_embed_tail_starts``: per kept item, first uncached feature index.
+    """
+
+    full_input_tokens: torch.Tensor
+    num_cached_tokens: int
+    mrope_mm_kwargs: BatchedTensorInputs | None
+    mm_embed_tail_starts: dict[str, list[int]] | None
 
 
 # FIXME(eunji): In original vLLM, this dataclasss is located in model_runner.
@@ -31,8 +48,6 @@ class ModelInputForRBLN:
     running_requests_ids: list[str]
     finished_requests_ids: list[str]
     is_prompt: bool = False
-    cached_block_tables: list[int] = field(default_factory=list)  # for prefix caching
-    cached_lengths: list[int] = field(default_factory=list)  # for prefix caching
     multi_modal_kwargs: BatchedTensorInputs | None = None
     dummy_block: int | None = None  # for prefix caching
     inputs_embeds: torch.Tensor | None = None
@@ -41,6 +56,9 @@ class ModelInputForRBLN:
     # deepstack features. Left None for models that don't use them.
     visual_pos_mask: torch.Tensor | None = None
     deepstack_embeds: torch.Tensor | None = None
+    # Set only on a partial prefix-cache hit (see PartialPrefixInfo); None on the
+    # no-hit path and for non-MRoPE models.
+    partial_prefix: "PartialPrefixInfo | None" = None
 
 
 version_error = RuntimeError(

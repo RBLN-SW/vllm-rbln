@@ -32,14 +32,20 @@ jobs:
           
       - name: Update Optimum Version in uv
         id: uv-update-optimum-rbln
+        env:
+          UV_INDEX_RBLN_NEXUS_NIGHTLY_USERNAME: ${{ secrets.UDC_NEXUS_USERNAME }}
+          UV_INDEX_RBLN_NEXUS_NIGHTLY_PASSWORD: ${{ secrets.UDC_NEXUS_PASSWORD }}
         run: |
+          set -euo pipefail
           VERSION="${{ inputs.optimum-version }}"
           VERSION="${VERSION#v}"
+
+          # Bump optimum-rbln in pyproject.toml and refresh uv.lock in one step.
           for i in {1..6}; do
-            uv add "optimum-rbln>=${VERSION}" --no-cache && exit 0
+            uv add "optimum-rbln>=${VERSION}" --upgrade-package optimum-rbln && exit 0
             sleep 10
           done
-          echo "All retries with --cache-dir failed."
+          echo "::error::uv add failed after retries"
           exit 1
 
       - name: Create PR for updated files
@@ -50,6 +56,7 @@ jobs:
           token: ${{ secrets.GIT_PAT }}
           add-paths: |
             pyproject.toml
+            uv.lock
           commit-message: "other: update optimum-rbln to ${{ inputs.optimum-version }}"
           title: "other: auto-update optimum-rbln to ${{ inputs.optimum-version }}"
           body: "Updated optimum-rbln to ${{ inputs.optimum-version }}."

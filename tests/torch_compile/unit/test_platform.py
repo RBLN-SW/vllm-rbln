@@ -92,8 +92,8 @@ def test_get_attn_backend_cls():
     )
     assert (
         attn_backend_cls
-        == "vllm_rbln.v1.attention.backends.flash_attention.RBLNAttentionBackend"
+        == "vllm_rbln.v1.attention.backends.flash_attention.RBLNFlashAttentionBackend"
     ), (
         f"Expected 'vllm_rbln.attention.backends.flash_attention.\
-        RBLNAttentionBackend', got {attn_backend_cls}"
+        RBLNFlashAttentionBackend', got {attn_backend_cls}"
     )

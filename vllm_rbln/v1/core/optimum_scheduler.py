@@ -15,6 +15,7 @@
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
+from typing import Any
 
 import torch
 from vllm.config import VllmConfig
@@ -111,15 +112,28 @@ class RBLNOptimumScheduler(Scheduler):
 
         # Scheduling constraints.
         self.max_num_running_reqs = self.scheduler_config.max_num_seqs
+        # Per-step token budget. Not max_num_batched_tokens: the optimum path
+        # repurposes that as the compiled prefill chunk size, and the runner
+        # prefills the whole prompt in one step (chunking is internal to the
+        # compiled binary). The budget must therefore fit a full-length prefill
+        # or a full decode batch.
         self.max_num_scheduled_tokens = (
             self.scheduler_config.max_num_scheduled_tokens
             if self.scheduler_config.max_num_scheduled_tokens
-            else self.scheduler_config.max_num_batched_tokens
+            else max(
+                vllm_config.model_config.max_model_len,
+                self.scheduler_config.max_num_seqs,
+            )
         )
         self.max_model_len = vllm_config.model_config.max_model_len
         self.enable_kv_cache_events = (
             self.kv_events_config is not None
             and self.kv_events_config.enable_kv_cache_events
+        )
+
+        # Diffusion models may not sample any tokens for a denoising step.
+        self.num_sampled_tokens_per_step = (
+            1 if not vllm_config.model_config.is_diffusion else 0
         )
         # Create KVConnector for the Scheduler. Note that each Worker
         # will have a corresponding KVConnector with Role=WORKER.
@@ -127,6 +141,12 @@ class RBLNOptimumScheduler(Scheduler):
         self.connector = None
         self.connector_prefix_cache_stats: PrefixCacheStats | None = None
         self.recompute_kv_load_failures = True
+        # defer_block_free postpones returning a freed request's KV blocks to
+        # the pool until the in-flight GPU step that may still be writing them
+        # completes. The optimum path uses encoder caching but not async
+        # scheduling / pipeline parallelism, so there are no overlapping
+        # in-flight writes and this is never needed.
+        self.defer_block_free = False
         self.kv_event_publisher = EventPublisherFactory.create(
             self.kv_events_config,
             self.parallel_config.data_parallel_rank,
@@ -182,17 +202,19 @@ class RBLNOptimumScheduler(Scheduler):
             attn_block_size = None
         # gemma3/gemma4: optimum-rbln's chunked prefill touches extra KV-cache
         # slots beyond the prompt (partition-alignment + trailing chunk
-        # write-extent), so `allocate_slots` must reserve them. `prefill_chunk_size`
-        # is persisted into `additional_config` during `sync_vllm_and_optimum`.
+        # write-extent), so `allocate_slots` must reserve them. The prefill chunk
+        # size is `max_num_batched_tokens` (set during `sync_vllm_and_optimum`);
+        # the image-prefill buckets live in `additional_config`.
         archs = getattr(vllm_config.model_config.hf_config, "architectures", None) or []
         needs_chunked_prefill_pad = any("Gemma3" in a or "Gemma4" in a for a in archs)
         prefill_chunk_size = None
         image_prefill_chunk_size = None
-        if needs_chunked_prefill_pad and vllm_config.additional_config is not None:
-            prefill_chunk_size = vllm_config.additional_config.get("prefill_chunk_size")
-            image_prefill_chunk_size = vllm_config.additional_config.get(
-                "image_prefill_chunk_size"
-            )
+        if needs_chunked_prefill_pad:
+            prefill_chunk_size = self.scheduler_config.max_num_batched_tokens
+            if vllm_config.additional_config is not None:
+                image_prefill_chunk_size = vllm_config.additional_config.get(
+                    "image_prefill_chunk_size"
+                )
 
         # Create the KV cache manager.
         if hash_block_size is None:
@@ -200,7 +222,11 @@ class RBLNOptimumScheduler(Scheduler):
         self.kv_cache_manager = RBLNKVCacheManager(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
-            max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
+            scheduler_block_size=self.block_size,
+            # The SWA/chunked-local admission cap, which must match the actual
+            # per-step budget, not max_num_batched_tokens (the compiled chunk
+            # size). See max_num_scheduled_tokens above.
+            max_num_batched_tokens=self.max_num_scheduled_tokens,
             enable_caching=self.cache_config.enable_prefix_caching,
             use_eagle=False,
             log_stats=self.log_stats,
@@ -246,11 +272,24 @@ class RBLNOptimumScheduler(Scheduler):
             else EncoderCacheManager(cache_size=encoder_cache_size)
         )
 
+        # Speculative decoding is not supported on the optimum path
+        self.use_eagle = False
+        self.num_spec_tokens = 0
+        self.num_lookahead_tokens = 0
+        self.dynamic_sd_lookup: list[int] | None = None
+
         self.use_pp = False
         self.use_v2_model_runner = False
         self._pause_state: PauseState = PauseState.UNPAUSED
+        # In-flight requests still prefilling (prefill chunks + in-progress
+        # async KV loads). Their remaining-block reservation gates async loads.
+        self._inflight_prefills: set[Request] = set()
+        # Scheduler iteration counter. Drives the V2+PP+async decode-throttle
+        # cadence (`next_decode_eligible_step`).
+        self.current_step = 0
 
-    def schedule(self) -> RBLNSchedulerOutput:
+    def schedule(self, throttle_prefills: bool = False) -> RBLNSchedulerOutput:
+        self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -627,7 +666,9 @@ class RBLNOptimumScheduler(Scheduler):
         self._pending_free_mm_hashes = []
         return scheduler_output
 
-    def _free_request(self, request: Request, delay_free_blocks: bool = False):
+    def _free_request(
+        self, request: Request, delay_free_blocks: bool = False
+    ) -> dict[str, Any] | None:
         # Capture mm hashes and notify the EC connector before super()
         # tears the request down — base._free_blocks deletes self.requests[id]
         # so we can't recover mm_features afterwards.
@@ -655,7 +696,7 @@ class RBLNOptimumScheduler(Scheduler):
             "Only running requests can be preempted"
         )
         preempted_blocks = self.kv_cache_manager.get_block_ids(request.request_id)[0]
-        self.kv_cache_manager.free(request, preemption=True)
+        self._free_request_blocks(request, preemption=True)
         if not self.cache_config.enable_prefix_caching:
             preempted_blocks = [block_idx - 1 for block_idx in preempted_blocks]
         logger.warning(
@@ -672,3 +713,22 @@ class RBLNOptimumScheduler(Scheduler):
 
         # Put the request back to the waiting queue.
         self.waiting.prepend_request(request)
+
+    def _free_request_blocks(self, request: Request, preemption: bool = False):
+        """Free the request's KV blocks, deferring the return to the block
+        pool when an in-flight GPU step may still write them.
+        """
+        if not self.defer_block_free or (
+            # Last scheduled step already processed: no in-flight write remains
+            # (always the case for a normal finish), so free now.
+            request.last_sched_seq <= self.processed_step_seq
+        ):
+            self.kv_cache_manager.free(request, preemption=preemption)
+            return
+        # Dead branch on the optimum path: defer_block_free is always False
+        # (no async scheduling / PP), so the guard above always frees and
+        # returns. Kept only to stay in sync with the upstream 0.24
+        # implementation. Note preemption is intentionally not threaded here.
+        blocks = self.kv_cache_manager.pop_blocks_for_free(request)
+        if blocks:
+            self.deferred_frees.append((self.sched_step_seq, blocks))
