@@ -20,10 +20,9 @@ from utils import RemoteOpenAIServer
 MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
 MAX_TOKENS = 1
 
-# num_hidden_layers=1 keeps compile fast; --max-num-seqs 4 mirrors the original
 SERVER_ARGS = [
     "--hf-overrides",
-    '{"num_hidden_layers": 1}',
+    '{"num_hidden_layers": 1, "layer_types": ["full_attention"]}',
     "--max-model-len",
     "2048",
     "--block-size",
