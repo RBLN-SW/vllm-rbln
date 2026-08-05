@@ -62,8 +62,6 @@ if TYPE_CHECKING:
     VLLM_RBLN_USE_DYNAMIC_KV_CACHE: bool = False
     # Debug-only override of the derived compile-time hint (see
     # compile_kv_cache_num_blocks); 0 opts out of the shrink and the resize.
-    # Kept a literal because this block is only read by type checkers; the value
-    # in force is DEFAULT_COMPILE_KV_CACHE_NUM_BLOCKS below.
     VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS: int = 8
     VLLM_RBLN_DYNAMIC_KV_UNPROFILED_RESERVE_BYTES: int = 48 * 1024 * 1024
     # --- ATTENTION ---
@@ -236,11 +234,9 @@ def _raw_compile_kv_cache_num_blocks() -> str | None:
 def compile_kv_cache_num_blocks_is_explicit() -> bool:
     """Whether the block count came from the operator or from the default.
 
-    Not `is_set(...)`: that answers presence, which differs from this on a blank
-    value -- and that is the input deciding whether a hint at or above the
-    estimate refuses (derived) or only warns (explicit). Sharing the getter's rule
-    keeps the value and its provenance from disagreeing. An explicit `0` is still
-    a choice.
+    Blank counts as absent, exactly as the getter treats it -- and that is the
+    input deciding whether a hint at or above the estimate refuses (derived) or
+    only warns (explicit). An explicit `0` is still a choice.
     """
     return _raw_compile_kv_cache_num_blocks() is not None
 

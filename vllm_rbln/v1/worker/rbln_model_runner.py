@@ -2471,15 +2471,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     )
                     kv_caches[layer_name] = typed_base.permute(*inv_order)
                     if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
-                        # Carry a dynamic-shape variable on num_blocks so the
-                        # artifact's buffers can be re-sized once the real block
-                        # count is known (compute_dynamic_kv_num_blocks). Exactly
-                        # one dim: the compiler assumes every dynamic variable in
-                        # a graph takes the same value, and requires the marked
-                        # input to reach a single
-                        # paged_flash_causal_attention_naive_* call. Without this
-                        # the rest of the path silently degrades to a no-op, so
-                        # the log line below is the only record that it ran.
+                        # Carry a dynamic-shape variable on num_blocks so the KV
+                        # buffers can be re-sized once the real count is known
+                        # (compute_dynamic_kv_num_blocks). Exactly one dim: the
+                        # compiler assumes every dynamic variable in a graph takes
+                        # the same value, and requires the marked input to reach a
+                        # single paged_flash_causal_attention_naive_* call.
                         torch._dynamo.mark_dynamic(kv_caches[layer_name], 1)
                         logger.info_once(
                             "[Dynamic KV] mark_dynamic(kv_cache, dim=1) applied "

@@ -500,13 +500,8 @@ def test_load_model_compiles_wrapper(monkeypatch, strict):
     assert captured["mode"] == ("strict" if strict else "")
 
 
-# Verifies the drafter joins the runner's runtime holder only when the dynamic-KV
-# path needs it.  The holder is a live list: `_process_kv_cache_copy_ops` indexes
-# it and `_propagate_runtime_holder` hands the same object to KV connectors, so
-# adding the drafter's runtimes to it changes what those see.  Dynamic KV does
-# need them there (their private device regions belong in the budget, and their
-# adaptive-size latch has to be cleared after a resize, or their first forward
-# raises), but nothing else does.
+# Verifies the drafter shares the runner's runtime holder only under dynamic KV;
+# `RBLNEagleProposer.load_model` records why the sharing is gated.
 @pytest.mark.parametrize("dynamic_kv", [False, True])
 def test_load_model_shares_runtime_holder_only_for_dynamic_kv(monkeypatch, dynamic_kv):
     holder: list = []

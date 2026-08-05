@@ -490,12 +490,7 @@ class RBLNWorker(WorkerBase):
     # ------------------------------------------------------------------
 
     def _compile_and_warmup_skip_reason(self) -> str | None:
-        """Why the compile and warm-up will be skipped, or None if they will run.
-
-        The dynamic-KV path needs what warm-up produces, so it has nothing to work
-        with when this returns a reason. One place decides and names it, so a
-        caller's log cannot describe a different condition than the branch.
-        """
+        """Why the compile and warm-up will be skipped, or None if they will run."""
         if self.model_config.enforce_eager:
             return "enforce_eager is set"
         if not envs.VLLM_RBLN_COMPILE_MODEL:
@@ -515,15 +510,6 @@ class RBLNWorker(WorkerBase):
         Building the artifact's buffers at the full size is pointless when the
         runtime resizes them anyway, and warm-up is safe small: every dummy
         request points at block id 0.
-
-        The count is derived, so `VLLM_RBLN_USE_DYNAMIC_KV_CACHE` is the only
-        switch to set; the env var is a debug override. Provenance matters here
-        because the same value means different things depending on who chose it.
-
-        The shrink is ANDed with `VLLM_RBLN_USE_DYNAMIC_KV_CACHE` and with the
-        *absence* of `--num-gpu-blocks-override`, because in both cases nothing
-        would put the full cache back and the scheduler would hand out block ids
-        the shrunk cache does not have.
         """
         compile_num_blocks = envs.VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS
         explicit = envs.compile_kv_cache_num_blocks_is_explicit()
@@ -1142,12 +1128,10 @@ class RBLNWorker(WorkerBase):
                 continue
             profiles.append(profile)
             profiled_ids.add(id(runtime))
-            # The full profile, verbatim, one line per artifact: the only record
-            # of base_bytes / bytes_per_block / alignment, since neither sysfs nor
-            # the runtime's allocation log exposes the per-block cost. Without it
-            # a finished run cannot be re-analysed offline. The identity fields go
-            # after the region list so a reader that splits at `device_regions=[`
-            # can still say which artifact the regions came from.
+            # The only record of base_bytes / bytes_per_block / alignment:
+            # neither sysfs nor the runtime's allocation log exposes the
+            # per-block cost. Identity fields go after the region list so a
+            # reader that splits at `device_regions=[` can still attribute them.
             logger.info(
                 "[Dynamic KV] compiled profile: %s rank=%d profile_index=%d "
                 "runtime=%s#%d num_regions=%d",
@@ -1222,8 +1206,6 @@ class RBLNWorker(WorkerBase):
             return None
 
         fit_usage = per_chiplet_usage(merged, num_blocks)
-        # Field names, not prose: a log reader keys on `computed_num_blocks` /
-        # `chiplet_budget_bytes` to recover the answer and its budget.
         logger.info(
             "[Dynamic KV] rank %d: computed_num_blocks=%d "
             "chiplet_budget_bytes=%d predicted usage per (node, chiplet)=%s "
@@ -1490,9 +1472,6 @@ class RBLNWorker(WorkerBase):
             if is_rbln_oom_error(e.inner_exception):
                 blocks = self.model_runner.kv_cache_config.num_blocks
                 if self._kv_blocks_before_shrink is not None:
-                    # The number in hand is the compile-time cache, not what the
-                    # server runs on, so "reduce the number of blocks" points at
-                    # the one thing already minimal.
                     raise RuntimeError(
                         f"Not enough memory to compile against the {blocks}-block "
                         "compile-time KV cache ("

@@ -1642,8 +1642,6 @@ class TestMaybeShrinkKvCacheForCompile:
 
         assert out.num_blocks == 16
         assert worker._kv_blocks_before_shrink == self.ESTIMATED_BLOCKS
-        # Names the variable the operator actually set, so the log says where 16
-        # came from rather than just that it was not the default.
         assert "VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS" in caplog.text
         assert "derived default" not in caplog.text
 
@@ -1738,8 +1736,6 @@ class TestMaybeShrinkKvCacheForCompile:
         assert out is config
         assert worker._kv_blocks_before_shrink is None
         assert "compile/warm-up is skipped" in caplog.text
-        # The operator needs to know the feature did nothing, not just that a
-        # step was skipped.
         assert "does nothing for this run" in caplog.text
 
     def test_flag_off_with_an_explicit_zero_is_silent(self, caplog):

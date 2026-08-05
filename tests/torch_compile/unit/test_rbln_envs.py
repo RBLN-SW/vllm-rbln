@@ -105,13 +105,7 @@ def test_dynamic_kv_cache_envs_default_off():
 def test_compile_kv_cache_num_blocks_default_is_not_derived_from_the_flag(
     monkeypatch,
 ):
-    """The default must not be spelled in terms of the other variable.
-
-    A derived default (the `use_auto_port` shape) is a second copy of the
-    sibling's default that has to be maintained by hand, and it is what would be
-    missed the day VLLM_RBLN_USE_DYNAMIC_KV_CACHE flips to default-on -- which
-    would restore the half-enabled state. The worker checks the flag instead.
-    """
+    """The default must not be spelled in terms of the other variable."""
     monkeypatch.delenv("VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS", raising=False)
     for flag in ("0", "1"):
         monkeypatch.setenv("VLLM_RBLN_USE_DYNAMIC_KV_CACHE", flag)
@@ -119,13 +113,7 @@ def test_compile_kv_cache_num_blocks_default_is_not_derived_from_the_flag(
 
 
 def test_blank_compile_kv_cache_num_blocks_is_the_default_not_a_crash(monkeypatch):
-    """`FOO=` must not raise.
-
-    vLLM's `enable_envs_cache` evaluates every registered getter once, RBLN's
-    included, so a getter that raises takes down deployments that never use this
-    feature. A shell that exports the variable empty is the realistic way to hit
-    it.
-    """
+    """`FOO=` must not raise: `enable_envs_cache` calls every getter once."""
     monkeypatch.setenv("VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS", "")
     assert envs.VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS == 8
     monkeypatch.setenv("VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS", "   ")
@@ -147,15 +135,7 @@ def test_is_set_reports_presence_not_truthiness(monkeypatch):
 
 
 def test_provenance_and_value_agree_on_a_blank_value(monkeypatch):
-    """A blank value must not read as a choice the operator made.
-
-    The two answers part company only here, and this is the one place they must
-    not: the worker refuses a *derived* hint that cannot shrink and merely warns
-    about an *explicit* one, so calling blank "explicit" would turn that refusal
-    back into the silent fallback to the pre-compile estimate. `is_set` still
-    reports presence -- that is what its name says -- which is why the worker
-    asks this instead.
-    """
+    """A blank value must not read as a choice the operator made."""
     for raw in ("", "   "):
         monkeypatch.setenv("VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS", raw)
         assert envs.VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS == 8

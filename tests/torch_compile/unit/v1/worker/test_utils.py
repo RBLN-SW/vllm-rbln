@@ -462,19 +462,9 @@ class TestChipletReplicationFactor:
 # who gets the exact replication factor
 # ---------------------------------------------------------------------------
 class TestReplicationFactorIsGated:
-    """`estimate_available_memory` is the sizing path EVERY model takes.
+    """The exact replication factor applies only under dynamic KV.
 
-    The exact factor is larger than the released `max(1, rsd_size // kvh)`
-    whenever kvh is neither a divisor nor a multiple of rsd_size, so switching to
-    it unconditionally would silently hand those models a smaller KV cache
-    (measured on RBLN-CR03, kernel 6 GiB, gmu 0.9: kvh=5 118.00 -> 73.75 GiB,
-    kvh=10 -> 98.33, kvh=3/6/9 -> 88.50). No such head count has been checked
-    against hardware, so the released number stays unless the dynamic-KV path --
-    which re-derives the block count from the compiled artifact and validates it
-    per chiplet -- is switched on.
-
-    Every figure here is measured with the card DRAM capacity pinned by
-    `_measure`; see its docstring for why that is necessary.
+    Measured on RBLN-CR03 (kernel 6 GiB, gmu 0.9); the figures are in DISAGREE below.
     """
 
     KERNEL = 6 * 2**30
@@ -500,20 +490,10 @@ class TestReplicationFactorIsGated:
     ):
         """Measure with the card DRAM capacity pinned, not read off the host.
 
-        The RBLN-CR branch of `estimate_available_memory` sources the capacity
-        from `read_rbln_card_dram_total_bytes()`. `get_device_name` is mocked to
-        a CR part below, but the capacity would still come from whatever card the
-        machine running the tests has -- and the CI fleet is ATOM
-        (`rbln-sw-k8s-ca22-*`), where that is a ~15.7 GiB card, so every figure
-        in this class came out about 9x too small. Pin it to the built-in
-        constant, which is also exactly what a uniform RBLN-CR host reports.
-
-        Args:
-            sysfs_total: what the reader should report. None means sysfs is
-                unavailable, i.e. fall back to the built-in constant.
-            sysfs_error: when given, the reader raises this instead of returning.
-                A caller cannot patch the reader itself -- this method's own
-                patch would override it.
+        The CI fleet is ATOM (~15.7 GiB), so letting the RBLN-CR branch read the
+        real card makes every figure in this class ~9x too small. `sysfs_error`
+        exists because a caller's own patch of the reader would lose to the one
+        applied here.
         """
         mock_platform.get_device_name.return_value = "RBLN-CR03"
         mock_envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK = 1

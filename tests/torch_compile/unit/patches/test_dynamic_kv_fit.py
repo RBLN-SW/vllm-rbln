@@ -12,14 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The resized KV cache must still hold one max-length request.
-
-Upstream's `check_enough_kv_cache_memory` runs against the pre-compile estimate,
-inside `get_kv_cache_configs`. Nothing re-checks the number the dynamic-KV path
-substitutes, so without this guard a profile returning too few blocks yields a
-server that starts and then rejects every request -- where dev dies at start-up
-with an actionable message.
-"""
+"""The resized KV cache must still hold one max-length request."""
 
 from types import SimpleNamespace
 

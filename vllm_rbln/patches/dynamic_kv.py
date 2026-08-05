@@ -58,15 +58,9 @@ def _dynamic_kv_enabled() -> bool:
 def resolve_rank_num_blocks(num_blocks_per_rank: list[Any]) -> int | None:
     """Reduce the per-rank answers to the single block count to apply.
 
-    All ranks run the same gates, so the result should be uniformly None or
-    uniformly an int. A mixed result means a rank could not validate a number
-    against its own device, and applying another rank's answer there risks an
-    OOM -- so it is refused.
-
-    Returns:
-        None when every rank declined, otherwise the minimum across ranks
-        (upstream's own reduction is a min; a rank with more blocks than the
-        agreed number simply leaves the extras unused).
+    All ranks run the same gates, so the answer is uniformly None or uniformly an
+    int; a mixed result is refused below. The reduction is a min, as upstream's
+    own is: a rank holding more than the agreed number leaves the extras unused.
     """
     if not num_blocks_per_rank:
         return None
@@ -147,10 +141,7 @@ def patched_initialize_kv_caches(
     override = vllm_config.cache_config.num_gpu_blocks_override
     if override is not None:
         # WARNING, not INFO: two features that each size the KV cache are on at
-        # once and one is being ignored. This combination used to break the
-        # server outright -- the scheduler handed out block ids the shrunk cache
-        # did not have -- so it must never pass silently even now that the shrink
-        # is refused.
+        # once and one is ignored -- a combination that used to break the server.
         logger.warning(
             "dynamic KV cache: VLLM_RBLN_USE_DYNAMIC_KV_CACHE and "
             "--num-gpu-blocks-override=%d are both set. The override wins: no "

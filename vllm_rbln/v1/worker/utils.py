@@ -141,30 +141,15 @@ def _read_card_attr_int(card_index: int, attr: str) -> int | None:
 def read_rbln_card_dram_total_bytes() -> int | None:
     """Per-card DRAM capacity in bytes, or None when sysfs is unavailable.
 
-    A heterogeneous set is rejected rather than averaged: it would make a single
+    Reads only the cards this process owns (`get_rbln_owned_card_indices`). A
+    heterogeneous set is rejected rather than averaged: it would make a single
     per-chiplet budget meaningless. On RBLN-CR the driver reports the same figure
     the previous literal encoded, now sourced from the device.
 
-    Reads the cards this process owns, the same set as
-    `read_rbln_card_dram_used_bytes`. Indexing sysfs by the raw `RBLN_DEVICES`
-    entry instead would read the capacity of a card belonging to another
-    container -- harmless while every card is the same SKU, but it would raise on
-    a heterogeneous host and go stale the moment sysfs starts exposing only the
-    cards a container owns.
-
-    The result is clamped to `REBEL_DRAM_NBYTES`, which already has the 4 GiB
-    system region subtracted; nothing documents that sysfs does the same. The
-    clamp lives here rather than at a call site because both callers size real
-    allocations from this number -- the static estimate every model takes, and
-    the per-chiplet dynamic-KV budget that feeds `max_num_blocks` -- and a
-    clamp applied to only one of them is the failure this reader is meant to
-    prevent. Current drivers report exactly `REBEL_DRAM_NBYTES`, so nothing
-    moves today.
-
-    The trade-off is that a future SKU with genuinely more DRAM is silently
-    capped at the current figure (with a warning). That is deliberate: reporting
-    too much memory over-commits the device, while reporting too little only
-    leaves capacity unused. Raise the constant when such a card exists.
+    Clamped to `REBEL_DRAM_NBYTES`, which already has the 4 GiB system region
+    subtracted; nothing documents that sysfs does the same. The clamp is here
+    rather than at the call sites because both of them size real allocations
+    from this number.
     """
     values: dict[int, int] = {}
     for card_index in get_rbln_owned_card_indices():
@@ -451,17 +436,11 @@ def estimate_available_memory(
         buffer = buffer_per_runtime_per_core * num_runtimes
     available_dram_bytes -= buffer
 
-    # The released expression `max(1, rsd_size // kvh)` agrees with the exact
-    # replication factor whenever kvh divides or is a multiple of rsd_size, and
-    # is optimistic otherwise (kvh in {3, 5, 6, 7, 9, 10, ...} at rsd_size 4).
-    #
-    # This is the *static* path every model takes and the exact factor has never
-    # been checked against hardware for a kvh where the two disagree, so it only
-    # applies together with dynamic KV -- which re-derives the size from the
-    # compiled artifact and re-validates it per chiplet. With the flag off the
-    # released value is kept byte-for-byte and the gap is only reported. The
-    # exact factor is always >= the released one, so the flag can only reduce the
-    # estimate, never grow it into an OOM.
+    # `max(1, rsd_size // kvh)` matches the exact replication factor only when
+    # kvh divides or is a multiple of rsd_size, and is optimistic otherwise
+    # (kvh in {3, 5, 6, 7, 9, 10, ...} at rsd_size 4). The exact factor is always
+    # >= it, so switching under the flag can only shrink this estimate, never
+    # grow it into an OOM.
     rsd_replicas = max(1, rsd_size // num_key_value_heads)
     released_dram_bytes = available_dram_bytes // rsd_replicas
     exact_dram_bytes = divide_by_chiplet_replication(

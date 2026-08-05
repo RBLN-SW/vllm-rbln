@@ -284,11 +284,7 @@ def assert_budget_covers_profile(
     profile: Any,
     budget: dict[int, dict[int, int]],
 ) -> None:
-    """Fail loudly when the budget map misses a (node, chiplet) the profile uses.
-
-    Without this `max_num_blocks` charges the missing unit against a 0-byte
-    budget and returns 0 blocks with no error.
-    """
+    """Fail loudly when the budget map misses a (node, chiplet) the profile uses."""
     used = {(int(r.node_id), int(r.chiplet_id)) for r in profile.device_regions}
     covered = {
         (node_id, chiplet_id)
