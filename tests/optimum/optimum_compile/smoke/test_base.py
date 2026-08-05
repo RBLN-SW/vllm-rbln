@@ -93,6 +93,14 @@ def _make_hf_overrides(dotted: dict[str, Any]) -> Callable:
                     break
             if obj is not None and hasattr(obj, last):
                 setattr(obj, last, value)
+                # Shrinking num_hidden_layers must also shrink a sibling
+                # layer_types list: newer transformers validates
+                # len(layer_types) == num_hidden_layers on save (e.g. the Gemma
+                # text tower of Paligemma), so a stale 26-entry list fails.
+                if last == "num_hidden_layers":
+                    lt = getattr(obj, "layer_types", None)
+                    if isinstance(lt, (list, tuple)) and len(lt) > value:
+                        obj.layer_types = list(lt[:value])
         return config
 
     return apply

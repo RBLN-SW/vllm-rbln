@@ -1,0 +1,19 @@
+name: vllm-rbln / PR
+
+# The vllm-rbln wheel packaging check is gated on review approval rather than
+# running on every push -- it builds only once a reviewer approves the PR, which
+# avoids rebuilding the wheel on every commit. (The NPU test suite runs
+# separately on Obedients, triggered on push.)
+on:
+  pull_request_review:
+    types: [submitted]
+
+jobs:
+  # Build only when a review APPROVES a PR into dev.
+  # (pull_request_review has no branch filter, so gate on base.ref here.)
+  build-vllm-rbln-wheel:
+    if: ${{ github.event.review.state == 'approved' && github.event.pull_request.base.ref == 'dev' }}
+    uses: ./.github/workflows/rbln_trigger_internal_test.yaml
+    secrets: inherit
+    with:
+      ref: ${{ github.event.pull_request.head.sha }}
