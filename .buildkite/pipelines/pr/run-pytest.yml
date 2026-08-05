@@ -44,7 +44,7 @@ steps:
   # (team-member + pre-commit gates run earlier, in pretest.yml, before this
   # pipeline is uploaded.)
   # ===========================================================================
-  - label: ":pytest: core"
+  - label: ":pytest: tests/optimum/v1/core"
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     resources: &cpu-only-resources
       cpu:
