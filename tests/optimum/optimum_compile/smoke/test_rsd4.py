@@ -16,9 +16,7 @@
 Run with ``pytest tests/optimum_compile/test_rsd4.py``."""
 
 import pytest
-from test_base import DecoderSmoke, MultimodalSmoke, requires_npu
-
-pytestmark = requires_npu
+from test_base import DecoderSmoke, MultimodalSmoke
 
 _GET_INPUT_EMBEDS_BUG = pytest.mark.xfail(
     reason="vllm-rbln get_input_embeddings() returns None in the MM embed path",
@@ -73,6 +71,6 @@ class TestPaligemma(MultimodalSmoke.Test):
     MODEL_ID = "google/paligemma2-3b-pt-224"
     HF_OVERRIDES = {"text_config.num_hidden_layers": 1}
     NUM_DEVICES = 1
-    LLM_KWARGS = {"block_size": 8192, "max_model_len": 8192, "max_num_seqs": 1}
+    LLM_KWARGS = {"block_size": 4096, "max_model_len": 4096, "max_num_seqs": 1}
     USE_CHAT_TEMPLATE = False
     PROMPT = "caption en"

@@ -17,7 +17,7 @@ import pytest
 import pytest_asyncio
 from utils import RemoteOpenAIServer
 
-MODEL_NAME = "meta-llama/Llama-3.2-1B-Instruct"
+MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
 MAX_TOKENS = 1
 
 # num_hidden_layers=1 keeps compile fast; --max-num-seqs 4 mirrors the original
@@ -25,9 +25,9 @@ SERVER_ARGS = [
     "--hf-overrides",
     '{"num_hidden_layers": 1}',
     "--max-model-len",
-    "4096",
+    "2048",
     "--block-size",
-    "4096",
+    "2048",
     "--max-num-seqs",
     "4",
 ]

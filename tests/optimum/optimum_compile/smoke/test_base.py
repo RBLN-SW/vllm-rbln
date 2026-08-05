@@ -24,7 +24,6 @@ import unittest
 from collections.abc import Callable
 from typing import Any
 
-import pytest
 import torch
 from PIL import Image
 from vllm import LLM, SamplingParams
@@ -35,9 +34,6 @@ try:
     _NPU_NAME = rebel.get_npu_name()
 except Exception:  # noqa: BLE001 - rebel import/NPU probe may fail without hw
     _NPU_NAME = None
-
-# Attach as ``pytestmark = requires_npu`` at module level in each test_rsd*.py.
-requires_npu = pytest.mark.skipif(_NPU_NAME is None, reason="requires a real RBLN NPU")
 
 # Bundled image for multimodal inputs -- keeps the default hermetic (no
 # external dataset download).

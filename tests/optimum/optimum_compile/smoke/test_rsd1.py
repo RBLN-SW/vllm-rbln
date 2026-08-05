@@ -16,9 +16,7 @@
 (kept full-size with a real ranking assertion) plus the hybrid-attention Gemma2
 decoder. Run with ``pytest tests/optimum_compile/test_rsd1.py``."""
 
-from test_base import DecoderSmoke, PoolingSmoke, requires_npu
-
-pytestmark = requires_npu
+from test_base import DecoderSmoke, PoolingSmoke
 
 
 class TestQwen3Embedding(PoolingSmoke.Test):

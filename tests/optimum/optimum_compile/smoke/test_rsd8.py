@@ -15,9 +15,7 @@
 """Optimum smoke tests for the RSD-8 (multi-device-class) runner.
 Run with ``pytest tests/optimum_compile/test_rsd8.py``."""
 
-from test_base import MultimodalSmoke, requires_npu
-
-pytestmark = requires_npu
+from test_base import MultimodalSmoke
 
 
 class TestQwen25VL(MultimodalSmoke.Test):
