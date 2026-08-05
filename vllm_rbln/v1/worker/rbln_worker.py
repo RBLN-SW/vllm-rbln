@@ -96,6 +96,16 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 
 
+def _kv_cache_config_at(cfg: KVCacheConfig, num_blocks: int) -> KVCacheConfig:
+    """A copy of `cfg` retargeted at `num_blocks` (tensor sizes scale with it)."""
+    scaled = copy.copy(cfg)
+    scaled.kv_cache_tensors = copy.deepcopy(cfg.kv_cache_tensors)
+    scaled.num_blocks = num_blocks
+    for kv_tensor in scaled.kv_cache_tensors:
+        kv_tensor.size = (kv_tensor.size * num_blocks) // cfg.num_blocks
+    return scaled
+
+
 def empty_rbln_device_caches() -> bool:
     """Return every *free* block the rbln caching allocator holds to the driver.
 
@@ -611,17 +621,7 @@ class RBLNWorker(WorkerBase):
             )
             return kv_cache_config
 
-        shrunk = copy.copy(kv_cache_config)
-        shrunk.kv_cache_tensors = copy.deepcopy(kv_cache_config.kv_cache_tensors)
-        shrunk.num_blocks = compile_num_blocks
-        # Each kv_cache_tensor's size is num_blocks * group.page_size_bytes;
-        # scale proportionally so the tensor allocation stays consistent with
-        # num_blocks (mirrors `_reallocate_kv_cache`).
-        for kv_tensor in shrunk.kv_cache_tensors:
-            kv_tensor.size = (
-                kv_tensor.size * compile_num_blocks
-            ) // kv_cache_config.num_blocks
-
+        shrunk = _kv_cache_config_at(kv_cache_config, compile_num_blocks)
         self._kv_blocks_before_shrink = kv_cache_config.num_blocks
         logger.info(
             "[Dynamic KV] compiling with %d KV blocks instead of %d "
@@ -1262,22 +1262,6 @@ class RBLNWorker(WorkerBase):
         self._reallocate_kv_cache(target)
         return target
 
-    def _kv_cache_layer_names(self, kv_cache_config: KVCacheConfig) -> list[str]:
-        """Every layer name `bind_kv_cache` would have bound for this config.
-
-        `KVCacheTensor.shared_by` is the same list `_allocate_kv_cache_tensors`
-        keys its output on, so this covers exactly the bound layers.
-        """
-        names: list[str] = []
-        seen: set[str] = set()
-        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-            for layer_name in kv_cache_tensor.shared_by:
-                if layer_name in seen:
-                    continue
-                seen.add(layer_name)
-                names.append(layer_name)
-        return names
-
     def _release_kv_cache_tensors(self, old_cfg: KVCacheConfig) -> None:
         """Drop every reference to the outgoing KV cache and free its device DRAM.
 
@@ -1313,7 +1297,11 @@ class RBLNWorker(WorkerBase):
         # expression that wrote it, so a rename breaks both at once.
         forward_context = mr.compilation_config.static_forward_context
         unbound = 0
-        for layer_name in self._kv_cache_layer_names(old_cfg):
+        # `KVCacheTensor.shared_by` is the same list `_allocate_kv_cache_tensors`
+        # keys its output on, so this is exactly the set of bound layers.
+        for layer_name in dict.fromkeys(
+            name for t in old_cfg.kv_cache_tensors for name in t.shared_by
+        ):
             layer = forward_context.get(layer_name)
             if layer is None:
                 logger.warning(
@@ -1365,13 +1353,7 @@ class RBLNWorker(WorkerBase):
         old_num_blocks = old_cfg.num_blocks
         assert old_num_blocks > 0, "cannot rescale a KV cache of 0 blocks"
 
-        new_cfg = copy.copy(old_cfg)
-        new_cfg.kv_cache_tensors = copy.deepcopy(old_cfg.kv_cache_tensors)
-        new_cfg.num_blocks = new_num_blocks
-        # Each kv_cache_tensor's size is num_blocks * group.page_size_bytes.
-        for kv_tensor in new_cfg.kv_cache_tensors:
-            kv_tensor.size = (kv_tensor.size * new_num_blocks) // old_num_blocks
-
+        new_cfg = _kv_cache_config_at(old_cfg, new_num_blocks)
         self.cache_config.num_gpu_blocks = new_num_blocks
         self.cache_config.num_cpu_blocks = new_num_blocks
 

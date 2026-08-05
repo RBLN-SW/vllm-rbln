@@ -34,19 +34,6 @@ from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)
 
-__all__ = [
-    "MergedMemoryRegion",
-    "MergedKvCacheMemoryProfile",
-    "merge_kv_cache_memory_profiles",
-    "build_per_chiplet_budget",
-    "assert_budget_covers_profile",
-    "per_chiplet_usage",
-    "format_memory_regions",
-    "format_profile_for_log",
-    "SOURCE_PROFILE_LOG_KEY",
-    "MERGED_PROFILE_LOG_KEY",
-]
-
 # The key the *per-artifact* profiles are logged under. Offline analysis keys on
 # this exact token to recover base_bytes / bytes_per_block from a finished run --
 # nothing else in the log carries them, so a run whose log lacks these dumps
@@ -148,16 +135,12 @@ def _merge_base_by_multiset(
 
     merged: list[MergedMemoryRegion] = []
     for key, count in shared.items():
-        region = _to_merged(prototypes[key])
-        for _ in range(count):
-            merged.append(region)
+        merged.extend([_to_merged(prototypes[key])] * count)
     num_shared = len(merged)
 
     for counter in counters:
         for key, count in (counter - shared).items():
-            region = _to_merged(prototypes[key])
-            for _ in range(count):
-                merged.append(region)
+            merged.extend([_to_merged(prototypes[key])] * count)
     num_private = len(merged) - num_shared
 
     logger.info(
@@ -319,39 +302,30 @@ def per_chiplet_usage(profile: Any, num_blocks: int) -> dict[tuple[int, int], in
     return dict(usage)
 
 
-def format_memory_regions(regions: Any, key: str = SOURCE_PROFILE_LOG_KEY) -> str:
-    """Render regions as ``<key>=[PyRblnMemoryRegion(...), ...]`` on one line.
-
-    The shape mirrors the compiler's own ``__repr__`` so that a log line is a
-    complete, machine-readable record of the compiled memory profile. The fields
-    are written out explicitly instead of calling ``repr()`` so the record stays
-    identical across compiler builds.
-    """
-    parts = []
-    for region in regions:
-        fields = [
-            f"node_id={int(region.node_id)}",
-            f"chiplet_id={int(region.chiplet_id)}",
-            f"base_bytes={int(region.base_bytes)}",
-            f"bytes_per_block={int(region.bytes_per_block)}",
-            f"alignment={int(region.alignment)}",
-        ]
-        parts.append("PyRblnMemoryRegion(" + ", ".join(fields) + ")")
-    return f"{key}=[" + ", ".join(parts) + "]"
-
-
 def format_profile_for_log(profile: Any, key: str = SOURCE_PROFILE_LOG_KEY) -> str:
-    """One-line, fully machine-readable record of a KV-cache memory profile.
+    """One-line, machine-readable record of a KV-cache memory profile.
+
+    Shaped like the compiler's own ``__repr__``, but written out field by field
+    rather than via ``repr()`` so the record stays identical across compiler
+    builds.
 
     Args:
         profile: Anything with ``device_regions`` / ``host_base_bytes`` /
             ``host_bytes_per_block`` -- a compiler profile or a merged one.
         key: `SOURCE_PROFILE_LOG_KEY` for a per-artifact profile,
-            `MERGED_PROFILE_LOG_KEY` for the merge (see those constants: the two
-            must stay distinguishable in the log).
+            `MERGED_PROFILE_LOG_KEY` for the merge; the two must stay
+            distinguishable in the log.
     """
+    regions = ", ".join(
+        "PyRblnMemoryRegion("
+        f"node_id={int(r.node_id)}, chiplet_id={int(r.chiplet_id)}, "
+        f"base_bytes={int(r.base_bytes)}, "
+        f"bytes_per_block={int(r.bytes_per_block)}, "
+        f"alignment={int(r.alignment)})"
+        for r in profile.device_regions
+    )
     return (
-        f"{format_memory_regions(profile.device_regions, key)} "
+        f"{key}=[{regions}] "
         f"host_base_bytes={int(profile.host_base_bytes)} "
         f"host_bytes_per_block={int(profile.host_bytes_per_block)}"
     )
