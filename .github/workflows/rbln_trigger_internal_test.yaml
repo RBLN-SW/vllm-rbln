@@ -58,15 +58,33 @@ jobs:
           retention-days: 7
 
   vllm-rbln-pytest:
+    name: Trigger Obedients vllm-rbln PR CI
     needs: [build-vllm-rbln]
     if: ${{ always() && !cancelled() && needs.build-vllm-rbln.result == 'success' }}
-    uses: ./.github/workflows/rbln_vllm-rbln_pytest.yaml
-    secrets: inherit
-    with:
-      ref: ${{ inputs.ref }}
-      # empty = downstream workflow uses uv.lock pin; set only for manual dispatch override
-      rebel_compiler_version: ${{ inputs.rebel_compiler_version }}
-      optimum_rbln_version: ${{ inputs.optimum_rbln_version }}
+    runs-on: rbln-sw-k8s-general
+    steps:
+      # Replaces the GHA self-hosted pytest jobs: POST an Obedients (Buildkite)
+      # build that runs .buildkite/pipeline.yml on the OB agents (devtools
+      # container + writable shared HF cache). Buildkite checks out `commit` on
+      # `branch`, so the build runs the PR's code.
+      - name: Trigger Obedients build
+        env:
+          OBEDIENTS_API_TOKEN: ${{ secrets.OBEDIENTS_API_TOKEN }}
+          OBEDIENTS_API_URL: ${{ secrets.OBEDIENTS_API_URL }}
+          SHA: ${{ github.event.pull_request.head.sha || inputs.ref || github.sha }}
+          REF: ${{ github.head_ref || inputs.ref || github.ref_name }}
+          PR: ${{ github.event.pull_request.number || inputs.pr_number }}
+        run: |
+          set -euo pipefail
+          command -v jq >/dev/null 2>&1 || (sudo apt-get update && sudo apt-get install -y jq curl)
+          curl -fsS --retry 5 --retry-max-time 120 -X POST \
+            "${OBEDIENTS_API_URL}/v2/organizations/main/pipelines/vllm-rbln-pr-ci-optimum/builds" \
+            -H "Authorization: Bearer ${OBEDIENTS_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg sha "$SHA" --arg ref "$REF" --arg pr "$PR" \
+              '{commit: $sha, branch: $ref,
+                message: ("vllm-rbln PR #" + $pr + " CI"),
+                env: {VLLM_RBLN_REF: $ref}}')"
 
   # vllm-rbln-optimum-ci:
   #   needs: [build-vllm-rbln]
