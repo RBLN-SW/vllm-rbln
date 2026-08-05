@@ -8,6 +8,10 @@
 # (Forked-PR builds are disabled on this pipeline, so uploading repo-defined
 # steps is safe -- same-repo PRs are trusted. That setting is the real fork
 # boundary; the team-member step is a policy narrowing to the sw/fsw teams.)
+notify:
+  - github_commit_status:
+      context: "[OB] vllm-rbln PR CI"
+
 env:
   UV_CACHE_DIR: "/mnt/uv_cache"
   UV_LINK_MODE: "symlink"
