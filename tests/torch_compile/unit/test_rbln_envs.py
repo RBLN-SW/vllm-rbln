@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+
 import vllm_rbln.envs as envs
 
 
@@ -127,20 +129,13 @@ def test_explicit_zero_survives_as_an_opt_out(monkeypatch):
     assert envs.compile_kv_cache_num_blocks_is_explicit()
 
 
-def test_is_set_reports_presence_not_truthiness(monkeypatch):
-    monkeypatch.delenv("VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS", raising=False)
-    assert not envs.is_set("VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS")
-    monkeypatch.setenv("VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS", "")
-    assert envs.is_set("VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS")
-
-
 def test_provenance_and_value_agree_on_a_blank_value(monkeypatch):
     """A blank value must not read as a choice the operator made."""
     for raw in ("", "   "):
         monkeypatch.setenv("VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS", raw)
         assert envs.VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS == 8
         assert not envs.compile_kv_cache_num_blocks_is_explicit()
-        assert envs.is_set("VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS")
+        assert "VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS" in os.environ
 
     monkeypatch.delenv("VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS", raising=False)
     assert not envs.compile_kv_cache_num_blocks_is_explicit()

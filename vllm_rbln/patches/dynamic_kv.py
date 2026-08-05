@@ -62,8 +62,6 @@ def resolve_rank_num_blocks(num_blocks_per_rank: list[Any]) -> int | None:
     int; a mixed result is refused below. The reduction is a min, as upstream's
     own is: a rank holding more than the agreed number leaves the extras unused.
     """
-    if not num_blocks_per_rank:
-        return None
     if all(n is None for n in num_blocks_per_rank):
         return None
     if any(n is None for n in num_blocks_per_rank):
@@ -151,26 +149,6 @@ def patched_initialize_kv_caches(
             override,
             kv_cache_config.num_blocks,
         )
-        # Consistency check, not a fix: the fix is the worker refusing the
-        # shrink. Under TP>1 the workers are separate processes, so the engine
-        # cannot rule out by inspection that the two gates disagreed. Repair and
-        # report rather than fail on the first request.
-        restored = self.model_executor.collective_rpc(
-            "apply_dynamic_kv_num_blocks", args=(None,)
-        )
-        if any(n is not None for n in restored):
-            logger.warning(
-                "dynamic KV cache: internal inconsistency -- a rank shrank its "
-                "KV cache for the compile even though "
-                "--num-gpu-blocks-override=%d should have prevented it. The "
-                "cache has been restored (per rank: %s) and the scheduler block "
-                "pool stays at %d blocks, but "
-                "RBLNWorker._maybe_shrink_kv_cache_for_compile and this branch "
-                "have drifted apart and should be re-read together.",
-                override,
-                restored,
-                kv_cache_config.num_blocks,
-            )
         return kv_cache_config
 
     num_blocks_per_rank = self.model_executor.collective_rpc(

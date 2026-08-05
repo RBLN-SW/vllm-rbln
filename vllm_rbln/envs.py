@@ -185,16 +185,6 @@ def get_decode_batch_bucket_manual_buckets() -> list[int]:
         ) from e
 
 
-def is_set(name: str) -> bool:
-    """Whether `name` is present, whatever its value (vLLM's helper of the same name).
-
-    Not a test for "the operator chose this": a blank `NAME=` is present but a
-    getter that maps blank to a default will disagree. See
-    `compile_kv_cache_num_blocks_is_explicit`.
-    """
-    return name in os.environ
-
-
 # Compile-time KV block count when the operator sets nothing. The traced
 # `num_blocks` is only the hint of the mark_dynamic'd dim and warm-up points every
 # dummy request at block 0, so a small cache suffices; 8 is what the runs measured.

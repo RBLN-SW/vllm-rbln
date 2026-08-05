@@ -810,23 +810,18 @@ class RBLNWorker(WorkerBase):
     def _collect_dynamic_kv_runtimes(self) -> list[Any]:
         """Every rbln runtime that holds a slice of the KV cache.
 
-        `runtime_holder` is shared with the spec-decode drafter, and any extra
-        holder on the drafter is folded in as well: a runtime missed here never
-        gets its adaptive-size latch cleared, and its first forward after the
-        resize dies inside the rbln runtime.
+        `runtime_holder` is shared with the spec-decode drafter (see
+        `RBLNEagleProposer`), so the runner's holder is the whole set. A runtime
+        missed here never gets its adaptive-size latch cleared, and its first
+        forward after the resize dies inside the rbln runtime.
         """
         runtimes: list[Any] = []
         seen: set[int] = set()
-        holders = [getattr(self.model_runner, "runtime_holder", None)]
-        drafter = getattr(self.model_runner, "drafter", None)
-        if drafter is not None:
-            holders.append(getattr(drafter, "runtime_holder", None))
-        for holder in holders:
-            for runtime in holder or []:
-                if id(runtime) in seen:
-                    continue
-                seen.add(id(runtime))
-                runtimes.append(runtime)
+        for runtime in getattr(self.model_runner, "runtime_holder", None) or []:
+            if id(runtime) in seen:
+                continue
+            seen.add(id(runtime))
+            runtimes.append(runtime)
         return runtimes
 
     def _assert_dynamo_runtimes(self, runtimes: list[Any]) -> None:
@@ -1299,13 +1294,8 @@ class RBLNWorker(WorkerBase):
         # accounting below means anything: with VLLM_RBLN_USE_DEVICE_TENSOR off
         # the KV tensors live on `meta` and the device buffers belong to the rbln
         # runtime. Read from the tensors, not from the env, and before they go.
-        kv_device_types = sorted(
-            {
-                getattr(getattr(kv_cache, "device", None), "type", None) or "unknown"
-                for kv_cache in mr.kv_caches
-            }
-        )
-        was_device_resident = bool(set(kv_device_types) - {"unknown", "meta", "cpu"})
+        kv_device_types = {kv_cache.device.type for kv_cache in mr.kv_caches}
+        was_device_resident = bool(kv_device_types - {"meta", "cpu"})
 
         # (1) The runner's own bindings. Clearing kv_caches is required either
         # way -- upstream `bind_kv_cache` asserts the list starts empty -- and
@@ -1353,7 +1343,7 @@ class RBLNWorker(WorkerBase):
             old_cfg.num_blocks,
             logical_bytes,
             unbound,
-            kv_device_types,
+            sorted(kv_device_types),
             released,
             was_device_resident,
         )
