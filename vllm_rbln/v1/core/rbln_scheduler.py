@@ -827,10 +827,7 @@ class RBLNScheduler(Scheduler):
             req.request_id
             for req in itertools.chain(scheduled_new_reqs, scheduled_resumed_reqs)
         }
-        step_no_spec_required = bool(
-            unsafe_backfill_req_ids & scheduled_running_req_ids
-        )
-        if step_no_spec_required:
+        if unsafe_backfill_req_ids & scheduled_running_req_ids:
             for req in scheduled_running_reqs:
                 req_id = req.request_id
 
