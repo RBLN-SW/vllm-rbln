@@ -13,9 +13,9 @@
 # NPU reservation uses the top-level `npu:` key (an Obedients extension), NOT a
 # queue named "npu". Counts mirror the old GHA runner classes
 # (ca22-1/4/8 -> 1/4/8). CPU-only suites run on the `udc` queue with no NPU.
-
-agents:
-  queue: "k8s"
+notify:
+  - github_commit_status:
+      context: "[OB] vllm-rbln PR CI"
 
 env:
   UV_CACHE_DIR: "/mnt/uv_cache"

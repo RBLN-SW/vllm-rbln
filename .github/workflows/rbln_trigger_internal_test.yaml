@@ -37,19 +37,6 @@ jobs:
           python-version: "3.12"
 
       - name: Build wheel (fails if packaging is broken)
-        # `python -m build` installs the [build-system].requires (setuptools_scm
-        # etc.) into an isolated env, so only `build` itself is needed here.
         run: |
           python -m pip install build
           python -m build --wheel
-
-  # vllm-rbln-optimum-ci:
-  #   needs: [build-vllm-rbln]
-  #   if: ${{ always() && !cancelled() && needs.build-vllm-rbln.result == 'success' }}
-  #   uses: ./.github/workflows/rbln_optimum_ci.yaml
-  #   secrets: inherit
-  #   with:
-  #     ref: ${{ inputs.ref }}
-  #     # empty = downstream workflow uses uv.lock pin; set only for manual dispatch override
-  #     rebel_compiler_version: ${{ inputs.rebel_compiler_version }}
-  #     optimum_rbln_version: ${{ inputs.optimum_rbln_version }}
