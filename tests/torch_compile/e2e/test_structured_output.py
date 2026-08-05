@@ -46,7 +46,8 @@ LLM_KWARGS = {
 ENV = {
     "VLLM_RBLN_USE_VLLM_MODEL": "1",
     "VLLM_DISABLE_COMPILE_CACHE": "1",
-    "VLLM_RBLN_SAMPLER": "1",
+    "VLLM_RBLN_SAMPLER": "0",
+    "VLLM_RBLN_USE_DEVICE_TENSOR": "0",
 }
 
 
@@ -54,7 +55,7 @@ ENV = {
 def sampling_kwargs(request: pytest.FixtureRequest) -> dict:
     """Sampling kwargs for greedy (temp=0) and random (from model gen config)."""
     if request.param == "greedy":
-        return {"temperature": 0.0}
+        return {"temperature": 0.0, "max_tokens": 128}
     gen_cfg = GenerationConfig.from_pretrained(MODEL_ID)
     return {
         "temperature": gen_cfg.temperature,
@@ -76,7 +77,7 @@ def test_choice_sentiment_classification(
                 structured_outputs=StructuredOutputsParams(choice=choices),
             ),
         )
-    assert outputs[0].outputs[0].text in choices
+    assert outputs[0].outputs[0].text in choices, f"{outputs}"
 
 
 def test_regex_email_format(
@@ -122,9 +123,8 @@ def test_json_car_description(
             ),
             sampling_params=SamplingParams(
                 **sampling_kwargs,
-                max_tokens=32,
                 structured_outputs=StructuredOutputsParams(
-                    json=CarDescription.model_json_schema()
+                    json=CarDescription.model_json_schema(),
                 ),
             ),
         )

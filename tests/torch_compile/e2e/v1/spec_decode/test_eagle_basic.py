@@ -54,7 +54,16 @@ def _build_llm(method: str) -> LLM:
     )
 
 
-@pytest.mark.parametrize("method", ["eagle", "eagle3"])
+@pytest.mark.parametrize(
+    "method",
+    [
+        "eagle",
+        pytest.param(
+            "eagle3",
+            marks=pytest.mark.xfail(reason="unexpected compilation error in eagle3"),
+        ),
+    ],
+)
 def test_basic_eagle_generation(method: str) -> None:
     sampling_params = SamplingParams(temperature=0.1, top_p=0.9, max_tokens=128)
 

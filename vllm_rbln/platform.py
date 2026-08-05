@@ -28,21 +28,16 @@ else:
 
 import rebel
 from torch._dynamo import register_backend
+from vllm.logger import init_logger
 from vllm.platforms import Platform, PlatformEnum
 
+import vllm_rbln.logger  # noqa: F401
 from vllm_rbln import envs
-from vllm_rbln.logger import init_logger
-from vllm_rbln.utils.optimum.converter import sync_vllm_and_optimum
-from vllm_rbln.utils.optimum.converter.common import (
-    USER_MAX_NUM_BATCHED_TOKENS_KEY,
-)
-from vllm_rbln.utils.optimum.predicates import is_qwen3_pooling
-from vllm_rbln.utils.optimum.registry import (
-    is_enc_dec_arch,
-    is_pooling_arch,
-)
 
 logger = init_logger(__name__)
+# Earliest point at which `vllm.envs` is guaranteed to exist, and still before
+# any engine code reads a variable.
+envs.publish_to_vllm_envs()
 
 try:
     import torch.rbln  # noqa: F401
@@ -201,6 +196,10 @@ class RblnPlatform(Platform):
         """
         from vllm.engine.arg_utils import EngineArgs
 
+        from vllm_rbln.utils.optimum.converter.common import (
+            USER_MAX_NUM_BATCHED_TOKENS_KEY,
+        )
+
         if getattr(EngineArgs, "_rbln_user_mnbt_patched", False):
             return
 
@@ -241,6 +240,9 @@ class RblnPlatform(Platform):
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
+        from vllm_rbln.utils.optimum.converter import sync_vllm_and_optimum
+        from vllm_rbln.utils.optimum.registry import is_pooling_arch
+
         if envs.VLLM_USE_V2_MODEL_RUNNER:
             raise ValueError(
                 "VLLM_USE_V2_MODEL_RUNNER is not supported for RBLN backend."
@@ -402,6 +404,21 @@ class RblnPlatform(Platform):
             )
 
     @classmethod
+    def register_custom_kv_cache_specs(cls, vllm_config: "VllmConfig") -> None:
+        from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+
+        from vllm_rbln.v1.kv_cache import (
+            RBLNSlidingWindowManager,
+            RBLNSlidingWindowSpec,
+        )
+
+        KVCacheSpecRegistry.register(
+            RBLNSlidingWindowSpec,
+            RBLNSlidingWindowManager,
+            uniform_type_base_spec=RBLNSlidingWindowSpec,
+        )
+
+    @classmethod
     def is_pin_memory_available(cls):
         logger.warning("Pin memory is not supported on RBLN.")
         return False
@@ -516,6 +533,12 @@ class RblnPlatform(Platform):
 
     @classmethod
     def disable_unsupported_prefix_caching(cls, vllm_config: VllmConfig) -> None:
+        from vllm_rbln.utils.optimum.predicates import is_qwen3_pooling
+        from vllm_rbln.utils.optimum.registry import (
+            is_enc_dec_arch,
+            is_pooling_arch,
+        )
+
         if not vllm_config.cache_config.enable_prefix_caching:
             return
         # An EC producer runs only the (vision) encoder and never executes the

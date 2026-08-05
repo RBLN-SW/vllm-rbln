@@ -16,11 +16,12 @@ import torch
 
 from vllm_rbln import envs
 from vllm_rbln import utils as rbln_utils
+from vllm_rbln.custom_ops import custom_op, register_fake
 
 from ..ops import triton_sliding_window_attention_naive  # noqa: F401
 
 
-@torch.library.custom_op(
+@custom_op(
     "rbln_custom_ops::sliding_window_attention_naive_prefill", mutates_args=["kv_cache"]
 )
 def sliding_window_attention_naive_prefill_impl(
@@ -132,7 +133,7 @@ def sliding_window_attention_naive_prefill_impl(
     return attn_output
 
 
-@torch.library.register_fake("rbln_custom_ops::sliding_window_attention_naive_prefill")
+@register_fake("rbln_custom_ops::sliding_window_attention_naive_prefill")
 def _(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -148,7 +149,7 @@ def _(
     return torch.empty_like(q)
 
 
-@torch.library.custom_op(
+@custom_op(
     "rbln_custom_ops::sliding_window_attention_naive_decode", mutates_args=["kv_cache"]
 )
 def sliding_window_attention_naive_decode_impl(
@@ -247,7 +248,7 @@ def sliding_window_attention_naive_decode_impl(
     return torch.cat(outputs, dim=0)
 
 
-@torch.library.register_fake("rbln_custom_ops::sliding_window_attention_naive_decode")
+@register_fake("rbln_custom_ops::sliding_window_attention_naive_decode")
 def _(
     q: torch.Tensor,
     k: torch.Tensor,
