@@ -103,7 +103,7 @@ steps:
   # ===========================================================================
   # Optimum smoke suites -> NPU using RSD
   # ===========================================================================
-  - label: ":pytest: vllm-rbln optimum compile smoke rsd-1"
+  - label: ":pytest: tests/optimum/optimum_compile/smoke rsd-1"
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     resources:
       npu:
@@ -114,7 +114,7 @@ steps:
       - *sync
       - "uv run --no-sync pytest -x tests/optimum/optimum_compile/smoke/test_rsd1.py -v --durations 0"
 
-  - label: ":pytest: vllm-rbln optimum compile smoke rsd-4"
+  - label: ":pytest: tests/optimum/optimum_compile/smoke rsd-4"
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     resources:
       npu:
@@ -125,7 +125,7 @@ steps:
       - *sync
       - "uv run --no-sync pytest -x tests/optimum/optimum_compile/smoke/test_rsd4.py -v --durations 0"
 
-  - label: ":pytest: vllm-rbln optimum compile smoke rsd-8"
+  - label: ":pytest: tests/optimum/optimum_compile/smoke rsd-8"
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     resources:
       npu:
