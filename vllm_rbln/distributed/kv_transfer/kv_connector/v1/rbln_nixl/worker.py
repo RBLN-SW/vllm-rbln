@@ -58,6 +58,7 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import
     rbln_pp_compat_hash,
 )
 from vllm_rbln.logger import init_logger
+from vllm_rbln.utils.tracing import traced_remote_fetch
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import ReqMeta
@@ -1043,6 +1044,7 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
             f"regions (regions/layer={rpl})."
         )
 
+    @traced_remote_fetch
     def _read_blocks_for_req(self, req_id: str, meta: "ReqMeta") -> None:
         assert meta.remote is not None and self.transfer_topo is not None
         engine_id = meta.remote.engine_id

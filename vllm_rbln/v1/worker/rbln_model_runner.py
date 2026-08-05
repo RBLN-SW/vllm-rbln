@@ -44,7 +44,7 @@ from vllm.model_executor.models.interfaces_base import (
 from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
-from vllm.tracing import instrument
+from vllm.tracing import SpanAttributes, instrument
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.utils.math_utils import cdiv
 from vllm.utils.platform_utils import is_pin_memory_available
@@ -109,6 +109,7 @@ from vllm_rbln.compilation import (
 from vllm_rbln.forward_context import RBLNDPMetadata, set_forward_context
 from vllm_rbln.logger import init_logger
 from vllm_rbln.platform import HAS_TORCH_RBLN, USE_DEVICE_TENSOR
+from vllm_rbln.utils.tracing import instrument_with_latency, traced_callable
 from vllm_rbln.v1.attention.backends.flash_attention import (
     RBLNFlashAttentionMetadataBuilder,
 )
@@ -1384,6 +1385,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         )
 
     @torch.inference_mode()
+    @instrument_with_latency(
+        span_name="model_execute",
+        attribute=SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_EXECUTE,
+    )
     def execute_model(
         self,
         scheduler_output: RBLNSchedulerOutput,
@@ -1903,6 +1908,17 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
                 runtime_holder=self.runtime_holder,
                 mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
+            )
+
+        # forward 는 method 가 아니라 compile 산출물(인스턴스 속성)이라 데코레이터를
+        # 달 자리가 없다. 여기서 한 번 감싸 gen_ai.latency.time_in_model_forward 를
+        # 채운다 — traced_callable 은 이미 감싼 것을 그대로 돌려주므로 warmup 재진입
+        # 으로 wrapper 가 중첩되지 않는다.
+        if self.model_executable is not None:
+            self.model_executable = traced_callable(
+                self.model_executable,
+                span_name="model_forward",
+                attribute=SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_FORWARD,
             )
 
     def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:
