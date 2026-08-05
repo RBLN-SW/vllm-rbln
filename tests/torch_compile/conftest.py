@@ -63,19 +63,12 @@ def _isolate_rbln_ctx_standalone():
 
 @pytest.fixture(autouse=True)
 def _keep_rbln_envs_lazy():
-    # Values in `vllm_rbln.envs` are produced by the module's `__getattr__`, so
-    # they never live in its `__dict__`. `monkeypatch.setattr(envs, "VLLM_RBLN_X",
-    # v)` -- which several tests in this tree use -- takes `hasattr` as proof the
-    # attribute exists and therefore undoes itself with `setattr`, leaving a real
-    # attribute behind that shadows the getter for the rest of the session. From
-    # then on every test reads one frozen value and `monkeypatch.setenv` has no
-    # effect, which presents as "the environment variable is ignored" in whichever
-    # test happens to run later -- so the meaning of a variable depends on
-    # collection order (and pytest-randomly makes that vary run to run).
-    #
-    # Drop anything that landed in `__dict__` after each test. `mock.patch` does
-    # not need this (it deletes rather than restores when the attribute was not
-    # local), so this only undoes the setattr route.
+    # `vllm_rbln.envs` serves values from `__getattr__`, so they never live in
+    # `__dict__`. `monkeypatch.setattr(envs, X, v)` undoes itself with `setattr`
+    # and leaves a real attribute shadowing the getter for the rest of the
+    # session; every later test then reads one frozen value and
+    # `monkeypatch.setenv` stops working. Drop whatever landed in `__dict__`.
+    # (`mock.patch` deletes rather than restores, so it never needed this.)
     import vllm_rbln.envs as rbln_envs
 
     yield

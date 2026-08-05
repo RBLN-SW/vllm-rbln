@@ -490,13 +490,11 @@ class RBLNWorker(WorkerBase):
     # ------------------------------------------------------------------
 
     def _compile_and_warmup_skip_reason(self) -> str | None:
-        """Why `compile_or_warm_up_model` will skip the compile and warm-up, if it will.
+        """Why the compile and warm-up will be skipped, or None if they will run.
 
-        The dynamic-KV path is built on what warm-up produces -- compiled
-        artifacts and their memory profiles -- so it has nothing to work with when
-        this returns a reason. One place decides *and* names it: two copies of the
-        condition would eventually disagree, and a caller that re-derived the
-        reason for its log would be a second copy.
+        The dynamic-KV path needs what warm-up produces, so it has nothing to work
+        with when this returns a reason. One place decides and names it, so a
+        caller's log cannot describe a different condition than the branch.
         """
         if self.model_config.enforce_eager:
             return "enforce_eager is set"
@@ -518,13 +516,9 @@ class RBLNWorker(WorkerBase):
         runtime resizes them anyway, and warm-up is safe small: every dummy
         request points at block id 0.
 
-        The block count is derived (`envs.DEFAULT_COMPILE_KV_CACHE_NUM_BLOCKS`),
-        so `VLLM_RBLN_USE_DYNAMIC_KV_CACHE` is the only switch an operator has to
-        set. `VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS` remains as a debug override,
-        and the two are told apart here because the same value means different
-        things depending on who chose it: a derived hint that cannot be applied is
-        this method's bug to report, an explicit one is the operator's request to
-        honour.
+        The count is derived, so `VLLM_RBLN_USE_DYNAMIC_KV_CACHE` is the only
+        switch to set; the env var is a debug override. Provenance matters here
+        because the same value means different things depending on who chose it.
 
         The shrink is ANDed with `VLLM_RBLN_USE_DYNAMIC_KV_CACHE` and with the
         *absence* of `--num-gpu-blocks-override`, because in both cases nothing
@@ -539,10 +533,9 @@ class RBLNWorker(WorkerBase):
             else "derived default; VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS is unset"
         )
         if not envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
-            # Only worth saying when the operator set a value that would have
-            # done something: with the flag off the derived value is not a choice
-            # anybody made, and an explicit 0 asks for no shrink, which is what
-            # happens here anyway -- nothing is being ignored.
+            # Only when the operator set something that would have done
+            # anything: the derived value is nobody's choice, and an explicit 0
+            # asks for the no-shrink that happens here regardless.
             if explicit and compile_num_blocks > 0:
                 logger.warning(
                     "VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS=%d is ignored because "
@@ -554,15 +547,10 @@ class RBLNWorker(WorkerBase):
             return kv_cache_config
         skip_reason = self._compile_and_warmup_skip_reason()
         if skip_reason is not None:
-            # Nothing will compile, so no artifact carries a memory profile and
-            # the resize cannot run. Shrinking anyway is worse than doing
-            # nothing: the latch would be set, `compute_dynamic_kv_num_blocks`
-            # would find no runtimes and return None, and the restore path would
-            # reallocate and then trip its own assertion that at least one
-            # runtime had its adaptive-buffer latch cleared -- a start-up
-            # AssertionError whose message names none of this. Skip the shrink
-            # and say why; the run serves the pre-compile estimate, exactly as it
-            # does with the feature off.
+            # Nothing compiles, so no artifact carries a profile and the resize
+            # cannot run. Shrinking anyway sets the latch, finds no runtimes, and
+            # the restore path trips its own assertion -- a start-up
+            # AssertionError naming none of the cause. Serve the estimate instead.
             logger.warning(
                 "[Dynamic KV] VLLM_RBLN_USE_DYNAMIC_KV_CACHE is set but "
                 "compile/warm-up is skipped (%s), so no artifact reports a KV "
@@ -605,12 +593,10 @@ class RBLNWorker(WorkerBase):
             )
             return kv_cache_config
         if compile_num_blocks >= kv_cache_config.num_blocks:
-            # Cancelling the shrink also cancels the resize (the gate in
-            # `compute_dynamic_kv_num_blocks`), so this branch serves the
-            # pre-compile estimate. As a *request* that is a legitimate control
-            # mode -- compile at the real size, measure without the resize -- but
-            # as the outcome of a value nobody chose it is issue #42 reproducing
-            # itself silently, so the derived hint refuses instead of warning.
+            # Cancelling the shrink cancels the resize too, so this branch
+            # serves the pre-compile estimate. As a request that is a usable
+            # control mode; as the outcome of a value nobody chose it is #42
+            # reproducing silently, so a derived hint refuses instead.
             if not explicit:
                 raise RuntimeError(
                     f"the derived compile-time KV block count "
@@ -929,21 +915,14 @@ class RBLNWorker(WorkerBase):
         reports it returned on all four -- hence the TP condition rather than an
         unconditional charge, which would cost TP=1 blocks it does get back.
 
-        The charged size comes from the cache that is actually resident:
-        `model_runner.kv_cache_config` is the (deep-copied) config the runner
-        allocated from, so it is the shrink that really happened rather than a
-        second reading of the env var. Today the two agree -- the caller returns
-        early unless the shrink applied -- and reading the allocation is what
-        keeps them from drifting, because a charge that does not match what is
-        resident is a silent budget overrun in whichever direction it is wrong.
+        The charged size comes from the cache that is actually resident
+        (`model_runner.kv_cache_config`), not a second reading of the env var: a
+        charge that does not match what is resident is a silent budget overrun.
 
         Known gap: the condition is `tensor_parallel_size > 1`, but DP4+EP runs
-        with `tensor_parallel_size=1` and sysfs bracketed the outgoing cache as
-        still resident on all four cards (1.0138x per chiplet), so that shape is
-        not charged. The measurements cannot say which of TP/DP/EP decides the
-        free -- both cases that do return it, PP4 and Qwen TP1, are TP=1 -- so
-        the predicate stays as measured and the hole is documented instead of
-        guessed at.
+        with tp=1 and keeps the cache (1.0138x per chiplet). Both shapes that do
+        return it (PP4, Qwen TP1) are also TP=1, so the data cannot say which of
+        TP/DP/EP decides it; the predicate stays as measured.
         """
         resident_blocks = self.model_runner.kv_cache_config.num_blocks
         tp_size = self.parallel_config.tensor_parallel_size
@@ -967,11 +946,9 @@ class RBLNWorker(WorkerBase):
             charged[node_id][chiplet_id] -= retained
             retained_by_unit[unit] = retained
 
-        # The advice has to match who chose the block count. Recommending a
-        # smaller value to an operator who set nothing points at a debug-only
-        # variable they have no reason to touch -- and following it would take
-        # them below the measured default, where the value also becomes explicit
-        # and the cannot-shrink branch stops refusing.
+        # The advice has to match who chose the count: telling an operator who
+        # set nothing to lower a debug-only variable would take them below the
+        # measured default, where the cannot-shrink branch also stops refusing.
         explicit = envs.compile_kv_cache_num_blocks_is_explicit()
         if explicit and resident_blocks > envs.DEFAULT_COMPILE_KV_CACHE_NUM_BLOCKS:
             advice = (
@@ -1001,13 +978,9 @@ class RBLNWorker(WorkerBase):
             if remaining <= 0
         }
         if exhausted:
-            # Which remedy is honest depends on who chose the block count. With
-            # the derived default there is nothing to lower -- documented values
-            # below it are unmeasured -- so the levers are the ones that set the
-            # budget instead.
-            # Name the block count by who chose it, not by how big it is: an
-            # operator who set 2 explicitly must not be told the cache "is already
-            # at the derived 2 blocks" and sent to investigate the wrong knob.
+            # Name the count by who chose it, not by size: an operator who set 2
+            # explicitly must not be told it is "the derived 2 blocks". With the
+            # derived default there is nothing to lower, so point at the budget.
             default_blocks = envs.DEFAULT_COMPILE_KV_CACHE_NUM_BLOCKS
             origin = (
                 f"VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS={resident_blocks}"
@@ -1116,12 +1089,10 @@ class RBLNWorker(WorkerBase):
             )
             return None
         if self._kv_blocks_before_shrink is None:
-            # Deliberately not re-reading the env var to name a cause: the shrink
-            # can be cancelled for reasons that have nothing to do with its value
-            # (a pinned block count, a value at or above the estimate), and this
-            # log used to print the requested number next to "not shrunk", which
-            # reads as a contradiction. `_maybe_shrink_kv_cache_for_compile`
-            # already logged the reason on the branch that took it.
+            # Not re-reading the env var: the shrink can be cancelled for
+            # reasons unrelated to its value, and printing the requested number
+            # next to "not shrunk" read as a contradiction. The branch that
+            # cancelled it already logged why.
             logger.warning(
                 "[Dynamic KV] the KV cache was not shrunk for the compile, so "
                 "the compiled profile is not queried and the block count stays "
@@ -1519,11 +1490,9 @@ class RBLNWorker(WorkerBase):
             if is_rbln_oom_error(e.inner_exception):
                 blocks = self.model_runner.kv_cache_config.num_blocks
                 if self._kv_blocks_before_shrink is not None:
-                    # The number in hand is the deliberately small compile-time
-                    # cache, not what the server will run on, so the stock advice
-                    # ("reduce the number of blocks") points at the one thing
-                    # that is already minimal -- and --num-gpu-blocks-override
-                    # would cancel the shrink rather than shrink anything.
+                    # The number in hand is the compile-time cache, not what the
+                    # server runs on, so "reduce the number of blocks" points at
+                    # the one thing already minimal.
                     raise RuntimeError(
                         f"Not enough memory to compile against the {blocks}-block "
                         "compile-time KV cache ("

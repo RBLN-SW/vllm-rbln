@@ -1551,13 +1551,9 @@ class TestRetainedCompileKvCacheCharge:
 
 
 class TestMaybeShrinkKvCacheForCompile:
-    """`_maybe_shrink_kv_cache_for_compile` decides both the compile size and,
-    through `_kv_blocks_before_shrink`, whether the resize runs at all.
-
-    Every branch that returns the config unchanged also turns the feature off for
-    that run -- `compute_dynamic_kv_num_blocks` returns early when the latch is
-    None -- so the branch taken and the log it leaves are the behaviour under
-    test, not an implementation detail.
+    """The shrink decides the compile size and, through the latch, whether the
+    resize runs at all: every branch returning the config unchanged turns the
+    feature off for that run, so the branch taken and its log are the behaviour.
     """
 
     ESTIMATED_BLOCKS = 211
@@ -1580,16 +1576,10 @@ class TestMaybeShrinkKvCacheForCompile:
     ):
         """Drive the method with the two env readings injected.
 
-        The values are patched as module attributes rather than through
-        `os.environ`, because by the time this file runs `vllm_rbln.envs` may no
-        longer be consulting the environment at all: `monkeypatch.setattr` on a
-        module whose values come from `__getattr__` restores by `setattr`, so any
-        earlier test that took that route (test_eagle.py does, for this very
-        variable) leaves a real attribute shadowing the getter for the rest of the
-        session. The getter itself -- unset means the derived default, blank is
-        not a crash, 0 survives as an opt-out -- is covered in test_rbln_envs.py.
-
-        `value=None` means the operator set nothing, i.e. the derived default.
+        Patched as module attributes rather than via `os.environ`: an earlier test
+        using `monkeypatch.setattr` on this module leaves a real attribute
+        shadowing the getter (see conftest). The getter itself is covered in
+        test_rbln_envs.py. `value=None` means the derived default.
         """
         import vllm_rbln.envs as envs
         from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
@@ -1711,13 +1701,11 @@ class TestMaybeShrinkKvCacheForCompile:
         assert "compiling as-is" in caplog.text
 
     def test_a_blank_env_value_still_refuses(self, monkeypatch):
-        """`VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS=` must not read as a choice.
+        """A blank value must not read as a choice.
 
-        Driven through the real environment rather than the injected helper,
-        because the bug this guards against lived in the disagreement between the
-        value (blank -> derived default) and the provenance (blank -> present).
-        Reading presence there would take the warn-only branch and serve the
-        pre-compile estimate with nobody having asked for it.
+        Driven through the real environment, because the bug lived in the
+        disagreement between the value (blank -> default) and the provenance
+        (blank -> present).
         """
         from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
 
@@ -1739,14 +1727,9 @@ class TestMaybeShrinkKvCacheForCompile:
             )
 
     def test_no_warmup_means_no_shrink(self, caplog):
-        """Skipping compile/warm-up has to skip the shrink too.
-
-        Nothing compiles, so no artifact reports a memory profile and the resize
-        cannot run. Shrinking anyway sets the latch, the profile query then finds
-        no runtimes, and the restore path reallocates and trips its own assertion
-        that some runtime had its adaptive-buffer latch cleared -- a start-up
-        AssertionError naming none of the actual cause. Serving the estimate is
-        what the feature-off path does, so do that and say why.
+        """Skipping compile/warm-up has to skip the shrink too: otherwise the
+        latch is set, the profile query finds no runtimes, and the restore path
+        trips an assertion whose message names none of the cause.
         """
         config = self._config()
         with caplog.at_level("WARNING"):
@@ -1760,11 +1743,8 @@ class TestMaybeShrinkKvCacheForCompile:
         assert "does nothing for this run" in caplog.text
 
     def test_flag_off_with_an_explicit_zero_is_silent(self, caplog):
-        """0 asks for no shrink, and with the flag off there is no shrink.
-
-        Nothing is being ignored, so the "is ignored" warning would be false --
-        and a launcher that kept `=0` from a static A/B comparison would carry it
-        into every unrelated static deployment.
+        """0 asks for no shrink and the flag off gives none, so "is ignored"
+        would be false -- and a launcher keeping `=0` would log it forever.
         """
         with caplog.at_level("WARNING"):
             worker, out = self._shrink(self._config(), dynamic=False, value=0)
@@ -1774,13 +1754,9 @@ class TestMaybeShrinkKvCacheForCompile:
 
 
 class TestChargeRemedyWording:
-    """The charge's advice has to name whoever chose the block count.
-
-    Both messages in `_charge_retained_compile_kv_cache` used to recommend
-    lowering `VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS` unconditionally. Under a
-    derived default that points an operator at a debug-only variable they never
-    set, and following it goes below the smallest measured hint — where the value
-    also becomes explicit, so the cannot-shrink branch stops refusing.
+    """The charge's advice has to name whoever chose the block count: telling an
+    operator who set nothing to lower a debug-only variable sends them below the
+    smallest measured hint, where the cannot-shrink branch also stops refusing.
     """
 
     BUDGET = 33_772_535_808
