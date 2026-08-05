@@ -30,8 +30,8 @@ env:
 _secrets: &secrets
   UV_INDEX_RBLN_NEXUS_NIGHTLY_USERNAME: MGMT_NEXUS_USERNAME
   UV_INDEX_RBLN_NEXUS_NIGHTLY_PASSWORD: MGMT_NEXUS_PASSWORD
-  UV_INDEX_REBELLIONS_USERNAME: REBEL_PYPI_USERNAME
-  UV_INDEX_REBELLIONS_PASSWORD: REBEL_PYPI_PASSWORD
+  UV_INDEX_REBELLIONS_USERNAME: REBEL_SW_DEV_USERNAME
+  UV_INDEX_REBELLIONS_PASSWORD: REBEL_SW_DEV_PASSWORD
   HF_TOKEN: HF_TOKEN
 
 # One `uv sync` per job. --no-sync on the pytest calls so uv never re-syncs and
@@ -124,7 +124,7 @@ steps:
   # ===========================================================================
   # Optimum smoke suites -> NPU by RSD class (self-compiling; VLLM_RBLN_SAMPLER=0).
   # ===========================================================================
-  - label: ":pytest: smoke rsd1"
+  - label: ":pytest: vllm-rbln compile smoke rsd-1"
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     resources:
       npu:
@@ -136,7 +136,7 @@ steps:
       - *sync
       - "uv run --no-sync pytest tests/optimum/optimum_compile/smoke/test_rsd1.py -v --durations 0"
 
-  - label: ":pytest: smoke rsd4"
+  - label: ":pytest: vllm-rbln compile smoke rsd-4"
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     resources:
       npu:
@@ -148,7 +148,7 @@ steps:
       - *sync
       - "uv run --no-sync pytest tests/optimum/optimum_compile/smoke/test_rsd4.py -v --durations 0"
 
-  - label: ":pytest: smoke rsd8"
+  - label: ":pytest: vllm-rbln compile smoke rsd-8"
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     resources:
       npu:
