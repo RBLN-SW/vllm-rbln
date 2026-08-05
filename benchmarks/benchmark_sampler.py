@@ -13,11 +13,8 @@
 # limitations under the License.
 
 import argparse
-import contextlib
-import time
 
 import numpy as np
-import rebel
 import torch
 from vllm.utils.torch_utils import make_tensor_with_pad
 from vllm.v1.sample.logits_processor import LogitsProcessors

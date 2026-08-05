@@ -334,11 +334,7 @@ class RBLNOptimumWorker(WorkerBase):
 
     def shutdown(self) -> None:
         logger.info("v1 optimum_worker shutdown called")
-        if envs.VLLM_RBLN_METRICS:
-            if self.model_runner.model_performance_tracker:
-                self.model_runner.model_performance_tracker.print_final_stats()
-            if self.model_runner.sampler_performance_tracker:
-                self.model_runner.sampler_performance_tracker.print_final_stats()
+        self.model_runner.performance_ctx.print_stats()
 
 
 def init_worker_distributed_environment(
