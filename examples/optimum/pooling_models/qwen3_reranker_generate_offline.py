@@ -62,16 +62,11 @@ def get_input_prompts(tokenizer) -> list[str]:
 def compute_logits(outputs, true_token, false_token):
     scores = []
     for output in outputs:
-        final_logits = output.outputs[0].logprobs[-1]
-        true_logit = (
-            final_logits[true_token].logprob if true_token in final_logits else -10
-        )
-        false_logit = (
-            final_logits[false_token].logprob if false_token in final_logits else -10
-        )
-        true_score = math.exp(true_logit)
-        false_score = math.exp(false_logit)
-        scores.append(true_score / (true_score + false_score))
+        logprobs = output.outputs[0].logprobs[-1]
+        true_logit = logprobs[true_token].logprob
+        false_logit = logprobs[false_token].logprob
+        # true_score / (true_score + false_score) simplifies to this sigmoid.
+        scores.append(1 / (1 + math.exp(false_logit - true_logit)))
     return scores
 
 
