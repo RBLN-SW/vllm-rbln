@@ -358,49 +358,81 @@ class RBLNEagleProposer(EagleProposer):
         mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         num_rejected_tokens: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # `drafter/*` scopes below are no-ops unless
-        # VLLM_CUSTOM_SCOPES_FOR_PROFILING=1. Read them under
-        # RBLN_RUNTIME_FORCE_SYNC=1: with async dispatch, device time lands in
-        # whichever scope happens to block.
+        # The step loop below is instrumented, but everything before it -- the
+        # aux projection, buffer fill, DP padding, first metadata build and the
+        # first forward -- was not, and it is the larger half: under
+        # RBLN_RUNTIME_FORCE_SYNC=1 the whole `draft` phase measured 45.87 ms
+        # per step while the two loop iterations accounted for only 6.4 ms.
+        # These scopes split the remainder. All are no-ops unless
+        # VLLM_CUSTOM_SCOPES_FOR_PROFILING=1.
         fold = self._fold_combine()
         if self.method == "eagle3":
             assert isinstance(
                 self.model, (Eagle3LlamaForCausalLM, Eagle3DeepseekV2ForCausalLM)
             )
             if not fold:
-                # Eager on purpose, and only fast with TORCH_RBLN_DEPLOY=ON: the
-                # non-deploy NaN/Inf scan walks this 56.6 MB weight on every call.
-                # See the commit message for the numbers.
+                # Eager on purpose. The projection used to get its own compiled
+                # graph because torch-rbln's non-deploy mode scans every eager
+                # op's inputs for NaN/Inf, which walked this 56.6 MB weight on
+                # every call (19.6 ms/step). With TORCH_RBLN_DEPLOY=ON the scan
+                # is gone and eager is 0.011 ms -- faster than the 0.035 ms
+                # graph -- so the graph was pure overhead: compiled on every
+                # start, never called under the default FUSE_FIRST_FORWARD=1,
+                # and its weight load is what fails `rbln_memcpy_v2h` when
+                # FUSE=0 (56,623,104 bytes = 3072 x 9216 x 2 exactly).
+                # This path now REQUIRES TORCH_RBLN_DEPLOY=ON to be fast.
                 with record_function_or_nullcontext("drafter/first: combine"):
                     target_hidden_states = self.model.combine_hidden_states(
                         target_hidden_states
                     )
                 assert target_hidden_states.shape[-1] == self.hidden_size
 
-        num_tokens, token_indices_to_sample = self.set_inputs_first_pass(
-            target_token_ids=target_token_ids,
-            next_token_ids=next_token_ids,
-            target_positions=target_positions,
-            target_hidden_states=target_hidden_states,
-            token_indices_to_sample=token_indices_to_sample,
-            cad=common_attn_metadata,
-        )
+        with record_function_or_nullcontext("drafter/first: set_inputs"):
+            num_tokens, token_indices_to_sample = self.set_inputs_first_pass(
+                target_token_ids=target_token_ids,
+                next_token_ids=next_token_ids,
+                target_positions=target_positions,
+                target_hidden_states=target_hidden_states,
+                token_indices_to_sample=token_indices_to_sample,
+                cad=common_attn_metadata,
+            )
 
         assert self.runner is not None
         is_prefill = self.runner.is_prefill
 
         # Build attention metadata
         num_reqs = self.runner.input_batch.num_reqs
-        num_reqs_padded, num_padded_tokens, num_tokens_across_dp = (
-            self._determine_draft_batch_padding(num_reqs, num_tokens, is_prefill)
-        )
+        with record_function_or_nullcontext("drafter/first: dp_padding"):
+            num_reqs_padded, num_padded_tokens, num_tokens_across_dp = (
+                self._determine_draft_batch_padding(num_reqs, num_tokens, is_prefill)
+            )
         per_layer_attn_metadata: dict[str, object] = {}
-        for attn_group in self.draft_attn_groups:
-            attn_metadata = attn_group.get_metadata_builder().build(
-                common_attn_metadata=common_attn_metadata,
-                positions=target_positions,
-                is_prefill=is_prefill,
-                batch_pad=num_reqs_padded,
+        with record_function_or_nullcontext("drafter/first: attn_meta"):
+            for attn_group in self.draft_attn_groups:
+                attn_metadata = attn_group.get_metadata_builder().build(
+                    common_attn_metadata=common_attn_metadata,
+                    positions=target_positions,
+                    is_prefill=is_prefill,
+                    batch_pad=num_reqs_padded,
+                )
+                attach_kv_cache_bindings(
+                    attn_metadata,
+                    self.runner.kv_caches,
+                    self.runner.kv_cache_bases,
+                    self.runner.kv_cache_view_infos,
+                )
+                for layer_name in attn_group.layer_names:
+                    per_layer_attn_metadata[layer_name] = attn_metadata
+
+        with record_function_or_nullcontext("drafter/first: preprocess"):
+            input_ids, positions, hidden_states, token_indices_to_sample_padded = (
+                self._preprocess(
+                    num_reqs,
+                    num_reqs_padded,
+                    num_tokens,
+                    token_indices_to_sample,
+                    is_prefill,
+                )
             )
             if fold:
                 # The projection happens inside the graph now, so hand it the
