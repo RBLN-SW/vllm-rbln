@@ -96,6 +96,13 @@ def _create_sampling_metadata_from_config(
             prompt_token_ids, vocab_size, device
         )
 
+    # Ban the same sequences for every row, which is the worst case for the
+    # per-row Python loop in `apply_bad_words`.
+    bad_words = config.get("bad_words")
+    bad_words_token_ids = (
+        {i: bad_words for i in range(batch_size)} if bad_words else {}
+    )
+
     fake_sampling_metadata = SamplingMetadata(
         temperature=temperature,
         all_greedy=config["all_greedy"],
@@ -112,7 +119,7 @@ def _create_sampling_metadata_from_config(
         repetition_penalties=_create_penalty_tensor(batch_size, rep_val, device),
         no_penalties=no_penalties,
         allowed_token_ids_mask=None,
-        bad_words_token_ids={},
+        bad_words_token_ids=bad_words_token_ids,
         logitsprocs=LogitsProcessors(),
     )
     return fake_sampling_metadata

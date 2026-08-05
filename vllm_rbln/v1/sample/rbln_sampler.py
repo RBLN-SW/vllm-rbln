@@ -378,9 +378,11 @@ class RBLNSampler(VLLMSampler):
         return LogprobsTensors(indices, logprobs, token_ranks)
 
 
-# NOTE: `max_num_logprobs` is honored only by benchmarks/benchmark_sampler.py.
-# Both model runners build their dummy metadata with `max_num_logprobs=None`,
-# so warm-up never compiles the logprobs path.
+# NOTE: `max_num_logprobs` and `bad_words` are honored only by
+# benchmarks/benchmark_sampler.py. The model runners build their dummy metadata
+# with `max_num_logprobs=None` and take bad words from the input batch, which
+# holds none during warm-up. Neither key changes any tensor signature either, so
+# warm-up would have nothing extra to compile for them anyway.
 WARM_UP_CONFIGS: list[dict[str, Any]] = [
     {
         "name": "no_penalty_greedy",
@@ -396,6 +398,19 @@ WARM_UP_CONFIGS: list[dict[str, Any]] = [
         "all_random": False,
         "temperature": 0.0,
         "max_num_logprobs": 5,
+    },
+    {
+        # bad_words masking is host-side Python: for each row it walks every
+        # banned sequence and compares the tail of that row's output tokens.
+        # The one-token entry always masks; the two-token entry masks only when
+        # the previous sampled token matches, which is what ties the work to the
+        # running output rather than to tensor shapes.
+        "name": "no_penalty_greedy_bad_words",
+        "no_penalties": True,
+        "all_greedy": True,
+        "all_random": False,
+        "temperature": 0.0,
+        "bad_words": [[7], [3, 9]],
     },
     {
         # Mixed batch: greedy requests ride the random path with a small
