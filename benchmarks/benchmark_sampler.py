@@ -129,6 +129,7 @@ def run_benchmark(
     benchmark_iters: int,
 ):
     sampler = RBLNSampler()
+    sampler = torch.compile(sampler, dynamic=False, fullgraph=False)
     performance_ctx = _PerformanceContext("SAMPLER")
 
     reference_logits = _create_logits(batch_size, vocab_size)
@@ -167,15 +168,7 @@ def run_benchmark(
         logits.copy_(reference_logits)
         with performance_ctx.profile_model(is_prefill=False):
             sampler(logits, sampling_metadata)
-        collect_metrics(
-            sampler_performance_tracker,
-            is_prefill=False,
-            start_time=start_time,
-            end_time=time.perf_counter(),
-            reports=model_reports,
-            token_count=0,
-        )
-    sampler_performance_tracker.print_final_stats()
+    performance_ctx.print_stats()
 
 
 def main():
