@@ -4,7 +4,6 @@ env:
   UV_CACHE_DIR: "/mnt/uv_cache"
   UV_LINK_MODE: "symlink"
   UV_INDEX_STRATEGY: "unsafe-best-match"
-  HF_HOME: "/mnt/shared_data/.cache/huggingface"
   NUM_INPUT_PROMPT: "1"
   VLLM_LOGGING_LEVEL: "DEBUG"
 
@@ -14,6 +13,7 @@ _secrets: &secrets
   UV_INDEX_REBELLIONS_USERNAME: REBEL_SW_DEV_USERNAME
   UV_INDEX_REBELLIONS_PASSWORD: REBEL_SW_DEV_PASSWORD
   HF_TOKEN: HF_TOKEN
+  HF_HOME: HF_HOME
 
 _sync: &sync "uv sync --locked --python 3.12 --extra test --extra dev --extra runtime"
 
