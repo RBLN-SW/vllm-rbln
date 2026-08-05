@@ -17,7 +17,7 @@ import pytest
 import pytest_asyncio
 from utils import RemoteOpenAIServer
 
-MODEL_NAME = "meta-llama/Llama-3.2-3B-Instruct"
+MODEL_NAME = "meta-llama/Llama-3.2-1B-Instruct"
 MAX_TOKENS = 1
 
 # num_hidden_layers=1 keeps compile fast; --max-num-seqs 4 mirrors the original
