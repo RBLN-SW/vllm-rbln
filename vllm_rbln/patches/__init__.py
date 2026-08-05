@@ -39,6 +39,7 @@ from . import (
     qwen2_moe,
     qwen3_moe,
     rotary_embedding,
+    tracing_engine_steps,
     tracing_nixl,
     tracing_request_phases,
 )
