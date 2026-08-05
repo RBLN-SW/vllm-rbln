@@ -19,9 +19,6 @@ import pytest
 import pytest_asyncio
 from utils import RemoteOpenAIServer
 
-# Self-compiled on the runner (no pre-compiled dir): opt-125m is already tiny, so
-# it compiles as-is with no --hf-overrides reduction. --max-num-seqs 2 mirrors
-# the original opt_125m_batch2 compile shape. Non-gated.
 MODEL_NAME = "facebook/opt-125m"
 MAX_TOKENS = 1
 

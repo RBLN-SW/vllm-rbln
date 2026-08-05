@@ -17,17 +17,10 @@ import pytest
 import pytest_asyncio
 from utils import RemoteOpenAIServer
 
-# Self-compiled on the runner (no pre-compiled dir): a real Instruct checkpoint
-# -- chat template intact -- shrunk to a single layer via vLLM --hf-overrides so
-# the compile is cheap. The assertions below check streaming / format only
-# (response content is never asserted), so the reduced model's meaningless
-# output is fine. Instruct is gated -> the runner's HF_TOKEN account must have
-# accepted the Llama license.
-MODEL_NAME = "meta-llama/Llama-3.2-1B-Instruct"
+MODEL_NAME = "meta-llama/Llama-3.2-3B-Instruct"
 MAX_TOKENS = 1
 
 # num_hidden_layers=1 keeps compile fast; --max-num-seqs 4 mirrors the original
-# llama3_2-3b ...batch4 compile shape.
 SERVER_ARGS = [
     "--hf-overrides",
     '{"num_hidden_layers": 1}',

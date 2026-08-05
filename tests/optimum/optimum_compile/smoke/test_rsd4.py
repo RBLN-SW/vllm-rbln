@@ -13,25 +13,13 @@
 # limitations under the License.
 
 """Optimum smoke tests for the RSD-4 runner: decoder + multimodal.
-
-Decoders use tiny published checkpoints as-is. Multimodal models use the *real*
-checkpoint shrunk in memory via ``HF_OVERRIDES`` (the ``hf-internal-testing``
-tiny randoms each carry an RBLN-incompatible quirk -- e.g. tiny Blip2 uses a T5
-seq2seq LM, tiny Qwen2.5-VL ships no image processor). Using the real checkpoint
-keeps the correct variant/processor while ``num_hidden_layers=1`` keeps it fast.
-
-Run with ``pytest tests/optimum_compile/test_rsd4.py``.
-"""
+Run with ``pytest tests/optimum_compile/test_rsd4.py``."""
 
 import pytest
 from test_base import DecoderSmoke, MultimodalSmoke, requires_npu
 
 pytestmark = requires_npu
 
-# vllm-rbln runtime bug: for these models ``self.model.get_input_embeddings()``
-# returns None in the multimodal text-embedding path (model_base.py), so decode
-# raises ``TypeError: 'NoneType' object is not callable``. Compile itself
-# succeeds. Tracked as xfail (may be a version skew of optimum-rbln/rebel).
 _GET_INPUT_EMBEDS_BUG = pytest.mark.xfail(
     reason="vllm-rbln get_input_embeddings() returns None in the MM embed path",
     strict=False,
@@ -77,7 +65,6 @@ class TestBlip2(MultimodalSmoke.Test):
     }
     NUM_DEVICES = 1
     LLM_KWARGS = {"block_size": 2048, "max_model_len": 2048, "max_num_seqs": 1}
-    # blip2-opt has no chat template; use a prompt-completion prefix.
     USE_CHAT_TEMPLATE = False
     PROMPT = "Question: What is shown in this image? Answer:"
 

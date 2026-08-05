@@ -15,32 +15,7 @@
 """Base classes for the optimum smoke suite.
 
 A smoke test compiles a model through vLLM's optimum-rbln path -- one
-``LLM(model=...)`` call = compile + inference -- and asserts it runs.
-
-Models are shrunk *in memory* (no on-disk checkpoint), the same way
-``optimum-rbln/tests/test_llm.py`` cuts ``num_hidden_layers``: vLLM's
-``hf_overrides`` mutates the HF config, and vllm-rbln forwards that same object
-to optimum as ``config=hf_config`` at compile time, so optimum builds the
-reduced model and loads only the matching weights from the *real* checkpoint
-(extra layer keys are ignored -- no ``ignore_mismatched_sizes`` needed). Using
-the real checkpoint also keeps the correct architecture variant, tokenizer and
-processor, avoiding the quirks of ``hf-internal-testing`` tiny randoms.
-
-Declare ``HF_OVERRIDES`` as a flat/dotted dict of config edits, e.g.
-``{"text_config.num_hidden_layers": 1}``; the base wraps it in a callable that
-applies the edits defensively (vLLM first probes the callable on a bare dummy
-config to detect ``model_type``, so absent sub-configs are skipped). Leave it
-``None`` to run the model full-size.
-
-Structure mirrors optimum-rbln's test suite: base ``TestCase`` classes are
-*nested* inside plain namespace classes so pytest does not collect them (it
-collects any module-level ``unittest.TestCase`` subclass regardless of name,
-but not nested ones). Concrete per-model classes live in ``test_rsd{1,4,8}.py``.
-
-Requires a real RBLN NPU; ``requires_npu`` skips the whole suite otherwise so
-the mocked converter unit tests (``tests/optimum_compile/converter``) still run
-on a non-NPU runner.
-"""
+``LLM(model=...)`` call = compile + inference -- and asserts it runs."""
 
 from __future__ import annotations
 
@@ -65,8 +40,7 @@ except Exception:  # noqa: BLE001 - rebel import/NPU probe may fail without hw
 requires_npu = pytest.mark.skipif(_NPU_NAME is None, reason="requires a real RBLN NPU")
 
 # Bundled image for multimodal inputs -- keeps the default hermetic (no
-# external dataset download). Repo asset; subclasses may override get_image()
-# to pull a dataset sample instead.
+# external dataset download).
 _ASSET_IMAGE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "..",
@@ -93,10 +67,6 @@ def _make_hf_overrides(dotted: dict[str, Any]) -> Callable:
                     break
             if obj is not None and hasattr(obj, last):
                 setattr(obj, last, value)
-                # Shrinking num_hidden_layers must also shrink a sibling
-                # layer_types list: newer transformers validates
-                # len(layer_types) == num_hidden_layers on save (e.g. the Gemma
-                # text tower of Paligemma), so a stale 26-entry list fails.
                 if last == "num_hidden_layers":
                     lt = getattr(obj, "layer_types", None)
                     if isinstance(lt, (list, tuple)) and len(lt) > value:
@@ -112,10 +82,9 @@ class SmokeBase:
     class Model(unittest.TestCase):
         # --- declared by concrete subclasses -------------------------------
         MODEL_ID: str | None = None
-        # Flat/dotted config edits applied via vLLM hf_overrides, or None to
-        # run full-size. E.g. {"text_config.num_hidden_layers": 1}.
+
         HF_OVERRIDES: dict | None = None
-        NUM_DEVICES = 1  # -> VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK
+        NUM_DEVICES = 1
         LLM_KWARGS: dict = {}  # block_size / max_model_len / max_num_seqs / runner ...
         # -------------------------------------------------------------------
         # Populated in setUpClass (declared here so mypy sees them).
@@ -198,9 +167,8 @@ class MultimodalSmoke:
     """Namespace (not collected)."""
 
     class Test(SmokeBase.Model):
-        NUM_DEVICES = 1  # tiny multimodal models: single device
+        NUM_DEVICES = 1
         MAX_TOKENS = 20
-        # Prompt text placed after the image.
         PROMPT = "What is shown in this image?"
         USE_CHAT_TEMPLATE = True
         PROCESSOR_KWARGS: dict = {}

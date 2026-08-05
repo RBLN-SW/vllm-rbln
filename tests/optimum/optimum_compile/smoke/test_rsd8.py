@@ -13,9 +13,7 @@
 # limitations under the License.
 
 """Optimum smoke tests for the RSD-8 (multi-device-class) runner.
-
-Run with ``pytest tests/optimum_compile/test_rsd8.py``.
-"""
+Run with ``pytest tests/optimum_compile/test_rsd8.py``."""
 
 from test_base import MultimodalSmoke, requires_npu
 
