@@ -21,10 +21,6 @@ from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
 
 from vllm_rbln.v1.sample import WARM_UP_CONFIGS, RBLNSampler
-
-# Import the implementation directly instead of the VLLM_RBLN_METRICS-gated
-# `PerformanceContext` alias: measuring is the whole point of this script, so it
-# must not degrade to the no-op context when the env var is unset.
 from vllm_rbln.v1.worker.metrics_v2 import _PerformanceContext
 
 MAX_NUM_PROMPT_TOKENS = 64
@@ -96,13 +92,6 @@ def _create_sampling_metadata_from_config(
             prompt_token_ids, vocab_size, device
         )
 
-    # Ban the same sequences for every row, which is the worst case for the
-    # per-row Python loop in `apply_bad_words`.
-    bad_words = config.get("bad_words")
-    bad_words_token_ids = (
-        {i: bad_words for i in range(batch_size)} if bad_words else {}
-    )
-
     fake_sampling_metadata = SamplingMetadata(
         temperature=temperature,
         all_greedy=config["all_greedy"],
@@ -110,7 +99,7 @@ def _create_sampling_metadata_from_config(
         top_p=top_p,
         top_k=top_k,
         generators={},
-        max_num_logprobs=config.get("max_num_logprobs"),
+        max_num_logprobs=None,
         prompt_token_ids=prompt_tokens_tensor,
         output_token_ids=output_token_ids,
         spec_token_ids=[[] for _ in range(batch_size)],
@@ -119,7 +108,7 @@ def _create_sampling_metadata_from_config(
         repetition_penalties=_create_penalty_tensor(batch_size, rep_val, device),
         no_penalties=no_penalties,
         allowed_token_ids_mask=None,
-        bad_words_token_ids=bad_words_token_ids,
+        bad_words_token_ids={},
         logitsprocs=LogitsProcessors(),
     )
     return fake_sampling_metadata
@@ -136,12 +125,11 @@ def run_benchmark(
     warmup_iters: int,
     benchmark_iters: int,
 ):
-    torch._dynamo.config.recompile_limit = len(WARM_UP_CONFIGS)
     sampler = RBLNSampler()
-    sampler = torch.compile(sampler, dynamic=False, fullgraph=False)
     performance_ctx = _PerformanceContext("SAMPLER")
 
-    logits = _create_logits(batch_size, vocab_size)
+    reference_logits = _create_logits(batch_size, vocab_size)
+    logits = reference_logits.clone()
 
     # warmup: iterate over all WARM_UP_CONFIGS, matching actual vllm-rbln behavior
     for _ in range(warmup_iters):
@@ -152,6 +140,7 @@ def run_benchmark(
                 vocab_size=vocab_size,
                 device=logits.device,
             )
+            logits.copy_(reference_logits)
             sampler(logits, sampling_metadata)
 
     print(f"Running benchmark: {benchmark_config['name']}")
@@ -166,11 +155,13 @@ def run_benchmark(
         device=logits.device,
     )
 
-    # The span handles timing and rebel report capture internally. `profile_model`
-    # rather than `profile_sampler` because the context only records a sampler span
-    # that follows a model span, and this benchmark runs the sampler standalone; the
-    # stats are therefore reported under the "DECODE + SAMPLE" label.
+    # Sampler-only spans are dropped (the context records a sampler span only when
+    # it follows a model span), so this standalone benchmark goes through
+    # `profile_model(is_prefill=False)` and is flushed as a model-only record.
+    # Label reads "DECODE + SAMPLE" but nothing is paired. Timing and rebel report
+    # capture are handled inside the span.
     for _ in range(benchmark_iters):
+        logits.copy_(reference_logits)
         with performance_ctx.profile_model(is_prefill=False):
             sampler(logits, sampling_metadata)
     performance_ctx.print_stats()
