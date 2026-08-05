@@ -23,7 +23,6 @@ from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
-from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 import vllm_rbln.envs as envs
@@ -94,10 +93,54 @@ class RBLNEagleProposer(EagleProposer):
             raise NotImplementedError
 
         self.runner = runner
+        self.arange_cpu = torch.arange(self.arange.shape[0], dtype=torch.int32)
         # Set in load_model when eagle3 + compilation are both on.
         self._compiled_unrolled = None
         self._draft_id_logged = 0
         self._prefill_shape_logged = 0
+
+    @staticmethod
+    def _mirror_seq_lens_to_host(
+        cad: CommonAttentionMetadata,
+        delta: torch.Tensor | int,
+        clamp_mask: torch.Tensor | None = None,
+    ) -> None:
+        """Apply to the host shadow whatever was just applied to `seq_lens`.
+
+        The flash-attention builder reads `_seq_lens_cpu`, not `seq_lens`
+        (`num_computed_tokens = seq_lens - query_seq_lens_cpu`), so a shadow
+        left stale makes every step after the first attend with the wrong
+        sequence length. That does not crash -- it silently lowers acceptance,
+        which is the thing this path exists to produce. Invalidating the shadow
+        instead costs a D2H sync per step; mirroring the arithmetic is free.
+
+        `_seq_lens_cpu` is upstream-private; `propose()` reaches it only through
+        here.
+
+        On this backend the two usually ALIAS. `rbln_model_runner` builds the
+        metadata as
+
+            seq_lens=self.seq_lens[:num_reqs],
+            _seq_lens_cpu=self.seq_lens[:num_reqs],
+
+        i.e. two slices of one CPU tensor, so the op on `seq_lens` has already
+        updated the shadow and mirroring it again applies the delta twice --
+        rejected tokens subtracted twice, each draft iteration advancing by 2.
+        `_build_dummy_attn_metadata` in this file does NOT alias (`.to(device)`
+        copies), so the check is made at run time rather than assumed either
+        way.
+        """
+        shadow = cad._seq_lens_cpu
+        if shadow is None:
+            return
+        seq_lens = cad.seq_lens
+        if shadow.data_ptr() == seq_lens.data_ptr() and shadow.shape == seq_lens.shape:
+            return
+        if isinstance(delta, torch.Tensor):
+            delta = delta.to(shadow.device, shadow.dtype)
+        shadow += delta
+        if clamp_mask is not None:
+            shadow.masked_fill_(clamp_mask.to(shadow.device), 1)
 
     def _fold_combine(self, is_prefill: bool | None = None) -> bool:
         """Whether the aux-state projection runs inside the drafter's graph.
@@ -315,81 +358,49 @@ class RBLNEagleProposer(EagleProposer):
         mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         num_rejected_tokens: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # The step loop below is instrumented, but everything before it -- the
-        # aux projection, buffer fill, DP padding, first metadata build and the
-        # first forward -- was not, and it is the larger half: under
-        # RBLN_RUNTIME_FORCE_SYNC=1 the whole `draft` phase measured 45.87 ms
-        # per step while the two loop iterations accounted for only 6.4 ms.
-        # These scopes split the remainder. All are no-ops unless
-        # VLLM_CUSTOM_SCOPES_FOR_PROFILING=1.
+        # `drafter/*` scopes below are no-ops unless
+        # VLLM_CUSTOM_SCOPES_FOR_PROFILING=1. Read them under
+        # RBLN_RUNTIME_FORCE_SYNC=1: with async dispatch, device time lands in
+        # whichever scope happens to block.
         fold = self._fold_combine()
         if self.method == "eagle3":
             assert isinstance(
                 self.model, (Eagle3LlamaForCausalLM, Eagle3DeepseekV2ForCausalLM)
             )
             if not fold:
-                # Eager on purpose. The projection used to get its own compiled
-                # graph because torch-rbln's non-deploy mode scans every eager
-                # op's inputs for NaN/Inf, which walked this 56.6 MB weight on
-                # every call (19.6 ms/step). With TORCH_RBLN_DEPLOY=ON the scan
-                # is gone and eager is 0.011 ms -- faster than the 0.035 ms
-                # graph -- so the graph was pure overhead: compiled on every
-                # start, never called under the default FUSE_FIRST_FORWARD=1,
-                # and its weight load is what fails `rbln_memcpy_v2h` when
-                # FUSE=0 (56,623,104 bytes = 3072 x 9216 x 2 exactly).
-                # This path now REQUIRES TORCH_RBLN_DEPLOY=ON to be fast.
+                # Eager on purpose, and only fast with TORCH_RBLN_DEPLOY=ON: the
+                # non-deploy NaN/Inf scan walks this 56.6 MB weight on every call.
+                # See the commit message for the numbers.
                 with record_function_or_nullcontext("drafter/first: combine"):
                     target_hidden_states = self.model.combine_hidden_states(
                         target_hidden_states
                     )
                 assert target_hidden_states.shape[-1] == self.hidden_size
 
-        with record_function_or_nullcontext("drafter/first: set_inputs"):
-            num_tokens, token_indices_to_sample = self.set_inputs_first_pass(
-                target_token_ids=target_token_ids,
-                next_token_ids=next_token_ids,
-                target_positions=target_positions,
-                target_hidden_states=target_hidden_states,
-                token_indices_to_sample=token_indices_to_sample,
-                cad=common_attn_metadata,
-            )
+        num_tokens, token_indices_to_sample = self.set_inputs_first_pass(
+            target_token_ids=target_token_ids,
+            next_token_ids=next_token_ids,
+            target_positions=target_positions,
+            target_hidden_states=target_hidden_states,
+            token_indices_to_sample=token_indices_to_sample,
+            cad=common_attn_metadata,
+        )
 
         assert self.runner is not None
         is_prefill = self.runner.is_prefill
 
         # Build attention metadata
         num_reqs = self.runner.input_batch.num_reqs
-        with record_function_or_nullcontext("drafter/first: dp_padding"):
-            num_reqs_padded, num_padded_tokens, num_tokens_across_dp = (
-                self._determine_draft_batch_padding(num_reqs, num_tokens, is_prefill)
-            )
+        num_reqs_padded, num_padded_tokens, num_tokens_across_dp = (
+            self._determine_draft_batch_padding(num_reqs, num_tokens, is_prefill)
+        )
         per_layer_attn_metadata: dict[str, object] = {}
-        with record_function_or_nullcontext("drafter/first: attn_meta"):
-            for attn_group in self.draft_attn_groups:
-                attn_metadata = attn_group.get_metadata_builder().build(
-                    common_attn_metadata=common_attn_metadata,
-                    positions=target_positions,
-                    is_prefill=is_prefill,
-                    batch_pad=num_reqs_padded,
-                )
-                attach_kv_cache_bindings(
-                    attn_metadata,
-                    self.runner.kv_caches,
-                    self.runner.kv_cache_bases,
-                    self.runner.kv_cache_view_infos,
-                )
-                for layer_name in attn_group.layer_names:
-                    per_layer_attn_metadata[layer_name] = attn_metadata
-
-        with record_function_or_nullcontext("drafter/first: preprocess"):
-            input_ids, positions, hidden_states, token_indices_to_sample_padded = (
-                self._preprocess(
-                    num_reqs,
-                    num_reqs_padded,
-                    num_tokens,
-                    token_indices_to_sample,
-                    is_prefill,
-                )
+        for attn_group in self.draft_attn_groups:
+            attn_metadata = attn_group.get_metadata_builder().build(
+                common_attn_metadata=common_attn_metadata,
+                positions=target_positions,
+                is_prefill=is_prefill,
+                batch_pad=num_reqs_padded,
             )
             if fold:
                 # The projection happens inside the graph now, so hand it the
@@ -461,25 +472,15 @@ class RBLNEagleProposer(EagleProposer):
             draft_tokens_ids = self._draft_ids(logits, num_reqs)
             return draft_tokens_ids.view(-1, 1)
 
-        # Gathers plus the first argmax. Grouped so the `draft` remainder can be
-        # attributed: argmax.out is a registered host fallback and measures
-        # 0.195 ms per call standalone, essentially all of it the crossing.
-        _post = record_function_or_nullcontext("drafter/first: sample")
-        _post.__enter__()
         assert token_indices_to_sample_padded is not None
         positions = target_positions[
             token_indices_to_sample_padded.to(target_positions.device)
         ]
 
-        # No gather of `hidden_states` here: `model_wrapper` already applies
-        # `token_indices_to_sample` to it (see load_model). This override used to
-        # gather again, which was correct against the pre-#821 wrapper -- that one
-        # indexed only `sample_hidden_states` -- but #821 moved the fed-back
-        # tensor's gather inside, so a second one indexes an already
-        # (num_reqs_padded, hidden_size) tensor with token-space indices and
-        # raises "index out of bounds for dimension 0 with size 1" on the first
-        # decode.
-
+        # `hidden_states` is deliberately not gathered here -- #821 moved
+        # that gather inside `model_wrapper`. Doing it again would index an
+        # already (num_reqs_padded, hidden_size) tensor with token-space
+        # indices and raise on the first decode.
         draft_token_ids = self._draft_ids(logits, num_reqs)
 
         if self.allowed_attn_types is not None and not isinstance(
@@ -492,15 +493,15 @@ class RBLNEagleProposer(EagleProposer):
                 f"{self.allowed_attn_types}"
             )
 
-        _post.__exit__(None, None, None)
-
         # Generate the remaining draft tokens.
         draft_token_ids_list = [draft_token_ids]
 
+        # it mutates seq_lens in place; detach from the runner's persistent buffer.
+        common_attn_metadata.seq_lens = common_attn_metadata.seq_lens.clone()
         common_attn_metadata.num_actual_tokens = num_reqs
         common_attn_metadata.max_query_len = 1
-        common_attn_metadata.query_start_loc = self.arange[: num_reqs + 1]
-        common_attn_metadata.query_start_loc_cpu = self.arange[: num_reqs + 1].cpu()
+        common_attn_metadata.query_start_loc = self.arange_cpu[: num_reqs + 1]
+        common_attn_metadata.query_start_loc_cpu = self.arange_cpu[: num_reqs + 1]
 
         # In padded drafter batch, we need to adjust the sequence lengths
         # to remove the "padding" (i.e. rejected tokens).
@@ -510,14 +511,7 @@ class RBLNEagleProposer(EagleProposer):
         _adj.__enter__()
         if self.num_speculative_tokens > 1 and num_rejected_tokens is not None:
             common_attn_metadata.seq_lens -= num_rejected_tokens
-            # Same reasoning as in the step loop below: the flash-attention
-            # builder reads the HOST shadow, not `seq_lens`, so mirror the
-            # adjustment there. Invalidating it instead (the commented-out lines
-            # this replaces) would force a D2H sync every step; applying the
-            # same arithmetic on the host is free.
-            _slc0 = common_attn_metadata._seq_lens_cpu
-            if _slc0 is not None:
-                _slc0 -= num_rejected_tokens.to(_slc0.device, _slc0.dtype)
+            self._mirror_seq_lens_to_host(common_attn_metadata, -num_rejected_tokens)
 
         _adj.__exit__(None, None, None)
 
@@ -526,11 +520,6 @@ class RBLNEagleProposer(EagleProposer):
                 self._determine_draft_batch_padding(num_reqs, num_reqs, False)
             )
         for token_index in range(self.num_speculative_tokens - 1):
-            _upd = record_function_or_nullcontext("drafter: loop_update")
-            _upd.__enter__()
-            # Update the inputs
-            # cast to int32 is crucial when eagle model is compiled.
-            # tensor.argmax returns int64 by default.
             self.input_ids[:num_reqs] = draft_token_ids_list[-1].int()
             positions = positions.view(-1) + 1
             self.positions[:num_reqs] = positions[:num_reqs]
@@ -539,40 +528,11 @@ class RBLNEagleProposer(EagleProposer):
             exceeds_max_model_len = positions[:num_reqs] >= self.max_model_len
             common_attn_metadata.seq_lens += 1
             common_attn_metadata.seq_lens.masked_fill_(exceeds_max_model_len, 1)
-            # Keep the HOST shadow in step with the device tensor. The
-            # flash-attention builder reads `_seq_lens_cpu`, not `seq_lens`
-            # (`num_computed_tokens = seq_lens - query_seq_lens_cpu`), so a
-            # shadow that is never updated leaves every step after the first
-            # attending with a stale sequence length. That does not crash -- it
-            # silently degrades the drafts, i.e. exactly the acceptance rate
-            # this path exists to produce.
-            #
             # Mirror the device op exactly: unsliced, same mask.
-            # `exceeds_max_model_len` derives from `positions`, a host tensor.
-            _slc = common_attn_metadata._seq_lens_cpu
-            if _slc is not None:
-                _slc += 1
-                _slc.masked_fill_(exceeds_max_model_len.to(_slc.device), 1)
+            self._mirror_seq_lens_to_host(
+                common_attn_metadata, 1, exceeds_max_model_len
+            )
 
-            _upd.__exit__(None, None, None)
-
-            # Split the drafter iteration into host metadata build vs device
-            # forward. The enclosing "rbln_model_runner: draft" phase is by far
-            # the most expensive part of a spec-decode step here, and the two
-            # candidates -- host attention metadata construction and the device
-            # forward -- need very different fixes, so the aggregate number is
-            # not actionable on its own.
-            #
-            # Read these only under RBLN_RUNTIME_FORCE_SYNC=1. With the default
-            # async dispatch, device time lands in whichever scope happens to
-            # block, which is how an earlier profile blamed `postprocess` (one
-            # line of indexing) for 32 ms.
-            #
-            # Both are no-ops unless VLLM_CUSTOM_SCOPES_FOR_PROFILING=1.
-            _attn_scope = record_function_or_nullcontext("drafter: attn_meta")
-            _attn_scope.__enter__()
-
-            # Rebuild attention metadata
             per_layer_attn_metadata.clear()
             for attn_group in self.draft_attn_groups:
                 attn_metadata = attn_group.get_metadata_builder().build(
@@ -595,18 +555,13 @@ class RBLNEagleProposer(EagleProposer):
             )
 
             # Run the model.
-            _attn_scope.__exit__(None, None, None)
-
-            with (
-                record_function_or_nullcontext("drafter: forward"),
-                set_forward_context(
-                    per_layer_attn_metadata,
-                    self.vllm_config,
-                    num_tokens=num_reqs,
-                    num_tokens_across_dp=num_tokens_across_dp,
-                    num_padded_tokens=num_padded_tokens,
-                    **build_kv_cache_forward_context_kwargs(self.runner.kv_cache_bases),
-                ),
+            with set_forward_context(
+                per_layer_attn_metadata,
+                self.vllm_config,
+                num_tokens=num_reqs,
+                num_tokens_across_dp=num_tokens_across_dp,
+                num_padded_tokens=num_padded_tokens,
+                **build_kv_cache_forward_context_kwargs(self.runner.kv_cache_bases),
             ):
                 hidden_states, logits = self.model_executable(
                     input_ids=input_ids,
@@ -647,7 +602,7 @@ class RBLNEagleProposer(EagleProposer):
             )
 
         if token_indices_to_sample is None:
-            token_indices_to_sample = cad.query_start_loc[1:] - 1
+            token_indices_to_sample = (cad.query_start_loc[1:] - 1).to(self.device)
 
         num_tokens = target_token_ids.shape[0]
         self.input_ids[: num_tokens - 1] = target_token_ids[1:]
@@ -714,29 +669,22 @@ class RBLNEagleProposer(EagleProposer):
         token_indices_to_sample, num_rejected_tokens = eagle_prepare_inputs_padded(
             spec_decode_metadata.cu_num_draft_tokens,
             valid_sampled_tokens_count,
-            common_attn_metadata.query_start_loc_cpu,
+            common_attn_metadata.query_start_loc,
         )
 
-        query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
-        seq_lens_cpu = (
-            common_attn_metadata._seq_lens_cpu
-            if common_attn_metadata._seq_lens_cpu is not None
-            else common_attn_metadata.seq_lens.cpu()
-        )
-        new_query_len_per_req = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
-
-        total_num_tokens = query_start_loc_cpu[-1].item()
+        query_start_loc = common_attn_metadata.query_start_loc
+        seq_lens = common_attn_metadata.seq_lens
+        new_query_len_per_req = query_start_loc[1:] - query_start_loc[:-1]
+        total_num_tokens = query_start_loc[-1].item()
 
         spec_common_attn_metadata = CommonAttentionMetadata(
-            query_start_loc=common_attn_metadata.query_start_loc,
-            seq_lens=common_attn_metadata.seq_lens,
-            query_start_loc_cpu=query_start_loc_cpu,
-            _seq_lens_cpu=common_attn_metadata._seq_lens_cpu,
-            _num_computed_tokens_cpu=common_attn_metadata._num_computed_tokens_cpu,
+            query_start_loc=query_start_loc,
+            seq_lens=seq_lens,
+            query_start_loc_cpu=query_start_loc,
             num_reqs=common_attn_metadata.num_reqs,
             num_actual_tokens=total_num_tokens,
             max_query_len=new_query_len_per_req.max().item(),
-            max_seq_len=seq_lens_cpu.max().item(),
+            max_seq_len=seq_lens.max().item(),
             block_table_tensor=common_attn_metadata.block_table_tensor,
             slot_mapping=torch.tensor(0),  # dummy,
             causal=True,
@@ -917,10 +865,9 @@ class RBLNEagleProposer(EagleProposer):
         query_start_loc[1 : num_reqs + 1] = torch.from_numpy(cum_num_tokens)
 
         return CommonAttentionMetadata(
-            query_start_loc=query_start_loc.to(self.device),
+            query_start_loc=query_start_loc,
             query_start_loc_cpu=query_start_loc,
-            seq_lens=seq_lens.to(self.device),
-            _seq_lens_cpu=seq_lens,
+            seq_lens=seq_lens,
             num_reqs=num_reqs,
             num_actual_tokens=num_tokens,
             max_query_len=num_tokens_per_req,
@@ -932,7 +879,6 @@ class RBLNEagleProposer(EagleProposer):
             causal=True,
         )
 
-    @torch.inference_mode()
     def dummy_run(
         self,
         num_reqs: int,
@@ -1016,14 +962,9 @@ class RBLNEagleProposer(EagleProposer):
 
         common_attn_metadata.num_actual_tokens = num_reqs
         common_attn_metadata.max_query_len = 1
-        common_attn_metadata.query_start_loc = self.arange[: num_reqs + 1]
-        common_attn_metadata.query_start_loc_cpu = (
-            common_attn_metadata.query_start_loc.cpu()
-        )
-        common_attn_metadata._seq_lens_cpu += 1
-        common_attn_metadata.seq_lens = common_attn_metadata._seq_lens_cpu.to(
-            self.device
-        )
+        common_attn_metadata.query_start_loc = self.arange_cpu[: num_reqs + 1]
+        common_attn_metadata.query_start_loc_cpu = self.arange_cpu[: num_reqs + 1]
+        common_attn_metadata.seq_lens += 1
 
         num_reqs_padded, dp_padded, num_tokens_across_dp = (
             self._determine_draft_batch_padding(num_reqs, num_reqs, False)

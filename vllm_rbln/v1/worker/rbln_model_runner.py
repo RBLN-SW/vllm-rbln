@@ -85,7 +85,7 @@ from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
-from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
+from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.kv_connector_model_runner_mixin import (
     KVConnectorModelRunnerMixin,
@@ -359,10 +359,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # Persistent buffers
         self.input_ids = torch.zeros(self.max_num_tokens, dtype=torch.int32)
         self.positions = torch.zeros(self.max_num_tokens, dtype=torch.int64)
-        self.query_start_loc = self._make_buffer(
-            self.max_num_reqs + 1, dtype=torch.int32
-        )
+        self.query_start_loc = torch.zeros(self.max_num_reqs + 1, dtype=torch.int32)
+        self.query_start_loc_np = self.query_start_loc.numpy()
         self.seq_lens = torch.zeros(self.max_num_tokens, dtype=torch.int32)
+        self.seq_lens_np = self.seq_lens.numpy()
         self.discard_request_mask = torch.zeros(self.max_num_reqs, dtype=torch.bool)
         self.input_stager = InputStager(self.device)
 
@@ -423,7 +423,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             and envs.VLLM_RBLN_SPECIALIZE_MOE_DECODE
         )
 
-        self.performance_ctx = PerformanceContext("runner")
+        self.performance_ctx = PerformanceContext("runner", self.runtime_holder)
 
         self.offload_context = nullcontext
         if HAS_TORCH_RBLN and USE_DEVICE_TENSOR and not envs.VLLM_RBLN_DISABLE_OFFLOAD:
@@ -432,17 +432,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
     def _get_positions(self, num_tokens: Any):
         assert not isinstance(num_tokens, int)
         return self.positions[:num_tokens]
-
-    def _make_buffer(
-        self, *size: int | torch.SymInt, dtype: torch.dtype, numpy: bool = True
-    ) -> CpuGpuBuffer:
-        return CpuGpuBuffer(
-            *size,
-            dtype=dtype,
-            device=self.device,
-            pin_memory=self.pin_memory,
-            with_numpy=numpy,
-        )
 
     def _init_model_kwargs(self):
         model_kwargs = dict[str, Any]()
@@ -811,17 +800,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         )
 
         # Prepare the attention metadata.
-        query_start_loc_np = self.query_start_loc.np
-        query_start_loc_np[0] = 0
-        query_start_loc_np[1 : num_reqs + 1] = cu_num_tokens
-        query_start_loc_np[num_reqs + 1 :].fill(cu_num_tokens[-1])
-        self.query_start_loc.copy_to_gpu()
+        self.query_start_loc_np[0] = 0
+        self.query_start_loc_np[1 : num_reqs + 1] = cu_num_tokens
+        self.query_start_loc_np[num_reqs + 1 :].fill(cu_num_tokens[-1])
 
-        seq_lens_np = self.seq_lens.numpy()
-        seq_lens_np[:num_reqs] = (
+        self.seq_lens_np[:num_reqs] = (
             self.input_batch.num_computed_tokens_cpu[:num_reqs] + logical_num_tokens
         )
-        seq_lens_np[num_reqs:].fill(0)
+        self.seq_lens_np[num_reqs:].fill(0)
 
         num_tokens = [self.requests[r].num_tokens for r in self.input_batch.req_ids]
         num_tokens_np = np.array(num_tokens, dtype=np.int32)
@@ -829,7 +815,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # Record which requests should not be sampled,
         # so that we could clear the sampled tokens before returningj
         discard_request_mask_np = self.discard_request_mask.numpy()
-        discard_request_mask_np[:num_reqs] = seq_lens_np[:num_reqs] < num_tokens_np
+        discard_request_mask_np[:num_reqs] = self.seq_lens_np[:num_reqs] < num_tokens_np
 
         if not use_spec_decode:
             # NOTE(woosuk): Due to chunked prefills, the batch may contain
@@ -837,7 +823,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             # from these partial requests, we do so for simplicity.
             # We will ignore the sampled tokens from the partial requests.
             # TODO: Support prompt logprobs.
-            logits_indices = self.query_start_loc.cpu[1 : num_reqs + 1] - 1
+            logits_indices = self.query_start_loc[1 : num_reqs + 1] - 1
             spec_decode_metadata = None
         else:
             # Get the number of draft tokens for each request.
@@ -900,10 +886,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             return blk_table_tensor
 
         cm_base = CommonAttentionMetadata(
-            query_start_loc=self.query_start_loc.gpu[: num_reqs + 1],
-            query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs + 1],
+            query_start_loc=self.query_start_loc[: num_reqs + 1],
+            query_start_loc_cpu=self.query_start_loc[: num_reqs + 1],
             seq_lens=self.seq_lens[:num_reqs],
-            _seq_lens_cpu=self.seq_lens[:num_reqs],
             num_reqs=num_reqs,
             num_actual_tokens=num_tokens,
             max_query_len=max_query_len,
@@ -1512,12 +1497,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         if grammar_output is not None:
             # NOTE(RBLN): `xgr.apply_token_bitmask_inplace` requires logits
             # to be float32 dtype for CPU tensors
-            origin_dtype = logits.dtype
-            logits = logits.to(torch.float32)
+            origin_dtype, origin_device = logits.dtype, logits.device
+            logits = logits.to(torch.float32).to("cpu")
             apply_grammar_bitmask(
                 scheduler_output, grammar_output, self.input_batch, logits
             )
-            logits = logits.to(origin_dtype)
+            logits = logits.to(origin_dtype).to(origin_device)
 
         with record_function_or_nullcontext("rbln_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
@@ -1599,23 +1584,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         if not self.num_spec_tokens or not req_ids:
             return None
         if self._draft_token_ids is None:
-            # No drafter ran this step. `execute_model` resets
-            # `_draft_token_ids = None` every step and only fills it when the
-            # inputs fit the drafter's length budget:
-            #
-            #     max_seq_len + num_spec <= effective_drafter_max_model_len
-            #
-            # A request that fills the context window breaks that condition and
-            # the drafter is skipped entirely. Handing `DraftTokenIds(req_ids,
-            # None)` back would pass core's guard (`if draft_token_ids is not
-            # None`), which only inspects the wrapper, and then kill the engine
-            # inside `update_draft_token_ids` on `zip(req_ids, None)`:
-            #
-            #     TypeError: 'NoneType' object is not iterable
-            #
-            # Return per-request empty lists so this step's draft is explicitly
-            # cleared. Returning None instead would skip the update and leave
-            # the previous step's draft in place, to be verified next step.
+            # No drafter ran this step -- `execute_model` skips it when
+            # `max_seq_len + num_spec > effective_drafter_max_model_len`.
+            # Wrapping the None gets past the core's `is not None` guard and
+            # kills the engine with "'NoneType' object is not iterable"; empty
+            # lists clear this step's drafts explicitly, whereas returning None
+            # would leave the previous step's drafts to be verified at the
+            # wrong position.
             return DraftTokenIds(req_ids, [[] for _ in req_ids])
         draft_token_ids = (
             self._draft_token_ids.tolist()
@@ -1684,22 +1659,18 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             assert isinstance(sampled_token_ids, torch.Tensor)
 
             # The "draft" phase covers more than propose(): these two helpers
-            # run first and were unmeasured. After compiling the aux projection
-            # the phase is 25.1 ms/step, of which the scopes inside propose()
-            # account for 15.6 -- the 9.5 ms remainder is here and in the
-            # post-forward block. prepare_next_token_ids_padded in particular
-            # holds nine of the eleven integer ops that fall back to the host
-            # (`why: dtype-not-fp16`), each one a device round-trip.
-            with record_function_or_nullcontext("drafter/pre: next_token_ids"):
-                next_token_ids, valid_sampled_tokens_count = (
-                    self.drafter.prepare_next_token_ids_padded(
-                        common_attn_metadata,
-                        sampled_token_ids,
-                        self.requests,
-                        self.input_batch,
-                        self.discard_request_mask,
-                    )
+            # run first. prepare_next_token_ids_padded holds nine of the eleven
+            # integer ops that fall back to the host (`why: dtype-not-fp16`),
+            # each one a device round-trip.
+            next_token_ids, valid_sampled_tokens_count = (
+                self.drafter.prepare_next_token_ids_padded(
+                    common_attn_metadata,
+                    sampled_token_ids,
+                    self.requests,
+                    self.input_batch,
+                    self.discard_request_mask,
                 )
+            )
 
             target_hidden_states = hidden_states
             num_rejected_tokens: torch.Tensor | None = None
@@ -1970,7 +1941,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             # If this is a partial request (i.e. chunked prefill),
             # then there is prompt logprob generated for each index.
             req_idx = self.input_batch.req_id_to_index[req_id]
-            offset = self.query_start_loc.cpu[req_idx].item()
+            offset = self.query_start_loc[req_idx].item()
             prompt_hidden_states = hidden_states[offset : offset + num_logits]
             logits = self.model.compute_logits(prompt_hidden_states)
 
@@ -2045,9 +2016,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         num_scheduled_tokens = np.array(num_scheduled_tokens_list, dtype=np.int32)
         num_tokens_unpadded = int(num_scheduled_tokens.sum())
 
-        seq_lens_np = self.seq_lens.numpy()
-        seq_lens_np[:num_reqs] = num_scheduled_tokens
-        seq_lens_np[num_reqs:] = 0
+        self.seq_lens_np[:num_reqs] = num_scheduled_tokens
+        self.seq_lens_np[num_reqs:] = 0
 
         # NOTE(RBLN): self.is_prefill is derived from num_tokens_no_spec.
         # For decode warmup, keep it at 1 so multi-token speculative decode
@@ -2062,9 +2032,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         )
         num_tokens_padded = num_tokens_padded or _num_tokens_padded
 
-        cum_num_tokens, _ = self._get_cumsum_and_arange(num_scheduled_tokens)
-        query_start_loc_np = self.query_start_loc.np
-        query_start_loc_np[1 : num_reqs + 1] = cum_num_tokens
+        cu_num_tokens, _ = self._get_cumsum_and_arange(num_scheduled_tokens)
+        self.query_start_loc_np[0] = 0
+        self.query_start_loc_np[1 : num_reqs + 1] = cu_num_tokens
+        self.query_start_loc_np[num_reqs + 1 :].fill(cu_num_tokens[-1])
 
         attn_metadata, _ = self._build_attention_metadata(
             num_tokens=num_tokens_unpadded,
@@ -2959,6 +2930,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
             # 5. specdec (medusa)
             if self.speculative_config and self.speculative_config.method == "medusa":
+                # Narrow like every other drafter branch in this file: only
+                # RBLNMedusaProposer.dummy_run takes no arguments, and without
+                # the assert the union resolves to the eagle proposer, whose
+                # dummy_run requires three.
+                assert isinstance(self.drafter, RBLNMedusaProposer)
                 self.drafter.dummy_run()
 
     def _process_kv_cache_copy_ops(
@@ -2979,7 +2955,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     src = op.src_block_id
                     dst = op.dst_block_id
                     nt = op.num_tokens
-                    kv_cache[:, dst, :, :, :nt, :] = kv_cache[:, src, :, :, :nt, :]
+                    if self.model_config.use_mla:
+                        kv_cache[dst, :nt, :] = kv_cache[src, :nt, :]
+                    else:
+                        kv_cache[:, dst, :, :, :nt, :] = kv_cache[:, src, :, :, :nt, :]
 
 
 def _pad_rows(t: torch.Tensor | None, bucket: int) -> torch.Tensor | None:

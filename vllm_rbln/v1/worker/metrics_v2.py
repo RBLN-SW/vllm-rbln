@@ -170,15 +170,18 @@ class _NoopSpan:
 
 
 class _PerformanceContext:
-    def __init__(self, name: str | None = None) -> None:
+    def __init__(self, name: str | None = None, runtimes: list | None = None) -> None:
         self.name = name
         self.rank_tag = _rank_tag()
         self._metrics: dict[bool, Metrics] = defaultdict(Metrics)
         self._pending: _Sample | None = None
         self._e2e_start: float | None = None
         self._e2e: dict[bool, Metrics] = defaultdict(Metrics)
+        self._runtimes = runtimes if runtimes is not None else []
+        self._backlog_drained = False
 
     def profile_model(self, is_prefill: bool) -> _TimingSpan:
+        self._drain_report_backlog()
         # A prior model step with no sampler (intermediate chunked prefill,
         # non-last PP rank) leaves a pending report; record it model-only here.
         self._flush_pending()
@@ -213,6 +216,16 @@ class _PerformanceContext:
             s.latency, s.host, s.device, s.ccl, s.prepare
         )
 
+    def _drain_report_backlog(self) -> None:
+        """Discard warmup reports left in the runtime FIFO before measuring."""
+        if self._backlog_drained:
+            return
+
+        self._backlog_drained = True
+        for runtime in self._runtimes:
+            if (flush := getattr(runtime, "flush_reports", None)) is not None:
+                flush()
+
     def print_stats(self) -> None:
         self._flush_pending()  # record the final step if it had no sampler
         sections: dict[str, Metrics] = {}
@@ -226,7 +239,7 @@ class _PerformanceContext:
 
 
 class _NoopPerformanceContext:
-    def __init__(self, name: str | None = None) -> None:
+    def __init__(self, *args, **kwargs) -> None:
         pass
 
     def profile_model(self, *args, **kwargs) -> _NoopSpan:
