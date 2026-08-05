@@ -33,7 +33,7 @@ steps:
     secrets: *secrets
     command:
       - *sync
-      - "uv run --no-sync pytest tests/optimum/v1/core -vv --durations 0"
+      - "uv run --no-sync pytest -x tests/optimum/v1/core -vv --durations 0"
 
   - label: ":pytest: tests/optimum/v1/worker"
     image: "${DEVTOOLS_DOCKER_IMAGE}"
@@ -41,7 +41,7 @@ steps:
     secrets: *secrets
     command:
       - *sync
-      - "uv run --no-sync pytest tests/optimum/v1/worker/test_rebel_optimum_model_runner.py -vv --durations 0"
+      - "uv run --no-sync pytest -x tests/optimum/v1/worker/test_rebel_optimum_model_runner.py -vv --durations 0"
 
   - label: ":pytest: tests/optimum/optimum_compile/converter"
     image: "${DEVTOOLS_DOCKER_IMAGE}"
@@ -49,7 +49,7 @@ steps:
     secrets: *secrets
     command:
       - *sync
-      - "uv run --no-sync pytest tests/optimum/optimum_compile/converter -vv --durations 0"
+      - "uv run --no-sync pytest -x tests/optimum/optimum_compile/converter -vv --durations 0"
 
   # ===========================================================================
   # NPU suites
@@ -63,7 +63,7 @@ steps:
     secrets: *secrets
     command:
       - *sync
-      - "uv run --no-sync pytest tests/optimum/entrypoints/openai -vv --durations 0 --timeout=600"
+      - "uv run --no-sync pytest -x tests/optimum/entrypoints/openai -vv --durations 0 --timeout=600"
 
   - label: ":pytest: tests/optimum/entrypoints/llm"
     image: "${DEVTOOLS_DOCKER_IMAGE}"
@@ -74,7 +74,7 @@ steps:
     secrets: *secrets
     command:
       - *sync
-      - "uv run --no-sync pytest tests/optimum/entrypoints/llm -vv --durations 0"
+      - "uv run --no-sync pytest -x tests/optimum/entrypoints/llm -vv --durations 0"
 
   - label: ":pytest: tests/optimum/v1/models"
     image: "${DEVTOOLS_DOCKER_IMAGE}"
@@ -85,7 +85,7 @@ steps:
     secrets: *secrets
     command:
       - *sync
-      - "uv run --no-sync pytest tests/optimum/v1/models -vv --durations 0"
+      - "uv run --no-sync pytest -x tests/optimum/v1/models -vv --durations 0"
 
   - label: ":pytest: tests/optimum/v1/worker/test_sampler.py"
     image: "${DEVTOOLS_DOCKER_IMAGE}"
@@ -96,9 +96,9 @@ steps:
     secrets: *secrets
     command:
       - *sync
-      - 'uv run --no-sync pytest -n 8 -k "warm_up_true" tests/optimum/v1/worker/test_sampler.py -vv --durations 0'
-      - 'uv run --no-sync pytest -n 8 -k "warm_up_false" tests/optimum/v1/worker/test_sampler.py -vv --durations 0'
-      - 'uv run --no-sync pytest -n 8 -k "not warm_up_true and not warm_up_false" tests/optimum/v1/worker/test_sampler.py -vv --durations 0'
+      - 'uv run --no-sync pytest -x -n 8 -k "warm_up_true" tests/optimum/v1/worker/test_sampler.py -vv --durations 0'
+      - 'uv run --no-sync pytest -x -n 8 -k "warm_up_false" tests/optimum/v1/worker/test_sampler.py -vv --durations 0'
+      - 'uv run --no-sync pytest -x -n 8 -k "not warm_up_true and not warm_up_false" tests/optimum/v1/worker/test_sampler.py -vv --durations 0'
 
   # ===========================================================================
   # Optimum smoke suites -> NPU using RSD
@@ -112,7 +112,7 @@ steps:
     secrets: *secrets
     command:
       - *sync
-      - "uv run --no-sync pytest tests/optimum/optimum_compile/smoke/test_rsd1.py -v --durations 0"
+      - "uv run --no-sync pytest -x tests/optimum/optimum_compile/smoke/test_rsd1.py -v --durations 0"
 
   - label: ":pytest: vllm-rbln optimum compile smoke rsd-4"
     image: "${DEVTOOLS_DOCKER_IMAGE}"
@@ -123,7 +123,7 @@ steps:
     secrets: *secrets
     command:
       - *sync
-      - "uv run --no-sync pytest tests/optimum/optimum_compile/smoke/test_rsd4.py -v --durations 0"
+      - "uv run --no-sync pytest -x tests/optimum/optimum_compile/smoke/test_rsd4.py -v --durations 0"
 
   - label: ":pytest: vllm-rbln optimum compile smoke rsd-8"
     image: "${DEVTOOLS_DOCKER_IMAGE}"
@@ -134,4 +134,4 @@ steps:
     secrets: *secrets
     command:
       - *sync
-      - "uv run --no-sync pytest tests/optimum/optimum_compile/smoke/test_rsd8.py -v --durations 0"
+      - "uv run --no-sync pytest -x tests/optimum/optimum_compile/smoke/test_rsd8.py -v --durations 0"
