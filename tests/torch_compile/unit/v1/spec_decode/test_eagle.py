@@ -80,6 +80,34 @@ class FakeEagle3Model(Eagle3LlamaForCausalLM):
         return self.combined
 
 
+class FakeMappedDraftModel(Eagle3LlamaForCausalLM):
+    """Draft model double carrying a draft->target id mapping (EAGLE3 + d2t).
+
+    Subclasses the real type to pass the isinstance gate in `model_wrapper`.
+    Exposes the attribute surface that path reads: `draft_id_to_target_id`, and
+    a `logits_processor(lm_head, hidden)` returning draft-vocab logits.
+    `compute_logits` only counts calls -- it is upstream's full-vocab scatter,
+    and reaching it is the defect under test.
+    """
+
+    def __init__(self, draft_id_to_target_id: torch.Tensor):
+        self.draft_id_to_target_id = draft_id_to_target_id
+        self.lm_head = object()
+        self.logits_processor_calls: list[tuple[object, torch.Tensor]] = []
+        self.compute_logits_calls = 0
+
+    def __call__(self, *, input_ids, positions, hidden_states, inputs_embeds):
+        return hidden_states + 1000, hidden_states + 2000
+
+    def logits_processor(self, lm_head, hidden_states: torch.Tensor) -> torch.Tensor:
+        self.logits_processor_calls.append((lm_head, hidden_states.clone()))
+        return hidden_states + 1
+
+    def compute_logits(self, sample_hidden_states: torch.Tensor) -> torch.Tensor:
+        self.compute_logits_calls += 1
+        return sample_hidden_states + 1
+
+
 class FakeMetadataBuilder:
     def __init__(self):
         self.calls: list[dict[str, object]] = []
@@ -197,6 +225,9 @@ def make_eagle_stub(
         runner if runner is not None else SimpleNamespace(compile_context=object())
     )
     stub.allowed_attn_types = None
+    # Populated from the draft model in load_model; None means the draft head
+    # shares the target vocabulary, so propose() maps no ids.
+    stub.draft_id_to_target_id = None
     return stub
 
 
@@ -535,6 +566,70 @@ def test_load_model_wrapper_composition(monkeypatch, with_indices):
     torch.testing.assert_close(logits, expected_sample + 1)
 
 
+# Verifies load_model picks up the draft->target mapping off the draft model.
+@pytest.mark.parametrize("mapped", [True, False])
+def test_load_model_captures_draft_id_to_target_id(monkeypatch, mapped):
+    stub = make_eagle_stub(enforce_eager=True)
+    d2t = torch.tensor([0, 2, 3], dtype=torch.long)
+    model = FakeMappedDraftModel(d2t) if mapped else FakeEagleModel()
+    _install_model(monkeypatch, stub, model)
+
+    RBLNEagleProposer.load_model(stub, target_model=object())
+
+    if mapped:
+        assert stub.draft_id_to_target_id is d2t
+    else:
+        # FakeEagleModel has no such attribute; the getattr default must hold.
+        assert stub.draft_id_to_target_id is None
+
+
+# Verifies a mapped draft head keeps the graph in draft-vocab space: the
+# wrapper calls logits_processor directly and never reaches the full-vocab
+# scatter in compute_logits.
+def test_load_model_wrapper_skips_compute_logits_when_mapped(monkeypatch):
+    stub = make_eagle_stub(hidden_size=4, enforce_eager=True)
+    model = FakeMappedDraftModel(torch.tensor([0, 2, 3], dtype=torch.long))
+    _install_model(monkeypatch, stub, model)
+
+    RBLNEagleProposer.load_model(stub, target_model=object())
+
+    hidden = torch.arange(24, dtype=torch.float32).view(2, 3, 4)
+    _, logits = stub.model_executable(
+        input_ids=torch.zeros((2, 3), dtype=torch.int32),
+        positions=torch.zeros((2, 3), dtype=torch.int64),
+        hidden_states=hidden,
+        token_indices_to_sample=None,
+    )
+
+    assert model.compute_logits_calls == 0
+    assert len(model.logits_processor_calls) == 1
+    lm_head_arg, hidden_arg = model.logits_processor_calls[0]
+    assert lm_head_arg is model.lm_head
+    expected_sample = (hidden + 1000).view(-1, 4)
+    torch.testing.assert_close(hidden_arg, expected_sample)
+    torch.testing.assert_close(logits, expected_sample + 1)
+
+
+# Verifies the unmapped path is untouched: no mapping means compute_logits
+# stays the source of logits.
+def test_load_model_wrapper_uses_compute_logits_without_mapping(monkeypatch):
+    stub = make_eagle_stub(hidden_size=4, enforce_eager=True)
+    model = FakeEagleModel()
+    _install_model(monkeypatch, stub, model)
+
+    RBLNEagleProposer.load_model(stub, target_model=object())
+
+    hidden = torch.arange(24, dtype=torch.float32).view(2, 3, 4)
+    stub.model_executable(
+        input_ids=torch.zeros((2, 3), dtype=torch.int32),
+        positions=torch.zeros((2, 3), dtype=torch.int64),
+        hidden_states=hidden,
+        token_indices_to_sample=None,
+    )
+
+    assert len(model.compute_logits_inputs) == 1
+
+
 # ---------------------------------------------------------------------------
 # delegation to spec-decode utils
 # ---------------------------------------------------------------------------
@@ -871,6 +966,164 @@ def test_propose_multistep_rejects_unsupported_attention_metadata_type():
             token_indices_to_sample=torch.tensor([1, 3], dtype=torch.int32),
             common_attn_metadata=cad,
         )
+
+
+# ---------------------------------------------------------------------------
+# draft -> target id mapping
+# ---------------------------------------------------------------------------
+
+
+# Verifies ids pass through untouched when the draft head shares the target
+# vocabulary (plain EAGLE, or an EAGLE3 checkpoint with no mapping).
+def test_to_target_token_ids_passes_through_without_mapping():
+    stub = make_eagle_stub()
+    draft_ids = torch.tensor([0, 5, 17], dtype=torch.int64)
+
+    out = stub._to_target_token_ids(draft_ids)
+
+    assert out is draft_ids
+
+
+# Verifies d2t is applied as an offset, not as an absolute target id.
+def test_to_target_token_ids_applies_offsets():
+    stub = make_eagle_stub()
+    # target ids: 0, 3, 5, 8, 12
+    stub.draft_id_to_target_id = torch.tensor([0, 2, 3, 5, 8], dtype=torch.long)
+
+    out = stub._to_target_token_ids(torch.tensor([0, 1, 4, 2], dtype=torch.int64))
+
+    torch.testing.assert_close(out, torch.tensor([0, 3, 12, 5], dtype=torch.int64))
+
+
+# Verifies the new argmax+map is equivalent to upstream's scatter-into-full-vocab
+# then argmax, which is what makes dropping the scatter safe.
+def test_to_target_token_ids_matches_full_vocab_scatter_argmax():
+    draft_vocab_size, target_vocab_size = 6, 20
+    d2t = torch.tensor([0, 2, 3, 5, 8, 11], dtype=torch.long)
+    # in range, unique, monotonic: 0, 3, 5, 8, 12, 16
+    target_ids = torch.arange(draft_vocab_size, dtype=torch.long) + d2t
+    assert bool((target_ids.diff() > 0).all())
+    assert int(target_ids.max()) < target_vocab_size
+
+    draft_logits = torch.tensor(
+        [
+            [0.0, 9.0, 1.0, 2.0, 3.0, 4.0],
+            [5.0, 1.0, 0.0, 0.0, 7.0, 2.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0, 8.0],
+        ],
+        dtype=torch.float32,
+    )
+
+    # upstream: widen to the target vocabulary, then argmax
+    full_logits = torch.full(
+        (draft_logits.shape[0], target_vocab_size), float("-inf"), dtype=torch.float32
+    )
+    full_logits[:, target_ids] = draft_logits
+    expected = full_logits.argmax(dim=-1)
+
+    stub = make_eagle_stub()
+    stub.draft_id_to_target_id = d2t
+    actual = stub._to_target_token_ids(draft_logits.argmax(dim=-1))
+
+    torch.testing.assert_close(actual, expected)
+
+
+# Verifies the single-step early return maps its argmax into target space.
+def test_propose_single_step_maps_draft_ids_to_target_ids():
+    stub = make_eagle_stub(num_speculative_tokens=1, hidden_size=4)
+    _prime_for_first_pass(stub)
+    stub.runner = make_fake_runner(batch_bucket=4, num_reqs=2, is_prefill=False)
+    stub.draft_id_to_target_id = torch.tensor([0, 2, 5], dtype=torch.long)
+
+    def model_executable(
+        *, input_ids, positions, hidden_states, inputs_embeds, token_indices_to_sample
+    ):
+        logits = torch.tensor(
+            [[0.0, 5.0, 1.0], [0.0, 1.0, 7.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
+        )
+        return hidden_states.view(-1, stub.hidden_size), logits
+
+    stub.model_executable = model_executable
+    cad = make_common_attn_metadata(
+        query_start_loc=torch.tensor([0, 2, 4], dtype=torch.int32),
+        seq_lens=torch.tensor([10, 11], dtype=torch.int32),
+    )
+
+    output = RBLNEagleProposer.propose(
+        stub,
+        target_token_ids=torch.tensor([10, 11, 20, 21], dtype=torch.int32),
+        target_positions=torch.tensor([4, 5, 6, 7], dtype=torch.int64),
+        target_hidden_states=torch.arange(16, dtype=torch.float32).view(4, 4),
+        next_token_ids=torch.tensor([30, 31], dtype=torch.int32),
+        token_indices_to_sample=torch.tensor([1, 3], dtype=torch.int32),
+        common_attn_metadata=cad,
+    )
+
+    # draft argmax [1, 2] -> target [1 + 2, 2 + 5] = [3, 7]
+    torch.testing.assert_close(output, torch.tensor([[3], [7]], dtype=torch.int64))
+
+
+# Verifies every draft token in the multi-step loop is mapped, and that the
+# mapped (target-space) id is what feeds the next iteration's input_ids.
+def test_propose_multistep_maps_every_draft_id_and_feeds_mapped_input():
+    stub = make_eagle_stub(num_speculative_tokens=2, hidden_size=4)
+    _prime_for_first_pass(stub)
+    stub.runner = make_fake_runner(batch_bucket=4, num_reqs=2, is_prefill=False)
+    # target ids: 0, 3, 5, 8, 12
+    stub.draft_id_to_target_id = torch.tensor([0, 2, 3, 5, 8], dtype=torch.long)
+    calls: list[torch.Tensor] = []
+    logits_by_call = [
+        torch.tensor(
+            [
+                [0.0, 9.0, 1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 8.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0],
+            ],
+            dtype=torch.float32,
+        ),
+        torch.tensor(
+            [
+                [0.0, 1.0, 7.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0, 6.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0],
+            ],
+            dtype=torch.float32,
+        ),
+    ]
+
+    def model_executable(
+        *, input_ids, positions, hidden_states, inputs_embeds, token_indices_to_sample
+    ):
+        calls.append(input_ids.clone())
+        return (
+            hidden_states.reshape(-1, stub.hidden_size),
+            logits_by_call[len(calls) - 1],
+        )
+
+    stub.model_executable = model_executable
+    cad = make_common_attn_metadata(
+        query_start_loc=torch.tensor([0, 2, 4], dtype=torch.int32),
+        seq_lens=torch.tensor([10, 11], dtype=torch.int32),
+    )
+
+    output = RBLNEagleProposer.propose(
+        stub,
+        target_token_ids=torch.tensor([10, 11, 20, 21], dtype=torch.int32),
+        target_positions=torch.tensor([4, 5, 6, 7], dtype=torch.int64),
+        target_hidden_states=torch.arange(16, dtype=torch.float32).view(4, 4),
+        next_token_ids=torch.tensor([30, 31], dtype=torch.int32),
+        token_indices_to_sample=torch.tensor([1, 3], dtype=torch.int32),
+        common_attn_metadata=cad,
+    )
+
+    # step 1 draft argmax [1, 3] -> target [3, 8]; those must be fed back.
+    torch.testing.assert_close(calls[1][:2, 0], torch.tensor([3, 8], dtype=torch.int32))
+    # step 2 draft argmax [2, 4] -> target [5, 12]
+    torch.testing.assert_close(
+        output, torch.tensor([[3, 5], [8, 12]], dtype=torch.int64)
+    )
 
 
 # ---------------------------------------------------------------------------
