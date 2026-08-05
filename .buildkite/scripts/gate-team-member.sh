@@ -1,19 +1,6 @@
 #!/usr/bin/env bash
-# Policy gate (moved off the GHA check-team-member job): only run CI for a PR
-# whose author is on the rbln-sw `sw`/`fsw` team, or is a repo collaborator.
-#
-# SECURITY NOTE: this is a *policy* gate for same-repo PRs, NOT a fork boundary.
-# A forked PR controls this very script and could bypass it, so forked-PR builds
-# MUST stay disabled on the Obedients pipeline -- that setting is the real
-# security boundary. This gate just narrows same-repo (push-access) authors down
-# to the sw/fsw teams / collaborators.
-#
-# Runs in the bootstrap step BEFORE `buildkite-agent pipeline upload`, so an
-# untrusted author uploads no test steps at all:
-#   bash .buildkite/scripts/gate-team-member.sh && buildkite-agent pipeline upload ...
-#
-# Needs: GIT_PAT secret; curl + jq on the agent. BK env: BUILDKITE_PULL_REQUEST,
-# BUILDKITE_REPO.
+# vllm-rbln team-member policy gate (moved off the GHA check-team-member job).
+
 set -euo pipefail
 
 # Not a pull request (e.g. a dev-branch push) -> nothing to gate.

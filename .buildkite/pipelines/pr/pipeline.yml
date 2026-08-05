@@ -1,13 +1,5 @@
 # vllm-rbln PR pre-test gate (Obedients / Buildkite).
-#
-# The Obedients bootstrap step uploads THIS file. It runs the two cheap gates --
-# the team-member policy check and pre-commit lint -- in parallel, and only if
-# BOTH pass does it upload the heavy test pipeline (run-pytest.yml). So the NPU /
-# pytest steps never start for an untrusted author or a lint failure.
-#
-# (Forked-PR builds are disabled on this pipeline, so uploading repo-defined
-# steps is safe -- same-repo PRs are trusted. That setting is the real fork
-# boundary; the team-member step is a policy narrowing to the sw/fsw teams.)
+
 notify:
   - github_commit_status:
       context: "[OB] vllm-rbln PR CI"

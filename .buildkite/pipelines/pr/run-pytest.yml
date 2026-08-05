@@ -1,18 +1,4 @@
-# vllm-rbln PR CI on Obedients (Buildkite).
-#
-# Triggered from GitHub Actions (the rbln_trigger_* chain POSTs a build to the
-# Obedients create-build API on every PR) and replaces the GHA self-hosted
-# pytest jobs. On Obedients the shared HF cache mount
-# (/mnt/shared_data/.cache/huggingface) is writable and the devtools container
-# is provided, so none of the GHA HF_HOME permission / offline workarounds are
-# needed -- cf. rebel_compiler .buildkite/pipelines/vllm-ci-v2.
-#
-# Each step builds its own uv env at job start (uv sync from the lock); the uv
-# download cache is carried across jobs by the shared /mnt/uv_cache mount.
-#
-# NPU reservation uses the top-level `npu:` key (an Obedients extension), NOT a
-# queue named "npu". Counts mirror the old GHA runner classes
-# (ca22-1/4/8 -> 1/4/8). CPU-only suites run on the `udc` queue with no NPU.
+# vllm-rbln pytest on Buildkite.
 
 env:
   UV_CACHE_DIR: "/mnt/uv_cache"
