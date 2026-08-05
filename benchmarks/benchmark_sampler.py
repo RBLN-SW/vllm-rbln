@@ -136,11 +136,15 @@ def run_benchmark(
     warmup_iters: int,
     benchmark_iters: int,
 ):
-    torch._dynamo.config.recompile_limit = len(WARM_UP_CONFIGS)
     sampler = RBLNSampler()
     performance_ctx = _PerformanceContext("SAMPLER")
 
-    logits = _create_logits(batch_size, vocab_size)
+    # The sampler scales logits in place, so every call needs fresh values --
+    # reusing one tensor would divide it by the temperature again and again until
+    # it overflows. A real step gets fresh logits from `compute_logits`; here the
+    # restore stands in for that, and stays outside the timed span.
+    reference_logits = _create_logits(batch_size, vocab_size)
+    logits = reference_logits.clone()
 
     # warmup: iterate over all WARM_UP_CONFIGS, matching actual vllm-rbln behavior
     for _ in range(warmup_iters):
@@ -151,6 +155,7 @@ def run_benchmark(
                 vocab_size=vocab_size,
                 device=logits.device,
             )
+            logits.copy_(reference_logits)
             sampler(logits, sampling_metadata)
 
     print(f"Running benchmark: {benchmark_config['name']}")
@@ -170,6 +175,7 @@ def run_benchmark(
     # that follows a model span, and this benchmark runs the sampler standalone; the
     # stats are therefore reported under the "DECODE + SAMPLE" label.
     for _ in range(benchmark_iters):
+        logits.copy_(reference_logits)
         with performance_ctx.profile_model(is_prefill=False):
             sampler(logits, sampling_metadata)
     performance_ctx.print_stats()

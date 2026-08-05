@@ -107,12 +107,6 @@ class RBLNTopKTopPSampler(nn.Module):
             rbln_top_k_top_p_sample, compile_context
         )
 
-    @torch.compiler.disable
-    def top_k_top_p_sample(
-        self, logits: torch.Tensor, k: torch.Tensor | None, p: torch.Tensor | None
-    ) -> torch.Tensor:
-        return self._compiled_rbln_topk_topp_sampler(logits, k, p)
-
     def forward(
         self,
         logits: torch.Tensor,
@@ -127,7 +121,7 @@ class RBLNTopKTopPSampler(nn.Module):
                 "per-request generators. Ignoring generators."
             )
 
-        return self.top_k_top_p_sample(logits, k, p), None
+        return self._compiled_rbln_topk_topp_sampler(logits, k, p), None
 
 
 class RBLNSampler(VLLMSampler):
@@ -161,7 +155,6 @@ class RBLNSampler(VLLMSampler):
             rbln_greedy_sample, compile_context
         )
 
-    @torch.compiler.disable
     def greedy_sample(self, logits: torch.Tensor) -> torch.Tensor:
         return self._compiled_greedy_sample(logits)
 
@@ -222,7 +215,6 @@ class RBLNSampler(VLLMSampler):
         )
         return random_sampled, processed_logprobs
 
-    @torch.compiler.disable
     def apply_penalties(
         self,
         logits: torch.Tensor,
@@ -313,21 +305,19 @@ class RBLNSampler(VLLMSampler):
         all_random: bool,
     ) -> torch.Tensor:
         # NOTE:
-        # in-place division triggers buffer key error
-        # in torchinductor
-        # NOTE:
         # Greedy requests use a small temperature (1e-3) so softmax collapses
         # to a near one-hot at argmax. _SAMPLING_EPS (1e-5) is too small here —
         # it pushes logits past softmax's safe exp range and overflows.
         if not all_random:
             temperature = torch.where(temperature < _SAMPLING_EPS, 1e-3, temperature)
         temperature = temperature.to(logits.dtype)
-        return logits.div(temperature.unsqueeze(dim=1))
+        # Divide in place, as upstream does: allocating a second logits-sized
+        # tensor here costs more than the division itself. Rows past num_reqs of
+        # the padded buffer must therefore carry temperature 1.0 -- see
+        # RBLNInputBatch._make_sampling_metadata_rbln.
+        return logits.div_(temperature.unsqueeze(dim=1))
 
-    # NOTE(eunji.lee):
-    # mark_unbacked torch method should be called outside of torch.compile
     @staticmethod
-    @torch.compiler.disable
     def gather_logprobs(
         logprobs: torch.Tensor,
         num_logprobs: int,
@@ -360,12 +350,6 @@ class RBLNSampler(VLLMSampler):
         token_logprobs = logprobs.gather(-1, token_ids)
 
         # Compute the ranks of the actual token.
-        # Avoid 0/1 specialization recompile on the batch dimension
-        # of the compiled batched_count_greater_than. mark_unbacked makes
-        # the size fully symbolic so dynamo doesn't specialize when
-        # batch_size transitions from 1 to >=2.
-        # torch._dynamo.decorators.mark_unbacked(logprobs, 0)
-        # torch._dynamo.decorators.mark_unbacked(token_logprobs, 0)
         token_ranks = batched_count_greater_than(logprobs, token_logprobs)
 
         # Concatenate together with the topk.

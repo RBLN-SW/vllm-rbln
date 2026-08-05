@@ -17,9 +17,10 @@ import torch
 def batched_count_greater_than(x: torch.Tensor, values: torch.Tensor) -> torch.Tensor:
     """
     Counts elements in each row of x that are greater than the corresponding
-    value in values.  Use torch.compile to generate an optimized kernel for
-    this function. otherwise, it will create additional copies of the input
-    tensors and cause memory issues.
+    value in values.
+
+    Nothing compiles this any more, so the comparison materializes a mask the
+    size of x. That only happens when a request asks for logprobs.
 
     Args:
         x (torch.Tensor): A 2D tensor of shape (batch_size, n_elements).
