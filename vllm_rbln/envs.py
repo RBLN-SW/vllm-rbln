@@ -15,11 +15,11 @@
 import os
 from typing import TYPE_CHECKING
 
-from vllm.envs import environment_variables as vllm_envs
-
-from vllm_rbln.logger import init_logger
-
-logger = init_logger(__name__)
+# NOTE(eunji.lee): Keep this module a leaf -- import `vllm` and `vllm_rbln` only
+# inside functions. Touching `vllm` resolves the platform plugin, which imports
+# `vllm_rbln.platform`, which reads `VLLM_RBLN_*` from here; were that to happen
+# while this module's own imports ran, it would hit a half-initialized module.
+# `vllm/envs.py` is a leaf upstream for the same reason.
 
 if TYPE_CHECKING:
     # ====================================================================
@@ -119,7 +119,9 @@ def get_num_devices_per_local_rank() -> int:
     legacy_value = os.environ.get("VLLM_RBLN_TP_SIZE")
 
     if legacy_value is not None:
-        logger.warning_once(
+        from vllm_rbln.logger import init_logger
+
+        init_logger(__name__).warning_once(
             "VLLM_RBLN_TP_SIZE is deprecated and will be removed in a future "
             "release. Please use VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK instead."
         )
@@ -191,7 +193,6 @@ def use_auto_port() -> bool:
 
 # extended environments
 environment_variables = {
-    **vllm_envs,
     # ====================================================================
     # Path selector: the value of VLLM_RBLN_USE_VLLM_MODEL splits the model
     # path in two, which decides which variables below take effect.
@@ -389,11 +390,21 @@ def __getattr__(name: str):
     # lazy evaluation of environment variables
     if name in environment_variables:
         return environment_variables[name]()
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    import vllm.envs as vllm_envs
+
+    try:
+        return getattr(vllm_envs, name)
+    except AttributeError:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
 
 
 def __dir__():
-    return list(environment_variables.keys())
+    import vllm.envs as vllm_envs
+
+    return sorted({*environment_variables, *dir(vllm_envs)})
 
 
-vllm_envs.update(environment_variables)
+def publish_to_vllm_envs() -> None:
+    from vllm.envs import environment_variables as vllm_envs
+
+    vllm_envs.update(environment_variables)
