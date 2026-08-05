@@ -23,6 +23,17 @@ import pytest
 from vllm_rbln.v1.worker import mega_cache
 
 
+@pytest.fixture(autouse=True)
+def _unshadow_rbln_envs():
+    # monkeypatch.setattr(envs, NAME, ...) plants NAME statically on undo, which
+    # permanently bypasses the __getattr__ that reads os.environ (test_medusa.py).
+    import vllm_rbln.envs as rbln_envs
+
+    for name in mega_cache._RBLN_COMPILE_ENV:
+        rbln_envs.__dict__.pop(name, None)
+    yield
+
+
 class TestRebelMajorMinor:
     @pytest.mark.parametrize(
         "version,expected",
@@ -155,8 +166,7 @@ class TestCompileEnvFactors:
         assert mega_cache._compile_env_factors() == mega_cache._compile_env_factors()
 
     def test_allowlist_names_all_resolve(self):
-        # An allowlist entry that no longer names a real var reads as None and
-        # silently stops keying the bundle, so pin the names here.
+        # A renamed entry reads as None and silently stops keying the bundle.
         import vllm_rbln.envs as rbln_envs
 
         unresolved = [
@@ -193,8 +203,7 @@ class TestCompileEnvFactors:
         assert a != b
 
     def test_strict_mode_invalidates(self, monkeypatch):
-        # A compile option rebel's per-blob key cannot see, so the bundle
-        # signature is the only thing separating the two artifacts.
+        # A compile option rebel's per-blob key cannot see.
         monkeypatch.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "0")
         off = mega_cache._compile_env_factors()
         monkeypatch.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
@@ -202,8 +211,7 @@ class TestCompileEnvFactors:
         assert off != on
 
     def test_sampler_flag_invariant(self, monkeypatch):
-        # Sampler graphs are compiled with use_cache=False, so they never enter
-        # the bundle — toggling the flag must not discard a valid model bundle.
+        # Sampler graphs compile with use_cache=False, so they never enter it.
         monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1")
         on = mega_cache._compile_env_factors()
         monkeypatch.setenv("VLLM_RBLN_SAMPLER", "0")
@@ -241,8 +249,7 @@ class TestCompileEnvFactors:
         ],
     )
     def test_unrelated_env_invariant(self, monkeypatch, name, value):
-        # Deployment details and other backends' flags cannot reach an rbln
-        # graph; keying on vLLM's compile_factors() let each discard the bundle.
+        # Cannot reach an rbln graph; compile_factors() let each discard it.
         before = mega_cache._compile_env_factors()
         monkeypatch.setenv(name, value)
         assert mega_cache._compile_env_factors() == before
@@ -342,8 +349,6 @@ class TestBundlePathEdges:
         path = mega_cache.bundle_path(model, "sig")
         # <root>/rbln/<model-seg>/<sig>/rank0/mega_cache.bin
         model_seg = path.split(os.sep)[-4]
-        # One component that cannot climb out of the cache root: separators are
-        # substituted, and the segment is never bare "." or "..".
         assert model_seg not in (".", "..")
         assert re.fullmatch(r"[A-Za-z0-9._-]+", model_seg), model_seg
         root = os.path.join(mega_cache.cache_root(), "")

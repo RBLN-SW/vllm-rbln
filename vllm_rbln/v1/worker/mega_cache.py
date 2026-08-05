@@ -53,8 +53,7 @@ def _rebel_major_minor(version: str | None = None) -> str:
 
 
 # Allowlist, not compile_factors(): that walks ~240 vLLM env vars, so host paths
-# and ports alone discarded the bundle. Graph-shaping vars need no entry — rebel's
-# per-blob key already covers those; these are the compile knobs it cannot see.
+# and ports alone discarded the bundle.
 _RBLN_COMPILE_ENV = frozenset(
     {
         "VLLM_RBLN_USE_VLLM_MODEL",
@@ -120,12 +119,11 @@ def _stable_compute_hash(vllm_config) -> str:
 
 
 def config_signature(vllm_config) -> str:
-    """Hash of everything that changes the compiled graphs, keying the bundle.
+    """vLLM config hash + rbln compile env + rebel major.minor.
 
-    vLLM config hash + rbln compile env + rebel major.minor. Ports are blanked and
-    the env part is an allowlist, so all TP/DP ranks share one signature across
-    launches and hosts; the rank subdir isolates their shards. TP/DP degree still
-    keys the bundle via parallel_config.compute_hash, only the rank does not.
+    Launch- and host-stable, and shared by all TP/DP ranks; the rank subdir
+    isolates their shards. TP/DP degree still keys the bundle via
+    parallel_config.compute_hash -- only the rank does not.
     """
     cfg = _stable_compute_hash(vllm_config)
     env = _compile_env_factors()
