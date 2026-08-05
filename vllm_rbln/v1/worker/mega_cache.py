@@ -52,50 +52,44 @@ def _rebel_major_minor(version: str | None = None) -> str:
     return f"{match.group(1)}.{match.group(2)}" if match else "unknown"
 
 
-# Per-worker identity that must NOT enter the bundle signature: the rank subdir
-# separates workers and DP replicas compile identically, so the DP-degree lives
-# in parallel_config.compute_hash, not the per-worker index. vLLM's
-# compile_factors already drops LOCAL_RANK / ports but keeps VLLM_DP_RANK*.
-_PER_WORKER_ENV_DROP = frozenset({"VLLM_DP_RANK", "VLLM_DP_RANK_LOCAL"})
-
-# rbln vars that never change the compiled graph (runtime, scheduling, KV
-# transfer). COMPILE_ONLY must stay here so a CPU-compiled bundle hits on the
-# NPU serving host.
-_RUNTIME_ENV_DROP = frozenset(
+# Allowlist, not compile_factors(): that walks ~240 vLLM env vars, so host paths
+# and ports alone discarded the bundle. Graph-shaping vars need no entry — rebel's
+# per-blob key already covers those; these are the compile knobs it cannot see.
+_RBLN_COMPILE_ENV = frozenset(
     {
-        "VLLM_RBLN_ENABLE_WARM_UP",
-        "VLLM_RBLN_METRICS",
-        "VLLM_RBLN_METRICS_FILE",
-        "VLLM_RBLN_NUMA",
-        "VLLM_RBLN_PROFILER",
-        "VLLM_RBLN_AUTO_PORT",
-        "VLLM_RBLN_SUB_BLOCK_CACHE",
-        "VLLM_RBLN_SORT_BATCH",
-        "VLLM_RBLN_DISABLE_OFFLOAD",
-        "VLLM_RBLN_NIXL_SWA_VIEW_OPT",
-        "VLLM_RBLN_COMPILE_ONLY",
-        # Sampler graphs are compiled with use_cache=False (#798), so they never
-        # enter the bundle and this flag cannot change its contents. Model graphs
-        # compile before the sampler in warmup, so their keys are unaffected too.
-        "VLLM_RBLN_SAMPLER",
+        "VLLM_RBLN_USE_VLLM_MODEL",
+        "VLLM_RBLN_COMPILE_MODEL",
+        "VLLM_RBLN_COMPILE_STRICT_MODE",
+        "VLLM_RBLN_USE_DEVICE_TENSOR",
+        "VLLM_RBLN_ENFORCE_MODEL_FP32",
+        "VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK",
+        "VLLM_RBLN_NUM_RAY_NODES",
+        "VLLM_RBLN_FLASH_CAUSAL_ATTN",
+        "VLLM_RBLN_BATCH_ATTN_OPT",
+        "VLLM_RBLN_USE_CUSTOM_KERNEL",
+        "VLLM_RBLN_SPECIALIZE_MOE_DECODE",
+        "VLLM_RBLN_USE_MOE_TOKENS_MASK",
+        "VLLM_RBLN_DISPATCH_ALL2ALL",
+        "VLLM_RBLN_COMBINE_ALL2ALL",
+        "VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY",
+        "VLLM_RBLN_DECODE_BATCH_BUCKET_MIN",
+        "VLLM_RBLN_DECODE_BATCH_BUCKET_STEP",
+        "VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT",
+        "VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS",
     }
 )
 
 
 def _compile_env_factors() -> str:
-    """vLLM's worker-aligned compile env hash (rbln vars are merged into that
-    registry by importing vllm_rbln.envs; per-worker and runtime-only vars are
-    dropped so all ranks share one signature)."""
-    import vllm.envs as vllm_envs
-    from vllm.config.utils import hash_factors
+    """Hash of the rbln compile env (allowlist above), rank- and host-invariant."""
+    from vllm.config.utils import hash_factors, normalize_value
 
-    # Import for the side effect: vllm_rbln.envs merges VLLM_RBLN_* into vLLM's
-    # environment_variables registry, which is what compile_factors() walks.
-    import vllm_rbln.envs  # noqa: F401
+    import vllm_rbln.envs as rbln_envs
 
-    factors = vllm_envs.compile_factors()
-    for name in _PER_WORKER_ENV_DROP | _RUNTIME_ENV_DROP:
-        factors.pop(name, None)
+    factors: dict[str, object] = {
+        name: normalize_value(getattr(rbln_envs, name, None))
+        for name in _RBLN_COMPILE_ENV
+    }
     return hash_factors(factors)
 
 
@@ -128,10 +122,10 @@ def _stable_compute_hash(vllm_config) -> str:
 def config_signature(vllm_config) -> str:
     """Hash of everything that changes the compiled graphs, keying the bundle.
 
-    vLLM config hash + vLLM's worker-aligned compile env factors + rebel
-    major.minor. Env factors drop per-worker vars (LOCAL_RANK, ports, ...) and
-    per-launch open ports are blanked, so all TP/DP ranks across launches share
-    one signature and the rank subdir isolates their shards.
+    vLLM config hash + rbln compile env + rebel major.minor. Ports are blanked and
+    the env part is an allowlist, so all TP/DP ranks share one signature across
+    launches and hosts; the rank subdir isolates their shards. TP/DP degree still
+    keys the bundle via parallel_config.compute_hash, only the rank does not.
     """
     cfg = _stable_compute_hash(vllm_config)
     env = _compile_env_factors()

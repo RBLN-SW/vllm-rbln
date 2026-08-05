@@ -147,14 +147,24 @@ class TestConfigSignature:
 
 
 class TestCompileEnvFactors:
-    """_compile_env_factors uses vLLM's worker-aligned compile_factors."""
+    """_compile_env_factors keys on an rbln allowlist, not vLLM's ~240 factors."""
 
     def test_deterministic(self):
         assert mega_cache._compile_env_factors() == mega_cache._compile_env_factors()
 
+    def test_allowlist_names_all_resolve(self):
+        # An allowlist entry that no longer names a real var reads as None and
+        # silently stops keying the bundle, so pin the names here.
+        import vllm_rbln.envs as rbln_envs
+
+        unresolved = [
+            name
+            for name in sorted(mega_cache._RBLN_COMPILE_ENV)
+            if getattr(rbln_envs, name, None) is None
+        ]
+        assert not unresolved
+
     def test_rank_invariant(self, monkeypatch):
-        # per-worker vars (LOCAL_RANK / CUDA_VISIBLE_DEVICES) are in vLLM's
-        # ignored_factors → all ranks must hash to the same env factors.
         monkeypatch.setenv("LOCAL_RANK", "0")
         monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
         r0 = mega_cache._compile_env_factors()
@@ -164,8 +174,7 @@ class TestCompileEnvFactors:
         assert r0 == r3
 
     def test_dp_rank_invariant(self, monkeypatch):
-        # VLLM_DP_RANK is NOT in vLLM's ignored_factors; we drop it ourselves so
-        # DP replicas (identical graphs) share one bundle signature.
+        # DP replicas compile identical graphs → one bundle signature.
         monkeypatch.setenv("VLLM_DP_RANK", "0")
         monkeypatch.setenv("VLLM_DP_RANK_LOCAL", "0")
         d0 = mega_cache._compile_env_factors()
@@ -175,24 +184,84 @@ class TestCompileEnvFactors:
         assert d0 == d7
 
     def test_compile_relevant_env_invalidates(self, monkeypatch):
-        import vllm_rbln.envs  # noqa: F401  (merges rbln vars into vLLM registry)
-
         monkeypatch.setenv("VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY", "exponential")
         a = mega_cache._compile_env_factors()
         monkeypatch.setenv("VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY", "linear")
         b = mega_cache._compile_env_factors()
         assert a != b
 
+    def test_strict_mode_invalidates(self, monkeypatch):
+        # A compile option rebel's per-blob key cannot see, so the bundle
+        # signature is the only thing separating the two artifacts.
+        monkeypatch.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "0")
+        off = mega_cache._compile_env_factors()
+        monkeypatch.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
+        on = mega_cache._compile_env_factors()
+        assert off != on
+
     def test_sampler_flag_invariant(self, monkeypatch):
         # Sampler graphs are compiled with use_cache=False, so they never enter
         # the bundle — toggling the flag must not discard a valid model bundle.
-        import vllm_rbln.envs  # noqa: F401
-
         monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1")
         on = mega_cache._compile_env_factors()
         monkeypatch.setenv("VLLM_RBLN_SAMPLER", "0")
         off = mega_cache._compile_env_factors()
         assert on == off
+
+    def test_host_invariant(self, monkeypatch):
+        # A bundle compiled on one host/user must hit on the serving host.
+        monkeypatch.setenv("HOME", "/home/someone")
+        monkeypatch.setenv("VLLM_CONFIG_ROOT", "/home/someone/.config/vllm")
+        monkeypatch.setenv("VLLM_XLA_CACHE_PATH", "/home/someone/.cache/xla")
+        a = mega_cache._compile_env_factors()
+        monkeypatch.setenv("HOME", "/root")
+        monkeypatch.setenv("VLLM_CONFIG_ROOT", "/root/.config/vllm")
+        monkeypatch.setenv("VLLM_XLA_CACHE_PATH", "/root/.cache/xla")
+        assert mega_cache._compile_env_factors() == a
+
+    @pytest.mark.parametrize(
+        "name,value",
+        [
+            ("VLLM_NIXL_SIDE_CHANNEL_PORT", "5999"),
+            ("VLLM_MOONCAKE_BOOTSTRAP_PORT", "9999"),
+            ("VLLM_SYSTEM_START_DATE", "2026-08-05"),
+            ("VLLM_API_KEY", "sk-secret"),
+            ("VLLM_RPC_TIMEOUT", "20000"),
+            ("VLLM_RAY_BUNDLE_INDICES", "0,1"),
+            ("VLLM_USAGE_SOURCE", "staging"),
+            ("VLLM_TARGET_DEVICE", "rocm"),
+            ("VLLM_ROCM_USE_AITER", "1"),
+            ("VLLM_USE_DEEP_GEMM", "0"),
+            ("VLLM_TPU_MOST_MODEL_LEN", "4096"),
+            ("VLLM_XPU_ENABLE_XPU_GRAPH", "1"),
+            ("VLLM_GC_DEBUG", "1"),
+            ("VLLM_TRACE_FUNCTION", "1"),
+        ],
+    )
+    def test_unrelated_env_invariant(self, monkeypatch, name, value):
+        # Deployment details and other backends' flags cannot reach an rbln
+        # graph; keying on vLLM's compile_factors() let each discard the bundle.
+        before = mega_cache._compile_env_factors()
+        monkeypatch.setenv(name, value)
+        assert mega_cache._compile_env_factors() == before
+
+    def test_rbln_runtime_env_invariant(self, monkeypatch):
+        for name in (
+            "VLLM_RBLN_ENABLE_WARM_UP",
+            "VLLM_RBLN_METRICS",
+            "VLLM_RBLN_NUMA",
+            "VLLM_RBLN_AUTO_PORT",
+            "VLLM_RBLN_SUB_BLOCK_CACHE",
+            "VLLM_RBLN_SORT_BATCH",
+            "VLLM_RBLN_DISABLE_OFFLOAD",
+            "VLLM_RBLN_NIXL_SWA_VIEW_OPT",
+            # must stay out so a CPU-compiled bundle hits on the NPU host
+            "VLLM_RBLN_COMPILE_ONLY",
+        ):
+            before = mega_cache._compile_env_factors()
+            monkeypatch.setenv(name, "1")
+            assert mega_cache._compile_env_factors() == before, name
+            monkeypatch.delenv(name)
 
 
 class TestConfigSignatureRealEnv:
