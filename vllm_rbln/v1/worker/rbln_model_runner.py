@@ -1361,13 +1361,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             num_reqs = self.input_batch.num_reqs
             req_ids = self.input_batch.req_ids
 
-            # NOTE(RBLN): Cross-DP no-spec reconciliation, run AFTER the empty
-            # early-return and BEFORE _prepare_inputs / _determine_batch_padding.
-            no_spec_reduced = self._reduce_cross_dp_no_spec(
-                scheduler_output.step_no_spec_required
-            )
-            self._apply_cross_dp_no_spec(scheduler_output, no_spec_reduced)
-
             tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
             num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
 
@@ -2771,34 +2764,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 self.kv_cache_bases,
                 self.kv_cache_view_infos,
             )
-
-    def _reduce_cross_dp_no_spec(self, local_no_spec: bool) -> bool:
-        """OR-reduce the per-rank no-spec election across the DP group"""
-        if self.parallel_config.data_parallel_size <= 1 or self.num_spec_tokens <= 0:
-            return False
-        return bool(
-            RBLNDPMetadata.num_tokens_across_dp(
-                1 if local_no_spec else 0,
-                self.parallel_config.data_parallel_size,
-                self.parallel_config.data_parallel_rank,
-            )
-            .sum()
-            .item()
-        )
-
-    def _apply_cross_dp_no_spec(
-        self, scheduler_output: RBLNSchedulerOutput, reduced: bool
-    ) -> None:
-        """Force this rank to no-spec (qlen=1) when the cross-DP OR-reduce voted
-        no-spec but this rank did not elect it locally."""
-        if not reduced or scheduler_output.step_no_spec_required or self.is_prefill:
-            return
-        for req_id in list(scheduler_output.scheduled_spec_decode_tokens.keys()):
-            scheduler_output.num_scheduled_tokens[req_id] = 1
-        scheduler_output.scheduled_spec_decode_tokens = {}
-        scheduler_output.total_num_scheduled_tokens = sum(
-            scheduler_output.num_scheduled_tokens.values()
-        )
 
     def _determine_batch_padding(
         self,
