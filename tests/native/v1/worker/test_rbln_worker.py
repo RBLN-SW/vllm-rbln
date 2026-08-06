@@ -38,6 +38,7 @@ def _make_vllm_config(
     data_parallel_size=1,
     data_parallel_rank=0,
     world_size_across_dp=1,
+    assigned_physical_gpu_ids=None,
     quantization=None,
     enforce_eager=False,
     profiler=None,
@@ -51,6 +52,7 @@ def _make_vllm_config(
             data_parallel_size=data_parallel_size,
             data_parallel_rank=data_parallel_rank,
             world_size_across_dp=world_size_across_dp,
+            assigned_physical_gpu_ids=assigned_physical_gpu_ids,
             disable_custom_all_reduce=False,
         ),
         model_config=SimpleNamespace(
@@ -108,6 +110,7 @@ def make_worker(monkeypatch):
         data_parallel_size=1,
         data_parallel_rank=0,
         world_size_across_dp=None,
+        assigned_physical_gpu_ids=None,
         num_devices=1,
         num_ray_nodes=1,
         has_torch_rbln=False,
@@ -120,6 +123,7 @@ def make_worker(monkeypatch):
             data_parallel_size=data_parallel_size,
             data_parallel_rank=data_parallel_rank,
             world_size_across_dp=wsd,
+            assigned_physical_gpu_ids=assigned_physical_gpu_ids,
         )
         monkeypatch.setattr(WorkerBase, "__init__", _fake_super_init)
         monkeypatch.setattr(
@@ -256,6 +260,43 @@ class TestInitDeviceEnv:
         os.environ["RBLN_DEVICES"] = "a,b,c,d"
         with pytest.raises(ValueError):
             make_worker(world_size=4, local_rank=0)
+
+    @pytest.mark.parametrize("dp_rank, assigned", [(0, [4]), (2, [6])])
+    def test_dp_mapping_wins_over_env(self, make_worker, dp_rank, assigned):
+        # Under DP the env var holds the whole deployment; vLLM 0.24 puts this
+        # rank's share on the config instead.
+        os.environ["RBLN_DEVICES"] = "4,5,6,7"
+        make_worker(
+            world_size=1,
+            data_parallel_size=4,
+            data_parallel_rank=dp_rank,
+            assigned_physical_gpu_ids=assigned,
+        )
+        assert os.environ["RBLN_DEVICES"] == str(assigned[0])
+
+    def test_dp_mapping_expands_by_num_devices(self, make_worker):
+        os.environ["RBLN_DEVICES"] = "0,1,2,3"
+        make_worker(
+            world_size=2,
+            data_parallel_size=2,
+            data_parallel_rank=1,
+            assigned_physical_gpu_ids=[2, 3],
+            num_devices=2,
+            local_rank=1,
+        )
+        assert os.environ["RBLN_DEVICES"] == "6,7"
+
+    def test_no_mapping_falls_back_to_env(self, make_worker):
+        os.environ["RBLN_DEVICES"] = "0,1"
+        make_worker(world_size=2, data_parallel_size=2, data_parallel_rank=1)
+        assert os.environ["RBLN_DEVICES"] == "0"
+
+    def test_dp_mapping_wrong_count_raises(self, make_worker):
+        os.environ["RBLN_DEVICES"] = "4,5,6,7"
+        with pytest.raises(AssertionError):
+            make_worker(
+                world_size=1, data_parallel_size=4, assigned_physical_gpu_ids=[4, 5]
+            )
 
 
 def _params():

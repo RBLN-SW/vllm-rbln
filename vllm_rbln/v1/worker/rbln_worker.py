@@ -135,15 +135,16 @@ class RBLNWorker(WorkerBase):
             end_idx = start_idx + num_devices
             selected_devices = ",".join(device_ids[start_idx:end_idx])
         else:
-            device_ids = os.environ[env_var].split(",")
-            # vLLM 0.24 took data parallelism out of `world_size`, so an explicit
-            # device list for a DP deployment carries one entry per DP rank per
-            # local rank. Slice out this rank's share; a list already sized to
-            # `world_size` is left alone.
-            dp_size = self.parallel_config.data_parallel_size
-            if dp_size > 1 and len(device_ids) == world_size * dp_size:
-                base = self.parallel_config.data_parallel_rank * world_size
-                device_ids = device_ids[base : base + world_size]
+            # vLLM 0.24 stopped narrowing the device-control env var per DP rank
+            # and puts the mapping on the config instead, so under DP the env var
+            # now holds the whole deployment's list (vllm/v1/engine/utils.py,
+            # set_assigned_physical_gpu_ids_for_dp_rank). getattr: older vLLM has
+            # no such field.
+            assigned = getattr(self.parallel_config, "assigned_physical_gpu_ids", None)
+            if assigned:
+                device_ids = [str(i) for i in assigned]
+            else:
+                device_ids = os.environ[env_var].split(",")
             assert len(device_ids) == world_size, (
                 f"device_ids: {device_ids} should have device count: {world_size}"
             )
