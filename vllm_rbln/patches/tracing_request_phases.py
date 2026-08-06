@@ -78,6 +78,7 @@ from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.v1.engine.output_processor import OutputProcessor
 
 from vllm_rbln.patches import register_patch
+from vllm_rbln.utils.tracing import derive_request_span_id, pinned_span_id
 
 if TYPE_CHECKING:
     from vllm.v1.engine import EngineCoreOutput
@@ -252,14 +253,34 @@ def _start_request_span(
         return None
 
     tracer = otel_trace.get_tracer(__name__)
-    span = tracer.start_span(
-        name="llm_request",
-        context=context,
-        start_time=start_time,
-        kind=SpanKind.SERVER,
-    )
+    with pinned_span_id(_predictable_span_id(context)):
+        span = tracer.start_span(
+            name="llm_request",
+            context=context,
+            start_time=start_time,
+            kind=SpanKind.SERVER,
+        )
     span.set_attributes(attributes)
     return span
+
+
+def _predictable_span_id(context: Any) -> int | None:
+    """The id other processes will guess for this ``llm_request``.
+
+    ``None`` for a request that arrived without a trace context — there is
+    nothing to derive from, and no other process could derive it either, so a
+    random id is the honest answer.
+    """
+    try:
+        from opentelemetry import trace as otel_trace
+    except ImportError:
+        return None
+    if context is None:
+        return None
+    caller = otel_trace.get_current_span(context).get_span_context()
+    if not caller.is_valid:
+        return None
+    return derive_request_span_id(caller.trace_id, caller.span_id)
 
 
 def _emit_phase_spans(request_span: Any, metrics: Any, anchor_ns: int) -> None:

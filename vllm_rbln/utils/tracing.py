@@ -30,12 +30,113 @@ reserved constant describes, so both are emitted.
 
 from __future__ import annotations
 
+import contextlib
 import functools
+import hashlib
+import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any, TypeVar
 
 F = TypeVar("F", bound=Callable[..., Any])
+
+#: Set by :func:`pinned_span_id` and consumed by the patched OTel id generator
+#: (``vllm_rbln.patches.tracing_span_ids``). Thread-local because the frontend
+#: finishes several requests concurrently and each pins its own id.
+_PINNED_SPAN_ID = threading.local()
+
+
+def take_pinned_span_id() -> int | None:
+    """Consume the pinned span id for this thread, if one is waiting.
+
+    Consumed rather than read so a pin can only ever apply to the single span it
+    was set for; anything else generated on this thread gets a random id.
+    """
+    pinned = getattr(_PINNED_SPAN_ID, "value", None)
+    if pinned is not None:
+        _PINNED_SPAN_ID.value = None
+    return pinned
+
+
+@contextlib.contextmanager
+def pinned_span_id(span_id: int | None):
+    """Force the next span created on this thread to use ``span_id``.
+
+    OTel has no per-call span id override — ``Tracer.start_span`` asks its id
+    generator and that is that. Pinning is how ``llm_request`` gets an id that a
+    *different process* can predict; see :func:`derive_request_span_id`.
+    """
+    if span_id is None:
+        yield
+        return
+    _PINNED_SPAN_ID.value = span_id
+    try:
+        yield
+    finally:
+        _PINNED_SPAN_ID.value = None
+
+
+def derive_request_span_id(trace_id: int, parent_span_id: int) -> int:
+    """The span id ``llm_request`` will have, computed from its trace context.
+
+    ``llm_request`` is created in the API-server process when the request
+    finishes, with a span id nothing else can know. The engine-core and worker
+    processes need it *while the request runs* — a KV-transfer or cache span
+    that cannot name its parent ends up a sibling of the request it belongs to,
+    which reads in a waterfall as if it ran alongside the request rather than
+    inside it.
+
+    So both sides compute the id instead of communicating it. The inputs are the
+    two things every side already has from the inbound ``traceparent``: the trace
+    id, and the span id of the caller (the sidecar leg). Including the caller
+    matters — prefill and decode share a trace but are different legs with
+    different ``llm_request`` spans, and the trace id alone would collide them.
+
+    SHA-256 rather than anything cheaper because the value must agree across
+    processes; ``hash()`` is per-process salted.
+    """
+    digest = hashlib.sha256(
+        trace_id.to_bytes(16, "big")
+        + parent_span_id.to_bytes(8, "big")
+        + b"vllm.llm_request"
+    ).digest()
+    # 0 is INVALID_SPAN_ID; the odds are astronomical but a trace silently
+    # losing its parentage is not worth leaving to chance.
+    return int.from_bytes(digest[:8], "big") or 1
+
+
+def request_span_context(trace_headers: Mapping[str, str] | None):
+    """Context whose current span is the request's ``llm_request``.
+
+    Returns ``None`` when the request carries no usable trace context, which
+    callers treat as "leave OTel's default parent alone".
+
+    The parent is a non-recording span: this process is not the one that emits
+    ``llm_request``, it only needs to point at it.
+    """
+    if not trace_headers:
+        return None
+    try:
+        from opentelemetry import trace as otel_trace
+        from vllm.tracing import extract_trace_context
+    except ImportError:
+        return None
+
+    context = extract_trace_context(trace_headers)
+    if context is None:
+        return None
+    caller = otel_trace.get_current_span(context).get_span_context()
+    if not caller.is_valid:
+        return None
+
+    request_span = otel_trace.SpanContext(
+        trace_id=caller.trace_id,
+        span_id=derive_request_span_id(caller.trace_id, caller.span_id),
+        is_remote=True,
+        trace_flags=caller.trace_flags,
+        trace_state=caller.trace_state,
+    )
+    return otel_trace.set_span_in_context(otel_trace.NonRecordingSpan(request_span))
 
 
 def instrument_with_latency(*, span_name: str, attribute: str) -> Callable[[F], F]:

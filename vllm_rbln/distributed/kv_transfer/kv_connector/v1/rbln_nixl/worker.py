@@ -42,7 +42,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
     compute_tp_mapping,
 )
-from vllm.tracing import extract_trace_context, instrument_manual
+from vllm.tracing import instrument_manual
 from vllm.v1.kv_cache_interface import (
     MambaSpec,
     SlidingWindowSpec,
@@ -51,6 +51,7 @@ from vllm.v1.kv_cache_interface import (
 
 import vllm_rbln.envs as envs
 from vllm_rbln.logger import init_logger
+from vllm_rbln.utils.tracing import request_span_context
 
 if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -110,7 +111,11 @@ def _traced_remote_fetch(func: Callable) -> Callable:
     it entirely. It lives here rather than in ``vllm_rbln.utils.tracing`` because
     it reads worker state (the request trace headers, the in-flight bookkeeping).
 
-    ``extract_trace_context`` returns ``None`` for an untraced request, which
+    The parent is the request's own ``llm_request`` span, whose id this process
+    derives rather than receives (``request_span_context``) — a read is part of
+    serving the request, not something that ran alongside it.
+
+    ``request_span_context`` returns ``None`` for an untraced request, which
     leaves OTel's default parent in place — the enclosing ``nixl.kv_transfer``
     span, the right answer when there is no request trace to join. No link is
     added in that case: it would point at the span that is already the parent.
@@ -126,7 +131,7 @@ def _traced_remote_fetch(func: Callable) -> Callable:
         except ImportError:
             return func(self, req_id, meta, *args, **kwargs)
 
-        request_context = extract_trace_context(trace_headers)
+        request_context = request_span_context(trace_headers)
         tracer = otel_trace.get_tracer(func.__module__)
         with tracer.start_as_current_span(
             "remote_fetch",
@@ -848,7 +853,7 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
                     start_time=int(record.issued_at * 1e9),
                     end_time=int(finished_at * 1e9),
                     attributes={"ca.request.id": req_id},
-                    context=extract_trace_context(record.trace_headers),
+                    context=request_span_context(record.trace_headers),
                 )
             except Exception:  # noqa: BLE001 - tracing must not break KV transfer
                 logger.debug("nixl.wait_for_transfer span emit failed", exc_info=True)
