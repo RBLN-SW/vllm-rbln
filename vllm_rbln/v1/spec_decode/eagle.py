@@ -40,13 +40,10 @@ from vllm_rbln.v1.attention.kv_cache_bindings import (
     build_kv_cache_forward_context_kwargs,
 )
 from vllm_rbln.v1.spec_decode.utils import (
-    DRAFT_ID_LOG_STEPS,
     FUSE_FIRST_FORWARD,
     FUSE_PREFILL,
     NARROW_LOGITS,
-    PREFILL_SHAPE_LOG,
     SKIP_DP_RENDEZVOUS,
-    WARMUP_SKIP_FOLD,
     eagle_prepare_inputs_padded,
     eagle_prepare_next_token_padded,
 )
@@ -93,8 +90,6 @@ class RBLNEagleProposer(EagleProposer):
         # Populated from the draft model in `load_model`. None means the draft
         # head shares the target vocabulary, so `propose()` maps no ids.
         self.draft_id_to_target_id: torch.Tensor | None = None
-        self._draft_id_logged = 0
-        self._prefill_shape_logged = 0
 
     def _fold_combine(self, is_prefill: bool | None = None) -> bool:
         """Whether the aux-state projection runs inside the drafter's graph.
@@ -399,13 +394,6 @@ class RBLNEagleProposer(EagleProposer):
         with record_function_or_nullcontext("drafter: stack"):
             # [batch_size, num_speculative_tokens]
             draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
-        if DRAFT_ID_LOG_STEPS and self._draft_id_logged < DRAFT_ID_LOG_STEPS:
-            self._draft_id_logged += 1
-            logger.info(
-                "DRAFT_IDS step=%d %s",
-                self._draft_id_logged,
-                draft_token_ids.reshape(-1).tolist(),
-            )
         return draft_token_ids
 
     def _to_target_token_ids(self, draft_token_ids: torch.Tensor) -> torch.Tensor:
@@ -724,7 +712,7 @@ class RBLNEagleProposer(EagleProposer):
                 is_prefill,
             )
         )
-        if self._fold_combine(is_prefill) and not WARMUP_SKIP_FOLD:
+        if self._fold_combine(is_prefill):
             # Compile the shape serving will actually hand in. `propose` replaces
             # the narrow buffer view with the wide aux states when the projection
             # is folded, so the warmup has to do the same or the first real step
@@ -811,24 +799,6 @@ class RBLNEagleProposer(EagleProposer):
         token_indices_to_sample: torch.Tensor | None,
         is_prefill: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        if (
-            PREFILL_SHAPE_LOG
-            and is_prefill
-            and self._prefill_shape_logged < PREFILL_SHAPE_LOG
-        ):
-            self._prefill_shape_logged += 1
-            ragged = num_reqs > 1 and num_input_tokens % num_reqs != 0
-            logger.info(
-                "PREFILL_SHAPE n=%d num_reqs=%d num_input_tokens=%d "
-                "buffer_rows=%d ragged=%s%s",
-                self._prefill_shape_logged,
-                num_reqs,
-                num_input_tokens,
-                self.hidden_states.shape[0],
-                ragged,
-                "  <- view(num_reqs, -1) is wrong here" if ragged else "",
-            )
-
         if is_prefill:
             input_ids = self.input_ids.view(num_reqs, -1)
             positions = self.positions.view(num_reqs, -1)

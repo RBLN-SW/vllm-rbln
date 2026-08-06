@@ -65,46 +65,6 @@ SKIP_DP_RENDEZVOUS = os.getenv("VLLM_RBLN_EAGLE3_SKIP_DP_RENDEZVOUS", "0") == "1
 # exclusive and this one is worth more (+18.2% versus the unroll's -5.8%).
 FUSE_FIRST_FORWARD = os.getenv("VLLM_RBLN_EAGLE3_FUSE_FIRST_FORWARD", "1") == "1"
 
-# Run `eagle_prepare_next_token_padded` on the host instead of letting each of
-# its integer ops fall back there one at a time.
-#
-# The tensors are (batch, num_spec + 1) -- 1x4 at max_num_seqs 1 -- but the
-# eleven integer ops on them have no fp16 device path, so nine of them fall back
-# to the host implementation and each one is its own device round trip. Copying
-# the three inputs across once, doing the same arithmetic in the same order, and
-# copying the two results back is 2 transfers instead of 9 round trips. Measured
-# 0.55 ms/step in the `drafter/pre: next_token_ids` scope.
-HOST_NEXT_TOKEN = os.getenv("VLLM_RBLN_EAGLE3_HOST_NEXT_TOKEN", "0") == "1"
-
-# Log the drafter's proposed ids for the first N steps, so that a change claimed
-# to be an equivalence can be checked against a baseline run rather than against
-# acceptance statistics.
-#
-# Acceptance is a poor gate for this. A mis-indexed per-iteration input makes the
-# drafter attend with the wrong sequence length, which does not crash and does
-# not collapse acceptance -- it degrades it by a few percent, which is inside the
-# arm-to-arm spread. Diffing the ids themselves is exact: with temperature 0 and
-# the same cache state the sequence is deterministic, so any single differing id
-# means the transform is not an equivalence.
-DRAFT_ID_LOG_STEPS = int(os.getenv("VLLM_RBLN_EAGLE3_DRAFT_ID_LOG_STEPS", "0"))
-
-
-# Log the first N prefill steps' request/token shape.
-#
-# `_preprocess`'s prefill branch reshapes the whole buffer with
-# `view(num_reqs, -1)`, which assumes every request in the step carries the SAME
-# number of tokens. At `max_num_batched_tokens=512` the scheduler generally
-# spends the whole budget on one request's chunk, so `num_reqs == 1` and the
-# assumption holds by accident. Raising the budget to 2048 lets several requests
-# share a prefill step with unequal chunk lengths, and then the reshape mixes
-# tokens across request boundaries.
-#
-# That is a hypothesis, and this exists to test it before any fix: a prefill step
-# with `num_reqs > 1` and `num_input_tokens % num_reqs != 0` proves the uniform
-# view wrong. Measured symptom it would explain -- mnbt 2048 + EAGLE3 produces
-# RepeatedFormatError on 26/26 SWE-bench instances (0/26 at mnbt 512, and 0/26
-# with spec-decode off at mnbt 2048) with accepted/draft at 0.097.
-PREFILL_SHAPE_LOG = int(os.getenv("VLLM_RBLN_EAGLE3_PREFILL_SHAPE_LOG", "0"))
 
 # Skip the target softmax on the all-greedy rejection path.
 #
@@ -196,16 +156,6 @@ def eagle_prepare_next_token_padded(
     This is the "last accepted token" from the sampled tokens, or the backup token if no
     tokens were accepted or if the request is marked as discarded.
     """
-    if HOST_NEXT_TOKEN and sampled_token_ids.device.type != "cpu":
-        dev = sampled_token_ids.device
-        nti, vc = eagle_prepare_next_token_padded(
-            sampled_token_ids.cpu(),
-            discard_request_mask.cpu(),
-            backup_next_token_ids.cpu(),
-            vocab_size,
-        )
-        return nti.to(dev), vc.to(dev)
-
     _, num_tokens = sampled_token_ids.shape
 
     is_valid = (sampled_token_ids != -1) & (sampled_token_ids < vocab_size)

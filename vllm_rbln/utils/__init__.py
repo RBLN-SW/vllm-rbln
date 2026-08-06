@@ -37,10 +37,6 @@ import torch
 _PAD_NO_CAT = os.getenv("VLLM_RBLN_PAD_NO_CAT", "1") == "1"
 
 
-# Off, and it should stay off: measured a regression. See `cat_last_dim`.
-_CAT_LAST_DIM_NO_CAT = os.getenv("VLLM_RBLN_CAT_LAST_DIM_NO_CAT", "0") == "1"
-
-
 def cat_last_dim(tensors: list[torch.Tensor]) -> torch.Tensor:
     """Concatenate along the last dimension.
 
@@ -57,17 +53,7 @@ def cat_last_dim(tensors: list[torch.Tensor]) -> torch.Tensor:
     So the generalisation "cat is expensive on device tensors" is wrong -- it is
     axis-dependent.
     """
-    if not _CAT_LAST_DIM_NO_CAT or len(tensors) == 1:
-        return torch.cat(tensors, dim=-1)
-    rows = tensors[0].shape[0]
-    total = sum(t.shape[-1] for t in tensors)
-    out = torch.empty((rows, total), dtype=tensors[0].dtype, device=tensors[0].device)
-    off = 0
-    for t in tensors:
-        width = t.shape[-1]
-        out[:, off : off + width].copy_(t)
-        off += width
-    return out
+    return torch.cat(tensors, dim=-1)
 
 
 def pad(
