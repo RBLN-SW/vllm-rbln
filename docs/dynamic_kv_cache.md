@@ -24,9 +24,9 @@ export VLLM_RBLN_USE_VLLM_MODEL=1
 export VLLM_RBLN_USE_DYNAMIC_KV_CACHE=1
 ```
 
-That is the whole public surface. The compile-time block count is derived
-(`vllm_rbln.envs.DEFAULT_COMPILE_KV_CACHE_NUM_BLOCKS`, currently 8) and does not
-have to be chosen.
+That is the whole public surface — one variable. The compile-time block count is a
+module constant (`vllm_rbln.v1.worker.rbln_worker.COMPILE_KV_CACHE_NUM_BLOCKS`,
+currently 8) and cannot be set from the environment.
 
 Use a **separate `VLLM_CACHE_ROOT` per configuration**. The compile cache hash
 does not include dynamism, so a static and a dynamic build of the same model
@@ -34,8 +34,7 @@ share one signature and can replay each other's codegen.
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `VLLM_RBLN_USE_DYNAMIC_KV_CACHE` | `0` | The switch. Off means the pre-compile estimate, exactly as before. |
-| `VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS` | derived (`8`) | Debug override of the compile-time block count. `0` opts out of the shrink, and therefore out of the resize. Blank (`VAR=`) counts as unset, so exporting it empty is not a way to change the behaviour. |
+| `VLLM_RBLN_USE_DYNAMIC_KV_CACHE` | `0` | The switch. Off means the pre-compile estimate. |
 
 ## What the compile-time block count is
 
@@ -57,50 +56,42 @@ The cost of the hint is asymmetric:
   charge existed — and the binding chiplet comes in at 0.9997x of budget instead
   of 1.015x of it, which is the point.
 
-The linearity is exact, and it is what makes a large value survivable. On the same
-MiniMax TP4+EP configuration, `VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS=64` serves at
-220 blocks where the derived 8 gives 276: `276 - 220 = 56 = 64 - 8`, one block of
-service lost per block of hint. Before the retained cache was charged, that same
-value was 4 runs out of 4 where the server started and the *first request* died
-with `SYS_EBUSY: Lack of device memory` — so the charge turns an over-large hint
-from a runtime failure into a predictable price.
+The cost is exactly linear in the hint, measured by compiling the same MiniMax
+TP4+EP configuration at two hints: 8 gives 276 blocks and 64 gives 220, and
+`276 - 220 = 56 = 64 - 8` — one block of service per block of hint. That is why the
+constant matters and why it is 8 rather than larger. It is not lower because values
+**below 8** are unmeasured: `2` is the smallest expected to keep the dimension
+dynamic, and `1` is specialized away silently by dynamo, which yields a static
+artifact whose profile query then finds no dynamic-shape variable.
 
 A hint large enough to drive a chiplet's budget to zero is refused at start-up
 with `the retained compile-time KV cache leaves no budget on ...`. That path has
-not been observed on hardware; 64 blocks on the configuration above does not come
-close to it.
+not been observed on hardware.
 
-## When the derived value is wrong
+## When the constant is too large for the run
 
-**The estimate is at or below the hint.** vLLM only guarantees
-`ceil(max_model_len / block_size)` blocks, so an estimate of 4 blocks
-(`--block-size 8192 --max-model-len 32768`) is legal. There is nothing to shrink
-there, and cancelling the shrink also cancels the resize — which would leave the
-run on the pre-compile estimate this feature exists to replace, without anybody
-having asked for that. The worker refuses to start instead, and names the
-override. Raise the estimate (`--gpu-memory-utilization`, a smaller
-`--block-size`) or set the override below the estimate.
-
-Values **below 8** are unmeasured. `2` is the smallest that is expected to keep
-the dimension dynamic; `1` risks dynamo specializing a size-1 dimension, which
-produces a static artifact. The profile query then finds no dynamic-shape variable
-and the run falls back to the estimate — loudly: a warning per runtime naming the
-static artifact, an error that no profile could be collected, and a third warning
-when the cache is restored to the estimate.
+**The estimate is at or below the hint.** The estimate is free device memory
+divided by the cost of one block, and that cost is proportional to `block_size`, so
+a large `--block-size` can legally put it below 8 — measured with this repo's own
+estimator on RBLN-CR03 at `--gpu-memory-utilization 0.9`, a Llama-3.1-8B shape
+reaches 6 blocks at `--block-size 131072`. There is nothing to shrink there, and
+cancelling the shrink also cancels the resize, which would leave the run on the
+pre-compile estimate this feature exists to replace without anybody having asked
+for it. The worker refuses to start instead. The remedy is to raise the estimate: a
+smaller `--block-size`, a higher `--gpu-memory-utilization`, or more devices.
 
 **Compile and warm-up are skipped** (`--enforce-eager`,
 `VLLM_RBLN_COMPILE_MODEL=0`, `VLLM_RBLN_ENABLE_WARM_UP=0`). Nothing compiles, so no
 artifact reports a memory profile and there is nothing to resize from. The shrink is
 skipped with a warning naming which switch did it, and the run serves the
-pre-compile estimate exactly as it does with the feature off. This is the one case
-where the derived default cannot work at all rather than working differently.
+pre-compile estimate exactly as it does with the feature off.
 
 **You want the pre-compile estimate on purpose** (comparing against the static
-path, measuring without the resize): set
-`VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS=0`. The shrink and the resize are both
-skipped, with a warning that says so. Note that `mark_dynamic` is still applied
-and still logged in this mode, so that log line is never evidence that the block
-count came from the device.
+path, measuring without the resize): pin the count with
+`--num-gpu-blocks-override=<the estimate>`. The override wins over the dynamic
+path, so the shrink and the resize are both skipped with a warning that says so.
+Note that `mark_dynamic` is still applied and still logged in this mode, so that
+log line is never evidence that the block count came from the device.
 
 ## Unsupported combinations
 

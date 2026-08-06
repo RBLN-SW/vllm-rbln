@@ -95,6 +95,13 @@ logger = init_logger(__name__)
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 
+# Blocks the KV cache is shrunk to for the compile. Not a capacity: the traced
+# `num_blocks` is only the hint of the mark_dynamic'd dim, and warm-up points every
+# dummy request at block 0, so a small cache suffices. 8 is what the runs measured;
+# below it is unmeasured, and 2 is the smallest expected to keep the dimension
+# dynamic at all (dynamo specializes a size-1 dim away silently).
+COMPILE_KV_CACHE_NUM_BLOCKS = 8
+
 # Bytes held back from every chiplet's dynamic-KV budget for device memory
 # `kv_cache_memory_profile()` does not describe: the profile is not a complete
 # inventory, so eager buffers and command-stream pools that match no region would
@@ -530,25 +537,8 @@ class RBLNWorker(WorkerBase):
         runtime resizes them anyway, and warm-up is safe small: every dummy
         request points at block id 0.
         """
-        compile_num_blocks = envs.VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS
-        explicit = envs.compile_kv_cache_num_blocks_is_explicit()
-        provenance = (
-            "VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS"
-            if explicit
-            else "derived default; VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS is unset"
-        )
+        compile_num_blocks = COMPILE_KV_CACHE_NUM_BLOCKS
         if not envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
-            # Only when the operator set something that would have done
-            # anything: the derived value is nobody's choice, and an explicit 0
-            # asks for the no-shrink that happens here regardless.
-            if explicit and compile_num_blocks > 0:
-                logger.warning(
-                    "VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS=%d is ignored because "
-                    "VLLM_RBLN_USE_DYNAMIC_KV_CACHE is off; without the dynamic "
-                    "KV path nothing would restore the full cache after the "
-                    "compile.",
-                    compile_num_blocks,
-                )
             return kv_cache_config
         skip_reason = self._compile_and_warmup_skip_reason()
         if skip_reason is not None:
@@ -566,80 +556,48 @@ class RBLNWorker(WorkerBase):
                 kv_cache_config.num_blocks,
             )
             return kv_cache_config
-        if compile_num_blocks <= 0:
-            logger.warning(
-                "[Dynamic KV] VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS=%d skips the "
-                "compile-time shrink. The resize is gated on the shrink, so no "
-                "compiled profile is queried and the KV cache keeps the %d blocks "
-                "the pre-compile estimate produced -- the sizing this feature "
-                "exists to replace. mark_dynamic is still applied and still "
-                "logged per layer, so that log line is not evidence that the "
-                "block count came from the device. Unset the variable to get the "
-                "derived default of %d blocks.",
-                compile_num_blocks,
-                kv_cache_config.num_blocks,
-                envs.DEFAULT_COMPILE_KV_CACHE_NUM_BLOCKS,
-            )
-            return kv_cache_config
         override = self.cache_config.num_gpu_blocks_override
         if override is not None:
             logger.warning(
-                "[Dynamic KV] the %d-block compile-time KV cache (%s) is ignored "
+                "[Dynamic KV] the %d-block compile-time KV cache is ignored "
                 "because --num-gpu-blocks-override=%d pins the block count: the "
                 "dynamic KV path then computes no new size, so nothing would "
                 "restore the full cache after the compile and the server would "
                 "serve from the %d-block compile cache while the scheduler hands "
                 "out block ids for %d. Compiling at the pinned size instead.",
                 compile_num_blocks,
-                provenance,
                 override,
                 compile_num_blocks,
                 kv_cache_config.num_blocks,
             )
             return kv_cache_config
         if compile_num_blocks >= kv_cache_config.num_blocks:
-            # Cancelling the shrink cancels the resize too, so this branch
-            # serves the pre-compile estimate. As a request that is a usable
-            # control mode; as the outcome of a value nobody chose it is #42
-            # reproducing silently, so a derived hint refuses instead.
-            if not explicit:
-                raise RuntimeError(
-                    f"the derived compile-time KV block count "
-                    f"({compile_num_blocks}) is not below the "
-                    f"{kv_cache_config.num_blocks} blocks vllm sized the KV cache "
-                    "with, so there is nothing to shrink -- and without a shrink "
-                    "the compiled profile is never queried, which leaves the "
-                    "cache on the pre-compile estimate that "
-                    "VLLM_RBLN_USE_DYNAMIC_KV_CACHE exists to replace. The "
-                    "estimate is this small because of gpu_memory_utilization, "
-                    "max_model_len and block_size (vllm only guarantees "
-                    "ceil(max_model_len / block_size) blocks). Raise the "
-                    "estimate, or set "
-                    "VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS to a value below it "
-                    "(2 is the smallest that is expected to keep the dim "
-                    "dynamic; 1 may specialize away), or set it to 0 to run "
-                    "without this feature."
-                )
-            logger.warning(
-                "[Dynamic KV] VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS=%d is not "
-                "below the %d blocks vllm sized the KV cache with; compiling "
-                "as-is. No profile will be queried and the block count stays at "
-                "the pre-compile estimate.",
-                compile_num_blocks,
-                kv_cache_config.num_blocks,
+            # Cancelling the shrink cancels the resize too, so serving on would
+            # leave the run on the pre-compile estimate -- #42 reproducing
+            # silently, with nobody having asked for it. Refuse instead.
+            raise RuntimeError(
+                f"the compile-time KV block count ({compile_num_blocks}) is not "
+                f"below the {kv_cache_config.num_blocks} blocks vllm sized the KV "
+                "cache with, so there is nothing to shrink -- and without a shrink "
+                "the compiled profile is never queried, which leaves the cache on "
+                "the pre-compile estimate that VLLM_RBLN_USE_DYNAMIC_KV_CACHE "
+                "exists to replace. The estimate is free device memory divided by "
+                "the cost of one block, and that cost is proportional to "
+                "block_size, so a smaller --block-size raises it; a higher "
+                "--gpu-memory-utilization or more devices do too. Or unset "
+                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE to serve the pre-compile estimate "
+                "exactly as before."
             )
-            return kv_cache_config
 
         shrunk = _kv_cache_config_at(kv_cache_config, compile_num_blocks)
         self._kv_blocks_before_shrink = kv_cache_config.num_blocks
         logger.info(
-            "[Dynamic KV] compiling with %d KV blocks instead of %d "
-            "(%s); the cache is resized after warm-up from the compiled "
-            "profile. On tensor_parallel_size>=2 these %d blocks are not "
-            "returned and are charged against the per-chiplet budget.",
+            "[Dynamic KV] compiling with %d KV blocks instead of %d; the cache is "
+            "resized after warm-up from the compiled profile. On "
+            "tensor_parallel_size>=2 these %d blocks are not returned and are "
+            "charged against the per-chiplet budget.",
             compile_num_blocks,
             kv_cache_config.num_blocks,
-            provenance,
             compile_num_blocks,
         )
         return shrunk
@@ -903,7 +861,7 @@ class RBLNWorker(WorkerBase):
 
         `_dynamic_kv_chiplet_budget` is derived from *capacity*, and
         `max_num_blocks` subtracts only the profile's `base_bytes`. The
-        `VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS` cache is per-block growth rather
+        `COMPILE_KV_CACHE_NUM_BLOCKS` cache is per-block growth rather
         than base, so it is in neither: the budget assumes
         `_release_kv_cache_tensors` handed it back before the replacement is
         allocated. On TP=1 it does. On TP>=2 it does not, and that method cannot
@@ -948,20 +906,11 @@ class RBLNWorker(WorkerBase):
             charged[node_id][chiplet_id] -= retained
             retained_by_unit[unit] = retained
 
-        # The advice has to match who chose the count: telling an operator who
-        # set nothing to lower a debug-only variable would take them below the
-        # measured default, where the cannot-shrink branch also stops refusing.
-        explicit = envs.compile_kv_cache_num_blocks_is_explicit()
-        if explicit and resident_blocks > envs.DEFAULT_COMPILE_KV_CACHE_NUM_BLOCKS:
-            advice = (
-                "a smaller VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS costs less "
-                f"({envs.DEFAULT_COMPILE_KV_CACHE_NUM_BLOCKS} is enough)"
-            )
-        else:
-            advice = (
-                "this is the smallest measured hint, so the block count is the "
-                "price of running this parallelism rather than something to tune"
-            )
+        # The hint is a constant, so there is nothing for the operator to lower.
+        advice = (
+            "this is the smallest measured hint, so the block count is the "
+            "price of running this parallelism rather than something to tune"
+        )
         logger.warning(
             "[Dynamic KV] tensor_parallel_size=%d does not return the "
             "%d-block compile-time KV cache, so its bytes are charged against "
@@ -980,27 +929,13 @@ class RBLNWorker(WorkerBase):
             if remaining <= 0
         }
         if exhausted:
-            # Name the count by who chose it, not by size: an operator who set 2
-            # explicitly must not be told it is "the derived 2 blocks". With the
-            # derived default there is nothing to lower, so point at the budget.
-            default_blocks = envs.DEFAULT_COMPILE_KV_CACHE_NUM_BLOCKS
-            origin = (
-                f"VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS={resident_blocks}"
-                if explicit
-                else f"the derived default of {resident_blocks} blocks"
+            remedy = (
+                f"the {resident_blocks}-block hint is already the smallest "
+                "measured one, so raise the budget instead: "
+                "--gpu-memory-utilization, a smaller --block-size (the retained "
+                "bytes scale with the page size), or another process holding "
+                "memory on the same cards"
             )
-            if explicit and resident_blocks > default_blocks:
-                remedy = (
-                    f"lower {origin} ({default_blocks} is enough -- warm-up "
-                    "points every dummy request at block 0)"
-                )
-            else:
-                remedy = (
-                    f"{origin} is already at or below the smallest measured hint, "
-                    "so raise the budget instead: --gpu-memory-utilization, a "
-                    "smaller --block-size (the retained bytes scale with the page "
-                    "size), or another process holding memory on the same cards"
-                )
             raise RuntimeError(
                 "the retained compile-time KV cache leaves no budget on "
                 f"{exhausted}. The {resident_blocks}-block cache compiled for "
@@ -1460,22 +1395,15 @@ class RBLNWorker(WorkerBase):
                 if self._kv_blocks_before_shrink is not None:
                     raise RuntimeError(
                         f"Not enough memory to compile against the {blocks}-block "
-                        "compile-time KV cache ("
-                        + (
-                            "VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS"
-                            if envs.compile_kv_cache_num_blocks_is_explicit()
-                            else "derived default"
-                        )
-                        + "); vllm sized the "
-                        f"cache with {self._kv_blocks_before_shrink} blocks, and "
-                        "it is the resize after warm-up that would have applied "
-                        "the real count. At this size the KV cache is not what "
-                        "exhausted the device, so lowering the block count will "
-                        "not help: reduce --max-num-batched-tokens (the runtime "
-                        "arena scales with it), --max-model-len or "
-                        "--max-num-seqs, raise --tensor-parallel-size to split "
-                        "the weights, or check whether another process holds "
-                        "memory on the same cards."
+                        "compile-time KV cache; vllm sized the cache with "
+                        f"{self._kv_blocks_before_shrink} blocks, and it is the "
+                        "resize after warm-up that would have applied the real "
+                        "count. At this size the KV cache is not what exhausted "
+                        "the device, so lowering the block count will not help: "
+                        "reduce --max-num-batched-tokens (the runtime arena scales "
+                        "with it), --max-model-len or --max-num-seqs, raise "
+                        "--tensor-parallel-size to split the weights, or check "
+                        "whether another process holds memory on the same cards."
                     ) from e
                 raise RuntimeError(
                     f"Not enough memory for {blocks} blocks of KV cache. "

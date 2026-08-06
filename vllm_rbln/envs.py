@@ -60,9 +60,6 @@ if TYPE_CHECKING:
     VLLM_RBLN_NUM_RAY_NODES: int = 1
     # --- DYNAMIC KV CACHE ---
     VLLM_RBLN_USE_DYNAMIC_KV_CACHE: bool = False
-    # Debug-only override of the derived compile-time hint (see
-    # compile_kv_cache_num_blocks); 0 opts out of the shrink and the resize.
-    VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS: int = 8
     # --- ATTENTION ---
     VLLM_RBLN_FLASH_CAUSAL_ATTN: bool = True
     VLLM_RBLN_BATCH_ATTN_OPT: bool = False
@@ -182,52 +179,6 @@ def get_decode_batch_bucket_manual_buckets() -> list[int]:
             f"Invalid VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS: "
             f"{manual_buckets}, {e}"
         ) from e
-
-
-# Compile-time KV block count when the operator sets nothing. The traced
-# `num_blocks` is only the hint of the mark_dynamic'd dim and warm-up points every
-# dummy request at block 0, so a small cache suffices; 8 is what the runs measured.
-DEFAULT_COMPILE_KV_CACHE_NUM_BLOCKS = 8
-
-
-def compile_kv_cache_num_blocks() -> int:
-    """Blocks the KV cache is compiled against, under the dynamic-KV path.
-
-    Unset means the default, so the feature has one public switch; an explicit
-    value is a debug override and an explicit 0 opts out of the shrink and the
-    resize. Deliberately not derived from VLLM_RBLN_USE_DYNAMIC_KV_CACHE --
-    `use_auto_port` shows why: it re-spells the sibling's default in a second
-    place, and that is the line missed the day this flag becomes default-on. The
-    flag is checked where the shrink is decided instead.
-
-    Never raises on unset or blank: vLLM's `enable_envs_cache` evaluates every
-    registered getter once, so raising here breaks deployments that never touch
-    this feature. A non-numeric value still raises.
-    """
-    raw = _raw_compile_kv_cache_num_blocks()
-    if raw is None:
-        return DEFAULT_COMPILE_KV_CACHE_NUM_BLOCKS
-    return int(raw)
-
-
-def _raw_compile_kv_cache_num_blocks() -> str | None:
-    """The operator's value, or None when there is effectively none.
-
-    Blank counts as absent: `VAR=`, `value: ""` and `export VAR=$UNSET` all leave
-    an empty string, and honouring that would mean using a number nobody picked.
-    """
-    raw = os.environ.get("VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS")
-    return raw if raw is not None and raw.strip() else None
-
-
-def compile_kv_cache_num_blocks_is_explicit() -> bool:
-    """Whether the block count came from the operator or from the default.
-
-    Blank counts as absent, exactly as the getter treats it -- and that is the
-    input deciding whether a hint at or above the estimate refuses (derived) or
-    only warns (explicit). An explicit `0` is still a choice.
-    """
-    return _raw_compile_kv_cache_num_blocks() is not None
 
 
 def use_auto_port() -> bool:
@@ -358,12 +309,6 @@ environment_variables = {
             in ("true", "1")
         )
     ),
-    # Debug-only override of the derived compile-time hint; see
-    # docs/dynamic_kv_cache.md. On TP=1 the cache is returned and the hint is
-    # free; on TP>=2 the final count loses exactly this many blocks. Values at or
-    # above vllm's estimate cancel the shrink (and so the resize); 0 opts out of
-    # both. Below 8 is unmeasured.
-    "VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS": compile_kv_cache_num_blocks,
     # --- ATTENTION ---
     # Use flash attention for causal attention
     "VLLM_RBLN_FLASH_CAUSAL_ATTN": (

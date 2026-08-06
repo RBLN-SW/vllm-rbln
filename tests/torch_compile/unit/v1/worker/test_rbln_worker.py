@@ -1571,21 +1571,16 @@ class TestMaybeShrinkKvCacheForCompile:
         )
 
     @staticmethod
-    def _shrink(
-        config, *, dynamic=True, value=None, override=None, warmup_skipped=False
-    ):
-        """Drive the method with the two env readings injected.
+    def _shrink(config, *, dynamic=True, override=None, warmup_skipped=False):
+        """Drive the method with the flag injected as a module attribute.
 
-        Patched as module attributes rather than via `os.environ`: an earlier test
+        Patched as a module attribute rather than via `os.environ`: an earlier test
         using `monkeypatch.setattr` on this module leaves a real attribute
-        shadowing the getter (see conftest). The getter itself is covered in
-        test_rbln_envs.py. `value=None` means the derived default.
+        shadowing the getter (see conftest). The block count is not injectable at
+        all -- it is the module constant COMPILE_KV_CACHE_NUM_BLOCKS.
         """
-        import vllm_rbln.envs as envs
         from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
 
-        explicit = value is not None
-        effective = envs.DEFAULT_COMPILE_KV_CACHE_NUM_BLOCKS if not explicit else value
         worker = SimpleNamespace(
             cache_config=SimpleNamespace(num_gpu_blocks_override=override),
             _kv_blocks_before_shrink=None,
@@ -1600,29 +1595,19 @@ class TestMaybeShrinkKvCacheForCompile:
                 "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE",
                 dynamic,
             ),
-            patch(
-                "vllm_rbln.v1.worker.rbln_worker.envs."
-                "VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS",
-                effective,
-            ),
-            patch(
-                "vllm_rbln.v1.worker.rbln_worker.envs."
-                "compile_kv_cache_num_blocks_is_explicit",
-                lambda: explicit,
-            ),
         ):
             out = RBLNWorker._maybe_shrink_kv_cache_for_compile(worker, config)
         return worker, out
 
-    def test_the_flag_alone_shrinks_to_the_derived_default(self, caplog):
-        import vllm_rbln.envs as envs
+    def test_the_flag_alone_shrinks_to_the_constant(self, caplog):
+        from vllm_rbln.v1.worker.rbln_worker import COMPILE_KV_CACHE_NUM_BLOCKS
 
         config = self._config()
         with caplog.at_level("INFO"):
             worker, out = self._shrink(config)
 
         assert out is not config
-        assert out.num_blocks == envs.DEFAULT_COMPILE_KV_CACHE_NUM_BLOCKS
+        assert out.num_blocks == COMPILE_KV_CACHE_NUM_BLOCKS
         assert worker._kv_blocks_before_shrink == self.ESTIMATED_BLOCKS
         # The tensors have to shrink with num_blocks or the allocation and the
         # config disagree.
@@ -1634,44 +1619,14 @@ class TestMaybeShrinkKvCacheForCompile:
             t.size == self.ESTIMATED_BLOCKS * self.PAGE_SIZE
             for t in config.kv_cache_tensors
         )
-        assert "derived default" in caplog.text
 
-    def test_an_explicit_value_is_reported_as_an_override(self, caplog):
-        with caplog.at_level("INFO"):
-            worker, out = self._shrink(self._config(), value=16)
-
-        assert out.num_blocks == 16
-        assert worker._kv_blocks_before_shrink == self.ESTIMATED_BLOCKS
-        assert "VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS" in caplog.text
-        assert "derived default" not in caplog.text
-
-    def test_explicit_zero_opts_out_and_says_so(self, caplog):
+    def test_the_flag_off_returns_the_config_untouched_and_silently(self, caplog):
         config = self._config()
         with caplog.at_level("WARNING"):
-            worker, out = self._shrink(config, value=0)
-
+            worker, out = self._shrink(config, dynamic=False)
         assert out is config
-        assert worker._kv_blocks_before_shrink is None
-        assert "skips the compile-time shrink" in caplog.text
-        # The operator has to be told the resize goes with it, and that the
-        # mark_dynamic line they will see next means nothing here.
-        assert "mark_dynamic" in caplog.text
-
-    def test_a_negative_value_is_treated_as_an_opt_out(self):
-        config = self._config()
-        worker, out = self._shrink(config, value=-1)
-        assert out is config
-        assert worker._kv_blocks_before_shrink is None
-
-    def test_the_flag_off_is_silent_unless_the_operator_set_something(self, caplog):
-        with caplog.at_level("WARNING"):
-            worker, out = self._shrink(self._config(), dynamic=False)
         assert worker._kv_blocks_before_shrink is None
         assert caplog.text == ""
-
-        with caplog.at_level("WARNING"):
-            self._shrink(self._config(), dynamic=False, value=8)
-        assert "is ignored because" in caplog.text
 
     def test_a_pinned_block_count_cancels_the_shrink(self, caplog):
         config = self._config()
@@ -1682,47 +1637,19 @@ class TestMaybeShrinkKvCacheForCompile:
         assert worker._kv_blocks_before_shrink is None
         assert "num-gpu-blocks-override" in caplog.text
 
-    def test_a_derived_hint_that_cannot_shrink_refuses(self):
-        # vllm only guarantees ceil(max_model_len / block_size) blocks, so an
-        # estimate at or below the derived hint is legal -- and taking the
-        # as-is branch there would silently serve the pre-compile estimate.
+    def test_a_hint_that_cannot_shrink_refuses(self):
+        # The estimate is free memory over the cost of one block, so a large
+        # block_size can legally put it at or below the hint. Serving on there
+        # would silently keep the pre-compile estimate, so it is a refusal.
         with pytest.raises(RuntimeError, match="nothing to shrink"):
             self._shrink(self._config(num_blocks=4))
 
-    def test_an_explicit_hint_that_cannot_shrink_still_warns(self, caplog):
-        config = self._config(num_blocks=4)
-        with caplog.at_level("WARNING"):
-            worker, out = self._shrink(config, value=64)
-
-        assert out is config
-        assert worker._kv_blocks_before_shrink is None
-        assert "compiling as-is" in caplog.text
-
-    def test_a_blank_env_value_still_refuses(self, monkeypatch):
-        """A blank value must not read as a choice.
-
-        Driven through the real environment, because the bug lived in the
-        disagreement between the value (blank -> default) and the provenance
-        (blank -> present).
-        """
-        from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
-
-        monkeypatch.setenv("VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS", "")
-        worker = SimpleNamespace(
-            cache_config=SimpleNamespace(num_gpu_blocks_override=None),
-            _kv_blocks_before_shrink=None,
-            _compile_and_warmup_skip_reason=lambda: None,
-        )
-        with (
-            patch(
-                "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE",
-                True,
-            ),
-            pytest.raises(RuntimeError, match="nothing to shrink"),
-        ):
-            RBLNWorker._maybe_shrink_kv_cache_for_compile(
-                worker, self._config(num_blocks=4)
-            )
+    def test_the_refusal_points_at_block_size_not_at_a_variable(self):
+        with pytest.raises(RuntimeError) as exc:
+            self._shrink(self._config(num_blocks=4))
+        assert "--block-size" in str(exc.value)
+        # The variable it used to name is gone; do not resurrect it in prose.
+        assert "VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS" not in str(exc.value)
 
     def test_no_warmup_means_no_shrink(self, caplog):
         """Skipping compile/warm-up has to skip the shrink too: otherwise the
@@ -1738,27 +1665,19 @@ class TestMaybeShrinkKvCacheForCompile:
         assert "compile/warm-up is skipped" in caplog.text
         assert "does nothing for this run" in caplog.text
 
-    def test_flag_off_with_an_explicit_zero_is_silent(self, caplog):
-        """0 asks for no shrink and the flag off gives none, so "is ignored"
-        would be false -- and a launcher keeping `=0` would log it forever.
-        """
-        with caplog.at_level("WARNING"):
-            worker, out = self._shrink(self._config(), dynamic=False, value=0)
-
-        assert worker._kv_blocks_before_shrink is None
-        assert caplog.text == ""
-
 
 class TestChargeRemedyWording:
-    """The charge's advice has to name whoever chose the block count: telling an
-    operator who set nothing to lower a debug-only variable sends them below the
-    smallest measured hint, where the cannot-shrink branch also stops refusing.
+    """What the retained-cache charge tells the operator.
+
+    The hint is a constant, so there is nothing for them to lower: the warning has
+    to say the block count is the price of the parallelism, and the exhausted-budget
+    refusal has to point at the budget. Both strings are asserted nowhere else.
     """
 
     BUDGET = 33_772_535_808
 
     @staticmethod
-    def _charge(*, blocks, explicit, bytes_per_block, tp=4):
+    def _charge(*, blocks, bytes_per_block, tp=4):
         from vllm_rbln.v1.worker.kv_profile import (
             MergedKvCacheMemoryProfile,
             MergedMemoryRegion,
@@ -1774,38 +1693,21 @@ class TestChargeRemedyWording:
                 kv_cache_config=SimpleNamespace(num_blocks=blocks)
             ),
         )
-        with patch(
-            "vllm_rbln.v1.worker.rbln_worker.envs."
-            "compile_kv_cache_num_blocks_is_explicit",
-            lambda: explicit,
-        ):
-            return RBLNWorker._charge_retained_compile_kv_cache(
-                worker, {0: {0: TestChargeRemedyWording.BUDGET}}, merged
-            )
+        return RBLNWorker._charge_retained_compile_kv_cache(
+            worker, {0: {0: TestChargeRemedyWording.BUDGET}}, merged
+        )
 
-    def test_the_derived_default_is_not_told_to_lower_the_variable(self, caplog):
+    def test_the_charge_does_not_offer_a_knob_to_lower(self, caplog):
         with caplog.at_level("WARNING"):
-            self._charge(blocks=8, explicit=False, bytes_per_block=65_011_712)
-        assert "a smaller VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS" not in caplog.text
+            self._charge(blocks=8, bytes_per_block=65_011_712)
         assert "price of running this parallelism" in caplog.text
+        assert "VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS" not in caplog.text
 
-    def test_an_explicit_large_value_is_told_to_lower_it(self, caplog):
-        with caplog.at_level("WARNING"):
-            self._charge(blocks=64, explicit=True, bytes_per_block=65_011_712)
-        assert "a smaller VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS" in caplog.text
-
-    def test_an_explicit_small_value_is_not_called_derived(self):
-        # Exhausts the budget so the RuntimeError path decides the wording.
+    def test_a_budget_the_charge_exhausts_points_at_the_budget(self):
         with pytest.raises(RuntimeError) as exc:
-            self._charge(blocks=2, explicit=True, bytes_per_block=self.BUDGET // 2)
-        assert "VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS=2" in str(exc.value)
-        assert "derived" not in str(exc.value)
-
-    def test_a_derived_value_that_exhausts_the_budget_says_derived(self):
-        with pytest.raises(RuntimeError) as exc:
-            self._charge(blocks=8, explicit=False, bytes_per_block=self.BUDGET // 4)
-        assert "the derived default of 8 blocks" in str(exc.value)
+            self._charge(blocks=8, bytes_per_block=self.BUDGET // 4)
         assert "gpu-memory-utilization" in str(exc.value)
+        assert "VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS" not in str(exc.value)
 
 
 class TestDynamicKvLayoutGuards:

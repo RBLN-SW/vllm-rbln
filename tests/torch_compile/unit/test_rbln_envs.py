@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-
 import vllm_rbln.envs as envs
 
 
@@ -85,69 +83,20 @@ def test_dynamic_kv_cache_envs_default_off():
 
     `VLLM_RBLN_USE_DYNAMIC_KV_CACHE` is read before / during the compile, so a
     non-False default would change the compiled artifact for every existing
-    deployment. The block count is the opposite case: it is only consulted from
-    inside the dynamic-KV path, so its non-zero default cannot be seen by a
-    static deployment, and having one keeps the feature from being reachable in a
-    half-enabled state (flag on, no shrink, no resize, mark_dynamic still
-    logged).
+    deployment. It is also the only variable the feature has: the compile-time
+    hint is a module constant, so there is no way to reach the feature in a
+    half-enabled state (flag on, no shrink, no resize, mark_dynamic still logged).
     """
     assert "VLLM_RBLN_USE_DYNAMIC_KV_CACHE" in envs.environment_variables
-    assert "VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS" in envs.environment_variables
     assert not envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE, (
         f"Expected VLLM_RBLN_USE_DYNAMIC_KV_CACHE to be False, \
         got {envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE}"
     )
-    assert envs.VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS == 8, (
-        f"Expected VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS to default to 8, \
-        got {envs.VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS}"
-    )
-    assert envs.DEFAULT_COMPILE_KV_CACHE_NUM_BLOCKS == 8
-
-
-def test_compile_kv_cache_num_blocks_default_is_not_derived_from_the_flag(
-    monkeypatch,
-):
-    """The default must not be spelled in terms of the other variable."""
-    monkeypatch.delenv("VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS", raising=False)
-    for flag in ("0", "1"):
-        monkeypatch.setenv("VLLM_RBLN_USE_DYNAMIC_KV_CACHE", flag)
-        assert envs.VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS == 8
-
-
-def test_blank_compile_kv_cache_num_blocks_is_the_default_not_a_crash(monkeypatch):
-    """`FOO=` must not raise: `enable_envs_cache` calls every getter once."""
-    monkeypatch.setenv("VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS", "")
-    assert envs.VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS == 8
-    monkeypatch.setenv("VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS", "   ")
-    assert envs.VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS == 8
-
-
-def test_explicit_zero_survives_as_an_opt_out(monkeypatch):
-    """0 has to stay distinguishable from unset, or the escape hatch is gone."""
-    monkeypatch.setenv("VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS", "0")
-    assert envs.VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS == 0
-    assert envs.compile_kv_cache_num_blocks_is_explicit()
-
-
-def test_provenance_and_value_agree_on_a_blank_value(monkeypatch):
-    """A blank value must not read as a choice the operator made."""
-    for raw in ("", "   "):
-        monkeypatch.setenv("VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS", raw)
-        assert envs.VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS == 8
-        assert not envs.compile_kv_cache_num_blocks_is_explicit()
-        assert "VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS" in os.environ
-
-    monkeypatch.delenv("VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS", raising=False)
-    assert not envs.compile_kv_cache_num_blocks_is_explicit()
-    monkeypatch.setenv("VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS", "16")
-    assert envs.compile_kv_cache_num_blocks_is_explicit()
 
 
 def test_dynamic_kv_cache_envs_are_read_from_os_environ(monkeypatch):
     monkeypatch.setenv("VLLM_RBLN_USE_DYNAMIC_KV_CACHE", "1")
-    monkeypatch.setenv("VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS", "64")
     assert envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE is True
-    assert envs.VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS == 64
 
 
 def test_the_unprofiled_reserve_is_not_an_env_var():
