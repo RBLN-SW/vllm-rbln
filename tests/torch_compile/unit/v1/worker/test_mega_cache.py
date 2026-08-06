@@ -210,6 +210,14 @@ class TestCompileEnvFactors:
         on = mega_cache._compile_env_factors()
         assert off != on
 
+    def test_w8a16_invalidates(self, monkeypatch):
+        # Gates the linear kernel inside the forward, so it lands in the graph.
+        monkeypatch.setenv("VLLM_RBLN_USE_W8A16", "0")
+        off = mega_cache._compile_env_factors()
+        monkeypatch.setenv("VLLM_RBLN_USE_W8A16", "1")
+        on = mega_cache._compile_env_factors()
+        assert off != on
+
     def test_sampler_flag_invariant(self, monkeypatch):
         # Sampler graphs compile with use_cache=False, so they never enter it.
         monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1")
