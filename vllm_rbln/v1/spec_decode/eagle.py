@@ -66,49 +66,6 @@ class RBLNEagleProposer(EagleProposer):
         # head shares the target vocabulary, so `propose()` maps no ids.
         self.draft_id_to_target_id: torch.Tensor | None = None
 
-    @staticmethod
-    def _mirror_seq_lens_to_host(
-        cad: CommonAttentionMetadata,
-        delta: torch.Tensor | int,
-        clamp_mask: torch.Tensor | None = None,
-    ) -> None:
-        """Apply to the host shadow whatever was just applied to `seq_lens`.
-
-        The flash-attention builder reads `_seq_lens_cpu`, not `seq_lens`
-        (`num_computed_tokens = seq_lens - query_seq_lens_cpu`), so a shadow
-        left stale makes every step after the first attend with the wrong
-        sequence length. That does not crash -- it silently lowers acceptance,
-        which is the thing this path exists to produce. Invalidating the shadow
-        instead costs a D2H sync per step; mirroring the arithmetic is free.
-
-        `_seq_lens_cpu` is upstream-private; `propose()` reaches it only through
-        here.
-
-        On this backend the two usually ALIAS. `rbln_model_runner` builds the
-        metadata as
-
-            seq_lens=self.seq_lens[:num_reqs],
-            _seq_lens_cpu=self.seq_lens[:num_reqs],
-
-        i.e. two slices of one CPU tensor, so the op on `seq_lens` has already
-        updated the shadow and mirroring it again applies the delta twice --
-        rejected tokens subtracted twice, each draft iteration advancing by 2.
-        `_build_dummy_attn_metadata` in this file does NOT alias (`.to(device)`
-        copies), so the check is made at run time rather than assumed either
-        way.
-        """
-        shadow = cad._seq_lens_cpu
-        if shadow is None:
-            return
-        seq_lens = cad.seq_lens
-        if shadow.data_ptr() == seq_lens.data_ptr() and shadow.shape == seq_lens.shape:
-            return
-        if isinstance(delta, torch.Tensor):
-            delta = delta.to(shadow.device, shadow.dtype)
-        shadow += delta
-        if clamp_mask is not None:
-            shadow.masked_fill_(clamp_mask.to(shadow.device), 1)
-
     def propose(
         self,
         target_token_ids: torch.Tensor,
@@ -128,9 +85,8 @@ class RBLNEagleProposer(EagleProposer):
             assert isinstance(
                 self.model, (Eagle3LlamaForCausalLM, Eagle3DeepseekV2ForCausalLM)
             )
-            # Eager on purpose, and only fast with TORCH_RBLN_DEPLOY=ON: the
-            # non-deploy NaN/Inf scan walks this 56.6 MB weight on every call.
-            # See the commit message for the numbers.
+            # Eager. Only cheap with TORCH_RBLN_DEPLOY=ON, which turns off the
+            # per-op NaN/Inf scan that would walk this weight on every call.
             target_hidden_states = self.model.combine_hidden_states(
                 target_hidden_states
             )
@@ -241,7 +197,6 @@ class RBLNEagleProposer(EagleProposer):
         # (i.e., not the first proposal).
         if self.num_speculative_tokens > 1 and num_rejected_tokens is not None:
             common_attn_metadata.seq_lens -= num_rejected_tokens
-            self._mirror_seq_lens_to_host(common_attn_metadata, -num_rejected_tokens)
 
         num_reqs_padded, num_padded_tokens, num_tokens_across_dp = (
             self._determine_draft_batch_padding(num_reqs, num_reqs, False)
@@ -255,10 +210,6 @@ class RBLNEagleProposer(EagleProposer):
             exceeds_max_model_len = positions[:num_reqs] >= self.max_model_len
             common_attn_metadata.seq_lens += 1
             common_attn_metadata.seq_lens.masked_fill_(exceeds_max_model_len, 1)
-            # Mirror the device op exactly: unsliced, same mask.
-            self._mirror_seq_lens_to_host(
-                common_attn_metadata, 1, exceeds_max_model_len
-            )
 
             per_layer_attn_metadata.clear()
             for attn_group in self.draft_attn_groups:
