@@ -324,6 +324,7 @@ class RBLNEagleProposer(EagleProposer):
             valid_sampled_tokens_count,
             common_attn_metadata.query_start_loc,
         )
+        token_indices_to_sample = token_indices_to_sample.to(self.device)
 
         query_start_loc = common_attn_metadata.query_start_loc
         seq_lens = common_attn_metadata.seq_lens
