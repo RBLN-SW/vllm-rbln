@@ -177,25 +177,23 @@ class TestPadDepad:
 
 
 class TestPredicates:
-    def test_is_prefill_boundary(self):
-        # is_prefill: num_computed < num_tokens_no_spec - 1 (request 0).
-        r = _make_runner_stub(
-            input_batch=SimpleNamespace(
-                num_computed_tokens_cpu=np.array([3]),
-                num_tokens_no_spec=np.array([10]),
-            )
-        )
-        assert r.is_prefill is True
-        r.input_batch.num_computed_tokens_cpu = np.array([9])
-        assert r.is_prefill is False
+    def test_is_prefill_phase_reads_scheduler_stamp(self):
+        # The runner no longer derives the phase from its own per-rank
+        # input_batch (that boundary logic moved to the scheduler's is_prefill).
+        # _set_step_phase records RBLNSchedulerOutput.is_prefill_step and
+        # is_prefill_phase() -- the single source of truth -- returns it, so all
+        # PP ranks agree.
+        r = _make_runner_stub()
+        r._set_step_phase(SimpleNamespace(is_prefill_step=True))
+        assert r.is_prefill_phase() is True
+        r._set_step_phase(SimpleNamespace(is_prefill_step=False))
+        assert r.is_prefill_phase() is False
 
     def test_is_intermediate_chunked_prefill(self):
-        # is_prefill AND discard_request_mask[0].
+        # is_prefill_phase() (scheduler-stamped step phase) AND
+        # discard_request_mask[0].
         r = _make_runner_stub(
-            input_batch=SimpleNamespace(
-                num_computed_tokens_cpu=np.array([3]),
-                num_tokens_no_spec=np.array([10]),
-            ),
+            _is_prefill_step=True,
             discard_request_mask=np.array([True]),
         )
         assert r.is_intermediate_chunked_prefill is True
@@ -319,11 +317,13 @@ class TestGetSupportedTasks:
 
 class TestDetermineBatchPadding:
     # data_parallel_size == 1 is the covered path (multi-DP needs RBLNDPMetadata
-    # collectives -> e2e). is_prefill is driven via the input_batch stub.
+    # collectives -> e2e). The phase is driven via the scheduler-stamped
+    # _is_prefill_step (is_prefill_phase()), not the runner's input_batch.
     @staticmethod
     def _runner(*, is_prefill, bucket=8):
         computed = 0 if is_prefill else 9
         return _make_runner_stub(
+            _is_prefill_step=is_prefill,
             bucketing_manager=SimpleNamespace(
                 find_decode_batch_bucket=lambda n: bucket
             ),
