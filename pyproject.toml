@@ -38,7 +38,7 @@ dependencies = [
     "pyyaml",
     "datasets>=4.0.0",
     "qwen_vl_utils",
-    "vllm==0.24.1.dev1+g8269f47a8.cpu",
+    "vllm @ https://pypi.rebellions.in/api/package/vllm/vllm-0.24.1.dev1+g8269f47a8.cpu-cp38-abi3-linux_x86_64.whl",
     "fastapi[standard]<0.137",
     "torch",
     "torchvision",
@@ -142,11 +142,12 @@ required-version = ">=0.11.25"
 environments = [
     "sys_platform == 'linux' and platform_machine == 'x86_64'"
 ]
-# pypi.rebellions.in is registered on this branch ONLY to reach the ax-k1-fp8
-# upstream vllm build, which is published nowhere else. It is `explicit`, and only
-# `vllm` maps to it, so no other package can be pulled from it by a lock refresh —
-# which was the reason it stays unregistered on dev/main. Everything else still
-# installs from it ad-hoc via --extra-index-url (see DEVELOPMENT.md).
+# pypi.rebellions.in is intentionally NOT registered: packages appear/disappear
+# there independently of dev/main, so a full lock refresh could pin versions that
+# must not be used. Install packages from it ad-hoc via --extra-index-url instead
+# (see DEVELOPMENT.md). The ax-k1-fp8 vllm build below is a direct URL for the same
+# reason — registering the index would move every package there, and mapping
+# `vllm` to it would drag consumers' released vllm onto it too.
 # Exact reproduction is uv.lock's job — installs without the lock are out of contract.
 index-strategy = "unsafe-best-match"
 prerelease = "if-necessary-or-explicit"   # pin uv's default explicitly — prereleases only for packages with a marker (or prerelease-only packages)
@@ -154,11 +155,6 @@ prerelease = "if-necessary-or-explicit"   # pin uv's default explicitly — prer
 [[tool.uv.index]]
 name = "vllm-cpu"
 url = "https://wheels.vllm.ai/0.24.0/cpu"
-explicit = true
-
-[[tool.uv.index]]
-name = "rebellions"
-url = "https://pypi.rebellions.in/simple/"
 explicit = true
 
 [[tool.uv.index]]
@@ -175,7 +171,6 @@ name = "rbln-release"
 url = "https://pypi.rbln.ai/simple/"
 
 [tool.uv.sources]
-vllm = { index = "rebellions" }   # ax-k1-fp8 upstream build; not on wheels.vllm.ai
 torch = { index = "pytorch-cpu" }
 torchvision = { index = "pytorch-cpu" }
 torchaudio = { index = "pytorch-cpu" }
