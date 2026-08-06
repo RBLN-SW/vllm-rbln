@@ -71,6 +71,7 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.utils import (
     finalize_kv_cache_registrations,
 )
 from vllm_rbln.logger import init_logger
+from vllm_rbln.platform import USE_DEVICE_TENSOR
 from vllm_rbln.v1.worker.kv_profile import (
     MERGED_PROFILE_LOG_KEY,
     assert_budget_covers_profile,
@@ -717,6 +718,21 @@ class RBLNWorker(WorkerBase):
                 "then the combination is refused rather than mis-sized."
             )
 
+        # `USE_DEVICE_TENSOR` is `VLLM_RBLN_USE_VLLM_MODEL and
+        # VLLM_RBLN_USE_DEVICE_TENSOR`, and the platform already refuses the flag
+        # without the former, so reaching here with it False means the operator
+        # turned VLLM_RBLN_USE_DEVICE_TENSOR off.
+        if not USE_DEVICE_TENSOR:
+            raise RuntimeError(
+                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE requires "
+                "VLLM_RBLN_USE_DEVICE_TENSOR=1. With it off the KV tensors are not "
+                "device-resident graph inputs -- they are registered by address via "
+                "`mark_static_address` -- while mark_dynamic is still applied, so "
+                "the artifact carries no dynamic-shape variable for the block "
+                "count and no runtime can report a memory profile to size the "
+                "cache from."
+            )
+
     def _assert_dynamic_kv_attention_layout(self) -> None:
         """Guard: every attention layer must dispatch to the paged-causal kernel.
 
@@ -1034,11 +1050,12 @@ class RBLNWorker(WorkerBase):
 
         runtimes = self._collect_dynamic_kv_runtimes()
         if not runtimes:
-            logger.error(
-                "[Dynamic KV] no rbln runtime was registered during warm-up; "
-                "cannot query the compiled memory profile."
+            raise RuntimeError(
+                "[Dynamic KV] no rbln runtime was registered during warm-up, so "
+                "the compiled memory profile cannot be queried. The KV cache was "
+                "already shrunk for the compile, and restoring it from here trips "
+                "an assertion that names none of this."
             )
-            return None
         self._assert_dynamo_runtimes(runtimes)
 
         profiles = []
@@ -1088,13 +1105,17 @@ class RBLNWorker(WorkerBase):
             )
 
         if not profiles:
-            logger.error(
-                "[Dynamic KV] not one of the %d rbln runtimes returned a KV "
-                "memory profile; the model was probably not compiled with a "
-                "mark_dynamic'd KV cache.",
-                len(runtimes),
+            raise RuntimeError(
+                f"[Dynamic KV] not one of the {len(runtimes)} rbln runtimes "
+                "returned a KV memory profile, so the block count cannot come from "
+                "the device. The usual cause is an artifact compiled without a "
+                "mark_dynamic'd KV cache -- check that "
+                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE was set before the compile and "
+                "that VLLM_CACHE_ROOT did not replay a static build. Serving on "
+                "would keep the pre-compile estimate this feature exists to "
+                "replace, and on tensor_parallel_size>=2 it would do so with the "
+                "compile-time cache still resident and charged to nobody."
             )
-            return None
 
         merged = merge_kv_cache_memory_profiles(profiles)
         # `merged_regions=`, not `device_regions=`: a reader scanning for the
@@ -1124,15 +1145,14 @@ class RBLNWorker(WorkerBase):
 
         try:
             num_blocks = max_num_blocks(merged, budget, per_node_budget=False)
-        except ValueError:
-            logger.error(
-                "[Dynamic KV] the merged profile has no per-block memory "
-                "growth, i.e. the artifacts were NOT compiled with a dynamic KV "
-                "dim. Check that mark_dynamic ran (VLLM_RBLN_USE_DYNAMIC_KV_"
-                "CACHE must be set before the compile) and that the compile "
-                "cache was not reused from a static build."
-            )
-            return None
+        except ValueError as exc:
+            raise RuntimeError(
+                "[Dynamic KV] the merged profile has no per-block memory growth, "
+                "i.e. the artifacts were NOT compiled with a dynamic KV dim. Check "
+                "that mark_dynamic ran (VLLM_RBLN_USE_DYNAMIC_KV_CACHE must be set "
+                "before the compile) and that the compile cache was not reused "
+                "from a static build."
+            ) from exc
 
         base_usage = per_chiplet_usage(merged, 0)
         logger.info(
@@ -1140,14 +1160,13 @@ class RBLNWorker(WorkerBase):
             {k: v for k, v in sorted(base_usage.items())},
         )
         if num_blocks <= 0:
-            logger.error(
+            raise RuntimeError(
                 "[Dynamic KV] max_num_blocks() returned 0: not even num_blocks=0 "
-                "fits the per-chiplet budget of %d bytes. Predicted base usage "
-                "%s.",
-                budget_per_chiplet,
-                {k: v for k, v in sorted(base_usage.items())},
+                f"fits the per-chiplet budget of {budget_per_chiplet} bytes. "
+                f"Predicted base usage {dict(sorted(base_usage.items()))}. Raise "
+                "the budget (--gpu-memory-utilization, more devices) or shrink the "
+                "model's non-KV footprint."
             )
-            return None
 
         fit_usage = per_chiplet_usage(merged, num_blocks)
         logger.info(

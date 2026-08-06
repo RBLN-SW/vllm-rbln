@@ -1821,3 +1821,100 @@ class TestDynamicKvLayoutGuards:
         )
         with pytest.raises(RuntimeError, match="cross-layer KV"):
             RBLNWorker._assert_dynamic_kv_cache_layout(worker)
+
+
+class TestDynamicKvFailuresRaise:
+    """After the shrink, a failure to size from the device must not boot.
+
+    The shrink is the trigger for the whole feature, so once it has happened every
+    later failure leaves the run on the pre-compile estimate -- and on
+    tensor_parallel_size>=2 with the compile-time cache still resident and charged
+    to nobody, because the charge sits past these branches. The three gates that
+    fire *before* the shrink stay as a quiet None: nothing was changed yet.
+    """
+
+    @staticmethod
+    def _worker(*, shrunk=True, override=None, runtimes=(), profiles_raise=None):
+        return SimpleNamespace(
+            rank=0,
+            cache_config=SimpleNamespace(num_gpu_blocks_override=override),
+            _kv_blocks_before_shrink=211 if shrunk else None,
+            model_runner=SimpleNamespace(
+                kv_cache_config=SimpleNamespace(num_blocks=211)
+            ),
+            _collect_dynamic_kv_runtimes=lambda: list(runtimes),
+            _assert_dynamo_runtimes=lambda rs: None,
+        )
+
+    @staticmethod
+    def _call(worker):
+        from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
+
+        with patch(
+            "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE",
+            True,
+        ):
+            return RBLNWorker.compute_dynamic_kv_num_blocks(worker)
+
+    def test_no_runtime_after_the_shrink_raises(self):
+        with pytest.raises(RuntimeError, match="no rbln runtime was registered"):
+            self._call(self._worker(runtimes=()))
+
+    def test_no_profile_after_the_shrink_raises(self):
+        """Every runtime refusing the query is the documented static-artifact case.
+
+        It used to log an error and boot on the estimate, which is the bug this
+        feature exists to remove.
+        """
+        runtime = SimpleNamespace(
+            _executor=SimpleNamespace(
+                kv_cache_memory_profile=lambda: (_ for _ in ()).throw(
+                    RuntimeError("no dynamic-shape variable")
+                )
+            )
+        )
+        with pytest.raises(RuntimeError) as exc:
+            self._call(self._worker(runtimes=(runtime,)))
+        assert "did not return" in str(exc.value) or "not one of the" in str(exc.value)
+        assert "VLLM_CACHE_ROOT" in str(exc.value)
+
+    def test_the_pre_shrink_gates_still_return_none(self):
+        """Flag off, an override, and "not shrunk" are legitimate: nothing moved."""
+        from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
+
+        # Flag off.
+        with patch(
+            "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE",
+            False,
+        ):
+            assert RBLNWorker.compute_dynamic_kv_num_blocks(self._worker()) is None
+        # Override pins the count.
+        assert self._call(self._worker(override=64)) is None
+        # The shrink did not happen, so there is nothing to size from.
+        assert self._call(self._worker(shrunk=False)) is None
+
+
+class TestDynamicKvDeviceTensorGuard:
+    """VLLM_RBLN_USE_DEVICE_TENSOR=0 is the one configuration that could
+    legitimately produce no profile, so it is refused up front rather than left to
+    surface as the post-shrink raise above."""
+
+    @staticmethod
+    def _assert(*, use_device_tensor):
+        from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
+
+        worker = SimpleNamespace(
+            model_config=SimpleNamespace(use_mla=False),
+            vllm_config=SimpleNamespace(speculative_config=None),
+        )
+        with patch(
+            "vllm_rbln.v1.worker.rbln_worker.USE_DEVICE_TENSOR", use_device_tensor
+        ):
+            RBLNWorker._assert_dynamic_kv_model_supported(worker)
+
+    def test_device_tensor_off_is_refused(self):
+        with pytest.raises(RuntimeError, match="VLLM_RBLN_USE_DEVICE_TENSOR=1"):
+            self._assert(use_device_tensor=False)
+
+    def test_device_tensor_on_passes(self):
+        self._assert(use_device_tensor=True)
