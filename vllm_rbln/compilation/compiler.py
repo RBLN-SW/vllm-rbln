@@ -17,7 +17,6 @@ from collections.abc import Callable
 from typing import Any, TypeVar, cast
 
 import torch
-from rebel import CompileContext
 from vllm.distributed import get_dp_group, get_pp_group, get_tp_group
 
 from vllm_rbln import envs
@@ -42,14 +41,6 @@ def _ensure_torch_dynamo_configured() -> None:
     _DYNAMO_CONFIGURED = True
 
 
-def create_compile_context(
-    use_weight_sharing: bool = False, use_global_ctx: bool = False
-) -> CompileContext:
-    return CompileContext(
-        use_weight_sharing=use_weight_sharing, use_global_ctx=use_global_ctx
-    )
-
-
 def build_process_group_dict() -> dict[str, list[int]]:
     """Build process group metadata consumed by the RBLN torch.compile backend."""
     tp = get_tp_group()
@@ -72,9 +63,8 @@ def compile(
     backend: str | Callable = rbln_backend,
     dynamic: bool = False,
     fullgraph: bool = False,
-    compile_context: CompileContext | None = None,
     num_devices: int | None = None,
-    model_trace_method: str = "",
+    model_trace_method: str = "export",
     process_group_dict: dict[str, list[int]] | None = None,
     guard_filter_fn: Callable | None = None,
     runtime_holder: list | None = None,
@@ -93,7 +83,6 @@ def compile(
             return
         options[key] = value
 
-    set_option("compile_context", compile_context)
     set_option("num_devices", num_devices)
     set_option("model_trace_method", model_trace_method)
     set_option("process_group_dict", process_group_dict)

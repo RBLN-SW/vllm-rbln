@@ -102,12 +102,10 @@ from vllm_rbln import envs
 from vllm_rbln.compilation import (
     build_process_group_dict,
     compile,
-    create_compile_context,
     set_compile_stage,
 )
 from vllm_rbln.forward_context import RBLNDPMetadata, set_forward_context
 from vllm_rbln.logger import init_logger
-from vllm_rbln.platform import HAS_TORCH_RBLN, USE_DEVICE_TENSOR
 from vllm_rbln.v1.attention.backends.flash_attention import (
     RBLNFlashAttentionMetadataBuilder,
 )
@@ -238,13 +236,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         # TODO(RBLN): Multi-modal data support
         # TODO(RBLN): Async scheduling
-
-        # NOTE(RBLN): Compilation context for marking the KV cache address as static.
-        self.compile_context = (
-            create_compile_context(use_weight_sharing=True, use_global_ctx=True)
-            if not USE_DEVICE_TENSOR
-            else None
-        )
         self.runtime_holder: list = []
 
         # Sampler
@@ -253,7 +244,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
             self.sampler = RBLNSampler(
                 logprobs_mode=self.model_config.logprobs_mode,
-                compile_context=self.compile_context,
             )
             logger.info("Using RBLN sampler.")
         else:
@@ -303,7 +293,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 )
             self.rejection_sampler = RBLNRejectionSampler(
                 self.sampler,
-                self.compile_context,
                 self.speculative_config,
                 self.device,
             )
@@ -422,7 +411,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self.performance_ctx = PerformanceContext("runner", self.runtime_holder)
 
         self.offload_context = nullcontext
-        if HAS_TORCH_RBLN and USE_DEVICE_TENSOR and not envs.VLLM_RBLN_DISABLE_OFFLOAD:
+        if not envs.VLLM_RBLN_DISABLE_OFFLOAD:
             self.offload_context = torch.rbln.offload
 
     def _get_positions(self, num_tokens: Any):
@@ -1802,9 +1791,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             self.model_executable = compile(
                 model_wrapper,
                 dynamic=False,
-                compile_context=self.compile_context,
                 num_devices=envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
-                model_trace_method="export" if USE_DEVICE_TENSOR else "",
                 process_group_dict=process_group_dict,
                 guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
                 runtime_holder=self.runtime_holder,
@@ -1815,9 +1802,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             self.compute_logits = compile(
                 self.model.compute_logits,
                 dynamic=False,
-                compile_context=self.compile_context,
                 num_devices=envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
-                model_trace_method="export" if USE_DEVICE_TENSOR else "",
                 process_group_dict=process_group_dict,
                 guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
                 runtime_holder=self.runtime_holder,
@@ -2325,13 +2310,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         """
         kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-            device = (
-                "cpu"
-                if not envs.VLLM_RBLN_COMPILE_MODEL
-                else self.device
-                if USE_DEVICE_TENSOR
-                else "meta"
-            )
+            device = "cpu" if not envs.VLLM_RBLN_COMPILE_MODEL else self.device
             tensor = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=device)
             for layer_name in kv_cache_tensor.shared_by:
                 kv_cache_raw_tensors[layer_name] = tensor
@@ -2540,24 +2519,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         )
         self.kv_cache_names = get_kv_cache_names(kv_caches, num_attn_module)
         assert len(self.kv_cache_names) == len(self.kv_caches)
-
-        if (
-            not USE_DEVICE_TENSOR
-            and not self.model_config.enforce_eager
-            and envs.VLLM_RBLN_COMPILE_MODEL
-        ):
-            # `mark_static_address` is last-write-wins on storage->name. Pin to
-            # one canonical layer per pool so the runtime, the connector's host
-            # buffers, and the runtime copy path address the same name (and the
-            # same logical block_id space).
-            layers_to_register = self._select_canonical_kv_layers_per_pool(
-                kv_cache_config
-            )
-            for name, kv_cache in kv_caches.items():
-                if name not in layers_to_register:
-                    continue
-                self.compile_context.mark_static_address(kv_cache, name)
-
         return kv_caches
 
     def maybe_add_kv_sharing_layers_to_kv_cache_groups(
@@ -2661,8 +2622,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             ) -> None:
                 """Copy KV blocks between the host xfer buffer and the device KV
                 cache. Splits K/V (dim 0) first so each per-block view is
-                contiguous, hitting `_copy_from_rbln`'s direct-DMA fast path.
-                Requires VLLM_RBLN_USE_DEVICE_TENSOR=1."""
+                contiguous, hitting `_copy_from_rbln`'s direct-DMA fast path."""
                 if (
                     not src_kv_caches
                     or not dst_kv_caches
@@ -2917,24 +2877,15 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self,
         copy_ops: list[KVCacheCopyOp],
     ) -> None:
-        use_runtime_kv_copy = (
-            not USE_DEVICE_TENSOR
-            and not self.model_config.enforce_eager
-            and envs.VLLM_RBLN_COMPILE_MODEL
-        )
         for op in copy_ops:
-            if use_runtime_kv_copy:
-                runtime = self.runtime_holder[0]
-                runtime._copy_kv_cache(op.src_block_id, op.dst_block_id, op.num_tokens)
-            else:
-                for kv_cache in self.kv_caches:
-                    src = op.src_block_id
-                    dst = op.dst_block_id
-                    nt = op.num_tokens
-                    if self.model_config.use_mla:
-                        kv_cache[dst, :nt, :] = kv_cache[src, :nt, :]
-                    else:
-                        kv_cache[:, dst, :, :, :nt, :] = kv_cache[:, src, :, :, :nt, :]
+            for kv_cache in self.kv_caches:
+                src = op.src_block_id
+                dst = op.dst_block_id
+                nt = op.num_tokens
+                if self.model_config.use_mla:
+                    kv_cache[dst, :nt, :] = kv_cache[src, :nt, :]
+                else:
+                    kv_cache[:, dst, :, :, :nt, :] = kv_cache[:, src, :, :, :nt, :]
 
 
 def _pad_rows(t: torch.Tensor | None, bucket: int) -> torch.Tensor | None:

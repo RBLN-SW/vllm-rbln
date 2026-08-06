@@ -31,7 +31,6 @@ from vllm_rbln.compilation import (
 )
 from vllm_rbln.forward_context import RBLNDPMetadata, set_forward_context
 from vllm_rbln.logger import init_logger
-from vllm_rbln.platform import USE_DEVICE_TENSOR
 from vllm_rbln.utils import pad
 from vllm_rbln.v1.attention.kv_cache_bindings import (
     attach_kv_cache_bindings,
@@ -393,9 +392,7 @@ class RBLNEagleProposer(EagleProposer):
                 model_wrapper,
                 dynamic=False,
                 fullgraph=True,
-                compile_context=self.runner.compile_context,
                 num_devices=envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
-                model_trace_method="export" if USE_DEVICE_TENSOR else "",
                 process_group_dict=build_process_group_dict(),
                 guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
                 mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",

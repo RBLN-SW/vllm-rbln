@@ -16,13 +16,11 @@ from vllm_rbln.compilation.backends import rbln_backend, set_compile_stage
 from vllm_rbln.compilation.compiler import (
     build_process_group_dict,
     compile,
-    create_compile_context,
 )
 
 __all__ = [
     "build_process_group_dict",
     "compile",
-    "create_compile_context",
     "rbln_backend",
     "set_compile_stage",
 ]

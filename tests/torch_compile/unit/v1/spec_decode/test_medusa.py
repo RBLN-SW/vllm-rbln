@@ -71,7 +71,6 @@ def make_proposer_stub(
     hidden_size: int = 4,
     dtype: torch.dtype = torch.float32,
     enforce_eager: bool = True,
-    compile_context: object | None = None,
 ) -> RBLNMedusaProposer:
     """Build a proposer without running the heavy base __init__.
 
@@ -86,7 +85,6 @@ def make_proposer_stub(
     stub.hidden_states = torch.zeros(
         max_num_seqs, hidden_size, device=DEVICE, dtype=dtype
     )
-    stub.compile_context = object() if compile_context is None else compile_context
     stub.vllm_config = make_vllm_config(
         max_num_seqs=max_num_seqs, enforce_eager=enforce_eager
     )
@@ -118,9 +116,6 @@ def patch_base_init(
 # Verifies __init__ preallocates a persistent buffer padded to max_num_seqs.
 def test_init_preallocates_padded_hidden_states(monkeypatch):
     patch_base_init(monkeypatch, hidden_size=6, dtype=torch.float16)
-    monkeypatch.setattr(
-        medusa_module, "create_compile_context", Mock(return_value=object())
-    )
     vllm_config = make_vllm_config(max_num_seqs=4)
 
     proposer = RBLNMedusaProposer(vllm_config, DEVICE)
@@ -242,8 +237,7 @@ def test_load_model_compiles_wrapper(monkeypatch, strict):
     assert fake.model_executable is compiled_sentinel
     assert captured["dynamic"] is False
     assert captured["fullgraph"] is True
-    assert captured["compile_context"] is fake.compile_context
-    assert captured["num_devices"] == 8
+    assert captured["tensor_parallel_size"] == 8
     assert captured["process_group_dict"] is process_group_sentinel
     assert captured["guard_filter_fn"] is torch.compiler.keep_tensor_guards_unsafe
     assert captured["mode"] == ("strict" if strict else "")

@@ -71,31 +71,24 @@ def _generated_token_ids(outputs) -> list[list[int]]:
     ],
 )
 def test_sub_block_prefix_cache_matches_baseline(
-    monkeypatch: pytest.MonkeyPatch, use_device_tensor: bool
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    env = {"VLLM_RBLN_USE_DEVICE_TENSOR": "1" if use_device_tensor else "0"}
-
     # RblnPlatform freezes device attrs at import; re-sync after env change.
     from vllm_rbln.platform import RblnPlatform
 
-    dev = "rbln" if use_device_tensor else "cpu"
-    monkeypatch.setattr(RblnPlatform, "device_type", dev)
-    monkeypatch.setattr(RblnPlatform, "device_name", dev)
-    monkeypatch.setattr(
-        RblnPlatform, "dist_backend", "rbln-ccl" if use_device_tensor else ""
-    )
+    monkeypatch.setattr(RblnPlatform, "device_type", "rbln")
+    monkeypatch.setattr(RblnPlatform, "device_name", "rbln")
+    monkeypatch.setattr(RblnPlatform, "dist_backend", "rbln-ccl")
 
     # Each engine is shut down before the next is built, so they never coexist.
     with managed_llm(
-        monkeypatch, env, **_llm_kwargs(enable_prefix_caching=False)
+        monkeypatch, **_llm_kwargs(enable_prefix_caching=False)
     ) as baseline:
         baseline_tokens = _generated_token_ids(
             baseline.generate(PROMPTS, SAMPLING_PARAMS)
         )
 
-    with managed_llm(
-        monkeypatch, env, **_llm_kwargs(enable_prefix_caching=True)
-    ) as cached:
+    with managed_llm(monkeypatch, **_llm_kwargs(enable_prefix_caching=True)) as cached:
         # Warm up prefix cache
         cached.generate(PROMPTS[0], SAMPLING_PARAMS)
 

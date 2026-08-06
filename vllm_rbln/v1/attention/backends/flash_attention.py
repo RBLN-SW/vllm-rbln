@@ -265,12 +265,26 @@ class RBLNFlashAttentionMetadataBuilder(
                 cache_offsets = rbln_utils.pad(cache_offsets, 0, batch_pad)
                 # Generate sliding window attention mask for decode
                 # mask[b, s] = 1.0 if s <= cache_seq_lens[b] else 0.0
-                positions = torch.arange(sliding_window)[None, :]
+                positions = torch.arange(sliding_window, device=self.device)[None, :]
                 swa_attn_masks = torch.where(positions - cache_seq_lens > 0, 0.0, 1.0)[
                     :, None, None, :
                 ]
 
             local_block_tables = block_tables_tensor[..., :1]
+
+        assert seq_idx.device.type == self.device.type, (
+            f"seq_idx device type {seq_idx.device.type} does not match "
+            f"expected device type {self.device.type}"
+        )
+        assert block_tables_tensor.device.type == self.device.type
+        assert attn_masks is None or attn_masks.device.type == self.device.type
+        assert cache_seq_lens is None or cache_seq_lens.device.type == self.device.type
+        assert cache_offsets is None or cache_offsets.device.type == self.device.type
+        assert swa_attn_masks is None or swa_attn_masks.device.type == self.device.type
+        assert (
+            local_block_tables is None
+            or local_block_tables.device.type == self.device.type
+        )
 
         attn_metadata = RBLNFlashAttentionMetadata(
             seq_lens=self._stage(seq_idx, "seq_idx"),

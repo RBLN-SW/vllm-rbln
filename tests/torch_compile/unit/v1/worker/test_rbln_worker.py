@@ -164,7 +164,6 @@ _INIT_PATCHES = {
     "envs_warmup": "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_ENABLE_WARM_UP",
     "envs_metrics": "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_METRICS",
     "envs_numa": "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_NUMA",
-    "has_torch_rbln": "vllm_rbln.v1.worker.rbln_worker.has_torch_rbln",
 }
 
 
@@ -191,7 +190,6 @@ def _create_worker(
     *,
     num_devices=1,
     num_ray_nodes=1,
-    has_torch_rbln_val=False,
     envs_overrides=None,
 ):
     """Instantiate RBLNWorker with mocked-out heavy dependencies."""
@@ -208,7 +206,6 @@ def _create_worker(
         "envs_warmup": True,
         "envs_metrics": False,
         "envs_numa": False,
-        "has_torch_rbln": has_torch_rbln_val,
     }
     if envs_overrides:
         defaults.update(envs_overrides)
@@ -243,7 +240,6 @@ def _create_worker(
             "envs_warmup",
             "envs_metrics",
             "envs_numa",
-            "has_torch_rbln",
         ):
             p = patch(_INIT_PATCHES[key], defaults[key])
             active.append(p)
@@ -507,16 +503,16 @@ class TestInitDeviceEnv:
             _create_worker(vllm_config=cfg)
 
     def test_num_devices_gt1_sets_npus_env(self):
-        _create_worker(num_devices=2, has_torch_rbln_val=True)
+        _create_worker(num_devices=2)
         assert os.environ.get("RBLN_NPUS_PER_DEVICE") == "2"
 
     def test_tp1_no_npus_per_device(self):
-        _create_worker(num_devices=1, has_torch_rbln_val=True)
+        _create_worker(num_devices=1)
         assert "RBLN_NPUS_PER_DEVICE" not in os.environ
 
     def test_num_devices_gt1_no_torch_rbln(self):
         """Without torch_rbln, RBLN_NPUS_PER_DEVICE should not be set."""
-        _create_worker(num_devices=2, has_torch_rbln_val=False)
+        _create_worker(num_devices=2)
         assert "RBLN_NPUS_PER_DEVICE" not in os.environ
 
     def test_tp4_but_only_2_devices_explicit(self):
@@ -1252,7 +1248,6 @@ class TestInitWorkerDistributed:
             patch("vllm_rbln.v1.worker.rbln_worker.ensure_model_parallel_initialized"),
             patch("vllm_rbln.v1.worker.rbln_worker.ensure_kv_transfer_initialized"),
             patch("vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_AUTO_PORT", True),
-            patch("vllm_rbln.v1.worker.rbln_worker.has_torch_rbln", True),
         ):
             init_worker_distributed_environment(
                 cfg,
@@ -1277,7 +1272,6 @@ class TestInitWorkerDistributed:
             patch("vllm_rbln.v1.worker.rbln_worker.ensure_model_parallel_initialized"),
             patch("vllm_rbln.v1.worker.rbln_worker.ensure_kv_transfer_initialized"),
             patch("vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_AUTO_PORT", True),
-            patch("vllm_rbln.v1.worker.rbln_worker.has_torch_rbln", False),
         ):
             init_worker_distributed_environment(
                 cfg,

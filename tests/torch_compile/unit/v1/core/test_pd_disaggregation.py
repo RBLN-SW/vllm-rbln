@@ -709,17 +709,11 @@ def _build_connector_worker(
 
 
 class TestRblnNixlConnectorWorkerInit:
-    """`__init__` recovers the host-buffer flag (upstream sets it False
-    because `RblnPlatform.device_type == 'cpu'`) and pins block sizes to
-    logical values."""
+    """`__init__` pins block sizes to logical values.
 
-    def test_recovers_host_buffer_for_cpu_kv_device(self):
-        worker = _build_connector_worker(kv_buffer_device="cpu")
-        assert worker.use_host_buffer is True
-
-    def test_no_host_buffer_when_kv_device_is_non_cpu(self):
-        worker = _build_connector_worker(kv_buffer_device="cuda")
-        assert worker.use_host_buffer is False
+    `use_host_buffer` is left to upstream: `device_type == "rbln"` makes
+    its `kv_buffer_device == "cpu"` derivation correct as-is, so there is
+    no RBLN override to test here."""
 
     def test_pins_logical_block_sizes(self):
         worker = _build_connector_worker(num_blocks=128, block_size=64)
@@ -730,9 +724,9 @@ class TestRblnNixlConnectorWorkerInit:
 
 
 class TestRblnNixlConnectorWorkerHostBuffer:
-    """`initialize_host_xfer_buffer` / `set_host_xfer_buffer_ops` honor
-    HND layout, allocate one rebel-aligned buffer per filtered layer, and
-    preserve insertion order (matters for NIXL region indexing in P/D)."""
+    """`initialize_host_xfer_buffer` honors HND layout, allocates one
+    rebel-aligned buffer per filtered layer, and preserves insertion
+    order (matters for NIXL region indexing in P/D)."""
 
     def _patch_worker(self, kv_cache_layout="HND"):
         worker = _build_connector_worker()
@@ -765,24 +759,6 @@ class TestRblnNixlConnectorWorkerHostBuffer:
             worker.initialize_host_xfer_buffer(
                 {"layer0": torch.zeros(4, 2, dtype=torch.float32)}
             )
-
-    def test_set_ops_noop_when_kv_buffer_not_cpu(self):
-        """When kv_buffer_device is not 'cpu' the operation is a no-op —
-        host-buffer copies aren't needed."""
-        worker = _build_connector_worker(kv_buffer_device="cuda")
-
-        sentinel = MagicMock(name="copy_op")
-        worker.set_host_xfer_buffer_ops(sentinel)
-
-        assert not hasattr(worker, "copy_blocks") or worker.copy_blocks is not sentinel
-
-    def test_set_ops_assigns_copy_when_kv_buffer_is_cpu(self):
-        worker = _build_connector_worker(kv_buffer_device="cpu")
-
-        sentinel = MagicMock(name="copy_op")
-        worker.set_host_xfer_buffer_ops(sentinel)
-
-        assert worker.copy_blocks is sentinel
 
 
 # ---------------------------------------------------------------------------
@@ -1106,9 +1082,8 @@ def _build_d2d_worker(**kw):
 
 
 class TestRblnNixlConnectorInitAsserts:
-    """Outer `RblnNixlConnector.__init__` validates `kv_buffer_device` and
-    requires `VLLM_RBLN_USE_DEVICE_TENSOR=1` before constructing either
-    the scheduler or worker side."""
+    """Outer `RblnNixlConnector.__init__` validates `kv_buffer_device`
+    before constructing either the scheduler or worker side."""
 
     def _vllm_config(self, kv_buffer_device="cpu"):
         cfg = MagicMock()
@@ -1118,9 +1093,6 @@ class TestRblnNixlConnectorInitAsserts:
         return cfg
 
     def test_rejects_unknown_kv_buffer_device(self):
-        import os
-        from unittest.mock import patch
-
         import pytest
         from vllm.distributed.kv_transfer.kv_connector.v1.base import (
             KVConnectorRole,
@@ -1130,35 +1102,9 @@ class TestRblnNixlConnectorInitAsserts:
             RblnNixlConnector,
         )
 
-        with (
-            patch.dict(os.environ, {"VLLM_RBLN_USE_DEVICE_TENSOR": "1"}),
-            pytest.raises(AssertionError, match="kv_buffer_device"),
-        ):
+        with pytest.raises(AssertionError, match="kv_buffer_device"):
             RblnNixlConnector(
                 vllm_config=self._vllm_config(kv_buffer_device="cuda"),
-                role=KVConnectorRole.SCHEDULER,
-                kv_cache_config=MagicMock(),
-            )
-
-    def test_requires_use_device_tensor(self):
-        import os
-        from unittest.mock import patch
-
-        import pytest
-        from vllm.distributed.kv_transfer.kv_connector.v1.base import (
-            KVConnectorRole,
-        )
-
-        from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl import (  # noqa: E501
-            RblnNixlConnector,
-        )
-
-        with (
-            patch.dict(os.environ, {"VLLM_RBLN_USE_DEVICE_TENSOR": "0"}),
-            pytest.raises(AssertionError, match="VLLM_RBLN_USE_DEVICE_TENSOR"),
-        ):
-            RblnNixlConnector(
-                vllm_config=self._vllm_config(kv_buffer_device="rbln"),
                 role=KVConnectorRole.SCHEDULER,
                 kv_cache_config=MagicMock(),
             )
@@ -1209,15 +1155,12 @@ class TestRblnNixlConnectorSchedulerHostBufferFlag:
 
 
 class TestRblnNixlConnectorWorkerD2DInit:
-    """Worker `__init__` under `kv_buffer_device='rbln'` flips
-    `use_host_buffer`, raises `nixl_memory_type` to VRAM, and primes the
-    deferred-registration slot that `finalize_kv_cache_registration` later
-    consumes."""
+    """Worker `__init__` under `kv_buffer_device='rbln'` raises
+    `nixl_memory_type` to VRAM and primes the deferred-registration slot
+    that `finalize_kv_cache_registration` later consumes."""
 
     def test_d2d_init_state(self):
         worker = _build_d2d_worker()
-        # Host buffer disabled — D2D path runs directly off the device tensor.
-        assert worker.use_host_buffer is False
         # VRAM segment: nixl-rbln uses ibv_reg_dmabuf_mr for device dmabufs.
         assert worker.nixl_memory_type == "VRAM"
         # Deferred-registration slot declared up-front so other methods can
@@ -1350,28 +1293,6 @@ class TestRblnNixlConnectorWorkerFinalizeKvCacheRegistration:
         assert impl.call_count == 1
 
 
-class TestRblnNixlConnectorWorkerSetHostXferBufferOps:
-    """`set_host_xfer_buffer_ops` is called by the runner regardless of
-    `kv_buffer_device`. On D2D there's no host buffer to copy through,
-    so the call must short-circuit and leave `copy_blocks` unset."""
-
-    def test_rbln_returns_without_setting_copy_blocks(self):
-        worker = _build_d2d_worker()
-        sentinel = MagicMock()
-        worker.set_host_xfer_buffer_ops(sentinel)
-        # copy_blocks must not have been assigned to the runner-supplied op.
-        assert getattr(worker, "copy_blocks", None) is not sentinel
-
-    def test_cpu_assigns_copy_blocks(self):
-        """Sanity: on the host-bounce path the runner-supplied callback
-        is installed verbatim."""
-        worker = _build_connector_worker(kv_buffer_device="cpu")
-        worker.use_host_buffer = True
-        sentinel = MagicMock()
-        worker.set_host_xfer_buffer_ops(sentinel)
-        assert worker.copy_blocks is sentinel
-
-
 class TestRblnNixlConnectorWorkerRegisterKvCachesImpl:
     """`_register_kv_caches_impl` (the deferred D2D body) is what
     `finalize_kv_cache_registration` calls after warm-up materializes
@@ -1403,6 +1324,9 @@ class TestRblnNixlConnectorWorkerRegisterKvCachesImpl:
         worker.model_config = MagicMock()
         worker.model_config.get_total_num_kv_heads.return_value = 8
         worker.host_xfer_buffers = {}
+        # Upstream derives this from `kv_buffer_device`; D2D never stages
+        # through a host buffer.
+        worker.use_host_buffer = False
         worker.nixl_wrapper = MagicMock()
         worker.nixl_wrapper.get_agent_metadata.return_value = b"agent-meta"
         worker.kv_caches_base_addr = {worker.engine_id: {0: None}}
