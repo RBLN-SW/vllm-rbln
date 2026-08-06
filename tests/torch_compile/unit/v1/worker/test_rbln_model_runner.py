@@ -3009,7 +3009,13 @@ def test_sample_tokens_skips_draft_proposal_when_drafter_context_overflows(
     output = rbln_model_runner.sample_tokens(grammar_output=None)
 
     assert calls == ["sample", "bookkeeping"]
-    assert rbln_model_runner._draft_token_ids is None
+    # The drafter was skipped, so the producer zeroes the drafts rather than
+    # leaving them `None` -- same as upstream's `gpu_model_runner`, which is why
+    # `take_draft_token_ids` carries no `None` case.
+    stale = rbln_model_runner._draft_token_ids
+    assert isinstance(stale, torch.Tensor)
+    assert stale.shape[1] == rbln_model_runner.num_spec_tokens
+    assert not stale.any()
     assert rbln_model_runner.execute_model_state is None
 
     assert output.req_ids == [req_id]
