@@ -350,7 +350,8 @@ def test_set_inputs_first_pass_uses_explicit_indices():
     )
 
     assert num_tokens == 5
-    assert token_indices is explicit
+    assert token_indices.device.type == stub.device.type
+    assert_close(token_indices, explicit)
     # input_ids[:4] = [11, 20, 21, 22]; scatter 99,88 at indices 0 and 3
     assert_close(stub.input_ids[:4], torch.tensor([99, 20, 21, 88], dtype=torch.int32))
 
