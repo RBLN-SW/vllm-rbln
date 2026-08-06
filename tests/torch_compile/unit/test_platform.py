@@ -100,10 +100,9 @@ def test_get_attn_backend_cls():
 
 
 # ---------------------------------------------------------------------------
-# check_and_update_config: VLLM_RBLN_USE_DYNAMIC_KV_CACHE needs the vLLM-native
-# path. The check has to sit outside the VLLM_RBLN_USE_VLLM_MODEL branch --
-# `validate_and_setup_prerequisite` only runs inside it, so a guard placed there
-# cannot see the optimum-rbln path this refuses.
+# check_and_update_config: the flag needs the vLLM-native path. The check sits
+# outside the VLLM_RBLN_USE_VLLM_MODEL branch because
+# `validate_and_setup_prerequisite` only runs inside it.
 # ---------------------------------------------------------------------------
 def _thin_config():
     from types import SimpleNamespace

@@ -1572,12 +1572,10 @@ class TestMaybeShrinkKvCacheForCompile:
 
     @staticmethod
     def _shrink(config, *, dynamic=True, override=None, warmup_skipped=False):
-        """Drive the method with the flag injected as a module attribute.
+        """Drive the method with the flag patched as a module attribute.
 
-        Patched as a module attribute rather than via `os.environ`: an earlier test
-        using `monkeypatch.setattr` on this module leaves a real attribute
-        shadowing the getter (see conftest). The block count is not injectable at
-        all -- it is the module constant COMPILE_KV_CACHE_NUM_BLOCKS.
+        Not via `os.environ`: a setattr elsewhere leaves an attribute shadowing the
+        getter (see conftest). The block count is a constant, not injectable.
         """
         from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
 
@@ -1711,14 +1709,8 @@ class TestChargeRemedyWording:
 
 
 class TestDynamicKvLayoutGuards:
-    """The layout guard is split across `initialize_kv_cache`.
-
-    The attention-layer half reads only `vllm_config`, which `load_model` has
-    already filled, so it runs before the shrink -- otherwise an unsupported
-    layout surfaces as the shrink's block-count refusal. The other half reads
-    runner state that `initialize_kv_cache` fills and must stay after it, or it
-    inspects empty containers and passes vacuously.
-    """
+    """The layout guard is split across `initialize_kv_cache`: the attention half
+    runs before it, the binding half after, and neither may drift."""
 
     @staticmethod
     def _layer(sliding_window=None, is_causal=True, is_normal=False):
@@ -1762,16 +1754,11 @@ class TestDynamicKvLayoutGuards:
             RBLNWorker.initialize_from_config(worker, config)
 
         assert calls.index("attention") < calls.index("shrink")
-        # And the binding checks stay behind the allocation that fills them.
         assert calls.index("bindings") > calls.index("initialize_kv_cache")
 
     def test_a_non_paged_causal_layer_is_refused_by_name(self):
-        """`block_size == max_model_len` makes is_normal True.
-
-        This is the case the ordering exists for: the estimate can be at or below
-        the compile-time hint, and the block-count refusal would then fire first
-        and blame the block count for a layout problem.
-        """
+        """`block_size == max_model_len` makes is_normal True -- and is also where
+        the estimate can fall below the hint, so the wrong refusal could fire."""
         from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
 
         worker = SimpleNamespace(vllm_config=object())
@@ -1785,7 +1772,6 @@ class TestDynamicKvLayoutGuards:
             RBLNWorker._assert_dynamic_kv_attention_layout(worker)
         assert "paged_flash_causal_attention_naive" in str(exc.value)
         assert "layer.0" in str(exc.value)
-        # Not the shrink's message.
         assert "nothing to shrink" not in str(exc.value)
 
     def test_a_paged_causal_layer_passes(self):
@@ -1824,17 +1810,11 @@ class TestDynamicKvLayoutGuards:
 
 
 class TestDynamicKvFailuresRaise:
-    """After the shrink, a failure to size from the device must not boot.
-
-    The shrink is the trigger for the whole feature, so once it has happened every
-    later failure leaves the run on the pre-compile estimate -- and on
-    tensor_parallel_size>=2 with the compile-time cache still resident and charged
-    to nobody, because the charge sits past these branches. The three gates that
-    fire *before* the shrink stay as a quiet None: nothing was changed yet.
-    """
+    """After the shrink, failing to size from the device must not boot: the run
+    would serve the pre-compile estimate. The gates before it stay a quiet None."""
 
     @staticmethod
-    def _worker(*, shrunk=True, override=None, runtimes=(), profiles_raise=None):
+    def _worker(*, shrunk=True, override=None, runtimes=()):
         return SimpleNamespace(
             rank=0,
             cache_config=SimpleNamespace(num_gpu_blocks_override=override),
@@ -1882,13 +1862,11 @@ class TestDynamicKvFailuresRaise:
         """Flag off, an override, and "not shrunk" are legitimate: nothing moved."""
         from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
 
-        # Flag off.
         with patch(
             "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE",
             False,
         ):
             assert RBLNWorker.compute_dynamic_kv_num_blocks(self._worker()) is None
-        # Override pins the count.
         assert self._call(self._worker(override=64)) is None
         # The shrink did not happen, so there is nothing to size from.
         assert self._call(self._worker(shrunk=False)) is None

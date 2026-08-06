@@ -96,19 +96,12 @@ logger = init_logger(__name__)
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 
-# Blocks the KV cache is shrunk to for the compile. Not a capacity: the traced
-# `num_blocks` is only the hint of the mark_dynamic'd dim, and warm-up points every
-# dummy request at block 0, so a small cache suffices. 8 is what the runs measured;
-# below it is unmeasured, and 2 is the smallest expected to keep the dimension
-# dynamic at all (dynamo specializes a size-1 dim away silently).
+# Blocks the cache is shrunk to for the compile -- the mark_dynamic'd dim's trace
+# hint, not a capacity. 8 is measured; below it is not, and 1 specializes away.
 COMPILE_KV_CACHE_NUM_BLOCKS = 8
 
-# Bytes held back from every chiplet's dynamic-KV budget for device memory
-# `kv_cache_memory_profile()` does not describe: the profile is not a complete
-# inventory, so eager buffers and command-stream pools that match no region would
-# otherwise be handed to KV blocks. Sized from the sum of those items on a
-# measured run (41,968,576 B), rounded up; it costs zero blocks on both
-# configurations measured on device.
+# Held back from every chiplet's budget for device memory the profile does not
+# describe. 41,968,576 B measured, rounded up; costs zero blocks on both configs.
 DYNAMIC_KV_UNPROFILED_RESERVE_BYTES = 48 * 1024 * 1024
 
 
@@ -718,10 +711,8 @@ class RBLNWorker(WorkerBase):
                 "then the combination is refused rather than mis-sized."
             )
 
-        # `USE_DEVICE_TENSOR` is `VLLM_RBLN_USE_VLLM_MODEL and
-        # VLLM_RBLN_USE_DEVICE_TENSOR`, and the platform already refuses the flag
-        # without the former, so reaching here with it False means the operator
-        # turned VLLM_RBLN_USE_DEVICE_TENSOR off.
+        # `USE_DEVICE_TENSOR` ANDs in VLLM_RBLN_USE_VLLM_MODEL, which the platform
+        # already requires, so False here means the operator turned the other off.
         if not USE_DEVICE_TENSOR:
             raise RuntimeError(
                 "VLLM_RBLN_USE_DYNAMIC_KV_CACHE requires "
@@ -736,10 +727,8 @@ class RBLNWorker(WorkerBase):
     def _assert_dynamic_kv_attention_layout(self) -> None:
         """Guard: every attention layer must dispatch to the paged-causal kernel.
 
-        Split out of `_assert_dynamic_kv_cache_layout` so it can run *before* the
-        shrink: it reads only `vllm_config`, which `load_model` has already filled,
-        and an unsupported layout otherwise surfaces as the shrink's block-count
-        refusal instead of the real reason.
+        Reads only `vllm_config`, so it runs before the shrink -- otherwise an
+        unsupported layout surfaces as the shrink's block-count refusal.
         """
         attn_layers = get_layers_from_vllm_config(self.vllm_config, Attention)
         offenders: list[str] = []
@@ -777,9 +766,8 @@ class RBLNWorker(WorkerBase):
         below breaks half of that invariant and each fails *silently* -- a no-op
         `mark_dynamic`, or a confusing 'has N uses' rejection -- unless checked.
 
-        These two read runner state that `initialize_kv_cache` fills, so unlike
-        `_assert_dynamic_kv_attention_layout` they cannot move before it: they
-        would see empty containers and pass vacuously.
+        Both read state `initialize_kv_cache` fills, so they cannot move before it:
+        they would see empty containers and pass vacuously.
         """
         mr = self.model_runner
 
