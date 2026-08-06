@@ -361,8 +361,47 @@ class RBLNWorker(WorkerBase):
         logger.info(
             "available_memory_estimate = %.2f GiB", available_memory_estimate / 1024**3
         )
+        self._available_memory_estimate = available_memory_estimate
 
         return available_memory_estimate
+
+    def _log_device_memory(self, phase: str) -> None:
+        """Log measured per-chiplet device memory against the KV budget estimate.
+
+        The estimate is per chiplet (`estimate_available_memory` divides by
+        `rsd_replicas`), and a device runs out on its heaviest chiplet.
+        """
+        if not has_torch_rbln:
+            return
+        try:
+            per_chiplet = torch.rbln.memory_stats_per_chiplet()
+        except (AttributeError, RuntimeError) as exc:
+            logger.debug("per-chiplet memory stats unavailable: %s", exc)
+            return
+        if not per_chiplet:
+            return
+
+        chiplets = sorted({int(key.split(".")[1]) for key in per_chiplet})
+        reserved = [
+            per_chiplet.get(f"chiplet.{c}.reserved.current", 0) for c in chiplets
+        ]
+        logger.info(
+            "[%s] device memory reserved per chiplet = %s GiB (max %.2f, total %.2f)",
+            phase,
+            ", ".join(f"{value / 1024**3:.2f}" for value in reserved),
+            max(reserved) / 1024**3,
+            sum(reserved) / 1024**3,
+        )
+
+        estimate = getattr(self, "_available_memory_estimate", None)
+        if estimate:
+            logger.info(
+                "[%s] KV budget estimate = %.2f GiB/chiplet, heaviest chiplet now "
+                "holds %.2f GiB",
+                phase,
+                estimate / 1024**3,
+                max(reserved) / 1024**3,
+            )
 
     def get_kv_connector_handshake_metadata(self) -> dict | None:
         """Get KV connector metadata from this worker if available."""
@@ -399,6 +438,7 @@ class RBLNWorker(WorkerBase):
         ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
 
         self.model_runner.initialize_kv_cache(kv_cache_config)
+        self._log_device_memory("after-kv-alloc")
 
     @instrument(span_name="Warmup (NPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:
@@ -444,6 +484,7 @@ class RBLNWorker(WorkerBase):
                 )
 
             if is_rbln_oom_error(e.inner_exception):
+                self._log_device_memory("oom")
                 raise RuntimeError(
                     "Not enough memory for "
                     f"{self.model_runner.kv_cache_config.num_blocks} "
@@ -454,6 +495,8 @@ class RBLNWorker(WorkerBase):
         finally:
             # NOTE(RBLN): Apply CPU affinity only after compile/warm-up.
             self._ensure_rbln_cpu_affinity_after_warmup()
+
+        self._log_device_memory("after-warmup")
 
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
