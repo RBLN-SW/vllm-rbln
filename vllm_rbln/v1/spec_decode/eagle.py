@@ -483,6 +483,7 @@ class RBLNEagleProposer(EagleProposer):
             causal=True,
         )
 
+    @torch.inference_mode()
     def dummy_run(
         self,
         num_reqs: int,
