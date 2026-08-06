@@ -108,6 +108,7 @@ from vllm_rbln.compilation import (
 from vllm_rbln.forward_context import RBLNDPMetadata, set_forward_context
 from vllm_rbln.logger import init_logger
 from vllm_rbln.platform import HAS_TORCH_RBLN, USE_DEVICE_TENSOR
+from vllm_rbln.utils import cat_last_dim
 from vllm_rbln.v1.attention.backends.flash_attention import (
     RBLNFlashAttentionMetadataBuilder,
 )
@@ -1684,23 +1685,25 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 else:
                     target_hidden_states = hidden_states[:num_scheduled_tokens]
             else:
-                (
-                    common_attn_metadata,
-                    token_indices_to_sample,
-                    num_rejected_tokens,
-                ) = self.drafter.prepare_inputs_padded(
-                    common_attn_metadata,
-                    spec_decode_metadata,
-                    valid_sampled_tokens_count,
-                )
-                total_num_tokens = common_attn_metadata.num_actual_tokens
-                target_token_ids = self.input_ids[:total_num_tokens]
-                target_positions = self.positions[:total_num_tokens]
-                if self.use_aux_hidden_state_outputs:
-                    assert aux_hidden_states is not None
-                    target_hidden_states = torch.cat(
-                        [h.view(-1, h.shape[-1]) for h in aux_hidden_states], dim=-1
+                with record_function_or_nullcontext("drafter/pre: inputs_padded"):
+                    (
+                        common_attn_metadata,
+                        token_indices_to_sample,
+                        num_rejected_tokens,
+                    ) = self.drafter.prepare_inputs_padded(
+                        common_attn_metadata,
+                        spec_decode_metadata,
+                        valid_sampled_tokens_count,
                     )
+                with record_function_or_nullcontext("drafter/pre: aux_cat"):
+                    total_num_tokens = common_attn_metadata.num_actual_tokens
+                    target_token_ids = self.input_ids[:total_num_tokens]
+                    target_positions = self.positions[:total_num_tokens]
+                    if self.use_aux_hidden_state_outputs:
+                        assert aux_hidden_states is not None
+                        target_hidden_states = cat_last_dim(
+                            [h.view(-1, h.shape[-1]) for h in aux_hidden_states]
+                        )
 
             draft_token_ids = self.drafter.propose(
                 target_token_ids=target_token_ids,

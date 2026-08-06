@@ -27,6 +27,10 @@ from vllm_rbln import envs
 from vllm_rbln.compilation import compile, create_compile_context
 from vllm_rbln.logger import init_logger
 from vllm_rbln.platform import HAS_TORCH_RBLN, USE_DEVICE_TENSOR
+from vllm_rbln.v1.spec_decode.utils import (
+    INDEX_SELECT_GATHER,
+    SKIP_GREEDY_SOFTMAX,
+)
 
 if TYPE_CHECKING:
     from rebel import CompileContext
@@ -109,7 +113,11 @@ class RBLNRejectionSampler(RejectionSampler):
         # logits tensor. This means any in-place operations on bonus_logits
         # won't affect the original logits tensor.
         assert logits is not None
-        bonus_logits = logits[bonus_logits_indices]
+        bonus_logits = (
+            logits.index_select(0, bonus_logits_indices)
+            if INDEX_SELECT_GATHER
+            else logits[bonus_logits_indices]
+        )
         bonus_sampler_output = self.sampler(
             logits=bonus_logits,
             sampling_metadata=replace(
@@ -128,7 +136,11 @@ class RBLNRejectionSampler(RejectionSampler):
         # Just like `bonus_logits`, `target_logits` is a new tensor with
         # separate storage from the original `logits` tensor. Therefore,
         # it is safe to update `target_logits` in place.
-        raw_target_logits = logits[target_logits_indices]
+        raw_target_logits = (
+            logits.index_select(0, target_logits_indices)
+            if INDEX_SELECT_GATHER
+            else logits[target_logits_indices]
+        )
         # Use float32 for the target_logits.
         raw_target_logits = raw_target_logits.to(torch.float32)
         target_logits = self.apply_logits_processors(
@@ -143,7 +155,20 @@ class RBLNRejectionSampler(RejectionSampler):
             sampling_metadata,
         )
         # Compute probability distribution from target logits.
-        target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
+        if SKIP_GREEDY_SOFTMAX and sampling_metadata.all_greedy:
+            # `argmax(softmax(x)) == argmax(x)`, and the all-greedy path takes the
+            # argmax and returns before anything else reads `target_probs` (the
+            # recovered-token and random branches sit after that early return).
+            # So the float32 softmax over [num_tokens, vocab_size] -- 200064 wide
+            # on MiniMax-M2.5 -- produces a tensor whose only use is an argmax
+            # that the logits already answer.
+            #
+            # Not gated on `synthetic_mode`: that path changes which tokens the
+            # greedy kernel accepts via `uniform_probs`, but it still consumes
+            # `target_argmax`, not the distribution.
+            target_probs = target_logits
+        else:
+            target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
 
         output_token_ids = self.impl.rejection_sample(
             metadata.draft_token_ids,

@@ -12,9 +12,62 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import Union
 
 import torch
+
+# Build the padded tensor directly instead of concatenating a pad block onto it.
+#
+# `torch.cat` on an RBLN device tensor -- and with
+# VLLM_RBLN_USE_DEVICE_TENSOR=1 the drafter's hidden-state buffer is one -- costs
+# far more than the bytes involved. On the step-200 trace of Qwen3-1.7B + eagle3
+# (DP4, num_spec 3) `aten::cat` totals 1.12 ms/step, and inside a 0.46 ms
+# `aten::cat` the only children are `narrow`/`slice`/`empty` adding up to 8 us:
+# the remaining 0.45 ms is work the profiler never sees. It is the backend
+# handling a device tensor, not a memcpy.
+#
+# `empty` + `copy_` + `fill_` writes the same values with one allocation instead
+# of two, and one pass over the payload instead of two -- `cat` copies both
+# operands, this copies only `x` and fills the tail. It also keeps the result a
+# non-view, which the branch below exists to guarantee. Measured 1.12 -> 0.89
+# ms/step, consistent across all four DP workers.
+#
+# Only `dim == 0` is rewritten; that is what the callers here use.
+_PAD_NO_CAT = os.getenv("VLLM_RBLN_PAD_NO_CAT", "1") == "1"
+
+
+# Off, and it should stay off: measured a regression. See `cat_last_dim`.
+_CAT_LAST_DIM_NO_CAT = os.getenv("VLLM_RBLN_CAT_LAST_DIM_NO_CAT", "0") == "1"
+
+
+def cat_last_dim(tensors: list[torch.Tensor]) -> torch.Tensor:
+    """Concatenate along the last dimension.
+
+    Kept as a named helper because the `empty` + `copy_` rewrite that works for
+    `pad` above does NOT work here, and that is worth recording rather than
+    rediscovering.
+
+    `_PAD_NO_CAT` replaces a `dim=0` concat, where the writes are contiguous. The
+    last dimension is different: `out[:, off:off + w].copy_(t)` is a strided
+    write, and on an RBLN device tensor that costs more than letting `torch.cat`
+    do it. On EAGLE3's three aux hidden states, region-normalised on the `0/2`
+    decode step: 0.53 -> 1.30 ms/step, a 2.3x regression.
+
+    So the generalisation "cat is expensive on device tensors" is wrong -- it is
+    axis-dependent.
+    """
+    if not _CAT_LAST_DIM_NO_CAT or len(tensors) == 1:
+        return torch.cat(tensors, dim=-1)
+    rows = tensors[0].shape[0]
+    total = sum(t.shape[-1] for t in tensors)
+    out = torch.empty((rows, total), dtype=tensors[0].dtype, device=tensors[0].device)
+    off = 0
+    for t in tensors:
+        width = t.shape[-1]
+        out[:, off : off + width].copy_(t)
+        off += width
+    return out
 
 
 def pad(
@@ -26,6 +79,14 @@ def pad(
         # NOTE: dynamo distinguishes views and non-views for inputs,
         # so ensure that the output is always a non-view.
         return x if x._base is None else x.clone()
+
+    if _PAD_NO_CAT and dim == 0:
+        out = torch.empty(
+            (target_len,) + tuple(x.shape[1:]), dtype=x.dtype, device=x.device
+        )
+        out[:current].copy_(x)
+        out[current:].fill_(pad_value)
+        return out
 
     pad_shape = list(x.shape)
     pad_shape[dim] = target_len - current
