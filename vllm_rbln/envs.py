@@ -63,7 +63,6 @@ if TYPE_CHECKING:
     # Debug-only override of the derived compile-time hint (see
     # compile_kv_cache_num_blocks); 0 opts out of the shrink and the resize.
     VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS: int = 8
-    VLLM_RBLN_DYNAMIC_KV_UNPROFILED_RESERVE_BYTES: int = 48 * 1024 * 1024
     # --- ATTENTION ---
     VLLM_RBLN_FLASH_CAUSAL_ATTN: bool = True
     VLLM_RBLN_BATCH_ATTN_OPT: bool = False
@@ -365,16 +364,6 @@ environment_variables = {
     # above vllm's estimate cancel the shrink (and so the resize); 0 opts out of
     # both. Below 8 is unmeasured.
     "VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS": compile_kv_cache_num_blocks,
-    # Bytes held back from every chiplet's dynamic-KV budget for device memory
-    # `kv_cache_memory_profile()` does not describe: the profile is not a
-    # complete inventory, so eager buffers and command-stream pools that match no
-    # region would otherwise be handed to KV blocks. Sized from the sum of those
-    # items on a measured run, rounded up. 0 disables it.
-    "VLLM_RBLN_DYNAMIC_KV_UNPROFILED_RESERVE_BYTES": lambda: int(
-        os.environ.get(
-            "VLLM_RBLN_DYNAMIC_KV_UNPROFILED_RESERVE_BYTES", 48 * 1024 * 1024
-        )
-    ),
     # --- ATTENTION ---
     # Use flash attention for causal attention
     "VLLM_RBLN_FLASH_CAUSAL_ATTN": (

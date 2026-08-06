@@ -36,7 +36,6 @@ share one signature and can replay each other's codegen.
 | --- | --- | --- |
 | `VLLM_RBLN_USE_DYNAMIC_KV_CACHE` | `0` | The switch. Off means the pre-compile estimate, exactly as before. |
 | `VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS` | derived (`8`) | Debug override of the compile-time block count. `0` opts out of the shrink, and therefore out of the resize. Blank (`VAR=`) counts as unset, so exporting it empty is not a way to change the behaviour. |
-| `VLLM_RBLN_DYNAMIC_KV_UNPROFILED_RESERVE_BYTES` | `48 MiB` | Held back from every chiplet's budget for device memory the profile does not describe. |
 
 ## What the compile-time block count is
 

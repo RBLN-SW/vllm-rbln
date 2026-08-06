@@ -95,6 +95,14 @@ logger = init_logger(__name__)
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 
+# Bytes held back from every chiplet's dynamic-KV budget for device memory
+# `kv_cache_memory_profile()` does not describe: the profile is not a complete
+# inventory, so eager buffers and command-stream pools that match no region would
+# otherwise be handed to KV blocks. Sized from the sum of those items on a
+# measured run (41,968,576 B), rounded up; it costs zero blocks on both
+# configurations measured on device.
+DYNAMIC_KV_UNPROFILED_RESERVE_BYTES = 48 * 1024 * 1024
+
 
 def _kv_cache_config_at(cfg: KVCacheConfig, num_blocks: int) -> KVCacheConfig:
     """A copy of `cfg` retargeted at `num_blocks` (tensor sizes scale with it)."""
@@ -991,8 +999,7 @@ class RBLNWorker(WorkerBase):
                     f"{origin} is already at or below the smallest measured hint, "
                     "so raise the budget instead: --gpu-memory-utilization, a "
                     "smaller --block-size (the retained bytes scale with the page "
-                    "size), VLLM_RBLN_DYNAMIC_KV_UNPROFILED_RESERVE_BYTES, or "
-                    "another process holding memory on the same cards"
+                    "size), or another process holding memory on the same cards"
                 )
             raise RuntimeError(
                 "the retained compile-time KV cache leaves no budget on "
@@ -1020,15 +1027,8 @@ class RBLNWorker(WorkerBase):
             )
         capacity_per_chiplet = dram_total // num_chiplets
         gmu = self.cache_config.gpu_memory_utilization
-        reserve = envs.VLLM_RBLN_DYNAMIC_KV_UNPROFILED_RESERVE_BYTES
-        if reserve < 0:
-            raise RuntimeError(
-                "VLLM_RBLN_DYNAMIC_KV_UNPROFILED_RESERVE_BYTES must not be "
-                f"negative (got {reserve}); a negative reserve would hand the KV "
-                "cache more memory than gpu_memory_utilization allows."
-            )
         gmu_budget = int(capacity_per_chiplet * gmu)
-        raw_budget = gmu_budget - reserve
+        raw_budget = gmu_budget - DYNAMIC_KV_UNPROFILED_RESERVE_BYTES
         # Card-scope figure against a per-chiplet budget, so it must be scaled.
         # Charging the whole card total to every chiplet drove the budget negative
         # and aborted start-up on a configuration that serves fine once scaled.
@@ -1046,7 +1046,7 @@ class RBLNWorker(WorkerBase):
             capacity_per_chiplet,
             gmu,
             gmu_budget,
-            reserve,
+            DYNAMIC_KV_UNPROFILED_RESERVE_BYTES,
             raw_budget,
             self._foreign_dram_used_bytes,
             foreign_per_chiplet,
@@ -1055,7 +1055,8 @@ class RBLNWorker(WorkerBase):
         if budget <= 0:
             raise RuntimeError(
                 f"per-chiplet KV budget is non-positive ({budget} bytes) after "
-                f"subtracting {reserve} bytes of unprofiled reserve and "
+                f"subtracting {DYNAMIC_KV_UNPROFILED_RESERVE_BYTES} bytes of "
+                "unprofiled reserve and "
                 f"{foreign_per_chiplet} bytes of foreign device usage "
                 f"({self._foreign_dram_used_bytes} bytes across "
                 f"{num_chiplets} chiplets)."

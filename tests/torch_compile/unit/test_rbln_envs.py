@@ -146,21 +146,24 @@ def test_provenance_and_value_agree_on_a_blank_value(monkeypatch):
 def test_dynamic_kv_cache_envs_are_read_from_os_environ(monkeypatch):
     monkeypatch.setenv("VLLM_RBLN_USE_DYNAMIC_KV_CACHE", "1")
     monkeypatch.setenv("VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS", "64")
-    monkeypatch.setenv("VLLM_RBLN_DYNAMIC_KV_UNPROFILED_RESERVE_BYTES", "0")
     assert envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE is True
     assert envs.VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS == 64
-    assert envs.VLLM_RBLN_DYNAMIC_KV_UNPROFILED_RESERVE_BYTES == 0
 
 
-def test_unprofiled_reserve_defaults_to_48_mib():
-    """Unlike the other two dynamic-KV variables this one defaults to non-zero.
+def test_the_unprofiled_reserve_is_not_an_env_var():
+    """It is a constant, and it has to stay above what the measurement found.
 
-    That is safe because it is only read inside `_dynamic_kv_chiplet_budget`,
-    which the dynamic KV path is the only caller of, so no existing static
-    deployment can see it.  48 MiB covers the 41,968,576 B of device memory the
-    measured artifacts hold with no matching profile region, and on both configs
-    measured on device it costs zero blocks.
+    48 MiB covers the 41,968,576 B of device memory the measured artifacts hold
+    with no matching profile region, and on both configs measured on device it
+    costs zero blocks. Not an env var: `_dynamic_kv_chiplet_budget` is its only
+    reader, and lowering it is the one "remedy" that would re-create the overrun
+    the reserve exists to prevent.
     """
-    assert "VLLM_RBLN_DYNAMIC_KV_UNPROFILED_RESERVE_BYTES" in envs.environment_variables
-    assert envs.VLLM_RBLN_DYNAMIC_KV_UNPROFILED_RESERVE_BYTES == 48 * 1024 * 1024
-    assert envs.VLLM_RBLN_DYNAMIC_KV_UNPROFILED_RESERVE_BYTES > 41_968_576
+    from vllm_rbln.v1.worker.rbln_worker import DYNAMIC_KV_UNPROFILED_RESERVE_BYTES
+
+    assert (
+        "VLLM_RBLN_DYNAMIC_KV_UNPROFILED_RESERVE_BYTES"
+        not in envs.environment_variables
+    )
+    assert DYNAMIC_KV_UNPROFILED_RESERVE_BYTES == 48 * 1024 * 1024
+    assert DYNAMIC_KV_UNPROFILED_RESERVE_BYTES > 41_968_576
