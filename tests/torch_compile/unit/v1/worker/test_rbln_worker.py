@@ -535,12 +535,8 @@ class TestInitDeviceEnv:
         assert os.environ["RBLN_DEVICES"] == "4,5"
 
     def test_assigned_physical_ids_win_over_the_env_var(self):
-        """Under DP the env var still holds the whole deployment's list.
-
-        vLLM 0.24 stopped narrowing it per rank and puts this rank's share on
-        the config instead, so DP=4/TP=1 sees four entries against a
-        `world_size` of 1 and has to read the mapping.
-        """
+        # Under DP the env var holds the whole deployment; vLLM 0.24 puts this
+        # rank's share on the config instead.
         os.environ["RBLN_DEVICES"] = "4,5,6,7"
         cfg = _make_vllm_config(
             world_size=1,
@@ -552,7 +548,6 @@ class TestInitDeviceEnv:
         assert os.environ["RBLN_DEVICES"] == "6"
 
     def test_assigned_physical_ids_expand_by_num_devices(self):
-        """The mapping feeds the same per-local-rank expansion as the env var."""
         os.environ["RBLN_DEVICES"] = "0,1,2,3"
         cfg = _make_vllm_config(
             world_size=2,
@@ -564,7 +559,6 @@ class TestInitDeviceEnv:
         assert os.environ["RBLN_DEVICES"] == "6,7"
 
     def test_no_assignment_falls_back_to_the_env_var(self):
-        """Without a mapping the pre-0.24 behaviour is kept exactly."""
         os.environ["RBLN_DEVICES"] = "0,1"
         cfg = _make_vllm_config(
             world_size=2,
@@ -576,7 +570,6 @@ class TestInitDeviceEnv:
         assert os.environ["RBLN_DEVICES"] == "0"
 
     def test_assigned_physical_ids_wrong_count_still_asserts(self):
-        """A mapping that does not match `world_size` must not pass silently."""
         os.environ["RBLN_DEVICES"] = "4,5,6,7"
         cfg = _make_vllm_config(
             world_size=1,
