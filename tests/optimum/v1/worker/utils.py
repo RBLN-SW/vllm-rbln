@@ -72,17 +72,15 @@ DEVICE = current_platform.device_type
 
 class MockModelWrapper(nn.Module):
     class MockModel:
-        def __init__(self):
-            self.rbln_config = SimpleNamespace(
-                use_multiple_decoder=False, dtype=torch.float32
-            )
+        def __init__(self, dtype: torch.dtype):
+            self.rbln_config = SimpleNamespace(use_multiple_decoder=False, dtype=dtype)
             self.kv_block_adapter = SimpleNamespace(
                 get_available_num_blocks=lambda: NUM_BLOCKS
             )
 
-    def __init__(self):
+    def __init__(self, dtype: torch.dtype = torch.float32):
         super().__init__()
-        self.model = self.MockModel()
+        self.model = self.MockModel(dtype)
         self.dtype = self.model.rbln_config.dtype
 
     def compute_logits(
@@ -91,18 +89,20 @@ class MockModelWrapper(nn.Module):
         return hidden_states
 
 
-def fake_load_model(runner: RBLNOptimumModelRunner):
+def fake_load_model(
+    runner: RBLNOptimumModelRunner, model_dtype: torch.dtype = torch.float32
+):
     def fake_forward(model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
         current_num_reqs = runner.input_batch.num_reqs
         current_vocab_size = runner.model_config.get_vocab_size()
 
         return torch.randn(
             (current_num_reqs, 1, current_vocab_size),
-            dtype=torch.float32,
+            dtype=model_dtype,
             device=runner.device,
         )
 
-    runner.model = MockModelWrapper()
+    runner.model = MockModelWrapper(model_dtype)
     runner.use_optimum_lora = False
     # Assign the fake forward function to the model
     runner.model.forward = fake_forward
@@ -146,6 +146,8 @@ def make_request(
     mm_hashes: list[str] | None = None,
     prompt_logprobs: int | None = None,
     cache_salt: str | None = None,
+    min_tokens: int = 0,
+    stop_token_ids: list[int] | None = None,
 ):
     mm_features = []
     if mm_positions is not None:
@@ -167,6 +169,8 @@ def make_request(
 
     sampling_params = SamplingParams(
         max_tokens=17,
+        min_tokens=min_tokens,
+        stop_token_ids=stop_token_ids,
         prompt_logprobs=prompt_logprobs,
         structured_outputs=structured_outputs,
         top_p=top_p,
@@ -380,7 +384,9 @@ def _schedule_cached_reqs(
     )
 
 
-def create_model_runner(max_num_seqs: int = MAX_NUM_SEQ):
+def create_model_runner(
+    max_num_seqs: int = MAX_NUM_SEQ, model_dtype: torch.dtype = torch.float32
+):
     vllm_config = get_vllm_config(max_num_seqs=max_num_seqs)
     with set_current_vllm_config(vllm_config, check_compile=False):
         temp_file = tempfile.mkstemp()[1]
@@ -396,7 +402,7 @@ def create_model_runner(max_num_seqs: int = MAX_NUM_SEQ):
             1,
         )
     runner = RBLNOptimumModelRunner(vllm_config, DEVICE)
-    fake_load_model(runner)
+    fake_load_model(runner, model_dtype)
     return runner
 
 

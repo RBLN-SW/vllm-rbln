@@ -389,3 +389,54 @@ def test_sampler_logits_reshape_keeps_shape_and_stride_stable(monkeypatch):
     assert seen[0] == seen[1], (
         f"sampler input changed across stride change: {seen[0]} -> {seen[1]}"
     )
+
+
+def test_min_tokens_masks_stop_tokens_in_half_precision_logits(monkeypatch):
+    """
+    RBLNSampler hands the logits to the logits processors in the model dtype
+    instead of casting them to float32, so a half-precision model produces a
+    half-precision logits buffer. MinTokensLogitsProcessor writes its -inf
+    constant with `index_put_`, which requires the source dtype to match the
+    destination exactly, so a float32 constant raises on that buffer.
+    """
+
+    monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1")
+    monkeypatch.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
+    monkeypatch.setenv("VLLM_RBLN_ENABLE_WARM_UP", "False")
+
+    stop_token_id = 5
+    runner = create_model_runner(max_num_seqs=1, model_dtype=torch.float16)
+
+    # Hold on to the tensor the sampler is handed: the logits processors mutate
+    # it in place, so it carries the mask once the step is over.
+    seen_logits: list[torch.Tensor] = []
+    real_forward = runner.sampler.forward
+
+    def recording_forward(logits, *args, **kwargs):
+        seen_logits.append(logits)
+        return real_forward(logits, *args, **kwargs)
+
+    monkeypatch.setattr(runner.sampler, "forward", recording_forward)
+
+    req = make_request(
+        request_id="req_0",
+        prompt_token_ids=[1, 2, 3],
+        min_tokens=8,
+        stop_token_ids=[stop_token_id],
+    )
+    scheduler_output = _schedule_new_request_from_request(
+        req, block_ids=([0],), outer_block_ids=[0]
+    )
+    runner.execute_model(scheduler_output)
+    assert runner.sample_tokens(grammar_output=None) is not None
+
+    assert len(seen_logits) == 1
+    logits = seen_logits[0]
+    assert logits.dtype == torch.float16, (
+        f"sampler should keep the model dtype, got {logits.dtype}"
+    )
+    # The request has produced no output token yet, so it is short of its
+    # min_tokens and its stop token must be inhibited.
+    assert logits[0, stop_token_id] == -float("inf"), (
+        "min_tokens did not mask the stop token"
+    )
