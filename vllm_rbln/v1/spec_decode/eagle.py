@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -40,10 +39,6 @@ from vllm_rbln.v1.attention.kv_cache_bindings import (
     build_kv_cache_forward_context_kwargs,
 )
 from vllm_rbln.v1.spec_decode.utils import (
-    FUSE_FIRST_FORWARD,
-    FUSE_PREFILL,
-    NARROW_LOGITS,
-    SKIP_DP_RENDEZVOUS,
     eagle_prepare_inputs_padded,
     eagle_prepare_next_token_padded,
 )
@@ -52,25 +47,6 @@ if TYPE_CHECKING:
     from vllm_rbln.v1.worker.rbln_model_runner import RBLNModelRunner
 
 logger = init_logger(__name__)
-
-# Pick the drafter's token inside the compiled graph instead of on the host.
-#
-# `torch.ops.rbln.argmax` lowers to contrib_top_k_top_p_sample(k=1, p=0) and runs
-# on the device, but only when it is traced into a compiled region -- calling it
-# eagerly lands on the host implementation. The target sampler already does it
-# this way, via compile_sampler(rbln_greedy_sample).
-#
-# Measured on Qwen3-1.7B + AngelSlim/Qwen3-1.7B_eagle3, DP4, num_spec 3, paired
-# A/B over two server instances, no profiler attached:
-#
-#   concurrency 1   22.72 -> 18.93 ms/step   (-3.79, -16.7%)   TPOT 11.57 -> 9.64
-#   concurrency 4   24.61 -> 21.51 ms/step   (-3.10, -12.6%)
-#   concurrency 8   41.04 -> 36.68 ms/step   (-4.36, -10.6%)
-#
-# Acceptance (0.3212 / 0.3432) and tokens-per-step (1.9635 / 2.0297) are
-# bit-identical between arms, as they must be: this only moves where the
-# reduction runs.
-_DEVICE_ARGMAX = os.getenv("VLLM_RBLN_DRAFT_DEVICE_ARGMAX", "1") == "1"
 
 
 class RBLNEagleProposer(EagleProposer):
@@ -91,7 +67,7 @@ class RBLNEagleProposer(EagleProposer):
         # head shares the target vocabulary, so `propose()` maps no ids.
         self.draft_id_to_target_id: torch.Tensor | None = None
 
-    def _fold_combine(self, is_prefill: bool | None = None) -> bool:
+    def _fold_combine(self) -> bool:
         """Whether the aux-state projection runs inside the drafter's graph.
 
         Both the decode and the prefill drafter graphs take a fixed-shape
@@ -107,11 +83,7 @@ class RBLNEagleProposer(EagleProposer):
         recompiles -- the exact failure this fold was added to remove, moved to
         the other path.
         """
-        if not (FUSE_FIRST_FORWARD and self.method == "eagle3"):
-            return False
-        if is_prefill is None:
-            is_prefill = self.runner.is_prefill
-        return FUSE_PREFILL or not is_prefill
+        return self.method == "eagle3"
 
     def _aux_width(self) -> int:
         """Width the folded projection expects at its input.
@@ -127,31 +99,15 @@ class RBLNEagleProposer(EagleProposer):
         return self.hidden_size * getattr(self.model.model, "num_aux_hidden_states", 3)
 
     def _draft_ids(self, out: torch.Tensor, num_reqs: int) -> torch.Tensor:
-        """Token ids for this drafter step.
+        """Target-vocabulary ids for this drafter step.
 
-        Two independent flags feed this:
-
-        `_DEVICE_ARGMAX`  the reduction already ran inside the compiled region,
-                          so `out` is ids, not logits.
-        `NARROW_LOGITS`   `compute_logits` left the logits at draft-vocabulary
-                          width, so the id is a DRAFT id and still needs the
-                          draft->target map. `target_ids` is `arange + d2t`, so
-                          one gather finishes it. Skipping this map would emit
-                          ids from the wrong vocabulary and acceptance would
-                          collapse to ~zero.
-
-        `index_select` rather than advanced indexing for the same reason as the
-        other gathers here -- equivalent for a 1-D row selection, but only
-        `index_select` takes the backend's native path.
+        `model_wrapper` reduces inside the compiled region, so `out` is already
+        draft ids rather than logits: `torch.ops.rbln.argmax` lowers to
+        contrib_top_k_top_p_sample(k=1, p=0) and runs on the device, where an
+        eager `argmax` is a registered host fallback and costs a round trip per
+        drafter pass. Only the draft->target map is left.
         """
-        if _DEVICE_ARGMAX:
-            # `model_wrapper` already reduced and, under NARROW_LOGITS, already
-            # mapped draft->target inside the region. Nothing left to do here.
-            return out[:num_reqs]
-        ids = out[:num_reqs].argmax(dim=-1)
-        if NARROW_LOGITS:
-            ids = self.model.target_ids.index_select(0, ids)
-        return ids
+        return self._to_target_token_ids(out[:num_reqs])
 
     def propose(
         self,
@@ -409,7 +365,13 @@ class RBLNEagleProposer(EagleProposer):
         d2t = self.draft_id_to_target_id
         if d2t is None:
             return draft_token_ids
-        return draft_token_ids + d2t[draft_token_ids]
+        # `index_select` rather than `d2t[ids]`: equivalent for a 1-D row
+        # selection, but only `index_select` takes the backend's native path --
+        # advanced indexing is the largest single eager op in the step trace.
+        # Cast back so the caller keeps the int32 the compiled region produced.
+        flat = draft_token_ids.reshape(-1)
+        mapped = flat + d2t.index_select(0, flat)
+        return mapped.to(draft_token_ids.dtype).view_as(draft_token_ids)
 
     def set_inputs_first_pass(
         self,
@@ -535,7 +497,7 @@ class RBLNEagleProposer(EagleProposer):
             token_indices_to_sample: torch.Tensor | None = None,
             inputs_embeds: torch.Tensor | None = None,
         ):
-            if FUSE_FIRST_FORWARD and hidden_states.shape[-1] != self.hidden_size:
+            if hidden_states.shape[-1] != self.hidden_size:
                 # Region 3/0 folded in: `hidden_states` arrived at
                 # num_aux * target_hidden width, so project it here instead of in
                 # its own compiled graph. Loop iterations feed the drafter's own
@@ -595,23 +557,13 @@ class RBLNEagleProposer(EagleProposer):
             else:
                 logits = self.model.compute_logits(sample_hidden_states)
 
-            if _DEVICE_ARGMAX:
-                # Traced into this region, so the reduction is a device op.
-                ids = torch.ops.rbln.argmax(logits)
-                if NARROW_LOGITS:
-                    # The draft->target map has to be inside the region too.
-                    # Left on the host it both costs a gather and forces the
-                    # result back to `target_ids`' int64, which would undo the
-                    # int32 cast below and put the `.int()` in `loop_update`
-                    # back on the critical path.
-                    ids = self.model.target_ids.index_select(0, ids.reshape(-1))
-                # int32 here rather than on the host: the op yields i64 and the
-                # caller needs i32 for the compiled drafter's input_ids, so the
-                # cast belongs inside the region. `.int()` in `loop_update` then
-                # becomes a no-op instead of a device round trip.
-                return hidden_states, ids.to(torch.int32)
-
-            return hidden_states, logits
+            # Reduce inside the region: traced here it is a device op, while an
+            # eager `argmax` is a registered host fallback. int32 here too, so the
+            # `.int()` in `loop_update` becomes a no-op rather than a round trip.
+            # The draft->target map stays outside -- `_to_target_token_ids` needs
+            # `d2t`, which is not a graph input.
+            ids = torch.ops.rbln.argmax(logits)
+            return hidden_states, ids.to(torch.int32)
 
         if (
             self.vllm_config.speculative_config.enforce_eager
@@ -712,7 +664,7 @@ class RBLNEagleProposer(EagleProposer):
                 is_prefill,
             )
         )
-        if self._fold_combine(is_prefill):
+        if self._fold_combine():
             # Compile the shape serving will actually hand in. `propose` replaces
             # the narrow buffer view with the wide aux states when the projection
             # is folded, so the warmup has to do the same or the first real step
@@ -876,7 +828,6 @@ class RBLNEagleProposer(EagleProposer):
         logger.info(
             "EAGLE3 drafter DP rendezvous: requested=%s draft_moe_layers=%d "
             "decode_buckets=%s -> skip on decode=%s, on prefill=%s",
-            SKIP_DP_RENDEZVOUS,
             len(moe_layers),
             buckets,
             self._skip_dp_rendezvous(False),
@@ -884,7 +835,7 @@ class RBLNEagleProposer(EagleProposer):
         )
 
     def _skip_dp_rendezvous(self, is_prefill: bool) -> bool:
-        if not SKIP_DP_RENDEZVOUS or self._draft_has_moe:
+        if self._draft_has_moe:
             return False
         return is_prefill or self._single_decode_bucket
 

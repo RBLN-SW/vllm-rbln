@@ -12,29 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 from typing import Union
 
 import torch
-
-# Build the padded tensor directly instead of concatenating a pad block onto it.
-#
-# `torch.cat` on an RBLN device tensor -- and with
-# VLLM_RBLN_USE_DEVICE_TENSOR=1 the drafter's hidden-state buffer is one -- costs
-# far more than the bytes involved. On the step-200 trace of Qwen3-1.7B + eagle3
-# (DP4, num_spec 3) `aten::cat` totals 1.12 ms/step, and inside a 0.46 ms
-# `aten::cat` the only children are `narrow`/`slice`/`empty` adding up to 8 us:
-# the remaining 0.45 ms is work the profiler never sees. It is the backend
-# handling a device tensor, not a memcpy.
-#
-# `empty` + `copy_` + `fill_` writes the same values with one allocation instead
-# of two, and one pass over the payload instead of two -- `cat` copies both
-# operands, this copies only `x` and fills the tail. It also keeps the result a
-# non-view, which the branch below exists to guarantee. Measured 1.12 -> 0.89
-# ms/step, consistent across all four DP workers.
-#
-# Only `dim == 0` is rewritten; that is what the callers here use.
-_PAD_NO_CAT = os.getenv("VLLM_RBLN_PAD_NO_CAT", "1") == "1"
 
 
 def cat_last_dim(tensors: list[torch.Tensor]) -> torch.Tensor:
@@ -44,7 +24,7 @@ def cat_last_dim(tensors: list[torch.Tensor]) -> torch.Tensor:
     `pad` above does NOT work here, and that is worth recording rather than
     rediscovering.
 
-    `_PAD_NO_CAT` replaces a `dim=0` concat, where the writes are contiguous. The
+    The `dim == 0` path replaces a `dim=0` concat, where the writes are contiguous. The
     last dimension is different: `out[:, off:off + w].copy_(t)` is a strided
     write, and on an RBLN device tensor that costs more than letting `torch.cat`
     do it. On EAGLE3's three aux hidden states, region-normalised on the `0/2`
@@ -66,7 +46,7 @@ def pad(
         # so ensure that the output is always a non-view.
         return x if x._base is None else x.clone()
 
-    if _PAD_NO_CAT and dim == 0:
+    if dim == 0:
         out = torch.empty(
             (target_len,) + tuple(x.shape[1:]), dtype=x.dtype, device=x.device
         )

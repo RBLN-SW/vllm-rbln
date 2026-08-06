@@ -27,9 +27,6 @@ from vllm_rbln import envs
 from vllm_rbln.compilation import compile, create_compile_context
 from vllm_rbln.logger import init_logger
 from vllm_rbln.platform import HAS_TORCH_RBLN, USE_DEVICE_TENSOR
-from vllm_rbln.v1.spec_decode.utils import (
-    SKIP_GREEDY_SOFTMAX,
-)
 
 if TYPE_CHECKING:
     from rebel import CompileContext
@@ -146,7 +143,7 @@ class RBLNRejectionSampler(RejectionSampler):
             sampling_metadata,
         )
         # Compute probability distribution from target logits.
-        if SKIP_GREEDY_SOFTMAX and sampling_metadata.all_greedy:
+        if sampling_metadata.all_greedy:
             # `argmax(softmax(x)) == argmax(x)`, and the all-greedy path takes the
             # argmax and returns before anything else reads `target_probs` (the
             # recovered-token and random branches sit after that early return).
