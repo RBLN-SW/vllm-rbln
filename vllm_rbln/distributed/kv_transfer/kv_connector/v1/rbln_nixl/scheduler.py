@@ -25,7 +25,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
     NixlConnectorMetadata,
-    NixlConnectorScheduler,
+    NixlPullConnectorScheduler,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     ReqId,
@@ -41,7 +41,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-class RblnNixlConnectorScheduler(NixlConnectorScheduler):
+class RblnNixlConnectorScheduler(NixlPullConnectorScheduler):
     """Implementation of Scheduler side methods"""
 
     def __init__(
