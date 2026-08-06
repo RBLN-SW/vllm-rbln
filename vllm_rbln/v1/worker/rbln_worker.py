@@ -487,6 +487,7 @@ class RBLNWorker(WorkerBase):
             self._assert_dynamic_kv_compiler_support()
             self._assert_dynamic_kv_scheduler_handoff_installed()
             self._assert_dynamic_kv_transfer_absent()
+            self._assert_dynamic_kv_attention_layout()
 
         self.model_runner.initialize_kv_cache(
             self._maybe_shrink_kv_cache_for_compile(kv_cache_config)
@@ -750,36 +751,14 @@ class RBLNWorker(WorkerBase):
                 "then the combination is refused rather than mis-sized."
             )
 
-    def _assert_dynamic_kv_cache_layout(self) -> None:
-        """Guard: the KV layout must satisfy the compiler's dynamic-input rules.
+    def _assert_dynamic_kv_attention_layout(self) -> None:
+        """Guard: every attention layer must dispatch to the paged-causal kernel.
 
-        The compiler requires every `mark_dynamic`'d KV input to have exactly one
-        use, and that use to be a
-        `paged_flash_causal_attention_naive_{prefill,decode}` call. Each item
-        below breaks half of that invariant and each fails *silently* -- a no-op
-        `mark_dynamic`, or a confusing 'has N uses' rejection -- unless checked.
+        Split out of `_assert_dynamic_kv_cache_layout` so it can run *before* the
+        shrink: it reads only `vllm_config`, which `load_model` has already filled,
+        and an unsupported layout otherwise surfaces as the shrink's block-count
+        refusal instead of the real reason.
         """
-        mr = self.model_runner
-
-        if mr.kv_cache_bases:
-            raise RuntimeError(
-                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE requires KV base deduplication "
-                f"to be inactive, but {len(mr.kv_cache_bases)} deduped bases "
-                "were built. The per-layer kv_cache would then be a view "
-                "created inside the traced graph, which makes mark_dynamic a "
-                "no-op, and marking the base itself is rejected by the "
-                "compiler ('kind is not call_arg')."
-            )
-
-        if mr.shared_kv_cache_layers:
-            raise RuntimeError(
-                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE does not support cross-layer KV "
-                f"sharing, but {len(mr.shared_kv_cache_layers)} layer(s) reuse "
-                "another layer's KV cache. The same tensor object reaching two "
-                "attention calls gives the marked input two uses, which the "
-                "compiler's dynamic-input validator rejects."
-            )
-
         attn_layers = get_layers_from_vllm_config(self.vllm_config, Attention)
         offenders: list[str] = []
         for layer_name, layer in attn_layers.items():
@@ -805,6 +784,40 @@ class RBLNWorker(WorkerBase):
                 "max_model_len). Offending layers: "
                 + ", ".join(offenders[:8])
                 + (f" (+{len(offenders) - 8} more)" if len(offenders) > 8 else "")
+            )
+
+    def _assert_dynamic_kv_cache_layout(self) -> None:
+        """Guard: the KV bindings must satisfy the compiler's dynamic-input rules.
+
+        The compiler requires every `mark_dynamic`'d KV input to have exactly one
+        use, and that use to be a
+        `paged_flash_causal_attention_naive_{prefill,decode}` call. Each item
+        below breaks half of that invariant and each fails *silently* -- a no-op
+        `mark_dynamic`, or a confusing 'has N uses' rejection -- unless checked.
+
+        These two read runner state that `initialize_kv_cache` fills, so unlike
+        `_assert_dynamic_kv_attention_layout` they cannot move before it: they
+        would see empty containers and pass vacuously.
+        """
+        mr = self.model_runner
+
+        if mr.kv_cache_bases:
+            raise RuntimeError(
+                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE requires KV base deduplication "
+                f"to be inactive, but {len(mr.kv_cache_bases)} deduped bases "
+                "were built. The per-layer kv_cache would then be a view "
+                "created inside the traced graph, which makes mark_dynamic a "
+                "no-op, and marking the base itself is rejected by the "
+                "compiler ('kind is not call_arg')."
+            )
+
+        if mr.shared_kv_cache_layers:
+            raise RuntimeError(
+                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE does not support cross-layer KV "
+                f"sharing, but {len(mr.shared_kv_cache_layers)} layer(s) reuse "
+                "another layer's KV cache. The same tensor object reaching two "
+                "attention calls gives the marked input two uses, which the "
+                "compiler's dynamic-input validator rejects."
             )
 
     def _collect_dynamic_kv_runtimes(self) -> list[Any]:

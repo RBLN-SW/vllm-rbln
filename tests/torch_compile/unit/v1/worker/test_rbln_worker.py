@@ -1806,3 +1806,116 @@ class TestChargeRemedyWording:
             self._charge(blocks=8, explicit=False, bytes_per_block=self.BUDGET // 4)
         assert "the derived default of 8 blocks" in str(exc.value)
         assert "gpu-memory-utilization" in str(exc.value)
+
+
+class TestDynamicKvLayoutGuards:
+    """The layout guard is split across `initialize_kv_cache`.
+
+    The attention-layer half reads only `vllm_config`, which `load_model` has
+    already filled, so it runs before the shrink -- otherwise an unsupported
+    layout surfaces as the shrink's block-count refusal. The other half reads
+    runner state that `initialize_kv_cache` fills and must stay after it, or it
+    inspects empty containers and passes vacuously.
+    """
+
+    @staticmethod
+    def _layer(sliding_window=None, is_causal=True, is_normal=False):
+        return SimpleNamespace(
+            impl=SimpleNamespace(
+                sliding_window=sliding_window,
+                is_causal=is_causal,
+                is_normal=is_normal,
+            )
+        )
+
+    def test_the_attention_guard_runs_before_the_shrink(self):
+        from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
+
+        calls: list[str] = []
+        config = SimpleNamespace(num_blocks=4, kv_cache_tensors=[])
+        worker = SimpleNamespace(
+            cache_config=SimpleNamespace(num_gpu_blocks=None, num_cpu_blocks=None),
+            vllm_config=object(),
+            model_runner=SimpleNamespace(
+                initialize_kv_cache=lambda cfg: calls.append("initialize_kv_cache")
+            ),
+            _assert_dynamic_kv_compiler_support=lambda: calls.append("compiler"),
+            _assert_dynamic_kv_scheduler_handoff_installed=lambda: calls.append(
+                "handoff"
+            ),
+            _assert_dynamic_kv_transfer_absent=lambda: calls.append("transfer"),
+            _assert_dynamic_kv_attention_layout=lambda: calls.append("attention"),
+            _assert_dynamic_kv_cache_layout=lambda: calls.append("bindings"),
+            _maybe_shrink_kv_cache_for_compile=lambda cfg: (
+                calls.append("shrink") or cfg
+            ),
+        )
+        with (
+            patch(
+                "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE",
+                True,
+            ),
+            patch("vllm_rbln.v1.worker.rbln_worker.ensure_kv_transfer_initialized"),
+        ):
+            RBLNWorker.initialize_from_config(worker, config)
+
+        assert calls.index("attention") < calls.index("shrink")
+        # And the binding checks stay behind the allocation that fills them.
+        assert calls.index("bindings") > calls.index("initialize_kv_cache")
+
+    def test_a_non_paged_causal_layer_is_refused_by_name(self):
+        """`block_size == max_model_len` makes is_normal True.
+
+        This is the case the ordering exists for: the estimate can be at or below
+        the compile-time hint, and the block-count refusal would then fire first
+        and blame the block count for a layout problem.
+        """
+        from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
+
+        worker = SimpleNamespace(vllm_config=object())
+        with (
+            patch(
+                "vllm_rbln.v1.worker.rbln_worker.get_layers_from_vllm_config",
+                return_value={"layer.0": self._layer(is_normal=True)},
+            ),
+            pytest.raises(RuntimeError) as exc,
+        ):
+            RBLNWorker._assert_dynamic_kv_attention_layout(worker)
+        assert "paged_flash_causal_attention_naive" in str(exc.value)
+        assert "layer.0" in str(exc.value)
+        # Not the shrink's message.
+        assert "nothing to shrink" not in str(exc.value)
+
+    def test_a_paged_causal_layer_passes(self):
+        from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
+
+        worker = SimpleNamespace(vllm_config=object())
+        with patch(
+            "vllm_rbln.v1.worker.rbln_worker.get_layers_from_vllm_config",
+            return_value={"layer.0": self._layer()},
+        ):
+            RBLNWorker._assert_dynamic_kv_attention_layout(worker)
+
+    def test_deduped_bases_are_still_refused_after_the_split(self):
+        """Guards the split itself: moving this check earlier would make it see an
+        empty list and pass, so its refusal has to stay asserted."""
+        from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
+
+        worker = SimpleNamespace(
+            model_runner=SimpleNamespace(
+                kv_cache_bases=[object()], shared_kv_cache_layers={}
+            )
+        )
+        with pytest.raises(RuntimeError, match="KV base deduplication"):
+            RBLNWorker._assert_dynamic_kv_cache_layout(worker)
+
+    def test_cross_layer_sharing_is_still_refused_after_the_split(self):
+        from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
+
+        worker = SimpleNamespace(
+            model_runner=SimpleNamespace(
+                kv_cache_bases=[], shared_kv_cache_layers={"layer.1": "layer.0"}
+            )
+        )
+        with pytest.raises(RuntimeError, match="cross-layer KV"):
+            RBLNWorker._assert_dynamic_kv_cache_layout(worker)
