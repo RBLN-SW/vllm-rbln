@@ -933,6 +933,64 @@ def test_placeholder_draft_random_non_synthetic(rejection_sampler):
     assert torch.equal(output.sampled_token_ids, expected)
 
 
+@pytest.mark.parametrize("npu_sampler, expect_softmax", [("0", False), ("1", True)])
+def test_greedy_softmax_skipped_only_for_the_torch_impl(
+    monkeypatch, npu_sampler, expect_softmax
+):
+    """The all-greedy softmax skip is a torch-impl-only shortcut.
+
+    The torch impl argmaxes `target_probs`, so raw logits are enough. The NPU
+    kernel reads `target_probs[draft_token]` as a probability and its
+    `apply_sampling_constraints` emits -inf except 0.0 at the argmax, so it needs
+    this softmax to get a one-hot.
+    """
+    monkeypatch.setenv("VLLM_RBLN_SAMPLER", npu_sampler)
+    mock_sampler = Mock(spec=Sampler)
+    mock_sampler.logprobs_mode = "raw_logprobs"
+    sampler = RBLNRejectionSampler(mock_sampler)
+
+    seen: list[torch.Tensor] = []
+
+    def capture(
+        draft_token_ids,
+        num_draft_tokens,
+        max_spec_len,
+        cu,
+        draft_probs,
+        target_probs,
+        bonus_token_ids,
+        sampling_metadata,
+        **kwargs,
+    ):
+        seen.append(target_probs.clone())
+        return torch.zeros(
+            (len(num_draft_tokens), max_spec_len + 1), dtype=torch.int64, device=DEVICE
+        )
+
+    monkeypatch.setattr(sampler.impl, "rejection_sample", capture)
+
+    vocab_size, k = 8, 2
+    target_logits = torch.randn(k, vocab_size, dtype=torch.float32, device=DEVICE)
+    bonus_token_ids = torch.zeros((1, 1), dtype=torch.int64, device=DEVICE)
+    mock_sampler_output(sampler, bonus_token_ids)
+    sampler(
+        create_spec_decode_metadata([[0, 1]], target_logits),
+        draft_probs=None,
+        logits=target_logits,
+        sampling_metadata=create_sampling_metadata(all_greedy=True),
+    )
+
+    assert len(seen) == 1
+    probs = seen[0]
+    if expect_softmax:
+        # A distribution: finite, rows summing to 1.
+        assert torch.isfinite(probs).all()
+        assert torch.allclose(probs.sum(dim=-1), torch.ones(k, device=probs.device))
+    else:
+        # Untouched logits -- no softmax ran.
+        assert torch.equal(probs, target_logits)
+
+
 def test_npu_impl_refuses_synthetic_mode(monkeypatch):
     """The NPU impl (VLLM_RBLN_SAMPLER=1) must fail fast on synthetic mode.
 

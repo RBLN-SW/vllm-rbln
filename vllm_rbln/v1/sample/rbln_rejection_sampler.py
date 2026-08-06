@@ -152,13 +152,16 @@ class RBLNRejectionSampler(RejectionSampler):
             sampling_metadata,
         )
         # Compute probability distribution from target logits.
-        if sampling_metadata.all_greedy:
-            # `argmax(softmax(x)) == argmax(x)`, and the all-greedy path takes the
-            # argmax and returns before anything else reads `target_probs` (the
-            # recovered-token and random branches sit after that early return).
-            # So the float32 softmax over [num_tokens, vocab_size] -- 200064 wide
-            # on MiniMax-M2.5 -- produces a tensor whose only use is an argmax
-            # that the logits already answer.
+        if sampling_metadata.all_greedy and not envs.VLLM_RBLN_SAMPLER:
+            # Torch impl only argmaxes `target_probs`, and argmax(softmax(x)) ==
+            # argmax(x), so this skips a float32 softmax over a 200064-wide vocab.
+            #
+            # Torch-impl only. The NPU kernel has no greedy path -- it reads
+            # `target_probs[draft_token]` as a probability -- and its
+            # `apply_sampling_constraints` hands us -inf except 0.0 at the argmax,
+            # counting on this softmax to make that a one-hot. Skip it there and
+            # even the argmax row scores 0.0, so nothing is ever accepted
+            # (measured on the op: one-hot accepts [1, 0], the raw mask [0, 0]).
             #
             # Not gated on `synthetic_mode`: that path changes which tokens the
             # greedy kernel accepts via `uniform_probs`, but it still consumes
