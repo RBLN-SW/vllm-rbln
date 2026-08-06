@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import time
 from collections import defaultdict
-from typing import TYPE_CHECKING, Any
+from collections.abc import Callable, Mapping
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import msgspec
 import numpy as np
@@ -46,7 +48,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import zmq_ctx
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.platforms import current_platform
-from vllm.tracing import instrument_manual
+from vllm.tracing import extract_trace_context, instrument_manual
 from vllm.utils.network_utils import make_zmq_path
 from vllm.v1.kv_cache_interface import (
     MambaSpec,
@@ -60,7 +62,6 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import
     rbln_pp_compat_hash,
 )
 from vllm_rbln.logger import init_logger
-from vllm_rbln.utils.tracing import traced_remote_fetch
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import ReqMeta
@@ -72,6 +73,87 @@ logger = init_logger(__name__)
 #: Pruning only kicks in past the soft limit so the common path stays a dict pop.
 _XFER_TRACKING_SOFT_LIMIT = 4096
 _XFER_TRACKING_MAX_AGE_S = 600.0
+
+
+class _XferRecord(NamedTuple):
+    """What a request's in-flight KV receive needs for its span.
+
+    ``issued_at`` is wall-clock: it is only ever subtracted from
+    ``time.time()`` in :meth:`_emit_transfer_wait_spans` and handed to a span as
+    an absolute timestamp, never mixed with a monotonic clock.
+
+    ``trace_headers`` is the request's inbound ``traceparent``, carried here from
+    the scheduler so the span lands in the request's trace. ``None`` when the
+    request arrived untraced.
+    """
+
+    issued_at: float
+    trace_headers: Mapping[str, str] | None
+
+
+def _step_span_links() -> list | None:
+    """Link to the engine step that is issuing this read, if there is one.
+
+    Reparenting ``remote_fetch`` into the request's trace costs the step
+    relationship it used to get from being nested under ``nixl.kv_transfer``. A
+    link keeps it: the read belongs to one request *and* to one step, which is
+    exactly the two-context case links exist for.
+    """
+    try:
+        from opentelemetry import trace as otel_trace
+    except ImportError:
+        return None
+
+    step_context = otel_trace.get_current_span().get_span_context()
+    if not step_context.is_valid:
+        return None
+    return [otel_trace.Link(step_context)]
+
+
+def _traced_remote_fetch(func: Callable) -> Callable:
+    """Name a per-request NIXL read and put it in that request's trace.
+
+    ``start_load_kv`` issues the reads for every request scheduled in the step,
+    so the step-level ``nixl.kv_transfer`` span cannot say which request's
+    transfer was slow.
+
+    A decorator rather than a ``with`` block inside the method because the
+    wrapped body is the PP-aware read path — this keeps the span concern out of
+    it entirely. It lives here rather than in ``vllm_rbln.utils.tracing`` because
+    it reads worker state (the step's trace headers, the in-flight bookkeeping).
+
+    ``extract_trace_context`` returns ``None`` for an untraced request, which
+    leaves OTel's default parent in place — the step's ``nixl.kv_transfer`` span,
+    the right answer when there is no request trace to join.
+    """
+
+    @functools.wraps(func)
+    def wrapper(self, req_id: str, meta, *args: Any, **kwargs: Any):
+        trace_headers = self._rbln_step_trace_headers.get(req_id)
+        self._rbln_xfer_tracking[req_id] = _XferRecord(time.time(), trace_headers)
+
+        try:
+            from opentelemetry import trace as otel_trace
+        except ImportError:
+            return func(self, req_id, meta, *args, **kwargs)
+
+        tracer = otel_trace.get_tracer(func.__module__)
+        with tracer.start_as_current_span(
+            "remote_fetch",
+            context=extract_trace_context(trace_headers),
+            links=_step_span_links(),
+        ) as span:
+            span.set_attribute("ca.request.id", req_id)
+            remote = getattr(meta, "remote", None)
+            block_ids = getattr(remote, "block_ids", None)
+            if block_ids is not None:
+                span.set_attribute("nixl.block_count", len(block_ids))
+            engine_id = getattr(remote, "engine_id", None)
+            if engine_id is not None:
+                span.set_attribute("nixl.remote_engine_id", str(engine_id))
+            return func(self, req_id, meta, *args, **kwargs)
+
+    return wrapper
 
 
 class RblnNixlConnectorWorker(NixlConnectorWorker):
@@ -95,9 +177,12 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
         self, vllm_config: VllmConfig, engine_id: str, kv_cache_config: "KVCacheConfig"
     ) -> None:
         super().__init__(vllm_config, engine_id, kv_cache_config)
-        #: req_id → 전송 발행 시각(wall-clock). get_finished 가 완료 시각과 짝지어
+        #: req_id → 발행 시각 + trace context. get_finished 가 완료 시각과 짝지어
         #: nixl.wait_for_transfer span 을 만든다.
-        self._rbln_xfer_issued_at: dict[str, float] = {}
+        self._rbln_xfer_tracking: dict[str, _XferRecord] = {}
+        #: 이번 step 에 스케줄된 req_id → trace headers. start_load_kv 가
+        #: connector metadata 에서 받아 채우고, 다음 step 에 통째로 교체된다.
+        self._rbln_step_trace_headers: dict[str, Mapping[str, str]] = {}
 
         # Pick the NIXL transport backend.
         #   * nixl-rbln installed  → use RBLN backend on both paths
@@ -1054,11 +1139,19 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
             f"regions (regions/layer={rpl})."
         )
 
-    @traced_remote_fetch
+    def start_load_kv(self, metadata) -> None:
+        """Pick up the trace context the scheduler attached, then load as usual.
+
+        ``getattr`` rather than an attribute access: upstream's plain
+        ``NixlConnectorMetadata`` is what ``start_load_kv`` is typed against and
+        what failure-recovery paths may hand us, and a missing trace context must
+        cost a span, not a KV transfer.
+        """
+        self._rbln_step_trace_headers = getattr(metadata, "trace_headers", None) or {}
+        return super().start_load_kv(metadata)
+
+    @_traced_remote_fetch
     def _read_blocks_for_req(self, req_id: str, meta: "ReqMeta") -> None:
-        # Wall-clock: paired with time.time() in get_finished to reconstruct the
-        # transfer wait as a span. Never compared against a monotonic clock.
-        self._rbln_xfer_issued_at[req_id] = time.time()
         assert meta.remote is not None and self.transfer_topo is not None
         engine_id = meta.remote.engine_id
         pp_size = self._remote_pp_size.get(engine_id, 1)
@@ -1148,7 +1241,7 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
 
     def get_finished(self) -> tuple[set[str], set[str]]:
         done_sending, done_recving = super().get_finished()
-        if self._rbln_xfer_issued_at and done_recving:
+        if self._rbln_xfer_tracking and done_recving:
             self._emit_transfer_wait_spans(done_recving)
         return done_sending, done_recving
 
@@ -1165,6 +1258,10 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
         A span per poll would emit thousands of empty spans and still not show
         the wait, which is why this keys off the requests that actually finished.
 
+        The span is parented to the request's own trace context rather than to
+        whatever step happens to be polling — the wait spans however many steps
+        it takes, so the polling step is not its parent in any meaningful sense.
+
         Tracing failures are swallowed: a missing span is a lost measurement, a
         raised exception is a lost request.
         """
@@ -1172,23 +1269,26 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
         # A request cancelled mid-transfer never shows up in done_recving, so its
         # entry would sit here forever. Drop anything older than any plausible
         # transfer — this dict is a measurement aid, not state the transfer needs.
-        if len(self._rbln_xfer_issued_at) > _XFER_TRACKING_SOFT_LIMIT:
+        if len(self._rbln_xfer_tracking) > _XFER_TRACKING_SOFT_LIMIT:
             cutoff = finished_at - _XFER_TRACKING_MAX_AGE_S
-            self._rbln_xfer_issued_at = {
-                rid: ts for rid, ts in self._rbln_xfer_issued_at.items() if ts >= cutoff
+            self._rbln_xfer_tracking = {
+                rid: record
+                for rid, record in self._rbln_xfer_tracking.items()
+                if record.issued_at >= cutoff
             }
         for req_id in done_recving:
-            issued_at = self._rbln_xfer_issued_at.pop(req_id, None)
-            if issued_at is None:
+            record = self._rbln_xfer_tracking.pop(req_id, None)
+            if record is None:
                 # Issued before tracing started, or a failed-setup request that
                 # never went through _read_blocks_for_req.
                 continue
             try:
                 instrument_manual(
                     span_name="nixl.wait_for_transfer",
-                    start_time=int(issued_at * 1e9),
+                    start_time=int(record.issued_at * 1e9),
                     end_time=int(finished_at * 1e9),
                     attributes={"ca.request.id": req_id},
+                    context=extract_trace_context(record.trace_headers),
                 )
             except Exception:  # noqa: BLE001 - tracing must not break KV transfer
                 logger.debug("nixl.wait_for_transfer span emit failed", exc_info=True)

@@ -24,7 +24,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
-    NixlConnectorMetadata,
     NixlConnectorScheduler,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
@@ -32,6 +31,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
 )
 from vllm.v1.core.sched.output import SchedulerOutput
 
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
+    RblnNixlConnectorMetadata,
+)
 from vllm_rbln.logger import init_logger
 
 if TYPE_CHECKING:
@@ -57,7 +59,7 @@ class RblnNixlConnectorScheduler(NixlConnectorScheduler):
         self,
         scheduler_output: SchedulerOutput,
     ) -> KVConnectorMetadata:
-        meta = NixlConnectorMetadata()
+        meta = RblnNixlConnectorMetadata()
 
         for req_id, (req, block_ids) in self._reqs_need_recv.items():
             assert req.kv_transfer_params is not None
@@ -66,6 +68,10 @@ class RblnNixlConnectorScheduler(NixlConnectorScheduler):
                 local_block_ids=block_ids,
                 kv_transfer_params=req.kv_transfer_params,
             )
+            # Hand the worker this request's trace context so its KV-transfer
+            # spans join the request's trace instead of starting their own.
+            if req.trace_headers:
+                meta.trace_headers[req_id] = req.trace_headers
 
         if self._reqs_need_save:
             # NOTE: For the prefill side, there might be a chance that an early added
