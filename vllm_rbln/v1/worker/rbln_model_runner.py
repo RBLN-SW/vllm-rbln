@@ -2071,7 +2071,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             token_indices=token_indices,
             layout=InputLayout(
                 num_reqs=num_reqs,
-                num_reqs_padded=num_reqs,
+                num_reqs_padded=num_reqs if self.is_prefill else num_reqs_padded,
                 query_len=num_tokens_per_req,
                 query_len_padded=num_tokens_per_req,
             ),
