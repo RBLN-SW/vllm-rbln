@@ -117,6 +117,42 @@ def test_untraced_requests_add_no_entry():
     assert sorted(meta.reqs_to_recv) == ["req-1", "req-2"]
 
 
+def test_headers_outlive_the_step_that_delivered_them(monkeypatch):
+    """A read deferred behind a NIXL handshake runs on a later step.
+
+    Scoping the headers to the delivering step lost them for exactly those
+    reads — measured on ca2 as 5 of 6 requests, since every
+    (decode rank, prefill engine) pair needs its own first handshake.
+    """
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl import NixlConnectorWorker
+
+    from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.worker import (
+        RblnNixlConnectorWorker,
+    )
+
+    monkeypatch.setattr(
+        NixlConnectorWorker, "start_load_kv", lambda self, metadata: None
+    )
+    worker = object.__new__(RblnNixlConnectorWorker)
+    worker._rbln_req_trace_headers = {}
+    worker._recving_metadata = {}
+
+    delivering_step = RblnNixlConnectorMetadata()
+    delivering_step.trace_headers["req-1"] = {"traceparent": _TRACEPARENT}
+    worker._recving_metadata["req-1"] = object()  # in flight, handshake pending
+    worker.start_load_kv(delivering_step)
+    assert worker._rbln_req_trace_headers == {"req-1": {"traceparent": _TRACEPARENT}}
+
+    # A later step that carries no headers of its own must not drop them.
+    worker.start_load_kv(RblnNixlConnectorMetadata())
+    assert worker._rbln_req_trace_headers == {"req-1": {"traceparent": _TRACEPARENT}}
+
+    # Transfer done — upstream drops it from _recving_metadata, so do we.
+    worker._recving_metadata.clear()
+    worker.start_load_kv(RblnNixlConnectorMetadata())
+    assert worker._rbln_req_trace_headers == {}
+
+
 def test_step_span_link_points_at_the_enclosing_step():
     """Reparenting into the request's trace must not lose the step relationship."""
     tracer = TracerProvider().get_tracer(__name__)

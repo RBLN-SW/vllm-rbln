@@ -120,16 +120,17 @@ def _traced_remote_fetch(func: Callable) -> Callable:
     A decorator rather than a ``with`` block inside the method because the
     wrapped body is the PP-aware read path — this keeps the span concern out of
     it entirely. It lives here rather than in ``vllm_rbln.utils.tracing`` because
-    it reads worker state (the step's trace headers, the in-flight bookkeeping).
+    it reads worker state (the request trace headers, the in-flight bookkeeping).
 
     ``extract_trace_context`` returns ``None`` for an untraced request, which
-    leaves OTel's default parent in place — the step's ``nixl.kv_transfer`` span,
-    the right answer when there is no request trace to join.
+    leaves OTel's default parent in place — the enclosing ``nixl.kv_transfer``
+    span, the right answer when there is no request trace to join. No link is
+    added in that case: it would point at the span that is already the parent.
     """
 
     @functools.wraps(func)
     def wrapper(self, req_id: str, meta, *args: Any, **kwargs: Any):
-        trace_headers = self._rbln_step_trace_headers.get(req_id)
+        trace_headers = self._rbln_req_trace_headers.get(req_id)
         self._rbln_xfer_tracking[req_id] = _XferRecord(time.time(), trace_headers)
 
         try:
@@ -137,11 +138,12 @@ def _traced_remote_fetch(func: Callable) -> Callable:
         except ImportError:
             return func(self, req_id, meta, *args, **kwargs)
 
+        request_context = extract_trace_context(trace_headers)
         tracer = otel_trace.get_tracer(func.__module__)
         with tracer.start_as_current_span(
             "remote_fetch",
-            context=extract_trace_context(trace_headers),
-            links=_step_span_links(),
+            context=request_context,
+            links=_step_span_links() if request_context is not None else None,
         ) as span:
             span.set_attribute("ca.request.id", req_id)
             remote = getattr(meta, "remote", None)
@@ -180,9 +182,9 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
         #: req_id → 발행 시각 + trace context. get_finished 가 완료 시각과 짝지어
         #: nixl.wait_for_transfer span 을 만든다.
         self._rbln_xfer_tracking: dict[str, _XferRecord] = {}
-        #: 이번 step 에 스케줄된 req_id → trace headers. start_load_kv 가
-        #: connector metadata 에서 받아 채우고, 다음 step 에 통째로 교체된다.
-        self._rbln_step_trace_headers: dict[str, Mapping[str, str]] = {}
+        #: req_id → trace headers. start_load_kv 가 connector metadata 에서
+        #: 받아 누적하고, 전송이 in-flight 인 동안 유지된다.
+        self._rbln_req_trace_headers: dict[str, Mapping[str, str]] = {}
 
         # Pick the NIXL transport backend.
         #   * nixl-rbln installed  → use RBLN backend on both paths
@@ -1142,13 +1144,34 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
     def start_load_kv(self, metadata) -> None:
         """Pick up the trace context the scheduler attached, then load as usual.
 
+        Accumulated rather than scoped to this step: a read whose remote engine
+        has not been handshaken yet is deferred to a background thread and runs
+        on a *later* step, so step-scoped headers would already be gone by the
+        time it needs them. Measured on ca2 before this fix — 1 of 6 requests
+        landed in its request trace, the rest were all first-contact pairs
+        (4 decode ranks × 4 prefill engines each need their own handshake).
+
+        Upstream's ``_recving_metadata`` is exactly the set of receives still in
+        flight, so it bounds this dict: an entry not in it is done or failed and
+        its headers are dead weight.
+
         ``getattr`` rather than an attribute access: upstream's plain
         ``NixlConnectorMetadata`` is what ``start_load_kv`` is typed against and
         what failure-recovery paths may hand us, and a missing trace context must
         cost a span, not a KV transfer.
         """
-        self._rbln_step_trace_headers = getattr(metadata, "trace_headers", None) or {}
-        return super().start_load_kv(metadata)
+        self._rbln_req_trace_headers.update(
+            getattr(metadata, "trace_headers", None) or {}
+        )
+        try:
+            return super().start_load_kv(metadata)
+        finally:
+            if self._rbln_req_trace_headers:
+                self._rbln_req_trace_headers = {
+                    req_id: headers
+                    for req_id, headers in self._rbln_req_trace_headers.items()
+                    if req_id in self._recving_metadata
+                }
 
     @_traced_remote_fetch
     def _read_blocks_for_req(self, req_id: str, meta: "ReqMeta") -> None:
