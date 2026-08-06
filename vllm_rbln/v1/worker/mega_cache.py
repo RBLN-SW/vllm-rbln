@@ -23,6 +23,7 @@ an atomic unit only when warm-up has fully succeeded.
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import os
 import re
@@ -191,6 +192,7 @@ def save(model: str, sig: str) -> None:
 
     rbln_mega_cache.set_dir(cache_root())
     path = bundle_path(model, sig)
+    tmp_path = path + ".tmp"
     try:
         rbln_mega_cache.flush_to_bundle()
         result = torch.compiler.save_cache_artifacts()
@@ -198,10 +200,30 @@ def save(model: str, sig: str) -> None:
             return
         artifact_bytes, _ = result
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp_path = path + ".tmp"
         with open(tmp_path, "wb") as dst:
             dst.write(artifact_bytes)
+            # Delayed allocation defers ENOSPC to flush, so a bundle could be
+            # renamed into place truncated without this.
+            dst.flush()
+            os.fsync(dst.fileno())
         os.replace(tmp_path, path)
-        logger.info("Saved rbln mega-cache bundle to %s", path)
+        logger.info(
+            "Saved rbln mega-cache bundle to %s (%.1f MiB)",
+            path,
+            len(artifact_bytes) / (1 << 20),
+        )
     except Exception as exc:  # pylint: disable=broad-exception-caught
-        logger.warning("Failed to save rbln mega-cache bundle: %s", exc)
+        with contextlib.suppress(OSError):
+            os.remove(tmp_path)
+        out_of_space = isinstance(exc, OSError) and exc.errno in (
+            errno.ENOSPC,
+            errno.EDQUOT,
+        )
+        logger.error(
+            "Could not persist the rbln mega-cache bundle to %s: %s%s. The "
+            "previous bundle is left untouched, so every restart recompiles "
+            "from scratch until this is resolved.",
+            path,
+            exc,
+            " (out of disk space)" if out_of_space else "",
+        )

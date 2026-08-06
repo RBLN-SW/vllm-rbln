@@ -14,6 +14,8 @@
 """Unit tests for mega-cache bundle keying (config signature + path)."""
 
 import dataclasses
+import errno
+import logging
 import os
 import re
 from types import SimpleNamespace
@@ -21,6 +23,13 @@ from types import SimpleNamespace
 import pytest
 
 from vllm_rbln.v1.worker import mega_cache
+
+
+def _raiser(exc):
+    def _raise(*args, **kwargs):
+        raise exc
+
+    return _raise
 
 
 @pytest.fixture(autouse=True)
@@ -497,6 +506,54 @@ class TestSaveLoadRoundTrip:
         mega_cache.save("m", "sig")
         with open(bundle_env.path, "rb") as f:
             assert f.read() == bundle_env.artifact
+
+    def test_out_of_space_leaves_no_partial_tmp(self, bundle_env, monkeypatch):
+        real_open = open
+
+        def full_disk(path, *args, **kwargs):
+            handle = real_open(path, *args, **kwargs)
+            if str(path).endswith(".tmp"):
+                handle.write(b"partial")
+                handle.close()
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return handle
+
+        monkeypatch.setattr("builtins.open", full_disk)
+        mega_cache.save("m", "sig")  # must not propagate
+        monkeypatch.undo()
+        assert not os.path.exists(bundle_env.path + ".tmp")
+        assert not os.path.exists(bundle_env.path)
+
+    def test_out_of_space_keeps_previous_bundle(self, bundle_env, monkeypatch):
+        mega_cache.save("m", "sig")
+        monkeypatch.setattr(
+            mega_cache.os, "replace", _raiser(OSError(errno.ENOSPC, "no space"))
+        )
+        bundle_env.artifact = b"second-bundle"
+        bundle_env.save_result = (bundle_env.artifact, object())
+        mega_cache.save("m", "sig")
+        monkeypatch.undo()
+        with open(bundle_env.path, "rb") as f:
+            assert f.read() == b"bundle-bytes"
+        assert not os.path.exists(bundle_env.path + ".tmp")
+
+    def test_out_of_space_is_logged_at_error(self, bundle_env, monkeypatch, caplog):
+        monkeypatch.setattr(
+            mega_cache.os, "replace", _raiser(OSError(errno.ENOSPC, "no space"))
+        )
+        with caplog.at_level(logging.ERROR, logger=mega_cache.logger.name):
+            mega_cache.save("m", "sig")
+        assert any(r.levelno >= logging.ERROR for r in caplog.records)
+        assert "out of disk space" in caplog.text
+
+    def test_fsync_failure_is_survivable(self, bundle_env, monkeypatch):
+        monkeypatch.setattr(
+            mega_cache.os, "fsync", _raiser(OSError(errno.EIO, "io error"))
+        )
+        mega_cache.save("m", "sig")  # must not propagate
+        monkeypatch.undo()
+        assert not os.path.exists(bundle_env.path)
+        assert not os.path.exists(bundle_env.path + ".tmp")
 
     def test_corrupt_bundle_does_not_raise(self, bundle_env, monkeypatch):
         import sys
