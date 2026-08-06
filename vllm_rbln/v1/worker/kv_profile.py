@@ -11,18 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Merge `rebel` KV-cache memory profiles into a single joint profile.
+"""Merge `rebel` KV-cache memory profiles into a single joint profile."""
 
-`kv_cache_memory_profile()` describes one artifact's memory per device region as
-`base_bytes + bytes_per_block * n` plus an alignment. A rank holds several
-artifacts that *share* the KV tensors while each keeps a small private footprint,
-so solving each profile alone and taking the min is optimistic.
-
-The joint profile sums base regions with shared ones counted once (multiset
-intersection), and counts growth regions once per (node, chiplet) -- they point
-at the same KV tensors, so summing would double-count. Regions are contributed
-verbatim to keep `max_num_blocks`' per-region alignment accounting intact.
-"""
+# NOTE(RBLN): the reduction is load-bearing and nothing here can test it -- `min`
+# is optimistic, summing the growth double-counts, and every merge recorded on
+# hardware had N=2, where all candidate rules are algebraically identical.
+# See docs/dynamic_kv_cache.md, "How the per-artifact profiles are merged".
 
 from __future__ import annotations
 
@@ -34,25 +28,15 @@ from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)
 
-# The key the *per-artifact* profiles are logged under. Offline analysis keys on
-# this exact token to recover base_bytes / bytes_per_block from a finished run --
-# nothing else in the log carries them, so a run whose log lacks these dumps
-# cannot be analysed afterwards at all and has to be repeated on the device.
+# NOTE(RBLN): log analysis recovers base_bytes / bytes_per_block by scanning for
+# these tokens, so the merged key must not contain the source one.
 SOURCE_PROFILE_LOG_KEY = "device_regions"
-# The key the *merged* profile is logged under. It must NOT contain
-# `device_regions=[`: log analysis counts that token to find source profiles, so
-# a shared key would feed the merged bytes back into the merge.
 MERGED_PROFILE_LOG_KEY = "merged_regions"
-assert SOURCE_PROFILE_LOG_KEY not in MERGED_PROFILE_LOG_KEY
 
 
 @dataclass(frozen=True)
 class MergedMemoryRegion:
-    """One device allocation region of the merged profile.
-
-    Field names mirror `rebel._C.PyRblnMemoryRegion`; `max_num_blocks` reads
-    them by duck typing only.
-    """
+    """One region of the merged profile; fields mirror `PyRblnMemoryRegion`."""
 
     node_id: int
     chiplet_id: int
@@ -71,16 +55,13 @@ class MergedKvCacheMemoryProfile:
     # Bookkeeping for logs / the prediction-vs-measurement gate. Not read by
     # `max_num_blocks`.
     num_source_profiles: int = 0
-    dedup_strategy: str = "none"
     num_shared_base_regions: int = 0
     num_private_base_regions: int = 0
     num_growth_regions: int = 0
 
 
-def _fallback_key(region: Any) -> tuple[int, int, int, int]:
-    """Dedup key. `alignment` is excluded: it is filled from a literal constant
-    and carries no discriminating information.
-    """
+def _region_key(region: Any) -> tuple[int, int, int, int]:
+    """Dedup key; `alignment` is excluded, it is a literal constant."""
     return (
         int(region.node_id),
         int(region.chiplet_id),
@@ -118,12 +99,8 @@ def _split_regions(profile: Any) -> _Split:
 def _merge_base_by_multiset(
     splits: list[_Split],
 ) -> tuple[list[MergedMemoryRegion], int, int]:
-    """Shared == multiset intersection across every profile.
-
-    Shared regions are counted once; what remains in each profile after removing
-    the shared multiset is its private footprint and is summed.
-    """
-    counters = [Counter(_fallback_key(r) for r in s.base) for s in splits]
+    """Shared == multiset intersection; the remainder is private and summed."""
+    counters = [Counter(_region_key(r) for r in s.base) for s in splits]
     shared = counters[0].copy()
     for counter in counters[1:]:
         shared &= counter
@@ -131,7 +108,7 @@ def _merge_base_by_multiset(
     prototypes: dict[tuple[int, int, int, int], Any] = {}
     for split in splits:
         for region in split.base:
-            prototypes.setdefault(_fallback_key(region), region)
+            prototypes.setdefault(_region_key(region), region)
 
     merged: list[MergedMemoryRegion] = []
     for key, count in shared.items():
@@ -144,8 +121,7 @@ def _merge_base_by_multiset(
     num_private = len(merged) - num_shared
 
     logger.info(
-        "[Dynamic KV] base regions deduped by (node, chiplet, base_bytes, "
-        "bytes_per_block) multiset intersection: shared=%d private=%d",
+        "[Dynamic KV] base regions deduped: shared=%d private=%d",
         num_shared,
         num_private,
     )
@@ -153,11 +129,9 @@ def _merge_base_by_multiset(
 
 
 def _merge_growth(splits: list[_Split]) -> list[MergedMemoryRegion]:
-    """Count per-block growth once per (node, chiplet).
-
-    Regions are kept individually rather than collapsed per chiplet because
-    `max_num_blocks` aligns every region on its own.
-    """
+    """Count per-block growth once per (node, chiplet)."""
+    # NOTE(RBLN): kept as individual regions, not collapsed per chiplet --
+    # `max_num_blocks` aligns every region on its own.
     totals: dict[tuple[int, int], dict[int, int]] = defaultdict(dict)
     for index, split in enumerate(splits):
         acc: Counter = Counter()
@@ -173,9 +147,8 @@ def _merge_growth(splits: list[_Split]) -> list[MergedMemoryRegion]:
         per_profile = totals[unit]
         if len(set(per_profile.values())) > 1:
             logger.warning(
-                "[Dynamic KV] per-block growth disagrees across compiled "
-                "artifacts at (node=%d, chiplet=%d): %s. Taking the maximum; "
-                "the artifacts may not share one KV layout.",
+                "[Dynamic KV] per-block growth disagrees at (node=%d, chiplet=%d): "
+                "%s. Taking the maximum; the KV layout may not be shared.",
                 unit[0],
                 unit[1],
                 {i: v for i, v in sorted(per_profile.items())},
@@ -191,23 +164,13 @@ def _merge_growth(splits: list[_Split]) -> list[MergedMemoryRegion]:
 def merge_kv_cache_memory_profiles(
     profiles: list[Any],
 ) -> MergedKvCacheMemoryProfile:
-    """Merge per-artifact KV-cache memory profiles into one joint profile.
-
-    Args:
-        profiles: `PyRblnKvCacheMemoryProfile`-shaped objects, one per compiled
-            artifact that consumes the KV cache.
-
-    Raises:
-        ValueError: when `profiles` is empty.
-    """
+    """Merge per-artifact KV-cache memory profiles into one joint profile."""
     if not profiles:
         raise ValueError("merge_kv_cache_memory_profiles() needs >= 1 profile")
 
     splits = [_split_regions(p) for p in profiles]
 
     base, num_shared, num_private = _merge_base_by_multiset(splits)
-    strategy = "multiset"
-
     growth = _merge_growth(splits)
 
     host_base_bytes = max((int(p.host_base_bytes) for p in profiles), default=0)
@@ -220,16 +183,14 @@ def merge_kv_cache_memory_profiles(
         host_base_bytes=host_base_bytes,
         host_bytes_per_block=host_bytes_per_block,
         num_source_profiles=len(profiles),
-        dedup_strategy=strategy,
         num_shared_base_regions=num_shared,
         num_private_base_regions=num_private,
         num_growth_regions=len(growth),
     )
     logger.info(
-        "[Dynamic KV] merged %d compiled profile(s) via %s: regions=%d "
+        "[Dynamic KV] merged %d compiled profile(s): regions=%d "
         "(base=%d growth=%d) host_base_bytes=%d host_bytes_per_block=%d",
         len(profiles),
-        strategy,
         len(merged.device_regions),
         len(base),
         len(growth),
@@ -244,12 +205,9 @@ def build_per_chiplet_budget(
     num_chiplets: int,
     budget_bytes_per_chiplet: int,
 ) -> dict[int, dict[int, int]]:
-    """Return the `{node_id: {chiplet_id: bytes}}` map `max_num_blocks` wants.
-
-    Every (node, chiplet) combination is filled in: a unit the profile uses but
-    the mapping omits is silently budgeted 0 bytes, which turns a plumbing
-    mistake into a plausible-looking answer of 0 blocks.
-    """
+    """Return the `{node_id: {chiplet_id: bytes}}` map `max_num_blocks` wants."""
+    # NOTE(RBLN): every combination is filled in -- a unit the profile uses but
+    # the map omits is silently budgeted 0 bytes, i.e. an answer of 0 blocks.
     if num_nodes <= 0 or num_chiplets <= 0:
         raise ValueError(
             f"invalid device topology: num_nodes={num_nodes} "
@@ -277,19 +235,13 @@ def assert_budget_covers_profile(
     missing = sorted(used - covered)
     if missing:
         raise RuntimeError(
-            "device budget map does not cover every (node_id, chiplet_id) the "
-            f"compiled profile allocates on: missing={missing} "
-            f"covered={sorted(covered)}. rebel.kv_cache.max_num_blocks would "
-            "silently budget 0 bytes for those units."
+            f"device budget map misses (node, chiplet) the profile uses: {missing} "
+            f"(covered={sorted(covered)}); max_num_blocks would budget them 0 bytes."
         )
 
 
 def per_chiplet_usage(profile: Any, num_blocks: int) -> dict[tuple[int, int], int]:
-    """Predicted aligned bytes per (node, chiplet) at `num_blocks`.
-
-    Mirrors the accounting inside `rebel.kv_cache.max_num_blocks` so the worker
-    can compare its prediction against the runtime's own allocation report.
-    """
+    """Predicted aligned bytes per (node, chiplet), mirroring `max_num_blocks`."""
     usage: Counter = Counter()
     for region in profile.device_regions:
         alignment = int(region.alignment)
@@ -305,16 +257,8 @@ def per_chiplet_usage(profile: Any, num_blocks: int) -> dict[tuple[int, int], in
 def format_profile_for_log(profile: Any, key: str = SOURCE_PROFILE_LOG_KEY) -> str:
     """One-line, machine-readable record of a KV-cache memory profile.
 
-    Shaped like the compiler's own ``__repr__``, but written out field by field
-    rather than via ``repr()`` so the record stays identical across compiler
-    builds.
-
-    Args:
-        profile: Anything with ``device_regions`` / ``host_base_bytes`` /
-            ``host_bytes_per_block`` -- a compiler profile or a merged one.
-        key: `SOURCE_PROFILE_LOG_KEY` for a per-artifact profile,
-            `MERGED_PROFILE_LOG_KEY` for the merge; the two must stay
-            distinguishable in the log.
+    Written out field by field rather than via ``repr()`` so the record stays
+    identical across compiler builds.
     """
     regions = ", ".join(
         "PyRblnMemoryRegion("

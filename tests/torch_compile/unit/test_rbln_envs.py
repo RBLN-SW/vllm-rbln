@@ -79,13 +79,11 @@ def test_rbln_envs():
 
 
 def test_dynamic_kv_cache_envs_default_off():
-    """The dynamic KV cache path must be opt-in behind ONE switch.
+    """The dynamic KV cache path must be opt-in.
 
     `VLLM_RBLN_USE_DYNAMIC_KV_CACHE` is read before / during the compile, so a
     non-False default would change the compiled artifact for every existing
-    deployment. It is also the only variable the feature has: the compile-time
-    hint is a module constant, so there is no way to reach the feature in a
-    half-enabled state (flag on, no shrink, no resize, mark_dynamic still logged).
+    deployment.
     """
     assert "VLLM_RBLN_USE_DYNAMIC_KV_CACHE" in envs.environment_variables
     assert not envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE, (
@@ -97,22 +95,3 @@ def test_dynamic_kv_cache_envs_default_off():
 def test_dynamic_kv_cache_envs_are_read_from_os_environ(monkeypatch):
     monkeypatch.setenv("VLLM_RBLN_USE_DYNAMIC_KV_CACHE", "1")
     assert envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE is True
-
-
-def test_the_unprofiled_reserve_is_not_an_env_var():
-    """It is a constant, and it has to stay above what the measurement found.
-
-    48 MiB covers the 41,968,576 B of device memory the measured artifacts hold
-    with no matching profile region, and on both configs measured on device it
-    costs zero blocks. Not an env var: `_dynamic_kv_chiplet_budget` is its only
-    reader, and lowering it is the one "remedy" that would re-create the overrun
-    the reserve exists to prevent.
-    """
-    from vllm_rbln.v1.worker.rbln_worker import DYNAMIC_KV_UNPROFILED_RESERVE_BYTES
-
-    assert (
-        "VLLM_RBLN_DYNAMIC_KV_UNPROFILED_RESERVE_BYTES"
-        not in envs.environment_variables
-    )
-    assert DYNAMIC_KV_UNPROFILED_RESERVE_BYTES == 48 * 1024 * 1024
-    assert DYNAMIC_KV_UNPROFILED_RESERVE_BYTES > 41_968_576

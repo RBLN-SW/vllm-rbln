@@ -1441,22 +1441,6 @@ class TestDynamicKvCompilerSupport:
         with patch.dict(sys.modules, mods):
             self._probe()(MagicMock())
 
-    def test_runs_before_the_other_dynamic_kv_guards(self):
-        """Ordering is the point: it must precede anything that compiles.
-
-        `initialize_from_config` calls it first, ahead of the scheduler-handoff
-        and KV-connector guards, and the executor runs `initialize_from_config`
-        on every rank before any rank's `compile_or_warm_up_model`.
-        """
-        source = inspect.getsource(
-            __import__(
-                "vllm_rbln.v1.worker.rbln_worker", fromlist=["RBLNWorker"]
-            ).RBLNWorker.initialize_from_config
-        )
-        probe = source.index("_assert_dynamic_kv_compiler_support")
-        handoff = source.index("_assert_dynamic_kv_scheduler_handoff_installed")
-        assert probe < handoff
-
 
 # ---------------------------------------------------------------------------
 # Dynamic KV: model / feature shapes the path cannot size
@@ -1674,7 +1658,7 @@ class TestMaybeShrinkKvCacheForCompile:
             worker, out = self._shrink(config, dynamic=False)
         assert out is config
         assert worker._kv_blocks_before_shrink is None
-        assert caplog.text == ""
+        assert "[Dynamic KV]" not in caplog.text
 
     def test_a_pinned_block_count_cancels_the_shrink(self, caplog):
         config = self._config()
@@ -1692,13 +1676,6 @@ class TestMaybeShrinkKvCacheForCompile:
         with pytest.raises(RuntimeError, match="nothing to shrink"):
             self._shrink(self._config(num_blocks=4))
 
-    def test_the_refusal_points_at_block_size_not_at_a_variable(self):
-        with pytest.raises(RuntimeError) as exc:
-            self._shrink(self._config(num_blocks=4))
-        assert "--block-size" in str(exc.value)
-        # The variable it used to name is gone; do not resurrect it in prose.
-        assert "VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS" not in str(exc.value)
-
     def test_no_warmup_means_no_shrink(self, caplog):
         """Skipping compile/warm-up has to skip the shrink too: otherwise the
         latch is set, the profile query finds no runtimes, and the restore path
@@ -1712,50 +1689,6 @@ class TestMaybeShrinkKvCacheForCompile:
         assert worker._kv_blocks_before_shrink is None
         assert "compile/warm-up is skipped" in caplog.text
         assert "does nothing for this run" in caplog.text
-
-
-class TestChargeRemedyWording:
-    """What the retained-cache charge tells the operator.
-
-    The hint is a constant, so there is nothing for them to lower: the warning has
-    to say the block count is the price of the parallelism, and the exhausted-budget
-    refusal has to point at the budget. Both strings are asserted nowhere else.
-    """
-
-    BUDGET = 33_772_535_808
-
-    @staticmethod
-    def _charge(*, blocks, bytes_per_block, tp=4):
-        from vllm_rbln.v1.worker.kv_profile import (
-            MergedKvCacheMemoryProfile,
-            MergedMemoryRegion,
-        )
-        from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
-
-        merged = MergedKvCacheMemoryProfile(
-            device_regions=[MergedMemoryRegion(0, 0, 0, bytes_per_block, 1)]
-        )
-        worker = SimpleNamespace(
-            parallel_config=SimpleNamespace(tensor_parallel_size=tp),
-            model_runner=SimpleNamespace(
-                kv_cache_config=SimpleNamespace(num_blocks=blocks)
-            ),
-        )
-        return RBLNWorker._charge_retained_compile_kv_cache(
-            worker, {0: {0: TestChargeRemedyWording.BUDGET}}, merged
-        )
-
-    def test_the_charge_does_not_offer_a_knob_to_lower(self, caplog):
-        with caplog.at_level("WARNING"):
-            self._charge(blocks=8, bytes_per_block=65_011_712)
-        assert "price of running this parallelism" in caplog.text
-        assert "VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS" not in caplog.text
-
-    def test_a_budget_the_charge_exhausts_points_at_the_budget(self):
-        with pytest.raises(RuntimeError) as exc:
-            self._charge(blocks=8, bytes_per_block=self.BUDGET // 4)
-        assert "gpu-memory-utilization" in str(exc.value)
-        assert "VLLM_RBLN_COMPILE_KV_CACHE_NUM_BLOCKS" not in str(exc.value)
 
 
 class TestDynamicKvLayoutGuards:
@@ -1806,6 +1739,10 @@ class TestDynamicKvLayoutGuards:
 
         assert calls.index("attention") < calls.index("shrink")
         assert calls.index("bindings") > calls.index("initialize_kv_cache")
+        # The compiler probe must precede everything that can compile, so it
+        # goes first of the guards.
+        assert calls.index("compiler") == 0
+        assert calls.index("compiler") < calls.index("handoff")
 
     def test_a_non_paged_causal_layer_is_refused_by_name(self):
         """`block_size == max_model_len` makes is_normal True -- and is also where

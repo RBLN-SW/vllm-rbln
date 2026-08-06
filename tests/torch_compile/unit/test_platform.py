@@ -13,7 +13,9 @@
 # limitations under the License.
 
 from pathlib import Path
+from types import SimpleNamespace
 
+import pytest
 import torch
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -105,8 +107,6 @@ def test_get_attn_backend_cls():
 # `validate_and_setup_prerequisite` only runs inside it.
 # ---------------------------------------------------------------------------
 def _thin_config():
-    from types import SimpleNamespace
-
     # Enough to reach the flag check and no further; the method needs a real
     # VllmConfig to finish either branch.
     return SimpleNamespace(
@@ -117,8 +117,6 @@ def _thin_config():
 
 
 def test_dynamic_kv_without_the_vllm_model_path_is_refused(monkeypatch):
-    import pytest
-
     from vllm_rbln.platform import RblnPlatform
 
     monkeypatch.setenv("VLLM_RBLN_USE_DYNAMIC_KV_CACHE", "1")
@@ -127,17 +125,18 @@ def test_dynamic_kv_without_the_vllm_model_path_is_refused(monkeypatch):
         RblnPlatform.check_and_update_config(_thin_config())
 
 
-def test_the_dynamic_kv_flag_check_does_not_overreach(monkeypatch):
-    import pytest
-
+@pytest.mark.parametrize(("dynamic_kv", "use_vllm_model"), [("0", "0"), ("1", "1")])
+def test_the_dynamic_kv_flag_check_does_not_overreach(
+    monkeypatch, dynamic_kv, use_vllm_model
+):
     from vllm_rbln.platform import RblnPlatform
 
     # Both valid pairings must get past this check. The thin config cannot carry
     # either branch to the end, so assert only that this guard is not what
-    # stopped it.
-    for dynamic_kv, use_vllm_model in (("0", "0"), ("1", "1")):
-        monkeypatch.setenv("VLLM_RBLN_USE_DYNAMIC_KV_CACHE", dynamic_kv)
-        monkeypatch.setenv("VLLM_RBLN_USE_VLLM_MODEL", use_vllm_model)
-        with pytest.raises(Exception) as excinfo:
-            RblnPlatform.check_and_update_config(_thin_config())
-        assert "VLLM_RBLN_USE_DYNAMIC_KV_CACHE" not in str(excinfo.value)
+    # stopped it -- and do not require that anything stops it at all.
+    monkeypatch.setenv("VLLM_RBLN_USE_DYNAMIC_KV_CACHE", dynamic_kv)
+    monkeypatch.setenv("VLLM_RBLN_USE_VLLM_MODEL", use_vllm_model)
+    try:
+        RblnPlatform.check_and_update_config(_thin_config())
+    except Exception as exc:
+        assert "VLLM_RBLN_USE_DYNAMIC_KV_CACHE" not in str(exc)

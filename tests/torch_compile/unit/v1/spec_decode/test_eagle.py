@@ -501,32 +501,6 @@ def test_load_model_compiles_wrapper(monkeypatch, strict):
     assert captured["mode"] == ("strict" if strict else "")
 
 
-# Verifies the drafter shares the runner's runtime holder only under dynamic KV;
-# `RBLNEagleProposer.load_model` records why the sharing is gated.
-@pytest.mark.parametrize("dynamic_kv", [False, True])
-def test_load_model_shares_runtime_holder_only_for_dynamic_kv(monkeypatch, dynamic_kv):
-    holder: list = []
-    runner = SimpleNamespace(compile_context=object(), runtime_holder=holder)
-    stub = make_eagle_stub(enforce_eager=False, runner=runner)
-    _install_model(monkeypatch, stub, FakeEagleModel())
-    captured: dict[str, object] = {}
-
-    def fake_compile(target, **kwargs):
-        captured.update(kwargs)
-        return object()
-
-    monkeypatch.setattr(eagle_module, "compile", fake_compile)
-    monkeypatch.setattr(eagle_module, "build_process_group_dict", lambda: object())
-    monkeypatch.setattr(eagle_module.envs, "VLLM_RBLN_COMPILE_MODEL", True)
-    monkeypatch.setattr(eagle_module.envs, "VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK", 8)
-    monkeypatch.setattr(eagle_module.envs, "VLLM_RBLN_COMPILE_STRICT_MODE", False)
-    monkeypatch.setattr(eagle_module.envs, "VLLM_RBLN_USE_DYNAMIC_KV_CACHE", dynamic_kv)
-
-    RBLNEagleProposer.load_model(stub, target_model=object())
-
-    assert captured["runtime_holder"] is (holder if dynamic_kv else None)
-
-
 # Verifies the wrapper gathers the last-token hidden states when indices are
 # given, and feeds the full last-hidden stream when they are not.
 @pytest.mark.parametrize("with_indices", [True, False])

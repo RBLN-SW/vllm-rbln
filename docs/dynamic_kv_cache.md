@@ -127,6 +127,63 @@ Known gaps, measured and not yet fixed:
   and landed at 1.043x of the requested budget. Whether that is a retained arena or
   the measurement artifact below is not settled.
 
+## How the per-artifact profiles are merged
+
+`kv_cache_memory_profile()` describes **one** artifact's memory per device region as
+`base_bytes + bytes_per_block * n` plus an alignment, and a rank holds several
+artifacts (prefill and decode) that *share* the KV tensors while each keeps a small
+private footprint. Two obvious reductions are both wrong:
+
+- Solving each profile alone and taking the `min` is **optimistic** — it ignores the
+  other artifacts' private footprints, which are resident at the same time.
+- Summing the growth regions **double-counts** — they point at the same KV tensors,
+  so `n` blocks would be charged once per artifact.
+
+So `vllm_rbln/v1/worker/kv_profile.py` sums the base regions with the shared ones
+counted once (multiset intersection on
+`(node_id, chiplet_id, base_bytes, bytes_per_block)`) and counts the growth once per
+`(node, chiplet)`. Regions are contributed verbatim rather than collapsed, because
+`rebel.kv_cache.max_num_blocks` aligns every region on its own.
+
+**This reduction is not distinguished by anything we can run.** Every merge recorded
+on hardware so far had exactly two profiles, and at N=2 the candidate rules are
+algebraically identical (`a + b - min == max`). A "simplification" to `sum()` or
+`min()` would therefore pass the unit tests *and* a device run while being wrong for
+N>2. Speculative decoding, the only shape that adds a third owner, is refused for the
+same reason: the merge key cannot tell an artifact re-reporting a shared tensor from
+one owning its own of the same size. Fixing that means attributing regions per
+artifact, not a better key.
+
+## Constants, and the measurements behind them
+
+| Constant | Value | Where it comes from |
+| --- | --- | --- |
+| `COMPILE_KV_CACHE_NUM_BLOCKS` | 8 | Smallest measured hint. Below 8 is unmeasured; `2` is the smallest expected to keep the dimension dynamic and `1` is specialized away silently by dynamo, which yields a static artifact whose profile query then finds no dynamic-shape variable. |
+| `DYNAMIC_KV_UNPROFILED_RESERVE_BYTES` | 48 MiB | Held back from every chiplet's budget for device memory no profile region describes. **41,968,576 B measured** (profile totals differenced against sysfs `dram_used`), rounded up. Costs zero blocks on both configurations measured on device. |
+| `REBEL_DRAM_NBYTES` | 140 GiB | 144 GiB of quad-chiplet DRAM minus the 4 GiB system region. Current drivers report exactly this in sysfs `dram_total`, so reading the device is a no-op today; the reader clamps to it so sourcing the figure from the driver can only ever lower the estimate. |
+
+Two accounting decisions are easy to "improve" into a bug:
+
+- **The per-chiplet budget is derived from capacity, not from a measured free
+  figure.** `max_num_blocks` subtracts the profile's own `base_bytes`, and those
+  bytes are already resident by the time the budget is computed — so feeding it a
+  measured *free* value charges the base twice and silently costs blocks.
+- **The outgoing cache is released before the replacement is allocated.**
+  `initialize_kv_cache_tensors` rebinds the runner list and the forward context, so
+  otherwise the old tensors outlive the free and the allocator keeps their blocks
+  reserved: **measured at 4.5 GiB per card**, the dominant term in that run's
+  `gpu_memory_utilization` overshoot. Releasing first also caps the peak at
+  `base + max(old, new)` rather than `base + old + new`.
+
+## Reading the right cards
+
+`RBLN_DEVICES` indexes the devices the *container* exposes, not the sysfs card
+numbering; the two coincide only when the container holds card 0 upward. Both sysfs
+readers therefore resolve each entry against the device nodes actually present
+(`/dev/rbln*`). Indexing sysfs by the raw entry charged a neighbouring container's
+workload to this worker: one measured run went from **1024 KV blocks to 308**, and
+with a larger neighbour the per-chiplet budget went negative and start-up aborted.
+
 ## Measuring per-chiplet residency
 
 The figures above come from summing the runtime's allocation log lines per

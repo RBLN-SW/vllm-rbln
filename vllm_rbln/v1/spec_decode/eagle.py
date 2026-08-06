@@ -400,17 +400,6 @@ class RBLNEagleProposer(EagleProposer):
                 process_group_dict=build_process_group_dict(),
                 guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
                 mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
-                # The drafter consumes the runner's KV cache, so under dynamic KV
-                # its runtimes must share the holder: otherwise their device
-                # regions go uncounted when solving for num_blocks and their
-                # adaptive-size latch is never cleared after the resize. Gated
-                # because the holder is a live list shared with
-                # `_process_kv_cache_copy_ops` and any KV-connector.
-                runtime_holder=(
-                    self.runner.runtime_holder
-                    if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE
-                    else None
-                ),
             )
 
     def _build_dummy_attn_metadata(

@@ -87,6 +87,7 @@ from vllm_rbln.v1.worker.utils import (
     get_rbln_planned_affinity_cpu_count,
     read_rbln_card_dram_total_bytes,
     read_rbln_card_dram_used_bytes,
+    rescale_kv_cache_config,
     set_cpu_affinity,
     set_omp_num_threads,
 )
@@ -96,12 +97,10 @@ logger = init_logger(__name__)
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 
-# Blocks the cache is shrunk to for the compile -- the mark_dynamic'd dim's trace
-# hint, not a capacity. 8 is measured; below it is not, and 1 specializes away.
+# Trace hint of the mark_dynamic'd dim, not a capacity. Both constants are
+# measured -- see docs/dynamic_kv_cache.md, "Constants, and the measurements
+# behind them", before changing either.
 COMPILE_KV_CACHE_NUM_BLOCKS = 8
-
-# Held back from every chiplet's budget for device memory the profile does not
-# describe. 41,968,576 B measured, rounded up; costs zero blocks on both configs.
 DYNAMIC_KV_UNPROFILED_RESERVE_BYTES = 48 * 1024 * 1024
 
 
@@ -109,33 +108,26 @@ def _kv_cache_config_at(cfg: KVCacheConfig, num_blocks: int) -> KVCacheConfig:
     """A copy of `cfg` retargeted at `num_blocks` (tensor sizes scale with it)."""
     scaled = copy.copy(cfg)
     scaled.kv_cache_tensors = copy.deepcopy(cfg.kv_cache_tensors)
-    scaled.num_blocks = num_blocks
-    for kv_tensor in scaled.kv_cache_tensors:
-        kv_tensor.size = (kv_tensor.size * num_blocks) // cfg.num_blocks
+    rescale_kv_cache_config(scaled, num_blocks)
     return scaled
 
 
 def empty_rbln_device_caches() -> bool:
-    """Return every *free* block the rbln caching allocator holds to the driver.
-
-    Without this a freed tensor's block stays reserved -- the allocator only
-    releases cached blocks as a *retry* after an allocation fails -- so the bytes
-    keep counting against the chiplet in sysfs `dram_used`. Only blocks that were
-    never split are freed, and it is a no-op for a device this process never
-    allocated on. Never raises: this runs during start-up.
-    """
+    """Return every *free* block the rbln caching allocator holds to the driver."""
+    # NOTE(RBLN): the allocator otherwise releases cached blocks only as a retry
+    # after an allocation fails, so freed bytes keep counting in sysfs
+    # `dram_used`. Never raises: this runs during start-up.
     if not has_torch_rbln:
         return False
     try:
-        # is_available() raises on a malformed RBLN_* config, hence the guard.
+        # NOTE(RBLN): is_available() raises on a malformed RBLN_* config.
         if not torch.rbln.is_available():
             return False
         device_count = torch.rbln.device_count()
-    except Exception as exc:  # pylint: disable=broad-exception-caught
+    except Exception as exc:
         logger.warning(
             "could not query the rbln devices to empty their allocator caches: "
-            "%s. Memory freed by the dynamic-KV resize stays reserved by the "
-            "caching allocator and keeps counting against the chiplet budget.",
+            "%s. Freed KV bytes stay reserved and keep counting per chiplet.",
             exc,
         )
         return False
@@ -143,11 +135,10 @@ def empty_rbln_device_caches() -> bool:
     for index in range(device_count):
         try:
             torch.rbln.empty_cache(index)
-        except Exception as exc:  # pylint: disable=broad-exception-caught
+        except Exception as exc:
             logger.warning(
                 "torch.rbln.empty_cache(%d) failed: %s. Freed KV blocks stay "
-                "reserved by the caching allocator and keep counting against "
-                "the chiplet's memory budget.",
+                "reserved and keep counting per chiplet.",
                 index,
                 exc,
             )
@@ -189,13 +180,15 @@ class RBLNWorker(WorkerBase):
         # raises inside the rbln runtime.
         self._dynamic_kv_profiled_runtime_ids: set[int] = set()
         # Other tenants' device DRAM, sampled before this worker allocates
-        # anything. Card-scope -- sysfs has no per-chiplet breakdown.
-        self._foreign_dram_used_bytes = read_rbln_card_dram_used_bytes()
-        logger.debug(
-            "foreign device DRAM at worker init: %d bytes (RBLN_DEVICES=%s)",
-            self._foreign_dram_used_bytes,
-            os.environ.get("RBLN_DEVICES", ""),
-        )
+        # anything. Card-scope; only `_dynamic_kv_chiplet_budget` reads it.
+        self._foreign_dram_used_bytes = 0
+        if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
+            self._foreign_dram_used_bytes = read_rbln_card_dram_used_bytes()
+            logger.debug(
+                "foreign device DRAM at worker init: %d bytes (RBLN_DEVICES=%s)",
+                self._foreign_dram_used_bytes,
+                os.environ.get("RBLN_DEVICES", ""),
+            )
 
         self.profiler: Any | None = None
         self.profiler_config = vllm_config.profiler_config
@@ -531,30 +524,22 @@ class RBLNWorker(WorkerBase):
     def _maybe_shrink_kv_cache_for_compile(
         self, kv_cache_config: KVCacheConfig
     ) -> KVCacheConfig:
-        """Return a small-KV-cache copy of the config, or `kv_cache_config`
-        unchanged when the shrink is not enabled.
+        """Return a small-KV-cache copy of the config, or it unchanged.
 
-        The cache allocated here is the one `warmup_model()` traces, so its
-        `num_blocks` becomes the trace-time hint of the `mark_dynamic`'d dim.
-        Building the artifact's buffers at the full size is pointless when the
-        runtime resizes them anyway, and warm-up is safe small: every dummy
-        request points at block id 0.
+        The cache allocated here is what `warmup_model()` traces, so its
+        `num_blocks` becomes the hint of the `mark_dynamic`'d dim.
         """
         compile_num_blocks = COMPILE_KV_CACHE_NUM_BLOCKS
         if not envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
             return kv_cache_config
         skip_reason = self._compile_and_warmup_skip_reason()
         if skip_reason is not None:
-            # Nothing compiles, so no artifact carries a profile and the resize
-            # cannot run. Shrinking anyway sets the latch, finds no runtimes, and
-            # the restore path trips its own assertion -- a start-up
-            # AssertionError naming none of the cause. Serve the estimate instead.
+            # Nothing compiles, so no artifact carries a profile: shrinking
+            # anyway would set the latch and then find no runtimes to resize.
             logger.warning(
-                "[Dynamic KV] VLLM_RBLN_USE_DYNAMIC_KV_CACHE is set but "
-                "compile/warm-up is skipped (%s), so no artifact reports a KV "
-                "memory profile and the cache cannot be resized. The KV cache "
-                "stays at the %d blocks the pre-compile estimate produced and "
-                "this feature does nothing for this run.",
+                "[Dynamic KV] compile/warm-up is skipped (%s), so the cache stays "
+                "at the estimated %d blocks and this feature does nothing for "
+                "this run.",
                 skip_reason,
                 kv_cache_config.num_blocks,
             )
@@ -562,15 +547,9 @@ class RBLNWorker(WorkerBase):
         override = self.cache_config.num_gpu_blocks_override
         if override is not None:
             logger.warning(
-                "[Dynamic KV] the %d-block compile-time KV cache is ignored "
-                "because --num-gpu-blocks-override=%d pins the block count: the "
-                "dynamic KV path then computes no new size, so nothing would "
-                "restore the full cache after the compile and the server would "
-                "serve from the %d-block compile cache while the scheduler hands "
-                "out block ids for %d. Compiling at the pinned size instead.",
-                compile_num_blocks,
+                "[Dynamic KV] --num-gpu-blocks-override=%d pins the count; no "
+                "shrink and no resize. Compiling at %d blocks.",
                 override,
-                compile_num_blocks,
                 kv_cache_config.num_blocks,
             )
             return kv_cache_config
@@ -579,29 +558,19 @@ class RBLNWorker(WorkerBase):
             # leave the run on the pre-compile estimate -- #42 reproducing
             # silently, with nobody having asked for it. Refuse instead.
             raise RuntimeError(
-                f"the compile-time KV block count ({compile_num_blocks}) is not "
-                f"below the {kv_cache_config.num_blocks} blocks vllm sized the KV "
-                "cache with, so there is nothing to shrink -- and without a shrink "
-                "the compiled profile is never queried, which leaves the cache on "
-                "the pre-compile estimate that VLLM_RBLN_USE_DYNAMIC_KV_CACHE "
-                "exists to replace. The estimate is free device memory divided by "
-                "the cost of one block, and that cost is proportional to "
-                "block_size, so a smaller --block-size raises it; a higher "
-                "--gpu-memory-utilization or more devices do too. Or unset "
-                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE to serve the pre-compile estimate "
-                "exactly as before."
+                f"the {compile_num_blocks}-block compile hint is not below the "
+                f"{kv_cache_config.num_blocks} blocks vllm estimated, so there is "
+                "nothing to shrink and no resize would run. See "
+                "docs/dynamic_kv_cache.md."
             )
 
         shrunk = _kv_cache_config_at(kv_cache_config, compile_num_blocks)
         self._kv_blocks_before_shrink = kv_cache_config.num_blocks
         logger.info(
-            "[Dynamic KV] compiling with %d KV blocks instead of %d; the cache is "
-            "resized after warm-up from the compiled profile. On "
-            "tensor_parallel_size>=2 these %d blocks are not returned and are "
-            "charged against the per-chiplet budget.",
+            "[Dynamic KV] compiling with %d KV blocks instead of %d; resized after "
+            "warm-up from the compiled profile.",
             compile_num_blocks,
             kv_cache_config.num_blocks,
-            compile_num_blocks,
         )
         return shrunk
 
@@ -609,16 +578,12 @@ class RBLNWorker(WorkerBase):
         """Guard: nothing may shrink the KV cache unless something will resize it.
 
         Both rpcs are only ever driven by the `EngineCore._initialize_kv_caches`
-        patch. Without it the cache would stay at the compile-time size while the
-        scheduler hands out block ids for the pre-compile estimate -- the exact
-        failure this feature exists to remove.
+        patch.
         """
         if not envs.VLLM_RBLN_USE_VLLM_MODEL:
             raise RuntimeError(
                 "VLLM_RBLN_USE_DYNAMIC_KV_CACHE requires "
-                "VLLM_RBLN_USE_VLLM_MODEL=1: the optimum path uses runtimes "
-                "that ignore adaptive buffer sizes, and the RBLN patch registry "
-                "(which carries the scheduler hand-off) is not applied there."
+                "VLLM_RBLN_USE_VLLM_MODEL=1; see docs/dynamic_kv_cache.md."
             )
 
         from vllm.v1.engine.core import EngineCore
@@ -627,28 +592,22 @@ class RBLNWorker(WorkerBase):
 
         if EngineCore._initialize_kv_caches is not patched_initialize_kv_caches:
             raise RuntimeError(
-                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE is set but the "
-                "EngineCore._initialize_kv_caches patch is not installed, so "
-                "nothing would query the compiled profile or tell the scheduler "
-                "the new block count."
+                "the EngineCore._initialize_kv_caches patch is not installed, so "
+                "nothing would resize the KV cache or re-announce the count."
             )
 
     def _assert_dynamic_kv_compiler_support(self) -> None:
         """Guard: the installed rebel-compiler must carry the #10678 API.
 
-        `rebel.kv_cache.max_num_blocks` and `DynamoRuntime.reset_adaptive_buffers`
-        both arrived in the same commit. Both are reached only *after* the model
-        has compiled and warmed up, so on an older compiler the run pays the full
-        compile and then dies on a bare ImportError / AttributeError. Probe them
-        up front instead, before anything is compiled.
+        Both symbols are reached only after the compile and warm-up, so probing
+        them up front saves an older compiler a full compile before it dies.
         """
         try:
             from rebel.kv_cache import max_num_blocks  # noqa: F401
         except ImportError as exc:
             raise RuntimeError(
-                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE requires a rebel-compiler that "
-                "provides rebel.kv_cache.max_num_blocks (rebel_compiler #10678). "
-                f"The installed one does not: {exc}"
+                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE needs rebel.kv_cache.max_num_blocks "
+                f"(rebel_compiler #10678): {exc}"
             ) from exc
 
         try:
@@ -660,84 +619,53 @@ class RBLNWorker(WorkerBase):
         # Defined on BaseRuntime, which DynamoRuntime inherits from.
         if not hasattr(DynamoRuntime, "reset_adaptive_buffers"):
             raise RuntimeError(
-                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE requires a rebel-compiler whose "
-                "DynamoRuntime provides reset_adaptive_buffers() "
-                "(rebel_compiler #10678); without it the KV cache cannot be "
-                "resized after warm-up."
+                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE needs "
+                "DynamoRuntime.reset_adaptive_buffers (rebel_compiler #10678)."
             )
 
     def _assert_dynamic_kv_transfer_absent(self) -> None:
-        """Guard: a KV connector and dynamic KV cannot be combined.
-
-        `compile_or_warm_up_model` calls `finalize_kv_cache_registrations`, which
-        hands the connector the KV cache's physical views. Reallocating the KV
-        tensors right afterwards would leave those registrations pointing at
-        freed memory.
-        """
+        """Guard: a KV connector and dynamic KV cannot be combined."""
+        # NOTE(RBLN): `finalize_kv_cache_registrations` hands the connector the
+        # KV cache's physical views during warm-up; the resize frees them.
         if has_kv_transfer_group():
             raise RuntimeError(
                 "VLLM_RBLN_USE_DYNAMIC_KV_CACHE cannot be combined with a KV "
-                "transfer connector: the connector registers the KV cache's "
-                "physical views during warm-up and the dynamic-KV resize "
-                "invalidates them."
+                "transfer connector; the resize invalidates its registrations."
             )
 
     def _assert_dynamic_kv_model_supported(self) -> None:
-        """Guard: reject the two shapes the dynamic path sizes wrongly.
+        """Guard: reject the shapes the dynamic path cannot size.
 
-        Checked in `__init__` rather than beside the other dynamic-KV guards in
-        `initialize_from_config`, because vLLM loads the model before it
-        initialises the cache -- and for spec decode that load compiles the
-        drafter (`RBLNEagleProposer.load_model`). A guard down there would
-        arrive after the compile it exists to prevent.
+        Reasons per shape: docs/dynamic_kv_cache.md, "Unsupported combinations".
         """
+        # NOTE(RBLN): must run in `__init__`, not beside the other dynamic-KV
+        # guards -- vLLM loads the model first, and for spec decode that load
+        # already compiles the drafter (`RBLNEagleProposer.load_model`).
         if self.model_config.use_mla:
             raise RuntimeError(
                 "VLLM_RBLN_USE_DYNAMIC_KV_CACHE does not support MLA models. "
-                "The compiler's dynamic-input validator only admits "
-                "paged_flash_causal_attention_naive_{prefill,decode} and MLA "
-                "dispatches paged_flash_causal_mla_naive_*, so the marked KV "
-                "input never reaches an allowed op. Two things would also be "
-                "wrong if it did: `_assert_dynamic_kv_cache_layout` enumerates "
-                "`Attention` layers and MLAAttention is not one, so it would "
-                "pass without checking anything, and dim 1 of MLA's "
-                "(num_blocks, block_size, head_size) is block_size, not "
-                "num_blocks, so the mark would land on the wrong axis. Run "
-                "with the flag off, or with VLLM_MLA_DISABLE=1."
+                "Run with the flag off, or with VLLM_MLA_DISABLE=1."
             )
 
         if self.vllm_config.speculative_config is not None:
             raise RuntimeError(
                 "VLLM_RBLN_USE_DYNAMIC_KV_CACHE does not support speculative "
-                "decoding. The drafter's runtimes share the runner's "
-                "runtime_holder, so its compiled profile is merged next to the "
-                "target's, and the merge keys regions on (node, chiplet, "
-                "base_bytes, bytes_per_block). That key cannot tell an artifact "
-                "re-reporting a KV tensor it shares from one owning a separate "
-                "tensor of the same size, so the joint per-block cost comes out "
-                "either too low -- a cache that does not fit -- or several times "
-                "too high. Attributing regions per artifact is the fix; until "
-                "then the combination is refused rather than mis-sized."
+                "decoding; the merged profiles cannot be attributed per artifact."
             )
 
-        # `USE_DEVICE_TENSOR` ANDs in VLLM_RBLN_USE_VLLM_MODEL, which the platform
-        # already requires, so False here means the operator turned the other off.
         if not USE_DEVICE_TENSOR:
             raise RuntimeError(
                 "VLLM_RBLN_USE_DYNAMIC_KV_CACHE requires "
-                "VLLM_RBLN_USE_DEVICE_TENSOR=1. With it off the KV tensors are not "
-                "device-resident graph inputs -- they are registered by address via "
-                "`mark_static_address` -- while mark_dynamic is still applied, so "
-                "the artifact carries no dynamic-shape variable for the block "
-                "count and no runtime can report a memory profile to size the "
-                "cache from."
+                "VLLM_RBLN_USE_DEVICE_TENSOR=1; without it the artifact carries "
+                "no dynamic KV dimension."
             )
 
     def _assert_dynamic_kv_attention_layout(self) -> None:
         """Guard: every attention layer must dispatch to the paged-causal kernel.
 
-        Reads only `vllm_config`, so it runs before the shrink -- otherwise an
-        unsupported layout surfaces as the shrink's block-count refusal.
+        i.e. `sliding_window is None`, `is_causal` True and `is_normal` False;
+        `is_normal` becomes True when `block_size == max_model_len`. Reads only
+        `vllm_config`, so it can run before the shrink.
         """
         attn_layers = get_layers_from_vllm_config(self.vllm_config, Attention)
         offenders: list[str] = []
@@ -757,55 +685,44 @@ class RBLNWorker(WorkerBase):
                 )
         if offenders:
             raise RuntimeError(
-                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE requires every attention layer "
-                "to dispatch to paged_flash_causal_attention_naive_{prefill,"
-                "decode}, i.e. sliding_window is None, is_causal is True and "
-                "is_normal is False (is_normal becomes True when block_size == "
-                "max_model_len). Offending layers: "
+                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE requires every layer to dispatch "
+                "to paged_flash_causal_attention_naive_*. Offending: "
                 + ", ".join(offenders[:8])
                 + (f" (+{len(offenders) - 8} more)" if len(offenders) > 8 else "")
             )
 
     def _assert_dynamic_kv_cache_layout(self) -> None:
-        """Guard: the KV bindings must satisfy the compiler's dynamic-input rules.
-
-        The compiler requires every `mark_dynamic`'d KV input to have exactly one
-        use, and that use to be a
-        `paged_flash_causal_attention_naive_{prefill,decode}` call. Each item
-        below breaks half of that invariant and each fails *silently* -- a no-op
-        `mark_dynamic`, or a confusing 'has N uses' rejection -- unless checked.
-
-        Both read state `initialize_kv_cache` fills, so they cannot move before it:
-        they would see empty containers and pass vacuously.
-        """
+        """Guard: the KV bindings must satisfy the compiler's dynamic-input rules."""
+        # NOTE(RBLN): the compiler requires each mark_dynamic'd KV input to have
+        # exactly one use, and that use to be paged_flash_causal_attention_naive_*.
+        # Both checks read state `initialize_kv_cache` fills, so moving them
+        # earlier makes them pass vacuously.
         mr = self.model_runner
 
+        # NOTE(RBLN): a deduped base makes the per-layer kv_cache a view built
+        # inside the graph, so mark_dynamic is a no-op, and marking the base is
+        # rejected by the compiler ('kind is not call_arg').
         if mr.kv_cache_bases:
             raise RuntimeError(
                 "VLLM_RBLN_USE_DYNAMIC_KV_CACHE requires KV base deduplication "
                 f"to be inactive, but {len(mr.kv_cache_bases)} deduped bases "
-                "were built. The per-layer kv_cache would then be a view "
-                "created inside the traced graph, which makes mark_dynamic a "
-                "no-op, and marking the base itself is rejected by the "
-                "compiler ('kind is not call_arg')."
+                "were built."
             )
 
+        # NOTE(RBLN): one tensor reaching two attention calls gives the marked
+        # input two uses, which the compiler's validator rejects.
         if mr.shared_kv_cache_layers:
             raise RuntimeError(
                 "VLLM_RBLN_USE_DYNAMIC_KV_CACHE does not support cross-layer KV "
                 f"sharing, but {len(mr.shared_kv_cache_layers)} layer(s) reuse "
-                "another layer's KV cache. The same tensor object reaching two "
-                "attention calls gives the marked input two uses, which the "
-                "compiler's dynamic-input validator rejects."
+                "another layer's KV cache."
             )
 
     def _collect_dynamic_kv_runtimes(self) -> list[Any]:
         """Every rbln runtime that holds a slice of the KV cache.
 
-        `runtime_holder` is shared with the spec-decode drafter (see
-        `RBLNEagleProposer`), so the runner's holder is the whole set. A runtime
-        missed here never gets its adaptive-size latch cleared, and its first
-        forward after the resize dies inside the rbln runtime.
+        The runner's holder is the whole set: spec decode, the only other
+        producer of KV-holding runtimes, is refused under this flag.
         """
         runtimes: list[Any] = []
         seen: set[int] = set()
@@ -819,9 +736,7 @@ class RBLNWorker(WorkerBase):
     def _assert_dynamo_runtimes(self, runtimes: list[Any]) -> None:
         """Guard: adaptive buffer sizes are a `DynamoRuntime`-only feature.
 
-        The other runtime classes ignore the resize without a word, so the server
-        would run on the compile-time cache while the scheduler hands out the new
-        block count.
+        The other classes ignore the resize silently.
         """
         offenders = [
             type(runtime).__name__
@@ -830,19 +745,14 @@ class RBLNWorker(WorkerBase):
         ]
         if offenders:
             raise RuntimeError(
-                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE requires every KV-holding "
-                "runtime to be a rebel DynamoRuntime (the torch.compile path, "
-                "VLLM_RBLN_USE_VLLM_MODEL=1). Found: "
-                f"{sorted(set(offenders))}. Other runtime classes silently "
-                "ignore adaptive buffer sizes."
+                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE needs every KV-holding runtime to "
+                f"be a rebel DynamoRuntime; found {sorted(set(offenders))}."
             )
 
     def _dynamic_kv_device_topology(self, runtimes: list[Any]) -> tuple[int, int]:
         """`(num_nodes, num_chiplets)` from a runtime's allocation report.
 
-        Taken from `get_alloc_per_chiplet(1)`'s shape rather than the memory
-        profile: deriving the budget keys from the profile would make the
-        coverage assert circular.
+        Not from the memory profile: that would make the coverage check circular.
         """
         for runtime in runtimes:
             alloc = runtime.get_alloc_per_chiplet(1)
@@ -860,10 +770,7 @@ class RBLNWorker(WorkerBase):
             if num_chiplets <= 0:
                 continue
             return num_nodes, num_chiplets
-        raise RuntimeError(
-            "no rbln runtime reported a per-chiplet allocation shape; cannot "
-            "determine the (node, chiplet) grid the KV budget must cover."
-        )
+        raise RuntimeError("no rbln runtime reported a per-chiplet allocation shape.")
 
     def _charge_retained_compile_kv_cache(
         self,
@@ -872,39 +779,20 @@ class RBLNWorker(WorkerBase):
     ) -> dict[int, dict[int, int]]:
         """Charge the compile-time KV cache that TP>=2 does not give back.
 
-        `_dynamic_kv_chiplet_budget` is derived from *capacity*, and
-        `max_num_blocks` subtracts only the profile's `base_bytes`. The
-        `COMPILE_KV_CACHE_NUM_BLOCKS` cache is per-block growth rather
-        than base, so it is in neither: the budget assumes
-        `_release_kv_cache_tensors` handed it back before the replacement is
-        allocated. On TP=1 it does. On TP>=2 it does not, and that method cannot
-        confirm the free from inside the process, so the resident bytes are
-        charged here instead of being spent twice.
+        The compile cache is per-block growth, so neither the capacity-derived
+        budget nor `max_num_blocks`' own `base_bytes` subtraction accounts for
+        it; on TP>=2 it is not returned and the process cannot see that it was
+        not. Charging TP=1 would cost blocks it does get back.
 
-        Measured on MiniMax TP4+EP at N=8: the binding chiplet landed at 1.015x
-        of its budget, and 8 blocks x 62 MiB = 0.484 GiB accounts for
-        essentially all of the 0.4738 GiB overshoot. The same run reports the
-        outgoing cache as still resident on all four cards, while PP4 (TP=1)
-        reports it returned on all four -- hence the TP condition rather than an
-        unconditional charge, which would cost TP=1 blocks it does get back.
-
-        The charged size comes from the cache that is actually resident
-        (`model_runner.kv_cache_config`), not a second reading of the env var: a
-        charge that does not match what is resident is a silent budget overrun.
-
-        Known gap: the condition is `tensor_parallel_size > 1`, but DP4+EP runs
-        with tp=1 and keeps the cache (1.0138x per chiplet). Both shapes that do
-        return it (PP4, Qwen TP1) are also TP=1, so the data cannot say which of
-        TP/DP/EP decides it; the predicate stays as measured.
+        Measurements and the uncharged DP+EP gap: docs/dynamic_kv_cache.md.
         """
         resident_blocks = self.model_runner.kv_cache_config.num_blocks
         tp_size = self.parallel_config.tensor_parallel_size
         if resident_blocks <= 0 or tp_size <= 1:
             return budget
 
-        # Difference of two aligned usages rather than num_blocks *
-        # bytes_per_block: alignment is applied per region, so this is the same
-        # accounting `max_num_blocks` will do with what is left.
+        # Difference of two aligned usages, not num_blocks * bytes_per_block:
+        # alignment is per region, so this matches what `max_num_blocks` does.
         at_compile = per_chiplet_usage(merged, resident_blocks)
         at_zero = per_chiplet_usage(merged, 0)
 
@@ -919,20 +807,14 @@ class RBLNWorker(WorkerBase):
             charged[node_id][chiplet_id] -= retained
             retained_by_unit[unit] = retained
 
-        # The hint is a constant, so there is nothing for the operator to lower.
-        advice = (
-            "this is the smallest measured hint, so the block count is the "
-            "price of running this parallelism rather than something to tune"
-        )
-        logger.warning(
-            "[Dynamic KV] tensor_parallel_size=%d does not return the "
-            "%d-block compile-time KV cache, so its bytes are charged against "
-            "the budget: %s. Expect a lower block count than TP=1 on the same "
-            "profile; %s.",
+        # INFO: the charge working as designed. The hint is a constant, so the
+        # lower block count is the price of the parallelism, not a knob.
+        logger.info(
+            "[Dynamic KV] tp=%d keeps the %d-block compile cache; charged per "
+            "chiplet: %s. Expect fewer blocks than TP=1.",
             tp_size,
             resident_blocks,
             {f"{n}:{c}": v for (n, c), v in sorted(retained_by_unit.items())},
-            advice,
         )
 
         exhausted = {
@@ -942,18 +824,10 @@ class RBLNWorker(WorkerBase):
             if remaining <= 0
         }
         if exhausted:
-            remedy = (
-                f"the {resident_blocks}-block hint is already the smallest "
-                "measured one, so raise the budget instead: "
-                "--gpu-memory-utilization, a smaller --block-size (the retained "
-                "bytes scale with the page size), or another process holding "
-                "memory on the same cards"
-            )
+            # The hint is a constant, so the budget is the only side to move.
             raise RuntimeError(
                 "the retained compile-time KV cache leaves no budget on "
-                f"{exhausted}. The {resident_blocks}-block cache compiled for "
-                f"tensor_parallel_size={tp_size} is too large for it to be "
-                f"charged, and this parallelism does not free it; {remedy}."
+                f"{exhausted}; raise --gpu-memory-utilization or lower --block-size."
             )
         return charged
 
@@ -961,27 +835,24 @@ class RBLNWorker(WorkerBase):
         """Per-chiplet byte budget for `max_num_blocks`.
 
         `floor(dram_total / num_chiplets * gmu)` minus the unprofiled reserve
-        minus other tenants' usage. Deliberately *capacity*-derived rather than a
-        measured free figure: `max_num_blocks` subtracts the profile's
-        `base_bytes` itself, and those are already resident by now, so a measured
-        free value would charge the base twice.
+        minus other tenants' usage.
         """
+        # NOTE(RBLN): capacity-derived on purpose. `max_num_blocks` subtracts the
+        # profile's own `base_bytes`, which is already resident, so feeding it a
+        # measured *free* figure charges the base twice.
         dram_total = read_rbln_card_dram_total_bytes()
         if dram_total is None:
             raise RuntimeError(
-                "cannot read per-card DRAM capacity from sysfs "
-                "(/sys/class/rebellions/rbln*/dram_total); "
-                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE needs it to budget per chiplet."
+                "cannot read /sys/class/rebellions/rbln*/dram_total, which "
+                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE needs to budget per chiplet."
             )
         capacity_per_chiplet = dram_total // num_chiplets
         gmu = self.cache_config.gpu_memory_utilization
         gmu_budget = int(capacity_per_chiplet * gmu)
         raw_budget = gmu_budget - DYNAMIC_KV_UNPROFILED_RESERVE_BYTES
-        # Card-scope figure against a per-chiplet budget, so it must be scaled.
-        # Charging the whole card total to every chiplet drove the budget negative
-        # and aborted start-up on a configuration that serves fine once scaled.
-        # An even spread is an assumption, but the same one `capacity_per_chiplet`
-        # above already makes.
+        # Card-scope figure, so scale it: charging the whole card to every chiplet
+        # drove the budget negative. An even spread is the same assumption
+        # `capacity_per_chiplet` already makes.
         foreign_per_chiplet = self._foreign_dram_used_bytes // num_chiplets
         budget = raw_budget - foreign_per_chiplet
         logger.info(
@@ -1002,25 +873,17 @@ class RBLNWorker(WorkerBase):
         )
         if budget <= 0:
             raise RuntimeError(
-                f"per-chiplet KV budget is non-positive ({budget} bytes) after "
-                f"subtracting {DYNAMIC_KV_UNPROFILED_RESERVE_BYTES} bytes of "
-                "unprofiled reserve and "
-                f"{foreign_per_chiplet} bytes of foreign device usage "
-                f"({self._foreign_dram_used_bytes} bytes across "
-                f"{num_chiplets} chiplets)."
+                f"per-chiplet KV budget is non-positive ({budget} bytes) after the "
+                f"reserve and {foreign_per_chiplet} bytes of foreign usage."
             )
         return budget
 
     def compute_dynamic_kv_num_blocks(self) -> int | None:
         """Ask the compiled artifacts how many KV blocks fit this device.
 
-        Runs after warm-up and reallocates nothing: the engine collects one
-        answer per rank, takes the minimum, and hands it back through
-        `apply_dynamic_kv_num_blocks`.
-
-        Returns:
-            The block count that fits, or None when the path is not in play or
-            the answer cannot be trusted.
+        Runs after warm-up and reallocates nothing; the engine takes the minimum
+        across ranks and hands it back through `apply_dynamic_kv_num_blocks`.
+        None means the path is not in play.
         """
         if not envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
             return None
@@ -1032,15 +895,10 @@ class RBLNWorker(WorkerBase):
             )
             return None
         if self._kv_blocks_before_shrink is None:
-            # Not re-reading the env var: the shrink can be cancelled for
-            # reasons unrelated to its value, and printing the requested number
-            # next to "not shrunk" read as a contradiction. The branch that
-            # cancelled it already logged why.
+            # The branch that cancelled the shrink already logged why.
             logger.warning(
-                "[Dynamic KV] the KV cache was not shrunk for the compile, so "
-                "the compiled profile is not queried and the block count stays "
-                "at the %d blocks vllm estimated; see the earlier "
-                "[Dynamic KV] warning for which condition applied.",
+                "[Dynamic KV] the cache was not shrunk, so no profile is queried "
+                "and the count stays at the %d blocks vllm estimated.",
                 self.model_runner.kv_cache_config.num_blocks,
             )
             return None
@@ -1049,9 +907,7 @@ class RBLNWorker(WorkerBase):
         if not runtimes:
             raise RuntimeError(
                 "[Dynamic KV] no rbln runtime was registered during warm-up, so "
-                "the compiled memory profile cannot be queried. The KV cache was "
-                "already shrunk for the compile, and restoring it from here trips "
-                "an assertion that names none of this."
+                "the compiled memory profile cannot be queried."
             )
         self._assert_dynamo_runtimes(runtimes)
 
@@ -1078,18 +934,15 @@ class RBLNWorker(WorkerBase):
                     reason = "unexpected RuntimeError"
                 logger.warning(
                     "[Dynamic KV] kv_cache_memory_profile() unavailable for one "
-                    "runtime (%s): %s. Continuing with the remaining runtimes; "
-                    "the holder legitimately contains graphs without KV inputs.",
+                    "runtime (%s): %s. Continuing with the rest.",
                     reason,
                     message,
                 )
                 continue
             profiles.append(profile)
             profiled_ids.add(id(runtime))
-            # The only record of base_bytes / bytes_per_block / alignment:
-            # neither sysfs nor the runtime's allocation log exposes the
-            # per-block cost. Identity fields go after the region list so a
-            # reader that splits at `device_regions=[` can still attribute them.
+            # The only record of base_bytes / bytes_per_block / alignment; see
+            # kv_profile.SOURCE_PROFILE_LOG_KEY.
             logger.info(
                 "[Dynamic KV] compiled profile: %s rank=%d profile_index=%d "
                 "runtime=%s#%d num_regions=%d",
@@ -1104,26 +957,17 @@ class RBLNWorker(WorkerBase):
         if not profiles:
             raise RuntimeError(
                 f"[Dynamic KV] not one of the {len(runtimes)} rbln runtimes "
-                "returned a KV memory profile, so the block count cannot come from "
-                "the device. The usual cause is an artifact compiled without a "
-                "mark_dynamic'd KV cache -- check that "
-                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE was set before the compile and "
-                "that VLLM_CACHE_ROOT did not replay a static build. Serving on "
-                "would keep the pre-compile estimate this feature exists to "
-                "replace, and on tensor_parallel_size>=2 it would do so with the "
-                "compile-time cache still resident and charged to nobody."
+                "returned a KV memory profile; was VLLM_CACHE_ROOT replaying a "
+                "static build?"
             )
 
         merged = merge_kv_cache_memory_profiles(profiles)
-        # `merged_regions=`, not `device_regions=`: a reader scanning for the
-        # latter would otherwise pick the merge up as one more source profile.
         logger.info(
             "[Dynamic KV] merged profile: %s rank=%d num_source_profiles=%d "
-            "dedup=%s num_regions=%d shared_base=%d private_base=%d growth=%d",
+            "num_regions=%d shared_base=%d private_base=%d growth=%d",
             format_profile_for_log(merged, MERGED_PROFILE_LOG_KEY),
             self.rank,
             merged.num_source_profiles,
-            merged.dedup_strategy,
             len(merged.device_regions),
             merged.num_shared_base_regions,
             merged.num_private_base_regions,
@@ -1135,20 +979,16 @@ class RBLNWorker(WorkerBase):
         assert_budget_covers_profile(merged, budget)
         budget = self._charge_retained_compile_kv_cache(budget, merged)
 
-        # `rebel/__init__.py` does not import `rebel.kv_cache`, so this exact
-        # import form is the only reliable one. Lazy: only needed once a compiled
-        # artifact exists.
+        # NOTE(RBLN): `rebel/__init__.py` does not import `rebel.kv_cache`, so
+        # this exact import form is the only reliable one.
         from rebel.kv_cache import max_num_blocks
 
         try:
             num_blocks = max_num_blocks(merged, budget, per_node_budget=False)
         except ValueError as exc:
             raise RuntimeError(
-                "[Dynamic KV] the merged profile has no per-block memory growth, "
-                "i.e. the artifacts were NOT compiled with a dynamic KV dim. Check "
-                "that mark_dynamic ran (VLLM_RBLN_USE_DYNAMIC_KV_CACHE must be set "
-                "before the compile) and that the compile cache was not reused "
-                "from a static build."
+                "[Dynamic KV] the merged profile has no per-block growth, i.e. the "
+                "artifacts were not compiled with a dynamic KV dim."
             ) from exc
 
         base_usage = per_chiplet_usage(merged, 0)
@@ -1158,11 +998,9 @@ class RBLNWorker(WorkerBase):
         )
         if num_blocks <= 0:
             raise RuntimeError(
-                "[Dynamic KV] max_num_blocks() returned 0: not even num_blocks=0 "
-                f"fits the per-chiplet budget of {budget_per_chiplet} bytes. "
-                f"Predicted base usage {dict(sorted(base_usage.items()))}. Raise "
-                "the budget (--gpu-memory-utilization, more devices) or shrink the "
-                "model's non-KV footprint."
+                "[Dynamic KV] max_num_blocks() returned 0: the per-chiplet budget "
+                f"of {budget_per_chiplet} bytes does not fit the base usage "
+                f"{dict(sorted(base_usage.items()))}."
             )
 
         fit_usage = per_chiplet_usage(merged, num_blocks)
@@ -1189,14 +1027,8 @@ class RBLNWorker(WorkerBase):
     def apply_dynamic_kv_num_blocks(self, n: int | None) -> int | None:
         """Resize the KV cache to the block count the engine settled on.
 
-        Args:
-            n: The cross-rank block count, or None to put back what vLLM sized
-                the cache with before the shrink -- otherwise the server runs on
-                the tiny compile cache while the scheduler believes the full
-                number.
-
-        Returns:
-            The block count now in effect, or None when nothing was done.
+        `n` is None when no usable count was computed; the pre-shrink number is
+        put back then, or the server would serve from the tiny compile cache.
         """
         if not envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
             return None
@@ -1230,36 +1062,25 @@ class RBLNWorker(WorkerBase):
     def _release_kv_cache_tensors(self, old_cfg: KVCacheConfig) -> None:
         """Drop every reference to the outgoing KV cache and free its device DRAM.
 
-        Called *before* the replacement is allocated. `initialize_kv_cache_tensors`
-        rebinds the runner list and the forward context, so otherwise the old
-        tensors outlive the free and the allocator keeps their blocks reserved --
-        measured at 4.5 GiB per card, the dominant term in that run's
-        `gpu_memory_utilization` overshoot. Releasing first also caps the peak at
-        `base + max(old, new)` rather than `base + old + new`.
+        Called *before* the replacement is allocated; the measured cost of not
+        doing so is in docs/dynamic_kv_cache.md.
         """
         mr = self.model_runner
 
-        # Whether the outgoing cache was device-resident decides whether the
-        # accounting below means anything: with VLLM_RBLN_USE_DEVICE_TENSOR off
-        # the KV tensors live on `meta` and the device buffers belong to the rbln
-        # runtime. Read from the tensors, not from the env, and before they go.
+        # Read residency from the tensors, not from the env, and before they go.
         kv_device_types = {kv_cache.device.type for kv_cache in mr.kv_caches}
         was_device_resident = bool(kv_device_types - {"meta", "cpu"})
 
-        # (1) The runner's own bindings. Clearing kv_caches is required either
-        # way -- upstream `bind_kv_cache` asserts the list starts empty -- and
-        # kv_cache_names must stay in step with it because
-        # `initialize_kv_cache_tensors` asserts equal length.
+        # NOTE(RBLN): upstream `bind_kv_cache` asserts kv_caches starts empty,
+        # and `initialize_kv_cache_tensors` asserts kv_cache_names has equal
+        # length, so the two must be cleared together.
         mr.kv_caches = []
         mr.kv_cache_bases = []
         mr.kv_cache_names = []
 
-        # (2) `bind_kv_cache` also parks each layer's view on the Attention
-        # module in the static forward context. The next bind overwrites those
-        # attributes, but only *after* the new tensors exist -- the window this
-        # method closes. Nothing on RBLN reads the attribute, but the reference
-        # is real. Read the context off the model runner, i.e. the same
-        # expression that wrote it, so a rename breaks both at once.
+        # NOTE(RBLN): `bind_kv_cache` also parks each layer's view on the
+        # Attention module; the next bind overwrites it only *after* the new
+        # tensors exist, which is the window this closes.
         forward_context = mr.compilation_config.static_forward_context
         unbound = 0
         # `KVCacheTensor.shared_by` is the same list `_allocate_kv_cache_tensors`
@@ -1279,16 +1100,14 @@ class RBLNWorker(WorkerBase):
             layer.kv_cache = None
             unbound += 1
 
-        # (3) Every per-layer tensor is a view and a view keeps its base alive,
-        # so the storage only dies with the last one. A reference cycle would
-        # defer the free past the replacement's allocation, losing the point.
+        # NOTE(RBLN): every per-layer tensor is a view and keeps its base alive,
+        # so a reference cycle would defer the free past the new allocation.
         gc.collect()
 
         released = empty_rbln_device_caches()
         logical_bytes = sum(t.size for t in old_cfg.kv_cache_tensors)
-        # Whether those bytes came back is not observable in-process -- the
-        # allocator's reserved-bytes counter does not track them. Confirm from
-        # the card's sysfs `dram_used` across the resize instead.
+        # Not observable in-process; confirm from sysfs `dram_used` across the
+        # resize instead.
         logger.info(
             "[Dynamic KV] released the outgoing %d-block KV cache: "
             "outgoing_kv_logical_bytes=%d unbound_layers=%d kv_device_types=%s "
@@ -1304,25 +1123,21 @@ class RBLNWorker(WorkerBase):
     def _reallocate_kv_cache(self, new_num_blocks: int) -> None:
         """Rebuild only the KV cache *tensors* at `new_num_blocks`.
 
-        `initialize_kv_cache()` is deliberately not re-run: the attention
-        backends, metadata builders and input batch depend on block_size /
-        max_model_len rather than num_blocks, are already initialized, and
-        `initialize_attn_backend` asserts `len(self.attn_groups) == 0`.
-
         No recompilation happens because the affected dim is `mark_dynamic`'d;
-        the physical allocation happens on the next forward. The outgoing cache
-        is released first -- nothing else in the process ever frees it.
+        the physical allocation happens on the next forward.
         """
+        # NOTE(RBLN): `initialize_kv_cache()` must not be re-run --
+        # `initialize_attn_backend` asserts `len(self.attn_groups) == 0`, and the
+        # backends and input batch depend on block_size, not num_blocks.
         mr = self.model_runner
         old_cfg = mr.kv_cache_config
         old_num_blocks = old_cfg.num_blocks
-        assert old_num_blocks > 0, "cannot rescale a KV cache of 0 blocks"
 
         new_cfg = _kv_cache_config_at(old_cfg, new_num_blocks)
         self.cache_config.num_gpu_blocks = new_num_blocks
         self.cache_config.num_cpu_blocks = new_num_blocks
 
-        logger.warning(
+        logger.info(
             "[Dynamic KV] reallocating KV cache: %d -> %d blocks",
             old_num_blocks,
             new_num_blocks,
@@ -1341,24 +1156,25 @@ class RBLNWorker(WorkerBase):
                 "mark_dynamic'd layer tensors are no longer graph inputs."
             )
 
-        # Warm-up latched every runtime's adaptive buffer sizes at the old
-        # num_blocks. Clear it so the next forward re-applies them at the new
-        # size. No getattr: a missing symbol must fail here, not on first request.
+        # NOTE(RBLN): warm-up latched the adaptive buffer sizes at the old
+        # num_blocks; without this clear, the next forward raises 'variable dim
+        # changed after adaptive buffers were fixed'. No getattr: a missing
+        # symbol must fail here, not on the first request.
         runtimes = self._collect_dynamic_kv_runtimes()
         reset_ids: set[int] = set()
         for runtime in runtimes:
             runtime.reset_adaptive_buffers()
             reset_ids.add(id(runtime))
         missing = self._dynamic_kv_profiled_runtime_ids - reset_ids
-        assert not missing, (
-            f"{len(missing)} runtime(s) contributed a KV memory profile but "
-            "were not reset after the reallocation; their first forward would "
-            "raise 'variable dim changed after adaptive buffers were fixed'."
-        )
-        assert reset_ids, (
-            "the KV cache was reallocated but no rbln runtime had its adaptive "
-            "buffer latch cleared."
-        )
+        if missing:
+            raise RuntimeError(
+                f"{len(missing)} runtime(s) contributed a KV memory profile but "
+                "were not reset after the reallocation."
+            )
+        if not reset_ids:
+            raise RuntimeError(
+                "the KV cache was reallocated but no runtime latch was cleared."
+            )
         logger.info(
             "[Dynamic KV] reset_adaptive_buffers() on %d runtime(s) "
             "(%d contributed a profile).",
@@ -1409,17 +1225,13 @@ class RBLNWorker(WorkerBase):
             if is_rbln_oom_error(e.inner_exception):
                 blocks = self.model_runner.kv_cache_config.num_blocks
                 if self._kv_blocks_before_shrink is not None:
+                    # The KV cache is not what exhausted the device at this size,
+                    # so --num-gpu-blocks-override is the wrong advice here.
                     raise RuntimeError(
                         f"Not enough memory to compile against the {blocks}-block "
-                        "compile-time KV cache; vllm sized the cache with "
-                        f"{self._kv_blocks_before_shrink} blocks, and it is the "
-                        "resize after warm-up that would have applied the real "
-                        "count. At this size the KV cache is not what exhausted "
-                        "the device, so lowering the block count will not help: "
-                        "reduce --max-num-batched-tokens (the runtime arena scales "
-                        "with it), --max-model-len or --max-num-seqs, raise "
-                        "--tensor-parallel-size to split the weights, or check "
-                        "whether another process holds memory on the same cards."
+                        "compile-time KV cache. Reduce --max-num-batched-tokens, "
+                        "--max-model-len or --max-num-seqs, or raise "
+                        "--tensor-parallel-size."
                     ) from e
                 raise RuntimeError(
                     f"Not enough memory for {blocks} blocks of KV cache. "

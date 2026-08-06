@@ -49,25 +49,21 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 RBLN_SYSFS_CLASS_DIR = "/sys/class/rebellions"
-# sysfs lists every card on the host; /dev lists only the ones this process was
-# given. That difference is why get_rbln_owned_card_indices exists.
+# NOTE(RBLN): sysfs lists every card on the host, /dev only the ones this process
+# was given -- see docs/dynamic_kv_cache.md, "Reading the right cards".
 RBLN_DEV_DIR = "/dev"
 
-# Usable DRAM on one REBEL card: 144 GiB of quad-chiplet DRAM minus the 4 GiB
-# system region. This is the ceiling `read_rbln_card_dram_total_bytes` clamps to
-# -- see its docstring for why the clamp lives in the reader.
+# 144 GiB of quad-chiplet DRAM minus the 4 GiB system region; the ceiling
+# `read_rbln_card_dram_total_bytes` clamps to.
 REBEL_DRAM_NBYTES = 144 * 2**30 - 4 * 2**30
 
 
 def get_rbln_visible_card_indices() -> list[int]:
     """Card indices this process may use, from `RBLN_DEVICES`.
 
-    Unset or empty means every card under /sys/class/rebellions.
-
-    Prefer `get_rbln_owned_card_indices`: this one takes each `RBLN_DEVICES`
-    entry as a sysfs card name, which is only right when the container happens
-    to hold card 0 upward. It remains as the fallback for hosts with no device
-    nodes at all.
+    Unset or empty means every card under /sys/class/rebellions. Prefer
+    `get_rbln_owned_card_indices`; this one reads each entry as a sysfs card
+    name and remains only as the fallback for hosts with no device nodes.
     """
     raw = os.environ.get("RBLN_DEVICES", "")
     if raw.strip():
@@ -86,8 +82,7 @@ def get_rbln_visible_card_indices() -> list[int]:
 def _rbln_present_card_indices() -> list[int]:
     """Physical card indices this process can open, from /dev/rbln*.
 
-    Device nodes keep their host numbering, so /dev is the only place that says
-    which cards are ours. [] means callers should fall back rather than guess.
+    Device nodes keep their host numbering. [] means callers should fall back.
     """
     try:
         names = os.listdir(RBLN_DEV_DIR)
@@ -103,11 +98,8 @@ def _rbln_present_card_indices() -> list[int]:
 def get_rbln_owned_card_indices() -> list[int]:
     """sysfs card indices this process owns, with `RBLN_DEVICES` resolved.
 
-    `RBLN_DEVICES` indexes the devices the *container* exposes, not the sysfs
-    card numbering; the two only coincide when the container holds card 0 upward.
-    So entry `i` selects the `i`-th present device, and reading the entry as a
-    sysfs name would charge a card belonging to somebody else. A physical name is
-    accepted too, so nothing is dropped on a container that does hold card 0.
+    Entry `i` selects the `i`-th present device; a physical name is accepted too.
+    See docs/dynamic_kv_cache.md, "Reading the right cards".
     """
     present = _rbln_present_card_indices()
     if not present:
@@ -141,15 +133,9 @@ def _read_card_attr_int(card_index: int, attr: str) -> int | None:
 def read_rbln_card_dram_total_bytes() -> int | None:
     """Per-card DRAM capacity in bytes, or None when sysfs is unavailable.
 
-    Reads only the cards this process owns (`get_rbln_owned_card_indices`). A
-    heterogeneous set is rejected rather than averaged: it would make a single
-    per-chiplet budget meaningless. On RBLN-CR the driver reports the same figure
-    the previous literal encoded, now sourced from the device.
-
-    Clamped to `REBEL_DRAM_NBYTES`, which already has the 4 GiB system region
-    subtracted; nothing documents that sysfs does the same. The clamp is here
-    rather than at the call sites because both of them size real allocations
-    from this number.
+    Reads only the cards this process owns; a heterogeneous set is rejected
+    rather than averaged. Clamped to `REBEL_DRAM_NBYTES` here rather than at the
+    call sites, because both of them size real allocations from this number.
     """
     values: dict[int, int] = {}
     for card_index in get_rbln_owned_card_indices():
@@ -168,10 +154,8 @@ def read_rbln_card_dram_total_bytes() -> int | None:
     if dram_total > REBEL_DRAM_NBYTES:
         logger.warning(
             "sysfs reports %d bytes of card DRAM, more than the %d this build "
-            "assumes usable; clamping. Either the driver is reporting raw "
-            "capacity without the system region, or this is a larger card than "
-            "REBEL_DRAM_NBYTES describes -- in the second case raise the "
-            "constant, because the clamp is leaving memory unused.",
+            "assumes usable; clamping. Raise REBEL_DRAM_NBYTES if the card is "
+            "genuinely larger.",
             dram_total,
             REBEL_DRAM_NBYTES,
         )
@@ -182,14 +166,10 @@ def read_rbln_card_dram_total_bytes() -> int | None:
 def read_rbln_card_dram_used_bytes() -> int:
     """Largest `dram_used` across the cards we own (0 when sysfs is absent).
 
-    Sampled before this process allocates anything, so it is what other tenants
-    hold. Cards we do not own are deliberately excluded: indexing sysfs by raw
-    `RBLN_DEVICES` charged a neighbour's workload to this worker, which cut a
-    measured run from 1024 KV blocks to 308 and, with a larger neighbour, drove
-    the per-chiplet budget negative.
-
-    Card-scope: sysfs exposes no per-chiplet breakdown, so the caller must scale
-    it to one chiplet before subtracting it from a per-chiplet budget.
+    Sampled before this process allocates, so it is what other tenants hold.
+    Card-scope: sysfs has no per-chiplet breakdown, so the caller must scale it
+    before subtracting it from a per-chiplet budget. Why cards we do not own are
+    excluded: docs/dynamic_kv_cache.md, "Reading the right cards".
     """
     used = [
         value
@@ -199,15 +179,26 @@ def read_rbln_card_dram_used_bytes() -> int:
     return max(used, default=0)
 
 
+def rescale_kv_cache_config(cfg: KVCacheConfig, num_blocks: int) -> None:
+    """Retarget `cfg` at `num_blocks`, in place.
+
+    `KVCacheTensor.size` is `num_blocks * page_size_bytes` and consumers read it
+    rather than recomputing, so it has to move with `num_blocks`.
+    """
+    old_num_blocks = cfg.num_blocks
+    if old_num_blocks <= 0:
+        raise ValueError(f"cannot rescale a KV cache config of {old_num_blocks} blocks")
+    cfg.num_blocks = num_blocks
+    for kv_tensor in cfg.kv_cache_tensors:
+        kv_tensor.size = (kv_tensor.size * num_blocks) // old_num_blocks
+
+
 def chiplet_replication_factor(num_key_value_heads: int, rsd_size: int) -> float:
     """How many times the KV cache is physically replicated across chiplets.
 
-    Each chiplet rounds up to `ceil(kvh / rsd_size)` KV heads, so the `rsd_size`
-    chiplets store `rsd_size * ceil(kvh / rsd_size)` heads where the logical
-    cache has `kvh` -- the ratio. It is > 1 exactly when `kvh` is not a multiple
-    of `rsd_size`.
-
-    Examples (rsd_size = 4): kvh=2 -> 2.0, kvh=4 -> 1.0, kvh=10 -> 1.2.
+    Each chiplet rounds up to `ceil(kvh / rsd_size)` KV heads, so the ratio is
+    > 1 exactly when `kvh` is not a multiple of `rsd_size`. Examples at
+    rsd_size=4: kvh=2 -> 2.0, kvh=4 -> 1.0, kvh=10 -> 1.2.
     """
     if num_key_value_heads <= 0 or rsd_size <= 0:
         return 1.0
@@ -353,17 +344,14 @@ def estimate_available_memory(
         REBEL_CHIPLET_SIZE = 4
         # single device == Quad chiplet
         rsd_size = REBEL_CHIPLET_SIZE
-        # Prefer the driver's figure over the module constant. The reader clamps
-        # to REBEL_DRAM_NBYTES, so it can only ever report *less* and this path
-        # -- which is not behind the dynamic-KV flag -- cannot grow. sysfs is
-        # absent on NPU-less hosts (CI / cross-compile), hence the fallback.
+        # Prefer the driver's figure. The reader clamps to REBEL_DRAM_NBYTES, so
+        # it can only report *less* and this path -- not behind the flag -- cannot
+        # grow. sysfs is absent on NPU-less hosts (CI), hence the fallback.
         try:
             sysfs_dram_total = read_rbln_card_dram_total_bytes()
         except RuntimeError as exc:
-            # The reader refuses on heterogeneous cards because a *per-chiplet*
-            # budget would be meaningless, but this estimate only wants one
-            # card's capacity. Raising here would be a new failure mode on the
-            # default path, so fall back to the literal and say so.
+            # The reader refuses on heterogeneous cards, but this estimate only
+            # wants one card's capacity -- do not add a default-path failure.
             logger.warning(
                 "%s; falling back to the built-in %d byte DRAM capacity for the "
                 "static KV cache estimate.",
@@ -436,11 +424,9 @@ def estimate_available_memory(
         buffer = buffer_per_runtime_per_core * num_runtimes
     available_dram_bytes -= buffer
 
-    # `max(1, rsd_size // kvh)` matches the exact replication factor only when
-    # kvh divides or is a multiple of rsd_size, and is optimistic otherwise
-    # (kvh in {3, 5, 6, 7, 9, 10, ...} at rsd_size 4). The exact factor is always
-    # >= it, so switching under the flag can only shrink this estimate, never
-    # grow it into an OOM.
+    # NOTE(RBLN): `max(1, rsd_size // kvh)` is optimistic unless kvh divides or
+    # is a multiple of rsd_size. The exact factor is always >= it, so switching
+    # under the flag can only shrink this estimate, never grow it into an OOM.
     rsd_replicas = max(1, rsd_size // num_key_value_heads)
     released_dram_bytes = available_dram_bytes // rsd_replicas
     exact_dram_bytes = divide_by_chiplet_replication(
@@ -456,29 +442,25 @@ def estimate_available_memory(
             released_dram_bytes / 2**30,
             exact_dram_bytes / 2**30,
         )
+        # One format string, three tails: `logger.*(a + b)` trips ruff G003.
+        disagreement = (
+            "KV cache replication: num_key_value_heads=%d over %d chiplets is "
+            "replicated %.4gx (%d heads per chiplet), but the released estimate "
+            "divides by %d: %.3f GiB released vs %.3f GiB exact.%s"
+        )
         if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
-            logger.info(
-                "KV cache replication: num_key_value_heads=%d over %d chiplets "
-                "is physically replicated %.4gx (each chiplet rounds up to %d "
-                "heads), but the released estimate divides the DRAM budget by "
-                "%d: %.3f GiB released vs %.3f GiB exact. Using the exact "
-                "figure (VLLM_RBLN_USE_DYNAMIC_KV_CACHE=1); the compiled "
-                "artifact re-derives the block count per chiplet anyway.",
+            logger.info(disagreement, *args, " Using the exact figure.")
+        elif envs.VLLM_RBLN_USE_VLLM_MODEL:
+            # Only suggest the flag where it can be turned on -- the platform
+            # refuses it on the optimum-rbln path.
+            logger.warning(
+                disagreement,
                 *args,
+                " Keeping the released figure; set VLLM_RBLN_USE_DYNAMIC_KV_CACHE=1 "
+                "to size from the compiled artifact instead.",
             )
         else:
-            logger.warning(
-                "KV cache replication: num_key_value_heads=%d over %d chiplets "
-                "is physically replicated %.4gx (each chiplet rounds up to %d "
-                "heads), but the released estimate divides the DRAM budget by "
-                "%d: %.3f GiB released vs %.3f GiB exact. Keeping the larger, "
-                "released figure: the exact factor has not been checked against "
-                "hardware for this head count. Set "
-                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE=1 to size the KV cache from the "
-                "compiled artifact, which applies the exact factor and validates "
-                "the result per chiplet.",
-                *args,
-            )
+            logger.warning(disagreement, *args, " Keeping the released figure.")
     available_dram_bytes = (
         exact_dram_bytes if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE else released_dram_bytes
     )

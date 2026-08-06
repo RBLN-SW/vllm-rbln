@@ -258,17 +258,13 @@ class RblnPlatform(Platform):
             )
             scheduler_config.async_scheduling = False
 
-        # Checked here, not in `validate_and_setup_prerequisite`: that runs only
-        # inside the vLLM-native branch below, and the optimum-rbln path is
-        # exactly where an unsupported flag would otherwise be silent.
+        # NOTE(RBLN): checked here, not in `validate_and_setup_prerequisite` --
+        # that runs only inside the vLLM-native branch below, and the optimum
+        # path is exactly where an unsupported flag would go unnoticed.
         if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE and not envs.VLLM_RBLN_USE_VLLM_MODEL:
             raise ValueError(
                 "VLLM_RBLN_USE_DYNAMIC_KV_CACHE=1 requires "
-                "VLLM_RBLN_USE_VLLM_MODEL=1. The resize needs DynamoRuntime's "
-                "adaptive buffer sizes and the EngineCore patch that re-announces "
-                "the block count to the scheduler; the optimum-rbln path has "
-                "neither, so the flag would size nothing and the server would run "
-                "on the pre-compile estimate this feature exists to replace."
+                "VLLM_RBLN_USE_VLLM_MODEL=1; see docs/dynamic_kv_cache.md."
             )
 
         if envs.VLLM_RBLN_USE_VLLM_MODEL:
