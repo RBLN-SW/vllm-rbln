@@ -135,7 +135,21 @@ class RBLNWorker(WorkerBase):
             end_idx = start_idx + num_devices
             selected_devices = ",".join(device_ids[start_idx:end_idx])
         else:
-            device_ids = os.environ[env_var].split(",")
+            # Through 0.23 vLLM narrowed the device-control env var itself before
+            # spawning a DP engine -- `set_device_control_env_var()` patched
+            # os.environ for platforms that need env isolation, which includes
+            # RBLN -- so by the time we read it, it already held this rank's
+            # share. 0.24 replaced that with
+            # `set_assigned_physical_gpu_ids_for_dp_rank()`, which leaves the env
+            # var alone and puts the per-rank mapping on the config instead
+            # (vllm/v1/engine/utils.py). Read the mapping when it is there;
+            # `world_size` is TPxPP in both releases, so it is the env var that
+            # changed meaning, not the size.
+            assigned = getattr(self.parallel_config, "assigned_physical_gpu_ids", None)
+            if assigned:
+                device_ids = [str(i) for i in assigned]
+            else:
+                device_ids = os.environ[env_var].split(",")
             assert len(device_ids) == world_size, (
                 f"device_ids: {device_ids} should have device count: {world_size}"
             )
