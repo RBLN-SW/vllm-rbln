@@ -1610,7 +1610,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         elif spec_config.method == "suffix":
             assert isinstance(sampled_token_ids, list)
             assert isinstance(self.drafter, SuffixDecodingProposer)
-            draft_token_ids = self.drafter.propose(self.input_batch, sampled_token_ids)
+            draft_token_ids = self.drafter.propose(
+                self.num_spec_tokens, self.input_batch, sampled_token_ids
+            )
         elif spec_config.method == "medusa":
             assert isinstance(sampled_token_ids, list)
             assert isinstance(self.drafter, RBLNMedusaProposer)
