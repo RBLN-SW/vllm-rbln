@@ -1533,6 +1533,15 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             else:
                 propose_drafts_after_bookkeeping = input_fits_in_drafter
 
+            if not input_fits_in_drafter:
+                # Zero out draft tokens so the scheduler does not schedule
+                # stale drafts from the previous step. Matches upstream's
+                # `gpu_model_runner`, which is why `take_draft_token_ids`
+                # needs no `None` case.
+                self._draft_token_ids = torch.zeros(
+                    1, device=self.device, dtype=torch.int32
+                ).expand(len(self.input_batch.req_ids), self.num_spec_tokens)
+
         with record_function_or_nullcontext("rbln_model_runner: bookkeep"):
             (
                 num_nans_in_logits,
@@ -1579,15 +1588,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         req_ids = self.input_batch.req_ids.copy()
         if not self.num_spec_tokens or not req_ids:
             return None
-        if self._draft_token_ids is None:
-            # No drafter ran this step -- `execute_model` skips it when
-            # `max_seq_len + num_spec > effective_drafter_max_model_len`.
-            # Wrapping the None gets past the core's `is not None` guard and
-            # kills the engine with "'NoneType' object is not iterable"; empty
-            # lists clear this step's drafts explicitly, whereas returning None
-            # would leave the previous step's drafts to be verified at the
-            # wrong position.
-            return DraftTokenIds(req_ids, [[] for _ in req_ids])
         draft_token_ids = (
             self._draft_token_ids.tolist()
             if isinstance(self._draft_token_ids, torch.Tensor)
