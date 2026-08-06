@@ -48,7 +48,7 @@ engine_core_original_initialize_kv_caches = EngineCore._initialize_kv_caches
 
 # vLLM release this patch was written against. A mismatch is not fatal -- the
 # structural asserts below are the real check -- but it is worth logging.
-_VERIFIED_VLLM_VERSION = "0.22.0"
+_VERIFIED_VLLM_VERSION = "0.24.0"
 
 
 def _dynamic_kv_enabled() -> bool:
