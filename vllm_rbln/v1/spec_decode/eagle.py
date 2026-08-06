@@ -815,18 +815,22 @@ class RBLNEagleProposer(EagleProposer):
         carry MoE layers keeps the collective, and so does a configuration with
         more than one decode bucket.
         """
-        from vllm_rbln.model_executor.layers.fused_moe.layer import RBLNFusedMoE
+        # vllm-rbln dropped its `RBLNFusedMoE` subclass in the 0.24 bump
+        # (c5228c5d), and upstream turned `FusedMoE` into a factory that composes
+        # a router, `RoutedExperts` and a runner -- so the module to look for is
+        # `RoutedExperts`, which is what holds the expert weights.
+        from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 
         moe_layers = [
             name
             for name, mod in self.model.named_modules()
-            if isinstance(mod, RBLNFusedMoE)
+            if isinstance(mod, RoutedExperts)
         ]
         self._draft_has_moe = bool(moe_layers)
         buckets = self.runner.bucketing_manager.decode_batch_buckets
         self._single_decode_bucket = len(buckets) == 1
         logger.info(
-            "EAGLE3 drafter DP rendezvous: requested=%s draft_moe_layers=%d "
+            "EAGLE3 drafter DP rendezvous: draft_moe_layers=%d "
             "decode_buckets=%s -> skip on decode=%s, on prefill=%s",
             len(moe_layers),
             buckets,
