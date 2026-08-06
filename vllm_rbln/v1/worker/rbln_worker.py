@@ -582,7 +582,11 @@ class RBLNWorker(WorkerBase):
 
     def execute_dummy_batch(self) -> None:
         bucket_size = self.model_runner.bucketing_manager.find_decode_batch_bucket(1)
-        query_len = 1 + self.model_runner.num_spec_tokens
+        spec = self.model_runner.speculative_config
+        if spec is not None and spec.use_eagle():
+            query_len = 1 + self.model_runner.num_spec_tokens
+        else:
+            query_len = 1
         self.model_runner._dummy_run(bucket_size, query_len, is_prefill=False)
 
     # def add_lora(self, lora_request: LoRARequest) -> bool:

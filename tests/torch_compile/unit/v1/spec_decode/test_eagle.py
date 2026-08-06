@@ -609,8 +609,8 @@ def test_load_model_wrapper_skips_compute_logits_when_mapped(monkeypatch):
     lm_head_arg, hidden_arg = model.logits_processor_calls[0]
     assert lm_head_arg is model.lm_head
     expected_sample = (hidden + 1000).view(-1, 4)
-    torch.testing.assert_close(hidden_arg, expected_sample)
-    torch.testing.assert_close(logits, expected_sample + 1)
+    assert_close(hidden_arg, expected_sample)
+    assert_close(logits, expected_sample + 1)
 
 
 # Verifies the unmapped path is untouched: no mapping means compute_logits
@@ -991,7 +991,7 @@ def test_to_target_token_ids_applies_offsets():
 
     out = stub._to_target_token_ids(torch.tensor([0, 1, 4, 2], dtype=torch.int64))
 
-    torch.testing.assert_close(out, torch.tensor([0, 3, 12, 5], dtype=torch.int64))
+    assert_close(out, torch.tensor([0, 3, 12, 5], dtype=torch.int64))
 
 
 # Verifies the new argmax+map is equivalent to upstream's scatter-into-full-vocab
@@ -1024,7 +1024,7 @@ def test_to_target_token_ids_matches_full_vocab_scatter_argmax():
     stub.draft_id_to_target_id = d2t
     actual = stub._to_target_token_ids(draft_logits.argmax(dim=-1))
 
-    torch.testing.assert_close(actual, expected)
+    assert_close(actual, expected)
 
 
 # Verifies the single-step early return maps its argmax into target space.
@@ -1059,7 +1059,7 @@ def test_propose_single_step_maps_draft_ids_to_target_ids():
     )
 
     # draft argmax [1, 2] -> target [1 + 2, 2 + 5] = [3, 7]
-    torch.testing.assert_close(output, torch.tensor([[3], [7]], dtype=torch.int64))
+    assert_close(output, torch.tensor([[3], [7]], dtype=torch.int64))
 
 
 # Verifies every draft token in the multi-step loop is mapped, and that the
@@ -1118,11 +1118,9 @@ def test_propose_multistep_maps_every_draft_id_and_feeds_mapped_input():
     )
 
     # step 1 draft argmax [1, 3] -> target [3, 8]; those must be fed back.
-    torch.testing.assert_close(calls[1][:2, 0], torch.tensor([3, 8], dtype=torch.int32))
+    assert_close(calls[1][:2, 0], torch.tensor([3, 8], dtype=torch.int32))
     # step 2 draft argmax [2, 4] -> target [5, 12]
-    torch.testing.assert_close(
-        output, torch.tensor([[3, 5], [8, 12]], dtype=torch.int64)
-    )
+    assert_close(output, torch.tensor([[3, 5], [8, 12]], dtype=torch.int64))
 
 
 # ---------------------------------------------------------------------------
