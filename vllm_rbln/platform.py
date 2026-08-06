@@ -299,6 +299,48 @@ class RblnPlatform(Platform):
                 "vllm_rbln.v1.core.rbln_scheduler.RBLNScheduler"
             )
 
+            # NOTE(RBLN): max_num_seqs is the max number of concurrently running
+            # sequences (the scheduler's running-queue cap), consistent with
+            # upstream and the non-PP case. Under PP the engine keeps
+            # pipeline_parallel_size microbatches in flight, so to keep total
+            # in-flight sequences <= max_num_seqs the *compiled* decode batch per
+            # PP stage is the derived max_num_seqs // pp_size (unlike GPU, which
+            # uses dynamic batch shapes and never divides). Validate here so an
+            # impossible config (e.g. max_num_seqs=1 with pp_size=2 -> 0) fails
+            # with a clear message instead of a cryptic assert deep in
+            # bucketing/scheduling.
+            pp_size = parallel_config.pipeline_parallel_size
+            if pp_size > 1:
+                max_num_seqs = scheduler_config.max_num_seqs
+                if max_num_seqs < pp_size:
+                    raise ValueError(
+                        f"pipeline_parallel_size={pp_size} requires "
+                        f"max_num_seqs >= {pp_size}: each PP stage is compiled "
+                        f"for max_num_seqs // pipeline_parallel_size decode "
+                        f"slots, but max_num_seqs={max_num_seqs} yields "
+                        f"{max_num_seqs // pp_size}."
+                    )
+                per_stage = max_num_seqs // pp_size
+                if max_num_seqs % pp_size != 0:
+                    logger.warning(
+                        "max_num_seqs=%d is not a multiple of "
+                        "pipeline_parallel_size=%d; the per-PP-stage decode "
+                        "batch floors to %d, so %d sequence slot(s) of the "
+                        "budget are unused. Set max_num_seqs to a multiple of "
+                        "pipeline_parallel_size to use the full budget.",
+                        max_num_seqs,
+                        pp_size,
+                        per_stage,
+                        max_num_seqs - per_stage * pp_size,
+                    )
+                logger.info(
+                    "PP=%d: max_num_seqs=%d (max concurrent sequences) -> "
+                    "per-PP-stage decode batch = %d (compiled).",
+                    pp_size,
+                    max_num_seqs,
+                    per_stage,
+                )
+
             # FIXME(jiwoo.park) This is a temporary workaround.
             if model_config.enforce_eager:
                 if not USE_DEVICE_TENSOR:

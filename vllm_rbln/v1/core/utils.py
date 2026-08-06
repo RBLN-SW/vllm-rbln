@@ -17,6 +17,14 @@
 A home for small, self-contained, independently-testable pieces of RBLN
 scheduling logic factored out of ``RBLNScheduler`` so that ``schedule()`` (a
 large copy of upstream's method with RBLN-specific tweaks) stays readable.
+Some are shared with the runner (``RBLNModelRunner``) -- e.g.
+``decode_batch_size`` and the spec-decode ``num_base_tokens`` /
+``resolve_propagated_token_write`` token bookkeeping.
+
+The speculative-decode + PP helpers -- ``should_defer_spec_step`` (running-loop
+anchor-reconciled deferral), ``num_base_tokens`` and
+``resolve_propagated_token_write`` (non-last-rank token propagation) -- live
+next to their docstrings below.
 
 The per-step decode-batch admission budget (``DecodeBatchBudget`` +
 ``DecodeCapPolicy`` + ``DecodeAdmissionController``): RBLN compiles a fixed
@@ -51,6 +59,109 @@ def decode_batch_size(max_num_seqs: int, pipeline_parallel_size: int) -> int:
     ``RBLNPlatform.check_and_update_config``); otherwise this floors to 0.
     """
     return max_num_seqs // pipeline_parallel_size
+
+
+def should_defer_spec_step(
+    num_spec_tokens: int,
+    spec_token_ids: list[int],
+    num_new_tokens: int,
+) -> bool:
+    """Whether ``schedule()``'s running loop must defer a speculative-decode
+    step under sync-scheduling PP because it has no reconciled BASE (anchor)
+    token to schedule yet.
+
+    Called with the RAW ``num_new_tokens`` (before the scheduler's caps). The
+    base count is ``num_new_tokens - len(spec_token_ids)``. The branch is on
+    whether the proposer currently holds drafts (``spec_token_ids``), which only
+    selects how the base is tested:
+
+    - Drafts held: ``num_new_tokens`` is draft-inflated, so gate on the base
+      itself. ``base <= 0`` means there is no fresh anchor token for the drafts
+      to verify against yet (the token-producing step has not reconciled);
+      scheduling anyway hands the non-last PP rank an empty token payload.
+    - No drafts held (just consumed, or no proposer match): ``base ==
+      num_new_tokens``, which goes negative only in the post-verify overshoot
+      (num_computed_tokens still optimistically advanced). The mundane ``== 0``
+      (no work this step) and the no-match case are left to the caller's plain
+      upstream defer.
+
+    Returns ``False`` when spec is disabled (``num_spec_tokens <= 0``), so
+    non-spec decode is untouched; also inert for pp=1, where synchronous
+    scheduling keeps the base reconciled.
+    """
+    if num_spec_tokens <= 0:
+        return False
+    if spec_token_ids:
+        return num_new_tokens - len(spec_token_ids) <= 0
+    return num_new_tokens < 0
+
+
+def num_base_tokens(
+    num_scheduled_tokens: dict[str, int],
+    scheduled_spec_decode_tokens: dict[str, list[int]],
+    req_id: str,
+) -> int:
+    """Number of non-draft (anchor / decode) tokens scheduled for ``req_id`` in
+    a step: the total scheduled tokens minus the speculative draft tokens.
+
+    This is the count that advances the request's committed sequence (the base
+    decode token plus any catch-up), as opposed to the unverified drafts. It is
+    the shared notion of "base" used by the scheduler's non-last-rank token
+    propagation and by the runner's token-write / output bookkeeping.
+    """
+    return num_scheduled_tokens.get(req_id, 0) - len(
+        scheduled_spec_decode_tokens.get(req_id, ())
+    )
+
+
+def resolve_propagated_token_write(
+    cursor: int,
+    num_computed_tokens: int,
+    base: int,
+    new_token_ids: list[int],
+) -> tuple[int, list[int]] | None:
+    """Plan the non-last PP rank's write of scheduler-propagated tokens.
+
+    Under sync-scheduling pipeline parallelism the scheduler ships
+    ``new_token_ids`` covering the request's committed-token tail (extended
+    backward by ``num_spec_tokens`` so it always spans a prior verify's
+    multi-accept lag). This rank brings its recorded-token cursor
+    (``num_tokens_no_spec``) up to
+    ``committed_tip = num_computed_tokens + base`` by writing the payload slice
+    that lands at ``[cursor, committed_tip)`` by ABSOLUTE position, idempotently
+    overwriting any mis-speculated slots.
+
+    Returns ``(committed_tip, tokens)`` where ``tokens`` is the length-``span``
+    slice to write at ``token_ids_cpu[cursor:committed_tip]``, or ``None`` if the
+    cursor has already reached ``committed_tip`` (nothing to write).
+
+    Sync-scheduling only: RBLN force-disables async scheduling (platform.py) and
+    the caller asserts a non-empty payload, so ``new_token_ids`` always covers
+    [cursor, committed_tip). Async support would NOT surface here as a per-request
+    empty payload -- it needs the prev_sampled_token_ids GPU-broadcast path plus
+    skipping this propagation block in _update_states entirely.
+    """
+    committed_tip = num_computed_tokens + base
+    if committed_tip <= cursor:
+        return None
+    span = committed_tip - cursor
+    # The payload covers all_token_ids[committed_tip - len : committed_tip], so
+    # the token for absolute position `cursor` sits at offset `lo`.
+    lo = cursor - (committed_tip - len(new_token_ids))
+    # Invariant (sync-scheduling PP): the scheduler extends new_token_ids
+    # backward by num_spec_tokens, so the payload always covers
+    # [cursor, committed_tip) -- a non-last rank never lags num_computed by more
+    # than one verify's worth. If a future scheduler change breaks that, fail
+    # here with a clear signal instead of deep inside _update_states with an
+    # opaque numpy broadcast error at token_ids_cpu[cursor:committed_tip] = tokens.
+    # (lo + span always equals len(new_token_ids), so there is no separate
+    # upper-bound to check.)
+    assert lo >= 0, (
+        f"propagated payload ({len(new_token_ids)}) shorter than the write span "
+        f"({span}): a non-last PP rank's cursor lags num_computed by more than "
+        "num_spec_tokens -- the token-propagation invariant is broken."
+    )
+    return committed_tip, new_token_ids[lo : lo + span]
 
 
 @runtime_checkable

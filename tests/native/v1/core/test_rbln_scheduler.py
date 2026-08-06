@@ -285,7 +285,15 @@ class TestScheduleNoMixedBatching:
 
 class TestScheduleDecodeBatchLimit:
     def test_decode_batch_capped_by_pipeline_parallel(self):
-        # RBLN difference: decode batch capped at max_num_seqs // pp_size.
+        # RBLN difference: the per-step decode batch is capped at
+        # max_num_seqs // pp_size. The shared decode budget also blanket-gates
+        # waiting-loop admissions, so once a step's decode batch is at
+        # the cap a further prefill is held for a later step. Advancing four
+        # requests one step at a time with max_num_seqs=4, pp=2 (cap 2): the
+        # 4th request's prefill is held while two decodes saturate the step, so
+        # running settles at 3, not 4. That simple gate is intended -- in the
+        # prefill/decode-disaggregated deployment this targets, a local prefill
+        # rarely meets this gate in practice.
         sched = create_rbln_scheduler(
             max_num_seqs=4,
             pipeline_parallel_size=2,
@@ -294,10 +302,40 @@ class TestScheduleDecodeBatchLimit:
         )
         for r in create_requests(4, num_tokens=10, req_ids=["A", "B", "C", "D"]):
             advance_to_decode(sched, r)
-        assert len(sched.running) == 4
+        assert len(sched.running) == 3
         out = sched.schedule()
         # cap = max_num_seqs // pp = 2.
         assert len(out.num_scheduled_tokens) == 2
+
+    def test_prefill_held_by_cap_is_not_starved(self):
+        # A prefill held behind a saturated per-step decode cap must still enter
+        # within a bounded number of steps -- the blanket decode-budget gate
+        # holds it for a step, not forever, because running decodes drain and
+        # free the slot. Regression guard: a permanently closed gate would
+        # silently starve the prefill (the drain would never converge).
+        sched = create_rbln_scheduler(
+            max_num_seqs=4,
+            pipeline_parallel_size=2,
+            block_size=16,
+            num_blocks=10000,
+        )
+        # Saturate the per-step decode cap (max_num_seqs // pp = 2).
+        for r in create_requests(2, num_tokens=10, req_ids=["A", "B"]):
+            advance_to_decode(sched, r)
+        # A fresh prefill arrives while the cap is saturated.
+        sched.add_request(create_requests(1, num_tokens=10, req_ids=["C"])[0])
+
+        scheduled = set()
+
+        def check(out):
+            # Never mixed and never over the cap.
+            assert len(out.num_scheduled_tokens) <= 2
+            scheduled.update(out.num_scheduled_tokens)
+
+        _drain(sched, per_step=check)
+        # The held prefill was admitted and every request drained to completion.
+        assert "C" in scheduled
+        assert not sched.requests
 
 
 class TestSchedulePrefillAllocation:
