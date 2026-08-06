@@ -58,6 +58,7 @@ from vllm.logger import init_logger
 from vllm.tracing import is_tracing_available
 
 from vllm_rbln.patches import register_patch
+from vllm_rbln.utils.tracing import take_pinned_span_id
 
 logger = init_logger(__name__)
 
@@ -74,15 +75,25 @@ _INVALID_ID = 0
 @register_patch(
     target="opentelemetry.sdk.trace.id_generator.RandomIdGenerator.generate_span_id",
     reason=(
-        "OTel's default generator draws span IDs from the global random module, "
+        "Two defects in one method. (1) OTel's default generator draws span IDs "
+        "from the global random module, "
         "which vLLM seeds identically in every worker via set_random_seed(). "
         "All workers then emit the same ID sequence, so span IDs collide across "
         "processes (measured: 257 spans, 73 distinct IDs, one ID shared by 9 "
-        "processes). Draw from SystemRandom so seeding cannot reach them."
+        "processes). Draw from SystemRandom so seeding cannot reach them. "
+        "(2) OTel offers no per-call span id override, which llm_request needs "
+        "so that spans emitted in other processes can name it as their parent; "
+        "a thread-local pin supplies one."
     ),
     condition=is_tracing_available,
 )
 def generate_span_id(self) -> int:
+    # A pinned id is how ``llm_request`` gets a span id other processes can
+    # predict, so that KV-transfer and cache spans can name it as their parent.
+    # See vllm_rbln.utils.tracing.derive_request_span_id.
+    pinned = take_pinned_span_id()
+    if pinned is not None:
+        return pinned
     span_id = _SYSTEM_RANDOM.getrandbits(64)
     while span_id == _INVALID_ID:
         span_id = _SYSTEM_RANDOM.getrandbits(64)

@@ -52,9 +52,10 @@ from collections.abc import Mapping
 from typing import Any
 
 from vllm.logger import init_logger
-from vllm.tracing import extract_trace_context, is_tracing_available
+from vllm.tracing import is_tracing_available
 
 from vllm_rbln.patches import register_patch
+from vllm_rbln.utils.tracing import request_span_context
 
 logger = init_logger(__name__)
 
@@ -134,7 +135,7 @@ def get_num_new_matched_tokens(self, request: Any, num_computed_tokens: int):
         return _ORIGINAL_LOOKUP(self, request, num_computed_tokens)
 
     with tracer.start_as_current_span(
-        "lmcache.lookup", context=extract_trace_context(trace_headers)
+        "lmcache.lookup", context=request_span_context(trace_headers)
     ) as span:
         matched = _ORIGINAL_LOOKUP(self, request, num_computed_tokens)
         if req_id:
@@ -259,7 +260,7 @@ def retrieve(self, *args: Any, **kwargs: Any):
     req_id = kwargs.get("req_id")
     with tracer.start_as_current_span(
         "lmcache.retrieve",
-        context=extract_trace_context(_WORKER_TRACE_HEADERS.get(req_id)),
+        context=request_span_context(_WORKER_TRACE_HEADERS.get(req_id)),
     ) as span:
         retrieved_mask = _ORIGINAL_RETRIEVE(self, *args, **kwargs)
         if req_id:
@@ -294,7 +295,7 @@ def store(self, *args: Any, **kwargs: Any):
     req_id = kwargs.get("req_id")
     with tracer.start_as_current_span(
         "lmcache.store",
-        context=extract_trace_context(_WORKER_TRACE_HEADERS.get(req_id)),
+        context=request_span_context(_WORKER_TRACE_HEADERS.get(req_id)),
     ) as span:
         if req_id:
             span.set_attribute("ca.request.id", req_id)
