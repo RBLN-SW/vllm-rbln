@@ -32,6 +32,7 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.utils import record_function_or_nullcontext
 
 import vllm_rbln.envs as envs
+from vllm_rbln.v1.core.utils import DecodeAdmissionController
 from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.core.rbln_kv_cache_manager import (
     KVCacheCopyOp,
@@ -116,6 +117,33 @@ class RBLNScheduler(Scheduler):
         # a full block table.
         self._pending_runner_block_deltas: dict[str, KVCacheBlocks] = {}
 
+        # NOTE(RBLN): Per-step decode-batch admission budget factory. Enforces
+        # the compiled decode-bucket ceiling (max_num_seqs // pp) and, under PP
+        # with VLLM_RBLN_PP_BALANCE_DECODE_BATCH, a dynamic ceil(demand/pp) soft
+        # cap that spreads decodes across microbatches. See v1/core/utils.py.
+        self._decode_admission = DecodeAdmissionController(
+            max_num_seqs=self.max_num_running_reqs,
+            pipeline_parallel_size=(
+                self.vllm_config.parallel_config.pipeline_parallel_size
+            ),
+            pp_balance_decode=envs.VLLM_RBLN_PP_BALANCE_DECODE_BATCH,
+        )
+
+    def _decode_demand(self) -> int:
+        """Total decode demand for this step's PP-balanced admission cap.
+
+        = running decodes + remote-KV requests ready to be admitted (transfer
+        complete, awaiting promotion). Including the ready remote-KV gives the
+        dynamic cap headroom to ramp the decode batch on the P/D-disaggregated
+        decode side; running-only would stall the ramp. Demand is invariant
+        under admission (promoting a ready remote-KV moves it from ready ->
+        running), so this snapshot is exact even as the running/ready split
+        shifts during the waiting loop. Evaluated only when PP balancing is on.
+        """
+        num_running_decodes = sum(1 for r in self.running if not is_prefill(r))
+        num_ready_remote_kv = len(self.finished_recving_kv_req_ids)
+        return num_running_decodes + num_ready_remote_kv
+
     def _add_pending_runner_block_delta(
         self,
         request_id: str,
@@ -184,6 +212,16 @@ class RBLNScheduler(Scheduler):
         scheduled_timestamp = time.monotonic()
 
         self.kv_cache_manager.new_step_starts()
+
+        # NOTE(RBLN): Per-step decode-batch admission budget shared by the
+        # running loop and the waiting-loop remote-KV promotion. can_admit()
+        # enforces the hard cap (max_num_seqs // pp == compiled bucket ceiling)
+        # plus, under PP with balancing on, a dynamic ceil(demand/pp) soft cap.
+        # In the non-PP / balance-off case this is exactly the old
+        # `len(scheduled_running_reqs) >= max_num_seqs // pp` gate.
+        decode_budget = self._decode_admission.make_budget(
+            demand_fn=self._decode_demand
+        )
 
         # First, schedule the RUNNING requests.
         # NOTE(RBLN): Prioritize prefill requests. Given our constraint that the prefill
@@ -315,6 +353,10 @@ class RBLNScheduler(Scheduler):
                         if preempted_req in scheduled_running_reqs:
                             preempted_req_id = preempted_req.request_id
                             scheduled_running_reqs.remove(preempted_req)
+                            # NOTE(RBLN): the victim was admitted just below its
+                            # append; un-admit it so the stale (over)count does
+                            # not make can_admit() stop admitting early.
+                            decode_budget.discard()
                             token_budget += num_scheduled_tokens.pop(preempted_req_id)
                             req_to_new_blocks.pop(preempted_req_id)
                             scheduled_spec_decode_tokens.pop(preempted_req_id, None)
@@ -345,6 +387,11 @@ class RBLNScheduler(Scheduler):
 
             # Schedule the request.
             scheduled_running_reqs.append(request)
+            # NOTE(RBLN): every scheduled running req joins this step's decode
+            # batch; admit() keeps the shared budget's count == batch size so
+            # the can_admit() gate at the loop's end (and the waiting loop)
+            # stops at the cap.
+            decode_budget.admit()
             request_id = request.request_id
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
@@ -386,11 +433,9 @@ class RBLNScheduler(Scheduler):
 
             # NOTE(RBLN): We restrict the decode batch size to
             # (max_num_seqs // pipeline_parallel_size) to prevent pipeline
-            # bubbles.
-            if len(scheduled_running_reqs) >= (
-                self.max_num_running_reqs
-                // self.vllm_config.parallel_config.pipeline_parallel_size
-            ):
+            # bubbles. Enforced via the shared decode budget (hard cap ==
+            # max_num_seqs // pp; optional PP-balanced soft cap on top).
+            if not decode_budget.can_admit():
                 break
 
         # Record the LoRAs in scheduled_running_reqs
@@ -798,6 +843,10 @@ class RBLNScheduler(Scheduler):
                     self._add_pending_runner_block_delta(req.request_id, evicted_delta)
 
                 scheduled_running_reqs.clear()
+                # NOTE(RBLN): the decode batch was just evicted to make room for
+                # a prefill (no mixed batching); zero the admission count so the
+                # budget tracks the now-empty batch.
+                decode_budget.reset()
                 token_budget = prefill_token_budget
 
                 # NOTE(RBLN): we restrict the prefill batch size to 1 for now.

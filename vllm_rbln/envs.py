@@ -70,6 +70,12 @@ if TYPE_CHECKING:
     VLLM_RBLN_USE_MOE_TOKENS_MASK: bool = True
     VLLM_RBLN_DISPATCH_ALL2ALL: bool = False
     VLLM_RBLN_COMBINE_ALL2ALL: bool = False
+    # --- PIPELINE PARALLELISM ---
+    # Spread each step's decode batch across PP microbatches
+    # (ceil(demand / pp_size)) instead of packing into one; avoids PP-depth
+    # collapse. See v1/core/utils.py DynamicDecodeCapPolicy. Off => static
+    # max_num_seqs // pp_size cap.
+    VLLM_RBLN_PP_BALANCE_DECODE_BATCH: bool = True
     # --- DECODE BATCH BUCKET ---
     VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY: str = "exponential"
     VLLM_RBLN_DECODE_BATCH_BUCKET_MIN: int = 1
@@ -350,6 +356,14 @@ environment_variables = {
     "VLLM_RBLN_COMBINE_ALL2ALL": (
         lambda: (
             os.environ.get("VLLM_RBLN_COMBINE_ALL2ALL", "False").lower()
+            in ("true", "1")
+        )
+    ),
+    # --- PIPELINE PARALLELISM ---
+    # Spread the decode batch across PP microbatches (dynamic decode cap).
+    "VLLM_RBLN_PP_BALANCE_DECODE_BATCH": (
+        lambda: (
+            os.environ.get("VLLM_RBLN_PP_BALANCE_DECODE_BATCH", "True").lower()
             in ("true", "1")
         )
     ),
