@@ -25,7 +25,22 @@ from vllm.v1.spec_decode.medusa import MedusaProposer
 import vllm_rbln.v1.spec_decode.medusa as medusa_module
 from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
 
-DEVICE = torch.device(current_platform.device_type)
+# NOTE: `torch.device("rbln")` carries no index, but a tensor actually
+# allocated there reports `rbln:0`, so comparing a tensor's `.device` against
+# the bare device would fail. Round-trip through a real allocation to get the
+# normalized device (``cpu`` stays ``cpu``).
+DEVICE = torch.zeros(0, device=current_platform.device_type).device
+
+
+def assert_close(actual, expected, **kwargs):
+    """``torch.testing.assert_close`` without the placement check.
+
+    The code under test allocates on ``DEVICE`` (``rbln`` on an RBLN platform),
+    while the expected values below are written as plain CPU literals for
+    readability. These tests assert values/shape/dtype, not placement.
+    """
+    kwargs.setdefault("check_device", False)
+    torch.testing.assert_close(actual, expected, **kwargs)
 
 
 class FakeMedusaModel:
@@ -111,6 +126,45 @@ def test_init_preallocates_padded_hidden_states(monkeypatch):
     assert torch.count_nonzero(proposer.hidden_states) == 0
 
 
+# Verifies an injected compile context is used verbatim and no new one is made.
+# Under device tensors the proposer deliberately runs without a compile context,
+# so the injected one is dropped as well.
+@pytest.mark.parametrize("use_device_tensor", [False, True])
+def test_init_uses_injected_compile_context(monkeypatch, use_device_tensor):
+    patch_base_init(monkeypatch, hidden_size=4, dtype=torch.float32)
+    create_compile_context = Mock()
+    monkeypatch.setattr(medusa_module, "create_compile_context", create_compile_context)
+    monkeypatch.setattr(medusa_module, "USE_DEVICE_TENSOR", use_device_tensor)
+    injected = object()
+
+    proposer = RBLNMedusaProposer(make_vllm_config(), DEVICE, compile_context=injected)
+
+    assert proposer.compile_context is (None if use_device_tensor else injected)
+    create_compile_context.assert_not_called()
+
+
+# Verifies __init__ builds a weight-sharing compile context when none is given,
+# and that it builds none at all when device tensors are in use.
+@pytest.mark.parametrize("use_device_tensor", [False, True])
+def test_init_creates_compile_context_when_not_provided(monkeypatch, use_device_tensor):
+    patch_base_init(monkeypatch, hidden_size=4, dtype=torch.float32)
+    sentinel = object()
+    create_compile_context = Mock(return_value=sentinel)
+    monkeypatch.setattr(medusa_module, "create_compile_context", create_compile_context)
+    monkeypatch.setattr(medusa_module, "USE_DEVICE_TENSOR", use_device_tensor)
+
+    proposer = RBLNMedusaProposer(make_vllm_config(), DEVICE)
+
+    if use_device_tensor:
+        create_compile_context.assert_not_called()
+        assert proposer.compile_context is None
+    else:
+        create_compile_context.assert_called_once_with(
+            use_weight_sharing=True, use_global_ctx=True
+        )
+        assert proposer.compile_context is sentinel
+
+
 # ---------------------------------------------------------------------------
 # load_model
 # ---------------------------------------------------------------------------
@@ -145,10 +199,10 @@ def test_load_model_uses_eager_wrapper(monkeypatch, enforce_eager, compile_model
 
     # Wrapper composes forward(...) then compute_logits(...) in that order.
     assert [name for name, _ in fake_model.events] == ["forward", "compute_logits"]
-    torch.testing.assert_close(fake_model.events[0][1], hidden_states)
-    torch.testing.assert_close(fake_model.events[1][1], hidden_states + 100)
-    torch.testing.assert_close(logits[0], hidden_states + 101)
-    torch.testing.assert_close(logits[1], hidden_states + 102)
+    assert_close(fake_model.events[0][1], hidden_states)
+    assert_close(fake_model.events[1][1], hidden_states + 100)
+    assert_close(logits[0], hidden_states + 101)
+    assert_close(logits[1], hidden_states + 102)
 
 
 # Verifies the compile path routes the wrapper through compile() with the
@@ -193,8 +247,8 @@ def test_load_model_compiles_wrapper(monkeypatch, strict):
     target = cast(Callable[[torch.Tensor], list[torch.Tensor]], captured["target"])
     logits = target(hidden_states)
     assert [name for name, _ in fake_model.events] == ["forward", "compute_logits"]
-    torch.testing.assert_close(logits[0], hidden_states + 101)
-    torch.testing.assert_close(logits[1], hidden_states + 102)
+    assert_close(logits[0], hidden_states + 101)
+    assert_close(logits[1], hidden_states + 102)
 
 
 # ---------------------------------------------------------------------------
@@ -223,8 +277,8 @@ def test_propose_uses_padded_hidden_state_buffer():
 
     # Same object passed through (static address matters for compile).
     assert captured["buffer"] is fake.hidden_states
-    torch.testing.assert_close(fake.hidden_states[:2], target_hidden_states)
-    torch.testing.assert_close(fake.hidden_states[2:], sentinel)
+    assert_close(fake.hidden_states[:2], target_hidden_states)
+    assert_close(fake.hidden_states[2:], sentinel)
 
 
 # Verifies per-head argmax is stacked into [batch, num_heads] for the active
@@ -245,9 +299,7 @@ def test_propose_returns_headwise_argmax_for_active_batch():
     )
 
     assert output.shape == (2, 3)
-    torch.testing.assert_close(
-        output, torch.tensor([[1, 0, 2], [0, 2, 0]], dtype=torch.int64)
-    )
+    assert_close(output, torch.tensor([[1, 0, 2], [0, 2, 0]], dtype=torch.int64))
 
 
 # ---------------------------------------------------------------------------

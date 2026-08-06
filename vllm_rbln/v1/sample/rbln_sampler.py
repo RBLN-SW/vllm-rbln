@@ -116,6 +116,7 @@ class RBLNSampler(VLLMSampler):
     def __init__(
         self,
         logprobs_mode: LogprobsMode = "raw_logprobs",
+        use_fp64_gumbel: bool = False,
     ):
         super().__init__()
         if logprobs_mode in ("raw_logprobs", "raw_logits"):
