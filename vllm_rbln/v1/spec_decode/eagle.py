@@ -83,7 +83,34 @@ class RBLNEagleProposer(EagleProposer):
         recompiles -- the exact failure this fold was added to remove, moved to
         the other path.
         """
-        return self.method == "eagle3"
+        # Disabled: on a .prod compiler build this triples the chiplet-0 device
+        # arena and the server cannot allocate its KV cache.
+        #
+        # Measured, one variable at a time, all on 0.11.2.dev158+gbaabdcac.prod
+        # with util 0.9 and 62 blocks:
+        #
+        #   this branch, fold on    3 x 15.211 GiB on chiplet 0 -> OOM
+        #   fold off                1 x 15.211 GiB              -> boots, 10/10
+        #   #831 (no fold at all)   1 x 15.211 GiB              -> boots
+        #
+        # Chiplets 1-3 are byte-identical across all three, which is what points
+        # at the drafter: it is the only graph that lives on chiplet 0 alone. The
+        # same code on a non-prod build of the same commit allocates one arena and
+        # boots, so this needs the .prod build *and* the fold together.
+        #
+        # Folding only decode is not a way out. The projection weight is then
+        # consumed inside the graph, which leaves it device-only, and the eager
+        # call on the next prefill step dies in
+        # `rbln_memcpy_v2h failed (56623104 bytes)` -- 3072 x 9216 x 2, the weight
+        # itself. Graph and eager use of one weight do not mix; the fold is
+        # all-or-nothing.
+        #
+        # Cost of turning it off, from the FUSE=1/0 pair at max_num_seqs 4
+        # (X1_fuse_greedy vs V1_final_mns4, everything else equal): wall 1914s ->
+        # 2331s. At max_num_seqs 1 the pair is within noise (52.56 vs 52.75 ms
+        # TPOT), which matches the earlier finding that this optimisation flips
+        # sign with the operating point.
+        return False
 
     def _aux_width(self) -> int:
         """Width the folded projection expects at its input.
