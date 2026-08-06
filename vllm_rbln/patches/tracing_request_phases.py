@@ -26,8 +26,8 @@ phases as child spans, laid end-to-end from the request's wall-clock arrival:
 
     llm_request (SERVER)   [arrival_time → iteration_timestamp]
     ├─ queue               (scheduled_ts - queued_ts)
-    ├─ prefill             (first_token_ts - scheduled_ts)
-    └─ decode              (last_token_ts - first_token_ts)
+    ├─ to_first_token      (first_token_ts - scheduled_ts)
+    └─ generate            (last_token_ts - first_token_ts)
 
 No new accounting is introduced — ``RequestStateStats`` already carries every
 boundary and upstream computes the same durations from them one line above. We
@@ -95,10 +95,17 @@ logger = init_logger(__name__)
 #: value to a span as an absolute timestamp is not (it would place the span
 #: decades away from the request). So the durations are taken from these fields
 #: and the *position* comes from the one wall-clock anchor we have.
+#: Names describe what the interval *measures*, not what the instance is assumed
+#: to be doing. Upstream calls the middle one ``time_in_model_prefill``, but on a
+#: decode instance in PD-disaggregation that window is KV receive + first decode
+#: forward — no prefill happens there (measured on ca2: prefill instance did 43
+#: tokens in 188ms while the decode instance's same-named window was 1737ms with
+#: forwards steady at 23ms). Naming it ``prefill`` made the waterfall read as
+#: "decode is prefilling", which is wrong.
 _PHASES: tuple[tuple[str, str, str], ...] = (
     ("queue", "queued_ts", "scheduled_ts"),
-    ("prefill", "scheduled_ts", "first_token_ts"),
-    ("decode", "first_token_ts", "last_token_ts"),
+    ("to_first_token", "scheduled_ts", "first_token_ts"),
+    ("generate", "first_token_ts", "last_token_ts"),
 )
 
 

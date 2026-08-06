@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import time
 from typing import TYPE_CHECKING, Any
 
 import msgspec
@@ -39,6 +40,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
     compute_tp_mapping,
 )
+from vllm.tracing import instrument_manual
 from vllm.v1.kv_cache_interface import (
     MambaSpec,
     SlidingWindowSpec,
@@ -53,6 +55,11 @@ if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
 logger = init_logger(__name__)
+
+#: Bounds for the transfer-issue bookkeeping used by nixl.wait_for_transfer.
+#: Pruning only kicks in past the soft limit so the common path stays a dict pop.
+_XFER_TRACKING_SOFT_LIMIT = 4096
+_XFER_TRACKING_MAX_AGE_S = 600.0
 
 
 class RblnNixlConnectorWorker(NixlConnectorWorker):
@@ -73,6 +80,9 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
         self, vllm_config: VllmConfig, engine_id: str, kv_cache_config: "KVCacheConfig"
     ) -> None:
         super().__init__(vllm_config, engine_id, kv_cache_config)
+        #: req_id → 전송 발행 시각(wall-clock). get_finished 가 완료 시각과 짝지어
+        #: nixl.wait_for_transfer span 을 만든다.
+        self._rbln_xfer_issued_at: dict[str, float] = {}
 
         # Pick the NIXL transport backend.
         #   * nixl-rbln installed  → use RBLN backend on both paths
@@ -671,4 +681,54 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
     # was slow. This thin override exists only to name the per-request read.
     @traced_remote_fetch
     def _read_blocks_for_req(self, req_id: str, meta) -> None:
+        # Wall-clock: spans need absolute timestamps and this is only ever
+        # compared against time.time() in get_finished, never a monotonic clock.
+        self._rbln_xfer_issued_at[req_id] = time.time()
         return super()._read_blocks_for_req(req_id, meta)
+
+    def get_finished(self) -> tuple[set[str], set[str]]:
+        done_sending, done_recving = super().get_finished()
+        if self._rbln_xfer_issued_at and done_recving:
+            self._emit_transfer_wait_spans(done_recving)
+        return done_sending, done_recving
+
+    def _emit_transfer_wait_spans(self, done_recving: set[str]) -> None:
+        """One ``nixl.wait_for_transfer`` span per completed receive.
+
+        ``nixl.kv_transfer`` on the connector only covers the *issue* of the
+        reads — measured at 0.05ms on ca2, because ``start_load_kv`` hands the
+        transfer to NIXL and returns. The elapsed time is the transfer
+        completing, which upstream discovers by polling ``_pop_done_transfers``
+        from ``get_finished`` every engine step. Neither end is a span by itself,
+        so the interval is reconstructed from issue → completion.
+
+        A span per poll would emit thousands of empty spans and still not show
+        the wait, which is why this keys off the requests that actually finished.
+
+        Tracing failures are swallowed: a missing span is a lost measurement, a
+        raised exception is a lost request.
+        """
+        finished_at = time.time()
+        # A request cancelled mid-transfer never shows up in done_recving, so its
+        # entry would sit here forever. Drop anything older than any plausible
+        # transfer — this dict is a measurement aid, not state the transfer needs.
+        if len(self._rbln_xfer_issued_at) > _XFER_TRACKING_SOFT_LIMIT:
+            cutoff = finished_at - _XFER_TRACKING_MAX_AGE_S
+            self._rbln_xfer_issued_at = {
+                rid: ts for rid, ts in self._rbln_xfer_issued_at.items() if ts >= cutoff
+            }
+        for req_id in done_recving:
+            issued_at = self._rbln_xfer_issued_at.pop(req_id, None)
+            if issued_at is None:
+                # Issued before tracing started, or a failed-setup request that
+                # never went through _read_blocks_for_req.
+                continue
+            try:
+                instrument_manual(
+                    span_name="nixl.wait_for_transfer",
+                    start_time=int(issued_at * 1e9),
+                    end_time=int(finished_at * 1e9),
+                    attributes={"ca.request.id": req_id},
+                )
+            except Exception:  # noqa: BLE001 - tracing must not break KV transfer
+                logger.debug("nixl.wait_for_transfer span emit failed", exc_info=True)
