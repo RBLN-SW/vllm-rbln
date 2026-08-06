@@ -61,7 +61,7 @@ SKIP_DP_RENDEZVOUS = os.getenv("VLLM_RBLN_EAGLE3_SKIP_DP_RENDEZVOUS", "0") == "1
 # exactly that basis.
 #
 # The drafter unroll requires this OFF, and two attempts to lift that did not
-# work -- see UNROLL_DRAFTER below. At max_num_seqs 4 the two are mutually
+# work. At max_num_seqs 4 the two are mutually
 # exclusive and this one is worth more (+18.2% versus the unroll's -5.8%).
 FUSE_FIRST_FORWARD = os.getenv("VLLM_RBLN_EAGLE3_FUSE_FIRST_FORWARD", "1") == "1"
 
@@ -88,76 +88,6 @@ HOST_NEXT_TOKEN = os.getenv("VLLM_RBLN_EAGLE3_HOST_NEXT_TOKEN", "0") == "1"
 # means the transform is not an equivalence.
 DRAFT_ID_LOG_STEPS = int(os.getenv("VLLM_RBLN_EAGLE3_DRAFT_ID_LOG_STEPS", "0"))
 
-# Run the drafter's chain as one compiled graph instead of three.
-#
-# A decode step launches four graphs today: the target's verify forward, the
-# drafter's first pass (qlen num_spec+1, aux projection folded in), and the
-# drafter's loop forward twice (qlen 1). The three drafter graphs exist because
-# `dynamic=False` compiles per input shape and the iterations chain through
-# host-visible buffers with a metadata rebuild in between.
-#
-# Only `seq_lens` differs between iterations. `block_tables` is loop-invariant
-# because `num_lookahead_tokens = num_spec` pre-allocates the draft positions;
-# `attn_masks` is None under VLLM_RBLN_FLASH_CAUSAL_ATTN; the sliding-window
-# fields are None (the EAGLE3 head has no window); and the KV write derives its
-# slot from `seq_lens` inside the attention kernel, so there is no slot mapping to
-# thread through.
-#
-# The metadata reaches attention through the forward context rather than as an
-# argument, so the unroll hands `set_forward_context` a LIST of per-iteration
-# dicts and advances `patches.attention.set_draft_unroll_index` before each
-# in-graph call. Upstream already defines that list shape for speculative
-# decoding (it reads `[0]`), and the getter is one we own, so nothing in vLLM
-# changes.
-#
-# MEASURED (MiniMax-M2.5 DP4+EP, max_num_seqs 1):
-#   -2.69 ms TPOT, 48.26 against a 50.95 baseline whose four runs have sd 0.12.
-#   Equivalence is verified, not assumed: 24/24 draft token ids identical to the
-#   non-unrolled path at temperature 0, and accepted/draft identical to four
-#   decimals (1.3095).
-#
-# Default stays OFF because of what it costs. The unrolled graph holds more
-# intermediate buffers: at gpu_memory_utilization 0.6 the server fails to start
-# ("Not enough memory for 90 blocks of KV cache"), and at 0.55 the KV cache is
-# 63,488 tokens against 92,160 for the rolled graph -- about 31% less. That trade
-# is worth taking at low concurrency and probably is not at max_num_seqs 4+,
-# where several sequences compete for the same cache.
-#
-# Requires FUSE_FIRST_FORWARD off, and that is what limits it. Two attempts to
-# make them coexist both failed, differently:
-#
-#   1. As written, `model_wrapper` branches on `hidden_states.shape[-1]` to decide
-#      whether to fold the aux projection. Inside one unrolled region only the
-#      first copy is handed a wide tensor, so the copies trace different bodies
-#      and accepted/draft comes out exactly 0.
-#   2. Hoisting the fold above the first `model_wrapper` call -- so every copy
-#      sees a hidden_size-wide input and the branch is uniformly false -- changes
-#      the failure rather than removing it. The engine dies during the request
-#      with a DP collective mismatch: one rank in `execute_dummy_batch` ->
-#      `_determine_batch_padding` -> `all_reduce`, another in
-#      `num_tokens_across_dp`, gloo reporting the peer closed.
-#   3. That looked like the drafter's skipped shape rendezvous desynchronising
-#      the ranks, so the pair was run again with `SKIP_DP_RENDEZVOUS=0`. It does
-#      not help: accepted/draft is back to 0. The rendezvous was not the cause.
-#
-# `UNROLL_DRAFTER=1` with `FUSE_FIRST_FORWARD=0` works and is exact, so all three
-# failures belong to the combination, not to the unroll. Three attempts, three
-# different mechanisms, root cause not identified. Treating the unroll as
-# max_num_seqs 1 only.
-#
-# The hoist is kept: it is a no-op when FUSE is off (the width test is already
-# false) and it is the clearer structure. It is not a fix.
-#
-# Consequence: at max_num_seqs 4, where the fold is worth +18.2% wall, the unroll
-# cannot be used. Measured there anyway, with the fold off: the unroll gives
-# -5.8% (38.8 -> 36.6 min) but the fold's absence costs more, so the combination
-# lands 14.7% behind the deployment config. It stays useful at max_num_seqs 1.
-#
-# Verify with `equiv_check.sh`, never with acceptance: a mis-indexed `seq_lens`
-# makes iterations 2 and 3 attend without seeing the tokens iteration 1 wrote,
-# which neither crashes nor collapses acceptance -- it costs a few percent, which
-# is inside the arm-to-arm spread.
-UNROLL_DRAFTER = os.getenv("VLLM_RBLN_EAGLE3_UNROLL_DRAFTER", "0") == "1"
 
 # Log the first N prefill steps' request/token shape.
 #

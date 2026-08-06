@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
-from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -34,10 +33,6 @@ from vllm_rbln.compilation import (
 )
 from vllm_rbln.forward_context import RBLNDPMetadata, set_forward_context
 from vllm_rbln.logger import init_logger
-from vllm_rbln.patches.attention import (
-    reset_draft_unroll_index,
-    set_draft_unroll_index,
-)
 from vllm_rbln.platform import USE_DEVICE_TENSOR
 from vllm_rbln.utils import pad
 from vllm_rbln.v1.attention.kv_cache_bindings import (
@@ -51,7 +46,6 @@ from vllm_rbln.v1.spec_decode.utils import (
     NARROW_LOGITS,
     PREFILL_SHAPE_LOG,
     SKIP_DP_RENDEZVOUS,
-    UNROLL_DRAFTER,
     WARMUP_SKIP_FOLD,
     eagle_prepare_inputs_padded,
     eagle_prepare_next_token_padded,
@@ -99,10 +93,6 @@ class RBLNEagleProposer(EagleProposer):
         # Populated from the draft model in `load_model`. None means the draft
         # head shares the target vocabulary, so `propose()` maps no ids.
         self.draft_id_to_target_id: torch.Tensor | None = None
-        # Set in load_model when eagle3 + compilation are both on.  Annotated
-        # because mypy otherwise infers `None` from the initialiser and rejects
-        # the call in `_propose_unrolled`.
-        self._compiled_unrolled: Callable[..., torch.Tensor] | None = None
         self._draft_id_logged = 0
         self._prefill_shape_logged = 0
 
@@ -167,151 +157,6 @@ class RBLNEagleProposer(EagleProposer):
         if NARROW_LOGITS:
             ids = self.model.target_ids.index_select(0, ids)
         return ids
-
-    def _build_loop_metadata(
-        self,
-        common_attn_metadata: CommonAttentionMetadata,
-        positions: torch.Tensor,
-        num_reqs: int,
-        num_reqs_padded: int,
-    ) -> tuple[dict[str, object], torch.Tensor]:
-        """Advance one drafter iteration on the host and build its metadata.
-
-        Mirrors the `loop_update` + `attn_meta` pair in `propose`, minus the
-        buffer writes: the unrolled graph chains through graph values, so
-        `self.input_ids` / `positions` / `hidden_states` are not used between
-        iterations.
-
-        The `_seq_lens_cpu` shadow has to move with the device tensor. The
-        flash-attention builder reads the shadow, not `seq_lens`, so leaving it
-        stale makes every iteration after the first attend at the wrong length --
-        which does not crash and does not collapse acceptance.
-        """
-        positions = positions.view(-1) + 1
-        exceeds = positions[:num_reqs] >= self.max_model_len
-        common_attn_metadata.seq_lens += 1
-        common_attn_metadata.seq_lens.masked_fill_(exceeds, 1)
-        _slc = common_attn_metadata._seq_lens_cpu
-        if _slc is not None:
-            _slc += 1
-            _slc.masked_fill_(exceeds.to(_slc.device), 1)
-
-        per_layer: dict[str, object] = {}
-        for attn_group in self.draft_attn_groups:
-            am = attn_group.get_metadata_builder().build(
-                common_attn_metadata=common_attn_metadata,
-                positions=positions,
-                is_prefill=False,
-                batch_pad=num_reqs_padded,
-            )
-            attach_kv_cache_bindings(
-                am,
-                self.runner.kv_caches,
-                self.runner.kv_cache_bases,
-                self.runner.kv_cache_view_infos,
-            )
-            for layer_name in attn_group.layer_names:
-                per_layer[layer_name] = am
-        return per_layer, positions
-
-    def _propose_unrolled(
-        self,
-        common_attn_metadata: CommonAttentionMetadata,
-        per_layer_attn_metadata: dict[str, object],
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        token_indices_to_sample_padded: torch.Tensor | None,
-        target_positions: torch.Tensor,
-        num_reqs: int,
-        num_tokens: int,
-        num_reqs_padded: int,
-        num_padded_tokens: int | None,
-        num_tokens_across_dp: torch.Tensor | None,
-        num_rejected_tokens: torch.Tensor | None,
-    ) -> torch.Tensor:
-        """The drafter's whole chain in one compiled call.
-
-        Replaces the first forward plus the `num_spec - 1` loop iterations, which
-        are three graphs today (`1/3`, `1/1` twice) with host work between them.
-
-        Everything the iterations need that differs is `seq_lens`, so this builds
-        one metadata dict per iteration on the host -- the builder reads the
-        `_seq_lens_cpu` shadow, which cannot move into the graph -- and hands the
-        list to `set_forward_context`. `patched_get_attention_context` indexes it
-        by `draft_unroll_index`, which the unrolled body advances; each copy is
-        traced with a constant index, so the three iterations read three different
-        tensors even though attention takes its metadata from the forward context
-        rather than as an argument.
-
-        `block_tables` is loop-invariant: `num_lookahead_tokens = num_spec` is
-        passed to `allocate_slots`, so the slots for every draft position exist
-        before the loop starts. The masks are None under
-        VLLM_RBLN_FLASH_CAUSAL_ATTN and the sliding-window fields are None, and
-        the KV write derives its slot from `seq_lens` inside the kernel.
-
-        Verify with `equiv_check.sh`, not with acceptance.
-        """
-        metas = [per_layer_attn_metadata]
-
-        # The loop iterations see a one-token query, and the rejected-token
-        # adjustment lands before the first of them. Same order as `propose`.
-        common_attn_metadata.num_actual_tokens = num_reqs
-        common_attn_metadata.max_query_len = 1
-        common_attn_metadata.query_start_loc = self.arange[: num_reqs + 1]
-        common_attn_metadata.query_start_loc_cpu = self.arange[: num_reqs + 1].cpu()
-        if num_rejected_tokens is not None:
-            common_attn_metadata.seq_lens -= num_rejected_tokens
-            _slc0 = common_attn_metadata._seq_lens_cpu
-            if _slc0 is not None:
-                _slc0 -= num_rejected_tokens.to(_slc0.device, _slc0.dtype)
-
-        with record_function_or_nullcontext("drafter/unroll: batch_padding"):
-            num_reqs_padded, num_padded_tokens, num_tokens_across_dp = (
-                self._determine_draft_batch_padding(num_reqs, num_reqs, False)
-            )
-
-        assert token_indices_to_sample_padded is not None
-        loop_positions = target_positions[
-            token_indices_to_sample_padded.to(target_positions.device)
-        ]
-        with record_function_or_nullcontext("drafter/unroll: attn_meta"):
-            for _ in range(self.num_speculative_tokens - 1):
-                meta, loop_positions = self._build_loop_metadata(
-                    common_attn_metadata, loop_positions, num_reqs, num_reqs_padded
-                )
-                metas.append(meta)
-
-        with (
-            record_function_or_nullcontext("drafter/unroll: forward"),
-            set_forward_context(
-                metas,
-                self.vllm_config,
-                num_tokens=num_tokens,
-                num_tokens_across_dp=num_tokens_across_dp,
-                num_padded_tokens=num_padded_tokens,
-                **build_kv_cache_forward_context_kwargs(self.runner.kv_cache_bases),
-            ),
-        ):
-            # `propose` guards this, but the narrowing does not cross the call
-            # boundary, so bind it locally (same pattern as 3e348e1f).
-            unrolled = self._compiled_unrolled
-            assert unrolled is not None
-            draft_token_ids = unrolled(
-                input_ids,
-                positions,
-                hidden_states,
-                token_indices_to_sample_padded,
-            )
-
-        if DRAFT_ID_LOG_STEPS and self._draft_id_logged < DRAFT_ID_LOG_STEPS:
-            self._draft_id_logged += 1
-            logger.info(
-                "DRAFT_IDS step=%d %s",
-                self._draft_id_logged,
-                draft_token_ids.reshape(-1).tolist(),
-            )
-        return draft_token_ids
 
     def propose(
         self,
@@ -423,28 +268,6 @@ class RBLNEagleProposer(EagleProposer):
                         flat[:num_tokens].view(num_reqs, -1, w), 0, num_reqs_padded
                     )
         inputs_embeds = None
-
-        if (
-            UNROLL_DRAFTER
-            and self._compiled_unrolled is not None
-            and not is_prefill
-            and self.num_speculative_tokens > 1
-        ):
-            return self._propose_unrolled(
-                common_attn_metadata=common_attn_metadata,
-                per_layer_attn_metadata=per_layer_attn_metadata,
-                input_ids=input_ids,
-                positions=positions,
-                hidden_states=hidden_states,
-                token_indices_to_sample_padded=token_indices_to_sample_padded,
-                target_positions=target_positions,
-                num_reqs=num_reqs,
-                num_tokens=num_tokens,
-                num_reqs_padded=num_reqs_padded,
-                num_padded_tokens=num_padded_tokens,
-                num_tokens_across_dp=num_tokens_across_dp,
-                num_rejected_tokens=num_rejected_tokens,
-            )
 
         with (
             record_function_or_nullcontext("drafter/first: forward"),
@@ -802,59 +625,6 @@ class RBLNEagleProposer(EagleProposer):
 
             return hidden_states, logits
 
-        def unrolled_wrapper(
-            input_ids: torch.Tensor,
-            positions: torch.Tensor,
-            hidden_states: torch.Tensor,
-            token_indices_to_sample: torch.Tensor | None = None,
-        ):
-            """The drafter's whole chain in one region.
-
-            The caller puts a list of per-iteration metadata dicts in the forward
-            context; `set_draft_unroll_index` below picks which one each unrolled
-            copy reads. The index is a Python int read during tracing, so it bakes
-            a constant per copy and nothing survives into the graph.
-
-            Iterations chain through graph values rather than through
-            `self.input_ids` / `positions` / `hidden_states`, so those buffers are
-            not written here. Nothing downstream reads them for this step -- the
-            next step's `set_inputs_first_pass` overwrites them.
-            """
-            reset_draft_unroll_index()
-            # Fold the aux projection here rather than letting `model_wrapper` do
-            # it. That wrapper decides by width -- `hidden_states.shape[-1] !=
-            # self.hidden_size` -- and inside one unrolled region only the first
-            # copy is handed a wide tensor, so the three copies traced different
-            # bodies and acceptance collapsed to exactly zero. Folding once up
-            # front hands every copy a hidden_size-wide input, so the width test
-            # is uniformly false and the three copies agree.
-            #
-            # Same computation, same place in the graph; only the branch moves.
-            if FUSE_FIRST_FORWARD and hidden_states.shape[-1] != self.hidden_size:
-                hidden_states = self.model.combine_hidden_states(hidden_states)
-            h, ids = model_wrapper(
-                input_ids, positions, hidden_states, token_indices_to_sample
-            )
-            flat = ids.reshape(-1)
-            out = [flat]
-            pos = positions.reshape(-1)[: flat.shape[0]]
-            for step in range(1, self.num_speculative_tokens):
-                set_draft_unroll_index(step)
-                pos = pos + 1
-                # `model_wrapper` returns hidden states as (num_tokens, hidden),
-                # but the model expects the `[B, L, H]` layout `_preprocess`
-                # produces. The loop iterations feed one token per request, so
-                # that is (num_reqs, 1, hidden).
-                nxt = out[-1].reshape(-1, 1)
-                h, ids = model_wrapper(
-                    nxt,
-                    pos.reshape(-1, 1),
-                    h.reshape(nxt.shape[0], -1, self.hidden_size),
-                )
-                out.append(ids.reshape(-1))
-            reset_draft_unroll_index()
-            return torch.stack(out, dim=1)
-
         if (
             self.vllm_config.speculative_config.enforce_eager
             or not envs.VLLM_RBLN_COMPILE_MODEL
@@ -872,18 +642,6 @@ class RBLNEagleProposer(EagleProposer):
                 guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
                 mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
             )
-            if UNROLL_DRAFTER and self.method == "eagle3":
-                self._compiled_unrolled = compile(
-                    unrolled_wrapper,
-                    dynamic=False,
-                    fullgraph=True,
-                    compile_context=self.runner.compile_context,
-                    num_devices=envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
-                    model_trace_method="export" if USE_DEVICE_TENSOR else "",
-                    process_group_dict=build_process_group_dict(),
-                    guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
-                    mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
-                )
 
     def _build_dummy_attn_metadata(
         self,
