@@ -26,6 +26,7 @@ from vllm.v1.request import RequestStatus
 
 from tests.native.v1.core.utils import (
     EOS_TOKEN_ID,
+    MockKVConfig,
     _drain,
     advance_to_decode,
     create_rbln_scheduler,
@@ -1173,3 +1174,55 @@ class TestDecodeCapMachinery:
             "discard() must fire exactly once for the preempted already-scheduled "
             f"decode, got {discard_calls}"
         )
+
+
+class TestDeferredBlockFree:
+    # The ``defer_block_free`` fence (``sched_step_seq``): blocks of a request
+    # aborted mid-step must not return to the pool until that step's output is
+    # processed, because with several batches in flight (PP) a connector load can
+    # refill blocks the in-flight step is still writing. On only when >1 batch is
+    # in flight AND the instance is a KV consumer. The fence lives in the copied
+    # schedule() and had no native unit coverage.
+
+    def test_deferred_free_fenced_by_inflight_step(self):
+        sched = create_rbln_scheduler(
+            pipeline_parallel_size=2, use_kv_connector=MockKVConfig()
+        )
+        assert sched.defer_block_free
+
+        request = create_requests(1)[0]
+        sched.add_request(request)
+        output = sched.schedule()
+        assert output.total_num_scheduled_tokens > 0
+        assert sched.sched_step_seq == 1
+        assert request.last_sched_seq == 1
+
+        block_pool = sched.kv_cache_manager.block_pool
+        free_before = block_pool.get_num_free_blocks()
+        sched.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
+        # Fenced: blocks stay out of the pool until the in-flight step drains.
+        assert sched.deferred_frees, "blocks must be fenced, not freed"
+        assert block_pool.get_num_free_blocks() == free_before
+
+        sched.update_from_output(output, make_model_runner_output(output, 0))
+        assert sched.processed_step_seq == 1
+        assert not sched.deferred_frees
+        assert block_pool.get_num_free_blocks() > free_before
+
+    def test_no_deferred_free_without_multiple_inflight_batches(self):
+        # Single batch in flight (no PP): freeing stays immediate even with a
+        # KV connector present.
+        sched = create_rbln_scheduler(use_kv_connector=MockKVConfig())
+        assert not sched.defer_block_free
+
+        request = create_requests(1)[0]
+        sched.add_request(request)
+        output = sched.schedule()
+        assert sched.sched_step_seq == 0
+
+        block_pool = sched.kv_cache_manager.block_pool
+        free_before = block_pool.get_num_free_blocks()
+        sched.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
+        assert not sched.deferred_frees
+        assert block_pool.get_num_free_blocks() > free_before
+        sched.update_from_output(output, make_model_runner_output(output, 0))
