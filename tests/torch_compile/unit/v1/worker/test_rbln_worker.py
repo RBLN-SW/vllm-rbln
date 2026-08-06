@@ -1776,23 +1776,24 @@ class TestDynamicKvLayoutGuards:
         from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
 
         calls: list[str] = []
+
+        def record(name: str, ret: object = None) -> object:
+            calls.append(name)
+            return ret
+
         config = SimpleNamespace(num_blocks=4, kv_cache_tensors=[])
         worker = SimpleNamespace(
             cache_config=SimpleNamespace(num_gpu_blocks=None, num_cpu_blocks=None),
             vllm_config=object(),
             model_runner=SimpleNamespace(
-                initialize_kv_cache=lambda cfg: calls.append("initialize_kv_cache")
+                initialize_kv_cache=lambda cfg: record("initialize_kv_cache")
             ),
-            _assert_dynamic_kv_compiler_support=lambda: calls.append("compiler"),
-            _assert_dynamic_kv_scheduler_handoff_installed=lambda: calls.append(
-                "handoff"
-            ),
-            _assert_dynamic_kv_transfer_absent=lambda: calls.append("transfer"),
-            _assert_dynamic_kv_attention_layout=lambda: calls.append("attention"),
-            _assert_dynamic_kv_cache_layout=lambda: calls.append("bindings"),
-            _maybe_shrink_kv_cache_for_compile=lambda cfg: (
-                calls.append("shrink") or cfg
-            ),
+            _assert_dynamic_kv_compiler_support=lambda: record("compiler"),
+            _assert_dynamic_kv_scheduler_handoff_installed=lambda: record("handoff"),
+            _assert_dynamic_kv_transfer_absent=lambda: record("transfer"),
+            _assert_dynamic_kv_attention_layout=lambda: record("attention"),
+            _assert_dynamic_kv_cache_layout=lambda: record("bindings"),
+            _maybe_shrink_kv_cache_for_compile=lambda cfg: record("shrink", cfg),
         )
         with (
             patch(
