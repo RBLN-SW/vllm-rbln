@@ -447,7 +447,7 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         recovered_token_ids, num_accepted = self._compiled_rejection_sample(
             reshaped_draft_token_ids,
             reshaped_target_probs,
-            cu_num_draft_tokens,
+            cu_num_draft_tokens.to(device),
             sampling_metadata.top_k,
             sampling_metadata.top_p,
         )

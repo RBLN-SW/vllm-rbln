@@ -2882,7 +2882,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 num_tokens + 1,
                 num_spec,
                 dtype=torch.int32,
-                device="cpu",
+                device=self.device,
             )
             bonus_token_ids = torch.zeros(
                 batch_size, 1, dtype=torch.int64, device=self.device
