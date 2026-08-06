@@ -65,11 +65,17 @@ def _build_worker(
         self.kv_cache_config = kv_cache_config
         self.kv_buffer_device = kv_buffer_device
         self._block_size = {}
+        # The real NixlPullConnectorWorker.__init__ sets this to None;
+        # register_kv_caches reads it after super().register_kv_caches().
+        self.xfer_handshake_metadata = None
 
     monkeypatch.setattr(NixlConnectorWorker, "__init__", fake_super_init)
 
     vllm_config = MagicMock()
     vllm_config.cache_config = CacheConfig(block_size=block_size)
+    # _check_pp_constraints compares pipeline_parallel_size <= 1; give it a real
+    # int (a MagicMock would raise TypeError). 1 == the non-PP default here.
+    vllm_config.parallel_config.pipeline_parallel_size = 1
     kv_cache_config = MagicMock()
     kv_cache_config.num_blocks = num_blocks
     kv_cache_config.kv_cache_groups = [

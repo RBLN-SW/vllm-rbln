@@ -109,7 +109,7 @@ class TestInit:
     ):
         # host-bounce ("cpu") stages through host DRAM; D2D ("rbln") does not.
         monkeypatch.setattr(
-            sm.NixlConnectorScheduler, "__init__", lambda self, *a, **k: None
+            sm.NixlPullConnectorScheduler, "__init__", lambda self, *a, **k: None
         )
         vllm_config = SimpleNamespace(
             kv_transfer_config=SimpleNamespace(kv_buffer_device=kv_buffer_device)
