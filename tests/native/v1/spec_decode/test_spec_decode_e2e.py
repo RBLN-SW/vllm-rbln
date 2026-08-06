@@ -76,7 +76,6 @@ SPEC_METHODS = {
 # acceptance there would measure model quality, not the code path.
 _EXPECT_ACCEPTANCE = {"ngram", "suffix", "eagle", "eagle3"}
 _XFAIL_REASON = {
-    "suffix": "SuffixDecodingProposer.propose() called with the pre-0.24 signature",
     "eagle3": "RBLNCompileError: RblnTensorAllocateDevTensorKey pass fails on the "
     "eagle3 aux-hidden-state graph",
 }
