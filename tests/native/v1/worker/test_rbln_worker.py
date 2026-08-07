@@ -117,7 +117,13 @@ def make_worker(monkeypatch):
         device_name="RBLN-CA25",
         vllm_config=None,
     ):
-        wsd = world_size if world_size_across_dp is None else world_size_across_dp
+        # vLLM leaves dp_size out of world_size (it sizes one DP replica) and
+        # multiplies it back in for world_size_across_dp.
+        wsd = (
+            world_size * data_parallel_size
+            if world_size_across_dp is None
+            else world_size_across_dp
+        )
         vllm_config = vllm_config or _make_vllm_config(
             world_size=world_size,
             data_parallel_size=data_parallel_size,

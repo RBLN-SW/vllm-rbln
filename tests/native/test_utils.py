@@ -27,7 +27,9 @@ from .utils import (
     NATIVE_ENV,
     SCRUBBED_EXTRA,
     SCRUBBED_PREFIXES,
+    devices_needed,
     is_scrubbed,
+    rbln_device_count,
     scrub_env,
 )
 
@@ -111,6 +113,33 @@ def test_native_env_pins_no_host_description():
     """The suite may pin behavior, never machine identity: pinning a passthrough
     like RBLN_DEVICES would hard-code one host's topology."""
     assert not (set(NATIVE_ENV) & HOST_ENV_PASSTHROUGH)
+
+
+class TestDeviceInventory:
+    """The guard that keeps a multi-device test off a host with too few NPUs."""
+
+    def test_visible_list_wins_over_the_nodes(self, monkeypatch):
+        monkeypatch.setenv("RBLN_DEVICES", "3,4")
+        assert rbln_device_count() == 2
+
+    @pytest.mark.parametrize("blank", ["", " "])
+    def test_blank_visible_list_falls_back_to_the_nodes(self, monkeypatch, blank):
+        # Read as zero it would skip every device test on a host that has them.
+        monkeypatch.delenv("RBLN_DEVICES", raising=False)
+        mounted = rbln_device_count()
+        monkeypatch.setenv("RBLN_DEVICES", blank)
+        assert rbln_device_count() == mounted
+
+    @pytest.mark.parametrize(
+        ("kwargs", "rsd", "expected"),
+        [
+            ({}, 1, 1),
+            ({"tensor_parallel_size": 2, "data_parallel_size": 4}, 1, 8),
+            ({"pipeline_parallel_size": 2}, 2, 4),
+        ],
+    )
+    def test_devices_needed_multiplies_every_axis(self, kwargs, rsd, expected):
+        assert devices_needed(kwargs, rsd) == expected
 
 
 def test_scrub_covers_every_name_the_env_table_reads():

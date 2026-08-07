@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # Placeholder: KV sharing is unsupported on RBLN (both attention impls raise on
-# kv_sharing_target_layer_name), so there is nothing to exercise yet. See NOTE.md.
+# kv_sharing_target_layer_name), so there is nothing to exercise yet.
 
 import pytest
 
