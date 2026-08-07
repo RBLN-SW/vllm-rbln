@@ -65,7 +65,7 @@ def ctx(monkeypatch):
 
 
 def report_lines(ctx, monkeypatch):
-    """print_stats() 가 실제로 찍는 리포트 줄들."""
+    """Lines emitted by print_stats()."""
     monkeypatch.setattr(mv2.envs, "VLLM_RBLN_METRICS_DIR", "", raising=False)
     captured: list[str] = []
     monkeypatch.setattr(mv2.logger, "info", lambda fmt, msg: captured.append(msg))
