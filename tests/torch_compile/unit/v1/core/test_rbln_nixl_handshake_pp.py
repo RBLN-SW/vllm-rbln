@@ -120,11 +120,17 @@ class _FakeSock:
         )
 
 
-def _make_worker(*, tp_target_ranks=(0,), sw_ratio=None, compat="HASH"):
+def _make_worker(*, tp_target_ranks=(0,), sw_ratio=None, compat="HASH", tp_ratio=1):
     w = object.__new__(RblnNixlConnectorWorker)
     w.use_host_buffer = True  # skip current_platform.set_device
     w.transfer_topo = MagicMock()
     w.transfer_topo.handshake_target_ranks.return_value = list(tp_target_ranks)
+    # Equal P/D TP unless a test says otherwise: the handshake now consults
+    # tp_ratio to decide between positional and head-band region pairing.
+    w.transfer_topo.tp_ratio.return_value = tp_ratio
+    w.transfer_topo.tp_size = 1
+    w.vllm_config = MagicMock()
+    w.vllm_config.parallel_config.pipeline_parallel_size = 1
     w.compat_hash = compat
     w.enforce_compat_hash = True
     w._sw_ratio = sw_ratio
@@ -265,11 +271,22 @@ class TestPpHandshakeFanout:
         with pytest.raises(RuntimeError, match="sliding-window"):
             _handshake(w, sock)
 
-    def test_tp_plus_pp_raises(self):
-        w = _make_worker(tp_target_ranks=(0,))
+    def test_pp_with_larger_peer_tp_raises(self):
+        """A PP producer with MORE TP ranks than us: each of our regions would
+        span several of theirs, which no path builds."""
+        w = _make_worker(tp_target_ranks=(0,), tp_ratio=-2)
         sock = _FakeSock(pp_size=2)
-        with pytest.raises(RuntimeError, match="tensor parallel"):
-            _handshake(w, sock, remote_tp_size=2)
+        with pytest.raises(RuntimeError, match="larger tensor-parallel size"):
+            _handshake(w, sock, remote_tp_size=4)
+
+    def test_pp_on_both_sides_with_heterogeneous_tp_raises(self):
+        """Layers and heads are each handled, but splitting both axes on both
+        sides at once is untested and stays out."""
+        w = _make_worker(tp_target_ranks=(0,), tp_ratio=2)
+        w.vllm_config.parallel_config.pipeline_parallel_size = 2
+        sock = _FakeSock(pp_size=2)
+        with pytest.raises(RuntimeError, match="BOTH sides"):
+            _handshake(w, sock, remote_tp_size=1)
 
     def test_compat_hash_mismatch_raises(self):
         w = _make_worker(compat="LOCAL")
@@ -394,15 +411,29 @@ class TestShardReadPath:
         group. Single group -> region_id * num_blocks + block_ids[0]."""
         w = object.__new__(RblnNixlConnectorWorker)
         w._shard_region_group_ids = {("eng", 1): (0, 0, 0, 0)}  # 4 regions, group 0
+        w._shard_desc_split = {}
         descs = w._get_block_descs_ids_for_shard(
             "eng", 1, num_blocks=10, block_ids=[[2, 5]]
         )
         # region r contributes r*10 + [2,5]: [2,5, 12,15, 22,25, 32,35]
         assert list(descs) == [2, 5, 12, 15, 22, 25, 32, 35]
 
+    def test_get_block_descs_ids_for_shard_with_split(self):
+        """split=2: each block becomes two consecutive descriptors, because
+        both dlists are laid out region-major, then block, then piece."""
+        w = object.__new__(RblnNixlConnectorWorker)
+        w._shard_region_group_ids = {("eng", 1): (0, 0)}  # 2 regions
+        w._shard_desc_split = {("eng", 1): 2}
+        descs = w._get_block_descs_ids_for_shard(
+            "eng", 1, num_blocks=10, block_ids=[[2, 5]]
+        )
+        # region 0: blocks 2,5 -> descs (2*2,+1) and (5*2,+1); region 1 adds 10*2.
+        assert list(descs) == [4, 5, 10, 11, 24, 25, 30, 31]
+
     def test_get_block_descs_ids_for_shard_empty_group(self):
         w = object.__new__(RblnNixlConnectorWorker)
         w._shard_region_group_ids = {("eng", 0): (0, 0)}
+        w._shard_desc_split = {}
         descs = w._get_block_descs_ids_for_shard("eng", 0, num_blocks=4, block_ids=[[]])
         assert descs.size == 0
 
@@ -420,6 +451,7 @@ class TestShardReadPath:
         w._recving_transfers = defaultdict(list)
         # single group, 2 regions per shard
         w._shard_region_group_ids = {("eng", r): (0, 0) for r in range(pp_size)}
+        w._shard_desc_split = {}
         w.src_xfer_handles_by_remote = {("eng", r, 16): 100 + r for r in range(pp_size)}
         w.dst_xfer_side_handles = {"eng": {r: 200 + r for r in range(pp_size)}}
         w._remote_agents = {"eng": {r: f"agent{r}" for r in range(pp_size)}}
@@ -515,8 +547,11 @@ class TestValidateRemoteAgentHandshake:
     @staticmethod
     def _consumer(*, num_layers=28, dst_num_blocks=8):
         # Full-model host-bounce consumer: num_regions = num_layers * 2 (K/V),
-        # so regions-per-layer = 2.
+        # so regions-per-layer = 2. host-bounce registers one logical region per
+        # layer (never the per-chiplet list), so the D2D region-pairing guard is
+        # a no-op here -- see TestD2DRegionPairing for that path.
         w = object.__new__(RblnNixlConnectorWorker)
+        w.use_host_buffer = True
         w.local_seen_layer_names = [f"l{i}" for i in range(num_layers)]
         w.num_regions = num_layers * 2
         w.block_len_per_layer = [64] * (num_layers * 2)
@@ -524,6 +559,7 @@ class TestValidateRemoteAgentHandshake:
         topo = MagicMock()
         topo.get_engine_info.return_value = MagicMock(remote_tp_size=1)
         topo.block_size_ratio.return_value = 1
+        topo.tp_ratio.return_value = 1   # equal P/D TP unless a test overrides
         w.transfer_topo = topo
         return w
 
@@ -559,10 +595,13 @@ class TestValidateRemoteAgentHandshake:
                 self._meta(pp_size=2, n_regions=58), remote_tp_size=1
             )
 
-    def test_pp_with_tp_raises(self):
+    def test_pp_with_larger_peer_tp_raises(self):
+        """PP no longer bars TP outright — a producer with FEWER TP ranks is
+        head-matched. Only the other direction is impossible."""
         w = self._consumer()
         w.transfer_topo.get_engine_info.return_value = MagicMock(remote_tp_size=2)
-        with pytest.raises(AssertionError, match="TP=1"):
+        w.transfer_topo.tp_ratio.return_value = -2
+        with pytest.raises(AssertionError, match="larger TP size"):
             w._validate_remote_agent_handshake(
                 self._meta(pp_size=2, n_regions=28), remote_tp_size=2
             )
@@ -591,6 +630,334 @@ class TestValidateRemoteAgentHandshake:
                 self._meta(pp_size=1, n_regions=56), remote_tp_size=1
             )
         base_val.assert_called_once()
+
+
+class TestHeadBandMatching:
+    """Pairing local and remote chiplet regions by KV head range.
+
+    On D2D a region is one chiplet area, so the heads are area-major and a peer
+    with a different TP degree lays them out differently. Position is therefore
+    the wrong key; these pin the two ways it goes wrong in practice.
+    """
+
+    @staticmethod
+    def _worker(*, tp_rank, tp_size, areas, slices, n_logical, block_len):
+        w = object.__new__(RblnNixlConnectorWorker)
+        w.tp_rank = tp_rank
+        w._kv_areas = areas
+        w._kv_slices = slices
+        w.block_len_per_layer = [block_len] * (n_logical * areas)
+        topo = MagicMock()
+        topo.tp_size = tp_size
+        topo.total_num_kv_heads = 8
+        w.transfer_topo = topo
+        w.get_backend_aware_kv_block_len = lambda layer_idx, **_: block_len
+        return w
+
+    @staticmethod
+    def _meta(*, areas, slices, n_logical, block_len, num_blocks=2, base=1000):
+        m = MagicMock()
+        m.kv_areas, m.kv_slices = areas, slices
+        m.num_blocks, m.device_id = num_blocks, 0
+        n = n_logical * areas
+        # Distinct, easily-read bases: region i starts at base * (i + 1).
+        m.kv_caches_base_addr = [base * (i + 1) for i in range(n)]
+        m.block_lens = [block_len] * n
+        return m
+
+    def test_slice_head_bounds(self):
+        # 8 KV heads on 4 chiplets. TP1: 2 heads per area, no replication.
+        # TP4: 2 heads per rank -> 1 per area, each held by 2 areas.
+        f = RblnNixlConnectorWorker._slice_head_bounds
+        assert f(0, 1, 8, 4, 4) == (0, 2)
+        assert f(0, 2, 8, 4, 4) == (0, 1)
+        assert f(1, 2, 8, 4, 4) == (4, 1)
+        assert f(0, 4, 8, 4, 2) == (0, 1)
+        assert f(2, 4, 8, 4, 2) == (4, 1)
+
+    def test_offset_into_coarser_remote_area(self):
+        """P TP1 -> D TP4: the peer's area holds 2 heads, we want one of them,
+        so half the descriptors start halfway into the remote area."""
+        w = self._worker(
+            tp_rank=0, tp_size=4, areas=4, slices=2, n_logical=1, block_len=256
+        )
+        meta = self._meta(areas=4, slices=4, n_logical=1, block_len=512)
+        out = w._build_head_matched_remote(meta, remote_tp_rank=0, remote_tp_size=1)
+        # local areas [h0, h0, h1, h1] -> remote area 0 (h0,h1) throughout;
+        # h1 sits at +256B inside it. 2 blocks each, stride = remote page 512.
+        assert [(a, ln) for a, ln, _ in out] == [
+            (1000, 256), (1512, 256),      # area0 -> remote area0 + 0
+            (1000, 256), (1512, 256),      # area1 (replica of h0) -> same
+            (1256, 256), (1768, 256),      # area2 -> remote area0 + 256
+            (1256, 256), (1768, 256),      # area3 (replica of h1) -> same
+        ]
+
+    def test_area_index_permutation_zero_offset(self):
+        """P TP2 -> D TP4: head widths match so the offset is 0, but local area
+        2 carries head 1, which is the peer's area 1 — not its area 2."""
+        w = self._worker(
+            tp_rank=0, tp_size=4, areas=4, slices=2, n_logical=1, block_len=256
+        )
+        meta = self._meta(areas=4, slices=4, n_logical=1, block_len=256)
+        out = w._build_head_matched_remote(meta, remote_tp_rank=0, remote_tp_size=2)
+        addrs = [a for a, _, _ in out]
+        # remote region bases are 1000/2000/3000/4000; block stride 256.
+        assert addrs == [
+            1000, 1256,   # local area0 (h0) -> remote area0
+            1000, 1256,   # local area1 (h0 replica) -> remote area0
+            2000, 2256,   # local area2 (h1) -> remote area1, NOT area2
+            2000, 2256,   # local area3 (h1 replica) -> remote area1
+        ]
+
+    def test_second_rank_reads_its_own_head_band(self):
+        """D TP4 rank 2 owns heads 4,5; against a TP2 peer those live on the
+        peer's rank 1, whose local slice numbering restarts at head 4."""
+        w = self._worker(
+            tp_rank=2, tp_size=4, areas=4, slices=2, n_logical=1, block_len=256
+        )
+        meta = self._meta(areas=4, slices=4, n_logical=1, block_len=256)
+        out = w._build_head_matched_remote(meta, remote_tp_rank=1, remote_tp_size=2)
+        assert [a for a, _, _ in out] == [1000, 1256, 1000, 1256,
+                                          2000, 2256, 2000, 2256]
+
+    def test_multiple_logical_regions_stay_layer_major(self):
+        """K and V of the same layer are separate logical regions; the mapping
+        must stay inside each one."""
+        w = self._worker(
+            tp_rank=0, tp_size=4, areas=4, slices=2, n_logical=2, block_len=256
+        )
+        meta = self._meta(areas=4, slices=4, n_logical=2, block_len=256, num_blocks=1)
+        out = w._build_head_matched_remote(meta, remote_tp_rank=0, remote_tp_size=2)
+        # logical region 0 -> remote regions 0..3, logical region 1 -> 4..7.
+        assert [a for a, _, _ in out] == [1000, 1000, 2000, 2000,
+                                          5000, 5000, 6000, 6000]
+
+    def test_peer_with_narrower_slice_splits_each_region(self):
+        """P TP2 -> D TP1: our area holds 2 heads, each of the peer's holds 1,
+        so every region is read in two half-length pieces from two different
+        remote regions -- block-major, piece-minor."""
+        w = self._worker(
+            tp_rank=0, tp_size=1, areas=4, slices=4, n_logical=1, block_len=512
+        )
+        meta = self._meta(
+            areas=4, slices=4, n_logical=1, block_len=256, num_blocks=2, base=1000
+        )
+        out = w._build_head_matched_remote(
+            meta, remote_tp_rank=0, remote_tp_size=2, peer_areas=[0, 1]
+        )
+        # 2 areas x 2 blocks x 2 pieces, every piece half of our 512B region.
+        assert len(out) == 8
+        assert {ln for _, ln, _ in out} == {256}
+        # Local area 0 = heads {0,1} -> peer regions 0 and 1 (bases 1000, 2000);
+        # area 1 = heads {2,3} -> peer regions 2 and 3 (3000, 4000). Remote page
+        # is 256B, so block 1 sits one page on.
+        assert [a for a, _, _ in out] == [
+            1000, 2000, 1256, 2256,   # area 0, blocks 0 and 1
+            3000, 4000, 3256, 4256,   # area 1
+        ]
+
+    def test_incommensurate_slices_raise(self):
+        # 3 heads per area against 2 does not divide; refuse rather than
+        # transfer a partial head.
+        with pytest.raises(RuntimeError, match="does not divide it"):
+            RblnNixlConnectorWorker._head_split(3, 2)
+
+    def test_head_split_is_one_unless_we_are_coarser(self):
+        f = RblnNixlConnectorWorker._head_split
+        assert f(1, 1) == 1  # equal granularity
+        assert f(1, 2) == 1  # peer coarser -> offset, not split
+        assert f(2, 1) == 2  # we are coarser -> two pieces
+        assert f(4, 1) == 4
+
+
+class TestFanInAreaPartition:
+    """Splitting our chiplet areas across a peer that has MORE TP ranks.
+
+    Our head band then lives on several producer ranks, so a transfer to any
+    one of them must carry exactly the areas whose heads that rank owns --
+    every area on exactly one peer. Reading an area from the wrong peer is
+    silent corruption, not an error, so these pin the partition itself.
+    """
+
+    @staticmethod
+    def _worker(*, tp_rank, tp_size, areas, slices, host_buffer=False):
+        w = object.__new__(RblnNixlConnectorWorker)
+        w.tp_rank = tp_rank
+        w._kv_areas = areas
+        w._kv_slices = slices
+        w.use_host_buffer = host_buffer
+        topo = MagicMock()
+        topo.tp_size = tp_size
+        topo.total_num_kv_heads = 8
+        topo.tp_ratio = lambda remote: (
+            tp_size // remote if tp_size >= remote else -(remote // tp_size)
+        )
+        w.transfer_topo = topo
+        return w
+
+    def test_peer_with_fewer_or_equal_tp_is_not_partitioned(self):
+        # tp_ratio > 0: the peer holds our whole band, so every area takes part
+        # and callers get None rather than an explicit list.
+        w = self._worker(tp_rank=0, tp_size=4, areas=4, slices=2)
+        assert w._fan_in_peer_areas(0, remote_tp_size=1) is None
+        assert w._fan_in_peer_areas(0, remote_tp_size=4) is None
+
+    def test_p4_to_d2_splits_areas_in_half(self):
+        """D TP2 rank 0 owns heads 0-3, one per area. P TP4 rank 0 owns heads
+        0-1, rank 1 owns 2-3 -- so areas {0,1} and {2,3}."""
+        w = self._worker(tp_rank=0, tp_size=2, areas=4, slices=4)
+        assert w._fan_in_peer_areas(0, remote_tp_size=4) == [0, 1]
+        assert w._fan_in_peer_areas(1, remote_tp_size=4) == [2, 3]
+
+    def test_p4_to_d2_second_decode_rank_reads_the_upper_peers(self):
+        # D TP2 rank 1 owns heads 4-7, which live on P TP4 ranks 2 and 3.
+        w = self._worker(tp_rank=1, tp_size=2, areas=4, slices=4)
+        assert w._fan_in_peer_areas(2, remote_tp_size=4) == [0, 1]
+        assert w._fan_in_peer_areas(3, remote_tp_size=4) == [2, 3]
+        # ...and nothing from the peers holding the other half.
+        assert w._fan_in_peer_areas(0, remote_tp_size=4) == []
+
+    def test_replicated_areas_follow_their_slice(self):
+        """D TP4 holds 2 heads over 2 slices, each replicated across 2 areas.
+        Both replicas of a slice must go to the same peer."""
+        w = self._worker(tp_rank=0, tp_size=4, areas=4, slices=2)
+        assert w._fan_in_peer_areas(0, remote_tp_size=8) == [0, 1]
+        assert w._fan_in_peer_areas(1, remote_tp_size=8) == [2, 3]
+
+    @pytest.mark.parametrize(
+        "tp_size,slices,remote_tp_size",
+        [(2, 4, 4), (1, 4, 2), (1, 4, 4), (4, 2, 8)],
+    )
+    def test_every_area_lands_on_exactly_one_peer(
+        self, tp_size, slices, remote_tp_size
+    ):
+        # The completeness property the descriptor lists depend on: no area
+        # read twice (last write wins, silently) and none dropped (stale KV).
+        w = self._worker(tp_rank=0, tp_size=tp_size, areas=4, slices=slices)
+        seen = [
+            area
+            for peer in range(remote_tp_size)
+            for area in (w._fan_in_peer_areas(peer, remote_tp_size) or [])
+        ]
+        assert sorted(seen) == [0, 1, 2, 3]
+
+    def test_area_straddling_two_peers_raises(self):
+        """P TP8 -> D TP1: an area holds heads {2a, 2a+1} but each peer owns a
+        single head, so the area would have to be split across two agents."""
+        w = self._worker(tp_rank=0, tp_size=1, areas=4, slices=4)
+        with pytest.raises(RuntimeError, match="straddle several"):
+            w._fan_in_peer_areas(0, remote_tp_size=8)
+
+    def test_host_bounce_never_fans_in(self):
+        # Host-bounce registers one logical full-shape buffer per layer, so
+        # upstream's model holds and base handles the whole engine.
+        w = self._worker(tp_rank=0, tp_size=2, areas=4, slices=4, host_buffer=True)
+        assert w._is_fan_in_peer(remote_tp_size=4) is False
+
+
+class TestShardRegionAreaFilter:
+    """`_shard_local_region_ids` narrows on two independent axes: a pipeline
+    stage's layers and a fan-in peer's chiplet areas."""
+
+    @staticmethod
+    def _worker(*, areas, n_layers):
+        w = object.__new__(RblnNixlConnectorWorker)
+        w._kv_areas = areas
+        # One K and one V region per layer, each expanded over `areas`.
+        w.num_regions = n_layers * 2 * areas
+        w.local_seen_layer_names = [f"l{i}" for i in range(n_layers)]
+        return w
+
+    def test_no_filter_keeps_every_region(self):
+        w = self._worker(areas=4, n_layers=2)
+        assert w._shard_local_region_ids(("l0", "l1")) == list(range(16))
+
+    def test_area_filter_keeps_those_areas_of_every_logical_region(self):
+        # Region ids are logical-major, area-minor: (layer * K/V) * areas + area.
+        # Keeping areas {0,1} keeps K and V of both layers at those offsets.
+        w = self._worker(areas=4, n_layers=2)
+        assert w._shard_local_region_ids(("l0", "l1"), peer_areas=[0, 1]) == [
+            0, 1, 4, 5, 8, 9, 12, 13
+        ]
+
+    def test_both_axes_compose(self):
+        # One pipeline stage (layer 1 only) AND one fan-in peer (areas {2,3}).
+        w = self._worker(areas=4, n_layers=2)
+        assert w._shard_local_region_ids(("l1",), peer_areas=[2, 3]) == [
+            10, 11, 14, 15
+        ]
+
+
+class TestD2DRegionPairing:
+    """D2D publishes one region PER CHIPLET AREA and pairs local region i with
+    remote region i positionally, so both sides must expand identically.
+
+    Two topologies break that silently and are rejected at handshake:
+    heterogeneous TP (upstream's rank_offset assumes the remote holds this
+    rank's heads contiguously in one region -- after chiplet expansion they are
+    area-major, so it reads the wrong heads while every numeric assert still
+    passes) and differing region counts. Host-bounce registers logical
+    full-shape buffers instead and is explicitly exempt."""
+
+    @staticmethod
+    def _worker(*, host_buffer, tp_ratio, n_local, tp_size=1, sw_ratio=None):
+        w = object.__new__(RblnNixlConnectorWorker)
+        w.use_host_buffer = host_buffer
+        w.block_len_per_layer = [64] * n_local
+        w._sw_ratio = sw_ratio
+        topo = MagicMock()
+        topo.tp_ratio.return_value = tp_ratio
+        topo.tp_size = tp_size
+        topo.get_engine_info.return_value = MagicMock(remote_tp_size=1)
+        topo.block_size_ratio.return_value = 1
+        w.transfer_topo = topo
+        return w
+
+    @staticmethod
+    def _meta(n_regions):
+        m = MagicMock()
+        m.pp_size = 1
+        m.engine_id = "eng"
+        m.kv_caches_base_addr = [1000 * i for i in range(n_regions)]
+        return m
+
+    def test_symmetric_tp_passes(self):
+        w = self._worker(host_buffer=False, tp_ratio=1, n_local=56)
+        w._check_d2d_region_pairing(self._meta(56), remote_tp_size=1)  # no raise
+
+    @pytest.mark.parametrize("tp_ratio", [2, 4])
+    def test_peer_with_fewer_tp_ranks_allowed(self, tp_ratio):
+        # Handled by _add_remote_agent_head_matched: the peer's regions carry
+        # wider head bands, matched by head range rather than by position.
+        w = self._worker(host_buffer=False, tp_ratio=tp_ratio, n_local=56, tp_size=4)
+        w._check_d2d_region_pairing(self._meta(56), remote_tp_size=1)  # no raise
+
+    def test_peer_with_more_tp_ranks_allowed(self):
+        # Fan-in: our head band is spread over several of the peer's ranks and
+        # _fan_in_peer_areas splits our chiplet areas between them. Whether an
+        # area straddles two peers depends on the measured chiplet geometry, so
+        # that bound is enforced there, not in this region-count check.
+        w = self._worker(host_buffer=False, tp_ratio=-2, n_local=56, tp_size=2)
+        w._check_d2d_region_pairing(self._meta(56), remote_tp_size=4)  # no raise
+
+    def test_heterogeneous_tp_with_swa_view_opt_raises(self):
+        # The SWA two-descriptor-range layout and head matching are not combined.
+        w = self._worker(
+            host_buffer=False, tp_ratio=2, n_local=56, tp_size=2, sw_ratio=4
+        )
+        with pytest.raises(RuntimeError, match="sliding-window view-opt"):
+            w._check_d2d_region_pairing(self._meta(56), remote_tp_size=1)
+
+    def test_region_count_mismatch_raises(self):
+        w = self._worker(host_buffer=False, tp_ratio=1, n_local=56)
+        with pytest.raises(RuntimeError, match="advertises 28 KV regions"):
+            w._check_d2d_region_pairing(self._meta(28), remote_tp_size=1)
+
+    @pytest.mark.parametrize("tp_ratio,n_remote", [(2, 56), (1, 28)])
+    def test_host_bounce_exempt(self, tp_ratio, n_remote):
+        # Verified working over kv_buffer_device=cpu for both shapes.
+        w = self._worker(host_buffer=True, tp_ratio=tp_ratio, n_local=56)
+        w._check_d2d_region_pairing(self._meta(n_remote), remote_tp_size=1)
 
 
 class TestPpConstraints:
@@ -649,7 +1016,7 @@ class TestPublishPpHandshakeMetadata:
             physical_blocks_per_logical_kv_block=1,
         )
 
-    def _publish(self, *, pp_rank, pp_size, layer_names):
+    def _publish(self, *, pp_rank, pp_size, layer_names, areas=1, slices=1):
         w = object.__new__(RblnNixlConnectorWorker)
         w.compat_hash = "BASE"
         # _check_pp_constraints reads these; a plain PP producer passes.
@@ -659,12 +1026,29 @@ class TestPublishPpHandshakeMetadata:
         w.transfer_topo.cross_layers_blocks = False
         w._has_mamba = False
         w._sw_ratio = None
+        # Chiplet geometry travels with the metadata so a consumer with a
+        # different TP degree can match head bands. Defaults are host-bounce's
+        # permanent values (one logical region, never expanded per area).
+        w._kv_areas = areas
+        w._kv_slices = slices
         pp_group = MagicMock()
         pp_group.rank_in_group = pp_rank
         pp_group.world_size = pp_size
         with patch.object(W, "get_pp_group", return_value=pp_group):
             w._publish_pp_handshake_metadata(self._base_meta(), layer_names)
         return w
+
+    def test_advertises_chiplet_geometry(self):
+        """Head-band matching on the consumer needs the producer's areas/slices;
+        they cannot be derived from the address list without assuming exactly
+        two regions per layer."""
+        w = self._publish(
+            pp_rank=0, pp_size=1, layer_names=["l0"], areas=4, slices=2
+        )
+        decoded = msgspec.msgpack.Decoder(RblnNixlAgentMetadata).decode(
+            w.xfer_handshake_metadata.agent_metadata_bytes
+        )
+        assert (decoded.kv_areas, decoded.kv_slices) == (4, 2)
 
     def test_wraps_base_and_folds_compat(self):
         w = self._publish(pp_rank=1, pp_size=2, layer_names=["l7", "l8"])

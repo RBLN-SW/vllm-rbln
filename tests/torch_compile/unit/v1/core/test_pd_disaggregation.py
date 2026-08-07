@@ -1798,16 +1798,22 @@ def _remote_agent_meta():
 
 
 class TestRblnNixlConnectorWorkerAddRemoteAgent:
-    """`add_remote_agent` 0.22 surface: `_sw_ratio is None` delegates to
-    upstream; the SWA path must register the remote engine in the
-    TransferTopology and build its TPMapping BEFORE any topology lookup
-    (the 0.22 handshake prelude — omitting it raised KeyError at runtime)."""
+    """`add_remote_agent` 0.22 surface: with no SWA view-opt and equal P/D TP
+    it delegates to upstream; the SWA path must register the remote engine in
+    the TransferTopology and build its TPMapping BEFORE any topology lookup
+    (the 0.22 handshake prelude — omitting it raised KeyError at runtime).
 
-    def test_sw_ratio_none_delegates_to_super(self):
+    A peer with fewer TP ranks takes neither route — see
+    `TestHeadBandMatching` in test_rbln_nixl_handshake_pp.py."""
+
+    def test_sw_ratio_none_and_equal_tp_delegates_to_super(self):
         from unittest.mock import patch
 
         worker = _build_connector_worker()  # _sw_ratio is None
         assert worker._sw_ratio is None
+        # Equal P/D TP: local region i IS remote region i, upstream's model.
+        worker.transfer_topo = MagicMock()
+        worker.transfer_topo.tp_ratio.return_value = 1
         meta = _remote_agent_meta()
         base = type(worker).__mro__[1]
         with patch.object(
