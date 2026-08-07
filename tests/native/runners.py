@@ -17,13 +17,17 @@ import lazily from a fixture (after pytest_configure sets the env)."""
 
 from __future__ import annotations
 
+import asyncio
 import gc
+from dataclasses import dataclass
 from typing import Any
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from vllm import LLM, SamplingParams
 from vllm.distributed import cleanup_dist_env_and_memory
+from vllm.engine.arg_utils import AsyncEngineArgs
+from vllm.v1.engine.async_llm import AsyncLLM
 
 # RBLN requires an explicit block_size; the rest are the known-good native config
 # for these small models (chunked prefill, small batch/token budget).
@@ -88,6 +92,107 @@ class VllmRunner:
         # suppressed, since a failed shutdown would leak the device silently.
         self.llm.llm_engine.engine_core.shutdown()
         del self.llm
+        torch._dynamo.reset()
+        cleanup_dist_env_and_memory()
+
+
+@dataclass(frozen=True)
+class DPRequest:
+    """One request; ``dp_rank=None`` leaves placement to the engine's load
+    balancer, an int pins it to that rank so a test's load is a known quantity."""
+
+    prompt: str
+    max_tokens: int
+    dp_rank: int | None = None
+
+
+async def _build_async_engine(args: AsyncEngineArgs) -> AsyncLLM:
+    # Synchronous work in a coroutine on purpose: AsyncLLM starts its output
+    # handler eagerly only when a loop is already running, and it has to be this
+    # runner's loop.
+    return AsyncLLM.from_engine_args(args)
+
+
+class AsyncVllmRunner:
+    """System under test for data parallel: ``AsyncLLM`` with the native RBLN
+    config; kwargs override, same as VllmRunner.
+
+    Not VllmRunner because the sync ``LLM`` rejects ``data_parallel_size > 1`` --
+    the internal-load-balancing engine client only exists on the async side
+    (``make_async_mp_client`` -> ``DPLBAsyncMPClient``). vLLM then owns rank
+    assignment, the DP master port, the coordinator and the liveness monitor.
+    """
+
+    def __init__(
+        self, model: str, *, request_timeout_s: float = 600.0, **kwargs
+    ) -> None:
+        self.request_timeout_s = request_timeout_s
+        args = AsyncEngineArgs(model=model, **{**_RBLN_RUNNER_DEFAULTS, **kwargs})
+        # One loop for the runner's lifetime; a fresh asyncio.run() per call would
+        # orphan the engine's output handler on a closed loop.
+        self._loop = asyncio.new_event_loop()
+        self.engine = self._loop.run_until_complete(_build_async_engine(args))
+
+    def generate_greedy(self, requests: list[DPRequest]) -> list[tuple[list[int], str]]:
+        """Run every request concurrently, returning results in the order given.
+        Concurrency is the point: DP ranks only interact while more than one of
+        them has -- or pointedly does not have -- work."""
+        return self._loop.run_until_complete(self._generate_all(requests))
+
+    async def _generate_all(self, requests: list[DPRequest]) -> list[Any]:
+        # gather() must be built inside the loop, or its futures attach to
+        # whatever loop asyncio considers current.
+        return list(
+            await asyncio.gather(
+                *(self._generate_one(i, req) for i, req in enumerate(requests))
+            )
+        )
+
+    async def _generate_one(
+        self, index: int, request: DPRequest
+    ) -> tuple[list[int], str]:
+        params = SamplingParams(temperature=0.0, max_tokens=request.max_tokens)
+        stream = self.engine.generate(
+            request.prompt,
+            params,
+            request_id=f"dp-req-{index}",
+            data_parallel_rank=request.dp_rank,
+        )
+
+        async def drain() -> Any:
+            final = None
+            async for output in stream:
+                final = output
+            return final
+
+        # A bound, not a budget: a rank stalled in a collective would otherwise
+        # hang the session. Startup has its own (VLLM_ENGINE_READY_TIMEOUT_S).
+        try:
+            final = await asyncio.wait_for(drain(), timeout=self.request_timeout_s)
+        except TimeoutError as exc:
+            raise TimeoutError(
+                f"request {index} (dp_rank={request.dp_rank}) did not finish "
+                f"within {self.request_timeout_s}s"
+            ) from exc
+
+        assert final is not None, (
+            f"request {index} (dp_rank={request.dp_rank}): the engine closed the "
+            f"stream without producing any output"
+        )
+        completion = final.outputs[0]
+        return list(completion.token_ids), completion.text
+
+    def __enter__(self) -> AsyncVllmRunner:
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        # Reaps every DP engine core, not just rank 0's. Not suppressed: a failed
+        # shutdown would leak the whole DP group of devices silently.
+        self.engine.shutdown()
+        # Let the cancelled output handler settle, or it is "destroyed but pending".
+        self._loop.run_until_complete(asyncio.sleep(0))
+        self._loop.close()
+        del self.engine
         torch._dynamo.reset()
         cleanup_dist_env_and_memory()
 
