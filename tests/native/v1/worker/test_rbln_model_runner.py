@@ -41,6 +41,7 @@ from vllm_rbln.v1.worker.rbln_model_runner import (
     _depad_sampler_output,
     _pad_rows,
     _pad_sampling_metadata,
+    _step_is_prefill,
 )
 
 
@@ -176,26 +177,44 @@ class TestPadDepad:
         assert _depad_sampler_output(out, 2).sampled_token_ids.shape == (2, 1)
 
 
+def _sched_out(num_scheduled_tokens, spec=None):
+    return SimpleNamespace(
+        num_scheduled_tokens=num_scheduled_tokens,
+        scheduled_spec_decode_tokens=spec or {},
+    )
+
+
+class TestStepIsPrefill:
+    # The step phase is the query length: >1 non-draft token per request.
+    def test_decode_step(self):
+        assert _step_is_prefill(_sched_out({"a": 1, "b": 1})) is False
+
+    def test_prefill_chunk(self):
+        assert _step_is_prefill(_sched_out({"a": 512})) is True
+
+    def test_single_token_prefill_chunk_is_decode_shaped(self):
+        assert _step_is_prefill(_sched_out({"a": 1})) is False
+
+    def test_spec_decode_drafts_do_not_inflate_the_phase(self):
+        # 1 base + 4 drafts is still a decode-shaped step.
+        out = _sched_out({"a": 5}, spec={"a": [1, 2, 3, 4]})
+        assert _step_is_prefill(out) is False
+
+    def test_empty_step(self):
+        assert _step_is_prefill(_sched_out({})) is False
+
+
 class TestPredicates:
-    def test_is_prefill_boundary(self):
-        # is_prefill: num_computed < num_tokens_no_spec - 1 (request 0).
-        r = _make_runner_stub(
-            input_batch=SimpleNamespace(
-                num_computed_tokens_cpu=np.array([3]),
-                num_tokens_no_spec=np.array([10]),
-            )
-        )
+    def test_is_prefill_returns_the_stamped_phase(self):
+        r = _make_runner_stub(_is_prefill_step=True)
         assert r.is_prefill is True
-        r.input_batch.num_computed_tokens_cpu = np.array([9])
+        r._is_prefill_step = False
         assert r.is_prefill is False
 
     def test_is_intermediate_chunked_prefill(self):
         # is_prefill AND discard_request_mask[0].
         r = _make_runner_stub(
-            input_batch=SimpleNamespace(
-                num_computed_tokens_cpu=np.array([3]),
-                num_tokens_no_spec=np.array([10]),
-            ),
+            _is_prefill_step=True,
             discard_request_mask=np.array([True]),
         )
         assert r.is_intermediate_chunked_prefill is True
@@ -319,20 +338,16 @@ class TestGetSupportedTasks:
 
 class TestDetermineBatchPadding:
     # data_parallel_size == 1 is the covered path (multi-DP needs RBLNDPMetadata
-    # collectives -> e2e). is_prefill is driven via the input_batch stub.
+    # collectives -> e2e).
     @staticmethod
     def _runner(*, is_prefill, bucket=8):
-        computed = 0 if is_prefill else 9
         return _make_runner_stub(
             bucketing_manager=SimpleNamespace(
                 find_decode_batch_bucket=lambda n: bucket
             ),
             parallel_config=SimpleNamespace(data_parallel_size=1),
             specialized_moe_decode=False,
-            input_batch=SimpleNamespace(
-                num_computed_tokens_cpu=np.array([computed]),
-                num_tokens_no_spec=np.array([10]),
-            ),
+            _is_prefill_step=is_prefill,
         )
 
     def test_decode_pads_to_bucket(self):
@@ -403,6 +418,8 @@ class TestDummyRunPadding:
             # use_wrapped_compute_logits is a property over this.
             is_pooling_model=True,
             speculative_config=None,
+            # Gates the drafter dummy run; __init__ always sets it.
+            drafter=None,
             kv_cache_bases=None,
             vllm_config=None,
             input_stager=SimpleNamespace(stage=stage),

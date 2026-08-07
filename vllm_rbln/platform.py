@@ -299,6 +299,19 @@ class RblnPlatform(Platform):
                 "vllm_rbln.v1.core.rbln_scheduler.RBLNScheduler"
             )
 
+            # NOTE(RBLN): max_num_seqs stays the cap on concurrently running
+            # sequences, as upstream. Under PP the engine keeps one microbatch
+            # in flight per stage, so the decode batch RBLN compiles for one
+            # stage is max_num_seqs // pipeline_parallel_size. Reject a config
+            # that floors that to 0 here rather than in bucketing.
+            pp_size = parallel_config.pipeline_parallel_size
+            if pp_size > 1 and scheduler_config.max_num_seqs < pp_size:
+                raise ValueError(
+                    f"pipeline_parallel_size={pp_size} requires max_num_seqs >= "
+                    f"{pp_size} (got {scheduler_config.max_num_seqs}); "
+                    "per-stage decode batch would floor to 0."
+                )
+
             # FIXME(jiwoo.park) This is a temporary workaround.
             if model_config.enforce_eager:
                 if not USE_DEVICE_TENSOR:

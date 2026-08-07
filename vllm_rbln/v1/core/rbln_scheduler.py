@@ -23,7 +23,11 @@ from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_utils import init_none_hash
 from vllm.v1.core.sched.interface import PauseState
-from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
+from vllm.v1.core.sched.output import (
+    CachedRequestData,
+    NewRequestData,
+    SchedulerOutput,
+)
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutputs
@@ -52,6 +56,95 @@ class RBLNSchedulerOutput(SchedulerOutput):
 
 def is_prefill(request: Request) -> bool:
     return request.num_computed_tokens < request.num_tokens - 1
+
+
+def num_base_tokens(
+    num_scheduled_tokens: dict[str, int],
+    scheduled_spec_decode_tokens: dict[str, list[int]],
+    req_id: str,
+) -> int:
+    """Non-draft tokens a step computes for ``req_id``: scheduled minus drafts.
+
+    These are the tokens that advance the request's committed sequence, as
+    opposed to the unverified drafts. The scheduler sizes the PP token payload
+    by this and the runner writes by it, so both must derive it identically.
+    """
+    return num_scheduled_tokens.get(req_id, 0) - len(
+        scheduled_spec_decode_tokens.get(req_id, ())
+    )
+
+
+def resolve_propagated_token_write(
+    cursor: int,
+    num_computed_tokens: int,
+    base: int,
+    new_token_ids: list[int],
+) -> tuple[int, list[int]] | None:
+    """Plan a non-last PP rank's write of the scheduler-propagated tokens.
+
+    Returns ``(committed_tip, tokens)`` for
+    ``token_ids_cpu[cursor:committed_tip] = tokens``, or ``None`` if the cursor
+    already reached the tip.
+
+    ``cursor`` is how far this rank has recorded, ``num_computed_tokens + base``
+    how far it should be. The payload ends at the tip and reaches further back
+    (see _make_cached_request_data), so the slice starts at the offset landing
+    on ``cursor``; too short a payload means the rank fell more than
+    num_spec_tokens behind, which would otherwise be an opaque broadcast error.
+    """
+    committed_tip = num_computed_tokens + base
+    if committed_tip <= cursor:
+        return None
+    lo = cursor - (committed_tip - len(new_token_ids))
+    assert lo >= 0, (
+        f"propagated payload ({len(new_token_ids)}) is shorter than the write "
+        f"span ({committed_tip - cursor}): a non-last PP rank lags "
+        "num_computed_tokens by more than num_spec_tokens."
+    )
+    return committed_tip, new_token_ids[lo:]
+
+
+def should_defer_spec_step(
+    num_spec_tokens: int,
+    spec_token_ids: list[int],
+    num_new_tokens: int,
+) -> bool:
+    """Whether to skip a speculative step whose drafts have no anchor token.
+
+    Takes the RAW ``num_new_tokens``, before the caps. Drafts are verified
+    against the last committed token the step computes, and there are
+    ``num_new_tokens - len(spec_token_ids)`` of those -- normally 1.
+
+    PP schedules the next step while one is still in flight, so
+    ``num_computed_tokens`` already covers the anchor while the token it will
+    produce is still missing, dropping that count to 0. Without drafts this
+    surfaces as ``num_new_tokens == 0`` and the caller skips the request;
+    drafts inflate the count and hide the signal.
+
+    Scheduling such a step is unrecoverable, not merely wasteful: with nothing
+    to verify the model returns no tokens, so ``update_from_output`` skips the
+    rejection rollback that would undo ``_update_after_schedule``'s advance --
+    and only a non-empty step can run that rollback. Skipping instead leaves
+    the request untouched for the next step.
+    """
+    if num_spec_tokens <= 0:
+        return False
+    if spec_token_ids:
+        return num_new_tokens - len(spec_token_ids) <= 0
+    # No drafts, so the count above is num_new_tokens itself; 0 is the
+    # caller's ordinary "nothing to do this step".
+    return num_new_tokens < 0
+
+
+def decode_batch_size(max_num_seqs: int, pipeline_parallel_size: int) -> int:
+    """Per-PP-stage decode batch size -- the shape the runner compiles for.
+
+    Under pipeline parallelism the engine keeps one microbatch in flight per
+    stage, so a single step's decode batch gets max_num_seqs // pp_size of the
+    concurrency budget. The scheduler caps admissions at this and the runner
+    buckets to it; they must agree or a scheduled batch has no compiled bucket.
+    """
+    return max_num_seqs // pipeline_parallel_size
 
 
 class RBLNScheduler(Scheduler):
@@ -115,6 +208,13 @@ class RBLNScheduler(Scheduler):
         # lifecycle hooks clear its pending delta before it can resume with
         # a full block table.
         self._pending_runner_block_deltas: dict[str, KVCacheBlocks] = {}
+
+        # NOTE(RBLN): Cap on one step's decode batch, shared by the running
+        # and waiting loops.
+        self.max_decode_batch = decode_batch_size(
+            self.max_num_running_reqs,
+            self.vllm_config.parallel_config.pipeline_parallel_size,
+        )
 
     def _add_pending_runner_block_delta(
         self,
@@ -185,6 +285,9 @@ class RBLNScheduler(Scheduler):
 
         self.kv_cache_manager.new_step_starts()
 
+        # Decode requests admitted to this step, against self.max_decode_batch.
+        num_decode_reqs = 0
+
         # First, schedule the RUNNING requests.
         # NOTE(RBLN): Prioritize prefill requests. Given our constraint that the prefill
         # batch size fixed to 1 if any prefill request is running there must be exactly
@@ -218,6 +321,14 @@ class RBLNScheduler(Scheduler):
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
+            # NOTE(RBLN): raw count only. The caps below shrink num_new_tokens
+            # without shrinking spec_token_ids, so the anchor count this reads
+            # would come out short and defer healthy steps.
+            if should_defer_spec_step(
+                self.num_spec_tokens, request.spec_token_ids, num_new_tokens
+            ):
+                req_index += 1
+                continue
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
             num_new_tokens = min(num_new_tokens, token_budget)
@@ -269,7 +380,7 @@ class RBLNScheduler(Scheduler):
                         unsafe_backfill_req_ids.add(request.request_id)
                         num_new_tokens = 1
 
-            if num_new_tokens <= 0:
+            if num_new_tokens == 0:
                 # The request cannot be scheduled because one of the following
                 # reasons:
                 # 1. No new tokens to schedule. This may happen when
@@ -281,8 +392,6 @@ class RBLNScheduler(Scheduler):
                 # 3. The encoder cache is exhausted.
                 # 4. Insufficient budget for a block-aligned chunk in hybrid
                 #    models with mamba cache mode \"align\".
-                # 5. (RBLN) Speculative decoding left num_computed_tokens ahead
-                #    of num_tokens_with_spec, so there is nothing to schedule.
                 # NOTE(woosuk): Here, by doing `continue` instead of `break`,
                 # we do not strictly follow the FCFS scheduling policy and
                 # allow the lower-priority requests to be scheduled.
@@ -315,6 +424,7 @@ class RBLNScheduler(Scheduler):
                         if preempted_req in scheduled_running_reqs:
                             preempted_req_id = preempted_req.request_id
                             scheduled_running_reqs.remove(preempted_req)
+                            num_decode_reqs -= 1
                             token_budget += num_scheduled_tokens.pop(preempted_req_id)
                             req_to_new_blocks.pop(preempted_req_id)
                             scheduled_spec_decode_tokens.pop(preempted_req_id, None)
@@ -345,6 +455,7 @@ class RBLNScheduler(Scheduler):
 
             # Schedule the request.
             scheduled_running_reqs.append(request)
+            num_decode_reqs += 1
             request_id = request.request_id
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
@@ -387,10 +498,7 @@ class RBLNScheduler(Scheduler):
             # NOTE(RBLN): We restrict the decode batch size to
             # (max_num_seqs // pipeline_parallel_size) to prevent pipeline
             # bubbles.
-            if len(scheduled_running_reqs) >= (
-                self.max_num_running_reqs
-                // self.vllm_config.parallel_config.pipeline_parallel_size
-            ):
+            if num_decode_reqs >= self.max_decode_batch:
                 break
 
         # Record the LoRAs in scheduled_running_reqs
@@ -538,6 +646,19 @@ class RBLNScheduler(Scheduler):
                     assert num_external_computed_tokens > 0
                     num_new_tokens = 0
                 else:
+                    # NOTE(RBLN): A request whose prefix is already fully
+                    # computed joins this step's decode batch below instead of
+                    # running a prefill, bypassing the running loop's cap. Check
+                    # it here -- before allocating anything -- so the request
+                    # just stays in the waiting queue for a later step. This is
+                    # `not is_prefill(request)` on the final num_computed_tokens
+                    # (set on the request at the `self.running.append` below).
+                    if (
+                        num_computed_tokens >= request.num_tokens - 1
+                        and num_decode_reqs >= self.max_decode_batch
+                    ):
+                        break
+
                     # Number of tokens to be scheduled.
                     # We use `request.num_tokens` instead of
                     # `request.num_prompt_tokens` to consider the resumed
@@ -762,6 +883,10 @@ class RBLNScheduler(Scheduler):
                         f"decode-ready request {request_id} has "
                         f"num_new_tokens={num_new_tokens} (expected 1)."
                     )
+                    # The cap is checked before allocation -- by here the
+                    # request is already popped, allocated, and appended to
+                    # self.running.
+                    num_decode_reqs += 1
                     # NOTE(RBLN): This path skips the running-loop backfill guard.
                     # A decode-ready req enters as a single-token decode (new_n==1,
                     # asserted above) that the runner backfills to num_spec+1; if the
@@ -798,6 +923,7 @@ class RBLNScheduler(Scheduler):
                     self._add_pending_runner_block_delta(req.request_id, evicted_delta)
 
                 scheduled_running_reqs.clear()
+                num_decode_reqs = 0
                 token_budget = prefill_token_budget
 
                 # NOTE(RBLN): we restrict the prefill batch size to 1 for now.
@@ -998,6 +1124,44 @@ class RBLNScheduler(Scheduler):
                 )
 
         return result
+
+    def _make_cached_request_data(
+        self,
+        running_reqs: list[Request],
+        resumed_reqs: list[Request],
+        num_scheduled_tokens: dict[str, int],
+        spec_decode_tokens: dict[str, list[int]],
+        req_to_new_blocks: dict[str, KVCacheBlocks],
+    ) -> CachedRequestData:
+        data = super()._make_cached_request_data(
+            running_reqs,
+            resumed_reqs,
+            num_scheduled_tokens,
+            spec_decode_tokens,
+            req_to_new_blocks,
+        )
+        # NOTE(RBLN): non-last PP ranks replay committed tokens from this
+        # payload. The base sizes it from num_computed, which suffices upstream
+        # because nothing reads further back -- but RBLN's fixed decode shape
+        # backfills past tokens, and a verify that accepted drafts leaves the
+        # write cursor up to num_spec_tokens behind, so that range still holds
+        # the previous occupant of the row. Widen the window backward; the
+        # runner writes it by absolute position.
+        if (
+            self.use_pp
+            and not self.scheduler_config.async_scheduling
+            and self.num_spec_tokens > 0
+            and data.new_token_ids
+        ):
+            for idx, req in enumerate(itertools.chain(running_reqs, resumed_reqs)):
+                if idx >= len(data.new_token_ids):
+                    break
+                req_id = req.request_id
+                base = num_base_tokens(num_scheduled_tokens, spec_decode_tokens, req_id)
+                lo = max(0, req.num_computed_tokens - self.num_spec_tokens)
+                hi = req.num_computed_tokens + base
+                data.new_token_ids[idx] = req.all_token_ids[lo:hi]
+        return data
 
     def _try_sub_block_match(
         self,

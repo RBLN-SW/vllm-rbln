@@ -38,8 +38,75 @@ from vllm_rbln.v1.core.rbln_kv_cache_manager import RBLNKVCacheManager
 from vllm_rbln.v1.core.rbln_scheduler import (
     RBLNScheduler,
     RBLNSchedulerOutput,
+    decode_batch_size,
     is_prefill,
+    num_base_tokens,
+    resolve_propagated_token_write,
+    should_defer_spec_step,
 )
+
+
+class TestNumBaseTokens:
+    def test_subtracts_the_drafts(self):
+        assert num_base_tokens({"a": 5}, {"a": [1, 2, 3, 4]}, "a") == 1
+
+    def test_no_drafts(self):
+        assert num_base_tokens({"a": 3}, {}, "a") == 3
+
+    def test_unscheduled_request(self):
+        assert num_base_tokens({}, {}, "a") == 0
+
+
+class TestResolvePropagatedTokenWrite:
+    # The payload reaches back past the tip, so the slice is picked by position.
+    def test_plain_decode_writes_the_newest_token(self):
+        # Payload covers [16, 21); only position 20 is missing.
+        got = resolve_propagated_token_write(20, 20, 1, [16, 17, 18, 19, 20])
+        assert got == (21, [20])
+
+    def test_multi_accept_lag_fills_the_gap(self):
+        # A prior verify accepted 2, so the cursor sits 2 behind num_computed.
+        got = resolve_propagated_token_write(18, 20, 1, [16, 17, 18, 19, 20])
+        assert got == (21, [18, 19, 20])
+
+    def test_nothing_to_write_when_cursor_is_at_the_tip(self):
+        assert resolve_propagated_token_write(21, 20, 1, [19, 20]) is None
+
+    def test_payload_shorter_than_the_span_asserts(self):
+        # Cursor 15 needs [15, 21) but the payload only reaches back to 19.
+        with pytest.raises(AssertionError, match="shorter than the write span"):
+            resolve_propagated_token_write(15, 20, 1, [19, 20])
+
+
+class TestDecodeBatchSize:
+    def test_splits_across_pp_stages(self):
+        assert decode_batch_size(8, 2) == 4
+
+    def test_pp1_is_identity(self):
+        assert decode_batch_size(8, 1) == 8
+
+    def test_floors(self):
+        assert decode_batch_size(7, 2) == 3
+
+
+class TestShouldDeferSpecStep:
+    # Deferring leaves num_computed_tokens intact; scheduling does not.
+    def test_inert_when_spec_is_off(self):
+        assert should_defer_spec_step(0, [], -5) is False
+
+    def test_drafts_held_defers_without_an_anchor(self):
+        # 2 scheduled, both drafts -> no committed token to verify against.
+        assert should_defer_spec_step(4, [1, 2], 2) is True
+
+    def test_drafts_held_admits_with_an_anchor(self):
+        # 3 scheduled, 2 drafts -> one committed token leads them.
+        assert should_defer_spec_step(4, [1, 2], 3) is False
+
+    def test_no_drafts_defers_only_on_negative(self):
+        assert should_defer_spec_step(4, [], -1) is True
+        # 0 is the caller's ordinary "nothing to do this step".
+        assert should_defer_spec_step(4, [], 0) is False
+        assert should_defer_spec_step(4, [], 1) is False
 
 
 class TestSchedulerInit:
@@ -298,6 +365,32 @@ class TestScheduleDecodeBatchLimit:
         out = sched.schedule()
         # cap = max_num_seqs // pp = 2.
         assert len(out.num_scheduled_tokens) == 2
+
+    def test_waiting_decode_ready_join_respects_pipeline_parallel_cap(self):
+        # A full prefix-cache match joins the decode batch straight from the
+        # waiting queue, bypassing the running loop -- it must still be capped,
+        # or the combined batch overflows the compiled decode bucket.
+        sched = create_rbln_scheduler(
+            max_num_seqs=4,
+            pipeline_parallel_size=2,
+            enable_prefix_caching=True,
+            block_size=16,
+            num_blocks=10000,
+        )
+        for req in (
+            make_request("A", list(range(16)), 16, max_tokens=50),
+            make_request("B", list(range(100, 116)), 16, max_tokens=50),
+        ):
+            advance_to_decode(sched, req)
+        assert len(sched.running) == 2
+
+        # C matches A's cached 16-token block, so it is decode-ready on arrival.
+        c = make_request("C", list(range(16)) + [999], 16, max_tokens=50)
+        sched.add_request(c)
+        out = sched.schedule()
+
+        assert len(out.num_scheduled_tokens) == 2
+        assert c.request_id not in out.num_scheduled_tokens
 
 
 class TestSchedulePrefillAllocation:

@@ -214,7 +214,8 @@ class TestModelParallelSideEffect:
         [
             dict(data_parallel_size=2),
             dict(tensor_parallel_size=2),
-            dict(pipeline_parallel_size=2),
+            # PP needs one decode slot per stage, so the default 1 is rejected.
+            dict(pipeline_parallel_size=2, max_num_seqs=2),
             dict(ep=True),
         ],
         ids=["dp", "tp", "pp", "ep"],

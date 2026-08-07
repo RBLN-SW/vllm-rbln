@@ -122,7 +122,12 @@ from vllm_rbln.v1.attention.kv_cache_bindings import (
     validate_shared_attention_kv_cache_contiguity,
 )
 from vllm_rbln.v1.core.rbln_kv_cache_manager import KVCacheCopyOp
-from vllm_rbln.v1.core.rbln_scheduler import RBLNSchedulerOutput
+from vllm_rbln.v1.core.rbln_scheduler import (
+    RBLNSchedulerOutput,
+    decode_batch_size,
+    num_base_tokens,
+    resolve_propagated_token_write,
+)
 from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
@@ -143,6 +148,30 @@ logger = init_logger(__name__)
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 PerLayerAttnMetadata: TypeAlias = AttnMetadataDict  #  | list[AttnMetadataDict]
+
+
+def _step_is_prefill(scheduler_output: RBLNSchedulerOutput) -> bool:
+    """Whether a step runs the prefill graph: more than one non-draft token
+    per request.
+
+    RBLN picks between two compiled graphs by shape, so query length is the
+    classification -- the same split upstream makes on ``query_lens`` -- minus
+    the drafts, which pad a decode query out to num_spec + 1. Reading the
+    scheduler output rather than input_batch is what keeps every PP rank on the
+    same graph.
+
+    A step is never mixed, so any() gives its phase; if that ever breaks this
+    errs toward prefill, which can still process a single-token query.
+    """
+    return any(
+        num_base_tokens(
+            scheduler_output.num_scheduled_tokens,
+            scheduler_output.scheduled_spec_decode_tokens,
+            req_id,
+        )
+        > 1
+        for req_id in scheduler_output.num_scheduled_tokens
+    )
 
 
 def _copy_pooler_output(
@@ -219,6 +248,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self.speculative_config = vllm_config.speculative_config
         # self.observability_config = vllm_config.observability_config
 
+        # Backing field for the is_prefill property.
+        self._is_prefill_step: bool = False
+
         model_config = self.model_config
         cache_config = self.cache_config
         scheduler_config = self.scheduler_config
@@ -284,13 +316,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # Set up speculative decoding.
         # NOTE(Jiayi): We put the entire draft model on the last PP rank.
         # This is not ideal if there are many layers in the draft model.
+        self.drafter: (
+            RBLNEagleProposer
+            | RBLNMedusaProposer
+            | NgramProposer
+            | SuffixDecodingProposer
+            | None
+        ) = None
         if self.speculative_config and get_pp_group().is_last_rank:
-            self.drafter: (
-                RBLNEagleProposer
-                | RBLNMedusaProposer
-                | NgramProposer
-                | SuffixDecodingProposer
-            )
             if self.speculative_config.method == "ngram":
                 self.drafter = NgramProposer(self.vllm_config)
             elif self.speculative_config.method == "suffix":
@@ -409,7 +442,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # NOTE(RBLN): Initialize bucketing manager
         self.bucketing_manager = get_bucketing_manager(
             envs.VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY,
-            max_batch_size=self.max_num_reqs,
+            max_batch_size=decode_batch_size(
+                self.max_num_reqs, parallel_config.pipeline_parallel_size
+            ),
             min_batch_size=envs.VLLM_RBLN_DECODE_BATCH_BUCKET_MIN,
             step=envs.VLLM_RBLN_DECODE_BATCH_BUCKET_STEP,
             limit=envs.VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT,
@@ -618,9 +653,16 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 new_token_ids = req_data.new_token_ids[i]
                 # Add the sampled token(s) from the previous step (if any).
                 # This doesn't include "unverified" tokens like spec tokens.
-                num_new_tokens = (
-                    num_computed_tokens + len(new_token_ids) - req_state.num_tokens
+                # NOTE(RBLN): the payload reaches further back than the newly
+                # committed tokens (see _make_cached_request_data), so its length
+                # overstates the delta -- use `base`. The slice below still lands
+                # on the newest tokens because the payload ends at the tip.
+                base = num_base_tokens(
+                    scheduler_output.num_scheduled_tokens,
+                    scheduled_spec_tokens,
+                    req_id,
                 )
+                num_new_tokens = num_computed_tokens + base - req_state.num_tokens
                 if num_new_tokens == 1:
                     # Avoid slicing list in most common case.
                     req_state.output_token_ids.append(new_token_ids[-1])
@@ -665,13 +707,20 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             # For the last rank, we don't need to update the token_ids_cpu
             # because the sampled tokens are already cached.
             if not is_last_rank:
-                # Add new_token_ids to token_ids_cpu.
-                start_token_index = num_computed_tokens
-                end_token_index = num_computed_tokens + len(new_token_ids)
-                self.input_batch.token_ids_cpu[
-                    req_index, start_token_index:end_token_index
-                ] = new_token_ids
-                self.input_batch.num_tokens_no_spec[req_index] = end_token_index
+                # NOTE(RBLN): write from this rank's cursor, not from
+                # num_computed: a prior verify's multi-accept can leave the
+                # cursor behind, and the skipped range still holds the previous
+                # occupant of this row.
+                ib = self.input_batch
+                cursor = int(ib.num_tokens_no_spec[req_index])
+                write = resolve_propagated_token_write(
+                    cursor, num_computed_tokens, base, new_token_ids
+                )
+                if write is not None:
+                    committed_tip, tokens = write
+                    ib.token_ids_cpu[req_index, cursor:committed_tip] = tokens
+                    ib.is_token_ids[req_index, cursor:committed_tip] = True
+                    ib.num_tokens_no_spec[req_index] = committed_tip
 
             # Add spec_token_ids to token_ids_cpu.
             self.input_batch.update_req_spec_token_ids(req_state, scheduled_spec_tokens)
@@ -916,7 +965,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             if kv_cache_gid > 0:
                 cm.block_table_tensor = _get_block_table(kv_cache_gid)
 
-            if self.speculative_config and spec_decode_common_attn_metadata is None:
+            # Gate on the drafter, not speculative_config: only the last PP
+            # rank drafts, and no other rank consumes this.
+            if self.drafter is not None and spec_decode_common_attn_metadata is None:
                 if isinstance(self.drafter, RBLNEagleProposer):
                     if self.drafter.kv_cache_gid == kv_cache_gid:
                         spec_decode_common_attn_metadata = cm
@@ -1339,6 +1390,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        # Stamp the step phase before anything reads self.is_prefill.
+        self.is_prefill = _step_is_prefill(scheduler_output)
 
         with record_function_or_nullcontext("rbln_model_runner: preprocess"):
             # Update persistent batch states.
@@ -1412,7 +1465,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after the draft model runs
         # in sample_tokens(), so the draft model can also save its KV cache.
-        defer_kv_connector_finalize = self.speculative_config is not None
+        # Only the last PP rank reaches that call, so deferring on any other
+        # rank would drop its finalize altogether.
+        defer_kv_connector_finalize = (
+            self.speculative_config is not None and get_pp_group().is_last_rank
+        )
         with (
             set_forward_context(
                 attn_metadata,
@@ -1736,7 +1793,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         else:
             self.logits_processor = None
         # TODO(RBLN): load lora
-        if hasattr(self, "drafter"):
+        if self.drafter is not None:
             logger.info_once("Loading drafter model...")
             self.drafter.load_model(self.model)
 
@@ -2013,13 +2070,18 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self.seq_lens_np[:num_reqs] = num_scheduled_tokens
         self.seq_lens_np[num_reqs:] = 0
 
-        # NOTE(RBLN): self.is_prefill is derived from num_tokens_no_spec.
-        # For decode warmup, keep it at 1 so multi-token speculative decode
-        # query lengths are not misclassified as prefill.
+        # NOTE(RBLN): num_tokens_no_spec is the per-request no-spec logical
+        # length consumed downstream (query backfill, spec metadata). For decode
+        # warmup keep it at 1 so a multi-token speculative decode query is sized
+        # as decode.
         if is_prefill:
             self.input_batch.num_tokens_no_spec[:num_reqs] = num_scheduled_tokens
         else:
             self.input_batch.num_tokens_no_spec[:num_reqs] = 1
+
+        # No scheduler output here. Stamping also keeps a prior real step's
+        # value out of the DP-idle path (rbln_worker.execute_dummy_batch).
+        self.is_prefill = is_prefill
 
         num_reqs_padded, _num_tokens_padded, num_tokens_across_dp = (
             self._determine_batch_padding(num_reqs, num_tokens_unpadded)
@@ -2061,9 +2123,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 dtype=self.model_config.dtype,
                 device=self.device,
             )
+            # Reshape by num_reqs, matching input_ids below: the tensors hold
+            # num_reqs * num_tokens_per_req rows, so num_reqs_padded would eat
+            # into the hidden dimension when a DP peer forces extra padding.
             intermediate_tensors = IntermediateTensors(
                 {
-                    k: v.view(num_reqs_padded, num_tokens_per_req, -1)
+                    k: v.view(num_reqs, num_tokens_per_req, -1)
                     for k, v in intermediate_tensors.items()
                 }
             )
@@ -2093,15 +2158,15 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         ):
             _ = self.model_executable(**staged_model_input.as_kwargs())
 
-        if self.speculative_config and self.speculative_config.use_eagle():
-            assert isinstance(self.drafter, RBLNEagleProposer)
-            if is_prefill or num_tokens_per_req == 1 + self.num_spec_tokens:
-                self.drafter.dummy_run(
-                    num_reqs,
-                    num_tokens_per_req,
-                    is_prefill,
-                    num_padded_tokens=draft_num_tokens_padded,
-                )
+        if isinstance(self.drafter, RBLNEagleProposer) and (
+            is_prefill or num_tokens_per_req == 1 + self.num_spec_tokens
+        ):
+            self.drafter.dummy_run(
+                num_reqs,
+                num_tokens_per_req,
+                is_prefill,
+                num_padded_tokens=draft_num_tokens_padded,
+            )
 
         self.input_batch.num_tokens_no_spec[:num_reqs] = 0
 
@@ -2260,9 +2325,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     num_metadata_builders=1,  # not use ubatching
                 )
 
-        # Initialize drafter attention backend
-        if self.speculative_config and self.speculative_config.use_eagle():
-            assert isinstance(self.drafter, RBLNEagleProposer)
+        # Initialize drafter attention backend.
+        if isinstance(self.drafter, RBLNEagleProposer):
             self.drafter.initialize_attn_backend(kv_cache_config, kernel_block_sizes)
 
     def may_reinitialize_input_batch(
@@ -2748,9 +2812,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
     @property
     def is_prefill(self) -> bool:
-        num_computed_tokens = self.input_batch.num_computed_tokens_cpu[0]
-        num_tokens_no_spec = self.input_batch.num_tokens_no_spec[0]
-        return bool(num_computed_tokens < (num_tokens_no_spec - 1))
+        return self._is_prefill_step
+
+    @is_prefill.setter
+    def is_prefill(self, value: bool) -> None:
+        self._is_prefill_step = value
 
     @property
     def is_intermediate_chunked_prefill(self) -> bool:
@@ -2853,7 +2919,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                         yield value
 
         models = [self.model]
-        if isinstance(getattr(self, "drafter", None), RBLNEagleProposer):
+        if isinstance(self.drafter, RBLNEagleProposer):
             models.append(self.drafter.model)
 
         for model in models:
@@ -2981,16 +3047,17 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     )
                     _ = self.compute_logits(hidden_states)
 
-            # 4. sampler
-            if not self.is_pooling_model:
-                for size in self.bucketing_manager.batch_buckets:
-                    self._dummy_sampler_run(size)
+            if get_pp_group().is_last_rank:
+                # 4. sampler
+                if not self.is_pooling_model:
+                    for size in self.bucketing_manager.batch_buckets:
+                        self._dummy_sampler_run(size)
 
-            # 4. rejection sampler warmup
-            self._warmup_sampler_decode_batches()
+                # 4. rejection sampler warmup
+                self._warmup_sampler_decode_batches()
 
             # 5. specdec (medusa)
-            if self.speculative_config and self.speculative_config.method == "medusa":
+            if isinstance(self.drafter, RBLNMedusaProposer):
                 self.drafter.dummy_run()
 
     def _process_kv_cache_copy_ops(
