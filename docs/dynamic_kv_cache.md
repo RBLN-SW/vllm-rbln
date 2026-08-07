@@ -40,8 +40,8 @@ export VLLM_CACHE_ROOT=<a fresh directory>
 That is the whole public surface. The number of blocks the cache is shrunk to for
 the compile is a module constant
 (`vllm_rbln.v1.worker.rbln_worker.COMPILE_KV_CACHE_NUM_BLOCKS`) and cannot be set
-from the environment. It is a trace hint for the dynamic dimension,
-not a capacity: the count that ends up in service comes from the compiled profile.
+from the environment. It is a trace hint for the dynamic dimension, not a
+capacity: the count that ends up in service comes from the compiled profile.
 
 Use a separate `VLLM_CACHE_ROOT` per configuration. The compile cache hash does
 not include dynamism, so a static and a dynamic build of the same model share one
@@ -66,10 +66,10 @@ would serve from the pre-compile estimate this feature exists to replace.
 
 - **The estimate is already at or below the compile hint.** The estimate is free
   device memory divided by the cost of one block, and that cost scales with
-  `--block-size`, so a large block size can put it below the hint. There is nothing to
-  shrink, and cancelling the shrink cancels the reallocation too. Raise the
-  estimate with a smaller `--block-size`, a higher `--gpu-memory-utilization`, or
-  more devices.
+  `--block-size`, so a large block size can put it below the hint. There is
+  nothing to shrink, and cancelling the shrink cancels the reallocation too.
+  Raise the estimate with a smaller `--block-size`, a higher
+  `--gpu-memory-utilization`, or more devices.
 - **The compiler does not carry the dynamic KV API.** `rebel.kv_cache.max_num_blocks`
   and `DynamoRuntime.reset_adaptive_buffers` are both checked before anything is
   compiled. Upgrade `rebel-compiler`.
