@@ -54,7 +54,10 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
 )
 from vllm.v1.attention.backends.utils import create_fast_prefill_custom_backend
-from vllm.v1.core.sched.output import GrammarOutput, NewRequestData
+from vllm.v1.core.sched.output import (
+    GrammarOutput,
+    NewRequestData,
+)
 from vllm.v1.kv_cache_interface import (
     EncoderOnlyAttentionSpec,
     FullAttentionSpec,
@@ -1362,6 +1365,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
             num_reqs = self.input_batch.num_reqs
             req_ids = self.input_batch.req_ids
+
             tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
             num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
 
@@ -1616,7 +1620,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         elif spec_config.method == "suffix":
             assert isinstance(sampled_token_ids, list)
             assert isinstance(self.drafter, SuffixDecodingProposer)
-            draft_token_ids = self.drafter.propose(self.input_batch, sampled_token_ids)
+            draft_token_ids = self.drafter.propose(
+                self.num_spec_tokens, self.input_batch, sampled_token_ids
+            )
         elif spec_config.method == "medusa":
             assert isinstance(sampled_token_ids, list)
             assert isinstance(self.drafter, RBLNMedusaProposer)
@@ -2071,7 +2077,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             token_indices=token_indices,
             layout=InputLayout(
                 num_reqs=num_reqs,
-                num_reqs_padded=num_reqs,
+                num_reqs_padded=num_reqs if self.is_prefill else num_reqs_padded,
                 query_len=num_tokens_per_req,
                 query_len_padded=num_tokens_per_req,
             ),
@@ -2855,6 +2861,71 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 if not t.is_contiguous():
                     t.data = t.data.contiguous()
 
+    @torch.inference_mode()
+    def _warmup_sampler_decode_batches(self) -> None:
+        """Warm the device rejection-sample op at every decode batch size."""
+        if (
+            self.speculative_config is None
+            or self.num_spec_tokens <= 0
+            or self.is_pooling_model
+            or not envs.VLLM_RBLN_SAMPLER
+        ):
+            return
+
+        num_spec = self.num_spec_tokens
+        vocab_size = self.model_config.get_vocab_size()
+        max_decode_batch = self.bucketing_manager.decode_batch_buckets[-1]
+
+        for batch_size in range(1, max_decode_batch + 1):
+            num_tokens = batch_size * num_spec
+            num_draft_tokens = [num_spec] * batch_size
+            draft_token_ids = torch.zeros(
+                num_tokens, dtype=torch.int32, device=self.device
+            )
+            target_probs = torch.zeros(
+                num_tokens, vocab_size, dtype=torch.float32, device=self.device
+            )
+            cu_num_draft_tokens = torch.arange(
+                num_spec,
+                num_tokens + 1,
+                num_spec,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            bonus_token_ids = torch.zeros(
+                batch_size, 1, dtype=torch.int64, device=self.device
+            )
+            dummy_sampling_metadata = SamplingMetadata(
+                temperature=None,
+                all_greedy=True,
+                all_random=False,
+                top_p=None,
+                top_k=None,
+                generators={},
+                max_num_logprobs=None,
+                no_penalties=True,
+                prompt_token_ids=None,
+                frequency_penalties=None,
+                presence_penalties=None,
+                repetition_penalties=None,
+                output_token_ids=[],
+                allowed_token_ids_mask=None,
+                bad_words_token_ids={},
+                logitsprocs=LogitsProcessors(),
+                spec_token_ids=[[] for _ in range(batch_size)],
+            )
+            logger.info("Warm-up: rejection sampler (decode_batch=%d)", batch_size)
+            self.rejection_sampler.impl.rejection_sample(
+                draft_token_ids,
+                num_draft_tokens,
+                num_spec,
+                cu_num_draft_tokens,
+                None,
+                target_probs,
+                bonus_token_ids,
+                dummy_sampling_metadata,
+            )
+
     def warmup_model(self) -> None:
         # NOTE(RBLN): Warm-up must not route through execute_model() while a
         # KV transfer group exists: the KV-connector mixin asserts
@@ -2914,6 +2985,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             if not self.is_pooling_model:
                 for size in self.bucketing_manager.batch_buckets:
                     self._dummy_sampler_run(size)
+
+            # 4. rejection sampler warmup
+            self._warmup_sampler_decode_batches()
 
             # 5. specdec (medusa)
             if self.speculative_config and self.speculative_config.method == "medusa":
