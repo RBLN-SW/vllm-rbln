@@ -13,10 +13,14 @@
 # limitations under the License.
 """Merge `rebel` KV-cache memory profiles into a single joint profile."""
 
-# NOTE(RBLN): the reduction is load-bearing and nothing here can test it -- `min`
-# is optimistic, summing the growth double-counts, and every merge recorded on
-# hardware had N=2, where all candidate rules are algebraically identical.
-# See docs/dynamic_kv_cache.md, "How the per-artifact profiles are merged".
+# NOTE(RBLN): the reduction is load-bearing. Solving each profile alone and
+# taking the `min` is optimistic, because it ignores the other artifacts' private
+# footprints, which are resident at the same time; summing the growth regions
+# double-counts, because they point at the same KV tensors. Every merge recorded
+# on hardware so far had exactly two profiles, and at N=2 all three rules are
+# algebraically identical (`a + b - min == max`), so neither the tests nor a
+# device run distinguishes them. Speculative decoding, the only shape that adds a
+# third owner, is refused in the worker for the same reason.
 
 from __future__ import annotations
 

@@ -97,10 +97,13 @@ logger = init_logger(__name__)
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 
-# Trace hint of the mark_dynamic'd dim, not a capacity. Both constants are
-# measured -- see docs/dynamic_kv_cache.md, "Constants, and the measurements
-# behind them", before changing either.
+# Blocks the KV cache is shrunk to for the compile: a trace hint for the
+# mark_dynamic'd dim, not a capacity. The cost is linear in the hint on TP>=2, so
+# it is kept small; below 8 is unmeasured, and dynamo specializes a size-1 dim
+# away silently, which yields a static artifact.
 COMPILE_KV_CACHE_NUM_BLOCKS = 8
+# Held back from every chiplet's budget for device memory no profile region
+# describes. Measured at 41,968,576 B, rounded up; costs no blocks in practice.
 DYNAMIC_KV_UNPROFILED_RESERVE_BYTES = 48 * 1024 * 1024
 
 
@@ -636,7 +639,8 @@ class RBLNWorker(WorkerBase):
     def _assert_dynamic_kv_model_supported(self) -> None:
         """Guard: reject the shapes the dynamic path cannot size.
 
-        Reasons per shape: docs/dynamic_kv_cache.md, "Unsupported combinations".
+        Reasons per shape: docs/dynamic_kv_cache.md, "Unsupported
+        Configurations".
         """
         # NOTE(RBLN): must run in `__init__`, not beside the other dynamic-KV
         # guards -- vLLM loads the model first, and for spec decode that load
@@ -784,7 +788,8 @@ class RBLNWorker(WorkerBase):
         it; on TP>=2 it is not returned and the process cannot see that it was
         not. Charging TP=1 would cost blocks it does get back.
 
-        Measurements and the uncharged DP+EP gap: docs/dynamic_kv_cache.md.
+        DP+EP keeps the cache resident at tp_size=1 and is therefore not
+        charged here; that gap is in docs/dynamic_kv_cache.md.
         """
         resident_blocks = self.model_runner.kv_cache_config.num_blocks
         tp_size = self.parallel_config.tensor_parallel_size
@@ -1062,8 +1067,10 @@ class RBLNWorker(WorkerBase):
     def _release_kv_cache_tensors(self, old_cfg: KVCacheConfig) -> None:
         """Drop every reference to the outgoing KV cache and free its device DRAM.
 
-        Called *before* the replacement is allocated; the measured cost of not
-        doing so is in docs/dynamic_kv_cache.md.
+        Called *before* the replacement is allocated. Otherwise the old tensors
+        outlive the free, the allocator keeps their blocks reserved (measured at
+        4.5 GiB per card), and the peak is base + old + new rather than
+        base + max(old, new).
         """
         mr = self.model_runner
 
