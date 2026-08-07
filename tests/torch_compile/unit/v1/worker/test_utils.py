@@ -564,8 +564,9 @@ class TestReplicationFactorIsGated:
     def test_disagreement_is_reported_not_silent(
         self, mock_envs, mock_platform, caplog
     ):
+        """Only the flag path warns -- it is the only one that acts on this."""
         with caplog.at_level("WARNING"):
-            self._measure(mock_envs, mock_platform, 5, False)
+            self._measure(mock_envs, mock_platform, 5, True)
         warnings = [
             r.getMessage()
             for r in caplog.records
@@ -575,6 +576,25 @@ class TestReplicationFactorIsGated:
         assert "num_key_value_heads=5" in warnings[0]
         assert "118.000 GiB released" in warnings[0]
         assert "73.750 GiB exact" in warnings[0]
+
+    @patch("vllm_rbln.v1.worker.utils.current_platform")
+    @patch("vllm_rbln.v1.worker.utils.envs")
+    def test_the_default_path_does_not_warn_about_an_estimate_it_keeps(
+        self, mock_envs, mock_platform, caplog
+    ):
+        """With the flag off this function changes nothing, so it says nothing.
+
+        The disagreement is still recorded at debug level -- it is the reason to
+        turn the flag on, not a fault in the run that did not.
+        """
+        with caplog.at_level("DEBUG", logger="vllm_rbln.v1.worker.utils"):
+            self._measure(mock_envs, mock_platform, 5, False)
+        by_level = [
+            (r.levelname, r.getMessage())
+            for r in caplog.records
+            if "KV cache replication" in r.getMessage()
+        ]
+        assert [level for level, _ in by_level] == ["DEBUG"]
 
     @patch("vllm_rbln.v1.worker.utils.current_platform")
     @patch("vllm_rbln.v1.worker.utils.envs")
@@ -594,16 +614,15 @@ class TestReplicationFactorIsGated:
 
         `read_rbln_card_dram_total_bytes` raises when the visible cards report
         different capacities, because a single per-chiplet budget would be
-        meaningless. This estimate only wants one card's capacity and used to read
-        a literal, so it falls back instead of turning a mixed host into a
-        start-up failure.
+        meaningless. This estimate only wants one card's capacity, so it falls
+        back instead of turning a mixed host into a start-up failure.
         """
         with caplog.at_level("WARNING"):
             got = self._measure(
                 mock_envs,
                 mock_platform,
                 8,
-                False,
+                True,
                 sysfs_error=RuntimeError(
                     "visible RBLN cards report different dram_total"
                 ),
@@ -625,13 +644,8 @@ class TestReplicationFactorIsGated:
     def test_sysfs_capacity_never_raises_the_estimate(
         self, mock_envs, mock_platform, sysfs_total
     ):
-        """Sourcing the capacity from sysfs must not grow the default path.
-
-        This is NOT behind VLLM_RBLN_USE_DYNAMIC_KV_CACHE, so a driver reporting
-        raw capacity would hand every model a larger KV cache than dev. The
-        reader clamps, so nothing above the ceiling can reach here.
-        """
-        got = self._measure(mock_envs, mock_platform, 8, False, sysfs_total=sysfs_total)
+        """The reader clamps, so nothing above the ceiling can reach here."""
+        got = self._measure(mock_envs, mock_platform, 8, True, sysfs_total=sysfs_total)
         assert got / 2**30 == pytest.approx(118.0, abs=1e-3)
 
     @patch("vllm_rbln.v1.worker.utils.current_platform")
@@ -647,10 +661,27 @@ class TestReplicationFactorIsGated:
             mock_envs,
             mock_platform,
             8,
-            False,
+            True,
             sysfs_total=REBEL_DRAM_NBYTES - 4 * 2**30,
         )
         assert got / 2**30 == pytest.approx(118.0 - 4 * 0.9, abs=1e-3)
+
+    @patch("vllm_rbln.v1.worker.utils.current_platform")
+    @patch("vllm_rbln.v1.worker.utils.envs")
+    @pytest.mark.parametrize(
+        "sysfs_total", [None, REBEL_DRAM_NBYTES - 4 * 2**30, REBEL_DRAM_NBYTES]
+    )
+    def test_the_default_path_never_reads_the_device(
+        self, mock_envs, mock_platform, sysfs_total
+    ):
+        """With the flag off the estimate is the constant, whatever sysfs says.
+
+        The two figures agree on every card measured, so reading the driver here
+        would change nothing today -- but it would tie the default path's KV size
+        to a driver release. That is not this feature's call to make.
+        """
+        got = self._measure(mock_envs, mock_platform, 8, False, sysfs_total=sysfs_total)
+        assert got / 2**30 == pytest.approx(118.0, abs=1e-3)
 
 
 # ---------------------------------------------------------------------------

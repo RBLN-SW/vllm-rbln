@@ -50,7 +50,8 @@ logger = init_logger(__name__)
 
 RBLN_SYSFS_CLASS_DIR = "/sys/class/rebellions"
 # NOTE(RBLN): sysfs lists every card on the host, /dev only the ones this process
-# was given -- see docs/dynamic_kv_cache.md, "Reading the right cards".
+# was given. `RBLN_DEVICES` indexes the latter, so reading sysfs by the raw entry
+# charges a neighbouring container's workload to this worker.
 RBLN_DEV_DIR = "/dev"
 
 # 144 GiB of quad-chiplet DRAM minus the 4 GiB system region; the ceiling
@@ -98,8 +99,8 @@ def _rbln_present_card_indices() -> list[int]:
 def get_rbln_owned_card_indices() -> list[int]:
     """sysfs card indices this process owns, with `RBLN_DEVICES` resolved.
 
-    Entry `i` selects the `i`-th present device; a physical name is accepted too.
-    See docs/dynamic_kv_cache.md, "Reading the right cards".
+    Entry `i` selects the `i`-th present device; a physical name is accepted too,
+    but the positional reading wins when both are possible.
     """
     present = _rbln_present_card_indices()
     if not present:
@@ -168,8 +169,8 @@ def read_rbln_card_dram_used_bytes() -> int:
 
     Sampled before this process allocates, so it is what other tenants hold.
     Card-scope: sysfs has no per-chiplet breakdown, so the caller must scale it
-    before subtracting it from a per-chiplet budget. Why cards we do not own are
-    excluded: docs/dynamic_kv_cache.md, "Reading the right cards".
+    before subtracting it from a per-chiplet budget. Cards we do not own are
+    excluded: charging a neighbour's usage cost one run 1024 blocks -> 308.
     """
     used = [
         value
@@ -344,31 +345,34 @@ def estimate_available_memory(
         REBEL_CHIPLET_SIZE = 4
         # single device == Quad chiplet
         rsd_size = REBEL_CHIPLET_SIZE
-        # Prefer the driver's figure. The reader clamps to REBEL_DRAM_NBYTES, so
-        # it can only report *less* and this path -- not behind the flag -- cannot
-        # grow. sysfs is absent on NPU-less hosts (CI), hence the fallback.
-        try:
-            sysfs_dram_total = read_rbln_card_dram_total_bytes()
-        except RuntimeError as exc:
-            # The reader refuses on heterogeneous cards, but this estimate only
-            # wants one card's capacity -- do not add a default-path failure.
-            logger.warning(
-                "%s; falling back to the built-in %d byte DRAM capacity for the "
-                "static KV cache estimate.",
-                exc,
-                REBEL_DRAM_NBYTES,
-            )
-            sysfs_dram_total = None
-        if sysfs_dram_total is None:
-            logger.debug(
-                "sysfs %s is unavailable; falling back to the built-in %d byte "
-                "DRAM capacity.",
-                RBLN_SYSFS_CLASS_DIR,
-                REBEL_DRAM_NBYTES,
-            )
-            available_dram_bytes = REBEL_DRAM_NBYTES
-        else:
-            available_dram_bytes = sysfs_dram_total
+        available_dram_bytes = REBEL_DRAM_NBYTES
+        if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
+            # NOTE(RBLN): only under the flag. The driver's figure and the
+            # built-in constant agree on every card measured so far, so reading
+            # sysfs here would change nothing today -- but it would make the
+            # default path's KV size depend on a driver release, which is not
+            # this feature's to decide. The reader clamps to REBEL_DRAM_NBYTES,
+            # so it can only ever report less.
+            try:
+                sysfs_dram_total = read_rbln_card_dram_total_bytes()
+            except RuntimeError as exc:
+                # The reader refuses on heterogeneous cards; this estimate only
+                # wants one card's capacity, so fall back rather than fail.
+                logger.warning(
+                    "%s; falling back to the built-in %d byte DRAM capacity.",
+                    exc,
+                    REBEL_DRAM_NBYTES,
+                )
+                sysfs_dram_total = None
+            if sysfs_dram_total is None:
+                logger.debug(
+                    "sysfs %s is unavailable; falling back to the built-in %d "
+                    "byte DRAM capacity.",
+                    RBLN_SYSFS_CLASS_DIR,
+                    REBEL_DRAM_NBYTES,
+                )
+            else:
+                available_dram_bytes = sysfs_dram_total
         # FIXME(RBLN) - basic data type fp8 for REBEL, for now fp16
         default_bits_per_param = 16
     else:
@@ -433,6 +437,15 @@ def estimate_available_memory(
         available_dram_bytes, num_key_value_heads, rsd_size
     )
     if released_dram_bytes != exact_dram_bytes:
+        # NOTE(RBLN): only the flag path acts on this, so only it warns. The
+        # default path keeps the released number and says so at debug level:
+        # warning about an estimate this function is not changing reads as a
+        # fault where there is none.
+        disagreement = (
+            "KV cache replication: num_key_value_heads=%d over %d chiplets is "
+            "replicated %.4gx (%d heads per chiplet), but the released estimate "
+            "divides by %d: %.3f GiB released vs %.3f GiB exact.%s"
+        )
         args = (
             num_key_value_heads,
             rsd_size,
@@ -442,25 +455,11 @@ def estimate_available_memory(
             released_dram_bytes / 2**30,
             exact_dram_bytes / 2**30,
         )
-        # One format string, three tails: `logger.*(a + b)` trips ruff G003.
-        disagreement = (
-            "KV cache replication: num_key_value_heads=%d over %d chiplets is "
-            "replicated %.4gx (%d heads per chiplet), but the released estimate "
-            "divides by %d: %.3f GiB released vs %.3f GiB exact.%s"
-        )
+        # One format string, two tails: `logger.*(a + b)` trips ruff G003.
         if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
-            logger.info(disagreement, *args, " Using the exact figure.")
-        elif envs.VLLM_RBLN_USE_VLLM_MODEL:
-            # Only suggest the flag where it can be turned on -- the platform
-            # refuses it on the optimum-rbln path.
-            logger.warning(
-                disagreement,
-                *args,
-                " Keeping the released figure; set VLLM_RBLN_USE_DYNAMIC_KV_CACHE=1 "
-                "to size from the compiled artifact instead.",
-            )
+            logger.warning(disagreement, *args, " Using the exact figure.")
         else:
-            logger.warning(disagreement, *args, " Keeping the released figure.")
+            logger.debug(disagreement, *args, " Keeping the released figure.")
     available_dram_bytes = (
         exact_dram_bytes if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE else released_dram_bytes
     )
