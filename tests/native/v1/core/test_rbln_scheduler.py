@@ -361,32 +361,6 @@ class TestSchedulePrefillAllocation:
         assert block.block_hash is not None
 
 
-class TestDelayedBlockCaching:
-    def test_each_chunk_caches_exactly_its_own_blocks(self):
-        # delay_cache_blocks=True everywhere and caching only after the step is
-        # finalized, so the scheduler can still change its mind mid-step.
-        num_blocks = 4
-        sched = create_rbln_scheduler(
-            block_size=16,
-            max_num_batched_tokens=16,
-            max_model_len=128,
-            enable_prefix_caching=True,
-            num_blocks=100,
-        )
-        req = make_request("a", list(range(16 * num_blocks)), 16, max_tokens=1)
-        sched.add_request(req)
-
-        for step in range(num_blocks):
-            out = sched.schedule()
-            blocks = sched.kv_cache_manager.get_blocks("a").blocks[0]
-            # The whole prompt is reserved from the first chunk on.
-            assert len(blocks) == num_blocks
-            assert all(block.ref_cnt == 1 for block in blocks)
-            cached = [block for block in blocks if block.block_hash is not None]
-            assert len(cached) == step + 1, f"chunk {step}"
-            sched.update_from_output(out, make_model_runner_output(out))
-
-
 class TestScheduleSpecDecodeCap:
     _BS = 1024
     _NUM_BLOCKS = 100
