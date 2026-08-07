@@ -206,6 +206,31 @@ class TestLifecycle:
             runner.generate_greedy([DPRequest("a", 2, 0)])
         assert fake_engine.shutdown_calls == 1
 
+    def test_a_failed_build_closes_the_loop(self, monkeypatch):
+        # __init__ raising means __exit__ never runs, so the loop has to be closed
+        # on the way out or a ResourceWarning lands next to the real failure.
+        created: list = []
+        real_new_event_loop = asyncio.new_event_loop
+
+        def record_loop():
+            loop = real_new_event_loop()
+            created.append(loop)
+            return loop
+
+        monkeypatch.setattr(asyncio, "new_event_loop", record_loop)
+
+        class _Exploding:
+            @staticmethod
+            def from_engine_args(args, *rest, **kwargs):
+                raise RuntimeError("engine build failed")
+
+        monkeypatch.setattr(runners, "AsyncLLM", _Exploding)
+
+        with pytest.raises(RuntimeError, match="engine build failed"):
+            AsyncVllmRunner(MODEL)
+
+        assert created and created[0].is_closed()
+
     def test_exit_closes_the_loop(self, fake_engine):
         with AsyncVllmRunner(MODEL) as runner:
             loop = runner._loop

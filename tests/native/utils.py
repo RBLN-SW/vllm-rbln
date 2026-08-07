@@ -186,7 +186,14 @@ def rbln_device_count() -> int:
 def devices_needed(engine_kwargs: dict, rsd: int = 1) -> int:
     """NPUs an engine built with ``engine_kwargs`` will occupy. Mirrors
     RBLNWorker._init_device_env: DP ranks do not share, and every (tp x pp) rank
-    takes VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK devices."""
+    takes ``rsd`` devices.
+
+    ``rsd`` is a spec's ``CompileModelSpec.rsd``, i.e. the
+    VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK the engine will run with. It is an
+    argument rather than an env read because the caller checks the budget *before*
+    ``apply_spec_envs`` publishes it, and because the suite scrubs that name from
+    the parent's environment anyway.
+    """
     return (
         engine_kwargs.get("tensor_parallel_size", 1)
         * engine_kwargs.get("pipeline_parallel_size", 1)

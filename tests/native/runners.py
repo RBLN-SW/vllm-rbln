@@ -131,7 +131,14 @@ class AsyncVllmRunner:
         # One loop for the runner's lifetime; a fresh asyncio.run() per call would
         # orphan the engine's output handler on a closed loop.
         self._loop = asyncio.new_event_loop()
-        self.engine = self._loop.run_until_complete(_build_async_engine(args))
+        try:
+            self.engine = self._loop.run_until_complete(_build_async_engine(args))
+        except BaseException:
+            # __exit__ never runs when __init__ raises, and an unclosed loop adds a
+            # ResourceWarning next to the real failure. BaseException so a Ctrl-C
+            # during a long compile is covered too.
+            self._loop.close()
+            raise
 
     def generate_greedy(self, requests: list[DPRequest]) -> list[tuple[list[int], str]]:
         """Run every request concurrently, returning results in the order given.
@@ -188,10 +195,13 @@ class AsyncVllmRunner:
     def __exit__(self, exc_type, exc_value, traceback) -> None:
         # Reaps every DP engine core, not just rank 0's. Not suppressed: a failed
         # shutdown would leak the whole DP group of devices silently.
-        self.engine.shutdown()
-        # Let the cancelled output handler settle, or it is "destroyed but pending".
-        self._loop.run_until_complete(asyncio.sleep(0))
-        self._loop.close()
+        try:
+            self.engine.shutdown()
+            # Let the cancelled output handler settle, or it is "destroyed but
+            # pending".
+            self._loop.run_until_complete(asyncio.sleep(0))
+        finally:
+            self._loop.close()
         del self.engine
         torch._dynamo.reset()
         cleanup_dist_env_and_memory()
