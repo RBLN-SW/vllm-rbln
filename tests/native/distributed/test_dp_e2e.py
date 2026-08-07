@@ -31,8 +31,8 @@ from tests.native.utils import (
 DP_MODELS: list[CompileModelSpec] = [
     CompileModelSpec(
         "openai/gpt-oss-20b",
-        {"data_parallel_size": 4},
-        {"VLLM_RBLN_SUB_BLOCK_CACHE": "0"},
+        {"data_parallel_size": 4, "max_num_seqs": 2},
+        {"VLLM_RBLN_SUB_BLOCK_CACHE": "0", "VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT": "2"},
     ),
 ]
 
@@ -113,8 +113,7 @@ def test_every_rank_produces_the_same_output(symmetric_outputs) -> None:
 
 
 def test_output_survives_idle_peers(dp_lane, symmetric_outputs) -> None:
-    # Every other rank dummy-runs (RBLNModelRunner._dummy_run) for the whole of
-    # rank 0's decode -- the shape #894 got wrong.
+    # Every other rank dummy-runs for the whole of rank 0's decode.
     outputs = dp_lane.generate_greedy([DPRequest(PROMPT, MAX_TOKENS, dp_rank=0)])
 
     check_outputs_equal(
@@ -149,4 +148,26 @@ def test_output_survives_a_peer_finishing_early(dp_lane, symmetric_outputs) -> N
     )
     assert short_ids == symmetric_outputs[0][0][: len(short_ids)], (
         "rank0's tokens changed when it shared the group with a longer request"
+    )
+
+
+def test_output_survives_a_peer_at_a_bigger_bucket(dp_lane) -> None:
+    # rank0 decodes two requests at once (bucket 2) while every other rank idles
+    # at bucket 1, so their dummy batches have to pad to the group's bucket. Under
+    # #894 that mismatch was a shape error, so completing at all is the signal;
+    # the batch-2 graph differs from symmetric_outputs' batch-1 one, so those are
+    # not compared.
+    first, second = dp_lane.generate_greedy(
+        [
+            DPRequest(PROMPT, MAX_TOKENS, dp_rank=0),
+            DPRequest(PROMPT, MAX_TOKENS, dp_rank=0),
+        ]
+    )
+
+    assert len(first[0]) == len(second[0]) == MAX_TOKENS
+    check_outputs_equal(
+        outputs_0_lst=[first],
+        outputs_1_lst=[second],
+        name_0="rank0 request 0",
+        name_1="rank0 request 1",
     )
