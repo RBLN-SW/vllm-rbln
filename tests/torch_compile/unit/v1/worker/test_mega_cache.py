@@ -436,13 +436,23 @@ def bundle_env(tmp_path, monkeypatch):
     monkeypatch.setattr(
         sys.modules["torch"].compiler, "save_cache_artifacts", fake_save
     )
+
+    def fake_load(data):
+        state.loaded.append(data)
+        return object()  # stands in for torch's CacheInfo
+
     monkeypatch.setattr(
-        sys.modules["torch"].compiler,
-        "load_cache_artifacts",
-        state.loaded.append,
+        sys.modules["torch"].compiler, "load_cache_artifacts", fake_load
     )
     state.path = mega_cache.bundle_path("m", "sig")
     return state
+
+
+def _tmp_leftovers(bundle_path):
+    bundle_dir = os.path.dirname(bundle_path)
+    if not os.path.isdir(bundle_dir):
+        return []
+    return [n for n in os.listdir(bundle_dir) if n.endswith(".tmp")]
 
 
 class TestSaveLoadRoundTrip:
@@ -521,7 +531,7 @@ class TestSaveLoadRoundTrip:
         monkeypatch.setattr("builtins.open", full_disk)
         mega_cache.save("m", "sig")  # must not propagate
         monkeypatch.undo()
-        assert not os.path.exists(bundle_env.path + ".tmp")
+        assert not _tmp_leftovers(bundle_env.path)
         assert not os.path.exists(bundle_env.path)
 
     def test_out_of_space_keeps_previous_bundle(self, bundle_env, monkeypatch):
@@ -535,7 +545,7 @@ class TestSaveLoadRoundTrip:
         monkeypatch.undo()
         with open(bundle_env.path, "rb") as f:
             assert f.read() == b"bundle-bytes"
-        assert not os.path.exists(bundle_env.path + ".tmp")
+        assert not _tmp_leftovers(bundle_env.path)
 
     def test_out_of_space_is_logged_at_error(self, bundle_env, monkeypatch, caplog):
         monkeypatch.setattr(
@@ -553,7 +563,7 @@ class TestSaveLoadRoundTrip:
         mega_cache.save("m", "sig")  # must not propagate
         monkeypatch.undo()
         assert not os.path.exists(bundle_env.path)
-        assert not os.path.exists(bundle_env.path + ".tmp")
+        assert not _tmp_leftovers(bundle_env.path)
 
     def test_corrupt_bundle_does_not_raise(self, bundle_env, monkeypatch):
         import sys
@@ -567,6 +577,17 @@ class TestSaveLoadRoundTrip:
 
         monkeypatch.setattr(sys.modules["torch"].compiler, "load_cache_artifacts", boom)
         mega_cache.load("m", "sig")  # warns, must not propagate
+
+    def test_unreadable_bundle_warns_and_skips(self, bundle_env, monkeypatch, caplog):
+        import sys
+
+        mega_cache.save("m", "sig")
+        monkeypatch.setattr(
+            sys.modules["torch"].compiler, "load_cache_artifacts", lambda _: None
+        )
+        with caplog.at_level(logging.WARNING, logger=mega_cache.logger.name):
+            mega_cache.load("m", "sig")
+        assert "unreadable" in caplog.text
 
     def test_resave_replaces_in_place(self, bundle_env):
         mega_cache.save("m", "sig")

@@ -13,11 +13,8 @@
 # limitations under the License.
 """torch.compiler mega-cache bundle helpers for the rbln model runner.
 
-Wraps `torch.compiler.{save,load}_cache_artifacts()` with a
-per-(model, config-signature, rank) file under VLLM_CACHE_ROOT. The rbln dynamo
-backend pushes `.rbln` blobs into
-`CacheArtifactManager` during compile; here we persist/restore the bundle as
-an atomic unit only when warm-up has fully succeeded.
+Persists/restores `torch.compiler.{save,load}_cache_artifacts()` bundles as a
+per-(model, config-signature, rank) file under VLLM_CACHE_ROOT.
 """
 
 from __future__ import annotations
@@ -53,8 +50,8 @@ def _rebel_major_minor(version: str | None = None) -> str:
     return f"{match.group(1)}.{match.group(2)}" if match else "unknown"
 
 
-# Allowlist, not compile_factors(): that walks ~240 vLLM env vars, so host paths
-# and ports alone discarded the bundle.
+# Allowlist, not compile_factors(): that walks ~240 vLLM env vars, so host
+# paths and ports alone discarded the bundle.
 _RBLN_COMPILE_ENV = frozenset(
     {
         "VLLM_RBLN_USE_VLLM_MODEL",
@@ -82,7 +79,7 @@ _RBLN_COMPILE_ENV = frozenset(
 
 
 def _compile_env_factors() -> str:
-    """Hash of the rbln compile env (allowlist above), rank- and host-invariant."""
+    """Hash of the rbln compile env allowlist, rank- and host-invariant."""
     from vllm.config.utils import hash_factors, normalize_value
 
     import vllm_rbln.envs as rbln_envs
@@ -95,11 +92,8 @@ def _compile_env_factors() -> str:
 
 
 def _stable_compute_hash(vllm_config) -> str:
-    """vllm_config.compute_hash() leaks per-launch auto-queried open ports via
-    ParallelConfig port fields that are not in its compute_hash ignored set (e.g.
-    _coord_store_port), so the hash changes every launch. Neutralize every
-    "port"-named parallel field around the call — ports never affect the compiled
-    graph — so the signature is launch-stable."""
+    """compute_hash() leaks per-launch auto-queried ports via ParallelConfig
+    port fields; zero them around the call so the hash is launch-stable."""
     import dataclasses
 
     pc = getattr(vllm_config, "parallel_config", None)
@@ -121,12 +115,8 @@ def _stable_compute_hash(vllm_config) -> str:
 
 
 def config_signature(vllm_config) -> str:
-    """vLLM config hash + rbln compile env + rebel major.minor.
-
-    Launch- and host-stable, and shared by all TP/DP ranks; the rank subdir
-    isolates their shards. TP/DP degree still keys the bundle via
-    parallel_config.compute_hash -- only the rank does not.
-    """
+    """vLLM config hash + rbln compile env + rebel major.minor; launch- and
+    host-stable, shared by all TP/DP ranks (the rank subdir isolates shards)."""
     cfg = _stable_compute_hash(vllm_config)
     env = _compile_env_factors()
     rebel_ver = _rebel_major_minor()
@@ -143,11 +133,8 @@ def config_signature(vllm_config) -> str:
 
 
 def bundle_path(model: str, sig: str) -> str:
-    """Per-(model, config-signature, local_rank) bundle path under VLLM_CACHE_ROOT.
-
-    `sig` isolates compile configs; local_rank isolates same-node NPUs. Assumes
-    VLLM_CACHE_ROOT is node-local; override per node on a shared filesystem.
-    """
+    """Per-(model, sig, local_rank) bundle path under VLLM_CACHE_ROOT
+    (assumed node-local; override per node on a shared filesystem)."""
     raw = model or "unknown"
     suffix = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:8]
     local_rank = os.environ.get("LOCAL_RANK", "0")
@@ -178,8 +165,14 @@ def load(model: str, sig: str) -> None:
         return
     try:
         with open(path, "rb") as src:
-            torch.compiler.load_cache_artifacts(src.read())
-        logger.info("Loaded rbln mega-cache bundle from %s", path)
+            info = torch.compiler.load_cache_artifacts(src.read())
+        if info is None:
+            logger.warning(
+                "Ignored an unreadable rbln mega-cache bundle at %s; recompiling",
+                path,
+            )
+        else:
+            logger.info("Loaded rbln mega-cache bundle from %s", path)
     except Exception as exc:  # pylint: disable=broad-exception-caught
         logger.warning("Failed to load rbln mega-cache bundle: %s", exc)
 
@@ -192,7 +185,7 @@ def save(model: str, sig: str) -> None:
 
     rbln_mega_cache.set_dir(cache_root())
     path = bundle_path(model, sig)
-    tmp_path = path + ".tmp"
+    tmp_path = f"{path}.{os.getpid()}.tmp"
     try:
         rbln_mega_cache.flush_to_bundle()
         result = torch.compiler.save_cache_artifacts()
