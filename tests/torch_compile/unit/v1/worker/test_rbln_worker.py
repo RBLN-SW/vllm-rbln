@@ -1673,8 +1673,10 @@ class TestMaybeShrinkKvCacheForCompile:
         # The estimate is free memory over the cost of one block, so a large
         # block_size can legally put it at or below the hint. Serving on there
         # would silently keep the pre-compile estimate, so it is a refusal.
+        from vllm_rbln.v1.worker.rbln_worker import COMPILE_KV_CACHE_NUM_BLOCKS
+
         with pytest.raises(RuntimeError, match="nothing to shrink"):
-            self._shrink(self._config(num_blocks=4))
+            self._shrink(self._config(num_blocks=COMPILE_KV_CACHE_NUM_BLOCKS))
 
     def test_no_warmup_means_no_shrink(self, caplog):
         """Skipping compile/warm-up has to skip the shrink too: otherwise the

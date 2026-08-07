@@ -98,10 +98,12 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 
 # Blocks the KV cache is shrunk to for the compile: a trace hint for the
-# mark_dynamic'd dim, not a capacity. The cost is linear in the hint on TP>=2, so
-# it is kept small; below 8 is unmeasured, and dynamo specializes a size-1 dim
-# away silently, which yields a static artifact.
-COMPILE_KV_CACHE_NUM_BLOCKS = 8
+# mark_dynamic'd dim, not a capacity. Smaller is strictly better -- it narrows the
+# window where the estimate is not above it and the run is refused, and TP>=2 is
+# charged the retained compile-time cache per block. This is the smallest value
+# that works: one step below, dynamo specializes the dimension away and leaves a
+# static artifact whose profile query finds nothing to size from.
+COMPILE_KV_CACHE_NUM_BLOCKS = 2
 # Held back from every chiplet's budget for device memory no profile region
 # describes. Measured at 41,968,576 B, rounded up; costs no blocks in practice.
 DYNAMIC_KV_UNPROFILED_RESERVE_BYTES = 48 * 1024 * 1024
