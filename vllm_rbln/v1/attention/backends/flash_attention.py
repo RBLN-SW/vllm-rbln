@@ -13,11 +13,12 @@
 # limitations under the License.
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, ClassVar
+from typing import ClassVar, TYPE_CHECKING
 
 import torch
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
+from vllm.utils.torch_utils import is_quantized_kv_cache
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionImpl,
@@ -346,12 +347,11 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                 f"Head size {head_size} is not supported by RBLNFlashAttention. "
                 f"Supported head sizes are: {supported_head_sizes}."
             )
-        supported_kv_cache_dtypes = RBLNFlashAttentionBackend.supported_kv_cache_dtypes
-        if self.kv_cache_dtype not in supported_kv_cache_dtypes:
+        if is_quantized_kv_cache(
+            self.kv_cache_dtype
+        ) and not self.kv_cache_dtype.startswith("fp8"):
             raise NotImplementedError(
-                "FlashAttention does not support "
-                f"kv_cache_dtype={self.kv_cache_dtype!r}. "
-                f"Supported kv_cache_dtypes are: {supported_kv_cache_dtypes}."
+                f"FlashAttention does not support kv_cache_dtype={self.kv_cache_dtype!r}"
             )
         self.attn_type = attn_type
 
