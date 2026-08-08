@@ -14,24 +14,13 @@
 
 """Utility helpers for the RBLN scheduler (``rbln_scheduler.py``).
 
-A home for small, self-contained, independently-testable pieces of RBLN
-scheduling logic factored out of ``RBLNScheduler`` so that ``schedule()`` (a
-large copy of upstream's method with RBLN-specific tweaks) stays readable.
-Some are shared with the runner (``RBLNModelRunner``) -- e.g.
-``decode_batch_size`` and the spec-decode ``num_base_tokens`` /
-``resolve_propagated_token_write`` token bookkeeping.
-
-The speculative-decode + PP helpers -- ``should_defer_spec_step`` (running-loop
-anchor-reconciled deferral), ``num_base_tokens`` and
-``resolve_propagated_token_write`` (non-last-rank token propagation) -- live
-next to their docstrings below.
-
-The per-step decode-batch admission budget (``DecodeBatchBudget`` +
-``DecodeCapPolicy`` + ``DecodeAdmissionController``): RBLN compiles a fixed
-decode-batch shape, so each PP microbatch must stay <=
-``max_num_seqs // pipeline_parallel_size``. The controller produces a per-step
-budget; the dynamic policy additionally spreads the decode demand across PP
-stages (``VLLM_RBLN_PP_BALANCE_DECODE_BATCH``) to avoid microbatch collapse.
+Small, independently-testable pieces factored out of ``RBLNScheduler`` so the
+large upstream-copied ``schedule()`` stays readable; some are shared with
+``RBLNModelRunner`` (``decode_batch_size``, the spec-decode ``num_base_tokens`` /
+``resolve_propagated_token_write`` token bookkeeping). The per-step decode-batch
+admission budget lives here too (``DecodeBatchBudget`` + ``DecodeCapPolicy`` +
+``DecodeAdmissionController``): RBLN compiles a fixed decode-batch shape, so each
+PP microbatch must stay <= ``max_num_seqs // pipeline_parallel_size``.
 """
 
 from collections.abc import Callable
@@ -41,22 +30,14 @@ from typing import Protocol, runtime_checkable
 def decode_batch_size(max_num_seqs: int, pipeline_parallel_size: int) -> int:
     """Per-PP-stage (compiled) decode batch size — the single source of truth.
 
-    ``max_num_seqs`` is the max number of concurrently running sequences (the
-    scheduler's running-queue cap), consistent with upstream vLLM and with the
-    non-PP case; the KV cache is provisioned to hold that many concurrent
-    sequences. Under pipeline parallelism the engine keeps
-    ``pipeline_parallel_size`` microbatches in flight, so to keep total
-    in-flight sequences <= ``max_num_seqs`` the batch RBLN must *compile* for
-    one PP stage is that cap split across stages:
-
-        decode_batch_size = max_num_seqs // pipeline_parallel_size
-
-    Unlike GPU (dynamic batch shapes, no division), RBLN compiles a fixed
-    decode-batch shape, so this derived value — not ``max_num_seqs`` itself —
+    ``max_num_seqs`` is the running-queue cap (as upstream). Under PP the engine
+    keeps ``pipeline_parallel_size`` microbatches in flight, so to keep total
+    in-flight sequences <= ``max_num_seqs`` the batch RBLN *compiles* per stage
+    is ``max_num_seqs // pipeline_parallel_size``. Unlike GPU (dynamic shapes),
+    RBLN compiles a fixed shape, so this derived value -- not ``max_num_seqs`` --
     is what the runner buckets to and the scheduler caps at. ``pp_size == 1``
-    returns ``max_num_seqs`` unchanged (non-PP). Callers must ensure
-    ``max_num_seqs >= pipeline_parallel_size`` (validated at config time in
-    ``RBLNPlatform.check_and_update_config``); otherwise this floors to 0.
+    returns ``max_num_seqs``; callers ensure ``max_num_seqs >= pp`` (validated in
+    ``check_and_update_config``).
     """
     return max_num_seqs // pipeline_parallel_size
 
@@ -66,28 +47,19 @@ def should_defer_spec_step(
     spec_token_ids: list[int],
     num_new_tokens: int,
 ) -> bool:
-    """Whether ``schedule()``'s running loop must defer a speculative-decode
-    step under sync-scheduling PP because it has no reconciled BASE (anchor)
-    token to schedule yet.
+    """Whether ``schedule()``'s running loop must defer a spec-decode step under
+    sync-scheduling PP because it has no reconciled BASE (anchor) token yet.
 
-    Called with the RAW ``num_new_tokens`` (before the scheduler's caps). The
-    base count is ``num_new_tokens - len(spec_token_ids)``. The branch is on
-    whether the proposer currently holds drafts (``spec_token_ids``), which only
-    selects how the base is tested:
+    Called with the RAW ``num_new_tokens`` (pre-cap); base is
+    ``num_new_tokens - len(spec_token_ids)``. Branch on whether the proposer
+    holds drafts:
 
-    - Drafts held: ``num_new_tokens`` is draft-inflated, so gate on the base
-      itself. ``base <= 0`` means there is no fresh anchor token for the drafts
-      to verify against yet (the token-producing step has not reconciled);
-      scheduling anyway hands the non-last PP rank an empty token payload.
-    - No drafts held (just consumed, or no proposer match): ``base ==
-      num_new_tokens``, which goes negative only in the post-verify overshoot
-      (num_computed_tokens still optimistically advanced). The mundane ``== 0``
-      (no work this step) and the no-match case are left to the caller's plain
-      upstream defer.
+    - drafts held: ``num_new_tokens`` is draft-inflated, so gate on base itself
+      (``base <= 0`` means no fresh anchor to verify against yet).
+    - no drafts: ``base == num_new_tokens``, negative only in post-verify
+      overshoot; the plain ``== 0`` / no-match cases fall to the caller.
 
-    Returns ``False`` when spec is disabled (``num_spec_tokens <= 0``), so
-    non-spec decode is untouched; also inert for pp=1, where synchronous
-    scheduling keeps the base reconciled.
+    Returns ``False`` when spec is off (``num_spec_tokens <= 0``); inert for pp=1.
     """
     if num_spec_tokens <= 0:
         return False
@@ -122,40 +94,31 @@ def resolve_propagated_token_write(
 ) -> tuple[int, list[int]] | None:
     """Plan the non-last PP rank's write of scheduler-propagated tokens.
 
-    Under sync-scheduling pipeline parallelism the scheduler ships
-    ``new_token_ids`` covering the request's committed-token tail (extended
-    backward by ``num_spec_tokens`` so it always spans a prior verify's
-    multi-accept lag). This rank brings its recorded-token cursor
-    (``num_tokens_no_spec``) up to
-    ``committed_tip = num_computed_tokens + base`` by writing the payload slice
-    that lands at ``[cursor, committed_tip)`` by ABSOLUTE position, idempotently
-    overwriting any mis-speculated slots.
+    Under sync-scheduling PP the scheduler ships ``new_token_ids`` covering the
+    committed-token tail (extended backward by ``num_spec_tokens`` to span a
+    prior verify's multi-accept lag). This rank brings its cursor
+    (``num_tokens_no_spec``) up to ``committed_tip = num_computed_tokens + base``
+    by writing the slice landing at ``[cursor, committed_tip)`` by ABSOLUTE
+    position, idempotently overwriting mis-speculated slots. Returns
+    ``(committed_tip, tokens)`` to write at ``token_ids_cpu[cursor:committed_tip]``,
+    or ``None`` if the cursor already reached it.
 
-    Returns ``(committed_tip, tokens)`` where ``tokens`` is the length-``span``
-    slice to write at ``token_ids_cpu[cursor:committed_tip]``, or ``None`` if the
-    cursor has already reached ``committed_tip`` (nothing to write).
-
-    Sync-scheduling only: RBLN force-disables async scheduling (platform.py) and
-    the caller asserts a non-empty payload, so ``new_token_ids`` always covers
-    [cursor, committed_tip). Async support would NOT surface here as a per-request
-    empty payload -- it needs the prev_sampled_token_ids GPU-broadcast path plus
-    skipping this propagation block in _update_states entirely.
+    Sync-scheduling only (RBLN force-disables async); async would need the
+    prev_sampled_token_ids broadcast path, not surface here.
     """
     committed_tip = num_computed_tokens + base
     if committed_tip <= cursor:
         return None
     span = committed_tip - cursor
-    # The payload covers all_token_ids[committed_tip - len : committed_tip], so
-    # the token for absolute position `cursor` sits at offset `lo`.
+    # `cursor`'s token sits at offset `lo` in new_token_ids, which covers
+    # all_token_ids[committed_tip - len : committed_tip].
     lo = cursor - (committed_tip - len(new_token_ids))
-    # Invariant (sync-scheduling PP): the scheduler extends new_token_ids
-    # backward by num_spec_tokens, so the payload always covers
-    # [cursor, committed_tip) -- a non-last rank never lags num_computed by more
-    # than one verify's worth. If a future scheduler change breaks that, fail
-    # here with a clear signal instead of deep inside _update_states with an
-    # opaque numpy broadcast error at token_ids_cpu[cursor:committed_tip] = tokens.
-    # (lo + span always equals len(new_token_ids), so there is no separate
-    # upper-bound to check.)
+    # Invariant (sync-scheduling PP): the scheduler extends new_token_ids backward
+    # by num_spec_tokens, so the payload always covers [cursor, committed_tip) --
+    # a non-last rank never lags num_computed by more than one verify's worth. The
+    # assert below fails fast if that breaks, instead of an opaque broadcast error
+    # deep in _update_states. (lo + span == len(new_token_ids), so no separate
+    # upper bound to check.)
     assert lo >= 0, (
         f"propagated payload ({len(new_token_ids)}) shorter than the write span "
         f"({span}): a non-last PP rank's cursor lags num_computed by more than "
@@ -195,30 +158,18 @@ class StaticDecodeCapPolicy:
 
 
 class DynamicDecodeCapPolicy:
-    """Cap that spreads the decode *demand* across the PP pipeline.
+    """Cap that spreads decode demand across PP microbatches to avoid PP-depth
+    collapse: after a drain the static ``max_num_seqs // pp_size`` cap lets all
+    decodes pack into one microbatch, idling the other stages. Sizing each step
+    to ``ceil(demand / pp_size)`` keeps the pipeline full.
 
-    Avoids PP-depth collapse: after a pipeline drain (e.g. a
-    prefill stall) every decode becomes reschedulable at once, and the static
-    ``max_num_seqs // pp_size`` cap lets them pack into a single microbatch ->
-    the other ``pp_size - 1`` stages idle (depth-1, ~2x decode latency). Sizing
-    each step's batch to ``ceil(demand / pp_size)`` instead spreads the decode
-    demand across ``pp_size`` microbatches so the pipeline stays full.
+    ``num_demand_decodes`` must include remote-KV requests ready to join (not
+    just running decodes), or the ramp stalls with no headroom. Demand is
+    invariant under admission (promoting a ready remote-KV keeps the total), so a
+    step-start snapshot is exact even as the running/ready split shifts.
 
-    ``num_demand_decodes`` is the total decode demand, NOT just the currently
-    running decodes: it must also include remote-KV requests that are ready to
-    join the decode batch (P/D-disaggregated decode). Using running-only would
-    leave no headroom to admit those, stalling the ramp (the cap is fully
-    consumed by the requests already cycling). Crucially, demand is *invariant*
-    under admission -- promoting a ready remote-KV moves it from "ready" to
-    "running" without changing the total -- so a single step-start snapshot is
-    exact even though the running/ready split shifts during the waiting loop.
-
-    The cap is **clamped to** ``static_max_cap`` (== the runner's compiled
-    decode-batch ceiling) so it can only go *lower*, never overflow the bucket;
-    and floored at 1. ``pp_size == 1`` yields ``min(static_max_cap, demand)``,
-    a no-op (only ``demand`` decodes are admittable anyway).
-
-    Constructed per ``schedule()`` call with that step's decode demand.
+    Clamped to ``static_max_cap`` (the compiled ceiling) and floored at 1;
+    ``pp_size == 1`` is a no-op.
     """
 
     def __init__(
@@ -255,17 +206,14 @@ class DecodeBatchBudget:
         self._count = 0
 
     def can_admit(self, *, apply_soft_cap: bool = True) -> bool:
-        """True iff one more decode request may be admitted this step.
+        """True iff one more decode may be admitted this step.
 
-        Two limits:
-          * hard cap (always): the compiled bucket ceiling; exceeding it
-            crashes the runner. Applies to every candidate decode join.
-          * soft cap (``apply_soft_cap``): the balance/spreading target
-            ``ceil(demand/pp)`` for the *budgeted* decode demand (running
-            decodes + ready remote-KV). Skip it (``apply_soft_cap=False``) for
-            joins not in the demand snapshot (full local prefix-cache match,
-            resumed-after-eviction) — they only face the hard limit. In static
-            mode the two caps are equal, so the flag has no effect.
+        * hard cap (always): the compiled bucket ceiling; exceeding it crashes
+          the runner.
+        * soft cap (``apply_soft_cap``): the ``ceil(demand/pp)`` spreading
+          target for the budgeted demand. Skip it for joins not in the demand
+          snapshot (full local prefix match, resumed-after-eviction). In static
+          mode the two caps are equal.
         """
         if self._count >= self._hard_cap:
             return False
@@ -280,12 +228,10 @@ class DecodeBatchBudget:
     def discard(self, n: int = 1) -> None:
         """Un-admit ``n`` decode requests dropped from this step's batch.
 
-        Unlike ``reset()`` (whole batch dropped by a prefill eviction), this
-        removes only the requests that left the batch while others remain
-        admitted -- currently the PRIORITY-policy preemption in the running
-        loop, which evicts an already-scheduled decode to free KV blocks.
-        Keeping the count in step with the batch keeps the subsequent
-        ``can_admit()`` gate from stopping early on a stale (over)count.
+        Unlike ``reset()`` (whole batch dropped), removes only requests that left
+        while others stay admitted -- the PRIORITY-policy preemption in the
+        running loop -- so the next ``can_admit()`` isn't stopped early on a
+        stale over-count.
         """
         self._count -= n
 
@@ -305,15 +251,11 @@ class DecodeBatchBudget:
 class DecodeAdmissionController:
     """Per-scheduler factory for per-step decode-batch admission budgets.
 
-    Built once from scheduler config; produces a fresh ``DecodeBatchBudget``
-    for each ``schedule()`` call. It owns the PP decode-cap machinery — the
-    compiled per-stage batch size, the static cap policy, and the choice
-    between the static cap and the PP-balanced dynamic cap — so ``schedule()``
-    only has to supply the demand and use the returned budget.
-
-    Dynamic (demand-spread) capping applies only when ``pp_balance_decode`` is
-    enabled *and* ``pipeline_parallel_size > 1``; otherwise the fixed
-    ``max_num_seqs // pp_size`` cap is used.
+    Built once from config; produces a fresh ``DecodeBatchBudget`` per
+    ``schedule()`` call. Owns the PP decode-cap machinery (compiled per-stage
+    size, static policy, and the static-vs-PP-balanced-dynamic choice). Dynamic
+    capping applies only when ``pp_balance_decode`` and
+    ``pipeline_parallel_size > 1``.
     """
 
     def __init__(

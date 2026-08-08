@@ -93,9 +93,6 @@ class RBLNEagleProposer(EagleProposer):
         )
 
         assert self.runner is not None
-        # Use the scheduler-stamped step phase (rank-consistent) rather than the
-        # runner's per-rank is_prefill property, which can diverge across PP
-        # ranks under spec-decode. Drives draft batch padding + draft attn build.
         is_prefill = self.runner.is_prefill_phase()
 
         # Build attention metadata

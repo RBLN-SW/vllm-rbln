@@ -12,11 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Pure-function helpers in ``vllm_rbln.v1.core.utils`` shared by the RBLN
-# scheduler and runner: ``decode_batch_size`` (the single source of truth for the
-# per-PP-stage compiled decode batch) and the spec-decode + PP token bookkeeping
-# (``should_defer_spec_step``, ``num_base_tokens``, ``resolve_propagated_token_write``).
-# The decode-batch admission budget classes are exercised in test_rbln_scheduler.py.
+# Pure-function helpers in v1/core/utils shared by the RBLN scheduler and runner:
+# decode_batch_size and the spec-decode + PP token bookkeeping. The decode-batch
+# admission budget classes are exercised in test_rbln_scheduler.py.
 
 import pytest
 
@@ -85,11 +83,8 @@ class TestSpecDecodePropagationHelpers:
 
     def test_write_out_of_window_asserts_broken_invariant(self):
         # A payload too short to cover [cursor, committed_tip) means the
-        # token-propagation invariant is broken (the non-last rank's cursor lags
-        # num_computed by more than num_spec_tokens). Fail loudly with a clear
-        # signal rather than returning a short slice that would then mismatch the
-        # width of token_ids_cpu[cursor:committed_tip] at the write site.
-        # committed_tip=101, span=4, payload len=1 -> lo=-3 -> assert.
+        # token-propagation invariant is broken; assert instead of returning a
+        # short slice. committed_tip=101, span=4, payload len=1 -> lo=-3.
         with pytest.raises(AssertionError, match="invariant is broken"):
             resolve_propagated_token_write(
                 cursor=97, num_computed_tokens=100, base=1, new_token_ids=[13]
