@@ -55,6 +55,7 @@ test = [
     "pytest-xdist",
     "pytest-cov",
     "pytest-timeout",
+    "arctic-inference",
 ]
 build = [
     "build",
