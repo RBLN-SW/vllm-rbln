@@ -106,6 +106,7 @@ class RBLNFlashAttnMLAImpl(MLAAttentionImpl[RBLNFlashAttentionMetadata]):
         kv_b_proj: ColumnParallelLinear,
         indexer=None,
         q_pad_num_heads: int | None = None,
+        topk_indices_buffer: torch.Tensor | None = None,
     ) -> None:
         self.num_heads = num_heads
         self.head_size = head_size
@@ -121,6 +122,13 @@ class RBLNFlashAttnMLAImpl(MLAAttentionImpl[RBLNFlashAttentionMetadata]):
         self.kv_b_proj = kv_b_proj
         self.indexer = indexer
         self.q_pad_num_heads = q_pad_num_heads
+        # NOTE(RBLN): vLLM's sparse MLA (DSA) path hands the impl a shared
+        # buffer that the indexer fills in place. RBLN cannot use an in-place
+        # buffer write inside the compiled graph, so
+        # `RBLNMultiHeadLatentAttentionWrapper.forward` instead threads the
+        # indexer's return value down as the `topk_indices` forward argument.
+        # Keep the buffer only so the upstream constructor contract holds.
+        self.topk_indices_buffer = topk_indices_buffer
 
         unsupported = [alibi_slopes, sliding_window, logits_soft_cap]
         if any(unsupported):
