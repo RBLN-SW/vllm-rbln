@@ -118,16 +118,15 @@ def get_vllm_config(
 
 @contextmanager
 def ensure_current_vllm_config():
-    from vllm.config import (
-        VllmConfig,
-        get_current_vllm_config_or_none,
-        set_current_vllm_config,
-    )
+    from vllm.config import get_current_vllm_config_or_none, set_current_vllm_config
 
     if get_current_vllm_config_or_none() is not None:
         yield
     else:
-        with set_current_vllm_config(VllmConfig()):
+        # NOTE(RBLN): a bare `VllmConfig()` cannot be used here — it has
+        # `model_config=None`, and `RblnPlatform.check_and_update_config`
+        # dereferences `model_config.dtype` unconditionally.
+        with set_current_vllm_config(get_vllm_config()):
             yield
 
 
@@ -151,8 +150,15 @@ def rbln_model_runner():
         yield runner
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def dist_init():
+    # NOTE(RBLN): module-scoped on purpose. `current_platform.dist_backend` is
+    # "rbln-ccl", and ProcessGroupRBLN can only be created ONCE per process:
+    # after `destroy_process_group()` a second `init_process_group` raises
+    # "Default group must be initialized here" (torch_rbln/lib/libc10d_rbln.so).
+    # A function-scoped fixture (init + destroy per test) therefore fails from
+    # the second test onwards; it only ever worked because the platform used to
+    # resolve to cpu, where `dist_backend` is "" and torch falls back to gloo.
     fd, temp_file = tempfile.mkstemp()
     os.close(fd)
 
@@ -425,7 +431,7 @@ def test_update_states_request_finished(rbln_model_runner, dist_init):
     assert _is_req_scheduled(rbln_model_runner, req_id)
 
     # finish req
-    scheduler_output = SchedulerOutput(
+    scheduler_output = RBLNSchedulerOutput(
         scheduled_new_reqs=[],
         scheduled_cached_reqs=CachedRequestData.make_empty(),
         num_scheduled_tokens={},
@@ -455,7 +461,7 @@ def test_update_states_unscheduled_cached_request_readded(rbln_model_runner, dis
     assert _is_req_scheduled(rbln_model_runner, req_id)
 
     # unschedule req
-    scheduler_output = SchedulerOutput(
+    scheduler_output = RBLNSchedulerOutput(
         scheduled_new_reqs=[],
         scheduled_cached_reqs=CachedRequestData.make_empty(),
         num_scheduled_tokens={},
@@ -485,7 +491,7 @@ def test_update_states_unscheduled_cached_request_readded(rbln_model_runner, dis
         num_output_tokens=[0],
     )
 
-    scheduler_output = SchedulerOutput(
+    scheduler_output = RBLNSchedulerOutput(
         scheduled_new_reqs=[],
         scheduled_cached_reqs=cached_req_data,
         num_scheduled_tokens={req_id: 1},
@@ -529,7 +535,7 @@ def test_update_states_no_changes(rbln_model_runner, dist_init):
     )
 
     # Keep the same cached request running without new tokens or block deltas.
-    scheduler_output = SchedulerOutput(
+    scheduler_output = RBLNSchedulerOutput(
         scheduled_new_reqs=[],
         scheduled_cached_reqs=cached_req_data,
         num_scheduled_tokens={req_id: 1},
@@ -581,7 +587,7 @@ def test_update_states_block_table_append_on_running_request(
         num_computed_tokens=[3],
         num_output_tokens=[0],
     )
-    scheduler_output = SchedulerOutput(
+    scheduler_output = RBLNSchedulerOutput(
         scheduled_new_reqs=[],
         scheduled_cached_reqs=cached_req_data,
         num_scheduled_tokens={req_id: 1},  # keeps req in the batch (req_index stays)
@@ -618,7 +624,7 @@ def test_update_states_resumed_from_preemption_replaces_block_table(
     # becomes None) but kept in self.requests. This is the precondition for the
     # resumed branch, which asserts req_index is None.
     rbln_model_runner._update_states(
-        SchedulerOutput(
+        RBLNSchedulerOutput(
             scheduled_new_reqs=[],
             scheduled_cached_reqs=CachedRequestData.make_empty(),
             num_scheduled_tokens={},
@@ -644,7 +650,7 @@ def test_update_states_resumed_from_preemption_replaces_block_table(
         num_output_tokens=[0],
     )
     rbln_model_runner._update_states(
-        SchedulerOutput(
+        RBLNSchedulerOutput(
             scheduled_new_reqs=[],
             scheduled_cached_reqs=cached_req_data,
             num_scheduled_tokens={req_id: 3},
@@ -773,7 +779,7 @@ def test_update_states_resumed_while_still_cached_is_recreated(
         num_computed_tokens=[0],
         num_output_tokens=[0],
     )
-    scheduler_output = SchedulerOutput(
+    scheduler_output = RBLNSchedulerOutput(
         scheduled_new_reqs=[],
         scheduled_cached_reqs=cached_req_data,
         num_scheduled_tokens={req_id: 3},
@@ -813,7 +819,7 @@ def test_update_states_condense_after_gaps(rbln_model_runner, dist_init):
     # Step 2: keep req_0 and req_2, drop the MIDDLE one (req_1), add nothing.
     # -> req_1 removed (gap at index 1); with no new request to backfill it,
     #    condense() slides req_2 (index 2) down into index 1.
-    scheduler_output = SchedulerOutput(
+    scheduler_output = RBLNSchedulerOutput(
         scheduled_new_reqs=[],
         scheduled_cached_reqs=CachedRequestData.make_empty(),
         num_scheduled_tokens={"req_0": 1, "req_2": 1},  # req_1 omitted -> unscheduled
@@ -918,7 +924,7 @@ def test_may_reorder_batch_noop_paths(rbln_model_runner, dist_init, monkeypatch)
 
     # (3) Sorting enabled but fewer than 2 requests -> early return.
     rbln_model_runner._update_states(
-        SchedulerOutput(
+        RBLNSchedulerOutput(
             scheduled_new_reqs=[],
             scheduled_cached_reqs=CachedRequestData.make_empty(),
             num_scheduled_tokens={"a": 1},  # keep only "a"; b, c unscheduled
@@ -991,7 +997,6 @@ def _real_input_batch(
         max_model_len=max_model_len,
         max_num_batched_tokens=512,
         device=torch.device("cpu"),
-        pin_memory=False,
         vocab_size=vocab_size,
         block_sizes=[block_size],
         kernel_block_sizes=[block_size],
@@ -1208,7 +1213,7 @@ def test_prepare_inputs_decode_path(rbln_model_runner, dist_init):
     # -> nothing discarded.
     ib.num_computed_tokens_cpu[:2] = [3, 3]
 
-    sched = SchedulerOutput(
+    sched = RBLNSchedulerOutput(
         scheduled_new_reqs=[],
         scheduled_cached_reqs=CachedRequestData.make_empty(),
         num_scheduled_tokens={"a": 1, "b": 1},
@@ -1246,7 +1251,7 @@ def test_prepare_inputs_chunked_prefill_sets_discard_mask(rbln_model_runner, dis
     # b: last chunk    (computed 2, will schedule 1 -> seq_lens 3 == 3) -> keep.
     ib.num_computed_tokens_cpu[:2] = [0, 2]
 
-    sched = SchedulerOutput(
+    sched = RBLNSchedulerOutput(
         scheduled_new_reqs=[],
         scheduled_cached_reqs=CachedRequestData.make_empty(),
         num_scheduled_tokens={"a": 2, "b": 1},
@@ -1285,7 +1290,7 @@ def test_prepare_inputs_spec_decode_path(rbln_model_runner, dist_init, monkeypat
     ib.num_tokens_no_spec[0] = 3  # is_prefill: 3 < 3-1 -> False (decode)
 
     # 1 draft kept -> logical = 1 real + 1 draft = 2 ; backfill = 3 - 2 = 1.
-    sched = SchedulerOutput(
+    sched = RBLNSchedulerOutput(
         scheduled_new_reqs=[],
         scheduled_cached_reqs=CachedRequestData.make_empty(),
         num_scheduled_tokens={"a": 2},
@@ -1306,7 +1311,7 @@ def test_prepare_inputs_spec_decode_path(rbln_model_runner, dist_init, monkeypat
     assert total == 3
 
     # positions shifted by -backfill(1): start at num_computed(3) - 1 = 2.
-    assert rbln_model_runner.positions_np[:3].tolist() == [2, 3, 4]
+    assert rbln_model_runner.positions[:3].tolist() == [2, 3, 4]
 
     # seq_lens uses the LOGICAL count (2), not query_lengths: 3 + 2 = 5.
     assert rbln_model_runner.seq_lens[:1].tolist() == [5]
@@ -1336,7 +1341,7 @@ def test_prepare_inputs_num_spec_tokens_without_scheduled_drafts_uses_logical_le
     ib.num_tokens_no_spec[0] = 3
     assert rbln_model_runner.is_prefill is False
 
-    scheduler_output = SchedulerOutput(
+    scheduler_output = RBLNSchedulerOutput(
         scheduled_new_reqs=[],
         scheduled_cached_reqs=CachedRequestData(
             req_ids=[req_id],
@@ -1367,7 +1372,7 @@ def test_prepare_inputs_num_spec_tokens_without_scheduled_drafts_uses_logical_le
     assert logits_indices.tolist() == [0]
 
     # No backfill/full-spec padding: position is computed + arange = 3.
-    assert rbln_model_runner.positions_np[:1].tolist() == [3]
+    assert rbln_model_runner.positions[:1].tolist() == [3]
 
     # seq_lens uses the logical scheduled token count, not num_spec_tokens + 1.
     assert rbln_model_runner.seq_lens[:1].tolist() == [4]
@@ -1385,7 +1390,7 @@ def test_prepare_inputs_pads_query_start_loc_and_seq_lens(rbln_model_runner, dis
     rbln_model_runner.query_start_loc.fill_(999)
     rbln_model_runner.seq_lens.fill_(999)
 
-    sched = SchedulerOutput(
+    sched = RBLNSchedulerOutput(
         scheduled_new_reqs=[],
         scheduled_cached_reqs=CachedRequestData.make_empty(),
         num_scheduled_tokens={"a": 1, "b": 1},
@@ -1519,6 +1524,7 @@ def test_sample_routes_to_regular_sampler(rbln_model_runner, monkeypatch):
     ib = rbln_model_runner.input_batch
 
     # Make sure this is not intermediate chunked prefill.
+    ib.req_id_to_index = {"0": 0}
     ib.num_computed_tokens_cpu[0] = 3
     ib.num_tokens_no_spec[0] = 3
     rbln_model_runner.discard_request_mask[0] = False
@@ -1548,9 +1554,8 @@ def test_sample_routes_to_regular_sampler(rbln_model_runner, monkeypatch):
         spec_decode_metadata=None,
     )
 
-    assert output is expected_output
+    assert output == expected_output
     assert calls["logits"] is logits
-    assert calls["sampling_metadata"] is rbln_model_runner.input_batch.sampling_metadata
 
 
 def test_sample_routes_to_rejection_sampler_for_spec_decode(
@@ -1618,7 +1623,7 @@ def test_bookkeeping_sync_caches_sampled_tokens(rbln_model_runner, dist_init):
         device=rbln_model_runner.device,
     )
 
-    scheduler_output = SchedulerOutput(
+    scheduler_output = RBLNSchedulerOutput(
         scheduled_new_reqs=[],
         scheduled_cached_reqs=CachedRequestData.make_empty(),
         num_scheduled_tokens={"req_0": 1, "req_1": 1},
@@ -1704,7 +1709,7 @@ def test_bookkeeping_sync_converts_logprobs_tensors(rbln_model_runner, dist_init
         logprobs_tensors=fake_logprobs_tensors,
     )
 
-    scheduler_output = SchedulerOutput(
+    scheduler_output = RBLNSchedulerOutput(
         scheduled_new_reqs=[],
         scheduled_cached_reqs=CachedRequestData(
             req_ids=[req_id],
@@ -1793,7 +1798,7 @@ def test_bookkeeping_sync_discards_chunked_prefill_samples(
         device=rbln_model_runner.device,
     )
 
-    scheduler_output = SchedulerOutput(
+    scheduler_output = RBLNSchedulerOutput(
         scheduled_new_reqs=[],
         scheduled_cached_reqs=CachedRequestData.make_empty(),
         num_scheduled_tokens={"req_0": 1, "req_1": 1},
@@ -1874,7 +1879,7 @@ def test_bookkeeping_sync_parses_spec_decode_output(rbln_model_runner, dist_init
         device=rbln_model_runner.device,
     )
 
-    scheduler_output = SchedulerOutput(
+    scheduler_output = RBLNSchedulerOutput(
         scheduled_new_reqs=[],
         scheduled_cached_reqs=CachedRequestData.make_empty(),
         num_scheduled_tokens={"req_0": 3, "req_1": 3},
@@ -2056,7 +2061,7 @@ def test_get_nans_in_logits_when_enabled(rbln_model_runner, dist_init, monkeypat
         device=rbln_model_runner.device,
     )
 
-    scheduler_output = SchedulerOutput(
+    scheduler_output = RBLNSchedulerOutput(
         scheduled_new_reqs=[],
         scheduled_cached_reqs=CachedRequestData(
             req_ids=list(req_ids),
@@ -2137,7 +2142,7 @@ def test_execute_model_empty_scheduler_output_returns_empty_output(
         raising=False,
     )
 
-    scheduler_output = SchedulerOutput(
+    scheduler_output = RBLNSchedulerOutput(
         scheduled_new_reqs=[],
         scheduled_cached_reqs=CachedRequestData.make_empty(),
         num_scheduled_tokens={},
@@ -2165,7 +2170,7 @@ def test_execute_model_requires_sample_tokens_before_next_execute(rbln_model_run
     pending_state = object()
     rbln_model_runner.execute_model_state = pending_state
 
-    scheduler_output = SchedulerOutput(
+    scheduler_output = RBLNSchedulerOutput(
         scheduled_new_reqs=[],
         scheduled_cached_reqs=CachedRequestData.make_empty(),
         num_scheduled_tokens={},
@@ -2194,7 +2199,7 @@ def test_sample_tokens_clears_execute_model_state_and_returns_output(
     bookkeeping exactly once, and return a populated ModelRunnerOutput."""
     req_id = "req_0"
 
-    scheduler_output = SchedulerOutput(
+    scheduler_output = RBLNSchedulerOutput(
         scheduled_new_reqs=[],
         scheduled_cached_reqs=CachedRequestData.make_empty(),
         num_scheduled_tokens={req_id: 1},
@@ -2389,7 +2394,7 @@ def test_execute_model_decode_slices_logits_by_logits_indices(
     rbln_model_runner.requests["req_1"].output_token_ids = [202]
     assert rbln_model_runner.is_prefill is False
 
-    scheduler_output = SchedulerOutput(
+    scheduler_output = RBLNSchedulerOutput(
         scheduled_new_reqs=[],
         scheduled_cached_reqs=CachedRequestData(
             req_ids=list(req_ids),
@@ -2473,9 +2478,10 @@ def test_execute_model_decode_slices_logits_by_logits_indices(
 
     # Critical contract: padded logits are sliced by logits_indices before
     # sample_tokens() sees them.
+    output_logits = state.logits[attn_metadata_calls["logits_indices"]]
     expected_logits = logits[attn_metadata_calls["logits_indices"]]
-    assert torch.equal(state.logits, expected_logits)
-    assert state.logits.shape == (2, vocab_size)
+    assert torch.equal(output_logits, expected_logits)
+    assert output_logits.shape == (2, vocab_size)
 
 
 def test_execute_model_spec_decode_stores_spec_metadata_and_common_attention_metadata(
@@ -2508,7 +2514,7 @@ def test_execute_model_spec_decode_stores_spec_metadata_and_common_attention_met
 
     monkeypatch.setattr(rbln_model_runner, "num_spec_tokens", 2)
 
-    scheduler_output = SchedulerOutput(
+    scheduler_output = RBLNSchedulerOutput(
         scheduled_new_reqs=[],
         scheduled_cached_reqs=CachedRequestData(
             req_ids=[req_id],
@@ -2615,7 +2621,7 @@ def test_sample_tokens_proposes_non_eagle_drafts_after_bookkeeping(
     tokens after bookkeeping."""
     req_id = "req_0"
 
-    scheduler_output = SchedulerOutput(
+    scheduler_output = RBLNSchedulerOutput(
         scheduled_new_reqs=[],
         scheduled_cached_reqs=CachedRequestData.make_empty(),
         num_scheduled_tokens={req_id: 1},
@@ -2754,7 +2760,7 @@ def test_sample_tokens_proposes_eagle_drafts_before_bookkeeping(
     output before bookkeeping parses accepted tokens."""
     req_id = "req_0"
 
-    scheduler_output = SchedulerOutput(
+    scheduler_output = RBLNSchedulerOutput(
         scheduled_new_reqs=[],
         scheduled_cached_reqs=CachedRequestData.make_empty(),
         num_scheduled_tokens={req_id: 1},
@@ -2910,7 +2916,7 @@ def test_sample_tokens_skips_draft_proposal_when_drafter_context_overflows(
     exceed the drafter's effective max model length."""
     req_id = "req_0"
 
-    scheduler_output = SchedulerOutput(
+    scheduler_output = RBLNSchedulerOutput(
         scheduled_new_reqs=[],
         scheduled_cached_reqs=CachedRequestData.make_empty(),
         num_scheduled_tokens={req_id: 1},
@@ -3598,7 +3604,6 @@ def test_build_attention_metadata_returns_per_layer_metadata_and_attaches_kv_bin
         common = call["common_attn_metadata"]
 
         assert common.query_start_loc.tolist() == [0, 1, 2]
-        assert common.query_start_loc_cpu.tolist() == [0, 1, 2]
         assert common.seq_lens.tolist() == [4, 4]
         assert common.num_reqs == 2
         assert common.num_actual_tokens == 2

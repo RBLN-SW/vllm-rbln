@@ -32,7 +32,6 @@ def get_param_paligemma(
         memory_budget,
         prefill_chunk_size,
     )
-    # paligemma pins its own prefill_chunk_size; this overrides the resolved one.
-    language_model_config["prefill_chunk_size"] = 8192
+    language_model_config["prefill_chunk_size"] = max_model_len
     param = {"language_model": language_model_config}
     return param

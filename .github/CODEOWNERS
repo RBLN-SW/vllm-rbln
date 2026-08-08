@@ -1,0 +1,25 @@
+# See https://help.github.com/articles/about-codeowners
+# for more info about CODEOWNERS file
+
+# vllm_rbln
+/vllm_rbln/compilation @rebel-cjlee @rebel-minkyu
+/vllm_rbln/distributed @rebel-cjlee @rebel-minkyu
+/vllm_rbln/distributed/ec_transfer @rebel-eunji @rebel-jonghewk
+/vllm_rbln/lora @rebel-cjlee @rebel-minkyu
+/vllm_rbln/model_executor @rebel-cjlee @rebel-minkyu
+/vllm_rbln/model_executor/model_loader @rebel-cjlee @rebel-minkyu @rebel-eunji @rebel-jonghewk
+/vllm_rbln/model_executor/models/optimum @rebel-eunji @rebel-jonghewk
+/vllm_rbln/models @rebel-cjlee @rebel-minkyu
+/vllm_rbln/patches @rebel-cjlee @rebel-minkyu
+/vllm_rbln/utils/optimum @rebel-eunji @rebel-jonghewk
+/vllm_rbln/v1 @rebel-cjlee @rebel-minkyu
+/vllm_rbln/v1/**/optimum_* @rebel-eunji @rebel-jonghewk
+/vllm_rbln/v1/core/prefix_cache_manager @rebel-eunji @rebel-jonghewk
+/vllm_rbln/v1/sample @rebel-eunji @rebel-jonghewk
+/vllm_rbln/v1/worker/ec_disagg_helpers.py @rebel-eunji @rebel-jonghewk
+/vllm_rbln/v1/worker/metrics.py @rebel-eunji @rebel-jonghewk
+/vllm_rbln/v1/worker/rbln_model_runner.py @rebel-cjlee @rebel-minkyu @rebel-jonghewk
+/vllm_rbln/v1/worker/utils.py @rebel-cjlee @rebel-minkyu @rebel-eunji @rebel-jonghewk
+
+# test
+/tests/native @rebel-cjlee

@@ -26,6 +26,8 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from vllm_rbln.custom_ops import custom_op, register_fake
+
 # ---------------------------------------------------------------------------
 # Mask generation helpers
 # ---------------------------------------------------------------------------
@@ -55,7 +57,7 @@ def prepare_send_mask_matrix(R: int, E: int) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 
-@torch.library.custom_op(
+@custom_op(
     "rbln_custom_ops::ccl_dispatch_send",
     mutates_args=(),
 )
@@ -81,7 +83,7 @@ def ccl_dispatch_send(
     return send_buffer, send_sizes
 
 
-@ccl_dispatch_send.register_fake
+@register_fake("rbln_custom_ops::ccl_dispatch_send")
 def _ccl_dispatch_send_fake(
     hidden_states: Tensor,
     router_logits: Tensor,
@@ -102,7 +104,7 @@ def _ccl_dispatch_send_fake(
 # ---------------------------------------------------------------------------
 
 
-@torch.library.custom_op(
+@custom_op(
     "rbln_custom_ops::ccl_all2all_x_kernel",
     mutates_args=(),
 )
@@ -120,7 +122,7 @@ def ccl_all2all_x_kernel(
     return torch.zeros(R, t, H, dtype=send_buffer.dtype)
 
 
-@ccl_all2all_x_kernel.register_fake
+@register_fake("rbln_custom_ops::ccl_all2all_x_kernel")
 def _ccl_all2all_x_kernel_fake(
     send_buffer: Tensor,
     send_sizes: Tensor,
@@ -138,7 +140,7 @@ def _ccl_all2all_x_kernel_fake(
 # ---------------------------------------------------------------------------
 
 
-@torch.library.custom_op(
+@custom_op(
     "rbln_custom_ops::ccl_dispatch_receive",
     mutates_args=(),
 )
@@ -177,7 +179,7 @@ def ccl_dispatch_receive(
     return unpacked
 
 
-@ccl_dispatch_receive.register_fake
+@register_fake("rbln_custom_ops::ccl_dispatch_receive")
 def _ccl_dispatch_receive_fake(
     recv_buffer: Tensor,
     router_logits: Tensor,
@@ -195,7 +197,7 @@ def _ccl_dispatch_receive_fake(
 # ---------------------------------------------------------------------------
 
 
-@torch.library.custom_op(
+@custom_op(
     "rbln_custom_ops::ccl_combine_send",
     mutates_args=(),
 )
@@ -234,7 +236,7 @@ def ccl_combine_send(
     return send_buffer, send_sizes
 
 
-@ccl_combine_send.register_fake
+@register_fake("rbln_custom_ops::ccl_combine_send")
 def _ccl_combine_send_fake(
     hidden_states: Tensor,
     router_logits: Tensor,
@@ -254,7 +256,7 @@ def _ccl_combine_send_fake(
 # ---------------------------------------------------------------------------
 
 
-@torch.library.custom_op(
+@custom_op(
     "rbln_custom_ops::ccl_combine_receive",
     mutates_args=(),
 )
@@ -309,7 +311,7 @@ def ccl_combine_receive(
     return unpacked.sum(dim=0)
 
 
-@ccl_combine_receive.register_fake
+@register_fake("rbln_custom_ops::ccl_combine_receive")
 def _ccl_combine_receive_fake(
     recv_buffer: Tensor,
     router_logits: Tensor,

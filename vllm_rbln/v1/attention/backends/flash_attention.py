@@ -158,6 +158,29 @@ class RBLNFlashAttentionMetadataBuilder(
         self.enforce_eager = get_current_vllm_config().model_config.enforce_eager
         self.is_causal = envs.VLLM_RBLN_FLASH_CAUSAL_ATTN
 
+        self._staged: dict[tuple, torch.Tensor] = {}
+
+    def _stage(self, t: torch.Tensor | None, slot: str) -> torch.Tensor | None:
+        """Copy a host tensor into this builder's persistent device buffer.
+
+        `slot` must be unique per logical tensor: cache_seq_lens and
+        cache_offsets share both shape and dtype, so keying on those alone
+        would silently make them share one buffer.
+
+        The returned tensor is overwritten by the next build() call, so the
+        caller must run the forward pass before building again. That holds
+        because each AttentionGroup owns its own builder instance and every
+        build() is immediately followed by a forward.
+        """
+        if t is None:
+            return None
+        key = (slot, t.shape, t.dtype)
+        if (buf := self._staged.get(key)) is None:
+            buf = torch.empty(t.shape, dtype=t.dtype, device=self.device)
+            self._staged[key] = buf
+        buf.copy_(t)
+        return buf
+
     def reorder_batch(
         self, input_batch: "InputBatch", scheduler_output: "SchedulerOutput"
     ) -> bool:
@@ -171,12 +194,15 @@ class RBLNFlashAttentionMetadataBuilder(
         is_prefill: bool,
     ) -> RBLNFlashAttentionMetadata:
         num_reqs = common_attn_metadata.num_reqs
-        query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
-        seq_lens = common_attn_metadata._seq_lens_cpu
+        # NOTE(RBLN): vllm-rbln keeps attention metadata on the host and copies
+        # to the device only when constructing RBLNFlashAttentionMetadata below.
+        # See RBLNModelRunner._build_attention_metadata.
+        query_start_loc_cpu = common_attn_metadata.query_start_loc
+        seq_lens_cpu = common_attn_metadata.seq_lens
         block_tables_tensor = common_attn_metadata.block_table_tensor
 
         query_seq_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
-        num_computed_tokens = seq_lens - query_seq_lens_cpu
+        num_computed_tokens = seq_lens_cpu - query_seq_lens_cpu
         seq_idx = positions[query_start_loc_cpu[:num_reqs]].view(-1, 1)
         max_seq_len = self.model_config.max_model_len
 
@@ -205,7 +231,6 @@ class RBLNFlashAttentionMetadataBuilder(
                     causal_mask
                 )
                 attn_masks = chunked_attention_mask
-                attn_masks = attn_masks.to(self.device)
         else:
             seq_idx = rbln_utils.pad(seq_idx, 0, batch_pad)
             block_tables_tensor = rbln_utils.pad(block_tables_tensor, 0, batch_pad)
@@ -218,10 +243,9 @@ class RBLNFlashAttentionMetadataBuilder(
                     max_seq_len,
                     dtype=torch.float16 if self.enforce_eager else torch.float32,
                 )
-                for batch_index, batch_step in enumerate(seq_lens):
+                for batch_index, batch_step in enumerate(seq_lens_cpu):
                     decode_attention_mask[batch_index, :, :, :, : batch_step + 1] = 1
                 attn_masks = decode_attention_mask
-                attn_masks = attn_masks.to(self.device)
 
         cache_seq_lens = None
         cache_offsets = None
@@ -229,7 +253,7 @@ class RBLNFlashAttentionMetadataBuilder(
         swa_attn_masks = None
         if sliding_window := getattr(self.kv_cache_spec, "sliding_window", None):
             num_computed_tokens = num_computed_tokens[:num_reqs].view(-1, 1)
-            seq_lens = seq_lens[:num_reqs].view(-1, 1)
+            seq_lens = seq_lens_cpu[:num_reqs].view(-1, 1)
             query_lens = seq_lens - num_computed_tokens
             cache_seq_lens = torch.clamp(num_computed_tokens, max=sliding_window)
             cache_offsets = cache_seq_lens + query_lens
@@ -246,22 +270,14 @@ class RBLNFlashAttentionMetadataBuilder(
             local_block_tables = block_tables_tensor[..., :1]
 
         attn_metadata = RBLNFlashAttentionMetadata(
-            seq_lens=seq_idx.to(self.device),
-            block_tables=block_tables_tensor.to(self.device),
+            seq_lens=self._stage(seq_idx, "seq_idx"),
+            block_tables=self._stage(block_tables_tensor, "block_tables"),
             is_prefill=is_prefill,
-            attn_masks=attn_masks,
-            cache_seq_lens=cache_seq_lens.to(self.device)
-            if cache_seq_lens is not None
-            else None,
-            cache_offsets=cache_offsets.to(self.device)
-            if cache_offsets is not None
-            else None,
-            local_block_tables=local_block_tables.to(self.device)
-            if local_block_tables is not None
-            else None,
-            swa_attn_masks=swa_attn_masks.to(self.device)
-            if swa_attn_masks is not None
-            else None,
+            attn_masks=self._stage(attn_masks, "attn_masks"),
+            cache_seq_lens=self._stage(cache_seq_lens, "cache_seq_lens"),
+            cache_offsets=self._stage(cache_offsets, "cache_offsets"),
+            local_block_tables=self._stage(local_block_tables, "local_block_tables"),
+            swa_attn_masks=self._stage(swa_attn_masks, "swa_attn_masks"),
         )
 
         return attn_metadata

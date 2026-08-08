@@ -22,12 +22,7 @@ def get_param_exaone4_5(
     memory_budget: float,
     prefill_chunk_size: int | None = None,
 ) -> dict:
-    param = {
-        "visual": {
-            # if tensor_parallel_size of submodule is not specified,
-            # it inherits tensor_parallel_size of main module.
-            "max_seq_len": 6400,
-        },
+    param: dict = {
         "num_devices": num_devices,
         "max_seq_len": max_model_len,
         "batch_size": batch_size,

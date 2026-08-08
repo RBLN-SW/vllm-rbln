@@ -22,17 +22,7 @@ def get_param_qwen2_vl(
     memory_budget: float,
     prefill_chunk_size: int | None = None,
 ) -> dict:
-    # Max sequence length for Vision Transformer (ViT), representing the number of patches in an image. # noqa: E501
-    # Example: For a 224x224 pixel image with patch size 14,
-    # this produces 256 patches [(224/14) * (224/14)]. Thus, max_seq_len must be at least 256. # noqa: E501
-    # RBLN optimization processes inference per image or video frame, so set max_seq_len to # noqa: E501
-    # match the maximum expected resolution to optimize computation.
-    param = {
-        "visual": {
-            # if num_devices of submodule is not specified,
-            # it inherits num_devices of main module.
-            "max_seq_len": 6400,
-        },
+    param: dict = {
         "num_devices": num_devices,
         "max_seq_len": max_model_len,
         "batch_size": batch_size,
@@ -53,6 +43,28 @@ def get_param_qwen2_vl(
 get_param_qwen2_5_vl = get_param_qwen2_vl
 get_param_qwen3_vl = get_param_qwen2_vl
 get_param_qwen3_vl_moe = get_param_qwen2_vl
+
+
+def get_param_qwen3_5(
+    batch_size: int,
+    max_model_len: int,
+    block_size: int,
+    num_devices: int,
+    memory_budget: float,
+    prefill_chunk_size: int | None = None,
+) -> dict:
+    # Qwen3.5's linear_attention layers use gated_delta_net; the full_attention
+    # layers require flash attention, so force it here.
+    param = get_param_qwen2_vl(
+        batch_size,
+        max_model_len,
+        block_size,
+        num_devices,
+        memory_budget,
+        prefill_chunk_size,
+    )
+    param["attn_impl"] = "flash_attn"
+    return param
 
 
 def get_overridable() -> frozenset[str]:

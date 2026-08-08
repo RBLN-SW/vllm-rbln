@@ -15,12 +15,14 @@ from dataclasses import replace
 from typing import Any
 
 import torch
+from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.qwen2_5_vl import (
     Qwen2_5_VLVideoPixelInputs,
 )
 
 from .base import ModelInputForRBLN
+from .optimum_attention import AttentionManager, LinearAttentionStrategy
 from .qwen2_vl import MODALITIES, RBLNOptimumQwen2_5_VLForConditionalGeneration
 
 logger = init_logger(__name__)
@@ -343,3 +345,127 @@ class RBLNOptimumQwen3VLMoeForConditionalGeneration(
     """
 
     pass
+
+
+class RBLNOptimumQwen3_5ForConditionalGeneration(
+    RBLNOptimumQwen2_5_VLForConditionalGeneration
+):
+    """
+    Vision-language Qwen3.5 for RBLN.
+
+    Qwen3.5 is a hybrid text backbone (GatedDeltaNet linear_attention layers + gated
+    full_attention layers). Its vision encoder returns the merged image embeddings (a
+    single tensor). It inherits the multimodal prefill path from Qwen2.5-VL.
+    """
+
+    def __init__(self, vllm_config: VllmConfig) -> None:
+        super().__init__(vllm_config=vllm_config)
+        # Per-request (batch_idx) into the [max_num_seqs] conv/recurrent state cache.
+        self.attention_manager: AttentionManager = AttentionManager(
+            LinearAttentionStrategy()
+        )
+
+    def _decode_batch_indices(self, model_input: ModelInputForRBLN) -> torch.Tensor:
+        """The state-cache row (batch_idx) of each running request, in running
+        order, as a tensor. This is only the index: the actual row placement is
+        done by the scatter (input_block_ids in forward / compute_decode_position_embed)
+        and undone by the logits gather (batch_indices in forward).
+        """
+        running = model_input.running_requests_ids
+        table_ids = self.attention_manager.get(
+            False, self.decoder_batch_size, running, []
+        )
+        return self.attention_manager.preprocess(
+            table_ids,
+            model_input.input_positions,
+            len(running),
+            self.decoder_batch_size,
+        )
+
+    def _add_model_specific_args(self, preprocess_args: dict, video_input: Any):
+        pass
+
+    def _create_video_pixel_inputs(
+        self,
+        pixel_values_videos: torch.Tensor,
+        video_grid_thw: torch.Tensor,
+        second_per_grid_ts: torch.Tensor | None = None,
+    ):
+        return Qwen2_5_VLVideoPixelInputs(
+            type="pixel_values_videos",
+            pixel_values_videos=pixel_values_videos,
+            video_grid_thw=video_grid_thw,
+            second_per_grid_ts=second_per_grid_ts,
+        )
+
+    def _image_token_id(self) -> int:
+        # Qwen3.5's HF config names the placeholder image_token_id (top-level), not
+        # image_token_index as the mixin default assumes.
+        return self.model.config.image_token_id
+
+    def compute_decode_position_embed(
+        self, model_input: ModelInputForRBLN, mrope_position_deltas: dict[str, float]
+    ) -> torch.Tensor:
+        # The base builds [2, max_num_seqs, ...] with the running requests at
+        # rows [0, n). Re-place each at its stable batch_idx row so the whole
+        # decode batch (position_embed / inputs_embeds / block_tables) is laid out
+        # by batch index, matching the [max_num_seqs] recurrent-state cache the
+        # graph indexes by row. forward lays out ids/embeds the same way.
+        position_embed = super().compute_decode_position_embed(
+            model_input, mrope_position_deltas
+        )
+        batch_indices = self._decode_batch_indices(model_input)
+        out = torch.zeros_like(position_embed)
+        out[:, batch_indices] = position_embed[:, : batch_indices.shape[0]]
+        return out
+
+    def forward(self, model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
+        """Qwen3.5 must place each request at its linear-attention batch_idx row.
+
+        The GatedDeltaNet linear_attention conv/recurrent state is a fixed
+        [max_num_seqs] on-device cache indexed by batch row. prefill writes
+        one row; decode reads/writes every row. So each request is pinned
+        to a stable batch_idx. prefill passes its batch_idx and decode lays
+        the batch out with the request at row == batch_idx, then gathers
+        logits back to running order.
+        """
+        input_ids = model_input.input_tokens
+        cache_position = model_input.input_positions
+        block_tables = model_input.block_tables
+
+        if model_input.is_prompt:
+            req_id = model_input.running_requests_ids[0]
+            batch_idx = self.attention_manager.get(
+                True, self.decoder_batch_size, [req_id], []
+            )[0]
+            self.attention_manager.add(req_id, batch_idx)
+            kw = self.preprocess_for_decoder(
+                True, block_tables, input_ids, cache_position
+            )
+            prefill_kwargs = {
+                "inputs_embeds": model_input.inputs_embeds,
+                "position_embed": model_input.position_embed,
+                "block_tables": kw.pop("block_tables"),
+                "cache_position": kw.pop("cache_position"),
+                "batch_idx": batch_idx,
+            }
+            return self.model.prefill_decoder(**prefill_kwargs).logits
+
+        batch_indices = self._decode_batch_indices(model_input)
+        kw = self.preprocess_for_decoder(
+            False,
+            block_tables,
+            input_ids,
+            cache_position,
+            input_block_ids=batch_indices,
+        )
+        input_ids = kw.pop("input_ids")
+        inputs_embeds = self.model.embed_tokens(input_ids).to(self.dtype)
+        self.model.decoder = self.model.decoders[self.decoder_batch_size]
+        logits = self.model.decoder(
+            inputs_embeds=inputs_embeds,
+            cache_position=kw.pop("cache_position"),
+            position_embed=model_input.position_embed,
+            block_tables=kw.pop("block_tables"),
+        ).logits
+        return logits[batch_indices]
