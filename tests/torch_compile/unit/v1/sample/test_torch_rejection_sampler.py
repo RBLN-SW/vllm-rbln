@@ -27,6 +27,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler, SamplerOutput
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
+import vllm_rbln.v1.sample.rbln_rejection_sampler as rejection_sampler_module
 from vllm_rbln.v1.sample.rbln_logits_processor import (
     RBLNMinTokensLogitsProcessor,
     build_rbln_logitsprocs,
@@ -34,6 +35,7 @@ from vllm_rbln.v1.sample.rbln_logits_processor import (
 from vllm_rbln.v1.sample.rbln_rejection_sampler import (
     PLACEHOLDER_TOKEN_ID,
     RBLNRejectionSampler,
+    TorchRejectionSamplerImpl,
 )
 
 from .utils import create_allowed_token_ids
@@ -1023,3 +1025,41 @@ def test_npu_impl_refuses_synthetic_mode(monkeypatch):
     spec_config.synthetic_acceptance_rates = [0.5, 0.5]
     with pytest.raises(AssertionError):
         RBLNRejectionSampler(mock_sampler, spec_config=spec_config, device="cpu")
+
+
+def test_dflash_uses_torch_impl_when_rbln_sampler_enabled(monkeypatch):
+    """DFlash must not allocate an extra device context for rejection sampling."""
+    monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1")
+    monkeypatch.setattr(rejection_sampler_module, "USE_DEVICE_TENSOR", True)
+    monkeypatch.setattr(
+        rejection_sampler_module,
+        "RBLNRejectionSamplerImpl",
+        Mock(return_value=object()),
+    )
+    mock_sampler = Mock(spec=Sampler)
+    mock_sampler.logprobs_mode = "raw_logprobs"
+    spec_config = Mock()
+    spec_config.method = "dflash"
+    spec_config.rejection_sample_method = "rejection_sampler"
+
+    sampler = RBLNRejectionSampler(mock_sampler, spec_config=spec_config, device="cpu")
+
+    assert isinstance(sampler.impl, TorchRejectionSamplerImpl)
+
+
+def test_non_dflash_keeps_rbln_impl_when_rbln_sampler_enabled(monkeypatch):
+    """The DFlash context-pressure workaround must not affect Eagle3."""
+    monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1")
+    monkeypatch.setattr(rejection_sampler_module, "USE_DEVICE_TENSOR", True)
+    rbln_impl = Mock(return_value=object())
+    monkeypatch.setattr(rejection_sampler_module, "RBLNRejectionSamplerImpl", rbln_impl)
+    mock_sampler = Mock(spec=Sampler)
+    mock_sampler.logprobs_mode = "raw_logprobs"
+    spec_config = Mock()
+    spec_config.method = "eagle3"
+    spec_config.rejection_sample_method = "rejection_sampler"
+
+    sampler = RBLNRejectionSampler(mock_sampler, spec_config=spec_config, device="cpu")
+
+    assert sampler.impl is rbln_impl.return_value
+    rbln_impl.assert_called_once_with(None, spec_config.num_speculative_tokens)

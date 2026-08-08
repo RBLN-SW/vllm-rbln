@@ -131,6 +131,7 @@ from vllm_rbln.v1.core.utils import (
 )
 from vllm_rbln.v1.sample.rbln_logits_processor import build_rbln_logitsprocs
 from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
+from vllm_rbln.v1.spec_decode.dflash import RBLNDFlashProposer
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
 from vllm_rbln.v1.worker import mega_cache
@@ -292,6 +293,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # This is not ideal if there are many layers in the draft model.
         self.drafter: (
             RBLNEagleProposer
+            | RBLNDFlashProposer
             | RBLNMedusaProposer
             | NgramProposer
             | SuffixDecodingProposer
@@ -304,6 +306,18 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 self.drafter = SuffixDecodingProposer(self.vllm_config)
             elif self.speculative_config.method == "medusa":
                 self.drafter = RBLNMedusaProposer(self.vllm_config, self.device)
+            elif self.speculative_config.use_dflash():
+                # MUST precede the use_eagle() branch: vLLM's use_eagle() returns
+                # True for "dflash", so without this the DFlash drafter would bind
+                # RBLNEagleProposer with no error -- doubly wrong, because EAGLE3
+                # drafts autoregressively while DFlash drafts a whole block in one
+                # non-causal forward, and the aux-hidden-state hookup below is
+                # gated on method == "eagle3" so the target would never export the
+                # 6 states DFlash needs. That failure mode is silent, not loud.
+                self.drafter = RBLNDFlashProposer(self.vllm_config, self.device, self)
+                self.use_aux_hidden_state_outputs = (
+                    self.drafter.eagle3_use_aux_hidden_state
+                )
             elif self.speculative_config.use_eagle():
                 self.drafter = RBLNEagleProposer(self.vllm_config, self.device, self)
                 if self.speculative_config.method == "eagle3":

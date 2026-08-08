@@ -140,6 +140,25 @@ class RBLNFlashAttentionMetadata:
         )
 
 
+def _resolve_is_causal(vllm_config: VllmConfig | None) -> bool:
+    """Per-model causality instead of one global switch.
+
+    `VLLM_RBLN_FLASH_CAUSAL_ATTN` is process-wide, but a cross-attention drafter
+    needs the DRAFTER non-causal while the TARGET stays causal in the same
+    process. DFlash asks for exactly that: upstream `_create_draft_vllm_config`
+    sets `attention_config.use_non_causal=True` on the draft config only, and
+    each model's attention layers are constructed under their own config, so
+    honouring that field scopes causality to the model that requested it.
+
+    Defaults to the env flag when the field is absent, so every existing path
+    (target models, EAGLE3, medusa, ngram) is unchanged.
+    """
+    if not envs.VLLM_RBLN_FLASH_CAUSAL_ATTN:
+        return False
+    attention_config = getattr(vllm_config, "attention_config", None)
+    return not getattr(attention_config, "use_non_causal", False)
+
+
 class RBLNFlashAttentionMetadataBuilder(
     AttentionMetadataBuilder[RBLNFlashAttentionMetadata]
 ):
@@ -159,7 +178,7 @@ class RBLNFlashAttentionMetadataBuilder(
         self.block_size = kv_cache_spec.block_size
         self.chunked_prefill_size = self.scheduler_config.max_num_batched_tokens
         self.enforce_eager = get_current_vllm_config().model_config.enforce_eager
-        self.is_causal = envs.VLLM_RBLN_FLASH_CAUSAL_ATTN
+        self.is_causal = _resolve_is_causal(vllm_config)
 
         self._staged: dict[tuple, torch.Tensor] = {}
 
@@ -359,7 +378,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
             if len(self.sinks.size()) == 1:
                 self.sinks = self.sinks[:, None]
 
-        self.is_causal = envs.VLLM_RBLN_FLASH_CAUSAL_ATTN
+        self.is_causal = _resolve_is_causal(vllm_config)
         self.is_batch_attention_opt = envs.VLLM_RBLN_BATCH_ATTN_OPT
         self.is_normal = (self.block_size == self.max_model_len) and (
             self.sinks is None

@@ -65,7 +65,19 @@ class RBLNRejectionSampler(RejectionSampler):
             spec_config.num_speculative_tokens if spec_config is not None else 0
         )
 
-        if envs.VLLM_RBLN_SAMPLER:
+        # DFlash with device tensors keeps several compiled graph contexts live.
+        # Its rejection-sampler inputs are CPU tensors anyway, so compiling the
+        # sampler for RBLN only consumes another device context and can exhaust
+        # the hardware context limit on large models such as MiniMax-M2.5.
+        use_rbln_impl = envs.VLLM_RBLN_SAMPLER and not (
+            USE_DEVICE_TENSOR and getattr(spec_config, "method", None) == "dflash"
+        )
+        if envs.VLLM_RBLN_SAMPLER and not use_rbln_impl:
+            logger.warning_once(
+                "DFlash with device tensors uses the CPU rejection sampler to "
+                "avoid allocating an additional RBLN device context."
+            )
+        if use_rbln_impl:
             assert not self.synthetic_mode, (
                 "RBLNRejectionSampler does not support synthetic rejection "
                 "sampling (rejection_sample_method='synthetic'). Use "
@@ -73,7 +85,7 @@ class RBLNRejectionSampler(RejectionSampler):
             )
         self.impl = (
             RBLNRejectionSamplerImpl(compile_context, num_spec_tokens)
-            if envs.VLLM_RBLN_SAMPLER
+            if use_rbln_impl
             else TorchRejectionSamplerImpl()
         )
 
