@@ -1,0 +1,41 @@
+name: vllm-rbln / Native / Nightly
+
+# tests/native 스위트를 매일 밤 dev 기준으로 돌린다. PR CI 와 같은 내용이며,
+# 대형 모델·추가 축은 앞으로 여기에 붙인다.
+#
+# 03:00 KST 는 기존 nightly 들과 겹치지 않는 슬롯이다
+# (01:00 vllm-rbln nightly / 02:00 mlfi · torch_compile nightly-e2e).
+
+on:
+  schedule:
+    # Daily 03:00 KST (18:00 UTC)
+    - cron: '0 18 * * *'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "vllm-rbln ref to test (branch, tag, or SHA). Defaults to dev."
+        required: false
+        type: string
+        default: dev
+
+jobs:
+  dispatch:
+    name: Dispatch native nightly to fsw-integration
+    if: github.repository_owner == 'RBLN-SW'
+    runs-on: fsw-r18s-atom-ext-rbln-sw-general-c1m12
+    steps:
+      - name: Dispatch to fsw-integration
+        uses: Wandalen/wretry.action@v3
+        with:
+          action: peter-evans/repository-dispatch@v4
+          attempt_limit: 5
+          attempt_delay: 2000
+          with: |
+            token: ${{ secrets.GIT_PAT }}
+            repository: rebellions-sw/fsw-integration
+            event-type: vllm-rbln-native-nightly-event
+            client-payload: |
+              {
+                "ref": "${{ inputs.ref || 'dev' }}",
+                "actor": "${{ github.actor }}"
+              }
