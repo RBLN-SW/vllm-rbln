@@ -31,7 +31,7 @@ from vllm.v1.core.sched.output import (
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutputs
-from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.utils import record_function_or_nullcontext
 
@@ -1134,6 +1134,74 @@ class RBLNScheduler(Scheduler):
         # never be scheduled again.
         self._pending_runner_block_deltas.pop(request.request_id, None)
         return super()._free_request(request, delay_free_blocks)
+
+    def _update_from_kv_xfer_finished(
+        self, kv_connector_output: KVConnectorOutput
+    ) -> None:
+        """Drop stale/duplicate ``finished_recving`` ids before upstream sees them.
+
+        Upstream assumes at most **one** connector reports a finished receive per
+        request::
+
+            for req_id in kv_connector_output.finished_recving or ():
+                req = self.requests[req_id]
+                if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+                    self.finished_recving_kv_req_ids.add(req_id)
+                else:
+                    assert RequestStatus.is_finished(req.status)   # <-- blows up
+                    self._free_blocks(...)
+
+        That does not hold under ``MultiConnector`` in a PD-disaggregated setup:
+        two children attach to the same request for *different* reasons — NIXL via
+        ``do_remote_prefill`` (the PD receive) and an offload connector (LMCache mp)
+        via a prefix match (``get_num_new_matched_tokens``). The scheduler-side
+        ownership map ``_requests_to_connector`` only covers the latter, and
+        ``MultiConnector.get_finished`` unions every child's ``finished_recving``
+        with no cross-step de-dup (``finished_sending`` *does* have one, via
+        ``_extra_async_saves``). ``finished_recving`` is a set, so same-step
+        duplicates collapse; the ones that survive arrive in *different* steps:
+
+            step N   : NIXL reports the PD receive -> WAITING_FOR_REMOTE_KVS -> RUNNING
+            step N+k : the offload connector reports its own load -> already RUNNING
+                       -> assert fires -> EngineCore dies -> gloo peers drop ->
+                          EngineDeadError across the DP group
+
+        A duplicate for a RUNNING request carries no work: the request already has
+        its KV and is decoding, so freeing its blocks here would be actively wrong.
+        Ignoring it is the correct action, so filter those ids out and let upstream
+        handle the rest unchanged.
+
+        Fix this properly upstream (de-dup ``finished_recving`` in
+        ``MultiConnector.get_finished`` the way ``finished_sending`` already is) and
+        this override can go away.
+        """
+        finished_recving = getattr(kv_connector_output, "finished_recving", None)
+        if finished_recving:
+            kept = set()
+            for req_id in finished_recving:
+                req = self.requests.get(req_id)
+                if req is None:
+                    # Upstream asserts membership; a notification for a request the
+                    # scheduler already dropped is stale by definition.
+                    logger.warning(
+                        "Dropping finished_recving for unknown request %s", req_id
+                    )
+                    continue
+                if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS or (
+                    RequestStatus.is_finished(req.status)
+                ):
+                    kept.add(req_id)
+                else:
+                    logger.warning(
+                        "Dropping duplicate finished_recving for request %s "
+                        "(status=%s) — another connector already completed its "
+                        "receive",
+                        req_id,
+                        req.status.name,
+                    )
+            kv_connector_output.finished_recving = kept or None
+
+        super()._update_from_kv_xfer_finished(kv_connector_output)
 
     def update_from_output(
         self,
