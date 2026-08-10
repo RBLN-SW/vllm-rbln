@@ -52,14 +52,16 @@ def build_op_top_k_top_p(
             torch.full((batch_size,), GREEDY_TOP_P, dtype=torch.float32, device=device),
         )
 
+    # vLLM already allocates these as int32 / float32 on the batch's device, so
+    # they feed the op as they are; only a missing one has to be built.
     top_k = (
-        sampling_metadata.top_k.to(device=device, dtype=torch.int32)
+        sampling_metadata.top_k
         if sampling_metadata.top_k is not None
         # vLLM stores `top_k=0` (unset) as `vocab_size`, which disables top-k.
         else torch.full((batch_size,), vocab_size, dtype=torch.int32, device=device)
     )
     top_p = (
-        sampling_metadata.top_p.to(device=device, dtype=torch.float32)
+        sampling_metadata.top_p
         if sampling_metadata.top_p is not None
         else torch.ones(batch_size, dtype=torch.float32, device=device)
     )
@@ -69,7 +71,7 @@ def build_op_top_k_top_p(
         return top_k, top_p
 
     assert sampling_metadata.temperature is not None
-    is_greedy = (sampling_metadata.temperature == GREEDY_TEMPERATURE).to(device)
+    is_greedy = sampling_metadata.temperature == GREEDY_TEMPERATURE
     return (
         torch.where(is_greedy, top_k.new_full((), GREEDY_TOP_K), top_k),
         torch.where(is_greedy, top_p.new_full((), GREEDY_TOP_P), top_p),

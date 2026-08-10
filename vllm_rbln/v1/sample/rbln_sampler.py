@@ -206,8 +206,6 @@ class RBLNSampler(VLLMSampler):
         for processor in sampling_metadata.logitsprocs.argmax_invariant:
             logits = processor.apply(logits)
 
-        # Apply top_k and/or top_p. Greedy requests are encoded as argmax
-        # (top_k=1), which is what lets them share the random-sampling path.
         k, p = build_op_top_k_top_p(
             sampling_metadata,
             logits.shape[0],
@@ -226,7 +224,7 @@ class RBLNSampler(VLLMSampler):
             "separately and merges the results, "
             "but vLLM RBLN processes greedy and random requests together: "
             "greedy requests are routed through the random-sampling path "
-            "with their candidate set narrowed to the argmax."
+            "with top_k=1, so the op can only draw their argmax."
         )
         return random_sampled, processed_logprobs
 
@@ -323,11 +321,6 @@ class RBLNSampler(VLLMSampler):
         # NOTE:
         # in-place division triggers buffer key error
         # in torchinductor
-        # NOTE(eunji.lee):
-        # Greedy rows reach the sampling op with top_k=1, so it draws their
-        # argmax and scaling their logits cannot change the outcome. Dividing by
-        # 1 like upstream is therefore enough -- the replacement only has to
-        # avoid a division by zero.
         if not all_random:
             temperature = torch.where(temperature < _SAMPLING_EPS, 1.0, temperature)
         temperature = temperature.to(logits.dtype)

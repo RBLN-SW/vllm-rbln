@@ -437,9 +437,6 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
             draft_per_batch[i, :n] = draft_token_ids[src_offset : src_offset + n]
             src_offset += n
 
-        # Per-request sampling params for the op. Greedy requests are encoded as
-        # argmax here instead of being pre-collapsed into a one-hot
-        # `target_probs` row on the host.
         top_k, top_p = build_op_top_k_top_p(
             sampling_metadata,
             batch_size,
@@ -531,13 +528,12 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         cu_num_draft_tokens: torch.Tensor,  # [batch_size]
         sampling_metadata: SamplingMetadata,
     ) -> torch.Tensor:
-        """Process logits based on sampling metadata.
+        """Scale the target logits by each request's temperature.
 
-        This function applies temperature scaling. Greedy requests need no
-        special handling here: the rejection sampling op draws their argmax
-        because `build_op_top_k_top_p` narrows those rows to their top-1
-        candidate, and scaling logits cannot move an argmax. top-k and top-p are
-        left to the op as well.
+        Every draft-token row is divided by the temperature of the request that
+        owns it, greedy rows (temperature 0) by 1. Unlike upstream vLLM, top-k and
+        top-p are not applied here; `rbln::rejection_sample` takes them as
+        per-request inputs.
 
         Args:
             logits: Input logits tensor to be processed.
@@ -546,8 +542,8 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
                 temperature and whether greedy sampling is used.
 
         Returns:
-            torch.Tensor: Processed logits -- the caller softmaxes the result to
-            build `target_probs`.
+            torch.Tensor: The scaled logits -- the caller softmaxes them to build
+            `target_probs`.
         """
         assert logits.ndim == 2
         assert cu_num_draft_tokens.ndim == 1
@@ -555,12 +551,9 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
             return logits
 
         num_tokens = logits.shape[0]
-        # NOTE(eunji.lee):
-        # Upstream vLLM treats any temperature below _SAMPLING_EPS as greedy,
-        # sets it to 0, and then overrides it to 1 right before the sampling op.
-        # We do the same here: the op resolves greedy rows to their argmax, so
-        # the value their logits are divided by does not matter as long as it is
-        # not 0.
+        # NOTE(eunji.lee): A greedy row's temperature is 0, which the division
+        # below cannot handle. Substituting 1 is harmless: `rbln::rejection_sample`
+        # samples those rows under top_k=1, so only their argmax can come out.
         temperature = expand_batch_to_tokens(
             sampling_metadata.temperature,
             cu_num_draft_tokens,
