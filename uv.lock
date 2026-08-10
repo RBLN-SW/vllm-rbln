@@ -150,6 +150,12 @@ wheels = [
 ]
 
 [[package]]
+name = "arctic-inference"
+version = "0.2.0"
+source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
+sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/arctic-inference/0.2.0/arctic_inference-0.2.0.tar.gz", hash = "sha256:242755ae3662527dd842b4c3bd0c921e5a969e270daff0c9436b412505af4c4d" }
+
+[[package]]
 name = "astor"
 version = "0.8.1"
 source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
@@ -2908,6 +2914,7 @@ runtime = [
     { name = "rebel-compiler" },
 ]
 test = [
+    { name = "arctic-inference" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "pytest-cov" },
@@ -2917,6 +2924,7 @@ test = [
 
 [package.metadata]
 requires-dist = [
+    { name = "arctic-inference", marker = "extra == 'test'" },
     { name = "build", marker = "extra == 'build'" },
     { name = "datasets", specifier = ">=4.0.0" },
     { name = "fastapi", extras = ["standard"], specifier = "<0.137" },
