@@ -48,43 +48,19 @@ def _rebel_major_minor(version: str | None = None) -> str:
     return f"{match.group(1)}.{match.group(2)}" if match else "unknown"
 
 
-# Allowlist, not compile_factors(): that walks ~240 vLLM env vars, so host
-# paths and ports alone discarded the bundle.
-_RBLN_COMPILE_ENV = frozenset(
-    {
-        "VLLM_RBLN_USE_VLLM_MODEL",
-        "VLLM_RBLN_COMPILE_MODEL",
-        "VLLM_RBLN_COMPILE_STRICT_MODE",
-        "VLLM_RBLN_USE_DEVICE_TENSOR",
-        "VLLM_RBLN_ENFORCE_MODEL_FP32",
-        "VLLM_RBLN_USE_W8A16",
-        "VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK",
-        "VLLM_RBLN_NUM_RAY_NODES",
-        "VLLM_RBLN_FLASH_CAUSAL_ATTN",
-        "VLLM_RBLN_BATCH_ATTN_OPT",
-        "VLLM_RBLN_USE_CUSTOM_KERNEL",
-        "VLLM_RBLN_SPECIALIZE_MOE_DECODE",
-        "VLLM_RBLN_USE_MOE_TOKENS_MASK",
-        "VLLM_RBLN_DISPATCH_ALL2ALL",
-        "VLLM_RBLN_COMBINE_ALL2ALL",
-        "VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY",
-        "VLLM_RBLN_DECODE_BATCH_BUCKET_MIN",
-        "VLLM_RBLN_DECODE_BATCH_BUCKET_STEP",
-        "VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT",
-        "VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS",
-    }
-)
-
-
 def _compile_env_factors() -> str:
-    """Hash of the rbln compile env allowlist, rank- and host-invariant."""
+    """Hash of rbln_envs.RBLN_COMPILE_ENV, rank- and host-invariant.
+
+    Keys on the rbln partition, not compile_factors(): that walks ~240 vLLM
+    env vars, so host paths and ports alone discarded the bundle.
+    """
     from vllm.config.utils import hash_factors, normalize_value
 
     import vllm_rbln.envs as rbln_envs
 
     factors: dict[str, object] = {
         name: normalize_value(getattr(rbln_envs, name, None))
-        for name in _RBLN_COMPILE_ENV
+        for name in rbln_envs.RBLN_COMPILE_ENV
     }
     return hash_factors(factors)
 

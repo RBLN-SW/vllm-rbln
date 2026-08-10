@@ -38,7 +38,7 @@ def _unshadow_rbln_envs():
     # permanently bypasses the __getattr__ that reads os.environ (test_medusa.py).
     import vllm_rbln.envs as rbln_envs
 
-    for name in mega_cache._RBLN_COMPILE_ENV:
+    for name in rbln_envs.RBLN_COMPILE_ENV:
         rbln_envs.__dict__.pop(name, None)
     yield
 
@@ -168,22 +168,32 @@ class TestConfigSignature:
         assert same_minor != next_minor
 
 
+class TestCompileEnvPartition:
+    """Every rbln env var must be explicitly classified compile/non-compile,
+    so a new var cannot silently skip (stale bundle) or churn the signature."""
+
+    def test_partition_covers_all_declared_vars(self):
+        import vllm_rbln.envs as rbln_envs
+
+        declared = set(rbln_envs.environment_variables)
+        classified = rbln_envs.RBLN_COMPILE_ENV | rbln_envs.RBLN_NON_COMPILE_ENV
+        assert classified == declared, (
+            f"unclassified: {sorted(declared - classified)}, "
+            f"stale: {sorted(classified - declared)}"
+        )
+
+    def test_partition_is_disjoint(self):
+        import vllm_rbln.envs as rbln_envs
+
+        overlap = rbln_envs.RBLN_COMPILE_ENV & rbln_envs.RBLN_NON_COMPILE_ENV
+        assert not overlap, f"classified twice: {sorted(overlap)}"
+
+
 class TestCompileEnvFactors:
-    """_compile_env_factors keys on an rbln allowlist, not vLLM's ~240 factors."""
+    """_compile_env_factors keys on the rbln partition, not vLLM's ~240 factors."""
 
     def test_deterministic(self):
         assert mega_cache._compile_env_factors() == mega_cache._compile_env_factors()
-
-    def test_allowlist_names_all_resolve(self):
-        # A renamed entry reads as None and silently stops keying the bundle.
-        import vllm_rbln.envs as rbln_envs
-
-        unresolved = [
-            name
-            for name in sorted(mega_cache._RBLN_COMPILE_ENV)
-            if getattr(rbln_envs, name, None) is None
-        ]
-        assert not unresolved
 
     def test_rank_invariant(self, monkeypatch):
         monkeypatch.setenv("LOCAL_RANK", "0")
@@ -210,14 +220,6 @@ class TestCompileEnvFactors:
         monkeypatch.setenv("VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY", "linear")
         b = mega_cache._compile_env_factors()
         assert a != b
-
-    def test_strict_mode_invalidates(self, monkeypatch):
-        # A compile option rebel's per-blob key cannot see.
-        monkeypatch.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "0")
-        off = mega_cache._compile_env_factors()
-        monkeypatch.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
-        on = mega_cache._compile_env_factors()
-        assert off != on
 
     def test_w8a16_invalidates(self, monkeypatch):
         # Gates the linear kernel inside the forward, so it lands in the graph.
