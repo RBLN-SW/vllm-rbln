@@ -15,7 +15,7 @@ _secrets: &secrets
   HF_TOKEN: HF_TOKEN
   HF_HOME: HF_HOME
 
-_sync: &sync "uv sync --locked --python 3.12 --extra test --extra dev --extra runtime"
+_sync: &sync "echo '--- :package: uv sync' && uv sync --locked --python 3.12 --extra test --extra dev --extra runtime && echo '+++ :pytest: pytest'"
 
 steps:
   # ===========================================================================
