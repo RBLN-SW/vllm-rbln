@@ -22,6 +22,8 @@ class TestQwen25VL(MultimodalSmoke.Test):
     MODEL_ID = "Qwen/Qwen2.5-VL-3B-Instruct"
     HF_OVERRIDES = {
         "text_config.num_hidden_layers": 1,
+        # depth 2 with a full-attention block at index 1 keeps one window + one
+        # full vision block.
         "vision_config.depth": 2,
         "vision_config.fullatt_block_indexes": [1],
     }
