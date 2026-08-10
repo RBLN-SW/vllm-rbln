@@ -39,4 +39,3 @@ def prepare_send_mask_matrix(R: int, E: int) -> np.ndarray:
     """
     expert_binary = np.where(generate_expert_mask(R, E) >= 0, 1, 0)
     return expert_binary
-
