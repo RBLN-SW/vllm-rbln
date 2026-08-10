@@ -426,7 +426,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             and envs.VLLM_RBLN_SPECIALIZE_MOE_DECODE
         )
 
-        self.performance_ctx = PerformanceContext("runner", self.runtime_holder)
+        self.performance_ctx = PerformanceContext("runner")
 
         self.offload_context = nullcontext
         if HAS_TORCH_RBLN and USE_DEVICE_TENSOR and not envs.VLLM_RBLN_DISABLE_OFFLOAD:

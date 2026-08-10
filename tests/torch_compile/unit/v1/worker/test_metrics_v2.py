@@ -196,12 +196,14 @@ class TestChunkedPrefill:
 # Paths that skip the sampler or the close
 # ---------------------------------------------------------------------------
 class TestPartialPasses:
-    def test_model_only_pass_is_recorded_lazily(self, ctx, clock):
-        """Non-last PP rank / intermediate chunk: no sampler, so E2E lands right
-        away but MODEL + SAMPLE waits for the next profile_model."""
+    def test_model_only_pass_is_recorded_with_its_own_pass(self, ctx, clock):
+        """Non-last PP rank / intermediate chunk: no sampler, so MODEL + SAMPLE is
+        the model span alone, closed out when the pass ends rather than carried
+        into the next one."""
         run_pass(ctx, clock, is_prefill=False, model=8 * MS, tail=1 * MS)
         assert ctx._e2e[False].mean_latency_ms() == pytest.approx(9.0)
-        assert ctx._metrics[False].call_count == 0  # still pending
+        assert ctx._metrics[False].call_count == 1
+        assert ctx._pending is None
 
         clock.advance(1 * MS)
         run_pass(ctx, clock, is_prefill=False, model=8 * MS, sample=1 * MS)
@@ -337,26 +339,44 @@ class TestE2EDecorators:
         # Two end calls reach the context; end_e2e() no-ops on the second.
         assert calls == ["start", "execute", "end", "sample", "end"]
 
-    def test_end_runs_even_when_the_body_raises(self):
+    def test_a_raising_body_aborts_instead_of_recording(self):
+        """The pass owns rebel's capture slot; it must be released, but not recorded."""
         calls: list[str] = []
+        ctx = type(
+            "C",
+            (),
+            {
+                "start_e2e": lambda self: calls.append("start"),
+                "end_e2e": lambda self: calls.append("end"),
+                "abort_e2e": lambda self: calls.append("abort"),
+            },
+        )()
 
         class Runner:
-            performance_ctx = type(
-                "C", (), {"end_e2e": lambda self: calls.append("end")}
-            )()
+            performance_ctx = ctx
 
             @_e2e_ends
             def sample_tokens(self):
                 raise RuntimeError("boom")
 
+            @_e2e_starts
+            def execute_model(self):
+                raise RuntimeError("boom")
+
         with pytest.raises(RuntimeError, match="boom"):
             Runner().sample_tokens()
-        assert calls == ["end"]
+        assert calls == ["abort"]
+
+        calls.clear()
+        with pytest.raises(RuntimeError, match="boom"):
+            Runner().execute_model()
+        assert calls == ["start", "abort"]
 
     def test_noop_context_matches_the_real_api(self):
         noop = _NoopPerformanceContext()
         noop.start_e2e()
         noop.end_e2e()
+        noop.abort_e2e()
         noop.print_stats()
         with noop.profile_model(True):
             pass

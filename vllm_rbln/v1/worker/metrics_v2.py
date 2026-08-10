@@ -17,7 +17,6 @@ import json
 import os
 import time
 from collections import defaultdict
-from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import TypeVar
 
@@ -123,7 +122,15 @@ except ImportError:
 
 
 class _TimingSpan:
-    __slots__ = ("_ctx", "_phase", "_is_sampler", "_reports", "_start", "_capture_ctx")
+    """A sub-span of the pass, delimited by a watermark into the pass's report list.
+
+    The pass-level capture is the only one open (nesting another would shadow it, since
+    rebel keeps a single thread-local slot rather than a stack). Its list is append-only,
+    so the reports a span is responsible for are exactly the ones appended between its
+    entry and its exit.
+    """
+
+    __slots__ = ("_ctx", "_phase", "_is_sampler", "_mark", "_start")
 
     def __init__(
         self, ctx: "_PerformanceContext", phase: bool | None, is_sampler: bool
@@ -131,26 +138,20 @@ class _TimingSpan:
         self._ctx = ctx
         self._phase = phase
         self._is_sampler = is_sampler
-        self._reports: list[dict] | None = None
+        self._mark = 0
         self._start = 0.0
 
     def __enter__(self) -> "_TimingSpan":
-        # Create capture_ctx on each __enter__ call: contextmanager-based objects
-        # are exhausted after __exit__ and cannot be reused.
-        self._capture_ctx = (
-            rebel.capture_reports() if _REBEL_HAS_CAPTURE else nullcontext()
-        )
-        self._reports = self._capture_ctx.__enter__()
+        self._mark = self._ctx.report_watermark()
         self._start = time.perf_counter()
         return self
 
     def __exit__(self, *args):
-        # Record time before closing capture_ctx to exclude any internal
-        # synchronization overhead inside rebel from the measured latency.
         end = time.perf_counter()
         latency = end - self._start
-        self._capture_ctx.__exit__(*args)
-        host, device, ccl, prepare = _parse_reports(self._reports)
+        host, device, ccl, prepare = _parse_reports(
+            self._ctx.reports_since(self._mark)
+        )
         self._ctx._submit(
             _Sample(latency, host, device, ccl, prepare, self._phase),
             self._is_sampler,
@@ -169,7 +170,7 @@ class _NoopSpan:
 
 
 class _PerformanceContext:
-    def __init__(self, name: str | None = None, runtimes: list | None = None) -> None:
+    def __init__(self, name: str | None = None) -> None:
         self.name = name
         self.rank_tag = _rank_tag()
         self._metrics: dict[bool, Metrics] = defaultdict(Metrics)
@@ -177,26 +178,64 @@ class _PerformanceContext:
         self._e2e_start: float | None = None
         self._e2e_is_prefill: bool | None = None
         self._e2e: dict[bool, Metrics] = defaultdict(Metrics)
-        self._runtimes = runtimes if runtimes is not None else []
-        self._backlog_drained = False
+        self._capture_ctx = None
+        self._reports: list[dict] | None = None
+
+    # -- pass-level report capture -------------------------------------------------
+
+    def report_watermark(self) -> int:
+        """Index a sub-span can slice from once it is done."""
+        return len(self._reports) if self._reports is not None else 0
+
+    def reports_since(self, mark: int) -> list[dict] | None:
+        return self._reports[mark:] if self._reports is not None else None
+
+    def _open_capture(self) -> None:
+        if not _REBEL_HAS_CAPTURE:
+            return
+        # An unclosed capture would keep rebel's thread-local pointing at a list nobody
+        # reads, and every later report would land there. Close it before opening ours.
+        self._close_capture()
+        self._capture_ctx = rebel.capture_reports()
+        self._reports = self._capture_ctx.__enter__()
+
+    def _close_capture(self) -> None:
+        ctx, self._capture_ctx = self._capture_ctx, None
+        self._reports = None
+        if ctx is not None:
+            ctx.__exit__(None, None, None)
+
+    # -- pass boundary -------------------------------------------------------------
 
     def start_e2e(self) -> None:
+        self._open_capture()
         self._e2e_start = time.perf_counter()
         self._e2e_is_prefill = None
 
     def end_e2e(self) -> None:
         end = time.perf_counter()
         start, self._e2e_start = self._e2e_start, None
+        # A pass whose model step had no sampler (intermediate chunked prefill, non-last
+        # PP rank) belongs to this pass, not to whichever one runs next.
+        self._flush_pending()
+        self._close_capture()
         if start is None:
             return
         if self._e2e_is_prefill is None:
             return  # no forward pass ran: nothing to attribute
+        # Latency only. Every report is produced by a graph run, and those all happen
+        # inside the model or sampler span, so a pass-level total would just restate
+        # what MODEL + SAMPLE already reports. E2E's own contribution is the latency,
+        # whose gap over MODEL + SAMPLE is the host overhead around the graphs.
         self._e2e[self._e2e_is_prefill].record(end - start)
 
+    def abort_e2e(self) -> None:
+        """Drop the pass without recording it; a raising pass has no useful timing."""
+        self._e2e_start = None
+        self._pending = None
+        self._close_capture()
+
     def profile_model(self, is_prefill: bool) -> _TimingSpan:
-        self._drain_report_backlog()
-        # A prior model step with no sampler (intermediate chunked prefill,
-        # non-last PP rank) leaves a pending report; record it model-only here.
         self._flush_pending()
         if self._e2e_start is not None:
             self._e2e_is_prefill = is_prefill
@@ -224,16 +263,6 @@ class _PerformanceContext:
             s.latency, s.host, s.device, s.ccl, s.prepare
         )
 
-    def _drain_report_backlog(self) -> None:
-        """Discard warmup reports left in the runtime FIFO before measuring."""
-        if self._backlog_drained:
-            return
-
-        self._backlog_drained = True
-        for runtime in self._runtimes:
-            if (flush := getattr(runtime, "flush_reports", None)) is not None:
-                flush()
-
     def print_stats(self) -> None:
         self._flush_pending()  # record the final step if it had no sampler
         sections: dict[str, Metrics] = {}
@@ -254,6 +283,9 @@ class _NoopPerformanceContext:
         pass
 
     def end_e2e(self) -> None:
+        pass
+
+    def abort_e2e(self) -> None:
         pass
 
     def profile_model(self, *args, **kwargs) -> _NoopSpan:
@@ -380,17 +412,29 @@ def _report_metrics(name: str | None, sections: dict[str, Metrics]) -> None:
 def _parse_reports(
     reports: list[dict] | None,
 ) -> tuple[int | None, int | None, int | None, int | None]:
-    """Extract timing information from rebel.capture_reports() output."""
-    if not reports:
-        return None, None, None, None
-    host_time = reports[0].get("total_host")
-    device_time = reports[0].get("total_device")
-    ccl_time = reports[0].get("total_ccl")
-    prepare_time = (
-        reports[1].get("prepare_input_us", 0) + reports[1].get("prepare_output_us", 0)
-        if len(reports) > 1
-        else None
-    )
+    """Sum the timing information in rebel.capture_reports() output.
+
+    Every runtime.run() inside the captured window appends its own pair of reports --
+    a "timer" one and a "prep" one -- so a window holding N graph runs yields 2N entries.
+    Sum over report kind rather than reading fixed positions, which would count only the
+    first run. Unrelated kinds (e.g. "buffer_transform") share the queue and are ignored.
+
+    A kind that never appears stays None instead of becoming 0, so a run without
+    RBLN_RUNTIME_TIMER reports no timings at all rather than a column of zeros.
+    """
+    host_time = device_time = ccl_time = prepare_time = None
+    for report in reports or ():
+        kind = report.get("type")
+        if kind == "timer":
+            host_time = (host_time or 0) + report.get("total_host", 0)
+            device_time = (device_time or 0) + report.get("total_device", 0)
+            ccl_time = (ccl_time or 0) + report.get("total_ccl", 0)
+        elif kind == "prep":
+            prepare_time = (
+                (prepare_time or 0)
+                + report.get("prepare_input_us", 0)
+                + report.get("prepare_output_us", 0)
+            )
     return host_time, device_time, ccl_time, prepare_time
 
 
@@ -399,7 +443,13 @@ def _e2e_starts(fn):
     def wrapper(self, *args, **kwargs):
         ctx = self.performance_ctx
         ctx.start_e2e()
-        output = fn(self, *args, **kwargs)
+        try:
+            output = fn(self, *args, **kwargs)
+        except BaseException:
+            # The pass holds rebel's thread-local capture slot; leaving it open would
+            # divert every later report into a list nobody reads.
+            ctx.abort_e2e()
+            raise
         if output is not None:
             ctx.end_e2e()
         return output
@@ -410,10 +460,14 @@ def _e2e_starts(fn):
 def _e2e_ends(fn):
     @functools.wraps(fn)
     def wrapper(self, *args, **kwargs):
+        ctx = self.performance_ctx
         try:
-            return fn(self, *args, **kwargs)
-        finally:
-            self.performance_ctx.end_e2e()
+            output = fn(self, *args, **kwargs)
+        except BaseException:
+            ctx.abort_e2e()
+            raise
+        ctx.end_e2e()
+        return output
 
     return wrapper
 
