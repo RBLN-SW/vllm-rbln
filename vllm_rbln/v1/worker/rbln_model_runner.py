@@ -1385,7 +1385,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # Stamp this step's prefill/decode phase from the scheduler before any
         # is_prefill_phase() read or early return, so all PP ranks agree on the
         # graph they select this step.
-        self._set_step_phase(scheduler_output)
+        self._set_step_phase(scheduler_output.is_prefill_step)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
 
@@ -2076,7 +2076,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         # Stamp from this dummy's own phase (see is_prefill_phase()); also guards
         # the DP-idle path so a prior real step's value can't leak into a read.
-        self._is_prefill_step = is_prefill
+        self._set_step_phase(is_prefill)
 
         num_reqs_padded, _num_tokens_padded, num_tokens_across_dp = (
             self._determine_batch_padding(num_reqs, num_tokens_unpadded)
@@ -2812,9 +2812,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
     # Only RBLN-Specific Methods
     ####################################################################################################
 
-    def _set_step_phase(self, scheduler_output: "RBLNSchedulerOutput") -> None:
-        """Record this step's prefill/decode phase from the scheduler stamp."""
-        self._is_prefill_step = scheduler_output.is_prefill_step
+    def _set_step_phase(self, is_prefill_step: bool) -> None:
+        """Stamp this step's prefill/decode phase. Sole writer of
+        _is_prefill_step: scheduler-authoritative in execute_model, the dummy's
+        own phase on the warm-up / DP-idle path."""
+        self._is_prefill_step = is_prefill_step
 
     def is_prefill_phase(self) -> bool:
         """The step's prefill/decode classification, stamped by the scheduler

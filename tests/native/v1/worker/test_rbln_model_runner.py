@@ -178,15 +178,12 @@ class TestPadDepad:
 
 class TestPredicates:
     def test_is_prefill_phase_reads_scheduler_stamp(self):
-        # The runner no longer derives the phase from its own per-rank
-        # input_batch (that boundary logic moved to the scheduler's is_prefill).
-        # _set_step_phase records RBLNSchedulerOutput.is_prefill_step and
-        # is_prefill_phase() -- the single source of truth -- returns it, so all
-        # PP ranks agree.
+        # _set_step_phase is the sole writer; is_prefill_phase() -- the single
+        # source of truth -- returns it, so all PP ranks agree.
         r = _make_runner_stub()
-        r._set_step_phase(SimpleNamespace(is_prefill_step=True))
+        r._set_step_phase(True)
         assert r.is_prefill_phase() is True
-        r._set_step_phase(SimpleNamespace(is_prefill_step=False))
+        r._set_step_phase(False)
         assert r.is_prefill_phase() is False
 
     def test_is_intermediate_chunked_prefill(self):
