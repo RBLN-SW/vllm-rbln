@@ -17,8 +17,6 @@ Persists/restores `torch.compiler.{save,load}_cache_artifacts()` bundles as a
 per-(model, config-signature, rank) file under VLLM_CACHE_ROOT.
 """
 
-from __future__ import annotations
-
 import contextlib
 import errno
 import hashlib
@@ -126,7 +124,7 @@ def config_signature(vllm_config) -> str:
         "mega-cache config_signature=%s (cfg=%s env=%s rebel=%s)",
         sig,
         cfg[:8],
-        hashlib.sha1(env.encode("utf-8")).hexdigest()[:8],
+        env[:8],
         rebel_ver,
     )
     return sig
