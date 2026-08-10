@@ -17,7 +17,7 @@
 decoder, and the Qwen3.5 VL model. Run with
 ``pytest tests/optimum_compile/test_rsd1.py``."""
 
-from test_base import DecoderSmoke, MultimodalSmoke, PoolingSmoke
+from test_base import DecoderSmoke, PoolingSmoke
 
 
 class TestQwen3Embedding(PoolingSmoke.Test):
@@ -56,6 +56,7 @@ class TestBgeM3(PoolingSmoke.Test):
     }
 
 
+# TODO: Uncomment this when we have a model to test.
 # class TestQwen35VL(MultimodalSmoke.Test):
 #     # Linear attention
 #     MODEL_ID = "Qwen/Qwen3.5-0.8B"
