@@ -380,17 +380,23 @@ def _report_metrics(name: str | None, sections: dict[str, Metrics]) -> None:
 def _parse_reports(
     reports: list[dict] | None,
 ) -> tuple[int | None, int | None, int | None, int | None]:
-    """Extract timing information from rebel.capture_reports() output."""
+    """Sum the timings across every graph run in rebel.capture_reports() output."""
     if not reports:
         return None, None, None, None
-    host_time = reports[0].get("total_host")
-    device_time = reports[0].get("total_device")
-    ccl_time = reports[0].get("total_ccl")
-    prepare_time = (
-        reports[1].get("prepare_input_us", 0) + reports[1].get("prepare_output_us", 0)
-        if len(reports) > 1
-        else None
-    )
+
+    host_time = device_time = ccl_time = prepare_time = None
+    for report in reports:
+        kind = report.get("type")
+        if kind == "timer":
+            host_time = (host_time or 0) + report.get("total_host", 0)
+            device_time = (device_time or 0) + report.get("total_device", 0)
+            ccl_time = (ccl_time or 0) + report.get("total_ccl", 0)
+        elif kind == "prep":
+            prepare_time = (
+                (prepare_time or 0)
+                + report.get("prepare_input_us", 0)
+                + report.get("prepare_output_us", 0)
+            )
     return host_time, device_time, ccl_time, prepare_time
 
 
