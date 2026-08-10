@@ -23,8 +23,6 @@ from tests.native.distributed.test_dp_e2e import DP_MODELS
 from tests.native.model_specs import CompileModelSpec, apply_spec_envs, spec_params
 from tests.native.runners import _RBLN_RUNNER_DEFAULTS
 
-_CARRIER = "Qwen/Qwen3-0.6B"
-
 _STANDALONE = "RBLN_CTX_STANDALONE"
 
 
@@ -38,7 +36,7 @@ def isolated_standalone_env(monkeypatch):
 def test_every_dp_spec_passes_the_platform_rules(spec: CompileModelSpec, monkeypatch):
     apply_spec_envs(spec, monkeypatch)
     EngineArgs(
-        model=_CARRIER, **{**_RBLN_RUNNER_DEFAULTS, **spec.engine_kwargs}
+        model=spec.model, **{**_RBLN_RUNNER_DEFAULTS, **spec.engine_kwargs}
     ).create_engine_config()
 
     assert os.environ[_STANDALONE] == "1"
