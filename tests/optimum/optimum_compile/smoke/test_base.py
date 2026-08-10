@@ -31,13 +31,6 @@ import torch
 from PIL import Image
 from vllm import LLM, SamplingParams
 
-try:
-    import rebel
-
-    _NPU_NAME = rebel.get_npu_name()
-except Exception:  # noqa: BLE001 - rebel import/NPU probe may fail without hw
-    _NPU_NAME = None
-
 # Seconds to wait after tearing an engine down.
 _TEARDOWN_SETTLE_S = 10
 
@@ -95,8 +88,6 @@ class SmokeBase:
         @classmethod
         def setUpClass(cls) -> None:
             # Compile once per class (the LLM(...) call is the compile step).
-            if _NPU_NAME is None:
-                raise unittest.SkipTest("requires a real RBLN NPU")
             assert cls.MODEL_ID, f"{cls.__name__}: MODEL_ID required"
             os.environ["VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK"] = str(cls.NUM_DEVICES)
             kwargs = dict(cls.LLM_KWARGS)
