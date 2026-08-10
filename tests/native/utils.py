@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import glob
 import json
 import os
 import signal
@@ -30,44 +31,39 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import ParamSpec
 
-# What "native" means: the switch that selects vLLM modelling over optimum.
-# Deliberately nothing else -- pinning a knob to the value the source already
-# defaults to would mean a flipped default goes unnoticed.
+# What "native" means: the switch that selects vLLM modelling over optimum, plus
+# the knobs whose source default the suite must not take. Nothing that merely
+# repeats a default -- pinning those would hide the day one is flipped.
 NATIVE_ENV = {
     "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
     "VLLM_RBLN_USE_VLLM_MODEL": "1",
+    "VLLM_DISABLE_COMPILE_CACHE": "1",
+    "RBLN_ROOT_IP": "127.0.0.1",
+    "RBLN_LOCAL_IP": "127.0.0.1",
 }
 
-# Host description -- which NPUs exist, what SOC to compile for, OMP threads.
-# CI and developer machines legitimately set these; scrubbing them would break
-# device selection and make compile-only hosts fail in get_device_name().
-HOST_ENV_PASSTHROUGH = frozenset(
-    {
-        "RBLN_DEVICES",
-        "RBLN_FORCE_NPU_NAME",
-        "RBLN_TARGET_SOC",
-        "RBLN_NPUS_PER_DEVICE",
-        "RBLN_NUM_THREADS",
-    }
-)
+SCRUBBED_PREFIXES = ("VLLM_RBLN_",)
 
-SCRUBBED_PREFIXES = ("VLLM_RBLN_", "RBLN_")
-
-# Upstream knobs RblnPlatform itself branches on, so they are part of the
-# native suite's input surface despite not being RBLN-named.
+# Knobs outside that prefix that still decide what the suite runs: two upstream
+# ones RblnPlatform branches on, and the compiler flag VLLM_RBLN_USE_CUSTOM_KERNEL
+# resolves from instead of a private copy.
 SCRUBBED_EXTRA = frozenset(
     {
         "VLLM_USE_V2_MODEL_RUNNER",
         "VLLM_DISABLE_COMPILE_CACHE",
         "VLLM_WORKER_MULTIPROC_METHOD",
+        "RBLN_USE_CUSTOM_KERNEL",
     }
 )
 
 
 def is_scrubbed(key: str) -> bool:
-    """Whether ``key`` is a behavior knob the suite must control itself."""
-    if key in HOST_ENV_PASSTHROUGH:
-        return False
+    """Whether ``key`` is a behavior knob the suite must control itself.
+
+    Bare ``RBLN_*`` names describe the host and drive the compiler (device list,
+    SOC, log verbosity); this suite tests vllm-rbln, so it leaves them to the
+    shell.
+    """
     # The harness's own spawn-control vars (VLLM_RBLN_TEST_SPAWN_*) are not RBLN
     # behavior knobs; scrubbing them in a spawned child would drop the re-entry
     # guard and make the child spawn itself forever.
@@ -163,7 +159,43 @@ def check_logprobs_close(
             break
 
 
-# -- per-test process isolation -------------------------------------------------
+# The driver exposes one node per NPU.
+_RBLN_DEVICE_NODES = "/dev/rbln*"
+
+
+def rbln_device_count() -> int:
+    """How many NPUs this session may use. ``RBLN_DEVICES`` wins when set, since a
+    job may be given two of eight. Otherwise the device nodes are counted rather
+    than asking the driver: this runs in the parent pytest process, which must not
+    open the device (that would pin it for the whole session)."""
+    visible = [
+        entry
+        for entry in os.environ.get("RBLN_DEVICES", "").split(",")
+        if entry.strip()
+    ]
+    # Exported but empty means "no restriction", not "no devices".
+    return len(visible) or len(glob.glob(_RBLN_DEVICE_NODES))
+
+
+def devices_needed(engine_kwargs: dict, rsd: int = 1) -> int:
+    """NPUs an engine built with ``engine_kwargs`` will occupy. Mirrors
+    RBLNWorker._init_device_env: DP ranks do not share, and every (tp x pp) rank
+    takes ``rsd`` devices.
+
+    ``rsd`` is a spec's ``CompileModelSpec.rsd``, i.e. the
+    VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK the engine will run with. It is an
+    argument rather than an env read because the caller checks the budget *before*
+    ``apply_spec_envs`` publishes it, and because the suite scrubs that name from
+    the parent's environment anyway.
+    """
+    return (
+        engine_kwargs.get("tensor_parallel_size", 1)
+        * engine_kwargs.get("pipeline_parallel_size", 1)
+        * engine_kwargs.get("data_parallel_size", 1)
+        * rsd
+    )
+
+
 # Ported from vLLM tests/utils.py (issue #41415). The RBLN SDK accumulates
 # device/runtime state across LLM instantiations in one process, so each
 # engine-using test must run in a fresh interpreter (dev-legacy #629:

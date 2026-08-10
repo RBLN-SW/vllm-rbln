@@ -522,6 +522,8 @@ class RBLNKVCacheManager(KVCacheManager):
         num_external_computed_tokens: int = 0,
         delay_cache_blocks: bool = False,
         num_encoder_tokens: int = 0,
+        full_sequence_must_fit: bool = False,
+        reserved_blocks: int = 0,
         has_scheduled_reqs: bool = True,
     ) -> KVCacheBlocks | None:
         result = super().allocate_slots(
@@ -533,6 +535,8 @@ class RBLNKVCacheManager(KVCacheManager):
             num_external_computed_tokens,
             delay_cache_blocks,
             num_encoder_tokens,
+            full_sequence_must_fit=full_sequence_must_fit,
+            reserved_blocks=reserved_blocks,
             has_scheduled_reqs=has_scheduled_reqs,
         )
 

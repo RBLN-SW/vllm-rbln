@@ -83,6 +83,7 @@ def compile(
     global_device_id: int | None = None,
     use_cache: bool = True,
     cache_dir: str = "",
+    use_static_output: bool = False,
 ) -> CompiledTarget:
     _ensure_torch_dynamo_configured()
 
@@ -106,6 +107,7 @@ def compile(
     set_option("mode", mode)
     set_option("use_global_ctx", use_global_ctx)
     set_option("global_device_id", global_device_id)
+    set_option("use_static_output", use_static_output)
     if use_cache and not envs.VLLM_DISABLE_COMPILE_CACHE:
         set_option("cache_dir", cache_dir or os.path.join(envs.VLLM_CACHE_ROOT, "rbln"))
         set_option("mega_cache_only", True)
