@@ -150,12 +150,6 @@ wheels = [
 ]
 
 [[package]]
-name = "arctic-inference"
-version = "0.2.0"
-source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
-sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/arctic-inference/0.2.0/arctic_inference-0.2.0.tar.gz", hash = "sha256:242755ae3662527dd842b4c3bd0c921e5a969e270daff0c9436b412505af4c4d" }
-
-[[package]]
 name = "astor"
 version = "0.8.1"
 source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
@@ -1533,7 +1527,7 @@ wheels = [
 
 [[package]]
 name = "optimum-rbln"
-version = "0.11.1"
+version = "0.11.2a0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "accelerate" },
@@ -1546,9 +1540,9 @@ dependencies = [
     { name = "torchvision", marker = "platform_python_implementation == 'CPython'" },
     { name = "transformers" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/37/6a/689b919b052ea676196201ae7dc244c656033190079e8bcc353a157a817b/optimum_rbln-0.11.1.tar.gz", hash = "sha256:c1cdb2c7344b773774ddc83fd834d326ee0041187726480aa374f505347e4fef", size = 599757, upload-time = "2026-07-31T07:51:42.193Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/a5/d7/50e611d30eedb8d14163ab1b05cc7c3dcfe6a4494bde71300859da6482c3/optimum_rbln-0.11.2a0.tar.gz", hash = "sha256:d3a2f978690ef1d824d211acb29cbbe73f7ef2353a8f70d020c9c76d5f7a8057", size = 601607, upload-time = "2026-08-06T02:44:22.416Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/4d/20/ca5c5a2f2427da84d032355ac85685ed68b8056494457d3bba6feae77d8b/optimum_rbln-0.11.1-py3-none-any.whl", hash = "sha256:29924640f285f122e87bb1939d38ca9440ffbbb8e47e916b8d242955789608a7", size = 650628, upload-time = "2026-07-31T07:51:40.223Z" },
+    { url = "https://files.pythonhosted.org/packages/5f/39/c71ab83b40ab9a2079bf420c5b19763231e6cba39f44dd59acd5ac35369a/optimum_rbln-0.11.2a0-py3-none-any.whl", hash = "sha256:54d55ae86d849d2ef71e70e6db3ceadcba2ce0c95e0fc4d6c86a0957fa17da52", size = 655177, upload-time = "2026-08-06T02:44:20.448Z" },
 ]
 
 [[package]]
@@ -2914,7 +2908,6 @@ runtime = [
     { name = "rebel-compiler" },
 ]
 test = [
-    { name = "arctic-inference" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "pytest-cov" },
@@ -2924,13 +2917,12 @@ test = [
 
 [package.metadata]
 requires-dist = [
-    { name = "arctic-inference", marker = "extra == 'test'" },
     { name = "build", marker = "extra == 'build'" },
     { name = "datasets", specifier = ">=4.0.0" },
     { name = "fastapi", extras = ["standard"], specifier = "<0.137" },
     { name = "fire", marker = "extra == 'dev'" },
     { name = "huggingface-hub", marker = "extra == 'dev'" },
-    { name = "optimum-rbln", specifier = ">=0.11.1" },
+    { name = "optimum-rbln", specifier = ">=0.11.2a0" },
     { name = "packaging", marker = "extra == 'dev'" },
     { name = "pynvml", marker = "extra == 'dev'" },
     { name = "pytest", marker = "extra == 'test'" },
