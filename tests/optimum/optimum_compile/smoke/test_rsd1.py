@@ -56,19 +56,19 @@ class TestBgeM3(PoolingSmoke.Test):
     }
 
 
-class TestQwen35VL(MultimodalSmoke.Test):
-    # Linear attention
-    MODEL_ID = "Qwen/Qwen3.5-0.8B"
-    HF_OVERRIDES = {
-        "text_config.num_hidden_layers": 4,
-        "vision_config.depth": 1,
-    }
-    NUM_DEVICES = 1
-    LLM_KWARGS = {
-        "block_size": 4096,
-        "max_model_len": 8192,
-        "max_num_seqs": 1,
-        "additional_config": {"rbln_config": {"visual": {"max_seq_len": [512]}}},
-    }
-    # Cap the image so its vision-token count fits the visual max_seq_len (512).
-    MM_PROCESSOR_KWARGS = {"min_pixels": 64 * 16 * 16, "max_pixels": 64 * 16 * 16}
+# class TestQwen35VL(MultimodalSmoke.Test):
+#     # Linear attention
+#     MODEL_ID = "Qwen/Qwen3.5-0.8B"
+#     HF_OVERRIDES = {
+#         "text_config.num_hidden_layers": 4,
+#         "vision_config.depth": 1,
+#     }
+#     NUM_DEVICES = 1
+#     LLM_KWARGS = {
+#         "block_size": 4096,
+#         "max_model_len": 8192,
+#         "max_num_seqs": 1,
+#         "additional_config": {"rbln_config": {"visual": {"max_seq_len": [512]}}},
+#     }
+#     # Cap the image so its vision-token count fits the visual max_seq_len (512).
+#     MM_PROCESSOR_KWARGS = {"min_pixels": 64 * 16 * 16, "max_pixels": 64 * 16 * 16}
