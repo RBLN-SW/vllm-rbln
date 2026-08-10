@@ -75,12 +75,15 @@ def patched_mla_get_kv_cache_spec(self: MLAAttention, vllm_config):
     if cache_dtype and cache_dtype.startswith("fp8"):
         from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
+        impl = getattr(self, "impl", None)
+        kv_lora_rank = getattr(impl, "kv_lora_rank", 512)
+        rope_dim = getattr(impl, "qk_rope_head_dim", 64)
+        _FP8_KV_SCALE_BYTES = 128
+        packed_head_size = kv_lora_rank + _FP8_KV_SCALE_BYTES + rope_dim * 2
         return MLAAttentionSpec(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,
-            # TODO(KBLEE): check hardcoded
-            # 512 (fp8 kv_c) + 128 (fp16 scale, 64 x 2B) + 128 (k_pe, 64 bf16 x 2B)
-            head_size=768,
+            head_size=packed_head_size,
             dtype=torch.int8,
             cache_dtype_str="auto",
         )
