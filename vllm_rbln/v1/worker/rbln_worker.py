@@ -174,7 +174,6 @@ class RBLNWorker(WorkerBase):
         self._rbln_host_threads_before_compile_ready = False
         self._rbln_cpu_affinity_applied = False
 
-        # --- dynamic KV cache (VLLM_RBLN_USE_DYNAMIC_KV_CACHE) ---
         if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
             self._assert_dynamic_kv_model_supported()
         # num_blocks vLLM sized the cache with, stashed while it is shrunk for
@@ -511,10 +510,6 @@ class RBLNWorker(WorkerBase):
 
         if dynamic_kv:
             self._assert_dynamic_kv_cache_layout()
-
-    # ------------------------------------------------------------------
-    # Dynamic KV cache (VLLM_RBLN_USE_DYNAMIC_KV_CACHE)
-    # ------------------------------------------------------------------
 
     def _compile_and_warmup_skip_reason(self) -> str | None:
         """Why the compile and warm-up will be skipped, or None if they will run."""
