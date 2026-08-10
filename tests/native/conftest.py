@@ -376,11 +376,38 @@ def vllm_runner():
 
 
 @pytest.fixture(scope="session")
+def async_vllm_runner():
+    """AsyncVllmRunner class -- the DP-capable runner (lazy import; see
+    vllm_runner)."""
+    from tests.native.runners import AsyncVllmRunner
+
+    return AsyncVllmRunner
+
+
+@pytest.fixture(scope="session")
 def hf_runner():
     """HfRunner class (lazy import; see vllm_runner)."""
     from tests.native.runners import HfRunner
 
     return HfRunner
+
+
+@pytest.fixture(autouse=True)
+def _drop_envs_shadows():
+    """Remove any ``vllm_rbln.envs`` attribute a test left behind.
+
+    `monkeypatch.setattr(envs, NAME, ...)` cannot clean up after itself here: envs
+    serves those names through the module's ``__getattr__``, so monkeypatch records
+    the value that produced and its undo puts it back as a *real* attribute -- which
+    then wins over ``__getattr__`` and freezes that variable for the rest of the
+    session, silently defeating any later monkeypatch.setenv on it.
+    """
+    from vllm_rbln import envs
+
+    before = set(vars(envs))
+    yield
+    for name in set(vars(envs)) - before:
+        delattr(envs, name)
 
 
 @pytest.fixture(autouse=True)
