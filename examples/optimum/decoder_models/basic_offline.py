@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+
 import fire
 from vllm import LLM, SamplingParams
 
@@ -28,9 +30,26 @@ sampling_params = SamplingParams(temperature=0, top_p=1.0)
 
 def main(
     model: str = "meta-llama/Llama-3.2-1B",
+    max_num_seqs: int = 1,
+    max_model_len: int = 4096,
+    block_size: int = None,  # if None, will be set to max_model_len
+    num_devices: int = 4,
+    use_decoder_batch_sizes: bool = False,
 ):
-    # Create an LLM.
-    llm = LLM(model=model, block_size=4096)
+    if num_devices is not None:
+        os.environ["VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK"] = str(num_devices)
+
+    llm = LLM(
+        model=model,
+        block_size=block_size,
+        max_model_len=max_model_len,
+        max_num_seqs=max_num_seqs,
+        additional_config={
+            "rbln_config": {
+                "decoder_batch_sizes": [1, 8] if use_decoder_batch_sizes else None,
+            }
+        },
+    )
     # Generate texts from the prompts.
     # The output is a list of RequestOutput objects
     # that contain the prompt, generated text, and other information.

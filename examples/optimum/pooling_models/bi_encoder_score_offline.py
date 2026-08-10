@@ -29,23 +29,45 @@ PAIRS = [
 ]
 
 
-def main(model_id: str):
-    llm = LLM(model=model_id)
+def main(
+    model: str = "BAAI/bge-m3",
+    max_num_seqs: int = 1,
+    assert_ranking: bool = False,
+    max_model_len: int = 4096,
+    block_size: int = 4096,
+):
+    llm = LLM(
+        model=model,
+        max_num_seqs=max_num_seqs,
+        max_model_len=max_model_len,
+        block_size=block_size,
+    )
 
     data_1 = [a for a, _ in PAIRS]
     data_2 = [b for _, b in PAIRS]
 
-    # N -> N pairing: data_1[i] is scored against data_2[i].
-    outputs = llm.score(data_1, data_2)
-    for idx, output in enumerate(outputs):
+    # N -> N pairing: data_1[i] is scored against data_2[i] (its correct match).
+    positives = llm.score(data_1, data_2)
+    for idx, output in enumerate(positives):
         print(f"[{idx}] score={output.outputs.score:.4f}")
 
-
-def entry_point(
-    model_id: str = "BAAI/bge-m3",
-):
-    main(model_id=model_id)
+    # if assert_ranking:
+    #     # Self-contained accuracy check (no external golden): score each query
+    #     # against a mismatched document (the next pair's, rotated) and require
+    #     # the correct pairing to score higher.
+    #     neg_docs = data_2[1:] + data_2[:1]
+    #     negatives = llm.score(data_1, neg_docs)
+    #     for idx in range(len(PAIRS)):
+    #         pos = positives[idx].outputs.score
+    #         neg = negatives[idx].outputs.score
+    #         print(f"[{idx}] positive={pos:.4f} negative={neg:.4f}")
+    #         if not pos > neg:
+    #             print(
+    #                 f"ranking check FAILED at {idx}: positive {pos} <= negative {neg}"
+    #             )
+    #             exit(1)
+    #     print("ranking check PASSED")
 
 
 if __name__ == "__main__":
-    fire.Fire(entry_point)
+    fire.Fire(main)

@@ -55,9 +55,13 @@ def generate_prompts(batch_size: int, model: str):
 def main(
     num_input_prompt: int = 4,
     model: str = "mistral-community/pixtral-12b",
+    max_model_len: int = 8192,
+    block_size: int = 4096,  # if None, will be set to max_model_len
 ):
     os.environ["VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK"] = "4"
-    llm = LLM(model=model, block_size=4096)
+    if block_size is None:
+        block_size = max_model_len
+    llm = LLM(model=model, block_size=block_size, max_model_len=max_model_len)
     tokenizer = AutoTokenizer.from_pretrained(model)
     inputs, labels = generate_prompts(num_input_prompt, model)
 

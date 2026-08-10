@@ -163,12 +163,17 @@ def generate_prompts_wo_processing(batch_size: int, model: str):
 def main(
     num_input_prompt: int = 4,
     model: str = "LGAI-EXAONE/EXAONE-4.5-33B",  # noqa: E501
+    max_model_len: int = 8192,
+    block_size: int = None,  # if None, will be set to max_model_len
+    num_devices: int = 4,
 ):
-    os.environ["VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK"] = "4"
+    os.environ["VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK"] = str(num_devices)
+    if block_size is None:
+        block_size = max_model_len
     llm = LLM(
         model=model,
-        block_size=4096,
-        max_model_len=8192,
+        block_size=block_size,
+        max_model_len=max_model_len,
         max_num_seqs=1,
     )
     tokenizer = AutoTokenizer.from_pretrained(model)
