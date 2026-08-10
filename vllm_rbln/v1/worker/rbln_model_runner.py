@@ -1821,6 +1821,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
                 runtime_holder=self.runtime_holder,
                 mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
+                # Logits are consumed by sampling within the same step, so the
+                # output buffer can be reused across steps even under async scheduling.
+                use_static_output=True,
             )
             # NOTE(RBLN): We compile compute_logits separately to cover cases when
             # `self.use_wrapped_compute_logits` is `False`
@@ -1834,6 +1837,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
                 runtime_holder=self.runtime_holder,
                 mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
+                use_static_output=True,
             )
 
     def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:

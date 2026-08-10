@@ -89,27 +89,68 @@ class TestSampleMerged:
         assert merged.prepare is None  # None + None -> None
 
 
+def _timer(host=0, device=0, ccl=0):
+    return {
+        "type": "timer",
+        "total_host": host,
+        "total_device": device,
+        "total_ccl": ccl,
+    }
+
+
+def _prep(prepare_in=0, prepare_out=0):
+    return {
+        "type": "prep",
+        "prepare_input_us": prepare_in,
+        "prepare_output_us": prepare_out,
+    }
+
+
 class TestParseReports:
     def test_none_or_empty_yields_all_none(self):
         assert mm._parse_reports(None) == (None, None, None, None)
         assert mm._parse_reports([]) == (None, None, None, None)
 
-    def test_single_report_has_no_prepare(self):
-        out = mm._parse_reports(
-            [{"total_host": 10, "total_device": 20, "total_ccl": 30}]
-        )
+    def test_timer_only_leaves_prepare_none(self):
+        out = mm._parse_reports([_timer(host=10, device=20, ccl=30)])
         assert out == (10, 20, 30, None)
 
-    def test_second_report_sums_prepare_in_out(self):
-        out = mm._parse_reports(
-            [{"total_host": 10}, {"prepare_input_us": 4, "prepare_output_us": 6}]
-        )
-        assert out == (10, None, None, 10)
+    def test_prep_only_leaves_timings_none(self):
+        out = mm._parse_reports([_prep(prepare_in=4, prepare_out=6)])
+        assert out == (None, None, None, 10)
 
-    def test_missing_prepare_keys_default_to_zero(self):
-        # A second report present but without prepare keys -> 0 + 0, not None.
-        out = mm._parse_reports([{"total_host": 10}, {}])
-        assert out == (10, None, None, 0)
+    def test_one_graph_run(self):
+        out = mm._parse_reports([_timer(host=10), _prep(prepare_in=4, prepare_out=6)])
+        assert out == (10, 0, 0, 10)
+
+    def test_every_graph_run_in_the_window_is_summed(self):
+        # Two runtime.run() calls -> two timer/prep pairs, interleaved as they arrive.
+        out = mm._parse_reports(
+            [
+                _timer(host=10, device=100, ccl=1),
+                _prep(prepare_in=4, prepare_out=6),
+                _timer(host=20, device=200, ccl=2),
+                _prep(prepare_in=40, prepare_out=60),
+            ]
+        )
+        assert out == (30, 300, 3, 110)
+
+    def test_missing_keys_count_as_zero(self):
+        out = mm._parse_reports([{"type": "timer"}, {"type": "prep"}])
+        assert out == (0, 0, 0, 0)
+
+    def test_unknown_report_kinds_are_ignored(self):
+        # RBLN_APPLY_TIMER pushes "buffer_transform" onto the same queue.
+        out = mm._parse_reports(
+            [
+                {"type": "buffer_transform", "wall_us": 999.0},
+                _timer(host=10),
+            ]
+        )
+        assert out == (10, 0, 0, None)
+
+    def test_untyped_reports_contribute_nothing(self):
+        assert mm._parse_reports([{"total_host": 10}]) == (None, None, None, None)
 
 
 class TestMean:
