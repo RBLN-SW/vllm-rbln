@@ -55,6 +55,22 @@ def get_param_qwen3_5(
 ) -> dict:
     # Qwen3.5's linear_attention layers use gated_delta_net; the full_attention
     # layers require flash attention, so force it here.
+    #
+    # flash attention needs a real KV-cache partition, and the base builder only
+    # sets kvcache_partition_len when block_size != max_model_len. So a
+    # block_size == max_model_len (or any block_size that does not evenly
+    # partition max_model_len into >= 2 parts) would reach optimum-rbln with
+    # attn_impl="flash_attn" but no partition length; optimum-rbln then silently
+    # substitutes DEFAULT_FLASH_ATTN_PARTITION_LENGTH (16384) and fails its own
+    # validation with a confusing 16384 reference. Reject it up front, in terms
+    # of block_size, so the requested value is what actually gets compiled.
+    if max_model_len % block_size != 0 or max_model_len // block_size < 2:
+        raise ValueError(
+            f"Qwen3.5 uses flash attention, so block_size ({block_size}) must "
+            f"partition max_model_len ({max_model_len}): it must divide evenly "
+            f"and leave at least 2 partitions (block_size <= max_model_len // 2). "
+            f"Set block_size < max_model_len (e.g. {max_model_len // 2})."
+        )
     param = get_param_qwen2_vl(
         batch_size,
         max_model_len,
