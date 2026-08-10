@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from vllm import LLM, SamplingParams
 from vllm.distributed import cleanup_dist_env_and_memory
 from vllm.engine.arg_utils import AsyncEngineArgs
@@ -211,8 +211,16 @@ class HfRunner:
     """Reference oracle: the same model via HuggingFace transformers on CPU."""
 
     def __init__(self, model: str, dtype: str = "auto") -> None:
+        from vllm_rbln import envs
+
+        config = AutoConfig.from_pretrained(model, trust_remote_code=True)
+        # Mirror the engine's truncation, or the oracle is a different model.
+        if envs.VLLM_RBLN_NUM_HIDDEN_LAYERS > 0:
+            config.num_hidden_layers = min(
+                config.num_hidden_layers, envs.VLLM_RBLN_NUM_HIDDEN_LAYERS
+            )
         self.model: Any = AutoModelForCausalLM.from_pretrained(
-            model, torch_dtype=dtype, trust_remote_code=True
+            model, config=config, torch_dtype=dtype, trust_remote_code=True
         )
         self.model.eval()
         self.tokenizer: Any = AutoTokenizer.from_pretrained(

@@ -124,6 +124,19 @@ def pytest_addoption(parser):
             "default is what gets exercised."
         ),
     )
+    parser.addoption(
+        "--num-hidden-layers",
+        type=int,
+        default=3,
+        help=(
+            "VLLM_RBLN_NUM_HIDDEN_LAYERS for the whole session: build only the "
+            "first N decoder layers, cutting compile time in the "
+            "--model-compile lane. hf_runner truncates to the same N, so "
+            "correctness comparisons stay like-for-like. 0 runs the whole "
+            "model. An exported value is scrubbed like every other "
+            "VLLM_RBLN_* knob; this option is the way in."
+        ),
+    )
 
 
 def pytest_collection_modifyitems(config, items):
@@ -223,6 +236,7 @@ def _spawn_for(item) -> ModuleSpawn:
         nodeid_prefix=item.nodeid.split("::", 1)[0],
         device_tensor=config.getoption("--device-tensor"),
         model_compile=config.getoption("--model-compile"),
+        num_hidden_layers=config.getoption("--num-hidden-layers"),
         tb_style=config.getoption("tbstyle", None),
         maxfail=config.getoption("maxfail", 0),
         stream_output=config.getoption("capture") == "no",
@@ -327,6 +341,11 @@ def pytest_configure(config):
     if device_tensor is not None:
         os.environ["VLLM_RBLN_USE_DEVICE_TENSOR"] = device_tensor
 
+    # Also before the import below: the get_pp_indices patch conditions on this.
+    os.environ["VLLM_RBLN_NUM_HIDDEN_LAYERS"] = str(
+        config.getoption("--num-hidden-layers")
+    )
+
     # Platform plugins activate on their own when current_platform is first
     # touched, but the patches live in the general_plugins group and nothing
     # loads those implicitly. Without this the suite runs half-applied:
@@ -362,6 +381,10 @@ def pytest_report_header(config):
         f"native: env {', '.join(f'{k}={v}' for k, v in NATIVE_ENV.items())}",
         f"native: device_type={RblnPlatform.device_type} ({origin})",
     ]
+    num_hidden_layers = config.getoption("--num-hidden-layers")
+    header.append(
+        f"native: num_hidden_layers={num_hidden_layers or 'whole model'}",
+    )
     if _scrubbed:
         header.append(f"native: scrubbed {', '.join(sorted(_scrubbed))}")
     return header
