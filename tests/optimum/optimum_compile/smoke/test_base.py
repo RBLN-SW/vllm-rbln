@@ -19,7 +19,10 @@ A smoke test compiles a model through vLLM's optimum-rbln path -- one
 
 from __future__ import annotations
 
+import contextlib
+import gc
 import os
+import time
 import unittest
 from collections.abc import Callable
 from typing import Any
@@ -35,8 +38,10 @@ try:
 except Exception:  # noqa: BLE001 - rebel import/NPU probe may fail without hw
     _NPU_NAME = None
 
-# Bundled image for multimodal inputs -- keeps the default hermetic (no
-# external dataset download).
+# Seconds to wait after tearing an engine down.
+_TEARDOWN_SETTLE_S = 10
+
+# Bundled image for multimodal inputs.
 _ASSET_IMAGE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "..",
@@ -102,9 +107,15 @@ class SmokeBase:
 
         @classmethod
         def tearDownClass(cls) -> None:
-            if getattr(cls, "llm", None) is not None:
-                del cls.llm
-                cls.llm = None
+            llm = getattr(cls, "llm", None)
+            cls.llm = None
+            if llm is None:
+                return
+            with contextlib.suppress(Exception):
+                llm.llm_engine.engine_core.shutdown()
+            del llm
+            gc.collect()
+            time.sleep(_TEARDOWN_SETTLE_S)
 
 
 class DecoderSmoke:
