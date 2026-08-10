@@ -43,7 +43,7 @@ from vllm_rbln.v1.core.rbln_kv_cache_manager import (
     SubBlockMatch,
 )
 from vllm_rbln.v1.core.utils import (
-    DecodeAdmissionController,
+    DecodeBatchBudget,
     num_base_tokens,
     should_defer_spec_step,
 )
@@ -135,27 +135,22 @@ class RBLNScheduler(Scheduler):
         # a full block table.
         self._pending_runner_block_deltas: dict[str, KVCacheBlocks] = {}
 
-        # NOTE(RBLN): per-step decode-admission budget factory. Enforces the
-        # compiled ceiling (max_num_seqs // pp) plus an optional ceil(demand/pp)
-        # soft cap that spreads decodes across microbatches. See v1/core/utils.py.
-        self._decode_admission = DecodeAdmissionController(
-            max_num_seqs=self.max_num_running_reqs,
-            pipeline_parallel_size=(
-                self.vllm_config.parallel_config.pipeline_parallel_size
-            ),
-            pp_balance_decode=envs.VLLM_RBLN_PP_BALANCE_DECODE_BATCH,
-        )
+        # NOTE(RBLN): PP degree for the per-step decode-admission budget
+        # (DecodeBatchBudget.for_step): hard cap = max_num_seqs // pp, soft cap =
+        # ceil(demand / pp) to spread decodes across microbatches. pp == 1 makes
+        # the soft cap a no-op. See v1/core/utils.py.
+        self._pp_size = self.vllm_config.parallel_config.pipeline_parallel_size
 
     def _decode_demand(self) -> int:
-        """Total decode demand for this step's PP-balanced admission cap.
+        """Total decode demand for this step's soft (ceil(demand/pp)) cap.
 
         = running decodes + remote-KV requests ready to be admitted (transfer
         complete, awaiting promotion). Including the ready remote-KV gives the
-        dynamic cap headroom to ramp the decode batch on the P/D-disaggregated
+        soft cap headroom to ramp the decode batch on the P/D-disaggregated
         decode side; running-only would stall the ramp. Demand is invariant
         under admission (promoting a ready remote-KV moves it from ready ->
         running), so this snapshot is exact even as the running/ready split
-        shifts during the waiting loop. Evaluated only when PP balancing is on.
+        shifts during the waiting loop.
         """
         num_running_decodes = sum(1 for r in self.running if not is_prefill(r))
         num_ready_remote_kv = len(self.finished_recving_kv_req_ids)
@@ -233,11 +228,13 @@ class RBLNScheduler(Scheduler):
         # NOTE(RBLN): Per-step decode-batch admission budget shared by the
         # running loop and the waiting-loop remote-KV promotion. can_admit()
         # enforces the hard cap (max_num_seqs // pp == compiled bucket ceiling)
-        # plus, under PP with balancing on, a dynamic ceil(demand/pp) soft cap.
-        # In the non-PP / balance-off case this is exactly the old
-        # `len(scheduled_running_reqs) >= max_num_seqs // pp` gate.
-        decode_budget = self._decode_admission.make_budget(
-            demand_fn=self._decode_demand
+        # plus a ceil(demand/pp) soft cap that spreads decodes across
+        # microbatches. At pp == 1 the soft cap == demand (a no-op), so this is
+        # exactly the old `len(scheduled_running_reqs) >= max_num_seqs` gate.
+        decode_budget = DecodeBatchBudget.for_step(
+            max_num_seqs=self.max_num_running_reqs,
+            pipeline_parallel_size=self._pp_size,
+            demand=self._decode_demand(),
         )
 
         # First, schedule the RUNNING requests.
@@ -459,8 +456,9 @@ class RBLNScheduler(Scheduler):
                     if self.ec_connector is not None:
                         self.ec_connector.update_state_after_alloc(request, i)
 
-            # NOTE(RBLN): hold the decode batch to the compiled max_num_seqs // pp
-            # (see the decode-admission budget) to avoid pipeline bubbles.
+            # NOTE(RBLN): hold the running decode batch within the shared budget
+            # -- the compiled ceiling (max_num_seqs // pp) and the ceil(demand/pp)
+            # spreading cap -- to keep the PP stages balanced (avoid bubbles).
             if not decode_budget.can_admit():
                 break
 

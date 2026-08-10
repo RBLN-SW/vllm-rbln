@@ -1000,43 +1000,39 @@ class TestNoSpecDuringPrefill:
 
 
 class TestDecodeCapMachinery:
-    # Covers the PP decode-batch admission machinery in v1/core/utils
-    # (DecodeBatchBudget + cap policies) and its wiring into schedule().
+    # Covers the per-step decode-batch admission budget in v1/core/utils
+    # (DecodeBatchBudget) and its wiring into schedule().
 
-    def test_dynamic_decode_cap_policy(self):
-        # DynamicDecodeCapPolicy spreads active decodes across PP stages:
-        # cap = max(1, min(static_max, ceil(active / pp_size))).
-        import math
+    def test_decode_budget_for_step_spreads_demand(self):
+        # for_step: hard cap = max_num_seqs // pp; soft cap = max(1, ceil(demand/pp)).
+        from vllm_rbln.v1.core.utils import DecodeBatchBudget
 
-        from vllm_rbln.v1.core.utils import DynamicDecodeCapPolicy
+        # max_num_seqs=16, pp=2 -> hard 8; demand 6 -> soft ceil(6/2)=3.
+        b = DecodeBatchBudget.for_step(16, 2, 6)
+        b.admit(3)  # count == soft
+        assert not b.can_admit()  # budgeted gate closes at the soft cap
+        assert b.can_admit(apply_soft_cap=False)  # hard (8) still has room
+        b.admit(5)  # count == hard
+        assert not b.can_admit(apply_soft_cap=False)
 
-        # static_max = 8 (e.g. max_num_seqs=16, pp=2)
-        assert DynamicDecodeCapPolicy(8, 2, 6).cap() == math.ceil(6 / 2) == 3
-        assert DynamicDecodeCapPolicy(8, 2, 1).cap() == 1
-        # No active -> floored at 1 (never 0, which would break the budget).
-        assert DynamicDecodeCapPolicy(8, 2, 0).cap() == 1
-        # ceil(15/2)=8 reaches the ceiling.
-        assert DynamicDecodeCapPolicy(8, 2, 15).cap() == 8
-        # Clamp: never exceed static_max (the compiled bucket ceiling).
-        assert DynamicDecodeCapPolicy(8, 2, 100).cap() == 8
-        # Non-divisible max_num_seqs: ceil(33/2)=17 clamps down to 16.
-        assert DynamicDecodeCapPolicy(16, 2, 33).cap() == 16
-        # pp_size == 1: cap = min(static_max, active) -> no-op vs static.
-        assert DynamicDecodeCapPolicy(16, 1, 5).cap() == 5
-        assert DynamicDecodeCapPolicy(16, 1, 20).cap() == 16
+        # No demand -> soft floored at 1 (never 0, which would wedge the budget).
+        nb = DecodeBatchBudget.for_step(16, 2, 0)
+        nb.admit()
+        assert not nb.can_admit()
+
+        # pp == 1 -> soft == demand, a no-op against the max_num_seqs hard cap.
+        b1 = DecodeBatchBudget.for_step(16, 1, 5)
+        b1.admit(5)
+        assert not b1.can_admit()  # soft == demand == 5
+        assert b1.can_admit(apply_soft_cap=False)  # hard == 16
 
     def test_decode_budget_hard_vs_soft_cap(self):
         # can_admit: the hard cap (compiled bucket ceiling) always applies; the
         # soft (spreading) cap only when apply_soft_cap. Demand-unbudgeted joins
         # (full local prefix / resumed-after-eviction) fill to the hard cap.
-        from vllm_rbln.v1.core.utils import (
-            DecodeBatchBudget,
-            DynamicDecodeCapPolicy,
-            StaticDecodeCapPolicy,
-        )
+        from vllm_rbln.v1.core.utils import DecodeBatchBudget
 
-        # Balance: hard=8, soft=ceil(4/2)=2.
-        b = DecodeBatchBudget(DynamicDecodeCapPolicy(8, 2, 4), hard_cap=8)
+        b = DecodeBatchBudget(hard_cap=8, soft_cap=2)
         b.admit(2)  # count == soft
         assert not b.can_admit()  # budgeted: gated at soft (2)
         assert b.can_admit(apply_soft_cap=False)  # unbudgeted: hard (8) has room
@@ -1044,8 +1040,8 @@ class TestDecodeCapMachinery:
         assert not b.can_admit(apply_soft_cap=False)  # hard cap reached
         assert not b.can_admit()
 
-        # Static: soft == hard, so apply_soft_cap makes no difference.
-        b2 = DecodeBatchBudget(StaticDecodeCapPolicy(8), hard_cap=8)
+        # soft == hard: apply_soft_cap makes no difference.
+        b2 = DecodeBatchBudget(hard_cap=8, soft_cap=8)
         b2.admit(8)
         assert not b2.can_admit()
         assert not b2.can_admit(apply_soft_cap=False)
@@ -1053,9 +1049,9 @@ class TestDecodeCapMachinery:
     def test_decode_budget_discard(self):
         # discard() un-admits decodes dropped from the step so can_admit() is not
         # stopped early on a stale over-count (still-admitted decodes stay counted).
-        from vllm_rbln.v1.core.utils import DecodeBatchBudget, StaticDecodeCapPolicy
+        from vllm_rbln.v1.core.utils import DecodeBatchBudget
 
-        b = DecodeBatchBudget(StaticDecodeCapPolicy(2), hard_cap=2)
+        b = DecodeBatchBudget(hard_cap=2, soft_cap=2)
         b.admit(2)  # batch full at the cap
         assert not b.can_admit()  # gate closed
         b.discard()  # a scheduled decode is preempted -> one slot freed
@@ -1068,9 +1064,9 @@ class TestDecodeCapMachinery:
     def test_decode_budget_discard_underflow_asserts(self):
         # A discard() without a matching admit would drive the count negative and
         # silently disable both caps -- the guard asserts instead.
-        from vllm_rbln.v1.core.utils import DecodeBatchBudget, StaticDecodeCapPolicy
+        from vllm_rbln.v1.core.utils import DecodeBatchBudget
 
-        b = DecodeBatchBudget(StaticDecodeCapPolicy(2), hard_cap=2)
+        b = DecodeBatchBudget(hard_cap=2, soft_cap=2)
         with pytest.raises(AssertionError, match="without a matching admit"):
             b.discard()  # count 0 -> would underflow
         b.admit()
@@ -1078,37 +1074,26 @@ class TestDecodeCapMachinery:
         with pytest.raises(AssertionError):
             b.discard()  # underflow again
 
-    def test_pp_balance_decode_spreads_microbatch(self, monkeypatch):
-        # VLLM_RBLN_PP_BALANCE_DECODE_BATCH=1 sizes one step's decode batch to
-        # ~ceil(active/pp_size), spreading active decodes across PP microbatches.
+    def test_schedule_spreads_decode_across_microbatch(self):
+        # Under PP the per-step decode batch is sized to ~ceil(active/pp),
+        # spreading active decodes across microbatches instead of packing them
+        # into one (which would idle the other PP stages).
         import math
 
         n = 6
-
-        def run(balance: bool):
-            monkeypatch.setenv(
-                "VLLM_RBLN_PP_BALANCE_DECODE_BATCH", "1" if balance else "0"
-            )
-            # max_num_seqs=16, pp=2 -> hard cap 8; n=6 active -> ceil(6/2)=3.
-            sched = create_rbln_scheduler(
-                max_num_seqs=16, pipeline_parallel_size=2, block_size=16
-            )
-            reqs = create_requests(
-                n, num_tokens=32, block_size=16, req_ids=[f"d{i}" for i in range(n)]
-            )
-            for r in reqs:
-                advance_to_decode(sched, r)
-            running_decodes = sum(1 for r in sched.running if not is_prefill(r))
-            out = sched.schedule()
-            return running_decodes, len(out.num_scheduled_tokens)
-
-        run_on, sched_on = run(True)
-        run_off, sched_off = run(False)
-        # Balanced: at most ceil(active / pp) admitted this step.
-        assert sched_on <= math.ceil(run_on / 2)
-        assert sched_on >= 1
-        # Static packs more decodes into the single microbatch than balanced.
-        assert sched_off > sched_on
+        # max_num_seqs=16, pp=2 -> hard cap 8; n=6 active -> soft ceil(6/2)=3.
+        sched = create_rbln_scheduler(
+            max_num_seqs=16, pipeline_parallel_size=2, block_size=16
+        )
+        reqs = create_requests(
+            n, num_tokens=32, block_size=16, req_ids=[f"d{i}" for i in range(n)]
+        )
+        for r in reqs:
+            advance_to_decode(sched, r)
+        running_decodes = sum(1 for r in sched.running if not is_prefill(r))
+        out = sched.schedule()
+        # At most ceil(active / pp) decodes admitted this step, and at least one.
+        assert 1 <= len(out.num_scheduled_tokens) <= math.ceil(running_decodes / 2)
 
     def test_priority_preemption_discards_admitted_decode(self, monkeypatch):
         # When PRIORITY preempts an already-scheduled decode to free KV, the

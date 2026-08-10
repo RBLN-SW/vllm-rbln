@@ -18,13 +18,10 @@ Small, independently-testable pieces factored out of ``RBLNScheduler`` so the
 large upstream-copied ``schedule()`` stays readable; some are shared with
 ``RBLNModelRunner`` (``decode_batch_size``, the spec-decode ``num_base_tokens`` /
 ``resolve_propagated_token_write`` token bookkeeping). The per-step decode-batch
-admission budget lives here too (``DecodeBatchBudget`` + ``DecodeCapPolicy`` +
-``DecodeAdmissionController``): RBLN compiles a fixed decode-batch shape, so each
-PP microbatch must stay <= ``max_num_seqs // pipeline_parallel_size``.
+admission budget lives here too (``DecodeBatchBudget``): RBLN compiles a fixed
+decode-batch shape, so each PP microbatch must stay <=
+``max_num_seqs // pipeline_parallel_size``.
 """
-
-from collections.abc import Callable
-from typing import Protocol, runtime_checkable
 
 
 def decode_batch_size(max_num_seqs: int, pipeline_parallel_size: int) -> int:
@@ -127,102 +124,46 @@ def resolve_propagated_token_write(
     return committed_tip, new_token_ids[lo : lo + span]
 
 
-@runtime_checkable
-class DecodeCapPolicy(Protocol):
-    """Supplies the per-step decode-batch cap (max decode requests admitted
-    to one PP microbatch).
-
-    Injected into ``DecodeBatchBudget`` so the admission logic stays fixed
-    while the *sizing* rule can evolve — e.g. a future dynamic policy that
-    splits available decodes across PP stages to avoid microbatch collapse."""
-
-    def cap(self) -> int: ...
-
-
-class StaticDecodeCapPolicy:
-    """Fixed cap = ``max_num_seqs // pipeline_parallel_size``.
-
-    Must equal ``RBLNModelRunner.bucketing_manager.max_batch_size`` so the
-    scheduled decode batch always maps onto a compiled decode-batch bucket.
-    ``pp_size == 1``
-    degenerates to ``max_num_seqs`` (the cap is then a no-op, since the
-    running queue is already bounded by ``max_num_seqs``).
-    """
-
-    def __init__(self, cap: int) -> None:
-        assert cap >= 1, f"decode-batch cap must be >= 1, got {cap}"
-        self._cap = cap
-
-    def cap(self) -> int:
-        return self._cap
-
-
-class DynamicDecodeCapPolicy:
-    """Cap that spreads decode demand across PP microbatches to avoid PP-depth
-    collapse: after a drain the static ``max_num_seqs // pp_size`` cap lets all
-    decodes pack into one microbatch, idling the other stages. Sizing each step
-    to ``ceil(demand / pp_size)`` keeps the pipeline full.
-
-    ``num_demand_decodes`` must include remote-KV requests ready to join (not
-    just running decodes), or the ramp stalls with no headroom. Demand is
-    invariant under admission (promoting a ready remote-KV keeps the total), so a
-    step-start snapshot is exact even as the running/ready split shifts.
-
-    Clamped to ``static_max_cap`` (the compiled ceiling) and floored at 1;
-    ``pp_size == 1`` is a no-op.
-    """
-
-    def __init__(
-        self,
-        static_max_cap: int,
-        pipeline_parallel_size: int,
-        num_demand_decodes: int,
-    ) -> None:
-        assert static_max_cap >= 1, f"static_max_cap must be >= 1, got {static_max_cap}"
-        # ceil(num_demand_decodes / pipeline_parallel_size)
-        spread = -(-num_demand_decodes // pipeline_parallel_size)
-        self._cap = max(1, min(static_max_cap, spread))
-
-    def cap(self) -> int:
-        return self._cap
-
-
 class DecodeBatchBudget:
-    """Tracks how many decode requests have been admitted to the current
-    step's batch, shared across ``schedule()``'s running and waiting loops.
+    """Per-step decode-admission budget, shared across ``schedule()``'s running
+    and waiting loops. One instance per ``schedule()`` call.
 
-    Lifecycle: one instance per ``schedule()`` call. ``admit()`` on every
-    decode added to the step; ``can_admit()`` gates further admissions in
-    both loops; ``reset()`` clears the count when a prefill evicts the
-    decode batch (the "disable mixed batching" path).
+    Two caps:
+    - hard: the compiled decode-bucket ceiling (``max_num_seqs // pp``); the
+      batch may never exceed it or the runner has no bucket -> crash.
+    - soft: ``ceil(demand / pp)``, the PP-balanced spreading target that keeps
+      each microbatch small enough to fill the pipeline. It equals ``demand``
+      (a no-op) when ``pp == 1``, so non-PP decode is unaffected.
     """
 
-    def __init__(self, cap_policy: DecodeCapPolicy, hard_cap: int) -> None:
-        self._cap_policy = cap_policy
-        # Compiled decode-bucket ceiling (max_num_seqs // pp). The batch may
-        # never exceed it or the runner has no bucket -> crash. The policy's
-        # cap() is the (<=) soft/spreading cap (== hard_cap in static mode).
+    def __init__(self, hard_cap: int, soft_cap: int) -> None:
+        assert hard_cap >= 1 and soft_cap >= 1
         self._hard_cap = hard_cap
+        self._soft_cap = soft_cap
         self._count = 0
 
-    def can_admit(self, *, apply_soft_cap: bool = True) -> bool:
-        """True iff one more decode may be admitted this step.
+    @classmethod
+    def for_step(
+        cls, max_num_seqs: int, pipeline_parallel_size: int, demand: int
+    ) -> "DecodeBatchBudget":
+        """Budget for one step. ``demand`` is running decodes + ready remote-KV
+        (invariant under admission -- promoting a ready remote-KV keeps the
+        total -- so a step-start snapshot is exact)."""
+        hard = decode_batch_size(max_num_seqs, pipeline_parallel_size)
+        soft = max(1, -(-demand // pipeline_parallel_size))  # ceil(demand / pp)
+        return cls(hard_cap=hard, soft_cap=soft)
 
-        * hard cap (always): the compiled bucket ceiling; exceeding it crashes
-          the runner.
-        * soft cap (``apply_soft_cap``): the ``ceil(demand/pp)`` spreading
-          target for the budgeted demand. Skip it for joins not in the demand
-          snapshot (full local prefix match, resumed-after-eviction). In static
-          mode the two caps are equal.
+    def can_admit(self, *, apply_soft_cap: bool = True) -> bool:
+        """True iff one more decode may be admitted this step. The hard cap
+        always applies; the soft cap is skipped (``apply_soft_cap=False``) for
+        joins outside the demand snapshot (full local prefix match /
+        resumed-after-eviction), which then face only the hard cap.
         """
         if self._count >= self._hard_cap:
             return False
-        # Soft (spreading) cap for the budgeted demand; skipped for
-        # demand-unbudgeted joins, which then face only the hard cap above.
-        return not (apply_soft_cap and self._count >= self._cap_policy.cap())
+        return not (apply_soft_cap and self._count >= self._soft_cap)
 
     def admit(self, n: int = 1) -> None:
-        """Record ``n`` decode requests as admitted to this step's batch."""
         self._count += n
 
     def discard(self, n: int = 1) -> None:
@@ -247,47 +188,3 @@ class DecodeBatchBudget:
     @property
     def count(self) -> int:
         return self._count
-
-    @property
-    def cap(self) -> int:
-        return self._cap_policy.cap()
-
-
-class DecodeAdmissionController:
-    """Per-scheduler factory for per-step decode-batch admission budgets.
-
-    Built once from config; produces a fresh ``DecodeBatchBudget`` per
-    ``schedule()`` call. Owns the PP decode-cap machinery (compiled per-stage
-    size, static policy, and the static-vs-PP-balanced-dynamic choice). Dynamic
-    capping applies only when ``pp_balance_decode`` and
-    ``pipeline_parallel_size > 1``.
-    """
-
-    def __init__(
-        self,
-        max_num_seqs: int,
-        pipeline_parallel_size: int,
-        pp_balance_decode: bool,
-    ) -> None:
-        self._pp_size = pipeline_parallel_size
-        self._max_decode_batch_size = decode_batch_size(
-            max_num_seqs, pipeline_parallel_size
-        )
-        self._static_policy = StaticDecodeCapPolicy(self._max_decode_batch_size)
-        # Demand-spread capping is only meaningful under PP.
-        self._balance = pp_balance_decode and pipeline_parallel_size > 1
-
-    def make_budget(self, demand_fn: Callable[[], int]) -> DecodeBatchBudget:
-        """Return a fresh budget for this step.
-
-        ``demand_fn`` is a zero-arg callable returning the total decode demand
-        (running decodes + ready remote-KV). It is invoked **only** when PP
-        balancing is active, so the static path pays nothing to compute it.
-        """
-        if self._balance:
-            policy: DecodeCapPolicy = DynamicDecodeCapPolicy(
-                self._max_decode_batch_size, self._pp_size, demand_fn()
-            )
-        else:
-            policy = self._static_policy
-        return DecodeBatchBudget(policy, hard_cap=self._max_decode_batch_size)
