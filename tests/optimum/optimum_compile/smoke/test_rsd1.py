@@ -43,6 +43,7 @@ class TestBgeM3(PoolingSmoke.Test):
 
 class TestQwen3Reranker(DecoderSmoke.Test):
     MODEL_ID = "Qwen/Qwen3-Reranker-0.6B"
+    HF_OVERRIDES = {"num_hidden_layers": 1}
     NUM_DEVICES = 1
     LLM_KWARGS = {"block_size": 1024, "max_model_len": 1024, "max_num_seqs": 2}
 
