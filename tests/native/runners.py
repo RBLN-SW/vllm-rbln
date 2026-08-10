@@ -146,19 +146,34 @@ class AsyncVllmRunner:
         them has -- or pointedly does not have -- work."""
         return self._loop.run_until_complete(self._generate_all(requests))
 
-    async def _generate_all(self, requests: list[DPRequest]) -> list[Any]:
+    def generate_greedy_logprobs(
+        self, requests: list[DPRequest], num_logprobs: int
+    ) -> list[tuple[list[int], str, list[dict[int, float]]]]:
+        """generate_greedy plus per-step top-k logprobs, for the tolerant
+        comparison: greedy flips on near-tied logits, so two runs that agree
+        mathematically can still pick different tokens."""
+        return self._loop.run_until_complete(self._generate_all(requests, num_logprobs))
+
+    async def _generate_all(
+        self, requests: list[DPRequest], num_logprobs: int | None = None
+    ) -> list[Any]:
         # gather() must be built inside the loop, or its futures attach to
         # whatever loop asyncio considers current.
         return list(
             await asyncio.gather(
-                *(self._generate_one(i, req) for i, req in enumerate(requests))
+                *(
+                    self._generate_one(i, req, num_logprobs)
+                    for i, req in enumerate(requests)
+                )
             )
         )
 
     async def _generate_one(
-        self, index: int, request: DPRequest
-    ) -> tuple[list[int], str]:
-        params = SamplingParams(temperature=0.0, max_tokens=request.max_tokens)
+        self, index: int, request: DPRequest, num_logprobs: int | None = None
+    ) -> tuple[list[int], str] | tuple[list[int], str, list[dict[int, float]]]:
+        params = SamplingParams(
+            temperature=0.0, max_tokens=request.max_tokens, logprobs=num_logprobs
+        )
         stream = self.engine.generate(
             request.prompt,
             params,
@@ -187,7 +202,13 @@ class AsyncVllmRunner:
             f"stream without producing any output"
         )
         completion = final.outputs[0]
-        return list(completion.token_ids), completion.text
+        if num_logprobs is None:
+            return list(completion.token_ids), completion.text
+        logprobs = [
+            {tid: lp.logprob for tid, lp in step.items()}
+            for step in (completion.logprobs or [])
+        ]
+        return list(completion.token_ids), completion.text, logprobs
 
     def __enter__(self) -> AsyncVllmRunner:
         return self
@@ -216,8 +237,9 @@ class HfRunner:
         config = AutoConfig.from_pretrained(model, trust_remote_code=True)
         # Mirror the engine's truncation, or the oracle is a different model.
         if envs.VLLM_RBLN_NUM_HIDDEN_LAYERS > 0:
-            config.num_hidden_layers = min(
-                config.num_hidden_layers, envs.VLLM_RBLN_NUM_HIDDEN_LAYERS
+            text_config = config.get_text_config()
+            text_config.num_hidden_layers = min(
+                text_config.num_hidden_layers, envs.VLLM_RBLN_NUM_HIDDEN_LAYERS
             )
         self.model: Any = AutoModelForCausalLM.from_pretrained(
             model, config=config, torch_dtype=dtype, trust_remote_code=True

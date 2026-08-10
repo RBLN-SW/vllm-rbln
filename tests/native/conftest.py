@@ -415,6 +415,14 @@ def hf_runner():
     return HfRunner
 
 
+@pytest.fixture(scope="session")
+def whole_model(pytestconfig) -> bool:
+    """Whether every decoder layer is built (--num-hidden-layers 0). A truncated
+    model still compiles and runs, but its logits are meaningless -- an assertion
+    that depends on output quality has to gate on this."""
+    return pytestconfig.getoption("--num-hidden-layers") == 0
+
+
 @pytest.fixture(autouse=True)
 def _drop_envs_shadows():
     """Remove any ``vllm_rbln.envs`` attribute a test left behind.

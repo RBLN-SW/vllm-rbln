@@ -23,6 +23,9 @@ import pytest
 from tests.native.model_specs import CompileModelSpec, apply_spec_envs, spec_params
 from tests.native.runners import DPRequest
 from tests.native.utils import (
+    TokensText,
+    TokensTextLogprobs,
+    check_logprobs_close,
     check_outputs_equal,
     devices_needed,
     rbln_device_count,
@@ -40,6 +43,7 @@ PROMPT = "The quick brown fox jumps over the lazy dog."
 MAX_TOKENS = 32
 # Finishes mid-decode of a MAX_TOKENS request, so its rank goes idle early.
 SHORT_MAX_TOKENS = 4
+NUM_LOGPROBS = 5
 
 # Hang detector, applied per test; the first test of a spec carries that spec's
 # engine build, which compiles once per DP rank.
@@ -64,8 +68,13 @@ class DPLane:
     def dp_size(self) -> int:
         return self.spec.engine_kwargs["data_parallel_size"]
 
-    def generate_greedy(self, requests: list[DPRequest]) -> list[tuple[list[int], str]]:
+    def generate_greedy(self, requests: list[DPRequest]) -> list[TokensText]:
         return self.runner.generate_greedy(requests)
+
+    def generate_greedy_logprobs(
+        self, requests: list[DPRequest]
+    ) -> list[TokensTextLogprobs]:
+        return self.runner.generate_greedy_logprobs(requests, NUM_LOGPROBS)
 
 
 @pytest.fixture(scope="module", params=spec_params(DP_MODELS))
@@ -94,8 +103,9 @@ def dp_lane(request, async_vllm_runner):
 @pytest.fixture(scope="module")
 def symmetric_outputs(dp_lane):
     """Every rank busy with the same prompt -- the reference for the asymmetric
-    runs, and the only run here with no idle rank."""
-    return dp_lane.generate_greedy(
+    runs, and the only run here with no idle rank. Carries logprobs because the
+    rank-to-rank comparison needs them; the asymmetric runs compare ids only."""
+    return dp_lane.generate_greedy_logprobs(
         [DPRequest(PROMPT, MAX_TOKENS, dp_rank=rank) for rank in range(dp_lane.dp_size)]
     )
 
@@ -103,8 +113,11 @@ def symmetric_outputs(dp_lane):
 def test_every_rank_produces_the_same_output(symmetric_outputs) -> None:
     # Ranks differ only in which NPU slice they hold, so a divergence here is a
     # per-rank fault: mis-assigned devices, or DP padding leaking into logits.
+    # Expert parallelism splits the experts across the ranks and recombines them,
+    # so rank-local accumulation order is not bit-identical; only a near-tie flip
+    # is tolerated, and a wrong slice is nowhere near a tie.
     for rank in range(1, len(symmetric_outputs)):
-        check_outputs_equal(
+        check_logprobs_close(
             outputs_0_lst=[symmetric_outputs[0]],
             outputs_1_lst=[symmetric_outputs[rank]],
             name_0="rank0",
@@ -116,8 +129,9 @@ def test_output_survives_idle_peers(dp_lane, symmetric_outputs) -> None:
     # Every other rank dummy-runs for the whole of rank 0's decode.
     outputs = dp_lane.generate_greedy([DPRequest(PROMPT, MAX_TOKENS, dp_rank=0)])
 
+    ref_ids, ref_text, _ = symmetric_outputs[0]
     check_outputs_equal(
-        outputs_0_lst=[symmetric_outputs[0]],
+        outputs_0_lst=[(ref_ids, ref_text)],
         outputs_1_lst=outputs,
         name_0="rank0 with every rank busy",
         name_1=f"rank0 with {dp_lane.dp_size - 1} idle peers",
@@ -135,8 +149,9 @@ def test_output_survives_a_peer_finishing_early(dp_lane, symmetric_outputs) -> N
     )
     short, long = outputs
 
+    ref_ids, ref_text, _ = symmetric_outputs[last]
     check_outputs_equal(
-        outputs_0_lst=[symmetric_outputs[last]],
+        outputs_0_lst=[(ref_ids, ref_text)],
         outputs_1_lst=[long],
         name_0=f"rank{last} with every rank busy",
         name_1=f"rank{last} outliving rank0",
