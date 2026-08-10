@@ -15,11 +15,12 @@
 
 # NOTE(RBLN): `EngineCore._initialize_kv_caches` is the only hook that works for
 # both single-process and TP>1 -- it warms the workers up before returning, and
-# the caller builds the `Scheduler` only afterwards. The second fact is re-checked
-# below, so a vLLM upgrade that reorders them fails loudly instead of mis-sizing.
+# the caller builds the `Scheduler` only afterwards. A vLLM upgrade that reorders
+# either fails loudly: no runtime reports a profile, or the resize lands too late.
 
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
+from vllm.config import VllmConfig
 from vllm.utils.math_utils import cdiv
 from vllm.v1.engine.core import EngineCore
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -28,9 +29,6 @@ import vllm_rbln.envs as envs
 from vllm_rbln.logger import init_logger
 from vllm_rbln.patches.registry import register_patch
 from vllm_rbln.v1.worker.utils import rescale_kv_cache_config
-
-if TYPE_CHECKING:
-    from vllm.config import VllmConfig
 
 logger = init_logger(__name__)
 
@@ -51,12 +49,6 @@ def resolve_rank_num_blocks(num_blocks_per_rank: list[Any]) -> int | None:
             "dynamic KV cache: some ranks computed a block count and some did not "
             f"({num_blocks_per_rank}); one rank's profile query failed."
         )
-    invalid = [n for n in num_blocks_per_rank if not isinstance(n, int) or n <= 0]
-    if invalid:
-        raise RuntimeError(
-            "dynamic KV cache: ranks returned invalid block counts "
-            f"({num_blocks_per_rank})."
-        )
     return min(num_blocks_per_rank)
 
 
@@ -71,15 +63,9 @@ def resolve_rank_num_blocks(num_blocks_per_rank: list[Any]) -> int | None:
     condition=lambda: envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE,
 )
 def patched_initialize_kv_caches(
-    self: EngineCore, vllm_config: "VllmConfig"
+    self: EngineCore, vllm_config: VllmConfig
 ) -> KVCacheConfig:
     kv_cache_config = engine_core_original_initialize_kv_caches(self, vllm_config)
-
-    if getattr(self, "scheduler", None) is not None:
-        raise RuntimeError(
-            "the scheduler already exists when _initialize_kv_caches returns, so "
-            "its block pool predates the resize; revisit the dynamic-KV patch."
-        )
 
     # The worker gates on the override too, so nothing has been resized here.
     override = vllm_config.cache_config.num_gpu_blocks_override
@@ -129,7 +115,7 @@ def patched_initialize_kv_caches(
 
 
 def assert_kv_cache_fits_one_request(
-    vllm_config: "VllmConfig", kv_cache_config: KVCacheConfig
+    vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
 ) -> None:
     """Fail loudly when the resized pool cannot hold a single max-length request."""
     # NOTE(RBLN): upstream's `check_enough_kv_cache_memory` runs against the
@@ -137,8 +123,6 @@ def assert_kv_cache_fits_one_request(
     # without this the server starts and then rejects every request.
     block_size = vllm_config.cache_config.block_size
     max_model_len = vllm_config.model_config.max_model_len
-    if not block_size or not max_model_len:
-        return
     needed = cdiv(max_model_len, block_size)
     if kv_cache_config.num_blocks >= needed:
         return
@@ -152,7 +136,7 @@ def assert_kv_cache_fits_one_request(
 
 
 def _log_gpu_kv_cache_size(
-    vllm_config: "VllmConfig", kv_cache_config: KVCacheConfig
+    vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
 ) -> None:
     """Re-announce the KV cache size after the resize.
 

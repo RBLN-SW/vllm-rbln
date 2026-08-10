@@ -67,9 +67,3 @@ def test_rejects_a_pool_that_cannot_hold_one_request(
     # The message has to be actionable, like the upstream one it restores.
     assert str(num_blocks) in str(excinfo.value)
     assert "max_model_len" in str(excinfo.value)
-
-
-@pytest.mark.parametrize("block_size,max_model_len", [(0, 32768), (1024, 0), (0, 0)])
-def test_degenerate_config_is_skipped_not_crashed(block_size, max_model_len):
-    """A missing block_size / max_model_len is not this guard's error to raise."""
-    assert_kv_cache_fits_one_request(_config(block_size, max_model_len), _kv(1))

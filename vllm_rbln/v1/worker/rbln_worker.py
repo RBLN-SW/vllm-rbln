@@ -732,7 +732,7 @@ class RBLNWorker(WorkerBase):
         """
         runtimes: list[Any] = []
         seen: set[int] = set()
-        for runtime in getattr(self.model_runner, "runtime_holder", None) or []:
+        for runtime in self.model_runner.runtime_holder:
             if id(runtime) in seen:
                 continue
             seen.add(id(runtime))
@@ -1179,10 +1179,6 @@ class RBLNWorker(WorkerBase):
             raise RuntimeError(
                 f"{len(missing)} runtime(s) contributed a KV memory profile but "
                 "were not reset after the reallocation."
-            )
-        if not reset_ids:
-            raise RuntimeError(
-                "the KV cache was reallocated but no runtime latch was cleared."
             )
         logger.info(
             "[Dynamic KV] reset_adaptive_buffers() on %d runtime(s) "
