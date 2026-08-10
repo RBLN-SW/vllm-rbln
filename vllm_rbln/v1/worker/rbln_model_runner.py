@@ -1661,10 +1661,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             assert isinstance(self.drafter, RBLNEagleProposer)
             assert isinstance(sampled_token_ids, torch.Tensor)
 
-            # The "draft" phase covers more than propose(): these two helpers
-            # run first. prepare_next_token_ids_padded holds nine of the eleven
-            # integer ops that fall back to the host (`why: dtype-not-fp16`),
-            # each one a device round-trip.
             next_token_ids, valid_sampled_tokens_count = (
                 self.drafter.prepare_next_token_ids_padded(
                     common_attn_metadata,
@@ -2998,10 +2994,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
             # 5. specdec (medusa)
             if self.speculative_config and self.speculative_config.method == "medusa":
-                # Narrow like every other drafter branch in this file: only
-                # RBLNMedusaProposer.dummy_run takes no arguments, and without
-                # the assert the union resolves to the eagle proposer, whose
-                # dummy_run requires three.
                 assert isinstance(self.drafter, RBLNMedusaProposer)
                 self.drafter.dummy_run()
 

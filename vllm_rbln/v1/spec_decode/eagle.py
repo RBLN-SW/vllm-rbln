@@ -77,10 +77,6 @@ class RBLNEagleProposer(EagleProposer):
         mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         num_rejected_tokens: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # `drafter/*` scopes below are no-ops unless
-        # VLLM_CUSTOM_SCOPES_FOR_PROFILING=1. Read them under
-        # RBLN_RUNTIME_FORCE_SYNC=1: with async dispatch, device time lands in
-        # whichever scope happens to block.
         if self.method == "eagle3":
             assert isinstance(
                 self.model, (Eagle3LlamaForCausalLM, Eagle3DeepseekV2ForCausalLM)
@@ -420,10 +416,6 @@ class RBLNEagleProposer(EagleProposer):
                 # that out-of-bounds write is the SIGSEGV in KV warmup. Stay in
                 # draft-vocab space and map after the argmax instead
                 # (`_to_target_token_ids`) -- no per-model patch needed.
-                #
-                # Narrowed like the eagle3 branch in `propose()`: only these two
-                # carry `draft_id_to_target_id`, and the assert is what tells
-                # mypy `logits_processor` is callable rather than a Tensor.
                 assert isinstance(
                     self.model, (Eagle3LlamaForCausalLM, Eagle3DeepseekV2ForCausalLM)
                 )
