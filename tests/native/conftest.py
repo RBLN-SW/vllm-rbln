@@ -127,7 +127,7 @@ def pytest_addoption(parser):
     parser.addoption(
         "--num-hidden-layers",
         type=int,
-        default=3,
+        default=4,
         help=(
             "VLLM_RBLN_NUM_HIDDEN_LAYERS for the whole session: build only the "
             "first N decoder layers, cutting compile time in the "
@@ -439,6 +439,19 @@ def _drop_envs_shadows():
     yield
     for name in set(vars(envs)) - before:
         delattr(envs, name)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_rbln_ctx_standalone():
+    """Clear the one env var the code under test writes to the process env.
+
+    RblnPlatform.validate_and_setup_prerequisite sets RBLN_CTX_STANDALONE=1 for
+    any TP/DP/PP/EP config and never clears it. The rebel runtime reads it on
+    every context creation, so one test building such a config leaves every later
+    test -- and every spawned child, which inherits the env -- unable to register
+    a device at all. Mirrors tests/torch_compile/conftest.py."""
+    os.environ.pop("RBLN_CTX_STANDALONE", None)
+    yield
 
 
 @pytest.fixture(autouse=True)
