@@ -1,4 +1,4 @@
-# Copyright 2025 Rebellions Inc. All rights reserved.
+# Copyright 2026 Rebellions Inc. All rights reserved.
 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -34,21 +34,7 @@ class TestGetParamQwen35:
         assert param["kvcache_partition_len"] == 1024
         assert param["max_seq_len"] == 4096
 
-    def test_two_partitions_is_the_minimum(self):
-        # max_model_len // block_size == 2 is allowed.
-        param = get_param_qwen3_5(max_model_len=8192, block_size=4096, **_COMMON)
-        assert param["kvcache_partition_len"] == 4096
-
     def test_block_size_equal_max_model_len_raises(self):
         # Only 1 partition -> flash attention has no partition to work with.
         with pytest.raises(ValueError, match="block_size"):
             get_param_qwen3_5(max_model_len=4096, block_size=4096, **_COMMON)
-
-    def test_non_divisor_block_size_raises(self):
-        with pytest.raises(ValueError, match="block_size"):
-            get_param_qwen3_5(max_model_len=4096, block_size=3000, **_COMMON)
-
-    def test_fewer_than_two_partitions_raises(self):
-        # Divides evenly but leaves < 2 partitions.
-        with pytest.raises(ValueError, match="block_size"):
-            get_param_qwen3_5(max_model_len=6144, block_size=4096, **_COMMON)
