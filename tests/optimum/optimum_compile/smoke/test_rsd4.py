@@ -40,8 +40,11 @@ class TestLlamaFlash(DecoderSmoke.Test):
 
 class TestLlavaNext(MultimodalSmoke.Test):
     MODEL_ID = "llava-hf/llava-v1.6-mistral-7b-hf"
-    HF_OVERRIDES = {"text_config.num_hidden_layers": 1}
-    NUM_DEVICES = 1
+    HF_OVERRIDES = {
+        "text_config.num_hidden_layers": 1,
+        "vision_config.num_hidden_layers": 1,
+    }
+    NUM_DEVICES = 4
     LLM_KWARGS = {"block_size": 4096, "max_model_len": 4096, "max_num_seqs": 1}
 
 
@@ -50,8 +53,9 @@ class TestIdefics3(MultimodalSmoke.Test):
     HF_OVERRIDES = {
         "text_config.num_hidden_layers": 1,
         "text_config.max_position_embeddings": 4096,
+        "vision_config.num_hidden_layers": 1,
     }
-    NUM_DEVICES = 1
+    NUM_DEVICES = 4
     LLM_KWARGS = {"block_size": 4096, "max_model_len": 4096, "max_num_seqs": 1}
 
 
@@ -61,19 +65,19 @@ class TestBlip2(MultimodalSmoke.Test):
         "text_config.num_hidden_layers": 1,
         "qformer_config.num_hidden_layers": 1,
     }
-    NUM_DEVICES = 1
+    NUM_DEVICES = 4
     LLM_KWARGS = {"block_size": 2048, "max_model_len": 2048, "max_num_seqs": 1}
     USE_CHAT_TEMPLATE = False
     PROMPT = "Question: What is shown in this image? Answer:"
 
 
 class TestPaligemma(MultimodalSmoke.Test):
-    MODEL_ID = "google/paligemma2-3b-pt-224"
+    MODEL_ID = "google/paligemma-3b-mix-224"
     HF_OVERRIDES = {
         "text_config.num_hidden_layers": 1,
         "vision_config.num_hidden_layers": 1,
     }
-    NUM_DEVICES = 1
+    NUM_DEVICES = 4
     LLM_KWARGS = {"block_size": 4096, "max_model_len": 4096, "max_num_seqs": 1}
     USE_CHAT_TEMPLATE = False
     PROMPT = "caption en"
