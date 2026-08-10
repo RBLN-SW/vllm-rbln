@@ -78,6 +78,7 @@ _EXPECT_ACCEPTANCE = {"ngram", "suffix", "eagle", "eagle3"}
 _XFAIL_REASON = {
     "eagle3": "RBLNCompileError: RblnTensorAllocateDevTensorKey pass fails on the "
     "eagle3 aux-hidden-state graph",
+    "suffix": "Temporarily disabled: suffix decoding requires an extra package",
 }
 
 
