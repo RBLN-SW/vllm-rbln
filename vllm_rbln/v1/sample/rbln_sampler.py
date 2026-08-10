@@ -31,6 +31,7 @@ from vllm_rbln.v1.sample.ops.logprobs import batched_count_greater_than
 from vllm_rbln.v1.sample.ops.penalties import (
     apply_all_penalties as rbln_apply_all_penalties,
 )
+from vllm_rbln.v1.sample.ops.top_k_top_p import build_op_top_k_top_p
 
 logger = init_logger(__name__)
 
@@ -205,12 +206,19 @@ class RBLNSampler(VLLMSampler):
         for processor in sampling_metadata.logitsprocs.argmax_invariant:
             logits = processor.apply(logits)
 
-        # Apply top_k and/or top_p.
+        # Apply top_k and/or top_p. Greedy requests are encoded as argmax
+        # (top_k=1), which is what lets them share the random-sampling path.
+        k, p = build_op_top_k_top_p(
+            sampling_metadata,
+            logits.shape[0],
+            logits.shape[-1],
+            logits.device,
+        )
         random_sampled, processed_logprobs = self.topk_topp_sampler(
             logits,
             sampling_metadata.generators,
-            sampling_metadata.top_k,
-            sampling_metadata.top_p,
+            k,
+            p,
         )
 
         assert greedy_sampled is None, (
@@ -218,7 +226,7 @@ class RBLNSampler(VLLMSampler):
             "separately and merges the results, "
             "but vLLM RBLN processes greedy and random requests together: "
             "greedy requests are routed through the random-sampling path "
-            "with a very small temperature value."
+            "with their candidate set narrowed to the argmax."
         )
         return random_sampled, processed_logprobs
 
@@ -315,12 +323,13 @@ class RBLNSampler(VLLMSampler):
         # NOTE:
         # in-place division triggers buffer key error
         # in torchinductor
-        # NOTE:
-        # Greedy requests use a small temperature (1e-3) so softmax collapses
-        # to a near one-hot at argmax. _SAMPLING_EPS (1e-5) is too small here —
-        # it pushes logits past softmax's safe exp range and overflows.
+        # NOTE(eunji.lee):
+        # Greedy rows reach the sampling op with top_k=1, so it draws their
+        # argmax and scaling their logits cannot change the outcome. Dividing by
+        # 1 like upstream is therefore enough -- the replacement only has to
+        # avoid a division by zero.
         if not all_random:
-            temperature = torch.where(temperature < _SAMPLING_EPS, 1e-3, temperature)
+            temperature = torch.where(temperature < _SAMPLING_EPS, 1.0, temperature)
         temperature = temperature.to(logits.dtype)
         return logits.div(temperature.unsqueeze(dim=1))
 
