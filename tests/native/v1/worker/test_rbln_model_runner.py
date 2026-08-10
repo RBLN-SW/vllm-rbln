@@ -16,6 +16,7 @@
 # what each method reads. Methods that need the real runner's buffers live in
 # test_rbln_model_runner_states / _inputs / _kv_cache.
 
+import contextlib
 from types import SimpleNamespace
 
 import numpy as np
@@ -31,6 +32,9 @@ from vllm.v1.worker.kv_connector_model_runner_mixin import (
 
 import vllm_rbln.v1.worker.rbln_model_runner as mr
 from vllm_rbln.v1.core.rbln_kv_cache_manager import KVCacheCopyOp
+from vllm_rbln.v1.worker.bucketing.exponential_bucketing_manager import (
+    ExponentialBucketingManager,
+)
 from vllm_rbln.v1.worker.rbln_model_runner import (
     ExecuteModelState,
     RBLNModelRunner,
@@ -344,6 +348,95 @@ class TestDetermineBatchPadding:
     def test_single_dp_returns_no_token_padding(self):
         _, tok, across = self._runner(is_prefill=False)._determine_batch_padding(3, 30)
         assert tok is None and across is None
+
+
+class TestDummyRunPadding:
+    # _dummy_run under DP: the decode layout must carry the group-agreed bucket,
+    # not this rank's own count. #894 was the layout keeping num_reqs while the
+    # attention metadata already used num_reqs_padded.
+    @staticmethod
+    def _runner(monkeypatch, *, reqs_across_dp, specialized=True):
+        captured: dict = {}
+
+        def fake_across_dp(num_tokens, num_reqs, dp_size, dp_rank, is_prefill):
+            reqs = torch.tensor(reqs_across_dp, dtype=torch.int32)
+            # The real one returns no per-rank counts while any rank prefills.
+            return reqs.clone(), None if is_prefill else reqs
+
+        monkeypatch.setattr(
+            mr, "get_pp_group", lambda: SimpleNamespace(is_first_rank=True)
+        )
+        monkeypatch.setattr(
+            mr, "set_forward_context", lambda *a, **kw: contextlib.nullcontext()
+        )
+        monkeypatch.setattr(
+            mr, "build_kv_cache_forward_context_kwargs", lambda *a, **kw: {}
+        )
+        monkeypatch.setattr(
+            mr.RBLNDPMetadata,
+            "num_tokens_and_reqs_across_dp",
+            staticmethod(fake_across_dp),
+        )
+
+        def stage(**kwargs):
+            captured["layout"] = kwargs["layout"]
+            return SimpleNamespace(as_kwargs=lambda: {})
+
+        runner = _make_runner_stub(
+            # Two buckets, so a padded count can differ from a raw one at all.
+            bucketing_manager=ExponentialBucketingManager(
+                max_batch_size=2, min_batch_size=1, limit=2, step=2
+            ),
+            parallel_config=SimpleNamespace(data_parallel_size=4, data_parallel_rank=0),
+            specialized_moe_decode=specialized,
+            input_batch=SimpleNamespace(
+                num_tokens_no_spec=np.zeros(8, dtype=np.int32),
+                num_computed_tokens_cpu=np.zeros(8, dtype=np.int32),
+            ),
+            max_num_tokens=128,
+            max_num_reqs=8,
+            seq_lens_np=np.zeros(8, dtype=np.int32),
+            query_start_loc_np=np.zeros(16, dtype=np.int32),
+            arange_np=np.arange(128),
+            input_ids=torch.zeros(128, dtype=torch.int32),
+            positions=torch.zeros(128, dtype=torch.int32),
+            # use_wrapped_compute_logits is a property over this.
+            is_pooling_model=True,
+            speculative_config=None,
+            kv_cache_bases=None,
+            vllm_config=None,
+            input_stager=SimpleNamespace(stage=stage),
+            model_executable=lambda **kwargs: None,
+            _build_attention_metadata=lambda **kwargs: (
+                captured.setdefault("attn", kwargs),
+                None,
+            ),
+        )
+        return runner, captured
+
+    def test_decode_layout_takes_the_group_bucket(self, monkeypatch):
+        runner, captured = self._runner(monkeypatch, reqs_across_dp=[2, 1, 1, 1])
+        runner._dummy_run(1, 1, is_prefill=False)
+
+        assert captured["layout"].num_reqs == 1
+        assert captured["layout"].num_reqs_padded == 2
+        # Both halves must agree; they disagreeing is the shape error.
+        assert captured["attn"]["num_reqs_padded"] == 2
+
+    def test_prefill_layout_keeps_the_raw_count(self, monkeypatch):
+        runner, captured = self._runner(monkeypatch, reqs_across_dp=[2, 1, 1, 1])
+        runner._dummy_run(1, 4, is_prefill=True)
+
+        assert captured["layout"].num_reqs_padded == 1
+
+    def test_without_specialised_decode_no_group_agreement(self, monkeypatch):
+        runner, captured = self._runner(
+            monkeypatch, reqs_across_dp=[2, 1, 1, 1], specialized=False
+        )
+        runner._dummy_run(1, 1, is_prefill=False)
+
+        # Each rank keeps its own bucket, so a peer at bucket 2 disagrees.
+        assert captured["layout"].num_reqs_padded == 1
 
 
 class TestProcessKvCacheCopyOps:

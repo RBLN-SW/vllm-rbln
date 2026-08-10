@@ -128,7 +128,11 @@ from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
 from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
 from vllm_rbln.v1.worker.input_stager import InputLayout, InputStager, StagedModelInputs
-from vllm_rbln.v1.worker.metrics_v2 import PerformanceContext
+from vllm_rbln.v1.worker.metrics_v2 import (
+    PerformanceContext,
+    e2e_ends,
+    e2e_starts,
+)
 from vllm_rbln.v1.worker.utils import (
     get_kv_cache_names,
     prepare_kernel_block_sizes,
@@ -1316,6 +1320,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             req_id_to_index_output_copy,
         )
 
+    @e2e_starts
     @torch.inference_mode()
     def execute_model(
         self,
@@ -1466,6 +1471,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self.kv_connector_output = kv_connector_output
         return None
 
+    @e2e_ends
     @torch.inference_mode()
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"

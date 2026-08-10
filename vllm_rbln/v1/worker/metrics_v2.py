@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import json
 import os
 import time
@@ -153,8 +154,6 @@ class _TimingSpan:
         self._ctx._submit(
             _Sample(latency, host, device, ccl, prepare, self._phase),
             self._is_sampler,
-            self._start,
-            end,
         )
         return False
 
@@ -176,40 +175,49 @@ class _PerformanceContext:
         self._metrics: dict[bool, Metrics] = defaultdict(Metrics)
         self._pending: _Sample | None = None
         self._e2e_start: float | None = None
+        self._e2e_is_prefill: bool | None = None
         self._e2e: dict[bool, Metrics] = defaultdict(Metrics)
         self._runtimes = runtimes if runtimes is not None else []
         self._backlog_drained = False
+
+    def start_e2e(self) -> None:
+        self._e2e_start = time.perf_counter()
+        self._e2e_is_prefill = None
+
+    def end_e2e(self) -> None:
+        end = time.perf_counter()
+        start, self._e2e_start = self._e2e_start, None
+        if start is None:
+            return
+        if self._e2e_is_prefill is None:
+            return  # no forward pass ran: nothing to attribute
+        self._e2e[self._e2e_is_prefill].record(end - start)
 
     def profile_model(self, is_prefill: bool) -> _TimingSpan:
         self._drain_report_backlog()
         # A prior model step with no sampler (intermediate chunked prefill,
         # non-last PP rank) leaves a pending report; record it model-only here.
         self._flush_pending()
+        if self._e2e_start is not None:
+            self._e2e_is_prefill = is_prefill
         return _TimingSpan(self, phase=is_prefill, is_sampler=False)
 
     def profile_sampler(self) -> _TimingSpan:
         return _TimingSpan(self, phase=None, is_sampler=True)
 
-    def _submit(
-        self, sample: _Sample, is_sampler: bool, start: float, end: float
-    ) -> None:
+    def _submit(self, sample: _Sample, is_sampler: bool) -> None:
         if not is_sampler:
             self._pending = sample  # model: stash, wait for the sampler
-            self._e2e_start = start
             return
         if self._pending is None:
             return  # sampler with no preceding model step; ignore
         self._record(self._pending.merged(sample))
-        if self._e2e_start is not None:
-            self._e2e[bool(self._pending.phase)].record(end - self._e2e_start)
         self._pending = None
-        self._e2e_start = None
 
     def _flush_pending(self) -> None:
         if self._pending is not None:
             self._record(self._pending)
             self._pending = None
-        self._e2e_start = None
 
     def _record(self, s: _Sample) -> None:
         self._metrics[bool(s.phase)].record(
@@ -240,6 +248,12 @@ class _PerformanceContext:
 
 class _NoopPerformanceContext:
     def __init__(self, *args, **kwargs) -> None:
+        pass
+
+    def start_e2e(self) -> None:
+        pass
+
+    def end_e2e(self) -> None:
         pass
 
     def profile_model(self, *args, **kwargs) -> _NoopSpan:
@@ -380,9 +394,40 @@ def _parse_reports(
     return host_time, device_time, ccl_time, prepare_time
 
 
+def _e2e_starts(fn):
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        ctx = self.performance_ctx
+        ctx.start_e2e()
+        output = fn(self, *args, **kwargs)
+        if output is not None:
+            ctx.end_e2e()
+        return output
+
+    return wrapper
+
+
+def _e2e_ends(fn):
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        try:
+            return fn(self, *args, **kwargs)
+        finally:
+            self.performance_ctx.end_e2e()
+
+    return wrapper
+
+
+def _identity(fn):
+    return fn
+
+
 # Resolved once at import time via VLLM_RBLN_METRICS env var.
 # When disabled, _NoopPerformanceContext is assigned so every profile()
-# call returns a zero-overhead no-op span.
+# call returns a zero-overhead no-op span, and the decorators hand back
+# the undecorated function.
 PerformanceContext: type[_PerformanceContext | _NoopPerformanceContext] = (
     _PerformanceContext if envs.VLLM_RBLN_METRICS else _NoopPerformanceContext
 )
+e2e_starts = _e2e_starts if envs.VLLM_RBLN_METRICS else _identity
+e2e_ends = _e2e_ends if envs.VLLM_RBLN_METRICS else _identity

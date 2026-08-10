@@ -31,11 +31,6 @@ MAX_TOKENS = 5
 NUM_LOGPROBS = 5
 
 
-@pytest.fixture(autouse=True)
-def _disable_compile_cache(monkeypatch):
-    monkeypatch.setenv("VLLM_DISABLE_COMPILE_CACHE", "1")
-
-
 @pytest.mark.model_compile
 @pytest.mark.parametrize("spec", spec_params(MODELS))
 def test_models(hf_runner, vllm_runner, spec: CompileModelSpec, monkeypatch) -> None:
