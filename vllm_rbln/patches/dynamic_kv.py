@@ -15,14 +15,11 @@
 
 # NOTE(RBLN): `EngineCore._initialize_kv_caches` is the only hook that works for
 # both single-process and TP>1 -- it warms the workers up before returning, and
-# the caller builds the `Scheduler` only afterwards. Both facts are re-checked
+# the caller builds the `Scheduler` only afterwards. The second fact is re-checked
 # below, so a vLLM upgrade that reorders them fails loudly instead of mis-sizing.
-
-from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-import vllm
 from vllm.utils.math_utils import cdiv
 from vllm.v1.engine.core import EngineCore
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -39,14 +36,6 @@ logger = init_logger(__name__)
 
 # Held at import time: the registry replaces the attribute outright.
 engine_core_original_initialize_kv_caches = EngineCore._initialize_kv_caches
-
-# vLLM release this was written against; the structural checks below are the real
-# guard, so a mismatch only warns.
-_VERIFIED_VLLM_VERSION = "0.24.0"
-
-
-def _dynamic_kv_enabled() -> bool:
-    return bool(envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE)
 
 
 def resolve_rank_num_blocks(num_blocks_per_rank: list[Any]) -> int | None:
@@ -79,26 +68,13 @@ def resolve_rank_num_blocks(num_blocks_per_rank: list[Any]) -> int | None:
         "Re-announce that number to the scheduler's block pool, which was "
         "otherwise sized from the pre-compile estimate."
     ),
-    condition=_dynamic_kv_enabled,
+    condition=lambda: envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE,
 )
 def patched_initialize_kv_caches(
-    self: EngineCore, vllm_config: VllmConfig
+    self: EngineCore, vllm_config: "VllmConfig"
 ) -> KVCacheConfig:
     kv_cache_config = engine_core_original_initialize_kv_caches(self, vllm_config)
 
-    # --- version-drift guards ---------------------------------------------
-    if vllm.__version__ != _VERIFIED_VLLM_VERSION:
-        logger.warning(
-            "the dynamic-KV scheduler hand-off was verified on vLLM %s, this is "
-            "%s; re-check the ordering noted at the top of this module.",
-            _VERIFIED_VLLM_VERSION,
-            vllm.__version__,
-        )
-    if not isinstance(kv_cache_config, KVCacheConfig):
-        raise RuntimeError(
-            "EngineCore._initialize_kv_caches no longer returns a KVCacheConfig "
-            f"(got {type(kv_cache_config).__name__}); revisit the dynamic-KV patch."
-        )
     if getattr(self, "scheduler", None) is not None:
         raise RuntimeError(
             "the scheduler already exists when _initialize_kv_caches returns, so "
@@ -153,7 +129,7 @@ def patched_initialize_kv_caches(
 
 
 def assert_kv_cache_fits_one_request(
-    vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
+    vllm_config: "VllmConfig", kv_cache_config: KVCacheConfig
 ) -> None:
     """Fail loudly when the resized pool cannot hold a single max-length request."""
     # NOTE(RBLN): upstream's `check_enough_kv_cache_memory` runs against the
@@ -176,7 +152,7 @@ def assert_kv_cache_fits_one_request(
 
 
 def _log_gpu_kv_cache_size(
-    vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
+    vllm_config: "VllmConfig", kv_cache_config: KVCacheConfig
 ) -> None:
     """Re-announce the KV cache size after the resize.
 
