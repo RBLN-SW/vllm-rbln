@@ -66,7 +66,7 @@ class TestQwen35VL(MultimodalSmoke.Test):
     NUM_DEVICES = 1
     LLM_KWARGS = {
         "block_size": 4096,
-        "max_model_len": 4096,
+        "max_model_len": 8192,
         "max_num_seqs": 1,
         "additional_config": {"rbln_config": {"visual": {"max_seq_len": [512]}}},
     }
