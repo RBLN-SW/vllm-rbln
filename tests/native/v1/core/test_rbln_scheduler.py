@@ -1065,6 +1065,19 @@ class TestDecodeCapMachinery:
         b.reset()
         assert b.count == 0
 
+    def test_decode_budget_discard_underflow_asserts(self):
+        # A discard() without a matching admit would drive the count negative and
+        # silently disable both caps -- the guard asserts instead.
+        from vllm_rbln.v1.core.utils import DecodeBatchBudget, StaticDecodeCapPolicy
+
+        b = DecodeBatchBudget(StaticDecodeCapPolicy(2), hard_cap=2)
+        with pytest.raises(AssertionError, match="without a matching admit"):
+            b.discard()  # count 0 -> would underflow
+        b.admit()
+        b.discard()  # matched -> count back to 0
+        with pytest.raises(AssertionError):
+            b.discard()  # underflow again
+
     def test_pp_balance_decode_spreads_microbatch(self, monkeypatch):
         # VLLM_RBLN_PP_BALANCE_DECODE_BATCH=1 sizes one step's decode batch to
         # ~ceil(active/pp_size), spreading active decodes across PP microbatches.

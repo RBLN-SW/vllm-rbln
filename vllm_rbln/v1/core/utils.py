@@ -233,6 +233,11 @@ class DecodeBatchBudget:
         running loop -- so the next ``can_admit()`` isn't stopped early on a
         stale over-count.
         """
+        # A discard without a matching admit would drive the count negative,
+        # silently disabling both caps (can_admit only tests >=) -> overschedule.
+        assert self._count >= n, (
+            f"discard({n}) with count={self._count}: discard without a matching admit"
+        )
         self._count -= n
 
     def reset(self) -> None:
