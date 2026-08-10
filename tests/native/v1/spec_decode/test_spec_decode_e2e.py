@@ -37,7 +37,7 @@ MAX_TOKENS = 16
 SPEC_METHODS = {
     "ngram": (
         _NGRAM_TARGET,
-        {},
+        {"num_gpu_blocks_override": 32},
         {
             "method": "ngram",
             "prompt_lookup_max": 5,
@@ -47,7 +47,7 @@ SPEC_METHODS = {
     ),
     "suffix": (
         _NGRAM_TARGET,
-        {},
+        {"num_gpu_blocks_override": 32},
         {
             "method": "suffix",
             "suffix_decoding_max_spec_factor": 2.0,

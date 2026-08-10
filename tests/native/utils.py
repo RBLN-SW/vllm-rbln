@@ -38,38 +38,32 @@ NATIVE_ENV = {
     "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
     "VLLM_RBLN_USE_VLLM_MODEL": "1",
     "VLLM_DISABLE_COMPILE_CACHE": "1",
+    "RBLN_ROOT_IP": "127.0.0.1",
+    "RBLN_LOCAL_IP": "127.0.0.1",
 }
 
-# Host description -- which NPUs exist, what SOC to compile for, OMP threads.
-# CI and developer machines legitimately set these; scrubbing them would break
-# device selection and make compile-only hosts fail in get_device_name().
-HOST_ENV_PASSTHROUGH = frozenset(
-    {
-        "RBLN_DEVICES",
-        "RBLN_FORCE_NPU_NAME",
-        "RBLN_TARGET_SOC",
-        "RBLN_NPUS_PER_DEVICE",
-        "RBLN_NUM_THREADS",
-    }
-)
+SCRUBBED_PREFIXES = ("VLLM_RBLN_",)
 
-SCRUBBED_PREFIXES = ("VLLM_RBLN_", "RBLN_")
-
-# Upstream knobs RblnPlatform itself branches on, so they are part of the
-# native suite's input surface despite not being RBLN-named.
+# Knobs outside that prefix that still decide what the suite runs: two upstream
+# ones RblnPlatform branches on, and the compiler flag VLLM_RBLN_USE_CUSTOM_KERNEL
+# resolves from instead of a private copy.
 SCRUBBED_EXTRA = frozenset(
     {
         "VLLM_USE_V2_MODEL_RUNNER",
         "VLLM_DISABLE_COMPILE_CACHE",
         "VLLM_WORKER_MULTIPROC_METHOD",
+        "RBLN_USE_CUSTOM_KERNEL",
     }
 )
 
 
 def is_scrubbed(key: str) -> bool:
-    """Whether ``key`` is a behavior knob the suite must control itself."""
-    if key in HOST_ENV_PASSTHROUGH:
-        return False
+    """Whether ``key`` is a behavior knob the suite must control itself.
+
+    Bare ``RBLN_*`` names describe the host and drive the compiler (device list,
+    SOC, log verbosity); this suite tests vllm-rbln, so it leaves them to the
+    shell.
+    """
     # The harness's own spawn-control vars (VLLM_RBLN_TEST_SPAWN_*) are not RBLN
     # behavior knobs; scrubbing them in a spawned child would drop the re-entry
     # guard and make the child spawn itself forever.

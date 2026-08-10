@@ -23,10 +23,8 @@ import pytest
 
 from .test_envs import ENV_SOURCE_ALIASES, RBLN_KEYS
 from .utils import (
-    HOST_ENV_PASSTHROUGH,
     NATIVE_ENV,
     SCRUBBED_EXTRA,
-    SCRUBBED_PREFIXES,
     devices_needed,
     is_scrubbed,
     rbln_device_count,
@@ -37,14 +35,14 @@ from .utils import (
 @pytest.mark.parametrize(
     ("key", "expected"),
     [
-        # A host description, even though it matches the RBLN_ prefix: the
-        # passthrough list takes precedence, which is the whole rule.
-        ("RBLN_DEVICES", False),
-        ("RBLN_FORCE_NPU_NAME", False),
-        # Same prefix, but a behavior knob rather than host description.
-        ("RBLN_CTX_STANDALONE", True),
-        ("RBLN_RUNTIME_FORCE_SYNC", True),
         ("VLLM_RBLN_SORT_BATCH", True),
+        # Bare RBLN_ names belong to the host and the compiler, not to the
+        # package under test, so the shell keeps them.
+        ("RBLN_DEVICES", False),
+        ("RBLN_CTX_STANDALONE", False),
+        ("RBLN_VERBOSE", False),
+        # The exception: VLLM_RBLN_USE_CUSTOM_KERNEL resolves from it.
+        ("RBLN_USE_CUSTOM_KERNEL", True),
         # No RBLN prefix at all; caught only because it is listed explicitly.
         ("VLLM_USE_V2_MODEL_RUNNER", True),
         # An upstream vLLM variable that is NOT listed. Scrubbing is targeted,
@@ -63,14 +61,14 @@ def test_scrub_env_removes_reports_and_preserves():
     """The three observable halves of the contract, in one pass."""
     environ = {
         "VLLM_RBLN_SORT_BATCH": "1",
-        "RBLN_CTX_STANDALONE": "1",
+        "RBLN_USE_CUSTOM_KERNEL": "1",
         "RBLN_DEVICES": "0,1",
         "PATH": "/usr/bin",
     }
     removed = scrub_env(environ)
 
     # Reported with values, so pytest_report_header can show what it took.
-    assert removed == {"VLLM_RBLN_SORT_BATCH": "1", "RBLN_CTX_STANDALONE": "1"}
+    assert removed == {"VLLM_RBLN_SORT_BATCH": "1", "RBLN_USE_CUSTOM_KERNEL": "1"}
     # Mutated in place, and nothing else was touched.
     assert environ == {"RBLN_DEVICES": "0,1", "PATH": "/usr/bin"}
 
@@ -95,24 +93,17 @@ def test_scrub_env_defaults_to_the_process_environment():
         os.environ.update(saved)
 
 
-def test_passthrough_entries_are_real_exceptions():
-    """Every passthrough entry must be something the rule would otherwise scrub;
-    a name no prefix matches is a dead entry."""
-    inert = sorted(
-        k for k in HOST_ENV_PASSTHROUGH if not k.startswith(SCRUBBED_PREFIXES)
-    )
-    assert not inert, f"{inert} are exempted from a rule that never applied to them"
-
-
-def test_passthrough_and_extra_are_disjoint():
-    """Listing a name in both would let passthrough silently win."""
-    assert not (HOST_ENV_PASSTHROUGH & SCRUBBED_EXTRA)
+def test_extra_entries_are_real_additions():
+    """An entry the prefix rule already covers is a dead line."""
+    redundant = sorted(k for k in SCRUBBED_EXTRA if k.startswith("VLLM_RBLN_"))
+    assert not redundant, f"{redundant} are already scrubbed by the prefix rule"
 
 
 def test_native_env_pins_no_host_description():
-    """The suite may pin behavior, never machine identity: pinning a passthrough
-    like RBLN_DEVICES would hard-code one host's topology."""
-    assert not (set(NATIVE_ENV) & HOST_ENV_PASSTHROUGH)
+    """The suite may pin behavior, never machine identity: pinning the device
+    list or the SOC would hard-code one host's topology."""
+    host_description = {"RBLN_DEVICES", "RBLN_FORCE_NPU_NAME", "RBLN_TARGET_SOC"}
+    assert not (set(NATIVE_ENV) & host_description)
 
 
 class TestDeviceInventory:
