@@ -180,19 +180,18 @@ class RBLNSampler(VLLMSampler):
 
         logprobs_mode = logprobs_mode_override or self.logprobs_mode
         assert not (sampling_metadata.all_greedy and sampling_metadata.all_random)
-        if not sampling_metadata.all_greedy:
-            greedy_sampled = None
-        else:
-            # It runs only all_greedy is True
-            greedy_sampled = self.greedy_sample(logits)
-            if sampling_metadata.all_greedy:
-                processed_logprobs = None
-                if sampling_metadata.max_num_logprobs is not None:
-                    if logprobs_mode == "processed_logits":
-                        processed_logprobs = logits
-                    elif logprobs_mode == "processed_logprobs":
-                        processed_logprobs = self.compute_logprobs(logits)
-                return greedy_sampled, processed_logprobs
+        if sampling_metadata.all_greedy:
+            # Upstream vLLM keeps this result to merge with the random one via
+            # `torch.where`. vLLM RBLN has no merge step: a mixed batch sends its
+            # greedy rows through the random-sampling path with top_k=1, so the op
+            # can only draw their argmax.
+            processed_logprobs = None
+            if sampling_metadata.max_num_logprobs is not None:
+                if logprobs_mode == "processed_logits":
+                    processed_logprobs = logits
+                elif logprobs_mode == "processed_logprobs":
+                    processed_logprobs = self.compute_logprobs(logits)
+            return self.greedy_sample(logits), processed_logprobs
 
         assert sampling_metadata.temperature is not None
 
@@ -219,13 +218,6 @@ class RBLNSampler(VLLMSampler):
             p,
         )
 
-        assert greedy_sampled is None, (
-            "Upstream vLLM runs greedy and random sampling "
-            "separately and merges the results, "
-            "but vLLM RBLN processes greedy and random requests together: "
-            "greedy requests are routed through the random-sampling path "
-            "with top_k=1, so the op can only draw their argmax."
-        )
         return random_sampled, processed_logprobs
 
     @torch.compiler.disable

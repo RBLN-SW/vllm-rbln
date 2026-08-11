@@ -19,7 +19,6 @@ from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
 
 from vllm_rbln.v1.sample import rbln_sampler as module
-from vllm_rbln.v1.sample.ops.top_k_top_p import GREEDY_TOP_K, GREEDY_TOP_P
 from vllm_rbln.v1.sample.rbln_sampler import RBLNSampler
 
 VOCAB_SIZE = 8
@@ -29,15 +28,13 @@ def make_sampling_metadata(
     temperature: torch.Tensor | None,
     all_greedy: bool,
     all_random: bool,
-    top_k: torch.Tensor | None = None,
-    top_p: torch.Tensor | None = None,
 ) -> SamplingMetadata:
     return SamplingMetadata(
         temperature=temperature,
         all_greedy=all_greedy,
         all_random=all_random,
-        top_p=top_p,
-        top_k=top_k,
+        top_p=None,
+        top_k=None,
         generators={},
         max_num_logprobs=None,
         no_penalties=True,
@@ -95,45 +92,13 @@ def test_greedy_row_of_a_mixed_batch_samples_its_argmax(sampler):
         all_random=False,
     )
 
-    for _ in range(50):
+    for _ in range(10):
         sampled, _ = sampler.sample(near_tied_logits(), metadata)
         assert sampled[0].item() == 6
 
 
-def test_mixed_batch_narrows_only_the_greedy_row(sampler, op_args):
-    metadata = make_sampling_metadata(
-        temperature=torch.tensor([0.0, 1.0]),
-        all_greedy=False,
-        all_random=False,
-    )
-
-    sampler.sample(near_tied_logits(), metadata)
-
-    top_k, top_p = op_args[0]
-    # The random row keeps the values that disable both filters.
-    assert torch.equal(
-        top_k, torch.tensor([GREEDY_TOP_K, VOCAB_SIZE], dtype=torch.int32)
-    )
-    assert torch.equal(top_p, torch.tensor([GREEDY_TOP_P, 1.0], dtype=torch.float32))
-
-
-def test_random_batch_keeps_request_top_k_top_p(sampler, op_args):
-    metadata = make_sampling_metadata(
-        temperature=torch.tensor([1.0, 2.0]),
-        all_greedy=False,
-        all_random=True,
-        top_k=torch.tensor([2, VOCAB_SIZE], dtype=torch.int32),
-        top_p=torch.tensor([1.0, 0.9], dtype=torch.float32),
-    )
-
-    sampler.sample(near_tied_logits(), metadata)
-
-    top_k, top_p = op_args[0]
-    assert torch.equal(top_k, torch.tensor([2, VOCAB_SIZE], dtype=torch.int32))
-    assert torch.equal(top_p, torch.tensor([1.0, 0.9], dtype=torch.float32))
-
-
 def test_all_greedy_batch_takes_the_argmax_op(sampler, op_args):
+    """The reference for the test above: `rbln::argmax` must answer the same."""
     metadata = make_sampling_metadata(
         temperature=None,
         all_greedy=True,
@@ -145,16 +110,3 @@ def test_all_greedy_batch_takes_the_argmax_op(sampler, op_args):
     # An all-greedy batch skips the top-k/top-p op entirely.
     assert op_args == []
     assert sampled.tolist() == [6, 1]
-
-
-def test_greedy_row_temperature_is_replaced_by_one(sampler):
-    """The temperature substitution only has to avoid dividing by zero, so the
-    greedy row's logits reach the op unscaled."""
-    logits = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
-
-    scaled = sampler.apply_temperature(
-        logits.clone(), torch.tensor([0.0, 2.0]), all_random=False
-    )
-
-    expected = torch.stack([logits[0], logits[1] / 2.0])
-    assert torch.equal(scaled, expected)

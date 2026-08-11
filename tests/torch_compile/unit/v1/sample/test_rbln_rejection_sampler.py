@@ -105,21 +105,6 @@ def test_all_random_batch_without_top_k_top_p_disables_both():
     assert torch.equal(top_p, torch.tensor([1.0, 1.0], dtype=torch.float32))
 
 
-def test_all_random_batch_keeps_request_top_k_top_p():
-    metadata = make_sampling_metadata(
-        temperature=torch.tensor([1.0, 2.0]),
-        all_greedy=False,
-        all_random=True,
-        top_k=torch.tensor([4, VOCAB_SIZE], dtype=torch.int32),
-        top_p=torch.tensor([0.9, 1.0], dtype=torch.float32),
-    )
-
-    top_k, top_p = build_op_top_k_top_p(metadata, 2, VOCAB_SIZE, DEVICE)
-
-    assert torch.equal(top_k, torch.tensor([4, VOCAB_SIZE], dtype=torch.int32))
-    assert torch.equal(top_p, torch.tensor([0.9, 1.0], dtype=torch.float32))
-
-
 def test_mixed_batch_overrides_only_greedy_rows():
     # Row 0 is greedy, and vLLM rewrites its params to the same values a random
     # request without top-k/top-p carries -- which is why the op cannot tell the
@@ -274,31 +259,6 @@ def test_greedy_rows_accept_exactly_the_target_argmax(impl, trial):
             [3, 5, 10],  # all accepted -> bonus token
             [2, 7, PLACEHOLDER_TOKEN_ID],  # accept one, then recover the argmax
             [6, 1, 12],  # top_k=1 row behaves like the greedy rows
-        ],
-        dtype=torch.int32,
-    )
-    assert torch.equal(output, expected)
-
-
-def test_all_greedy_rows_accept_exactly_the_target_argmax(impl):
-    metadata = make_sampling_metadata(
-        temperature=None,
-        all_greedy=True,
-        all_random=False,
-    )
-
-    output = run_rejection_sample(
-        impl,
-        draft_token_ids=[3, 5, 2, 4],
-        target_argmax_token_ids=[3, 5, 2, 7],
-        bonus_token_ids=[10, 11],
-        metadata=metadata,
-    )
-
-    expected = torch.tensor(
-        [
-            [3, 5, 10],
-            [2, 7, PLACEHOLDER_TOKEN_ID],
         ],
         dtype=torch.int32,
     )

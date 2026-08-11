@@ -26,22 +26,8 @@ def build_op_top_k_top_p(
     vocab_size: int,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build the per-request `top_k` / `top_p` inputs of an RBLN sampling op.
-
-    Both tensors are always materialized, and greedy requests carry
-    `(GREEDY_TOP_K, GREEDY_TOP_P)` instead of their own values.
-
-    The RBLN sampling ops have no greedy kernel: they draw one token per row
-    under that row's top-k/top-p. `sampling_metadata` on its own cannot tell an
-    op which rows are greedy, because vLLM rewrites a greedy request's params to
-    `top_k=0` (stored as `vocab_size`) and `top_p=1.0` -- exactly what a random
-    request that uses neither top-k nor top-p carries. Narrowing a greedy row to
-    its single most probable token restores the distinction, and makes the
-    row's outcome its argmax.
-
-    Materializing both tensors also keeps the compiled op's graph signature
-    fixed. `None` and a tensor are different inputs, so a batch that gains or
-    loses its last top-k request would otherwise force a recompile.
+    """
+    Build the per-request `top_k` / `top_p` inputs of an RBLN sampling op.
     """
     if sampling_metadata.all_greedy:
         return (
