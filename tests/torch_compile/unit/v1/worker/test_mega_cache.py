@@ -530,21 +530,21 @@ class TestSaveLoadRoundTrip:
                 raise OSError(errno.ENOSPC, "No space left on device")
             return handle
 
-        monkeypatch.setattr("builtins.open", full_disk)
-        mega_cache.save("m", "sig")  # must not propagate
-        monkeypatch.undo()
+        with monkeypatch.context() as m:
+            m.setattr("builtins.open", full_disk)
+            mega_cache.save("m", "sig")  # must not propagate
         assert not _tmp_leftovers(bundle_env.path)
         assert not os.path.exists(bundle_env.path)
 
     def test_out_of_space_keeps_previous_bundle(self, bundle_env, monkeypatch):
         mega_cache.save("m", "sig")
-        monkeypatch.setattr(
-            mega_cache.os, "replace", _raiser(OSError(errno.ENOSPC, "no space"))
-        )
         bundle_env.artifact = b"second-bundle"
         bundle_env.save_result = (bundle_env.artifact, object())
-        mega_cache.save("m", "sig")
-        monkeypatch.undo()
+        with monkeypatch.context() as m:
+            m.setattr(
+                mega_cache.os, "replace", _raiser(OSError(errno.ENOSPC, "no space"))
+            )
+            mega_cache.save("m", "sig")
         with open(bundle_env.path, "rb") as f:
             assert f.read() == b"bundle-bytes"
         assert not _tmp_leftovers(bundle_env.path)
@@ -559,11 +559,9 @@ class TestSaveLoadRoundTrip:
         assert "out of disk space" in caplog.text
 
     def test_fsync_failure_is_survivable(self, bundle_env, monkeypatch):
-        monkeypatch.setattr(
-            mega_cache.os, "fsync", _raiser(OSError(errno.EIO, "io error"))
-        )
-        mega_cache.save("m", "sig")  # must not propagate
-        monkeypatch.undo()
+        with monkeypatch.context() as m:
+            m.setattr(mega_cache.os, "fsync", _raiser(OSError(errno.EIO, "io error")))
+            mega_cache.save("m", "sig")  # must not propagate
         assert not os.path.exists(bundle_env.path)
         assert not _tmp_leftovers(bundle_env.path)
 
