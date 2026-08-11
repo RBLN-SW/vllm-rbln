@@ -15,10 +15,7 @@ import torch
 from vllm.v1.sample.metadata import SamplingMetadata
 
 GREEDY_TEMPERATURE = 0
-# NOTE(RBLN): The (top_k, top_p) pair that the compiler's `rbln::argmax`
-# converter feeds to `contrib_top_k_top_p_sample`. Handing it to a sampling op
-# narrows a row to its single most probable token, so the op draws that row's
-# argmax. See `build_op_top_k_top_p`.
+
 GREEDY_TOP_K = 1
 GREEDY_TOP_P = 0.0
 
