@@ -11,16 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-"""Tests for how RBLNSampler hands greedy requests to the NPU sampling ops.
-
-`rbln::top_k_top_p` has no greedy kernel, so a mixed batch cannot be split into
-a greedy and a random half the way upstream vLLM does. Greedy rows instead go
-through the same op with their candidate set narrowed to the argmax
-(`top_k=1`), which these tests pin down. `compile` is replaced by the identity
-so the sampler calls the ops eagerly against their CPU reference bodies.
-"""
-
 from unittest.mock import Mock
 
 import pytest

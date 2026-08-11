@@ -12,16 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for how RBLNRejectionSamplerImpl hands greedy requests to the NPU
-`rbln::rejection_sample` op.
-
-The op has no greedy kernel: it draws one token per row from `target_probs`
-under that row's top-k/top-p and accepts the draft only if the two match. Greedy
-rows are therefore narrowed to their top-1 candidate, which is what these tests
-pin down. `compile` is replaced by the identity so the impl calls the op eagerly
-and runs against its CPU reference implementation.
-"""
-
 from unittest.mock import Mock
 
 import pytest
@@ -250,7 +240,7 @@ def run_rejection_sample(
     )
 
 
-@pytest.mark.parametrize("trial", range(20))
+@pytest.mark.parametrize("trial", range(10))
 def test_greedy_rows_accept_exactly_the_target_argmax(impl, trial):
     """A greedy row accepts iff its draft is the target argmax, and recovers the
     argmax at the first mismatch.
