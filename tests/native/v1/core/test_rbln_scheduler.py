@@ -36,7 +36,12 @@ from tests.native.v1.core.utils import (
     prefill_request,
 )
 from vllm_rbln.v1.core.rbln_kv_cache_manager import RBLNKVCacheManager
-from vllm_rbln.v1.core.rbln_scheduler import RBLNScheduler, RBLNSchedulerOutput
+from vllm_rbln.v1.core.rbln_scheduler import (
+    RBLNScheduler,
+    RBLNSchedulerOutput,
+    _cap_dflash_prefill_chunk_to_kv_block,
+    _restore_full_dflash_target_budget,
+)
 from vllm_rbln.v1.core.utils import is_prefill, step_is_prefill
 
 
@@ -252,6 +257,104 @@ class TestScheduleBasic:
         sched.update_from_output(out, make_model_runner_output(out, 0))
         out = sched.schedule()
         assert out.num_scheduled_tokens[req.request_id] == 1
+
+
+class TestDFlashPrefill:
+    def test_restores_only_implicit_target_budget(self):
+        class _SpecConfig:
+            def __init__(self, reserve: int, use_dflash: bool):
+                self.max_num_new_slots_for_drafting = reserve
+                self._use_dflash = use_dflash
+
+            def use_dflash(self) -> bool:
+                return self._use_dflash
+
+        assert (
+            _restore_full_dflash_target_budget(
+                current_budget=506,
+                max_num_batched_tokens=512,
+                max_num_seqs=1,
+                speculative_config=_SpecConfig(reserve=6, use_dflash=True),
+            )
+            == 512
+        )
+        assert (
+            _restore_full_dflash_target_budget(
+                current_budget=504,
+                max_num_batched_tokens=512,
+                max_num_seqs=1,
+                speculative_config=_SpecConfig(reserve=6, use_dflash=True),
+            )
+            == 504
+        )
+        assert (
+            _restore_full_dflash_target_budget(
+                current_budget=506,
+                max_num_batched_tokens=512,
+                max_num_seqs=1,
+                speculative_config=_SpecConfig(reserve=6, use_dflash=False),
+            )
+            == 506
+        )
+
+    def test_chunked_prefill_does_not_cross_kv_block_boundary(self):
+        block_size = 1024
+        sched = create_rbln_scheduler(
+            max_num_batched_tokens=512,
+            max_num_seqs=1,
+            block_size=block_size,
+            max_model_len=49152,
+            num_speculative_tokens=7,
+        )
+        sched.max_num_scheduled_tokens = 506
+        sched._cap_dflash_prefill_to_kv_block = True
+        req = create_requests(
+            num_requests=1,
+            num_tokens=1135,
+            block_size=block_size,
+            max_tokens=64,
+        )[0]
+        sched.add_request(req)
+
+        chunks = []
+        starts = []
+        while req.num_computed_tokens < req.num_prompt_tokens:
+            start = req.num_computed_tokens
+            starts.append(start)
+            out = sched.schedule()
+            chunk = out.num_scheduled_tokens[req.request_id]
+            chunks.append(chunk)
+            assert start % block_size + chunk <= block_size
+            sched.update_from_output(out, make_model_runner_output(out))
+
+        assert chunks == [506, 506, 12, 111]
+        assert starts == [0, 506, 1012, 1024]
+
+    def test_cap_uses_effective_waiting_prefix(self):
+        req = create_requests(
+            num_requests=1,
+            num_tokens=1135,
+            block_size=1024,
+        )[0]
+
+        assert (
+            _cap_dflash_prefill_chunk_to_kv_block(
+                req,
+                num_new_tokens=123,
+                block_size=1024,
+                num_computed_tokens=1012,
+            )
+            == 12
+        )
+        assert (
+            _cap_dflash_prefill_chunk_to_kv_block(
+                req,
+                num_new_tokens=1,
+                block_size=1024,
+                num_computed_tokens=1134,
+            )
+            == 1
+        )
 
 
 class TestSchedulePrefillBatchLimit:

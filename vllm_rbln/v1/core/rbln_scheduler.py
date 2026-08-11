@@ -60,6 +60,48 @@ class RBLNSchedulerOutput(SchedulerOutput):
     kv_cache_copy_ops: list[KVCacheCopyOp] = field(default_factory=list)
 
 
+def _cap_dflash_prefill_chunk_to_kv_block(
+    request: Request,
+    num_new_tokens: int,
+    block_size: int,
+    num_computed_tokens: int,
+) -> int:
+    """Keep one paged-attention prefill call inside one KV block."""
+    if num_computed_tokens >= request.num_tokens - 1:
+        return num_new_tokens
+    tokens_used_in_block = num_computed_tokens % block_size
+    return min(num_new_tokens, block_size - tokens_used_in_block)
+
+
+def _restore_full_dflash_target_budget(
+    current_budget: int,
+    max_num_batched_tokens: int,
+    max_num_seqs: int,
+    speculative_config: Any | None,
+) -> int:
+    """Undo old vLLM's target-budget reservation for RBLN DFlash.
+
+    Upstream's pre-v0.19 scheduler subtracts draft slots from
+    ``max_num_scheduled_tokens`` when speculative decoding is enabled. That is
+    correct for methods that append draft slots into the target batch, but our
+    DFlash port runs the draft block on a separate non-causal graph. Keeping the
+    reduced target budget only changes target prefill chunk geometry.
+
+    Only restore the budget when the current value matches the constructor's
+    implicit DFlash reservation. Explicit user-provided budgets stay intact.
+    """
+    if speculative_config is None or not speculative_config.use_dflash():
+        return current_budget
+
+    reserved_slots = (
+        speculative_config.max_num_new_slots_for_drafting * max_num_seqs
+    )
+    implicit_budget = max_num_batched_tokens - reserved_slots
+    if current_budget != implicit_budget:
+        return current_budget
+    return max_num_batched_tokens
+
+
 class RBLNScheduler(Scheduler):
     def __init__(
         self,
@@ -68,6 +110,17 @@ class RBLNScheduler(Scheduler):
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
+
+        speculative_config = self.vllm_config.speculative_config
+        self._cap_dflash_prefill_to_kv_block = (
+            speculative_config is not None and speculative_config.use_dflash()
+        )
+        self.max_num_scheduled_tokens = _restore_full_dflash_target_budget(
+            current_budget=self.max_num_scheduled_tokens,
+            max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
+            max_num_seqs=self.scheduler_config.max_num_seqs,
+            speculative_config=speculative_config,
+        )
 
         # Replace the upstream KVCacheManager with RBLNKVCacheManager
         # when sub-block prefix caching is enabled.
@@ -311,6 +364,18 @@ class RBLNScheduler(Scheduler):
             if self.need_mamba_block_aligned_split:
                 num_new_tokens = self._mamba_block_aligned_split(
                     request, num_new_tokens
+                )
+
+            # Paged prefill attention writes one contiguous query window.  A
+            # speculative slot reservation can make the prefill budget cease to
+            # divide the KV block size (for example 506 vs 1024), so cap the
+            # logical chunk before it crosses into the next block.
+            if self._cap_dflash_prefill_to_kv_block:
+                num_new_tokens = _cap_dflash_prefill_chunk_to_kv_block(
+                    request,
+                    num_new_tokens,
+                    self.block_size,
+                    request.num_computed_tokens,
                 )
 
             # NOTE(RBLN): A decode query is written as one contiguous KV window.
@@ -689,6 +754,11 @@ class RBLNScheduler(Scheduler):
                     )
                     if num_new_tokens == 0:
                         break
+
+                if self._cap_dflash_prefill_to_kv_block:
+                    num_new_tokens = _cap_dflash_prefill_chunk_to_kv_block(
+                        request, num_new_tokens, self.block_size, num_computed_tokens
+                    )
 
                 # Handles an edge case when P/D Disaggregation
                 # is used with Spec Decoding where an
