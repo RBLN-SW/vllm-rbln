@@ -46,8 +46,8 @@ def _neutralize(monkeypatch):
 def _wire_runner(proposer, *, num_reqs, is_prefill):
     proposer.runner = SimpleNamespace(
         # spec propose runs in the decode phase; the scheduler-stamped
-        # step phase (is_prefill_phase) is what eagle.propose reads now.
-        is_prefill_phase=lambda: False,
+        # step phase (is_prefill_step) is what eagle.propose reads now.
+        is_prefill_step=False,
         input_batch=SimpleNamespace(num_reqs=num_reqs),
         is_prefill=is_prefill,
         kv_caches=[],
@@ -504,7 +504,7 @@ class TestDummyRun:
         _neutralize(monkeypatch)
         proposer = make_eagle_proposer(num_speculative_tokens=1)
         proposer.runner = SimpleNamespace(
-            is_prefill_phase=lambda: False,
+            is_prefill_step=False,
             input_batch=SimpleNamespace(
                 num_reqs=2,
                 block_table=[
@@ -552,7 +552,7 @@ class TestDummyRun:
         _neutralize(monkeypatch)
         proposer = make_eagle_proposer(num_speculative_tokens=2)
         proposer.runner = SimpleNamespace(
-            is_prefill_phase=lambda: False,
+            is_prefill_step=False,
             input_batch=SimpleNamespace(
                 num_reqs=2,
                 block_table=[
@@ -596,7 +596,7 @@ class TestBuildDummyAttnMetadata:
     def test_computes_cumsum_and_shapes(self):
         proposer = make_eagle_proposer(num_speculative_tokens=1)
         proposer.runner = SimpleNamespace(
-            is_prefill_phase=lambda: False,
+            is_prefill_step=False,
             input_batch=SimpleNamespace(
                 block_table=[
                     SimpleNamespace(

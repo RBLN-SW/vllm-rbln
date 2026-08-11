@@ -41,7 +41,7 @@ def _decode_ready(runner, monkeypatch, *, num_spec_tokens: int) -> None:
     # drafter, and none of the arithmetic under test depends on one.
     monkeypatch.setattr(runner, "num_spec_tokens", num_spec_tokens)
     runner._is_prefill_step = False
-    assert runner.is_prefill_phase() is False
+    assert runner.is_prefill_step is False
 
 
 class TestPrepareInputsSpecDecode:

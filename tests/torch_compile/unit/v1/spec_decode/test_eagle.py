@@ -135,7 +135,7 @@ def make_fake_runner(
         compile_context=object(),
         is_prefill=is_prefill,
         # eagle.propose reads the scheduler-stamped step phase.
-        is_prefill_phase=lambda: is_prefill,
+        is_prefill_step=is_prefill,
         is_intermediate_chunked_prefill=is_intermediate_chunked_prefill,
         # _build_dummy_attn_metadata only consumes the cumsum (arange ignored).
         _get_cumsum_and_arange=lambda num_tokens, cumsum_dtype=None: (

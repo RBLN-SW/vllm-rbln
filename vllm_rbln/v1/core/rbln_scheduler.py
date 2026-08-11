@@ -59,13 +59,10 @@ class RBLNSchedulerOutput(SchedulerOutput):
     kv_cache_copy_ops: list[KVCacheCopyOp] = field(default_factory=list)
     # NOTE(RBLN): Whether this step runs the prefill graph (True) or the decode
     # graph (False). RBLN has no mixed batching, so a step is uniformly one or
-    # the other. Stamped by the scheduler (a single authority) from the
-    # authoritative pre-advance Request state, so every PP rank reads an
-    # identical value. The runner MUST use this (via is_prefill_phase()) rather
-    # than re-deriving the phase from its own per-rank input_batch, whose
-    # num_tokens_no_spec is maintained on different paths on the last PP rank
-    # (sampling) vs other ranks (scheduler output) -- a runner-side
-    # classification would diverge across ranks under spec-decode + PP.
+    # the other. The scheduler is the single authority: it stamps this from the
+    # pre-advance Request state so every PP rank reads an identical value. The
+    # runner consumes it via its is_prefill_step property, which documents why a
+    # per-rank re-derivation would diverge.
     is_prefill_step: bool = False
 
 

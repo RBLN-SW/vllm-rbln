@@ -177,17 +177,17 @@ class TestPadDepad:
 
 
 class TestPredicates:
-    def test_is_prefill_phase_reads_scheduler_stamp(self):
-        # _set_step_phase is the sole writer; is_prefill_phase() -- the single
-        # source of truth -- returns it, so all PP ranks agree.
+    def test_is_prefill_step_reads_scheduler_stamp(self):
+        # The is_prefill_step setter is the sole write path; the getter -- the
+        # single source of truth -- returns it, so all PP ranks agree.
         r = _make_runner_stub()
-        r._set_step_phase(True)
-        assert r.is_prefill_phase() is True
-        r._set_step_phase(False)
-        assert r.is_prefill_phase() is False
+        r.is_prefill_step = True
+        assert r.is_prefill_step is True
+        r.is_prefill_step = False
+        assert r.is_prefill_step is False
 
     def test_is_intermediate_chunked_prefill(self):
-        # is_prefill_phase() (scheduler-stamped step phase) AND
+        # is_prefill_step (scheduler-stamped step phase) AND
         # discard_request_mask[0].
         r = _make_runner_stub(
             _is_prefill_step=True,
@@ -315,7 +315,7 @@ class TestGetSupportedTasks:
 class TestDetermineBatchPadding:
     # data_parallel_size == 1 is the covered path (multi-DP needs RBLNDPMetadata
     # collectives -> e2e). The phase is driven via the scheduler-stamped
-    # _is_prefill_step (is_prefill_phase()), not the runner's input_batch.
+    # _is_prefill_step (is_prefill_step), not the runner's input_batch.
     @staticmethod
     def _runner(*, is_prefill, bucket=8):
         computed = 0 if is_prefill else 9

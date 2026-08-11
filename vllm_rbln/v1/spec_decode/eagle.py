@@ -93,7 +93,7 @@ class RBLNEagleProposer(EagleProposer):
         )
 
         assert self.runner is not None
-        is_prefill = self.runner.is_prefill_phase()
+        is_prefill = self.runner.is_prefill_step
 
         # Build attention metadata
         num_reqs = self.runner.input_batch.num_reqs
