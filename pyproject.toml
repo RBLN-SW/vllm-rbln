@@ -145,10 +145,9 @@ check_untyped_defs = true
 follow_imports = "silent"
 
 [tool.uv]
-# 0.11.25 changed lockfile serialization (redundant `environments` markers factored
-# out into `supported-markers`, astral-sh/uv#19933); older uv re-locking writes them
-# all back inline, producing a ~900-line noise diff. Gate every uv command on >= 0.11.25.
-required-version = ">=0.11.25"
+# Re-lock only with uv >= 0.11.25: older uv rewrites the lockfile serialization
+# (astral-sh/uv#19933) into a ~900-line noise diff. Not enforced via required-version
+# because CI images ship older uv and only run `uv pip install` (never re-lock).
 environments = [
     "sys_platform == 'linux' and platform_machine == 'x86_64'"
 ]
