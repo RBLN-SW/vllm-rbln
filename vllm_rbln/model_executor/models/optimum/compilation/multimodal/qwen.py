@@ -57,10 +57,9 @@ def get_param_qwen3_5(
     # layers require flash attention, so force it here.
     if max_model_len // block_size < 2:
         raise ValueError(
-            f"Qwen3.5 uses flash attention, so block_size ({block_size}) must "
-            f"partition max_model_len ({max_model_len}): it must leave at least "
-            f"2 partitions (block_size <= max_model_len // 2). "
-            f"Set block_size < max_model_len (e.g. {max_model_len // 2})."
+            f"Qwen3.5 forces flash attention, which requires block_size ({block_size}) "
+            f"to divide max_model_len ({max_model_len}) into at least 2 equal partitions. "
+            f"Use a divisor of max_model_len that is at most {max_model_len // 2}."
         )
     param = get_param_qwen2_vl(
         batch_size,
