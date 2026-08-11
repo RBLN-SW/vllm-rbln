@@ -18,7 +18,6 @@ import rebel
 import torch
 import torch.nn as nn
 from vllm.config.model import LogprobsMode
-from vllm.sampling_params import _SAMPLING_EPS
 from vllm.v1.outputs import LogprobsTensors, SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler as VLLMSampler
@@ -32,17 +31,29 @@ from vllm_rbln.v1.sample.ops.penalties import (
     apply_all_penalties as rbln_apply_all_penalties,
 )
 
+# NOTE:
+# Greedy requests use a small temperature (1e-3) so softmax collapses
+# to a near one-hot at argmax. _SAMPLING_EPS (1e-5) is too small here —
+# it pushes logits past softmax's safe exp range and overflows.
+_SAMPLING_EPS = 1e-3
+
 logger = init_logger(__name__)
 
 
 def rbln_top_k_top_p_sample(
-    logits: torch.Tensor, k: torch.Tensor | None, p: torch.Tensor | None
+    logits: torch.Tensor,
+    temperature: torch.Tensor,
+    k: torch.Tensor | None,
+    p: torch.Tensor | None,
 ) -> torch.Tensor:
     """
-    Implementation of RBLN top-k top-p sampling.
+    Implementation of RBLN top-k top-p sampling with temperature scaling.
     To avoid self parameter issues when torch.compile is used,
     we define this as a static method.
     """
+    # Apply temperature.
+    logits = logits.div(temperature.unsqueeze(dim=1))
+
     # Apply top-k top-p sampling using RBLN custom op.
     # It requires softmax prior to calling the op.
     probs = torch.nn.functional.softmax(logits, dim=-1)
@@ -109,25 +120,33 @@ class RBLNTopKTopPSampler(nn.Module):
 
     @torch.compiler.disable
     def top_k_top_p_sample(
-        self, logits: torch.Tensor, k: torch.Tensor | None, p: torch.Tensor | None
+        self,
+        logits: torch.Tensor,
+        temperature: torch.Tensor,
+        k: torch.Tensor | None,
+        p: torch.Tensor | None,
     ) -> torch.Tensor:
-        return self._compiled_rbln_topk_topp_sampler(logits, k, p)
+        return self._compiled_rbln_topk_topp_sampler(logits, temperature, k, p)
 
     def forward(
         self,
         logits: torch.Tensor,
         generators: dict[int, torch.Generator],
+        temperature: torch.Tensor,
         k: torch.Tensor | None,
         p: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """More optimized implementation for top-k and top-p sampling."""
+        """More optimized implementation for top-k and top-p sampling.
+
+        Unlike upstream `TopKTopPSampler`, `temperature` is applied here.
+        """
         if generators:
             logger.debug_once(
                 "RBLN Sampling does not support "
                 "per-request generators. Ignoring generators."
             )
 
-        return self.top_k_top_p_sample(logits, k, p), None
+        return self.top_k_top_p_sample(logits, temperature, k, p), None
 
 
 class RBLNSampler(VLLMSampler):
@@ -195,20 +214,28 @@ class RBLNSampler(VLLMSampler):
 
         assert sampling_metadata.temperature is not None
 
-        # Apply temperature.
-        logits = self.apply_temperature(
-            logits, sampling_metadata.temperature, sampling_metadata.all_random
-        )
+        temperature = sampling_metadata.temperature
+        if not sampling_metadata.all_random:
+            temperature = torch.where(
+                temperature < _SAMPLING_EPS, _SAMPLING_EPS, temperature
+            )
+
+        argmax_invariant = sampling_metadata.logitsprocs.argmax_invariant
+        # if argmax_invariant processors are active, apply temperature scaling before applying them.
+        if any(getattr(p, "min_p_count", 1) for p in argmax_invariant):
+            logits = logits.div(temperature.unsqueeze(dim=1))
+            temperature = torch.ones_like(temperature)
 
         # Apply logits processors that only apply to random sampling
         # (argmax invariant)
-        for processor in sampling_metadata.logitsprocs.argmax_invariant:
+        for processor in argmax_invariant:
             logits = processor.apply(logits)
 
-        # Apply top_k and/or top_p.
+        # Apply temperature and top_k and/or top_p.
         random_sampled, processed_logprobs = self.topk_topp_sampler(
             logits,
             sampling_metadata.generators,
+            temperature,
             sampling_metadata.top_k,
             sampling_metadata.top_p,
         )
@@ -305,24 +332,6 @@ class RBLNSampler(VLLMSampler):
             logprobs_tensors=logprobs_tensors,
         )
         return sampler_output
-
-    def apply_temperature(
-        self,
-        logits: torch.Tensor,
-        temperature: torch.Tensor,
-        all_random: bool,
-    ) -> torch.Tensor:
-        # NOTE:
-        # in-place division triggers buffer key error
-        # in torchinductor
-        # NOTE:
-        # Greedy requests use a small temperature (1e-3) so softmax collapses
-        # to a near one-hot at argmax. _SAMPLING_EPS (1e-5) is too small here —
-        # it pushes logits past softmax's safe exp range and overflows.
-        if not all_random:
-            temperature = torch.where(temperature < _SAMPLING_EPS, 1e-3, temperature)
-        temperature = temperature.to(logits.dtype)
-        return logits.div(temperature.unsqueeze(dim=1))
 
     # NOTE(eunji.lee):
     # mark_unbacked torch method should be called outside of torch.compile
