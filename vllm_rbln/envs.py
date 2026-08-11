@@ -51,6 +51,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_COMPILE_MODEL: bool = True
     VLLM_RBLN_COMPILE_STRICT_MODE: bool = False
     VLLM_RBLN_COMPILE_ONLY: bool = False
+    VLLM_RBLN_NUM_HIDDEN_LAYERS: int = 0
     VLLM_RBLN_USE_DEVICE_TENSOR: bool = True
     VLLM_RBLN_DISABLE_OFFLOAD: bool = False
     # Default follows VLLM_RBLN_USE_DEVICE_TENSOR (see use_auto_port), so it is
@@ -264,6 +265,16 @@ environment_variables = {
             os.environ.get("VLLM_RBLN_COMPILE_ONLY", "False").lower() in ("true", "1")
         )
     ),
+    # Build only the first N decoder layers and leave the rest as
+    # `PPMissingLayer`, to cut compile time during bring-up. 0 disables the
+    # truncation. The HF config is left untouched, so layer indices still line
+    # up with the checkpoint and the untruncated count remains available to
+    # anything that reads it (e.g. the MTP start index). For a hybrid attention
+    # model, pick a multiple of the layer-type period (2 for gpt-oss) to keep
+    # the KV cache group structure the full model would have.
+    "VLLM_RBLN_NUM_HIDDEN_LAYERS": lambda: int(
+        os.environ.get("VLLM_RBLN_NUM_HIDDEN_LAYERS", 0)
+    ),
     # Use RBLN device tensors end-to-end (platform device_type="rbln",
     # KV cache / inputs on device, CPU-first attention metadata, padded
     # sampling metadata, no CompileContext). Enabled by default; set to False
@@ -384,6 +395,52 @@ environment_variables = {
     # --- QUANTIZATION ---
     "VLLM_RBLN_USE_W8A16": get_use_w8a16,
 }
+
+# Partition for the mega-cache config signature: COMPILE vars are hashed into
+# the bundle key, NON_COMPILE vars are ignored. test_mega_cache.py asserts the
+# two sets exactly cover environment_variables — classify every new var here.
+RBLN_COMPILE_ENV = frozenset(
+    {
+        "VLLM_RBLN_USE_VLLM_MODEL",
+        "VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK",
+        "VLLM_RBLN_COMPILE_MODEL",
+        "VLLM_RBLN_USE_DEVICE_TENSOR",
+        "VLLM_RBLN_ENFORCE_MODEL_FP32",
+        "VLLM_RBLN_FLASH_CAUSAL_ATTN",
+        "VLLM_RBLN_BATCH_ATTN_OPT",
+        "VLLM_RBLN_USE_CUSTOM_KERNEL",
+        "VLLM_RBLN_SPECIALIZE_MOE_DECODE",
+        "VLLM_RBLN_USE_MOE_TOKENS_MASK",
+        "VLLM_RBLN_DISPATCH_ALL2ALL",
+        "VLLM_RBLN_COMBINE_ALL2ALL",
+        "VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY",
+        "VLLM_RBLN_DECODE_BATCH_BUCKET_MIN",
+        "VLLM_RBLN_DECODE_BATCH_BUCKET_STEP",
+        "VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT",
+        "VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS",
+        "VLLM_RBLN_USE_W8A16",
+    }
+)
+
+RBLN_NON_COMPILE_ENV = frozenset(
+    {
+        # sampler graphs compile with use_cache=False, never enter the bundle
+        "VLLM_RBLN_SAMPLER",
+        "VLLM_RBLN_COMPILE_STRICT_MODE",
+        "VLLM_RBLN_NUM_RAY_NODES",
+        "VLLM_RBLN_ENABLE_WARM_UP",
+        "VLLM_RBLN_METRICS",
+        "VLLM_RBLN_METRICS_FILE",
+        "VLLM_RBLN_METRICS_DIR",
+        "VLLM_RBLN_NUMA",
+        "VLLM_RBLN_COMPILE_ONLY",
+        "VLLM_RBLN_DISABLE_OFFLOAD",
+        "VLLM_RBLN_AUTO_PORT",
+        "VLLM_RBLN_SORT_BATCH",
+        "VLLM_RBLN_SUB_BLOCK_CACHE",
+        "VLLM_RBLN_NIXL_SWA_VIEW_OPT",
+    }
+)
 
 
 def __getattr__(name: str):
