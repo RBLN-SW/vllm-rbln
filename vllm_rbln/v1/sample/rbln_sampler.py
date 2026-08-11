@@ -190,7 +190,7 @@ class RBLNSampler(VLLMSampler):
         buf = ring[self._tok_slot]
         self._tok_slot ^= 1
         buf.copy_(out, non_blocking=True)
-        return buf[:, 0]
+        return buf
 
     def sample(
         self,
