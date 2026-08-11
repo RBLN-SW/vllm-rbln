@@ -12,19 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Temporary per-step probe. Not for merge.
+"""Per-step region timing. Off unless VLLM_RBLN_STEP_PROBE is set.
 
-Answers one question: does the main thread reach forward(N+1)'s dispatch while
-the device is still executing forward(N)?
+This is the primary metric for async scheduling work, because the obvious one
+does not survive contact with the workload: end-to-end tok/s swings ~3% between
+rounds of the same arm, which is larger than most of the effects worth chasing.
+A region here reports over 200 steps per rank with under 1% spread.
 
-`blocked` is wall minus CPU time on this thread, so a region that waits on the
-device shows up there and pure host work does not. If the inter-step host work
-is free (blocked ~ 0) and the first transfer inside forward.dispatch is not,
-the host ran ahead and the step is device-bound.
+Each region reports wall, CPU (thread_time) and their difference. That split is
+what makes it useful: a region that waits on the device shows up as wall minus
+CPU, and pure host work shows up as CPU, so "1.1 ms of host gather" and "1.1 ms
+of waiting for the device" are told apart without a device-side profiler. It was
+that split which showed the token feedback was host work rather than a wait.
 
-Enable with VLLM_RBLN_STEP_PROBE=<steps per report>; VLLM_RBLN_PYMARK=1 adds
-microsecond breadcrumbs into rebel's own log stream so TRACE lines can be
-attributed to a call site.
+Percentiles, not just a mean: a window mean cannot tell "always 1 ms" from
+"0.9 ms most steps, 5 ms sometimes", and those say opposite things about whether
+async is hiding anything.
+
+Set VLLM_RBLN_STEP_PROBE=<steps per report>. VLLM_RBLN_PYMARK=1 additionally
+writes microsecond breadcrumbs into rebel's own log stream, so its TRACE lines
+can be attributed to a call site.
 """
 
 from __future__ import annotations

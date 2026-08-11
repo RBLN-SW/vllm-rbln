@@ -153,7 +153,10 @@ from vllm_rbln.v1.worker.utils import (
 
 logger = init_logger(__name__)
 
-# TEMPORARY: host-only per-step signature; see VLLM_RBLN_STEP_SIG_DIR.
+# Diagnostic: per-step signature of the tokens actually fed, written to
+# VLLM_RBLN_STEP_SIG_DIR. Diffing that row between two arms names the first step
+# where they part, which is how the async output mismatch was localised. Host
+# only, off unless the env var is set.
 _SIG_DIR = os.environ.get("VLLM_RBLN_STEP_SIG_DIR")
 _SIG_ROWS: list = []
 _SIG_SEQ = 0
@@ -373,16 +376,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         else:
             self.sampler = Sampler(self.model_config.logprobs_mode)
 
-        # TEMPORARY per-step timing probe; off unless VLLM_RBLN_STEP_PROBE is set.
+        # Per-step region timing; off unless VLLM_RBLN_STEP_PROBE is set.
         self.step_probe = StepProbe()
         # Host hop for the token feedback; see the identity branch below.
         self._tokfb_host = None
-        # TEMPORARY: let the sampler time its own two halves. The `sample`
-        # region covers the graph call and the staging copy together, and the
-        # graph dump shows the depad tail is a __nop (no execution node), so
-        # whichever half holds the 12.2 ms decides where to look next.
-        self.sampler._probe = self.step_probe
-        # TEMPORARY: dummy-run counter for the step signature capture.
+        # Dummy-run counter for the step signature capture above.
         self._dummy_runs = 0
 
         # Sampled tokens handed back by the output thread, applied to
@@ -449,10 +447,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 self.effective_drafter_max_model_len = self.max_model_len
 
         self.use_async_scheduling = self.scheduler_config.async_scheduling
-        # TEMPORARY: decouple the two things async_scheduling switches at once -
-        # the scheduler class and this runner's output path - so a repro failure
-        # can be attributed to one of them. 1 forces the async output path on,
-        # 0 off; unset keeps the scheduler's choice.
+        # Diagnostic: async_scheduling switches two things at once - the
+        # scheduler class and this runner's output path - so a failure cannot be
+        # attributed to either. This splits them; ab_throughput.sh drives its
+        # schedonly and runneronly arms with it. 1 forces the async output path
+        # on, 0 off, unset keeps the scheduler's choice.
         _runner_override = os.environ.get("VLLM_RBLN_ASYNC_RUNNER")
         if _runner_override is not None:
             self.use_async_scheduling = _runner_override == "1"
