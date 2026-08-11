@@ -16,8 +16,10 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 from vllm_rbln.v1.sample import rbln_rejection_sampler as module
 from vllm_rbln.v1.sample.ops.top_k_top_p import (
@@ -125,6 +127,104 @@ def test_mixed_batch_overrides_only_greedy_rows():
     assert torch.equal(
         top_p, torch.tensor([GREEDY_TOP_P, 1.0, 0.9], dtype=torch.float32)
     )
+
+
+def build_input_batch(requests: list[tuple[str, SamplingParams]]) -> InputBatch:
+    """Feed real `SamplingParams` through an `InputBatch`, as the runner does.
+
+    Metadata built this way carries whatever vLLM's own bookkeeping puts there,
+    rather than the values a test picked.
+    """
+    input_batch = InputBatch(
+        max_num_reqs=8,
+        max_model_len=64,
+        max_num_batched_tokens=64,
+        device=DEVICE,
+        vocab_size=VOCAB_SIZE,
+        block_sizes=[16],
+        kernel_block_sizes=[16],
+        max_num_blocks_per_req=[4],
+    )
+    for req_id, params in requests:
+        input_batch.add_request(
+            CachedRequestState(
+                req_id=req_id,
+                prompt_token_ids=[1, 2, 3],
+                mm_features=None,
+                sampling_params=params,
+                pooling_params=None,
+                generator=None,
+                block_ids=([0, 1],),
+                num_computed_tokens=0,
+                output_token_ids=[],
+            )
+        )
+    input_batch.refresh_metadata()
+    return input_batch
+
+
+def test_greedy_request_of_a_mixed_batch_carries_neutral_top_k_top_p():
+    """The upstream contract the greedy detection rests on.
+
+    vLLM hands a greedy request the values that disable both filters --
+    `top_p=1.0` and `top_k=vocab_size` -- whatever the caller asked for, which is
+    exactly what a random request without filters carries. Temperature is the
+    only thing left that marks the row.
+    """
+    # The greedy request asks for both filters; the random ones are what make
+    # vLLM materialize the per-request tensors for the whole batch.
+    input_batch = build_input_batch(
+        [
+            ("greedy", SamplingParams(temperature=0.0, top_k=4, top_p=0.5)),
+            ("random_top_k", SamplingParams(temperature=1.0, top_k=4)),
+            ("random_top_p", SamplingParams(temperature=1.0, top_p=0.9)),
+        ]
+    )
+
+    metadata = input_batch.sampling_metadata
+    greedy = input_batch.req_id_to_index["greedy"]
+
+    assert not metadata.all_greedy
+    assert not metadata.all_random
+    assert metadata.top_k is not None
+    assert metadata.top_p is not None
+    assert metadata.top_k[greedy].item() == VOCAB_SIZE
+    assert metadata.top_p[greedy].item() == 1.0
+    assert metadata.temperature[greedy].item() == 0.0
+
+    # Which is why the row has to be re-encoded before it reaches the op.
+    top_k, top_p = build_op_top_k_top_p(
+        metadata, input_batch.num_reqs, VOCAB_SIZE, DEVICE
+    )
+    assert top_k[greedy].item() == GREEDY_TOP_K
+    assert top_p[greedy].item() == GREEDY_TOP_P
+
+
+# Every kind of row the op can receive, and the (k, p) pair it must arrive with.
+# `V` disables top-k and `1.0` disables top-p, so only the greedy row is rewritten.
+ROW_KINDS = [
+    ("greedy", SamplingParams(temperature=0.0), GREEDY_TOP_K, GREEDY_TOP_P),
+    ("pure_random", SamplingParams(temperature=1.0), VOCAB_SIZE, 1.0),
+    ("top_k_only", SamplingParams(temperature=1.0, top_k=3), 3, 1.0),
+    ("top_p_only", SamplingParams(temperature=1.0, top_p=0.9), VOCAB_SIZE, 0.9),
+    ("top_k_top_p", SamplingParams(temperature=1.0, top_k=2, top_p=0.8), 2, 0.8),
+]
+
+
+def test_every_row_kind_gets_its_own_top_k_top_p():
+    """All five kinds in one batch, since the op reads k/p per row."""
+    input_batch = build_input_batch(
+        [(name, params) for name, params, _, _ in ROW_KINDS]
+    )
+
+    top_k, top_p = build_op_top_k_top_p(
+        input_batch.sampling_metadata, input_batch.num_reqs, VOCAB_SIZE, DEVICE
+    )
+
+    for name, _, expected_k, expected_p in ROW_KINDS:
+        row = input_batch.req_id_to_index[name]
+        assert top_k[row].item() == expected_k, name
+        assert top_p[row].item() == pytest.approx(expected_p), name
 
 
 def test_mixed_batch_without_request_top_k_top_p():

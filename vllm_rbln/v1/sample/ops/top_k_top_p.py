@@ -17,7 +17,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 GREEDY_TEMPERATURE = 0
 
 GREEDY_TOP_K = 1
-GREEDY_TOP_P = 0.0
+GREEDY_TOP_P = 1.0
 
 
 def build_op_top_k_top_p(
@@ -35,8 +35,6 @@ def build_op_top_k_top_p(
             torch.full((batch_size,), GREEDY_TOP_P, dtype=torch.float32, device=device),
         )
 
-    # vLLM already allocates these as int32 / float32 on the batch's device, so
-    # they feed the op as they are; only a missing one has to be built.
     top_k = (
         sampling_metadata.top_k
         if sampling_metadata.top_k is not None
