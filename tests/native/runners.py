@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -41,11 +42,20 @@ _RBLN_RUNNER_DEFAULTS = dict(
 )
 
 
+def rbln_engine_args(**kwargs) -> dict:
+    merged = {**_RBLN_RUNNER_DEFAULTS, **kwargs}
+    merged.setdefault(
+        "num_gpu_blocks_override",
+        math.ceil(merged["max_model_len"] / merged["block_size"]) + 1,
+    )
+    return merged
+
+
 class VllmRunner:
     """System under test: ``vllm.LLM`` with the native RBLN config; kwargs override."""
 
     def __init__(self, model: str, **kwargs) -> None:
-        self.llm = LLM(model=model, **{**_RBLN_RUNNER_DEFAULTS, **kwargs})
+        self.llm = LLM(model=model, **rbln_engine_args(**kwargs))
 
     def generate_greedy(
         self, prompts: list[str], max_tokens: int
@@ -127,7 +137,7 @@ class AsyncVllmRunner:
         self, model: str, *, request_timeout_s: float = 600.0, **kwargs
     ) -> None:
         self.request_timeout_s = request_timeout_s
-        args = AsyncEngineArgs(model=model, **{**_RBLN_RUNNER_DEFAULTS, **kwargs})
+        args = AsyncEngineArgs(model=model, **rbln_engine_args(**kwargs))
         # One loop for the runner's lifetime; a fresh asyncio.run() per call would
         # orphan the engine's output handler on a closed loop.
         self._loop = asyncio.new_event_loop()
