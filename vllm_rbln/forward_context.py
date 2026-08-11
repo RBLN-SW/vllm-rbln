@@ -36,74 +36,45 @@ from vllm_rbln.logger import init_logger
 logger = init_logger(__name__)
 
 
-@dataclass
-class RBLNDPMetadata(DPMetadata):
-    max_pads_across_dp: torch.Tensor | None = None
+# Bit layout of the packed DP all_reduce payload (int32, low to high):
+#   0..15 num_tokens (max 65535), 16..29 num_reqs (max 16383),
+#   30 is_prefill flag
+_DP_TOKEN_BITS = 16
+_DP_REQ_BITS = 14
+_DP_TOKEN_MASK = (1 << _DP_TOKEN_BITS) - 1
+_DP_REQ_MASK_RAW = (1 << _DP_REQ_BITS) - 1
+_DP_REQ_MASK_SHIFTED = _DP_REQ_MASK_RAW << _DP_TOKEN_BITS
+_DP_PREFILL_FLAG = 1 << (_DP_TOKEN_BITS + _DP_REQ_BITS)
 
-    @staticmethod
-    def num_tokens_across_dp(
-        num_tokens: int, dp_size: int, dp_rank: int
-    ) -> torch.Tensor:
-        """
-        Gather the num_tokens across all DP ranks and return results in a
-        CPU tensor of size dp_size.
-        """
-        num_tokens_across_dp = [0] * dp_size
-        num_tokens_across_dp[dp_rank] = num_tokens
-        num_tokens_tensor = torch.tensor(
-            num_tokens_across_dp, device="cpu", dtype=torch.int32
-        )
-        from vllm.distributed.parallel_state import get_dp_group
 
-        dist.all_reduce(num_tokens_tensor, group=get_dp_group().cpu_group)
-        return num_tokens_tensor
+class DPTokensReduceHandle:
+    """A DP num_tokens/num_reqs all_reduce, possibly still in flight.
 
-    @staticmethod
-    def num_tokens_and_reqs_across_dp(
-        num_tokens: int, num_reqs: int, dp_size: int, dp_rank: int, is_prefill: bool
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """All-reduce per-rank (num_tokens, num_reqs, is_prefill) across DP via
-        a single bit-packed int32 and split the result back out.
+    Issuing is split from consuming (`wait`) so the caller can run host input prep
+    - and leave device work in flight - while the gloo collective progresses on the
+    process group's own thread.
+    """
 
-        Bit layout (int32, low to high):
-            bits  0..15  num_tokens (max 65535)
-            bits 16..29  num_reqs   (max 16383)
-            bit  30      is_prefill flag
+    def __init__(self, encoded_across_dp: torch.Tensor, dp_size: int, work: Any | None):
+        self._encoded_across_dp = encoded_across_dp
+        self._dp_size = dp_size
+        self._work = work
 
-        Returns:
-            num_tokens_across_dp_cpu: per-rank num_tokens (size dp_size).
-            num_reqs_across_dp_cpu: per-rank num_reqs (size dp_size), or None
-                if any rank is in prefill phase.
-        """
-        token_bits = 16
-        req_bits = 14
-        token_mask = (1 << token_bits) - 1
-        req_mask_raw = (1 << req_bits) - 1
-        req_mask_shifted = req_mask_raw << token_bits
-        prefill_flag = 1 << (token_bits + req_bits)
+    def wait(self) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if self._work is not None:
+            self._work.wait()
+            self._work = None
 
-        assert num_tokens <= token_mask, (
-            f"num_tokens={num_tokens} exceeds bit-packed limit {token_mask}"
-        )
-        assert num_reqs <= req_mask_raw, (
-            f"num_reqs={num_reqs} exceeds bit-packed limit {req_mask_raw}"
-        )
-
-        encoded = num_tokens | (num_reqs << token_bits)
-        if is_prefill:
-            encoded |= prefill_flag
-
-        encoded_across_dp = RBLNDPMetadata.num_tokens_across_dp(
-            encoded, dp_size, dp_rank
-        )
+        encoded_across_dp = self._encoded_across_dp
+        dp_size = self._dp_size
 
         prefill_mask = torch.tensor(
-            [prefill_flag] * dp_size, device="cpu", dtype=torch.int32
+            [_DP_PREFILL_FLAG] * dp_size, device="cpu", dtype=torch.int32
         )
         any_prefill = bool((encoded_across_dp & prefill_mask).any().item())
 
         token_mask_t = torch.tensor(
-            [token_mask] * dp_size, device="cpu", dtype=torch.int32
+            [_DP_TOKEN_MASK] * dp_size, device="cpu", dtype=torch.int32
         )
         num_tokens_across_dp_cpu = encoded_across_dp & token_mask_t
 
@@ -111,11 +82,66 @@ class RBLNDPMetadata(DPMetadata):
             num_reqs_across_dp_cpu = None
         else:
             req_mask_t = torch.tensor(
-                [req_mask_shifted] * dp_size, device="cpu", dtype=torch.int32
+                [_DP_REQ_MASK_SHIFTED] * dp_size, device="cpu", dtype=torch.int32
             )
-            num_reqs_across_dp_cpu = (encoded_across_dp & req_mask_t) >> token_bits
+            num_reqs_across_dp_cpu = (encoded_across_dp & req_mask_t) >> _DP_TOKEN_BITS
 
         return num_tokens_across_dp_cpu, num_reqs_across_dp_cpu
+
+
+@dataclass
+class RBLNDPMetadata(DPMetadata):
+    max_pads_across_dp: torch.Tensor | None = None
+
+    @staticmethod
+    def start_num_tokens_and_reqs_across_dp(
+        num_tokens: int,
+        num_reqs: int,
+        dp_size: int,
+        dp_rank: int,
+        is_prefill: bool,
+        async_op: bool = False,
+    ) -> DPTokensReduceHandle:
+        """Issue the all-reduce of per-rank (num_tokens, num_reqs, is_prefill)
+        across DP as a single bit-packed int32.
+
+        Returns a handle; call `wait()` on it to get
+        (num_tokens_across_dp_cpu, num_reqs_across_dp_cpu) - the latter is None
+        if any rank is in prefill phase.
+        """
+        assert num_tokens <= _DP_TOKEN_MASK, (
+            f"num_tokens={num_tokens} exceeds bit-packed limit {_DP_TOKEN_MASK}"
+        )
+        assert num_reqs <= _DP_REQ_MASK_RAW, (
+            f"num_reqs={num_reqs} exceeds bit-packed limit {_DP_REQ_MASK_RAW}"
+        )
+
+        encoded = num_tokens | (num_reqs << _DP_TOKEN_BITS)
+        if is_prefill:
+            encoded |= _DP_PREFILL_FLAG
+
+        num_tokens_across_dp = [0] * dp_size
+        num_tokens_across_dp[dp_rank] = encoded
+        encoded_across_dp = torch.tensor(
+            num_tokens_across_dp, device="cpu", dtype=torch.int32
+        )
+        from vllm.distributed.parallel_state import get_dp_group
+
+        work = dist.all_reduce(
+            encoded_across_dp, group=get_dp_group().cpu_group, async_op=async_op
+        )
+        return DPTokensReduceHandle(
+            encoded_across_dp, dp_size, work if async_op else None
+        )
+
+    @staticmethod
+    def num_tokens_and_reqs_across_dp(
+        num_tokens: int, num_reqs: int, dp_size: int, dp_rank: int, is_prefill: bool
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Blocking form of start_num_tokens_and_reqs_across_dp."""
+        return RBLNDPMetadata.start_num_tokens_and_reqs_across_dp(
+            num_tokens, num_reqs, dp_size, dp_rank, is_prefill, async_op=False
+        ).wait()
 
     @staticmethod
     def make(

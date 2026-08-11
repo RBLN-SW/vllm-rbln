@@ -160,10 +160,37 @@ class RBLNSampler(VLLMSampler):
         self._compiled_greedy_sample = compile_sampler(
             rbln_greedy_sample, compile_context
         )
+        # Staging buffers for the sampled tokens; see greedy_sample.
+        self._tok_stage: list[torch.Tensor] = []
+        self._tok_slot = 0
 
     @torch.compiler.disable
     def greedy_sample(self, logits: torch.Tensor) -> torch.Tensor:
-        return self._compiled_greedy_sample(logits)
+        # The graph returns the kernel's raw (B, 64) int32 slots; column 0 is the
+        # token. Copying out lets the graph output die at once, which keeps its
+        # address stable - a changed one re-patches the command stream every step.
+        # Whole-buffer and non_blocking are both deliberate: a strided column copy
+        # is a host-bound integer gather, and a blocking copy would wait on argmax,
+        # reinstating the drain this change removes.
+        #
+        # Two buffers, alternating: async scheduling hands the returned view to
+        # the output thread and keeps stepping, so a single buffer would be
+        # overwritten by the next step before those tokens had been read. Unlike
+        # the attention staging buffers these are not graph IO - nothing relocates
+        # to them - so rotating costs no command-stream patching.
+        out = self._compiled_greedy_sample(logits)
+        ring = self._tok_stage
+        if not ring or ring[0].shape != out.shape or ring[0].device != out.device:
+            ring = [
+                torch.empty(out.shape, dtype=out.dtype, device=out.device)
+                for _ in range(2)
+            ]
+            self._tok_stage = ring
+            self._tok_slot = 0
+        buf = ring[self._tok_slot]
+        self._tok_slot ^= 1
+        buf.copy_(out, non_blocking=True)
+        return buf[:, 0]
 
     def sample(
         self,
@@ -274,11 +301,8 @@ class RBLNSampler(VLLMSampler):
         sampled, processed_logprobs = self.sample(logits, sampling_metadata)
         if processed_logprobs is not None:
             raw_logprobs = processed_logprobs
-        # Convert sampled token ids to int64 (long) type to ensure compatibility
-        # with subsequent operations that may use these values as indices.
-        # This conversion is necessary because FlashInfer sampling operations
-        # return int32 (while PyTorch argmax and topk return int64).
-        sampled = sampled.long()
+        # The int64 round-trip is dropped: integer eager ops have no device kernel,
+        # so it pulled the tokens off the device. gather_logprobs casts its own copy.
 
         if num_logprobs is None:
             logprobs_tensors = None
@@ -290,11 +314,8 @@ class RBLNSampler(VLLMSampler):
         else:
             # Gather the logprobs and ranks of the topk and sampled token.
             logprobs_tensors = self.gather_logprobs(
-                raw_logprobs, num_logprobs, token_ids=sampled
+                raw_logprobs, num_logprobs, token_ids=sampled.long()
             )
-
-        # Use int32 to reduce the tensor size.
-        sampled = sampled.to(torch.int32)
 
         # These are GPU tensors.
         sampler_output = SamplerOutput(

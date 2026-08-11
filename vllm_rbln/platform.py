@@ -251,12 +251,18 @@ class RblnPlatform(Platform):
         parallel_config = vllm_config.parallel_config
         scheduler_config = vllm_config.scheduler_config
 
-        if scheduler_config.async_scheduling:
-            logger.warning(
-                "Asynchronous scheduling is not supported on RBLN. "
-                "Overriding scheduler_config.async_scheduling to False."
-            )
+        # scheduler_config.async_scheduling is the single switch: it picks the
+        # scheduler class below and drives the runner's whole output path.
+        # VLLM_RBLN_DISABLE_ASYNC=1 is the RBLN kill switch on top of it.
+        if os.environ.get("VLLM_RBLN_DISABLE_ASYNC") == "1":
             scheduler_config.async_scheduling = False
+        if os.environ.get("VLLM_RBLN_ASYNC_SCHED") is not None:
+            logger.warning_once(
+                "VLLM_RBLN_ASYNC_SCHED has been removed and is ignored. Async "
+                "scheduling now follows scheduler_config.async_scheduling, which "
+                "is on by default for generation models; use "
+                "VLLM_RBLN_DISABLE_ASYNC=1 to turn it off."
+            )
 
         if envs.VLLM_RBLN_USE_VLLM_MODEL:
             if vllm_config.lora_config is not None:
@@ -295,9 +301,17 @@ class RblnPlatform(Platform):
                 parallel_config.worker_cls = (
                     "vllm_rbln.v1.worker.rbln_worker.RBLNWorker"
                 )
-            scheduler_config.scheduler_cls = (
-                "vllm_rbln.v1.core.rbln_scheduler.RBLNScheduler"
-            )
+            if scheduler_config.async_scheduling:
+                # Schedule-ahead. Only RBLNAsyncScheduler bumps
+                # num_output_placeholders at schedule time, which is what lets the
+                # engine's batch_queue fill; plain RBLNScheduler would serialise it.
+                scheduler_config.scheduler_cls = (
+                    "vllm_rbln.v1.core.rbln_scheduler.RBLNAsyncScheduler"
+                )
+            else:
+                scheduler_config.scheduler_cls = (
+                    "vllm_rbln.v1.core.rbln_scheduler.RBLNScheduler"
+                )
 
             # FIXME(jiwoo.park) This is a temporary workaround.
             if model_config.enforce_eager:
@@ -360,6 +374,8 @@ class RblnPlatform(Platform):
             scheduler_config.scheduler_cls = (
                 "vllm_rbln.v1.core.optimum_scheduler.RBLNOptimumScheduler"
             )
+            # Optimum model runner doesn't support async scheduling.
+            scheduler_config.async_scheduling = False
 
             assert vllm_config.parallel_config.tensor_parallel_size == 1, (
                 "Cannot set tensor_parallel_size for pre-compiled optimum-rbln models. "

@@ -53,6 +53,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_COMPILE_ONLY: bool = False
     VLLM_RBLN_USE_DEVICE_TENSOR: bool = True
     VLLM_RBLN_DISABLE_OFFLOAD: bool = False
+    VLLM_RBLN_DP_ALL_REDUCE_ASYNC: bool = True
     # Default follows VLLM_RBLN_USE_DEVICE_TENSOR (see use_auto_port), so it is
     # True unless device-tensor mode is explicitly disabled.
     VLLM_RBLN_AUTO_PORT: bool = True
@@ -271,6 +272,15 @@ environment_variables = {
     "VLLM_RBLN_USE_DEVICE_TENSOR": (
         lambda: (
             os.environ.get("VLLM_RBLN_USE_DEVICE_TENSOR", "True").lower()
+            in ("true", "1")
+        )
+    ),
+    # Run the per-step DP num_tokens/num_reqs all_reduce with async_op=True (issue
+    # in _prepare_inputs, wait in _determine_batch_padding) or async_op=False (one
+    # blocking call at the use site). Applies in both scheduling modes.
+    "VLLM_RBLN_DP_ALL_REDUCE_ASYNC": (
+        lambda: (
+            os.environ.get("VLLM_RBLN_DP_ALL_REDUCE_ASYNC", "True").lower()
             in ("true", "1")
         )
     ),

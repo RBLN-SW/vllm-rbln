@@ -88,6 +88,7 @@ def get_vllm_config(
     max_num_batched_tokens: int = 128,
     max_model_len: int = 4096,
     block_size: int = BLOCK_SIZE,
+    async_scheduling: bool = False,
 ) -> VllmConfig:
     model_config = ModelConfig(
         model="meta-llama/Llama-3.2-1B-Instruct",
@@ -95,10 +96,13 @@ def get_vllm_config(
         seed=42,
         max_model_len=max_model_len,
     )
+    # These tests assert the synchronous bookkeeping path, so pin the switch
+    # rather than inheriting vLLM's default (which enables async scheduling).
     scheduler_config = SchedulerConfig(
         max_num_seqs=max_num_seqs,
         max_num_batched_tokens=max_num_batched_tokens,
         max_model_len=max_model_len,
+        async_scheduling=async_scheduling,
         is_encoder_decoder=model_config.is_encoder_decoder,
     )
     cache_config = CacheConfig(
@@ -364,6 +368,7 @@ def _bookkeeping_return(
     num_nans_in_logits=None,
     logprobs_lists=None,
     prompt_logprobs_dict=None,
+    invalid_req_indices=None,
 ):
     return (
         num_nans_in_logits or {},
@@ -372,6 +377,7 @@ def _bookkeeping_return(
         prompt_logprobs_dict or {},
         req_ids,
         req_id_to_index,
+        invalid_req_indices or [],
     )
 
 
@@ -1225,8 +1231,8 @@ def test_prepare_inputs_decode_path(rbln_model_runner, dist_init):
         free_encoder_mm_hashes=[],
     )
 
-    logits_indices, spec_md, query_lengths, total = rbln_model_runner._prepare_inputs(
-        sched, np.array([1, 1], dtype=np.int32)
+    logits_indices, spec_md, query_lengths, total, *_ = (
+        rbln_model_runner._prepare_inputs(sched, np.array([1, 1], dtype=np.int32))
     )
 
     # Decode path: no spec metadata, last-token logits, qlen == 1 each.
@@ -1263,8 +1269,8 @@ def test_prepare_inputs_chunked_prefill_sets_discard_mask(rbln_model_runner, dis
         free_encoder_mm_hashes=[],
     )
 
-    logits_indices, spec_md, query_lengths, total = rbln_model_runner._prepare_inputs(
-        sched, np.array([2, 1], dtype=np.int32)
+    logits_indices, spec_md, query_lengths, total, *_ = (
+        rbln_model_runner._prepare_inputs(sched, np.array([2, 1], dtype=np.int32))
     )
 
     # a is partial -> discarded; b is complete -> kept.
@@ -1302,8 +1308,8 @@ def test_prepare_inputs_spec_decode_path(rbln_model_runner, dist_init, monkeypat
         free_encoder_mm_hashes=[],
     )
 
-    logits_indices, spec_md, query_lengths, total = rbln_model_runner._prepare_inputs(
-        sched, np.array([2], dtype=np.int32)
+    logits_indices, spec_md, query_lengths, total, *_ = (
+        rbln_model_runner._prepare_inputs(sched, np.array([2], dtype=np.int32))
     )
 
     # Fixed full-spec query, padded to num_spec+1 even though logical was 2.
@@ -1361,9 +1367,11 @@ def test_prepare_inputs_num_spec_tokens_without_scheduled_drafts_uses_logical_le
         free_encoder_mm_hashes=[],
     )
 
-    logits_indices, spec_md, query_lengths, total = rbln_model_runner._prepare_inputs(
-        scheduler_output,
-        np.array([1], dtype=np.int32),
+    logits_indices, spec_md, query_lengths, total, *_ = (
+        rbln_model_runner._prepare_inputs(
+            scheduler_output,
+            np.array([1], dtype=np.int32),
+        )
     )
 
     assert spec_md is None
@@ -1648,6 +1656,7 @@ def test_bookkeeping_sync_caches_sampled_tokens(rbln_model_runner, dist_init):
         prompt_logprobs_dict,
         req_ids_output_copy,
         req_id_to_index_output_copy,
+        _invalid_req_indices,
     ) = rbln_model_runner._bookkeeping_sync(
         scheduler_output=scheduler_output,
         sampler_output=sampler_output,
@@ -1742,6 +1751,7 @@ def test_bookkeeping_sync_converts_logprobs_tensors(rbln_model_runner, dist_init
         prompt_logprobs_dict,
         req_ids_output_copy,
         req_id_to_index_output_copy,
+        _invalid_req_indices,
     ) = rbln_model_runner._bookkeeping_sync(
         scheduler_output=scheduler_output,
         sampler_output=sampler_output,
@@ -1823,6 +1833,7 @@ def test_bookkeeping_sync_discards_chunked_prefill_samples(
         prompt_logprobs_dict,
         req_ids_output_copy,
         req_id_to_index_output_copy,
+        _invalid_req_indices,
     ) = rbln_model_runner._bookkeeping_sync(
         scheduler_output=scheduler_output,
         sampler_output=sampler_output,
@@ -1904,6 +1915,7 @@ def test_bookkeeping_sync_parses_spec_decode_output(rbln_model_runner, dist_init
         prompt_logprobs_dict,
         req_ids_output_copy,
         req_id_to_index_output_copy,
+        _invalid_req_indices,
     ) = rbln_model_runner._bookkeeping_sync(
         scheduler_output=scheduler_output,
         sampler_output=sampler_output,
@@ -2094,6 +2106,7 @@ def test_get_nans_in_logits_when_enabled(rbln_model_runner, dist_init, monkeypat
         prompt_logprobs_dict,
         req_ids_output_copy,
         req_id_to_index_output_copy,
+        _invalid_req_indices,
     ) = rbln_model_runner._bookkeeping_sync(
         scheduler_output=scheduler_output,
         sampler_output=sampler_output,
