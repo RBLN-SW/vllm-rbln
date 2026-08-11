@@ -151,7 +151,8 @@ follow_imports = "silent"
 environments = [
     "sys_platform == 'linux' and platform_machine == 'x86_64'"
 ]
-# pypi.rebellions.in is intentionally NOT registered: packages appear/disappear
+# pypi.rebellions.in is intentionally NOT used for resolution (the explicit+unmapped
+# entry below is a credential anchor only): packages appear/disappear
 # there independently of dev/main, so a full lock refresh could pin versions that
 # must not be used. Install packages from it ad-hoc via --extra-index-url instead
 # (see DEVELOPMENT.md). The ax-k1-fp8 vllm build below is a direct URL for the same
@@ -160,6 +161,13 @@ environments = [
 # Exact reproduction is uv.lock's job — installs without the lock are out of contract.
 index-strategy = "unsafe-best-match"
 prerelease = "if-necessary-or-explicit"   # pin uv's default explicitly — prereleases only for packages with a marker (or prerelease-only packages)
+
+[[tool.uv.index]]
+# Never resolved from (explicit, no source mapping); exists so
+# UV_INDEX_REBELLIONS_USERNAME/PASSWORD authenticate the direct-URL vllm wheel above.
+name = "rebellions"
+url = "https://pypi.rebellions.in/"
+explicit = true
 
 [[tool.uv.index]]
 name = "vllm-cpu"
