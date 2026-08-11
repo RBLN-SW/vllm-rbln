@@ -29,15 +29,14 @@ sampling_params = SamplingParams(temperature=0, top_p=1.0)
 
 
 def main(
-    model: str = "meta-llama/Llama-3.2-1B",
+    model: str = "meta-llama/Llama-3.2-3B",
     max_num_seqs: int = 1,
-    max_model_len: int = 4096,
-    block_size: int = None,  # if None, will be set to max_model_len
-    num_devices: int = 4,
+    max_model_len: int = 131072,
+    block_size: int = 16384,
+    num_devices: int = 8,
     use_decoder_batch_sizes: bool = False,
 ):
-    if num_devices is not None:
-        os.environ["VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK"] = str(num_devices)
+    os.environ["VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK"] = str(num_devices)
 
     llm = LLM(
         model=model,

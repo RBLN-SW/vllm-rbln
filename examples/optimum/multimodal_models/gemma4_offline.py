@@ -65,18 +65,23 @@ def main(
     num_input_prompt: int = 1,
     model: str = "google/gemma-4-31B-it",
     max_num_seqs: int = 1,
-    max_model_len: int = 4096,
-    block_size: int = None,  # if None, will be set to max_model_len
-    num_devices: int = 4,
+    max_model_len: int = 262144,
+    block_size: int = 16384,
+    num_devices: int = 16,
+    vision_num_devices: int = 8,
 ):
     os.environ["VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK"] = str(num_devices)
-    if block_size is None:
-        block_size = max_model_len
+    rbln_config = {
+        "visual": {
+            "num_devices": vision_num_devices,
+        },
+    }
     llm = LLM(
         model=model,
         block_size=block_size,
         max_model_len=max_model_len,
         max_num_seqs=max_num_seqs,
+        additional_config={"rbln_config": rbln_config},
     )
     tokenizer = AutoTokenizer.from_pretrained(model)
     inputs = generate_prompts(num_input_prompt, model)

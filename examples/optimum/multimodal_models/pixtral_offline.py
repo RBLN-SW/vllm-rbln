@@ -56,12 +56,11 @@ def main(
     num_input_prompt: int = 4,
     model: str = "mistral-community/pixtral-12b",
     max_num_seqs: int = 1,
-    max_model_len: int = 8192,
-    block_size: int = 4096,  # if None, will be set to max_model_len
+    max_model_len: int = 131072,
+    block_size: int = 16384,
+    num_devices: int = 8,
 ):
-    os.environ["VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK"] = "4"
-    if block_size is None:
-        block_size = max_model_len
+    os.environ["VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK"] = str(num_devices)
     llm = LLM(
         model=model, 
         block_size=block_size, 

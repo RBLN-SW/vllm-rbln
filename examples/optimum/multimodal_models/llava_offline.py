@@ -65,7 +65,7 @@ def main(
     num_input_prompt: int = 10,
     model: str = "llava-hf/llava-v1.6-mistral-7b-hf",
     max_num_seqs: int = 1,
-    max_model_len: int = 16384,
+    max_model_len: int = 32768,
     block_size: int = None,  # if None, will be set to max_model_len
     num_devices: int = 4,
 ):

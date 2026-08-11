@@ -65,13 +65,11 @@ def main(
     num_input_prompt: int = 10,
     model: str = "google/gemma-3-4b-it",
     max_num_seqs: int = 1,
-    max_model_len: int = 4096,
-    block_size: int = None,  # if None, will be set to max_model_len
-    num_devices: int = 4,
+    max_model_len: int = 131072,
+    block_size: int = 16384,
+    num_devices: int = 8,
 ):
     os.environ["VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK"] = str(num_devices)
-    if block_size is None:
-        block_size = max_model_len
     llm = LLM(
         model=model, 
         block_size=block_size, 
