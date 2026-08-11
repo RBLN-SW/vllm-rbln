@@ -21,5 +21,7 @@ from tests.native.model_specs import CompileModelSpec
 MODELS: list[CompileModelSpec] = [
     CompileModelSpec("Qwen/Qwen3-30B-A3B", {"tensor_parallel_size": 8}),
     CompileModelSpec("Qwen/Qwen1.5-MoE-A2.7B", {"tensor_parallel_size": 8}),
-    CompileModelSpec("openai/gpt-oss-20b", {"tensor_parallel_size": 8}),
+    CompileModelSpec(
+        "openai/gpt-oss-20b", {"tensor_parallel_size": 8}, num_hidden_layers=4
+    ),
 ]
