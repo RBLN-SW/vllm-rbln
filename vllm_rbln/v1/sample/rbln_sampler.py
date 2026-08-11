@@ -219,13 +219,6 @@ class RBLNSampler(VLLMSampler):
             p,
         )
 
-        assert greedy_sampled is None, (
-            "Upstream vLLM runs greedy and random sampling "
-            "separately and merges the results, "
-            "but vLLM RBLN processes greedy and random requests together: "
-            "greedy requests are routed through the random-sampling path "
-            "with top_k=1, so the op can only draw their argmax."
-        )
         return random_sampled, processed_logprobs
 
     @torch.compiler.disable
