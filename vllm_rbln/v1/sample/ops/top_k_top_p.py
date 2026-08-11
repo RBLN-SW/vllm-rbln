@@ -53,6 +53,7 @@ def build_op_top_k_top_p(
 
     assert sampling_metadata.temperature is not None
     is_greedy = sampling_metadata.temperature == GREEDY_TEMPERATURE
+    # A greedy row already carries GREEDY_TOP_P, so only its top_k really changes.
     return (
         torch.where(is_greedy, top_k.new_full((), GREEDY_TOP_K), top_k),
         torch.where(is_greedy, top_p.new_full((), GREEDY_TOP_P), top_p),
