@@ -173,7 +173,7 @@ def main(
     os.environ["VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK"] = str(num_devices)
     rbln_config = {
         "visual": {
-            "max_seq_len": vision_max_seq_len, 
+            "max_seq_len": vision_max_seq_len,
             "num_devices": vision_num_devices,
         },
     }

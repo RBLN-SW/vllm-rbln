@@ -62,10 +62,10 @@ def main(
 ):
     os.environ["VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK"] = str(num_devices)
     llm = LLM(
-        model=model, 
-        block_size=block_size, 
-        max_model_len=max_model_len, 
-        max_num_seqs=max_num_seqs
+        model=model,
+        block_size=block_size,
+        max_model_len=max_model_len,
+        max_num_seqs=max_num_seqs,
     )
     tokenizer = AutoTokenizer.from_pretrained(model)
     inputs, labels = generate_prompts(num_input_prompt, model)
