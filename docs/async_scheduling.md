@@ -246,9 +246,25 @@ erroring:
 | repo | note |
 |---|---|
 | `vllm-rbln` | branch `async-scheduling`, installed editable into the venv |
-| `rebel_compiler` | must be **built** from a branch carrying the `Stream` mutex (`grep -q LockForDispatch rebel/include/rebel/runtime/base/stream.h`). Without it the off-main-thread D2H races the compute dispatch — it does not crash, it perturbs logits and flips near-tie argmax tokens, so a wrong build looks fine and produces quietly wrong comparisons. Installed **editable**, and `rebel_compiler/python/rebel` is a symlink to `rebel_compiler/rebel/python/rebel`, so Python edits take effect immediately while C++ edits need `./rebel_install.sh -a -n` |
+| `rebel_compiler` | built from the `async-scheduling` branch. Installed **editable**, and `rebel_compiler/python/rebel` is a symlink to `rebel_compiler/rebel/python/rebel`, so Python edits take effect immediately while C++ edits need `./rebel_install.sh -a -n` — which returns 0 even when ninja fails, so check the `librbln.so` mtime instead of the exit code |
 | `vllm-rbln-executor` | provides the `vllm_rbln_executor.cli` driver and the venv. Invocation is `cli vllm-decoderonly gpt-oss <opts> rbln-run`; the flags used here are `--run-iter`, `--torch-profile`, `--profile-dir`, `--compiled-model-path`, `--cache-ignore`, `-o` |
 | native golden | `remote_cache` copy at `/mnt/shared_data/users/yunseong.kim/nas_data/vllm-rbln-exec-golden`. `native_results_cache_key` excludes dp/ep/block_size/pcs/nblk, so the key is model_id + max_num_seqs + mt: `b8` + `--max-tokens 256` selects the 64-prompt golden. Off-key values silently compare against nothing |
+
+
+> **Correction.** An earlier version of this file said a build without the `Stream`
+> mutex lets the off-main-thread D2H race the compute dispatch, perturbing logits
+> and flipping near-tie argmax tokens. That was misattributed. The output
+> divergence it described had a different cause, fixed in 04315eb8: the async path
+> writes a `-1` placeholder into `CachedRequestState.output_token_ids`, and
+> `token_ids_cpu` is rebuilt from that state every time a request re-enters the
+> batch. And the D2H in question does not reach the mutex at all — a blocking
+> `copy_` lands on `rbln_memcpy_v2h`, whose `CopyCmdBuffer::DoCopy` dispatches and
+> waits without ever touching the Stream; `LockForDispatch` is taken only by
+> `DispatchFlatAsyncCopy` and by the `Run` dispatch loop. Verified under gdb:
+> `rbln_memcpy_v2h_async` is never called on this path. None of that says the
+> mutex is unnecessary in general - `AsyncRuntime` runs `instance->Run()` on
+> several threads against one Context - only that it is not what keeps this
+> comparison honest.
 
 ```bash
 python -c "import rebel, os; print(os.path.dirname(rebel.__file__))"   # from that checkout?
