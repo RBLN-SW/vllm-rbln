@@ -12,9 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Pure aggregation, no NPU: the _PerformanceContext state machine is driven by
-# feeding _Sample objects into _submit/_flush_pending directly.
-
 import json
 import types
 
@@ -92,27 +89,68 @@ class TestSampleMerged:
         assert merged.prepare is None  # None + None -> None
 
 
+def _timer(host=0, device=0, ccl=0):
+    return {
+        "type": "timer",
+        "total_host": host,
+        "total_device": device,
+        "total_ccl": ccl,
+    }
+
+
+def _prep(prepare_in=0, prepare_out=0):
+    return {
+        "type": "prep",
+        "prepare_input_us": prepare_in,
+        "prepare_output_us": prepare_out,
+    }
+
+
 class TestParseReports:
     def test_none_or_empty_yields_all_none(self):
         assert mm._parse_reports(None) == (None, None, None, None)
         assert mm._parse_reports([]) == (None, None, None, None)
 
-    def test_single_report_has_no_prepare(self):
-        out = mm._parse_reports(
-            [{"total_host": 10, "total_device": 20, "total_ccl": 30}]
-        )
+    def test_timer_only_leaves_prepare_none(self):
+        out = mm._parse_reports([_timer(host=10, device=20, ccl=30)])
         assert out == (10, 20, 30, None)
 
-    def test_second_report_sums_prepare_in_out(self):
-        out = mm._parse_reports(
-            [{"total_host": 10}, {"prepare_input_us": 4, "prepare_output_us": 6}]
-        )
-        assert out == (10, None, None, 10)
+    def test_prep_only_leaves_timings_none(self):
+        out = mm._parse_reports([_prep(prepare_in=4, prepare_out=6)])
+        assert out == (None, None, None, 10)
 
-    def test_missing_prepare_keys_default_to_zero(self):
-        # A second report present but without prepare keys -> 0 + 0, not None.
-        out = mm._parse_reports([{"total_host": 10}, {}])
-        assert out == (10, None, None, 0)
+    def test_one_graph_run(self):
+        out = mm._parse_reports([_timer(host=10), _prep(prepare_in=4, prepare_out=6)])
+        assert out == (10, 0, 0, 10)
+
+    def test_every_graph_run_in_the_window_is_summed(self):
+        # Two runtime.run() calls -> two timer/prep pairs, interleaved as they arrive.
+        out = mm._parse_reports(
+            [
+                _timer(host=10, device=100, ccl=1),
+                _prep(prepare_in=4, prepare_out=6),
+                _timer(host=20, device=200, ccl=2),
+                _prep(prepare_in=40, prepare_out=60),
+            ]
+        )
+        assert out == (30, 300, 3, 110)
+
+    def test_missing_keys_count_as_zero(self):
+        out = mm._parse_reports([{"type": "timer"}, {"type": "prep"}])
+        assert out == (0, 0, 0, 0)
+
+    def test_unknown_report_kinds_are_ignored(self):
+        # RBLN_APPLY_TIMER pushes "buffer_transform" onto the same queue.
+        out = mm._parse_reports(
+            [
+                {"type": "buffer_transform", "wall_us": 999.0},
+                _timer(host=10),
+            ]
+        )
+        assert out == (10, 0, 0, None)
+
+    def test_untyped_reports_contribute_nothing(self):
+        assert mm._parse_reports([{"total_host": 10}]) == (None, None, None, None)
 
 
 class TestMean:
@@ -124,19 +162,45 @@ class TestMean:
 
 
 def _ctx(monkeypatch, **kwargs):
-    # Pin rank_tag so construction never depends on a live distributed group.
+    # Pin rank_tag so construction never depends on a live distributed group,
+    # and keep spans on nullcontext even if a real rebel runtime is installed.
     monkeypatch.setattr(mm, "_rank_tag", lambda: "")
+    monkeypatch.setattr(mm, "_REBEL_HAS_CAPTURE", False)
     return mm._PerformanceContext(name="runner", **kwargs)
 
 
+class _Clock:
+    # Stands in for the time module; only perf_counter is used.
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def perf_counter(self) -> float:
+        return self.now
+
+
+def _fake_clock(monkeypatch):
+    clock = _Clock()
+    monkeypatch.setattr(mm, "time", clock)
+    return clock
+
+
+def _run_pass(ctx, is_prefill, with_sampler=True):
+    """Drive one execute_model pass the way the runner decorators do."""
+    ctx.start_e2e()
+    with ctx.profile_model(is_prefill=is_prefill):
+        pass
+    if with_sampler:
+        with ctx.profile_sampler():
+            pass
+    ctx.end_e2e()
+
+
 class TestPerformanceContextStateMachine:
-    def test_model_then_sampler_merges_records_and_times_e2e(self, monkeypatch):
+    def test_model_then_sampler_merges_and_records(self, monkeypatch):
         ctx = _ctx(monkeypatch)
         ctx._submit(
             mm._Sample(1.0, host=10, device=20, ccl=30, prepare=5, phase=True),
             is_sampler=False,
-            start=100.0,
-            end=100.6,
         )
         # Model span alone stays pending -- nothing recorded yet.
         assert ctx._metrics[True].call_count == 0
@@ -145,42 +209,34 @@ class TestPerformanceContextStateMachine:
         ctx._submit(
             mm._Sample(0.5, host=1, device=2, ccl=3, prepare=4, phase=None),
             is_sampler=True,
-            start=100.6,
-            end=101.0,
         )
         m = ctx._metrics[True]
         assert m.latencies == [1.5]
         assert (m.host_times, m.device_times) == ([11], [22])
         assert (m.ccl_times, m.prepare_times) == ([33], [9])
-        # e2e spans model.start .. sampler.end = 101.0 - 100.0.
-        assert ctx._e2e[True].latencies == [1.0]
-        assert ctx._pending is None and ctx._e2e_start is None
+        assert ctx._pending is None
 
     def test_sampler_without_pending_is_ignored(self, monkeypatch):
         ctx = _ctx(monkeypatch)
-        ctx._submit(mm._Sample(0.5, phase=None), is_sampler=True, start=0.0, end=0.5)
+        ctx._submit(mm._Sample(0.5, phase=None), is_sampler=True)
         assert ctx._metrics[True].call_count == 0
         assert ctx._metrics[False].call_count == 0
 
-    def test_flush_pending_records_model_only_without_e2e(self, monkeypatch):
-        # A model step with no following sampler is recorded model-only on flush,
-        # and does NOT emit an e2e sample.
+    def test_flush_pending_records_model_only(self, monkeypatch):
+        # A model step with no following sampler is recorded model-only on flush.
         ctx = _ctx(monkeypatch)
-        ctx._submit(
-            mm._Sample(2.0, host=7, phase=False), is_sampler=False, start=0.0, end=2.0
-        )
+        ctx._submit(mm._Sample(2.0, host=7, phase=False), is_sampler=False)
         ctx._flush_pending()
         assert ctx._metrics[False].latencies == [2.0]
         assert ctx._metrics[False].host_times == [7]
-        assert ctx._e2e[False].call_count == 0
         assert ctx._pending is None
 
     def test_prefill_and_decode_go_to_separate_buckets(self, monkeypatch):
         ctx = _ctx(monkeypatch)
-        ctx._submit(mm._Sample(1.0, phase=True), is_sampler=False, start=0.0, end=1.0)
-        ctx._submit(mm._Sample(0.5, phase=None), is_sampler=True, start=1.0, end=1.5)
-        ctx._submit(mm._Sample(0.2, phase=False), is_sampler=False, start=2.0, end=2.2)
-        ctx._submit(mm._Sample(0.1, phase=None), is_sampler=True, start=2.2, end=2.3)
+        ctx._submit(mm._Sample(1.0, phase=True), is_sampler=False)
+        ctx._submit(mm._Sample(0.5, phase=None), is_sampler=True)
+        ctx._submit(mm._Sample(0.2, phase=False), is_sampler=False)
+        ctx._submit(mm._Sample(0.1, phase=None), is_sampler=True)
         assert ctx._metrics[True].latencies == [1.5]
         assert ctx._metrics[False].latencies == pytest.approx([0.3])
 
@@ -188,7 +244,7 @@ class TestPerformanceContextStateMachine:
         # Back-to-back model steps: the earlier pending one is flushed (recorded
         # model-only) when the next profile_model starts.
         ctx = _ctx(monkeypatch)
-        ctx._submit(mm._Sample(1.0, phase=True), is_sampler=False, start=0.0, end=1.0)
+        ctx._submit(mm._Sample(1.0, phase=True), is_sampler=False)
         ctx.profile_model(is_prefill=False)  # span not entered; only flushes
         assert ctx._metrics[True].call_count == 1
         assert ctx._pending is None
@@ -202,41 +258,202 @@ class TestPerformanceContextStateMachine:
         ctx._drain_report_backlog()  # idempotent
         assert calls == [1]
 
-    def test_print_stats_labels_all_sections_and_writes_json(
-        self, monkeypatch, tmp_path
-    ):
-        monkeypatch.setattr(envs, "VLLM_RBLN_METRICS_DIR", str(tmp_path))
-        ctx = _ctx(monkeypatch)
-        ctx._submit(mm._Sample(1.0, phase=True), is_sampler=False, start=0.0, end=1.0)
-        ctx._submit(mm._Sample(0.5, phase=None), is_sampler=True, start=1.0, end=1.5)
-        ctx._submit(mm._Sample(0.2, phase=False), is_sampler=False, start=2.0, end=2.2)
-        ctx._submit(mm._Sample(0.1, phase=None), is_sampler=True, start=2.2, end=2.3)
-        ctx.print_stats()
 
-        data = json.loads((tmp_path / "metrics.json").read_text())
-        assert set(data["sections"]) == {
-            "PREFILL + SAMPLE",
-            "DECODE + SAMPLE",
-            "PREFILL E2E",
-            "DECODE E2E",
-        }
+class TestE2EWindow:
+    # e2e is bounded by start_e2e/end_e2e -- one execute_model pass -- not by the
+    # spans inside it, and holds whether or not the pass reached a sampler.
+    def test_window_covers_the_pass_not_just_the_spans(self, monkeypatch):
+        clock = _fake_clock(monkeypatch)
+        ctx = _ctx(monkeypatch)
+        ctx.start_e2e()
+        clock.now += 1.0  # input preparation, before the model span opens
+        with ctx.profile_model(is_prefill=True):
+            clock.now += 4.0
+        clock.now += 1.0
+        with ctx.profile_sampler():
+            clock.now += 2.0
+        clock.now += 1.0  # output copy, after the sampler span closed
+        ctx.end_e2e()
+        assert ctx._metrics[True].latencies == [6.0]  # the two spans only
+        assert ctx._e2e[True].latencies == [9.0]  # the whole pass
+        assert ctx._e2e_start is None
+
+    def test_time_between_passes_is_excluded(self, monkeypatch):
+        clock = _fake_clock(monkeypatch)
+        ctx = _ctx(monkeypatch)
+        for _ in range(2):
+            ctx.start_e2e()
+            with ctx.profile_model(is_prefill=False):
+                clock.now += 1.0
+            ctx.end_e2e()
+            clock.now += 10.0  # engine and idle time between passes
+        assert ctx._e2e[False].latencies == [1.0, 1.0]
+
+    def test_sampler_less_pass_is_still_timed(self, monkeypatch):
+        # Intermediate chunked prefill / non-last PP rank.
+        clock = _fake_clock(monkeypatch)
+        ctx = _ctx(monkeypatch)
+        ctx.start_e2e()
+        with ctx.profile_model(is_prefill=True):
+            clock.now += 3.0
+        ctx.end_e2e()
+        assert ctx._e2e[True].latencies == [3.0]
+
+    def test_pass_without_a_model_span_is_dropped(self, monkeypatch):
+        clock = _fake_clock(monkeypatch)
+        ctx = _ctx(monkeypatch)
+        ctx.start_e2e()
+        clock.now += 1.0
+        ctx.end_e2e()
+        assert ctx._e2e == {}
+
+    def test_end_without_start_is_a_noop(self, monkeypatch):
+        _fake_clock(monkeypatch)
+        ctx = _ctx(monkeypatch)
+        ctx.end_e2e()
+        assert ctx._e2e == {}
+
+    def test_second_end_does_not_record_again(self, monkeypatch):
+        # execute_model closes the window when it returns an output itself;
+        # sample_tokens still runs its own end.
+        clock = _fake_clock(monkeypatch)
+        ctx = _ctx(monkeypatch)
+        ctx.start_e2e()
+        with ctx.profile_model(is_prefill=False):
+            clock.now += 1.0
+        ctx.end_e2e()
+        clock.now += 5.0
+        ctx.end_e2e()
+        assert ctx._e2e[False].latencies == [1.0]
+
+    def test_phase_does_not_carry_over_to_the_next_window(self, monkeypatch):
+        clock = _fake_clock(monkeypatch)
+        ctx = _ctx(monkeypatch)
+        ctx.start_e2e()
+        with ctx.profile_model(is_prefill=False):
+            clock.now += 1.0
+        ctx.end_e2e()
+        ctx.start_e2e()
+        clock.now += 5.0
+        ctx.end_e2e()  # no model span: must not land in the decode bucket again
+        assert ctx._e2e[False].latencies == [1.0]
+
+    def test_model_span_outside_a_window_is_not_attributed(self, monkeypatch):
+        _fake_clock(monkeypatch)
+        ctx = _ctx(monkeypatch)
+        ctx.profile_model(is_prefill=True)
+        assert ctx._e2e_is_prefill is None
 
 
 class TestTimingSpanWiring:
-    # With rebel capture unavailable the span falls back to nullcontext, so the
-    # real profile_model -> profile_sampler wiring runs without an NPU.
     def test_model_and_sampler_spans_record_one_merged_step(self, monkeypatch):
-        monkeypatch.setattr(mm, "_REBEL_HAS_CAPTURE", False)
         ctx = _ctx(monkeypatch)
-        with ctx.profile_model(is_prefill=True):
-            pass
-        with ctx.profile_sampler():
-            pass
+        _run_pass(ctx, is_prefill=True)
         m = ctx._metrics[True]
         assert m.call_count == 1
         assert m.host_times == []  # no reports captured -> no timing series
         assert ctx._e2e[True].call_count == 1
         assert ctx._pending is None
+
+
+class TestReporting:
+    def test_sections_are_labelled_by_phase_and_metric(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(envs, "VLLM_RBLN_METRICS_DIR", str(tmp_path))
+        ctx = _ctx(monkeypatch)
+        _run_pass(ctx, is_prefill=True)
+        _run_pass(ctx, is_prefill=False)
+        ctx.print_stats()
+
+        data = json.loads((tmp_path / "metrics.json").read_text())
+        assert list(data["sections"]) == [
+            "PREFILL + SAMPLE",
+            "DECODE + SAMPLE",
+            "PREFILL E2E",
+            "DECODE E2E",
+        ]
+
+    def test_unseen_phase_is_omitted(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(envs, "VLLM_RBLN_METRICS_DIR", str(tmp_path))
+        ctx = _ctx(monkeypatch)
+        _run_pass(ctx, is_prefill=False)
+        ctx.print_stats()
+
+        data = json.loads((tmp_path / "metrics.json").read_text())
+        assert list(data["sections"]) == ["DECODE + SAMPLE", "DECODE E2E"]
+
+    def test_print_stats_flushes_the_final_pending_span(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(envs, "VLLM_RBLN_METRICS_DIR", str(tmp_path))
+        ctx = _ctx(monkeypatch)
+        _run_pass(ctx, is_prefill=True, with_sampler=False)
+        assert ctx._metrics[True].call_count == 0  # waiting for a sampler
+
+        ctx.print_stats()
+        assert ctx._metrics[True].call_count == 1
+
+
+class TestE2EDecorators:
+    @staticmethod
+    def _runner(calls, execute_output):
+        class Runner:
+            performance_ctx = types.SimpleNamespace(
+                start_e2e=lambda: calls.append("start"),
+                end_e2e=lambda: calls.append("end"),
+            )
+
+            @mm._e2e_starts
+            def execute_model(self):
+                calls.append("execute")
+                return execute_output
+
+            @mm._e2e_ends
+            def sample_tokens(self):
+                calls.append("sample")
+                return "out"
+
+        return Runner()
+
+    def test_window_closes_in_sample_tokens_when_execute_returns_none(self):
+        calls: list = []
+        runner = self._runner(calls, None)
+        assert runner.execute_model() is None
+        assert runner.sample_tokens() == "out"
+        assert calls == ["start", "execute", "sample", "end"]
+
+    def test_window_closes_in_execute_model_when_it_returns_an_output(self):
+        calls: list = []
+        runner = self._runner(calls, "early-output")
+        assert runner.execute_model() == "early-output"
+        assert calls == ["start", "execute", "end"]
+
+    def test_end_runs_even_when_the_body_raises(self):
+        calls = []
+
+        class Runner:
+            performance_ctx = types.SimpleNamespace(
+                end_e2e=lambda: calls.append("end"),
+            )
+
+            @mm._e2e_ends
+            def sample_tokens(self):
+                raise RuntimeError("boom")
+
+        with pytest.raises(RuntimeError, match="boom"):
+            Runner().sample_tokens()
+        assert calls == ["end"]
+
+    def test_identity_hands_back_the_undecorated_function(self):
+        def fn():
+            return 1
+
+        assert mm._identity(fn) is fn
+
+    def test_module_level_hooks_follow_the_metrics_env(self):
+        expected = (
+            (mm._e2e_starts, mm._e2e_ends)
+            if envs.VLLM_RBLN_METRICS
+            else (mm._identity, mm._identity)
+        )
+        assert (mm.e2e_starts, mm.e2e_ends) == expected
 
 
 class TestWriteMetricsJson:
@@ -331,8 +548,10 @@ class TestNoopVariants:
 
     def test_noop_context_methods_are_inert(self):
         ctx = mm._NoopPerformanceContext("runner", runtimes=[])
+        ctx.start_e2e()
         with ctx.profile_model(True):
             pass
         with ctx.profile_sampler():
             pass
+        ctx.end_e2e()
         ctx.print_stats()  # must not raise
