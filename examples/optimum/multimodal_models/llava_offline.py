@@ -69,9 +69,6 @@ def main(
     block_size: int = None,  # if None, will be set to max_model_len
     num_devices: int = 4,
 ):
-    # Compile shape follows the rebel_compiler multi-modal compile.py pattern:
-    # num_devices → env var, batch_size / max_seq_len → additional_config
-    # ["rbln_config"]; block_size stays a top-level vLLM kwarg.
     os.environ["VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK"] = str(num_devices)
     if block_size is None:
         block_size = max_model_len

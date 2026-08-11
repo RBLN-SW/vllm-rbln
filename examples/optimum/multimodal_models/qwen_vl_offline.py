@@ -194,21 +194,18 @@ def main(
     # NOTE: This example supports Qwen2-VL, Qwen2.5-VL, Qwen3-VL and Qwen3.5
     model: str = "Qwen/Qwen3-VL-2B-Instruct",
     max_num_seqs: int = 1,
-    max_model_len: int = 8192,
-    num_devices: int = 1,
-    block_size: int = None,  # if None, will be set to max_model_len
-    vision_max_seq_len: int = 2048,
+    max_model_len: int = 262144,
+    num_devices: int = 8,
+    block_size: int = 16384,
+    vision_max_seq_len: int = 4096,
+    vision_num_devices: int = 8,
 ):
-    # Compile shape follows the rebel_compiler multi-modal compile.py pattern:
-    # num_devices → env var, batch_size / max_seq_len → additional_config
-    # ["rbln_config"]; block_size stays a top-level vLLM kwarg. The previous
-    # hard-coded 17-device `device` / `visual.device` pinning was dropped so this
-    # runs on any box; for a specific layout, add those keys back into rbln_config.
     os.environ["VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK"] = str(num_devices)
-    if block_size is None:
-        block_size = max_model_len
     rbln_config = {
-        "visual": {"max_seq_len": vision_max_seq_len},
+        "visual": {
+            "max_seq_len": vision_max_seq_len, 
+            "num_devices": vision_num_devices,
+        },
     }
     llm = LLM(
         model=model,

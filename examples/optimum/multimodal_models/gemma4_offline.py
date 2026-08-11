@@ -64,6 +64,7 @@ def generate_prompts(batch_size: int, model: str):
 def main(
     num_input_prompt: int = 1,
     model: str = "google/gemma-4-31B-it",
+    max_num_seqs: int = 1,
     max_model_len: int = 4096,
     block_size: int = None,  # if None, will be set to max_model_len
     num_devices: int = 4,
@@ -75,6 +76,7 @@ def main(
         model=model,
         block_size=block_size,
         max_model_len=max_model_len,
+        max_num_seqs=max_num_seqs,
     )
     tokenizer = AutoTokenizer.from_pretrained(model)
     inputs = generate_prompts(num_input_prompt, model)
