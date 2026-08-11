@@ -36,6 +36,7 @@ DP_MODELS: list[CompileModelSpec] = [
         "openai/gpt-oss-20b",
         {"data_parallel_size": 4, "max_num_seqs": 2, "enable_expert_parallel": True},
         {"VLLM_RBLN_SUB_BLOCK_CACHE": "0", "VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT": "2"},
+        num_hidden_layers=4,
     ),
 ]
 

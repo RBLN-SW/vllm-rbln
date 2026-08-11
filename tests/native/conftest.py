@@ -22,11 +22,14 @@ import pytest
 from tests.native.utils import (
     _SPAWN_CHILD_ENV,
     _SPAWN_RESULTS_ENV,
+    LAYERS_PINNABLE_ENV,
     NATIVE_ENV,
     ModuleSpawn,
     read_log_tail,
     scrub_env,
 )
+
+_DEFAULT_NUM_HIDDEN_LAYERS = 3
 
 _scrubbed: dict[str, str] = {}
 
@@ -127,16 +130,25 @@ def pytest_addoption(parser):
     parser.addoption(
         "--num-hidden-layers",
         type=int,
-        default=4,
+        default=None,
         help=(
             "VLLM_RBLN_NUM_HIDDEN_LAYERS for the whole session: build only the "
             "first N decoder layers, cutting compile time in the "
             "--model-compile lane. hf_runner truncates to the same N, so "
             "correctness comparisons stay like-for-like. 0 runs the whole "
             "model. An exported value is scrubbed like every other "
-            "VLLM_RBLN_* knob; this option is the way in."
+            f"VLLM_RBLN_* knob; this option is the way in. Defaults to "
+            f"{_DEFAULT_NUM_HIDDEN_LAYERS}, and only then does a spec's own "
+            "num_hidden_layers apply."
         ),
     )
+
+
+def _session_layers(config) -> int:
+    """The option's value, or the default when it was left off. Not `or`: an
+    explicit 0 is the whole model, not a missing value."""
+    layers = config.getoption("--num-hidden-layers")
+    return _DEFAULT_NUM_HIDDEN_LAYERS if layers is None else layers
 
 
 def pytest_collection_modifyitems(config, items):
@@ -236,7 +248,7 @@ def _spawn_for(item) -> ModuleSpawn:
         nodeid_prefix=item.nodeid.split("::", 1)[0],
         device_tensor=config.getoption("--device-tensor"),
         model_compile=config.getoption("--model-compile"),
-        num_hidden_layers=config.getoption("--num-hidden-layers"),
+        num_hidden_layers=_session_layers(config),
         tb_style=config.getoption("tbstyle", None),
         maxfail=config.getoption("maxfail", 0),
         stream_output=config.getoption("capture") == "no",
@@ -342,9 +354,16 @@ def pytest_configure(config):
         os.environ["VLLM_RBLN_USE_DEVICE_TENSOR"] = device_tensor
 
     # Also before the import below: the get_pp_indices patch conditions on this.
-    os.environ["VLLM_RBLN_NUM_HIDDEN_LAYERS"] = str(
-        config.getoption("--num-hidden-layers")
-    )
+    os.environ["VLLM_RBLN_NUM_HIDDEN_LAYERS"] = str(_session_layers(config))
+
+    # Parent only -- the child is handed the resolved value, so its own view of
+    # the option is always "given". Cleared rather than merely left unset, or an
+    # exported one would pin behind an explicit option's back.
+    if os.environ.get(_SPAWN_CHILD_ENV) != "1":
+        if config.getoption("--num-hidden-layers") is None:
+            os.environ[LAYERS_PINNABLE_ENV] = "1"
+        else:
+            os.environ.pop(LAYERS_PINNABLE_ENV, None)
 
     # Platform plugins activate on their own when current_platform is first
     # touched, but the patches live in the general_plugins group and nothing
@@ -381,9 +400,12 @@ def pytest_report_header(config):
         f"native: env {', '.join(f'{k}={v}' for k, v in NATIVE_ENV.items())}",
         f"native: device_type={RblnPlatform.device_type} ({origin})",
     ]
-    num_hidden_layers = config.getoption("--num-hidden-layers")
+    num_hidden_layers = _session_layers(config)
+    pinnable = (
+        " (a spec may pin its own)" if os.environ.get(LAYERS_PINNABLE_ENV) else ""
+    )
     header.append(
-        f"native: num_hidden_layers={num_hidden_layers or 'whole model'}",
+        f"native: num_hidden_layers={num_hidden_layers or 'whole model'}{pinnable}",
     )
     if _scrubbed:
         header.append(f"native: scrubbed {', '.join(sorted(_scrubbed))}")

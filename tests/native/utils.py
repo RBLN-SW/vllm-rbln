@@ -271,6 +271,10 @@ _SPAWN_CHILD_ENV = "VLLM_RBLN_TEST_SPAWN_CHILD"
 # Path the module-batch child writes per-test outcomes to (one JSON obj/line),
 # so the parent can attribute results back to each test of the single spawn.
 _SPAWN_RESULTS_ENV = "VLLM_RBLN_TEST_SPAWN_RESULTS"
+# Set by the parent's conftest when --num-hidden-layers was left off, so a spec
+# may pin its own count. It rides in the env because the child is handed the
+# resolved value and so cannot tell the option was absent.
+LAYERS_PINNABLE_ENV = "VLLM_RBLN_TEST_LAYERS_PINNABLE"
 
 
 def _format_subprocess_exit(returncode: int) -> str:
