@@ -13,26 +13,19 @@
 # limitations under the License.
 """DFlash speculative decoding for RBLN.
 
-DFlash drafts all speculative tokens in one drafter forward per step:
+Two compiled graphs per step, all static shapes captured during warmup:
 
 1. Context-KV insert: target hidden states (concatenated aux layers) are
    projected into per-layer K/V and written into the drafter's KV cache.
-   The drafter never runs over the prompt itself.
-2. Block forward: one pass over ``[bonus_token, mask * K]`` per request with
-   non-causal attention (bidirectional inside the block, full attention to
-   the cached context); argmax at the K mask positions yields all drafts.
-
-Compiled graphs, all static shapes captured during warmup:
-
-* context KV insert -- prefill ``[1, max_num_batched_tokens]``, decode
-  ``[bucket, 1]`` (no-spec steps) and ``[bucket, 1 + K]`` (verify steps)
-* block forward     -- ``[bucket, 1 + K]``
-
-The context KV write reuses the attention op's built-in cache update (k/v
-are written at ``seq_idx .. seq_idx + L - 1`` through the block table) with
-a dummy query whose attention output is discarded.
-TODO(RBLN): replace with a dedicated KV-cache-update op when one is
-available.
+   Shapes: prefill ``[1, max_num_batched_tokens]``, decode ``[bucket, 1]``
+   and ``[bucket, 1 + K]``. The write reuses the attention op's built-in
+   cache update (k/v land at ``seq_idx .. seq_idx + L - 1`` through the
+   block table) by calling each drafter layer's Attention module with a
+   zero query and discarding the output. TODO(RBLN): replace with a
+   dedicated KV-cache-update op when one is available.
+2. Block forward: one non-causal pass over ``[bonus_token, mask * K]`` per
+   request at ``[bucket, 1 + K]``; argmax at the K mask positions yields
+   all drafts at once.
 """
 
 from typing import TYPE_CHECKING
@@ -40,7 +33,6 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn.functional as F
 from vllm.config import VllmConfig
-from vllm.forward_context import get_forward_context
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
 
@@ -48,7 +40,6 @@ import vllm_rbln.envs as envs
 from vllm_rbln.compilation import build_process_group_dict, compile
 from vllm_rbln.forward_context import set_forward_context
 from vllm_rbln.logger import init_logger
-from vllm_rbln.patches.attention import _resolve_kv_cache
 from vllm_rbln.platform import USE_DEVICE_TENSOR
 from vllm_rbln.v1.attention.backends.flash_attention import (
     RBLNFlashAttentionMetadata,
@@ -74,15 +65,10 @@ def build_block_inputs_cpu(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build drafter block positions and attention mask on the host.
 
-    ``anchor_positions`` is the bonus-token position per request (right
-    after the last accepted token). The mask allows columns
-    ``[0, anchor + block_len)``: the block's K/V are written at
-    anchor..anchor+K before attention runs, overwriting any rejected-token
-    K/V in that range, so the visible extent is contiguous. Padded requests
-    attend ``[0, block_len)`` to keep softmax rows non-empty.
-
-    Returns ``positions [num_reqs_padded, block_len]`` and
-    ``mask [num_reqs_padded, 1, 1, 1, max_model_len]``.
+    The mask allows columns ``[0, anchor + block_len)``: the block's K/V
+    are written at anchor..anchor+K before attention runs, overwriting any
+    rejected-token K/V there, so the visible extent is contiguous. Padded
+    requests attend ``[0, block_len)`` to keep softmax rows non-empty.
     """
     num_reqs = anchor_positions.shape[0]
     anchor_padded = torch.zeros(num_reqs_padded, dtype=torch.int64)
@@ -101,13 +87,8 @@ def build_block_inputs_cpu(
 
 
 class RBLNDFlashProposer(RBLNEagleProposer):
-    """DFlash proposer for RBLN NPUs.
-
-    Reuses the RBLN EAGLE proposer's runner integration
-    (``prepare_next_token_ids_padded`` / ``prepare_inputs_padded`` /
-    ``_determine_draft_batch_padding``) and replaces the drafting itself
-    with DFlash's single-pass block drafting.
-    """
+    """DFlash proposer: reuses the RBLN EAGLE proposer's runner integration
+    and replaces the drafting itself with single-pass block drafting."""
 
     def __init__(
         self,
@@ -119,9 +100,8 @@ class RBLNDFlashProposer(RBLNEagleProposer):
         assert vllm_config.speculative_config.method == "dflash"
         super().__init__(vllm_config, device, runner)
 
-        # DFlash embeds the mask token via embed_tokens; checkpoints carry
-        # no mask_hidden tensor, so the base-class load path must not look
-        # for one.
+        # DFlash checkpoints carry no mask_hidden tensor; the base-class
+        # load path must not look for one.
         self.parallel_drafting_hidden_state_tensor = None
 
         draft_hf_config = self.draft_model_config.hf_config
@@ -132,10 +112,34 @@ class RBLNDFlashProposer(RBLNEagleProposer):
             raise NotImplementedError(
                 "vllm-rbln does not support causal DFlash variants yet."
             )
-        if drafter_config.get("use_swa") or drafter_config.get("layer_types"):
+        if drafter_config.get("use_swa"):
             raise NotImplementedError(
                 "vllm-rbln does not support DFlash drafters with sliding "
                 "window attention yet."
+            )
+        # The drafter is always built dense; a sliding-attention checkpoint
+        # matches that only while its window covers max_model_len.
+        layer_types = drafter_config.get("layer_types") or getattr(
+            draft_hf_config, "layer_types", None
+        )
+        has_sliding_layers = bool(layer_types) and any(
+            t == "sliding_attention" for t in layer_types
+        )
+        if has_sliding_layers:
+            sliding_window = getattr(draft_hf_config, "sliding_window", None)
+            if sliding_window is None or sliding_window < self.max_model_len:
+                raise NotImplementedError(
+                    "DFlash drafter declares sliding-attention layers with "
+                    f"window {sliding_window} < max_model_len "
+                    f"{self.max_model_len}; the dense drafter build would "
+                    "diverge from how the drafter was trained."
+                )
+            logger.warning(
+                "DFlash drafter declares sliding-attention layers; building "
+                "dense, which is equivalent only because sliding_window "
+                "(%d) >= max_model_len (%d).",
+                sliding_window,
+                self.max_model_len,
             )
         if drafter_config.get("sample_from_anchor"):
             raise NotImplementedError(
@@ -160,8 +164,8 @@ class RBLNDFlashProposer(RBLNEagleProposer):
         else:
             self.context_feature_size = vllm_config.model_config.get_hidden_size()
 
-        # Device buffers are allocated in load_model(): the runner's
-        # bucketing manager does not exist yet at drafter construction.
+        # Buffers are sized in load_model(): the runner's bucketing manager
+        # does not exist yet at drafter construction.
         self.context_features: torch.Tensor | None = None
         self.context_positions: torch.Tensor | None = None
         self.block_input_ids: torch.Tensor | None = None
@@ -191,8 +195,7 @@ class RBLNDFlashProposer(RBLNEagleProposer):
         return buf
 
     def load_model(self, target_model: torch.nn.Module) -> None:
-        # Bypass RBLNEagleProposer.load_model: it compiles the EAGLE
-        # wrapper, which does not apply to DFlash.
+        # Bypass RBLNEagleProposer.load_model (compiles the EAGLE wrapper).
         SpecDecodeBaseProposer.load_model(self, target_model)
 
         max_bucket = self.runner.bucketing_manager.decode_batch_buckets[-1]
@@ -218,20 +221,21 @@ class RBLNDFlashProposer(RBLNEagleProposer):
             context_features: torch.Tensor,  # [B, L, feature_size]
             context_positions: torch.Tensor,  # [B, L] int64
         ):
-            """Project target features into per-layer K/V and write them
-            into the drafter KV cache via the attention op's cache update."""
+            """Write projected context K/V into the drafter KV cache.
+
+            Each layer calls its own Attention module with a zero query so
+            the traced call is shape-identical to a normal model forward;
+            only the op's cache-update side effect matters.
+            """
             model = self.model.model
             features = self.model.combine_hidden_states(context_features)
             normed = model.hidden_norm(features)
 
-            attn_metadata_dict = get_forward_context().attn_metadata
             batch_size, ctx_len = context_positions.shape
-            num_tokens = batch_size * ctx_len
 
             out = None
             for decoder_layer in model.layers:
                 attn_module = decoder_layer.self_attn
-                attn = attn_module.attn
                 head_dim = attn_module.head_dim
                 kv_size = attn_module.kv_size
 
@@ -249,30 +253,14 @@ class RBLNDFlashProposer(RBLNEagleProposer):
                     k.view(*k_shape[:-1], k_shape[-1] // head_dim, head_dim)
                 ).view(k_shape)
 
-                # Only K is roped; the patched RoPE signature requires a
-                # query operand, so pass a minimal zero tensor.
-                zero_q = k.new_zeros(batch_size, ctx_len, head_dim)
-                _, k = attn_module.rotary_emb(context_positions, zero_q, k)
+                q_zero = kv.new_zeros(batch_size, ctx_len, attn_module.q_size)
+                _, k = attn_module.rotary_emb(context_positions, q_zero, k)
+                out = attn_module.attn(q_zero, k, v)
 
-                attn_metadata = attn_metadata_dict[attn.layer_name]
-                kv_cache = _resolve_kv_cache(attn_metadata, attn.layer_index)
-
-                q_dummy = k.new_zeros(num_tokens, attn_module.num_heads * head_dim)
-                out = k.new_empty(num_tokens, attn_module.num_heads, head_dim)
-                attn.impl.forward(
-                    attn,
-                    q_dummy,
-                    k.reshape(num_tokens, kv_size),
-                    v.reshape(num_tokens, kv_size),
-                    kv_cache,
-                    attn_metadata,
-                    output=out,
-                )
-
-            # The traced graph needs an output; the real effect is the
-            # in-place KV cache update above.
+            # The traced graph needs an output; the KV cache update is the
+            # real effect.
             assert out is not None
-            return out[:1, :1, :1]
+            return out.reshape(-1)[:1]
 
         def block_wrapper(
             input_ids: torch.Tensor,  # [B, block_len] int32
@@ -335,12 +323,9 @@ class RBLNDFlashProposer(RBLNEagleProposer):
         mask_cpu: torch.Tensor | None,
         slot_prefix: str,
     ) -> dict[str, object]:
-        """Per-layer attention metadata for a drafter graph.
-
-        With a mask, is_causal=False selects the explicit-mask op family;
-        without one, is_causal=True selects the causal family, which the
-        context-KV insert uses purely for its cache-update side effect.
-        """
+        """Per-layer attention metadata for a drafter graph. A mask selects
+        the explicit-mask (non-causal) op family; without one the causal
+        family is used, which the context-KV insert wants anyway."""
         if is_prefill:
             # The prefill op family expects a 1D block table.
             block_tables = block_tables_cpu[0]
@@ -348,8 +333,7 @@ class RBLNDFlashProposer(RBLNEagleProposer):
         else:
             seq_idx = torch.zeros((num_reqs_padded, 1), dtype=torch.int32)
             seq_idx[:num_reqs, 0] = seq_idx_cpu.to(torch.int32)
-            # Padded rows keep block 0 (the reserved null block), so their
-            # KV writes land in scratch space.
+            # Padded rows keep block 0 (the reserved null block).
             block_tables = torch.zeros(
                 (num_reqs_padded, block_tables_cpu.shape[1]),
                 dtype=block_tables_cpu.dtype,
@@ -401,9 +385,8 @@ class RBLNDFlashProposer(RBLNEagleProposer):
             num_input_tokens = num_reqs_padded * ctx_len
             batch_size = num_reqs_padded
 
-        # Rows beyond num_ctx keep stale buffer contents. Their K/V writes
-        # are harmless: prefill padding is overwritten before it can be
-        # attended, and padded decode requests write to the null block.
+        # Rows beyond num_ctx keep stale contents: their K/V writes go to
+        # positions overwritten before being attended, or to the null block.
         self.context_features[:num_ctx] = context_features
         self.context_positions[:num_ctx] = context_positions.to(
             self.context_positions.dtype
@@ -458,8 +441,7 @@ class RBLNDFlashProposer(RBLNEagleProposer):
         )
         block_tables_cpu = cad.block_table_tensor.cpu()
 
-        # The context is the window the target just processed. RBLN forces
-        # uniform per-request query lengths, so it splits evenly.
+        # RBLN forces uniform per-request query lengths.
         num_ctx = target_token_ids.shape[0]
         assert num_ctx % num_reqs == 0, (
             f"non-uniform target query lengths are not supported: "
