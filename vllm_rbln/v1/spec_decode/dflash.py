@@ -43,11 +43,13 @@ not accept, so the MRO breaks at construction.
 
 from __future__ import annotations
 
+from copy import copy
 from dataclasses import replace
 
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 
 import vllm_rbln.envs as envs
@@ -56,7 +58,6 @@ from vllm_rbln.forward_context import set_forward_context
 from vllm_rbln.logger import init_logger
 from vllm_rbln.patches.qwen3_dflash import (
     WRITE_CONTEXT_KV,
-    _DFlashForwardGraph,
     get_or_create_context_kv,
 )
 from vllm_rbln.platform import USE_DEVICE_TENSOR
@@ -68,7 +69,6 @@ from vllm_rbln.v1.attention.kv_cache_bindings import (
 from vllm_rbln.v1.spec_decode.eagle import _DEVICE_ARGMAX, RBLNEagleProposer
 
 logger = init_logger(__name__)
-
 
 # The DFlash drafter queries exactly `1 + num_speculative_tokens` positions on
 # every step, in both target phases: after a target prefill it still drafts one
@@ -84,6 +84,86 @@ logger = init_logger(__name__)
 _DRAFT_IS_PREFILL = False
 
 
+def _get_dflash_forward_split(layer_types: list[str]) -> int | None:
+    """Return the one SWA-to-full boundary that needs a graph split.
+
+    The Machine flash-attention control pass keys dynamic indices only by
+    batch and physical partition. A compiled function therefore cannot contain
+    attention layers whose partition loops use different sequence indices.
+    Homogeneous stacks need no split; MiniMax-M2.5-DFlash's four leading SWA
+    layers and final full layer need one at index four.
+    """
+    if not layer_types:
+        return None
+    invalid = set(layer_types) - {"full_attention", "sliding_attention"}
+    if invalid:
+        raise ValueError(f"Invalid DFlash layer type(s): {sorted(invalid)}")
+    if len(set(layer_types)) == 1:
+        return None
+    split_index = layer_types.index("full_attention")
+    if (
+        not split_index
+        or any(kind != "sliding_attention" for kind in layer_types[:split_index])
+        or any(kind != "full_attention" for kind in layer_types[split_index:])
+    ):
+        raise ValueError(
+            "DFlash mixed attention layers must form contiguous sliding/full groups"
+        )
+    return split_index
+
+
+def _dflash_page_crossing_mask(
+    seq_lens: torch.Tensor,
+    partition_size: int,
+    query_len: int,
+) -> torch.Tensor:
+    """Requests whose one-block query K/V cannot fit in the current KV page.
+
+    The RBLN naive non-causal kernel accepts one dynamic offset per physical
+    partition and inserts the complete query block there. Unlike upstream's
+    slot-mapping kernel, it cannot split one query across two pages. Suppress
+    speculation only for the seven affected offsets in the MiniMax setup; the
+    target advances normally and speculation resumes at the aligned page.
+    """
+    if seq_lens.ndim != 1:
+        raise ValueError("DFlash sequence lengths must be one-dimensional")
+    if partition_size <= 0 or query_len <= 0 or query_len > partition_size:
+        raise ValueError("Invalid DFlash query/page geometry")
+    offsets = torch.remainder(seq_lens.cpu(), partition_size)
+    return offsets + query_len > partition_size
+
+
+def _empty_drafts_for_page_crossing(
+    crossing: torch.Tensor,
+) -> list[list[int]] | None:
+    """Skip a whole local batch before any unrepresentable KV insert runs."""
+    crossing_list = [bool(value) for value in crossing.tolist()]
+    if not any(crossing_list):
+        return None
+    # Selective execution would require rebuilding the compiled attention
+    # metadata for a smaller batch. Running a crossing row and filtering only
+    # its token IDs afterwards is unsafe because its unsplittable KV insert has
+    # already happened. Sacrifice speculation for this one local batch instead.
+    return [[] for _ in crossing_list]
+
+
+class _DFlashSplitForwardGraph:
+    """Join independently compiled SWA and full-attention graph regions."""
+
+    def __init__(self, sliding_graph, full_graph) -> None:
+        self._sliding_graph = sliding_graph
+        self._full_graph = full_graph
+
+    def __call__(self, input_ids, positions, token_indices_to_sample=None):
+        hidden_states, residual = self._sliding_graph(input_ids, positions)
+        return self._full_graph(
+            hidden_states,
+            residual,
+            positions,
+            token_indices_to_sample,
+        )
+
+
 class RBLNDFlashProposer(RBLNEagleProposer):
     """DFlash drafting on the RBLN execution shell."""
 
@@ -95,6 +175,8 @@ class RBLNDFlashProposer(RBLNEagleProposer):
     ) -> None:
         assert vllm_config.speculative_config is not None
         assert vllm_config.speculative_config.method == "dflash"
+        self._dflash_sliding_layer_names: set[str] = set()
+        self._dflash_sliding_window: int | None = None
         super().__init__(vllm_config, device, runner)
 
         # Only the bonus token and the mask tokens are queries; everything else
@@ -200,6 +282,7 @@ class RBLNDFlashProposer(RBLNEagleProposer):
         non-causal.
         """
         super().initialize_attn_backend(kv_cache_config, kernel_block_sizes)
+        self._configure_dflash_attention_layers()
         for attn_group in self.draft_attn_groups:
             builders = getattr(attn_group, "metadata_builders", None) or [
                 attn_group.get_metadata_builder()
@@ -212,6 +295,57 @@ class RBLNDFlashProposer(RBLNEagleProposer):
                         sorted(attn_group.layer_names),
                     )
                 builder.is_causal = False
+
+    def _configure_dflash_attention_layers(self) -> None:
+        """Map checkpoint-local layer types onto vLLM's global layer names.
+
+        MiniMax-M2.5-DFlash has four sliding-attention layers followed by one
+        full-attention layer. This vLLM release loads all five as full
+        attention, so the checkpoint's ``layer_types`` never reaches the
+        proposer. Keep the full KV allocation (DFlash prewrites all context
+        K/V), but retain the layer split here so metadata can apply the trained
+        compute semantics.
+        """
+        layer_names = sorted(
+            (
+                layer_name
+                for attn_group in self.draft_attn_groups
+                for layer_name in attn_group.layer_names
+            ),
+            key=extract_layer_index,
+        )
+        layer_types = getattr(self.draft_model_config.hf_config, "layer_types", None)
+        if layer_types is None:
+            self._dflash_sliding_layer_names = set()
+            self._dflash_sliding_window = None
+            return
+        if len(layer_types) != len(layer_names):
+            raise ValueError(
+                "DFlash layer_types length does not match attention layers: "
+                f"{len(layer_types)} != {len(layer_names)}"
+            )
+        invalid = set(layer_types) - {"full_attention", "sliding_attention"}
+        if invalid:
+            raise ValueError(f"Invalid DFlash layer type(s): {sorted(invalid)}")
+
+        sliding_names = {
+            layer_name
+            for layer_name, layer_type in zip(layer_names, layer_types)
+            if layer_type == "sliding_attention"
+        }
+        sliding_window = getattr(
+            self.draft_model_config.hf_config, "sliding_window", None
+        )
+        if sliding_names and not sliding_window:
+            raise ValueError("DFlash sliding layers require a sliding_window")
+        self._dflash_sliding_layer_names = sliding_names
+        self._dflash_sliding_window = int(sliding_window) if sliding_names else None
+        logger.info(
+            "DFlash attention semantics: sliding_window=%s sliding=%s full=%s",
+            self._dflash_sliding_window,
+            sorted(sliding_names),
+            sorted(set(layer_names) - sliding_names),
+        )
 
     def _block_start_positions(self, cad: CommonAttentionMetadata) -> torch.Tensor:
         """Positions view that puts the drafter's K/V writes at the block start.
@@ -244,8 +378,10 @@ class RBLNDFlashProposer(RBLNEagleProposer):
         cad: CommonAttentionMetadata,
         num_reqs: int,
         num_reqs_padded: int,
+        sliding_window: int | None = None,
+        seq_lens_override: torch.Tensor | None = None,
     ) -> None:
-        """Replace the decode mask with one shaped for a whole draft block.
+        """Build a whole-block full-attention or causal-SWA mask.
 
         The shared builder writes its non-causal decode mask as
         `[batch, 1, 1, 1, max_seq_len]` -- query length one, because ordinary
@@ -257,11 +393,12 @@ class RBLNDFlashProposer(RBLNEagleProposer):
               mask_dims.at(i) == input_dims.at(i) not satisfied
             Cannot find valid tiling, op=rtosa.flash_attn_tile
 
-        Rebuild it at the block's query width. Every query slot sees the same
-        keys, and the window is opened `num_query_per_req` past the context so
-        the block's own K/V -- written into the cache by this step -- is visible
-        to all of its slots, which is what makes the drafting non-causal WITHIN
-        the block as DFlash requires.
+        Full-attention layers let every query see the entire context and every
+        query K/V in the block. Sliding-attention layers use the checkpoint's
+        trained causal window: row ``i`` sees at most ``sliding_window`` keys
+        ending at its own absolute position. The physical KV cache remains full
+        sized in both cases because DFlash prewrites all context K/V before the
+        draft forward.
 
         Built on the host from `_seq_lens_cpu` -- the same shadow the builder
         reads -- and moved across once, the way the builder does it. Deriving it
@@ -273,26 +410,139 @@ class RBLNDFlashProposer(RBLNEagleProposer):
             return
         num_query_per_req = 1 + self.num_speculative_tokens
         mask = attn_metadata.attn_masks
-        if mask.shape[-2] == num_query_per_req:
-            return
 
         max_seq_len = mask.shape[-1]
-        seq_lens = cad._seq_lens_cpu
+        seq_lens = cad._seq_lens_cpu if seq_lens_override is None else seq_lens_override
         assert seq_lens is not None, "flash-attention builder needs the host shadow"
-        # The builder opens keys [0, seq_len] for its single query row. The block
-        # adds num_query_per_req - 1 more positions, all of which every slot in
-        # the block must see -- that is what makes the drafting non-causal within
-        # the block.
-        window = (seq_lens[:num_reqs] + num_query_per_req).view(-1, 1)
-        key_pos = torch.arange(max_seq_len).view(1, -1)
-        valid = (key_pos < window).to(mask.dtype)
-
-        new_mask = valid.view(num_reqs, 1, 1, 1, max_seq_len).expand(
-            num_reqs, 1, 1, num_query_per_req, max_seq_len
-        )
+        key_pos = torch.arange(max_seq_len)
+        if sliding_window is None:
+            key_end = (seq_lens[:num_reqs] + num_query_per_req).view(-1, 1)
+            valid = key_pos.view(1, -1) < key_end
+            new_mask = valid.view(num_reqs, 1, 1, 1, max_seq_len).expand(
+                num_reqs, 1, 1, num_query_per_req, max_seq_len
+            )
+        else:
+            query_pos = seq_lens[:num_reqs].view(-1, 1) + torch.arange(
+                num_query_per_req
+            ).view(1, -1)
+            distance = query_pos.unsqueeze(-1) - key_pos.view(1, 1, -1)
+            valid = (distance >= 0) & (distance < sliding_window)
+            new_mask = valid.view(num_reqs, 1, 1, num_query_per_req, max_seq_len)
         if num_reqs_padded > num_reqs:
             new_mask = pad(new_mask, 0, num_reqs_padded)
-        attn_metadata.attn_masks = new_mask.contiguous().to(mask.device)
+        attn_metadata.attn_masks = new_mask.to(mask.dtype).contiguous().to(mask.device)
+
+    def _localize_sliding_attn_metadata(
+        self,
+        attn_group,
+        attn_metadata,
+        cad: CommonAttentionMetadata,
+        num_reqs: int,
+        num_reqs_padded: int,
+    ):
+        """Bound SWA compute while preserving the shared full KV allocation.
+
+        The non-causal flash kernel reduces one softmax state per physical
+        partition. Passing the full 49K cache to a 2K sliding layer produces
+        wholly-masked leading partitions once the request exceeds the window;
+        those invalid partial states poison the final reduction. It also scans
+        four small drafter layers over the full context on every decode step.
+
+        Move the physical partitions that cover the union of all draft query
+        windows to the front of the block table and rebase their absolute
+        positions to that local view. Keep the original input shapes: mixing a
+        short SWA attention shape and a full-attention shape in one compiled
+        graph violates the compiler's per-partition dynamic-index invariant.
+        The compiler expands the rebased raw ``[batch, 1]`` sequence position
+        into per-partition lengths, making the kernel skip every unused trailing
+        partition while bounding runtime work by the SWA window.
+        """
+        assert self._dflash_sliding_window is not None
+        assert cad._seq_lens_cpu is not None
+        block_size = int(attn_group.kv_cache_spec.block_size)
+        num_query_per_req = 1 + self.num_speculative_tokens
+        covered_tokens = self._dflash_sliding_window + num_query_per_req - 1
+        # A span that straddles an aligned boundary can occupy one more block
+        # than ceil(span / block_size). This exact bound is four blocks for
+        # MiniMax-M2.5-DFlash: window=2048, queries=8, block_size=1024.
+        num_local_blocks = (covered_tokens + block_size - 2) // block_size + 1
+
+        absolute_seq_lens = cad._seq_lens_cpu[:num_reqs]
+        window_starts = torch.clamp(
+            absolute_seq_lens - self._dflash_sliding_window + 1,
+            min=0,
+        )
+        first_blocks = torch.div(window_starts, block_size, rounding_mode="floor")
+        base_positions = first_blocks * block_size
+        local_seq_lens = absolute_seq_lens - base_positions
+
+        full_block_tables = cad.block_table_tensor[:num_reqs]
+        block_indices = first_blocks.view(-1, 1) + torch.arange(
+            num_local_blocks, dtype=first_blocks.dtype
+        ).view(1, -1)
+        if (
+            block_indices.numel()
+            and int(block_indices.max()) >= full_block_tables.shape[1]
+        ):
+            raise ValueError("DFlash SWA local block view exceeds the KV block table")
+        active_block_tables = torch.gather(
+            full_block_tables,
+            1,
+            block_indices.to(full_block_tables.device),
+        )
+        local_block_tables = torch.zeros_like(full_block_tables)
+        local_block_tables[:, :num_local_blocks] = active_block_tables
+        local_block_tables = pad(local_block_tables, 0, num_reqs_padded)
+        local_seq_lens = pad(local_seq_lens.view(-1, 1), 0, num_reqs_padded)
+
+        sliding_metadata = copy(attn_metadata)
+        sliding_metadata.block_tables = local_block_tables.to(
+            device=attn_metadata.block_tables.device,
+            dtype=attn_metadata.block_tables.dtype,
+        )
+        sliding_metadata.seq_lens = local_seq_lens.to(
+            device=attn_metadata.seq_lens.device,
+            dtype=attn_metadata.seq_lens.dtype,
+        )
+        sliding_metadata.attn_masks = attn_metadata.attn_masks
+        self._rebuild_block_draft_mask(
+            sliding_metadata,
+            cad,
+            num_reqs,
+            num_reqs_padded,
+            self._dflash_sliding_window,
+            local_seq_lens[:num_reqs, 0],
+        )
+        return sliding_metadata
+
+    def _specialize_layer_attn_metadata(
+        self,
+        attn_group,
+        attn_metadata,
+        cad: CommonAttentionMetadata,
+        num_reqs: int,
+        num_reqs_padded: int,
+    ) -> dict[str, object]:
+        """Return full and SWA metadata views without changing cache geometry."""
+        self._rebuild_block_draft_mask(attn_metadata, cad, num_reqs, num_reqs_padded)
+        sliding_names = self._dflash_sliding_layer_names.intersection(
+            attn_group.layer_names
+        )
+        sliding_metadata = None
+        if sliding_names:
+            sliding_metadata = self._localize_sliding_attn_metadata(
+                attn_group,
+                attn_metadata,
+                cad,
+                num_reqs,
+                num_reqs_padded,
+            )
+
+        per_layer = {layer_name: attn_metadata for layer_name in attn_group.layer_names}
+        if sliding_metadata is not None:
+            for layer_name in sliding_names:
+                per_layer[layer_name] = sliding_metadata
+        return per_layer
 
     # ------------------------------------------------------------------
     # Compiled drafter graph
@@ -316,16 +566,10 @@ class RBLNDFlashProposer(RBLNEagleProposer):
         super(RBLNEagleProposer, self).load_model(target_model)
         self._probe_dp_rendezvous_need()
 
-        def dflash_wrapper(
-            input_ids: torch.Tensor,
-            positions: torch.Tensor,
-            token_indices_to_sample: torch.Tensor | None = None,
+        def sample_hidden_states(
+            hidden_states: torch.Tensor,
+            token_indices_to_sample: torch.Tensor | None,
         ):
-            hidden_states = self.model(
-                input_ids=input_ids,
-                positions=positions,
-                inputs_embeds=None,
-            )
             hidden_states = hidden_states.view(-1, self.hidden_size)
             if token_indices_to_sample is not None:
                 # Only the mask slots are sampled. Advanced indexing rather than
@@ -340,32 +584,90 @@ class RBLNDFlashProposer(RBLNEagleProposer):
                 return hidden_states, ids.to(torch.int32)
             return hidden_states, logits
 
+        def dflash_wrapper(
+            input_ids: torch.Tensor,
+            positions: torch.Tensor,
+            token_indices_to_sample: torch.Tensor | None = None,
+        ):
+            hidden_states = self.model(
+                input_ids=input_ids,
+                positions=positions,
+                inputs_embeds=None,
+            )
+            return sample_hidden_states(hidden_states, token_indices_to_sample)
+
         if (
             self.vllm_config.speculative_config.enforce_eager
             or not envs.VLLM_RBLN_COMPILE_MODEL
         ):
             self.model_executable = dflash_wrapper
         else:
-            runtime_holder: list = []
-            compiled = compile(
-                dflash_wrapper,
-                dynamic=False,
-                fullgraph=True,
-                compile_context=self.runner.compile_context,
-                num_devices=envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
-                model_trace_method="export" if USE_DEVICE_TENSOR else "",
-                process_group_dict=build_process_group_dict(),
-                guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
-                mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
-                runtime_holder=runtime_holder,
-                # Four DP workers compile the same two DFlash shapes during
-                # warmup. The rebel cache writer does not serialize writes to
-                # a shared cache path, so concurrent cache misses can leave a
-                # checksum-invalid .rbln file. Keep this small, DFlash-only
-                # graph process-local; target-model caching remains enabled.
-                use_cache=False,
+
+            def compile_forward(fn):
+                return compile(
+                    fn,
+                    dynamic=False,
+                    fullgraph=True,
+                    compile_context=self.runner.compile_context,
+                    num_devices=envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
+                    model_trace_method="export" if USE_DEVICE_TENSOR else "",
+                    process_group_dict=build_process_group_dict(),
+                    guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
+                    mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
+                    use_static_output=True,
+                    # Four DP workers compile the same DFlash shapes during
+                    # warmup. Concurrent writes to a shared cache path can
+                    # produce checksum-invalid artifacts, so drafter graphs
+                    # remain process-local; target-model caching stays enabled.
+                    use_cache=False,
+                )
+
+            layer_types = list(
+                getattr(self.draft_model_config.hf_config, "layer_types", [])
             )
-            self.model_executable = _DFlashForwardGraph(compiled, runtime_holder)
+            split_index = _get_dflash_forward_split(layer_types)
+            if split_index is None:
+                self.model_executable = compile_forward(dflash_wrapper)
+                return
+
+            core_model = self.model.model
+
+            def sliding_forward(input_ids: torch.Tensor, positions: torch.Tensor):
+                hidden_states = core_model.embed_input_ids(input_ids)
+                residual = None
+                for layer in core_model.layers[:split_index]:
+                    hidden_states, residual = layer(
+                        positions=positions,
+                        hidden_states=hidden_states,
+                        residual=residual,
+                    )
+                return hidden_states, residual
+
+            def full_forward(
+                hidden_states: torch.Tensor,
+                residual: torch.Tensor,
+                positions: torch.Tensor,
+                token_indices_to_sample: torch.Tensor | None = None,
+            ):
+                for layer in core_model.layers[split_index:]:
+                    hidden_states, residual = layer(
+                        positions=positions,
+                        hidden_states=hidden_states,
+                        residual=residual,
+                    )
+                hidden_states, _ = core_model.norm(hidden_states, residual)
+                return sample_hidden_states(hidden_states, token_indices_to_sample)
+
+            logger.info(
+                "DFlash forward split at layer %d: SWA=%d full=%d",
+                split_index,
+                split_index,
+                len(layer_types) - split_index,
+            )
+            self.model_executable = _DFlashSplitForwardGraph(
+                compile_forward(sliding_forward),
+                compile_forward(full_forward),
+            )
 
     @torch.inference_mode()
     def dummy_run(
@@ -427,11 +729,15 @@ class RBLNDFlashProposer(RBLNEagleProposer):
                 self.runner.kv_cache_bases,
                 self.runner.kv_cache_view_infos,
             )
-            self._rebuild_block_draft_mask(
-                attn_metadata, common_attn_metadata, num_reqs, num_reqs_padded
+            per_layer_attn_metadata.update(
+                self._specialize_layer_attn_metadata(
+                    attn_group,
+                    attn_metadata,
+                    common_attn_metadata,
+                    num_reqs,
+                    num_reqs_padded,
+                )
             )
-            for layer_name in attn_group.layer_names:
-                per_layer_attn_metadata[layer_name] = attn_metadata
 
         token_indices_to_sample = (
             torch.arange(num_reqs, device=self.device, dtype=torch.int32)
@@ -538,14 +844,35 @@ class RBLNDFlashProposer(RBLNEagleProposer):
             cad, draft_index
         )
         for layer_name, attn_metadata in per_layer.items():
-            causal = getattr(attn_metadata, "causal", None)
-            if causal:
+            causal = getattr(attn_metadata, "causal", False)
+            if layer_name not in self._dflash_sliding_layer_names and causal:
                 raise RuntimeError(
-                    f"DFlash requires non-causal attention but layer {layer_name} "
-                    "reports causal=True. Check that the draft vllm_config carries "
-                    "attention_config.use_non_causal=True."
+                    f"DFlash full-attention layer {layer_name} reports causal=True. "
+                    "Check the draft attention configuration."
                 )
         return per_group, per_layer
+
+    def _intermediate_prefill_drafts(self, num_reqs: int) -> torch.Tensor | None:
+        """Skip the stateful draft forward when its output will be discarded.
+
+        Chunked prefill still has to project and store every target hidden
+        state into the DFlash cache.  It does not have to run the draft model
+        after an intermediate chunk: the scheduler discards those proposals.
+        On RBLN that unnecessary forward also writes bonus/mask query K/V into
+        lookahead pages.  Avoiding those writes keeps intermediate chunks free
+        of draft-only state and removes work whose output cannot be observed.
+
+        Returning zero placeholders matches the existing Medusa intermediate
+        prefill path in the runner; the scheduler drops their values.
+        """
+        if not getattr(self.runner, "is_intermediate_chunked_prefill", False):
+            return None
+        return torch.zeros(
+            num_reqs,
+            self.num_speculative_tokens,
+            dtype=torch.int64,
+            device=self.device,
+        )
 
     # ------------------------------------------------------------------
     # Context KV precompute
@@ -635,7 +962,7 @@ class RBLNDFlashProposer(RBLNEagleProposer):
         common_attn_metadata: CommonAttentionMetadata,
         mm_embed_inputs=None,
         num_rejected_tokens: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | list[list[int]]:
         """One non-causal forward produces every draft token."""
         # The drafter batch arrives padded to the full speculation width, so
         # `seq_lens` still counts the tokens the target just rejected. Everything
@@ -696,12 +1023,16 @@ class RBLNDFlashProposer(RBLNEagleProposer):
                 self.runner.kv_cache_bases,
                 self.runner.kv_cache_view_infos,
             )
-            self._rebuild_block_draft_mask(
-                attn_metadata, common_attn_metadata, num_reqs, num_reqs_padded
-            )
             per_group_metadata.append((attn_group, attn_metadata))
-            for layer_name in attn_group.layer_names:
-                per_layer_attn_metadata[layer_name] = attn_metadata
+            per_layer_attn_metadata.update(
+                self._specialize_layer_attn_metadata(
+                    attn_group,
+                    attn_metadata,
+                    common_attn_metadata,
+                    num_reqs,
+                    num_reqs_padded,
+                )
+            )
 
         # Project the target's hidden states into the drafter's KV cache. This
         # is a compiled graph (patches/qwen3_dflash.py): upstream runs it eager,
@@ -722,23 +1053,33 @@ class RBLNDFlashProposer(RBLNEagleProposer):
             partition_size=self.runner.cache_config.block_size,
         )
         # Project the aux-layer concatenation down to one hidden width before
-        # the precompute. With `use_aux_hidden_state` the runner hands over
-        # `cat([h for h in aux], dim=-1)` -- 6 aux layers x 3072 = 18432 here --
-        # but `precompute_and_store_context_kv` normalises with
-        # `hidden_norm = RMSNorm(config.hidden_size)` and projects with
-        # `_fused_kv_weight[..., hidden_size]`, both of which are 3072 wide.
-        # Upstream keeps that projection OUT of the precompute, in
-        # `combine_hidden_states` (qwen3_dflash.py), so the caller has to apply
-        # it -- eagle.py does exactly this in three places. Without it the very
-        # first real request dies in the precompute graph with
-        # `mul(FakeTensor(64, 18432), FakeTensor(3072))`.
-        # Left eager on purpose: this repo already dropped the aux-projection
-        # graph because deploy mode makes eager faster.
+        # the precompute. With ``use_aux_hidden_state`` the runner hands over
+        # six target layers concatenated to 18432 features, while the drafter's
+        # RMSNorm and KV projections consume 3072. Upstream keeps this FC out of
+        # ``precompute_and_store_context_kv``; retain that contract here.
         self.model.precompute_and_store_context_kv(
             self.model.combine_hidden_states(self._dflash_hidden_states),
             self._context_positions_buffer[: self._dflash_num_context],
             WRITE_CONTEXT_KV,
         )
+
+        intermediate_drafts = self._intermediate_prefill_drafts(num_reqs)
+        if intermediate_drafts is not None:
+            return intermediate_drafts
+
+        assert common_attn_metadata._seq_lens_cpu is not None
+        page_crossing = _dflash_page_crossing_mask(
+            common_attn_metadata._seq_lens_cpu[:num_reqs],
+            self.runner.cache_config.block_size,
+            1 + self.num_speculative_tokens,
+        )
+        empty_drafts = _empty_drafts_for_page_crossing(page_crossing)
+        if empty_drafts is not None:
+            # Context K/V above is still required: this target-only step is what
+            # advances the request toward the next aligned page. Do not return a
+            # zero-filled tensor; the scheduler would treat those zeros as valid
+            # draft token IDs.
+            return empty_drafts
 
         # Same reshape/pad path the warmup used, so the compiled shape matches
         # and the first real step does not trigger a recompile.

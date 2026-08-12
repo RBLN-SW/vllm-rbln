@@ -55,7 +55,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
+from vllm.config import SpeculativeConfig
 from vllm.model_executor.layers.rotary_embedding.common import rotate_neox
+from vllm.v1.core.sched.scheduler import Scheduler
 
 import vllm_rbln.envs as envs
 from vllm_rbln.compilation import compile as rbln_compile
@@ -63,6 +65,54 @@ from vllm_rbln.logger import init_logger
 from vllm_rbln.patches import register_patch
 
 logger = init_logger(__name__)
+
+_ORIGINAL_SCHEDULER_INIT = Scheduler.__init__
+
+
+def _scheduler_cache_drop_patch_needed() -> bool:
+    return not hasattr(SpeculativeConfig, "requires_eagle_cache_drop")
+
+
+@register_patch(
+    target="vllm.v1.core.sched.scheduler.Scheduler.__init__",
+    reason=(
+        "This vLLM release classifies DFlash as EAGLE and consequently drops "
+        "the final matching KV block. DFlash projects target hidden states into "
+        "its own cache and must retain that block; upstream fixed this by "
+        "separating use_eagle from requires_eagle_cache_drop."
+    ),
+    condition=_scheduler_cache_drop_patch_needed,
+)
+def patched_scheduler_init(self, vllm_config, *args, **kwargs):
+    """Construct a DFlash scheduler without EAGLE's last-block cache drop.
+
+    Older vLLM schedulers derive both lookahead allocation and cache-drop
+    behavior from ``use_eagle()``. Present DFlash as a generic draft model only
+    while that constructor runs: this preserves lookahead tokens while keeping
+    the final cache block. Restore the shared config before returning so model
+    runners continue to recognize the DFlash method.
+    """
+    spec_config = vllm_config.speculative_config
+    if spec_config is None or not spec_config.use_dflash():
+        return _ORIGINAL_SCHEDULER_INIT(self, vllm_config, *args, **kwargs)
+
+    original_method = spec_config.method
+    spec_config.method = "draft_model"
+    try:
+        result = _ORIGINAL_SCHEDULER_INIT(self, vllm_config, *args, **kwargs)
+    finally:
+        spec_config.method = original_method
+
+    # Keep DFlash's EAGLE execution semantics after constructing only the KV
+    # cache manager as a generic draft model.  Newer vLLM releases express this
+    # with a separate ``requires_eagle_cache_drop`` flag and also reserve the
+    # bonus-token slot.  This older release has neither distinction, so restore
+    # the scheduler flag after construction and account for DFlash's
+    # [bonus + num_spec] query width explicitly.
+    self.use_eagle = True
+    self.num_lookahead_tokens = spec_config.num_speculative_tokens + 1
+    return result
+
 
 _TARGET = (
     "vllm.model_executor.models.qwen3_dflash.DFlashQwen3Model"
@@ -79,8 +129,7 @@ _WHY = (
 )
 
 _CACHE_PARTITION_SIZE = 1024
-
-_STABLE_DFLASH_FORWARD_INPUT_FRAGMENT = "kv_cache"
+_DFLASH_CONTEXT_KV_MAX_RUN_LEN = 506
 
 
 # The third parameter of `precompute_and_store_context_kv` is upstream's
@@ -161,11 +210,31 @@ class _RuntimeInputBindingCache:
             ),
         )
 
-    def execute(self, runtime, pointers: tuple[int, ...], get_device_addrs) -> bool:
+    def execute(
+        self,
+        runtime,
+        pointers: tuple[int, ...],
+        get_device_addrs,
+        outputs: list[torch.Tensor] | tuple[torch.Tensor, ...],
+    ) -> bool:
         """Run using prior bindings; return False when a normal prepare is needed."""
         plan = self.plan(pointers)
         if not plan.can_reuse:
             return False
+        if not isinstance(outputs, (list, tuple)):
+            return False
+
+        device_outputs: dict[int, int] = {}
+        cpu_outputs: dict[int, int] = {}
+        for output_index, output in enumerate(outputs):
+            if not isinstance(output, torch.Tensor) or not output.is_contiguous():
+                return False
+            if output.device.type == "rbln":
+                device_outputs[output_index] = output.data_ptr()
+            elif output.is_cpu:
+                cpu_outputs[output_index] = output.data_ptr()
+            else:
+                return False
 
         handle = runtime._runtime_handle
         handle.begin_io_patch_batch()
@@ -195,6 +264,10 @@ class _RuntimeInputBindingCache:
                         "device allocation count exceeds relocation capacity",
                         index,
                     )
+            # Match DynamoRuntime.run: every manual invocation must patch the
+            # cached output addresses and declare their physical views as the
+            # values produced by the upcoming device run.
+            handle.prepare_outputs(device_outputs, cpu_outputs)
         finally:
             handle.end_io_patch_batch()
         handle.run()
@@ -273,7 +346,7 @@ class _StableRuntimeGraph:
             )
             runtime.run = call
             runtime._rbln_dflash_context_stable_inputs = call
-            logger.info(
+            logger.debug(
                 "DFlash context-KV runtime boundary installed: inputs=%s",
                 sorted(runtime._input_name_to_index.items(), key=lambda item: item[1]),
             )
@@ -289,13 +362,12 @@ class _StableRuntimeGraph:
 
 
 class _StableDynamoRuntimeCall:
-    """Drop-in ``DynamoRuntime.run`` wrapper for hidden graph inputs.
+    """Reuse validated context-projection bindings and output allocations.
 
-    The DFlash forward's attention metadata and five KV caches are captured by
-    ``set_forward_context`` and therefore do not appear in the three Python
-    arguments of ``model_executable``.  They do appear in ``DynamoRuntime.run``;
-    wrapping at that boundary lets us reuse their already-validated bindings
-    without changing the model graph ABI.
+    Projection profiles share their input staging buffers across attention
+    layers.  The wrapper keeps ordinary preparation for dynamic buffers while
+    patching already-observed layer-specific weight bindings, without changing
+    the compiled graph ABI.
     """
 
     def __init__(
@@ -341,7 +413,7 @@ class _StableDynamoRuntimeCall:
             return False
         self._dynamic_input_indices = dynamic_indices
         if self._log_label is not None:
-            logger.info(
+            logger.debug(
                 "DFlash %s stable runtime inputs enabled: "
                 "dynamic_indices=%s stable_count=%d",
                 self._log_label,
@@ -362,7 +434,10 @@ class _StableDynamoRuntimeCall:
         if supported:
             pointers = tuple(tensor.data_ptr() for tensor in inputs)
             if self._bindings is not None and self._bindings.execute(
-                self._runtime, pointers, self._get_device_addrs
+                self._runtime,
+                pointers,
+                self._get_device_addrs,
+                self._output,
             ):
                 return self._output
 
@@ -372,96 +447,13 @@ class _StableDynamoRuntimeCall:
             self._bindings.observe(pointers)
             self._output = output
             if self._log_label is not None:
-                logger.info(
+                logger.debug(
                     "DFlash %s runtime input profile installed",
                     self._log_label,
                 )
             return output
 
         output = self._original_run(*input_args, out=out, **input_kwargs)
-        return output
-
-
-def _install_stable_runtime_inputs(
-    runtime,
-    *,
-    get_device_addrs=None,
-    tensor_is_supported=None,
-) -> bool:
-    """Install the DFlash-forward binding fast path once on a Dynamo runtime."""
-    if getattr(runtime, "_rbln_dflash_stable_inputs", None) is not None:
-        return False
-    if not hasattr(runtime, "_runtime_utils") or not hasattr(
-        runtime, "_runtime_handle"
-    ):
-        return False
-
-    # KV caches are the only forward inputs whose contents and addresses are
-    # stable across decode steps.  Treat every other input as dynamic by
-    # default, including metadata introduced by future attention backends. This
-    # is intentionally an allowlist for reuse rather than a denylist for
-    # preparation: missing one changing slot/query tensor would silently reuse
-    # stale device contents.
-    stable_indices = {
-        input_index
-        for runtime_name, input_index in runtime._input_name_to_index.items()
-        if _STABLE_DFLASH_FORWARD_INPUT_FRAGMENT in runtime_name.lower()
-    }
-    for input_index, profile in enumerate(getattr(runtime, "_input_profile", ())):
-        shape = tuple(getattr(profile, "shape", ()))
-        # Export erases semantic names (``kv_caches.0`` becomes ``args_3``),
-        # but DFlash cache ABI remains unambiguous: [K/V, blocks, heads, 1,
-        # partition, head_dim]. No other forward input has this rank/layout.
-        if len(shape) == 6 and shape[0] == 2 and shape[3] == 1:
-            stable_indices.add(input_index)
-    if not stable_indices:
-        return False
-    input_indices = tuple(sorted(runtime._input_name_to_index.values()))
-    dynamic_indices = tuple(
-        input_index
-        for input_index in input_indices
-        if input_index not in stable_indices
-    )
-    index_to_name = {
-        input_index: runtime_name
-        for runtime_name, input_index in runtime._input_name_to_index.items()
-    }
-    stable_inputs = [
-        f"{index_to_name.get(input_index, input_index)}[{input_index}]"
-        for input_index in sorted(stable_indices)
-    ]
-    call = _StableDynamoRuntimeCall(
-        runtime,
-        runtime.run,
-        dynamic_indices,
-        get_device_addrs=(
-            get_device_addrs or _StableRuntimeGraph._default_get_device_addrs
-        ),
-        tensor_is_supported=(
-            tensor_is_supported or _StableRuntimeGraph._default_tensor_is_supported
-        ),
-    )
-    runtime.run = call
-    runtime._rbln_dflash_stable_inputs = call
-    logger.info(
-        "DFlash stable runtime inputs enabled: reused=%s dynamic_count=%d",
-        stable_inputs,
-        len(dynamic_indices),
-    )
-    return True
-
-
-class _DFlashForwardGraph:
-    """Installs runtime binding reuse after torch.compile creates its runtime."""
-
-    def __init__(self, compiled, runtime_holder: list) -> None:
-        self._compiled = compiled
-        self._runtime_holder = runtime_holder
-
-    def __call__(self, *args, **kwargs):
-        output = self._compiled(*args, **kwargs)
-        for runtime in tuple(self._runtime_holder):
-            _install_stable_runtime_inputs(runtime)
         return output
 
 
@@ -523,7 +515,26 @@ def _plan_context_kv_runs(
         )
         if run.block_offset + run.token_count > partition_size:
             raise ValueError(f"run crosses partition boundary: {run}")
-        runs.append(run)
+        if run.token_count > _DFLASH_CONTEXT_KV_MAX_RUN_LEN:
+            remaining = run.token_count
+            token_start = run.token_start
+            block_offset = run.block_offset
+            while remaining:
+                token_count = min(remaining, _DFLASH_CONTEXT_KV_MAX_RUN_LEN)
+                runs.append(
+                    _ContextKVRun(
+                        token_start=token_start,
+                        token_count=token_count,
+                        physical_block_id=run.physical_block_id,
+                        block_offset=block_offset,
+                        group_id=run.group_id,
+                    )
+                )
+                remaining -= token_count
+                token_start += token_count
+                block_offset += token_count
+        else:
+            runs.append(run)
         run_start = token_idx
 
     return tuple(runs)
@@ -694,6 +705,13 @@ class _ContextKVPrecompute:
                 value.permute(1, 0, 2).contiguous(),
             )
 
+        # Dynamo caches by code-object identity. These closures intentionally
+        # compile with different weights, shapes, and backend runtime holders;
+        # sharing this lexical code object makes them look like recompilations
+        # of one function and trips the 64-entry limit on chunked prompts.
+        frame_name = f"dflash_context_kv_l{layer_idx}_n{run_len}"
+        fn.__name__ = frame_name
+        fn.__code__ = fn.__code__.replace(co_name=frame_name)
         return fn
 
     def _get_graph(self, layer_idx: int, run_len: int):

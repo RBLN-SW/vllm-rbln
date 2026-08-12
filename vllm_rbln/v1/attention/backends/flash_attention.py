@@ -532,10 +532,9 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         self.sinks,
                     )
             else:
-                # * batched attention - seq_lens[B, 1] == seq_idx,
-                #   original sequence index
-                # * otherwise         - seq_lens[B, P] == seq_lens_tensor,
-                #   dynamic size for each partition
+                # The compiler converter accepts the raw sequence index as
+                # seq_lens[B, 1] for both batched and non-batched attention and
+                # derives each partition's dynamic size exactly once.
                 if attn_metadata.is_prefill:
                     attn_output = flash_causal_attention_naive_prefill(
                         query,

@@ -73,31 +73,28 @@ def _cap_dflash_prefill_chunk_to_kv_block(
     return min(num_new_tokens, block_size - tokens_used_in_block)
 
 
-def _restore_full_dflash_target_budget(
+def _get_dflash_step_token_budget(
     current_budget: int,
     max_num_batched_tokens: int,
     max_num_seqs: int,
     speculative_config: Any | None,
 ) -> int:
-    """Undo old vLLM's target-budget reservation for RBLN DFlash.
+    """Restore only the implicit reservation for a lone DFlash request.
 
-    Upstream's pre-v0.19 scheduler subtracts draft slots from
-    ``max_num_scheduled_tokens`` when speculative decoding is enabled. That is
-    correct for methods that append draft slots into the target batch, but our
-    DFlash port runs the draft block on a separate non-causal graph. Keeping the
-    reduced target budget only changes target prefill chunk geometry.
-
-    Only restore the budget when the current value matches the constructor's
-    implicit DFlash reservation. Explicit user-provided budgets stay intact.
+    The old scheduler reserves target-batch slots for speculative tokens. RBLN
+    DFlash runs its draft graph separately, so a lone target prefill can still
+    use the complete compiled target width. Explicitly smaller budgets and
+    multi-request schedulers retain the original limit.
     """
-    if speculative_config is None or not speculative_config.use_dflash():
+    if (
+        speculative_config is None
+        or not speculative_config.use_dflash()
+        or max_num_seqs != 1
+    ):
         return current_budget
 
-    reserved_slots = (
-        speculative_config.max_num_new_slots_for_drafting * max_num_seqs
-    )
-    implicit_budget = max_num_batched_tokens - reserved_slots
-    if current_budget != implicit_budget:
+    reserved_slots = speculative_config.max_num_new_slots_for_drafting
+    if current_budget != max_num_batched_tokens - reserved_slots:
         return current_budget
     return max_num_batched_tokens
 
@@ -115,7 +112,7 @@ class RBLNScheduler(Scheduler):
         self._cap_dflash_prefill_to_kv_block = (
             speculative_config is not None and speculative_config.use_dflash()
         )
-        self.max_num_scheduled_tokens = _restore_full_dflash_target_budget(
+        self._dflash_step_token_budget = _get_dflash_step_token_budget(
             current_budget=self.max_num_scheduled_tokens,
             max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
             max_num_seqs=self.scheduler_config.max_num_seqs,
@@ -258,7 +255,11 @@ class RBLNScheduler(Scheduler):
         # breaks that read; see the step-phase section in v1/core/utils.py for
         # what it would cost.
         num_scheduled_tokens: dict[str, int] = {}
-        token_budget = self.max_num_scheduled_tokens
+        # Only a lone DFlash prefill can consume the restored portion. Decode
+        # queries remain bounded by their fixed speculative width, while the
+        # stored global budget keeps the ordinary scheduler contract intact.
+        step_token_budget = self._dflash_step_token_budget
+        token_budget = step_token_budget
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
             token_budget = 0
@@ -545,7 +546,7 @@ class RBLNScheduler(Scheduler):
         ):
             # NOTE(RBLN): refresh the token budget to determine whether we can schedule
             # new prefill requests into the running batch.
-            prefill_token_budget = self.max_num_scheduled_tokens
+            prefill_token_budget = step_token_budget
 
             step_skipped_waiting = create_request_queue(self.policy)
             sub_block_match = None
@@ -995,7 +996,7 @@ class RBLNScheduler(Scheduler):
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
-        assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
+        assert total_num_scheduled_tokens <= step_token_budget
 
         assert token_budget >= 0
         assert len(self.running) <= self.max_num_running_reqs

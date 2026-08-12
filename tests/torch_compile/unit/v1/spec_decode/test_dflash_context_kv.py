@@ -1,3 +1,4 @@
+import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -8,14 +9,23 @@ from vllm_rbln.patches.qwen3_dflash import (
     _apply_rope,
     _ContextKVPrecompute,
     _ContextKVRun,
-    _DFlashForwardGraph,
-    _install_stable_runtime_inputs,
     _plan_context_kv_runs,
     _rms_norm,
     _RuntimeInputBindingCache,
     _StableRuntimeGraph,
+    patched_scheduler_init,
 )
-from vllm_rbln.v1.spec_decode.dflash import RBLNDFlashProposer
+from vllm_rbln.v1.attention.ops.triton_flash_attention_naive import (
+    flash_attention_naive_decode,
+    flash_attention_naive_prefill,
+)
+from vllm_rbln.v1.spec_decode.dflash import (
+    RBLNDFlashProposer,
+    _dflash_page_crossing_mask,
+    _DFlashSplitForwardGraph,
+    _empty_drafts_for_page_crossing,
+    _get_dflash_forward_split,
+)
 
 
 def test_apply_rope_broadcasts_over_kv_heads() -> None:
@@ -29,7 +39,7 @@ def test_apply_rope_broadcasts_over_kv_heads() -> None:
     torch.testing.assert_close(actual, expected)
 
 
-def test_exact_length_runtime_buffers_keep_stable_addresses() -> None:
+def test_projection_runtime_buffers_are_exact_length_and_stable() -> None:
     model = SimpleNamespace(
         _fused_kv_weight=torch.empty(16, 32),
         _head_dim=4,
@@ -37,11 +47,15 @@ def test_exact_length_runtime_buffers_keep_stable_addresses() -> None:
     helper = _ContextKVPrecompute(model)
 
     first_inputs = helper._get_run_inputs(8, torch.bfloat16, torch.device("cpu"))
-    second_inputs = helper._get_run_inputs(8, torch.bfloat16, torch.device("cpu"))
+    repeated_inputs = helper._get_run_inputs(8, torch.bfloat16, torch.device("cpu"))
+    tail_inputs = helper._get_run_inputs(506, torch.bfloat16, torch.device("cpu"))
 
     assert tuple(t.data_ptr() for t in first_inputs) == tuple(
-        t.data_ptr() for t in second_inputs
+        t.data_ptr() for t in repeated_inputs
     )
+    assert first_inputs[0].shape[0] == 8
+    assert tail_inputs[0].shape[0] == 506
+    assert first_inputs[0].data_ptr() != tail_inputs[0].data_ptr()
 
 
 def test_context_kv_compiles_projection_only_runtime_per_layer_without_disk_cache(
@@ -67,12 +81,367 @@ def test_context_kv_compiles_projection_only_runtime_per_layer_without_disk_cach
     monkeypatch.setattr(qwen3_dflash_patch.envs, "VLLM_RBLN_COMPILE_MODEL", True)
     monkeypatch.setattr(qwen3_dflash_patch, "rbln_compile", fake_compile)
 
-    layer0 = helper._get_graph(0, 8)
-    layer1 = helper._get_graph(1, 8)
+    layer0_decode = helper._get_graph(0, 1)
+    layer0_decode_again = helper._get_graph(0, 1)
+    layer0_prefill = helper._get_graph(0, 506)
+    layer1_decode = helper._get_graph(1, 1)
+    layer1_prefill = helper._get_graph(1, 506)
 
-    assert layer0 is not layer1
-    assert len(compile_calls) == 2
+    assert layer0_decode is layer0_decode_again
+    assert layer0_decode is not layer0_prefill
+    assert layer0_decode is not layer1_decode
+    assert layer0_prefill is not layer1_prefill
+    assert isinstance(layer0_decode, _StableRuntimeGraph)
+    assert isinstance(layer0_prefill, _StableRuntimeGraph)
+    assert len(compile_calls) == 4
     assert all(call["use_cache"] is False for call in compile_calls)
+
+
+def test_context_kv_gives_exact_profiles_unique_dynamo_frames(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    num_layers = 5
+    model = SimpleNamespace(
+        _num_attn_layers=num_layers,
+        _num_kv_heads=2,
+        _head_dim=4,
+        _hidden_norm_weight=torch.empty(8),
+        _fused_kv_weight=torch.empty(num_layers * 2 * 2 * 4, 8),
+        _fused_kv_bias=None,
+        _k_norm_weights=[torch.empty(4) for _ in range(num_layers)],
+        _rms_norm_eps=1e-6,
+    )
+    helper = _ContextKVPrecompute(model)
+    code_objects: list[object] = []
+
+    def fake_compile(fn, **kwargs):
+        code_objects.append(fn.__code__)
+        return fn
+
+    monkeypatch.setattr(qwen3_dflash_patch.envs, "VLLM_RBLN_COMPILE_MODEL", True)
+    monkeypatch.setattr(qwen3_dflash_patch, "rbln_compile", fake_compile)
+
+    for run_len in (1, 8, 111, 506):
+        for layer_idx in range(num_layers):
+            helper._get_graph(layer_idx, run_len)
+
+    assert len(code_objects) == 20
+    assert len({id(code) for code in code_objects}) == 20
+
+
+def test_dflash_scheduler_disables_only_eagle_cache_drop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    class SpecConfig:
+        method = "dflash"
+        num_speculative_tokens = 3
+
+        def use_dflash(self) -> bool:
+            return self.method == "dflash"
+
+        def use_eagle(self) -> bool:
+            return self.method in ("eagle", "eagle3", "mtp", "dflash")
+
+        def uses_draft_model(self) -> bool:
+            return self.method == "draft_model"
+
+    config = SimpleNamespace(speculative_config=SpecConfig())
+
+    def original_init(_self, vllm_config, marker=None):
+        spec = vllm_config.speculative_config
+        observed.update(
+            use_eagle=spec.use_eagle(),
+            uses_draft_model=spec.uses_draft_model(),
+            marker=marker,
+        )
+
+    monkeypatch.setattr(qwen3_dflash_patch, "_ORIGINAL_SCHEDULER_INIT", original_init)
+
+    scheduler = SimpleNamespace()
+    patched_scheduler_init(scheduler, config, marker="called")
+
+    assert observed == {
+        "use_eagle": False,
+        "uses_draft_model": True,
+        "marker": "called",
+    }
+    assert config.speculative_config.method == "dflash"
+    assert scheduler.use_eagle is True
+    assert scheduler.num_lookahead_tokens == 4
+
+
+def test_non_dflash_scheduler_keeps_eagle_semantics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+    spec = SimpleNamespace(method="eagle3", use_dflash=lambda: False)
+    config = SimpleNamespace(speculative_config=spec)
+
+    def original_init(_self, vllm_config):
+        observed["method"] = vllm_config.speculative_config.method
+
+    monkeypatch.setattr(qwen3_dflash_patch, "_ORIGINAL_SCHEDULER_INIT", original_init)
+
+    patched_scheduler_init(object(), config)
+
+    assert observed == {"method": "eagle3"}
+    assert spec.method == "eagle3"
+
+
+def test_dflash_maps_checkpoint_swa_types_to_global_layer_names() -> None:
+    proposer = object.__new__(RBLNDFlashProposer)
+    proposer.draft_model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            layer_types=[
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            sliding_window=2048,
+        )
+    )
+    names = [f"model.layers.{index}.self_attn.attn" for index in range(62, 67)]
+    proposer.draft_attn_groups = [SimpleNamespace(layer_names=list(reversed(names)))]
+
+    RBLNDFlashProposer._configure_dflash_attention_layers(proposer)
+
+    assert proposer._dflash_sliding_layer_names == set(names[:4])
+    assert proposer._dflash_sliding_window == 2048
+
+
+def test_dflash_forward_split_follows_the_swa_full_boundary() -> None:
+    assert (
+        _get_dflash_forward_split(
+            [
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+            ]
+        )
+        == 4
+    )
+    assert _get_dflash_forward_split(["full_attention"] * 5) is None
+    assert _get_dflash_forward_split(["sliding_attention"] * 5) is None
+
+    with pytest.raises(ValueError, match="contiguous"):
+        _get_dflash_forward_split(
+            ["sliding_attention", "full_attention", "sliding_attention"]
+        )
+
+
+def test_dflash_page_crossing_guard_covers_only_unrepresentable_offsets() -> None:
+    mask = _dflash_page_crossing_mask(
+        torch.tensor([1016, *range(1017, 1024), 1024, 1135]),
+        partition_size=1024,
+        query_len=8,
+    )
+
+    assert mask.tolist() == [False, *([True] * 7), False, False]
+
+
+def test_dflash_page_crossing_guard_skips_whole_batch_before_kv_insert() -> None:
+    assert _empty_drafts_for_page_crossing(torch.tensor([True, False])) == [[], []]
+    assert _empty_drafts_for_page_crossing(torch.tensor([True, True])) == [[], []]
+    assert _empty_drafts_for_page_crossing(torch.tensor([False, False])) is None
+
+
+def test_dflash_intermediate_prefill_keeps_only_context_kv_work() -> None:
+    proposer = object.__new__(RBLNDFlashProposer)
+    proposer.runner = SimpleNamespace(is_intermediate_chunked_prefill=True)
+    proposer.num_speculative_tokens = 7
+    proposer.device = torch.device("cpu")
+
+    drafts = RBLNDFlashProposer._intermediate_prefill_drafts(proposer, 2)
+
+    assert drafts is not None
+    assert drafts.shape == (2, 7)
+    assert drafts.dtype == torch.int64
+    assert torch.count_nonzero(drafts) == 0
+
+    proposer.runner.is_intermediate_chunked_prefill = False
+    assert RBLNDFlashProposer._intermediate_prefill_drafts(proposer, 2) is None
+
+
+def test_dflash_split_forward_graph_preserves_hidden_residual_abi() -> None:
+    calls: list[tuple] = []
+
+    def sliding(input_ids, positions):
+        calls.append(("sliding", input_ids, positions))
+        return input_ids + 10, input_ids + 20
+
+    def full(hidden_states, residual, positions, sample_indices):
+        calls.append(("full", hidden_states, residual, positions, sample_indices))
+        return hidden_states + residual, sample_indices + 1
+
+    graph = _DFlashSplitForwardGraph(sliding, full)
+
+    assert graph(2, 3, 4) == (34, 5)
+    assert calls == [
+        ("sliding", 2, 3),
+        ("full", 12, 22, 3, 4),
+    ]
+
+
+def test_dflash_causal_swa_mask_tracks_each_query_position() -> None:
+    proposer = object.__new__(RBLNDFlashProposer)
+    proposer.num_speculative_tokens = 3
+    metadata = SimpleNamespace(attn_masks=torch.zeros(1, 1, 1, 1, 12))
+    cad = SimpleNamespace(_seq_lens_cpu=torch.tensor([5], dtype=torch.int32))
+
+    RBLNDFlashProposer._rebuild_block_draft_mask(
+        proposer,
+        metadata,
+        cad,
+        num_reqs=1,
+        num_reqs_padded=1,
+        sliding_window=4,
+    )
+
+    expected = torch.zeros(4, 12)
+    expected[0, 2:6] = 1
+    expected[1, 3:7] = 1
+    expected[2, 4:8] = 1
+    expected[3, 5:9] = 1
+    torch.testing.assert_close(metadata.attn_masks[0, 0, 0], expected)
+
+
+def test_dflash_preserves_absolute_position_for_compiler_partition_abi() -> None:
+    proposer = object.__new__(RBLNDFlashProposer)
+    proposer.num_speculative_tokens = 7
+    proposer._dflash_sliding_layer_names = set()
+    proposer._dflash_sliding_window = None
+    metadata = SimpleNamespace(
+        attn_masks=torch.zeros(1, 1, 1, 1, 4096),
+        block_tables=torch.arange(4).view(1, -1),
+        seq_lens=torch.tensor([[1135]], dtype=torch.int32),
+    )
+    cad = SimpleNamespace(
+        _seq_lens_cpu=torch.tensor([1135], dtype=torch.int32),
+        block_table_tensor=metadata.block_tables,
+    )
+    group = SimpleNamespace(
+        layer_names=["layer.full"],
+        kv_cache_spec=SimpleNamespace(block_size=1024),
+    )
+
+    per_layer = RBLNDFlashProposer._specialize_layer_attn_metadata(
+        proposer,
+        group,
+        metadata,
+        cad,
+        num_reqs=1,
+        num_reqs_padded=1,
+    )
+
+    # The compiler converter is the single owner of absolute-to-partition
+    # expansion. Passing [1024, 111, ...] here would make it expand a second
+    # time and erase the 111-token tail partition.
+    assert per_layer["layer.full"].seq_lens.shape == (1, 1)
+    assert per_layer["layer.full"].seq_lens.tolist() == [[1135]]
+
+
+def test_dflash_keeps_full_metadata_and_specializes_only_swa_layers() -> None:
+    proposer = object.__new__(RBLNDFlashProposer)
+    proposer.num_speculative_tokens = 3
+    proposer._dflash_sliding_layer_names = {"layer.sw"}
+    proposer._dflash_sliding_window = 4
+    block_tables = torch.arange(3).view(1, -1)
+    metadata = SimpleNamespace(
+        attn_masks=torch.zeros(1, 1, 1, 1, 12),
+        block_tables=block_tables,
+        seq_lens=torch.tensor([[5]], dtype=torch.int32),
+    )
+    cad = SimpleNamespace(
+        _seq_lens_cpu=torch.tensor([5], dtype=torch.int32),
+        block_table_tensor=block_tables,
+    )
+    group = SimpleNamespace(
+        layer_names=["layer.sw", "layer.full"],
+        kv_cache_spec=SimpleNamespace(block_size=4),
+    )
+
+    per_layer = RBLNDFlashProposer._specialize_layer_attn_metadata(
+        proposer,
+        group,
+        metadata,
+        cad,
+        num_reqs=1,
+        num_reqs_padded=1,
+    )
+
+    assert per_layer["layer.full"] is metadata
+    assert per_layer["layer.sw"] is not metadata
+    assert torch.equal(metadata.attn_masks[0, 0, 0, 0], metadata.attn_masks[0, 0, 0, 3])
+    assert not torch.equal(
+        per_layer["layer.sw"].attn_masks[0, 0, 0, 0],
+        per_layer["layer.sw"].attn_masks[0, 0, 0, 3],
+    )
+
+
+def test_dflash_swa_metadata_rebases_to_bounded_physical_partitions() -> None:
+    proposer = object.__new__(RBLNDFlashProposer)
+    proposer.num_speculative_tokens = 7
+    proposer._dflash_sliding_layer_names = {"layer.sw"}
+    proposer._dflash_sliding_window = 2048
+    metadata = SimpleNamespace(
+        attn_masks=torch.zeros(1, 1, 1, 1, 49152),
+        block_tables=torch.arange(100, 148).view(1, -1),
+        seq_lens=torch.tensor([[3497]], dtype=torch.int32),
+    )
+    cad = SimpleNamespace(
+        _seq_lens_cpu=torch.tensor([3497], dtype=torch.int32),
+        block_table_tensor=metadata.block_tables,
+    )
+    group = SimpleNamespace(
+        layer_names=["layer.sw", "layer.full"],
+        kv_cache_spec=SimpleNamespace(block_size=1024),
+    )
+
+    per_layer = RBLNDFlashProposer._specialize_layer_attn_metadata(
+        proposer,
+        group,
+        metadata,
+        cad,
+        num_reqs=1,
+        num_reqs_padded=1,
+    )
+
+    sliding = per_layer["layer.sw"]
+    # The eight draft queries cover at most four aligned 1024-token cache
+    # partitions. Absolute position 3497 starts the local view at partition 1.
+    assert sliding.block_tables.shape == (1, 48)
+    assert sliding.block_tables[0, :4].tolist() == [101, 102, 103, 104]
+    assert torch.count_nonzero(sliding.block_tables[0, 4:]) == 0
+    assert sliding.seq_lens.shape == (1, 1)
+    assert sliding.seq_lens.tolist() == [[2473]]
+    assert sliding.attn_masks.shape == (1, 1, 1, 8, 49152)
+    assert torch.count_nonzero(sliding.attn_masks[0, 0, 0, 0, :426]) == 0
+    assert torch.all(sliding.attn_masks[0, 0, 0, 0, 426:2474] == 1)
+    assert torch.count_nonzero(sliding.attn_masks[0, 0, 0, 0, 2474:]) == 0
+    # The full-attention layer must retain its original 48-partition geometry.
+    assert per_layer["layer.full"] is metadata
+    assert metadata.block_tables.shape == (1, 48)
+    assert metadata.seq_lens.shape == (1, 1)
+    assert metadata.seq_lens.tolist() == [[3497]]
+    assert metadata.attn_masks.shape[-1] == 49152
+
+
+@pytest.mark.parametrize(
+    "kernel", [flash_attention_naive_prefill, flash_attention_naive_decode]
+)
+def test_noncausal_flash_kernel_derives_each_partition_offset(kernel) -> None:
+    source = inspect.getsource(kernel.fn)
+
+    # The compiler expands the raw absolute position into one bounded length
+    # per partition. Preserve that maximum on the dynamic index so load/store
+    # shape inference cannot grow past the physical cache partition.
+    assert "to_dynamic_index(SP_block_ptr, P)" in source
 
 
 def test_context_kv_projection_graph_does_not_take_cache_input() -> None:
@@ -147,6 +516,59 @@ def test_context_kv_store_uses_one_batched_copy_and_preserves_sentinels(
         assert torch.count_nonzero(cache[:, 2, :, 0, 12:, :] != 7.5) == 0
 
 
+def test_context_kv_run_uses_exact_shape_and_preserves_sentinels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    num_heads, head_dim, hidden_size, run_len = 2, 4, 8, 3
+    rotary = SimpleNamespace(
+        cos_cache=torch.randn(16, head_dim),
+        sin_cache=torch.randn(16, head_dim),
+    )
+    cache = torch.full((2, 2, num_heads, 1, 16, head_dim), 7.5)
+    model = SimpleNamespace(
+        layers=[SimpleNamespace(self_attn=SimpleNamespace(rotary_emb=rotary))],
+        _fused_kv_weight=torch.empty(2 * num_heads * head_dim, hidden_size),
+        _fused_kv_bias=None,
+        _num_kv_heads=num_heads,
+        _head_dim=head_dim,
+        _attn_layers=[SimpleNamespace(kv_cache=cache)],
+    )
+    helper = _ContextKVPrecompute(model)
+    helper._group_runs = {0: (_ContextKVRun(0, run_len, 1, 5, 0),)}
+    helper._layer_group = {0: 0}
+    graph_input_shapes: list[tuple[torch.Size, ...]] = []
+
+    def projection_graph(*inputs: torch.Tensor):
+        graph_input_shapes.append(tuple(tensor.shape for tensor in inputs))
+        output = torch.arange(num_heads * run_len * head_dim, dtype=torch.float32).view(
+            num_heads, run_len, head_dim
+        )
+        return output, output + 1
+
+    monkeypatch.setattr(helper, "_get_graph", lambda _layer, _length: projection_graph)
+
+    helper.run(
+        torch.randn(run_len, hidden_size),
+        torch.arange(run_len),
+        torch.tensor(1),
+    )
+
+    assert graph_input_shapes == [
+        (
+            torch.Size([run_len, hidden_size]),
+            torch.Size([run_len, head_dim]),
+            torch.Size([run_len, head_dim]),
+        )
+    ]
+    expected = torch.arange(num_heads * run_len * head_dim, dtype=torch.float32).view(
+        num_heads, run_len, head_dim
+    )
+    torch.testing.assert_close(cache[0, 1, :, 0, 5:8, :], expected)
+    torch.testing.assert_close(cache[1, 1, :, 0, 5:8, :], expected + 1)
+    assert torch.count_nonzero(cache[:, 1, :, 0, :5, :] != 7.5) == 0
+    assert torch.count_nonzero(cache[:, 1, :, 0, 8:, :] != 7.5) == 0
+
+
 def test_runtime_input_binding_cache_reuses_seen_layer_bindings() -> None:
     bindings = _RuntimeInputBindingCache(dynamic_input_indices=(0, 3))
     layer0 = (10, 11, 12, 13)
@@ -187,6 +609,9 @@ def test_runtime_input_binding_cache_executes_minimal_prepare_and_patch() -> Non
         def update_input_addr(self, index, addresses) -> None:
             events.append(("patch", index, addresses))
 
+        def prepare_outputs(self, device_outputs, cpu_outputs) -> None:
+            events.append(("prepare_outputs", device_outputs, cpu_outputs))
+
         def end_io_patch_batch(self) -> None:
             events.append(("end",))
 
@@ -200,11 +625,13 @@ def test_runtime_input_binding_cache_executes_minimal_prepare_and_patch() -> Non
     bindings = _RuntimeInputBindingCache(dynamic_input_indices=(0, 3))
     bindings.observe((10, 11, 12, 13))
     bindings.observe((10, 21, 22, 13))
+    output = torch.empty(1)
 
     reused = bindings.execute(
         runtime,
         (10, 11, 12, 13),
         get_device_addrs=lambda pointer: [pointer + 1000],
+        outputs=[output],
     )
 
     assert reused is True
@@ -213,10 +640,26 @@ def test_runtime_input_binding_cache_executes_minimal_prepare_and_patch() -> Non
         ("prepare", {0: 10, 3: 13}, {}),
         ("patch", 1, [1011]),
         ("patch", 2, [1012]),
+        ("prepare_outputs", {}, {0: output.data_ptr()}),
         ("end",),
         ("run",),
         ("reports",),
     ]
+
+
+def test_runtime_input_binding_cache_falls_back_for_non_sequence_outputs() -> None:
+    bindings = _RuntimeInputBindingCache(dynamic_input_indices=())
+    bindings.observe((10,))
+
+    assert (
+        bindings.execute(
+            SimpleNamespace(),
+            (10,),
+            get_device_addrs=lambda pointer: [pointer],
+            outputs=torch.empty(()),
+        )
+        is False
+    )
 
 
 def test_runtime_input_binding_cache_retries_patch_after_one_time_prepare() -> None:
@@ -239,6 +682,9 @@ def test_runtime_input_binding_cache_retries_patch_after_one_time_prepare() -> N
                     "INIT_INTERNAL (addrs.size() <= rbln_slot.device_allocs().size())"
                 )
 
+        def prepare_outputs(self, device_outputs, cpu_outputs) -> None:
+            events.append(("prepare_outputs", device_outputs, cpu_outputs))
+
         def end_io_patch_batch(self) -> None:
             events.append(("end",))
 
@@ -254,11 +700,13 @@ def test_runtime_input_binding_cache_retries_patch_after_one_time_prepare() -> N
     layer1 = (10, 21, 22, 13)
     bindings.observe(layer0)
     bindings.observe(layer1)
+    output = torch.empty(1)
 
     assert bindings.execute(
         runtime,
         layer0,
         get_device_addrs=lambda pointer: [pointer + 1000],
+        outputs=[output],
     )
     assert ("prepare", {1: 11}, {}) in events
 
@@ -267,12 +715,14 @@ def test_runtime_input_binding_cache_retries_patch_after_one_time_prepare() -> N
         runtime,
         layer1,
         get_device_addrs=lambda pointer: [pointer + 1000],
+        outputs=[output],
     )
     assert events == [
         ("begin",),
         ("prepare", {0: 10, 3: 13}, {}),
         ("patch", 1, [1021]),
         ("patch", 2, [1022]),
+        ("prepare_outputs", {}, {0: output.data_ptr()}),
         ("end",),
         ("run",),
         ("reports",),
@@ -291,6 +741,9 @@ def test_stable_runtime_graph_warms_each_layer_then_reuses_bindings() -> None:
 
         def update_input_addr(self, index, addresses) -> None:
             events.append(("patch", index, addresses))
+
+        def prepare_outputs(self, device_outputs, cpu_outputs) -> None:
+            events.append(("prepare_outputs", device_outputs, cpu_outputs))
 
         def end_io_patch_batch(self) -> None:
             events.append(("end",))
@@ -359,175 +812,8 @@ def test_stable_runtime_graph_warms_each_layer_then_reuses_bindings() -> None:
     assert events[1][0] == "prepare"
     assert events[1][1] == {1: common.data_ptr()}
     assert [event[1] for event in events if event[0] == "patch"] == [0, 2]
+    assert events[-4][0] == "prepare_outputs"
     assert events[-2:] == [("run",), ("reports",)]
-
-
-def test_stable_dynamo_runtime_prepares_metadata_but_reuses_cache_binding() -> None:
-    events: list[tuple] = []
-
-    class Handle:
-        def begin_io_patch_batch(self) -> None:
-            events.append(("begin",))
-
-        def prepare_inputs(self, device_inputs, cpu_inputs) -> None:
-            events.append(("prepare", device_inputs, cpu_inputs))
-
-        def update_input_addr(self, index, addresses) -> None:
-            events.append(("patch", index, addresses))
-
-        def end_io_patch_batch(self) -> None:
-            events.append(("end",))
-
-        def run(self) -> None:
-            events.append(("device_run",))
-
-    original_calls: list[tuple] = []
-
-    def original_run(*inputs, out, **kwargs):
-        original_calls.append(inputs)
-        return [torch.tensor(len(original_calls))]
-
-    runtime = SimpleNamespace(
-        _num_inputs=3,
-        _input_name_to_index={
-            "l_input_ids_": 0,
-            "l_kv_caches_0_": 1,
-            "l_positions_": 2,
-        },
-        _runtime_utils=SimpleNamespace(
-            prepare_inputs=lambda *args, **kwargs: list(args)
-        ),
-        _runtime_handle=Handle(),
-        _capture_reports_if_needed=lambda: events.append(("reports",)),
-        run=original_run,
-    )
-    assert _install_stable_runtime_inputs(
-        runtime,
-        get_device_addrs=lambda pointer: [pointer + 1000],
-        tensor_is_supported=lambda tensor: True,
-    )
-    input_ids, cache, positions = torch.empty(1), torch.empty(2), torch.empty(3)
-
-    first = runtime.run(input_ids, cache, positions, out=None)
-    reused = runtime.run(input_ids, cache, positions, out=None)
-
-    assert first is reused
-    assert len(original_calls) == 1
-    prepare = next(event for event in events if event[0] == "prepare")
-    assert prepare[1] == {0: input_ids.data_ptr(), 2: positions.data_ptr()}
-    assert all(event[0] != "patch" for event in events)
-    assert events[-2:] == [("device_run",), ("reports",)]
-
-
-def test_stable_dynamo_runtime_treats_unknown_metadata_as_dynamic() -> None:
-    prepared: list[dict[int, int]] = []
-
-    class Handle:
-        def begin_io_patch_batch(self) -> None:
-            pass
-
-        def prepare_inputs(self, device_inputs, cpu_inputs) -> None:
-            prepared.append(device_inputs)
-
-        def end_io_patch_batch(self) -> None:
-            pass
-
-        def run(self) -> None:
-            pass
-
-    def original_run(*inputs, out, **kwargs):
-        return [torch.tensor(1)]
-
-    runtime = SimpleNamespace(
-        _input_name_to_index={
-            "l_input_ids_": 0,
-            "l_kv_caches_0_": 1,
-            "l_slot_mapping_": 2,
-        },
-        _runtime_utils=SimpleNamespace(
-            prepare_inputs=lambda *args, **kwargs: list(args)
-        ),
-        _runtime_handle=Handle(),
-        run=original_run,
-    )
-    assert _install_stable_runtime_inputs(
-        runtime,
-        get_device_addrs=lambda pointer: [pointer + 1000],
-        tensor_is_supported=lambda tensor: True,
-    )
-    input_ids, cache, slot_mapping = torch.empty(1), torch.empty(2), torch.empty(3)
-
-    runtime.run(input_ids, cache, slot_mapping, out=None)
-    runtime.run(input_ids, cache, slot_mapping, out=None)
-
-    assert prepared == [{0: input_ids.data_ptr(), 2: slot_mapping.data_ptr()}]
-
-
-def test_stable_dynamo_runtime_detects_generic_rank6_kv_cache() -> None:
-    prepared: list[dict[int, int]] = []
-
-    class Handle:
-        def begin_io_patch_batch(self) -> None:
-            pass
-
-        def prepare_inputs(self, device_inputs, cpu_inputs) -> None:
-            prepared.append(device_inputs)
-
-        def end_io_patch_batch(self) -> None:
-            pass
-
-        def run(self) -> None:
-            pass
-
-    def original_run(*inputs, out, **kwargs):
-        return [torch.tensor(1)]
-
-    runtime = SimpleNamespace(
-        _input_name_to_index={"args_0": 0, "args_1": 1, "args_2": 2},
-        _input_profile=[
-            SimpleNamespace(shape=(1, 8)),
-            SimpleNamespace(shape=(2, 62, 8, 1, 1024, 128)),
-            SimpleNamespace(shape=(1,)),
-        ],
-        _runtime_utils=SimpleNamespace(
-            prepare_inputs=lambda *args, **kwargs: list(args)
-        ),
-        _runtime_handle=Handle(),
-        run=original_run,
-    )
-    assert _install_stable_runtime_inputs(
-        runtime,
-        get_device_addrs=lambda pointer: [pointer + 1000],
-        tensor_is_supported=lambda tensor: True,
-    )
-    input_ids, cache, slots = torch.empty(1), torch.empty(2), torch.empty(3)
-
-    runtime.run(input_ids, cache, slots, out=None)
-    runtime.run(input_ids, cache, slots, out=None)
-
-    assert prepared == [{0: input_ids.data_ptr(), 2: slots.data_ptr()}]
-
-
-def test_dflash_forward_graph_installs_runtime_reuse_after_compile() -> None:
-    def make_runtime():
-        return SimpleNamespace(
-            _input_name_to_index={"l_kv_caches_0_": 0},
-            _runtime_utils=SimpleNamespace(),
-            _runtime_handle=SimpleNamespace(),
-            run=lambda *args, **kwargs: None,
-        )
-
-    runtimes = [make_runtime(), make_runtime()]
-    runtime_holder: list = []
-
-    def compiled(value):
-        runtime_holder.extend(runtimes)
-        return value + 1
-
-    graph = _DFlashForwardGraph(compiled, runtime_holder)
-
-    assert graph(4) == 5
-    assert all(runtime._rbln_dflash_stable_inputs is not None for runtime in runtimes)
 
 
 def _coordinates(
@@ -547,7 +833,7 @@ def _covered_token_indices(runs: tuple[_ContextKVRun, ...]) -> list[int]:
     ]
 
 
-@pytest.mark.parametrize("length", [8, 64, 512])
+@pytest.mark.parametrize("length", [8, 64, 506])
 def test_plan_context_kv_runs_keeps_within_block_inputs_maximal(length: int) -> None:
     blocks, offsets = _coordinates(start_block=3, offset=16, length=length)
 
@@ -559,6 +845,27 @@ def test_plan_context_kv_runs_keeps_within_block_inputs_maximal(length: int) -> 
     )
 
     assert runs == (_ContextKVRun(0, length, 3, 16, 7),)
+    assert _covered_token_indices(runs) == list(range(length))
+
+
+@pytest.mark.parametrize(
+    ("length", "expected_counts"),
+    [(507, (506, 1)), (512, (506, 6))],
+)
+def test_plan_context_kv_runs_caps_verified_projection_profile(
+    length: int, expected_counts: tuple[int, ...]
+) -> None:
+    blocks, offsets = _coordinates(start_block=3, offset=16, length=length)
+
+    runs = _plan_context_kv_runs(
+        blocks,
+        offsets,
+        request_ids=torch.zeros(length, dtype=torch.int64),
+        group_id=7,
+    )
+
+    assert tuple(run.token_count for run in runs) == expected_counts
+    assert tuple(run.block_offset for run in runs) == (16, 522)
     assert _covered_token_indices(runs) == list(range(length))
 
 
@@ -631,6 +938,57 @@ def test_scheduler_batch_resolves_request_and_physical_block_runs() -> None:
         _ContextKVRun(8, 13, 8, 31, 0),
     )
     assert layer_group == {layer_idx: 0 for layer_idx in range(5)}
+
+
+@pytest.mark.parametrize(
+    ("seq_len", "chunk_len", "expected"),
+    [
+        (
+            512,
+            512,
+            (
+                _ContextKVRun(0, 506, 3, 0, 0),
+                _ContextKVRun(506, 6, 3, 506, 0),
+            ),
+        ),
+        (
+            1024,
+            512,
+            (
+                _ContextKVRun(0, 506, 3, 512, 0),
+                _ContextKVRun(506, 6, 3, 1018, 0),
+            ),
+        ),
+        (1135, 111, (_ContextKVRun(0, 111, 4, 0, 0),)),
+    ],
+)
+def test_scheduler_repeated_prefill_chunks_keep_absolute_cache_offsets(
+    seq_len: int,
+    chunk_len: int,
+    expected: tuple[_ContextKVRun, ...],
+) -> None:
+    proposer = SimpleNamespace(
+        runner=SimpleNamespace(cache_config=SimpleNamespace(block_size=1024)),
+        _dflash_num_context=chunk_len,
+    )
+    cad = SimpleNamespace(
+        num_reqs=1,
+        query_start_loc_cpu=torch.tensor([0, chunk_len], dtype=torch.int32),
+        _seq_lens_cpu=torch.tensor([seq_len], dtype=torch.int32),
+        block_table_tensor=torch.tensor([[3, 4, 5]], dtype=torch.int32),
+    )
+    group = SimpleNamespace(layer_names=[f"layer.{i}" for i in range(5)])
+    metadata = SimpleNamespace(local_block_tables=None, cache_seq_lens=None)
+
+    group_slots, layer_group, request_ids = RBLNDFlashProposer._resolve_group_slots(
+        proposer, [(group, metadata)], cad
+    )
+    helper = _ContextKVPrecompute(
+        SimpleNamespace(_fused_kv_weight=torch.empty(16, 32), _head_dim=4)
+    )
+    helper.set_group_slots(group_slots, layer_group, request_ids)
+
+    assert helper._group_runs[0] == expected
 
 
 def test_run_planner_drives_cpu_kv_scatter_bit_exactly() -> None:

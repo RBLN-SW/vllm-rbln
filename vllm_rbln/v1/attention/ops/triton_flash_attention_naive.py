@@ -113,7 +113,7 @@ def flash_attention_naive_prefill(
                 order=(1, 0),
             )
             block_number = rblib.to_dynamic_index(BT_block_ptr)
-            block_offset = rblib.to_dynamic_index(SP_block_ptr)
+            block_offset = rblib.to_dynamic_index(SP_block_ptr, P)
             block_number = block_number.cast(tl.int32)
             block_offset = block_offset.cast(tl.int32)
 
@@ -277,7 +277,7 @@ def flash_attention_naive_decode(
                 order=(1, 0),
             )
             block_number = rblib.to_dynamic_index(BT_block_ptr)
-            block_offset = rblib.to_dynamic_index(SP_block_ptr)
+            block_offset = rblib.to_dynamic_index(SP_block_ptr, P)
             block_number = block_number.cast(tl.int32)
             block_offset = block_offset.cast(tl.int32)
 

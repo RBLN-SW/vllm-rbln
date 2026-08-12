@@ -93,6 +93,10 @@ class TestCompileOptions:
         assert opts["num_devices"] == 4
         assert opts["model_trace_method"] == "trace"
 
+    def test_forwards_static_output_option(self, captured_compile):
+        compile(object(), use_static_output=True)
+        assert captured_compile["options"]["use_static_output"] is True
+
     def test_runtime_holder_uses_underscore_key(self, captured_compile):
         # runtime_holder maps to the "_runtime_holder" option key.
         holder: list = []
