@@ -383,8 +383,6 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         output_token_ids = torch.full(
             (batch_size, max_spec_len + 1),
             PLACEHOLDER_TOKEN_ID,
-            # int32 all the way through: the ops return int32, and it is what
-            # `SamplerOutput.sampled_token_ids` carries.
             dtype=torch.int32,
             device=device,
         )
