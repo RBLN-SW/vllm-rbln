@@ -1,5 +1,3 @@
-# vllm-rbln PR pre-test gate (Obedients / Buildkite).
-
 notify:
   - github_commit_status:
       context: "[OB] vllm-rbln PR CI"
@@ -33,22 +31,22 @@ steps:
   # Both gates must pass before the heavy test pipelines are even uploaded.
   - wait: ~
 
-  - group: ":one: type 1 tests"
-    key: "type1"
+  - group: ":gear: optimum tests"
+    key: "optimum"
     steps:
-      - label: ":sparkles: upload type1-pr"
+      - label: ":sparkles: upload optimum-pr"
         checkout:
           sparse:
             paths:
               - .buildkite
-        command: "buildkite-agent pipeline upload .buildkite/pipelines/type1-pr/pipeline.yml"
+        command: "buildkite-agent pipeline upload .buildkite/pipelines/optimum-pr/pipeline.yml"
 
-  - group: ":two: type 2 tests"
-    key: "type2"
+  - group: ":snake: native tests"
+    key: "native"
     steps:
-      - label: ":sparkles: upload type2-pr"
+      - label: ":sparkles: upload native-pr"
         checkout:
           sparse:
             paths:
               - .buildkite
-        command: "buildkite-agent pipeline upload .buildkite/pipelines/type2-pr/pipeline.yml"
+        command: "buildkite-agent pipeline upload .buildkite/pipelines/native-pr/pipeline.yml"
