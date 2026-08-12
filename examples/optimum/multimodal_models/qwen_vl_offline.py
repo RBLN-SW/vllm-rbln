@@ -191,24 +191,28 @@ def generate_prompts_wo_processing(batch_size: int, model: str):
 
 def main(
     num_input_prompt: int = 1,
-    # NOTE: This example supports Qwen2-VL, Qwen2.5-VL, and Qwen3-VL.
+    # NOTE: This example supports Qwen2-VL, Qwen2.5-VL, Qwen3-VL and Qwen3.5
     model: str = "Qwen/Qwen3-VL-2B-Instruct",
+    max_num_seqs: int = 1,
+    max_model_len: int = 262144,
+    num_devices: int = 8,
+    block_size: int = 16384,
+    vision_max_seq_len: int = 4096,
+    vision_num_devices: int = 8,
 ):
-    # number of devices per local rank for main module
-    os.environ["VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK"] = "16"
+    os.environ["VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK"] = str(num_devices)
+    rbln_config = {
+        "visual": {
+            "max_seq_len": vision_max_seq_len,
+            "num_devices": vision_num_devices,
+        },
+    }
     llm = LLM(
         model=model,
-        block_size=4096,
-        max_model_len=8192,
-        max_num_seqs=1,
-        additional_config={
-            "rbln_config": {
-                "device": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
-                "visual": {
-                    "device": [16],
-                },
-            }
-        },
+        block_size=block_size,
+        max_model_len=max_model_len,
+        max_num_seqs=max_num_seqs,
+        additional_config={"rbln_config": rbln_config},
     )
     tokenizer = AutoTokenizer.from_pretrained(model)
     inputs = generate_prompts_image(num_input_prompt, model)

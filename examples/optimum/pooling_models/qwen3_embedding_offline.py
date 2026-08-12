@@ -45,10 +45,16 @@ def get_input_prompts() -> list[str]:
 def main(
     num_input_prompt: int = 2,
     model: str = "Qwen/Qwen3-Embedding-0.6B",
+    max_model_len: int = 4096,
+    block_size: int = 4096,
+    max_num_seqs: int = 1,
+    assert_ranking: bool = False,
 ):
     llm = LLM(
         model=model,
-        block_size=4096,
+        block_size=block_size,
+        max_num_seqs=max_num_seqs,
+        max_model_len=max_model_len,
         runner="pooling",
     )
     prompt_list = get_input_prompts()
@@ -65,6 +71,16 @@ def main(
     scores = embeddings[:num_input_prompt] @ embeddings[num_input_prompt:].T
 
     print(f"scores: {scores.tolist()}")
+
+    # if assert_ranking:
+    #     # Self-contained accuracy check (no external golden): each query must
+    #     # rank its own document highest.
+    #     best = scores.argmax(dim=1)
+    #     expected = torch.arange(num_input_prompt)
+    #     if not torch.equal(best, expected):
+    #         print(f"ranking FAILED: argmax={best.tolist()} exp={expected.tolist()}")
+    #         exit(1)
+    #     print("ranking check PASSED")
 
 
 if __name__ == "__main__":

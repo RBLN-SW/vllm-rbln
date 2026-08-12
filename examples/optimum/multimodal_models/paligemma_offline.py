@@ -45,9 +45,23 @@ def generate_prompts(batch_size: int):
 def main(
     num_input_prompt: int = 10,
     model: str = "google/paligemma2-3b-pt-224",
+    max_num_seqs: int = 1,
+    max_model_len: int = 8192,
+    block_size: int = None,  # if None, will be set to max_model_len
+    num_devices: int = 4,
 ):
-    os.environ["VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK"] = "4"
-    llm = LLM(model=model, block_size=8192, max_model_len=8192)
+    # Compile shape follows the rebel_compiler multi-modal compile.py pattern:
+    # num_devices → env var, batch_size / max_seq_len → additional_config
+    # ["rbln_config"]; block_size stays a top-level vLLM kwarg.
+    os.environ["VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK"] = str(num_devices)
+    if block_size is None:
+        block_size = max_model_len
+    llm = LLM(
+        model=model,
+        block_size=block_size,
+        max_num_seqs=max_num_seqs,
+        max_model_len=max_model_len,
+    )
     tokenizer = AutoTokenizer.from_pretrained(model)
     inputs = generate_prompts(num_input_prompt)
 
