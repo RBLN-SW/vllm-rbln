@@ -70,34 +70,50 @@ class RblnNixlConnectorScheduler(NixlPullConnectorScheduler):
         if self._reqs_need_save:
             # NOTE: For the prefill side, there might be a chance that an early added
             # request is a chunked prefill, so we need to check if new blocks are added
-            for req_id, new_block_id_groups, _ in yield_req_data(scheduler_output):
+            for req_id, new_block_id_groups, resumed in yield_req_data(
+                scheduler_output
+            ):
                 req_to_save = self._reqs_need_save.get(req_id)
                 if req_to_save is None:
                     continue
-
-                # NOTE(RBLN): RBLN allocates the whole prefill blocks at once
-                # and does not resume prefill requests in P/D disaggregation scenario.
-                # save_to_host path will be deprecated in the future.
-                has_block_ids_to_save = req_id in self._block_ids_need_save
-                has_new_block_ids = new_block_id_groups is not None
-                assert has_block_ids_to_save ^ has_new_block_ids
-
-                if has_new_block_ids:
-                    self._block_ids_need_save[req_id] = new_block_id_groups
 
                 req = req_to_save
 
                 assert req.kv_transfer_params is not None
                 assert scheduler_output.num_scheduled_tokens is not None
                 num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
+
+                has_block_ids_to_save = req_id in self._block_ids_need_save
+                has_new_block_ids = new_block_id_groups is not None
+                # Blocks follow the chunks, so the closing one often adds none.
+                # Neither side holding any would stage a prefill without its KV.
+                assert has_block_ids_to_save or has_new_block_ids, (
+                    "RBLN host-bounce save path reached with no blocks: "
+                    f"req_id={req_id} resumed={resumed} "
+                    f"num_computed={req.num_computed_tokens} "
+                    f"num_prompt={req.num_prompt_tokens} "
+                    f"num_scheduled={num_scheduled_tokens}"
+                )
+
+                if has_new_block_ids:
+                    if resumed or not has_block_ids_to_save:
+                        # A resumed request re-sends its full block list, not a
+                        # delta, so appending would double-count.
+                        self._block_ids_need_save[req_id] = tuple(
+                            list(group) for group in new_block_id_groups
+                        )
+                    else:
+                        for stored_group, new_group in zip(
+                            self._block_ids_need_save[req_id], new_block_id_groups
+                        ):
+                            stored_group.extend(new_group)
                 is_partial = (
                     req.num_computed_tokens + num_scheduled_tokens
                 ) < req.num_prompt_tokens
 
                 if not is_partial:
-                    new_block_id_groups = self._block_ids_need_save.pop(req_id)
                     clipped_block_id_groups = self.get_sw_clipped_blocks(
-                        new_block_id_groups
+                        self._block_ids_need_save.pop(req_id)
                     )
                     meta.add_new_req_to_save(
                         request_id=req_id,
