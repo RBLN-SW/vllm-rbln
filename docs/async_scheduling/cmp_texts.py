@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """Compare arms by generated text: same prompt in, same text out?
 
-This is the correctness check that applies to async scheduling. Async does not
-emit logprobs, so the executor's golden Pearsonr is structurally absent for it,
-and the gate is blind to the defect anyway - sync and schedonly both score
-0.99566 against the golden while schedonly fails the determinism check.
+One of two correctness checks worth running on async scheduling, and the one
+that needs no reference run: same prompt in, same text out. The other is the
+executor's native golden, which async does reach now that it carries logprobs
+through the deferred output.
+
+Neither replaces the other. Comparing the arms to each other cannot see a defect
+in the sampler they share - measured: a bad runtime patch left both arms corrupt
+and agreeing 32/32, while the text had moved 30k characters from a known-good
+build. Compare against something that did not run the same code.
 
 Reads the outputs.json that ab_throughput.sh lifts out of the run cache
 (<arm>_r<N>.outputs.json). Entries are joined on the prompt string, never on

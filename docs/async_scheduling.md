@@ -20,12 +20,16 @@ Line numbers are hints — symbols are the stable reference.
 
 | want | how |
 |---|---|
-| async (schedule-ahead) | nothing — vLLM turns `scheduler_config.async_scheduling` on by default for generation models |
-| sync | `VLLM_RBLN_DISABLE_ASYNC=1` |
+| async (schedule-ahead) | `--async-scheduling` |
+| sync | nothing — the executor defaults to `--no-async-scheduling` |
+
+vLLM's own default is the other way round: an unset value resolves to async for
+any model it deems compatible (`vllm/config/vllm.py:964`). The executor pins it
+instead, so a result always records which mode produced it.
 
 `scheduler_config.async_scheduling` is the single field that decides everything: the
 scheduler class, the engine's batch queue, and the runner's output path.
-`vllm_rbln/platform.py:256-258` is the kill switch; `:303-317` picks the class from the
+`:303-317` picks the class from the
 same field. vLLM's own `--async-scheduling` sets that field too, so the two compose. The
 optimum path forces it off (`platform.py:376-380`).
 

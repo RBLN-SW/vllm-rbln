@@ -464,20 +464,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             else:
                 self.effective_drafter_max_model_len = self.max_model_len
 
-        self.use_async_scheduling = self.scheduler_config.async_scheduling
-        # Diagnostic: async_scheduling switches two things at once - the
-        # scheduler class and this runner's output path - so a failure cannot be
-        # attributed to either. This splits them; ab_throughput.sh drives its
-        # schedonly and runneronly arms with it. 1 forces the async output path
-        # on, 0 off, unset keeps the scheduler's choice.
-        _runner_override = os.environ.get("VLLM_RBLN_ASYNC_RUNNER")
-        if _runner_override is not None:
-            self.use_async_scheduling = _runner_override == "1"
-            logger.info(
-                "[varsplit] scheduler async=%s, runner async=%s",
-                self.scheduler_config.async_scheduling,
-                self.use_async_scheduling,
-            )
+        # bool(), not the field itself: vLLM resolves an unset value to True or
+        # False before this runs (config/vllm.py:964), but a config built
+        # directly - a unit test, say - can still carry None, and None here
+        # would silently mean sync while reading as "not configured".
+        self.use_async_scheduling = bool(self.scheduler_config.async_scheduling)
 
         # Request states.
         self.requests: dict[str, CachedRequestState] = {}
@@ -1814,7 +1805,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             if _SIG_DIR and not self.is_prefill:
                 # The tokens actually about to be fed, captured at the one point
                 # both arms reach: async has just scattered prev_sampled here,
-                # sync/schedonly left the scheduler's staging alone. Diffing this
+                # sync left the scheduler's staging alone. Diffing this
                 # row between arms names the first step where they part.
                 #
                 # This reads the device, which the older capture forbade because

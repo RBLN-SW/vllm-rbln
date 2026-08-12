@@ -112,7 +112,7 @@ run() { # $1=name $2=cfgenv $3=round
   local ARGS="vllm-decoderonly gpt-oss -m gpt-oss-120b -ep -dp $DP -rsd 1 \
 -s 131072 --block-size 1024 -pcs 512 -b $eb -nblk 129 \
 --max-tokens $MAXTOK --num-prompts $np --run-iter $RUNITER --cache-ignore \
---cache-results ${EXTRA_ARGS:-} \
+--cache-results ${A:-} ${EXTRA_ARGS:-} \
 ${COMPILED_MODEL_PATH:+--compiled-model-path $COMPILED_MODEL_PATH} \
 -o $OUTDIR/${name}_r${r}.result.json rbln-run"
   echo "=== RUN $name round=$r b=$eb maxtok=$MAXTOK nprompts=$((np * DP)) $(date +%T) ==="
@@ -123,10 +123,12 @@ ${COMPILED_MODEL_PATH:+--compiled-model-path $COMPILED_MODEL_PATH} \
   save_outputs "$name" "$r"
 }
 
-# The only correctness question that applies to async is "same prompt -> same
-# text": async does not emit logprobs, so its Pearsonr against the golden is
-# structurally absent (sync and schedonly do emit them and both score 0.99566,
-# which is precisely why that gate cannot see the async defect).
+# Two correctness questions, and both are worth asking. "Same prompt -> same
+# text" catches a divergence the golden's Pearsonr can miss; the golden catches
+# what comparing the arms to each other cannot, since a defect in the sampler
+# shows up in both and they agree while being wrong together. Async reaches the
+# golden now - it carries its logprobs through the deferred output - so run it
+# at a key the golden covers (b8 + mt256) when the change could touch numbers.
 #
 # result.json is not enough for that comparison - sample_comparison.py stores
 # only rbln_run_text[:128], a preview. --cache-results writes the real
@@ -152,18 +154,16 @@ PY
 CONFIGS=${CONFIGS:-"async sync"}
 for r in $(seq 1 "$ROUNDS"); do
   for cfg in $CONFIGS; do
-    CFG_BATCH=""
+    CFG_BATCH=""; A=""
     case "$cfg" in
-      async) E="" ;;                            # async is the default (see docs section 1)
-      sync)  E="VLLM_RBLN_DISABLE_ASYNC=1" ;;
-      fsync) E="RBLN_RUNTIME_FORCE_SYNC=1" ;;   # async sched + rebel drains after every op
-      # Variable isolation: async_scheduling switches the scheduler class and the
-      # runner's output path together. These split them.
-      schedonly) E="VLLM_RBLN_ASYNC_RUNNER=0" ;;                            # async sched, sync runner
-      runneronly) E="VLLM_RBLN_DISABLE_ASYNC=1 VLLM_RBLN_ASYNC_RUNNER=1" ;;  # sync sched, async runner
-      b1) E=""; CFG_BATCH=1 ;;                  # batch as a config, so arms alternate in time
-      b8) E=""; CFG_BATCH=8 ;;
-      noextcache) E="RBLN_EXTERNAL_ONLY_CACHE_BYTES=0" ;;   # disable rebel ext-ref recon cache
+      # The executor defaults to --no-async-scheduling, so each arm says which
+      # mode it is rather than inheriting vLLM's (async-by-default) resolution.
+      async) E=""; A="--async-scheduling" ;;
+      sync)  E=""; A="" ;;
+      fsync) E="RBLN_RUNTIME_FORCE_SYNC=1"; A="--async-scheduling" ;;  # async sched + rebel drains after every op
+      b1) E=""; A="--async-scheduling"; CFG_BATCH=1 ;;                  # batch as a config, so arms alternate in time
+      b8) E=""; A="--async-scheduling"; CFG_BATCH=8 ;;
+      noextcache) E="RBLN_EXTERNAL_ONLY_CACHE_BYTES=0"; A="--async-scheduling" ;;   # disable rebel ext-ref recon cache
       *) echo "unknown config $cfg"; exit 1 ;;
     esac
     run "$cfg" "$E" "$r"

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Capture a torch/perfetto trace for one config.
 #
-#   ./profile.sh async     # no flag - async scheduling is the default
-#   ./profile.sh sync      # VLLM_RBLN_DISABLE_ASYNC=1
+#   ./profile.sh async     # --async-scheduling
+#   ./profile.sh sync      # nothing - the executor defaults to --no-async-scheduling
 #
 # Keep MAXTOK small: an 8 s run already produces ~4 M events and ~60 MB per rank,
 # and profiling roughly halves throughput - the trace is for structure, never for
@@ -35,8 +35,8 @@ python3 -m vllm_rbln_executor.cli config set local_cache "$LOCAL_CACHE"
 python3 -m vllm_rbln_executor.cli config set hf_home "$HF_HOME_DIR"
 
 case "$CFG" in
-  async) CFGENV="" ;;                        # async is the default (docs section 1)
-  sync)  CFGENV="VLLM_RBLN_DISABLE_ASYNC=1" ;;
+  async) CFGENV=""; CFGARG="--async-scheduling" ;;
+  sync)  CFGENV=""; CFGARG="" ;;
   *) echo "unknown config $CFG (async|sync)"; exit 1 ;;
 esac
 
@@ -61,7 +61,7 @@ PDIR="$OUTDIR/$CFG"; rm -rf "$PDIR"; mkdir -p "$PDIR"
 cleanup
 ARGS="vllm-decoderonly gpt-oss -m gpt-oss-120b -ep -dp $DP -rsd 1 \
 -s 131072 --block-size 1024 -pcs 512 -b $BATCH -nblk 129 \
---max-tokens $MAXTOK --num-prompts $BATCH --run-iter 1 --cache-ignore \
+--max-tokens $MAXTOK --num-prompts $BATCH --run-iter 1 --cache-ignore ${CFGARG:-} \
 ${COMPILED_MODEL_PATH:+--compiled-model-path $COMPILED_MODEL_PATH} \
 --torch-profile --profile-dir $PDIR rbln-run"
 

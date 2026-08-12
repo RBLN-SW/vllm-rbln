@@ -251,18 +251,20 @@ class RblnPlatform(Platform):
         parallel_config = vllm_config.parallel_config
         scheduler_config = vllm_config.scheduler_config
 
-        # scheduler_config.async_scheduling is the single switch: it picks the
-        # scheduler class below and drives the runner's whole output path.
-        # VLLM_RBLN_DISABLE_ASYNC=1 is the RBLN kill switch on top of it.
-        if os.environ.get("VLLM_RBLN_DISABLE_ASYNC") == "1":
-            scheduler_config.async_scheduling = False
-        if os.environ.get("VLLM_RBLN_ASYNC_SCHED") is not None:
-            logger.warning_once(
-                "VLLM_RBLN_ASYNC_SCHED has been removed and is ignored. Async "
-                "scheduling now follows scheduler_config.async_scheduling, which "
-                "is on by default for generation models; use "
-                "VLLM_RBLN_DISABLE_ASYNC=1 to turn it off."
-            )
+        # scheduler_config.async_scheduling is the switch, and vLLM's --async-
+        # scheduling / --no-async-scheduling is how it is set. Nothing is
+        # overridden here on purpose: by the time this hook runs, VllmConfig has
+        # already resolved an unset (None) value to True for anything it deems
+        # compatible, so "the user asked for async" and "the user said nothing"
+        # are indistinguishable from here. An RBLN-side override could only turn
+        # it off, never honour a request to turn it on.
+        for removed in ("VLLM_RBLN_ASYNC_SCHED", "VLLM_RBLN_DISABLE_ASYNC"):
+            if os.environ.get(removed) is not None:
+                logger.warning_once(
+                    "%s has been removed and is ignored. Async scheduling "
+                    "follows vLLM's --async-scheduling / --no-async-scheduling.",
+                    removed,
+                )
 
         if envs.VLLM_RBLN_USE_VLLM_MODEL:
             if vllm_config.lora_config is not None:
@@ -375,6 +377,12 @@ class RblnPlatform(Platform):
                 "vllm_rbln.v1.core.optimum_scheduler.RBLNOptimumScheduler"
             )
             # Optimum model runner doesn't support async scheduling.
+            if scheduler_config.async_scheduling:
+                logger.warning(
+                    "Ignoring --async-scheduling: the optimum model runner does "
+                    "not support it. Running synchronously. Unset "
+                    "VLLM_RBLN_USE_VLLM_MODEL=0 to use the runner that does."
+                )
             scheduler_config.async_scheduling = False
 
             assert vllm_config.parallel_config.tensor_parallel_size == 1, (
