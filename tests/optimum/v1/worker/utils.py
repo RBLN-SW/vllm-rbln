@@ -435,8 +435,8 @@ def get_grammar_bitmask(
     return GrammarOutput(structured_output_request_ids, bitmask)
 
 
-def forward_steps(reqs: list[Request]):
-    runner = create_model_runner(max_num_seqs=4)
+def forward_steps(reqs: list[Request], model_dtype: torch.dtype = torch.float32):
+    runner = create_model_runner(max_num_seqs=4, model_dtype=model_dtype)
     structured_output_manager = StructuredOutputManager(runner.vllm_config)
     requests: dict[str, Request] = {}
     # Prefill

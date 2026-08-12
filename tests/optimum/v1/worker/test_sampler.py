@@ -224,6 +224,43 @@ def test_forward_sampling_parameters(
     forward_steps(reqs)
 
 
+@pytest.mark.parametrize(
+    "model_dtype", [torch.float32, torch.float16], ids=["fp32", "fp16"]
+)
+@pytest.mark.parametrize("min_tokens", [0, 8])
+@pytest.mark.parametrize("temperature", [0.0, 1.0])
+@pytest.mark.parametrize(
+    "use_rbln_sampler", [True, False], ids=["rbln_sampler", "vllm_sampler"]
+)
+def test_forward_min_tokens_in_the_model_dtype(
+    monkeypatch, model_dtype, min_tokens, temperature, use_rbln_sampler
+):
+    """`min_tokens` masking writes into the logits buffer as it is handed over.
+
+    The RBLN sampler hands the processors the model dtype, and the -inf constant
+    is retyped to match once the model is loaded; the vLLM sampler casts to
+    float32 and leaves the constant alone. Both dtypes therefore have to work,
+    and each sampler has to see the constant the other did not take. Masking
+    moves the argmax, so greedy and random both go through it.
+    """
+    monkeypatch.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
+    monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1" if use_rbln_sampler else "0")
+    monkeypatch.setenv("VLLM_RBLN_ENABLE_WARM_UP", "False")
+    reqs = [
+        make_request(
+            request_id=f"req_{i}",
+            prompt_token_ids=[1, 2, 3],
+            # A stop token is what min_tokens masks; without one the processor
+            # holds no indices and never writes.
+            stop_token_ids=[5],
+            min_tokens=min_tokens,
+            temperature=temperature,
+        )
+        for i in range(3)
+    ]
+    forward_steps(reqs, model_dtype=model_dtype)
+
+
 # TODO mix the requests with different sampling parameters
 
 
