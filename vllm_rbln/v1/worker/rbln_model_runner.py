@@ -124,6 +124,7 @@ from vllm_rbln.v1.attention.kv_cache_bindings import (
 from vllm_rbln.v1.core.rbln_kv_cache_manager import KVCacheCopyOp
 from vllm_rbln.v1.core.rbln_scheduler import RBLNSchedulerOutput
 from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
+from vllm_rbln.v1.spec_decode.dflash import RBLNDFlashProposer
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
 from vllm_rbln.v1.worker import mega_cache
@@ -298,6 +299,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 self.drafter = SuffixDecodingProposer(self.vllm_config)
             elif self.speculative_config.method == "medusa":
                 self.drafter = RBLNMedusaProposer(self.vllm_config, self.device)
+            elif self.speculative_config.use_dflash():
+                # Must precede use_eagle(): use_eagle() is also True for dflash.
+                self.drafter = RBLNDFlashProposer(self.vllm_config, self.device, self)
+                self.use_aux_hidden_state_outputs = (
+                    self.drafter.eagle3_use_aux_hidden_state
+                )
             elif self.speculative_config.use_eagle():
                 self.drafter = RBLNEagleProposer(self.vllm_config, self.device, self)
                 if self.speculative_config.method == "eagle3":
@@ -2100,7 +2107,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         if self.speculative_config and self.speculative_config.use_eagle():
             assert isinstance(self.drafter, RBLNEagleProposer)
-            if is_prefill or num_tokens_per_req == 1 + self.num_spec_tokens:
+            # DFlash also needs the query-length-1 decode shape: it inserts
+            # context K/V on no-spec steps too.
+            if (
+                self.speculative_config.use_dflash()
+                or is_prefill
+                or num_tokens_per_req == 1 + self.num_spec_tokens
+            ):
                 self.drafter.dummy_run(
                     num_reqs,
                     num_tokens_per_req,

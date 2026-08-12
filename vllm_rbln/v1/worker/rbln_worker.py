@@ -345,6 +345,10 @@ class RBLNWorker(WorkerBase):
             )
 
             num_draft_runtimes = 1 + decode_batch_buckets_count
+            if getattr(speculative_config, "method", None) == "dflash":
+                # Context-KV insert (prefill + two decode query lengths per
+                # bucket) plus the block forward (one per bucket).
+                num_draft_runtimes = 1 + 3 * decode_batch_buckets_count
             draft_n_model_bytes = 0
 
             for value in draft_model.parameters():

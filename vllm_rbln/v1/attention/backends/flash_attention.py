@@ -113,6 +113,10 @@ class RBLNFlashAttentionMetadata:
     kv_caches: list[torch.Tensor] | None = None
     kv_cache_view_infos: list[KVCacheViewInfo] | None = None
 
+    # Per-call causality override; None falls back to the impl-level
+    # VLLM_RBLN_FLASH_CAUSAL_ATTN setting. Non-causal requires attn_masks.
+    is_causal: bool | None = None
+
     # For sliding window attention
     cache_seq_lens: torch.Tensor | None = None
     cache_offsets: torch.Tensor | None = None
@@ -453,6 +457,12 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         # ex) tensor[block0 : 0, block1 : 100,
         #  block2: 10, block3: 5, ...]
         # attn_output = [batch,H,4,L,D]
+        is_causal = (
+            attn_metadata.is_causal
+            if attn_metadata.is_causal is not None
+            else self.is_causal
+        )
+
         if self.sliding_window is not None:
             assert self.sliding_window == kv_cache.size(-2), (
                 "SWA kernel_block_size must match window_size"
@@ -488,7 +498,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                     self.sinks,
                 )
 
-        elif self.is_causal:
+        elif is_causal:
             if self.is_normal:
                 if attn_metadata.is_prefill:
                     attn_output = causal_attention_naive_prefill(
