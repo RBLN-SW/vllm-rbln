@@ -20,7 +20,6 @@ import torch.nn as nn
 from vllm.config.model import LogprobsMode
 from vllm.sampling_params import _SAMPLING_EPS
 from vllm.v1.outputs import LogprobsTensors, SamplerOutput
-from vllm.v1.sample.logits_processor import MinTokensLogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.logprobs import batched_count_greater_than
 from vllm.v1.sample.sampler import Sampler as VLLMSampler
@@ -212,30 +211,6 @@ class RBLNSampler(VLLMSampler):
             "with a very small temperature value."
         )
         return random_sampled, processed_logprobs
-
-    def apply_logits_processors(
-        self,
-        logits: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
-        predict_bonus_token: bool,
-    ) -> torch.Tensor:
-        # `forward` hands the logits over in the model dtype rather than casting
-        # them to float32, so the constants the builtin processors write into
-        # them have to follow. `MinTokensLogitsProcessor` writes its -inf with
-        # `index_put_`, which rejects a source dtype that differs from the
-        # destination — unlike `__setitem__`, which converts — so a float32
-        # constant raises on a half-precision logits buffer.
-        for processor in sampling_metadata.logitsprocs.all:
-            if (
-                isinstance(processor, MinTokensLogitsProcessor)
-                and processor.neg_inf_tensor.dtype != logits.dtype
-            ):
-                # Built once in the processor's `__init__` and never rebuilt, so
-                # this retype runs at most once per processor.
-                processor.neg_inf_tensor = processor.neg_inf_tensor.to(logits.dtype)
-        return super().apply_logits_processors(
-            logits, sampling_metadata, predict_bonus_token
-        )
 
     def forward(
         self,

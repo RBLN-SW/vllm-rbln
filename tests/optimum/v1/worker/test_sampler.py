@@ -14,6 +14,7 @@
 
 import pytest
 import torch
+from torch._dynamo.testing import CompileCounter
 from vllm.platforms import current_platform
 
 from .utils import (
@@ -224,43 +225,6 @@ def test_forward_sampling_parameters(
     forward_steps(reqs)
 
 
-@pytest.mark.parametrize(
-    "model_dtype", [torch.float32, torch.float16], ids=["fp32", "fp16"]
-)
-@pytest.mark.parametrize("min_tokens", [0, 8])
-@pytest.mark.parametrize("temperature", [0.0, 1.0])
-@pytest.mark.parametrize(
-    "use_rbln_sampler", [True, False], ids=["rbln_sampler", "vllm_sampler"]
-)
-def test_forward_min_tokens_in_the_model_dtype(
-    monkeypatch, model_dtype, min_tokens, temperature, use_rbln_sampler
-):
-    """`min_tokens` masking writes into the logits buffer as it is handed over.
-
-    The RBLN sampler hands the processors the model dtype, and the -inf constant
-    is retyped to match once the model is loaded; the vLLM sampler casts to
-    float32 and leaves the constant alone. Both dtypes therefore have to work,
-    and each sampler has to see the constant the other did not take. Masking
-    moves the argmax, so greedy and random both go through it.
-    """
-    monkeypatch.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
-    monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1" if use_rbln_sampler else "0")
-    monkeypatch.setenv("VLLM_RBLN_ENABLE_WARM_UP", "False")
-    reqs = [
-        make_request(
-            request_id=f"req_{i}",
-            prompt_token_ids=[1, 2, 3],
-            # A stop token is what min_tokens masks; without one the processor
-            # holds no indices and never writes.
-            stop_token_ids=[5],
-            min_tokens=min_tokens,
-            temperature=temperature,
-        )
-        for i in range(3)
-    ]
-    forward_steps(reqs, model_dtype=model_dtype)
-
-
 # TODO mix the requests with different sampling parameters
 
 
@@ -362,35 +326,31 @@ def test_no_nan_logits_with_padded_bucket(
     assert_no_nan_in_pooled(output)
 
 
-def test_sampler_logits_reshape_keeps_shape_and_stride_stable(monkeypatch):
+def test_sampler_logits_reshape_prevents_torch_compile_recompile(monkeypatch):
     """
-    Test to ensure that the sampler always receives the same shape and stride
-    even when `compute_logits` returns logits with different strides.
+    Test to ensure that the sampler does not recompile
+    when `compute_logits` returns logits with different strides.
 
-    The sampler ops are compiled for the RBLN device, and dynamo guards on
-    stride, so a varying stride would recompile them on every other step. This
-    test forces `compute_logits` to alternate strides while keeping
-    batch_size=1, and asserts the reshape in `sample_tokens` absorbs it.
+    This test forces `compute_logits` to return logits with different strides
+    while keeping batch_size=1, and asserts the sampler compiles only once.
     """
 
     monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1")
     monkeypatch.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
     monkeypatch.setenv("VLLM_RBLN_ENABLE_WARM_UP", "False")
+    monkeypatch.setenv("TORCH_LOGS", "recompiles")
+
+    compile_counter = CompileCounter()
+    real_torch_compile = torch.compile
+
+    def torch_compile_with_counter(fn, *args, **kwargs):
+        kwargs.setdefault("backend", compile_counter)
+        return real_torch_compile(fn, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "compile", torch_compile_with_counter)
 
     # Keep max_num_seqs=1 so we always take the non-padding path.
     runner = create_model_runner(max_num_seqs=1)
-
-    # Record what the sampler is actually handed on each step. Patch `forward`
-    # rather than the module itself: the runner also reaches the sampler for
-    # `compute_logprobs` / `gather_logprobs`.
-    seen: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
-    real_forward = runner.sampler.forward
-
-    def recording_forward(logits, sampling_metadata, *args, **kwargs):
-        seen.append((tuple(logits.shape), tuple(logits.stride())))
-        return real_forward(logits, sampling_metadata, *args, **kwargs)
-
-    monkeypatch.setattr(runner.sampler, "forward", recording_forward)
 
     # Alternate logits rank across steps.
     call_count = 0
@@ -418,62 +378,15 @@ def test_sampler_logits_reshape_keeps_shape_and_stride_stable(monkeypatch):
         runner.execute_model(scheduler_output)
         _ = runner.sample_tokens(grammar_output=None)
 
-    # 1st iter: stride-changed logits. 2nd iter: normal-stride logits.
+    # 1st iter: stride-changed logits — initial compilation happens here.
     run_step(0)
+    baseline_frames = compile_counter.frame_count
+    assert baseline_frames > 0, "sampler should have been compiled on the first call"
+
+    # 2nd iter: normal-stride logits — reshape in sample_tokens should keep the
+    # sampler input shape/stride identical, so no recompilation should occur.
     run_step(1)
-
-    assert len(seen) == 2, f"sampler should have run once per step, got {seen}"
-    assert seen[0] == seen[1], (
-        f"sampler input changed across stride change: {seen[0]} -> {seen[1]}"
-    )
-
-
-def test_min_tokens_masks_stop_tokens_in_half_precision_logits(monkeypatch):
-    """
-    RBLNSampler hands the logits to the logits processors in the model dtype
-    instead of casting them to float32, so a half-precision model produces a
-    half-precision logits buffer. MinTokensLogitsProcessor writes its -inf
-    constant with `index_put_`, which requires the source dtype to match the
-    destination exactly, so a float32 constant raises on that buffer.
-    """
-
-    monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1")
-    monkeypatch.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
-    monkeypatch.setenv("VLLM_RBLN_ENABLE_WARM_UP", "False")
-
-    stop_token_id = 5
-    runner = create_model_runner(max_num_seqs=1, model_dtype=torch.float16)
-
-    # Hold on to the tensor the sampler is handed: the logits processors mutate
-    # it in place, so it carries the mask once the step is over.
-    seen_logits: list[torch.Tensor] = []
-    real_forward = runner.sampler.forward
-
-    def recording_forward(logits, *args, **kwargs):
-        seen_logits.append(logits)
-        return real_forward(logits, *args, **kwargs)
-
-    monkeypatch.setattr(runner.sampler, "forward", recording_forward)
-
-    req = make_request(
-        request_id="req_0",
-        prompt_token_ids=[1, 2, 3],
-        min_tokens=8,
-        stop_token_ids=[stop_token_id],
-    )
-    scheduler_output = _schedule_new_request_from_request(
-        req, block_ids=([0],), outer_block_ids=[0]
-    )
-    runner.execute_model(scheduler_output)
-    assert runner.sample_tokens(grammar_output=None) is not None
-
-    assert len(seen_logits) == 1
-    logits = seen_logits[0]
-    assert logits.dtype == torch.float16, (
-        f"sampler should keep the model dtype, got {logits.dtype}"
-    )
-    # The request has produced no output token yet, so it is short of its
-    # min_tokens and its stop token must be inhibited.
-    assert logits[0, stop_token_id] == -float("inf"), (
-        "min_tokens did not mask the stop token"
+    assert compile_counter.frame_count == baseline_frames, (
+        f"sampler recompiled across stride change: "
+        f"{baseline_frames} -> {compile_counter.frame_count}"
     )
