@@ -19,6 +19,7 @@
 import torch
 
 from vllm_rbln import envs
+from vllm_rbln.custom_ops import custom_op, register_fake
 
 
 def _fake_mla_output(q: torch.Tensor, kv_c_normed: torch.Tensor) -> torch.Tensor:
@@ -30,7 +31,7 @@ def _fake_mla_output(q: torch.Tensor, kv_c_normed: torch.Tensor) -> torch.Tensor
     )
 
 
-@torch.library.custom_op(
+@custom_op(
     "rbln_custom_ops::paged_flash_causal_mla_naive_prefill",
     mutates_args=["kv_cache"],
 )
@@ -46,12 +47,12 @@ def paged_flash_causal_mla_naive_prefill_impl(
     return _fake_mla_output(q, kv_c_normed)
 
 
-@torch.library.register_fake("rbln_custom_ops::paged_flash_causal_mla_naive_prefill")
+@register_fake("rbln_custom_ops::paged_flash_causal_mla_naive_prefill")
 def _(q, kv_c_normed, k_pe, kv_cache, seq_idx, block_tables, scale):
     return _fake_mla_output(q, kv_c_normed)
 
 
-@torch.library.custom_op(
+@custom_op(
     "rbln_custom_ops::paged_flash_causal_mla_naive_decode",
     mutates_args=["kv_cache"],
 )
@@ -67,7 +68,7 @@ def paged_flash_causal_mla_naive_decode_impl(
     return _fake_mla_output(q, kv_c_normed)
 
 
-@torch.library.register_fake("rbln_custom_ops::paged_flash_causal_mla_naive_decode")
+@register_fake("rbln_custom_ops::paged_flash_causal_mla_naive_decode")
 def _(q, kv_c_normed, k_pe, kv_cache, seq_idx, block_tables, scale):
     return _fake_mla_output(q, kv_c_normed)
 

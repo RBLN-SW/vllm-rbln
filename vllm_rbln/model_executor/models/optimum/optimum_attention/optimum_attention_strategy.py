@@ -271,9 +271,7 @@ class HybridAttentionImageStrategy(
         assert input_ids is not None
 
         if is_prompt:
-            # Not an input of the compiled graph: optimum-rbln only uses this
-            # mask to drop padding from the prefill inputs.
-            attention_mask = (input_ids != self.pad_token_id).squeeze(0)
+            attention_mask = (input_ids != self.pad_token_id).to(torch.int64).squeeze(0)
         else:
             get_extra_values_fn = lambda entry: (
                 entry.pad_len,

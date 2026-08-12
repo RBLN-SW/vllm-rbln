@@ -12,7 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from vllm_rbln import envs
+# NOTE(eunji.lee): Keep this module free of top-level imports.
+# vLLM resolves platform plugins lazily on the first
+# `vllm.platforms.current_platform` access, which almost any
+# vLLM import triggers. If importing `vllm_rbln` pulls in vLLM before `register`
+# is bound, the plugin loader re-enters this partially initialized module,
+# `getattr(module, "register")` raises, and vLLM falls back to CpuPlatform.
 
 
 def register():
@@ -22,6 +27,8 @@ def register():
 
 def register_model():
     # FIXME(kblee): A.X K2 (axk2) is not in upstream vLLM yet.
+    from vllm_rbln import envs
+
     if not envs.VLLM_RBLN_USE_VLLM_MODEL:
         return
 
@@ -37,6 +44,7 @@ def register_model():
 
 def register_ops():
     import vllm_rbln.distributed.ec_transfer.ec_connector.factory  # noqa
+    from vllm_rbln import envs
 
     if envs.VLLM_RBLN_USE_VLLM_MODEL:
         from vllm_rbln.patches import apply_registered_patches, apply_registrations

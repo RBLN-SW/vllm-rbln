@@ -31,6 +31,17 @@ from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 DEVICE = torch.device(current_platform.device_type)
 
 
+def assert_close(actual, expected, **kwargs):
+    """``torch.testing.assert_close`` without the placement check.
+
+    The code under test allocates on ``DEVICE`` (``rbln`` on an RBLN platform),
+    while the expected values below are written as plain CPU literals for
+    readability. These tests assert values/shape/dtype, not placement.
+    """
+    kwargs.setdefault("check_device", False)
+    torch.testing.assert_close(actual, expected, **kwargs)
+
+
 class FakeEagleModel:
     """Draft model double.
 
@@ -144,8 +155,6 @@ def make_common_attn_metadata(
         query_start_loc=query_start_loc,
         query_start_loc_cpu=query_start_loc.cpu(),
         seq_lens=seq_lens,
-        _seq_lens_cpu=seq_lens.cpu(),
-        _num_computed_tokens_cpu=torch.zeros_like(seq_lens),
         num_reqs=seq_lens.shape[0],
         num_actual_tokens=total_num_tokens,
         max_query_len=int((query_start_loc[1:] - query_start_loc[:-1]).max().item()),
@@ -185,6 +194,7 @@ def make_eagle_stub(
         max_num_tokens, hidden_size, dtype=torch.float32, device=DEVICE
     )
     stub.arange = torch.arange(max_num_tokens + 1, dtype=torch.int32, device=DEVICE)
+    stub.arange_cpu = torch.arange(max_num_tokens + 1, dtype=torch.int32)
     stub.vllm_config = SimpleNamespace(
         speculative_config=SimpleNamespace(enforce_eager=enforce_eager),
         parallel_config=SimpleNamespace(data_parallel_size=1),
@@ -233,8 +243,8 @@ def test_preprocess_prefill_views_full_buffers():
     assert input_ids.shape == (2, 4)
     assert positions.shape == (2, 4)
     assert hidden_states.shape == (2, 4, 4)
-    torch.testing.assert_close(input_ids, torch.arange(8, dtype=torch.int32).view(2, 4))
-    torch.testing.assert_close(token_indices, torch.tensor([1, 3], dtype=torch.int32))
+    assert_close(input_ids, torch.arange(8, dtype=torch.int32).view(2, 4))
+    assert_close(token_indices, torch.tensor([1, 3], dtype=torch.int32))
 
 
 # Verifies the decode branch slices to the active tokens, then pads the batch
@@ -257,14 +267,10 @@ def test_preprocess_decode_slices_and_pads_to_bucket():
     assert input_ids.shape == (4, 2)
     assert positions.shape == (4, 2)
     assert hidden_states.shape == (4, 2, 4)
-    torch.testing.assert_close(
-        input_ids[:2], torch.tensor([[10, 11], [20, 21]], dtype=torch.int32)
-    )
-    torch.testing.assert_close(input_ids[2:], torch.zeros((2, 2), dtype=torch.int32))
+    assert_close(input_ids[:2], torch.tensor([[10, 11], [20, 21]], dtype=torch.int32))
+    assert_close(input_ids[2:], torch.zeros((2, 2), dtype=torch.int32))
     # token indices are zero-padded up to the bucket.
-    torch.testing.assert_close(
-        token_indices, torch.tensor([1, 3, 0, 0], dtype=torch.int32)
-    )
+    assert_close(token_indices, torch.tensor([1, 3, 0, 0], dtype=torch.int32))
 
 
 # Verifies token indices stay None when none are requested.
@@ -313,13 +319,13 @@ def test_set_inputs_first_pass_shifts_tokens_and_infers_default_indices():
 
     assert num_tokens == 5
     # default indices = query_start_loc[1:] - 1 = [2, 5] - 1
-    torch.testing.assert_close(token_indices, torch.tensor([1, 4], dtype=torch.int32))
+    assert_close(token_indices, torch.tensor([1, 4], dtype=torch.int32))
     # shifted target[1:] then next-token scatter at indices 1 and 4
-    torch.testing.assert_close(
+    assert_close(
         stub.input_ids[:5], torch.tensor([11, 99, 21, 22, 88], dtype=torch.int32)
     )
-    torch.testing.assert_close(stub.positions[:5], target_positions)
-    torch.testing.assert_close(stub.hidden_states[:5], target_hidden_states)
+    assert_close(stub.positions[:5], target_positions)
+    assert_close(stub.hidden_states[:5], target_hidden_states)
 
 
 # Verifies explicit sample indices are used verbatim instead of being inferred.
@@ -344,11 +350,10 @@ def test_set_inputs_first_pass_uses_explicit_indices():
     )
 
     assert num_tokens == 5
-    assert token_indices is explicit
+    assert token_indices.device.type == stub.device.type
+    assert_close(token_indices, explicit)
     # input_ids[:4] = [11, 20, 21, 22]; scatter 99,88 at indices 0 and 3
-    torch.testing.assert_close(
-        stub.input_ids[:4], torch.tensor([99, 20, 21, 88], dtype=torch.int32)
-    )
+    assert_close(stub.input_ids[:4], torch.tensor([99, 20, 21, 88], dtype=torch.int32))
 
 
 # Verifies extra input slots (parallel drafting) are explicitly unsupported.
@@ -387,10 +392,8 @@ def test_build_dummy_attn_metadata_computes_cumsum_and_shapes():
         stub, num_reqs=3, num_tokens_per_req=2
     )
 
-    torch.testing.assert_close(
-        cad.query_start_loc, torch.tensor([0, 2, 4, 6], dtype=torch.int32)
-    )
-    torch.testing.assert_close(cad.seq_lens, torch.tensor([2, 2, 2], dtype=torch.int32))
+    assert_close(cad.query_start_loc, torch.tensor([0, 2, 4, 6], dtype=torch.int32))
+    assert_close(cad.seq_lens, torch.tensor([2, 2, 2], dtype=torch.int32))
     assert cad.num_reqs == 3
     assert cad.num_actual_tokens == 6
     assert cad.max_query_len == 2
@@ -418,6 +421,7 @@ def test_init_rejects_multimodal_inputs(monkeypatch):
 def test_init_stores_runner(monkeypatch):
     def fake_super_init(self, vllm_config, device, runner):
         self.supports_mm_inputs = False
+        self.arange = torch.arange(4, dtype=torch.int32, device=DEVICE)
 
     monkeypatch.setattr(EagleProposer, "__init__", fake_super_init)
     runner = object()
@@ -522,12 +526,12 @@ def test_load_model_wrapper_composition(monkeypatch, with_indices):
     expected_hidden = (hidden + 2000).view(-1, 4)
     if with_indices:
         expected_hidden = expected_hidden.index_select(0, indices)
-    torch.testing.assert_close(out_hidden, expected_hidden)
+    assert_close(out_hidden, expected_hidden)
 
     last_hidden_flat = (hidden + 1000).view(-1, 4)
     expected_sample = last_hidden_flat[indices] if with_indices else last_hidden_flat
-    torch.testing.assert_close(model.compute_logits_inputs[0], expected_sample)
-    torch.testing.assert_close(logits, expected_sample + 1)
+    assert_close(model.compute_logits_inputs[0], expected_sample)
+    assert_close(logits, expected_sample + 1)
 
 
 # ---------------------------------------------------------------------------
@@ -570,11 +574,9 @@ def test_prepare_next_token_ids_padded_builds_backup_and_delegates(monkeypatch):
 
     assert out is sentinel
     # backup token = token_base(100) + seq_len -> [105, 106, 107]
-    torch.testing.assert_close(
-        captured["backup"], torch.tensor([105, 106, 107], dtype=torch.int32)
-    )
-    torch.testing.assert_close(captured["sampled"], sampled)
-    torch.testing.assert_close(captured["discard"], discard)
+    assert_close(captured["backup"], torch.tensor([105, 106, 107], dtype=torch.int32))
+    assert_close(captured["sampled"], sampled)
+    assert_close(captured["discard"], discard)
     assert captured["vocab"] == 50
 
 
@@ -612,8 +614,8 @@ def test_prepare_inputs_padded_builds_spec_metadata_and_delegates(monkeypatch):
     assert spec_cad.max_query_len == 3  # max of per-req query lens [2, 3]
     assert spec_cad.max_seq_len == 9
     assert spec_cad.causal is True
-    torch.testing.assert_close(captured["cu"], spec_md.cu_num_draft_tokens)
-    torch.testing.assert_close(captured["valid"], valid_count)
+    assert_close(captured["cu"], spec_md.cu_num_draft_tokens)
+    assert_close(captured["valid"], valid_count)
 
 
 # ---------------------------------------------------------------------------
@@ -684,7 +686,7 @@ def test_propose_returns_zeros_for_intermediate_chunked_prefill():
 
     assert len(builder.calls) == 2
     assert output.shape == (2, 2)
-    torch.testing.assert_close(output, torch.zeros((2, 2), dtype=torch.int64))
+    assert_close(output, torch.zeros((2, 2), dtype=torch.int64))
 
 
 # Verifies the single-step decode path pads inputs to the decode bucket and
@@ -723,7 +725,7 @@ def test_propose_single_step_decode_returns_argmax():
 
     # decode: [2, 2] reshaped then padded up to the bucket batch of 4
     assert captured["input_shape"] == (4, 2)
-    torch.testing.assert_close(
+    assert_close(
         captured["token_indices_to_sample"],
         torch.tensor([1, 3, 0, 0], dtype=torch.int32),
     )
@@ -731,7 +733,7 @@ def test_propose_single_step_decode_returns_argmax():
     assert builder.calls[0]["batch_pad"] == 4
     # logits[:2].argmax(-1) = [1, 2] -> [[1], [2]]
     assert output.shape == (2, 1)
-    torch.testing.assert_close(output, torch.tensor([[1], [2]], dtype=torch.int64))
+    assert_close(output, torch.tensor([[1], [2]], dtype=torch.int64))
 
 
 # Verifies the multi-step decode loop feeds each step's sampled draft tokens
@@ -807,17 +809,15 @@ def test_propose_multistep_decode_feeds_previous_draft_and_stacks_tokens():
     assert builder.calls[1]["is_prefill"] is False
     assert builder.calls[0]["batch_pad"] == 4
     assert builder.calls[1]["batch_pad"] == 4
-    torch.testing.assert_close(
+    assert_close(
         calls[0]["token_indices_to_sample"],
         torch.tensor([1, 3, 0, 0], dtype=torch.int32),
     )
     assert calls[1]["token_indices_to_sample"] is None
     second_input_ids = cast(torch.Tensor, calls[1]["input_ids"])
-    torch.testing.assert_close(
-        second_input_ids[:2, 0], torch.tensor([1, 3], dtype=torch.int32)
-    )
+    assert_close(second_input_ids[:2, 0], torch.tensor([1, 3], dtype=torch.int32))
     assert output.shape == (2, 2)
-    torch.testing.assert_close(
+    assert_close(
         output,
         torch.tensor([[1, 2], [3, 4]], dtype=torch.int64),
     )
