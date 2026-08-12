@@ -51,6 +51,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_COMPILE_MODEL: bool = True
     VLLM_RBLN_COMPILE_STRICT_MODE: bool = False
     VLLM_RBLN_COMPILE_ONLY: bool = False
+    VLLM_RBLN_NUM_HIDDEN_LAYERS: int = 0
     VLLM_RBLN_USE_DEVICE_TENSOR: bool = True
     VLLM_RBLN_DISABLE_OFFLOAD: bool = False
     # Default follows VLLM_RBLN_USE_DEVICE_TENSOR (see use_auto_port), so it is
@@ -264,6 +265,16 @@ environment_variables = {
             os.environ.get("VLLM_RBLN_COMPILE_ONLY", "False").lower() in ("true", "1")
         )
     ),
+    # Build only the first N decoder layers and leave the rest as
+    # `PPMissingLayer`, to cut compile time during bring-up. 0 disables the
+    # truncation. The HF config is left untouched, so layer indices still line
+    # up with the checkpoint and the untruncated count remains available to
+    # anything that reads it (e.g. the MTP start index). For a hybrid attention
+    # model, pick a multiple of the layer-type period (2 for gpt-oss) to keep
+    # the KV cache group structure the full model would have.
+    "VLLM_RBLN_NUM_HIDDEN_LAYERS": lambda: int(
+        os.environ.get("VLLM_RBLN_NUM_HIDDEN_LAYERS", 0)
+    ),
     # Use RBLN device tensors end-to-end (platform device_type="rbln",
     # KV cache / inputs on device, CPU-first attention metadata, padded
     # sampling metadata, no CompileContext). Enabled by default; set to False
@@ -393,6 +404,7 @@ RBLN_COMPILE_ENV = frozenset(
         "VLLM_RBLN_USE_VLLM_MODEL",
         "VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK",
         "VLLM_RBLN_COMPILE_MODEL",
+        "VLLM_RBLN_NUM_HIDDEN_LAYERS",
         "VLLM_RBLN_USE_DEVICE_TENSOR",
         "VLLM_RBLN_ENFORCE_MODEL_FP32",
         "VLLM_RBLN_FLASH_CAUSAL_ATTN",

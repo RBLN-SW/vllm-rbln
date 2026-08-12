@@ -18,7 +18,7 @@
 
 import pytest
 
-from tests.native.utils import check_outputs_equal
+from tests.native.utils import check_outputs_almost_equal
 from tests.native.v1.spec_decode.utils import (
     _DRAFT,
     MEDUSA_DRAFT,
@@ -31,13 +31,14 @@ from tests.native.v1.spec_decode.utils import (
 _NGRAM_TARGET = "meta-llama/Llama-3.2-1B-Instruct"
 PROMPT = "The quick brown fox jumps over the lazy dog. " * 20
 MAX_TOKENS = 16
+NUM_LOGPROBS = 5
 
 # method -> (target model, extra LLM kwargs, speculative_config). The eagle/medusa
 # drafts cap at 2048 positions, so max_model_len is lowered for them.
 SPEC_METHODS = {
     "ngram": (
         _NGRAM_TARGET,
-        {"num_gpu_blocks_override": 32},
+        {},
         {
             "method": "ngram",
             "prompt_lookup_max": 5,
@@ -47,7 +48,7 @@ SPEC_METHODS = {
     ),
     "suffix": (
         _NGRAM_TARGET,
-        {"num_gpu_blocks_override": 32},
+        {},
         {
             "method": "suffix",
             "suffix_decoding_max_spec_factor": 2.0,
@@ -56,12 +57,12 @@ SPEC_METHODS = {
     ),
     "eagle": (
         TARGET_MODEL,
-        {"max_model_len": 2048, "tensor_parallel_size": 4},
+        {"max_model_len": 2048, "tensor_parallel_size": 2},
         {"method": "eagle", "model": _DRAFT["eagle"], "num_speculative_tokens": 3},
     ),
     "eagle3": (
         TARGET_MODEL,
-        {"max_model_len": 2048, "tensor_parallel_size": 4},
+        {"max_model_len": 2048, "tensor_parallel_size": 2},
         {"method": "eagle3", "model": _DRAFT["eagle3"], "num_speculative_tokens": 3},
     ),
     "medusa": (
@@ -98,26 +99,36 @@ def _use_reference_sampler(monkeypatch):
 
 @pytest.mark.model_compile
 @pytest.mark.parametrize("method", [_method_param(m) for m in SPEC_METHODS])
-def test_speculative_decoding_matches_reference(vllm_runner, method: str) -> None:
+def test_speculative_decoding_matches_reference(
+    vllm_runner, method: str, whole_model: bool
+) -> None:
     target, extra_kwargs, spec_config = SPEC_METHODS[method]
 
     with vllm_runner(target, **extra_kwargs) as ref_model:
-        ref_outputs = ref_model.generate_greedy([PROMPT], MAX_TOKENS)
+        ref_outputs = ref_model.generate_greedy_logprobs(
+            [PROMPT], MAX_TOKENS, NUM_LOGPROBS
+        )
 
     with vllm_runner(
         target, **extra_kwargs, speculative_config=spec_config
     ) as spec_model:
-        spec_outputs = spec_model.generate_greedy([PROMPT], MAX_TOKENS)
+        spec_outputs = spec_model.generate_greedy_logprobs(
+            [PROMPT], MAX_TOKENS, NUM_LOGPROBS
+        )
         # Read while the engine is alive (__exit__ shuts down the EngineCore).
         accepted = spec_model.spec_decode_accepted_tokens()
 
-    check_outputs_equal(
+    # Rejection sampling is lossless in exact arithmetic only: the spec run
+    # verifies K+1 tokens in one target pass where the reference decodes one at
+    # a time, so the two differ by rounding. Only near-tie flips are tolerated.
+    check_outputs_almost_equal(
         outputs_0_lst=ref_outputs,
         outputs_1_lst=spec_outputs,
         name_0="reference",
         name_1=f"spec:{method}",
     )
     # Equivalence alone passes even if every draft is rejected, so where drafts
-    # can realistically hit, require at least one acceptance.
-    if method in _EXPECT_ACCEPTANCE:
+    # can realistically hit, require at least one acceptance. Truncated layers
+    # leave the draft's predictions unrelated to the target's, so nothing hits.
+    if method in _EXPECT_ACCEPTANCE and whole_model:
         assert accepted > 0, f"spec:{method} accepted no draft tokens"

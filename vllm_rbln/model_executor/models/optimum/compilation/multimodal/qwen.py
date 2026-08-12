@@ -55,6 +55,12 @@ def get_param_qwen3_5(
 ) -> dict:
     # Qwen3.5's linear_attention layers use gated_delta_net; the full_attention
     # layers require flash attention, so force it here.
+    if max_model_len // block_size < 2:
+        raise ValueError(
+            f"Qwen3.5 forces flash attention, which requires block_size ({block_size}) "
+            f"to divide max_model_len ({max_model_len}) into at least 2 partitions. "
+            f"Use a divisor of max_model_len that is at most {max_model_len // 2}."
+        )
     param = get_param_qwen2_vl(
         batch_size,
         max_model_len,
