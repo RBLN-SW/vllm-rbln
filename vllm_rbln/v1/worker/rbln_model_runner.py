@@ -233,6 +233,7 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
         pending_token_writeback: Any = None,
         req_ids: list[str] | None = None,
         placeholder_pos: dict[str, int] | None = None,
+        logprobs_tensors: Any = None,
     ):
         self._model_runner_output = model_runner_output
         self._invalid_req_indices = invalid_req_indices
@@ -250,6 +251,16 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
             dtype=sampled_token_ids.dtype,
             device="cpu",
         )
+        # Logprobs ride the same deferral, and only in the dense form. The topk
+        # form cannot: gather_logprobs indexes by the sampled ids, integer eager
+        # ops have no device kernel here, so building it pulls the tokens to the
+        # host mid-step - exactly the copy async scheduling exists to defer. The
+        # dense form (logprobs=-1, which is what the executor asks for by
+        # default) is a log_softmax and nothing else, so it stays on device until
+        # this object is drained. sample_tokens rejects the topk form under async
+        # rather than let it silently serialise the step.
+        self._logprobs_tensors = logprobs_tensors
+
         # The D2H is neither dispatched nor awaited here - both happen in
         # get_output().
 
@@ -295,6 +306,10 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
 
         output = self._model_runner_output
         output.sampled_token_ids = valid_sampled_token_ids
+        if self._logprobs_tensors is not None:
+            # tolists() is where the logprobs D2H actually happens - on this
+            # thread, off the step's critical path.
+            output.logprobs = self._logprobs_tensors.tolists()
         return output
 
 
@@ -380,6 +395,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self.step_probe = StepProbe()
         # Host hop for the token feedback; see the identity branch below.
         self._tokfb_host = None
+        # Logprobs handed to the deferred output; see the async branch of
+        # _bookkeeping_sync.
+        self._async_logprobs_tensors = None
         # Dummy-run counter for the step signature capture above.
         self._dummy_runs = 0
 
@@ -1529,6 +1547,31 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             # Async scheduling: defer the sampled-token D2H to get_output(). Cache
             # the tokens on-device (prev_sampled_token_ids) for next-step feedback;
             # valid_sampled_token_ids is filled later by AsyncRBLNModelRunnerOutput.
+            #
+            # Logprobs ride along, deferred to get_output() like the tokens.
+            # Building them is expensive - vLLM turns logprobs=-1 into a
+            # full-vocab gather, gather_logprobs indexes by the sampled ids, and
+            # integer eager ops have no device kernel on RBLN, so it runs on the
+            # host - but that cost is the sampler's, not this deferral's: sync
+            # pays it too (39.8 vs async 38.3 ms/step, against 18.9 and 17.1
+            # without logprobs). The deferred D2H here is off the step entirely.
+            #
+            # Worth carrying because it is what puts async under the executor's
+            # native golden gate: that comparison rides on the teacher-forced
+            # validation pass, and with no logprobs the pass produces nothing
+            # and the gate silently does not exist. A run that does not ask for
+            # logprobs never builds them and is unaffected.
+            if logprobs_tensors is not None:
+                logger.warning_once(
+                    "logprobs cost about 22 ms of host CPU per step here - "
+                    "gather_logprobs indexes full vocab by the sampled ids and "
+                    "integer eager ops have no device kernel, so it runs on the "
+                    "host. Both scheduling modes pay it (async 38.3 vs sync 39.8 "
+                    "ms/step, against 17.1 and 18.9 without), so this is not a "
+                    "reason to turn async off - only a reason not to read decode "
+                    "timings off a run that asks for logprobs."
+                )
+            self._async_logprobs_tensors = logprobs_tensors
             valid_sampled_token_ids = []
             invalid_req_indices = discard_sampled_tokens_req_indices.tolist()
             invalid_req_indices_set = set(invalid_req_indices)
@@ -1994,6 +2037,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             pending_token_writeback=self._pending_token_writeback,
             req_ids=list(self.input_batch.req_ids),
             placeholder_pos=dict(self._placeholder_pos),
+            logprobs_tensors=self._async_logprobs_tensors,
         )
         return async_output
 

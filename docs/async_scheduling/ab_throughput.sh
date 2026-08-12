@@ -112,7 +112,7 @@ run() { # $1=name $2=cfgenv $3=round
   local ARGS="vllm-decoderonly gpt-oss -m gpt-oss-120b -ep -dp $DP -rsd 1 \
 -s 131072 --block-size 1024 -pcs 512 -b $eb -nblk 129 \
 --max-tokens $MAXTOK --num-prompts $np --run-iter $RUNITER --cache-ignore \
---cache-results \
+--cache-results ${EXTRA_ARGS:-} \
 ${COMPILED_MODEL_PATH:+--compiled-model-path $COMPILED_MODEL_PATH} \
 -o $OUTDIR/${name}_r${r}.result.json rbln-run"
   echo "=== RUN $name round=$r b=$eb maxtok=$MAXTOK nprompts=$((np * DP)) $(date +%T) ==="
