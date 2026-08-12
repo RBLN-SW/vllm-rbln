@@ -1,0 +1,8 @@
+agents:
+  queue: r18s
+
+steps:
+  - label: ":wave: hello world"
+    image: "${DEVTOOLS_DOCKER_IMAGE}"
+    command:
+      - "echo 'hello world'"

@@ -19,13 +19,6 @@ _uv_secrets: &uv_secrets
 steps:
   - label: ":closed_lock_with_key: team-member gate"
     image: "${DEVTOOLS_DOCKER_IMAGE}"
-    resources: &light-cpu
-      cpu:
-        requests: "2"
-        limits: "2"
-      memory:
-        requests: "8Gi"
-        limits: "8Gi"
     secrets:
       - GIT_PAT
     command:
@@ -33,17 +26,29 @@ steps:
 
   - label: ":mag: pre-commit"
     image: "${DEVTOOLS_DOCKER_IMAGE}"
-    resources: *light-cpu
     secrets: *uv_secrets
     command:
       - "uv tool run pre-commit run --all-files --hook-stage manual --show-diff-on-failure"
 
-  # Both gates must pass before the heavy test pipeline is even uploaded.
+  # Both gates must pass before the heavy test pipelines are even uploaded.
   - wait: ~
 
-  - label: ":sparkles: vllm-rbln pytest"
-    command: "buildkite-agent pipeline upload .buildkite/pipelines/pr/run-pytest.yml"
-    plugins:
-      - sparse-checkout#v1.6.0:
-          paths:
-            - .buildkite
+  - group: ":one: type 1 tests"
+    key: "type1"
+    steps:
+      - label: ":sparkles: upload type1-pr"
+        checkout:
+          sparse:
+            paths:
+              - .buildkite
+        command: "buildkite-agent pipeline upload .buildkite/pipelines/type1-pr/pipeline.yml"
+
+  - group: ":two: type 2 tests"
+    key: "type2"
+    steps:
+      - label: ":sparkles: upload type2-pr"
+        checkout:
+          sparse:
+            paths:
+              - .buildkite
+        command: "buildkite-agent pipeline upload .buildkite/pipelines/type2-pr/pipeline.yml"

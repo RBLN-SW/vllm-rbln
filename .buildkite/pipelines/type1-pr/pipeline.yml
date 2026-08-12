@@ -1,4 +1,4 @@
-# vllm-rbln pytest on Buildkite.
+# vllm-rbln type 1 PR test suites, uploaded by .buildkite/pr.yml.
 
 env:
   UV_CACHE_DIR: "/mnt/uv_cache"
