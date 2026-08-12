@@ -154,6 +154,25 @@ class TestCompileOptions:
         compile(object(), use_cache=False)
         assert "cache_dir" not in captured_compile["options"]
 
+    def test_caching_goes_through_the_mega_cache_only(
+        self, captured_compile, monkeypatch
+    ):
+        # The bundle is the only compile cache: with this set the backend neither
+        # reads nor writes per-graph <cache_dir>/<hash>.rbln files.
+        monkeypatch.setattr(compiler.envs, "VLLM_DISABLE_COMPILE_CACHE", False)
+        compile(object())
+        assert captured_compile["options"]["mega_cache_only"] is True
+
+    @pytest.mark.parametrize(
+        ("disabled", "use_cache"), [(True, True), (False, False)], ids=["env", "kwarg"]
+    )
+    def test_mega_cache_only_follows_cache_dir(
+        self, captured_compile, monkeypatch, disabled, use_cache
+    ):
+        monkeypatch.setattr(compiler.envs, "VLLM_DISABLE_COMPILE_CACHE", disabled)
+        compile(object(), use_cache=use_cache)
+        assert "mega_cache_only" not in captured_compile["options"]
+
     def test_forwards_backend_dynamic_fullgraph(self, captured_compile):
         # backend / dynamic / fullgraph pass straight through to torch.compile.
         backend = object()
