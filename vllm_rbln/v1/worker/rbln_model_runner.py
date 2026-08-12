@@ -131,6 +131,7 @@ from vllm_rbln.v1.core.utils import (
 from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
+from vllm_rbln.v1.worker import mega_cache
 from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
 from vllm_rbln.v1.worker.input_stager import InputLayout, InputStager, StagedModelInputs
 from vllm_rbln.v1.worker.metrics_v2 import (
@@ -3017,6 +3018,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # the model directly, bypassing the connector lifecycle entirely.
         logger.info("Compile and warming up model.")
 
+        sig = mega_cache.config_signature(self.vllm_config)
+        mega_cache.load(self.model_config.model, sig)
         with set_compile_stage("warmup"), self.offload_context():
             # 1. prefill
             self._dummy_run(1, self.max_num_tokens, True)
@@ -3077,6 +3080,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             drafter = getattr(self, "drafter", None)
             if isinstance(drafter, RBLNMedusaProposer):
                 drafter.dummy_run()
+
+        mega_cache.save(self.model_config.model, sig)
 
     def _process_kv_cache_copy_ops(
         self,

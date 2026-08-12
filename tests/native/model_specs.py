@@ -16,14 +16,18 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
 
+from tests.native.utils import LAYERS_PINNABLE_ENV
+
 # Harness-visible env vars are promoted to fields because the harness branches
 # on them; `envs` is everything the harness does NOT interpret.
 _RSD_ENV = "VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK"
+_LAYERS_ENV = "VLLM_RBLN_NUM_HIDDEN_LAYERS"
 _ID_KEYS = (
     ("tp", "tensor_parallel_size", 1),
     ("pp", "pipeline_parallel_size", 1),
@@ -39,12 +43,21 @@ class CompileModelSpec:
     envs: dict[str, str] = field(default_factory=dict)
     rsd: int = 1
     id: str | None = None
+    # Layers to build for this model, overriding the session default. Ignored
+    # when --num-hidden-layers is given, so a lane can always force its own
+    # depth -- 0 (whole model) especially.
+    num_hidden_layers: int | None = None
 
     def __post_init__(self):
-        if _RSD_ENV in self.envs:
-            raise ValueError(f"{_RSD_ENV} is harness-visible; set rsd= instead")
+        for env, field_name in ((_RSD_ENV, "rsd"), (_LAYERS_ENV, "num_hidden_layers")):
+            if env in self.envs:
+                raise ValueError(f"{env} is harness-visible; set {field_name}= instead")
         if self.rsd < 1:
             raise ValueError(f"rsd must be >= 1, got {self.rsd}")
+        if self.num_hidden_layers is not None and self.num_hidden_layers < 0:
+            raise ValueError(
+                f"num_hidden_layers must be >= 0, got {self.num_hidden_layers}"
+            )
 
     @property
     def test_id(self) -> str:
@@ -80,5 +93,9 @@ def spec_params(specs: list[CompileModelSpec]) -> list[Any]:
 def apply_spec_envs(spec: CompileModelSpec, monkeypatch) -> None:
     if spec.rsd > 1:
         monkeypatch.setenv(_RSD_ENV, str(spec.rsd))
+    # Only when --num-hidden-layers was left off: an explicit value -- 0 above
+    # all -- belongs to the lane, not to one model.
+    if spec.num_hidden_layers is not None and os.environ.get(LAYERS_PINNABLE_ENV):
+        monkeypatch.setenv(_LAYERS_ENV, str(spec.num_hidden_layers))
     for key, value in spec.envs.items():
         monkeypatch.setenv(key, value)
