@@ -52,7 +52,7 @@ def rbln_top_k_top_p_sample(
     we define this as a static method.
     """
     # Apply temperature.
-    logits = logits.div(temperature.unsqueeze(dim=1))
+    logits = logits.div(temperature.to(logits.dtype).unsqueeze(dim=1))
 
     # Apply top-k top-p sampling using RBLN custom op.
     # It requires softmax prior to calling the op.
