@@ -30,6 +30,7 @@ from . import (
     compressed_tensors_moe_method,
     deepseek_mtp,
     deepseek_v2,
+    distributed_utils,
     fp8_moe_method,
     gpt_oss,
     gpt_oss_mxfp4_config,
