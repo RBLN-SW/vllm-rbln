@@ -65,6 +65,7 @@ if TYPE_CHECKING:
     # --- MODEL INPUT / SCHEDULING ---
     VLLM_RBLN_SORT_BATCH: bool = False
     VLLM_RBLN_SUB_BLOCK_CACHE: bool = True
+    VLLM_RBLN_PAGE_EXTENT: bool = False
     # --- MOE ---
     VLLM_RBLN_SPECIALIZE_MOE_DECODE: bool = True
     VLLM_RBLN_USE_MOE_TOKENS_MASK: bool = True
@@ -323,6 +324,12 @@ environment_variables = {
     # Sub-block size equals max_num_batched_tokens (prefill chunk size).
     "VLLM_RBLN_SUB_BLOCK_CACHE": lambda: (
         os.environ.get("VLLM_RBLN_SUB_BLOCK_CACHE", "True").lower() in ("true", "1")
+    ),
+    # Back pages with contiguous extents (docs/page_extent_kv_manager.md).
+    # --block-size becomes the page; the extent comes from the compiled model.
+    # Supersedes VLLM_RBLN_SUB_BLOCK_CACHE, which it disables when on.
+    "VLLM_RBLN_PAGE_EXTENT": lambda: (
+        os.environ.get("VLLM_RBLN_PAGE_EXTENT", "False").lower() in ("true", "1")
     ),
     # --- MOE ---
     # If true, it specializes the cases where all instances are at decode stage
