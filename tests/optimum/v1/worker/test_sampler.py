@@ -228,6 +228,70 @@ def test_forward_sampling_parameters(
 # TODO mix the requests with different sampling parameters
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+def test_forward_min_tokens_masks_stop_tokens(monkeypatch, dtype):
+    """min_tokens must keep stop tokens unsampleable until the request has
+    generated min_tokens tokens, then release them.
+
+    The bfloat16 case is a regression test for a dtype crash: the RBLN
+    sampler keeps logits in the model dtype (no float32 upcast), while the
+    builtin MinTokensLogitsProcessor holds a float32 -inf constant, and
+    index_put_ rejects mixed dtypes.
+    """
+    monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1")
+    monkeypatch.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
+    monkeypatch.setenv("VLLM_RBLN_ENABLE_WARM_UP", "False")
+
+    runner = create_model_runner(max_num_seqs=1, dtype=dtype)
+
+    stop_token_id = 9
+    runner_up_token_id = 5
+    min_tokens = 3
+
+    # Rig the logits so greedy sampling always picks the stop token unless
+    # min_tokens masks it, in which case the runner-up token wins.
+    def rigged_forward(model_input, **kwargs):
+        num_reqs = runner.input_batch.num_reqs
+        vocab_size = runner.model_config.get_vocab_size()
+        logits = torch.full((num_reqs, 1, vocab_size), -10.0, dtype=dtype)
+        logits[..., stop_token_id] = 10.0
+        logits[..., runner_up_token_id] = 5.0
+        return logits
+
+    runner.model.forward = rigged_forward
+
+    req = make_request(
+        request_id="req_0",
+        prompt_token_ids=[1, 2, 3],
+        temperature=0.0,
+        min_tokens=min_tokens,
+        stop_token_ids=[stop_token_id],
+    )
+
+    # Prefill samples the first output token.
+    scheduler_output = _schedule_new_request_from_request(
+        req, block_ids=([0],), outer_block_ids=[0]
+    )
+    runner.execute_model(scheduler_output)
+    output = runner.sample_tokens(grammar_output=None)
+    sampled = [output.sampled_token_ids[0][0]]
+
+    # Decode until one step past the min_tokens boundary.
+    req.num_computed_tokens = len(req.prompt_token_ids)
+    for _ in range(min_tokens):
+        scheduler_output = _schedule_cached_reqs([req], new_block_ids=[None])
+        runner.execute_model(scheduler_output)
+        output = runner.sample_tokens(grammar_output=None)
+        sampled.append(output.sampled_token_ids[0][0])
+        req.num_computed_tokens += 1
+
+    # While fewer than min_tokens tokens are generated, the stop token is
+    # masked and greedy sampling falls to the runner-up token.
+    assert sampled[:min_tokens] == [runner_up_token_id] * min_tokens
+    # Once min_tokens is reached, the stop token becomes sampleable again.
+    assert sampled[min_tokens] == stop_token_id
+
+
 @pytest.mark.parametrize("top_p", [0.7, 1.0])
 @pytest.mark.parametrize("top_k", [0, 3])
 @pytest.mark.parametrize("temperature", [0.0, 1.0])
