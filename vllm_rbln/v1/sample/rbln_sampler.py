@@ -221,7 +221,8 @@ class RBLNSampler(VLLMSampler):
             )
 
         argmax_invariant = sampling_metadata.logitsprocs.argmax_invariant
-        # if argmax_invariant processors are active, apply temperature scaling before applying them.
+        # if argmax_invariant processors are active, apply temperature scaling
+        # before applying them.
         if any(getattr(p, "min_p_count", 1) for p in argmax_invariant):
             logits = logits.div(temperature.unsqueeze(dim=1))
             temperature = torch.ones_like(temperature)
