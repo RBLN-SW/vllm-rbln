@@ -479,53 +479,71 @@ would collide with a live upstream mechanism for no gain.
 
 ## Implementation status
 
-Enabled with `VLLM_RBLN_PAGE_EXTENT=1` (default off). When on, it replaces the
-sub-block overlay; when the model publishes no extent size the geometry is
-degenerate and the layer is a no-op, so the flag is safe to set blindly.
+Enabled with `VLLM_RBLN_PAGE_EXTENT=1` (default off). A model that publishes no
+extent size gets a degenerate geometry and the layer is a no-op, so the flag is
+safe to set blindly.
 
-| Piece | Where | State |
-|---|---|---|
-| Geometry, allocator, page→extent table, binding policy | `vllm_rbln/v1/core/page_extent/` | done, unit-tested |
-| Config resolution + startup validation | `page_extent/config.py` | done |
-| Page-native KV cache manager | `rbln_page_extent_kv_cache_manager.py` | done, untested on hardware |
-| Scheduler wiring, prefill-alignment clamp | `rbln_scheduler.py` | done |
-| Worker copy execution (slot ranges) | `rbln_model_runner.py` | done |
-| **Extent-major KV tensors + extent block table** | `rbln_model_runner.py` | **not started — the remaining blocker** |
-| Retire the overlay | `rbln_kv_cache_manager.py` | deferred until the above is validated |
+Landed in `afd7142d`: `page_extent.py` (geometry, extent pool, page->extent
+map, binding policy), `rbln_page_extent_kv_cache_manager.py`, scheduler wiring
+and extent-id block tables, worker geometry restatement and slot-range copies.
+409 unit tests.
 
-**The blocker**, and why it is smaller than it looks. With the flip,
-`kv_cache_spec.block_size` is the page, so the worker still allocates
-page-sized blocks and its block table still addresses pages, while the manager
-hands out extent ids. Guarded by `WORKER_SUPPORTS_EXTENT_ADDRESSING`, which
-fails loudly rather than letting extent ids index page-sized blocks — that
-corruption would not crash, so nothing would catch it.
+### Measured 2026-08-13 (MiniMax-M2.5, DP4+EP, 1536-token shared prefix)
 
-The fix does **not** require reworking the attention or tensor paths. *The
-worker never needs to know about pages at all*: if it sees blocks of
-`extent_size`, every downstream path — tensor allocation, `InputBatch`, block
-tables, attention metadata — behaves exactly as it does today with
-`--block-size 8192`. The page/extent split stays entirely scheduler-side. So:
+| config | match | physical | mean TTFT | mean TPOT | tok/s |
+|---|---|---|---|---|---|
+| sub-block off | 1024 | 1024 | 877.1 ms | 65.67 ms | 101.8 |
+| sub-block on | 512 | 1024 | 493.2 ms | 62.72 ms | 113.9 |
+| page/extent | 512 | 8192 | 519.2 ms | 51.87 ms | 134.2 |
+| sub-block on | 512 | 8192 | 539.0 ms | 51.98 ms | 133.9 |
+| sub-block off | 8192 | 8192 | 1330.8 ms | 69.77 ms | 88.8 |
 
-1. **Worker**: `initialize_kv_cache` already deep-copies `kv_cache_config`;
-   rewrite the copy's `spec.block_size` to `extent_size` and `num_blocks` to
-   `num_blocks // pages_per_extent`. Nothing else changes.
-2. **Scheduler**: emit extent ids (`manager.block_table(request_id)`) in
-   `NewRequestData.block_ids` and in the per-step block deltas, instead of
-   upstream's page ids.
+The effect decomposes cleanly and neither half belongs to this design:
+**match granularity** (512) buys TTFT (-44%), **physical block size** (8192)
+buys TPOT (-17%) and throughput (+18%). Page/extent and the overlay are within
+noise of each other once both run at 8192, so **page/extent carries no
+performance advantage**. Its case is alignment: `--block-size` becomes the unit
+the scheduler, routers and connectors share, and upstream's native hashing and
+events replace the overlay's reimplementation.
 
-Step 2 is the delicate half: the delta path assumes an append-only block list,
-and an extent list grows once per `pages_per_extent` pages rather than once per
-page. Getting that wrong is the same silent-corruption class as above, so it
-wants tests before hardware.
+Immediately actionable and independent of this work: the current default
+deployment gains ~18% throughput from `--block-size 8192` alone.
 
-Note the *inverse* of upstream's `kernel_block_size` shows up here too: upstream
-splits a manager block into smaller kernel blocks, whereas this groups pages —
-which is why the worker is told a bigger block size rather than a smaller one.
+### Verification
 
-**Not yet done in the scheduler**: the spec-decode "contiguous KV window" clamp
-still cuts at `self.block_size` (now the page) rather than `extent_size` —
-conservative and safe, but it narrows the decode window. Connector arbitration
-(`_try_sub_block_match`) is bypassed rather than replaced with cooperation.
+Wrong KV here is silent *and reads faster* -- fixed output length makes token
+counts identical across configs, and every benchmark metric improved while the
+model emitted garbage. Only a greedy probe diffed against the overlay catches
+it. Do this after any addressing change.
+
+Eviction paths are unit-tested but have never run on hardware: the benchmark
+pool (222K tokens) never evicted. Force it with `--num-gpu-blocks-override`.
+
+## Next steps
+
+1. **Pin down what consumes `cache_config.block_size` in the worker.**
+   Restating only the KV cache spec produced corrupt output; also overwriting
+   `cache_config` fixed it, but the RBLN attention impls are *not* the
+   consumer -- their `block_size` only selects a mode. This blocks (2).
+2. **Per-group physical units, for SWA hybrids.** The SWA kernel asserts
+   `sliding_window == kv_cache.size(-2)`, so an SWA group's physical unit is
+   fixed by its window, not chosen. The page stays global (upstream shares
+   `hash_block_size` and `num_computed_tokens` across groups) but the extent
+   must become per-group, which the single global `cache_config.block_size`
+   overwrite cannot express -- hence (1) first. Then drop the single-group
+   restriction in `can_use_page_extent`.
+3. **Rename with (2).** `extent` collides with two existing names for the same
+   thing: the compiler's `kvcache_partition_len` / `attn_block_size` and
+   upstream's `kernel_block_size`. Prefer `kernel_block`, which is already the
+   vocabulary in the SWA assert message; note upstream's namesake *splits*
+   where this *groups*. `ExtentGeometry` -> `PageLayout`. Not worth doing
+   before (2) reshapes it.
+4. **O(1) `bind()`.** It rewalks every extent of a request each step: 0.54 us
+   at 4 pages, 20.66 us at 1024. That is 0.08% of TPOT at `max_model_len`, so
+   it is scaling, not a present cost. Skip sealed extents.
+5. **Decide whether to keep this path at all**, given it is performance-neutral
+   and costs ~230 lines in the scheduler and worker plus a second KV stack to
+   maintain.
 
 ## Migration
 
