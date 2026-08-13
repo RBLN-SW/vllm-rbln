@@ -2,7 +2,7 @@
 
 notify:
 - github_commit_status:
-    context: "[OB] optimum tests"
+    context: "[OB] vllm-rbln optimum tests"
 
 env:
   UV_CACHE_DIR: "/mnt/uv_cache"
