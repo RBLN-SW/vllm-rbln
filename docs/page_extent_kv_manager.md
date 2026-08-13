@@ -32,7 +32,8 @@ compile config would close that hole and is the natural follow-up.
 Upstream vLLM treats `--block-size` as one unit for everything: scheduling,
 hashing, prefix matching, and physical storage. With a 4096-token block, any
 reusable prefix that ends inside a block is missed, so vllm-rbln added an
-overlay ([sub-block prefix caching](./sub_block_prefix_caching.md)).
+overlay ([sub-block prefix caching](./sub_block_prefix_caching.md)) -- "the
+overlay" below always means that feature, gated by `VLLM_RBLN_SUB_BLOCK_CACHE`.
 
 **Scope.** This design targets the **native vLLM-model path**
 (`VLLM_RBLN_USE_VLLM_MODEL=True`), where `--block-size` is still the coarse
@@ -528,7 +529,7 @@ a 512-token remainder), 4 prompts after a warm-up:
 
 | config | copy calls | ops | tokens copied |
 |---|---|---|---|
-| overlay (`--block-size 1024`, sub-block 256) | 4 | 4 | 2048 |
+| sub-block on (`--block-size 1024`, sub-block 256) | 4 | 4 | 2048 |
 | page/extent (page 256, extent 1024) | 4 | 4 | 2048 |
 
 The second continuation genuinely must copy in both designs: two requests
@@ -543,7 +544,7 @@ it eliminates the copy outright:
 
 | `[a,b,c]` finishes, then `[a,b,c,d]` | tokens copied | extents used |
 |---|---|---|
-| overlay | 768 | 2 blocks |
+| sub-block on | 768 | 2 blocks |
 | page/extent, no adoption | 768 | 2 |
 | page/extent with adoption | **0** | **1** |
 
@@ -568,7 +569,7 @@ tokens:
 
 | | copy ops | tokens copied | extents |
 |---|---|---|---|
-| overlay | 3 | 1536 | one new block per turn |
+| sub-block on | 3 | 1536 | one new block per turn |
 | page/extent, no adoption | 3 | 1536 | one new extent per turn |
 | page/extent with adoption | **0** | **0** | 2, reused every turn |
 
@@ -584,15 +585,20 @@ diverge immediately.
 emits exactly 2560 tokens. Chunk 512 throughout, identical KV pool (262144
 tokens), one NPU, runs sequential.
 
+The baseline is **sub-block prefix caching** (`VLLM_RBLN_SUB_BLOCK_CACHE=1`),
+which is what "the overlay" means throughout this doc; both baseline runs logged
+`Sub-block prefix caching enabled: block_size=<N>, sub_block_size=512`.
+
 | config | tok/s | mean TTFT | copy ops | tokens copied | copy time |
 |---|---|---|---|---|---|
-| overlay, block 1024 (today's default) | 191.9 | 34.8 ms | 5 | 2 560 | 61.2 ms |
-| overlay, block 8192 | 216.4 | 37.8 ms | 9 | 24 064 | 90.1 ms |
+| sub-block on, block 1024 (today's default) | 191.9 | 34.8 ms | 5 | 2 560 | 61.2 ms |
+| sub-block on, block 8192 | 216.4 | 37.8 ms | 9 | 24 064 | 90.1 ms |
 | page/extent, page 512 extent 8192 | **220.9** | **27.7 ms** | **0** | **0** | **0** |
 
-Against the overlay at the same physical block size: **TTFT -26.7%**, tok/s
-+2.1%. The TTFT gap (10.1 ms) is almost exactly the per-turn copy cost the
-overlay pays (90.1 ms / 10 turns = 9.0 ms), so the attribution is direct.
+Against sub-block caching at the same physical block size: **TTFT -26.7%**,
+tok/s +2.1%. Against today's default (block 1024): tok/s +15.1%, TTFT -20.4%.
+The 10.1 ms TTFT gap is almost exactly the per-turn copy cost sub-block caching
+pays (90.1 ms / 10 turns = 9.0 ms), so the attribution is direct.
 
 Two things this changes:
 
@@ -608,8 +614,8 @@ Two things this changes:
   is the agentic / multi-turn case, and it is where the two designs genuinely
   diverge.
 
-One loose end: `page/extent @ 8192` and `overlay @ 1024` produced byte-identical
-text, while `overlay @ 8192` diverged from both. Cross-geometry text comparison
+One loose end: `page/extent @ 8192` and `sub-block @ 1024` produced
+byte-identical text, while `sub-block @ 8192` diverged from both. Cross-geometry text comparison
 is not diagnostic (chunked-prefill boundaries move with cache hits, so bitwise
 equality is not expected even when both are correct), but the odd one out being
 the overlay at the large block size is worth a short greedy probe before
@@ -675,7 +681,7 @@ pool (222K tokens) never evicted. Force it with `--num-gpu-blocks-override`.
    MiniMax has 62 to Qwen's 28. Use the serve path, not the offline API, and a
    conversation long enough to cross an 8192-token extent so the overlay's
    full-block sharing also gets exercised.
-6. **Short greedy probe on `overlay @ block 8192`.** In the run above it was the
+6. **Short greedy probe on `sub-block caching @ block 8192`.** In the run above it was the
    only config whose text diverged from the other two. Probably benign (moving
    chunked-prefill boundaries), but that is the config recommended for the +18%
    throughput, so it should not go out unchecked.
