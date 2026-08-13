@@ -11,15 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import contextlib
 import logging
-import time
 from collections.abc import Iterator
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, NamedTuple, Union, cast
 
 import numpy as np
-import rebel
 import torch
 import torch.distributed
 import torch.nn as nn
@@ -90,7 +87,7 @@ from vllm_rbln.utils.optimum.registry import (
 from vllm_rbln.v1.core.optimum_scheduler import RBLNSchedulerOutput
 from vllm_rbln.v1.sample import WARM_UP_CONFIGS, RBLNSampler
 from vllm_rbln.v1.worker.ec_disagg_helpers import ECDisaggHelpersMixin
-from vllm_rbln.v1.worker.metrics import PerformanceTracker, collect_metrics
+from vllm_rbln.v1.worker.metrics_v2 import PerformanceContext
 from vllm_rbln.v1.worker.optimum_input_batch import RBLNInputBatch
 
 if TYPE_CHECKING:
@@ -261,9 +258,7 @@ class RBLNOptimumModelRunner(
             pin_memory=self.pin_memory,
         )
 
-        if envs.VLLM_RBLN_METRICS:
-            self.model_performance_tracker = PerformanceTracker("MODEL")
-            self.sampler_performance_tracker = PerformanceTracker("SAMPLER")
+        self.performance_ctx = PerformanceContext("runner")
 
         # Encoder cache for EC disaggregation.
         # Maps mm_hash → dict of prefill params (inputs_embeds, position_embed, etc.)
@@ -367,41 +362,20 @@ class RBLNOptimumModelRunner(
             blocking=has_new_prefill,
         ) as ec_connector_output:
             with record_function_or_nullcontext("rbln_model_runner: forward"):
-                if hasattr(rebel, "capture_reports"):
-                    capture_ctx = rebel.capture_reports()
-                else:
-                    # use a dummy context manager that does nothing
-                    capture_ctx = contextlib.nullcontext()
-                model_start_time = time.perf_counter()
                 # EC consumer with cached encoder output: run the decoder
                 # with pre-computed embeddings instead of the full model
                 # forward (which would require the vision encoder runtime).
-
                 new_reqs = scheduler_output.scheduled_new_reqs
                 prefill_has_mm = bool(new_reqs) and bool(new_reqs[0].mm_features)
-                if self.is_ec_consumer and model_input.is_prompt and prefill_has_mm:
-                    with capture_ctx as model_reports:
+                with self.performance_ctx.profile_model(model_input.is_prompt):
+                    if self.is_ec_consumer and model_input.is_prompt and prefill_has_mm:
                         hidden_states = self._run_prefill_with_cached_encoder(
                             model_input, scheduler_output
                         )
-                else:
-                    with capture_ctx as model_reports:
+                    else:
                         model_input = self._build_forward_inputs(model_input)
                         self.reuse_prefix_cached_kv(model_input, scheduler_output)
                         hidden_states = self.model(model_input)
-                if (
-                    envs.VLLM_RBLN_METRICS
-                    and self.model_performance_tracker is not None
-                ):
-                    collect_metrics(
-                        self.model_performance_tracker,
-                        model_input.is_prompt,
-                        start_time=model_start_time,
-                        end_time=time.perf_counter(),
-                        reports=model_reports,
-                        token_count=0,
-                        # the performance of sampler doesn't depend on token count
-                    )
                 sample_hidden_states = hidden_states.clone()
 
             with record_function_or_nullcontext("rbln_model_runner: postprocess"):
@@ -1531,24 +1505,8 @@ class RBLNOptimumModelRunner(
                 padded_logits = logits.reshape(1, -1)
             else:
                 padded_logits = logits
-            sampler_start_time = time.perf_counter()
-            if hasattr(rebel, "capture_reports"):
-                capture_ctx = rebel.capture_reports()
-            else:
-                # use a dummy context manager that does nothing
-                capture_ctx = contextlib.nullcontext()
-            with capture_ctx as sampler_reports:
+            with self.performance_ctx.profile_sampler():
                 sampler_output = self._sample(padded_logits, spec_decode_metadata=None)
-            if envs.VLLM_RBLN_METRICS and self.sampler_performance_tracker is not None:
-                collect_metrics(
-                    self.sampler_performance_tracker,
-                    is_prompt,
-                    start_time=sampler_start_time,
-                    end_time=time.perf_counter(),
-                    reports=sampler_reports,
-                    token_count=0,
-                    # the performance of sampler doesn't depend on token count
-                )
         self.input_batch.prev_sampled_token_ids = None
 
         with record_function_or_nullcontext("rbln_model_runner: bookkeep"):

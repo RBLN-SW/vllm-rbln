@@ -13,18 +13,15 @@
 # limitations under the License.
 
 import argparse
-import contextlib
-import time
 
 import numpy as np
-import rebel
 import torch
 from vllm.utils.torch_utils import make_tensor_with_pad
 from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
 
 from vllm_rbln.v1.sample import WARM_UP_CONFIGS, RBLNSampler
-from vllm_rbln.v1.worker.metrics import PerformanceTracker, collect_metrics
+from vllm_rbln.v1.worker.metrics_v2 import _PerformanceContext
 
 MAX_NUM_PROMPT_TOKENS = 64
 
@@ -102,7 +99,7 @@ def _create_sampling_metadata_from_config(
         top_p=top_p,
         top_k=top_k,
         generators={},
-        max_num_logprobs=0,
+        max_num_logprobs=None,
         prompt_token_ids=prompt_tokens_tensor,
         output_token_ids=output_token_ids,
         spec_token_ids=[[] for _ in range(batch_size)],
@@ -128,12 +125,12 @@ def run_benchmark(
     warmup_iters: int,
     benchmark_iters: int,
 ):
-    torch._dynamo.config.recompile_limit = len(WARM_UP_CONFIGS)
-    sampler = RBLNSampler(seed=42)
+    sampler = RBLNSampler()
     sampler = torch.compile(sampler, dynamic=False, fullgraph=False)
-    sampler_performance_tracker = PerformanceTracker("SAMPLER")
+    performance_ctx = _PerformanceContext("SAMPLER")
 
-    logits = _create_logits(batch_size, vocab_size)
+    reference_logits = _create_logits(batch_size, vocab_size)
+    logits = reference_logits.clone()
 
     # warmup: iterate over all WARM_UP_CONFIGS, matching actual vllm-rbln behavior
     for _ in range(warmup_iters):
@@ -144,6 +141,7 @@ def run_benchmark(
                 vocab_size=vocab_size,
                 device=logits.device,
             )
+            logits.copy_(reference_logits)
             sampler(logits, sampling_metadata)
 
     print(f"Running benchmark: {benchmark_config['name']}")
@@ -158,23 +156,16 @@ def run_benchmark(
         device=logits.device,
     )
 
+    # Sampler-only spans are dropped (the context records a sampler span only when
+    # it follows a model span), so this standalone benchmark goes through
+    # `profile_model(is_prefill=False)` and is flushed as a model-only record.
+    # Label reads "DECODE + SAMPLE" but nothing is paired. Timing and rebel report
+    # capture are handled inside the span.
     for _ in range(benchmark_iters):
-        if hasattr(rebel, "capture_reports"):
-            capture_ctx = rebel.capture_reports()
-        else:
-            capture_ctx = contextlib.nullcontext()
-        start_time = time.perf_counter()
-        with capture_ctx as model_reports:
+        logits.copy_(reference_logits)
+        with performance_ctx.profile_model(is_prefill=False):
             sampler(logits, sampling_metadata)
-        collect_metrics(
-            sampler_performance_tracker,
-            is_prefill=False,
-            start_time=start_time,
-            end_time=time.perf_counter(),
-            reports=model_reports,
-            token_count=0,
-        )
-    sampler_performance_tracker.print_final_stats()
+    performance_ctx.print_stats()
 
 
 def main():
