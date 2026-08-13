@@ -501,10 +501,13 @@ and extent-id block tables, worker geometry restatement and slot-range copies.
 The effect decomposes cleanly and neither half belongs to this design:
 **match granularity** (512) buys TTFT (-44%), **physical block size** (8192)
 buys TPOT (-17%) and throughput (+18%). Page/extent and the overlay are within
-noise of each other once both run at 8192, so **page/extent carries no
-performance advantage**. Its case is alignment: `--block-size` becomes the unit
-the scheduler, routers and connectors share, and upstream's native hashing and
-events replace the overlay's reimplementation.
+noise of each other here, which is why this was first read as "no performance
+advantage" -- but the workload is a shared prefix fanned out to four different
+questions, and on *that* shape parity is structural (see below). The multi-turn
+shape, where the two designs do diverge, is measured further down. Beyond speed
+the case is alignment: `--block-size` becomes the unit the scheduler, routers
+and connectors share, and upstream's native hashing and events replace the
+overlay's reimplementation.
 
 Immediately actionable and independent of this work: the current default
 deployment gains ~18% throughput from `--block-size 8192` alone.
@@ -574,6 +577,44 @@ turns, which is the check that matters: the two differ only in whether the KV
 bytes are copied elsewhere or left in place, so any mis-aimed extent would
 diverge immediately.
 
+### Measured 2026-08-13 (Qwen3-0.6B, multi-turn, deployment geometry)
+
+10 turns, each resuming the previous turn's tokens, prompt growing 1654 ->
+4048 tokens, 256 output tokens per turn pinned with `ignore_eos` so every config
+emits exactly 2560 tokens. Chunk 512 throughout, identical KV pool (262144
+tokens), one NPU, runs sequential.
+
+| config | tok/s | mean TTFT | copy ops | tokens copied | copy time |
+|---|---|---|---|---|---|
+| overlay, block 1024 (today's default) | 191.9 | 34.8 ms | 5 | 2 560 | 61.2 ms |
+| overlay, block 8192 | 216.4 | 37.8 ms | 9 | 24 064 | 90.1 ms |
+| page/extent, page 512 extent 8192 | **220.9** | **27.7 ms** | **0** | **0** | **0** |
+
+Against the overlay at the same physical block size: **TTFT -26.7%**, tok/s
++2.1%. The TTFT gap (10.1 ms) is almost exactly the per-turn copy cost the
+overlay pays (90.1 ms / 10 turns = 9.0 ms), so the attribution is direct.
+
+Two things this changes:
+
+- **The copy is per-op, not per-byte.** 12.2 ms/op for 56 MiB (block 1024) and
+  10.0 ms/op for 292 MiB (block 8192) -- 5x the bytes at the same cost. It is
+  the 28 per-layer slice assignments that dominate, not bandwidth, so earlier
+  GB/s reasoning about this cost was wrong. Expect it to scale with layer count:
+  MiniMax-M2.5 has 62.
+- **The overlay's cost grows with conversation length.** At block 8192 no full
+  block exists until the conversation reaches 8192 tokens, so every turn copies
+  the entire matched prefix -- 24 064 tokens over 10 turns here, and rising
+  quadratically with turn count. Adoption keeps page/extent flat at zero. This
+  is the agentic / multi-turn case, and it is where the two designs genuinely
+  diverge.
+
+One loose end: `page/extent @ 8192` and `overlay @ 1024` produced byte-identical
+text, while `overlay @ 8192` diverged from both. Cross-geometry text comparison
+is not diagnostic (chunked-prefill boundaries move with cache hits, so bitwise
+equality is not expected even when both are correct), but the odd one out being
+the overlay at the large block size is worth a short greedy probe before
+recommending that config.
+
 Beyond copies, page/extent's other mechanical edge is match *composability*: the
 overlay takes its remainder from a single source block, while `_place` locates
 each page independently and can compose one destination from several sources.
@@ -628,22 +669,20 @@ pool (222K tokens) never evicted. Force it with `--num-gpu-blocks-override`.
 4. **O(1) `bind()`.** It rewalks every extent of a request each step: 0.54 us
    at 4 pages, 20.66 us at 1024. That is 0.08% of TPOT at `max_model_len`, so
    it is scaling, not a present cost. Skip sealed extents.
-5. **Re-benchmark on multi-turn traffic, then decide whether to keep this
-   path.** The performance-neutral verdict was measured on fan-out traffic,
-   where parity is structural. Adoption makes the append case zero-copy where
-   the overlay structurally cannot be, and at the deployment geometry that is
-   `cached_tokens mod 8192` tokens per turn -- mean `(ppe-1)/2 x page` = 3840
-   tokens, worst 7680 -- times 248 KiB/token on MiniMax-M2.5 (62 layers, 8 KV
-   heads, head_dim 128, bf16), so ~930 MiB average and up to 1.82 GiB per turn.
-   In device-tensor mode that copy runs as 62 per-layer slice assignments, not
-   the runtime helper (`use_runtime_kv_copy` is False when
-   `VLLM_RBLN_USE_DEVICE_TENSOR=1`), so it is dispatch-bound rather than
-   bandwidth-bound. The existing table's TTFT regression from physical 1024 to
-   8192 (+45.8 ms) is arithmetically consistent with that copy at ~19 GB/s
-   effective, which if confirmed means adoption should recover it -- giving
-   8192's TPOT and throughput *and* 1024's TTFT instead of trading them. Time
-   `_process_kv_cache_copy_ops` directly to confirm before trusting the
-   attribution.
+5. **Confirm the multi-turn result on MiniMax-M2.5.** The Qwen3-0.6B numbers
+   above (TTFT -26.7% against the overlay at the same physical block) should
+   grow with layer count, since the copy is per-op dispatch over layers and
+   MiniMax has 62 to Qwen's 28. Use the serve path, not the offline API, and a
+   conversation long enough to cross an 8192-token extent so the overlay's
+   full-block sharing also gets exercised.
+6. **Short greedy probe on `overlay @ block 8192`.** In the run above it was the
+   only config whose text diverged from the other two. Probably benign (moving
+   chunked-prefill boundaries), but that is the config recommended for the +18%
+   throughput, so it should not go out unchecked.
+7. **Decide whether to keep this path**, given ~230 lines in the scheduler and
+   worker plus a second KV stack. It is no longer performance-neutral: on
+   fan-out it ties, on multi-turn it wins and the gap widens with conversation
+   length.
 
 ## Migration
 
