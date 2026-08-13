@@ -13,16 +13,17 @@
 # limitations under the License.
 
 import asyncio
-import os
 
 import openai
 import pytest
 import pytest_asyncio
 from utils import RemoteOpenAIServer
 
-MODEL_DIR = os.getenv("REBEL_VLLM_PRE_COMPILED_DIR", "./")
-MODEL_NAME = MODEL_DIR + "/opt_125m_batch2"
+MODEL_NAME = "facebook/opt-125m"
 MAX_TOKENS = 1
+
+SERVER_ARGS = ["--block-size", "2048", "--max-num-seqs", "2"]
+SERVER_ENV = {"VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK": "1"}
 
 
 @pytest.fixture(scope="module")
@@ -62,10 +63,11 @@ def server_args(request: pytest.FixtureRequest) -> list[str]:
 @pytest.fixture(scope="module")
 def server(server_args):
     args = [
+        *SERVER_ARGS,
         *server_args,
     ]
 
-    with RemoteOpenAIServer(MODEL_NAME, args) as remote_server:
+    with RemoteOpenAIServer(MODEL_NAME, args, env_dict=SERVER_ENV) as remote_server:
         yield remote_server
 
 

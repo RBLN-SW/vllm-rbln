@@ -15,6 +15,9 @@
 
 import pytest
 
+from vllm_rbln.model_executor.models.optimum.compilation.multimodal.qwen import (
+    get_param_qwen3_5,
+)
 from vllm_rbln.utils.optimum.converter.params import (
     RBLNParams,
     _num_devices_of,
@@ -302,3 +305,27 @@ class TestResolveNumDevices:
     def test_falls_back_to_top_level_when_submodule_lacks_num_devices(self):
         cfg = {"num_devices": 4, "language_model": {"batch_size": 2}}
         assert _resolve_num_devices(cfg) == 4
+
+
+class TestGetParamQwen35:
+    """Qwen3.5 forces flash attention, so block_size must partition
+    max_model_len into >= 2 even parts; otherwise the config is rejected."""
+
+    cfg = {
+        "batch_size": 1,
+        "num_devices": 1,
+        "memory_budget": 0.9,
+        "prefill_chunk_size": 128,
+    }
+
+    def test_valid_partition_sets_kvcache_partition_len(self):
+        param = get_param_qwen3_5(max_model_len=4096, block_size=1024, **self.cfg)
+        assert param["attn_impl"] == "flash_attn"
+        # block_size is actually carried into the compiled model.
+        assert param["kvcache_partition_len"] == 1024
+        assert param["max_seq_len"] == 4096
+
+    def test_block_size_equal_max_model_len_raises(self):
+        # Only 1 partition -> flash attention has no partition to work with.
+        with pytest.raises(ValueError, match="block_size"):
+            get_param_qwen3_5(max_model_len=4096, block_size=4096, **self.cfg)
