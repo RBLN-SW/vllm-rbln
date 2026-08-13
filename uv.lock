@@ -1527,8 +1527,8 @@ wheels = [
 
 [[package]]
 name = "optimum-rbln"
-version = "0.11.2a0"
-source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
+version = "0.11.2a1"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "accelerate" },
     { name = "diffusers" },
@@ -1540,9 +1540,9 @@ dependencies = [
     { name = "torchvision", marker = "platform_python_implementation == 'CPython'" },
     { name = "transformers" },
 ]
-sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/optimum-rbln/0.11.2a0/optimum_rbln-0.11.2a0.tar.gz", hash = "sha256:d3a2f978690ef1d824d211acb29cbbe73f7ef2353a8f70d020c9c76d5f7a8057" }
+sdist = { url = "https://files.pythonhosted.org/packages/37/22/4f0ace819ba138d2aa6f70f92c097b3bc0796d561ab9daea7e54b306336d/optimum_rbln-0.11.2a1.tar.gz", hash = "sha256:10d10abd186e7e3b59b1b622c45326b83df465036018ce15de65679b6cbf07a9", size = 602350, upload-time = "2026-08-13T11:12:37.693Z" }
 wheels = [
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/optimum-rbln/0.11.2a0/optimum_rbln-0.11.2a0-py3-none-any.whl", hash = "sha256:54d55ae86d849d2ef71e70e6db3ceadcba2ce0c95e0fc4d6c86a0957fa17da52" },
+    { url = "https://files.pythonhosted.org/packages/b6/b5/f7b9565052823ed3ec5b86178a65faa96ac00eee6859c5a9bce8646d6d5e/optimum_rbln-0.11.2a1-py3-none-any.whl", hash = "sha256:418c976cf884576c5bb286eef0ea302c27ae10ebbbb88f08c1dc29d1bfd0451e", size = 656637, upload-time = "2026-08-13T11:12:35.854Z" },
 ]
 
 [[package]]
@@ -2922,7 +2922,7 @@ requires-dist = [
     { name = "fastapi", extras = ["standard"], specifier = "<0.137" },
     { name = "fire", marker = "extra == 'dev'" },
     { name = "huggingface-hub", marker = "extra == 'dev'" },
-    { name = "optimum-rbln", specifier = ">=0.11.2a0" },
+    { name = "optimum-rbln", specifier = ">=0.11.2a1" },
     { name = "packaging", marker = "extra == 'dev'" },
     { name = "pynvml", marker = "extra == 'dev'" },
     { name = "pytest", marker = "extra == 'test'" },
