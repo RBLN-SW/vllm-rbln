@@ -48,4 +48,4 @@ steps:
           sparse:
             paths:
               - .buildkite
-        command: "buildkite-agent pipeline upload .buildkite/pipelines/vlln-rbln-pr/pipeline.yml"
+        command: "buildkite-agent pipeline upload .buildkite/pipelines/vllm-rbln-pr/pipeline.yml"
