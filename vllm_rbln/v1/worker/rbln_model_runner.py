@@ -3055,7 +3055,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
     def _process_kv_cache_copy_ops(
         self,
-        copy_ops: list[KVCacheCopyOp],
+        copy_ops: list[KVCacheCopyOp | KernelBlockCopyOp],
     ) -> None:
         use_runtime_kv_copy = (
             not USE_DEVICE_TENSOR

@@ -15,7 +15,7 @@
 import itertools
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
@@ -1136,7 +1136,11 @@ class RBLNScheduler(Scheduler):
         # Sources can be released now the worker has read them; running after
         # super() keeps this safe under async scheduling / PP.
         if scheduler_output.kv_cache_copy_ops:
-            self.kv_cache_manager.release_copy_ops(scheduler_output.kv_cache_copy_ops)
+            # One manager is installed at a time and each emits only its own op
+            # shape, so the list is homogeneous even though its type is a union.
+            self.kv_cache_manager.release_copy_ops(
+                cast(Any, scheduler_output.kv_cache_copy_ops)
+            )
 
         return result
 
