@@ -1,4 +1,8 @@
-# vllm-rbln pytest on Buildkite.
+# vllm-rbln optimum PR test suites, uploaded by .buildkite/pr.yml.
+
+notify:
+- github_commit_status:
+    context: "[OB] vllm-rbln optimum tests"
 
 env:
   UV_CACHE_DIR: "/mnt/uv_cache"
