@@ -400,6 +400,8 @@ class TestDummyRunPadding:
             # use_wrapped_compute_logits is a property over this.
             is_pooling_model=True,
             speculative_config=None,
+            # Gates the drafter's dummy run; __init__ always sets it.
+            drafter=None,
             kv_cache_bases=None,
             vllm_config=None,
             input_stager=SimpleNamespace(stage=stage),

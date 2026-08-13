@@ -31,7 +31,7 @@ import pytest
 import torch
 
 from tests.native.vllm_config import make_vllm_config
-from vllm_rbln.v1.worker import mega_cache
+from vllm_rbln.v1.worker import mega_cache, rbln_model_runner
 
 MODEL = "meta-llama/Llama-3"
 SIG = "sig"
@@ -486,6 +486,13 @@ class TestWarmupWiring:
         runner = make_model_runner()
         steps: list[tuple] = []
 
+        # The sampling-side warm-up is gated on the last PP rank; nothing here
+        # initializes a distributed group.
+        monkeypatch.setattr(
+            rbln_model_runner,
+            "get_pp_group",
+            lambda: SimpleNamespace(is_last_rank=True),
+        )
         monkeypatch.setattr(runner, "offload_context", contextlib.nullcontext)
         monkeypatch.setattr(
             runner, "_dummy_run", lambda *a, **kw: steps.append(("compile",))

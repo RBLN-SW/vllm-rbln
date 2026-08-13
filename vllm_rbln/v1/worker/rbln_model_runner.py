@@ -293,13 +293,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # Set up speculative decoding.
         # NOTE(Jiayi): We put the entire draft model on the last PP rank.
         # This is not ideal if there are many layers in the draft model.
+        self.drafter: (
+            RBLNEagleProposer
+            | RBLNMedusaProposer
+            | NgramProposer
+            | SuffixDecodingProposer
+            | None
+        ) = None
         if self.speculative_config and get_pp_group().is_last_rank:
-            self.drafter: (
-                RBLNEagleProposer
-                | RBLNMedusaProposer
-                | NgramProposer
-                | SuffixDecodingProposer
-            )
             if self.speculative_config.method == "ngram":
                 self.drafter = NgramProposer(self.vllm_config)
             elif self.speculative_config.method == "suffix":
@@ -954,15 +955,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             if kv_cache_gid > 0:
                 cm.block_table_tensor = _get_block_table(kv_cache_gid)
 
-            if self.speculative_config and spec_decode_common_attn_metadata is None:
-                # NOTE(RBLN): the drafter lives only on the last PP rank, so gate
-                # on the drafter object via getattr, not speculative_config (which
-                # every rank has). Here non-last ranks (drafter absent -> None)
-                # take the else branch, whose spec_decode_common_attn_metadata is
-                # unused -- only the last rank drafts.
-                drafter = getattr(self, "drafter", None)
-                if isinstance(drafter, RBLNEagleProposer):
-                    if drafter.kv_cache_gid == kv_cache_gid:
+            # NOTE(RBLN): gate on the drafter, not speculative_config (which every
+            # rank has): only the last PP rank drafts, and no other rank consumes
+            # this.
+            if self.drafter is not None and spec_decode_common_attn_metadata is None:
+                if isinstance(self.drafter, RBLNEagleProposer):
+                    if self.drafter.kv_cache_gid == kv_cache_gid:
                         spec_decode_common_attn_metadata = cm
                 else:
                     spec_decode_common_attn_metadata = cm
@@ -1788,7 +1786,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         else:
             self.logits_processor = None
         # TODO(RBLN): load lora
-        if hasattr(self, "drafter"):
+        if self.drafter is not None:
             logger.info_once("Loading drafter model...")
             self.drafter.load_model(self.model)
 
@@ -2157,13 +2155,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         ):
             _ = self.model_executable(**staged_model_input.as_kwargs())
 
-        # NOTE(RBLN): drafter is last-PP-rank only -- see _build_attention_metadata
-        # for the getattr gating rationale; non-last ranks skip.
-        drafter = getattr(self, "drafter", None)
-        if isinstance(drafter, RBLNEagleProposer) and (
+        if isinstance(self.drafter, RBLNEagleProposer) and (
             is_prefill or num_tokens_per_req == 1 + self.num_spec_tokens
         ):
-            drafter.dummy_run(
+            self.drafter.dummy_run(
                 num_reqs,
                 num_tokens_per_req,
                 is_prefill,
@@ -2327,11 +2322,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     num_metadata_builders=1,  # not use ubatching
                 )
 
-        # Initialize drafter attention backend; drafter is last-PP-rank only
-        # (see _build_attention_metadata), non-last ranks skip.
-        drafter = getattr(self, "drafter", None)
-        if isinstance(drafter, RBLNEagleProposer):
-            drafter.initialize_attn_backend(kv_cache_config, kernel_block_sizes)
+        # Initialize drafter attention backend.
+        if isinstance(self.drafter, RBLNEagleProposer):
+            self.drafter.initialize_attn_backend(kv_cache_config, kernel_block_sizes)
 
     def may_reinitialize_input_batch(
         self, kv_cache_config: KVCacheConfig, kernel_block_sizes: list[int]
@@ -2937,7 +2930,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                         yield value
 
         models = [self.model]
-        if isinstance(getattr(self, "drafter", None), RBLNEagleProposer):
+        if isinstance(self.drafter, RBLNEagleProposer):
             models.append(self.drafter.model)
 
         for model in models:
@@ -3067,19 +3060,20 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     )
                     _ = self.compute_logits(hidden_states)
 
-            # 4. sampler
-            if not self.is_pooling_model:
-                for size in self.bucketing_manager.batch_buckets:
-                    self._dummy_sampler_run(size)
+            # NOTE(RBLN): the sampler and the rejection sampler are built on the
+            # last PP rank only, so no other rank has anything to warm up here.
+            if get_pp_group().is_last_rank:
+                # 4-1. sampler
+                if not self.is_pooling_model:
+                    for size in self.bucketing_manager.batch_buckets:
+                        self._dummy_sampler_run(size)
 
-            # 4. rejection sampler warmup
-            self._warmup_sampler_decode_batches()
+                # 4-2. rejection sampler
+                self._warmup_sampler_decode_batches()
 
-            # 5. specdec (medusa); drafter is last-PP-rank only
-            # (see _build_attention_metadata).
-            drafter = getattr(self, "drafter", None)
-            if isinstance(drafter, RBLNMedusaProposer):
-                drafter.dummy_run()
+            # 5. specdec (medusa)
+            if isinstance(self.drafter, RBLNMedusaProposer):
+                self.drafter.dummy_run()
 
         mega_cache.save(self.model_config.model, sig)
 
