@@ -107,6 +107,12 @@ class RBLNScheduler(Scheduler):
         # matching is off.
         match_unit: int | None = None
 
+        # A decode query is written as one contiguous KV window, so the
+        # spec-decode boundary guards below need the *physical* block. Without
+        # page layout that is `self.block_size`; page layout makes it coarser
+        # and `_maybe_install_page_layout_manager` overwrites this.
+        self.physical_block_size = self.block_size
+
         # Supersedes the overlay: upstream gives the same fine-grained hits
         # directly once the page is --block-size.
         page_layout_installed = self._maybe_install_page_layout_manager()
@@ -225,7 +231,22 @@ class RBLNScheduler(Scheduler):
             metrics_collector=self.kv_metrics_collector,
             watermark=self.scheduler_config.watermark,
         )
+        self.physical_block_size = page_layout_config.geometry.kernel_block_size
         return True
+
+    def _spec_backfill_is_unsafe(
+        self, num_computed_tokens: int, num_new_tokens: int
+    ) -> bool:
+        """Would the runner's backfill reach out of the current physical block?
+
+        A decode query is written as one contiguous KV window, and the runner
+        pads it to `num_spec_tokens + 1` by reaching backwards. The block here
+        must be the *physical* one: under page layout the pages inside a kernel
+        block are contiguous (I3), so crossing a page boundary is harmless and
+        only a kernel-block boundary is a real discontinuity.
+        """
+        required_backfill = max(0, self.num_spec_tokens + 1 - num_new_tokens)
+        return required_backfill > num_computed_tokens % self.physical_block_size
 
     def _add_pending_runner_block_delta(
         self,
@@ -368,17 +389,17 @@ class RBLNScheduler(Scheduler):
             # the previous block, remember this request and force the finalized decode
             # batch to single-token decode only if this request remains scheduled.
             if self.num_spec_tokens > 0 and not is_prefill(request):
-                tokens_used_in_block = request.num_computed_tokens % self.block_size
-                remaining_in_block = self.block_size - tokens_used_in_block
+                tokens_used_in_block = (
+                    request.num_computed_tokens % self.physical_block_size
+                )
+                remaining_in_block = self.physical_block_size - tokens_used_in_block
                 num_new_tokens = min(remaining_in_block, num_new_tokens)
 
-                if num_new_tokens > 0:
-                    required_backfill = max(
-                        0, self.num_spec_tokens + 1 - num_new_tokens
-                    )
-                    if required_backfill > tokens_used_in_block:
-                        unsafe_backfill_req_ids.add(request.request_id)
-                        num_new_tokens = 1
+                if num_new_tokens > 0 and self._spec_backfill_is_unsafe(
+                    request.num_computed_tokens, num_new_tokens
+                ):
+                    unsafe_backfill_req_ids.add(request.request_id)
+                    num_new_tokens = 1
 
             if num_new_tokens <= 0:
                 # The request cannot be scheduled because one of the following
@@ -879,13 +900,10 @@ class RBLNScheduler(Scheduler):
                     # num_spec past tokens don't fit the current block the backfill
                     # would cross into the previous one -> mark unsafe so the batch
                     # drops to no-spec.
-                    if self.num_spec_tokens > 0:
-                        tokens_used_in_block = (
-                            request.num_computed_tokens % self.block_size
-                        )
-                        required_backfill = self.num_spec_tokens  # (num_spec+1)-1
-                        if required_backfill > tokens_used_in_block:
-                            unsafe_backfill_req_ids.add(request.request_id)
+                    if self.num_spec_tokens > 0 and self._spec_backfill_is_unsafe(
+                        request.num_computed_tokens, num_new_tokens
+                    ):
+                        unsafe_backfill_req_ids.add(request.request_id)
                     # The scheduled new request is added as a decoding-phase req, so
                     # we can continue to schedule the next request.
                     continue

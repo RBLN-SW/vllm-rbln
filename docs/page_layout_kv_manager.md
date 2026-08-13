@@ -356,6 +356,30 @@ kernel block-major, so gather/scatter still needs `(kernel_block_id, page_offset
 now equal), the backend must expose `kernel_block_size` to the connector through an
 explicit channel. This is an open item; see [§ Open questions](#open-questions).
 
+### NIXL / P-D disaggregation (unverified, open)
+
+Not exercised yet, and there is no guard, so this is a code-reading account
+rather than a measurement.
+
+`ensure_kv_transfer_initialized` runs *before* the runner's
+`initialize_kv_cache` (`rbln_worker.py`), and the runner deepcopies before
+restating geometry, so the NIXL worker holds the **pre-restatement, page-sized**
+config: `num_blocks` is a page count and `self.block_size` the page. The tensors
+it then registers are kernel-block shaped, so
+`assert cache.shape[0] == num_blocks` in the NIXL worker looks like it should
+fire at startup -- a loud failure rather than silent mis-addressing, but an
+unexplained one. `_select_canonical_kv_layers_per_pool` also loses the equality
+its docstring rests on: it prefers a Full-attention layer because that view's
+`cache.shape[-2]` equals `cache_config.block_size`, which page layout makes
+false (kernel block vs page).
+
+**A page-granular descriptor layout should be sound**, so this is a descriptor
+question rather than a redesign: pages inside a kernel block are contiguous by
+I3 and the pool is one flat token space, so page-space addressing stays correct
+as long as registration describes the tensor at page granularity. What needs
+settling is whether NIXL keeps the page as its unit (and the `shape[0]` /
+stride derivation follows) or is taught the kernel block.
+
 ### Cache hierarchy policy
 
 Device kernel blocks plus LMCache CPU/disk form a multi-level cache, and the policy
