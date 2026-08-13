@@ -14,10 +14,12 @@
 """Backport of vllm-project/vllm#46865 — give every sub-connector the request's
 real blocks in ``MultiConnector.update_state_after_alloc``.
 
-**Delete this module once the pinned vLLM contains that fix** (merged to vLLM
-``main`` as ``2285cfc`` on 2026-07-09; **not** in 0.24.0 — verified by reading
-the installed source). The ``condition`` below makes the patch a no-op on a
-fixed vLLM, so an early bump is safe; the module is still dead weight then.
+TODO(vllm>=0.26.0): delete this module, its registration in
+``vllm_rbln/patches/__init__.py`` and ``tests/native/patches/test_multi_connector.py``.
+The fix is upstream (merged to vLLM ``main`` as ``2285cfc`` on 2026-07-09) and
+ships in 0.26.0; it is **not** in 0.24.0 — verified by reading the installed
+source. The ``condition`` below already makes the patch a no-op on a fixed vLLM,
+so bumping before the cleanup is safe — the module just becomes dead weight.
 
 Why it matters
 --------------
@@ -86,12 +88,13 @@ logger = init_logger(__name__)
 def _upstream_still_blanks_blocks() -> bool:
     """True while the installed vLLM hands empty blocks to non-chosen children.
 
-    Read from the source rather than a version comparison: the fix landed on
-    ``main`` after 0.24.0 was cut, so there is no released version to compare
-    against yet, and vllm-rbln pins vLLM through its own lock. If the source
-    cannot be read we assume the bug is present — the pinned vLLM predates the
-    fix, and applying the patch on an already-fixed build is behaviour-neutral
-    anyway (the replacement is that fix).
+    Read from the source rather than comparing ``vllm.__version__`` against
+    0.26.0: vllm-rbln pins vLLM through its own lock, so a build can sit on a
+    ``main`` snapshot that carries the fix without carrying the version, and a
+    version test would then re-patch it. Reading the source is exact either way.
+    If the source cannot be read we assume the bug is present — applying the
+    patch on an already-fixed build is behaviour-neutral (the replacement *is*
+    that fix).
     """
     try:
         source = inspect.getsource(MultiConnector.update_state_after_alloc)
@@ -115,7 +118,7 @@ def _upstream_still_blanks_blocks() -> bool:
         "offload connector's store path — it records the request's block ids "
         "from this argument. On a prefill instance with a cold cache nobody "
         "wins, so no child ever sees the real blocks and the cache can never "
-        "bootstrap. Delete once the pinned vLLM carries the fix (2285cfc)."
+        "bootstrap. TODO(vllm>=0.26.0): delete — upstream fix is 2285cfc."
     ),
     condition=_upstream_still_blanks_blocks,
 )
