@@ -866,9 +866,7 @@ def test_min_tokens_masks_stop_tokens(rejection_sampler):
 
     # No output tokens yet and min_tokens=2, so both draft positions mask
     # the stop token.
-    params = SamplingParams(
-        min_tokens=2, max_tokens=18, stop_token_ids=[stop_token_id]
-    )
+    params = SamplingParams(min_tokens=2, max_tokens=18, stop_token_ids=[stop_token_id])
     proc.update_state(
         BatchUpdate(
             batch_size=1,

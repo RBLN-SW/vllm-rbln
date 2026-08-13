@@ -73,9 +73,7 @@ DEVICE = current_platform.device_type
 class MockModelWrapper(nn.Module):
     class MockModel:
         def __init__(self, dtype: torch.dtype):
-            self.rbln_config = SimpleNamespace(
-                use_multiple_decoder=False, dtype=dtype
-            )
+            self.rbln_config = SimpleNamespace(use_multiple_decoder=False, dtype=dtype)
             self.kv_block_adapter = SimpleNamespace(
                 get_available_num_blocks=lambda: NUM_BLOCKS
             )
