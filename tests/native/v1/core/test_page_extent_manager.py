@@ -183,22 +183,46 @@ class TestAdoption:
         assert len(ops) == 1 and ops[0].num_tokens == 16
         assert manager.block_table("r2") != manager.block_table("r1")
 
-    def test_real_turn_still_copies_because_the_tail_slot_is_stale(self, manager):
-        # The shape a real turn leaves behind, and the limit of adoption today:
-        # turn 0 ends mid-page, so its extent holds a partial page (16) upstream
-        # never hashed. Turn 1 matches only 14, 15 and gets a fresh trailing
-        # block (99), so the extent is not a prefix of the group and 14, 15 are
-        # copied. Fixing this needs the write pointer rewound past slot 2, which
-        # is only safe for pages nothing else has cached -- see doc step 5.
+    def test_real_turn_shape_is_zero_copy(self, manager):
+        # The shape observed on hardware (Qwen3-0.6B, 4 turns): upstream hands
+        # back the *same* block ids every turn, trailing block included, because
+        # the partial tail block is freed and immediately reallocated. So the
+        # retained extent already holds exactly this group and only its tail slot
+        # -- which upstream gave out for fresh writing -- needs rewriting.
+        turn = pages(10, 11, 12, 13, 14, 15, 16)
+        manager.bind("t0", turn, num_cached_pages=0)
+        head, tail = manager.block_table("t0")
+        manager.free_request("t0")
+
+        for i in range(1, 4):
+            ops = manager.bind(f"t{i}", turn, num_cached_pages=6)
+            assert ops == [], f"turn {i} copied"
+            assert manager.block_table(f"t{i}") == [head, tail]
+            manager.free_request(f"t{i}")
+        assert manager.num_pages_copied == 0
+
+    def test_a_different_trailing_block_is_not_adopted(self, manager):
+        # If the tail slot holds some other page, its bytes may still be cached
+        # for a longer prefix elsewhere, so dropping them is not ours to do.
         manager.bind("r1", pages(10, 11, 12, 13, 14, 15, 16), num_cached_pages=0)
-        head, tail = manager.block_table("r1")
+        tail = manager.block_table("r1")[1]
         manager.free_request("r1")
 
         ops = manager.bind("r2", pages(10, 11, 12, 13, 14, 15, 99), num_cached_pages=6)
         assert manager.table.require(tail).page_ids == [14, 15, 16]
         assert len(ops) == 1 and ops[0].num_tokens == 2 * 16
-        # The leading full extent still attaches by reference, as it should.
-        assert manager.block_table("r2")[0] == head
+
+    def test_a_poisoned_tail_slot_is_a_wildcard(self, manager):
+        # Slot 2's claim was revoked when page 16 was last written elsewhere. The
+        # resumed request rewrites that slot anyway, so it must not block reuse.
+        manager.bind("r1", pages(10, 11, 12), num_cached_pages=0)
+        extent_id = manager.block_table("r1")[0]
+        manager.free_request("r1")
+        manager.bind("other", pages(12), num_cached_pages=0)  # poisons slot 2
+        assert manager.table.require(extent_id).page_ids == [10, 11, -1]
+
+        ops = manager.bind("r2", pages(10, 11, 12), num_cached_pages=2)
+        assert ops == [] and manager.block_table("r2") == [extent_id]
 
     def test_uncached_prefix_is_not_adopted(self, manager):
         # Upstream reported no hit, so those page ids carry no reusable content.

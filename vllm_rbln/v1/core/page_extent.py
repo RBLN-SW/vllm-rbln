@@ -331,6 +331,21 @@ class ExtentTable:
         self._page_holders.setdefault(page_id, set()).add(extent_id)
         return slot
 
+    def truncate(self, extent_id: int, keep: int) -> None:
+        """Rewind the write pointer to ``keep`` slots, dropping their claims.
+
+        Only ever called for slots upstream handed out for fresh writing, so no
+        one can be matching the pages dropped here (same reasoning as
+        ``_revoke_stale_claims``).
+        """
+        extent = self.require(extent_id)
+        for page_id in extent.page_ids[keep:]:
+            if holders := self._page_holders.get(page_id):
+                holders.discard(extent_id)
+                if not holders:
+                    del self._page_holders[page_id]
+        del extent.page_ids[keep:]
+
     def _revoke_stale_claims(self, page_id: int, new_extent_id: int) -> None:
         """Poison, don't remove: removing shifts later slots and breaks I3."""
         holders = self._page_holders.get(page_id)
@@ -462,6 +477,11 @@ class PageExtentManager:
                     self.table.create(extent_id, depth=ext_idx)
                 else:
                     extent_id = adopt_id
+                    # Rewind to the cached prefix; the rest this request rewrites.
+                    self.table.truncate(
+                        extent_id,
+                        self._cached_in_group(group, base, num_cached_pages),
+                    )
                 self.table.attach_to_request(request_id, extent_id)
                 self.table.require(extent_id).owner = request_id
 
@@ -529,25 +549,42 @@ class PageExtentManager:
     ) -> int | None:
         """I5b: a retained partial extent this request can keep writing into.
 
-        The multi-turn case: a request ended mid-extent and the next one shares
+        The multi-turn case: a request ended mid-extent and the next one resumes
         that prefix and extends it. Appending in place is safe precisely when
         nobody else references the extent -- the resumed pages keep their slots,
         so I3 holds and the sharer I4 protects does not exist. Two requests
-        extending the same prefix still copy: the first adopts, the second sees
-        a live refcount.
+        extending one prefix still copy: the first adopts, the second sees a live
+        refcount.
+
+        A slot may hold the group's page or ``INVALID_PAGE`` (poisoned when that
+        page was last written elsewhere); either way the request rewrites it,
+        since only its cached pages are kept.
         """
+        cached = self._cached_in_group(group, base, num_cached_pages)
+        if cached == 0:
+            return None
         for candidate in self.table.holders(group[0]):
             extent = self.table.get(candidate)
             if (
                 extent is None
                 or extent.ref_cnt > 0
-                or extent.num_pages >= len(group)
-                or base + extent.num_pages > num_cached_pages
-                or extent.page_ids != group[: extent.num_pages]
+                or extent.sealed
+                or extent.num_pages > len(group)
+                or extent.num_pages < cached
             ):
                 continue
-            return candidate
+            if all(
+                held in (group[slot], INVALID_PAGE)
+                for slot, held in enumerate(extent.page_ids)
+            ):
+                return candidate
         return None
+
+    def _cached_in_group(
+        self, group: list[int], base: int, num_cached_pages: int
+    ) -> int:
+        """Leading pages of this group whose content already exists."""
+        return max(0, min(len(group), num_cached_pages - base))
 
     def _maybe_seal(self, extent_id: int) -> None:
         extent = self.table.get(extent_id)

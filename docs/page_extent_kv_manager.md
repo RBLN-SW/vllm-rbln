@@ -536,7 +536,7 @@ prefix, the multi-turn chat and agentic-loop shape. In principle page/extent can
 keep writing into the extent it already holds, where the overlay cannot:
 upstream caches only full blocks, so its sub-block match must land in a freshly
 allocated block and pay the copy every turn. Adoption (I5b) implements that, and
-it does eliminate the copy when the previous turn ended on a page boundary:
+it eliminates the copy outright:
 
 | `[a,b,c]` finishes, then `[a,b,c,d]` | tokens copied | extents used |
 |---|---|---|
@@ -544,23 +544,35 @@ it does eliminate the copy when the previous turn ended on a page boundary:
 | page/extent, no adoption | 768 | 2 |
 | page/extent with adoption | **0** | **1** |
 
-**Real turns do not end on a page boundary, and there adoption does not fire
-yet.** Measured 2026-08-13, Qwen3-0.6B, 4 turns each resuming the previous
-turn's tokens: overlay and page/extent both copy 512 tokens per turn, 1536
-total. The reason is exact and narrow. A turn leaves its retained extent holding
-`[p4, p5, p6]` where `p6` is a *partial* trailing page; upstream never hashed
-`p6`, so the next turn matches only `p4, p5` and is handed a fresh trailing
-block `p99`. The group is then `[p4, p5, p99]`, which is not a prefix of
-`[p4, p5, p6]`, so the extent is not adoptable and `p4, p5` are copied.
+Real turns do not end on a page boundary either, and adoption still covers
+them, because **upstream hands back the same block ids every turn** -- trailing
+block included, since the partial tail block is freed and immediately
+reallocated. Observed on hardware: `pages=[1,2,3,4,5,6,7] cached=6` identically
+on every turn. So the retained extent already holds exactly this group, and only
+its tail slot needs rewriting. Adoption therefore rewinds the write pointer to
+the cached prefix and re-places the rest; a slot may hold the group's page or
+`INVALID_PAGE` (poisoned when that page was last written elsewhere) and either
+way the request rewrites it.
 
-Closing that needs adoption to **rewind the write pointer** past trailing slots
-the new request does not count as cached, overwriting them in place. The blocker
-is safety, not mechanism: dropping those bytes is only sound if no *other*
-request has a longer cached prefix covering them, since upstream would still
-report a hit and read what we overwrote -- the silent-corruption mode this
-design warns about. `PageExtentManager` cannot see global hash state;
-`RBLNPageExtentKVCacheManager`, which holds the block pool, can. See
-[§ Next steps](#next-steps).
+Rewinding is safe without consulting global hash state, because it only ever
+drops slots upstream handed out for *fresh* writing, and upstream does not hand
+out a block that is currently cached -- the same reasoning `_revoke_stale_claims`
+already relies on. A slot holding a *different* page is not dropped: those bytes
+may still be cached for a longer prefix elsewhere.
+
+Measured 2026-08-13, Qwen3-0.6B, 4 turns each resuming the previous turn's
+tokens:
+
+| | copy ops | tokens copied | extents |
+|---|---|---|---|
+| overlay | 3 | 1536 | one new block per turn |
+| page/extent, no adoption | 3 | 1536 | one new extent per turn |
+| page/extent with adoption | **0** | **0** | 2, reused every turn |
+
+Greedy output is **bit-identical** with and without adoption across all four
+turns, which is the check that matters: the two differ only in whether the KV
+bytes are copied elsewhere or left in place, so any mis-aimed extent would
+diverge immediately.
 
 Beyond copies, page/extent's other mechanical edge is match *composability*: the
 overlay takes its remainder from a single source block, while `_place` locates
@@ -616,21 +628,22 @@ pool (222K tokens) never evicted. Force it with `--num-gpu-blocks-override`.
 4. **O(1) `bind()`.** It rewalks every extent of a request each step: 0.54 us
    at 4 pages, 20.66 us at 1024. That is 0.08% of TPOT at `max_model_len`, so
    it is scaling, not a present cost. Skip sealed extents.
-5. **Rewind the write pointer on adoption**, so the multi-turn append case is
-   actually zero-copy rather than only the page-boundary-aligned case. Adoption
-   (I5b) currently requires the retained extent to be an exact prefix of the
-   group, which a real turn never is: its trailing slot holds the previous
-   turn's partial page. Overwriting those trailing slots in place is safe only
-   for pages nothing else has cached, so the check belongs in
-   `RBLNPageExtentKVCacheManager`, which can see the block pool's hash state --
-   `PageExtentManager` cannot. This is the one remaining lever that could make
-   the path faster rather than merely aligned, so do it before (6).
-6. **Decide whether to keep this path at all**, given ~230 lines in the
-   scheduler and worker plus a second KV stack to maintain. The
-   performance-neutral verdict was measured on fan-out traffic, where parity is
-   structural. Re-benchmark on multi-turn traffic *after* (5): that is the only
-   shape where this design can beat the overlay on bytes moved, and the
-   1536-token shared-prefix benchmark cannot show it.
+5. **Re-benchmark on multi-turn traffic, then decide whether to keep this
+   path.** The performance-neutral verdict was measured on fan-out traffic,
+   where parity is structural. Adoption makes the append case zero-copy where
+   the overlay structurally cannot be, and at the deployment geometry that is
+   `cached_tokens mod 8192` tokens per turn -- mean `(ppe-1)/2 x page` = 3840
+   tokens, worst 7680 -- times 248 KiB/token on MiniMax-M2.5 (62 layers, 8 KV
+   heads, head_dim 128, bf16), so ~930 MiB average and up to 1.82 GiB per turn.
+   In device-tensor mode that copy runs as 62 per-layer slice assignments, not
+   the runtime helper (`use_runtime_kv_copy` is False when
+   `VLLM_RBLN_USE_DEVICE_TENSOR=1`), so it is dispatch-bound rather than
+   bandwidth-bound. The existing table's TTFT regression from physical 1024 to
+   8192 (+45.8 ms) is arithmetically consistent with that copy at ~19 GB/s
+   effective, which if confirmed means adoption should recover it -- giving
+   8192's TPOT and throughput *and* 1024's TTFT instead of trading them. Time
+   `_process_kv_cache_copy_ops` directly to confirm before trusting the
+   attribution.
 
 ## Migration
 
