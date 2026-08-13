@@ -3,7 +3,7 @@ agents:
 
 notify:
   - github_commit_status:
-      context: "[OB] native tests"
+      context: "[OB] vllm-rbln tests"
 
 steps:
   - label: "placeholder"

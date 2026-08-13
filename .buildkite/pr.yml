@@ -30,7 +30,7 @@ steps:
   # Both gates must pass before the heavy test pipelines are even uploaded.
   - wait: ~
 
-  - group: ":gear: optimum tests"
+  - group: ":gear: vllm-rbln optimum tests"
     key: "optimum"
     steps:
       - label: ":sparkles: upload optimum-pr"
@@ -40,12 +40,12 @@ steps:
               - .buildkite
         command: "buildkite-agent pipeline upload .buildkite/pipelines/optimum-pr/pipeline.yml"
 
-  - group: ":snake: native tests"
-    key: "native"
+  - group: ":snake: vllm-rbln tests"
+    key: "vlln-rbln"
     steps:
-      - label: ":sparkles: upload native-pr"
+      - label: ":sparkles: upload vlln-rbln-pr"
         checkout:
           sparse:
             paths:
               - .buildkite
-        command: "buildkite-agent pipeline upload .buildkite/pipelines/native-pr/pipeline.yml"
+        command: "buildkite-agent pipeline upload .buildkite/pipelines/vlln-rbln-pr/pipeline.yml"
