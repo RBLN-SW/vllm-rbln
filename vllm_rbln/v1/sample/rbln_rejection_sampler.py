@@ -77,6 +77,57 @@ class RBLNRejectionSampler(RejectionSampler):
             else TorchRejectionSamplerImpl()
         )
 
+    def _greedy_slice_path(
+        self,
+        metadata: SpecDecodeMetadata,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Views onto `logits` for the target and bonus rows, or None.
+
+        `logits` is laid out per request as `k` target rows followed by one
+        bonus row (`_calc_spec_decode_metadata`), so when every request drafts
+        the same `k` -- which EAGLE3 always does, it proposes exactly
+        `num_speculative_tokens` every step -- the two index tensors select
+        contiguous spans and the gathers can be slices instead.
+
+        Returned only when nothing downstream writes into them. The gathers are
+        load-bearing otherwise: `apply_sampling_constraints` divides by the
+        temperature in place, which on a view would corrupt `logits` itself.
+        """
+        if not sampling_metadata.all_greedy or envs.VLLM_RBLN_SAMPLER:
+            # The NPU kernel has no greedy path and needs the softmax over a
+            # real distribution (see `keep the greedy softmax` in the history),
+            # so it takes the writing path.
+            return None
+        if sampling_metadata.max_num_logprobs is not None:
+            # Bonus logprobs come from the sampler output we would skip.
+            return None
+        # Mirror `apply_logits_processors`: anything it would apply writes.
+        holder = sampling_metadata.thinking_budget_state_holder
+        if (
+            not sampling_metadata.no_penalties
+            or sampling_metadata.bad_words_token_ids
+            or (holder is not None and holder.has_tracked_requests())
+        ):
+            return None
+
+        num_draft_tokens = metadata.num_draft_tokens
+        if not num_draft_tokens:
+            return None
+        k = num_draft_tokens[0]
+        batch_size = len(num_draft_tokens)
+        if k == 0 or any(n != k for n in num_draft_tokens):
+            return None
+        if logits.shape[0] != batch_size * (k + 1):
+            return None
+
+        rows = logits.view(batch_size, k + 1, -1)
+        # `[:, :k]` is a prefix of each row group, so the reshape is free at the
+        # batch sizes this path is meant for; it falls back to a copy above
+        # that, which is no worse than the gather it replaces.
+        return rows[:, k], rows[:, :k].reshape(batch_size * k, -1)
+
     def forward(
         self,
         metadata: SpecDecodeMetadata,
@@ -113,36 +164,51 @@ class RBLNRejectionSampler(RejectionSampler):
         bonus_logits_indices = metadata.bonus_logits_indices
         target_logits_indices = metadata.target_logits_indices
 
-        # When indexing with a tensor (bonus_logits_indices), PyTorch
-        # creates a new tensor with separate storage from the original
-        # logits tensor. This means any in-place operations on bonus_logits
-        # won't affect the original logits tensor.
         assert logits is not None
-        bonus_logits = logits[bonus_logits_indices]
-        bonus_sampler_output = self.sampler(
-            logits=bonus_logits,
-            sampling_metadata=replace(
-                sampling_metadata,
-                max_num_logprobs=-1,
-            ),
-            predict_bonus_token=True,
-            # Override the logprobs mode to return logits because they are
-            # needed later to compute the accepted token logprobs.
-            logprobs_mode_override="processed_logits"
-            if self.is_processed_logprobs_mode
-            else "raw_logits",
-        )
-        bonus_token_ids = bonus_sampler_output.sampled_token_ids
+        bonus_sampler_output = None
+        fast = self._greedy_slice_path(metadata, logits, sampling_metadata)
+        if fast is not None:
+            # NOTE(RBLN): all-greedy fast path. Nothing below writes into these
+            # tensors, so they can be views: `apply_logits_processors` is a
+            # no-op without penalties/bad-words/thinking budget,
+            # `apply_sampling_constraints` returns greedy logits untouched, the
+            # softmax is skipped, and `argmax` only reads. That removes the two
+            # gathers -- 0.38 ms each on [4, 200064] -- and the float32 copy of
+            # the target rows, which argmax does not need: bf16 -> float32
+            # widens, so it cannot reorder.
+            bonus_logits, raw_target_logits = fast
+            bonus_token_ids = bonus_logits.argmax(dim=-1, keepdim=True)
+            target_logits = raw_target_logits
+        else:
+            # When indexing with a tensor (bonus_logits_indices), PyTorch
+            # creates a new tensor with separate storage from the original
+            # logits tensor. This means any in-place operations on bonus_logits
+            # won't affect the original logits tensor.
+            bonus_logits = logits[bonus_logits_indices]
+            bonus_sampler_output = self.sampler(
+                logits=bonus_logits,
+                sampling_metadata=replace(
+                    sampling_metadata,
+                    max_num_logprobs=-1,
+                ),
+                predict_bonus_token=True,
+                # Override the logprobs mode to return logits because they are
+                # needed later to compute the accepted token logprobs.
+                logprobs_mode_override="processed_logits"
+                if self.is_processed_logprobs_mode
+                else "raw_logits",
+            )
+            bonus_token_ids = bonus_sampler_output.sampled_token_ids
 
-        # Just like `bonus_logits`, `target_logits` is a new tensor with
-        # separate storage from the original `logits` tensor. Therefore,
-        # it is safe to update `target_logits` in place.
-        raw_target_logits = logits[target_logits_indices]
-        # Use float32 for the target_logits.
-        raw_target_logits = raw_target_logits.to(torch.float32)
-        target_logits = self.apply_logits_processors(
-            raw_target_logits, sampling_metadata, metadata
-        )
+            # Just like `bonus_logits`, `target_logits` is a new tensor with
+            # separate storage from the original `logits` tensor. Therefore,
+            # it is safe to update `target_logits` in place.
+            raw_target_logits = logits[target_logits_indices]
+            # Use float32 for the target_logits.
+            raw_target_logits = raw_target_logits.to(torch.float32)
+            target_logits = self.apply_logits_processors(
+                raw_target_logits, sampling_metadata, metadata
+            )
         # [num_tokens, vocab_size]
         # NOTE(woosuk): `target_logits` can be updated in place inside the
         # `apply_sampling_constraints` function.
@@ -185,6 +251,9 @@ class RBLNRejectionSampler(RejectionSampler):
 
         logprobs_tensors = None
         if sampling_metadata.max_num_logprobs is not None:
+            # The fast path above is gated on there being no logprobs, so the
+            # sampler output it skips is always present here.
+            assert bonus_sampler_output is not None
             logprobs_tensors = self._get_logprobs_tensors(
                 sampling_metadata.max_num_logprobs,
                 metadata,
