@@ -1,5 +1,9 @@
 # vllm-rbln optimum PR test suites, uploaded by .buildkite/pr.yml.
 
+notify:
+- github_commit_status:
+    context: "[OB] optimum tests"
+
 env:
   UV_CACHE_DIR: "/mnt/uv_cache"
   UV_LINK_MODE: "symlink"

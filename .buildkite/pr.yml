@@ -1,7 +1,3 @@
-notify:
-  - github_commit_status:
-      context: "[OB] vllm-rbln PR CI"
-
 env:
   UV_CACHE_DIR: "/mnt/uv_cache"
   UV_LINK_MODE: "symlink"
@@ -36,9 +32,6 @@ steps:
 
   - group: ":gear: optimum tests"
     key: "optimum"
-    notify:
-    - github_commit_status:
-        context: "[OB] optimum tests"
     steps:
       - label: ":sparkles: upload optimum-pr"
         checkout:
@@ -49,9 +42,6 @@ steps:
 
   - group: ":snake: native tests"
     key: "native"
-    notify:
-    - github_commit_status:
-        context: "[OB] native tests"
     steps:
       - label: ":sparkles: upload native-pr"
         checkout:

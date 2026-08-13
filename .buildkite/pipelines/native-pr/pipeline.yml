@@ -1,6 +1,10 @@
 agents:
   queue: r18s
 
+notify:
+  - github_commit_status:
+      context: "[OB] native tests"
+
 steps:
   - label: "placeholder"
     image: "${DEVTOOLS_DOCKER_IMAGE}"
