@@ -356,6 +356,72 @@ kernel block-major, so gather/scatter still needs `(kernel_block_id, page_offset
 now equal), the backend must expose `kernel_block_size` to the connector through an
 explicit channel. This is an open item; see [§ Open questions](#open-questions).
 
+### Hybrid attention (gpt-oss-120b): what it actually needs
+
+gpt-oss-120b alternates `sliding_attention` (window **128**) with
+`full_attention` over 36 layers, so two KV cache groups. The window is
+*smaller* than any sensible page, and that changes the shape of the problem:
+
+| group | page | physical unit | direction |
+|---|---|---|---|
+| full attention | 512 | 8192 (`attn_block_size`) | **group** pages -- this design |
+| sliding window | 512 | 128 (`sliding_window`) | **split** the page -- upstream already does this |
+
+A hybrid therefore needs *both* directions at once, and only one of them is new
+work: `prepare_kernel_block_sizes` already returns `sliding_window` for an
+`RBLNSlidingWindowSpec` group, which is how hybrids run today. So support
+reduces to **passing non-groupable groups through untouched** rather than
+per-group grouping in full generality:
+
+1. `can_use_page_layout` accepts several groups, requires all of them page-sized
+   and exactly one *groupable* (no `sliding_window`), and returns its index.
+2. The manager stores that index; `_page_ids` uses
+   `get_blocks(request_id)[group_id]` instead of `[0]`.
+3. `_rewrite_block_ids_to_kernel_blocks` rewrites only that group's entry of the
+   `block_ids` tuple and passes the others through, including the `None` delta
+   case, which now has to distinguish "no delta for us" from "no delta at all".
+4. The worker restates only that group's spec and trims only its pools.
+   `kv_cache_config.num_blocks` is not the obstacle it looks like: the reshape
+   derives each pool's block count from `raw_tensor.numel() //
+   spec.page_size_bytes`, so per-group physical units are already expressible,
+   and the worker's `num_blocks` only feeds `cache_config.num_gpu_blocks` and a
+   log line.
+
+**They do share a pool, and that is the blocker.** Upstream's uniform-page-size
+hybrid path builds one `KVCacheTensor` per slot index whose `shared_by` holds the
+i-th layer of *every* group (`kv_cache_utils.py`, `size = page_size *
+num_blocks`), so a Full layer and an SWA layer sit in the same bytes -- gpt-oss's
+two groups have the same head count and head size, so they pool. The coordinator
+then hands out page ids for both groups from that one shared pool, relying on the
+allocations being disjoint.
+
+Page layout cannot live inside that arrangement as written, because it does not
+merely re-tile a view: `KernelBlockAllocator` is a *second allocator* over the
+same memory, sized `num_pages // pages_per_kernel_block`. With a single group it
+owns the whole pool and that is fine. Sharing the pool with a group upstream is
+still allocating pages from means two allocators over one region, so a kernel
+block and an SWA page id can name the same bytes. Re-tiling alone is not the
+problem -- a pool is a flat token space and both tilings are valid views of it --
+the problem is ownership.
+
+Two ways out, neither contained:
+
+- **Give the groupable group its own pool.** Costs the memory that HMA pooling
+  saves and needs the upstream allocation path to stop merging those layers.
+- **Let page layout consume the coordinator's page ids instead of allocating.**
+  Kernel blocks would have to be formed from whatever pages upstream hands out,
+  which breaks the contiguity (I3) that makes a kernel block DMA-addressable in
+  the first place.
+
+So hybrid support is not the pass-through change steps 1-4 suggest. Settle
+ownership first.
+
+Also still unguarded, unrelated to hybrids: a **pure-SWA single group** passes
+`can_use_page_layout` today, because `RBLNSlidingWindowSpec` is an
+`AttentionSpec` and its `block_size` equals the page. The worker would restate
+it to the kernel block while `prepare_kernel_block_sizes` reports
+`sliding_window`, so the geometry disagrees. It should be rejected explicitly.
+
 ### NIXL / P-D disaggregation (unverified, open)
 
 Not exercised yet, and there is no guard, so this is a code-reading account
