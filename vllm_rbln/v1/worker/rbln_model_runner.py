@@ -2627,15 +2627,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         for group in kv_cache_config.kv_cache_groups:
             group.kv_cache_spec = replace(group.kv_cache_spec, block_size=extent_size)
 
-        # Restating only the spec produced corrupt output that looked *faster*
-        # (2026-08-13, greedy probe); overwriting cache_config too fixed it.
-        # Which consumer reads this is not yet pinned down -- it is not the
-        # RBLN attention impls, whose block_size only selects a mode. No
-        # benchmark metric catches this, so verify addressing changes with a
-        # greedy probe. Safe to overwrite: the worker is a separate process.
-        self.cache_config.block_size = extent_size
-        self.vllm_config.cache_config.block_size = extent_size
-
+        # Restate the spec only. `cache_config.block_size` must keep the page:
+        # the engine core reads it *after* this runs, in
+        # `resolve_kv_cache_block_sizes`, where for a single group it becomes
+        # both the scheduler block size and the hash block size. Under an
+        # in-process worker (uniproc, world_size 1) that read sees whatever we
+        # write here, and an extent-sized value contradicts the page-sized spec
+        # the scheduler kept -- `UnitaryKVCacheCoordinator` asserts on it.
         old_num_blocks = kv_cache_config.num_blocks
         num_extents = old_num_blocks // pages_per_extent
         kv_cache_config.num_blocks = num_extents

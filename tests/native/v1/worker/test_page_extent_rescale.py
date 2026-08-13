@@ -107,14 +107,16 @@ def test_degenerate_or_misaligned_extent_is_ignored(monkeypatch, extent):
     assert config.kv_cache_groups[0].kv_cache_spec.block_size == PAGE
 
 
-def test_cache_config_is_restated_so_attention_sees_the_extent(monkeypatch):
-    # Attention impls read their block size from cache_config, not from the KV
-    # cache spec. Leaving it at the page size makes them stride a 512-token
-    # block through an 8192-token tensor -- reading a sixteenth of each block,
-    # which corrupts output while appearing faster.
+def test_cache_config_keeps_the_page(monkeypatch):
+    # Only the spec is restated. The engine core reads cache_config.block_size
+    # after this, in resolve_kv_cache_block_sizes, where a single group makes it
+    # both the scheduler block size and the hash block size; an in-process
+    # worker shares the object, so an extent here contradicts the page-sized
+    # spec the scheduler kept and trips UnitaryKVCacheCoordinator's
+    # hash_block_size == block_size assert.
     runner, _ = rescale(make_config(217), monkeypatch=monkeypatch)
-    assert runner.cache_config.block_size == EXTENT
-    assert runner.vllm_config.cache_config.block_size == EXTENT
+    assert runner.cache_config.block_size == PAGE
+    assert runner.vllm_config.cache_config.block_size == PAGE
 
 
 def test_block_size_is_untouched_when_disabled(monkeypatch):

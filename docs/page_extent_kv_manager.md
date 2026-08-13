@@ -509,6 +509,31 @@ events replace the overlay's reimplementation.
 Immediately actionable and independent of this work: the current default
 deployment gains ~18% throughput from `--block-size 8192` alone.
 
+### Why the parity is structural, not an artifact of this benchmark
+
+The intuition that the overlay must pay a pre-forward D2D copy page/extent
+avoids does not hold: **at equal physical block size the two copy the same
+bytes, always.** Both share whole physical units by reference and copy only the
+sub-unit remainder of the match -- the overlay from `apply_sub_block_match`
+(`num_matched * sub_block_size` tokens), page/extent from `_place` (one page per
+slot whose source extent differs, coalesced). Copy volume is
+`cached_tokens % physical_block` either way, bounded by one physical unit.
+
+Measured 2026-08-13, Qwen3-0.6B, page/sub-block 256, physical 1024, 1640-token
+shared prefix (matches 6 pages = 1536 tokens = one full 1024 unit plus a
+512-token remainder), 4 prompts after a warm-up:
+
+| config | copy calls | ops | tokens copied |
+|---|---|---|---|
+| overlay (`--block-size 1024`, sub-block 256) | 4 | 4 | 2048 |
+| page/extent (page 256, extent 1024) | 4 | 4 | 2048 |
+
+Identical. Page/extent's mechanical advantage over the overlay is not copy
+avoidance but match *composability*: the overlay takes its remainder from a
+single source block, while `_place` locates each page independently and can
+compose one destination from several sources. That shows up as hit rate on
+fragmented traffic, not as bytes moved.
+
 ### Verification
 
 Wrong KV here is silent *and reads faster* -- fixed output length makes token
@@ -521,17 +546,34 @@ pool (222K tokens) never evicted. Force it with `--num-gpu-blocks-override`.
 
 ## Next steps
 
-1. **Pin down what consumes `cache_config.block_size` in the worker.**
-   Restating only the KV cache spec produced corrupt output; also overwriting
-   `cache_config` fixed it, but the RBLN attention impls are *not* the
-   consumer -- their `block_size` only selects a mode. This blocks (2).
+1. ~~**Pin down what consumes `cache_config.block_size` in the worker.**~~
+   **Done 2026-08-13 -- nothing in the worker does.** A read tracer installed
+   on `cache_config` at the end of the rescale logged exactly two post-rescale
+   readers, both in the *engine core*:
+   `resolve_kv_cache_block_sizes` (`vllm/v1/core/kv_cache_utils.py:631`, called
+   from `EngineCore.__init__`), where a single group makes it *both* the
+   scheduler block size and the hash block size, and the config handshake at
+   `core.py:1528`, which reports it to the front end. Zero worker-side readers.
+
+   The overwrite reached them only because at `world_size == 1` vLLM uses
+   `UniProcExecutor`, so the worker shares the process -- and the `VllmConfig`
+   object -- with the engine core; under a multi-process executor (the DP4+EP
+   benchmark) it was inert. It is now also fatal in-process: an extent-sized
+   value contradicts the page-sized spec the scheduler kept, and
+   `UnitaryKVCacheCoordinator` asserts `hash_block_size == block_size` at
+   startup. **The overwrite is deleted**; the spec restatement alone is
+   correct, and the greedy probe on Qwen3-0.6B is coherent and byte-identical
+   with and without the (now removed) write. The earlier corruption that
+   motivated it must have had another cause -- most likely the
+   `long_prefill_token_threshold` flooring bug fixed in the same commit.
 2. **Per-group physical units, for SWA hybrids.** The SWA kernel asserts
    `sliding_window == kv_cache.size(-2)`, so an SWA group's physical unit is
    fixed by its window, not chosen. The page stays global (upstream shares
-   `hash_block_size` and `num_computed_tokens` across groups) but the extent
-   must become per-group, which the single global `cache_config.block_size`
-   overwrite cannot express -- hence (1) first. Then drop the single-group
-   restriction in `can_use_page_extent`.
+   `hash_block_size` and `num_computed_tokens` across groups) and the extent
+   becomes per-group. No longer blocked: with (1) resolved the physical unit
+   lives only in the per-group spec, which is already per-group, so nothing has
+   to be expressed through the one global `cache_config.block_size`. Then drop
+   the single-group restriction in `can_use_page_extent`.
 3. **Rename with (2).** `extent` collides with two existing names for the same
    thing: the compiler's `kvcache_partition_len` / `attn_block_size` and
    upstream's `kernel_block_size`. Prefer `kernel_block`, which is already the
@@ -543,7 +585,9 @@ pool (222K tokens) never evicted. Force it with `--num-gpu-blocks-override`.
    it is scaling, not a present cost. Skip sealed extents.
 5. **Decide whether to keep this path at all**, given it is performance-neutral
    and costs ~230 lines in the scheduler and worker plus a second KV stack to
-   maintain.
+   maintain. The copy-volume measurement above closes off the last hypothesised
+   source of a speed win, so the decision rests on match composability and on
+   `--block-size` alignment alone.
 
 ## Migration
 
