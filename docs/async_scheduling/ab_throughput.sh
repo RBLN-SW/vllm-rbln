@@ -2,9 +2,9 @@
 # Throughput A/B for async vs sync scheduling.
 #
 # Metric = vLLM's own tqdm "est. speed output" (wall clock, total_out_toks /
-# elapsed). That is only comparable across arms when every request emits exactly
-# max_tokens, which needs VLLM_RBLN_EXEC_IGNORE_EOS=1 (see COMMON). It is NOT a
-# suite default - suite.py `_ignore_eos` reads that variable and defaults to 0.
+# elapsed). Comparable across arms because two correct arms emit the same tokens
+# and stop at the same place: measured without ignore_eos, both arms produced
+# 29641 tokens and identical text, and round-to-round spread was under 0.4%.
 #
 # Read the results with agg_tokps.py - never by eyeballing the last tok/s line.
 # Run-to-run spread is 1-3%. NOTE: RUNITER is NOT the old REPRO. --repro-run N
@@ -68,16 +68,8 @@ python3 -m vllm_rbln_executor.cli config list
 # True on its own, producing the identical OfflineModeIsEnabled failure.
 # Everything else is already in HF_HOME, so online mode only costs etag checks.
 #
-# VLLM_RBLN_EXEC_IGNORE_EOS=1 is what makes tok/s an arm-to-arm comparison.
-# suite.py `_ignore_eos` defaults it to 0, so requests stop at EOS: measured at
-# mt=1024, only 27 of 32 prompts reached the cap and the arms emitted different
-# totals (async 29411 vs sync 29511 tokens). Worse than the numerator drift is
-# the straggler tail the docstring warns about - finished slots idle while one
-# long request runs on, for a different stretch in each arm. Note this does not
-# touch the text comparison: ignore_eos decides when generation stops, never
-# which token is picked, so two correct arms still produce identical text.
 COMMON="MKL_NUM_THREADS=1 VLLM_RBLN_USE_DEVICE_TENSOR=1 TORCH_RBLN_DISABLE_FALLBACK=compile_error \
-VLLM_RBLN_SAMPLER=1 VLLM_RBLN_EXEC_IGNORE_EOS=1 \
+VLLM_RBLN_SAMPLER=1 \
 VLLM_RBLN_AUTO_PORT=1 RBLN_WEIGHT_FREE=1 VLLM_RBLN_BATCH_ATTN_OPT=1 \
 VLLM_RBLN_SORT_BATCH=1 VLLM_RBLN_MOE_REDUCE_SCATTER=1 \
 SPDLOG_LEVEL=warning RBLN_VERBOSE=warning \

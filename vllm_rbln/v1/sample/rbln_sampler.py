@@ -166,20 +166,13 @@ class RBLNSampler(VLLMSampler):
 
     @torch.compiler.disable
     def greedy_sample(self, logits: torch.Tensor) -> torch.Tensor:
-        # The graph returns a dense (B,) int32. The kernel writes each token
-        # splatted across a 64-lane group, but reshape_last_dim compacts that on
-        # device, so the output's physical form is a single 64-lane block with the
-        # B tokens adjacent at the head and the rest padding - one 32-byte copy
-        # for B=8, not a strided gather. Copying out lets the graph output die at
-        # once, which keeps its address stable - a changed one re-patches the
-        # command stream every step. non_blocking is deliberate: a blocking copy
-        # would wait on argmax, reinstating the drain this change removes.
+        # Copy the dense (B,) out so the graph output dies at once and keeps its
+        # address; a changed one re-patches the command stream every step.
+        # non_blocking, or the copy waits on argmax.
         #
-        # Two buffers, alternating: async scheduling hands the returned view to
-        # the output thread and keeps stepping, so a single buffer would be
-        # overwritten by the next step before those tokens had been read. Unlike
-        # the attention staging buffers these are not graph IO - nothing relocates
-        # to them - so rotating costs no command-stream patching.
+        # Two buffers alternating: async scheduling hands the returned view to the
+        # output thread and keeps stepping, so one buffer would be overwritten
+        # before those tokens were read.
         out = self._compiled_greedy_sample(logits)
         ring = self._tok_stage
         if not ring or ring[0].shape != out.shape or ring[0].device != out.device:

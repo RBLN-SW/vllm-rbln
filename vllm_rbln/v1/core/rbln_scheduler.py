@@ -1049,35 +1049,24 @@ class RBLNAsyncScheduler(RBLNScheduler, AsyncScheduler):
     serial, no overlap with forward(N)'s NPU work.
 
     AsyncScheduler fixes this by bumping num_output_placeholders at schedule
-    time (and reconciling on output). Compose via MRO:
-    RBLNAsyncScheduler -> RBLNScheduler -> AsyncScheduler -> Scheduler.
-    RBLNScheduler.schedule() calls self._update_after_schedule() and
-    update_from_output() calls super().update_from_output() (base ->
-    _update_request_with_output); RBLNScheduler defines neither hook, so both
-    resolve to AsyncScheduler. Selected only when async_scheduling is set.
+    time. Composed via MRO: RBLNAsyncScheduler -> RBLNScheduler ->
+    AsyncScheduler -> Scheduler. RBLNScheduler defines neither
+    _update_after_schedule nor _update_request_with_output, so both resolve to
+    AsyncScheduler.
 
-    Cold-start batch composition: the optimistic scheduler dispatches steps
-    non-blocking, so it can begin stepping before all in-flight client requests
-    have been ingested from the EngineCore input queue
-    (vllm.v1.engine.core.EngineCore._process_input_queue only drains what has
-    already arrived). The number of requests admitted before the first prefill
-    can therefore vary run-to-run with IPC delivery timing, which changes the
-    per-step DP batch composition (num_tokens_across_dp). The schedule()
-    override below holds the first step until request ingestion has quiesced so
-    that composition is fixed; see _det_quiesced.
+    Cold start: stepping can begin before every in-flight client request has
+    been ingested from the EngineCore input queue, so how many requests are
+    admitted before the first prefill varies with IPC timing - and with it the
+    per-step DP batch composition. schedule() holds the first step until
+    ingestion quiesces; see _det_quiesced.
     """
 
     def _det_quiesced(self) -> bool:
-        """Cold-start determinism gate.
+        """True once the initially-queued request set has stopped growing.
 
-        Returns True once the initially-queued request set has stopped growing,
-        so the first-step DP batch composition is fixed run-to-run. Until then
-        returns False -- the caller then schedules nothing this step
-        (token_budget=0) and this method sleeps briefly, letting the EngineCore
-        loop drain more requests from its input queue (filled by a separate
-        socket thread) before the next call. Re-arms whenever the engine goes
-        idle, so every cold start is covered. Only the cold start can wait; once
-        _det_warm is set this returns True immediately. See the class docstring.
+        Until then the caller schedules nothing and this sleeps briefly, letting
+        the EngineCore loop drain more requests from its input queue. Re-arms
+        when the engine goes idle; returns True immediately once warm.
         """
         if not self.waiting and not self.running:
             # Engine idle: nothing to hold for; re-arm for the next cold start.
@@ -1103,13 +1092,11 @@ class RBLNAsyncScheduler(RBLNScheduler, AsyncScheduler):
         return False
 
     def schedule(self, throttle_prefills: bool = False) -> RBLNSchedulerOutput:
-        # The signature must track RBLNScheduler.schedule: vLLM 0.24's
-        # step_with_batch_queue calls schedule(self._should_throttle_prefills()),
-        # and that is the async-only path, so a stale signature here fails
-        # nowhere else -- it takes down every async run at the first step.
+        # The signature must track RBLNScheduler.schedule: step_with_batch_queue
+        # calls schedule(self._should_throttle_prefills()), and that is the
+        # async-only path, so a stale signature here breaks every async run.
         #
         # Hold the first step until request ingestion quiesces so the DP batch
-        # composition is deterministic run-to-run (see class docstring). Async only;
-        # sync gets determinism free from its blocking first prefill.
+        # composition is deterministic (see class docstring).
         self._det_hold = not self._det_quiesced()
         return super().schedule(throttle_prefills)

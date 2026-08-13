@@ -14,24 +14,17 @@
 
 """Per-step region timing. Off unless VLLM_RBLN_STEP_PROBE is set.
 
-This is the primary metric for async scheduling work, because the obvious one
-does not survive contact with the workload: end-to-end tok/s swings ~3% between
-rounds of the same arm, which is larger than most of the effects worth chasing.
-A region here reports over 200 steps per rank with under 1% spread.
+The primary metric for async scheduling work: end-to-end tok/s swings ~3%
+between rounds of the same arm, larger than most effects worth chasing, while a
+region here reports over 200 steps per rank with under 1% spread.
 
-Each region reports wall, CPU (thread_time) and their difference. That split is
-what makes it useful: a region that waits on the device shows up as wall minus
-CPU, and pure host work shows up as CPU, so "1.1 ms of host gather" and "1.1 ms
-of waiting for the device" are told apart without a device-side profiler. It was
-that split which showed the token feedback was host work rather than a wait.
-
-Percentiles, not just a mean: a window mean cannot tell "always 1 ms" from
-"0.9 ms most steps, 5 ms sometimes", and those say opposite things about whether
-async is hiding anything.
+Each region reports wall, CPU (thread_time) and their difference, which
+separates waiting for the device (wall minus CPU) from host work (CPU) without
+a device-side profiler. Percentiles as well as the mean, since a window mean
+cannot tell "always 1 ms" from "0.9 ms most steps, 5 ms sometimes".
 
 Set VLLM_RBLN_STEP_PROBE=<steps per report>. VLLM_RBLN_PYMARK=1 additionally
-writes microsecond breadcrumbs into rebel's own log stream, so its TRACE lines
-can be attributed to a call site.
+writes microsecond breadcrumbs into rebel's log stream.
 """
 
 from __future__ import annotations
@@ -73,12 +66,8 @@ class StepProbe:
     def _reset(self) -> None:
         self.n = 0
         self.acc: dict[str, list[float]] = defaultdict(lambda: [0.0, 0.0])
-        # Per-step samples, not just the window sum. A window mean cannot show a
-        # tail, and the DP all_reduce is exactly the region whose tail matters:
-        # hiding it under device(N) is what async scheduling is for, and a mean
-        # of 1 ms is equally consistent with "always 1 ms" and with "0.9 ms most
-        # steps, 5 ms sometimes". Those two say opposite things about whether
-        # async is working.
+        # Per-step samples, not just the window sum: the DP all_reduce is the
+        # region whose tail matters, and a mean cannot show one.
         self.samples: dict[str, list[float]] = defaultdict(list)
         self.steps: list[float] = []
         self.w0, self.c0 = _now()

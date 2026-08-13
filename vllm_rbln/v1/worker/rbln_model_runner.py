@@ -14,7 +14,6 @@
 
 import collections
 import dataclasses
-import os
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
 from contextlib import nullcontext
@@ -153,28 +152,6 @@ from vllm_rbln.v1.worker.utils import (
 
 logger = init_logger(__name__)
 
-# Diagnostic: per-step signature of the tokens actually fed, written to
-# VLLM_RBLN_STEP_SIG_DIR. Diffing that row between two arms names the first step
-# where they part, which is how the async output mismatch was localised. Host
-# only, off unless the env var is set.
-_SIG_DIR = os.environ.get("VLLM_RBLN_STEP_SIG_DIR")
-_SIG_ROWS: list = []
-_SIG_SEQ = 0
-
-
-def _sig_dump() -> None:
-    """One file per generation per rank, written when the batch drains."""
-    global _SIG_SEQ
-    if not _SIG_DIR or not _SIG_ROWS:
-        return
-    _SIG_SEQ += 1
-    path = f"{_SIG_DIR}/sig_{os.getpid()}_{_SIG_SEQ:03d}.txt"
-    with open(path, "w") as f:
-        for i, row in enumerate(_SIG_ROWS):
-            f.write(f"{i}\t{row!r}\n")
-    logger.info("[stepsig] wrote %s (%d steps)", path, len(_SIG_ROWS))
-    _SIG_ROWS.clear()
-
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 PerLayerAttnMetadata: TypeAlias = AttnMetadataDict  #  | list[AttnMetadataDict]
 
@@ -251,14 +228,10 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
             dtype=sampled_token_ids.dtype,
             device="cpu",
         )
-        # Logprobs ride the same deferral, and only in the dense form. The topk
-        # form cannot: gather_logprobs indexes by the sampled ids, integer eager
-        # ops have no device kernel here, so building it pulls the tokens to the
-        # host mid-step - exactly the copy async scheduling exists to defer. The
-        # dense form (logprobs=-1, which is what the executor asks for by
-        # default) is a log_softmax and nothing else, so it stays on device until
-        # this object is drained. sample_tokens rejects the topk form under async
-        # rather than let it silently serialise the step.
+        # Logprobs ride the same deferral, dense form only: the topk form
+        # indexes by the sampled ids, which pulls the tokens to the host
+        # mid-step. sample_tokens rejects it under async rather than let it
+        # silently serialise the step.
         self._logprobs_tensors = logprobs_tensors
 
         # The D2H is neither dispatched nor awaited here - both happen in
@@ -398,9 +371,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # Logprobs handed to the deferred output; see the async branch of
         # _bookkeeping_sync.
         self._async_logprobs_tensors = None
-        # Dummy-run counter for the step signature capture above.
-        self._dummy_runs = 0
-
         # Sampled tokens handed back by the output thread, applied to
         # token_ids_cpu by the main thread; see _apply_pending_token_writeback.
         self._pending_token_writeback: collections.deque = collections.deque()
@@ -464,10 +434,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             else:
                 self.effective_drafter_max_model_len = self.max_model_len
 
-        # bool(), not the field itself: vLLM resolves an unset value to True or
-        # False before this runs (config/vllm.py:964), but a config built
-        # directly - a unit test, say - can still carry None, and None here
-        # would silently mean sync while reading as "not configured".
+        # bool(), not the field: vLLM resolves an unset value before this runs,
+        # but a directly-built config (a unit test) can still carry None.
         self.use_async_scheduling = bool(self.scheduler_config.async_scheduling)
 
         # Request states.
@@ -675,9 +643,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # Remove the finished requests from the persistent batch.
         for req_id in scheduler_output.finished_req_ids:
             self.input_batch.remove_request(req_id)
-        if _SIG_DIR and _SIG_ROWS and self.input_batch.num_reqs == 0:
-            _sig_dump()
-
         scheduled_req_ids = scheduler_output.num_scheduled_tokens.keys()
         cached_req_ids = self.input_batch.req_id_to_index.keys()
         resumed_req_ids = scheduler_output.scheduled_cached_reqs.resumed_req_ids
@@ -972,33 +937,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         with self.step_probe.region("dp_reduce.wait"):
             num_reqs_padded, num_tokens_padded, num_tokens_across_dp = (
                 self._determine_batch_padding(num_reqs, total_query_tokens, dp_reduce)
-            )
-
-        if _SIG_DIR:
-            ib = self.input_batch
-            _SIG_ROWS.append(
-                (
-                    "step",
-                    tuple(ib.req_ids),
-                    num_reqs,
-                    total_query_tokens,
-                    num_reqs_padded,
-                    num_tokens_padded,
-                    int(self.is_prefill),
-                    tuple(num_tokens_across_dp.tolist())
-                    if num_tokens_across_dp is not None
-                    else (),
-                    # What the async scheduler advances optimistically.
-                    tuple(ib.num_computed_tokens_cpu[:num_reqs].tolist()),
-                    tuple(ib.num_tokens_no_spec[:num_reqs].tolist()),
-                    # Dummy-run count: if it drifts between ranks, the k-th
-                    # all_reduce pairs different steps. The collective ordinal
-                    # that used to sit beside it came from
-                    # forward_context.DP_REDUCE_CALLS, which the dev merge
-                    # removed - reading it raised AttributeError and killed
-                    # every worker, but only with VLLM_RBLN_STEP_SIG_DIR set.
-                    self._dummy_runs,
-                )
             )
 
         self.seq_lens_np[:num_reqs] = (
@@ -1540,18 +1478,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             # valid_sampled_token_ids is filled later by AsyncRBLNModelRunnerOutput.
             #
             # Logprobs ride along, deferred to get_output() like the tokens.
-            # Building them is expensive - vLLM turns logprobs=-1 into a
-            # full-vocab gather, gather_logprobs indexes by the sampled ids, and
-            # integer eager ops have no device kernel on RBLN, so it runs on the
-            # host - but that cost is the sampler's, not this deferral's: sync
-            # pays it too (39.8 vs async 38.3 ms/step, against 18.9 and 17.1
-            # without logprobs). The deferred D2H here is off the step entirely.
-            #
-            # Worth carrying because it is what puts async under the executor's
-            # native golden gate: that comparison rides on the teacher-forced
-            # validation pass, and with no logprobs the pass produces nothing
-            # and the gate silently does not exist. A run that does not ask for
-            # logprobs never builds them and is unaffected.
+            # Carried because the executor's native golden gate rides on the
+            # teacher-forced validation pass, which produces nothing without
+            # them. Building them is expensive, but both scheduling modes pay
+            # that equally (see the warning below); only the D2H is deferred.
             if logprobs_tensors is not None:
                 logger.warning_once(
                     "logprobs cost about 22 ms of host CPU per step here - "
@@ -1578,18 +1508,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 for i, req_id in enumerate(self.input_batch.req_ids)
                 if i not in invalid_req_indices_set
             }
-
-        if _SIG_DIR:
-            _SIG_ROWS.append(
-                (
-                    "sampled",
-                    tuple(self.input_batch.req_ids),
-                    tuple(
-                        t[0] if t else None
-                        for t in (valid_sampled_token_ids or [])
-                    ),
-                )
-            )
 
         # Cache the sampled tokens in the model runner, so that the scheduler
         # doesn't need to send them back.
@@ -1750,22 +1668,19 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 and prev_sampled is not None
                 and prev_map is not None
             ):
-                # Per request, not all-or-nothing. The old `all(r in prev_map)`
-                # guard skipped the scatter for the WHOLE batch whenever a single
-                # request was absent, leaving the scheduler's -1 placeholders in
-                # every row (16 of 4080 steps). Absent requests instead fall back
-                # to token_ids_cpu, which _apply_pending_token_writeback keeps
-                # truthful.
+                # Per request, not all-or-nothing: a request absent from
+                # prev_map falls back to token_ids_cpu, which
+                # _apply_pending_token_writeback keeps truthful. Skipping the
+                # whole batch instead left -1 placeholders in every row.
                 #
-                # prev_sampled is referenced, not copied: it is a view of the
-                # sampler's 2-deep output ring, and this read happens before this
-                # step's sample() writes the other slot. Copying it here instead
-                # cost 13.5 ms/step - the indexed read of a just-sampled tensor
-                # waits for the sampler graph.
+                # prev_sampled is referenced, not copied - it is a view of the
+                # sampler's 2-deep ring, read before this step's sample() writes
+                # the other slot. Copying it here waits on the sampler graph
+                # (13.5 ms/step).
                 #
-                # The identity case - every request present, same order - is the
-                # steady state, and a slice copy there avoids building two index
-                # tensors from Python lists every step (2.2 ms of a 20.5 ms step).
+                # Identity - every request present, same order - is the steady
+                # state; the slice copy there avoids building two index tensors
+                # from Python lists every step (2.2 ms of a 20.5 ms step).
                 rows, dsts, identity = [], [], True
                 for j, r in enumerate(req_ids):
                     idx = prev_map.get(r)
@@ -1778,20 +1693,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     dsts.append(j)
                 if identity:
                     n_fb = len(rows)
-                    # Routed through the host on purpose. prev_sampled is a
-                    # column of the sampler's (B, 64) ring, so a device-to-device
-                    # copy of it is eight 4-byte pieces at 256B stride, and the
-                    # async D2D command buffer takes only 128B-aligned addresses
-                    # and sizes (d2d_multi_copy_cmd_buffer.cc). Every piece is
-                    # rejected and the fallback drains pending transfers, which
-                    # measured 1.10 ms per step. The D2H and H2D paths carry no
-                    # such alignment rule and take the same strided column with
-                    # no reject at all.
+                    # staged input_ids is a host tensor, so this is a D2H
+                    # either way; the intermediate buffer keeps it contiguous.
                     with self.step_probe.region("tok_feedback"):
-                        if (
-                            self._tokfb_host is None
-                            or self._tokfb_host.shape[0] < n_fb
-                        ):
+                        if self._tokfb_host is None or self._tokfb_host.shape[0] < n_fb:
                             self._tokfb_host = torch.empty(
                                 prev_sampled.shape[0], dtype=prev_sampled.dtype
                             )
@@ -1801,28 +1706,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 elif rows:
                     with self.step_probe.region("tok_feedback"):
                         staged_model_inputs.input_ids[dsts, 0] = prev_sampled[rows, 0]
-
-            if _SIG_DIR and not self.is_prefill:
-                # The tokens actually about to be fed, captured at the one point
-                # both arms reach: async has just scattered prev_sampled here,
-                # sync left the scheduler's staging alone. Diffing this
-                # row between arms names the first step where they part.
-                #
-                # This reads the device, which the older capture forbade because
-                # a per-step sync can hide a timing-dependent bug. That no longer
-                # applies: the divergence is static (async reproduces itself
-                # 32/32 across processes), so a synchronising read cannot mask it.
-                _SIG_ROWS.append(
-                    (
-                        "fed",
-                        tuple(req_ids),
-                        tuple(
-                            staged_model_inputs.input_ids[: len(req_ids), 0]
-                            .cpu()
-                            .tolist()
-                        ),
-                    )
-                )
 
         # Run the model.
         # When spec decode is enabled, defer connector finalization
@@ -2472,7 +2355,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         else:
             self.input_batch.num_tokens_no_spec[:num_reqs] = 1
 
-        self._dummy_runs += 1
         num_reqs_padded, _num_tokens_padded, num_tokens_across_dp = (
             self._determine_batch_padding(num_reqs, num_tokens_unpadded)
         )

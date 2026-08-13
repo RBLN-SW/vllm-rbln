@@ -251,13 +251,10 @@ class RblnPlatform(Platform):
         parallel_config = vllm_config.parallel_config
         scheduler_config = vllm_config.scheduler_config
 
-        # scheduler_config.async_scheduling is the switch, and vLLM's --async-
-        # scheduling / --no-async-scheduling is how it is set. Nothing is
-        # overridden here on purpose: by the time this hook runs, VllmConfig has
-        # already resolved an unset (None) value to True for anything it deems
-        # compatible, so "the user asked for async" and "the user said nothing"
-        # are indistinguishable from here. An RBLN-side override could only turn
-        # it off, never honour a request to turn it on.
+        # async_scheduling is set by vLLM's --async-scheduling flag and is not
+        # overridden here: VllmConfig has already resolved an unset value by the
+        # time this hook runs, so "asked for async" and "said nothing" are
+        # indistinguishable from here.
         for removed in ("VLLM_RBLN_ASYNC_SCHED", "VLLM_RBLN_DISABLE_ASYNC"):
             if os.environ.get(removed) is not None:
                 logger.warning_once(
@@ -304,9 +301,8 @@ class RblnPlatform(Platform):
                     "vllm_rbln.v1.worker.rbln_worker.RBLNWorker"
                 )
             if scheduler_config.async_scheduling:
-                # Schedule-ahead. Only RBLNAsyncScheduler bumps
-                # num_output_placeholders at schedule time, which is what lets the
-                # engine's batch_queue fill; plain RBLNScheduler would serialise it.
+                # Only RBLNAsyncScheduler bumps num_output_placeholders at
+                # schedule time, which is what lets the batch_queue fill.
                 scheduler_config.scheduler_cls = (
                     "vllm_rbln.v1.core.rbln_scheduler.RBLNAsyncScheduler"
                 )
