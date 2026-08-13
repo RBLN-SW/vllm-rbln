@@ -23,6 +23,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torch._dynamo.exc import BackendCompilerFailed
+from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 import vllm_rbln.v1.worker.rbln_worker as wm
@@ -654,3 +655,55 @@ class TestInitWorkerDistributedEnvironment:
     def test_auto_port_sets_rccl_env(self, monkeypatch):
         _, _, rccl = self._run(monkeypatch, auto_port=True, has_torch_rbln=True)
         assert rccl == "1"
+
+
+class TestHandshakeMetadata:
+    # The producer half of vllm's handshake contract: EngineCore merges these
+    # per-worker dicts and hands the result to the connector.
+    @staticmethod
+    def _metadata(
+        make_worker,
+        monkeypatch,
+        *,
+        pp_rank=0,
+        tp_rank=0,
+        metadata="META",
+        has_group=True,
+    ):
+        worker = make_worker()
+        monkeypatch.setattr(wm, "has_kv_transfer_group", lambda: has_group)
+        monkeypatch.setattr(
+            wm,
+            "get_kv_transfer_group",
+            lambda: SimpleNamespace(get_handshake_metadata=lambda: metadata),
+        )
+        monkeypatch.setattr(
+            wm, "get_tp_group", lambda: SimpleNamespace(rank_in_group=tp_rank)
+        )
+        monkeypatch.setattr(
+            wm, "get_pp_group", lambda: SimpleNamespace(rank_in_group=pp_rank)
+        )
+        return worker.get_kv_connector_handshake_metadata()
+
+    def test_key_is_pp_tp_pair(self, make_worker, monkeypatch):
+        assert self._metadata(make_worker, monkeypatch, pp_rank=1, tp_rank=2) == {
+            (1, 2): "META"
+        }
+
+    def test_upstream_hook_takes_the_keys(self, make_worker, monkeypatch):
+        # Runs vllm's own implementation over the merged dict, so a contract
+        # change upstream fails here instead of at engine-core init.
+        merged = self._metadata(make_worker, monkeypatch, tp_rank=1)
+        received: dict = {}
+        KVConnectorBase_V1.set_xfer_handshake_metadata_pp_aware(
+            SimpleNamespace(set_xfer_handshake_metadata=received.update), merged
+        )
+        assert received == {1: "META"}
+
+    def test_returns_none_without_kv_transfer_group(self, make_worker, monkeypatch):
+        assert self._metadata(make_worker, monkeypatch, has_group=False) is None
+
+    def test_returns_none_when_connector_has_no_metadata(
+        self, make_worker, monkeypatch
+    ):
+        assert self._metadata(make_worker, monkeypatch, metadata=None) is None
