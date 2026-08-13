@@ -23,6 +23,9 @@ steps:
       - "bash .buildkite/scripts/gate-team-member.sh"
 
   - label: ":mag: pre-commit"
+    notify:
+    - github_commit_status:
+        context: "[OB] pre-commit"
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     secrets: *uv_secrets
     command:
@@ -33,6 +36,9 @@ steps:
 
   - group: ":gear: optimum tests"
     key: "optimum"
+    notify:
+    - github_commit_status:
+        context: "[OB] optimum tests"
     steps:
       - label: ":sparkles: upload optimum-pr"
         checkout:
@@ -43,6 +49,9 @@ steps:
 
   - group: ":snake: native tests"
     key: "native"
+    notify:
+    - github_commit_status:
+        context: "[OB] native tests"
     steps:
       - label: ":sparkles: upload native-pr"
         checkout:
