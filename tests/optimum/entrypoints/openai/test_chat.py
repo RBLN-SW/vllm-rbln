@@ -12,22 +12,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-
 import openai  # use the official client for correctness check
 import pytest
 import pytest_asyncio
 from utils import RemoteOpenAIServer
 
-MODEL_DIR = os.getenv("REBEL_VLLM_PRE_COMPILED_DIR", "./")
-MODEL_NAME = MODEL_DIR + "/llama3_2-3b-128k_kv16k_batch4"
+MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
 MAX_TOKENS = 1
 
+SERVER_ARGS = [
+    "--hf-overrides",
+    '{"num_hidden_layers": 1, "layer_types": ["full_attention"]}',
+    "--max-model-len",
+    "2048",
+    "--block-size",
+    "2048",
+    "--max-num-seqs",
+    "4",
+]
+SERVER_ENV = {"VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK": "1"}
 
-@pytest.fixture(scope="module", params=[False, True])
+
+@pytest.fixture(scope="module")
 def server():
-    args: list[str] = []
-    with RemoteOpenAIServer(MODEL_NAME, args) as remote_server:
+    with RemoteOpenAIServer(
+        MODEL_NAME, SERVER_ARGS, env_dict=SERVER_ENV
+    ) as remote_server:
         yield remote_server
 
 
@@ -39,7 +49,6 @@ async def client(server):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    # just test 1 lora hereafter
     "model_name",
     [MODEL_NAME],
 )
