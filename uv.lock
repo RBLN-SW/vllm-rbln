@@ -2147,10 +2147,10 @@ dependencies = [
     { name = "typing-extensions" },
 ]
 wheels = [
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/rebel-compiler/0.11.1.dev431+gd747c02e.prod/rebel_compiler-0.11.1.dev431+gd747c02e.prod-cp310-cp310-manylinux_2_34_x86_64.whl", hash = "md5:3e3e4e0e36f5f9c4caeff57cccaca4bc" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/rebel-compiler/0.11.1.dev431+gd747c02e.prod/rebel_compiler-0.11.1.dev431+gd747c02e.prod-cp311-cp311-manylinux_2_34_x86_64.whl", hash = "md5:40a840b7ebda0d55734e4b2bab71275c" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/rebel-compiler/0.11.1.dev431+gd747c02e.prod/rebel_compiler-0.11.1.dev431+gd747c02e.prod-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "md5:7d9cd80111327ed1a220efd756347d6d" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/rebel-compiler/0.11.1.dev431+gd747c02e.prod/rebel_compiler-0.11.1.dev431+gd747c02e.prod-cp313-cp313-manylinux_2_34_x86_64.whl", hash = "md5:5228c0b3fc7c881930a2d4eccbcc19ba" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/rebel-compiler/0.11.1.dev431+gd747c02e.prod/rebel_compiler-0.11.1.dev431+gd747c02e.prod-cp310-cp310-manylinux_2_34_x86_64.whl", hash = "md5:ba6982402cb3bbc57461cebc3f0ce134" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/rebel-compiler/0.11.1.dev431+gd747c02e.prod/rebel_compiler-0.11.1.dev431+gd747c02e.prod-cp311-cp311-manylinux_2_34_x86_64.whl", hash = "md5:e7df0f90a144db9e6ab1a2a3f5c9033a" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/rebel-compiler/0.11.1.dev431+gd747c02e.prod/rebel_compiler-0.11.1.dev431+gd747c02e.prod-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "md5:a00f12e0e7f75b577cbf2e559d681cba" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/rebel-compiler/0.11.1.dev431+gd747c02e.prod/rebel_compiler-0.11.1.dev431+gd747c02e.prod-cp313-cp313-manylinux_2_34_x86_64.whl", hash = "md5:e954023535fb6a2d414074a5697e886e" },
 ]
 
 [[package]]
@@ -2606,7 +2606,7 @@ wheels = [
 
 [[package]]
 name = "torch-rbln"
-version = "0.3.0rc3"
+version = "0.4.0rc0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "libcst" },
@@ -2617,10 +2617,10 @@ dependencies = [
     { name = "torch" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/cc/f8/d60f1b8c931049a98763332c50ca0d38792779b45a18bedb3bca576f434b/torch_rbln-0.3.0rc3-cp310-cp310-manylinux_2_34_x86_64.whl", hash = "sha256:12f15d8d9b914671086e8146c278675c0338186e2c97aa7233bfb7bfbf8076ab", size = 1245890, upload-time = "2026-07-22T13:40:09.013Z" },
-    { url = "https://files.pythonhosted.org/packages/33/70/bbfad5d824ffa37de927d49bfd769f17b496c7881e0b87981916e4de68b4/torch_rbln-0.3.0rc3-cp311-cp311-manylinux_2_34_x86_64.whl", hash = "sha256:ab2599d8d77aecaa37a635c4d56c9f841879d43484ba7987f7797321254faa0e", size = 1247479, upload-time = "2026-07-22T13:40:10.914Z" },
-    { url = "https://files.pythonhosted.org/packages/7a/bd/634bd28e643894adcfc588ff6e32370a8bc718fccd7f4f84cd75f5c457f2/torch_rbln-0.3.0rc3-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "sha256:ddabed2f1e716f547afd2d9af54381fa797ef76cb108b11e4051162de66fea98", size = 1252892, upload-time = "2026-07-22T13:40:12.793Z" },
-    { url = "https://files.pythonhosted.org/packages/b6/2e/4c1fee0cd156ba3f8e148a40755e291abdfd0e246763c5978ee895302ee9/torch_rbln-0.3.0rc3-cp313-cp313-manylinux_2_34_x86_64.whl", hash = "sha256:6e9138d300ae06bdb50ad83ba38405c56c0e570e4426a75c503bbcfeb17ea7c7", size = 1254460, upload-time = "2026-07-22T13:40:14.585Z" },
+    { url = "https://files.pythonhosted.org/packages/d3/30/a30524970d1208bc2bf6d26720faf6c463b58dfe015bdbe2bf4394518c03/torch_rbln-0.4.0rc0-cp310-cp310-manylinux_2_34_x86_64.whl", hash = "sha256:7687f86a22bc75ee5c86182facbbdbb8a7a34914a0bd4a2e48d6eb873fdae785", size = 1257550, upload-time = "2026-08-13T02:15:59.62Z" },
+    { url = "https://files.pythonhosted.org/packages/56/a3/75c73b473afcb74f02bd4e11b11b01514945ab96648bc19751818c25e193/torch_rbln-0.4.0rc0-cp311-cp311-manylinux_2_34_x86_64.whl", hash = "sha256:60fc4a9f9b744414c010b8f5e5184c35194e0c722f811fb74f0ac117b6995a6e", size = 1259238, upload-time = "2026-08-13T02:16:01.587Z" },
+    { url = "https://files.pythonhosted.org/packages/de/c3/851f7c6886fb6dca5f737c15eff06942ef496f5ac695a9fc4f3d57194959/torch_rbln-0.4.0rc0-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "sha256:e1f0ce90935b314f7cccc20964ad0c79516620d40f0c7c8a09a2e17a7c926637", size = 1264731, upload-time = "2026-08-13T02:16:03.062Z" },
+    { url = "https://files.pythonhosted.org/packages/50/3c/7f110587a35833b2d5e0a1f5b9c44353b8944a14d48c28ed4f19e97c7ab1/torch_rbln-0.4.0rc0-cp313-cp313-manylinux_2_34_x86_64.whl", hash = "sha256:1bd2aa1e263b59a8b0b214bb79ededd7efa4a64b479da5fb89cf37a2a7ed5a39", size = 1266411, upload-time = "2026-08-13T02:16:05.153Z" },
 ]
 
 [[package]]
@@ -2964,7 +2964,7 @@ requires-dist = [
     { name = "setuptools-scm", marker = "extra == 'build'" },
     { name = "simphile", marker = "extra == 'dev'" },
     { name = "torch", index = "https://download.pytorch.org/whl/cpu" },
-    { name = "torch-rbln", marker = "platform_machine == 'x86_64'", specifier = "~=0.3.0rc3" },
+    { name = "torch-rbln", marker = "platform_machine == 'x86_64'", specifier = "~=0.4.0rc0" },
     { name = "torchaudio", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torchcodec", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torchvision", index = "https://download.pytorch.org/whl/cpu" },
