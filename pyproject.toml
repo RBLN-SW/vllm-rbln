@@ -38,14 +38,14 @@ dependencies = [
     "pyyaml",
     "datasets>=4.0.0",
     "qwen_vl_utils",
-    "vllm==0.22.0+cpu",
+    "vllm==0.24.0+cpu",
     "fastapi[standard]<0.137",
     "torch",
     "torchvision",
     "torchaudio",
     "torchcodec",
     "torch-rbln~=0.4.0rc0 ; platform_machine == 'x86_64'",
-    "optimum-rbln>=0.11.1a4",
+    "optimum-rbln>=0.11.2a0",
 ]
 
 [project.optional-dependencies]
@@ -92,6 +92,16 @@ version_file = "vllm_rbln/_version.py"
 where = ["."]
 exclude = ["benchmarks", "csrc", "docs", "examples", "tests*"]
 namespaces = false
+
+[tool.pytest.ini_options]
+# Reject unregistered markers. A typo'd mark is silently inert otherwise, which
+# is exactly how an expensive test leaks into the lane that runs on every PR.
+addopts = ["--strict-markers"]
+markers = [
+    "model_compile: compiles a whole model on the NPU; minutes per test. Skipped unless --model-compile is passed. Tests that compile only an individual op are deliberately left unmarked so they stay in the default lane.",
+    "use_device: always touches the NPU (e.g. compiles an op via the rbln backend) regardless of --device-tensor, so it is always auto-spawned in a fresh process -- never run in the parent, which would pin the device for the rest of the session.",
+    "maybe_use_device: opens the RBLN device only when device tensors are on. Auto-spawned in a fresh process under --device-tensor 1 (never in the parent, which would pin the device for the rest of the session); runs in-process under --device-tensor 0 (cpu).",
+]
 
 [tool.ruff.lint]
 select = [
@@ -152,7 +162,7 @@ prerelease = "if-necessary-or-explicit"   # pin uv's default explicitly — prer
 
 [[tool.uv.index]]
 name = "vllm-cpu"
-url = "https://wheels.vllm.ai/0.22.0/cpu"
+url = "https://wheels.vllm.ai/0.24.0/cpu"
 explicit = true
 
 [[tool.uv.index]]

@@ -522,6 +522,9 @@ class RBLNKVCacheManager(KVCacheManager):
         num_external_computed_tokens: int = 0,
         delay_cache_blocks: bool = False,
         num_encoder_tokens: int = 0,
+        full_sequence_must_fit: bool = False,
+        reserved_blocks: int = 0,
+        has_scheduled_reqs: bool = True,
     ) -> KVCacheBlocks | None:
         result = super().allocate_slots(
             request,
@@ -532,6 +535,9 @@ class RBLNKVCacheManager(KVCacheManager):
             num_external_computed_tokens,
             delay_cache_blocks,
             num_encoder_tokens,
+            full_sequence_must_fit=full_sequence_must_fit,
+            reserved_blocks=reserved_blocks,
+            has_scheduled_reqs=has_scheduled_reqs,
         )
 
         if result is not None and not delay_cache_blocks:
@@ -742,8 +748,7 @@ class RBLNKVCacheManager(KVCacheManager):
                     ),
                     gid,
                 )
-                assert blk.block_hash is None
-                blk.block_hash = synthetic_hash
+                blk.set_block_hash(synthetic_hash, num_tokens=num_computed_tokens)
                 self.block_pool.cached_block_hash_to_block.insert(synthetic_hash, blk)
 
     def _on_block_evicted(self, block_id: int) -> None:

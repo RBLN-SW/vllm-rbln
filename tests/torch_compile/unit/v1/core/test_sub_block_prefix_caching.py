@@ -14,6 +14,8 @@
 
 """Tests for sub-block prefix caching components."""
 
+import math
+
 import pytest
 import torch
 from vllm.distributed.kv_events import (
@@ -337,6 +339,7 @@ def _make_manager(
     manager = RBLNKVCacheManager(
         kv_cache_config=_make_kv_cache_config(block_size, num_blocks),
         max_model_len=max_model_len,
+        scheduler_block_size=block_size,
         hash_block_size=block_size,
         sub_block_size=sub_block_size,
         hash_fn=sha256,
@@ -1357,6 +1360,7 @@ def _make_hybrid_manager(
             block_size, num_blocks, sliding_window
         ),
         max_model_len=max_model_len,
+        scheduler_block_size=block_size,
         hash_block_size=block_size,
         sub_block_size=sub_block_size,
         hash_fn=sha256,
@@ -1479,6 +1483,9 @@ class TestMultiGroupRBLNKVCacheManager:
         manager = RBLNKVCacheManager(
             kv_cache_config=config,
             max_model_len=8192,
+            # Upstream requires the scheduling granularity to be the LCM of
+            # all group block sizes (and a multiple of hash_block_size).
+            scheduler_block_size=math.lcm(full_bs, sw_bs),
             hash_block_size=hash_bs,
             sub_block_size=sbs,
             hash_fn=sha256,
@@ -2508,6 +2515,7 @@ class TestKVCacheEvents:
                     self.BLOCK_SIZE, num_blocks=10, sliding_window=16
                 ),
                 max_model_len=8192,
+                scheduler_block_size=self.BLOCK_SIZE,
                 hash_block_size=self.BLOCK_SIZE,
                 sub_block_size=self.SUB_BLOCK_SIZE,
                 hash_fn=sha256,

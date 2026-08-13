@@ -135,7 +135,16 @@ class RBLNWorker(WorkerBase):
             end_idx = start_idx + num_devices
             selected_devices = ",".join(device_ids[start_idx:end_idx])
         else:
-            device_ids = os.environ[env_var].split(",")
+            # vLLM 0.24 stopped narrowing the device-control env var per DP rank
+            # and puts the mapping on the config instead, so under DP the env var
+            # now holds the whole deployment's list (vllm/v1/engine/utils.py,
+            # set_assigned_physical_gpu_ids_for_dp_rank). getattr: older vLLM has
+            # no such field.
+            assigned = getattr(self.parallel_config, "assigned_physical_gpu_ids", None)
+            if assigned:
+                device_ids = [str(i) for i in assigned]
+            else:
+                device_ids = os.environ[env_var].split(",")
             assert len(device_ids) == world_size, (
                 f"device_ids: {device_ids} should have device count: {world_size}"
             )
@@ -574,7 +583,11 @@ class RBLNWorker(WorkerBase):
 
     def execute_dummy_batch(self) -> None:
         bucket_size = self.model_runner.bucketing_manager.find_decode_batch_bucket(1)
-        query_len = 1 + self.model_runner.num_spec_tokens
+        spec = self.model_runner.speculative_config
+        if spec is not None and spec.use_eagle():
+            query_len = 1 + self.model_runner.num_spec_tokens
+        else:
+            query_len = 1
         self.model_runner._dummy_run(bucket_size, query_len, is_prefill=False)
 
     # def add_lora(self, lora_request: LoRARequest) -> bool:

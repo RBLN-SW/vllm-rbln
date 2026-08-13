@@ -47,15 +47,17 @@ from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.tracing import instrument
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.utils.math_utils import cdiv
-from vllm.utils.platform_utils import is_pin_memory_available
-from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+from vllm.utils.torch_utils import PIN_MEMORY, kv_cache_dtype_str_to_dtype
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionMetadata,
     CommonAttentionMetadata,
 )
 from vllm.v1.attention.backends.utils import create_fast_prefill_custom_backend
-from vllm.v1.core.sched.output import GrammarOutput, NewRequestData
+from vllm.v1.core.sched.output import (
+    GrammarOutput,
+    NewRequestData,
+)
 from vllm.v1.kv_cache_interface import (
     EncoderOnlyAttentionSpec,
     FullAttentionSpec,
@@ -85,7 +87,7 @@ from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
-from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
+from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.kv_connector_model_runner_mixin import (
     KVConnectorModelRunnerMixin,
@@ -124,9 +126,14 @@ from vllm_rbln.v1.core.rbln_scheduler import RBLNSchedulerOutput
 from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
+from vllm_rbln.v1.worker import mega_cache
 from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
 from vllm_rbln.v1.worker.input_stager import InputLayout, InputStager, StagedModelInputs
-from vllm_rbln.v1.worker.metrics_v2 import PerformanceContext
+from vllm_rbln.v1.worker.metrics_v2 import (
+    PerformanceContext,
+    e2e_ends,
+    e2e_starts,
+)
 from vllm_rbln.v1.worker.utils import (
     get_kv_cache_names,
     prepare_kernel_block_sizes,
@@ -218,7 +225,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         scheduler_config = self.scheduler_config
         parallel_config = self.parallel_config
         self.device = device
-        self.pin_memory = is_pin_memory_available()
         self.dtype = model_config.dtype
 
         self.kv_cache_dtype = kv_cache_dtype_str_to_dtype(
@@ -338,7 +344,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             max_model_len=self.max_model_len,
             max_num_batched_tokens=self.max_num_tokens,
             device=self.device,
-            pin_memory=self.pin_memory,
             vocab_size=model_config.get_vocab_size(),
             block_sizes=[cache_config.block_size],
             kernel_block_sizes=[cache_config.block_size],
@@ -346,7 +351,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             logitsprocs=build_logitsprocs(
                 self.vllm_config,
                 self.device,
-                self.pin_memory,
+                PIN_MEMORY,
                 self.is_pooling_model,
                 custom_logitsprocs,
             ),
@@ -358,10 +363,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # Persistent buffers
         self.input_ids = torch.zeros(self.max_num_tokens, dtype=torch.int32)
         self.positions = torch.zeros(self.max_num_tokens, dtype=torch.int64)
-        self.query_start_loc = self._make_buffer(
-            self.max_num_reqs + 1, dtype=torch.int32
-        )
+        self.query_start_loc = torch.zeros(self.max_num_reqs + 1, dtype=torch.int32)
+        self.query_start_loc_np = self.query_start_loc.numpy()
         self.seq_lens = torch.zeros(self.max_num_tokens, dtype=torch.int32)
+        self.seq_lens_np = self.seq_lens.numpy()
         self.discard_request_mask = torch.zeros(self.max_num_reqs, dtype=torch.bool)
         self.input_stager = InputStager(self.device)
 
@@ -422,7 +427,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             and envs.VLLM_RBLN_SPECIALIZE_MOE_DECODE
         )
 
-        self.performance_ctx = PerformanceContext("runner")
+        self.performance_ctx = PerformanceContext("runner", self.runtime_holder)
 
         self.offload_context = nullcontext
         if HAS_TORCH_RBLN and USE_DEVICE_TENSOR and not envs.VLLM_RBLN_DISABLE_OFFLOAD:
@@ -431,17 +436,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
     def _get_positions(self, num_tokens: Any):
         assert not isinstance(num_tokens, int)
         return self.positions[:num_tokens]
-
-    def _make_buffer(
-        self, *size: int | torch.SymInt, dtype: torch.dtype, numpy: bool = True
-    ) -> CpuGpuBuffer:
-        return CpuGpuBuffer(
-            *size,
-            dtype=dtype,
-            device=self.device,
-            pin_memory=self.pin_memory,
-            with_numpy=numpy,
-        )
 
     def _init_model_kwargs(self):
         model_kwargs = dict[str, Any]()
@@ -810,17 +804,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         )
 
         # Prepare the attention metadata.
-        query_start_loc_np = self.query_start_loc.np
-        query_start_loc_np[0] = 0
-        query_start_loc_np[1 : num_reqs + 1] = cu_num_tokens
-        query_start_loc_np[num_reqs + 1 :].fill(cu_num_tokens[-1])
-        self.query_start_loc.copy_to_gpu()
+        self.query_start_loc_np[0] = 0
+        self.query_start_loc_np[1 : num_reqs + 1] = cu_num_tokens
+        self.query_start_loc_np[num_reqs + 1 :].fill(cu_num_tokens[-1])
 
-        seq_lens_np = self.seq_lens.numpy()
-        seq_lens_np[:num_reqs] = (
+        self.seq_lens_np[:num_reqs] = (
             self.input_batch.num_computed_tokens_cpu[:num_reqs] + logical_num_tokens
         )
-        seq_lens_np[num_reqs:].fill(0)
+        self.seq_lens_np[num_reqs:].fill(0)
 
         num_tokens = [self.requests[r].num_tokens for r in self.input_batch.req_ids]
         num_tokens_np = np.array(num_tokens, dtype=np.int32)
@@ -828,7 +819,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # Record which requests should not be sampled,
         # so that we could clear the sampled tokens before returningj
         discard_request_mask_np = self.discard_request_mask.numpy()
-        discard_request_mask_np[:num_reqs] = seq_lens_np[:num_reqs] < num_tokens_np
+        discard_request_mask_np[:num_reqs] = self.seq_lens_np[:num_reqs] < num_tokens_np
 
         if not use_spec_decode:
             # NOTE(woosuk): Due to chunked prefills, the batch may contain
@@ -836,7 +827,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             # from these partial requests, we do so for simplicity.
             # We will ignore the sampled tokens from the partial requests.
             # TODO: Support prompt logprobs.
-            logits_indices = self.query_start_loc.cpu[1 : num_reqs + 1] - 1
+            logits_indices = self.query_start_loc[1 : num_reqs + 1] - 1
             spec_decode_metadata = None
         else:
             # Get the number of draft tokens for each request.
@@ -899,10 +890,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             return blk_table_tensor
 
         cm_base = CommonAttentionMetadata(
-            query_start_loc=self.query_start_loc.gpu[: num_reqs + 1],
-            query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs + 1],
+            query_start_loc=self.query_start_loc[: num_reqs + 1],
+            query_start_loc_cpu=self.query_start_loc[: num_reqs + 1],
             seq_lens=self.seq_lens[:num_reqs],
-            _seq_lens_cpu=self.seq_lens[:num_reqs],
             num_reqs=num_reqs,
             num_actual_tokens=num_tokens,
             max_query_len=max_query_len,
@@ -1331,6 +1321,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             req_id_to_index_output_copy,
         )
 
+    @e2e_starts
     @torch.inference_mode()
     def execute_model(
         self,
@@ -1375,6 +1366,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
             num_reqs = self.input_batch.num_reqs
             req_ids = self.input_batch.req_ids
+
             tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
             num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
 
@@ -1480,6 +1472,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self.kv_connector_output = kv_connector_output
         return None
 
+    @e2e_ends
     @torch.inference_mode()
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
@@ -1511,12 +1504,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         if grammar_output is not None:
             # NOTE(RBLN): `xgr.apply_token_bitmask_inplace` requires logits
             # to be float32 dtype for CPU tensors
-            origin_dtype = logits.dtype
-            logits = logits.to(torch.float32)
+            origin_dtype, origin_device = logits.dtype, logits.device
+            logits = logits.to(torch.float32).to("cpu")
             apply_grammar_bitmask(
                 scheduler_output, grammar_output, self.input_batch, logits
             )
-            logits = logits.to(origin_dtype)
+            logits = logits.to(origin_dtype).to(origin_device)
 
         with record_function_or_nullcontext("rbln_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
@@ -1620,6 +1613,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             assert isinstance(sampled_token_ids, list)
             assert isinstance(self.drafter, NgramProposer)
             draft_token_ids = self.drafter.propose(
+                self.num_spec_tokens,
                 sampled_token_ids,
                 self.input_batch.num_tokens_no_spec,
                 self.input_batch.token_ids_cpu,
@@ -1627,7 +1621,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         elif spec_config.method == "suffix":
             assert isinstance(sampled_token_ids, list)
             assert isinstance(self.drafter, SuffixDecodingProposer)
-            draft_token_ids = self.drafter.propose(self.input_batch, sampled_token_ids)
+            draft_token_ids = self.drafter.propose(
+                self.num_spec_tokens, self.input_batch, sampled_token_ids
+            )
         elif spec_config.method == "medusa":
             assert isinstance(sampled_token_ids, list)
             assert isinstance(self.drafter, RBLNMedusaProposer)
@@ -1826,6 +1822,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
                 runtime_holder=self.runtime_holder,
                 mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
+                # Logits are consumed by sampling within the same step, so the
+                # output buffer can be reused across steps even under async scheduling.
+                use_static_output=True,
             )
             # NOTE(RBLN): We compile compute_logits separately to cover cases when
             # `self.use_wrapped_compute_logits` is `False`
@@ -1839,6 +1838,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
                 runtime_holder=self.runtime_holder,
                 mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
+                use_static_output=True,
             )
 
     def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:
@@ -1940,7 +1940,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             # If this is a partial request (i.e. chunked prefill),
             # then there is prompt logprob generated for each index.
             req_idx = self.input_batch.req_id_to_index[req_id]
-            offset = self.query_start_loc.cpu[req_idx].item()
+            offset = self.query_start_loc[req_idx].item()
             prompt_hidden_states = hidden_states[offset : offset + num_logits]
             logits = self.model.compute_logits(prompt_hidden_states)
 
@@ -2015,9 +2015,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         num_scheduled_tokens = np.array(num_scheduled_tokens_list, dtype=np.int32)
         num_tokens_unpadded = int(num_scheduled_tokens.sum())
 
-        seq_lens_np = self.seq_lens.numpy()
-        seq_lens_np[:num_reqs] = num_scheduled_tokens
-        seq_lens_np[num_reqs:] = 0
+        self.seq_lens_np[:num_reqs] = num_scheduled_tokens
+        self.seq_lens_np[num_reqs:] = 0
 
         # NOTE(RBLN): self.is_prefill is derived from num_tokens_no_spec.
         # For decode warmup, keep it at 1 so multi-token speculative decode
@@ -2032,9 +2031,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         )
         num_tokens_padded = num_tokens_padded or _num_tokens_padded
 
-        cum_num_tokens, _ = self._get_cumsum_and_arange(num_scheduled_tokens)
-        query_start_loc_np = self.query_start_loc.np
-        query_start_loc_np[1 : num_reqs + 1] = cum_num_tokens
+        cu_num_tokens, _ = self._get_cumsum_and_arange(num_scheduled_tokens)
+        self.query_start_loc_np[0] = 0
+        self.query_start_loc_np[1 : num_reqs + 1] = cu_num_tokens
+        self.query_start_loc_np[num_reqs + 1 :].fill(cu_num_tokens[-1])
 
         attn_metadata, _ = self._build_attention_metadata(
             num_tokens=num_tokens_unpadded,
@@ -2082,7 +2082,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             token_indices=token_indices,
             layout=InputLayout(
                 num_reqs=num_reqs,
-                num_reqs_padded=num_reqs,
+                num_reqs_padded=num_reqs if self.is_prefill else num_reqs_padded,
                 query_len=num_tokens_per_req,
                 query_len_padded=num_tokens_per_req,
             ),
@@ -2308,7 +2308,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 max_model_len=max_model_len,
                 max_num_batched_tokens=self.max_num_tokens,
                 device=self.device,
-                pin_memory=self.pin_memory,
                 vocab_size=self.model_config.get_vocab_size(),
                 block_sizes=block_sizes,
                 kernel_block_sizes=kernel_block_sizes,
@@ -2867,6 +2866,71 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 if not t.is_contiguous():
                     t.data = t.data.contiguous()
 
+    @torch.inference_mode()
+    def _warmup_sampler_decode_batches(self) -> None:
+        """Warm the device rejection-sample op at every decode batch size."""
+        if (
+            self.speculative_config is None
+            or self.num_spec_tokens <= 0
+            or self.is_pooling_model
+            or not envs.VLLM_RBLN_SAMPLER
+        ):
+            return
+
+        num_spec = self.num_spec_tokens
+        vocab_size = self.model_config.get_vocab_size()
+        max_decode_batch = self.bucketing_manager.decode_batch_buckets[-1]
+
+        for batch_size in range(1, max_decode_batch + 1):
+            num_tokens = batch_size * num_spec
+            num_draft_tokens = [num_spec] * batch_size
+            draft_token_ids = torch.zeros(
+                num_tokens, dtype=torch.int32, device=self.device
+            )
+            target_probs = torch.zeros(
+                num_tokens, vocab_size, dtype=torch.float32, device=self.device
+            )
+            cu_num_draft_tokens = torch.arange(
+                num_spec,
+                num_tokens + 1,
+                num_spec,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            bonus_token_ids = torch.zeros(
+                batch_size, 1, dtype=torch.int64, device=self.device
+            )
+            dummy_sampling_metadata = SamplingMetadata(
+                temperature=None,
+                all_greedy=True,
+                all_random=False,
+                top_p=None,
+                top_k=None,
+                generators={},
+                max_num_logprobs=None,
+                no_penalties=True,
+                prompt_token_ids=None,
+                frequency_penalties=None,
+                presence_penalties=None,
+                repetition_penalties=None,
+                output_token_ids=[],
+                allowed_token_ids_mask=None,
+                bad_words_token_ids={},
+                logitsprocs=LogitsProcessors(),
+                spec_token_ids=[[] for _ in range(batch_size)],
+            )
+            logger.info("Warm-up: rejection sampler (decode_batch=%d)", batch_size)
+            self.rejection_sampler.impl.rejection_sample(
+                draft_token_ids,
+                num_draft_tokens,
+                num_spec,
+                cu_num_draft_tokens,
+                None,
+                target_probs,
+                bonus_token_ids,
+                dummy_sampling_metadata,
+            )
+
     def warmup_model(self) -> None:
         # NOTE(RBLN): Warm-up must not route through execute_model() while a
         # KV transfer group exists: the KV-connector mixin asserts
@@ -2875,6 +2939,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # the model directly, bypassing the connector lifecycle entirely.
         logger.info("Compile and warming up model.")
 
+        sig = mega_cache.config_signature(self.vllm_config)
+        mega_cache.load(self.model_config.model, sig)
         with set_compile_stage("warmup"), self.offload_context():
             # 1. prefill
             self._dummy_run(1, self.max_num_tokens, True)
@@ -2927,9 +2993,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 for size in self.bucketing_manager.batch_buckets:
                     self._dummy_sampler_run(size)
 
+            # 4. rejection sampler warmup
+            self._warmup_sampler_decode_batches()
+
             # 5. specdec (medusa)
             if self.speculative_config and self.speculative_config.method == "medusa":
                 self.drafter.dummy_run()
+
+        mega_cache.save(self.model_config.model, sig)
 
     def _process_kv_cache_copy_ops(
         self,
@@ -2949,7 +3020,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     src = op.src_block_id
                     dst = op.dst_block_id
                     nt = op.num_tokens
-                    kv_cache[:, dst, :, :, :nt, :] = kv_cache[:, src, :, :, :nt, :]
+                    if self.model_config.use_mla:
+                        kv_cache[dst, :nt, :] = kv_cache[src, :nt, :]
+                    else:
+                        kv_cache[:, dst, :, :, :nt, :] = kv_cache[:, src, :, :, :nt, :]
 
 
 def _pad_rows(t: torch.Tensor | None, bucket: int) -> torch.Tensor | None:
