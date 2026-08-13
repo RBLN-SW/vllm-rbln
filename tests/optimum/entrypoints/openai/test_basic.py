@@ -92,7 +92,7 @@ async def test_request_cancellation(server: RemoteOpenAIServer):
                 prompt=prompt,
                 model=MODEL_NAME,
                 max_tokens=100,
-                extra_body={"min_tokens": 100},
+                extra_body={"ignore_eos": True},
             )
         )
         tasks.append(task)
