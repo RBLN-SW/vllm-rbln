@@ -823,12 +823,13 @@ pool (222K tokens) never evicted. Force it with `--num-gpu-blocks-override`.
 4. **O(1) `bind()`.** It rewalks every kernel block of a request each step: 0.54 us
    at 4 pages, 20.66 us at 1024. That is 0.08% of TPOT at `max_model_len`, so
    it is scaling, not a present cost. Skip sealed kernel blocks.
-5. **Confirm the multi-turn result on MiniMax-M2.5.** The Qwen3-0.6B numbers
-   above (TTFT -26.7% against the overlay at the same physical block) should
-   grow with layer count, since the copy is per-op dispatch over layers and
-   MiniMax has 62 to Qwen's 28. Use the serve path, not the offline API, and a
-   conversation long enough to cross an 8192-token kernel block so the overlay's
-   full-block sharing also gets exercised.
+5. ~~**Confirm the multi-turn result on MiniMax-M2.5.**~~ **Done 2026-08-13** --
+   +8.8% req/s and -8.0% TPOT against sub-block caching at the same kernel
+   block, with identical match coverage (see the table above). Two follow-ups it
+   raised: TTFT did not separate from noise in a single run, so repeat it or time
+   `_process_kv_cache_copy_ops` per step to test whether the copy tax lands on
+   co-batched decodes; and conversations never crossed one kernel block, so the
+   regime where both designs share full blocks by reference is still unmeasured.
 6. **Short greedy probe on `sub-block caching @ block 8192`.** In the run above it was the
    only config whose text diverged from the other two. Probably benign (moving
    chunked-prefill boundaries), but that is the config recommended for the +18%
