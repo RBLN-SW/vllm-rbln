@@ -43,7 +43,9 @@ def _upstream_still_blanks_blocks() -> bool:
     try:
         source = inspect.getsource(MultiConnector.update_state_after_alloc)
     except (OSError, TypeError):
-        logger.warning("Cannot read MultiConnector source; applying vllm#46865 backport.")
+        logger.warning(
+            "Cannot read MultiConnector source; applying vllm#46865 backport."
+        )
         return True
     return "empty_blocks" in source
 
