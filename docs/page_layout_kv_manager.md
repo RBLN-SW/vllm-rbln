@@ -356,6 +356,54 @@ kernel block-major, so gather/scatter still needs `(kernel_block_id, page_offset
 now equal), the backend must expose `kernel_block_size` to the connector through an
 explicit channel. This is an open item; see [§ Open questions](#open-questions).
 
+### Measured 2026-08-13 (MiniMax-M2.5, DP4+EP, multi-turn serve)
+
+The confirmation the Qwen result asked for, on the deployment model and through
+the serve path. Both configs run **kernel block 8192 and prefill chunk 512** and
+differ only in how the 512-token match unit is reached:
+
+| | `--block-size` | physical | match unit |
+|---|---|---|---|
+| sub-block on | 8192 | 8192 | 512 (`sub_block_size` = chunk) |
+| page layout | 512 | 8192 (`attn_block_size`) | 512 (page) |
+
+DP4 + expert parallel, `--max-model-len 16384`, `--max-num-seqs 8`,
+`--gpu-memory-utilization 0.8`, prefix caching on, **no KV connector** (this
+compares vLLM-local mechanisms; connector interaction is still unverified).
+Workload is `benchmarks/multi_turn/benchmark_serving_multi_turn.py` with the
+stock `generate_multi_turn.json` at 16 conversations -- 12-18 turns, 500-token
+common prefix, ~1000-token per-conversation prefix, 120-160 in / 80-120 out per
+turn -- 4 clients, seed 0. `vllm bench serve` cannot be used for this: it sends
+independent requests, so no turn ever resumes the previous turn's tokens, which
+is the entire effect under test.
+
+Identical workload either way: 109 requests, 7.02 turns and 2202 input tokens on
+average, and **79.72% of input tokens matched in both runs**. Same match, same
+amount; only the delivery differs.
+
+| | runtime | req/s | mean TTFT | mean TPOT | mean latency |
+|---|---|---|---|---|---|
+| sub-block on | 156.9 s | 0.695 | 528.5 ms | 51.56 ms | 5668.6 ms |
+| page layout | **144.1 s** | **0.756** | **473.1 ms** | **47.42 ms** | **5189.0 ms** |
+| delta | -8.1% | +8.8% | -10.5% | **-8.0%** | **-8.5%** |
+
+Welch t across the 109 per-request samples: TPOT `t=6.16`, latency `t=4.08` --
+both solid. **TTFT `t=1.42`, so its -10.5% is not separable from noise in a
+single run**, which is the opposite of what the Qwen run suggested and of what
+the mechanism predicts, since the copy happens before the forward pass.
+
+The likely reason TPOT moves instead is that the copy does not run in isolation:
+with chunked prefill, 4 clients and `max_num_seqs 8`, a step carrying a
+prefill's copy also carries other requests' decodes, so the copy tax lands on
+whatever is batched alongside it rather than only on the request paying it. That
+is a hypothesis -- confirming it needs per-step timing, not these aggregates.
+
+**Regime this measures.** Conversations reached 3948 input tokens at most, so no
+full 8192 kernel block ever forms and sub-block caching recopies the entire
+matched prefix every turn while adoption copies nothing. Conversations longer
+than one kernel block would share full blocks by reference in both designs and
+narrow the gap; this is the favourable end of the range, not the average one.
+
 ### Hybrid attention (gpt-oss-120b): what it actually needs
 
 gpt-oss-120b alternates `sliding_attention` (window **128**) with
