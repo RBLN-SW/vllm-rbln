@@ -11,14 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Dtype-aware variants of vLLM's builtin logits processors.
 
-The RBLN sampler keeps logits in the model dtype instead of upcasting
-them to float32, while the builtin processors create their constant
-tensors as float32. Mixed-dtype in-place ops (``index_put_``, ``mul_``,
-``+=``) raise a RuntimeError, so these subclasses keep the constants in
-the model dtype.
-"""
 import itertools
 from collections.abc import Sequence
 
@@ -48,6 +41,8 @@ class RBLNMinTokensLogitsProcessor(MinTokensLogitsProcessor):
     # apply_with_spec_decode() sees the float32-upcast target logits from
     # the rejection sampler. The -inf constant is therefore synced to the
     # incoming logits dtype per call, with one cached tensor per dtype.
+    neg_inf_tensor: torch.Tensor
+
     def __init__(
         self, vllm_config: VllmConfig, device: torch.device, is_pin_memory: bool
     ):
@@ -74,6 +69,8 @@ class RBLNMinTokensLogitsProcessor(MinTokensLogitsProcessor):
 
 
 class RBLNLogitBiasLogitsProcessor(LogitBiasLogitsProcessor):
+    bias_tensor: torch.Tensor
+
     def __init__(
         self, vllm_config: VllmConfig, device: torch.device, is_pin_memory: bool
     ):
@@ -89,6 +86,8 @@ class RBLNLogitBiasLogitsProcessor(LogitBiasLogitsProcessor):
 
 
 class RBLNMinPLogitsProcessor(MinPLogitsProcessor):
+    min_p: torch.Tensor
+
     def __init__(
         self, vllm_config: VllmConfig, device: torch.device, is_pin_memory: bool
     ):
