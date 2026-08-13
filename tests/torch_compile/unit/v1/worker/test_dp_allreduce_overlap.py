@@ -107,7 +107,6 @@ def _rank_main(rank: int, port: int, conn) -> None:
         dist.destroy_process_group()
 
 
-@pytest.mark.timeout(180)
 def test_async_dp_allreduce_matches_blocking_and_hides_skew():
     ctx = mp.get_context("spawn")
     port = 29500 + (os.getpid() % 1000)
@@ -119,7 +118,16 @@ def test_async_dp_allreduce_matches_blocking_and_hides_skew():
         procs.append(p)
         conns.append(parent_conn)
 
-    results = [c.recv() for c in conns]
+    # Poll before recv: a rank that dies before sending would otherwise leave
+    # recv() blocking forever, and this file may not assume pytest-timeout is
+    # installed - the repo runs with --strict-markers and does not register it.
+    results = []
+    for c in conns:
+        if not c.poll(120):
+            for p in procs:
+                p.kill()
+            pytest.fail("a rank produced no result within 120s")
+        results.append(c.recv())
     for p in procs:
         p.join(timeout=120)
         assert p.exitcode == 0, f"rank process exited with {p.exitcode}"
