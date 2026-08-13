@@ -253,7 +253,6 @@ def _schedule_new_request(
         num_common_prefix_blocks=[],
         finished_req_ids=set(),
         free_encoder_mm_hashes=[],
-        is_prefill_step=True,
     )
 
 
@@ -1340,7 +1339,7 @@ def test_prepare_inputs_num_spec_tokens_without_scheduled_drafts_uses_logical_le
     # Force decode state. is_prefill must be False.
     ib.num_computed_tokens_cpu[0] = 3
     ib.num_tokens_no_spec[0] = 3
-    assert rbln_model_runner.is_prefill_step is False
+    assert rbln_model_runner.is_prefill is False
 
     scheduler_output = RBLNSchedulerOutput(
         scheduled_new_reqs=[],
@@ -1449,17 +1448,17 @@ def test_prepare_kv_sharing_fast_prefill_pads_with_last_index(rbln_model_runner)
 
 
 def test_is_prefill_boundary_properties(rbln_model_runner):
-    """Step phase is scheduler-stamped now (the num_computed < nts-1 boundary
-    moved to the scheduler); is_prefill_step reads that stamp, and
-    is_intermediate_chunked_prefill = is_prefill_step AND discard_mask[0];
+    """The step phase now comes from the scheduler output (the num_computed <
+    nts-1 boundary moved to the scheduler), and
+    is_intermediate_chunked_prefill = is_prefill AND discard_mask[0];
     use_wrapped_compute_logits = not pooling."""
     r = rbln_model_runner
     r._is_prefill_step = True
-    assert r.is_prefill_step is True
+    assert r.is_prefill is True
     r._is_prefill_step = False
-    assert r.is_prefill_step is False
+    assert r.is_prefill is False
 
-    # is_intermediate_chunked_prefill = is_prefill_step AND discard_mask[0].
+    # is_intermediate_chunked_prefill = is_prefill AND discard_mask[0].
     r._is_prefill_step = True
     r.discard_request_mask[0] = True
     assert r.is_intermediate_chunked_prefill is True
@@ -1483,7 +1482,7 @@ def test_sample_skips_sampler_for_intermediate_chunked_prefill(
     the sampler. This guards the fast path used when sampled tokens are
     discarded by discard_request_mask."""
 
-    # Make is_prefill_step True (scheduler-stamped step phase):
+    # Make is_prefill True (the step phase):
     rbln_model_runner._is_prefill_step = True
 
     # Make is_intermediate_chunked_prefill True:
@@ -2327,7 +2326,7 @@ def test_execute_model_prefill_passes_token_indices_and_stores_execute_state(
     assert output is None
 
     # Prefill runs the real input preparation path.
-    assert rbln_model_runner.is_prefill_step is True
+    assert rbln_model_runner.is_prefill is True
     assert attn_metadata_calls["num_tokens"] == 3
     assert attn_metadata_calls["num_reqs"] == 1
     assert attn_metadata_calls["max_query_len"] == 3
@@ -2384,7 +2383,7 @@ def test_execute_model_decode_slices_logits_by_logits_indices(
     ib.num_tokens_no_spec[:2] = [4, 4]
     rbln_model_runner.requests["req_0"].output_token_ids = [101]
     rbln_model_runner.requests["req_1"].output_token_ids = [202]
-    assert rbln_model_runner.is_prefill_step is False
+    assert rbln_model_runner.is_prefill is False
 
     scheduler_output = RBLNSchedulerOutput(
         scheduled_new_reqs=[],
@@ -2443,7 +2442,7 @@ def test_execute_model_decode_slices_logits_by_logits_indices(
     output = rbln_model_runner.execute_model(scheduler_output)
 
     assert output is None
-    assert rbln_model_runner.is_prefill_step is False
+    assert rbln_model_runner.is_prefill is False
 
     # Decode path uses one query token per request and does not pass token_indices
     # to wrapped compute_logits.
@@ -2502,7 +2501,7 @@ def test_execute_model_spec_decode_stores_spec_metadata_and_common_attention_met
     ib.num_computed_tokens_cpu[0] = 3
     ib.num_tokens_no_spec[0] = 4
     rbln_model_runner.requests[req_id].output_token_ids = [101]
-    assert rbln_model_runner.is_prefill_step is False
+    assert rbln_model_runner.is_prefill is False
 
     monkeypatch.setattr(rbln_model_runner, "num_spec_tokens", 2)
 
@@ -2563,7 +2562,7 @@ def test_execute_model_spec_decode_stores_spec_metadata_and_common_attention_met
     output = rbln_model_runner.execute_model(scheduler_output)
 
     assert output is None
-    assert rbln_model_runner.is_prefill_step is False
+    assert rbln_model_runner.is_prefill is False
 
     assert attn_metadata_calls["num_tokens"] == 3
     assert attn_metadata_calls["num_reqs"] == 1
@@ -3072,9 +3071,9 @@ def test_determine_batch_padding_decode_uses_bucket(rbln_model_runner, monkeypat
 
     assert rbln_model_runner.parallel_config.data_parallel_size == 1
 
-    # Prefill path (step phase is scheduler-stamped now).
+    # Prefill path (the step phase comes from the scheduler output).
     rbln_model_runner._is_prefill_step = True
-    assert rbln_model_runner.is_prefill_step is True
+    assert rbln_model_runner.is_prefill is True
 
     num_reqs_padded, num_tokens_padded, num_tokens_across_dp = (
         rbln_model_runner._determine_batch_padding(
@@ -3090,7 +3089,7 @@ def test_determine_batch_padding_decode_uses_bucket(rbln_model_runner, monkeypat
 
     # Decode path.
     rbln_model_runner._is_prefill_step = False
-    assert rbln_model_runner.is_prefill_step is False
+    assert rbln_model_runner.is_prefill is False
 
     num_reqs_padded, num_tokens_padded, num_tokens_across_dp = (
         rbln_model_runner._determine_batch_padding(
@@ -3111,9 +3110,9 @@ def test_determine_batch_padding_data_parallel_prefill_uses_max_num_tokens(
     """Data-parallel prefill should use max_num_tokens padding and return
     cross-rank token counts."""
 
-    # Force prefill (scheduler-stamped step phase).
+    # Force prefill (the step phase).
     rbln_model_runner._is_prefill_step = True
-    assert rbln_model_runner.is_prefill_step is True
+    assert rbln_model_runner.is_prefill is True
 
     monkeypatch.setattr(
         rbln_model_runner.parallel_config,
@@ -3194,7 +3193,7 @@ def test_determine_batch_padding_specialized_moe_decode_uses_decode_bucket(
     # Force decode.
     ib.num_computed_tokens_cpu[0] = 7
     ib.num_tokens_no_spec[0] = 8
-    assert rbln_model_runner.is_prefill_step is False
+    assert rbln_model_runner.is_prefill is False
 
     monkeypatch.setattr(
         rbln_model_runner.parallel_config,

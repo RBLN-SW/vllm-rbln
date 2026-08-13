@@ -44,6 +44,7 @@ from vllm_rbln.v1.core.rbln_kv_cache_manager import (
 )
 from vllm_rbln.v1.core.utils import (
     DecodeBatchBudget,
+    is_prefill,
     num_base_tokens,
     should_defer_spec_step,
 )
@@ -54,20 +55,9 @@ logger = init_logger(__name__)
 @dataclass
 class RBLNSchedulerOutput(SchedulerOutput):
     """SchedulerOutput extended with KV cache copy operations for sub-block
-    prefix caching, and a step-level prefill/decode phase anchor."""
+    prefix caching."""
 
     kv_cache_copy_ops: list[KVCacheCopyOp] = field(default_factory=list)
-    # NOTE(RBLN): Whether this step runs the prefill graph (True) or the decode
-    # graph (False). RBLN has no mixed batching, so a step is uniformly one or
-    # the other. The scheduler is the single authority: it stamps this from the
-    # pre-advance Request state so every PP rank reads an identical value. The
-    # runner consumes it via its is_prefill_step property, which documents why a
-    # per-rank re-derivation would diverge.
-    is_prefill_step: bool = False
-
-
-def is_prefill(request: Request) -> bool:
-    return request.num_computed_tokens < request.num_tokens - 1
 
 
 class RBLNScheduler(Scheduler):
@@ -204,6 +194,16 @@ class RBLNScheduler(Scheduler):
         preempted_reqs: list[Request] = []
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
+        # NOTE(RBLN): The runner reads this step's phase off this dict
+        # (step_is_prefill), which holds because a step is never mixed -- all
+        # decodes, or a lone prefill. Four guards keep it that way:
+        #   (A) the running loop schedules a trailing prefill alone;
+        #   (B) that prefill then skips the waiting loop;
+        #   (C) a waiting prefill defers once anything else is admitted;
+        #   (D) an admitted waiting prefill evicts the decode batch.
+        # Relaxing any of (A)-(D), or clamping a prefill chunk to a single token,
+        # breaks that read; see the step-phase section in v1/core/utils.py for
+        # what it would cost.
         num_scheduled_tokens: dict[str, int] = {}
         token_budget = self.max_num_scheduled_tokens
         if self._pause_state == PauseState.PAUSED_ALL:
@@ -238,7 +238,8 @@ class RBLNScheduler(Scheduler):
         # NOTE(RBLN): Prioritize prefill requests. Given our constraint that the prefill
         # batch size fixed to 1 if any prefill request is running there must be exactly
         # one at the end of the list.
-        # Guard (A) of the no-mixed-batching invariant; see is_prefill_step.
+        # Guard (A) of the no-mixed-batching invariant; see the step-phase
+        # section in v1/core/utils.py.
         req_index = (
             len(self.running) - 1
             if self.running and is_prefill(self.running[-1])
@@ -470,7 +471,8 @@ class RBLNScheduler(Scheduler):
         # Next, schedule the WAITING requests.
         # NOTE(RBLN): We do not attempt to schedule a new prefill request when a running
         # prefill request is already scheduled.
-        # Guard (B) of the no-mixed-batching invariant; see is_prefill_step.
+        # Guard (B) of the no-mixed-batching invariant; see the step-phase
+        # section in v1/core/utils.py.
         if (
             not preempted_reqs
             and self._pause_state == PauseState.UNPAUSED
@@ -657,7 +659,7 @@ class RBLNScheduler(Scheduler):
                         # local prefill now would illegally mix it with those decode
                         # reqs. Left un-popped at the queue head, re-tried next step.
                         # Guard (C) of the no-mixed-batching invariant
-                        # (see is_prefill_step).
+                        # (see the step-phase section in v1/core/utils.py).
                         break
 
                     # Schedule encoder inputs.
@@ -865,7 +867,8 @@ class RBLNScheduler(Scheduler):
                 # NOTE(RBLN): admit this prefill by evicting all scheduled running
                 # reqs and running it alone (no mixed batching); they rejoin as
                 # decodes next step (or once its prefill finishes).
-                # Guard (D) of the no-mixed-batching invariant; see is_prefill_step.
+                # Guard (D) of the no-mixed-batching invariant; see the step-phase
+                # section in v1/core/utils.py.
                 for req in scheduled_running_reqs:
                     evicted_delta = req_to_new_blocks.pop(req.request_id)
                     num_scheduled_tokens.pop(req.request_id)
@@ -997,22 +1000,6 @@ class RBLNScheduler(Scheduler):
             else None
         )
 
-        # NOTE(RBLN): Stamp the step-level prefill/decode phase from the
-        # pre-advance Request state (num_computed < num_tokens - 1). A step is
-        # never mixed -- all decodes, or a lone prefill -- so the first scheduled
-        # id decides it (running reqs inserted first; else the waiting prefill).
-        # Empty step (no tokens) -> False (decode); the runner early-returns.
-        #
-        # Four guards hold this no-mixed-batching invariant:
-        #   (A) the running loop schedules a trailing prefill alone;
-        #   (B) that prefill then skips the waiting loop;
-        #   (C) a waiting prefill defers once anything else is admitted;
-        #   (D) an admitted waiting prefill evicts the decode batch.
-        # Relaxing any of (A)-(D) silently invalidates this classification.
-        is_prefill_step = bool(num_scheduled_tokens) and is_prefill(
-            self.requests[next(iter(num_scheduled_tokens))]
-        )
-
         scheduler_output = RBLNSchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
@@ -1029,7 +1016,6 @@ class RBLNScheduler(Scheduler):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
-            is_prefill_step=is_prefill_step,
         )
 
         # Drain pending copy ops from the KV cache manager.

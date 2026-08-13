@@ -13,8 +13,11 @@
 # limitations under the License.
 
 # Pure-function helpers in v1/core/utils shared by the RBLN scheduler and runner:
-# decode_batch_size and the spec-decode + PP token bookkeeping. The decode-batch
-# admission budget classes are exercised in test_rbln_scheduler.py.
+# decode_batch_size, the step phase, and the spec-decode + PP token bookkeeping.
+# The decode-batch admission budget classes are exercised in
+# test_rbln_scheduler.py, as is is_prefill against real requests.
+
+from types import SimpleNamespace
 
 import pytest
 
@@ -23,7 +26,45 @@ from vllm_rbln.v1.core.utils import (
     num_base_tokens,
     resolve_propagated_token_write,
     should_defer_spec_step,
+    step_is_prefill,
 )
+
+
+def _sched_out(num_scheduled_tokens, spec=None):
+    return SimpleNamespace(
+        num_scheduled_tokens=num_scheduled_tokens,
+        scheduled_spec_decode_tokens=spec or {},
+    )
+
+
+class TestStepIsPrefill:
+    # The phase the runner selects its compiled graph with: more than one
+    # non-draft token for some request.
+
+    def test_decode_step(self):
+        assert step_is_prefill(_sched_out({"a": 1, "b": 1})) is False
+
+    def test_prefill_chunk(self):
+        assert step_is_prefill(_sched_out({"a": 512})) is True
+
+    def test_single_token_step_is_decode(self):
+        # Where a 1-token prompt, a chunked prefill's last token and a full
+        # remote-KV or prefix-cache match all land -- is_prefill() reports decode
+        # for each, so this has to as well.
+        assert step_is_prefill(_sched_out({"a": 1})) is False
+
+    def test_drafts_do_not_inflate_the_phase(self):
+        # 1 base + 4 drafts is a decode step; only the base counts.
+        assert step_is_prefill(_sched_out({"a": 5}, spec={"a": [1, 2, 3, 4]})) is False
+
+    def test_empty_step(self):
+        assert step_is_prefill(_sched_out({})) is False
+
+    def test_a_mixed_step_reads_prefill(self):
+        # Unreachable (the scheduler never mixes) and asserted against there.
+        # Pinned because any() picks the safe side: a prefill graph can still
+        # take a single-token query, a decode graph cannot take a chunk.
+        assert step_is_prefill(_sched_out({"a": 1, "b": 512})) is True
 
 
 @pytest.mark.parametrize(

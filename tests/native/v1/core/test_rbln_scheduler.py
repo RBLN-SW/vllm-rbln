@@ -17,6 +17,7 @@
 
 import dataclasses
 import inspect
+from types import SimpleNamespace
 
 import pytest
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -34,11 +35,8 @@ from tests.native.v1.core.utils import (
     prefill_request,
 )
 from vllm_rbln.v1.core.rbln_kv_cache_manager import RBLNKVCacheManager
-from vllm_rbln.v1.core.rbln_scheduler import (
-    RBLNScheduler,
-    RBLNSchedulerOutput,
-    is_prefill,
-)
+from vllm_rbln.v1.core.rbln_scheduler import RBLNScheduler, RBLNSchedulerOutput
+from vllm_rbln.v1.core.utils import is_prefill, step_is_prefill
 
 
 class TestSchedulerInit:
@@ -664,6 +662,32 @@ class TestPortDriftConformance:
 # check the invariants hold at every step.
 
 
+def _check_phase_agrees(sched, out) -> bool:
+    """The scheduler's phase for a step against the phase the runner derives from
+    it, and that the step carries only one of the two. Returns the phase.
+
+    schedule() advances num_computed_tokens by the scheduled chunk before it
+    returns, so back the chunk out to reach the state the scheduler classified.
+    """
+    phases = set()
+    for rid, chunk in out.num_scheduled_tokens.items():
+        req = sched.requests[rid]
+        phases.add(
+            is_prefill(
+                SimpleNamespace(
+                    num_computed_tokens=req.num_computed_tokens - chunk,
+                    num_tokens=req.num_tokens,
+                )
+            )
+        )
+    assert len(phases) <= 1, "a step mixed prefill and decode"
+    assert step_is_prefill(out) is (phases == {True}), (
+        f"phase {phases} but chunks {out.num_scheduled_tokens} "
+        f"(spec {out.scheduled_spec_decode_tokens})"
+    )
+    return phases == {True}
+
+
 class TestFullRunInvariants:
     def test_multi_request_full_drain(self):
         # Six requests to completion: every step homogeneous, prefill batch <= 1,
@@ -675,15 +699,51 @@ class TestFullRunInvariants:
 
         def check(out):
             scheduled = list(out.num_scheduled_tokens)
-            phases = {is_prefill(sched.requests[rid]) for rid in scheduled}
-            assert len(phases) <= 1, "a step mixed prefill and decode"
-            n_prefill = sum(1 for rid in scheduled if is_prefill(sched.requests[rid]))
-            assert n_prefill <= 1, "more than one prefill in a step"
+            if _check_phase_agrees(sched, out):
+                assert len(scheduled) == 1, "more than one request in a prefill step"
             assert len(scheduled) <= 4, "decode batch exceeded the cap"
 
         _drain(sched, per_step=check)
         assert all(r.is_finished() for r in reqs)
         assert sched.running == []
+
+    @pytest.mark.parametrize(
+        ("num_tokens", "max_num_batched_tokens"),
+        [
+            (10, 8192),  # prompt in one chunk
+            (1, 8192),  # single-token prompt: no prefill step at all
+            (33, 16),  # chunked, tail chunk of 1 token
+            (32, 16),  # chunked, block-aligned
+        ],
+    )
+    def test_step_phase_matches_the_scheduled_chunks(
+        self, num_tokens, max_num_batched_tokens
+    ):
+        # What the runner derives from a step (step_is_prefill) has to be what the
+        # scheduler decided (is_prefill), on every step of a run. The chunk sizes
+        # here reach the cases where the two could come apart -- above all a
+        # prefill whose last chunk is a single token.
+        sched = create_rbln_scheduler(
+            max_num_seqs=4,
+            block_size=16,
+            num_blocks=10000,
+            max_num_batched_tokens=max_num_batched_tokens,
+        )
+        for r in create_requests(3, num_tokens=num_tokens, max_tokens=4):
+            sched.add_request(r)
+
+        _drain(sched, per_step=lambda out: _check_phase_agrees(sched, out))
+
+    def test_step_phase_matches_the_scheduled_chunks_under_spec_decode(self):
+        # A verify step schedules 1 + num_spec tokens; only the base token counts,
+        # so the step still reads as decode.
+        sched = create_rbln_scheduler(
+            max_num_seqs=4, block_size=16, num_blocks=10000, num_speculative_tokens=3
+        )
+        for r in create_requests(2, num_tokens=10, max_tokens=6):
+            sched.add_request(r)
+
+        _drain(sched, per_step=lambda out: _check_phase_agrees(sched, out))
 
     def test_scheduled_token_count_matches_output(self):
         # Across a run, every request in num_scheduled_tokens must appear in the

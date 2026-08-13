@@ -12,16 +12,63 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Utility helpers for the RBLN scheduler (``rbln_scheduler.py``).
+"""Utility helpers for the ``RBLNScheduler`` (``rbln_scheduler.py``).
 
-Small, independently-testable pieces factored out of ``RBLNScheduler`` so the
-large upstream-copied ``schedule()`` stays readable; some are shared with
-``RBLNModelRunner`` (``decode_batch_size``, the spec-decode ``num_base_tokens`` /
-``resolve_propagated_token_write`` token bookkeeping). The per-step decode-batch
-admission budget lives here too (``DecodeBatchBudget``): RBLN compiles a fixed
-decode-batch shape, so each PP microbatch must stay <=
-``max_num_seqs // pipeline_parallel_size``.
+- Step phase -- ``is_prefill``, ``step_is_prefill``: the two views of a step's
+  prefill-or-decode classification. See the section below.
+- Decode batch -- ``decode_batch_size``, ``DecodeBatchBudget``: the compiled
+  per-PP-stage batch size and the per-step admission budget that holds each PP
+  microbatch to ``max_num_seqs // pipeline_parallel_size``.
+- Token bookkeeping under spec-decode and PP -- ``should_defer_spec_step``,
+  ``num_base_tokens``, ``resolve_propagated_token_write``.
 """
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from vllm.v1.core.sched.output import SchedulerOutput
+    from vllm.v1.request import Request
+
+
+# --- Step phase: prefill graph or decode graph -------------------------------
+#
+# RBLN compiles a graph per shape, so a step runs one graph or the other, never a
+# mix. Two functions answer which, because the scheduler decides the phase but
+# every PP rank has to arrive at the same answer:
+#
+#   is_prefill(request)         2 or more tokens left to compute. The definition,
+#                               on pre-advance state only the scheduler holds.
+#   step_is_prefill(sched_out)  2 or more non-draft tokens scheduled. The same
+#                               phase, from what every rank receives alike.
+#
+# They can disagree only on a prefill scheduled exactly 1 token. That does not
+# happen: with 1 token left, is_prefill() already reports decode, which is where
+# a 1-token prompt, a chunked prefill's last token, a full remote-KV match and a
+# full prefix-cache match all land -- and no clamp in schedule() cuts a chunk
+# that short. The scheduler tests pin both views together across whole runs.
+#
+# If that ever breaks, an unfinished prompt runs on the decode graph, and
+# is_intermediate_chunked_prefill falls with it since it ANDs the phase: the step
+# gets sampled and drafts get proposed with no anchor token, landing drafts on a
+# request that is still prefilling.
+
+
+def is_prefill(request: Request) -> bool:
+    return request.num_computed_tokens < request.num_tokens - 1
+
+
+def step_is_prefill(scheduler_output: SchedulerOutput) -> bool:
+    return any(
+        num_base_tokens(
+            scheduler_output.num_scheduled_tokens,
+            scheduler_output.scheduled_spec_decode_tokens,
+            req_id,
+        )
+        > 1
+        for req_id in scheduler_output.num_scheduled_tokens
+    )
 
 
 def decode_batch_size(max_num_seqs: int, pipeline_parallel_size: int) -> int:
@@ -145,7 +192,7 @@ class DecodeBatchBudget:
     @classmethod
     def for_step(
         cls, max_num_seqs: int, pipeline_parallel_size: int, demand: int
-    ) -> "DecodeBatchBudget":
+    ) -> DecodeBatchBudget:
         """Budget for one step. ``demand`` is running decodes + ready remote-KV
         (invariant under admission -- promoting a ready remote-KV keeps the
         total -- so a step-start snapshot is exact)."""

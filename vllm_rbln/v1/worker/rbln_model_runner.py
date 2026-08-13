@@ -127,6 +127,7 @@ from vllm_rbln.v1.core.utils import (
     decode_batch_size,
     num_base_tokens,
     resolve_propagated_token_write,
+    step_is_prefill,
 )
 from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
@@ -224,7 +225,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self.scheduler_config = vllm_config.scheduler_config
         self.speculative_config = vllm_config.speculative_config
 
-        # Step phase; see is_prefill_step for authority and lifecycle.
+        # Step phase; see is_prefill for authority and lifecycle.
         self._is_prefill_step: bool = False
         # self.observability_config = vllm_config.observability_config
 
@@ -790,7 +791,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # ngram/suffix steps clear scheduled_spec_decode_tokens and run with
         # the logical query length, usually qlen=1.
         use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
-        if use_spec_decode and self.num_spec_tokens > 0 and not self.is_prefill_step:
+        if use_spec_decode and self.num_spec_tokens > 0 and not self.is_prefill:
             target_query_len = self.num_spec_tokens + 1
             query_lengths = np.full(num_reqs, target_query_len, dtype=np.int32)
             backfill = query_lengths - logical_num_tokens
@@ -973,7 +974,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 attn_metadata_i = builder.build(
                     common_attn_metadata=cm,
                     positions=self.positions,
-                    is_prefill=self.is_prefill_step,
+                    is_prefill=self.is_prefill,
                     batch_pad=num_reqs_padded,
                 )
 
@@ -1192,14 +1193,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         else:
             assert intermediate_tensors is not None
 
-        is_prefill_step = self.is_prefill_step
+        is_prefill = self.is_prefill
         layout = InputLayout(
             num_reqs=num_reqs,
-            num_reqs_padded=num_reqs if is_prefill_step else num_reqs_padded,
+            num_reqs_padded=num_reqs if is_prefill else num_reqs_padded,
             query_len=input_ids.shape[1],
-            query_len_padded=self.max_num_tokens
-            if is_prefill_step
-            else input_ids.shape[1],
+            query_len_padded=self.max_num_tokens if is_prefill else input_ids.shape[1],
         )
         staged_model_inputs = self.input_stager.stage(
             input_ids=input_ids,
@@ -1207,7 +1206,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
             token_indices=logits_indices
-            if is_prefill_step and self.use_wrapped_compute_logits
+            if is_prefill and self.use_wrapped_compute_logits
             else None,
             layout=layout,
         )
@@ -1377,7 +1376,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             )
 
         # Stamp the step's phase before any step logic reads it.
-        self.is_prefill_step = scheduler_output.is_prefill_step
+        self.is_prefill = step_is_prefill(scheduler_output)
 
         if has_kv_transfer_group():
             kv_connector_metadata = scheduler_output.kv_connector_metadata
@@ -1477,7 +1476,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 scheduler_output,
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
-            self.performance_ctx.profile_model(self.is_prefill_step),
+            self.performance_ctx.profile_model(self.is_prefill),
         ):
             model_output = self.model_executable(
                 **staged_model_inputs.as_kwargs(),
@@ -1506,7 +1505,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
             sample_hidden_states = hidden_states
             assert self.use_wrapped_compute_logits
-            if not self.is_prefill_step and spec_decode_metadata is not None:
+            if not self.is_prefill and spec_decode_metadata is not None:
                 logits = logits[logits_indices]
 
         self.execute_model_state = ExecuteModelState(
@@ -2061,7 +2060,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         # Stamp the dummy's own phase before any step setup; on the DP-idle path
         # this stops a prior real step's value leaking into a read.
-        self.is_prefill_step = is_prefill
+        self.is_prefill = is_prefill
 
         draft_num_tokens_padded = num_tokens_padded
 
@@ -2139,7 +2138,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             token_indices=token_indices,
             layout=InputLayout(
                 num_reqs=num_reqs,
-                num_reqs_padded=(num_reqs if self.is_prefill_step else num_reqs_padded),
+                num_reqs_padded=(num_reqs if self.is_prefill else num_reqs_padded),
                 query_len=num_tokens_per_req,
                 query_len_padded=num_tokens_per_req,
             ),
@@ -2808,29 +2807,28 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
     ####################################################################################################
 
     @property
-    def is_prefill_step(self) -> bool:
-        """The step's prefill/decode classification, stamped by the scheduler
-        (RBLNSchedulerOutput.is_prefill_step) and stashed at the top of
-        execute_model.
+    def is_prefill(self) -> bool:
+        """The step's prefill/decode classification, read off the scheduler
+        output by step_is_prefill and stashed at the top of execute_model.
 
         The single source of truth for all graph/phase selection in the runner.
-        A runner-side re-derivation from num_tokens_no_spec would diverge across
-        PP ranks under spec-decode -- it is updated on the sampling path on the
-        last PP rank but on the scheduler-output path on the others -- so the
-        rank-consistent scheduler value is used instead. On the dummy path
+        Deriving it from input_batch instead would diverge across PP ranks under
+        spec-decode -- num_tokens_no_spec is updated on the sampling path on the
+        last PP rank but on the scheduler-output path on the others -- whereas
+        every rank receives the same scheduler output. On the dummy path
         (_dummy_run, incl. the DP-idle execute_dummy_batch), it is stamped from
         the dummy's own phase instead of a scheduler output.
         """
         return self._is_prefill_step
 
-    @is_prefill_step.setter
-    def is_prefill_step(self, value: bool) -> None:
+    @is_prefill.setter
+    def is_prefill(self, value: bool) -> None:
         # Sole write path for _is_prefill_step.
         self._is_prefill_step = value
 
     @property
     def is_intermediate_chunked_prefill(self) -> bool:
-        return self.is_prefill_step and bool(self.discard_request_mask[0])
+        return self.is_prefill and bool(self.discard_request_mask[0])
 
     @property
     def use_wrapped_compute_logits(self) -> bool:
@@ -2854,10 +2852,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         num_reqs_unpadded: int,
         num_tokens_unpadded: int,
     ) -> tuple[int, int | None, torch.Tensor | None]:
-        is_prefill_step = self.is_prefill_step
+        is_prefill = self.is_prefill
         num_reqs_padded = (
             self.bucketing_manager.find_decode_batch_bucket(num_reqs_unpadded)
-            if not is_prefill_step
+            if not is_prefill
             else num_reqs_unpadded
         )
         if self.parallel_config.data_parallel_size == 1:
@@ -2869,7 +2867,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 num_reqs_unpadded,
                 self.parallel_config.data_parallel_size,
                 self.parallel_config.data_parallel_rank,
-                is_prefill_step,
+                is_prefill,
             )
         )
         num_tokens_padded = self.max_num_tokens
