@@ -33,9 +33,9 @@ from vllm.v1.utils import record_function_or_nullcontext
 
 import vllm_rbln.envs as envs
 from vllm_rbln.logger import init_logger
-from vllm_rbln.v1.core.page_extent import (
-    ExtentCopyOp,
-    extent_size_from_config,
+from vllm_rbln.v1.core.page_layout import (
+    KernelBlockCopyOp,
+    kernel_block_size_from_config,
     resolve_config,
     validate_fragmentation,
 )
@@ -44,8 +44,8 @@ from vllm_rbln.v1.core.rbln_kv_cache_manager import (
     RBLNKVCacheManager,
     SubBlockMatch,
 )
-from vllm_rbln.v1.core.rbln_page_extent_kv_cache_manager import (
-    RBLNPageExtentKVCacheManager,
+from vllm_rbln.v1.core.rbln_page_layout_kv_cache_manager import (
+    RBLNPageLayoutKVCacheManager,
 )
 
 logger = init_logger(__name__)
@@ -57,10 +57,12 @@ class RBLNSchedulerOutput(SchedulerOutput):
     before the forward pass.
 
     Carries whichever op shape the active manager produces: the overlay's
-    block-prefix copy or the page/extent layer's slot-range copy.
+    block-prefix copy or the page/kernel block layer's slot-range copy.
     """
 
-    kv_cache_copy_ops: list[KVCacheCopyOp | ExtentCopyOp] = field(default_factory=list)
+    kv_cache_copy_ops: list[KVCacheCopyOp | KernelBlockCopyOp] = field(
+        default_factory=list
+    )
 
 
 def is_prefill(request: Request) -> bool:
@@ -107,8 +109,8 @@ class RBLNScheduler(Scheduler):
 
         # Supersedes the overlay: upstream gives the same fine-grained hits
         # directly once the page is --block-size.
-        page_extent_installed = self._maybe_install_page_extent_manager()
-        if page_extent_installed:
+        page_layout_installed = self._maybe_install_page_layout_manager()
+        if page_layout_installed:
             match_unit = self.block_size
             sub_block_size = None
         elif sub_block_size is None and envs.VLLM_RBLN_SUB_BLOCK_CACHE:
@@ -167,50 +169,50 @@ class RBLNScheduler(Scheduler):
         # a full block table.
         self._pending_runner_block_deltas: dict[str, KVCacheBlocks] = {}
 
-        # Extents the worker already holds. Not derivable from the page delta:
-        # the list grows once per `pages_per_extent` pages.
-        self._sent_extent_counts: dict[str, int] = {}
+        # KernelBlocks the worker already holds. Not derivable from the page delta:
+        # the list grows once per `pages_per_kernel_block` pages.
+        self._sent_kernel_block_counts: dict[str, int] = {}
 
-    def _maybe_install_page_extent_manager(self) -> bool:
-        """Swap in the page/extent manager; everything is derivable."""
-        if not envs.VLLM_RBLN_PAGE_EXTENT:
+    def _maybe_install_page_layout_manager(self) -> bool:
+        """Swap in the page/kernel block manager; everything is derivable."""
+        if not envs.VLLM_RBLN_PAGE_LAYOUT:
             return False
         if not self.cache_config.enable_prefix_caching:
             return False
 
-        extent_size = extent_size_from_config(self.vllm_config)
-        page_extent_config = resolve_config(
+        kernel_block_size = kernel_block_size_from_config(self.vllm_config)
+        page_layout_config = resolve_config(
             page_size=self.block_size,
-            extent_size=extent_size,
+            kernel_block_size=kernel_block_size,
             num_pages=self.kv_cache_config.num_blocks,
         )
-        if not RBLNPageExtentKVCacheManager.can_use_page_extent(
-            self.kv_cache_config, page_extent_config
+        if not RBLNPageLayoutKVCacheManager.can_use_page_layout(
+            self.kv_cache_config, page_layout_config
         ):
             logger.warning(
-                "VLLM_RBLN_PAGE_EXTENT is set but this configuration cannot "
-                "use it (extent_size=%s, page_size=%d, kv_cache_groups=%d); "
+                "VLLM_RBLN_PAGE_LAYOUT is set but this configuration cannot "
+                "use it (kernel_block_size=%s, page_size=%d, kv_cache_groups=%d); "
                 "falling back.",
-                extent_size,
+                kernel_block_size,
                 self.block_size,
                 len(self.kv_cache_config.kv_cache_groups),
             )
             return False
 
-        page_extent_config.geometry.validate_chunk(
+        page_layout_config.geometry.validate_chunk(
             self.scheduler_config.max_num_batched_tokens
         )
         validate_fragmentation(
-            page_extent_config.geometry,
+            page_layout_config.geometry,
             self.scheduler_config.max_num_seqs,
-            page_extent_config.num_extents,
+            page_layout_config.num_kernel_blocks,
         )
 
         hash_fn = get_hash_fn_by_name(self.cache_config.prefix_caching_hash_algo)
         init_none_hash(hash_fn)
-        self.kv_cache_manager = RBLNPageExtentKVCacheManager(
+        self.kv_cache_manager = RBLNPageLayoutKVCacheManager(
             kv_cache_config=self.kv_cache_config,
-            page_extent_config=page_extent_config,
+            page_layout_config=page_layout_config,
             max_model_len=self.max_model_len,
             scheduler_block_size=self.block_size,
             hash_block_size=self.block_size,
@@ -1067,36 +1069,36 @@ class RBLNScheduler(Scheduler):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
-        self._rewrite_block_ids_to_extents(scheduler_output)
+        self._rewrite_block_ids_to_kernel_blocks(scheduler_output)
         return scheduler_output
 
-    def _rewrite_block_ids_to_extents(
+    def _rewrite_block_ids_to_kernel_blocks(
         self, scheduler_output: RBLNSchedulerOutput
     ) -> None:
-        """Swap page ids for the extents backing them, at the output boundary.
+        """Swap page ids for the kernel blocks backing them, at the output boundary.
 
         Keeps the translation out of ``schedule()``'s delta bookkeeping.
         """
         manager = self.kv_cache_manager
-        if not isinstance(manager, RBLNPageExtentKVCacheManager):
+        if not isinstance(manager, RBLNPageLayoutKVCacheManager):
             return
 
         for new_req in scheduler_output.scheduled_new_reqs:
-            extents = manager.block_table(new_req.req_id)
-            new_req.block_ids = (list(extents),)
-            self._sent_extent_counts[new_req.req_id] = len(extents)
+            kernel_blocks = manager.block_table(new_req.req_id)
+            new_req.block_ids = (list(kernel_blocks),)
+            self._sent_kernel_block_counts[new_req.req_id] = len(kernel_blocks)
 
         cached = scheduler_output.scheduled_cached_reqs
         for i, req_id in enumerate(cached.req_ids):
-            extents = manager.block_table(req_id)
+            kernel_blocks = manager.block_table(req_id)
             if req_id in cached.resumed_req_ids:
                 # resumed requests get the whole table, not a delta
-                cached.new_block_ids[i] = (list(extents),)
+                cached.new_block_ids[i] = (list(kernel_blocks),)
             else:
-                already_sent = self._sent_extent_counts.get(req_id, 0)
-                delta = extents[already_sent:]
+                already_sent = self._sent_kernel_block_counts.get(req_id, 0)
+                delta = kernel_blocks[already_sent:]
                 cached.new_block_ids[i] = (list(delta),) if delta else None
-            self._sent_extent_counts[req_id] = len(extents)
+            self._sent_kernel_block_counts[req_id] = len(kernel_blocks)
 
     def _preempt_request(
         self, request: Request, timestamp: float
@@ -1104,7 +1106,7 @@ class RBLNScheduler(Scheduler):
         # Preempted requests resume with full block tables, so pending deltas
         # from the previous running state are stale.
         self._pending_runner_block_deltas.pop(request.request_id, None)
-        self._sent_extent_counts.pop(request.request_id, None)
+        self._sent_kernel_block_counts.pop(request.request_id, None)
         return super()._preempt_request(request, timestamp)
 
     def _free_request(
@@ -1113,7 +1115,7 @@ class RBLNScheduler(Scheduler):
         # Drop any pending runner block delta; the request is finishing and will
         # never be scheduled again.
         self._pending_runner_block_deltas.pop(request.request_id, None)
-        self._sent_extent_counts.pop(request.request_id, None)
+        self._sent_kernel_block_counts.pop(request.request_id, None)
         return super()._free_request(request, delay_free_blocks)
 
     def update_from_output(

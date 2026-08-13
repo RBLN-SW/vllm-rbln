@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Page-native KV cache manager with extent backing.
+"""Page-native KV cache manager with kernel block backing.
 
-See docs/page_extent_kv_manager.md. Once ``--block-size`` is the page, upstream
+See docs/page_layout_kv_manager.md. Once ``--block-size`` is the page, upstream
 does all the matching natively, so this only maps those pages onto contiguous
-extents and emits the copies that implies.
+kernel blocks and emits the copies that implies.
 """
 
 from __future__ import annotations
@@ -26,12 +26,12 @@ from typing import TYPE_CHECKING
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 
 from vllm_rbln.logger import init_logger
-from vllm_rbln.v1.core.page_extent import (
+from vllm_rbln.v1.core.page_layout import (
     INVALID_PAGE,
-    ExtentCopyOp,
-    OutOfExtents,
-    PageExtentConfig,
-    PageExtentManager,
+    KernelBlockCopyOp,
+    OutOfKernelBlocks,
+    PageLayoutConfig,
+    PageLayoutManager,
 )
 
 if TYPE_CHECKING:
@@ -41,16 +41,16 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-__all__ = ["RBLNPageExtentKVCacheManager"]
+__all__ = ["RBLNPageLayoutKVCacheManager"]
 
 
-class RBLNPageExtentKVCacheManager(KVCacheManager):
-    """``KVCacheManager`` whose pages are backed by contiguous extents."""
+class RBLNPageLayoutKVCacheManager(KVCacheManager):
+    """``KVCacheManager`` whose pages are backed by contiguous kernel blocks."""
 
     @staticmethod
-    def can_use_page_extent(
+    def can_use_page_layout(
         kv_cache_config: KVCacheConfig,
-        config: PageExtentConfig,
+        config: PageLayoutConfig,
     ) -> bool:
         """I10 keeps the MVP to a single full-attention group."""
         if not config.enabled:
@@ -64,32 +64,32 @@ class RBLNPageExtentKVCacheManager(KVCacheManager):
     def __init__(
         self,
         kv_cache_config: KVCacheConfig,
-        page_extent_config: PageExtentConfig,
+        page_layout_config: PageLayoutConfig,
         **kwargs,
     ) -> None:
-        assert self.can_use_page_extent(kv_cache_config, page_extent_config)
+        assert self.can_use_page_layout(kv_cache_config, page_layout_config)
         super().__init__(kv_cache_config=kv_cache_config, **kwargs)
 
-        self.page_extent_config = page_extent_config
-        self.geometry = page_extent_config.geometry
-        self.extents = PageExtentManager(
-            geometry=page_extent_config.geometry,
-            num_extents=page_extent_config.num_extents,
-            num_reserved=page_extent_config.num_reserved,
+        self.page_layout_config = page_layout_config
+        self.geometry = page_layout_config.geometry
+        self.kernel_blocks = PageLayoutManager(
+            geometry=page_layout_config.geometry,
+            num_kernel_blocks=page_layout_config.num_kernel_blocks,
+            num_reserved=page_layout_config.num_reserved,
         )
         # Copies the worker must perform before the next forward pass. Each op
-        # keeps its source extent referenced until the worker is done.
-        self.pending_copy_ops: list[ExtentCopyOp] = []
+        # keeps its source kernel block referenced until the worker is done.
+        self.pending_copy_ops: list[KernelBlockCopyOp] = []
         self._install_eviction_hook()
 
         logger.info(
-            "Page/extent KV cache: page=%d, extent=%d (%d pages), "
-            "extents=%d (%d reserved for copy-on-write)",
+            "Page/kernel block KV cache: page=%d, kernel block=%d (%d pages), "
+            "kernel blocks=%d (%d reserved for copy-on-write)",
             self.geometry.page_size,
-            self.geometry.extent_size,
-            self.geometry.pages_per_extent,
-            page_extent_config.num_extents,
-            page_extent_config.num_reserved,
+            self.geometry.kernel_block_size,
+            self.geometry.pages_per_kernel_block,
+            page_layout_config.num_kernel_blocks,
+            page_layout_config.num_reserved,
         )
 
     # -- allocation ---------------------------------------------------------
@@ -117,26 +117,30 @@ class RBLNPageExtentKVCacheManager(KVCacheManager):
         if result is None:
             return None
 
-        self._bind_extents(request, cached_tokens)
+        self._bind_kernel_blocks(request, cached_tokens)
         return result
 
-    def _bind_extents(self, request: Request, cached_tokens: int) -> None:
-        """Back the request's pages with extents, queueing any copies."""
+    def _bind_kernel_blocks(self, request: Request, cached_tokens: int) -> None:
+        """Back the request's pages with kernel blocks, queueing any copies."""
         page_ids = self._page_ids(request)
         if not page_ids:
             return
         num_cached_pages = min(cached_tokens // self.geometry.page_size, len(page_ids))
         try:
-            ops = self.extents.bind(request.request_id, page_ids, num_cached_pages)
-        except OutOfExtents:
-            # retained extents are only given up under pressure
-            needed = self.geometry.num_extents_for_pages(len(page_ids))
+            ops = self.kernel_blocks.bind(
+                request.request_id, page_ids, num_cached_pages
+            )
+        except OutOfKernelBlocks:
+            # retained kernel blocks are only given up under pressure
+            needed = self.geometry.num_kernel_blocks_for_pages(len(page_ids))
             if self._reclaim_retained(needed) == 0:
                 raise
-            ops = self.extents.bind(request.request_id, page_ids, num_cached_pages)
+            ops = self.kernel_blocks.bind(
+                request.request_id, page_ids, num_cached_pages
+            )
 
         for op in ops:
-            self.extents.table.acquire(op.src_extent_id)
+            self.kernel_blocks.table.acquire(op.src_kernel_block_id)
         self.pending_copy_ops.extend(ops)
 
     def _page_ids(self, request: Request) -> list[int]:
@@ -145,73 +149,75 @@ class RBLNPageExtentKVCacheManager(KVCacheManager):
 
     # -- copy op plumbing ---------------------------------------------------
 
-    def drain_pending_copy_ops(self) -> list[ExtentCopyOp]:
+    def drain_pending_copy_ops(self) -> list[KernelBlockCopyOp]:
         """Copies for this step; sources stay referenced until released."""
         ops = self.pending_copy_ops
         self.pending_copy_ops = []
         return ops
 
-    def release_copy_ops(self, ops: list[ExtentCopyOp]) -> None:
+    def release_copy_ops(self, ops: list[KernelBlockCopyOp]) -> None:
         """Drop the source references held by drained copy ops."""
         for op in ops:
-            if self.extents.table.get(op.src_extent_id) is not None:
-                self.extents.table.release(op.src_extent_id)
+            if self.kernel_blocks.table.get(op.src_kernel_block_id) is not None:
+                self.kernel_blocks.table.release(op.src_kernel_block_id)
 
     def block_table(self, request_id: str) -> list[int]:
-        """The worker's block table: extent ids backing a request."""
-        return self.extents.block_table(request_id)
+        """The worker's block table: kernel block ids backing a request."""
+        return self.kernel_blocks.block_table(request_id)
 
     # -- lifetime -----------------------------------------------------------
 
     def free(self, request: Request) -> None:
         preempted = request.num_computed_tokens == 0
-        self.extents.free_request(request.request_id, preempted=preempted)
+        self.kernel_blocks.free_request(request.request_id, preempted=preempted)
         super().free(request)
 
     def reset_prefix_cache(self) -> bool:
         result = super().reset_prefix_cache()
         if result:
-            self.extents.reset()
+            self.kernel_blocks.reset()
             self.pending_copy_ops.clear()
         return result
 
     def _on_page_evicted(self, page_id: int) -> None:
-        """I7 has no way to punch a hole, so losing one page costs the extent.
+        """I7 has no way to punch a hole, so losing one page costs the kernel block.
 
         CoW can leave several holders; referenced ones are skipped.
         """
-        for extent_id in self.extents.table.holders(page_id):
-            self._reclaim_extent(extent_id, already_evicted=page_id)
+        for kernel_block_id in self.kernel_blocks.table.holders(page_id):
+            self._reclaim_kernel_block(kernel_block_id, already_evicted=page_id)
 
-    def _reclaim_extent(self, extent_id: int, *, already_evicted: int = -1) -> bool:
-        """Reclaim an extent and drop upstream's claim on the pages it held.
+    def _reclaim_kernel_block(
+        self, kernel_block_id: int, *, already_evicted: int = -1
+    ) -> bool:
+        """Reclaim an kernel block and drop upstream's claim on the pages it held.
 
-        Reclaiming takes down every page in the extent, but upstream still
+        Reclaiming takes down every page in the kernel block, but upstream still
         lists the siblings as cached and would report hits for bytes that are
         gone -- a miss that recomputes nothing. Evict them there too, unless a
-        copy survives in another extent.
+        copy survives in another kernel block.
         """
-        extent = self.extents.table.get(extent_id)
-        if extent is None or extent.ref_cnt > 0:
+        kernel_block = self.kernel_blocks.table.get(kernel_block_id)
+        if kernel_block is None or kernel_block.ref_cnt > 0:
             return False
         siblings = [
             page_id
-            for page_id in extent.page_ids
+            for page_id in kernel_block.page_ids
             if page_id not in (already_evicted, INVALID_PAGE)
         ]
-        if not self.extents.reclaim(extent_id):
+        if not self.kernel_blocks.reclaim(kernel_block_id):
             return False
         for page_id in siblings:
-            if not self.extents.table.holders(page_id):
+            if not self.kernel_blocks.table.holders(page_id):
                 self._evict_upstream_page(page_id)
         return True
 
     def _reclaim_retained(self, count: int) -> int:
         reclaimed = 0
-        for extent_id in self.extents.retained_extents():
+        for kernel_block_id in self.kernel_blocks.retained_kernel_blocks():
             if reclaimed >= count:
                 break
-            reclaimed += self._reclaim_extent(extent_id)
+            reclaimed += self._reclaim_kernel_block(kernel_block_id)
         return reclaimed
 
     def _evict_upstream_page(self, page_id: int) -> None:
@@ -226,17 +232,17 @@ class RBLNPageExtentKVCacheManager(KVCacheManager):
             self.block_pool._maybe_evict_cached_block
         )
 
-        def evict_with_extent_reclaim(block: KVCacheBlock) -> bool:
+        def evict_with_kernel_block_reclaim(block: KVCacheBlock) -> bool:
             page_id = block.block_id
             evicted = original_evict(block)
             if evicted:
                 self._on_page_evicted(page_id)
             return evicted
 
-        self.block_pool._maybe_evict_cached_block = evict_with_extent_reclaim
+        self.block_pool._maybe_evict_cached_block = evict_with_kernel_block_reclaim
 
     # -- metrics ------------------------------------------------------------
 
     @property
     def copy_amplification(self) -> float:
-        return self.extents.copy_amplification
+        return self.kernel_blocks.copy_amplification

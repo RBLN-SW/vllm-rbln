@@ -122,7 +122,10 @@ from vllm_rbln.v1.attention.kv_cache_bindings import (
     build_kv_cache_forward_context_kwargs,
     validate_shared_attention_kv_cache_contiguity,
 )
-from vllm_rbln.v1.core.page_extent import ExtentCopyOp, extent_size_from_config
+from vllm_rbln.v1.core.page_layout import (
+    KernelBlockCopyOp,
+    kernel_block_size_from_config,
+)
 from vllm_rbln.v1.core.rbln_kv_cache_manager import KVCacheCopyOp
 from vllm_rbln.v1.core.rbln_scheduler import RBLNSchedulerOutput
 from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
@@ -2602,54 +2605,58 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 else:
                     break
 
-    def _maybe_rescale_to_extents(self, kv_cache_config: KVCacheConfig) -> None:
-        """Restate the KV geometry in extents so the worker sees one unit.
+    def _maybe_rescale_to_kernel_blocks(self, kv_cache_config: KVCacheConfig) -> None:
+        """Restate the KV geometry in kernel blocks so the worker sees one unit.
 
         Every downstream path (tensor allocation, InputBatch, block tables,
         attention metadata) then behaves as it does without the feature. This
         is the inverse of upstream ``kernel_block_size``, which splits rather
         than groups.
         """
-        if not envs.VLLM_RBLN_PAGE_EXTENT:
+        if not envs.VLLM_RBLN_PAGE_LAYOUT:
             return
-        extent_size = extent_size_from_config(self.vllm_config)
-        if extent_size is None:
+        kernel_block_size = kernel_block_size_from_config(self.vllm_config)
+        if kernel_block_size is None:
             return
         page_size = self.cache_config.block_size
-        if extent_size == page_size or extent_size % page_size != 0:
+        if kernel_block_size == page_size or kernel_block_size % page_size != 0:
             return
-        pages_per_extent = extent_size // page_size
+        pages_per_kernel_block = kernel_block_size // page_size
 
         for group in kv_cache_config.kv_cache_groups:
             spec = group.kv_cache_spec
             if not isinstance(spec, AttentionSpec) or spec.block_size != page_size:
                 return
         for group in kv_cache_config.kv_cache_groups:
-            group.kv_cache_spec = replace(group.kv_cache_spec, block_size=extent_size)
+            group.kv_cache_spec = replace(
+                group.kv_cache_spec, block_size=kernel_block_size
+            )
 
         # Restate the spec only. `cache_config.block_size` must keep the page:
         # the engine core reads it *after* this runs, in
         # `resolve_kv_cache_block_sizes`, where for a single group it becomes
         # both the scheduler block size and the hash block size. Under an
         # in-process worker (uniproc, world_size 1) that read sees whatever we
-        # write here, and an extent-sized value contradicts the page-sized spec
+        # write here, and an kernel block-sized value contradicts the page-sized spec
         # the scheduler kept -- `UnitaryKVCacheCoordinator` asserts on it.
         old_num_blocks = kv_cache_config.num_blocks
-        num_extents = old_num_blocks // pages_per_extent
-        kv_cache_config.num_blocks = num_extents
-        # A page count is not generally a whole number of extents, and the
+        num_kernel_blocks = old_num_blocks // pages_per_kernel_block
+        kv_cache_config.num_blocks = num_kernel_blocks
+        # A page count is not generally a whole number of kernel blocks, and the
         # remainder is unusable anyway; without trimming, reshape trips on
         # `numel() % page_size_bytes`.
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
             bytes_per_page = kv_cache_tensor.size // old_num_blocks
-            kv_cache_tensor.size = bytes_per_page * pages_per_extent * num_extents
+            kv_cache_tensor.size = (
+                bytes_per_page * pages_per_kernel_block * num_kernel_blocks
+            )
         logger.info(
-            "Page/extent: worker KV geometry restated as %d extents of %d "
-            "tokens (page=%d, %d pages per extent).",
+            "Page/kernel block: worker KV geometry restated as %d kernel blocks of %d "
+            "tokens (page=%d, %d pages per kernel block).",
             kv_cache_config.num_blocks,
-            extent_size,
+            kernel_block_size,
             page_size,
-            pages_per_extent,
+            pages_per_kernel_block,
         )
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
@@ -2664,7 +2671,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             )
 
         kv_cache_config = deepcopy(kv_cache_config)
-        self._maybe_rescale_to_extents(kv_cache_config)
+        self._maybe_rescale_to_kernel_blocks(kv_cache_config)
         self.kv_cache_config = kv_cache_config
         self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
         self.initialize_attn_backend(kv_cache_config)
@@ -3057,15 +3064,15 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         )
         for op in copy_ops:
             # Two op shapes reach here: the overlay copies a block prefix, the
-            # page/extent layer an arbitrary token range.
-            if isinstance(op, ExtentCopyOp):
-                src, dst = op.src_extent_id, op.dst_extent_id
+            # page/kernel block layer an arbitrary token range.
+            if isinstance(op, KernelBlockCopyOp):
+                src, dst = op.src_kernel_block_id, op.dst_kernel_block_id
                 src_start, dst_start, nt = op.src_start, op.dst_start, op.num_tokens
             else:
                 src, dst = op.src_block_id, op.dst_block_id
                 src_start, dst_start, nt = 0, 0, op.num_tokens
             # The runtime helper can only copy a block prefix, which is the
-            # common case (a matched prefix starts at the extent boundary).
+            # common case (a matched prefix starts at the kernel block boundary).
             if use_runtime_kv_copy and src_start == 0 and dst_start == 0:
                 runtime = self.runtime_holder[0]
                 runtime._copy_kv_cache(src, dst, nt)

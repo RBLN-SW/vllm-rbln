@@ -65,7 +65,7 @@ if TYPE_CHECKING:
     # --- MODEL INPUT / SCHEDULING ---
     VLLM_RBLN_SORT_BATCH: bool = False
     VLLM_RBLN_SUB_BLOCK_CACHE: bool = True
-    VLLM_RBLN_PAGE_EXTENT: bool = False
+    VLLM_RBLN_PAGE_LAYOUT: bool = False
     # --- MOE ---
     VLLM_RBLN_SPECIALIZE_MOE_DECODE: bool = True
     VLLM_RBLN_USE_MOE_TOKENS_MASK: bool = True
@@ -325,11 +325,16 @@ environment_variables = {
     "VLLM_RBLN_SUB_BLOCK_CACHE": lambda: (
         os.environ.get("VLLM_RBLN_SUB_BLOCK_CACHE", "True").lower() in ("true", "1")
     ),
-    # Back pages with contiguous extents (docs/page_extent_kv_manager.md).
-    # --block-size becomes the page; the extent comes from the compiled model.
+    # Back pages with contiguous kernel blocks (docs/page_layout_kv_manager.md).
+    # --block-size becomes the page; the kernel block comes from the compiled model.
     # Supersedes VLLM_RBLN_SUB_BLOCK_CACHE, which it disables when on.
-    "VLLM_RBLN_PAGE_EXTENT": lambda: (
-        os.environ.get("VLLM_RBLN_PAGE_EXTENT", "False").lower() in ("true", "1")
+    # VLLM_RBLN_PAGE_EXTENT is the pre-rename name, kept as an alias.
+    "VLLM_RBLN_PAGE_LAYOUT": lambda: (
+        os.environ.get(
+            "VLLM_RBLN_PAGE_LAYOUT",
+            os.environ.get("VLLM_RBLN_PAGE_EXTENT", "False"),
+        ).lower()
+        in ("true", "1")
     ),
     # --- MOE ---
     # If true, it specializes the cases where all instances are at decode stage

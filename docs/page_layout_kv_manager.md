@@ -1,6 +1,6 @@
-# Page + Extent KV Manager (Design)
+# Page + Kernel Block KV Manager (Design)
 
-Status: **partially implemented**, off by default behind `VLLM_RBLN_PAGE_EXTENT`.
+Status: **partially implemented**, off by default behind `VLLM_RBLN_PAGE_LAYOUT`.
 See [§ Implementation status](#implementation-status).
 Related: [sub_block_prefix_caching.md](./sub_block_prefix_caching.md) (current overlay implementation)
 Upstream analogues: `CacheConfig.prefix_match_unit` / `hash_block_size`,
@@ -25,7 +25,7 @@ On the **native path the operator supplies it** — nothing publishes
 
 Both paths therefore read the same key, and it is the single source of truth.
 The trade-off is accepted deliberately: the native path cannot cross-check the
-value against the compiled artifact, so an operator who names an extent size
+value against the compiled artifact, so an operator who names a kernel block size
 the kernel does not actually use gets no warning. Deriving it from the native
 compile config would close that hole and is the natural follow-up.
 
@@ -38,9 +38,9 @@ overlay" below always means that feature, gated by `VLLM_RBLN_SUB_BLOCK_CACHE`.
 **Scope.** This design targets the **native vLLM-model path**
 (`VLLM_RBLN_USE_VLLM_MODEL=True`), where `--block-size` is still the coarse
 unit. The optimum path (the default) already runs a two-level scheme under
-different names — `attn_block_size`/`ob_size` is the extent,
+different names — `attn_block_size`/`ob_size` is the kernel block,
 `cache_config.block_size`/`ib_size` is the page, `get_block_ratio()` is
-`pages_per_extent` — implemented in `RBLNPrefixKVCacheManager`. That path is
+`pages_per_kernel_block` — implemented in `RBLNPrefixKVCacheManager`. That path is
 prior art and is deliberately **out of scope**: this work ports its proven
 structure rather than refactoring it.
 
@@ -62,17 +62,17 @@ cost model rather than reinventing both.
 | SSD / FTL | This design |
 |---|---|
 | program / read unit (NAND page) | **page** (e.g. 512) |
-| erase unit (erase block) | **extent** (e.g. 4096) |
+| erase unit (erase block) | **kernel block** (e.g. 4096) |
 | LBA space exposed to the host | page-id space exposed to scheduler / connectors |
-| physical address `(block, page offset)` | `(extent_id, page_offset)` |
-| FTL mapping table | page-hash index (`page_hash → (extent_id, page_offset)`) |
+| physical address `(block, page offset)` | `(kernel_block_id, page_offset)` |
+| FTL mapping table | page-hash index (`page_hash → (kernel_block_id, page_offset)`) |
 | out-of-place update (no in-place overwrite) | copy-on-write on a shared prefix |
-| open block + sequential write pointer | per-request open extent, append-only |
-| multi-stream (one open block per stream) | one open extent per request |
+| open block + sequential write pointer | per-request open kernel block, append-only |
+| multi-stream (one open block per stream) | one open kernel block per request |
 | trim (invalidate) vs erase (reclaim) | request free vs prefix-cache eviction |
 | write amplification | copy amplification |
-| over-provisioning | reserved free extents |
-| GC victim selection by valid-page count | extent compaction (future, not MVP) |
+| over-provisioning | reserved free kernel blocks |
+| GC victim selection by valid-page count | kernel block compaction (future, not MVP) |
 
 FTLs come in three mapping granularities: page-level (fine map, no merges,
 huge table), block-level (small table, read-modify-write on every partial
@@ -93,10 +93,10 @@ block handling have no counterpart here.
 |---|---|---|
 | **chunk** | 512 | Prefill step size (`--max-num-batched-tokens`) |
 | **page** | 512 | Schedule, hash, prefix match, connector addressing |
-| **extent** | 4096 | Allocation / reclaim / DMA unit; contiguous token storage |
+| **kernel block** | 4096 | Allocation / reclaim / DMA unit; contiguous token storage |
 
 ```text
-extent (physical, DMA-addressed)
+kernel block (physical, DMA-addressed)
 ┌───────┬───────┬───────┬───────┬───────┬───────┬───────┬───────┐
 │ page0 │ page1 │ page2 │ page3 │ page4 │ page5 │ page6 │ page7 │
 └───────┴───────┴───────┴───────┴───────┴───────┴───────┴───────┘
@@ -108,29 +108,29 @@ extent (physical, DMA-addressed)
 | This design | Current overlay (`RBLNKVCacheManager`) |
 |---|---|
 | page | sub-block (`sub_block_size`) |
-| extent | physical / upstream block (`block_size`) |
+| kernel block | physical / upstream block (`block_size`) |
 | page hash chain | `SubBlockHasher` |
-| page → extent map | `SubBlockIndex` |
+| page → kernel block map | `SubBlockIndex` |
 | partial merge (CoW) | `KVCacheCopyOp` |
 | full dedup | upstream full-block hash hit + collapse of the private copy |
 
-Internal code should use `page` / `extent`, never upstream's
-`kernel_block_size` (a different, opposite-direction concept — see
-[§ Why not `kernel_block_size`](#why-not-kernel_block_size)).
+Internal code uses `page` / `kernel_block`. That is deliberately upstream's
+word for the same thing, built the opposite way — see
+[§ Relation to upstream `kernel_block_size`](#relation-to-upstream-kernel_block_size).
 
 ## Spec
 
 ### Sizes
 
 ```text
-chunk_size       = scheduler_config.max_num_batched_tokens
-page_size        = cache_config.block_size          # --block-size
-extent_size      = backend-derived (not user-visible)
-pages_per_extent = extent_size // page_size
+chunk_size             = scheduler_config.max_num_batched_tokens
+page_size              = cache_config.block_size    # --block-size
+kernel_block_size      = backend-derived (not user-visible)
+pages_per_kernel_block = kernel_block_size // page_size
 
-REQUIRED: page_size   % chunk_size == 0             # a prefill never spans two pages
-REQUIRED: extent_size % page_size  == 0
-REQUIRED: pages_per_extent >= 2                     # otherwise use plain upstream
+REQUIRED: page_size % chunk_size == 0        # a prefill never spans two pages
+REQUIRED: kernel_block_size % page_size == 0
+REQUIRED: pages_per_kernel_block >= 2        # otherwise use plain upstream
 ```
 
 `page_size == chunk_size` is the default (one chunk completes one page).
@@ -143,26 +143,26 @@ User-visible:
 
 | Knob | Role | Note |
 |---|---|---|
-| `--block-size` | **page** size | must be a multiple of the prefill chunk, must divide `extent_size` |
+| `--block-size` | **page** size | must be a multiple of the prefill chunk, must divide `kernel_block_size` |
 | `--max-num-batched-tokens` | prefill chunk | `page_size % chunk_size == 0` |
 | `--enable-prefix-caching` | on/off | unchanged |
-| `VLLM_RBLN_SUB_BLOCK_CACHE` | feature gate | keep as the enable switch; rename to `VLLM_RBLN_PAGE_EXTENT` with an alias once the overlay is retired |
+| `VLLM_RBLN_PAGE_LAYOUT` | feature gate | `VLLM_RBLN_PAGE_EXTENT` is accepted as an alias; supersedes `VLLM_RBLN_SUB_BLOCK_CACHE`, which it disables when on |
 
 Published by the model, not tuned per run:
 
 | Knob | Role |
 |---|---|
-| `additional_config["attn_block_size"]` | `extent_size` — the DMA packing size the attention kernel was compiled for |
-| `pages_per_extent` | derived: `extent_size // page_size` |
+| `additional_config["attn_block_size"]` | `kernel_block_size` — the DMA packing size the attention kernel was compiled for |
+| `pages_per_kernel_block` | derived: `kernel_block_size // page_size` |
 
 Do **not** add `VLLM_RBLN_KERNEL_BLOCK_SIZE`. A model that publishes nothing
-gets a degenerate geometry (one page per extent) and the layer is a no-op, so
+gets a degenerate geometry (one page per kernel block) and the layer is a no-op, so
 enabling the feature is always safe.
 
-Worked example — page 1024, extent 8192, eight pages per extent:
+Worked example — page 1024, kernel block 8192, eight pages per kernel block:
 
 ```bash
-VLLM_RBLN_PAGE_EXTENT=1 vllm serve <model> \
+VLLM_RBLN_PAGE_LAYOUT=1 vllm serve <model> \
     --block-size 1024 \
     --max-num-batched-tokens 512 \
     --additional-config '{"attn_block_size": 8192}'
@@ -178,8 +178,8 @@ Two maps, and conflating them is a correctness bug:
 
 | Map | Role |
 |---|---|
-| `request → [extent_id]` | **the address** — the block table the worker uses |
-| `page_id → {extent_id}` | **content locator** — used only to pick a CoW source |
+| `request → [kernel_block_id]` | **the address** — the block table the worker uses |
+| `page_id → {kernel_block_id}` | **content locator** — used only to pick a CoW source |
 
 The locator is *many-valued*: a copy-on-write gives a request its own physical
 copy of a shared prefix, so one logical page legitimately has different
@@ -187,15 +187,15 @@ physical homes in different requests. Physical address is therefore per-request
 and never per-page. Any holder of a page is an equally valid copy source — all
 holders have identical bytes.
 
-Within an extent, sequential writes (I3) make the slot a pure function of the
+Within a kernel block, sequential writes (I3) make the slot a pure function of the
 logical page index:
 
 ```text
-slot(page_index) = page_index % pages_per_extent
+slot(page_index) = page_index % pages_per_kernel_block
 ```
 
 **Page-id recycling.** Upstream reissues a freed page id immediately (unhashed
-blocks go to the head of its free queue), so an older extent can still claim a
+blocks go to the head of its free queue), so an older kernel block can still claim a
 page id whose content has been replaced. Binding therefore distinguishes a
 *fresh* page (upstream just handed the id out; every other claim on it is
 stale and must be revoked) from a *copy* (content that remains valid
@@ -204,7 +204,7 @@ would shift later slots and break the positional addressing I3 rests on.
 
 ### Allocator
 
-The free list holds extents; reclaim returns whole extents (I7). A slice of the
+The free list holds kernel blocks; reclaim returns whole kernel blocks (I7). A slice of the
 pool is withheld as over-provisioning and released only to copy-on-write
 destinations, so a pool that is merely full still degrades gracefully.
 
@@ -214,47 +214,47 @@ destinations, so a pool that is merely full still degrades gracefully.
 |---|---|---|
 | **I1** | Prefix-cache hits land only on page boundaries (`num_tokens % page_size == 0`). | Hash keys exist only there. |
 | **I2** | A request's `num_computed_tokens` is page-aligned throughout prefill. | Keeps pages either complete or untouched. Holds because `page_size % chunk_size == 0`, at most one prefill runs per step, and every per-step token clamp is page-aligned (see [§ Scheduler](#scheduler-integration)). |
-| **I3** | Within an extent, a request's pages are written sequentially from offset 0. | Sequential-write (ZNS-style) rule; makes `page_offset` derivable and the extent DMA-contiguous. |
-| **I4** | Never append into an extent another request references. A partial match is resolved by copying into a private extent. | Out-of-place update: an in-place append would corrupt the sharer's prefix. |
-| **I5** | Full extents are attach targets, shared read-only. A partial extent is a **copy source** for anyone, and an **adoption** target for at most one request: an unreferenced one whose pages are exactly the leading pages of the group being bound is extended in place (**I5b**). | A partial extent has a live write pointer (I3), so only one writer may hold it; `ref_cnt == 0` means the sharer I4 protects does not exist, and the resumed pages keep their slots. Adoption is what makes the multi-turn append case zero-copy. |
-| **I6** | Dedup happens only when an extent becomes full, keyed by its extent hash (the chained page hash at its last page boundary). | Partial extents have no stable identity. |
-| **I7** | Reclaim is at extent granularity; no mid-extent holes. | Erase-unit asymmetry. Page-only eviction is forbidden. |
-| **I8** | Refcounts live on the **extent**. The page-hash index is mapping metadata and owns no reference. | By I4/I5, sharing is always whole-extent, so per-page refcounts would be uniform across an extent by construction. |
+| **I3** | Within a kernel block, a request's pages are written sequentially from offset 0. | Sequential-write (ZNS-style) rule; makes `page_offset` derivable and the kernel block DMA-contiguous. |
+| **I4** | Never append into a kernel block another request references. A partial match is resolved by copying into a private kernel block. | Out-of-place update: an in-place append would corrupt the sharer's prefix. |
+| **I5** | Full kernel blocks are attach targets, shared read-only. A partial kernel block is a **copy source** for anyone, and an **adoption** target for at most one request: an unreferenced one whose pages are exactly the leading pages of the group being bound is extended in place (**I5b**). | A partial kernel block has a live write pointer (I3), so only one writer may hold it; `ref_cnt == 0` means the sharer I4 protects does not exist, and the resumed pages keep their slots. Adoption is what makes the multi-turn append case zero-copy. |
+| **I6** | Dedup happens only when a kernel block becomes full, keyed by its kernel-block hash (the chained page hash at its last page boundary). | Partial kernel blocks have no stable identity. |
+| **I7** | Reclaim is at kernel block granularity; no mid-kernel-block holes. | Erase-unit asymmetry. Page-only eviction is forbidden. |
+| **I8** | Refcounts live on the **kernel block**. The page-hash index is mapping metadata and owns no reference. | By I4/I5, sharing is always whole-kernel-block, so per-page refcounts would be uniform across a kernel block by construction. |
 | **I9** | The scheduler always leaves at least one token to recompute (`match ≤ num_tokens - 1`). | Upstream requires the last token's forward pass to produce logits. |
 | **I10** | Eligible specs store per-token KV: `FullAttentionSpec` (MVP), later `SlidingWindowSpec` / `ChunkedLocalAttentionSpec`. `MambaSpec` / `CrossAttentionSpec` are ineligible. | Partial copying requires a sliceable token dimension. |
 
 **Two distinct counters — do not conflate.**
 
-- *Extent refcount* (I8) governs memory lifetime.
-- *Hash multiplicity* — how many extents currently carry a given page hash —
+- *Kernel block refcount* (I8) governs memory lifetime.
+- *Hash multiplicity* — how many kernel blocks currently carry a given page hash —
   governs KV-event emission (Store/Remove fire on 0↔1 transitions). CoW
-  duplicates page hashes across two extents, which is precisely why this
+  duplicates page hashes across two kernel blocks, which is precisely why this
   counter exists.
 
 ## Lifecycle
 
 ```text
 1. schedule / hash   : page unit (--block-size)
-2. allocate          : extent unit, per-request open extent, append-only
-3. partial match     : full extents attached by reference; the straddling
-                       extent's matched pages copied into a private extent
-4. extent fills      : if its extent hash already exists, collapse to canonical
-5. request finishes  : extents become retained (cached, unreferenced)
-6. eviction          : whole extent reclaimed, its page hashes unmapped
+2. allocate          : kernel block unit, per-request open kernel block, append-only
+3. partial match     : full kernel blocks attached by reference; the straddling
+                       kernel block's matched pages copied into a private kernel block
+4. kernel block fills      : if its kernel-block hash already exists, collapse to canonical
+5. request finishes  : kernel blocks become retained (cached, unreferenced)
+6. eviction          : whole kernel block reclaimed, its page hashes unmapped
 ```
 
 ### Allocate
 
-Append into the request's open extent; when it fills, allocate a new one.
-Capacity is accounted in extents even though the scheduler counts pages
+Append into the request's open kernel block; when it fills, allocate a new one.
+Capacity is accounted in kernel blocks even though the scheduler counts pages
 (see [§ Capacity](#capacity-and-cost-model)).
 
 ### Partial merge (CoW)
 
-Split the matched prefix at extent boundaries:
+Split the matched prefix at kernel block boundaries:
 
 ```text
-matched prefix = [ full extent ][ full extent ] ... [ k pages of extent E ]
+matched prefix = [ full kernel block ][ full kernel block ] ... [ k pages of kernel block E ]
                   └── attach by reference ──┘        └── copy into private F,
                                                           slots 0..k-1 ──┘
 then continue appending into F at slot k.
@@ -262,21 +262,21 @@ then continue appending into F at slot k.
 
 Consequences:
 
-- Copy cost per match is `< extent_size` tokens regardless of match length —
+- Copy cost per match is `< kernel_block_size` tokens regardless of match length —
   hybrid-FTL *partial* merge only; a full merge never occurs.
-- Source pages (which may live in a partial extent, per I5) are pinned until
+- Source pages (which may live in a partial kernel block, per I5) are pinned until
   the worker's copy completes — today's `release_copy_ops` contract.
-- Lookups may match interior pages of a full extent, not just prompt tails.
+- Lookups may match interior pages of a full kernel block, not just prompt tails.
   This is deliberately denser than upstream and preserves today's hit rate.
 
 ### Full dedup
 
-When a private extent fills, publish its extent hash. If the hash is already
-mapped to a canonical extent, repoint the request at the canonical one and
+When a private kernel block fills, publish its kernel-block hash. If the hash is already
+mapped to a canonical kernel block, repoint the request at the canonical one and
 release the private copy when its refcount allows. This bounds how long CoW
 duplicates persist.
 
-### Extent lifetime
+### Kernel block lifetime
 
 Three states, mirroring trim-vs-erase:
 
@@ -284,7 +284,7 @@ Three states, mirroring trim-vs-erase:
 |---|---|
 | **live** | refcount > 0; at least one request owns it |
 | **retained** | refcount == 0, still reachable through the page-hash index; a prefix-cache hit can revive it |
-| **reclaimed** | evicted; page hashes unmapped, extent returned to the free list |
+| **reclaimed** | evicted; page hashes unmapped, kernel block returned to the free list |
 
 The overlay's trick of assigning a synthetic `block_hash` to a finishing
 request's partial block exists to make the *retained* state reachable. In this
@@ -298,41 +298,41 @@ Three quantities, all measurable:
 
 ```text
 CA = copied tokens / newly computed tokens
-per-match bound: < extent_size tokens (one partial merge)
+per-match bound: < kernel_block_size tokens (one partial merge)
 ```
 
-Report it; treat a sustained rise as the signal that extents are too large or
+Report it; treat a sustained rise as the signal that kernel blocks are too large or
 over-provisioning is too low.
 
-**Internal fragmentation.** One open extent per concurrent request (the
+**Internal fragmentation.** One open kernel block per concurrent request (the
 multi-stream cost):
 
 ```text
-worst case = concurrent_requests * (extent_size - page_size) tokens
-REQUIRED:  max_num_seqs * extent_size  <<  KV pool capacity
+worst case = concurrent_requests * (kernel_block_size - page_size) tokens
+REQUIRED:  max_num_seqs * kernel_block_size  <<  KV pool capacity
 ```
 
 `RBLN_DEFAULT_MAX_NUM_SEQS` is 1, but serving deployments raise it; at
-`max_num_seqs=64, extent_size=4096` this pins ~256K tokens in partial extents.
+`max_num_seqs=64, kernel_block_size=4096` this pins ~256K tokens in partial kernel blocks.
 Validate this at startup rather than discovering it as preemption thrash.
 
 **Over-provisioning.** The scheduler's page count must not expose the whole
-physical pool: CoW needs a destination extent, and if free extents run dry the
+physical pool: CoW needs a destination kernel block, and if free kernel blocks run dry the
 system degrades sharply (the SSD write-cliff analogue). Reserve a fraction of
-extents, and round each request's need **up to extent granularity** when
+kernel blocks, and round each request's need **up to kernel block granularity** when
 reporting free capacity — otherwise upstream's `memory / page_size_bytes`
 accounting over-admits by exactly the fragmentation above.
 
 ## Scheduler integration
 
 After the CLI flip, `block_size` means *page* everywhere it is read. Every
-existing use must be classified; the ones that actually mean *extent* have to
+existing use must be classified; the ones that actually mean *kernel block* have to
 be changed. Known sites in `vllm_rbln/v1/core/rbln_scheduler.py`:
 
 | Site | Current meaning | After flip |
 |---|---|---|
 | `long_prefill_token_threshold` clamp (L221) | arbitrary token cap | must be floored to a page multiple, or it breaks **I2** — the only remaining misalignment path |
-| spec-decode "contiguous KV window" clamp (L260-262), `self.block_size` | physical block | must use `extent_size`; using the page is safe but needlessly narrows the decode window |
+| spec-decode "contiguous KV window" clamp (L260-262), `self.block_size` | physical block | must use `kernel_block_size`; using the page is safe but needlessly narrows the decode window |
 | `_mamba_block_aligned_split` | mamba block alignment | unchanged; also the template for the page-aligned clamp above |
 
 I2 does *not* need a per-request budget clamp for chunked prefill: prefill
@@ -351,19 +351,19 @@ config in `sub_block_paging` disappears: `--block-size` *is* the page size, so
 `pages_per_block` collapses to 1 and the expand/split becomes the identity.
 
 **But the device-side translation does not disappear** — the KV tensor stays
-extent-major, so gather/scatter still needs `(extent_id, page_offset)`. Since
-`pages_per_extent` can no longer be derived from vLLM config (both numbers are
-now equal), the backend must expose `extent_size` to the connector through an
+kernel block-major, so gather/scatter still needs `(kernel_block_id, page_offset)`. Since
+`pages_per_kernel_block` can no longer be derived from vLLM config (both numbers are
+now equal), the backend must expose `kernel_block_size` to the connector through an
 explicit channel. This is an open item; see [§ Open questions](#open-questions).
 
 ### Cache hierarchy policy
 
-Device extents plus LMCache CPU/disk form a multi-level cache, and the policy
+Device kernel blocks plus LMCache CPU/disk form a multi-level cache, and the policy
 is currently unspecified. Because the eviction unit is a whole 4096-token
-extent, these choices matter more here than on GPU vLLM:
+kernel block, these choices matter more here than on GPU vLLM:
 
 - **Write-back vs write-through**: push a page to LMCache when it completes, or
-  when its extent is evicted? Write-through spends steady bandwidth;
+  when its kernel block is evicted? Write-through spends steady bandwidth;
   write-back concentrates it into eviction stalls.
 - **Inclusive vs exclusive**: may the CPU tier duplicate what is resident on
   device, or only hold what was evicted?
@@ -377,8 +377,8 @@ Emit and index at **page** granularity — which, after the flip, is simply
 upstream's own block granularity, so the custom emission path shrinks to the
 dedup rule.
 
-CoW makes two extents carry the same page hashes, so Store/Remove must fire on
-0↔1 transitions of *hash multiplicity* (not extent refcount, per I8) to keep
+CoW makes two kernel blocks carry the same page hashes, so Store/Remove must fire on
+0↔1 transitions of *hash multiplicity* (not kernel block refcount, per I8) to keep
 llm-d's set-membership index correct. Rationale and the chain-safety argument
 are unchanged from
 [sub_block_prefix_caching.md § KV cache events](./sub_block_prefix_caching.md#kv-cache-events).
@@ -390,12 +390,12 @@ Routers configure their block size to `--block-size`. The "use
 
 ### vs current overlay
 
-| | Overlay today | Page + extent |
+| | Overlay today | Page + kernel block |
 |---|---|---|
-| CLI `--block-size` | extent (large) | **page** |
-| Schedule / hash unit | extent + sub-block extension | **page** |
-| Indexing | `SubBlockIndex` layered on extents | pages first-class; extent is packing |
-| Partial hit | memcpy into a new block | partial merge into a private extent (same mechanism, named) |
+| CLI `--block-size` | kernel block (large) | **page** |
+| Schedule / hash unit | kernel block + sub-block extension | **page** |
+| Indexing | `SubBlockIndex` layered on kernel blocks | pages first-class; kernel block is packing |
+| Partial hit | memcpy into a new block | partial merge into a private kernel block (same mechanism, named) |
 | Interior page of a full block | indexed | kept — no regression to tail-only |
 | Full dedup | implicit via upstream full hash | explicit end of the CoW lifetime |
 | Contiguity | ensured by copying into a fresh block | allocator invariant (I3) |
@@ -428,33 +428,42 @@ concept, but cannot be adopted as-is:
 Long-term convergence is desirable; short-term RBLN still needs unitary
 fine-grained behavior with interior-page indexing.
 
-### Why not `kernel_block_size`
+### Relation to upstream `kernel_block_size`
 
-Upstream's `kernel_block_size` looks related but runs in the opposite
-direction: `prepare_kernel_block_sizes` → `select_common_block_size` **splits**
-a manager block into smaller kernel blocks, so `kernel_block_size ≤ block_size`
-is structural (`num_blocks_per_kv_block = block_size // kernel_block_size`).
-An extent **groups** pages, which that axis cannot express.
+Same denotation, opposite construction. Both name *the token extent the
+attention kernel addresses*, which is why this design borrows the word (it is
+also the vocabulary of the SWA kernel's `sliding_window == kv_cache.size(-2)`
+assert). But upstream **splits**: `prepare_kernel_block_sizes` ->
+`select_common_block_size` divides a manager block into smaller kernel blocks,
+so `kernel_block_size <= cache_config.block_size` is structural
+(`num_blocks_per_kv_block = block_size // kernel_block_size`). This design
+**groups** pages, so `kernel_block_size >= cache_config.block_size`. **That
+inverts upstream's invariant, and it is the thing to watch when reading code
+that spans both.**
 
-It is currently inert in vllm-rbln: no RBLN backend overrides
-`get_supported_kernel_block_sizes`, so `select_common_block_size` returns
-`block_size` unchanged and the split factor is 1. Reusing the name for extents
-would collide with a live upstream mechanism for no gain.
+In practice the two coincide here. The split is inert in vllm-rbln -- no RBLN
+backend overrides `get_supported_kernel_block_sizes`, so `select_common_block_size`
+returns `block_size` unchanged and the factor is 1 -- and the worker restates
+the KV spec to the kernel block before `prepare_kernel_block_sizes` runs, so it
+reports exactly the grouped size. For an SWA group it reports `sliding_window`,
+which is precisely the per-group physical unit that
+[§ Next steps](#next-steps) (2) needs; the two mechanisms are expected to merge
+there rather than coexist.
 
 ## Non-goals (MVP)
 
 - Sliding-window / Mamba / hybrid fine-grained paths.
 - Replacing upstream's hybrid partial-tail machinery for Mamba align mode.
-- **Extent compaction (GC).** I7 forbids holes, so an extent whose early pages
+- **Kernel block compaction (GC).** I7 forbids holes, so a kernel block whose early pages
   are hot and whose tail is dead cannot be partially reclaimed. The standard
   answer — victim selection by valid-page ratio (greedy or cost-benefit),
   followed by migrating the valid pages — is deferred. Record the trigger
-  metric (per-extent valid-page ratio) now so the hook has a home.
+  metric (per-kernel-block valid-page ratio) now so the hook has a home.
 - Shipping code in this document's PR.
 
 ## Open questions
 
-1. ~~How is `extent_size` published?~~ **Resolved**: through
+1. ~~How is `kernel_block_size` published?~~ **Resolved**: through
    `additional_config["attn_block_size"]` — set by the converter on the
    optimum path, given on the command line on the native path. No new
    environment variable. Follow-up: derive it from the native compile config
@@ -462,31 +471,31 @@ would collide with a live upstream mechanism for no gain.
 2. Over-provisioning ratio: fixed fraction, or derived from `max_num_seqs`?
 3. Cache hierarchy policy: write-back vs write-through, inclusive vs exclusive,
    admission control.
-4. Should the number of concurrently open extents be capped (bounding
+4. Should the number of concurrently open kernel blocks be capped (bounding
    fragmentation) at the cost of rejecting or downgrading some requests?
-5. Measured `extent_size` vs DMA bandwidth curve — the number that justifies
+5. Measured `kernel_block_size` vs DMA bandwidth curve — the number that justifies
    the whole design and sets the CoW budget.
 
 ## Risks
 
 | Risk | Mitigation |
 |---|---|
-| vLLM assumes `block_size` == KV tensor token dim | Explicit page→extent table + extent-major tensors; audit every `block_size` read ([§ Scheduler](#scheduler-integration)) |
-| Copy amplification | Partial merges only (`< extent_size` per match); dedup promptly on full; track CA as a metric |
-| Free-extent exhaustion (write cliff) | Over-provisioning; extent-granular capacity accounting |
-| Internal fragmentation | Startup check `max_num_seqs * extent_size << pool` |
-| Allocator complexity | MVP: append-only open extent + CoW on partial match — close to today's always-copy behavior |
+| vLLM assumes `block_size` == KV tensor token dim | Explicit page→kernel block table + kernel block-major tensors; audit every `block_size` read ([§ Scheduler](#scheduler-integration)) |
+| Copy amplification | Partial merges only (`< kernel_block_size` per match); dedup promptly on full; track CA as a metric |
+| Free-kernel-block exhaustion (write cliff) | Over-provisioning; kernel block-granular capacity accounting |
+| Internal fragmentation | Startup check `max_num_seqs * kernel_block_size << pool` |
+| Allocator complexity | MVP: append-only open kernel block + CoW on partial match — close to today's always-copy behavior |
 | Hybrid / SWA / Mamba | Reject at startup (I10), do not silently degrade |
 
 ## Implementation status
 
-Enabled with `VLLM_RBLN_PAGE_EXTENT=1` (default off). A model that publishes no
-extent size gets a degenerate geometry and the layer is a no-op, so the flag is
+Enabled with `VLLM_RBLN_PAGE_LAYOUT=1` (default off). A model that publishes no
+kernel block size gets a degenerate geometry and the layer is a no-op, so the flag is
 safe to set blindly.
 
-Landed in `afd7142d`: `page_extent.py` (geometry, extent pool, page->extent
-map, binding policy), `rbln_page_extent_kv_cache_manager.py`, scheduler wiring
-and extent-id block tables, worker geometry restatement and slot-range copies.
+Landed in `afd7142d`: `page_layout.py` (geometry, kernel block pool, page->kernel block
+map, binding policy), `rbln_page_layout_kv_cache_manager.py`, scheduler wiring
+and kernel block-id block tables, worker geometry restatement and slot-range copies.
 409 unit tests.
 
 ### Measured 2026-08-13 (MiniMax-M2.5, DP4+EP, 1536-token shared prefix)
@@ -495,13 +504,13 @@ and extent-id block tables, worker geometry restatement and slot-range copies.
 |---|---|---|---|---|---|
 | sub-block off | 1024 | 1024 | 877.1 ms | 65.67 ms | 101.8 |
 | sub-block on | 512 | 1024 | 493.2 ms | 62.72 ms | 113.9 |
-| page/extent | 512 | 8192 | 519.2 ms | 51.87 ms | 134.2 |
+| page layout | 512 | 8192 | 519.2 ms | 51.87 ms | 134.2 |
 | sub-block on | 512 | 8192 | 539.0 ms | 51.98 ms | 133.9 |
 | sub-block off | 8192 | 8192 | 1330.8 ms | 69.77 ms | 88.8 |
 
 The effect decomposes cleanly and neither half belongs to this design:
 **match granularity** (512) buys TTFT (-44%), **physical block size** (8192)
-buys TPOT (-17%) and throughput (+18%). Page/extent and the overlay are within
+buys TPOT (-17%) and throughput (+18%). Page layout and the overlay are within
 noise of each other here, which is why this was first read as "no performance
 advantage" -- but the workload is a shared prefix fanned out to four different
 questions, and on *that* shape parity is structural (see below). The multi-turn
@@ -521,7 +530,7 @@ exercised one of the two shapes.
 **Fan-out** — one cached prefix, several different continuations. Here the two
 paths move identical bytes. Both share whole physical units by reference and
 copy only the sub-unit remainder of the match: the overlay from
-`apply_sub_block_match` (`num_matched * sub_block_size` tokens), page/extent
+`apply_sub_block_match` (`num_matched * sub_block_size` tokens), page layout
 from `_place`. Volume is `cached_tokens % physical_block` either way, bounded by
 one physical unit. Measured 2026-08-13, Qwen3-0.6B, page/sub-block 256, physical
 1024, 1640-token shared prefix (6 pages = 1536 tokens = one full 1024 unit plus
@@ -530,29 +539,29 @@ a 512-token remainder), 4 prompts after a warm-up:
 | config | copy calls | ops | tokens copied |
 |---|---|---|---|
 | sub-block on (`--block-size 1024`, sub-block 256) | 4 | 4 | 2048 |
-| page/extent (page 256, extent 1024) | 4 | 4 | 2048 |
+| page layout (page 256, kernel block 1024) | 4 | 4 | 2048 |
 
 The second continuation genuinely must copy in both designs: two requests
 writing different next pages cannot share one write pointer.
 
 **Append** — a request ends mid-unit and the *next* one extends that same
-prefix, the multi-turn chat and agentic-loop shape. In principle page/extent can
-keep writing into the extent it already holds, where the overlay cannot:
+prefix, the multi-turn chat and agentic-loop shape. In principle page layout can
+keep writing into the kernel block it already holds, where the overlay cannot:
 upstream caches only full blocks, so its sub-block match must land in a freshly
 allocated block and pay the copy every turn. Adoption (I5b) implements that, and
 it eliminates the copy outright:
 
-| `[a,b,c]` finishes, then `[a,b,c,d]` | tokens copied | extents used |
+| `[a,b,c]` finishes, then `[a,b,c,d]` | tokens copied | kernel blocks used |
 |---|---|---|
 | sub-block on | 768 | 2 blocks |
-| page/extent, no adoption | 768 | 2 |
-| page/extent with adoption | **0** | **1** |
+| page layout, no adoption | 768 | 2 |
+| page layout with adoption | **0** | **1** |
 
 Real turns do not end on a page boundary either, and adoption still covers
 them, because **upstream hands back the same block ids every turn** -- trailing
 block included, since the partial tail block is freed and immediately
 reallocated. Observed on hardware: `pages=[1,2,3,4,5,6,7] cached=6` identically
-on every turn. So the retained extent already holds exactly this group, and only
+on every turn. So the retained kernel block already holds exactly this group, and only
 its tail slot needs rewriting. Adoption therefore rewinds the write pointer to
 the cached prefix and re-places the rest; a slot may hold the group's page or
 `INVALID_PAGE` (poisoned when that page was last written elsewhere) and either
@@ -567,15 +576,15 @@ may still be cached for a longer prefix elsewhere.
 Measured 2026-08-13, Qwen3-0.6B, 4 turns each resuming the previous turn's
 tokens:
 
-| | copy ops | tokens copied | extents |
+| | copy ops | tokens copied | kernel blocks |
 |---|---|---|---|
 | sub-block on | 3 | 1536 | one new block per turn |
-| page/extent, no adoption | 3 | 1536 | one new extent per turn |
-| page/extent with adoption | **0** | **0** | 2, reused every turn |
+| page layout, no adoption | 3 | 1536 | one new kernel block per turn |
+| page layout with adoption | **0** | **0** | 2, reused every turn |
 
 Greedy output is **bit-identical** with and without adoption across all four
 turns, which is the check that matters: the two differ only in whether the KV
-bytes are copied elsewhere or left in place, so any mis-aimed extent would
+bytes are copied elsewhere or left in place, so any mis-aimed kernel block would
 diverge immediately.
 
 ### Measured 2026-08-13 (Qwen3-0.6B, multi-turn, deployment geometry)
@@ -593,7 +602,7 @@ which is what "the overlay" means throughout this doc; both baseline runs logged
 |---|---|---|---|---|---|
 | sub-block on, block 1024 (today's default) | 191.9 | 34.8 ms | 5 | 2 560 | 61.2 ms |
 | sub-block on, block 8192 | 216.4 | 37.8 ms | 9 | 24 064 | 90.1 ms |
-| page/extent, page 512 extent 8192 | **220.9** | **27.7 ms** | **0** | **0** | **0** |
+| page layout, page 512 kernel block 8192 | **220.9** | **27.7 ms** | **0** | **0** | **0** |
 
 Against sub-block caching at the same physical block size: **TTFT -26.7%**,
 tok/s +2.1%. Against today's default (block 1024): tok/s +15.1%, TTFT -20.4%.
@@ -610,18 +619,18 @@ Two things this changes:
 - **The overlay's cost grows with conversation length.** At block 8192 no full
   block exists until the conversation reaches 8192 tokens, so every turn copies
   the entire matched prefix -- 24 064 tokens over 10 turns here, and rising
-  quadratically with turn count. Adoption keeps page/extent flat at zero. This
+  quadratically with turn count. Adoption keeps page layout flat at zero. This
   is the agentic / multi-turn case, and it is where the two designs genuinely
   diverge.
 
-One loose end: `page/extent @ 8192` and `sub-block @ 1024` produced
+One loose end: `page layout @ 8192` and `sub-block @ 1024` produced
 byte-identical text, while `sub-block @ 8192` diverged from both. Cross-geometry text comparison
 is not diagnostic (chunked-prefill boundaries move with cache hits, so bitwise
 equality is not expected even when both are correct), but the odd one out being
 the overlay at the large block size is worth a short greedy probe before
 recommending that config.
 
-Beyond copies, page/extent's other mechanical edge is match *composability*: the
+Beyond copies, page layout's other mechanical edge is match *composability*: the
 overlay takes its remainder from a single source block, while `_place` locates
 each page independently and can compose one destination from several sources.
 That shows up as hit rate on fragmented traffic, not as bytes moved.
@@ -650,7 +659,7 @@ pool (222K tokens) never evicted. Force it with `--num-gpu-blocks-override`.
    The overwrite reached them only because at `world_size == 1` vLLM uses
    `UniProcExecutor`, so the worker shares the process -- and the `VllmConfig`
    object -- with the engine core; under a multi-process executor (the DP4+EP
-   benchmark) it was inert. It is now also fatal in-process: an extent-sized
+   benchmark) it was inert. It is now also fatal in-process: a kernel block-sized
    value contradicts the page-sized spec the scheduler kept, and
    `UnitaryKVCacheCoordinator` asserts `hash_block_size == block_size` at
    startup. **The overwrite is deleted**; the spec restatement alone is
@@ -661,25 +670,26 @@ pool (222K tokens) never evicted. Force it with `--num-gpu-blocks-override`.
 2. **Per-group physical units, for SWA hybrids.** The SWA kernel asserts
    `sliding_window == kv_cache.size(-2)`, so an SWA group's physical unit is
    fixed by its window, not chosen. The page stays global (upstream shares
-   `hash_block_size` and `num_computed_tokens` across groups) and the extent
+   `hash_block_size` and `num_computed_tokens` across groups) and the kernel block
    becomes per-group. No longer blocked: with (1) resolved the physical unit
    lives only in the per-group spec, which is already per-group, so nothing has
    to be expressed through the one global `cache_config.block_size`. Then drop
-   the single-group restriction in `can_use_page_extent`.
-3. **Rename with (2).** `extent` collides with two existing names for the same
-   thing: the compiler's `kvcache_partition_len` / `attn_block_size` and
-   upstream's `kernel_block_size`. Prefer `kernel_block`, which is already the
-   vocabulary in the SWA assert message; note upstream's namesake *splits*
-   where this *groups*. `ExtentGeometry` -> `PageLayout`. Not worth doing
-   before (2) reshapes it.
-4. **O(1) `bind()`.** It rewalks every extent of a request each step: 0.54 us
+   the single-group restriction in `can_use_page_layout`.
+3. ~~**Rename.**~~ **Done 2026-08-13.** `extent` -> `kernel_block`,
+   `ExtentGeometry` -> `PageLayout`, module `page_extent.py` -> `page_layout.py`,
+   env `VLLM_RBLN_PAGE_EXTENT` -> `VLLM_RBLN_PAGE_LAYOUT` (old name kept as an
+   alias). Done ahead of (2) rather than with it, as a pure mechanical commit, so
+   (2)'s diff carries only the semantic change. See
+   [§ Relation to upstream `kernel_block_size`](#relation-to-upstream-kernel_block_size)
+   for the invariant this name inverts.
+4. **O(1) `bind()`.** It rewalks every kernel block of a request each step: 0.54 us
    at 4 pages, 20.66 us at 1024. That is 0.08% of TPOT at `max_model_len`, so
-   it is scaling, not a present cost. Skip sealed extents.
+   it is scaling, not a present cost. Skip sealed kernel blocks.
 5. **Confirm the multi-turn result on MiniMax-M2.5.** The Qwen3-0.6B numbers
    above (TTFT -26.7% against the overlay at the same physical block) should
    grow with layer count, since the copy is per-op dispatch over layers and
    MiniMax has 62 to Qwen's 28. Use the serve path, not the offline API, and a
-   conversation long enough to cross an 8192-token extent so the overlay's
+   conversation long enough to cross an 8192-token kernel block so the overlay's
    full-block sharing also gets exercised.
 6. **Short greedy probe on `sub-block caching @ block 8192`.** In the run above it was the
    only config whose text diverged from the other two. Probably benign (moving
@@ -694,9 +704,9 @@ pool (222K tokens) never evicted. Force it with `--num-gpu-blocks-override`.
 
 1. Agree the invariants and the spec (this doc).
 2. Land the addressing layer behind the overlay, without flipping CLI
-   semantics. **Done** — `vllm_rbln/v1/core/page_extent/` (geometry, allocator,
-   page→extent table, binding policy) with unit tests.
-3. Flip `--block-size` to the page; derive `extent_size` in the platform;
+   semantics. **Done** — `vllm_rbln/v1/core/page_layout/` (geometry, allocator,
+   page→kernel block table, binding policy) with unit tests.
+3. Flip `--block-size` to the page; derive `kernel_block_size` in the platform;
    update the `block_size` audit sites, tests, llm-d notes, and LMCache paging
    defaults.
 4. Enable connector cooperation (drop the mutual-exclusion arbitration).
@@ -708,12 +718,12 @@ pool (222K tokens) never evicted. Force it with `--num-gpu-blocks-override`.
 | Decision | Choice |
 |---|---|
 | Schedule / hash / match unit | page (`--block-size`), `page % chunk == 0` |
-| Physical / DMA unit | extent (backend-derived, e.g. 4096) |
+| Physical / DMA unit | kernel block (backend-derived, e.g. 4096) |
 | Mapping granularity | hybrid: fine map, coarse allocation, merge on partial update |
 | New env `VLLM_RBLN_KERNEL_BLOCK_SIZE` | **No** |
-| Partial match | partial merge (CoW) into a private extent |
-| Dedup | full extents only, by extent hash |
-| Refcount granularity | extent (I8) |
+| Partial match | partial merge (CoW) into a private kernel block |
+| Dedup | full kernel blocks only, by kernel-block hash |
+| Refcount granularity | kernel block (I8) |
 | Interior page indexing | **Yes** (preserves today's hit rate) |
 | Connector interaction | cooperative, not arbitrated |
 | GC / compaction | out of MVP; trigger metric recorded |

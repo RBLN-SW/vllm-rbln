@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Restating the worker's KV geometry from pages to extents."""
+"""Restating the worker's KV geometry from pages to kernel blocks."""
 
 import types
 from dataclasses import dataclass, field
@@ -25,7 +25,7 @@ import vllm_rbln.envs as envs
 from vllm_rbln.v1.worker.rbln_model_runner import RBLNModelRunner
 
 PAGE = 1024
-EXTENT = 8192
+KERNEL_BLOCK = 8192
 BYTES_PER_PAGE = 4096
 
 
@@ -58,25 +58,27 @@ def make_config(num_pages=217, page_size=PAGE):
     )
 
 
-def rescale(config, extent=EXTENT, enabled=True, page=PAGE, monkeypatch=None):
+def rescale(
+    config, kernel_block=KERNEL_BLOCK, enabled=True, page=PAGE, monkeypatch=None
+):
     runner = RBLNModelRunner.__new__(RBLNModelRunner)
     cache_config = types.SimpleNamespace(block_size=page)
     runner.vllm_config = types.SimpleNamespace(
-        additional_config={"attn_block_size": extent} if extent else {},
+        additional_config={"attn_block_size": kernel_block} if kernel_block else {},
         cache_config=cache_config,
     )
     runner.cache_config = cache_config
-    monkeypatch.setattr(envs, "VLLM_RBLN_PAGE_EXTENT", enabled)
-    RBLNModelRunner._maybe_rescale_to_extents(runner, config)
+    monkeypatch.setattr(envs, "VLLM_RBLN_PAGE_LAYOUT", enabled)
+    RBLNModelRunner._maybe_rescale_to_kernel_blocks(runner, config)
     return runner, config
 
 
-def test_buffer_is_trimmed_to_whole_extents(monkeypatch):
-    # 217 pages is not a whole number of 8-page extents; the leftover page
+def test_buffer_is_trimmed_to_whole_kernel_blocks(monkeypatch):
+    # 217 pages is not a whole number of 8-page kernel blocks; the leftover page
     # cannot be allocated anyway, and leaving it in trips the reshape assert.
     runner, config = rescale(make_config(217), monkeypatch=monkeypatch)
     assert config.num_blocks == 27
-    assert config.kv_cache_groups[0].kv_cache_spec.block_size == EXTENT
+    assert config.kv_cache_groups[0].kv_cache_spec.block_size == KERNEL_BLOCK
     assert config.kv_cache_tensors[0].size == BYTES_PER_PAGE * 8 * 27
     assert config.kv_cache_tensors[0].size % (BYTES_PER_PAGE * 8) == 0
 
@@ -93,16 +95,20 @@ def test_disabled_leaves_geometry_alone(monkeypatch):
     assert config.kv_cache_groups[0].kv_cache_spec.block_size == PAGE
 
 
-def test_model_without_published_extent_is_untouched(monkeypatch):
-    runner, config = rescale(make_config(217), extent=None, monkeypatch=monkeypatch)
+def test_model_without_published_kernel_block_is_untouched(monkeypatch):
+    runner, config = rescale(
+        make_config(217), kernel_block=None, monkeypatch=monkeypatch
+    )
     assert config.num_blocks == 217
     assert config.kv_cache_groups[0].kv_cache_spec.block_size == PAGE
 
 
-@pytest.mark.parametrize("extent", [PAGE, 1536])
-def test_degenerate_or_misaligned_extent_is_ignored(monkeypatch, extent):
-    # extent == page is a no-op; a non-multiple is not expressible at all.
-    runner, config = rescale(make_config(217), extent=extent, monkeypatch=monkeypatch)
+@pytest.mark.parametrize("kernel_block", [PAGE, 1536])
+def test_degenerate_or_misaligned_kernel_block_is_ignored(monkeypatch, kernel_block):
+    # kernel block == page is a no-op; a non-multiple is not expressible at all.
+    runner, config = rescale(
+        make_config(217), kernel_block=kernel_block, monkeypatch=monkeypatch
+    )
     assert config.num_blocks == 217
     assert config.kv_cache_groups[0].kv_cache_spec.block_size == PAGE
 
@@ -111,7 +117,7 @@ def test_cache_config_keeps_the_page(monkeypatch):
     # Only the spec is restated. The engine core reads cache_config.block_size
     # after this, in resolve_kv_cache_block_sizes, where a single group makes it
     # both the scheduler block size and the hash block size; an in-process
-    # worker shares the object, so an extent here contradicts the page-sized
+    # worker shares the object, so an kernel block here contradicts the page-sized
     # spec the scheduler kept and trips UnitaryKVCacheCoordinator's
     # hash_block_size == block_size assert.
     runner, _ = rescale(make_config(217), monkeypatch=monkeypatch)
