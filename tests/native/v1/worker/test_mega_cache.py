@@ -190,6 +190,22 @@ class TestSignatureVllmConfig:
         base = mega_cache.config_signature(make_vllm_config())
         assert mega_cache.config_signature(make_vllm_config(**overrides)) != base
 
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"max_num_seqs": 8},
+            {"num_gpu_blocks_override": 64},
+            {"gpu_memory_utilization": 0.5},
+        ],
+        ids=["max_num_seqs", "num_gpu_blocks_override", "gpu_memory_utilization"],
+    )
+    def test_warmup_graph_set_config_invalidates(self, overrides):
+        # compute_hash() drops all three, but each moves a warm-up graph shape
+        # (decode batch / KV num_blocks) — sharing a bundle across them makes the
+        # graphs only partly hit, which costs a duplicate weight set on device.
+        base = mega_cache.config_signature(make_vllm_config())
+        assert mega_cache.config_signature(make_vllm_config(**overrides)) != base
+
     def test_every_port_field_is_swept(self):
         # Ports are auto-queried per launch; one reaching the hash moves the
         # signature every restart. The empty guard catches an upstream rename
