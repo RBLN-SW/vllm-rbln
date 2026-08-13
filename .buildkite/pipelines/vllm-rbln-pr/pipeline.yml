@@ -1,12 +1,44 @@
-agents:
-  queue: r18s
-
 notify:
   - github_commit_status:
-      context: "[OB] vllm-rbln tests"
+      context: "[OB] vLLM-RBLN pytest"
+
+env:
+  UV_CACHE_DIR: "/root/.cache/uv"
+  UV_LINK_MODE: "symlink"
+  UV_INDEX_STRATEGY: "unsafe-best-match"
+
+_secrets: &secrets
+  UV_INDEX_RBLN_NEXUS_NIGHTLY_USERNAME: MGMT_NEXUS_USERNAME
+  UV_INDEX_RBLN_NEXUS_NIGHTLY_PASSWORD: MGMT_NEXUS_PASSWORD
+  UV_INDEX_REBELLIONS_USERNAME: REBEL_SW_DEV_USERNAME
+  UV_INDEX_REBELLIONS_PASSWORD: REBEL_SW_DEV_PASSWORD
+  HF_TOKEN: HF_TOKEN
+  # The stack already injects HF_HOME=/mnt/shared_data/.cache/huggingface into
+  # every job container, and only the .cache and .github subtrees of that export
+  # are mounted -- a value pointing anywhere else is a path the pod does not have.
+  # HF_HOME: FSW_HF_HOME
 
 steps:
-  - label: "placeholder"
+  - label: ":pytest: [CA25] pytest"
+    key: "vllm-rbln-pr-pytest-ca25"
+    agents:
+      queue: r18s
+      resource_class: "RBLN-CA25-32"
     image: "${DEVTOOLS_DOCKER_IMAGE}"
+    secrets: *secrets
+    timeout_in_minutes: 60
     command:
-      - "echo 'placeholder'"
+      - "bash .buildkite/pipelines/vllm-rbln-pr/scripts/run-t0-unit.sh"
+      - "bash .buildkite/pipelines/vllm-rbln-pr/scripts/run-t1-compile.sh"
+
+  - label: ":pytest: [CR03] pytest"
+    key: "vllm-rbln-pr-pytest-cr03"
+    agents:
+      queue: udc
+      resource_class: "RBLN-CR03-8"
+    image: "${DEVTOOLS_DOCKER_IMAGE}"
+    secrets: *secrets
+    timeout_in_minutes: 60
+    command:
+      - "bash .buildkite/pipelines/vllm-rbln-pr/scripts/run-t0-unit.sh"
+      - "bash .buildkite/pipelines/vllm-rbln-pr/scripts/run-t1-compile.sh"

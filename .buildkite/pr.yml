@@ -41,9 +41,9 @@ steps:
         command: "buildkite-agent pipeline upload .buildkite/pipelines/optimum-pr/pipeline.yml"
 
   - group: ":snake: vllm-rbln tests"
-    key: "vlln-rbln"
+    key: "vllm-rbln"
     steps:
-      - label: ":sparkles: upload vlln-rbln-pr"
+      - label: ":sparkles: upload vllm-rbln-pr"
         checkout:
           sparse:
             paths:

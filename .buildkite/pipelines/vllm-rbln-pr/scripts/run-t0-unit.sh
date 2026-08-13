@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# T0 -- unit lane. No --model-compile, so the whole-model lane stays skipped.
+# Without --model-compile the whole-model tests skip themselves.
 
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
