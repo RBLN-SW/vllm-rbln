@@ -318,7 +318,7 @@ class RblnPlatform(Platform):
                         pp_size,
                         max_num_seqs % pp_size,
                     )
-                logger.info(
+                logger.info_once(
                     "pipeline_parallel_size=%d, max_num_seqs=%d -> "
                     "per-stage decode batch=%d.",
                     pp_size,

@@ -330,7 +330,7 @@ class RBLNScheduler(Scheduler):
                         unsafe_backfill_req_ids.add(request.request_id)
                         num_new_tokens = 1
 
-            if num_new_tokens <= 0:
+            if num_new_tokens == 0:
                 # The request cannot be scheduled because one of the following
                 # reasons:
                 # 1. No new tokens to schedule. This may happen when
@@ -342,8 +342,6 @@ class RBLNScheduler(Scheduler):
                 # 3. The encoder cache is exhausted.
                 # 4. Insufficient budget for a block-aligned chunk in hybrid
                 #    models with mamba cache mode \"align\".
-                # 5. (RBLN) Speculative decoding left num_computed_tokens ahead
-                #    of num_tokens_with_spec, so there is nothing to schedule.
                 # NOTE(woosuk): Here, by doing `continue` instead of `break`,
                 # we do not strictly follow the FCFS scheduling policy and
                 # allow the lower-priority requests to be scheduled.
