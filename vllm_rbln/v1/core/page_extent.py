@@ -418,10 +418,10 @@ class ExtentCopyOp:
 class PageExtentManager:
     """Owns the extent pool and decides attach-vs-copy per request.
 
-    I4-I7: a fully matched extent attaches by reference, anything less is
-    copied into a private one, only sealed extents are attach targets, reclaim
-    is whole-extent. Splitting the match at extent boundaries bounds the copy
-    by one extent however long the match.
+    I4-I7: a fully matched extent attaches by reference, an unreferenced partial
+    one is adopted and extended in place, anything else is copied into a private
+    extent, reclaim is whole-extent. Splitting the match at extent boundaries
+    bounds the copy by one extent however long the match.
     """
 
     def __init__(
@@ -451,32 +451,30 @@ class PageExtentManager:
 
             if ext_idx < len(existing):
                 extent_id = existing[ext_idx]
-                extent = self.table.require(extent_id)
-                if extent.num_pages >= len(group):
-                    continue
-                pending = [
-                    op
-                    for slot in range(extent.num_pages, len(group))
-                    for op in self._place(
-                        group[slot], extent_id, slot, base + slot, num_cached_pages
-                    )
-                ]
             else:
                 attach_id = self._attachable(group, base, num_cached_pages)
                 if attach_id is not None:
                     self.table.attach_to_request(request_id, attach_id)
                     continue
-                extent_id = self.allocator.allocate(urgent=base < num_cached_pages)
-                self.table.create(extent_id, owner=request_id, depth=ext_idx)
+                adopt_id = self._adoptable(group, base, num_cached_pages)
+                if adopt_id is None:
+                    extent_id = self.allocator.allocate(urgent=base < num_cached_pages)
+                    self.table.create(extent_id, depth=ext_idx)
+                else:
+                    extent_id = adopt_id
                 self.table.attach_to_request(request_id, extent_id)
-                pending = [
-                    op
-                    for slot, page_id in enumerate(group)
-                    for op in self._place(
-                        page_id, extent_id, slot, base + slot, num_cached_pages
-                    )
-                ]
+                self.table.require(extent_id).owner = request_id
 
+            written = self.table.require(extent_id).num_pages
+            if written >= len(group):
+                continue
+            pending = [
+                op
+                for slot in range(written, len(group))
+                for op in self._place(
+                    group[slot], extent_id, slot, base + slot, num_cached_pages
+                )
+            ]
             self._maybe_seal(extent_id)
             ops.extend(_coalesce(pending))
 
@@ -515,7 +513,7 @@ class PageExtentManager:
     def _attachable(
         self, group: list[int], base: int, num_cached_pages: int
     ) -> int | None:
-        """I5: a sealed extent holding exactly this group."""
+        """I5: a sealed extent holding exactly this group, shared read-only."""
         if len(group) != self.geometry.pages_per_extent:
             return None
         if base + len(group) > num_cached_pages:
@@ -524,6 +522,31 @@ class PageExtentManager:
             extent = self.table.get(candidate)
             if extent is not None and extent.sealed and extent.page_ids == group:
                 return candidate
+        return None
+
+    def _adoptable(
+        self, group: list[int], base: int, num_cached_pages: int
+    ) -> int | None:
+        """I5b: a retained partial extent this request can keep writing into.
+
+        The multi-turn case: a request ended mid-extent and the next one shares
+        that prefix and extends it. Appending in place is safe precisely when
+        nobody else references the extent -- the resumed pages keep their slots,
+        so I3 holds and the sharer I4 protects does not exist. Two requests
+        extending the same prefix still copy: the first adopts, the second sees
+        a live refcount.
+        """
+        for candidate in self.table.holders(group[0]):
+            extent = self.table.get(candidate)
+            if (
+                extent is None
+                or extent.ref_cnt > 0
+                or extent.num_pages >= len(group)
+                or base + extent.num_pages > num_cached_pages
+                or extent.page_ids != group[: extent.num_pages]
+            ):
+                continue
+            return candidate
         return None
 
     def _maybe_seal(self, extent_id: int) -> None:

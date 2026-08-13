@@ -215,7 +215,7 @@ destinations, so a pool that is merely full still degrades gracefully.
 | **I2** | A request's `num_computed_tokens` is page-aligned throughout prefill. | Keeps pages either complete or untouched. Holds because `page_size % chunk_size == 0`, at most one prefill runs per step, and every per-step token clamp is page-aligned (see [§ Scheduler](#scheduler-integration)). |
 | **I3** | Within an extent, a request's pages are written sequentially from offset 0. | Sequential-write (ZNS-style) rule; makes `page_offset` derivable and the extent DMA-contiguous. |
 | **I4** | Never append into an extent another request references. A partial match is resolved by copying into a private extent. | Out-of-place update: an in-place append would corrupt the sharer's prefix. |
-| **I5** | Only **full** extents are attach targets. Partial extents may be **copy sources** but are never attached by reference. | A partial extent still has a live write pointer (I3, I4). Its completed pages are still indexed — that is the hit-rate win over upstream. |
+| **I5** | Full extents are attach targets, shared read-only. A partial extent is a **copy source** for anyone, and an **adoption** target for at most one request: an unreferenced one whose pages are exactly the leading pages of the group being bound is extended in place (**I5b**). | A partial extent has a live write pointer (I3), so only one writer may hold it; `ref_cnt == 0` means the sharer I4 protects does not exist, and the resumed pages keep their slots. Adoption is what makes the multi-turn append case zero-copy. |
 | **I6** | Dedup happens only when an extent becomes full, keyed by its extent hash (the chained page hash at its last page boundary). | Partial extents have no stable identity. |
 | **I7** | Reclaim is at extent granularity; no mid-extent holes. | Erase-unit asymmetry. Page-only eviction is forbidden. |
 | **I8** | Refcounts live on the **extent**. The page-hash index is mapping metadata and owns no reference. | By I4/I5, sharing is always whole-extent, so per-page refcounts would be uniform across an extent by construction. |
@@ -509,30 +509,63 @@ events replace the overlay's reimplementation.
 Immediately actionable and independent of this work: the current default
 deployment gains ~18% throughput from `--block-size 8192` alone.
 
-### Why the parity is structural, not an artifact of this benchmark
+### D2D copy volume: parity on fan-out, a win on append
 
-The intuition that the overlay must pay a pre-forward D2D copy page/extent
-avoids does not hold: **at equal physical block size the two copy the same
-bytes, always.** Both share whole physical units by reference and copy only the
-sub-unit remainder of the match -- the overlay from `apply_sub_block_match`
-(`num_matched * sub_block_size` tokens), page/extent from `_place` (one page per
-slot whose source extent differs, coalesced). Copy volume is
-`cached_tokens % physical_block` either way, bounded by one physical unit.
+Copy volume depends on the *shape* of the traffic, and the benchmark above only
+exercised one of the two shapes.
 
-Measured 2026-08-13, Qwen3-0.6B, page/sub-block 256, physical 1024, 1640-token
-shared prefix (matches 6 pages = 1536 tokens = one full 1024 unit plus a
-512-token remainder), 4 prompts after a warm-up:
+**Fan-out** — one cached prefix, several different continuations. Here the two
+paths move identical bytes. Both share whole physical units by reference and
+copy only the sub-unit remainder of the match: the overlay from
+`apply_sub_block_match` (`num_matched * sub_block_size` tokens), page/extent
+from `_place`. Volume is `cached_tokens % physical_block` either way, bounded by
+one physical unit. Measured 2026-08-13, Qwen3-0.6B, page/sub-block 256, physical
+1024, 1640-token shared prefix (6 pages = 1536 tokens = one full 1024 unit plus
+a 512-token remainder), 4 prompts after a warm-up:
 
 | config | copy calls | ops | tokens copied |
 |---|---|---|---|
 | overlay (`--block-size 1024`, sub-block 256) | 4 | 4 | 2048 |
 | page/extent (page 256, extent 1024) | 4 | 4 | 2048 |
 
-Identical. Page/extent's mechanical advantage over the overlay is not copy
-avoidance but match *composability*: the overlay takes its remainder from a
-single source block, while `_place` locates each page independently and can
-compose one destination from several sources. That shows up as hit rate on
-fragmented traffic, not as bytes moved.
+The second continuation genuinely must copy in both designs: two requests
+writing different next pages cannot share one write pointer.
+
+**Append** — a request ends mid-unit and the *next* one extends that same
+prefix, the multi-turn chat and agentic-loop shape. In principle page/extent can
+keep writing into the extent it already holds, where the overlay cannot:
+upstream caches only full blocks, so its sub-block match must land in a freshly
+allocated block and pay the copy every turn. Adoption (I5b) implements that, and
+it does eliminate the copy when the previous turn ended on a page boundary:
+
+| `[a,b,c]` finishes, then `[a,b,c,d]` | tokens copied | extents used |
+|---|---|---|
+| overlay | 768 | 2 blocks |
+| page/extent, no adoption | 768 | 2 |
+| page/extent with adoption | **0** | **1** |
+
+**Real turns do not end on a page boundary, and there adoption does not fire
+yet.** Measured 2026-08-13, Qwen3-0.6B, 4 turns each resuming the previous
+turn's tokens: overlay and page/extent both copy 512 tokens per turn, 1536
+total. The reason is exact and narrow. A turn leaves its retained extent holding
+`[p4, p5, p6]` where `p6` is a *partial* trailing page; upstream never hashed
+`p6`, so the next turn matches only `p4, p5` and is handed a fresh trailing
+block `p99`. The group is then `[p4, p5, p99]`, which is not a prefix of
+`[p4, p5, p6]`, so the extent is not adoptable and `p4, p5` are copied.
+
+Closing that needs adoption to **rewind the write pointer** past trailing slots
+the new request does not count as cached, overwriting them in place. The blocker
+is safety, not mechanism: dropping those bytes is only sound if no *other*
+request has a longer cached prefix covering them, since upstream would still
+report a hit and read what we overwrote -- the silent-corruption mode this
+design warns about. `PageExtentManager` cannot see global hash state;
+`RBLNPageExtentKVCacheManager`, which holds the block pool, can. See
+[§ Next steps](#next-steps).
+
+Beyond copies, page/extent's other mechanical edge is match *composability*: the
+overlay takes its remainder from a single source block, while `_place` locates
+each page independently and can compose one destination from several sources.
+That shows up as hit rate on fragmented traffic, not as bytes moved.
 
 ### Verification
 
@@ -583,11 +616,21 @@ pool (222K tokens) never evicted. Force it with `--num-gpu-blocks-override`.
 4. **O(1) `bind()`.** It rewalks every extent of a request each step: 0.54 us
    at 4 pages, 20.66 us at 1024. That is 0.08% of TPOT at `max_model_len`, so
    it is scaling, not a present cost. Skip sealed extents.
-5. **Decide whether to keep this path at all**, given it is performance-neutral
-   and costs ~230 lines in the scheduler and worker plus a second KV stack to
-   maintain. The copy-volume measurement above closes off the last hypothesised
-   source of a speed win, so the decision rests on match composability and on
-   `--block-size` alignment alone.
+5. **Rewind the write pointer on adoption**, so the multi-turn append case is
+   actually zero-copy rather than only the page-boundary-aligned case. Adoption
+   (I5b) currently requires the retained extent to be an exact prefix of the
+   group, which a real turn never is: its trailing slot holds the previous
+   turn's partial page. Overwriting those trailing slots in place is safe only
+   for pages nothing else has cached, so the check belongs in
+   `RBLNPageExtentKVCacheManager`, which can see the block pool's hash state --
+   `PageExtentManager` cannot. This is the one remaining lever that could make
+   the path faster rather than merely aligned, so do it before (6).
+6. **Decide whether to keep this path at all**, given ~230 lines in the
+   scheduler and worker plus a second KV stack to maintain. The
+   performance-neutral verdict was measured on fan-out traffic, where parity is
+   structural. Re-benchmark on multi-turn traffic *after* (5): that is the only
+   shape where this design can beat the overlay on bytes moved, and the
+   1536-token shared-prefix benchmark cannot show it.
 
 ## Migration
 

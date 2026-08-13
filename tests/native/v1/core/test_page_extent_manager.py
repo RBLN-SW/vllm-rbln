@@ -126,6 +126,90 @@ class TestPartialMerge:
         assert manager.table.require(src_extent).page_ids == [10, 11, 12, 13]
 
 
+class TestAdoption:
+    """I5b: a retained partial extent is extended in place, not copied.
+
+    The multi-turn shape -- a request ends mid-extent and the next one shares
+    that prefix and appends to it -- which is where this design beats the
+    sub-block overlay, since the overlay must copy the matched remainder into a
+    freshly allocated block.
+    """
+
+    def test_resumed_prefix_is_extended_in_place(self, manager):
+        manager.bind("r1", pages(10, 11, 12), num_cached_pages=0)
+        extent_id = manager.block_table("r1")[0]
+        manager.free_request("r1")
+
+        ops = manager.bind("r2", pages(10, 11, 12, 13), num_cached_pages=3)
+        assert ops == []
+        assert manager.block_table("r2") == [extent_id]
+        assert manager.table.require(extent_id).page_ids == [10, 11, 12, 13]
+        assert manager.num_pages_copied == 0
+
+    def test_adopted_extent_is_reowned_and_referenced(self, manager):
+        manager.bind("r1", pages(10, 11), num_cached_pages=0)
+        extent_id = manager.block_table("r1")[0]
+        manager.free_request("r1")
+
+        manager.bind("r2", pages(10, 11, 12), num_cached_pages=2)
+        extent = manager.table.require(extent_id)
+        assert extent.ref_cnt == 1 and extent.owner == "r2"
+
+    def test_second_branch_off_the_same_prefix_still_copies(self, manager):
+        # Two continuations cannot share one write pointer; the loser pays CoW.
+        manager.bind("r1", pages(10, 11, 12), num_cached_pages=0)
+        manager.free_request("r1")
+        manager.bind("r2", pages(10, 11, 12, 13), num_cached_pages=3)
+
+        ops = manager.bind("r3", pages(10, 11, 12, 14), num_cached_pages=3)
+        assert len(ops) == 1 and ops[0].num_tokens == 3 * 16
+        assert manager.block_table("r3") != manager.block_table("r2")
+
+    def test_live_sharer_is_never_adopted(self, manager):
+        # I4 still governs: r1 has not finished, so its extent is off limits.
+        manager.bind("r1", pages(10, 11, 12), num_cached_pages=0)
+        src = manager.block_table("r1")[0]
+
+        ops = manager.bind("r2", pages(10, 11, 12, 13), num_cached_pages=3)
+        assert len(ops) == 1 and ops[0].src_extent_id == src
+        assert manager.table.require(src).page_ids == [10, 11, 12]
+
+    def test_divergent_prefix_is_not_adopted(self, manager):
+        # A shared first page is not a shared prefix; slots must line up (I3).
+        manager.bind("r1", pages(10, 11, 12), num_cached_pages=0)
+        manager.free_request("r1")
+
+        ops = manager.bind("r2", pages(10, 20, 21, 22), num_cached_pages=1)
+        assert len(ops) == 1 and ops[0].num_tokens == 16
+        assert manager.block_table("r2") != manager.block_table("r1")
+
+    def test_real_turn_still_copies_because_the_tail_slot_is_stale(self, manager):
+        # The shape a real turn leaves behind, and the limit of adoption today:
+        # turn 0 ends mid-page, so its extent holds a partial page (16) upstream
+        # never hashed. Turn 1 matches only 14, 15 and gets a fresh trailing
+        # block (99), so the extent is not a prefix of the group and 14, 15 are
+        # copied. Fixing this needs the write pointer rewound past slot 2, which
+        # is only safe for pages nothing else has cached -- see doc step 5.
+        manager.bind("r1", pages(10, 11, 12, 13, 14, 15, 16), num_cached_pages=0)
+        head, tail = manager.block_table("r1")
+        manager.free_request("r1")
+
+        ops = manager.bind("r2", pages(10, 11, 12, 13, 14, 15, 99), num_cached_pages=6)
+        assert manager.table.require(tail).page_ids == [14, 15, 16]
+        assert len(ops) == 1 and ops[0].num_tokens == 2 * 16
+        # The leading full extent still attaches by reference, as it should.
+        assert manager.block_table("r2")[0] == head
+
+    def test_uncached_prefix_is_not_adopted(self, manager):
+        # Upstream reported no hit, so those page ids carry no reusable content.
+        manager.bind("r1", pages(10, 11), num_cached_pages=0)
+        retained = manager.block_table("r1")[0]
+        manager.free_request("r1")
+
+        manager.bind("r2", pages(10, 11, 12), num_cached_pages=0)
+        assert manager.block_table("r2") != [retained]
+
+
 class TestGrowth:
     def test_open_extent_grows_across_steps(self, manager):
         manager.bind("r1", pages(10, 11), num_cached_pages=0)
