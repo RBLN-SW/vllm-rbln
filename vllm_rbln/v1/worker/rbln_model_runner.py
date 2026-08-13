@@ -78,7 +78,6 @@ from vllm.v1.outputs import (
 from vllm.v1.sample.logits_processor import (
     LogitsProcessors,
     MoveDirectionality,
-    build_logitsprocs,
 )
 from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -123,6 +122,7 @@ from vllm_rbln.v1.attention.kv_cache_bindings import (
 )
 from vllm_rbln.v1.core.rbln_kv_cache_manager import KVCacheCopyOp
 from vllm_rbln.v1.core.rbln_scheduler import RBLNSchedulerOutput
+from vllm_rbln.v1.sample.rbln_logits_processor import build_rbln_logitsprocs
 from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
@@ -348,7 +348,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             block_sizes=[cache_config.block_size],
             kernel_block_sizes=[cache_config.block_size],
             num_spec_tokens=self.num_spec_tokens,
-            logitsprocs=build_logitsprocs(
+            logitsprocs=build_rbln_logitsprocs(
                 self.vllm_config,
                 self.device,
                 PIN_MEMORY,

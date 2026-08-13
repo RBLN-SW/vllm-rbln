@@ -61,7 +61,6 @@ from vllm.v1.outputs import (
     PoolerOutput,
     SamplerOutput,
 )
-from vllm.v1.sample.logits_processor import build_logitsprocs
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
@@ -89,6 +88,7 @@ from vllm_rbln.utils.optimum.registry import (
 )
 from vllm_rbln.v1.core.optimum_scheduler import RBLNSchedulerOutput
 from vllm_rbln.v1.sample import WARM_UP_CONFIGS, RBLNSampler
+from vllm_rbln.v1.sample.rbln_logits_processor import build_rbln_logitsprocs
 from vllm_rbln.v1.worker.ec_disagg_helpers import ECDisaggHelpersMixin
 from vllm_rbln.v1.worker.metrics import PerformanceTracker, collect_metrics
 from vllm_rbln.v1.worker.optimum_input_batch import RBLNInputBatch
@@ -227,7 +227,7 @@ class RBLNOptimumModelRunner(
             block_sizes=[cache_config.block_size],
             kernel_block_sizes=[cache_config.block_size],  # FIXME: why do we need this?
             max_num_blocks_per_req=None,
-            logitsprocs=build_logitsprocs(
+            logitsprocs=build_rbln_logitsprocs(
                 self.vllm_config,
                 self.device,
                 self.pin_memory,
