@@ -29,8 +29,8 @@ from vllm_rbln.logger import init_logger
 from vllm_rbln.platform import HAS_TORCH_RBLN, USE_DEVICE_TENSOR
 
 # NOTE:
-# Greedy requests use a small temperature (1e-3) so softmax collapses
-# to a near one-hot at argmax. _SAMPLING_EPS (1e-5) is too small here —
+# Greedy requests use a small temperature (1e-3) so softmax collapses to a near
+# one-hot at argmax. Upstream's _SAMPLING_EPS (1e-5) is too small here —
 # it pushes logits past softmax's safe exp range and overflows.
 _SAMPLING_EPS = 1e-3
 
@@ -202,9 +202,6 @@ class RBLNSampler(VLLMSampler):
 
         temperature = sampling_metadata.temperature
         if not sampling_metadata.all_random:
-            # NOTE: Greedy requests use a small temperature (1e-3) so softmax collapses
-            # to a near one-hot at argmax. original _SAMPLING_EPS (1e-5) is too small
-            # here — it pushes logits past softmax's safe exp range and overflows.
             temperature = torch.where(
                 temperature < _SAMPLING_EPS, _SAMPLING_EPS, temperature
             )
