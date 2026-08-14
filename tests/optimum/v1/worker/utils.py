@@ -42,7 +42,7 @@ from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.utils.hashing import sha256
 from vllm.utils.import_utils import LazyLoader
 from vllm.v1.core.kv_cache_manager import KVCacheManager, Request
-from vllm.v1.core.kv_cache_utils import get_request_block_hasher
+from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.output import CachedRequestData, GrammarOutput, NewRequestData
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -64,6 +64,10 @@ else:
 
 MAX_NUM_SEQ = 2
 MAX_MODEL_LEN = 64
+
+# Appending output tokens to a Request hashes each completed block, which
+# needs the module-level NONE_HASH seeded first.
+init_none_hash(sha256)
 OB_SIZE = 16
 IB_SIZE = 4
 NUM_BLOCKS = MAX_MODEL_LEN // OB_SIZE * MAX_NUM_SEQ + 1
@@ -378,6 +382,55 @@ def _schedule_cached_reqs(
         cached_length=[],
         dummy_block=None,
     )
+
+
+def prefill_requests(runner, reqs: list[Request]):
+    """Prefill each request on its own step and mark its prompt computed.
+
+    The token sampled at prefill is the request's first output token, so it
+    is fed back like run_decode_steps does — the first decode step's
+    penalties must already see it. Returns one ModelRunnerOutput per request.
+    """
+    outputs = []
+    for i, req in enumerate(reqs):
+        scheduler_output = _schedule_new_request_from_request(
+            req, block_ids=([i],), outer_block_ids=[i]
+        )
+        runner.execute_model(scheduler_output)
+        output = runner.sample_tokens(grammar_output=None)
+        sampled = output.sampled_token_ids[output.req_ids.index(req.request_id)]
+        req.append_output_token_ids(sampled)
+        req.num_computed_tokens = len(req.prompt_token_ids)
+        outputs.append(output)
+    return outputs
+
+
+def run_decode_steps(runner, reqs: list[Request], num_steps: int):
+    """Run `num_steps` decode steps, feeding each step's sampled tokens back.
+
+    The runner grows its internal per-request output_token_ids on its own in
+    sample_tokens; this helper plays the scheduler's part, advancing
+    num_computed_tokens and output_token_ids on the test-side Request objects
+    so SamplingMetadata.output_token_ids grows across steps as in production.
+    Returns one ModelRunnerOutput per step.
+    """
+    outputs = []
+    for _ in range(num_steps):
+        scheduler_output = _schedule_cached_reqs(reqs, new_block_ids=[None] * len(reqs))
+        runner.execute_model(scheduler_output)
+        output = runner.sample_tokens(grammar_output=None)
+        for req in reqs:
+            sampled = output.sampled_token_ids[output.req_ids.index(req.request_id)]
+            req.append_output_token_ids(sampled)
+            req.num_computed_tokens += len(sampled)
+        outputs.append(output)
+    return outputs
+
+
+def sampled_token(output, req_id: str) -> int:
+    """The single token an output holds for `req_id`."""
+    (token,) = output.sampled_token_ids[output.req_ids.index(req_id)]
+    return token
 
 
 def create_model_runner(max_num_seqs: int = MAX_NUM_SEQ):
