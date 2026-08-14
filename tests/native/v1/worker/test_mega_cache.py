@@ -206,6 +206,30 @@ class TestSignatureVllmConfig:
         base = mega_cache.config_signature(make_vllm_config())
         assert mega_cache.config_signature(make_vllm_config(**overrides)) != base
 
+    @pytest.mark.parametrize(("a", "b"), [(1, 4), (4, 8), (2, 16)])
+    def test_differing_decode_buckets_differ_in_signature(self, a, b):
+        # What the key has to cover is not max_num_seqs itself but the decode
+        # graph set it picks, so pin that instead of the field.
+        from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
+
+        def buckets(n):
+            return get_bucketing_manager(
+                "exponential", max_batch_size=n
+            ).decode_batch_buckets
+
+        assert buckets(a) != buckets(b), "probe does not move the bucket set"
+        assert mega_cache.config_signature(
+            make_vllm_config(max_num_seqs=a)
+        ) != mega_cache.config_signature(make_vllm_config(max_num_seqs=b))
+
+    def test_every_factor_is_a_real_field(self):
+        # The factors are read with a getattr default, so an upstream rename
+        # would drop an axis from the key instead of failing.
+        config = make_vllm_config()
+        assert hasattr(config.scheduler_config, "max_num_seqs")
+        for name in ("num_gpu_blocks_override", "gpu_memory_utilization"):
+            assert hasattr(config.cache_config, name), name
+
     def test_every_port_field_is_swept(self):
         # Ports are auto-queried per launch; one reaching the hash moves the
         # signature every restart. The empty guard catches an upstream rename
@@ -385,6 +409,15 @@ class TestSaveLoad:
     def test_signature_miss_does_not_read_another_bundle(self, bundle):
         mega_cache.save(MODEL, SIG)
         mega_cache.load(MODEL, "other-sig")
+        assert bundle.loaded == []
+
+    def test_a_run_does_not_read_another_max_num_seqs_bundle(self, bundle):
+        # The reported failure: two runs differing only here shared a bundle,
+        # so prefill hit while decode missed.
+        sig1 = mega_cache.config_signature(make_vllm_config(max_num_seqs=1))
+        sig4 = mega_cache.config_signature(make_vllm_config(max_num_seqs=4))
+        mega_cache.save(MODEL, sig1)
+        mega_cache.load(MODEL, sig4)
         assert bundle.loaded == []
 
     def test_rank_miss_does_not_read_another_rank(self, bundle, monkeypatch):
