@@ -20,6 +20,11 @@ from vllm.v1.sample.logits_processor.builtin import (
     MinPLogitsProcessor,
 )
 
+from vllm_rbln.v1.sample.rbln_logits_processor import (
+    RBLNLogitBiasLogitsProcessor,
+    RBLNMinPLogitsProcessor,
+)
+
 from .utils import (
     _schedule_cached_reqs,
     _schedule_new_request_from_request,
@@ -231,17 +236,22 @@ def test_forward_sampling_parameters(
 # TODO mix the requests with different sampling parameters
 
 
+@pytest.mark.parametrize(
+    "use_rbln_sampler", ["1", "0"], ids=["rbln_sampler", "vllm_sampler"]
+)
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
-def test_forward_min_tokens_masks_stop_tokens(monkeypatch, dtype):
+def test_forward_min_tokens_masks_stop_tokens(monkeypatch, dtype, use_rbln_sampler):
     """min_tokens must keep stop tokens unsampleable until the request has
     generated min_tokens tokens, then release them.
 
-    The bfloat16 case is a regression test for a dtype crash: the RBLN
-    sampler keeps logits in the model dtype (no float32 upcast), while the
-    builtin MinTokensLogitsProcessor holds a float32 -inf constant, and
-    index_put_ rejects mixed dtypes.
+    The bfloat16 case with the RBLN sampler is a regression test for a
+    dtype crash: the RBLN sampler keeps logits in the model dtype (no
+    float32 upcast), while the builtin MinTokensLogitsProcessor holds a
+    float32 -inf constant, and index_put_ rejects mixed dtypes. The
+    VLLM_RBLN_SAMPLER=0 case covers the fallback path, where the default
+    vLLM sampler upcasts logits to float32 before the processors run.
     """
-    monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1")
+    monkeypatch.setenv("VLLM_RBLN_SAMPLER", use_rbln_sampler)
     monkeypatch.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
     monkeypatch.setenv("VLLM_RBLN_ENABLE_WARM_UP", "False")
 
@@ -295,19 +305,26 @@ def test_forward_min_tokens_masks_stop_tokens(monkeypatch, dtype):
     assert sampled[min_tokens] == stop_token_id
 
 
+@pytest.mark.parametrize(
+    "use_rbln_sampler", ["1", "0"], ids=["rbln_sampler", "vllm_sampler"]
+)
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
-def test_forward_logit_bias_overrides_argmax(monkeypatch, dtype):
+def test_forward_logit_bias_overrides_argmax(monkeypatch, dtype, use_rbln_sampler):
     """logit_bias must be added to the logits before sampling, so a large
     positive bias lifts an otherwise losing token above the raw argmax
     token under greedy sampling.
 
-    The bfloat16 case is a regression test for a dtype mismatch: the RBLN
-    sampler keeps logits in the model dtype (no float32 upcast), while the
-    builtin LogitBiasLogitsProcessor rebuilds its bias tensor as float32 on
-    every state change. RBLNLogitBiasLogitsProcessor must re-sync the bias
-    tensor to the model dtype so the in-place += never mixes dtypes.
+    The bfloat16 case with the RBLN sampler is a regression test for a
+    dtype mismatch: the RBLN sampler keeps logits in the model dtype (no
+    float32 upcast), while the builtin LogitBiasLogitsProcessor rebuilds
+    its bias tensor as float32 on every state change.
+    RBLNLogitBiasLogitsProcessor must re-sync the bias tensor to the
+    incoming logits dtype so the in-place += never mixes dtypes. The
+    VLLM_RBLN_SAMPLER=0 case covers the fallback path, where the default
+    vLLM sampler upcasts logits to float32 and must keep the builtin
+    float32 processor.
     """
-    monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1")
+    monkeypatch.setenv("VLLM_RBLN_SAMPLER", use_rbln_sampler)
     monkeypatch.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
     monkeypatch.setenv("VLLM_RBLN_ENABLE_WARM_UP", "False")
 
@@ -356,29 +373,44 @@ def test_forward_logit_bias_overrides_argmax(monkeypatch, dtype):
     # token (10), so greedy sampling must pick it on every step.
     assert sampled == [biased_token_id] * (num_decodes + 1)
 
-    # The float32 bias tensor rebuilt on every state change must have been
-    # re-synced to the model dtype.
     bias_proc = next(
         p
         for p in runner.input_batch.logitsprocs.all
         if isinstance(p, LogitBiasLogitsProcessor)
     )
-    assert bias_proc.bias_tensor.dtype == dtype
+    if use_rbln_sampler == "1":
+        # The float32 bias tensor rebuilt on every state change must have
+        # been re-synced to the logits dtype.
+        assert isinstance(bias_proc, RBLNLogitBiasLogitsProcessor)
+        assert bias_proc.bias_tensor.dtype == dtype
+    else:
+        # The fallback path must keep the builtin float32 processor: the
+        # default vLLM sampler upcasts logits to float32 before apply.
+        assert not isinstance(bias_proc, RBLNLogitBiasLogitsProcessor)
+        assert bias_proc.bias_tensor.dtype == torch.float32
 
 
+@pytest.mark.parametrize(
+    "use_rbln_sampler", ["1", "0"], ids=["rbln_sampler", "vllm_sampler"]
+)
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
-def test_forward_min_p_masks_low_probability_tokens(monkeypatch, dtype):
+def test_forward_min_p_masks_low_probability_tokens(
+    monkeypatch, dtype, use_rbln_sampler
+):
     """min_p must mask every token whose probability is below
     min_p * max_prob, leaving only the top token sampleable.
 
-    The bfloat16 case is a regression test for a dtype mismatch: the RBLN
-    sampler keeps logits in the model dtype (no float32 upcast), while the
-    builtin MinPLogitsProcessor re-slices min_p from a float32 buffer on
-    state changes. RBLNMinPLogitsProcessor must re-sync the min_p tensor to
-    the model dtype so the in-place mul_ into model-dtype probabilities
-    never mixes dtypes.
+    The bfloat16 case with the RBLN sampler is a regression test for a
+    dtype mismatch: the RBLN sampler keeps logits in the model dtype (no
+    float32 upcast), while the builtin MinPLogitsProcessor re-slices min_p
+    from a float32 buffer on state changes. RBLNMinPLogitsProcessor must
+    re-sync the min_p tensor to the incoming logits dtype so the in-place
+    mul_ into model-dtype probabilities never mixes dtypes. The
+    VLLM_RBLN_SAMPLER=0 case covers the fallback path, where the default
+    vLLM sampler upcasts logits to float32 and must keep the builtin
+    float32 processor.
     """
-    monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1")
+    monkeypatch.setenv("VLLM_RBLN_SAMPLER", use_rbln_sampler)
     monkeypatch.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
     monkeypatch.setenv("VLLM_RBLN_ENABLE_WARM_UP", "False")
 
@@ -426,14 +458,21 @@ def test_forward_min_p_masks_low_probability_tokens(monkeypatch, dtype):
 
     assert sampled == [top_token_id] * (num_decodes + 1)
 
-    # The min_p slice refreshed from the float32 buffer on state changes
-    # must have been re-synced to the model dtype.
     min_p_proc = next(
         p
         for p in runner.input_batch.logitsprocs.all
         if isinstance(p, MinPLogitsProcessor)
     )
-    assert min_p_proc.min_p.dtype == dtype
+    if use_rbln_sampler == "1":
+        # The min_p slice refreshed from the float32 buffer on state
+        # changes must have been re-synced to the logits dtype.
+        assert isinstance(min_p_proc, RBLNMinPLogitsProcessor)
+        assert min_p_proc.min_p.dtype == dtype
+    else:
+        # The fallback path must keep the builtin float32 processor: the
+        # default vLLM sampler upcasts logits to float32 before apply.
+        assert not isinstance(min_p_proc, RBLNMinPLogitsProcessor)
+        assert min_p_proc.min_p.dtype == torch.float32
 
 
 @pytest.mark.parametrize("top_p", [0.7, 1.0])
