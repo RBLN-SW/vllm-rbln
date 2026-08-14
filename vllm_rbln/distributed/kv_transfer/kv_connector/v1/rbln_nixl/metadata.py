@@ -27,28 +27,40 @@ from dataclasses import dataclass, field
 from vllm.config.utils import hash_factors
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import NixlAgentMetadata
 
-# Bump on any incompatible change to the RBLN PP metadata schema/semantics.
-# Folded into the NIXL compatibility hash so a PP-aware producer and a
-# mismatched consumer fail the handshake cleanly (both ends are RBLN).
-RBLN_NIXL_PP_VERSION: int = 1
+# Bump on any incompatible change to the RBLN metadata schema/semantics.
+# Folded into the NIXL compatibility hash so an RBLN peer speaking a different
+# schema fails the handshake cleanly (both ends are RBLN).
+#   1: pp_rank / pp_size / registered_layer_names
+#   2: + kv_areas / kv_slices (chiplet geometry, for asymmetric-TP matching)
+RBLN_NIXL_PP_VERSION: int = 2
 
 
 @dataclass
 class RblnNixlAgentMetadata(NixlAgentMetadata):
-    """``NixlAgentMetadata`` + this producer stage's PP identity and the layer
-    names it owns.
+    """``NixlAgentMetadata`` + this producer shard's PP identity, the layer
+    names it owns, and its chiplet geometry.
 
-    New fields default to the ``pp_size == 1`` (no-PP) values so a blob decoded
+    New fields default to the single-shard, single-area values so a blob decoded
     by the base/older consumer (which uses ``NixlAgentMetadata`` and ignores the
-    extra fields) degrades to single-stage behavior. A PP-aware consumer decodes
-    with this type to read them and matches ``registered_layer_names`` against
-    its own local layers to place each shard's regions.
+    extra fields) degrades to single-stage behavior. An RBLN consumer decodes
+    with this type to read them: ``registered_layer_names`` places each shard's
+    regions on the layer axis, and ``kv_areas`` / ``kv_slices`` do the same on
+    the head axis.
     """
 
     pp_rank: int = 0
     pp_size: int = 1
     # Registered KV-cache layer names, ordered as kv_caches_base_addr / block_lens.
     registered_layer_names: list[str] = field(default_factory=list)
+    # Chiplet geometry of one KV entry on this shard. kv_areas is how many
+    # physical areas each logical region expanded into; kv_slices is how many of
+    # them are DISTINCT (the rest are replicas of a KV head the compiler had to
+    # duplicate because the shard owns fewer heads than the device has
+    # chiplets). Sent rather than derived: deriving kv_areas from
+    # len(kv_caches_base_addr) assumes exactly two regions per layer, which
+    # stops being true for MLA / blocks-first layouts.
+    kv_areas: int = 1
+    kv_slices: int = 1
 
 
 def rbln_pp_compat_hash(base_hash: str) -> str:

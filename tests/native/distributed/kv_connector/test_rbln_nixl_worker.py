@@ -68,6 +68,10 @@ def _build_worker(
         # The real NixlPullConnectorWorker.__init__ sets this to None;
         # register_kv_caches reads it after super().register_kv_caches().
         self.xfer_handshake_metadata = None
+        # add_remote_agent asks for tp_ratio before deciding whether upstream's
+        # positional pairing applies; 1 keeps these cases homogeneous.
+        self.transfer_topo = MagicMock()
+        self.transfer_topo.tp_ratio.return_value = 1
 
     monkeypatch.setattr(NixlConnectorWorker, "__init__", fake_super_init)
 
