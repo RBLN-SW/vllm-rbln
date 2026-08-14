@@ -116,11 +116,38 @@ class NearTieWarning(UserWarning):
     """A greedy pick differed but both runs rated the two tokens near-equal."""
 
 
+# The stricter bound: only the step's leading pair may swap, and each run must
+# rate them within this many nats.
+#
+# The floor is the arithmetic's own resolution, not the true gap: what is
+# compared is each run's *estimate* of one gap, and a bf16 logprob near -4 lands
+# on a grid of 2**2 * 2**-7 = 0.03125 nats. Two runs of the same math routinely
+# report estimates a couple of steps apart -- the eagle e2e divergence has one
+# run at 0.0 (a literal tie, broken by token id) and the other at 0.0625, around
+# a true gap of 0.0243 measured in fp32. Anything below ~0.0625 asks for an
+# agreement the representation cannot express. 0.125 is four steps at that
+# magnitude and ~13% in probability, still far inside check_logprobs_close's
+# 0.5 nats (a 65% difference).
+ALMOST_EQUAL_MAX_LOGPROB_GAP = 0.125
+ALMOST_EQUAL_MAX_RANK = 2
+
+
 def _tie_gap(topk: dict[int, float], *, own: int, other: int) -> float | None:
     """``logprob(own) - logprob(other)`` within one run's top-k; None if absent."""
     if own not in topk or other not in topk:
         return None
     return topk[own] - topk[other]
+
+
+def _rank(topk: dict[int, float], token: int) -> int | None:
+    """0-based position of ``token`` among the step's candidates ordered by
+    logprob; None if the step did not report it. The run's own greedy pick is
+    rank 0, so the other run's pick is rank 1 when they are the leading pair."""
+    if token not in topk:
+        return None
+    # Break ties deterministically (PyTorch argmax returns the first max index).
+    ordered = sorted(topk.items(), key=lambda kv: (-kv[1], kv[0]))
+    return next((i for i, (tid, _) in enumerate(ordered) if tid == token), None)
 
 
 def check_logprobs_close(
@@ -130,10 +157,13 @@ def check_logprobs_close(
     name_0: str,
     name_1: str,
     max_logprob_gap: float = NEAR_TIE_MAX_LOGPROB_GAP,
+    max_rank: int | None = None,
 ) -> None:
     """Assert two runs agree, tolerating only genuine near-tie flips: at the
     first differing token each run must rank the other's pick within its top-k
-    and within ``max_logprob_gap`` nats (else fail). Stops at first divergence."""
+    and within ``max_logprob_gap`` nats (else fail). ``max_rank`` additionally
+    caps where the other's pick may sit in this run's ordering. Stops at first
+    divergence."""
     assert len(outputs_0_lst) == len(outputs_1_lst)
     for i, ((ids_0, _, lps_0), (ids_1, _, lps_1)) in enumerate(
         zip(outputs_0_lst, outputs_1_lst)
@@ -150,6 +180,17 @@ def check_logprobs_close(
                     f"picked {t_1}; not a near-tie (gap {name_0}={gap_0}, "
                     f"{name_1}={gap_1} nats, threshold {max_logprob_gap})"
                 )
+            if max_rank is not None:
+                # Both are reported -- the gap check above needs them present --
+                # but a step that omitted one is outside the leading pair too.
+                rank_0 = _rank(lps_0[pos], t_1)
+                rank_1 = _rank(lps_1[pos], t_0)
+                if rank_0 is None or rank_1 is None or max(rank_0, rank_1) >= max_rank:
+                    raise AssertionError(
+                        f"prompt {i} token {pos}: {name_0} picked {t_0}, {name_1} "
+                        f"picked {t_1}; the other's pick ranks {name_0}={rank_0}, "
+                        f"{name_1}={rank_1}, outside the leading {max_rank}"
+                    )
             warnings.warn(
                 f"prompt {i} token {pos}: near-tie flip -- {name_0} picked {t_0}, "
                 f"{name_1} picked {t_1} (gap {max(gap_0, gap_1):.3f} nats)",
@@ -157,6 +198,28 @@ def check_logprobs_close(
                 stacklevel=2,
             )
             break
+
+
+def check_outputs_almost_equal(
+    *,
+    outputs_0_lst: list[TokensTextLogprobs],
+    outputs_1_lst: list[TokensTextLogprobs],
+    name_0: str,
+    name_1: str,
+) -> None:
+    """check_outputs_equal, minus the flips no arithmetic could avoid: a
+    divergence survives only when the two picks are the step's leading pair and
+    their probabilities agree to ~13%. Anything a real disagreement would produce
+    -- a pick further down the ordering, or a visible probability difference --
+    still fails."""
+    check_logprobs_close(
+        outputs_0_lst=outputs_0_lst,
+        outputs_1_lst=outputs_1_lst,
+        name_0=name_0,
+        name_1=name_1,
+        max_logprob_gap=ALMOST_EQUAL_MAX_LOGPROB_GAP,
+        max_rank=ALMOST_EQUAL_MAX_RANK,
+    )
 
 
 # The driver exposes one node per NPU.
@@ -208,6 +271,10 @@ _SPAWN_CHILD_ENV = "VLLM_RBLN_TEST_SPAWN_CHILD"
 # Path the module-batch child writes per-test outcomes to (one JSON obj/line),
 # so the parent can attribute results back to each test of the single spawn.
 _SPAWN_RESULTS_ENV = "VLLM_RBLN_TEST_SPAWN_RESULTS"
+# Set by the parent's conftest when --num-hidden-layers was left off, so a spec
+# may pin its own count. It rides in the env because the child is handed the
+# resolved value and so cannot tell the option was absent.
+LAYERS_PINNABLE_ENV = "VLLM_RBLN_TEST_LAYERS_PINNABLE"
 
 
 def _format_subprocess_exit(returncode: int) -> str:
@@ -448,6 +515,7 @@ def start_module_in_spawned_process(
     nodeid_prefix: str = "",
     device_tensor: str | None,
     model_compile: bool,
+    num_hidden_layers: int,
     tb_style: str | None = None,
     maxfail: int = 0,
     stream_output: bool = False,
@@ -464,9 +532,10 @@ def start_module_in_spawned_process(
     -m/-k/--deselect mean what they say: handing over the file would run the
     deselected tests too (on the NPU, invisibly), and would re-run any unmarked
     test of a mixed file that the parent is already running in-process.
-    --device-tensor / --model-compile are forwarded so the child's skip/run
-    decisions match the parent's, and --tb / --maxfail so the reports it builds
-    are rendered and cut off the way the parent was asked to.
+    --device-tensor / --model-compile / --num-hidden-layers are forwarded so the
+    child's skip/run decisions and engine config match the parent's, and --tb /
+    --maxfail so the reports it builds are rendered and cut off the way the
+    parent was asked to.
 
     The child's raw stream is redirected to a log file rather than inherited.
     Inheriting it would put the WHOLE file's output -- every EngineCore
@@ -504,6 +573,8 @@ def start_module_in_spawned_process(
         args += ["--device-tensor", device_tensor]
     if model_compile:
         args.append("--model-compile")
+    # A flag, not env: the child scrubs every VLLM_RBLN_* it inherits.
+    args += ["--num-hidden-layers", str(num_hidden_layers)]
     if tb_style:
         args.append(f"--tb={tb_style}")
     if maxfail:
