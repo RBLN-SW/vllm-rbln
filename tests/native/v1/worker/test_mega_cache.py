@@ -200,16 +200,14 @@ class TestSignatureVllmConfig:
         ids=["max_num_seqs", "num_gpu_blocks_override", "gpu_memory_utilization"],
     )
     def test_warmup_graph_set_config_invalidates(self, overrides):
-        # compute_hash() drops all three, but each moves a warm-up graph shape
-        # (decode batch / KV num_blocks) — sharing a bundle across them makes the
-        # graphs only partly hit, which costs a duplicate weight set on device.
+        # compute_hash() drops all three, but each moves a warm-up graph shape,
+        # and a partly-hitting bundle costs a duplicate weight set on device.
         base = mega_cache.config_signature(make_vllm_config())
         assert mega_cache.config_signature(make_vllm_config(**overrides)) != base
 
     def test_speculative_tokens_invalidate(self):
-        # num_spec_tokens sets the decode query_len the warm-up compiles
-        # (rbln_model_runner.py:2951), and compute_hash() does not separate it:
-        # SpeculativeConfig keys only on the eagle3 aux-hidden-states factors.
+        # num_spec_tokens sets the decode query_len the warm-up compiles, and
+        # SpeculativeConfig.compute_hash() keys only on the eagle3 factors.
         spec = {
             "method": "ngram",
             "num_speculative_tokens": 3,
@@ -223,8 +221,7 @@ class TestSignatureVllmConfig:
         assert mega_cache.config_signature(other) != base
 
     def test_npu_name_invalidates(self, monkeypatch):
-        # The per-graph hash stamps meta=npu:..., so an ATOM and a REBEL run must
-        # not land on one bundle file either.
+        # The per-graph hash stamps meta=npu:...; the bundle file must split too.
         import rebel
 
         monkeypatch.setattr(rebel, "get_npu_name", lambda device_id=0: None)
@@ -234,8 +231,7 @@ class TestSignatureVllmConfig:
         assert mega_cache.config_signature(make_vllm_config()) != atom
 
     def test_every_factor_is_a_real_field(self):
-        # The factors are read with a getattr default, so an upstream rename
-        # would drop an axis from the key instead of failing.
+        # A getattr default would drop an axis from the key on an upstream rename.
         config = make_vllm_config()
         assert hasattr(config.scheduler_config, "max_num_seqs")
         for name in ("num_gpu_blocks_override", "gpu_memory_utilization"):

@@ -66,12 +66,7 @@ def _compile_env_factors() -> str:
 
 
 def _npu_name() -> str:
-    """Target NPU name, resolved the way the per-graph hash resolves it.
-
-    `filename_hash` stamps `meta=npu:...`, so the graphs are already keyed on the
-    architecture; keying the bundle the same way just stops an ATOM and a REBEL
-    run from sharing one file.
-    """
+    """Target NPU name, from the source the per-graph `meta=npu:...` hash uses."""
     try:
         from vllm_rbln.platform import RblnPlatform
 
@@ -83,21 +78,15 @@ def _npu_name() -> str:
 def _warmup_graph_set_factors(vllm_config) -> str:
     """Hash of the graph-shaping config that compute_hash() leaves out.
 
-    `max_num_seqs` shapes the decode buckets, the KV-block knobs shape the KV
-    cache input, and the speculative fields shape the decode query length and
-    which drafter graphs exist (`SpeculativeConfig.compute_hash()` keys only on
-    the eagle3 aux-hidden-states factors). All are excluded upstream, so without
-    them two runs share a bundle that only partly hits.
+    Decode buckets, KV cache input, decode query length, which drafter graphs
+    exist. Without them two runs share a bundle that only partly hits.
     """
     from vllm.config.utils import hash_factors, normalize_value
 
     scheduler = getattr(vllm_config, "scheduler_config", None)
     cache = getattr(vllm_config, "cache_config", None)
     spec = getattr(vllm_config, "speculative_config", None)
-    # draft_model_config, not draft_parallel_config: the latter carries the same
-    # per-launch ports. draft_tensor_parallel_size does not reach the rbln compile
-    # path today (the drafter compiles with VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK),
-    # but upstream builds the draft model with it and nothing else here covers it.
+    # Not draft_parallel_config: it carries the same per-launch ports.
     draft = getattr(spec, "draft_model_config", None)
     factors: dict[str, object] = {
         "max_num_seqs": normalize_value(getattr(scheduler, "max_num_seqs", None)),
