@@ -106,6 +106,15 @@ class RBLNPageLayoutKVCacheManager(KVCacheManager):
         # computed + just-matched pages have content; the rest gets written
         cached_tokens = request.num_computed_tokens + num_new_computed_tokens
 
+        # Kernel blocks are the scarcer resource: a request pins whole blocks
+        # while filling only part of their page capacity, so they run out while
+        # the page pool still looks free. Gate on them here, before upstream
+        # commits page ids, so exhaustion becomes a scheduling outcome upstream
+        # can act on -- preempt and retry -- instead of an exception out of
+        # `bind` that has nowhere to go.
+        if not self._have_kernel_blocks_for(request, cached_tokens + num_new_tokens):
+            return None
+
         result = super().allocate_slots(
             request,
             num_new_tokens,
@@ -119,6 +128,25 @@ class RBLNPageLayoutKVCacheManager(KVCacheManager):
 
         self._bind_kernel_blocks(request, cached_tokens)
         return result
+
+    def _have_kernel_blocks_for(self, request: Request, total_tokens: int) -> bool:
+        """Can this request reach ``total_tokens`` without exhausting the pool?
+
+        Counts what it already holds, then reclaims retained blocks before
+        giving up. The reserve stays out of it: that share exists so a partial
+        match of an already-admitted request can find a copy destination, and
+        spending it on admission would deadlock exactly the case it protects.
+        """
+        pages = -(-total_tokens // self.geometry.page_size)
+        shortfall = self.geometry.num_kernel_blocks_for_pages(pages) - len(
+            self.kernel_blocks.block_table(request.request_id)
+        )
+        if shortfall <= 0:
+            return True
+        if self.kernel_blocks.allocator.can_allocate(shortfall):
+            return True
+        self._reclaim_retained(shortfall)
+        return self.kernel_blocks.allocator.can_allocate(shortfall)
 
     def _bind_kernel_blocks(self, request: Request, cached_tokens: int) -> None:
         """Back the request's pages with kernel blocks, queueing any copies."""

@@ -161,24 +161,38 @@ def kernel_block_size_from_config(vllm_config: VllmConfig) -> int | None:
 
 
 def validate_fragmentation(
-    geometry: PageLayout, max_num_seqs: int, num_kernel_blocks: int
+    geometry: PageLayout,
+    max_num_seqs: int,
+    num_kernel_blocks: int,
+    max_model_len: int | None = None,
 ) -> None:
-    """Every running request pins one partly filled kernel block."""
+    """A running request pins every kernel block it spans, not just one.
+
+    Only its last block is partly filled, but all of them are held, so demand
+    scales with request length. Sizing for one block per sequence under-counts
+    by that factor and lets a pool through that then runs out at runtime.
+    """
     if geometry.is_degenerate:
         return
-    if max_num_seqs >= num_kernel_blocks:
+    blocks_per_seq = (
+        1 if not max_model_len else -(-max_model_len // geometry.kernel_block_size)
+    )
+    peak = max_num_seqs * blocks_per_seq
+    if peak >= num_kernel_blocks:
         raise ValueError(
-            f"max_num_seqs ({max_num_seqs}) needs at least one kernel block each, but "
-            f"the pool holds only {num_kernel_blocks} kernel blocks of "
-            f"{geometry.kernel_block_size} tokens; lower max_num_seqs or raise "
-            f"the KV cache size"
+            f"max_num_seqs ({max_num_seqs}) x {blocks_per_seq} kernel blocks per "
+            f"request at max_model_len needs {peak} kernel blocks, but the pool "
+            f"holds only {num_kernel_blocks} of {geometry.kernel_block_size} "
+            f"tokens; lower max_num_seqs or max_model_len, or raise the KV cache size"
         )
-    if max_num_seqs / num_kernel_blocks > 0.5:
+    if peak / num_kernel_blocks > 0.5:
         logger.warning(
-            "Page layout: up to %d of %d kernel blocks can be pinned by "
-            "partially filled kernel blocks, one per running request.",
-            max_num_seqs,
+            "Page layout: up to %d of %d kernel blocks can be pinned at once "
+            "(%d requests x %d blocks each at max_model_len).",
+            peak,
             num_kernel_blocks,
+            max_num_seqs,
+            blocks_per_seq,
         )
 
 

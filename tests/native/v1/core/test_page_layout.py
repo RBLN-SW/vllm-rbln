@@ -243,13 +243,13 @@ class TestPageLayoutConfig:
 
     def test_fragmentation_rejects_pool_smaller_than_concurrency(self):
         geo = PageLayout(page_size=512, kernel_block_size=4096)
-        with pytest.raises(ValueError, match="at least one kernel block each"):
+        with pytest.raises(ValueError, match="kernel blocks per request"):
             validate_fragmentation(geo, max_num_seqs=8, num_kernel_blocks=8)
 
     def test_fragmentation_warns_when_most_of_the_pool_can_be_pinned(self, caplog):
         geo = PageLayout(page_size=512, kernel_block_size=4096)
         validate_fragmentation(geo, max_num_seqs=7, num_kernel_blocks=10)
-        assert "pinned by partially filled kernel blocks" in caplog.text
+        assert "kernel blocks can be pinned at once" in caplog.text
 
     def test_fragmentation_is_silent_when_degenerate(self):
         geo = PageLayout(page_size=512, kernel_block_size=512)

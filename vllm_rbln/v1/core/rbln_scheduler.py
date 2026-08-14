@@ -212,6 +212,7 @@ class RBLNScheduler(Scheduler):
             page_layout_config.geometry,
             self.scheduler_config.max_num_seqs,
             page_layout_config.num_kernel_blocks,
+            self.max_model_len,
         )
 
         hash_fn = get_hash_fn_by_name(self.cache_config.prefix_caching_hash_algo)
