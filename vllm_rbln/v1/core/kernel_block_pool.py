@@ -14,6 +14,11 @@
 
 """A block pool that hands out pages in kernel-block-aligned runs.
 
+NOT YET WIRED IN. It implements identity mapping, which is exclusive with the
+copy-on-write the current manager relies on -- see "The allocator fork" in
+docs/page_layout_kv_manager.md. Wiring it requires relaxing the worker's
+positional addressing (slot derived from page index) first.
+
 Page layout needs two things upstream's pool does not provide: a request's
 pages must land contiguously inside one kernel block (I3), and the capacity
 that gates admission must be the kernel block, because that is what runs out

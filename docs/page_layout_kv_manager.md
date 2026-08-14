@@ -404,6 +404,40 @@ matched prefix every turn while adoption copies nothing. Conversations longer
 than one kernel block would share full blocks by reference in both designs and
 narrow the gap; this is the favourable end of the range, not the average one.
 
+### The allocator fork: identity mapping vs. copy-on-write
+
+`KernelBlockPool` (`vllm_rbln/v1/core/kernel_block_pool.py`) subclasses
+upstream's `BlockPool` and hands out pages in kernel-block-aligned runs, so a
+page id encodes its own location (`kernel_block = id // ppe`,
+`slot = id % ppe`) and `get_num_free_blocks` -- the value `KVCacheManager`
+consults before admitting work -- counts only what whole kernel blocks can
+back. It was written to remove the two-allocator split behind the defect below.
+
+**It cannot be wired into the current manager as-is, and the reason is worth
+recording.** The worker addresses KV positionally: its block table holds kernel
+block ids and a token at page index `i` is read from
+`block_table[i // ppe]`, slot `i % ppe`. So every page of one `i // ppe` group
+must live in the *same* kernel block. That forces the two designs apart:
+
+- **Identity mapping (the pool).** A page id names its own storage, so nothing
+  may move. When a prefix match ends mid-group, the request's remaining pages of
+  that group would have to be written into the producer's block, which I4
+  forbids while the producer is live. Copy-on-write is the only way out, and CoW
+  moves bytes to a block the page id does not name -- contradicting identity.
+- **Explicit mapping (today).** `KernelBlockTable` maps page -> (block, slot)
+  independently of the page id, so CoW can place the matched pages at their
+  correct slots in a private block. This is what runs now, and why every partial
+  match costs a copy.
+
+They are exclusive. Identity mapping deletes the mapping layer *and* the copy,
+but only if the positional contract with the worker is relaxed -- for instance
+by sending a per-page slot table rather than deriving the slot from the index.
+That is a worker-side change, not a scheduler-side one.
+
+Until that is decided, admission is gated per request in
+`_have_kernel_blocks_for` rather than by the pool, and `KernelBlockPool` is
+landed but unused.
+
 ### Defect found 2026-08-14: `OutOfKernelBlocks` kills the engine
 
 A controlled multi-turn suite with conversations long enough to span two kernel
