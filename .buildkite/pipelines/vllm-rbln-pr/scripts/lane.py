@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""What the perf and accuracy drivers both need: which chip and how many devices
+"""What the perf and lm-eval drivers both need: which chip and how many devices
 this host has, how a target's env and flags become a command, and how to run one
 with its output kept."""
 

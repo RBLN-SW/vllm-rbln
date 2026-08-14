@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Accuracy. lm-eval comes from an overlay rather than the locked environment: it
+# lm-eval comes from an overlay rather than the locked environment: it
 # is only needed here, and pinning it keeps a score comparable across runs, since
 # the harness version decides the prompt and the filters.
 
@@ -9,20 +9,20 @@ source "${_here}/../common.sh"
 require_env HF_TOKEN
 
 sync_env
-section ":dart: accuracy"
+section ":dart: lm-eval"
 
 run_id="$(date +%Y%m%d_%H%M%S)"
 # The driver reads this, so where results land has one source. Defaulted here
 # rather than there because only this side knows where the caller was.
-export ACCURACY_OUTPUT_DIR="${ACCURACY_OUTPUT_DIR:-${LANE_PWD}/accuracy-results}"
-out="${ACCURACY_OUTPUT_DIR}"
+export LM_EVAL_OUTPUT_DIR="${LM_EVAL_OUTPUT_DIR:-${LANE_PWD}/lm-eval-results}"
+out="${LM_EVAL_OUTPUT_DIR}"
 
 # Arguments are target names. A flag would otherwise become one and write a
 # directory named after it.
 for arg in "$@"; do
   case "$arg" in
     -*)
-      echo "$arg: arguments are target names; set the output with ACCURACY_OUTPUT_DIR" >&2
+      echo "$arg: arguments are target names; set the output with LM_EVAL_OUTPUT_DIR" >&2
       exit 2
       ;;
   esac
@@ -50,10 +50,10 @@ status=0
 for target in "${targets[@]}"; do
   log_dir="${out}/${run_id}/${target}"
   mkdir -p "${log_dir}"
-  log="${log_dir}/accuracy.log"
+  log="${log_dir}/lm-eval.log"
   echo "  ${target} -> ${log}"
 
-  uv run --no-sync --with "lm_eval[api]==0.4.12" python "${_here}/run_accuracy.py" \
+  uv run --no-sync --with "lm_eval[api]==0.4.12" python "${_here}/run_lm_eval.py" \
     --run-id "${run_id}" "${target}" 2>&1 | log_to "${log}" ||
     {
       echo "  ${target} failed; see ${log}" >&2

@@ -245,7 +245,7 @@ def main() -> int:
     if not paths:
         parser.error(f"no targets under {args.targets_dir}")
 
-    out_dir = output_dir("ACCURACY_OUTPUT_DIR", "accuracy-results")
+    out_dir = output_dir("LM_EVAL_OUTPUT_DIR", "lm-eval-results")
     return max(run_target(p, out_dir, args.run_id) for p in paths)
 
 
