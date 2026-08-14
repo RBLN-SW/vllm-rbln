@@ -206,6 +206,33 @@ class TestSignatureVllmConfig:
         base = mega_cache.config_signature(make_vllm_config())
         assert mega_cache.config_signature(make_vllm_config(**overrides)) != base
 
+    def test_speculative_tokens_invalidate(self):
+        # num_spec_tokens sets the decode query_len the warm-up compiles
+        # (rbln_model_runner.py:2951), and compute_hash() does not separate it:
+        # SpeculativeConfig keys only on the eagle3 aux-hidden-states factors.
+        spec = {
+            "method": "ngram",
+            "num_speculative_tokens": 3,
+            "prompt_lookup_max": 5,
+            "prompt_lookup_min": 2,
+        }
+        base = mega_cache.config_signature(make_vllm_config(speculative_config=spec))
+        other = make_vllm_config(
+            speculative_config={**spec, "num_speculative_tokens": 5}
+        )
+        assert mega_cache.config_signature(other) != base
+
+    def test_npu_name_invalidates(self, monkeypatch):
+        # The per-graph hash stamps meta=npu:..., so an ATOM and a REBEL run must
+        # not land on one bundle file either.
+        import rebel
+
+        monkeypatch.setattr(rebel, "get_npu_name", lambda device_id=0: None)
+        monkeypatch.setenv("RBLN_FORCE_NPU_NAME", "RBLN-CA25")
+        atom = mega_cache.config_signature(make_vllm_config())
+        monkeypatch.setenv("RBLN_FORCE_NPU_NAME", "RBLN-CR13")
+        assert mega_cache.config_signature(make_vllm_config()) != atom
+
     def test_every_factor_is_a_real_field(self):
         # The factors are read with a getattr default, so an upstream rename
         # would drop an axis from the key instead of failing.
@@ -213,6 +240,17 @@ class TestSignatureVllmConfig:
         assert hasattr(config.scheduler_config, "max_num_seqs")
         for name in ("num_gpu_blocks_override", "gpu_memory_utilization"):
             assert hasattr(config.cache_config, name), name
+
+        spec = make_vllm_config(
+            speculative_config={
+                "method": "ngram",
+                "num_speculative_tokens": 3,
+                "prompt_lookup_max": 5,
+                "prompt_lookup_min": 2,
+            }
+        ).speculative_config
+        for name in ("num_speculative_tokens", "method", "draft_tensor_parallel_size"):
+            assert hasattr(spec, name), name
 
     def test_every_port_field_is_swept(self):
         # Ports are auto-queried per launch; one reaching the hash moves the
