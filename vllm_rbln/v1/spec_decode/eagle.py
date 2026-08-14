@@ -77,16 +77,9 @@ class RBLNEagleProposer(EagleProposer):
         mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         num_rejected_tokens: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if self.method == "eagle3":
-            assert isinstance(
-                self.model, (Eagle3LlamaForCausalLM, Eagle3DeepseekV2ForCausalLM)
-            )
-            # Eager. Only cheap with TORCH_RBLN_DEPLOY=ON, which turns off the
-            # per-op NaN/Inf scan that would walk this weight on every call.
-            target_hidden_states = self.model.combine_hidden_states(
-                target_hidden_states
-            )
-            assert target_hidden_states.shape[-1] == self.hidden_size
+        # NOTE(RBLN): combine_hidden_states in eagle3 is fused
+        # into the target model graph.
+        assert target_hidden_states.shape[-1] == self.hidden_size
 
         num_tokens, token_indices_to_sample = self.set_inputs_first_pass(
             target_token_ids=target_token_ids,

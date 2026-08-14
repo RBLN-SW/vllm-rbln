@@ -23,7 +23,6 @@ from unittest import mock
 import numpy as np
 import pytest
 import torch
-from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 
 import vllm_rbln.v1.spec_decode.eagle as eagle_module
 from tests.native.v1.spec_decode.utils import make_cad, make_eagle_proposer
@@ -90,11 +89,13 @@ def _echo_model_exec(hidden_size):
     return executable
 
 
-def _call_propose(proposer):
+def _call_propose(proposer, target_hidden_states=None):
     return proposer.propose(
         target_token_ids=torch.arange(4, dtype=torch.int32),
         target_positions=torch.arange(4, dtype=torch.int64),
-        target_hidden_states=torch.zeros(4, proposer.hidden_size),
+        target_hidden_states=torch.zeros(4, proposer.hidden_size)
+        if target_hidden_states is None
+        else target_hidden_states,
         next_token_ids=torch.tensor([30, 31], dtype=torch.int32),
         token_indices_to_sample=torch.tensor([1, 3], dtype=torch.int32),
         common_attn_metadata=make_cad([0, 2, 4], [10, 11]),
@@ -395,23 +396,14 @@ class TestPropose:
         assert out.shape == (1, 2)
         assert torch.equal(out.cpu()[:, 1:], out.cpu()[:, :-1] + 1)
 
-    def test_eagle3_rejects_wrong_combined_hidden_size(self, monkeypatch):
-        # eagle3 combines the target hidden states first and asserts the width;
-        # a mismatch fails before any draft pass.
+    def test_eagle3_rejects_uncombined_hidden_states(self, monkeypatch):
+        # eagle3's combine_hidden_states now runs in the target graph, so propose
+        # is handed already-combined states; raw aux-width ones must not pass.
         _neutralize(monkeypatch)
         proposer = make_eagle_proposer(method="eagle3", num_speculative_tokens=1)
         _wire_runner(proposer, num_reqs=2)
-
-        class _FakeEagle3(Eagle3LlamaForCausalLM):
-            def __init__(self, combined):
-                self.combined = combined
-
-            def combine_hidden_states(self, target_hidden_states):
-                return self.combined
-
-        proposer.model = _FakeEagle3(torch.zeros((4, proposer.hidden_size + 1)))
         with pytest.raises(AssertionError):
-            _call_propose(proposer)
+            _call_propose(proposer, torch.zeros(4, proposer.hidden_size * 3))
 
 
 class TestLoadModel:

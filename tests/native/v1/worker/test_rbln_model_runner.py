@@ -210,7 +210,7 @@ class TestExecuteModelState:
             "spec_decode_common_attn_metadata",
             "hidden_states",
             "sample_hidden_states",
-            "aux_hidden_states",
+            "combined_hidden_states",
         )
 
     def test_is_named_tuple(self):
