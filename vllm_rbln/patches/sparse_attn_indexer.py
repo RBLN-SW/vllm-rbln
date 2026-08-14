@@ -23,6 +23,7 @@ from vllm_rbln.patches.models_utils import (
 )
 from vllm_rbln.v1.attention.backends.mla.indexer import (
     RBLNDeepseekV32IndexerBackend,
+    RBLNDeepseekV32IndexerScaleBackend,
 )
 
 logger = init_logger(__name__)
@@ -43,16 +44,38 @@ def rbln_indexer_cache_init(self, *args, **kwargs) -> None:
 
     vllm_config = get_current_vllm_config()
     self.head_dim = vllm_config.model_config.hf_text_config.index_head_dim
-    self.dtype = torch.bfloat16
+    cache_dtype = vllm_config.cache_config.cache_dtype
+    self.is_fp8_cache = bool(cache_dtype) and cache_dtype.startswith("fp8")
+    self.dtype = torch.float8_e4m3fn if self.is_fp8_cache else torch.bfloat16
 
     model_config = vllm_config.model_config
     num_attn_module = rbln_num_attn_module(model_config)
-    self.layer_index = rbln_extract_layer_index(self.prefix, num_attn_module)
+    start = 0
     if model_config is not None:
         start, _end = model_config.get_layers_start_end_indices(
             vllm_config.parallel_config
         )
-        self.layer_index -= start * num_attn_module
+    self.layer_index = (
+        rbln_extract_layer_index(self.prefix, num_attn_module) - start * num_attn_module
+    )
+
+    # register fp16 scale cache (2-cache spec).
+    self.scale_cache = None
+    if self.is_fp8_cache:
+        scale = DeepseekV32IndexerCache.__new__(DeepseekV32IndexerCache)
+        _original_indexer_cache_init(
+            scale,
+            head_dim=1,
+            dtype=torch.float16,
+            prefix=f"{self.prefix}.scale_cache",
+            cache_config=self.cache_config,
+        )
+        scale.get_attn_backend = lambda: RBLNDeepseekV32IndexerScaleBackend
+        scale.layer_index = (
+            rbln_extract_layer_index(scale.prefix, num_attn_module)
+            - start * num_attn_module
+        )
+        self.scale_cache = scale
 
 
 @register_patch(
@@ -109,6 +132,12 @@ def rbln_indexer_forward(
         attn_metadata = attn_metadata[self.k_cache.prefix]
     k_cache = _resolve_kv_cache(attn_metadata, self.k_cache.layer_index)
 
+    scale_cache = None
+    if getattr(self.k_cache, "scale_cache", None) is not None:
+        scale_cache = _resolve_kv_cache(
+            attn_metadata, self.k_cache.scale_cache.layer_index
+        ).squeeze(-1)  # [num_block, ps, 1] -> [num_block, ps]
+
     weights = weights.contiguous()  # [B, T, n_head]
     softmax_scale = torch.tensor(
         self.softmax_scale, dtype=torch.float32, device=q_indexer.device
@@ -122,5 +151,6 @@ def rbln_indexer_forward(
         attn_metadata.seq_lens,
         attn_metadata.block_tables,
         self.topk_tokens,
+        scale_cache,
     )
     return topk_index

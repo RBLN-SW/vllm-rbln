@@ -60,6 +60,15 @@ def _rbln_indexer_forward(
         attn_metadata = attn_metadata[self.k_cache.prefix]
     k_cache = _resolve_kv_cache(attn_metadata, self.k_cache.layer_index)
 
+    # fp8 indexer cache is a 2-cache spec: fp8_e4m3 values here plus a companion
+    # fp16 per-position scale cache. Registered by the DeepseekV32IndexerCache
+    # patch only when --kv-cache-dtype is fp8*, so this stays None on the bf16 path.
+    scale_cache = None
+    if getattr(self.k_cache, "scale_cache", None) is not None:
+        scale_cache = _resolve_kv_cache(
+            attn_metadata, self.k_cache.scale_cache.layer_index
+        ).squeeze(-1)  # [num_block, ps, 1] -> [num_block, ps]
+
     softmax_scale = torch.tensor(
         self.softmax_scale, dtype=torch.float32, device=q_indexer.device
     )
@@ -72,6 +81,7 @@ def _rbln_indexer_forward(
         attn_metadata.seq_lens,
         attn_metadata.block_tables,
         self.topk_tokens,
+        scale_cache,
     )
 
 

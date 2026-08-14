@@ -29,6 +29,7 @@ from vllm_rbln.patches.attention import (
 
 mla_attention_original_init = MLAAttention.__init__
 mla_attention_original_process_weights = MLAAttention.process_weights_after_loading
+mla_attention_original_get_kv_cache_spec = MLAAttention.get_kv_cache_spec
 
 
 class _RBLNNoOpMLAPrefillBackend:
@@ -53,6 +54,37 @@ class _RBLNNoOpMLAPrefillBackend:
 )
 def patched_get_mla_prefill_backend(vllm_config) -> type[_RBLNNoOpMLAPrefillBackend]:
     return _RBLNNoOpMLAPrefillBackend
+
+
+@register_patch(
+    target=(
+        "vllm.model_executor.layers.attention.mla_attention."
+        "MLAAttention.get_kv_cache_spec"
+    ),
+    reason=(
+        "fp8 DSA MLA stores the latent cache as an RBLN-packed 768-byte int8 row "
+        "(512 fp8 kv_c + fp16 scale + k_pe), quantized/packed in-kernel by the "
+        "sparse_attn_deepseek_mla fp8 kernel. The compiler routes fp8 vs bf16 by "
+        "the cache channel width (768 != 576), so allocate head_size=768 int8. "
+        "cache_dtype_str stays 'auto' so the page size is the plain "
+        "head_size*itemsize (768B), not the upstream fp8_ds_mla 656B layout."
+    ),
+)
+def patched_mla_get_kv_cache_spec(self: MLAAttention, vllm_config):
+    cache_dtype = vllm_config.cache_config.cache_dtype
+    if cache_dtype and cache_dtype.startswith("fp8"):
+        from vllm.v1.kv_cache_interface import MLAAttentionSpec
+
+        return MLAAttentionSpec(
+            block_size=vllm_config.cache_config.block_size,
+            num_kv_heads=1,
+            # TODO(KBLEE): check hardcoded
+            # 512 (fp8 kv_c) + 128 (fp16 scale, 64 x 2B) + 128 (k_pe, 64 bf16 x 2B)
+            head_size=768,
+            dtype=torch.int8,
+            cache_dtype_str="auto",
+        )
+    return mla_attention_original_get_kv_cache_spec(self, vllm_config)
 
 
 @register_patch(

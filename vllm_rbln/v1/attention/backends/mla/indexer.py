@@ -20,8 +20,10 @@ logger = init_logger(__name__)
 
 
 class RBLNDeepseekV32IndexerBackend(AttentionBackend):
-    # TODO(kblee): check no quant, so bf16
-    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
+    supported_dtypes: ClassVar[list[torch.dtype]] = [
+        torch.bfloat16,
+        torch.float8_e4m3fn,
+    ]
     accept_output_buffer: bool = False
 
     @staticmethod
@@ -60,3 +62,15 @@ class RBLNDeepseekV32IndexerBackend(AttentionBackend):
         if include_num_layers_dimension:
             return (0, 1, 2, 3)
         return (0, 1, 2)
+
+
+class RBLNDeepseekV32IndexerScaleBackend(RBLNDeepseekV32IndexerBackend):
+    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16]
+
+    @staticmethod
+    def get_name() -> str:
+        return "RBLN_DEEPSEEK_V32_INDEXER_SCALE"
+
+    @classmethod
+    def get_supported_head_sizes(cls) -> list[int]:
+        return [1]
