@@ -251,38 +251,6 @@ class RblnPlatform(Platform):
         parallel_config = vllm_config.parallel_config
         scheduler_config = vllm_config.scheduler_config
 
-        # async_scheduling is set by vLLM's --async-scheduling flag and is not
-        # overridden here: VllmConfig has already resolved an unset value by the
-        # time this hook runs, so "asked for async" and "said nothing" are
-        # indistinguishable from here.
-        for removed in ("VLLM_RBLN_ASYNC_SCHED", "VLLM_RBLN_DISABLE_ASYNC"):
-            if os.environ.get(removed) is not None:
-                logger.warning_once(
-                    "%s has been removed and is ignored. Async scheduling "
-                    "follows vLLM's --async-scheduling / --no-async-scheduling.",
-                    removed,
-                )
-
-        # Two device-side pieces carry async scheduling's in-flight tokens, and
-        # each is switched off by its own env var. Without them async decodes
-        # from a token that was never sampled and returns wrong text with no
-        # error, so refuse the combination instead of running it:
-        #
-        # - VLLM_RBLN_USE_DEVICE_TENSOR gates the feedback scatter that replaces
-        #   the scheduler's -1 placeholders with the previous step's real tokens
-        #   (rbln_model_runner._prepare_inputs). token_ids_cpu cannot stand in:
-        #   it is written by AsyncRBLNModelRunnerOutput.get_output(), which runs
-        #   after execute_model(N+1) is already dispatched, so it is one step
-        #   stale by construction. Measured with it off: 85% of adjacent token
-        #   ids equal, and the text a third of its length.
-        # - VLLM_RBLN_SAMPLER gates RBLNSampler, whose greedy_sample keeps the
-        #   2-deep ring the output thread reads while the next step is stepping.
-        #   vLLM's Sampler has no such ring.
-        # Read both through envs, not the module-level USE_DEVICE_TENSOR: that one
-        # is frozen at import, while the runner's feedback gate reads
-        # envs.VLLM_RBLN_USE_DEVICE_TENSOR per step. A test that sets the env after
-        # import would otherwise let this gate pass while the runner still refuses
-        # the feedback -- the exact combination being excluded here.
         if scheduler_config.async_scheduling and not (
             envs.VLLM_RBLN_USE_DEVICE_TENSOR and envs.VLLM_RBLN_SAMPLER
         ):
@@ -296,14 +264,7 @@ class RblnPlatform(Platform):
             )
             scheduler_config.async_scheduling = False
 
-        # Speculative decoding is the other combination async cannot serve yet.
-        # The async bookkeeping path caches this step's tokens for the next step's
-        # feedback and asserts a single sampled column
-        # (rbln_model_runner._bookkeeping_sync), but the rejection sampler emits
-        # (batch, num_spec + 1), so the assert fires as soon as a draft is
-        # accepted. vLLM itself permits async with eagle / ngram / draft_model
-        # (see _set_default_args in vllm/config/vllm.py), so this is reachable
-        # rather than theoretical -- refuse it here instead of dying mid-decode.
+        # TODO(yskim): Support speculative decoding on RBLN under async scheduling.
         if (
             scheduler_config.async_scheduling
             and vllm_config.speculative_config is not None
