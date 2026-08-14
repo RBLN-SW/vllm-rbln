@@ -78,6 +78,7 @@ from vllm.v1.outputs import (
 from vllm.v1.sample.logits_processor import (
     LogitsProcessors,
     MoveDirectionality,
+    build_logitsprocs,
 )
 from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -339,6 +340,17 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         )
         self._init_block_sizes = [placeholder_block_size]
         self._init_kernel_block_sizes = [placeholder_block_size]
+        logitsprocs_builder = (
+            build_rbln_logitsprocs if envs.VLLM_RBLN_SAMPLER else build_logitsprocs
+        )
+
+        logitsprocs = logitsprocs_builder(
+            self.vllm_config,
+            self.device,
+            PIN_MEMORY,
+            self.is_pooling_model,
+            custom_logitsprocs,
+        )
         self.input_batch = InputBatch(
             max_num_reqs=self.max_num_reqs,
             max_model_len=self.max_model_len,
@@ -348,13 +360,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             block_sizes=[cache_config.block_size],
             kernel_block_sizes=[cache_config.block_size],
             num_spec_tokens=self.num_spec_tokens,
-            logitsprocs=build_rbln_logitsprocs(
-                self.vllm_config,
-                self.device,
-                PIN_MEMORY,
-                self.is_pooling_model,
-                custom_logitsprocs,
-            ),
+            logitsprocs=logitsprocs,
             logitsprocs_need_output_token_ids=bool(custom_logitsprocs),
             is_pooling_model=self.is_pooling_model,
             cp_kv_cache_interleave_size=parallel_config.cp_kv_cache_interleave_size,

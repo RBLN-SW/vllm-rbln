@@ -14,7 +14,7 @@
 import contextlib
 import logging
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, NamedTuple, Union, cast
 
@@ -44,7 +44,7 @@ from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.tracing import instrument
 from vllm.utils.import_utils import LazyLoader
 from vllm.utils.jsontree import json_map_leaves
-from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+from vllm.utils.torch_utils import PIN_MEMORY, kv_cache_dtype_str_to_dtype
 
 # from vllm.utils import LazyLoader, is_pin_memory_available)
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -61,6 +61,8 @@ from vllm.v1.outputs import (
     PoolerOutput,
     SamplerOutput,
 )
+from vllm.v1.sample.logits_processor import build_logitsprocs
+from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
@@ -149,7 +151,6 @@ class RBLNOptimumModelRunner(
         model_config = self.model_config
         cache_config = self.cache_config
         self.device = device
-        self.pin_memory = False
         self.dtype = self.model_config.dtype
         self.kv_cache_dtype = kv_cache_dtype_str_to_dtype(
             cache_config.cache_dtype, self.model_config
@@ -218,6 +219,21 @@ class RBLNOptimumModelRunner(
         # solution, we initialize the input batch here, and re-initialize it
         # in `initialize_kv_cache` if the block_sizes here is different from
         # the block_sizes in the kv cache config.
+        logits_processors = model_config.logits_processors
+        custom_logitsprocs: Sequence[str | type[LogitsProcessor]] = (
+            tuple(logits_processors) if logits_processors is not None else ()
+        )
+        logitsprocs_builder = (
+            build_rbln_logitsprocs if envs.VLLM_RBLN_SAMPLER else build_logitsprocs
+        )
+        logitsprocs = logitsprocs_builder(
+            self.vllm_config,
+            self.device,
+            PIN_MEMORY,
+            self.is_pooling_model,
+            custom_logitsprocs,
+        )
+
         self.input_batch = RBLNInputBatch(
             max_num_reqs=self.max_num_reqs,
             max_model_len=self.max_model_len,
@@ -227,13 +243,7 @@ class RBLNOptimumModelRunner(
             block_sizes=[cache_config.block_size],
             kernel_block_sizes=[cache_config.block_size],  # FIXME: why do we need this?
             max_num_blocks_per_req=None,
-            logitsprocs=build_rbln_logitsprocs(
-                self.vllm_config,
-                self.device,
-                self.pin_memory,
-                self.is_pooling_model,
-                self.vllm_config.model_config.logits_processors,
-            ),
+            logitsprocs=logitsprocs,
             num_spec_tokens=0,  # No spec decode in optimum model runner
             is_pooling_model=self.is_pooling_model,
             use_rbln_sampler=self.use_rbln_sampler,
