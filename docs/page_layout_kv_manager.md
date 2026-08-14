@@ -404,6 +404,56 @@ matched prefix every turn while adoption copies nothing. Conversations longer
 than one kernel block would share full blocks by reference in both designs and
 narrow the gap; this is the favourable end of the range, not the average one.
 
+### Defect found 2026-08-14: `OutOfKernelBlocks` kills the engine
+
+A controlled multi-turn suite with conversations long enough to span two kernel
+blocks (up to ~11.7k tokens, kernel block 8192) crashed MiniMax-M2.5 DP4+EP
+within seconds of starting:
+
+```
+vllm_rbln.v1.core.page_layout.OutOfKernelBlocks:
+  no kernel block available (free=0, reserved=1, urgent=True)
+  rbln_page_layout_kv_cache_manager.py:138, in _bind_kernel_blocks
+```
+
+One DP rank raised, its worker died, and the remaining ranks followed with
+`Connection closed by peer` out of the gloo all-gather. Sub-block caching ran the
+same workload at the same `--max-num-seqs 8` and the same pool without trouble.
+
+**Root cause: two allocators over one region, only one of which gates
+admission.** Upstream's block pool (432 pages) drives scheduling, admission and
+preemption. `KernelBlockAllocator` (27 kernel blocks) is a second allocator over
+the same memory that upstream cannot see. Internal fragmentation makes the two
+diverge: a request pins whole kernel blocks while occupying only part of their
+page capacity, so the kernel block pool empties long before the page pool looks
+full. Upstream keeps admitting; `bind()` then raises, and there is no
+backpressure path for that exception -- it escapes `allocate_slots` into the
+engine core and takes the worker down.
+
+Arithmetic for the failing run: 8 concurrent requests of ~11.7k tokens need
+`ceil(23/16) = 2` kernel blocks each, so 16 of 27 are pinned by live requests
+before counting retained blocks, while the page pool is only ~43% used.
+`_bind_kernel_blocks` does try `_reclaim_retained` and retry; the retry is what
+raised, so reclaim freed some blocks but not enough.
+
+**The startup guard cannot catch this.** `validate_fragmentation` models "every
+running request pins *one* partly filled kernel block" -- true only for requests
+shorter than a kernel block. Here `max_num_seqs / num_kernel_blocks = 8/27 =
+0.30` passed both its error and its warning thresholds. It needs the request
+length, i.e. `ceil(max_model_len / kernel_block_size)` blocks per sequence, not 1.
+
+Two things to fix, in order:
+
+1. **Never let allocation failure escape as an exception.** Out of kernel blocks
+   is a scheduling outcome, not an error: `allocate_slots` should return `None`
+   so upstream preempts or defers, exactly as it does when pages run out.
+2. **Make the guard model multi-block requests**, and consider reporting kernel
+   block occupancy to the scheduler so admission accounts for the unit that
+   actually runs out.
+
+Until (1) lands, page layout is unsafe for conversations that exceed one kernel
+block, which is the regime the multi-turn case is otherwise best at.
+
 ### Hybrid attention (gpt-oss-120b): what it actually needs
 
 gpt-oss-120b alternates `sliding_attention` (window **128**) with
@@ -820,21 +870,26 @@ pool (222K tokens) never evicted. Force it with `--num-gpu-blocks-override`.
    (2)'s diff carries only the semantic change. See
    [§ Relation to upstream `kernel_block_size`](#relation-to-upstream-kernel_block_size)
    for the invariant this name inverts.
-4. **O(1) `bind()`.** It rewalks every kernel block of a request each step: 0.54 us
+4. **Make `OutOfKernelBlocks` a scheduling outcome, not an exception** (see the
+   defect above). `allocate_slots` should return `None` so upstream preempts or
+   defers; today the exception escapes and kills the worker. Then teach
+   `validate_fragmentation` about multi-block requests. This blocks any
+   long-conversation use, so do it first.
+5. **O(1) `bind()`.** It rewalks every kernel block of a request each step: 0.54 us
    at 4 pages, 20.66 us at 1024. That is 0.08% of TPOT at `max_model_len`, so
    it is scaling, not a present cost. Skip sealed kernel blocks.
-5. ~~**Confirm the multi-turn result on MiniMax-M2.5.**~~ **Done 2026-08-13** --
+6. ~~**Confirm the multi-turn result on MiniMax-M2.5.**~~ **Done 2026-08-13** --
    +8.8% req/s and -8.0% TPOT against sub-block caching at the same kernel
    block, with identical match coverage (see the table above). Two follow-ups it
    raised: TTFT did not separate from noise in a single run, so repeat it or time
    `_process_kv_cache_copy_ops` per step to test whether the copy tax lands on
    co-batched decodes; and conversations never crossed one kernel block, so the
    regime where both designs share full blocks by reference is still unmeasured.
-6. **Short greedy probe on `sub-block caching @ block 8192`.** In the run above it was the
+7. **Short greedy probe on `sub-block caching @ block 8192`.** In the run above it was the
    only config whose text diverged from the other two. Probably benign (moving
    chunked-prefill boundaries), but that is the config recommended for the +18%
    throughput, so it should not go out unchecked.
-7. **Decide whether to keep this path**, given ~230 lines in the scheduler and
+8. **Decide whether to keep this path**, given ~230 lines in the scheduler and
    worker plus a second KV stack. It is no longer performance-neutral: on
    fan-out it ties, on multi-turn it wins and the gap widens with conversation
    length.
