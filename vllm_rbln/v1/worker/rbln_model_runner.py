@@ -1803,7 +1803,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # and returns, and the sampler's device ops chain on the context's
         # default stream, so ordering against the forward is the stream's job.
 
-        # TODO(RBLN): structured output bitmasks if present.
+        # Structured output: mask the logits before sampling. The grammar itself is
+        # advanced by the scheduler from the real sampled tokens in
+        # update_from_output, and under async scheduling EngineCore defers this
+        # call until that has happened for the previous step
+        # (pending_structured_output_tokens), so the bitmask is never built from a
+        # placeholder.
         if grammar_output is not None:
             # NOTE(RBLN): `xgr.apply_token_bitmask_inplace` requires logits
             # to be float32 dtype for CPU tensors
