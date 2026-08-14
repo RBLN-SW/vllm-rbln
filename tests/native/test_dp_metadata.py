@@ -47,10 +47,30 @@ def fake_dp_collective(monkeypatch):
 
     others: dict[int, int] = {}
 
-    def fake_all_reduce(tensor, group=None):
-        assert group is dp_group.cpu_group
+    def apply(tensor):
         for rank, value in others.items():
             tensor[rank] += value
+
+    class _FakeWork:
+        """A collective that has not landed until wait() is called.
+
+        Deferring the contribution is the point: the async path hands this handle
+        back and prepares inputs before waiting, so reading the payload early has
+        to show up as missing remote ranks rather than passing by accident.
+        """
+
+        def __init__(self, tensor):
+            self._tensor = tensor
+
+        def wait(self):
+            apply(self._tensor)
+
+    def fake_all_reduce(tensor, group=None, async_op=False):
+        assert group is dp_group.cpu_group
+        if async_op:
+            return _FakeWork(tensor)
+        apply(tensor)
+        return None
 
     monkeypatch.setattr(fc.dist, "all_reduce", fake_all_reduce)
 
@@ -126,20 +146,75 @@ class TestNumTokensAndReqsAcrossDP:
             )
 
 
-class TestNumTokensAcrossDP:
+class TestSelfSlotPlacement:
+    """Placement of the local rank's own contribution.
+
+    Every test above uses dp_rank=0, where placement is indistinguishable from
+    writing a constant into slot 0. These carry that coverage over from the
+    removed `num_tokens_across_dp` helper, which the packed encoding absorbed.
+    """
+
     def test_single_rank_identity(self, fake_dp_collective):
         # world_size 1: the reduce is a no-op, so only the self slot is present.
         fake_dp_collective({})
-        out = RBLNDPMetadata.num_tokens_across_dp(num_tokens=7, dp_size=1, dp_rank=0)
-        assert out.dtype == torch.int32
-        assert out.cpu().tolist() == [7]
+        tokens, _ = RBLNDPMetadata.num_tokens_and_reqs_across_dp(
+            num_tokens=7, num_reqs=7, dp_size=1, dp_rank=0, is_prefill=False
+        )
+        assert tokens.dtype == torch.int32
+        assert tokens.cpu().tolist() == [7]
 
     def test_places_self_at_own_rank_slot(self, fake_dp_collective):
         # A non-zero dp_rank proves the source writes at index dp_rank, not slot
         # 0; a slot-0 test could not tell placement from a constant.
-        fake_dp_collective({0: 11, 1: 22, 3: 33})
-        out = RBLNDPMetadata.num_tokens_across_dp(num_tokens=7, dp_size=4, dp_rank=2)
-        assert out.cpu().tolist() == [11, 22, 7, 33]
+        fake_dp_collective(
+            {
+                0: _encode(11, 1, False),
+                1: _encode(22, 2, False),
+                3: _encode(33, 3, False),
+            }
+        )
+        tokens, reqs = RBLNDPMetadata.num_tokens_and_reqs_across_dp(
+            num_tokens=7, num_reqs=7, dp_size=4, dp_rank=2, is_prefill=False
+        )
+        assert tokens.cpu().tolist() == [11, 22, 7, 33]
+        assert reqs.cpu().tolist() == [1, 2, 7, 3]
+
+
+class TestAsyncHandle:
+    def test_payload_is_only_valid_after_wait(self, fake_dp_collective):
+        """The async form must not be read before wait().
+
+        This is the whole point of splitting issue from consume: the caller runs
+        host input prep while the gloo collective is still in flight. The fake
+        collective withholds the remote ranks until wait() for that reason.
+        """
+        fake_dp_collective({r: _encode(10 * r, r, False) for r in (1, 2, 3)})
+        handle = RBLNDPMetadata.start_num_tokens_and_reqs_across_dp(
+            num_tokens=8,
+            num_reqs=8,
+            dp_size=4,
+            dp_rank=0,
+            is_prefill=False,
+            async_op=True,
+        )
+        tokens, reqs = handle.wait()
+        assert tokens.cpu().tolist() == [8, 10, 20, 30]
+        assert reqs.cpu().tolist() == [8, 1, 2, 3]
+
+    def test_wait_is_idempotent(self, fake_dp_collective):
+        # The runner may reach the consume site more than once per step; a second
+        # wait() must not re-apply the collective.
+        fake_dp_collective({1: _encode(10, 1, False)})
+        handle = RBLNDPMetadata.start_num_tokens_and_reqs_across_dp(
+            num_tokens=8,
+            num_reqs=8,
+            dp_size=2,
+            dp_rank=0,
+            is_prefill=False,
+            async_op=True,
+        )
+        first = handle.wait()[0].cpu().tolist()
+        assert handle.wait()[0].cpu().tolist() == first
 
 
 class TestMake:
