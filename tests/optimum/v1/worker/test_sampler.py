@@ -30,6 +30,15 @@ from .utils import (
 DEVICE = current_platform.device_type
 
 
+@pytest.fixture
+def rbln_sampler_env(monkeypatch):
+    """RBLN sampler on, strict compile, no warm-up — the setup every test
+    here shares unless it parametrizes one of these itself."""
+    monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1")
+    monkeypatch.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
+    monkeypatch.setenv("VLLM_RBLN_ENABLE_WARM_UP", "False")
+
+
 def set_fixed_logits(runner, favored: dict[int, float]):
     """Make every forward return the same logits: `favored` token values on a
     zero background, for every request row. Greedy sampling then picks the
@@ -55,119 +64,16 @@ def set_fixed_logits(runner, favored: dict[int, float]):
         pytest.param(16, [1, 2, 4, 8, 16], id="16_seq"),
         pytest.param(17, [1, 2, 4, 8, 16, 17], id="17_seq"),
         pytest.param(61, [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 61], id="61_seq"),
+        # Powers of two to 16, then step 8 to 256, then step 16 to 512, and
+        # a non-bucket max_num_seqs is appended as its own final bucket.
         pytest.param(
             512,
-            [
-                1,
-                2,
-                4,
-                8,
-                16,
-                24,
-                32,
-                40,
-                48,
-                56,
-                64,
-                72,
-                80,
-                88,
-                96,
-                104,
-                112,
-                120,
-                128,
-                136,
-                144,
-                152,
-                160,
-                168,
-                176,
-                184,
-                192,
-                200,
-                208,
-                216,
-                224,
-                232,
-                240,
-                248,
-                256,
-                272,
-                288,
-                304,
-                320,
-                336,
-                352,
-                368,
-                384,
-                400,
-                416,
-                432,
-                448,
-                464,
-                480,
-                496,
-                512,
-            ],
+            [1, 2, 4, 8, *range(16, 257, 8), *range(272, 513, 16)],
             id="512_seq",
         ),
         pytest.param(
             515,
-            [
-                1,
-                2,
-                4,
-                8,
-                16,
-                24,
-                32,
-                40,
-                48,
-                56,
-                64,
-                72,
-                80,
-                88,
-                96,
-                104,
-                112,
-                120,
-                128,
-                136,
-                144,
-                152,
-                160,
-                168,
-                176,
-                184,
-                192,
-                200,
-                208,
-                216,
-                224,
-                232,
-                240,
-                248,
-                256,
-                272,
-                288,
-                304,
-                320,
-                336,
-                352,
-                368,
-                384,
-                400,
-                416,
-                432,
-                448,
-                464,
-                480,
-                496,
-                512,
-                515,
-            ],
+            [1, 2, 4, 8, *range(16, 257, 8), *range(272, 513, 16), 515],
             id="515_seq",
         ),
     ],
@@ -181,7 +87,7 @@ def test_get_bucket_sizes(monkeypatch, num_seqs: int, expected_bucket_sizes: lis
     assert len(runner.pooled_tensors) == len(expected_bucket_sizes)
 
 
-@pytest.mark.parametrize("use_rbln_sampler", [False])
+@pytest.mark.parametrize("use_rbln_sampler", [True, False])
 @pytest.mark.parametrize("use_structured_output", [True, False])
 def test_forward_sampler_mode_and_structured_output(
     monkeypatch, use_rbln_sampler, use_structured_output
@@ -206,9 +112,13 @@ def test_forward_sampler_mode_and_structured_output(
 @pytest.mark.parametrize("top_k", [0, 3])
 @pytest.mark.parametrize("temperature", [0.0, 1.0])
 @pytest.mark.parametrize("logprobs", [0, 3])
-@pytest.mark.parametrize("presence_penalty", [0.0, 2.0])
-@pytest.mark.parametrize("frequency_penalty", [0.0, 2.0])
-@pytest.mark.parametrize("repetition_penalty", [1.0, 2.0])
+# The three penalties travel one code path (no_penalties on/off), so one
+# all-on case suffices here; exact penalty effects have dedicated tests.
+@pytest.mark.parametrize(
+    "presence_penalty, frequency_penalty, repetition_penalty",
+    [(0.0, 0.0, 1.0), (2.0, 2.0, 2.0)],
+    ids=["no_penalty", "all_penalty"],
+)
 @pytest.mark.parametrize(
     "warm_up", [True, False], ids=["warm_up_true", "warm_up_false"]
 )
@@ -255,7 +165,7 @@ def test_forward_sampling_parameters(
     ids=["no_penalty", "all_penalty"],
 )
 def test_no_nan_logits_with_padded_bucket(
-    monkeypatch,
+    rbln_sampler_env,
     top_p,
     top_k,
     temperature,
@@ -274,10 +184,6 @@ def test_no_nan_logits_with_padded_bucket(
     patched during runner construction so every uninitialized float tensor
     starts as NaN. Any missing init guard in RBLNInputBatch will then surface.
     """
-    monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1")
-    monkeypatch.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
-    monkeypatch.setenv("VLLM_RBLN_ENABLE_WARM_UP", "False")
-
     # max_num_seqs=4 with 3 reqs -> decode uses bucket_size=4, one padded row.
     # Force torch.empty to return NaN-filled float tensors during init so the
     # test does not rely on lucky zero-page allocations.
@@ -336,7 +242,9 @@ def test_no_nan_logits_with_padded_bucket(
         assert_no_nan_in_pooled(output)
 
 
-def test_sampler_logits_reshape_keeps_shape_and_stride_stable(monkeypatch):
+def test_sampler_logits_reshape_keeps_shape_and_stride_stable(
+    rbln_sampler_env, monkeypatch
+):
     """
     Test to ensure that the sampler always receives the same shape and stride
     even when `compute_logits` returns logits with different strides.
@@ -346,11 +254,6 @@ def test_sampler_logits_reshape_keeps_shape_and_stride_stable(monkeypatch):
     test forces `compute_logits` to alternate strides while keeping
     batch_size=1, and asserts the reshape in `sample_tokens` absorbs it.
     """
-
-    monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1")
-    monkeypatch.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
-    monkeypatch.setenv("VLLM_RBLN_ENABLE_WARM_UP", "False")
-
     # Keep max_num_seqs=1 so we always take the non-padding path.
     runner = create_model_runner(max_num_seqs=1)
 
@@ -402,7 +305,7 @@ def test_sampler_logits_reshape_keeps_shape_and_stride_stable(monkeypatch):
     )
 
 
-def test_penalty_decode_steps_do_not_recompile(monkeypatch):
+def test_penalty_decode_steps_do_not_recompile(rbln_sampler_env, monkeypatch):
     """Penalties feed SamplingMetadata.output_token_ids into the sampler — a
     list[list[int]] that grows by one token every decode step. The penalty
     path runs eagerly, fully outside torch.compile, so no dynamo frame may
@@ -411,10 +314,6 @@ def test_penalty_decode_steps_do_not_recompile(monkeypatch):
     the list would recompile per token and eventually kill the engine with
     FailOnRecompileLimitHit.
     """
-    monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1")
-    monkeypatch.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
-    monkeypatch.setenv("VLLM_RBLN_ENABLE_WARM_UP", "False")
-
     # One bucket only, so a changed shape can't excuse a recompile.
     runner = create_model_runner(max_num_seqs=1)
     req = make_request(
@@ -434,16 +333,12 @@ def test_penalty_decode_steps_do_not_recompile(monkeypatch):
 
 
 @pytest.mark.parametrize("use_penalty", [True, False], ids=["penalty", "no_penalty"])
-def test_presence_frequency_penalty_changes_greedy_pick(monkeypatch, use_penalty):
+def test_presence_frequency_penalty_changes_greedy_pick(rbln_sampler_env, use_penalty):
     """Presence/frequency penalties must actually reach the logits: with
     greedy sampling and fixed logits, the top token wins until it has been
     generated once, after which the penalties push it below the runner-up.
     Without penalties the top token wins every step.
     """
-    monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1")
-    monkeypatch.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
-    monkeypatch.setenv("VLLM_RBLN_ENABLE_WARM_UP", "False")
-
     runner = create_model_runner(max_num_seqs=1)
     # Gaps below 4.0, so presence 2.0 + frequency 2.0 demotes a generated
     # token below the next one.
@@ -473,15 +368,13 @@ def test_presence_frequency_penalty_changes_greedy_pick(monkeypatch, use_penalty
 @pytest.mark.parametrize(
     "repetition_penalty", [2.0, 1.0], ids=["penalty", "no_penalty"]
 )
-def test_repetition_penalty_applies_to_prompt_tokens(monkeypatch, repetition_penalty):
+def test_repetition_penalty_applies_to_prompt_tokens(
+    rbln_sampler_env, repetition_penalty
+):
     """Repetition penalty covers prompt tokens, not just generated ones: a
     prompt token holding the top logit must lose to the runner-up already at
     the prefill sample when the penalty halves its positive logit.
     """
-    monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1")
-    monkeypatch.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
-    monkeypatch.setenv("VLLM_RBLN_ENABLE_WARM_UP", "False")
-
     runner = create_model_runner(max_num_seqs=1)
     # Token 3 is in the prompt: 2.0 / 2.0 = 1.0 < 1.5, so 11 wins.
     set_fixed_logits(runner, {3: 2.0, 11: 1.5})
@@ -497,15 +390,11 @@ def test_repetition_penalty_applies_to_prompt_tokens(monkeypatch, repetition_pen
     assert sampled_token(prefill_output, "req_0") == expected
 
 
-def test_mixed_penalty_batch_isolates_requests(monkeypatch):
+def test_mixed_penalty_batch_isolates_requests(rbln_sampler_env):
     """One penalized request in a batch must not disturb the others: the
     batch-level no_penalties flag turns the penalty path on for every row,
     and the unpenalized rows rely on their 0.0/1.0 defaults being no-ops.
     """
-    monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1")
-    monkeypatch.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
-    monkeypatch.setenv("VLLM_RBLN_ENABLE_WARM_UP", "False")
-
     # 3 reqs pad to bucket_size=4, covering the padded-metadata path too.
     runner = create_model_runner(max_num_seqs=4)
     set_fixed_logits(runner, {7: 3.0, 11: 1.0, 23: 0.5})
