@@ -170,43 +170,47 @@ VLLM_RBLN_PAGE_LAYOUT=1 vllm serve <model> \
 
 ### Address space
 
-Page ids are upstream's **logical** ids, not physical addresses. Translation is
-an explicit table, not page-id arithmetic — which is what lets upstream's
-`BlockPool` stay untouched.
-
-Two maps, and conflating them is a correctness bug:
-
-| Map | Role |
-|---|---|
-| `request → [kernel_block_id]` | **the address** — the block table the worker uses |
-| `page_id → {kernel_block_id}` | **content locator** — used only to pick a CoW source |
-
-The locator is *many-valued*: a copy-on-write gives a request its own physical
-copy of a shared prefix, so one logical page legitimately has different
-physical homes in different requests. Physical address is therefore per-request
-and never per-page. Any holder of a page is an equally valid copy source — all
-holders have identical bytes.
-
-Within a kernel block, sequential writes (I3) make the slot a pure function of the
-logical page index:
+A page id **is** its physical address. The pool partitions page ids statically,
+so no translation table exists:
 
 ```text
-slot(page_index) = page_index % pages_per_kernel_block
+kernel_block(page_id) = page_id // pages_per_kernel_block
+slot(page_id)         = page_id %  pages_per_kernel_block
 ```
 
-**Page-id recycling.** Upstream reissues a freed page id immediately (unhashed
-blocks go to the head of its free queue), so an older kernel block can still claim a
-page id whose content has been replaced. Binding therefore distinguishes a
-*fresh* page (upstream just handed the id out; every other claim on it is
-stale and must be revoked) from a *copy* (content that remains valid
-elsewhere). Revoking poisons the stale slot rather than removing it — removing
-would shift later slots and break the positional addressing I3 rests on.
+This has to agree with the worker, which derives the slot from the *sequence
+position* (`block_table[i // ppe]`, slot `i % ppe`) because the attention kernel
+computes `partition_start = p * partition_size` internally. The two agree when
+
+```text
+page_id % ppe == page_index % ppe          for every page a request holds
+page_id // ppe is constant within a group  (one block table entry per group)
+```
+
+`KernelBlockPool` guarantees both for pages it allocates: a request's run starts
+at slot 0 of a kernel block it alone owns and grows contiguously (I3, I4). Prefix
+matching guarantees them for pages it does not allocate, because a hit returns
+the page produced at the same sequence position. The one way the invariant can be
+violated is a hash naming two different blocks — see the truncation guard below.
+
+**No page-id recycling hazard.** A page id never changes its kernel block, so a
+recycled id cannot invalidate anyone else's slot. What the old explicit-mapping
+design needed poisoning and revocation for does not arise.
 
 ### Allocator
 
-The free list holds kernel blocks; reclaim returns whole kernel blocks (I7). A slice of the
-pool is withheld as over-provisioning and released only to copy-on-write
-destinations, so a pool that is merely full still degrades gracefully.
+`KernelBlockPool` subclasses upstream's `BlockPool` and overrides three things:
+
+- `get_new_blocks` serves the calling request's open kernel block first, then a
+  wholly idle block — never a block another request has open (I4).
+- `get_num_free_blocks` counts only pages a kernel block can actually back, and
+  inside `allocating_for(request_id)` only those *this* request may take. This is
+  the value `KVCacheManager` gates admission on, so a single count now drives
+  both admission and allocation.
+- `free_blocks` releases a kernel block once none of its pages are live;
+  `release_owner` drops a finished request's claim so the next turn can adopt it.
+
+There is no reserve and no separate kernel block free list.
 
 ## Invariants
 
@@ -216,10 +220,10 @@ destinations, so a pool that is merely full still degrades gracefully.
 | **I2** | A request's `num_computed_tokens` is page-aligned throughout prefill. | Keeps pages either complete or untouched. Holds because `page_size % chunk_size == 0`, at most one prefill runs per step, and every per-step token clamp is page-aligned (see [§ Scheduler](#scheduler-integration)). |
 | **I3** | Within a kernel block, a request's pages are written sequentially from offset 0. | Sequential-write (ZNS-style) rule; makes `page_offset` derivable and the kernel block DMA-contiguous. |
 | **I4** | Never append into a kernel block another request references. A partial match is resolved by copying into a private kernel block. | Out-of-place update: an in-place append would corrupt the sharer's prefix. |
-| **I5** | Full kernel blocks are attach targets, shared read-only. A partial kernel block is a **copy source** for anyone, and an **adoption** target for at most one request: an unreferenced one whose pages are exactly the leading pages of the group being bound is extended in place (**I5b**). | A partial kernel block has a live write pointer (I3), so only one writer may hold it; `ref_cnt == 0` means the sharer I4 protects does not exist, and the resumed pages keep their slots. Adoption is what makes the multi-turn append case zero-copy. |
+| **I5** | Full kernel blocks are attach targets, shared read-only. A partial kernel block is an **adoption** target for at most one request: an unowned one whose remaining slots hold nothing cached is extended in place (**I5b**). | A partial kernel block has a live write pointer (I3), so only one writer may hold it; unowned means the sharer I4 protects does not exist, and the resumed pages keep their slots. Adoption is what makes the multi-turn append case zero-copy. |
 | **I6** | Dedup happens only when a kernel block becomes full, keyed by its kernel-block hash (the chained page hash at its last page boundary). | Partial kernel blocks have no stable identity. |
-| **I7** | Reclaim is at kernel block granularity; no mid-kernel-block holes. | Erase-unit asymmetry. Page-only eviction is forbidden. |
-| **I8** | Refcounts live on the **kernel block**. The page-hash index is mapping metadata and owns no reference. | By I4/I5, sharing is always whole-kernel-block, so per-page refcounts would be uniform across a kernel block by construction. |
+| **I7** | ~~Reclaim is at kernel block granularity.~~ **Retired.** Under identity mapping a page owns its slot exclusively, so evicting one page leaves its siblings addressable; a kernel block simply becomes reusable when all its pages are free. | I7 was a consequence of the page → location indirection, not of the hardware. |
+| **I8** | Refcounts live on the **page**, as upstream's do. A kernel block is held exactly as long as one of its pages is. | Identity mapping makes a page's lifetime independent of its siblings'; the kernel block needs no counter of its own. |
 | **I9** | The scheduler always leaves at least one token to recompute (`match ≤ num_tokens - 1`). | Upstream requires the last token's forward pass to produce logits. |
 | **I10** | Eligible specs store per-token KV: `FullAttentionSpec` (MVP), later `SlidingWindowSpec` / `ChunkedLocalAttentionSpec`. `MambaSpec` / `CrossAttentionSpec` are ineligible. | Partial copying requires a sliceable token dimension. |
 
@@ -255,17 +259,24 @@ Split the matched prefix at kernel block boundaries:
 
 ```text
 matched prefix = [ full kernel block ][ full kernel block ] ... [ k pages of kernel block E ]
-                  └── attach by reference ──┘        └── copy into private F,
-                                                          slots 0..k-1 ──┘
-then continue appending into F at slot k.
+                  └── attach by reference ──┘        └── if E is unowned: append at slot k.
+                                                         otherwise: allocate F whole,
+                                                         copy E[0..k) -> F[0..k),
+                                                         re-issue those k pages as F's ids ──┘
 ```
+
+Re-issuing the ids is what keeps the copy compatible with identity mapping: the
+private copy is addressed by ids that name F, so nothing has to remember that
+"the page formerly known as E[2] now lives in F".
 
 Consequences:
 
 - Copy cost per match is `< kernel_block_size` tokens regardless of match length —
   hybrid-FTL *partial* merge only; a full merge never occurs.
-- Source pages (which may live in a partial kernel block, per I5) are pinned until
-  the worker's copy completes — today's `release_copy_ops` contract.
+- The copy is always a block prefix (`src_start == dst_start == 0`), the shape the
+  runtime fast path accepts.
+- Source pages keep the reference `allocate_slots` took on them until the worker's
+  copy completes — the `drain_pending_copy_ops` / `release_copy_ops` contract.
 - Lookups may match interior pages of a full kernel block, not just prompt tails.
   This is deliberately denser than upstream and preserves today's hit rate.
 
@@ -404,39 +415,55 @@ matched prefix every turn while adoption copies nothing. Conversations longer
 than one kernel block would share full blocks by reference in both designs and
 narrow the gap; this is the favourable end of the range, not the average one.
 
-### The allocator fork: identity mapping vs. copy-on-write
+### The allocator: identity mapping, and how CoW survives it
 
 `KernelBlockPool` (`vllm_rbln/v1/core/kernel_block_pool.py`) subclasses
 upstream's `BlockPool` and hands out pages in kernel-block-aligned runs, so a
-page id encodes its own location (`kernel_block = id // ppe`,
-`slot = id % ppe`) and `get_num_free_blocks` -- the value `KVCacheManager`
-consults before admitting work -- counts only what whole kernel blocks can
-back. It was written to remove the two-allocator split behind the defect below.
+page id encodes its own location:
 
-**It cannot be wired into the current manager as-is, and the reason is worth
-recording.** The worker addresses KV positionally: its block table holds kernel
-block ids and a token at page index `i` is read from
-`block_table[i // ppe]`, slot `i % ppe`. So every page of one `i // ppe` group
-must live in the *same* kernel block. That forces the two designs apart:
+```
+kernel_block = page_id // pages_per_kernel_block
+slot         = page_id %  pages_per_kernel_block
+```
 
-- **Identity mapping (the pool).** A page id names its own storage, so nothing
-  may move. When a prefix match ends mid-group, the request's remaining pages of
-  that group would have to be written into the producer's block, which I4
-  forbids while the producer is live. Copy-on-write is the only way out, and CoW
-  moves bytes to a block the page id does not name -- contradicting identity.
-- **Explicit mapping (today).** `KernelBlockTable` maps page -> (block, slot)
-  independently of the page id, so CoW can place the matched pages at their
-  correct slots in a private block. This is what runs now, and why every partial
-  match costs a copy.
+This is the same contract the worker already enforces. Its block table holds
+kernel block ids and the attention kernel derives the offset from the absolute
+position (`partition_start = p * partition_size`,
+`vllm_rbln/v1/attention/ops/flash_causal_attention_naive.py`), so a token at page
+index `i` is read from `block_table[i // ppe]` at slot `i % ppe`. Allocation in
+runs makes `page_id % ppe == i % ppe` hold for fresh pages; prefix matching
+preserves it for cached ones, because a hit returns the page produced at the same
+sequence position. The two agree, and the page -> location table disappears.
 
-They are exclusive. Identity mapping deletes the mapping layer *and* the copy,
-but only if the positional contract with the worker is relaxed -- for instance
-by sending a per-page slot table rather than deriving the slot from the index.
-That is a worker-side change, not a scheduler-side one.
+**The reconciliation with CoW.** The apparent contradiction -- a copy moves
+bytes to a block the page id does not name -- only holds if the copied pages keep
+their ids. They do not. When a group's match ends part-way and the producer's
+block is still live, the group is re-allocated **whole** as a private run and the
+matched head copied into it; the copied pages get *fresh* ids naming the private
+block. Identity survives, and so does the copy:
 
-Until that is decided, admission is gated per request in
-`_have_kernel_blocks_for` rather than by the pool, and `KernelBlockPool` is
-landed but unused.
+| group state | handling | copy |
+| --- | --- | --- |
+| whole group matched | share the producer's block by refcount | 0 |
+| partial, producer's block unowned and its tail uncached | resume it (`open_run`) | 0 |
+| partial, producer live | fresh run + `KernelBlockCopyOp` | <= 1 block |
+
+The copy is always a block prefix (`src_start == dst_start == 0`), because a
+match starts at slot 0 of the producer's group -- which is the shape the runtime
+fast path in `_process_kv_cache_copy_ops` can take.
+
+**What this removes.** `KernelBlockTable`, `KernelBlockAllocator`, the reserve
+fraction, `OutOfKernelBlocks`, the per-request admission gate, the eviction hook
+and whole-block reclaim (I7 was a consequence of the indirection, not of the
+hardware: under identity mapping evicting one page leaves its siblings intact).
+`get_num_free_blocks` is now the single admission gate, and inside
+`allocating_for` it reports what *that* request can take -- another request's
+open run has free slots I4 forbids it from touching.
+
+**One new guard.** A block hash can name several blocks (upstream does not
+de-duplicate, `BlockHashToBlockMap` NOTE #1), so a lookup can stitch one group
+out of two producers' pages. `get_computed_blocks` truncates the match at the
+first page that breaks the run.
 
 ### Defect found 2026-08-14: `OutOfKernelBlocks` kills the engine
 
@@ -702,7 +729,7 @@ there rather than coexist.
 
 | Risk | Mitigation |
 |---|---|
-| vLLM assumes `block_size` == KV tensor token dim | Explicit page→kernel block table + kernel block-major tensors; audit every `block_size` read ([§ Scheduler](#scheduler-integration)) |
+| vLLM assumes `block_size` == KV tensor token dim | Kernel block-major tensors + kernel-block-id block tables; audit every `block_size` read ([§ Scheduler](#scheduler-integration)) |
 | Copy amplification | Partial merges only (`< kernel_block_size` per match); dedup promptly on full; track CA as a metric |
 | Free-kernel-block exhaustion (write cliff) | Over-provisioning; kernel block-granular capacity accounting |
 | Internal fragmentation | Startup check `max_num_seqs * kernel_block_size << pool` |
@@ -719,6 +746,14 @@ Landed in `afd7142d`: `page_layout.py` (geometry, kernel block pool, page->kerne
 map, binding policy), `rbln_page_layout_kv_cache_manager.py`, scheduler wiring
 and kernel block-id block tables, worker geometry restatement and slot-range copies.
 409 unit tests.
+
+**Rebuilt on identity mapping 2026-08-14.** `KernelBlockPool` is now the single
+allocator; `page_layout.py` keeps only geometry, configuration and the copy op.
+Deleted: `KernelBlockTable`, `KernelBlockAllocator`, `PageLayoutManager`, the
+reserve fraction, `OutOfKernelBlocks`, `INVALID_PAGE` poisoning, the eviction
+hook, whole-block reclaim, and the per-request admission gate. Added: the
+match-truncation guard for stitched hash lookups. The manager is ~280 lines of
+policy over upstream's allocation path instead of a parallel allocator.
 
 ### Measured 2026-08-13 (MiniMax-M2.5, DP4+EP, 1536-token shared prefix)
 
@@ -904,14 +939,14 @@ pool (222K tokens) never evicted. Force it with `--num-gpu-blocks-override`.
    (2)'s diff carries only the semantic change. See
    [§ Relation to upstream `kernel_block_size`](#relation-to-upstream-kernel_block_size)
    for the invariant this name inverts.
-4. **Make `OutOfKernelBlocks` a scheduling outcome, not an exception** (see the
-   defect above). `allocate_slots` should return `None` so upstream preempts or
-   defers; today the exception escapes and kills the worker. Then teach
-   `validate_fragmentation` about multi-block requests. This blocks any
-   long-conversation use, so do it first.
-5. **O(1) `bind()`.** It rewalks every kernel block of a request each step: 0.54 us
-   at 4 pages, 20.66 us at 1024. That is 0.08% of TPOT at `max_model_len`, so
-   it is scaling, not a present cost. Skip sealed kernel blocks.
+4. ~~**Make `OutOfKernelBlocks` a scheduling outcome, not an exception.**~~
+   **Done 2026-08-14, then made unreachable.** The first fix was a per-request
+   admission gate; the rewrite onto `KernelBlockPool` removed the second
+   allocator that caused it, so `get_num_free_blocks` is now the only gate and
+   there is nothing left to raise. `validate_fragmentation` knows about
+   multi-block requests.
+5. ~~**O(1) `bind()`.**~~ **Moot** -- `bind()` is gone. The block table is derived
+   arithmetically from the request's page ids.
 6. ~~**Confirm the multi-turn result on MiniMax-M2.5.**~~ **Done 2026-08-13** --
    +8.8% req/s and -8.0% TPOT against sub-block caching at the same kernel
    block, with identical match coverage (see the table above). Two follow-ups it

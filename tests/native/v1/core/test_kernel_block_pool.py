@@ -123,9 +123,8 @@ class TestAdmissionAccounting:
 
     def test_refuses_more_than_it_reports(self):
         p = pool()
-        with pytest.raises(ValueError, match="Cannot get"):
-            with p.allocating_for("r1"):
-                p.get_new_blocks(p.get_num_free_blocks() + 1)
+        with pytest.raises(ValueError, match="Cannot get"), p.allocating_for("r1"):
+            p.get_new_blocks(p.get_num_free_blocks() + 1)
 
 
 class TestRelease:

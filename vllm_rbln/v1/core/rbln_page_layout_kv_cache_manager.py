@@ -15,26 +15,42 @@
 """Page-native KV cache manager with kernel block backing.
 
 See docs/page_layout_kv_manager.md. Once ``--block-size`` is the page, upstream
-does all the matching natively, so this only maps those pages onto contiguous
-kernel blocks and emits the copies that implies.
+does all the matching natively, so what is left is making a page id name its own
+physical home:
+
+    kernel block = page_id // pages_per_kernel_block
+    slot         = page_id %  pages_per_kernel_block
+
+`KernelBlockPool` allocates so that this identity holds for pages it hands out,
+and prefix matching preserves it for pages it does not, because a cache hit
+returns the page produced at the same sequence position. The block table the
+worker wants then falls out arithmetically -- no page -> location map to keep.
+
+That leaves one case with no legal answer: a group whose match ends part-way
+while the producer's block is still live. Its remaining slots must be written,
+I4 forbids writing them in the producer's block, and the group is one block table
+entry so they cannot go elsewhere. The group is then re-allocated whole as a
+private run and the matched head copied into it -- the copied pages get *fresh*
+ids naming the new block, which is what keeps the identity intact.
 """
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+import vllm.v1.core.kv_cache_coordinator as kv_cache_coordinator
+from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 
 from vllm_rbln.logger import init_logger
-from vllm_rbln.v1.core.page_layout import (
-    INVALID_PAGE,
-    KernelBlockCopyOp,
-    OutOfKernelBlocks,
-    PageLayoutConfig,
-    PageLayoutManager,
-)
+from vllm_rbln.v1.core.kernel_block_pool import KernelBlockPool
+from vllm_rbln.v1.core.page_layout import KernelBlockCopyOp, PageLayoutConfig
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator, Sequence
+
     from vllm.v1.core.kv_cache_utils import KVCacheBlock
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
@@ -42,6 +58,47 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 __all__ = ["RBLNPageLayoutKVCacheManager"]
+
+
+@contextmanager
+def _kernel_block_pool(pages_per_kernel_block: int) -> Iterator[None]:
+    """Make the coordinator build a `KernelBlockPool` instead of a `BlockPool`.
+
+    The pool is created several frames down and captured by every single-type
+    manager (including its null block), so substituting the object afterwards
+    would leave those references pointing at the pool it replaced.
+    """
+
+    def factory(**kwargs) -> BlockPool:
+        return KernelBlockPool(pages_per_kernel_block=pages_per_kernel_block, **kwargs)
+
+    original = kv_cache_coordinator.BlockPool
+    kv_cache_coordinator.BlockPool = factory
+    try:
+        yield
+    finally:
+        kv_cache_coordinator.BlockPool = original
+
+
+@dataclass
+class _Adoption:
+    """The request continues writing into the block its match ended in."""
+
+    kernel_block: int
+
+
+@dataclass
+class _Refused:
+    """No private block for the copy, so the request waits."""
+
+
+@dataclass
+class _PrivateCopy:
+    """The matched head of a group, re-issued in a private block."""
+
+    first_page_index: int
+    source: list[KVCacheBlock]
+    destination: list[KVCacheBlock]
 
 
 class RBLNPageLayoutKVCacheManager(KVCacheManager):
@@ -68,29 +125,70 @@ class RBLNPageLayoutKVCacheManager(KVCacheManager):
         **kwargs,
     ) -> None:
         assert self.can_use_page_layout(kv_cache_config, page_layout_config)
-        super().__init__(kv_cache_config=kv_cache_config, **kwargs)
-
         self.page_layout_config = page_layout_config
         self.geometry = page_layout_config.geometry
-        self.kernel_blocks = PageLayoutManager(
-            geometry=page_layout_config.geometry,
-            num_kernel_blocks=page_layout_config.num_kernel_blocks,
-            num_reserved=page_layout_config.num_reserved,
-        )
-        # Copies the worker must perform before the next forward pass. Each op
-        # keeps its source kernel block referenced until the worker is done.
+        ppe = self.geometry.pages_per_kernel_block
+        with _kernel_block_pool(ppe):
+            super().__init__(kv_cache_config=kv_cache_config, **kwargs)
+        assert isinstance(self.block_pool, KernelBlockPool)
+        self.pool: KernelBlockPool = self.block_pool
+
+        # Copies the worker must perform before the next forward pass, and the
+        # source pages each keeps alive until it has run.
         self.pending_copy_ops: list[KernelBlockCopyOp] = []
-        self._install_eviction_hook()
+        self._pending_sources: list[KVCacheBlock] = []
+        self._in_flight_sources: list[list[KVCacheBlock]] = []
+        self.num_pages_copied = 0
+        self.num_pages_written = 0
 
         logger.info(
             "Page/kernel block KV cache: page=%d, kernel block=%d (%d pages), "
-            "kernel blocks=%d (%d reserved for copy-on-write)",
+            "kernel blocks=%d",
             self.geometry.page_size,
             self.geometry.kernel_block_size,
-            self.geometry.pages_per_kernel_block,
-            page_layout_config.num_kernel_blocks,
-            page_layout_config.num_reserved,
+            ppe,
+            self.pool.num_kernel_blocks,
         )
+
+    # -- prefix match -------------------------------------------------------
+
+    def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int]:
+        """Drop any tail of the match whose pages are not laid out as a run.
+
+        A hash can name several blocks (upstream does not de-duplicate), so a
+        lookup can stitch one group out of two producers' pages. The group is a
+        single block table entry, so such a match cannot be addressed at all.
+        """
+        blocks, num_computed_tokens = super().get_computed_blocks(request)
+        if num_computed_tokens == 0:
+            return blocks, num_computed_tokens
+
+        pages = blocks.blocks[0]
+        keep = self._laid_out_prefix(pages)
+        if keep == len(pages):
+            return blocks, num_computed_tokens
+
+        logger.debug(
+            "Page layout: truncating a %d-page match to %d; the pages do not "
+            "form kernel-block-aligned runs.",
+            len(pages),
+            keep,
+        )
+        return (
+            self.create_kv_cache_blocks((list(pages[:keep]),)),
+            min(num_computed_tokens, keep * self.geometry.page_size),
+        )
+
+    def _laid_out_prefix(self, pages: Sequence[KVCacheBlock]) -> int:
+        """Length of the leading run of pages that satisfy the identity map."""
+        ppe = self.geometry.pages_per_kernel_block
+        for index, block in enumerate(pages):
+            slot = index % ppe
+            if block.block_id % ppe != slot:
+                return index
+            if slot and block.block_id != pages[index - 1].block_id + 1:
+                return index
+        return len(pages)
 
     # -- allocation ---------------------------------------------------------
 
@@ -103,77 +201,88 @@ class RBLNPageLayoutKVCacheManager(KVCacheManager):
         *args,
         **kwargs,
     ) -> KVCacheBlocks | None:
-        # computed + just-matched pages have content; the rest gets written
-        cached_tokens = request.num_computed_tokens + num_new_computed_tokens
-
-        # Kernel blocks are the scarcer resource: a request pins whole blocks
-        # while filling only part of their page capacity, so they run out while
-        # the page pool still looks free. Gate on them here, before upstream
-        # commits page ids, so exhaustion becomes a scheduling outcome upstream
-        # can act on -- preempt and retry -- instead of an exception out of
-        # `bind` that has nowhere to go.
-        if not self._have_kernel_blocks_for(request, cached_tokens + num_new_tokens):
+        plan = self._plan_partial_group(request, new_computed_blocks)
+        if isinstance(plan, _Refused):
             return None
-
-        result = super().allocate_slots(
-            request,
-            num_new_tokens,
-            num_new_computed_tokens,
-            new_computed_blocks,
-            *args,
-            **kwargs,
-        )
+        with self.pool.allocating_for(request.request_id):
+            result = super().allocate_slots(
+                request,
+                num_new_tokens,
+                num_new_computed_tokens,
+                new_computed_blocks,
+                *args,
+                **kwargs,
+            )
         if result is None:
+            self._abandon(request, plan)
             return None
-
-        self._bind_kernel_blocks(request, cached_tokens)
+        if isinstance(plan, _PrivateCopy):
+            self._redirect(request, plan)
+        self.num_pages_written += sum(len(group) for group in result.blocks)
         return result
 
-    def _have_kernel_blocks_for(self, request: Request, total_tokens: int) -> bool:
-        """Can this request reach ``total_tokens`` without exhausting the pool?
+    def _plan_partial_group(
+        self, request: Request, new_computed_blocks: KVCacheBlocks | None
+    ) -> _Adoption | _PrivateCopy | _Refused | None:
+        """Decide how a match that ends mid-group is continued.
 
-        Counts what it already holds, then reclaims retained blocks before
-        giving up. The reserve stays out of it: that share exists so a partial
-        match of an already-admitted request can find a copy destination, and
-        spending it on admission would deadlock exactly the case it protects.
+        Runs before the allocation so the pool knows which block the request's
+        next pages belong in: upstream allocates the group's unmatched tail
+        without knowing it must land at a particular slot of a particular block.
         """
-        pages = -(-total_tokens // self.geometry.page_size)
-        shortfall = self.geometry.num_kernel_blocks_for_pages(pages) - len(
-            self.kernel_blocks.block_table(request.request_id)
+        if new_computed_blocks is None:
+            return None
+        matched = new_computed_blocks.blocks[0]
+        ppe = self.geometry.pages_per_kernel_block
+        head = len(matched) % ppe
+        if not matched or head == 0:
+            return None
+
+        producer = self.pool.kernel_block_of(matched[-head].block_id)
+        if self.pool.can_resume(producer, head):
+            self.pool.open_run(request.request_id, producer)
+            return _Adoption(producer)
+
+        with self.pool.allocating_for(request.request_id):
+            if self.pool.get_num_free_blocks() < head:
+                return _Refused()
+            destination = self.pool.get_new_blocks(head)
+        return _PrivateCopy(len(matched) - head, list(matched[-head:]), destination)
+
+    def _redirect(self, request: Request, plan: _PrivateCopy) -> None:
+        """Swap the matched head for the private copies and queue the transfer.
+
+        The originals keep the reference `allocate_slots` took on them; that is
+        what holds the copy source in place until the worker has read it.
+        """
+        blocks = self.coordinator.get_blocks(request.request_id)[0]
+        first, last = plan.first_page_index, plan.first_page_index + len(plan.source)
+        assert [b.block_id for b in blocks[first:last]] == [
+            b.block_id for b in plan.source
+        ]
+        blocks[first:last] = plan.destination
+
+        page = self.geometry.page_size
+        self.pending_copy_ops.append(
+            KernelBlockCopyOp(
+                src_kernel_block_id=self.pool.kernel_block_of(plan.source[0].block_id),
+                dst_kernel_block_id=self.pool.kernel_block_of(
+                    plan.destination[0].block_id
+                ),
+                src_start=0,
+                dst_start=0,
+                num_tokens=len(plan.source) * page,
+            )
         )
-        if shortfall <= 0:
-            return True
-        if self.kernel_blocks.allocator.can_allocate(shortfall):
-            return True
-        self._reclaim_retained(shortfall)
-        return self.kernel_blocks.allocator.can_allocate(shortfall)
+        self._pending_sources.extend(plan.source)
+        self.num_pages_copied += len(plan.source)
 
-    def _bind_kernel_blocks(self, request: Request, cached_tokens: int) -> None:
-        """Back the request's pages with kernel blocks, queueing any copies."""
-        page_ids = self._page_ids(request)
-        if not page_ids:
-            return
-        num_cached_pages = min(cached_tokens // self.geometry.page_size, len(page_ids))
-        try:
-            ops = self.kernel_blocks.bind(
-                request.request_id, page_ids, num_cached_pages
-            )
-        except OutOfKernelBlocks:
-            # retained kernel blocks are only given up under pressure
-            needed = self.geometry.num_kernel_blocks_for_pages(len(page_ids))
-            if self._reclaim_retained(needed) == 0:
-                raise
-            ops = self.kernel_blocks.bind(
-                request.request_id, page_ids, num_cached_pages
-            )
-
-        for op in ops:
-            self.kernel_blocks.table.acquire(op.src_kernel_block_id)
-        self.pending_copy_ops.extend(ops)
-
-    def _page_ids(self, request: Request) -> list[int]:
-        blocks: list[KVCacheBlock] = self.coordinator.get_blocks(request.request_id)[0]
-        return [block.block_id for block in blocks]
+    def _abandon(self, request: Request, plan: _Adoption | _PrivateCopy | None) -> None:
+        """Undo a plan whose allocation the scheduler then refused."""
+        if isinstance(plan, _Adoption):
+            self.pool.release_owner(request.request_id)
+        elif isinstance(plan, _PrivateCopy):
+            self.pool.free_blocks(plan.destination)
 
     # -- copy op plumbing ---------------------------------------------------
 
@@ -181,96 +290,44 @@ class RBLNPageLayoutKVCacheManager(KVCacheManager):
         """Copies for this step; sources stay referenced until released."""
         ops = self.pending_copy_ops
         self.pending_copy_ops = []
+        self._in_flight_sources.append(self._pending_sources)
+        self._pending_sources = []
         return ops
 
     def release_copy_ops(self, ops: list[KernelBlockCopyOp]) -> None:
         """Drop the source references held by drained copy ops."""
-        for op in ops:
-            if self.kernel_blocks.table.get(op.src_kernel_block_id) is not None:
-                self.kernel_blocks.table.release(op.src_kernel_block_id)
+        del ops
+        if self._in_flight_sources:
+            self.pool.free_blocks(self._in_flight_sources.pop(0))
 
     def block_table(self, request_id: str) -> list[int]:
         """The worker's block table: kernel block ids backing a request."""
-        return self.kernel_blocks.block_table(request_id)
+        ppe = self.geometry.pages_per_kernel_block
+        pages = self.coordinator.get_blocks(request_id)[0]
+        return [
+            self.pool.kernel_block_of(pages[i].block_id)
+            for i in range(0, len(pages), ppe)
+        ]
 
     # -- lifetime -----------------------------------------------------------
 
     def free(self, request: Request) -> None:
-        preempted = request.num_computed_tokens == 0
-        self.kernel_blocks.free_request(request.request_id, preempted=preempted)
+        # Before the pages go back: an owned block stays unadoptable, and its
+        # cached head can outlive the writer by any number of turns.
+        self.pool.release_owner(request.request_id)
         super().free(request)
 
     def reset_prefix_cache(self) -> bool:
         result = super().reset_prefix_cache()
         if result:
-            self.kernel_blocks.reset()
+            self.pool.reset_ownership()
             self.pending_copy_ops.clear()
         return result
-
-    def _on_page_evicted(self, page_id: int) -> None:
-        """I7 has no way to punch a hole, so losing one page costs the kernel block.
-
-        CoW can leave several holders; referenced ones are skipped.
-        """
-        for kernel_block_id in self.kernel_blocks.table.holders(page_id):
-            self._reclaim_kernel_block(kernel_block_id, already_evicted=page_id)
-
-    def _reclaim_kernel_block(
-        self, kernel_block_id: int, *, already_evicted: int = -1
-    ) -> bool:
-        """Reclaim an kernel block and drop upstream's claim on the pages it held.
-
-        Reclaiming takes down every page in the kernel block, but upstream still
-        lists the siblings as cached and would report hits for bytes that are
-        gone -- a miss that recomputes nothing. Evict them there too, unless a
-        copy survives in another kernel block.
-        """
-        kernel_block = self.kernel_blocks.table.get(kernel_block_id)
-        if kernel_block is None or kernel_block.ref_cnt > 0:
-            return False
-        siblings = [
-            page_id
-            for page_id in kernel_block.page_ids
-            if page_id not in (already_evicted, INVALID_PAGE)
-        ]
-        if not self.kernel_blocks.reclaim(kernel_block_id):
-            return False
-        for page_id in siblings:
-            if not self.kernel_blocks.table.holders(page_id):
-                self._evict_upstream_page(page_id)
-        return True
-
-    def _reclaim_retained(self, count: int) -> int:
-        reclaimed = 0
-        for kernel_block_id in self.kernel_blocks.retained_kernel_blocks():
-            if reclaimed >= count:
-                break
-            reclaimed += self._reclaim_kernel_block(kernel_block_id)
-        return reclaimed
-
-    def _evict_upstream_page(self, page_id: int) -> None:
-        block = self.block_pool.blocks[page_id]
-        if block.block_hash is not None:
-            # the unhooked original, so this does not recurse into our hook
-            self._evict_cached_block(block)
-
-    def _install_eviction_hook(self) -> None:
-        # no upstream callback, and we need to know whether it actually evicted
-        original_evict = self._evict_cached_block = (
-            self.block_pool._maybe_evict_cached_block
-        )
-
-        def evict_with_kernel_block_reclaim(block: KVCacheBlock) -> bool:
-            page_id = block.block_id
-            evicted = original_evict(block)
-            if evicted:
-                self._on_page_evicted(page_id)
-            return evicted
-
-        self.block_pool._maybe_evict_cached_block = evict_with_kernel_block_reclaim
 
     # -- metrics ------------------------------------------------------------
 
     @property
     def copy_amplification(self) -> float:
-        return self.kernel_blocks.copy_amplification
+        if self.num_pages_written == 0:
+            return 0.0
+        return self.num_pages_copied / self.num_pages_written
