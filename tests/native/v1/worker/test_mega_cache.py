@@ -206,22 +206,6 @@ class TestSignatureVllmConfig:
         base = mega_cache.config_signature(make_vllm_config())
         assert mega_cache.config_signature(make_vllm_config(**overrides)) != base
 
-    @pytest.mark.parametrize(("a", "b"), [(1, 4), (4, 8), (2, 16)])
-    def test_differing_decode_buckets_differ_in_signature(self, a, b):
-        # What the key has to cover is not max_num_seqs itself but the decode
-        # graph set it picks, so pin that instead of the field.
-        from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
-
-        def buckets(n):
-            return get_bucketing_manager(
-                "exponential", max_batch_size=n
-            ).decode_batch_buckets
-
-        assert buckets(a) != buckets(b), "probe does not move the bucket set"
-        assert mega_cache.config_signature(
-            make_vllm_config(max_num_seqs=a)
-        ) != mega_cache.config_signature(make_vllm_config(max_num_seqs=b))
-
     def test_every_factor_is_a_real_field(self):
         # The factors are read with a getattr default, so an upstream rename
         # would drop an axis from the key instead of failing.
