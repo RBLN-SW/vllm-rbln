@@ -36,7 +36,7 @@ def isolated_standalone_env(monkeypatch):
 def test_every_dp_spec_passes_the_platform_rules(spec: CompileModelSpec, monkeypatch):
     apply_spec_envs(spec, monkeypatch)
     EngineArgs(
-        model=spec.model, **rbln_engine_args(**spec.engine_kwargs)
+        model=spec.model, **rbln_engine_args(spec.model, **spec.engine_kwargs)
     ).create_engine_config()
 
     assert os.environ[_STANDALONE] == "1"
