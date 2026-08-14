@@ -17,6 +17,7 @@
 /vllm_rbln/v1/core/prefix_cache_manager @rebel-eunji @rebel-jonghewk
 /vllm_rbln/v1/sample @rebel-eunji @rebel-jonghewk
 /vllm_rbln/v1/worker/ec_disagg_helpers.py @rebel-eunji @rebel-jonghewk
+/vllm_rbln/v1/worker/mega_cache.py @rebel-eunji @rebel-jonghewk
 /vllm_rbln/v1/worker/metrics.py @rebel-eunji @rebel-jonghewk
 /vllm_rbln/v1/worker/rbln_model_runner.py @rebel-cjlee @rebel-minkyu @rebel-jonghewk
 /vllm_rbln/v1/worker/utils.py @rebel-cjlee @rebel-minkyu @rebel-eunji @rebel-jonghewk
