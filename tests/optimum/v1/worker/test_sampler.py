@@ -14,7 +14,6 @@
 
 import pytest
 import torch
-from torch._dynamo.testing import CompileCounter
 from vllm.platforms import current_platform
 
 from .utils import (
@@ -326,31 +325,35 @@ def test_no_nan_logits_with_padded_bucket(
     assert_no_nan_in_pooled(output)
 
 
-def test_sampler_logits_reshape_prevents_torch_compile_recompile(monkeypatch):
+def test_sampler_logits_reshape_keeps_shape_and_stride_stable(monkeypatch):
     """
-    Test to ensure that the sampler does not recompile
-    when `compute_logits` returns logits with different strides.
+    Test to ensure that the sampler always receives the same shape and stride
+    even when `compute_logits` returns logits with different strides.
 
-    This test forces `compute_logits` to return logits with different strides
-    while keeping batch_size=1, and asserts the sampler compiles only once.
+    The sampler ops are compiled for the RBLN device, and dynamo guards on
+    stride, so a varying stride would recompile them on every other step. This
+    test forces `compute_logits` to alternate strides while keeping
+    batch_size=1, and asserts the reshape in `sample_tokens` absorbs it.
     """
 
     monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1")
     monkeypatch.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
     monkeypatch.setenv("VLLM_RBLN_ENABLE_WARM_UP", "False")
-    monkeypatch.setenv("TORCH_LOGS", "recompiles")
-
-    compile_counter = CompileCounter()
-    real_torch_compile = torch.compile
-
-    def torch_compile_with_counter(fn, *args, **kwargs):
-        kwargs.setdefault("backend", compile_counter)
-        return real_torch_compile(fn, *args, **kwargs)
-
-    monkeypatch.setattr(torch, "compile", torch_compile_with_counter)
 
     # Keep max_num_seqs=1 so we always take the non-padding path.
     runner = create_model_runner(max_num_seqs=1)
+
+    # Record what the sampler is actually handed on each step. Patch `forward`
+    # rather than the module itself: the runner also reaches the sampler for
+    # `compute_logprobs` / `gather_logprobs`.
+    seen: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
+    real_forward = runner.sampler.forward
+
+    def recording_forward(logits, sampling_metadata, *args, **kwargs):
+        seen.append((tuple(logits.shape), tuple(logits.stride())))
+        return real_forward(logits, sampling_metadata, *args, **kwargs)
+
+    monkeypatch.setattr(runner.sampler, "forward", recording_forward)
 
     # Alternate logits rank across steps.
     call_count = 0
@@ -378,15 +381,11 @@ def test_sampler_logits_reshape_prevents_torch_compile_recompile(monkeypatch):
         runner.execute_model(scheduler_output)
         _ = runner.sample_tokens(grammar_output=None)
 
-    # 1st iter: stride-changed logits — initial compilation happens here.
+    # 1st iter: stride-changed logits. 2nd iter: normal-stride logits.
     run_step(0)
-    baseline_frames = compile_counter.frame_count
-    assert baseline_frames > 0, "sampler should have been compiled on the first call"
-
-    # 2nd iter: normal-stride logits — reshape in sample_tokens should keep the
-    # sampler input shape/stride identical, so no recompilation should occur.
     run_step(1)
-    assert compile_counter.frame_count == baseline_frames, (
-        f"sampler recompiled across stride change: "
-        f"{baseline_frames} -> {compile_counter.frame_count}"
+
+    assert len(seen) == 2, f"sampler should have run once per step, got {seen}"
+    assert seen[0] == seen[1], (
+        f"sampler input changed across stride change: {seen[0]} -> {seen[1]}"
     )
