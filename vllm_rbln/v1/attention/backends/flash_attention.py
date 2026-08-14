@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass
-from typing import ClassVar, TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 from vllm.config import VllmConfig, get_current_vllm_config
@@ -62,6 +62,18 @@ from ..ops.sliding_window_attention_naive import (
 )
 
 logger = init_logger(__name__)
+
+
+def _fp8_cache_dtype(kv_cache_dtype: str) -> torch.dtype | None:
+    """Real element dtype the uint8 fp8 KV-cache container holds, or None on
+    the non-fp8 "auto" path (the cache tensor's own dtype is real). Upstream's
+    kv_cache_dtype_str_to_dtype gives the uint8 byte-container dtype instead,
+    so it cannot be used here. "fp8" is an alias of e4m3 upstream."""
+    return {
+        "fp8": torch.float8_e4m3fn,
+        "fp8_e4m3": torch.float8_e4m3fn,
+        "fp8_e5m2": torch.float8_e5m2,
+    }.get(kv_cache_dtype)
 
 
 @register_backend(AttentionBackendEnum.FLASH_ATTN)
@@ -351,7 +363,8 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
             self.kv_cache_dtype
         ) and not self.kv_cache_dtype.startswith("fp8"):
             raise NotImplementedError(
-                f"FlashAttention does not support kv_cache_dtype={self.kv_cache_dtype!r}"
+                "FlashAttention does not support "
+                f"kv_cache_dtype={self.kv_cache_dtype!r}"
             )
         self.attn_type = attn_type
 
@@ -563,6 +576,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                 # * otherwise         - seq_lens[B, P] == seq_lens_tensor,
                 #   dynamic size for each partition
                 k_quantize_scale, v_quantize_scale = self._kv_quantize_scales(layer)
+                cache_dtype = _fp8_cache_dtype(self.kv_cache_dtype)
                 if attn_metadata.is_prefill:
                     attn_output = flash_causal_attention_naive_prefill(
                         query,
@@ -575,6 +589,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         self.sinks,
                         k_quantize_scale,
                         v_quantize_scale,
+                        cache_dtype,
                     )
                 else:
                     attn_output = flash_causal_attention_naive_decode(
@@ -588,6 +603,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         self.sinks,
                         k_quantize_scale,
                         v_quantize_scale,
+                        cache_dtype,
                     )
         else:
             if self.is_normal:

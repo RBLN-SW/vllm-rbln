@@ -500,9 +500,32 @@ class TestFlashImplInit:
         with pytest.raises(ValueError, match="not supported"):
             make_impl(cfg, head_size=100)
 
-    def test_fp8_kv_cache_not_supported(self, cfg):
-        with pytest.raises(NotImplementedError, match="FP8"):
-            make_impl(cfg, kv_cache_dtype="fp8")
+    def test_non_fp8_quantized_kv_cache_not_supported(self, cfg):
+        # Quantized KV cache dtypes other than fp8 are rejected; fp8 variants
+        # are allowed and resolve to the real fp8 element dtype.
+        with pytest.raises(NotImplementedError, match="does not support"):
+            make_impl(cfg, kv_cache_dtype="nvfp4")
+
+    @pytest.mark.parametrize(
+        "kv_cache_dtype,expected",
+        [
+            ("auto", None),
+            ("fp8", torch.float8_e4m3fn),  # upstream alias of e4m3
+            ("fp8_e4m3", torch.float8_e4m3fn),
+            ("fp8_e5m2", torch.float8_e5m2),
+        ],
+    )
+    def test_fp8_cache_dtype_mapping(self, kv_cache_dtype, expected):
+        # _fp8_cache_dtype resolves the real element dtype the uint8 fp8-KV
+        # container holds; forward hands it to the compiled custom op as its
+        # last argument (None on the non-fp8 "auto" path).
+        from vllm_rbln.v1.attention.backends.flash_attention import _fp8_cache_dtype
+
+        assert _fp8_cache_dtype(kv_cache_dtype) == expected
+
+    def test_fp8_kv_cache_accepted(self, cfg):
+        # fp8 KV cache dtypes pass the __init__ quantization guard.
+        assert make_impl(cfg, kv_cache_dtype="fp8").kv_cache_dtype == "fp8"
 
     def test_logits_soft_cap_disabled_with_warning(self, cfg, monkeypatch):
         # RBLN does not support a logits soft cap: it warns and forces it to 0.
