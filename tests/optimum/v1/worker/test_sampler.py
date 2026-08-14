@@ -241,15 +241,9 @@ def test_forward_sampling_parameters(
 )
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
 def test_forward_min_tokens_masks_stop_tokens(monkeypatch, dtype, use_rbln_sampler):
-    """min_tokens must keep stop tokens unsampleable until the request has
-    generated min_tokens tokens, then release them.
-
-    The bfloat16 case with the RBLN sampler is a regression test for a
-    dtype crash: the RBLN sampler keeps logits in the model dtype (no
-    float32 upcast), while the builtin MinTokensLogitsProcessor holds a
-    float32 -inf constant, and index_put_ rejects mixed dtypes. The
-    VLLM_RBLN_SAMPLER=0 case covers the fallback path, where the default
-    vLLM sampler upcasts logits to float32 before the processors run.
+    """min_tokens must mask stop tokens until min_tokens tokens are
+    generated, then release them. The bf16 + RBLN sampler case is a
+    regression test for the mixed-dtype index_put_ crash.
     """
     monkeypatch.setenv("VLLM_RBLN_SAMPLER", use_rbln_sampler)
     monkeypatch.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
@@ -261,8 +255,7 @@ def test_forward_min_tokens_masks_stop_tokens(monkeypatch, dtype, use_rbln_sampl
     runner_up_token_id = 5
     min_tokens = 3
 
-    # Rig the logits so greedy sampling always picks the stop token unless
-    # min_tokens masks it, in which case the runner-up token wins.
+    # Greedy picks the stop token unless min_tokens masks it.
     def rigged_forward(model_input, **kwargs):
         num_reqs = runner.input_batch.num_reqs
         vocab_size = runner.model_config.get_vocab_size()
@@ -281,7 +274,6 @@ def test_forward_min_tokens_masks_stop_tokens(monkeypatch, dtype, use_rbln_sampl
         stop_token_ids=[stop_token_id],
     )
 
-    # Prefill samples the first output token.
     scheduler_output = _schedule_new_request_from_request(
         req, block_ids=([0],), outer_block_ids=[0]
     )
@@ -289,7 +281,6 @@ def test_forward_min_tokens_masks_stop_tokens(monkeypatch, dtype, use_rbln_sampl
     output = runner.sample_tokens(grammar_output=None)
     sampled = [output.sampled_token_ids[0][0]]
 
-    # Decode until one step past the min_tokens boundary.
     req.num_computed_tokens = len(req.prompt_token_ids)
     for _ in range(min_tokens):
         scheduler_output = _schedule_cached_reqs([req], new_block_ids=[None])
@@ -298,10 +289,7 @@ def test_forward_min_tokens_masks_stop_tokens(monkeypatch, dtype, use_rbln_sampl
         sampled.append(output.sampled_token_ids[0][0])
         req.num_computed_tokens += 1
 
-    # While fewer than min_tokens tokens are generated, the stop token is
-    # masked and greedy sampling falls to the runner-up token.
     assert sampled[:min_tokens] == [runner_up_token_id] * min_tokens
-    # Once min_tokens is reached, the stop token becomes sampleable again.
     assert sampled[min_tokens] == stop_token_id
 
 
@@ -310,19 +298,9 @@ def test_forward_min_tokens_masks_stop_tokens(monkeypatch, dtype, use_rbln_sampl
 )
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
 def test_forward_logit_bias_overrides_argmax(monkeypatch, dtype, use_rbln_sampler):
-    """logit_bias must be added to the logits before sampling, so a large
-    positive bias lifts an otherwise losing token above the raw argmax
-    token under greedy sampling.
-
-    The bfloat16 case with the RBLN sampler is a regression test for a
-    dtype mismatch: the RBLN sampler keeps logits in the model dtype (no
-    float32 upcast), while the builtin LogitBiasLogitsProcessor rebuilds
-    its bias tensor as float32 on every state change.
-    RBLNLogitBiasLogitsProcessor must re-sync the bias tensor to the
-    incoming logits dtype so the in-place += never mixes dtypes. The
-    VLLM_RBLN_SAMPLER=0 case covers the fallback path, where the default
-    vLLM sampler upcasts logits to float32 and must keep the builtin
-    float32 processor.
+    """logit_bias must lift a losing token above the raw argmax under
+    greedy sampling. The bf16 + RBLN sampler case is a regression test
+    for bias_tensor staying float32 against model-dtype logits.
     """
     monkeypatch.setenv("VLLM_RBLN_SAMPLER", use_rbln_sampler)
     monkeypatch.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
@@ -334,8 +312,8 @@ def test_forward_logit_bias_overrides_argmax(monkeypatch, dtype, use_rbln_sample
     biased_token_id = 5
     num_decodes = 3
 
-    # Rig the logits so the top token wins greedy sampling unless the bias
-    # lifts the biased token above it.
+    # The top token wins greedy sampling unless the +20 bias lifts the
+    # biased token (5 + 20) above it (10).
     def rigged_forward(model_input, **kwargs):
         num_reqs = runner.input_batch.num_reqs
         vocab_size = runner.model_config.get_vocab_size()
@@ -353,7 +331,6 @@ def test_forward_logit_bias_overrides_argmax(monkeypatch, dtype, use_rbln_sample
         logit_bias={biased_token_id: 20.0},
     )
 
-    # Prefill samples the first output token.
     scheduler_output = _schedule_new_request_from_request(
         req, block_ids=([0],), outer_block_ids=[0]
     )
@@ -369,8 +346,6 @@ def test_forward_logit_bias_overrides_argmax(monkeypatch, dtype, use_rbln_sample
         sampled.append(output.sampled_token_ids[0][0])
         req.num_computed_tokens += 1
 
-    # The +20 bias lifts the biased token (5 + 20) above the raw argmax
-    # token (10), so greedy sampling must pick it on every step.
     assert sampled == [biased_token_id] * (num_decodes + 1)
 
     bias_proc = next(
@@ -379,13 +354,11 @@ def test_forward_logit_bias_overrides_argmax(monkeypatch, dtype, use_rbln_sample
         if isinstance(p, LogitBiasLogitsProcessor)
     )
     if use_rbln_sampler == "1":
-        # The float32 bias tensor rebuilt on every state change must have
-        # been re-synced to the logits dtype.
         assert isinstance(bias_proc, RBLNLogitBiasLogitsProcessor)
         assert bias_proc.bias_tensor.dtype == dtype
     else:
-        # The fallback path must keep the builtin float32 processor: the
-        # default vLLM sampler upcasts logits to float32 before apply.
+        # The fallback keeps the builtin float32 processor because the
+        # default vLLM sampler upcasts logits to float32.
         assert not isinstance(bias_proc, RBLNLogitBiasLogitsProcessor)
         assert bias_proc.bias_tensor.dtype == torch.float32
 
@@ -397,18 +370,9 @@ def test_forward_logit_bias_overrides_argmax(monkeypatch, dtype, use_rbln_sample
 def test_forward_min_p_masks_low_probability_tokens(
     monkeypatch, dtype, use_rbln_sampler
 ):
-    """min_p must mask every token whose probability is below
-    min_p * max_prob, leaving only the top token sampleable.
-
-    The bfloat16 case with the RBLN sampler is a regression test for a
-    dtype mismatch: the RBLN sampler keeps logits in the model dtype (no
-    float32 upcast), while the builtin MinPLogitsProcessor re-slices min_p
-    from a float32 buffer on state changes. RBLNMinPLogitsProcessor must
-    re-sync the min_p tensor to the incoming logits dtype so the in-place
-    mul_ into model-dtype probabilities never mixes dtypes. The
-    VLLM_RBLN_SAMPLER=0 case covers the fallback path, where the default
-    vLLM sampler upcasts logits to float32 and must keep the builtin
-    float32 processor.
+    """min_p must mask every token below min_p * max_prob. The bf16 +
+    RBLN sampler case is a regression test for min_p staying float32
+    against model-dtype logits.
     """
     monkeypatch.setenv("VLLM_RBLN_SAMPLER", use_rbln_sampler)
     monkeypatch.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
@@ -419,11 +383,9 @@ def test_forward_min_p_masks_low_probability_tokens(
     top_token_id = 5
     num_decodes = 4
 
-    # Rig the logits so the top token holds only ~5% probability mass and
-    # the rest is spread uniformly over the vocab. With min_p=0.5 every
-    # other token falls below min_p * max_prob and is masked, making random
-    # sampling deterministic; without min_p the top token would be sampled
-    # with only ~5% probability per step.
+    # The top token holds only ~5% probability; min_p=0.5 masks all other
+    # tokens, so random sampling becomes deterministic only when min_p is
+    # actually applied.
     def rigged_forward(model_input, **kwargs):
         num_reqs = runner.input_batch.num_reqs
         vocab_size = runner.model_config.get_vocab_size()
@@ -440,7 +402,6 @@ def test_forward_min_p_masks_low_probability_tokens(
         min_p=0.5,
     )
 
-    # Prefill samples the first output token.
     scheduler_output = _schedule_new_request_from_request(
         req, block_ids=([0],), outer_block_ids=[0]
     )
@@ -464,13 +425,11 @@ def test_forward_min_p_masks_low_probability_tokens(
         if isinstance(p, MinPLogitsProcessor)
     )
     if use_rbln_sampler == "1":
-        # The min_p slice refreshed from the float32 buffer on state
-        # changes must have been re-synced to the logits dtype.
         assert isinstance(min_p_proc, RBLNMinPLogitsProcessor)
         assert min_p_proc.min_p.dtype == dtype
     else:
-        # The fallback path must keep the builtin float32 processor: the
-        # default vLLM sampler upcasts logits to float32 before apply.
+        # The fallback keeps the builtin float32 processor because the
+        # default vLLM sampler upcasts logits to float32.
         assert not isinstance(min_p_proc, RBLNMinPLogitsProcessor)
         assert min_p_proc.min_p.dtype == torch.float32
 
