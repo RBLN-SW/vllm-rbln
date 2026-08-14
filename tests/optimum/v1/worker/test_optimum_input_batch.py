@@ -26,7 +26,6 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
 from vllm_rbln.v1.sample.ops.top_k_top_p import (
     GREEDY_TOP_K,
-    GREEDY_TOP_P,
     build_op_top_k_top_p,
 )
 from vllm_rbln.v1.worker.optimum_input_batch import RBLNInputBatch
@@ -90,13 +89,12 @@ def test_padded_rows_reach_the_op_with_both_filters_disabled():
 
     top_k, top_p = build_op_top_k_top_p(metadata, BUCKET_SIZE, VOCAB_SIZE, DEVICE)
 
-    # Both inputs cover the whole bucket, the padded rows included.
+    # `top_k` covers the whole bucket, the padded rows included; the unused
+    # top-p is elided to `None`, which the compiler spells as a scalar 1.0.
     assert top_k.shape == (BUCKET_SIZE,)
-    assert top_p.shape == (BUCKET_SIZE,)
+    assert top_p is None
 
     greedy = input_batch.req_id_to_index["greedy"]
     random_top_k = input_batch.req_id_to_index["random_top_k"]
     assert top_k[greedy].item() == GREEDY_TOP_K
-    assert top_p[greedy].item() == GREEDY_TOP_P
     assert top_k[random_top_k].item() == TOP_K
-    assert top_p[random_top_k].item() == 1.0

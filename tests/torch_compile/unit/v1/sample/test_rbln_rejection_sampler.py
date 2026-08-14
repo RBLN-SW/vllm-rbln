@@ -89,7 +89,8 @@ def test_all_greedy_batch_is_encoded_as_argmax():
     top_k, top_p = build_op_top_k_top_p(metadata, 3, VOCAB_SIZE, DEVICE)
 
     assert torch.equal(top_k, torch.tensor([GREEDY_TOP_K] * 3, dtype=torch.int32))
-    assert torch.equal(top_p, torch.tensor([GREEDY_TOP_P] * 3, dtype=torch.float32))
+    # Greedy is keyed on `top_k == 1` alone; the unused top-p is elided.
+    assert top_p is None
 
 
 def test_all_random_batch_without_top_k_top_p_disables_both():
@@ -101,10 +102,58 @@ def test_all_random_batch_without_top_k_top_p_disables_both():
 
     top_k, top_p = build_op_top_k_top_p(metadata, 2, VOCAB_SIZE, DEVICE)
 
-    # `top_k == vocab_size` and `top_p == 1.0` are the values that leave the
-    # candidate set untouched.
+    # (`None`, `None`) is not allowed, so `top_k` carries the neutral
+    # `vocab_size` tensor and only top-p is elided.
     assert torch.equal(top_k, torch.tensor([VOCAB_SIZE] * 2, dtype=torch.int32))
-    assert torch.equal(top_p, torch.tensor([1.0, 1.0], dtype=torch.float32))
+    assert top_p is None
+
+
+def test_all_random_top_k_only_batch_elides_top_p():
+    metadata = make_sampling_metadata(
+        temperature=torch.tensor([1.0, 2.0]),
+        all_greedy=False,
+        all_random=True,
+        top_k=torch.tensor([3, VOCAB_SIZE], dtype=torch.int32),
+    )
+
+    top_k, top_p = build_op_top_k_top_p(metadata, 2, VOCAB_SIZE, DEVICE)
+
+    assert top_k is metadata.top_k
+    assert top_p is None
+
+
+def test_all_random_top_p_only_batch_elides_top_k():
+    metadata = make_sampling_metadata(
+        temperature=torch.tensor([1.0, 2.0]),
+        all_greedy=False,
+        all_random=True,
+        top_p=torch.tensor([0.9, 1.0], dtype=torch.float32),
+    )
+
+    top_k, top_p = build_op_top_k_top_p(metadata, 2, VOCAB_SIZE, DEVICE)
+
+    assert top_k is None
+    assert top_p is metadata.top_p
+
+
+def test_mixed_batch_top_p_only_still_builds_top_k():
+    """A greedy row is encoded as `top_k == 1`, so `top_k` cannot be elided
+    from a mixed batch even when no request uses top-k."""
+    metadata = make_sampling_metadata(
+        temperature=torch.tensor([0.0, 1.0]),
+        all_greedy=False,
+        all_random=False,
+        top_p=torch.tensor([1.0, 0.9], dtype=torch.float32),
+    )
+
+    top_k, top_p = build_op_top_k_top_p(metadata, 2, VOCAB_SIZE, DEVICE)
+
+    assert torch.equal(
+        top_k, torch.tensor([GREEDY_TOP_K, VOCAB_SIZE], dtype=torch.int32)
+    )
+    assert torch.equal(
+        top_p, torch.tensor([GREEDY_TOP_P, 0.9], dtype=torch.float32)
+    )
 
 
 def test_mixed_batch_overrides_only_greedy_rows():
@@ -239,7 +288,7 @@ def test_mixed_batch_without_request_top_k_top_p():
     assert torch.equal(
         top_k, torch.tensor([VOCAB_SIZE, GREEDY_TOP_K], dtype=torch.int32)
     )
-    assert torch.equal(top_p, torch.tensor([1.0, GREEDY_TOP_P], dtype=torch.float32))
+    assert top_p is None
 
 
 ########################### apply_sampling_constraints ###########################

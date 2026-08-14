@@ -25,36 +25,58 @@ def build_op_top_k_top_p(
     batch_size: int,
     vocab_size: int,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
     """
     Build the per-request `top_k` / `top_p` inputs of an RBLN sampling op.
+
+    batch / filters in use      | top_k             | top_p
+    ----------------------------+-------------------+------------------
+    all greedy                  | tensor of 1s      | None
+    all random:                 |                   |
+      none (pure multinomial)   | vocab_size tensor | None
+      top-k only                | metadata tensor   | None
+      top-p only                | None              | metadata tensor
+      top-k and top-p           | metadata tensor   | metadata tensor
+    greedy + random mixed:      |                   |
+      none (pure multinomial)   | 1 / vocab_size    | None
+      top-k only                | 1 / metadata      | None
+      top-p only                | 1 / vocab_size    | 1.0 / metadata
+      top-k and top-p           | 1 / metadata      | 1.0 / metadata
+
+    In the mixed rows, `a / b` reads: `a` at greedy rows, `b` at random
+    rows. `top_k` is never `None` there, because a greedy row is encoded as
+    `top_k == 1`.
+
+    `None` marks an unused filter: the compiler spells it as a scalar
+    neutral, which lets the primitive drop the dead criterion. `top_k` keeps
+    the neutral tensor when nothing is in use so that the pair is never
+    (`None`, `None`).
     """
+    # Reached only from the rejection sampler: spec decode has no separate
+    # greedy op, while the normal sampler answers all_greedy with rbln::argmax.
     if sampling_metadata.all_greedy:
         return (
             torch.full((batch_size,), GREEDY_TOP_K, dtype=torch.int32, device=device),
-            torch.full((batch_size,), GREEDY_TOP_P, dtype=torch.float32, device=device),
+            None,
         )
 
-    top_k = (
-        sampling_metadata.top_k
-        if sampling_metadata.top_k is not None
+    top_k = sampling_metadata.top_k
+    top_p = sampling_metadata.top_p
+    assert top_k is None or top_k.shape == (batch_size,)
+    assert top_p is None or top_p.shape == (batch_size,)
+
+    if sampling_metadata.all_random and top_k is None and top_p is not None:
+        return None, top_p
+
+    if top_k is None:
         # vLLM stores `top_k=0` (unset) as `vocab_size`, which disables top-k.
-        else torch.full((batch_size,), vocab_size, dtype=torch.int32, device=device)
-    )
-    top_p = (
-        sampling_metadata.top_p
-        if sampling_metadata.top_p is not None
-        else torch.ones(batch_size, dtype=torch.float32, device=device)
-    )
-    assert top_k.shape == (batch_size,)
-    assert top_p.shape == (batch_size,)
+        top_k = torch.full((batch_size,), vocab_size, dtype=torch.int32, device=device)
     if sampling_metadata.all_random:
         return top_k, top_p
 
     assert sampling_metadata.temperature is not None
     is_greedy = sampling_metadata.temperature == GREEDY_TEMPERATURE
-    # A greedy row already carries GREEDY_TOP_P, so only its top_k really changes.
-    return (
-        torch.where(is_greedy, top_k.new_full((), GREEDY_TOP_K), top_k),
-        torch.where(is_greedy, top_p.new_full((), GREEDY_TOP_P), top_p),
-    )
+    top_k = torch.where(is_greedy, top_k.new_full((), GREEDY_TOP_K), top_k)
+    # `top_p` needs no rewrite: vLLM already pins a greedy row's top_p to
+    # GREEDY_TOP_P (1.0).
+    return top_k, top_p
