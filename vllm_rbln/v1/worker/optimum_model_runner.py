@@ -1493,7 +1493,6 @@ class RBLNOptimumModelRunner(
         torch._dynamo.config.recompile_limit = len(self.bucket_sizes) * len(
             WARM_UP_CONFIGS
         )
-        self.sampler = torch.compile(self.sampler, dynamic=False, fullgraph=False)
 
     @torch.inference_mode
     def sample_tokens(
