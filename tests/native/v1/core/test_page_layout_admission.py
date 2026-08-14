@@ -51,9 +51,7 @@ def request(rid="r1"):
 
 
 def have(mgr, req, total_tokens):
-    return RBLNPageLayoutKVCacheManager._have_kernel_blocks_for(
-        mgr, req, total_tokens
-    )
+    return RBLNPageLayoutKVCacheManager._have_kernel_blocks_for(mgr, req, total_tokens)
 
 
 class TestAdmission:
