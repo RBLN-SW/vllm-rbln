@@ -85,6 +85,9 @@ class KernelBlockPool(BlockPool):
         # second writer, so ownership is single-valued.
         self._owner: dict[int, str] = {}
         self._allocating_for: str | None = None
+        self.num_hash_inserts = 0
+        self.num_evictions = 0
+        self.evictions_by: dict[str, int] = {}
         if usable != num_gpu_blocks:
             logger.info(
                 "Kernel block pool: dropped %d trailing pages that cannot form "
@@ -92,6 +95,17 @@ class KernelBlockPool(BlockPool):
                 num_gpu_blocks - usable,
                 pages_per_kernel_block,
             )
+
+    # -- accounting probes ---------------------------------------------------
+
+    def _insert_block_hash(self, block_hash_with_group_id, block, num_tokens) -> None:
+        self.num_hash_inserts += 1
+        super()._insert_block_hash(block_hash_with_group_id, block, num_tokens)
+
+    def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
+        evicted = super()._maybe_evict_cached_block(block)
+        self.num_evictions += evicted
+        return evicted
 
     # -- geometry -----------------------------------------------------------
 
@@ -139,10 +153,17 @@ class KernelBlockPool(BlockPool):
     def can_resume(self, kernel_block: int, from_slot: int) -> bool:
         """May a request that already holds slots ``[0, from_slot)`` append here?
 
-        Only when nobody owns the block and its remaining slots hold nothing
-        worth keeping. A cached tail means the producer filled past this point
-        and other requests can still match it, so appending would destroy live
-        cache; the caller copies instead.
+        Nobody owns the block, nothing live sits in the tail, and -- the part that
+        is easy to get wrong -- the tail carries no cache. A cached tail means the
+        block belongs to some *other* continuation of the same prefix, and
+        appending would overwrite pages that continuation still matches.
+
+        Dropping this condition looked like a win (it took copies to nearly zero)
+        and was in fact catastrophic: with a short shared prefix, `from_slot` is
+        1, the block holding it belongs to another conversation, and every turn
+        resumed a stranger's block and destroyed its cache. Measured on
+        MiniMax-M2.5 multi-turn: every eviction in the run came from that path,
+        88% of published hashes were lost, and matches collapsed to one page.
         """
         if kernel_block in self._owner:
             return False
@@ -153,8 +174,16 @@ class KernelBlockPool(BlockPool):
             for page_id in self.page_ids_of(kernel_block)[from_slot:]
         )
 
-    def open_run(self, request_id: str, kernel_block: int) -> None:
-        """Claim ``kernel_block`` so this request's next pages continue in it."""
+    def open_run(self, request_id: str, kernel_block: int, from_slot: int = 0) -> None:
+        """Claim ``kernel_block`` so this request's next pages continue in it.
+
+        The tail keeps whatever cache it holds; `get_new_blocks` evicts a page as
+        it hands it out, which is late enough to be correct and leaves cache that
+        the request never reaches intact. Evicting the whole tail up front was
+        measurably worse: it threw away the previous turn's pages before knowing
+        whether this turn would overwrite them.
+        """
+        del from_slot
         self._owner[kernel_block] = request_id
 
     def _open_run_for(
@@ -171,18 +200,52 @@ class KernelBlockPool(BlockPool):
                 return kernel_block
         return None
 
-    def _idle_kernel_blocks(self) -> list[int]:
-        """Kernel blocks with no live page and no owner: allocatable whole."""
-        idle = []
+    def _is_idle(self, kernel_block: int) -> bool:
+        """No live page and no owner: allocatable whole."""
+        if kernel_block in self._owner:
+            return False
+        return all(
+            self.blocks[p].ref_cnt == 0 and not self.blocks[p].is_null
+            for p in self.page_ids_of(kernel_block)
+        )
+
+    def idle_kernel_blocks(self) -> list[int]:
+        """Every idle kernel block, for capacity accounting."""
+        return [k for k in range(self.num_kernel_blocks) if self._is_idle(k)]
+
+    def num_owned(self) -> int:
+        return len(self._owner)
+
+    def _num_cached_in(self, kernel_block: int) -> int:
+        return sum(
+            self.blocks[p].block_hash is not None
+            for p in self.page_ids_of(kernel_block)
+        )
+
+    def _next_idle_kernel_block(self, taken: set[int]) -> int | None:
+        """The idle kernel block it costs least to take.
+
+        Taking a block destroys every cached page in it, so a block holding no
+        cache is free and one holding cache is not. Prefer the former outright;
+        only when none is left fall back to the least-cached block, which is the
+        closest thing to upstream's LRU at this granularity.
+
+        Ordering by anything else was catastrophic for hit rate: the pool sat 25
+        of 27 blocks idle while holding barely 20 cached pages, because each new
+        request kept claiming a block that still held cache.
+        """
+        fallback: tuple[int, int] | None = None
         for kernel_block in range(self.num_kernel_blocks):
-            if kernel_block in self._owner:
+            if not self._is_idle(kernel_block):
                 continue
-            if all(
-                self.blocks[p].ref_cnt == 0 and not self.blocks[p].is_null
-                for p in self.page_ids_of(kernel_block)
-            ):
-                idle.append(kernel_block)
-        return idle
+            if not any(p not in taken for p in self.page_ids_of(kernel_block)):
+                continue
+            cached = self._num_cached_in(kernel_block)
+            if cached == 0:
+                return kernel_block
+            if fallback is None or cached < fallback[0]:
+                fallback = (cached, kernel_block)
+        return fallback[1] if fallback else None
 
     def get_num_free_blocks(self) -> int:
         """Pages that can actually be handed out, in kernel block terms.
@@ -199,9 +262,26 @@ class KernelBlockPool(BlockPool):
             for kernel_block, owner in self._owner.items()
             if self._allocating_for is None or owner == self._allocating_for
         )
-        return free_in_open + len(self._idle_kernel_blocks()) * (
+        return free_in_open + len(self.idle_kernel_blocks()) * (
             self.pages_per_kernel_block
         )
+
+    def _claim(self, kernel_block: int) -> None:
+        """Drop the cache still held in a block a request is about to write into.
+
+        Leaving it would let another request match a page *ahead* of the owner's
+        write pointer and take a reference on it. The owner would then have to
+        skip that slot, putting a hole in its run, and the block table addresses
+        slots positionally (slot = page index % ppe), so a hole is silent
+        corruption rather than waste. Upstream evicts the same span when it takes
+        a block at this size, so this is no coarser than the alternative.
+        """
+        if not self.enable_caching:
+            return
+        for page_id in self.page_ids_of(kernel_block):
+            block = self.blocks[page_id]
+            if block.block_hash is not None:
+                self._maybe_evict_cached_block(block)
 
     def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
         """Serve pages from this request's open kernel block, then fresh ones."""
@@ -214,16 +294,12 @@ class KernelBlockPool(BlockPool):
         while len(chosen) < num_blocks:
             kernel_block = self._open_run_for(request_id, taken)
             if kernel_block is None:
-                idle = [
-                    k
-                    for k in self._idle_kernel_blocks()
-                    if any(p not in taken for p in self.page_ids_of(k))
-                ]
-                if not idle:
+                kernel_block = self._next_idle_kernel_block(taken)
+                if kernel_block is None:
                     raise ValueError(
                         f"Cannot get {num_blocks} free blocks from the pool"
                     )
-                kernel_block = idle[0]
+                self._claim(kernel_block)
                 if request_id is not None:
                     self._owner[kernel_block] = request_id
             available = [
@@ -231,6 +307,14 @@ class KernelBlockPool(BlockPool):
             ]
             if not available:
                 raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
+            # A gap means someone took a slot ahead of this request's write
+            # pointer. Slots are addressed positionally, so serving across the
+            # gap would silently point attention at the wrong page.
+            if available != list(range(available[0], available[0] + len(available))):
+                raise ValueError(
+                    f"kernel block {kernel_block} has a hole in its free run: "
+                    f"{available}"
+                )
             picked = available[: num_blocks - len(chosen)]
             chosen.extend(picked)
             taken.update(picked)
@@ -253,6 +337,24 @@ class KernelBlockPool(BlockPool):
         for kernel_block in {self.kernel_block_of(b.block_id) for b in blocks}:
             if all(self.blocks[p].ref_cnt == 0 for p in self.page_ids_of(kernel_block)):
                 self._owner.pop(kernel_block, None)
+
+    def publish_copy(self, source: KVCacheBlock, destination: KVCacheBlock) -> None:
+        """Give a copied page the identity of the page it was copied from.
+
+        Without this the copy is unmatchable: upstream counts the range as
+        already cached, so it never hashes the destination, and the only page
+        carrying that hash stays in the producer's block. A later turn of the same
+        conversation then matches the producer's page at index 0 and its own page
+        at index 1, which is not a run, so the whole match collapses to one page.
+        Upstream keeps several blocks per hash by design, so publishing a second
+        one is a supported state.
+        """
+        if not self.enable_caching:
+            return
+        block_hash = source.block_hash
+        if block_hash is None:
+            return
+        self._insert_block_hash(block_hash, destination, source.block_hash_num_tokens)
 
     def release_owner(self, request_id: str) -> None:
         """Give up the request's open runs so the next turn can adopt them.

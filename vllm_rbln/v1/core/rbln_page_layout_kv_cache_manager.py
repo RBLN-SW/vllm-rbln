@@ -140,6 +140,12 @@ class RBLNPageLayoutKVCacheManager(KVCacheManager):
         self._in_flight_sources: list[list[KVCacheBlock]] = []
         self.num_pages_copied = 0
         self.num_pages_written = 0
+        self.num_whole_groups = 0
+        self.num_resumes = 0
+        self.num_copies = 0
+        self.num_refusals = 0
+        self.num_truncated = 0
+        self.num_pages_truncated = 0
 
         logger.info(
             "Page/kernel block KV cache: page=%d, kernel block=%d (%d pages), "
@@ -164,20 +170,53 @@ class RBLNPageLayoutKVCacheManager(KVCacheManager):
             return blocks, num_computed_tokens
 
         pages = blocks.blocks[0]
-        keep = self._laid_out_prefix(pages)
-        if keep == len(pages):
+        if self._laid_out_prefix(pages) == len(pages):
             return blocks, num_computed_tokens
 
-        logger.debug(
-            "Page layout: truncating a %d-page match to %d; the pages do not "
-            "form kernel-block-aligned runs.",
-            len(pages),
-            keep,
-        )
+        realigned = self._realign(pages)
+        if len(realigned) < len(pages):
+            self.num_truncated += 1
+            self.num_pages_truncated += len(pages) - len(realigned)
         return (
-            self.create_kv_cache_blocks((list(pages[:keep]),)),
-            min(num_computed_tokens, keep * self.geometry.page_size),
+            self.create_kv_cache_blocks((realigned,)),
+            min(num_computed_tokens, len(realigned) * self.geometry.page_size),
         )
+
+    def _realign(self, pages: Sequence[KVCacheBlock]) -> list[KVCacheBlock]:
+        """Re-pick the match so each group sits in one kernel block.
+
+        A copy publishes a second page under a hash the original already holds,
+        and upstream deliberately keeps both and returns an arbitrary one. So a
+        long match routinely arrives as one conversation's page 0 followed by
+        another's page 1 -- addressable nowhere, since a group is one block table
+        entry. The duplicate that *does* continue the run usually exists; find it
+        by asking, for each kernel block, whether it holds this group's hashes at
+        the right slots.
+        """
+        ppe = self.geometry.pages_per_kernel_block
+        cache = self.pool.cached_block_hash_to_block
+        out: list[KVCacheBlock] = []
+        for start in range(0, len(pages), ppe):
+            group = pages[start : start + ppe]
+            hashes = [page.block_hash for page in group]
+            if any(block_hash is None for block_hash in hashes):
+                break
+            best: list[int] = []
+            for kernel_block in range(self.pool.num_kernel_blocks):
+                base = kernel_block * ppe
+                run: list[int] = []
+                for slot, block_hash in enumerate(hashes):
+                    if not cache.contain(block_hash, base + slot):
+                        break
+                    run.append(base + slot)
+                if len(run) > len(best):
+                    best = run
+                    if len(best) == len(group):
+                        break
+            out.extend(self.pool.blocks[page_id] for page_id in best)
+            if len(best) < len(group):
+                break
+        return out
 
     def _laid_out_prefix(self, pages: Sequence[KVCacheBlock]) -> int:
         """Length of the leading run of pages that satisfy the identity map."""
@@ -236,18 +275,37 @@ class RBLNPageLayoutKVCacheManager(KVCacheManager):
         ppe = self.geometry.pages_per_kernel_block
         head = len(matched) % ppe
         if not matched or head == 0:
+            self.num_whole_groups += bool(matched)
             return None
 
         producer = self.pool.kernel_block_of(matched[-head].block_id)
         if self.pool.can_resume(producer, head):
-            self.pool.open_run(request.request_id, producer)
+            self.pool.open_run(request.request_id, producer, head)
+            self.num_resumes += 1
             return _Adoption(producer)
 
         with self.pool.allocating_for(request.request_id):
             if self.pool.get_num_free_blocks() < head:
+                self.num_refusals += 1
                 return _Refused()
             destination = self.pool.get_new_blocks(head)
         return _PrivateCopy(len(matched) - head, list(matched[-head:]), destination)
+
+    def log_binding_stats(self) -> None:
+        """Why the copies happen, in one line. Called per scheduler stats tick."""
+        logger.info(
+            "Page layout: whole-group=%d resume=%d copy=%d refused=%d | "
+            "pages copied=%d written=%d CA=%.4f | match truncated=%d (%d pages)",
+            self.num_whole_groups,
+            self.num_resumes,
+            self.num_copies,
+            self.num_refusals,
+            self.num_pages_copied,
+            self.num_pages_written,
+            self.copy_amplification,
+            self.num_truncated,
+            self.num_pages_truncated,
+        )
 
     def _redirect(self, request: Request, plan: _PrivateCopy) -> None:
         """Swap the matched head for the private copies and queue the transfer.
@@ -274,8 +332,11 @@ class RBLNPageLayoutKVCacheManager(KVCacheManager):
                 num_tokens=len(plan.source) * page,
             )
         )
+        for source, destination in zip(plan.source, plan.destination):
+            self.pool.publish_copy(source, destination)
         self._pending_sources.extend(plan.source)
         self.num_pages_copied += len(plan.source)
+        self.num_copies += 1
 
     def _abandon(self, request: Request, plan: _Adoption | _PrivateCopy | None) -> None:
         """Undo a plan whose allocation the scheduler then refused."""
@@ -292,6 +353,8 @@ class RBLNPageLayoutKVCacheManager(KVCacheManager):
         self.pending_copy_ops = []
         self._in_flight_sources.append(self._pending_sources)
         self._pending_sources = []
+        if ops:
+            self.log_binding_stats()
         return ops
 
     def release_copy_ops(self, ops: list[KernelBlockCopyOp]) -> None:

@@ -119,7 +119,7 @@ class TestAdmissionAccounting:
                 p.get_new_blocks(1)
         assert p.get_num_free_blocks() == 3 * (PPE - 1)
         # ...and a fourth request cannot be backed by a fresh block.
-        assert p._idle_kernel_blocks() == []
+        assert p.idle_kernel_blocks() == []
 
     def test_refuses_more_than_it_reports(self):
         p = pool()
