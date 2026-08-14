@@ -144,6 +144,8 @@ def make_request(
     presence_penalty: float = 0.0,
     frequency_penalty: float = 0.0,
     repetition_penalty: float = 1.0,
+    allowed_token_ids: list[int] | None = None,
+    bad_words_token_ids: list[list[int]] | None = None,
     block_size: int = IB_SIZE,
     hash_fn: Callable = sha256,
     mm_positions: list[PlaceholderRange] | None = None,
@@ -180,7 +182,12 @@ def make_request(
         presence_penalty=presence_penalty,
         frequency_penalty=frequency_penalty,
         repetition_penalty=repetition_penalty,
+        allowed_token_ids=allowed_token_ids,
     )
+    if bad_words_token_ids is not None:
+        # The engine's processor normally tokenizes SamplingParams.bad_words
+        # into this field; there is no tokenizer here, so set it directly.
+        sampling_params._bad_words_token_ids = bad_words_token_ids
 
     return Request(
         request_id=request_id,

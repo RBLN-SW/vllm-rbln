@@ -420,3 +420,167 @@ def test_mixed_penalty_batch_isolates_requests(rbln_sampler_env):
             assert sampled_token(output, req.request_id) == 7
     assert sampled_token(step1, "req_0") == 11
     assert sampled_token(step2, "req_0") == 23
+
+
+@pytest.mark.parametrize("restricted", [True, False], ids=["allowed", "unrestricted"])
+def test_allowed_token_ids_masks_greedy_pick(rbln_sampler_env, restricted):
+    """allowed_token_ids must mask every other token to -inf: the top token
+    loses to an allowed runner-up, at prefill and on decode steps alike.
+    """
+    runner = create_model_runner(max_num_seqs=1)
+    set_fixed_logits(runner, {7: 3.0, 11: 1.0})
+    req = make_request(
+        request_id="req_0",
+        prompt_token_ids=[1, 2, 3],
+        temperature=0.0,
+        allowed_token_ids=[11, 23] if restricted else None,
+    )
+
+    expected = 11 if restricted else 7
+    (prefill_output,) = prefill_requests(runner, [req])
+    assert sampled_token(prefill_output, "req_0") == expected
+    (step1,) = run_decode_steps(runner, [req], num_steps=1)
+    assert sampled_token(step1, "req_0") == expected
+
+
+def test_allowed_token_ids_in_padded_batch(rbln_sampler_env):
+    """A restricted request in a padded batch keeps its mask to itself: the
+    other rows and the pad row of the bucket-sized mask stay unrestricted.
+    """
+    runner = create_model_runner(max_num_seqs=4)
+    set_fixed_logits(runner, {7: 3.0, 11: 1.0})
+
+    restricted = make_request(
+        request_id="req_0",
+        prompt_token_ids=[1, 2, 3],
+        temperature=0.0,
+        allowed_token_ids=[11],
+    )
+    plain = [
+        make_request(request_id=f"req_{i}", prompt_token_ids=[1, 2, 3], temperature=0.0)
+        for i in (1, 2)
+    ]
+    reqs = [restricted, *plain]
+
+    prefill_requests(runner, reqs)
+    for output in run_decode_steps(runner, reqs, num_steps=2):
+        assert sampled_token(output, "req_0") == 11
+        for req in plain:
+            assert sampled_token(output, req.request_id) == 7
+
+
+@pytest.mark.parametrize("banned", [True, False], ids=["bad_word", "no_bad_word"])
+def test_bad_words_single_token_masked_from_prefill(rbln_sampler_env, banned):
+    """A single-token bad word is masked unconditionally, so the top token
+    already loses at the prefill sample."""
+    runner = create_model_runner(max_num_seqs=1)
+    set_fixed_logits(runner, {7: 3.0, 11: 1.0})
+    req = make_request(
+        request_id="req_0",
+        prompt_token_ids=[1, 2, 3],
+        temperature=0.0,
+        bad_words_token_ids=[[7]] if banned else None,
+    )
+
+    (prefill_output,) = prefill_requests(runner, [req])
+    assert sampled_token(prefill_output, "req_0") == (11 if banned else 7)
+
+
+def test_bad_words_multi_token_masks_continuation(rbln_sampler_env):
+    """A multi-token bad word only masks its last token when the output
+    history ends with the preceding tokens, so the pick alternates: the top
+    token, then the runner-up while [7] is banned from continuing to [7, 7],
+    then the top token again once the history no longer matches.
+    """
+    runner = create_model_runner(max_num_seqs=1)
+    set_fixed_logits(runner, {7: 3.0, 11: 1.0})
+    req = make_request(
+        request_id="req_0",
+        prompt_token_ids=[1, 2, 3],
+        temperature=0.0,
+        bad_words_token_ids=[[7, 7]],
+    )
+
+    (prefill_output,) = prefill_requests(runner, [req])
+    assert sampled_token(prefill_output, "req_0") == 7
+
+    step1, step2 = run_decode_steps(runner, [req], num_steps=2)
+    assert sampled_token(step1, "req_0") == 11
+    assert sampled_token(step2, "req_0") == 7
+
+
+def test_mixed_greedy_random_batch(rbln_sampler_env):
+    """vLLM RBLN does not split a mixed batch: greedy requests ride the
+    random-sampling path with a tiny temperature. With fixed logits the
+    greedy row must still get the argmax token, next to a random row
+    constrained to top_k=1.
+    """
+    runner = create_model_runner(max_num_seqs=4)
+    set_fixed_logits(runner, {7: 3.0, 11: 1.0})
+
+    greedy = make_request(
+        request_id="req_0", prompt_token_ids=[1, 2, 3], temperature=0.0
+    )
+    random_req = make_request(
+        request_id="req_1", prompt_token_ids=[1, 2, 3], temperature=1.0, top_k=1
+    )
+    reqs = [greedy, random_req]
+
+    prefill_requests(runner, reqs)
+    for output in run_decode_steps(runner, reqs, num_steps=2):
+        assert sampled_token(output, "req_0") == 7
+        assert sampled_token(output, "req_1") == 7
+
+
+def test_logprobs_match_log_softmax_reference(rbln_sampler_env):
+    """gather_logprobs must return the sampled token first, then the top-k
+    tokens, with raw log-softmax values (before penalties/temperature) and a
+    1-based rank."""
+    runner = create_model_runner(max_num_seqs=1)
+    favored = {7: 3.0, 11: 1.0, 23: 0.5}
+    set_fixed_logits(runner, favored)
+    req = make_request(
+        request_id="req_0", prompt_token_ids=[1, 2, 3], temperature=0.0, logprobs=3
+    )
+
+    (output,) = prefill_requests(runner, [req])
+    lp = output.logprobs
+
+    assert list(lp.logprob_token_ids[0]) == [7, 7, 11, 23]
+    assert lp.sampled_token_ranks[0] == 1
+
+    row = torch.zeros(runner.model_config.get_vocab_size())
+    for token_id, value in favored.items():
+        row[token_id] = value
+    reference = torch.log_softmax(row, dim=-1)
+    expected = reference[torch.tensor(lp.logprob_token_ids[0])]
+    assert torch.allclose(torch.tensor(lp.logprobs[0]), expected, atol=1e-5)
+
+
+@pytest.mark.parametrize(
+    "sampling_kwargs, favored",
+    [
+        # top_k=1 leaves only the argmax in the candidate set.
+        pytest.param({"top_k": 1}, {7: 3.0, 11: 1.0}, id="top_k_1"),
+        # The top token holds ~all probability mass, so a 0.5 nucleus is
+        # exactly {top token}.
+        pytest.param({"top_p": 0.5}, {7: 20.0, 11: 10.0}, id="top_p_singleton"),
+    ],
+)
+def test_top_k_top_p_deterministic_cases(rbln_sampler_env, sampling_kwargs, favored):
+    """Deterministic corners of the RBLN top-k/top-p op: when the candidate
+    set collapses to a single token, random sampling must return it on every
+    step."""
+    runner = create_model_runner(max_num_seqs=1)
+    set_fixed_logits(runner, favored)
+    req = make_request(
+        request_id="req_0",
+        prompt_token_ids=[1, 2, 3],
+        temperature=1.0,
+        **sampling_kwargs,
+    )
+
+    (prefill_output,) = prefill_requests(runner, [req])
+    assert sampled_token(prefill_output, "req_0") == 7
+    for output in run_decode_steps(runner, [req], num_steps=3):
+        assert sampled_token(output, "req_0") == 7
