@@ -49,7 +49,7 @@ def rbln_top_k_top_p_sample(
     we define this as a static method.
     """
     # Apply temperature.
-    logits = logits.div(temperature.to(logits.dtype).unsqueeze(dim=1))
+    logits = logits.div_(temperature.to(logits.dtype).unsqueeze(dim=1))
 
     # Apply top-k top-p sampling using RBLN custom op.
     # It requires softmax prior to calling the op.
@@ -202,6 +202,9 @@ class RBLNSampler(VLLMSampler):
 
         temperature = sampling_metadata.temperature
         if not sampling_metadata.all_random:
+            # NOTE: Greedy requests use a small temperature (1e-3) so softmax collapses
+            # to a near one-hot at argmax. original _SAMPLING_EPS (1e-5) is too small
+            # here — it pushes logits past softmax's safe exp range and overflows.
             temperature = torch.where(
                 temperature < _SAMPLING_EPS, _SAMPLING_EPS, temperature
             )
@@ -210,7 +213,11 @@ class RBLNSampler(VLLMSampler):
         # if argmax_invariant processors are active, apply temperature scaling
         # before applying them.
         if any(getattr(p, "min_p_count", 1) for p in argmax_invariant):
-            logits = logits.div(temperature.unsqueeze(dim=1))
+            # Divide in place, as upstream does: allocating a second logits-sized
+            # tensor here costs more than the division itself. Rows past num_reqs of
+            # the padded buffer must therefore carry temperature 1.0 -- see
+            # RBLNInputBatch._make_sampling_metadata_rbln.
+            logits = logits.div_(temperature.to(logits.dtype).unsqueeze(dim=1))
             temperature = torch.ones_like(temperature)
 
         # Apply logits processors that only apply to random sampling
@@ -300,25 +307,6 @@ class RBLNSampler(VLLMSampler):
             logprobs_tensors=logprobs_tensors,
         )
         return sampler_output
-
-    def apply_temperature(
-        self,
-        logits: torch.Tensor,
-        temperature: torch.Tensor,
-        all_random: bool,
-    ) -> torch.Tensor:
-        # NOTE:
-        # Greedy requests use a small temperature (1e-3) so softmax collapses
-        # to a near one-hot at argmax. _SAMPLING_EPS (1e-5) is too small here —
-        # it pushes logits past softmax's safe exp range and overflows.
-        if not all_random:
-            temperature = torch.where(temperature < _SAMPLING_EPS, 1e-3, temperature)
-        temperature = temperature.to(logits.dtype)
-        # Divide in place, as upstream does: allocating a second logits-sized
-        # tensor here costs more than the division itself. Rows past num_reqs of
-        # the padded buffer must therefore carry temperature 1.0 -- see
-        # RBLNInputBatch._make_sampling_metadata_rbln.
-        return logits.div_(temperature.unsqueeze(dim=1))
 
     @staticmethod
     def gather_logprobs(
