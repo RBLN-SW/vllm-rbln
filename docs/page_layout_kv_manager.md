@@ -947,13 +947,13 @@ pool (222K tokens) never evicted. Force it with `--num-gpu-blocks-override`.
    multi-block requests.
 5. ~~**O(1) `bind()`.**~~ **Moot** -- `bind()` is gone. The block table is derived
    arithmetically from the request's page ids.
-6. ~~**Confirm the multi-turn result on MiniMax-M2.5.**~~ **Done 2026-08-13** --
-   +8.8% req/s and -8.0% TPOT against sub-block caching at the same kernel
-   block, with identical match coverage (see the table above). Two follow-ups it
-   raised: TTFT did not separate from noise in a single run, so repeat it or time
-   `_process_kv_cache_copy_ops` per step to test whether the copy tax lands on
-   co-batched decodes; and conversations never crossed one kernel block, so the
-   regime where both designs share full blocks by reference is still unmeasured.
+6. ~~**Confirm the multi-turn result on MiniMax-M2.5.**~~ **Superseded.** The
+   2026-08-13 figures above come from a single unpaired run per config, with the
+   two configs seeing differently composed workloads -- enough to show the
+   mechanism works, not enough to size it. A paired suite (warmup discarded,
+   distinct seed per repetition, same seeds and workload order both sides) was
+   run on 2026-08-14 against the identity-mapped rewrite; treat the numbers in
+   this section as indicative only until it is written up.
 7. **Short greedy probe on `sub-block caching @ block 8192`.** In the run above it was the
    only config whose text diverged from the other two. Probably benign (moving
    chunked-prefill boundaries), but that is the config recommended for the +18%
