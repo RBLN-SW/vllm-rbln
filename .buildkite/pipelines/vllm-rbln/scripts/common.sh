@@ -20,12 +20,6 @@ section() {
   fi
 }
 
-sync_env() {
-  [ -n "${BUILDKITE:-}" ] || return 0
-  section ":package: uv sync"
-  uv sync --locked --python 3.12 --extra test --extra dev --extra runtime
-}
-
 require_env() {
   local name
   for name in "$@"; do

@@ -8,7 +8,6 @@ source "${_here}/../common.sh"
 
 require_env HF_TOKEN
 
-sync_env
 section ":dart: lm-eval"
 
 run_id="$(date +%Y%m%d_%H%M%S)"

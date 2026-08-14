@@ -19,5 +19,4 @@ if [ -n "${NUM_HIDDEN_LAYERS:-}" ]; then
   args+=(--num-hidden-layers "${NUM_HIDDEN_LAYERS}")
 fi
 
-sync_env
 run_pytest "${args[@]}" "$@"
