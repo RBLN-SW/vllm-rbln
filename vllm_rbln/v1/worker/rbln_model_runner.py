@@ -133,7 +133,6 @@ from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
 from vllm_rbln.v1.worker import mega_cache
-from vllm_rbln.v1.worker._step_probe import StepProbe
 from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
 from vllm_rbln.v1.worker.input_stager import (
     InputLayout,
@@ -366,7 +365,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             self.sampler = Sampler(self.model_config.logprobs_mode)
 
         # Per-step region timing; off unless VLLM_RBLN_STEP_PROBE is set.
-        self.step_probe = StepProbe()
         # Host hop for the token feedback; see the identity branch below.
         self._tokfb_host = None
         # Logprobs handed to the deferred output; see the async branch of
@@ -891,8 +889,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # Issue the per-step DP num_tokens all_reduce as soon as its inputs are known
         # and consume it in _determine_batch_padding below. Host gloo collective on
         # CPU tensors; touches no device memory.
-        with self.step_probe.region("dp_reduce.issue"):
-            dp_reduce = self._start_dp_token_reduce(num_reqs, total_query_tokens)
+        dp_reduce = self._start_dp_token_reduce(num_reqs, total_query_tokens)
 
         # Get request indices.
         # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
@@ -935,10 +932,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self.query_start_loc_np[1 : num_reqs + 1] = cu_num_tokens
         self.query_start_loc_np[num_reqs + 1 :].fill(cu_num_tokens[-1])
 
-        with self.step_probe.region("dp_reduce.wait"):
-            num_reqs_padded, num_tokens_padded, num_tokens_across_dp = (
-                self._determine_batch_padding(num_reqs, total_query_tokens, dp_reduce)
-            )
+        num_reqs_padded, num_tokens_padded, num_tokens_across_dp = (
+            self._determine_batch_padding(num_reqs, total_query_tokens, dp_reduce)
+        )
 
         self.seq_lens_np[:num_reqs] = (
             self.input_batch.num_computed_tokens_cpu[:num_reqs] + logical_num_tokens
@@ -1064,13 +1060,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 builder = attn_group.get_metadata_builder(0)
                 assert isinstance(builder, RBLNFlashAttentionMetadataBuilder)
 
-                with self.step_probe.region("attn.build"):
-                    attn_metadata_i = builder.build(
-                        common_attn_metadata=cm,
-                        positions=self.positions,
-                        is_prefill=self.is_prefill,
-                        batch_pad=num_reqs_padded,
-                    )
+                attn_metadata_i = builder.build(
+                    common_attn_metadata=cm,
+                    positions=self.positions,
+                    is_prefill=self.is_prefill,
+                    batch_pad=num_reqs_padded,
+                )
 
                 for layer_name in attn_group.layer_names:
                     attn_metadata[layer_name] = attn_metadata_i
@@ -1577,8 +1572,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         # Before anything reads token_ids_cpu this step.
         if self.use_async_scheduling:
-            with self.step_probe.region("pending_writeback"):
-                self._apply_pending_token_writeback()
+            self._apply_pending_token_writeback()
 
         if has_kv_transfer_group():
             kv_connector_metadata = scheduler_output.kv_connector_metadata
@@ -1645,17 +1639,16 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 )
             )
 
-            with self.step_probe.region("preprocess"):
-                (
-                    staged_model_inputs,
-                    model_kwargs,
-                ) = self._preprocess(
-                    num_reqs,
-                    num_reqs_padded,
-                    num_query_tokens,
-                    logits_indices,
-                    intermediate_tensors,
-                )
+            (
+                staged_model_inputs,
+                model_kwargs,
+            ) = self._preprocess(
+                num_reqs,
+                num_reqs_padded,
+                num_query_tokens,
+                logits_indices,
+                intermediate_tensors,
+            )
 
             # Device-tensor async token feedback (decode fast path). staged input_ids
             # holds the scheduler's placeholders; scatter the real previous token from
@@ -1696,17 +1689,15 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     n_fb = len(rows)
                     # staged input_ids is a host tensor, so this is a D2H
                     # either way; the intermediate buffer keeps it contiguous.
-                    with self.step_probe.region("tok_feedback"):
-                        if self._tokfb_host is None or self._tokfb_host.shape[0] < n_fb:
-                            self._tokfb_host = torch.empty(
-                                prev_sampled.shape[0], dtype=prev_sampled.dtype
-                            )
-                        host = self._tokfb_host[:n_fb]
-                        host.copy_(prev_sampled[:n_fb, 0])
-                        staged_model_inputs.input_ids[:n_fb, 0].copy_(host)
+                    if self._tokfb_host is None or self._tokfb_host.shape[0] < n_fb:
+                        self._tokfb_host = torch.empty(
+                            prev_sampled.shape[0], dtype=prev_sampled.dtype
+                        )
+                    host = self._tokfb_host[:n_fb]
+                    host.copy_(prev_sampled[:n_fb, 0])
+                    staged_model_inputs.input_ids[:n_fb, 0].copy_(host)
                 elif rows:
-                    with self.step_probe.region("tok_feedback"):
-                        staged_model_inputs.input_ids[dsts, 0] = prev_sampled[rows, 0]
+                    staged_model_inputs.input_ids[dsts, 0] = prev_sampled[rows, 0]
 
         # Run the model.
         # When spec decode is enabled, defer connector finalization
@@ -1728,7 +1719,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
             self.performance_ctx.profile_model(self.is_prefill),
-            self.step_probe.region("forward.dispatch"),
         ):
             model_output = self.model_executable(
                 **staged_model_inputs.as_kwargs(),
@@ -1822,7 +1812,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         with (
             record_function_or_nullcontext("rbln_model_runner: sample"),
-            self.step_probe.region("sample"),
         ):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
@@ -1902,8 +1891,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 num_nans_in_logits=num_nans_in_logits,
                 kv_connector_output=kv_connector_output,
             )
-
-        self.step_probe.tick()
 
         if not self.use_async_scheduling:
             return output
