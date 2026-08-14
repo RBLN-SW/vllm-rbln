@@ -148,6 +148,8 @@ def make_request(
     cache_salt: str | None = None,
     min_tokens: int = 0,
     stop_token_ids: list[int] | None = None,
+    logit_bias: dict[int, float] | None = None,
+    min_p: float = 0.0,
 ):
     mm_features = []
     if mm_positions is not None:
@@ -180,6 +182,8 @@ def make_request(
         repetition_penalty=repetition_penalty,
         min_tokens=min_tokens,
         stop_token_ids=stop_token_ids,
+        logit_bias=logit_bias,
+        min_p=min_p,
     )
 
     return Request(

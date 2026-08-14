@@ -15,6 +15,10 @@
 import pytest
 import torch
 from vllm.platforms import current_platform
+from vllm.v1.sample.logits_processor.builtin import (
+    LogitBiasLogitsProcessor,
+    MinPLogitsProcessor,
+)
 
 from .utils import (
     _schedule_cached_reqs,
@@ -289,6 +293,147 @@ def test_forward_min_tokens_masks_stop_tokens(monkeypatch, dtype):
     assert sampled[:min_tokens] == [runner_up_token_id] * min_tokens
     # Once min_tokens is reached, the stop token becomes sampleable again.
     assert sampled[min_tokens] == stop_token_id
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+def test_forward_logit_bias_overrides_argmax(monkeypatch, dtype):
+    """logit_bias must be added to the logits before sampling, so a large
+    positive bias lifts an otherwise losing token above the raw argmax
+    token under greedy sampling.
+
+    The bfloat16 case is a regression test for a dtype mismatch: the RBLN
+    sampler keeps logits in the model dtype (no float32 upcast), while the
+    builtin LogitBiasLogitsProcessor rebuilds its bias tensor as float32 on
+    every state change. RBLNLogitBiasLogitsProcessor must re-sync the bias
+    tensor to the model dtype so the in-place += never mixes dtypes.
+    """
+    monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1")
+    monkeypatch.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
+    monkeypatch.setenv("VLLM_RBLN_ENABLE_WARM_UP", "False")
+
+    runner = create_model_runner(max_num_seqs=1, dtype=dtype)
+
+    top_token_id = 9
+    biased_token_id = 5
+    num_decodes = 3
+
+    # Rig the logits so the top token wins greedy sampling unless the bias
+    # lifts the biased token above it.
+    def rigged_forward(model_input, **kwargs):
+        num_reqs = runner.input_batch.num_reqs
+        vocab_size = runner.model_config.get_vocab_size()
+        logits = torch.full((num_reqs, 1, vocab_size), -10.0, dtype=dtype)
+        logits[..., top_token_id] = 10.0
+        logits[..., biased_token_id] = 5.0
+        return logits
+
+    runner.model.forward = rigged_forward
+
+    req = make_request(
+        request_id="req_0",
+        prompt_token_ids=[1, 2, 3],
+        temperature=0.0,
+        logit_bias={biased_token_id: 20.0},
+    )
+
+    # Prefill samples the first output token.
+    scheduler_output = _schedule_new_request_from_request(
+        req, block_ids=([0],), outer_block_ids=[0]
+    )
+    runner.execute_model(scheduler_output)
+    output = runner.sample_tokens(grammar_output=None)
+    sampled = [output.sampled_token_ids[0][0]]
+
+    req.num_computed_tokens = len(req.prompt_token_ids)
+    for _ in range(num_decodes):
+        scheduler_output = _schedule_cached_reqs([req], new_block_ids=[None])
+        runner.execute_model(scheduler_output)
+        output = runner.sample_tokens(grammar_output=None)
+        sampled.append(output.sampled_token_ids[0][0])
+        req.num_computed_tokens += 1
+
+    # The +20 bias lifts the biased token (5 + 20) above the raw argmax
+    # token (10), so greedy sampling must pick it on every step.
+    assert sampled == [biased_token_id] * (num_decodes + 1)
+
+    # The float32 bias tensor rebuilt on every state change must have been
+    # re-synced to the model dtype.
+    bias_proc = next(
+        p
+        for p in runner.input_batch.logitsprocs.all
+        if isinstance(p, LogitBiasLogitsProcessor)
+    )
+    assert bias_proc.bias_tensor.dtype == dtype
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+def test_forward_min_p_masks_low_probability_tokens(monkeypatch, dtype):
+    """min_p must mask every token whose probability is below
+    min_p * max_prob, leaving only the top token sampleable.
+
+    The bfloat16 case is a regression test for a dtype mismatch: the RBLN
+    sampler keeps logits in the model dtype (no float32 upcast), while the
+    builtin MinPLogitsProcessor re-slices min_p from a float32 buffer on
+    state changes. RBLNMinPLogitsProcessor must re-sync the min_p tensor to
+    the model dtype so the in-place mul_ into model-dtype probabilities
+    never mixes dtypes.
+    """
+    monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1")
+    monkeypatch.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
+    monkeypatch.setenv("VLLM_RBLN_ENABLE_WARM_UP", "False")
+
+    runner = create_model_runner(max_num_seqs=1, dtype=dtype)
+
+    top_token_id = 5
+    num_decodes = 4
+
+    # Rig the logits so the top token holds only ~5% probability mass and
+    # the rest is spread uniformly over the vocab. With min_p=0.5 every
+    # other token falls below min_p * max_prob and is masked, making random
+    # sampling deterministic; without min_p the top token would be sampled
+    # with only ~5% probability per step.
+    def rigged_forward(model_input, **kwargs):
+        num_reqs = runner.input_batch.num_reqs
+        vocab_size = runner.model_config.get_vocab_size()
+        logits = torch.zeros((num_reqs, 1, vocab_size), dtype=dtype)
+        logits[..., top_token_id] = 8.0
+        return logits
+
+    runner.model.forward = rigged_forward
+
+    req = make_request(
+        request_id="req_0",
+        prompt_token_ids=[1, 2, 3],
+        temperature=1.0,
+        min_p=0.5,
+    )
+
+    # Prefill samples the first output token.
+    scheduler_output = _schedule_new_request_from_request(
+        req, block_ids=([0],), outer_block_ids=[0]
+    )
+    runner.execute_model(scheduler_output)
+    output = runner.sample_tokens(grammar_output=None)
+    sampled = [output.sampled_token_ids[0][0]]
+
+    req.num_computed_tokens = len(req.prompt_token_ids)
+    for _ in range(num_decodes):
+        scheduler_output = _schedule_cached_reqs([req], new_block_ids=[None])
+        runner.execute_model(scheduler_output)
+        output = runner.sample_tokens(grammar_output=None)
+        sampled.append(output.sampled_token_ids[0][0])
+        req.num_computed_tokens += 1
+
+    assert sampled == [top_token_id] * (num_decodes + 1)
+
+    # The min_p slice refreshed from the float32 buffer on state changes
+    # must have been re-synced to the model dtype.
+    min_p_proc = next(
+        p
+        for p in runner.input_batch.logitsprocs.all
+        if isinstance(p, MinPLogitsProcessor)
+    )
+    assert min_p_proc.min_p.dtype == dtype
 
 
 @pytest.mark.parametrize("top_p", [0.7, 1.0])

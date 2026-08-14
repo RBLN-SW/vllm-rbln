@@ -29,7 +29,7 @@ from vllm.v1.sample.logits_processor.builtin import (
     MinPLogitsProcessor,
     MinTokensLogitsProcessor,
 )
-from vllm.v1.sample.logits_processor.interface import BatchUpdate, LogitsProcessor
+from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 
 logger = init_logger(__name__)
 
@@ -69,37 +69,31 @@ class RBLNMinTokensLogitsProcessor(MinTokensLogitsProcessor):
 
 
 class RBLNLogitBiasLogitsProcessor(LogitBiasLogitsProcessor):
+    # bias_tensor is rebuilt as float32 on every state change, so it is
+    # synced to the incoming logits dtype per apply() call. The logits
+    # dtype cannot be read from model_config: the optimum path forces
+    # model_config.dtype to float32 while the compiled model can still
+    # emit bfloat16 logits.
     bias_tensor: torch.Tensor
 
-    def __init__(
-        self, vllm_config: VllmConfig, device: torch.device, is_pin_memory: bool
-    ):
-        super().__init__(vllm_config, device, is_pin_memory)
-        self._logits_dtype = vllm_config.model_config.dtype
-
-    def update_state(self, batch_update: BatchUpdate | None):
-        # bias_tensor is rebuilt as float32 on every state change, so it
-        # must be re-cast here rather than once in __init__.
-        super().update_state(batch_update)
-        if self.biases and self.bias_tensor.dtype != self._logits_dtype:
-            self.bias_tensor = self.bias_tensor.to(self._logits_dtype)
+    def apply(self, logits: torch.Tensor) -> torch.Tensor:
+        if self.biases and self.bias_tensor.dtype != logits.dtype:
+            self.bias_tensor = self.bias_tensor.to(logits.dtype)
+        return super().apply(logits)
 
 
 class RBLNMinPLogitsProcessor(MinPLogitsProcessor):
+    # min_p is re-sliced from the float32 buffer on state changes and
+    # multiplied in place into model-dtype probabilities, so it is synced
+    # to the incoming logits dtype per apply() call (see
+    # RBLNLogitBiasLogitsProcessor for why model_config.dtype is not
+    # usable here).
     min_p: torch.Tensor
 
-    def __init__(
-        self, vllm_config: VllmConfig, device: torch.device, is_pin_memory: bool
-    ):
-        super().__init__(vllm_config, device, is_pin_memory)
-        self._logits_dtype = vllm_config.model_config.dtype
-
-    def update_state(self, batch_update: BatchUpdate | None):
-        # min_p is re-sliced from the float32 buffer on state changes;
-        # apply() multiplies it in place into model-dtype probabilities.
-        super().update_state(batch_update)
-        if self.min_p_count and self.min_p.dtype != self._logits_dtype:
-            self.min_p = self.min_p.to(self._logits_dtype)
+    def apply(self, logits: torch.Tensor) -> torch.Tensor:
+        if self.min_p_count and self.min_p.dtype != logits.dtype:
+            self.min_p = self.min_p.to(logits.dtype)
+        return super().apply(logits)
 
 
 RBLN_BUILTIN_LOGITS_PROCESSORS: list[type[LogitsProcessor]] = [

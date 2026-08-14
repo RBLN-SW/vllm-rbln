@@ -268,7 +268,7 @@ class RBLNOptimumModelRunner(
             (self.max_model_len, 1),
             dtype=torch.int64,
             device="cpu",
-            pin_memory=self.pin_memory,
+            pin_memory=PIN_MEMORY,
         )
 
         if envs.VLLM_RBLN_METRICS:
@@ -783,7 +783,7 @@ class RBLNOptimumModelRunner(
         for _, _, mm_kwargs_batch in group_and_batch_mm_kwargs(
             mm_kwargs,
             device=self.device,
-            pin_memory=self.pin_memory,
+            pin_memory=PIN_MEMORY,
         ):
             mm_kwargs_combined.update(mm_kwargs_batch)
 
