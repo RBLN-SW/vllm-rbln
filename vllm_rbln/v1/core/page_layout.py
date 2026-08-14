@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Page/kernel block KV geometry. See docs/page_layout_kv_manager.md.
+"""Page/kernel block KV sizes. See docs/page_layout_kv_manager.md.
 
-A page id names its own physical home -- ``page_id // pages_per_kernel_block``
-is the kernel block, the remainder is the slot -- so there is no map to keep
-here, only the arithmetic and the configuration that fixes it.
-`KernelBlockPool` is what makes allocation respect the identity.
+Sizes and the checks on them, nothing else. A page id names its own physical
+home, but the arithmetic that says so belongs to `KernelBlockPool`, which is the
+only thing that can enforce it -- keeping a second copy here is how the two
+drift apart.
 """
 
 from __future__ import annotations
@@ -78,7 +78,7 @@ class PageLayout:
         return self.pages_per_kernel_block == 1
 
     def validate_chunk(self, chunk_size: int) -> None:
-        """I2: a prefill step must never straddle a page boundary."""
+        """A prefill step must never straddle a page boundary."""
         if chunk_size <= 0:
             raise ValueError(f"chunk_size must be positive, got {chunk_size}")
         if self.page_size % chunk_size != 0:
@@ -87,13 +87,6 @@ class PageLayout:
                 f"prefill chunk ({chunk_size}) so a prefill step never spans "
                 f"two pages"
             )
-
-    def num_kernel_blocks_for_pages(self, num_pages: int) -> int:
-        return -(-num_pages // self.pages_per_kernel_block)
-
-    def slot(self, page_index: int) -> int:
-        """I3: sequential writes make the slot a function of the index alone."""
-        return page_index % self.pages_per_kernel_block
 
 
 # --------------------------------------------------------------------------- #

@@ -28,7 +28,7 @@ worker wants then falls out arithmetically -- no page -> location map to keep.
 
 That leaves one case with no legal answer: a group whose match ends part-way
 while the producer's block is still live. Its remaining slots must be written,
-I4 forbids writing them in the producer's block, and the group is one block table
+R1 forbids writing them in the producer's block, and the group is one block table
 entry so they cannot go elsewhere. The group is then re-allocated whole as a
 private run and the matched head copied into it -- the copied pages get *fresh*
 ids naming the new block, which is what keeps the identity intact.
@@ -109,7 +109,7 @@ class RBLNPageLayoutKVCacheManager(KVCacheManager):
         kv_cache_config: KVCacheConfig,
         config: PageLayoutConfig,
     ) -> bool:
-        """I10 keeps the MVP to a single full-attention group."""
+        """Eligibility: the MVP groups a single full-attention group only."""
         if not config.enabled:
             return False
         groups = kv_cache_config.kv_cache_groups

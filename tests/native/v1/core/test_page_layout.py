@@ -55,19 +55,6 @@ class TestPageLayout:
         with pytest.raises(ValueError):
             geo.validate_chunk(300)
 
-    def test_slot_is_derived_from_logical_index(self):
-        geo = PageLayout(page_size=512, kernel_block_size=4096)
-        # Invariant I3: slot is a pure function of the logical page index.
-        for page_index in range(20):
-            assert geo.slot(page_index) == page_index % 8
-
-    def test_num_kernel_blocks_for_pages(self):
-        geo = PageLayout(page_size=512, kernel_block_size=4096)
-        assert geo.num_kernel_blocks_for_pages(0) == 0
-        assert geo.num_kernel_blocks_for_pages(1) == 1
-        assert geo.num_kernel_blocks_for_pages(8) == 1
-        assert geo.num_kernel_blocks_for_pages(9) == 2
-
 
 class TestPageLayoutConfig:
     def test_resolves_geometry_and_pool(self):

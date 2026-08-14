@@ -15,7 +15,7 @@
 """A block pool that hands out pages in kernel-block-aligned runs.
 
 Page layout needs two things upstream's pool does not provide: a request's
-pages must land contiguously inside one kernel block (I3), and the capacity
+pages must land contiguously inside one kernel block (R1), and the capacity
 that gates admission must be the kernel block, because that is what runs out
 first. Keeping those rules in a second allocator beside the pool is what let
 the two disagree -- upstream kept admitting against free pages while kernel
@@ -81,7 +81,7 @@ class KernelBlockPool(BlockPool):
         self.pages_per_kernel_block = pages_per_kernel_block
         self.num_kernel_blocks = usable // pages_per_kernel_block
         # Which request each open kernel block belongs to. A kernel block is
-        # open while it holds live pages of exactly one request; I4 forbids a
+        # open while it holds live pages of exactly one request; R1 forbids a
         # second writer, so ownership is single-valued.
         self._owner: dict[int, str] = {}
         self._allocating_for: str | None = None
@@ -253,7 +253,7 @@ class KernelBlockPool(BlockPool):
         Upstream's `KVCacheManager` gates admission on this, so reporting the
         raw free-page count is what let it admit work the kernel block pool
         could not back. Inside `allocating_for` the answer is narrowed to what
-        *that* request can take: another request's open run has free slots I4
+        *that* request can take: another request's Open group has free slots R1
         forbids it from touching, and counting them would admit work that
         `get_new_blocks` then cannot serve.
         """
